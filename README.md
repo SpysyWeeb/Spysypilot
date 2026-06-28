@@ -15,7 +15,9 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ❌ **Hot-swap button between Chill/Experimental mode**
 - ❌ **Nudgeless lane changes**
 - ❌ **Smooth stops**
+- ❌ **Force Stops**
 - ❌ **Earlier lead takeoffs**
 - ❌ **Better longitudinal tune**
 - ❌ **Replace the "prime" window with a stats window**
 - ❌ **Replace the live on-road view with a different screen showing live stats**
+- ❌ **Get Clip.py working on device with a route viewer**
