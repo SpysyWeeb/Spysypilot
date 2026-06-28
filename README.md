@@ -11,10 +11,10 @@ Any and all code and features generated in this project are free for others to u
 Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
 
 - ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control
+- ❌ **Quiet mode**
 - ❌ **Nudgeless lane changes**
 - ❌ **Smooth stops**
-- ❌ **Quiet mode**
+- ❌ **Earlier lead takeoffs**
+- ❌ **Better longitudinal tune**
 - ❌ **Replace the "prime" window with a stats window**
 - ❌ **Replace the live on-road view with a different screen showing live stats**
-- ❌ **Better longitudinal tune**
-- ❌ **Earlier lead takeoffs**
