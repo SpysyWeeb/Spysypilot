@@ -12,6 +12,7 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 
 - ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control
 - ❌ **Quiet mode**
+- ❌ **Hot-swap button between Chill/Experimental mode**
 - ❌ **Nudgeless lane changes**
 - ❌ **Smooth stops**
 - ❌ **Earlier lead takeoffs**
