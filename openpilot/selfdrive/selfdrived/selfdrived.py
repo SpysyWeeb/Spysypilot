@@ -38,6 +38,7 @@ LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 EventName = log.OnroadEvent.EventName
 ButtonType = car.CarState.ButtonEvent.Type
+DISTANCE_LONG_PRESS = 50  # frames @ 100 Hz = 0.5s hold to toggle ExperimentalMode
 SafetyModel = car.CarParams.SafetyModel
 AlertLevel = log.DriverMonitoringState.AlertLevel
 MonitoringPolicy = log.DriverMonitoringState.MonitoringPolicy
@@ -122,6 +123,8 @@ class SelfdriveD:
     self.not_running_prev = None
     self.experimental_mode = False
     self.personality = self.params.get("LongitudinalPersonality", return_default=True)
+    self.gap_button_frame_count = 0
+    self.experimental_mode_switched = False
     self.recalibrating_seen = False
     self.dm_lockout_set = False
     self.dm_uncertain_alerted = False
@@ -426,12 +429,25 @@ class SelfdriveD:
       if self.sm['modelV2'].frameDropPerc > 1:
         self.events.add(EventName.modeldLagging)
 
-    # Decrement personality on distance button press
+    # Distance button: hold 0.5s to toggle ExperimentalMode; tap to cycle personality
     if self.CP.openpilotLongitudinalControl:
+      if self.gap_button_frame_count > 0:
+        self.gap_button_frame_count += 1
+      for be in CS.buttonEvents:
+        if be.type == ButtonType.gapAdjustCruise:
+          self.gap_button_frame_count = 1 if be.pressed else 0
+
+      if self.gap_button_frame_count >= DISTANCE_LONG_PRESS and not self.experimental_mode_switched:
+        self.experimental_mode = not self.experimental_mode
+        self.params.put_bool("ExperimentalMode", self.experimental_mode)
+        self.experimental_mode_switched = True
+
       if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents):
-        self.personality = (self.personality - 1) % 3
-        self.params.put('LongitudinalPersonality', self.personality)
-        self.events.add(EventName.personalityChanged)
+        if not self.experimental_mode_switched:
+          self.personality = (self.personality - 1) % 3
+          self.params.put('LongitudinalPersonality', self.personality)
+          self.events.add(EventName.personalityChanged)
+        self.experimental_mode_switched = False
 
   def data_sample(self):
     _car_state = messaging.recv_one(self.car_state_sock)
@@ -563,3 +579,4 @@ def main():
 
 if __name__ == "__main__":
   main()
+
