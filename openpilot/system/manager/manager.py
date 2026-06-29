@@ -11,6 +11,7 @@ import openpilot.cereal.messaging as messaging
 import openpilot.system.sentry as sentry
 from openpilot.common.utils import atomic_write
 from openpilot.common.params import Params, ParamKeyFlag
+from openpilot.common.spinner import Spinner
 from openpilot.common.text_window import TextWindow
 from openpilot.common.hardware import HARDWARE
 from openpilot.system.manager.helpers import unblock_stdout, save_bootlog
@@ -122,10 +123,15 @@ def manager_thread() -> None:
   pm = messaging.PubMaster(['managerState'])
 
   params.put_bool("IsOffroad", True, block=True)
+
+  # Boot console spinner: shows process startup status until UI is live
+  boot_spinner = Spinner()
+  boot_spinner.log("Starting processes...")
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
 
   started_prev = False
   ignition_prev = False
+  boot_spinner_deadline = time.monotonic() + 20.0
 
   while True:
     sm.update(1000)
@@ -150,10 +156,20 @@ def manager_thread() -> None:
 
     ensure_running(managed_processes.values(), started, params=params, CP=sm['carParams'], not_run=ignore)
 
-    running = ' '.join("{}{}\u001b[0m".format("\u001b[32m" if p.proc.is_alive() else "\u001b[31m", p.name)
+    running = ' '.join("{}{}\x1b[0m".format("\x1b[32m" if p.proc.is_alive() else "\x1b[31m", p.name)
                        for p in managed_processes.values() if p.proc)
     print(running)
     cloudlog.debug(running)
+
+    # Log process status and close boot spinner once UI is up or timeout expires
+    if boot_spinner is not None:
+      alive = [p.name for p in managed_processes.values() if p.proc and p.proc.is_alive()]
+      if alive:
+        boot_spinner.log("Running: " + ", ".join(alive[:8]))
+      ui_live = any(n in alive for n in ("selfdrived", "ui"))
+      if ui_live or time.monotonic() > boot_spinner_deadline:
+        boot_spinner.close()
+        boot_spinner = None
 
     # send managerState
     msg = messaging.new_message('managerState', valid=True)
