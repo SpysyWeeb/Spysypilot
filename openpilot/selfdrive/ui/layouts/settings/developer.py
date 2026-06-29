@@ -1,13 +1,19 @@
+import html
+import os
+
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.ssh_key import ssh_key_item
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.list_view import toggle_item
+from openpilot.system.ui.widgets.html_render import HtmlModal
+from openpilot.system.ui.widgets.list_view import toggle_item, button_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
+
+ERROR_LOG_PATH = "/data/community/crashes/error.log"
 
 # Description constants
 DESCRIPTIONS = {
@@ -90,6 +96,13 @@ class DeveloperLayout(Widget):
     )
     self._on_enable_ui_debug(self._params.get_bool("ShowDebugInfo"))
 
+    self._error_log_button = button_item(
+      "Error Log",
+      "VIEW",
+      description="View crash and error logs from the current session.",
+      callback=self._on_error_log_clicked,
+    )
+
     self._scroller = Scroller([
       self._adb_toggle,
       self._ssh_toggle,
@@ -99,6 +112,7 @@ class DeveloperLayout(Widget):
       self._lat_maneuver_toggle,
       self._alpha_long_toggle,
       self._ui_debug_toggle,
+      self._error_log_button,
     ], line_separator=True, spacing=0)
 
     # Toggles should be not available to change in onroad state
@@ -183,6 +197,15 @@ class DeveloperLayout(Widget):
     self._params.put_bool("LongitudinalManeuverMode", False, block=True)
     self._long_maneuver_toggle.action_item.set_state(False)
 
+  def _on_error_log_clicked(self):
+    if os.path.exists(ERROR_LOG_PATH):
+      with open(ERROR_LOG_PATH) as f:
+        content = f.read()
+      body = f"<pre>{html.escape(content)}</pre>"
+    else:
+      body = "<p>No errors logged yet.</p>"
+    gui_app.push_widget(HtmlModal(text=body))
+
   def _on_alpha_long_enabled(self, state: bool):
     if state:
       def confirm_callback(result: DialogResult):
@@ -204,3 +227,4 @@ class DeveloperLayout(Widget):
       self._params.put_bool("AlphaLongitudinalEnabled", False, block=True)
       self._params.put_bool("OnroadCycleRequested", True, block=True)
       self._update_toggles()
+

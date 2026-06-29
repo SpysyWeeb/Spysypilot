@@ -1,4 +1,7 @@
 """Install exception handler for process crash."""
+import datetime
+import os
+import traceback
 import sentry_sdk
 from enum import Enum
 from sentry_sdk.integrations.threading import ThreadingIntegration
@@ -8,6 +11,9 @@ from openpilot.system.athena.registration import is_registered_device
 from openpilot.common.hardware import HARDWARE, PC
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.version import get_build_metadata, get_version
+
+ERROR_LOG_PATH = "/data/community/crashes/error.log"
+ERROR_LOG_MAX_BYTES = 100 * 1024  # keep the file under 100 KB
 
 
 class SentryProject(Enum):
@@ -27,8 +33,31 @@ def report_tombstone(fn: str, message: str, contents: str) -> None:
     sentry_sdk.flush()
 
 
+def save_exception() -> None:
+  try:
+    os.makedirs(os.path.dirname(ERROR_LOG_PATH), exist_ok=True)
+    tb = traceback.format_exc()
+    if not tb or tb.strip() == "NoneType: None":
+      return
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}]\n{tb}\n{'=' * 60}\n\n"
+    existing = ""
+    if os.path.exists(ERROR_LOG_PATH):
+      with open(ERROR_LOG_PATH) as f:
+        existing = f.read()
+    # newest entry at the top; trim if the file grows too large
+    combined = entry + existing
+    if len(combined.encode()) > ERROR_LOG_MAX_BYTES:
+      combined = combined.encode()[:ERROR_LOG_MAX_BYTES].decode(errors="ignore")
+    with open(ERROR_LOG_PATH, "w") as f:
+      f.write(combined)
+  except Exception:
+    pass
+
+
 def capture_exception(*args, **kwargs) -> None:
   cloudlog.error("crash", exc_info=kwargs.get('exc_info', 1))
+  save_exception()
 
   try:
     sentry_sdk.capture_exception(*args, **kwargs)
@@ -71,3 +100,4 @@ def init(project: SentryProject) -> bool:
   sentry_sdk.set_tag("device", HARDWARE.get_device_type())
 
   return True
+
