@@ -11,6 +11,7 @@ from openpilot.common.hardware import HARDWARE, AGNOS
 def build() -> None:
   spinner = Spinner()
   spinner.update_progress(0, 100)
+  spinner.log("Checking build...")
 
   HARDWARE.set_power_save(False)
   if AGNOS:
@@ -18,8 +19,10 @@ def build() -> None:
 
   # building with all cores can result in using too much memory, so retry serially
   compile_output: list[bytes] = []
-  for parallelism in ([], ["-j4"], ["-j1"]):
+  for attempt, parallelism in enumerate(([], ["-j4"], ["-j1"])):
     compile_output.clear()
+    if attempt > 0:
+      spinner.log(f"Retrying build (attempt {attempt + 1})...")
     with subprocess.Popen(["scons", *parallelism], cwd=BASEDIR, env={**os.environ, "PWD": BASEDIR}, stderr=subprocess.PIPE) as scons:
       assert scons.stderr is not None
 
@@ -50,11 +53,16 @@ def build() -> None:
           compile_output.append(line)
 
     if scons.returncode == 0:
+      if compile_output:
+        spinner.log("Build complete.")
+      else:
+        spinner.log("Build up to date.")
       break
 
   if scons.returncode != 0:
     # Build failed log errors
     error_s = b"\n".join(compile_output).decode('utf8', 'replace')
+    spinner.log("Build FAILED.")
 
     # Show TextWindow
     spinner.close()
