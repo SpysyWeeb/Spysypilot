@@ -4,6 +4,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.controls.lib.smooth_stops import SmoothStopController
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
@@ -52,20 +53,31 @@ class LongControl:
                              (CP.longitudinalTuning.kiBP, CP.longitudinalTuning.kiV),
                              rate=1 / DT_CTRL)
     self.last_output_accel = 0.0
+    self.smooth = SmoothStopController()
 
   def reset(self):
     self.pid.reset()
 
-  def update(self, active, CS, a_target, should_stop, accel_limits):
+  def update(self, active, CS, a_target, should_stop, accel_limits, lead_distance=0.0, has_lead=False):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
+    self.smooth.update()
+
+    # Smooth Stops owns the final approach: while the plan wants to stop but the car is
+    # still rolling, defer the hold clamp and feather in the pid branch below. The clamp
+    # (stopping state) only arms once we're actually stopped, so it never headbangs.
+    if active and self.long_control_state != LongCtrlState.stopping:
+      stop_now = self.smooth.want_hold(should_stop, CS.vEgo, CS.standstill)
+    else:
+      stop_now = should_stop
 
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
-                                                       should_stop, CS.brakePressed,
+                                                       stop_now, CS.brakePressed,
                                                        CS.cruiseState.standstill)
     if self.long_control_state == LongCtrlState.off:
       self.reset()
+      self.smooth.reset()
       output_accel = 0.
 
     elif self.long_control_state == LongCtrlState.stopping:
@@ -74,15 +86,24 @@ class LongControl:
         output_accel = min(output_accel, 0.0)
         output_accel -= self.CP.stoppingDecelRate * DT_CTRL
       self.reset()
+      self.smooth.reset()
 
     elif self.long_control_state == LongCtrlState.starting:
       output_accel = self.CP.startAccel
       self.reset()
+      self.smooth.reset()
 
     else:  # LongCtrlState.pid
-      error = a_target - CS.aEgo
-      output_accel = self.pid.update(error, speed=CS.vEgo,
-                                     feedforward=a_target)
+      if active and should_stop:
+        # SETTLE: feather to a true standstill instead of clamping while still rolling.
+        # Open-loop accel command (like stopping/starting), so keep the PID reset.
+        output_accel = self.smooth.settle(a_target, CS.vEgo, lead_distance, has_lead, self.last_output_accel)
+        self.reset()
+      else:
+        error = a_target - CS.aEgo
+        output_accel = self.pid.update(error, speed=CS.vEgo,
+                                       feedforward=a_target)
+        self.smooth.reset()
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel
