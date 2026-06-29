@@ -10,16 +10,16 @@ Any and all code and features generated in this project are free for others to u
 
 Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
 
-Origin legend: 💡 personal idea &nbsp;•&nbsp; 🌱 inspired by another fork
+Origin legend: personal idea &nbsp;•&nbsp; inspired by another fork
 
-- ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control &nbsp;*(🌱 inspired by sunnypilot)*
-- ❌ **Quiet mode** &nbsp;*(🌱 inspired by sunnypilot)*
-- ❌ **Hot-swap button between Chill/Experimental mode** &nbsp;*(🌱 inspired by sunnypilot)*
-- ⚠️ **Nudgeless lane changes** &nbsp;*(🌱 inspired by sunnypilot)*
-- ⚠️ **Smooth stops** &nbsp;*(💡 personal idea)*
-- ❌ **Force Stops** &nbsp;*(🌱 inspired by IQPilot)*
-- ❌ **Earlier lead takeoffs** &nbsp;*(🌱 inspired by IQPilot)*
-- ❌ **Better longitudinal tune** &nbsp;*(💡 personal idea)*
-- ❌ **Replace the "prime" window with a stats window** &nbsp;*(💡 personal idea)*
-- ❌ **Replace the live on-road view with a different screen showing live stats** &nbsp;*(💡 personal idea)*
-- ❌ **Get Clip.py working on device with a route viewer** &nbsp;*(💡 personal idea)*
+- ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control &nbsp;*(inspired by sunnypilot)*
+- ❌ **Quiet mode** &nbsp;*(inspired by sunnypilot)*
+- ❌ **Hot-swap button between Chill/Experimental mode** &nbsp;*(inspired by sunnypilot)*
+- ⚠️ **Nudgeless lane changes** &nbsp;*(inspired by sunnypilot)*
+- ⚠️ **Smooth stops** &nbsp;*(personal idea)*
+- ❌ **Force Stops** &nbsp;*(inspired by IQPilot)*
+- ❌ **Earlier lead takeoffs** &nbsp;*(inspired by IQPilot)*
+- ❌ **Better longitudinal tune** &nbsp;*(personal idea)*
+- ❌ **Replace the "prime" window with a stats window** &nbsp;*(personal idea)*
+- ❌ **Replace the live on-road view with a different screen showing live stats** &nbsp;*(personal idea)*
+- ❌ **Get Clip.py working on device with a route viewer** &nbsp;*(personal idea)*
