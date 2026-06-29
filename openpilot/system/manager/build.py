@@ -37,7 +37,9 @@ def build() -> None:
             spinner.update_progress(100 * min(1., progress / 100.), 100.)
           elif len(line):
             compile_output.append(line)
-            print(line.decode('utf8', 'replace'))
+            line_str = line.decode('utf8', 'replace')
+            spinner.log(line_str)
+            print(line_str)
         except Exception:
           pass
 
