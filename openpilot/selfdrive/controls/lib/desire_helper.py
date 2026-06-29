@@ -16,6 +16,7 @@ class DesireHelper:
     self.lane_change_direction = LaneChangeDirection.none
     self.lane_change_timer = 0.0
     self.lane_change_wait_timer = 0.0
+    self.nudgeless_used = False
     self.prev_one_blinker = False
     self.desire = log.Desire.none
 
@@ -33,11 +34,13 @@ class DesireHelper:
       self.lane_change_direction = LaneChangeDirection.none
       self.lane_change_timer = 0.0
       self.lane_change_wait_timer = 0.0
+      self.nudgeless_used = False
     else:
       if self.lane_change_state == LaneChangeState.off and one_blinker and not self.prev_one_blinker and not below_lane_change_speed:
         self.lane_change_state = LaneChangeState.preLaneChange
         self.lane_change_timer = 0.0
         self.lane_change_wait_timer = 0.0
+        self.nudgeless_used = False
         # Initialize lane change direction to prevent UI alert flicker
         self.lane_change_direction = self.get_lane_change_direction(carstate)
 
@@ -47,15 +50,26 @@ class DesireHelper:
 
         self.lane_change_wait_timer += DT_MDL
 
+        torque_applied = carstate.steeringPressed and \
+                         ((carstate.steeringTorque > 0 and self.lane_change_direction == LaneChangeDirection.left) or
+                          (carstate.steeringTorque < 0 and self.lane_change_direction == LaneChangeDirection.right))
+
         blindspot_detected = ((carstate.leftBlindspot and self.lane_change_direction == LaneChangeDirection.left) or
                               (carstate.rightBlindspot and self.lane_change_direction == LaneChangeDirection.right))
+
+        # Nudgeless fires once per blinker activation; subsequent changes in the same
+        # signal require a manual nudge so the car can't keep auto-changing lanes.
+        auto_allowed = not self.nudgeless_used and self.lane_change_wait_timer > LANE_CHANGE_NUDGELESS_DELAY
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
           self.lane_change_direction = LaneChangeDirection.none
           self.lane_change_timer = 0.0
           self.lane_change_wait_timer = 0.0
-        elif not blindspot_detected and self.lane_change_wait_timer > LANE_CHANGE_NUDGELESS_DELAY:
+          self.nudgeless_used = False
+        elif not blindspot_detected and (torque_applied or auto_allowed):
+          if auto_allowed:
+            self.nudgeless_used = True
           self.lane_change_state = LaneChangeState.laneChangeStarting
           self.lane_change_timer = 0.0
           self.lane_change_wait_timer = 0.0
