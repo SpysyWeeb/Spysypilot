@@ -23,11 +23,13 @@ from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware.hw import Paths
 
 
-def manager_init() -> None:
+def manager_init(boot_spinner: Spinner | None = None) -> None:
   save_bootlog()
 
   build_metadata = get_build_metadata()
 
+  if boot_spinner:
+    boot_spinner.log("Initializing params...")
   params = Params()
   params.clear_all(ParamKeyFlag.CLEAR_ON_MANAGER_START)
   params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
@@ -65,7 +67,9 @@ def manager_init() -> None:
   params.put("HardwareSerial", serial, block=True)
 
   # set dongle id
-  reg_res = register(show_spinner=True)
+  if boot_spinner:
+    boot_spinner.log("Registering device...")
+  reg_res = register(show_spinner=False)
   if reg_res:
     dongle_id = reg_res
   else:
@@ -89,7 +93,11 @@ def manager_init() -> None:
                        device=HARDWARE.get_device_type())
 
   # preimport all processes
+  if boot_spinner:
+    boot_spinner.log("Preloading processes...")
   for p in managed_processes.values():
+    if boot_spinner:
+      boot_spinner.log(f"  {p.name}")
     p.prepare()
 
 
@@ -105,7 +113,7 @@ def manager_cleanup() -> None:
   cloudlog.info("everything is dead")
 
 
-def manager_thread() -> None:
+def manager_thread(boot_spinner: Spinner | None = None) -> None:
   cloudlog.bind(daemon="manager")
   cloudlog.info("manager start")
   cloudlog.info({"environ": os.environ})
@@ -124,14 +132,14 @@ def manager_thread() -> None:
 
   params.put_bool("IsOffroad", True, block=True)
 
-  # Boot console spinner: shows process startup status until UI is live
-  boot_spinner = Spinner()
-  boot_spinner.log("Starting processes...")
+  if boot_spinner:
+    boot_spinner.log("Starting processes...")
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
 
   started_prev = False
   ignition_prev = False
-  boot_spinner_deadline = time.monotonic() + 20.0
+  # close boot spinner once the UI is alive (it would cover the spinner anyway)
+  boot_spinner_deadline = time.monotonic() + 30.0
 
   while True:
     sm.update(1000)
@@ -161,11 +169,11 @@ def manager_thread() -> None:
     print(running)
     cloudlog.debug(running)
 
-    # Log process status and close boot spinner once UI is up or timeout expires
+    # Log running processes; close spinner once UI is live (it covers the display anyway)
     if boot_spinner is not None:
       alive = [p.name for p in managed_processes.values() if p.proc and p.proc.is_alive()]
       if alive:
-        boot_spinner.log("Running: " + ", ".join(alive[:8]))
+        boot_spinner.log("Running: " + ", ".join(alive))
       ui_live = any(n in alive for n in ("selfdrived", "ui"))
       if ui_live or time.monotonic() > boot_spinner_deadline:
         boot_spinner.close()
@@ -197,20 +205,25 @@ def manager_thread() -> None:
 
 
 def main() -> None:
-  manager_init()
-  if os.getenv("PREPAREONLY") is not None:
-    return
-
-  # SystemExit on sigterm
-  signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(1))
-
+  boot_spinner = Spinner()
   try:
-    manager_thread()
-  except Exception:
-    traceback.print_exc()
-    sentry.capture_exception()
+    boot_spinner.log("Starting spysypilot...")
+    manager_init(boot_spinner)
+    if os.getenv("PREPAREONLY") is not None:
+      return
+
+    # SystemExit on sigterm
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(1))
+
+    try:
+      manager_thread(boot_spinner)  # closes boot_spinner internally when UI is live
+    except Exception:
+      traceback.print_exc()
+      sentry.capture_exception()
+    finally:
+      manager_cleanup()
   finally:
-    manager_cleanup()
+    boot_spinner.close()  # no-op if already closed by manager_thread
 
   params = Params()
   if params.get_bool("DoUninstall"):
