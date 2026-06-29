@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import pyray as rl
+import re
 import select
 import sys
 
@@ -15,17 +16,27 @@ if gui_app.big_ui():
   TEXTURE_SIZE = 360
   WRAPPED_SPACING = 50
   CENTERED_SPACING = 150
+  CONSOLE_FONT_SIZE = 32
+  CONSOLE_LINE_HEIGHT = 38
 else:
   PROGRESS_BAR_WIDTH = 268
   PROGRESS_BAR_HEIGHT = 10
   TEXTURE_SIZE = 140
   WRAPPED_SPACING = 10
   CENTERED_SPACING = 20
+  CONSOLE_FONT_SIZE = 18
+  CONSOLE_LINE_HEIGHT = 22
 DEGREES_PER_SECOND = 360.0  # one full rotation per second
 MARGIN_H = 100
 FONT_SIZE = 96
 LINE_HEIGHT = 104
 DARKGRAY = (55, 55, 55, 255)
+LOG_PREFIX = "LOG:"
+MAX_CONSOLE_LINES = 15
+MAX_LINE_CHARS = 140
+CONSOLE_MARGIN = 20
+CONSOLE_ALPHA = 191  # ~75% opacity
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[mKJH]')
 
 
 def clamp(value, min_value, max_value):
@@ -40,9 +51,16 @@ class Spinner(Widget):
     self._rotation = 0.0
     self._progress: int | None = None
     self._wrapped_lines: list[str] = []
+    self._console_lines: list[str] = []
 
   def set_text(self, text: str) -> None:
-    if text.isdigit():
+    if text.startswith(LOG_PREFIX):
+      line = ANSI_ESCAPE.sub('', text[len(LOG_PREFIX):]).strip()[:MAX_LINE_CHARS]
+      if line:
+        self._console_lines.append(line)
+        if len(self._console_lines) > MAX_CONSOLE_LINES:
+          self._console_lines.pop(0)
+    elif text.isdigit():
       self._progress = clamp(int(text), 0, 100)
       self._wrapped_lines = []
     else:
@@ -87,6 +105,17 @@ class Spinner(Widget):
         rl.draw_text_ex(gui_app.font(), line, rl.Vector2(center.x - text_size.x / 2, y_pos + i * LINE_HEIGHT),
                         FONT_SIZE, 0.0, rl.WHITE)
 
+    # Console log overlay at ~75% opacity anchored to the bottom of the screen
+    if self._console_lines:
+      n = len(self._console_lines)
+      total_h = n * CONSOLE_LINE_HEIGHT + CONSOLE_MARGIN * 2
+      bg_rect = rl.Rectangle(0, rect.height - total_h, rect.width, total_h)
+      rl.draw_rectangle_rec(bg_rect, rl.Color(0, 0, 0, 128))
+      text_color = rl.Color(255, 255, 255, CONSOLE_ALPHA)
+      for i, line in enumerate(self._console_lines):
+        y = rect.height - total_h + CONSOLE_MARGIN + i * CONSOLE_LINE_HEIGHT
+        rl.draw_text_ex(gui_app.font(), line, rl.Vector2(CONSOLE_MARGIN, y), CONSOLE_FONT_SIZE, 0.0, text_color)
+
 
 def _read_stdin():
   """Non-blocking read of available lines from stdin."""
@@ -107,8 +136,8 @@ def main():
   spinner = Spinner()
   for _ in gui_app.render():
     text_list = _read_stdin()
-    if text_list:
-      spinner.set_text(text_list[-1])
+    for text in text_list:
+      spinner.set_text(text)
 
     spinner.render(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
 
