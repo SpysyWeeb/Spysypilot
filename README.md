@@ -20,6 +20,8 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ⚠️ **Hot-swap button between Chill/Experimental mode** &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **Nudgeless lane changes** &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **Smooth stops** &nbsp;*(personal idea)*
+- ❌ **Better boot screen** — show console output during startup so hangs are immediately diagnosable &nbsp;*(personal idea)*
+- ❌ **Error log viewer** — button in dev menu to view the error log before/during/after a drive &nbsp;*(inspired by sunnypilot)*
 - ❌ **Quiet mode** &nbsp;*(inspired by sunnypilot)*
 - ❌ **Force Stops** &nbsp;*(inspired by IQPilot)*
 - ❌ **Earlier lead takeoffs** &nbsp;*(inspired by IQPilot)*
