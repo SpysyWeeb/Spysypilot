@@ -27,6 +27,9 @@ class Spinner:
   def update_progress(self, cur: float, total: float):
     self.update(str(round(100 * cur / total)))
 
+  def log(self, text: str):
+    self.update(f"LOG:{text}")
+
   def close(self):
     if self.spinner_proc is not None:
       self.spinner_proc.kill()
