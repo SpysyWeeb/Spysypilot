@@ -20,6 +20,8 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ⚠️ **Hot-swap button between Chill/Experimental mode** &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **Nudgeless lane changes** &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **Smooth stops** &nbsp;*(personal idea)*
+- ❌ **Swapped cruise speed adjustments** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(personal idea)*
+- ❌ **Exaggerated follow personalities** — aggressive targets ~1s following distance and reacts quickly; relaxed targets ~3s and smooths out inputs more than stock &nbsp;*(personal idea)*
 - ❌ **Better boot screen** — show console output during startup so hangs are immediately diagnosable &nbsp;*(personal idea)*
 - ❌ **Error log viewer** — button in dev menu to view the error log before/during/after a drive &nbsp;*(inspired by sunnypilot)*
 - ❌ **Quiet mode** &nbsp;*(inspired by sunnypilot)*
