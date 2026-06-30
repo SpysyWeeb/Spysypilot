@@ -18,7 +18,7 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 
 - ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **Hot-swap button between Chill/Experimental mode** &nbsp;*(inspired by sunnypilot)*
-- ⚠️ **Nudgeless lane changes** &nbsp;*(inspired by sunnypilot)*
+- ✅ **Nudgeless lane changes** &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **Smooth stops** &nbsp;*(personal idea)*
 - ⚠️ **Better boot screen** — show console output during startup so hangs are immediately diagnosable &nbsp;*(personal idea)*
 - ⚠️ **Error log viewer** — button in dev menu to view the error log before/during/after a drive &nbsp;*(inspired by sunnypilot)*
@@ -31,3 +31,4 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ❌ **Better longitudinal tune** &nbsp;*(personal idea)*
 - ❌ **Replace the live on-road view with a different screen showing live stats** &nbsp;*(personal idea)*
 - ❌ **Get Clip.py working on device with a route viewer** &nbsp;*(personal idea)*
+
