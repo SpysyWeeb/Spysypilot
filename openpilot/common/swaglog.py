@@ -143,11 +143,44 @@ log.addHandler(outhandler)
 # logs are sent through IPC before writing to disk to prevent disk I/O blocking
 log.addHandler(ipchandler)
 
-# Spysypilot: live plaintext feed for the terminal widget
+# Spysypilot: live plaintext feed for the terminal widget (offroad only, /tmp = tmpfs, clears on reboot)
+class _SpysyLiveHandler(logging.Handler):
+  _CHECK_INTERVAL = 1.0  # check onroad state at most once per second
+
+  def __init__(self):
+    super().__init__(level=logging.INFO)
+    self.setFormatter(logging.Formatter('[%(levelname)s] %(name)s: %(message)s'))
+    self._is_onroad = False
+    self._last_check = 0.0
+    self._params = None
+    try:
+      self._fp = open('/tmp/spysy_terminal.log', 'a')
+    except Exception:
+      self._fp = None
+
+  def _check_onroad(self) -> bool:
+    now = time.monotonic()
+    if now - self._last_check >= self._CHECK_INTERVAL:
+      self._last_check = now
+      try:
+        if self._params is None:
+          from openpilot.common.params import Params
+          self._params = Params()
+        self._is_onroad = self._params.get_bool("IsOnroad")
+      except Exception:
+        self._is_onroad = False
+    return self._is_onroad
+
+  def emit(self, record):
+    if self._fp is None or self._check_onroad():
+      return
+    try:
+      self._fp.write(self.format(record) + '\n')
+      self._fp.flush()
+    except Exception:
+      pass
+
 try:
-  _live_handler = logging.FileHandler('/tmp/spysy_terminal.log', mode='a', delay=True)
-  _live_handler.setLevel(logging.INFO)
-  _live_handler.setFormatter(logging.Formatter('[%(levelname)s] %(name)s: %(message)s'))
-  log.addHandler(_live_handler)
+  log.addHandler(_SpysyLiveHandler())
 except Exception:
   pass
