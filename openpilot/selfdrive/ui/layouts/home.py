@@ -70,10 +70,13 @@ class HomeLayout(Widget):
   def _setup_callbacks(self):
     self.update_alert.set_dismiss_callback(lambda: self._set_state(HomeLayoutState.HOME))
     self.offroad_alert.set_dismiss_callback(lambda: self._set_state(HomeLayoutState.HOME))
-    self._exp_mode_button.set_click_callback(lambda: self.settings_callback() if self.settings_callback else None)
+    self._exp_mode_button.set_click_callback(self._toggle_experimental_mode)
 
   def set_settings_callback(self, callback: Callable):
     self.settings_callback = callback
+
+  def _toggle_experimental_mode(self):
+    self.params.put_bool("ExperimentalMode", not self.params.get_bool("ExperimentalMode"))
 
   def _set_state(self, state: HomeLayoutState):
     # propagate show/hide events
