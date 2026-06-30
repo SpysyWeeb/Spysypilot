@@ -17,16 +17,16 @@ if gui_app.big_ui():
   TEXTURE_SIZE = 360
   WRAPPED_SPACING = 50
   CENTERED_SPACING = 150
-  CONSOLE_FONT_SIZE = 28
-  CONSOLE_LINE_HEIGHT = 34
+  CONSOLE_FONT_SIZE = 38
+  CONSOLE_LINE_HEIGHT = 46
 else:
   PROGRESS_BAR_WIDTH = 268
   PROGRESS_BAR_HEIGHT = 10
   TEXTURE_SIZE = 140
   WRAPPED_SPACING = 10
   CENTERED_SPACING = 20
-  CONSOLE_FONT_SIZE = 16
-  CONSOLE_LINE_HEIGHT = 20
+  CONSOLE_FONT_SIZE = 20
+  CONSOLE_LINE_HEIGHT = 25
 DEGREES_PER_SECOND = 360.0  # one full rotation per second
 MARGIN_H = 100
 FONT_SIZE = 96
@@ -52,7 +52,8 @@ class Spinner(Widget):
     self._rotation = 0.0
     self._progress: int | None = None
     self._wrapped_lines: list[str] = []
-    self._console_lines: list[str] = []
+    # Show a default line immediately so the screen isn't blank while waiting for FIFO
+    self._console_lines: list[str] = ["Starting spysypilot..."]
 
   def set_text(self, text: str) -> None:
     if text.startswith(LOG_PREFIX):
@@ -103,7 +104,7 @@ class Spinner(Widget):
         rl.draw_text_ex(gui_app.font(), line, rl.Vector2(center.x - text_size.x / 2, y_pos + i * LINE_HEIGHT),
                         FONT_SIZE, 0.0, rl.WHITE)
 
-    # Console log overlay at ~75% opacity — fill from the bottom up to the top of the screen
+    # Console log overlay at ~75% opacity — fill from bottom up, as many lines as the screen fits
     if self._console_lines:
       max_visible = max(1, (int(rect.height) - CONSOLE_MARGIN * 2) // CONSOLE_LINE_HEIGHT)
       visible = self._console_lines[-max_visible:]
