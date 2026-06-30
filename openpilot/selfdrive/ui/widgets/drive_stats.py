@@ -5,6 +5,7 @@ import pyray as rl
 from openpilot.common.params import Params
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.widgets import Widget
+from openpilot.system.ui.widgets.button import Button, ButtonStyle
 
 REFRESH_INTERVAL = 2.0
 
@@ -24,6 +25,7 @@ class DriveStatsWidget(Widget):
         self._last_drive: dict | None = None
         self._status: str = ""
         self._last_refresh = 0.0
+        self._refresh_btn = Button(lambda: "Update Stats", self._request_refresh, button_style=ButtonStyle.PRIMARY)
 
     def _render(self, rect: rl.Rectangle):
         now = time.monotonic()
@@ -61,6 +63,13 @@ class DriveStatsWidget(Widget):
 
         y = self._draw_section("OVERRIDES & DISENGAGEMENTS", x, y, w)
         self._draw_reasons(x, y, w)
+
+        btn_rect = rl.Rectangle(x, rect.y + rect.height - 110, w, 75)
+        self._refresh_btn.render(btn_rect)
+
+    def _request_refresh(self):
+        self._params.put_bool("SpysyForceStatsRefresh", True)
+        self._status = "Refresh requested..."
 
     def _reload(self):
         self._status = self._params.get("SpysyStatsStatus") or ""
