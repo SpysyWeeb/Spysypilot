@@ -486,6 +486,19 @@ def main() -> None:
         else:
           updater.fetch_update()
           write_time_to_param(params, "UpdaterLastFetchTime")
+          # If the fetched update matches what's already running, the cache was stale.
+          # Invalidate it and re-fetch once in case the remote has actually advanced.
+          if (Path(os.path.join(FINALIZED, ".overlay_consistent")).is_file() and
+              updater.get_commit_hash(FINALIZED) == updater.get_commit_hash(BASEDIR) and
+              updater.get_branch(FINALIZED) == updater.get_branch(BASEDIR)):
+            cloudlog.info("finalized update matches running version, stale cache — re-checking")
+            set_consistent_flag(False)
+            params.put("UpdaterState", "checking...", block=True)
+            updater.check_for_update()
+            if updater.update_available:
+              params.put("UpdaterState", "downloading...", block=True)
+              updater.fetch_update()
+              write_time_to_param(params, "UpdaterLastFetchTime")
         update_failed_count = 0
       except subprocess.CalledProcessError as e:
         cloudlog.event(
