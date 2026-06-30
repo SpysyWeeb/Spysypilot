@@ -139,7 +139,13 @@ class Sidebar(Widget):
 
   def _update_pwr_status(self, device_state):
     watts = device_state.powerDrawW
-    self._pwr_status.update(tr_noop("POWER"), f"{watts:.1f}W", Colors.GOOD)
+    if watts >= 15:
+      color = Colors.DANGER
+    elif watts >= 13:
+      color = Colors.WARNING
+    else:
+      color = Colors.GOOD
+    self._pwr_status.update(tr_noop("POWER"), f"{watts:.1f}W", color)
 
   def _handle_mouse_release(self, mouse_pos: MousePos):
     if rl.check_collision_point_rec(mouse_pos, SETTINGS_BTN):
