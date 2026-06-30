@@ -31,7 +31,6 @@ class AolDriver:
 
     self._cruise_available_prev = False
 
-    # Set panda alternativeExperience flags
 
   @property
   def available(self) -> bool:
