@@ -214,6 +214,7 @@ def main():
         unprocessed = sorted(name for name in all_routes if name not in processed)
 
         if not unprocessed:
+            params.put("SpysyStatsStatus", "Nothing to analyze")
             time.sleep(POLL_INTERVAL)
             continue
 
