@@ -215,6 +215,8 @@ class Device:
     self._interactive_timeout_callbacks: list[Callable] = []
     self._prev_timed_out = False
     self._awake: bool = True
+    self._params = Params()
+    self._screen_always_on: bool | None = None
 
     self._offroad_brightness: int = BACKLIGHT_OFFROAD
     self._last_brightness: int = 0
@@ -248,6 +250,11 @@ class Device:
 
   def update(self):
     self._start_brightness_thread()  # start thread after manager forks ui
+
+    always_on = self._params.get_bool("ScreenAlwaysOn")
+    if always_on != self._screen_always_on:
+      self._screen_always_on = always_on
+      self.set_override_interactive_timeout(999999 if always_on else None)
 
     # do initial reset
     if self._interaction_time <= 0:
