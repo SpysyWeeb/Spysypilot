@@ -50,7 +50,14 @@ class Spinner:
         self._owns_subprocess = True
       except OSError:
         return
-    # else: existing spinner is alive, we just attach to the FIFO
+
+    # Wait until the spinner subprocess opens the FIFO for reading (up to 15s).
+    # This blocks here so callers can immediately send messages after __init__ returns.
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+      if self._connect():
+        break
+      time.sleep(0.05)
 
   def _connect(self) -> bool:
     """Non-blocking attempt to open FIFO for writing. Returns True on success."""
