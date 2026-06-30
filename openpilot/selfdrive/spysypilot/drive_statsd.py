@@ -159,7 +159,14 @@ def main():
 
     try:
         raw = params.get("SpysyLifetimeStats")
-        lifetime = json.loads(raw) if raw else {'engaged_m': 0.0, 'disengaged_m': 0.0}
+        if raw:
+            stored = json.loads(raw)
+            lifetime = {
+                'engaged_m': stored.get('engaged_mi', 0.0) * METERS_PER_MILE,
+                'disengaged_m': stored.get('disengaged_mi', 0.0) * METERS_PER_MILE,
+            }
+        else:
+            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0}
     except Exception:
         lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0}
 
@@ -204,14 +211,14 @@ def main():
             'reasons': _reason_pcts(drive['events']),
         }
 
-        params.put("SpysyStatsStatus", "")
         # Write route name first to prevent double-counting if killed mid-write
         params.put("SpysyLastProcessedRoute", route_name)
         params.put("SpysyLastDriveStats", json.dumps(last_drive))
         params.put("SpysyLifetimeStats", json.dumps({
-            'engaged_m': lifetime['engaged_m'],
-            'disengaged_m': lifetime['disengaged_m'],
+            'engaged_mi': round(lifetime['engaged_m'] / METERS_PER_MILE, 2),
+            'disengaged_mi': round(lifetime['disengaged_m'] / METERS_PER_MILE, 2),
         }))
+        params.put("SpysyStatsStatus", f"Done analyzing · {route_name}")
         last_processed = route_name
         cloudlog.info(f"drive_statsd: done — {eng_pct:.1f}% engaged last drive")
 
