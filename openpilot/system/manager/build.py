@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import select as io_select
 import subprocess
 
 # NOTE: Do NOT import anything here that needs be built (e.g. params)
@@ -23,34 +24,47 @@ def build() -> None:
     compile_output.clear()
     if attempt > 0:
       spinner.log(f"Retrying build (attempt {attempt + 1})...")
-    with subprocess.Popen(["scons", *parallelism], cwd=BASEDIR, env={**os.environ, "PWD": BASEDIR}, stderr=subprocess.PIPE) as scons:
+    with subprocess.Popen(["scons", *parallelism], cwd=BASEDIR, env={**os.environ, "PWD": BASEDIR},
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as scons:
+      assert scons.stdout is not None
       assert scons.stderr is not None
 
-      # Read progress from stderr and update spinner
+      # Read from both stdout (compilation lines) and stderr (progress + warnings)
       while scons.poll() is None:
         try:
-          line = scons.stderr.readline()
-          if line is None:
-            continue
-          line = line.rstrip()
+          rlist, _, _ = io_select.select([scons.stdout, scons.stderr], [], [], 0.1)
+          for f in rlist:
+            line = f.readline()
+            if not line:
+              continue
+            line = line.rstrip()
 
-          prefix = b'progress: '
-          if line.startswith(prefix):
-            progress = float(line[len(prefix):])
-            spinner.update_progress(100 * min(1., progress / 100.), 100.)
-          elif len(line):
-            compile_output.append(line)
-            line_str = line.decode('utf8', 'replace')
-            spinner.log(line_str)
-            print(line_str)
+            if f is scons.stderr:
+              prefix = b'progress: '
+              if line.startswith(prefix):
+                progress = float(line[len(prefix):])
+                spinner.update_progress(100 * min(1., progress / 100.), 100.)
+              elif len(line):
+                compile_output.append(line)
+                line_str = line.decode('utf8', 'replace')
+                spinner.log(line_str)
+                print(line_str)
+            else:
+              # stdout: actual scons compilation lines
+              if len(line):
+                compile_output.append(line)
+                line_str = line.decode('utf8', 'replace')
+                spinner.log(line_str)
+                print(line_str)
         except Exception:
           pass
 
-      # Drain and close the pipe before retrying or returning.
-      for line in scons.stderr.read().split(b'\n'):
-        line = line.rstrip()
-        if len(line):
-          compile_output.append(line)
+      # Drain both pipes before retrying or returning
+      for f in (scons.stdout, scons.stderr):
+        for line in f.read().split(b'\n'):
+          line = line.rstrip()
+          if len(line):
+            compile_output.append(line)
 
     if scons.returncode == 0:
       if compile_output:
