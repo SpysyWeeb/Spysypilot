@@ -48,23 +48,35 @@ class DriveStatsWidget(Widget):
         y = self._draw_section("LIFETIME DRIVING", x, y, w)
         y = self._draw_stat_pair(
             x, y, w,
-            "Engaged",    self._fmt_mi('lifetime', 'engaged_mi'),    _GREEN,
-            "Disengaged", self._fmt_mi('lifetime', 'disengaged_mi'), _ORANGE,
+            "Engaged",
+            self._fmt_mi('lifetime', 'engaged_mi'),
+            self._lifetime_pct('engaged'),
+            _GREEN,
+            "Disengaged",
+            self._fmt_mi('lifetime', 'disengaged_mi'),
+            self._lifetime_pct('disengaged'),
+            _ORANGE,
         )
-        y += 38
+        y += 25
 
         y = self._draw_section("LAST DRIVE", x, y, w)
         y = self._draw_stat_pair(
             x, y, w,
-            "Engaged",    self._fmt_pct('engaged_pct'),    _GREEN,
-            "Disengaged", self._fmt_pct('disengaged_pct'), _ORANGE,
+            "Engaged",
+            self._fmt_mi('last', 'engaged_mi'),
+            self._fmt_pct('engaged_pct'),
+            _GREEN,
+            "Disengaged",
+            self._fmt_mi('last', 'disengaged_mi'),
+            self._fmt_pct('disengaged_pct'),
+            _ORANGE,
         )
-        y += 38
+        y += 25
 
         y = self._draw_section("OVERRIDES & DISENGAGEMENTS", x, y, w)
         self._draw_reasons(x, y, w)
 
-        btn_rect = rl.Rectangle(x, rect.y + rect.height - 110, w, 75)
+        btn_rect = rl.Rectangle(x, rect.y + rect.height - 120, w, 75)
         self._refresh_btn.render(btn_rect)
 
     def _request_refresh(self):
@@ -91,6 +103,17 @@ class DriveStatsWidget(Widget):
             return "—"
         return f"{self._last_drive.get(field, 0.0):.1f}%"
 
+    def _lifetime_pct(self, side: str) -> str:
+        if self._lifetime is None:
+            return "—"
+        eng = self._lifetime.get('engaged_mi', 0.0)
+        dis = self._lifetime.get('disengaged_mi', 0.0)
+        total = eng + dis
+        if total == 0:
+            return "—"
+        pct = eng / total * 100 if side == 'engaged' else dis / total * 100
+        return f"{pct:.1f}%"
+
     def _draw_section(self, title: str, x: int, y: int, w: int) -> int:
         font = gui_app.font(FontWeight.BOLD)
         rl.draw_text_ex(font, title, rl.Vector2(x, y), 34, 0, _BLUE)
@@ -99,16 +122,22 @@ class DriveStatsWidget(Widget):
         return line_y + 18
 
     def _draw_stat_pair(self, x: int, y: int, w: int,
-                        left_label: str, left_val: str, left_color: rl.Color,
-                        right_label: str, right_val: str, right_color: rl.Color) -> int:
+                        left_label: str, left_primary: str, left_secondary: str, left_color: rl.Color,
+                        right_label: str, right_primary: str, right_secondary: str, right_color: rl.Color) -> int:
         fn = gui_app.font(FontWeight.NORMAL)
         fb = gui_app.font(FontWeight.BOLD)
         half = w // 2
-        rl.draw_text_ex(fn, left_label,  rl.Vector2(x,        y),      38, 0, _DIM)
-        rl.draw_text_ex(fn, right_label, rl.Vector2(x + half, y),      38, 0, _DIM)
-        rl.draw_text_ex(fb, left_val,    rl.Vector2(x,        y + 48), 54, 0, left_color)
-        rl.draw_text_ex(fb, right_val,   rl.Vector2(x + half, y + 48), 54, 0, right_color)
-        return y + 118
+
+        rl.draw_text_ex(fn, left_label,  rl.Vector2(x,        y), 38, 0, _DIM)
+        rl.draw_text_ex(fn, right_label, rl.Vector2(x + half, y), 38, 0, _DIM)
+
+        rl.draw_text_ex(fb, left_primary,  rl.Vector2(x,        y + 46), 52, 0, left_color)
+        rl.draw_text_ex(fb, right_primary, rl.Vector2(x + half, y + 46), 52, 0, right_color)
+
+        rl.draw_text_ex(fn, left_secondary,  rl.Vector2(x,        y + 106), 38, 0, left_color)
+        rl.draw_text_ex(fn, right_secondary, rl.Vector2(x + half, y + 106), 38, 0, right_color)
+
+        return y + 152
 
     def _draw_reasons(self, x: int, y: int, w: int):
         fn = gui_app.font(FontWeight.NORMAL)
@@ -119,31 +148,32 @@ class DriveStatsWidget(Widget):
             if sum(r.values()) == 0:
                 rl.draw_text_ex(fn, "No interruptions recorded", rl.Vector2(x, y + 12), 40, 0, _DIM)
                 return
-            overrides = [("Gas override", f"{r.get('gas', 0.0):.0f}%"),
-                         ("Steering",     f"{r.get('steer', 0.0):.0f}%")]
-            disengages = [("Brake",  f"{r.get('brake', 0.0):.0f}%"),
-                          ("Cancel", f"{r.get('cancel', 0.0):.0f}%")]
+            overrides  = [("Accel",    f"{r.get('gas', 0.0):.0f}%"),
+                          ("Steering", f"{r.get('steer', 0.0):.0f}%")]
+            disengages = [("Braking", f"{r.get('brake', 0.0):.0f}%"),
+                          ("Cancel",  f"{r.get('cancel', 0.0):.0f}%")]
         else:
             rl.draw_text_ex(fn, "No drive data yet", rl.Vector2(x, y + 12), 40, 0, _DIM)
             return
 
         half = w // 2
         mid_x = x + half
+        inner_pad = 12  # equal gap on each side of the divider
 
-        # Vertical divider
+        # Vertical divider at true center
         rl.draw_line_ex(rl.Vector2(mid_x, y), rl.Vector2(mid_x, y + 116), 1, _DIVIDER)
 
-        # Sub-headers
-        rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x,         y), 30, 0, _DIM)
-        rl.draw_text_ex(fn, "Disengagements", rl.Vector2(mid_x + 24, y), 30, 0, _DIM)
+        # Sub-headers — equal distance from divider on each side
+        rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x,                  y), 30, 0, _DIM)
+        rl.draw_text_ex(fn, "Disengagements", rl.Vector2(mid_x + inner_pad,  y), 30, 0, _DIM)
 
-        col_w = half // 2
+        col_w = (half - inner_pad) // 2
         row_y = y + 38
         for i, (label, val) in enumerate(overrides):
             cx = x + i * col_w
             rl.draw_text_ex(fn, label, rl.Vector2(cx, row_y),      34, 0, _DIM)
             rl.draw_text_ex(fb, val,   rl.Vector2(cx, row_y + 42), 50, 0, rl.WHITE)
         for i, (label, val) in enumerate(disengages):
-            cx = mid_x + 24 + i * col_w
+            cx = mid_x + inner_pad + i * col_w
             rl.draw_text_ex(fn, label, rl.Vector2(cx, row_y),      34, 0, _DIM)
             rl.draw_text_ex(fb, val,   rl.Vector2(cx, row_y + 42), 50, 0, rl.WHITE)

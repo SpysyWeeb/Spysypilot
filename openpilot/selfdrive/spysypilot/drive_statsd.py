@@ -135,7 +135,7 @@ def _parse_route(log_root: str, seg_dirs: list[str], params: Params, route_name:
                    'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0}}
     n = len(seg_dirs)
     for i, seg_dir in enumerate(seg_dirs, 1):
-        params.put("SpysyStatsStatus", f"Analyzing {route_name} · seg {i}/{n}")
+        params.put("SpysyStatsStatus", f"Analyzing {route_name} - seg {i}/{n}")
         seg = _parse_segment(os.path.join(log_root, seg_dir))
         if not seg:
             continue
@@ -223,7 +223,7 @@ def main():
             'engaged_mi': round(lifetime['engaged_m'] / METERS_PER_MILE, 2),
             'disengaged_mi': round(lifetime['disengaged_m'] / METERS_PER_MILE, 2),
         }))
-        params.put("SpysyStatsStatus", f"Done analyzing · {route_name}")
+        params.put("SpysyStatsStatus", f"Done analyzing - {route_name}")
         last_processed = route_name
         cloudlog.info(f"drive_statsd: done — {eng_pct:.1f}% engaged last drive")
 
