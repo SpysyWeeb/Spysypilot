@@ -18,6 +18,7 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 
 - ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control &nbsp;*(inspired by sunnypilot)*
 - ✅ **Hot-swap button between Chill/Experimental mode** — a button on the main driving screen toggles between Chill and Experimental longitudinal mode without going into settings &nbsp;*(inspired by sunnypilot)*
+- ⚠️ **Side panel quick-action buttons** — a growing column of quick-access buttons on the driving screen; currently includes a screen-always-on toggle; planned additions: an error log shortcut that opens the viewer directly, and an update button that also reflects live download/install status &nbsp;*(personal idea)*
 - ✅ **Nudgeless lane changes** — lane changes trigger on turn signal alone without requiring a steering nudge to confirm &nbsp;*(inspired by sunnypilot)*
 - ✅\* **Smooth stops** — softer deceleration curve on approach to a full stop, reducing the lurch the Palisade tends to have at the very end of a stop &nbsp;*(personal idea)*
 - ✅\* **Better boot screen** — show console output during startup so hangs are immediately diagnosable &nbsp;*(personal idea)*
