@@ -32,7 +32,7 @@ def _find_rlog(seg_path: str) -> Optional[str]:
 
 
 def _list_routes(log_root: str) -> dict[str, list[str]]:
-    """Return {route_name: [seg_dir, ...]} for all routes in log_root."""
+    """Return {route_name: [seg_dir, ...]} sorted within each route."""
     routes: dict[str, list[str]] = {}
     try:
         for entry in os.listdir(log_root):
@@ -48,24 +48,6 @@ def _list_routes(log_root: str) -> dict[str, list[str]]:
     for segs in routes.values():
         segs.sort(key=lambda d: int(d.rsplit('--', 1)[1]) if d.rsplit('--', 1)[1].isdigit() else 0)
     return routes
-
-
-def _most_recent_route(log_root: str) -> Optional[tuple[str, list[str]]]:
-    routes = _list_routes(log_root)
-    if not routes:
-        return None
-
-    def _mtime(item: tuple[str, list[str]]) -> float:
-        _, segs = item
-        times = []
-        for seg in segs:
-            try:
-                times.append(os.path.getmtime(os.path.join(log_root, seg)))
-            except OSError:
-                pass
-        return max(times) if times else 0.0
-
-    return max(routes.items(), key=_mtime)
 
 
 def _parse_segment(seg_path: str) -> dict:
@@ -130,12 +112,14 @@ def _parse_segment(seg_path: str) -> dict:
     }
 
 
-def _parse_route(log_root: str, seg_dirs: list[str], params: Params, route_name: str) -> dict:
+def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
+                 route_name: str, route_idx: int, route_total: int) -> dict:
     total: dict = {'engaged_m': 0.0, 'disengaged_m': 0.0,
                    'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0}}
     n = len(seg_dirs)
     for i, seg_dir in enumerate(seg_dirs, 1):
-        params.put("SpysyStatsStatus", f"Analyzing {route_name} - seg {i}/{n}")
+        params.put("SpysyStatsStatus",
+                   f"Route {route_idx}/{route_total} - seg {i}/{n}")
         seg = _parse_segment(os.path.join(log_root, seg_dir))
         if not seg:
             continue
@@ -153,79 +137,102 @@ def _reason_pcts(events: dict) -> dict:
     return {k: round(v / total * 100, 1) for k, v in events.items()}
 
 
-def main():
-    params = Params()
-    log_root = Paths.log_root()
-
+def _load_lifetime(params: Params) -> dict:
     try:
         raw = params.get("SpysyLifetimeStats")
         if raw:
             stored = json.loads(raw)
-            lifetime = {
+            return {
                 'engaged_m': stored.get('engaged_mi', 0.0) * METERS_PER_MILE,
                 'disengaged_m': stored.get('disengaged_mi', 0.0) * METERS_PER_MILE,
             }
-        else:
-            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0}
     except Exception:
-        lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0}
+        pass
+    return {'engaged_m': 0.0, 'disengaged_m': 0.0}
 
-    last_processed = params.get("SpysyLastProcessedRoute") or ""
+
+def _save_lifetime(params: Params, lifetime: dict):
+    params.put("SpysyLifetimeStats", json.dumps({
+        'engaged_mi': round(lifetime['engaged_m'] / METERS_PER_MILE, 2),
+        'disengaged_mi': round(lifetime['disengaged_m'] / METERS_PER_MILE, 2),
+    }))
+
+
+def _load_processed(params: Params) -> set[str]:
+    try:
+        raw = params.get("SpysyProcessedRoutes")
+        return set(json.loads(raw)) if raw else set()
+    except Exception:
+        return set()
+
+
+def _save_processed(params: Params, processed: set[str]):
+    params.put("SpysyProcessedRoutes", json.dumps(sorted(processed)))
+
+
+def main():
+    params = Params()
+    log_root = Paths.log_root()
+
+    lifetime = _load_lifetime(params)
+    processed = _load_processed(params)
 
     while True:
+        # Force refresh: wipe accumulated stats and reprocess everything
         if params.get_bool("SpysyForceStatsRefresh"):
             params.put_bool("SpysyForceStatsRefresh", False)
-            last_processed = ""
-            cloudlog.info("drive_statsd: manual refresh requested")
+            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0}
+            processed = set()
+            _save_lifetime(params, lifetime)
+            _save_processed(params, processed)
+            cloudlog.info("drive_statsd: force refresh - reprocessing all routes")
 
-        result = _most_recent_route(log_root)
-        if result is None or result[0] == last_processed:
+        all_routes = _list_routes(log_root)
+
+        # Prune stale entries for routes the deleter has already removed
+        processed &= set(all_routes.keys())
+
+        unprocessed = sorted(name for name in all_routes if name not in processed)
+
+        if not unprocessed:
             time.sleep(POLL_INTERVAL)
             continue
 
-        route_name, seg_dirs = result
-        cloudlog.info(f"drive_statsd: processing route {route_name} ({len(seg_dirs)} segments)")
+        cloudlog.info(f"drive_statsd: {len(unprocessed)} unprocessed route(s)")
 
-        # Allow loggerd a moment to finish flushing the final segment
-        time.sleep(5.0)
+        last_drive: Optional[dict] = None
+        total_routes = len(unprocessed)
 
-        # Re-fetch in case more segments appeared during the wait
-        result = _most_recent_route(log_root)
-        if result is None:
-            time.sleep(POLL_INTERVAL)
-            continue
-        route_name, seg_dirs = result
+        for idx, route_name in enumerate(unprocessed, 1):
+            seg_dirs = all_routes[route_name]
+            cloudlog.info(f"drive_statsd: processing {route_name} ({len(seg_dirs)} seg(s))")
 
-        if route_name == last_processed:
-            time.sleep(POLL_INTERVAL)
-            continue
+            drive = _parse_route(log_root, seg_dirs, params, route_name, idx, total_routes)
 
-        drive = _parse_route(log_root, seg_dirs, params, route_name)
+            lifetime['engaged_m'] += drive['engaged_m']
+            lifetime['disengaged_m'] += drive['disengaged_m']
 
-        lifetime['engaged_m'] += drive['engaged_m']
-        lifetime['disengaged_m'] += drive['disengaged_m']
+            total_m = drive['engaged_m'] + drive['disengaged_m']
+            eng_pct = round(drive['engaged_m'] / total_m * 100, 1) if total_m > 0 else 0.0
 
-        total_m = drive['engaged_m'] + drive['disengaged_m']
-        eng_pct = round(drive['engaged_m'] / total_m * 100, 1) if total_m > 0 else 0.0
+            last_drive = {
+                'engaged_mi': round(drive['engaged_m'] / METERS_PER_MILE, 2),
+                'disengaged_mi': round(drive['disengaged_m'] / METERS_PER_MILE, 2),
+                'engaged_pct': eng_pct,
+                'disengaged_pct': round(100.0 - eng_pct, 1),
+                'reasons': _reason_pcts(drive['events']),
+            }
 
-        last_drive = {
-            'engaged_mi': round(drive['engaged_m'] / METERS_PER_MILE, 2),
-            'disengaged_mi': round(drive['disengaged_m'] / METERS_PER_MILE, 2),
-            'engaged_pct': eng_pct,
-            'disengaged_pct': round(100.0 - eng_pct, 1),
-            'reasons': _reason_pcts(drive['events']),
-        }
+            processed.add(route_name)
+            # Persist after every route so a crash mid-run doesn't lose progress
+            _save_processed(params, processed)
+            _save_lifetime(params, lifetime)
 
-        # Write route name first to prevent double-counting if killed mid-write
-        params.put("SpysyLastProcessedRoute", route_name)
-        params.put("SpysyLastDriveStats", json.dumps(last_drive))
-        params.put("SpysyLifetimeStats", json.dumps({
-            'engaged_mi': round(lifetime['engaged_m'] / METERS_PER_MILE, 2),
-            'disengaged_mi': round(lifetime['disengaged_m'] / METERS_PER_MILE, 2),
-        }))
-        params.put("SpysyStatsStatus", f"Done analyzing - {route_name}")
-        last_processed = route_name
-        cloudlog.info(f"drive_statsd: done — {eng_pct:.1f}% engaged last drive")
+        if last_drive:
+            params.put("SpysyLastDriveStats", json.dumps(last_drive))
+
+        params.put("SpysyStatsStatus", f"Done analyzing - {unprocessed[-1]}")
+        cloudlog.info(f"drive_statsd: done - processed {total_routes} route(s)")
 
         time.sleep(POLL_INTERVAL)
 
