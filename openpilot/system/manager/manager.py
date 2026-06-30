@@ -207,7 +207,7 @@ def manager_thread(boot_spinner: Spinner | None = None) -> None:
 def main() -> None:
   boot_spinner = Spinner()
   try:
-    boot_spinner.log("Starting spysypilot...")
+    boot_spinner.log("Initializing...")
     manager_init(boot_spinner)
     if os.getenv("PREPAREONLY") is not None:
       return
