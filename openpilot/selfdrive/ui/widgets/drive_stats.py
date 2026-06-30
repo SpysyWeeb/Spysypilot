@@ -8,12 +8,13 @@ from openpilot.system.ui.widgets import Widget
 
 REFRESH_INTERVAL = 2.0
 
-_BG      = rl.Color(40, 40, 40, 255)
-_BLUE    = rl.Color(70, 91, 234, 255)
-_GREEN   = rl.Color(70, 200, 100, 255)
-_ORANGE  = rl.Color(234, 160, 50, 255)
-_DIM     = rl.Color(255, 255, 255, 150)
-_DIVIDER = rl.Color(255, 255, 255, 35)
+_BG       = rl.Color(40, 40, 40, 255)
+_BLUE     = rl.Color(70, 91, 234, 255)
+_GREEN    = rl.Color(70, 200, 100, 255)
+_ORANGE   = rl.Color(234, 160, 50, 255)
+_OVERRIDE = rl.Color(180, 130, 255, 255)
+_DIM      = rl.Color(255, 255, 255, 150)
+_DIVIDER  = rl.Color(255, 255, 255, 35)
 
 
 class DriveStatsWidget(Widget):
@@ -55,63 +56,82 @@ class DriveStatsWidget(Widget):
         y = self._draw_stat_pair(
             x, y, w,
             "Engaged",
-            self._lifetime_pct('engaged'),
-            self._fmt_mi('lifetime', 'engaged_mi'),
+            self._lifetime_pct("engaged"),
+            self._fmt_lifetime_mi("engaged_mi"),
             _GREEN,
             "Disengaged",
-            self._lifetime_pct('disengaged'),
-            self._fmt_mi('lifetime', 'disengaged_mi'),
+            self._lifetime_pct("disengaged"),
+            self._fmt_lifetime_mi("disengaged_mi"),
             _ORANGE,
         )
-        y += 25
+        y = self._draw_override_row(x, y + 18, w,
+                                    self._lifetime_override_pct(),
+                                    self._fmt_lifetime_mi("override_mi"))
+        y += 20
 
         y = self._draw_section("LAST DRIVE", x, y, w)
         y = self._draw_stat_pair(
             x, y, w,
             "Engaged",
-            self._fmt_pct('engaged_pct'),
-            self._fmt_mi('last', 'engaged_mi'),
+            self._fmt_pct("engaged_pct"),
+            self._fmt_drive_mi("engaged_mi"),
             _GREEN,
             "Disengaged",
-            self._fmt_pct('disengaged_pct'),
-            self._fmt_mi('last', 'disengaged_mi'),
+            self._fmt_pct("disengaged_pct"),
+            self._fmt_drive_mi("disengaged_mi"),
             _ORANGE,
         )
-        y += 25
+        y = self._draw_override_row(x, y + 18, w,
+                                    self._fmt_pct("override_pct"),
+                                    self._fmt_drive_mi("override_mi"))
+        y += 20
 
         y = self._draw_section("OVERRIDES & DISENGAGEMENTS", x, y, w)
         self._draw_reasons(x, y, w)
 
     def _reload(self):
         self._status = self._params.get("SpysyStatsStatus") or ""
-        for attr, key in (('_lifetime', 'SpysyLifetimeStats'), ('_last_drive', 'SpysyLastDriveStats')):
+        for attr, key in (("_lifetime", "SpysyLifetimeStats"), ("_last_drive", "SpysyLastDriveStats")):
             raw = self._params.get(key)
             try:
                 setattr(self, attr, json.loads(raw) if raw else None)
             except Exception:
                 setattr(self, attr, None)
 
-    def _fmt_mi(self, source: str, field: str) -> str:
-        data = self._lifetime if source == 'lifetime' else self._last_drive
-        if data is None:
+    def _fmt_lifetime_mi(self, field: str) -> str:
+        if self._lifetime is None or field not in self._lifetime:
             return "—"
-        return f"{data.get(field, 0.0):,.1f} mi"
+        return f"{self._lifetime.get(field, 0.0):,.1f} mi"
+
+    def _fmt_drive_mi(self, field: str) -> str:
+        if self._last_drive is None or field not in self._last_drive:
+            return "—"
+        return f"{self._last_drive.get(field, 0.0):,.1f} mi"
 
     def _fmt_pct(self, field: str) -> str:
-        if self._last_drive is None:
+        if self._last_drive is None or field not in self._last_drive:
             return "—"
         return f"{self._last_drive.get(field, 0.0):.1f}%"
 
     def _lifetime_pct(self, side: str) -> str:
         if self._lifetime is None:
             return "—"
-        eng = self._lifetime.get('engaged_mi', 0.0)
-        dis = self._lifetime.get('disengaged_mi', 0.0)
+        eng = self._lifetime.get("engaged_mi", 0.0)
+        dis = self._lifetime.get("disengaged_mi", 0.0)
         total = eng + dis
         if total == 0:
             return "—"
-        pct = eng / total * 100 if side == 'engaged' else dis / total * 100
+        pct = eng / total * 100 if side == "engaged" else dis / total * 100
         return f"{pct:.1f}%"
+
+    def _lifetime_override_pct(self) -> str:
+        if self._lifetime is None or "override_mi" not in self._lifetime:
+            return "—"
+        eng = self._lifetime.get("engaged_mi", 0.0)
+        ovr = self._lifetime.get("override_mi", 0.0)
+        if eng == 0:
+            return "—"
+        return f"{ovr / eng * 100:.1f}%"
 
     def _draw_section(self, title: str, x: int, y: int, w: int) -> int:
         font = gui_app.font(FontWeight.BOLD)
@@ -138,12 +158,20 @@ class DriveStatsWidget(Widget):
 
         return y + 152
 
+    def _draw_override_row(self, x: int, y: int, w: int, pct: str, miles: str) -> int:
+        fn = gui_app.font(FontWeight.NORMAL)
+        fb = gui_app.font(FontWeight.BOLD)
+        rl.draw_text_ex(fn, "Override (of engaged)", rl.Vector2(x, y + 8), 32, 0, _DIM)
+        rl.draw_text_ex(fb, pct,   rl.Vector2(x + w // 2,     y),      46, 0, _OVERRIDE)
+        rl.draw_text_ex(fn, miles, rl.Vector2(x + w * 3 // 4, y + 12), 32, 0, _OVERRIDE)
+        return y + 58
+
     def _draw_reasons(self, x: int, y: int, w: int):
         fn = gui_app.font(FontWeight.NORMAL)
         fb = gui_app.font(FontWeight.BOLD)
 
-        if self._last_drive and self._last_drive.get('reasons'):
-            r = self._last_drive['reasons']
+        if self._last_drive and self._last_drive.get("reasons"):
+            r = self._last_drive["reasons"]
             if sum(r.values()) == 0:
                 rl.draw_text_ex(fn, "No interruptions recorded", rl.Vector2(x, y + 12), 40, 0, _DIM)
                 return
