@@ -22,6 +22,7 @@ class DriveStatsWidget(Widget):
         self._params = Params()
         self._lifetime: dict | None = None
         self._last_drive: dict | None = None
+        self._status: str = ""
         self._last_refresh = 0.0
 
     def _render(self, rect: rl.Rectangle):
@@ -36,6 +37,11 @@ class DriveStatsWidget(Widget):
         x = int(rect.x + pad)
         w = int(rect.width - pad * 2)
         y = int(rect.y + 45)
+
+        if self._status:
+            fn = gui_app.font(FontWeight.NORMAL)
+            rl.draw_text_ex(fn, self._status, rl.Vector2(x, y), 32, 0, _DIM)
+            y += 48
 
         y = self._draw_section("LIFETIME DRIVING", x, y, w)
         y = self._draw_stat_pair(
@@ -57,6 +63,7 @@ class DriveStatsWidget(Widget):
         self._draw_reasons(x, y, w)
 
     def _reload(self):
+        self._status = self._params.get("SpysyStatsStatus") or ""
         for attr, key in (('_lifetime', 'SpysyLifetimeStats'), ('_last_drive', 'SpysyLastDriveStats')):
             raw = self._params.get(key)
             try:
