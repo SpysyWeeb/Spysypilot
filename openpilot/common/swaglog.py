@@ -142,3 +142,12 @@ ipchandler = UnixDomainSocketHandler(SwagFormatter(log))
 log.addHandler(outhandler)
 # logs are sent through IPC before writing to disk to prevent disk I/O blocking
 log.addHandler(ipchandler)
+
+# Spysypilot: live plaintext feed for the terminal widget
+try:
+  _live_handler = logging.FileHandler('/tmp/spysy_terminal.log', mode='a', delay=True)
+  _live_handler.setLevel(logging.INFO)
+  _live_handler.setFormatter(logging.Formatter('[%(levelname)s] %(name)s: %(message)s'))
+  log.addHandler(_live_handler)
+except Exception:
+  pass
