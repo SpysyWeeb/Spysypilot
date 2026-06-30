@@ -63,6 +63,8 @@ class SoftwareLayout(Widget):
     # Track waiting-for-updater transition to avoid brief re-enable while still idle
     self._waiting_for_updater = False
     self._waiting_start_ts: float = 0.0
+    # Set when user taps CHECK so _update_state can auto-fire the download once check finds an update
+    self._auto_fetch_pending = False
 
     # Branch switcher
     self._branch_btn = button_item(lambda: tr("Target Branch"), lambda: tr("SELECT"), callback=self._on_select_branch)
@@ -118,6 +120,11 @@ class SoftwareLayout(Widget):
       elif fetch_available:
         self._download_btn.action_item.set_value(tr("update available"))
         self._download_btn.action_item.set_text(tr("DOWNLOAD"))
+        if self._auto_fetch_pending:
+          self._auto_fetch_pending = False
+          self._waiting_for_updater = True
+          self._waiting_start_ts = time.monotonic()
+          os.system("pkill -SIGHUP -f openpilot.system.updated.updated")
       else:
         last_update = ui_state.params.get("LastUpdateTime")
         if last_update:
@@ -152,12 +159,16 @@ class SoftwareLayout(Widget):
       self._install_btn.set_visible(False)
 
   def _on_download_update(self):
-    # Always kick off a full check+download regardless of whether the button says CHECK or DOWNLOAD.
-    # SIGHUP tells the daemon to fetch (not just check), so the user never has to tap twice.
     self._download_btn.action_item.set_enabled(False)
     self._waiting_for_updater = True
     self._waiting_start_ts = time.monotonic()
-    os.system("pkill -SIGHUP -f openpilot.system.updated.updated")
+    if self._download_btn.action_item.text == tr("CHECK"):
+      # Check only — if an update is found, _update_state auto-fires the download
+      self._auto_fetch_pending = True
+      os.system("pkill -SIGUSR1 -f openpilot.system.updated.updated")
+    else:
+      # Update already confirmed available, go straight to download
+      os.system("pkill -SIGHUP -f openpilot.system.updated.updated")
 
   def _on_uninstall(self):
     def handle_uninstall_confirmation(result: DialogResult):
