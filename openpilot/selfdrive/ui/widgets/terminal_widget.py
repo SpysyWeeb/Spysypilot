@@ -38,6 +38,7 @@ class TerminalWidget(Widget):
         self._lines: collections.deque[tuple[str, rl.Color]] = collections.deque(maxlen=MAX_LINES)
         self._lock = threading.Lock()
         self._running = False
+        self._openpilot_proc: subprocess.Popen | None = None
         self._journal_proc: subprocess.Popen | None = None
         self._grep_proc: subprocess.Popen | None = None
         self._background_tap_callback = None
@@ -78,12 +79,13 @@ class TerminalWidget(Widget):
 
     def _stop(self) -> None:
         self._running = False
-        for proc in (self._grep_proc, self._journal_proc):
+        for proc in (self._openpilot_proc, self._grep_proc, self._journal_proc):
             if proc is not None:
                 try:
                     proc.terminate()
                 except Exception:
                     pass
+        self._openpilot_proc = None
         self._grep_proc = None
         self._journal_proc = None
 
@@ -98,6 +100,7 @@ class TerminalWidget(Widget):
                 self._lines.append(('[tail not found]', _YELLOW))
             return
 
+        self._openpilot_proc = proc
         for line in proc.stdout:
             if not self._running:
                 proc.terminate()
