@@ -114,6 +114,7 @@ void fill_panda_state(cereal::PandaState::Builder &ps, cereal::PandaState::Panda
   ps.setIgnitionLine(health.ignition_line_pkt);
   ps.setIgnitionCan(health.ignition_can_pkt);
   ps.setControlsAllowed(health.controls_allowed_pkt);
+  ps.setLateralAllowed(health.lateral_allowed_pkt);
   ps.setTxBufferOverflow(health.tx_buffer_overflow_pkt);
   ps.setRxBufferOverflow(health.rx_buffer_overflow_pkt);
   ps.setPandaType(hw_type);
@@ -258,7 +259,7 @@ void send_peripheral_state(Panda *panda, PubMaster *pm) {
   pm->send("peripheralState", msg);
 }
 
-void process_panda_state(Panda *panda, PubMaster *pm, bool engaged, bool is_onroad, bool spoofing_started) {
+void process_panda_state(Panda *panda, PubMaster *pm, bool engaged, bool engaged_aol, bool is_onroad, bool spoofing_started) {
   auto ignition_opt = send_panda_states(pm, panda, is_onroad, spoofing_started);
   if (!ignition_opt) {
     LOGE("Failed to get ignition_opt");
@@ -273,7 +274,7 @@ void process_panda_state(Panda *panda, PubMaster *pm, bool engaged, bool is_onro
     }
   }
 
-  panda->send_heartbeat(engaged);
+  panda->send_heartbeat(engaged, engaged_aol);
 }
 
 void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control, bool is_onroad) {
@@ -366,10 +367,11 @@ void pandad_run(Panda *panda) {
   std::thread send_thread(can_send_thread, panda, fake_send);
 
   RateKeeper rk("pandad", 100);
-  SubMaster sm({"selfdriveState", "deviceState"});
+  SubMaster sm({"selfdriveState", "deviceState", "spysydriveStateSP"});
   PubMaster pm({"can", "pandaStates", "peripheralState"});
   PandaSafety panda_safety(panda);
   bool engaged = false;
+  bool engaged_aol = false;
   bool is_onroad = false;
 
   // Main loop: receive CAN first, then process lower priority panda and peripheral state.
@@ -385,10 +387,11 @@ void pandad_run(Panda *panda) {
     if (rk.frame() % 10 == 0) {
       sm.update(0);
       engaged = sm.allAliveAndValid({"selfdriveState"}) && sm["selfdriveState"].getSelfdriveState().getEnabled();
+      engaged_aol = sm.allAliveAndValid({"spysydriveStateSP"}) && sm["spysydriveStateSP"].getSpysydriveStateSP().getAol().getEnabled();
       if (sm.updated("deviceState")) {
         is_onroad = sm["deviceState"].getDeviceState().getStarted();
       }
-      process_panda_state(panda, &pm, engaged, is_onroad, spoofing_started);
+      process_panda_state(panda, &pm, engaged, engaged_aol, is_onroad, spoofing_started);
       panda_safety.configureSafetyMode(is_onroad);
     }
 
