@@ -139,12 +139,11 @@ class TerminalWidget(Widget):
 
         max_visible = max(1, int((rect.height - PAD * 2) / LINE_H))
         visible = lines[-max_visible:]
-        max_chars = max(1, int((rect.width - PAD * 2) / (FONT_SIZE * 0.56)))
 
         rl.begin_scissor_mode(int(rect.x), int(rect.y), int(rect.width), int(rect.height))
         y = int(rect.y + PAD)
         x = int(rect.x + PAD)
         for text, color in visible:
-            rl.draw_text_ex(fn, text[:max_chars], rl.Vector2(x, y), FONT_SIZE, 0, color)
+            rl.draw_text_ex(fn, text, rl.Vector2(x, y), FONT_SIZE, 0, color)
             y += LINE_H
         rl.end_scissor_mode()
