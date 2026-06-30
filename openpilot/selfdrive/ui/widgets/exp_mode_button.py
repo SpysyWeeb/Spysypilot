@@ -19,6 +19,9 @@ class ExperimentalModeButton(Widget):
     self.chill_pixmap = gui_app.texture("icons/couch.png", self.img_width, self.img_width)
     self.experimental_pixmap = gui_app.texture("icons/experimental_grey.png", self.img_width, self.img_width)
 
+  def _update_state(self) -> None:
+    self.experimental_mode = self.params.get_bool("ExperimentalMode")
+
   def show_event(self):
     super().show_event()
     self.experimental_mode = self.params.get_bool("ExperimentalMode")
