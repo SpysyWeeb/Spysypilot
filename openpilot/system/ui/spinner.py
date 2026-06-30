@@ -53,7 +53,7 @@ class Spinner(Widget):
     self._progress: int | None = None
     self._wrapped_lines: list[str] = []
     # Show a default line immediately so the screen isn't blank while waiting for FIFO
-    self._console_lines: list[str] = ["Starting spysypilot..."]
+    self._console_lines: list[str] = ["Booting up..."]
 
   def set_text(self, text: str) -> None:
     if text.startswith(LOG_PREFIX):
