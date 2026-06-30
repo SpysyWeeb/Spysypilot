@@ -49,12 +49,12 @@ class DriveStatsWidget(Widget):
         y = self._draw_stat_pair(
             x, y, w,
             "Engaged",
-            self._fmt_mi('lifetime', 'engaged_mi'),
             self._lifetime_pct('engaged'),
+            self._fmt_mi('lifetime', 'engaged_mi'),
             _GREEN,
             "Disengaged",
-            self._fmt_mi('lifetime', 'disengaged_mi'),
             self._lifetime_pct('disengaged'),
+            self._fmt_mi('lifetime', 'disengaged_mi'),
             _ORANGE,
         )
         y += 25
@@ -63,12 +63,12 @@ class DriveStatsWidget(Widget):
         y = self._draw_stat_pair(
             x, y, w,
             "Engaged",
-            self._fmt_mi('last', 'engaged_mi'),
             self._fmt_pct('engaged_pct'),
+            self._fmt_mi('last', 'engaged_mi'),
             _GREEN,
             "Disengaged",
-            self._fmt_mi('last', 'disengaged_mi'),
             self._fmt_pct('disengaged_pct'),
+            self._fmt_mi('last', 'disengaged_mi'),
             _ORANGE,
         )
         y += 25
@@ -76,7 +76,7 @@ class DriveStatsWidget(Widget):
         y = self._draw_section("OVERRIDES & DISENGAGEMENTS", x, y, w)
         self._draw_reasons(x, y, w)
 
-        btn_rect = rl.Rectangle(x, rect.y + rect.height - 120, w, 75)
+        btn_rect = rl.Rectangle(x, rect.y + rect.height - 95, w, 75)
         self._refresh_btn.render(btn_rect)
 
     def _request_refresh(self):
@@ -157,23 +157,23 @@ class DriveStatsWidget(Widget):
             return
 
         half = w // 2
-        mid_x = x + half
-        inner_pad = 12  # equal gap on each side of the divider
+        quarter = w // 4
+        divider_x = x + half
 
-        # Vertical divider at true center
-        rl.draw_line_ex(rl.Vector2(mid_x, y), rl.Vector2(mid_x, y + 116), 1, _DIVIDER)
+        # Vertical divider at exact center
+        rl.draw_line_ex(rl.Vector2(divider_x, y), rl.Vector2(divider_x, y + 116), 1, _DIVIDER)
 
-        # Sub-headers — equal distance from divider on each side
-        rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x,                  y), 30, 0, _DIM)
-        rl.draw_text_ex(fn, "Disengagements", rl.Vector2(mid_x + inner_pad,  y), 30, 0, _DIM)
+        # Sub-headers centered within each half
+        ow = int(rl.measure_text_ex(fn, "Overrides", 30, 0).x)
+        dw = int(rl.measure_text_ex(fn, "Disengagements", 30, 0).x)
+        rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x + (half - ow) // 2,         y), 30, 0, _DIM)
+        rl.draw_text_ex(fn, "Disengagements", rl.Vector2(divider_x + (half - dw) // 2, y), 30, 0, _DIM)
 
-        col_w = (half - inner_pad) // 2
+        # 4 columns each centered in their quarter slot
         row_y = y + 38
-        for i, (label, val) in enumerate(overrides):
-            cx = x + i * col_w
-            rl.draw_text_ex(fn, label, rl.Vector2(cx, row_y),      34, 0, _DIM)
-            rl.draw_text_ex(fb, val,   rl.Vector2(cx, row_y + 42), 50, 0, rl.WHITE)
-        for i, (label, val) in enumerate(disengages):
-            cx = mid_x + inner_pad + i * col_w
-            rl.draw_text_ex(fn, label, rl.Vector2(cx, row_y),      34, 0, _DIM)
-            rl.draw_text_ex(fb, val,   rl.Vector2(cx, row_y + 42), 50, 0, rl.WHITE)
+        for i, (label, val) in enumerate(overrides + disengages):
+            col_center = x + i * quarter + quarter // 2
+            lw = int(rl.measure_text_ex(fn, label, 34, 0).x)
+            vw = int(rl.measure_text_ex(fb, val,   50, 0).x)
+            rl.draw_text_ex(fn, label, rl.Vector2(col_center - lw // 2, row_y),      34, 0, _DIM)
+            rl.draw_text_ex(fb, val,   rl.Vector2(col_center - vw // 2, row_y + 42), 50, 0, rl.WHITE)
