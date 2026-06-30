@@ -173,6 +173,11 @@ def main():
     last_processed = params.get("SpysyLastProcessedRoute") or ""
 
     while True:
+        if params.get_bool("SpysyForceStatsRefresh"):
+            params.put_bool("SpysyForceStatsRefresh", False)
+            last_processed = ""
+            cloudlog.info("drive_statsd: manual refresh requested")
+
         result = _most_recent_route(log_root)
         if result is None or result[0] == last_processed:
             time.sleep(POLL_INTERVAL)
