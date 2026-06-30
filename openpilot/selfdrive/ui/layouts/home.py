@@ -10,6 +10,7 @@ from openpilot.selfdrive.ui.widgets.terminal_widget import TerminalWidget
 from openpilot.selfdrive.ui.widgets.screen_timeout_button import ScreenTimeoutButton
 from openpilot.selfdrive.ui.widgets.update_button import UpdateButton
 from openpilot.selfdrive.ui.widgets.error_log_button import ErrorLogButton
+from openpilot.selfdrive.ui.widgets.system_stats import SystemStatsWidget
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
@@ -62,9 +63,10 @@ class HomeLayout(Widget):
 
     self._stats_widget = DriveStatsWidget()
     self._terminal_widget = TerminalWidget()
+    self._system_stats_widget = SystemStatsWidget()
     self._setup_widget = SetupWidget()
 
-    self._left_windows: list[Widget] = [self._stats_widget, self._terminal_widget]
+    self._left_windows: list[Widget] = [self._stats_widget, self._terminal_widget, self._system_stats_widget]
     self._current_left_idx: int = 0
     for w in self._left_windows:
       w.set_background_tap_callback(self._cycle_left_window)
