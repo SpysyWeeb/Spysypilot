@@ -37,10 +37,7 @@ class TerminalWidget(Widget):
         super().__init__()
         self._lines: collections.deque[tuple[str, rl.Color]] = collections.deque(maxlen=MAX_LINES)
         self._lock = threading.Lock()
-        self._running = False
-        self._openpilot_proc: subprocess.Popen | None = None
-        self._journal_proc: subprocess.Popen | None = None
-        self._grep_proc: subprocess.Popen | None = None
+        self._started = False
         self._background_tap_callback = None
 
     def set_background_tap_callback(self, cb) -> None:
@@ -48,46 +45,31 @@ class TerminalWidget(Widget):
 
     def show_event(self) -> None:
         super().show_event()
+        # Start the live feeds once and let them keep accumulating in the background;
+        # restarting on every cycle would wipe history and re-tail from scratch.
         self._start()
 
-    def hide_event(self) -> None:
-        super().hide_event()
-        self._stop()
-
     def _start(self) -> None:
-        self._stop()
-        self._running = True
-        with self._lock:
-            self._lines.clear()
+        if self._started:
+            return
+        self._started = True
 
         # Thread 1: openpilot swaglog feed (tail the live plaintext file)
         threading.Thread(target=self._openpilot_reader, daemon=True).start()
 
         # Thread 2: filtered system journal (SSH connections, kernel, etc.)
         try:
-            self._journal_proc = subprocess.Popen(
+            journal_proc = subprocess.Popen(
                 ['journalctl', '-f', '-n', '5', '--no-pager', '-o', 'short-monotonic', '--no-hostname'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
             )
-            self._grep_proc = subprocess.Popen(
+            grep_proc = subprocess.Popen(
                 ['grep', '--line-buffered', '-Ev', _JOURNAL_NOISE],
-                stdin=self._journal_proc.stdout, stdout=subprocess.PIPE, text=True, bufsize=1,
+                stdin=journal_proc.stdout, stdout=subprocess.PIPE, text=True, bufsize=1,
             )
-            threading.Thread(target=self._journal_reader, daemon=True).start()
+            threading.Thread(target=self._journal_reader, args=(grep_proc,), daemon=True).start()
         except FileNotFoundError:
             pass
-
-    def _stop(self) -> None:
-        self._running = False
-        for proc in (self._openpilot_proc, self._grep_proc, self._journal_proc):
-            if proc is not None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-        self._openpilot_proc = None
-        self._grep_proc = None
-        self._journal_proc = None
 
     def _openpilot_reader(self) -> None:
         try:
@@ -100,23 +82,16 @@ class TerminalWidget(Widget):
                 self._lines.append(('[tail not found]', _YELLOW))
             return
 
-        self._openpilot_proc = proc
         for line in proc.stdout:
-            if not self._running:
-                proc.terminate()
-                break
             text = line.rstrip('\n')
             if text:
                 with self._lock:
                     self._lines.append((text, _level_color(text)))
 
-    def _journal_reader(self) -> None:
-        proc = self._grep_proc
-        if proc is None or proc.stdout is None:
+    def _journal_reader(self, proc: subprocess.Popen) -> None:
+        if proc.stdout is None:
             return
         for line in proc.stdout:
-            if not self._running:
-                break
             text = line.rstrip('\n')
             if text:
                 with self._lock:
