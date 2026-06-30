@@ -22,12 +22,12 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ⚠️ **Smooth stops** &nbsp;*(personal idea)*
 - ⚠️ **Better boot screen** — show console output during startup so hangs are immediately diagnosable &nbsp;*(personal idea)*
 - ⚠️ **Error log viewer** — button in dev menu to view the error log before/during/after a drive &nbsp;*(inspired by sunnypilot)*
+- ❌ **Custom main menu windows** — replaces the "upgrade now" panel; tap cycles between windows; default is a driver status screen showing engaged time for the last drive and lifetime average (pulled from on-board routes); other windows include a live terminal showing openpilot output &nbsp;*(personal idea)*
 - ❌ **Swapped cruise speed adjustments** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(personal idea)*
 - ❌ **Exaggerated follow personalities** — aggressive targets ~1s following distance and reacts quickly; relaxed targets ~3s and smooths out inputs more than stock &nbsp;*(personal idea)*
 - ❌ **Quiet mode** &nbsp;*(inspired by sunnypilot)*
 - ❌ **Force Stops** &nbsp;*(inspired by IQPilot)*
 - ❌ **Earlier lead takeoffs** &nbsp;*(inspired by IQPilot)*
 - ❌ **Better longitudinal tune** &nbsp;*(personal idea)*
-- ❌ **Replace the "prime" window with a stats window** &nbsp;*(personal idea)*
 - ❌ **Replace the live on-road view with a different screen showing live stats** &nbsp;*(personal idea)*
 - ❌ **Get Clip.py working on device with a route viewer** &nbsp;*(personal idea)*
