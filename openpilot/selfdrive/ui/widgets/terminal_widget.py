@@ -3,13 +3,6 @@ import subprocess
 import threading
 import pyray as rl
 
-try:
-    import zmq
-    import msgpack
-    _HAS_ZMQ = True
-except ImportError:
-    _HAS_ZMQ = False
-
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.widgets import Widget
 
@@ -25,18 +18,18 @@ FONT_SIZE  = 22
 LINE_H     = 28
 PAD        = 16
 
-SWAGLOG_SOCKET = "ipc:///tmp/swaglog"
-
-_SWAGLOG_COLORS = {
-    'DEBUG':    _DIM,
-    'INFO':     _GREEN,
-    'WARNING':  _YELLOW,
-    'ERROR':    _RED,
-    'CRITICAL': _RED,
-}
+LIVE_LOG   = '/tmp/spysy_terminal.log'
 
 # journalctl patterns to suppress (PAM session spam)
 _JOURNAL_NOISE = r'pam_unix.*session\|session opened for\|session closed for\|COMMAND='
+
+
+def _level_color(line: str) -> rl.Color:
+    if line.startswith('[W]') or line.startswith('[WARNING]'):
+        return _YELLOW
+    if line.startswith('[E]') or line.startswith('[ERROR]') or line.startswith('[C]') or line.startswith('[CRITICAL]'):
+        return _RED
+    return _GREEN
 
 
 class TerminalWidget(Widget):
@@ -66,10 +59,13 @@ class TerminalWidget(Widget):
         with self._lock:
             self._lines.clear()
 
-        # journalctl → grep (filter noise) → reader thread
+        # Thread 1: openpilot swaglog feed (tail the live plaintext file)
+        threading.Thread(target=self._openpilot_reader, daemon=True).start()
+
+        # Thread 2: filtered system journal (SSH connections, kernel, etc.)
         try:
             self._journal_proc = subprocess.Popen(
-                ['journalctl', '-f', '-n', '20', '--no-pager', '-o', 'short-monotonic', '--no-hostname'],
+                ['journalctl', '-f', '-n', '5', '--no-pager', '-o', 'short-monotonic', '--no-hostname'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
             )
             self._grep_proc = subprocess.Popen(
@@ -78,23 +74,38 @@ class TerminalWidget(Widget):
             )
             threading.Thread(target=self._journal_reader, daemon=True).start()
         except FileNotFoundError:
-            with self._lock:
-                self._lines.append(('[journalctl not found]', _DIM))
-
-        # swaglog ZMQ subscriber — openpilot internal logs
-        if _HAS_ZMQ:
-            threading.Thread(target=self._swaglog_reader, daemon=True).start()
-        else:
-            with self._lock:
-                self._lines.append(('[zmq/msgpack not available — openpilot logs hidden]', _YELLOW))
+            pass
 
     def _stop(self) -> None:
         self._running = False
         for proc in (self._grep_proc, self._journal_proc):
             if proc is not None:
-                proc.terminate()
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
         self._grep_proc = None
         self._journal_proc = None
+
+    def _openpilot_reader(self) -> None:
+        try:
+            proc = subprocess.Popen(
+                ['tail', '-f', '-n', '50', LIVE_LOG],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            with self._lock:
+                self._lines.append(('[tail not found]', _YELLOW))
+            return
+
+        for line in proc.stdout:
+            if not self._running:
+                proc.terminate()
+                break
+            text = line.rstrip('\n')
+            if text:
+                with self._lock:
+                    self._lines.append((text, _level_color(text)))
 
     def _journal_reader(self) -> None:
         proc = self._grep_proc
@@ -106,38 +117,7 @@ class TerminalWidget(Widget):
             text = line.rstrip('\n')
             if text:
                 with self._lock:
-                    self._lines.append((text, _DIM))
-
-    def _swaglog_reader(self) -> None:
-        try:
-            ctx = zmq.Context()
-            sock = ctx.socket(zmq.SUB)
-            sock.connect(SWAGLOG_SOCKET)
-            sock.setsockopt(zmq.SUBSCRIBE, b"")
-            sock.setsockopt(zmq.RCVTIMEO, 200)
-        except Exception:
-            return
-
-        while self._running:
-            try:
-                data = sock.recv()
-                msg = msgpack.unpackb(data, raw=False)
-                level = msg.get('levelname', 'INFO')
-                name  = msg.get('name', '?')
-                text  = str(msg.get('message', ''))
-                line  = f"[{level[0]}] {name}: {text}"
-                color = _SWAGLOG_COLORS.get(level, _GREEN)
-                with self._lock:
-                    self._lines.append((line, color))
-            except zmq.error.Again:
-                pass
-            except Exception:
-                pass
-
-        try:
-            sock.close()
-        except Exception:
-            pass
+                    self._lines.append(('[sys] ' + text, _DIM))
 
     def _handle_mouse_release(self, mouse_pos) -> None:
         if self._background_tap_callback:
@@ -153,8 +133,8 @@ class TerminalWidget(Widget):
         fn = gui_app.font(FontWeight.NORMAL)
 
         if not lines:
-            rl.draw_text_ex(fn, 'Waiting for output...', rl.Vector2(int(rect.x + PAD), int(rect.y + PAD)),
-                            FONT_SIZE, 0, _DIM)
+            rl.draw_text_ex(fn, 'Waiting for openpilot output...',
+                            rl.Vector2(int(rect.x + PAD), int(rect.y + PAD)), FONT_SIZE, 0, _DIM)
             return
 
         max_visible = max(1, int((rect.height - PAD * 2) / LINE_H))
