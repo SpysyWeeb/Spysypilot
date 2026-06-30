@@ -42,6 +42,10 @@ class AolDriver:
 
     cruise_available = CS.cruiseState.available
 
+    # Driver is manually overpowering AOL's steering — track as 'overriding' instead of 'enabled'
+    if CS.steeringPressed:
+      self.state_machine.add_event('overrideLateral')
+
     # LKAS/LFA button: rising edge toggles AOL on/off
     lkas_pressed = any(be.type == ButtonType.lkas and be.pressed for be in CS.buttonEvents)
     if lkas_pressed:
