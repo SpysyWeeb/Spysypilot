@@ -1,11 +1,12 @@
 import openpilot.cereal.messaging as messaging
-from openpilot.cereal import custom, log
+from openpilot.cereal import custom
+from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.selfdrived.events import ET, Events
 from openpilot.spysypilot.mads.state import MADSStateMachine, ACTIVE_STATES, ENABLED_STATES, State
 from openpilot.spysypilot.mads.helpers import set_alternative_experience, is_hyundai_always_allow
 
-ButtonType = log.Car.CarState.ButtonEvent.Type
+ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
 
 
