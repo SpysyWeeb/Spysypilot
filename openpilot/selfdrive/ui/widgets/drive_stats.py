@@ -5,7 +5,6 @@ import pyray as rl
 from openpilot.common.params import Params
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.button import Button, ButtonStyle
 
 REFRESH_INTERVAL = 2.0
 
@@ -25,17 +24,14 @@ class DriveStatsWidget(Widget):
         self._last_drive: dict | None = None
         self._status: str = ""
         self._last_refresh = 0.0
-        self._refresh_btn = Button(lambda: "Update Stats", self._request_refresh, button_style=ButtonStyle.PRIMARY)
-        self._refresh_btn_rect = rl.Rectangle(0, 0, 0, 0)
         self._background_tap_callback = None
 
     def set_background_tap_callback(self, cb) -> None:
         self._background_tap_callback = cb
 
     def _handle_mouse_release(self, mouse_pos) -> None:
-        if not rl.check_collision_point_rec(mouse_pos, self._refresh_btn_rect):
-            if self._background_tap_callback:
-                self._background_tap_callback()
+        if self._background_tap_callback:
+            self._background_tap_callback()
 
     def _render(self, rect: rl.Rectangle):
         now = time.monotonic()
@@ -85,14 +81,6 @@ class DriveStatsWidget(Widget):
 
         y = self._draw_section("OVERRIDES & DISENGAGEMENTS", x, y, w)
         self._draw_reasons(x, y, w)
-
-        btn_rect = rl.Rectangle(x, rect.y + rect.height - 95, w, 75)
-        self._refresh_btn_rect = btn_rect
-        self._refresh_btn.render(btn_rect)
-
-    def _request_refresh(self):
-        self._params.put_bool("SpysyForceStatsRefresh", True)
-        self._status = "Refresh requested..."
 
     def _reload(self):
         self._status = self._params.get("SpysyStatsStatus") or ""
@@ -171,16 +159,13 @@ class DriveStatsWidget(Widget):
         quarter = w // 4
         divider_x = x + half
 
-        # Vertical divider at exact center
         rl.draw_line_ex(rl.Vector2(divider_x, y), rl.Vector2(divider_x, y + 116), 1, _DIVIDER)
 
-        # Sub-headers centered within each half
         ow = int(rl.measure_text_ex(fn, "Overrides", 30, 0).x)
         dw = int(rl.measure_text_ex(fn, "Disengagements", 30, 0).x)
         rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x + (half - ow) // 2,         y), 30, 0, _DIM)
         rl.draw_text_ex(fn, "Disengagements", rl.Vector2(divider_x + (half - dw) // 2, y), 30, 0, _DIM)
 
-        # 4 columns each centered in their quarter slot
         row_y = y + 38
         for i, (label, val) in enumerate(overrides + disengages):
             col_center = x + i * quarter + quarter // 2
