@@ -152,18 +152,12 @@ class SoftwareLayout(Widget):
       self._install_btn.set_visible(False)
 
   def _on_download_update(self):
-    # Check if we should start checking or start downloading
+    # Always kick off a full check+download regardless of whether the button says CHECK or DOWNLOAD.
+    # SIGHUP tells the daemon to fetch (not just check), so the user never has to tap twice.
     self._download_btn.action_item.set_enabled(False)
-    if self._download_btn.action_item.text == tr("CHECK"):
-      # Start checking for updates
-      self._waiting_for_updater = True
-      self._waiting_start_ts = time.monotonic()
-      os.system("pkill -SIGUSR1 -f openpilot.system.updated.updated")
-    else:
-      # Start downloading
-      self._waiting_for_updater = True
-      self._waiting_start_ts = time.monotonic()
-      os.system("pkill -SIGHUP -f openpilot.system.updated.updated")
+    self._waiting_for_updater = True
+    self._waiting_start_ts = time.monotonic()
+    os.system("pkill -SIGHUP -f openpilot.system.updated.updated")
 
   def _on_uninstall(self):
     def handle_uninstall_confirmation(result: DialogResult):
