@@ -1,6 +1,5 @@
 import openpilot.cereal.messaging as messaging
-from openpilot.cereal import custom, log
-from opendbc.car.structs import car
+from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.selfdrived.events import ET, Events
