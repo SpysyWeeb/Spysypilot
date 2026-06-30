@@ -34,19 +34,14 @@ class AolStateMachine:
 
     elif self.state == State.disabled:
       if self.has('lkasEnable') or self.has('silentLkasEnable'):
-        if self.has('noEntry'):
-          if self.has('canPause'):
-            self.state = State.paused
-        else:
-          self.state = State.enabled
+        self.state = State.enabled
 
     elif self.state == State.paused:
       if self.has('lkasEnable') or self.has('silentLkasEnable'):
-        if not self.has('noEntry'):
-          if self.has('overrideLateral'):
-            self.state = State.overriding
-          else:
-            self.state = State.enabled
+        if self.has('overrideLateral'):
+          self.state = State.overriding
+        else:
+          self.state = State.enabled
 
     elif self.state == State.enabled:
       if self.has('softDisable'):
@@ -59,8 +54,7 @@ class AolStateMachine:
 
     elif self.state == State.softDisabling:
       if self.has('lkasEnable') or self.has('silentLkasEnable'):
-        if not self.has('noEntry'):
-          self.state = State.enabled
+        self.state = State.enabled
       elif not self.has('softDisable'):
         self.state = State.enabled
       else:
