@@ -3,7 +3,8 @@ import os
 import pyray as rl
 from openpilot.system.ui.lib.application import gui_app, FontWeight, FONT_SCALE
 from openpilot.system.ui.lib.multilang import tr
-from openpilot.system.ui.widgets import Widget
+from openpilot.system.ui.widgets import DialogResult, Widget
+from openpilot.system.ui.widgets.confirm_dialog import ConfirmDialog
 from openpilot.system.ui.widgets.html_render import HtmlModal
 
 ERROR_LOG_PATH = "/data/community/crashes/error.log"
@@ -21,7 +22,16 @@ class ErrorLogButton(Widget):
     else:
       body = "<p>No errors logged yet.</p>"
 
-    gui_app.push_widget(HtmlModal(text=body))
+    def on_log_closed():
+      if not os.path.exists(ERROR_LOG_PATH):
+        return
+      def confirm_delete(result: DialogResult):
+        if result == DialogResult.CONFIRM:
+          os.remove(ERROR_LOG_PATH)
+      dlg = ConfirmDialog(tr("Delete the error log?"), tr("Delete"), callback=confirm_delete)
+      gui_app.push_widget(dlg)
+
+    gui_app.push_widget(HtmlModal(text=body, on_close=on_log_closed))
 
   def _render(self, rect: rl.Rectangle) -> None:
     alpha = 0xCC if self.is_pressed else 0xFF
