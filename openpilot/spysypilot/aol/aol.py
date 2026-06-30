@@ -120,6 +120,7 @@ class AolDriver:
 
   def publish(self, pm) -> None:
     msg = messaging.new_message('spysydriveStateSP')
+    msg.valid = True
     aol = msg.spysydriveStateSP.aol
     aol.state = self.state_machine.state
     aol.enabled = self.enabled
