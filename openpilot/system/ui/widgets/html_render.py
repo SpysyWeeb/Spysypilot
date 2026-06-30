@@ -256,11 +256,17 @@ class HtmlRenderer(Widget):
 
 
 class HtmlModal(Widget):
-  def __init__(self, file_path: str | None = None, text: str | None = None):
+  def __init__(self, file_path: str | None = None, text: str | None = None, on_close=None):
     super().__init__()
     self._content = HtmlRenderer(file_path=file_path, text=text)
     self._scroll_panel = GuiScrollPanel()
-    self._ok_button = Button(tr("OK"), click_callback=gui_app.pop_widget, button_style=ButtonStyle.PRIMARY)
+
+    def _on_ok():
+      gui_app.pop_widget()
+      if on_close is not None:
+        on_close()
+
+    self._ok_button = Button(tr("OK"), click_callback=_on_ok, button_style=ButtonStyle.PRIMARY)
 
   def _render(self, rect: rl.Rectangle):
     margin = 50
