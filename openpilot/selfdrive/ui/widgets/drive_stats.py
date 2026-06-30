@@ -59,7 +59,7 @@ class DriveStatsWidget(Widget):
         )
         y += 38
 
-        y = self._draw_section("DISENGAGEMENT REASONS", x, y, w)
+        y = self._draw_section("OVERRIDES & DISENGAGEMENTS", x, y, w)
         self._draw_reasons(x, y, w)
 
     def _reload(self):
@@ -110,18 +110,31 @@ class DriveStatsWidget(Widget):
             if sum(r.values()) == 0:
                 rl.draw_text_ex(fn, "No interruptions recorded", rl.Vector2(x, y + 12), 40, 0, _DIM)
                 return
-            items = [
-                ("Gas override", f"{r.get('gas', 0.0):.0f}%"),
-                ("Steering",     f"{r.get('steer', 0.0):.0f}%"),
-                ("Brake",        f"{r.get('brake', 0.0):.0f}%"),
-                ("Cancel",       f"{r.get('cancel', 0.0):.0f}%"),
-            ]
+            overrides = [("Gas override", f"{r.get('gas', 0.0):.0f}%"),
+                         ("Steering",     f"{r.get('steer', 0.0):.0f}%")]
+            disengages = [("Brake",  f"{r.get('brake', 0.0):.0f}%"),
+                          ("Cancel", f"{r.get('cancel', 0.0):.0f}%")]
         else:
             rl.draw_text_ex(fn, "No drive data yet", rl.Vector2(x, y + 12), 40, 0, _DIM)
             return
 
-        col_w = w // 4
-        for i, (label, val) in enumerate(items):
+        half = w // 2
+        mid_x = x + half
+
+        # Vertical divider
+        rl.draw_line_ex(rl.Vector2(mid_x, y), rl.Vector2(mid_x, y + 116), 1, _DIVIDER)
+
+        # Sub-headers
+        rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x,         y), 30, 0, _DIM)
+        rl.draw_text_ex(fn, "Disengagements", rl.Vector2(mid_x + 24, y), 30, 0, _DIM)
+
+        col_w = half // 2
+        row_y = y + 38
+        for i, (label, val) in enumerate(overrides):
             cx = x + i * col_w
-            rl.draw_text_ex(fn, label, rl.Vector2(cx, y),      34, 0, _DIM)
-            rl.draw_text_ex(fb, val,   rl.Vector2(cx, y + 44), 50, 0, rl.WHITE)
+            rl.draw_text_ex(fn, label, rl.Vector2(cx, row_y),      34, 0, _DIM)
+            rl.draw_text_ex(fb, val,   rl.Vector2(cx, row_y + 42), 50, 0, rl.WHITE)
+        for i, (label, val) in enumerate(disengages):
+            cx = mid_x + 24 + i * col_w
+            rl.draw_text_ex(fn, label, rl.Vector2(cx, row_y),      34, 0, _DIM)
+            rl.draw_text_ex(fb, val,   rl.Vector2(cx, row_y + 42), 50, 0, rl.WHITE)
