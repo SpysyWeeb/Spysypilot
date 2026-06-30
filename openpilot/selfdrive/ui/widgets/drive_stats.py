@@ -53,38 +53,22 @@ class DriveStatsWidget(Widget):
             y += 48
 
         y = self._draw_section("LIFETIME DRIVING", x, y, w)
-        y = self._draw_stat_pair(
+        y = self._draw_stat_triple(
             x, y, w,
-            "Engaged",
-            self._lifetime_pct("engaged"),
-            self._fmt_lifetime_mi("engaged_mi"),
-            _GREEN,
-            "Disengaged",
-            self._lifetime_pct("disengaged"),
-            self._fmt_lifetime_mi("disengaged_mi"),
-            _ORANGE,
+            "Engaged",    self._lifetime_pct("engaged"),    self._fmt_lifetime_mi("engaged_mi"),    _GREEN,
+            "Disengaged", self._lifetime_pct("disengaged"),  self._fmt_lifetime_mi("disengaged_mi"), _ORANGE,
+            "Override",   self._lifetime_override_pct(),    self._fmt_lifetime_mi("override_mi"),   _OVERRIDE,
         )
-        y = self._draw_override_row(x, y + 18, w,
-                                    self._lifetime_override_pct(),
-                                    self._fmt_lifetime_mi("override_mi"))
-        y += 20
+        y += 25
 
         y = self._draw_section("LAST DRIVE", x, y, w)
-        y = self._draw_stat_pair(
+        y = self._draw_stat_triple(
             x, y, w,
-            "Engaged",
-            self._fmt_pct("engaged_pct"),
-            self._fmt_drive_mi("engaged_mi"),
-            _GREEN,
-            "Disengaged",
-            self._fmt_pct("disengaged_pct"),
-            self._fmt_drive_mi("disengaged_mi"),
-            _ORANGE,
+            "Engaged",    self._fmt_pct("engaged_pct"),    self._fmt_drive_mi("engaged_mi"),    _GREEN,
+            "Disengaged", self._fmt_pct("disengaged_pct"), self._fmt_drive_mi("disengaged_mi"), _ORANGE,
+            "Override",   self._fmt_pct("override_pct"),   self._fmt_drive_mi("override_mi"),   _OVERRIDE,
         )
-        y = self._draw_override_row(x, y + 18, w,
-                                    self._fmt_pct("override_pct"),
-                                    self._fmt_drive_mi("override_mi"))
-        y += 20
+        y += 25
 
         y = self._draw_section("OVERRIDES & DISENGAGEMENTS", x, y, w)
         self._draw_reasons(x, y, w)
@@ -140,31 +124,21 @@ class DriveStatsWidget(Widget):
         rl.draw_line_ex(rl.Vector2(x, line_y), rl.Vector2(x + w, line_y), 1, _DIVIDER)
         return line_y + 18
 
-    def _draw_stat_pair(self, x: int, y: int, w: int,
-                        left_label: str, left_primary: str, left_secondary: str, left_color: rl.Color,
-                        right_label: str, right_primary: str, right_secondary: str, right_color: rl.Color) -> int:
+    def _draw_stat_triple(self, x: int, y: int, w: int,
+                          l1: str, p1: str, s1: str, c1: rl.Color,
+                          l2: str, p2: str, s2: str, c2: rl.Color,
+                          l3: str, p3: str, s3: str, c3: rl.Color) -> int:
         fn = gui_app.font(FontWeight.NORMAL)
         fb = gui_app.font(FontWeight.BOLD)
-        half = w // 2
-
-        rl.draw_text_ex(fn, left_label,  rl.Vector2(x,        y), 38, 0, _DIM)
-        rl.draw_text_ex(fn, right_label, rl.Vector2(x + half, y), 38, 0, _DIM)
-
-        rl.draw_text_ex(fb, left_primary,  rl.Vector2(x,        y + 46), 52, 0, left_color)
-        rl.draw_text_ex(fb, right_primary, rl.Vector2(x + half, y + 46), 52, 0, right_color)
-
-        rl.draw_text_ex(fn, left_secondary,  rl.Vector2(x,        y + 106), 38, 0, left_color)
-        rl.draw_text_ex(fn, right_secondary, rl.Vector2(x + half, y + 106), 38, 0, right_color)
-
+        third = w // 3
+        for i, (label, primary, secondary, color) in enumerate(
+            [(l1, p1, s1, c1), (l2, p2, s2, c2), (l3, p3, s3, c3)]
+        ):
+            col_x = x + i * third
+            rl.draw_text_ex(fn, label,     rl.Vector2(col_x, y),       38, 0, _DIM)
+            rl.draw_text_ex(fb, primary,   rl.Vector2(col_x, y + 46),  52, 0, color)
+            rl.draw_text_ex(fn, secondary, rl.Vector2(col_x, y + 106), 38, 0, color)
         return y + 152
-
-    def _draw_override_row(self, x: int, y: int, w: int, pct: str, miles: str) -> int:
-        fn = gui_app.font(FontWeight.NORMAL)
-        fb = gui_app.font(FontWeight.BOLD)
-        rl.draw_text_ex(fn, "Override (of engaged)", rl.Vector2(x, y + 8), 32, 0, _DIM)
-        rl.draw_text_ex(fb, pct,   rl.Vector2(x + w // 2,     y),      46, 0, _OVERRIDE)
-        rl.draw_text_ex(fn, miles, rl.Vector2(x + w * 3 // 4, y + 12), 32, 0, _OVERRIDE)
-        return y + 58
 
     def _draw_reasons(self, x: int, y: int, w: int):
         fn = gui_app.font(FontWeight.NORMAL)
