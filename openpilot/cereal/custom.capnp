@@ -14,7 +14,7 @@ struct SpysydriveStateSP @0x81c2f05a394cf4af {
   aol @0 :AolState;
 }
 
-struct AolState @0xaedffd8f31e7b55d {
+struct AolState @0xcfe2a93b1d754086 {
   state @0 :AolStateEnum;
   enabled @1 :Bool;
   active @2 :Bool;
@@ -27,6 +27,9 @@ struct AolState @0xaedffd8f31e7b55d {
     softDisabling @3;
     overriding @4;
   }
+}
+
+struct CustomReserved1 @0xaedffd8f31e7b55d {
 }
 
 struct CustomReserved2 @0xf35cc4560bbf6ec2 {
