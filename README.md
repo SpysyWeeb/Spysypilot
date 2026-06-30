@@ -25,7 +25,7 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ✅ **Error log viewer** — button in dev menu to view the error log before/during/after a drive &nbsp;*(inspired by sunnypilot)*
 - ✅ **Auto-update** — tapping "Check" automatically checks, downloads if an update is found, and reboots to install; background downloads (which already happen every ~1.5 hrs on non-metered connections) also auto-install the moment they finish while the car is parked &nbsp;*(personal idea)*
 - ⚠️ **Custom main menu windows** — replaces the "upgrade now" panel; tap cycles between windows; default is a driver status screen showing engaged time for the last drive and lifetime average (pulled from on-board routes); other windows include a live terminal showing openpilot output &nbsp;*(personal idea)*
-- ⚠️ **Swapped cruise speed adjustments** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(personal idea)*
+- ✅ **Swapped cruise speed adjustments** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(personal idea)*
 - ❌ **Exaggerated follow personalities** — aggressive targets ~1s following distance and reacts quickly; relaxed targets ~3s and smooths out inputs more than stock &nbsp;*(personal idea)*
 - ❌ **Quiet mode** — silence the engage and disengage sounds while leaving safety alerts audible &nbsp;*(inspired by sunnypilot)*
 - ❌ **Force Stops** — ensure the car comes to a complete stop at lights and stop signs rather than a rolling stop &nbsp;*(inspired by IQPilot)*
