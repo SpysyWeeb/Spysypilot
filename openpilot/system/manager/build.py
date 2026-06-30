@@ -64,12 +64,13 @@ def build() -> None:
     error_s = b"\n".join(compile_output).decode('utf8', 'replace')
     spinner.log("Build FAILED.")
 
-    # Show TextWindow
+    # Kill the boot spinner before showing the TextWindow
     spinner.close()
     if not os.getenv("CI"):
       with TextWindow("openpilot failed to build\n \n" + error_s) as t:
         t.wait_for_exit()
     exit(1)
+  # On success, detach() is called implicitly by __del__ — spinner subprocess survives
 
 if __name__ == "__main__":
   build()
