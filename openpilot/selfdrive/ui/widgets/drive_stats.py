@@ -6,7 +6,7 @@ from openpilot.common.params import Params
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.widgets import Widget
 
-REFRESH_INTERVAL = 5.0
+REFRESH_INTERVAL = 2.0
 
 _BG      = rl.Color(40, 40, 40, 255)
 _BLUE    = rl.Color(70, 91, 234, 255)
