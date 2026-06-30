@@ -6,6 +6,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAlert
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
 from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsWidget
+from openpilot.selfdrive.ui.widgets.terminal_widget import TerminalWidget
 from openpilot.selfdrive.ui.widgets.screen_timeout_button import ScreenTimeoutButton
 from openpilot.selfdrive.ui.widgets.update_button import UpdateButton
 from openpilot.selfdrive.ui.widgets.error_log_button import ErrorLogButton
@@ -22,6 +23,7 @@ CONTENT_MARGIN = 40
 SPACING = 25
 RIGHT_COLUMN_WIDTH = 750
 REFRESH_INTERVAL = 10.0
+DOT_STRIP_H = 40
 
 
 class HomeLayoutState(IntEnum):
@@ -59,7 +61,13 @@ class HomeLayout(Widget):
     self.alert_notif_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
 
     self._stats_widget = DriveStatsWidget()
+    self._terminal_widget = TerminalWidget()
     self._setup_widget = SetupWidget()
+
+    self._left_windows: list[Widget] = [self._stats_widget, self._terminal_widget]
+    self._current_left_idx: int = 0
+    for w in self._left_windows:
+      w.set_background_tap_callback(self._cycle_left_window)
 
     self._exp_mode_button = ExperimentalModeButton()
     self._update_button = UpdateButton()
@@ -70,8 +78,13 @@ class HomeLayout(Widget):
   def show_event(self):
     super().show_event()
     self._exp_mode_button.show_event()
+    self._left_windows[self._current_left_idx].show_event()
     self.last_refresh = time.monotonic()
     self._refresh()
+
+  def hide_event(self):
+    super().hide_event()
+    self._left_windows[self._current_left_idx].hide_event()
 
   def _setup_callbacks(self):
     self.update_alert.set_dismiss_callback(lambda: self._set_state(HomeLayoutState.HOME))
@@ -83,6 +96,11 @@ class HomeLayout(Widget):
 
   def _toggle_experimental_mode(self):
     self.params.put_bool("ExperimentalMode", not self.params.get_bool("ExperimentalMode"))
+
+  def _cycle_left_window(self):
+    self._left_windows[self._current_left_idx].hide_event()
+    self._current_left_idx = (self._current_left_idx + 1) % len(self._left_windows)
+    self._left_windows[self._current_left_idx].show_event()
 
   def _set_state(self, state: HomeLayoutState):
     # propagate show/hide events
@@ -200,7 +218,27 @@ class HomeLayout(Widget):
     self.offroad_alert.render(self.content_rect)
 
   def _render_left_column(self):
-    self._stats_widget.render(self.left_column_rect)
+    # Reserve bottom strip for page indicator dots
+    window_rect = rl.Rectangle(
+      self.left_column_rect.x,
+      self.left_column_rect.y,
+      self.left_column_rect.width,
+      self.left_column_rect.height - DOT_STRIP_H,
+    )
+    self._left_windows[self._current_left_idx].render(window_rect)
+    self._draw_window_dots()
+
+  def _draw_window_dots(self):
+    n = len(self._left_windows)
+    dot_r = 7
+    gap = 20
+    total_w = n * dot_r * 2 + (n - 1) * gap
+    cx = int(self.left_column_rect.x + self.left_column_rect.width // 2)
+    dot_y = int(self.left_column_rect.y + self.left_column_rect.height - DOT_STRIP_H // 2)
+    for i in range(n):
+      dot_x = cx - total_w // 2 + i * (dot_r * 2 + gap) + dot_r
+      color = rl.WHITE if i == self._current_left_idx else rl.Color(255, 255, 255, 80)
+      rl.draw_circle(dot_x, dot_y, dot_r, color)
 
   def _render_right_column(self):
     btn_height = 125
@@ -241,4 +279,3 @@ class HomeLayout(Widget):
     brand = "spysypilot"
     description = self.params.get("UpdaterCurrentDescription")
     return f"{brand} {description}" if description else brand
-
