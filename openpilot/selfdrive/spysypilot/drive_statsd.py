@@ -119,7 +119,7 @@ def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
     n = len(seg_dirs)
     for i, seg_dir in enumerate(seg_dirs, 1):
         params.put("SpysyStatsStatus",
-                   f"Route {route_idx}/{route_total} - seg {i}/{n}")
+                   f"Analyzing route {route_idx}/{route_total} - seg {i}/{n}")
         seg = _parse_segment(os.path.join(log_root, seg_dir))
         if not seg:
             continue
