@@ -4,7 +4,7 @@ from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.selfdrived.events import ET, Events
 from openpilot.spysypilot.aol.state import AolStateMachine, ACTIVE_STATES, ENABLED_STATES, State
-from openpilot.spysypilot.aol.helpers import set_alternative_experience, is_hyundai_always_allow
+from openpilot.spysypilot.aol.helpers import is_hyundai_always_allow
 
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
@@ -32,7 +32,6 @@ class AolDriver:
     self._cruise_available_prev = False
 
     # Set panda alternativeExperience flags
-    set_alternative_experience(self.CP)
 
   @property
   def available(self) -> bool:
