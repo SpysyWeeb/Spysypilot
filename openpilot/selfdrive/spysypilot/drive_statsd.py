@@ -137,6 +137,23 @@ def _reason_pcts(events: dict) -> dict:
     return {k: round(v / total * 100, 1) for k, v in events.items()}
 
 
+def _startup_verify(log_root: str, processed: set[str], params: Params):
+    """Check each tracked route still exists on disk; update status per route."""
+    if not processed:
+        return
+    all_routes_disk = _list_routes(log_root)
+    route_list = sorted(processed)
+    total = len(route_list)
+    cloudlog.info(f"drive_statsd: verifying {total} tracked route(s) at startup")
+    for idx, route_name in enumerate(route_list, 1):
+        params.put("SpysyStatsStatus", f"Verifying route {idx}/{total}...")
+        time.sleep(0.3)
+        if route_name not in all_routes_disk:
+            cloudlog.warning(f"drive_statsd: tracked route missing from disk: {route_name}")
+    params.put("SpysyStatsStatus", f"Verified {total} route(s)")
+    cloudlog.info("drive_statsd: startup verification complete")
+
+
 def _load_lifetime(params: Params) -> dict:
     try:
         raw = params.get("SpysyLifetimeStats")
@@ -176,6 +193,8 @@ def main():
 
     lifetime = _load_lifetime(params)
     processed = _load_processed(params)
+
+    _startup_verify(log_root, processed, params)
 
     while True:
         # Force refresh: wipe accumulated stats and reprocess everything
