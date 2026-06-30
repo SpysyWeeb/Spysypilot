@@ -42,7 +42,7 @@ class AolDriver:
 
     cruise_available = CS.cruiseState.available
 
-    # LKAS/LFA button press (rising edge)
+    # LKAS/LFA button: rising edge toggles AOL on/off
     lkas_pressed = any(be.type == ButtonType.lkas and be.pressed for be in CS.buttonEvents)
     if lkas_pressed:
       if self.enabled:
@@ -51,12 +51,22 @@ class AolDriver:
         if cruise_available or self.allow_always:
           self.state_machine.add_event('lkasEnable')
 
-    # ACC main rising edge → activate AOL
+    # Cruise main button: rising edge toggles AOL on/off.
+    # On Hyundai CANFD (e.g. Palisade), cruiseState.available never changes so we
+    # must watch the raw button event directly.
+    main_pressed = any(be.type == ButtonType.mainCruise and be.pressed for be in CS.buttonEvents)
+    if main_pressed:
+      if self.enabled:
+        self.state_machine.add_event('userDisable')
+      else:
+        self.state_machine.add_event('lkasEnable')
+
+    # ACC main rising edge → activate AOL (for cars where cruiseState.available changes)
     if cruise_available and not self._cruise_available_prev:
       if not self.enabled:
         self.state_machine.add_event('lkasEnable')
 
-    # ACC main falling edge → deactivate AOL
+    # ACC main falling edge → deactivate AOL (for cars where cruiseState.available changes)
     if not cruise_available and self._cruise_available_prev:
       if self.enabled:
         self.state_machine.add_event('immediateDisable')
