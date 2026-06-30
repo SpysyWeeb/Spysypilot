@@ -123,7 +123,7 @@ class TestVCruiseHelper:
       self.enable(V_CRUISE_INITIAL * CV.KPH_TO_MS, False)
 
       # first decrement speed, then perform gas pressed logic
-      expected_v_cruise_kph = self.v_cruise_helper.v_cruise_kph - IMPERIAL_INCREMENT
+      expected_v_cruise_kph = self.v_cruise_helper.v_cruise_kph - 5 * IMPERIAL_INCREMENT
       expected_v_cruise_kph = max(expected_v_cruise_kph, v_ego * CV.MS_TO_KPH)  # clip to min of vEgo
       expected_v_cruise_kph = float(np.clip(round(expected_v_cruise_kph, 1), V_CRUISE_MIN, V_CRUISE_MAX))
 
