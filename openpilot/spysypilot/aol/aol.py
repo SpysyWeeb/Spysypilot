@@ -30,15 +30,39 @@ class AolDriver:
     self.allow_always = is_hyundai_always_allow(self.CP)
 
     self._cruise_available_prev = False
+    self._lateral_mismatch_counter = 0
 
 
   @property
   def available(self) -> bool:
     return True  # Always enabled — no toggle in Spysypilot
 
+  def check_panda_mismatch(self) -> None:
+    """If AOL is active but panda's lateral_allowed disagrees for ~2s, force AOL off.
+
+    pandaStates goes over a different socket than CAN messages, so allow a couple
+    cycles of mismatch before acting (avoids a race where one update arrives before
+    the other on a single frame).
+    """
+    IGNORED_SAFETY_MODES = (car.CarParams.SafetyModel.silent, car.CarParams.SafetyModel.noOutput)
+    sm = self.sd.sm
+    if not self.active or self.sd.enabled:
+      self._lateral_mismatch_counter = 0
+      return
+    if not sm.alive['pandaStates'] or not sm.valid['pandaStates']:
+      return
+    mismatched = any(not ps.lateralAllowed for ps in sm['pandaStates'] if ps.safetyModel not in IGNORED_SAFETY_MODES)
+    if mismatched:
+      self._lateral_mismatch_counter += 1
+    else:
+      self._lateral_mismatch_counter = 0
+    if self._lateral_mismatch_counter >= 200:
+      self.state_machine.add_event('immediateDisable')
+
   def update_events(self, CS) -> None:
     """Process car state and generate AOL events for the state machine."""
     self.state_machine.clear_events()
+    self.check_panda_mismatch()
 
     cruise_available = CS.cruiseState.available
 
