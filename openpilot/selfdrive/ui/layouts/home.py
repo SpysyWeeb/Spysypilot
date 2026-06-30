@@ -6,6 +6,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAlert
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
 from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsWidget
+from openpilot.selfdrive.ui.widgets.screen_timeout_button import ScreenTimeoutButton
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
@@ -59,6 +60,7 @@ class HomeLayout(Widget):
     self._setup_widget = SetupWidget()
 
     self._exp_mode_button = ExperimentalModeButton()
+    self._screen_timeout_button = ScreenTimeoutButton()
     self._setup_callbacks()
 
   def show_event(self):
@@ -197,17 +199,25 @@ class HomeLayout(Widget):
     self._stats_widget.render(self.left_column_rect)
 
   def _render_right_column(self):
-    exp_height = 125
+    btn_height = 125
     exp_rect = rl.Rectangle(
-      self.right_column_rect.x, self.right_column_rect.y, self.right_column_rect.width, exp_height
+      self.right_column_rect.x, self.right_column_rect.y, self.right_column_rect.width, btn_height
     )
     self._exp_mode_button.render(exp_rect)
 
+    timeout_rect = rl.Rectangle(
+      self.right_column_rect.x,
+      self.right_column_rect.y + btn_height + SPACING,
+      self.right_column_rect.width,
+      btn_height,
+    )
+    self._screen_timeout_button.render(timeout_rect)
+
     setup_rect = rl.Rectangle(
       self.right_column_rect.x,
-      self.right_column_rect.y + exp_height + SPACING,
+      self.right_column_rect.y + 2 * (btn_height + SPACING),
       self.right_column_rect.width,
-      self.right_column_rect.height - exp_height - SPACING,
+      self.right_column_rect.height - 2 * (btn_height + SPACING),
     )
     self._setup_widget.render(setup_rect)
 
