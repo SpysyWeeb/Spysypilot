@@ -7,6 +7,8 @@ from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAl
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
 from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsWidget
 from openpilot.selfdrive.ui.widgets.screen_timeout_button import ScreenTimeoutButton
+from openpilot.selfdrive.ui.widgets.update_button import UpdateButton
+from openpilot.selfdrive.ui.widgets.error_log_button import ErrorLogButton
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
@@ -60,7 +62,9 @@ class HomeLayout(Widget):
     self._setup_widget = SetupWidget()
 
     self._exp_mode_button = ExperimentalModeButton()
+    self._update_button = UpdateButton()
     self._screen_timeout_button = ScreenTimeoutButton()
+    self._error_log_button = ErrorLogButton()
     self._setup_callbacks()
 
   def show_event(self):
@@ -200,25 +204,18 @@ class HomeLayout(Widget):
 
   def _render_right_column(self):
     btn_height = 125
-    exp_rect = rl.Rectangle(
-      self.right_column_rect.x, self.right_column_rect.y, self.right_column_rect.width, btn_height
-    )
-    self._exp_mode_button.render(exp_rect)
+    step = btn_height + SPACING
+    x = self.right_column_rect.x
+    y = self.right_column_rect.y
+    w = self.right_column_rect.width
 
-    timeout_rect = rl.Rectangle(
-      self.right_column_rect.x,
-      self.right_column_rect.y + btn_height + SPACING,
-      self.right_column_rect.width,
-      btn_height,
-    )
-    self._screen_timeout_button.render(timeout_rect)
+    # Stacked top-to-bottom: experimental mode, update, screen timeout, error log
+    self._exp_mode_button.render(rl.Rectangle(x, y, w, btn_height))
+    self._update_button.render(rl.Rectangle(x, y + step, w, btn_height))
+    self._screen_timeout_button.render(rl.Rectangle(x, y + 2 * step, w, btn_height))
+    self._error_log_button.render(rl.Rectangle(x, y + 3 * step, w, btn_height))
 
-    setup_rect = rl.Rectangle(
-      self.right_column_rect.x,
-      self.right_column_rect.y + 2 * (btn_height + SPACING),
-      self.right_column_rect.width,
-      self.right_column_rect.height - 2 * (btn_height + SPACING),
-    )
+    setup_rect = rl.Rectangle(x, y + 4 * step, w, self.right_column_rect.height - 4 * step)
     self._setup_widget.render(setup_rect)
 
   def _refresh(self):
