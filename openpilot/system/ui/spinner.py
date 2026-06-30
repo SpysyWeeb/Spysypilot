@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import pathlib
 import pyray as rl
 import re
 import select
@@ -39,6 +40,9 @@ CONSOLE_MARGIN = 20
 CONSOLE_ALPHA = 191  # ~75% opacity
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[mKJH]')
 
+_JETBRAINS_MONO = (pathlib.Path(__file__).resolve().parent.parent.parent /
+                   "selfdrive" / "assets" / "fonts" / "JetBrainsMono-Medium.ttf")
+
 
 def clamp(value, min_value, max_value):
   return max(min(value, max_value), min_value)
@@ -54,6 +58,10 @@ class Spinner(Widget):
     self._wrapped_lines: list[str] = []
     # Show a default line immediately so the screen isn't blank while waiting for FIFO
     self._console_lines: list[str] = ["Booting up..."]
+    # Bake at 64px so it scales down cleanly to CONSOLE_FONT_SIZE under any FONT_SCALE
+    self._console_font = rl.load_font_ex(str(_JETBRAINS_MONO), 64, None, 0)
+    rl.gen_texture_mipmaps(self._console_font.texture)
+    rl.set_texture_filter(self._console_font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
 
   def set_text(self, text: str) -> None:
     if text.startswith(LOG_PREFIX):
@@ -115,7 +123,7 @@ class Spinner(Widget):
       text_color = rl.Color(255, 255, 255, CONSOLE_ALPHA)
       for i, line in enumerate(visible):
         y = rect.height - total_h + CONSOLE_MARGIN + i * CONSOLE_LINE_HEIGHT
-        rl.draw_text_ex(gui_app.font(), line, rl.Vector2(CONSOLE_MARGIN, y), CONSOLE_FONT_SIZE, 0.0, text_color)
+        rl.draw_text_ex(self._console_font, line, rl.Vector2(CONSOLE_MARGIN, y), CONSOLE_FONT_SIZE, 0.0, text_color)
 
 
 def _read_input(f):
