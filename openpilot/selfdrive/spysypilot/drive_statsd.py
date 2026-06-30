@@ -130,10 +130,12 @@ def _parse_segment(seg_path: str) -> dict:
     }
 
 
-def _parse_route(log_root: str, seg_dirs: list[str]) -> dict:
+def _parse_route(log_root: str, seg_dirs: list[str], params: Params, route_name: str) -> dict:
     total: dict = {'engaged_m': 0.0, 'disengaged_m': 0.0,
                    'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0}}
-    for seg_dir in seg_dirs:
+    n = len(seg_dirs)
+    for i, seg_dir in enumerate(seg_dirs, 1):
+        params.put("SpysyStatsStatus", f"Analyzing {route_name} · seg {i}/{n}")
         seg = _parse_segment(os.path.join(log_root, seg_dir))
         if not seg:
             continue
@@ -186,7 +188,7 @@ def main():
             time.sleep(POLL_INTERVAL)
             continue
 
-        drive = _parse_route(log_root, seg_dirs)
+        drive = _parse_route(log_root, seg_dirs, params, route_name)
 
         lifetime['engaged_m'] += drive['engaged_m']
         lifetime['disengaged_m'] += drive['disengaged_m']
@@ -202,6 +204,7 @@ def main():
             'reasons': _reason_pcts(drive['events']),
         }
 
+        params.put("SpysyStatsStatus", "")
         # Write route name first to prevent double-counting if killed mid-write
         params.put("SpysyLastProcessedRoute", route_name)
         params.put("SpysyLastDriveStats", json.dumps(last_drive))

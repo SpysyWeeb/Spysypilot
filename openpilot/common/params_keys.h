@@ -135,4 +135,5 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SpysyLifetimeStats", {PERSISTENT, STRING}},
     {"SpysyLastDriveStats", {PERSISTENT, STRING}},
     {"SpysyLastProcessedRoute", {PERSISTENT, STRING}},
+    {"SpysyStatsStatus", {CLEAR_ON_MANAGER_START, STRING}},
 };
