@@ -29,7 +29,7 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ❌ **Force Stops** &nbsp;*(inspired by IQPilot)*
 - ❌ **Earlier lead takeoffs** &nbsp;*(inspired by IQPilot)*
 - ❌ **Better longitudinal tune** &nbsp;*(personal idea)*
-- ❌ **Detailed system stats sidebar** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
+- ⚠️ **Detailed system stats sidebar** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 - ❌ **Replace the live on-road view with a different screen showing live stats** &nbsp;*(personal idea)*
 - ❌ **Get Clip.py working on device with a route viewer** &nbsp;*(personal idea)*
 
