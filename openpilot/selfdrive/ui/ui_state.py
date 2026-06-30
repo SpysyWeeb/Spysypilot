@@ -190,6 +190,11 @@ class UIState:
 
   def update_params(self) -> None:
     # For slower operations
+    # Auto-install: if a finalized update is ready and the car is offroad, reboot to apply it.
+    # This covers both background downloads and user-initiated check+download flows.
+    if self.params.get_bool("UpdateAvailable") and not self.started:
+      self.params.put_bool("DoReboot", True, block=True)
+
     # Update longitudinal control state
     CP_bytes = self.params.get("CarParamsPersistent")
     if CP_bytes is not None:
