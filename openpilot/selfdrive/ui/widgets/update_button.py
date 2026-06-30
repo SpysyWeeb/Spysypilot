@@ -21,9 +21,12 @@ class UpdateButton(Widget):
     super().__init__()
     self._params = Params()
     self._label = tr("CHECK FOR UPDATE")
+    self._auto_fetch_pending = False
 
   def _update_state(self) -> None:
     state = self._params.get("UpdaterState") or "idle"
+    fetch_available = self._params.get_bool("UpdaterFetchAvailable")
+
     if state != "idle":
       # An update is actively in progress; reflect the live status
       self._label = tr(STATE_LABELS.get(state, state.upper()))
@@ -31,7 +34,10 @@ class UpdateButton(Widget):
       self._label = tr("UPDATE FAILED")
     elif self._params.get_bool("UpdateAvailable"):
       self._label = tr("INSTALL UPDATE")
-    elif self._params.get_bool("UpdaterFetchAvailable"):
+    elif fetch_available:
+      if self._auto_fetch_pending:
+        self._auto_fetch_pending = False
+        os.system(f"pkill -SIGHUP -f {UPDATER_PROC}")
       self._label = tr("DOWNLOAD UPDATE")
     else:
       self._label = tr("CHECK FOR UPDATE")
@@ -51,7 +57,8 @@ class UpdateButton(Widget):
       # Update available -> start the download
       os.system(f"pkill -SIGHUP -f {UPDATER_PROC}")
     else:
-      # Otherwise kick off a fresh check for updates
+      # Kick off a fresh check; auto-trigger download if one is found
+      self._auto_fetch_pending = True
       os.system(f"pkill -SIGUSR1 -f {UPDATER_PROC}")
 
   def _render(self, rect: rl.Rectangle) -> None:
