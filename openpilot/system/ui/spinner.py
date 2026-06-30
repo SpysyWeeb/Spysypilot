@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import pyray as rl
 import re
 import select
@@ -16,23 +17,23 @@ if gui_app.big_ui():
   TEXTURE_SIZE = 360
   WRAPPED_SPACING = 50
   CENTERED_SPACING = 150
-  CONSOLE_FONT_SIZE = 32
-  CONSOLE_LINE_HEIGHT = 38
+  CONSOLE_FONT_SIZE = 28
+  CONSOLE_LINE_HEIGHT = 34
 else:
   PROGRESS_BAR_WIDTH = 268
   PROGRESS_BAR_HEIGHT = 10
   TEXTURE_SIZE = 140
   WRAPPED_SPACING = 10
   CENTERED_SPACING = 20
-  CONSOLE_FONT_SIZE = 18
-  CONSOLE_LINE_HEIGHT = 22
+  CONSOLE_FONT_SIZE = 16
+  CONSOLE_LINE_HEIGHT = 20
 DEGREES_PER_SECOND = 360.0  # one full rotation per second
 MARGIN_H = 100
 FONT_SIZE = 96
 LINE_HEIGHT = 104
 DARKGRAY = (55, 55, 55, 255)
 LOG_PREFIX = "LOG:"
-MAX_CONSOLE_LINES = 15
+MAX_CONSOLE_LINES = 100   # history buffer; rendered lines are capped by screen height
 MAX_LINE_CHARS = 140
 CONSOLE_MARGIN = 20
 CONSOLE_ALPHA = 191  # ~75% opacity
@@ -69,12 +70,10 @@ class Spinner(Widget):
 
   def _render(self, rect: rl.Rectangle):
     if self._wrapped_lines:
-      # Calculate total height required for spinner and text
       spacing = WRAPPED_SPACING
       total_height = TEXTURE_SIZE + spacing + len(self._wrapped_lines) * LINE_HEIGHT
       center_y = (rect.height - total_height) / 2.0 + TEXTURE_SIZE / 2.0
     else:
-      # Center spinner vertically
       spacing = CENTERED_SPACING
       center_y = rect.height / 2.0
     y_pos = center_y + TEXTURE_SIZE / 2.0 + spacing
@@ -96,7 +95,6 @@ class Spinner(Widget):
     if self._progress is not None:
       bar = rl.Rectangle(center.x - PROGRESS_BAR_WIDTH / 2.0, y_pos, PROGRESS_BAR_WIDTH, PROGRESS_BAR_HEIGHT)
       rl.draw_rectangle_rounded(bar, 1, 10, DARKGRAY)
-
       bar.width *= self._progress / 100.0
       rl.draw_rectangle_rounded(bar, 1, 10, rl.WHITE)
     elif self._wrapped_lines:
@@ -105,38 +103,54 @@ class Spinner(Widget):
         rl.draw_text_ex(gui_app.font(), line, rl.Vector2(center.x - text_size.x / 2, y_pos + i * LINE_HEIGHT),
                         FONT_SIZE, 0.0, rl.WHITE)
 
-    # Console log overlay at ~75% opacity anchored to the bottom of the screen
+    # Console log overlay at ~75% opacity — fill from the bottom up to the top of the screen
     if self._console_lines:
-      n = len(self._console_lines)
+      max_visible = max(1, (int(rect.height) - CONSOLE_MARGIN * 2) // CONSOLE_LINE_HEIGHT)
+      visible = self._console_lines[-max_visible:]
+      n = len(visible)
       total_h = n * CONSOLE_LINE_HEIGHT + CONSOLE_MARGIN * 2
       bg_rect = rl.Rectangle(0, rect.height - total_h, rect.width, total_h)
       rl.draw_rectangle_rec(bg_rect, rl.Color(0, 0, 0, 128))
       text_color = rl.Color(255, 255, 255, CONSOLE_ALPHA)
-      for i, line in enumerate(self._console_lines):
+      for i, line in enumerate(visible):
         y = rect.height - total_h + CONSOLE_MARGIN + i * CONSOLE_LINE_HEIGHT
         rl.draw_text_ex(gui_app.font(), line, rl.Vector2(CONSOLE_MARGIN, y), CONSOLE_FONT_SIZE, 0.0, text_color)
 
 
-def _read_stdin():
-  """Non-blocking read of available lines from stdin."""
+def _read_input(f):
+  """Non-blocking read of available lines from f (stdin or FIFO)."""
   lines = []
   while True:
-    rlist, _, _ = select.select([sys.stdin], [], [], 0.0)
+    rlist, _, _ = select.select([f], [], [], 0.0)
     if not rlist:
       break
-    line = sys.stdin.readline().strip()
+    try:
+      line = f.readline()
+    except (BlockingIOError, OSError):
+      break
     if line == "":
       break
-    lines.append(line)
+    line = line.strip()
+    if line:
+      lines.append(line)
   return lines
 
 
 def main():
   gui_app.init_window("Spinner")
   spinner = Spinner()
+
+  # Use FIFO if given as argument (boot console mode), otherwise fall back to stdin
+  if len(sys.argv) > 1:
+    fifo_path = sys.argv[1]
+    # O_RDWR: keeps write end open so reader never sees EOF between writers (keepalive trick)
+    raw_fd = os.open(fifo_path, os.O_RDWR)
+    input_file = os.fdopen(raw_fd, 'r')
+  else:
+    input_file = sys.stdin
+
   for _ in gui_app.render():
-    text_list = _read_stdin()
-    for text in text_list:
+    for text in _read_input(input_file):
       spinner.set_text(text)
 
     spinner.render(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
