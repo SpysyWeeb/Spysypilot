@@ -204,7 +204,17 @@ class DeveloperLayout(Widget):
       body = f"<pre>{html.escape(content)}</pre>"
     else:
       body = "<p>No errors logged yet.</p>"
-    gui_app.push_widget(HtmlModal(text=body))
+
+    def on_log_closed():
+      if not os.path.exists(ERROR_LOG_PATH):
+        return
+      def confirm_delete(result: DialogResult):
+        if result == DialogResult.CONFIRM:
+          os.remove(ERROR_LOG_PATH)
+      dlg = ConfirmDialog("Delete the error log?", tr("Delete"), callback=confirm_delete)
+      gui_app.push_widget(dlg)
+
+    gui_app.push_widget(HtmlModal(text=body, on_close=on_log_closed))
 
   def _on_alpha_long_enabled(self, state: bool):
     if state:
@@ -227,4 +237,3 @@ class DeveloperLayout(Widget):
       self._params.put_bool("AlphaLongitudinalEnabled", False, block=True)
       self._params.put_bool("OnroadCycleRequested", True, block=True)
       self._update_toggles()
-
