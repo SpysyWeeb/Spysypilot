@@ -111,6 +111,16 @@ MAX_FRAMES_PER_TICK = 10  # cap catch-up work per UI frame after a stall/seek
 # stalls; it will never again visibly speed up to compensate).
 RESYNC_LAG_FRAMES = FRAMERATE  # 1 second of lag -- small jitter is normal, this is well past that
 
+# How far ahead of a segment boundary (in frames) ClipPlayer._maybe_start_prefetch starts decoding
+# the *next* segment's qcamera data in the background, so the segment-boundary _reload() can often
+# find it already sitting in the cache instead of blocking on a fresh whole-segment ffmpeg call --
+# see _decode_qcam_segment and ClipPlayer._prefetch_cache. 10s is a generous margin against however
+# long that decode actually takes on this hardware (not precisely measured; err on the side of
+# starting early since the cost of doing so is just a second background ffmpeg process for a few
+# seconds, not a correctness issue either way -- worst case the segment boundary is still reached
+# before decode finishes and _reload() blocks same as before, no worse than not prefetching at all).
+PREFETCH_LEAD_FRAMES = 10 * FRAMERATE
+
 # Number of physical buffers VisionIpcServer.create_buffers() allocates per stream. CameraView
 # (selfdrive/ui/onroad/cameraview.py -- shared with the live onroad screen, not modified by this
 # feature) caches one GPU/EGL/DMA-buf import per distinct frame.idx it sees, keyed by whatever idx
@@ -201,12 +211,39 @@ def _get_frame_dimensions(camera_path: str) -> tuple[int, int]:
   return stream["width"], stream["height"]
 
 
+def _decode_qcam_segment(path: str, frame_size: tuple[int, int] | None) -> np.ndarray | None:
+  """Decode one whole qcamera.ts segment file into an (num_frames, w*h*1.5) NV12 byte array via a
+  single blocking ffmpeg call. This is the exact cost ClipPlayer's background prefetch (see
+  _maybe_start_prefetch) exists to hide -- extracted out of _iter_segment_frames so both the
+  regular (on-demand, possibly-blocking) decode path and the prefetch path share one
+  implementation. Returns None on failure (already logged)."""
+  w, h = frame_size or _get_frame_dimensions(path)
+  with FileReader(path) as f:
+    # "-i pipe:0", not "-i -": CONFIRMED ON-DEVICE (live SSH, 2026-07-01) this device's
+    # ffmpeg is a minimal build (--disable-autodetect, --enable-protocol='file,pipe' only --
+    # see `ffmpeg -version`'s configuration line) that does not resolve the "-" stdin
+    # shorthand the way a typical full-featured ffmpeg build does -- it fails immediately
+    # with "Error opening input: Protocol not found". tools/clip/run.py has this same "-i -"
+    # invocation but is normally run on a dev PC with a full ffmpeg build, so this never
+    # surfaced there. "-v error" (was "quiet"): quiet was swallowing the real error text
+    # above, which is exactly what made this fail silently instead of self-diagnosing.
+    result = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "-"],
+                            input=f.read(), capture_output=True)
+  if result.returncode != 0:
+    cloudlog.warning(f"clip_playback: ffmpeg qcamera decode failed: {result.stderr.decode()}")
+    return None
+  return np.frombuffer(result.stdout, dtype=np.uint8).reshape(-1, w * h * 3 // 2)
+
+
 def _iter_segment_frames(camera_paths, start_time, end_time, fps=FRAMERATE, use_qcam=False,
-                          frame_size: tuple[int, int] | None = None):
-  """Same as tools/clip/run.py's iter_segment_frames, except it stops the generator quietly
+                          frame_size: tuple[int, int] | None = None,
+                          prefetch_cache: dict[int, np.ndarray] | None = None):
+  """Same as tools/clip/run.py's iter_segment_frames, except (a) it stops the generator quietly
   instead of raising when it runs past the last recorded segment/frame -- a nominal
   num_segments*60s route duration can overrun the real (possibly shorter) last segment, and that
-  is expected here (we don't parse logs just to find the exact last frame for a list display)."""
+  is expected here (we don't parse logs just to find the exact last frame for a list display), and
+  (b) for qcam, it checks prefetch_cache (popping the entry once consumed) before paying for a
+  fresh decode -- see ClipPlayer._maybe_start_prefetch, which is what actually populates it."""
   frames_per_seg = fps * SEG_SECONDS
   start_frame, end_frame = int(start_time * fps), int(end_time * fps)
   current_seg = -1
@@ -222,22 +259,10 @@ def _iter_segment_frames(camera_paths, start_time, end_time, fps=FRAMERATE, use_
         return
 
       if use_qcam:
-        w, h = frame_size or _get_frame_dimensions(path)
-        with FileReader(path) as f:
-          # "-i pipe:0", not "-i -": CONFIRMED ON-DEVICE (live SSH, 2026-07-01) this device's
-          # ffmpeg is a minimal build (--disable-autodetect, --enable-protocol='file,pipe' only --
-          # see `ffmpeg -version`'s configuration line) that does not resolve the "-" stdin
-          # shorthand the way a typical full-featured ffmpeg build does -- it fails immediately
-          # with "Error opening input: Protocol not found". tools/clip/run.py has this same "-i -"
-          # invocation but is normally run on a dev PC with a full ffmpeg build, so this never
-          # surfaced there. "-v error" (was "quiet"): quiet was swallowing the real error text
-          # above, which is exactly what made this fail silently instead of self-diagnosing.
-          result = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "-"],
-                                  input=f.read(), capture_output=True)
-        if result.returncode != 0:
-          cloudlog.warning(f"clip_playback: ffmpeg qcamera decode failed: {result.stderr.decode()}")
+        cached = prefetch_cache.pop(seg_idx, None) if prefetch_cache is not None else None
+        seg_frames = cached if cached is not None else _decode_qcam_segment(path, frame_size)
+        if seg_frames is None:
           return
-        seg_frames = np.frombuffer(result.stdout, dtype=np.uint8).reshape(-1, w * h * 3 // 2)
       else:
         seg_frames = FrameReader(path, pix_fmt="nv12")
 
@@ -251,10 +276,16 @@ def _iter_segment_frames(camera_paths, start_time, end_time, fps=FRAMERATE, use_
 
 
 class FrameQueue:
-  """Background camera-frame decoder/prefetcher -- behavior matches tools/clip/run.py's
-  FrameQueue exactly. Strictly sequential/forward over [start_time, end_time); it cannot rewind
-  or jump ahead, so ClipPlayer recreates a fresh one on every seek (see ClipPlayer._reload)."""
-  def __init__(self, camera_paths, start_time, end_time, fps=FRAMERATE, prefetch_count=60, use_qcam=False):
+  """Background camera-frame decoder -- behavior matches tools/clip/run.py's FrameQueue exactly.
+  Strictly sequential/forward over [start_time, end_time); it cannot rewind or jump ahead, so
+  ClipPlayer recreates a fresh one on every seek (see ClipPlayer._reload). "prefetch_count" here is
+  just this queue's own bounded look-ahead buffer (frames decoded but not yet consumed) -- a
+  different, smaller-scale thing from ClipPlayer's cross-segment prefetch_cache (a whole segment,
+  decoded ahead of time in a separate thread so a segment-boundary _reload() doesn't have to pay
+  for that decode from a cold start; see ClipPlayer._maybe_start_prefetch), which is what the
+  optional prefetch_cache param here threads through to _iter_segment_frames."""
+  def __init__(self, camera_paths, start_time, end_time, fps=FRAMERATE, prefetch_count=60, use_qcam=False,
+               prefetch_cache: dict[int, np.ndarray] | None = None):
     first_path = next((p for p in camera_paths if p), None)
     if not first_path:
       raise RuntimeError("No valid camera paths")
@@ -265,14 +296,14 @@ class FrameQueue:
     self._error: Exception | None = None
     self._thread = threading.Thread(
       target=self._worker,
-      args=(camera_paths, start_time, end_time, fps, use_qcam, (self.frame_w, self.frame_h)),
+      args=(camera_paths, start_time, end_time, fps, use_qcam, (self.frame_w, self.frame_h), prefetch_cache),
       daemon=True,
     )
     self._thread.start()
 
-  def _worker(self, camera_paths, start_time, end_time, fps, use_qcam, frame_size):
+  def _worker(self, camera_paths, start_time, end_time, fps, use_qcam, frame_size, prefetch_cache):
     try:
-      for idx, data in _iter_segment_frames(camera_paths, start_time, end_time, fps, use_qcam, frame_size):
+      for idx, data in _iter_segment_frames(camera_paths, start_time, end_time, fps, use_qcam, frame_size, prefetch_cache):
         if self._stop.is_set():
           break
         self._queue.put((idx, data.tobytes()))
@@ -326,6 +357,13 @@ class ClipPlayer:
     self._wide_pending: tuple[int, bytes] | None = None
     self._vipc: VisionIpcServer | None = None
     self._frame_send_count = 0  # diagnostic: logged once so a future test is diagnosable via cloudlog
+
+    # Cross-segment prefetch (qcam only -- see _maybe_start_prefetch/PREFETCH_LEAD_FRAMES). At most
+    # one segment's worth ever cached at a time; _prefetch_seg_idx is which segment that cache
+    # entry is for (or was last triggered for), so a repeat call near the same boundary is a no-op.
+    self._prefetch_cache: dict[int, np.ndarray] = {}
+    self._prefetch_thread: threading.Thread | None = None
+    self._prefetch_seg_idx: int | None = None
 
     self.total_frames = 0
     self._route_frame = 0  # wall-clock DECODE TARGET -- drives _reload()/window positioning only
@@ -419,7 +457,8 @@ class ClipPlayer:
     window_end_s = seg_end * SEG_SECONDS
     if target_s < window_end_s and any(self._camera_paths[seg_start:seg_end]):
       try:
-        fq = FrameQueue(self._camera_paths, target_s, window_end_s, fps=FRAMERATE, use_qcam=self._use_qcam)
+        fq = FrameQueue(self._camera_paths, target_s, window_end_s, fps=FRAMERATE, use_qcam=self._use_qcam,
+                        prefetch_cache=self._prefetch_cache if self._use_qcam else None)
         vipc = VisionIpcServer("camerad")
         vipc.create_buffers(VisionStreamType.VISION_STREAM_ROAD, NUM_VIPC_BUFFERS, fq.frame_w, fq.frame_h)
 
@@ -451,6 +490,48 @@ class ClipPlayer:
         self._frame_queue = None
         self._wide_frame_queue = None
         self._vipc = None
+
+  def _maybe_start_prefetch(self):
+    """Kick off decoding the *next* segment's qcamera data in a background thread once we're
+    within PREFETCH_LEAD_FRAMES of needing it, so the segment-boundary _reload() (still triggered
+    reactively, right when the boundary is actually crossed) can often find it already sitting in
+    self._prefetch_cache instead of blocking on a fresh whole-segment ffmpeg call from a cold
+    start. Only relevant for qcam: fcamera's FrameReader is a proper incremental/seekable decoder,
+    not one blocking call for an entire 60s segment, so it doesn't have this problem to begin with.
+
+    Deliberately simple: at most one segment ever prefetched ahead, tracked by _prefetch_seg_idx so
+    a repeated call near the same boundary is a cheap no-op, and the (large -- a whole decoded
+    segment, tens of MB) cache entry is cleared before starting a new prefetch rather than
+    accumulating one per boundary crossed. If the user seeks away before this segment is ever
+    reached, the finished prefetch just sits unused in the cache until overwritten by the next
+    trigger or the route closes -- wasted background CPU time, not a correctness or leak concern
+    (self.close() clears it)."""
+    if not self._use_qcam or not self.route:
+      return
+    num_segs = len(self._camera_paths)
+    frames_per_seg = SEG_SECONDS * FRAMERATE
+    cur_seg = self._route_frame // frames_per_seg
+    next_seg = cur_seg + 1
+    if next_seg >= num_segs:
+      return  # no next segment to prefetch
+    if frames_per_seg - (self._route_frame % frames_per_seg) > PREFETCH_LEAD_FRAMES:
+      return  # not close enough to the boundary yet
+    if self._prefetch_seg_idx == next_seg:
+      return  # already triggered (in flight or already cached) for this one
+    path = self._camera_paths[next_seg]
+    if not path:
+      return
+
+    self._prefetch_seg_idx = next_seg
+    self._prefetch_cache.clear()
+
+    def _worker(seg_idx: int = next_seg, path: str = path):
+      frames = _decode_qcam_segment(path, None)
+      if frames is not None:
+        self._prefetch_cache[seg_idx] = frames
+
+    self._prefetch_thread = threading.Thread(target=_worker, daemon=True)
+    self._prefetch_thread.start()
 
   # -- transport ------------------------------------------------------------------------------
   def play(self):
@@ -524,6 +605,7 @@ class ClipPlayer:
       self._route_frame = target
       if target >= self.total_frames - 1:
         self.playing = False
+      self._maybe_start_prefetch()
 
     self._pump_camera_frames()
 
@@ -691,6 +773,10 @@ class ClipPlayer:
       self._teardown_frame_feed()
       self._message_chunks = []
       self._window_seg_start = -1
+      # Don't join self._prefetch_thread -- it's a daemon thread decoding on its own; just stop
+      # referencing its result. Safe to abandon (matches FrameQueue's own daemon threads).
+      self._prefetch_cache.clear()
+      self._prefetch_seg_idx = None
     finally:
       self._restore_patch()
 
