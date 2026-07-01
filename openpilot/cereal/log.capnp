@@ -561,7 +561,7 @@ struct PandaState @0xa7649e2575e4591e {
 
   # these fields are not used by openpilot, but they're
   # reserved for forks building alternate experiences.
-  controlsAllowedRESERVED1 @38 :Bool;
+  lateralAllowed @38 :Bool;
   controlsAllowedRESERVED2 @39 :Bool;
 
   enum FaultStatus {
@@ -2589,7 +2589,7 @@ struct Event {
     # DO change the name of the field and struct
     # DON'T change the ID (e.g. @107)
     # DON'T change which struct it points to
-    customReserved0 @107 :Custom.CustomReserved0;
+    spysydriveStateSP @107 :Custom.SpysydriveStateSP;
     customReserved1 @108 :Custom.CustomReserved1;
     customReserved2 @109 :Custom.CustomReserved2;
     customReserved3 @110 :Custom.CustomReserved3;

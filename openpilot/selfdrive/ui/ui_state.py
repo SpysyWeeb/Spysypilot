@@ -21,6 +21,7 @@ class UIStatus(Enum):
   DISENGAGED = "disengaged"
   ENGAGED = "engaged"
   OVERRIDE = "override"
+  AOL_ACTIVE = "aol_active"
 
 
 class UIState:
@@ -51,6 +52,7 @@ class UIState:
         "wideRoadCameraState",
         "managerState",
         "selfdriveState",
+        "spysydriveStateSP",
         "longitudinalPlan",
         "gpsLocationExternal",
         "carOutput",
@@ -161,14 +163,18 @@ class UIState:
         callback()
 
   def _update_status(self) -> None:
-    if self.started and self.sm.updated["selfdriveState"]:
+    if self.started and (self.sm.updated["selfdriveState"] or self.sm.updated["spysydriveStateSP"]):
       ss = self.sm["selfdriveState"]
       state = ss.state
 
       if state in (log.SelfdriveState.OpenpilotState.preEnabled, log.SelfdriveState.OpenpilotState.overriding):
         self.status = UIStatus.OVERRIDE
+      elif ss.enabled:
+        self.status = UIStatus.ENGAGED
+      elif self.sm["spysydriveStateSP"].aol.active:
+        self.status = UIStatus.AOL_ACTIVE
       else:
-        self.status = UIStatus.ENGAGED if ss.enabled else UIStatus.DISENGAGED
+        self.status = UIStatus.DISENGAGED
 
     # Check for engagement state changes
     if self.engaged != self._engaged_prev:
