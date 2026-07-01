@@ -194,7 +194,15 @@ def _iter_segment_frames(camera_paths, start_time, end_time, fps=FRAMERATE, use_
       if use_qcam:
         w, h = frame_size or _get_frame_dimensions(path)
         with FileReader(path) as f:
-          result = subprocess.run(["ffmpeg", "-v", "quiet", "-i", "-", "-f", "rawvideo", "-pix_fmt", "nv12", "-"],
+          # "-i pipe:0", not "-i -": CONFIRMED ON-DEVICE (live SSH, 2026-07-01) this device's
+          # ffmpeg is a minimal build (--disable-autodetect, --enable-protocol='file,pipe' only --
+          # see `ffmpeg -version`'s configuration line) that does not resolve the "-" stdin
+          # shorthand the way a typical full-featured ffmpeg build does -- it fails immediately
+          # with "Error opening input: Protocol not found". tools/clip/run.py has this same "-i -"
+          # invocation but is normally run on a dev PC with a full ffmpeg build, so this never
+          # surfaced there. "-v error" (was "quiet"): quiet was swallowing the real error text
+          # above, which is exactly what made this fail silently instead of self-diagnosing.
+          result = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "nv12", "-"],
                                   input=f.read(), capture_output=True)
         if result.returncode != 0:
           cloudlog.warning(f"clip_playback: ffmpeg qcamera decode failed: {result.stderr.decode()}")
