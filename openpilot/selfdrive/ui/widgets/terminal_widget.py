@@ -99,7 +99,7 @@ class TerminalWidget(Widget):
 
     def _handle_mouse_release(self, mouse_pos) -> None:
         if self._background_tap_callback:
-            self._background_tap_callback()
+            self._background_tap_callback(mouse_pos)
 
     def _render(self, rect: rl.Rectangle) -> None:
         rl.draw_rectangle_rounded(rect, 0.025, 10, _BG)

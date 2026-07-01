@@ -30,7 +30,7 @@ class StatsPageWidget(Widget):
 
     def _handle_mouse_release(self, mouse_pos) -> None:
         if self._background_tap_callback:
-            self._background_tap_callback()
+            self._background_tap_callback(mouse_pos)
 
     def _maybe_reload(self):
         now = time.monotonic()
