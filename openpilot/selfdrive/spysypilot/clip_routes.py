@@ -16,8 +16,11 @@ from openpilot.selfdrive.spysypilot.drive_statsd import _list_routes
 # duration estimate without parsing any logs.
 SEGMENT_APPROX_SECONDS = 60
 
-# On-disk route name: "<16-hex-char dongle_id>_<YYYY-MM-DD>--<HH-MM-SS>"
-_ROUTE_NAME_RE = re.compile(r'^[0-9a-f]{16}_(?P<date>\d{4}-\d{2}-\d{2})--(?P<time>\d{2}-\d{2}-\d{2})$')
+# On-disk route name: "<dongle_id>_<YYYY-MM-DD>--<HH-MM-SS>". Deliberately NOT anchored on the
+# dongle_id's format (length/charset) -- a real device's dongle_id turned out not to match the
+# assumed 16-lowercase-hex-char pattern (every route showed "unknown date" in the field), so this
+# only anchors on the fixed-format date/time suffix and ignores whatever precedes it.
+_ROUTE_NAME_RE = re.compile(r'(?P<date>\d{4}-\d{2}-\d{2})--(?P<time>\d{2}-\d{2}-\d{2})$')
 
 
 @dataclass
@@ -33,7 +36,7 @@ class RouteSummary:
 
 
 def _format_date(route_name: str) -> str:
-  m = _ROUTE_NAME_RE.match(route_name)
+  m = _ROUTE_NAME_RE.search(route_name)
   if not m:
     return "unknown date"
   return f"{m.group('date')} {m.group('time').replace('-', ':')}"

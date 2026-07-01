@@ -24,8 +24,8 @@ from openpilot.system.ui.widgets.list_view import button_item
 from openpilot.system.ui.widgets.scroller_tici import Scroller
 
 MARGIN = 40
-PREVIEW_W = 480
-PREVIEW_H = 270
+PREVIEW_W = 900
+PREVIEW_H = 506
 SEEK_BAR_HEIGHT = 90
 BACK_BTN_W = 200
 BACK_BTN_H = 90
