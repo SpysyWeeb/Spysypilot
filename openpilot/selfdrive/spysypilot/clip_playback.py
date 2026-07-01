@@ -413,6 +413,12 @@ class ClipPlayer:
     if not self.route or self.total_frames == 0:
       return
     frame = max(0, min(frame, self.total_frames - 1))
+    # Defense in depth against duplicate/bursty seek calls (see clip_seek_bar.py's
+    # _handle_mouse_event docstring) -- _reload() unconditionally tears down and recreates the
+    # VisionIpcServer/FrameQueue/GL textures, so a no-op duplicate seek to the exact frame we're
+    # already serving should skip that entirely rather than repeat the expensive rebuild.
+    if frame == self._route_frame and self._frame_queue is not None:
+      return
     self._route_frame = frame
     self._reload(frame)
     if self.playing:

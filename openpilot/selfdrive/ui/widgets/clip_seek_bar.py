@@ -60,22 +60,28 @@ class ClipSeekBar(Widget):
     return max(0.0, min((x - track.x) / track.width, 1.0))
 
   def _handle_mouse_event(self, mouse_event: MouseEvent) -> None:
+    """Only commit a seek on release, not on press or on every intermediate drag sample.
+    CONFIRMED ON-DEVICE (live SSH session, 2026-07-01): each seek commit tears down and recreates
+    the entire VisionIpcServer/FrameQueue/GL textures (ClipPlayer._reload -> unconditional
+    _teardown_frame_feed + recreate), and mouse events can arrive in bursts of a dozen-plus for
+    what was physically a single touch (observed on the back button: ~18 duplicate release events
+    in ~20ms when the render loop is already stalling) -- committing on every press+move+release
+    sample turned one drag gesture into a storm of full server/texture rebuilds, which was the
+    dominant cause of sustained stutter (FPS logged as low as 0, sustained 3-7 for a minute-plus),
+    not a one-time hiccup. Dragging still updates the visually-displayed position every sample
+    (cheap, local-only), just without touching the player until the finger lifts."""
     super()._handle_mouse_event(mouse_event)
     track = self._track_rect(self._slider_rect())
 
     if mouse_event.left_pressed:
       self._dragging = True
       self._progress = self._progress_from_x(track, mouse_event.pos.x)
-      if self._seek_callback:
-        self._seek_callback(self._progress)
     elif mouse_event.left_released:
       if self._dragging and self._seek_callback:
         self._seek_callback(self._progress)
       self._dragging = False
     elif self._dragging:
       self._progress = self._progress_from_x(track, mouse_event.pos.x)
-      if self._seek_callback:
-        self._seek_callback(self._progress)
 
   def _slider_rect(self) -> rl.Rectangle:
     return rl.Rectangle(self._rect.x, self._rect.y + LABEL_ROW_HEIGHT, self._rect.width, self._rect.height - LABEL_ROW_HEIGHT)
