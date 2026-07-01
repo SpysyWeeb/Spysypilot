@@ -5,6 +5,7 @@ from enum import IntEnum
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAlert
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
+from openpilot.selfdrive.ui.widgets.clip_viewer_button import ClipViewerButton
 from openpilot.selfdrive.ui.widgets.prime import PrimeWidget
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -59,6 +60,7 @@ class HomeLayout(Widget):
     self._setup_widget = SetupWidget()
 
     self._exp_mode_button = ExperimentalModeButton()
+    self._clip_viewer_button = ClipViewerButton()
     self._setup_callbacks()
 
   def show_event(self):
@@ -194,18 +196,20 @@ class HomeLayout(Widget):
     self._prime_widget.render(self.left_column_rect)
 
   def _render_right_column(self):
-    exp_height = 125
-    exp_rect = rl.Rectangle(
-      self.right_column_rect.x, self.right_column_rect.y, self.right_column_rect.width, exp_height
-    )
-    self._exp_mode_button.render(exp_rect)
+    # Fixed-height, SPACING-stacked buttons top-to-bottom, remainder goes to setup_widget. Same
+    # pattern this fork uses for its other right-column buttons (update/screen-timeout/error-log,
+    # not present on this branch -- see clip-viewer report), so slotting more buttons in later is
+    # just adding another `step` multiple below.
+    btn_height = 125
+    step = btn_height + SPACING
+    x = self.right_column_rect.x
+    y = self.right_column_rect.y
+    w = self.right_column_rect.width
 
-    setup_rect = rl.Rectangle(
-      self.right_column_rect.x,
-      self.right_column_rect.y + exp_height + SPACING,
-      self.right_column_rect.width,
-      self.right_column_rect.height - exp_height - SPACING,
-    )
+    self._exp_mode_button.render(rl.Rectangle(x, y, w, btn_height))
+    self._clip_viewer_button.render(rl.Rectangle(x, y + step, w, btn_height))
+
+    setup_rect = rl.Rectangle(x, y + 2 * step, w, self.right_column_rect.height - 2 * step)
     self._setup_widget.render(setup_rect)
 
   def _refresh(self):
