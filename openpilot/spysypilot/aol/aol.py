@@ -2,6 +2,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.selfdrived.events import ET, Events
 from openpilot.spysypilot.aol.state import AolStateMachine, ACTIVE_STATES, ENABLED_STATES, State
 from openpilot.spysypilot.aol.helpers import is_hyundai_always_allow
@@ -57,6 +58,7 @@ class AolDriver:
     else:
       self._lateral_mismatch_counter = 0
     if self._lateral_mismatch_counter >= 200:
+      cloudlog.error("AOL: panda lateral_allowed mismatch for 2s, forcing immediateDisable")
       self.state_machine.add_event('immediateDisable')
 
   def update_events(self, CS) -> None:
@@ -74,6 +76,7 @@ class AolDriver:
     lkas_pressed = any(be.type == ButtonType.lkas and be.pressed for be in CS.buttonEvents)
     if lkas_pressed:
       if self.enabled:
+        cloudlog.warning("AOL: userDisable (lkas button)")
         self.state_machine.add_event('userDisable')
       else:
         if cruise_available or self.allow_always:
@@ -85,6 +88,7 @@ class AolDriver:
     main_pressed = any(be.type == ButtonType.mainCruise and be.pressed for be in CS.buttonEvents)
     if main_pressed:
       if self.enabled:
+        cloudlog.warning("AOL: userDisable (mainCruise button)")
         self.state_machine.add_event('userDisable')
       else:
         self.state_machine.add_event('lkasEnable')
@@ -97,6 +101,7 @@ class AolDriver:
     # ACC main falling edge → deactivate AOL (for cars where cruiseState.available changes)
     if not cruise_available and self._cruise_available_prev:
       if self.enabled:
+        cloudlog.warning("AOL: immediateDisable (cruiseState.available falling edge)")
         self.state_machine.add_event('immediateDisable')
 
     self._cruise_available_prev = cruise_available
@@ -109,8 +114,12 @@ class AolDriver:
 
     # Steering fault → disable
     if CS.steerFaultPermanent:
+      if self.enabled:
+        cloudlog.error("AOL: immediateDisable (steerFaultPermanent)")
       self.state_machine.add_event('immediateDisable')
     elif CS.steerFaultTemporary:
+      if self.active:
+        cloudlog.warning("AOL: softDisable (steerFaultTemporary)")
       self.state_machine.add_event('softDisable')
 
     # REMAIN_ACTIVE: brake/gas press does NOT affect AOL state
