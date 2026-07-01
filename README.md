@@ -33,6 +33,6 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ❌ **Better longitudinal tune** — tune follow distance stability (less speed hunting), lead reaction speed, launch smoothness from stops, and overall jerk feel to be more natural and comfortable &nbsp;*(personal idea)*
 - ✅ **Detailed system stats sidebar** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 - ❌ **Replace the live on-road view with a live stats screen** — swap the road camera feed for a display of real-time driving metrics such as speed, acceleration, follow distance, and engagement state &nbsp;*(personal idea)*
-- ❌ **Clip.py route viewer** — wire up the existing Clip.py openpilot tool to run on the device with a UI for browsing and reviewing recorded drive clips &nbsp;*(personal idea)*
+- ⚠️ **Clip.py route viewer** — wire up the existing Clip.py openpilot tool to run on the device with a UI for browsing and reviewing recorded drive clips &nbsp;*(personal idea)*
 
 _\* = functional but could be better_
