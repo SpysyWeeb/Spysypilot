@@ -25,6 +25,15 @@ Differences from tools/clip/run.py (which is unmodified -- see that file for the
    frame index is read live from this instance (self._route_frame / self._window_seg_start)
    instead of captured once over a fixed message_chunks list -- a window reload (seek) then just
    needs to update that state, not reinstall the patch.
+ - The idx passed to VisionIpcServer.send() is NOT the raw route-frame counter run.py uses --
+   see NUM_VIPC_BUFFERS below. CONFIRMED IN THE FIELD: shipping this with run.py's unbounded idx
+   froze the device (silent, unrecoverable, no OOM-killer log, no panic, no crash log -- consistent
+   with a wedged GPU driver) after ~14s/~280 frames of playback. run.py never surfaces this because
+   it's a short-lived process that exits right after rendering one clip.
+ - Also serves VISION_STREAM_WIDE_ROAD (matching run.py's conditional wide-camera setup) instead
+   of road-only: AugmentedRoadView can switch to wide mid-replay (this fork's own
+   experimental-mode hot-swap feature makes replayed experimentalMode=True routes common), and a
+   road-only server leaves that switch stuck retrying an unthrottled per-frame reconnect forever.
 
 SAFETY-CRITICAL, read before touching this file:
 ui_state (selfdrive/ui/ui_state.py) is a hard process-wide singleton. selfdrive/ui/ui.py's main
@@ -72,6 +81,20 @@ SEG_SECONDS = 60  # nominal segment length
 WINDOW_SEGMENTS = 2  # how many ~60s segments to keep parsed/decoded around the playhead
 MAX_FRAMES_PER_TICK = 10  # cap catch-up work per UI frame after a stall/seek
 
+# Number of physical buffers VisionIpcServer.create_buffers() allocates per stream. CameraView
+# (selfdrive/ui/onroad/cameraview.py -- shared with the live onroad screen, not modified by this
+# feature) caches one GPU/EGL/DMA-buf import per distinct frame.idx it sees, keyed by whatever idx
+# value send() was called with, and never evicts that cache short of the widget being fully closed.
+# tools/clip/run.py passes a route-relative frame counter (0..thousands) as idx and gets away with
+# it because it's a short-lived process that exits after rendering one clip -- any accumulation
+# dies with the process. This runs inside the long-lived, cached-for-the-app's-lifetime ui process
+# instead (see clip_viewer_button.py), so an unbounded, ever-growing idx would mean an unbounded,
+# never-freed GPU resource per frame -- a real, confirmed-in-the-field device freeze (silent, no
+# OOM-killer log, no panic, no crash log: consistent with a wedged GPU driver, not a clean crash).
+# Fix: cycle idx through [0, NUM_VIPC_BUFFERS) so CameraView's cache legitimately reuses at most
+# this many entries, mirroring how the small physical buffer ring is actually sized.
+NUM_VIPC_BUFFERS = 4
+
 
 def _resolve_segment(log_root: str, seg_dir_name: str) -> dict[str, str | None]:
   """Find the known on-disk filenames for one segment directory.
@@ -99,6 +122,7 @@ def _resolve_segment(log_root: str, seg_dir_name: str) -> dict[str, str | None]:
     'log_path': find(FileName.RLOG),
     'camera_path': find(FileName.FCAMERA),
     'qcamera_path': find(FileName.QCAMERA),
+    'ecamera_path': find(FileName.ECAMERA),
   }
 
 
@@ -252,13 +276,16 @@ class ClipPlayer:
     self.route: RouteSummary | None = None
     self._log_paths: list[str | None] = []
     self._camera_paths: list[str | None] = []
+    self._ecamera_paths: list[str | None] = []
     self._use_qcam = False
 
     self._window_seg_start = -1
     self._message_chunks: list[dict] = []
 
     self._frame_queue: FrameQueue | None = None
+    self._wide_frame_queue: FrameQueue | None = None
     self._vipc: VisionIpcServer | None = None
+    self._frame_send_count = 0  # diagnostic: logged once so a future test is diagnosable via cloudlog
 
     self.total_frames = 0
     self._route_frame = 0
@@ -283,11 +310,13 @@ class ClipPlayer:
     self.route = route
     self._log_paths = []
     self._camera_paths = []
+    self._ecamera_paths = []
     qcamera_paths: list[str | None] = []
     for seg_name in route.segments:
       paths = _resolve_segment(self._log_root, seg_name)
       self._log_paths.append(paths['log_path'])
       self._camera_paths.append(paths['camera_path'])
+      self._ecamera_paths.append(paths['ecamera_path'])
       qcamera_paths.append(paths['qcamera_path'])
 
     # Fall back to qcamera for the whole route if any segment is missing the full-res camera
@@ -296,6 +325,7 @@ class ClipPlayer:
     if self._use_qcam:
       self._camera_paths = qcamera_paths
 
+    self._frame_send_count = 0
     self.total_frames = route.num_segments * SEG_SECONDS * FRAMERATE
     self._route_frame = 0
     self.playing = False
@@ -332,13 +362,35 @@ class ClipPlayer:
       try:
         fq = FrameQueue(self._camera_paths, target_s, window_end_s, fps=FRAMERATE, use_qcam=self._use_qcam)
         vipc = VisionIpcServer("camerad")
-        vipc.create_buffers(VisionStreamType.VISION_STREAM_ROAD, 4, fq.frame_w, fq.frame_h)
+        vipc.create_buffers(VisionStreamType.VISION_STREAM_ROAD, NUM_VIPC_BUFFERS, fq.frame_w, fq.frame_h)
+
+        # Also serve VISION_STREAM_WIDE_ROAD when the route has it (mirrors tools/clip/run.py).
+        # Without this, AugmentedRoadView._switch_stream_if_needed can decide to switch to wide
+        # (e.g. replayed experimentalMode + low replayed vEgo -- this fork ships an
+        # experimental-mode hot-swap button, so this is a real, not hypothetical, combination) and
+        # get stuck target-connecting to a stream we never provisioned. Not used with the qcamera
+        # fallback, matching run.py -- qcam-only routes don't have a wide segment to decode either.
+        wfq = None
+        if not self._use_qcam and any(self._ecamera_paths[seg_start:seg_end]):
+          try:
+            wfq = FrameQueue(self._ecamera_paths, target_s, window_end_s, fps=FRAMERATE)
+            vipc.create_buffers(VisionStreamType.VISION_STREAM_WIDE_ROAD, NUM_VIPC_BUFFERS, wfq.frame_w, wfq.frame_h)
+          except Exception:
+            cloudlog.exception("clip_playback: failed to start wide camera feed, road-only")
+            if wfq is not None:
+              wfq.stop()  # create_buffers can fail after the decoder thread already started
+            wfq = None
+
         vipc.start_listener()
         self._frame_queue = fq
+        self._wide_frame_queue = wfq
         self._vipc = vipc
+        cloudlog.debug(f"clip_playback: serving ROAD{'+WIDE' if wfq else ''} buffers "
+                        f"({fq.frame_w}x{fq.frame_h}) for {self.route.name if self.route else '?'}")
       except Exception:
         cloudlog.exception("clip_playback: failed to start camera feed")
         self._frame_queue = None
+        self._wide_frame_queue = None
         self._vipc = None
 
   # -- transport ------------------------------------------------------------------------------
@@ -411,30 +463,56 @@ class ClipPlayer:
     self._pump_camera_frames()
     return True
 
-  def _pump_camera_frames(self):
-    """Drain whatever the background decoder has ready and forward only the most recent frame to
-    the preview VisionIpcServer -- the vision client conflates to the latest buffer anyway, and
-    the UI's own render loop is what actually paints, so intermediate frames on a slow tick don't
-    need to be sent individually. Bounded so a big stall/seek can't spend unbounded time here."""
-    if self._frame_queue is None or self._vipc is None:
-      return
+  def _drain_latest(self, fq: FrameQueue) -> tuple[tuple[int, bytes] | None, bool]:
+    """Drain up to MAX_FRAMES_PER_TICK entries from one decoder queue, keeping only the most
+    recent -- the vision client conflates to the latest buffer anyway, and the UI's own render
+    loop is what actually paints, so intermediate frames on a slow tick don't need sending
+    individually. Bounded so a big stall/seek can't spend unbounded time here. Returns
+    (latest_or_None, exhausted) -- the caller drops its reference to fq when exhausted is True."""
     latest = None
     for _ in range(MAX_FRAMES_PER_TICK):
       try:
-        latest = self._frame_queue.get_nowait()
+        latest = fq.get_nowait()
       except queue.Empty:
         break
       except StopIteration:
-        self._frame_queue = None
-        break
+        return latest, True
       except Exception:
         cloudlog.exception("clip_playback: frame queue error")
+        return latest, True
+    return latest, False
+
+  def _pump_camera_frames(self):
+    """Forward the latest decoded road (and wide, if being served) frame to the preview
+    VisionIpcServer. The idx passed to send() is deliberately NOT the raw route-frame counter --
+    see NUM_VIPC_BUFFERS' module-level comment: CameraView caches one GPU/EGL image per distinct
+    idx forever, so an ever-growing idx is an ever-growing, never-freed GPU resource in this
+    long-lived process. pts is still computed from the real (unbounded) frame counter so playback
+    timing/ordering stays correct -- only the buffer-slot idx is bounded."""
+    if self._vipc is None:
+      return
+
+    if self._frame_queue is not None:
+      road, exhausted = self._drain_latest(self._frame_queue)
+      if exhausted:
         self._frame_queue = None
-        break
-    if latest is not None:
-      idx, frame_bytes = latest
-      pts = int(idx * 5e7)  # matches tools/clip/run.py's synthetic 50ms-per-frame timestamp spacing
-      self._vipc.send(VisionStreamType.VISION_STREAM_ROAD, frame_bytes, idx, pts, pts)
+      if road is not None:
+        idx, frame_bytes = road
+        pts = int(idx * 5e7)  # matches tools/clip/run.py's synthetic 50ms-per-frame timestamp spacing
+        self._vipc.send(VisionStreamType.VISION_STREAM_ROAD, frame_bytes, idx % NUM_VIPC_BUFFERS, pts, pts)
+        self._frame_send_count += 1
+        if self._frame_send_count == 1:
+          route_name = self.route.name if self.route else '?'
+          cloudlog.debug(f"clip_playback: sent first ROAD frame (route idx {idx}) for {route_name}")
+
+    if self._wide_frame_queue is not None:
+      wide, exhausted = self._drain_latest(self._wide_frame_queue)
+      if exhausted:
+        self._wide_frame_queue = None
+      if wide is not None:
+        idx, frame_bytes = wide
+        pts = int(idx * 5e7)
+        self._vipc.send(VisionStreamType.VISION_STREAM_WIDE_ROAD, frame_bytes, idx % NUM_VIPC_BUFFERS, pts, pts)
 
   # -- ui_state.sm monkeypatch (see module docstring) ------------------------------------------
   def _install_patch(self):
@@ -480,6 +558,9 @@ class ClipPlayer:
     if self._frame_queue is not None:
       self._frame_queue.stop()
       self._frame_queue = None
+    if self._wide_frame_queue is not None:
+      self._wide_frame_queue.stop()
+      self._wide_frame_queue = None
     # No explicit close()/stop() API observed on VisionIpcServer anywhere in this codebase's
     # usage (e.g. CameraView.close() just drops its VisionIpcClient reference the same way) --
     # dropping the reference lets its destructor release the shared buffers/listener socket.
@@ -494,6 +575,7 @@ class ClipPlayer:
       self.route = None
       self._log_paths = []
       self._camera_paths = []
+      self._ecamera_paths = []
       self.total_frames = 0
       self._route_frame = 0
       self._teardown_frame_feed()
