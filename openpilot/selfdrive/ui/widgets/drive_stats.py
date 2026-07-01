@@ -1,56 +1,23 @@
 import json
-import time
 import pyray as rl
 
-from openpilot.common.params import Params
 from openpilot.system.ui.lib.application import gui_app, FontWeight
-from openpilot.system.ui.widgets import Widget
+from openpilot.selfdrive.ui.widgets.stats_common import StatsPageWidget, DIM, DIVIDER
 
-REFRESH_INTERVAL = 2.0
-
-_BG       = rl.Color(40, 40, 40, 255)
-_BLUE     = rl.Color(70, 91, 234, 255)
 _GREEN    = rl.Color(70, 200, 100, 255)
 _ORANGE   = rl.Color(234, 160, 50, 255)
 _AOL      = rl.Color(180, 130, 255, 255)
-_DIM      = rl.Color(255, 255, 255, 150)
-_DIVIDER  = rl.Color(255, 255, 255, 35)
 
 
-class DriveStatsWidget(Widget):
+class DriveStatsWidget(StatsPageWidget):
     def __init__(self):
         super().__init__()
-        self._params = Params()
         self._lifetime: dict | None = None
         self._last_drive: dict | None = None
-        self._status: str = ""
-        self._last_refresh = 0.0
-        self._background_tap_callback = None
-
-    def set_background_tap_callback(self, cb) -> None:
-        self._background_tap_callback = cb
-
-    def _handle_mouse_release(self, mouse_pos) -> None:
-        if self._background_tap_callback:
-            self._background_tap_callback()
 
     def _render(self, rect: rl.Rectangle):
-        now = time.monotonic()
-        if now - self._last_refresh >= REFRESH_INTERVAL:
-            self._reload()
-            self._last_refresh = now
-
-        rl.draw_rectangle_rounded(rect, 0.025, 10, _BG)
-
-        pad = 50
-        x = int(rect.x + pad)
-        w = int(rect.width - pad * 2)
-        y = int(rect.y + 45)
-
-        if self._status:
-            fn = gui_app.font(FontWeight.NORMAL)
-            rl.draw_text_ex(fn, self._status, rl.Vector2(x, y), 32, 0, _DIM)
-            y += 48
+        self._maybe_reload()
+        x, y, w = self._draw_frame(rect)
 
         y = self._draw_section("LIFETIME DRIVING", x, y, w)
         y = self._draw_stat_triple(
@@ -74,7 +41,6 @@ class DriveStatsWidget(Widget):
         self._draw_reasons(x, y, w)
 
     def _reload(self):
-        self._status = self._params.get("SpysyStatsStatus") or ""
         for attr, key in (("_lifetime", "SpysyLifetimeStats"), ("_last_drive", "SpysyLastDriveStats")):
             raw = self._params.get(key)
             try:
@@ -109,13 +75,6 @@ class DriveStatsWidget(Widget):
         value = {"engaged": eng, "aol": aol, "disengaged": dis}[side]
         return f"{value / total * 100:.1f}%"
 
-    def _draw_section(self, title: str, x: int, y: int, w: int) -> int:
-        font = gui_app.font(FontWeight.BOLD)
-        rl.draw_text_ex(font, title, rl.Vector2(x, y), 34, 0, _BLUE)
-        line_y = y + 46
-        rl.draw_line_ex(rl.Vector2(x, line_y), rl.Vector2(x + w, line_y), 1, _DIVIDER)
-        return line_y + 18
-
     def _draw_stat_triple(self, x: int, y: int, w: int,
                           l1: str, p1: str, s1: str, c1: rl.Color,
                           l2: str, p2: str, s2: str, c2: rl.Color,
@@ -127,7 +86,7 @@ class DriveStatsWidget(Widget):
             [(l1, p1, s1, c1), (l2, p2, s2, c2), (l3, p3, s3, c3)]
         ):
             col_x = x + i * third
-            rl.draw_text_ex(fn, label,     rl.Vector2(col_x, y),       38, 0, _DIM)
+            rl.draw_text_ex(fn, label,     rl.Vector2(col_x, y),       38, 0, DIM)
             rl.draw_text_ex(fb, primary,   rl.Vector2(col_x, y + 46),  52, 0, color)
             rl.draw_text_ex(fn, secondary, rl.Vector2(col_x, y + 106), 38, 0, color)
         return y + 152
@@ -139,7 +98,7 @@ class DriveStatsWidget(Widget):
         if self._last_drive and self._last_drive.get("reasons"):
             r = self._last_drive["reasons"]
             if sum(r.values()) == 0:
-                rl.draw_text_ex(fn, "No interruptions recorded", rl.Vector2(x, y + 12), 40, 0, _DIM)
+                rl.draw_text_ex(fn, "No interruptions recorded", rl.Vector2(x, y + 12), 40, 0, DIM)
                 return
             # AOL counts as an override reason: it's steering-active middle ground, not a
             # full disengagement, so it belongs alongside Accel/Steering rather than Braking/Cancel.
@@ -149,18 +108,18 @@ class DriveStatsWidget(Widget):
             disengages = [("Braking", f"{r.get('brake', 0.0):.0f}%"),
                           ("Cancel",  f"{r.get('cancel', 0.0):.0f}%")]
         else:
-            rl.draw_text_ex(fn, "No drive data yet", rl.Vector2(x, y + 12), 40, 0, _DIM)
+            rl.draw_text_ex(fn, "No drive data yet", rl.Vector2(x, y + 12), 40, 0, DIM)
             return
 
         half = w // 2
         divider_x = x + half
 
-        rl.draw_line_ex(rl.Vector2(divider_x, y), rl.Vector2(divider_x, y + 116), 1, _DIVIDER)
+        rl.draw_line_ex(rl.Vector2(divider_x, y), rl.Vector2(divider_x, y + 116), 1, DIVIDER)
 
         ow = int(rl.measure_text_ex(fn, "Overrides", 30, 0).x)
         dw = int(rl.measure_text_ex(fn, "Disengagements", 30, 0).x)
-        rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x + (half - ow) // 2,         y), 30, 0, _DIM)
-        rl.draw_text_ex(fn, "Disengagements", rl.Vector2(divider_x + (half - dw) // 2, y), 30, 0, _DIM)
+        rl.draw_text_ex(fn, "Overrides",      rl.Vector2(x + (half - ow) // 2,         y), 30, 0, DIM)
+        rl.draw_text_ex(fn, "Disengagements", rl.Vector2(divider_x + (half - dw) // 2, y), 30, 0, DIM)
 
         row_y = y + 38
         self._draw_reason_cells(x, half, overrides, row_y, fn, fb)
@@ -172,5 +131,5 @@ class DriveStatsWidget(Widget):
             col_center = section_x + i * col_w + col_w // 2
             lw = int(rl.measure_text_ex(fn, label, 34, 0).x)
             vw = int(rl.measure_text_ex(fb, val,   50, 0).x)
-            rl.draw_text_ex(fn, label, rl.Vector2(col_center - lw // 2, row_y),      34, 0, _DIM)
+            rl.draw_text_ex(fn, label, rl.Vector2(col_center - lw // 2, row_y),      34, 0, DIM)
             rl.draw_text_ex(fb, val,   rl.Vector2(col_center - vw // 2, row_y + 42), 50, 0, rl.WHITE)

@@ -22,9 +22,14 @@ _GAS_OVERRIDE    = 13  # gasPressedOverride
 _STEER_OVERRIDE  = 14  # steerOverride
 _STEER_DISENGAGE = 94  # steerDisengage
 
+# |commanded steering angle| at/above this counts as "in a turn" rather than
+# "lane position" when bucketing a steering override by context.
+STEER_ANGLE_TURN_DEG = 15.0
+
 # All fields the current analyzer produces in SpysyLifetimeStats.
 # If stored data is missing any of these, all routes are reanalyzed.
-REQUIRED_LIFETIME_FIELDS = {"engaged_mi", "disengaged_mi", "aol_mi"}
+REQUIRED_LIFETIME_FIELDS = {"engaged_mi", "disengaged_mi", "aol_mi", "override_mi",
+                            "turn_mi", "lane_pos_mi", "lane_change_mi", "avg_divergence_deg"}
 
 
 def _find_rlog(seg_path: str) -> Optional[str]:
@@ -67,11 +72,17 @@ def _parse_segment(seg_path: str) -> dict:
     engaged_m = 0.0
     disengaged_m = 0.0
     aol_m = 0.0
+    override_m = 0.0
+    turn_m = 0.0
+    lane_pos_m = 0.0
+    lane_change_m = 0.0
+    divergence_wsum = 0.0  # degrees * meters, distance-weighted sum for averaging later
     gas = steer = brake = cancel = aol = 0
 
     enabled = False
     aol_active = False
     aol_middle_prev = False
+    commanded_angle = 0.0
     last_t: Optional[float] = None
     last_vego = 0.0
     prev_event_names: set[int] = set()
@@ -91,7 +102,8 @@ def _parse_segment(seg_path: str) -> dict:
             w = msg.which()
 
             if w == 'carState':
-                vego = msg.carState.vEgo
+                cs = msg.carState
+                vego = cs.vEgo
                 if last_t is not None:
                     dt = min(t - last_t, 0.5)
                     m = last_vego * dt
@@ -101,8 +113,25 @@ def _parse_segment(seg_path: str) -> dict:
                         aol_m += m
                     else:
                         disengaged_m += m
+
+                    # Override analysis: only meaningful while the model is actually in
+                    # control (engaged or AOL) and the driver is fighting the wheel.
+                    if (enabled or aol_active) and cs.steeringPressed:
+                        override_m += m
+                        divergence_wsum += abs(commanded_angle - cs.steeringAngleDeg) * m
+                        if cs.leftBlinker or cs.rightBlinker:
+                            lane_change_m += m
+                        elif abs(commanded_angle) >= STEER_ANGLE_TURN_DEG:
+                            turn_m += m
+                        else:
+                            lane_pos_m += m
                 last_t = t
                 last_vego = vego
+
+            elif w == 'carControl':
+                # Angle-based commanded steering (this fork targets an angle-control car);
+                # compared directly against carState.steeringAngleDeg, the actual angle.
+                commanded_angle = msg.carControl.actuators.steeringAngleDeg
 
             elif w == 'selfdriveState':
                 enabled = msg.selfdriveState.enabled
@@ -132,6 +161,11 @@ def _parse_segment(seg_path: str) -> dict:
         'engaged_m': engaged_m,
         'disengaged_m': disengaged_m,
         'aol_m': aol_m,
+        'override_m': override_m,
+        'turn_m': turn_m,
+        'lane_pos_m': lane_pos_m,
+        'lane_change_m': lane_change_m,
+        'divergence_wsum': divergence_wsum,
         'events': {'gas': gas, 'steer': steer, 'brake': brake, 'cancel': cancel, 'aol': aol},
     }
 
@@ -139,6 +173,8 @@ def _parse_segment(seg_path: str) -> dict:
 def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
                  route_name: str, route_idx: int, route_total: int) -> dict:
     total: dict = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0,
+                   'override_m': 0.0, 'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0,
+                   'divergence_wsum': 0.0,
                    'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0, 'aol': 0}}
     n = len(seg_dirs)
     for i, seg_dir in enumerate(seg_dirs, 1):
@@ -150,6 +186,11 @@ def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
         total['engaged_m'] += seg['engaged_m']
         total['disengaged_m'] += seg['disengaged_m']
         total['aol_m'] += seg.get('aol_m', 0.0)
+        total['override_m'] += seg.get('override_m', 0.0)
+        total['turn_m'] += seg.get('turn_m', 0.0)
+        total['lane_pos_m'] += seg.get('lane_pos_m', 0.0)
+        total['lane_change_m'] += seg.get('lane_change_m', 0.0)
+        total['divergence_wsum'] += seg.get('divergence_wsum', 0.0)
         for k in total['events']:
             total['events'][k] += seg['events'].get(k, 0)
     return total
@@ -160,6 +201,15 @@ def _reason_pcts(events: dict) -> dict:
     if total == 0:
         return {k: 0.0 for k in events}
     return {k: round(v / total * 100, 1) for k, v in events.items()}
+
+
+def _merge_avg(old_avg: float, old_weight: float, new_avg: float, new_weight: float) -> float:
+    """Distance-weighted merge of two averages, e.g. combining a route's average
+    divergence into the running lifetime average without needing to keep the raw sum."""
+    total_weight = old_weight + new_weight
+    if total_weight == 0:
+        return 0.0
+    return (old_avg * old_weight + new_avg * new_weight) / total_weight
 
 
 def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
@@ -192,7 +242,8 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
         if needs_reanalysis:
             params.put("SpysyStatsStatus", "New data fields detected — reanalyzing all routes...")
             processed = set()
-            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0}
+            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0, 'override_m': 0.0,
+                        'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0, 'avg_divergence_deg': 0.0}
             _save_lifetime(params, lifetime)
             _save_processed(params, processed)
             return lifetime, processed
@@ -224,10 +275,16 @@ def _load_lifetime(params: Params) -> dict:
                 'engaged_m': stored.get('engaged_mi', 0.0) * METERS_PER_MILE,
                 'disengaged_m': stored.get('disengaged_mi', 0.0) * METERS_PER_MILE,
                 'aol_m': stored.get('aol_mi', 0.0) * METERS_PER_MILE,
+                'override_m': stored.get('override_mi', 0.0) * METERS_PER_MILE,
+                'turn_m': stored.get('turn_mi', 0.0) * METERS_PER_MILE,
+                'lane_pos_m': stored.get('lane_pos_mi', 0.0) * METERS_PER_MILE,
+                'lane_change_m': stored.get('lane_change_mi', 0.0) * METERS_PER_MILE,
+                'avg_divergence_deg': stored.get('avg_divergence_deg', 0.0),
             }
     except Exception:
         pass
-    return {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0}
+    return {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0, 'override_m': 0.0,
+            'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0, 'avg_divergence_deg': 0.0}
 
 
 def _save_lifetime(params: Params, lifetime: dict):
@@ -235,6 +292,11 @@ def _save_lifetime(params: Params, lifetime: dict):
         'engaged_mi': round(lifetime['engaged_m'] / METERS_PER_MILE, 2),
         'disengaged_mi': round(lifetime['disengaged_m'] / METERS_PER_MILE, 2),
         'aol_mi': round(lifetime['aol_m'] / METERS_PER_MILE, 2),
+        'override_mi': round(lifetime['override_m'] / METERS_PER_MILE, 2),
+        'turn_mi': round(lifetime['turn_m'] / METERS_PER_MILE, 2),
+        'lane_pos_mi': round(lifetime['lane_pos_m'] / METERS_PER_MILE, 2),
+        'lane_change_mi': round(lifetime['lane_change_m'] / METERS_PER_MILE, 2),
+        'avg_divergence_deg': round(lifetime['avg_divergence_deg'], 2),
     }))
 
 
@@ -263,7 +325,8 @@ def main():
         # Force refresh: wipe accumulated stats and reprocess everything
         if params.get_bool("SpysyForceStatsRefresh"):
             params.put_bool("SpysyForceStatsRefresh", False)
-            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0}
+            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0, 'override_m': 0.0,
+                        'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0, 'avg_divergence_deg': 0.0}
             processed = set()
             _save_lifetime(params, lifetime)
             _save_processed(params, processed)
@@ -302,6 +365,23 @@ def main():
             eng_pct = round(drive['engaged_m'] / total_m * 100, 1) if total_m > 0 else 0.0
             aol_pct = round(drive['aol_m'] / total_m * 100, 1) if total_m > 0 else 0.0
 
+            # Override analysis: override_pct is share of controlled (engaged+AOL) distance
+            # spent overriding; turn/lane_pos/lane_change_pct break that override time down
+            # by context, so they sum to 100% of override_pct rather than of the whole drive.
+            controlled_m = drive['engaged_m'] + drive['aol_m']
+            override_pct = round(drive['override_m'] / controlled_m * 100, 1) if controlled_m > 0 else 0.0
+            route_avg_divergence = drive['divergence_wsum'] / drive['override_m'] if drive['override_m'] > 0 else 0.0
+            turn_pct = round(drive['turn_m'] / drive['override_m'] * 100, 1) if drive['override_m'] > 0 else 0.0
+            lane_change_pct = round(drive['lane_change_m'] / drive['override_m'] * 100, 1) if drive['override_m'] > 0 else 0.0
+            lane_pos_pct = round(100.0 - turn_pct - lane_change_pct, 1) if drive['override_m'] > 0 else 0.0
+
+            lifetime['avg_divergence_deg'] = _merge_avg(
+                lifetime['avg_divergence_deg'], lifetime['override_m'], route_avg_divergence, drive['override_m'])
+            lifetime['override_m'] += drive['override_m']
+            lifetime['turn_m'] += drive['turn_m']
+            lifetime['lane_pos_m'] += drive['lane_pos_m']
+            lifetime['lane_change_m'] += drive['lane_change_m']
+
             last_drive = {
                 'engaged_mi': round(drive['engaged_m'] / METERS_PER_MILE, 2),
                 'disengaged_mi': round(drive['disengaged_m'] / METERS_PER_MILE, 2),
@@ -310,6 +390,12 @@ def main():
                 'disengaged_pct': round(100.0 - eng_pct - aol_pct, 1),
                 'aol_pct': aol_pct,
                 'reasons': _reason_pcts(drive['events']),
+                'override_mi': round(drive['override_m'] / METERS_PER_MILE, 2),
+                'override_pct': override_pct,
+                'avg_divergence_deg': round(route_avg_divergence, 2),
+                'turn_pct': turn_pct,
+                'lane_pos_pct': lane_pos_pct,
+                'lane_change_pct': lane_change_pct,
             }
 
             processed.add(route_name)
