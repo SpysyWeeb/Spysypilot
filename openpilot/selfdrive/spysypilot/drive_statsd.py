@@ -24,7 +24,7 @@ _STEER_DISENGAGE = 94  # steerDisengage
 
 # All fields the current analyzer produces in SpysyLifetimeStats.
 # If stored data is missing any of these, all routes are reanalyzed.
-REQUIRED_LIFETIME_FIELDS = {"engaged_mi", "disengaged_mi", "override_mi"}
+REQUIRED_LIFETIME_FIELDS = {"engaged_mi", "disengaged_mi", "aol_mi"}
 
 
 def _find_rlog(seg_path: str) -> Optional[str]:
@@ -66,14 +66,24 @@ def _parse_segment(seg_path: str) -> dict:
 
     engaged_m = 0.0
     disengaged_m = 0.0
-    override_m = 0.0
-    gas = steer = brake = cancel = 0
+    aol_m = 0.0
+    gas = steer = brake = cancel = aol = 0
 
     enabled = False
-    override_active = False
+    aol_active = False
+    aol_middle_prev = False
     last_t: Optional[float] = None
     last_vego = 0.0
     prev_event_names: set[int] = set()
+
+    def _mark_aol_edge():
+        # AOL's "middle ground": steering is active (aol_active) but the car isn't
+        # fully engaged (enabled). Counts one event per rising edge into that state.
+        nonlocal aol, aol_middle_prev
+        aol_middle = aol_active and not enabled
+        if aol_middle and not aol_middle_prev:
+            aol += 1
+        aol_middle_prev = aol_middle
 
     try:
         for msg in LogReader(rlog):
@@ -87,8 +97,8 @@ def _parse_segment(seg_path: str) -> dict:
                     m = last_vego * dt
                     if enabled:
                         engaged_m += m
-                        if override_active:
-                            override_m += m
+                    elif aol_active:
+                        aol_m += m
                     else:
                         disengaged_m += m
                 last_t = t
@@ -96,10 +106,14 @@ def _parse_segment(seg_path: str) -> dict:
 
             elif w == 'selfdriveState':
                 enabled = msg.selfdriveState.enabled
+                _mark_aol_edge()
+
+            elif w == 'spysydriveStateSP':
+                aol_active = bool(msg.spysydriveStateSP.aol.active)
+                _mark_aol_edge()
 
             elif w == 'onroadEvents':
                 names: set[int] = {ev.name.raw for ev in msg.onroadEvents}
-                override_active = _GAS_OVERRIDE in names or _STEER_OVERRIDE in names
                 new = names - prev_event_names
                 if _GAS_OVERRIDE in new:
                     gas += 1
@@ -117,15 +131,15 @@ def _parse_segment(seg_path: str) -> dict:
     return {
         'engaged_m': engaged_m,
         'disengaged_m': disengaged_m,
-        'override_m': override_m,
-        'events': {'gas': gas, 'steer': steer, 'brake': brake, 'cancel': cancel},
+        'aol_m': aol_m,
+        'events': {'gas': gas, 'steer': steer, 'brake': brake, 'cancel': cancel, 'aol': aol},
     }
 
 
 def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
                  route_name: str, route_idx: int, route_total: int) -> dict:
-    total: dict = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'override_m': 0.0,
-                   'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0}}
+    total: dict = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0,
+                   'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0, 'aol': 0}}
     n = len(seg_dirs)
     for i, seg_dir in enumerate(seg_dirs, 1):
         params.put("SpysyStatsStatus",
@@ -135,7 +149,7 @@ def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
             continue
         total['engaged_m'] += seg['engaged_m']
         total['disengaged_m'] += seg['disengaged_m']
-        total['override_m'] += seg.get('override_m', 0.0)
+        total['aol_m'] += seg.get('aol_m', 0.0)
         for k in total['events']:
             total['events'][k] += seg['events'].get(k, 0)
     return total
@@ -178,7 +192,7 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
         if needs_reanalysis:
             params.put("SpysyStatsStatus", "New data fields detected — reanalyzing all routes...")
             processed = set()
-            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'override_m': 0.0}
+            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0}
             _save_lifetime(params, lifetime)
             _save_processed(params, processed)
             return lifetime, processed
@@ -209,18 +223,18 @@ def _load_lifetime(params: Params) -> dict:
             return {
                 'engaged_m': stored.get('engaged_mi', 0.0) * METERS_PER_MILE,
                 'disengaged_m': stored.get('disengaged_mi', 0.0) * METERS_PER_MILE,
-                'override_m': stored.get('override_mi', 0.0) * METERS_PER_MILE,
+                'aol_m': stored.get('aol_mi', 0.0) * METERS_PER_MILE,
             }
     except Exception:
         pass
-    return {'engaged_m': 0.0, 'disengaged_m': 0.0, 'override_m': 0.0}
+    return {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0}
 
 
 def _save_lifetime(params: Params, lifetime: dict):
     params.put("SpysyLifetimeStats", json.dumps({
         'engaged_mi': round(lifetime['engaged_m'] / METERS_PER_MILE, 2),
         'disengaged_mi': round(lifetime['disengaged_m'] / METERS_PER_MILE, 2),
-        'override_mi': round(lifetime['override_m'] / METERS_PER_MILE, 2),
+        'aol_mi': round(lifetime['aol_m'] / METERS_PER_MILE, 2),
     }))
 
 
@@ -249,7 +263,7 @@ def main():
         # Force refresh: wipe accumulated stats and reprocess everything
         if params.get_bool("SpysyForceStatsRefresh"):
             params.put_bool("SpysyForceStatsRefresh", False)
-            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'override_m': 0.0}
+            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0}
             processed = set()
             _save_lifetime(params, lifetime)
             _save_processed(params, processed)
@@ -280,19 +294,21 @@ def main():
 
             lifetime['engaged_m'] += drive['engaged_m']
             lifetime['disengaged_m'] += drive['disengaged_m']
-            lifetime['override_m'] += drive['override_m']
+            lifetime['aol_m'] += drive['aol_m']
 
-            total_m = drive['engaged_m'] + drive['disengaged_m']
+            # Engaged / AOL / Disengaged are mutually exclusive and always sum to 100%;
+            # disengaged_pct absorbs the rounding remainder so the three stay exact.
+            total_m = drive['engaged_m'] + drive['aol_m'] + drive['disengaged_m']
             eng_pct = round(drive['engaged_m'] / total_m * 100, 1) if total_m > 0 else 0.0
-            override_pct = round(drive['override_m'] / drive['engaged_m'] * 100, 1) if drive['engaged_m'] > 0 else 0.0
+            aol_pct = round(drive['aol_m'] / total_m * 100, 1) if total_m > 0 else 0.0
 
             last_drive = {
                 'engaged_mi': round(drive['engaged_m'] / METERS_PER_MILE, 2),
                 'disengaged_mi': round(drive['disengaged_m'] / METERS_PER_MILE, 2),
-                'override_mi': round(drive['override_m'] / METERS_PER_MILE, 2),
+                'aol_mi': round(drive['aol_m'] / METERS_PER_MILE, 2),
                 'engaged_pct': eng_pct,
-                'disengaged_pct': round(100.0 - eng_pct, 1),
-                'override_pct': override_pct,
+                'disengaged_pct': round(100.0 - eng_pct - aol_pct, 1),
+                'aol_pct': aol_pct,
                 'reasons': _reason_pcts(drive['events']),
             }
 
