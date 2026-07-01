@@ -25,25 +25,56 @@ _STEER_DISENGAGE = 94  # steerDisengage
 
 # A "turn" (as opposed to a highway curve or lane-position nudge) is a low-speed,
 # large-angle maneuver - the kind you'd make at an intersection. Positive
-# steeringAngleDeg is left (ISO convention), so sign(angle) gives turn direction.
+# steeringAngleDeg is left (ISO convention), so sign(angle) gives direction throughout.
 TURN_SPEED_MAX_MS = 15.0 * CV.MPH_TO_MS
 TURN_PEAK_MIN_DEG = 90.0
 
-# Turn-episode detection (for unwind-timing) brackets a turn between crossing this
-# onset angle on the way in and back out; UNWIND_FRACTION of the episode's peak angle
-# is the "starting to straighten out" proxy compared between commanded and actual.
+# Below this |commanded angle|, an override is "straight line" (lane position preference);
+# at/above it (but not a Turn), it's a "curve" (the model is actually steering for road
+# geometry, e.g. a highway bend).
+STRAIGHT_LINE_MAX_DEG = 10.0
+
+# Turn-episode detection (for turn-in/unwind timing) brackets a turn between crossing this
+# onset angle on the way in and back out; UNWIND_FRACTION of the episode's peak angle is the
+# "starting to straighten out" proxy compared between commanded and actual.
 TURN_ONSET_DEG = 20.0
 UNWIND_FRACTION = 0.5
 
 # All fields the current analyzer produces in SpysyLifetimeStats.
 # If stored data is missing any of these, all routes are reanalyzed.
-REQUIRED_LIFETIME_FIELDS = {"engaged_mi", "disengaged_mi", "aol_mi", "override_mi",
-                            "turn_mi", "lane_pos_mi", "lane_change_mi", "avg_divergence_deg",
-                            "turn_left_mi", "turn_right_mi",
-                            "avg_agg_left_deg", "avg_agg_right_deg",
-                            "soft_pct_left", "soft_pct_right",
-                            "avg_unwind_lead_left_s", "avg_unwind_lead_right_s",
-                            "unwind_count_left", "unwind_count_right"}
+REQUIRED_LIFETIME_FIELDS = {
+    "engaged_mi", "disengaged_mi", "aol_mi", "override_mi",
+    "turn_mi", "straight_mi", "curve_mi", "lane_change_mi", "avg_divergence_deg",
+    "turn_left_mi", "turn_right_mi",
+    "avg_agg_left_deg", "avg_agg_right_deg",
+    "soft_pct_left", "soft_pct_right",
+    "avg_unwind_lead_left_s", "avg_unwind_lead_right_s",
+    "unwind_count_left", "unwind_count_right",
+    "avg_turnin_lead_left_s", "avg_turnin_lead_right_s",
+    "turnin_count_left", "turnin_count_right",
+    "straight_left_mi", "straight_right_mi",
+    "avg_pull_left_deg", "avg_pull_right_deg",
+    "curve_left_mi", "curve_right_mi",
+    "avg_curve_agg_left_deg", "avg_curve_agg_right_deg",
+    "curve_soft_pct_left", "curve_soft_pct_right",
+}
+
+_LIFETIME_ZERO = {
+    'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0, 'override_m': 0.0,
+    'turn_m': 0.0, 'straight_m': 0.0, 'curve_m': 0.0, 'lane_change_m': 0.0, 'avg_divergence_deg': 0.0,
+    'turn_left_m': 0.0, 'turn_right_m': 0.0,
+    'avg_agg_left_deg': 0.0, 'avg_agg_right_deg': 0.0,
+    'soft_pct_left': 0.0, 'soft_pct_right': 0.0,
+    'avg_unwind_lead_left_s': 0.0, 'avg_unwind_lead_right_s': 0.0,
+    'unwind_count_left': 0, 'unwind_count_right': 0,
+    'avg_turnin_lead_left_s': 0.0, 'avg_turnin_lead_right_s': 0.0,
+    'turnin_count_left': 0, 'turnin_count_right': 0,
+    'straight_left_m': 0.0, 'straight_right_m': 0.0,
+    'avg_pull_left_deg': 0.0, 'avg_pull_right_deg': 0.0,
+    'curve_left_m': 0.0, 'curve_right_m': 0.0,
+    'avg_curve_agg_left_deg': 0.0, 'avg_curve_agg_right_deg': 0.0,
+    'curve_soft_pct_left': 0.0, 'curve_soft_pct_right': 0.0,
+}
 
 
 def _find_rlog(seg_path: str) -> Optional[str]:
@@ -88,7 +119,8 @@ def _parse_segment(seg_path: str) -> dict:
     aol_m = 0.0
     override_m = 0.0
     turn_m = 0.0
-    lane_pos_m = 0.0
+    straight_m = 0.0
+    curve_m = 0.0
     lane_change_m = 0.0
     divergence_wsum = 0.0  # degrees * meters, distance-weighted sum for averaging later
     gas = steer = brake = cancel = aol = 0
@@ -96,13 +128,26 @@ def _parse_segment(seg_path: str) -> dict:
     # Turn detail, split by direction (left/right). *_m and *_agg_wsum are the override-time
     # distance and signed-divergence-weighted-sum used to compute an "is the model too soft or
     # too aggressive" average; *_soft_m is the subset of that where the driver pushed harder
-    # than commanded (model undershooting).
+    # than commanded (model undershooting). Same pattern reused for curves.
     turn_side_m = {'left': 0.0, 'right': 0.0}
     turn_side_agg_wsum = {'left': 0.0, 'right': 0.0}
     turn_side_soft_m = {'left': 0.0, 'right': 0.0}
 
-    # Unwind-timing: how much sooner the driver starts straightening the wheel out than the
-    # model's own plan would, for turn episodes whose peak exceeds TURN_PEAK_MIN_DEG.
+    curve_side_m = {'left': 0.0, 'right': 0.0}
+    curve_side_agg_wsum = {'left': 0.0, 'right': 0.0}
+    curve_side_soft_m = {'left': 0.0, 'right': 0.0}
+
+    # Straight-line: side is which way the driver is pulling (sign of actual angle, since
+    # commanded is ~0 here and its sign isn't meaningful). wsum is pull magnitude.
+    straight_side_m = {'left': 0.0, 'right': 0.0}
+    straight_side_wsum = {'left': 0.0, 'right': 0.0}
+
+    # Turn-in / unwind timing: how much sooner the driver starts turning into / straightening
+    # out of a turn than the model's own plan would, for turns whose peak exceeds
+    # TURN_PEAK_MIN_DEG. Tracked independently of steeringPressed - even a turn the driver
+    # never touches is a valid (near-zero-lead) data point.
+    turnin_lead_sum = {'left': 0.0, 'right': 0.0}
+    turnin_count = {'left': 0, 'right': 0}
     unwind_lead_sum = {'left': 0.0, 'right': 0.0}
     unwind_count = {'left': 0, 'right': 0}
 
@@ -123,45 +168,68 @@ def _parse_segment(seg_path: str) -> dict:
             aol += 1
         aol_middle_prev = aol_middle
 
-    # Turn-episode state, for unwind timing. Tracked independently of steeringPressed -
-    # even a turn the driver never touches is a valid (near-zero-lead) data point.
+    # Turn-episode state.
     in_turn = False
     turn_side = 0  # +1 left, -1 right
     turn_peak_cmd = 0.0
     turn_peak_cmd_t = 0.0
     turn_peak_act = 0.0
     turn_peak_act_t = 0.0
+    cmd_onset_t: Optional[float] = None
+    act_onset_t: Optional[float] = None
     cmd_unwind_t: Optional[float] = None
     act_unwind_t: Optional[float] = None
 
     def _turn_episode_tick(t: float, ang: float, act: float):
         nonlocal in_turn, turn_side, turn_peak_cmd, turn_peak_cmd_t, turn_peak_act, turn_peak_act_t, \
-            cmd_unwind_t, act_unwind_t
+            cmd_onset_t, act_onset_t, cmd_unwind_t, act_unwind_t
 
         if not in_turn:
-            if abs(ang) >= TURN_ONSET_DEG:
+            # Episode starts on whichever signal (commanded or actual) crosses onset first,
+            # so a driver who leads the model into a turn doesn't get missed.
+            triggered = ang if abs(ang) >= TURN_ONSET_DEG else act if abs(act) >= TURN_ONSET_DEG else None
+            if triggered is not None:
                 in_turn = True
-                turn_side = 1 if ang > 0 else -1
+                turn_side = 1 if triggered > 0 else -1
                 turn_peak_cmd, turn_peak_cmd_t = ang, t
                 turn_peak_act, turn_peak_act_t = act, t
+                cmd_onset_t = t if turn_side * ang >= TURN_ONSET_DEG else None
+                act_onset_t = t if turn_side * act >= TURN_ONSET_DEG else None
                 cmd_unwind_t = act_unwind_t = None
             return
+
+        if cmd_onset_t is None and turn_side * ang >= TURN_ONSET_DEG:
+            cmd_onset_t = t
+        if act_onset_t is None and turn_side * act >= TURN_ONSET_DEG:
+            act_onset_t = t
 
         if turn_side * ang > turn_side * turn_peak_cmd:
             turn_peak_cmd, turn_peak_cmd_t = ang, t
         if turn_side * act > turn_side * turn_peak_act:
             turn_peak_act, turn_peak_act_t = act, t
 
-        if cmd_unwind_t is None and t > turn_peak_cmd_t and turn_side * ang <= turn_side * turn_peak_cmd * UNWIND_FRACTION:
+        # Only evaluate an unwind crossing once the tracked peak is a real maneuver peak
+        # (>= onset), not the trivial near-zero value right at episode entry - otherwise
+        # "0 <= 0 * UNWIND_FRACTION" trivially fires before the angle has even started rising.
+        if (cmd_unwind_t is None and abs(turn_peak_cmd) >= TURN_ONSET_DEG and t > turn_peak_cmd_t
+                and turn_side * ang <= turn_side * turn_peak_cmd * UNWIND_FRACTION):
             cmd_unwind_t = t
-        if act_unwind_t is None and t > turn_peak_act_t and turn_side * act <= turn_side * turn_peak_act * UNWIND_FRACTION:
+        if (act_unwind_t is None and abs(turn_peak_act) >= TURN_ONSET_DEG and t > turn_peak_act_t
+                and turn_side * act <= turn_side * turn_peak_act * UNWIND_FRACTION):
             act_unwind_t = t
 
-        if abs(ang) < TURN_ONSET_DEG:
-            if abs(turn_peak_cmd) >= TURN_PEAK_MIN_DEG and cmd_unwind_t is not None and act_unwind_t is not None:
+        # Only exit once BOTH signals are past their own peak - otherwise a driver who leads
+        # the model into the turn causes a premature exit while commanded is still ramping up
+        # (commanded is briefly still below onset, wiping the onset timestamps just recorded).
+        if abs(ang) < TURN_ONSET_DEG and t > turn_peak_cmd_t and t > turn_peak_act_t:
+            if abs(turn_peak_cmd) >= TURN_PEAK_MIN_DEG:
                 side_key = 'left' if turn_side > 0 else 'right'
-                unwind_lead_sum[side_key] += cmd_unwind_t - act_unwind_t
-                unwind_count[side_key] += 1
+                if cmd_onset_t is not None and act_onset_t is not None:
+                    turnin_lead_sum[side_key] += cmd_onset_t - act_onset_t
+                    turnin_count[side_key] += 1
+                if cmd_unwind_t is not None and act_unwind_t is not None:
+                    unwind_lead_sum[side_key] += cmd_unwind_t - act_unwind_t
+                    unwind_count[side_key] += 1
             in_turn = False
 
     try:
@@ -191,6 +259,7 @@ def _parse_segment(seg_path: str) -> dict:
                         override_m += m
                         divergence_wsum += abs(commanded_angle - cs.steeringAngleDeg) * m
                         is_turn = vego < TURN_SPEED_MAX_MS and abs(commanded_angle) > TURN_PEAK_MIN_DEG
+
                         if cs.leftBlinker or cs.rightBlinker:
                             lane_change_m += m
                         elif is_turn:
@@ -201,8 +270,20 @@ def _parse_segment(seg_path: str) -> dict:
                             turn_side_agg_wsum[side_key] += aggression * m
                             if aggression > 0:
                                 turn_side_soft_m[side_key] += m
+                        elif abs(commanded_angle) < STRAIGHT_LINE_MAX_DEG:
+                            straight_m += m
+                            side_key = 'left' if cs.steeringAngleDeg > 0 else 'right'
+                            pull = abs(cs.steeringAngleDeg - commanded_angle)
+                            straight_side_m[side_key] += m
+                            straight_side_wsum[side_key] += pull * m
                         else:
-                            lane_pos_m += m
+                            curve_m += m
+                            side_key = 'left' if commanded_angle > 0 else 'right'
+                            aggression = (1 if commanded_angle > 0 else -1) * (cs.steeringAngleDeg - commanded_angle)
+                            curve_side_m[side_key] += m
+                            curve_side_agg_wsum[side_key] += aggression * m
+                            if aggression > 0:
+                                curve_side_soft_m[side_key] += m
                 last_t = t
                 last_vego = vego
 
@@ -241,12 +322,20 @@ def _parse_segment(seg_path: str) -> dict:
         'aol_m': aol_m,
         'override_m': override_m,
         'turn_m': turn_m,
-        'lane_pos_m': lane_pos_m,
+        'straight_m': straight_m,
+        'curve_m': curve_m,
         'lane_change_m': lane_change_m,
         'divergence_wsum': divergence_wsum,
         'turn_side_m': turn_side_m,
         'turn_side_agg_wsum': turn_side_agg_wsum,
         'turn_side_soft_m': turn_side_soft_m,
+        'curve_side_m': curve_side_m,
+        'curve_side_agg_wsum': curve_side_agg_wsum,
+        'curve_side_soft_m': curve_side_soft_m,
+        'straight_side_m': straight_side_m,
+        'straight_side_wsum': straight_side_wsum,
+        'turnin_lead_sum': turnin_lead_sum,
+        'turnin_count': turnin_count,
         'unwind_lead_sum': unwind_lead_sum,
         'unwind_count': unwind_count,
         'events': {'gas': gas, 'steer': steer, 'brake': brake, 'cancel': cancel, 'aol': aol},
@@ -255,15 +344,24 @@ def _parse_segment(seg_path: str) -> dict:
 
 def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
                  route_name: str, route_idx: int, route_total: int) -> dict:
-    total: dict = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0,
-                   'override_m': 0.0, 'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0,
-                   'divergence_wsum': 0.0,
-                   'turn_side_m': {'left': 0.0, 'right': 0.0},
-                   'turn_side_agg_wsum': {'left': 0.0, 'right': 0.0},
-                   'turn_side_soft_m': {'left': 0.0, 'right': 0.0},
-                   'unwind_lead_sum': {'left': 0.0, 'right': 0.0},
-                   'unwind_count': {'left': 0, 'right': 0},
-                   'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0, 'aol': 0}}
+    total: dict = {
+        'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0,
+        'override_m': 0.0, 'turn_m': 0.0, 'straight_m': 0.0, 'curve_m': 0.0, 'lane_change_m': 0.0,
+        'divergence_wsum': 0.0,
+        'turn_side_m': {'left': 0.0, 'right': 0.0},
+        'turn_side_agg_wsum': {'left': 0.0, 'right': 0.0},
+        'turn_side_soft_m': {'left': 0.0, 'right': 0.0},
+        'curve_side_m': {'left': 0.0, 'right': 0.0},
+        'curve_side_agg_wsum': {'left': 0.0, 'right': 0.0},
+        'curve_side_soft_m': {'left': 0.0, 'right': 0.0},
+        'straight_side_m': {'left': 0.0, 'right': 0.0},
+        'straight_side_wsum': {'left': 0.0, 'right': 0.0},
+        'turnin_lead_sum': {'left': 0.0, 'right': 0.0},
+        'turnin_count': {'left': 0, 'right': 0},
+        'unwind_lead_sum': {'left': 0.0, 'right': 0.0},
+        'unwind_count': {'left': 0, 'right': 0},
+        'events': {'gas': 0, 'steer': 0, 'brake': 0, 'cancel': 0, 'aol': 0},
+    }
     n = len(seg_dirs)
     for i, seg_dir in enumerate(seg_dirs, 1):
         params.put("SpysyStatsStatus",
@@ -276,13 +374,21 @@ def _parse_route(log_root: str, seg_dirs: list[str], params: Params,
         total['aol_m'] += seg.get('aol_m', 0.0)
         total['override_m'] += seg.get('override_m', 0.0)
         total['turn_m'] += seg.get('turn_m', 0.0)
-        total['lane_pos_m'] += seg.get('lane_pos_m', 0.0)
+        total['straight_m'] += seg.get('straight_m', 0.0)
+        total['curve_m'] += seg.get('curve_m', 0.0)
         total['lane_change_m'] += seg.get('lane_change_m', 0.0)
         total['divergence_wsum'] += seg.get('divergence_wsum', 0.0)
         for side in ('left', 'right'):
             total['turn_side_m'][side] += seg.get('turn_side_m', {}).get(side, 0.0)
             total['turn_side_agg_wsum'][side] += seg.get('turn_side_agg_wsum', {}).get(side, 0.0)
             total['turn_side_soft_m'][side] += seg.get('turn_side_soft_m', {}).get(side, 0.0)
+            total['curve_side_m'][side] += seg.get('curve_side_m', {}).get(side, 0.0)
+            total['curve_side_agg_wsum'][side] += seg.get('curve_side_agg_wsum', {}).get(side, 0.0)
+            total['curve_side_soft_m'][side] += seg.get('curve_side_soft_m', {}).get(side, 0.0)
+            total['straight_side_m'][side] += seg.get('straight_side_m', {}).get(side, 0.0)
+            total['straight_side_wsum'][side] += seg.get('straight_side_wsum', {}).get(side, 0.0)
+            total['turnin_lead_sum'][side] += seg.get('turnin_lead_sum', {}).get(side, 0.0)
+            total['turnin_count'][side] += seg.get('turnin_count', {}).get(side, 0)
             total['unwind_lead_sum'][side] += seg.get('unwind_lead_sum', {}).get(side, 0.0)
             total['unwind_count'][side] += seg.get('unwind_count', {}).get(side, 0)
         for k in total['events']:
@@ -312,7 +418,7 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
     Schema check then disk presence check.
 
     If stored lifetime data is missing any field from REQUIRED_LIFETIME_FIELDS,
-    all routes are cleared for full reanalysis — this automatically triggers
+    all routes are cleared for full reanalysis - this automatically triggers
     whenever a new data field is added to the analyzer.
 
     Returns (lifetime, processed), either of which may have been reset.
@@ -321,7 +427,7 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
         raw = params.get("SpysyLifetimeStats")
         needs_reanalysis = False
         if not raw:
-            # Processed set is non-empty but lifetime data is gone — inconsistent state.
+            # Processed set is non-empty but lifetime data is gone - inconsistent state.
             needs_reanalysis = True
         else:
             try:
@@ -336,13 +442,7 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
         if needs_reanalysis:
             params.put("SpysyStatsStatus", "New data fields detected - reanalyzing all routes...")
             processed = set()
-            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0, 'override_m': 0.0,
-                        'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0, 'avg_divergence_deg': 0.0,
-             'turn_left_m': 0.0, 'turn_right_m': 0.0,
-             'avg_agg_left_deg': 0.0, 'avg_agg_right_deg': 0.0,
-             'soft_pct_left': 0.0, 'soft_pct_right': 0.0,
-             'avg_unwind_lead_left_s': 0.0, 'avg_unwind_lead_right_s': 0.0,
-             'unwind_count_left': 0, 'unwind_count_right': 0}
+            lifetime = dict(_LIFETIME_ZERO)
             _save_lifetime(params, lifetime)
             _save_processed(params, processed)
             return lifetime, processed
@@ -350,7 +450,7 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
     if not processed:
         return lifetime, processed
 
-    # Disk presence check — confirm each tracked route still exists
+    # Disk presence check - confirm each tracked route still exists
     all_routes_disk = _list_routes(log_root)
     route_list = sorted(processed)
     total = len(route_list)
@@ -376,7 +476,8 @@ def _load_lifetime(params: Params) -> dict:
                 'aol_m': stored.get('aol_mi', 0.0) * METERS_PER_MILE,
                 'override_m': stored.get('override_mi', 0.0) * METERS_PER_MILE,
                 'turn_m': stored.get('turn_mi', 0.0) * METERS_PER_MILE,
-                'lane_pos_m': stored.get('lane_pos_mi', 0.0) * METERS_PER_MILE,
+                'straight_m': stored.get('straight_mi', 0.0) * METERS_PER_MILE,
+                'curve_m': stored.get('curve_mi', 0.0) * METERS_PER_MILE,
                 'lane_change_m': stored.get('lane_change_mi', 0.0) * METERS_PER_MILE,
                 'avg_divergence_deg': stored.get('avg_divergence_deg', 0.0),
                 'turn_left_m': stored.get('turn_left_mi', 0.0) * METERS_PER_MILE,
@@ -389,16 +490,24 @@ def _load_lifetime(params: Params) -> dict:
                 'avg_unwind_lead_right_s': stored.get('avg_unwind_lead_right_s', 0.0),
                 'unwind_count_left': stored.get('unwind_count_left', 0),
                 'unwind_count_right': stored.get('unwind_count_right', 0),
+                'avg_turnin_lead_left_s': stored.get('avg_turnin_lead_left_s', 0.0),
+                'avg_turnin_lead_right_s': stored.get('avg_turnin_lead_right_s', 0.0),
+                'turnin_count_left': stored.get('turnin_count_left', 0),
+                'turnin_count_right': stored.get('turnin_count_right', 0),
+                'straight_left_m': stored.get('straight_left_mi', 0.0) * METERS_PER_MILE,
+                'straight_right_m': stored.get('straight_right_mi', 0.0) * METERS_PER_MILE,
+                'avg_pull_left_deg': stored.get('avg_pull_left_deg', 0.0),
+                'avg_pull_right_deg': stored.get('avg_pull_right_deg', 0.0),
+                'curve_left_m': stored.get('curve_left_mi', 0.0) * METERS_PER_MILE,
+                'curve_right_m': stored.get('curve_right_mi', 0.0) * METERS_PER_MILE,
+                'avg_curve_agg_left_deg': stored.get('avg_curve_agg_left_deg', 0.0),
+                'avg_curve_agg_right_deg': stored.get('avg_curve_agg_right_deg', 0.0),
+                'curve_soft_pct_left': stored.get('curve_soft_pct_left', 0.0),
+                'curve_soft_pct_right': stored.get('curve_soft_pct_right', 0.0),
             }
     except Exception:
         pass
-    return {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0, 'override_m': 0.0,
-            'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0, 'avg_divergence_deg': 0.0,
-            'turn_left_m': 0.0, 'turn_right_m': 0.0,
-            'avg_agg_left_deg': 0.0, 'avg_agg_right_deg': 0.0,
-            'soft_pct_left': 0.0, 'soft_pct_right': 0.0,
-            'avg_unwind_lead_left_s': 0.0, 'avg_unwind_lead_right_s': 0.0,
-            'unwind_count_left': 0, 'unwind_count_right': 0}
+    return dict(_LIFETIME_ZERO)
 
 
 def _save_lifetime(params: Params, lifetime: dict):
@@ -408,7 +517,8 @@ def _save_lifetime(params: Params, lifetime: dict):
         'aol_mi': round(lifetime['aol_m'] / METERS_PER_MILE, 2),
         'override_mi': round(lifetime['override_m'] / METERS_PER_MILE, 2),
         'turn_mi': round(lifetime['turn_m'] / METERS_PER_MILE, 2),
-        'lane_pos_mi': round(lifetime['lane_pos_m'] / METERS_PER_MILE, 2),
+        'straight_mi': round(lifetime['straight_m'] / METERS_PER_MILE, 2),
+        'curve_mi': round(lifetime['curve_m'] / METERS_PER_MILE, 2),
         'lane_change_mi': round(lifetime['lane_change_m'] / METERS_PER_MILE, 2),
         'avg_divergence_deg': round(lifetime['avg_divergence_deg'], 2),
         'turn_left_mi': round(lifetime['turn_left_m'] / METERS_PER_MILE, 2),
@@ -421,6 +531,20 @@ def _save_lifetime(params: Params, lifetime: dict):
         'avg_unwind_lead_right_s': round(lifetime['avg_unwind_lead_right_s'], 2),
         'unwind_count_left': lifetime['unwind_count_left'],
         'unwind_count_right': lifetime['unwind_count_right'],
+        'avg_turnin_lead_left_s': round(lifetime['avg_turnin_lead_left_s'], 2),
+        'avg_turnin_lead_right_s': round(lifetime['avg_turnin_lead_right_s'], 2),
+        'turnin_count_left': lifetime['turnin_count_left'],
+        'turnin_count_right': lifetime['turnin_count_right'],
+        'straight_left_mi': round(lifetime['straight_left_m'] / METERS_PER_MILE, 2),
+        'straight_right_mi': round(lifetime['straight_right_m'] / METERS_PER_MILE, 2),
+        'avg_pull_left_deg': round(lifetime['avg_pull_left_deg'], 2),
+        'avg_pull_right_deg': round(lifetime['avg_pull_right_deg'], 2),
+        'curve_left_mi': round(lifetime['curve_left_m'] / METERS_PER_MILE, 2),
+        'curve_right_mi': round(lifetime['curve_right_m'] / METERS_PER_MILE, 2),
+        'avg_curve_agg_left_deg': round(lifetime['avg_curve_agg_left_deg'], 2),
+        'avg_curve_agg_right_deg': round(lifetime['avg_curve_agg_right_deg'], 2),
+        'curve_soft_pct_left': round(lifetime['curve_soft_pct_left'], 1),
+        'curve_soft_pct_right': round(lifetime['curve_soft_pct_right'], 1),
     }))
 
 
@@ -436,6 +560,25 @@ def _save_processed(params: Params, processed: set[str]):
     params.put("SpysyProcessedRoutes", json.dumps(sorted(processed)))
 
 
+def _merge_side_detail(lifetime: dict, route_side_m: dict, route_agg_wsum: dict, route_soft_m: dict,
+                       m_key_fmt: str, agg_key_fmt: str, soft_key_fmt: str) -> dict:
+    """Shared merge for turn/curve side detail (aggression avg + soft-time %).
+    Returns this route's per-side values for the caller's last_drive dict."""
+    route_detail = {}
+    for side in ('left', 'right'):
+        side_m = route_side_m[side]
+        route_agg = route_agg_wsum[side] / side_m if side_m > 0 else 0.0
+        route_soft_pct = round(route_soft_m[side] / side_m * 100, 1) if side_m > 0 else 0.0
+
+        m_key, agg_key, soft_key = m_key_fmt.format(side), agg_key_fmt.format(side), soft_key_fmt.format(side)
+        lifetime[agg_key] = _merge_avg(lifetime[agg_key], lifetime[m_key], route_agg, side_m)
+        lifetime[soft_key] = _merge_avg(lifetime[soft_key], lifetime[m_key], route_soft_pct, side_m)
+        lifetime[m_key] += side_m
+
+        route_detail[side] = {'agg_deg': round(route_agg, 2), 'soft_pct': route_soft_pct}
+    return route_detail
+
+
 def main():
     params = Params()
     log_root = Paths.log_root()
@@ -449,13 +592,7 @@ def main():
         # Force refresh: wipe accumulated stats and reprocess everything
         if params.get_bool("SpysyForceStatsRefresh"):
             params.put_bool("SpysyForceStatsRefresh", False)
-            lifetime = {'engaged_m': 0.0, 'disengaged_m': 0.0, 'aol_m': 0.0, 'override_m': 0.0,
-                        'turn_m': 0.0, 'lane_pos_m': 0.0, 'lane_change_m': 0.0, 'avg_divergence_deg': 0.0,
-             'turn_left_m': 0.0, 'turn_right_m': 0.0,
-             'avg_agg_left_deg': 0.0, 'avg_agg_right_deg': 0.0,
-             'soft_pct_left': 0.0, 'soft_pct_right': 0.0,
-             'avg_unwind_lead_left_s': 0.0, 'avg_unwind_lead_right_s': 0.0,
-             'unwind_count_left': 0, 'unwind_count_right': 0}
+            lifetime = dict(_LIFETIME_ZERO)
             processed = set()
             _save_lifetime(params, lifetime)
             _save_processed(params, processed)
@@ -495,48 +632,62 @@ def main():
             aol_pct = round(drive['aol_m'] / total_m * 100, 1) if total_m > 0 else 0.0
 
             # Override analysis: override_pct is share of controlled (engaged+AOL) distance
-            # spent overriding; turn/lane_pos/lane_change_pct break that override time down
-            # by context, so they sum to 100% of override_pct rather than of the whole drive.
+            # spent overriding; turn/straight/curve/lane_change_pct break that override time
+            # down by context, so they sum to 100% of override_pct. curve_pct absorbs the
+            # rounding remainder, same trick as disengaged_pct above.
             controlled_m = drive['engaged_m'] + drive['aol_m']
             override_pct = round(drive['override_m'] / controlled_m * 100, 1) if controlled_m > 0 else 0.0
             route_avg_divergence = drive['divergence_wsum'] / drive['override_m'] if drive['override_m'] > 0 else 0.0
             turn_pct = round(drive['turn_m'] / drive['override_m'] * 100, 1) if drive['override_m'] > 0 else 0.0
+            straight_pct = round(drive['straight_m'] / drive['override_m'] * 100, 1) if drive['override_m'] > 0 else 0.0
             lane_change_pct = round(drive['lane_change_m'] / drive['override_m'] * 100, 1) if drive['override_m'] > 0 else 0.0
-            lane_pos_pct = round(100.0 - turn_pct - lane_change_pct, 1) if drive['override_m'] > 0 else 0.0
+            curve_pct = round(100.0 - turn_pct - straight_pct - lane_change_pct, 1) if drive['override_m'] > 0 else 0.0
 
             lifetime['avg_divergence_deg'] = _merge_avg(
                 lifetime['avg_divergence_deg'], lifetime['override_m'], route_avg_divergence, drive['override_m'])
             lifetime['override_m'] += drive['override_m']
             lifetime['turn_m'] += drive['turn_m']
-            lifetime['lane_pos_m'] += drive['lane_pos_m']
+            lifetime['straight_m'] += drive['straight_m']
+            lifetime['curve_m'] += drive['curve_m']
             lifetime['lane_change_m'] += drive['lane_change_m']
 
             # Turn detail, split left/right: aggression is a signed avg (+ = model too soft,
-            # driver pushes harder; - = model too aggressive, driver backs off). Unwind lead is
-            # seconds the driver started straightening out before the model's own plan would have.
-            turn_detail = {}
+            # driver pushes harder; - = model too aggressive, driver backs off).
+            turn_detail = _merge_side_detail(
+                lifetime, drive['turn_side_m'], drive['turn_side_agg_wsum'], drive['turn_side_soft_m'],
+                'turn_{}_m', 'avg_agg_{}_deg', 'soft_pct_{}')
+
+            # Curve detail: same aggression concept, scoped to curves instead of sharp turns.
+            curve_detail = _merge_side_detail(
+                lifetime, drive['curve_side_m'], drive['curve_side_agg_wsum'], drive['curve_side_soft_m'],
+                'curve_{}_m', 'avg_curve_agg_{}_deg', 'curve_soft_pct_{}')
+
+            # Straight-line detail: which way the driver tends to pull, and by how much.
+            straight_detail = {}
             for side in ('left', 'right'):
-                side_m = drive['turn_side_m'][side]
-                route_agg = drive['turn_side_agg_wsum'][side] / side_m if side_m > 0 else 0.0
-                route_soft_pct = round(drive['turn_side_soft_m'][side] / side_m * 100, 1) if side_m > 0 else 0.0
-                unwind_n = drive['unwind_count'][side]
-                route_unwind_lead = drive['unwind_lead_sum'][side] / unwind_n if unwind_n > 0 else 0.0
+                side_m = drive['straight_side_m'][side]
+                route_pull = drive['straight_side_wsum'][side] / side_m if side_m > 0 else 0.0
+                lifetime[f'avg_pull_{side}_deg'] = _merge_avg(
+                    lifetime[f'avg_pull_{side}_deg'], lifetime[f'straight_{side}_m'], route_pull, side_m)
+                lifetime[f'straight_{side}_m'] += side_m
+                straight_detail[side] = round(route_pull, 2)
 
-                lifetime[f'avg_agg_{side}_deg'] = _merge_avg(
-                    lifetime[f'avg_agg_{side}_deg'], lifetime[f'turn_{side}_m'], route_agg, side_m)
-                lifetime[f'soft_pct_{side}'] = _merge_avg(
-                    lifetime[f'soft_pct_{side}'], lifetime[f'turn_{side}_m'], route_soft_pct, side_m)
-                lifetime[f'avg_unwind_lead_{side}_s'] = _merge_avg(
-                    lifetime[f'avg_unwind_lead_{side}_s'], lifetime[f'unwind_count_{side}'], route_unwind_lead, unwind_n)
-                lifetime[f'turn_{side}_m'] += side_m
-                lifetime[f'unwind_count_{side}'] += unwind_n
-
-                turn_detail[side] = {
-                    'agg_deg': round(route_agg, 2),
-                    'soft_pct': route_soft_pct,
-                    'unwind_lead_s': round(route_unwind_lead, 2),
-                    'unwind_count': unwind_n,
-                }
+            # Turn-in / unwind timing, split left/right.
+            timing_detail: dict = {}
+            for kind, lead_sum, count, lifetime_avg_fmt, lifetime_count_fmt in (
+                ('turnin', drive['turnin_lead_sum'], drive['turnin_count'],
+                 'avg_turnin_lead_{}_s', 'turnin_count_{}'),
+                ('unwind', drive['unwind_lead_sum'], drive['unwind_count'],
+                 'avg_unwind_lead_{}_s', 'unwind_count_{}'),
+            ):
+                timing_detail[kind] = {}
+                for side in ('left', 'right'):
+                    n = count[side]
+                    route_lead = lead_sum[side] / n if n > 0 else 0.0
+                    avg_key, count_key = lifetime_avg_fmt.format(side), lifetime_count_fmt.format(side)
+                    lifetime[avg_key] = _merge_avg(lifetime[avg_key], lifetime[count_key], route_lead, n)
+                    lifetime[count_key] += n
+                    timing_detail[kind][side] = {'lead_s': round(route_lead, 2), 'count': n}
 
             last_drive = {
                 'engaged_mi': round(drive['engaged_m'] / METERS_PER_MILE, 2),
@@ -550,16 +701,27 @@ def main():
                 'override_pct': override_pct,
                 'avg_divergence_deg': round(route_avg_divergence, 2),
                 'turn_pct': turn_pct,
-                'lane_pos_pct': lane_pos_pct,
+                'straight_pct': straight_pct,
+                'curve_pct': curve_pct,
                 'lane_change_pct': lane_change_pct,
                 'turn_left_agg_deg': turn_detail['left']['agg_deg'],
                 'turn_left_soft_pct': turn_detail['left']['soft_pct'],
-                'turn_left_unwind_lead_s': turn_detail['left']['unwind_lead_s'],
-                'turn_left_unwind_count': turn_detail['left']['unwind_count'],
                 'turn_right_agg_deg': turn_detail['right']['agg_deg'],
                 'turn_right_soft_pct': turn_detail['right']['soft_pct'],
-                'turn_right_unwind_lead_s': turn_detail['right']['unwind_lead_s'],
-                'turn_right_unwind_count': turn_detail['right']['unwind_count'],
+                'turn_left_turnin_lead_s': timing_detail['turnin']['left']['lead_s'],
+                'turn_left_turnin_count': timing_detail['turnin']['left']['count'],
+                'turn_right_turnin_lead_s': timing_detail['turnin']['right']['lead_s'],
+                'turn_right_turnin_count': timing_detail['turnin']['right']['count'],
+                'turn_left_unwind_lead_s': timing_detail['unwind']['left']['lead_s'],
+                'turn_left_unwind_count': timing_detail['unwind']['left']['count'],
+                'turn_right_unwind_lead_s': timing_detail['unwind']['right']['lead_s'],
+                'turn_right_unwind_count': timing_detail['unwind']['right']['count'],
+                'curve_left_agg_deg': curve_detail['left']['agg_deg'],
+                'curve_left_soft_pct': curve_detail['left']['soft_pct'],
+                'curve_right_agg_deg': curve_detail['right']['agg_deg'],
+                'curve_right_soft_pct': curve_detail['right']['soft_pct'],
+                'straight_left_pull_deg': straight_detail['left'],
+                'straight_right_pull_deg': straight_detail['right'],
             }
 
             processed.add(route_name)
