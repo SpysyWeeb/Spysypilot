@@ -12,7 +12,7 @@ _BG       = rl.Color(40, 40, 40, 255)
 _BLUE     = rl.Color(70, 91, 234, 255)
 _GREEN    = rl.Color(70, 200, 100, 255)
 _ORANGE   = rl.Color(234, 160, 50, 255)
-_OVERRIDE = rl.Color(180, 130, 255, 255)
+_AOL      = rl.Color(180, 130, 255, 255)
 _DIM      = rl.Color(255, 255, 255, 150)
 _DIVIDER  = rl.Color(255, 255, 255, 35)
 
@@ -56,8 +56,8 @@ class DriveStatsWidget(Widget):
         y = self._draw_stat_triple(
             x, y, w,
             "Engaged",    self._lifetime_pct("engaged"),    self._fmt_lifetime_mi("engaged_mi"),    _GREEN,
-            "Disengaged", self._lifetime_pct("disengaged"),  self._fmt_lifetime_mi("disengaged_mi"), _ORANGE,
-            "Override",   self._lifetime_override_pct(),    self._fmt_lifetime_mi("override_mi"),   _OVERRIDE,
+            "AOL",        self._lifetime_pct("aol"),        self._fmt_lifetime_mi("aol_mi"),        _AOL,
+            "Disengaged", self._lifetime_pct("disengaged"), self._fmt_lifetime_mi("disengaged_mi"), _ORANGE,
         )
         y += 25
 
@@ -65,8 +65,8 @@ class DriveStatsWidget(Widget):
         y = self._draw_stat_triple(
             x, y, w,
             "Engaged",    self._fmt_pct("engaged_pct"),    self._fmt_drive_mi("engaged_mi"),    _GREEN,
+            "AOL",        self._fmt_pct("aol_pct"),        self._fmt_drive_mi("aol_mi"),        _AOL,
             "Disengaged", self._fmt_pct("disengaged_pct"), self._fmt_drive_mi("disengaged_mi"), _ORANGE,
-            "Override",   self._fmt_pct("override_pct"),   self._fmt_drive_mi("override_mi"),   _OVERRIDE,
         )
         y += 25
 
@@ -101,21 +101,13 @@ class DriveStatsWidget(Widget):
         if self._lifetime is None:
             return "—"
         eng = self._lifetime.get("engaged_mi", 0.0)
+        aol = self._lifetime.get("aol_mi", 0.0)
         dis = self._lifetime.get("disengaged_mi", 0.0)
-        total = eng + dis
+        total = eng + aol + dis
         if total == 0:
             return "—"
-        pct = eng / total * 100 if side == "engaged" else dis / total * 100
-        return f"{pct:.1f}%"
-
-    def _lifetime_override_pct(self) -> str:
-        if self._lifetime is None or "override_mi" not in self._lifetime:
-            return "—"
-        eng = self._lifetime.get("engaged_mi", 0.0)
-        ovr = self._lifetime.get("override_mi", 0.0)
-        if eng == 0:
-            return "—"
-        return f"{ovr / eng * 100:.1f}%"
+        value = {"engaged": eng, "aol": aol, "disengaged": dis}[side]
+        return f"{value / total * 100:.1f}%"
 
     def _draw_section(self, title: str, x: int, y: int, w: int) -> int:
         font = gui_app.font(FontWeight.BOLD)
@@ -149,8 +141,11 @@ class DriveStatsWidget(Widget):
             if sum(r.values()) == 0:
                 rl.draw_text_ex(fn, "No interruptions recorded", rl.Vector2(x, y + 12), 40, 0, _DIM)
                 return
+            # AOL counts as an override reason: it's steering-active middle ground, not a
+            # full disengagement, so it belongs alongside Accel/Steering rather than Braking/Cancel.
             overrides  = [("Accel",    f"{r.get('gas', 0.0):.0f}%"),
-                          ("Steering", f"{r.get('steer', 0.0):.0f}%")]
+                          ("Steering", f"{r.get('steer', 0.0):.0f}%"),
+                          ("AOL",      f"{r.get('aol', 0.0):.0f}%")]
             disengages = [("Braking", f"{r.get('brake', 0.0):.0f}%"),
                           ("Cancel",  f"{r.get('cancel', 0.0):.0f}%")]
         else:
@@ -158,7 +153,6 @@ class DriveStatsWidget(Widget):
             return
 
         half = w // 2
-        quarter = w // 4
         divider_x = x + half
 
         rl.draw_line_ex(rl.Vector2(divider_x, y), rl.Vector2(divider_x, y + 116), 1, _DIVIDER)
@@ -169,8 +163,13 @@ class DriveStatsWidget(Widget):
         rl.draw_text_ex(fn, "Disengagements", rl.Vector2(divider_x + (half - dw) // 2, y), 30, 0, _DIM)
 
         row_y = y + 38
-        for i, (label, val) in enumerate(overrides + disengages):
-            col_center = x + i * quarter + quarter // 2
+        self._draw_reason_cells(x, half, overrides, row_y, fn, fb)
+        self._draw_reason_cells(divider_x, half, disengages, row_y, fn, fb)
+
+    def _draw_reason_cells(self, section_x: int, section_w: int, items: list, row_y: int, fn, fb):
+        col_w = section_w // len(items)
+        for i, (label, val) in enumerate(items):
+            col_center = section_x + i * col_w + col_w // 2
             lw = int(rl.measure_text_ex(fn, label, 34, 0).x)
             vw = int(rl.measure_text_ex(fb, val,   50, 0).x)
             rl.draw_text_ex(fn, label, rl.Vector2(col_center - lw // 2, row_y),      34, 0, _DIM)
