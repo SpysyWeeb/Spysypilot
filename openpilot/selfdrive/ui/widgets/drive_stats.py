@@ -50,28 +50,28 @@ class DriveStatsWidget(StatsPageWidget):
 
     def _fmt_lifetime_mi(self, field: str) -> str:
         if self._lifetime is None or field not in self._lifetime:
-            return "—"
+            return "N/A"
         return f"{self._lifetime.get(field, 0.0):,.1f} mi"
 
     def _fmt_drive_mi(self, field: str) -> str:
         if self._last_drive is None or field not in self._last_drive:
-            return "—"
+            return "N/A"
         return f"{self._last_drive.get(field, 0.0):,.1f} mi"
 
     def _fmt_pct(self, field: str) -> str:
         if self._last_drive is None or field not in self._last_drive:
-            return "—"
+            return "N/A"
         return f"{self._last_drive.get(field, 0.0):.1f}%"
 
     def _lifetime_pct(self, side: str) -> str:
         if self._lifetime is None:
-            return "—"
+            return "N/A"
         eng = self._lifetime.get("engaged_mi", 0.0)
         aol = self._lifetime.get("aol_mi", 0.0)
         dis = self._lifetime.get("disengaged_mi", 0.0)
         total = eng + aol + dis
         if total == 0:
-            return "—"
+            return "N/A"
         value = {"engaged": eng, "aol": aol, "disengaged": dis}[side]
         return f"{value / total * 100:.1f}%"
 
