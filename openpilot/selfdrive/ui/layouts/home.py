@@ -7,6 +7,9 @@ from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAl
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
 from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsWidget
 from openpilot.selfdrive.ui.widgets.override_stats import OverrideStatsWidget
+from openpilot.selfdrive.ui.widgets.straight_stats import StraightStatsWidget
+from openpilot.selfdrive.ui.widgets.curve_stats import CurveStatsWidget
+from openpilot.selfdrive.ui.widgets.turn_stats import TurnStatsWidget
 from openpilot.selfdrive.ui.widgets.terminal_widget import TerminalWidget
 from openpilot.selfdrive.ui.widgets.system_stats import SystemStatsWidget
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
@@ -61,12 +64,17 @@ class HomeLayout(Widget):
 
     self._stats_widget = DriveStatsWidget()
     self._override_stats_widget = OverrideStatsWidget()
+    self._straight_stats_widget = StraightStatsWidget()
+    self._curve_stats_widget = CurveStatsWidget()
+    self._turn_stats_widget = TurnStatsWidget()
     self._terminal_widget = TerminalWidget()
     self._system_stats_widget = SystemStatsWidget()
     self._setup_widget = SetupWidget()
 
     self._left_windows: list[Widget] = [
-      self._stats_widget, self._override_stats_widget, self._terminal_widget, self._system_stats_widget,
+      self._stats_widget, self._override_stats_widget,
+      self._straight_stats_widget, self._curve_stats_widget, self._turn_stats_widget,
+      self._terminal_widget, self._system_stats_widget,
     ]
     self._current_left_idx: int = 0
     for w in self._left_windows:
