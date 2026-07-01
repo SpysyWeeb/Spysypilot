@@ -103,9 +103,13 @@ class HomeLayout(Widget):
   def _toggle_experimental_mode(self):
     self.params.put_bool("ExperimentalMode", not self.params.get_bool("ExperimentalMode"))
 
-  def _cycle_left_window(self):
+  def _cycle_left_window(self, mouse_pos: MousePos):
+    # Tap the left half of the window to go back, right half to advance.
+    midpoint = self.left_column_rect.x + self.left_column_rect.width / 2
+    direction = -1 if mouse_pos.x < midpoint else 1
+
     self._left_windows[self._current_left_idx].hide_event()
-    self._current_left_idx = (self._current_left_idx + 1) % len(self._left_windows)
+    self._current_left_idx = (self._current_left_idx + direction) % len(self._left_windows)
     self._left_windows[self._current_left_idx].show_event()
 
   def _set_state(self, state: HomeLayoutState):
