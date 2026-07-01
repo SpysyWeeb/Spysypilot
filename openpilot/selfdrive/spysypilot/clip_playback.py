@@ -319,9 +319,15 @@ class ClipPlayer:
       self._ecamera_paths.append(paths['ecamera_path'])
       qcamera_paths.append(paths['qcamera_path'])
 
-    # Fall back to qcamera for the whole route if any segment is missing the full-res camera
-    # (e.g. thinned by the on-device deleter over time) but still has the low-res one.
-    self._use_qcam = not all(self._camera_paths) and any(qcamera_paths)
+    # Prefer qcamera (low-res) whenever every segment has it, rather than only as a fallback for
+    # missing full-res segments. CONFIRMED ON-DEVICE (live SSH session, 2026-07-01): with the
+    # EGL bypass (see cameraview.py's use_egl), every displayed frame now goes through a real CPU
+    # texture upload (the exact cost the zero-copy path exists to avoid) at fcamera's full
+    # 1928x1208, and that upload is the dominant remaining cost -- FPS logged chronically at
+    # 3-9 (should be ~20) for the entire duration of playback, not just during reloads. qcamera is
+    # roughly an order of magnitude fewer pixels; for a route-review preview (not the primary
+    # driving display) that's a reasonable trade against a large, continuous performance cost.
+    self._use_qcam = all(qcamera_paths) or (not all(self._camera_paths) and any(qcamera_paths))
     if self._use_qcam:
       self._camera_paths = qcamera_paths
 
