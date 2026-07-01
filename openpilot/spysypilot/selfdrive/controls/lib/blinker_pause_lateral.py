@@ -1,6 +1,11 @@
 from openpilot.common.realtime import DT_CTRL
 
-BLINKER_MIN_SPEED = 30 * 0.44704  # 30 mph in m/s
+# Matches DesireHelper.LANE_CHANGE_SPEED_MIN (desire_helper.py). modeld feeds DesireHelper
+# the post-blinker-pause carControl.latActive, so a higher threshold here than DesireHelper's
+# own floor creates a speed band where DesireHelper would attempt a lane change but this pause
+# has already zeroed latActive first, permanently blocking lane changes below this fork's
+# BLINKER_MIN_SPEED regardless of DesireHelper's own gating. Keep the two in sync.
+BLINKER_MIN_SPEED = 20 * 0.44704  # 20 mph in m/s
 
 class BlinkerPauseLateral:
   def __init__(self):
