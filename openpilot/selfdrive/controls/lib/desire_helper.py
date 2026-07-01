@@ -59,7 +59,9 @@ class DesireHelper:
 
         # Nudgeless fires once per blinker activation; subsequent changes in the same
         # signal require a manual nudge so the car can't keep auto-changing lanes.
-        auto_allowed = not self.nudgeless_used and self.lane_change_wait_timer > LANE_CHANGE_NUDGELESS_DELAY
+        # Braking also forces a manual nudge, since an auto lane change while the driver
+        # is slowing down isn't something they asked for.
+        auto_allowed = not self.nudgeless_used and not carstate.brakePressed and self.lane_change_wait_timer > LANE_CHANGE_NUDGELESS_DELAY
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
