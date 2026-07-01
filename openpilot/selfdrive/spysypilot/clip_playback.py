@@ -98,6 +98,19 @@ SEG_SECONDS = 60  # nominal segment length
 WINDOW_SEGMENTS = 2  # how many ~60s segments to keep parsed/decoded around the playhead
 MAX_FRAMES_PER_TICK = 10  # cap catch-up work per UI frame after a stall/seek
 
+# CONFIRMED IN THE FIELD (2026-07-01): a segment-boundary _reload() can genuinely stall for
+# multiple real seconds (the qcamera path decodes an entire 60s segment via one blocking ffmpeg
+# call in the background thread before yielding even its first frame). _route_frame (the
+# wall-clock target) keeps advancing the whole time regardless -- correct on its own -- so once
+# decode catches up, there's a backlog of now-overdue-but-decoded frames that the max_idx gate in
+# _drain_ready correctly paces but which visibly played back as a fast-forward "catch-up" burst.
+# RESYNC_LAG_FRAMES: once the displayed frame falls this far behind the wall-clock target, tick()
+# resets the pacing baseline to wherever playback actually is instead of racing to catch up to
+# where it "should" be -- smooth resumption over strict wall-clock accuracy, the right trade for a
+# review feature (a clip can now take longer than its nominal duration to fully play if decode
+# stalls; it will never again visibly speed up to compensate).
+RESYNC_LAG_FRAMES = FRAMERATE  # 1 second of lag -- small jitter is normal, this is well past that
+
 # Number of physical buffers VisionIpcServer.create_buffers() allocates per stream. CameraView
 # (selfdrive/ui/onroad/cameraview.py -- shared with the live onroad screen, not modified by this
 # feature) caches one GPU/EGL/DMA-buf import per distinct frame.idx it sees, keyed by whatever idx
@@ -513,6 +526,16 @@ class ClipPlayer:
         self.playing = False
 
     self._pump_camera_frames()
+
+    if self.playing and self._route_frame - self._displayed_frame_idx > RESYNC_LAG_FRAMES:
+      # Decode fell far behind wall clock (e.g. a segment-boundary stall) -- resync the pacing
+      # baseline to the actually-displayed frame so the *next* tick's elapsed-time math resumes
+      # normal-speed playback from here, instead of continuing to target the old, now-far-ahead
+      # wall-clock position (which is what produced the fast-forward catch-up). See
+      # RESYNC_LAG_FRAMES above.
+      self._play_wall_start = time.monotonic()
+      self._play_frame_start = self._displayed_frame_idx
+
     return True
 
   def _drain_ready(self, fq: FrameQueue, pending_attr: str, max_idx: int) -> tuple[tuple[int, bytes] | None, bool]:
