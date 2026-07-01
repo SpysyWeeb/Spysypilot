@@ -23,6 +23,7 @@ BORDER_COLORS = {
   UIStatus.DISENGAGED: rl.Color(0x12, 0x28, 0x39, 0xFF),  # Blue for disengaged state
   UIStatus.OVERRIDE: rl.Color(0x89, 0x92, 0x8D, 0xFF),  # Gray for override state
   UIStatus.ENGAGED: rl.Color(0x16, 0x7F, 0x40, 0xFF),  # Green for engaged state
+  UIStatus.AOL_ACTIVE: rl.Color(0x1E, 0x3A, 0x8A, 0xFF),  # Dark blue for AOL active state
 }
 
 WIDE_CAM_MAX_SPEED = 10.0  # m/s (22 mph)
