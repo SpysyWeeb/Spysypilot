@@ -70,7 +70,7 @@ class SystemStatsWidget(Widget):
 
   def _handle_mouse_release(self, mouse_pos) -> None:
     if self._background_tap_callback:
-      self._background_tap_callback()
+      self._background_tap_callback(mouse_pos)
 
   def _update_state(self):
     now = time.monotonic()
