@@ -11,6 +11,7 @@ from openpilot.selfdrive.ui.widgets.screen_timeout_button import ScreenTimeoutBu
 from openpilot.selfdrive.ui.widgets.update_button import UpdateButton
 from openpilot.selfdrive.ui.widgets.error_log_button import ErrorLogButton
 from openpilot.selfdrive.ui.widgets.system_stats import SystemStatsWidget
+from openpilot.selfdrive.ui.widgets.clip_viewer_button import ClipViewerButton
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
@@ -75,6 +76,7 @@ class HomeLayout(Widget):
     self._update_button = UpdateButton()
     self._screen_timeout_button = ScreenTimeoutButton()
     self._error_log_button = ErrorLogButton()
+    self._clip_viewer_button = ClipViewerButton()
     self._setup_callbacks()
 
   def show_event(self):
@@ -243,19 +245,21 @@ class HomeLayout(Widget):
       rl.draw_circle(dot_x, dot_y, dot_r, color)
 
   def _render_right_column(self):
+    # Fixed-height, SPACING-stacked buttons top-to-bottom, remainder goes to setup_widget.
     btn_height = 125
     step = btn_height + SPACING
     x = self.right_column_rect.x
     y = self.right_column_rect.y
     w = self.right_column_rect.width
 
-    # Stacked top-to-bottom: experimental mode, update, screen timeout, error log
+    # Stacked top-to-bottom: experimental mode, update, screen timeout, error log, clip viewer
     self._exp_mode_button.render(rl.Rectangle(x, y, w, btn_height))
     self._update_button.render(rl.Rectangle(x, y + step, w, btn_height))
     self._screen_timeout_button.render(rl.Rectangle(x, y + 2 * step, w, btn_height))
     self._error_log_button.render(rl.Rectangle(x, y + 3 * step, w, btn_height))
+    self._clip_viewer_button.render(rl.Rectangle(x, y + 4 * step, w, btn_height))
 
-    setup_rect = rl.Rectangle(x, y + 4 * step, w, self.right_column_rect.height - 4 * step)
+    setup_rect = rl.Rectangle(x, y + 5 * step, w, self.right_column_rect.height - 5 * step)
     self._setup_widget.render(setup_rect)
 
   def _refresh(self):
