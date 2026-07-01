@@ -6,6 +6,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAlert
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
 from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsWidget
+from openpilot.selfdrive.ui.widgets.override_stats import OverrideStatsWidget
 from openpilot.selfdrive.ui.widgets.terminal_widget import TerminalWidget
 from openpilot.selfdrive.ui.widgets.system_stats import SystemStatsWidget
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
@@ -59,11 +60,14 @@ class HomeLayout(Widget):
     self.alert_notif_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
 
     self._stats_widget = DriveStatsWidget()
+    self._override_stats_widget = OverrideStatsWidget()
     self._terminal_widget = TerminalWidget()
     self._system_stats_widget = SystemStatsWidget()
     self._setup_widget = SetupWidget()
 
-    self._left_windows: list[Widget] = [self._stats_widget, self._terminal_widget, self._system_stats_widget]
+    self._left_windows: list[Widget] = [
+      self._stats_widget, self._override_stats_widget, self._terminal_widget, self._system_stats_widget,
+    ]
     self._current_left_idx: int = 0
     for w in self._left_windows:
       w.set_background_tap_callback(self._cycle_left_window)
