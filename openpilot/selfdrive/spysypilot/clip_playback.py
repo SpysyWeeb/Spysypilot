@@ -22,9 +22,19 @@ Differences from tools/clip/run.py (which is unmodified -- see that file for the
    Threads are slower for this CPU-bound parsing step (GIL contention), but 1-2 segments' worth
    of local logs is small enough that this is not a practical problem for a manual seek.
  - The ui_state.sm.update monkeypatch (patch_submaster in run.py) is reworked so the replayed
-   frame index is read live from this instance (self._route_frame / self._window_seg_start)
+   frame index is read live from this instance (self._displayed_frame_idx / self._window_seg_start)
    instead of captured once over a fixed message_chunks list -- a window reload (seek) then just
    needs to update that state, not reinstall the patch.
+ - Message replay is keyed off self._displayed_frame_idx (the real idx of whatever camera frame
+   was last actually sent to the preview, set in _pump_camera_frames), NOT self._route_frame (the
+   wall-clock decode target run.py's equivalent linear loop would use). CONFIRMED IN THE FIELD:
+   keying replay off the wall-clock target instead of the displayed frame produced visibly unsynced
+   video/overlay -- the background camera decoder can fall well behind wall clock (e.g. the
+   qcamera path below blocks on decoding an entire 60s segment before yielding its first frame)
+   with nothing coupling the two clocks back together. self._route_frame still exists and still
+   drives _reload()/window positioning (i.e. what to decode *towards*); self._displayed_frame_idx
+   is what actually gets shown and replayed, so overlay data always matches the video frame
+   underneath it, at the cost of playback running slower than real time when decode lags.
  - The idx passed to VisionIpcServer.send() is NOT the raw route-frame counter run.py uses --
    see NUM_VIPC_BUFFERS below. CONFIRMED IN THE FIELD: shipping this with run.py's unbounded idx
    froze the device (silent, unrecoverable, no OOM-killer log, no panic, no crash log -- consistent
@@ -296,7 +306,19 @@ class ClipPlayer:
     self._frame_send_count = 0  # diagnostic: logged once so a future test is diagnosable via cloudlog
 
     self.total_frames = 0
-    self._route_frame = 0
+    self._route_frame = 0  # wall-clock DECODE TARGET -- drives _reload()/window positioning only
+    # Real (route-relative) idx of the last camera frame actually sent to the preview. Message
+    # replay and UI-facing position (current_time_s/progress) key off THIS, not _route_frame --
+    # CONFIRMED ON-DEVICE (2026-07-01): video and overlay were visibly unsynced. Root cause: the
+    # camera frame shown at any given tick is whatever the background FrameQueue decoder thread
+    # has managed to produce so far (which can fall well behind wall clock, e.g. the qcamera path
+    # blocks on decoding an entire 60s/1200-frame segment before yielding its first frame), while
+    # _route_frame/mock_update marched forward on wall clock regardless -- two independent clocks
+    # with no coupling between them. Keying replay off the actually-displayed frame instead means
+    # overlay data (lane lines, alerts, HUD) always matches what's on screen, at the cost of
+    # playback running slower than real time when decode is the bottleneck -- correct pairing over
+    # correct speed, which is the right trade for a review feature.
+    self._displayed_frame_idx = 0
     self.playing = False
     self._play_wall_start = 0.0
     self._play_frame_start = 0
@@ -342,6 +364,7 @@ class ClipPlayer:
     self._frame_send_count = 0
     self.total_frames = route.num_segments * SEG_SECONDS * FRAMERATE
     self._route_frame = 0
+    self._displayed_frame_idx = 0
     self.playing = False
 
     self._reload(0)
@@ -520,6 +543,7 @@ class ClipPlayer:
         idx, frame_bytes = road
         pts = int(idx * 5e7)  # matches tools/clip/run.py's synthetic 50ms-per-frame timestamp spacing
         self._vipc.send(VisionStreamType.VISION_STREAM_ROAD, frame_bytes, idx % NUM_VIPC_BUFFERS, pts, pts)
+        self._displayed_frame_idx = idx  # mock_update keys off this -- see module/field docstring
         self._frame_send_count += 1
         if self._frame_send_count == 1:
           route_name = self.route.name if self.route else '?'
@@ -551,7 +575,7 @@ class ClipPlayer:
       t = time.monotonic()
       sm.updated = dict.fromkeys(sm.services, False)
       chunks = player._message_chunks
-      idx = player._route_frame - player._window_seg_start * SEG_SECONDS * FRAMERATE
+      idx = player._displayed_frame_idx - player._window_seg_start * SEG_SECONDS * FRAMERATE
       if chunks and 0 <= idx < len(chunks):
         for svc, msg in chunks[idx].items():
           if svc in sm.data:
@@ -598,6 +622,7 @@ class ClipPlayer:
       self._ecamera_paths = []
       self.total_frames = 0
       self._route_frame = 0
+      self._displayed_frame_idx = 0
       self._teardown_frame_feed()
       self._message_chunks = []
       self._window_seg_start = -1
@@ -605,9 +630,12 @@ class ClipPlayer:
       self._restore_patch()
 
   # -- convenience for the UI ------------------------------------------------------------------
+  # current_time_s/progress key off _displayed_frame_idx (what's actually on screen), not
+  # _route_frame (the wall-clock decode target) -- so the seek bar's position always matches the
+  # video/overlay pair actually being shown, not where playback is nominally "supposed" to be.
   @property
   def current_time_s(self) -> float:
-    return self._route_frame / FRAMERATE
+    return self._displayed_frame_idx / FRAMERATE
 
   @property
   def total_time_s(self) -> float:
@@ -617,7 +645,7 @@ class ClipPlayer:
   def progress(self) -> float:
     if not self.total_frames:
       return 0.0
-    return self._route_frame / max(self.total_frames - 1, 1)
+    return self._displayed_frame_idx / max(self.total_frames - 1, 1)
 
   @property
   def is_loaded(self) -> bool:
