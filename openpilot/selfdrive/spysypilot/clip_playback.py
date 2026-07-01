@@ -35,6 +35,13 @@ Differences from tools/clip/run.py (which is unmodified -- see that file for the
    drives _reload()/window positioning (i.e. what to decode *towards*); self._displayed_frame_idx
    is what actually gets shown and replayed, so overlay data always matches the video frame
    underneath it, at the cost of playback running slower than real time when decode lags.
+ - Camera frames are only ever displayed once wall-clock time says they're due (see _drain_ready).
+   run.py's loop is 1 render tick = 1 decoded frame, always true there since it owns a dedicated
+   render loop paced at FRAMERATE; not true here, where the render loop's rate is independent of
+   the video's native 20fps. CONFIRMED IN THE FIELD: without this cap, a 20fps clip visibly played
+   back far faster than 20fps whenever decode had a backlog ready and the render loop ticked
+   faster than 20Hz (which it now often can). A one-frame lookahead holds a decoded-but-not-yet-due
+   frame between calls instead of showing it early or dropping it.
  - The idx passed to VisionIpcServer.send() is NOT the raw route-frame counter run.py uses --
    see NUM_VIPC_BUFFERS below. CONFIRMED IN THE FIELD: shipping this with run.py's unbounded idx
    froze the device (silent, unrecoverable, no OOM-killer log, no panic, no crash log -- consistent
@@ -302,6 +309,8 @@ class ClipPlayer:
 
     self._frame_queue: FrameQueue | None = None
     self._wide_frame_queue: FrameQueue | None = None
+    self._road_pending: tuple[int, bytes] | None = None  # see _drain_ready
+    self._wide_pending: tuple[int, bytes] | None = None
     self._vipc: VisionIpcServer | None = None
     self._frame_send_count = 0  # diagnostic: logged once so a future test is diagnosable via cloudlog
 
@@ -506,16 +515,37 @@ class ClipPlayer:
     self._pump_camera_frames()
     return True
 
-  def _drain_latest(self, fq: FrameQueue) -> tuple[tuple[int, bytes] | None, bool]:
-    """Drain up to MAX_FRAMES_PER_TICK entries from one decoder queue, keeping only the most
-    recent -- the vision client conflates to the latest buffer anyway, and the UI's own render
-    loop is what actually paints, so intermediate frames on a slow tick don't need sending
-    individually. Bounded so a big stall/seek can't spend unbounded time here. Returns
-    (latest_or_None, exhausted) -- the caller drops its reference to fq when exhausted is True."""
-    latest = None
+  def _drain_ready(self, fq: FrameQueue, pending_attr: str, max_idx: int) -> tuple[tuple[int, bytes] | None, bool]:
+    """Drain decoded frames with idx <= max_idx from one decoder queue, keeping only the most
+    recent due one -- the vision client conflates to the latest buffer anyway, and the UI's own
+    render loop is what actually paints, so intermediate frames on a slow tick don't need sending
+    individually. Bounded so a big stall/seek can't spend unbounded time here.
+
+    CONFIRMED IN THE FIELD (2026-07-01): without the max_idx cap, this always returned whatever
+    the decoder had most recently produced, with no relation to wall-clock time. FrameQueue's
+    background thread decodes as fast as it can (only blocked by its queue filling up, never
+    throttled to real time), and this method gets called once per UI render tick -- so whenever
+    the render loop ticks faster than the source's native 20fps (it now often can, after the
+    earlier performance fixes), playback raced through frames far faster than real time (a 20fps
+    clip visibly playing back at whatever rate decoder+render-loop could sustain together, well
+    above 20fps). max_idx is the current wall-clock playback target (self._route_frame, computed
+    for real-time pacing regardless of render rate) -- a frame is only ever handed to the caller
+    once its idx is actually due. A decoded frame that's ahead of schedule is held in
+    getattr(self, pending_attr) (a one-frame lookahead) rather than being shown early or dropped,
+    so it's simply used on a later call once max_idx catches up to it -- this is also exactly what
+    lets playback correctly run *slower* than real time when decode is the bottleneck (round 5's
+    fix), rather than skipping ahead to resync.
+
+    Returns (frame_or_None, exhausted) -- the caller drops its reference to fq when exhausted."""
+    latest = getattr(self, pending_attr)
+    if latest is not None:
+      if latest[0] > max_idx:
+        return None, False  # already holding a not-yet-due frame; nothing new to show this tick
+      setattr(self, pending_attr, None)
+
     for _ in range(MAX_FRAMES_PER_TICK):
       try:
-        latest = fq.get_nowait()
+        item = fq.get_nowait()
       except queue.Empty:
         break
       except StopIteration:
@@ -523,20 +553,28 @@ class ClipPlayer:
       except Exception:
         cloudlog.exception("clip_playback: frame queue error")
         return latest, True
+      if item[0] <= max_idx:
+        latest = item
+      else:
+        setattr(self, pending_attr, item)  # ahead of schedule -- hold for a later tick
+        break
     return latest, False
 
   def _pump_camera_frames(self):
-    """Forward the latest decoded road (and wide, if being served) frame to the preview
-    VisionIpcServer. The idx passed to send() is deliberately NOT the raw route-frame counter --
-    see NUM_VIPC_BUFFERS' module-level comment: CameraView caches one GPU/EGL image per distinct
-    idx forever, so an ever-growing idx is an ever-growing, never-freed GPU resource in this
-    long-lived process. pts is still computed from the real (unbounded) frame counter so playback
-    timing/ordering stays correct -- only the buffer-slot idx is bounded."""
+    """Forward the newest *due* decoded road (and wide, if being served) frame to the preview
+    VisionIpcServer -- see _drain_ready for the wall-clock-pacing reasoning. The idx passed to
+    send() is deliberately NOT the raw route-frame counter -- see NUM_VIPC_BUFFERS' module-level
+    comment: CameraView caches one GPU/EGL image per distinct idx forever, so an ever-growing idx
+    is an ever-growing, never-freed GPU resource in this long-lived process. pts is still computed
+    from the real (unbounded) frame counter so playback timing/ordering stays correct -- only the
+    buffer-slot idx is bounded."""
     if self._vipc is None:
       return
 
+    max_idx = self._route_frame  # wall-clock target; see _drain_ready
+
     if self._frame_queue is not None:
-      road, exhausted = self._drain_latest(self._frame_queue)
+      road, exhausted = self._drain_ready(self._frame_queue, '_road_pending', max_idx)
       if exhausted:
         self._frame_queue = None
       if road is not None:
@@ -550,7 +588,7 @@ class ClipPlayer:
           cloudlog.debug(f"clip_playback: sent first ROAD frame (route idx {idx}) for {route_name}")
 
     if self._wide_frame_queue is not None:
-      wide, exhausted = self._drain_latest(self._wide_frame_queue)
+      wide, exhausted = self._drain_ready(self._wide_frame_queue, '_wide_pending', max_idx)
       if exhausted:
         self._wide_frame_queue = None
       if wide is not None:
@@ -605,6 +643,10 @@ class ClipPlayer:
     if self._wide_frame_queue is not None:
       self._wide_frame_queue.stop()
       self._wide_frame_queue = None
+    # A pending lookahead frame belongs to the FrameQueue that decoded it -- never carry it over
+    # to whatever gets created next (_reload always tears down before creating fresh queues).
+    self._road_pending = None
+    self._wide_pending = None
     # No explicit close()/stop() API observed on VisionIpcServer anywhere in this codebase's
     # usage (e.g. CameraView.close() just drops its VisionIpcClient reference the same way) --
     # dropping the reference lets its destructor release the shared buffers/listener socket.
