@@ -59,7 +59,10 @@ class ClipViewerScreen(Widget):
     self._fullscreen = False
     self._guard_failed = False
 
-    self._road_view = self._child(AugmentedRoadView())
+    # use_egl=False: our frames are software-decoded and fed through a synthetic VisionIpcServer
+    # (selfdrive/spysypilot/clip_playback.py), not real camerad DMA-buf memory -- confirmed
+    # on-device that the zero-copy EGL import path fails every frame (EGL_BAD_MATCH) for this.
+    self._road_view = self._child(AugmentedRoadView(use_egl=False))
     self._road_view.set_click_callback(self._toggle_fullscreen)
 
     self._seek_bar = self._child(ClipSeekBar())
