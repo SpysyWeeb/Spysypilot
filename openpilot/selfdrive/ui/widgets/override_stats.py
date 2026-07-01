@@ -14,7 +14,7 @@ class OverrideStatsWidget(StatsPageWidget):
     """Shows how much of your driving is spent overriding the model's steering, and
     breaks that override time down by driving context (turn / lane position / lane
     change). The breakdown is inferred from measurable conditions at override time,
-    not the driver's actual intent — it's a "under what conditions" view, not a
+    not the driver's actual intent - it's a "under what conditions" view, not a
     literal "why"."""
 
     def __init__(self):
@@ -34,8 +34,12 @@ class OverrideStatsWidget(StatsPageWidget):
         )
         y += 25
 
-        y = self._draw_section("LAST DRIVE — OVERRIDE CONTEXT", x, y, w)
-        self._draw_context_breakdown(x, y, w)
+        y = self._draw_section("LAST DRIVE - OVERRIDE CONTEXT", x, y, w)
+        y = self._draw_context_breakdown(x, y, w)
+        y += 25
+
+        y = self._draw_section("TURN DETAIL - LAST DRIVE", x, y, w)
+        self._draw_turn_detail(x, y, w)
 
     def _reload(self):
         for attr, key in (("_lifetime", "SpysyLifetimeStats"), ("_last_drive", "SpysyLastDriveStats")):
@@ -47,25 +51,25 @@ class OverrideStatsWidget(StatsPageWidget):
 
     def _lifetime_override_pct(self) -> str:
         if self._lifetime is None:
-            return "—"
+            return "N/A"
         controlled = self._lifetime.get("engaged_mi", 0.0) + self._lifetime.get("aol_mi", 0.0)
         if controlled == 0:
-            return "—"
+            return "N/A"
         return f"{self._lifetime.get('override_mi', 0.0) / controlled * 100:.1f}%"
 
     def _lifetime_avg_divergence(self) -> str:
         if self._lifetime is None or "avg_divergence_deg" not in self._lifetime:
-            return "—"
+            return "N/A"
         return f"{self._lifetime.get('avg_divergence_deg', 0.0):.1f}°"
 
     def _fmt_pct(self, field: str) -> str:
         if self._last_drive is None or field not in self._last_drive:
-            return "—"
+            return "N/A"
         return f"{self._last_drive.get(field, 0.0):.1f}%"
 
     def _fmt_deg(self, field: str) -> str:
         if self._last_drive is None or field not in self._last_drive:
-            return "—"
+            return "N/A"
         return f"{self._last_drive.get(field, 0.0):.1f}°"
 
     def _draw_stat_pair(self, x: int, y: int, w: int,
@@ -80,16 +84,16 @@ class OverrideStatsWidget(StatsPageWidget):
             rl.draw_text_ex(fb, val,   rl.Vector2(col_x, y + 44), 56, 0, color)
         return y + 120
 
-    def _draw_context_breakdown(self, x: int, y: int, w: int):
+    def _draw_context_breakdown(self, x: int, y: int, w: int) -> int:
         fn = gui_app.font(FontWeight.NORMAL)
         fb = gui_app.font(FontWeight.BOLD)
 
         if self._last_drive is None or "override_pct" not in self._last_drive:
             rl.draw_text_ex(fn, "No drive data yet", rl.Vector2(x, y + 12), 40, 0, DIM)
-            return
+            return y + 60
         if self._last_drive.get("override_mi", 0.0) == 0:
             rl.draw_text_ex(fn, "No overrides on the last drive", rl.Vector2(x, y + 12), 40, 0, DIM)
-            return
+            return y + 60
 
         cells = [
             ("Turns",         self._fmt_pct("turn_pct"),        _TURN),
@@ -107,3 +111,54 @@ class OverrideStatsWidget(StatsPageWidget):
         rl.draw_text_ex(fn, note, rl.Vector2(x, y + 118), 28, 0, DIM)
         rl.draw_text_ex(fn, "Buckets reflect driving context at override time, not confirmed intent",
                          rl.Vector2(x, y + 152), 26, 0, DIM)
+        return y + 190
+
+    def _fmt_turn_soft(self, side: str) -> str:
+        if self._last_drive is None:
+            return "N/A"
+        pct = self._last_drive.get(f"turn_{side}_soft_pct")
+        deg = self._last_drive.get(f"turn_{side}_agg_deg")
+        if pct is None or deg is None:
+            return "N/A"
+        return f"{pct:.0f}% ({deg:+.1f}°)"
+
+    def _fmt_unwind(self, side: str) -> str:
+        if self._last_drive is None:
+            return "N/A"
+        n = self._last_drive.get(f"turn_{side}_unwind_count", 0)
+        if not n:
+            return "N/A"
+        lead = self._last_drive.get(f"turn_{side}_unwind_lead_s", 0.0)
+        return f"{lead:+.1f}s"
+
+    def _draw_turn_detail(self, x: int, y: int, w: int):
+        fn = gui_app.font(FontWeight.NORMAL)
+        fb = gui_app.font(FontWeight.BOLD)
+
+        if self._last_drive is None or "turn_pct" not in self._last_drive:
+            rl.draw_text_ex(fn, "No drive data yet", rl.Vector2(x, y + 12), 40, 0, DIM)
+            return
+        if self._last_drive.get("turn_pct", 0.0) == 0.0:
+            rl.draw_text_ex(fn, "No turns on the last drive", rl.Vector2(x, y + 12), 40, 0, DIM)
+            return
+
+        label_w = int(w * 0.32)
+        left_x = x + label_w
+        right_x = left_x + (w - label_w) // 2
+
+        rl.draw_text_ex(fn, "Left Turns",  rl.Vector2(left_x, y),  32, 0, DIM)
+        rl.draw_text_ex(fn, "Right Turns", rl.Vector2(right_x, y), 32, 0, DIM)
+
+        row_y = y + 42
+        rl.draw_text_ex(fn, "Model too soft", rl.Vector2(x, row_y), 32, 0, DIM)
+        rl.draw_text_ex(fb, self._fmt_turn_soft("left"),  rl.Vector2(left_x, row_y),  40, 0, _TURN)
+        rl.draw_text_ex(fb, self._fmt_turn_soft("right"), rl.Vector2(right_x, row_y), 40, 0, _TURN)
+
+        row_y += 56
+        rl.draw_text_ex(fn, "Unwind sooner", rl.Vector2(x, row_y), 32, 0, DIM)
+        rl.draw_text_ex(fb, self._fmt_unwind("left"),  rl.Vector2(left_x, row_y),  40, 0, _LANEPOS)
+        rl.draw_text_ex(fb, self._fmt_unwind("right"), rl.Vector2(right_x, row_y), 40, 0, _LANEPOS)
+
+        n = self._last_drive.get("turn_left_unwind_count", 0) + self._last_drive.get("turn_right_unwind_count", 0)
+        rl.draw_text_ex(fn, f"({n} turn{'s' if n != 1 else ''} over 90° analyzed for unwind timing)",
+                         rl.Vector2(x, row_y + 56), 26, 0, DIM)
