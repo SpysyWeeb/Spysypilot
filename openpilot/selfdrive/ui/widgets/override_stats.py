@@ -4,7 +4,6 @@ import pyray as rl
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.selfdrive.ui.widgets.stats_common import StatsPageWidget, DIM, DIVIDER
 
-_WHITE    = rl.Color(255, 255, 255, 255)
 _GREEN    = rl.Color(70, 200, 100, 255)
 _ORANGE   = rl.Color(234, 160, 50, 255)
 _AOL      = rl.Color(180, 130, 255, 255)
@@ -15,13 +14,12 @@ _LANECHG  = rl.Color(180, 130, 255, 255)
 
 
 class OverrideStatsWidget(StatsPageWidget):
-    """Everything about the most recent drive: Engaged / AOL / Disengaged split, how much
-    was overridden and by how much, a breakdown of that override time by driving context
-    (turn / straight line / curve / lane change), and why (accel/steer/AOL override vs.
-    braking/cancel disengagement). See the Turn / Curve / Straight Line pages (next in the
-    cycle) for detail on each context. The context breakdown is inferred from measurable
-    conditions at override time, not the driver's actual intent - it's a "under what
-    conditions" view, not a literal "why"."""
+    """Everything about the most recent drive: Engaged / AOL / Disengaged split, a
+    breakdown of override time by driving context (turn / straight line / curve / lane
+    change), and why (accel/steer/AOL override vs. braking/cancel disengagement). See the
+    Turn / Curve / Straight Line pages (next in the cycle) for detail on each context. The
+    context breakdown is inferred from measurable conditions at override time, not the
+    driver's actual intent - it's a "under what conditions" view, not a literal "why"."""
 
     def __init__(self):
         super().__init__()
@@ -37,14 +35,6 @@ class OverrideStatsWidget(StatsPageWidget):
             "Engaged",    self._fmt_pct("engaged_pct"),    self._fmt_mi("engaged_mi"),    _GREEN,
             "AOL",        self._fmt_pct("aol_pct"),        self._fmt_mi("aol_mi"),        _AOL,
             "Disengaged", self._fmt_pct("disengaged_pct"), self._fmt_mi("disengaged_mi"), _ORANGE,
-        )
-        y += 25
-
-        y = self._draw_section("STEERING OVERRIDES", x, y, w)
-        y = self._draw_stat_pair(
-            x, y, w,
-            "Override Time", self._fmt_pct("override_pct"), _WHITE,
-            "Avg. Angle Disagreement", self._fmt_deg("avg_divergence_deg"), _WHITE,
         )
         y += 25
 
@@ -71,23 +61,6 @@ class OverrideStatsWidget(StatsPageWidget):
         if self._last_drive is None or field not in self._last_drive:
             return "N/A"
         return f"{self._last_drive.get(field, 0.0):.1f}%"
-
-    def _fmt_deg(self, field: str) -> str:
-        if self._last_drive is None or field not in self._last_drive:
-            return "N/A"
-        return f"{self._last_drive.get(field, 0.0):.1f}°"
-
-    def _draw_stat_pair(self, x: int, y: int, w: int,
-                        l1: str, v1: str, c1: rl.Color,
-                        l2: str, v2: str, c2: rl.Color) -> int:
-        fn = gui_app.font(FontWeight.NORMAL)
-        fb = gui_app.font(FontWeight.BOLD)
-        half = w // 2
-        for i, (label, val, color) in enumerate([(l1, v1, c1), (l2, v2, c2)]):
-            col_x = x + i * half
-            rl.draw_text_ex(fn, label, rl.Vector2(col_x, y),      32, 0, DIM)
-            rl.draw_text_ex(fb, val,   rl.Vector2(col_x, y + 44), 56, 0, color)
-        return y + 120
 
     def _draw_context_breakdown(self, x: int, y: int, w: int) -> int:
         fn = gui_app.font(FontWeight.NORMAL)
