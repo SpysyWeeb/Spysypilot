@@ -30,7 +30,9 @@ class AolDriver:
     # Hyundai with LDA button or CANFD can always activate (no cruise required)
     self.allow_always = is_hyundai_always_allow(self.CP)
 
-    self._cruise_available_prev = False
+    # None until the first carState frame so the initial value of
+    # cruiseState.available can never register as a rising/falling edge
+    self._cruise_available_prev: bool | None = None
     self._lateral_mismatch_counter = 0
 
 
@@ -93,13 +95,20 @@ class AolDriver:
       else:
         self.state_machine.add_event('lkasEnable')
 
-    # ACC main rising edge → activate AOL (for cars where cruiseState.available changes)
-    if cruise_available and not self._cruise_available_prev:
-      if not self.enabled:
-        self.state_machine.add_event('lkasEnable')
+    # ACC main rising edge → activate AOL (for cars where cruiseState.available tracks
+    # the ACC main switch). Skipped on allow_always cars (Hyundai CANFD, e.g. Palisade):
+    # there available means "no TCS fault" and is true from the first frame after
+    # ignition, so this edge would phantom-enable AOL at every start while the panda's
+    # lateral_allowed latch (armed only by a real button press) stays off — panda then
+    # blocks the LKAS frames and the MDPS faults until the user toggles AOL manually.
+    if not self.allow_always and self._cruise_available_prev is not None:
+      if cruise_available and not self._cruise_available_prev:
+        if not self.enabled:
+          self.state_machine.add_event('lkasEnable')
 
-    # ACC main falling edge → deactivate AOL (for cars where cruiseState.available changes)
-    if not cruise_available and self._cruise_available_prev:
+    # ACC main falling edge → deactivate AOL (for cars where cruiseState.available changes;
+    # on allow_always cars this only fires on a real TCS fault, where disabling is also right)
+    if self._cruise_available_prev is not None and not cruise_available and self._cruise_available_prev:
       if self.enabled:
         cloudlog.warning("AOL: immediateDisable (cruiseState.available falling edge)")
         self.state_machine.add_event('immediateDisable')
