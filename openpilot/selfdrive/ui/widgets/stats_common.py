@@ -62,3 +62,19 @@ class StatsPageWidget(Widget):
         line_y = y + 46
         rl.draw_line_ex(rl.Vector2(x, line_y), rl.Vector2(x + w, line_y), 1, DIVIDER)
         return line_y + 18
+
+    def _draw_stat_triple(self, x: int, y: int, w: int,
+                          l1: str, p1: str, s1: str, c1: rl.Color,
+                          l2: str, p2: str, s2: str, c2: rl.Color,
+                          l3: str, p3: str, s3: str, c3: rl.Color) -> int:
+        fn = gui_app.font(FontWeight.NORMAL)
+        fb = gui_app.font(FontWeight.BOLD)
+        third = w // 3
+        for i, (label, primary, secondary, color) in enumerate(
+            [(l1, p1, s1, c1), (l2, p2, s2, c2), (l3, p3, s3, c3)]
+        ):
+            col_x = x + i * third
+            rl.draw_text_ex(fn, label,     rl.Vector2(col_x, y),       38, 0, DIM)
+            rl.draw_text_ex(fb, primary,   rl.Vector2(col_x, y + 46),  52, 0, color)
+            rl.draw_text_ex(fn, secondary, rl.Vector2(col_x, y + 106), 38, 0, color)
+        return y + 152
