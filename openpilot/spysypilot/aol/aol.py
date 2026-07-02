@@ -10,6 +10,12 @@ from openpilot.spysypilot.aol.helpers import is_hyundai_always_allow
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = log.OnroadEvent.EventName
 
+# Turn-signal / lane-change events surfaced as alerts during AOL-only steering.
+# All of these are plain ET.WARNING alerts, which the main state machine only
+# permits while fully engaged — so without help they never render under AOL.
+LANE_CHANGE_EVENTS = (EventName.preLaneChangeLeft, EventName.preLaneChangeRight,
+                      EventName.laneChangeBlocked, EventName.laneChange)
+
 
 class AolDriver:
   """Always-On-Lateral state machine for Spysypilot.
@@ -135,6 +141,26 @@ class AolDriver:
 
   def update(self, CS) -> None:
     self.enabled, self.active = self.state_machine.update()
+
+  def create_lane_change_alerts(self, callback_args: list) -> list:
+    """Surface turn-signal / lane-change alerts while AOL steers without full engagement.
+
+    selfdrived adds the lane-change events unconditionally, but update_alerts only
+    renders alert types permitted by the main state machine — [PERMANENT] when not
+    engaged — so the WARNING-type lane-change prompts never show during AOL-only
+    driving even though the lane changes themselves happen (modeld's DesireHelper
+    keys off carControl.latActive). Return just those alerts for selfdrived to add;
+    every other WARNING stays suppressed as stock intends.
+    """
+    if self.sd.enabled or not self.active:
+      return []
+    active_lane_events = [e for e in LANE_CHANGE_EVENTS if e in self.sd.events.events]
+    if not active_lane_events:
+      return []
+    lane_change_events = Events()
+    for event_name in active_lane_events:
+      lane_change_events.add(event_name)
+    return lane_change_events.create_alerts([ET.WARNING], callback_args)
 
   def publish(self, pm) -> None:
     msg = messaging.new_message('spysydriveStateSP')
