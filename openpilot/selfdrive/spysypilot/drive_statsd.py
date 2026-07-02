@@ -4,10 +4,12 @@ drive_statsd - Off-road service that parses completed drive logs and
 writes per-drive and lifetime engagement stats to Params for the UI.
 """
 import json
+import math
 import os
 import time
 from typing import Optional
 
+from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.params import Params
 from openpilot.common.constants import CV
 from openpilot.common.hardware.hw import Paths
@@ -15,6 +17,11 @@ from openpilot.common.swaglog import cloudlog
 
 METERS_PER_MILE = 1609.344
 POLL_INTERVAL = 30.0
+
+# Bump whenever a fix changes what existing field *values* mean (not just which fields
+# exist) - REQUIRED_LIFETIME_FIELDS alone only catches missing keys, not semantic changes
+# to keys that already exist, so this forces a reanalysis of all routes when it changes.
+ANALYZER_VERSION = 2
 
 # OnroadEvent.EventName ordinals from cereal/log.capnp
 _BUTTON_CANCEL   = 9   # buttonCancel
@@ -154,6 +161,14 @@ def _parse_segment(seg_path: str) -> dict:
     enabled = False
     aol_active = False
     aol_middle_prev = False
+    # This fork's cars are torque-controlled (steerControlType defaults to torque, and
+    # Hyundai never overrides it), so carControl.actuators.steeringAngleDeg is never
+    # populated - only .curvature is set unconditionally by controlsd. Convert that
+    # commanded curvature to an equivalent steering-wheel angle (matching
+    # carState.steeringAngleDeg's units and sign convention) using the same VehicleModel
+    # math the controller itself uses, so it's comparable to the actual angle.
+    vm: Optional[VehicleModel] = None
+    commanded_curvature = 0.0
     commanded_angle = 0.0
     last_t: Optional[float] = None
     last_vego = 0.0
@@ -250,12 +265,19 @@ def _parse_segment(seg_path: str) -> dict:
                     else:
                         disengaged_m += m
 
-                    if enabled or aol_active:
+                    # Angle-dependent analysis needs a VehicleModel (built from a logged
+                    # carParams) to convert commanded_curvature into a comparable angle;
+                    # until one shows up (should be within the first ~50s of most segments)
+                    # this section is skipped rather than comparing against a bogus zero.
+                    if vm is not None:
+                        commanded_angle = math.degrees(vm.get_steer_from_curvature(-commanded_curvature, vego, 0.0))
+
+                    if vm is not None and (enabled or aol_active):
                         _turn_episode_tick(t, commanded_angle, cs.steeringAngleDeg)
 
                     # Override analysis: only meaningful while the model is actually in
                     # control (engaged or AOL) and the driver is fighting the wheel.
-                    if (enabled or aol_active) and cs.steeringPressed:
+                    if vm is not None and (enabled or aol_active) and cs.steeringPressed:
                         override_m += m
                         divergence_wsum += abs(commanded_angle - cs.steeringAngleDeg) * m
                         is_turn = vego < TURN_SPEED_MAX_MS and abs(commanded_angle) > TURN_PEAK_MIN_DEG
@@ -288,9 +310,16 @@ def _parse_segment(seg_path: str) -> dict:
                 last_vego = vego
 
             elif w == 'carControl':
-                # Angle-based commanded steering (this fork targets an angle-control car);
-                # compared directly against carState.steeringAngleDeg, the actual angle.
-                commanded_angle = msg.carControl.actuators.steeringAngleDeg
+                # actuators.curvature is set unconditionally by controlsd regardless of
+                # steerControlType; converted to an angle above once a VehicleModel exists.
+                commanded_curvature = msg.carControl.actuators.curvature
+
+            elif w == 'carParams':
+                if vm is None:
+                    try:
+                        vm = VehicleModel(msg.carParams)
+                    except Exception as e:
+                        cloudlog.warning(f"drive_statsd: failed to build VehicleModel: {e}")
 
             elif w == 'selfdriveState':
                 enabled = msg.selfdriveState.enabled
@@ -417,9 +446,10 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
     """
     Schema check then disk presence check.
 
-    If stored lifetime data is missing any field from REQUIRED_LIFETIME_FIELDS,
-    all routes are cleared for full reanalysis - this automatically triggers
-    whenever a new data field is added to the analyzer.
+    If stored lifetime data is missing any field from REQUIRED_LIFETIME_FIELDS, or was
+    written by an older ANALYZER_VERSION, all routes are cleared for full reanalysis -
+    this automatically triggers whenever a new data field is added, or a fix changes what
+    an existing field's values mean without adding a new field name.
 
     Returns (lifetime, processed), either of which may have been reset.
     """
@@ -435,6 +465,9 @@ def _startup_verify(log_root: str, processed: set[str], lifetime: dict,
                 missing = REQUIRED_LIFETIME_FIELDS - set(stored.keys())
                 if missing:
                     cloudlog.info(f"drive_statsd: lifetime data missing fields {missing}, clearing for full reanalysis")
+                    needs_reanalysis = True
+                elif stored.get('_analyzer_version', 0) != ANALYZER_VERSION:
+                    cloudlog.info("drive_statsd: analyzer version changed, clearing for full reanalysis")
                     needs_reanalysis = True
             except Exception:
                 needs_reanalysis = True
@@ -512,6 +545,7 @@ def _load_lifetime(params: Params) -> dict:
 
 def _save_lifetime(params: Params, lifetime: dict):
     params.put("SpysyLifetimeStats", json.dumps({
+        '_analyzer_version': ANALYZER_VERSION,
         'engaged_mi': round(lifetime['engaged_m'] / METERS_PER_MILE, 2),
         'disengaged_mi': round(lifetime['disengaged_m'] / METERS_PER_MILE, 2),
         'aol_mi': round(lifetime['aol_m'] / METERS_PER_MILE, 2),
@@ -575,7 +609,7 @@ def _merge_side_detail(lifetime: dict, route_side_m: dict, route_agg_wsum: dict,
         lifetime[soft_key] = _merge_avg(lifetime[soft_key], lifetime[m_key], route_soft_pct, side_m)
         lifetime[m_key] += side_m
 
-        route_detail[side] = {'agg_deg': round(route_agg, 2), 'soft_pct': route_soft_pct}
+        route_detail[side] = {'agg_deg': round(route_agg, 2), 'soft_pct': route_soft_pct, 'm': side_m}
     return route_detail
 
 
@@ -670,7 +704,7 @@ def main():
                 lifetime[f'avg_pull_{side}_deg'] = _merge_avg(
                     lifetime[f'avg_pull_{side}_deg'], lifetime[f'straight_{side}_m'], route_pull, side_m)
                 lifetime[f'straight_{side}_m'] += side_m
-                straight_detail[side] = round(route_pull, 2)
+                straight_detail[side] = {'pull_deg': round(route_pull, 2), 'm': side_m}
 
             # Turn-in / unwind timing, split left/right.
             timing_detail: dict = {}
@@ -718,10 +752,14 @@ def main():
                 'turn_right_unwind_count': timing_detail['unwind']['right']['count'],
                 'curve_left_agg_deg': curve_detail['left']['agg_deg'],
                 'curve_left_soft_pct': curve_detail['left']['soft_pct'],
+                'curve_left_mi': round(curve_detail['left']['m'] / METERS_PER_MILE, 2),
                 'curve_right_agg_deg': curve_detail['right']['agg_deg'],
                 'curve_right_soft_pct': curve_detail['right']['soft_pct'],
-                'straight_left_pull_deg': straight_detail['left'],
-                'straight_right_pull_deg': straight_detail['right'],
+                'curve_right_mi': round(curve_detail['right']['m'] / METERS_PER_MILE, 2),
+                'straight_left_pull_deg': straight_detail['left']['pull_deg'],
+                'straight_left_mi': round(straight_detail['left']['m'] / METERS_PER_MILE, 2),
+                'straight_right_pull_deg': straight_detail['right']['pull_deg'],
+                'straight_right_mi': round(straight_detail['right']['m'] / METERS_PER_MILE, 2),
             }
 
             processed.add(route_name)
