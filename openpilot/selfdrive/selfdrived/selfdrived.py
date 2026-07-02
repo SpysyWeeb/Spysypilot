@@ -485,16 +485,21 @@ class SelfdriveD:
     return CS
 
   def update_alerts(self, CS):
+    pers = LONGITUDINAL_PERSONALITY_MAP[self.personality]
+    callback_args = [self.CP, CS, self.sm, self.is_metric, self.state_machine.soft_disable_timer, pers]
+
+    # AOL: lane-change prompts are WARNING alerts, which are suppressed unless fully
+    # engaged — surface them while AOL is steering so turn-signal use gets feedback
+    aol_lane_change_alerts = self.aol.create_lane_change_alerts(callback_args)
+
     clear_event_types = set()
-    if ET.WARNING not in self.state_machine.current_alert_types:
+    if ET.WARNING not in self.state_machine.current_alert_types and not aol_lane_change_alerts:
       clear_event_types.add(ET.WARNING)
     if self.enabled:
       clear_event_types.add(ET.NO_ENTRY)
 
-    pers = LONGITUDINAL_PERSONALITY_MAP[self.personality]
-    alerts = self.events.create_alerts(self.state_machine.current_alert_types, [self.CP, CS, self.sm, self.is_metric,
-                                                                                self.state_machine.soft_disable_timer, pers])
-    self.AM.add_many(self.sm.frame, alerts)
+    alerts = self.events.create_alerts(self.state_machine.current_alert_types, callback_args)
+    self.AM.add_many(self.sm.frame, alerts + aol_lane_change_alerts)
     self.AM.process_alerts(self.sm.frame, clear_event_types)
 
   def publish_selfdriveState(self, CS):
