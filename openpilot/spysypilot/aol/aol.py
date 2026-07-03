@@ -3,7 +3,8 @@ from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.selfdrived.events import ET, Events
+from openpilot.selfdrive.selfdrived.events import (ET, Events, Alert, Priority, AlertSize,
+                                                   AlertStatus, VisualAlert, AudibleAlert)
 from openpilot.spysypilot.aol.state import AolStateMachine, ACTIVE_STATES, ENABLED_STATES, State
 from openpilot.spysypilot.aol.helpers import is_hyundai_always_allow
 
@@ -15,6 +16,9 @@ EventName = log.OnroadEvent.EventName
 # permits while fully engaged — so without help they never render under AOL.
 LANE_CHANGE_EVENTS = (EventName.preLaneChangeLeft, EventName.preLaneChangeRight,
                       EventName.laneChangeBlocked, EventName.laneChange)
+
+# How long the one-shot "AOL disengaged" warning stays up after AOL turns itself off
+DISABLE_ALERT_TIME = 3.0
 
 
 class AolDriver:
@@ -40,6 +44,7 @@ class AolDriver:
     # cruiseState.available can never register as a rising/falling edge
     self._cruise_available_prev: bool | None = None
     self._lateral_mismatch_counter = 0
+    self._disable_alert_frames = 0
 
 
   @property
@@ -122,10 +127,14 @@ class AolDriver:
     self._cruise_available_prev = cruise_available
 
     # Safety: door open or park brake → pause
-    if hasattr(CS, 'doorOpen') and CS.doorOpen:
+    pause_requested = (hasattr(CS, 'doorOpen') and CS.doorOpen) or \
+                      (hasattr(CS, 'parkingBrake') and CS.parkingBrake)
+    if pause_requested:
       self.state_machine.add_event('canPause')
-    if hasattr(CS, 'parkingBrake') and CS.parkingBrake:
-      self.state_machine.add_event('canPause')
+    elif self.state_machine.state == State.paused:
+      # Auto-resume once the pause cause clears — paused otherwise exits only on
+      # a button press, so a closed door would leave AOL off for the whole drive
+      self.state_machine.add_event('silentLkasEnable')
 
     # Steering fault → disable
     if CS.steerFaultPermanent:
@@ -149,7 +158,15 @@ class AolDriver:
     # REMAIN_ACTIVE: brake/gas press does NOT affect AOL state
 
   def update(self, CS) -> None:
+    prev_enabled = self.enabled
     self.enabled, self.active = self.state_machine.update()
+
+    # One-shot warning when AOL turns itself off (steer fault, panda mismatch,
+    # cruise loss) — a user button press is intentional and gets no alert
+    if prev_enabled and not self.enabled and not self.state_machine.has('userDisable'):
+      self._disable_alert_frames = int(DISABLE_ALERT_TIME / DT_CTRL)
+    elif self._disable_alert_frames > 0:
+      self._disable_alert_frames -= 1
 
   def create_lane_change_alerts(self, callback_args: list) -> list:
     """Surface turn-signal / lane-change alerts while AOL steers without full engagement.
@@ -170,6 +187,32 @@ class AolDriver:
     for event_name in active_lane_events:
       lane_change_events.add(event_name)
     return lane_change_events.create_alerts([ET.WARNING], callback_args)
+
+  def create_aol_alerts(self) -> list:
+    """Alerts for AOL state changes that stock plumbing renders nothing for.
+
+    WARNING alerts only render while fully engaged, so during AOL-only driving a
+    steer-fault soft disable or a forced AOL disable is invisible — exactly when
+    the driver most needs to know steering stopped.
+    """
+    if self.sd.enabled:
+      return []
+    alerts = []
+    if self.state_machine.state == State.softDisabling:
+      a = Alert("Steering Temporarily Unavailable", "Always-On Lateral disengaging",
+                AlertStatus.userPrompt, AlertSize.small, Priority.LOW,
+                VisualAlert.steerRequired, AudibleAlert.prompt, .2)
+      a.alert_type = "aolSoftDisabling/warning"
+      a.event_type = ET.WARNING
+      alerts.append(a)
+    if self._disable_alert_frames > 0 and not self.enabled:
+      a = Alert("Always-On Lateral DISENGAGED", "Steering is off",
+                AlertStatus.userPrompt, AlertSize.mid, Priority.MID,
+                VisualAlert.steerRequired, AudibleAlert.warningSoft, .2)
+      a.alert_type = "aolDisengaged/warning"
+      a.event_type = ET.WARNING
+      alerts.append(a)
+    return alerts
 
   def publish(self, pm) -> None:
     msg = messaging.new_message('spysydriveStateSP')
