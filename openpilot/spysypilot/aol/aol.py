@@ -133,9 +133,18 @@ class AolDriver:
         cloudlog.error("AOL: immediateDisable (steerFaultPermanent)")
       self.state_machine.add_event('immediateDisable')
     elif CS.steerFaultTemporary:
-      if self.active:
-        cloudlog.warning("AOL: softDisable (steerFaultTemporary)")
-      self.state_machine.add_event('softDisable')
+      # The Palisade MDPS raises a temporary fault (ToiUnavail) about a second
+      # after controlsd's standstill gate drops latActive at every stop, and it
+      # persists until the car moves off — long enough to run out the 3s soft
+      # disable timer at any normal stoplight. Steering is already blocked by
+      # controlsd while the fault or standstill persists, so the fault is benign
+      # here: only treat it as real while the car is moving. Mirror controlsd's
+      # standstill expression so the two gates agree.
+      standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
+      if not standstill:
+        if self.active:
+          cloudlog.warning("AOL: softDisable (steerFaultTemporary)")
+        self.state_machine.add_event('softDisable')
 
     # REMAIN_ACTIVE: brake/gas press does NOT affect AOL state
 
