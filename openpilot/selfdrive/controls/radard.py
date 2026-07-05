@@ -22,6 +22,10 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 
 # stationary qualification parameters
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
+LOW_SPEED_LEAD_MIN_CNT = 20  # ~1s at 20Hz: the unconfirmed low-speed override only trusts tracks that were
+                             # tracked in from a distance. A real stopped lead is tracked for seconds on
+                             # approach; clutter and crossing traffic pop into existence at close range
+                             # (seen max-braking a stop for a 0.8s ghost 3.6m ahead with modelProb 0.00)
 
 RADAR_TO_CENTER = 2.7   # (deprecated) RADAR is ~ 2.7m ahead from center of car
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
@@ -101,7 +105,9 @@ class Track:
   def potential_low_speed_lead(self, v_ego: float):
     # stop for stuff in front of you and low speed, even without model confirmation
     # Radar points closer than 0.75, are almost always glitches on toyota radars
-    return abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (0.75 < self.dRel < 25)
+    # Require track age: vision-confirmed leads bypass this path entirely, so radar alone
+    # only gets to declare a close lead for objects it tracked arriving (see LOW_SPEED_LEAD_MIN_CNT)
+    return abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (0.75 < self.dRel < 25) and (self.cnt >= LOW_SPEED_LEAD_MIN_CNT)
 
   def is_potential_fcw(self, model_prob: float):
     return model_prob > .9
