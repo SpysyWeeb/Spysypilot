@@ -62,13 +62,17 @@ class LongControl:
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
-    self.smooth.update()
 
     # Smooth Stops owns the final approach: while the plan wants to stop but the car is
-    # still rolling, defer the hold clamp and feather in the pid branch below. The clamp
+    # still rolling, defer the hold clamp and settle in the pid branch below. The clamp
     # (stopping state) only arms once we're actually stopped, so it never headbangs.
-    if active and self.long_control_state != LongCtrlState.stopping:
+    # starting is exempt: if the lead re-stops mid-launch, take the stock path (immediate
+    # stopping) rather than keep commanding startAccel toward a stopped lead.
+    if active and self.long_control_state not in (LongCtrlState.stopping, LongCtrlState.starting):
       stop_now = self.smooth.want_hold(should_stop, CS.vEgo, CS.standstill)
+    elif active and self.long_control_state == LongCtrlState.stopping:
+      # debounced hold exit: a one-frame should_stop flicker must not blip the brake at standstill
+      stop_now = not self.smooth.hold_release(should_stop)
     else:
       stop_now = should_stop
 
