@@ -1,0 +1,58 @@
+name: sync stock branch with upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: stock
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/commaai/openpilot.git
+          git fetch upstream master
+
+      - name: Fast-forward stock to upstream/master
+        id: ff
+        run: |
+          if git merge --ff-only upstream/master; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=diverged" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push
+        if: steps.ff.outputs.result == 'success'
+        run: git push origin stock
+
+      - name: Notify on divergence
+        if: steps.ff.outputs.result == 'diverged'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="stock branch has diverged from commaai/openpilot master"
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -z "$existing" ]; then
+            gh issue create \
+              --title "$title" \
+              --body "Fast-forward sync failed on **stock** — it has commits upstream/master doesn't, which shouldn't happen on this branch. Investigate and resolve manually." \
+              --label bot
+          else
+            echo "Issue #$existing already open, skipping"
+          fi
