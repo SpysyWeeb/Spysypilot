@@ -8,7 +8,6 @@ on:
 permissions:
   contents: write
   issues: write
-  workflows: write
 
 jobs:
   sync:
@@ -60,7 +59,13 @@ jobs:
 
       - name: Push clean merge
         if: steps.merge.outputs.result == 'clean'
-        run: git push origin ${{ matrix.branch }}
+        id: push
+        run: |
+          if git push origin ${{ matrix.branch }}; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Notify on conflict
         if: steps.merge.outputs.result == 'conflict'
@@ -74,6 +79,23 @@ jobs:
             gh api "repos/${{ github.repository }}/issues" \
               -f title="$title" \
               -f body="Automated sync from commaai/openpilot master hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch upstream master && git checkout ${{ matrix.branch }} && git merge upstream/master\`, fix conflicts, then push." \
+              -f "labels[]=bot"
+          else
+            echo "Issue #$existing already open, skipping"
+          fi
+
+      - name: Notify on push failure
+        if: steps.push.outputs.result == 'failed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="[sync] push blocked on ${{ matrix.branch }} — workflow file changed"
+          existing=$(gh api "repos/${{ github.repository }}/issues?state=open&labels=bot&per_page=100" \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+          if [ -z "$existing" ]; then
+            gh api "repos/${{ github.repository }}/issues" \
+              -f title="$title" \
+              -f body="The merge from commaai/openpilot master into **${{ matrix.branch }}** was clean, but GitHub rejected the push because commaai touched a file under .github/workflows/ too — the default GITHUB_TOKEN can never push workflow-file changes, no permission grant fixes it. Nothing was pushed (the merge only happened in this run's disposable checkout). To resolve locally with your own credentials: \`git fetch upstream master && git checkout ${{ matrix.branch }} && git merge upstream/master && git push\`." \
               -f "labels[]=bot"
           else
             echo "Issue #$existing already open, skipping"
