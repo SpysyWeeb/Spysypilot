@@ -62,12 +62,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           title="[sync] upstream conflicts on ${{ matrix.branch }} need review"
-          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          existing=$(gh api "repos/${{ github.repository }}/issues?state=open&labels=bot&per_page=100" \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
           if [ -z "$existing" ]; then
-            gh issue create \
-              --title "$title" \
-              --body "Automated sync from commaai/openpilot master hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch upstream master && git checkout ${{ matrix.branch }} && git merge upstream/master\`, fix conflicts, then push." \
-              --label bot
+            gh api "repos/${{ github.repository }}/issues" \
+              -f title="$title" \
+              -f body="Automated sync from commaai/openpilot master hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch upstream master && git checkout ${{ matrix.branch }} && git merge upstream/master\`, fix conflicts, then push." \
+              -f "labels[]=bot"
           else
             echo "Issue #$existing already open, skipping"
           fi

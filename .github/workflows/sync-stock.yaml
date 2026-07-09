@@ -47,12 +47,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           title="stock branch has diverged from commaai/openpilot master"
-          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          existing=$(gh api "repos/${{ github.repository }}/issues?state=open&labels=bot&per_page=100" \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
           if [ -z "$existing" ]; then
-            gh issue create \
-              --title "$title" \
-              --body "Fast-forward sync failed on **stock** — it has commits upstream/master doesn't, which shouldn't happen on this branch. Investigate and resolve manually." \
-              --label bot
+            gh api "repos/${{ github.repository }}/issues" \
+              -f title="$title" \
+              -f body="Fast-forward sync failed on **stock** — it has commits upstream/master doesn't, which shouldn't happen on this branch. Investigate and resolve manually." \
+              -f "labels[]=bot"
           else
             echo "Issue #$existing already open, skipping"
           fi

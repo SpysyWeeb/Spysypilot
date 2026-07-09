@@ -57,12 +57,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           title="[sync] combo conflicts on ${{ matrix.branch }} need review"
-          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          existing=$(gh api "repos/${{ github.repository }}/issues?state=open&labels=bot&per_page=100" \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
           if [ -z "$existing" ]; then
-            gh issue create \
-              --title "$title" \
-              --body "Automated sync from **combo** hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch origin combo && git checkout ${{ matrix.branch }} && git merge origin/combo\`, fix conflicts, then push." \
-              --label bot
+            gh api "repos/${{ github.repository }}/issues" \
+              -f title="$title" \
+              -f body="Automated sync from **combo** hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch origin combo && git checkout ${{ matrix.branch }} && git merge origin/combo\`, fix conflicts, then push." \
+              -f "labels[]=bot"
           else
             echo "Issue #$existing already open, skipping"
           fi
@@ -87,12 +88,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           title="[sync] commaai/openpilot:${{ matrix.upstream_ref }} conflicts on ${{ matrix.branch }} need review"
-          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          existing=$(gh api "repos/${{ github.repository }}/issues?state=open&labels=bot&per_page=100" \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
           if [ -z "$existing" ]; then
-            gh issue create \
-              --title "$title" \
-              --body "Automated sync from **commaai/openpilot:${{ matrix.upstream_ref }}** hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch upstream ${{ matrix.upstream_ref }} && git checkout ${{ matrix.branch }} && git merge upstream/${{ matrix.upstream_ref }}\`, fix conflicts, then push." \
-              --label bot
+            gh api "repos/${{ github.repository }}/issues" \
+              -f title="$title" \
+              -f body="Automated sync from **commaai/openpilot:${{ matrix.upstream_ref }}** hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch upstream ${{ matrix.upstream_ref }} && git checkout ${{ matrix.branch }} && git merge upstream/${{ matrix.upstream_ref }}\`, fix conflicts, then push." \
+              -f "labels[]=bot"
           else
             echo "Issue #$existing already open, skipping"
           fi
