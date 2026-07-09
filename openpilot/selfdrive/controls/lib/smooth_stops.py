@@ -19,9 +19,15 @@ STOP_KISS_DECEL = 0.12    # m/s^2, residual decel right at the stop; the anti-cr
                           # the stop still completes, so this can be truly gentle
 MIN_ENTRY_SPEED = 0.1     # m/s, floor on the latched entry speed (guards the taper division)
 STOP_GAP_MARGIN = 3.0     # m, settle brakes to stop at least this far behind the lead (anti-creep-in)
-MIN_GAP_BUDGET = 0.5      # m, lower bound on the gap budget; bounds required decel as the gap -> 0
+MIN_GAP_BUDGET = 0.15     # m, floor on the gap budget -- only guards the division, must NOT meaningfully
+                          # soften the lead-floor term close-in (ACCEL_MIN + jerk limiting downstream
+                          # already bound the result; a looser floor here previously let this term go
+                          # weak exactly where it matters most: close range at low speed)
 PROGRESS_EPS = 0.02       # m/s, speed drop (vs the running minimum) that counts as "still slowing"
 ANTI_CREEP_RATE = 0.50    # m/s^2 added per second the car is NOT slowing (kills creep / held creep)
+URGENT_GAP = 2.0          # m, inside this gap budget the anti-creep ratchet escalates faster than the
+                          # open-road rate -- a stall near a lead is a proximity problem, not just comfort
+URGENT_RATE_MULT = 4.0    # ratchet-rate multiplier at gap -> 0, ramped in linearly from 1x at URGENT_GAP
 SETTLE_JERK = 2.5         # m/s^3, smoothness of the settle pressure itself (plan braking is never feathered)
 HOLD_RELEASE_FRAMES = 10  # frames of should_stop=False required to release the hold (kills one-frame
                           # plan flickers that blip the brake at standstill; costs 0.1s of launch latency)
@@ -41,7 +47,9 @@ class SmoothStopController:
                       v -> 0 (entry-anchored: no step at engage by construction, whatever the
                       plan was doing); firm up toward the decel required to stop behind the
                       lead (lead-aware "how swiftly"); ratchet firmer if the car stops making
-                      progress (anti-creep). Only the settle pressure is feathered -- braking
+                      progress (anti-creep), escalating faster the tighter the remaining gap
+                      to a lead is -- a stall that's eating into a close gap is urgent, not
+                      just uncomfortable. Only the settle pressure is feathered -- braking
                       demanded by the MPC's plan (which owns collision avoidance) is applied
                       immediately, so full braking force is never delayed.
     want_hold()    -- arm the stopping/hold clamp only once v_ego is at/below STANDSTILL_SPEED
@@ -101,10 +109,15 @@ class SmoothStopController:
     landing = STOP_KISS_DECEL + (self._entry_decel - STOP_KISS_DECEL) * min(v_ego / self._entry_v, 1.0)
     a_settle = -landing
 
-    # lead-aware: brake hard enough to stop short of the lead (how swiftly to execute)
+    # lead-aware: brake hard enough to stop short of the lead (how swiftly to execute). Also
+    # sets how urgently anti-creep below should escalate -- a stall that eats into a tight gap
+    # is a proximity problem, not just a comfort one, and shouldn't get the open-road grace period.
+    creep_rate = ANTI_CREEP_RATE
     if has_lead and lead_distance > 0.0:
       gap = max(lead_distance - STOP_GAP_MARGIN, MIN_GAP_BUDGET)
       a_settle = min(a_settle, -(v_ego * v_ego) / (2.0 * gap))
+      urgency = max(0.0, min(1.0, 1.0 - gap / URGENT_GAP))
+      creep_rate = ANTI_CREEP_RATE * (1.0 + urgency * (URGENT_RATE_MULT - 1.0))
 
     # anti-creep: while the car is NOT actually slowing, ratchet the pressure firmer. The
     # firmness is latched (never released until reset()) -- resetting it on each sliver of
@@ -115,7 +128,7 @@ class SmoothStopController:
       self._stall_s = 0.0
     else:
       self._stall_s += DT_CTRL
-    self._creep_decel = max(self._creep_decel, ANTI_CREEP_RATE * self._stall_s)
+    self._creep_decel = max(self._creep_decel, creep_rate * self._stall_s)
     a_settle -= self._creep_decel
 
     a_settle = max(a_settle, ACCEL_MIN)
