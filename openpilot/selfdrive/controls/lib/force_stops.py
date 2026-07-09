@@ -73,6 +73,18 @@ class ForceStops:
     if self.override_timer > 0.0:
       return NO_CAP
 
+    # Once the car is actually stopped, this cap's one job -- getting it to commit to
+    # the stop despite the model dithering -- is done. Staying in place from here is the
+    # hold-clamp's job (via longitudinalPlan.shouldStop, independent of this cap entirely),
+    # not this cap's: remaining can only progress by distance traveled, which is zero for
+    # as long as this cap is itself the thing pinning speed near zero, so holding on here
+    # is a fixed point with no way out except the driver's gas. Step aside instead, every
+    # tick, without latching a fresh forcing bout until the car is moving again -- a car
+    # already at standstill is never "approaching" a stop, so it's outside this cap's job.
+    if CS.standstill:
+      self.forcing = False
+      return NO_CAP
+
     if not self.forcing:
       if self.detect_filter.x >= LATCH_THRESHOLD and model_stopping:
         # latch the model's stop point now, while it is confident; from here we only
@@ -86,6 +98,4 @@ class ForceStops:
     if self.detect_filter.x < RELEASE_THRESHOLD:
       self.forcing = False
       return NO_CAP
-    if CS.standstill:
-      return 0.0
     return self.remaining / RAMP_TIME
