@@ -1,0 +1,73 @@
+name: sync branches with upstream openpilot
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - swapped-cruise-speed
+          - nudgless-lane-changes
+          - hot-swap-experimental
+          - force-stops
+          - error-log-viewer
+          - detailed-stats-sidebar
+          - better-green-lights
+          - better-boot-screen
+          - AOL
+          - smooth-stops
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/commaai/openpilot.git
+          git fetch upstream master
+
+      - name: Attempt merge
+        id: merge
+        run: |
+          if git merge --no-edit upstream/master; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push clean merge
+        if: steps.merge.outputs.result == 'clean'
+        run: git push origin ${{ matrix.branch }}
+
+      - name: Notify on conflict
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="[sync] upstream conflicts on ${{ matrix.branch }} need review"
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -z "$existing" ]; then
+            gh issue create \
+              --title "$title" \
+              --body "Automated sync from commaai/openpilot master hit a merge conflict on **${{ matrix.branch }}**. Nothing was pushed. To resolve locally: \`git fetch upstream master && git checkout ${{ matrix.branch }} && git merge upstream/master\`, fix conflicts, then push." \
+              --label bot
+          else
+            echo "Issue #$existing already open, skipping"
+          fi
