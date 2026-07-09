@@ -1,0 +1,80 @@
+name: bump panda/opendbc submodule pointers
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  bump:
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - combo
+          - AOL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Unshallow submodules
+        run: git submodule foreach 'git fetch --unshallow || true'
+
+      - name: Advance submodules to their tracked branch tip (fast-forward only)
+        id: bump
+        run: |
+          changed=""
+          skipped=""
+          for sub in panda opendbc_repo; do
+            old=$(git -C "$sub" rev-parse HEAD)
+            git submodule update --remote -- "$sub"
+            new=$(git -C "$sub" rev-parse HEAD)
+            if [ "$old" = "$new" ]; then
+              continue
+            fi
+            if git -C "$sub" merge-base --is-ancestor "$old" "$new"; then
+              git add "$sub"
+              changed="$changed $sub"
+            else
+              git -C "$sub" checkout -q "$old"
+              skipped="$skipped $sub"
+            fi
+          done
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        if: steps.bump.outputs.changed != ''
+        run: |
+          git commit -m "bump submodules:${{ steps.bump.outputs.changed }}"
+          git push origin ${{ matrix.branch }}
+
+      - name: Notify on divergence
+        if: steps.bump.outputs.skipped != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="[sync] submodule divergence on ${{ matrix.branch }} need review:${{ steps.bump.outputs.skipped }}"
+          existing=$(gh api "repos/${{ github.repository }}/issues?state=open&labels=bot&per_page=100" \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+          if [ -z "$existing" ]; then
+            gh api "repos/${{ github.repository }}/issues" \
+              -f title="$title" \
+              -f body="On **${{ matrix.branch }}**, the tracked submodule branch tip for:${{ steps.bump.outputs.skipped }} is not a fast-forward from what's currently pinned (it's diverged, not just ahead). Nothing was changed. Resolve manually: decide which commit should win, then \`git -C <submodule> checkout <commit> && git add <submodule> && git commit && git push\`." \
+              -f "labels[]=bot"
+          else
+            echo "Issue #$existing already open, skipping"
+          fi
