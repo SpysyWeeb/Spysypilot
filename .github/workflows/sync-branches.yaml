@@ -25,6 +25,7 @@ jobs:
           - better-boot-screen
           - AOL
           - smooth-stops
+          - auto-update
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
