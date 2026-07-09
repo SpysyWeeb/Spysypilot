@@ -32,6 +32,7 @@ jobs:
         with:
           ref: ${{ matrix.branch }}
           fetch-depth: 0
+          submodules: recursive
 
       - name: Configure git
         run: |
@@ -42,6 +43,9 @@ jobs:
         run: |
           git remote add upstream https://github.com/commaai/openpilot.git
           git fetch upstream master
+
+      - name: Unshallow submodules
+        run: git submodule foreach 'git fetch --unshallow || true'
 
       - name: Attempt merge
         id: merge
