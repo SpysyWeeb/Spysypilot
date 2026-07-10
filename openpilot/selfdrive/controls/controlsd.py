@@ -124,7 +124,7 @@ class Controls:
     radar_lead = self.sm['radarState'].leadOne
     has_lead = bool(radar_lead.status) and self.sm.valid['radarState']  # don't trust a frozen lead if radard dies
     actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits,
-                                            radar_lead.dRel, has_lead))
+                                            radar_lead.dRel, has_lead, max(float(radar_lead.vLeadK), 0.0)))
 
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage

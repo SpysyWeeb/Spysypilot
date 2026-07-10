@@ -60,7 +60,7 @@ class LongControl:
   def reset(self):
     self.pid.reset()
 
-  def update(self, active, CS, a_target, should_stop, accel_limits, lead_distance=0.0, has_lead=False):
+  def update(self, active, CS, a_target, should_stop, accel_limits, lead_distance=0.0, has_lead=False, lead_speed=0.0):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
@@ -108,7 +108,7 @@ class LongControl:
         # Open-loop accel command (like stopping/starting), so keep the PID reset.
         # Smooth Release is deliberately NOT applied here: settle's entry-anchored taper
         # must be free to rise toward the kiss faster than the release governor allows.
-        output_accel = self.smooth.settle(a_target, CS.vEgo, lead_distance, has_lead, self.last_output_accel)
+        output_accel = self.smooth.settle(a_target, CS.vEgo, lead_distance, has_lead, self.last_output_accel, lead_speed)
         self.reset()
       else:
         error = a_target - CS.aEgo
