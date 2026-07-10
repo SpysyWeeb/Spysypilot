@@ -29,14 +29,23 @@ late brake.
 """
 import math
 
-A_APPROACH = 1.5   # m/s^2, envelope deceleration; the comfort profile the cap plans around,
-                   # below the MPC's COMFORT_BRAKE (2.5) which keeps full authority
+A_APPROACH = 1.2   # m/s^2, envelope deceleration. Deliberately at (not above) what the bounded
+                   # trim actually delivers (~1.4): route 37 showed a 1.5 curve rides ~2 m/s hot the
+                   # whole way down and repays the energy deficit close-in ("more pressure the closer
+                   # you get"). At 1.2 the car converges ONTO the curve -- which sits just above the
+                   # owner's own measured carried speeds (he holds 6.0 m/s at 20m from a stopped
+                   # lead; this allows 6.2) -- so there is no debt left for the endgame
 STOP_MARGIN = 4.0  # m, where the envelope reaches zero speed -- the owner's median standstill
                    # gap; NOT the MPC's STOP_DISTANCE (6.0), which is a soft-cost target the
                    # dynamics settle inside of, not a wall to stop behind
 TIME_MARGIN = 1.0  # s, headway term of the margin -- deliberately UNDER the owner's steady
                    # following (~1.3-1.9s) so the cap never binds while just following
 DV_MAX = 2.0       # m/s, the most the cap may sit below current speed (see field lesson)
+HANDOFF_SPEED = 3.0    # m/s, below this the endgame belongs to the MPC's own stopping + Smooth Stops
+HANDOFF_HEADWAY = 2.0  # s, within this time-gap of an effectively stopped lead the MPC's lead logic
+                       # is already in charge -- the envelope owns the middle of the approach, never
+                       # the landing, so the final gap is set by the MPC's soft costs (~4-5m, the
+                       # owner's own 4.8m median), not pinned by a hard v_cruise ceiling
 NO_CAP = float('inf')
 
 
@@ -50,6 +59,10 @@ class SmoothApproach:
 
     v_ego = max(float(sm['carState'].vEgo), 0.0)
     v_lead = max(float(lead.vLeadK), 0.0)  # Kalman-filtered lead speed; clamp radar noise at standstill
+
+    # endgame handoff: the envelope shapes the approach, the MPC + Smooth Stops land the stop
+    if v_ego < HANDOFF_SPEED or (v_lead < 1.0 and float(lead.dRel) < HANDOFF_HEADWAY * v_ego):
+      return NO_CAP
 
     # v_cap^2 = v_lead^2 + 2*a*d: the speed from which A_APPROACH of braking over the gap budget
     # lands exactly at the lead's speed at the margin. Faster/receding leads push it above v_ego.
