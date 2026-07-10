@@ -27,6 +27,13 @@ LEAD_RC = 1.0             # s, filter on radar lead status
 LEAD_GATE = 0.45          # filtered lead level above which stopping is the lead logic's job
 RAMP_TIME = 3.0           # s, speed cap = remaining distance / this (linear-in-distance ramp to 0)
 GAS_OVERRIDE_S = 10.0     # s, a gas press during a forced stop cancels forcing for this long
+EXTEND_RATE = 3.0         # m/s, max rate the latched stop point may follow the model's endpoint
+                          # forward. The latch trips mid-collapse of the model's path (by
+                          # construction: the detector needs pathEnd < v*3s), so when the model
+                          # honestly extends its plan toward the true stop line afterward, the
+                          # frozen target parks the car short. Bounded following keeps the latch's
+                          # purpose -- immunity to dithering -- while letting the car roll up.
+EXTEND_DEADBAND = 2.0     # m, endpoint jitter to ignore before following it forward
 NO_CAP = float('inf')
 
 
@@ -95,6 +102,10 @@ class ForceStops:
         return NO_CAP
 
     self.remaining = max(self.remaining - v_ego * self.dt, 0.0)
+    # forward-ratchet: while the model still confidently plans this stop, follow its endpoint
+    # as it extends (bounded rate, never backward -- shrinking happens only by travel above)
+    if self.detect_filter.x >= LATCH_THRESHOLD and model_length > self.remaining + EXTEND_DEADBAND:
+      self.remaining = min(self.remaining + EXTEND_RATE * self.dt, model_length)
     if self.detect_filter.x < RELEASE_THRESHOLD:
       self.forcing = False
       return NO_CAP
