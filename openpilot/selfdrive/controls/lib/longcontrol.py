@@ -117,7 +117,7 @@ class LongControl:
                                        feedforward=a_target,
                                        freeze_integrator=self.smooth_release.engaged)
         # Smooth Release: brake releases are bled off as one human-like taper, never a pump
-        output_accel = self.smooth_release.govern(output_accel, a_target, self.last_output_accel, CS.vEgo)
+        output_accel = self.smooth_release.govern(output_accel, a_target, self.last_output_accel, CS.vEgo, lead_speed, has_lead)
         self.smooth.reset()
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
