@@ -9,7 +9,8 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.blt import BLTSupervisor
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.controls.lib.force_stops import ForceStops
@@ -66,6 +67,7 @@ class LongitudinalPlanner:
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.force_stops = ForceStops(dt=self.dt)
+    self.blt = BLTSupervisor()
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
     self.output_a_target = 0.0
     self.output_should_stop = False
@@ -145,9 +147,13 @@ class LongitudinalPlanner:
     # Force Stops: hold the model to a stop it planned (red-light indecision / e2e crawl)
     v_cruise = min(v_cruise, self.force_stops.update(sm))
 
-    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
+    # BLT necessity supervisor: modulates the solver's own runtime knobs (see docs/BLT.md)
+    personality = sm['selfdriveState'].personality
+    jerk_scale, t_follow_blt, tau_floor = self.blt.update(sm, self.a_desired, get_T_FOLLOW(personality))
+    self.mpc.set_weights(prev_accel_constraint, personality=personality, jerk_factor_scale=jerk_scale)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality)
+    self.mpc.update(sm['radarState'], v_cruise, personality=personality,
+                    t_follow=t_follow_blt, a_lead_tau_floor=tau_floor)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
