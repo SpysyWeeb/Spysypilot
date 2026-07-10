@@ -25,6 +25,11 @@ MIN_GAP_BUDGET = 0.15     # m, floor on the gap budget -- only guards the divisi
                           # weak exactly where it matters most: close range at low speed)
 PROGRESS_EPS = 0.02       # m/s, speed drop (vs the running minimum) that counts as "still slowing"
 ANTI_CREEP_RATE = 0.50    # m/s^2 added per second the car is NOT slowing (kills creep / held creep)
+LEAD_CREEP_SPEED = 0.3    # m/s, a present lead moving faster than this means the pace is the queue's,
+                          # not creep torque's -- the anti-creep ratchet stands down (route 38 t=972:
+                          # correctly following a creeping queue at constant 0.6 m/s read as a "stall"
+                          # and was crushed to a stop at -1.4 while the plan asked -0.3); the stop
+                          # still completes once the queue actually halts
 URGENT_GAP = 2.0          # m, inside this gap budget the anti-creep ratchet escalates faster than the
                           # open-road rate -- a stall near a lead is a proximity problem, not just comfort
 URGENT_RATE_MULT = 4.0    # ratchet-rate multiplier at gap -> 0, ramped in linearly from 1x at URGENT_GAP
@@ -98,7 +103,8 @@ class SmoothStopController:
       self._no_stop_frames += 1
     return self._no_stop_frames >= HOLD_RELEASE_FRAMES
 
-  def settle(self, a_target: float, v_ego: float, lead_distance: float, has_lead: bool, last_output: float) -> float:
+  def settle(self, a_target: float, v_ego: float, lead_distance: float, has_lead: bool, last_output: float,
+             lead_speed: float = 0.0) -> float:
     # Entry-anchored taper: latch the braking level the car entered settle with and fade it
     # linearly down to the kiss as v -> 0 -- the limo "roll to a stop" (release pressure
     # before the wheels stop). Anchoring on entry means no step at engage: a fixed baseline
@@ -126,7 +132,7 @@ class SmoothStopController:
     if v_ego < self._v_min - PROGRESS_EPS:
       self._v_min = v_ego
       self._stall_s = 0.0
-    else:
+    elif not (has_lead and lead_speed > LEAD_CREEP_SPEED):
       self._stall_s += DT_CTRL
     self._creep_decel = max(self._creep_decel, creep_rate * self._stall_s)
     a_settle -= self._creep_decel
