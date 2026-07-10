@@ -39,6 +39,10 @@ CANCEL_JERK = 2.5     # m/s^3, release rate once the plan wants to go or the car
 GOVERN_FLOOR = -0.05  # m/s^2, braking level below which a release starts being governed; above it
                       # (cruising, accelerating) the governor never arms and output passes untouched
 CANCEL_ACCEL = 0.05   # m/s^2, plan demand above this means "go" -- switch to the brisk rate
+PULLAWAY_MARGIN = 0.3   # m/s, a lead moving this much faster than ego is pulling away -- the gap
+                        # is opening, so holding brake buys nothing but distance (route 39 t=617:
+                        # the taper kept braking past the speed-match point after a hard event,
+                        # sinking ego 1.5 m/s below the recovering lead). Brisk release instead.
 MIN_GOVERN_SPEED = 4.5  # m/s, below this use the brisk rate, never the slow taper. Every brake
                         # pump ever measured happened at road speed (10-13 m/s); at queue-creep
                         # speeds the plan's fast relaxations are always legitimate, and route 37
@@ -57,13 +61,15 @@ class SmoothRelease:
   def reset(self) -> None:
     self.engaged = False
 
-  def govern(self, output_accel: float, a_target: float, last_output: float, v_ego: float) -> float:
+  def govern(self, output_accel: float, a_target: float, last_output: float, v_ego: float,
+             lead_speed: float = 0.0, has_lead: bool = False) -> float:
     # Arm only from real braking. Once armed, keep rate-limiting until the limit catches the raw
     # demand (engaged clears itself below), so letting go is always continuous, never a step.
     if not self.engaged and last_output >= GOVERN_FLOOR:
       return output_accel
 
-    taper = v_ego >= MIN_GOVERN_SPEED and a_target <= CANCEL_ACCEL
+    pulling_away = has_lead and lead_speed > v_ego + PULLAWAY_MARGIN
+    taper = v_ego >= MIN_GOVERN_SPEED and a_target <= CANCEL_ACCEL and not pulling_away
     # fast-then-gentle, like a foot easing off: rate is proportional to remaining pressure
     rate = max(RELEASE_JERK, -last_output / RELEASE_HORIZON) if taper else CANCEL_JERK
     limit = last_output + rate * DT_CTRL
