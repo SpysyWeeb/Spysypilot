@@ -3,6 +3,7 @@ from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
+from openpilot.selfdrive.controls.lib.smooth_release import SmoothRelease
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -52,6 +53,7 @@ class LongControl:
                              (CP.longitudinalTuning.kiBP, CP.longitudinalTuning.kiV),
                              rate=1 / DT_CTRL)
     self.last_output_accel = 0.0
+    self.smooth_release = SmoothRelease()
 
   def reset(self):
     self.pid.reset()
@@ -66,6 +68,7 @@ class LongControl:
                                                        CS.cruiseState.standstill)
     if self.long_control_state == LongCtrlState.off:
       self.reset()
+      self.smooth_release.reset()
       output_accel = 0.
 
     elif self.long_control_state == LongCtrlState.stopping:
@@ -74,15 +77,21 @@ class LongControl:
         output_accel = min(output_accel, 0.0)
         output_accel -= self.CP.stoppingDecelRate * DT_CTRL
       self.reset()
+      self.smooth_release.reset()
 
     elif self.long_control_state == LongCtrlState.starting:
       output_accel = self.CP.startAccel
       self.reset()
+      self.smooth_release.reset()
 
     else:  # LongCtrlState.pid
       error = a_target - CS.aEgo
+      # freeze the integrator while Smooth Release is clamping, else it winds up against the hold
       output_accel = self.pid.update(error, speed=CS.vEgo,
-                                     feedforward=a_target)
+                                     feedforward=a_target,
+                                     freeze_integrator=self.smooth_release.engaged)
+      # Smooth Release: brake releases are bled off as one human-like taper, never a pump
+      output_accel = self.smooth_release.govern(output_accel, a_target, self.last_output_accel, CS.vEgo)
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel
