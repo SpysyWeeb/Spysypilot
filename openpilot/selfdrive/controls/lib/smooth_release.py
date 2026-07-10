@@ -23,13 +23,16 @@ braking, never less.
 from openpilot.common.realtime import DT_CTRL
 
 RELEASE_JERK = 0.18     # m/s^3, floor on the release rate: the owner's fitted final-taper
-RELEASE_HORIZON = 4.0   # s, any braking level bleeds to ~zero within this window (the measured
+RELEASE_HORIZON = 3.0   # s, any braking level bleeds to ~zero within this window (the measured
                         # length of the owner's release phase), so deep braking releases
                         # proportionally faster. FIELD LESSON (route 00000036): a flat 0.20 cap
                         # held slam-level braking against a relaxing plan for seconds (plans
                         # legitimately relax at ~0.55 m/s^3 from deep decel) and once parked the
                         # car 19m behind a lead; depth-scaled, the governor passes honest plan
-                        # tapers and only resists the fast let-offs that become pumps
+                        # tapers and only resists the fast let-offs that become pumps.
+                        # 4.0 -> 3.0 after route 39 t=617: hard-event plans relax at ~1.0 m/s^3
+                        # from deep braking and the 4s schedule (0.6-0.7 there) held ~0.4 extra
+                        # for two seconds -- part of the over-slow-then-crawl tail after slams
 CANCEL_JERK = 2.5     # m/s^3, release rate once the plan wants to go or the car is nearly stopped --
                       # brisk (full release from -2.0 in 0.8s) but continuous, so cancelling the
                       # taper never steps the command the way an instant disarm would
