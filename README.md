@@ -16,6 +16,8 @@ Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌
 - ❌ **Nudgeless lane changes**
 - ❌ **Smooth stops**
 - ❌ **Force Stops**
+- ⚠️ **Smooth Approach** — when a lead is slowing, commit to the slowdown early (~3 s headway, like a human) via a comfort envelope on v_cruise, so the MPC spreads the braking out instead of the stock watch-then-slam (route 35: watched a lead decelerate for 10 s, then braked −3.5 m/s²); fitted from my own manual braking &nbsp;*(personal idea)*
+- ⚠️ **Smooth Release** — brake releases bleed off as one human-like taper (+0.2 m/s³, fitted from my stops) instead of the plan's pump (brake, let off mid-approach, brake again); braking demands always pass through instantly &nbsp;*(personal idea)*
 - ❌ **Earlier lead takeoffs**
 - ❌ **Better longitudinal tune**
 - ❌ **Replace the "prime" window with a stats window**
