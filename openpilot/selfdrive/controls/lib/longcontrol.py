@@ -3,6 +3,7 @@ from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
+from openpilot.selfdrive.controls.lib.smooth_release import SmoothRelease
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.smooth_stops import SmoothStopController
 
@@ -54,6 +55,7 @@ class LongControl:
                              rate=1 / DT_CTRL)
     self.last_output_accel = 0.0
     self.smooth = SmoothStopController()
+    self.smooth_release = SmoothRelease()
 
   def reset(self):
     self.pid.reset()
@@ -82,6 +84,7 @@ class LongControl:
     if self.long_control_state == LongCtrlState.off:
       self.reset()
       self.smooth.reset()
+      self.smooth_release.reset()
       output_accel = 0.
 
     elif self.long_control_state == LongCtrlState.stopping:
@@ -91,22 +94,30 @@ class LongControl:
         output_accel -= self.CP.stoppingDecelRate * DT_CTRL
       self.reset()
       self.smooth.reset()
+      self.smooth_release.reset()
 
     elif self.long_control_state == LongCtrlState.starting:
       output_accel = self.CP.startAccel
       self.reset()
       self.smooth.reset()
+      self.smooth_release.reset()
 
     else:  # LongCtrlState.pid
       if active and should_stop:
         # SETTLE: feather to a true standstill instead of clamping while still rolling.
         # Open-loop accel command (like stopping/starting), so keep the PID reset.
+        # Smooth Release is deliberately NOT applied here: settle's entry-anchored taper
+        # must be free to rise toward the kiss faster than the release governor allows.
         output_accel = self.smooth.settle(a_target, CS.vEgo, lead_distance, has_lead, self.last_output_accel)
         self.reset()
       else:
         error = a_target - CS.aEgo
+        # freeze the integrator while Smooth Release is clamping, else it winds up against the hold
         output_accel = self.pid.update(error, speed=CS.vEgo,
-                                       feedforward=a_target)
+                                       feedforward=a_target,
+                                       freeze_integrator=self.smooth_release.engaged)
+        # Smooth Release: brake releases are bled off as one human-like taper, never a pump
+        output_accel = self.smooth_release.govern(output_accel, a_target, self.last_output_accel, CS.vEgo)
         self.smooth.reset()
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
