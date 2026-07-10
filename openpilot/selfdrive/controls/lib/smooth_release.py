@@ -22,8 +22,14 @@ braking, never less.
 """
 from openpilot.common.realtime import DT_CTRL
 
-RELEASE_JERK = 0.20   # m/s^3, release rate while still in a braking context; fitted from the
-                      # owner's manual stops (mean single-taper release +0.18 m/s^2/s)
+RELEASE_JERK = 0.18     # m/s^3, floor on the release rate: the owner's fitted final-taper
+RELEASE_HORIZON = 4.0   # s, any braking level bleeds to ~zero within this window (the measured
+                        # length of the owner's release phase), so deep braking releases
+                        # proportionally faster. FIELD LESSON (route 00000036): a flat 0.20 cap
+                        # held slam-level braking against a relaxing plan for seconds (plans
+                        # legitimately relax at ~0.55 m/s^3 from deep decel) and once parked the
+                        # car 19m behind a lead; depth-scaled, the governor passes honest plan
+                        # tapers and only resists the fast let-offs that become pumps
 CANCEL_JERK = 2.5     # m/s^3, release rate once the plan wants to go or the car is nearly stopped --
                       # brisk (full release from -2.0 in 0.8s) but continuous, so cancelling the
                       # taper never steps the command the way an instant disarm would
@@ -52,7 +58,9 @@ class SmoothRelease:
       return output_accel
 
     taper = v_ego >= MIN_GOVERN_SPEED and a_target <= CANCEL_ACCEL
-    limit = last_output + (RELEASE_JERK if taper else CANCEL_JERK) * DT_CTRL
+    # fast-then-gentle, like a foot easing off: rate is proportional to remaining pressure
+    rate = max(RELEASE_JERK, -last_output / RELEASE_HORIZON) if taper else CANCEL_JERK
+    limit = last_output + rate * DT_CTRL
     self.engaged = output_accel > limit
     # min(): deeper braking passes through unlimited, only the release is rate-limited
     return min(output_accel, limit)
