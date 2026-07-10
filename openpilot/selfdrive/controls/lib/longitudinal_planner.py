@@ -27,6 +27,10 @@ LAUNCH_DISARM_SPEED = 2.0
 LAUNCH_COMMIT_T = 3.5
 LAUNCH_MOVING_SPEED = 1.2
 LAUNCH_MAX_ACCEL = 1.5
+LAUNCH_OPEN_LENGTH = 20.0   # m, model path length that reads as "the way ahead is open" (red-light
+                            # stubs sit at 2-5m with occasional 12-13m flickers; green opens 30-60m)
+LAUNCH_OPEN_CONFIRM = 0.7   # filtered (RC 0.3s) open level to trust -- ~0.5s of sustained open path
+LAUNCH_CLOSE_LENGTH = 10.0  # m, path re-collapse below this cancels anticipation (model changed its mind)
 
 # Lookup table for turns
 _A_TOTAL_MAX_V = [1.7, 3.2]
@@ -68,6 +72,8 @@ class LongitudinalPlanner:
     self.output_a_target = 0.0
     self.output_should_stop = False
     self.launch_armed = False
+    self.launch_open = FirstOrderFilter(0.0, 0.3, self.dt)
+    self.anticipating = False
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -166,6 +172,25 @@ class LongitudinalPlanner:
                                                                         action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
+
+    # Green-light anticipation: at a hold, the model's path length explodes (2-5m stub ->
+    # 30-60m) about 1.5-2s BEFORE its shouldStop bit releases (field data, routes 37/38).
+    # Read the path instead of the laggy bit -- the same trick Force Stops uses for stop
+    # intent, mirrored for launch intent. Clearing shouldStop releases the hold; the car
+    # creeps off on startAccel, the model sees motion and commits its plan, and the launch
+    # assist below takes it from there. If the path re-collapses (the model changed its
+    # mind), the bit passes through again and the hold re-engages at creep speed.
+    xs = sm['modelV2'].position.x
+    model_length = float(xs[-1]) if len(xs) else 0.0
+    self.launch_open.update(1.0 if model_length > LAUNCH_OPEN_LENGTH else 0.0)
+    if (sm['carState'].standstill and output_should_stop_e2e and
+        sm['selfdriveState'].experimentalMode and self.launch_open.x > LAUNCH_OPEN_CONFIRM):
+      self.anticipating = True
+    if self.anticipating:
+      if model_length < LAUNCH_CLOSE_LENGTH or v_ego > LAUNCH_DISARM_SPEED or not sm['selfdriveState'].experimentalMode:
+        self.anticipating = False
+      else:
+        output_should_stop_e2e = False
 
     if sm['carState'].standstill:
       self.launch_armed = True
