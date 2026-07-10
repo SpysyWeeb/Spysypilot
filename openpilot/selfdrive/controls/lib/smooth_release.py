@@ -36,8 +36,11 @@ CANCEL_JERK = 2.5     # m/s^3, release rate once the plan wants to go or the car
 GOVERN_FLOOR = -0.05  # m/s^2, braking level below which a release starts being governed; above it
                       # (cruising, accelerating) the governor never arms and output passes untouched
 CANCEL_ACCEL = 0.05   # m/s^2, plan demand above this means "go" -- switch to the brisk rate
-MIN_GOVERN_SPEED = 1.0  # m/s, below this the stopping/settle logic is about to own the car and a
-                        # launch may be imminent -- use the brisk rate, never the slow taper
+MIN_GOVERN_SPEED = 4.5  # m/s, below this use the brisk rate, never the slow taper. Every brake
+                        # pump ever measured happened at road speed (10-13 m/s); at queue-creep
+                        # speeds the plan's fast relaxations are always legitimate, and route 37
+                        # showed the taper holding 0.4-0.7 extra there nearly parked the car 13m
+                        # behind a creeping lead. Settle owns the landing regardless
 
 
 class SmoothRelease:
