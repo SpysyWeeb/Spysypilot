@@ -36,12 +36,16 @@ if the world worsens mid-boost. All outputs are rate-limited: no steps, ever.
 """
 from openpilot.common.realtime import DT_MDL
 
-# --- necessity (validated against the owner's stops: routes 35/37) ---
-STOP_MARGIN = 4.0        # m, owner's median standstill gap
-TIME_MARGIN = 1.0        # s, headway term of the necessity margin -- under his following
+# --- necessity, relative frame (route 3c lesson: the old headway-margin form exploded to
+# nonsense at the owner's 1.2-1.6s following and BLT sat out the onset of every close-follow
+# event; necessity is "match the lead's braking plus kill the closing energy") ---
+D_MIN = 4.0              # m, owner's median standstill gap; the closing-energy denominator floor
 MIN_GAP_BUDGET = 1.0     # m, guards the division
 
 # --- recovery boost ---
+MIN_BOOST_BRAKE = 0.8    # m/s^2, only meaningful braking is worth boosting out of -- the relative
+                         # necessity reads near zero in ordinary following and small trims should
+                         # not put the solver in its loose-cost mode
 EXCESS_ON = 0.4          # m/s^2, plan demand beyond necessity that arms the boost
 EXCESS_OFF = 0.15        # m/s^2, disarm level (hysteresis)
 EXCESS_DEBOUNCE = 0.4    # s, excess must persist this long before boosting
@@ -57,10 +61,14 @@ TAU_RATE = 1.5           # 1/s, floor slew
 
 # --- dynamic onset ---
 ONSET_LEAD_DECEL = 0.4   # m/s^2, lead braking at least this much opens the gap term early
-ONSET_T_FOLLOW_MAX = 1.9 # s, padded gap parameter ceiling (stock relaxed is 1.75)
+ONSET_PAD_MAX = 0.45     # s, max t_follow pad ON TOP of the personality base (route 3c: an
+                         # absolute 1.9 ceiling meant +0.65 on aggressive -- a manufactured 5m
+                         # deficit and phantom braking for a lead easing off by -0.5)
+ONSET_FULL_DECEL = 1.5   # m/s^2, lead decel at which the pad reaches its full value; the pad is
+                         # PROPORTIONAL below that, so a mild slowdown gets a mild gap-opening
 ONSET_MAX_A_REQ = 1.5    # m/s^2, above this the situation is real: stock gap, no padding
 ONSET_RATE_UP = 0.4      # s per s, t_follow pad slew up
-ONSET_RATE_DOWN = 0.25   # s per s, pad slew back down
+ONSET_RATE_DOWN = 0.5    # s per s, pad slew back down (0.25 lingered 2-4s after events)
 
 # --- global safety gate ---
 MIN_TTC = 3.5            # s, below this every intervention stands down (stock solver)
@@ -91,18 +99,19 @@ class BLTSupervisor:
       d_rel = float(lead.dRel)
       a_lead = float(lead.aLeadK)
 
-      gap_budget = max(d_rel - (STOP_MARGIN + TIME_MARGIN * v_lead), MIN_GAP_BUDGET)
-      a_req = max((v_ego * v_ego - v_lead * v_lead) / (2.0 * gap_budget), 0.0)
       closing = v_ego - v_lead
+      # relative-frame necessity: hold the lead's own deceleration, plus enough to shed the
+      # closing energy before the standstill margin
+      a_req = max(-a_lead, 0.0) + max(closing, 0.0) ** 2 / (2.0 * max(d_rel - D_MIN, MIN_GAP_BUDGET))
       ttc = d_rel / closing if closing > 0.3 else 100.0
 
       if ttc > MIN_TTC:
-        # recovery boost: demand beyond necessity, sustained, means the solver is
-        # holding stale braking -- let it move
+        # recovery boost: meaningful braking beyond necessity, sustained, means the solver
+        # is holding stale deceleration -- let it move
         excess = -a_plan - a_req
-        if excess > EXCESS_ON:
+        if excess > EXCESS_ON and -a_plan > MIN_BOOST_BRAKE:
           self._excess_s += DT_MDL
-        elif excess < EXCESS_OFF:
+        elif excess < EXCESS_OFF or -a_plan <= MIN_BOOST_BRAKE:
           self._excess_s = 0.0
         if self._excess_s >= EXCESS_DEBOUNCE:
           scale_target = JERK_SCALE_MIN
@@ -112,10 +121,13 @@ class BLTSupervisor:
         if a_lead < -0.5 and a_req < TAU_MILD_A_REQ:
           tau_target = TAU_FLOOR
 
-        # dynamic onset: lead has started braking, situation still mild -- open the
-        # gap term early so the distance cost pulls gently now instead of hard later
-        if a_lead < -ONSET_LEAD_DECEL and a_req < ONSET_MAX_A_REQ:
-          pad_target = max(ONSET_T_FOLLOW_MAX - t_follow_base, 0.0)
+        # dynamic onset: lead has started braking, situation still mild -- open the gap
+        # term early, PROPORTIONALLY to how hard the lead is braking. Never pad during
+        # the recovery (ego already at/below lead speed) or while the lead accelerates:
+        # holding the gap open there is exactly the lag the owner felt (route 3c t=1227)
+        recovering = v_ego <= v_lead + 0.2 or a_lead > 0.2
+        if a_lead < -ONSET_LEAD_DECEL and a_req < ONSET_MAX_A_REQ and not recovering:
+          pad_target = ONSET_PAD_MAX * min(-a_lead / ONSET_FULL_DECEL, 1.0)
       else:
         self._excess_s = 0.0
     else:
