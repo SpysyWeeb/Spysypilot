@@ -33,8 +33,10 @@ LAUNCH_OPEN_CONFIRM = 0.7   # filtered (RC 0.3s) open level to trust -- ~0.5s of
 LAUNCH_CLOSE_LENGTH = 10.0  # m, path re-collapse below this cancels anticipation (model changed its mind)
 
 # Lookup table for turns
-_A_TOTAL_MAX_V = [1.7, 3.2]
-_A_TOTAL_MAX_BP = [20., 40.]
+_A_TOTAL_MAX_V = [3.4, 4.0]  # Spysypilot: raised with the doubled gas schedule -- the old 1.7
+_A_TOTAL_MAX_BP = [20., 40.]  # low-speed TOTAL budget re-clipped every launch to 1.7 even driving
+                              # straight (route 40 t=830: plan pinned at exactly +1.70 for 8s while
+                              # the lead ran away); turns still shed longitudinal authority via a_y
 
 def get_max_accel(v_ego):
   return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
