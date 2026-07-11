@@ -70,6 +70,16 @@ ONSET_MAX_A_REQ = 1.5    # m/s^2, above this the situation is real: stock gap, n
 ONSET_RATE_UP = 0.4      # s per s, t_follow pad slew up
 ONSET_RATE_DOWN = 0.5    # s per s, pad slew back down (0.25 lingered 2-4s after events)
 
+# --- gap forgiveness (route 3f: after a lead's dive drags ego inside its own desired gap,
+# the deficit cost brakes to REBUILD the cushion -- the fall-back gap and the second half of
+# every ping-pong. Humans rebuild a compressed gap by coasting relative to the lead, not by
+# braking: let t_follow temporarily track the actual headway down and recover it slowly) ---
+FORGIVE_FLOOR = 0.7      # s, never forgive below this equivalent headway
+FORGIVE_MAX_CLOSING = 0.5  # m/s, forgiveness only while not meaningfully closing
+FORGIVE_TRACK_RATE = 0.3   # s/s, rate the forgiveness may deepen (track a fresh compression)
+FORGIVE_RECOVER_RATE = 0.04  # s/s, cushion rebuild rate (~8s to restore 0.3s of gap)
+FORGIVE_RECOVER_FAST = 0.5   # s/s, snap the cushion back the moment the lead brakes again
+
 # --- global safety gate ---
 MIN_TTC = 3.5            # s, below this every intervention stands down (stock solver)
 MIN_SPEED = 1.0          # m/s, nothing to supervise at crawl (settle/hold own that)
@@ -79,6 +89,7 @@ class BLTSupervisor:
   def __init__(self):
     self.jerk_scale = 1.0
     self.t_follow_pad = 0.0
+    self.forgive = 0.0     # negative t_follow adjustment (gap forgiveness)
     self.tau_floor = 0.0
     self._excess_s = 0.0
 
@@ -93,6 +104,8 @@ class BLTSupervisor:
     v_ego = max(float(sm['carState'].vEgo), 0.0)
 
     scale_target, pad_target, tau_target = 1.0, 0.0, 0.0
+    forgive_target = 0.0
+    lead_braking = False
 
     if lead.status and sm.valid['radarState'] and v_ego > MIN_SPEED:
       v_lead = max(float(lead.vLeadK), 0.0)
@@ -105,7 +118,11 @@ class BLTSupervisor:
       a_req = max(-a_lead, 0.0) + max(closing, 0.0) ** 2 / (2.0 * max(d_rel - D_MIN, MIN_GAP_BUDGET))
       ttc = d_rel / closing if closing > 0.3 else 100.0
 
-      if ttc > MIN_TTC:
+      # emergency = low TTC AND high necessity together. A controlled approach to a stopped
+      # lead naturally runs TTC < 3.5 (10m at 3.6 m/s), and standing down there dropped the
+      # stopped-lead pad mid-approach (route 3e replay) -- a desired-gap release right where
+      # firmness matters most
+      if ttc > MIN_TTC or a_req < ONSET_MAX_A_REQ:
         # recovery boost: meaningful braking beyond necessity, sustained, means the solver
         # is holding stale deceleration -- let it move
         excess = -a_plan - a_req
@@ -128,6 +145,21 @@ class BLTSupervisor:
         recovering = v_ego <= v_lead + 0.2 or a_lead > 0.2
         if a_lead < -ONSET_LEAD_DECEL and a_req < ONSET_MAX_A_REQ and not recovering:
           pad_target = ONSET_PAD_MAX * min(-a_lead / ONSET_FULL_DECEL, 1.0)
+        # stopped-lead onset (route 3e): a lead that is already stopped never trips the
+        # decel-based pad, so nothing opened the gap term early and the car carried speed
+        # to a 2.2m squeak-stop. Drive the pad from closing-energy necessity instead.
+        if v_lead < 2.0 and 0.3 < a_req < ONSET_MAX_A_REQ and not recovering:
+          pad_target = max(pad_target, ONSET_PAD_MAX * min(a_req / 1.2, 1.0))
+
+        # gap forgiveness: compressed inside the desired gap, not meaningfully closing,
+        # lead not braking hard -- accept the compressed cushion and rebuild it gently.
+        # (Hard lead braking keeps the full cushion demand: restoring the gap during a
+        # dive is safety behavior, not the fall-back this fixes.)
+        lead_braking = a_lead < -0.4
+        forgive_blocked = a_lead < -0.8
+        t_eq = (d_rel + v_lead * v_lead / 5.0 - v_ego * v_ego / 5.0 - 6.0) / max(v_ego, 2.0)
+        if t_eq < t_follow_base and closing < FORGIVE_MAX_CLOSING and not forgive_blocked:
+          forgive_target = max(t_eq, FORGIVE_FLOOR) - t_follow_base
       else:
         self._excess_s = 0.0
     else:
@@ -135,6 +167,12 @@ class BLTSupervisor:
 
     self.jerk_scale = self._slew(self.jerk_scale, scale_target, JERK_SCALE_RATE)
     self.t_follow_pad = self._slew(self.t_follow_pad, pad_target, ONSET_RATE_UP if pad_target > self.t_follow_pad else ONSET_RATE_DOWN)
+    # forgiveness deepens fast, rebuilds slowly -- and snaps back the moment the lead brakes
+    if forgive_target < self.forgive:
+      self.forgive = self._slew(self.forgive, forgive_target, FORGIVE_TRACK_RATE)
+    else:
+      self.forgive = self._slew(self.forgive, forgive_target, FORGIVE_RECOVER_FAST if lead_braking else FORGIVE_RECOVER_RATE)
     self.tau_floor = self._slew(self.tau_floor, tau_target, TAU_RATE)
 
-    return self.jerk_scale, t_follow_base + self.t_follow_pad, self.tau_floor
+    t_follow = max(t_follow_base + self.t_follow_pad + self.forgive, FORGIVE_FLOOR)
+    return self.jerk_scale, t_follow, self.tau_floor
