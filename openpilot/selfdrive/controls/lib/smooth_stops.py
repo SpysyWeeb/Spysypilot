@@ -18,7 +18,10 @@ STANDSTILL_HOLD_SPEED = 0.15   # m/s, ceiling for trusting CS.standstill -- neve
 STOP_KISS_DECEL = 0.12    # m/s^2, residual decel right at the stop; the anti-creep ratchet guarantees
                           # the stop still completes, so this can be truly gentle
 MIN_ENTRY_SPEED = 0.1     # m/s, floor on the latched entry speed (guards the taper division)
-STOP_GAP_MARGIN = 3.0     # m, settle brakes to stop at least this far behind the lead (anti-creep-in)
+STOP_GAP_MARGIN = 2.5     # m, settle brakes to stop at least this far behind the lead (anti-creep-in).
+                          # 3.0 -> 2.5 after route 3c t=1343: a legitimately tight 2.9m roll-up put the
+                          # budget near zero and the lead floor grabbed -1.2 at walking speed; contact
+                          # safety re-verified by replay at 2.5 (floor keeps full strength inside ~2.7m)
 MIN_GAP_BUDGET = 0.15     # m, floor on the gap budget -- only guards the division, must NOT meaningfully
                           # soften the lead-floor term close-in (ACCEL_MIN + jerk limiting downstream
                           # already bound the result; a looser floor here previously let this term go
