@@ -366,7 +366,7 @@ class LongitudinalMpc:
     if model_leads is not None:
       # NewLeadMpc path: the model's predicted lead horizon (BLT's a_lead_tau_floor is a patch
       # for the legacy extrapolation's pessimism and is inert here -- predictions replace it)
-      self.status = radarstate.leadOne.status or radarstate.leadTwo.status
+      self.status = model_leads[0].prob > 0.5 or model_leads[1].prob > 0.5
       lead_xv_0 = self.process_lead_model(model_leads[0], radarstate.leadOne, v_ego)
       lead_xv_1 = self.process_lead_model(model_leads[1], radarstate.leadTwo, v_ego)
     else:
@@ -404,8 +404,11 @@ class LongitudinalMpc:
     self.params[:,5] = LEAD_DANGER_FACTOR
 
     self.run()
+    # FCW confidence gate follows the trajectory source (PR #37824): the crash check compares
+    # against lead_xv_0, so gate on the same source's confidence
+    lead_prob_ok = model_leads[0].prob > 0.9 if model_leads is not None else radarstate.leadOne.modelProb > 0.9
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
-            radarstate.leadOne.modelProb > 0.9):
+            lead_prob_ok):
       self.crash_cnt += 1
     else:
       self.crash_cnt = 0
