@@ -7,8 +7,10 @@ from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 # WARNING: imports outside of constants will not trigger a rebuild
-from openpilot.selfdrive.modeld.constants import index_function
-from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
+from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU  # legacy lead extrapolation (NewLeadMpc off)
+
+LEAD_T_IDXS_MODEL = np.array(ModelConstants.LEAD_T_IDXS)  # [0, 2, 4, 6, 8, 10]s
 
 if __name__ == '__main__':  # generating code
   from acados.acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
@@ -58,6 +60,10 @@ STOP_DISTANCE = 6.0
 CRUISE_MIN_ACCEL = -1.2
 CRUISE_MAX_ACCEL = 3.2  # Spysypilot: doubled with the cruise accel schedule
 MIN_X_LEAD_FACTOR = 0.5
+LEAD_PULLAWAY_VREL = 0.5    # m/s, radar says the lead is genuinely pulling away...
+LEAD_PULLAWAY_ABRAKE = -0.5 # ...and not braking: floor the model's prediction with the radar
+                            # (SpysyWeeb's pull-away fix, as adopted by IQPilot -- guards phantom
+                            # launch braking when the model's prediction lags a real pull-away)
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -285,6 +291,38 @@ class LongitudinalMpc:
         self.solver.set(i, 'x', self.x0)
 
   @staticmethod
+  def process_lead_model(model_lead, radar_lead, v_ego):
+    """NewLeadMpc (upstream PR #37824, via IQPilot): feed the solver the driving model's full
+    predicted lead trajectory instead of a kinematic extrapolation of the current radar state.
+    The model anticipates launches and slowdowns from vision seconds before the radar can
+    measure them -- this is the single deepest lead-reaction-time lever in the stack.
+    Anchored at the radar's trusted h=0 measurement; the model contributes the deltas."""
+    if model_lead.prob > 0.5 and radar_lead.status:
+      x = np.asarray(model_lead.x, dtype=np.float64)
+      v = np.asarray(model_lead.v, dtype=np.float64)
+      x_lead_traj = float(radar_lead.dRel) + (x - x[0])
+      v_lead_traj = float(radar_lead.vLead) + (v - v[0])
+    else:
+      # Fake a fast lead so the MPC stays in the same mode
+      x_lead_traj = 50.0 + (v_ego + 10.0) * LEAD_T_IDXS_MODEL
+      v_lead_traj = np.full_like(LEAD_T_IDXS_MODEL, v_ego + 10.0)
+
+    # MPC won't converge on an immediate expected crash; lift h=0 to min braking distance
+    v_lead_0 = v_lead_traj[0]
+    min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead_0) * (v_ego - v_lead_0) / (-ACCEL_MIN * 2)
+    x_lead_traj[0] = max(x_lead_traj[0], min_x_lead)
+    v_lead_traj = np.clip(v_lead_traj, 0.0, 1e8)
+
+    x_lead_mpc = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead_traj))
+    v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
+    if radar_lead.status and radar_lead.vRel > LEAD_PULLAWAY_VREL and radar_lead.aLeadK > LEAD_PULLAWAY_ABRAKE:
+      # lead measurably pulling away and not braking: never predict it slower/closer than
+      # a constant-velocity radar continuation (phantom launch-braking guard)
+      v_lead_mpc = np.maximum(v_lead_mpc, float(radar_lead.vLead))
+      x_lead_mpc = np.maximum(x_lead_mpc, float(radar_lead.dRel) + float(radar_lead.vLead) * T_IDXS)
+    return np.column_stack((x_lead_mpc, v_lead_mpc))
+
+  @staticmethod
   def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau):
     a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.)
     v_lead_traj = np.clip(v_lead + np.cumsum(T_DIFFS * a_lead_traj), 0.0, 1e8)
@@ -320,14 +358,21 @@ class LongitudinalMpc:
     return lead_xv
 
   def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard,
-             t_follow=None, a_lead_tau_floor=0.0):
+             t_follow=None, a_lead_tau_floor=0.0, model_leads=None):
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
-    self.status = radarstate.leadOne.status or radarstate.leadTwo.status
 
-    lead_xv_0 = self.process_lead(radarstate.leadOne, a_lead_tau_floor)
-    lead_xv_1 = self.process_lead(radarstate.leadTwo, a_lead_tau_floor)
+    if model_leads is not None:
+      # NewLeadMpc path: the model's predicted lead horizon (BLT's a_lead_tau_floor is a patch
+      # for the legacy extrapolation's pessimism and is inert here -- predictions replace it)
+      self.status = radarstate.leadOne.status or radarstate.leadTwo.status
+      lead_xv_0 = self.process_lead_model(model_leads[0], radarstate.leadOne, v_ego)
+      lead_xv_1 = self.process_lead_model(model_leads[1], radarstate.leadTwo, v_ego)
+    else:
+      self.status = radarstate.leadOne.status or radarstate.leadTwo.status
+      lead_xv_0 = self.process_lead(radarstate.leadOne, a_lead_tau_floor)
+      lead_xv_1 = self.process_lead(radarstate.leadTwo, a_lead_tau_floor)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
