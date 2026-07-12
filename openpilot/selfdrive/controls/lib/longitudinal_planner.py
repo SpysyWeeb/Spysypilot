@@ -15,7 +15,6 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDX
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
-from openpilot.common.params import Params
 
 A_CRUISE_MAX_VALS = [3.2, 2.4, 1.6, 1.2]  # Spysypilot: doubled (owner request; requires the
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]    # matching ACCEL_MAX=4.0 + panda safety bump in opendbc)
@@ -60,11 +59,6 @@ class LongitudinalPlanner:
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.blt = BLTSupervisor()
-    self._params = Params()
-    if self._params.get("NewLeadMpc") is None:
-      self._params.put_bool("NewLeadMpc", True)  # default ON; `echo -n 0 > /data/params/d/NewLeadMpc` for A/B
-    self.new_lead_mpc = self._params.get_bool("NewLeadMpc")
-    self._param_frame = 0
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
     self.output_a_target = 0.0
     self.output_should_stop = False
@@ -140,15 +134,12 @@ class LongitudinalPlanner:
 
     # BLT necessity supervisor: modulates the solver's own runtime knobs (see docs/BLT.md)
     personality = sm['selfdriveState'].personality
-    jerk_scale, t_follow_blt, tau_floor = self.blt.update(sm, self.a_desired, get_T_FOLLOW(personality))
-    self._param_frame += 1
-    if self._param_frame % 100 == 0:  # ~5s: cheap live A/B toggle
-      self.new_lead_mpc = self._params.get_bool("NewLeadMpc")
-    model_leads = sm['modelV2'].leadsV3 if (self.new_lead_mpc and len(sm['modelV2'].leadsV3) > 1) else None
+    jerk_scale, t_follow_blt = self.blt.update(sm, self.a_desired, get_T_FOLLOW(personality))
+    model_leads = sm['modelV2'].leadsV3 if len(sm['modelV2'].leadsV3) > 1 else None
     self.mpc.set_weights(prev_accel_constraint, personality=personality, jerk_factor_scale=jerk_scale)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
     self.mpc.update(sm['radarState'], v_cruise, personality=personality,
-                    t_follow=t_follow_blt, a_lead_tau_floor=tau_floor, model_leads=model_leads)
+                    t_follow=t_follow_blt, model_leads=model_leads)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
