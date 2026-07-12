@@ -55,7 +55,8 @@ T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
-STOP_DISTANCE = 6.0
+STOP_DISTANCE = 7.0  # stock 6.0; +1m per owner preference -- a constant term of the desired-gap
+                     # cost at every horizon node, so the whole decel plan lands 1m earlier
 CRUISE_MIN_ACCEL = -1.2
 CRUISE_MAX_ACCEL = 3.2  # Spysypilot: doubled with the cruise accel schedule
 MIN_X_LEAD_FACTOR = 0.5
