@@ -155,6 +155,16 @@ class AolDriver:
           cloudlog.warning("AOL: softDisable (steerFaultTemporary)")
         self.state_machine.add_event('softDisable')
 
+    # Reverse gear → soft disable: the forward-facing model has nothing valid to steer
+    # with while backing up (and vEgo is unsigned on the Palisade, so the speed gates
+    # alone don't block actuation in reverse). softDisable rather than immediate so a
+    # quick R-to-D shuffle in a 3-point turn survives; a real reversing maneuver runs
+    # out the timer and AOL stays off until re-toggled.
+    if CS.gearShifter == car.CarState.GearShifter.reverse:
+      if self.active and self.state_machine.state != State.softDisabling:
+        cloudlog.warning("AOL: softDisable (reverse gear)")
+      self.state_machine.add_event('softDisable')
+
     # REMAIN_ACTIVE: brake/gas press does NOT affect AOL state
 
   def update(self, CS) -> None:
