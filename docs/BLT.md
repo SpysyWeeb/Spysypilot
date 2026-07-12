@@ -77,10 +77,11 @@ Interventions, in priority order (all runtime-parameter modulation, no output cl
   healthy, scale jerk_factor down (toward ~0.3) in `set_weights` so A_CHANGE_COST stops
   pinning the recovery; restore as demand converges to a_req. The solver still shapes
   everything — it just stops paying rent on stale deceleration.
-- **Pessimism floor** (fixes mechanism 2a): floor the effective `a_lead_tau` in
-  `process_lead` (e.g. tau >= 0.4) whenever a_req is mild and the measured lead accel is
-  *rising* (recovering) — the "brakes forever" prediction only survives while the lead
-  is actually still deep in its own braking. Small, surgical long_mpc change.
+- ~~**Pessimism floor**~~ (RETIRED 2026-07-11): mechanism 2a no longer exists. The MPC
+  now consumes the driving model's predicted lead trajectory (upstream PR #37824, ported
+  via IQPilot) instead of the `aLeadTau` kinematic extrapolation, so there is no
+  extrapolation to floor — the model's forecast anticipates the lead's recovery directly.
+  First wrapper deleted per the no-crutches rule.
 - **Dynamic onset** (fixes mechanism 1, replaces the retired Smooth Approach): when a
   tracked lead's measured decel first crosses a small threshold, ramp the per-frame
   t_follow parameter up briefly (standard -> ~1.7 over ~1 s) so the desired-distance

@@ -8,7 +8,6 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
-from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU  # legacy lead extrapolation (NewLeadMpc off)
 
 LEAD_T_IDXS_MODEL = np.array(ModelConstants.LEAD_T_IDXS)  # [0, 2, 4, 6, 8, 10]s
 
@@ -297,7 +296,7 @@ class LongitudinalMpc:
     The model anticipates launches and slowdowns from vision seconds before the radar can
     measure them -- this is the single deepest lead-reaction-time lever in the stack.
     Anchored at the radar's trusted h=0 measurement; the model contributes the deltas."""
-    if model_lead.prob > 0.5 and radar_lead.status:
+    if model_lead is not None and model_lead.prob > 0.5 and radar_lead.status:
       x = np.asarray(model_lead.x, dtype=np.float64)
       v = np.asarray(model_lead.v, dtype=np.float64)
       x_lead_traj = float(radar_lead.dRel) + (x - x[0])
@@ -322,57 +321,17 @@ class LongitudinalMpc:
       x_lead_mpc = np.maximum(x_lead_mpc, float(radar_lead.dRel) + float(radar_lead.vLead) * T_IDXS)
     return np.column_stack((x_lead_mpc, v_lead_mpc))
 
-  @staticmethod
-  def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau):
-    a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.)
-    v_lead_traj = np.clip(v_lead + np.cumsum(T_DIFFS * a_lead_traj), 0.0, 1e8)
-    x_lead_traj = x_lead + np.cumsum(T_DIFFS * v_lead_traj)
-    lead_xv = np.column_stack((x_lead_traj, v_lead_traj))
-    return lead_xv
-
-  def process_lead(self, lead, a_lead_tau_floor=0.0):
-    v_ego = self.x0[1]
-    if lead is not None and lead.status:
-      x_lead = lead.dRel
-      v_lead = lead.vLead
-      a_lead = lead.aLeadK
-      # BLT pessimism floor: a larger tau decays the extrapolated lead deceleration
-      # faster; radard drives tau toward 0 under sustained lead braking ("this lead
-      # brakes forever"), which is the right caution close-in and pure over-braking
-      # when the gap is healthy -- the supervisor raises the floor only then
-      a_lead_tau = max(lead.aLeadTau, a_lead_tau_floor)
-    else:
-      # Fake a fast lead car, so mpc can keep running in the same mode
-      x_lead = 50.0
-      v_lead = v_ego + 10.0
-      a_lead = 0.0
-      a_lead_tau = _LEAD_ACCEL_TAU
-
-    # MPC will not converge if immediate crash is expected
-    # Clip lead distance to what is still possible to brake for
-    min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead) * (v_ego - v_lead) / (-ACCEL_MIN * 2)
-    x_lead = np.clip(x_lead, min_x_lead, 1e8)
-    v_lead = np.clip(v_lead, 0.0, 1e8)
-    a_lead = np.clip(a_lead, -10., 5.)
-    lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
-    return lead_xv
-
   def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard,
-             t_follow=None, a_lead_tau_floor=0.0, model_leads=None):
+             t_follow=None, model_leads=None):
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
 
-    if model_leads is not None:
-      # NewLeadMpc path: the model's predicted lead horizon (BLT's a_lead_tau_floor is a patch
-      # for the legacy extrapolation's pessimism and is inert here -- predictions replace it)
-      self.status = model_leads[0].prob > 0.5 or model_leads[1].prob > 0.5
-      lead_xv_0 = self.process_lead_model(model_leads[0], radarstate.leadOne, v_ego)
-      lead_xv_1 = self.process_lead_model(model_leads[1], radarstate.leadTwo, v_ego)
-    else:
-      self.status = radarstate.leadOne.status or radarstate.leadTwo.status
-      lead_xv_0 = self.process_lead(radarstate.leadOne, a_lead_tau_floor)
-      lead_xv_1 = self.process_lead(radarstate.leadTwo, a_lead_tau_floor)
+    ml0 = model_leads[0] if model_leads is not None else None
+    ml1 = model_leads[1] if model_leads is not None else None
+    self.status = (ml0 is not None and ml0.prob > 0.5) or (ml1 is not None and ml1.prob > 0.5)
+    lead_xv_0 = self.process_lead_model(ml0, radarstate.leadOne, v_ego)
+    lead_xv_1 = self.process_lead_model(ml1, radarstate.leadTwo, v_ego)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
@@ -406,7 +365,7 @@ class LongitudinalMpc:
     self.run()
     # FCW confidence gate follows the trajectory source (PR #37824): the crash check compares
     # against lead_xv_0, so gate on the same source's confidence
-    lead_prob_ok = model_leads[0].prob > 0.9 if model_leads is not None else radarstate.leadOne.modelProb > 0.9
+    lead_prob_ok = ml0 is not None and ml0.prob > 0.9
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
             lead_prob_ok):
       self.crash_cnt += 1

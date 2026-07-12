@@ -4,24 +4,21 @@ Original concept and implementation by SpysyWeeb (github.com/SpysyWeeb).
 BLT -- Better Longitudinal Tune. Design doc: docs/BLT.md.
 
 A necessity supervisor over the stock longitudinal MPC. Each frame it computes what
-braking the situation physically requires from the RAW measured lead (no pessimistic
-extrapolation), then modulates knobs the solver already accepts at runtime -- the
-jerk/accel-change cost weight, the t_follow gap parameter, and the lead-accel
-extrapolation decay. It never wraps v_cruise and never clamps the controller output;
+braking the situation physically requires from the RAW measured lead, then modulates
+knobs the solver already accepts at runtime -- the jerk/accel-change cost weight and
+the t_follow gap parameter. It never wraps v_cruise and never clamps the controller output;
 the solver keeps shaping everything, so intensity stays proportional by construction
 and the behavior is model-independent (this is the radar+MPC leg, identical under
 every driving model, in chill and experimental mode alike).
 
-Three interventions, mapped to the three stock mechanisms found in field data:
+Interventions, mapped to the stock mechanisms found in field data (a third, the
+lead-accel-extrapolation pessimism floor, retired 2026-07-11 when the MPC moved to
+model-predicted lead trajectories -- there is no extrapolation left to patch):
 
   recovery boost   -- braking held past necessity (route 39 t=617: 2.2s of post-
                       necessity braking). While the plan demands meaningfully more
                       than necessity, scale the accel-change cost down so the solver
                       stops paying rent on stale deceleration and relaxes itself.
-  pessimism floor  -- radard drives aLeadTau toward 0 while a lead brakes hard, which
-                      makes the MPC plan against a lead that brakes forever across
-                      the 10s horizon. While physics says the situation is mild,
-                      floor the decay so the prediction stays a forecast, not a doom.
   dynamic onset    -- the quadratic obstacle cost barely moves for a mildly-slowing
                       lead, then explodes late (late-then-hard). When a lead starts
                       braking and necessity is still mild, pad the t_follow parameter
@@ -52,12 +49,6 @@ EXCESS_DEBOUNCE = 0.4    # s, excess must persist this long before boosting
 JERK_SCALE_MIN = 0.3     # floor on the jerk/accel-change weight multiplier (stock
                          # personalities already span 0.5-1.0; this extends modestly)
 JERK_SCALE_RATE = 1.5    # 1/s, multiplier slew (continuity)
-
-# --- pessimism floor ---
-TAU_FLOOR = 0.5          # min aLeadTau while active (larger tau = faster decay of the
-                         # extrapolated lead deceleration = less pessimism)
-TAU_MILD_A_REQ = 1.2     # m/s^2, only floor pessimism while necessity is mild
-TAU_RATE = 1.5           # 1/s, floor slew
 
 # --- dynamic onset ---
 ONSET_LEAD_DECEL = 0.4   # m/s^2, lead braking at least this much opens the gap term early
@@ -90,7 +81,6 @@ class BLTSupervisor:
     self.jerk_scale = 1.0
     self.t_follow_pad = 0.0
     self.forgive = 0.0     # negative t_follow adjustment (gap forgiveness)
-    self.tau_floor = 0.0
     self._excess_s = 0.0
 
   def _slew(self, cur: float, target: float, rate: float) -> float:
@@ -99,11 +89,11 @@ class BLTSupervisor:
 
   def update(self, sm, a_plan: float, t_follow_base: float):
     """a_plan: the planner's current desired acceleration (negative = braking).
-    Returns (jerk_factor_scale, t_follow, tau_floor) for the MPC's runtime knobs."""
+    Returns (jerk_factor_scale, t_follow) for the MPC's runtime knobs."""
     lead = sm['radarState'].leadOne
     v_ego = max(float(sm['carState'].vEgo), 0.0)
 
-    scale_target, pad_target, tau_target = 1.0, 0.0, 0.0
+    scale_target, pad_target = 1.0, 0.0
     forgive_target = 0.0
     lead_braking = False
 
@@ -132,11 +122,6 @@ class BLTSupervisor:
           self._excess_s = 0.0
         if self._excess_s >= EXCESS_DEBOUNCE:
           scale_target = JERK_SCALE_MIN
-
-        # pessimism floor: the lead is braking hard enough that radard is driving its
-        # extrapolation tau toward zero, but physics says we are not in trouble
-        if a_lead < -0.5 and a_req < TAU_MILD_A_REQ:
-          tau_target = TAU_FLOOR
 
         # dynamic onset: lead has started braking, situation still mild -- open the gap
         # term early, PROPORTIONALLY to how hard the lead is braking. Never pad during
@@ -172,7 +157,6 @@ class BLTSupervisor:
       self.forgive = self._slew(self.forgive, forgive_target, FORGIVE_TRACK_RATE)
     else:
       self.forgive = self._slew(self.forgive, forgive_target, FORGIVE_RECOVER_FAST if lead_braking else FORGIVE_RECOVER_RATE)
-    self.tau_floor = self._slew(self.tau_floor, tau_target, TAU_RATE)
 
     t_follow = max(t_follow_base + self.t_follow_pad + self.forgive, FORGIVE_FLOOR)
-    return self.jerk_scale, t_follow, self.tau_floor
+    return self.jerk_scale, t_follow

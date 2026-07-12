@@ -117,6 +117,14 @@ class Plant:
     model.modelV2.acceleration = acceleration
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
+    # model lead predictions for the lead-trajectory MPC: constant-velocity continuation
+    # of the simulated lead (the radar anchor supplies h=0, the model supplies the deltas)
+    lead_v3 = log.ModelDataV2.LeadDataV3.new_message()
+    lead_v3.prob = float(prob_lead) if self.lead_relevancy else 0.0
+    lead_v3.x = [float(d_rel + v_lead * t) for t in ModelConstants.LEAD_T_IDXS]
+    lead_v3.v = [float(v_lead) for _ in ModelConstants.LEAD_T_IDXS]
+    model.modelV2.leadsV3 = [lead_v3, lead_v3, lead_v3]
+
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
     ss.selfdriveState.experimentalMode = self.e2e
     ss.selfdriveState.personality = self.personality
