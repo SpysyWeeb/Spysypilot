@@ -158,7 +158,8 @@ class AolDriver:
     # Reverse gear → immediate disable: the forward-facing model has nothing valid to
     # steer with while backing up (and vEgo is unsigned on the Palisade, so the speed
     # gates alone don't block actuation in reverse). Steering cuts the instant R is
-    # selected; AOL stays off until re-toggled.
+    # selected; AOL stays off until re-toggled. Silent, like a button press: shifting
+    # to R is the driver's own deliberate act, not a fault worth announcing.
     if CS.gearShifter == car.CarState.GearShifter.reverse:
       if self.enabled:
         cloudlog.warning("AOL: immediateDisable (reverse gear)")
@@ -171,8 +172,10 @@ class AolDriver:
     self.enabled, self.active = self.state_machine.update()
 
     # One-shot warning when AOL turns itself off (steer fault, panda mismatch,
-    # cruise loss) — a user button press is intentional and gets no alert
-    if prev_enabled and not self.enabled and not self.state_machine.has('userDisable'):
+    # cruise loss) — a user button press or shifting into reverse is intentional
+    # and gets no alert
+    intentional = self.state_machine.has('userDisable') or CS.gearShifter == car.CarState.GearShifter.reverse
+    if prev_enabled and not self.enabled and not intentional:
       self._disable_alert_frames = int(DISABLE_ALERT_TIME / DT_CTRL)
     elif self._disable_alert_frames > 0:
       self._disable_alert_frames -= 1
