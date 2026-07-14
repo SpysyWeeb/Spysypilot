@@ -64,6 +64,13 @@ LEAD_PULLAWAY_VREL = 0.5    # m/s, radar says the lead is genuinely pulling away
 LEAD_PULLAWAY_ABRAKE = -0.5 # ...and not braking: floor the model's prediction with the radar
                             # (SpysyWeeb's pull-away fix, as adopted by IQPilot -- guards phantom
                             # launch braking when the model's prediction lags a real pull-away)
+LAUNCH_CONFIRM_VLEAD = 0.3  # m/s, radar-measured lead speed below this = not yet confirmed moving
+LAUNCH_GATE_EGO_V = 2.0     # m/s, only relevant near a stop -- ordinary following applies once rolling
+LAUNCH_GATE_DIST = 8.0      # m, close-range launch scenarios only -- mirror of the pull-away floor
+                            # above, opposite direction: caps the model's prediction instead of
+                            # flooring it (route 55: NewLeadMpc's own predicted trajectory forecast
+                            # a launch 3s before radar confirmed any lead motion, closing a 3.6m
+                            # stopped gap to 1.8m before the lead's real launch caught up)
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -320,6 +327,19 @@ class LongitudinalMpc:
       # a constant-velocity radar continuation (phantom launch-braking guard)
       v_lead_mpc = np.maximum(v_lead_mpc, float(radar_lead.vLead))
       x_lead_mpc = np.maximum(x_lead_mpc, float(radar_lead.dRel) + float(radar_lead.vLead) * T_IDXS)
+    if model_lead is not None and model_lead.prob > 0.5 and v_ego < LAUNCH_GATE_EGO_V \
+            and radar_lead.status and radar_lead.dRel < LAUNCH_GATE_DIST \
+            and radar_lead.vLead < LAUNCH_CONFIRM_VLEAD:
+      # lead hasn't been radar-confirmed as moving yet: never predict it farther/faster than
+      # a stationary continuation of the radar measurement (phantom launch-acceleration guard --
+      # mirror of the pull-away floor above; releases itself the instant radar crosses the
+      # confirm threshold, so a genuinely launching lead costs at most a few hundred ms). Gated
+      # on the SAME model.prob trust threshold that selects the real-trajectory branch above --
+      # without it, a low-confidence model read (radar clutter the model itself doesn't believe,
+      # route-20 regression check: prob 0.05-0.26) still dragged the fake-fast-lead fallback's
+      # deliberately-far obstacle back down to noisy, untrusted radar chatter
+      v_lead_mpc = np.minimum(v_lead_mpc, max(float(radar_lead.vLead), 0.0))
+      x_lead_mpc = np.minimum(x_lead_mpc, float(radar_lead.dRel) + max(float(radar_lead.vLead), 0.0) * T_IDXS)
     return np.column_stack((x_lead_mpc, v_lead_mpc))
 
   def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard,
