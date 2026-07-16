@@ -253,7 +253,6 @@ class LongitudinalMpc:
       self.solver.set(i, 'x', np.zeros(X_DIM))
 
     self.last_cloudlog_t = 0
-    self.status = False
     self.crash_cnt = 0.0
     self.solution_status = 0
     # timers
@@ -350,7 +349,6 @@ class LongitudinalMpc:
 
     ml0 = model_leads[0] if model_leads is not None else None
     ml1 = model_leads[1] if model_leads is not None else None
-    self.status = (ml0 is not None and ml0.prob > 0.5) or (ml1 is not None and ml1.prob > 0.5)
     lead_xv_0 = self.process_lead_model(ml0, radarstate.leadOne, v_ego)
     lead_xv_1 = self.process_lead_model(ml1, radarstate.leadTwo, v_ego)
 
