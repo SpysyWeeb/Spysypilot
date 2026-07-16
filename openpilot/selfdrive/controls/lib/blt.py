@@ -37,6 +37,22 @@ model-predicted leads is now a field question, answered without the mask):
                       braking and necessity is still mild, pad the t_follow parameter
                       so the distance cost engages early and gently -- the owner's
                       "start smooth, peak mid" shape, produced inside the solver.
+  launch boost     -- the exact mirror of recovery boost (route 59 t=5.5: 3.5s to
+                      swing from braking to peak accel while a launching lead opened
+                      a 35m gap against a ~26m request). When the lead is measurably
+                      pulling away AND accelerating, necessity is zero, and the plan's
+                      accel lags the lead's own, the solver is paying rent on stale
+                      LOW acceleration -- same disease, opposite sign, same knob. The
+                      yardstick is radar aLeadK, not the model: for launches radar
+                      leads the model by 1-1.5s (measured, route 59), the reverse of
+                      hard braking where the model-arm above exists. Never touches
+                      t_follow -- gap shrinking is a safety change, jerk relaxation
+                      only changes how fast the solver tracks the gap it already wants.
+                      A whiplash ratchet guards the launch-then-brake handoff: the
+                      scale may relax at any time, but may only STIFFEN while the
+                      measured lead is braking and we're closing, so a boost that was
+                      live when the lead flipped to decel stays relaxed through the
+                      swing into braking instead of returning stiffness mid-event.
 
 Safety posture: every intervention stands down entirely below MIN_TTC and only moves
 within modest extensions of ranges the stock personalities already span. The solver's
@@ -76,6 +92,18 @@ MODEL_LEAD_PROB_MIN = 0.5   # matches NewLeadMpc's own trust gate (long_mpc.py) 
                              # model isn't confident, this path is simply silent and behavior
                              # is identical to radar-only
 
+# --- launch boost ---
+LAUNCH_VREL_ON = 0.5        # m/s, lead measurably faster than ego -- matches the pull-away
+                            # floor's gate in long_mpc.py
+LAUNCH_VREL_OFF = 0.2       # disarm hysteresis on the same
+LAUNCH_ALEAD_ON = 0.5       # m/s^2, lead genuinely launching, not drifting ahead at steady
+                            # speed (the constant-speed pull-away is the floor's job)
+LAUNCH_SHORTFALL_ON = 0.6   # m/s^2, plan accel this far below the lead's own accel arms it
+LAUNCH_SHORTFALL_OFF = 0.2  # disarm: plan has essentially caught the lead's acceleration
+LAUNCH_DEBOUNCE = 0.4       # s, matches EXCESS_DEBOUNCE
+RATCHET_LEAD_BRAKE = 0.2    # m/s^2, lead decel beyond this (while closing) freezes any
+                            # upward slew of the jerk scale -- the whiplash guard
+
 # --- dynamic onset ---
 ONSET_LEAD_DECEL = 0.4   # m/s^2, lead braking at least this much opens the gap term early
 ONSET_PAD_MAX = 0.45     # s, max t_follow pad ON TOP of the personality base (route 3c: an
@@ -98,6 +126,7 @@ class BLTSupervisor:
     self.t_follow_pad = 0.0
     self._excess_s = 0.0
     self._model_excess_s = 0.0
+    self._launch_s = 0.0
 
   def _slew(self, cur: float, target: float, rate: float) -> float:
     step = rate * DT_MDL
@@ -160,6 +189,30 @@ class BLTSupervisor:
         if self._model_excess_s >= MODEL_ARM_DEBOUNCE:
           scale_target = JERK_SCALE_MIN
 
+        # launch boost: mirror of recovery boost. Lead measurably pulling away and
+        # accelerating, nothing to brake for, plan accel lagging the lead's own. The
+        # a_req check is definitionally implied by the two lead gates (receding +
+        # accelerating means both necessity terms are zero) but stays as the explicit
+        # statement that this trigger only exists where there is nothing to brake for.
+        # In the hysteresis band the timer holds, same as the excess trigger above.
+        shortfall = a_lead - a_plan
+        if -closing > LAUNCH_VREL_ON and a_lead > LAUNCH_ALEAD_ON and a_req < 0.1 \
+                and shortfall > LAUNCH_SHORTFALL_ON:
+          self._launch_s += DT_MDL
+        elif shortfall < LAUNCH_SHORTFALL_OFF or a_lead < LAUNCH_ALEAD_ON or -closing < LAUNCH_VREL_OFF:
+          self._launch_s = 0.0
+        if self._launch_s >= LAUNCH_DEBOUNCE:
+          scale_target = JERK_SCALE_MIN
+
+        # whiplash ratchet: relaxing is always allowed, stiffening never happens while
+        # the measured lead is braking and we're closing -- a boost live at the moment
+        # a launch turns into a braking event keeps its relaxed cost through the swing
+        # into decel (relaxed jerk helps that swing exactly as it helped the launch).
+        # Deliberately inside the non-emergency path only: the MIN_TTC stand-down below
+        # still returns the solver to full stock stiffness, unchanged
+        if scale_target > self.jerk_scale and a_lead < -RATCHET_LEAD_BRAKE and closing > 0.0:
+          scale_target = self.jerk_scale
+
         # dynamic onset: lead has started braking, situation still mild -- open the gap
         # term early, PROPORTIONALLY to how hard the lead is braking. Never pad during
         # the recovery (ego already at/below lead speed) or while the lead accelerates:
@@ -175,9 +228,11 @@ class BLTSupervisor:
       else:
         self._excess_s = 0.0
         self._model_excess_s = 0.0
+        self._launch_s = 0.0
     else:
       self._excess_s = 0.0
       self._model_excess_s = 0.0
+      self._launch_s = 0.0
 
     self.jerk_scale = self._slew(self.jerk_scale, scale_target, JERK_SCALE_RATE)
     self.t_follow_pad = self._slew(self.t_follow_pad, pad_target, ONSET_RATE_UP if pad_target > self.t_follow_pad else ONSET_RATE_DOWN)
