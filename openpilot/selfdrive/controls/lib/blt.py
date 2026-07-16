@@ -1,64 +1,41 @@
 """
 Original concept and implementation by SpysyWeeb (github.com/SpysyWeeb).
 
-BLT -- Better Longitudinal Tune. Design doc: docs/BLT.md.
+BLT -- Better Longitudinal Tune. Design doc, history and per-intervention rationale:
+docs/BLT.md (repo root).
 
 A necessity supervisor over the stock longitudinal MPC. Each frame it computes what
 braking the situation physically requires from the RAW measured lead, then modulates
 knobs the solver already accepts at runtime -- the jerk/accel-change cost weight and
-the t_follow gap parameter. It never wraps v_cruise and never clamps the controller output;
-the solver keeps shaping everything, so intensity stays proportional by construction
-and the behavior is model-independent (this is the radar+MPC leg, identical under
-every driving model, in chill and experimental mode alike).
+the t_follow gap parameter. It never wraps v_cruise and never clamps the controller
+output; the solver keeps shaping everything, so intensity stays proportional by
+construction and the behavior is model-independent.
 
-Interventions, mapped to the stock mechanisms found in field data. Two others have
-been retired: the lead-accel-extrapolation pessimism floor (2026-07-11, obsolete when
-the MPC moved to model-predicted lead trajectories -- no extrapolation left to patch)
-and gap forgiveness (2026-07-11, route 46: tuned on legacy-MPC route-3f data, it
-ratcheted steady-following headway down to its floor and silently absorbed gap-button
-personality changes; whether the fall-back ping-pong it patched even occurs under
-model-predicted leads is now a field question, answered without the mask):
+Interventions (see docs/BLT.md for the field data behind each):
 
-  recovery boost   -- braking held past necessity (route 39 t=617: 2.2s of post-
-                      necessity braking). While the plan demands meaningfully more
-                      than necessity, scale the accel-change cost down so the solver
-                      stops paying rent on stale deceleration and relaxes itself. A
-                      second, independent trigger arms the same boost off the model's
-                      OWN predicted lead trajectory (leadsV3) for hard braking specifically
-                      -- replay-validated against 14 real routes: even on the events where
-                      the radar-driven trigger above eventually arms, the model would have
-                      gotten there ~3s sooner, median, because it forecasts hard braking
-                      before radar can measure it. Deliberately narrow: the threshold sits
-                      well clear of the mild band dynamic onset owns below, so the model
-                      never gets a vote on necessity or on subtle slowdowns -- only on
-                      whether the solver's jerk cost is allowed to relax sooner.
-  dynamic onset    -- the quadratic obstacle cost barely moves for a mildly-slowing
-                      lead, then explodes late (late-then-hard). When a lead starts
-                      braking and necessity is still mild, pad the t_follow parameter
-                      so the distance cost engages early and gently -- the owner's
-                      "start smooth, peak mid" shape, produced inside the solver.
-  launch boost     -- the exact mirror of recovery boost (route 59 t=5.5: 3.5s to
-                      swing from braking to peak accel while a launching lead opened
-                      a 35m gap against a ~26m request). When the lead is measurably
-                      pulling away AND accelerating, necessity is zero, and the plan's
-                      accel lags the lead's own, the solver is paying rent on stale
-                      LOW acceleration -- same disease, opposite sign, same knob. The
-                      yardstick is radar aLeadK, not the model: for launches radar
-                      leads the model by 1-1.5s (measured, route 59), the reverse of
-                      hard braking where the model-arm above exists. Never touches
-                      t_follow -- gap shrinking is a safety change, jerk relaxation
-                      only changes how fast the solver tracks the gap it already wants.
-                      A whiplash ratchet guards the launch-then-brake handoff: the
-                      scale may relax at any time, but may only STIFFEN while the
-                      measured lead is braking and we're closing, so a boost that was
-                      live when the lead flipped to decel stays relaxed through the
-                      swing into braking instead of returning stiffness mid-event.
+  recovery boost   -- plan holds meaningfully more braking than necessity: relax the
+                      jerk cost so the solver stops paying rent on stale deceleration.
+                      A second, independent trigger arms the same boost early off the
+                      model's own predicted lead trajectory (leadsV3) for hard braking
+                      -- the model forecasts hard events ~3s before radar measures them.
+  launch boost     -- the exact mirror: lead measurably pulling away AND accelerating,
+                      necessity zero, plan accel lagging the lead's own -- stale LOW
+                      acceleration, same knob. Radar-driven (for launches radar leads
+                      the model, the reverse of hard braking). Never touches t_follow.
+  whiplash ratchet -- the jerk scale may relax at any time but may only STIFFEN while
+                      the measured lead is braking and ego closes, so a boost live when
+                      a launch flips to braking keeps its relaxed cost through the
+                      swing into decel.
+  dynamic onset    -- a mildly-braking or stopped lead barely moves the quadratic
+                      obstacle cost until too late (late-then-hard): pad t_follow
+                      proportionally so the distance cost engages early and gently.
 
-Safety posture: every intervention stands down entirely below MIN_TTC and only moves
-within modest extensions of ranges the stock personalities already span. The solver's
-hard constraints (ACCEL_MIN/MAX, danger-zone slack) are untouched, and the boost can
-only make the solver more responsive to its own optimum -- braking deepens FASTER too
-if the world worsens mid-boost. All outputs are rate-limited: no steps, ever.
+Safety posture: every intervention stands down entirely on low TTC with high necessity
+(back to full stock stiffness -- the ratchet lives inside the non-emergency path only)
+and moves only within modest extensions of ranges the stock personalities already span.
+The solver's hard constraints (ACCEL_MIN/MAX, danger-zone slack) are untouched, and the
+boost can only make the solver more responsive to its own optimum -- braking deepens
+FASTER too if the world worsens mid-boost. All outputs are rate-limited: no steps, ever.
 """
 from openpilot.common.realtime import DT_MDL
 
@@ -120,13 +97,33 @@ MIN_TTC = 3.5            # s, below this every intervention stands down (stock s
 MIN_SPEED = 1.0          # m/s, nothing to supervise at crawl (settle/hold own that)
 
 
+class DebouncedTrigger:
+  """Shared arm/hold/reset bookkeeping for the boost triggers: accrues time while `arm`
+  holds, resets when `disarm` holds, and HOLDS the accrued time in the hysteresis band
+  between them. Armed once the accrual crosses the debounce."""
+  def __init__(self, debounce: float):
+    self.debounce = debounce
+    self._s = 0.0
+
+  def reset(self) -> None:
+    self._s = 0.0
+
+  def step(self, arm: bool, disarm: bool) -> bool:
+    if arm:
+      self._s += DT_MDL
+    elif disarm:
+      self._s = 0.0
+    return self._s >= self.debounce
+
+
 class BLTSupervisor:
   def __init__(self):
     self.jerk_scale = 1.0
     self.t_follow_pad = 0.0
-    self._excess_s = 0.0
-    self._model_excess_s = 0.0
-    self._launch_s = 0.0
+    self._excess = DebouncedTrigger(EXCESS_DEBOUNCE)
+    self._model = DebouncedTrigger(MODEL_ARM_DEBOUNCE)
+    self._launch = DebouncedTrigger(LAUNCH_DEBOUNCE)
+    self._triggers = (self._excess, self._model, self._launch)
 
   def _slew(self, cur: float, target: float, rate: float) -> float:
     step = rate * DT_MDL
@@ -171,37 +168,28 @@ class BLTSupervisor:
         # recovery boost: meaningful braking beyond necessity, sustained, means the solver
         # is holding stale deceleration -- let it move
         excess = -a_plan - a_req
-        if excess > EXCESS_ON and -a_plan > MIN_BOOST_BRAKE:
-          self._excess_s += DT_MDL
-        elif excess < EXCESS_OFF or -a_plan <= MIN_BOOST_BRAKE:
-          self._excess_s = 0.0
-        if self._excess_s >= EXCESS_DEBOUNCE:
+        if self._excess.step(arm=excess > EXCESS_ON and -a_plan > MIN_BOOST_BRAKE,
+                             disarm=excess < EXCESS_OFF or -a_plan <= MIN_BOOST_BRAKE):
           scale_target = JERK_SCALE_MIN
 
         # model early-arm: independent trigger, same target knob, never combined into the
         # excess magnitude above -- an unconfident or mild model reading simply never fires,
         # it can't stack with a marginal radar reading to produce an unwarranted early boost
         pred_decel = self._model_predicted_decel(sm)
-        if pred_decel is not None and pred_decel < MODEL_HARD_THRESH:
-          self._model_excess_s += DT_MDL
-        else:
-          self._model_excess_s = 0.0
-        if self._model_excess_s >= MODEL_ARM_DEBOUNCE:
+        pred_hard = pred_decel is not None and pred_decel < MODEL_HARD_THRESH
+        if self._model.step(arm=pred_hard, disarm=not pred_hard):
           scale_target = JERK_SCALE_MIN
 
         # launch boost: mirror of recovery boost. Lead measurably pulling away and
         # accelerating, nothing to brake for, plan accel lagging the lead's own. The
         # a_req check is definitionally implied by the two lead gates (receding +
         # accelerating means both necessity terms are zero) but stays as the explicit
-        # statement that this trigger only exists where there is nothing to brake for.
-        # In the hysteresis band the timer holds, same as the excess trigger above.
+        # statement that this trigger only exists where there is nothing to brake for
         shortfall = a_lead - a_plan
-        if -closing > LAUNCH_VREL_ON and a_lead > LAUNCH_ALEAD_ON and a_req < 0.1 \
-                and shortfall > LAUNCH_SHORTFALL_ON:
-          self._launch_s += DT_MDL
-        elif shortfall < LAUNCH_SHORTFALL_OFF or a_lead < LAUNCH_ALEAD_ON or -closing < LAUNCH_VREL_OFF:
-          self._launch_s = 0.0
-        if self._launch_s >= LAUNCH_DEBOUNCE:
+        if self._launch.step(arm=(-closing > LAUNCH_VREL_ON and a_lead > LAUNCH_ALEAD_ON
+                                  and a_req < 0.1 and shortfall > LAUNCH_SHORTFALL_ON),
+                             disarm=(shortfall < LAUNCH_SHORTFALL_OFF or a_lead < LAUNCH_ALEAD_ON
+                                     or -closing < LAUNCH_VREL_OFF)):
           scale_target = JERK_SCALE_MIN
 
         # whiplash ratchet: relaxing is always allowed, stiffening never happens while
@@ -226,13 +214,11 @@ class BLTSupervisor:
         if v_lead < 2.0 and 0.3 < a_req < ONSET_MAX_A_REQ and not recovering:
           pad_target = max(pad_target, ONSET_PAD_MAX * min(a_req / 1.2, 1.0))
       else:
-        self._excess_s = 0.0
-        self._model_excess_s = 0.0
-        self._launch_s = 0.0
+        for trig in self._triggers:
+          trig.reset()
     else:
-      self._excess_s = 0.0
-      self._model_excess_s = 0.0
-      self._launch_s = 0.0
+      for trig in self._triggers:
+        trig.reset()
 
     self.jerk_scale = self._slew(self.jerk_scale, scale_target, JERK_SCALE_RATE)
     self.t_follow_pad = self._slew(self.t_follow_pad, pad_target, ONSET_RATE_UP if pad_target > self.t_follow_pad else ONSET_RATE_DOWN)

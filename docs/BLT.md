@@ -11,9 +11,12 @@ Reference targets, fitted from the owner's manual driving (route 00000035, 19 st
 onset at ~2.9 s headway, single application, build ~0.5 m/s^3, plateau −1.4..−1.8
 scaled by need, one release taper ~+0.2 m/s^3, landing −0.33, stop gap ~4.3 m median.
 
-## Where the felt problems actually live (from reading the whole stack)
+Code: `selfdrive/controls/lib/blt.py` (`BLTSupervisor`), wired in
+`longitudinal_planner.py`, driving runtime knobs of
+`longitudinal_mpc_lib/long_mpc.py`. Unit tests:
+`selfdrive/controls/tests/test_blt.py`.
 
-Three mechanisms in stock code produce everything field-tested so far:
+## Where the felt problems actually live (from reading the whole stack)
 
 ### 1. Late-then-hard onset — the obstacle formulation
 
@@ -30,19 +33,22 @@ cost explodes — hence gentle situations get nothing and developing situations 
 wall of braking all at once. The onset shape is baked into COMFORT_BRAKE (2.5) and
 t_follow, both of which are **runtime parameters**.
 
-### 2. Braking held past necessity — lead-accel extrapolation plus recovery cost
+### 2. Solution stiffness — A_CHANGE_COST pins both directions of recovery
 
-Two stacked causes, measured at ~2.2 s of post-necessity braking in route 39 t=617:
+`A_CHANGE_COST = 200` (x jerk_factor, applied only over the first 2 s of the horizon)
+limits how fast the *solution itself* may change, symmetrically:
 
-- `radard.py`: `aLeadTau` starts at 1.5 but, while `|aLeadK| >= 0.5`, filters toward
-  **0.0** with RC 0.45 s. `long_mpc.extrapolate_lead` decays predicted lead accel as
-  `exp(-tau * T^2 / 2)` — so after ~1 s of sustained lead braking, tau ~ 0 and the MPC
-  plans against a lead that **keeps braking across the entire 10 s horizon**. When the
-  real lead recovers, `aLeadK` (Kalman) lags ~0.5-1 s before tau snaps back. This is the
-  single biggest "holds the brakes" mechanism.
-- `A_CHANGE_COST = 200` (x jerk_factor, applied only over the first 2 s of the horizon)
-  limits how fast the *solution itself* may relax — observed recovery ~1.0 m/s^3 from
-  deep braking, i.e. 2.5+ s from a slam back to neutral even after the obstacle clears.
+- **Braking held past necessity** (route 39 t=617: ~2.2 s of post-necessity braking) —
+  the solver keeps paying rent on stale deceleration after the world has recovered.
+- **Acceleration lagging a launching lead** (route 59 seg 3: 3.5 s to swing from
+  braking to peak accel while the lead opened a 35 m gap against a ~26 m request) —
+  the same stiffness on the way up, measured at ~0.45 m/s^3 plan ramp.
+
+(Historical: a second held-braking mechanism — `radard.aLeadTau` filtering to 0 during
+sustained lead braking, making `extrapolate_lead` predict a lead that brakes across the
+whole 10 s horizon — was the single biggest "holds the brakes" cause. It no longer
+exists: the MPC now consumes the driving model's predicted lead trajectory directly,
+see "Related machinery" below.)
 
 The remaining ~0.5 s is hydraulic brake bleed on the Palisade (CAN JerkUpperLimit is
 already 3.0 — verified not the bottleneck).
@@ -50,7 +56,7 @@ already 3.0 — verified not the bottleneck).
 ### 3. Proportionality — the personality knobs already exist, statically
 
 `get_jerk_factor` (relaxed 1.0 / standard 1.0 / aggressive 0.5) scales both J_EGO_COST
-and A_CHANGE_COST; `get_T_FOLLOW` (1.75 / 1.45 / 1.25) sets the gap term. Both are read
+and A_CHANGE_COST; `get_T_FOLLOW` (1.75 / 1.45 / 1.00) sets the gap term. Both are read
 **every frame** (`set_weights(...)` and `params[:,4]`), which means the stock controller
 already accepts per-frame modulation of exactly the quantities that determine onset
 timing, intensity, and release rate. Nothing needs a solver regen to be scheduled.
@@ -60,55 +66,110 @@ timing, intensity, and release rate. Nothing needs a solver regen to be schedule
 The failed pattern (retired): wrapping the MPC's inputs (v_cruise caps) or outputs
 (release governors) — caps cannot express intensity, and every wrapper fights the
 solver's internal state. The BLT pattern: compute, each frame, what physics actually
-requires from the **raw measured lead** (no pessimistic extrapolation):
+requires from the **raw measured lead**, in the relative frame (the route-3c lesson:
+an absolute headway-margin form exploded at the owner's 1.2-1.6 s following distances):
 
-    a_req = required decel to land at desired gap given dRel, vRel, measured aLead trend
+    a_req = max(-aLead, 0) + max(closing, 0)^2 / (2 * max(dRel - D_MIN, budget))
 
-and answer the owner's two watchdog questions with it:
+("match the lead's own braking, plus shed the closing energy before the standstill
+margin") — and use it to decide when the solver's own knobs may be relaxed or opened.
+The supervisor never commands accelerations; it returns `(jerk_factor_scale, t_follow)`
+and the solver keeps shaping everything.
 
-1. **"Is this braking actually necessary?"** — compare the plan's current demand to
-   a_req. Excess = demand beyond `a_req + margin`, sustained beyond a debounce.
-2. **"How much longer must it hold?"** — not a timer: the moment excess exists, start
-   removing the *reasons* the solver holds, and let it converge itself.
+### Current interventions
 
-Interventions, in priority order (all runtime-parameter modulation, no output clamping):
+- **Recovery boost** — while the plan demands meaningfully more braking than `a_req`
+  (excess > 0.4, braking > 0.8, sustained 0.4 s), scale the jerk/accel-change weight
+  down toward 0.3 so A_CHANGE_COST stops pinning the recovery; restore as the demand
+  converges. Two independent arming paths, one knob:
+  - *Radar path*: the excess computation above.
+  - *Model early-arm*: the model's own predicted lead trajectory (`leadsV3` 0→2 s
+    v-slope < −0.5, prob > 0.5, sustained 0.3 s). For hard braking the model forecasts
+    the event ~3 s (median) before radar can measure it — replay-validated over 14
+    routes. Deliberately narrow: the threshold sits well clear of the mild band the
+    dynamic onset owns, and an unconfident model reading is simply silent.
+- **Launch boost** — the exact mirror (route 59). Lead measurably pulling away
+  (vrel > 0.5, matching the pull-away floor's gate) AND genuinely accelerating
+  (aLeadK > 0.5), necessity zero, and the plan's accel lagging the lead's own by > 0.6:
+  same knob, same debounce and slew. Radar-driven by design — for launches radar leads
+  the model by 1-1.5 s (measured), the reverse of hard braking. Never touches t_follow:
+  shrinking the gap is a safety change; jerk relaxation only changes how fast the
+  solver tracks the gap it already wants.
+- **Whiplash ratchet** — the jerk scale may relax at any time but may only *stiffen*
+  while the measured lead is braking (aLeadK < −0.2) and ego is closing. A boost that
+  is live when a launch flips into a braking event keeps its relaxed cost through the
+  swing into decel (relaxed jerk helps that swing exactly as it helped the launch).
+  Lives inside the non-emergency path only — the stand-down below still returns full
+  stock stiffness.
+- **Dynamic onset** (fixes mechanism 1) — when a tracked lead's measured decel crosses
+  0.4 and necessity is still mild, pad the per-frame t_follow parameter (up to +0.45 on
+  top of the personality base, **proportional** to the lead's decel) so the
+  desired-distance term opens *early* and the quadratic cost pulls *gently*. Cancels
+  while recovering (ego at/below lead speed) or while the lead accelerates. A second
+  form covers the already-stopped lead (route 3e: nothing else opens the gap term and
+  the car carried speed to a 2.2 m squeak-stop): the pad is driven from closing-energy
+  necessity when vLead < 2.
+- **Emergency stand-down** — everything resets and the solver returns to stock weights
+  when TTC < 3.5 **and** a_req ≥ 1.5 together. The conjunction matters: a controlled
+  approach to a stopped lead naturally runs TTC < 3.5, and standing down on TTC alone
+  dropped the stopped-lead pad mid-approach (route 3e replay) — a desired-gap release
+  right where firmness matters most.
 
-- **Recovery boost** (fixes mechanism 2b): while excess braking is detected and TTC is
-  healthy, scale jerk_factor down (toward ~0.3) in `set_weights` so A_CHANGE_COST stops
-  pinning the recovery; restore as demand converges to a_req. The solver still shapes
-  everything — it just stops paying rent on stale deceleration.
-- ~~**Pessimism floor**~~ (RETIRED 2026-07-11): mechanism 2a no longer exists. The MPC
-  now consumes the driving model's predicted lead trajectory (upstream PR #37824, ported
-  via IQPilot) instead of the `aLeadTau` kinematic extrapolation, so there is no
-  extrapolation to floor — the model's forecast anticipates the lead's recovery directly.
-  First wrapper deleted per the no-crutches rule.
-- **Dynamic onset** (fixes mechanism 1, replaces the retired Smooth Approach): when a
-  tracked lead's measured decel first crosses a small threshold, ramp the per-frame
-  t_follow parameter up briefly (standard -> ~1.7 over ~1 s) so the desired-distance
-  term opens *early* and the quadratic cost starts pulling *gently* — early smooth
-  commitment through the solver, intensity inherently proportional, no external cap to
-  fight. Ramp back as the situation resolves or once ego is established on its own
-  braking profile.
-- **Static base-tune** (cheapest, do first): candidate COMFORT_BRAKE 2.5 -> ~2.2
-  (earlier, gentler engagement of the distance cost at speed; stop distance unaffected —
-  the stopped-equivalence term is zero for a stopped lead) and personality-grade
-  jerk_factor/T_FOLLOW selection, scored offline before any road test.
+All outputs are rate-limited (jerk scale 1.5/s, pad 0.4/s up, 0.5/s down): no steps,
+ever. Trigger bookkeeping is shared (`DebouncedTrigger`): accrue while arming
+conditions hold, reset on disarm conditions, hold in the hysteresis band between.
 
-Safety posture: the supervisor can only modulate within ranges the stock controller
-already exposes (personalities span jerk_factor 0.5-1.0 and t_follow 1.25-1.75 today;
-BLT extends those ranges modestly and schedules them). The solver's hard constraints
-(ACCEL_MIN/MAX, danger-zone slack, crash distance) are untouched, and every intervention
-de-activates on low TTC. The watchdog can never command braking below what the solver
-itself decides under un-modulated weights in a genuine emergency.
+### Retired interventions (kept for the record)
+
+- ~~**Pessimism floor**~~ (2026-07-11) — floored `aLeadTau` so the legacy extrapolation
+  stopped predicting a lead that brakes forever. Obsolete when the MPC moved to
+  model-predicted lead trajectories: no extrapolation left to patch. First crutch
+  actually deleted.
+- ~~**Gap forgiveness**~~ (2026-07-11, route 46) — tuned on legacy-MPC route-3f data, it
+  ratcheted steady-following headway down to its floor and silently absorbed gap-button
+  personality changes. Whether the fall-back ping-pong it patched even occurs under
+  model-predicted leads is a field question, answered without the mask.
+- ~~**Smooth Approach / Release wrappers**~~ (2026-07-10) — v_cruise caps and output
+  governors; could not express intensity. Superseded by this architecture entirely.
+
+### Owner doctrine: the boosts are crutches
+
+If the base tune were right, neither boost would ever fire. Boost-activity % per route
+is the metric to drive toward zero — when a data-backed base-tune change makes a
+trigger silent in the field, delete the trigger. (Recent duty readings: recovery boost
+2.7-3.8 % on exp-mode routes; launch boost 1.01 % over the 14-route validation set.)
+
+## Related machinery (lives in long_mpc.py, not BLT — but part of the same tune)
+
+- **NewLeadMpc** (`process_lead_model`, upstream PR #37824 via IQPilot): the solver's
+  lead input is the model's predicted `leadsV3` trajectory anchored to radar's h=0
+  measurement — the single deepest lead-reaction-time lever in the stack. Always on;
+  there is no legacy path anymore.
+- **Pull-away floor** (`LEAD_PULLAWAY_*`): radar says the lead is genuinely receding
+  and not braking → never predict it slower/closer than a constant-velocity radar
+  continuation (phantom launch-braking guard).
+- **Launch-confirm ceiling** (`LAUNCH_CONFIRM_*`, route 55): near a stop, a
+  model-forecast launch is capped to the radar's stationary continuation until radar
+  confirms the lead actually moving (phantom launch-acceleration guard — the exact
+  mirror of the floor, and gated on the same model-confidence threshold that selects
+  the real-trajectory branch).
+- **Base tune**: STOP_DISTANCE 6.0→7.0 (owner preference, translates the whole decel
+  plan), doubled gas schedule (A_CRUISE_MAX + opendbc ACCEL_MAX 4.0 + panda +
+  turn-budget `_A_TOTAL_MAX`), aggressive t_follow 1.25→1.00.
 
 ## Verification
 
-- Replay library (already built, real classes + logged leads): route 36 t=775/1858,
-  route 38 t=1066, route 39 t=617 as the held-braking acceptance set; routes 35-39
-  full-route sweeps for regressions (false releases, onset regressions).
+- Every change replays the **real production class** (never a transcription) against
+  recorded rlogs before shipping: held-braking acceptance set (routes 36/38/39), the
+  14-route sweep for regressions and duty-cycle, plus the motivating route for each
+  feature (route 59 for the launch boost).
+- `selfdrive/controls/tests/test_blt.py` locks in trigger semantics, debounce times,
+  hysteresis holds, ratchet freeze/release, stand-down, and slew continuity.
 - op-model-grader as the scorer: the owner's manual-stop template is the target
   distribution (onset headway, peak, peak-position, release slope, landing, stop gap).
-- Field acceptance: the owner's seat.
+- Field acceptance: the owner's seat. The replay harness cannot run the acados solver
+  offline, so knob modulation is verified logic-level and directionally; the solver's
+  felt response is what the road test checks.
 
 ## Non-goals
 
