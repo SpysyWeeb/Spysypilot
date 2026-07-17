@@ -10,7 +10,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.blt import BLTSupervisor
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW,
+                                                                            LAUNCH_GATE_DIST, LAUNCH_CONFIRM_VLEAD)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
@@ -19,6 +20,13 @@ from openpilot.common.swaglog import cloudlog
 A_CRUISE_MAX_VALS = [3.2, 2.4, 1.6, 1.2]  # Spysypilot: doubled (owner request; requires the
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]    # matching ACCEL_MAX=4.0 + panda safety bump in opendbc)
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
+LEAD_LAUNCH_FORECAST_V = 1.0   # m/s, leadsV3 2s-out predicted lead speed that reads as committed
+                               # launch intent (real launches onset at 1.4-3.8 in field data)
+LEAD_LAUNCH_FORECAST_OFF = 0.5 # forecast-episode-over hysteresis (re-arms the one-shot)
+LEAD_LAUNCH_CONFIRM_S = 0.4    # s, forecast must persist before the hold releases
+LEAD_LAUNCH_MAX_S = 4.0        # s, hard cap on one anticipatory release (radar confirms within
+                               # 1.3-2.9s of forecast on every observed real launch)
+
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
@@ -59,6 +67,10 @@ class LongitudinalPlanner:
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.blt = BLTSupervisor()
+    self.lead_launch_s = 0.0
+    self.lead_launch_state = 0  # 0 armed, 1 releasing, 2 spent (until forecast episode ends)
+    self.lead_launch_t = 0.0
+    self.lead_launch_rolled = False
     self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
     self.output_a_target = 0.0
     self.output_should_stop = False
@@ -158,6 +170,45 @@ class LongitudinalPlanner:
     action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
     output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                                                         action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
+    # Lead-launch anticipation: the hold-release companion of the launch-confirm gap
+    # credit (long_mpc). The credit bounds what an unconfirmed forecast may PLAN, but
+    # the bounded creep is too small to flip get_accel_from_plan's stop bit, so the
+    # brake hold and the ~1.7s starting-state ramp stayed serialized behind radar
+    # confirm (route 5d: shouldStop released within 0.1s of radar confirm on every
+    # launch). On a sustained, confident forecast of a stopped close lead launching,
+    # release the hold directly -- the starting ramp then runs DURING the anticipation
+    # window, and the credit keeps the plan honest: if the lead never moves, aTarget
+    # pins negative inside the desired gap and the car re-holds after at most a
+    # human-like inch (route-55 false-forecast geometry: obstacle 5.8m vs 7m desired).
+    # One release per forecast episode: a persistent false forecast cannot cycle the
+    # hold. Radar confirm hands over to the plan's own bit and re-arms.
+    leads_v3 = sm['modelV2'].leadsV3
+    lead_one = sm['radarState'].leadOne
+    forecast_v = float(leads_v3[0].v[1]) if (len(leads_v3) > 0 and len(leads_v3[0].v) > 1) else 0.0
+    forecast_confident = len(leads_v3) > 0 and leads_v3[0].prob > 0.5
+    forecast = forecast_confident and forecast_v > LEAD_LAUNCH_FORECAST_V
+    forecast_alive = forecast_confident and forecast_v > LEAD_LAUNCH_FORECAST_OFF
+    launch_gate = (sm['carState'].standstill and lead_one.status and
+                   lead_one.dRel < LAUNCH_GATE_DIST and lead_one.vLead < LAUNCH_CONFIRM_VLEAD)
+    if self.lead_launch_state == 0:
+      self.lead_launch_s = self.lead_launch_s + self.dt if (forecast and launch_gate) else 0.0
+      if self.lead_launch_s >= LEAD_LAUNCH_CONFIRM_S:
+        self.lead_launch_state, self.lead_launch_t, self.lead_launch_rolled = 1, 0.0, False
+        self.lead_launch_s = 0.0
+    elif self.lead_launch_state == 1:
+      self.lead_launch_t += self.dt
+      self.lead_launch_rolled |= not sm['carState'].standstill
+      handed_over = lead_one.status and lead_one.vLead >= LAUNCH_CONFIRM_VLEAD
+      crept_and_reheld = self.lead_launch_rolled and sm['carState'].standstill
+      if handed_over:
+        self.lead_launch_state = 0
+      elif crept_and_reheld or not lead_one.status or not forecast_alive or self.lead_launch_t > LEAD_LAUNCH_MAX_S:
+        self.lead_launch_state = 2
+      else:
+        output_should_stop_mpc = False
+    elif not forecast_alive:
+      self.lead_launch_state = 0
+
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 

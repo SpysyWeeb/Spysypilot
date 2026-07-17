@@ -158,6 +158,16 @@ trigger silent in the field, delete the trigger. (Recent duty readings: recovery
   the credit can never open the obstacle past the desired standstill gap at the ranges
   the gate admits — route 55's false launch replays to a ~1 m creep-and-hold. Gated on
   the same model-confidence threshold that selects the real-trajectory branch.
+- **Lead-launch anticipation** (`LEAD_LAUNCH_*`, planner, route 5d): the hold-release
+  companion of the gap credit. The credit bounds what an unconfirmed forecast may
+  *plan*, but the bounded creep is too small to flip `get_accel_from_plan`'s stop bit,
+  so the brake hold and the ~1.7 s starting-state ramp stayed serialized behind radar
+  confirm anyway. On a sustained (0.4 s), confident forecast of a stopped close lead
+  launching, the planner clears the MPC stop bit directly — the starting ramp runs
+  *during* the anticipation window and hands over at radar confirm. One release per
+  forecast episode, 4 s hard cap; a wrong forecast ends in a human-like inch-and-hold
+  because the credit pins aTarget negative inside the desired gap. Field census over
+  the 14-route set: 64 releases, 61 handed to a confirmed launch, 3 false (0.4-1.0 s).
 - **Base tune**: STOP_DISTANCE 6.0→7.0 (owner preference, translates the whole decel
   plan), doubled gas schedule (A_CRUISE_MAX + opendbc ACCEL_MAX 4.0 + panda +
   turn-budget `_A_TOTAL_MAX`), aggressive t_follow 1.25→1.00.
