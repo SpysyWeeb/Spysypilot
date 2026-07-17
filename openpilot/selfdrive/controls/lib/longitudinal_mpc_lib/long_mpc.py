@@ -71,6 +71,18 @@ LAUNCH_GATE_DIST = 8.0      # m, close-range launch scenarios only -- mirror of 
                             # flooring it (route 55: NewLeadMpc's own predicted trajectory forecast
                             # a launch 3s before radar confirmed any lead motion, closing a 3.6m
                             # stopped gap to 1.8m before the lead's real launch caught up)
+LAUNCH_CREDIT_X = 2.0       # m, max future gap-opening an unconfirmed forecast may promise the
+                            # solver -- enough to release the brake hold and begin the standstill
+                            # exit on the model's anticipation (route 5b: the hard stationary clamp
+                            # discarded 2.8s of correct forecast and serialized the ~1.7s starting-
+                            # state ramp AFTER radar confirm instead of overlapping it), but small
+                            # enough that geometry holds if the forecast is wrong: obstacle can
+                            # exceed the stationary continuation by at most this + the v-credit
+                            # term, which stays inside the desired gap (STOP_DISTANCE alone is 7m)
+                            # at any stopped-lead range the gate admits -- route 55's false-launch
+                            # replay: worst-case creep of ~1m, then the distance cost holds
+LAUNCH_CREDIT_V = 1.0       # m/s, matching cap on predicted lead speed while unconfirmed (bounds
+                            # the stopped-equivalence term to v^2/(2*COMFORT_BRAKE) = 0.2m)
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -329,16 +341,22 @@ class LongitudinalMpc:
     if model_lead is not None and model_lead.prob > 0.5 and v_ego < LAUNCH_GATE_EGO_V \
             and radar_lead.status and radar_lead.dRel < LAUNCH_GATE_DIST \
             and radar_lead.vLead < LAUNCH_CONFIRM_VLEAD:
-      # lead hasn't been radar-confirmed as moving yet: never predict it farther/faster than
-      # a stationary continuation of the radar measurement (phantom launch-acceleration guard --
-      # mirror of the pull-away floor above; releases itself the instant radar crosses the
-      # confirm threshold, so a genuinely launching lead costs at most a few hundred ms). Gated
-      # on the SAME model.prob trust threshold that selects the real-trajectory branch above --
-      # without it, a low-confidence model read (radar clutter the model itself doesn't believe,
-      # route-20 regression check: prob 0.05-0.26) still dragged the fake-fast-lead fallback's
+      # lead not radar-confirmed as moving yet: the forecast passes through, but capped at a
+      # small bounded gap credit over the stationary radar continuation (phantom launch-
+      # acceleration guard, v2). The solver plans against the whole horizon, so an unbounded
+      # forecast can promise 10s of gap-opening and buy real acceleration toward a lead that
+      # never moves (route 55: 3.6m closed to 1.8m); a hard stationary clamp fixes that but
+      # discards seconds of correct anticipation on every real launch (route 5b). The credit
+      # is the middle: brake release + creep start on the forecast, while geometry (desired
+      # gap >= STOP_DISTANCE) absorbs the whole credit if the forecast is wrong. Releases
+      # fully the instant radar crosses the confirm threshold. Gated on the SAME model.prob
+      # trust threshold that selects the real-trajectory branch above -- without it, a low-
+      # confidence model read (radar clutter the model itself doesn't believe, route-20
+      # regression check: prob 0.05-0.26) still dragged the fake-fast-lead fallback's
       # deliberately-far obstacle back down to noisy, untrusted radar chatter
-      v_lead_mpc = np.minimum(v_lead_mpc, max(float(radar_lead.vLead), 0.0))
-      x_lead_mpc = np.minimum(x_lead_mpc, float(radar_lead.dRel) + max(float(radar_lead.vLead), 0.0) * T_IDXS)
+      v_meas = max(float(radar_lead.vLead), 0.0)
+      v_lead_mpc = np.minimum(v_lead_mpc, v_meas + LAUNCH_CREDIT_V)
+      x_lead_mpc = np.minimum(x_lead_mpc, float(radar_lead.dRel) + LAUNCH_CREDIT_X + v_meas * T_IDXS)
     return np.column_stack((x_lead_mpc, v_lead_mpc))
 
   def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard,

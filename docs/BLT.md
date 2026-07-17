@@ -148,11 +148,16 @@ trigger silent in the field, delete the trigger. (Recent duty readings: recovery
 - **Pull-away floor** (`LEAD_PULLAWAY_*`): radar says the lead is genuinely receding
   and not braking → never predict it slower/closer than a constant-velocity radar
   continuation (phantom launch-braking guard).
-- **Launch-confirm ceiling** (`LAUNCH_CONFIRM_*`, route 55): near a stop, a
-  model-forecast launch is capped to the radar's stationary continuation until radar
-  confirms the lead actually moving (phantom launch-acceleration guard — the exact
-  mirror of the floor, and gated on the same model-confidence threshold that selects
-  the real-trajectory branch).
+- **Launch-confirm gap credit** (`LAUNCH_CONFIRM_*` / `LAUNCH_CREDIT_*`, routes 55 +
+  5b): near a stop, an unconfirmed model-forecast launch passes through capped at a
+  small bounded gap credit (+2m x, +1 m/s v) over the radar's stationary continuation,
+  until radar confirms the lead actually moving. The credit lets brake release and the
+  standstill exit begin on the model's anticipation (v1's hard stationary clamp
+  discarded ~2.8 s of correct forecast per launch and serialized the ~1.7 s
+  starting-state ramp behind radar confirm), while geometry absorbs a wrong forecast:
+  the credit can never open the obstacle past the desired standstill gap at the ranges
+  the gate admits — route 55's false launch replays to a ~1 m creep-and-hold. Gated on
+  the same model-confidence threshold that selects the real-trajectory branch.
 - **Base tune**: STOP_DISTANCE 6.0→7.0 (owner preference, translates the whole decel
   plan), doubled gas schedule (A_CRUISE_MAX + opendbc ACCEL_MAX 4.0 + panda +
   turn-budget `_A_TOTAL_MAX`), aggressive t_follow 1.25→1.00.
