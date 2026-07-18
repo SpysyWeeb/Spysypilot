@@ -23,7 +23,7 @@ jobs:
           - detailed-stats-sidebar
           - better-green-lights
           - better-boot-screen
-          - AOL
+          - SOL
           - smooth-stops
           - auto-update
     runs-on: ubuntu-latest
