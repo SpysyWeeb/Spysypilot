@@ -81,7 +81,7 @@ class LongControl:
 
     elif self.long_control_state == LongCtrlState.starting:
       # Spysypilot: the plan drives the launch; startAccel is the CEILING, not the value.
-      # aTarget already scales with the situation (lead forecast + gap credit + MPC:
+      # aTarget already scales with the situation (lead forecast + trust ledger + MPC:
       # ~0.1 for a lead that hasn't moved yet, 0.5-0.9 for a hesitant roll-away, 2+ for
       # a committed launch; e2e launch assist covers no-lead greens) -- the stock fixed
       # command blasted full startAccel at every exit regardless, then the guard caught
