@@ -1,23 +1,22 @@
-# Spysypilot
+# nudgless-lane-changes
 
-This fork is **entirely vibe-coded using [Claude Code](https://claude.com/claude-code)** — including this README.
+Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded with [Claude Code](https://claude.com/claude-code), is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-It's a personal side project for SpysyWeeb. It is **not meant for others to use**, but it's available for anyone who wants to try it **at their own risk**.
+*(Yes, the branch name is missing an "e". It's staying that way.)*
 
-Any and all code and features generated in this project are free for others to use. SpysyWeeb can't take credit for the code itself, but if you build on an idea from here, a little credit for the idea would be appreciated. 🙏
+## What it does
 
-## To-Do
+**Lane changes trigger on the turn signal alone** — no steering nudge needed to confirm. With guardrails so it never fires when you didn't mean it:
 
-Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
+- **One auto change per blinker activation.** A second change on the same blinker needs a manual nudge; cycling the blinker re-arms the automatic one.
+- **Braking cancels the automatic change for the whole blinker event.** If you touch the brake with the blinker on, that blinker activation requires a manual nudge — the change will *not* fire the moment you lift off the pedal. Re-arm by cycling the blinker.
 
-- ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control
-- ❌ **Quiet mode**
-- ❌ **Hot-swap button between Chill/Experimental mode**
-- ❌ **Nudgeless lane changes**
-- ❌ **Smooth stops**
-- ❌ **Force Stops**
-- ❌ **Earlier lead takeoffs**
-- ❌ **Better longitudinal tune**
-- ❌ **Replace the "prime" window with a stats window**
-- ❌ **Replace the live on-road view with a different screen showing live stats**
-- ❌ **Get Clip.py working on device with a route viewer**
+*(inspired by sunnypilot)*
+
+## How it works
+
+All in `DesireHelper`. After a short delay (`LANE_CHANGE_NUDGELESS_DELAY`, 0.05 s) in the pre-lane-change state, the change starts as if the driver had nudged — gated by `auto_allowed`, which requires: no auto change already used this blinker event (`nudgeless_used` latch) and no brake press seen this blinker event (`brake_cancelled` latch, set on `brakePressed` and only cleared when the blinker cycles off). Manual torque always works exactly as stock.
+
+## What changed
+
+- `openpilot/selfdrive/controls/lib/desire_helper.py` — the only file: nudgeless auto-start with delay, the one-per-blinker latch, and the brake latch-cancel.
