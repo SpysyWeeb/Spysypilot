@@ -187,8 +187,10 @@ trigger silent in the field, delete the trigger. (Recent duty readings: recovery
     pinned while vEgo stayed 0). 5.0 is the platform's own factory-launch floor;
     pid keeps 3.0, stopping/off keep the gentle 1.0 for brake feathering.
 - **Base tune**: STOP_DISTANCE 6.0→7.0 (owner preference, translates the whole decel
-  plan), doubled gas schedule (A_CRUISE_MAX + opendbc ACCEL_MAX 4.0 + panda +
-  turn-budget `_A_TOTAL_MAX`), aggressive t_follow 1.25→1.00.
+  plan), launch-tapered gas schedule (A_CRUISE_MAX [4.0, 2.4, 1.2, 0.6] at
+  [0, 10, 25, 40] m/s — 2.5×/2×/1.5×/1× stock, full ACCEL_MAX off the line decaying
+  to stock by highway speed; backed by opendbc ACCEL_MAX 4.0 + panda safety bump +
+  turn-budget `_A_TOTAL_MAX` [4.0, 4.0]), aggressive t_follow 1.25→1.00.
 
 ## Verification
 
