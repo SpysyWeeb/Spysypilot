@@ -1,8 +1,8 @@
 """
 Original concept and implementation by SpysyWeeb (github.com/SpysyWeeb).
 
-BLT -- Better Longitudinal Tune. Design doc, history and per-intervention rationale:
-docs/BLT.md (repo root).
+BLoT -- Better Longitudinal Tune (branch: BLoT). Design doc, history and rationale:
+docs/BLoT.md (repo root).
 
 A necessity supervisor over the stock longitudinal MPC. Each frame it computes what
 braking the situation physically requires from the RAW measured lead, then modulates
@@ -11,7 +11,7 @@ the t_follow gap parameter. It never wraps v_cruise and never clamps the control
 output; the solver keeps shaping everything, so intensity stays proportional by
 construction and the behavior is model-independent.
 
-Interventions (see docs/BLT.md for the field data behind each):
+Interventions (see docs/BLoT.md for the field data behind each):
 
   recovery boost   -- plan holds meaningfully more braking than necessity: relax the
                       jerk cost so the solver stops paying rent on stale deceleration.

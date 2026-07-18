@@ -132,7 +132,7 @@ class LongitudinalPlanner:
     if force_slow_decel:
       v_cruise = 0.0
 
-    # BLT necessity supervisor: modulates the solver's own runtime knobs (see docs/BLT.md)
+    # BLT necessity supervisor: modulates the solver's own runtime knobs (see docs/BLoT.md)
     personality = sm['selfdriveState'].personality
     jerk_scale, t_follow_blt = self.blt.update(sm, self.a_desired, get_T_FOLLOW(personality))
     model_leads = sm['modelV2'].leadsV3 if len(sm['modelV2'].leadsV3) > 1 else None
