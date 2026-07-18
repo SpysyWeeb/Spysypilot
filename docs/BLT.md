@@ -162,7 +162,7 @@ trigger silent in the field, delete the trigger. (Recent duty readings: recovery
   companion of the gap credit. The credit bounds what an unconfirmed forecast may
   *plan*, but the bounded creep is too small to flip `get_accel_from_plan`'s stop bit,
   so the brake hold and the ~1.7 s starting-state ramp stayed serialized behind radar
-  confirm anyway. On a sustained (0.4 s), confident forecast of a stopped close lead
+  confirm anyway. On a sustained (0.2 s), confident forecast of a stopped close lead
   launching, the planner clears the MPC stop bit directly — the starting ramp runs
   *during* the anticipation window and hands over at radar confirm. One release per
   forecast episode, 4 s hard cap; a wrong forecast ends in a human-like inch-and-hold

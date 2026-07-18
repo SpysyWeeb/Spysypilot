@@ -24,7 +24,10 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 LEAD_LAUNCH_FORECAST_V = 1.0   # m/s, leadsV3 2s-out predicted lead speed that reads as committed
                                # launch intent (real launches onset at 1.4-3.8 in field data)
 LEAD_LAUNCH_FORECAST_OFF = 0.5 # forecast-episode-over hysteresis (re-arms the one-shot)
-LEAD_LAUNCH_CONFIRM_S = 0.4    # s, forecast must persist before the hold releases
+LEAD_LAUNCH_CONFIRM_S = 0.2    # s, forecast must persist before the hold releases (0.4 at first
+                               # ship; halved after the 14-route census showed 61/64 releases were
+                               # genuine launches and the 3 false ones self-terminated in <1s --
+                               # the forecast is precise enough to commit to sooner)
 LEAD_LAUNCH_MAX_S = 4.0        # s, hard cap on one anticipatory release (radar confirms within
                                # 1.3-2.9s of forecast on every observed real launch)
 
