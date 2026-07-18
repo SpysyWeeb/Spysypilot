@@ -64,25 +64,28 @@ LEAD_PULLAWAY_VREL = 0.5    # m/s, radar says the lead is genuinely pulling away
 LEAD_PULLAWAY_ABRAKE = -0.5 # ...and not braking: floor the model's prediction with the radar
                             # (SpysyWeeb's pull-away fix, as adopted by IQPilot -- guards phantom
                             # launch braking when the model's prediction lags a real pull-away)
-LAUNCH_CONFIRM_VLEAD = 0.3  # m/s, radar-measured lead speed below this = not yet confirmed moving
-LAUNCH_GATE_EGO_V = 2.0     # m/s, only relevant near a stop -- ordinary following applies once rolling
-LAUNCH_GATE_DIST = 8.0      # m, close-range launch scenarios only -- mirror of the pull-away floor
-                            # above, opposite direction: caps the model's prediction instead of
-                            # flooring it (route 55: NewLeadMpc's own predicted trajectory forecast
-                            # a launch 3s before radar confirmed any lead motion, closing a 3.6m
-                            # stopped gap to 1.8m before the lead's real launch caught up)
-LAUNCH_CREDIT_X = 2.0       # m, max future gap-opening an unconfirmed forecast may promise the
-                            # solver -- enough to release the brake hold and begin the standstill
-                            # exit on the model's anticipation (route 5b: the hard stationary clamp
-                            # discarded 2.8s of correct forecast and serialized the ~1.7s starting-
-                            # state ramp AFTER radar confirm instead of overlapping it), but small
-                            # enough that geometry holds if the forecast is wrong: obstacle can
-                            # exceed the stationary continuation by at most this + the v-credit
-                            # term, which stays inside the desired gap (STOP_DISTANCE alone is 7m)
-                            # at any stopped-lead range the gate admits -- route 55's false-launch
-                            # replay: worst-case creep of ~1m, then the distance cost holds
-LAUNCH_CREDIT_V = 1.0       # m/s, matching cap on predicted lead speed while unconfirmed (bounds
-                            # the stopped-equivalence term to v^2/(2*COMFORT_BRAKE) = 0.2m)
+# --- forecast trust ledger (launch guard v3; replaces the confirm-gated gap credit) ---
+# The model's forecast is trusted FULLY by default -- stock PR #37824 behavior, no radar
+# gatekeeping, no confirm threshold. Radar is the AUDITOR instead: every frame the model's
+# promised near-term lead acceleration is compared against what radar actually measured,
+# and broken promises accrue debt that smoothly blends the obstacle back toward the
+# radar's constant-velocity continuation. Promises that verify (or stop being made) pay
+# the debt down fast. Net: zero lag when the model is right (launches, creeps, ping-pong
+# leads all corroborate continuously), and a persistently wrong forecast (route 55: launch
+# predicted 3s before any motion) can only spend a bounded ~0.5s of optimism before the
+# obstacle collapses to what radar can vouch for -- a tapering ease, not a slam.
+TRUST_DEADBAND = 0.3   # m/s^2, promised-minus-measured lead accel below this never accrues
+                       # (stationary aLeadK noise measured at +/-0.08; mild model lead is fine)
+TRUST_DEBT_FULL = 0.8  # m/s of promised-but-unrealized lead speed at which trust hits zero
+                       # (a 2 m/s^2 launch promise with a motionless lead zeroes out in ~0.5s)
+TRUST_PAYDOWN = 2.5    # m/s per s, debt decay while the model has stopped over-promising
+TRUST_CORROB_VLEAD = 0.3   # m/s, radar-measured lead speed that vouches for a launch forecast
+TRUST_CORROB_ALEAD = 0.4   # m/s^2, radar-measured lead accel that vouches for it early
+TRUST_RECOVER_TAU = 0.12   # s, exponential debt decay once radar corroborates real motion --
+                           # the launch is verified, forgive the early promise fast (~0.3s to
+                           # full trust; replay showed accel-gated paydown lagged the credit
+                           # guard at the exact moment the lead genuinely launched)
+TRUST_SWAP_JUMP = 3.0  # m, frame-to-frame dRel step that reads as a track swap: reset ledger
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -238,6 +241,36 @@ def gen_long_ocp():
   return ocp
 
 
+class LeadTrustLedger:
+  """Per-lead forecast accountability: integrates promised-but-unmeasured lead
+  acceleration into debt, maps debt to a trust factor in [0, 1]. Unauditable frames
+  (no model lead, unconfident model, no radar track, track swap) reset to full trust --
+  a fresh situation gets stock PR behavior and earns distrust only by breaking promises."""
+  def __init__(self):
+    self.debt = 0.0
+    self.prev_drel = None
+
+  def update(self, model_lead, radar_lead, dt):
+    auditable = (model_lead is not None and model_lead.prob > 0.5 and radar_lead.status
+                 and len(model_lead.v) > 1
+                 and (self.prev_drel is None or abs(float(radar_lead.dRel) - self.prev_drel) < TRUST_SWAP_JUMP))
+    if not auditable:
+      self.debt = 0.0
+    else:
+      pred_a = (float(model_lead.v[1]) - float(model_lead.v[0])) / 2.0
+      shortfall = pred_a - float(radar_lead.aLeadK)
+      corroborated = (float(radar_lead.vLead) > TRUST_CORROB_VLEAD
+                      or float(radar_lead.aLeadK) > TRUST_CORROB_ALEAD)
+      if corroborated:
+        self.debt *= np.exp(-dt / TRUST_RECOVER_TAU)
+      elif shortfall > TRUST_DEADBAND:
+        self.debt = min(self.debt + (shortfall - TRUST_DEADBAND) * dt, TRUST_DEBT_FULL)
+      else:
+        self.debt = max(self.debt - TRUST_PAYDOWN * dt, 0.0)
+    self.prev_drel = float(radar_lead.dRel) if radar_lead.status else None
+    return 1.0 - self.debt / TRUST_DEBT_FULL
+
+
 class LongitudinalMpc:
   def __init__(self, dt=DT_MDL):
     self.dt = dt
@@ -266,6 +299,7 @@ class LongitudinalMpc:
 
     self.last_cloudlog_t = 0
     self.crash_cnt = 0.0
+    self.lead0_trust = LeadTrustLedger()
     self.solution_status = 0
     # timers
     self.solve_time = 0.0
@@ -309,7 +343,7 @@ class LongitudinalMpc:
         self.solver.set(i, 'x', self.x0)
 
   @staticmethod
-  def process_lead_model(model_lead, radar_lead, v_ego):
+  def process_lead_model(model_lead, radar_lead, v_ego, trust=1.0):
     """NewLeadMpc (upstream PR #37824, via IQPilot): feed the solver the driving model's full
     predicted lead trajectory instead of a kinematic extrapolation of the current radar state.
     The model anticipates launches and slowdowns from vision seconds before the radar can
@@ -333,30 +367,20 @@ class LongitudinalMpc:
 
     x_lead_mpc = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead_traj))
     v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
+    if trust < 1.0:
+      # trust ledger blend: bill the forecast for its unverified optimism -- fall back
+      # smoothly toward the radar's constant-velocity continuation (same reference the
+      # pull-away floor uses). Anchored at the (crash-lifted) h=0 point, so h=0 is
+      # untouched; only the promised FUTURE is haircut
+      v_cont = max(float(radar_lead.vLead), 0.0)
+      x_cont = x_lead_mpc[0] + v_cont * T_IDXS
+      x_lead_mpc = trust * x_lead_mpc + (1.0 - trust) * x_cont
+      v_lead_mpc = trust * v_lead_mpc + (1.0 - trust) * v_cont
     if radar_lead.status and radar_lead.vRel > LEAD_PULLAWAY_VREL and radar_lead.aLeadK > LEAD_PULLAWAY_ABRAKE:
       # lead measurably pulling away and not braking: never predict it slower/closer than
       # a constant-velocity radar continuation (phantom launch-braking guard)
       v_lead_mpc = np.maximum(v_lead_mpc, float(radar_lead.vLead))
       x_lead_mpc = np.maximum(x_lead_mpc, float(radar_lead.dRel) + float(radar_lead.vLead) * T_IDXS)
-    if model_lead is not None and model_lead.prob > 0.5 and v_ego < LAUNCH_GATE_EGO_V \
-            and radar_lead.status and radar_lead.dRel < LAUNCH_GATE_DIST \
-            and radar_lead.vLead < LAUNCH_CONFIRM_VLEAD:
-      # lead not radar-confirmed as moving yet: the forecast passes through, but capped at a
-      # small bounded gap credit over the stationary radar continuation (phantom launch-
-      # acceleration guard, v2). The solver plans against the whole horizon, so an unbounded
-      # forecast can promise 10s of gap-opening and buy real acceleration toward a lead that
-      # never moves (route 55: 3.6m closed to 1.8m); a hard stationary clamp fixes that but
-      # discards seconds of correct anticipation on every real launch (route 5b). The credit
-      # is the middle: brake release + creep start on the forecast, while geometry (desired
-      # gap >= STOP_DISTANCE) absorbs the whole credit if the forecast is wrong. Releases
-      # fully the instant radar crosses the confirm threshold. Gated on the SAME model.prob
-      # trust threshold that selects the real-trajectory branch above -- without it, a low-
-      # confidence model read (radar clutter the model itself doesn't believe, route-20
-      # regression check: prob 0.05-0.26) still dragged the fake-fast-lead fallback's
-      # deliberately-far obstacle back down to noisy, untrusted radar chatter
-      v_meas = max(float(radar_lead.vLead), 0.0)
-      v_lead_mpc = np.minimum(v_lead_mpc, v_meas + LAUNCH_CREDIT_V)
-      x_lead_mpc = np.minimum(x_lead_mpc, float(radar_lead.dRel) + LAUNCH_CREDIT_X + v_meas * T_IDXS)
     return np.column_stack((x_lead_mpc, v_lead_mpc))
 
   def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard,
@@ -367,7 +391,8 @@ class LongitudinalMpc:
 
     ml0 = model_leads[0] if model_leads is not None else None
     ml1 = model_leads[1] if model_leads is not None else None
-    lead_xv_0 = self.process_lead_model(ml0, radarstate.leadOne, v_ego)
+    trust0 = self.lead0_trust.update(ml0, radarstate.leadOne, self.dt)
+    lead_xv_0 = self.process_lead_model(ml0, radarstate.leadOne, v_ego, trust=trust0)
     lead_xv_1 = self.process_lead_model(ml1, radarstate.leadTwo, v_ego)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
