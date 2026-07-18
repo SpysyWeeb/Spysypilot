@@ -6,6 +6,9 @@ requires; hard braking held no longer than necessary; and the fix must work rega
 of which driving model is running. That last constraint fixes the architecture: BLT
 tunes and supervises the **radar + MPC leg** of the planner (which runs identically
 under every model, in both chill and experimental mode) and does not touch the e2e leg.
+(One exception downstream of the planner: the launch chain — see Related machinery —
+extends into longcontrol's starting state and the opendbc CAN limits, equally
+model-agnostic.)
 
 Reference targets, fitted from the owner's manual driving (route 00000035, 19 stops):
 onset at ~2.9 s headway, single application, build ~0.5 m/s^3, plateau −1.4..−1.8
@@ -50,8 +53,9 @@ whole 10 s horizon — was the single biggest "holds the brakes" cause. It no lo
 exists: the MPC now consumes the driving model's predicted lead trajectory directly,
 see "Related machinery" below.)
 
-The remaining ~0.5 s is hydraulic brake bleed on the Palisade (CAN JerkUpperLimit is
-already 3.0 — verified not the bottleneck).
+The remaining ~0.5 s is hydraulic brake bleed on the Palisade (for *release*, the
+pid-state CAN JerkUpperLimit of 3.0 was verified not the bottleneck; the standstill
+exit was a different story — see "Launch chain" under Related machinery).
 
 ### 3. Proportionality — the personality knobs already exist, statically
 
@@ -163,6 +167,25 @@ trigger silent in the field, delete the trigger. (Recent duty readings: recovery
   2.7 s, all in genuine launch-forecast ambiguity or stopped-lead approaches (where
   distrust errs conservative). Fresh/unauditable tracks reset to full trust — a new
   situation gets stock behavior and earns distrust only by breaking promises.
+- **Launch chain** (the "quicker" leg downstream of the ledger — routes 5d/61/63):
+  three layers between "the plan wants to go" and "the wheels move".
+  - *Proportional starting command* (`longcontrol.py`): the starting state issues
+    `clip(a_target, START_ACCEL_MIN, startAccel)` — the plan drives the launch and
+    `startAccel` is a **ceiling**, not the value. a_target already scales with the
+    situation (~0.1 for a lead that hasn't moved yet, 0.5–0.9 for a hesitant
+    roll-away, 2+ for a committed launch); the stock fixed command blasted full
+    startAccel at every standstill exit and the safety guard then caught it
+    (route 63: lunge-and-catch on every slow lead). START_ACCEL_MIN 0.6 floors it —
+    always enough to roll off brake bleed and reach vEgoStarting, a nudge rather
+    than a lunge when the plan doesn't believe in the launch yet.
+  - *startAccel 1.0 → 1.5* (opendbc `interface.py`): firmer ceiling off the line;
+    pid takes over at vEgoStarting (0.1 m/s), so the exposure window is only the
+    first ~0.1 m/s.
+  - *Starting-state CAN JerkUpperLimit 1.0 → 5.0* (opendbc `carcontroller.py`): the
+    real standstill-exit gate — at the stock 1.0 the car took ~1.4 s to physically
+    deliver startAccel against brake bleed (field-measured, routes 5d/61: accCmd
+    pinned while vEgo stayed 0). 5.0 is the platform's own factory-launch floor;
+    pid keeps 3.0, stopping/off keep the gentle 1.0 for brake feathering.
 - **Base tune**: STOP_DISTANCE 6.0→7.0 (owner preference, translates the whole decel
   plan), doubled gas schedule (A_CRUISE_MAX + opendbc ACCEL_MAX 4.0 + panda +
   turn-budget `_A_TOTAL_MAX`), aggressive t_follow 1.25→1.00.
