@@ -17,6 +17,7 @@ class DesireHelper:
     self.lane_change_timer = 0.0
     self.lane_change_wait_timer = 0.0
     self.nudgeless_used = False
+    self.brake_cancelled = False
     self.prev_one_blinker = False
     self.desire = log.Desire.none
 
@@ -35,12 +36,14 @@ class DesireHelper:
       self.lane_change_timer = 0.0
       self.lane_change_wait_timer = 0.0
       self.nudgeless_used = False
+      self.brake_cancelled = False
     else:
       if self.lane_change_state == LaneChangeState.off and one_blinker and not self.prev_one_blinker and not below_lane_change_speed:
         self.lane_change_state = LaneChangeState.preLaneChange
         self.lane_change_timer = 0.0
         self.lane_change_wait_timer = 0.0
         self.nudgeless_used = False
+        self.brake_cancelled = False
         # Initialize lane change direction to prevent UI alert flicker
         self.lane_change_direction = self.get_lane_change_direction(carstate)
 
@@ -59,9 +62,13 @@ class DesireHelper:
 
         # Nudgeless fires once per blinker activation; subsequent changes in the same
         # signal require a manual nudge so the car can't keep auto-changing lanes.
-        # Braking also forces a manual nudge, since an auto lane change while the driver
-        # is slowing down isn't something they asked for.
-        auto_allowed = not self.nudgeless_used and not carstate.brakePressed and self.lane_change_wait_timer > LANE_CHANGE_NUDGELESS_DELAY
+        # Braking CANCELS auto for the rest of this blinker event -- not just while the
+        # pedal is down. A driver braking with the blinker on isn't setting up an auto
+        # change, and the change firing the instant they lift the pedal is a surprise;
+        # they can still nudge the wheel to change, or cycle the blinker to re-arm.
+        if carstate.brakePressed:
+          self.brake_cancelled = True
+        auto_allowed = not self.nudgeless_used and not self.brake_cancelled and self.lane_change_wait_timer > LANE_CHANGE_NUDGELESS_DELAY
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
@@ -69,6 +76,7 @@ class DesireHelper:
           self.lane_change_timer = 0.0
           self.lane_change_wait_timer = 0.0
           self.nudgeless_used = False
+          self.brake_cancelled = False
         elif not blindspot_detected and (torque_applied or auto_allowed):
           if auto_allowed:
             self.nudgeless_used = True
