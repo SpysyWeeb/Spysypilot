@@ -17,8 +17,10 @@ from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
-A_CRUISE_MAX_VALS = [3.2, 2.4, 1.6, 1.2]  # Spysypilot: doubled (owner request; requires the
-A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]    # matching ACCEL_MAX=4.0 + panda safety bump in opendbc)
+A_CRUISE_MAX_VALS = [4.0, 2.4, 1.2, 0.6]  # Spysypilot: launch-tapered (owner request) -- full
+A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]    # ACCEL_MAX off the line, decaying to stock by 40 m/s
+                                          # (2.5x/2x/1.5x/1x stock; needs ACCEL_MAX=4.0 + panda
+                                          # safety bump in opendbc, both already in place)
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
@@ -33,7 +35,8 @@ LAUNCH_OPEN_CONFIRM = 0.7   # filtered (RC 0.3s) open level to trust -- ~0.5s of
 LAUNCH_CLOSE_LENGTH = 10.0  # m, path re-collapse below this cancels anticipation (model changed its mind)
 
 # Lookup table for turns
-_A_TOTAL_MAX_V = [3.4, 4.0]  # Spysypilot: raised with the doubled gas schedule -- the old 1.7
+_A_TOTAL_MAX_V = [4.0, 4.0]  # Spysypilot: raised with the gas schedule (low end 3.4 -> 4.0 so the
+                              # total budget never clips the 4.0 launch cap while straight) -- the old 1.7
 _A_TOTAL_MAX_BP = [20., 40.]  # low-speed TOTAL budget re-clipped every launch to 1.7 even driving
                               # straight (route 40 t=830: plan pinned at exactly +1.70 for 8s while
                               # the lead ran away); turns still shed longitudinal authority via a_y
