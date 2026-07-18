@@ -1,25 +1,26 @@
-# Spysypilot
+# smooth-stops
 
-This fork is **entirely vibe-coded using [Claude Code](https://claude.com/claude-code)** — including this README.
+Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded with [Claude Code](https://claude.com/claude-code), is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-It's a personal side project for SpysyWeeb. It is **not meant for others to use**, but it's available for anyone who wants to try it **at their own risk**.
+## What it does
 
-Any and all code and features generated in this project are free for others to use. SpysyWeeb can't take credit for the code itself, but if you build on an idea from here, a little credit for the idea would be appreciated. 🙏
+Kills the **"headbang" at the end of every stop**. Stock openpilot jumps to the `stopping` state the moment the plan's speed drops below `vEgoStopping` and ramps the brake command to −2.0 m/s² *while the car is still rolling* — on the Palisade that lands as a lurch at the very end of an otherwise smooth stop. This branch feathers the brake all the way down to a true standstill and only then hands off to the hold clamp.
 
-## To-Do
+*(personal idea)*
 
-Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
+## How it works
 
-- ⚠️ **Always-On-Lateral (AOL)** — steering can be actuated while not fully engaged with cruise control
-- ❌ **Quiet mode**
-- ❌ **Hot-swap button between Chill/Experimental mode**
-- ❌ **Nudgeless lane changes**
-- ❌ **Smooth stops**
-- ❌ **Force Stops**
-- ⚠️ **Smooth Approach** — when a lead is slowing, commit to the slowdown early (~3 s headway, like a human) via a comfort envelope on v_cruise, so the MPC spreads the braking out instead of the stock watch-then-slam (route 35: watched a lead decelerate for 10 s, then braked −3.5 m/s²); fitted from my own manual braking &nbsp;*(personal idea)*
-- ⚠️ **Smooth Release** — brake releases bleed off as one human-like taper (+0.2 m/s³, fitted from my stops) instead of the plan's pump (brake, let off mid-approach, brake again); braking demands always pass through instantly &nbsp;*(personal idea)*
-- ❌ **Earlier lead takeoffs**
-- ❌ **Better longitudinal tune**
-- ❌ **Replace the "prime" window with a stats window**
-- ❌ **Replace the live on-road view with a different screen showing live stats**
-- ❌ **Get Clip.py working on device with a route viewer**
+A `SmoothStopController` inside longcontrol (control rate, true `v_ego`) owns the final approach:
+
+- **Settle feather** — the braking level you *entered* the stop with fades linearly down to a gentle "kiss" (0.12 m/s²) as v → 0, anchored at entry so there's no step at engagement. Only the settle pressure is feathered — braking demanded by the MPC's plan (which owns collision avoidance) always passes through immediately, so full braking force is never delayed.
+- **Lead awareness** — the settle firms up toward whatever deceleration is needed to stop at least 2.5 m behind a stopped lead, with the term keeping full strength at close range.
+- **Anti-creep ratchet** — if the car stops making progress toward the stop (creep torque holding it at walking pace), pressure ratchets up at 0.5 m/s² per second, escalating up to 4× when the remaining gap to a lead is tight. It stands down while following a genuinely creeping queue (lead moving > 0.3 m/s), so queue-following isn't crushed to a stop.
+- **Clean handoff** — the stopping/hold clamp is only armed once the car is actually stopped (≤ 0.05 m/s or a trusted standstill signal), and once holding, release requires `shouldStop` to stay false for 10 frames so a one-frame plan flicker can't blip the brake at a light.
+
+## What changed
+
+- `openpilot/selfdrive/controls/lib/smooth_stops.py` *(new)* — the `SmoothStopController`: settle feather, lead-gap term, anti-creep ratchet, hold arm/release logic.
+- `openpilot/selfdrive/controls/lib/longcontrol.py` — the stopping-state transition and hold release route through the controller instead of the stock instant clamp.
+- `openpilot/selfdrive/controls/controlsd.py`, `openpilot/selfdrive/controls/radard.py`, `openpilot/selfdrive/controls/lib/longitudinal_planner.py` — wiring: lead distance to the controller and the hold-release path.
+
+History note: this branch once also carried Smooth Approach / Smooth Release wrappers for braking further out; those were retired in favor of the [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/tree/BLoT) supervisor, which drives the MPC's own knobs instead of wrapping its output. This branch is now the stop-landing piece only.
