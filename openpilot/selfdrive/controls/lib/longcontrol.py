@@ -7,6 +7,10 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
+START_ACCEL_MIN = 0.6  # m/s^2, floor on the proportional starting command -- enough to always
+                       # roll the car off brake bleed and reach vEgoStarting, gentle enough that
+                       # a launch the plan doesn't believe in yet is a nudge, not a lunge
+
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
 
@@ -76,7 +80,13 @@ class LongControl:
       self.reset()
 
     elif self.long_control_state == LongCtrlState.starting:
-      output_accel = self.CP.startAccel
+      # Spysypilot: the plan drives the launch; startAccel is the CEILING, not the value.
+      # aTarget already scales with the situation (lead forecast + gap credit + MPC:
+      # ~0.1 for a lead that hasn't moved yet, 0.5-0.9 for a hesitant roll-away, 2+ for
+      # a committed launch; e2e launch assist covers no-lead greens) -- the stock fixed
+      # command blasted full startAccel at every exit regardless, then the guard caught
+      # it (route 63: lunge-and-catch on every slow lead)
+      output_accel = float(np.clip(a_target, START_ACCEL_MIN, self.CP.startAccel))
       self.reset()
 
     else:  # LongCtrlState.pid
