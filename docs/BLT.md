@@ -148,26 +148,21 @@ trigger silent in the field, delete the trigger. (Recent duty readings: recovery
 - **Pull-away floor** (`LEAD_PULLAWAY_*`): radar says the lead is genuinely receding
   and not braking → never predict it slower/closer than a constant-velocity radar
   continuation (phantom launch-braking guard).
-- **Launch-confirm gap credit** (`LAUNCH_CONFIRM_*` / `LAUNCH_CREDIT_*`, routes 55 +
-  5b): near a stop, an unconfirmed model-forecast launch passes through capped at a
-  small bounded gap credit (+2m x, +1 m/s v) over the radar's stationary continuation,
-  until radar confirms the lead actually moving. The credit lets brake release and the
-  standstill exit begin on the model's anticipation (v1's hard stationary clamp
-  discarded ~2.8 s of correct forecast per launch and serialized the ~1.7 s
-  starting-state ramp behind radar confirm), while geometry absorbs a wrong forecast:
-  the credit can never open the obstacle past the desired standstill gap at the ranges
-  the gate admits — route 55's false launch replays to a ~1 m creep-and-hold. Gated on
-  the same model-confidence threshold that selects the real-trajectory branch.
-- **Lead-launch anticipation** (`LEAD_LAUNCH_*`, planner, route 5d): the hold-release
-  companion of the gap credit. The credit bounds what an unconfirmed forecast may
-  *plan*, but the bounded creep is too small to flip `get_accel_from_plan`'s stop bit,
-  so the brake hold and the ~1.7 s starting-state ramp stayed serialized behind radar
-  confirm anyway. On a sustained (0.2 s), confident forecast of a stopped close lead
-  launching, the planner clears the MPC stop bit directly — the starting ramp runs
-  *during* the anticipation window and hands over at radar confirm. One release per
-  forecast episode, 4 s hard cap; a wrong forecast ends in a human-like inch-and-hold
-  because the credit pins aTarget negative inside the desired gap. Field census over
-  the 14-route set: 64 releases, 61 handed to a confirmed launch, 3 false (0.4-1.0 s).
+- **Forecast trust ledger** (`TRUST_*`, routes 55/5b/5d/61/64 — launch guard v3,
+  replaces both the confirm-gated gap credit and the planner's lead-launch
+  anticipation machine): the model's forecast is trusted fully by default (stock PR
+  behavior, no radar gatekeeping), and radar is the *auditor* — promised-but-unmeasured
+  lead acceleration accrues debt that smoothly blends the obstacle toward the radar's
+  constant-velocity continuation; radar-corroborated motion (vLead > 0.3 or aLeadK >
+  0.4) pays debt down in ~0.3 s. Net: zero lag when the model is right (launches,
+  creeps, ping-pong leads corroborate continuously), and a persistently wrong forecast
+  can spend only ~0.5 s of optimism before easing off — a taper, not a slam. Replay
+  library: route 55 ends up *safer* than the credit (slack more negative throughout
+  the false window); route 61's creep-restop pays no confirmation tax on any swing;
+  14-route census: trust < 0.99 on 1.6% of lead-frames, longest low-trust episode
+  2.7 s, all in genuine launch-forecast ambiguity or stopped-lead approaches (where
+  distrust errs conservative). Fresh/unauditable tracks reset to full trust — a new
+  situation gets stock behavior and earns distrust only by breaking promises.
 - **Base tune**: STOP_DISTANCE 6.0→7.0 (owner preference, translates the whole decel
   plan), doubled gas schedule (A_CRUISE_MAX + opendbc ACCEL_MAX 4.0 + panda +
   turn-budget `_A_TOTAL_MAX`), aggressive t_follow 1.25→1.00.
