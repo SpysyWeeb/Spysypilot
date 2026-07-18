@@ -1,7 +1,7 @@
 """Unit tests for the BLT necessity supervisor (selfdrive/controls/lib/blt.py).
 
 These lock in the behavior that was originally validated by replaying the real class
-against recorded routes (see docs/BLT.md): trigger arm/disarm semantics, debounce
+against recorded routes (see docs/BLoT.md): trigger arm/disarm semantics, debounce
 times, hysteresis holds, the whiplash ratchet, the emergency stand-down, and slew
 continuity. Scenario numbers are chosen to isolate one mechanism at a time -- each
 test states which gates the other mechanisms are held clear of.

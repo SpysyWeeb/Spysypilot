@@ -1,4 +1,4 @@
-# BLT — Better Longitudinal Tune
+# BLoT — Better Longitudinal Tune (branch renamed from BLT 2026-07-17 to free the acronym; BLaT = Better Lateral Tune)
 
 Goal, in the owner's words: braking events start smooth, peak around the middle of the
 event, then release naturally; intensity proportional to what the situation actually
