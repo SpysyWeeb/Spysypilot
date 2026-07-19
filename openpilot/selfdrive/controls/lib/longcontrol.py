@@ -72,7 +72,10 @@ class LongControl:
     # (stopping state) only arms once we're actually stopped, so it never headbangs.
     # starting is exempt: if the lead re-stops mid-launch, take the stock path (immediate
     # stopping) rather than keep commanding startAccel toward a stopped lead.
-    if active and self.long_control_state not in (LongCtrlState.stopping, LongCtrlState.starting):
+    # off is exempt too: engaging while already rolling into a stop must take the stock
+    # off->stopping edge -- deferring the hold there reads as "not stopping" to the state
+    # machine and blips startAccel for a frame before stopping catches it.
+    if active and self.long_control_state == LongCtrlState.pid:
       stop_now = self.smooth.want_hold(should_stop, CS.vEgo, CS.standstill)
     elif active and self.long_control_state == LongCtrlState.stopping:
       # debounced hold exit: a one-frame should_stop flicker must not blip the brake at standstill
@@ -80,9 +83,15 @@ class LongControl:
     else:
       stop_now = should_stop
 
+    prev_state = self.long_control_state
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
                                                        stop_now, CS.brakePressed,
                                                        CS.cruiseState.standstill)
+    if self.long_control_state == LongCtrlState.stopping and prev_state != LongCtrlState.stopping:
+      # every entry into the hold gets a fresh release debounce -- the stock edges
+      # (off/starting -> stopping) bypass want_hold, and a stale counter from the previous
+      # stop would let a one-frame should_stop flicker release the hold instantly
+      self.smooth.arm_hold()
     if self.long_control_state == LongCtrlState.off:
       self.reset()
       self.smooth.reset()
