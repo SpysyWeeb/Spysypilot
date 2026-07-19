@@ -149,24 +149,18 @@ trigger silent in the field, delete the trigger. (Recent duty readings: recovery
   lead input is the model's predicted `leadsV3` trajectory anchored to radar's h=0
   measurement — the single deepest lead-reaction-time lever in the stack. Always on;
   there is no legacy path anymore.
-- **Pull-away floor** (`LEAD_PULLAWAY_*`): radar says the lead is genuinely receding
-  and not braking → never predict it slower/closer than a constant-velocity radar
-  continuation (phantom launch-braking guard).
-- **Forecast trust ledger** (`TRUST_*`, routes 55/5b/5d/61/64 — launch guard v3,
-  replaces both the confirm-gated gap credit and the planner's lead-launch
-  anticipation machine): the model's forecast is trusted fully by default (stock PR
-  behavior, no radar gatekeeping), and radar is the *auditor* — promised-but-unmeasured
-  lead acceleration accrues debt that smoothly blends the obstacle toward the radar's
-  constant-velocity continuation; radar-corroborated motion (vLead > 0.3 or aLeadK >
-  0.4) pays debt down in ~0.3 s. Net: zero lag when the model is right (launches,
-  creeps, ping-pong leads corroborate continuously), and a persistently wrong forecast
-  can spend only ~0.5 s of optimism before easing off — a taper, not a slam. Replay
-  library: route 55 ends up *safer* than the credit (slack more negative throughout
-  the false window); route 61's creep-restop pays no confirmation tax on any swing;
-  14-route census: trust < 0.99 on 1.6% of lead-frames, longest low-trust episode
-  2.7 s, all in genuine launch-forecast ambiguity or stopped-lead approaches (where
-  distrust errs conservative). Fresh/unauditable tracks reset to full trust — a new
-  situation gets stock behavior and earns distrust only by breaking promises.
+- ~~**Pull-away floor**~~ / ~~**Forecast trust ledger**~~ — **removed 2026-07-18 for a
+  stock-PR A/B field test** (owner request: "back to stock, I want to test stock
+  again"). `process_lead_model` is now the unmodified PR #37824 form: the model's
+  forecast is consumed as-is, no radar floor, no trust haircut. Both interventions —
+  the pull-away floor (phantom launch-braking guard: never predict a measurably
+  receding, non-braking lead slower/closer than radar's constant-velocity
+  continuation) and the trust ledger (launch guard v3: radar-as-auditor debt on
+  promised-but-unmeasured lead acceleration, blending the obstacle toward radar's
+  continuation; validated on routes 55/5b/5d/61/64 + 14-route census) — live intact
+  in git history if the stock test shows they were earning their keep. What the
+  stock test exposes: route-55-style false launch forecasts (the ledger's job) and
+  phantom braking during real pull-aways (the floor's job).
 - **Launch chain** (the "quicker" leg downstream of the ledger — routes 5d/61/63):
   three layers between "the plan wants to go" and "the wheels move".
   - *Proportional starting command* (`longcontrol.py`): the starting state issues

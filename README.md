@@ -13,13 +13,13 @@ Makes braking and acceleration feel like the owner's own driving: commit to slow
 Three cooperating pieces:
 
 - **BLT necessity supervisor** (`blt.py`) — a watchdog that modulates the MPC's per-frame runtime knobs (`jerk_factor`, `t_follow`, an `aLeadTau` floor) instead of overriding its commands. A *recovery boost* relaxes the solver when braking is provably no longer necessary (measured excess, or the model forecasting the lead pulling away), a *launch boost* stiffens response when the plan lags a genuinely accelerating lead, and a *whiplash ratchet* lets stiffness relax at any time but never re-stiffen while the lead is braking toward us. Triggers share a debounced arm/hold/reset primitive (`DebouncedTrigger`).
-- **Forecast trust ledger** (`long_mpc.py`) — the model's lead forecast is trusted fully by default (= stock PR behavior); radar is an *auditor*, not a gatekeeper. A per-frame ledger accrues debt when the forecast promises acceleration the radar-measured lead never delivers, and pays it down exponentially the moment radar corroborates real movement. Trust below 1.0 blends the MPC's lead trajectory toward a radar constant-velocity continuation — so a wrong forecast degrades gracefully (surge–soften–resume) instead of either ignoring radar or slamming the brakes. Kept from the earlier iterations: the radar pull-away floor.
+- **Model-predicted lead trajectories** (`long_mpc.py`) — the MPC plans against the driving model's `leadsV3` forecast, currently in the *unmodified* PR #37824 form: the earlier forecast trust ledger and radar pull-away floor were removed 2026-07-18 for a stock-baseline A/B field test (both preserved in git history; see docs/BLoT.md).
 - **Launch chain** (`longcontrol.py` + opendbc) — the starting state issues a *proportional* command, `clip(a_target, 0.6, startAccel)`, so `startAccel` (raised to 1.5 on the opendbc side, with starting-state jerk limit 5.0) is a ceiling the plan can use, not a fixed shove.
 
 ## What changed
 
 - `openpilot/selfdrive/controls/lib/blt.py` *(new)* — the necessity supervisor and `DebouncedTrigger`.
-- `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` — `LeadTrustLedger`, forecast/radar blend in `process_lead_model`, pull-away floor.
+- `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` — model-predicted lead trajectories (PR #37824, currently stock form — ledger/floor removed for A/B testing), base-tune constants.
 - `openpilot/selfdrive/controls/lib/longitudinal_planner.py` — BLT wiring into the MPC's weights, raised accel limits.
 - `openpilot/selfdrive/controls/lib/longcontrol.py` — proportional starting command.
 - `openpilot/selfdrive/controls/tests/test_blt.py` *(new)* — 24 unit tests on trigger/ratchet/onset semantics.
