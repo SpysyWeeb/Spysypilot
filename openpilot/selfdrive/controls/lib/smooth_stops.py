@@ -60,8 +60,12 @@ class SmoothStopController:
                       just uncomfortable. Only the settle pressure is feathered -- braking
                       demanded by the MPC's plan (which owns collision avoidance) is applied
                       immediately, so full braking force is never delayed.
-    want_hold()    -- arm the stopping/hold clamp only once v_ego is at/below STANDSTILL_SPEED
-                      (or the car reports standstill), so the clamp lands on a stopped car.
+    want_hold()    -- request the stopping/hold clamp only once v_ego is at/below
+                      STANDSTILL_SPEED (or the car reports standstill), so the clamp lands
+                      on a stopped car. Pure query, no state.
+    arm_hold()     -- called by longcontrol on every transition into the stopping state
+                      (including the stock off/starting edges that bypass want_hold), so
+                      the hold always starts with a fresh release debounce.
     hold_release() -- once holding, require should_stop to stay false for HOLD_RELEASE_FRAMES
                       before releasing, so a one-frame plan flicker can't blip the brake.
 
@@ -84,15 +88,19 @@ class SmoothStopController:
     self._entry_decel = 0.0
 
   def want_hold(self, should_stop: bool, v_ego: float, standstill: bool) -> bool:
-    # Arm the stopping/hold clamp only once the car is actually stopped, so it never
+    # Request the stopping/hold clamp only once the car is actually stopped, so it never
     # clamps down while still rolling (the headbang). CS.standstill is only a backstop for
     # a noisy v_ego near zero -- it is NOT trusted to arm the hold while the car is still
     # moving (some cars, incl. the Palisade, assert standstill a hair early), hence the
     # STANDSTILL_HOLD_SPEED ceiling.
-    hold = bool(should_stop and (v_ego <= STANDSTILL_SPEED or (standstill and v_ego <= STANDSTILL_HOLD_SPEED)))
-    if hold:
-      self._no_stop_frames = 0  # arm the hold with a fresh release debounce
-    return hold
+    return bool(should_stop and (v_ego <= STANDSTILL_SPEED or (standstill and v_ego <= STANDSTILL_HOLD_SPEED)))
+
+  def arm_hold(self) -> None:
+    # Fresh release debounce for a new hold. Longcontrol calls this on every transition
+    # into the stopping state -- the stock edges (off/starting -> stopping) never go
+    # through want_hold, and a counter left >= HOLD_RELEASE_FRAMES by the previous stop
+    # would let a one-frame should_stop flicker release the new hold instantly.
+    self._no_stop_frames = 0
 
   def hold_release(self, should_stop: bool) -> bool:
     # Debounce the hold exit: the plan's should_stop can flicker false for a frame while

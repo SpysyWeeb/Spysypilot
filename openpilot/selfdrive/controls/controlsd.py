@@ -117,7 +117,9 @@ class Controls:
     # accel PID loop
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
     radar_lead = self.sm['radarState'].leadOne
-    has_lead = bool(radar_lead.status) and self.sm.valid['radarState']  # don't trust a frozen lead if radard dies
+    # all_checks (alive + freq + valid), not just valid: valid only updates when a message
+    # arrives, so a dead radard would leave the last lead frozen-but-"valid" forever
+    has_lead = bool(radar_lead.status) and self.sm.all_checks(['radarState'])
     actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits,
                                             radar_lead.dRel, has_lead, max(float(radar_lead.vLeadK), 0.0)))
 

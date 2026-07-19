@@ -128,7 +128,6 @@ class LongitudinalPlanner:
     if force_slow_decel:
       v_cruise = 0.0
 
-
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
     self.mpc.update(sm['radarState'], v_cruise, personality=sm['selfdriveState'].personality)
