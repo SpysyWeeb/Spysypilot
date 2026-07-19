@@ -19,35 +19,25 @@ dependencies = [
   "scons",
   "pycapnp==2.1.0",  # 2.2 introduces a memory leak due to cyclic references
   "Cython",
-  "setuptools",
   "numpy >=2.0",
 
   # vendored native dependencies
-  "comma-deps-bzip2",
-  "comma-deps-bootstrap-icons",
   "comma-deps-capnproto",
   "comma-deps-catch2",
   "comma-deps-acados",
   "comma-deps-ffmpeg",
   "comma-deps-zstd",
-  "comma-deps-ncurses",
   "comma-deps-zeromq",
-  "comma-deps-libusb",
   "comma-deps-json11",
   "comma-deps-git-lfs",
   "comma-deps-gcc-arm-none-eabi",
 
-  # body / webrtcd
-  "av",
-  "aiortc",
-
   # logging
   "pyzmq",
   "sentry-sdk",
-  "xattr",  # used in place of 'os.getxattr' for macOS compatibility
 
   # athena
-  "PyJWT",
+  "PyJWT[crypto]",
   "websocket_client",
 
   # joystickd
@@ -68,7 +58,6 @@ dependencies = [
 
 [project.optional-dependencies]
 docs = [
-  "Jinja2",
   "zensical",
 ]
 
@@ -93,15 +82,15 @@ dev = [
 
 tools = [
   "comma-deps-imgui",
+  "comma-deps-bzip2",
+  "comma-deps-bootstrap-icons",
+  "comma-deps-libusb",
+  "comma-deps-ncurses",
 
   # this can be added back once it's stripped down some more
   #"metadrive-simulator @ git+https://github.com/commaai/metadrive.git@minimal ; (platform_machine != 'aarch64')",
 ]
 
-[project.urls]
-Homepage = "https://github.com/commaai/openpilot"
-
-[dependency-groups]
 submodules = [
   "msgq",
   "opendbc",
@@ -109,6 +98,14 @@ submodules = [
   "rednose",
   "teleoprtc",
   "tinygrad",
+]
+
+[project.urls]
+Homepage = "https://github.com/commaai/openpilot"
+
+[dependency-groups]
+standalone = [
+  "openpilot[submodules]",
 ]
 
 [build-system]
@@ -155,33 +152,26 @@ lint.select = [
   "E", "F", "W", "PIE", "C4", "ISC", "A", "B",
   "NPY", # numpy
   "UP",  # pyupgrade
+  "ASYNC",
+  "B904", "B905",
+  "PLC0207",
   "TRY203", "TRY400", "TRY401", # try/excepts
-  "RUF008", "RUF100",
+  "RUF006", "RUF008", "RUF009", "RUF061", "RUF064", "RUF100", "RUF102", "RUF103", "RUF104",
   "TID251",
   "PLE", "PLR1704",
 ]
 lint.ignore = [
   "E741",
   "E402",
-  "C408",
-  "ISC003",
   "B027",
-  "B024",
-  "NPY002",  # new numpy random syntax is worse
-  "UP045", "UP007",  # these don't play nice with raylib atm
+  "UP007",  # this doesn't play nice with raylib atm
 ]
 line-length = 160
-exclude = [
-  "openpilot/cereal",
-  "*.ipynb",
-  "generated",
-]
 lint.flake8-implicit-str-concat.allow-multiline = false
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "pytest.main".msg = "pytest.main requires special handling that is easy to mess up!"
-"unittest".msg = "Use pytest"
-"time.time".msg = "Use time.monotonic"
+"time.time".msg = "Use time.monotonic"  # time.time can skip due to its reference clock, you probably want a monotonic clock
 
 # raylib banned APIs
 "pyray.measure_text_ex".msg = "Use openpilot.system.ui.lib.text_measure"
@@ -207,10 +197,9 @@ not-subscriptable = "ignore" # false positives from dynamic types
 
 [tool.uv]
 python-preference = "only-managed"
-default-groups = ["submodules"]
+default-groups = ["standalone"]
 override-dependencies = [
   "opendbc",  # panda pins opendbc from git for standalone use; always use our submodule
-  "av",       # teleoprtc's av<13 pin is stale
 ]
 
 [tool.uv.sources]

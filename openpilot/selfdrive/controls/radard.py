@@ -27,7 +27,6 @@ LOW_SPEED_LEAD_MIN_CNT = 20  # ~1s at 20Hz: the unconfirmed low-speed override o
                              # approach; clutter and crossing traffic pop into existence at close range
                              # (seen max-braking a stop for a 0.8s ghost 3.6m ahead with modelProb 0.00)
 
-RADAR_TO_CENTER = 2.7   # (deprecated) RADAR is ~ 2.7m ahead from center of car
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
 
@@ -63,13 +62,12 @@ class Track:
     self.K_K = kalman_params.K
     self.kf = KF1D([[v_lead], [0.0]], self.K_A, self.K_C, self.K_K)
 
-  def update(self, d_rel: float, y_rel: float, v_rel: float, v_lead: float, measured: float):
+  def update(self, d_rel: float, y_rel: float, v_rel: float, v_lead: float):
     # relative values, copy
     self.dRel = d_rel   # LONG_DIST
     self.yRel = y_rel   # -LAT_DIST
     self.vRel = v_rel   # REL_SPEED
     self.vLead = v_lead
-    self.measured = measured   # measured or estimate
 
     # computed velocity and accelerations
     if self.cnt > 0:
@@ -95,8 +93,7 @@ class Track:
       "vLeadK": float(self.vLeadK),
       "aLeadK": float(self.aLeadK),
       "aLeadTau": float(self.aLeadTau.x),
-      "status": True,
-      "fcw": self.is_potential_fcw(model_prob),
+      "present": True,
       "modelProb": model_prob,
       "radar": True,
       "radarTrackId": self.identifier,
@@ -108,9 +105,6 @@ class Track:
     # Require track age: vision-confirmed leads bypass this path entirely, so radar alone
     # only gets to declare a close lead for objects it tracked arriving (see LOW_SPEED_LEAD_MIN_CNT)
     return abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (0.75 < self.dRel < 25) and (self.cnt >= LOW_SPEED_LEAD_MIN_CNT)
-
-  def is_potential_fcw(self, model_prob: float):
-    return model_prob > .9
 
   def __str__(self):
     ret = f"x: {self.dRel:4.1f}  y: {self.yRel:4.1f}  v: {self.vRel:4.1f}  a: {self.aLeadK:4.1f}"
@@ -155,9 +149,8 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
     "vLeadK": float(v_ego + lead_v_rel_pred),
     "aLeadK": float(lead_msg.a[0]),
     "aLeadTau": 0.3,
-    "fcw": False,
     "modelProb": float(lead_prob),
-    "status": True,
+    "present": True,
     "radar": False,
     "radarTrackId": -1,
   }
@@ -171,7 +164,7 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
   else:
     track = None
 
-  lead_dict = {'status': False}
+  lead_dict = {'present': False}
   if track is not None:
     lead_dict = track.get_RadarState(lead_prob)
   elif (track is None) and ready and (lead_prob > .5):
@@ -183,7 +176,7 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
       closest_track = min(low_speed_tracks, key=lambda c: c.dRel)
 
       # Only choose new track if it is actually closer than the previous one
-      if (not lead_dict['status']) or (closest_track.dRel < lead_dict['dRel']):
+      if (not lead_dict['present']) or (closest_track.dRel < lead_dict['dRel']):
         lead_dict = closest_track.get_RadarState()
 
   return lead_dict
@@ -215,7 +208,7 @@ class RadarD:
       self.v_ego_hist.append(self.v_ego)
       self.last_v_ego_frame = sm.recv_frame['carState']
 
-    ar_pts = {pt.trackId: [pt.dRel, pt.yRel, pt.vRel, pt.measured] for pt in rr.points}
+    ar_pts = {pt.trackId: [pt.dRel, pt.yRel, pt.vRel] for pt in rr.points}
 
     # *** remove missing points from meta data ***
     for ids in list(self.tracks.keys()):
@@ -232,14 +225,13 @@ class RadarD:
       # create the track if it doesn't exist or it's a new track
       if ids not in self.tracks:
         self.tracks[ids] = Track(ids, v_lead, self.kalman_params)
-      self.tracks[ids].update(rpt[0], rpt[1], rpt[2], v_lead, rpt[3])
+      self.tracks[ids].update(rpt[0], rpt[1], rpt[2], v_lead)
 
     # *** publish radarState ***
     self.radar_state_valid = sm.all_checks()
     self.radar_state = log.RadarState.new_message()
     self.radar_state.mdMonoTime = sm.logMonoTime['modelV2']
     self.radar_state.radarErrors = rr.errors
-    self.radar_state.carStateMonoTime = sm.logMonoTime['carState']
 
     if len(sm['modelV2'].velocity.x):
       model_v_ego = sm['modelV2'].velocity.x[0]
