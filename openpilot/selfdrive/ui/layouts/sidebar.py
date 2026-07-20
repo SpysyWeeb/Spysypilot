@@ -64,7 +64,7 @@ class MetricData:
 class Sidebar(Widget):
   def __init__(self):
     super().__init__()
-    self._net_type = NETWORK_TYPES.get(NetworkType.none)
+    self._net_type = NETWORK_TYPES[NetworkType.none]
     self._net_strength = 0
 
     self._cpu_status = MetricData(tr_noop("CPU"), tr_noop("--°C"), Colors.GOOD)
