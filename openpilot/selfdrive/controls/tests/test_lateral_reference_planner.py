@@ -93,6 +93,7 @@ class TestLateralReferencePlanner:
     planner = LateralReferencePlanner()
     assert planner.update(constant_curvature_model(0.01, speed), 0.0, speed)
     assert planner.get_curvature(0.04, speed, LATERAL_DELAY) == pytest.approx(0.04)
+    assert planner.solution is None
 
   def test_reference_becomes_fully_active_by_15_mph(self):
     outputs = []

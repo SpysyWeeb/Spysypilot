@@ -151,6 +151,9 @@ class LateralReferencePlanner:
     return True
 
   def get_curvature(self, raw_curvature: float, v_ego: float, lateral_delay: float) -> float:
+    if v_ego <= LOW_SPEED_REFERENCE_SPEED and abs(raw_curvature) >= ZERO_LOW_SPEED_CURVATURE:
+      self.reset()
+      return raw_curvature
     if self.solution is None:
       return raw_curvature
 
