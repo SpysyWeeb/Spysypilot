@@ -3,10 +3,6 @@ import pytest
 
 from openpilot.cereal import log
 from openpilot.selfdrive.controls.lib.lateral_reference_planner import (
-  FULL_PLANNER_CURVATURE,
-  FULL_PLANNER_SPEED,
-  PLANNER_RESET_CURVATURE,
-  PLANNER_RESET_SPEED,
   LateralReferencePlanner,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -36,11 +32,11 @@ class TestLateralReferencePlanner:
     assert planner.update(constant_curvature_model(0.0), 0.0, V_EGO)
     assert planner.get_curvature(0.0, V_EGO, LATERAL_DELAY) == pytest.approx(0.0, abs=1e-10)
 
-  @pytest.mark.parametrize("curvature", [-0.01, 0.01])
-  def test_constant_curvature(self, curvature):
+  @pytest.mark.parametrize(("speed", "curvature"), [(3.0, -0.01), (3.0, 0.01), (15.0, 0.002), (30.0, 0.0005)])
+  def test_constant_curvature(self, speed, curvature):
     planner = LateralReferencePlanner()
-    assert planner.update(constant_curvature_model(curvature), 0.0, V_EGO)
-    assert planner.get_curvature(curvature, V_EGO, LATERAL_DELAY) == pytest.approx(curvature, rel=0.02)
+    assert planner.update(constant_curvature_model(curvature, speed), 0.0, speed)
+    assert planner.get_curvature(curvature, speed, LATERAL_DELAY) == pytest.approx(curvature, rel=0.05)
 
   def test_symmetry(self):
     outputs = []
@@ -85,39 +81,52 @@ class TestLateralReferencePlanner:
     assert np.all(np.isfinite(outputs))
     assert np.all(np.diff(outputs) > 0.0)
 
-  def test_speed_blend_and_reset(self):
-    model = constant_curvature_model(0.02)
-    raw_curvature = -0.01
-
+  def test_active_at_highway_speed(self):
+    speed = 30.0
+    future_turn_yaw = np.where(MODEL_T < 0.5, 0.0, speed * 0.001 * (MODEL_T - 0.5))
     planner = LateralReferencePlanner()
-    planner.update(model, 0.0, FULL_PLANNER_SPEED)
-    full_output = planner.get_curvature(raw_curvature, FULL_PLANNER_SPEED, LATERAL_DELAY)
-    assert full_output != pytest.approx(raw_curvature)
+    assert planner.update(build_model(future_turn_yaw, speed), 0.0, speed)
+    assert planner.get_curvature(0.0, speed, LATERAL_DELAY) > 0.0002
 
-    blend_speed = (FULL_PLANNER_SPEED + PLANNER_RESET_SPEED) / 2.0
-    planner.reset()
-    planner.update(model, 0.0, blend_speed)
-    blend_output = planner.get_curvature(raw_curvature, blend_speed, LATERAL_DELAY)
-    assert min(full_output, raw_curvature) < blend_output < max(full_output, raw_curvature)
-
-    assert not planner.update(model, 0.0, PLANNER_RESET_SPEED)
-    assert planner.get_curvature(raw_curvature, PLANNER_RESET_SPEED, LATERAL_DELAY) == raw_curvature
-
-  def test_curvature_blend_and_reset(self):
-    model = constant_curvature_model(0.01)
+  def test_low_speed_sharp_turn_behavior_is_preserved(self):
+    speed = 12.0 * 0.44704
     planner = LateralReferencePlanner()
-    planner.update(model, 0.0, V_EGO)
-    full_output = planner.get_curvature(FULL_PLANNER_CURVATURE, V_EGO, LATERAL_DELAY)
-
-    blend_curvature = (FULL_PLANNER_CURVATURE + PLANNER_RESET_CURVATURE) / 2.0
-    planner.reset()
-    planner.update(model, 0.0, V_EGO)
-    blend_output = planner.get_curvature(blend_curvature, V_EGO, LATERAL_DELAY)
-    assert min(full_output, blend_curvature) < blend_output < max(full_output, blend_curvature)
-
-    planner.update(model, 0.0, V_EGO)
-    assert planner.get_curvature(PLANNER_RESET_CURVATURE, V_EGO, LATERAL_DELAY) == PLANNER_RESET_CURVATURE
+    assert planner.update(constant_curvature_model(0.01, speed), 0.0, speed)
+    assert planner.get_curvature(0.04, speed, LATERAL_DELAY) == pytest.approx(0.04)
     assert planner.solution is None
+
+  def test_reference_becomes_fully_active_by_15_mph(self):
+    outputs = []
+    for speed_mph in (12.0, 13.5, 15.0):
+      speed = speed_mph * 0.44704
+      planner = LateralReferencePlanner()
+      assert planner.update(constant_curvature_model(0.01, speed), 0.0, speed)
+      outputs.append(planner.get_curvature(0.04, speed, LATERAL_DELAY))
+
+    assert outputs[0] == pytest.approx(0.04)
+    assert outputs[0] > outputs[1] > outputs[2]
+    assert outputs[2] == pytest.approx(0.01, rel=0.05)
+
+  def test_speed_scaled_replan_responds_immediately(self):
+    lateral_accel = 0.6
+    for speed in (3.0, 10.0, 20.0, 30.0):
+      curvature = lateral_accel / speed**2
+      planner = LateralReferencePlanner()
+      planner.update(constant_curvature_model(curvature, speed), 0.0, speed)
+      old_output = planner.get_curvature(curvature, speed, LATERAL_DELAY)
+      for _ in range(4):
+        planner.get_curvature(curvature, speed, LATERAL_DELAY)
+
+      planner.update(constant_curvature_model(-curvature, speed), 0.0, speed)
+      new_output = planner.get_curvature(-curvature, speed, LATERAL_DELAY)
+      assert new_output < 0.0
+      assert abs(new_output - old_output) * speed**2 > 0.5
+
+  @pytest.mark.parametrize(("speed", "curvature"), [(30.0, 0.02), (20.0, 0.03), (3.0, 0.3)])
+  def test_unphysical_solution_falls_back(self, speed, curvature):
+    planner = LateralReferencePlanner()
+    assert not planner.update(constant_curvature_model(curvature, speed), 0.0, speed)
+    assert planner.get_curvature(curvature, speed, LATERAL_DELAY) == curvature
 
   @pytest.mark.parametrize("malformed", ["empty", "nan"])
   def test_invalid_model_falls_back(self, malformed):
