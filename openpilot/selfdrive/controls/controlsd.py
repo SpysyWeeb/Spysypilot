@@ -31,6 +31,14 @@ LaneChangeDirection = log.LaneChangeDirection
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
 
+def get_steer_limited_by_safety(CP, CC, CO) -> bool:
+  if not CC.latActive:
+    return False
+  if CP.steerControlType == car.CarParams.SteerControlType.angle:
+    return abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > STEER_ANGLE_SATURATION_THRESHOLD
+  return abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
+
+
 class Controls:
   def __init__(self) -> None:
     self.params = Params()
@@ -194,13 +202,8 @@ class Controls:
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    if self.sm['selfdriveState'].active:
-      CO = self.sm['carOutput']
-      if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
-        self.steer_limited_by_safety = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
-                                              STEER_ANGLE_SATURATION_THRESHOLD
-      else:
-        self.steer_limited_by_safety = abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
+    # AOL can steer while selfdriveState is inactive. Keep limiter feedback live whenever lateral control is active.
+    self.steer_limited_by_safety = get_steer_limited_by_safety(self.CP, CC, self.sm['carOutput'])
 
     # TODO: both controlsState and carControl valids should be set by
     #       sm.all_checks(), but this creates a circular dependency
