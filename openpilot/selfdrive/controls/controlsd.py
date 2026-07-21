@@ -18,6 +18,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
+from openpilot.selfdrive.controls.lib.lateral_reference_planner import LateralReferencePlanner
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
@@ -49,6 +50,7 @@ class Controls:
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.lateral_reference_planner = LateralReferencePlanner(DT_CTRL)
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -128,14 +130,20 @@ class Controls:
     actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits,
                                             radar_lead.dRel, has_lead, max(float(radar_lead.vLeadK), 0.0)))
 
-    # Steering PID loop and lateral MPC
+    # Steering PID loop and future-aware lateral reference planner
     # Reset desired curvature to current to avoid violating the limits on engage
+    lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
     if self.sm.valid['lateralManeuverPlan']:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
+      self.lateral_reference_planner.reset()
     else:
-      new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      raw_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      if not CC.latActive or not self.sm.valid['modelV2']:
+        self.lateral_reference_planner.reset()
+      elif self.sm.updated['modelV2']:
+        self.lateral_reference_planner.update(model_v2, self.curvature, CS.vEgo)
+      new_desired_curvature = self.lateral_reference_planner.get_curvature(raw_desired_curvature, CS.vEgo, lat_delay)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
-    lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
