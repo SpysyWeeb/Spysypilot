@@ -124,7 +124,7 @@ class SoftwareLayout(Widget):
           self._auto_fetch_pending = False
           self._waiting_for_updater = True
           self._waiting_start_ts = time.monotonic()
-          subprocess.run("pkill -SIGHUP -f openpilot.system.updated.updated", shell=True)
+          subprocess.run(["pkill", "-SIGHUP", "-f", "openpilot.system.updated.updated"], check=False)
       else:
         last_update = ui_state.params.get("LastUpdateTime")
         if last_update:
