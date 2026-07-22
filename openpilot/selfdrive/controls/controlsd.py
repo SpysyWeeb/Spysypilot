@@ -179,15 +179,17 @@ class Controls:
     if self.CP.lateralTuning.which() == 'torque':
       reference_log = self.lateral_reference_planner.diagnostics
       lac_log.referenceVersion = reference_log.version
-      lac_log.referenceBaseCurvature = reference_log.base_curvature
-      lac_log.referenceOutputCurvature = reference_log.output_curvature
-      lac_log.referencePreviewTime = reference_log.sample_time
-      lac_log.referencePreviewExtraTime = reference_log.extra_time
-      lac_log.referenceTargetTorque = reference_log.target_torque
-      lac_log.referenceAppliedTorque = reference_log.applied_torque
-      lac_log.referenceUnwindScale = reference_log.unwind_scale
-      lac_log.referenceAuthorityRestored = reference_log.authority_restored
-      lac_log.referencePreviewCorrection = reference_log.preview_correction
+      # np.interp/np.clip may return NumPy scalar types, which pycapnp refuses.
+      # Convert every planner diagnostic at the cereal boundary.
+      lac_log.referenceBaseCurvature = float(reference_log.base_curvature)
+      lac_log.referenceOutputCurvature = float(reference_log.output_curvature)
+      lac_log.referencePreviewTime = float(reference_log.sample_time)
+      lac_log.referencePreviewExtraTime = float(reference_log.extra_time)
+      lac_log.referenceTargetTorque = float(reference_log.target_torque)
+      lac_log.referenceAppliedTorque = float(reference_log.applied_torque)
+      lac_log.referenceUnwindScale = float(reference_log.unwind_scale)
+      lac_log.referenceAuthorityRestored = float(reference_log.authority_restored)
+      lac_log.referencePreviewCorrection = float(reference_log.preview_correction)
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
