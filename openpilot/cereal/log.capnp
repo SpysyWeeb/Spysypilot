@@ -900,6 +900,16 @@ struct ControlsState @0x97ff69c53601abf1 {
     speedProjectionCorrection @21 :Float32;    # projected minus current-speed feedforward reference, m/s^2
     longitudinalLateralAccelRate @22 :Float32; # excluded 2*v*a*kappa measurement-rate component, m/s^3
     rateBrakeSpeedScale @23 :Float32;          # speed-only portion of the all-speed rate-brake gate
+    referenceVersion @24 :Int32;               # future-path reference implementation version
+    referenceBaseCurvature @25 :Float32;       # legacy fixed-delay trajectory sample, 1/m
+    referenceOutputCurvature @26 :Float32;     # actuator-aware path reference before clip_curvature, 1/m
+    referencePreviewTime @27 :Float32;         # total model-horizon sample time, seconds
+    referencePreviewExtraTime @28 :Float32;    # actuator-delivery addition to fixed preview, seconds
+    referenceTargetTorque @29 :Float32;        # normalized torque estimated for the selected future path
+    referenceAppliedTorque @30 :Float32;       # normalized torque delivered by carcontroller last cycle
+    referenceUnwindScale @31 :Float32;         # path-phase confidence that the selected reference is unwinding
+    referenceAuthorityRestored @32 :Float32;   # turn strength restored over smoothed path, m/s^2
+    referencePreviewCorrection @33 :Float32;   # output minus legacy reference, m/s^2
    }
 
   struct LateralAngleState {
