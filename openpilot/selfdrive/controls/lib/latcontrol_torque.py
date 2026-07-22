@@ -36,7 +36,7 @@ MEASUREMENT_RATE_BRAKE_MAX = 0.16  # m/s^2
 MEASUREMENT_RATE_BRAKE_OPPOSING_FULL = 0.15  # m/s^2 of controller demand opposing wheel motion
 MEASUREMENT_RATE_BRAKE_FULL_SPEED = 12.0 * CV.MPH_TO_MS
 MEASUREMENT_RATE_BRAKE_ZERO_SPEED = 15.0 * CV.MPH_TO_MS
-VERSION = 4
+VERSION = 5
 
 
 def smoothstep(value: float) -> float:
@@ -151,8 +151,12 @@ class LatControlTorque(LatControl):
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
       rate_brake = 0.0
       rate_brake_scale = 0.0
-      rate_brake_allowed = self.measurement_rate_brake_enabled and not steer_limited_by_safety and not CS.steeringPressed \
-                           and CS.vEgo < MEASUREMENT_RATE_BRAKE_ZERO_SPEED
+      # The requested/applied torque gap represented by steer_limited_by_safety
+      # is expected while Hyundai's downstream rate limiter catches up. Gating
+      # on that gap suppresses rate feedback through nearly the entire release,
+      # so leave downstream actuator limits authoritative and only suppress for
+      # a real driver override or outside the analyzed speed band.
+      rate_brake_allowed = self.measurement_rate_brake_enabled and not CS.steeringPressed and CS.vEgo < MEASUREMENT_RATE_BRAKE_ZERO_SPEED
       if rate_brake_allowed:
         # Get the undamped command without moving the integrator, then add rate
         # feedback only when that command is already braking the measured motion.
