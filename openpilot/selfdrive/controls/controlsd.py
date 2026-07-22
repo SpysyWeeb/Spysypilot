@@ -18,7 +18,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
-from openpilot.selfdrive.controls.lib.lateral_reference_planner import LateralReferencePlanner
+from openpilot.selfdrive.controls.lib.lateral_reference_planner import ActuatorPreviewConfig, LateralReferencePlanner
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
@@ -74,6 +74,18 @@ class Controls:
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.CP.lateralTuning.which() == 'torque':
       self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
+
+    # BLaT's actuator-aware path timing is currently calibrated from the
+    # Hyundai controller limits. Keep every other platform on the legacy path
+    # reference until its delivery limits have been measured independently.
+    if self.CP.brand == "hyundai" and self.CP.lateralTuning.which() == 'torque':
+      hyundai_params = self.CI.CC.params
+      self.lateral_reference_planner.configure_actuator(ActuatorPreviewConfig(
+        max_torque=hyundai_params.STEER_MAX,
+        delta_up=hyundai_params.STEER_DELTA_UP,
+        delta_down=hyundai_params.STEER_DELTA_DOWN,
+        steer_step=hyundai_params.STEER_STEP,
+      ))
 
     self.controls_ext = ControlsExt()
 
@@ -150,13 +162,32 @@ class Controls:
         self.lateral_reference_planner.reset()
       elif self.sm.updated['modelV2']:
         self.lateral_reference_planner.update(model_v2, self.curvature, CS.vEgo)
-      new_desired_curvature = self.lateral_reference_planner.get_curvature(raw_desired_curvature, CS.vEgo, lat_delay)
+      if self.CP.lateralTuning.which() == 'torque':
+        applied_torque = self.sm['carOutput'].actuatorsOutput.torque
+        new_desired_curvature = self.lateral_reference_planner.get_curvature(
+          raw_desired_curvature, CS.vEgo, lat_delay, applied_torque,
+          self.LaC.torque_params.latAccelFactor, self.LaC.torque_params.friction,
+        )
+      else:
+        new_desired_curvature = self.lateral_reference_planner.get_curvature(raw_desired_curvature, CS.vEgo, lat_delay)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                      self.steer_limited_by_safety, self.desired_curvature,
                                                      curvature_limited, lat_delay)
+    if self.CP.lateralTuning.which() == 'torque':
+      reference_log = self.lateral_reference_planner.diagnostics
+      lac_log.referenceVersion = reference_log.version
+      lac_log.referenceBaseCurvature = reference_log.base_curvature
+      lac_log.referenceOutputCurvature = reference_log.output_curvature
+      lac_log.referencePreviewTime = reference_log.sample_time
+      lac_log.referencePreviewExtraTime = reference_log.extra_time
+      lac_log.referenceTargetTorque = reference_log.target_torque
+      lac_log.referenceAppliedTorque = reference_log.applied_torque
+      lac_log.referenceUnwindScale = reference_log.unwind_scale
+      lac_log.referenceAuthorityRestored = reference_log.authority_restored
+      lac_log.referencePreviewCorrection = reference_log.preview_correction
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
