@@ -35,7 +35,15 @@ MEASUREMENT_RATE_BRAKE_GAIN = 0.18  # seconds; converts measured lateral jerk to
 MEASUREMENT_RATE_BRAKE_MAX = 0.16  # m/s^2
 MEASUREMENT_RATE_BRAKE_OPPOSING_FULL = 0.15  # m/s^2 of controller demand opposing wheel motion
 MEASUREMENT_RATE_BRAKE_FULL_SPEED = 12.0 * CV.MPH_TO_MS
-MEASUREMENT_RATE_BRAKE_ZERO_SPEED = 15.0 * CV.MPH_TO_MS
+MEASUREMENT_RATE_BRAKE_SPEEDS = tuple(speed * CV.MPH_TO_MS for speed in (0.0, 12.0, 15.0, 30.0, 60.0, 90.0))
+MEASUREMENT_RATE_BRAKE_SCALES = (1.0, 1.0, 0.25, 0.15, 0.08, 0.05)
+ACTUATION_SPEED_PROJECTION_MIN_SPEED = 0.3  # m/s; do not project from a standstill
+ACTUATION_SPEED_PROJECTION_FULL_SPEED = 1.0  # m/s
+ACTUATION_SPEED_PROJECTION_MAX_TIME = 0.35  # seconds
+ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
+ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
+ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
+ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
 VERSION = 6
 
 
@@ -45,8 +53,40 @@ def smoothstep(value: float) -> float:
 
 
 def measurement_rate_brake_speed_scale(v_ego: float) -> float:
-  fraction = (v_ego - MEASUREMENT_RATE_BRAKE_FULL_SPEED) / (MEASUREMENT_RATE_BRAKE_ZERO_SPEED - MEASUREMENT_RATE_BRAKE_FULL_SPEED)
-  return 1.0 - smoothstep(fraction)
+  """Return the conservative all-speed gain schedule for motion feedback."""
+  speed = max(v_ego, 0.0)
+  for i in range(1, len(MEASUREMENT_RATE_BRAKE_SPEEDS)):
+    if speed <= MEASUREMENT_RATE_BRAKE_SPEEDS[i]:
+      lower_speed = MEASUREMENT_RATE_BRAKE_SPEEDS[i - 1]
+      upper_speed = MEASUREMENT_RATE_BRAKE_SPEEDS[i]
+      fraction = (speed - lower_speed) / (upper_speed - lower_speed)
+      blend = smoothstep(fraction)
+      lower_scale = MEASUREMENT_RATE_BRAKE_SCALES[i - 1]
+      upper_scale = MEASUREMENT_RATE_BRAKE_SCALES[i]
+      return lower_scale + blend * (upper_scale - lower_scale)
+  return MEASUREMENT_RATE_BRAKE_SCALES[-1]
+
+
+def get_actuation_speed(v_ego: float, a_ego: float, lat_delay: float) -> float:
+  """Project speed over the bounded steering delay for feedforward only."""
+  speed = max(v_ego, 0.0)
+  projection_scale = smoothstep((speed - ACTUATION_SPEED_PROJECTION_MIN_SPEED) /
+                                (ACTUATION_SPEED_PROJECTION_FULL_SPEED - ACTUATION_SPEED_PROJECTION_MIN_SPEED))
+  projection_time = float(np.clip(lat_delay, 0.0, ACTUATION_SPEED_PROJECTION_MAX_TIME))
+  acceleration = float(np.clip(a_ego, ACTUATION_SPEED_PROJECTION_ACCEL_MIN, ACTUATION_SPEED_PROJECTION_ACCEL_MAX))
+  speed_delta = float(np.clip(acceleration * projection_time,
+                              -ACTUATION_SPEED_PROJECTION_MAX_DELTA, ACTUATION_SPEED_PROJECTION_MAX_DELTA))
+  return max(speed + projection_scale * speed_delta, 0.0)
+
+
+def get_projected_lateral_accel(desired_curvature: float, v_ego: float, a_ego: float, lat_delay: float) -> tuple[float, float]:
+  """Return projected speed and a separately bounded feedforward reference."""
+  actuation_speed = get_actuation_speed(v_ego, a_ego, lat_delay)
+  current_speed_lateral_accel = desired_curvature * v_ego ** 2
+  projection_correction = desired_curvature * (actuation_speed ** 2 - v_ego ** 2)
+  projection_correction = float(np.clip(projection_correction,
+                                        -ACTUATION_LATERAL_ACCEL_CORRECTION_MAX, ACTUATION_LATERAL_ACCEL_CORRECTION_MAX))
+  return actuation_speed, current_speed_lateral_accel + projection_correction
 
 
 def get_measurement_rate_brake(output_lataccel: float, measurement_rate: float, v_ego: float) -> tuple[float, float]:
@@ -70,19 +110,20 @@ class MeasurementRateFilter:
   def __init__(self, dt: float):
     self.dt = dt
     self.filter = FirstOrderFilter(0.0, MEASUREMENT_RATE_FILTER_TAU, dt, initialized=False)
-    self.previous_measurement: float | None = None
+    self.previous_curvature: float | None = None
 
-  def update(self, measurement: float, active: bool) -> float:
+  def update(self, measured_curvature: float, v_ego: float, active: bool) -> float:
+    """Return curvature-motion lateral-acceleration rate, excluding 2*v*a*kappa."""
     if not active:
-      self.filter.x = measurement
+      self.filter.x = measured_curvature
       self.filter.initialized = True
-      self.previous_measurement = measurement
+      self.previous_curvature = measured_curvature
       return 0.0
 
-    filtered_measurement = float(self.filter.update(measurement))
-    measurement_rate = 0.0 if self.previous_measurement is None else (filtered_measurement - self.previous_measurement) / self.dt
-    self.previous_measurement = filtered_measurement
-    return measurement_rate
+    filtered_curvature = float(self.filter.update(measured_curvature))
+    curvature_rate = 0.0 if self.previous_curvature is None else (filtered_curvature - self.previous_curvature) / self.dt
+    self.previous_curvature = filtered_curvature
+    return curvature_rate * max(v_ego, 0.0) ** 2
 
 
 class LatControlTorque(LatControl):
@@ -119,9 +160,13 @@ class LatControlTorque(LatControl):
     pid_log.version = VERSION
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     measurement = measured_curvature * CS.vEgo ** 2
-    measurement_rate = self.measurement_rate_filter.update(measurement, active)
-    future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
-    self.lat_accel_request_buffer.append(future_desired_lateral_accel)
+    measurement_rate = self.measurement_rate_filter.update(measured_curvature, CS.vEgo, active)
+    longitudinal_lateral_accel_rate = 2.0 * CS.vEgo * CS.aEgo * measured_curvature
+    current_speed_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
+    actuation_speed, future_desired_lateral_accel = get_projected_lateral_accel(desired_curvature, CS.vEgo, CS.aEgo, lat_delay)
+    # Keep the delay-reference shadow and jerk path at current speed so this
+    # change remains isolated to feedforward.
+    self.lat_accel_request_buffer.append(current_speed_desired_lateral_accel)
     self.curvature_request_buffer.append(desired_curvature)
 
     roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
@@ -165,8 +210,9 @@ class LatControlTorque(LatControl):
       # is expected while Hyundai's downstream rate limiter catches up. Gating
       # on that gap suppresses rate feedback through nearly the entire release,
       # so leave downstream actuator limits authoritative and only suppress for
-      # a real driver override or outside the analyzed speed band.
-      rate_brake_allowed = self.measurement_rate_brake_enabled and not CS.steeringPressed and CS.vEgo < MEASUREMENT_RATE_BRAKE_ZERO_SPEED
+      # a real driver override. A decreasing gain schedule keeps the correction
+      # small but nonzero above the low-speed release regime.
+      rate_brake_allowed = self.measurement_rate_brake_enabled and not CS.steeringPressed
       if rate_brake_allowed:
         # Get the undamped command without moving the integrator, then add rate
         # feedback only when that command is already braking the measured motion.
@@ -174,8 +220,8 @@ class LatControlTorque(LatControl):
         rate_brake, rate_brake_scale = get_measurement_rate_brake(base_output_lataccel, measurement_rate, CS.vEgo)
         output_lataccel = self.pid.update(pid_log.error, speed=CS.vEgo, feedforward=ff + rate_brake, freeze_integrator=freeze_integrator)
       else:
-        # Preserve the existing single-update path exactly on other platforms,
-        # during driver/safety intervention, and above the feature's speed band.
+        # Preserve the existing single-update path exactly on other platforms
+        # and during driver intervention.
         output_lataccel = self.pid.update(pid_log.error, speed=CS.vEgo, feedforward=ff, freeze_integrator=freeze_integrator)
       output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
       torque_command = -output_torque
@@ -197,6 +243,11 @@ class LatControlTorque(LatControl):
     pid_log.delayedDesiredCurvature = float(delayed_desired_curvature)
     pid_log.legacyDesiredLateralAccel = float(legacy_expected_lateral_accel)
     pid_log.speedAlignmentCorrection = float(expected_lateral_accel - legacy_expected_lateral_accel)
+    pid_log.actuationSpeed = float(actuation_speed)
+    pid_log.currentSpeedDesiredLateralAccel = float(current_speed_desired_lateral_accel)
+    pid_log.speedProjectionCorrection = float(future_desired_lateral_accel - current_speed_desired_lateral_accel)
+    pid_log.longitudinalLateralAccelRate = float(longitudinal_lateral_accel_rate)
+    pid_log.rateBrakeSpeedScale = float(measurement_rate_brake_speed_scale(CS.vEgo))
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log
