@@ -11,17 +11,17 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   ACTUATION_LATERAL_ACCEL_CORRECTION_MAX,
   ACTUATION_SPEED_PROJECTION_MAX_DELTA,
-  MEASUREMENT_RATE_BRAKE_FULL_SPEED,
-  MEASUREMENT_RATE_BRAKE_MAX,
-  MEASUREMENT_RATE_BRAKE_SCALES,
-  MEASUREMENT_RATE_BRAKE_SPEEDS,
+  REFERENCE_RATE_MIN_SPEED,
+  REFERENCE_RATE_TRACKING_MAX,
+  REFERENCE_RATE_TRACKING_SCALES,
+  REFERENCE_RATE_TRACKING_SPEEDS,
   VERSION,
   LatControlTorque,
   MeasurementRateFilter,
   get_actuation_speed,
-  get_measurement_rate_brake,
   get_projected_lateral_accel,
-  measurement_rate_brake_speed_scale,
+  get_reference_rate_tracking,
+  reference_rate_tracking_speed_scale,
 )
 
 
@@ -32,54 +32,48 @@ def get_controller(car_name):
   return LatControlTorque(CP.as_reader(), CI, DT_CTRL), VehicleModel(CP)
 
 
-class TestMeasurementRateBrake:
-  @pytest.mark.parametrize(("output_lataccel", "measurement_rate"), [(0.5, 1.0), (-0.5, -1.0)])
-  def test_preserves_command_driving_measured_motion(self, output_lataccel, measurement_rate):
-    brake, scale = get_measurement_rate_brake(output_lataccel, measurement_rate, 5.0)
-    assert brake == 0.0
-    assert scale == 0.0
-
-  @pytest.mark.parametrize(("output_lataccel", "measurement_rate"), [(0.5, -1.0), (-0.5, 1.0)])
-  def test_augments_command_opposing_measured_motion(self, output_lataccel, measurement_rate):
-    brake, scale = get_measurement_rate_brake(output_lataccel, measurement_rate, 5.0)
-    assert brake * output_lataccel > 0.0
-    assert brake * measurement_rate < 0.0
+class TestReferenceRateTracking:
+  def test_zero_error_has_no_correction(self):
+    correction, scale = get_reference_rate_tracking(1.0, 1.0, 5.0)
+    assert correction == 0.0
     assert scale == pytest.approx(1.0)
 
-  def test_opposing_demand_gate_is_smooth_and_monotonic(self):
-    weak_brake, weak_scale = get_measurement_rate_brake(-0.05, 1.0, 5.0)
-    medium_brake, medium_scale = get_measurement_rate_brake(-0.10, 1.0, 5.0)
-    full_brake, full_scale = get_measurement_rate_brake(-0.15, 1.0, 5.0)
+  @pytest.mark.parametrize(("reference_rate", "measurement_rate", "sign"), [
+    (1.0, 0.25, 1.0),    # drive a wheel lagging the future path
+    (0.25, 1.0, -1.0),   # brake a wheel outrunning the future path
+    (-1.0, 1.0, -1.0),   # start a planned reversal without waiting for measured motion to reverse
+  ])
+  def test_tracks_reference_in_both_directions(self, reference_rate, measurement_rate, sign):
+    correction, _ = get_reference_rate_tracking(reference_rate, measurement_rate, 5.0)
+    assert correction * sign > 0.0
 
-    assert 0.0 < weak_scale < medium_scale < full_scale
-    assert abs(weak_brake) < abs(medium_brake) < abs(full_brake)
-    assert full_scale == pytest.approx(1.0)
-
-  def test_brake_is_bounded(self):
-    brake, _ = get_measurement_rate_brake(-1.0, 100.0, 5.0)
-    assert brake == pytest.approx(-MEASUREMENT_RATE_BRAKE_MAX)
+  def test_correction_is_bounded(self):
+    positive, _ = get_reference_rate_tracking(100.0, 0.0, 5.0)
+    negative, _ = get_reference_rate_tracking(-100.0, 0.0, 5.0)
+    assert positive == pytest.approx(REFERENCE_RATE_TRACKING_MAX)
+    assert negative == pytest.approx(-REFERENCE_RATE_TRACKING_MAX)
 
   def test_all_speed_schedule(self):
-    full, _ = get_measurement_rate_brake(-0.5, 1.0, MEASUREMENT_RATE_BRAKE_FULL_SPEED)
-    casual, _ = get_measurement_rate_brake(-0.5, 1.0, 30.0 * CV.MPH_TO_MS)
-    highway, _ = get_measurement_rate_brake(-0.5, 1.0, 60.0 * CV.MPH_TO_MS)
-    very_high, scale = get_measurement_rate_brake(-0.5, 1.0, 100.0 * CV.MPH_TO_MS)
+    full, _ = get_reference_rate_tracking(100.0, 0.0, 12.0 * CV.MPH_TO_MS)
+    casual, _ = get_reference_rate_tracking(100.0, 0.0, 30.0 * CV.MPH_TO_MS)
+    highway, _ = get_reference_rate_tracking(100.0, 0.0, 60.0 * CV.MPH_TO_MS)
+    very_high, scale = get_reference_rate_tracking(100.0, 0.0, 100.0 * CV.MPH_TO_MS)
 
-    assert casual == pytest.approx(full * 0.15)
-    assert highway == pytest.approx(full * 0.08)
-    assert very_high == pytest.approx(full * 0.05)
-    assert scale == pytest.approx(0.05)
+    assert casual == pytest.approx(full * 0.50)
+    assert highway == pytest.approx(full * 0.35)
+    assert very_high == pytest.approx(full * 0.25)
+    assert scale == pytest.approx(0.25)
 
   def test_speed_schedule_is_continuous_monotonic_and_nonzero(self):
-    samples = [measurement_rate_brake_speed_scale(speed) for speed in np.linspace(0.0, 50.0, 1001)]
+    samples = [reference_rate_tracking_speed_scale(speed) for speed in np.linspace(0.0, 50.0, 1001)]
     assert all(current <= previous for previous, current in zip(samples[:-1], samples[1:], strict=True))
-    assert min(samples) == pytest.approx(MEASUREMENT_RATE_BRAKE_SCALES[-1])
-    for speed, scale in zip(MEASUREMENT_RATE_BRAKE_SPEEDS, MEASUREMENT_RATE_BRAKE_SCALES, strict=True):
-      assert measurement_rate_brake_speed_scale(speed) == pytest.approx(scale)
+    assert min(samples) == pytest.approx(REFERENCE_RATE_TRACKING_SCALES[-1])
+    for speed, scale in zip(REFERENCE_RATE_TRACKING_SPEEDS, REFERENCE_RATE_TRACKING_SCALES, strict=True):
+      assert reference_rate_tracking_speed_scale(speed) == pytest.approx(scale)
 
   def test_symmetry(self):
-    positive, _ = get_measurement_rate_brake(0.5, -1.0, 5.0)
-    negative, _ = get_measurement_rate_brake(-0.5, 1.0, 5.0)
+    positive, _ = get_reference_rate_tracking(1.0, -1.0, 5.0)
+    negative, _ = get_reference_rate_tracking(-1.0, 1.0, 5.0)
     assert positive == pytest.approx(-negative)
 
 
@@ -109,6 +103,13 @@ class TestMeasurementRateFilter:
     assert slow_rate > 0.0
     assert fast_rate == pytest.approx(4.0 * slow_rate)
 
+  def test_exposes_filtered_curvature_rate_for_common_tracking_speed(self):
+    rate_filter = MeasurementRateFilter(DT_CTRL)
+    rate_filter.update(0.0, 1.0, True)
+    rate_filter.update(0.001, 1.0, True)
+    assert rate_filter.curvature_rate > 0.0
+    assert rate_filter.curvature_rate * REFERENCE_RATE_MIN_SPEED**2 > rate_filter.curvature_rate
+
 
 class TestActuationSpeedProjection:
   def test_zero_acceleration_is_identity(self):
@@ -134,44 +135,44 @@ class TestActuationSpeedProjection:
     assert abs(projected_lateral_accel - current_lateral_accel) == pytest.approx(ACTUATION_LATERAL_ACCEL_CORRECTION_MAX)
 
 
-class TestMeasurementRateBrakeIntegration:
+class TestReferenceRateTrackingIntegration:
   @pytest.mark.parametrize("steer_limited_by_safety", [False, True])
-  def test_hyundai_controller_logs_brake_attribution(self, steer_limited_by_safety):
+  def test_hyundai_controller_logs_tracking_attribution(self, steer_limited_by_safety):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
     car_state = car.CarState.new_message()
     car_state.vEgo = 3.0
     params = log.LiveParametersData.new_message()
 
     controller.update(True, car_state, vehicle_model, params, steer_limited_by_safety, 0.0, False, 0.2)
-    car_state.steeringAngleDeg = 10.0
-    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, steer_limited_by_safety, 0.0, False, 0.2)
+    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, steer_limited_by_safety, 0.01, False, 0.2)
 
     assert torque_log.version == VERSION
-    assert torque_log.measurementRate < 0.0
-    assert torque_log.rateBrake > 0.0
-    assert torque_log.rateBrakeScale > 0.0
-    assert torque_log.rateBrakeSpeedScale == pytest.approx(1.0)
-    assert torque_log.d == pytest.approx(torque_log.rateBrake)
-
-    car_state.steeringPressed = True
-    car_state.steeringAngleDeg = 20.0
-    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2)
+    assert torque_log.referenceRate > 0.0
+    assert torque_log.trackingMeasurementRate == pytest.approx(0.0)
+    assert torque_log.rateTrackingError > 0.0
+    assert torque_log.rateTrackingCorrection > 0.0
+    assert torque_log.rateTrackingSpeedScale == pytest.approx(1.0)
+    assert torque_log.d == pytest.approx(torque_log.rateTrackingCorrection)
     assert torque_log.rateBrake == 0.0
     assert torque_log.rateBrakeScale == 0.0
 
-  def test_hyundai_controller_keeps_bounded_brake_at_high_speed(self):
+    car_state.steeringPressed = True
+    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.02, False, 0.2)
+    assert torque_log.rateTrackingCorrection == 0.0
+    assert torque_log.rateTrackingSpeedScale == 0.0
+
+  def test_hyundai_controller_keeps_bounded_tracking_at_high_speed(self):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
     car_state = car.CarState.new_message()
     car_state.vEgo = 30.0
     params = log.LiveParametersData.new_message()
 
     controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2)
-    car_state.steeringAngleDeg = 10.0
-    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2)
+    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.01, False, 0.2)
 
-    assert 0.0 < torque_log.rateBrakeSpeedScale < 0.08
-    assert torque_log.rateBrake > 0.0
-    assert torque_log.rateBrake <= MEASUREMENT_RATE_BRAKE_MAX * torque_log.rateBrakeSpeedScale
+    assert 0.25 < torque_log.rateTrackingSpeedScale < 0.35
+    assert torque_log.rateTrackingCorrection > 0.0
+    assert torque_log.rateTrackingCorrection == pytest.approx(REFERENCE_RATE_TRACKING_MAX * torque_log.rateTrackingSpeedScale)
 
   def test_feedforward_projection_is_logged_separately(self):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
