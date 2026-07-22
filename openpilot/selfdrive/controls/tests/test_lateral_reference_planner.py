@@ -3,7 +3,9 @@ import pytest
 
 from openpilot.cereal import log
 from openpilot.selfdrive.controls.lib.lateral_reference_planner import (
+  ActuatorPreviewConfig,
   LateralReferencePlanner,
+  MAX_PREVIEW_LATERAL_ACCEL_DELTA,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -11,6 +13,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 MODEL_T = np.asarray(ModelConstants.T_IDXS)
 V_EGO = 3.0
 LATERAL_DELAY = 0.385
+HYUNDAI_ACTUATOR = ActuatorPreviewConfig(max_torque=409, delta_up=4, delta_down=7)
 
 
 def build_model(yaws, speeds=V_EGO):
@@ -94,6 +97,57 @@ class TestLateralReferencePlanner:
     assert planner.update(constant_curvature_model(0.01, speed), 0.0, speed)
     assert planner.get_curvature(0.04, speed, LATERAL_DELAY) == pytest.approx(0.04)
     assert planner.solution is None
+
+  def test_actuator_preview_leads_low_speed_sharp_unwind_without_erasing_turn(self):
+    speed = 3.0
+    curvature = 0.04
+    # Hold the turn through the action horizon, then unwind in the future path.
+    yaws = speed * curvature * np.minimum(MODEL_T, 0.7)
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    assert planner.update(build_model(yaws, speed), curvature, speed)
+
+    output = planner.get_curvature(curvature, speed, LATERAL_DELAY, applied_torque=-0.8,
+                                   lat_accel_factor=2.5, friction=0.115)
+    assert output < curvature
+    assert (curvature - output) * speed**2 <= MAX_PREVIEW_LATERAL_ACCEL_DELTA + 1e-9
+    assert planner.solution is not None
+    assert planner.diagnostics.extra_time > 0.0
+    assert planner.diagnostics.unwind_scale > 0.0
+
+  def test_actuator_preview_preserves_turn_in_authority(self):
+    speed = 3.0
+    future_turn_yaw = np.where(MODEL_T < 0.7, 0.0, speed * 0.04 * (MODEL_T - 0.7))
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    assert planner.update(build_model(future_turn_yaw, speed), 0.0, speed)
+
+    raw_curvature = 0.02
+    output = planner.get_curvature(raw_curvature, speed, LATERAL_DELAY, applied_torque=0.0,
+                                   lat_accel_factor=2.5, friction=0.115)
+    assert output >= raw_curvature
+    assert planner.diagnostics.extra_time == 0.0
+    assert planner.diagnostics.authority_restored > 0.0
+
+  def test_actuator_transition_accounts_for_slow_sign_reversal(self):
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    same_direction_time = planner._transition_time(-0.8, -0.4)
+    reversal_time = planner._transition_time(-0.8, 0.4)
+    assert reversal_time > same_direction_time
+
+  def test_speed_change_alone_does_not_trigger_path_unwind(self):
+    speed = 8.0
+    curvature = 0.01
+    speeds = np.linspace(speed, 3.0, len(MODEL_T))
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    assert planner.update(build_model(speed * curvature * MODEL_T, speeds), curvature, speed)
+
+    planner.get_curvature(curvature, speed, LATERAL_DELAY, applied_torque=-0.4,
+                          lat_accel_factor=2.5, friction=0.115)
+    assert planner.diagnostics.unwind_scale == pytest.approx(0.0, abs=1e-6)
+    assert planner.diagnostics.extra_time == pytest.approx(0.0, abs=1e-6)
 
   def test_reference_becomes_fully_active_by_15_mph(self):
     outputs = []
