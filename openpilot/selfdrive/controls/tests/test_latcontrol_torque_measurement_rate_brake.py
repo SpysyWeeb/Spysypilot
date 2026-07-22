@@ -78,15 +78,16 @@ class TestMeasurementRateFilter:
 
 
 class TestMeasurementRateBrakeIntegration:
-  def test_hyundai_controller_logs_brake_attribution(self):
+  @pytest.mark.parametrize("steer_limited_by_safety", [False, True])
+  def test_hyundai_controller_logs_brake_attribution(self, steer_limited_by_safety):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
     car_state = car.CarState.new_message()
     car_state.vEgo = 3.0
     params = log.LiveParametersData.new_message()
 
-    controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2)
+    controller.update(True, car_state, vehicle_model, params, steer_limited_by_safety, 0.0, False, 0.2)
     car_state.steeringAngleDeg = 10.0
-    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2)
+    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, steer_limited_by_safety, 0.0, False, 0.2)
 
     assert torque_log.version == VERSION
     assert torque_log.measurementRate < 0.0
