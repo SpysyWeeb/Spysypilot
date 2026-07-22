@@ -910,6 +910,13 @@ struct ControlsState @0x97ff69c53601abf1 {
     referenceUnwindScale @31 :Float32;         # path-phase confidence that the selected reference is unwinding
     referenceAuthorityRestored @32 :Float32;   # turn strength restored over smoothed path, m/s^2
     referencePreviewCorrection @33 :Float32;   # output minus legacy reference, m/s^2
+    referenceRate @34 :Float32;                # future-path curvature rate at the tracking speed floor, m/s^3
+    trackingMeasurementRate @35 :Float32;      # measured curvature-motion rate at the same tracking speed, m/s^3
+    rateTrackingError @36 :Float32;            # reference minus measured curvature-motion rate, m/s^3
+    rateTrackingCorrection @37 :Float32;       # bounded rate-tracking contribution, m/s^2
+    rateTrackingSpeedScale @38 :Float32;       # all-speed gain schedule applied to rate tracking
+    referenceCurvatureRate @39 :Float32;        # filtered future-reference curvature rate, 1/m/s
+    measurementCurvatureRate @40 :Float32;      # filtered measured curvature rate, 1/m/s
    }
 
   struct LateralAngleState {
