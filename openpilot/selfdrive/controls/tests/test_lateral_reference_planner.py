@@ -115,6 +115,19 @@ class TestLateralReferencePlanner:
     assert planner.diagnostics.extra_time > 0.0
     assert planner.diagnostics.unwind_scale > 0.0
 
+    # These values are copied into cereal at 100 Hz. pycapnp rejects NumPy
+    # scalar types even though they behave like Python floats.
+    torque_log = log.ControlsState.LateralTorqueState.new_message()
+    torque_log.referenceBaseCurvature = planner.diagnostics.base_curvature
+    torque_log.referenceOutputCurvature = planner.diagnostics.output_curvature
+    torque_log.referencePreviewTime = planner.diagnostics.sample_time
+    torque_log.referencePreviewExtraTime = planner.diagnostics.extra_time
+    torque_log.referenceTargetTorque = planner.diagnostics.target_torque
+    torque_log.referenceAppliedTorque = planner.diagnostics.applied_torque
+    torque_log.referenceUnwindScale = planner.diagnostics.unwind_scale
+    torque_log.referenceAuthorityRestored = planner.diagnostics.authority_restored
+    torque_log.referencePreviewCorrection = planner.diagnostics.preview_correction
+
   def test_actuator_preview_preserves_turn_in_authority(self):
     speed = 3.0
     future_turn_yaw = np.where(MODEL_T < 0.7, 0.0, speed * 0.04 * (MODEL_T - 0.7))
