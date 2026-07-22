@@ -889,12 +889,17 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
-    measurementRate @13 :Float32;  # filtered actual lateral-acceleration rate, m/s^3
+    measurementRate @13 :Float32;  # filtered curvature-motion lateral-acceleration rate, excludes 2*v*a*kappa, m/s^3
     rateBrake @14 :Float32;        # bounded D-on-measurement contribution, m/s^2
-    rateBrakeScale @15 :Float32;   # combined opposing-demand and low-speed gate
+    rateBrakeScale @15 :Float32;   # combined opposing-demand and speed-schedule gate
     delayedDesiredCurvature @16 :Float32;    # delay-aligned curvature used by feedback, 1/m
     legacyDesiredLateralAccel @17 :Float32;  # old-speed buffered reference for A/B attribution, m/s^2
     speedAlignmentCorrection @18 :Float32;   # new reference minus legacy reference, m/s^2
+    actuationSpeed @19 :Float32;               # bounded delay-projected speed before lateral-acceleration cap, m/s
+    currentSpeedDesiredLateralAccel @20 :Float32; # desired lateral acceleration before speed projection, m/s^2
+    speedProjectionCorrection @21 :Float32;    # projected minus current-speed feedforward reference, m/s^2
+    longitudinalLateralAccelRate @22 :Float32; # excluded 2*v*a*kappa measurement-rate component, m/s^3
+    rateBrakeSpeedScale @23 :Float32;          # speed-only portion of the all-speed rate-brake gate
    }
 
   struct LateralAngleState {
