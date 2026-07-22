@@ -889,6 +889,9 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
+    measurementRate @13 :Float32;  # filtered actual lateral-acceleration rate, m/s^3
+    rateBrake @14 :Float32;        # bounded D-on-measurement contribution, m/s^2
+    rateBrakeScale @15 :Float32;   # combined opposing-demand and low-speed gate
    }
 
   struct LateralAngleState {
