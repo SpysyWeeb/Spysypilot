@@ -36,7 +36,7 @@ MEASUREMENT_RATE_BRAKE_MAX = 0.16  # m/s^2
 MEASUREMENT_RATE_BRAKE_OPPOSING_FULL = 0.15  # m/s^2 of controller demand opposing wheel motion
 MEASUREMENT_RATE_BRAKE_FULL_SPEED = 12.0 * CV.MPH_TO_MS
 MEASUREMENT_RATE_BRAKE_ZERO_SPEED = 15.0 * CV.MPH_TO_MS
-VERSION = 5
+VERSION = 6
 
 
 def smoothstep(value: float) -> float:
@@ -84,6 +84,7 @@ class MeasurementRateFilter:
     self.previous_measurement = filtered_measurement
     return measurement_rate
 
+
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
@@ -95,6 +96,7 @@ class LatControlTorque(LatControl):
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
     self.lat_accel_request_buffer_len = int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / self.dt)
     self.lat_accel_request_buffer = deque([0.] * self.lat_accel_request_buffer_len , maxlen=self.lat_accel_request_buffer_len)
+    self.curvature_request_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
     self.lookahead_frames = int(JERK_LOOKAHEAD_SECONDS / self.dt)
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
     self.measurement_rate_filter = MeasurementRateFilter(self.dt)
@@ -120,13 +122,21 @@ class LatControlTorque(LatControl):
     measurement_rate = self.measurement_rate_filter.update(measurement, active)
     future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
     self.lat_accel_request_buffer.append(future_desired_lateral_accel)
+    self.curvature_request_buffer.append(desired_curvature)
 
     roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
     curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
     lateral_accel_deadzone = curvature_deadzone * CS.vEgo ** 2
 
     delay_frames = int(np.clip(lat_delay / self.dt + 1, 1, self.lat_accel_request_buffer_len))
-    expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
+    legacy_expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
+    delayed_desired_curvature = self.curvature_request_buffer[-delay_frames]
+    # Compare delayed desired curvature and current measured curvature at the
+    # same speed. Buffering lateral acceleration directly compares an old-speed
+    # reference against a current-speed measurement, creating a false P error
+    # whenever the driver accelerates or brakes through an otherwise unchanged
+    # path.
+    expected_lateral_accel = delayed_desired_curvature * CS.vEgo ** 2
     setpoint = expected_lateral_accel
     error = setpoint - measurement
 
@@ -184,6 +194,9 @@ class LatControlTorque(LatControl):
     pid_log.measurementRate = float(measurement_rate)
     pid_log.rateBrake = float(rate_brake)
     pid_log.rateBrakeScale = float(rate_brake_scale)
+    pid_log.delayedDesiredCurvature = float(delayed_desired_curvature)
+    pid_log.legacyDesiredLateralAccel = float(legacy_expected_lateral_accel)
+    pid_log.speedAlignmentCorrection = float(expected_lateral_accel - legacy_expected_lateral_accel)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log
