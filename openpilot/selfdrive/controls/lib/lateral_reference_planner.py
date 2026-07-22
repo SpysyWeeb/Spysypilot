@@ -294,14 +294,14 @@ class LateralReferencePlanner:
     output_curvature = planned_curvature if actuator_preview else legacy_reference
     target_torque = self._target_torque(output_curvature, sample_time, v_ego, lat_accel_factor, friction)
     self.diagnostics = LateralReferenceDiagnostics(
-      base_curvature=base_curvature,
-      output_curvature=output_curvature,
-      sample_time=sample_time,
-      extra_time=sample_time - base_time,
-      target_torque=target_torque,
-      applied_torque=applied_torque,
-      unwind_scale=unwind_scale,
-      authority_restored=authority_restored,
-      preview_correction=(output_curvature - legacy_reference) * v_ego**2,
+      base_curvature=float(base_curvature),
+      output_curvature=float(output_curvature),
+      sample_time=float(sample_time),
+      extra_time=float(sample_time - base_time),
+      target_torque=float(target_torque),
+      applied_torque=float(applied_torque),
+      unwind_scale=float(unwind_scale),
+      authority_restored=float(authority_restored),
+      preview_correction=float((output_curvature - legacy_reference) * v_ego**2),
     )
     return float(output_curvature)
