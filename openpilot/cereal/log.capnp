@@ -892,6 +892,9 @@ struct ControlsState @0x97ff69c53601abf1 {
     measurementRate @13 :Float32;  # filtered actual lateral-acceleration rate, m/s^3
     rateBrake @14 :Float32;        # bounded D-on-measurement contribution, m/s^2
     rateBrakeScale @15 :Float32;   # combined opposing-demand and low-speed gate
+    delayedDesiredCurvature @16 :Float32;    # delay-aligned curvature used by feedback, 1/m
+    legacyDesiredLateralAccel @17 :Float32;  # old-speed buffered reference for A/B attribution, m/s^2
+    speedAlignmentCorrection @18 :Float32;   # new reference minus legacy reference, m/s^2
    }
 
   struct LateralAngleState {
