@@ -363,6 +363,8 @@ class TestReferenceRateTrackingIntegration:
 
     assert torque_log.version == VERSION
     assert torque_log.referenceRate > 0.0
+    assert not torque_log.trajectoryReferenceRateValid
+    assert torque_log.referenceCurvatureRate == pytest.approx(torque_log.finiteDifferenceReferenceCurvatureRate)
     assert torque_log.trackingMeasurementRate == pytest.approx(0.0)
     assert torque_log.rateTrackingError > 0.0
     assert torque_log.rateTrackingCorrection > 0.0
@@ -391,6 +393,31 @@ class TestReferenceRateTrackingIntegration:
     assert 0.25 < torque_log.rateTrackingSpeedScale < 0.35
     assert torque_log.rateTrackingCorrection > 0.0
     assert torque_log.rateTrackingCorrection == pytest.approx(CASCADE_RATE_CORRECTION_MAX * torque_log.rateTrackingSpeedScale)
+
+  def test_hyundai_controller_uses_trajectory_rate_without_replan_spike(self):
+    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
+    car_state = car.CarState.new_message()
+    car_state.vEgo = 3.0
+    params = log.LiveParametersData.new_message()
+
+    controller.update(
+      True, car_state, vehicle_model, params, False, 0.0, False, 0.2,
+      trajectory_reference_curvature_rate=0.0,
+    )
+    _, _, torque_log = controller.update(
+      True, car_state, vehicle_model, params, False, 0.01, False, 0.2,
+      trajectory_reference_curvature_rate=0.001,
+    )
+
+    assert torque_log.trajectoryReferenceRateValid
+    assert torque_log.trajectoryReferenceCurvatureRate == pytest.approx(0.001)
+    assert torque_log.finiteDifferenceReferenceCurvatureRate > 0.05
+    assert torque_log.trajectoryReferenceInnovation > 0.05
+    assert 0.001 < torque_log.referenceCurvatureRate < 0.01
+    assert torque_log.filteredTrajectoryReferenceInnovation < torque_log.trajectoryReferenceInnovation
+    assert torque_log.referenceRate == pytest.approx(
+      torque_log.referenceCurvatureRate * REFERENCE_RATE_MIN_SPEED**2,
+    )
 
   def test_feedforward_projection_is_logged_separately(self):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
