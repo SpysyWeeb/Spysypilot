@@ -924,6 +924,12 @@ struct ControlsState @0x97ff69c53601abf1 {
     actuatorAppliedLateralAccel @45 :Float32;    # applied normalized torque expressed in controller coordinates, m/s^2
     actuatorStateCorrection @46 :Float32;       # future-rate-gated feedback from applied actuator state, m/s^2
     cascadePScale @47 :Float32;                 # residual share of the legacy direct proportional path
+    unwindBrakeActivation @48 :Float32;         # future-path/applied-torque braking blend
+    unwindTorqueZeroTime @49 :Float32;           # predicted time for applied torque to decay to zero, seconds
+    unwindProjectedPositionError @50 :Float32;   # position error projected to torque-zero time, m/s^2
+    unwindTorqueCorrection @51 :Float32;         # normalized request shift toward the future target torque
+    cascadeBasePScale @52 :Float32;              # speed-scheduled P share before future-unwind arbitration
+    dampingTurnInBlocked @53 :Bool;               # preserve authority while a same-direction turn is under-tracked
    }
 
   struct LateralAngleState {
