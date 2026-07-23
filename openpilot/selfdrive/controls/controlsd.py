@@ -167,6 +167,7 @@ class Controls:
         new_desired_curvature = self.lateral_reference_planner.get_curvature(
           raw_desired_curvature, CS.vEgo, lat_delay, applied_torque,
           self.LaC.torque_params.latAccelFactor, self.LaC.torque_params.friction,
+          lp.roll, self.LaC.torque_params.latAccelOffset,
         )
       else:
         new_desired_curvature = self.lateral_reference_planner.get_curvature(raw_desired_curvature, CS.vEgo, lat_delay)
@@ -199,6 +200,9 @@ class Controls:
       lac_log.referenceUnwindScale = float(reference_log.unwind_scale)
       lac_log.referenceAuthorityRestored = float(reference_log.authority_restored)
       lac_log.referencePreviewCorrection = float(reference_log.preview_correction)
+      lac_log.referenceGeometricTargetTorque = float(reference_log.geometric_target_torque)
+      lac_log.referenceNeutralTorque = float(reference_log.neutral_torque)
+      lac_log.referenceReachableTargetTorque = float(reference_log.reachable_target_torque)
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
