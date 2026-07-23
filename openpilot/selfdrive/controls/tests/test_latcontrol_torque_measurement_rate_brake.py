@@ -21,14 +21,19 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   REFERENCE_RATE_MIN_SPEED,
   REFERENCE_RATE_TRACKING_SCALES,
   REFERENCE_RATE_TRACKING_SPEEDS,
+  UNWIND_TORQUE_BLEND_MAX,
+  UNWIND_TORQUE_DELTA_DOWN,
+  UNWIND_TORQUE_MAX,
   VERSION,
   LatControlTorque,
   MeasurementRateFilter,
   cascade_p_scale,
   get_actuation_speed,
+  get_future_unwind_brake,
   get_projected_lateral_accel,
   get_reference_rate_cascade,
   reference_rate_tracking_speed_scale,
+  should_block_undertracked_turn_in_damping,
 )
 
 
@@ -112,6 +117,59 @@ class TestReferenceRateCascade:
     assert all(current >= previous for previous, current in zip(samples[:-1], samples[1:], strict=True))
     for speed, scale in zip(CASCADE_P_SCALE_SPEEDS, CASCADE_P_SCALES, strict=True):
       assert cascade_p_scale(speed) == pytest.approx(scale)
+
+
+class TestFutureUnwindBrake:
+  def test_inactive_outside_future_path_unwind(self):
+    p_factor, torque_blend, activation, *_ = get_future_unwind_brake(
+      0.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0,
+    )
+    assert p_factor == 1.0
+    assert torque_blend == 0.0
+    assert activation == 0.0
+
+  def test_stalled_unwind_transfers_position_authority_without_torque_hold(self):
+    p_factor, torque_blend, activation, *_ = get_future_unwind_brake(
+      1.0, -0.8, 0.0, -2.0, 0.5, 0.8, 2.5, 1.0,
+    )
+    assert p_factor == pytest.approx(0.5)
+    assert torque_blend == 0.0
+    assert activation == 0.0
+
+  def test_applied_torque_brakes_predicted_unwind_overshoot(self):
+    p_factor, torque_blend, activation, zero_time, projected_error = get_future_unwind_brake(
+      1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0,
+    )
+    expected_zero_time = 0.8 / (UNWIND_TORQUE_DELTA_DOWN / UNWIND_TORQUE_MAX / DT_CTRL)
+    assert zero_time == pytest.approx(expected_zero_time)
+    assert projected_error > 0.2
+    assert activation == pytest.approx(1.0)
+    assert p_factor == pytest.approx(0.25)
+    assert torque_blend == pytest.approx(UNWIND_TORQUE_BLEND_MAX)
+
+  def test_future_target_that_drives_motion_is_not_used(self):
+    _, torque_blend, activation, *_ = get_future_unwind_brake(
+      1.0, 1.0, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0,
+    )
+    assert torque_blend == 0.0
+    assert activation == 0.0
+
+  def test_all_speed_schedule_retains_more_direct_p_at_high_speed(self):
+    low_speed = get_future_unwind_brake(1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0)
+    high_speed = get_future_unwind_brake(1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 0.25)
+    assert high_speed[0] > low_speed[0]
+    assert high_speed[1] < low_speed[1]
+
+
+class TestTurnInDampingGuard:
+  def test_blocks_only_meaningful_same_direction_undertracking(self):
+    assert should_block_undertracked_turn_in_damping(0.02, 0.2, 0.5, 0.0)
+    assert not should_block_undertracked_turn_in_damping(-0.02, 0.2, 0.5, 0.0)
+    assert not should_block_undertracked_turn_in_damping(0.02, 0.02, 0.5, 0.0)
+
+  def test_future_unwind_remains_eligible_for_damping(self):
+    assert not should_block_undertracked_turn_in_damping(0.02, 0.2, -0.5, 0.0)
+    assert not should_block_undertracked_turn_in_damping(0.02, 0.2, 0.5, 1.0)
 
 
 class TestMeasurementRateFilter:
@@ -226,3 +284,23 @@ class TestReferenceRateTrackingIntegration:
     assert torque_log.actuationSpeed == pytest.approx(5.4)
     assert torque_log.currentSpeedDesiredLateralAccel == pytest.approx(0.25)
     assert torque_log.speedProjectionCorrection == pytest.approx(0.01 * (5.4**2 - 5.0**2))
+
+  def test_future_target_torque_brakes_unwind_before_applied_torque_catches_up(self):
+    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
+    car_state = car.CarState.new_message()
+    car_state.vEgo = 3.0
+    params = log.LiveParametersData.new_message()
+
+    controller.update(True, car_state, vehicle_model, params, False, 0.02, False, 0.2,
+                      applied_torque=-0.8, reference_unwind_scale=0.0, reference_target_torque=-0.8)
+    car_state.steeringAngleDeg = -5.0
+    torque, _, torque_log = controller.update(
+      True, car_state, vehicle_model, params, False, 0.01, False, 0.2,
+      applied_torque=-0.8, reference_unwind_scale=1.0, reference_target_torque=0.8,
+    )
+
+    assert torque_log.unwindBrakeActivation == pytest.approx(1.0)
+    assert torque_log.unwindTorqueZeroTime > 0.4
+    assert torque_log.cascadePScale < torque_log.cascadeBasePScale
+    assert torque_log.unwindTorqueCorrection > 0.0
+    assert 0.0 < torque < 0.8
