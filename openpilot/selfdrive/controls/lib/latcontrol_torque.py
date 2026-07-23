@@ -31,8 +31,22 @@ JERK_LOOKAHEAD_SECONDS = 0.19
 JERK_GAIN = 0.3
 LAT_ACCEL_REQUEST_BUFFER_SECONDS = 1.0
 MEASUREMENT_RATE_FILTER_TAU = 0.12
-REFERENCE_RATE_TRACKING_GAIN = 0.05  # seconds; converts curvature-motion rate error to lateral acceleration
-REFERENCE_RATE_TRACKING_MAX = 0.12  # m/s^2 before the speed schedule
+# Two-degree-of-freedom cascade: the future path supplies reference motion,
+# position error supplies only a bounded catch-up rate, and the inner rate loop
+# supplies torque. This keeps quick planned turns while preventing raw position
+# error from repeatedly commanding full torque into the Hyundai slew limiter.
+CASCADE_POSITION_RATE_GAIN = 6.0  # 1/s
+CASCADE_CATCHUP_RATE_MAX = 4.0  # m/s^3 at the common tracking speed
+CASCADE_DESIRED_RATE_MAX = 8.0  # m/s^3 at the common tracking speed
+CASCADE_RATE_GAIN = 0.35  # seconds; converts rate error to lateral acceleration
+CASCADE_RATE_CORRECTION_MAX = 0.85  # m/s^2 before the speed schedule
+CASCADE_ACTIVATION_MIN_SPEED = 0.3  # m/s; do not steer a stationary rack from the synthetic speed floor
+CASCADE_ACTIVATION_FULL_SPEED = 1.0  # m/s
+CASCADE_P_SCALE_SPEEDS = tuple(speed * CV.MPH_TO_MS for speed in (0.0, 22.0, 45.0, 67.0))
+CASCADE_P_SCALES = (0.50, 0.50, 0.75, 1.0)
+CASCADE_ACTUATOR_OVERSPEED_FULL = 0.8  # m/s^3
+CASCADE_ACTUATOR_STATE_GAIN = 0.15
+CASCADE_ACTUATOR_CORRECTION_MAX = 0.15  # m/s^2 before the speed schedule
 REFERENCE_RATE_MIN_SPEED = 5.0  # m/s; retain steering-rate authority where v^2 would otherwise vanish
 REFERENCE_RATE_TRACKING_SPEEDS = tuple(speed * CV.MPH_TO_MS for speed in (0.0, 12.0, 15.0, 30.0, 60.0, 90.0))
 REFERENCE_RATE_TRACKING_SCALES = (1.0, 1.0, 0.65, 0.50, 0.35, 0.25)
@@ -43,7 +57,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 8
+VERSION = 9
 
 
 def smoothstep(value: float) -> float:
@@ -64,6 +78,18 @@ def reference_rate_tracking_speed_scale(v_ego: float) -> float:
       upper_scale = REFERENCE_RATE_TRACKING_SCALES[i]
       return lower_scale + blend * (upper_scale - lower_scale)
   return REFERENCE_RATE_TRACKING_SCALES[-1]
+
+
+def cascade_p_scale(v_ego: float) -> float:
+  """Return the residual direct-P share; most low-speed authority moves to the rate cascade."""
+  speed = max(v_ego, 0.0)
+  for i in range(1, len(CASCADE_P_SCALE_SPEEDS)):
+    if speed <= CASCADE_P_SCALE_SPEEDS[i]:
+      lower_speed = CASCADE_P_SCALE_SPEEDS[i - 1]
+      upper_speed = CASCADE_P_SCALE_SPEEDS[i]
+      blend = smoothstep((speed - lower_speed) / (upper_speed - lower_speed))
+      return CASCADE_P_SCALES[i - 1] + blend * (CASCADE_P_SCALES[i] - CASCADE_P_SCALES[i - 1])
+  return CASCADE_P_SCALES[-1]
 
 
 def get_actuation_speed(v_ego: float, a_ego: float, lat_delay: float) -> float:
@@ -88,17 +114,35 @@ def get_projected_lateral_accel(desired_curvature: float, v_ego: float, a_ego: f
   return actuation_speed, current_speed_lateral_accel + projection_correction
 
 
-def get_reference_rate_tracking(reference_rate: float, measurement_rate: float, v_ego: float) -> tuple[float, float]:
-  """Track the wheel motion implied by the future path without imposing a rate cap.
+def get_reference_rate_cascade(reference_rate: float, measurement_rate: float, position_error: float,
+                               applied_lateral_accel: float, v_ego: float) -> tuple[float, float, float, float, float, float]:
+  """Return future-path rate control and actuator-state feedback diagnostics."""
+  activation_scale = smoothstep((v_ego - CASCADE_ACTIVATION_MIN_SPEED) /
+                                (CASCADE_ACTIVATION_FULL_SPEED - CASCADE_ACTIVATION_MIN_SPEED))
+  speed_scale = reference_rate_tracking_speed_scale(v_ego) * activation_scale
+  catchup_rate = float(np.clip(CASCADE_POSITION_RATE_GAIN * position_error,
+                               -CASCADE_CATCHUP_RATE_MAX, CASCADE_CATCHUP_RATE_MAX))
+  desired_rate = float(np.clip(reference_rate + catchup_rate,
+                               -CASCADE_DESIRED_RATE_MAX, CASCADE_DESIRED_RATE_MAX))
+  rate_error = desired_rate - measurement_rate
+  rate_correction = float(np.clip(CASCADE_RATE_GAIN * rate_error,
+                                  -CASCADE_RATE_CORRECTION_MAX, CASCADE_RATE_CORRECTION_MAX)) * speed_scale
 
-  The correction drives the wheel when it lags a quick planned ramp and opposes
-  it when it outruns that ramp. Constant speed changes are excluded before this
-  comparison, so throttle and braking cannot create a false steering request.
-  """
-  speed_scale = reference_rate_tracking_speed_scale(v_ego)
-  correction = float(np.clip(REFERENCE_RATE_TRACKING_GAIN * (reference_rate - measurement_rate),
-                             -REFERENCE_RATE_TRACKING_MAX, REFERENCE_RATE_TRACKING_MAX))
-  return correction * speed_scale, speed_scale
+  # Applied torque is useful as a plant state, not as a duplicate request
+  # limiter. Only oppose torque that is still driving a wheel which is already
+  # outrunning the desired future-path rate. This naturally sits out a fast
+  # planned turn and does not pull torque from a stalled wheel.
+  actuator_correction = 0.0
+  if abs(measurement_rate) > 1e-3:
+    motion_sign = math.copysign(1.0, measurement_rate)
+    overspeed = max(-rate_error * motion_sign, 0.0)
+    applied_driving_motion = max(applied_lateral_accel * motion_sign, 0.0)
+    overspeed_scale = smoothstep(overspeed / CASCADE_ACTUATOR_OVERSPEED_FULL)
+    actuator_magnitude = min(CASCADE_ACTUATOR_STATE_GAIN * applied_driving_motion,
+                             CASCADE_ACTUATOR_CORRECTION_MAX)
+    actuator_correction = -motion_sign * actuator_magnitude * overspeed_scale * speed_scale
+
+  return rate_correction, actuator_correction, catchup_rate, desired_rate, rate_error, speed_scale
 
 
 class MeasurementRateFilter:
@@ -153,7 +197,8 @@ class LatControlTorque(LatControl):
     self.pid.set_limits(self.lateral_accel_from_torque(self.steer_max, self.torque_params),
                         self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
 
-  def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
+  def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay,
+             applied_torque=0.0):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
@@ -186,6 +231,8 @@ class LatControlTorque(LatControl):
     expected_lateral_accel = delayed_desired_curvature * CS.vEgo ** 2
     setpoint = expected_lateral_accel
     error = setpoint - measurement
+    tracking_position_error = (delayed_desired_curvature - measured_curvature) * rate_reference_speed ** 2
+    applied_lateral_accel = -applied_torque * self.torque_params.latAccelFactor
 
     lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len+1, -2))
     raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx+1] - self.lat_accel_request_buffer[lookahead_idx-1]) / (2 * self.dt)
@@ -200,17 +247,31 @@ class LatControlTorque(LatControl):
       torque_command = 0.0
       pid_log.active = False
       rate_tracking_correction = 0.0
+      actuator_state_correction = 0.0
       rate_tracking_scale = 0.0
+      catchup_rate = 0.0
+      cascade_desired_rate = 0.0
+      cascade_rate_error = 0.0
+      direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
     else:
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
 
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
       rate_tracking_correction = 0.0
+      actuator_state_correction = 0.0
       rate_tracking_scale = 0.0
+      catchup_rate = 0.0
+      cascade_desired_rate = reference_rate
+      cascade_rate_error = reference_rate - tracking_measurement_rate
+      direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
       if self.reference_rate_tracking_enabled and not CS.steeringPressed:
-        rate_tracking_correction, rate_tracking_scale = get_reference_rate_tracking(reference_rate, tracking_measurement_rate, CS.vEgo)
-      output_lataccel = self.pid.update(pid_log.error, speed=CS.vEgo, feedforward=ff + rate_tracking_correction,
+        cascade_values = get_reference_rate_cascade(reference_rate, tracking_measurement_rate, tracking_position_error,
+                                                     applied_lateral_accel, CS.vEgo)
+        rate_tracking_correction, actuator_state_correction, catchup_rate, cascade_desired_rate, cascade_rate_error, rate_tracking_scale = cascade_values
+      controller_error = pid_log.error * direct_p_scale
+      cascade_correction = rate_tracking_correction + actuator_state_correction
+      output_lataccel = self.pid.update(controller_error, speed=CS.vEgo, feedforward=ff + cascade_correction,
                                        freeze_integrator=freeze_integrator)
       output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
       torque_command = -output_torque
@@ -218,8 +279,8 @@ class LatControlTorque(LatControl):
       pid_log.active = True
       pid_log.p = float(self.pid.p)
       pid_log.i = float(self.pid.i)
-      pid_log.d = float(rate_tracking_correction)
-      pid_log.f = float(self.pid.f - rate_tracking_correction)
+      pid_log.d = float(cascade_correction)
+      pid_log.f = float(self.pid.f - cascade_correction)
       pid_log.output = float(torque_command) # TODO: log lat accel?
       pid_log.actualLateralAccel = float(measurement)
       pid_log.desiredLateralAccel = float(setpoint)
@@ -246,6 +307,13 @@ class LatControlTorque(LatControl):
     pid_log.rateTrackingSpeedScale = float(rate_tracking_scale)
     pid_log.referenceCurvatureRate = float(self.reference_rate_filter.curvature_rate)
     pid_log.measurementCurvatureRate = float(self.measurement_rate_filter.curvature_rate)
+    pid_log.cascadePositionError = float(tracking_position_error)
+    pid_log.cascadeCatchupRate = float(catchup_rate)
+    pid_log.cascadeDesiredRate = float(cascade_desired_rate)
+    pid_log.cascadeRateError = float(cascade_rate_error)
+    pid_log.actuatorAppliedLateralAccel = float(applied_lateral_accel)
+    pid_log.actuatorStateCorrection = float(actuator_state_correction)
+    pid_log.cascadePScale = float(direct_p_scale)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log

@@ -153,6 +153,7 @@ class Controls:
     # Steering PID loop and future-aware lateral reference planner
     # Reset desired curvature to current to avoid violating the limits on engage
     lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    applied_torque = self.sm['carOutput'].actuatorsOutput.torque
     if self.sm.valid['lateralManeuverPlan']:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
       self.lateral_reference_planner.reset()
@@ -163,7 +164,6 @@ class Controls:
       elif self.sm.updated['modelV2']:
         self.lateral_reference_planner.update(model_v2, self.curvature, CS.vEgo)
       if self.CP.lateralTuning.which() == 'torque':
-        applied_torque = self.sm['carOutput'].actuatorsOutput.torque
         new_desired_curvature = self.lateral_reference_planner.get_curvature(
           raw_desired_curvature, CS.vEgo, lat_delay, applied_torque,
           self.LaC.torque_params.latAccelFactor, self.LaC.torque_params.friction,
@@ -173,9 +173,14 @@ class Controls:
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
-    steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                     self.steer_limited_by_safety, self.desired_curvature,
-                                                     curvature_limited, lat_delay)
+    if self.CP.lateralTuning.which() == 'torque':
+      steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                       self.steer_limited_by_safety, self.desired_curvature,
+                                                       curvature_limited, lat_delay, applied_torque)
+    else:
+      steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                       self.steer_limited_by_safety, self.desired_curvature,
+                                                       curvature_limited, lat_delay)
     if self.CP.lateralTuning.which() == 'torque':
       reference_log = self.lateral_reference_planner.diagnostics
       lac_log.referenceVersion = reference_log.version

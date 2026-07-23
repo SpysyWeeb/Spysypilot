@@ -11,16 +11,23 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   ACTUATION_LATERAL_ACCEL_CORRECTION_MAX,
   ACTUATION_SPEED_PROJECTION_MAX_DELTA,
+  CASCADE_ACTUATOR_CORRECTION_MAX,
+  CASCADE_ACTIVATION_MIN_SPEED,
+  CASCADE_CATCHUP_RATE_MAX,
+  CASCADE_DESIRED_RATE_MAX,
+  CASCADE_P_SCALES,
+  CASCADE_P_SCALE_SPEEDS,
+  CASCADE_RATE_CORRECTION_MAX,
   REFERENCE_RATE_MIN_SPEED,
-  REFERENCE_RATE_TRACKING_MAX,
   REFERENCE_RATE_TRACKING_SCALES,
   REFERENCE_RATE_TRACKING_SPEEDS,
   VERSION,
   LatControlTorque,
   MeasurementRateFilter,
+  cascade_p_scale,
   get_actuation_speed,
   get_projected_lateral_accel,
-  get_reference_rate_tracking,
+  get_reference_rate_cascade,
   reference_rate_tracking_speed_scale,
 )
 
@@ -32,37 +39,61 @@ def get_controller(car_name):
   return LatControlTorque(CP.as_reader(), CI, DT_CTRL), VehicleModel(CP)
 
 
-class TestReferenceRateTracking:
+class TestReferenceRateCascade:
   def test_zero_error_has_no_correction(self):
-    correction, scale = get_reference_rate_tracking(1.0, 1.0, 5.0)
-    assert correction == 0.0
+    rate, actuator, catchup, desired, error, scale = get_reference_rate_cascade(1.0, 1.0, 0.0, 0.0, 5.0)
+    assert rate == 0.0
+    assert actuator == 0.0
+    assert catchup == 0.0
+    assert desired == 1.0
+    assert error == 0.0
     assert scale == pytest.approx(1.0)
 
-  @pytest.mark.parametrize(("reference_rate", "measurement_rate", "sign"), [
-    (1.0, 0.25, 1.0),    # drive a wheel lagging the future path
-    (0.25, 1.0, -1.0),   # brake a wheel outrunning the future path
-    (-1.0, 1.0, -1.0),   # start a planned reversal without waiting for measured motion to reverse
+  @pytest.mark.parametrize(("reference_rate", "measurement_rate", "position_error", "sign"), [
+    (1.0, 0.25, 0.0, 1.0),    # drive a wheel lagging the future path
+    (0.25, 1.0, 0.0, -1.0),   # brake a wheel outrunning the future path
+    (-1.0, 1.0, 0.0, -1.0),   # start a planned reversal before measured motion reverses
+    (0.0, 0.0, 0.25, 1.0),    # turn position error into a catch-up rate, not raw torque
   ])
-  def test_tracks_reference_in_both_directions(self, reference_rate, measurement_rate, sign):
-    correction, _ = get_reference_rate_tracking(reference_rate, measurement_rate, 5.0)
-    assert correction * sign > 0.0
+  def test_tracks_reference_and_position_in_both_directions(self, reference_rate, measurement_rate, position_error, sign):
+    rate, _, _, _, _, _ = get_reference_rate_cascade(reference_rate, measurement_rate, position_error, 0.0, 5.0)
+    assert rate * sign > 0.0
 
-  def test_correction_is_bounded(self):
-    positive, _ = get_reference_rate_tracking(100.0, 0.0, 5.0)
-    negative, _ = get_reference_rate_tracking(-100.0, 0.0, 5.0)
-    assert positive == pytest.approx(REFERENCE_RATE_TRACKING_MAX)
-    assert negative == pytest.approx(-REFERENCE_RATE_TRACKING_MAX)
+  def test_cascade_is_bounded(self):
+    positive = get_reference_rate_cascade(100.0, 0.0, 100.0, 0.0, 5.0)
+    negative = get_reference_rate_cascade(-100.0, 0.0, -100.0, 0.0, 5.0)
+    assert positive[0] == pytest.approx(CASCADE_RATE_CORRECTION_MAX)
+    assert negative[0] == pytest.approx(-CASCADE_RATE_CORRECTION_MAX)
+    assert positive[2] == pytest.approx(CASCADE_CATCHUP_RATE_MAX)
+    assert negative[2] == pytest.approx(-CASCADE_CATCHUP_RATE_MAX)
+    assert positive[3] == pytest.approx(CASCADE_DESIRED_RATE_MAX)
+    assert negative[3] == pytest.approx(-CASCADE_DESIRED_RATE_MAX)
+
+  def test_cascade_is_suppressed_at_standstill(self):
+    result = get_reference_rate_cascade(100.0, 0.0, 100.0, 0.0, CASCADE_ACTIVATION_MIN_SPEED)
+    assert result[0] == 0.0
+    assert result[-1] == 0.0
+
+  def test_applied_state_only_brakes_excess_motion(self):
+    # Measured motion outruns the desired rate while applied torque still drives it.
+    rate, actuator, *_ = get_reference_rate_cascade(0.0, 2.0, 0.0, 2.0, 5.0)
+    assert rate < 0.0
+    assert -CASCADE_ACTUATOR_CORRECTION_MAX <= actuator < 0.0
+
+    # The same applied torque must not be opposed while the wheel lags a quick planned ramp.
+    _, actuator, *_ = get_reference_rate_cascade(3.0, 1.0, 0.0, 2.0, 5.0)
+    assert actuator == 0.0
 
   def test_all_speed_schedule(self):
-    full, _ = get_reference_rate_tracking(100.0, 0.0, 12.0 * CV.MPH_TO_MS)
-    casual, _ = get_reference_rate_tracking(100.0, 0.0, 30.0 * CV.MPH_TO_MS)
-    highway, _ = get_reference_rate_tracking(100.0, 0.0, 60.0 * CV.MPH_TO_MS)
-    very_high, scale = get_reference_rate_tracking(100.0, 0.0, 100.0 * CV.MPH_TO_MS)
+    full = get_reference_rate_cascade(100.0, 0.0, 0.0, 0.0, 12.0 * CV.MPH_TO_MS)
+    casual = get_reference_rate_cascade(100.0, 0.0, 0.0, 0.0, 30.0 * CV.MPH_TO_MS)
+    highway = get_reference_rate_cascade(100.0, 0.0, 0.0, 0.0, 60.0 * CV.MPH_TO_MS)
+    very_high = get_reference_rate_cascade(100.0, 0.0, 0.0, 0.0, 100.0 * CV.MPH_TO_MS)
 
-    assert casual == pytest.approx(full * 0.50)
-    assert highway == pytest.approx(full * 0.35)
-    assert very_high == pytest.approx(full * 0.25)
-    assert scale == pytest.approx(0.25)
+    assert casual[0] == pytest.approx(full[0] * 0.50)
+    assert highway[0] == pytest.approx(full[0] * 0.35)
+    assert very_high[0] == pytest.approx(full[0] * 0.25)
+    assert very_high[-1] == pytest.approx(0.25)
 
   def test_speed_schedule_is_continuous_monotonic_and_nonzero(self):
     samples = [reference_rate_tracking_speed_scale(speed) for speed in np.linspace(0.0, 50.0, 1001)]
@@ -72,9 +103,15 @@ class TestReferenceRateTracking:
       assert reference_rate_tracking_speed_scale(speed) == pytest.approx(scale)
 
   def test_symmetry(self):
-    positive, _ = get_reference_rate_tracking(1.0, -1.0, 5.0)
-    negative, _ = get_reference_rate_tracking(-1.0, 1.0, 5.0)
-    assert positive == pytest.approx(-negative)
+    positive = get_reference_rate_cascade(1.0, -1.0, 0.1, -0.5, 5.0)
+    negative = get_reference_rate_cascade(-1.0, 1.0, -0.1, 0.5, 5.0)
+    assert positive[:-1] == pytest.approx(tuple(-value for value in negative[:-1]))
+
+  def test_residual_p_schedule_is_continuous_and_restores_high_speed_gain(self):
+    samples = [cascade_p_scale(speed) for speed in np.linspace(0.0, 40.0, 1001)]
+    assert all(current >= previous for previous, current in zip(samples[:-1], samples[1:], strict=True))
+    for speed, scale in zip(CASCADE_P_SCALE_SPEEDS, CASCADE_P_SCALES, strict=True):
+      assert cascade_p_scale(speed) == pytest.approx(scale)
 
 
 class TestMeasurementRateFilter:
@@ -151,8 +188,11 @@ class TestReferenceRateTrackingIntegration:
     assert torque_log.trackingMeasurementRate == pytest.approx(0.0)
     assert torque_log.rateTrackingError > 0.0
     assert torque_log.rateTrackingCorrection > 0.0
+    assert torque_log.cascadeDesiredRate == pytest.approx(torque_log.referenceRate)
+    assert torque_log.cascadeRateError > 0.0
+    assert torque_log.cascadePScale == pytest.approx(0.5)
     assert torque_log.rateTrackingSpeedScale == pytest.approx(1.0)
-    assert torque_log.d == pytest.approx(torque_log.rateTrackingCorrection)
+    assert torque_log.d == pytest.approx(torque_log.rateTrackingCorrection + torque_log.actuatorStateCorrection)
     assert torque_log.rateBrake == 0.0
     assert torque_log.rateBrakeScale == 0.0
 
@@ -172,7 +212,7 @@ class TestReferenceRateTrackingIntegration:
 
     assert 0.25 < torque_log.rateTrackingSpeedScale < 0.35
     assert torque_log.rateTrackingCorrection > 0.0
-    assert torque_log.rateTrackingCorrection == pytest.approx(REFERENCE_RATE_TRACKING_MAX * torque_log.rateTrackingSpeedScale)
+    assert torque_log.rateTrackingCorrection == pytest.approx(CASCADE_RATE_CORRECTION_MAX * torque_log.rateTrackingSpeedScale)
 
   def test_feedforward_projection_is_logged_separately(self):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
