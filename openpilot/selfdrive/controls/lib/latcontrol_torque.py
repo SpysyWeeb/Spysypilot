@@ -32,6 +32,7 @@ JERK_LOOKAHEAD_SECONDS = 0.19
 JERK_GAIN = 0.3
 LAT_ACCEL_REQUEST_BUFFER_SECONDS = 1.0
 MEASUREMENT_RATE_FILTER_TAU = 0.12
+REFERENCE_RATE_INNOVATION_FILTER_TAU = 0.18
 # Two-degree-of-freedom cascade: the future path supplies reference motion,
 # position error supplies only a bounded catch-up rate, and the inner rate loop
 # supplies torque. This keeps quick planned turns while preventing raw position
@@ -82,7 +83,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 12
+VERSION = 13
 
 
 def smoothstep(value: float) -> float:
@@ -369,6 +370,9 @@ class LatControlTorque(LatControl):
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
     self.measurement_rate_filter = MeasurementRateFilter(self.dt)
     self.reference_rate_filter = MeasurementRateFilter(self.dt)
+    self.reference_rate_innovation_filter = FirstOrderFilter(
+      0.0, REFERENCE_RATE_INNOVATION_FILTER_TAU, self.dt, initialized=False,
+    )
     self.unwind_phase_tracker = UnwindPhaseTracker(self.dt)
     # Route-derived for the affected Hyundai EPS. Other torque platforms keep
     # their existing controller behavior until they are analyzed independently.
@@ -383,6 +387,7 @@ class LatControlTorque(LatControl):
   def reset(self):
     super().reset()
     self.unwind_phase_tracker.reset()
+    self.reference_rate_innovation_filter.initialized = False
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -396,7 +401,8 @@ class LatControlTorque(LatControl):
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay,
              applied_torque=0.0, reference_unwind_scale=0.0, reference_target_torque=0.0,
-             reference_geometric_target_torque: float | None = None):
+             reference_geometric_target_torque: float | None = None,
+             trajectory_reference_curvature_rate: float | None = None):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
@@ -405,7 +411,30 @@ class LatControlTorque(LatControl):
     self.reference_rate_filter.update(desired_curvature, CS.vEgo, active)
     rate_reference_speed = max(CS.vEgo, REFERENCE_RATE_MIN_SPEED)
     tracking_measurement_rate = self.measurement_rate_filter.curvature_rate * rate_reference_speed ** 2
-    reference_rate = self.reference_rate_filter.curvature_rate * rate_reference_speed ** 2
+    finite_difference_reference_curvature_rate = self.reference_rate_filter.curvature_rate
+    trajectory_reference_rate_valid = (
+      trajectory_reference_curvature_rate is not None and np.isfinite(trajectory_reference_curvature_rate)
+    )
+    trajectory_reference_innovation = 0.0
+    filtered_trajectory_reference_innovation = 0.0
+    if trajectory_reference_rate_valid:
+      # The horizon slope carries immediate planned motion. Retain only the
+      # low-frequency part of replan-to-replan changes in the final command,
+      # preventing its numerical derivative from turning small updates into
+      # steering-rate chatter.
+      trajectory_reference_innovation = (
+        finite_difference_reference_curvature_rate - float(trajectory_reference_curvature_rate)
+      )
+      filtered_trajectory_reference_innovation = float(
+        self.reference_rate_innovation_filter.update(trajectory_reference_innovation)
+      )
+      reference_curvature_rate = (
+        float(trajectory_reference_curvature_rate) + filtered_trajectory_reference_innovation
+      )
+    else:
+      self.reference_rate_innovation_filter.initialized = False
+      reference_curvature_rate = finite_difference_reference_curvature_rate
+    reference_rate = reference_curvature_rate * rate_reference_speed ** 2
     longitudinal_lateral_accel_rate = 2.0 * CS.vEgo * CS.aEgo * measured_curvature
     current_speed_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
     actuation_speed, future_desired_lateral_accel = get_projected_lateral_accel(desired_curvature, CS.vEgo, CS.aEgo, lat_delay)
@@ -542,7 +571,14 @@ class LatControlTorque(LatControl):
     pid_log.rateTrackingError = float(reference_rate - tracking_measurement_rate)
     pid_log.rateTrackingCorrection = float(rate_tracking_correction)
     pid_log.rateTrackingSpeedScale = float(rate_tracking_scale)
-    pid_log.referenceCurvatureRate = float(self.reference_rate_filter.curvature_rate)
+    pid_log.referenceCurvatureRate = float(reference_curvature_rate)
+    pid_log.finiteDifferenceReferenceCurvatureRate = float(finite_difference_reference_curvature_rate)
+    pid_log.trajectoryReferenceCurvatureRate = (
+      float(trajectory_reference_curvature_rate) if trajectory_reference_rate_valid else 0.0
+    )
+    pid_log.trajectoryReferenceRateValid = bool(trajectory_reference_rate_valid)
+    pid_log.trajectoryReferenceInnovation = float(trajectory_reference_innovation)
+    pid_log.filteredTrajectoryReferenceInnovation = float(filtered_trajectory_reference_innovation)
     pid_log.measurementCurvatureRate = float(self.measurement_rate_filter.curvature_rate)
     pid_log.cascadePositionError = float(tracking_position_error)
     pid_log.cascadeCatchupRate = float(catchup_rate)

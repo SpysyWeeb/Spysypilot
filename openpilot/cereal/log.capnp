@@ -915,7 +915,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     rateTrackingError @36 :Float32;            # reference minus measured curvature-motion rate, m/s^3
     rateTrackingCorrection @37 :Float32;       # bounded rate-tracking contribution, m/s^2
     rateTrackingSpeedScale @38 :Float32;       # all-speed gain schedule applied to rate tracking
-    referenceCurvatureRate @39 :Float32;        # filtered future-reference curvature rate, 1/m/s
+    referenceCurvatureRate @39 :Float32;        # curvature rate selected for cascade tracking, 1/m/s
     measurementCurvatureRate @40 :Float32;      # filtered measured curvature rate, 1/m/s
     cascadePositionError @41 :Float32;          # delay-aligned curvature error at the tracking speed, m/s^2
     cascadeCatchupRate @42 :Float32;            # bounded position-error contribution to desired rate, m/s^3
@@ -942,6 +942,11 @@ struct ControlsState @0x97ff69c53601abf1 {
     unwindSameEpisode @63 :Bool;                    # active phase still belongs to the original geometric maneuver
     unwindOppositeTime @64 :Float32;                # persisted opposite geometric-torque demand, seconds
     unwindEpisodeArmed @65 :Bool;                   # planner unwind geometry reset since the previous handoff
+    finiteDifferenceReferenceCurvatureRate @66 :Float32; # shadow rate from differentiating the final command, 1/m/s
+    trajectoryReferenceCurvatureRate @67 :Float32;       # centered rate from the continuous future path, 1/m/s
+    trajectoryReferenceRateValid @68 :Bool;              # future-path rate selected instead of the shadow fallback
+    trajectoryReferenceInnovation @69 :Float32;          # differentiated-command rate minus trajectory rate, 1/m/s
+    filteredTrajectoryReferenceInnovation @70 :Float32;  # low-frequency innovation retained by the cascade, 1/m/s
    }
 
   struct LateralAngleState {

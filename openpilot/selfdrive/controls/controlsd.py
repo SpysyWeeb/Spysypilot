@@ -180,7 +180,9 @@ class Controls:
                                                        self.steer_limited_by_safety, self.desired_curvature,
                                                        curvature_limited, lat_delay, applied_torque,
                                                        reference_log.unwind_scale, reference_log.target_torque,
-                                                       reference_log.geometric_target_torque)
+                                                       reference_log.geometric_target_torque,
+                                                       (reference_log.trajectory_curvature_rate
+                                                        if reference_log.trajectory_rate_valid else None))
     else:
       steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                        self.steer_limited_by_safety, self.desired_curvature,
@@ -194,6 +196,8 @@ class Controls:
       # Convert every planner diagnostic at the cereal boundary.
       lac_log.referenceBaseCurvature = float(reference_log.base_curvature)
       lac_log.referenceOutputCurvature = float(reference_log.output_curvature)
+      lac_log.trajectoryReferenceCurvatureRate = float(reference_log.trajectory_curvature_rate)
+      lac_log.trajectoryReferenceRateValid = bool(reference_log.trajectory_rate_valid)
       lac_log.referencePreviewTime = float(reference_log.sample_time)
       lac_log.referencePreviewExtraTime = float(reference_log.extra_time)
       lac_log.referenceTargetTorque = float(reference_log.target_torque)
