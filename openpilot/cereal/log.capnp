@@ -939,6 +939,9 @@ struct ControlsState @0x97ff69c53601abf1 {
     unwindPhaseOverspeed @60 :Float32;             # wheel-rate excess in the active unwind direction, m/s^3
     unwindNeutralTorque @61 :Float32;               # controller-side roll/offset neutral used for delivery timing
     unwindTorqueNeutralTime @62 :Float32;           # predicted transition time from applied torque to neutral, seconds
+    unwindSameEpisode @63 :Bool;                    # active phase still belongs to the original geometric maneuver
+    unwindOppositeTime @64 :Float32;                # persisted opposite geometric-torque demand, seconds
+    unwindEpisodeArmed @65 :Bool;                   # planner unwind geometry reset since the previous handoff
    }
 
   struct LateralAngleState {

@@ -21,6 +21,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   REFERENCE_RATE_MIN_SPEED,
   REFERENCE_RATE_TRACKING_SCALES,
   REFERENCE_RATE_TRACKING_SPEEDS,
+  UNWIND_EPISODE_OPPOSITE_TIME,
   UNWIND_TORQUE_BLEND_MAX,
   UNWIND_TORQUE_DELTA_DOWN,
   UNWIND_TORQUE_MAX,
@@ -156,6 +157,19 @@ class TestFutureUnwindBrake:
     assert torque_blend == pytest.approx(UNWIND_TORQUE_BLEND_MAX)
     assert activation == pytest.approx(1.0)
 
+  def test_overspeed_uses_raw_path_rate_not_catchup_target(self):
+    # The raw path is nearly stationary while the wheel is moving quickly.
+    # A position catch-up target in the wheel's direction must not redefine
+    # that motion as on-rate for unwind braking.
+    raw_path = get_future_unwind_brake(
+      1.0, 0.0, -4.0, 3.0, 0.0, 0.0, 2.5, 1.0,
+    )
+    catchup_inflated = get_future_unwind_brake(
+      1.0, 0.0, -4.0, -1.0, 0.0, 0.0, 2.5, 1.0,
+    )
+    assert raw_path[2] == pytest.approx(1.0)
+    assert catchup_inflated[2] == pytest.approx(0.0)
+
   def test_all_speed_schedule_retains_more_direct_p_at_high_speed(self):
     low_speed = get_future_unwind_brake(1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0)
     high_speed = get_future_unwind_brake(1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 0.25)
@@ -185,7 +199,7 @@ class TestFutureUnwindBrake:
 class TestUnwindPhaseTracker:
   def test_holds_through_delivery_then_releases_smoothly(self):
     tracker = UnwindPhaseTracker(DT_CTRL)
-    phase, direction, gap, _ = tracker.update(
+    phase, direction, gap, *_ = tracker.update(
       True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0,
     )
     assert phase == pytest.approx(1.0)
@@ -213,10 +227,58 @@ class TestUnwindPhaseTracker:
     assert direction == -1.0
     assert phase < 1.0
 
+  def test_opposite_geometric_maneuver_releases_delivery_hold(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    tracker.update(
+      True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0, -0.5,
+    )
+
+    samples = int(np.ceil(UNWIND_EPISODE_OPPOSITE_TIME / DT_CTRL)) + 1
+    for _ in range(samples):
+      phase, direction, gap, _, same_episode, opposite_time, episode_armed = tracker.update(
+        True, 1.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, 0.5,
+      )
+
+    assert direction == -1.0
+    assert gap > 0.05
+    assert not same_episode
+    assert opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME
+    assert not episode_armed
+    assert phase < 1.0
+
+    # The old geometry indication must not immediately start a second episode
+    # after the smooth handoff reaches zero.
+    for _ in range(100):
+      phase, *_, episode_armed = tracker.update(
+        True, 1.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, 0.5,
+      )
+    assert phase == 0.0
+    assert not episode_armed
+
+    *_, episode_armed = tracker.update(
+      True, 0.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, 0.5,
+    )
+    assert episode_armed
+
+  def test_geometric_deadband_does_not_chatter_episode_ownership(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    tracker.update(
+      True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0, -0.5,
+    )
+
+    for geometric_target in (0.27, 0.13) * 20:  # +/-0.07 around the 0.20 crown-neutral torque
+      phase, _, _, _, same_episode, opposite_time, _ = tracker.update(
+        True, 0.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, geometric_target,
+      )
+
+    assert phase == pytest.approx(1.0)
+    assert same_episode
+    assert opposite_time == 0.0
+
   def test_driver_override_resets_phase(self):
     tracker = UnwindPhaseTracker(DT_CTRL)
     tracker.update(True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0)
-    assert tracker.update(False, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0) == (0.0, 0.0, 0.0, 0.0)
+    assert tracker.update(False, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0) == (0.0, 0.0, 0.0, 0.0, False, 0.0, True)
 
 
 class TestTurnInDampingGuard:
@@ -363,4 +425,7 @@ class TestReferenceRateTrackingIntegration:
     assert torque_log.unwindTorqueCorrection > 0.0
     assert torque_log.unwindEffectivePhase == pytest.approx(1.0)
     assert torque_log.unwindPhaseDirection == -1.0
+    assert torque_log.unwindSameEpisode
+    assert torque_log.unwindOppositeTime == 0.0
+    assert torque_log.unwindEpisodeArmed
     assert 0.0 < torque < 0.8
