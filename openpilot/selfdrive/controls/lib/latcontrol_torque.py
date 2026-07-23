@@ -67,6 +67,8 @@ UNWIND_PHASE_START = 0.20
 UNWIND_PHASE_DELIVERY_GAP = 0.05  # normalized torque still left in the original turn direction
 UNWIND_PHASE_OVERSPEED = 0.15  # m/s^3 at the common tracking speed
 UNWIND_PHASE_RELEASE_TIME = 0.35  # seconds; smoothly restore direct P after delivery catches up
+UNWIND_EPISODE_TORQUE_DEADBAND = 0.08  # normalized geometric torque beyond crown-neutral
+UNWIND_EPISODE_OPPOSITE_TIME = 0.10  # seconds a new maneuver must persist before handoff
 DAMPING_TURN_IN_POSITION_ERROR_MIN = 0.08  # m/s^2 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_SCALE_MIN = 0.20
@@ -80,7 +82,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 11
+VERSION = 12
 
 
 def smoothstep(value: float) -> float:
@@ -179,7 +181,7 @@ def torque_transition_time(current: float, target: float, torque_build_rate: flo
 
 
 def get_future_unwind_brake(reference_unwind_scale: float, reference_target_torque: float, measurement_rate: float,
-                            rate_error: float, position_error: float, applied_torque: float,
+                            reference_rate_error: float, position_error: float, applied_torque: float,
                             lat_accel_factor: float, rate_tracking_scale: float,
                             torque_decay_rate: float | None = None, torque_build_rate: float | None = None,
                             neutral_torque: float = 0.0) -> tuple[float, float, float, float, float]:
@@ -193,7 +195,11 @@ def get_future_unwind_brake(reference_unwind_scale: float, reference_target_torq
     torque_transition_time(applied_torque, neutral_torque, torque_build_rate, torque_decay_rate),
     UNWIND_TORQUE_TRANSITION_TIME_MAX,
   )
-  projected_position_error = position_error + rate_error * torque_neutral_time
+  # Project against the path's actual future rate. The cascade catch-up rate is
+  # a bounded control goal for closing position error, not path motion. Folding
+  # it into this prediction can make a wheel which is already outrunning the
+  # path appear on-rate and suppress the brake during a catch-up fling.
+  projected_position_error = position_error + reference_rate_error * torque_neutral_time
 
   # Future-path unwind confidence alone transfers part of the low-speed duty
   # from the high-gain position loop to the rate loop. Fade this transfer with
@@ -206,7 +212,7 @@ def get_future_unwind_brake(reference_unwind_scale: float, reference_target_torq
   projected_scale = 0.0
   if abs(measurement_rate) > 1e-3:
     motion_sign = math.copysign(1.0, measurement_rate)
-    overspeed = max(-rate_error * motion_sign, 0.0)
+    overspeed = max(-reference_rate_error * motion_sign, 0.0)
     projected_overshoot = max(-projected_position_error * motion_sign, 0.0)
     overspeed_scale = smoothstep(overspeed / UNWIND_OVERSPEED_FULL)
     projected_scale = smoothstep(projected_overshoot / UNWIND_PROJECTED_ERROR_FULL)
@@ -229,37 +235,69 @@ class UnwindPhaseTracker:
     self.turn_torque_sign = 0.0
     self.delivery_gap = 0.0
     self.overspeed = 0.0
+    self.same_episode = False
+    self.opposite_time = 0.0
+    self.episode_armed = True
 
   def reset(self) -> None:
     self.phase = 0.0
     self.turn_torque_sign = 0.0
     self.delivery_gap = 0.0
     self.overspeed = 0.0
+    self.same_episode = False
+    self.opposite_time = 0.0
+    self.episode_armed = True
 
   def update(self, enabled: bool, geometry_scale: float, delayed_desired_curvature: float,
              reference_target_torque: float, applied_torque: float, neutral_torque: float,
-             reference_rate: float, measurement_rate: float) -> tuple[float, float, float, float]:
+             reference_rate: float, measurement_rate: float,
+             geometric_target_torque: float | None = None) -> tuple[float, float, float, float, bool, float, bool]:
     if not enabled:
       self.reset()
-      return self.phase, self.turn_torque_sign, self.delivery_gap, self.overspeed
+      return (self.phase, self.turn_torque_sign, self.delivery_gap, self.overspeed,
+              self.same_episode, self.opposite_time, self.episode_armed)
 
-    candidate_sign = 0.0 if abs(delayed_desired_curvature) < 1e-5 else -math.copysign(1.0, delayed_desired_curvature)
-    if candidate_sign == 0.0 and abs(applied_torque - neutral_torque) > UNWIND_PHASE_DELIVERY_GAP:
-      candidate_sign = math.copysign(1.0, applied_torque - neutral_torque)
+    if geometric_target_torque is None:
+      candidate_sign = 0.0 if abs(delayed_desired_curvature) < 1e-5 else -math.copysign(1.0, delayed_desired_curvature)
+    else:
+      geometric_torque = geometric_target_torque - neutral_torque
+      candidate_sign = (0.0 if abs(geometric_torque) < UNWIND_EPISODE_TORQUE_DEADBAND
+                        else math.copysign(1.0, geometric_torque))
     geometry_scale = float(np.clip(geometry_scale, 0.0, 1.0))
-    if self.phase <= 1e-6 and geometry_scale >= UNWIND_PHASE_START and candidate_sign != 0.0:
-      self.turn_torque_sign = candidate_sign
-      self.phase = geometry_scale
+    if self.phase <= 1e-6 and not self.episode_armed and geometry_scale < UNWIND_PHASE_START:
+      self.episode_armed = True
+    if self.phase <= 1e-6 and self.episode_armed and geometry_scale >= UNWIND_PHASE_START:
+      # Start ownership from the current delay-aligned maneuver; use the
+      # future geometric target only to identify when that ownership changes.
+      start_sign = (0.0 if abs(delayed_desired_curvature) < 1e-5
+                    else -math.copysign(1.0, delayed_desired_curvature))
+      if start_sign == 0.0:
+        start_sign = candidate_sign
+      if start_sign == 0.0 and abs(applied_torque - neutral_torque) > UNWIND_PHASE_DELIVERY_GAP:
+        start_sign = math.copysign(1.0, applied_torque - neutral_torque)
+      if start_sign != 0.0:
+        self.turn_torque_sign = start_sign
+        self.same_episode = True
+        self.phase = geometry_scale
 
     if self.phase <= 1e-6:
-      return self.phase, self.turn_torque_sign, self.delivery_gap, self.overspeed
+      return (self.phase, self.turn_torque_sign, self.delivery_gap, self.overspeed,
+              self.same_episode, self.opposite_time, self.episode_armed)
 
-    same_episode = candidate_sign == 0.0 or candidate_sign == self.turn_torque_sign
-    episode_geometry_scale = geometry_scale if same_episode else 0.0
+    opposite_maneuver = candidate_sign != 0.0 and candidate_sign != self.turn_torque_sign
+    if self.same_episode:
+      self.opposite_time = self.opposite_time + self.dt if opposite_maneuver else 0.0
+      if self.opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME:
+        # Once ownership transfers, do not let a near-neutral target re-arm
+        # delivery or overspeed holds for the old turn while its phase fades.
+        self.same_episode = False
+        self.episode_armed = False
+
+    episode_geometry_scale = geometry_scale if self.same_episode and not opposite_maneuver else 0.0
     self.delivery_gap = max((applied_torque - reference_target_torque) * self.turn_torque_sign, 0.0)
     self.overspeed = max((measurement_rate - reference_rate) * self.turn_torque_sign, 0.0)
-    delivery_incomplete = self.delivery_gap > UNWIND_PHASE_DELIVERY_GAP
-    wheel_overspeed = self.overspeed > UNWIND_PHASE_OVERSPEED
+    delivery_incomplete = self.same_episode and self.delivery_gap > UNWIND_PHASE_DELIVERY_GAP
+    wheel_overspeed = self.same_episode and self.overspeed > UNWIND_PHASE_OVERSPEED
     phase_target = max(episode_geometry_scale, 1.0 if delivery_incomplete or wheel_overspeed else 0.0)
 
     if phase_target >= self.phase:
@@ -268,8 +306,17 @@ class UnwindPhaseTracker:
       self.phase = max(self.phase - self.dt / UNWIND_PHASE_RELEASE_TIME, phase_target)
 
     if self.phase <= 1e-6:
-      self.reset()
-    return self.phase, self.turn_torque_sign, self.delivery_gap, self.overspeed
+      # Preserve the handoff lockout until the planner's unwind geometry has
+      # fallen below its start threshold; otherwise one old unwind indication
+      # can immediately create a second phase owned by the next maneuver.
+      self.phase = 0.0
+      self.turn_torque_sign = 0.0
+      self.delivery_gap = 0.0
+      self.overspeed = 0.0
+      self.same_episode = False
+      self.opposite_time = 0.0
+    return (self.phase, self.turn_torque_sign, self.delivery_gap, self.overspeed,
+            self.same_episode, self.opposite_time, self.episode_armed)
 
 
 def should_block_undertracked_turn_in_damping(delayed_desired_curvature: float, position_error: float,
@@ -348,7 +395,8 @@ class LatControlTorque(LatControl):
                         self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay,
-             applied_torque=0.0, reference_unwind_scale=0.0, reference_target_torque=0.0):
+             applied_torque=0.0, reference_unwind_scale=0.0, reference_target_torque=0.0,
+             reference_geometric_target_torque: float | None = None):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
@@ -389,8 +437,10 @@ class LatControlTorque(LatControl):
       self.reference_rate_tracking_enabled and active and not CS.steeringPressed,
       reference_unwind_scale, delayed_desired_curvature, reference_target_torque,
       applied_torque, neutral_torque, reference_rate, tracking_measurement_rate,
+      reference_geometric_target_torque,
     )
-    effective_unwind_scale, unwind_phase_direction, unwind_delivery_gap, unwind_phase_overspeed = phase_values
+    (effective_unwind_scale, unwind_phase_direction, unwind_delivery_gap, unwind_phase_overspeed,
+     unwind_same_episode, unwind_opposite_time, unwind_episode_armed) = phase_values
     damping_turn_in_blocked = self.reference_rate_tracking_enabled and should_block_undertracked_turn_in_damping(
       delayed_desired_curvature, tracking_position_error, reference_rate, effective_unwind_scale,
     )
@@ -445,8 +495,9 @@ class LatControlTorque(LatControl):
         cascade_values = get_reference_rate_cascade(reference_rate, tracking_measurement_rate, tracking_position_error,
                                                      applied_lateral_accel, CS.vEgo)
         rate_tracking_correction, actuator_state_correction, catchup_rate, cascade_desired_rate, cascade_rate_error, rate_tracking_scale = cascade_values
+        reference_rate_error = reference_rate - tracking_measurement_rate
         unwind_values = get_future_unwind_brake(effective_unwind_scale, reference_target_torque, tracking_measurement_rate,
-                                                cascade_rate_error, tracking_position_error, applied_torque,
+                                                reference_rate_error, tracking_position_error, applied_torque,
                                                 self.torque_params.latAccelFactor, rate_tracking_scale,
                                                 self.unwind_torque_decay_rate, self.unwind_torque_build_rate,
                                                 neutral_torque)
@@ -512,6 +563,9 @@ class LatControlTorque(LatControl):
     pid_log.unwindPhaseOverspeed = float(unwind_phase_overspeed)
     pid_log.unwindNeutralTorque = float(neutral_torque)
     pid_log.unwindTorqueNeutralTime = float(unwind_torque_neutral_time)
+    pid_log.unwindSameEpisode = bool(unwind_same_episode)
+    pid_log.unwindOppositeTime = float(unwind_opposite_time)
+    pid_log.unwindEpisodeArmed = bool(unwind_episode_armed)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log
