@@ -121,6 +121,8 @@ class TestLateralReferencePlanner:
     torque_log = log.ControlsState.LateralTorqueState.new_message()
     torque_log.referenceBaseCurvature = planner.diagnostics.base_curvature
     torque_log.referenceOutputCurvature = planner.diagnostics.output_curvature
+    torque_log.trajectoryReferenceCurvatureRate = planner.diagnostics.trajectory_curvature_rate
+    torque_log.trajectoryReferenceRateValid = planner.diagnostics.trajectory_rate_valid
     torque_log.referencePreviewTime = planner.diagnostics.sample_time
     torque_log.referencePreviewExtraTime = planner.diagnostics.extra_time
     torque_log.referenceTargetTorque = planner.diagnostics.target_torque
@@ -145,6 +147,35 @@ class TestLateralReferencePlanner:
     assert output >= raw_curvature
     assert planner.diagnostics.extra_time == 0.0
     assert planner.diagnostics.authority_restored > 0.0
+
+  def test_trajectory_rate_preserves_quick_planned_motion(self):
+    speed = 10.0
+    curvature_rate = 0.001
+    # Integral of yaw_rate = speed * curvature_rate * time.
+    yaws = 0.5 * speed * curvature_rate * MODEL_T**2
+    planner = LateralReferencePlanner()
+    assert planner.update(build_model(yaws, speed), 0.0, speed)
+
+    planner.get_curvature(0.0, speed, LATERAL_DELAY)
+    assert planner.diagnostics.trajectory_rate_valid
+    assert planner.diagnostics.trajectory_curvature_rate == pytest.approx(curvature_rate, rel=0.10)
+
+  def test_trajectory_rate_rejects_constant_curve_replan_step(self):
+    speed = 10.0
+    planner = LateralReferencePlanner()
+    assert planner.update(constant_curvature_model(0.003, speed), 0.0, speed)
+    previous_output = planner.get_curvature(0.003, speed, LATERAL_DELAY)
+    for _ in range(4):
+      previous_output = planner.get_curvature(0.003, speed, LATERAL_DELAY)
+
+    # A small replan-to-replan curvature step looks like a very fast rate when
+    # the final 100 Hz output is differentiated. The horizon itself still
+    # describes a steady curve and should report almost no planned motion.
+    assert planner.update(constant_curvature_model(0.0035, speed), 0.003, speed)
+    output = planner.get_curvature(0.0035, speed, LATERAL_DELAY)
+    finite_difference_rate = (output - previous_output) / planner.dt
+    assert abs(finite_difference_rate) > 0.01
+    assert abs(planner.diagnostics.trajectory_curvature_rate) < 0.001
 
   def test_actuator_transition_accounts_for_slow_sign_reversal(self):
     planner = LateralReferencePlanner()
@@ -275,3 +306,4 @@ class TestLateralReferencePlanner:
     planner.update(constant_curvature_model(0.01), 0.0, V_EGO)
     planner.reset()
     assert planner.get_curvature(-0.004, V_EGO, LATERAL_DELAY) == -0.004
+    assert not planner.diagnostics.trajectory_rate_valid

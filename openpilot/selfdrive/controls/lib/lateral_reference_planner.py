@@ -11,6 +11,7 @@ HORIZON_SECONDS = 1.5
 TRAJECTORY_DT = DT_MDL
 TRAJECTORY_T = np.arange(0.0, HORIZON_SECONDS + TRAJECTORY_DT / 2.0, TRAJECTORY_DT)
 TRAJECTORY_SIZE = len(TRAJECTORY_T)
+TRAJECTORY_RATE_WINDOW = 0.20
 
 # The model path starts at camera capture time. modeld currently samples the
 # scalar action one frame plus half an action interval into the future.
@@ -76,9 +77,11 @@ class ActuatorPreviewConfig:
 
 @dataclass
 class LateralReferenceDiagnostics:
-  version: int = 3
+  version: int = 4
   base_curvature: float = 0.0
   output_curvature: float = 0.0
+  trajectory_curvature_rate: float = 0.0
+  trajectory_rate_valid: bool = False
   sample_time: float = 0.0
   extra_time: float = 0.0
   target_torque: float = 0.0
@@ -211,6 +214,18 @@ class LateralReferencePlanner:
     if self.predicted_speeds is None:
       return max(fallback, MIN_MODEL_SPEED)
     return float(np.interp(sample_time, TRAJECTORY_T, self.predicted_speeds))
+
+  def _trajectory_curvature_rate(self, sample_time: float) -> float:
+    """Return a centered slope from the continuous future-path solution."""
+    assert self.solution is not None
+    half_window = 0.5 * TRAJECTORY_RATE_WINDOW
+    start_time = max(sample_time - half_window, TRAJECTORY_T[0])
+    end_time = min(sample_time + half_window, TRAJECTORY_T[-1])
+    if end_time - start_time < 1e-6:
+      return 0.0
+    start_curvature = float(np.interp(start_time, TRAJECTORY_T, self.solution))
+    end_curvature = float(np.interp(end_time, TRAJECTORY_T, self.solution))
+    return (end_curvature - start_curvature) / (end_time - start_time)
 
   def _target_torque(self, curvature: float, sample_time: float, v_ego: float, lat_accel_factor: float, friction: float,
                      roll: float = 0.0, lat_accel_offset: float = 0.0) -> float:
@@ -353,6 +368,8 @@ class LateralReferencePlanner:
     self.diagnostics = LateralReferenceDiagnostics(
       base_curvature=float(base_curvature),
       output_curvature=float(output_curvature),
+      trajectory_curvature_rate=float(self._trajectory_curvature_rate(sample_time)),
+      trajectory_rate_valid=True,
       sample_time=float(sample_time),
       extra_time=float(sample_time - base_time),
       target_torque=float(target_torque),
