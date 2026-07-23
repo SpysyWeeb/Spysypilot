@@ -20,7 +20,12 @@ class LatEventToast:
     if recv_frame > self._last_recv_frame:
       self._last_recv_frame = recv_frame
       if ui_state.sm.updated["lateralEvent"] and ui_state.sm.valid["lateralEvent"]:
-        self._visible_until = time.monotonic() + self.DISPLAY_SECONDS
+        # The shared bookmark button records both long and lateral context. Let the
+        # structured userBookmark alert provide the single manual confirmation.
+        if str(ui_state.sm["lateralEvent"].source) == "user":
+          self._visible_until = 0.0
+        else:
+          self._visible_until = time.monotonic() + self.DISPLAY_SECONDS
 
     remaining = self._visible_until - time.monotonic()
     if remaining <= 0.0:
