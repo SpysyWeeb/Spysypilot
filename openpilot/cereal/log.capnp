@@ -930,6 +930,15 @@ struct ControlsState @0x97ff69c53601abf1 {
     unwindTorqueCorrection @51 :Float32;         # normalized request shift toward the future target torque
     cascadeBasePScale @52 :Float32;              # speed-scheduled P share before future-unwind arbitration
     dampingTurnInBlocked @53 :Bool;               # preserve authority while a same-direction turn is under-tracked
+    referenceGeometricTargetTorque @54 :Float32;  # controller-consistent torque for the selected path sample
+    referenceNeutralTorque @55 :Float32;          # roll/offset torque required at zero geometric curvature
+    referenceReachableTargetTorque @56 :Float32;  # backward rate-reachable target from the future torque trajectory
+    unwindEffectivePhase @57 :Float32;             # geometry phase retained through actuator delivery and P handback
+    unwindPhaseDirection @58 :Float32;             # original turn torque sign for the active unwind episode
+    unwindDeliveryGap @59 :Float32;                # old-turn applied torque remaining beyond the reachable target
+    unwindPhaseOverspeed @60 :Float32;             # wheel-rate excess in the active unwind direction, m/s^3
+    unwindNeutralTorque @61 :Float32;               # controller-side roll/offset neutral used for delivery timing
+    unwindTorqueNeutralTime @62 :Float32;           # predicted transition time from applied torque to neutral, seconds
    }
 
   struct LateralAngleState {
