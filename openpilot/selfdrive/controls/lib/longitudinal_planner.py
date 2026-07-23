@@ -9,7 +9,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.blt import BLTSupervisor
+from openpilot.selfdrive.controls.lib.blt import BLTSupervisor, LeadDeparturePreRelease
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
@@ -58,6 +58,7 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
+    self.lead_departure = LeadDeparturePreRelease()
 
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -161,6 +162,15 @@ class LongitudinalPlanner:
     action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
     output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                                                         action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
+    # Route 8d: the Palisade took ~2.1 s from a positive post-controller request to
+    # wheel motion at standstill, while the normal planner action horizon is ~0.55 s.
+    # Start only the hold-release/brake-bleed leg from the radar-anchored predicted
+    # lead departure; preserve the MPC aTarget so this does not retune the launch curve.
+    pre_release = self.lead_departure.update(
+      sm, active=self.CP.openpilotLongitudinalControl and not long_control_off,
+    )
+    if pre_release:
+      output_should_stop_mpc = False
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 

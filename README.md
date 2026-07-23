@@ -14,7 +14,12 @@ Three cooperating pieces:
 
 - **BLT necessity supervisor** (`blt.py`) — a watchdog that modulates the MPC's per-frame runtime knobs (`jerk_factor`, `t_follow`, an `aLeadTau` floor) instead of overriding its commands. A *recovery boost* relaxes the solver when braking is provably no longer necessary (measured excess, or the model forecasting the lead pulling away), a *launch boost* stiffens response when the plan lags a genuinely accelerating lead, and a *whiplash ratchet* lets stiffness relax at any time but never re-stiffen while the lead is braking toward us. Triggers share a debounced arm/hold/reset primitive (`DebouncedTrigger`).
 - **Model-predicted lead trajectories** (`long_mpc.py`) — the MPC plans against the driving model's `leadsV3` forecast, currently in the *unmodified* PR #37824 form: the earlier forecast trust ledger and radar pull-away floor were removed 2026-07-18 for a stock-baseline A/B field test (both preserved in git history; see docs/BLoT.md).
-- **Launch chain** (`longcontrol.py` + opendbc) — the starting state issues a *proportional* command, `clip(a_target, 0.6, startAccel)`, so `startAccel` (raised to 1.5 on the opendbc side, with starting-state jerk limit 5.0) is a ceiling the plan can use, not a fixed shove.
+- **Launch chain** (`blt.py` + `longitudinal_planner.py` + `longcontrol.py` + opendbc) —
+  while stopped behind a tracked lead, a sustained radar-anchored model prediction of
+  departure pre-releases only the MPC hold so the Palisade's measured brake bleed can
+  start early. The starting state then issues a *proportional* command,
+  `clip(a_target, 0.6, startAccel)`, so `startAccel` (raised to 1.5 on the opendbc side,
+  with starting-state jerk limit 5.0) is a ceiling the plan can use, not a fixed shove.
 
 ## What changed
 
@@ -22,7 +27,8 @@ Three cooperating pieces:
 - `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` — model-predicted lead trajectories (PR #37824, currently stock form — ledger/floor removed for A/B testing), base-tune constants.
 - `openpilot/selfdrive/controls/lib/longitudinal_planner.py` — BLT wiring into the MPC's weights, raised accel limits.
 - `openpilot/selfdrive/controls/lib/longcontrol.py` — proportional starting command.
-- `openpilot/selfdrive/controls/tests/test_blt.py` *(new)* — 24 unit tests on trigger/ratchet/onset semantics.
+- `openpilot/selfdrive/controls/tests/test_blt.py` *(new)* — unit tests on trigger,
+  ratchet, onset, and standstill pre-release semantics.
 - `docs/BLoT.md` *(new)* — full architecture, retired interventions, and the "no crutches" doctrine.
 - `opendbc_repo` (SpysyWeeb/opendbc, branch `BLoT`) — Hyundai `startAccel` 1.5 and starting-state CAN jerk limit 5.0.
 

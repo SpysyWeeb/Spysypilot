@@ -22,6 +22,10 @@ Interventions (see docs/BLoT.md for the field data behind each):
                       necessity zero, plan accel lagging the lead's own -- stale LOW
                       acceleration, same knob. Radar-driven (for launches radar leads
                       the model, the reverse of hard braking). Never touches t_follow.
+  lead pre-release -- at standstill only, release the MPC hold when the radar-anchored
+                      model trajectory consistently predicts the tracked lead will be
+                      moving within the Palisade's measured brake-bleed time. This
+                      changes only shouldStop; the MPC acceleration target is untouched.
   whiplash ratchet -- the jerk scale may relax at any time but may only STIFFEN while
                       the measured lead is braking and ego closes, so a boost live when
                       a launch flips to braking keeps its relaxed cost through the
@@ -81,6 +85,14 @@ LAUNCH_DEBOUNCE = 0.4       # s, matches EXCESS_DEBOUNCE
 RATCHET_LEAD_BRAKE = 0.2    # m/s^2, lead decel beyond this (while closing) freezes any
                             # upward slew of the jerk scale -- the whiplash guard
 
+# --- standstill lead-departure pre-release (route 8d) ---
+LEAD_DEPARTURE_LOOKAHEAD = 2.0  # s, first leadsV3 prediction sample and measured median
+                                 # post-controller-to-wheel-motion delay on the Palisade
+LEAD_DEPARTURE_SPEED = 0.3      # m/s, predicted speed that counts as a real departure
+LEAD_MOVING_SPEED = 0.25        # m/s, measured lead motion is definitive and needs no debounce
+LEAD_DEPARTURE_CONFIRM = 0.2    # s, reject one-frame launch forecasts before releasing the hold
+LEAD_DEPARTURE_CANCEL = 0.2     # s, reject brief forecast/radar dropouts before reapplying the hold
+
 # --- dynamic onset ---
 ONSET_LEAD_DECEL = 0.4   # m/s^2, lead braking at least this much opens the gap term early
 ONSET_PAD_MAX = 0.45     # s, max t_follow pad ON TOP of the personality base (route 3c: an
@@ -114,6 +126,71 @@ class DebouncedTrigger:
     elif disarm:
       self._s = 0.0
     return self._s >= self.debounce
+
+
+class LeadDeparturePreRelease:
+  """Standstill-only brake-bleed compensation for a tracked lead launch.
+
+  NewLeadMpc anchors the model trajectory to radar at t=0; use the same anchoring
+  here and inspect its first future sample (2 s). A sustained predicted departure
+  releases only the MPC's shouldStop bit, allowing the existing starting state to
+  begin brake bleed while leaving aTarget and the driving curve unchanged.
+
+  Loss of both predicted and measured departure evidence cancels after a short
+  confirmation, preventing a release-rehold pulse on a one-frame model/radar dropout.
+  """
+  def __init__(self):
+    self._prediction_s = 0.0
+    self._cancel_s = 0.0
+    self._released = False
+
+  def reset(self) -> None:
+    self._prediction_s = 0.0
+    self._cancel_s = 0.0
+    self._released = False
+
+  @staticmethod
+  def _predicted_speed(sm):
+    leads_v3 = sm['modelV2'].leadsV3
+    if len(leads_v3) < 1:
+      return None
+    model_lead = leads_v3[0]
+    if model_lead.prob < MODEL_LEAD_PROB_MIN or len(model_lead.v) < 2:
+      return None
+
+    # Match NewLeadMpc's radar anchoring: radar owns the current speed and the model
+    # contributes only its predicted delta over the first two seconds.
+    lead = sm['radarState'].leadOne
+    return float(lead.vLead) + float(model_lead.v[1]) - float(model_lead.v[0])
+
+  def update(self, sm, active: bool) -> bool:
+    lead = sm['radarState'].leadOne
+    if not (active and sm['carState'].standstill and sm.valid['radarState'] and lead.status):
+      self.reset()
+      return False
+
+    # Measured motion is definitive and bypasses the model-arm debounce. Brief loss
+    # of both radar and model evidence is handled by the cancellation debounce below.
+    if float(lead.vLeadK) > LEAD_MOVING_SPEED:
+      self._released = True
+      self._prediction_s = 0.0
+      self._cancel_s = 0.0
+      return True
+
+    predicted_speed = self._predicted_speed(sm)
+    if predicted_speed is not None and predicted_speed > LEAD_DEPARTURE_SPEED:
+      self._prediction_s += DT_MDL
+      self._cancel_s = 0.0
+      if self._prediction_s + 1e-9 >= LEAD_DEPARTURE_CONFIRM:
+        self._released = True
+    else:
+      self._prediction_s = 0.0
+      if self._released:
+        self._cancel_s += DT_MDL
+        if self._cancel_s + 1e-9 >= LEAD_DEPARTURE_CANCEL:
+          self.reset()
+
+    return self._released
 
 
 class BLTSupervisor:
