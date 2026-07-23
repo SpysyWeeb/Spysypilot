@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from openpilot.cereal import log
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.selfdrive.controls.lib.lateral_reference_planner import (
   ActuatorPreviewConfig,
   LateralReferencePlanner,
@@ -127,6 +128,9 @@ class TestLateralReferencePlanner:
     torque_log.referenceUnwindScale = planner.diagnostics.unwind_scale
     torque_log.referenceAuthorityRestored = planner.diagnostics.authority_restored
     torque_log.referencePreviewCorrection = planner.diagnostics.preview_correction
+    torque_log.referenceGeometricTargetTorque = planner.diagnostics.geometric_target_torque
+    torque_log.referenceNeutralTorque = planner.diagnostics.neutral_torque
+    torque_log.referenceReachableTargetTorque = planner.diagnostics.reachable_target_torque
 
   def test_actuator_preview_preserves_turn_in_authority(self):
     speed = 3.0
@@ -148,6 +152,54 @@ class TestLateralReferencePlanner:
     same_direction_time = planner._transition_time(-0.8, -0.4)
     reversal_time = planner._transition_time(-0.8, 0.4)
     assert reversal_time > same_direction_time
+
+  def test_reachable_torque_envelope_breaks_saturated_preview_deadlock(self):
+    speed = 6.0
+    curvature = 0.08
+    # At the fixed-delay sample both applied and geometric target torque are
+    # saturated in the turn direction, while the full path clearly unwinds.
+    yaws = speed * curvature * np.minimum(MODEL_T, 0.6)
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    assert planner.update(build_model(yaws, speed), curvature, speed)
+
+    planner.get_curvature(curvature, speed, 0.2, applied_torque=-1.0,
+                          lat_accel_factor=2.7, friction=0.13, roll=0.07, lat_accel_offset=-0.103)
+    diagnostics = planner.diagnostics
+    assert diagnostics.geometric_target_torque < -0.95
+    assert diagnostics.reachable_target_torque > diagnostics.geometric_target_torque + 0.5
+    assert diagnostics.unwind_scale > 0.9
+    # The old scalar preview could not move because its current transition was
+    # zero; the reachable horizon still supplies an early release target.
+    assert diagnostics.extra_time == pytest.approx(0.0)
+
+  def test_reference_target_includes_crown_adjusted_neutral(self):
+    speed = 5.0
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    assert planner.update(constant_curvature_model(0.0, speed), 0.0, speed)
+
+    planner.get_curvature(0.0, speed, 0.2, applied_torque=0.0,
+                          lat_accel_factor=2.7, friction=0.13, roll=0.07, lat_accel_offset=-0.103)
+    expected_neutral = (0.07 * ACCELERATION_DUE_TO_GRAVITY - 0.103) / 2.7
+    assert planner.diagnostics.neutral_torque == pytest.approx(expected_neutral)
+    assert planner.diagnostics.geometric_target_torque == pytest.approx(expected_neutral, abs=1e-6)
+    assert planner.diagnostics.reachable_target_torque == pytest.approx(expected_neutral, abs=1e-6)
+
+  def test_backward_torque_envelope_is_rate_reachable(self):
+    speed = 6.0
+    curvature = 0.08
+    yaws = speed * curvature * np.minimum(MODEL_T, 0.6)
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    assert planner.update(build_model(yaws, speed), curvature, speed)
+
+    _, reachable = planner._reachable_torque_trajectory(speed, 2.7, 0.13, 0.07, -0.103)
+    transition_times = [
+      planner._transition_time(current, following)
+      for current, following in zip(reachable[:-1], reachable[1:], strict=True)
+    ]
+    assert max(transition_times) <= 0.05 + 1e-4
 
   def test_speed_change_alone_does_not_trigger_path_unwind(self):
     speed = 8.0
