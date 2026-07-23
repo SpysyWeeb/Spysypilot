@@ -9,8 +9,9 @@ test states which gates the other mechanisms are held clear of.
 import pytest
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.blt import (BLTSupervisor, DebouncedTrigger,
+from openpilot.selfdrive.controls.lib.blt import (BLTSupervisor, DebouncedTrigger, LeadDeparturePreRelease,
                                                   JERK_SCALE_MIN, JERK_SCALE_RATE,
+                                                  LEAD_DEPARTURE_CANCEL, LEAD_DEPARTURE_CONFIRM,
                                                   ONSET_PAD_MAX, ONSET_RATE_UP, ONSET_RATE_DOWN)
 
 T_FOLLOW_BASE = 1.45
@@ -28,13 +29,17 @@ class FakeSM(dict):
 
 
 def make_sm(status=True, v_ego=15.0, v_lead=15.0, d_rel=30.0, a_lead=0.0,
-            lead_prob=1.0, model_v=None, radar_valid=True):
+            lead_prob=1.0, model_v=None, radar_valid=True, standstill=False,
+            v_lead_raw=None):
   """model_v defaults to a flat leadsV3 speed prediction (slope 0 -> model-arm quiet)."""
   if model_v is None:
     model_v = [v_lead] * 6
   sm = FakeSM(radar_valid=radar_valid)
-  sm['radarState'] = Obj(leadOne=Obj(status=status, vLeadK=v_lead, dRel=d_rel, aLeadK=a_lead))
-  sm['carState'] = Obj(vEgo=v_ego)
+  if v_lead_raw is None:
+    v_lead_raw = v_lead
+  sm['radarState'] = Obj(leadOne=Obj(status=status, vLead=v_lead_raw, vLeadK=v_lead,
+                                    dRel=d_rel, aLeadK=a_lead))
+  sm['carState'] = Obj(vEgo=v_ego, standstill=standstill)
   sm['modelV2'] = Obj(leadsV3=[Obj(prob=lead_prob, v=model_v)])
   return sm
 
@@ -43,6 +48,13 @@ def run(sup, sm, a_plan, n=1):
   out = None
   for _ in range(n):
     out = sup.update(sm, a_plan, T_FOLLOW_BASE)
+  return out
+
+
+def run_pre_release(release, sm, n=1, active=True):
+  out = False
+  for _ in range(n):
+    out = release.update(sm, active)
   return out
 
 
@@ -163,6 +175,68 @@ class TestLaunchBoost:
     run(sup, sm, a_plan=0.2, n=frames(1.5))
     js, _ = run(sup, sm, a_plan=2.0, n=frames(1.0))  # shortfall ~ 0; lead accelerating: no ratchet
     assert js == 1.0
+
+
+class TestLeadDeparturePreRelease:
+  @staticmethod
+  def launch_sm(**kwargs):
+    defaults = dict(v_ego=0.0, v_lead=0.0, v_lead_raw=0.0, d_rel=6.0,
+                    model_v=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], standstill=True)
+    defaults.update(kwargs)
+    return make_sm(**defaults)
+
+  def test_requires_sustained_prediction(self):
+    release = LeadDeparturePreRelease()
+    sm = self.launch_sm()
+    for _ in range(frames(LEAD_DEPARTURE_CONFIRM) - 1):
+      assert not release.update(sm, active=True)
+    assert release.update(sm, active=True)
+
+  def test_uses_radar_anchored_model_delta(self):
+    release = LeadDeparturePreRelease()
+    # The model's absolute v[1] is above threshold, but its predicted delta is only
+    # 0.1 m/s and radar says the lead is stopped: no departure.
+    sm = self.launch_sm(model_v=[2.0, 2.1, 2.2, 2.3, 2.4, 2.5])
+    for _ in range(frames(1.0)):
+      assert not release.update(sm, active=True)
+
+  def test_collapsed_prediction_cancels_smoothly(self):
+    release = LeadDeparturePreRelease()
+    assert run_pre_release(release, self.launch_sm(), frames(LEAD_DEPARTURE_CONFIRM))
+    collapsed = self.launch_sm(model_v=[0.0] * 6)
+    for _ in range(frames(LEAD_DEPARTURE_CANCEL) - 1):
+      assert release.update(collapsed, active=True)
+    assert not release.update(collapsed, active=True)
+
+  def test_measured_motion_releases_without_model_confirmation(self):
+    release = LeadDeparturePreRelease()
+    moving_lead = self.launch_sm(v_lead=0.4, v_lead_raw=0.4, model_v=[0.0] * 6)
+    assert release.update(moving_lead, active=True)
+
+    # A brief radar/model dropout must not pulse the hold while ego waits for brake bleed.
+    stopped_reading = self.launch_sm(model_v=[0.0] * 6)
+    assert release.update(stopped_reading, active=True)
+    assert not release.update(self.launch_sm(standstill=False, v_ego=0.2), active=True)
+
+  def test_reapplies_hold_if_measured_lead_re_stops(self):
+    release = LeadDeparturePreRelease()
+    moving_lead = self.launch_sm(v_lead=0.4, v_lead_raw=0.4, model_v=[0.0] * 6)
+    assert release.update(moving_lead, active=True)
+    stopped_lead = self.launch_sm(model_v=[0.0] * 6)
+    assert not run_pre_release(release, stopped_lead, frames(LEAD_DEPARTURE_CANCEL))
+
+  @pytest.mark.parametrize("kwargs,active", [
+    ({"status": False}, True),
+    ({"radar_valid": False}, True),
+    ({"standstill": False, "v_ego": 0.2}, True),
+    ({}, False),
+    ({"lead_prob": 0.3}, True),
+  ])
+  def test_scope_guards(self, kwargs, active):
+    release = LeadDeparturePreRelease()
+    sm = self.launch_sm(**kwargs)
+    for _ in range(frames(1.0)):
+      assert not release.update(sm, active=active)
 
 
 class TestWhiplashRatchet:
