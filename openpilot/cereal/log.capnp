@@ -2526,6 +2526,49 @@ struct DebugAlert {
 struct UserBookmark @0xfe346a9de48d9b50 {
 }
 
+struct LateralEvent @0xd4281d502164abd1 {
+  version @0 :UInt16;
+  type @1 :Type;
+  source @2 :Source;
+  severity @3 :Severity;
+  confidence @4 :Float32;
+  controllerVersion @5 :Int32;
+  referenceVersion @6 :Int32;
+  vEgo @7 :Float32;
+  steeringAngleDeg @8 :Float32;
+  steeringRateDeg @9 :Float32;
+  desiredLateralAccel @10 :Float32;
+  actualLateralAccel @11 :Float32;
+  requestTorque @12 :Float32;
+  appliedTorque @13 :Float32;
+  referenceTargetTorque @14 :Float32;
+  referenceUnwindScale @15 :Float32;
+  appliedTargetGap @16 :Float32;
+  roadConfounded @17 :Bool;
+  driverConfounded @18 :Bool;
+  reason @19 :Text;
+
+  enum Type {
+    manual @0;
+    stallRelease @1;
+    lateUnwind @2;
+    handoffMismatch @3;
+    centerOvershoot @4;
+    torqueAuthority @5;
+  }
+
+  enum Source {
+    automatic @0;
+    user @1;
+  }
+
+  enum Severity {
+    info @0;
+    warning @1;
+    critical @2;
+  }
+}
+
 struct SoundPressure @0xdc24138990726023 {
   soundPressure @0 :Float32;
 
@@ -2644,6 +2687,7 @@ struct Event {
     audioFeedback @149 :AudioFeedback;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
+    lateralEvent @152 :LateralEvent;
 
     # *********** debug ***********
     testJoystick @52 :Joystick;
