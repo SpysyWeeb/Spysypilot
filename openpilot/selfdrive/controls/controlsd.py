@@ -48,11 +48,29 @@ class Controls:
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP)
 
-    self.sm = messaging.SubMaster(['liveDelay', 'liveParameters', 'liveTorqueParameters', 'modelV2', 'selfdriveState',
-                                   'liveCalibration', 'livePose', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'radarState', 'spysydriveStateSP'],
-                                  poll='selfdriveState', ignore_alive=['spysydriveStateSP'],
-                                  ignore_valid=['spysydriveStateSP'])
+    self.sm = messaging.SubMaster(
+      [
+        'liveDelay',
+        'liveParameters',
+        'liveTorqueParameters',
+        'modelV2',
+        'selfdriveState',
+        'liveCalibration',
+        'livePose',
+        'longitudinalPlan',
+        'lateralManeuverPlan',
+        'carState',
+        'carOutput',
+        'driverMonitoringState',
+        'onroadEvents',
+        'driverAssistance',
+        'radarState',
+        'spysydriveStateSP',
+      ],
+      poll='selfdriveState',
+      ignore_alive=['spysydriveStateSP'],
+      ignore_valid=['spysydriveStateSP'],
+    )
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited_by_safety = False
@@ -80,12 +98,14 @@ class Controls:
     # reference until its delivery limits have been measured independently.
     if self.CP.brand == "hyundai" and self.CP.lateralTuning.which() == 'torque':
       hyundai_params = self.CI.CC.params
-      self.lateral_reference_planner.configure_actuator(ActuatorPreviewConfig(
-        max_torque=hyundai_params.STEER_MAX,
-        delta_up=hyundai_params.STEER_DELTA_UP,
-        delta_down=hyundai_params.STEER_DELTA_DOWN,
-        steer_step=hyundai_params.STEER_STEP,
-      ))
+      self.lateral_reference_planner.configure_actuator(
+        ActuatorPreviewConfig(
+          max_torque=hyundai_params.STEER_MAX,
+          delta_up=hyundai_params.STEER_DELTA_UP,
+          delta_down=hyundai_params.STEER_DELTA_DOWN,
+          steer_step=hyundai_params.STEER_STEP,
+        )
+      )
 
     self.controls_ext = ControlsExt()
 
@@ -113,8 +133,9 @@ class Controls:
     if self.CP.lateralTuning.which() == 'torque':
       torque_params = self.sm['liveTorqueParameters']
       if self.sm.all_checks(['liveTorqueParameters']) and torque_params.useParams:
-        self.LaC.update_live_torque_params(torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered,
-                                           torque_params.frictionCoefficientFiltered)
+        self.LaC.update_live_torque_params(
+          torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered, torque_params.frictionCoefficientFiltered
+        )
 
     long_plan = self.sm['longitudinalPlan']
     model_v2 = self.sm['modelV2']
@@ -124,8 +145,9 @@ class Controls:
 
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
-    CC.latActive = self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
-                   (not standstill or self.CP.steerAtStandstill)
+    CC.latActive = (
+      self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and (not standstill or self.CP.steerAtStandstill)
+    )
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
     actuators = CC.actuators
@@ -147,8 +169,11 @@ class Controls:
     # all_checks (alive + freq + valid), not just valid: valid only updates when a message
     # arrives, so a dead radard would leave the last lead frozen-but-"valid" forever
     has_lead = bool(radar_lead.status) and self.sm.all_checks(['radarState'])
-    actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits,
-                                            radar_lead.dRel, has_lead, max(float(radar_lead.vLeadK), 0.0)))
+    actuators.accel = float(
+      self.LoC.update(
+        CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits, radar_lead.dRel, has_lead, max(float(radar_lead.vLeadK), 0.0)
+      )
+    )
 
     # Steering PID loop and future-aware lateral reference planner
     # Reset desired curvature to current to avoid violating the limits on engage
@@ -165,9 +190,14 @@ class Controls:
         self.lateral_reference_planner.update(model_v2, self.curvature, CS.vEgo)
       if self.CP.lateralTuning.which() == 'torque':
         new_desired_curvature = self.lateral_reference_planner.get_curvature(
-          raw_desired_curvature, CS.vEgo, lat_delay, applied_torque,
-          self.LaC.torque_params.latAccelFactor, self.LaC.torque_params.friction,
-          lp.roll, self.LaC.torque_params.latAccelOffset,
+          raw_desired_curvature,
+          CS.vEgo,
+          lat_delay,
+          applied_torque,
+          self.LaC.torque_params.latAccelFactor,
+          self.LaC.torque_params.friction,
+          lp.roll,
+          self.LaC.torque_params.latAccelOffset,
         )
       else:
         new_desired_curvature = self.lateral_reference_planner.get_curvature(raw_desired_curvature, CS.vEgo, lat_delay)
@@ -176,20 +206,29 @@ class Controls:
     actuators.curvature = self.desired_curvature
     if self.CP.lateralTuning.which() == 'torque':
       reference_log = self.lateral_reference_planner.diagnostics
-      steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                       self.steer_limited_by_safety, self.desired_curvature,
-                                                       curvature_limited, lat_delay, applied_torque,
-                                                       reference_log.unwind_scale, reference_log.target_torque,
-                                                       reference_log.geometric_target_torque,
-                                                       (reference_log.trajectory_curvature_rate
-                                                        if reference_log.trajectory_rate_valid else None))
+      steer, lateral_output, lac_log = self.LaC.update(
+        CC.latActive,
+        CS,
+        self.VM,
+        lp,
+        self.steer_limited_by_safety,
+        self.desired_curvature,
+        curvature_limited,
+        lat_delay,
+        applied_torque,
+        reference_log.unwind_scale,
+        reference_log.target_torque,
+        reference_log.geometric_target_torque,
+        reference_log.episode_target_torque,
+        reference_log.output_curvature * CS.vEgo**2,
+        reference_log.episode_lateral_accel,
+        (reference_log.trajectory_curvature_rate if reference_log.trajectory_rate_valid else None),
+      )
     else:
-      steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                       self.steer_limited_by_safety, self.desired_curvature,
-                                                       curvature_limited, lat_delay)
-    actuators.torqueDampingBlocked = bool(
-      self.CP.lateralTuning.which() == 'torque' and lac_log.dampingTurnInBlocked
-    )
+      steer, lateral_output, lac_log = self.LaC.update(
+        CC.latActive, CS, self.VM, lp, self.steer_limited_by_safety, self.desired_curvature, curvature_limited, lat_delay
+      )
+    actuators.torqueDampingBlocked = bool(self.CP.lateralTuning.which() == 'torque' and lac_log.dampingTurnInBlocked)
     if self.CP.lateralTuning.which() == 'torque':
       lac_log.referenceVersion = reference_log.version
       # np.interp/np.clip may return NumPy scalar types, which pycapnp refuses.
@@ -208,6 +247,9 @@ class Controls:
       lac_log.referenceGeometricTargetTorque = float(reference_log.geometric_target_torque)
       lac_log.referenceNeutralTorque = float(reference_log.neutral_torque)
       lac_log.referenceReachableTargetTorque = float(reference_log.reachable_target_torque)
+      lac_log.referenceSustainedUnwindScale = float(reference_log.sustained_unwind_scale)
+      lac_log.referenceEpisodeTargetTorque = float(reference_log.episode_target_torque)
+      lac_log.referenceEpisodeLateralAccel = float(reference_log.episode_lateral_accel)
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
@@ -272,8 +314,7 @@ class Controls:
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)
     cs.ufAccelCmd = float(self.LoC.pid.f)
-    cs.forceDecel = bool(self.sm['driverMonitoringState'].noResponseForceDecel or
-                         (self.sm['selfdriveState'].state == State.softDisabling))
+    cs.forceDecel = bool(self.sm['driverMonitoringState'].noResponseForceDecel or (self.sm['selfdriveState'].state == State.softDisabling))
 
     # trigger the car's stock driver monitoring escalation
     CC.driverMonitoringEscalation = cs.forceDecel
