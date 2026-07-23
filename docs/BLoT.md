@@ -99,6 +99,17 @@ and the solver keeps shaping everything.
   the model by 1-1.5 s (measured), the reverse of hard braking. Never touches t_follow:
   shrinking the gap is a safety change; jerk relaxation only changes how fast the
   solver tracks the gap it already wants.
+- **Standstill lead pre-release** — route 8d separated decision time from wheel time:
+  over four openpilot-controlled lead launches the MPC released 0.77 s before measured
+  lead motion and the post-controller acceleration request arrived 0.66 s before, but
+  the Palisade rolled 1.32 s after; command-to-wheel-motion was 2.09 s median. While
+  stopped behind a valid radar lead, a 0.2 s sustained model prediction that the
+  radar-anchored lead trajectory will exceed 0.3 m/s at its 2 s sample releases only
+  the MPC `shouldStop` bit. The ordinary MPC `aTarget` remains untouched, so this starts
+  brake bleed earlier without changing the subsequent acceleration curve. Loss of both
+  predicted and measured departure evidence for 0.2 s cancels the release (shorter
+  dropouts are ignored to prevent release-rehold pulses). No lead, invalid radar,
+  disengagement, and a moving ego reset it immediately.
 - **Whiplash ratchet** — the jerk scale may relax at any time but may only *stiffen*
   while the measured lead is braking (aLeadK < −0.2) and ego is closing. A boost that
   is live when a launch flips into a braking event keeps its relaxed cost through the
