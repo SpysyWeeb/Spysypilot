@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from openpilot.common.constants import CV
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY, CV
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -76,7 +76,7 @@ class ActuatorPreviewConfig:
 
 @dataclass
 class LateralReferenceDiagnostics:
-  version: int = 2
+  version: int = 3
   base_curvature: float = 0.0
   output_curvature: float = 0.0
   sample_time: float = 0.0
@@ -86,6 +86,9 @@ class LateralReferenceDiagnostics:
   unwind_scale: float = 0.0
   authority_restored: float = 0.0
   preview_correction: float = 0.0
+  geometric_target_torque: float = 0.0
+  neutral_torque: float = 0.0
+  reachable_target_torque: float = 0.0
 
 
 class LateralReferencePlanner:
@@ -209,11 +212,18 @@ class LateralReferencePlanner:
       return max(fallback, MIN_MODEL_SPEED)
     return float(np.interp(sample_time, TRAJECTORY_T, self.predicted_speeds))
 
-  def _target_torque(self, curvature: float, sample_time: float, v_ego: float, lat_accel_factor: float, friction: float) -> float:
+  def _target_torque(self, curvature: float, sample_time: float, v_ego: float, lat_accel_factor: float, friction: float,
+                     roll: float = 0.0, lat_accel_offset: float = 0.0) -> float:
     speed = self._predicted_speed(sample_time, v_ego)
-    lateral_accel = curvature * speed**2
-    friction_torque = friction * np.sign(lateral_accel) if abs(lateral_accel) > 0.02 else 0.0
-    return float(np.clip(-(lateral_accel / max(lat_accel_factor, 1e-3) + friction_torque), -1.0, 1.0))
+    geometric_lateral_accel = curvature * speed**2
+    gravity_adjusted_lateral_accel = geometric_lateral_accel - roll * ACCELERATION_DUE_TO_GRAVITY - lat_accel_offset
+    friction_torque = friction * np.sign(geometric_lateral_accel) if abs(geometric_lateral_accel) > 0.02 else 0.0
+    return float(np.clip(-(gravity_adjusted_lateral_accel / max(lat_accel_factor, 1e-3) + friction_torque), -1.0, 1.0))
+
+  @staticmethod
+  def _neutral_torque(roll: float, lat_accel_offset: float, lat_accel_factor: float) -> float:
+    return float(np.clip((roll * ACCELERATION_DUE_TO_GRAVITY + lat_accel_offset) /
+                         max(lat_accel_factor, 1e-3), -1.0, 1.0))
 
   def _transition_time(self, current: float, target: float) -> float:
     assert self.actuator_config is not None
@@ -224,6 +234,41 @@ class LateralReferencePlanner:
       rate = rate_up if abs(target) > abs(current) else rate_down
       return abs(target - current) / max(rate, 1e-3)
     return abs(current) / max(rate_down, 1e-3) + abs(target) / max(rate_up, 1e-3)
+
+  def _reachable_previous_torque(self, desired_previous: float, reachable_next: float, duration: float) -> float:
+    """Project a desired prior torque into the set that can reach the next torque."""
+    if self._transition_time(desired_previous, reachable_next) <= duration:
+      return desired_previous
+
+    # Transition time is monotonic on the line between the reachable next
+    # value and the desired prior value, including across zero. Find the
+    # furthest feasible point toward the desired prior value.
+    feasible_fraction = 0.0
+    infeasible_fraction = 1.0
+    for _ in range(16):
+      fraction = 0.5 * (feasible_fraction + infeasible_fraction)
+      candidate = reachable_next + fraction * (desired_previous - reachable_next)
+      if self._transition_time(candidate, reachable_next) <= duration:
+        feasible_fraction = fraction
+      else:
+        infeasible_fraction = fraction
+    return float(reachable_next + feasible_fraction * (desired_previous - reachable_next))
+
+  def _reachable_torque_trajectory(self, v_ego: float, lat_accel_factor: float, friction: float,
+                                   roll: float, lat_accel_offset: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return geometric torque demand and its backward rate-reachable envelope."""
+    assert self.solution is not None
+    desired = np.asarray([
+      self._target_torque(curvature, sample_time, v_ego, lat_accel_factor, friction, roll, lat_accel_offset)
+      for curvature, sample_time in zip(self.solution, TRAJECTORY_T, strict=True)
+    ])
+    if self.actuator_config is None:
+      return desired, desired.copy()
+
+    reachable = desired.copy()
+    for i in range(len(reachable) - 2, -1, -1):
+      reachable[i] = self._reachable_previous_torque(desired[i], reachable[i + 1], TRAJECTORY_DT)
+    return desired, reachable
 
   def _unwind_scale(self, sample_time: float) -> float:
     assert self.solution is not None
@@ -240,7 +285,8 @@ class LateralReferencePlanner:
     return self._smoothstep(unwind_jerk, UNWIND_JERK_START, UNWIND_JERK_FULL)
 
   def get_curvature(self, raw_curvature: float, v_ego: float, lateral_delay: float, applied_torque: float = 0.0,
-                    lat_accel_factor: float = 1.0, friction: float = 0.0) -> float:
+                    lat_accel_factor: float = 1.0, friction: float = 0.0, roll: float = 0.0,
+                    lat_accel_offset: float = 0.0) -> float:
     actuator_preview = self.actuator_config is not None
     if not actuator_preview and v_ego <= LOW_SPEED_REFERENCE_SPEED and abs(raw_curvature) >= ZERO_LOW_SPEED_CURVATURE:
       self.reset()
@@ -254,14 +300,16 @@ class LateralReferencePlanner:
     legacy_reference = reference_scale * base_curvature + (1.0 - reference_scale) * raw_curvature
 
     sample_time = base_time
-    target_torque = self._target_torque(base_curvature, base_time, v_ego, lat_accel_factor, friction)
+    target_torque = self._target_torque(base_curvature, base_time, v_ego, lat_accel_factor, friction,
+                                        roll, lat_accel_offset)
     if actuator_preview:
       # Only lead a predicted release. During turn-in, looking farther ahead can
       # select the later unwind and weaken the torque build that is needed now.
       base_unwind_scale = self._unwind_scale(base_time)
       for _ in range(3):
         planned_curvature = float(np.interp(sample_time, TRAJECTORY_T, self.solution))
-        target_torque = self._target_torque(planned_curvature, sample_time, v_ego, lat_accel_factor, friction)
+        target_torque = self._target_torque(planned_curvature, sample_time, v_ego, lat_accel_factor, friction,
+                                            roll, lat_accel_offset)
         slew_time = self._transition_time(applied_torque, target_torque)
         extra_time = np.clip(ACTUATOR_PREVIEW_GAIN * max(slew_time - ACTUATOR_PREVIEW_NOMINAL_SLEW, 0.0),
                              0.0, ACTUATOR_PREVIEW_MAX_EXTRA)
@@ -292,7 +340,16 @@ class LateralReferencePlanner:
     self.solution_age += self.dt
 
     output_curvature = planned_curvature if actuator_preview else legacy_reference
-    target_torque = self._target_torque(output_curvature, sample_time, v_ego, lat_accel_factor, friction)
+    geometric_target_torque = self._target_torque(output_curvature, sample_time, v_ego, lat_accel_factor, friction,
+                                                  roll, lat_accel_offset)
+    neutral_torque = self._neutral_torque(roll, lat_accel_offset, lat_accel_factor)
+    reachable_target_torque = geometric_target_torque
+    if actuator_preview:
+      _, reachable_torque = self._reachable_torque_trajectory(
+        v_ego, lat_accel_factor, friction, roll, lat_accel_offset,
+      )
+      reachable_target_torque = float(np.interp(base_time, TRAJECTORY_T, reachable_torque))
+    target_torque = reachable_target_torque
     self.diagnostics = LateralReferenceDiagnostics(
       base_curvature=float(base_curvature),
       output_curvature=float(output_curvature),
@@ -303,5 +360,8 @@ class LateralReferencePlanner:
       unwind_scale=float(unwind_scale),
       authority_restored=float(authority_restored),
       preview_correction=float((output_curvature - legacy_reference) * v_ego**2),
+      geometric_target_torque=float(geometric_target_torque),
+      neutral_torque=float(neutral_torque),
+      reachable_target_torque=float(reachable_target_torque),
     )
     return float(output_curvature)

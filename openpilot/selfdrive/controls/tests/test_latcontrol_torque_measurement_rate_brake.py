@@ -27,6 +27,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   VERSION,
   LatControlTorque,
   MeasurementRateFilter,
+  UnwindPhaseTracker,
   cascade_p_scale,
   get_actuation_speed,
   get_future_unwind_brake,
@@ -34,6 +35,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   get_reference_rate_cascade,
   reference_rate_tracking_speed_scale,
   should_block_undertracked_turn_in_damping,
+  torque_transition_time,
 )
 
 
@@ -128,13 +130,13 @@ class TestFutureUnwindBrake:
     assert torque_blend == 0.0
     assert activation == 0.0
 
-  def test_stalled_unwind_transfers_position_authority_without_torque_hold(self):
+  def test_stalled_unwind_uses_reachable_target_without_waiting_for_wheel_motion(self):
     p_factor, torque_blend, activation, *_ = get_future_unwind_brake(
       1.0, -0.8, 0.0, -2.0, 0.5, 0.8, 2.5, 1.0,
     )
-    assert p_factor == pytest.approx(0.5)
-    assert torque_blend == 0.0
-    assert activation == 0.0
+    assert p_factor == pytest.approx(0.25)
+    assert torque_blend == pytest.approx(UNWIND_TORQUE_BLEND_MAX)
+    assert activation == pytest.approx(1.0)
 
   def test_applied_torque_brakes_predicted_unwind_overshoot(self):
     p_factor, torque_blend, activation, zero_time, projected_error = get_future_unwind_brake(
@@ -147,18 +149,74 @@ class TestFutureUnwindBrake:
     assert p_factor == pytest.approx(0.25)
     assert torque_blend == pytest.approx(UNWIND_TORQUE_BLEND_MAX)
 
-  def test_future_target_that_drives_motion_is_not_used(self):
+  def test_confirmed_unwind_can_use_target_that_starts_the_planned_release(self):
     _, torque_blend, activation, *_ = get_future_unwind_brake(
       1.0, 1.0, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0,
     )
-    assert torque_blend == 0.0
-    assert activation == 0.0
+    assert torque_blend == pytest.approx(UNWIND_TORQUE_BLEND_MAX)
+    assert activation == pytest.approx(1.0)
 
   def test_all_speed_schedule_retains_more_direct_p_at_high_speed(self):
     low_speed = get_future_unwind_brake(1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0)
     high_speed = get_future_unwind_brake(1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 0.25)
     assert high_speed[0] > low_speed[0]
     assert high_speed[1] < low_speed[1]
+
+  def test_neutral_aware_transition_explains_directional_crown_asymmetry(self):
+    build_rate = 4 / 409 / DT_CTRL
+    decay_rate = 7 / 409 / DT_CTRL
+    right_to_neutral = torque_transition_time(-1.0, 0.25, build_rate, decay_rate)
+    left_to_neutral = torque_transition_time(1.0, 0.25, build_rate, decay_rate)
+    to_zero = torque_transition_time(-1.0, 0.0, build_rate, decay_rate)
+    assert right_to_neutral > to_zero > left_to_neutral
+
+    *_, right_time, _ = get_future_unwind_brake(
+      1.0, 0.25, 0.0, 0.0, 0.0, -1.0, 2.5, 1.0,
+      decay_rate, build_rate, 0.25,
+    )
+    *_, left_time, _ = get_future_unwind_brake(
+      1.0, 0.25, 0.0, 0.0, 0.0, 1.0, 2.5, 1.0,
+      decay_rate, build_rate, 0.25,
+    )
+    assert right_time == pytest.approx(right_to_neutral)
+    assert left_time == pytest.approx(left_to_neutral)
+
+
+class TestUnwindPhaseTracker:
+  def test_holds_through_delivery_then_releases_smoothly(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    phase, direction, gap, _ = tracker.update(
+      True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0,
+    )
+    assert phase == pytest.approx(1.0)
+    assert direction == -1.0
+    assert gap == pytest.approx(0.6)
+
+    # Geometry has passed its instantaneous knee, but old-turn applied torque
+    # still has not caught the reachable target.
+    phase, *_ = tracker.update(True, 0.0, 0.02, 0.0, -0.5, 0.2, -1.0, 0.0)
+    assert phase == pytest.approx(1.0)
+
+    # Once delivery and rate have caught up, P authority returns gradually.
+    phase, *_ = tracker.update(True, 0.0, 0.02, 0.2, 0.2, 0.2, 0.0, 0.0)
+    assert 0.0 < phase < 1.0
+    previous = phase
+    phase, *_ = tracker.update(True, 0.0, 0.02, 0.2, 0.2, 0.2, 0.0, 0.0)
+    assert 0.0 < phase < previous
+
+  def test_active_episode_ignores_far_side_retrigger(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    tracker.update(True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0)
+    phase, direction, *_ = tracker.update(
+      True, 1.0, -0.02, 0.2, 0.2, 0.2, 0.0, 0.0,
+    )
+    assert direction == -1.0
+    assert phase < 1.0
+
+  def test_driver_override_resets_phase(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    tracker.update(True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0)
+    assert tracker.update(False, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0) == (0.0, 0.0, 0.0, 0.0)
 
 
 class TestTurnInDampingGuard:
@@ -300,7 +358,9 @@ class TestReferenceRateTrackingIntegration:
     )
 
     assert torque_log.unwindBrakeActivation == pytest.approx(1.0)
-    assert torque_log.unwindTorqueZeroTime > 0.4
+    assert torque_log.unwindTorqueNeutralTime > 0.4
     assert torque_log.cascadePScale < torque_log.cascadeBasePScale
     assert torque_log.unwindTorqueCorrection > 0.0
+    assert torque_log.unwindEffectivePhase == pytest.approx(1.0)
+    assert torque_log.unwindPhaseDirection == -1.0
     assert 0.0 < torque < 0.8
