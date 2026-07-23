@@ -2463,6 +2463,23 @@ struct DebugAlert {
 }
 
 struct UserBookmark @0xfe346a9de48d9b50 {
+  source @0 :Source;
+  eventType @1 :Text;
+  alertText1 @2 :Text;
+  alertText2 @3 :Text;
+  severity @4 :UInt8;
+  confidence @5 :Float32;
+  leadToEgoS @6 :Float32;
+  commandToEgoS @7 :Float32;
+  planToLeadS @8 :Float32;
+  commandToLeadS @9 :Float32;
+  forecastToLeadS @10 :Float32;
+
+  enum Source {
+    generic @0;
+    manual @1;
+    automatic @2;
+  }
 }
 
 struct SoundPressure @0xdc24138990726023 {

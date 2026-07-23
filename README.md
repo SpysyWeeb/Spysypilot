@@ -32,4 +32,25 @@ Three cooperating pieces:
 - `docs/BLoT.md` *(new)* — full architecture, retired interventions, and the "no crutches" doctrine.
 - `opendbc_repo` (SpysyWeeb/opendbc, branch `BLoT`) — Hyundai `startAccel` 1.5 and starting-state CAN jerk limit 5.0.
 
+## Automatic longitudinal event logging
+
+- `long_event_detector.py` is a pure, lightweight state machine. It separates predicted
+  lead motion, measured lead motion, MPC hold release, post-controller acceleration,
+  and actual ego movement, then attributes a late launch to planner, controller, or
+  vehicle response.
+- `feedbackd.py` feeds the detector current logged signals. Automatic detections and
+  manual bookmark presses publish a structured `userBookmark`; no control command,
+  planner trajectory, or safety state is modified.
+- `loggerd` already preserves the current segment whenever `userBookmark` is published.
+- `long_eventd.py` runs only off-road, indexes structured bookmarks from completed
+  rlogs, preserves two preceding segments plus one following segment, and writes
+  `/data/community/long_events/manifest.jsonl`.
+- `events.py` displays the bookmark's structured text. Generic/audio bookmarks retain
+  the stock **Bookmark Saved** message.
+
+Automatic detections and manual bookmark presses show **Long Event Logged** without
+changing any control command, planner trajectory, or safety state. Full thresholds,
+manifest format, and the SSH workflow are documented in
+[`docs/AutoLongLogger.md`](docs/AutoLongLogger.md).
+
 Step 1 of this effort was [op-model-grader](https://github.com/SpysyWeeb/op-model-grader), a standalone tool that grades the model's longitudinal (and lateral) performance from rlogs against the owner's manual driving.
