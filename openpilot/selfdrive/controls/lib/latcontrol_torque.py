@@ -6,6 +6,7 @@ from openpilot.cereal import log
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY, CV
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
@@ -47,6 +48,23 @@ CASCADE_P_SCALES = (0.50, 0.50, 0.75, 1.0)
 CASCADE_ACTUATOR_OVERSPEED_FULL = 0.8  # m/s^3
 CASCADE_ACTUATOR_STATE_GAIN = 0.15
 CASCADE_ACTUATOR_CORRECTION_MAX = 0.15  # m/s^2 before the speed schedule
+# The Hyundai rack cannot change torque faster than 409/4/7. During a planned
+# unwind, predict where the wheel will be when the already-applied torque can
+# reach zero, then let future-rate feedback take authority from direct P before
+# that torque carries the wheel through the target.
+UNWIND_TORQUE_MAX = 409
+UNWIND_TORQUE_DELTA_DOWN = 7
+UNWIND_TORQUE_ZERO_TIME_MAX = 0.65  # seconds
+UNWIND_TORQUE_ERROR_START = 0.05  # normalized
+UNWIND_TORQUE_ERROR_FULL = 0.35  # normalized
+UNWIND_OVERSPEED_FULL = 0.8  # m/s^3 at the common tracking speed
+UNWIND_PROJECTED_ERROR_FULL = 0.20  # m/s^2 at the common tracking speed
+UNWIND_PHASE_P_REDUCTION = 0.50
+UNWIND_OVERSPEED_P_REDUCTION = 0.25
+UNWIND_TORQUE_BLEND_MAX = 0.625
+DAMPING_TURN_IN_POSITION_ERROR_MIN = 0.08  # m/s^2 at the common tracking speed
+DAMPING_TURN_IN_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
+DAMPING_TURN_IN_UNWIND_SCALE_MIN = 0.20
 REFERENCE_RATE_MIN_SPEED = 5.0  # m/s; retain steering-rate authority where v^2 would otherwise vanish
 REFERENCE_RATE_TRACKING_SPEEDS = tuple(speed * CV.MPH_TO_MS for speed in (0.0, 12.0, 15.0, 30.0, 60.0, 90.0))
 REFERENCE_RATE_TRACKING_SCALES = (1.0, 1.0, 0.65, 0.50, 0.35, 0.25)
@@ -57,7 +75,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 9
+VERSION = 10
 
 
 def smoothstep(value: float) -> float:
@@ -145,6 +163,57 @@ def get_reference_rate_cascade(reference_rate: float, measurement_rate: float, p
   return rate_correction, actuator_correction, catchup_rate, desired_rate, rate_error, speed_scale
 
 
+def get_future_unwind_brake(reference_unwind_scale: float, reference_target_torque: float, measurement_rate: float,
+                            rate_error: float, position_error: float, applied_torque: float,
+                            lat_accel_factor: float, rate_tracking_scale: float,
+                            torque_decay_rate: float | None = None) -> tuple[float, float, float, float, float]:
+  """Return phase-aware P scaling and braking for a slew-limited planned unwind."""
+  unwind_scale = float(np.clip(reference_unwind_scale, 0.0, 1.0))
+  applied_magnitude = abs(applied_torque)
+  if torque_decay_rate is None:
+    torque_decay_rate = UNWIND_TORQUE_DELTA_DOWN / UNWIND_TORQUE_MAX / DT_CTRL
+  torque_zero_time = min(applied_magnitude / torque_decay_rate, UNWIND_TORQUE_ZERO_TIME_MAX)
+  projected_position_error = position_error + rate_error * torque_zero_time
+
+  # Future-path unwind confidence alone transfers part of the low-speed duty
+  # from the high-gain position loop to the rate loop. Fade this transfer with
+  # the existing all-speed rate schedule so highway position authority remains.
+  phase_reduction = UNWIND_PHASE_P_REDUCTION * unwind_scale * rate_tracking_scale
+  brake_activation = 0.0
+  torque_blend = 0.0
+  if abs(measurement_rate) > 1e-3:
+    motion_sign = math.copysign(1.0, measurement_rate)
+    overspeed = max(-rate_error * motion_sign, 0.0)
+    projected_overshoot = max(-projected_position_error * motion_sign, 0.0)
+    torque_error = reference_target_torque - applied_torque
+    target_lateral_accel_change = -torque_error * lat_accel_factor
+    target_brakes_motion = target_lateral_accel_change * motion_sign < 0.0
+    torque_error_scale = smoothstep((abs(torque_error) - UNWIND_TORQUE_ERROR_START) /
+                                    (UNWIND_TORQUE_ERROR_FULL - UNWIND_TORQUE_ERROR_START))
+    overspeed_scale = smoothstep(overspeed / UNWIND_OVERSPEED_FULL)
+    projected_scale = smoothstep(projected_overshoot / UNWIND_PROJECTED_ERROR_FULL)
+    zero_time_scale = smoothstep(torque_zero_time / UNWIND_TORQUE_ZERO_TIME_MAX)
+    urgency = max(torque_error_scale, overspeed_scale, projected_scale, zero_time_scale)
+    brake_activation = unwind_scale * urgency if target_brakes_motion else 0.0
+    torque_blend = UNWIND_TORQUE_BLEND_MAX * brake_activation * rate_tracking_scale
+
+  p_scale_factor = max(1.0 - phase_reduction - UNWIND_OVERSPEED_P_REDUCTION * brake_activation * rate_tracking_scale,
+                       1.0 - UNWIND_PHASE_P_REDUCTION - UNWIND_OVERSPEED_P_REDUCTION)
+  return p_scale_factor, torque_blend, brake_activation, torque_zero_time, projected_position_error
+
+
+def should_block_undertracked_turn_in_damping(delayed_desired_curvature: float, position_error: float,
+                                              reference_rate: float, reference_unwind_scale: float) -> bool:
+  """Keep release damping from shaving torque while the future path still needs more turn."""
+  if abs(delayed_desired_curvature) < 1e-5:
+    return False
+  turn_sign = math.copysign(1.0, delayed_desired_curvature)
+  undertracked = position_error * turn_sign > DAMPING_TURN_IN_POSITION_ERROR_MIN
+  future_unwind = (reference_unwind_scale >= DAMPING_TURN_IN_UNWIND_SCALE_MIN or
+                   reference_rate * turn_sign < -DAMPING_TURN_IN_UNWIND_RATE_MIN)
+  return undertracked and not future_unwind
+
+
 class MeasurementRateFilter:
   def __init__(self, dt: float):
     self.dt = dt
@@ -186,6 +255,10 @@ class LatControlTorque(LatControl):
     # Route-derived for the affected Hyundai EPS. Other torque platforms keep
     # their existing controller behavior until they are analyzed independently.
     self.reference_rate_tracking_enabled = CP.brand == "hyundai"
+    self.unwind_torque_decay_rate = UNWIND_TORQUE_DELTA_DOWN / UNWIND_TORQUE_MAX / self.dt
+    if self.reference_rate_tracking_enabled:
+      actuator_params = CI.CC.params
+      self.unwind_torque_decay_rate = actuator_params.STEER_DELTA_DOWN / actuator_params.STEER_MAX / (self.dt * actuator_params.STEER_STEP)
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -198,7 +271,7 @@ class LatControlTorque(LatControl):
                         self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay,
-             applied_torque=0.0):
+             applied_torque=0.0, reference_unwind_scale=0.0, reference_target_torque=0.0):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
@@ -233,6 +306,9 @@ class LatControlTorque(LatControl):
     error = setpoint - measurement
     tracking_position_error = (delayed_desired_curvature - measured_curvature) * rate_reference_speed ** 2
     applied_lateral_accel = -applied_torque * self.torque_params.latAccelFactor
+    damping_turn_in_blocked = self.reference_rate_tracking_enabled and should_block_undertracked_turn_in_damping(
+      delayed_desired_curvature, tracking_position_error, reference_rate, reference_unwind_scale,
+    )
 
     lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len+1, -2))
     raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx+1] - self.lat_accel_request_buffer[lookahead_idx-1]) / (2 * self.dt)
@@ -248,11 +324,17 @@ class LatControlTorque(LatControl):
       pid_log.active = False
       rate_tracking_correction = 0.0
       actuator_state_correction = 0.0
+      unwind_torque_blend = 0.0
+      unwind_torque_correction = 0.0
+      unwind_brake_activation = 0.0
+      unwind_torque_zero_time = 0.0
+      unwind_projected_position_error = tracking_position_error
       rate_tracking_scale = 0.0
       catchup_rate = 0.0
       cascade_desired_rate = 0.0
       cascade_rate_error = 0.0
-      direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
+      base_direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
+      direct_p_scale = base_direct_p_scale
     else:
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
@@ -260,21 +342,36 @@ class LatControlTorque(LatControl):
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
       rate_tracking_correction = 0.0
       actuator_state_correction = 0.0
+      unwind_torque_blend = 0.0
+      unwind_torque_correction = 0.0
+      unwind_brake_activation = 0.0
+      unwind_torque_zero_time = 0.0
+      unwind_projected_position_error = tracking_position_error
       rate_tracking_scale = 0.0
       catchup_rate = 0.0
       cascade_desired_rate = reference_rate
       cascade_rate_error = reference_rate - tracking_measurement_rate
-      direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
+      base_direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
+      direct_p_scale = base_direct_p_scale
       if self.reference_rate_tracking_enabled and not CS.steeringPressed:
         cascade_values = get_reference_rate_cascade(reference_rate, tracking_measurement_rate, tracking_position_error,
                                                      applied_lateral_accel, CS.vEgo)
         rate_tracking_correction, actuator_state_correction, catchup_rate, cascade_desired_rate, cascade_rate_error, rate_tracking_scale = cascade_values
+        unwind_values = get_future_unwind_brake(reference_unwind_scale, reference_target_torque, tracking_measurement_rate,
+                                                cascade_rate_error, tracking_position_error, applied_torque,
+                                                self.torque_params.latAccelFactor, rate_tracking_scale,
+                                                self.unwind_torque_decay_rate)
+        unwind_p_factor, unwind_torque_blend, unwind_brake_activation, unwind_torque_zero_time, unwind_projected_position_error = unwind_values
+        direct_p_scale *= unwind_p_factor
       controller_error = pid_log.error * direct_p_scale
       cascade_correction = rate_tracking_correction + actuator_state_correction
       output_lataccel = self.pid.update(controller_error, speed=CS.vEgo, feedforward=ff + cascade_correction,
                                        freeze_integrator=freeze_integrator)
       output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
       torque_command = -output_torque
+      if unwind_torque_blend > 0.0:
+        unwind_torque_correction = unwind_torque_blend * (reference_target_torque - torque_command)
+        torque_command += unwind_torque_correction
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
@@ -285,7 +382,7 @@ class LatControlTorque(LatControl):
       pid_log.actualLateralAccel = float(measurement)
       pid_log.desiredLateralAccel = float(setpoint)
       pid_log.desiredLateralJerk = float(desired_lateral_jerk)
-      pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_torque) < 1e-3, CS, steer_limited_by_safety, curvature_limited))
+      pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(torque_command) < 1e-3, CS, steer_limited_by_safety, curvature_limited))
 
     pid_log.measurementRate = float(measurement_rate)
     # Retain the old fields as explicit zeros so mixed-version route tooling
@@ -314,6 +411,12 @@ class LatControlTorque(LatControl):
     pid_log.actuatorAppliedLateralAccel = float(applied_lateral_accel)
     pid_log.actuatorStateCorrection = float(actuator_state_correction)
     pid_log.cascadePScale = float(direct_p_scale)
+    pid_log.unwindBrakeActivation = float(unwind_brake_activation)
+    pid_log.unwindTorqueZeroTime = float(unwind_torque_zero_time)
+    pid_log.unwindProjectedPositionError = float(unwind_projected_position_error)
+    pid_log.unwindTorqueCorrection = float(unwind_torque_correction)
+    pid_log.cascadeBasePScale = float(base_direct_p_scale)
+    pid_log.dampingTurnInBlocked = bool(damping_turn_in_blocked)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log
