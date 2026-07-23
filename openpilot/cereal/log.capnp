@@ -917,6 +917,13 @@ struct ControlsState @0x97ff69c53601abf1 {
     rateTrackingSpeedScale @38 :Float32;       # all-speed gain schedule applied to rate tracking
     referenceCurvatureRate @39 :Float32;        # filtered future-reference curvature rate, 1/m/s
     measurementCurvatureRate @40 :Float32;      # filtered measured curvature rate, 1/m/s
+    cascadePositionError @41 :Float32;          # delay-aligned curvature error at the tracking speed, m/s^2
+    cascadeCatchupRate @42 :Float32;            # bounded position-error contribution to desired rate, m/s^3
+    cascadeDesiredRate @43 :Float32;            # future-path rate plus bounded catch-up rate, m/s^3
+    cascadeRateError @44 :Float32;              # cascade desired rate minus measured rate, m/s^3
+    actuatorAppliedLateralAccel @45 :Float32;    # applied normalized torque expressed in controller coordinates, m/s^2
+    actuatorStateCorrection @46 :Float32;       # future-rate-gated feedback from applied actuator state, m/s^2
+    cascadePScale @47 :Float32;                 # residual share of the legacy direct proportional path
    }
 
   struct LateralAngleState {
