@@ -116,6 +116,7 @@ procs = [
   PythonProcess("modem", "openpilot.common.hardware.tici.modem", always_run, enabled=TICI),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
+  PythonProcess("long_eventd", "openpilot.selfdrive.spysypilot.long_eventd", only_offroad),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", always_run),
   PythonProcess("feedbackd", "openpilot.selfdrive.ui.feedback.feedbackd", only_onroad),
   PythonProcess("drive_statsd", "openpilot.selfdrive.spysypilot.drive_statsd", only_offroad),
