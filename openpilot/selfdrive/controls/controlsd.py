@@ -174,15 +174,19 @@ class Controls:
 
     actuators.curvature = self.desired_curvature
     if self.CP.lateralTuning.which() == 'torque':
+      reference_log = self.lateral_reference_planner.diagnostics
       steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                        self.steer_limited_by_safety, self.desired_curvature,
-                                                       curvature_limited, lat_delay, applied_torque)
+                                                       curvature_limited, lat_delay, applied_torque,
+                                                       reference_log.unwind_scale, reference_log.target_torque)
     else:
       steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                        self.steer_limited_by_safety, self.desired_curvature,
                                                        curvature_limited, lat_delay)
+    actuators.torqueDampingBlocked = bool(
+      self.CP.lateralTuning.which() == 'torque' and lac_log.dampingTurnInBlocked
+    )
     if self.CP.lateralTuning.which() == 'torque':
-      reference_log = self.lateral_reference_planner.diagnostics
       lac_log.referenceVersion = reference_log.version
       # np.interp/np.clip may return NumPy scalar types, which pycapnp refuses.
       # Convert every planner diagnostic at the cereal boundary.
