@@ -1,5 +1,6 @@
 #include <sys/xattr.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -19,13 +20,35 @@ struct LoggerdState {
   std::atomic<int> ready_to_rotate{0};  // count of encoders ready to rotate
   int max_waiting = 0;
   double last_rotate_tms = 0.;      // last rotate time in ms
+  int last_preserved_segment = -1;
+  int preserve_next_segments = 0;
 };
+
+void preserve_current_segment(LoggerdState *s) {
+  if (s->logger.segment() == s->last_preserved_segment) return;
+
+  LOGW("preserving %s", s->logger.segmentPath().c_str());
+
+#ifdef __APPLE__
+  int ret = setxattr(s->logger.segmentPath().c_str(), PRESERVE_ATTR_NAME, &PRESERVE_ATTR_VALUE, 1, 0, 0);
+#else
+  int ret = setxattr(s->logger.segmentPath().c_str(), PRESERVE_ATTR_NAME, &PRESERVE_ATTR_VALUE, 1, 0);
+#endif
+  if (ret) {
+    LOGE("setxattr %s failed for %s: %s", PRESERVE_ATTR_NAME, s->logger.segmentPath().c_str(), strerror(errno));
+  }
+  s->last_preserved_segment = s->logger.segment();
+}
 
 void logger_rotate(LoggerdState *s) {
   bool ret =s->logger.next();
   assert(ret);
   s->ready_to_rotate = 0;
   s->last_rotate_tms = millis_since_boot();
+  if (s->preserve_next_segments > 0) {
+    preserve_current_segment(s);
+    --s->preserve_next_segments;
+  }
   LOGW((s->logger.segment() == 0) ? "logging to %s" : "rotated to %s", s->logger.segmentPath().c_str());
 }
 
@@ -195,26 +218,14 @@ int handle_encoder_msg(LoggerdState *s, Message *msg, std::string &name, struct 
 }
 
 void handle_preserve_segment(LoggerdState *s) {
-  static int prev_segment = -1;
-  if (s->logger.segment() == prev_segment) return;
-
-  LOGW("preserving %s", s->logger.segmentPath().c_str());
-
-#ifdef __APPLE__
-  int ret = setxattr(s->logger.segmentPath().c_str(), PRESERVE_ATTR_NAME, &PRESERVE_ATTR_VALUE, 1, 0, 0);
-#else
-  int ret = setxattr(s->logger.segmentPath().c_str(), PRESERVE_ATTR_NAME, &PRESERVE_ATTR_VALUE, 1, 0);
-#endif
-  if (ret) {
-    LOGE("setxattr %s failed for %s: %s", PRESERVE_ATTR_NAME, s->logger.segmentPath().c_str(), strerror(errno));
-  }
+  preserve_current_segment(s);
+  s->preserve_next_segments = std::max(s->preserve_next_segments, 1);
 
   // mark route for uploading
   Params params;
   std::string routes = params.get("AthenadRecentlyViewedRoutes");
   params.put("AthenadRecentlyViewedRoutes", routes + "," + s->logger.routeName());
 
-  prev_segment = s->logger.segment();
 }
 
 void loggerd_thread() {
@@ -246,7 +257,7 @@ void loggerd_thread() {
         .counter = 0,
         .freq = it.decimation,
         .encoder = encoder,
-        .preserve_segment = (it.name == "userBookmark") || (it.name == "audioFeedback"),
+        .preserve_segment = (it.name == "userBookmark") || (it.name == "audioFeedback") || (it.name == "lateralEvent"),
         .record_audio = record_audio,
       };
     }
