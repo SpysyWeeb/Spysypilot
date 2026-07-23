@@ -57,12 +57,15 @@ class TestReferenceRateCascade:
     assert error == 0.0
     assert scale == pytest.approx(1.0)
 
-  @pytest.mark.parametrize(("reference_rate", "measurement_rate", "position_error", "sign"), [
-    (1.0, 0.25, 0.0, 1.0),    # drive a wheel lagging the future path
-    (0.25, 1.0, 0.0, -1.0),   # brake a wheel outrunning the future path
-    (-1.0, 1.0, 0.0, -1.0),   # start a planned reversal before measured motion reverses
-    (0.0, 0.0, 0.25, 1.0),    # turn position error into a catch-up rate, not raw torque
-  ])
+  @pytest.mark.parametrize(
+    ("reference_rate", "measurement_rate", "position_error", "sign"),
+    [
+      (1.0, 0.25, 0.0, 1.0),  # drive a wheel lagging the future path
+      (0.25, 1.0, 0.0, -1.0),  # brake a wheel outrunning the future path
+      (-1.0, 1.0, 0.0, -1.0),  # start a planned reversal before measured motion reverses
+      (0.0, 0.0, 0.25, 1.0),  # turn position error into a catch-up rate, not raw torque
+    ],
+  )
   def test_tracks_reference_and_position_in_both_directions(self, reference_rate, measurement_rate, position_error, sign):
     rate, _, _, _, _, _ = get_reference_rate_cascade(reference_rate, measurement_rate, position_error, 0.0, 5.0)
     assert rate * sign > 0.0
@@ -125,7 +128,14 @@ class TestReferenceRateCascade:
 class TestFutureUnwindBrake:
   def test_inactive_outside_future_path_unwind(self):
     p_factor, torque_blend, activation, *_ = get_future_unwind_brake(
-      0.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0,
+      0.0,
+      -0.8,
+      -2.0,
+      1.0,
+      0.2,
+      0.8,
+      2.5,
+      1.0,
     )
     assert p_factor == 1.0
     assert torque_blend == 0.0
@@ -133,7 +143,14 @@ class TestFutureUnwindBrake:
 
   def test_stalled_unwind_uses_reachable_target_without_waiting_for_wheel_motion(self):
     p_factor, torque_blend, activation, *_ = get_future_unwind_brake(
-      1.0, -0.8, 0.0, -2.0, 0.5, 0.8, 2.5, 1.0,
+      1.0,
+      -0.8,
+      0.0,
+      -2.0,
+      0.5,
+      0.8,
+      2.5,
+      1.0,
     )
     assert p_factor == pytest.approx(0.25)
     assert torque_blend == pytest.approx(UNWIND_TORQUE_BLEND_MAX)
@@ -141,7 +158,14 @@ class TestFutureUnwindBrake:
 
   def test_applied_torque_brakes_predicted_unwind_overshoot(self):
     p_factor, torque_blend, activation, zero_time, projected_error = get_future_unwind_brake(
-      1.0, -0.8, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0,
+      1.0,
+      -0.8,
+      -2.0,
+      1.0,
+      0.2,
+      0.8,
+      2.5,
+      1.0,
     )
     expected_zero_time = 0.8 / (UNWIND_TORQUE_DELTA_DOWN / UNWIND_TORQUE_MAX / DT_CTRL)
     assert zero_time == pytest.approx(expected_zero_time)
@@ -152,7 +176,14 @@ class TestFutureUnwindBrake:
 
   def test_confirmed_unwind_can_use_target_that_starts_the_planned_release(self):
     _, torque_blend, activation, *_ = get_future_unwind_brake(
-      1.0, 1.0, -2.0, 1.0, 0.2, 0.8, 2.5, 1.0,
+      1.0,
+      1.0,
+      -2.0,
+      1.0,
+      0.2,
+      0.8,
+      2.5,
+      1.0,
     )
     assert torque_blend == pytest.approx(UNWIND_TORQUE_BLEND_MAX)
     assert activation == pytest.approx(1.0)
@@ -162,10 +193,24 @@ class TestFutureUnwindBrake:
     # A position catch-up target in the wheel's direction must not redefine
     # that motion as on-rate for unwind braking.
     raw_path = get_future_unwind_brake(
-      1.0, 0.0, -4.0, 3.0, 0.0, 0.0, 2.5, 1.0,
+      1.0,
+      0.0,
+      -4.0,
+      3.0,
+      0.0,
+      0.0,
+      2.5,
+      1.0,
     )
     catchup_inflated = get_future_unwind_brake(
-      1.0, 0.0, -4.0, -1.0, 0.0, 0.0, 2.5, 1.0,
+      1.0,
+      0.0,
+      -4.0,
+      -1.0,
+      0.0,
+      0.0,
+      2.5,
+      1.0,
     )
     assert raw_path[2] == pytest.approx(1.0)
     assert catchup_inflated[2] == pytest.approx(0.0)
@@ -185,12 +230,30 @@ class TestFutureUnwindBrake:
     assert right_to_neutral > to_zero > left_to_neutral
 
     *_, right_time, _ = get_future_unwind_brake(
-      1.0, 0.25, 0.0, 0.0, 0.0, -1.0, 2.5, 1.0,
-      decay_rate, build_rate, 0.25,
+      1.0,
+      0.25,
+      0.0,
+      0.0,
+      0.0,
+      -1.0,
+      2.5,
+      1.0,
+      decay_rate,
+      build_rate,
+      0.25,
     )
     *_, left_time, _ = get_future_unwind_brake(
-      1.0, 0.25, 0.0, 0.0, 0.0, 1.0, 2.5, 1.0,
-      decay_rate, build_rate, 0.25,
+      1.0,
+      0.25,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      2.5,
+      1.0,
+      decay_rate,
+      build_rate,
+      0.25,
     )
     assert right_time == pytest.approx(right_to_neutral)
     assert left_time == pytest.approx(left_to_neutral)
@@ -200,7 +263,14 @@ class TestUnwindPhaseTracker:
   def test_holds_through_delivery_then_releases_smoothly(self):
     tracker = UnwindPhaseTracker(DT_CTRL)
     phase, direction, gap, *_ = tracker.update(
-      True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0,
+      True,
+      1.0,
+      0.02,
+      -0.2,
+      -0.8,
+      0.2,
+      -1.0,
+      0.0,
     )
     assert phase == pytest.approx(1.0)
     assert direction == -1.0
@@ -222,7 +292,14 @@ class TestUnwindPhaseTracker:
     tracker = UnwindPhaseTracker(DT_CTRL)
     tracker.update(True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0)
     phase, direction, *_ = tracker.update(
-      True, 1.0, -0.02, 0.2, 0.2, 0.2, 0.0, 0.0,
+      True,
+      1.0,
+      -0.02,
+      0.2,
+      0.2,
+      0.2,
+      0.0,
+      0.0,
     )
     assert direction == -1.0
     assert phase < 1.0
@@ -230,13 +307,29 @@ class TestUnwindPhaseTracker:
   def test_opposite_geometric_maneuver_releases_delivery_hold(self):
     tracker = UnwindPhaseTracker(DT_CTRL)
     tracker.update(
-      True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0, -0.5,
+      True,
+      1.0,
+      0.02,
+      -0.2,
+      -0.8,
+      0.2,
+      -1.0,
+      0.0,
+      -0.5,
     )
 
     samples = int(np.ceil(UNWIND_EPISODE_OPPOSITE_TIME / DT_CTRL)) + 1
     for _ in range(samples):
       phase, direction, gap, _, same_episode, opposite_time, episode_armed = tracker.update(
-        True, 1.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, 0.5,
+        True,
+        1.0,
+        -0.02,
+        0.5,
+        0.2,
+        0.2,
+        0.0,
+        0.0,
+        0.5,
       )
 
     assert direction == -1.0
@@ -250,25 +343,164 @@ class TestUnwindPhaseTracker:
     # after the smooth handoff reaches zero.
     for _ in range(100):
       phase, *_, episode_armed = tracker.update(
-        True, 1.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, 0.5,
+        True,
+        1.0,
+        -0.02,
+        0.5,
+        0.2,
+        0.2,
+        0.0,
+        0.0,
+        0.5,
       )
     assert phase == 0.0
     assert not episode_armed
 
     *_, episode_armed = tracker.update(
-      True, 0.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, 0.5,
+      True,
+      0.0,
+      -0.02,
+      0.5,
+      0.2,
+      0.2,
+      0.0,
+      0.0,
+      0.5,
     )
     assert episode_armed
+
+  def test_transient_opposite_sample_does_not_transfer_episode(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    tracker.update(
+      True,
+      1.0,
+      0.02,
+      -0.2,
+      -0.8,
+      0.2,
+      -1.0,
+      0.0,
+      -0.5,
+      -0.5,
+    )
+
+    samples = int(np.ceil(UNWIND_EPISODE_OPPOSITE_TIME / DT_CTRL)) + 2
+    for _ in range(samples):
+      phase, _, gap, _, same_episode, opposite_time, _ = tracker.update(
+        True,
+        0.0,
+        -0.02,
+        0.2,
+        0.5,
+        0.2,
+        0.0,
+        0.0,
+        0.5,
+        -0.5,
+      )
+
+    assert phase == pytest.approx(1.0)
+    assert gap == pytest.approx(0.3)
+    assert same_episode
+    assert opposite_time == 0.0
+
+  def test_friction_sign_flip_on_nearly_straight_path_does_not_transfer_episode(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    tracker.update(
+      True,
+      1.0,
+      0.02,
+      -0.2,
+      -0.8,
+      0.2,
+      -1.0,
+      0.0,
+      -0.5,
+      -0.5,
+      0.5,
+      0.5,
+    )
+
+    samples = int(np.ceil(UNWIND_EPISODE_OPPOSITE_TIME / DT_CTRL)) + 2
+    for _ in range(samples):
+      phase, _, _, _, same_episode, opposite_time, _ = tracker.update(
+        True,
+        0.0,
+        -0.02,
+        0.2,
+        0.5,
+        0.2,
+        0.0,
+        0.0,
+        0.5,
+        0.5,
+        -0.13,
+        -0.15,
+      )
+
+    assert phase == pytest.approx(1.0)
+    assert same_episode
+    assert opposite_time == 0.0
+
+  def test_symmetric_delivery_gap_holds_far_side_torque_mismatch(self):
+    tracker = UnwindPhaseTracker(DT_CTRL)
+    tracker.update(
+      True,
+      1.0,
+      0.02,
+      -0.2,
+      -0.8,
+      0.2,
+      -1.0,
+      0.0,
+      -0.5,
+      -0.5,
+    )
+
+    # Applied torque has crossed to the far side of the original turn. The old
+    # directional gap was zero here despite a large mismatch to the future
+    # crown-adjusted target.
+    phase, _, gap, _, same_episode, *_ = tracker.update(
+      True,
+      0.0,
+      0.0,
+      0.2,
+      0.5,
+      0.2,
+      0.0,
+      0.0,
+      0.2,
+      -0.5,
+    )
+    assert gap == pytest.approx(0.3)
+    assert phase == pytest.approx(1.0)
+    assert same_episode
 
   def test_geometric_deadband_does_not_chatter_episode_ownership(self):
     tracker = UnwindPhaseTracker(DT_CTRL)
     tracker.update(
-      True, 1.0, 0.02, -0.2, -0.8, 0.2, -1.0, 0.0, -0.5,
+      True,
+      1.0,
+      0.02,
+      -0.2,
+      -0.8,
+      0.2,
+      -1.0,
+      0.0,
+      -0.5,
     )
 
     for geometric_target in (0.27, 0.13) * 20:  # +/-0.07 around the 0.20 crown-neutral torque
       phase, _, _, _, same_episode, opposite_time, _ = tracker.update(
-        True, 0.0, -0.02, 0.5, 0.2, 0.2, 0.0, 0.0, geometric_target,
+        True,
+        0.0,
+        -0.02,
+        0.5,
+        0.2,
+        0.2,
+        0.0,
+        0.0,
+        geometric_target,
       )
 
     assert phase == pytest.approx(1.0)
@@ -401,11 +633,25 @@ class TestReferenceRateTrackingIntegration:
     params = log.LiveParametersData.new_message()
 
     controller.update(
-      True, car_state, vehicle_model, params, False, 0.0, False, 0.2,
+      True,
+      car_state,
+      vehicle_model,
+      params,
+      False,
+      0.0,
+      False,
+      0.2,
       trajectory_reference_curvature_rate=0.0,
     )
     _, _, torque_log = controller.update(
-      True, car_state, vehicle_model, params, False, 0.01, False, 0.2,
+      True,
+      car_state,
+      vehicle_model,
+      params,
+      False,
+      0.01,
+      False,
+      0.2,
       trajectory_reference_curvature_rate=0.001,
     )
 
@@ -438,12 +684,22 @@ class TestReferenceRateTrackingIntegration:
     car_state.vEgo = 3.0
     params = log.LiveParametersData.new_message()
 
-    controller.update(True, car_state, vehicle_model, params, False, 0.02, False, 0.2,
-                      applied_torque=-0.8, reference_unwind_scale=0.0, reference_target_torque=-0.8)
+    controller.update(
+      True, car_state, vehicle_model, params, False, 0.02, False, 0.2, applied_torque=-0.8, reference_unwind_scale=0.0, reference_target_torque=-0.8
+    )
     car_state.steeringAngleDeg = -5.0
     torque, _, torque_log = controller.update(
-      True, car_state, vehicle_model, params, False, 0.01, False, 0.2,
-      applied_torque=-0.8, reference_unwind_scale=1.0, reference_target_torque=0.8,
+      True,
+      car_state,
+      vehicle_model,
+      params,
+      False,
+      0.01,
+      False,
+      0.2,
+      applied_torque=-0.8,
+      reference_unwind_scale=1.0,
+      reference_target_torque=0.8,
     )
 
     assert torque_log.unwindBrakeActivation == pytest.approx(1.0)
