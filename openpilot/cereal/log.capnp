@@ -947,6 +947,9 @@ struct ControlsState @0x97ff69c53601abf1 {
     trajectoryReferenceRateValid @68 :Bool;              # future-path rate selected instead of the shadow fallback
     trajectoryReferenceInnovation @69 :Float32;          # differentiated-command rate minus trajectory rate, 1/m/s
     filteredTrajectoryReferenceInnovation @70 :Float32;  # low-frequency innovation retained by the cascade, 1/m/s
+    referenceSustainedUnwindScale @71 :Float32;           # unwind confidence sustained across the release-preview horizon
+    referenceEpisodeTargetTorque @72 :Float32;           # later geometric torque used to confirm episode handoff
+    referenceEpisodeLateralAccel @73 :Float32;           # later geometric lateral acceleration used to reject friction-only sign flips
    }
 
   struct LateralAngleState {
