@@ -30,11 +30,12 @@ rolling. It remains separate from the standstill lead-launch detector and will
 not be considered complete until replay calibration and new field logs have
 been reviewed.
 
-🚧 **Lateral detector version 4 is in progress.** The update separates
-requested direction reversals from unrequested center overshoots, consolidates
-duplicate handoff evidence, and expands driver, road, and stall-release
-evidence. It will remain in progress until the saved-route regressions and new
-field collection have been reviewed.
+🚧 **Lateral detector version 5 is in progress.** Version 4's reversal,
+handoff, driver, road, and stall-release evidence remains intact. Version 5
+adds progress-based bad-unwind detection and a sensitive single
+turn–stop–turn detector without changing steering behavior. Route 93 replay is
+complete; it will remain in progress until new field collection has been
+reviewed.
 
 ## What it does
 
@@ -57,7 +58,7 @@ manifest, or directly notify another orchestrator.
 | source | recorded event types | purpose |
 |---|---|---|
 | Manual sidebar flag | `manual.general` | Mark any moment the driver wants reviewed |
-| BLaT lateral detector | `lat.stallRelease`, `lat.lateUnwind`, `lat.handoffMismatch`, `lat.centerOvershoot`, `lat.committedHandoffHarshness`, `lat.torqueAuthority` | Capture known steering failure shapes and their controller/actuator evidence |
+| BLaT lateral detector | `lat.stallRelease`, `lat.lateUnwind`, `lat.unwindProgressDeficit`, `lat.turnStopTurn`, `lat.handoffMismatch`, `lat.centerOvershoot`, `lat.committedHandoffHarshness`, `lat.torqueAuthority` | Capture known steering failure shapes and their controller/actuator evidence |
 | Lead-launch detector | `long.lateLeadLaunchPlanner`, `long.lateLeadLaunchController`, `long.lateLeadLaunchVehicle`, `long.leadLaunchStall` | Capture a delayed launch and attribute where the response chain lagged |
 | Rolling lead-response detector | `long.lateRollingLeadResponsePlanner`, `long.lateRollingLeadResponseController`, `long.lateRollingLeadResponseVehicle` | Capture a continuously tracked lead pulling away from an already-rolling ego while the response chain lags |
 | Smooth-stop jolt detector | `long.stopJolt` | Capture an abrupt brake grab or brake-release rebound during the final low-speed landing |
@@ -220,7 +221,7 @@ Historical `/data/community/lat_events` and
 
 ## Detector behavior
 
-### Lateral detector, version 4
+### Lateral detector, version 5
 
 The lateral detector is conservative and runs only while the torque controller
 and lateral control are active. Each event type has its own eight-second
@@ -231,13 +232,18 @@ It detects:
 
 - three steering stall-release cycles inside six seconds, retaining a
   structured snapshot for every release;
+- one strong high-angle or high-demand turn–stop–turn release without
+  requiring three cycles;
 - an expected unwind that remains stalled for more than one second;
+- an expected unwind whose wheel motion remains materially behind requested
+  progress even when the wheel is not stationary;
 - a high-rate phase handoff with a large applied/reference torque gap;
 - a fast signed center crossing without a committed requested reversal;
 - an intentionally requested center handoff that remains unusually harsh;
 - sustained requested/applied torque saturation with growing tracking error.
 
-Version 4 establishes the wheel beyond 25 degrees, interpolates its physical
+Version 5 preserves version 4's crossing classification. It establishes the
+wheel beyond 25 degrees, interpolates its physical
 zero crossing, and waits roughly 0.2 seconds to confirm whether the desired
 lateral acceleration committed to a new sign. The physical crossing remains
 `occurredMonoTime`; the later classification is `detectedMonoTime`.
@@ -251,8 +257,30 @@ Driver evidence distinguishes possible raw torque from confirmed
 state. Road evidence similarly distinguishes trigger-time, transient, and
 substantial confounding while retaining every event. Stall releases record
 actual Hyundai damping amount/state, blocked state, floor, breakaway latch, and
-version from `carOutput`; version 4 never treats the controller D-term as
+version from `carOutput`; version 5 never treats the controller D-term as
 actual damping. The fields are optional for stock and non-Hyundai vehicles.
+
+The version-5 work is observer-only. `unwindProgressDeficit` compares
+timestamp-integrated expected wheel progress with actual angle reduction using
+angle-dependent deadlines, and treats driver assistance as confirmation rather
+than suppression. `turnStopTurn` follows moving, slowing, dwell, and released
+states so one strong high-angle/high-demand stall and restart is retained even
+when it does not satisfy the older three-release pattern. Both request six
+seconds before and two seconds after their physical trigger.
+
+Full-rlog replay of route `00000093--3198e2f719` currently gives:
+
+- the first requested unwind arms around 12:36:38.56 MDT while the wheel is
+  still moving outward, retains the roughly 17.6-degree additional excursion,
+  and finalizes at the confirmed driver assist around 12:36:40.47;
+- the 12:38 case emits `turnStopTurn` at about 12:38:32.96 with a
+  roughly 1.23-second dwell near 214 degrees, near-full requested/applied/
+  reference torque, and an `unwind` restart;
+- the later unwind arms at about 12:41:20.34, retains the approximately
+  −368.5-degree peak, interpolates requested/applied neutral crossings around
+  12:41:21.14/21.17, and finalizes at `steeringPressed` around 12:41:22.45.
+
+These are replay-calibration results, not field completion.
 
 Saved full-rlog replay currently gives:
 

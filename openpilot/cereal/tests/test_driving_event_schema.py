@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from openpilot.cereal import messaging
@@ -40,6 +42,7 @@ def test_lateral_payload_round_trip():
     controller_version=3, reference_version=4, road_confounded=True,
     driver_torque=75.0, steering_torque_eps=123.0, damping_applied=0.2, damping_state="applied",
   )
+  sample.measurement_rate = -0.22
   evidence = LateralEvidence(
     0.0, 1.0, 0.5, 100.0, False, 0.25, 1, 0.0, "lat:episode", 2.0, 2.0,
     stall_release_count=3,
@@ -80,6 +83,61 @@ def test_lateral_payload_round_trip():
       True, False, "turnIn",
     ),),
   )
+  evidence = SimpleNamespace(**(evidence.__dict__ | {
+    "driver_confounded_any": evidence.driver_confounded_any,
+    "road_confounded_any": evidence.road_confounded_any,
+    "unwind_episode_start_mono_time": 0.20,
+    "unwind_deficit_start_mono_time": 0.35,
+    "unwind_deficit_duration_s": 0.65,
+    "initial_steering_angle_deg": 42.0,
+    "peak_steering_angle_deg": 45.0,
+    "trigger_steering_angle_deg": 31.0,
+    "expected_unwind_direction": "towardCenter",
+    "expected_angle_progress_deg": 18.0,
+    "actual_angle_progress_deg": 4.5,
+    "unwind_progress_ratio": 0.25,
+    "reference_rate_at_trigger": -0.8,
+    "measurement_rate_at_trigger": -0.1,
+    "peak_reference_measurement_rate_gap": 0.92,
+    "requested_torque_neutral_cross_mono_time": 0.44,
+    "applied_torque_neutral_cross_mono_time": 0.59,
+    "unwind_command_delay_s": 0.15,
+    "driver_assisted_unwind": True,
+    "driver_assist_mono_time": 0.70,
+    "driver_assist_angle_deg": 28.0,
+    "driver_assist_wheel_rate_deg": -22.0,
+    "driver_assist_torque": -85.0,
+    "wheel_rate_increase_after_assist_deg_s": 35.0,
+    "movement_start_mono_time": 0.10,
+    "dwell_start_mono_time": 0.40,
+    "release_mono_time": 0.90,
+    "dwell_duration_s": 0.50,
+    "dwell_steering_angle_deg": 12.0,
+    "pre_dwell_peak_rate_deg_s": 75.0,
+    "minimum_dwell_rate_deg_s": 2.0,
+    "release_peak_rate_deg_s": 68.0,
+    "rate_reduction_ratio": 0.0267,
+    "restart_classification": "oppositeDirection",
+    "request_torque_during_dwell": -0.4,
+    "applied_torque_during_dwell": -0.3,
+    "reference_target_during_dwell": -0.2,
+    "tracking_active_during_dwell": True,
+    "driver_involved_before_dwell": False,
+    "driver_involved_during_dwell": True,
+    "driver_involved_after_dwell": False,
+    "turn_stop_actual_damping_amount": 0.029,
+    "turn_stop_actual_damping_state": "damping",
+    "turn_stop_turn_in_blocked": False,
+    "turn_stop_breakaway_latch": 0.89,
+    "turn_stop_sustain_floor_contribution": 0.80,
+    "turn_stop_damping_version": 2,
+    "turn_stop_damping_valid": True,
+    "unwind_requested_torque_at_trigger": -0.55,
+    "unwind_applied_torque_at_trigger": -0.42,
+    "unwind_reference_target_torque_at_trigger": -0.12,
+    "unwind_applied_target_gap_at_trigger": 0.30,
+    "unwind_peak_applied_target_gap": 0.35,
+  }))
   candidate = lateral_candidate(sample, LateralDetection(
     "committedHandoffHarshness", "warning", 0.9, "reason", evidence,
     occurred_mono_time=0.75, detected_mono_time=1.0,
@@ -104,6 +162,60 @@ def test_lateral_payload_round_trip():
   assert event.payload.lateral.requestedTorqueAtCrossing == pytest.approx(0.55)
   assert event.payload.lateral.appliedTorqueAtCrossing == pytest.approx(0.42)
   assert event.payload.lateral.referenceTargetTorqueAtCrossing == pytest.approx(0.12)
+  assert event.payload.lateral.unwindEpisodeStartMonoTime == 200_000_000
+  assert event.payload.lateral.unwindDeficitStartMonoTime == 350_000_000
+  assert event.payload.lateral.unwindDeficitDurationS == pytest.approx(0.65)
+  assert event.payload.lateral.initialSteeringAngleDeg == pytest.approx(42.0)
+  assert event.payload.lateral.peakSteeringAngleDeg == pytest.approx(45.0)
+  assert event.payload.lateral.triggerSteeringAngleDeg == pytest.approx(31.0)
+  assert event.payload.lateral.expectedUnwindDirection == "towardCenter"
+  assert event.payload.lateral.expectedAngleProgressDeg == pytest.approx(18.0)
+  assert event.payload.lateral.actualAngleProgressDeg == pytest.approx(4.5)
+  assert event.payload.lateral.unwindProgressRatio == pytest.approx(0.25)
+  assert event.payload.lateral.referenceRateAtTrigger == pytest.approx(-0.8)
+  assert event.payload.lateral.measurementRateAtTrigger == pytest.approx(-0.1)
+  assert event.payload.lateral.peakReferenceMeasurementRateGap == pytest.approx(0.92)
+  assert event.payload.lateral.requestedTorqueNeutralCrossPresent
+  assert event.payload.lateral.requestedTorqueNeutralCrossMonoTime == 440_000_000
+  assert event.payload.lateral.appliedTorqueNeutralCrossPresent
+  assert event.payload.lateral.appliedTorqueNeutralCrossMonoTime == 590_000_000
+  assert event.payload.lateral.unwindCommandDelayS == pytest.approx(0.15)
+  assert event.payload.lateral.driverAssistedUnwind
+  assert event.payload.lateral.driverAssistMonoTime == 700_000_000
+  assert event.payload.lateral.driverAssistAngleDeg == pytest.approx(28.0)
+  assert event.payload.lateral.driverAssistWheelRateDeg == pytest.approx(-22.0)
+  assert event.payload.lateral.driverAssistTorque == pytest.approx(-85.0)
+  assert event.payload.lateral.wheelRateIncreaseAfterAssistDegS == pytest.approx(35.0)
+  assert event.payload.lateral.movementStartMonoTime == 100_000_000
+  assert event.payload.lateral.dwellStartMonoTime == 400_000_000
+  assert event.payload.lateral.releaseMonoTime == 900_000_000
+  assert event.payload.lateral.dwellDurationS == pytest.approx(0.5)
+  assert event.payload.lateral.dwellSteeringAngleDeg == pytest.approx(12.0)
+  assert event.payload.lateral.preDwellPeakRateDegS == pytest.approx(75.0)
+  assert event.payload.lateral.minimumDwellRateDegS == pytest.approx(2.0)
+  assert event.payload.lateral.releasePeakRateDegS == pytest.approx(68.0)
+  assert event.payload.lateral.rateReductionRatio == pytest.approx(0.0267)
+  assert event.payload.lateral.restartClassification == "oppositeDirection"
+  assert event.payload.lateral.requestTorqueDuringDwell == pytest.approx(-0.4)
+  assert event.payload.lateral.appliedTorqueDuringDwell == pytest.approx(-0.3)
+  assert event.payload.lateral.referenceTargetDuringDwell == pytest.approx(-0.2)
+  assert event.payload.lateral.trackingActiveDuringDwell
+  assert event.payload.lateral.measurementRate == pytest.approx(-0.22)
+  assert not event.payload.lateral.driverInvolvedBeforeDwell
+  assert event.payload.lateral.driverInvolvedDuringDwell
+  assert not event.payload.lateral.driverInvolvedAfterDwell
+  assert event.payload.lateral.turnStopActualDampingAmount == pytest.approx(0.029)
+  assert event.payload.lateral.turnStopActualDampingState == "damping"
+  assert not event.payload.lateral.turnStopTurnInBlocked
+  assert event.payload.lateral.turnStopBreakawayLatch == pytest.approx(0.89)
+  assert event.payload.lateral.turnStopSustainFloorContribution == pytest.approx(0.80)
+  assert event.payload.lateral.turnStopDampingVersion == 2
+  assert event.payload.lateral.turnStopDampingValid
+  assert event.payload.lateral.unwindRequestedTorqueAtTrigger == pytest.approx(-0.55)
+  assert event.payload.lateral.unwindAppliedTorqueAtTrigger == pytest.approx(-0.42)
+  assert event.payload.lateral.unwindReferenceTargetTorqueAtTrigger == pytest.approx(-0.12)
+  assert event.payload.lateral.unwindAppliedTargetGapAtTrigger == pytest.approx(0.30)
+  assert event.payload.lateral.unwindPeakAppliedTargetGap == pytest.approx(0.35)
   release = event.payload.lateral.stallReleases[0]
   assert release.dampingValid
   assert release.dampingState == "turnInAuthority"

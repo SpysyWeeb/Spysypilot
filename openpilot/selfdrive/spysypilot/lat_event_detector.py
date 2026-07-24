@@ -1,7 +1,7 @@
 """Pure lateral driving-event detection and signal conditioning.
 
 This module intentionally owns no messaging, Params, filesystem, UI, process
-lifecycle, or actuation behavior. Detector v4 distinguishes an intentionally
+lifecycle, or actuation behavior. Detector v5 distinguishes an intentionally
 requested center crossing from an unrequested overshoot and keeps driver/road
 interaction as attribution evidence rather than an event-suppression rule.
 """
@@ -10,7 +10,7 @@ from collections import deque
 from dataclasses import dataclass
 
 
-DETECTOR_VERSION = 4
+DETECTOR_VERSION = 5
 EVENT_COOLDOWN = 8.0
 STALL_RELEASE_WINDOW_S = 6.0
 STALL_TRANSITION_HYSTERESIS_S = 0.25
@@ -32,6 +32,42 @@ TRACKING_ERROR_THRESHOLD = 0.35
 TRACKING_ERROR_PERSIST_S = 0.15
 DRIVER_RAW_TORQUE_THRESHOLD = 50.0
 ROAD_SUBSTANTIAL_FRACTION = 0.25
+
+UNWIND_ARM_ANGLE_DEG = 45.0
+UNWIND_REFERENCE_SCALE = 0.6
+UNWIND_PHASE = 0.6
+UNWIND_REFERENCE_RATE_MIN = 0.2
+UNWIND_PROGRESS_RATIO_MIN = 0.35
+UNWIND_DEFICIT_ELIGIBLE_S = 0.10
+UNWIND_DRIVER_ASSIST_WHEEL_RATE_DEG_S = 30.0
+UNWIND_NO_ASSIST_OBSERVATION_S = 2.0
+UNWIND_PROGRESS_RECENT_RATE_LOOKBACK_S = 0.75
+UNWIND_PROGRESS_DRIVER_RATE_LOOKBACK_S = 0.25
+UNWIND_RAW_DRIVER_ASSIST_S = 0.08
+UNWIND_CONFIRMED_DRIVER_TORQUE = 200.0
+UNWIND_MAX_EXPECTED_WHEEL_RATE_DEG_S = 400.0
+UNWIND_EXPECTED_RATE_LOW_DEG_S = 25.0
+UNWIND_EXPECTED_RATE_MID_DEG_S = 50.0
+UNWIND_EXPECTED_RATE_HIGH_DEG_S = 112.5
+UNWIND_DURATION_LOW_S = 0.8
+UNWIND_DURATION_MID_S = 0.6
+UNWIND_DURATION_HIGH_S = 0.4
+UNWIND_LOW_BAND_MAX_DEG = 120.0
+UNWIND_MID_BAND_MAX_DEG = 240.0
+UNWIND_END_ANGLE_DEG = 25.0
+
+TURN_STOP_MOVING_RATE_DEG_S = 30.0
+TURN_STOP_ARM_ANGLE_DEG = 25.0
+TURN_STOP_ABSOLUTE_DWELL_RATE_DEG_S = 8.0
+TURN_STOP_DWELL_RATE_FRACTION = 0.25
+TURN_STOP_SLOWING_RATE_FRACTION = 0.70
+TURN_STOP_MIN_DWELL_S = 0.30
+TURN_STOP_STRONG_DWELL_S = 0.50
+TURN_STOP_STRONG_ANGLE_DEG = 90.0
+TURN_STOP_STRONG_TORQUE = 0.80
+TURN_STOP_TRACKING_ERROR = 0.15
+TURN_STOP_RELEASE_OBSERVATION_S = 0.25
+TURN_STOP_CLUSTER_SELECTION_S = 2.1
 
 DRIVER_CONFOUND_TORQUE = 1
 DRIVER_CONFOUND_STEERING_PRESSED = 2
@@ -65,6 +101,7 @@ class LateralSample:
   controller_version: int = 0
   reference_version: int = 0
   reference_rate: float = 0.0
+  measurement_rate: float = 0.0
   reference_target_torque: float = 0.0
   reference_unwind_scale: float = 0.0
   reference_sustained_unwind_scale: float = 0.0
@@ -170,6 +207,58 @@ class LateralEvidence:
   handoff_center_delta_s: float = 0.0
   stall_releases: tuple[StallReleaseEvidence, ...] = ()
 
+  unwind_episode_start_mono_time: float = 0.0
+  unwind_deficit_start_mono_time: float = 0.0
+  unwind_deficit_duration_s: float = 0.0
+  initial_steering_angle_deg: float = 0.0
+  peak_steering_angle_deg: float = 0.0
+  trigger_steering_angle_deg: float = 0.0
+  expected_unwind_direction: str = ""
+  expected_angle_progress_deg: float = 0.0
+  actual_angle_progress_deg: float = 0.0
+  unwind_progress_ratio: float = 0.0
+  reference_rate_at_trigger: float = 0.0
+  measurement_rate_at_trigger: float = 0.0
+  peak_reference_measurement_rate_gap: float = 0.0
+  requested_torque_neutral_cross_mono_time: float | None = None
+  applied_torque_neutral_cross_mono_time: float | None = None
+  unwind_command_delay_s: float = 0.0
+  driver_assisted_unwind: bool = False
+  driver_assist_mono_time: float | None = None
+  driver_assist_angle_deg: float = 0.0
+  driver_assist_wheel_rate_deg: float = 0.0
+  driver_assist_torque: float = 0.0
+  wheel_rate_increase_after_assist_deg_s: float = 0.0
+  unwind_requested_torque_at_trigger: float = 0.0
+  unwind_applied_torque_at_trigger: float = 0.0
+  unwind_reference_target_torque_at_trigger: float = 0.0
+  unwind_applied_target_gap_at_trigger: float = 0.0
+  unwind_peak_applied_target_gap: float = 0.0
+
+  movement_start_mono_time: float = 0.0
+  dwell_start_mono_time: float = 0.0
+  release_mono_time: float = 0.0
+  dwell_duration_s: float = 0.0
+  dwell_steering_angle_deg: float = 0.0
+  pre_dwell_peak_rate_deg_s: float = 0.0
+  minimum_dwell_rate_deg_s: float = 0.0
+  release_peak_rate_deg_s: float = 0.0
+  rate_reduction_ratio: float = 0.0
+  restart_classification: str = ""
+  request_torque_during_dwell: float = 0.0
+  applied_torque_during_dwell: float = 0.0
+  reference_target_during_dwell: float = 0.0
+  tracking_active_during_dwell: bool = False
+  driver_involved_before_dwell: bool = False
+  driver_involved_during_dwell: bool = False
+  driver_involved_after_dwell: bool = False
+  turn_stop_actual_damping_amount: float | None = None
+  turn_stop_actual_damping_state: str | None = None
+  turn_stop_turn_in_blocked: bool | None = None
+  turn_stop_breakaway_latch: float | None = None
+  turn_stop_sustain_floor_contribution: float | None = None
+  turn_stop_damping_version: int | None = None
+
   @property
   def driver_confounded_any(self) -> bool:
     return self.driver_confound_reason != 0
@@ -248,6 +337,72 @@ class PendingHandoff:
   peak_applied_target_gap: float
 
 
+@dataclass
+class UnwindProgressEpisode:
+  start_mono_time: float
+  initial_steering_angle_deg: float
+  peak_steering_angle_deg: float
+  expected_direction: int
+  expected_rate_deg_s: float
+  deficit_start_mono_time: float | None = None
+  mature_mono_time: float | None = None
+  trigger_steering_angle_deg: float = 0.0
+  trigger_expected_progress_deg: float = 0.0
+  trigger_actual_progress_deg: float = 0.0
+  trigger_progress_ratio: float = 0.0
+  trigger_reference_rate: float = 0.0
+  trigger_measurement_rate: float = 0.0
+  trigger_requested_torque: float = 0.0
+  trigger_applied_torque: float = 0.0
+  trigger_reference_target_torque: float = 0.0
+  trigger_applied_target_gap: float = 0.0
+  peak_reference_measurement_rate_gap: float = 0.0
+  peak_applied_target_gap: float = 0.0
+  requested_neutral_cross_mono_time: float | None = None
+  applied_neutral_cross_mono_time: float | None = None
+  previous_request_torque: float = 0.0
+  previous_applied_torque: float = 0.0
+  previous_mono_time: float = 0.0
+  recent_toward_rates: deque[tuple[float, float]] | None = None
+  steering_pressed_was_active: bool = False
+  raw_driver_assist_since: float | None = None
+  raw_driver_assist_start_rate_deg_s: float = 0.0
+
+
+@dataclass
+class TurnStopEpisode:
+  state: str
+  movement_start_mono_time: float
+  movement_direction: int
+  pre_dwell_peak_signed_rate_deg_s: float
+  pre_dwell_peak_rate_deg_s: float
+  driver_involved_before_dwell: bool
+  dwell_start_mono_time: float | None = None
+  dwell_steering_angle_deg: float = 0.0
+  minimum_dwell_rate_deg_s: float = math.inf
+  max_request_torque_during_dwell: float = 0.0
+  max_applied_torque_during_dwell: float = 0.0
+  max_reference_target_during_dwell: float = 0.0
+  tracking_active_during_dwell: bool = True
+  meaningful_reference_during_dwell: bool = False
+  driver_involved_during_dwell: bool = False
+  release_mono_time: float | None = None
+  release_sample: LateralSample | None = None
+  release_peak_rate_deg_s: float = 0.0
+  restart_classification: str = ""
+  driver_involved_after_dwell: bool = False
+
+
+@dataclass
+class PendingTurnStopCandidate:
+  episode: TurnStopEpisode
+  release_sample: LateralSample
+  score: float
+  deadline_mono_time: float
+  previous_phase: float
+  previous_same_episode: bool
+
+
 @dataclass(frozen=True)
 class LateralDetection:
   event_type: str
@@ -312,10 +467,15 @@ class LateralEventDetector:
     self.authority_since: float | None = None
     self.releases: deque[StallRelease] = deque()
     # time, driver-any, torque, pressed, road, tracking, vertical deviation,
-    # desired lateral acceleration, tracking error, and applied-target gap
-    self.history: deque[tuple[float, bool, float, bool, bool, bool, float, float, float, float]] = deque()
+    # desired lateral acceleration, tracking error, applied-target gap, and
+    # signed wheel rate.
+    self.history: deque[tuple[float, bool, float, bool, bool, bool, float, float, float, float, float]] = deque()
     self.episode_start: float | None = None
     self.episode_last_activity = -math.inf
+    self.unwind_progress_episode: UnwindProgressEpisode | None = None
+    self.unwind_progress_latched = False
+    self.turn_stop_episode: TurnStopEpisode | None = None
+    self.pending_turn_stop_candidate: PendingTurnStopCandidate | None = None
 
   def reset_temporal(self) -> None:
     self.previous_sample = None
@@ -331,6 +491,10 @@ class LateralEventDetector:
     self.releases.clear()
     self.episode_start = None
     self.episode_last_activity = -math.inf
+    self.unwind_progress_episode = None
+    self.unwind_progress_latched = False
+    self.turn_stop_episode = None
+    self.pending_turn_stop_candidate = None
 
   def _update_history(self, sample: LateralSample) -> None:
     tracking_active = abs(sample.reference_rate) > 0.2 or abs(sample.desired_lateral_accel - sample.actual_lateral_accel) > 0.15
@@ -345,6 +509,7 @@ class LateralEventDetector:
       sample.desired_lateral_accel,
       abs(sample.desired_lateral_accel - sample.actual_lateral_accel),
       sample.applied_target_gap,
+      sample.steering_rate_deg,
     ))
     while self.history and sample.mono_time - self.history[0][0] > EVIDENCE_HISTORY_S:
       self.history.popleft()
@@ -372,6 +537,8 @@ class LateralEventDetector:
       "committedHandoffHarshness": (2.0, 2.0),
       "handoffMismatch": (2.0, 2.0),
       "torqueAuthority": (2.0, 2.0),
+      "unwindProgressDeficit": (6.0, 2.0),
+      "turnStopTurn": (6.0, 2.0),
     }[event_type]
 
   @staticmethod
@@ -400,7 +567,13 @@ class LateralEventDetector:
                 late_unwind_duration: float = 0.0,
                 occurred_time: float | None = None,
                 crossing: PendingCrossing | None = None,
-                handoff_time: float | None = None) -> LateralEvidence:
+                handoff_time: float | None = None,
+                unwind_episode: UnwindProgressEpisode | None = None,
+                turn_stop_episode: TurnStopEpisode | None = None,
+                driver_assist_sample: LateralSample | None = None,
+                wheel_rate_increase_after_assist: float = 0.0,
+                turn_stop_release_sample: LateralSample | None = None,
+                turn_stop_restart_classification: str = "") -> LateralEvidence:
     samples = [entry for entry in self.history if entry[0] >= evidence_start]
     if not samples:
       samples = [(
@@ -414,6 +587,7 @@ class LateralEventDetector:
         sample.desired_lateral_accel,
         abs(sample.desired_lateral_accel - sample.actual_lateral_accel),
         sample.applied_target_gap,
+        sample.steering_rate_deg,
       )]
     driver_count = sum(entry[1] for entry in samples)
     raw_torque_count = sum(abs(entry[2]) > DRIVER_RAW_TORQUE_THRESHOLD for entry in samples)
@@ -549,6 +723,173 @@ class LateralEventDetector:
         if crossing is not None and handoff_time is not None else 0.0
       ),
       stall_releases=structured_releases,
+      unwind_episode_start_mono_time=(
+        unwind_episode.start_mono_time if unwind_episode is not None else 0.0
+      ),
+      unwind_deficit_start_mono_time=(
+        unwind_episode.deficit_start_mono_time
+        if unwind_episode is not None and unwind_episode.deficit_start_mono_time is not None else 0.0
+      ),
+      unwind_deficit_duration_s=(
+        sample.mono_time - unwind_episode.deficit_start_mono_time
+        if unwind_episode is not None and unwind_episode.deficit_start_mono_time is not None else 0.0
+      ),
+      initial_steering_angle_deg=(
+        unwind_episode.initial_steering_angle_deg if unwind_episode is not None else 0.0
+      ),
+      peak_steering_angle_deg=(
+        unwind_episode.peak_steering_angle_deg if unwind_episode is not None else 0.0
+      ),
+      trigger_steering_angle_deg=(
+        unwind_episode.trigger_steering_angle_deg if unwind_episode is not None else 0.0
+      ),
+      expected_unwind_direction=(
+        "positive" if unwind_episode is not None and unwind_episode.expected_direction > 0
+        else "negative" if unwind_episode is not None else ""
+      ),
+      expected_angle_progress_deg=(
+        unwind_episode.trigger_expected_progress_deg if unwind_episode is not None else 0.0
+      ),
+      actual_angle_progress_deg=(
+        unwind_episode.trigger_actual_progress_deg if unwind_episode is not None else 0.0
+      ),
+      unwind_progress_ratio=(
+        unwind_episode.trigger_progress_ratio if unwind_episode is not None else 0.0
+      ),
+      reference_rate_at_trigger=(
+        unwind_episode.trigger_reference_rate if unwind_episode is not None else 0.0
+      ),
+      measurement_rate_at_trigger=(
+        unwind_episode.trigger_measurement_rate if unwind_episode is not None else 0.0
+      ),
+      peak_reference_measurement_rate_gap=(
+        unwind_episode.peak_reference_measurement_rate_gap if unwind_episode is not None else 0.0
+      ),
+      requested_torque_neutral_cross_mono_time=(
+        unwind_episode.requested_neutral_cross_mono_time if unwind_episode is not None else None
+      ),
+      applied_torque_neutral_cross_mono_time=(
+        unwind_episode.applied_neutral_cross_mono_time if unwind_episode is not None else None
+      ),
+      unwind_command_delay_s=(
+        unwind_episode.requested_neutral_cross_mono_time - unwind_episode.start_mono_time
+        if (
+          unwind_episode is not None
+          and unwind_episode.requested_neutral_cross_mono_time is not None
+        ) else 0.0
+      ),
+      driver_assisted_unwind=driver_assist_sample is not None,
+      driver_assist_mono_time=(
+        driver_assist_sample.mono_time if driver_assist_sample is not None else None
+      ),
+      driver_assist_angle_deg=(
+        driver_assist_sample.steering_angle_deg if driver_assist_sample is not None else 0.0
+      ),
+      driver_assist_wheel_rate_deg=(
+        driver_assist_sample.steering_rate_deg if driver_assist_sample is not None else 0.0
+      ),
+      driver_assist_torque=(
+        driver_assist_sample.driver_torque if driver_assist_sample is not None else 0.0
+      ),
+      wheel_rate_increase_after_assist_deg_s=wheel_rate_increase_after_assist,
+      unwind_requested_torque_at_trigger=(
+        unwind_episode.trigger_requested_torque if unwind_episode is not None else 0.0
+      ),
+      unwind_applied_torque_at_trigger=(
+        unwind_episode.trigger_applied_torque if unwind_episode is not None else 0.0
+      ),
+      unwind_reference_target_torque_at_trigger=(
+        unwind_episode.trigger_reference_target_torque if unwind_episode is not None else 0.0
+      ),
+      unwind_applied_target_gap_at_trigger=(
+        unwind_episode.trigger_applied_target_gap if unwind_episode is not None else 0.0
+      ),
+      unwind_peak_applied_target_gap=(
+        unwind_episode.peak_applied_target_gap if unwind_episode is not None else 0.0
+      ),
+      movement_start_mono_time=(
+        turn_stop_episode.movement_start_mono_time if turn_stop_episode is not None else 0.0
+      ),
+      dwell_start_mono_time=(
+        turn_stop_episode.dwell_start_mono_time
+        if turn_stop_episode is not None and turn_stop_episode.dwell_start_mono_time is not None else 0.0
+      ),
+      release_mono_time=(
+        turn_stop_episode.release_mono_time
+        if turn_stop_episode is not None and turn_stop_episode.release_mono_time is not None else 0.0
+      ),
+      dwell_duration_s=(
+        turn_stop_episode.release_mono_time - turn_stop_episode.dwell_start_mono_time
+        if (
+          turn_stop_episode is not None
+          and turn_stop_episode.dwell_start_mono_time is not None
+          and turn_stop_episode.release_mono_time is not None
+        ) else 0.0
+      ),
+      dwell_steering_angle_deg=(
+        turn_stop_episode.dwell_steering_angle_deg if turn_stop_episode is not None else 0.0
+      ),
+      pre_dwell_peak_rate_deg_s=(
+        turn_stop_episode.pre_dwell_peak_rate_deg_s if turn_stop_episode is not None else 0.0
+      ),
+      minimum_dwell_rate_deg_s=(
+        turn_stop_episode.minimum_dwell_rate_deg_s
+        if turn_stop_episode is not None and math.isfinite(turn_stop_episode.minimum_dwell_rate_deg_s)
+        else 0.0
+      ),
+      release_peak_rate_deg_s=(
+        turn_stop_episode.release_peak_rate_deg_s if turn_stop_episode is not None else 0.0
+      ),
+      rate_reduction_ratio=(
+        max(
+          0.0,
+          1.0 - turn_stop_episode.minimum_dwell_rate_deg_s
+          / max(turn_stop_episode.pre_dwell_peak_rate_deg_s, 1e-3),
+        )
+        if turn_stop_episode is not None and math.isfinite(turn_stop_episode.minimum_dwell_rate_deg_s)
+        else 0.0
+      ),
+      restart_classification=turn_stop_restart_classification,
+      request_torque_during_dwell=(
+        turn_stop_episode.max_request_torque_during_dwell if turn_stop_episode is not None else 0.0
+      ),
+      applied_torque_during_dwell=(
+        turn_stop_episode.max_applied_torque_during_dwell if turn_stop_episode is not None else 0.0
+      ),
+      reference_target_during_dwell=(
+        turn_stop_episode.max_reference_target_during_dwell if turn_stop_episode is not None else 0.0
+      ),
+      tracking_active_during_dwell=(
+        turn_stop_episode.tracking_active_during_dwell if turn_stop_episode is not None else False
+      ),
+      driver_involved_before_dwell=(
+        turn_stop_episode.driver_involved_before_dwell if turn_stop_episode is not None else False
+      ),
+      driver_involved_during_dwell=(
+        turn_stop_episode.driver_involved_during_dwell if turn_stop_episode is not None else False
+      ),
+      driver_involved_after_dwell=(
+        turn_stop_episode.driver_involved_after_dwell if turn_stop_episode is not None else False
+      ),
+      turn_stop_actual_damping_amount=(
+        turn_stop_release_sample.actual_damping_amount if turn_stop_release_sample is not None else None
+      ),
+      turn_stop_actual_damping_state=(
+        turn_stop_release_sample.actual_damping_state if turn_stop_release_sample is not None else None
+      ),
+      turn_stop_turn_in_blocked=(
+        turn_stop_release_sample.turn_in_blocked if turn_stop_release_sample is not None else None
+      ),
+      turn_stop_breakaway_latch=(
+        turn_stop_release_sample.breakaway_latch if turn_stop_release_sample is not None else None
+      ),
+      turn_stop_sustain_floor_contribution=(
+        turn_stop_release_sample.sustain_floor_contribution
+        if turn_stop_release_sample is not None else None
+      ),
+      turn_stop_damping_version=(
+        turn_stop_release_sample.damping_version if turn_stop_release_sample is not None else None
+      ),
     )
 
   def _reversal_commit_time(self, crossing: PendingCrossing, now: float) -> float | None:
@@ -609,7 +950,13 @@ class LateralEventDetector:
             reason: str, occurred_time: float, previous_phase: float,
             previous_same_episode: bool, stall_releases: list[StallRelease] | None = None,
             late_unwind_duration: float = 0.0, crossing: PendingCrossing | None = None,
-            handoff_time: float | None = None) -> LateralDetection | None:
+            handoff_time: float | None = None,
+            unwind_episode: UnwindProgressEpisode | None = None,
+            turn_stop_episode: TurnStopEpisode | None = None,
+            driver_assist_sample: LateralSample | None = None,
+            wheel_rate_increase_after_assist: float = 0.0,
+            turn_stop_release_sample: LateralSample | None = None,
+            turn_stop_restart_classification: str = "") -> LateralDetection | None:
     if sample.mono_time - self.last_event_times.get(event_type, -math.inf) < self.cooldown:
       return None
     self.last_event_times[event_type] = sample.mono_time
@@ -620,6 +967,8 @@ class LateralEventDetector:
       "committedHandoffHarshness": occurred_time - 2.0,
       "handoffMismatch": occurred_time - 2.0,
       "torqueAuthority": sample.mono_time - 2.0,
+      "unwindProgressDeficit": occurred_time - 6.0,
+      "turnStopTurn": occurred_time - 6.0,
     }[event_type]
     evidence = self._evidence(
       sample,
@@ -632,6 +981,12 @@ class LateralEventDetector:
       occurred_time,
       crossing,
       handoff_time,
+      unwind_episode,
+      turn_stop_episode,
+      driver_assist_sample,
+      wheel_rate_increase_after_assist,
+      turn_stop_release_sample,
+      turn_stop_restart_classification,
     )
     return LateralDetection(
       event_type,
@@ -871,6 +1226,484 @@ class LateralEventDetector:
       handoff_time=handoff.mono_time,
     )
 
+  @staticmethod
+  def _unwind_duration(angle_deg: float) -> float:
+    angle = abs(angle_deg)
+    if angle > UNWIND_MID_BAND_MAX_DEG:
+      return UNWIND_DURATION_HIGH_S
+    if angle > UNWIND_LOW_BAND_MAX_DEG:
+      return UNWIND_DURATION_MID_S
+    return UNWIND_DURATION_LOW_S
+
+  @staticmethod
+  def _unwind_minimum_rate(angle_deg: float) -> float:
+    angle = abs(angle_deg)
+    if angle > UNWIND_MID_BAND_MAX_DEG:
+      return UNWIND_EXPECTED_RATE_HIGH_DEG_S
+    if angle > UNWIND_LOW_BAND_MAX_DEG:
+      return UNWIND_EXPECTED_RATE_MID_DEG_S
+    return UNWIND_EXPECTED_RATE_LOW_DEG_S
+
+  @staticmethod
+  def _interpolated_neutral_cross(previous_time: float, previous_value: float,
+                                   now: float, value: float) -> float | None:
+    if previous_value == value or previous_value * value > 0.0:
+      return None
+    denominator = abs(previous_value) + abs(value)
+    if denominator <= 1e-9:
+      return now
+    return previous_time + (now - previous_time) * abs(previous_value) / denominator
+
+  @staticmethod
+  def _unwind_reference_committed(sample: LateralSample, expected_direction: int) -> bool:
+    # Standard openpilot curvature/lateral-acceleration sign is opposite the
+    # steering-wheel angle sign. Keep this sign convention isolated here; the
+    # reference rate remains a lateral-acceleration rate and is never
+    # integrated as wheel angle.
+    return (
+      sample.reference_sustained_unwind_scale > UNWIND_REFERENCE_SCALE
+      and sample.unwind_effective_phase > UNWIND_PHASE
+      and sample.reference_rate * expected_direction < -UNWIND_REFERENCE_RATE_MIN
+    )
+
+  def _recent_wheel_rate_peak(self, now: float) -> float:
+    return max(
+      (
+        abs(entry[10]) for entry in self.history
+        if now - UNWIND_PROGRESS_RECENT_RATE_LOOKBACK_S <= entry[0] <= now
+      ),
+      default=0.0,
+    )
+
+  @staticmethod
+  def _snapshot_unwind_trigger(episode: UnwindProgressEpisode, sample: LateralSample,
+                               expected_progress: float, actual_progress: float,
+                               progress_ratio: float) -> None:
+    episode.trigger_steering_angle_deg = sample.steering_angle_deg
+    episode.trigger_expected_progress_deg = expected_progress
+    episode.trigger_actual_progress_deg = actual_progress
+    episode.trigger_progress_ratio = progress_ratio
+    episode.trigger_reference_rate = sample.reference_rate
+    episode.trigger_measurement_rate = sample.measurement_rate
+    episode.trigger_requested_torque = sample.request_torque
+    episode.trigger_applied_torque = sample.applied_torque
+    episode.trigger_reference_target_torque = sample.reference_target_torque
+    episode.trigger_applied_target_gap = sample.applied_target_gap
+
+  def _update_unwind_progress(self, sample: LateralSample, previous_phase: float,
+                              previous_same_episode: bool) -> LateralDetection | None:
+    if (
+      self.unwind_progress_latched
+      and abs(sample.steering_angle_deg) <= UNWIND_END_ANGLE_DEG
+    ):
+      self.unwind_progress_latched = False
+
+    episode = self.unwind_progress_episode
+    expected_direction = -1 if sample.steering_angle_deg > 0.0 else 1
+    committed = self._unwind_reference_committed(sample, expected_direction)
+    if episode is None:
+      if (
+        self.unwind_progress_latched
+        or abs(sample.steering_angle_deg) <= UNWIND_ARM_ANGLE_DEG
+        or not committed
+      ):
+        return None
+      expected_rate = min(
+        UNWIND_MAX_EXPECTED_WHEEL_RATE_DEG_S,
+        max(
+          self._unwind_minimum_rate(sample.steering_angle_deg),
+          self._recent_wheel_rate_peak(sample.mono_time),
+        ),
+      )
+      episode = UnwindProgressEpisode(
+        start_mono_time=sample.mono_time,
+        initial_steering_angle_deg=sample.steering_angle_deg,
+        peak_steering_angle_deg=sample.steering_angle_deg,
+        expected_direction=expected_direction,
+        expected_rate_deg_s=expected_rate,
+        previous_request_torque=sample.request_torque,
+        previous_applied_torque=sample.applied_torque,
+        previous_mono_time=sample.mono_time,
+        recent_toward_rates=deque(),
+        steering_pressed_was_active=sample.steering_pressed,
+      )
+      self.unwind_progress_episode = episode
+
+    # A meaningful reference that changes back toward the existing turn
+    # invalidates an apparent unwind before publication.
+    if (
+      sample.reference_sustained_unwind_scale > UNWIND_REFERENCE_SCALE
+      and sample.unwind_effective_phase > UNWIND_PHASE
+      and abs(sample.reference_rate) > UNWIND_REFERENCE_RATE_MIN
+      and sample.reference_rate * episode.expected_direction >= 0.0
+    ):
+      self.unwind_progress_episode = None
+      return None
+
+    if abs(sample.steering_angle_deg) > abs(episode.peak_steering_angle_deg):
+      episode.peak_steering_angle_deg = sample.steering_angle_deg
+    episode.peak_reference_measurement_rate_gap = max(
+      episode.peak_reference_measurement_rate_gap,
+      abs(sample.reference_rate - sample.measurement_rate),
+    )
+    episode.peak_applied_target_gap = max(
+      episode.peak_applied_target_gap,
+      sample.applied_target_gap,
+    )
+
+    if episode.requested_neutral_cross_mono_time is None:
+      episode.requested_neutral_cross_mono_time = self._interpolated_neutral_cross(
+        episode.previous_mono_time,
+        episode.previous_request_torque,
+        sample.mono_time,
+        sample.request_torque,
+      )
+    if episode.applied_neutral_cross_mono_time is None:
+      episode.applied_neutral_cross_mono_time = self._interpolated_neutral_cross(
+        episode.previous_mono_time,
+        episode.previous_applied_torque,
+        sample.mono_time,
+        sample.applied_torque,
+      )
+    episode.previous_request_torque = sample.request_torque
+    episode.previous_applied_torque = sample.applied_torque
+    episode.previous_mono_time = sample.mono_time
+
+    elapsed = max(0.0, sample.mono_time - episode.start_mono_time)
+    expected_progress = min(
+      abs(episode.initial_steering_angle_deg),
+      episode.expected_rate_deg_s * elapsed,
+    )
+    actual_progress = max(
+      0.0,
+      abs(episode.initial_steering_angle_deg) - abs(sample.steering_angle_deg),
+    )
+    progress_ratio = actual_progress / max(expected_progress, 1e-3)
+    deficit = (
+      expected_progress >= UNWIND_DEFICIT_ELIGIBLE_S * episode.expected_rate_deg_s
+      and progress_ratio < UNWIND_PROGRESS_RATIO_MIN
+    )
+    if deficit and episode.deficit_start_mono_time is None:
+      episode.deficit_start_mono_time = sample.mono_time
+    elif (
+      not deficit
+      and episode.mature_mono_time is None
+      and episode.deficit_start_mono_time is not None
+    ):
+      episode.deficit_start_mono_time = None
+
+    if (
+      episode.deficit_start_mono_time is not None
+      and episode.mature_mono_time is None
+      and sample.mono_time - episode.deficit_start_mono_time
+      >= self._unwind_duration(episode.peak_steering_angle_deg)
+    ):
+      episode.mature_mono_time = sample.mono_time
+      self._snapshot_unwind_trigger(
+        episode,
+        sample,
+        expected_progress,
+        actual_progress,
+        progress_ratio,
+      )
+
+    toward_rate = max(0.0, sample.steering_rate_deg * episode.expected_direction)
+    recent_rates = episode.recent_toward_rates
+    assert recent_rates is not None
+    while recent_rates and sample.mono_time - recent_rates[0][0] > UNWIND_PROGRESS_DRIVER_RATE_LOOKBACK_S:
+      recent_rates.popleft()
+    previous_toward_rate = max((value for _, value in recent_rates), default=0.0)
+    raw_assist_active = (
+      sample.driver_torque * episode.expected_direction >= UNWIND_CONFIRMED_DRIVER_TORQUE
+      and toward_rate >= UNWIND_DRIVER_ASSIST_WHEEL_RATE_DEG_S
+    )
+    if raw_assist_active:
+      if episode.raw_driver_assist_since is None:
+        episode.raw_driver_assist_since = sample.mono_time
+        episode.raw_driver_assist_start_rate_deg_s = toward_rate
+    else:
+      episode.raw_driver_assist_since = None
+      episode.raw_driver_assist_start_rate_deg_s = 0.0
+    raw_assist_confirmed = (
+      episode.raw_driver_assist_since is not None
+      and sample.mono_time - episode.raw_driver_assist_since >= UNWIND_RAW_DRIVER_ASSIST_S
+    )
+    steering_press_began = sample.steering_pressed and not episode.steering_pressed_was_active
+    assist_confirmed = (
+      episode.deficit_start_mono_time is not None
+      and (steering_press_began or raw_assist_confirmed)
+    )
+    episode.steering_pressed_was_active = sample.steering_pressed
+    recent_rates.append((sample.mono_time, toward_rate))
+
+    if assist_confirmed:
+      if episode.mature_mono_time is None:
+        episode.mature_mono_time = sample.mono_time
+        self._snapshot_unwind_trigger(
+          episode,
+          sample,
+          expected_progress,
+          actual_progress,
+          progress_ratio,
+        )
+      occurred_time = episode.deficit_start_mono_time
+      detection = self._emit(
+        sample,
+        "unwindProgressDeficit",
+        "warning",
+        0.95,
+        "driver intervention accelerated an unwind that was behind the requested trajectory",
+        occurred_time,
+        previous_phase,
+        previous_same_episode,
+        unwind_episode=episode,
+        driver_assist_sample=sample,
+        wheel_rate_increase_after_assist=max(
+          0.0,
+          toward_rate - (
+            episode.raw_driver_assist_start_rate_deg_s
+            if raw_assist_confirmed else previous_toward_rate
+          ),
+        ),
+      )
+      self.unwind_progress_episode = None
+      self.unwind_progress_latched = True
+      self.late_unwind_since = None
+      return detection
+
+    if (
+      episode.mature_mono_time is not None
+      and sample.mono_time - episode.mature_mono_time >= UNWIND_NO_ASSIST_OBSERVATION_S
+    ):
+      occurred_time = (
+        episode.deficit_start_mono_time
+        if episode.deficit_start_mono_time is not None else episode.mature_mono_time
+      )
+      detection = self._emit(
+        sample,
+        "unwindProgressDeficit",
+        "warning",
+        0.90,
+        "wheel unwind progress remained materially behind the requested trajectory",
+        occurred_time,
+        previous_phase,
+        previous_same_episode,
+        unwind_episode=episode,
+      )
+      self.unwind_progress_episode = None
+      self.unwind_progress_latched = True
+      self.late_unwind_since = None
+      return detection
+    return None
+
+  @staticmethod
+  def _larger_abs(previous: float, value: float) -> float:
+    return value if abs(value) > abs(previous) else previous
+
+  @staticmethod
+  def _restart_classification(episode: TurnStopEpisode, sample: LateralSample) -> str:
+    restart_direction = 1 if sample.steering_rate_deg > 0.0 else -1
+    if restart_direction == episode.movement_direction:
+      return "sameDirectionTurn"
+    toward_center_direction = -1 if episode.dwell_steering_angle_deg > 0.0 else 1
+    if restart_direction == toward_center_direction:
+      return "unwind"
+    return "reversal"
+
+  def _update_turn_stop_turn(self, sample: LateralSample, tracking_active: bool,
+                             previous_phase: float,
+                             previous_same_episode: bool) -> LateralDetection | None:
+    pending = self.pending_turn_stop_candidate
+    if pending is not None and sample.mono_time >= pending.deadline_mono_time:
+      self.pending_turn_stop_candidate = None
+      return self._emit(
+        sample,
+        "turnStopTurn",
+        "warning",
+        0.90,
+        "steering motion slowed into a sustained high-demand dwell before releasing",
+        pending.episode.release_mono_time,
+        pending.previous_phase,
+        pending.previous_same_episode,
+        turn_stop_episode=pending.episode,
+        turn_stop_release_sample=pending.release_sample,
+        turn_stop_restart_classification=pending.episode.restart_classification,
+      )
+
+    episode = self.turn_stop_episode
+    rate = sample.steering_rate_deg
+    abs_rate = abs(rate)
+    meaningful_demand = (
+      tracking_active
+      or abs(sample.reference_rate) > TURN_STOP_TRACKING_ERROR
+      or sample.reference_sustained_unwind_scale > 0.2
+    )
+    if episode is None:
+      if (
+        abs_rate <= TURN_STOP_MOVING_RATE_DEG_S
+        or (
+          abs(sample.steering_angle_deg) <= TURN_STOP_ARM_ANGLE_DEG
+          and not meaningful_demand
+        )
+      ):
+        return None
+      self.turn_stop_episode = TurnStopEpisode(
+        state="moving",
+        movement_start_mono_time=sample.mono_time,
+        movement_direction=1 if rate > 0.0 else -1,
+        pre_dwell_peak_signed_rate_deg_s=rate,
+        pre_dwell_peak_rate_deg_s=abs_rate,
+        driver_involved_before_dwell=sample.driver_confounded,
+      )
+      return None
+
+    if episode.state == "released":
+      assert episode.release_mono_time is not None
+      assert episode.release_sample is not None
+      episode.release_peak_rate_deg_s = max(episode.release_peak_rate_deg_s, abs_rate)
+      episode.driver_involved_after_dwell |= sample.driver_confounded
+      if sample.mono_time - episode.release_mono_time < TURN_STOP_RELEASE_OBSERVATION_S:
+        return None
+      self.turn_stop_episode = None
+      return None
+
+    if episode.state in ("moving", "slowing"):
+      current_direction = 1 if rate > 0.0 else -1
+      if abs_rate > TURN_STOP_MOVING_RATE_DEG_S and current_direction != episode.movement_direction:
+        self.turn_stop_episode = TurnStopEpisode(
+          state="moving",
+          movement_start_mono_time=sample.mono_time,
+          movement_direction=current_direction,
+          pre_dwell_peak_signed_rate_deg_s=rate,
+          pre_dwell_peak_rate_deg_s=abs_rate,
+          driver_involved_before_dwell=sample.driver_confounded,
+        )
+        return None
+      episode.driver_involved_before_dwell |= sample.driver_confounded
+      if abs_rate > episode.pre_dwell_peak_rate_deg_s:
+        episode.pre_dwell_peak_rate_deg_s = abs_rate
+        episode.pre_dwell_peak_signed_rate_deg_s = rate
+        episode.movement_direction = 1 if rate > 0.0 else -1
+      dwell_limit = max(
+        TURN_STOP_ABSOLUTE_DWELL_RATE_DEG_S,
+        TURN_STOP_DWELL_RATE_FRACTION * episode.pre_dwell_peak_rate_deg_s,
+      )
+      if abs_rate <= dwell_limit:
+        episode.state = "dwell"
+        episode.dwell_start_mono_time = sample.mono_time
+        episode.dwell_steering_angle_deg = sample.steering_angle_deg
+        episode.minimum_dwell_rate_deg_s = abs_rate
+        episode.max_request_torque_during_dwell = sample.request_torque
+        episode.max_applied_torque_during_dwell = sample.applied_torque
+        episode.max_reference_target_during_dwell = sample.reference_target_torque
+        episode.tracking_active_during_dwell = tracking_active
+        episode.meaningful_reference_during_dwell = meaningful_demand
+        episode.driver_involved_during_dwell = sample.driver_confounded
+      elif abs_rate < TURN_STOP_SLOWING_RATE_FRACTION * episode.pre_dwell_peak_rate_deg_s:
+        episode.state = "slowing"
+      else:
+        episode.state = "moving"
+      return None
+
+    assert episode.dwell_start_mono_time is not None
+    dwell_duration = sample.mono_time - episode.dwell_start_mono_time
+    released = (
+      dwell_duration >= TURN_STOP_MIN_DWELL_S
+      and abs_rate > TURN_STOP_MOVING_RATE_DEG_S
+      and abs_rate
+      >= max(
+        TURN_STOP_MOVING_RATE_DEG_S,
+        episode.minimum_dwell_rate_deg_s + TURN_STOP_ABSOLUTE_DWELL_RATE_DEG_S,
+      )
+    )
+    if not released:
+      episode.minimum_dwell_rate_deg_s = min(episode.minimum_dwell_rate_deg_s, abs_rate)
+      if abs(sample.steering_angle_deg) > abs(episode.dwell_steering_angle_deg):
+        episode.dwell_steering_angle_deg = sample.steering_angle_deg
+      episode.max_request_torque_during_dwell = self._larger_abs(
+        episode.max_request_torque_during_dwell,
+        sample.request_torque,
+      )
+      episode.max_applied_torque_during_dwell = self._larger_abs(
+        episode.max_applied_torque_during_dwell,
+        sample.applied_torque,
+      )
+      episode.max_reference_target_during_dwell = self._larger_abs(
+        episode.max_reference_target_during_dwell,
+        sample.reference_target_torque,
+      )
+      episode.tracking_active_during_dwell &= tracking_active
+      episode.meaningful_reference_during_dwell |= meaningful_demand
+      episode.driver_involved_during_dwell |= sample.driver_confounded
+      return None
+
+    unsupported_hold = (
+      not episode.tracking_active_during_dwell
+      and not episode.meaningful_reference_during_dwell
+      and abs(episode.max_request_torque_during_dwell) <= TURN_STOP_STRONG_TORQUE
+      and abs(episode.max_applied_torque_during_dwell) <= TURN_STOP_STRONG_TORQUE
+      and abs(episode.max_reference_target_during_dwell) <= TURN_STOP_STRONG_TORQUE
+    )
+    shape_context = (
+      abs(episode.dwell_steering_angle_deg) > TURN_STOP_ARM_ANGLE_DEG
+      or abs(episode.max_request_torque_during_dwell) > TURN_STOP_STRONG_TORQUE
+      or abs(episode.max_applied_torque_during_dwell) > TURN_STOP_STRONG_TORQUE
+    )
+    strong = shape_context and not unsupported_hold and (
+      abs(episode.dwell_steering_angle_deg) > TURN_STOP_STRONG_ANGLE_DEG
+      or dwell_duration > TURN_STOP_STRONG_DWELL_S
+      or abs(episode.max_request_torque_during_dwell) > TURN_STOP_STRONG_TORQUE
+      or abs(episode.max_applied_torque_during_dwell) > TURN_STOP_STRONG_TORQUE
+      or episode.tracking_active_during_dwell
+      or episode.meaningful_reference_during_dwell
+    )
+    classification = self._restart_classification(episode, sample)
+    if not strong:
+      self.turn_stop_episode = None
+      return None
+    episode.state = "released"
+    episode.release_mono_time = sample.mono_time
+    episode.release_sample = sample
+    episode.release_peak_rate_deg_s = abs_rate
+    episode.restart_classification = classification
+    episode.driver_involved_after_dwell = sample.driver_confounded
+    score = (
+      10.0 * dwell_duration
+      + abs(episode.dwell_steering_angle_deg) / TURN_STOP_STRONG_ANGLE_DEG
+      + 2.0 * max(
+        abs(episode.max_request_torque_during_dwell),
+        abs(episode.max_applied_torque_during_dwell),
+        abs(episode.max_reference_target_during_dwell),
+      )
+      + episode.release_peak_rate_deg_s / 200.0
+    )
+    pending = self.pending_turn_stop_candidate
+    if pending is None:
+      self.pending_turn_stop_candidate = PendingTurnStopCandidate(
+        episode=episode,
+        release_sample=sample,
+        score=score,
+        deadline_mono_time=sample.mono_time + TURN_STOP_CLUSTER_SELECTION_S,
+        previous_phase=previous_phase,
+        previous_same_episode=previous_same_episode,
+      )
+    elif sample.mono_time <= pending.deadline_mono_time and score > pending.score:
+      # Preserve the strongest dwell/release in a short sawtooth cluster.
+      # Extend only enough to finish that release's evidence observation; the
+      # original selection horizon otherwise remains fixed.
+      self.pending_turn_stop_candidate = PendingTurnStopCandidate(
+        episode=episode,
+        release_sample=sample,
+        score=score,
+        deadline_mono_time=max(
+          pending.deadline_mono_time,
+          sample.mono_time + TURN_STOP_RELEASE_OBSERVATION_S,
+        ),
+        previous_phase=previous_phase,
+        previous_same_episode=previous_same_episode,
+      )
+    return None
+
   def update(self, sample: LateralSample) -> LateralDetection | None:
     previous_phase = self.prev_phase
     previous_same_episode = self.prev_same_episode
@@ -909,6 +1742,19 @@ class LateralEventDetector:
     detection = self._update_pending_crossing(sample)
     if detection is None:
       detection = self._update_pending_handoff(sample)
+    if detection is None:
+      detection = self._update_unwind_progress(
+        sample,
+        previous_phase,
+        previous_same_episode,
+      )
+    if detection is None:
+      detection = self._update_turn_stop_turn(
+        sample,
+        tracking_active,
+        previous_phase,
+        previous_same_episode,
+      )
 
     stall_releases: list[StallRelease] = []
     late_unwind_duration = 0.0
@@ -917,6 +1763,7 @@ class LateralEventDetector:
       and sample.unwind_effective_phase > 0.6
       and abs(sample.steering_angle_deg) > 25.0
       and abs(sample.reference_rate) > 0.2
+      and not self.unwind_progress_latched
     )
     if unwind_expected and abs(sample.steering_rate_deg) < 8.0:
       if self.late_unwind_since is None:
@@ -937,6 +1784,8 @@ class LateralEventDetector:
         late_unwind_duration=late_unwind_duration,
       )
       self.late_unwind_since = None
+      self.unwind_progress_episode = None
+      self.unwind_progress_latched = True
 
     stationary = abs(sample.steering_rate_deg) < 8.0 and tracking_active
     if stationary:
