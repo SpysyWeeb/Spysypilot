@@ -373,7 +373,7 @@ void loggerd_thread() {
         .counter = 0,
         .freq = it.decimation,
         .encoder = encoder,
-        .preserve_segment = (it.name == "userBookmark") || (it.name == "audioFeedback") || (it.name == "lateralEvent"),
+        .preserve_segment = (it.name == "userBookmark") || (it.name == "audioFeedback"),
         .record_audio = record_audio,
       };
     }

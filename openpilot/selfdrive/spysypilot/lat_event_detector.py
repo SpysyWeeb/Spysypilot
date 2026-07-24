@@ -1,7 +1,7 @@
 """Pure lateral driving-event detection and signal conditioning.
 
 This module intentionally owns no messaging, Params, filesystem, UI, or process
-lifecycle behavior. Thresholds and classifications are migrated from lat_eventd.
+lifecycle behavior. It retains the original detector thresholds and classifications.
 """
 import math
 from collections import deque

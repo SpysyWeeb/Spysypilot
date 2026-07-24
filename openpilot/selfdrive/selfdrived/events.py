@@ -13,7 +13,6 @@ from openpilot.common.git import get_short_branch
 from openpilot.common.realtime import DT_CTRL, DT_DMON
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.selfdrive.monitoring.policy import DRIVER_MONITOR_SETTINGS
-from openpilot.selfdrive.spysypilot.long_event_detector import bookmark_alert_text
 from openpilot.system.micd import SAMPLE_RATE, SAMPLE_BUFFER
 from openpilot.selfdrive.ui.feedback.feedbackd import FEEDBACK_MAX_DURATION
 from openpilot.common.hardware import HARDWARE
@@ -284,8 +283,7 @@ def audio_feedback_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubM
 
 
 def user_bookmark_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  title, detail = bookmark_alert_text(sm['userBookmark'])
-  return NormalPermanentAlert(title, detail, duration=1.5, priority=Priority.LOWER)
+  return NormalPermanentAlert("Bookmark Saved", "", duration=1.5, priority=Priority.LOWER)
 
 
 # *** debug alerts ***

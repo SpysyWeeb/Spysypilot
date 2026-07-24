@@ -45,7 +45,7 @@ def test_lateral_payload_round_trip():
 def test_longitudinal_payload_round_trip():
   sample = LaunchSample(2.0, True, True, 0.0, True, True, 5.0, 1.0, 1.0, 2, True, False, True, 0.1, True, 1.0)
   detected = LongEvent(
-    "late_lead_launch_planner", "Long Event Logged", "reason", 3, 0.55,
+    "late_lead_launch_planner", "reason", 3, 0.55,
     lead_to_ego_s=1.5, command_to_ego_s=1.0, plan_to_lead_s=0.5,
     command_to_lead_s=0.7, forecast_to_lead_s=-0.2, radar_discontinuity=True,
   )

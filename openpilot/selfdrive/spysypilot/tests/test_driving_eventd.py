@@ -52,7 +52,7 @@ def test_retrying_an_accepted_event_retains_ids():
 def test_manual_lateral_and_longitudinal_coexist():
   lateral = FixedDetector(LateralDetection("centerOvershoot", "warning", 0.9, "lateral reason"))
   longitudinal = FixedDetector(LongEvent(
-    "late_lead_launch_vehicle", "Long Event Logged", "long reason", 2, 0.95,
+    "late_lead_launch_vehicle", "long reason", 2, 0.95,
   ))
   ids = iter(("group", "lat", "long", "manual"))
   platform = DrivingEventPlatform(
@@ -71,7 +71,7 @@ def test_detector_exception_isolation():
     recorder=EventRecorder(iter(("group", "long")).__next__),
     lateral_detector=FixedDetector(error=RuntimeError("broken")),
     longitudinal_detector=FixedDetector(LongEvent(
-      "late_lead_launch_controller", "Long Event Logged", "long reason", 1, 0.95,
+      "late_lead_launch_controller", "long reason", 1, 0.95,
     )),
     on_error=errors.append,
   )
