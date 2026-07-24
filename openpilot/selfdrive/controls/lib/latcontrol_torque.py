@@ -74,6 +74,18 @@ UNWIND_PHASE_RELEASE_TIME = 0.35  # seconds; smoothly restore direct P after del
 UNWIND_EPISODE_TORQUE_DEADBAND = 0.08  # normalized geometric torque beyond crown-neutral
 UNWIND_EPISODE_LATERAL_ACCEL_DEADBAND = 0.20  # m/s^2; excludes friction-sign flips around a nearly straight path
 UNWIND_EPISODE_OPPOSITE_TIME = 0.20  # seconds a horizon-confirmed new maneuver must persist before handoff
+HIGH_ANGLE_UNWIND_START_DEG = 120.0
+HIGH_ANGLE_UNWIND_FULL_DEG = 320.0
+HIGH_ANGLE_UNWIND_MIN_SPEED = 0.3
+HIGH_ANGLE_UNWIND_FULL_SPEED = 12.0 * CV.MPH_TO_MS
+HIGH_ANGLE_UNWIND_MAX_SPEED = 20.0 * CV.MPH_TO_MS
+HIGH_ANGLE_UNWIND_PHASE_MIN = 0.60
+HIGH_ANGLE_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
+HIGH_ANGLE_UNWIND_RATE_FULL = 0.80  # m/s^3 at the common tracking speed
+HIGH_ANGLE_UNWIND_CONFIRM_TIME = 0.15  # seconds of persistent future-path evidence
+HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME = 0.10
+HIGH_ANGLE_UNWIND_RAMP_IN_TIME = 0.20
+HIGH_ANGLE_UNWIND_RAMP_OUT_TIME = 0.25
 HANDOFF_TORQUE_CAP_RAMP_TIME = 0.15  # seconds; CAN slew remains the final actuator-rate boundary
 DAMPING_TURN_IN_POSITION_ERROR_MIN = 0.08  # m/s^2 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
@@ -88,7 +100,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 15
+VERSION = 16
 
 
 def smoothstep(value: float) -> float:
@@ -220,6 +232,24 @@ def get_future_unwind_brake(
   return p_scale_factor, torque_blend, brake_activation, torque_neutral_time, projected_position_error
 
 
+def get_high_angle_unwind_exit(
+  torque_command: float,
+  neutral_torque: float,
+  old_turn_torque_sign: float,
+  exit_scale: float,
+) -> tuple[float, float, float]:
+  """Move only stale old-turn command toward crown-neutral without crossing it."""
+  scale = clip_scalar(exit_scale, 0.0, 1.0)
+  if scale <= 0.0 or old_turn_torque_sign == 0.0:
+    return torque_command, 0.0, 0.0
+
+  old_sign = math.copysign(1.0, old_turn_torque_sign)
+  old_direction_command = max((torque_command - neutral_torque) * old_sign, 0.0)
+  old_release = old_direction_command * scale
+  old_direction_correction = -old_sign * old_release
+  return torque_command + old_direction_correction, old_direction_correction, old_direction_command
+
+
 def get_committed_handoff_torque_cap(
   torque_command: float,
   reference_target_torque: float,
@@ -249,6 +279,72 @@ class UnwindPhaseState(NamedTuple):
   same_episode: bool
   opposite_time: float
   episode_armed: bool
+
+
+class HighAngleUnwindExitState:
+  """Persist and slew low-speed, high-angle exit urgency from future-path evidence."""
+
+  def __init__(self, dt: float):
+    self.dt = dt
+    self.confirmed_time = 0.0
+    self.ineligible_time = 0.0
+    self.target_scale = 0.0
+    self.scale = 0.0
+
+  def reset(self) -> None:
+    self.confirmed_time = 0.0
+    self.ineligible_time = 0.0
+    self.target_scale = 0.0
+    self.scale = 0.0
+
+  def update(
+    self,
+    enabled: bool,
+    steering_angle_deg: float,
+    v_ego: float,
+    sustained_unwind_scale: float,
+    effective_unwind_phase: float,
+    same_episode: bool,
+    old_turn_torque_sign: float,
+    reference_rate: float,
+  ) -> float:
+    if not enabled:
+      self.reset()
+      return 0.0
+
+    aligned_angle = steering_angle_deg * old_turn_torque_sign if old_turn_torque_sign != 0.0 else 0.0
+    angle_scale = smoothstep((aligned_angle - HIGH_ANGLE_UNWIND_START_DEG) / (HIGH_ANGLE_UNWIND_FULL_DEG - HIGH_ANGLE_UNWIND_START_DEG))
+    speed_scale = 1.0 - smoothstep((v_ego - HIGH_ANGLE_UNWIND_FULL_SPEED) / (HIGH_ANGLE_UNWIND_MAX_SPEED - HIGH_ANGLE_UNWIND_FULL_SPEED))
+    sustained_scale = smoothstep((sustained_unwind_scale - HIGH_ANGLE_UNWIND_PHASE_MIN) / (1.0 - HIGH_ANGLE_UNWIND_PHASE_MIN))
+    phase_scale = smoothstep((effective_unwind_phase - HIGH_ANGLE_UNWIND_PHASE_MIN) / (1.0 - HIGH_ANGLE_UNWIND_PHASE_MIN))
+    unloading_rate = reference_rate * old_turn_torque_sign if old_turn_torque_sign != 0.0 else 0.0
+    rate_scale = smoothstep((unloading_rate - HIGH_ANGLE_UNWIND_RATE_MIN) / (HIGH_ANGLE_UNWIND_RATE_FULL - HIGH_ANGLE_UNWIND_RATE_MIN))
+    scope_valid = (
+      same_episode
+      and old_turn_torque_sign != 0.0
+      and aligned_angle > HIGH_ANGLE_UNWIND_START_DEG
+      and HIGH_ANGLE_UNWIND_MIN_SPEED <= v_ego < HIGH_ANGLE_UNWIND_MAX_SPEED
+    )
+    if not scope_valid:
+      self.reset()
+      return 0.0
+
+    eligible = speed_scale > 0.0 and sustained_scale > 0.0 and phase_scale > 0.0 and rate_scale > 0.0
+    if eligible:
+      self.confirmed_time += self.dt
+      self.ineligible_time = 0.0
+      if self.confirmed_time >= HIGH_ANGLE_UNWIND_CONFIRM_TIME:
+        self.target_scale = angle_scale * speed_scale * sustained_scale * phase_scale * rate_scale
+    else:
+      self.ineligible_time += self.dt
+      if self.ineligible_time >= HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME:
+        self.confirmed_time = 0.0
+        self.target_scale = 0.0
+
+    ramp_time = HIGH_ANGLE_UNWIND_RAMP_IN_TIME if self.target_scale > self.scale else HIGH_ANGLE_UNWIND_RAMP_OUT_TIME
+    max_step = self.dt / ramp_time
+    self.scale += clip_scalar(self.target_scale - self.scale, -max_step, max_step)
+    return self.scale
 
 
 class UnwindPhaseTracker:
@@ -441,6 +537,7 @@ class LatControlTorque(LatControl):
       initialized=False,
     )
     self.unwind_phase_tracker = UnwindPhaseTracker(self.dt)
+    self.high_angle_unwind_exit_state = HighAngleUnwindExitState(self.dt)
     # Route-derived for the affected Hyundai EPS. Other torque platforms keep
     # their existing controller behavior until they are analyzed independently.
     self.reference_rate_tracking_enabled = CP.brand == "hyundai"
@@ -454,6 +551,7 @@ class LatControlTorque(LatControl):
   def reset(self):
     super().reset()
     self.unwind_phase_tracker.reset()
+    self.high_angle_unwind_exit_state.reset()
     self.reference_rate_innovation_filter.initialized = False
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
@@ -477,6 +575,7 @@ class LatControlTorque(LatControl):
     lat_delay,
     applied_torque=0.0,
     reference_unwind_scale=0.0,
+    reference_sustained_unwind_scale=0.0,
     reference_target_torque=0.0,
     reference_geometric_target_torque: float | None = None,
     reference_episode_target_torque: float | None = None,
@@ -567,6 +666,16 @@ class LatControlTorque(LatControl):
       and unwind_opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME
       and unwind_phase_direction != 0.0
     )
+    high_angle_unwind_scale = self.high_angle_unwind_exit_state.update(
+      self.reference_rate_tracking_enabled and active and not CS.steeringPressed,
+      CS.steeringAngleDeg - params.angleOffsetDeg,
+      CS.vEgo,
+      reference_sustained_unwind_scale,
+      effective_unwind_scale,
+      unwind_same_episode,
+      unwind_phase_direction,
+      reference_rate,
+    )
     damping_turn_in_blocked = self.reference_rate_tracking_enabled and should_block_undertracked_turn_in_damping(
       delayed_desired_curvature,
       tracking_position_error,
@@ -601,6 +710,9 @@ class LatControlTorque(LatControl):
       base_direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
       direct_p_scale = base_direct_p_scale
       torque_command_before_handoff_cap = torque_command
+      torque_command_before_high_angle_exit = torque_command
+      high_angle_unwind_old_torque_correction = 0.0
+      high_angle_unwind_old_direction_torque = 0.0
       handoff_torque_correction = 0.0
       handoff_old_direction_limit = 0.0
       handoff_torque_cap_scale = 0.0
@@ -608,7 +720,7 @@ class LatControlTorque(LatControl):
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
 
-      freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
+      freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5 or high_angle_unwind_scale > 0.0
       rate_tracking_correction = 0.0
       actuator_state_correction = 0.0
       unwind_torque_blend = 0.0
@@ -649,6 +761,13 @@ class LatControlTorque(LatControl):
       if unwind_torque_blend > 0.0:
         unwind_torque_correction = unwind_torque_blend * (reference_target_torque - torque_command)
         torque_command += unwind_torque_correction
+      torque_command_before_high_angle_exit = torque_command
+      torque_command, high_angle_unwind_old_torque_correction, high_angle_unwind_old_direction_torque = get_high_angle_unwind_exit(
+        torque_command,
+        neutral_torque,
+        unwind_phase_direction,
+        high_angle_unwind_scale,
+      )
       torque_command_before_handoff_cap = torque_command
       torque_command, handoff_torque_correction, handoff_old_direction_limit, handoff_torque_cap_scale = get_committed_handoff_torque_cap(
         torque_command,
@@ -723,6 +842,10 @@ class LatControlTorque(LatControl):
     pid_log.handoffOldDirectionLimit = float(handoff_old_direction_limit)
     pid_log.handoffTorqueCapScale = float(handoff_torque_cap_scale)
     pid_log.handoffTorqueCorrection = float(handoff_torque_correction)
+    pid_log.highAngleUnwindScale = float(high_angle_unwind_scale)
+    pid_log.torqueCommandBeforeHighAngleExit = float(torque_command_before_high_angle_exit)
+    pid_log.highAngleUnwindOldTorqueCorrection = float(high_angle_unwind_old_torque_correction)
+    pid_log.highAngleUnwindOldDirectionTorque = float(high_angle_unwind_old_direction_torque)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log

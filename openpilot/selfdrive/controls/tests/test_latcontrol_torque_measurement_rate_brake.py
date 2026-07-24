@@ -19,6 +19,13 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   CASCADE_P_SCALE_SPEEDS,
   CASCADE_RATE_CORRECTION_MAX,
   HANDOFF_TORQUE_CAP_RAMP_TIME,
+  HIGH_ANGLE_UNWIND_CONFIRM_TIME,
+  HIGH_ANGLE_UNWIND_FULL_DEG,
+  HIGH_ANGLE_UNWIND_FULL_SPEED,
+  HIGH_ANGLE_UNWIND_MAX_SPEED,
+  HIGH_ANGLE_UNWIND_MIN_SPEED,
+  HIGH_ANGLE_UNWIND_RAMP_IN_TIME,
+  HIGH_ANGLE_UNWIND_START_DEG,
   REFERENCE_RATE_MIN_SPEED,
   REFERENCE_RATE_TRACKING_SCALES,
   REFERENCE_RATE_TRACKING_SPEEDS,
@@ -27,6 +34,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   UNWIND_TORQUE_DELTA_DOWN,
   UNWIND_TORQUE_MAX,
   VERSION,
+  HighAngleUnwindExitState,
   LatControlTorque,
   MeasurementRateFilter,
   UnwindPhaseTracker,
@@ -34,6 +42,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   get_actuation_speed,
   get_committed_handoff_torque_cap,
   get_future_unwind_brake,
+  get_high_angle_unwind_exit,
   get_projected_lateral_accel,
   get_reference_rate_cascade,
   reference_rate_tracking_speed_scale,
@@ -259,6 +268,136 @@ class TestFutureUnwindBrake:
     )
     assert right_time == pytest.approx(right_to_neutral)
     assert left_time == pytest.approx(left_to_neutral)
+
+
+class TestHighAngleUnwindExit:
+  def test_inactive_is_identity(self):
+    assert get_high_angle_unwind_exit(0.8, 0.1, 1.0, 0.0) == (0.8, 0.0, 0.0)
+    assert get_high_angle_unwind_exit(0.8, 0.1, 0.0, 1.0) == (0.8, 0.0, 0.0)
+
+  def test_releases_only_old_direction_torque_without_crossing_neutral(self):
+    torque, correction, old_direction = get_high_angle_unwind_exit(
+      0.9,
+      0.1,
+      1.0,
+      0.75,
+    )
+    assert old_direction == pytest.approx(0.8)
+    assert correction == pytest.approx(-0.8 * 0.75)
+    assert torque == pytest.approx(0.1 + 0.8 * 0.25)
+    assert torque > 0.1
+
+  def test_neutral_and_opposite_requests_are_unchanged(self):
+    neutral = get_high_angle_unwind_exit(0.1, 0.1, 1.0, 1.0)
+    torque, correction, old_direction = get_high_angle_unwind_exit(-0.9, 0.1, 1.0, 1.0)
+    assert neutral == (0.1, 0.0, 0.0)
+    assert torque == pytest.approx(-0.9)
+    assert correction == 0.0
+    assert old_direction == 0.0
+
+  def test_crown_aware_behavior_is_symmetric(self):
+    positive = get_high_angle_unwind_exit(0.9, 0.1, 1.0, 0.75)
+    negative = get_high_angle_unwind_exit(-0.9, -0.1, -1.0, 0.75)
+    assert positive[:2] == pytest.approx(tuple(-value for value in negative[:2]))
+    assert positive[2] == pytest.approx(negative[2])
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_one_sided_invariant_across_dense_inputs(self, sign):
+    neutral = 0.13 * sign
+    for command in np.linspace(-1.0, 1.0, 101):
+      old_before = max((command - neutral) * sign, 0.0)
+      for scale in np.linspace(0.0, 1.0, 21):
+        output, correction, old_logged = get_high_angle_unwind_exit(command, neutral, sign, scale)
+        old_after = max((output - neutral) * sign, 0.0)
+        assert old_after <= old_before + 1e-12
+        assert old_logged == pytest.approx(old_before if scale > 0.0 else 0.0)
+        assert correction * sign <= 0.0
+        if old_before == 0.0:
+          assert output == pytest.approx(command)
+        else:
+          assert (output - neutral) * sign >= -1e-12
+
+
+class TestHighAngleUnwindExitState:
+  @staticmethod
+  def run_confirmed(
+    state,
+    angle=HIGH_ANGLE_UNWIND_FULL_DEG,
+    speed=HIGH_ANGLE_UNWIND_FULL_SPEED,
+    turn_sign=1.0,
+    reference_rate=None,
+  ):
+    reference_rate = turn_sign if reference_rate is None else reference_rate
+    samples = int(np.ceil((HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_UNWIND_RAMP_IN_TIME) / DT_CTRL)) + 2
+    return [state.update(True, angle, speed, 1.0, 1.0, True, turn_sign, reference_rate) for _ in range(samples)]
+
+  def test_requires_persistent_future_confirmed_unwind(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    preconfirm_samples = int(np.floor(HIGH_ANGLE_UNWIND_CONFIRM_TIME / DT_CTRL)) - 1
+    for _ in range(preconfirm_samples):
+      assert state.update(True, HIGH_ANGLE_UNWIND_FULL_DEG, 3.0, 1.0, 1.0, True, 1.0, 1.0) == 0.0
+
+    samples = self.run_confirmed(state)
+    assert any(scale > 0.0 for scale in samples)
+    assert samples[-1] == pytest.approx(1.0)
+
+  def test_angle_schedule_is_smooth_and_stronger_at_larger_angles(self):
+    moderate = HighAngleUnwindExitState(DT_CTRL)
+    full = HighAngleUnwindExitState(DT_CTRL)
+    moderate_scale = self.run_confirmed(moderate, angle=(HIGH_ANGLE_UNWIND_START_DEG + HIGH_ANGLE_UNWIND_FULL_DEG) / 2.0)[-1]
+    full_scale = self.run_confirmed(full)[-1]
+    assert 0.0 < moderate_scale < full_scale
+    assert full_scale == pytest.approx(1.0)
+
+  def test_speed_fades_to_zero_by_maximum(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    assert all(scale == 0.0 for scale in self.run_confirmed(state, speed=HIGH_ANGLE_UNWIND_MAX_SPEED))
+
+  def test_speed_below_controller_motion_floor_never_arms(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    assert all(scale == 0.0 for scale in self.run_confirmed(state, speed=HIGH_ANGLE_UNWIND_MIN_SPEED - 0.01))
+
+  @pytest.mark.parametrize(
+    ("angle", "same_episode", "turn_sign", "reference_rate"),
+    [
+      (HIGH_ANGLE_UNWIND_START_DEG, True, 1.0, 1.0),
+      (-HIGH_ANGLE_UNWIND_FULL_DEG, True, 1.0, 1.0),
+      (HIGH_ANGLE_UNWIND_FULL_DEG, False, 1.0, 1.0),
+      (HIGH_ANGLE_UNWIND_FULL_DEG, True, 0.0, 1.0),
+      (HIGH_ANGLE_UNWIND_FULL_DEG, True, 1.0, -1.0),
+    ],
+  )
+  def test_ineligible_geometry_never_arms(self, angle, same_episode, turn_sign, reference_rate):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    samples = [state.update(True, angle, 3.0, 1.0, 1.0, same_episode, turn_sign, reference_rate) for _ in range(100)]
+    assert all(scale == 0.0 for scale in samples)
+
+  def test_route_like_negative_unwind_reaches_full_scale(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    scales = self.run_confirmed(state, angle=-336.0, speed=3.63, turn_sign=-1.0, reference_rate=-1.69)
+    assert scales[-1] > 0.95
+    output, correction, old_direction = get_high_angle_unwind_exit(-0.785, 0.0, -1.0, scales[-1])
+    assert old_direction == pytest.approx(0.785)
+    assert correction > 0.0
+    assert -0.04 < output <= 0.0
+
+  def test_single_reference_dropout_is_held_without_command_step(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    assert self.run_confirmed(state)[-1] == pytest.approx(1.0)
+    dropout_scale = state.update(True, HIGH_ANGLE_UNWIND_FULL_DEG, 3.0, 0.0, 1.0, True, 1.0, 1.0)
+    assert dropout_scale == pytest.approx(1.0)
+    assert state.confirmed_time >= HIGH_ANGLE_UNWIND_CONFIRM_TIME
+
+  def test_committed_handoff_resets_immediately(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    assert self.run_confirmed(state)[-1] == pytest.approx(1.0)
+    assert state.update(True, HIGH_ANGLE_UNWIND_FULL_DEG, 3.0, 1.0, 1.0, False, 1.0, 1.0) == 0.0
+
+  def test_driver_or_inactive_reset_is_immediate(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    assert self.run_confirmed(state)[-1] == pytest.approx(1.0)
+    assert state.update(False, HIGH_ANGLE_UNWIND_FULL_DEG, 3.0, 1.0, 1.0, True, 1.0, 1.0) == 0.0
+    assert state.confirmed_time == 0.0
 
 
 class TestCommittedHandoffTorqueCap:
@@ -654,6 +793,9 @@ class TestReferenceRateTrackingIntegration:
     assert torque_log.d == pytest.approx(torque_log.rateTrackingCorrection + torque_log.actuatorStateCorrection)
     assert torque_log.rateBrake == 0.0
     assert torque_log.rateBrakeScale == 0.0
+    assert torque_log.highAngleUnwindScale == 0.0
+    assert torque_log.highAngleUnwindOldTorqueCorrection == 0.0
+    assert torque_log.highAngleUnwindOldDirectionTorque == 0.0
 
     car_state.steeringPressed = True
     _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.02, False, 0.2)
