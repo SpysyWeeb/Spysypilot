@@ -356,6 +356,7 @@ class TestLoggerd:
     assert getxattr(segment_dir, PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
     rlog = list(LogReader(str(segment_dir / "rlog.zst")))
     assert len([msg for msg in rlog if msg.which() == "drivingEvent" and msg.drivingEvent.eventId == "loggerd-test-event"]) == 1
+    assert any(msg.which() == "drivingEventRecorded" and msg.drivingEventRecorded.eventId == "loggerd-test-event" for msg in rlog)
 
   def test_driving_event_setxattr_failure_is_acknowledged_and_retried(self):
     os.environ["LOGGERD_TEST_SETXATTR_FAILURES"] = "1"
