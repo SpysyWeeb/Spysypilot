@@ -379,7 +379,7 @@ def longitudinal_sample(sm: messaging.SubMaster) -> LaunchSample:
     active=bool(sm.valid["carState"] and sm.valid["carControl"] and sm["carControl"].longActive),
     standstill=bool(sm["carState"].standstill),
     v_ego=float(sm["carState"].vEgo),
-    lead_present=bool(lead.status),
+    lead_present=bool(lead.present),
     radar_valid=bool(sm.valid["radarState"]),
     d_rel=float(lead.dRel),
     v_lead=float(lead.vLead),
