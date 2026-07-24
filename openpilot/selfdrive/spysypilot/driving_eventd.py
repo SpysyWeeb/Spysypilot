@@ -29,6 +29,7 @@ EVENT_VERSION = 1
 GROUP_WINDOW_NS = 2_500_000_000
 CONTEXT_BEFORE = 2
 CONTEXT_AFTER = 1
+ACK_RETRY_INTERVAL_NS = 1_000_000_000
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,13 @@ class AcceptedEvent:
   event_id: str
   group_id: str
   candidate: EventCandidate
+
+
+@dataclass
+class PendingEvent:
+  event: AcceptedEvent
+  last_sent_ns: int
+  attempts: int = 1
 
 
 class EventRecorder:
@@ -140,22 +148,24 @@ class DrivingEventPlatform:
     self.longitudinal_detector = longitudinal_detector or LeadLaunchDetector()
     self.on_error = on_error or (lambda domain: cloudlog.exception(f"driving_eventd: {domain} detector failed"))
 
-  def update(self, lateral_sample: LateralSample, longitudinal_sample: LaunchSample,
+  def update(self, lateral_sample: LateralSample | None = None, longitudinal_sample: LaunchSample | None = None,
              manual_pressed: bool = False, manual_time_ns: int | None = None) -> list[AcceptedEvent]:
     candidates: list[EventCandidate] = []
-    try:
-      detection = self.lateral_detector.update(lateral_sample)
-      if detection is not None:
-        candidates.append(lateral_candidate(lateral_sample, detection))
-    except Exception:
-      self.on_error("lateral")
+    if lateral_sample is not None:
+      try:
+        detection = self.lateral_detector.update(lateral_sample)
+        if detection is not None:
+          candidates.append(lateral_candidate(lateral_sample, detection))
+      except Exception:
+        self.on_error("lateral")
 
-    try:
-      event = self.longitudinal_detector.update(longitudinal_sample)
-      if event is not None:
-        candidates.append(longitudinal_candidate(longitudinal_sample, event))
-    except Exception:
-      self.on_error("longitudinal")
+    if longitudinal_sample is not None:
+      try:
+        event = self.longitudinal_detector.update(longitudinal_sample)
+        if event is not None:
+          candidates.append(longitudinal_candidate(longitudinal_sample, event))
+      except Exception:
+        self.on_error("longitudinal")
 
     if manual_pressed:
       candidates.append(manual_candidate(manual_time_ns if manual_time_ns is not None else time.monotonic_ns()))
@@ -231,6 +241,46 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
   return msg
 
 
+class EventSubmitter:
+  """Retain accepted events until loggerd acknowledges their stable event IDs."""
+
+  def __init__(self, pm: messaging.PubMaster, git_commit: str = "", git_branch: str = "",
+               retry_interval_ns: int = ACK_RETRY_INTERVAL_NS):
+    self.pm = pm
+    self.git_commit = git_commit
+    self.git_branch = git_branch
+    self.retry_interval_ns = retry_interval_ns
+    self.pending: dict[str, PendingEvent] = {}
+
+  def _send(self, pending: PendingEvent, now_ns: int) -> bool:
+    pending.last_sent_ns = now_ns
+    try:
+      self.pm.send("drivingEvent", build_message(pending.event, self.git_commit, self.git_branch))
+      return True
+    except Exception:
+      cloudlog.exception(f"driving_eventd: failed to submit event {pending.event.event_id}")
+      return False
+
+  def submit(self, event: AcceptedEvent, now_ns: int | None = None) -> None:
+    now_ns = time.monotonic_ns() if now_ns is None else now_ns
+    pending = PendingEvent(event, now_ns)
+    self.pending[event.event_id] = pending
+    self._send(pending, now_ns)
+
+  def acknowledge(self, event_id: str) -> bool:
+    return self.pending.pop(event_id, None) is not None
+
+  def retry_due(self, now_ns: int | None = None) -> list[str]:
+    now_ns = time.monotonic_ns() if now_ns is None else now_ns
+    retried: list[str] = []
+    for event_id, pending in self.pending.items():
+      if now_ns - pending.last_sent_ns >= self.retry_interval_ns:
+        pending.attempts += 1
+        self._send(pending, now_ns)
+        retried.append(event_id)
+    return retried
+
+
 def longitudinal_sample(sm: messaging.SubMaster) -> LaunchSample:
   lead = sm["radarState"].leadOne
   leads_v3 = sm["modelV2"].leadsV3
@@ -299,31 +349,42 @@ def main() -> None:
   git_commit = _param_text(params, "GitCommit")
   git_branch = _param_text(params, "GitBranch")
   pm = messaging.PubMaster(["drivingEvent"])
+  ack_sock = messaging.sub_sock("drivingEventRecorded", conflate=False)
   sm = messaging.SubMaster(
     ["bookmarkButton", "carState", "carControl", "carOutput", "controlsState",
      "radarState", "longitudinalPlan", "modelV2", "livePose"],
-    poll="carState",
   )
   platform = DrivingEventPlatform()
+  submitter = EventSubmitter(pm, git_commit, git_branch)
   rate_filter = SteeringRateFilter()
   bump_classifier = RoadBumpClassifier()
 
+  if not pm.wait_for_readers_to_update("drivingEvent", timeout=10):
+    cloudlog.warning("driving_eventd: loggerd reader not ready; retaining events for retry")
+
   while True:
-    sm.update(1000)
-    if not sm.updated["carState"] and not sm.updated["bookmarkButton"]:
-      continue
-    lat_sample = lateral_sample(sm, rate_filter, bump_classifier)
-    long_sample = longitudinal_sample(sm)
+    sm.update(100)
+    for ack_msg in messaging.drain_sock(ack_sock):
+      if ack_msg.valid and ack_msg.which() == "drivingEventRecorded":
+        submitter.acknowledge(ack_msg.drivingEventRecorded.eventId)
+
+    controls_updated = bool(sm.updated["controlsState"])
+    car_state_updated = bool(sm.updated["carState"])
+    bookmark_updated = bool(sm.updated["bookmarkButton"])
+    lat_sample = lateral_sample(sm, rate_filter, bump_classifier) if controls_updated else None
+    long_sample = longitudinal_sample(sm) if car_state_updated else None
     events = platform.update(
       lat_sample,
       long_sample,
-      manual_pressed=bool(sm.updated["bookmarkButton"]),
-      manual_time_ns=time.monotonic_ns(),
+      manual_pressed=bookmark_updated,
+      manual_time_ns=sm.logMonoTime["bookmarkButton"] if bookmark_updated else None,
     )
     for event in events:
-      pm.send("drivingEvent", build_message(event, git_commit, git_branch))
+      submitter.submit(event)
       cloudlog.event("driving_event", event_id=event.event_id, group_id=event.group_id,
                      domain=event.candidate.domain, event_type=event.candidate.event_type)
+    for event_id in submitter.retry_due():
+      cloudlog.warning("driving_eventd: retrying unacknowledged event", event_id=event_id)
 
 
 if __name__ == "__main__":

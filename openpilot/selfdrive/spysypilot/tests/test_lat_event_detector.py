@@ -1,4 +1,4 @@
-from openpilot.selfdrive.spysypilot.lat_event_detector import LateralEventDetector, LateralSample
+from openpilot.selfdrive.spysypilot.lat_event_detector import DETECTOR_VERSION, LateralEventDetector, LateralSample
 
 
 def sample(t: float, **kwargs) -> LateralSample:
@@ -9,6 +9,10 @@ def sample(t: float, **kwargs) -> LateralSample:
   }
   defaults.update(kwargs)
   return LateralSample(t, **defaults)
+
+
+def test_per_type_cooldown_is_detector_version_two():
+  assert DETECTOR_VERSION == 2
 
 
 def test_inactive_never_triggers():
