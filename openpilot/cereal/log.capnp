@@ -963,16 +963,33 @@ struct ControlsState @0x97ff69c53601abf1 {
     highAngleUnwindOldDirectionTorque @83 :Float32;       # pre-cap old-turn component beyond crown-neutral
     highAngleUnwindLatchedScale @84 :Float32;              # monotonic release authority retained for the owned episode
     highAngleUnwindOldDirectionLimit @85 :Float32;         # crown-relative maximum old-turn command retained by the latch
-    highAngleUnwindTurnInGuard @86 :Float32;               # present-demand protection reducing newly accumulated release
+    highAngleUnwindTurnInGuard @86 :Float32;               # diagnostic strength of present plateau/undertracking protection before commitment
     highAngleUnwindEvidenceHeld @87 :Bool;                 # confirmed release retained through a short evidence dropout
     highAngleUnwindEvidenceDropoutTime @88 :Float32;       # seconds since future unwind evidence was last eligible
     highAngleUnwindAppliedOldDirectionTorque @89 :Float32; # crown-relative old-turn component still applied by the EPS
     highAngleUnwindAppliedNeutral @90 :Bool;               # applied torque is within the breakout crown-neutral tolerance
-    highAngleUnwindNeutralDwell @91 :Float32;              # continuous seconds at applied crown-neutral
+    highAngleUnwindNeutralDwell @91 :Float32;              # elapsed progress-window time since the first qualifying crown-neutral sample
     highAngleUnwindProgressDeg @92 :Float32;               # wheel unwind progress since applied crown-neutral
     highAngleUnwindBreakoutScale @93 :Float32;             # bounded extreme-angle opposite-assist scale
     highAngleUnwindBreakoutCorrection @94 :Float32;        # signed normalized opposite correction added by breakout
     highAngleUnwindPresentDemandRate @95 :Float32;         # delay-aligned present lateral-demand rate, m/s^3
+    highAngleUnwindReleaseCommitted @96 :Bool;              # present-turn demand has persistently released; monotonic exit authority may begin
+    highAngleUnwindReleaseCandidateTime @97 :Float32;       # continuous seconds satisfying the present-demand release gate
+    highAngleUnwindPresentOldDemand @98 :Float32;           # strongest present request still pointing into the owned turn, m/s^2
+    highAngleUnwindPresentPeakDemand @99 :Float32;          # recent peak old-turn request used for release hysteresis, m/s^2
+    highAngleUnwindPresentReleaseAmount @100 :Float32;      # recent peak minus current old-turn request, m/s^2
+    highAngleUnwindPresentTotalDemandRate @101 :Float32;    # delay-aligned request rate in the old-turn direction, m/s^3
+    highAngleUnwindBreakoutEarned @102 :Bool;               # insufficient post-neutral wheel progress earned bounded opposite assist
+    highAngleUnwindBreakoutCompleted @103 :Bool;            # rate recovery or safe angle exit ended breakout for this episode
+    highAngleUnwindBreakoutCatchTime @104 :Float32;         # continuous measured wheel-rate recovery, seconds
+    highAngleUnwindBreakoutPlannedRate @105 :Float32;       # planned lateral-acceleration rate out of the owned turn, m/s^3
+    highAngleUnwindBreakoutActualRate @106 :Float32;        # measured lateral-acceleration rate out of the owned turn, m/s^3
+    highAngleUnwindBreakoutSteeringRate @107 :Float32;      # raw steering-wheel rate out of the owned turn, deg/s
+    highAngleUnwindFutureConfirmed @108 :Bool;               # future unwind intent was confirmed while waiting for present demand to release
+    highAngleUnwindWaitingForPresent @109 :Bool;              # future intent is confirmed but high-angle torque action is still hard-disabled
+    highAngleUnwindBreakoutProgressEvaluated @110 :Bool;      # the fixed post-neutral progress window has been evaluated for this episode
+    highAngleUnwindBreakoutTargetScale @111 :Float32;         # latched breakout target before bounded ramping
+    highAngleUnwindNeutralDelivered @112 :Bool;                # applied old-turn torque completed crown-neutral confirmation
    }
 
   struct LateralAngleState {

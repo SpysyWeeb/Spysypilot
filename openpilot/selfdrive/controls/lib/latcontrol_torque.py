@@ -86,13 +86,19 @@ HIGH_ANGLE_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
 HIGH_ANGLE_UNWIND_RATE_FULL = 0.80  # m/s^3 at the common tracking speed
 HIGH_ANGLE_UNWIND_CONFIRM_TIME = 0.15  # seconds of persistent future-path evidence
 HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME = 0.25
+HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME = 1.75  # bounded wait for the route-confirmed present-demand release lag
 HIGH_ANGLE_UNWIND_RAMP_IN_TIME = 0.20
 HIGH_ANGLE_UNWIND_PRESENT_DEMAND_MIN = 0.20  # m/s^2 in the owned turn direction
-HIGH_ANGLE_UNWIND_PRESENT_BUILD_START = 0.15  # m/s^3 in the delay-aligned present request
-HIGH_ANGLE_UNWIND_PRESENT_BUILD_FULL = 0.80
+HIGH_ANGLE_UNWIND_PRESENT_PEAK_TIME = 0.75
+HIGH_ANGLE_UNWIND_PRESENT_RELEASE_MIN = 0.20  # m/s^2 below the recent old-turn peak
+HIGH_ANGLE_UNWIND_PRESENT_RELEASE_FRACTION = 0.15
+HIGH_ANGLE_UNWIND_PRESENT_RELEASE_RATE = -0.20  # m/s^3 in the old-turn lateral-acceleration direction
+HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME = 0.15
+HIGH_ANGLE_UNWIND_EXTREME_RELEASE_TIME = 0.10
+HIGH_ANGLE_UNWIND_PRESENT_RELEASE_DEMAND_MAX = 0.50  # m/s^2 still requested into the old turn
+HIGH_ANGLE_UNWIND_PRESENT_PLATEAU_MIN = 0.50
 HIGH_ANGLE_UNWIND_PRESENT_ERROR_START = 0.08  # m/s^2 at the common tracking speed
 HIGH_ANGLE_UNWIND_PRESENT_ERROR_FULL = 0.30
-HIGH_ANGLE_UNWIND_PRESENT_GUARD_MAX = 0.60  # retain at least 40% predictive release while present demand builds
 HIGH_ANGLE_UNWIND_HANDOFF_BRIDGE_TIME = UNWIND_EPISODE_OPPOSITE_TIME + 0.15
 HIGH_ANGLE_BREAKOUT_START_DEG = 300.0
 HIGH_ANGLE_BREAKOUT_FULL_DEG = 360.0
@@ -103,7 +109,10 @@ HIGH_ANGLE_BREAKOUT_NEUTRAL_DWELL_TIME = 0.10
 HIGH_ANGLE_BREAKOUT_PROGRESS_TIME = 0.30
 HIGH_ANGLE_BREAKOUT_PROGRESS_MIN_DEG = 30.0
 HIGH_ANGLE_BREAKOUT_REFERENCE_RATE_MIN = 0.35
-HIGH_ANGLE_BREAKOUT_PRESENT_GUARD_MAX = 0.25
+HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_MIN = 0.35
+HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_FRACTION = 0.80
+HIGH_ANGLE_BREAKOUT_STEERING_RATE_MIN = 60.0  # deg/s out of the old turn
+HIGH_ANGLE_BREAKOUT_RATE_RECOVERY_TIME = 0.15
 HIGH_ANGLE_BREAKOUT_TORQUE_MAX = 0.15
 HIGH_ANGLE_BREAKOUT_RAMP_IN_TIME = 0.20
 HIGH_ANGLE_BREAKOUT_RAMP_OUT_TIME = 0.15
@@ -121,7 +130,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 17
+VERSION = 18
 
 
 def smoothstep(value: float) -> float:
@@ -293,8 +302,12 @@ def apply_high_angle_unwind_limits(
   breakout_magnitude = HIGH_ANGLE_BREAKOUT_TORQUE_MAX * clip_scalar(breakout_scale, 0.0, 1.0)
   breakout_coordinate = -breakout_magnitude
   final_coordinate = min(limited_coordinate, breakout_coordinate) if breakout_magnitude > 0.0 else limited_coordinate
-  breakout_correction = old_sign * (final_coordinate - limited_coordinate)
-  return neutral_torque + old_sign * final_coordinate, old_direction_correction, old_direction_command, breakout_correction
+  limited_command = neutral_torque + old_sign * limited_coordinate
+  final_command = neutral_torque + old_sign * final_coordinate
+  if breakout_magnitude > 0.0:
+    final_command = clip_scalar(final_command, -1.0, 1.0)
+  breakout_correction = final_command - limited_command
+  return final_command, old_direction_correction, old_direction_command, breakout_correction
 
 
 def get_committed_handoff_torque_cap(
@@ -333,7 +346,16 @@ class HighAngleUnwindExitState:
 
   def __init__(self, dt: float):
     self.dt = dt
+    self.present_demand_history: deque[float] = deque(maxlen=max(1, int(round(HIGH_ANGLE_UNWIND_PRESENT_PEAK_TIME / dt))))
     self.confirmed_time = 0.0
+    self.future_confirmed = False
+    self.confirmed_target_scale = 0.0
+    self.release_candidate_time = 0.0
+    self.release_committed = False
+    self.present_old_demand = 0.0
+    self.present_peak_demand = 0.0
+    self.present_release_amount = 0.0
+    self.present_total_demand_rate = 0.0
     self.ineligible_time = 0.0
     self.low_angle_time = 0.0
     self.target_scale = 0.0
@@ -346,16 +368,33 @@ class HighAngleUnwindExitState:
     self.handoff_bridge_time = 0.0
     self.applied_old_direction_torque = 0.0
     self.applied_neutral = False
+    self.neutral_delivered = False
     self.neutral_dwell_time = 0.0
     self.neutral_entry_angle = 0.0
     self.progress_deg = 0.0
     self.peak_aligned_angle = 0.0
     self.breakout_target_scale = 0.0
     self.breakout_scale = 0.0
+    self.breakout_progress_evaluated = False
+    self.breakout_earned = False
+    self.breakout_catch_time = 0.0
+    self.breakout_completed = False
+    self.breakout_planned_rate = 0.0
+    self.breakout_actual_rate = 0.0
+    self.breakout_steering_rate = 0.0
     self.evidence_held = False
 
   def reset(self) -> None:
+    self.present_demand_history.clear()
     self.confirmed_time = 0.0
+    self.future_confirmed = False
+    self.confirmed_target_scale = 0.0
+    self.release_candidate_time = 0.0
+    self.release_committed = False
+    self.present_old_demand = 0.0
+    self.present_peak_demand = 0.0
+    self.present_release_amount = 0.0
+    self.present_total_demand_rate = 0.0
     self.ineligible_time = 0.0
     self.low_angle_time = 0.0
     self.target_scale = 0.0
@@ -368,12 +407,20 @@ class HighAngleUnwindExitState:
     self.handoff_bridge_time = 0.0
     self.applied_old_direction_torque = 0.0
     self.applied_neutral = False
+    self.neutral_delivered = False
     self.neutral_dwell_time = 0.0
     self.neutral_entry_angle = 0.0
     self.progress_deg = 0.0
     self.peak_aligned_angle = 0.0
     self.breakout_target_scale = 0.0
     self.breakout_scale = 0.0
+    self.breakout_progress_evaluated = False
+    self.breakout_earned = False
+    self.breakout_catch_time = 0.0
+    self.breakout_completed = False
+    self.breakout_planned_rate = 0.0
+    self.breakout_actual_rate = 0.0
+    self.breakout_steering_rate = 0.0
     self.evidence_held = False
 
   def _reset_release(self, preserve_limit_for_handoff: bool) -> None:
@@ -384,6 +431,15 @@ class HighAngleUnwindExitState:
       self.old_turn_torque_sign = 0.0
       self.handoff_bridge_time = 0.0
     self.confirmed_time = 0.0
+    self.future_confirmed = False
+    self.confirmed_target_scale = 0.0
+    self.release_candidate_time = 0.0
+    self.release_committed = False
+    self.present_demand_history.clear()
+    self.present_old_demand = 0.0
+    self.present_peak_demand = 0.0
+    self.present_release_amount = 0.0
+    self.present_total_demand_rate = 0.0
     self.ineligible_time = 0.0
     self.low_angle_time = 0.0
     self.target_scale = 0.0
@@ -393,12 +449,20 @@ class HighAngleUnwindExitState:
     self.release_owned = False
     self.applied_old_direction_torque = 0.0
     self.applied_neutral = False
+    self.neutral_delivered = False
     self.neutral_dwell_time = 0.0
     self.neutral_entry_angle = 0.0
     self.progress_deg = 0.0
     self.peak_aligned_angle = 0.0
     self.breakout_target_scale = 0.0
     self.breakout_scale = 0.0
+    self.breakout_progress_evaluated = False
+    self.breakout_earned = False
+    self.breakout_catch_time = 0.0
+    self.breakout_completed = False
+    self.breakout_planned_rate = 0.0
+    self.breakout_actual_rate = 0.0
+    self.breakout_steering_rate = 0.0
     self.evidence_held = False
 
   def update(
@@ -413,7 +477,11 @@ class HighAngleUnwindExitState:
     reference_rate: float,
     present_demand_rate: float = 0.0,
     tracking_position_error: float = 0.0,
+    delayed_lateral_accel: float = 0.0,
     current_lateral_accel: float = 0.0,
+    geometric_lateral_accel: float | None = None,
+    tracking_measurement_rate: float = 0.0,
+    steering_rate_deg: float = 0.0,
     applied_torque: float = 0.0,
     neutral_torque: float = 0.0,
   ) -> float:
@@ -428,14 +496,15 @@ class HighAngleUnwindExitState:
         self.old_turn_torque_sign = 0.0
 
     sign_changed = (
-      self.release_owned
-      and self.old_turn_torque_sign != 0.0
+      self.old_turn_torque_sign != 0.0
       and old_turn_torque_sign != 0.0
       and math.copysign(1.0, old_turn_torque_sign) != math.copysign(1.0, self.old_turn_torque_sign)
     )
     if not same_episode or old_turn_torque_sign == 0.0 or sign_changed:
       if self.release_owned:
         self._reset_release(preserve_limit_for_handoff=True)
+      elif self.handoff_bridge_time == 0.0:
+        self._reset_release(preserve_limit_for_handoff=False)
       return 0.0
 
     old_sign = math.copysign(1.0, old_turn_torque_sign)
@@ -466,75 +535,145 @@ class HighAngleUnwindExitState:
     rate_scale = smoothstep((unloading_rate - HIGH_ANGLE_UNWIND_RATE_MIN) / (HIGH_ANGLE_UNWIND_RATE_FULL - HIGH_ANGLE_UNWIND_RATE_MIN))
 
     old_lateral_accel_sign = -old_sign
-    present_old_demand = max(current_lateral_accel * old_lateral_accel_sign, 0.0)
-    present_build = max(present_demand_rate * old_lateral_accel_sign, 0.0)
+    demand_candidates = (delayed_lateral_accel, current_lateral_accel)
+    if geometric_lateral_accel is not None and np.isfinite(geometric_lateral_accel):
+      demand_candidates += (geometric_lateral_accel,)
+    self.present_old_demand = max(*(demand * old_lateral_accel_sign for demand in demand_candidates), 0.0)
+    self.present_demand_history.append(self.present_old_demand)
+    self.present_peak_demand = max(self.present_demand_history, default=0.0)
+    self.present_release_amount = max(self.present_peak_demand - self.present_old_demand, 0.0)
+    self.present_total_demand_rate = present_demand_rate * old_lateral_accel_sign
     present_undertrack = max(tracking_position_error * old_lateral_accel_sign, 0.0)
-    build_guard = smoothstep(
-      (present_build - HIGH_ANGLE_UNWIND_PRESENT_BUILD_START) / (HIGH_ANGLE_UNWIND_PRESENT_BUILD_FULL - HIGH_ANGLE_UNWIND_PRESENT_BUILD_START)
-    )
     undertrack_guard = smoothstep(
       (present_undertrack - HIGH_ANGLE_UNWIND_PRESENT_ERROR_START) / (HIGH_ANGLE_UNWIND_PRESENT_ERROR_FULL - HIGH_ANGLE_UNWIND_PRESENT_ERROR_START)
     )
-    demand_gate = smoothstep(present_old_demand / HIGH_ANGLE_UNWIND_PRESENT_DEMAND_MIN)
-    self.turn_in_guard = build_guard * undertrack_guard * demand_gate
+    plateau_guard = float(
+      self.present_old_demand >= HIGH_ANGLE_UNWIND_PRESENT_PLATEAU_MIN and self.present_total_demand_rate > HIGH_ANGLE_UNWIND_PRESENT_RELEASE_RATE
+    )
+    self.turn_in_guard = 0.0 if self.release_committed else max(plateau_guard, undertrack_guard)
 
     eligible = speed_scale > 0.0 and sustained_scale > 0.0 and phase_scale > 0.0 and rate_scale > 0.0
     if eligible:
+      raw_target = angle_scale * speed_scale * sustained_scale * phase_scale * rate_scale
       self.confirmed_time += self.dt
       self.ineligible_time = 0.0
       if self.confirmed_time >= HIGH_ANGLE_UNWIND_CONFIRM_TIME:
-        raw_target = angle_scale * speed_scale * sustained_scale * phase_scale * rate_scale
-        authority_ceiling = 1.0 - HIGH_ANGLE_UNWIND_PRESENT_GUARD_MAX * self.turn_in_guard
-        self.latched_scale = max(self.latched_scale, min(raw_target, authority_ceiling))
-        self.release_owned = self.latched_scale > 0.0
+        self.future_confirmed = True
+        self.confirmed_target_scale = max(self.confirmed_target_scale, raw_target)
+      if self.release_committed:
+        self.latched_scale = max(self.latched_scale, raw_target)
     else:
       self.ineligible_time += self.dt
-      if not self.release_owned and self.ineligible_time >= HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME:
+      if self.ineligible_time >= HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME:
+        # The preview intent stays remembered while this geometric episode is
+        # owned, but stronger authority still requires fresh future evidence.
         self.confirmed_time = 0.0
-      elif self.release_owned and self.ineligible_time >= HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME:
-        # Preserve the already-earned ceiling, but require fresh confirmation
-        # before accumulating any stronger release after a long dropout.
-        self.confirmed_time = 0.0
-    self.evidence_held = self.release_owned and not eligible and self.ineligible_time < HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME
+      if not self.release_committed and self.ineligible_time >= HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME:
+        self.future_confirmed = False
+        self.confirmed_target_scale = 0.0
+        self.release_candidate_time = 0.0
+
+    required_release = max(
+      HIGH_ANGLE_UNWIND_PRESENT_RELEASE_MIN,
+      HIGH_ANGLE_UNWIND_PRESENT_RELEASE_FRACTION * self.present_peak_demand,
+    )
+    materially_declining = (
+      self.present_release_amount >= required_release
+      and self.present_total_demand_rate <= HIGH_ANGLE_UNWIND_PRESENT_RELEASE_RATE
+      and self.present_old_demand <= HIGH_ANGLE_UNWIND_PRESENT_RELEASE_DEMAND_MAX
+    )
+    near_neutral = self.present_old_demand <= HIGH_ANGLE_UNWIND_PRESENT_DEMAND_MIN
+    release_candidate = not self.release_committed and self.future_confirmed and (near_neutral or materially_declining)
+    self.release_candidate_time = self.release_candidate_time + self.dt if release_candidate else 0.0
+    required_release_time = (
+      HIGH_ANGLE_UNWIND_EXTREME_RELEASE_TIME if self.peak_aligned_angle >= HIGH_ANGLE_BREAKOUT_FULL_DEG else HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME
+    )
+    if self.release_candidate_time >= required_release_time:
+      self.release_committed = True
+      current_angle_speed_authority = angle_scale * speed_scale
+      self.latched_scale = max(self.latched_scale, min(self.confirmed_target_scale, current_angle_speed_authority))
+      self.release_owned = self.latched_scale > 0.0
+      self.turn_in_guard = 0.0
+
+    self.evidence_held = self.release_committed and not eligible and self.ineligible_time < HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME
     self.target_scale = self.latched_scale
     self.scale += clip_scalar(self.target_scale - self.scale, 0.0, self.dt / HIGH_ANGLE_UNWIND_RAMP_IN_TIME)
 
     self.applied_old_direction_torque = max((applied_torque - neutral_torque) * old_sign, 0.0)
-    breakout_scope = (
-      self.release_owned
+    self.breakout_planned_rate = unloading_rate
+    self.breakout_actual_rate = tracking_measurement_rate * old_sign
+    self.breakout_steering_rate = -steering_rate_deg * old_sign
+    breakout_structural_scope = (
+      self.release_committed
+      and self.release_owned
       and self.latched_scale >= HIGH_ANGLE_BREAKOUT_RELEASE_SCALE_MIN
       and self.peak_aligned_angle >= HIGH_ANGLE_BREAKOUT_START_DEG
       and aligned_angle >= HIGH_ANGLE_BREAKOUT_EXIT_DEG
-      and self.turn_in_guard < HIGH_ANGLE_BREAKOUT_PRESENT_GUARD_MAX
-      and self.ineligible_time < HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME
-      and unloading_rate > HIGH_ANGLE_BREAKOUT_REFERENCE_RATE_MIN
+      and HIGH_ANGLE_UNWIND_MIN_SPEED <= v_ego < HIGH_ANGLE_UNWIND_MAX_SPEED
     )
-    self.applied_neutral = breakout_scope and self.applied_old_direction_torque <= HIGH_ANGLE_BREAKOUT_APPLIED_NEUTRAL_TOL
-    if self.applied_neutral:
-      if self.neutral_dwell_time == 0.0:
-        self.neutral_entry_angle = aligned_angle
+    strengthening_allowed = (
+      breakout_structural_scope
+      and eligible
+      and unloading_rate > HIGH_ANGLE_BREAKOUT_REFERENCE_RATE_MIN
+      and self.present_old_demand <= HIGH_ANGLE_UNWIND_PRESENT_DEMAND_MIN
+    )
+    self.applied_neutral = breakout_structural_scope and self.applied_old_direction_torque <= HIGH_ANGLE_BREAKOUT_APPLIED_NEUTRAL_TOL
+    if breakout_structural_scope and not self.neutral_delivered:
+      if self.applied_neutral:
+        if self.neutral_dwell_time == 0.0:
+          self.neutral_entry_angle = aligned_angle
+        self.neutral_dwell_time += self.dt
+        self.progress_deg = max(self.neutral_entry_angle - aligned_angle, 0.0)
+        if self.neutral_dwell_time >= HIGH_ANGLE_BREAKOUT_NEUTRAL_DWELL_TIME:
+          self.neutral_delivered = True
+      elif self.applied_old_direction_torque > HIGH_ANGLE_BREAKOUT_APPLIED_NEUTRAL_TOL + 0.03:
+        self.neutral_dwell_time = 0.0
+        self.neutral_entry_angle = 0.0
+        self.progress_deg = 0.0
+    elif breakout_structural_scope and self.neutral_delivered:
       self.neutral_dwell_time += self.dt
       self.progress_deg = max(self.neutral_entry_angle - aligned_angle, 0.0)
-    else:
-      self.neutral_dwell_time = 0.0
-      self.neutral_entry_angle = 0.0
-      self.progress_deg = 0.0
 
-    if self.applied_neutral and self.neutral_dwell_time >= max(HIGH_ANGLE_BREAKOUT_NEUTRAL_DWELL_TIME, HIGH_ANGLE_BREAKOUT_PROGRESS_TIME):
-      angle_breakout_scale = smoothstep(
-        (self.peak_aligned_angle - HIGH_ANGLE_BREAKOUT_START_DEG) / (HIGH_ANGLE_BREAKOUT_FULL_DEG - HIGH_ANGLE_BREAKOUT_START_DEG)
-      )
-      progress_deficit_scale = smoothstep((HIGH_ANGLE_BREAKOUT_PROGRESS_MIN_DEG - self.progress_deg) / HIGH_ANGLE_BREAKOUT_PROGRESS_MIN_DEG)
-      self.breakout_target_scale = angle_breakout_scale * speed_scale * progress_deficit_scale
-    else:
+    if (
+      breakout_structural_scope
+      and self.neutral_delivered
+      and not self.breakout_progress_evaluated
+      and self.neutral_dwell_time >= HIGH_ANGLE_BREAKOUT_PROGRESS_TIME
+    ):
+      self.breakout_progress_evaluated = True
+      if self.progress_deg < HIGH_ANGLE_BREAKOUT_PROGRESS_MIN_DEG:
+        angle_breakout_scale = smoothstep(
+          (self.peak_aligned_angle - HIGH_ANGLE_BREAKOUT_START_DEG) / (HIGH_ANGLE_BREAKOUT_FULL_DEG - HIGH_ANGLE_BREAKOUT_START_DEG)
+        )
+        self.breakout_target_scale = angle_breakout_scale * speed_scale
+        self.breakout_earned = self.breakout_target_scale > 0.0
+
+    rate_recovered = (
+      self.breakout_actual_rate >= max(HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_MIN, HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_FRACTION * unloading_rate)
+      and self.breakout_steering_rate >= HIGH_ANGLE_BREAKOUT_STEERING_RATE_MIN
+    )
+    if self.breakout_earned and not self.breakout_completed:
+      if strengthening_allowed:
+        self.breakout_catch_time = self.breakout_catch_time + self.dt if rate_recovered else 0.0
+      if self.breakout_catch_time >= HIGH_ANGLE_BREAKOUT_RATE_RECOVERY_TIME:
+        self.breakout_completed = True
+        self.breakout_target_scale = 0.0
+
+    if not breakout_structural_scope and self.release_committed:
+      if aligned_angle < HIGH_ANGLE_BREAKOUT_EXIT_DEG and (self.breakout_earned or self.neutral_delivered):
+        self.breakout_completed = True
       self.breakout_target_scale = 0.0
 
-    breakout_ramp_time = HIGH_ANGLE_BREAKOUT_RAMP_IN_TIME if self.breakout_target_scale > self.breakout_scale else HIGH_ANGLE_BREAKOUT_RAMP_OUT_TIME
-    self.breakout_scale += clip_scalar(
-      self.breakout_target_scale - self.breakout_scale,
-      -self.dt / breakout_ramp_time,
-      self.dt / breakout_ramp_time,
-    )
+    if self.breakout_earned and not self.breakout_completed and not strengthening_allowed:
+      breakout_delta = 0.0
+    else:
+      breakout_ramp_time = HIGH_ANGLE_BREAKOUT_RAMP_IN_TIME if self.breakout_target_scale > self.breakout_scale else HIGH_ANGLE_BREAKOUT_RAMP_OUT_TIME
+      breakout_delta = clip_scalar(
+        self.breakout_target_scale - self.breakout_scale,
+        -self.dt / breakout_ramp_time,
+        self.dt / breakout_ramp_time,
+      )
+    self.breakout_scale += breakout_delta
     return self.scale
 
   def apply(self, torque_command: float, neutral_torque: float) -> tuple[float, float, float, float]:
@@ -888,11 +1027,15 @@ class LatControlTorque(LatControl):
       unwind_same_episode,
       unwind_phase_direction,
       reference_rate,
-      present_demand_rate,
-      tracking_position_error,
-      expected_lateral_accel,
-      applied_torque,
-      neutral_torque,
+      present_demand_rate=present_demand_rate,
+      tracking_position_error=tracking_position_error,
+      delayed_lateral_accel=expected_lateral_accel,
+      current_lateral_accel=current_speed_desired_lateral_accel,
+      geometric_lateral_accel=reference_geometric_lateral_accel,
+      tracking_measurement_rate=tracking_measurement_rate,
+      steering_rate_deg=CS.steeringRateDeg,
+      applied_torque=applied_torque,
+      neutral_torque=neutral_torque,
     )
     high_angle_unwind_breakout_scale = self.high_angle_unwind_exit_state.breakout_scale
     high_angle_unwind_turn_in_guard = self.high_angle_unwind_exit_state.turn_in_guard
@@ -1086,6 +1229,25 @@ class LatControlTorque(LatControl):
     pid_log.highAngleUnwindBreakoutScale = float(high_angle_unwind_breakout_scale)
     pid_log.highAngleUnwindBreakoutCorrection = float(high_angle_unwind_breakout_correction)
     pid_log.highAngleUnwindPresentDemandRate = float(present_demand_rate)
+    pid_log.highAngleUnwindReleaseCommitted = bool(self.high_angle_unwind_exit_state.release_committed)
+    pid_log.highAngleUnwindReleaseCandidateTime = float(self.high_angle_unwind_exit_state.release_candidate_time)
+    pid_log.highAngleUnwindPresentOldDemand = float(self.high_angle_unwind_exit_state.present_old_demand)
+    pid_log.highAngleUnwindPresentPeakDemand = float(self.high_angle_unwind_exit_state.present_peak_demand)
+    pid_log.highAngleUnwindPresentReleaseAmount = float(self.high_angle_unwind_exit_state.present_release_amount)
+    pid_log.highAngleUnwindPresentTotalDemandRate = float(self.high_angle_unwind_exit_state.present_total_demand_rate)
+    pid_log.highAngleUnwindBreakoutEarned = bool(self.high_angle_unwind_exit_state.breakout_earned)
+    pid_log.highAngleUnwindBreakoutCompleted = bool(self.high_angle_unwind_exit_state.breakout_completed)
+    pid_log.highAngleUnwindBreakoutCatchTime = float(self.high_angle_unwind_exit_state.breakout_catch_time)
+    pid_log.highAngleUnwindBreakoutPlannedRate = float(self.high_angle_unwind_exit_state.breakout_planned_rate)
+    pid_log.highAngleUnwindBreakoutActualRate = float(self.high_angle_unwind_exit_state.breakout_actual_rate)
+    pid_log.highAngleUnwindBreakoutSteeringRate = float(self.high_angle_unwind_exit_state.breakout_steering_rate)
+    pid_log.highAngleUnwindFutureConfirmed = bool(self.high_angle_unwind_exit_state.future_confirmed)
+    pid_log.highAngleUnwindWaitingForPresent = bool(
+      self.high_angle_unwind_exit_state.future_confirmed and not self.high_angle_unwind_exit_state.release_committed
+    )
+    pid_log.highAngleUnwindBreakoutProgressEvaluated = bool(self.high_angle_unwind_exit_state.breakout_progress_evaluated)
+    pid_log.highAngleUnwindBreakoutTargetScale = float(self.high_angle_unwind_exit_state.breakout_target_scale)
+    pid_log.highAngleUnwindNeutralDelivered = bool(self.high_angle_unwind_exit_state.neutral_delivered)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log

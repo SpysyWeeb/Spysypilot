@@ -26,6 +26,15 @@ Active tuning work:
   demand, keeps confirmed release monotonic, strengthens the 200–280 degree
   range, and permits only a bounded, evidence-gated breakout assist. Replay is
   complete, but the change remains in progress pending another field test.
+- **In progress:** correct controller v17 using field route
+  `00000095--23c2a1f7a2`. V17's rate-only present-demand guard could disappear
+  while a strong turn merely plateaued, allowing its irreversible release
+  latch to unwind 10 of 12 usable episodes too early. Its breakout assist also
+  stopped after 30 degrees of progress while the EPS remained deeply wound.
+  V18 must require a sustained present-turn release before latching, retain the
+  monotonic ceiling only after that commitment, and hold the existing bounded
+  breakout until rate recovery or the angle exit. Route 94/95 open-loop replay
+  is complete; the task remains in progress pending another field test.
 
 ## What it does
 
