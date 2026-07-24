@@ -1,5 +1,10 @@
 # Automatic Longitudinal Event Logger
 
+> Historical design: the active runtime has moved to the universal platform in
+> [DrivingEventPlatform.md](DrivingEventPlatform.md). Existing
+> `/data/community/long_events` files are intentionally left intact, but no new
+> entries are written there.
+
 ## Purpose
 
 Comma Connect is not the source of truth for this tool. Detection operates on the
