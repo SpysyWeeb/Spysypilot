@@ -60,7 +60,7 @@ class UIState:
         "liveParameters",
         "testJoystick",
         "rawAudioData",
-        "lateralEvent",
+        "drivingEventRecorded",
       ]
     )
 
