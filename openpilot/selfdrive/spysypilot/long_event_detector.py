@@ -44,7 +44,6 @@ class LaunchSample:
 @dataclass(frozen=True)
 class LongEvent:
   event_type: str
-  title: str
   detail: str
   severity: int
   confidence: float
@@ -54,10 +53,6 @@ class LongEvent:
   command_to_lead_s: float = 0.0
   forecast_to_lead_s: float = 0.0
   radar_discontinuity: bool = False
-
-
-def bookmark_alert_text(bookmark) -> tuple[str, str]:
-  return str(bookmark.alertText1) or "Bookmark Saved", str(bookmark.alertText2)
 
 
 class LeadLaunchDetector:
@@ -130,7 +125,6 @@ class LeadLaunchDetector:
     confidence = 0.55 if self._radar_discontinuity else 0.95
     return LongEvent(
       event_type=event_type,
-      title="Long Event Logged",
       detail=f"Late launch +{lag:.1f} s - {cause}",
       severity=self._severity(lag),
       confidence=confidence,
@@ -194,7 +188,6 @@ class LeadLaunchDetector:
       confidence = 0.55 if self._radar_discontinuity else 0.95
       return LongEvent(
         event_type="lead_launch_stall",
-        title="Long Event Logged",
         detail=f"Launch stalled +{sample.t - t_lead:.1f} s",
         severity=3,
         confidence=confidence,
