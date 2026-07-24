@@ -18,6 +18,7 @@ SEVERE_LAUNCH_LAG_S = 1.5
 LAUNCH_STALL_S = 3.0
 LEAD_LOSS_GRACE_S = 0.3
 RADAR_JUMP_M = 1.5
+DETECTOR_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class LongEvent:
   plan_to_lead_s: float = 0.0
   command_to_lead_s: float = 0.0
   forecast_to_lead_s: float = 0.0
+  radar_discontinuity: bool = False
 
 
 def bookmark_alert_text(bookmark) -> tuple[str, str]:
@@ -137,6 +139,7 @@ class LeadLaunchDetector:
       plan_to_lead_s=(t_plan - t_lead) if t_plan is not None else 0.0,
       command_to_lead_s=(t_command - t_lead) if t_command is not None else 0.0,
       forecast_to_lead_s=(t_forecast - t_lead) if t_forecast is not None else 0.0,
+      radar_discontinuity=self._radar_discontinuity,
     )
 
   def update(self, sample: LaunchSample) -> LongEvent | None:
@@ -200,6 +203,7 @@ class LeadLaunchDetector:
         plan_to_lead_s=(t_plan - t_lead) if t_plan is not None else 0.0,
         command_to_lead_s=(t_command - t_lead) if t_command is not None else 0.0,
         forecast_to_lead_s=(self._onsets["forecast"] - t_lead) if "forecast" in self._onsets else 0.0,
+        radar_discontinuity=self._radar_discontinuity,
       )
 
     # Ego moved before radar measured a departure. That is not a late launch; end this
