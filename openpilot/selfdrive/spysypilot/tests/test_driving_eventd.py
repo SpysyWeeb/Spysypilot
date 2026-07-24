@@ -1,9 +1,12 @@
+from types import SimpleNamespace
+
 from openpilot.selfdrive.spysypilot.driving_eventd import (
   AcceptedEvent,
   DrivingEventPlatform,
   EventCandidate,
   EventRecorder,
   build_message,
+  longitudinal_sample,
   manual_candidate,
 )
 from openpilot.selfdrive.spysypilot.lat_event_detector import LateralDetection, LateralSample
@@ -104,3 +107,27 @@ def test_generic_domain_message_has_typed_empty_payload():
   msg = build_message(AcceptedEvent("event", "group", candidate))
   assert msg.drivingEvent.domain == "system"
   assert msg.drivingEvent.payload.which() == "none"
+
+
+def test_longitudinal_sampler_uses_fork_radar_status_field():
+  class FakeSubMaster:
+    def __init__(self):
+      self.data = {
+        "radarState": SimpleNamespace(leadOne=SimpleNamespace(
+          status=True, dRel=5.0, vLead=1.0, vLeadK=1.0, radarTrackId=7,
+        )),
+        "modelV2": SimpleNamespace(leadsV3=[]),
+        "carState": SimpleNamespace(standstill=True, vEgo=0.0),
+        "carControl": SimpleNamespace(longActive=True),
+        "longitudinalPlan": SimpleNamespace(shouldStop=True),
+        "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(accel=0.0)),
+      }
+      self.valid = dict.fromkeys(self.data, True)
+      self.logMonoTime = {"carState": 1_000_000_000}
+
+    def __getitem__(self, name):
+      return self.data[name]
+
+  sample = longitudinal_sample(FakeSubMaster())
+  assert sample.lead_present
+  assert sample.radar_track_id == 7
