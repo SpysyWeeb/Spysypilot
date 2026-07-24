@@ -9,10 +9,15 @@ FEEDBACK_MAX_DURATION = 10.0
 ButtonType = car.CarState.ButtonEvent.Type
 
 
+def publish_bookmark(pm: messaging.PubMaster) -> None:
+  msg = messaging.new_message('userBookmark', valid=True)
+  pm.send('userBookmark', msg)
+
+
 def main():
   params = Params()
   pm = messaging.PubMaster(['userBookmark', 'audioFeedback'])
-  sm = messaging.SubMaster(['rawAudioData', 'bookmarkButton', 'carState'])
+  sm = messaging.SubMaster(['rawAudioData', 'carState'])
   should_record_audio = False
   block_num = 0
   waiting_for_release = False
@@ -57,10 +62,6 @@ def main():
         early_stop_triggered = False
         cloudlog.info("10-second recording completed or second button press - stopping audio feedback")
       pm.send('audioFeedback', msg)
-
-    if sm.updated['bookmarkButton']:
-      cloudlog.info("Bookmark button pressed!")
-      should_send_bookmark = True
 
     if should_send_bookmark:
       msg = messaging.new_message('userBookmark', valid=True)
