@@ -361,7 +361,7 @@ class TestLoggerd:
   def test_driving_event_setxattr_failure_is_acknowledged_and_retried(self):
     os.environ["LOGGERD_TEST_SETXATTR_FAILURES"] = "1"
     pm = messaging.PubMaster(["drivingEvent"])
-    ack_sock = messaging.sub_sock("drivingEventRecorded", timeout=5000)
+    ack_sock = messaging.sub_sock("drivingEventRecorded", timeout=5000, conflate=False)
     managed_processes["loggerd"].start()
     try:
       assert pm.wait_for_readers_to_update("drivingEvent", timeout=5)
@@ -385,7 +385,21 @@ class TestLoggerd:
       assert received.drivingEventRecorded.markerWritten
       assert not received.drivingEventRecorded.currentSegmentPreserved
       assert "setxattr" in received.drivingEventRecorded.error
-      time.sleep(1.2)
+      corrected = messaging.recv_one(ack_sock)
+      assert corrected is not None
+      corrected_ack = corrected.drivingEventRecorded
+      assert corrected_ack.eventId == "loggerd-xattr-failure"
+      assert corrected_ack.markerWritten
+      assert corrected_ack.currentSegmentPreserved
+      assert corrected_ack.followingSegmentScheduled
+      assert corrected_ack.error == ""
+
+      msg.clear_write_flag()
+      pm.send("drivingEvent", msg)
+      duplicate_ack = messaging.recv_one(ack_sock)
+      assert duplicate_ack is not None
+      assert duplicate_ack.drivingEventRecorded.currentSegmentPreserved
+      assert duplicate_ack.drivingEventRecorded.error == ""
     finally:
       managed_processes["loggerd"].stop()
       os.environ.pop("LOGGERD_TEST_SETXATTR_FAILURES", None)
