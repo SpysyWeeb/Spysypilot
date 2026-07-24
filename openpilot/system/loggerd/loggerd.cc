@@ -31,6 +31,8 @@ struct RecordedDrivingEvent {
   bool current_segment_preserved;
   bool following_segment_scheduled;
   std::string error;
+  uint64_t segment_start_mono_time;
+  uint64_t ack_mono_time;
 };
 
 struct LoggerdState {
@@ -68,6 +70,9 @@ void publish_driving_event_recorded(PubMaster *pm, const RecordedDrivingEvent &r
   ack.setCurrentSegmentPreserved(recorded.current_segment_preserved);
   ack.setFollowingSegmentScheduled(recorded.following_segment_scheduled);
   ack.setError(recorded.error);
+  ack.setSegmentStartMonoTime(recorded.segment_start_mono_time);
+  ack.setAckMonoTime(recorded.ack_mono_time);
+  ack.setMarkerAccepted(recorded.marker_written);
   pm->send("drivingEventRecorded", msg);
 }
 
@@ -149,6 +154,7 @@ void retry_failed_preservations(LoggerdState *s, bool force = false) {
           if (recorded != s->recorded_events.end() && !recorded->second.current_segment_preserved) {
             recorded->second.current_segment_preserved = true;
             recorded->second.error.clear();
+            recorded->second.ack_mono_time = nanos_since_boot();
             publish_driving_event_recorded(s->event_pm, recorded->second);
           }
         }
@@ -491,6 +497,8 @@ void loggerd_thread() {
               .current_segment_preserved = current_preserved,
               .following_segment_scheduled = true,
               .error = preservation_error,
+              .segment_start_mono_time = s.logger.segmentStartMonoTime(),
+              .ack_mono_time = nanos_since_boot(),
             };
             publish_driving_event_recorded(&pm, recorded);
             if (!event_id.empty()) {
