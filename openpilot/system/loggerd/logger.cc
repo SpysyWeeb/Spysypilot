@@ -192,6 +192,7 @@ bool LoggerState::next() {
 
   // log init data & sentinel type.
   write(init_data.asBytes(), true);
+  segment_start_mono_time = nanos_since_boot();
   log_sentinel(this, part > 0 ? SentinelType::START_OF_SEGMENT : SentinelType::START_OF_ROUTE);
   return true;
 }

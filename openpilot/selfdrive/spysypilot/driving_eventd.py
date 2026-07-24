@@ -25,7 +25,7 @@ from openpilot.selfdrive.spysypilot.long_event_detector import (
 )
 
 
-EVENT_VERSION = 1
+EVENT_VERSION = 2
 GROUP_WINDOW_NS = 2_500_000_000
 CONTEXT_BEFORE = 2
 CONTEXT_AFTER = 1
@@ -47,6 +47,12 @@ class EventCandidate:
   driver_confounded: bool = False
   road_confounded: bool = False
   payload: Any | None = None
+  detector_evidence: Any | None = None
+  detected_mono_time: int = 0
+  episode_start_mono_time: int = 0
+  analysis_window_before_s: float = 0.0
+  analysis_window_after_s: float = 0.0
+  episode_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -71,11 +77,25 @@ class EventRecorder:
     self.group_window_ns = group_window_ns
     self._group_id = ""
     self._group_last_time = -group_window_ns
+    self._episode_groups: dict[str, tuple[str, int]] = {}
 
   def accept(self, candidate: EventCandidate) -> AcceptedEvent:
-    if not self._group_id or candidate.occurred_mono_time - self._group_last_time > self.group_window_ns:
+    if candidate.episode_key:
+      episode_group = self._episode_groups.get(candidate.episode_key)
+      if episode_group is None:
+        if not self._group_id or candidate.occurred_mono_time - self._group_last_time > self.group_window_ns:
+          self._group_id = self.id_factory()
+        self._episode_groups[candidate.episode_key] = (self._group_id, candidate.occurred_mono_time)
+      else:
+        self._group_id = episode_group[0]
+        self._episode_groups[candidate.episode_key] = (self._group_id, candidate.occurred_mono_time)
+    elif not self._group_id or candidate.occurred_mono_time - self._group_last_time > self.group_window_ns:
       self._group_id = self.id_factory()
     self._group_last_time = max(self._group_last_time, candidate.occurred_mono_time)
+    self._episode_groups = {
+      key: value for key, value in self._episode_groups.items()
+      if candidate.occurred_mono_time - value[1] <= 60_000_000_000
+    }
     return AcceptedEvent(self.id_factory(), self._group_id, candidate)
 
 
@@ -90,13 +110,23 @@ def manual_candidate(occurred_mono_time: int) -> EventCandidate:
     severity="info",
     confidence=1.0,
     reason="user marked a driving event",
+    detected_mono_time=occurred_mono_time,
+    episode_start_mono_time=occurred_mono_time,
+    analysis_window_before_s=15.0,
+    analysis_window_after_s=5.0,
   )
 
 
 def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> EventCandidate:
   attribution = "actuator" if detection.event_type == "torqueAuthority" else "controller"
+  evidence = detection.evidence
+  driver_confounded = evidence.driver_confounded_any if evidence is not None else sample.driver_confounded
+  road_confounded = evidence.road_confounded_any if evidence is not None else sample.road_confounded
+  if driver_confounded or road_confounded:
+    attribution = "mixed"
+  occurred_mono_time = round(sample.mono_time * 1e9)
   return EventCandidate(
-    occurred_mono_time=round(sample.mono_time * 1e9),
+    occurred_mono_time=occurred_mono_time,
     domain="lateral",
     source="automatic",
     event_type=f"lat.{detection.event_type}",
@@ -106,9 +136,15 @@ def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> Eve
     confidence=detection.confidence,
     reason=detection.reason,
     attribution=attribution,
-    driver_confounded=sample.driver_confounded,
-    road_confounded=sample.road_confounded,
+    driver_confounded=driver_confounded,
+    road_confounded=road_confounded,
     payload=sample,
+    detector_evidence=evidence,
+    detected_mono_time=occurred_mono_time,
+    episode_start_mono_time=round(evidence.episode_start_mono_time * 1e9) if evidence is not None else occurred_mono_time,
+    analysis_window_before_s=evidence.analysis_window_before_s if evidence is not None else 2.0,
+    analysis_window_after_s=evidence.analysis_window_after_s if evidence is not None else 2.0,
+    episode_key=evidence.episode_key if evidence is not None else "",
   )
 
 
@@ -116,13 +152,14 @@ def longitudinal_candidate(sample: LaunchSample, event: LongEvent) -> EventCandi
   names = {
     "late_lead_launch_planner": ("long.lateLeadLaunchPlanner", "planner"),
     "late_lead_launch_controller": ("long.lateLeadLaunchController", "controller"),
-    "late_lead_launch_vehicle": ("long.lateLeadLaunchVehicle", "vehicle"),
+    "late_lead_launch_vehicle": ("long.lateLeadLaunchVehicle", "mixed"),
     "lead_launch_stall": ("long.leadLaunchStall", "unknown"),
   }
   event_type, attribution = names[event.event_type]
   severity = "critical" if event.severity >= 3 else ("warning" if event.severity else "info")
+  occurred_mono_time = round(sample.t * 1e9)
   return EventCandidate(
-    occurred_mono_time=round(sample.t * 1e9),
+    occurred_mono_time=occurred_mono_time,
     domain="longitudinal",
     source="automatic",
     event_type=event_type,
@@ -133,6 +170,11 @@ def longitudinal_candidate(sample: LaunchSample, event: LongEvent) -> EventCandi
     reason=event.detail,
     attribution=attribution,
     payload=event,
+    detected_mono_time=occurred_mono_time,
+    episode_start_mono_time=round(event.episode_start_mono_time * 1e9) if event.episode_start_mono_time else occurred_mono_time,
+    analysis_window_before_s=event.analysis_window_before_s,
+    analysis_window_after_s=event.analysis_window_after_s,
+    episode_key=f"long:{round(event.episode_start_mono_time * 1e9)}" if event.episode_start_mono_time else "",
   )
 
 
@@ -204,9 +246,15 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
   out.requestedContextAfter = CONTEXT_AFTER
   out.gitCommit = git_commit
   out.gitBranch = git_branch
+  out.detectedMonoTime = candidate.detected_mono_time or candidate.occurred_mono_time
+  out.episodeStartMonoTime = candidate.episode_start_mono_time or candidate.occurred_mono_time
+  out.analysisWindowBeforeS = candidate.analysis_window_before_s
+  out.analysisWindowAfterS = candidate.analysis_window_after_s
+  out.episodeKey = candidate.episode_key
 
   if candidate.domain == "lateral":
     sample: LateralSample = candidate.payload
+    evidence = candidate.detector_evidence
     payload = out.payload.init("lateral")
     payload.controllerVersion = sample.controller_version
     payload.referenceVersion = sample.reference_version
@@ -226,6 +274,30 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
     payload.unwindSameEpisode = sample.unwind_same_episode
     payload.appliedTargetGap = sample.applied_target_gap
     payload.pTerm = sample.p_term
+    payload.driverTorque = sample.driver_torque
+    payload.steeringPressed = sample.steering_pressed
+    payload.steeringTorqueEps = sample.steering_torque_eps
+    payload.dampingApplied = sample.damping_applied
+    payload.dampingState = sample.damping_state
+    payload.triggerDriverConfounded = sample.driver_confounded
+    payload.triggerRoadConfounded = sample.road_confounded
+    if evidence is not None:
+      payload.driverConfoundedFraction = evidence.driver_confounded_fraction
+      payload.maxAbsDriverTorque = evidence.max_abs_driver_torque
+      payload.steeringPressedAny = evidence.steering_pressed_any
+      payload.roadConfoundedFraction = evidence.road_confounded_fraction
+      payload.driverConfoundReason = evidence.driver_confound_reason
+      payload.evidenceStartMonoTime = round(evidence.evidence_start_mono_time * 1e9)
+      payload.evidenceEndMonoTime = round(evidence.evidence_end_mono_time * 1e9)
+      payload.stallReleaseCount = evidence.stall_release_count
+      payload.releaseOffsetsS = list(evidence.release_offsets_s)
+      payload.stallDurationsS = list(evidence.stall_durations_s)
+      payload.releasePeakRatesDeg = list(evidence.release_peak_rates_deg)
+      payload.stallEpisodePhase = evidence.stall_episode_phase
+      payload.lateUnwindDurationS = evidence.late_unwind_duration_s
+      payload.previousUnwindEffectivePhase = evidence.previous_unwind_effective_phase
+      payload.previousUnwindSameEpisode = evidence.previous_unwind_same_episode
+      payload.trackingInactiveTimeS = evidence.tracking_inactive_time_s
   elif candidate.domain == "longitudinal":
     long_event: LongEvent = candidate.payload
     payload = out.payload.init("leadLaunch")
@@ -236,6 +308,18 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
     payload.commandToEgoS = long_event.command_to_ego_s
     payload.radarDiscontinuity = long_event.radar_discontinuity
     payload.radarConfidence = long_event.confidence
+    payload.attributionDetail = long_event.attribution_detail
+    onsets = payload.init("onsets", len(long_event.onsets))
+    for index, onset in enumerate(long_event.onsets):
+      onsets[index].kind = onset.kind
+      onsets[index].monoTime = round(onset.t * 1e9)
+      onsets[index].dRel = onset.d_rel
+      onsets[index].vLead = onset.v_lead
+      onsets[index].vEgo = onset.v_ego
+      onsets[index].aEgo = onset.a_ego
+      onsets[index].outputAccel = onset.output_accel
+      onsets[index].brakePressed = onset.brake_pressed
+      onsets[index].brakeHoldActive = onset.brake_hold_active
   else:
     out.payload.none = None
   return msg
@@ -307,6 +391,9 @@ def longitudinal_sample(sm: messaging.SubMaster) -> LaunchSample:
     output_accel=float(sm["carOutput"].actuatorsOutput.accel),
     forecast_valid=forecast_valid,
     predicted_lead_v_2s=predicted_lead_v_2s,
+    a_ego=float(getattr(sm["carState"], "aEgo", 0.0)),
+    brake_pressed=bool(getattr(sm["carState"], "brakePressed", False)),
+    brake_hold_active=bool(getattr(sm["carState"], "brakeHoldActive", False)),
   )
 
 
@@ -318,6 +405,11 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
   now = sm.logMonoTime["controlsState"] * 1e-9 if sm.logMonoTime["controlsState"] else time.monotonic()
   angle = float(car_state.steeringAngleDeg)
   road_confounded = sm.valid["livePose"] and bump_classifier.update(float(sm["livePose"].accelerationDevice.z), now)
+  damping_applied = float(torque_state.d) if torque_state is not None else 0.0
+  damping_state = (
+    "blocked" if torque_state is not None and torque_state.dampingTurnInBlocked
+    else ("applied" if abs(damping_applied) > 1e-6 else "inactive")
+  )
   return LateralSample(
     mono_time=now,
     active=bool(torque_state is not None and torque_state.active and sm["carControl"].latActive),
@@ -331,6 +423,9 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     request_torque=float(sm["carControl"].actuators.torque),
     applied_torque=float(sm["carOutput"].actuatorsOutput.torque),
     p_term=float(torque_state.p) if torque_state is not None else 0.0,
+    steering_torque_eps=float(car_state.steeringTorqueEps),
+    damping_applied=damping_applied,
+    damping_state=damping_state,
     controller_version=int(torque_state.version) if torque_state is not None else 0,
     reference_version=int(torque_state.referenceVersion) if torque_state is not None else 0,
     reference_rate=float(torque_state.referenceRate) if torque_state is not None else 0.0,
