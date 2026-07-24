@@ -17,3 +17,7 @@ Every process crash already flows through `sentry.capture_exception()`. This bra
 - `openpilot/system/sentry.py` — `save_exception()` writes every captured crash to `/data/community/crashes/error.log` (newest first, 100 KB cap); hooked into `capture_exception()`.
 - `openpilot/selfdrive/ui/layouts/settings/developer.py` — "Error Log" button that renders the log in a modal and offers deletion on close.
 - `openpilot/system/ui/widgets/html_render.py` — `HtmlModal` gained an `on_close` callback so the viewer can chain the delete prompt.
+
+## Cross-branch note
+
+[`side-buttons`](https://github.com/SpysyWeeb/Spysypilot/tree/side-buttons) ships a home-screen shortcut to this viewer and carries the same `HtmlModal` `on_close` change (identical patch, no conflict on merge). This branch is fully standalone; side-buttons' error-log button only shows useful content when this branch's crash-writing hook is also present (as it is in combo).
