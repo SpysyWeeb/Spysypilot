@@ -15,9 +15,9 @@ segment, and publishes `drivingEventRecorded`. The UI listens only to this
 acknowledgment. Success requires both marker acceptance and current-segment
 preservation; failures remain visible and preservation paths remain retryable.
 
-The old `userBookmark` and `lateralEvent` schemas and source files remain available
-for old-route decoding and rollback, but the active event runtime no longer uses
-them. Audio feedback may still emit a generic legacy bookmark.
+The old `userBookmark` and `lateralEvent` schemas remain solely for decoding old
+routes. Their logger processes, indexers, and UI renderer have been removed. Audio
+feedback may still emit a generic legacy bookmark.
 
 ## Off-road index
 
