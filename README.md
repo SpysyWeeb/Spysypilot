@@ -283,14 +283,21 @@ Replay on the locally available full rlogs currently gives:
 - route 25 near 104, 493, and 670 seconds: three warning `releaseSnap` events;
 - four automated post-fix stops on route 8d: three remain silent, while the
   stop near 428 seconds produces one lower-confidence borderline warning.
+- route 92 (`00000092--c82a9cefa7`): 21 standstill transitions contain nine
+  valid openpilot-controlled stop episodes. Seven remain silent. Two
+  unconfounded lower-confidence `releaseSnap` warnings occur at route offsets
+  2349.14 seconds (segment 39 + 9.14 seconds, IMU +3.40 m/s³ and aEgo
+  +0.95 m/s³, controller-attributed) and 2809.18 seconds (segment 46 +
+  49.18 seconds, IMU +3.26 m/s³ and aEgo +0.75 m/s³, mixed attribution).
 
 The complete requested population cannot yet be claimed: route 3c near 1343
 seconds and route 38 near 972 seconds are no longer present on the device,
 local disk, or the route listing returned for this dongle, and the post-fix
-route-8d stops do not carry human good/bad labels. The thresholds therefore
-remain provisional pending those archived route identifiers and manual review
-of the borderline route-8d event. Field validation is also still required
-before the detector can be considered complete.
+route-8d and route-92 stops do not carry human good/bad labels. The thresholds
+therefore remain provisional pending those archived route identifiers and
+manual review of the borderline route-8d event and the two route-92 warnings.
+Field validation is also still required before the detector can be considered
+complete.
 
 ## Data model and compatibility
 
