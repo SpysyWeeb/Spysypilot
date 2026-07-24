@@ -231,8 +231,7 @@ class AugmentedRoadView(CameraView):
     self._hud_renderer.set_can_draw_top_icons(alert_to_render is None)
     self._hud_renderer.set_wheel_critical_icon(alert_to_render is not None and not not_animating_out and
                                                alert_to_render.visual_alert == car.CarControl.HUDControl.VisualAlert.steerRequired)
-    critical_alert = alert_to_render is not None and alert_to_render.status == log.SelfdriveState.AlertStatus.critical
-    self._driving_event_notification.render(self._content_rect, critical_alert)
+    self._driving_event_notification.render(self._content_rect, alert_to_render is not None)
     self._alert_renderer.render(self._content_rect)
     self._hud_renderer.render(self._content_rect)
 
