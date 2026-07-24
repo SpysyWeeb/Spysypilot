@@ -78,7 +78,7 @@ class TestDeleter(UploaderTestCase):
       self.make_file_with_data(self.seg_format.format(2), self.f_type),
     ] + [
       self.make_file_with_data(self.seg_format2.format(i), self.f_type, preserve_xattr=deleter.PRESERVE_ATTR_VALUE)
-      for i in range(5)
+      for i in range(deleter.PRESERVE_COUNT)
     ])
 
   def test_delete_last(self):
