@@ -1,6 +1,4 @@
-import json
-
-from openpilot.selfdrive.controls.lat_eventd import LateralEventDetector, LateralEventStore, LateralSample
+from openpilot.selfdrive.spysypilot.lat_event_detector import LateralEventDetector, LateralSample
 
 
 def sample(t: float, **kwargs) -> LateralSample:
@@ -103,9 +101,29 @@ def test_cooldown_suppresses_repeated_events():
   assert second is None
 
 
-def test_store_writes_and_rotates(tmp_path):
-  store = LateralEventStore(tmp_path, max_bytes=10)
-  store.write({"event": 1})
-  store.write({"event": 2})
-  assert store.path.with_suffix(".jsonl.1").exists()
-  assert json.loads(store.path.read_text()) == {"event": 2}
+def test_different_event_types_do_not_share_a_cooldown():
+  detector = LateralEventDetector(cooldown=8.0)
+  first = detector.update(sample(
+    1.0,
+    steering_angle_deg=5.0,
+    steering_rate_deg=150.0,
+    unwind_effective_phase=0.8,
+    unwind_overspeed=0.5,
+    applied_torque=0.5,
+  ))
+  detector.update(sample(
+    1.01,
+    unwind_effective_phase=1.0,
+    applied_torque=-0.7,
+    reference_target_torque=-0.7,
+  ))
+  second = detector.update(sample(
+    1.02,
+    unwind_effective_phase=0.0,
+    unwind_same_episode=False,
+    steering_rate_deg=80.0,
+    applied_torque=-0.6,
+    reference_target_torque=0.2,
+  ))
+  assert first is not None and first.event_type == "centerOvershoot"
+  assert second is not None and second.event_type == "handoffMismatch"
