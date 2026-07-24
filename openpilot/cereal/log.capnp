@@ -957,6 +957,10 @@ struct ControlsState @0x97ff69c53601abf1 {
     handoffOldDirectionLimit @77 :Float32;                # allowed old-turn component beyond crown-neutral
     handoffTorqueCapScale @78 :Float32;                   # smooth post-commit ramp from zero to full cap
     handoffTorqueCorrection @79 :Float32;                 # signed normalized correction applied by the cap
+    highAngleUnwindScale @80 :Float32;                    # persisted low-speed/high-angle exit urgency
+    torqueCommandBeforeHighAngleExit @81 :Float32;        # normalized request after legacy unwind blend, before exit urgency
+    highAngleUnwindOldTorqueCorrection @82 :Float32;      # signed correction removing old-turn torque toward crown-neutral
+    highAngleUnwindOldDirectionTorque @83 :Float32;       # pre-cap old-turn component beyond crown-neutral
    }
 
   struct LateralAngleState {

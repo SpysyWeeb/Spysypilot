@@ -10,6 +10,15 @@ Companion longitudinal branch: [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/
 place, but BLaT remains in field validation. It is not considered done until
 the behavior has been tested on the car and explicitly signed off.
 
+Active tuning work:
+
+- **In progress:** add angle-scaled exit urgency for low-speed, high-angle
+  unwinds. Route `00000093--3198e2f719` showed that the future unwind was
+  recognized before peak steering angle, but old-turn torque remained for
+  roughly 1.2–1.4 seconds before crossing crown-neutral. The change must remove
+  stale holding torque earlier without raising the existing torque or safety
+  limits, and remains subject to replay and field validation.
+
 ## What it does
 
 BLaT makes steering smooth without making it uniformly slow. It combines the
@@ -28,6 +37,8 @@ The controller:
   limiter before the path needs it;
 - starts and hands off unwind episodes using future geometry, crown-neutral
   torque, wheel rate, and applied-torque delivery state;
+- adds angle-scaled exit urgency when a same-episode, low-speed unwind is
+  confirmed, removing stale old-turn torque without crossing crown-neutral;
 - preserves turn-in authority when the wheel is still behind the planned path;
 - records versioned controller diagnostics in `LateralTorqueState` for rlog
   analysis.
@@ -89,6 +100,10 @@ lateral-acceleration space:
   moving more low-speed work into the rate loop;
 - applied torque is treated as actuator state and only opposes torque that is
   still driving a wheel already outrunning the planned path;
+- during a confirmed high-angle unwind below 20 mph, a short persistence gate
+  progressively removes old-direction command in proportion to steering angle,
+  unwind rate, and sustained future-path evidence; it cannot add
+  opposite-direction torque or move the command past crown-neutral;
 - after the future horizon confirms a new maneuver for 200 ms, a crown-aware
   handoff cap progressively removes only controller command that still points
   into the old episode beyond the reachable target.
@@ -111,6 +126,13 @@ for a new turn. Once that commitment is confirmed, the old-direction cap ramps
 in over 150 ms and can only subtract stale command; command already braking or
 steering into the new maneuver is left unchanged. Driver steering immediately
 resets the unwind state.
+
+Before a direction handoff, high-angle exit urgency can act within the current
+episode when the wheel and future reference both show a sustained unwind. It
+starts above 120 degrees of old-turn steering angle, scales with angle and
+unwind rate, is limited to low speed, and freezes integral growth while active.
+Brief evidence dropout is tolerated to avoid command chatter, while loss of
+lateral control, driver input, or unwind ownership resets it immediately.
 
 ### 4. Hyundai EPS damping and panda safety
 
@@ -177,7 +199,7 @@ Current diagnostic versions:
 | layer | version | examples |
 |---|---:|---|
 | future reference planner | 5 | base/output curvature, preview timing, reachable/geometric/episode torque, unwind confidence |
-| torque controller | 15 | delayed curvature, trajectory/measured rate, cascade terms, unwind ownership, committed-handoff cap |
+| torque controller | 16 | delayed curvature, trajectory/measured rate, cascade terms, unwind ownership, high-angle exit urgency, committed-handoff cap |
 | Hyundai EPS damping | 3 | requested/applied damping, gate state, signed wheel rate, breakaway stall and relief state |
 
 The universal driving-event logger remains separate infrastructure. BLaT
@@ -185,21 +207,30 @@ supplies the behavior and diagnostics that it observes.
 
 ## Validation
 
-Focused tests were rerun against the committed-handoff and EPS-breakaway
-implementation with opendbc pin `8876af47`:
+Focused tests were rerun against the high-angle unwind exit,
+committed-handoff, and EPS-breakaway implementation with opendbc pin
+`8876af47`:
 
 | suite | result |
 |---|---:|
-| delayed-feedback, reference-rate, actuator, unwind, and handoff controller tests | 55 passed |
+| delayed-feedback, reference-rate, actuator, unwind, and handoff controller tests | 70 passed |
 | future-reference planner tests | 34 passed |
 | Hyundai low-speed torque damping and breakaway tests | 20 passed |
-| Hyundai panda safety tests | 342 passed, 55 skipped by suite configuration |
-| **total passing** | **451 passed** |
+| Hyundai panda safety tests | 1215 passed, 313 skipped by suite configuration |
+| **total passing** | **1339 passed** |
 
 The suites cover symmetry, bounds, speed schedules, invalid-model fallback,
 torque reachability, crown-neutral transitions, episode handoff, driver
 override, under-tracked turn-in protection, post-stall relief, stale-direction
-handoff limiting, command/safety rate limits, and diagnostic schema exposure.
+handoff limiting, one-sided high-angle unwind limiting, command/safety rate
+limits, and diagnostic schema exposure.
+
+An open-loop command-path replay of route `00000093--3198e2f719` modeled
+crown-neutral crossings about 0.71 seconds earlier near 12:36:39 and 0.95
+seconds earlier near 12:41:16. The cap remained one-sided in all three inspected
+windows, including the weaker 12:38:30 event. This replay verifies controller
+direction and gating against the logged inputs; it does not predict closed-loop
+vehicle response and must be followed by a field test.
 
 Automated tests are not a substitute for route analysis and field testing of
 steering feel.
