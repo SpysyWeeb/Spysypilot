@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from openpilot.selfdrive.spysypilot.driving_eventd import (
   AcceptedEvent,
   DrivingEventPlatform,
@@ -7,11 +9,14 @@ from openpilot.selfdrive.spysypilot.driving_eventd import (
   EventCandidate,
   EventRecorder,
   build_message,
+  live_pose_sample,
   longitudinal_sample,
   manual_candidate,
+  stop_jolt_candidate,
 )
 from openpilot.selfdrive.spysypilot.lat_event_detector import LateralDetection, LateralSample
 from openpilot.selfdrive.spysypilot.long_event_detector import LaunchSample, LongEvent
+from openpilot.selfdrive.spysypilot.stop_jolt_detector import StopJoltCarSample, StopJoltEvent, StopJoltImuSample
 
 
 def launch_sample(t: float = 1.0) -> LaunchSample:
@@ -29,6 +34,77 @@ class FixedDetector:
     if self.error is not None:
       raise self.error
     return self.result
+
+
+class FixedStopDetector:
+  def __init__(self, result=None, car_error: Exception | None = None, imu_error: Exception | None = None):
+    self.result = result
+    self.car_error = car_error
+    self.imu_error = imu_error
+    self.car_calls = 0
+    self.imu_calls = 0
+
+  def update_car(self, _sample):
+    self.car_calls += 1
+    if self.car_error is not None:
+      raise self.car_error
+    return self.result
+
+  def update_imu(self, _sample):
+    self.imu_calls += 1
+    if self.imu_error is not None:
+      raise self.imu_error
+
+
+def stop_car_sample(t: float = 2.0) -> StopJoltCarSample:
+  return StopJoltCarSample(
+    t, True, True, True, 0.0, -1.0, True, False, False, True,
+    -0.5, -0.6, -0.7, "stopping", True, 4.0, 0.0, True,
+  )
+
+
+def stop_event() -> StopJoltEvent:
+  return StopJoltEvent(
+    classification="grabAndRebound",
+    severity="warning",
+    confidence=0.91,
+    reason="bad landing",
+    attribution="mixed",
+    episode_start_mono_time=1.0,
+    standstill_mono_time=2.0,
+    peak_jolt_mono_time=1.8,
+    detection_mono_time=2.45,
+    imu_jerk=-3.5,
+    a_ego_jerk=-3.0,
+    imu_accel_before=-0.2,
+    imu_accel_after=-1.0,
+    a_ego_accel_before=-0.3,
+    a_ego_accel_after=-1.1,
+    accel_change=-0.8,
+    accel_at_02_mps=-0.9,
+    v_ego_at_peak=0.15,
+    plan_a_target=-0.5,
+    requested_accel=-0.6,
+    applied_accel=-0.7,
+    plan_accel_change=0.1,
+    requested_accel_change=0.2,
+    applied_accel_change=0.3,
+    should_stop_before=True,
+    should_stop_at_peak=True,
+    should_stop_after=True,
+    long_control_state_before="stopping",
+    long_control_state_at_peak="stopping",
+    long_control_state_after="pid",
+    lead_present=True,
+    d_rel=4.0,
+    v_lead_k=0.0,
+    brake_pressed=False,
+    gas_pressed=False,
+    brake_hold_active=True,
+    radar_valid=True,
+    imu_valid=True,
+    road_confounded=False,
+  )
 
 
 def test_unique_ids_and_group_correlation():
@@ -96,6 +172,40 @@ def test_detector_exception_isolation():
   events = platform.update(LateralSample(1.0), launch_sample())
   assert errors == ["lateral"]
   assert [event.candidate.domain for event in events] == ["longitudinal"]
+
+
+def test_lead_launch_and_stop_jolt_failure_isolation():
+  errors = []
+  stop_detector = FixedStopDetector(stop_event())
+  platform = DrivingEventPlatform(
+    recorder=EventRecorder(iter(("group", "stop")).__next__),
+    lateral_detector=FixedDetector(),
+    longitudinal_detector=FixedDetector(error=RuntimeError("lead broken")),
+    stop_jolt_detector=stop_detector,
+    on_error=errors.append,
+  )
+  events = platform.update(
+    longitudinal_sample=launch_sample(),
+    stop_car_sample=stop_car_sample(),
+    stop_imu_sample=StopJoltImuSample(2.0, -1.0, True),
+  )
+  assert errors == ["longitudinal"]
+  assert stop_detector.imu_calls == 1
+  assert [event.candidate.event_type for event in events] == ["long.stopJolt"]
+
+  errors.clear()
+  platform = DrivingEventPlatform(
+    recorder=EventRecorder(iter(("group", "lead")).__next__),
+    lateral_detector=FixedDetector(),
+    longitudinal_detector=FixedDetector(LongEvent(
+      "late_lead_launch_controller", "long reason", 1, 0.95,
+    )),
+    stop_jolt_detector=FixedStopDetector(car_error=RuntimeError("stop broken")),
+    on_error=errors.append,
+  )
+  events = platform.update(longitudinal_sample=launch_sample(), stop_car_sample=stop_car_sample())
+  assert errors == ["stop_jolt"]
+  assert [event.candidate.event_type for event in events] == ["long.lateLeadLaunchController"]
 
 
 def test_manual_input_does_not_suppress_or_replace_detector_output():
@@ -186,12 +296,67 @@ def test_generic_domain_message_has_typed_empty_payload():
   assert msg.drivingEvent.payload.which() == "none"
 
 
-def test_longitudinal_sampler_uses_fork_radar_status_field():
+def test_stop_jolt_schema_round_trip_preserves_peak_and_detection_times():
+  candidate = stop_jolt_candidate(stop_event())
+  msg = build_message(AcceptedEvent("stop-event", "stop-group", candidate)).as_reader().drivingEvent
+  assert msg.eventType == "long.stopJolt"
+  assert msg.detector == "smoothStopJoltDetector"
+  assert msg.detectorVersion == 1
+  assert msg.occurredMonoTime == 1_800_000_000
+  assert msg.detectedMonoTime == 2_450_000_000
+  assert msg.episodeKey == "stop:1000000000"
+  assert msg.analysisWindowBeforeS == 5.0
+  assert msg.analysisWindowAfterS == 2.0
+  assert msg.payload.which() == "stopJolt"
+  payload = msg.payload.stopJolt
+  assert payload.peakJoltMonoTime == msg.occurredMonoTime
+  assert payload.detectionMonoTime == msg.detectedMonoTime
+  assert payload.classification == "grabAndRebound"
+  assert payload.imuJerk == pytest.approx(-3.5)
+  assert payload.aEgoJerk == pytest.approx(-3.0)
+  assert payload.shouldStopBefore and payload.shouldStopAtPeak and payload.shouldStopAfter
+  assert payload.longControlStateAfter == "pid"
+
+
+def test_live_pose_sampler_uses_its_own_timestamp_and_updates_bump_once():
+  class CountingBumpClassifier:
+    def __init__(self):
+      self.calls = []
+
+    def update(self, z_accel, now):
+      self.calls.append((z_accel, now))
+      return True
+
+  class FakeSubMaster:
+    def __init__(self):
+      self.data = {
+        "livePose": SimpleNamespace(
+          accelerationDevice=SimpleNamespace(x=-0.8, z=9.9, valid=True),
+          inputsOK=True,
+          sensorsOK=True,
+        ),
+      }
+      self.valid = {"livePose": True}
+      self.logMonoTime = {"livePose": 2_500_000_000, "carState": 9_000_000_000}
+
+    def __getitem__(self, name):
+      return self.data[name]
+
+  bump_classifier = CountingBumpClassifier()
+  sample = live_pose_sample(FakeSubMaster(), bump_classifier)
+  assert sample.t == 2.5
+  assert sample.accel_x == -0.8
+  assert sample.valid
+  assert sample.road_confounded
+  assert bump_classifier.calls == [(9.9, 2.5)]
+
+
+def test_longitudinal_sampler_uses_radar_present_field():
   class FakeSubMaster:
     def __init__(self):
       self.data = {
         "radarState": SimpleNamespace(leadOne=SimpleNamespace(
-          status=True, dRel=5.0, vLead=1.0, vLeadK=1.0, radarTrackId=7,
+          present=True, dRel=5.0, vLead=1.0, vLeadK=1.0, radarTrackId=7,
         )),
         "modelV2": SimpleNamespace(leadsV3=[]),
         "carState": SimpleNamespace(standstill=True, vEgo=0.0),

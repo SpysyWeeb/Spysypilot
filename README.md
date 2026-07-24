@@ -18,6 +18,12 @@ must not be considered done until its event detection, segment preservation,
 off-road indexing, and review workflow have been verified on the device and
 explicitly signed off.
 
+🚧 **Automatic bad-stop detection is in progress.** The provisional
+`long.stopJolt` detector, typed evidence, manifest serialization, and focused
+tests are implemented on this branch. Its thresholds still require the
+documented replay comparison and on-device field validation before this work
+can be signed off.
+
 ## What it does
 
 This branch is Spysypilot's shared evidence logger for driving behavior worth
@@ -41,6 +47,7 @@ manifest, or directly notify another orchestrator.
 | Manual sidebar flag | `manual.general` | Mark any moment the driver wants reviewed |
 | BLaT lateral detector | `lat.stallRelease`, `lat.lateUnwind`, `lat.handoffMismatch`, `lat.centerOvershoot`, `lat.torqueAuthority` | Capture known steering failure shapes and their controller/actuator evidence |
 | Lead-launch detector | `long.lateLeadLaunchPlanner`, `long.lateLeadLaunchController`, `long.lateLeadLaunchVehicle`, `long.leadLaunchStall` | Capture a delayed launch and attribute where the response chain lagged |
+| Smooth-stop jolt detector | `long.stopJolt` | Capture an abrupt brake grab or brake-release rebound during the final low-speed landing |
 
 Lateral detections include controller/reference versions, planned and measured
 lateral acceleration, requested/applied/reference torque, steering rate,
@@ -48,6 +55,11 @@ driver input, road-bump confounders, unwind state, and event-specific evidence.
 Lead-launch detections retain candidate, model forecast, plan, command, lead,
 ego-motion, and ego-acceleration onset snapshots together with radar quality,
 brake state, and timing between stages.
+Stop-jolt detections retain the stop episode, standstill, peak, and detection
+times; filtered IMU and wheel-speed-estimator jerk; before/after acceleration;
+plan/request/applied acceleration snapshots and changes; longitudinal state;
+lead state; driver inputs; and IMU, radar, brake-hold, and road-confounder
+validity.
 
 ## How it works
 
@@ -55,7 +67,10 @@ brake state, and timing between stages.
 
 `openpilot/selfdrive/spysypilot/driving_eventd.py` runs on-road for a real car.
 It advances lateral detection only when `controlsState` updates and
-longitudinal detection only when `carState` updates. A manual
+longitudinal detectors only when `carState` updates. The stop-jolt car side
+runs with the 100 Hz `carState` stream. Its IMU side advances only on an
+actual 20 Hz `livePose` update, uses `livePose`'s own monotonic timestamp, and
+never differentiates duplicated held samples. A manual
 `bookmarkButton` update creates only the manual event at the button message's
 monotonic timestamp.
 
@@ -70,8 +85,10 @@ Each accepted event receives:
 
 Nearby generic events share a group for 2.5 seconds. Detector-defined episode
 keys keep lateral maneuvers and lead launches grouped even when the underlying
-episode lasts longer. Detector failures are isolated by domain so a lateral
-exception cannot disable longitudinal or manual logging.
+episode lasts longer; each stop uses its approach start as its episode key.
+The lateral, lead-launch, stop-jolt IMU, and stop-jolt car paths have separate
+exception boundaries, so a failure in one detector cannot disable the others
+or manual logging.
 
 Accepted events remain in memory and are retried once per second with the same
 event and group IDs until `loggerd` acknowledges them. `driving_eventd` does
@@ -223,6 +240,58 @@ No ego movement for three seconds after confirmed lead movement becomes a
 launch-stall event. Radar distance jumps or track-ID changes lower confidence
 without hiding the event.
 
+### Smooth-stop jolt detector, version 1
+
+The pure `smoothStopJoltDetector` is observer-only and independent from the
+lead-launch detector. It arms only when openpilot longitudinal control is
+active, `longitudinalPlan.shouldStop` is true, required messages are valid,
+the driver is not pressing either pedal, and an approach from above 0.5 m/s
+crosses below 1.5 m/s. Hard braking before that low-speed landing is excluded.
+
+Standstill must persist for about 0.2 seconds at `standstill` or no more than
+0.05 m/s. The detector then observes another 0.45 seconds to retain both the
+brake grab and brake-release rebound. A creeping queue therefore remains open
+until the car actually stops. It emits at most one event and cannot re-arm
+until longitudinal control resets or the vehicle moves above 1 m/s.
+
+Both `carState.aEgo` and `livePose.accelerationDevice.x` are kept in short ring
+buffers, smoothed over 0.3 seconds, and converted to jerk with a rolling
+0.25-second slope using actual timestamps. A warning normally requires
+same-sign IMU and aEgo peaks within 0.30 seconds, at least 3.0 and
+2.5 m/s³ respectively, plus a meaningful acceleration change. A stricter
+aEgo-only fallback is permitted when IMU data is unavailable; a wheel-speed
+spike with valid but nonconfirming IMU data remains silent.
+
+Replay also identified an IMU-dominant release shape in which the device sees
+at least 3.0 m/s³ at standstill and the filtered aEgo estimate follows about
+0.2 seconds later with a smaller sustained change. That narrowly scoped path
+requires IMU confirmation, at least 0.5 m/s² of IMU acceleration change, and
+at least 0.75 m/s³ plus 0.17 m/s² on aEgo; it is recorded at lower confidence.
+
+Ordinary warning-level evidence overlapping the existing vertical-acceleration
+bump classifier is suppressed. Severe evidence may still be recorded with
+`roadConfounded=true` and reduced confidence. Any brake or gas intervention
+during the landing blocks classification as a Smooth Stops failure. The
+actual retained jolt peak is `occurredMonoTime`; finalization roughly
+0.45 seconds later is `detectedMonoTime`. Requested review context is five
+seconds before and two seconds after the peak.
+
+Replay on the locally available full rlogs currently gives:
+
+- route 22 segment 18: one critical `releaseSnap`, at the retained peak before
+  delayed finalization;
+- route 25 near 104, 493, and 670 seconds: three warning `releaseSnap` events;
+- four automated post-fix stops on route 8d: three remain silent, while the
+  stop near 428 seconds produces one lower-confidence borderline warning.
+
+The complete requested population cannot yet be claimed: route 3c near 1343
+seconds and route 38 near 972 seconds are no longer present on the device,
+local disk, or the route listing returned for this dongle, and the post-fix
+route-8d stops do not carry human good/bad labels. The thresholds therefore
+remain provisional pending those archived route identifiers and manual review
+of the borderline route-8d event. Field validation is also still required
+before the detector can be considered complete.
+
 ## Data model and compatibility
 
 `openpilot/cereal/log.capnp` defines:
@@ -243,6 +312,7 @@ Current versions:
 | universal event envelope | 2 |
 | lateral detector | 3 |
 | lead-launch detector | 2 |
+| smooth-stop jolt detector | 1 |
 
 ## Main implementation files
 
@@ -252,6 +322,8 @@ Current versions:
   detector and signal conditioning.
 - `openpilot/selfdrive/spysypilot/long_event_detector.py` — pure lead-launch
   detector and attribution.
+- `openpilot/selfdrive/spysypilot/stop_jolt_detector.py` — pure low-speed
+  stop-landing detector and typed evidence extraction.
 - `openpilot/system/loggerd/loggerd.cc` — authoritative event write,
   deduplication, preservation, retry, and acknowledgment.
 - `openpilot/selfdrive/spysypilot/driving_event_indexer.py` — completed-rlog
@@ -285,9 +357,9 @@ Current boundaries to account for during validation:
 - indexing waits until the device is off-road and the full rlog is complete;
 - the platform has no built-in review UI, manifest uploader, or orchestrator
   notification transport;
-- the current branch has one stale unit-test fixture that still supplies the
-  retired radar lead field `status`; runtime code follows the current
-  `present` schema.
+- stop-jolt thresholds are provisional until the unavailable route-3c and
+  route-38 rlogs and explicitly labeled good post-fix stops can complete the
+  two-population replay comparison.
 
 Automated tests are not a substitute for verifying real event timing,
 preservation, manifest contents, and reviewability on the device.

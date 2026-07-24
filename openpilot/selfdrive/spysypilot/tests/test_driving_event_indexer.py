@@ -32,6 +32,45 @@ def event_message(event_id="event", group_id="group", occurred=102_500_000_000,
   return msg.as_reader()
 
 
+def stop_jolt_message(event_id="stop-event", group_id="stop-group", occurred=102_250_000_000):
+  msg = build_message(AcceptedEvent(event_id, group_id, manual_candidate(occurred)))
+  msg.logMonoTime = occurred + 500_000_000
+  event = msg.drivingEvent
+  event.domain = "longitudinal"
+  event.source = "automatic"
+  event.eventType = "long.stopJolt"
+  event.detector = "smoothStopJoltDetector"
+  event.detectorVersion = 1
+  event.severity = "warning"
+  event.confidence = 0.9
+  event.attribution = "mixed"
+  event.detectedMonoTime = occurred + 500_000_000
+  event.episodeStartMonoTime = occurred - 1_000_000_000
+  event.episodeKey = f"stop:{occurred - 1_000_000_000}"
+  event.analysisWindowBeforeS = 5.0
+  event.analysisWindowAfterS = 2.0
+  payload = event.payload.init("stopJolt")
+  payload.episodeStartMonoTime = event.episodeStartMonoTime
+  payload.standstillMonoTime = occurred + 200_000_000
+  payload.peakJoltMonoTime = occurred
+  payload.detectionMonoTime = event.detectedMonoTime
+  payload.imuJerk = -3.5
+  payload.absImuJerk = 3.5
+  payload.aEgoJerk = -3.0
+  payload.absAEgoJerk = 3.0
+  payload.accelChange = -0.8
+  payload.vEgoAtPeak = 0.15
+  payload.shouldStopBefore = True
+  payload.shouldStopAtPeak = True
+  payload.shouldStopAfter = True
+  payload.longControlStateBefore = "stopping"
+  payload.longControlStateAtPeak = "stopping"
+  payload.longControlStateAfter = "pid"
+  payload.imuValid = True
+  payload.classification = "brakeGrab"
+  return msg.as_reader()
+
+
 def ack_message(event_id="event", group_id="group", occurred=102_500_000_000,
                 current_preserved=True, log_offset=20, segment_start=100_000_000_000):
   msg = messaging.new_message("drivingEventRecorded", valid=True)
@@ -125,6 +164,31 @@ def test_segment_offset_uses_authoritative_ack_start_not_cached_init_data(tmp_pa
   record = json.loads((event_root / MANIFEST_NAME).read_text())
   assert record["route_offset_s"] == 92.5
   assert record["segment_offset_s"] == 1.5
+
+
+def test_stop_jolt_payload_serializes_to_manifest(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 3)
+  os.setxattr(log_root / f"{route}--2", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+
+  def reader(path):
+    segment = int(Path(path).parent.name.rsplit("--", 1)[1])
+    if segment == 2:
+      return [baseline_message(), stop_jolt_message()]
+    return [baseline_message()]
+
+  assert scan_once(log_root, event_root, reader) == 1
+  record = json.loads((event_root / MANIFEST_NAME).read_text())
+  assert record["event_type"] == "long.stopJolt"
+  assert record["payload_type"] == "stopJolt"
+  assert record["detected_mono_time"] > record["occurred_mono_time"]
+  assert record["analysis_window"] == {"before_s": 5.0, "after_s": 2.0}
+  assert record["payload"]["classification"] == "brakeGrab"
+  assert record["payload"]["imu_jerk"] == -3.5
+  assert record["payload"]["a_ego_jerk"] == -3.0
+  assert record["payload"]["peak_jolt_mono_time"] == record["occurred_mono_time"]
 
 
 def test_joins_latest_acknowledgment_across_segment_boundary(tmp_path):

@@ -1,16 +1,19 @@
 # Universal Driving-Event Platform
 
-This observer-only platform records manual bookmarks and automatic BLaT/lead-launch
-detections without changing controller, planner, model, CAN, or safety behavior.
+This observer-only platform records manual bookmarks and automatic BLaT,
+lead-launch, and low-speed stop-jolt detections without changing controller,
+planner, model, CAN, or safety behavior.
 
 ## Data flow
 
 `driving_eventd` normalizes current signals, advances lateral detection only on
-`controlsState` updates and longitudinal detection only on `carState` updates,
-assigns stable event/group IDs, and publishes `drivingEvent`. Bookmark-only updates
-create only the manual event at the button message's monotonic timestamp. It never
-looks up routes or writes files. Accepted events remain in memory and are retried
-with the same ID until loggerd acknowledges them.
+`controlsState` updates, and advances the lead-launch and stop-jolt car paths only
+on 100 Hz `carState` updates. Stop-jolt IMU processing runs only for an actual
+20 Hz `livePose` update and uses that message's monotonic timestamp. It assigns
+stable event/group IDs and publishes `drivingEvent`. Bookmark-only updates create
+only the manual event at the button message's monotonic timestamp. It never looks
+up routes or writes files. Accepted events remain in memory and are retried with
+the same ID until loggerd acknowledges them.
 
 `loggerd` accepts that exact event into the active full rlog, assigns the authoritative
 route, segment, and segment-start monotonic time, attempts `user.preserve` on the
@@ -71,6 +74,15 @@ they outlast the generic 2.5-second manual correlation window.
 The lead-launch detector is version 2. Trigger timing is unchanged; its compact
 payload now retains candidate/forecast/plan/command/lead/ego/ego-acceleration onset
 snapshots, brake state, and neutral wording for downstream/vehicle response.
+
+The smooth-stop jolt detector is version 1 and emits `long.stopJolt`. It retains
+about two seconds of the final low-speed landing plus 0.45 seconds after sustained
+standstill, smooths IMU and aEgo acceleration over 0.3 seconds, and calculates jerk
+with actual-time rolling slopes. Its typed payload preserves peak and finalization
+times, signed jerk and acceleration changes, plan/request/applied command evidence,
+longitudinal and lead state, driver inputs, validity, and road-bump confounding.
+Lead-launch, stop-jolt IMU, and stop-jolt car exceptions are isolated from one
+another.
 
 ## Reviews
 

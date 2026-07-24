@@ -152,6 +152,47 @@ def _payload(event: Any) -> dict[str, Any]:
         "brake_hold_active": bool(onset.brakeHoldActive),
       } for onset in value.onsets],
     }
+  if which == "stopJolt":
+    value = event.payload.stopJolt
+    return {
+      "episode_start_mono_time": int(value.episodeStartMonoTime),
+      "standstill_mono_time": int(value.standstillMonoTime),
+      "peak_jolt_mono_time": int(value.peakJoltMonoTime),
+      "detection_mono_time": int(value.detectionMonoTime),
+      "imu_jerk": round(float(value.imuJerk), 4),
+      "abs_imu_jerk": round(float(value.absImuJerk), 4),
+      "a_ego_jerk": round(float(value.aEgoJerk), 4),
+      "abs_a_ego_jerk": round(float(value.absAEgoJerk), 4),
+      "imu_accel_before": round(float(value.imuAccelBefore), 4),
+      "imu_accel_after": round(float(value.imuAccelAfter), 4),
+      "a_ego_accel_before": round(float(value.aEgoAccelBefore), 4),
+      "a_ego_accel_after": round(float(value.aEgoAccelAfter), 4),
+      "accel_change": round(float(value.accelChange), 4),
+      "accel_at_02_mps": round(float(value.accelAt02Mps), 4),
+      "v_ego_at_peak": round(float(value.vEgoAtPeak), 4),
+      "plan_a_target": round(float(value.planATarget), 4),
+      "requested_accel": round(float(value.requestedAccel), 4),
+      "applied_accel": round(float(value.appliedAccel), 4),
+      "plan_accel_change": round(float(value.planAccelChange), 4),
+      "requested_accel_change": round(float(value.requestedAccelChange), 4),
+      "applied_accel_change": round(float(value.appliedAccelChange), 4),
+      "should_stop_before": bool(value.shouldStopBefore),
+      "should_stop_at_peak": bool(value.shouldStopAtPeak),
+      "should_stop_after": bool(value.shouldStopAfter),
+      "long_control_state_before": str(value.longControlStateBefore),
+      "long_control_state_at_peak": str(value.longControlStateAtPeak),
+      "long_control_state_after": str(value.longControlStateAfter),
+      "lead_present": bool(value.leadPresent),
+      "d_rel": round(float(value.dRel), 4),
+      "v_lead_k": round(float(value.vLeadK), 4),
+      "brake_pressed": bool(value.brakePressed),
+      "gas_pressed": bool(value.gasPressed),
+      "brake_hold_active": bool(value.brakeHoldActive),
+      "radar_valid": bool(value.radarValid),
+      "imu_valid": bool(value.imuValid),
+      "road_confounded": bool(value.roadConfounded),
+      "classification": str(value.classification),
+    }
   return {}
 
 

@@ -2554,6 +2554,7 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     none @19 :Void;
     lateral @20 :LateralPayload;
     leadLaunch @21 :LeadLaunchPayload;
+    stopJolt @27 :StopJoltPayload;
   }
 
   detectedMonoTime @22 :UInt64;
@@ -2669,6 +2670,52 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
         ego @5;
         egoAcceleration @6;
       }
+    }
+  }
+
+  struct StopJoltPayload {
+    episodeStartMonoTime @0 :UInt64;
+    standstillMonoTime @1 :UInt64;
+    peakJoltMonoTime @2 :UInt64;
+    detectionMonoTime @3 :UInt64;
+    imuJerk @4 :Float32;
+    absImuJerk @5 :Float32;
+    aEgoJerk @6 :Float32;
+    absAEgoJerk @7 :Float32;
+    imuAccelBefore @8 :Float32;
+    imuAccelAfter @9 :Float32;
+    aEgoAccelBefore @10 :Float32;
+    aEgoAccelAfter @11 :Float32;
+    accelChange @12 :Float32;
+    accelAt02Mps @13 :Float32;
+    vEgoAtPeak @14 :Float32;
+    planATarget @15 :Float32;
+    requestedAccel @16 :Float32;
+    appliedAccel @17 :Float32;
+    planAccelChange @18 :Float32;
+    requestedAccelChange @19 :Float32;
+    appliedAccelChange @20 :Float32;
+    shouldStopBefore @21 :Bool;
+    shouldStopAtPeak @22 :Bool;
+    shouldStopAfter @23 :Bool;
+    longControlStateBefore @24 :Text;
+    longControlStateAtPeak @25 :Text;
+    longControlStateAfter @26 :Text;
+    leadPresent @27 :Bool;
+    dRel @28 :Float32;
+    vLeadK @29 :Float32;
+    brakePressed @30 :Bool;
+    gasPressed @31 :Bool;
+    brakeHoldActive @32 :Bool;
+    radarValid @33 :Bool;
+    imuValid @34 :Bool;
+    roadConfounded @35 :Bool;
+    classification @36 :Classification;
+
+    enum Classification {
+      brakeGrab @0;
+      releaseSnap @1;
+      grabAndRebound @2;
     }
   }
 }

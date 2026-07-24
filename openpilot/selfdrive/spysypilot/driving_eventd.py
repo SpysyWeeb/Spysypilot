@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Observer-only runtime for manual, lateral, and longitudinal driving events."""
+import math
 import time
 import uuid
 from collections.abc import Callable
@@ -22,6 +23,13 @@ from openpilot.selfdrive.spysypilot.long_event_detector import (
   LaunchSample,
   LeadLaunchDetector,
   LongEvent,
+)
+from openpilot.selfdrive.spysypilot.stop_jolt_detector import (
+  DETECTOR_VERSION as STOP_JOLT_DETECTOR_VERSION,
+  StopJoltCarSample,
+  StopJoltDetector,
+  StopJoltEvent,
+  StopJoltImuSample,
 )
 
 
@@ -178,20 +186,48 @@ def longitudinal_candidate(sample: LaunchSample, event: LongEvent) -> EventCandi
   )
 
 
+def stop_jolt_candidate(event: StopJoltEvent) -> EventCandidate:
+  occurred_mono_time = round(event.peak_jolt_mono_time * 1e9)
+  episode_start_mono_time = round(event.episode_start_mono_time * 1e9)
+  return EventCandidate(
+    occurred_mono_time=occurred_mono_time,
+    domain="longitudinal",
+    source="automatic",
+    event_type="long.stopJolt",
+    detector="smoothStopJoltDetector",
+    detector_version=STOP_JOLT_DETECTOR_VERSION,
+    severity=event.severity,
+    confidence=event.confidence,
+    reason=event.reason,
+    attribution=event.attribution,
+    road_confounded=event.road_confounded,
+    payload=event,
+    detected_mono_time=round(event.detection_mono_time * 1e9),
+    episode_start_mono_time=episode_start_mono_time,
+    analysis_window_before_s=5.0,
+    analysis_window_after_s=2.0,
+    episode_key=f"stop:{episode_start_mono_time}",
+  )
+
+
 class DrivingEventPlatform:
   """Runs detectors independently so one domain cannot disable another."""
 
   def __init__(self, recorder: EventRecorder | None = None,
                lateral_detector: LateralEventDetector | None = None,
                longitudinal_detector: LeadLaunchDetector | None = None,
+               stop_jolt_detector: StopJoltDetector | None = None,
                on_error: Callable[[str], None] | None = None):
     self.recorder = recorder or EventRecorder()
     self.lateral_detector = lateral_detector or LateralEventDetector()
     self.longitudinal_detector = longitudinal_detector or LeadLaunchDetector()
+    self.stop_jolt_detector = stop_jolt_detector or StopJoltDetector()
     self.on_error = on_error or (lambda domain: cloudlog.exception(f"driving_eventd: {domain} detector failed"))
 
   def update(self, lateral_sample: LateralSample | None = None, longitudinal_sample: LaunchSample | None = None,
-             manual_pressed: bool = False, manual_time_ns: int | None = None) -> list[AcceptedEvent]:
+             manual_pressed: bool = False, manual_time_ns: int | None = None,
+             stop_car_sample: StopJoltCarSample | None = None,
+             stop_imu_sample: StopJoltImuSample | None = None) -> list[AcceptedEvent]:
     candidates: list[EventCandidate] = []
     if lateral_sample is not None:
       try:
@@ -208,6 +244,20 @@ class DrivingEventPlatform:
           candidates.append(longitudinal_candidate(longitudinal_sample, event))
       except Exception:
         self.on_error("longitudinal")
+
+    if stop_imu_sample is not None:
+      try:
+        self.stop_jolt_detector.update_imu(stop_imu_sample)
+      except Exception:
+        self.on_error("stop_jolt_imu")
+
+    if stop_car_sample is not None:
+      try:
+        event = self.stop_jolt_detector.update_car(stop_car_sample)
+        if event is not None:
+          candidates.append(stop_jolt_candidate(event))
+      except Exception:
+        self.on_error("stop_jolt")
 
     if manual_pressed:
       candidates.append(manual_candidate(manual_time_ns if manual_time_ns is not None else time.monotonic_ns()))
@@ -298,6 +348,46 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
       payload.previousUnwindEffectivePhase = evidence.previous_unwind_effective_phase
       payload.previousUnwindSameEpisode = evidence.previous_unwind_same_episode
       payload.trackingInactiveTimeS = evidence.tracking_inactive_time_s
+  elif candidate.event_type == "long.stopJolt":
+    stop_event: StopJoltEvent = candidate.payload
+    payload = out.payload.init("stopJolt")
+    payload.episodeStartMonoTime = round(stop_event.episode_start_mono_time * 1e9)
+    payload.standstillMonoTime = round(stop_event.standstill_mono_time * 1e9)
+    payload.peakJoltMonoTime = round(stop_event.peak_jolt_mono_time * 1e9)
+    payload.detectionMonoTime = round(stop_event.detection_mono_time * 1e9)
+    payload.imuJerk = stop_event.imu_jerk
+    payload.absImuJerk = stop_event.abs_imu_jerk
+    payload.aEgoJerk = stop_event.a_ego_jerk
+    payload.absAEgoJerk = stop_event.abs_a_ego_jerk
+    payload.imuAccelBefore = stop_event.imu_accel_before
+    payload.imuAccelAfter = stop_event.imu_accel_after
+    payload.aEgoAccelBefore = stop_event.a_ego_accel_before
+    payload.aEgoAccelAfter = stop_event.a_ego_accel_after
+    payload.accelChange = stop_event.accel_change
+    payload.accelAt02Mps = stop_event.accel_at_02_mps
+    payload.vEgoAtPeak = stop_event.v_ego_at_peak
+    payload.planATarget = stop_event.plan_a_target
+    payload.requestedAccel = stop_event.requested_accel
+    payload.appliedAccel = stop_event.applied_accel
+    payload.planAccelChange = stop_event.plan_accel_change
+    payload.requestedAccelChange = stop_event.requested_accel_change
+    payload.appliedAccelChange = stop_event.applied_accel_change
+    payload.shouldStopBefore = stop_event.should_stop_before
+    payload.shouldStopAtPeak = stop_event.should_stop_at_peak
+    payload.shouldStopAfter = stop_event.should_stop_after
+    payload.longControlStateBefore = stop_event.long_control_state_before
+    payload.longControlStateAtPeak = stop_event.long_control_state_at_peak
+    payload.longControlStateAfter = stop_event.long_control_state_after
+    payload.leadPresent = stop_event.lead_present
+    payload.dRel = stop_event.d_rel
+    payload.vLeadK = stop_event.v_lead_k
+    payload.brakePressed = stop_event.brake_pressed
+    payload.gasPressed = stop_event.gas_pressed
+    payload.brakeHoldActive = stop_event.brake_hold_active
+    payload.radarValid = stop_event.radar_valid
+    payload.imuValid = stop_event.imu_valid
+    payload.roadConfounded = stop_event.road_confounded
+    payload.classification = stop_event.classification
   elif candidate.domain == "longitudinal":
     long_event: LongEvent = candidate.payload
     payload = out.payload.init("leadLaunch")
@@ -397,14 +487,86 @@ def longitudinal_sample(sm: messaging.SubMaster) -> LaunchSample:
   )
 
 
+def live_pose_sample(sm: messaging.SubMaster, bump_classifier: RoadBumpClassifier) -> StopJoltImuSample:
+  """Sample IMU once per actual livePose update, using livePose's timestamp."""
+  live_pose = sm["livePose"]
+  acceleration = live_pose.accelerationDevice
+  now = sm.logMonoTime["livePose"] * 1e-9
+  accel_x = float(acceleration.x)
+  accel_z = float(acceleration.z)
+  accel_x_valid = bool(acceleration.valid and math.isfinite(accel_x))
+  accel_z_valid = bool(acceleration.valid and math.isfinite(accel_z))
+  imu_valid = bool(
+    sm.valid["livePose"]
+    and accel_x_valid
+    and live_pose.inputsOK
+    and live_pose.sensorsOK
+  )
+  road_confounded = (
+    bump_classifier.update(accel_z, now)
+    if accel_z_valid
+    else now < bump_classifier.confounded_until
+  )
+  return StopJoltImuSample(
+    t=now,
+    accel_x=accel_x,
+    valid=imu_valid,
+    road_confounded=road_confounded,
+  )
+
+
+def stop_jolt_car_sample(sm: messaging.SubMaster, road_confounded: bool) -> StopJoltCarSample:
+  car_state = sm["carState"]
+  car_control = sm["carControl"]
+  car_output = sm["carOutput"]
+  plan = sm["longitudinalPlan"]
+  controls_state = sm["controlsState"]
+  lead = sm["radarState"].leadOne
+  now = sm.logMonoTime["carState"] * 1e-9
+  numeric_values = (
+    float(car_state.vEgo),
+    float(car_state.aEgo),
+    float(plan.aTarget),
+    float(car_control.actuators.accel),
+    float(car_output.actuatorsOutput.accel),
+  )
+  required_valid = bool(
+    all(sm.valid[service] for service in ("carState", "carControl", "carOutput", "controlsState", "longitudinalPlan"))
+    and all(math.isfinite(value) for value in numeric_values)
+  )
+  d_rel = float(lead.dRel)
+  v_lead_k = float(lead.vLeadK)
+  radar_valid = bool(sm.valid["radarState"] and math.isfinite(d_rel) and math.isfinite(v_lead_k))
+  return StopJoltCarSample(
+    t=now,
+    required_valid=required_valid,
+    long_active=bool(car_control.longActive),
+    should_stop=bool(plan.shouldStop),
+    v_ego=numeric_values[0],
+    a_ego=numeric_values[1],
+    standstill=bool(car_state.standstill),
+    brake_pressed=bool(car_state.brakePressed),
+    gas_pressed=bool(car_state.gasPressed),
+    brake_hold_active=bool(car_state.brakeHoldActive),
+    plan_a_target=numeric_values[2],
+    requested_accel=numeric_values[3],
+    applied_accel=numeric_values[4],
+    long_control_state=str(controls_state.longControlState),
+    lead_present=bool(lead.present),
+    d_rel=d_rel if math.isfinite(d_rel) else 0.0,
+    v_lead_k=v_lead_k if math.isfinite(v_lead_k) else 0.0,
+    radar_valid=radar_valid,
+    road_confounded=road_confounded,
+  )
+
+
 def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
-                   bump_classifier: RoadBumpClassifier) -> LateralSample:
+                   road_confounded: bool) -> LateralSample:
   controls_state = sm["controlsState"]
   torque_state = controls_state.lateralControlState.torqueState if controls_state.lateralControlState.which() == "torqueState" else None
   car_state = sm["carState"]
   now = sm.logMonoTime["controlsState"] * 1e-9 if sm.logMonoTime["controlsState"] else time.monotonic()
   angle = float(car_state.steeringAngleDeg)
-  road_confounded = sm.valid["livePose"] and bump_classifier.update(float(sm["livePose"].accelerationDevice.z), now)
   damping_applied = float(torque_state.d) if torque_state is not None else 0.0
   damping_state = (
     "blocked" if torque_state is not None and getattr(torque_state, "dampingTurnInBlocked", False)
@@ -435,7 +597,7 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     unwind_effective_phase=float(getattr(torque_state, "unwindEffectivePhase", 0.0)) if torque_state is not None else 0.0,
     unwind_overspeed=float(getattr(torque_state, "unwindPhaseOverspeed", 0.0)) if torque_state is not None else 0.0,
     unwind_same_episode=bool(getattr(torque_state, "unwindSameEpisode", False)) if torque_state is not None else False,
-    road_confounded=bool(road_confounded),
+    road_confounded=road_confounded,
   )
 
 
@@ -453,6 +615,7 @@ def main() -> None:
   submitter = EventSubmitter(pm, git_commit, git_branch)
   rate_filter = SteeringRateFilter()
   bump_classifier = RoadBumpClassifier()
+  road_confounded = False
 
   if not pm.wait_for_readers_to_update("drivingEvent", timeout=10):
     cloudlog.warning("driving_eventd: loggerd reader not ready; retaining events for retry")
@@ -465,14 +628,21 @@ def main() -> None:
 
     controls_updated = bool(sm.updated["controlsState"])
     car_state_updated = bool(sm.updated["carState"])
+    live_pose_updated = bool(sm.updated["livePose"])
     bookmark_updated = bool(sm.updated["bookmarkButton"])
-    lat_sample = lateral_sample(sm, rate_filter, bump_classifier) if controls_updated else None
+    imu_sample = live_pose_sample(sm, bump_classifier) if live_pose_updated else None
+    if imu_sample is not None:
+      road_confounded = imu_sample.road_confounded
+    lat_sample = lateral_sample(sm, rate_filter, road_confounded) if controls_updated else None
     long_sample = longitudinal_sample(sm) if car_state_updated else None
+    stop_sample = stop_jolt_car_sample(sm, road_confounded) if car_state_updated else None
     events = platform.update(
       lat_sample,
       long_sample,
       manual_pressed=bookmark_updated,
       manual_time_ns=sm.logMonoTime["bookmarkButton"] if bookmark_updated else None,
+      stop_car_sample=stop_sample,
+      stop_imu_sample=imu_sample,
     )
     for event in events:
       submitter.submit(event)
