@@ -2467,6 +2467,114 @@ struct DebugAlert {
 struct UserBookmark @0xfe346a9de48d9b50 {
 }
 
+# Universal, rlog-authoritative driving event envelope. UserBookmark and
+# LateralEvent above remain for decoding routes recorded before this migration.
+struct DrivingEvent @0xd9f3c9b84f67a2e1 {
+  version @0 :UInt16;
+  eventId @1 :Text;
+  groupId @2 :Text;
+  occurredMonoTime @3 :UInt64;
+  domain @4 :Domain;
+  source @5 :Source;
+  eventType @6 :Text;
+  detector @7 :Text;
+  detectorVersion @8 :UInt16;
+  severity @9 :Severity;
+  confidence @10 :Float32;
+  reason @11 :Text;
+  attribution @12 :Attribution;
+  driverConfounded @13 :Bool;
+  roadConfounded @14 :Bool;
+  requestedContextBefore @15 :UInt8;
+  requestedContextAfter @16 :UInt8;
+  gitCommit @17 :Text;
+  gitBranch @18 :Text;
+
+  payload :union {
+    none @19 :Void;
+    lateral @20 :LateralPayload;
+    leadLaunch @21 :LeadLaunchPayload;
+  }
+
+  enum Domain {
+    manual @0;
+    lateral @1;
+    longitudinal @2;
+    road @3;
+    driver @4;
+    system @5;
+  }
+
+  enum Source {
+    automatic @0;
+    user @1;
+  }
+
+  enum Severity {
+    info @0;
+    warning @1;
+    critical @2;
+  }
+
+  enum Attribution {
+    unknown @0;
+    model @1;
+    planner @2;
+    controller @3;
+    actuator @4;
+    vehicle @5;
+    driver @6;
+    road @7;
+    mixed @8;
+  }
+
+  struct LateralPayload {
+    controllerVersion @0 :Int32;
+    referenceVersion @1 :Int32;
+    vEgo @2 :Float32;
+    steeringAngleDeg @3 :Float32;
+    steeringRateDeg @4 :Float32;
+    desiredLateralAccel @5 :Float32;
+    actualLateralAccel @6 :Float32;
+    requestTorque @7 :Float32;
+    appliedTorque @8 :Float32;
+    referenceTargetTorque @9 :Float32;
+    referenceRate @10 :Float32;
+    referenceUnwindScale @11 :Float32;
+    referenceSustainedUnwindScale @12 :Float32;
+    unwindEffectivePhase @13 :Float32;
+    unwindOverspeed @14 :Float32;
+    unwindSameEpisode @15 :Bool;
+    appliedTargetGap @16 :Float32;
+    pTerm @17 :Float32;
+  }
+
+  struct LeadLaunchPayload {
+    forecastToLeadS @0 :Float32;
+    planToLeadS @1 :Float32;
+    commandToLeadS @2 :Float32;
+    leadToEgoS @3 :Float32;
+    commandToEgoS @4 :Float32;
+    radarDiscontinuity @5 :Bool;
+    radarConfidence @6 :Float32;
+  }
+}
+
+struct DrivingEventRecorded @0xcac5f5a6b137d821 {
+  eventId @0 :Text;
+  groupId @1 :Text;
+  domain @2 :DrivingEvent.Domain;
+  source @3 :DrivingEvent.Source;
+  eventType @4 :Text;
+  occurredMonoTime @5 :UInt64;
+  route @6 :Text;
+  segment @7 :Int32;
+  markerWritten @8 :Bool;
+  currentSegmentPreserved @9 :Bool;
+  followingSegmentScheduled @10 :Bool;
+  error @11 :Text;
+}
+
 struct SoundPressure @0xdc24138990726023 {
   soundPressure @0 :Float32;
 
@@ -2585,6 +2693,8 @@ struct Event {
     audioFeedback @149 :AudioFeedback;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
+    drivingEvent @153 :DrivingEvent;
+    drivingEventRecorded @154 :DrivingEventRecorded;
 
     # *********** debug ***********
     testJoystick @52 :Joystick;
