@@ -24,7 +24,8 @@ class EventNotice:
 
 
 def notification_text(recorded: Any) -> tuple[str, bool]:
-  if not (bool(recorded.markerWritten) and bool(recorded.currentSegmentPreserved)):
+  marker_accepted = bool(getattr(recorded, "markerAccepted", False) or recorded.markerWritten)
+  if not (marker_accepted and bool(recorded.currentSegmentPreserved)):
     return "Event Save Failed", True
   if str(recorded.source) == "user" or str(recorded.domain) == "manual":
     return "Event Logged", False

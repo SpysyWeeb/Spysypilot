@@ -55,6 +55,7 @@ class TestLeadLaunchDetector:
         v_lead_k=0.5 if t >= 2.0 else 0.0,
         standstill=t < 3.2,
         v_ego=0.2 if t >= 3.2 else 0.0,
+        a_ego=0.2 if t >= 3.0 else 0.0,
       )
 
     event = run_scenario(detector, 4.0, state)
@@ -65,6 +66,11 @@ class TestLeadLaunchDetector:
     assert event.plan_to_lead_s == pytest.approx(-1.0)
     assert event.forecast_to_lead_s == pytest.approx(-1.2)
     assert event.confidence == pytest.approx(0.95)
+    assert event.attribution_detail == "downstream/vehicle response"
+    assert event.episode_start_mono_time == 0.0
+    assert {onset.kind for onset in event.onsets} >= {
+      "candidate", "forecast", "plan", "command", "lead", "ego", "egoAcceleration",
+    }
 
   def test_attributes_late_plan(self):
     detector = LeadLaunchDetector()
