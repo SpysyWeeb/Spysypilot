@@ -63,13 +63,32 @@ indexer repairs the current and following xattrs, retaining the requested
 two-before/current/one-after window without consuming four preservation-quota
 entries per event.
 
-The lateral detector is version 4. It detects an interpolated signed steering
+The lateral detector version 5 is in progress. It preserves version 4's
+interpolated signed steering
 center crossing only after the wheel was established outside 25 degrees, then
 waits for desired-trajectory commitment evidence. A requested reversal may
 produce one `committedHandoffHarshness`; an unrequested rapid crossing may
 produce `centerOvershoot`. A phase handoff and crossing in the same episode
 within 500 ms are consolidated before publication. The physical crossing and
 later classification times are retained separately.
+
+Version 5 adds `unwindProgressDeficit`, which compares expected reference
+unwind progress with actual timestamped steering-angle reduction instead of
+requiring a nearly stationary wheel, and `turnStopTurn`, which records one
+strong moving/slowing/dwell/release transition without weakening the existing
+three-cycle `stallRelease`. Driver assistance confirms and attributes a
+progress deficit; it never suppresses it. Both new events are observer-only,
+request six seconds before and two seconds after the trigger, and remain in
+progress pending new field review. Route 93 replay is complete.
+
+Route `00000093--3198e2f719` replay captures both requested unwind cases with
+their physical deficit onset and later driver-assist detection separated. The
+12:41 case arms around 12:41:20.34 MDT, retains the roughly −368.5-degree peak
+and interpolated request/applied neutral crossings, then finalizes at the
+12:41:22.45 steering press. The 12:38 case emits one strong
+`turnStopTurn` around 12:38:32.96 with about 1.23 seconds of dwell near
+214 degrees and near-full requested/applied/reference torque. Replay
+acceptance does not mark v5 complete; new field logs still require review.
 
 Driver and road evidence no longer suppresses lateral events. The typed payload
 records raw-torque and confirmed-steering-press fractions/durations plus

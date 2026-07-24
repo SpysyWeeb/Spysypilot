@@ -123,8 +123,8 @@ def stall_release_event(detector: LateralEventDetector, *,
   return event
 
 
-def test_lateral_detector_version_four():
-  assert DETECTOR_VERSION == 4
+def test_lateral_detector_version_five():
+  assert DETECTOR_VERSION == 5
 
 
 def test_inactive_never_triggers():
@@ -690,3 +690,349 @@ def test_non_hyundai_does_not_reuse_legacy_torque_state_d_as_actual_damping():
   )
   assert event is not None and event.evidence is not None
   assert all(release.actual_damping_amount is None for release in event.evidence.stall_releases)
+
+
+def unwind_progress_event(*, angle: float = 300.0, driver_assist: bool = False,
+                          road_confounded: bool = False):
+  detector = LateralEventDetector(cooldown=0.0)
+  expected_direction = -1.0 if angle > 0.0 else 1.0
+  reference_rate = -expected_direction
+  detector.update(sample(
+    0.0,
+    steering_angle_deg=angle - expected_direction * 10.0,
+    steering_rate_deg=-expected_direction * 300.0,
+    reference_rate=0.0,
+  ))
+  event = None
+  for index in range(1, 321):
+    now = index * 0.01
+    kwargs = {
+      "steering_angle_deg": angle,
+      "steering_rate_deg": expected_direction * 100.0,
+      "reference_rate": reference_rate,
+      "measurement_rate": -0.2 * reference_rate,
+      "reference_sustained_unwind_scale": 0.9,
+      "unwind_effective_phase": 0.9,
+      "request_torque": 0.8 if now < 0.6 else -0.8,
+      "applied_torque": 0.8 if now < 0.7 else -0.8,
+      "reference_target_torque": -0.9,
+      "road_confounded": road_confounded,
+      "vertical_accel_deviation": 1.8 if road_confounded else 0.0,
+    }
+    if driver_assist and now >= 0.75:
+      kwargs["driver_torque"] = expected_direction * 100.0
+      kwargs["steering_pressed"] = True
+      kwargs["steering_rate_deg"] = expected_direction * 180.0
+    event = detector.update(sample(now, **kwargs))
+    if event is not None:
+      return event
+  return event
+
+
+def turn_stop_turn_event(*, movement_rate: float = 120.0, dwell_rate: float = 0.0,
+                         release_rate: float = 60.0, angle: float = 120.0,
+                         dwell_s: float = 0.6, driver_before: bool = False,
+                         driver_during: bool = False, driver_after: bool = False,
+                         road_confounded: bool = False, demand: bool = True,
+                         damping: bool = False):
+  detector = LateralEventDetector(cooldown=0.0)
+  reference_rate = 0.5 if demand else 0.0
+  desired = 0.5 if demand else 0.0
+  actual = 0.0 if demand else 0.0
+  detector.update(sample(
+    0.0,
+    steering_angle_deg=angle,
+    steering_rate_deg=movement_rate,
+    reference_rate=reference_rate,
+    desired_lateral_accel=desired,
+    actual_lateral_accel=actual,
+    driver_torque=80.0 if driver_before else 0.0,
+    steering_pressed=driver_before,
+  ))
+  count = int(round(dwell_s / 0.01))
+  for index in range(1, count + 1):
+    detector.update(sample(
+      index * 0.01,
+      steering_angle_deg=angle,
+      steering_rate_deg=dwell_rate,
+      reference_rate=reference_rate,
+      desired_lateral_accel=desired,
+      actual_lateral_accel=actual,
+      request_torque=0.9 if demand else 0.0,
+      applied_torque=0.85 if demand else 0.0,
+      reference_target_torque=0.8 if demand else 0.0,
+      driver_torque=80.0 if driver_during else 0.0,
+      steering_pressed=driver_during,
+      road_confounded=road_confounded,
+      vertical_accel_deviation=1.7 if road_confounded else 0.0,
+    ))
+  release_time = (count + 1) * 0.01
+  event = detector.update(sample(
+    release_time,
+    steering_angle_deg=angle - 1.0,
+    steering_rate_deg=release_rate,
+    reference_rate=reference_rate,
+    desired_lateral_accel=desired,
+    actual_lateral_accel=actual,
+    request_torque=0.7 if demand else 0.0,
+    applied_torque=0.7 if demand else 0.0,
+    reference_target_torque=0.75 if demand else 0.0,
+    driver_torque=80.0 if driver_after else 0.0,
+    steering_pressed=driver_after,
+    actual_damping_amount=0.03 if damping else None,
+    actual_damping_state="damping" if damping else None,
+    turn_in_blocked=False if damping else None,
+    breakaway_latch=0.8 if damping else None,
+    sustain_floor_contribution=0.6 if damping else None,
+    damping_version=2 if damping else None,
+    road_confounded=road_confounded,
+    vertical_accel_deviation=1.7 if road_confounded else 0.0,
+  ))
+  for index in range(1, 291):
+    event = detector.update(sample(
+      release_time + index * 0.01,
+      steering_angle_deg=angle - 1.0,
+      steering_rate_deg=release_rate * (1.5 if index <= 10 else 1.0),
+      reference_rate=reference_rate,
+      desired_lateral_accel=desired,
+      actual_lateral_accel=actual,
+      driver_torque=80.0 if driver_after else 0.0,
+      steering_pressed=driver_after,
+      road_confounded=road_confounded,
+      vertical_accel_deviation=1.7 if road_confounded else 0.0,
+    )) or event
+  return event
+
+
+def test_unwind_progress_deficit_detects_moving_but_lagging_wheel():
+  event = unwind_progress_event()
+  assert event is not None and event.evidence is not None
+  assert event.event_type == "unwindProgressDeficit"
+  assert event.evidence.expected_angle_progress_deg > 0.0
+  assert event.evidence.unwind_progress_ratio < 0.35
+  assert abs(event.evidence.measurement_rate_at_trigger) > 0.0
+  assert event.evidence.analysis_window_before_s == 6.0
+  assert event.evidence.analysis_window_after_s == 2.0
+
+
+@pytest.mark.parametrize(("angle", "minimum_duration"), [
+  (80.0, 0.8),
+  (180.0, 0.6),
+  (300.0, 0.4),
+])
+def test_unwind_progress_uses_angle_dependent_duration(angle, minimum_duration):
+  event = unwind_progress_event(angle=angle)
+  assert event is not None and event.evidence is not None
+  # Normal-confidence events retain a two-second confirmation window after
+  # the band-specific deficit duration.
+  assert event.evidence.unwind_deficit_duration_s >= minimum_duration + 1.99
+
+
+def test_driver_assist_immediately_confirms_unwind_deficit():
+  event = unwind_progress_event(driver_assist=True)
+  assert event is not None and event.evidence is not None
+  assert event.event_type == "unwindProgressDeficit"
+  assert event.confidence >= 0.95
+  assert event.reason == "driver intervention accelerated an unwind that was behind the requested trajectory"
+  assert event.evidence.driver_assisted_unwind
+  assert event.evidence.driver_assist_mono_time == pytest.approx(event.detected_mono_time)
+  assert event.evidence.driver_assist_torque < 0.0
+  assert event.evidence.wheel_rate_increase_after_assist_deg_s > 0.0
+
+
+def test_unwind_neutral_crossings_are_interpolated_and_trigger_torque_is_retained():
+  event = unwind_progress_event(driver_assist=True)
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.requested_torque_neutral_cross_mono_time == pytest.approx(0.595)
+  assert evidence.applied_torque_neutral_cross_mono_time == pytest.approx(0.695)
+  assert evidence.unwind_command_delay_s == pytest.approx(
+    evidence.requested_torque_neutral_cross_mono_time - evidence.unwind_episode_start_mono_time,
+  )
+  assert evidence.unwind_requested_torque_at_trigger != event.evidence.driver_assist_torque
+
+
+def test_reference_recommit_cancels_apparent_unwind():
+  detector = LateralEventDetector(cooldown=0.0)
+  events = []
+  for index in range(350):
+    now = index * 0.01
+    reference_rate = 0.8 if now < 0.35 else -0.8
+    event = detector.update(sample(
+      now,
+      steering_angle_deg=180.0,
+      steering_rate_deg=-40.0,
+      reference_rate=reference_rate,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+    ))
+    if event is not None:
+      events.append(event)
+  assert all(event.event_type != "unwindProgressDeficit" for event in events)
+
+
+def test_unwind_road_bump_is_attribution_not_suppression():
+  event = unwind_progress_event(driver_assist=True, road_confounded=True)
+  assert event is not None and event.evidence is not None
+  assert event.evidence.road_confounded_any
+
+
+def test_legacy_stationary_late_unwind_does_not_duplicate_progress_event():
+  detector = LateralEventDetector(cooldown=0.0)
+  events = []
+  for index in range(400):
+    event = detector.update(sample(
+      index * 0.01,
+      steering_angle_deg=90.0,
+      steering_rate_deg=0.0,
+      reference_rate=0.5,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+    ))
+    if event is not None:
+      events.append(event.event_type)
+  assert events.count("lateUnwind") == 1
+  assert "unwindProgressDeficit" not in events
+
+
+def test_turn_stop_turn_detects_one_strong_release():
+  event = turn_stop_turn_event()
+  assert event is not None and event.evidence is not None
+  assert event.event_type == "turnStopTurn"
+  assert event.evidence.dwell_duration_s >= 0.5
+  assert event.evidence.restart_classification == "sameDirectionTurn"
+  assert event.evidence.analysis_window_before_s == 6.0
+  assert event.evidence.analysis_window_after_s == 2.0
+  assert event.occurred_mono_time == pytest.approx(event.evidence.release_mono_time)
+  assert event.detected_mono_time > event.occurred_mono_time
+
+
+def test_turn_stop_turn_detects_major_slowdown_without_sub_eight_rate():
+  event = turn_stop_turn_event(
+    movement_rate=200.0,
+    dwell_rate=40.0,
+    release_rate=90.0,
+  )
+  assert event is not None and event.evidence is not None
+  assert event.evidence.minimum_dwell_rate_deg_s == pytest.approx(40.0)
+  assert event.evidence.rate_reduction_ratio == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize(("movement_rate", "release_rate", "classification"), [
+  (120.0, 60.0, "sameDirectionTurn"),
+  (120.0, -60.0, "unwind"),
+  (-120.0, 60.0, "reversal"),
+])
+def test_turn_stop_turn_restart_classification(movement_rate, release_rate, classification):
+  event = turn_stop_turn_event(
+    movement_rate=movement_rate,
+    release_rate=release_rate,
+  )
+  assert event is not None and event.evidence is not None
+  assert event.evidence.restart_classification == classification
+
+
+def test_turn_stop_turn_tracks_driver_phases_and_actual_damping():
+  event = turn_stop_turn_event(
+    driver_before=True,
+    driver_during=False,
+    driver_after=True,
+    damping=True,
+  )
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.driver_involved_before_dwell
+  assert not evidence.driver_involved_during_dwell
+  assert evidence.driver_involved_after_dwell
+  assert evidence.turn_stop_actual_damping_amount == pytest.approx(0.03)
+  assert evidence.turn_stop_actual_damping_state == "damping"
+  assert evidence.turn_stop_breakaway_latch == pytest.approx(0.8)
+  assert evidence.turn_stop_damping_version == 2
+
+
+def test_turn_stop_turn_non_hyundai_optional_damping_is_absent():
+  event = turn_stop_turn_event()
+  assert event is not None and event.evidence is not None
+  assert event.evidence.turn_stop_actual_damping_amount is None
+  assert event.evidence.turn_stop_actual_damping_state is None
+  assert event.evidence.turn_stop_damping_version is None
+
+
+def test_turn_stop_turn_road_bump_is_retained_as_attribution():
+  event = turn_stop_turn_event(road_confounded=True)
+  assert event is not None and event.evidence is not None
+  assert event.evidence.road_confounded_any
+
+
+def test_intentional_driver_hold_without_reference_demand_is_silent():
+  event = turn_stop_turn_event(
+    demand=False,
+    driver_before=True,
+    driver_during=True,
+    driver_after=True,
+  )
+  assert event is None
+
+
+def test_steady_constant_radius_hold_does_not_emit_without_release():
+  detector = LateralEventDetector(cooldown=0.0)
+  detector.update(sample(
+    0.0,
+    steering_angle_deg=110.0,
+    steering_rate_deg=80.0,
+    reference_rate=0.0,
+    desired_lateral_accel=0.5,
+    actual_lateral_accel=0.5,
+  ))
+  for index in range(1, 501):
+    event = detector.update(sample(
+      index * 0.01,
+      steering_angle_deg=110.0,
+      steering_rate_deg=0.0,
+      reference_rate=0.0,
+      desired_lateral_accel=0.5,
+      actual_lateral_accel=0.5,
+    ))
+    assert event is None
+
+
+def test_constant_radius_pause_then_release_without_reference_motion_is_silent():
+  assert turn_stop_turn_event(demand=False) is None
+
+
+def test_near_center_pause_and_tiny_corrections_are_silent():
+  for angle in (10.0, 24.0):
+    detector = LateralEventDetector(cooldown=0.0)
+    detector.update(sample(
+      0.0,
+      steering_angle_deg=angle,
+      steering_rate_deg=60.0,
+      reference_rate=0.0,
+      desired_lateral_accel=0.0,
+      actual_lateral_accel=0.0,
+    ))
+    for index in range(1, 80):
+      assert detector.update(sample(
+        index * 0.01,
+        steering_angle_deg=angle,
+        steering_rate_deg=0.0,
+        reference_rate=0.0,
+        desired_lateral_accel=0.0,
+        actual_lateral_accel=0.0,
+      )) is None
+    assert detector.update(sample(
+      0.81,
+      steering_angle_deg=angle,
+      steering_rate_deg=50.0,
+      reference_rate=0.0,
+      desired_lateral_accel=0.0,
+      actual_lateral_accel=0.0,
+    )) is None
+
+
+def test_short_weak_turn_stop_dwell_is_silent():
+  assert turn_stop_turn_event(
+    angle=40.0,
+    dwell_s=0.2,
+    demand=False,
+  ) is None

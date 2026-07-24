@@ -134,6 +134,11 @@ def manual_candidate(occurred_mono_time: int) -> EventCandidate:
 
 def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> EventCandidate:
   attribution = "actuator" if detection.event_type == "torqueAuthority" else "controller"
+  normalized_event_types = {
+    "unwind_progress_deficit": "unwindProgressDeficit",
+    "turn_stop_turn": "turnStopTurn",
+  }
+  event_type = normalized_event_types.get(detection.event_type, detection.event_type)
   evidence = detection.evidence
   driver_confounded = evidence.driver_confounded_any if evidence is not None else sample.driver_confounded
   road_confounded = evidence.road_confounded_any if evidence is not None else sample.road_confounded
@@ -148,7 +153,7 @@ def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> Eve
     occurred_mono_time=occurred_mono_time,
     domain="lateral",
     source="automatic",
-    event_type=f"lat.{detection.event_type}",
+    event_type=f"lat.{event_type}",
     detector="blatLateralEventDetector",
     detector_version=LAT_DETECTOR_VERSION,
     severity=detection.severity,
@@ -369,6 +374,7 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
     payload.appliedTorque = sample.applied_torque
     payload.referenceTargetTorque = sample.reference_target_torque
     payload.referenceRate = sample.reference_rate
+    payload.measurementRate = float(getattr(sample, "measurement_rate", 0.0))
     payload.referenceUnwindScale = sample.reference_unwind_scale
     payload.referenceSustainedUnwindScale = sample.reference_sustained_unwind_scale
     payload.unwindEffectivePhase = sample.unwind_effective_phase
@@ -433,6 +439,125 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
       payload.requestedTorqueAtCrossing = evidence.requested_torque_at_crossing
       payload.appliedTorqueAtCrossing = evidence.applied_torque_at_crossing
       payload.referenceTargetTorqueAtCrossing = evidence.reference_target_torque_at_crossing
+      payload.unwindEpisodeStartMonoTime = round(
+        float(getattr(evidence, "unwind_episode_start_mono_time", 0.0) or 0.0) * 1e9,
+      )
+      payload.unwindDeficitStartMonoTime = round(
+        float(getattr(evidence, "unwind_deficit_start_mono_time", 0.0) or 0.0) * 1e9,
+      )
+      payload.unwindDeficitDurationS = float(getattr(evidence, "unwind_deficit_duration_s", 0.0))
+      payload.initialSteeringAngleDeg = float(getattr(evidence, "initial_steering_angle_deg", 0.0))
+      payload.peakSteeringAngleDeg = float(getattr(evidence, "peak_steering_angle_deg", 0.0))
+      payload.triggerSteeringAngleDeg = float(getattr(evidence, "trigger_steering_angle_deg", 0.0))
+      payload.expectedUnwindDirection = str(getattr(evidence, "expected_unwind_direction", ""))
+      payload.expectedAngleProgressDeg = float(getattr(evidence, "expected_angle_progress_deg", 0.0))
+      payload.actualAngleProgressDeg = float(getattr(evidence, "actual_angle_progress_deg", 0.0))
+      payload.unwindProgressRatio = float(getattr(evidence, "unwind_progress_ratio", 0.0))
+      payload.referenceRateAtTrigger = float(getattr(evidence, "reference_rate_at_trigger", 0.0))
+      payload.measurementRateAtTrigger = float(getattr(evidence, "measurement_rate_at_trigger", 0.0))
+      payload.peakReferenceMeasurementRateGap = float(
+        getattr(evidence, "peak_reference_measurement_rate_gap", 0.0),
+      )
+      requested_neutral_cross = getattr(evidence, "requested_torque_neutral_cross_mono_time", None)
+      requested_neutral_cross_present = (
+        requested_neutral_cross is not None and float(requested_neutral_cross) > 0.0
+      )
+      payload.requestedTorqueNeutralCrossPresent = requested_neutral_cross_present
+      payload.requestedTorqueNeutralCrossMonoTime = (
+        round(float(requested_neutral_cross) * 1e9) if requested_neutral_cross_present else 0
+      )
+      applied_neutral_cross = getattr(evidence, "applied_torque_neutral_cross_mono_time", None)
+      applied_neutral_cross_present = (
+        applied_neutral_cross is not None and float(applied_neutral_cross) > 0.0
+      )
+      payload.appliedTorqueNeutralCrossPresent = applied_neutral_cross_present
+      payload.appliedTorqueNeutralCrossMonoTime = (
+        round(float(applied_neutral_cross) * 1e9) if applied_neutral_cross_present else 0
+      )
+      payload.unwindCommandDelayS = float(getattr(evidence, "unwind_command_delay_s", 0.0))
+      payload.driverAssistedUnwind = bool(getattr(evidence, "driver_assisted_unwind", False))
+      driver_assist_time = getattr(evidence, "driver_assist_mono_time", None)
+      payload.driverAssistMonoTime = (
+        round(float(driver_assist_time) * 1e9) if driver_assist_time is not None else 0
+      )
+      payload.driverAssistAngleDeg = float(getattr(evidence, "driver_assist_angle_deg", 0.0))
+      payload.driverAssistWheelRateDeg = float(getattr(evidence, "driver_assist_wheel_rate_deg", 0.0))
+      payload.driverAssistTorque = float(getattr(evidence, "driver_assist_torque", 0.0))
+      payload.wheelRateIncreaseAfterAssistDegS = float(
+        getattr(evidence, "wheel_rate_increase_after_assist_deg_s", 0.0),
+      )
+      payload.movementStartMonoTime = round(
+        float(getattr(evidence, "movement_start_mono_time", 0.0) or 0.0) * 1e9,
+      )
+      payload.dwellStartMonoTime = round(
+        float(getattr(evidence, "dwell_start_mono_time", 0.0) or 0.0) * 1e9,
+      )
+      payload.releaseMonoTime = round(
+        float(getattr(evidence, "release_mono_time", 0.0) or 0.0) * 1e9,
+      )
+      payload.dwellDurationS = float(getattr(evidence, "dwell_duration_s", 0.0))
+      payload.dwellSteeringAngleDeg = float(getattr(evidence, "dwell_steering_angle_deg", 0.0))
+      payload.preDwellPeakRateDegS = float(getattr(evidence, "pre_dwell_peak_rate_deg_s", 0.0))
+      payload.minimumDwellRateDegS = float(getattr(evidence, "minimum_dwell_rate_deg_s", 0.0))
+      payload.releasePeakRateDegS = float(getattr(evidence, "release_peak_rate_deg_s", 0.0))
+      payload.rateReductionRatio = float(getattr(evidence, "rate_reduction_ratio", 0.0))
+      payload.restartClassification = str(getattr(evidence, "restart_classification", ""))
+      payload.requestTorqueDuringDwell = float(getattr(evidence, "request_torque_during_dwell", 0.0))
+      payload.appliedTorqueDuringDwell = float(getattr(evidence, "applied_torque_during_dwell", 0.0))
+      payload.referenceTargetDuringDwell = float(
+        getattr(evidence, "reference_target_during_dwell", 0.0),
+      )
+      payload.trackingActiveDuringDwell = bool(getattr(evidence, "tracking_active_during_dwell", False))
+      payload.driverInvolvedBeforeDwell = bool(getattr(evidence, "driver_involved_before_dwell", False))
+      payload.driverInvolvedDuringDwell = bool(getattr(evidence, "driver_involved_during_dwell", False))
+      payload.driverInvolvedAfterDwell = bool(getattr(evidence, "driver_involved_after_dwell", False))
+      turn_stop_damping_amount = getattr(evidence, "turn_stop_actual_damping_amount", None)
+      turn_stop_damping_state = getattr(evidence, "turn_stop_actual_damping_state", None)
+      turn_stop_damping_version = getattr(evidence, "turn_stop_damping_version", None)
+      payload.turnStopActualDampingAmount = (
+        float(turn_stop_damping_amount) if turn_stop_damping_amount is not None else 0.0
+      )
+      payload.turnStopActualDampingState = (
+        str(turn_stop_damping_state) if turn_stop_damping_state is not None else "unavailable"
+      )
+      payload.turnStopTurnInBlocked = bool(getattr(evidence, "turn_stop_turn_in_blocked", False))
+      turn_stop_breakaway_latch = getattr(evidence, "turn_stop_breakaway_latch", None)
+      payload.turnStopBreakawayLatch = (
+        float(turn_stop_breakaway_latch) if turn_stop_breakaway_latch is not None else 0.0
+      )
+      turn_stop_floor = getattr(evidence, "turn_stop_sustain_floor_contribution", None)
+      payload.turnStopSustainFloorContribution = (
+        float(turn_stop_floor) if turn_stop_floor is not None else 0.0
+      )
+      payload.turnStopDampingVersion = (
+        int(turn_stop_damping_version) if turn_stop_damping_version is not None else 0
+      )
+      inferred_turn_stop_damping_valid = bool(
+        turn_stop_damping_version is not None
+        and int(turn_stop_damping_version) > 0
+        and turn_stop_damping_amount is not None
+        and turn_stop_damping_state is not None
+      )
+      turn_stop_damping_valid = getattr(evidence, "turn_stop_damping_valid", None)
+      payload.turnStopDampingValid = (
+        inferred_turn_stop_damping_valid
+        if turn_stop_damping_valid is None else bool(turn_stop_damping_valid)
+      )
+      payload.unwindRequestedTorqueAtTrigger = float(
+        getattr(evidence, "unwind_requested_torque_at_trigger", 0.0),
+      )
+      payload.unwindAppliedTorqueAtTrigger = float(
+        getattr(evidence, "unwind_applied_torque_at_trigger", 0.0),
+      )
+      payload.unwindReferenceTargetTorqueAtTrigger = float(
+        getattr(evidence, "unwind_reference_target_torque_at_trigger", 0.0),
+      )
+      payload.unwindAppliedTargetGapAtTrigger = float(
+        getattr(evidence, "unwind_applied_target_gap_at_trigger", 0.0),
+      )
+      payload.unwindPeakAppliedTargetGap = float(
+        getattr(evidence, "unwind_peak_applied_target_gap", 0.0),
+      )
       payload.handoffObserved = evidence.phase_handoff_mono_time is not None
       payload.handoffMonoTime = (
         round(evidence.phase_handoff_mono_time * 1e9)
@@ -814,7 +939,7 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
   actual_damping_state = (
     str(getattr(actuators_output, "torqueDampingState", "inactive")) if damping_valid else None
   )
-  return LateralSample(
+  sample = LateralSample(
     mono_time=now,
     active=bool(torque_state is not None and torque_state.active and sm["carControl"].latActive),
     v_ego=float(car_state.vEgo),
@@ -836,6 +961,10 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     controller_version=int(torque_state.version) if torque_state is not None else 0,
     reference_version=int(getattr(torque_state, "referenceVersion", 0)) if torque_state is not None else 0,
     reference_rate=float(getattr(torque_state, "referenceRate", 0.0)) if torque_state is not None else 0.0,
+    measurement_rate=(
+      float(getattr(torque_state, "trackingMeasurementRate", 0.0))
+      if torque_state is not None else 0.0
+    ),
     reference_target_torque=float(getattr(torque_state, "referenceReachableTargetTorque", 0.0)) if torque_state is not None else 0.0,
     reference_unwind_scale=float(getattr(torque_state, "referenceUnwindScale", 0.0)) if torque_state is not None else 0.0,
     reference_sustained_unwind_scale=float(getattr(torque_state, "referenceSustainedUnwindScale", 0.0)) if torque_state is not None else 0.0,
@@ -857,6 +986,7 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     ),
     damping_version=damping_version if damping_valid else None,
   )
+  return sample
 
 
 def main() -> None:
