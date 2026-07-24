@@ -27,3 +27,7 @@ Turns the right column of the home screen into a **stack of quick-action buttons
 - `openpilot/selfdrive/ui/ui_state.py` — `Device` honors `ScreenAlwaysOn` via an interactive-timeout override.
 - `openpilot/common/params_keys.h` — new `ScreenAlwaysOn` param (plus the `Spysy*` stats keys shared with [`custom-main-menu`](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)).
 - `openpilot/system/ui/widgets/html_render.py` — `HtmlModal` `on_close` hook (shared with the error-log viewer).
+
+## Cross-branch note
+
+The error-log button depends on [`error-log-viewer`](https://github.com/SpysyWeeb/Spysypilot/tree/error-log-viewer): that branch's `sentry.py` hook is what writes `/data/community/crashes/error.log`. On this branch alone the button works but the log stays empty; both branches carry the identical `HtmlModal` `on_close` patch, so they merge cleanly. Everything else here is standalone.
