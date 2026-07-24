@@ -11,7 +11,7 @@ from openpilot.selfdrive.ui.mici.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.mici.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.mici.onroad.confidence_ball import ConfidenceBall
 from openpilot.selfdrive.ui.mici.onroad.cameraview import CameraView
-from openpilot.selfdrive.ui.onroad.lat_event_toast import LatEventToast
+from openpilot.selfdrive.ui.onroad.driving_event_notification import DrivingEventNotification
 from openpilot.system.ui.lib.application import FontWeight, gui_app, MousePos, MouseEvent
 from openpilot.system.ui.widgets.label import UnifiedLabel
 from openpilot.system.ui.widgets import Widget
@@ -153,7 +153,7 @@ class AugmentedRoadView(CameraView):
     self._alert_renderer = AlertRenderer()
     self._driver_state_renderer = DriverStateRenderer()
     self._confidence_ball = ConfidenceBall()
-    self._lat_event_toast = LatEventToast()
+    self._driving_event_notification = DrivingEventNotification()
     self._offroad_label = UnifiedLabel("start the car to\nuse openpilot", 54, FontWeight.DISPLAY,
                                        text_color=rl.Color(255, 255, 255, int(255 * 0.9)),
                                        alignment=rl.GuiTextAlignment.TEXT_ALIGN_CENTER,
@@ -245,7 +245,8 @@ class AugmentedRoadView(CameraView):
     self._confidence_ball.render(self.rect)
 
     self._bookmark_icon.render(self.rect)
-    self._lat_event_toast.render(self._content_rect)
+    critical_alert = alert_to_render is not None and alert_to_render.status == log.SelfdriveState.AlertStatus.critical
+    self._driving_event_notification.render(self._content_rect, critical_alert)
 
   def _switch_stream_if_needed(self, sm):
     if sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
