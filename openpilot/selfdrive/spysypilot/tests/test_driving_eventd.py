@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from openpilot.selfdrive.spysypilot.driving_eventd import (
   AcceptedEvent,
   DrivingEventPlatform,
+  EventSubmitter,
   EventCandidate,
   EventRecorder,
   build_message,
@@ -90,6 +91,65 @@ def test_manual_input_does_not_suppress_or_replace_detector_output():
   events = platform.update(LateralSample(1.0), launch_sample(), manual_pressed=True, manual_time_ns=1_000_000_000)
   assert lateral.calls == 1
   assert len(events) == 2
+
+
+def test_detectors_run_only_for_their_updated_sample():
+  lateral = FixedDetector()
+  longitudinal = FixedDetector()
+  platform = DrivingEventPlatform(lateral_detector=lateral, longitudinal_detector=longitudinal)
+
+  platform.update(lateral_sample=LateralSample(1.0))
+  assert lateral.calls == 1
+  assert longitudinal.calls == 0
+
+  platform.update(longitudinal_sample=launch_sample())
+  assert lateral.calls == 1
+  assert longitudinal.calls == 1
+
+  platform.update(manual_pressed=True, manual_time_ns=123)
+  assert lateral.calls == 1
+  assert longitudinal.calls == 1
+
+
+def test_submitter_retries_stable_id_until_acknowledged():
+  class FakePubMaster:
+    def __init__(self):
+      self.messages = []
+
+    def send(self, service, msg):
+      self.messages.append((service, msg.drivingEvent.eventId, msg.drivingEvent.groupId))
+
+  pm = FakePubMaster()
+  submitter = EventSubmitter(pm, retry_interval_ns=100)
+  accepted = AcceptedEvent("event", "group", manual_candidate(123))
+  submitter.submit(accepted, now_ns=1_000)
+  assert submitter.retry_due(now_ns=1_099) == []
+  assert submitter.retry_due(now_ns=1_100) == ["event"]
+  assert pm.messages == [
+    ("drivingEvent", "event", "group"),
+    ("drivingEvent", "event", "group"),
+  ]
+  assert submitter.pending["event"].attempts == 2
+  assert submitter.acknowledge("event")
+  assert submitter.retry_due(now_ns=2_000) == []
+
+
+def test_submit_failure_remains_pending_for_retry():
+  class FlakyPubMaster:
+    def __init__(self):
+      self.calls = 0
+
+    def send(self, _service, _msg):
+      self.calls += 1
+      if self.calls == 1:
+        raise RuntimeError("logger unavailable")
+
+  pm = FlakyPubMaster()
+  submitter = EventSubmitter(pm, retry_interval_ns=100)
+  submitter.submit(AcceptedEvent("event", "group", manual_candidate(123)), now_ns=1_000)
+  assert "event" in submitter.pending
+  assert submitter.retry_due(now_ns=1_100) == ["event"]
+  assert pm.calls == 2
 
 
 def test_generic_domain_message_has_typed_empty_payload():
