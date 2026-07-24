@@ -42,6 +42,22 @@ def test_unique_ids_and_group_correlation():
   assert third.group_id == "next-group"
 
 
+def test_semantic_episode_group_survives_generic_time_window():
+  values = iter(("episode-group", "event-1", "event-2"))
+  recorder = EventRecorder(values.__next__, group_window_ns=100)
+  first_candidate = EventCandidate(
+    1_000, "lateral", "automatic", "lat.stallRelease", "test", 3,
+    "warning", 0.8, "first", episode_key="lat:episode",
+  )
+  second_candidate = EventCandidate(
+    10_000, "lateral", "automatic", "lat.handoffMismatch", "test", 3,
+    "warning", 0.9, "second", episode_key="lat:episode",
+  )
+  first = recorder.accept(first_candidate)
+  second = recorder.accept(second_candidate)
+  assert first.group_id == second.group_id == "episode-group"
+
+
 def test_retrying_an_accepted_event_retains_ids():
   accepted = AcceptedEvent("event", "group", manual_candidate(123))
   first = build_message(accepted).drivingEvent
@@ -64,6 +80,7 @@ def test_manual_lateral_and_longitudinal_coexist():
   events = platform.update(LateralSample(1.0), launch_sample(), manual_pressed=True, manual_time_ns=1_000_000_000)
   assert {event.candidate.domain for event in events} == {"manual", "lateral", "longitudinal"}
   assert {event.group_id for event in events} == {"group"}
+  assert next(event for event in events if event.candidate.domain == "longitudinal").candidate.attribution == "mixed"
 
 
 def test_detector_exception_isolation():

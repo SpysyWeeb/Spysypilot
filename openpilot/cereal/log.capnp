@@ -2496,6 +2496,12 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     leadLaunch @21 :LeadLaunchPayload;
   }
 
+  detectedMonoTime @22 :UInt64;
+  episodeStartMonoTime @23 :UInt64;
+  analysisWindowBeforeS @24 :Float32;
+  analysisWindowAfterS @25 :Float32;
+  episodeKey @26 :Text;
+
   enum Domain {
     manual @0;
     lateral @1;
@@ -2547,6 +2553,29 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     unwindSameEpisode @15 :Bool;
     appliedTargetGap @16 :Float32;
     pTerm @17 :Float32;
+    driverTorque @18 :Float32;
+    steeringPressed @19 :Bool;
+    steeringTorqueEps @20 :Float32;
+    dampingApplied @21 :Float32;
+    dampingState @22 :Text;
+    triggerDriverConfounded @23 :Bool;
+    triggerRoadConfounded @24 :Bool;
+    driverConfoundedFraction @25 :Float32;
+    maxAbsDriverTorque @26 :Float32;
+    steeringPressedAny @27 :Bool;
+    roadConfoundedFraction @28 :Float32;
+    driverConfoundReason @29 :UInt16;
+    evidenceStartMonoTime @30 :UInt64;
+    evidenceEndMonoTime @31 :UInt64;
+    stallReleaseCount @32 :UInt8;
+    releaseOffsetsS @33 :List(Float32);
+    stallDurationsS @34 :List(Float32);
+    releasePeakRatesDeg @35 :List(Float32);
+    stallEpisodePhase @36 :Text;
+    lateUnwindDurationS @37 :Float32;
+    previousUnwindEffectivePhase @38 :Float32;
+    previousUnwindSameEpisode @39 :Bool;
+    trackingInactiveTimeS @40 :Float32;
   }
 
   struct LeadLaunchPayload {
@@ -2557,6 +2586,30 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     commandToEgoS @4 :Float32;
     radarDiscontinuity @5 :Bool;
     radarConfidence @6 :Float32;
+    onsets @7 :List(OnsetSnapshot);
+    attributionDetail @8 :Text;
+
+    struct OnsetSnapshot {
+      kind @0 :Kind;
+      monoTime @1 :UInt64;
+      dRel @2 :Float32;
+      vLead @3 :Float32;
+      vEgo @4 :Float32;
+      aEgo @5 :Float32;
+      outputAccel @6 :Float32;
+      brakePressed @7 :Bool;
+      brakeHoldActive @8 :Bool;
+
+      enum Kind {
+        candidate @0;
+        forecast @1;
+        plan @2;
+        command @3;
+        lead @4;
+        ego @5;
+        egoAcceleration @6;
+      }
+    }
   }
 }
 
@@ -2569,10 +2622,13 @@ struct DrivingEventRecorded @0xcac5f5a6b137d821 {
   occurredMonoTime @5 :UInt64;
   route @6 :Text;
   segment @7 :Int32;
-  markerWritten @8 :Bool;
+  markerWritten @8 :Bool;  # Legacy name: accepted by loggerd, not an fsync claim.
   currentSegmentPreserved @9 :Bool;
   followingSegmentScheduled @10 :Bool;
   error @11 :Text;
+  segmentStartMonoTime @12 :UInt64;
+  ackMonoTime @13 :UInt64;
+  markerAccepted @14 :Bool;  # Accepted by the active logger; completed-rlog indexing verifies durability.
 }
 
 struct SoundPressure @0xdc24138990726023 {
