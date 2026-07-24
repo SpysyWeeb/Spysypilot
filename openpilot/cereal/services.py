@@ -49,6 +49,8 @@ _services: dict[str, tuple] = {
   "longitudinalPlan": (True, 20., 10),
   "lateralManeuverPlan": (True, 20.),
   "lateralEvent": (True, 0., 1),
+  "drivingEvent": (True, 0., 1),
+  "drivingEventRecorded": (True, 0., 1),
   "driverAssistance": (True, 20., 20),
   "procLog": (True, 0.5, 15, QueueSize.BIG),
   "gpsLocationExternal": (True, 10., 10),
