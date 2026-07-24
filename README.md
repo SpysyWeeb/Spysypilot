@@ -18,6 +18,14 @@ Active tuning work:
   roughly 1.2–1.4 seconds before crossing crown-neutral. The change must remove
   stale holding torque earlier without raising the existing torque or safety
   limits, and remains subject to replay and field validation.
+- **In progress:** refine that exit using field route
+  `00000094--8cec74a749`. Controller v16 removed stale torque safely, but its
+  falling angle scale could reintroduce old-turn torque, its 200–280 degree
+  release was sometimes too weak, and crown-neutral alone did not free the
+  most tightly wound EPS cases. Controller v17 now protects immediate turn-in
+  demand, keeps confirmed release monotonic, strengthens the 200–280 degree
+  range, and permits only a bounded, evidence-gated breakout assist. Replay is
+  complete, but the change remains in progress pending another field test.
 
 ## What it does
 
@@ -37,8 +45,9 @@ The controller:
   limiter before the path needs it;
 - starts and hands off unwind episodes using future geometry, crown-neutral
   torque, wheel rate, and applied-torque delivery state;
-- adds angle-scaled exit urgency when a same-episode, low-speed unwind is
-  confirmed, removing stale old-turn torque without crossing crown-neutral;
+- latches an angle-scaled old-direction ceiling when a same-episode, low-speed
+  unwind is confirmed, then uses a separately gated, bounded breakout target
+  only if an extreme-angle EPS remains stuck at crown-neutral;
 - preserves turn-in authority when the wheel is still behind the planned path;
 - records versioned controller diagnostics in `LateralTorqueState` for rlog
   analysis.
@@ -101,9 +110,14 @@ lateral-acceleration space:
 - applied torque is treated as actuator state and only opposes torque that is
   still driving a wheel already outrunning the planned path;
 - during a confirmed high-angle unwind below 20 mph, a short persistence gate
-  progressively removes old-direction command in proportion to steering angle,
-  unwind rate, and sustained future-path evidence; it cannot add
-  opposite-direction torque or move the command past crown-neutral;
+  progressively lowers a crown-relative old-direction ceiling in proportion to
+  steering angle, unwind rate, and sustained future-path evidence; the ceiling
+  cannot rise again while that episode remains owned;
+- a delay-aligned present-demand guard retains turn-in authority while the
+  immediate old-direction request is still building and under-tracked;
+- only after an extreme-angle wheel reaches applied crown-neutral and fails a
+  300 ms progress check may a separate breakout target request up to 0.15
+  normalized torque in the unwind direction;
 - after the future horizon confirms a new maneuver for 200 ms, a crown-aware
   handoff cap progressively removes only controller command that still points
   into the old episode beyond the reachable target.
@@ -131,8 +145,18 @@ Before a direction handoff, high-angle exit urgency can act within the current
 episode when the wheel and future reference both show a sustained unwind. It
 starts above 120 degrees of old-turn steering angle, scales with angle and
 unwind rate, is limited to low speed, and freezes integral growth while active.
-Brief evidence dropout is tolerated to avoid command chatter, while loss of
-lateral control, driver input, or unwind ownership resets it immediately.
+Full one-sided release is available by 240 degrees, and confirmed authority is
+latched as a monotonically tightening crown-relative ceiling. Brief evidence
+dropout is tolerated for 250 ms without restoring old-direction torque. The
+last ceiling bridges into a committed direction handoff, while breakout
+authority resets immediately. Loss of lateral control or driver input resets
+the full state immediately.
+
+At angles above 300 degrees, a separate EPS breakout stage can act only after
+applied torque has reached crown-neutral and the wheel has failed to unwind at
+least 30 degrees during a 300 ms progress window. It ramps toward at most 0.15
+normalized opposite torque, never weakens an already stronger unwind command,
+and is blocked by building, under-tracked present turn demand.
 
 ### 4. Hyundai EPS damping and panda safety
 
@@ -199,7 +223,7 @@ Current diagnostic versions:
 | layer | version | examples |
 |---|---:|---|
 | future reference planner | 5 | base/output curvature, preview timing, reachable/geometric/episode torque, unwind confidence |
-| torque controller | 16 | delayed curvature, trajectory/measured rate, cascade terms, unwind ownership, high-angle exit urgency, committed-handoff cap |
+| torque controller | 17 | delayed curvature and demand rate, trajectory/measured rate, unwind ownership, monotonic old-direction ceiling, present-demand guard, breakout progress and committed-handoff cap |
 | Hyundai EPS damping | 3 | requested/applied damping, gate state, signed wheel rate, breakaway stall and relief state |
 
 The universal driving-event logger remains separate infrastructure. BLaT
@@ -213,11 +237,11 @@ committed-handoff, and EPS-breakaway implementation with opendbc pin
 
 | suite | result |
 |---|---:|
-| delayed-feedback, reference-rate, actuator, unwind, and handoff controller tests | 70 passed |
-| future-reference planner tests | 34 passed |
+| delayed-feedback, reference-rate, actuator, unwind, and handoff controller tests | 88 passed |
+| supporting lateral-controller, request-buffer, and future-reference planner tests | 42 passed |
 | Hyundai low-speed torque damping and breakaway tests | 20 passed |
 | Hyundai panda safety tests | 1215 passed, 313 skipped by suite configuration |
-| **total passing** | **1339 passed** |
+| **total passing** | **1365 passed** |
 
 The suites cover symmetry, bounds, speed schedules, invalid-model fallback,
 torque reachability, crown-neutral transitions, episode handoff, driver
@@ -231,6 +255,16 @@ seconds earlier near 12:41:16. The cap remained one-sided in all three inspected
 windows, including the weaker 12:38:30 event. This replay verifies controller
 direction and gating against the logged inputs; it does not predict closed-loop
 vehicle response and must be followed by a field test.
+
+A second open-loop replay processed all 70,631 controller samples from route
+`00000094--8cec74a749`. Across 19 logical release intervals, the latched
+old-direction ceiling never increased, no release or breakout correction had
+the wrong sign, and breakout never appeared with driver input, lost episode
+ownership, or a committed handoff. Two recorded extreme-angle stalls satisfied
+the counterfactual breakout gates, peaking at 0.048 and 0.019 normalized torque.
+The present-demand guard also activated in the identified early-release
+windows. Because recorded wheel motion came from controller v16, these results
+verify v17 command invariants and eligibility—not closed-loop improvement.
 
 Automated tests are not a substitute for route analysis and field testing of
 steering feel.

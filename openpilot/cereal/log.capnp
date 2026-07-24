@@ -961,6 +961,18 @@ struct ControlsState @0x97ff69c53601abf1 {
     torqueCommandBeforeHighAngleExit @81 :Float32;        # normalized request after legacy unwind blend, before exit urgency
     highAngleUnwindOldTorqueCorrection @82 :Float32;      # signed correction removing old-turn torque toward crown-neutral
     highAngleUnwindOldDirectionTorque @83 :Float32;       # pre-cap old-turn component beyond crown-neutral
+    highAngleUnwindLatchedScale @84 :Float32;              # monotonic release authority retained for the owned episode
+    highAngleUnwindOldDirectionLimit @85 :Float32;         # crown-relative maximum old-turn command retained by the latch
+    highAngleUnwindTurnInGuard @86 :Float32;               # present-demand protection reducing newly accumulated release
+    highAngleUnwindEvidenceHeld @87 :Bool;                 # confirmed release retained through a short evidence dropout
+    highAngleUnwindEvidenceDropoutTime @88 :Float32;       # seconds since future unwind evidence was last eligible
+    highAngleUnwindAppliedOldDirectionTorque @89 :Float32; # crown-relative old-turn component still applied by the EPS
+    highAngleUnwindAppliedNeutral @90 :Bool;               # applied torque is within the breakout crown-neutral tolerance
+    highAngleUnwindNeutralDwell @91 :Float32;              # continuous seconds at applied crown-neutral
+    highAngleUnwindProgressDeg @92 :Float32;               # wheel unwind progress since applied crown-neutral
+    highAngleUnwindBreakoutScale @93 :Float32;             # bounded extreme-angle opposite-assist scale
+    highAngleUnwindBreakoutCorrection @94 :Float32;        # signed normalized opposite correction added by breakout
+    highAngleUnwindPresentDemandRate @95 :Float32;         # delay-aligned present lateral-demand rate, m/s^3
    }
 
   struct LateralAngleState {
