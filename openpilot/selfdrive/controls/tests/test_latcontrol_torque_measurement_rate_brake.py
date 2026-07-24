@@ -18,6 +18,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   CASCADE_P_SCALES,
   CASCADE_P_SCALE_SPEEDS,
   CASCADE_RATE_CORRECTION_MAX,
+  HANDOFF_TORQUE_CAP_RAMP_TIME,
   REFERENCE_RATE_MIN_SPEED,
   REFERENCE_RATE_TRACKING_SCALES,
   REFERENCE_RATE_TRACKING_SPEEDS,
@@ -31,6 +32,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   UnwindPhaseTracker,
   cascade_p_scale,
   get_actuation_speed,
+  get_committed_handoff_torque_cap,
   get_future_unwind_brake,
   get_projected_lateral_accel,
   get_reference_rate_cascade,
@@ -259,6 +261,48 @@ class TestFutureUnwindBrake:
     assert left_time == pytest.approx(left_to_neutral)
 
 
+class TestCommittedHandoffTorqueCap:
+  def test_inactive_is_identity(self):
+    assert get_committed_handoff_torque_cap(0.8, -0.4, 0.1, 1.0, False, 1.0) == (0.8, 0.0, 0.0, 0.0)
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_full_cap_removes_only_old_direction_excess(self, sign):
+    torque, correction, limit, scale = get_committed_handoff_torque_cap(
+      0.9 * sign,
+      0.4 * sign,
+      0.1 * sign,
+      sign,
+      True,
+      HANDOFF_TORQUE_CAP_RAMP_TIME,
+    )
+    assert torque == pytest.approx(0.4 * sign)
+    assert correction == pytest.approx(-0.5 * sign)
+    assert limit == pytest.approx(0.3)
+    assert scale == pytest.approx(1.0)
+
+  def test_cap_ramps_after_commitment(self):
+    torque, correction, limit, scale = get_committed_handoff_torque_cap(
+      0.9,
+      0.4,
+      0.1,
+      1.0,
+      True,
+      HANDOFF_TORQUE_CAP_RAMP_TIME / 2.0,
+    )
+    assert scale == pytest.approx(0.5)
+    assert limit == pytest.approx(0.3)
+    assert correction == pytest.approx(-0.25)
+    assert torque == pytest.approx(0.65)
+
+  def test_never_opposes_new_direction_or_increases_old_torque(self):
+    new_direction = get_committed_handoff_torque_cap(-0.4, -0.7, 0.1, 1.0, True, 1.0)
+    below_limit = get_committed_handoff_torque_cap(0.3, 0.7, 0.1, 1.0, True, 1.0)
+    assert new_direction[0] == pytest.approx(-0.4)
+    assert new_direction[1] == 0.0
+    assert below_limit[0] == pytest.approx(0.3)
+    assert below_limit[1] == 0.0
+
+
 class TestUnwindPhaseTracker:
   def test_holds_through_delivery_then_releases_smoothly(self):
     tracker = UnwindPhaseTracker(DT_CTRL)
@@ -337,12 +381,13 @@ class TestUnwindPhaseTracker:
     assert not same_episode
     assert opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME
     assert not episode_armed
+    assert tracker.handoff_time > 0.0
     assert phase < 1.0
 
     # The old geometry indication must not immediately start a second episode
     # after the smooth handoff reaches zero.
     for _ in range(100):
-      phase, *_, episode_armed = tracker.update(
+      state = tracker.update(
         True,
         1.0,
         -0.02,
@@ -353,10 +398,12 @@ class TestUnwindPhaseTracker:
         0.0,
         0.5,
       )
+      phase = state.phase
+      episode_armed = state.episode_armed
     assert phase == 0.0
     assert not episode_armed
 
-    *_, episode_armed = tracker.update(
+    state = tracker.update(
       True,
       0.0,
       -0.02,
@@ -367,7 +414,7 @@ class TestUnwindPhaseTracker:
       0.0,
       0.5,
     )
-    assert episode_armed
+    assert state.episode_armed
 
   def test_transient_opposite_sample_does_not_transfer_episode(self):
     tracker = UnwindPhaseTracker(DT_CTRL)
@@ -711,4 +758,61 @@ class TestReferenceRateTrackingIntegration:
     assert torque_log.unwindSameEpisode
     assert torque_log.unwindOppositeTime == 0.0
     assert torque_log.unwindEpisodeArmed
+    assert not torque_log.handoffCommitted
+    assert torque_log.handoffTime == 0.0
+    assert torque_log.handoffTorqueCorrection == 0.0
     assert 0.0 < torque < 0.8
+
+  def test_confirmed_handoff_caps_stale_old_direction_controller_output(self):
+    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
+    car_state = car.CarState.new_message()
+    car_state.vEgo = 3.0
+    params = log.LiveParametersData.new_message()
+
+    controller.update(
+      True,
+      car_state,
+      vehicle_model,
+      params,
+      False,
+      0.02,
+      False,
+      0.2,
+      applied_torque=-0.8,
+      reference_unwind_scale=1.0,
+      reference_target_torque=-0.5,
+      reference_geometric_target_torque=-0.5,
+      reference_episode_target_torque=-0.5,
+      reference_geometric_lateral_accel=0.5,
+      reference_episode_lateral_accel=0.5,
+    )
+
+    torque = 0.0
+    torque_log = None
+    samples = int(np.ceil(UNWIND_EPISODE_OPPOSITE_TIME / DT_CTRL)) + 2
+    for _ in range(samples):
+      torque, _, torque_log = controller.update(
+        True,
+        car_state,
+        vehicle_model,
+        params,
+        False,
+        0.02,
+        False,
+        0.2,
+        applied_torque=-0.5,
+        reference_unwind_scale=1.0,
+        reference_target_torque=0.5,
+        reference_geometric_target_torque=0.5,
+        reference_episode_target_torque=0.5,
+        reference_geometric_lateral_accel=-0.5,
+        reference_episode_lateral_accel=-0.5,
+      )
+
+    assert torque_log is not None
+    assert torque_log.handoffCommitted
+    assert torque_log.handoffTime > 0.0
+    assert torque_log.handoffTorqueCapScale > 0.0
+    assert torque_log.handoffTorqueCorrection > 0.0
+    assert torque == pytest.approx(torque_log.output)
+    assert abs(torque) < abs(torque_log.torqueCommandBeforeHandoffCap)
