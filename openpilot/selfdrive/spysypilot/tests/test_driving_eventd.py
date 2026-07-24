@@ -191,7 +191,7 @@ def test_longitudinal_sampler_uses_fork_radar_status_field():
     def __init__(self):
       self.data = {
         "radarState": SimpleNamespace(leadOne=SimpleNamespace(
-          status=True, dRel=5.0, vLead=1.0, vLeadK=1.0, radarTrackId=7,
+          present=True, dRel=5.0, vLead=1.0, vLeadK=1.0, radarTrackId=7,
         )),
         "modelV2": SimpleNamespace(leadsV3=[]),
         "carState": SimpleNamespace(standstill=True, vEgo=0.0),
