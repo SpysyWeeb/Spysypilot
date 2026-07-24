@@ -1,0 +1,110 @@
+import unittest
+from types import SimpleNamespace
+
+import numpy as np
+
+from openpilot.common.constants import CV
+from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
+from openpilot.selfdrive.controls.lib.model_curve_speed import (
+  CURVATURE_BP,
+  CURVE_SPEED_V,
+  MAX_CURVE_SPEED,
+  ModelCurveSpeedLimiter,
+  curve_speed_for_curvature,
+)
+from openpilot.selfdrive.modeld.constants import ModelConstants
+
+
+def make_model(curvature=None, position_x=None, position_y=None, speed=15.0):
+  sample_count = ModelConstants.IDX_N
+  curvature = np.zeros(sample_count) if curvature is None else np.asarray(curvature)
+  position_x = np.arange(sample_count, dtype=float) if position_x is None else np.asarray(position_x)
+  position_y = np.zeros(sample_count) if position_y is None else np.asarray(position_y)
+  velocity_x = np.full(sample_count, speed)
+  return SimpleNamespace(
+    position=SimpleNamespace(x=position_x, y=position_y),
+    velocity=SimpleNamespace(x=velocity_x),
+    orientationRate=SimpleNamespace(z=curvature * velocity_x),
+  )
+
+
+class TestModelCurveSpeed(unittest.TestCase):
+  def test_field_calibration_points(self):
+    for curvature, speed in zip(CURVATURE_BP, CURVE_SPEED_V, strict=True):
+      with self.subTest(curvature=curvature):
+        self.assertAlmostEqual(curve_speed_for_curvature(curvature), speed)
+
+  def test_curvature_speed_envelope_is_monotonic_and_fail_open_for_straight_path(self):
+    curvature = np.array([0.0, CURVATURE_BP[0] / 2.0, *CURVATURE_BP, CURVATURE_BP[-1] * 2.0])
+    speed = curve_speed_for_curvature(curvature)
+
+    self.assertEqual(speed[0], MAX_CURVE_SPEED)
+    self.assertTrue(np.all(np.diff(speed) <= 0.0))
+    self.assertLess(speed[-1], CURVE_SPEED_V[-1])
+
+  def test_single_sample_prediction_spike_is_rejected(self):
+    for spike_index in (0, 12, ModelConstants.IDX_N - 1):
+      with self.subTest(spike_index=spike_index):
+        curvature = np.zeros(ModelConstants.IDX_N)
+        curvature[spike_index] = CURVATURE_BP[-1]
+        limiter = ModelCurveSpeedLimiter()
+        v_cruise = 30.0
+
+        self.assertEqual(limiter.update(make_model(curvature=curvature), v_cruise), v_cruise)
+        self.assertFalse(limiter.active)
+
+  def test_sustained_curve_caps_cruise_using_approach_distance(self):
+    curvature = np.zeros(ModelConstants.IDX_N)
+    curvature[12:17] = CURVATURE_BP[1]
+    limiter = ModelCurveSpeedLimiter()
+
+    model = make_model(curvature=curvature)
+    limiter.update(model, 30.0)
+    target = limiter.update(model, 30.0)
+
+    expected = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
+    self.assertTrue(limiter.active)
+    self.assertAlmostEqual(limiter.curvature, CURVATURE_BP[1])
+    self.assertGreater(limiter.distance, 0.0)
+    self.assertAlmostEqual(target, expected)
+
+  def test_single_frame_prediction_spike_is_rejected(self):
+    limiter = ModelCurveSpeedLimiter()
+    straight_model = make_model()
+    spike_model = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
+
+    self.assertEqual(limiter.update(straight_model, 30.0), 30.0)
+    self.assertEqual(limiter.update(spike_model, 30.0), 30.0)
+    self.assertEqual(limiter.update(straight_model, 30.0), 30.0)
+    self.assertFalse(limiter.active)
+
+  def test_approach_distance_follows_path_arc_not_only_forward_position(self):
+    curvature = np.zeros(ModelConstants.IDX_N)
+    curvature[20:25] = CURVATURE_BP[-1]
+    x = np.minimum(np.arange(ModelConstants.IDX_N, dtype=float), 10.0)
+    y = np.maximum(np.arange(ModelConstants.IDX_N, dtype=float) - 10.0, 0.0)
+    limiter = ModelCurveSpeedLimiter()
+
+    model = make_model(curvature=curvature, position_x=x, position_y=y)
+    limiter.update(model, 30.0)
+    limiter.update(model, 30.0)
+
+    self.assertTrue(limiter.active)
+    self.assertGreater(limiter.distance, np.ptp(x))
+
+  def test_invalid_model_data_does_not_change_cruise(self):
+    for invalid_value in ("short", "nan"):
+      with self.subTest(invalid_value=invalid_value):
+        model = make_model()
+        if invalid_value == "short":
+          model.orientationRate.z = model.orientationRate.z[:-1]
+        else:
+          model.position.x[5] = np.nan
+        limiter = ModelCurveSpeedLimiter()
+
+        self.assertEqual(limiter.update(model, 20.0), 20.0)
+        self.assertFalse(limiter.active)
+
+  def test_curve_speed_units_match_field_mph_values(self):
+    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [38.0, 19.0, 11.0])
+    self.assertEqual(MAX_CURVE_SPEED, V_CRUISE_MAX * CV.KPH_TO_MS)

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import math
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
@@ -10,6 +9,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.blt import BLTSupervisor, LeadDeparturePreRelease
+from openpilot.selfdrive.controls.lib.model_curve_speed import ModelCurveSpeedLimiter
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
@@ -34,32 +34,11 @@ LAUNCH_OPEN_LENGTH = 20.0   # m, model path length that reads as "the way ahead 
 LAUNCH_OPEN_CONFIRM = 0.7   # filtered (RC 0.3s) open level to trust -- ~0.5s of sustained open path
 LAUNCH_CLOSE_LENGTH = 10.0  # m, path re-collapse below this cancels anticipation (model changed its mind)
 
-# Lookup table for turns
-_A_TOTAL_MAX_V = [4.0, 4.0]  # Spysypilot: raised with the gas schedule (low end 3.4 -> 4.0 so the
-                              # total budget never clips the 4.0 launch cap while straight) -- the old 1.7
-_A_TOTAL_MAX_BP = [20., 40.]  # low-speed TOTAL budget re-clipped every launch to 1.7 even driving
-                              # straight (route 40 t=830: plan pinned at exactly +1.70 for 8s while
-                              # the lead ran away); turns still shed longitudinal authority via a_y
-
 def get_max_accel(v_ego):
   return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
 
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
-
-def limit_accel_in_turns(v_ego, angle_steers, a_target, CP):
-  """
-  This function returns a limited long acceleration allowed, depending on the existing lateral acceleration
-  this should avoid accelerating when losing the target in turns
-  """
-  # FIXME: This function to calculate lateral accel is incorrect and should use the VehicleModel
-  # The lookup table for turns should also be updated if we do this
-  a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
-  a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
-  a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
-
-  return [a_target[0], min(a_target[1], a_x_allowed)]
-
 
 class LongitudinalPlanner:
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
@@ -69,6 +48,7 @@ class LongitudinalPlanner:
     self.dt = dt
     self.allow_throttle = True
     self.lead_departure = LeadDeparturePreRelease()
+    self.curve_speed_limiter = ModelCurveSpeedLimiter()
 
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -132,8 +112,6 @@ class LongitudinalPlanner:
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
     accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
-    steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
-    accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
 
     if reset_state:
       self.v_desired_filter.x = v_ego
@@ -153,6 +131,8 @@ class LongitudinalPlanner:
 
     if force_slow_decel:
       v_cruise = 0.0
+    else:
+      v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise)
 
     # Force Stops: hold the model to a stop it planned (red-light indecision / e2e crawl)
     v_cruise = min(v_cruise, self.force_stops.update(sm))
