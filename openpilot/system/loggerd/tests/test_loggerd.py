@@ -351,8 +351,11 @@ class TestLoggerd:
     assert ack.eventId == "loggerd-test-event"
     assert ack.groupId == "loggerd-test-group"
     assert ack.markerWritten
+    assert ack.markerAccepted
     assert ack.currentSegmentPreserved
     assert ack.followingSegmentScheduled
+    assert ack.segmentStartMonoTime > 0
+    assert ack.ackMonoTime >= ack.occurredMonoTime
     segment_dir = self._get_latest_log_dir()
     assert ack.route == segment_dir.name.rsplit("--", 1)[0]
     assert ack.segment == int(segment_dir.name.rsplit("--", 1)[1])
@@ -386,6 +389,7 @@ class TestLoggerd:
       received = messaging.recv_one(ack_sock)
       assert received is not None
       assert received.drivingEventRecorded.markerWritten
+      assert received.drivingEventRecorded.markerAccepted
       assert not received.drivingEventRecorded.currentSegmentPreserved
       assert "setxattr" in received.drivingEventRecorded.error
       corrected = messaging.recv_one(ack_sock)
@@ -393,9 +397,11 @@ class TestLoggerd:
       corrected_ack = corrected.drivingEventRecorded
       assert corrected_ack.eventId == "loggerd-xattr-failure"
       assert corrected_ack.markerWritten
+      assert corrected_ack.markerAccepted
       assert corrected_ack.currentSegmentPreserved
       assert corrected_ack.followingSegmentScheduled
       assert corrected_ack.error == ""
+      assert corrected_ack.ackMonoTime >= received.drivingEventRecorded.ackMonoTime
 
       msg.clear_write_flag()
       pm.send("drivingEvent", msg)
