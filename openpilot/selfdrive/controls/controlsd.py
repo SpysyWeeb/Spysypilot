@@ -62,20 +62,22 @@ class Controls:
 
     self.LoC = LongControl(self.CP)
     self.VM = VehicleModel(self.CP)
+    self.lateral_tuning_type = self.CP.lateralTuning.which()
+    self.is_torque_lateral = self.lateral_tuning_type == 'torque'
     self.LaC: LatControl
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
       self.LaC = LatControlAngle(self.CP, self.CI, DT_CTRL)
     elif self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       self.LaC = LatControlCurvature(self.CP, self.CI, DT_CTRL)
-    elif self.CP.lateralTuning.which() == 'pid':
+    elif self.lateral_tuning_type == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
-    elif self.CP.lateralTuning.which() == 'torque':
+    elif self.is_torque_lateral:
       self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
 
     # BLaT's actuator-aware path timing is currently calibrated from the
     # Hyundai controller limits. Keep every other platform on the legacy path
     # reference until its delivery limits have been measured independently.
-    if self.CP.brand == "hyundai" and self.CP.lateralTuning.which() == 'torque':
+    if self.CP.brand == "hyundai" and self.is_torque_lateral:
       hyundai_params = self.CI.CC.params
       self.lateral_reference_planner.configure_actuator(
         ActuatorPreviewConfig(
@@ -107,7 +109,7 @@ class Controls:
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
 
     # Update Torque Params
-    if self.CP.lateralTuning.which() == 'torque':
+    if self.is_torque_lateral:
       torque_params = self.sm['liveTorqueParameters']
       if self.sm.all_checks(['liveTorqueParameters']) and torque_params.useParams:
         self.LaC.update_live_torque_params(
@@ -156,7 +158,7 @@ class Controls:
         self.lateral_reference_planner.reset()
       elif self.sm.updated['modelV2']:
         self.lateral_reference_planner.update(model_v2, self.curvature, CS.vEgo)
-      if self.CP.lateralTuning.which() == 'torque':
+      if self.is_torque_lateral:
         new_desired_curvature = self.lateral_reference_planner.get_curvature(
           raw_desired_curvature,
           CS.vEgo,
@@ -172,7 +174,7 @@ class Controls:
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
     actuators.curvature = self.desired_curvature
-    if self.CP.lateralTuning.which() == 'torque':
+    if self.is_torque_lateral:
       reference_log = self.lateral_reference_planner.diagnostics
       steer, lateral_output, lac_log = self.LaC.update(
         CC.latActive,
@@ -196,8 +198,8 @@ class Controls:
       steer, lateral_output, lac_log = self.LaC.update(
         CC.latActive, CS, self.VM, lp, self.steer_limited_by_safety, self.desired_curvature, curvature_limited, lat_delay
       )
-    actuators.torqueDampingBlocked = bool(self.CP.lateralTuning.which() == 'torque' and lac_log.dampingTurnInBlocked)
-    if self.CP.lateralTuning.which() == 'torque':
+    actuators.torqueDampingBlocked = bool(self.is_torque_lateral and lac_log.dampingTurnInBlocked)
+    if self.is_torque_lateral:
       lac_log.referenceVersion = reference_log.version
       # np.interp/np.clip may return NumPy scalar types, which pycapnp refuses.
       # Convert every planner diagnostic at the cereal boundary.
@@ -287,7 +289,7 @@ class Controls:
     # trigger the car's stock driver monitoring escalation
     CC.driverMonitoringEscalation = cs.forceDecel
 
-    lat_tuning = self.CP.lateralTuning.which()
+    lat_tuning = self.lateral_tuning_type
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
       cs.lateralControlState.angleState = lac_log
     elif self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
