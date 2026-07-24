@@ -10,6 +10,7 @@ from openpilot.selfdrive.spysypilot.driving_event_indexer import (
   REVIEWS_NAME,
   ROTATED_MANIFEST_NAME,
   append_events,
+  event_to_record,
   rebuild,
   scan_once,
 )
@@ -189,6 +190,128 @@ def test_stop_jolt_payload_serializes_to_manifest(tmp_path):
   assert record["payload"]["imu_jerk"] == -3.5
   assert record["payload"]["a_ego_jerk"] == -3.0
   assert record["payload"]["peak_jolt_mono_time"] == record["occurred_mono_time"]
+
+
+def test_rolling_lead_payload_serializes_commit_and_response_evidence():
+  occurred = 100_000_000_000
+  msg = messaging.new_message("drivingEvent", valid=True)
+  event = msg.drivingEvent
+  event.version = 2
+  event.eventId = "rolling"
+  event.groupId = "group"
+  event.occurredMonoTime = occurred
+  event.detectedMonoTime = occurred + 2_500_000_000
+  event.episodeStartMonoTime = occurred
+  event.domain = "longitudinal"
+  event.source = "automatic"
+  event.eventType = "long.lateRollingLeadResponseVehicle"
+  event.detector = "rollingLeadResponseDetector"
+  event.detectorVersion = 1
+  event.severity = "warning"
+  event.confidence = 0.95
+  event.attribution = "vehicle"
+  event.analysisWindowBeforeS = 5.0
+  event.analysisWindowAfterS = 8.0
+  payload = event.payload.init("rollingLeadResponse")
+  payload.attributionDetail = "vehicle"
+  payload.leadCommitMonoTime = occurred
+  payload.controllerResponseMonoTime = occurred + 400_000_000
+  payload.egoResponseMonoTime = occurred + 1_100_000_000
+  payload.detectedMonoTime = event.detectedMonoTime
+  payload.leadToCommandS = 0.4
+  payload.leadToEgoS = 1.1
+  payload.maxGapGrowth = 4.9
+  payload.peakRelativeSpeed = 3.5
+  payload.radarTrackId = 42
+  payload.controllerResponsePresent = True
+  payload.egoResponsePresent = True
+  onsets = payload.init("onsets", 1)
+  onsets[0].kind = "leadCommit"
+  onsets[0].monoTime = occurred
+  onsets[0].radarValid = True
+
+  record = event_to_record(
+    msg.as_reader().drivingEvent, None, "route", 1, occurred + 2_600_000_000,
+    60_000_000_000, 40_000_000_000,
+  )
+  assert record["payload_type"] == "rollingLeadResponse"
+  assert record["occurred_mono_time"] == record["payload"]["lead_commit_mono_time"]
+  assert record["detected_mono_time"] == record["payload"]["detected_mono_time"]
+  assert record["payload"]["radar_track_id"] == 42
+  assert record["payload"]["max_gap_growth"] == 4.9
+  assert record["payload"]["onsets"][0]["kind"] == "leadCommit"
+
+
+def test_old_lateral_payload_defaults_remain_indexable_and_v4_release_is_structured():
+  occurred = 100_000_000_000
+  for detector_version in (2, 3):
+    old_msg = messaging.new_message("drivingEvent", valid=True)
+    old = old_msg.drivingEvent
+    old.version = 2
+    old.eventId = f"old-v{detector_version}"
+    old.groupId = "group"
+    old.occurredMonoTime = occurred
+    old.domain = "lateral"
+    old.source = "automatic"
+    old.eventType = "lat.stallRelease"
+    old.detector = "blatLateralEventDetector"
+    old.detectorVersion = detector_version
+    old.severity = "warning"
+    old.confidence = 0.8
+    old.attribution = "controller"
+    old_payload = old.payload.init("lateral")
+    if detector_version >= 3:
+      old_payload.stallReleaseCount = 3
+      old_payload.dampingApplied = -0.72
+
+    old_record = event_to_record(
+      old_msg.as_reader().drivingEvent, None, "route", 1, occurred,
+      60_000_000_000, 40_000_000_000,
+    )
+    assert old_record["detector_version"] == detector_version
+    assert old_record["payload"]["damping_applied"] == (-0.72 if detector_version >= 3 else 0.0)
+    assert old_record["payload"]["driver_interaction"] == "none"
+    assert old_record["payload"]["requested_torque_at_crossing"] == 0.0
+    assert old_record["payload"]["stall_releases"] == []
+
+  new_msg = messaging.new_message("drivingEvent", valid=True)
+  new = new_msg.drivingEvent
+  new.version = 2
+  new.eventId = "v4"
+  new.groupId = "group"
+  new.occurredMonoTime = occurred
+  new.detectedMonoTime = occurred + 250_000_000
+  new.domain = "lateral"
+  new.source = "automatic"
+  new.eventType = "lat.stallRelease"
+  new.detector = "blatLateralEventDetector"
+  new.detectorVersion = 4
+  new.severity = "warning"
+  new.confidence = 0.85
+  new.attribution = "controller"
+  new_payload = new.payload.init("lateral")
+  new_payload.driverInteraction = "possibleRawTorque"
+  new_payload.roadConfoundExtent = "substantial"
+  releases = new_payload.init("stallReleases", 3)
+  for index, release in enumerate(releases):
+    release.releaseMonoTime = occurred - (2 - index) * 500_000_000
+    release.dampingVersion = 2
+    release.dampingValid = True
+    release.dampingState = "turnInAuthority" if index < 2 else "damping"
+    release.dampingApplied = 0.0 if index < 2 else 0.02934
+    release.turnInBlocked = index < 2
+    release.breakawayLatch = 0.0 if index < 2 else 0.894866
+
+  new_record = event_to_record(
+    new_msg.as_reader().drivingEvent, None, "route", 1, occurred + 250_000_000,
+    60_000_000_000, 40_000_000_000,
+  )
+  serialized = new_record["payload"]["stall_releases"]
+  assert len(serialized) == 3
+  assert [release["damping_applied"] for release in serialized] == [0.0, 0.0, 0.0293]
+  assert [release["turn_in_blocked"] for release in serialized] == [True, True, False]
+  assert new_record["payload"]["driver_interaction"] == "possibleRawTorque"
+  assert new_record["payload"]["road_confound_extent"] == "substantial"
 
 
 def test_joins_latest_acknowledgment_across_segment_boundary(tmp_path):

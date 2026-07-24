@@ -9,13 +9,27 @@ from openpilot.selfdrive.spysypilot.driving_eventd import (
   EventCandidate,
   EventRecorder,
   build_message,
+  lateral_candidate,
+  lateral_sample,
   live_pose_sample,
   longitudinal_sample,
   manual_candidate,
+  rolling_lead_candidate,
+  rolling_lead_sample,
   stop_jolt_candidate,
 )
-from openpilot.selfdrive.spysypilot.lat_event_detector import LateralDetection, LateralSample
+from openpilot.selfdrive.spysypilot.lat_event_detector import (
+  LateralDetection,
+  LateralEvidence,
+  LateralSample,
+  SteeringRateFilter,
+)
 from openpilot.selfdrive.spysypilot.long_event_detector import LaunchSample, LongEvent
+from openpilot.selfdrive.spysypilot.rolling_lead_response_detector import (
+  RollingLeadOnsetSnapshot,
+  RollingLeadResponseEvent,
+  RollingLeadSample,
+)
 from openpilot.selfdrive.spysypilot.stop_jolt_detector import StopJoltCarSample, StopJoltEvent, StopJoltImuSample
 
 
@@ -104,6 +118,26 @@ def stop_event() -> StopJoltEvent:
     radar_valid=True,
     imu_valid=True,
     road_confounded=False,
+  )
+
+
+def rolling_sample(t: float = 3.0) -> RollingLeadSample:
+  return RollingLeadSample(
+    t, True, 8.0, 0.0, False, False, True, True, True, 7,
+    20.0, 10.0, 10.0, 2.0, True, -0.5, False, True, -0.5,
+  )
+
+
+def rolling_event() -> RollingLeadResponseEvent:
+  onset = RollingLeadOnsetSnapshot(
+    "leadCommit", 3.0, 20.0, 10.0, 10.0, 2.0, 8.0, 0.0, -0.5, -0.5, False, False, False,
+  )
+  return RollingLeadResponseEvent(
+    "late_rolling_lead_response_planner", "planner", "late planner", 2, 0.95,
+    3.0, 5.5, 3.0, 4.0, 4.1, None, 1.0, 1.1, None,
+    8.0, 13.0, 8.0, 9.0, 4.0, 20.0, 25.0, 5.0,
+    0.0, 2.5, -0.5, 1.0, -0.5, 1.0, 0.0, 0.4,
+    7, False, False, (onset,), 3.0,
   )
 
 
@@ -205,6 +239,32 @@ def test_lead_launch_and_stop_jolt_failure_isolation():
   )
   events = platform.update(longitudinal_sample=launch_sample(), stop_car_sample=stop_car_sample())
   assert errors == ["stop_jolt"]
+  assert [event.candidate.event_type for event in events] == ["long.lateLeadLaunchController"]
+
+
+def test_rolling_lead_and_standstill_launch_failure_isolation():
+  errors = []
+  platform = DrivingEventPlatform(
+    recorder=EventRecorder(iter(("group", "rolling")).__next__),
+    longitudinal_detector=FixedDetector(error=RuntimeError("standstill detector broken")),
+    rolling_lead_detector=FixedDetector(rolling_event()),
+    on_error=errors.append,
+  )
+  events = platform.update(longitudinal_sample=launch_sample(), rolling_lead_sample=rolling_sample())
+  assert errors == ["longitudinal"]
+  assert [event.candidate.event_type for event in events] == ["long.lateRollingLeadResponsePlanner"]
+
+  errors.clear()
+  platform = DrivingEventPlatform(
+    recorder=EventRecorder(iter(("group", "launch")).__next__),
+    longitudinal_detector=FixedDetector(LongEvent(
+      "late_lead_launch_controller", "long reason", 1, 0.95,
+    )),
+    rolling_lead_detector=FixedDetector(error=RuntimeError("rolling detector broken")),
+    on_error=errors.append,
+  )
+  events = platform.update(longitudinal_sample=launch_sample(), rolling_lead_sample=rolling_sample())
+  assert errors == ["rolling_lead_response"]
   assert [event.candidate.event_type for event in events] == ["long.lateLeadLaunchController"]
 
 
@@ -318,6 +378,44 @@ def test_stop_jolt_schema_round_trip_preserves_peak_and_detection_times():
   assert payload.longControlStateAfter == "pid"
 
 
+def test_rolling_lead_schema_preserves_commit_and_later_detection():
+  candidate = rolling_lead_candidate(rolling_event())
+  msg = build_message(AcceptedEvent("rolling", "group", candidate)).as_reader().drivingEvent
+  assert msg.eventType == "long.lateRollingLeadResponsePlanner"
+  assert msg.detector == "rollingLeadResponseDetector"
+  assert msg.detectorVersion == 1
+  assert msg.occurredMonoTime == 3_000_000_000
+  assert msg.detectedMonoTime == 5_500_000_000
+  assert msg.analysisWindowBeforeS == 5.0
+  assert msg.analysisWindowAfterS == 8.0
+  assert msg.payload.which() == "rollingLeadResponse"
+  payload = msg.payload.rollingLeadResponse
+  assert payload.leadCommitMonoTime == msg.occurredMonoTime
+  assert payload.detectedMonoTime == msg.detectedMonoTime
+  assert payload.plannerResponsePresent
+  assert payload.controllerResponsePresent
+  assert not payload.egoResponsePresent
+  assert payload.radarTrackId == 7
+  assert payload.onsets[0].kind == "leadCommit"
+  assert payload.onsets[0].monoTime == msg.occurredMonoTime
+
+
+def test_lateral_candidate_uses_physical_crossing_and_later_confirmation_times():
+  evidence = LateralEvidence(
+    1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+    center_crossing_mono_time=1.25,
+    committed_reversal=True,
+  )
+  detection = LateralDetection(
+    "committedHandoffHarshness", "warning", 0.9, "harsh",
+    evidence, occurred_mono_time=1.25, detected_mono_time=1.50,
+  )
+  candidate = lateral_candidate(LateralSample(1.5), detection)
+  assert candidate.occurred_mono_time == 1_250_000_000
+  assert candidate.detected_mono_time == 1_500_000_000
+  assert candidate.event_type == "lat.committedHandoffHarshness"
+
+
 def test_live_pose_sampler_uses_its_own_timestamp_and_updates_bump_once():
   class CountingBumpClassifier:
     def __init__(self):
@@ -373,3 +471,87 @@ def test_longitudinal_sampler_uses_radar_present_field():
   sample = longitudinal_sample(FakeSubMaster())
   assert sample.lead_present
   assert sample.radar_track_id == 7
+
+
+def test_rolling_sampler_requires_a_radar_matched_valid_track():
+  class FakeSubMaster:
+    def __init__(self):
+      self.data = {
+        "radarState": SimpleNamespace(leadOne=SimpleNamespace(
+          present=True, radar=True, dRel=20.0, vLead=10.0, vLeadK=10.0, aLeadK=1.5, radarTrackId=7,
+        )),
+        "carState": SimpleNamespace(vEgo=8.0, aEgo=-0.2, gasPressed=False, brakePressed=False),
+        "carControl": SimpleNamespace(longActive=True),
+        "longitudinalPlan": SimpleNamespace(aTarget=-0.4, shouldStop=False),
+        "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(accel=-0.4)),
+      }
+      self.valid = dict.fromkeys(self.data, True)
+      self.logMonoTime = {"carState": 3_000_000_000}
+
+    def __getitem__(self, name):
+      return self.data[name]
+
+  sm = FakeSubMaster()
+  sample = rolling_lead_sample(sm)
+  assert sample.t == 3.0
+  assert sample.long_active and sample.lead_valid and sample.radar_valid
+  assert sample.radar_track_id == 7
+  sm.data["radarState"].leadOne.radar = False
+  assert not rolling_lead_sample(sm).lead_valid
+
+
+def test_lateral_sampler_uses_actual_caroutput_damping_not_torque_d_term():
+  torque_state = SimpleNamespace(
+    active=True, desiredLateralAccel=0.2, actualLateralAccel=0.1, p=0.3, d=-0.72,
+    version=4, referenceVersion=4, referenceRate=0.5, referenceReachableTargetTorque=0.1,
+    referenceUnwindScale=0.5, referenceSustainedUnwindScale=0.6, unwindEffectivePhase=0.7,
+    unwindPhaseOverspeed=0.8, unwindSameEpisode=True,
+  )
+
+  class FakeSubMaster:
+    def __init__(self):
+      self.data = {
+        "controlsState": SimpleNamespace(
+          lateralControlState=SimpleNamespace(
+            which=lambda: "torqueState",
+            torqueState=torque_state,
+          ),
+        ),
+        "carState": SimpleNamespace(
+          steeringAngleDeg=30.0, vEgo=4.0, steeringTorque=0.0,
+          steeringPressed=False, steeringTorqueEps=20.0,
+        ),
+        "carControl": SimpleNamespace(
+          latActive=True, actuators=SimpleNamespace(torque=0.6),
+        ),
+        "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(
+          torque=0.5,
+          torqueDampingApplied=0.031,
+          torqueDampingState="damping",
+          torqueDampingVersion=2,
+          torqueDampingBlocked=False,
+          torqueBreakawayLatch=0.895,
+          torqueDampingFloor=0.805,
+        )),
+      }
+      self.logMonoTime = {"controlsState": 2_000_000_000}
+      self.valid = {"carOutput": True}
+
+    def __getitem__(self, name):
+      return self.data[name]
+
+  sm = FakeSubMaster()
+  sample = lateral_sample(sm, SteeringRateFilter(), False, 2.1)
+  assert sample.damping_applied == 0.0
+  assert sample.damping_state == "legacyUnavailable"
+  assert sample.actual_damping_amount == pytest.approx(0.031)
+  assert sample.actual_damping_state == "damping"
+  assert sample.breakaway_latch == pytest.approx(0.895)
+  assert sample.sustain_floor_contribution == pytest.approx(0.805)
+  assert sample.damping_version == 2
+  assert sample.vertical_accel_deviation == pytest.approx(2.1)
+  sm.valid["carOutput"] = False
+  invalid = lateral_sample(sm, SteeringRateFilter(), False)
+  assert invalid.actual_damping_amount is None
+  assert invalid.actual_damping_state is None
+  assert invalid.damping_version is None

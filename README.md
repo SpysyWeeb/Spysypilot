@@ -24,6 +24,18 @@ tests are implemented on this branch. Its thresholds still require the
 documented replay comparison and on-device field validation before this work
 can be signed off.
 
+🚧 **Rolling lead-response detection is in progress.** This branch is adding
+an observer-only detector for a tracked lead pulling away while ego is already
+rolling. It remains separate from the standstill lead-launch detector and will
+not be considered complete until replay calibration and new field logs have
+been reviewed.
+
+🚧 **Lateral detector version 4 is in progress.** The update separates
+requested direction reversals from unrequested center overshoots, consolidates
+duplicate handoff evidence, and expands driver, road, and stall-release
+evidence. It will remain in progress until the saved-route regressions and new
+field collection have been reviewed.
+
 ## What it does
 
 This branch is Spysypilot's shared evidence logger for driving behavior worth
@@ -45,8 +57,9 @@ manifest, or directly notify another orchestrator.
 | source | recorded event types | purpose |
 |---|---|---|
 | Manual sidebar flag | `manual.general` | Mark any moment the driver wants reviewed |
-| BLaT lateral detector | `lat.stallRelease`, `lat.lateUnwind`, `lat.handoffMismatch`, `lat.centerOvershoot`, `lat.torqueAuthority` | Capture known steering failure shapes and their controller/actuator evidence |
+| BLaT lateral detector | `lat.stallRelease`, `lat.lateUnwind`, `lat.handoffMismatch`, `lat.centerOvershoot`, `lat.committedHandoffHarshness`, `lat.torqueAuthority` | Capture known steering failure shapes and their controller/actuator evidence |
 | Lead-launch detector | `long.lateLeadLaunchPlanner`, `long.lateLeadLaunchController`, `long.lateLeadLaunchVehicle`, `long.leadLaunchStall` | Capture a delayed launch and attribute where the response chain lagged |
+| Rolling lead-response detector | `long.lateRollingLeadResponsePlanner`, `long.lateRollingLeadResponseController`, `long.lateRollingLeadResponseVehicle` | Capture a continuously tracked lead pulling away from an already-rolling ego while the response chain lags |
 | Smooth-stop jolt detector | `long.stopJolt` | Capture an abrupt brake grab or brake-release rebound during the final low-speed landing |
 
 Lateral detections include controller/reference versions, planned and measured
@@ -55,6 +68,9 @@ driver input, road-bump confounders, unwind state, and event-specific evidence.
 Lead-launch detections retain candidate, model forecast, plan, command, lead,
 ego-motion, and ego-acceleration onset snapshots together with radar quality,
 brake state, and timing between stages.
+Rolling lead-response detections retain the lead-commit, plan, command, and ego
+response times; baseline and peak lead/ego motion; gap growth; the stable radar
+track; and onset snapshots. They are separate from standstill launches.
 Stop-jolt detections retain the stop episode, standstill, peak, and detection
 times; filtered IMU and wheel-speed-estimator jerk; before/after acceleration;
 plan/request/applied acceleration snapshots and changes; longitudinal state;
@@ -84,11 +100,11 @@ Each accepted event receives:
 - the running git commit and branch.
 
 Nearby generic events share a group for 2.5 seconds. Detector-defined episode
-keys keep lateral maneuvers and lead launches grouped even when the underlying
+keys keep lateral maneuvers, lead launches, and rolling pull-aways grouped even when the underlying
 episode lasts longer; each stop uses its approach start as its episode key.
-The lateral, lead-launch, stop-jolt IMU, and stop-jolt car paths have separate
-exception boundaries, so a failure in one detector cannot disable the others
-or manual logging.
+The lateral, lead-launch, rolling lead-response, stop-jolt IMU, and stop-jolt
+car paths have separate exception boundaries, so a failure in one detector
+cannot disable the others or manual logging.
 
 Accepted events remain in memory and are retried once per second with the same
 event and group IDs until `loggerd` acknowledges them. `driving_eventd` does
@@ -204,24 +220,57 @@ Historical `/data/community/lat_events` and
 
 ## Detector behavior
 
-### Lateral detector, version 3
+### Lateral detector, version 4
 
 The lateral detector is conservative and runs only while the torque controller
-and lateral control are active. Driver steering immediately resets its
-temporal detection state. Each event type has its own eight-second cooldown.
+and lateral control are active. Each event type has its own eight-second
+cooldown. Driver and road evidence affects attribution, not whether useful
+evidence is persisted.
 
 It detects:
 
-- three steering stall-release cycles inside six seconds;
+- three steering stall-release cycles inside six seconds, retaining a
+  structured snapshot for every release;
 - an expected unwind that remains stalled for more than one second;
 - a high-rate phase handoff with a large applied/reference torque gap;
-- a fast center crossing while unwind braking still trails its target;
+- a fast signed center crossing without a committed requested reversal;
+- an intentionally requested center handoff that remains unusually harsh;
 - sustained requested/applied torque saturation with growing tracking error.
 
-Version 3 prevents stale stall arming from surviving inactive tracking and
-keeps only 250 ms of transition hysteresis through the steering-rate boundary.
-It also aggregates driver-torque, steering-press, and road-bump confounders
-over the evidence window.
+Version 4 establishes the wheel beyond 25 degrees, interpolates its physical
+zero crossing, and waits roughly 0.2 seconds to confirm whether the desired
+lateral acceleration committed to a new sign. The physical crossing remains
+`occurredMonoTime`; the later classification is `detectedMonoTime`.
+`centerOvershoot` is reserved for an unrequested crossing, while a requested
+but harsh transition becomes `committedHandoffHarshness`. A phase handoff and
+crossing in the same episode within 0.5 seconds are consolidated in detector
+state instead of relying on downstream grouping.
+
+Driver evidence distinguishes possible raw torque from confirmed
+`steeringPressed`, including fractions, longest duration, and exact-trigger
+state. Road evidence similarly distinguishes trigger-time, transient, and
+substantial confounding while retaining every event. Stall releases record
+actual Hyundai damping amount/state, blocked state, floor, breakaway latch, and
+version from `carOutput`; version 4 never treats the controller D-term as
+actual damping. The fields are optional for stock and non-Hyundai vehicles.
+
+Saved full-rlog replay currently gives:
+
+- route 92 segment 52 emits one `committedHandoffHarshness` at the
+  interpolated crossing, about 0.27 seconds after its consolidated phase
+  handoff, with roughly 289 deg/s wheel rate, 0.67 m/s² peak tracking error,
+  and 0.32 applied/reference torque gap;
+- route 92 segment 28 remains one `stallRelease` with three releases: the
+  first two have zero actual damping in `turnInAuthority`, while the third has
+  about 0.029 actual damping in `damping`;
+- route 92 segment 26 remains visible as `centerOvershoot` and is classified
+  substantially road-confounded;
+- the older route-8f segment 4 and 5/6 transitions remain separate because the
+  relevant physical events are roughly 95 seconds apart, not one handoff.
+
+These are replay acceptance results, not field completion. Historical v2/v3
+markers and their detector versions remain unchanged, and `reviews.jsonl` is
+not rewritten.
 
 ### Lead-launch detector, version 2
 
@@ -239,6 +288,31 @@ A lead-to-ego delay over 0.25 seconds is classified by the first late stage:
 No ego movement for three seconds after confirmed lead movement becomes a
 launch-stall event. Radar distance jumps or track-ID changes lower confidence
 without hiding the event.
+
+### Rolling lead-response detector, version 1
+
+The pure `rollingLeadResponseDetector` observes a different case from
+standstill launch: ego is already moving between 1.5 and 25 m/s behind one
+radar-confirmed track. It requires 0.75 seconds of track continuity, a 4–60 m
+gap, no driver pedal input, active openpilot longitudinal control, and valid
+plan/output messages. Track changes, radar jumps over 1.5 m, or lead loss
+cancel silently.
+
+A lead commitment is confirmed only after a meaningful speed rise or sustained
+acceleration also produces increasing relative speed and gap. The detector
+retrospectively preserves the onset of that lead motion, then measures
+baseline-relative planner, applied-output, and ego response onsets for about
+2.5 seconds. It emits once only when the gap grows at least 3 m and a named
+latency, relative-speed, or rapid-gap threshold is exceeded. Rearming requires
+settled relative motion and gap plus a 25-second cooldown.
+
+Route 92 replay of the driver-cited 09:06:49 and 09:17:10 pull-aways emits two
+vehicle-attributed events with lead-commit offsets about 695.43 and 1314.68
+seconds. Detection follows about 2.5 seconds later. The plan/output response
+onsets were measured within about 0.11–0.35 seconds, while the retained
+relative-speed/gap and ego evidence crossed the bad-response criteria. This
+does not support forcing the provisional planner attribution; new field logs
+remain required before the thresholds or attribution are considered final.
 
 ### Smooth-stop jolt detector, version 1
 
@@ -324,8 +398,9 @@ Current versions:
 | component | version |
 |---|---:|
 | universal event envelope | 2 |
-| lateral detector | 3 |
+| lateral detector | 4 |
 | lead-launch detector | 2 |
+| rolling lead-response detector | 1 |
 | smooth-stop jolt detector | 1 |
 
 ## Main implementation files
@@ -336,6 +411,8 @@ Current versions:
   detector and signal conditioning.
 - `openpilot/selfdrive/spysypilot/long_event_detector.py` — pure lead-launch
   detector and attribution.
+- `openpilot/selfdrive/spysypilot/rolling_lead_response_detector.py` — pure
+  already-rolling lead pull-away detector and attribution.
 - `openpilot/selfdrive/spysypilot/stop_jolt_detector.py` — pure low-speed
   stop-landing detector and typed evidence extraction.
 - `openpilot/system/loggerd/loggerd.cc` — authoritative event write,

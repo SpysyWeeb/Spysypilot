@@ -24,6 +24,13 @@ from openpilot.selfdrive.spysypilot.long_event_detector import (
   LeadLaunchDetector,
   LongEvent,
 )
+from openpilot.selfdrive.spysypilot.rolling_lead_response_detector import (
+  DETECTOR_NAME as ROLLING_LEAD_DETECTOR_NAME,
+  DETECTOR_VERSION as ROLLING_LEAD_DETECTOR_VERSION,
+  RollingLeadResponseDetector,
+  RollingLeadResponseEvent,
+  RollingLeadSample,
+)
 from openpilot.selfdrive.spysypilot.stop_jolt_detector import (
   DETECTOR_VERSION as STOP_JOLT_DETECTOR_VERSION,
   StopJoltCarSample,
@@ -130,9 +137,13 @@ def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> Eve
   evidence = detection.evidence
   driver_confounded = evidence.driver_confounded_any if evidence is not None else sample.driver_confounded
   road_confounded = evidence.road_confounded_any if evidence is not None else sample.road_confounded
-  if driver_confounded or road_confounded:
+  substantial_driver = evidence is not None and evidence.driver_interaction == "confirmedSteeringPressed"
+  substantial_road = evidence is not None and evidence.road_interaction == "substantial"
+  if substantial_driver or substantial_road:
     attribution = "mixed"
-  occurred_mono_time = round(sample.mono_time * 1e9)
+  occurred_time = detection.occurred_mono_time if detection.occurred_mono_time is not None else sample.mono_time
+  detected_time = detection.detected_mono_time if detection.detected_mono_time is not None else sample.mono_time
+  occurred_mono_time = round(occurred_time * 1e9)
   return EventCandidate(
     occurred_mono_time=occurred_mono_time,
     domain="lateral",
@@ -148,7 +159,7 @@ def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> Eve
     road_confounded=road_confounded,
     payload=sample,
     detector_evidence=evidence,
-    detected_mono_time=occurred_mono_time,
+    detected_mono_time=round(detected_time * 1e9),
     episode_start_mono_time=round(evidence.episode_start_mono_time * 1e9) if evidence is not None else occurred_mono_time,
     analysis_window_before_s=evidence.analysis_window_before_s if evidence is not None else 2.0,
     analysis_window_after_s=evidence.analysis_window_after_s if evidence is not None else 2.0,
@@ -210,6 +221,36 @@ def stop_jolt_candidate(event: StopJoltEvent) -> EventCandidate:
   )
 
 
+def rolling_lead_candidate(event: RollingLeadResponseEvent) -> EventCandidate:
+  names = {
+    "late_rolling_lead_response_planner": ("long.lateRollingLeadResponsePlanner", "planner"),
+    "late_rolling_lead_response_controller": ("long.lateRollingLeadResponseController", "controller"),
+    "late_rolling_lead_response_vehicle": ("long.lateRollingLeadResponseVehicle", "vehicle"),
+  }
+  event_type, attribution = names[event.event_type]
+  occurred_mono_time = round(event.occurred_mono_time * 1e9)
+  episode_start_mono_time = round(event.episode_start_mono_time * 1e9)
+  return EventCandidate(
+    occurred_mono_time=occurred_mono_time,
+    domain="longitudinal",
+    source="automatic",
+    event_type=event_type,
+    detector=ROLLING_LEAD_DETECTOR_NAME,
+    detector_version=ROLLING_LEAD_DETECTOR_VERSION,
+    severity="critical" if event.severity >= 3 else "warning",
+    confidence=event.confidence,
+    reason=event.detail,
+    attribution=attribution,
+    driver_confounded=event.driver_confounded,
+    payload=event,
+    detected_mono_time=round(event.detected_mono_time * 1e9),
+    episode_start_mono_time=episode_start_mono_time,
+    analysis_window_before_s=event.analysis_window_before_s,
+    analysis_window_after_s=event.analysis_window_after_s,
+    episode_key=f"rolling-lead:{episode_start_mono_time}",
+  )
+
+
 class DrivingEventPlatform:
   """Runs detectors independently so one domain cannot disable another."""
 
@@ -217,17 +258,20 @@ class DrivingEventPlatform:
                lateral_detector: LateralEventDetector | None = None,
                longitudinal_detector: LeadLaunchDetector | None = None,
                stop_jolt_detector: StopJoltDetector | None = None,
+               rolling_lead_detector: RollingLeadResponseDetector | None = None,
                on_error: Callable[[str], None] | None = None):
     self.recorder = recorder or EventRecorder()
     self.lateral_detector = lateral_detector or LateralEventDetector()
     self.longitudinal_detector = longitudinal_detector or LeadLaunchDetector()
     self.stop_jolt_detector = stop_jolt_detector or StopJoltDetector()
+    self.rolling_lead_detector = rolling_lead_detector or RollingLeadResponseDetector()
     self.on_error = on_error or (lambda domain: cloudlog.exception(f"driving_eventd: {domain} detector failed"))
 
   def update(self, lateral_sample: LateralSample | None = None, longitudinal_sample: LaunchSample | None = None,
              manual_pressed: bool = False, manual_time_ns: int | None = None,
              stop_car_sample: StopJoltCarSample | None = None,
-             stop_imu_sample: StopJoltImuSample | None = None) -> list[AcceptedEvent]:
+             stop_imu_sample: StopJoltImuSample | None = None,
+             rolling_lead_sample: RollingLeadSample | None = None) -> list[AcceptedEvent]:
     candidates: list[EventCandidate] = []
     if lateral_sample is not None:
       try:
@@ -244,6 +288,14 @@ class DrivingEventPlatform:
           candidates.append(longitudinal_candidate(longitudinal_sample, event))
       except Exception:
         self.on_error("longitudinal")
+
+    if rolling_lead_sample is not None:
+      try:
+        event = self.rolling_lead_detector.update(rolling_lead_sample)
+        if event is not None:
+          candidates.append(rolling_lead_candidate(event))
+      except Exception:
+        self.on_error("rolling_lead_response")
 
     if stop_imu_sample is not None:
       try:
@@ -348,6 +400,81 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
       payload.previousUnwindEffectivePhase = evidence.previous_unwind_effective_phase
       payload.previousUnwindSameEpisode = evidence.previous_unwind_same_episode
       payload.trackingInactiveTimeS = evidence.tracking_inactive_time_s
+      payload.rawTorqueAboveThresholdFraction = evidence.raw_torque_exceeded_fraction
+      payload.rawTorqueAboveThresholdLongestS = evidence.longest_raw_torque_duration_s
+      payload.steeringPressedFraction = evidence.steering_pressed_fraction
+      payload.driverTorquePresentAtTrigger = evidence.driver_torque_active_at_trigger
+      payload.steeringPressedAtTrigger = evidence.steering_pressed_at_trigger
+      payload.driverInteraction = evidence.driver_interaction
+      payload.roadConfoundedAtEventTime = evidence.road_confounded_at_trigger
+      payload.maxVerticalAccelDeviation = evidence.max_vertical_accel_deviation
+      payload.longestRoadBumpIntervalS = evidence.longest_road_confounded_duration_s
+      payload.roadConfoundExtent = evidence.road_interaction
+      payload.centerCrossingMonoTime = (
+        round(evidence.center_crossing_mono_time * 1e9)
+        if evidence.center_crossing_mono_time is not None else 0
+      )
+      payload.classificationConfirmedMonoTime = candidate.detected_mono_time
+      payload.establishedOutsideCenter = evidence.established_outside_center
+      payload.centerCrossingWheelRateDeg = evidence.signed_center_rate_deg
+      payload.signedCenterCrossingWheelRateDeg = evidence.signed_center_rate_deg
+      payload.peakAbsCenterWheelRateDeg = evidence.peak_abs_center_rate_deg
+      payload.desiredLateralAccelBeforeCrossing = evidence.desired_lateral_accel_before_crossing
+      payload.desiredLateralAccelAfterCrossing = evidence.desired_lateral_accel_after_crossing
+      payload.desiredReversalCommitted = evidence.committed_reversal
+      payload.desiredReversalCommitMonoTime = (
+        round(evidence.desired_reversal_commit_mono_time * 1e9)
+        if evidence.desired_reversal_commit_mono_time is not None else 0
+      )
+      payload.trackingErrorAtCrossing = evidence.tracking_error_at_crossing
+      payload.appliedTargetGapAtCrossing = evidence.applied_target_gap_at_crossing
+      payload.peakTrackingError = evidence.peak_tracking_error
+      payload.peakAppliedTargetGap = evidence.peak_applied_target_gap
+      payload.requestedTorqueAtCrossing = evidence.requested_torque_at_crossing
+      payload.appliedTorqueAtCrossing = evidence.applied_torque_at_crossing
+      payload.referenceTargetTorqueAtCrossing = evidence.reference_target_torque_at_crossing
+      payload.handoffObserved = evidence.phase_handoff_mono_time is not None
+      payload.handoffMonoTime = (
+        round(evidence.phase_handoff_mono_time * 1e9)
+        if evidence.phase_handoff_mono_time is not None else 0
+      )
+      payload.handoffCenterDeltaS = evidence.handoff_center_delta_s
+      payload.handoffConsolidated = evidence.handoff_consolidated
+      releases = payload.init("stallReleases", len(evidence.stall_releases))
+      for index, release in enumerate(evidence.stall_releases):
+        releases[index].releaseMonoTime = round(release.mono_time * 1e9)
+        releases[index].offsetFromTriggerS = release.offset_from_trigger_s
+        releases[index].stallDurationS = release.stall_duration_s
+        releases[index].peakSignedSteeringRateDeg = release.peak_signed_rate_deg
+        releases[index].peakAbsSteeringRateDeg = release.peak_abs_rate_deg
+        releases[index].steeringAngleDeg = release.steering_angle_deg
+        releases[index].vEgo = release.v_ego
+        releases[index].desiredLateralAccel = release.desired_lateral_accel
+        releases[index].actualLateralAccel = release.actual_lateral_accel
+        releases[index].requestedTorque = release.request_torque
+        releases[index].appliedTorque = release.applied_torque
+        releases[index].referenceTargetTorque = release.reference_target_torque
+        releases[index].dampingApplied = (
+          release.actual_damping_amount if release.actual_damping_amount is not None else 0.0
+        )
+        releases[index].dampingState = release.actual_damping_state or "unavailable"
+        releases[index].turnInBlocked = bool(release.turn_in_blocked)
+        releases[index].breakawayLatch = (
+          release.breakaway_latch if release.breakaway_latch is not None else 0.0
+        )
+        releases[index].sustainFloor = (
+          release.sustain_floor_contribution if release.sustain_floor_contribution is not None else 0.0
+        )
+        releases[index].dampingVersion = release.damping_version or 0
+        releases[index].dampingValid = bool(
+          release.damping_version is not None
+          and release.damping_version > 0
+          and release.actual_damping_amount is not None
+          and release.actual_damping_state is not None
+        )
+        releases[index].driverEvidenceActive = release.driver_evidence_active
+        releases[index].roadEvidenceActive = release.road_evidence_active
+        releases[index].phase = release.phase
   elif candidate.event_type == "long.stopJolt":
     stop_event: StopJoltEvent = candidate.payload
     payload = out.payload.init("stopJolt")
@@ -388,6 +515,72 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
     payload.imuValid = stop_event.imu_valid
     payload.roadConfounded = stop_event.road_confounded
     payload.classification = stop_event.classification
+  elif candidate.event_type.startswith("long.lateRollingLeadResponse"):
+    rolling_event: RollingLeadResponseEvent = candidate.payload
+    payload = out.payload.init("rollingLeadResponse")
+    payload.attributionDetail = rolling_event.attribution_detail
+    payload.leadCommitMonoTime = round(rolling_event.lead_commit_mono_time * 1e9)
+    payload.plannerResponseMonoTime = (
+      round(rolling_event.planner_response_mono_time * 1e9)
+      if rolling_event.planner_response_mono_time is not None else 0
+    )
+    payload.controllerResponseMonoTime = (
+      round(rolling_event.controller_response_mono_time * 1e9)
+      if rolling_event.controller_response_mono_time is not None else 0
+    )
+    payload.egoResponseMonoTime = (
+      round(rolling_event.ego_response_mono_time * 1e9)
+      if rolling_event.ego_response_mono_time is not None else 0
+    )
+    payload.plannerResponsePresent = rolling_event.planner_response_mono_time is not None
+    payload.controllerResponsePresent = rolling_event.controller_response_mono_time is not None
+    payload.egoResponsePresent = rolling_event.ego_response_mono_time is not None
+    payload.detectedMonoTime = round(rolling_event.detected_mono_time * 1e9)
+    payload.leadToPlanS = rolling_event.lead_to_plan_s if rolling_event.lead_to_plan_s is not None else 0.0
+    payload.leadToCommandS = rolling_event.lead_to_command_s if rolling_event.lead_to_command_s is not None else 0.0
+    payload.leadToEgoS = rolling_event.lead_to_ego_s if rolling_event.lead_to_ego_s is not None else 0.0
+    payload.baselineLeadSpeed = rolling_event.baseline_lead_speed
+    payload.peakLeadSpeed = rolling_event.peak_lead_speed
+    payload.baselineEgoSpeed = rolling_event.baseline_ego_speed
+    payload.peakEgoSpeed = rolling_event.peak_ego_speed
+    payload.peakRelativeSpeed = rolling_event.peak_relative_speed
+    payload.baselineGap = rolling_event.baseline_gap
+    payload.finalGap = rolling_event.final_gap
+    payload.maxGapGrowth = rolling_event.max_gap_growth
+    payload.baselineLeadAccel = rolling_event.baseline_lead_accel
+    payload.peakLeadAccel = rolling_event.peak_lead_accel
+    payload.baselinePlannerAccel = rolling_event.baseline_planner_accel
+    payload.peakPlannerAccel = rolling_event.peak_planner_accel
+    payload.baselineOutputAccel = rolling_event.baseline_output_accel
+    payload.peakOutputAccel = rolling_event.peak_output_accel
+    payload.baselineEgoAccel = rolling_event.baseline_ego_accel
+    payload.peakEgoAccel = rolling_event.peak_ego_accel
+    payload.radarTrackId = rolling_event.radar_track_id
+    payload.radarDiscontinuity = rolling_event.radar_discontinuity
+    payload.driverConfounded = rolling_event.driver_confounded
+    onsets = payload.init("onsets", len(rolling_event.onsets))
+    onset_names = {
+      "leadCommit": "leadCommit",
+      "plan": "plannerResponse",
+      "command": "controllerResponse",
+      "ego": "egoResponse",
+    }
+    for index, onset in enumerate(rolling_event.onsets):
+      onsets[index].kind = onset_names[onset.kind]
+      onsets[index].monoTime = round(onset.t * 1e9)
+      onsets[index].dRel = onset.d_rel
+      onsets[index].vLead = onset.v_lead
+      onsets[index].vLeadK = onset.v_lead_k
+      onsets[index].aLeadK = onset.a_lead_k
+      onsets[index].vEgo = onset.v_ego
+      onsets[index].aEgo = onset.a_ego
+      onsets[index].plannerAccel = onset.a_target
+      onsets[index].outputAccel = onset.output_accel
+      onsets[index].shouldStop = onset.should_stop
+      onsets[index].longActive = True
+      onsets[index].radarValid = True
+      onsets[index].gasPressed = onset.gas_pressed
+      onsets[index].brakePressed = onset.brake_pressed
   elif candidate.domain == "longitudinal":
     long_event: LongEvent = candidate.payload
     payload = out.payload.init("leadLaunch")
@@ -487,6 +680,51 @@ def longitudinal_sample(sm: messaging.SubMaster) -> LaunchSample:
   )
 
 
+def rolling_lead_sample(sm: messaging.SubMaster) -> RollingLeadSample:
+  car_state = sm["carState"]
+  car_control = sm["carControl"]
+  lead = sm["radarState"].leadOne
+  plan = sm["longitudinalPlan"]
+  output = sm["carOutput"].actuatorsOutput
+  now = sm.logMonoTime["carState"] * 1e-9 if sm.logMonoTime["carState"] else time.monotonic()
+  numeric_values = (
+    float(car_state.vEgo),
+    float(car_state.aEgo),
+    float(lead.dRel),
+    float(lead.vLead),
+    float(lead.vLeadK),
+    float(lead.aLeadK),
+    float(plan.aTarget),
+    float(output.accel),
+  )
+  radar_valid = bool(
+    sm.valid["radarState"]
+    and all(math.isfinite(value) for value in numeric_values[2:6])
+  )
+  track_id = int(lead.radarTrackId)
+  return RollingLeadSample(
+    t=now,
+    long_active=bool(sm.valid["carState"] and sm.valid["carControl"] and car_control.longActive),
+    v_ego=numeric_values[0],
+    a_ego=numeric_values[1],
+    gas_pressed=bool(car_state.gasPressed),
+    brake_pressed=bool(car_state.brakePressed),
+    lead_present=bool(lead.present),
+    lead_valid=bool(radar_valid and lead.present and lead.radar and track_id >= 0),
+    radar_valid=radar_valid,
+    radar_track_id=track_id,
+    d_rel=numeric_values[2],
+    v_lead=numeric_values[3],
+    v_lead_k=numeric_values[4],
+    a_lead_k=numeric_values[5],
+    plan_valid=bool(sm.valid["longitudinalPlan"] and math.isfinite(numeric_values[6])),
+    a_target=numeric_values[6],
+    should_stop=bool(plan.shouldStop),
+    output_valid=bool(sm.valid["carOutput"] and math.isfinite(numeric_values[7])),
+    output_accel=numeric_values[7],
+  )
+
+
 def live_pose_sample(sm: messaging.SubMaster, bump_classifier: RoadBumpClassifier) -> StopJoltImuSample:
   """Sample IMU once per actual livePose update, using livePose's timestamp."""
   live_pose = sm["livePose"]
@@ -561,16 +799,20 @@ def stop_jolt_car_sample(sm: messaging.SubMaster, road_confounded: bool) -> Stop
 
 
 def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
-                   road_confounded: bool) -> LateralSample:
+                   road_confounded: bool, vertical_accel_deviation: float = 0.0) -> LateralSample:
   controls_state = sm["controlsState"]
   torque_state = controls_state.lateralControlState.torqueState if controls_state.lateralControlState.which() == "torqueState" else None
   car_state = sm["carState"]
+  actuators_output = sm["carOutput"].actuatorsOutput
   now = sm.logMonoTime["controlsState"] * 1e-9 if sm.logMonoTime["controlsState"] else time.monotonic()
   angle = float(car_state.steeringAngleDeg)
-  damping_applied = float(torque_state.d) if torque_state is not None else 0.0
-  damping_state = (
-    "blocked" if torque_state is not None and getattr(torque_state, "dampingTurnInBlocked", False)
-    else ("applied" if abs(damping_applied) > 1e-6 else "inactive")
+  damping_version = int(getattr(actuators_output, "torqueDampingVersion", 0))
+  damping_valid = bool(sm.valid["carOutput"] and damping_version > 0)
+  actual_damping_amount = (
+    float(getattr(actuators_output, "torqueDampingApplied", 0.0)) if damping_valid else None
+  )
+  actual_damping_state = (
+    str(getattr(actuators_output, "torqueDampingState", "inactive")) if damping_valid else None
   )
   return LateralSample(
     mono_time=now,
@@ -586,8 +828,11 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     applied_torque=float(sm["carOutput"].actuatorsOutput.torque),
     p_term=float(torque_state.p) if torque_state is not None else 0.0,
     steering_torque_eps=float(car_state.steeringTorqueEps),
-    damping_applied=damping_applied,
-    damping_state=damping_state,
+    # Versions 2/3 serialized torqueState.d into these legacy fields. Version 4
+    # leaves them explicitly unavailable and records actual CarController
+    # damping in the append-only fields below.
+    damping_applied=0.0,
+    damping_state="legacyUnavailable",
     controller_version=int(torque_state.version) if torque_state is not None else 0,
     reference_version=int(getattr(torque_state, "referenceVersion", 0)) if torque_state is not None else 0,
     reference_rate=float(getattr(torque_state, "referenceRate", 0.0)) if torque_state is not None else 0.0,
@@ -598,6 +843,19 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     unwind_overspeed=float(getattr(torque_state, "unwindPhaseOverspeed", 0.0)) if torque_state is not None else 0.0,
     unwind_same_episode=bool(getattr(torque_state, "unwindSameEpisode", False)) if torque_state is not None else False,
     road_confounded=road_confounded,
+    vertical_accel_deviation=vertical_accel_deviation,
+    actual_damping_amount=actual_damping_amount,
+    actual_damping_state=actual_damping_state,
+    turn_in_blocked=(
+      bool(getattr(actuators_output, "torqueDampingBlocked", False)) if damping_valid else None
+    ),
+    breakaway_latch=(
+      float(getattr(actuators_output, "torqueBreakawayLatch", 0.0)) if damping_valid else None
+    ),
+    sustain_floor_contribution=(
+      float(getattr(actuators_output, "torqueDampingFloor", 0.0)) if damping_valid else None
+    ),
+    damping_version=damping_version if damping_valid else None,
   )
 
 
@@ -616,6 +874,7 @@ def main() -> None:
   rate_filter = SteeringRateFilter()
   bump_classifier = RoadBumpClassifier()
   road_confounded = False
+  vertical_accel_deviation = 0.0
 
   if not pm.wait_for_readers_to_update("drivingEvent", timeout=10):
     cloudlog.warning("driving_eventd: loggerd reader not ready; retaining events for retry")
@@ -633,8 +892,13 @@ def main() -> None:
     imu_sample = live_pose_sample(sm, bump_classifier) if live_pose_updated else None
     if imu_sample is not None:
       road_confounded = imu_sample.road_confounded
-    lat_sample = lateral_sample(sm, rate_filter, road_confounded) if controls_updated else None
+      vertical_accel_deviation = bump_classifier.last_deviation
+    lat_sample = (
+      lateral_sample(sm, rate_filter, road_confounded, vertical_accel_deviation)
+      if controls_updated else None
+    )
     long_sample = longitudinal_sample(sm) if car_state_updated else None
+    rolling_sample = rolling_lead_sample(sm) if car_state_updated else None
     stop_sample = stop_jolt_car_sample(sm, road_confounded) if car_state_updated else None
     events = platform.update(
       lat_sample,
@@ -643,6 +907,7 @@ def main() -> None:
       manual_time_ns=sm.logMonoTime["bookmarkButton"] if bookmark_updated else None,
       stop_car_sample=stop_sample,
       stop_imu_sample=imu_sample,
+      rolling_lead_sample=rolling_sample,
     )
     for event in events:
       submitter.submit(event)
