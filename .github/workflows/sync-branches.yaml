@@ -26,6 +26,8 @@ jobs:
           - SOL
           - smooth-stops
           - auto-update
+          - custom-main-menu
+          - side-buttons
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
