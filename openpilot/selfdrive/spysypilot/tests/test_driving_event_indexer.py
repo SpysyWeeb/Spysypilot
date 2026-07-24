@@ -7,6 +7,7 @@ from openpilot.selfdrive.spysypilot.driving_event_indexer import (
   MANIFEST_NAME,
   PRESERVE_ATTR_NAME,
   PRESERVE_ATTR_VALUE,
+  REVIEWS_NAME,
   ROTATED_MANIFEST_NAME,
   append_events,
   rebuild,
@@ -32,7 +33,7 @@ def event_message(event_id="event", group_id="group", occurred=102_500_000_000,
 
 
 def ack_message(event_id="event", group_id="group", occurred=102_500_000_000,
-                current_preserved=True, log_offset=20):
+                current_preserved=True, log_offset=20, segment_start=100_000_000_000):
   msg = messaging.new_message("drivingEventRecorded", valid=True)
   msg.logMonoTime = occurred + log_offset
   ack = msg.drivingEventRecorded
@@ -47,12 +48,22 @@ def ack_message(event_id="event", group_id="group", occurred=102_500_000_000,
   ack.markerWritten = True
   ack.currentSegmentPreserved = current_preserved
   ack.followingSegmentScheduled = True
+  ack.segmentStartMonoTime = segment_start
+  ack.ackMonoTime = msg.logMonoTime
+  ack.markerAccepted = True
   return msg.as_reader()
 
 
 def baseline_message(mono_time=100_000_000_000):
   msg = messaging.new_message("carState", valid=True)
   msg.logMonoTime = mono_time
+  return msg.as_reader()
+
+
+def sentinel_message(mono_time, sentinel_type):
+  msg = messaging.new_message("sentinel", valid=True)
+  msg.logMonoTime = mono_time
+  msg.sentinel.type = sentinel_type
   return msg.as_reader()
 
 
@@ -77,10 +88,43 @@ def test_indexes_exact_segment_offset_ack_and_context_once(tmp_path):
   assert record["route"] == route
   assert record["segment"] == 2
   assert record["segment_offset_s"] == 2.5
+  assert record["route_offset_s"] == 2.5
+  assert record["marker_offset_s"] == 2.5
+  assert record["verified_in_completed_rlog"]
+  assert record["logger_acknowledgment"]["marker_accepted"]
+  assert record["logger_acknowledgment"]["ack_mono_time"] == 102_500_000_020
+  assert record["detector_to_marker_ms"] == 0.0
+  assert record["marker_to_ack_ms"] == 0.0
+  assert "review" not in record
   assert record["logger_acknowledgment"]["marker_written"]
   assert record["context_segments"] == [f"{route}--{index}" for index in range(4)]
   assert os.getxattr(log_root / f"{route}--2", PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
   assert os.getxattr(log_root / f"{route}--3", PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
+  assert (event_root / REVIEWS_NAME).exists()
+
+
+def test_segment_offset_uses_authoritative_ack_start_not_cached_init_data(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 3)
+  os.setxattr(log_root / f"{route}--2", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+
+  def reader(path):
+    segment = int(Path(path).parent.name.rsplit("--", 1)[1])
+    if segment == 2:
+      return [
+        baseline_message(10_000_000_000),
+        sentinel_message(100_000_000_000, "startOfSegment"),
+        event_message(occurred=102_500_000_000),
+        ack_message(occurred=102_500_000_000, segment_start=101_000_000_000),
+      ]
+    return [baseline_message()]
+
+  assert scan_once(log_root, event_root, reader) == 1
+  record = json.loads((event_root / MANIFEST_NAME).read_text())
+  assert record["route_offset_s"] == 92.5
+  assert record["segment_offset_s"] == 1.5
 
 
 def test_joins_latest_acknowledgment_across_segment_boundary(tmp_path):
@@ -138,7 +182,9 @@ def test_rebuild_scans_unpreserved_full_rlogs(tmp_path):
     return [baseline_message(), event_message(occurred=101_000_000_000)]
 
   assert rebuild(log_root, event_root, reader) == 1
-  assert json.loads((event_root / MANIFEST_NAME).read_text())["event_id"] == "event"
+  rebuilt = json.loads((event_root / MANIFEST_NAME).read_text())
+  assert rebuilt["event_id"] == "event"
+  assert rebuilt["effective_context"] == {"before": 0, "after": 0}
   assert rebuild(log_root, event_root, reader) == 1
   indexed_ids = [
     json.loads(line)["event_id"]
@@ -147,6 +193,22 @@ def test_rebuild_scans_unpreserved_full_rlogs(tmp_path):
     for line in path.read_text().splitlines()
   ]
   assert indexed_ids == ["event"]
+
+
+def test_rebuild_never_erases_reviews(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  event_root.mkdir()
+  review = '{"event_id":"event","status":"accepted","notes":"keep me"}\n'
+  (event_root / REVIEWS_NAME).write_text(review)
+
+  def reader(_path):
+    return [baseline_message(), event_message()]
+
+  assert rebuild(log_root, event_root, reader) == 1
+  assert (event_root / REVIEWS_NAME).read_text() == review
 
 
 def test_manifest_rotation_and_dedup_across_rotated_file(tmp_path):
