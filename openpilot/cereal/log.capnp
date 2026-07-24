@@ -951,6 +951,12 @@ struct ControlsState @0x97ff69c53601abf1 {
     referenceSustainedUnwindScale @71 :Float32;           # unwind confidence sustained across the release-preview horizon
     referenceEpisodeTargetTorque @72 :Float32;           # later geometric torque used to confirm episode handoff
     referenceEpisodeLateralAccel @73 :Float32;           # later geometric lateral acceleration used to reject friction-only sign flips
+    handoffCommitted @74 :Bool;                           # selected and later future geometry sustained an opposite maneuver
+    handoffTime @75 :Float32;                             # seconds since committed ownership transfer
+    torqueCommandBeforeHandoffCap @76 :Float32;           # normalized controller request before old-direction limiting
+    handoffOldDirectionLimit @77 :Float32;                # allowed old-turn component beyond crown-neutral
+    handoffTorqueCapScale @78 :Float32;                   # smooth post-commit ramp from zero to full cap
+    handoffTorqueCorrection @79 :Float32;                 # signed normalized correction applied by the cap
    }
 
   struct LateralAngleState {
