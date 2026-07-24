@@ -246,9 +246,6 @@ class LongitudinalMpc:
     self.solution_status = 0
     # timers
     self.solve_time = 0.0
-    self.time_qp_solution = 0.0
-    self.time_linearization = 0.0
-    self.time_integrator = 0.0
     self.x0 = np.zeros(X_DIM)
     self.set_weights()
 
@@ -294,7 +291,7 @@ class LongitudinalMpc:
     Anchored at the radar's trusted h=0 measurement; the model contributes the deltas.
     Stock PR form: trust ledger + pull-away floor removed 2026-07-18 for an A/B field
     test of the unmodified PR (both live in git history if reinstated)."""
-    if model_lead is not None and model_lead.prob > 0.5 and radar_lead.status:
+    if model_lead is not None and model_lead.prob > 0.5 and radar_lead.present:
       x = np.asarray(model_lead.x, dtype=np.float64)
       v = np.asarray(model_lead.v, dtype=np.float64)
       x_lead_traj = float(radar_lead.dRel) + (x - x[0])
@@ -372,9 +369,6 @@ class LongitudinalMpc:
 
     self.solution_status = self.solver.solve()
     self.solve_time = float(self.solver.get_stats('time_tot')[0])
-    self.time_qp_solution = float(self.solver.get_stats('time_qp')[0])
-    self.time_linearization = float(self.solver.get_stats('time_lin')[0])
-    self.time_integrator = float(self.solver.get_stats('time_sim')[0])
 
     for i in range(N+1):
       self.x_sol[i] = self.solver.get(i, 'x')

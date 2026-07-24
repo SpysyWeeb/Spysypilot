@@ -64,7 +64,8 @@ def main():
       pm.send('audioFeedback', msg)
 
     if should_send_bookmark:
-      publish_bookmark(pm)
+      msg = messaging.new_message('userBookmark', valid=True)
+      pm.send('userBookmark', msg)
 
 
 if __name__ == '__main__':

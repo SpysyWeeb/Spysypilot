@@ -15,7 +15,7 @@ DELETE_LAST = ['boot', 'crash']
 
 PRESERVE_ATTR_NAME = 'user.preserve'
 PRESERVE_ATTR_VALUE = b'1'
-# A lateral event marks its current and following segment. Keep ten marked
+# Each driving event protects its current and following segment. Keep ten marked
 # segments so roughly the five newest event windows (plus their lead-in) survive.
 PRESERVE_COUNT = 10
 
