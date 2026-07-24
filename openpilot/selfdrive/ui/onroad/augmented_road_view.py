@@ -9,7 +9,7 @@ from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
-from openpilot.selfdrive.ui.onroad.lat_event_toast import LatEventToast
+from openpilot.selfdrive.ui.onroad.driving_event_notification import DrivingEventNotification
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
@@ -49,7 +49,7 @@ class AugmentedRoadView(CameraView):
     self._hud_renderer = HudRenderer()
     self.alert_renderer = AlertRenderer()
     self.driver_state_renderer = DriverStateRenderer()
-    self.lat_event_toast = LatEventToast()
+    self.driving_event_notification = DrivingEventNotification()
 
   def _render(self, rect):
     # Only render when system is started to avoid invalid data access
@@ -84,9 +84,11 @@ class AugmentedRoadView(CameraView):
     # Draw all UI overlays
     self.model_renderer.render(self._content_rect)
     self._hud_renderer.render(self._content_rect)
+    alert = self.alert_renderer.get_alert(ui_state.sm)
     self.alert_renderer.render(self._content_rect)
     self.driver_state_renderer.render(self._content_rect)
-    self.lat_event_toast.render(self._content_rect)
+    critical_alert = alert is not None and alert.status == log.SelfdriveState.AlertStatus.critical
+    self.driving_event_notification.render(self._content_rect, critical_alert)
 
     # Custom UI extension point - add custom overlays here
     # Use self._content_rect for positioning within camera bounds
