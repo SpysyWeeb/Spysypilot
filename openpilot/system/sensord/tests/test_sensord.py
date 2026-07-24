@@ -1,4 +1,5 @@
 import os
+import subprocess
 import pytest
 import time
 import numpy as np
@@ -19,7 +20,7 @@ SENSOR_CONFIGS = (
 )
 SENSOR_CONFIGS_BY_MEASUREMENT = {config.measurement: config for config in SENSOR_CONFIGS}
 
-def get_irq_count(irq: int):
+def get_irq_count(irq: str):
   with open(f"/sys/kernel/irq/{irq}/per_cpu_count") as f:
     per_cpu = map(int, f.read().split(","))
     return sum(per_cpu)
@@ -61,7 +62,7 @@ class TestSensord:
     os.environ["LSM_SELF_TEST"] = "1"
 
     # read initial sensor values every test case can use
-    os.system("pkill -f \\\\./sensord")
+    subprocess.run("pkill -f \\\\./sensord", shell=True)
     try:
       managed_processes["sensord"].start()
       cls.sample_secs = int(os.getenv("SAMPLE_SECS", "10"))
