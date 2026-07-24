@@ -6,24 +6,59 @@ Companion longitudinal branch: [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/
 
 ## What it does
 
-Gives the Palisade's steering **more authority and a faster wind-up** so it can hold tighter curves and take 90° turns without running wide:
+BLaT makes steering smooth without making it uniformly slow. It combines the
+model's future path with measured wheel motion and the torque the Hyundai EPS
+can actually receive through its fixed slew limits.
 
-- **Max steering torque 384 → 409** (+6.5%)
-- **Torque ramp-up rate 3 → 4 per frame** — full torque reachable from zero in ~1.0 s instead of ~1.4 s
-- Ramp-*down* stays at 7, so torque still sheds nearly twice as fast as it builds (the safety asymmetry is preserved)
+The controller:
 
-The full Hyundai limit tuple is now **(409, 4, 7)** vs. stock **(384, 3, 7)**.
+- derives an all-speed curvature and steering-rate reference from the future
+  model trajectory;
+- aligns delayed lateral feedback to the car's current speed, avoiding false
+  P error while the driver accelerates or brakes;
+- uses a position/rate cascade so the wheel can move quickly for a real turn
+  without blindly following short torque spikes;
+- predicts whether requested torque is reachable through the Hyundai slew
+  limiter before the path needs it;
+- starts and hands off unwind episodes using future geometry, crown-neutral
+  torque, wheel rate, and applied-torque delivery state;
+- preserves turn-in authority when the wheel is still behind the planned path;
+- records versioned controller diagnostics in `LateralTorqueState` for rlog
+  analysis.
+
+The Hyundai command and safety limits are also raised from stock **(384, 3, 7)**
+to **(409, 4, 7)**:
+
+- maximum steering torque: 384 → 409;
+- torque build rate: 3 → 4 counts per frame;
+- torque decay remains 7 counts per frame.
 
 ## How it works
 
-This superproject branch carries no openpilot code changes — it is a submodule pointer: `.gitmodules` overrides `opendbc` to [SpysyWeeb/opendbc](https://github.com/SpysyWeeb/opendbc), branch [`BLaT`](https://github.com/SpysyWeeb/opendbc/tree/BLaT), where the actual changes live. Steering limits exist in **two enforcement layers** and both must agree, or the panda safety firmware blocks openpilot's own commands:
+The openpilot side is owned by this branch:
 
-1. `opendbc/car/hyundai/values.py` — what openpilot *commands* (`STEER_MAX = 409`, `STEER_DELTA_UP = 4`; cars on `ALT_LIMITS` are untouched).
-2. `opendbc/safety/modes/hyundai.h` — what the panda safety code *permits* (`HYUNDAI_LIMITS(409, 4, 7)`).
-3. `opendbc/safety/tests/test_hyundai.py` — the safety tests asserting the new limits.
+- `openpilot/selfdrive/controls/lib/lateral_reference_planner.py` builds the
+  future trajectory reference and actuator-reachable torque preview.
+- `openpilot/selfdrive/controls/lib/latcontrol_torque.py` applies the
+  speed-aligned P loop, rate cascade, actuator-state correction, and
+  future-unwind control.
+- `openpilot/selfdrive/controls/controlsd.py` connects model trajectory,
+  actuator limits, applied torque, and the torque controller.
+- `openpilot/cereal/log.capnp` carries the BLaT diagnostics.
 
-`hyundai_canfd.h` is deliberately untouched — the Palisade is CAN, not CANFD. The panda reflashes with the new limits on the next boot after installing.
+The branch also points `opendbc_repo` to
+[SpysyWeeb/opendbc BLaT](https://github.com/SpysyWeeb/opendbc/tree/BLaT).
+That branch owns the matching Hyundai command/safety limits and the low-speed
+EPS-motion damping layer. Both command and panda safety limits must agree or
+panda rejects openpilot's requests.
 
 ## What changed
 
-- `.gitmodules` + `opendbc_repo` pointer — the whole superproject delta; see the three opendbc files above for the real content.
+- opendbc BLaT submodule pointer;
+- torque-controller and future-reference implementation;
+- controller integration and rlog diagnostics;
+- three focused test suites covering delayed feedback, actuator/rate/unwind
+  behavior, and the trajectory reference planner.
+
+The universal driving-event logger is intentionally separate infrastructure.
+BLaT supplies the lateral behavior and diagnostics that it observes.
