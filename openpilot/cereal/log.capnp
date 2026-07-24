@@ -890,6 +890,67 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
+    measurementRate @13 :Float32;  # filtered curvature-motion lateral-acceleration rate, excludes 2*v*a*kappa, m/s^3
+    rateBrake @14 :Float32;        # bounded D-on-measurement contribution, m/s^2
+    rateBrakeScale @15 :Float32;   # combined opposing-demand and speed-schedule gate
+    delayedDesiredCurvature @16 :Float32;    # delay-aligned curvature used by feedback, 1/m
+    legacyDesiredLateralAccel @17 :Float32;  # old-speed buffered reference for A/B attribution, m/s^2
+    speedAlignmentCorrection @18 :Float32;   # new reference minus legacy reference, m/s^2
+    actuationSpeed @19 :Float32;               # bounded delay-projected speed before lateral-acceleration cap, m/s
+    currentSpeedDesiredLateralAccel @20 :Float32; # desired lateral acceleration before speed projection, m/s^2
+    speedProjectionCorrection @21 :Float32;    # projected minus current-speed feedforward reference, m/s^2
+    longitudinalLateralAccelRate @22 :Float32; # excluded 2*v*a*kappa measurement-rate component, m/s^3
+    rateBrakeSpeedScale @23 :Float32;          # speed-only portion of the all-speed rate-brake gate
+    referenceVersion @24 :Int32;               # future-path reference implementation version
+    referenceBaseCurvature @25 :Float32;       # legacy fixed-delay trajectory sample, 1/m
+    referenceOutputCurvature @26 :Float32;     # actuator-aware path reference before clip_curvature, 1/m
+    referencePreviewTime @27 :Float32;         # total model-horizon sample time, seconds
+    referencePreviewExtraTime @28 :Float32;    # actuator-delivery addition to fixed preview, seconds
+    referenceTargetTorque @29 :Float32;        # normalized torque estimated for the selected future path
+    referenceAppliedTorque @30 :Float32;       # normalized torque delivered by carcontroller last cycle
+    referenceUnwindScale @31 :Float32;         # path-phase confidence that the selected reference is unwinding
+    referenceAuthorityRestored @32 :Float32;   # turn strength restored over smoothed path, m/s^2
+    referencePreviewCorrection @33 :Float32;   # output minus legacy reference, m/s^2
+    referenceRate @34 :Float32;                # future-path curvature rate at the tracking speed floor, m/s^3
+    trackingMeasurementRate @35 :Float32;      # measured curvature-motion rate at the same tracking speed, m/s^3
+    rateTrackingError @36 :Float32;            # reference minus measured curvature-motion rate, m/s^3
+    rateTrackingCorrection @37 :Float32;       # bounded rate-tracking contribution, m/s^2
+    rateTrackingSpeedScale @38 :Float32;       # all-speed gain schedule applied to rate tracking
+    referenceCurvatureRate @39 :Float32;        # curvature rate selected for cascade tracking, 1/m/s
+    measurementCurvatureRate @40 :Float32;      # filtered measured curvature rate, 1/m/s
+    cascadePositionError @41 :Float32;          # delay-aligned curvature error at the tracking speed, m/s^2
+    cascadeCatchupRate @42 :Float32;            # bounded position-error contribution to desired rate, m/s^3
+    cascadeDesiredRate @43 :Float32;            # future-path rate plus bounded catch-up rate, m/s^3
+    cascadeRateError @44 :Float32;              # cascade desired rate minus measured rate, m/s^3
+    actuatorAppliedLateralAccel @45 :Float32;    # applied normalized torque expressed in controller coordinates, m/s^2
+    actuatorStateCorrection @46 :Float32;       # future-rate-gated feedback from applied actuator state, m/s^2
+    cascadePScale @47 :Float32;                 # residual share of the legacy direct proportional path
+    unwindBrakeActivation @48 :Float32;         # future-path/applied-torque braking blend
+    unwindTorqueZeroTime @49 :Float32;           # predicted time for applied torque to decay to zero, seconds
+    unwindProjectedPositionError @50 :Float32;   # position error projected to torque-zero time, m/s^2
+    unwindTorqueCorrection @51 :Float32;         # normalized request shift toward the future target torque
+    cascadeBasePScale @52 :Float32;              # speed-scheduled P share before future-unwind arbitration
+    dampingTurnInBlocked @53 :Bool;               # preserve authority while a same-direction turn is under-tracked
+    referenceGeometricTargetTorque @54 :Float32;  # controller-consistent torque for the selected path sample
+    referenceNeutralTorque @55 :Float32;          # roll/offset torque required at zero geometric curvature
+    referenceReachableTargetTorque @56 :Float32;  # backward rate-reachable target from the future torque trajectory
+    unwindEffectivePhase @57 :Float32;             # geometry phase retained through actuator delivery and P handback
+    unwindPhaseDirection @58 :Float32;             # original turn torque sign for the active unwind episode
+    unwindDeliveryGap @59 :Float32;                # old-turn applied torque remaining beyond the reachable target
+    unwindPhaseOverspeed @60 :Float32;             # wheel-rate excess in the active unwind direction, m/s^3
+    unwindNeutralTorque @61 :Float32;               # controller-side roll/offset neutral used for delivery timing
+    unwindTorqueNeutralTime @62 :Float32;           # predicted transition time from applied torque to neutral, seconds
+    unwindSameEpisode @63 :Bool;                    # active phase still belongs to the original geometric maneuver
+    unwindOppositeTime @64 :Float32;                # persisted opposite geometric-torque demand, seconds
+    unwindEpisodeArmed @65 :Bool;                   # planner unwind geometry reset since the previous handoff
+    finiteDifferenceReferenceCurvatureRate @66 :Float32; # shadow rate from differentiating the final command, 1/m/s
+    trajectoryReferenceCurvatureRate @67 :Float32;       # centered rate from the continuous future path, 1/m/s
+    trajectoryReferenceRateValid @68 :Bool;              # future-path rate selected instead of the shadow fallback
+    trajectoryReferenceInnovation @69 :Float32;          # differentiated-command rate minus trajectory rate, 1/m/s
+    filteredTrajectoryReferenceInnovation @70 :Float32;  # low-frequency innovation retained by the cascade, 1/m/s
+    referenceSustainedUnwindScale @71 :Float32;           # unwind confidence sustained across the release-preview horizon
+    referenceEpisodeTargetTorque @72 :Float32;           # later geometric torque used to confirm episode handoff
+    referenceEpisodeLateralAccel @73 :Float32;           # later geometric lateral acceleration used to reject friction-only sign flips
    }
 
   struct LateralAngleState {
