@@ -18,7 +18,7 @@ SEVERE_LAUNCH_LAG_S = 1.5
 LAUNCH_STALL_S = 3.0
 LEAD_LOSS_GRACE_S = 0.3
 RADAR_JUMP_M = 1.5
-DETECTOR_VERSION = 1
+DETECTOR_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,22 @@ class LaunchSample:
   output_accel: float
   forecast_valid: bool
   predicted_lead_v_2s: float
+  a_ego: float = 0.0
+  brake_pressed: bool = False
+  brake_hold_active: bool = False
+
+
+@dataclass(frozen=True)
+class OnsetSnapshot:
+  kind: str
+  t: float
+  d_rel: float
+  v_lead: float
+  v_ego: float
+  a_ego: float
+  output_accel: float
+  brake_pressed: bool
+  brake_hold_active: bool
 
 
 @dataclass(frozen=True)
@@ -53,6 +69,11 @@ class LongEvent:
   command_to_lead_s: float = 0.0
   forecast_to_lead_s: float = 0.0
   radar_discontinuity: bool = False
+  onsets: tuple[OnsetSnapshot, ...] = ()
+  episode_start_mono_time: float = 0.0
+  analysis_window_before_s: float = 5.0
+  analysis_window_after_s: float = 3.0
+  attribution_detail: str = ""
 
 
 class LeadLaunchDetector:
@@ -64,25 +85,54 @@ class LeadLaunchDetector:
     self._candidate_start: float | None = None
     self._last_lead_seen: float | None = None
     self._condition_starts: dict[str, float] = {}
+    self._condition_snapshots: dict[str, OnsetSnapshot] = {}
     self._onsets: dict[str, float] = {}
+    self._onset_snapshots: dict[str, OnsetSnapshot] = {}
+    self._candidate_snapshot: OnsetSnapshot | None = None
     self._prev_radar_t: float | None = None
     self._prev_d_rel: float | None = None
     self._prev_track_id: int | None = None
     self._radar_discontinuity = False
     self._emitted = False
 
-  def _onset(self, name: str, condition: bool, t: float, confirm_s: float) -> float | None:
+  @staticmethod
+  def _snapshot(kind: str, sample: LaunchSample) -> OnsetSnapshot:
+    return OnsetSnapshot(
+      kind,
+      sample.t,
+      sample.d_rel,
+      sample.v_lead,
+      sample.v_ego,
+      sample.a_ego,
+      sample.output_accel,
+      sample.brake_pressed,
+      sample.brake_hold_active,
+    )
+
+  def _onset(self, name: str, condition: bool, sample: LaunchSample, confirm_s: float) -> float | None:
     if name in self._onsets:
       return self._onsets[name]
     if not condition:
       self._condition_starts.pop(name, None)
+      self._condition_snapshots.pop(name, None)
       return None
 
-    start = self._condition_starts.setdefault(name, t)
-    if t - start + 1e-9 >= confirm_s:
+    start = self._condition_starts.setdefault(name, sample.t)
+    self._condition_snapshots.setdefault(name, self._snapshot(name, sample))
+    if sample.t - start + 1e-9 >= confirm_s:
       self._onsets[name] = start
+      self._onset_snapshots[name] = self._condition_snapshots[name]
       return start
     return None
+
+  def _event_onsets(self) -> tuple[OnsetSnapshot, ...]:
+    snapshots = []
+    if self._candidate_snapshot is not None:
+      snapshots.append(self._candidate_snapshot)
+    snapshots.extend(self._onset_snapshots[name] for name in (
+      "forecast", "plan", "command", "lead", "ego", "egoAcceleration"
+    ) if name in self._onset_snapshots)
+    return tuple(snapshots)
 
   def _update_radar_quality(self, sample: LaunchSample) -> None:
     if not (sample.lead_present and sample.radar_valid):
@@ -119,7 +169,7 @@ class LeadLaunchDetector:
       cause = "controller"
       event_type = "late_lead_launch_controller"
     else:
-      cause = "vehicle response"
+      cause = "downstream/vehicle response"
       event_type = "late_lead_launch_vehicle"
 
     confidence = 0.55 if self._radar_discontinuity else 0.95
@@ -134,6 +184,9 @@ class LeadLaunchDetector:
       command_to_lead_s=(t_command - t_lead) if t_command is not None else 0.0,
       forecast_to_lead_s=(t_forecast - t_lead) if t_forecast is not None else 0.0,
       radar_discontinuity=self._radar_discontinuity,
+      onsets=self._event_onsets(),
+      episode_start_mono_time=self._candidate_start if self._candidate_start is not None else t_lead,
+      attribution_detail=cause,
     )
 
   def update(self, sample: LaunchSample) -> LongEvent | None:
@@ -144,6 +197,7 @@ class LeadLaunchDetector:
     lead_valid = sample.lead_present and sample.radar_valid
     if sample.standstill and lead_valid and self._candidate_start is None:
       self._candidate_start = sample.t
+      self._candidate_snapshot = self._snapshot("candidate", sample)
 
     if self._candidate_start is None:
       return None
@@ -160,15 +214,16 @@ class LeadLaunchDetector:
       return None
 
     self._onset("forecast", sample.forecast_valid and sample.predicted_lead_v_2s > 0.3,
-                sample.t, FORECAST_CONFIRM_S)
+                sample, FORECAST_CONFIRM_S)
     t_plan = self._onset("plan", sample.plan_valid and not sample.plan_should_stop,
-                         sample.t, SIGNAL_CONFIRM_S)
+                         sample, SIGNAL_CONFIRM_S)
     t_command = self._onset("command", sample.output_valid and sample.output_accel > POSITIVE_ACCEL,
-                            sample.t, SIGNAL_CONFIRM_S)
+                            sample, SIGNAL_CONFIRM_S)
     t_lead = self._onset("lead", lead_valid and sample.v_lead > LEAD_MOVING_SPEED,
-                         sample.t, SIGNAL_CONFIRM_S)
+                         sample, SIGNAL_CONFIRM_S)
     t_ego = self._onset("ego", sample.v_ego > EGO_MOVING_SPEED,
-                        sample.t, SIGNAL_CONFIRM_S)
+                        sample, SIGNAL_CONFIRM_S)
+    self._onset("egoAcceleration", sample.a_ego > POSITIVE_ACCEL, sample, 0.0)
 
     if self._emitted:
       if t_ego is not None or not sample.standstill:
@@ -197,6 +252,9 @@ class LeadLaunchDetector:
         command_to_lead_s=(t_command - t_lead) if t_command is not None else 0.0,
         forecast_to_lead_s=(self._onsets["forecast"] - t_lead) if "forecast" in self._onsets else 0.0,
         radar_discontinuity=self._radar_discontinuity,
+        onsets=self._event_onsets(),
+        episode_start_mono_time=self._candidate_start if self._candidate_start is not None else t_lead,
+        attribution_detail="downstream response unresolved",
       )
 
     # Ego moved before radar measured a departure. That is not a late launch; end this

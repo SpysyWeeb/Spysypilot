@@ -8,8 +8,8 @@ from openpilot.selfdrive.spysypilot.driving_eventd import (
   longitudinal_candidate,
   manual_candidate,
 )
-from openpilot.selfdrive.spysypilot.lat_event_detector import LateralDetection, LateralSample
-from openpilot.selfdrive.spysypilot.long_event_detector import LaunchSample, LongEvent
+from openpilot.selfdrive.spysypilot.lat_event_detector import LateralDetection, LateralEvidence, LateralSample
+from openpilot.selfdrive.spysypilot.long_event_detector import LaunchSample, LongEvent, OnsetSnapshot
 
 
 def round_trip(msg):
@@ -24,6 +24,8 @@ def test_manual_event_round_trip():
   assert event.domain == "manual"
   assert event.payload.which() == "none"
   assert event.gitCommit == "commit"
+  assert event.detectedMonoTime == 123
+  assert event.analysisWindowBeforeS == 15.0
 
 
 def test_lateral_payload_round_trip():
@@ -31,8 +33,17 @@ def test_lateral_payload_round_trip():
     1.0, v_ego=12.0, steering_angle_deg=4.0, steering_rate_deg=-20.0,
     request_torque=0.5, applied_torque=0.4, reference_target_torque=0.1,
     controller_version=3, reference_version=4, road_confounded=True,
+    driver_torque=75.0, steering_torque_eps=123.0, damping_applied=0.2, damping_state="applied",
   )
-  candidate = lateral_candidate(sample, LateralDetection("centerOvershoot", "warning", 0.9, "reason"))
+  evidence = LateralEvidence(
+    0.0, 1.0, 0.5, 100.0, False, 0.25, 1, 0.0, "lat:episode", 2.0, 2.0,
+    stall_release_count=3,
+    release_offsets_s=(-1.0, -0.5, 0.0),
+    stall_durations_s=(0.2, 0.3, 0.4),
+    release_peak_rates_deg=(40.0, 50.0, 60.0),
+    stall_episode_phase="mixed",
+  )
+  candidate = lateral_candidate(sample, LateralDetection("centerOvershoot", "warning", 0.9, "reason", evidence))
   event = round_trip(build_message(AcceptedEvent("lat", "group", candidate))).drivingEvent
   assert event.eventId == "lat"
   assert event.payload.which() == "lateral"
@@ -40,6 +51,10 @@ def test_lateral_payload_round_trip():
   assert event.payload.lateral.steeringRateDeg == -20.0
   assert event.payload.lateral.appliedTargetGap == pytest.approx(0.3)
   assert event.roadConfounded
+  assert event.driverConfounded
+  assert event.payload.lateral.driverTorque == 75.0
+  assert list(event.payload.lateral.stallDurationsS) == pytest.approx([0.2, 0.3, 0.4])
+  assert event.episodeKey == "lat:episode"
 
 
 def test_longitudinal_payload_round_trip():
@@ -48,12 +63,17 @@ def test_longitudinal_payload_round_trip():
     "late_lead_launch_planner", "reason", 3, 0.55,
     lead_to_ego_s=1.5, command_to_ego_s=1.0, plan_to_lead_s=0.5,
     command_to_lead_s=0.7, forecast_to_lead_s=-0.2, radar_discontinuity=True,
+    onsets=(OnsetSnapshot("lead", 1.0, 5.0, 0.5, 0.0, 0.0, 0.1, False, False),),
+    episode_start_mono_time=0.5,
+    attribution_detail="planner",
   )
   event = round_trip(build_message(AcceptedEvent("long", "group", longitudinal_candidate(sample, detected)))).drivingEvent
   assert event.payload.which() == "leadLaunch"
   assert event.payload.leadLaunch.leadToEgoS == 1.5
   assert event.payload.leadLaunch.radarDiscontinuity
   assert event.attribution == "planner"
+  assert event.payload.leadLaunch.onsets[0].kind == "lead"
+  assert event.payload.leadLaunch.onsets[0].monoTime == 1_000_000_000
 
 
 def test_acknowledgment_round_trip_preserves_identity_and_status():
@@ -70,12 +90,18 @@ def test_acknowledgment_round_trip_preserves_identity_and_status():
   ack.markerWritten = True
   ack.currentSegmentPreserved = True
   ack.followingSegmentScheduled = True
+  ack.segmentStartMonoTime = 100
+  ack.ackMonoTime = 150
+  ack.markerAccepted = True
   result = round_trip(msg).drivingEventRecorded
   assert result.eventId == "event"
   assert result.groupId == "group"
   assert result.route == "route"
   assert result.segment == 4
   assert result.markerWritten and result.currentSegmentPreserved and result.followingSegmentScheduled
+  assert result.markerAccepted
+  assert result.segmentStartMonoTime == 100
+  assert result.ackMonoTime == 150
 
 
 def test_legacy_bookmark_and_lateral_event_remain_readable():
