@@ -58,6 +58,7 @@ class UIState:
         "liveParameters",
         "testJoystick",
         "rawAudioData",
+        "drivingEventRecorded",
       ]
     )
 
