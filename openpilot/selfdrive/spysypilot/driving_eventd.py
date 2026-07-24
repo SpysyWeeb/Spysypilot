@@ -379,7 +379,7 @@ def longitudinal_sample(sm: messaging.SubMaster) -> LaunchSample:
     active=bool(sm.valid["carState"] and sm.valid["carControl"] and sm["carControl"].longActive),
     standstill=bool(sm["carState"].standstill),
     v_ego=float(sm["carState"].vEgo),
-    lead_present=bool(lead.status),
+    lead_present=bool(lead.present),
     radar_valid=bool(sm.valid["radarState"]),
     d_rel=float(lead.dRel),
     v_lead=float(lead.vLead),
@@ -407,7 +407,7 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
   road_confounded = sm.valid["livePose"] and bump_classifier.update(float(sm["livePose"].accelerationDevice.z), now)
   damping_applied = float(torque_state.d) if torque_state is not None else 0.0
   damping_state = (
-    "blocked" if torque_state is not None and torque_state.dampingTurnInBlocked
+    "blocked" if torque_state is not None and getattr(torque_state, "dampingTurnInBlocked", False)
     else ("applied" if abs(damping_applied) > 1e-6 else "inactive")
   )
   return LateralSample(
@@ -427,14 +427,14 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     damping_applied=damping_applied,
     damping_state=damping_state,
     controller_version=int(torque_state.version) if torque_state is not None else 0,
-    reference_version=int(torque_state.referenceVersion) if torque_state is not None else 0,
-    reference_rate=float(torque_state.referenceRate) if torque_state is not None else 0.0,
-    reference_target_torque=float(torque_state.referenceReachableTargetTorque) if torque_state is not None else 0.0,
-    reference_unwind_scale=float(torque_state.referenceUnwindScale) if torque_state is not None else 0.0,
-    reference_sustained_unwind_scale=float(torque_state.referenceSustainedUnwindScale) if torque_state is not None else 0.0,
-    unwind_effective_phase=float(torque_state.unwindEffectivePhase) if torque_state is not None else 0.0,
-    unwind_overspeed=float(torque_state.unwindPhaseOverspeed) if torque_state is not None else 0.0,
-    unwind_same_episode=bool(torque_state.unwindSameEpisode) if torque_state is not None else False,
+    reference_version=int(getattr(torque_state, "referenceVersion", 0)) if torque_state is not None else 0,
+    reference_rate=float(getattr(torque_state, "referenceRate", 0.0)) if torque_state is not None else 0.0,
+    reference_target_torque=float(getattr(torque_state, "referenceReachableTargetTorque", 0.0)) if torque_state is not None else 0.0,
+    reference_unwind_scale=float(getattr(torque_state, "referenceUnwindScale", 0.0)) if torque_state is not None else 0.0,
+    reference_sustained_unwind_scale=float(getattr(torque_state, "referenceSustainedUnwindScale", 0.0)) if torque_state is not None else 0.0,
+    unwind_effective_phase=float(getattr(torque_state, "unwindEffectivePhase", 0.0)) if torque_state is not None else 0.0,
+    unwind_overspeed=float(getattr(torque_state, "unwindPhaseOverspeed", 0.0)) if torque_state is not None else 0.0,
+    unwind_same_episode=bool(getattr(torque_state, "unwindSameEpisode", False)) if torque_state is not None else False,
     road_confounded=bool(road_confounded),
   )
 

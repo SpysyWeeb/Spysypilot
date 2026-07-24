@@ -90,7 +90,7 @@ class ForceStops:
       self._reset()
       return NO_CAP
 
-    self.lead_filter.update(1.0 if sm['radarState'].leadOne.status else 0.0)
+    self.lead_filter.update(1.0 if sm['radarState'].leadOne.present else 0.0)
     tracking_lead = self.lead_filter.x > LEAD_GATE
 
     # the model's planned path ends here; a short endpoint means it is planning a stop,
@@ -129,7 +129,7 @@ class ForceStops:
         # count down by distance actually traveled, immune to later dithering
         self.forcing = True
         self.remaining = max(model_length - LATCH_SETBACK, MIN_STOP_LENGTH)
-      elif self.detect_filter.x >= PRE_LATCH_GATE and 0.0 < model_length and not sm['radarState'].leadOne.status:
+      elif self.detect_filter.x >= PRE_LATCH_GATE and 0.0 < model_length and not sm['radarState'].leadOne.present:
         # pre-latch shaping: comfort envelope on the model's LIVE endpoint, so lead-less
         # red lights brake on the owner's curve instead of the model's backloaded ramp;
         # nothing is frozen yet, so a green light or model change of heart costs nothing.
