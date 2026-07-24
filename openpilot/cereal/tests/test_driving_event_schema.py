@@ -8,7 +8,12 @@ from openpilot.selfdrive.spysypilot.driving_eventd import (
   longitudinal_candidate,
   manual_candidate,
 )
-from openpilot.selfdrive.spysypilot.lat_event_detector import LateralDetection, LateralEvidence, LateralSample
+from openpilot.selfdrive.spysypilot.lat_event_detector import (
+  LateralDetection,
+  LateralEvidence,
+  LateralSample,
+  StallReleaseEvidence,
+)
 from openpilot.selfdrive.spysypilot.long_event_detector import LaunchSample, LongEvent, OnsetSnapshot
 
 
@@ -42,8 +47,43 @@ def test_lateral_payload_round_trip():
     stall_durations_s=(0.2, 0.3, 0.4),
     release_peak_rates_deg=(40.0, 50.0, 60.0),
     stall_episode_phase="mixed",
+    raw_torque_exceeded_fraction=0.25,
+    longest_raw_torque_duration_s=0.44,
+    steering_pressed_fraction=0.0,
+    driver_torque_active_at_trigger=True,
+    driver_interaction="possibleRawTorque",
+    road_confounded_at_trigger=True,
+    max_vertical_accel_deviation=2.02,
+    longest_road_confounded_duration_s=0.84,
+    road_interaction="substantial",
+    center_crossing_mono_time=0.75,
+    phase_handoff_mono_time=0.5,
+    committed_reversal=True,
+    peak_abs_center_rate_deg=315.8,
+    signed_center_rate_deg=300.0,
+    established_outside_center=True,
+    desired_lateral_accel_before_crossing=0.24,
+    desired_lateral_accel_after_crossing=-0.36,
+    desired_reversal_commit_mono_time=0.93,
+    tracking_error_at_crossing=0.70,
+    applied_target_gap_at_crossing=0.30,
+    requested_torque_at_crossing=0.55,
+    applied_torque_at_crossing=0.42,
+    reference_target_torque_at_crossing=0.12,
+    peak_tracking_error=0.776,
+    peak_applied_target_gap=0.307,
+    handoff_consolidated=True,
+    handoff_center_delta_s=0.25,
+    stall_releases=(StallReleaseEvidence(
+      0.8, -0.2, 0.16, -62.5, 62.5, 13.8, 3.4, -0.13, -0.05,
+      0.69, 0.52, 0.31, 0.0, "turnInAuthority", True, 0.0, 0.0, 2,
+      True, False, "turnIn",
+    ),),
   )
-  candidate = lateral_candidate(sample, LateralDetection("centerOvershoot", "warning", 0.9, "reason", evidence))
+  candidate = lateral_candidate(sample, LateralDetection(
+    "committedHandoffHarshness", "warning", 0.9, "reason", evidence,
+    occurred_mono_time=0.75, detected_mono_time=1.0,
+  ))
   event = round_trip(build_message(AcceptedEvent("lat", "group", candidate))).drivingEvent
   assert event.eventId == "lat"
   assert event.payload.which() == "lateral"
@@ -54,6 +94,21 @@ def test_lateral_payload_round_trip():
   assert event.driverConfounded
   assert event.payload.lateral.driverTorque == 75.0
   assert list(event.payload.lateral.stallDurationsS) == pytest.approx([0.2, 0.3, 0.4])
+  assert event.occurredMonoTime == 750_000_000
+  assert event.detectedMonoTime == 1_000_000_000
+  assert event.payload.lateral.driverInteraction == "possibleRawTorque"
+  assert event.payload.lateral.roadConfoundExtent == "substantial"
+  assert event.payload.lateral.centerCrossingMonoTime == event.occurredMonoTime
+  assert event.payload.lateral.handoffConsolidated
+  assert event.payload.lateral.peakAbsCenterWheelRateDeg == pytest.approx(315.8)
+  assert event.payload.lateral.requestedTorqueAtCrossing == pytest.approx(0.55)
+  assert event.payload.lateral.appliedTorqueAtCrossing == pytest.approx(0.42)
+  assert event.payload.lateral.referenceTargetTorqueAtCrossing == pytest.approx(0.12)
+  release = event.payload.lateral.stallReleases[0]
+  assert release.dampingValid
+  assert release.dampingState == "turnInAuthority"
+  assert release.dampingApplied == 0.0
+  assert release.turnInBlocked
   assert event.episodeKey == "lat:episode"
 
 

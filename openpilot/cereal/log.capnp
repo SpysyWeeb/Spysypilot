@@ -2615,6 +2615,8 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     none @19 :Void;
     lateral @20 :LateralPayload;
     leadLaunch @21 :LeadLaunchPayload;
+    stopJolt @27 :StopJoltPayload;
+    rollingLeadResponse @28 :RollingLeadResponsePayload;
   }
 
   detectedMonoTime @22 :UInt64;
@@ -2697,6 +2699,75 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     previousUnwindEffectivePhase @38 :Float32;
     previousUnwindSameEpisode @39 :Bool;
     trackingInactiveTimeS @40 :Float32;
+    rawTorqueAboveThresholdFraction @41 :Float32;
+    rawTorqueAboveThresholdLongestS @42 :Float32;
+    steeringPressedFraction @43 :Float32;
+    driverTorquePresentAtTrigger @44 :Bool;
+    driverInteraction @45 :DriverInteraction;
+    roadConfoundedAtEventTime @46 :Bool;
+    maxVerticalAccelDeviation @47 :Float32;
+    longestRoadBumpIntervalS @48 :Float32;
+    roadConfoundExtent @49 :RoadConfoundExtent;
+    centerCrossingMonoTime @50 :UInt64;
+    classificationConfirmedMonoTime @51 :UInt64;
+    establishedOutsideCenter @52 :Bool;
+    centerCrossingWheelRateDeg @53 :Float32;
+    desiredLateralAccelBeforeCrossing @54 :Float32;
+    desiredLateralAccelAfterCrossing @55 :Float32;
+    desiredReversalCommitted @56 :Bool;
+    desiredReversalCommitMonoTime @57 :UInt64;
+    trackingErrorAtCrossing @58 :Float32;
+    appliedTargetGapAtCrossing @59 :Float32;
+    handoffObserved @60 :Bool;
+    handoffMonoTime @61 :UInt64;
+    handoffCenterDeltaS @62 :Float32;
+    handoffConsolidated @63 :Bool;
+    stallReleases @64 :List(StallReleaseEvidence);
+    signedCenterCrossingWheelRateDeg @65 :Float32;
+    peakAbsCenterWheelRateDeg @66 :Float32;
+    peakTrackingError @67 :Float32;
+    peakAppliedTargetGap @68 :Float32;
+    steeringPressedAtTrigger @69 :Bool;
+    requestedTorqueAtCrossing @70 :Float32;
+    appliedTorqueAtCrossing @71 :Float32;
+    referenceTargetTorqueAtCrossing @72 :Float32;
+
+    enum DriverInteraction {
+      none @0;
+      possibleRawTorque @1;
+      confirmedSteeringPressed @2;
+    }
+
+    enum RoadConfoundExtent {
+      none @0;
+      transient @1;
+      substantial @2;
+    }
+
+    struct StallReleaseEvidence {
+      releaseMonoTime @0 :UInt64;
+      offsetFromTriggerS @1 :Float32;
+      stallDurationS @2 :Float32;
+      peakSignedSteeringRateDeg @3 :Float32;
+      peakAbsSteeringRateDeg @4 :Float32;
+      steeringAngleDeg @5 :Float32;
+      vEgo @6 :Float32;
+      desiredLateralAccel @7 :Float32;
+      actualLateralAccel @8 :Float32;
+      requestedTorque @9 :Float32;
+      appliedTorque @10 :Float32;
+      referenceTargetTorque @11 :Float32;
+      dampingApplied @12 :Float32;
+      dampingState @13 :Text;
+      turnInBlocked @14 :Bool;
+      breakawayLatch @15 :Float32;
+      sustainFloor @16 :Float32;
+      dampingVersion @17 :UInt8;
+      dampingValid @18 :Bool;
+      driverEvidenceActive @19 :Bool;
+      roadEvidenceActive @20 :Bool;
+      phase @21 :Text;
+    }
   }
 
   struct LeadLaunchPayload {
@@ -2729,6 +2800,114 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
         lead @4;
         ego @5;
         egoAcceleration @6;
+      }
+    }
+  }
+
+  struct StopJoltPayload {
+    episodeStartMonoTime @0 :UInt64;
+    standstillMonoTime @1 :UInt64;
+    peakJoltMonoTime @2 :UInt64;
+    detectionMonoTime @3 :UInt64;
+    imuJerk @4 :Float32;
+    absImuJerk @5 :Float32;
+    aEgoJerk @6 :Float32;
+    absAEgoJerk @7 :Float32;
+    imuAccelBefore @8 :Float32;
+    imuAccelAfter @9 :Float32;
+    aEgoAccelBefore @10 :Float32;
+    aEgoAccelAfter @11 :Float32;
+    accelChange @12 :Float32;
+    accelAt02Mps @13 :Float32;
+    vEgoAtPeak @14 :Float32;
+    planATarget @15 :Float32;
+    requestedAccel @16 :Float32;
+    appliedAccel @17 :Float32;
+    planAccelChange @18 :Float32;
+    requestedAccelChange @19 :Float32;
+    appliedAccelChange @20 :Float32;
+    shouldStopBefore @21 :Bool;
+    shouldStopAtPeak @22 :Bool;
+    shouldStopAfter @23 :Bool;
+    longControlStateBefore @24 :Text;
+    longControlStateAtPeak @25 :Text;
+    longControlStateAfter @26 :Text;
+    leadPresent @27 :Bool;
+    dRel @28 :Float32;
+    vLeadK @29 :Float32;
+    brakePressed @30 :Bool;
+    gasPressed @31 :Bool;
+    brakeHoldActive @32 :Bool;
+    radarValid @33 :Bool;
+    imuValid @34 :Bool;
+    roadConfounded @35 :Bool;
+    classification @36 :Classification;
+
+    enum Classification {
+      brakeGrab @0;
+      releaseSnap @1;
+      grabAndRebound @2;
+    }
+  }
+
+  struct RollingLeadResponsePayload {
+    attributionDetail @0 :Text;
+    leadCommitMonoTime @1 :UInt64;
+    plannerResponseMonoTime @2 :UInt64;
+    controllerResponseMonoTime @3 :UInt64;
+    egoResponseMonoTime @4 :UInt64;
+    detectedMonoTime @5 :UInt64;
+    leadToPlanS @6 :Float32;
+    leadToCommandS @7 :Float32;
+    leadToEgoS @8 :Float32;
+    baselineLeadSpeed @9 :Float32;
+    peakLeadSpeed @10 :Float32;
+    baselineEgoSpeed @11 :Float32;
+    peakEgoSpeed @12 :Float32;
+    peakRelativeSpeed @13 :Float32;
+    baselineGap @14 :Float32;
+    finalGap @15 :Float32;
+    maxGapGrowth @16 :Float32;
+    baselineLeadAccel @17 :Float32;
+    peakLeadAccel @18 :Float32;
+    baselinePlannerAccel @19 :Float32;
+    peakPlannerAccel @20 :Float32;
+    baselineOutputAccel @21 :Float32;
+    peakOutputAccel @22 :Float32;
+    baselineEgoAccel @23 :Float32;
+    peakEgoAccel @24 :Float32;
+    radarTrackId @25 :Int64;
+    radarDiscontinuity @26 :Bool;
+    driverConfounded @27 :Bool;
+    onsets @28 :List(OnsetSnapshot);
+    plannerResponsePresent @29 :Bool;
+    controllerResponsePresent @30 :Bool;
+    egoResponsePresent @31 :Bool;
+
+    struct OnsetSnapshot {
+      kind @0 :Kind;
+      monoTime @1 :UInt64;
+      dRel @2 :Float32;
+      vLead @3 :Float32;
+      vLeadK @4 :Float32;
+      aLeadK @5 :Float32;
+      vEgo @6 :Float32;
+      aEgo @7 :Float32;
+      plannerAccel @8 :Float32;
+      outputAccel @9 :Float32;
+      shouldStop @10 :Bool;
+      longActive @11 :Bool;
+      radarValid @12 :Bool;
+      gasPressed @13 :Bool;
+      brakePressed @14 :Bool;
+
+      enum Kind {
+        baseline @0;
+        leadCommit @1;
+        plannerResponse @2;
+        controllerResponse @3;
+        egoResponse @4;
+        detection @5;
       }
     }
   }
