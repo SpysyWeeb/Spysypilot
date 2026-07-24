@@ -1,8 +1,8 @@
 """Lightweight on-road longitudinal event detection.
 
-This module deliberately has no messaging or filesystem dependencies. feedbackd feeds
-it the latest planner, radar, controller, and vehicle state; emitted events are then
-published through userBookmark so loggerd preserves the local segment.
+This module deliberately has no messaging or filesystem dependencies. driving_eventd
+feeds it the latest planner, radar, controller, and vehicle state and publishes its
+results through the shared drivingEvent envelope.
 """
 from dataclasses import dataclass
 
