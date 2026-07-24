@@ -37,10 +37,20 @@ def test_group_is_coalesced_without_hiding_failure():
   assert queue.pending[0].text == "Event Save Failed"
 
 
-def test_critical_alert_delays_then_releases_notice():
+def test_any_safety_alert_delays_then_releases_notice():
   queue = EventNotificationQueue()
   queue.push(ack(), 1.0)
-  assert queue.current(critical_alert=True, now=1.1) is None
-  notice = queue.current(critical_alert=False, now=2.0)
+  assert queue.current(safety_alert_visible=True, now=1.1) is None
+  notice = queue.current(safety_alert_visible=False, now=2.0)
   assert notice is not None
   assert notice.text == "Lat Event Logged"
+
+
+def test_corrected_acknowledgment_replaces_failure_for_same_event():
+  queue = EventNotificationQueue()
+  queue.push(ack(marker=False), 1.0)
+  queue.push(ack(marker=True, preserved=True), 1.1)
+  notice = queue.current(safety_alert_visible=False, now=1.2)
+  assert notice is not None
+  assert notice.text == "Lat Event Logged"
+  assert not notice.failed
