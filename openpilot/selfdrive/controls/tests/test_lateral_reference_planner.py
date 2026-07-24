@@ -8,6 +8,8 @@ from openpilot.selfdrive.controls.lib.lateral_reference_planner import (
   EPISODE_COMMITMENT_LOOKAHEAD,
   LateralReferencePlanner,
   MAX_PREVIEW_LATERAL_ACCEL_DELTA,
+  TRAJECTORY_DT,
+  TRAJECTORY_T,
   UNWIND_RELEASE_PREVIEW_TIME,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -243,6 +245,78 @@ class TestLateralReferencePlanner:
     reversal_time = planner._transition_time(-0.8, 0.4)
     assert reversal_time > same_direction_time
 
+  def test_closed_form_reachability_matches_transition_definition(self):
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    rng = np.random.default_rng(0)
+
+    for desired_previous, reachable_next, duration in zip(
+      rng.uniform(-1.0, 1.0, 1000),
+      rng.uniform(-1.0, 1.0, 1000),
+      rng.uniform(0.0, 0.2, 1000),
+      strict=True,
+    ):
+      actual = planner._reachable_previous_torque(desired_previous, reachable_next, duration)
+
+      # Independent high-precision version of the previous monotonic bisection.
+      if planner._transition_time(desired_previous, reachable_next) <= duration:
+        expected = desired_previous
+      else:
+        feasible_fraction = 0.0
+        infeasible_fraction = 1.0
+        for _ in range(60):
+          fraction = 0.5 * (feasible_fraction + infeasible_fraction)
+          candidate = reachable_next + fraction * (desired_previous - reachable_next)
+          if planner._transition_time(candidate, reachable_next) <= duration:
+            feasible_fraction = fraction
+          else:
+            infeasible_fraction = fraction
+        expected = reachable_next + feasible_fraction * (desired_previous - reachable_next)
+
+      assert actual == pytest.approx(expected, abs=1e-12)
+      assert planner._transition_time(actual, reachable_next) <= duration + 1e-12
+
+  def test_vectorized_torque_demand_matches_scalar_definition(self):
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    rng = np.random.default_rng(1)
+    planner.solution = rng.uniform(-0.04, 0.04, len(TRAJECTORY_T))
+    planner.predicted_speeds = rng.uniform(1.0, 15.0, len(TRAJECTORY_T))
+    v_ego = 5.0
+    lat_accel_factor = 2.7
+    friction = 0.13
+    roll = 0.06
+    lat_accel_offset = -0.1
+
+    desired, _ = planner._reachable_torque_trajectory(v_ego, lat_accel_factor, friction, roll, lat_accel_offset)
+    scalar_desired = np.asarray(
+      [
+        planner._target_torque(curvature, sample_time, v_ego, lat_accel_factor, friction, roll, lat_accel_offset)
+        for curvature, sample_time in zip(planner.solution, TRAJECTORY_T, strict=True)
+      ]
+    )
+    np.testing.assert_array_equal(desired, scalar_desired)
+
+  def test_actuator_preview_keeps_road_tested_single_pass(self, monkeypatch):
+    speed = 4.0
+    curvature = 0.05
+    yaws = speed * curvature * np.minimum(MODEL_T, 0.6)
+    planner = LateralReferencePlanner()
+    planner.configure_actuator(HYUNDAI_ACTUATOR)
+    assert planner.update(build_model(yaws, speed), curvature, speed)
+
+    transition_calls = 0
+    transition_time = planner._transition_time
+
+    def count_transition(current, target):
+      nonlocal transition_calls
+      transition_calls += 1
+      return transition_time(current, target)
+
+    monkeypatch.setattr(planner, "_transition_time", count_transition)
+    planner.get_curvature(curvature, speed, 0.2, applied_torque=-0.8, lat_accel_factor=2.7, friction=0.13)
+    assert transition_calls == 1
+
   def test_reachable_torque_envelope_breaks_saturated_preview_deadlock(self):
     speed = 6.0
     curvature = 0.08
@@ -284,7 +358,7 @@ class TestLateralReferencePlanner:
 
     _, reachable = planner._reachable_torque_trajectory(speed, 2.7, 0.13, 0.07, -0.103)
     transition_times = [planner._transition_time(current, following) for current, following in zip(reachable[:-1], reachable[1:], strict=True)]
-    assert max(transition_times) <= 0.05 + 1e-4
+    assert max(transition_times) <= TRAJECTORY_DT + 1e-12
 
   def test_speed_change_alone_does_not_trigger_path_unwind(self):
     speed = 8.0
