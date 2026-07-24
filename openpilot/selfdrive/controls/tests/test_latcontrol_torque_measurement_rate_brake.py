@@ -27,9 +27,10 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME,
   HIGH_ANGLE_UNWIND_FULL_DEG,
   HIGH_ANGLE_UNWIND_FULL_SPEED,
+  HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME,
   HIGH_ANGLE_UNWIND_MAX_SPEED,
   HIGH_ANGLE_UNWIND_MIN_SPEED,
-  HIGH_ANGLE_UNWIND_PRESENT_GUARD_MAX,
+  HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME,
   HIGH_ANGLE_UNWIND_RAMP_IN_TIME,
   HIGH_ANGLE_UNWIND_START_DEG,
   REFERENCE_RATE_MIN_SPEED,
@@ -54,6 +55,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   get_reference_rate_cascade,
   reference_rate_tracking_speed_scale,
   should_block_undertracked_turn_in_damping,
+  smoothstep,
   torque_transition_time,
 )
 
@@ -353,6 +355,12 @@ class TestHighAngleUnwindExit:
     assert old_direction == 0.0
     assert breakout_correction == 0.0
 
+  @pytest.mark.parametrize(("neutral", "old_sign"), [(1.0, -1.0), (-1.0, 1.0)])
+  def test_breakout_never_pushes_absolute_command_outside_normalized_bounds(self, neutral, old_sign):
+    output, _, _, breakout = apply_high_angle_unwind_limits(neutral, neutral, old_sign, None, 1.0)
+    assert output == pytest.approx(neutral)
+    assert breakout == 0.0
+
   @pytest.mark.parametrize("sign", [-1.0, 1.0])
   def test_dense_latched_and_breakout_limits_remain_bounded(self, sign):
     for neutral in np.linspace(-0.25, 0.25, 11):
@@ -388,7 +396,7 @@ class TestHighAngleUnwindExitState:
     reference_rate=None,
   ):
     reference_rate = turn_sign if reference_rate is None else reference_rate
-    samples = int(np.ceil((HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_UNWIND_RAMP_IN_TIME) / DT_CTRL)) + 2
+    samples = int(np.ceil((HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME + HIGH_ANGLE_UNWIND_RAMP_IN_TIME) / DT_CTRL)) + 2
     return [state.update(True, angle, speed, 1.0, 1.0, True, turn_sign, reference_rate) for _ in range(samples)]
 
   def test_requires_persistent_future_confirmed_unwind(self):
@@ -463,31 +471,211 @@ class TestHighAngleUnwindExitState:
     assert dropout_scale == pytest.approx(1.0)
     assert state.confirmed_time >= HIGH_ANGLE_UNWIND_CONFIRM_TIME
 
-  @pytest.mark.parametrize("sign", [-1.0, 1.0])
-  def test_present_build_and_undertrack_limit_new_release_authority(self, sign):
+  def test_uncommitted_future_intent_expires_after_bounded_wait(self):
     state = HighAngleUnwindExitState(DT_CTRL)
-    samples = int(np.ceil((HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_UNWIND_RAMP_IN_TIME) / DT_CTRL)) + 2
-    for _ in range(samples):
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, delayed_lateral_accel=-1.2)
+    assert state.future_confirmed
+
+    for _ in range(int(np.ceil(HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME / DT_CTRL)) + 2):
+      state.update(True, 400.0, 3.0, 0.0, 1.0, True, 1.0, 0.0, delayed_lateral_accel=-1.2)
+    assert not state.future_confirmed
+    assert state.confirmed_target_scale == 0.0
+
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 0.0, 1.0, True, 1.0, 0.0, delayed_lateral_accel=0.0)
+    assert not state.release_committed
+    assert state.latched_scale == 0.0
+
+  def test_sparse_unconfirmed_future_blips_cannot_refresh_old_intent(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, delayed_lateral_accel=-1.2)
+    assert state.future_confirmed
+
+    dropout_samples = int(np.floor((HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME - 0.05) / DT_CTRL))
+    for _ in range(5):
+      for _ in range(dropout_samples):
+        state.update(True, 400.0, 3.0, 0.0, 1.0, True, 1.0, 0.0, delayed_lateral_accel=-1.2)
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, delayed_lateral_accel=-1.2)
+    assert not state.future_confirmed
+    assert state.confirmed_target_scale == 0.0
+
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 0.0, 1.0, True, 1.0, 0.0, delayed_lateral_accel=0.0)
+    assert not state.release_committed
+
+  def test_delayed_commit_cannot_exceed_current_angle_authority(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, delayed_lateral_accel=-1.2)
+    assert state.confirmed_target_scale == pytest.approx(1.0)
+
+    for _ in range(int(np.ceil(HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME / DT_CTRL)) + 2):
       state.update(
         True,
-        HIGH_ANGLE_UNWIND_FULL_DEG * sign,
+        130.0,
+        3.0,
+        0.0,
+        1.0,
+        True,
+        1.0,
+        0.0,
+        present_demand_rate=0.5,
+        delayed_lateral_accel=-0.4,
+      )
+    current_angle_scale = smoothstep((130.0 - HIGH_ANGLE_UNWIND_START_DEG) / (HIGH_ANGLE_UNWIND_FULL_DEG - HIGH_ANGLE_UNWIND_START_DEG))
+    assert state.release_committed
+    assert state.latched_scale == pytest.approx(current_angle_scale)
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_strong_present_plateau_blocks_all_release_authority(self, sign):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(100):
+      state.update(
+        True,
+        235.0 * sign,
+        4.4,
+        1.0,
+        1.0,
+        True,
+        sign,
+        sign,
+        present_demand_rate=0.0,
+        tracking_position_error=-0.25 * sign,
+        delayed_lateral_accel=-1.9 * sign,
+        current_lateral_accel=-1.9 * sign,
+        geometric_lateral_accel=-1.9 * sign,
+        applied_torque=0.8 * sign,
+      )
+    assert state.turn_in_guard == pytest.approx(1.0)
+    assert not state.release_committed
+    assert state.latched_scale == 0.0
+    assert state.scale == 0.0
+    assert state.old_direction_limit is None
+    output, correction, old_direction, breakout = state.apply(0.9 * sign, 0.1 * sign)
+    assert old_direction == pytest.approx(0.8)
+    assert output == pytest.approx(0.9 * sign)
+    assert correction == 0.0
+    assert breakout == 0.0
+
+  def test_brief_present_demand_rate_noise_cannot_commit_release(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(40):
+      state.update(True, -235.0, 4.4, 1.0, 1.0, True, -1.0, -1.0, delayed_lateral_accel=1.9)
+    for _ in range(int(np.floor(HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME / DT_CTRL)) - 1):
+      state.update(
+        True,
+        -235.0,
+        4.4,
+        1.0,
+        1.0,
+        True,
+        -1.0,
+        -1.0,
+        present_demand_rate=-0.5,
+        delayed_lateral_accel=0.6,
+      )
+    for _ in range(40):
+      state.update(True, -235.0, 4.4, 1.0, 1.0, True, -1.0, -1.0, delayed_lateral_accel=1.9)
+    assert not state.release_committed
+    assert state.release_candidate_time == 0.0
+    assert state.latched_scale == 0.0
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_true_present_demand_decline_commits_without_wheel_motion(self, sign):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(30):
+      state.update(True, 400.0 * sign, 3.0, 1.0, 1.0, True, sign, sign, delayed_lateral_accel=-1.2 * sign)
+    release_samples = int(np.ceil(HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME / DT_CTRL)) + 2
+    for _ in range(release_samples):
+      state.update(
+        True,
+        400.0 * sign,
         3.0,
         1.0,
         1.0,
         True,
         sign,
         sign,
-        -1.0 * sign,
-        -0.40 * sign,
-        -1.0 * sign,
+        present_demand_rate=0.4 * sign,
+        tracking_position_error=-0.25 * sign,
+        delayed_lateral_accel=-0.45 * sign,
+        applied_torque=0.8 * sign,
+        neutral_torque=0.1 * sign,
       )
-    assert state.turn_in_guard == pytest.approx(1.0)
-    assert state.latched_scale == pytest.approx(1.0 - HIGH_ANGLE_UNWIND_PRESENT_GUARD_MAX)
-    output, correction, old_direction, breakout = state.apply(0.9 * sign, 0.1 * sign)
-    assert old_direction == pytest.approx(0.8)
-    assert (output - 0.1 * sign) * sign == pytest.approx(0.8 * HIGH_ANGLE_UNWIND_PRESENT_GUARD_MAX)
-    assert correction * sign < 0.0
-    assert breakout == 0.0
+    assert state.release_committed
+    assert state.release_owned
+    assert state.latched_scale == pytest.approx(1.0)
+
+  def test_route_603_like_gradual_extreme_release_commits_before_angle_exit(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(30):
+      state.update(True, -425.0, 2.9, 1.0, 1.0, True, -1.0, -1.0, delayed_lateral_accel=0.85)
+    for demand in np.linspace(0.85, 0.26, 50):
+      state.update(
+        True,
+        -425.0,
+        2.9,
+        0.0,
+        1.0,
+        True,
+        -1.0,
+        0.0,
+        present_demand_rate=-0.8,
+        delayed_lateral_accel=float(demand),
+      )
+    assert state.release_committed
+    assert state.latched_scale == pytest.approx(1.0)
+
+  def test_confirmed_future_intent_waits_without_torque_then_survives_preview_dropout(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, delayed_lateral_accel=-1.2)
+    assert state.future_confirmed
+    assert not state.release_committed
+    output, correction, *_ = state.apply(0.9, 0.1)
+    assert output == pytest.approx(0.9)
+    assert correction == 0.0
+
+    for _ in range(int(np.ceil(HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME / DT_CTRL)) + 2):
+      state.update(
+        True,
+        400.0,
+        3.0,
+        0.0,
+        1.0,
+        True,
+        1.0,
+        0.0,
+        present_demand_rate=0.5,
+        delayed_lateral_accel=-0.4,
+      )
+    assert state.release_committed
+    assert state.latched_scale == pytest.approx(1.0)
+
+  def test_route_577_plateau_dip_does_not_commit_release(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for demand, demand_rate in [(1.99, 0.0)] * 30 + [(1.86, -0.3)] * 3 + [(1.9, 0.0)] * 50:
+      state.update(
+        True,
+        -235.0,
+        4.4,
+        1.0,
+        1.0,
+        True,
+        -1.0,
+        -1.0,
+        present_demand_rate=demand_rate,
+        tracking_position_error=0.25,
+        delayed_lateral_accel=demand,
+        current_lateral_accel=demand,
+        geometric_lateral_accel=demand,
+        applied_torque=-0.78,
+      )
+    assert not state.release_committed
+    assert state.latched_scale == 0.0
+    assert state.old_direction_limit is None
 
   def test_release_ceiling_never_relaxes_with_falling_angle_or_rising_command(self):
     state = HighAngleUnwindExitState(DT_CTRL)
@@ -528,7 +716,7 @@ class TestHighAngleUnwindExitState:
 
   def test_breakout_waits_for_applied_crown_neutral(self):
     state = HighAngleUnwindExitState(DT_CTRL)
-    samples = int(np.ceil((HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_BREAKOUT_PROGRESS_TIME + 0.5) / DT_CTRL))
+    samples = int(np.ceil((HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME + HIGH_ANGLE_BREAKOUT_PROGRESS_TIME + 0.5) / DT_CTRL))
     for _ in range(samples):
       state.update(
         True,
@@ -547,7 +735,15 @@ class TestHighAngleUnwindExitState:
 
   def test_extreme_stall_earns_bounded_breakout_after_neutral_progress_window(self):
     state = HighAngleUnwindExitState(DT_CTRL)
-    samples = int(np.ceil((HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_BREAKOUT_PROGRESS_TIME + HIGH_ANGLE_UNWIND_RAMP_IN_TIME) / DT_CTRL)) + 4
+    samples = (
+      int(
+        np.ceil(
+          (HIGH_ANGLE_UNWIND_CONFIRM_TIME + HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME + HIGH_ANGLE_BREAKOUT_PROGRESS_TIME + HIGH_ANGLE_UNWIND_RAMP_IN_TIME)
+          / DT_CTRL
+        )
+      )
+      + 4
+    )
     for _ in range(samples):
       state.update(
         True,
@@ -566,6 +762,69 @@ class TestHighAngleUnwindExitState:
     assert -HIGH_ANGLE_BREAKOUT_TORQUE_MAX <= output - 0.1 < 0.0
     assert breakout < 0.0
 
+  def test_earned_breakout_survives_future_evidence_dropout(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(100):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, applied_torque=0.1, neutral_torque=0.1)
+    assert state.breakout_earned
+    earned_scale = state.breakout_scale
+    for _ in range(40):
+      state.update(True, 400.0, 3.0, 0.0, 1.0, True, 1.0, 1.0, applied_torque=0.1, neutral_torque=0.1)
+    assert state.breakout_earned
+    assert not state.breakout_completed
+    assert state.breakout_scale == pytest.approx(earned_scale)
+
+  def test_newly_earned_breakout_freezes_during_short_future_dropout(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(200):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, applied_torque=0.1, neutral_torque=0.1)
+      if state.breakout_earned:
+        break
+    assert state.breakout_earned
+    earned_scale = state.breakout_scale
+    catch_time = state.breakout_catch_time
+    for _ in range(10):
+      state.update(
+        True,
+        400.0,
+        3.0,
+        0.0,
+        1.0,
+        True,
+        1.0,
+        1.0,
+        tracking_measurement_rate=1.0,
+        steering_rate_deg=-70.0,
+        applied_torque=0.1,
+        neutral_torque=0.1,
+      )
+    assert state.breakout_scale == pytest.approx(earned_scale)
+    assert state.breakout_catch_time == pytest.approx(catch_time)
+
+  def test_breakout_ends_only_after_sustained_measured_rate_recovery(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(100):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, applied_torque=0.1, neutral_torque=0.1)
+    assert state.breakout_earned
+    recovery_samples = int(np.ceil(0.15 / DT_CTRL)) + 1
+    for _ in range(recovery_samples):
+      state.update(
+        True,
+        400.0,
+        3.0,
+        1.0,
+        1.0,
+        True,
+        1.0,
+        1.0,
+        tracking_measurement_rate=1.0,
+        steering_rate_deg=-70.0,
+        applied_torque=0.1,
+        neutral_torque=0.1,
+      )
+    assert state.breakout_completed
+    assert state.breakout_target_scale == 0.0
+
   def test_sufficient_progress_or_moderate_angle_prevents_breakout(self):
     moderate = HighAngleUnwindExitState(DT_CTRL)
     for _ in range(100):
@@ -573,7 +832,9 @@ class TestHighAngleUnwindExitState:
     assert moderate.breakout_scale == 0.0
 
     progressing = HighAngleUnwindExitState(DT_CTRL)
-    for angle in np.linspace(400.0, 360.0, 60):
+    for _ in range(40):
+      progressing.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, applied_torque=0.2, neutral_torque=0.1)
+    for angle in np.linspace(400.0, 350.0, 40):
       progressing.update(True, angle, 3.0, 1.0, 1.0, True, 1.0, 1.0, applied_torque=0.1, neutral_torque=0.1)
     assert progressing.progress_deg >= 30.0
     assert progressing.breakout_scale == 0.0
@@ -995,6 +1256,13 @@ class TestReferenceRateTrackingIntegration:
     assert torque_log.highAngleUnwindBreakoutScale == 0.0
     assert torque_log.highAngleUnwindBreakoutCorrection == 0.0
     assert torque_log.highAngleUnwindPresentDemandRate == 0.0
+    assert not torque_log.highAngleUnwindFutureConfirmed
+    assert not torque_log.highAngleUnwindReleaseCommitted
+    assert torque_log.highAngleUnwindReleaseCandidateTime == 0.0
+    assert not torque_log.highAngleUnwindBreakoutEarned
+    assert not torque_log.highAngleUnwindBreakoutCompleted
+    assert not torque_log.highAngleUnwindNeutralDelivered
+    assert torque_log.highAngleUnwindFutureWaitAge == 0.0
 
     car_state.steeringPressed = True
     _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.02, False, 0.2)
