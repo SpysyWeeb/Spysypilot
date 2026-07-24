@@ -88,7 +88,10 @@ lateral-acceleration space:
 - a residual direct-P schedule retains high-speed position authority while
   moving more low-speed work into the rate loop;
 - applied torque is treated as actuator state and only opposes torque that is
-  still driving a wheel already outrunning the planned path.
+  still driving a wheel already outrunning the planned path;
+- after the future horizon confirms a new maneuver for 200 ms, a crown-aware
+  handoff cap progressively removes only controller command that still points
+  into the old episode beyond the reachable target.
 
 The future trajectory rate is used directly instead of differentiating every
 20 Hz model replan. A low-frequency innovation path retains genuine changes in
@@ -104,13 +107,16 @@ P smoothly.
 Episode handoff requires the selected geometric target and a later horizon
 sample to agree on the new direction for a sustained interval. This prevents a
 single near-center sample, road crown, or friction sign flip from being mistaken
-for a new turn. Driver steering immediately resets the unwind state.
+for a new turn. Once that commitment is confirmed, the old-direction cap ramps
+in over 150 ms and can only subtract stale command; command already braking or
+steering into the new maneuver is left unchanged. Driver steering immediately
+resets the unwind state.
 
 ### 4. Hyundai EPS damping and panda safety
 
 The branch points `opendbc_repo` to
 [SpysyWeeb/opendbc BLaT](https://github.com/SpysyWeeb/opendbc/tree/BLaT), pinned
-at `830d9aa4` for this implementation. That branch owns:
+at `8876af47` for this implementation. That branch owns:
 
 - the matching Hyundai command and panda safety limits;
 - low-speed EPS-motion-gated torque damping;
@@ -123,6 +129,14 @@ breakaway floor can limit how much damping subtracts, but can never hold the
 command above the torque controller's current demand. A turn-in guard disables
 damping whenever the wheel is meaningfully behind a same-direction path that
 has not begun to unwind.
+
+The turn-in guard also observes loaded stalls without weakening the torque that
+is trying to break the rack free. If at least 150 ms of stationary, aligned EPS
+behavior ends in a directionally consistent release above 30 degrees/second, a
+bounded 300 ms breakaway-relief window becomes eligible. It uses the existing
+speed fade and adaptive floor, never adds authority, and immediately resets for
+driver input, sign disagreement, inactive control, or speeds at and above
+15 mph.
 
 Both the openpilot command layer and panda safety layer must agree on steering
 limits. Changing only one side either has no effect or causes panda to reject
@@ -163,29 +177,29 @@ Current diagnostic versions:
 | layer | version | examples |
 |---|---:|---|
 | future reference planner | 5 | base/output curvature, preview timing, reachable/geometric/episode torque, unwind confidence |
-| torque controller | 14 | delayed curvature, trajectory/measured rate, cascade terms, P scale, unwind ownership and delivery |
-| Hyundai EPS damping | 2 | pre-damping torque, requested/applied damping, gate state, signed wheel rate, breakaway floor |
+| torque controller | 15 | delayed curvature, trajectory/measured rate, cascade terms, unwind ownership, committed-handoff cap |
+| Hyundai EPS damping | 3 | requested/applied damping, gate state, signed wheel rate, breakaway stall and relief state |
 
 The universal driving-event logger remains separate infrastructure. BLaT
 supplies the behavior and diagnostics that it observes.
 
 ## Validation
 
-Focused tests were rerun against the BLaT implementation baseline
-`e1a010eee` and opendbc pin `830d9aa4`:
+Focused tests were rerun against the committed-handoff and EPS-breakaway
+implementation with opendbc pin `8876af47`:
 
 | suite | result |
 |---|---:|
-| delayed-feedback, reference-rate, actuator, and unwind controller tests | 49 passed |
+| delayed-feedback, reference-rate, actuator, unwind, and handoff controller tests | 55 passed |
 | future-reference planner tests | 34 passed |
-| Hyundai low-speed torque damping tests | 16 passed |
+| Hyundai low-speed torque damping and breakaway tests | 20 passed |
 | Hyundai panda safety tests | 342 passed, 55 skipped by suite configuration |
-| **total passing** | **441 passed** |
+| **total passing** | **451 passed** |
 
 The suites cover symmetry, bounds, speed schedules, invalid-model fallback,
 torque reachability, crown-neutral transitions, episode handoff, driver
-override, under-tracked turn-in protection, command/safety rate limits, and
-diagnostic schema exposure.
+override, under-tracked turn-in protection, post-stall relief, stale-direction
+handoff limiting, command/safety rate limits, and diagnostic schema exposure.
 
 Automated tests are not a substitute for route analysis and field testing of
 steering feel.
