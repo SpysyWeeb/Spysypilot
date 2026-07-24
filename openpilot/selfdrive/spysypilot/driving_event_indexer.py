@@ -18,6 +18,7 @@ EVENT_ROOT = Path("/data/community/driving_events")
 MANIFEST_NAME = "manifest.jsonl"
 ROTATED_MANIFEST_NAME = "manifest.jsonl.1"
 STATE_NAME = "processed_segments.json"
+REVIEWS_NAME = "reviews.jsonl"
 MANIFEST_MAX_BYTES = 2 * 1024 * 1024
 PRESERVE_ATTR_NAME = "user.preserve"
 PRESERVE_ATTR_VALUE = b"1"
@@ -30,6 +31,7 @@ class ScannedSegment:
   route: str
   segment: int
   start_mono_time: int | None
+  route_start_mono_time: int | None
   events: list[tuple[int, Any]]
   acknowledgments: dict[str, tuple[int, Any]]
 
@@ -70,6 +72,15 @@ def _enum_name(value: Any) -> str:
   return str(value)
 
 
+def _driver_confound_reasons(mask: int) -> list[str]:
+  reasons = []
+  if mask & 1:
+    reasons.append("driverTorque")
+  if mask & 2:
+    reasons.append("steeringPressed")
+  return reasons
+
+
 def _payload(event: Any) -> dict[str, Any]:
   which = event.payload.which()
   if which == "lateral":
@@ -93,6 +104,30 @@ def _payload(event: Any) -> dict[str, Any]:
       "unwind_same_episode": bool(value.unwindSameEpisode),
       "applied_target_gap": round(float(value.appliedTargetGap), 4),
       "p_term": round(float(value.pTerm), 4),
+      "driver_torque": round(float(value.driverTorque), 4),
+      "steering_pressed": bool(value.steeringPressed),
+      "steering_torque_eps": round(float(value.steeringTorqueEps), 4),
+      "damping_applied": round(float(value.dampingApplied), 4),
+      "damping_state": str(value.dampingState),
+      "trigger_driver_confounded": bool(value.triggerDriverConfounded),
+      "trigger_road_confounded": bool(value.triggerRoadConfounded),
+      "driver_confounded_fraction": round(float(value.driverConfoundedFraction), 4),
+      "max_abs_driver_torque": round(float(value.maxAbsDriverTorque), 4),
+      "steering_pressed_any": bool(value.steeringPressedAny),
+      "road_confounded_fraction": round(float(value.roadConfoundedFraction), 4),
+      "driver_confound_reason": int(value.driverConfoundReason),
+      "driver_confound_reasons": _driver_confound_reasons(int(value.driverConfoundReason)),
+      "evidence_start_mono_time": int(value.evidenceStartMonoTime),
+      "evidence_end_mono_time": int(value.evidenceEndMonoTime),
+      "stall_release_count": int(value.stallReleaseCount),
+      "release_offsets_s": [round(float(item), 4) for item in value.releaseOffsetsS],
+      "stall_durations_s": [round(float(item), 4) for item in value.stallDurationsS],
+      "release_peak_rates_deg": [round(float(item), 4) for item in value.releasePeakRatesDeg],
+      "stall_episode_phase": str(value.stallEpisodePhase),
+      "late_unwind_duration_s": round(float(value.lateUnwindDurationS), 4),
+      "previous_unwind_effective_phase": round(float(value.previousUnwindEffectivePhase), 4),
+      "previous_unwind_same_episode": bool(value.previousUnwindSameEpisode),
+      "tracking_inactive_time_s": round(float(value.trackingInactiveTimeS), 4),
     }
   if which == "leadLaunch":
     value = event.payload.leadLaunch
@@ -104,13 +139,32 @@ def _payload(event: Any) -> dict[str, Any]:
       "command_to_ego_s": round(float(value.commandToEgoS), 4),
       "radar_discontinuity": bool(value.radarDiscontinuity),
       "radar_confidence": round(float(value.radarConfidence), 4),
+      "attribution_detail": str(value.attributionDetail),
+      "onsets": [{
+        "kind": str(onset.kind),
+        "mono_time": int(onset.monoTime),
+        "d_rel": round(float(onset.dRel), 4),
+        "v_lead": round(float(onset.vLead), 4),
+        "v_ego": round(float(onset.vEgo), 4),
+        "a_ego": round(float(onset.aEgo), 4),
+        "output_accel": round(float(onset.outputAccel), 4),
+        "brake_pressed": bool(onset.brakePressed),
+        "brake_hold_active": bool(onset.brakeHoldActive),
+      } for onset in value.onsets],
     }
   return {}
 
 
 def event_to_record(event: Any, acknowledgment: Any | None, route: str, segment: int,
-                    marker_mono_time: int, segment_start_mono_time: int) -> dict[str, Any]:
+                    marker_mono_time: int, segment_start_mono_time: int,
+                    route_start_mono_time: int, acknowledgment_mono_time: int | None = None) -> dict[str, Any]:
   occurred_mono_time = int(event.occurredMonoTime)
+  detected_mono_time = int(event.detectedMonoTime) or occurred_mono_time
+  if acknowledgment is not None and int(acknowledgment.segmentStartMonoTime):
+    segment_start_mono_time = int(acknowledgment.segmentStartMonoTime)
+  ack_mono_time = 0
+  if acknowledgment is not None:
+    ack_mono_time = int(acknowledgment.ackMonoTime) or int(acknowledgment_mono_time or 0)
   requested_before = max(0, int(event.requestedContextBefore))
   requested_after = max(0, int(event.requestedContextAfter))
   effective_before = min(requested_before, CONTEXT_BEFORE)
@@ -118,9 +172,11 @@ def event_to_record(event: Any, acknowledgment: Any | None, route: str, segment:
   ack = {
     "seen": acknowledgment is not None,
     "marker_written": bool(acknowledgment.markerWritten) if acknowledgment is not None else False,
+    "marker_accepted": bool(acknowledgment.markerAccepted or acknowledgment.markerWritten) if acknowledgment is not None else False,
     "current_segment_preserved": bool(acknowledgment.currentSegmentPreserved) if acknowledgment is not None else False,
     "following_segment_scheduled": bool(acknowledgment.followingSegmentScheduled) if acknowledgment is not None else False,
     "error": str(acknowledgment.error) if acknowledgment is not None else "",
+    "ack_mono_time": ack_mono_time,
   }
   return {
     "version": int(event.version),
@@ -129,8 +185,16 @@ def event_to_record(event: Any, acknowledgment: Any | None, route: str, segment:
     "route": route,
     "segment": segment,
     "occurred_mono_time": occurred_mono_time,
+    "detected_mono_time": detected_mono_time,
+    "episode_start_mono_time": int(event.episodeStartMonoTime) or occurred_mono_time,
+    "episode_key": str(event.episodeKey),
     "marker_mono_time": marker_mono_time,
     "segment_offset_s": round((occurred_mono_time - segment_start_mono_time) / 1e9, 6),
+    "route_offset_s": round((occurred_mono_time - route_start_mono_time) / 1e9, 6),
+    "marker_offset_s": round((marker_mono_time - segment_start_mono_time) / 1e9, 6),
+    "detector_to_marker_ms": round((marker_mono_time - detected_mono_time) / 1e6, 3),
+    "marker_to_ack_ms": round((ack_mono_time - marker_mono_time) / 1e6, 3) if ack_mono_time else None,
+    "verified_in_completed_rlog": True,
     "domain": _enum_name(event.domain),
     "source": _enum_name(event.source),
     "event_type": str(event.eventType),
@@ -146,10 +210,13 @@ def event_to_record(event: Any, acknowledgment: Any | None, route: str, segment:
     "git_branch": str(event.gitBranch),
     "requested_context": {"before": requested_before, "after": requested_after},
     "effective_context": {"before": effective_before, "after": effective_after},
+    "analysis_window": {
+      "before_s": round(float(event.analysisWindowBeforeS), 3),
+      "after_s": round(float(event.analysisWindowAfterS), 3),
+    },
     "payload_type": event.payload.which(),
     "payload": _payload(event),
     "logger_acknowledgment": ack,
-    "review": "unreviewed",
   }
 
 
@@ -163,13 +230,19 @@ def scan_segment(segment_path: Path, reader_factory: Callable[[str], Iterable[An
   raw_events: list[tuple[int, Any]] = []
   acknowledgments: dict[str, tuple[int, Any]] = {}
   segment_start_mono_time: int | None = None
+  route_start_mono_time: int | None = None
+  first_mono_time: int | None = None
   for msg in reader_factory(str(rlog)):
     try:
       log_mono_time = int(msg.logMonoTime)
-      if segment_start_mono_time is None:
-        segment_start_mono_time = log_mono_time
+      if first_mono_time is None:
+        first_mono_time = log_mono_time
       which = msg.which()
-      if which == "drivingEvent":
+      if which == "initData" and route_start_mono_time is None:
+        route_start_mono_time = log_mono_time
+      elif which == "sentinel" and str(msg.sentinel.type) in ("startOfRoute", "startOfSegment"):
+        segment_start_mono_time = log_mono_time
+      elif which == "drivingEvent":
         raw_events.append((log_mono_time, msg.drivingEvent))
       elif which == "drivingEventRecorded":
         event_id = str(msg.drivingEventRecorded.eventId)
@@ -180,7 +253,9 @@ def scan_segment(segment_path: Path, reader_factory: Callable[[str], Iterable[An
       cloudlog.exception(f"driving_event_indexer: malformed record in {rlog}")
       continue
 
-  return ScannedSegment(route, segment, segment_start_mono_time, raw_events, acknowledgments)
+  segment_start_mono_time = segment_start_mono_time or first_mono_time
+  route_start_mono_time = route_start_mono_time or first_mono_time
+  return ScannedSegment(route, segment, segment_start_mono_time, route_start_mono_time, raw_events, acknowledgments)
 
 
 def protect_context(log_root: Path, route: str, segment: int,
@@ -222,6 +297,14 @@ def atomic_write_json(path: Path, value) -> None:
     file.flush()
     os.fsync(file.fileno())
   os.replace(temporary, path)
+
+
+def ensure_reviews_file(event_root: Path) -> None:
+  fd = os.open(event_root / REVIEWS_NAME, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+  try:
+    os.fsync(fd)
+  finally:
+    os.close(fd)
 
 
 def load_event_ids(*manifest_paths: Path) -> set[str]:
@@ -334,6 +417,11 @@ def collect_records(log_root: Path, candidate_paths: list[Path],
         prior = acknowledgments.get(event_id)
         if prior is None or acknowledgment[0] >= prior[0]:
           acknowledgments[event_id] = acknowledgment
+    route_start_times = [
+      result.route_start_mono_time for result in scanned.values()
+      if result.route_start_mono_time is not None
+    ]
+    route_start_mono_time = min(route_start_times) if route_start_times else 0
 
     for candidate in route_candidates:
       if candidate in deferred or candidate in failed or candidate not in scanned:
@@ -358,11 +446,23 @@ def collect_records(log_root: Path, candidate_paths: list[Path],
             result.segment,
             marker_time,
             result.start_mono_time,
+            route_start_mono_time,
+            acknowledgment[0] if acknowledgment is not None else None,
           )
           context = record["effective_context"]
-          record["context_segments"] = protect_context(
+          context_segments = protect_context(
             log_root, result.route, result.segment, context["before"], context["after"],
           )
+          record["context_segments"] = context_segments
+          context_indices = {
+            parse_segment_name(name)[1]
+            for name in context_segments
+            if parse_segment_name(name) is not None
+          }
+          record["effective_context"] = {
+            "before": sum(index < result.segment for index in context_indices),
+            "after": sum(index > result.segment for index in context_indices),
+          }
           records.append(record)
       successfully_scanned.add(candidate.name)
 
@@ -385,6 +485,7 @@ def scan_once(log_root: Path, event_root: Path = EVENT_ROOT,
     reader_factory = _default_reader_factory()
 
   event_root.mkdir(parents=True, exist_ok=True)
+  ensure_reviews_file(event_root)
   manifest_path = event_root / MANIFEST_NAME
   rotated_path = event_root / ROTATED_MANIFEST_NAME
   state_path = event_root / STATE_NAME
@@ -413,6 +514,7 @@ def rebuild(log_root: Path, event_root: Path = EVENT_ROOT,
     reader_factory = _default_reader_factory()
 
   event_root.mkdir(parents=True, exist_ok=True)
+  ensure_reviews_file(event_root)
   manifest_path = event_root / MANIFEST_NAME
   rotated_path = event_root / ROTATED_MANIFEST_NAME
   state_path = event_root / STATE_NAME
