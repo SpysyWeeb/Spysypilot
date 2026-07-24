@@ -289,15 +289,22 @@ Replay on the locally available full rlogs currently gives:
   2349.14 seconds (segment 39 + 9.14 seconds, IMU +3.40 m/s³ and aEgo
   +0.95 m/s³, controller-attributed) and 2809.18 seconds (segment 46 +
   49.18 seconds, IMU +3.26 m/s³ and aEgo +0.75 m/s³, mixed attribution).
+  Driver review maps these to 09:34:26 and 09:42:06 respectively. The first
+  was genuinely rough but situationally justified by traffic; retaining it
+  as review evidence is acceptable rather than a false positive. The second
+  was a confirmed unnecessarily harsh landing from a slow creep with ample
+  stopping room. This labeled route therefore supports retaining the current
+  lower-confidence boundary: it captures both rough landings while seven
+  other eligible stops remain silent.
 
 The complete requested population cannot yet be claimed: route 3c near 1343
 seconds and route 38 near 972 seconds are no longer present on the device,
 local disk, or the route listing returned for this dongle, and the post-fix
-route-8d and route-92 stops do not carry human good/bad labels. The thresholds
-therefore remain provisional pending those archived route identifiers and
-manual review of the borderline route-8d event and the two route-92 warnings.
-Field validation is also still required before the detector can be considered
-complete.
+route-8d stops do not carry human good/bad labels. The thresholds therefore
+remain provisional pending those archived route identifiers and manual review
+of the borderline route-8d event. Route 92 now supplies positive field labels,
+but broader field validation is still required before the detector can be
+considered complete.
 
 ## Data model and compatibility
 
