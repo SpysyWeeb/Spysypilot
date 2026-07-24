@@ -2465,6 +2465,66 @@ struct DebugAlert {
 }
 
 struct UserBookmark @0xfe346a9de48d9b50 {
+  source @0 :Source;
+  eventType @1 :Text;
+  alertText1 @2 :Text;
+  alertText2 @3 :Text;
+  severity @4 :UInt8;
+  confidence @5 :Float32;
+  leadToEgoS @6 :Float32;
+  commandToEgoS @7 :Float32;
+  planToLeadS @8 :Float32;
+  commandToLeadS @9 :Float32;
+  forecastToLeadS @10 :Float32;
+
+  enum Source {
+    generic @0;
+    manual @1;
+    automatic @2;
+  }
+}
+
+struct LateralEvent @0xd4281d502164abd1 {
+  version @0 :UInt16;
+  type @1 :Type;
+  source @2 :Source;
+  severity @3 :Severity;
+  confidence @4 :Float32;
+  controllerVersion @5 :Int32;
+  referenceVersion @6 :Int32;
+  vEgo @7 :Float32;
+  steeringAngleDeg @8 :Float32;
+  steeringRateDeg @9 :Float32;
+  desiredLateralAccel @10 :Float32;
+  actualLateralAccel @11 :Float32;
+  requestTorque @12 :Float32;
+  appliedTorque @13 :Float32;
+  referenceTargetTorque @14 :Float32;
+  referenceUnwindScale @15 :Float32;
+  appliedTargetGap @16 :Float32;
+  roadConfounded @17 :Bool;
+  driverConfounded @18 :Bool;
+  reason @19 :Text;
+
+  enum Type {
+    manual @0;
+    stallRelease @1;
+    lateUnwind @2;
+    handoffMismatch @3;
+    centerOvershoot @4;
+    torqueAuthority @5;
+  }
+
+  enum Source {
+    automatic @0;
+    user @1;
+  }
+
+  enum Severity {
+    info @0;
+    warning @1;
+    critical @2;
+  }
 }
 
 # Universal, rlog-authoritative driving event envelope. UserBookmark and
@@ -2749,6 +2809,7 @@ struct Event {
     audioFeedback @149 :AudioFeedback;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
+    lateralEvent @152 :LateralEvent;
     drivingEvent @153 :DrivingEvent;
     drivingEventRecorded @154 :DrivingEventRecorded;
 
