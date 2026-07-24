@@ -1,3 +1,20 @@
+# Model Curve Speed Limit — In Progress
+
+Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot).
+
+Status: **in progress pending field testing**. This feature must not be marked
+complete until the owner has tested it on-device.
+
+This branch adds a small model-path curve speed limiter to stock openpilot
+longitudinal planning. It spatially and temporally filters isolated curvature
+prediction spikes, maps the remaining predicted curvature to owner-calibrated
+maximum speeds, and caps cruise so the existing longitudinal controller can
+accelerate up to—but not through—the selected curve speed. See
+[`docs/ModelCurveSpeedLimit.md`](docs/ModelCurveSpeedLimit.md) for the design
+and calibration data.
+
+---
+
 <div align="center" style="text-align: center;">
 
 <h1>openpilot</h1>
