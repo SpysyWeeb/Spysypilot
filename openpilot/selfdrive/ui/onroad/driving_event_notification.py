@@ -5,7 +5,7 @@ from typing import Any
 
 import pyray as rl
 
-from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.cereal import messaging
 from openpilot.system.ui.lib.application import FontWeight, gui_app
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 
@@ -17,6 +17,7 @@ STALE_SECONDS = 30.0
 @dataclass
 class EventNotice:
   group_id: str
+  event_id: str
   text: str
   failed: bool
   received_at: float
@@ -43,10 +44,12 @@ class EventNotificationQueue:
   def push(self, recorded: Any, now: float) -> None:
     text, failed = notification_text(recorded)
     group_id = str(recorded.groupId) or str(recorded.eventId)
-    notice = EventNotice(group_id, text, failed, now)
+    event_id = str(recorded.eventId)
+    notice = EventNotice(group_id, event_id, text, failed, now)
 
     if self.active is not None and self.active.group_id == group_id:
-      if failed or self.active.text == "Event Logged":
+      if event_id == self.active.event_id or failed or self.active.text == "Event Logged":
+        self.active.event_id = event_id
         self.active.text = text
         self.active.failed = failed
       self.visible_until = max(self.visible_until, now + DISPLAY_SECONDS)
@@ -54,17 +57,18 @@ class EventNotificationQueue:
 
     for queued in self.pending:
       if queued.group_id == group_id:
-        if failed or queued.text == "Event Logged":
+        if event_id == queued.event_id or failed or queued.text == "Event Logged":
+          queued.event_id = event_id
           queued.text = text
           queued.failed = failed
         return
     self.pending.append(notice)
 
-  def current(self, critical_alert: bool, now: float) -> EventNotice | None:
+  def current(self, safety_alert_visible: bool, now: float) -> EventNotice | None:
     while self.pending and now - self.pending[0].received_at > STALE_SECONDS:
       self.pending.popleft()
 
-    if critical_alert:
+    if safety_alert_visible:
       if self.active is not None:
         self.pending.appendleft(self.active)
         self.active = None
@@ -81,18 +85,16 @@ class EventNotificationQueue:
 class DrivingEventNotification:
   def __init__(self):
     self._font = gui_app.font(FontWeight.SEMI_BOLD)
-    self._last_recv_frame = -1
+    self._sock = messaging.sub_sock("drivingEventRecorded", conflate=False)
     self.queue = EventNotificationQueue()
 
-  def render(self, rect: rl.Rectangle, critical_alert: bool = False) -> None:
+  def render(self, rect: rl.Rectangle, safety_alert_visible: bool = False) -> None:
     now = time.monotonic()
-    recv_frame = ui_state.sm.recv_frame["drivingEventRecorded"]
-    if recv_frame > self._last_recv_frame:
-      self._last_recv_frame = recv_frame
-      if ui_state.sm.updated["drivingEventRecorded"] and ui_state.sm.valid["drivingEventRecorded"]:
-        self.queue.push(ui_state.sm["drivingEventRecorded"], now)
+    for msg in messaging.drain_sock(self._sock):
+      if msg.valid and msg.which() == "drivingEventRecorded":
+        self.queue.push(msg.drivingEventRecorded, now)
 
-    notice = self.queue.current(critical_alert, now)
+    notice = self.queue.current(safety_alert_visible, now)
     if notice is None:
       return
 
