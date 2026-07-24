@@ -242,9 +242,146 @@ def test_rolling_lead_payload_serializes_commit_and_response_evidence():
   assert record["payload"]["onsets"][0]["kind"] == "leadCommit"
 
 
-def test_old_lateral_payload_defaults_remain_indexable_and_v4_release_is_structured():
+def test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence():
   occurred = 100_000_000_000
-  for detector_version in (2, 3):
+  msg = messaging.new_message("drivingEvent", valid=True)
+  event = msg.drivingEvent
+  event.version = 2
+  event.eventId = "v5-evidence"
+  event.groupId = "group"
+  event.occurredMonoTime = occurred
+  event.detectedMonoTime = occurred + 1_000_000_000
+  event.episodeStartMonoTime = occurred - 2_000_000_000
+  event.domain = "lateral"
+  event.source = "automatic"
+  event.eventType = "lat.unwindProgressDeficit"
+  event.detector = "blatLateralEventDetector"
+  event.detectorVersion = 5
+  event.severity = "warning"
+  event.confidence = 0.9
+  event.attribution = "controller"
+  event.analysisWindowBeforeS = 6.0
+  event.analysisWindowAfterS = 4.0
+  payload = event.payload.init("lateral")
+  payload.unwindEpisodeStartMonoTime = occurred - 2_000_000_000
+  payload.unwindDeficitStartMonoTime = occurred
+  payload.unwindDeficitDurationS = 1.25
+  payload.initialSteeringAngleDeg = 42.0
+  payload.peakSteeringAngleDeg = 45.0
+  payload.triggerSteeringAngleDeg = 31.0
+  payload.expectedUnwindDirection = "towardCenter"
+  payload.expectedAngleProgressDeg = 18.0
+  payload.actualAngleProgressDeg = 4.5
+  payload.unwindProgressRatio = 0.25
+  payload.referenceRateAtTrigger = -0.8
+  payload.measurementRateAtTrigger = -0.1
+  payload.peakReferenceMeasurementRateGap = 0.92
+  payload.requestedTorqueNeutralCrossMonoTime = occurred + 100_000_000
+  payload.requestedTorqueNeutralCrossPresent = True
+  payload.appliedTorqueNeutralCrossMonoTime = occurred + 300_000_000
+  payload.appliedTorqueNeutralCrossPresent = True
+  payload.unwindCommandDelayS = 0.2
+  payload.driverAssistedUnwind = True
+  payload.driverAssistMonoTime = occurred + 500_000_000
+  payload.driverAssistAngleDeg = 28.0
+  payload.driverAssistWheelRateDeg = -22.0
+  payload.driverAssistTorque = -85.0
+  payload.wheelRateIncreaseAfterAssistDegS = 35.0
+  payload.movementStartMonoTime = occurred - 1_000_000_000
+  payload.dwellStartMonoTime = occurred - 400_000_000
+  payload.releaseMonoTime = occurred + 200_000_000
+  payload.dwellDurationS = 0.6
+  payload.dwellSteeringAngleDeg = 12.0
+  payload.preDwellPeakRateDegS = 75.0
+  payload.minimumDwellRateDegS = 2.0
+  payload.releasePeakRateDegS = 68.0
+  payload.rateReductionRatio = 0.0267
+  payload.restartClassification = "oppositeDirection"
+  payload.requestTorqueDuringDwell = -0.4
+  payload.appliedTorqueDuringDwell = -0.3
+  payload.referenceTargetDuringDwell = -0.2
+  payload.trackingActiveDuringDwell = True
+  payload.measurementRate = -0.22
+  payload.driverInvolvedBeforeDwell = False
+  payload.driverInvolvedDuringDwell = True
+  payload.driverInvolvedAfterDwell = False
+  payload.turnStopActualDampingAmount = 0.029
+  payload.turnStopActualDampingState = "damping"
+  payload.turnStopTurnInBlocked = False
+  payload.turnStopBreakawayLatch = 0.89
+  payload.turnStopSustainFloorContribution = 0.80
+  payload.turnStopDampingVersion = 2
+  payload.turnStopDampingValid = True
+  payload.unwindRequestedTorqueAtTrigger = -0.55
+  payload.unwindAppliedTorqueAtTrigger = -0.42
+  payload.unwindReferenceTargetTorqueAtTrigger = -0.12
+  payload.unwindAppliedTargetGapAtTrigger = 0.30
+  payload.unwindPeakAppliedTargetGap = 0.35
+
+  record = event_to_record(
+    msg.as_reader().drivingEvent, None, "route", 1, event.detectedMonoTime,
+    60_000_000_000, 40_000_000_000,
+  )
+  serialized = record["payload"]
+  assert serialized["unwind_episode_start_mono_time"] == occurred - 2_000_000_000
+  assert serialized["unwind_deficit_start_mono_time"] == occurred
+  assert serialized["unwind_deficit_duration_s"] == 1.25
+  assert serialized["initial_steering_angle_deg"] == 42.0
+  assert serialized["peak_steering_angle_deg"] == 45.0
+  assert serialized["trigger_steering_angle_deg"] == 31.0
+  assert serialized["expected_unwind_direction"] == "towardCenter"
+  assert serialized["expected_angle_progress_deg"] == 18.0
+  assert serialized["actual_angle_progress_deg"] == 4.5
+  assert serialized["unwind_progress_ratio"] == 0.25
+  assert serialized["reference_rate_at_trigger"] == -0.8
+  assert serialized["measurement_rate_at_trigger"] == -0.1
+  assert serialized["peak_reference_measurement_rate_gap"] == 0.92
+  assert serialized["requested_torque_neutral_cross_mono_time"] == occurred + 100_000_000
+  assert serialized["requested_torque_neutral_cross_present"]
+  assert serialized["applied_torque_neutral_cross_mono_time"] == occurred + 300_000_000
+  assert serialized["applied_torque_neutral_cross_present"]
+  assert serialized["unwind_command_delay_s"] == 0.2
+  assert serialized["driver_assisted_unwind"]
+  assert serialized["driver_assist_mono_time"] == occurred + 500_000_000
+  assert serialized["driver_assist_angle_deg"] == 28.0
+  assert serialized["driver_assist_wheel_rate_deg"] == -22.0
+  assert serialized["driver_assist_torque"] == -85.0
+  assert serialized["wheel_rate_increase_after_assist_deg_s"] == 35.0
+  assert serialized["movement_start_mono_time"] == occurred - 1_000_000_000
+  assert serialized["dwell_start_mono_time"] == occurred - 400_000_000
+  assert serialized["release_mono_time"] == occurred + 200_000_000
+  assert serialized["dwell_duration_s"] == 0.6
+  assert serialized["dwell_steering_angle_deg"] == 12.0
+  assert serialized["pre_dwell_peak_rate_deg_s"] == 75.0
+  assert serialized["minimum_dwell_rate_deg_s"] == 2.0
+  assert serialized["release_peak_rate_deg_s"] == 68.0
+  assert serialized["rate_reduction_ratio"] == 0.0267
+  assert serialized["restart_classification"] == "oppositeDirection"
+  assert serialized["request_torque_during_dwell"] == -0.4
+  assert serialized["applied_torque_during_dwell"] == -0.3
+  assert serialized["reference_target_during_dwell"] == -0.2
+  assert serialized["tracking_active_during_dwell"]
+  assert serialized["measurement_rate"] == -0.22
+  assert not serialized["driver_involved_before_dwell"]
+  assert serialized["driver_involved_during_dwell"]
+  assert not serialized["driver_involved_after_dwell"]
+  assert serialized["turn_stop_actual_damping_amount"] == 0.029
+  assert serialized["turn_stop_actual_damping_state"] == "damping"
+  assert not serialized["turn_stop_turn_in_blocked"]
+  assert serialized["turn_stop_breakaway_latch"] == 0.89
+  assert serialized["turn_stop_sustain_floor_contribution"] == 0.8
+  assert serialized["turn_stop_damping_version"] == 2
+  assert serialized["turn_stop_damping_valid"]
+  assert serialized["unwind_requested_torque_at_trigger"] == -0.55
+  assert serialized["unwind_applied_torque_at_trigger"] == -0.42
+  assert serialized["unwind_reference_target_torque_at_trigger"] == -0.12
+  assert serialized["unwind_applied_target_gap_at_trigger"] == 0.3
+  assert serialized["unwind_peak_applied_target_gap"] == 0.35
+
+
+def test_old_lateral_payload_defaults_remain_indexable_and_v5_release_is_structured():
+  occurred = 100_000_000_000
+  for detector_version in (2, 3, 4):
     old_msg = messaging.new_message("drivingEvent", valid=True)
     old = old_msg.drivingEvent
     old.version = 2
@@ -272,12 +409,20 @@ def test_old_lateral_payload_defaults_remain_indexable_and_v4_release_is_structu
     assert old_record["payload"]["damping_applied"] == (-0.72 if detector_version >= 3 else 0.0)
     assert old_record["payload"]["driver_interaction"] == "none"
     assert old_record["payload"]["requested_torque_at_crossing"] == 0.0
+    assert old_record["payload"]["unwind_episode_start_mono_time"] == 0
+    assert not old_record["payload"]["requested_torque_neutral_cross_present"]
+    assert old_record["payload"]["restart_classification"] == ""
+    assert not old_record["payload"]["tracking_active_during_dwell"]
+    assert old_record["payload"]["measurement_rate"] == 0.0
+    assert not old_record["payload"]["driver_involved_during_dwell"]
+    assert not old_record["payload"]["turn_stop_damping_valid"]
+    assert old_record["payload"]["unwind_requested_torque_at_trigger"] == 0.0
     assert old_record["payload"]["stall_releases"] == []
 
   new_msg = messaging.new_message("drivingEvent", valid=True)
   new = new_msg.drivingEvent
   new.version = 2
-  new.eventId = "v4"
+  new.eventId = "v5"
   new.groupId = "group"
   new.occurredMonoTime = occurred
   new.detectedMonoTime = occurred + 250_000_000
@@ -285,7 +430,7 @@ def test_old_lateral_payload_defaults_remain_indexable_and_v4_release_is_structu
   new.source = "automatic"
   new.eventType = "lat.stallRelease"
   new.detector = "blatLateralEventDetector"
-  new.detectorVersion = 4
+  new.detectorVersion = 5
   new.severity = "warning"
   new.confidence = 0.85
   new.attribution = "controller"

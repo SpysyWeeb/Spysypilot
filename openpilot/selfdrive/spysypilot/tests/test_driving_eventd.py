@@ -19,6 +19,7 @@ from openpilot.selfdrive.spysypilot.driving_eventd import (
   stop_jolt_candidate,
 )
 from openpilot.selfdrive.spysypilot.lat_event_detector import (
+  DETECTOR_VERSION as LAT_DETECTOR_VERSION,
   LateralDetection,
   LateralEvidence,
   LateralSample,
@@ -416,6 +417,42 @@ def test_lateral_candidate_uses_physical_crossing_and_later_confirmation_times()
   assert candidate.event_type == "lat.committedHandoffHarshness"
 
 
+@pytest.mark.parametrize(
+  ("internal_name", "public_name"),
+  [
+    ("unwind_progress_deficit", "lat.unwindProgressDeficit"),
+    ("turn_stop_turn", "lat.turnStopTurn"),
+  ],
+)
+def test_lateral_v5_names_times_windows_and_missing_optional_evidence_are_safe(internal_name, public_name):
+  evidence = LateralEvidence(
+    1.0, 3.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:v5", 6.0, 4.0,
+  )
+  detection = LateralDetection(
+    internal_name, "warning", 0.9, "v5 evidence",
+    evidence, occurred_mono_time=1.25, detected_mono_time=2.50,
+  )
+  candidate = lateral_candidate(LateralSample(2.5), detection)
+  msg = build_message(AcceptedEvent("v5", "group", candidate)).as_reader().drivingEvent
+
+  assert LAT_DETECTOR_VERSION == 5
+  assert candidate.event_type == public_name
+  assert msg.eventType == public_name
+  assert msg.detectorVersion == 5
+  assert msg.occurredMonoTime == 1_250_000_000
+  assert msg.detectedMonoTime == 2_500_000_000
+  assert msg.analysisWindowBeforeS == 6.0
+  assert msg.analysisWindowAfterS == 4.0
+  assert not msg.payload.lateral.requestedTorqueNeutralCrossPresent
+  assert msg.payload.lateral.requestedTorqueNeutralCrossMonoTime == 0
+  assert not msg.payload.lateral.appliedTorqueNeutralCrossPresent
+  assert msg.payload.lateral.appliedTorqueNeutralCrossMonoTime == 0
+  assert not msg.payload.lateral.turnStopDampingValid
+  assert msg.payload.lateral.turnStopActualDampingState == "unavailable"
+  assert msg.payload.lateral.unwindRequestedTorqueAtTrigger == 0.0
+  assert not msg.payload.lateral.driverInvolvedDuringDwell
+
+
 def test_live_pose_sampler_uses_its_own_timestamp_and_updates_bump_once():
   class CountingBumpClassifier:
     def __init__(self):
@@ -504,6 +541,7 @@ def test_lateral_sampler_uses_actual_caroutput_damping_not_torque_d_term():
   torque_state = SimpleNamespace(
     active=True, desiredLateralAccel=0.2, actualLateralAccel=0.1, p=0.3, d=-0.72,
     version=4, referenceVersion=4, referenceRate=0.5, referenceReachableTargetTorque=0.1,
+    trackingMeasurementRate=-0.22,
     referenceUnwindScale=0.5, referenceSustainedUnwindScale=0.6, unwindEffectivePhase=0.7,
     unwindPhaseOverspeed=0.8, unwindSameEpisode=True,
   )
@@ -550,6 +588,7 @@ def test_lateral_sampler_uses_actual_caroutput_damping_not_torque_d_term():
   assert sample.sustain_floor_contribution == pytest.approx(0.805)
   assert sample.damping_version == 2
   assert sample.vertical_accel_deviation == pytest.approx(2.1)
+  assert sample.measurement_rate == pytest.approx(-0.22)
   sm.valid["carOutput"] = False
   invalid = lateral_sample(sm, SteeringRateFilter(), False)
   assert invalid.actual_damping_amount is None
