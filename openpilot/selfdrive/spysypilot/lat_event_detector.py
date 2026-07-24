@@ -8,7 +8,9 @@ from collections import deque
 from dataclasses import dataclass
 
 
-DETECTOR_VERSION = 1
+# Version 2 intentionally uses per-event-type cooldowns. This retains a distinct
+# failure in the same physical episode instead of letting one lateral type hide it.
+DETECTOR_VERSION = 2
 EVENT_COOLDOWN = 8.0
 
 

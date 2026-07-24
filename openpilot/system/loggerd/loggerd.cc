@@ -18,6 +18,21 @@
 
 ExitHandler do_exit;
 
+struct RecordedDrivingEvent {
+  std::string event_id;
+  std::string group_id;
+  cereal::DrivingEvent::Domain domain;
+  cereal::DrivingEvent::Source source;
+  std::string event_type;
+  uint64_t occurred_mono_time;
+  std::string route;
+  int segment;
+  bool marker_written;
+  bool current_segment_preserved;
+  bool following_segment_scheduled;
+  std::string error;
+};
+
 struct LoggerdState {
   LoggerState logger;
   std::atomic<double> last_camera_seen_tms{0.0};
@@ -29,10 +44,32 @@ struct LoggerdState {
   double last_preserve_retry_tms = 0.;
   std::deque<std::string> preserve_retry_queue;
   std::unordered_set<std::string> preserve_retry_paths;
+  std::unordered_map<std::string, std::unordered_set<std::string>> preserve_retry_event_ids;
+  std::unordered_map<std::string, RecordedDrivingEvent> recorded_events;
+  std::deque<std::string> recorded_event_order;
+  PubMaster *event_pm = nullptr;
 };
 
 constexpr size_t MAX_PRESERVE_RETRIES = 32;
 constexpr double PRESERVE_RETRY_INTERVAL_MS = 1000.;
+
+void publish_driving_event_recorded(PubMaster *pm, const RecordedDrivingEvent &recorded) {
+  MessageBuilder msg;
+  auto ack = msg.initEvent().initDrivingEventRecorded();
+  ack.setEventId(recorded.event_id);
+  ack.setGroupId(recorded.group_id);
+  ack.setDomain(recorded.domain);
+  ack.setSource(recorded.source);
+  ack.setEventType(recorded.event_type);
+  ack.setOccurredMonoTime(recorded.occurred_mono_time);
+  ack.setRoute(recorded.route);
+  ack.setSegment(recorded.segment);
+  ack.setMarkerWritten(recorded.marker_written);
+  ack.setCurrentSegmentPreserved(recorded.current_segment_preserved);
+  ack.setFollowingSegmentScheduled(recorded.following_segment_scheduled);
+  ack.setError(recorded.error);
+  pm->send("drivingEventRecorded", msg);
+}
 
 bool preserve_path(const std::string &path, std::string *error = nullptr) {
   static int forced_failures = []() {
@@ -60,10 +97,14 @@ bool preserve_path(const std::string &path, std::string *error = nullptr) {
   return true;
 }
 
-void enqueue_preserve_retry(LoggerdState *s, const std::string &path) {
+void enqueue_preserve_retry(LoggerdState *s, const std::string &path, const std::string &event_id = "") {
+  if (!event_id.empty()) {
+    s->preserve_retry_event_ids[path].insert(event_id);
+  }
   if (s->preserve_retry_paths.count(path)) return;
   if (s->preserve_retry_queue.size() >= MAX_PRESERVE_RETRIES) {
     LOGE("preserve retry queue full; dropping oldest path %s", s->preserve_retry_queue.front().c_str());
+    s->preserve_retry_event_ids.erase(s->preserve_retry_queue.front());
     s->preserve_retry_paths.erase(s->preserve_retry_queue.front());
     s->preserve_retry_queue.pop_front();
   }
@@ -71,13 +112,13 @@ void enqueue_preserve_retry(LoggerdState *s, const std::string &path) {
   s->preserve_retry_paths.insert(path);
 }
 
-bool preserve_current_segment(LoggerdState *s, std::string *error = nullptr) {
+bool preserve_current_segment(LoggerdState *s, std::string *error = nullptr, const std::string &event_id = "") {
   if (s->logger.segment() == s->last_preserved_segment) return true;
 
   const std::string path = s->logger.segmentPath();
   LOGW("preserving %s", path.c_str());
   if (!preserve_path(path, error)) {
-    enqueue_preserve_retry(s, path);
+    enqueue_preserve_retry(s, path, event_id);
     return false;
   }
 
@@ -100,6 +141,18 @@ void retry_failed_preservations(LoggerdState *s, bool force = false) {
       s->preserve_retry_paths.erase(path);
       if (path == s->logger.segmentPath()) {
         s->last_preserved_segment = s->logger.segment();
+      }
+      auto event_ids = s->preserve_retry_event_ids.find(path);
+      if (event_ids != s->preserve_retry_event_ids.end()) {
+        for (const std::string &event_id : event_ids->second) {
+          auto recorded = s->recorded_events.find(event_id);
+          if (recorded != s->recorded_events.end() && !recorded->second.current_segment_preserved) {
+            recorded->second.current_segment_preserved = true;
+            recorded->second.error.clear();
+            publish_driving_event_recorded(s->event_pm, recorded->second);
+          }
+        }
+        s->preserve_retry_event_ids.erase(event_ids);
       }
       LOGW("preserve retry succeeded for %s", path.c_str());
     } else {
@@ -299,48 +352,18 @@ void handle_preserve_segment(LoggerdState *s) {
 
 }
 
-struct RecordedDrivingEvent {
-  std::string event_id;
-  std::string group_id;
-  cereal::DrivingEvent::Domain domain;
-  cereal::DrivingEvent::Source source;
-  std::string event_type;
-  uint64_t occurred_mono_time;
-  std::string route;
-  int segment;
-  bool marker_written;
-  bool current_segment_preserved;
-  bool following_segment_scheduled;
-  std::string error;
-};
-
-void publish_driving_event_recorded(PubMaster *pm, const RecordedDrivingEvent &recorded) {
-  MessageBuilder msg;
-  auto ack = msg.initEvent().initDrivingEventRecorded();
-  ack.setEventId(recorded.event_id);
-  ack.setGroupId(recorded.group_id);
-  ack.setDomain(recorded.domain);
-  ack.setSource(recorded.source);
-  ack.setEventType(recorded.event_type);
-  ack.setOccurredMonoTime(recorded.occurred_mono_time);
-  ack.setRoute(recorded.route);
-  ack.setSegment(recorded.segment);
-  ack.setMarkerWritten(recorded.marker_written);
-  ack.setCurrentSegmentPreserved(recorded.current_segment_preserved);
-  ack.setFollowingSegmentScheduled(recorded.following_segment_scheduled);
-  ack.setError(recorded.error);
-  pm->send("drivingEventRecorded", msg);
-}
-
-void remember_recorded_event(std::unordered_map<std::string, RecordedDrivingEvent> *events,
-                             std::deque<std::string> *order, RecordedDrivingEvent record) {
+void remember_recorded_event(LoggerdState *s, RecordedDrivingEvent record) {
   constexpr size_t MAX_RECORDED_EVENT_IDS = 256;
-  if (events->size() >= MAX_RECORDED_EVENT_IDS) {
-    events->erase(order->front());
-    order->pop_front();
+  if (s->recorded_events.size() >= MAX_RECORDED_EVENT_IDS) {
+    const std::string evicted_id = s->recorded_event_order.front();
+    s->recorded_events.erase(evicted_id);
+    s->recorded_event_order.pop_front();
+    for (auto &[path, event_ids] : s->preserve_retry_event_ids) {
+      event_ids.erase(evicted_id);
+    }
   }
-  order->push_back(record.event_id);
-  events->emplace(record.event_id, std::move(record));
+  s->recorded_event_order.push_back(record.event_id);
+  s->recorded_events.emplace(record.event_id, std::move(record));
 }
 
 void loggerd_thread() {
@@ -380,14 +403,13 @@ void loggerd_thread() {
   }
 
   LoggerdState s;
+  s.event_pm = &pm;
   // init logger
   logger_rotate(&s);
   Params().put("CurrentRoute", s.logger.routeName());
 
   std::map<std::string, EncoderInfo> encoder_infos_dict;
   std::vector<RemoteEncoder*> encoders_with_audio;
-  std::unordered_map<std::string, RecordedDrivingEvent> recorded_events;
-  std::deque<std::string> recorded_event_order;
   for (const auto &cam : cameras_logged) {
     for (const auto &encoder_info : cam.encoder_infos) {
       encoder_infos_dict[encoder_info.publish_name] = encoder_info;
@@ -440,8 +462,8 @@ void loggerd_thread() {
           capnp::FlatArrayMessageReader cmsg(kj::ArrayPtr<capnp::word>((capnp::word *)msg->getData(), msg->getSize() / sizeof(capnp::word)));
           auto event = cmsg.getRoot<cereal::Event>().getDrivingEvent();
           const std::string event_id = event.getEventId().cStr();
-          auto duplicate = recorded_events.find(event_id);
-          if (!event_id.empty() && duplicate != recorded_events.end()) {
+          auto duplicate = s.recorded_events.find(event_id);
+          if (!event_id.empty() && duplicate != s.recorded_events.end()) {
             publish_driving_event_recorded(&pm, duplicate->second);
           } else {
             // This is acceptance by the active rlog writer, not an fsync claim.
@@ -449,7 +471,7 @@ void loggerd_thread() {
             bytes_count += msg->getSize();
 
             std::string preservation_error;
-            const bool current_preserved = preserve_current_segment(&s, &preservation_error);
+            const bool current_preserved = preserve_current_segment(&s, &preservation_error, event_id);
             s.preserve_next_segment = true;
 
             Params params;
@@ -472,7 +494,7 @@ void loggerd_thread() {
             };
             publish_driving_event_recorded(&pm, recorded);
             if (!event_id.empty()) {
-              remember_recorded_event(&recorded_events, &recorded_event_order, std::move(recorded));
+              remember_recorded_event(&s, std::move(recorded));
             }
           }
           delete msg;

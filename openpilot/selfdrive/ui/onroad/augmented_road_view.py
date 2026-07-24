@@ -85,8 +85,7 @@ class AugmentedRoadView(CameraView):
     self.model_renderer.render(self._content_rect)
     self._hud_renderer.render(self._content_rect)
     alert = self.alert_renderer.get_alert(ui_state.sm)
-    critical_alert = alert is not None and alert.status == log.SelfdriveState.AlertStatus.critical
-    self.driving_event_notification.render(self._content_rect, critical_alert)
+    self.driving_event_notification.render(self._content_rect, alert is not None)
     self.alert_renderer.render(self._content_rect)
     self.driver_state_renderer.render(self._content_rect)
 
