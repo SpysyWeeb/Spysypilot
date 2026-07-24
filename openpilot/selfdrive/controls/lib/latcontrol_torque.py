@@ -74,6 +74,7 @@ UNWIND_PHASE_RELEASE_TIME = 0.35  # seconds; smoothly restore direct P after del
 UNWIND_EPISODE_TORQUE_DEADBAND = 0.08  # normalized geometric torque beyond crown-neutral
 UNWIND_EPISODE_LATERAL_ACCEL_DEADBAND = 0.20  # m/s^2; excludes friction-sign flips around a nearly straight path
 UNWIND_EPISODE_OPPOSITE_TIME = 0.20  # seconds a horizon-confirmed new maneuver must persist before handoff
+HANDOFF_TORQUE_CAP_RAMP_TIME = 0.15  # seconds; CAN slew remains the final actuator-rate boundary
 DAMPING_TURN_IN_POSITION_ERROR_MIN = 0.08  # m/s^2 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_SCALE_MIN = 0.20
@@ -87,7 +88,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 14
+VERSION = 15
 
 
 def smoothstep(value: float) -> float:
@@ -219,6 +220,27 @@ def get_future_unwind_brake(
   return p_scale_factor, torque_blend, brake_activation, torque_neutral_time, projected_position_error
 
 
+def get_committed_handoff_torque_cap(
+  torque_command: float,
+  reference_target_torque: float,
+  neutral_torque: float,
+  old_turn_torque_sign: float,
+  committed: bool,
+  handoff_time: float,
+) -> tuple[float, float, float, float]:
+  """Progressively remove command beyond the reachable old-turn target after a confirmed handoff."""
+  if not committed or old_turn_torque_sign == 0.0:
+    return torque_command, 0.0, 0.0, 0.0
+
+  old_sign = math.copysign(1.0, old_turn_torque_sign)
+  old_direction_command = max((torque_command - neutral_torque) * old_sign, 0.0)
+  old_direction_limit = max((reference_target_torque - neutral_torque) * old_sign, 0.0)
+  cap_scale = smoothstep(handoff_time / HANDOFF_TORQUE_CAP_RAMP_TIME)
+  excess = max(old_direction_command - old_direction_limit, 0.0)
+  correction = -old_sign * excess * cap_scale
+  return torque_command + correction, correction, old_direction_limit, cap_scale
+
+
 class UnwindPhaseState(NamedTuple):
   phase: float
   turn_torque_sign: float
@@ -241,6 +263,7 @@ class UnwindPhaseTracker:
     self.same_episode = False
     self.opposite_time = 0.0
     self.episode_armed = True
+    self.handoff_time = 0.0
 
   def reset(self) -> None:
     self.phase = 0.0
@@ -250,6 +273,7 @@ class UnwindPhaseTracker:
     self.same_episode = False
     self.opposite_time = 0.0
     self.episode_armed = True
+    self.handoff_time = 0.0
 
   def update(
     self,
@@ -315,6 +339,10 @@ class UnwindPhaseTracker:
         # delivery or overspeed holds for the old turn while its phase fades.
         self.same_episode = False
         self.episode_armed = False
+    if not self.same_episode and self.opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME:
+      self.handoff_time += self.dt
+    else:
+      self.handoff_time = 0.0
 
     episode_geometry_scale = geometry_scale if self.same_episode and not opposite_maneuver else 0.0
     # Delivery is complete only when applied torque reaches the selected
@@ -341,6 +369,7 @@ class UnwindPhaseTracker:
       self.overspeed = 0.0
       self.same_episode = False
       self.opposite_time = 0.0
+      self.handoff_time = 0.0
     return self._state()
 
   def _state(self) -> UnwindPhaseState:
@@ -531,6 +560,13 @@ class LatControlTorque(LatControl):
     unwind_same_episode = phase_state.same_episode
     unwind_opposite_time = phase_state.opposite_time
     unwind_episode_armed = phase_state.episode_armed
+    handoff_time = self.unwind_phase_tracker.handoff_time
+    handoff_committed = (
+      self.reference_rate_tracking_enabled
+      and not unwind_same_episode
+      and unwind_opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME
+      and unwind_phase_direction != 0.0
+    )
     damping_turn_in_blocked = self.reference_rate_tracking_enabled and should_block_undertracked_turn_in_damping(
       delayed_desired_curvature,
       tracking_position_error,
@@ -564,6 +600,10 @@ class LatControlTorque(LatControl):
       cascade_rate_error = 0.0
       base_direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
       direct_p_scale = base_direct_p_scale
+      torque_command_before_handoff_cap = torque_command
+      handoff_torque_correction = 0.0
+      handoff_old_direction_limit = 0.0
+      handoff_torque_cap_scale = 0.0
     else:
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
@@ -609,6 +649,15 @@ class LatControlTorque(LatControl):
       if unwind_torque_blend > 0.0:
         unwind_torque_correction = unwind_torque_blend * (reference_target_torque - torque_command)
         torque_command += unwind_torque_correction
+      torque_command_before_handoff_cap = torque_command
+      torque_command, handoff_torque_correction, handoff_old_direction_limit, handoff_torque_cap_scale = get_committed_handoff_torque_cap(
+        torque_command,
+        reference_target_torque,
+        neutral_torque,
+        unwind_phase_direction,
+        handoff_committed and not CS.steeringPressed,
+        handoff_time,
+      )
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
@@ -668,6 +717,12 @@ class LatControlTorque(LatControl):
     pid_log.unwindSameEpisode = bool(unwind_same_episode)
     pid_log.unwindOppositeTime = float(unwind_opposite_time)
     pid_log.unwindEpisodeArmed = bool(unwind_episode_armed)
+    pid_log.handoffCommitted = bool(handoff_committed)
+    pid_log.handoffTime = float(handoff_time)
+    pid_log.torqueCommandBeforeHandoffCap = float(torque_command_before_handoff_cap)
+    pid_log.handoffOldDirectionLimit = float(handoff_old_direction_limit)
+    pid_log.handoffTorqueCapScale = float(handoff_torque_cap_scale)
+    pid_log.handoffTorqueCorrection = float(handoff_torque_correction)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log
