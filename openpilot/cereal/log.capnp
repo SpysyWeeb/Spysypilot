@@ -990,6 +990,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     highAngleUnwindBreakoutProgressEvaluated @110 :Bool;      # the fixed post-neutral progress window has been evaluated for this episode
     highAngleUnwindBreakoutTargetScale @111 :Float32;         # latched breakout target before bounded ramping
     highAngleUnwindNeutralDelivered @112 :Bool;                # applied old-turn torque completed crown-neutral confirmation
+    highAngleUnwindFutureWaitAge @113 :Float32;                 # age of remembered precommit intent since the last fully confirmed future evidence
    }
 
   struct LateralAngleState {

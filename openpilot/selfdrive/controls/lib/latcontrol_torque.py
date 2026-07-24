@@ -349,6 +349,7 @@ class HighAngleUnwindExitState:
     self.present_demand_history: deque[float] = deque(maxlen=max(1, int(round(HIGH_ANGLE_UNWIND_PRESENT_PEAK_TIME / dt))))
     self.confirmed_time = 0.0
     self.future_confirmed = False
+    self.future_wait_age = 0.0
     self.confirmed_target_scale = 0.0
     self.release_candidate_time = 0.0
     self.release_committed = False
@@ -388,6 +389,7 @@ class HighAngleUnwindExitState:
     self.present_demand_history.clear()
     self.confirmed_time = 0.0
     self.future_confirmed = False
+    self.future_wait_age = 0.0
     self.confirmed_target_scale = 0.0
     self.release_candidate_time = 0.0
     self.release_committed = False
@@ -432,6 +434,7 @@ class HighAngleUnwindExitState:
       self.handoff_bridge_time = 0.0
     self.confirmed_time = 0.0
     self.future_confirmed = False
+    self.future_wait_age = 0.0
     self.confirmed_target_scale = 0.0
     self.release_candidate_time = 0.0
     self.release_committed = False
@@ -559,17 +562,23 @@ class HighAngleUnwindExitState:
       self.ineligible_time = 0.0
       if self.confirmed_time >= HIGH_ANGLE_UNWIND_CONFIRM_TIME:
         self.future_confirmed = True
+        self.future_wait_age = 0.0
         self.confirmed_target_scale = max(self.confirmed_target_scale, raw_target)
+      elif self.future_confirmed and not self.release_committed:
+        self.future_wait_age += self.dt
       if self.release_committed:
         self.latched_scale = max(self.latched_scale, raw_target)
     else:
       self.ineligible_time += self.dt
+      if self.future_confirmed and not self.release_committed:
+        self.future_wait_age += self.dt
       if self.ineligible_time >= HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME:
         # The preview intent stays remembered while this geometric episode is
         # owned, but stronger authority still requires fresh future evidence.
         self.confirmed_time = 0.0
-      if not self.release_committed and self.ineligible_time >= HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME:
+      if not self.release_committed and self.future_wait_age >= HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME:
         self.future_confirmed = False
+        self.future_wait_age = 0.0
         self.confirmed_target_scale = 0.0
         self.release_candidate_time = 0.0
 
@@ -1248,6 +1257,7 @@ class LatControlTorque(LatControl):
     pid_log.highAngleUnwindBreakoutProgressEvaluated = bool(self.high_angle_unwind_exit_state.breakout_progress_evaluated)
     pid_log.highAngleUnwindBreakoutTargetScale = float(self.high_angle_unwind_exit_state.breakout_target_scale)
     pid_log.highAngleUnwindNeutralDelivered = bool(self.high_angle_unwind_exit_state.neutral_delivered)
+    pid_log.highAngleUnwindFutureWaitAge = float(self.high_angle_unwind_exit_state.future_wait_age)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log

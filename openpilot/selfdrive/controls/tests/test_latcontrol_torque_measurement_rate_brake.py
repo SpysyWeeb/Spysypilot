@@ -487,6 +487,24 @@ class TestHighAngleUnwindExitState:
     assert not state.release_committed
     assert state.latched_scale == 0.0
 
+  def test_sparse_unconfirmed_future_blips_cannot_refresh_old_intent(self):
+    state = HighAngleUnwindExitState(DT_CTRL)
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, delayed_lateral_accel=-1.2)
+    assert state.future_confirmed
+
+    dropout_samples = int(np.floor((HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME - 0.05) / DT_CTRL))
+    for _ in range(5):
+      for _ in range(dropout_samples):
+        state.update(True, 400.0, 3.0, 0.0, 1.0, True, 1.0, 0.0, delayed_lateral_accel=-1.2)
+      state.update(True, 400.0, 3.0, 1.0, 1.0, True, 1.0, 1.0, delayed_lateral_accel=-1.2)
+    assert not state.future_confirmed
+    assert state.confirmed_target_scale == 0.0
+
+    for _ in range(30):
+      state.update(True, 400.0, 3.0, 0.0, 1.0, True, 1.0, 0.0, delayed_lateral_accel=0.0)
+    assert not state.release_committed
+
   def test_delayed_commit_cannot_exceed_current_angle_authority(self):
     state = HighAngleUnwindExitState(DT_CTRL)
     for _ in range(30):
@@ -1244,6 +1262,7 @@ class TestReferenceRateTrackingIntegration:
     assert not torque_log.highAngleUnwindBreakoutEarned
     assert not torque_log.highAngleUnwindBreakoutCompleted
     assert not torque_log.highAngleUnwindNeutralDelivered
+    assert torque_log.highAngleUnwindFutureWaitAge == 0.0
 
     car_state.steeringPressed = True
     _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.02, False, 0.2)
