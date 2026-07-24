@@ -12,13 +12,19 @@ create only the manual event at the button message's monotonic timestamp. It nev
 looks up routes or writes files. Accepted events remain in memory and are retried
 with the same ID until loggerd acknowledges them.
 
-`loggerd` writes that exact event to the active full rlog, assigns the authoritative
-route and segment, attempts `user.preserve` on the current segment, schedules the next
-segment, and publishes `drivingEventRecorded`. The UI listens only to this
-acknowledgment. Success requires both marker acceptance and current-segment
-preservation; failures remain visible and preservation paths remain retryable.
+`loggerd` accepts that exact event into the active full rlog, assigns the authoritative
+route, segment, and segment-start monotonic time, attempts `user.preserve` on the
+current segment, schedules the next segment, and publishes `drivingEventRecorded`.
+The UI listens only to this acknowledgment. Success requires both marker acceptance
+and current-segment preservation; failures remain visible and preservation paths
+remain retryable.
 When a failed preservation later succeeds, loggerd republishes a corrected
 acknowledgment for the same event ID.
+
+`markerAccepted` (and the legacy `markerWritten` alias) is deliberately a low-latency
+acceptance signal. It does not claim that the file was fsynced. The off-road indexer's
+discovery of the marker in a completed full rlog is the durable verification, exposed
+as `verified_in_completed_rlog`.
 
 The old `userBookmark` and `lateralEvent` schemas remain solely for decoding old
 routes. Their logger processes, indexers, and UI renderer have been removed. Audio
@@ -32,13 +38,14 @@ feedback may still emit a generic legacy bookmark.
 /data/community/driving_events/manifest.jsonl
 ```
 
-Records include event/group IDs, exact route/segment and monotonic offset, typed
-metrics, confounders, acknowledgment state, context segment names, and an initial
-`unreviewed` state. The manifest rotates near 2 MiB and deduplicates across active
-and rotated files. Processed-segment state is atomic and bounded to segments still
-present on the device. Events and acknowledgments are joined by ID across adjacent
-segments in a route, so a logger rotation between marker acceptance and
-acknowledgment does not lose acknowledgment status.
+Records include event/group IDs, exact route/segment, separate route/segment/marker
+offsets, detector-to-marker and marker-to-ack latency, typed evidence, aggregate
+confounders, acknowledgment state, analysis-window hints, and context segment names.
+The manifest rotates near 2 MiB and deduplicates across active and rotated files.
+Processed-segment state is atomic and bounded to segments still present on the
+device. Events and acknowledgments are joined by ID across adjacent segments in a
+route, so a logger rotation between marker acceptance and acknowledgment does not
+lose acknowledgment status.
 
 Normal scans prioritize preserved segments. A complete reconstruction ignores that
 optimization:
@@ -52,9 +59,32 @@ indexer repairs the current and following xattrs, retaining the requested
 two-before/current/one-after window without consuming four preservation-quota
 entries per event.
 
-The lateral detector is version 2. Its thresholds and classifications are unchanged,
-but its cooldown is intentionally per event type: a stall/release event no longer
-hides a separate handoff mismatch in the same episode.
+The lateral detector is version 3. Its thresholds, three-release/six-second policy,
+and per-event-type cooldown are unchanged. Version 3 fixes stale `stallRelease`
+arming by clearing the current arm as soon as tracking becomes inactive and retaining
+only a 250 ms transition hysteresis through the 8–30 deg/s wheel-rate band.
+
+The event envelope carries detector-defined episode keys. Lateral maneuvers and lead
+launches therefore retain one group across overlapping semantic evidence even when
+they outlast the generic 2.5-second manual correlation window.
+
+The lead-launch detector is version 2. Trigger timing is unchanged; its compact
+payload now retains candidate/forecast/plan/command/lead/ego/ego-acceleration onset
+snapshots, brake state, and neutral wording for downstream/vehicle response.
+
+## Reviews
+
+`manifest.jsonl` contains only reconstructable event facts. Human review state is an
+independent append-only file:
+
+```text
+/data/community/driving_events/reviews.jsonl
+```
+
+Each review line is keyed by `event_id` and may contain `status`, `labels`, `notes`,
+`reviewer`, and `reviewed_at`. Rebuild mode never rotates, replaces, or deletes this
+file, so regenerating the manifest cannot erase review work. An event with no review
+entry is implicitly unreviewed.
 
 Historical `/data/community/lat_events` and `/data/community/long_events` indexes
 are not deleted or overwritten.
