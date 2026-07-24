@@ -37,7 +37,7 @@ def make_sm(status=True, v_ego=15.0, v_lead=15.0, d_rel=30.0, a_lead=0.0,
   sm = FakeSM(radar_valid=radar_valid)
   if v_lead_raw is None:
     v_lead_raw = v_lead
-  sm['radarState'] = Obj(leadOne=Obj(status=status, vLead=v_lead_raw, vLeadK=v_lead,
+  sm['radarState'] = Obj(leadOne=Obj(present=status, vLead=v_lead_raw, vLeadK=v_lead,
                                     dRel=d_rel, aLeadK=a_lead))
   sm['carState'] = Obj(vEgo=v_ego, standstill=standstill)
   sm['modelV2'] = Obj(leadsV3=[Obj(prob=lead_prob, v=model_v)])
