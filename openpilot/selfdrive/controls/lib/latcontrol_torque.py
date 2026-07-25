@@ -116,6 +116,35 @@ HIGH_ANGLE_BREAKOUT_RATE_RECOVERY_TIME = 0.15
 HIGH_ANGLE_BREAKOUT_TORQUE_MAX = 0.15
 HIGH_ANGLE_BREAKOUT_RAMP_IN_TIME = 0.20
 HIGH_ANGLE_BREAKOUT_RAMP_OUT_TIME = 0.15
+CATCHUP_SURGE_MIN_SPEED = 0.3
+CATCHUP_SURGE_MAX_SPEED = 6.0
+CATCHUP_SURGE_DRIVER_TORQUE_MAX = 100.0
+CATCHUP_SURGE_QUALIFY_TIME = 0.20
+CATCHUP_SURGE_TORQUE_MAX = 0.15
+CATCHUP_SURGE_RAMP_IN_TIME = 0.10
+CATCHUP_SURGE_RAMP_OUT_TIME = 0.15
+CATCHUP_SURGE_MAX_ACTIVE_TIME = 0.30
+CATCHUP_SURGE_RECOVERY_TIME = 0.10
+CATCHUP_SURGE_COOLDOWN_TIME = 0.50
+CATCHUP_SURGE_REARM_HEALTHY_TIME = 0.25
+CATCHUP_SURGE_PROGRESS_DEG = 10.0
+CATCHUP_SURGE_POSITION_EXIT = 0.08
+CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG = 120.0
+CATCHUP_SURGE_TURN_IN_ANGLE_FULL_DEG = 300.0
+CATCHUP_SURGE_TURN_IN_DEMAND_MIN = 0.50
+CATCHUP_SURGE_TURN_IN_ERROR_START = 0.20
+CATCHUP_SURGE_TURN_IN_ERROR_FULL = 0.50
+CATCHUP_SURGE_UNWIND_PEAK_DEG = 300.0
+CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG = 280.0
+CATCHUP_SURGE_UNWIND_ANGLE_FULL_DEG = 360.0
+CATCHUP_SURGE_UNWIND_PRESENT_MAX = 0.50
+CATCHUP_SURGE_UNWIND_STRONG_RELEASE_MAX = 0.20
+CATCHUP_SURGE_UNWIND_PEAK_DEMAND_MIN = 0.35
+CATCHUP_SURGE_UNWIND_EXCESS_MIN = 0.25
+CATCHUP_SURGE_UNWIND_EXCESS_FULL = 0.50
+CATCHUP_SURGE_RATE_MIN = 0.35
+CATCHUP_SURGE_RATE_RECOVERY_FRACTION = 0.80
+SIGNED_STEERING_RATE_FILTER_TAU = 0.08
 HANDOFF_TORQUE_CAP_RAMP_TIME = 0.15  # seconds; CAN slew remains the final actuator-rate boundary
 DAMPING_TURN_IN_POSITION_ERROR_MIN = 0.08  # m/s^2 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
@@ -130,7 +159,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 18
+VERSION = 19
 
 
 def smoothstep(value: float) -> float:
@@ -341,6 +370,32 @@ class UnwindPhaseState(NamedTuple):
   episode_armed: bool
 
 
+class SignedSteeringRateFilter:
+  """Derive signed wheel rate from angle; Hyundai's reported steering rate is unsigned."""
+
+  def __init__(self, dt: float):
+    self.dt = dt
+    self.filter = FirstOrderFilter(0.0, SIGNED_STEERING_RATE_FILTER_TAU, dt, initialized=True)
+    self.previous_angle: float | None = None
+
+  def reset(self) -> None:
+    self.filter.x = 0.0
+    self.filter.initialized = True
+    self.previous_angle = None
+
+  def update(self, steering_angle_deg: float, enabled: bool) -> float:
+    if not enabled:
+      self.reset()
+      return 0.0
+    if self.previous_angle is None:
+      self.previous_angle = steering_angle_deg
+      return 0.0
+
+    raw_rate = (steering_angle_deg - self.previous_angle) / self.dt
+    self.previous_angle = steering_angle_deg
+    return float(self.filter.update(raw_rate))
+
+
 class HighAngleUnwindExitState:
   """Latch a crown-relative unwind ceiling and gate bounded EPS breakout assistance."""
 
@@ -484,7 +539,7 @@ class HighAngleUnwindExitState:
     current_lateral_accel: float = 0.0,
     geometric_lateral_accel: float | None = None,
     tracking_measurement_rate: float = 0.0,
-    steering_rate_deg: float = 0.0,
+    signed_steering_rate_deg: float = 0.0,
     applied_torque: float = 0.0,
     neutral_torque: float = 0.0,
   ) -> float:
@@ -611,7 +666,7 @@ class HighAngleUnwindExitState:
     self.applied_old_direction_torque = max((applied_torque - neutral_torque) * old_sign, 0.0)
     self.breakout_planned_rate = unloading_rate
     self.breakout_actual_rate = tracking_measurement_rate * old_sign
-    self.breakout_steering_rate = -steering_rate_deg * old_sign
+    self.breakout_steering_rate = -signed_steering_rate_deg * old_sign
     breakout_structural_scope = (
       self.release_committed
       and self.release_owned
@@ -704,6 +759,323 @@ class HighAngleUnwindExitState:
       active_limit,
       active_breakout,
     )
+
+
+class CatchupSurgeState:
+  """Issue one bounded low-speed pulse when normal control proves severe under-response."""
+
+  MODE_NONE = 0
+  MODE_TURN_IN = 1
+  MODE_UNWIND = 2
+
+  TERMINATION_NONE = 0
+  TERMINATION_RECOVERED = 1
+  TERMINATION_POSITION = 2
+  TERMINATION_PROGRESS = 3
+  TERMINATION_TIMEOUT = 4
+  TERMINATION_DRIVER = 5
+  TERMINATION_INACTIVE = 6
+  TERMINATION_INTENT = 7
+  TERMINATION_SPEED = 8
+  TERMINATION_EPISODE = 9
+
+  def __init__(self, dt: float):
+    self.dt = dt
+    self.reset()
+
+  def reset(self) -> None:
+    self.mode = self.MODE_NONE
+    self.candidate_mode = self.MODE_NONE
+    self.candidate_direction = 0.0
+    self.candidate_time = 0.0
+    self.candidate_valid = False
+    self.active = False
+    self.pulse_active = False
+    self.scale = 0.0
+    self.target_scale = 0.0
+    self.correction = 0.0
+    self.planned_rate = 0.0
+    self.actual_rate = 0.0
+    self.position_error = 0.0
+    self.termination_reason = self.TERMINATION_NONE
+    self.cooldown = 0.0
+    self.signed_steering_rate = 0.0
+    self.underperform = False
+    self.direction = 0.0
+    self.active_time = 0.0
+    self.recovery_time = 0.0
+    self.healthy_time = 0.0
+    self.start_angle = 0.0
+    self.trigger_position_error = 0.0
+    self.used = False
+    self.used_mode = self.MODE_NONE
+
+  def _terminate(self, reason: int, immediate: bool = False) -> None:
+    if self.pulse_active or self.scale > 0.0:
+      self.termination_reason = reason
+      self.cooldown = CATCHUP_SURGE_COOLDOWN_TIME
+      self.healthy_time = 0.0
+      self.used = True
+    self.pulse_active = False
+    self.target_scale = 0.0
+    self.candidate_time = 0.0
+    self.candidate_mode = self.MODE_NONE
+    self.candidate_direction = 0.0
+    if immediate:
+      self.scale = 0.0
+      self.active = False
+      self.mode = self.MODE_NONE
+      self.direction = 0.0
+      self.candidate_valid = False
+      self.underperform = False
+
+  def update(
+    self,
+    enabled: bool,
+    steering_pressed: bool,
+    driver_torque: float,
+    steering_angle_deg: float,
+    signed_steering_rate: float,
+    v_ego: float,
+    delayed_lateral_accel: float,
+    current_lateral_accel: float,
+    measured_lateral_accel: float,
+    tracking_position_error: float,
+    reference_rate: float,
+    tracking_measurement_rate: float,
+    torque_command: float,
+    neutral_torque: float,
+    handoff_committed: bool,
+    unwind_same_episode: bool,
+    unwind_direction: float,
+    high_angle_state: HighAngleUnwindExitState,
+  ) -> float:
+    self.correction = 0.0
+    self.signed_steering_rate = signed_steering_rate
+    self.cooldown = max(self.cooldown - self.dt, 0.0)
+
+    if steering_pressed or abs(driver_torque) >= CATCHUP_SURGE_DRIVER_TORQUE_MAX:
+      self._terminate(self.TERMINATION_DRIVER, immediate=True)
+      return torque_command
+    if not enabled:
+      self._terminate(self.TERMINATION_INACTIVE, immediate=True)
+      return torque_command
+    if not (CATCHUP_SURGE_MIN_SPEED <= v_ego < CATCHUP_SURGE_MAX_SPEED):
+      self._terminate(self.TERMINATION_SPEED, immediate=True)
+      return torque_command
+
+    angle_magnitude = abs(steering_angle_deg)
+    turn_lateral_sign = 0.0 if abs(current_lateral_accel) < CATCHUP_SURGE_TURN_IN_DEMAND_MIN else math.copysign(1.0, current_lateral_accel)
+    turn_direction = -turn_lateral_sign
+    turn_consistent = turn_lateral_sign != 0.0 and delayed_lateral_accel * turn_lateral_sign >= CATCHUP_SURGE_TURN_IN_DEMAND_MIN
+    turn_position_error = max(tracking_position_error * turn_lateral_sign, 0.0)
+    turn_underperform = turn_position_error
+    turn_planned_rate = reference_rate * turn_lateral_sign
+    turn_actual_rate = tracking_measurement_rate * turn_lateral_sign
+    turn_base_coordinate = (torque_command - neutral_torque) * turn_direction
+    turn_structure = (
+      turn_consistent
+      and steering_angle_deg * turn_direction >= CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG
+      and turn_base_coordinate > 0.0
+      and not handoff_committed
+      and not high_angle_state.release_committed
+    )
+    turn_qualifies = turn_structure and turn_underperform >= CATCHUP_SURGE_TURN_IN_ERROR_START
+    turn_angle_scale = smoothstep(
+      (angle_magnitude - CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG)
+      / (CATCHUP_SURGE_TURN_IN_ANGLE_FULL_DEG - CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG)
+    )
+    turn_deficit_scale = smoothstep(
+      (turn_underperform - CATCHUP_SURGE_TURN_IN_ERROR_START)
+      / (CATCHUP_SURGE_TURN_IN_ERROR_FULL - CATCHUP_SURGE_TURN_IN_ERROR_START)
+    )
+    turn_authority = turn_angle_scale * turn_deficit_scale
+
+    old_sign = 0.0 if unwind_direction == 0.0 else math.copysign(1.0, unwind_direction)
+    old_lateral_sign = -old_sign
+    aligned_angle = steering_angle_deg * old_sign
+    current_old_demand = max(current_lateral_accel * old_lateral_sign, 0.0)
+    measured_old_demand = measured_lateral_accel * old_lateral_sign
+    unwind_excess = max(measured_old_demand - current_old_demand, 0.0)
+    unwind_position_error = max(unwind_excess, -tracking_position_error * old_lateral_sign, 0.0)
+    unwind_planned_rate = reference_rate * old_sign
+    unwind_actual_rate = tracking_measurement_rate * old_sign
+    unwind_direction_sign = -old_sign
+    unwind_base_coordinate = (torque_command - neutral_torque) * old_sign
+    fresh_future = high_angle_state.future_confirmed and high_angle_state.ineligible_time < HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME
+    model_release_agreement = (
+      fresh_future
+      and current_old_demand <= CATCHUP_SURGE_UNWIND_PRESENT_MAX
+      and unwind_excess >= CATCHUP_SURGE_UNWIND_EXCESS_MIN
+    )
+    strong_present_release = (
+      current_old_demand <= CATCHUP_SURGE_UNWIND_STRONG_RELEASE_MAX
+      and high_angle_state.present_old_demand <= CATCHUP_SURGE_UNWIND_STRONG_RELEASE_MAX
+      and high_angle_state.present_peak_demand >= CATCHUP_SURGE_UNWIND_PEAK_DEMAND_MIN
+    )
+    unwind_structure = (
+      old_sign != 0.0
+      and unwind_same_episode
+      and high_angle_state.peak_aligned_angle >= CATCHUP_SURGE_UNWIND_PEAK_DEG
+      and aligned_angle >= CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG
+      and (model_release_agreement or strong_present_release)
+      and unwind_base_coordinate <= 0.0
+      and unwind_planned_rate > CATCHUP_SURGE_RATE_MIN
+    )
+    unwind_active_structure = (
+      old_sign != 0.0
+      and unwind_same_episode
+      and aligned_angle >= CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG
+      and current_old_demand <= CATCHUP_SURGE_UNWIND_PRESENT_MAX
+      and unwind_base_coordinate <= 0.0
+      and unwind_planned_rate > CATCHUP_SURGE_RATE_MIN
+    )
+    unwind_qualifies = (
+      unwind_structure
+      and unwind_actual_rate < CATCHUP_SURGE_RATE_RECOVERY_FRACTION * unwind_planned_rate
+    )
+    unwind_angle_scale = smoothstep(
+      (aligned_angle - CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG)
+      / (CATCHUP_SURGE_UNWIND_ANGLE_FULL_DEG - CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG)
+    )
+    unwind_rate_deficit = max(unwind_planned_rate - unwind_actual_rate, 0.0)
+    unwind_rate_scale = smoothstep(unwind_rate_deficit / max(0.5 * unwind_planned_rate, 1e-3))
+    unwind_excess_scale = smoothstep(
+      (unwind_excess - CATCHUP_SURGE_UNWIND_EXCESS_MIN)
+      / (CATCHUP_SURGE_UNWIND_EXCESS_FULL - CATCHUP_SURGE_UNWIND_EXCESS_MIN)
+    )
+    unwind_authority = unwind_angle_scale * max(unwind_rate_scale, unwind_excess_scale)
+
+    if unwind_qualifies:
+      candidate_mode = self.MODE_UNWIND
+      candidate_direction = unwind_direction_sign
+      candidate_authority = unwind_authority
+      candidate_planned_rate = unwind_planned_rate
+      candidate_actual_rate = unwind_actual_rate
+      candidate_position_error = unwind_position_error
+    elif turn_qualifies:
+      candidate_mode = self.MODE_TURN_IN
+      candidate_direction = turn_direction
+      candidate_authority = turn_authority
+      candidate_planned_rate = turn_planned_rate
+      candidate_actual_rate = turn_actual_rate
+      candidate_position_error = turn_underperform
+    else:
+      candidate_mode = self.MODE_NONE
+      candidate_direction = 0.0
+      candidate_authority = 0.0
+      candidate_planned_rate = 0.0
+      candidate_actual_rate = 0.0
+      candidate_position_error = 0.0
+
+    self.candidate_valid = candidate_mode != self.MODE_NONE and candidate_authority > 0.0
+    self.planned_rate = candidate_planned_rate
+    self.actual_rate = candidate_actual_rate
+    self.position_error = candidate_position_error
+    self.underperform = self.candidate_valid
+    if not self.pulse_active and self.scale <= 0.0:
+      if self.used_mode == self.MODE_UNWIND:
+        healthy = (
+          not unwind_same_episode
+          or unwind_position_error < CATCHUP_SURGE_POSITION_EXIT
+          or (
+            unwind_planned_rate > CATCHUP_SURGE_RATE_MIN
+            and unwind_actual_rate >= CATCHUP_SURGE_RATE_RECOVERY_FRACTION * unwind_planned_rate
+          )
+        )
+      elif self.used_mode == self.MODE_TURN_IN:
+        healthy = (
+          not turn_consistent
+          or turn_position_error < CATCHUP_SURGE_POSITION_EXIT
+          or (
+            turn_planned_rate > CATCHUP_SURGE_RATE_MIN
+            and turn_actual_rate >= CATCHUP_SURGE_RATE_RECOVERY_FRACTION * turn_planned_rate
+          )
+        )
+      else:
+        healthy = not self.candidate_valid
+      self.healthy_time = self.healthy_time + self.dt if healthy else 0.0
+      if self.used and self.cooldown <= 0.0 and self.healthy_time >= CATCHUP_SURGE_REARM_HEALTHY_TIME:
+        self.used = False
+        self.used_mode = self.MODE_NONE
+        self.termination_reason = self.TERMINATION_NONE
+
+    if not self.pulse_active and not self.used and self.candidate_valid:
+      same_candidate = self.candidate_mode == candidate_mode and self.candidate_direction == candidate_direction
+      self.candidate_time = self.candidate_time + self.dt if same_candidate else self.dt
+      self.candidate_mode = candidate_mode
+      self.candidate_direction = candidate_direction
+      if self.candidate_time >= CATCHUP_SURGE_QUALIFY_TIME:
+        self.mode = candidate_mode
+        self.direction = candidate_direction
+        self.pulse_active = True
+        self.active_time = 0.0
+        self.recovery_time = 0.0
+        self.start_angle = steering_angle_deg
+        self.trigger_position_error = candidate_position_error
+        self.target_scale = candidate_authority
+        self.used = True
+        self.used_mode = candidate_mode
+        self.termination_reason = self.TERMINATION_NONE
+    elif not self.pulse_active:
+      self.candidate_time = 0.0
+      self.candidate_mode = self.MODE_NONE
+      self.candidate_direction = 0.0
+
+    if self.pulse_active:
+      active_structure = unwind_active_structure if self.mode == self.MODE_UNWIND else turn_structure
+      active_direction = unwind_direction_sign if self.mode == self.MODE_UNWIND else turn_direction
+      if not active_structure or active_direction != self.direction:
+        reason = self.TERMINATION_EPISODE if self.mode == self.MODE_UNWIND else self.TERMINATION_INTENT
+        self._terminate(reason, immediate=True)
+        return torque_command
+
+      if self.mode == self.MODE_UNWIND:
+        self.planned_rate = unwind_planned_rate
+        self.actual_rate = unwind_actual_rate
+        self.position_error = unwind_position_error
+        self.underperform = unwind_qualifies
+        self.target_scale = max(self.target_scale, unwind_authority)
+      else:
+        self.planned_rate = turn_planned_rate
+        self.actual_rate = turn_actual_rate
+        self.position_error = turn_underperform
+        self.underperform = turn_qualifies
+        self.target_scale = max(self.target_scale, turn_authority)
+
+      self.active_time += self.dt
+      recovered = self.planned_rate > CATCHUP_SURGE_RATE_MIN and (
+        self.actual_rate >= CATCHUP_SURGE_RATE_RECOVERY_FRACTION * self.planned_rate
+      )
+      self.recovery_time = self.recovery_time + self.dt if recovered else 0.0
+      progress = max((steering_angle_deg - self.start_angle) * self.direction, 0.0)
+      position_exit = max(CATCHUP_SURGE_POSITION_EXIT, 0.5 * self.trigger_position_error)
+      if self.recovery_time >= CATCHUP_SURGE_RECOVERY_TIME:
+        self._terminate(self.TERMINATION_RECOVERED)
+      elif self.position_error < position_exit:
+        self._terminate(self.TERMINATION_POSITION)
+      elif progress >= CATCHUP_SURGE_PROGRESS_DEG:
+        self._terminate(self.TERMINATION_PROGRESS)
+      elif self.active_time >= CATCHUP_SURGE_MAX_ACTIVE_TIME:
+        self._terminate(self.TERMINATION_TIMEOUT)
+
+    ramp_time = CATCHUP_SURGE_RAMP_IN_TIME if self.pulse_active else CATCHUP_SURGE_RAMP_OUT_TIME
+    scale_delta = clip_scalar(self.target_scale - self.scale, -self.dt / ramp_time, self.dt / ramp_time)
+    self.scale = clip_scalar(self.scale + scale_delta, 0.0, 1.0)
+    self.active = self.pulse_active or self.scale > 0.0
+    if not self.active:
+      self.mode = self.MODE_NONE
+      self.direction = 0.0
+
+    command_coordinate = (torque_command - neutral_torque) * self.direction
+    direction_agrees = command_coordinate > 0.0 or (self.mode == self.MODE_UNWIND and command_coordinate >= 0.0)
+    if self.scale > 0.0 and direction_agrees:
+      breakout_reserve = HIGH_ANGLE_BREAKOUT_TORQUE_MAX * high_angle_state.breakout_scale
+      correction_budget = max(CATCHUP_SURGE_TORQUE_MAX - breakout_reserve, 0.0)
+      corrected_command = clip_scalar(torque_command + self.direction * correction_budget * self.scale, -1.0, 1.0)
+      self.correction = corrected_command - torque_command
+      return corrected_command
+    return torque_command
 
 
 class UnwindPhaseTracker:
@@ -896,8 +1268,10 @@ class LatControlTorque(LatControl):
       self.dt,
       initialized=False,
     )
+    self.signed_steering_rate_filter = SignedSteeringRateFilter(self.dt)
     self.unwind_phase_tracker = UnwindPhaseTracker(self.dt)
     self.high_angle_unwind_exit_state = HighAngleUnwindExitState(self.dt)
+    self.catchup_surge_state = CatchupSurgeState(self.dt)
     # Route-derived for the affected Hyundai EPS. Other torque platforms keep
     # their existing controller behavior until they are analyzed independently.
     self.reference_rate_tracking_enabled = CP.brand == "hyundai"
@@ -910,8 +1284,10 @@ class LatControlTorque(LatControl):
 
   def reset(self):
     super().reset()
+    self.signed_steering_rate_filter.reset()
     self.unwind_phase_tracker.reset()
     self.high_angle_unwind_exit_state.reset()
+    self.catchup_surge_state.reset()
     self.reference_rate_innovation_filter.initialized = False
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
@@ -945,7 +1321,15 @@ class LatControlTorque(LatControl):
   ):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
-    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
+    steering_angle_deg = CS.steeringAngleDeg - params.angleOffsetDeg
+    signed_steering_rate = self.signed_steering_rate_filter.update(
+      steering_angle_deg,
+      self.reference_rate_tracking_enabled
+      and active
+      and not CS.steeringPressed
+      and abs(CS.steeringTorque) < CATCHUP_SURGE_DRIVER_TORQUE_MAX,
+    )
+    measured_curvature = -VM.calc_curvature(math.radians(steering_angle_deg), CS.vEgo, params.roll)
     measurement = measured_curvature * CS.vEgo**2
     measurement_rate = self.measurement_rate_filter.update(measured_curvature, CS.vEgo, active)
     self.reference_rate_filter.update(desired_curvature, CS.vEgo, active)
@@ -1029,7 +1413,7 @@ class LatControlTorque(LatControl):
     )
     high_angle_unwind_scale = self.high_angle_unwind_exit_state.update(
       self.reference_rate_tracking_enabled and active and not CS.steeringPressed,
-      CS.steeringAngleDeg - params.angleOffsetDeg,
+      steering_angle_deg,
       CS.vEgo,
       reference_sustained_unwind_scale,
       effective_unwind_scale,
@@ -1042,17 +1426,20 @@ class LatControlTorque(LatControl):
       current_lateral_accel=current_speed_desired_lateral_accel,
       geometric_lateral_accel=reference_geometric_lateral_accel,
       tracking_measurement_rate=tracking_measurement_rate,
-      steering_rate_deg=CS.steeringRateDeg,
+      signed_steering_rate_deg=signed_steering_rate,
       applied_torque=applied_torque,
       neutral_torque=neutral_torque,
     )
     high_angle_unwind_breakout_scale = self.high_angle_unwind_exit_state.breakout_scale
     high_angle_unwind_turn_in_guard = self.high_angle_unwind_exit_state.turn_in_guard
-    damping_turn_in_blocked = self.reference_rate_tracking_enabled and should_block_undertracked_turn_in_damping(
-      delayed_desired_curvature,
-      tracking_position_error,
-      reference_rate,
-      effective_unwind_scale,
+    damping_turn_in_blocked = self.reference_rate_tracking_enabled and (
+      should_block_undertracked_turn_in_damping(
+        delayed_desired_curvature,
+        tracking_position_error,
+        reference_rate,
+        effective_unwind_scale,
+      )
+      or high_angle_unwind_turn_in_guard > 0.0
     )
 
     lookahead_idx = int(clip_scalar(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len + 1, -2))
@@ -1066,6 +1453,26 @@ class LatControlTorque(LatControl):
 
     if not active:
       torque_command = 0.0
+      self.catchup_surge_state.update(
+        False,
+        CS.steeringPressed,
+        CS.steeringTorque,
+        steering_angle_deg,
+        signed_steering_rate,
+        CS.vEgo,
+        expected_lateral_accel,
+        current_speed_desired_lateral_accel,
+        measurement,
+        tracking_position_error,
+        reference_rate,
+        tracking_measurement_rate,
+        torque_command,
+        neutral_torque,
+        handoff_committed,
+        unwind_same_episode,
+        unwind_phase_direction,
+        self.high_angle_unwind_exit_state,
+      )
       pid_log.active = False
       rate_tracking_correction = 0.0
       actuator_state_correction = 0.0
@@ -1100,6 +1507,7 @@ class LatControlTorque(LatControl):
         or high_angle_unwind_scale > 0.0
         or high_angle_unwind_breakout_scale > 0.0
         or self.high_angle_unwind_exit_state.old_direction_limit is not None
+        or self.catchup_surge_state.active
       )
       rate_tracking_correction = 0.0
       actuator_state_correction = 0.0
@@ -1141,6 +1549,27 @@ class LatControlTorque(LatControl):
       if unwind_torque_blend > 0.0:
         unwind_torque_correction = unwind_torque_blend * (reference_target_torque - torque_command)
         torque_command += unwind_torque_correction
+      torque_command = self.catchup_surge_state.update(
+        self.reference_rate_tracking_enabled and active,
+        CS.steeringPressed,
+        CS.steeringTorque,
+        steering_angle_deg,
+        signed_steering_rate,
+        CS.vEgo,
+        expected_lateral_accel,
+        current_speed_desired_lateral_accel,
+        measurement,
+        tracking_position_error,
+        reference_rate,
+        tracking_measurement_rate,
+        torque_command,
+        neutral_torque,
+        handoff_committed,
+        unwind_same_episode,
+        unwind_phase_direction,
+        self.high_angle_unwind_exit_state,
+      )
+      damping_turn_in_blocked = damping_turn_in_blocked or self.catchup_surge_state.active
       torque_command_before_high_angle_exit = torque_command
       torque_command, high_angle_unwind_old_torque_correction, high_angle_unwind_old_direction_torque, high_angle_unwind_breakout_correction = (
         self.high_angle_unwind_exit_state.apply(
@@ -1258,6 +1687,18 @@ class LatControlTorque(LatControl):
     pid_log.highAngleUnwindBreakoutTargetScale = float(self.high_angle_unwind_exit_state.breakout_target_scale)
     pid_log.highAngleUnwindNeutralDelivered = bool(self.high_angle_unwind_exit_state.neutral_delivered)
     pid_log.highAngleUnwindFutureWaitAge = float(self.high_angle_unwind_exit_state.future_wait_age)
+    pid_log.catchupMode = int(self.catchup_surge_state.mode)
+    pid_log.catchupCandidateTime = float(self.catchup_surge_state.candidate_time)
+    pid_log.catchupActive = bool(self.catchup_surge_state.active)
+    pid_log.catchupScale = float(self.catchup_surge_state.scale)
+    pid_log.catchupCorrection = float(self.catchup_surge_state.correction)
+    pid_log.catchupPlannedRate = float(self.catchup_surge_state.planned_rate)
+    pid_log.catchupActualRate = float(self.catchup_surge_state.actual_rate)
+    pid_log.catchupPositionError = float(self.catchup_surge_state.position_error)
+    pid_log.catchupTerminationReason = int(self.catchup_surge_state.termination_reason)
+    pid_log.catchupCooldown = float(self.catchup_surge_state.cooldown)
+    pid_log.catchupSignedSteeringRate = float(self.catchup_surge_state.signed_steering_rate)
+    pid_log.catchupUnderperform = bool(self.catchup_surge_state.underperform)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log
