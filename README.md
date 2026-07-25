@@ -6,12 +6,21 @@ Companion longitudinal branch: [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/
 
 ## Status
 
-⚠️ **In progress.** BLaT has returned to the final controller v14 baseline
-from commit `e1a010eeef`. The v15–v19 committed-handoff, high-angle release,
-breakout, remembered-intent, and catch-up interventions have been removed so
-low-speed performance can be approached from a simpler foundation. The v14
-baseline must be revalidated on the car and explicitly signed off before this
-task can be considered done.
+⚠️ **In progress.** BLaT has returned to the field-tested final controller v14
+baseline from commit `e1a010eeef`. The v15–v19 committed-handoff, high-angle
+release, breakout, remembered-intent, and catch-up interventions remain
+removed.
+
+The next architecture restructure has emitted and versioned its Phase 0
+counterfactual replay baseline from frozen routes `0000008f--429bc635f2` and
+`0000009b--217a1b70db` in route-audit commit `acdc165`. No v15 controller
+changes have begun. Later phases remain in progress until they pass both the
+replay gate and a separate field drive, followed by explicit sign-off.
+
+Replay rows are identified by both the Spysypilot commit and opendbc commit,
+not by the logged controller `VERSION` alone. Beginning with v15, every
+behavior-affecting controller change must bump `VERSION` in the same commit;
+two builds that steer differently must never report the same version.
 
 Automated rollback validation currently covers 87 lateral-controller/reference
 tests, 16 Hyundai damping tests, and 1,367 Hyundai panda safety tests. These
