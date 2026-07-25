@@ -1,0 +1,319 @@
+{
+  "_doc": [
+    "Committed regression fixture for lateral detector v6, route 00000094--8cec74a749.",
+    "Ground truth for every value in this file is",
+    "/home/alex/Documents/spysypilot-route-audit/routes/00000094--8cec74a749/analysis/route94_v6_validation_report.md",
+    "(prior-agent validation of the v6 detector against real device telemetry, branch",
+    "driving-event-platform @ f93ec779f0). The CSV rows were extracted verbatim (only",
+    "rounded to 5 decimals) from that same directory's route94_lat_samples_v6.csv, which",
+    "was itself produced by re-extracting route-94's rlogs against the durable device-exact",
+    "schema archive (see map-replaykit.md). Nothing was re-extracted or re-replayed from",
+    "scratch to build this fixture -- only windowed and trimmed to consumed columns.",
+    "Every window below was independently re-verified by this fixture's author against a",
+    "full continuous route-94 replay: replaying ONLY the rows in a window through a fresh",
+    "LateralEventDetector() reproduces the exact occurred_mono_time/detected_mono_time/",
+    "evidence fields that the full-route replay produces for that anchor -- i.e. no window",
+    "was sized by guesswork.",
+    "Detector construction for ALL windows below is the DEFAULT LateralEventDetector()",
+    "(EVENT_COOLDOWN=8.0 active) -- deliberately NOT cooldown=0, because the",
+    "cooldown_pair_731_977_735_289 window specifically exercises real 8s-cooldown",
+    "suppression (amendment A10) and must see the same cooldown the live detector sees."
+  ],
+  "route": "00000094--8cec74a749",
+  "fixture_csv": "route94_lat_windows.csv.zst",
+  "csv_columns_doc": "Only the columns openpilot/.../lat_event_detector.py's LateralSample construction consumes (matching the analysis directory's replay_route94_lat_v6.py field mapping) plus mono_s; floats rounded to 5 decimals.",
+
+  "pre_existing_artifacts_not_included": [
+    {
+      "label": "seg1_14_6s",
+      "mono": 141.79,
+      "mechanism": "pre-existing-live-only-artifact",
+      "explanation": "Live daemon dwell (14.6s) at mono ~141.79 was NEVER reproducible in ANY offline replay (v5 or v6) -- both full-fidelity replays instead resolve this stretch into two separate short dwells (~1.85s @127.1-129.0, ~0.3s @142.4-144.8) that bracket where the live daemon's sm.update(100) frame-skipping merged one long dwell. This is a pre-existing v5-era live/replay divergence, unchanged by v6. Not included in the fixture: testing 'absence' here would only prove 'still absent, same as v5' and would NOT exercise any v6-specific max-dwell/progress-gate/episode-identity logic. Documented here rather than given a dedicated window per the task's explicit option to omit."
+    },
+    {
+      "label": "seg2_02_24_2",
+      "mono": 211.68,
+      "mechanism": "pre-existing-live-only-artifact",
+      "explanation": "Live daemon dwell (31.8s) at mono ~211.68 was NEVER reproducible in ANY offline replay (v5 or v6): the dwell-transition probe shows the detector never enters 'dwell' state anywhere near mono 211.68 in EITHER replay (nearest dwell entries at 181.7 and 233.1). Same pre-existing v5-era gap as seg1_14_6s above, not a v6 discard. Not included in the fixture for the same reason."
+    }
+  ],
+
+  "windows": [
+    {
+      "label": "unwind_00_25_6",
+      "kind": "unwind_keep",
+      "mono_start": 92.278, "mono_end": 95.878,
+      "anchor_mono": 93.078,
+      "is_driver_rescue_anchor": false,
+      "expect": {
+        "occurred_mono_time": 93.077578,
+        "confidence": 0.9,
+        "driver_causation": "driverCreated",
+        "driver_assisted_unwind": false,
+        "driver_assist_raw_torque_only": false,
+        "requested_crown_neutral_mono_time": 93.32795,
+        "applied_crown_neutral_mono_time": 93.437687,
+        "requested_torque_neutral_cross_mono_time": 94.678627,
+        "requested_vs_literal_delta_s": -1.3507,
+        "rebound_max_magnitude": 0.12869,
+        "rebound_start_mono_time": 95.37715,
+        "rebound_duration_s": 0.05016
+      },
+      "assertion": "unwindProgressDeficit fires at anchor; requested-crown present and meaningfully EARLIER than the literal-zero crossing (delta magnitude ~1.351s, opposite direction from the other 3 comparable anchors -- report section E)."
+    },
+    {
+      "label": "unwind_03_59_8",
+      "kind": "unwind_keep",
+      "mono_start": 306.509, "mono_end": 310.109,
+      "anchor_mono": 307.309,
+      "is_driver_rescue_anchor": false,
+      "expect": {
+        "occurred_mono_time": 307.309352,
+        "confidence": 0.9,
+        "driver_causation": "driverCreated",
+        "driver_assisted_unwind": false,
+        "driver_assist_raw_torque_only": false,
+        "requested_crown_neutral_mono_time": 307.636397,
+        "applied_crown_neutral_mono_time": null,
+        "requested_torque_neutral_cross_mono_time": 307.502005,
+        "requested_vs_literal_delta_s": 0.1344,
+        "rebound_max_magnitude": 0.90764,
+        "rebound_start_mono_time": 307.896438,
+        "rebound_duration_s": 1.70867
+      },
+      "assertion": "unwindProgressDeficit fires at anchor; requested-crown present, meaningfully LATER than literal-zero (delta ~0.134s); applied-crown ABSENT (applied-torque rebound never sustains the 0.05 tolerance for 0.10s before the no-assist emission deadline -- physically correct, not a bug); confirmed rebound #1 (0.908/307.896/1.709) pinned exactly."
+    },
+    {
+      "label": "unwind_04_50_0",
+      "kind": "unwind_keep",
+      "mono_start": 356.728, "mono_end": 360.328,
+      "anchor_mono": 357.528,
+      "is_driver_rescue_anchor": false,
+      "expect": {
+        "occurred_mono_time": 357.528429,
+        "confidence": 0.9,
+        "driver_causation": "mixed",
+        "driver_assisted_unwind": false,
+        "driver_assist_raw_torque_only": false,
+        "requested_crown_neutral_mono_time": 357.846933,
+        "applied_crown_neutral_mono_time": null,
+        "requested_torque_neutral_cross_mono_time": 357.762107,
+        "requested_vs_literal_delta_s": 0.0848,
+        "rebound_max_magnitude": 0.44023,
+        "rebound_start_mono_time": 358.396366,
+        "rebound_duration_s": 1.19968
+      },
+      "assertion": "unwindProgressDeficit fires at anchor with driver_causation=='mixed' (road-bump attribution override, not driverCreated/interventionBacked -- distinct from the other 6 keeps); requested-crown present, meaningfully LATER than literal-zero (delta ~0.085s); applied-crown ABSENT (same physically-correct rebound-still-decaying reason as 03:59.8); confirmed rebound #2 (0.440/358.396/1.200) pinned exactly."
+    },
+    {
+      "label": "unwind_05_29_7",
+      "kind": "unwind_keep",
+      "mono_start": 396.347, "mono_end": 398.947,
+      "anchor_mono": 397.147,
+      "is_driver_rescue_anchor": true,
+      "expect": {
+        "occurred_mono_time": 397.146852,
+        "confidence": 0.95,
+        "driver_causation": "driverCreated",
+        "driver_assisted_unwind": true,
+        "driver_assist_raw_torque_only": false,
+        "requested_crown_neutral_mono_time": 397.357684,
+        "applied_crown_neutral_mono_time": 397.646172,
+        "requested_torque_neutral_cross_mono_time": 397.349214,
+        "requested_vs_literal_delta_s": 0.0085,
+        "rebound_max_magnitude": 0.0,
+        "rebound_start_mono_time": null,
+        "rebound_duration_s": 0.0
+      },
+      "assertion": "unwindProgressDeficit fires, confidence 0.95, driver_assisted_unwind True (assist-path rescue). driver_causation is 'driverCreated' NOT 'interventionBacked' -- DESIGN.md S6 named this anchor as an interventionBacked example, but the driver was confounded continuously through arm/deficit-start/evaluation on this hands-on-heavy route (see report section D), so the code's stricter driverCreated branch wins; reviewed and accepted by the user. requested-crown present but delta vs literal-zero is only 0.0085s -- the one anchor where crown and literal-zero nearly coincide (report section E), NOT asserted as a 'meaningful' (>0.05s) difference. No rebound (clean single release, assist path)."
+    },
+    {
+      "label": "unwind_09_19_1",
+      "kind": "unwind_keep",
+      "mono_start": 625.748, "mono_end": 627.848,
+      "anchor_mono": 626.548,
+      "is_driver_rescue_anchor": true,
+      "expect": {
+        "occurred_mono_time": 626.547841,
+        "confidence": 0.95,
+        "driver_causation": "driverCreated",
+        "driver_assisted_unwind": true,
+        "driver_assist_raw_torque_only": false,
+        "requested_crown_neutral_mono_time": null,
+        "applied_crown_neutral_mono_time": null,
+        "rebound_max_magnitude": 0.0,
+        "rebound_start_mono_time": null,
+        "rebound_duration_s": 0.0
+      },
+      "assertion": "unwindProgressDeficit fires, confidence 0.95, driver_assisted_unwind True, driver_causation 'driverCreated' (same hands-on-heavy-route reasoning as 05:29.7). BOTH crown timestamps ABSENT: requested torque is saturated/oscillating full-lock swings with heavy driver correction right up to emission, so the old-direction component never sustains a continuous <0.05 hold for 0.10s before the assist-path emission (report section E) -- physically correct, not a bug. No rebound."
+    },
+    {
+      "label": "unwind_10_07_56",
+      "kind": "unwind_keep",
+      "mono_start": 662.958, "mono_end": 675.658,
+      "anchor_mono": 675.058,
+      "is_driver_rescue_anchor": true,
+      "expect": {
+        "occurred_mono_time": 675.057777,
+        "detected_mono_time": 675.057777,
+        "confidence": 0.95,
+        "driver_causation": "driverCreated",
+        "driver_assisted_unwind": true,
+        "driver_assist_raw_torque_only": true,
+        "requested_crown_neutral_mono_time": 663.170414,
+        "applied_crown_neutral_mono_time": 663.170414,
+        "rebound_max_magnitude": 0.9711,
+        "rebound_start_mono_time": 664.396409,
+        "rebound_duration_s": 1.9653
+      },
+      "assertion": "This is the 10:07.56 driver-rescue anchor -- NOT one of the 7 keeps in report section A (it is the extra 'driver-rescue anchor extras' the task asks for). confidence 0.95, driver_assisted_unwind True, driver_causation 'driverCreated', AND driver_assist_raw_torque_only True (the one anchor of the 4 rescue anchors where the assist confirmed via raw torque without steering_pressed). Window is asymmetric (~13s back) because this episode arms at mono 663.17 -- 11.9s before the deficit is flagged -- and both crown timestamps and the rebound land inside that long arm-to-deficit span, not near occurred_mono_time itself; this is the report's own sanity-check example (section 'Sanity check (Step 1)') of high_angle_unwind_scale peaking near 1.0 around mono 307.6-307.8 and 357.9-358.2 in the OTHER two rebound windows, and analogously dynamic here."
+    },
+    {
+      "label": "unwind_10_35_1",
+      "kind": "unwind_keep",
+      "mono_start": 701.337, "mono_end": 705.937,
+      "anchor_mono": 702.637,
+      "is_driver_rescue_anchor": false,
+      "expect": {
+        "occurred_mono_time": 702.637481,
+        "confidence": 0.9,
+        "driver_causation": "driverCreated",
+        "driver_assisted_unwind": false,
+        "driver_assist_raw_torque_only": false,
+        "requested_crown_neutral_mono_time": null,
+        "applied_crown_neutral_mono_time": null,
+        "rebound_max_magnitude": 0.15177,
+        "rebound_start_mono_time": 704.846825,
+        "rebound_duration_s": 0.08806
+      },
+      "assertion": "unwindProgressDeficit fires. BOTH crown timestamps ABSENT: requested torque swings -1.0..+1.0 full-lock with driver torque -109..+96 throughout the window (heavy noisy driver correction); the old-direction component gets close (0.045-0.126 in the final approach) but keeps bouncing back above 0.05 until after emission (report section E) -- physically correct, not a bug."
+    },
+    {
+      "label": "unwind_11_04_0",
+      "kind": "unwind_keep",
+      "mono_start": 730.728, "mono_end": 734.328,
+      "anchor_mono": 731.528,
+      "is_driver_rescue_anchor": true,
+      "expect": {
+        "occurred_mono_time": 731.52757,
+        "confidence": 0.95,
+        "driver_causation": "driverCreated",
+        "driver_assisted_unwind": true,
+        "driver_assist_raw_torque_only": false,
+        "requested_crown_neutral_mono_time": 731.717526,
+        "applied_crown_neutral_mono_time": 731.856491,
+        "requested_torque_neutral_cross_mono_time": 731.653261,
+        "requested_vs_literal_delta_s": 0.0643,
+        "rebound_max_magnitude": 0.0,
+        "rebound_start_mono_time": null,
+        "rebound_duration_s": 0.0
+      },
+      "assertion": "unwindProgressDeficit fires, confidence 0.95, driver_assisted_unwind True, driver_causation 'driverCreated' (same hands-on-heavy-route reasoning). Requested-crown present, meaningfully LATER than literal-zero (delta ~0.065s). No rebound (clean single release, assist path)."
+    },
+
+    {
+      "label": "reject_06_38_9_never_enters_dwell",
+      "kind": "turn_stop_reject_mechanism",
+      "mono_start": 466.2, "mono_end": 471.3,
+      "anchor_mono": 466.36,
+      "v5_dwell_s": 15.5,
+      "mechanism": "never-enters-dwell",
+      "expect_no_event": "turnStopTurn",
+      "anti_vacuity_probe": {
+        "description": "Track detector.turn_stop_episode.state transitions across the window. A 'moving' episode begins essentially AT the anchor (mono 466.359) and transitions to 'slowing' at 466.448, but NO 'dwell' state is entered anywhere near the anchor -- the episode lingers in 'slowing' and only belatedly reaches a brief (0.089s) 'dwell' far away at mono 470.948-471.037, well outside any reasonable proximity to the anchor.",
+        "expected_moving_entry_mono": 466.359,
+        "expected_slowing_entry_mono": 466.448,
+        "no_dwell_within_s_of_anchor": 3.0,
+        "nearest_dwell_entry_mono": 470.948
+      },
+      "assertion": "No turnStopTurn fires anywhere in the window. The anti-vacuity guard proves this is NOT vacuous by confirming the episode DOES become active (moving/slowing) right at the anchor -- it just never forms a dwell there -- distinguishing this from a case where the detector saw no activity at all."
+    },
+    {
+      "label": "reject_08_33_7_center_band_reset",
+      "kind": "turn_stop_reject_mechanism",
+      "mono_start": 580.3, "mono_end": 583.2,
+      "anchor_mono": 581.2,
+      "v5_dwell_s": 19.9,
+      "mechanism": "center-band-drift-reset",
+      "expect_no_event": "turnStopTurn",
+      "anti_vacuity_probe": {
+        "description": "A real dwell IS entered (proving the state machine reached 'dwell', not silently absent) at mono 581.808 (angle -11.9deg), but resets directly to None (episode discarded) after ~1.1s at mono 582.907 when the wheel drifts back inside the center band with no meaningful demand (DESIGN S2 rule 4) -- the state trace goes 'dwell' -> None directly, NEVER passing through 'released', so no PendingTurnStopCandidate is ever created from this episode.",
+        "expected_dwell_entry_mono": 581.8077,
+        "expected_dwell_exit_mono": 582.9074,
+        "expected_dwell_duration_s": 1.0997,
+        "expected_exit_state": null
+      },
+      "assertion": "No turnStopTurn fires anywhere in the window. The anti-vacuity guard proves the detector actually ENTERS 'dwell' (dwell_start ~581.808, duration ~1.0997s matching the report's '~1.1s') and confirms it exits directly to no-episode (never 'released'), i.e. this is the center-band-drift-reset mechanism specifically, not a generic absence."
+      },
+    {
+      "label": "reject_seg9_649_0_fragmentation",
+      "kind": "turn_stop_reject_mechanism",
+      "mono_start": 648.8, "mono_end": 652.3,
+      "anchor_mono": 649.0,
+      "v5_dwell_s": 7.1,
+      "mechanism": "state-fragmentation",
+      "expect_no_event_near_anchor_s": 1.0,
+      "byproduct_event": {
+        "description": "A genuinely separate, real turnStopTurn DOES fire inside this window as a byproduct of the fragmentation -- NOT the anchor's own would-be sustained dwell, but the SECOND of three rapid dwell/release fragments the report names (0.3s@649.6, 0.588s@650.5, 0.3s@651.8). This is not documented as a named anchor anywhere in the validation report's tables; it was found and verified directly against the report's own described mechanism and against a full-route ground-truth replay. Documented and asserted explicitly here rather than silently passed through, per the task's 'no untested silent events' requirement.",
+        "occurred_mono_time": 651.095991,
+        "detected_mono_time": 652.018953,
+        "dwell_duration_s": 0.587757,
+        "dwell_steering_angle_deg": 44.8,
+        "restart_classification": "sameDirectionTurn"
+      },
+      "anti_vacuity_probe": {
+        "description": "Track dwell state-entry mono times across the window; the report describes the anchor's would-be single 7.1s dwell fragmenting into 'moving/slowing/short dwell/released' cycles instead.",
+        "expected_dwell_entries_mono": [649.6187, 650.5082, 651.7576],
+        "min_fragment_count": 3
+      },
+      "assertion": "No turnStopTurn fires with occurred_mono_time within 1.0s of the anchor (mono 649.0/648.997 move-start) -- proving the anchor's own attempted dwell never survives as itself. The anti-vacuity guard confirms >=3 separate dwell-entry cycles in the window (state fragmentation, matching the report's mechanism). The byproduct event at 651.096 is asserted explicitly (not ignored) as a real, different, v6 raw detection."
+    },
+
+    {
+      "label": "cooldown_pair_731_977_735_289",
+      "kind": "turn_stop_cooldown_pair",
+      "mono_start": 729.8, "mono_end": 737.5,
+      "fires": {
+        "anchor_mono": 731.977,
+        "occurred_mono_time": 731.976856,
+        "detected_mono_time": 734.077121,
+        "dwell_duration_s": 0.469071,
+        "dwell_steering_angle_deg": -410.6,
+        "turn_stop_pre_dwell_progress_deg": 152.2,
+        "turn_stop_post_dwell_progress_deg": 487.1,
+        "restart_classification": "unwind"
+      },
+      "does_not_fire": {
+        "anchor_mono": 735.289,
+        "v5_dwell_s": 1.012,
+        "v5_dwell_angle_deg": 116.6
+      },
+      "assertion": "731.977 is a genuinely NEW v6-only turnStopTurn (absent in the v5 replay) that fires and consumes the shared 8s per-type EVENT_COOLDOWN. 735.289 (dwell physically happens at 734.277-735.289, pre-progress 496.4deg, post-progress growing to 109.2deg by its own 2.1s deadline at 737.389 -- comfortably clearing BOTH progress gates) does NOT fire, purely because 737.389 - 731.977 = 5.41s < 8.0s EVENT_COOLDOWN. This is the ALREADY-ACCEPTED amendment A10 tradeoff ('cooldown-consumed episodes... not new-discard-rule losses'), not a bug and not a gate failure. Do not assert 735.289 fires (it correctly doesn't); do not omit it silently either -- assert its absence explicitly with this documented cause.",
+      "note": "Window intentionally does NOT need to include the earlier 723.690 keep: 731.977 is its OWN cooldown chain-setter (731.977 - 723.690 = 8.287s > 8.0s, already clear regardless), so only 731.977's own ~0.7s of lead-in is required. Verified empirically that starting earlier (~723-728) truncates an unrelated earlier episode mid-flight and produces a spurious extra detection -- avoided by keeping the window this tight."
+    },
+
+    {"label": "keep_83_156",  "kind": "turn_stop_keep", "mono_start": 82.136,  "mono_end": 85.307,  "anchor_mono": 83.156,  "expect_occurred_mono_time": 83.156},
+    {"label": "keep_93_457",  "kind": "turn_stop_keep", "mono_start": 91.837,  "mono_end": 95.618,  "anchor_mono": 93.457,  "expect_occurred_mono_time": 93.457},
+    {"label": "keep_118_199", "kind": "turn_stop_keep", "mono_start": 115.619, "mono_end": 119.299, "anchor_mono": 118.199, "expect_occurred_mono_time": 118.199},
+    {"label": "keep_158_827", "kind": "turn_stop_keep", "mono_start": 157.207, "mono_end": 160.987, "anchor_mono": 158.827, "expect_occurred_mono_time": 158.827},
+    {"label": "keep_173_670", "kind": "turn_stop_keep", "mono_start": 172.650, "mono_end": 175.827, "anchor_mono": 173.670, "expect_occurred_mono_time": 173.670},
+    {"label": "keep_233_417", "kind": "turn_stop_keep", "mono_start": 232.397, "mono_end": 235.568, "anchor_mono": 233.417, "expect_occurred_mono_time": 233.417},
+    {"label": "keep_307_769", "kind": "turn_stop_keep", "mono_start": 306.749, "mono_end": 309.919, "anchor_mono": 307.769, "expect_occurred_mono_time": 307.769},
+    {"label": "keep_355_358", "kind": "turn_stop_keep", "mono_start": 354.338, "mono_end": 357.508, "anchor_mono": 355.358, "expect_occurred_mono_time": 355.358},
+    {"label": "keep_393_396", "kind": "turn_stop_keep", "mono_start": 391.776, "mono_end": 394.567, "anchor_mono": 393.396, "expect_occurred_mono_time": 393.396},
+    {"label": "keep_401_397", "kind": "turn_stop_keep", "mono_start": 398.817, "mono_end": 403.557, "anchor_mono": 401.397, "expect_occurred_mono_time": 401.397},
+    {"label": "keep_487_159", "kind": "turn_stop_keep", "mono_start": 485.539, "mono_end": 489.318, "anchor_mono": 487.159, "expect_occurred_mono_time": 487.159},
+    {"label": "keep_558_667", "kind": "turn_stop_keep", "mono_start": 557.047, "mono_end": 560.817, "anchor_mono": 558.667, "expect_occurred_mono_time": 558.667},
+    {"label": "keep_606_148", "kind": "turn_stop_keep", "mono_start": 605.128, "mono_end": 608.309, "anchor_mono": 606.148, "expect_occurred_mono_time": 606.148},
+    {"label": "keep_626_159", "kind": "turn_stop_keep", "mono_start": 624.539, "mono_end": 628.317, "anchor_mono": 626.159, "expect_occurred_mono_time": 626.159},
+    {"label": "keep_637_387", "kind": "turn_stop_keep", "mono_start": 636.367, "mono_end": 639.537, "anchor_mono": 637.387, "expect_occurred_mono_time": 637.387},
+    {"label": "keep_661_197", "kind": "turn_stop_keep", "mono_start": 660.177, "mono_end": 663.358, "anchor_mono": 661.197, "expect_occurred_mono_time": 661.197},
+    {"label": "keep_676_419", "kind": "turn_stop_keep", "mono_start": 675.399, "mono_end": 678.578, "anchor_mono": 676.419, "expect_occurred_mono_time": 676.419},
+    {"label": "keep_701_168", "kind": "turn_stop_keep", "mono_start": 698.588, "mono_end": 701.787, "anchor_mono": 701.168, "expect_occurred_mono_time": 701.168},
+    {"label": "keep_723_690", "kind": "turn_stop_keep", "mono_start": 721.110, "mono_end": 724.757, "anchor_mono": 723.690, "expect_occurred_mono_time": 723.690}
+  ],
+
+  "short_dwell_population_doc": "Report section C: 25 v5 turnStopTurn total minus the 5 long-dwell rejects = 20 short-dwell (0.3-1.6s, 42-486deg) events. 19/20 fire under v6 (the 19 turn_stop_keep windows above); the 20th (v5 anchor mono 735.289, dwell 1.012s/116.6deg) does NOT fire, but NOT because of the pre/post-progress gates -- see the cooldown_pair_731_977_735_289 window/assertion above for the full mechanism.",
+
+  "old_manifest_decodability_doc": "A separate test (test_old_v5_manifest_lines_still_decode_safely in test_route94_replay.py) constructs 3-4 SYNTHESIZED manifest-shaped dicts (route/event/git identifiers replaced with fixed test strings per amendment A11 -- no real device identifiers are committed) matching the STRUCTURE of a real v5-era manifest line, and does a schema-level capnp round-trip decode check (LateralPayload / DrivingEvent) confirming version<3 / detector_version 2-5 style records decode safely with group_role defaulting to 'primary' and no v6-only fields expected. A full driving_event_indexer.py integration (tmp_path segment trees, real scan_once/rebuild) was judged too heavy for this fixture-focused test file; the schema-level check directly exercises the append-only guarantee this fixture's own v6 records rely on."
+}
