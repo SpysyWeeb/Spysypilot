@@ -1,15 +1,30 @@
+from collections import deque
+
 import pytest
 
+from openpilot.selfdrive.spysypilot import lat_event_detector
 from openpilot.selfdrive.spysypilot.lat_event_detector import (
   DETECTOR_VERSION,
+  DRIVER_AT_START_WINDOW_S,
+  DRIVER_CAUSATION_AUTONOMOUS_ONLY,
+  DRIVER_CAUSATION_DRIVER_CREATED,
+  DRIVER_CAUSATION_INTERVENTION_BACKED,
   DRIVER_CONFOUND_STEERING_PRESSED,
   DRIVER_CONFOUND_TORQUE,
   DRIVER_INTERACTION_CONFIRMED_STEERING_PRESSED,
   DRIVER_INTERACTION_POSSIBLE_RAW_TORQUE,
+  EPISODE_CENTER_CLOSE_S,
+  EPISODE_MAX_LIFETIME_S,
   LateralEventDetector,
   LateralSample,
+  PendingHandoff,
   ROAD_INTERACTION_SUBSTANTIAL,
   ROAD_INTERACTION_TRANSIENT,
+  TURN_STOP_CLUSTER_SELECTION_S,
+  TURN_STOP_MAX_DWELL_S,
+  TURN_STOP_MIN_POST_PROGRESS_DEG,
+  UnwindProgressEpisode,
+  UNWIND_REBOUND_MIN_COMPONENT,
 )
 
 
@@ -123,8 +138,8 @@ def stall_release_event(detector: LateralEventDetector, *,
   return event
 
 
-def test_lateral_detector_version_five():
-  assert DETECTOR_VERSION == 5
+def test_lateral_detector_version_six():
+  assert DETECTOR_VERSION == 6
 
 
 def test_inactive_never_triggers():
@@ -693,15 +708,19 @@ def test_non_hyundai_does_not_reuse_legacy_torque_state_d_as_actual_damping():
 
 
 def unwind_progress_event(*, angle: float = 300.0, driver_assist: bool = False,
-                          road_confounded: bool = False):
+                          road_confounded: bool = False, assist_mode: str | None = None,
+                          assist_at: float = 0.75, sustained_driver_torque: float = 0.0):
   detector = LateralEventDetector(cooldown=0.0)
   expected_direction = -1.0 if angle > 0.0 else 1.0
   reference_rate = -expected_direction
+  if assist_mode is None and driver_assist:
+    assist_mode = "pressed"
   detector.update(sample(
     0.0,
     steering_angle_deg=angle - expected_direction * 10.0,
     steering_rate_deg=-expected_direction * 300.0,
     reference_rate=0.0,
+    driver_torque=sustained_driver_torque,
   ))
   event = None
   for index in range(1, 321):
@@ -718,10 +737,14 @@ def unwind_progress_event(*, angle: float = 300.0, driver_assist: bool = False,
       "reference_target_torque": -0.9,
       "road_confounded": road_confounded,
       "vertical_accel_deviation": 1.8 if road_confounded else 0.0,
+      "driver_torque": sustained_driver_torque,
     }
-    if driver_assist and now >= 0.75:
+    if assist_mode == "pressed" and now >= assist_at:
       kwargs["driver_torque"] = expected_direction * 100.0
       kwargs["steering_pressed"] = True
+      kwargs["steering_rate_deg"] = expected_direction * 180.0
+    elif assist_mode == "raw" and now >= assist_at:
+      kwargs["driver_torque"] = expected_direction * 250.0
       kwargs["steering_rate_deg"] = expected_direction * 180.0
     event = detector.update(sample(now, **kwargs))
     if event is not None:
@@ -731,7 +754,8 @@ def unwind_progress_event(*, angle: float = 300.0, driver_assist: bool = False,
 
 def turn_stop_turn_event(*, movement_rate: float = 120.0, dwell_rate: float = 0.0,
                          release_rate: float = 60.0, angle: float = 120.0,
-                         dwell_s: float = 0.6, driver_before: bool = False,
+                         dwell_s: float = 0.6, movement_s: float = 0.15,
+                         post_sweep_ticks: int = 30, driver_before: bool = False,
                          driver_during: bool = False, driver_after: bool = False,
                          road_confounded: bool = False, demand: bool = True,
                          damping: bool = False):
@@ -739,20 +763,24 @@ def turn_stop_turn_event(*, movement_rate: float = 120.0, dwell_rate: float = 0.
   reference_rate = 0.5 if demand else 0.0
   desired = 0.5 if demand else 0.0
   actual = 0.0 if demand else 0.0
-  detector.update(sample(
-    0.0,
-    steering_angle_deg=angle,
-    steering_rate_deg=movement_rate,
-    reference_rate=reference_rate,
-    desired_lateral_accel=desired,
-    actual_lateral_accel=actual,
-    driver_torque=80.0 if driver_before else 0.0,
-    steering_pressed=driver_before,
-  ))
-  count = int(round(dwell_s / 0.01))
-  for index in range(1, count + 1):
+  movement_count = int(round(movement_s / 0.01))
+  for index in range(movement_count):
+    # The wheel sweeps kinematically into the dwell angle at movement_rate,
+    # so the pre-dwell travel equals movement_rate * movement_s.
     detector.update(sample(
       index * 0.01,
+      steering_angle_deg=angle - movement_rate * (movement_count - index) * 0.01,
+      steering_rate_deg=movement_rate,
+      reference_rate=reference_rate,
+      desired_lateral_accel=desired,
+      actual_lateral_accel=actual,
+      driver_torque=80.0 if driver_before else 0.0,
+      steering_pressed=driver_before,
+    ))
+  count = int(round(dwell_s / 0.01))
+  for index in range(count):
+    detector.update(sample(
+      (movement_count + index) * 0.01,
       steering_angle_deg=angle,
       steering_rate_deg=dwell_rate,
       reference_rate=reference_rate,
@@ -766,10 +794,10 @@ def turn_stop_turn_event(*, movement_rate: float = 120.0, dwell_rate: float = 0.
       road_confounded=road_confounded,
       vertical_accel_deviation=1.7 if road_confounded else 0.0,
     ))
-  release_time = (count + 1) * 0.01
+  release_time = (movement_count + count) * 0.01
   event = detector.update(sample(
     release_time,
-    steering_angle_deg=angle - 1.0,
+    steering_angle_deg=angle,
     steering_rate_deg=release_rate,
     reference_rate=reference_rate,
     desired_lateral_accel=desired,
@@ -788,11 +816,17 @@ def turn_stop_turn_event(*, movement_rate: float = 120.0, dwell_rate: float = 0.
     road_confounded=road_confounded,
     vertical_accel_deviation=1.7 if road_confounded else 0.0,
   ))
+  current_angle = angle
   for index in range(1, 291):
+    rate = release_rate * (1.5 if index <= 10 else 1.0)
+    if index <= post_sweep_ticks:
+      # The post-release tail sweeps consistently with the release rate for
+      # post_sweep_ticks samples, then holds the reached angle.
+      current_angle += rate * 0.01
     event = detector.update(sample(
       release_time + index * 0.01,
-      steering_angle_deg=angle - 1.0,
-      steering_rate_deg=release_rate * (1.5 if index <= 10 else 1.0),
+      steering_angle_deg=current_angle,
+      steering_rate_deg=rate,
       reference_rate=reference_rate,
       desired_lateral_accel=desired,
       actual_lateral_accel=actual,
@@ -905,6 +939,9 @@ def test_turn_stop_turn_detects_one_strong_release():
   assert event.evidence.analysis_window_after_s == 2.0
   assert event.occurred_mono_time == pytest.approx(event.evidence.release_mono_time)
   assert event.detected_mono_time > event.occurred_mono_time
+  assert event.evidence.turn_stop_pre_dwell_progress_deg == pytest.approx(18.0)
+  assert event.evidence.turn_stop_post_dwell_progress_deg == pytest.approx(21.0)
+  assert event.evidence.driver_causation == DRIVER_CAUSATION_AUTONOMOUS_ONLY
 
 
 def test_turn_stop_turn_detects_major_slowdown_without_sub_eight_rate():
@@ -1036,3 +1073,599 @@ def test_short_weak_turn_stop_dwell_is_silent():
     dwell_s=0.2,
     demand=False,
   ) is None
+
+
+# --- v6: turn-stop max-dwell lifetime (design.md section 2 rule 1) ---------
+
+
+def test_turn_stop_dwell_past_max_never_emits():
+  event = turn_stop_turn_event(dwell_s=TURN_STOP_MAX_DWELL_S + 0.45)
+  assert event is None
+
+
+def test_turn_stop_dwell_just_under_max_with_valid_release_emits():
+  event = turn_stop_turn_event(dwell_s=TURN_STOP_MAX_DWELL_S - 0.05)
+  assert event is not None and event.evidence is not None
+  assert event.event_type == "turnStopTurn"
+  assert event.evidence.dwell_duration_s == pytest.approx(TURN_STOP_MAX_DWELL_S - 0.05)
+  assert event.evidence.turn_stop_post_dwell_progress_deg >= TURN_STOP_MIN_POST_PROGRESS_DEG
+
+
+# --- v6: crown-neutral-aware unwind timing (design.md section 1) ----------
+
+
+def crown_offset_unwind_event(*, angle: float, unwind_neutral_torque: float = 0.0):
+  """Like unwind_progress_event, but request/applied torque ramp linearly
+  through the old-turn direction instead of stepping, so a nonzero crown
+  offset measurably shifts the crown-neutral-reach timestamp away from the
+  literal-zero torque crossing (which stays fixed at the ramp midpoint)."""
+  detector = LateralEventDetector(cooldown=0.0)
+  expected_direction = -1.0 if angle > 0.0 else 1.0
+  reference_rate = -expected_direction
+  sign = 1.0 if angle > 0.0 else -1.0
+  detector.update(sample(
+    0.0,
+    steering_angle_deg=angle - expected_direction * 10.0,
+    steering_rate_deg=-expected_direction * 300.0,
+    reference_rate=0.0,
+  ))
+  event = None
+  for index in range(1, 321):
+    now = round(index * 0.01, 2)
+    ramp = min(1.0, max(0.0, now - 0.2))
+    torque = (1.0 - 2.0 * ramp) * sign
+    event = detector.update(sample(
+      now,
+      steering_angle_deg=angle,
+      steering_rate_deg=expected_direction * 100.0,
+      reference_rate=reference_rate,
+      measurement_rate=-0.2 * reference_rate,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+      request_torque=torque,
+      applied_torque=torque,
+      reference_target_torque=-0.9 * sign,
+      unwind_neutral_torque=unwind_neutral_torque * sign,
+    ))
+    if event is not None:
+      return event
+  return event
+
+
+def test_crown_neutral_timestamps_symmetric_across_mirrored_turns():
+  left = crown_offset_unwind_event(angle=300.0, unwind_neutral_torque=0.2)
+  right = crown_offset_unwind_event(angle=-300.0, unwind_neutral_torque=0.2)
+  assert left is not None and left.evidence is not None
+  assert right is not None and right.evidence is not None
+  assert left.evidence.requested_crown_neutral_mono_time == pytest.approx(
+    right.evidence.requested_crown_neutral_mono_time,
+  )
+  assert left.evidence.applied_crown_neutral_mono_time == pytest.approx(
+    right.evidence.applied_crown_neutral_mono_time,
+  )
+  # A nonzero crown offset pulls the crown-reach point away from the
+  # literal-zero torque crossing (fixed at the ramp midpoint, ~0.70).
+  assert abs(
+    left.evidence.requested_crown_neutral_mono_time
+    - left.evidence.requested_torque_neutral_cross_mono_time,
+  ) > 0.05
+  assert abs(
+    left.evidence.applied_crown_neutral_mono_time
+    - left.evidence.applied_torque_neutral_cross_mono_time,
+  ) > 0.05
+
+
+def test_crown_neutral_matches_literal_zero_when_neutral_is_zero():
+  # No-assist path (assist would fire at 0.75, before the applied crown's
+  # 0.10s hold completes at ~0.80 -- A13: applied-crown presence is only
+  # guaranteed for no-assist keeps).
+  event = unwind_progress_event()
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.requested_crown_neutral_mono_time == pytest.approx(
+    evidence.requested_torque_neutral_cross_mono_time, abs=0.015,
+  )
+  assert evidence.applied_crown_neutral_mono_time == pytest.approx(
+    evidence.applied_torque_neutral_cross_mono_time, abs=0.015,
+  )
+
+
+# --- v6: old-torque rebound tracker (design.md section 1.5) ----------------
+
+
+def unwind_rebound_event(*, angle: float = 300.0, rebound: bool = True):
+  """Requested torque releases past crown-neutral (old_turn_sign=+1, neutral=0
+  for angle=300.0) and, when rebound=True, re-excurses into the old-turn
+  direction in two damped cycles (~0.5 then ~0.2 normalized, ~0.35s apart)
+  before settling for good."""
+  detector = LateralEventDetector(cooldown=0.0)
+  expected_direction = -1.0 if angle > 0.0 else 1.0
+  reference_rate = -expected_direction
+  detector.update(sample(
+    0.0,
+    steering_angle_deg=angle - expected_direction * 10.0,
+    steering_rate_deg=-expected_direction * 300.0,
+    reference_rate=0.0,
+  ))
+  event = None
+  for index in range(1, 321):
+    now = round(index * 0.01, 2)
+    if now < 0.60:
+      torque = 0.8
+    elif now < 0.62:
+      torque = -0.30
+    elif rebound and now < 0.66:
+      torque = 0.50
+    elif now < 0.95:
+      torque = -0.30
+    elif rebound and now < 0.98:
+      torque = 0.20
+    else:
+      torque = -0.8
+    event = detector.update(sample(
+      now,
+      steering_angle_deg=angle,
+      steering_rate_deg=expected_direction * 100.0,
+      reference_rate=reference_rate,
+      measurement_rate=-0.2 * reference_rate,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+      request_torque=torque,
+      applied_torque=torque,
+      reference_target_torque=-0.9,
+    ))
+    if event is not None:
+      return event
+  return event
+
+
+def test_unwind_rebound_cycles_are_tracked():
+  event = unwind_rebound_event(rebound=True)
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.unwind_rebound_start_mono_time == pytest.approx(0.62)
+  assert evidence.unwind_rebound_max_magnitude == pytest.approx(0.50)
+  assert evidence.unwind_rebound_max_magnitude > UNWIND_REBOUND_MIN_COMPONENT
+  assert evidence.unwind_rebound_duration_s > 0.0
+  assert evidence.unwind_rebound_same_episode
+
+
+def test_unwind_clean_release_records_no_rebound():
+  event = unwind_rebound_event(rebound=False)
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.unwind_rebound_start_mono_time is None
+  assert evidence.unwind_rebound_max_magnitude == 0.0
+  assert evidence.unwind_rebound_duration_s == 0.0
+
+
+def unwind_rebound_without_genuine_release_event(*, angle: float = 300.0):
+  """Episode arms already near crown-neutral (requested torque starts at
+  0.0, well inside CROWN_NEUTRAL_TOLERANCE) -- there is no genuine prior
+  old-direction hold to release from. A single transient torque bump
+  (ordinary control-loop chatter, not a real hold-then-release) crosses
+  UNWIND_REBOUND_MIN_COMPONENT briefly around t=0.60-0.62 before subsiding
+  back to zero for the rest of the episode."""
+  detector = LateralEventDetector(cooldown=0.0)
+  expected_direction = -1.0 if angle > 0.0 else 1.0
+  reference_rate = -expected_direction
+  detector.update(sample(
+    0.0,
+    steering_angle_deg=angle - expected_direction * 10.0,
+    steering_rate_deg=-expected_direction * 300.0,
+    reference_rate=0.0,
+    request_torque=0.0,
+    applied_torque=0.0,
+  ))
+  event = None
+  for index in range(1, 321):
+    now = round(index * 0.01, 2)
+    torque = 0.15 if 0.60 <= now < 0.62 else 0.0
+    event = detector.update(sample(
+      now,
+      steering_angle_deg=angle,
+      steering_rate_deg=expected_direction * 100.0,
+      reference_rate=reference_rate,
+      measurement_rate=-0.2 * reference_rate,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+      request_torque=torque,
+      applied_torque=torque,
+      reference_target_torque=-0.9,
+    ))
+    if event is not None:
+      return event
+  return event
+
+
+def test_rebound_does_not_arm_without_a_genuine_prior_hold():
+  # Fix 3 (minor, confirmed): rebound_armed_mono_time used to be set the
+  # FIRST time requested_component dropped below CROWN_NEUTRAL_TOLERANCE,
+  # with no check that old-direction torque was ever genuinely held above
+  # tolerance first. An episode that arms already near crown-neutral would
+  # then misrepresent a later transient chatter bump (never a real hold then
+  # release) as a "rebound". Pre-fix this scenario would report
+  # unwind_rebound_start_mono_time ~= 0.60 and unwind_rebound_max_magnitude
+  # ~= 0.15; post-fix, since old-direction torque was never held above
+  # tolerance before that bump, no rebound is armed in time to record it.
+  event = unwind_rebound_without_genuine_release_event()
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.unwind_rebound_start_mono_time is None
+  assert evidence.unwind_rebound_max_magnitude == 0.0
+  assert evidence.unwind_rebound_duration_s == 0.0
+
+
+# --- v6 fix: crown/rebound bookkeeping must not be skipped when a
+# higher-priority detector (crossing/handoff) claims the emission slot ------
+
+
+def test_crown_rebound_bookkeeping_advances_on_a_sample_claimed_by_handoff():
+  # Fix 2 (major, empirically reproduced): update() ran a priority chain
+  # (_update_pending_crossing, then _update_pending_handoff, then
+  # _update_unwind_progress) where at most one detector's update path ran
+  # per sample. The crown-neutral/rebound tracker lives entirely inside
+  # _update_unwind_progress, so whenever a pending crossing/handoff resolved
+  # on a sample where an unwind episode was ALSO active, the crown/rebound
+  # bookkeeping (and the previous_mono_time/previous_request_torque/
+  # previous_applied_torque advance it depends on) silently skipped that
+  # sample -- corrupting the next real invocation's delta.
+  #
+  # This constructs the shared-sample scenario directly (an already-mid-
+  # flight UnwindProgressEpisode plus a PendingHandoff about to resolve) so
+  # the exact sample-skip can be pinned deterministically. Pre-fix, this
+  # test fails: nothing below ever runs `_update_unwind_crown_tracking` for
+  # the handoff-claimed sample, so `previous_mono_time` stays stuck at 10.00
+  # and `rebound_duration_s` stays 0.0 (the genuine 0.01s the signal spent
+  # above UNWIND_REBOUND_MIN_COMPONENT between 10.00 and 10.01 is dropped
+  # entirely, on both the shared sample and the following real invocation).
+  detector = LateralEventDetector(cooldown=0.0)
+  episode = UnwindProgressEpisode(
+    start_mono_time=9.0,
+    initial_steering_angle_deg=300.0,
+    peak_steering_angle_deg=300.0,
+    expected_direction=-1,
+    expected_rate_deg_s=112.5,
+    episode_start_snapshot=9.0,
+    old_turn_sign=1.0,
+    previous_request_torque=0.15,
+    previous_applied_torque=0.15,
+    previous_mono_time=10.00,
+    recent_toward_rates=deque(),
+    rebound_armed_mono_time=9.50,
+    rebound_start_mono_time=9.55,
+    rebound_max_magnitude=0.15,
+    rebound_same_episode=True,
+    rebound_previous_above=True,
+    held_old_direction_before_release=True,
+  )
+  detector.unwind_progress_episode = episode
+  detector.pending_handoff = PendingHandoff(
+    mono_time=9.50,
+    episode_start=9.0,
+    previous_phase=0.0,
+    previous_same_episode=False,
+    peak_abs_rate_deg=100.0,
+    peak_tracking_error=0.5,
+    peak_applied_target_gap=0.3,
+  )
+
+  # Shared sample: a handoff resolves (claims the emission slot) while the
+  # unwind episode is genuinely still mid-rebound (component 0.15 stays
+  # above UNWIND_REBOUND_MIN_COMPONENT=0.10).
+  shared = sample(
+    10.01,
+    steering_angle_deg=300.0,
+    steering_rate_deg=-100.0,
+    reference_rate=1.0,
+    unwind_effective_phase=0.9,
+    reference_sustained_unwind_scale=0.9,
+    request_torque=0.15,
+    applied_torque=0.15,
+    unwind_neutral_torque=0.0,
+  )
+  detection = detector.update(shared)
+  assert detection is not None and detection.event_type == "handoffMismatch"
+
+  assert episode.previous_mono_time == pytest.approx(10.01)
+  assert episode.rebound_duration_s == pytest.approx(0.01)
+  assert episode.rebound_previous_above
+
+  # The next (uncontested) invocation drops back below the rebound
+  # threshold. The total rebound_duration_s must already reflect the shared
+  # sample's contribution -- it must NOT change here, and previous_mono_time
+  # must advance from the shared sample's time, not from the stale 10.00.
+  followup = sample(
+    10.02,
+    steering_angle_deg=300.0,
+    steering_rate_deg=-100.0,
+    reference_rate=1.0,
+    unwind_effective_phase=0.9,
+    reference_sustained_unwind_scale=0.9,
+    request_torque=0.02,
+    applied_torque=0.02,
+    unwind_neutral_torque=0.0,
+  )
+  detector.update(followup)
+  assert episode.rebound_duration_s == pytest.approx(0.01)
+  assert not episode.rebound_previous_above
+  assert episode.previous_mono_time == pytest.approx(10.02)
+
+
+# --- v6: driver causation vs rescue (design.md section 6, amendment A5) ---
+
+
+def test_pressed_assist_rescue_is_intervention_backed():
+  event = unwind_progress_event(driver_assist=True)
+  assert event is not None and event.evidence is not None
+  assert event.evidence.driver_causation == DRIVER_CAUSATION_INTERVENTION_BACKED
+  assert event.evidence.driver_assisted_unwind
+  assert event.confidence == pytest.approx(0.95)
+  assert not event.evidence.driver_assist_raw_torque_only
+
+
+def test_raw_torque_assist_rescue_is_intervention_backed_raw_only():
+  event = unwind_progress_event(assist_mode="raw", assist_at=0.75)
+  assert event is not None and event.evidence is not None
+  assert event.evidence.driver_causation == DRIVER_CAUSATION_INTERVENTION_BACKED
+  assert event.evidence.driver_assist_raw_torque_only
+
+
+def test_sustained_driver_torque_throughout_is_driver_created():
+  event = unwind_progress_event(sustained_driver_torque=80.0)
+  assert event is not None and event.evidence is not None
+  assert event.evidence.driver_causation == DRIVER_CAUSATION_DRIVER_CREATED
+  assert event.evidence.driver_confounded_any
+
+
+def test_rescue_shortly_after_deficit_start_is_still_intervention_backed():
+  # A5: driver_active_at_deficit_start only looks BACKWARD from deficit
+  # start. Find where the deficit starts for the default no-assist profile,
+  # then land the press just after it (well inside DRIVER_AT_START_WINDOW_S)
+  # to prove the one-sided window does not misclassify a near-immediate
+  # rescue as "active at start".
+  probe = unwind_progress_event()
+  assert probe is not None and probe.evidence is not None
+  deficit_start = probe.evidence.unwind_deficit_start_mono_time
+  assist_at = round(deficit_start + DRIVER_AT_START_WINDOW_S / 2.0, 2)
+  assert deficit_start < assist_at <= deficit_start + DRIVER_AT_START_WINDOW_S
+
+  event = unwind_progress_event(assist_mode="pressed", assist_at=assist_at)
+  assert event is not None and event.evidence is not None
+  assert not event.evidence.driver_active_at_deficit_start
+  assert event.evidence.driver_causation == DRIVER_CAUSATION_INTERVENTION_BACKED
+
+
+# --- v6: road confounding placement (design.md section 7, amendment A7) ---
+
+
+def test_road_confounded_assist_deficit_still_emits_at_full_confidence():
+  event = unwind_progress_event(driver_assist=True, road_confounded=True)
+  assert event is not None and event.evidence is not None
+  assert event.event_type == "unwindProgressDeficit"
+  assert event.confidence == pytest.approx(0.95)
+  assert event.evidence.road_confounded_fraction > 0.0
+  assert event.evidence.max_vertical_accel_deviation > 0.0
+
+
+def test_road_confounded_non_assist_deficit_records_metrics_without_penalty():
+  # The road confidence penalty (A7) is applied daemon-side in Stage B, not
+  # in the detector; the no-assist literal confidence (0.90) is unchanged.
+  event = unwind_progress_event(road_confounded=True)
+  assert event is not None and event.evidence is not None
+  assert event.confidence == pytest.approx(0.90)
+  assert event.evidence.road_confounded_fraction > 0.0
+  assert event.evidence.max_vertical_accel_deviation > 0.0
+
+
+# --- v6: episode identity, re-arm guard, lifetime cap (section 3, A2) -----
+
+
+def test_turn_stop_event_keeps_snapshot_key_after_wheel_recenters():
+  # The dwell/release is identical to the default turn_stop_turn_event
+  # scenario (movement_rate=120, angle=120, dwell_s=0.6) up to release, then
+  # the wheel is swept straight back through center and held there long
+  # enough to close the detector's live episode BEFORE the pending
+  # candidate's 2.1s cluster deadline elapses. The emitted evidence must
+  # still carry the key that was live when the turn-stop episode was
+  # created (occurrence time), not the live (closed) state at emission.
+  detector = LateralEventDetector(cooldown=0.0)
+  angle = 120.0
+  movement_rate = 120.0
+  movement_count = 15
+  for index in range(movement_count):
+    detector.update(sample(
+      index * 0.01,
+      steering_angle_deg=angle - movement_rate * (movement_count - index) * 0.01,
+      steering_rate_deg=movement_rate,
+      reference_rate=0.5,
+      desired_lateral_accel=0.5,
+      actual_lateral_accel=0.0,
+    ))
+  dwell_count = 60
+  for index in range(dwell_count):
+    detector.update(sample(
+      (movement_count + index) * 0.01,
+      steering_angle_deg=angle,
+      steering_rate_deg=0.0,
+      reference_rate=0.5,
+      desired_lateral_accel=0.5,
+      actual_lateral_accel=0.0,
+      request_torque=0.9,
+      applied_torque=0.85,
+      reference_target_torque=0.8,
+    ))
+  release_time = (movement_count + dwell_count) * 0.01
+  event = detector.update(sample(
+    release_time,
+    steering_angle_deg=angle,
+    steering_rate_deg=60.0,
+    reference_rate=0.5,
+    desired_lateral_accel=0.5,
+    actual_lateral_accel=0.0,
+    request_torque=0.7,
+    applied_torque=0.7,
+    reference_target_torque=0.75,
+  ))
+  assert event is None
+  assert detector.episode_start == pytest.approx(0.0)
+
+  # Sweep straight back through center (large post-release progress, easily
+  # clearing TURN_STOP_MIN_POST_PROGRESS_DEG) then hold at 0 well past
+  # EPISODE_CENTER_CLOSE_S so the live episode closes.
+  t = release_time
+  for index in range(1, 41):
+    t = round(release_time + index * 0.01, 2)
+    event = detector.update(sample(
+      t,
+      steering_angle_deg=angle - 3.0 * index,
+      steering_rate_deg=-300.0,
+      reference_rate=0.0,
+      desired_lateral_accel=0.0,
+      actual_lateral_accel=0.0,
+    )) or event
+  hold_ticks = int(round((EPISODE_CENTER_CLOSE_S + 0.3) / 0.01))
+  for _ in range(hold_ticks):
+    t = round(t + 0.01, 2)
+    event = detector.update(sample(
+      t,
+      steering_angle_deg=0.0,
+      steering_rate_deg=0.0,
+      reference_rate=0.0,
+      desired_lateral_accel=0.0,
+      actual_lateral_accel=0.0,
+    )) or event
+  assert detector.episode_start is None  # live episode closed before deadline
+
+  deadline = release_time + TURN_STOP_CLUSTER_SELECTION_S
+  while t < deadline + 0.05:
+    t = round(t + 0.01, 2)
+    event = detector.update(sample(
+      t,
+      steering_angle_deg=0.0,
+      steering_rate_deg=0.0,
+      reference_rate=0.0,
+      desired_lateral_accel=0.0,
+      actual_lateral_accel=0.0,
+    )) or event
+
+  assert event is not None and event.evidence is not None
+  assert event.event_type == "turnStopTurn"
+  assert event.evidence.episode_start_mono_time == pytest.approx(0.0)
+  assert event.evidence.episode_key == "lat:0"
+  assert detector.episode_start is None  # confirms the live state had moved on
+
+
+def test_episode_rearm_guard_blocks_tracking_active_alone_near_center():
+  detector = LateralEventDetector(cooldown=0.0)
+  detector.update(sample(0.0, steering_angle_deg=30.0, steering_rate_deg=60.0, reference_rate=0.0))
+  assert detector.episode_start == pytest.approx(0.0)
+
+  close_ticks = int(round((EPISODE_CENTER_CLOSE_S + 0.1) / 0.01))
+  now = 0.0
+  for index in range(1, close_ticks + 1):
+    now = round(index * 0.01, 2)
+    detector.update(sample(now, steering_angle_deg=0.0, steering_rate_deg=0.0, reference_rate=0.0))
+  assert detector.episode_start is None
+
+  # tracking_active alone (reference_rate spike) must NOT re-arm while the
+  # wheel stays centered (A2 churn guard) -- true on every sample, not just
+  # the last one.
+  for index in range(close_ticks + 1, close_ticks + 61):
+    now = round(index * 0.01, 2)
+    detector.update(sample(now, steering_angle_deg=0.0, steering_rate_deg=0.0, reference_rate=0.5))
+    assert detector.episode_start is None
+
+  # Real motion resumes: a fresh episode identity is stamped.
+  now = round(now + 0.01, 2)
+  detector.update(sample(now, steering_angle_deg=30.0, steering_rate_deg=60.0, reference_rate=0.0))
+  assert detector.episode_start == pytest.approx(now)
+
+
+def test_episode_lifetime_cap_forces_reset_after_max_lifetime():
+  detector = LateralEventDetector(cooldown=0.0)
+  detector.update(sample(0.0, steering_angle_deg=30.0, steering_rate_deg=0.0, reference_rate=0.0))
+  first_start = detector.episode_start
+  assert first_start == pytest.approx(0.0)
+
+  now = 0.0
+  ticks_to_boundary = int(round(EPISODE_MAX_LIFETIME_S / 0.1))
+  for index in range(1, ticks_to_boundary + 1):
+    now = round(index * 0.1, 1)
+    detector.update(sample(now, steering_angle_deg=30.0, steering_rate_deg=0.0, reference_rate=0.0))
+    assert detector.episode_start == pytest.approx(first_start)
+
+  now = round(now + 0.1, 1)
+  assert now > EPISODE_MAX_LIFETIME_S
+  detector.update(sample(now, steering_angle_deg=30.0, steering_rate_deg=0.0, reference_rate=0.0))
+  assert detector.episode_start == pytest.approx(now)
+  assert detector.episode_start != pytest.approx(first_start)
+
+
+# --- v6: route discontinuity reset (section 2 rule 5, amendment A8) -------
+
+
+def test_backwards_discontinuity_resets_cooldown_and_history_with_default_cooldown():
+  # Uses the DEFAULT cooldown (not cooldown=0.0): without reset_discontinuity()
+  # clearing last_event_times, a backwards jump leaves a future-stamped
+  # cooldown entry that would suppress this event type forever (every later
+  # delta stays negative, which always satisfies "< cooldown").
+  detector = LateralEventDetector()
+  event = None
+  for index in range(102):
+    t = round(699.0 + index * 0.01, 2)
+    event = detector.update(sample(
+      t,
+      steering_angle_deg=90.0,
+      steering_rate_deg=0.0,
+      reference_rate=0.5,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+    )) or event
+  assert event is not None and event.event_type == "lateUnwind"
+  assert event.occurred_mono_time == pytest.approx(700.01)
+
+  event2 = None
+  for index in range(102):
+    t = round(60.0 + index * 0.01, 2)
+    event2 = detector.update(sample(
+      t,
+      steering_angle_deg=90.0,
+      steering_rate_deg=0.0,
+      reference_rate=0.5,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+    )) or event2
+  assert event2 is not None and event2.event_type == "lateUnwind"
+  assert event2.occurred_mono_time == pytest.approx(61.01)
+  # No pre-gap history leaked into the post-gap evidence window.
+  assert event2.evidence is not None
+  assert event2.evidence.evidence_start_mono_time == pytest.approx(60.0)
+  assert event2.evidence.evidence_start_mono_time >= 60.0
+
+
+# --- v6: road-evidence window clamped to retained history (section 7, A6) -
+
+
+def test_road_evidence_window_clamped_to_trimmed_history(monkeypatch):
+  # Fix 4 / amendment A6 (test-coverage gap): road_evidence_window_start_
+  # mono_time must be clamped to max(min(episode_start_snapshot,
+  # evidence_start), history[0][0]) -- the serialized window must never
+  # claim coverage the retained history ring didn't actually have. Shrinking
+  # EVIDENCE_HISTORY_S makes the ring actually TRIM mid-scenario (not merely
+  # run out from route start, which every early-route test already exercises
+  # trivially): the naive window start here is episode_start_mono_time=0.0,
+  # but by the time the no-assist deficit fires (~2.5s later) the trimmed
+  # history ring only goes back to ~1.52s, so the clamp must win.
+  monkeypatch.setattr(lat_event_detector, "EVIDENCE_HISTORY_S", 1.0)
+  event = unwind_progress_event()
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.episode_start_mono_time == pytest.approx(0.0)
+
+  naive_window_start = min(evidence.episode_start_mono_time, event.occurred_mono_time - 6.0)
+  assert naive_window_start < evidence.episode_start_mono_time
+  assert evidence.road_evidence_window_start_mono_time is not None
+  assert evidence.road_evidence_window_start_mono_time > evidence.episode_start_mono_time
+  assert evidence.road_evidence_window_start_mono_time != pytest.approx(naive_window_start)
+  assert evidence.road_evidence_window_start_mono_time == pytest.approx(1.52)
