@@ -463,13 +463,15 @@ class UnwindProgressEpisode:
   wheel_progress_5_mono_time: float | None = None
   wheel_progress_20_mono_time: float | None = None
   wheel_progress_50_mono_time: float | None = None
-  # v6: old-torque rebound tracker (armed at first requested crown candidate).
+  # v6: old-torque rebound tracker (armed at first requested crown candidate,
+  # but only once a genuine prior old-direction hold has been observed).
   rebound_armed_mono_time: float | None = None
   rebound_start_mono_time: float | None = None
   rebound_max_magnitude: float = 0.0
   rebound_duration_s: float = 0.0
   rebound_same_episode: bool = False
   rebound_previous_above: bool = False
+  held_old_direction_before_release: bool = False
   # v6: crown/high-angle trigger snapshots.
   trigger_unwind_neutral_torque: float = 0.0
   trigger_unwind_phase_direction: float = 0.0
@@ -1611,6 +1613,12 @@ class LateralEventDetector:
     requested_component = self._old_direction_component(
       sample.request_torque, sample.unwind_neutral_torque, episode.old_turn_sign,
     )
+    if requested_component >= CROWN_NEUTRAL_TOLERANCE:
+      # A genuine old-direction hold has now been observed; only after this
+      # may the rebound tracker arm (Fix 3 -- otherwise an episode that arms
+      # already near crown-neutral would misrepresent ordinary control-loop
+      # torque chatter as a "rebound" from a release that never happened).
+      episode.held_old_direction_before_release = True
     if requested_component < CROWN_NEUTRAL_TOLERANCE:
       if episode.requested_crown_candidate_start is None:
         episode.requested_crown_candidate_start = sample.mono_time
@@ -1637,9 +1645,11 @@ class LateralEventDetector:
       episode.applied_crown_candidate_start = None
 
     # Rebound tracker arms at the first requested crown-neutral candidate (no
-    # hold requirement) and then watches for old-direction re-excursions.
+    # hold requirement) and then watches for old-direction re-excursions --
+    # but only once a genuine prior old-direction hold has actually been
+    # observed (Fix 3); otherwise there was never a "release" to rebound from.
     if episode.rebound_armed_mono_time is None:
-      if requested_component < CROWN_NEUTRAL_TOLERANCE:
+      if episode.held_old_direction_before_release and requested_component < CROWN_NEUTRAL_TOLERANCE:
         episode.rebound_armed_mono_time = sample.mono_time
       return
     if requested_component > UNWIND_REBOUND_MIN_COMPONENT:
@@ -1719,6 +1729,40 @@ class LateralEventDetector:
       causation = DRIVER_CAUSATION_MIXED
     return DriverCausationSummary(causation=causation)
 
+  def _advance_unwind_episode(self, episode: UnwindProgressEpisode, sample: LateralSample) -> None:
+    """Per-sample state advancement for an ACTIVE unwind episode: the literal-
+    zero neutral-cross interpolation, the crown-neutral/rebound tracker, and
+    the previous_*/previous_mono_time bookkeeping they depend on.
+
+    This must run on EVERY sample while an episode is active, independent of
+    which detector (if any) wins the emission-priority slot that sample. It
+    is called from two places: normally, inline from `_update_unwind_progress`
+    when the priority chain reaches it uncontested; and directly from
+    `update()` when a higher-priority detector (pending crossing/handoff)
+    claims the emission slot instead, so this bookkeeping is never silently
+    skipped -- a skipped sample would otherwise leave `previous_mono_time`
+    stale, and the NEXT real invocation would compute its hold/rebound deltas
+    across the wrong (too-wide) gap, lumping the skipped sample's real signal
+    change into the wrong bucket."""
+    if episode.requested_neutral_cross_mono_time is None:
+      episode.requested_neutral_cross_mono_time = self._interpolated_neutral_cross(
+        episode.previous_mono_time,
+        episode.previous_request_torque,
+        sample.mono_time,
+        sample.request_torque,
+      )
+    if episode.applied_neutral_cross_mono_time is None:
+      episode.applied_neutral_cross_mono_time = self._interpolated_neutral_cross(
+        episode.previous_mono_time,
+        episode.previous_applied_torque,
+        sample.mono_time,
+        sample.applied_torque,
+      )
+    self._update_unwind_crown_tracking(episode, sample)
+    episode.previous_request_torque = sample.request_torque
+    episode.previous_applied_torque = sample.applied_torque
+    episode.previous_mono_time = sample.mono_time
+
   def _update_unwind_progress(self, sample: LateralSample, previous_phase: float,
                               previous_same_episode: bool) -> LateralDetection | None:
     if (
@@ -1793,24 +1837,7 @@ class LateralEventDetector:
       sample.applied_target_gap,
     )
 
-    if episode.requested_neutral_cross_mono_time is None:
-      episode.requested_neutral_cross_mono_time = self._interpolated_neutral_cross(
-        episode.previous_mono_time,
-        episode.previous_request_torque,
-        sample.mono_time,
-        sample.request_torque,
-      )
-    if episode.applied_neutral_cross_mono_time is None:
-      episode.applied_neutral_cross_mono_time = self._interpolated_neutral_cross(
-        episode.previous_mono_time,
-        episode.previous_applied_torque,
-        sample.mono_time,
-        sample.applied_torque,
-      )
-    self._update_unwind_crown_tracking(episode, sample)
-    episode.previous_request_torque = sample.request_torque
-    episode.previous_applied_torque = sample.applied_torque
-    episode.previous_mono_time = sample.mono_time
+    self._advance_unwind_episode(episode, sample)
 
     elapsed = max(0.0, sample.mono_time - episode.start_mono_time)
     expected_progress = min(
@@ -2274,7 +2301,16 @@ class LateralEventDetector:
     detection = self._update_pending_crossing(sample)
     if detection is None:
       detection = self._update_pending_handoff(sample)
-    if detection is None:
+    if detection is not None:
+      # A higher-priority detector (crossing/handoff) claimed this sample's
+      # emission slot, so _update_unwind_progress never runs -- but an
+      # active episode's crown-neutral/rebound bookkeeping must still
+      # advance every sample regardless of which detector emits, or it
+      # silently skips real signal changes on shared samples (fix: decouple
+      # state advancement from emission priority).
+      if self.unwind_progress_episode is not None:
+        self._advance_unwind_episode(self.unwind_progress_episode, sample)
+    else:
       detection = self._update_unwind_progress(
         sample,
         previous_phase,

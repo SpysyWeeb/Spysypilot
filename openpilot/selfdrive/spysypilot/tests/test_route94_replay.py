@@ -67,7 +67,10 @@ WINDOWS_BY_LABEL = {window["label"]: window for window in META["windows"]}
 
 def _load_fixture_rows() -> list[dict[str, str]]:
   compressed = (DATA_DIR / META["fixture_csv"]).read_bytes()
-  csv_bytes = zstandard.ZstdDecompressor().stream_reader(compressed).read()
+  # Bounded decompression (matches the sibling extraction-script convention
+  # elsewhere in this project family); harmless here since this is trusted,
+  # committed first-party test data, but free to keep consistent.
+  csv_bytes = zstandard.ZstdDecompressor().decompress(compressed, max_output_size=2 * 1024**3)
   return list(csv.DictReader(io.StringIO(csv_bytes.decode("utf-8"))))
 
 

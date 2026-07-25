@@ -223,6 +223,37 @@ def test_group_key_last_seen_refresh_is_monotone_under_out_of_order_occurrence()
   assert third.group_id == first.group_id
 
 
+def test_brand_new_key_far_in_the_past_mints_a_new_group():
+  # Fix 1 (major, empirically reproduced): the brand-new-key chain check
+  # compared occurred_mono_time - group_last_time <= group_window_ns with NO
+  # lower bound. A candidate whose occurred_mono_time is far EARLIER than the
+  # running group's last-seen time produces a large NEGATIVE delta, which is
+  # trivially <= any positive window -- so it always "passed" and incorrectly
+  # joined the running group, even when the two candidates are a genuinely
+  # separate maneuver 50s apart. Bug reproduced: under the pre-fix one-sided
+  # comparison, `second.group_id` would wrongly equal `first.group_id` here.
+  recorder = EventRecorder()
+  first = recorder.accept(EventCandidate(
+    200_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "first", episode_key="lat:first",
+  ))
+  second = recorder.accept(EventCandidate(
+    150_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "second", episode_key="lat:second",
+  ))
+  assert second.group_id != first.group_id
+
+
+def test_keyless_candidate_far_in_the_past_mints_a_new_group():
+  # Fix 1, keyless path: the same one-sided comparison bug (as an inverted OR
+  # condition) let a far-in-the-past keyless (manual) candidate silently join
+  # the running group instead of minting a new one.
+  recorder = EventRecorder()
+  first = recorder.accept(manual_candidate(200_000_000_000))
+  second = recorder.accept(manual_candidate(150_000_000_000))
+  assert second.group_id != first.group_id
+
+
 def test_group_hard_lifetime_splits_a_pathological_same_key_chain():
   # A3: exact-key reuse alone would chain a same-key stream forever; the
   # hard GROUP_MAX_LIFETIME_NS cap must split it and re-bind the key.

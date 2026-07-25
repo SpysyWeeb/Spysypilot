@@ -116,6 +116,18 @@ class EventRecorder:
     return group_id
 
   def _group_expired(self, group_id: str, occurred_mono_time: int) -> bool:
+    # Intentionally one-sided (forward-only): this expresses "has the group's
+    # OWN lifetime, measured forward from its first-seen time, overflowed" --
+    # the pathological-long-chain case (test_group_hard_lifetime_splits_a_
+    # pathological_same_key_chain). It is only ever consulted (a) after the
+    # window check below, which already uses abs() and rejects anything far
+    # in the past, or (b) from the existing-key rebind path, where exact-key
+    # match is itself the relatedness proof (A3) and an out-of-order-but-
+    # earlier occurred time for the SAME key is expected (detection lag), not
+    # a sign the group is stale. Making this symmetric would wrongly split a
+    # still-live same-key group whenever a late-arriving-but-earlier-occurred
+    # member showed up (see test_group_key_last_seen_refresh_is_monotone_
+    # under_out_of_order_occurrence).
     first_time = self._group_first_time.get(group_id)
     return first_time is None or occurred_mono_time - first_time > GROUP_MAX_LIFETIME_NS
 
@@ -128,9 +140,15 @@ class EventRecorder:
         # lifetime; otherwise mint a new group. No idle-staleness test is
         # applied to an EXISTING key's binding below — exact-key match is
         # itself the relatedness proof (A3).
+        # abs() here: candidates from different detectors reach accept() in
+        # different update() calls with different detection lag, so a later
+        # accept() can carry an EARLIER occurred_mono_time (A3) -- a one-sided
+        # check would let anything arbitrarily far in the PAST always satisfy
+        # "<= window" (a negative delta is trivially <= a positive window),
+        # incorrectly chaining unrelated maneuvers minutes apart.
         if (
           self._group_id
-          and candidate.occurred_mono_time - self._group_last_time <= self.group_window_ns
+          and abs(candidate.occurred_mono_time - self._group_last_time) <= self.group_window_ns
           and not self._group_expired(self._group_id, candidate.occurred_mono_time)
         ):
           group_id = self._group_id
@@ -147,7 +165,7 @@ class EventRecorder:
         self._episode_groups[candidate.episode_key] = (group_id, max(last_seen, candidate.occurred_mono_time))
     elif (
       not self._group_id
-      or candidate.occurred_mono_time - self._group_last_time > self.group_window_ns
+      or abs(candidate.occurred_mono_time - self._group_last_time) > self.group_window_ns
       or self._group_expired(self._group_id, candidate.occurred_mono_time)
     ):
       self._group_id = self._mint_group(candidate.occurred_mono_time)

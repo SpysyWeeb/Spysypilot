@@ -1,5 +1,8 @@
+from collections import deque
+
 import pytest
 
+from openpilot.selfdrive.spysypilot import lat_event_detector
 from openpilot.selfdrive.spysypilot.lat_event_detector import (
   DETECTOR_VERSION,
   DRIVER_AT_START_WINDOW_S,
@@ -14,11 +17,13 @@ from openpilot.selfdrive.spysypilot.lat_event_detector import (
   EPISODE_MAX_LIFETIME_S,
   LateralEventDetector,
   LateralSample,
+  PendingHandoff,
   ROAD_INTERACTION_SUBSTANTIAL,
   ROAD_INTERACTION_TRANSIENT,
   TURN_STOP_CLUSTER_SELECTION_S,
   TURN_STOP_MAX_DWELL_S,
   TURN_STOP_MIN_POST_PROGRESS_DEG,
+  UnwindProgressEpisode,
   UNWIND_REBOUND_MIN_COMPONENT,
 )
 
@@ -1234,6 +1239,159 @@ def test_unwind_clean_release_records_no_rebound():
   assert evidence.unwind_rebound_duration_s == 0.0
 
 
+def unwind_rebound_without_genuine_release_event(*, angle: float = 300.0):
+  """Episode arms already near crown-neutral (requested torque starts at
+  0.0, well inside CROWN_NEUTRAL_TOLERANCE) -- there is no genuine prior
+  old-direction hold to release from. A single transient torque bump
+  (ordinary control-loop chatter, not a real hold-then-release) crosses
+  UNWIND_REBOUND_MIN_COMPONENT briefly around t=0.60-0.62 before subsiding
+  back to zero for the rest of the episode."""
+  detector = LateralEventDetector(cooldown=0.0)
+  expected_direction = -1.0 if angle > 0.0 else 1.0
+  reference_rate = -expected_direction
+  detector.update(sample(
+    0.0,
+    steering_angle_deg=angle - expected_direction * 10.0,
+    steering_rate_deg=-expected_direction * 300.0,
+    reference_rate=0.0,
+    request_torque=0.0,
+    applied_torque=0.0,
+  ))
+  event = None
+  for index in range(1, 321):
+    now = round(index * 0.01, 2)
+    torque = 0.15 if 0.60 <= now < 0.62 else 0.0
+    event = detector.update(sample(
+      now,
+      steering_angle_deg=angle,
+      steering_rate_deg=expected_direction * 100.0,
+      reference_rate=reference_rate,
+      measurement_rate=-0.2 * reference_rate,
+      reference_sustained_unwind_scale=0.9,
+      unwind_effective_phase=0.9,
+      request_torque=torque,
+      applied_torque=torque,
+      reference_target_torque=-0.9,
+    ))
+    if event is not None:
+      return event
+  return event
+
+
+def test_rebound_does_not_arm_without_a_genuine_prior_hold():
+  # Fix 3 (minor, confirmed): rebound_armed_mono_time used to be set the
+  # FIRST time requested_component dropped below CROWN_NEUTRAL_TOLERANCE,
+  # with no check that old-direction torque was ever genuinely held above
+  # tolerance first. An episode that arms already near crown-neutral would
+  # then misrepresent a later transient chatter bump (never a real hold then
+  # release) as a "rebound". Pre-fix this scenario would report
+  # unwind_rebound_start_mono_time ~= 0.60 and unwind_rebound_max_magnitude
+  # ~= 0.15; post-fix, since old-direction torque was never held above
+  # tolerance before that bump, no rebound is armed in time to record it.
+  event = unwind_rebound_without_genuine_release_event()
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.unwind_rebound_start_mono_time is None
+  assert evidence.unwind_rebound_max_magnitude == 0.0
+  assert evidence.unwind_rebound_duration_s == 0.0
+
+
+# --- v6 fix: crown/rebound bookkeeping must not be skipped when a
+# higher-priority detector (crossing/handoff) claims the emission slot ------
+
+
+def test_crown_rebound_bookkeeping_advances_on_a_sample_claimed_by_handoff():
+  # Fix 2 (major, empirically reproduced): update() ran a priority chain
+  # (_update_pending_crossing, then _update_pending_handoff, then
+  # _update_unwind_progress) where at most one detector's update path ran
+  # per sample. The crown-neutral/rebound tracker lives entirely inside
+  # _update_unwind_progress, so whenever a pending crossing/handoff resolved
+  # on a sample where an unwind episode was ALSO active, the crown/rebound
+  # bookkeeping (and the previous_mono_time/previous_request_torque/
+  # previous_applied_torque advance it depends on) silently skipped that
+  # sample -- corrupting the next real invocation's delta.
+  #
+  # This constructs the shared-sample scenario directly (an already-mid-
+  # flight UnwindProgressEpisode plus a PendingHandoff about to resolve) so
+  # the exact sample-skip can be pinned deterministically. Pre-fix, this
+  # test fails: nothing below ever runs `_update_unwind_crown_tracking` for
+  # the handoff-claimed sample, so `previous_mono_time` stays stuck at 10.00
+  # and `rebound_duration_s` stays 0.0 (the genuine 0.01s the signal spent
+  # above UNWIND_REBOUND_MIN_COMPONENT between 10.00 and 10.01 is dropped
+  # entirely, on both the shared sample and the following real invocation).
+  detector = LateralEventDetector(cooldown=0.0)
+  episode = UnwindProgressEpisode(
+    start_mono_time=9.0,
+    initial_steering_angle_deg=300.0,
+    peak_steering_angle_deg=300.0,
+    expected_direction=-1,
+    expected_rate_deg_s=112.5,
+    episode_start_snapshot=9.0,
+    old_turn_sign=1.0,
+    previous_request_torque=0.15,
+    previous_applied_torque=0.15,
+    previous_mono_time=10.00,
+    recent_toward_rates=deque(),
+    rebound_armed_mono_time=9.50,
+    rebound_start_mono_time=9.55,
+    rebound_max_magnitude=0.15,
+    rebound_same_episode=True,
+    rebound_previous_above=True,
+    held_old_direction_before_release=True,
+  )
+  detector.unwind_progress_episode = episode
+  detector.pending_handoff = PendingHandoff(
+    mono_time=9.50,
+    episode_start=9.0,
+    previous_phase=0.0,
+    previous_same_episode=False,
+    peak_abs_rate_deg=100.0,
+    peak_tracking_error=0.5,
+    peak_applied_target_gap=0.3,
+  )
+
+  # Shared sample: a handoff resolves (claims the emission slot) while the
+  # unwind episode is genuinely still mid-rebound (component 0.15 stays
+  # above UNWIND_REBOUND_MIN_COMPONENT=0.10).
+  shared = sample(
+    10.01,
+    steering_angle_deg=300.0,
+    steering_rate_deg=-100.0,
+    reference_rate=1.0,
+    unwind_effective_phase=0.9,
+    reference_sustained_unwind_scale=0.9,
+    request_torque=0.15,
+    applied_torque=0.15,
+    unwind_neutral_torque=0.0,
+  )
+  detection = detector.update(shared)
+  assert detection is not None and detection.event_type == "handoffMismatch"
+
+  assert episode.previous_mono_time == pytest.approx(10.01)
+  assert episode.rebound_duration_s == pytest.approx(0.01)
+  assert episode.rebound_previous_above
+
+  # The next (uncontested) invocation drops back below the rebound
+  # threshold. The total rebound_duration_s must already reflect the shared
+  # sample's contribution -- it must NOT change here, and previous_mono_time
+  # must advance from the shared sample's time, not from the stale 10.00.
+  followup = sample(
+    10.02,
+    steering_angle_deg=300.0,
+    steering_rate_deg=-100.0,
+    reference_rate=1.0,
+    unwind_effective_phase=0.9,
+    reference_sustained_unwind_scale=0.9,
+    request_torque=0.02,
+    applied_torque=0.02,
+    unwind_neutral_torque=0.0,
+  )
+  detector.update(followup)
+  assert episode.rebound_duration_s == pytest.approx(0.01)
+  assert not episode.rebound_previous_above
+  assert episode.previous_mono_time == pytest.approx(10.02)
+
+
 # --- v6: driver causation vs rescue (design.md section 6, amendment A5) ---
 
 
@@ -1484,3 +1642,30 @@ def test_backwards_discontinuity_resets_cooldown_and_history_with_default_cooldo
   assert event2.evidence is not None
   assert event2.evidence.evidence_start_mono_time == pytest.approx(60.0)
   assert event2.evidence.evidence_start_mono_time >= 60.0
+
+
+# --- v6: road-evidence window clamped to retained history (section 7, A6) -
+
+
+def test_road_evidence_window_clamped_to_trimmed_history(monkeypatch):
+  # Fix 4 / amendment A6 (test-coverage gap): road_evidence_window_start_
+  # mono_time must be clamped to max(min(episode_start_snapshot,
+  # evidence_start), history[0][0]) -- the serialized window must never
+  # claim coverage the retained history ring didn't actually have. Shrinking
+  # EVIDENCE_HISTORY_S makes the ring actually TRIM mid-scenario (not merely
+  # run out from route start, which every early-route test already exercises
+  # trivially): the naive window start here is episode_start_mono_time=0.0,
+  # but by the time the no-assist deficit fires (~2.5s later) the trimmed
+  # history ring only goes back to ~1.52s, so the clamp must win.
+  monkeypatch.setattr(lat_event_detector, "EVIDENCE_HISTORY_S", 1.0)
+  event = unwind_progress_event()
+  assert event is not None and event.evidence is not None
+  evidence = event.evidence
+  assert evidence.episode_start_mono_time == pytest.approx(0.0)
+
+  naive_window_start = min(evidence.episode_start_mono_time, event.occurred_mono_time - 6.0)
+  assert naive_window_start < evidence.episode_start_mono_time
+  assert evidence.road_evidence_window_start_mono_time is not None
+  assert evidence.road_evidence_window_start_mono_time > evidence.episode_start_mono_time
+  assert evidence.road_evidence_window_start_mono_time != pytest.approx(naive_window_start)
+  assert evidence.road_evidence_window_start_mono_time == pytest.approx(1.52)

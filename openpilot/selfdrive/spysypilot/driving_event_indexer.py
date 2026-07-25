@@ -742,6 +742,13 @@ def collect_records(log_root: Path, candidate_paths: list[Path],
     for candidate in route_candidates:
       parsed = parse_segment_name(candidate.name)
       assert parsed is not None
+      # Known narrow race (accepted, not fixed): loggerd removes segment N's
+      # lock before creating segment N+1's directory, so a scan landing in
+      # that exact window could see `following` as not-yet-existing here and
+      # let a lower-priority event in N self-designate primary before N+1's
+      # higher-priority member becomes visible. Accepted because it requires
+      # a scan to race a directory-creation syscall, which does not happen
+      # in the 30s-interval polling model this indexer runs under.
       following = path_by_key.get((route, parsed[1] + 1))
       if following is not None:
         if not is_complete(following) or find_rlog(following) is None:
