@@ -35,6 +35,15 @@ Active tuning work:
   monotonic ceiling only after that commitment, and hold the existing bounded
   breakout until rate recovery or the angle exit. Route 94/95 open-loop replay
   is complete; the task remains in progress pending another field test.
+- **In progress:** validate controller v19 from low-speed field route
+  `00000098--0cae131b10`. V19 adds a bounded, model-intent catch-up surge
+  only after 200 ms of measured turn-in or unwind underperformance, connects
+  the existing high-angle present-demand guard to Hyundai damping protection,
+  and derives signed wheel motion from steering-angle change instead of the
+  platform's unsigned steering-rate signal. The surge remains capped at 0.15
+  normalized torque and cannot exceed the existing command, slew, or panda
+  safety limits. Implementation, automated validation, and route replay are
+  complete; this task remains in progress pending a field test.
 
 ## What it does
 
@@ -58,6 +67,8 @@ The controller:
   unwind is confirmed, then uses a separately gated, bounded breakout target
   only if an extreme-angle EPS remains stuck at crown-neutral;
 - preserves turn-in authority when the wheel is still behind the planned path;
+- applies one bounded, model-direction catch-up pulse only after a deeply wound
+  wheel has underperformed for 200 ms during an extreme turn-in or unwind;
 - records versioned controller diagnostics in `LateralTorqueState` for rlog
   analysis.
 
@@ -127,6 +138,13 @@ lateral-acceleration space:
 - only after an extreme-angle wheel reaches applied crown-neutral and fails a
   300 ms progress check may a separate breakout target request up to 0.15
   normalized torque in the unwind direction;
+- separately, a model-intent catch-up observer may request one ramped pulse
+  after 200 ms of severe position/rate underperformance in an extreme turn-in
+  or unwind; it uses steering-angle delta for signed wheel rate, shares the
+  breakout controller's 0.15 normalized-torque budget, and aborts for driver
+  input, intent loss, recovery, timeout, or episode loss;
+- the immediate high-angle present-demand guard is also wired into Hyundai's
+  low-speed damping gate so EPS damping cannot suppress a still-needed turn-in;
 - after the future horizon confirms a new maneuver for 200 ms, a crown-aware
   handoff cap progressively removes only controller command that still points
   into the old episode beyond the reachable target.
@@ -232,7 +250,7 @@ Current diagnostic versions:
 | layer | version | examples |
 |---|---:|---|
 | future reference planner | 5 | base/output curvature, preview timing, reachable/geometric/episode torque, unwind confidence |
-| torque controller | 17 | delayed curvature and demand rate, trajectory/measured rate, unwind ownership, monotonic old-direction ceiling, present-demand guard, breakout progress and committed-handoff cap |
+| torque controller | 19 | delayed curvature and demand rate, trajectory/measured rate, unwind ownership, monotonic old-direction ceiling, signed wheel rate, catch-up mode/qualification/correction/termination, breakout progress, present-demand guard, and committed-handoff cap |
 | Hyundai EPS damping | 3 | requested/applied damping, gate state, signed wheel rate, breakaway stall and relief state |
 
 The universal driving-event logger remains separate infrastructure. BLaT
@@ -240,23 +258,24 @@ supplies the behavior and diagnostics that it observes.
 
 ## Validation
 
-Focused tests were rerun against the high-angle unwind exit,
+Focused tests were rerun against controller v19, the high-angle unwind exit,
 committed-handoff, and EPS-breakaway implementation with opendbc pin
 `8876af47`:
 
 | suite | result |
 |---|---:|
-| delayed-feedback, reference-rate, actuator, unwind, and handoff controller tests | 88 passed |
-| supporting lateral-controller, request-buffer, and future-reference planner tests | 42 passed |
+| delayed-feedback, reference-rate, catch-up, actuator, unwind, handoff, request-buffer, and future-reference planner tests | 192 passed |
 | Hyundai low-speed torque damping and breakaway tests | 20 passed |
-| Hyundai panda safety tests | 1215 passed, 313 skipped by suite configuration |
-| **total passing** | **1365 passed** |
+| Hyundai panda safety tests | 1367 passed, 162 skipped by suite configuration |
+| **total passing** | **1579 passed** |
 
 The suites cover symmetry, bounds, speed schedules, invalid-model fallback,
 torque reachability, crown-neutral transitions, episode handoff, driver
 override, under-tracked turn-in protection, post-stall relief, stale-direction
-handoff limiting, one-sided high-angle unwind limiting, command/safety rate
-limits, and diagnostic schema exposure.
+handoff limiting, one-sided high-angle unwind limiting, exact 200 ms catch-up
+qualification, single-pulse cooldown/rearm, correction direction and shared
+0.15 authority bounds, command/safety rate limits, and diagnostic schema
+exposure.
 
 An open-loop command-path replay of route `00000093--3198e2f719` modeled
 crown-neutral crossings about 0.71 seconds earlier near 12:36:39 and 0.95
@@ -274,6 +293,15 @@ the counterfactual breakout gates, peaking at 0.048 and 0.019 normalized torque.
 The present-demand guard also activated in the identified early-release
 windows. Because recorded wheel motion came from controller v16, these results
 verify v17 command invariants and eligibility—not closed-loop improvement.
+
+A counterfactual observer replay processed 23,999 controller samples from
+low-speed route `00000098--0cae131b10`. The intended extreme unwind windows at
+1758 and 2487 seconds and the extreme turn-in at 2485 seconds sustained the
+200 ms qualification and received correctly signed corrections no larger than
+0.15 normalized torque. Candidate evidence at 2049 and 2196 seconds did not
+persist for 200 ms and therefore did not trigger. This uses recorded v18 wheel
+motion, so it validates v19 eligibility, direction, persistence, and bounds;
+closed-loop improvement still requires the pending field test.
 
 Automated tests are not a substitute for route analysis and field testing of
 steering feel.

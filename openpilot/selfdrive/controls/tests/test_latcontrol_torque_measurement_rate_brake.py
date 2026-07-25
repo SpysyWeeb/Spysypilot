@@ -18,6 +18,12 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   CASCADE_P_SCALES,
   CASCADE_P_SCALE_SPEEDS,
   CASCADE_RATE_CORRECTION_MAX,
+  CATCHUP_SURGE_COOLDOWN_TIME,
+  CATCHUP_SURGE_MAX_ACTIVE_TIME,
+  CATCHUP_SURGE_QUALIFY_TIME,
+  CATCHUP_SURGE_REARM_HEALTHY_TIME,
+  CATCHUP_SURGE_RECOVERY_TIME,
+  CATCHUP_SURGE_TORQUE_MAX,
   HANDOFF_TORQUE_CAP_RAMP_TIME,
   HIGH_ANGLE_BREAKOUT_APPLIED_NEUTRAL_TOL,
   HIGH_ANGLE_BREAKOUT_PROGRESS_TIME,
@@ -41,9 +47,11 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   UNWIND_TORQUE_DELTA_DOWN,
   UNWIND_TORQUE_MAX,
   VERSION,
+  CatchupSurgeState,
   HighAngleUnwindExitState,
   LatControlTorque,
   MeasurementRateFilter,
+  SignedSteeringRateFilter,
   UnwindPhaseTracker,
   apply_high_angle_unwind_limits,
   cascade_p_scale,
@@ -794,7 +802,7 @@ class TestHighAngleUnwindExitState:
         1.0,
         1.0,
         tracking_measurement_rate=1.0,
-        steering_rate_deg=-70.0,
+        signed_steering_rate_deg=-70.0,
         applied_torque=0.1,
         neutral_torque=0.1,
       )
@@ -818,7 +826,7 @@ class TestHighAngleUnwindExitState:
         1.0,
         1.0,
         tracking_measurement_rate=1.0,
-        steering_rate_deg=-70.0,
+        signed_steering_rate_deg=-70.0,
         applied_torque=0.1,
         neutral_torque=0.1,
       )
@@ -851,6 +859,325 @@ class TestHighAngleUnwindExitState:
     assert state.confirmed_time == 0.0
     assert state.old_direction_limit is None
     assert state.breakout_scale == 0.0
+
+
+class TestCatchupSurgeState:
+  @staticmethod
+  def turn_in_case(sign=1.0):
+    high_angle_state = HighAngleUnwindExitState(DT_CTRL)
+    return high_angle_state, {
+      "enabled": True,
+      "steering_pressed": False,
+      "driver_torque": 0.0,
+      "steering_angle_deg": 300.0 * sign,
+      "signed_steering_rate": 5.0 * sign,
+      "v_ego": 2.0,
+      "delayed_lateral_accel": -0.9 * sign,
+      "current_lateral_accel": -0.9 * sign,
+      "measured_lateral_accel": -0.3 * sign,
+      "tracking_position_error": -0.6 * sign,
+      "reference_rate": -1.0 * sign,
+      "tracking_measurement_rate": -0.1 * sign,
+      "torque_command": 0.7 * sign,
+      "neutral_torque": 0.0,
+      "handoff_committed": False,
+      "unwind_same_episode": False,
+      "unwind_direction": 0.0,
+      "high_angle_state": high_angle_state,
+    }
+
+  @staticmethod
+  def unwind_case(sign=1.0, fresh_future=True):
+    high_angle_state = HighAngleUnwindExitState(DT_CTRL)
+    high_angle_state.peak_aligned_angle = 360.0
+    high_angle_state.future_confirmed = fresh_future
+    high_angle_state.present_peak_demand = 0.8
+    return high_angle_state, {
+      "enabled": True,
+      "steering_pressed": False,
+      "driver_torque": 0.0,
+      "steering_angle_deg": 360.0 * sign,
+      "signed_steering_rate": -5.0 * sign,
+      "v_ego": 2.0,
+      "delayed_lateral_accel": -0.1 * sign,
+      "current_lateral_accel": -0.1 * sign,
+      "measured_lateral_accel": -0.7 * sign,
+      "tracking_position_error": 0.0,
+      "reference_rate": 1.0 * sign,
+      "tracking_measurement_rate": 0.2 * sign,
+      "torque_command": -0.3 * sign,
+      "neutral_torque": 0.0,
+      "handoff_committed": False,
+      "unwind_same_episode": True,
+      "unwind_direction": sign,
+      "high_angle_state": high_angle_state,
+    }
+
+  @staticmethod
+  def qualify(state, case):
+    output = case["torque_command"]
+    for _ in range(int(round(CATCHUP_SURGE_QUALIFY_TIME / DT_CTRL))):
+      output = state.update(**case)
+    return output
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_turn_in_qualification_timing_and_crown_symmetry(self, sign):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.turn_in_case(sign)
+    for _ in range(int(round(CATCHUP_SURGE_QUALIFY_TIME / DT_CTRL)) - 1):
+      assert state.update(**case) == pytest.approx(case["torque_command"])
+      assert not state.active
+
+    output = state.update(**case)
+    assert state.active
+    assert state.mode == state.MODE_TURN_IN
+    assert state.candidate_time >= CATCHUP_SURGE_QUALIFY_TIME
+    assert state.correction * sign > 0.0
+    assert output == pytest.approx(case["torque_command"] + state.correction)
+
+  @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+      ("steering_angle_deg", 119.0),
+      ("current_lateral_accel", -0.49),
+      ("delayed_lateral_accel", -0.49),
+      ("tracking_position_error", -0.19),
+      ("torque_command", -0.7),
+      ("handoff_committed", True),
+    ],
+  )
+  def test_turn_in_requires_all_structural_gates(self, field, value):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.turn_in_case()
+    case[field] = value
+    for _ in range(30):
+      assert state.update(**case) == pytest.approx(case["torque_command"])
+    assert not state.active
+    assert state.correction == 0.0
+
+  def test_turn_in_rejects_committed_high_angle_release(self):
+    state = CatchupSurgeState(DT_CTRL)
+    high_angle_state, case = self.turn_in_case()
+    high_angle_state.release_committed = True
+    for _ in range(30):
+      state.update(**case)
+    assert not state.active
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_route98_position_undertrack_qualifies_despite_smaller_accel_gap(self, sign):
+    state = CatchupSurgeState(DT_CTRL)
+    high_angle_state, case = self.turn_in_case(sign)
+    case.update(
+      steering_angle_deg=400.0 * sign,
+      delayed_lateral_accel=-0.64 * sign,
+      current_lateral_accel=-0.64 * sign,
+      measured_lateral_accel=-0.53 * sign,
+      tracking_position_error=-0.62 * sign,
+      torque_command=0.75 * sign,
+    )
+    high_angle_state.future_confirmed = True
+    high_angle_state.turn_in_guard = 1.0
+    output = self.qualify(state, case)
+    assert state.active
+    assert state.mode == state.MODE_TURN_IN
+    assert state.position_error == pytest.approx(0.62)
+    assert state.correction * sign > 0.0
+    assert abs(output) > abs(case["torque_command"])
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_turn_in_correction_is_bounded_and_saturates_at_normal_limit(self, sign):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.turn_in_case(sign)
+    case["torque_command"] = 0.95 * sign
+    outputs = [self.qualify(state, case)]
+    outputs.extend(state.update(**case) for _ in range(20))
+    assert max(abs(output) for output in outputs) <= 1.0
+    assert max(abs(output - case["torque_command"]) for output in outputs) <= CATCHUP_SURGE_TORQUE_MAX
+    assert max(abs(output) for output in outputs) == pytest.approx(1.0)
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  @pytest.mark.parametrize("fresh_future", [False, True])
+  def test_unwind_accepts_fresh_future_or_strong_present_release(self, sign, fresh_future):
+    state = CatchupSurgeState(DT_CTRL)
+    high_angle_state, case = self.unwind_case(sign, fresh_future)
+    if fresh_future:
+      high_angle_state.present_peak_demand = 0.0
+    output = self.qualify(state, case)
+    assert state.active
+    assert state.mode == state.MODE_UNWIND
+    assert state.correction * sign < 0.0
+    assert abs(output) > abs(case["torque_command"])
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_unwind_can_begin_from_natural_crown_neutral_command(self, sign):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.unwind_case(sign)
+    case["torque_command"] = 0.0
+    output = self.qualify(state, case)
+    assert state.active
+    assert state.mode == state.MODE_UNWIND
+    assert state.correction * sign < 0.0
+    assert output == pytest.approx(state.correction)
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_route98_extreme_low_speed_release_uses_angle_proof_with_moderate_peak_demand(self, sign):
+    state = CatchupSurgeState(DT_CTRL)
+    high_angle_state, case = self.unwind_case(sign, fresh_future=False)
+    high_angle_state.present_peak_demand = 0.36
+    high_angle_state.present_old_demand = 0.19
+    output = self.qualify(state, case)
+    assert state.mode == state.MODE_UNWIND
+    assert state.active
+    assert state.correction * sign < 0.0
+    assert abs(output) > abs(case["torque_command"])
+
+    blocked = CatchupSurgeState(DT_CTRL)
+    high_angle_state.present_old_demand = 0.21
+    for _ in range(30):
+      blocked.update(**case)
+    assert not blocked.active
+
+  def test_catchup_and_breakout_share_one_bounded_assist_budget(self):
+    state = CatchupSurgeState(DT_CTRL)
+    high_angle_state, case = self.unwind_case()
+    high_angle_state.breakout_scale = 0.6
+    self.qualify(state, case)
+    for _ in range(10):
+      state.update(**case)
+    breakout_reserve = HIGH_ANGLE_BREAKOUT_TORQUE_MAX * high_angle_state.breakout_scale
+    assert abs(state.correction) + breakout_reserve <= CATCHUP_SURGE_TORQUE_MAX
+
+  @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+      ("steering_angle_deg", 235.0),
+      ("steering_angle_deg", 279.0),
+      ("torque_command", 0.3),
+      ("reference_rate", 0.35),
+      ("tracking_measurement_rate", 0.8),
+      ("unwind_same_episode", False),
+    ],
+  )
+  def test_unwind_rejects_route95_and_missing_proof_gates(self, field, value):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.unwind_case()
+    case[field] = value
+    for _ in range(30):
+      state.update(**case)
+    assert not state.active
+
+  def test_unwind_requires_peak_angle_and_rejects_model_preview_alone(self):
+    for mutation in ("peak", "model_only"):
+      state = CatchupSurgeState(DT_CTRL)
+      high_angle_state, case = self.unwind_case()
+      if mutation == "peak":
+        high_angle_state.peak_aligned_angle = 299.0
+      else:
+        high_angle_state.present_peak_demand = 0.0
+        case["measured_lateral_accel"] = case["current_lateral_accel"]
+      for _ in range(30):
+        state.update(**case)
+      assert not state.active
+
+  @pytest.mark.parametrize(
+    ("mutation", "termination"),
+    [
+      ({"steering_pressed": True}, CatchupSurgeState.TERMINATION_DRIVER),
+      ({"driver_torque": 100.0}, CatchupSurgeState.TERMINATION_DRIVER),
+      ({"enabled": False}, CatchupSurgeState.TERMINATION_INACTIVE),
+      ({"v_ego": 6.0}, CatchupSurgeState.TERMINATION_SPEED),
+      ({"torque_command": -0.7}, CatchupSurgeState.TERMINATION_INTENT),
+      (
+        {
+          "steering_angle_deg": -300.0,
+          "delayed_lateral_accel": 0.9,
+          "current_lateral_accel": 0.9,
+          "measured_lateral_accel": 0.3,
+          "tracking_position_error": 0.6,
+          "reference_rate": 1.0,
+          "tracking_measurement_rate": 0.1,
+          "torque_command": -0.7,
+        },
+        CatchupSurgeState.TERMINATION_INTENT,
+      ),
+    ],
+  )
+  def test_turn_in_abort_conditions_clear_within_one_update(self, mutation, termination):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.turn_in_case()
+    self.qualify(state, case)
+    assert state.active
+    case.update(mutation)
+    output = state.update(**case)
+    assert output == pytest.approx(case["torque_command"])
+    assert not state.active
+    assert state.scale == 0.0
+    assert state.termination_reason == termination
+
+  def test_unwind_episode_change_aborts_within_one_update(self):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.unwind_case()
+    self.qualify(state, case)
+    case["unwind_same_episode"] = False
+    assert state.update(**case) == pytest.approx(case["torque_command"])
+    assert not state.active
+    assert state.termination_reason == state.TERMINATION_EPISODE
+
+  @pytest.mark.parametrize(
+    ("exit_kind", "termination"),
+    [
+      ("rate", CatchupSurgeState.TERMINATION_RECOVERED),
+      ("position", CatchupSurgeState.TERMINATION_POSITION),
+      ("progress", CatchupSurgeState.TERMINATION_PROGRESS),
+      ("timeout", CatchupSurgeState.TERMINATION_TIMEOUT),
+    ],
+  )
+  def test_recovery_position_progress_and_timeout_exit(self, exit_kind, termination):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.turn_in_case()
+    self.qualify(state, case)
+    if exit_kind == "rate":
+      case["tracking_measurement_rate"] = -0.9
+      updates = int(round(CATCHUP_SURGE_RECOVERY_TIME / DT_CTRL)) + 1
+    elif exit_kind == "position":
+      case["tracking_position_error"] = -0.1
+      updates = 1
+    elif exit_kind == "progress":
+      case["steering_angle_deg"] += 10.0
+      updates = 1
+    else:
+      updates = int(round(CATCHUP_SURGE_MAX_ACTIVE_TIME / DT_CTRL)) + 1
+    for _ in range(updates):
+      state.update(**case)
+      if not state.pulse_active:
+        break
+    assert not state.pulse_active
+    assert state.termination_reason == termination
+
+  def test_cooldown_requires_healthy_rearm_before_second_pulse(self):
+    state = CatchupSurgeState(DT_CTRL)
+    _, case = self.turn_in_case()
+    self.qualify(state, case)
+    case["steering_angle_deg"] += 10.0
+    state.update(**case)
+    assert state.used
+    assert state.cooldown == pytest.approx(CATCHUP_SURGE_COOLDOWN_TIME)
+
+    case["steering_angle_deg"] -= 10.0
+    for _ in range(int(round(CATCHUP_SURGE_COOLDOWN_TIME / DT_CTRL)) + 5):
+      state.update(**case)
+      assert not state.pulse_active
+    assert state.used
+
+    healthy_case = dict(case)
+    healthy_case["current_lateral_accel"] = 0.0
+    healthy_case["delayed_lateral_accel"] = 0.0
+    healthy_case["torque_command"] = 0.0
+    for _ in range(int(round(CATCHUP_SURGE_REARM_HEALTHY_TIME / DT_CTRL)) + 1):
+      state.update(**healthy_case)
+    assert not state.used
+    self.qualify(state, case)
+    assert state.pulse_active
 
 
 class TestCommittedHandoffTorqueCap:
@@ -1197,6 +1524,33 @@ class TestMeasurementRateFilter:
     assert rate_filter.curvature_rate * REFERENCE_RATE_MIN_SPEED**2 > rate_filter.curvature_rate
 
 
+class TestSignedSteeringRateFilter:
+  @pytest.mark.parametrize("initial_angle", [-320.0, 320.0])
+  def test_first_sample_does_not_spike(self, initial_angle):
+    rate_filter = SignedSteeringRateFilter(DT_CTRL)
+    assert rate_filter.update(initial_angle, True) == 0.0
+
+  @pytest.mark.parametrize("sign", [-1.0, 1.0])
+  def test_angle_delta_produces_crown_symmetric_signed_rate(self, sign):
+    rate_filter = SignedSteeringRateFilter(DT_CTRL)
+    assert rate_filter.update(200.0 * sign, True) == 0.0
+    rate = rate_filter.update(201.0 * sign, True)
+    assert rate * sign > 0.0
+
+    mirrored_filter = SignedSteeringRateFilter(DT_CTRL)
+    mirrored_filter.update(-200.0 * sign, True)
+    mirrored_rate = mirrored_filter.update(-201.0 * sign, True)
+    assert rate == pytest.approx(-mirrored_rate)
+
+  def test_inactive_reset_prevents_reenable_spike(self):
+    rate_filter = SignedSteeringRateFilter(DT_CTRL)
+    rate_filter.update(200.0, True)
+    assert rate_filter.update(201.0, True) > 0.0
+    assert rate_filter.update(-300.0, False) == 0.0
+    assert rate_filter.update(-300.0, True) == 0.0
+    assert rate_filter.update(-301.0, True) < 0.0
+
+
 class TestActuationSpeedProjection:
   def test_zero_acceleration_is_identity(self):
     assert get_actuation_speed(10.0, 0.0, 0.2) == pytest.approx(10.0)
@@ -1222,6 +1576,52 @@ class TestActuationSpeedProjection:
 
 
 class TestReferenceRateTrackingIntegration:
+  def test_catchup_state_is_wired_to_output_diagnostics_and_damping(self, monkeypatch):
+    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
+    car_state = car.CarState.new_message()
+    car_state.vEgo = 2.0
+    params = log.LiveParametersData.new_message()
+    state = controller.catchup_surge_state
+
+    def active_catchup_update(*args):
+      torque_command = args[12]
+      state.mode = state.MODE_TURN_IN
+      state.active = True
+      state.scale = 0.5
+      state.correction = 0.05
+      state.planned_rate = 1.0
+      state.actual_rate = 0.1
+      state.position_error = 0.6
+      state.underperform = True
+      return torque_command + state.correction
+
+    monkeypatch.setattr(state, "update", active_catchup_update)
+    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2)
+    assert torque_log.catchupMode == state.MODE_TURN_IN
+    assert torque_log.catchupActive
+    assert torque_log.catchupScale == pytest.approx(0.5)
+    assert torque_log.catchupCorrection == pytest.approx(0.05)
+    assert torque_log.catchupPlannedRate == pytest.approx(1.0)
+    assert torque_log.catchupActualRate == pytest.approx(0.1)
+    assert torque_log.catchupPositionError == pytest.approx(0.6)
+    assert torque_log.catchupUnderperform
+    assert torque_log.dampingTurnInBlocked
+
+  def test_high_angle_present_guard_is_included_in_damping_block(self, monkeypatch):
+    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
+    car_state = car.CarState.new_message()
+    car_state.vEgo = 2.0
+    params = log.LiveParametersData.new_message()
+
+    def guarded_high_angle_update(*args, **kwargs):
+      controller.high_angle_unwind_exit_state.turn_in_guard = 1.0
+      return 0.0
+
+    monkeypatch.setattr(controller.high_angle_unwind_exit_state, "update", guarded_high_angle_update)
+    _, _, torque_log = controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2)
+    assert torque_log.highAngleUnwindTurnInGuard == pytest.approx(1.0)
+    assert torque_log.dampingTurnInBlocked
+
   @pytest.mark.parametrize("steer_limited_by_safety", [False, True])
   def test_hyundai_controller_logs_tracking_attribution(self, steer_limited_by_safety):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)

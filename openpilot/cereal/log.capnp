@@ -991,6 +991,18 @@ struct ControlsState @0x97ff69c53601abf1 {
     highAngleUnwindBreakoutTargetScale @111 :Float32;         # latched breakout target before bounded ramping
     highAngleUnwindNeutralDelivered @112 :Bool;                # applied old-turn torque completed crown-neutral confirmation
     highAngleUnwindFutureWaitAge @113 :Float32;                 # age of remembered precommit intent since the last fully confirmed future evidence
+    catchupMode @114 :UInt8;                                    # catch-up observer mode
+    catchupCandidateTime @115 :Float32;                          # continuous seconds satisfying the catch-up entry gates
+    catchupActive @116 :Bool;                                    # bounded catch-up correction is active
+    catchupScale @117 :Float32;                                  # ramped catch-up authority
+    catchupCorrection @118 :Float32;                             # signed normalized correction applied by catch-up
+    catchupPlannedRate @119 :Float32;                            # planned lateral-acceleration rate in the tracked direction, m/s^3
+    catchupActualRate @120 :Float32;                             # measured lateral-acceleration rate in the tracked direction, m/s^3
+    catchupPositionError @121 :Float32;                          # tracked lateral-acceleration position error, m/s^2
+    catchupTerminationReason @122 :UInt8;                        # reason the most recent catch-up episode ended
+    catchupCooldown @123 :Float32;                               # remaining catch-up rearm delay, seconds
+    catchupSignedSteeringRate @124 :Float32;                     # filtered signed steering-wheel rate derived from angle delta, deg/s
+    catchupUnderperform @125 :Bool;                              # planned-versus-actual progress gate is satisfied
    }
 
   struct LateralAngleState {
