@@ -13,14 +13,39 @@ removed.
 
 The next architecture restructure has emitted and versioned its Phase 0
 counterfactual replay baseline from frozen routes `0000008f--429bc635f2` and
-`0000009b--217a1b70db` in route-audit commit `acdc165`. No v15 controller
-changes have begun. Later phases remain in progress until they pass both the
-replay gate and a separate field drive, followed by explicit sign-off.
+`0000009b--217a1b70db` in route-audit commit `acdc165`. Phase 1 controller v15
+remains in progress. Its scalar-anchored washout, one-replan quarantine, and
+anchored-rate adapter have provisionally cleared the frozen-route replay gate;
+the result remains subject to regeneration against the exact committed build
+and a separate field drive followed by explicit sign-off. Later phases remain
+in progress under the same replay-and-field requirements.
 
 Replay rows are identified by both the Spysypilot commit and opendbc commit,
 not by the logged controller `VERSION` alone. Beginning with v15, every
 behavior-affecting controller change must bump `VERSION` in the same commit;
 two builds that steer differently must never report the same version.
+
+For v15 above 12 mph, the raw planner trajectory is washout input only; every
+surviving downstream reference consumer must follow the final scalar-anchored
+reference. Accordingly, `trajectoryReferenceRateValid = false` is nominal
+above 12 mph and selects the controller's finite-difference rate from the
+anchored command through the existing 0.18-second reference-rate innovation
+filter—it does not indicate planner failure. The v14 trajectory-rate path
+remains unchanged through 12 mph. The unanchored unwind and torque-target
+diagnostics are a documented temporary exception pending their Phase 2
+deletion.
+
+Phase 2 must derive the slew-feasible feedforward's rate content analytically
+from the plan through the scalar-anchor transform. Numerically differentiating
+a replan-discontinuous command is prohibited: v15 demonstrated that even a
+filtered finite difference can turn model-update boundaries into actuator-rate
+roughness. This requirement carries forward independently of the temporary
+v15 rate-cascade adapter, which Phase 3 deletes with the cascade itself.
+
+The cumulative Phase 1 controller-source diff is +276/-65 lines (net +211),
+within the approved Phase 1 whitelist. Phase 2's mandated mechanism deletions
+must make the cumulative Phase 1–2 controller-source total net-negative at its
+gate.
 
 Automated rollback validation currently covers 87 lateral-controller/reference
 tests, 16 Hyundai damping tests, and 1,367 Hyundai panda safety tests. These

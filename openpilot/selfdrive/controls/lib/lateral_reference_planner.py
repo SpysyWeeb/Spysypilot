@@ -35,16 +35,19 @@ LOW_SPEED_CURVATURE_ACCEL_WEIGHT = 0.001
 LATERAL_JERK_WEIGHT = 1e-5
 LATERAL_JERK_RATE_WEIGHT = 1e-13
 LOW_SPEED_PREVIOUS_CURVATURE_WEIGHT = 0.1
-PREVIOUS_LATERAL_ACCEL_WEIGHT = 3e-5
+PREVIOUS_LATERAL_ACCEL_WEIGHT = 0.0
 INITIAL_LATERAL_ACCEL_WEIGHT = 1e-4
 INITIAL_CURVATURE_WEIGHT = 0.01
 HIGH_SPEED_YAW_WEIGHT_DECAY = 0.8
 
-# The preview can lead the legacy scalar reference, but only by this much in
-# lateral-acceleration space on any one replan. This keeps path timing separate
-# from steering authority: the preview may prepare for a release, but it cannot
-# erase the turn that the model requested.
+# Frozen V14 low-speed output constants. The complete mechanism is fenced in
+# get_curvature and remains active only through 12 mph.
 MAX_PREVIEW_LATERAL_ACCEL_DELTA = 0.20
+AUTHORITY_RESTORE_START = 0.03
+AUTHORITY_RESTORE_FULL = 0.10
+
+SCALAR_ANCHOR_TAU = 0.25
+SCALAR_ANCHOR_LATERAL_ACCEL_TOLERANCE = 0.02
 ACTUATOR_PREVIEW_GAIN = 0.5
 ACTUATOR_PREVIEW_NOMINAL_SLEW = 0.20
 ACTUATOR_PREVIEW_MAX_EXTRA = 0.35
@@ -53,8 +56,6 @@ EPISODE_COMMITMENT_LOOKAHEAD = 0.35
 PATH_PHASE_LOOKAHEAD = 0.20
 UNWIND_JERK_START = 0.10
 UNWIND_JERK_FULL = 0.60
-AUTHORITY_RESTORE_START = 0.03
-AUTHORITY_RESTORE_FULL = 0.10
 
 
 def _difference_matrix(order: int) -> np.ndarray:
@@ -83,7 +84,7 @@ class ActuatorPreviewConfig:
 
 @dataclass
 class LateralReferenceDiagnostics:
-  version: int = 5
+  version: int = 6
   base_curvature: float = 0.0
   output_curvature: float = 0.0
   trajectory_curvature_rate: float = 0.0
@@ -101,6 +102,9 @@ class LateralReferenceDiagnostics:
   sustained_unwind_scale: float = 0.0
   episode_target_torque: float = 0.0
   episode_lateral_accel: float = 0.0
+  scalar_anchor_deviation: float = 0.0
+  persistence_gate_hold: bool = False
+  scalar_anchor_active: bool = False
 
 
 class LateralReferencePlanner:
@@ -111,6 +115,18 @@ class LateralReferencePlanner:
     self.solution: np.ndarray | None = None
     self.predicted_speeds: np.ndarray | None = None
     self.solution_age = 0.0
+    self.candidate_solution: np.ndarray | None = None
+    self.candidate_speeds: np.ndarray | None = None
+    self.pending_solution: np.ndarray | None = None
+    self.pending_speeds: np.ndarray | None = None
+    self.anchor_input: float | None = None
+    self.anchor_correction = 0.0
+    self.previous_plan_scalar: float | None = None
+    self.scalar_trend = 0
+    self.scalar_quasi_steady = True
+    self.model_plan_updated = False
+    self.high_speed_active = False
+    self.persistence_gate_hold = False
     self.actuator_config: ActuatorPreviewConfig | None = None
     self.diagnostics = LateralReferenceDiagnostics()
 
@@ -121,7 +137,28 @@ class LateralReferencePlanner:
     self.solution = None
     self.predicted_speeds = None
     self.solution_age = 0.0
+    self._reset_high_speed_state()
     self.diagnostics = LateralReferenceDiagnostics()
+
+  def _reset_high_speed_state(self) -> None:
+    self.candidate_solution = None
+    self.candidate_speeds = None
+    self.pending_solution = None
+    self.pending_speeds = None
+    self.anchor_input = None
+    self.anchor_correction = 0.0
+    self.previous_plan_scalar = None
+    self.scalar_trend = 0
+    self.scalar_quasi_steady = True
+    self.model_plan_updated = False
+    self.high_speed_active = False
+    self.persistence_gate_hold = False
+
+  def _accept_solution(self, solution: np.ndarray, speeds: np.ndarray) -> None:
+    self.solution, self.predicted_speeds, self.solution_age = solution, speeds, 0.0
+    self.candidate_solution = self.candidate_speeds = None
+    self.pending_solution = self.pending_speeds = None
+    self.persistence_gate_hold = False
 
   @staticmethod
   def _smoothstep(value: float, start: float, end: float) -> float:
@@ -157,6 +194,10 @@ class LateralReferencePlanner:
       self.reset()
       return False
     yaws, speeds = trajectory
+    if v_ego > LOW_SPEED_REFERENCE_SPEED and self.solution_age > SCALAR_ANCHOR_TAU:
+      self.solution = self.predicted_speeds = None
+      self._reset_high_speed_state()
+      self.persistence_gate_hold = True
 
     # yaw[i] = sum(speed[j] * curvature[j] * dt), j < i
     dynamics = np.tril(np.broadcast_to(speeds * TRAJECTORY_DT, (TRAJECTORY_SIZE, TRAJECTORY_SIZE)), -1)
@@ -205,10 +246,86 @@ class LateralReferencePlanner:
       self.reset()
       return False
 
-    self.solution = solution
-    self.predicted_speeds = speeds
-    self.solution_age = 0.0
+    if v_ego <= LOW_SPEED_REFERENCE_SPEED:
+      self._accept_solution(solution, speeds)
+      self._reset_high_speed_state()
+    elif self.solution is None or not self.high_speed_active:
+      self._accept_solution(solution, speeds)
+      self.high_speed_active = True
+    else:
+      self.candidate_solution, self.candidate_speeds = solution, speeds
+    self.model_plan_updated = True
     return True
+
+  def _resolve_candidate(
+    self,
+    raw_curvature: float,
+    v_ego: float,
+    lateral_delay: float,
+    applied_torque: float,
+    lat_accel_factor: float,
+    friction: float,
+    roll: float,
+    lat_accel_offset: float,
+  ) -> None:
+    if self.model_plan_updated:
+      if self.previous_plan_scalar is not None:
+        magnitude_change = abs(raw_curvature) - abs(self.previous_plan_scalar)
+        self.scalar_trend = int(np.sign(magnitude_change))
+        self.scalar_quasi_steady = abs(magnitude_change) * v_ego**2 <= SCALAR_ANCHOR_LATERAL_ACCEL_TOLERANCE
+      self.previous_plan_scalar = raw_curvature
+      self.model_plan_updated = False
+    if self.candidate_solution is None:
+      return
+
+    assert self.solution is not None
+    accepted = self._select_curvature(
+      self.solution, self.predicted_speeds, self.solution_age, v_ego, lateral_delay, applied_torque, lat_accel_factor, friction, roll, lat_accel_offset
+    )[2]
+    candidate = self._select_curvature(
+      self.candidate_solution, self.candidate_speeds, 0.0, v_ego, lateral_delay, applied_torque, lat_accel_factor, friction, roll, lat_accel_offset
+    )[2]
+    innovation = (candidate - accepted) * v_ego**2
+    if abs(innovation) <= SCALAR_ANCHOR_LATERAL_ACCEL_TOLERANCE:
+      assert self.candidate_speeds is not None
+      self._accept_solution(self.candidate_solution, self.candidate_speeds)
+    elif self.pending_solution is not None:
+      pending = self._select_curvature(
+        self.pending_solution, self.pending_speeds, DT_MDL, v_ego, lateral_delay, applied_torque, lat_accel_factor, friction, roll, lat_accel_offset
+      )[2]
+      pending_innovation = (pending - accepted) * v_ego**2
+      if innovation * pending_innovation > 0.0:
+        assert self.candidate_speeds is not None
+        self._accept_solution(self.candidate_solution, self.candidate_speeds)
+      else:
+        self.pending_solution, self.pending_speeds = self.candidate_solution, self.candidate_speeds
+        self.candidate_solution = self.candidate_speeds = None
+        self.persistence_gate_hold = True
+    else:
+      self.pending_solution, self.pending_speeds = self.candidate_solution, self.candidate_speeds
+      self.candidate_solution = self.candidate_speeds = None
+      self.persistence_gate_hold = True
+
+  def _anchor_curvature(self, raw_curvature: float, planned_curvature: float, v_ego: float) -> float:
+    anchor_input = planned_curvature - raw_curvature
+    if self.anchor_input is None:
+      self.anchor_correction = 0.0
+    else:
+      alpha = SCALAR_ANCHOR_TAU / (SCALAR_ANCHOR_TAU + self.dt)
+      self.anchor_correction = alpha * (self.anchor_correction + anchor_input - self.anchor_input)
+    self.anchor_input = anchor_input
+
+    correction = self.anchor_correction
+    if self.scalar_trend < 0:
+      correction = 0.0 if raw_curvature == 0.0 else (
+        clip_scalar(correction, -abs(raw_curvature), 0.0) if raw_curvature > 0.0 else clip_scalar(correction, 0.0, abs(raw_curvature))
+      )
+    elif self.scalar_trend == 0 and raw_curvature * correction > 0.0:
+      correction = 0.0
+    if self.scalar_quasi_steady:
+      limit = SCALAR_ANCHOR_LATERAL_ACCEL_TOLERANCE / v_ego**2
+      correction = clip_scalar(correction, -limit, limit)
+    return raw_curvature + correction
 
   def _reference_scale(self, raw_curvature: float, v_ego: float) -> float:
     high_speed_reference_scale = self._smoothstep(v_ego, LOW_SPEED_REFERENCE_SPEED, FULL_SPEED_REFERENCE_SPEED)
@@ -220,9 +337,13 @@ class LateralReferencePlanner:
     return low_speed_curvature_scale + high_speed_reference_scale * (1.0 - low_speed_curvature_scale)
 
   def _predicted_speed(self, sample_time: float, fallback: float) -> float:
-    if self.predicted_speeds is None:
+    return self._predicted_speed_from(self.predicted_speeds, sample_time, fallback)
+
+  @staticmethod
+  def _predicted_speed_from(predicted_speeds: np.ndarray | None, sample_time: float, fallback: float) -> float:
+    if predicted_speeds is None:
       return max(fallback, MIN_MODEL_SPEED)
-    return float(np.interp(sample_time, TRAJECTORY_T, self.predicted_speeds))
+    return float(np.interp(sample_time, TRAJECTORY_T, predicted_speeds))
 
   def _trajectory_curvature_rate(self, sample_time: float) -> float:
     """Return a centered slope from the continuous future-path solution."""
@@ -238,7 +359,22 @@ class LateralReferencePlanner:
   def _target_torque(
     self, curvature: float, sample_time: float, v_ego: float, lat_accel_factor: float, friction: float, roll: float = 0.0, lat_accel_offset: float = 0.0
   ) -> float:
-    speed = self._predicted_speed(sample_time, v_ego)
+    return self._target_torque_from(
+      curvature, sample_time, self.predicted_speeds, v_ego, lat_accel_factor, friction, roll, lat_accel_offset
+    )
+
+  @staticmethod
+  def _target_torque_from(
+    curvature: float,
+    sample_time: float,
+    predicted_speeds: np.ndarray | None,
+    v_ego: float,
+    lat_accel_factor: float,
+    friction: float,
+    roll: float,
+    lat_accel_offset: float,
+  ) -> float:
+    speed = LateralReferencePlanner._predicted_speed_from(predicted_speeds, sample_time, v_ego)
     geometric_lateral_accel = curvature * speed**2
     gravity_adjusted_lateral_accel = geometric_lateral_accel - roll * ACCELERATION_DUE_TO_GRAVITY - lat_accel_offset
     friction_torque = friction * np.sign(geometric_lateral_accel) if abs(geometric_lateral_accel) > 0.02 else 0.0
@@ -322,6 +458,11 @@ class LateralReferencePlanner:
   def _unwind_scales(self, sample_time: float) -> tuple[float, float]:
     """Return immediate and horizon-persistent curvature release scales."""
     assert self.solution is not None
+    return self._unwind_scales_from(self.solution, self.predicted_speeds, sample_time)
+
+  def _unwind_scales_from(
+    self, solution: np.ndarray, predicted_speeds: np.ndarray | None, sample_time: float
+  ) -> tuple[float, float]:
     phase_time = min(sample_time + PATH_PHASE_LOOKAHEAD, TRAJECTORY_T[-1])
     if phase_time <= sample_time:
       return 0.0, 0.0
@@ -330,12 +471,12 @@ class LateralReferencePlanner:
     curvature, future_curvature, sustained_curvature = np.interp(
       (sample_time, phase_time, end_time),
       TRAJECTORY_T,
-      self.solution,
+      solution,
     )
     # Classify the geometry, not the driver's throttle/brake input. Holding the
     # same curvature while speed changes is not an unwind. Predicted speed is
     # still used below for actuator demand and timing.
-    speed = self._predicted_speed(sample_time, 0.0)
+    speed = self._predicted_speed_from(predicted_speeds, sample_time, 0.0)
     unwind_jerk = (abs(curvature) - abs(future_curvature)) * speed**2 / (phase_time - sample_time)
     immediate_scale = self._smoothstep(unwind_jerk, UNWIND_JERK_START, UNWIND_JERK_FULL)
 
@@ -344,6 +485,45 @@ class LateralReferencePlanner:
     sustained_jerk = (abs(curvature) - abs(sustained_curvature)) * speed**2 / (end_time - sample_time)
     sustained_scale = self._smoothstep(sustained_jerk, UNWIND_JERK_START, UNWIND_JERK_FULL)
     return immediate_scale, min(immediate_scale, sustained_scale)
+
+  def _select_curvature(
+    self,
+    solution: np.ndarray,
+    predicted_speeds: np.ndarray | None,
+    age: float,
+    v_ego: float,
+    lateral_delay: float,
+    applied_torque: float,
+    lat_accel_factor: float,
+    friction: float,
+    roll: float,
+    lat_accel_offset: float,
+  ) -> tuple[float, float, float, float, float]:
+    base_time = lateral_delay + MODEL_PATH_TIME_OFFSET + age
+    base_curvature = float(np.interp(base_time, TRAJECTORY_T, solution))
+    sample_time = base_time
+    sustained_unwind_scale = 0.0
+    if self.actuator_config is not None:
+      base_unwind_scale, sustained_unwind_scale = self._unwind_scales_from(solution, predicted_speeds, base_time)
+      release_preview = sustained_unwind_scale * UNWIND_RELEASE_PREVIEW_TIME
+      sample_time = base_time + release_preview
+      planned_curvature = float(np.interp(sample_time, TRAJECTORY_T, solution))
+      preview_target_torque = self._target_torque_from(
+        planned_curvature, sample_time, predicted_speeds, v_ego, lat_accel_factor, friction, roll, lat_accel_offset
+      )
+      slew_time = self._transition_time(applied_torque, preview_target_torque)
+      extra_time = clip_scalar(
+        ACTUATOR_PREVIEW_GAIN * max(slew_time - ACTUATOR_PREVIEW_NOMINAL_SLEW, 0.0),
+        0.0,
+        ACTUATOR_PREVIEW_MAX_EXTRA,
+      )
+      sample_time = base_time + max(release_preview, base_unwind_scale * extra_time)
+
+    planned_curvature = float(np.interp(sample_time, TRAJECTORY_T, solution))
+    unwind_scale = max(
+      self._unwind_scales_from(solution, predicted_speeds, sample_time)[0], sustained_unwind_scale
+    ) if self.actuator_config is not None else 0.0
+    return base_curvature, sample_time, planned_curvature, unwind_scale, sustained_unwind_scale
 
   def _unwind_scale(self, sample_time: float) -> float:
     return self._unwind_scales(sample_time)[0]
@@ -363,64 +543,78 @@ class LateralReferencePlanner:
     if not actuator_preview and v_ego <= LOW_SPEED_REFERENCE_SPEED and abs(raw_curvature) >= ZERO_LOW_SPEED_CURVATURE:
       self.reset()
       return raw_curvature
-    if self.solution is None:
-      return raw_curvature
+    low_speed = v_ego <= LOW_SPEED_REFERENCE_SPEED
+    if low_speed:
+      if self.high_speed_active:
+        self._reset_high_speed_state()
+    elif not self.high_speed_active:
+      self._reset_high_speed_state()
+      self.high_speed_active = True
 
     base_time = lateral_delay + MODEL_PATH_TIME_OFFSET + self.solution_age
-    base_curvature = float(np.interp(base_time, TRAJECTORY_T, self.solution))
+    if not low_speed:
+      self._resolve_candidate(raw_curvature, v_ego, lateral_delay, applied_torque, lat_accel_factor, friction, roll, lat_accel_offset)
+      if self.solution is not None and self.solution_age > SCALAR_ANCHOR_TAU:
+        self.solution = self.predicted_speeds = None
+        self._reset_high_speed_state()
+        self.high_speed_active = self.persistence_gate_hold = True
+    if self.solution is None:
+      if not low_speed:
+        target_torque = self._target_torque(raw_curvature, base_time, v_ego, lat_accel_factor, friction, roll, lat_accel_offset)
+        self.diagnostics = LateralReferenceDiagnostics(
+          output_curvature=float(raw_curvature),
+          sample_time=float(base_time),
+          target_torque=float(target_torque),
+          applied_torque=float(applied_torque),
+          geometric_target_torque=float(target_torque),
+          neutral_torque=float(self._neutral_torque(roll, lat_accel_offset, lat_accel_factor)),
+          reachable_target_torque=float(target_torque),
+          episode_target_torque=float(target_torque),
+          episode_lateral_accel=float(raw_curvature * v_ego**2),
+          persistence_gate_hold=bool(self.persistence_gate_hold),
+        )
+      return raw_curvature
+
+    base_curvature, sample_time, planned_curvature, unwind_scale, sustained_unwind_scale = self._select_curvature(
+      self.solution,
+      self.predicted_speeds,
+      self.solution_age,
+      v_ego,
+      lateral_delay,
+      applied_torque,
+      lat_accel_factor,
+      friction,
+      roll,
+      lat_accel_offset,
+    )
+    base_time = lateral_delay + MODEL_PATH_TIME_OFFSET + self.solution_age
     reference_scale = self._reference_scale(raw_curvature, v_ego)
     legacy_reference = reference_scale * base_curvature + (1.0 - reference_scale) * raw_curvature
-
-    sample_time = base_time
-    sustained_unwind_scale = 0.0
-    if actuator_preview:
-      # Only lead a predicted release. During turn-in, looking farther ahead can
-      # select the later unwind and weaken the torque build that is needed now.
-      base_unwind_scale, sustained_unwind_scale = self._unwind_scales(base_time)
-      release_preview = sustained_unwind_scale * UNWIND_RELEASE_PREVIEW_TIME
-      sample_time = base_time + release_preview
-      # Keep the road-tested one-pass preview. The former three-iteration loop
-      # repeated this calculation without updating sample_time.
-      planned_curvature = float(np.interp(sample_time, TRAJECTORY_T, self.solution))
-      preview_target_torque = self._target_torque(
-        planned_curvature,
-        sample_time,
-        v_ego,
-        lat_accel_factor,
-        friction,
-        roll,
-        lat_accel_offset,
-      )
-      slew_time = self._transition_time(applied_torque, preview_target_torque)
-      extra_time = clip_scalar(
-        ACTUATOR_PREVIEW_GAIN * max(slew_time - ACTUATOR_PREVIEW_NOMINAL_SLEW, 0.0),
-        0.0,
-        ACTUATOR_PREVIEW_MAX_EXTRA,
-      )
-      sample_time = base_time + max(release_preview, base_unwind_scale * extra_time)
-
-    planned_curvature = float(np.interp(sample_time, TRAJECTORY_T, self.solution))
-    unwind_scale = max(self._unwind_scale(sample_time), sustained_unwind_scale) if actuator_preview else 0.0
     authority_restored = 0.0
-    authority_reference = planned_curvature
-    if actuator_preview and raw_curvature * planned_curvature > 0.0 and abs(planned_curvature) < abs(raw_curvature):
-      raw_lateral_accel = abs(raw_curvature) * v_ego**2
-      authority_scale = (1.0 - unwind_scale) * self._smoothstep(raw_lateral_accel, AUTHORITY_RESTORE_START, AUTHORITY_RESTORE_FULL)
-      authority_reference = planned_curvature + authority_scale * (raw_curvature - planned_curvature)
-      authority_restored = (authority_reference - planned_curvature) * v_ego**2
-      planned_curvature = authority_reference
-
-    if actuator_preview:
-      max_curvature_delta = MAX_PREVIEW_LATERAL_ACCEL_DELTA / max(v_ego**2, 1.0)
-      planned_curvature = clip_scalar(planned_curvature, legacy_reference - max_curvature_delta, legacy_reference + max_curvature_delta)
-      # Meaningful turn-in/hold authority is deliberately exempt from the
-      # preview cap. Tiny straight-road actions retain the smoothed reference.
-      if abs(authority_reference) > abs(planned_curvature):
+    if low_speed:
+      # Frozen V14 low-speed output block. Keep this complete fence intact until
+      # its behavior is replaced and separately validated on the low-speed set.
+      authority_reference = planned_curvature
+      if actuator_preview and raw_curvature * planned_curvature > 0.0 and abs(planned_curvature) < abs(raw_curvature):
+        raw_lateral_accel = abs(raw_curvature) * v_ego**2
+        authority_scale = (1.0 - unwind_scale) * self._smoothstep(raw_lateral_accel, AUTHORITY_RESTORE_START, AUTHORITY_RESTORE_FULL)
+        authority_reference = planned_curvature + authority_scale * (raw_curvature - planned_curvature)
+        authority_restored = (authority_reference - planned_curvature) * v_ego**2
         planned_curvature = authority_reference
+
+      if actuator_preview:
+        max_curvature_delta = MAX_PREVIEW_LATERAL_ACCEL_DELTA / max(v_ego**2, 1.0)
+        planned_curvature = clip_scalar(planned_curvature, legacy_reference - max_curvature_delta, legacy_reference + max_curvature_delta)
+        # Meaningful turn-in/hold authority is deliberately exempt from the
+        # preview cap. Tiny straight-road actions retain the smoothed reference.
+        if abs(authority_reference) > abs(planned_curvature):
+          planned_curvature = authority_reference
 
     self.solution_age += self.dt
 
-    output_curvature = planned_curvature if actuator_preview else legacy_reference
+    output_curvature = planned_curvature if low_speed and actuator_preview else legacy_reference if low_speed else self._anchor_curvature(
+      raw_curvature, planned_curvature, v_ego
+    )
     geometric_target_torque = self._target_torque(output_curvature, sample_time, v_ego, lat_accel_factor, friction, roll, lat_accel_offset)
     neutral_torque = self._neutral_torque(roll, lat_accel_offset, lat_accel_factor)
     reachable_target_torque = geometric_target_torque
@@ -446,7 +640,7 @@ class LateralReferencePlanner:
       base_curvature=float(base_curvature),
       output_curvature=float(output_curvature),
       trajectory_curvature_rate=float(self._trajectory_curvature_rate(sample_time)),
-      trajectory_rate_valid=True,
+      trajectory_rate_valid=bool(low_speed),
       sample_time=float(sample_time),
       extra_time=float(sample_time - base_time),
       target_torque=float(target_torque),
@@ -460,5 +654,8 @@ class LateralReferencePlanner:
       sustained_unwind_scale=float(sustained_unwind_scale),
       episode_target_torque=float(episode_target_torque),
       episode_lateral_accel=float(episode_lateral_accel),
+      scalar_anchor_deviation=float((output_curvature - raw_curvature) * v_ego**2),
+      persistence_gate_hold=bool(self.persistence_gate_hold),
+      scalar_anchor_active=bool(not low_speed),
     )
     return float(output_curvature)
