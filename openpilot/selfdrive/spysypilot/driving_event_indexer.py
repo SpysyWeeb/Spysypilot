@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import time
+from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,31 @@ PRESERVE_ATTR_NAME = "user.preserve"
 PRESERVE_ATTR_VALUE = b"1"
 CONTEXT_BEFORE = 2
 CONTEXT_AFTER = 1
+
+# Primary-event designation (A4). Only manifest records with an envelope
+# version >= DESIGNATION_MIN_VERSION participate in group_role computation;
+# older (v5-era and earlier) records always self-designate as primary.
+DESIGNATION_MIN_VERSION = 3
+GROUP_PRIMARY_PRIORITY_MANUAL = 110
+GROUP_PRIMARY_PRIORITY_DRIVER_ASSISTED_UNWIND = 100
+GROUP_PRIMARY_PRIORITY_AUTONOMOUS_UNWIND = 90
+GROUP_PRIMARY_PRIORITY_HANDOFF = 80
+GROUP_PRIMARY_PRIORITY_TURN_STOP_AND_LONG = 70
+GROUP_PRIMARY_PRIORITY_STALL_AND_LATE_UNWIND = 60
+GROUP_PRIMARY_PRIORITY_DEFAULT = 0
+# lat.unwindProgressDeficit's priority depends on driver-assisted vs
+# autonomous (see _group_priority); long.* is matched by prefix, not listed.
+GROUP_PRIMARY_PRIORITY: dict[str, int] = {
+  "manual.general": GROUP_PRIMARY_PRIORITY_MANUAL,
+  "lat.unwindProgressDeficit": GROUP_PRIMARY_PRIORITY_AUTONOMOUS_UNWIND,
+  "lat.handoffMismatch": GROUP_PRIMARY_PRIORITY_HANDOFF,
+  "lat.centerOvershoot": GROUP_PRIMARY_PRIORITY_HANDOFF,
+  "lat.committedHandoffHarshness": GROUP_PRIMARY_PRIORITY_HANDOFF,
+  "lat.torqueAuthority": GROUP_PRIMARY_PRIORITY_HANDOFF,
+  "lat.turnStopTurn": GROUP_PRIMARY_PRIORITY_TURN_STOP_AND_LONG,
+  "lat.stallRelease": GROUP_PRIMARY_PRIORITY_STALL_AND_LATE_UNWIND,
+  "lat.lateUnwind": GROUP_PRIMARY_PRIORITY_STALL_AND_LATE_UNWIND,
+}
 
 
 @dataclass
@@ -213,6 +239,45 @@ def _payload(event: Any) -> dict[str, Any]:
       "unwind_reference_target_torque_at_trigger": round(float(value.unwindReferenceTargetTorqueAtTrigger), 4),
       "unwind_applied_target_gap_at_trigger": round(float(value.unwindAppliedTargetGapAtTrigger), 4),
       "unwind_peak_applied_target_gap": round(float(value.unwindPeakAppliedTargetGap), 4),
+      "unwind_neutral_torque": round(float(value.unwindNeutralTorque), 4),
+      "unwind_phase_direction": round(float(value.unwindPhaseDirection), 4),
+      "high_angle_evidence_valid": bool(value.highAngleEvidenceValid),
+      "high_angle_unwind_scale": round(float(value.highAngleUnwindScale), 4),
+      "torque_command_before_high_angle_exit": round(float(value.torqueCommandBeforeHighAngleExit), 4),
+      "high_angle_unwind_old_torque_correction": round(float(value.highAngleUnwindOldTorqueCorrection), 4),
+      "high_angle_unwind_old_direction_torque": round(float(value.highAngleUnwindOldDirectionTorque), 4),
+      "old_turn_sign": round(float(value.oldTurnSign), 4),
+      "future_unwind_commit_mono_time": int(value.futureUnwindCommitMonoTime),
+      "future_unwind_commit_present": bool(value.futureUnwindCommitPresent),
+      "high_angle_exit_first_nonzero_mono_time": int(value.highAngleExitFirstNonzeroMonoTime),
+      "high_angle_exit_first_nonzero_present": bool(value.highAngleExitFirstNonzeroPresent),
+      "requested_crown_neutral_mono_time": int(value.requestedCrownNeutralMonoTime),
+      "requested_crown_neutral_present": bool(value.requestedCrownNeutralPresent),
+      "applied_crown_neutral_mono_time": int(value.appliedCrownNeutralMonoTime),
+      "applied_crown_neutral_present": bool(value.appliedCrownNeutralPresent),
+      "unwind_crown_command_delay_s": round(float(value.unwindCrownCommandDelayS), 4),
+      "wheel_progress_5_mono_time": int(value.wheelProgress5MonoTime),
+      "wheel_progress_5_present": bool(value.wheelProgress5Present),
+      "wheel_progress_20_mono_time": int(value.wheelProgress20MonoTime),
+      "wheel_progress_20_present": bool(value.wheelProgress20Present),
+      "wheel_progress_50_mono_time": int(value.wheelProgress50MonoTime),
+      "wheel_progress_50_present": bool(value.wheelProgress50Present),
+      "unwind_rebound_max_magnitude": round(float(value.unwindReboundMaxMagnitude), 4),
+      "unwind_rebound_start_mono_time": int(value.unwindReboundStartMonoTime),
+      "unwind_rebound_start_present": bool(value.unwindReboundStartPresent),
+      "unwind_rebound_duration_s": round(float(value.unwindReboundDurationS), 4),
+      "unwind_rebound_same_episode": bool(value.unwindReboundSameEpisode),
+      "driver_active_before_deficit": bool(value.driverActiveBeforeDeficit),
+      "driver_active_at_deficit_start": bool(value.driverActiveAtDeficitStart),
+      "driver_active_during_evaluation": bool(value.driverActiveDuringEvaluation),
+      "driver_intervened_after_deficit": bool(value.driverIntervenedAfterDeficit),
+      "driver_intervention_accelerated_progress": bool(value.driverInterventionAcceleratedProgress),
+      "driver_causation": str(value.driverCausation),
+      "turn_stop_pre_dwell_progress_deg": round(float(value.turnStopPreDwellProgressDeg), 4),
+      "turn_stop_post_dwell_progress_deg": round(float(value.turnStopPostDwellProgressDeg), 4),
+      "road_evidence_window_start_mono_time": int(value.roadEvidenceWindowStartMonoTime),
+      "road_evidence_window_start_present": bool(value.roadEvidenceWindowStartPresent),
+      "driver_assist_raw_torque_only": bool(value.driverAssistRawTorqueOnly),
       "stall_releases": [{
         "release_mono_time": int(release.releaseMonoTime),
         "offset_from_trigger_s": round(float(release.offsetFromTriggerS), 4),
@@ -355,6 +420,50 @@ def _payload(event: Any) -> dict[str, Any]:
       } for onset in value.onsets],
     }
   return {}
+
+
+def _group_priority(record: dict[str, Any]) -> int:
+  """Priority table for choosing a group's primary event (A4). Highest wins."""
+  event_type = record.get("event_type", "")
+  if event_type == "lat.unwindProgressDeficit":
+    payload = record.get("payload") or {}
+    if payload.get("driver_assisted_unwind") or payload.get("driver_causation") == "interventionBacked":
+      return GROUP_PRIMARY_PRIORITY_DRIVER_ASSISTED_UNWIND
+    return GROUP_PRIMARY_PRIORITY_AUTONOMOUS_UNWIND
+  if isinstance(event_type, str) and event_type.startswith("long."):
+    return GROUP_PRIMARY_PRIORITY_TURN_STOP_AND_LONG
+  return GROUP_PRIMARY_PRIORITY.get(event_type, GROUP_PRIMARY_PRIORITY_DEFAULT)
+
+
+def _assign_group_role(record: dict[str, Any], groups: dict[str, list[dict[str, Any]]],
+                       known_group_primaries: dict[str, str]) -> None:
+  """Set group_role/primary_event_id on `record` in place (A4).
+
+  Records older than DESIGNATION_MIN_VERSION always self-designate as
+  primary (no priority computation, no cross-group lookup) so rebuild can
+  never re-designate a v5-era group. `groups` must include every event
+  scanned for this route this round, including a candidate's lookahead
+  following-segment members, so a group that straddles a segment boundary
+  is designated identically whether seen in one round or two (A4).
+  """
+  if int(record["version"]) < DESIGNATION_MIN_VERSION:
+    record["group_role"] = "primary"
+    record["primary_event_id"] = record["event_id"]
+    return
+  group_id = record["group_id"]
+  primary_event_id = known_group_primaries.get(group_id)
+  if primary_event_id is None:
+    members = groups.get(group_id) or [record]
+    chosen = min(
+      members,
+      key=lambda member: (-_group_priority(member), member["occurred_mono_time"], member["event_id"]),
+    )
+    primary_event_id = chosen["event_id"]
+    # First-manifested-primary-wins: cache immediately so any other
+    # write-eligible member of this same group in this same round agrees.
+    known_group_primaries[group_id] = primary_event_id
+  record["group_role"] = "primary" if record["event_id"] == primary_event_id else "secondary"
+  record["primary_event_id"] = primary_event_id
 
 
 def event_to_record(event: Any, acknowledgment: Any | None, route: str, segment: int,
@@ -526,6 +635,43 @@ def load_event_ids(*manifest_paths: Path) -> set[str]:
   return event_ids
 
 
+def load_group_primaries(*manifest_paths: Path) -> dict[str, str]:
+  """Harvest group_id -> primary event_id from already-manifested lines (A4).
+
+  A `group_role == "primary"` line claims its group directly; a
+  `group_role == "secondary"` line's `primary_event_id` also claims the
+  group (covers a secondary manifesting before its primary does). First
+  manifested wins per group_id, so callers should pass paths oldest-first
+  (rotated manifest, then the current active manifest).
+  """
+  primaries: dict[str, str] = {}
+  for manifest_path in manifest_paths:
+    try:
+      with manifest_path.open(encoding="utf-8") as file:
+        for line in file:
+          try:
+            event = json.loads(line)
+          except ValueError:
+            continue
+          if not isinstance(event, dict):
+            continue
+          group_id = event.get("group_id")
+          if not isinstance(group_id, str) or not group_id or group_id in primaries:
+            continue
+          role = event.get("group_role")
+          if role == "primary":
+            event_id = event.get("event_id")
+            if isinstance(event_id, str) and event_id:
+              primaries[group_id] = event_id
+          elif role == "secondary":
+            primary_event_id = event.get("primary_event_id")
+            if isinstance(primary_event_id, str) and primary_event_id:
+              primaries[group_id] = primary_event_id
+    except OSError:
+      pass
+  return primaries
+
+
 def rotate_manifest(manifest_path: Path, rotated_path: Path, incoming_bytes: int,
                     max_bytes: int = MANIFEST_MAX_BYTES) -> None:
   try:
@@ -572,8 +718,11 @@ def _segment_paths(log_root: Path) -> list[Path]:
 
 def collect_records(log_root: Path, candidate_paths: list[Path],
                     all_segment_paths: list[Path],
-                    reader_factory: Callable[[str], Iterable[Any]]) -> tuple[list[dict[str, Any]], set[str]]:
+                    reader_factory: Callable[[str], Iterable[Any]],
+                    known_group_primaries: dict[str, str] | None = None) -> tuple[list[dict[str, Any]], set[str]]:
   """Scan each candidate route in two passes, then join events to the newest acknowledgment by ID."""
+  if known_group_primaries is None:
+    known_group_primaries = {}
   path_by_key = {
     parsed: path
     for path in all_segment_paths
@@ -625,6 +774,37 @@ def collect_records(log_root: Path, candidate_paths: list[Path],
     ]
     route_start_mono_time = min(route_start_times) if route_start_times else 0
 
+    # Build every event's record across ALL scanned segments of this route —
+    # write-eligible candidates AND their lookahead following segment — so
+    # primary designation below sees group members that straddle a segment
+    # boundary (A4), even though only write-eligible records are appended to
+    # the output. `groups` feeds priority computation; only write-eligible
+    # records are ever mutated with a group_role/primary_event_id or written.
+    route_records_by_path: dict[Path, list[dict[str, Any]]] = {}
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for path, result in scanned.items():
+      if result.start_mono_time is None:
+        continue
+      path_records: list[dict[str, Any]] = []
+      for marker_time, event in result.events:
+        event_id = str(event.eventId)
+        if not event_id:
+          continue
+        acknowledgment = acknowledgments.get(event_id)
+        record = event_to_record(
+          event,
+          acknowledgment[1] if acknowledgment is not None else None,
+          result.route,
+          result.segment,
+          marker_time,
+          result.start_mono_time,
+          route_start_mono_time,
+          acknowledgment[0] if acknowledgment is not None else None,
+        )
+        path_records.append(record)
+        groups[record["group_id"]].append(record)
+      route_records_by_path[path] = path_records
+
     for candidate in route_candidates:
       if candidate in deferred or candidate in failed or candidate not in scanned:
         continue
@@ -636,21 +816,8 @@ def collect_records(log_root: Path, candidate_paths: list[Path],
 
       result = scanned[candidate]
       if result.start_mono_time is not None:
-        for marker_time, event in result.events:
-          event_id = str(event.eventId)
-          if not event_id:
-            continue
-          acknowledgment = acknowledgments.get(event_id)
-          record = event_to_record(
-            event,
-            acknowledgment[1] if acknowledgment is not None else None,
-            result.route,
-            result.segment,
-            marker_time,
-            result.start_mono_time,
-            route_start_mono_time,
-            acknowledgment[0] if acknowledgment is not None else None,
-          )
+        for record in route_records_by_path.get(candidate, []):
+          _assign_group_role(record, groups, known_group_primaries)
           context = record["effective_context"]
           context_segments = protect_context(
             log_root, result.route, result.segment, context["before"], context["after"],
@@ -693,6 +860,9 @@ def scan_once(log_root: Path, event_root: Path = EVENT_ROOT,
   state_path = event_root / STATE_NAME
   processed = set() if scan_all else set(load_json(state_path, []))
   known_ids = load_event_ids(manifest_path, rotated_path)
+  # Oldest-first (rotated, then active) so first-manifested-primary-wins
+  # reads chronologically (A4).
+  known_group_primaries = load_group_primaries(rotated_path, manifest_path)
   all_segments = _segment_paths(log_root)
   present_segments = {path.name for path in all_segments}
   candidates = [
@@ -702,8 +872,16 @@ def scan_once(log_root: Path, event_root: Path = EVENT_ROOT,
     and find_rlog(path) is not None
     and (scan_all or is_preserved(path))
   ]
-  events, scanned = collect_records(log_root, candidates, all_segments, reader_factory)
+  events, scanned = collect_records(log_root, candidates, all_segments, reader_factory, known_group_primaries)
+  ids_before_append = set(known_ids)
   added = append_events(manifest_path, rotated_path, events, known_ids)
+  if added:
+    added_ids = known_ids - ids_before_append
+    primary_count = sum(
+      1 for event in events
+      if event["event_id"] in added_ids and event.get("group_role") != "secondary"
+    )
+    cloudlog.info(f"driving_event_indexer: indexed {added} event(s) ({primary_count} primary)")
   processed.update(scanned)
   processed &= present_segments
   atomic_write_json(state_path, sorted(processed))
@@ -733,7 +911,9 @@ def rebuild(log_root: Path, event_root: Path = EVENT_ROOT,
     path for path in all_segments
     if is_complete(path) and find_rlog(path) is not None
   ]
-  events, scanned = collect_records(log_root, candidates, all_segments, reader_factory)
+  # Rebuild recomputes designation from scratch: empty known-ids AND an
+  # empty known-primary map, so it never inherits a stale primary choice.
+  events, scanned = collect_records(log_root, candidates, all_segments, reader_factory, {})
   append_events(temporary_manifest, temporary_rotated, events, set())
   if not temporary_manifest.exists():
     temporary_manifest.touch(mode=0o600)
@@ -752,6 +932,8 @@ def rebuild(log_root: Path, event_root: Path = EVENT_ROOT,
   finally:
     os.close(directory_fd)
   atomic_write_json(state_path, sorted(scanned))
+  primary_count = sum(1 for event in events if event.get("group_role") != "secondary")
+  cloudlog.info(f"driving_event_indexer: rebuilt {len(events)} event(s) ({primary_count} primary)")
   return len(events)
 
 
@@ -764,15 +946,12 @@ def main() -> None:
   args = parser.parse_args()
 
   if args.rebuild:
-    added = rebuild(args.log_root, args.event_root)
-    cloudlog.info(f"driving_event_indexer: rebuilt {added} event(s)")
+    rebuild(args.log_root, args.event_root)
     return
 
   while True:
     try:
-      added = scan_once(args.log_root, args.event_root)
-      if added:
-        cloudlog.info(f"driving_event_indexer: indexed {added} new event(s)")
+      scan_once(args.log_root, args.event_root)
     except Exception:
       cloudlog.exception("driving_event_indexer: scan failed")
     if args.once:

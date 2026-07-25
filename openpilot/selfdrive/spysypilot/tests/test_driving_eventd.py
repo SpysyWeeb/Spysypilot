@@ -8,6 +8,10 @@ from openpilot.selfdrive.spysypilot.driving_eventd import (
   EventSubmitter,
   EventCandidate,
   EventRecorder,
+  GROUP_KEY_PRUNE_NS,
+  GROUP_MAX_LIFETIME_NS,
+  ROAD_CONFIDENCE_FLOOR,
+  ROAD_SUBSTANTIAL_CONFIDENCE_PENALTY,
   build_message,
   lateral_candidate,
   lateral_sample,
@@ -167,6 +171,84 @@ def test_semantic_episode_group_survives_generic_time_window():
   first = recorder.accept(first_candidate)
   second = recorder.accept(second_candidate)
   assert first.group_id == second.group_id == "episode-group"
+
+
+def test_distinct_keys_ten_seconds_apart_get_different_groups():
+  # A3: unlike an exact-key match, two genuinely different physical
+  # maneuvers (distinct episode keys) more than the keyless chain window
+  # apart must NOT share a group.
+  recorder = EventRecorder()
+  first = recorder.accept(EventCandidate(
+    0, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "first", episode_key="lat:first",
+  ))
+  second = recorder.accept(EventCandidate(
+    10_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "second", episode_key="lat:second",
+  ))
+  assert second.group_id != first.group_id
+
+
+def test_group_key_last_seen_refresh_is_monotone_under_out_of_order_occurrence():
+  # A3: candidates within one update() call are only sorted by occurred
+  # time; across separate accept() calls, detection lag differs per
+  # detector, so a later accept() can carry an EARLIER occurred_mono_time.
+  # The key's last_seen bookkeeping must never rewind, or a still-related
+  # key could be pruned early.
+  recorder = EventRecorder()
+  key = "lat:episode"
+  first = recorder.accept(EventCandidate(
+    20_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "first", episode_key=key,
+  ))
+  second = recorder.accept(EventCandidate(
+    5_000_000_000, "lateral", "automatic", "lat.handoffMismatch", "test", 6,
+    "warning", 0.8, "second", episode_key=key,
+  ))
+  assert second.group_id == first.group_id
+  # An unrelated key far enough away triggers a memory-only prune sweep
+  # (GROUP_KEY_PRUNE_NS after the correct, monotone last_seen of 20s): if
+  # last_seen had wrongly rewound to 5s here, this sweep would evict `key`.
+  assert 40_000_000_000 - 20_000_000_000 <= GROUP_KEY_PRUNE_NS
+  assert 40_000_000_000 - 5_000_000_000 > GROUP_KEY_PRUNE_NS
+  unrelated = recorder.accept(EventCandidate(
+    40_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "unrelated", episode_key="lat:other",
+  ))
+  assert unrelated.group_id != first.group_id
+  third = recorder.accept(EventCandidate(
+    40_100_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "third", episode_key=key,
+  ))
+  assert third.group_id == first.group_id
+
+
+def test_group_hard_lifetime_splits_a_pathological_same_key_chain():
+  # A3: exact-key reuse alone would chain a same-key stream forever; the
+  # hard GROUP_MAX_LIFETIME_NS cap must split it and re-bind the key.
+  recorder = EventRecorder()
+  key = "lat:episode"
+  first = recorder.accept(EventCandidate(
+    0, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "first", episode_key=key,
+  ))
+  second = recorder.accept(EventCandidate(
+    GROUP_MAX_LIFETIME_NS - 1_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "second", episode_key=key,
+  ))
+  assert second.group_id == first.group_id
+  third = recorder.accept(EventCandidate(
+    GROUP_MAX_LIFETIME_NS + 1_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "third", episode_key=key,
+  ))
+  assert third.group_id != first.group_id
+  # The key is now bound to the new group; a later same-key candidate still
+  # within THAT group's own hard lifetime reuses it.
+  fourth = recorder.accept(EventCandidate(
+    GROUP_MAX_LIFETIME_NS + 2_000_000_000, "lateral", "automatic", "lat.stallRelease", "test", 6,
+    "warning", 0.8, "fourth", episode_key=key,
+  ))
+  assert fourth.group_id == third.group_id
 
 
 def test_retrying_an_accepted_event_retains_ids():
@@ -417,6 +499,155 @@ def test_lateral_candidate_uses_physical_crossing_and_later_confirmation_times()
   assert candidate.event_type == "lat.committedHandoffHarshness"
 
 
+def test_road_confidence_penalty_applies_to_non_rescued_substantial_road_events():
+  evidence = LateralEvidence(
+    1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+    road_interaction="substantial",
+  )
+  detection = LateralDetection(
+    "centerOvershoot", "warning", 0.90, "road bump", evidence,
+    occurred_mono_time=1.0, detected_mono_time=1.0,
+  )
+  candidate = lateral_candidate(LateralSample(1.0), detection)
+  # A7: confidence_out == max(confidence_in - PENALTY, FLOOR), an honest
+  # invariant — not a claim that the 0.50 floor is reached in practice.
+  assert candidate.confidence == pytest.approx(
+    max(0.90 - ROAD_SUBSTANTIAL_CONFIDENCE_PENALTY, ROAD_CONFIDENCE_FLOOR),
+  )
+  assert candidate.confidence == pytest.approx(0.85)
+
+
+def test_road_confidence_penalty_never_applies_to_intervention_backed_or_assisted_unwind():
+  rescued_by_causation = LateralEvidence(
+    1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+    road_interaction="substantial", driver_causation="interventionBacked",
+  )
+  detection = LateralDetection(
+    "unwindProgressDeficit", "info", 0.95, "assisted", rescued_by_causation,
+    occurred_mono_time=1.0, detected_mono_time=1.0,
+  )
+  candidate = lateral_candidate(LateralSample(1.0), detection)
+  assert candidate.confidence == 0.95
+
+  # driver_assisted_unwind alone (independent of driver_causation) also
+  # exempts the event from the penalty.
+  rescued_by_flag = LateralEvidence(
+    1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+    road_interaction="substantial", driver_assisted_unwind=True,
+  )
+  flag_detection = LateralDetection(
+    "unwindProgressDeficit", "info", 0.95, "assisted", rescued_by_flag,
+    occurred_mono_time=1.0, detected_mono_time=1.0,
+  )
+  flag_candidate = lateral_candidate(LateralSample(1.0), flag_detection)
+  assert flag_candidate.confidence == 0.95
+
+
+def test_road_confidence_penalty_not_applied_when_road_interaction_not_substantial():
+  evidence = LateralEvidence(
+    1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+  )
+  detection = LateralDetection(
+    "centerOvershoot", "warning", 0.90, "clean", evidence,
+    occurred_mono_time=1.0, detected_mono_time=1.0,
+  )
+  candidate = lateral_candidate(LateralSample(1.0), detection)
+  assert candidate.confidence == 0.90
+
+
+def test_road_confidence_floor_is_an_invariant_not_a_reachable_branch():
+  # The lowest real emit-site confidence literal is 0.80, and
+  # 0.80 - 0.05 = 0.75 never reaches the 0.50 floor in practice; assert the
+  # formula directly rather than claiming the floor engages.
+  for confidence_in in (0.80, 0.90, 0.95, 1.0):
+    evidence = LateralEvidence(
+      1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+      road_interaction="substantial",
+    )
+    detection = LateralDetection(
+      "centerOvershoot", "warning", confidence_in, "road bump", evidence,
+      occurred_mono_time=1.0, detected_mono_time=1.0,
+    )
+    candidate = lateral_candidate(LateralSample(1.0), detection)
+    assert candidate.confidence == pytest.approx(
+      max(confidence_in - ROAD_SUBSTANTIAL_CONFIDENCE_PENALTY, ROAD_CONFIDENCE_FLOOR),
+    )
+    assert candidate.confidence > ROAD_CONFIDENCE_FLOOR
+
+
+def test_lateral_build_message_wires_v6_present_bit_and_causation_fields():
+  # v6 monoTime+Present pairs use `is not None` as the presence test, NOT
+  # `> 0.0` like the legacy torque-neutral-crossing fields: a real mono time
+  # can legitimately land on exactly 0.0 and must still serialize Present.
+  evidence = LateralEvidence(
+    1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+    requested_crown_neutral_mono_time=0.0,
+    wheel_progress_5_mono_time=0.0,
+    road_evidence_window_start_mono_time=0.0,
+    unwind_rebound_start_mono_time=None,
+    future_unwind_commit_mono_time=1.0,
+    high_angle_evidence_valid=True,
+    high_angle_unwind_scale=0.42,
+    torque_command_before_high_angle_exit=0.33,
+    high_angle_unwind_old_torque_correction=0.11,
+    high_angle_unwind_old_direction_torque=0.09,
+    old_turn_sign=-1.0,
+    driver_causation="interventionBacked",
+    driver_assist_raw_torque_only=True,
+    unwind_neutral_torque=0.18,
+    unwind_phase_direction=-1.0,
+  )
+  detection = LateralDetection(
+    "unwindProgressDeficit", "info", 0.95, "reason", evidence,
+    occurred_mono_time=1.0, detected_mono_time=1.0,
+  )
+  candidate = lateral_candidate(LateralSample(1.0), detection)
+  msg = build_message(AcceptedEvent("event", "group", candidate)).as_reader().drivingEvent
+  payload = msg.payload.lateral
+  assert payload.requestedCrownNeutralPresent
+  assert payload.requestedCrownNeutralMonoTime == 0
+  assert payload.wheelProgress5Present
+  assert payload.wheelProgress5MonoTime == 0
+  assert payload.roadEvidenceWindowStartPresent
+  assert payload.roadEvidenceWindowStartMonoTime == 0
+  assert not payload.unwindReboundStartPresent
+  assert payload.futureUnwindCommitPresent
+  assert payload.futureUnwindCommitMonoTime == 1_000_000_000
+  assert payload.highAngleEvidenceValid
+  assert payload.highAngleUnwindScale == pytest.approx(0.42)
+  assert payload.torqueCommandBeforeHighAngleExit == pytest.approx(0.33)
+  assert payload.highAngleUnwindOldTorqueCorrection == pytest.approx(0.11)
+  assert payload.highAngleUnwindOldDirectionTorque == pytest.approx(0.09)
+  assert payload.oldTurnSign == pytest.approx(-1.0)
+  assert payload.driverCausation == "interventionBacked"
+  assert payload.driverAssistRawTorqueOnly
+  assert payload.unwindNeutralTorque == pytest.approx(0.18)
+  assert payload.unwindPhaseDirection == pytest.approx(-1.0)
+
+
+def test_lateral_build_message_high_angle_scalars_zero_when_invalid():
+  evidence = LateralEvidence(
+    1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
+    high_angle_evidence_valid=False,
+    high_angle_unwind_scale=0.9,
+    torque_command_before_high_angle_exit=0.9,
+    high_angle_unwind_old_torque_correction=0.9,
+    high_angle_unwind_old_direction_torque=0.9,
+  )
+  detection = LateralDetection(
+    "centerOvershoot", "warning", 0.9, "reason", evidence,
+    occurred_mono_time=1.0, detected_mono_time=1.0,
+  )
+  candidate = lateral_candidate(LateralSample(1.0), detection)
+  msg = build_message(AcceptedEvent("event", "group", candidate)).as_reader().drivingEvent
+  payload = msg.payload.lateral
+  assert not payload.highAngleEvidenceValid
+  assert payload.highAngleUnwindScale == 0.0
+  assert payload.torqueCommandBeforeHighAngleExit == 0.0
+  assert payload.highAngleUnwindOldTorqueCorrection == 0.0
+  assert payload.highAngleUnwindOldDirectionTorque == 0.0
+
+
 @pytest.mark.parametrize(
   ("internal_name", "public_name"),
   [
@@ -424,7 +655,7 @@ def test_lateral_candidate_uses_physical_crossing_and_later_confirmation_times()
     ("turn_stop_turn", "lat.turnStopTurn"),
   ],
 )
-def test_lateral_v5_names_times_windows_and_missing_optional_evidence_are_safe(internal_name, public_name):
+def test_lateral_names_times_windows_and_missing_optional_evidence_are_safe(internal_name, public_name):
   evidence = LateralEvidence(
     1.0, 3.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:v5", 6.0, 4.0,
   )
@@ -435,10 +666,10 @@ def test_lateral_v5_names_times_windows_and_missing_optional_evidence_are_safe(i
   candidate = lateral_candidate(LateralSample(2.5), detection)
   msg = build_message(AcceptedEvent("v5", "group", candidate)).as_reader().drivingEvent
 
-  assert LAT_DETECTOR_VERSION == 5
+  assert LAT_DETECTOR_VERSION == 6
   assert candidate.event_type == public_name
   assert msg.eventType == public_name
-  assert msg.detectorVersion == 5
+  assert msg.detectorVersion == 6
   assert msg.occurredMonoTime == 1_250_000_000
   assert msg.detectedMonoTime == 2_500_000_000
   assert msg.analysisWindowBeforeS == 6.0
@@ -451,6 +682,22 @@ def test_lateral_v5_names_times_windows_and_missing_optional_evidence_are_safe(i
   assert msg.payload.lateral.turnStopActualDampingState == "unavailable"
   assert msg.payload.lateral.unwindRequestedTorqueAtTrigger == 0.0
   assert not msg.payload.lateral.driverInvolvedDuringDwell
+  # v6 optional evidence, absent on this legacy-shaped evidence object.
+  assert not msg.payload.lateral.highAngleEvidenceValid
+  assert msg.payload.lateral.highAngleUnwindScale == 0.0
+  assert not msg.payload.lateral.futureUnwindCommitPresent
+  assert msg.payload.lateral.futureUnwindCommitMonoTime == 0
+  assert not msg.payload.lateral.requestedCrownNeutralPresent
+  assert msg.payload.lateral.requestedCrownNeutralMonoTime == 0
+  assert not msg.payload.lateral.appliedCrownNeutralPresent
+  assert not msg.payload.lateral.wheelProgress5Present
+  assert not msg.payload.lateral.wheelProgress20Present
+  assert not msg.payload.lateral.wheelProgress50Present
+  assert not msg.payload.lateral.unwindReboundStartPresent
+  assert msg.payload.lateral.unwindReboundMaxMagnitude == 0.0
+  assert msg.payload.lateral.driverCausation == ""
+  assert not msg.payload.lateral.driverAssistRawTorqueOnly
+  assert not msg.payload.lateral.roadEvidenceWindowStartPresent
 
 
 def test_live_pose_sampler_uses_its_own_timestamp_and_updates_bump_once():
@@ -594,3 +841,109 @@ def test_lateral_sampler_uses_actual_caroutput_damping_not_torque_d_term():
   assert invalid.actual_damping_amount is None
   assert invalid.actual_damping_state is None
   assert invalid.damping_version is None
+
+
+def test_lateral_sampler_wires_crown_neutral_and_high_angle_fields_together():
+  torque_state = SimpleNamespace(
+    active=True, desiredLateralAccel=0.2, actualLateralAccel=0.1, p=0.3, d=-0.72,
+    version=4, referenceVersion=4, referenceRate=0.5, referenceReachableTargetTorque=0.1,
+    trackingMeasurementRate=-0.22,
+    referenceUnwindScale=0.5, referenceSustainedUnwindScale=0.6, unwindEffectivePhase=0.7,
+    unwindPhaseOverspeed=0.8, unwindSameEpisode=True,
+    unwindNeutralTorque=0.18, unwindPhaseDirection=-1.0,
+    highAngleUnwindScale=0.42, torqueCommandBeforeHighAngleExit=0.33,
+    highAngleUnwindOldTorqueCorrection=0.11, highAngleUnwindOldDirectionTorque=0.09,
+  )
+
+  class FakeSubMaster:
+    def __init__(self):
+      self.data = {
+        "controlsState": SimpleNamespace(
+          lateralControlState=SimpleNamespace(which=lambda: "torqueState", torqueState=torque_state),
+        ),
+        "carState": SimpleNamespace(
+          steeringAngleDeg=30.0, vEgo=4.0, steeringTorque=0.0,
+          steeringPressed=False, steeringTorqueEps=20.0,
+        ),
+        "carControl": SimpleNamespace(latActive=True, actuators=SimpleNamespace(torque=0.6)),
+        "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(torque=0.5)),
+      }
+      self.logMonoTime = {"controlsState": 2_000_000_000}
+      self.valid = {"carOutput": False}
+
+    def __getitem__(self, name):
+      return self.data[name]
+
+  sample = lateral_sample(FakeSubMaster(), SteeringRateFilter(), False)
+  assert sample.unwind_neutral_torque == pytest.approx(0.18)
+  assert sample.unwind_phase_direction == pytest.approx(-1.0)
+  assert sample.high_angle_unwind_scale == pytest.approx(0.42)
+  assert sample.torque_command_before_high_angle_exit == pytest.approx(0.33)
+  assert sample.high_angle_unwind_old_torque_correction == pytest.approx(0.11)
+  assert sample.high_angle_unwind_old_direction_torque == pytest.approx(0.09)
+
+
+def test_lateral_sampler_high_angle_fields_all_none_together_when_schema_lacks_them():
+  # DESIGN §1.1: the four high-angle fields are grouped under one
+  # availability check so they are all-None (schema lacks them) or
+  # all-float together — never gated on carOutput's damping_valid.
+  torque_state = SimpleNamespace(
+    active=True, desiredLateralAccel=0.2, actualLateralAccel=0.1, p=0.3, d=-0.72,
+    version=4, unwindNeutralTorque=0.05, unwindPhaseDirection=1.0,
+  )
+
+  class FakeSubMaster:
+    def __init__(self):
+      self.data = {
+        "controlsState": SimpleNamespace(
+          lateralControlState=SimpleNamespace(which=lambda: "torqueState", torqueState=torque_state),
+        ),
+        "carState": SimpleNamespace(
+          steeringAngleDeg=10.0, vEgo=4.0, steeringTorque=0.0,
+          steeringPressed=False, steeringTorqueEps=20.0,
+        ),
+        "carControl": SimpleNamespace(latActive=True, actuators=SimpleNamespace(torque=0.1)),
+        "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(torque=0.1)),
+      }
+      self.logMonoTime = {"controlsState": 1_000_000_000}
+      self.valid = {"carOutput": False}
+
+    def __getitem__(self, name):
+      return self.data[name]
+
+  sample = lateral_sample(FakeSubMaster(), SteeringRateFilter(), False)
+  assert sample.unwind_neutral_torque == pytest.approx(0.05)
+  assert sample.unwind_phase_direction == pytest.approx(1.0)
+  assert sample.high_angle_unwind_scale is None
+  assert sample.torque_command_before_high_angle_exit is None
+  assert sample.high_angle_unwind_old_torque_correction is None
+  assert sample.high_angle_unwind_old_direction_torque is None
+
+
+def test_lateral_sampler_defaults_crown_and_high_angle_fields_without_torque_state():
+  class FakeSubMaster:
+    def __init__(self):
+      self.data = {
+        "controlsState": SimpleNamespace(
+          lateralControlState=SimpleNamespace(which=lambda: "other"),
+        ),
+        "carState": SimpleNamespace(
+          steeringAngleDeg=0.0, vEgo=0.0, steeringTorque=0.0,
+          steeringPressed=False, steeringTorqueEps=0.0,
+        ),
+        "carControl": SimpleNamespace(latActive=False, actuators=SimpleNamespace(torque=0.0)),
+        "carOutput": SimpleNamespace(actuatorsOutput=SimpleNamespace(torque=0.0)),
+      }
+      self.logMonoTime = {"controlsState": 500_000_000}
+      self.valid = {"carOutput": False}
+
+    def __getitem__(self, name):
+      return self.data[name]
+
+  sample = lateral_sample(FakeSubMaster(), SteeringRateFilter(), False)
+  assert sample.unwind_neutral_torque == 0.0
+  assert sample.unwind_phase_direction == 0.0
+  assert sample.high_angle_unwind_scale is None
+  assert sample.torque_command_before_high_angle_exit is None
+  assert sample.high_angle_unwind_old_torque_correction is None
+  assert sample.high_angle_unwind_old_direction_torque is None

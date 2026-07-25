@@ -2,6 +2,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from openpilot.cereal import messaging
 from openpilot.selfdrive.spysypilot.driving_event_indexer import (
   MANIFEST_NAME,
@@ -11,6 +13,7 @@ from openpilot.selfdrive.spysypilot.driving_event_indexer import (
   ROTATED_MANIFEST_NAME,
   append_events,
   event_to_record,
+  load_group_primaries,
   rebuild,
   scan_once,
 )
@@ -104,6 +107,35 @@ def sentinel_message(mono_time, sentinel_type):
   msg = messaging.new_message("sentinel", valid=True)
   msg.logMonoTime = mono_time
   msg.sentinel.type = sentinel_type
+  return msg.as_reader()
+
+
+def driving_event_message(event_id, group_id, event_type, occurred, *, version=3,
+                          domain="lateral", detector_version=6, driver_assisted_unwind=False,
+                          driver_causation="", log_offset=10):
+  """Hand-built drivingEvent message for primary-designation tests (A4)."""
+  msg = messaging.new_message("drivingEvent", valid=True)
+  msg.logMonoTime = occurred + log_offset
+  event = msg.drivingEvent
+  event.version = version
+  event.eventId = event_id
+  event.groupId = group_id
+  event.occurredMonoTime = occurred
+  event.detectedMonoTime = occurred
+  event.domain = domain
+  event.source = "user" if domain == "manual" else "automatic"
+  event.eventType = event_type
+  event.detector = "test"
+  event.detectorVersion = detector_version
+  event.severity = "warning"
+  event.confidence = 0.9
+  event.attribution = "controller"
+  if event_type == "lat.unwindProgressDeficit":
+    payload = event.payload.init("lateral")
+    payload.driverAssistedUnwind = driver_assisted_unwind
+    payload.driverCausation = driver_causation
+  else:
+    event.payload.none = None
   return msg.as_reader()
 
 
@@ -570,3 +602,367 @@ def test_corrupt_manifest_and_state_do_not_stop_scan(tmp_path):
     return [baseline_message(), event_message()]
 
   assert scan_once(log_root, event_root, reader) == 1
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
+def test_designation_version_gate_legacy_always_primary_current_computes_role(tmp_path, version):
+  # A4: designation applies ONLY to version >= 3 (DESIGNATION_MIN_VERSION).
+  # Legacy (v5-era and earlier) records always self-designate as primary,
+  # regardless of any higher-priority sibling sharing their group_id.
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+
+  def reader(_path):
+    return [
+      baseline_message(),
+      driving_event_message("low", "group", "lat.stallRelease", 100_000_000_000, version=version),
+      driving_event_message(
+        "high", "group", "manual.general", 100_500_000_000, version=version, domain="manual",
+      ),
+    ]
+
+  assert scan_once(log_root, event_root, reader) == 2
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  if version < 3:
+    assert records["low"]["group_role"] == "primary"
+    assert records["low"]["primary_event_id"] == "low"
+    assert records["high"]["group_role"] == "primary"
+    assert records["high"]["primary_event_id"] == "high"
+  else:
+    assert records["high"]["group_role"] == "primary"
+    assert records["high"]["primary_event_id"] == "high"
+    assert records["low"]["group_role"] == "secondary"
+    assert records["low"]["primary_event_id"] == "high"
+
+
+def test_designation_priority_ordering_manual_outranks_everything(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+  base = 100_000_000_000
+
+  def reader(_path):
+    return [
+      baseline_message(),
+      driving_event_message("stall", "group", "lat.stallRelease", base + 1),
+      driving_event_message("long", "group", "long.stopJolt", base + 2, domain="longitudinal"),
+      driving_event_message("turnstop", "group", "lat.turnStopTurn", base + 3),
+      driving_event_message("handoff", "group", "lat.handoffMismatch", base + 4),
+      driving_event_message(
+        "autounwind", "group", "lat.unwindProgressDeficit", base + 5, driver_assisted_unwind=False,
+      ),
+      driving_event_message(
+        "assistedunwind", "group", "lat.unwindProgressDeficit", base + 6, driver_assisted_unwind=True,
+      ),
+      driving_event_message("manual", "group", "manual.general", base + 7, domain="manual"),
+    ]
+
+  assert scan_once(log_root, event_root, reader) == 7
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  assert records["manual"]["group_role"] == "primary"
+  assert records["manual"]["primary_event_id"] == "manual"
+  for event_id in ("stall", "long", "turnstop", "handoff", "autounwind", "assistedunwind"):
+    assert records[event_id]["group_role"] == "secondary"
+    assert records[event_id]["primary_event_id"] == "manual"
+
+
+def test_designation_priority_ordering_among_automatic_tiers(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+  base = 100_000_000_000
+
+  def reader(_path):
+    return [
+      baseline_message(),
+      driving_event_message("stall", "group", "lat.stallRelease", base + 1),
+      driving_event_message("long", "group", "long.stopJolt", base + 2, domain="longitudinal"),
+      driving_event_message("turnstop", "group", "lat.turnStopTurn", base + 3),
+      driving_event_message("handoff", "group", "lat.handoffMismatch", base + 4),
+      driving_event_message(
+        "autounwind", "group", "lat.unwindProgressDeficit", base + 5, driver_assisted_unwind=False,
+      ),
+      driving_event_message(
+        "assistedunwind", "group", "lat.unwindProgressDeficit", base + 6, driver_assisted_unwind=True,
+      ),
+    ]
+
+  assert scan_once(log_root, event_root, reader) == 6
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  assert records["assistedunwind"]["group_role"] == "primary"
+  for event_id in ("stall", "long", "turnstop", "handoff", "autounwind"):
+    assert records[event_id]["group_role"] == "secondary"
+    assert records[event_id]["primary_event_id"] == "assistedunwind"
+  # driver_causation == "interventionBacked" is equivalent to the
+  # driver_assisted_unwind flag for this priority tier.
+  assert records["autounwind"]["group_role"] == "secondary"
+
+
+def test_designation_driver_causation_intervention_backed_equivalent_to_flag(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+  base = 100_000_000_000
+
+  def reader(_path):
+    return [
+      baseline_message(),
+      driving_event_message("handoff", "group", "lat.handoffMismatch", base + 1),
+      driving_event_message(
+        "rescued", "group", "lat.unwindProgressDeficit", base + 2,
+        driver_assisted_unwind=False, driver_causation="interventionBacked",
+      ),
+    ]
+
+  assert scan_once(log_root, event_root, reader) == 2
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  assert records["rescued"]["group_role"] == "primary"
+  assert records["handoff"]["primary_event_id"] == "rescued"
+
+
+def test_designation_tie_break_by_earliest_occurred_time(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+  base = 100_000_000_000
+
+  def reader(_path):
+    return [
+      baseline_message(),
+      # Same priority tier (both 80); "zzz-early" occurs first and must win
+      # despite a lexicographically later event_id.
+      driving_event_message("zzz-early", "group", "lat.handoffMismatch", base),
+      driving_event_message("aaa-late", "group", "lat.centerOvershoot", base + 1_000_000_000),
+    ]
+
+  assert scan_once(log_root, event_root, reader) == 2
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  assert records["zzz-early"]["group_role"] == "primary"
+  assert records["aaa-late"]["group_role"] == "secondary"
+  assert records["aaa-late"]["primary_event_id"] == "zzz-early"
+
+
+def test_designation_tie_break_lexicographic_event_id_when_occurred_matches(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+  occurred = 100_000_000_000
+
+  def reader(_path):
+    return [
+      baseline_message(),
+      driving_event_message("bbb", "group", "lat.handoffMismatch", occurred, log_offset=10),
+      driving_event_message("aaa", "group", "lat.centerOvershoot", occurred, log_offset=20),
+    ]
+
+  assert scan_once(log_root, event_root, reader) == 2
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  assert records["aaa"]["group_role"] == "primary"
+  assert records["bbb"]["group_role"] == "secondary"
+  assert records["bbb"]["primary_event_id"] == "aaa"
+
+
+def test_designation_segment_boundary_straddling_matches_rebuild(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 2)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+
+  group_id = "group"
+  low_priority_event = driving_event_message(
+    "turnstop", group_id, "lat.turnStopTurn", 100_000_000_000,
+  )
+  high_priority_event = driving_event_message(
+    "assisted", group_id, "lat.unwindProgressDeficit", 101_000_000_000, driver_assisted_unwind=True,
+  )
+
+  def reader(path):
+    segment = int(Path(path).parent.name.rsplit("--", 1)[1])
+    if segment == 0:
+      return [baseline_message(), low_priority_event]
+    if segment == 1:
+      return [baseline_message(), high_priority_event]
+    raise AssertionError(f"unexpected segment {segment}")
+
+  # Round 1: only segment 0 is preserved/a route_candidate. Segment 1 is
+  # complete with an rlog, so it is visible as a LOOKAHEAD for priority
+  # purposes (A4) without being written this round.
+  assert scan_once(log_root, event_root, reader) == 1
+  round_one_lines = (event_root / MANIFEST_NAME).read_text().splitlines()
+  assert len(round_one_lines) == 1
+  round_one_record = json.loads(round_one_lines[0])
+  assert round_one_record["event_id"] == "turnstop"
+  assert round_one_record["group_role"] == "secondary"
+  assert round_one_record["primary_event_id"] == "assisted"
+
+  # Round 2: segment 1 becomes preserved and is now its own candidate. It
+  # consults the known-primary map (built from segment 0's already-written
+  # secondary line) and self-designates as the primary it already was.
+  os.setxattr(log_root / f"{route}--1", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+  assert scan_once(log_root, event_root, reader) == 1
+  all_lines = (event_root / MANIFEST_NAME).read_text().splitlines()
+  assert len(all_lines) == 2
+  incremental_by_id = {json.loads(line)["event_id"]: json.loads(line) for line in all_lines}
+  assert incremental_by_id["assisted"]["group_role"] == "primary"
+  assert incremental_by_id["assisted"]["primary_event_id"] == "assisted"
+  assert incremental_by_id["turnstop"]["group_role"] == "secondary"
+  assert incremental_by_id["turnstop"]["primary_event_id"] == "assisted"
+
+  # Rebuild (single pass, both segments together) must reach the SAME
+  # designation as the incremental two-round scan above.
+  rebuilt_event_root = tmp_path / "rebuilt-events"
+  assert rebuild(log_root, rebuilt_event_root, reader) == 2
+  rebuilt_by_id = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (rebuilt_event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  for event_id in ("turnstop", "assisted"):
+    assert rebuilt_by_id[event_id]["group_role"] == incremental_by_id[event_id]["group_role"]
+    assert rebuilt_by_id[event_id]["primary_event_id"] == incremental_by_id[event_id]["primary_event_id"]
+
+
+def test_rebuild_recomputes_designation_ignoring_stale_prior_manifest(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+
+  group_id = "group"
+  low = driving_event_message("low", group_id, "lat.stallRelease", 100_000_000_000)
+  high = driving_event_message("high", group_id, "manual.general", 100_500_000_000, domain="manual")
+
+  def reader(_path):
+    return [baseline_message(), low, high]
+
+  # Seed a stale manifest that (incorrectly, by construction) claims the
+  # LOW-priority event as primary, as an old/buggy scan might have.
+  event_root.mkdir()
+  stale = {
+    "event_id": "low", "group_id": group_id, "version": 3,
+    "group_role": "primary", "primary_event_id": "low",
+  }
+  (event_root / MANIFEST_NAME).write_text(json.dumps(stale) + "\n")
+
+  assert rebuild(log_root, event_root, reader) == 2
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  # Rebuild recomputes with an EMPTY known-primary map: the priority table
+  # alone decides, regardless of what a stale manifest claimed.
+  assert records["high"]["group_role"] == "primary"
+  assert records["high"]["primary_event_id"] == "high"
+  assert records["low"]["group_role"] == "secondary"
+  assert records["low"]["primary_event_id"] == "high"
+
+
+def test_designation_persists_across_manifest_rotation(tmp_path):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+
+  group_id = "group"
+  low = driving_event_message("low", group_id, "lat.stallRelease", 100_000_000_000)
+  high = driving_event_message("high", group_id, "manual.general", 100_500_000_000, domain="manual")
+
+  def reader(_path):
+    return [baseline_message(), low, high]
+
+  assert scan_once(log_root, event_root, reader) == 2
+  by_id = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  assert by_id["high"]["group_role"] == "primary"
+  assert by_id["low"]["primary_event_id"] == "high"
+
+  # Simulate the active manifest having rotated: move today's content into
+  # the ROTATED file and start a fresh, empty active manifest, as
+  # rotate_manifest() would once the active file grows past its size cap.
+  manifest_path = event_root / MANIFEST_NAME
+  rotated_path = event_root / ROTATED_MANIFEST_NAME
+  manifest_path.rename(rotated_path)
+  manifest_path.touch()
+
+  primaries = load_group_primaries(rotated_path, manifest_path)
+  assert primaries[group_id] == "high"
+
+  # A later sibling of the same group, scanned after rotation, must still
+  # reference the correct (now-rotated) primary.
+  (log_root / f"{route}--1").mkdir(parents=True)
+  (log_root / f"{route}--1" / "rlog.zst").touch()
+  os.setxattr(log_root / f"{route}--1", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+  later = driving_event_message("later", group_id, "lat.stallRelease", 101_000_000_000)
+
+  def reader_two(path):
+    segment = int(Path(path).parent.name.rsplit("--", 1)[1])
+    if segment == 0:
+      return [baseline_message(), low, high]
+    if segment == 1:
+      return [baseline_message(), later]
+    raise AssertionError(f"unexpected segment {segment}")
+
+  assert scan_once(log_root, event_root, reader_two) == 1
+  later_lines = (event_root / MANIFEST_NAME).read_text().splitlines()
+  assert len(later_lines) == 1
+  later_record = json.loads(later_lines[0])
+  assert later_record["event_id"] == "later"
+  assert later_record["group_role"] == "secondary"
+  assert later_record["primary_event_id"] == "high"
+
+
+def test_designation_count_message_reports_primary_subset(tmp_path, caplog):
+  log_root = tmp_path / "realdata"
+  event_root = tmp_path / "events"
+  route = "abc|2026-01-01--00-00-00"
+  make_segments(log_root, route, 1)
+  os.setxattr(log_root / f"{route}--0", PRESERVE_ATTR_NAME, PRESERVE_ATTR_VALUE)
+
+  def reader(_path):
+    return [
+      baseline_message(),
+      driving_event_message("low", "group", "lat.stallRelease", 100_000_000_000),
+      driving_event_message("high", "group", "manual.general", 100_500_000_000, domain="manual"),
+    ]
+
+  assert scan_once(log_root, event_root, reader) == 2
+  records = {
+    json.loads(line)["event_id"]: json.loads(line)
+    for line in (event_root / MANIFEST_NAME).read_text().splitlines()
+  }
+  primary_count = sum(1 for record in records.values() if record["group_role"] != "secondary")
+  assert primary_count == 1

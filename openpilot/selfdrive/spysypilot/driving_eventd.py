@@ -40,11 +40,22 @@ from openpilot.selfdrive.spysypilot.stop_jolt_detector import (
 )
 
 
-EVENT_VERSION = 2
+EVENT_VERSION = 3
 GROUP_WINDOW_NS = 2_500_000_000
+# Strictly greater than lat_event_detector.EPISODE_MAX_LIFETIME_S (20.0 s) plus
+# occurred-time slack: a keyed group's physical episode can never legitimately
+# span longer than the detector's own episode-lifetime cap (A3).
+GROUP_MAX_LIFETIME_NS = 25_000_000_000
+# Memory-only bookkeeping for _episode_groups entries; NOT a relatedness test
+# (exact-key match within GROUP_MAX_LIFETIME_NS is the relatedness proof, A3).
+GROUP_KEY_PRUNE_NS = 30_000_000_000
 CONTEXT_BEFORE = 2
 CONTEXT_AFTER = 1
 ACK_RETRY_INTERVAL_NS = 1_000_000_000
+# A7: confidence penalty for substantial road confounding, never applied to
+# intervention-backed / driver-assisted unwind rescues (the 0.95 literal wins).
+ROAD_SUBSTANTIAL_CONFIDENCE_PENALTY = 0.05
+ROAD_CONFIDENCE_FLOOR = 0.50
 
 
 @dataclass(frozen=True)
@@ -92,24 +103,64 @@ class EventRecorder:
     self.group_window_ns = group_window_ns
     self._group_id = ""
     self._group_last_time = -group_window_ns
+    # episode_key -> (group_id, last_seen_mono_time); last_seen refresh is
+    # monotone (candidates can arrive with out-of-order occurred times within
+    # one update() call since detection lag differs per detector, A3).
     self._episode_groups: dict[str, tuple[str, int]] = {}
+    # group_id -> first-seen mono time, for the hard GROUP_MAX_LIFETIME_NS cap.
+    self._group_first_time: dict[str, int] = {}
+
+  def _mint_group(self, occurred_mono_time: int) -> str:
+    group_id = self.id_factory()
+    self._group_first_time[group_id] = occurred_mono_time
+    return group_id
+
+  def _group_expired(self, group_id: str, occurred_mono_time: int) -> bool:
+    first_time = self._group_first_time.get(group_id)
+    return first_time is None or occurred_mono_time - first_time > GROUP_MAX_LIFETIME_NS
 
   def accept(self, candidate: EventCandidate) -> AcceptedEvent:
     if candidate.episode_key:
       episode_group = self._episode_groups.get(candidate.episode_key)
       if episode_group is None:
-        if not self._group_id or candidate.occurred_mono_time - self._group_last_time > self.group_window_ns:
-          self._group_id = self.id_factory()
-        self._episode_groups[candidate.episode_key] = (self._group_id, candidate.occurred_mono_time)
+        # A brand-new key: chain onto the current running group only if it is
+        # still fresh (keyless-style window) AND has not hit its hard
+        # lifetime; otherwise mint a new group. No idle-staleness test is
+        # applied to an EXISTING key's binding below — exact-key match is
+        # itself the relatedness proof (A3).
+        if (
+          self._group_id
+          and candidate.occurred_mono_time - self._group_last_time <= self.group_window_ns
+          and not self._group_expired(self._group_id, candidate.occurred_mono_time)
+        ):
+          group_id = self._group_id
+        else:
+          group_id = self._mint_group(candidate.occurred_mono_time)
+        self._group_id = group_id
+        self._episode_groups[candidate.episode_key] = (group_id, candidate.occurred_mono_time)
       else:
-        self._group_id = episode_group[0]
-        self._episode_groups[candidate.episode_key] = (self._group_id, candidate.occurred_mono_time)
-    elif not self._group_id or candidate.occurred_mono_time - self._group_last_time > self.group_window_ns:
-      self._group_id = self.id_factory()
+        group_id, last_seen = episode_group
+        if self._group_expired(group_id, candidate.occurred_mono_time):
+          # Hard lifetime exceeded: mint a new group and re-bind the key to it.
+          group_id = self._mint_group(candidate.occurred_mono_time)
+        self._group_id = group_id
+        self._episode_groups[candidate.episode_key] = (group_id, max(last_seen, candidate.occurred_mono_time))
+    elif (
+      not self._group_id
+      or candidate.occurred_mono_time - self._group_last_time > self.group_window_ns
+      or self._group_expired(self._group_id, candidate.occurred_mono_time)
+    ):
+      self._group_id = self._mint_group(candidate.occurred_mono_time)
     self._group_last_time = max(self._group_last_time, candidate.occurred_mono_time)
+    # Bookkeeping-only pruning (not a relatedness/closure signal, A3).
     self._episode_groups = {
       key: value for key, value in self._episode_groups.items()
-      if candidate.occurred_mono_time - value[1] <= 60_000_000_000
+      if candidate.occurred_mono_time - value[1] <= GROUP_KEY_PRUNE_NS
+    }
+    active_group_ids = {value[0] for value in self._episode_groups.values()} | {self._group_id}
+    self._group_first_time = {
+      group_id: first_time for group_id, first_time in self._group_first_time.items()
+      if group_id in active_group_ids
     }
     return AcceptedEvent(self.id_factory(), self._group_id, candidate)
 
@@ -146,6 +197,15 @@ def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> Eve
   substantial_road = evidence is not None and evidence.road_interaction == "substantial"
   if substantial_driver or substantial_road:
     attribution = "mixed"
+  # A7: bounded confidence penalty for substantial road confounding, applied
+  # BEFORE constructing the frozen EventCandidate; never applied to an
+  # intervention-backed / driver-assisted unwind rescue (the 0.95-confidence
+  # literal wins there). The floor is an invariant, not a claimed engagement.
+  confidence = detection.confidence
+  if substantial_road:
+    rescued = evidence.driver_causation == "interventionBacked" or evidence.driver_assisted_unwind
+    if not rescued:
+      confidence = max(confidence - ROAD_SUBSTANTIAL_CONFIDENCE_PENALTY, ROAD_CONFIDENCE_FLOOR)
   occurred_time = detection.occurred_mono_time if detection.occurred_mono_time is not None else sample.mono_time
   detected_time = detection.detected_mono_time if detection.detected_mono_time is not None else sample.mono_time
   occurred_mono_time = round(occurred_time * 1e9)
@@ -157,7 +217,7 @@ def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> Eve
     detector="blatLateralEventDetector",
     detector_version=LAT_DETECTOR_VERSION,
     severity=detection.severity,
-    confidence=detection.confidence,
+    confidence=confidence,
     reason=detection.reason,
     attribution=attribution,
     driver_confounded=driver_confounded,
@@ -565,6 +625,96 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
       )
       payload.handoffCenterDeltaS = evidence.handoff_center_delta_s
       payload.handoffConsolidated = evidence.handoff_consolidated
+      # v6 crown-neutral trigger snapshots (@127-@134).
+      payload.unwindNeutralTorque = float(getattr(evidence, "unwind_neutral_torque", 0.0))
+      payload.unwindPhaseDirection = float(getattr(evidence, "unwind_phase_direction", 0.0))
+      high_angle_valid = bool(getattr(evidence, "high_angle_evidence_valid", False))
+      payload.highAngleEvidenceValid = high_angle_valid
+      payload.highAngleUnwindScale = (
+        float(getattr(evidence, "high_angle_unwind_scale", 0.0)) if high_angle_valid else 0.0
+      )
+      payload.torqueCommandBeforeHighAngleExit = (
+        float(getattr(evidence, "torque_command_before_high_angle_exit", 0.0)) if high_angle_valid else 0.0
+      )
+      payload.highAngleUnwindOldTorqueCorrection = (
+        float(getattr(evidence, "high_angle_unwind_old_torque_correction", 0.0)) if high_angle_valid else 0.0
+      )
+      payload.highAngleUnwindOldDirectionTorque = (
+        float(getattr(evidence, "high_angle_unwind_old_direction_torque", 0.0)) if high_angle_valid else 0.0
+      )
+      payload.oldTurnSign = float(getattr(evidence, "old_turn_sign", 0.0))
+      # v6 per-episode timestamps (@135-@149). Present test is `is not None`,
+      # NOT `> 0.0`: unlike the legacy literal-zero torque crossings above,
+      # these are real mono times that could theoretically land on exactly
+      # 0.0 in a synthetic test and are never absent-vs-zero-ambiguous the
+      # way torque is, so `> 0.0` would wrongly hide a legitimate zero time.
+      future_unwind_commit = getattr(evidence, "future_unwind_commit_mono_time", None)
+      future_unwind_commit_present = future_unwind_commit is not None
+      payload.futureUnwindCommitPresent = future_unwind_commit_present
+      payload.futureUnwindCommitMonoTime = (
+        round(float(future_unwind_commit) * 1e9) if future_unwind_commit_present else 0
+      )
+      high_angle_exit_first_nonzero = getattr(evidence, "high_angle_exit_first_nonzero_mono_time", None)
+      high_angle_exit_first_nonzero_present = high_angle_exit_first_nonzero is not None
+      payload.highAngleExitFirstNonzeroPresent = high_angle_exit_first_nonzero_present
+      payload.highAngleExitFirstNonzeroMonoTime = (
+        round(float(high_angle_exit_first_nonzero) * 1e9) if high_angle_exit_first_nonzero_present else 0
+      )
+      requested_crown_neutral = getattr(evidence, "requested_crown_neutral_mono_time", None)
+      requested_crown_neutral_present = requested_crown_neutral is not None
+      payload.requestedCrownNeutralPresent = requested_crown_neutral_present
+      payload.requestedCrownNeutralMonoTime = (
+        round(float(requested_crown_neutral) * 1e9) if requested_crown_neutral_present else 0
+      )
+      applied_crown_neutral = getattr(evidence, "applied_crown_neutral_mono_time", None)
+      applied_crown_neutral_present = applied_crown_neutral is not None
+      payload.appliedCrownNeutralPresent = applied_crown_neutral_present
+      payload.appliedCrownNeutralMonoTime = (
+        round(float(applied_crown_neutral) * 1e9) if applied_crown_neutral_present else 0
+      )
+      payload.unwindCrownCommandDelayS = float(getattr(evidence, "unwind_crown_command_delay_s", 0.0))
+      wheel_progress_5 = getattr(evidence, "wheel_progress_5_mono_time", None)
+      wheel_progress_5_present = wheel_progress_5 is not None
+      payload.wheelProgress5Present = wheel_progress_5_present
+      payload.wheelProgress5MonoTime = round(float(wheel_progress_5) * 1e9) if wheel_progress_5_present else 0
+      wheel_progress_20 = getattr(evidence, "wheel_progress_20_mono_time", None)
+      wheel_progress_20_present = wheel_progress_20 is not None
+      payload.wheelProgress20Present = wheel_progress_20_present
+      payload.wheelProgress20MonoTime = round(float(wheel_progress_20) * 1e9) if wheel_progress_20_present else 0
+      wheel_progress_50 = getattr(evidence, "wheel_progress_50_mono_time", None)
+      wheel_progress_50_present = wheel_progress_50 is not None
+      payload.wheelProgress50Present = wheel_progress_50_present
+      payload.wheelProgress50MonoTime = round(float(wheel_progress_50) * 1e9) if wheel_progress_50_present else 0
+      # v6 old-torque rebound tracker snapshot (@150-@154).
+      payload.unwindReboundMaxMagnitude = float(getattr(evidence, "unwind_rebound_max_magnitude", 0.0))
+      unwind_rebound_start = getattr(evidence, "unwind_rebound_start_mono_time", None)
+      unwind_rebound_start_present = unwind_rebound_start is not None
+      payload.unwindReboundStartPresent = unwind_rebound_start_present
+      payload.unwindReboundStartMonoTime = (
+        round(float(unwind_rebound_start) * 1e9) if unwind_rebound_start_present else 0
+      )
+      payload.unwindReboundDurationS = float(getattr(evidence, "unwind_rebound_duration_s", 0.0))
+      payload.unwindReboundSameEpisode = bool(getattr(evidence, "unwind_rebound_same_episode", False))
+      # v6 driver causation (@155-@160, @165).
+      payload.driverActiveBeforeDeficit = bool(getattr(evidence, "driver_active_before_deficit", False))
+      payload.driverActiveAtDeficitStart = bool(getattr(evidence, "driver_active_at_deficit_start", False))
+      payload.driverActiveDuringEvaluation = bool(getattr(evidence, "driver_active_during_evaluation", False))
+      payload.driverIntervenedAfterDeficit = bool(getattr(evidence, "driver_intervened_after_deficit", False))
+      payload.driverInterventionAcceleratedProgress = bool(
+        getattr(evidence, "driver_intervention_accelerated_progress", False),
+      )
+      payload.driverCausation = str(getattr(evidence, "driver_causation", ""))
+      payload.driverAssistRawTorqueOnly = bool(getattr(evidence, "driver_assist_raw_torque_only", False))
+      # v6 turn-stop lifetime progress (@161-@162).
+      payload.turnStopPreDwellProgressDeg = float(getattr(evidence, "turn_stop_pre_dwell_progress_deg", 0.0))
+      payload.turnStopPostDwellProgressDeg = float(getattr(evidence, "turn_stop_post_dwell_progress_deg", 0.0))
+      # v6 consolidated road-metrics window start actually covered (@163-@164).
+      road_evidence_window_start = getattr(evidence, "road_evidence_window_start_mono_time", None)
+      road_evidence_window_start_present = road_evidence_window_start is not None
+      payload.roadEvidenceWindowStartPresent = road_evidence_window_start_present
+      payload.roadEvidenceWindowStartMonoTime = (
+        round(float(road_evidence_window_start) * 1e9) if road_evidence_window_start_present else 0
+      )
       releases = payload.init("stallReleases", len(evidence.stall_releases))
       for index, release in enumerate(evidence.stall_releases):
         releases[index].releaseMonoTime = round(release.mono_time * 1e9)
@@ -939,6 +1089,11 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
   actual_damping_state = (
     str(getattr(actuators_output, "torqueDampingState", "inactive")) if damping_valid else None
   )
+  # v6 high-angle unwind evidence: torqueState fields, NOT gated on the
+  # carOutput damping_valid check above. Grouped under one hasattr guard so
+  # all four are present together (float, possibly 0.0) or absent together
+  # (None) depending on whether the running schema carries them.
+  high_angle_available = torque_state is not None and hasattr(torque_state, "highAngleUnwindScale")
   sample = LateralSample(
     mono_time=now,
     active=bool(torque_state is not None and torque_state.active and sm["carControl"].latActive),
@@ -971,6 +1126,20 @@ def lateral_sample(sm: messaging.SubMaster, rate_filter: SteeringRateFilter,
     unwind_effective_phase=float(getattr(torque_state, "unwindEffectivePhase", 0.0)) if torque_state is not None else 0.0,
     unwind_overspeed=float(getattr(torque_state, "unwindPhaseOverspeed", 0.0)) if torque_state is not None else 0.0,
     unwind_same_episode=bool(getattr(torque_state, "unwindSameEpisode", False)) if torque_state is not None else False,
+    unwind_neutral_torque=float(getattr(torque_state, "unwindNeutralTorque", 0.0)) if torque_state is not None else 0.0,
+    unwind_phase_direction=float(getattr(torque_state, "unwindPhaseDirection", 0.0)) if torque_state is not None else 0.0,
+    high_angle_unwind_scale=(
+      float(torque_state.highAngleUnwindScale) if high_angle_available else None
+    ),
+    torque_command_before_high_angle_exit=(
+      float(torque_state.torqueCommandBeforeHighAngleExit) if high_angle_available else None
+    ),
+    high_angle_unwind_old_torque_correction=(
+      float(torque_state.highAngleUnwindOldTorqueCorrection) if high_angle_available else None
+    ),
+    high_angle_unwind_old_direction_torque=(
+      float(torque_state.highAngleUnwindOldDirectionTorque) if high_angle_available else None
+    ),
     road_confounded=road_confounded,
     vertical_accel_deviation=vertical_accel_deviation,
     actual_damping_amount=actual_damping_amount,
