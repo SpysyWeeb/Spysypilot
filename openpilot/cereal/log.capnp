@@ -2724,6 +2724,45 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     unwindReferenceTargetTorqueAtTrigger @124 :Float32;
     unwindAppliedTargetGapAtTrigger @125 :Float32;
     unwindPeakAppliedTargetGap @126 :Float32;
+    unwindNeutralTorque @127 :Float32;
+    unwindPhaseDirection @128 :Float32;
+    highAngleEvidenceValid @129 :Bool;  # The four high-angle fields below were schema-present at trigger.
+    highAngleUnwindScale @130 :Float32;
+    torqueCommandBeforeHighAngleExit @131 :Float32;
+    highAngleUnwindOldTorqueCorrection @132 :Float32;
+    highAngleUnwindOldDirectionTorque @133 :Float32;
+    oldTurnSign @134 :Float32;
+    futureUnwindCommitMonoTime @135 :UInt64;
+    futureUnwindCommitPresent @136 :Bool;
+    highAngleExitFirstNonzeroMonoTime @137 :UInt64;
+    highAngleExitFirstNonzeroPresent @138 :Bool;
+    requestedCrownNeutralMonoTime @139 :UInt64;
+    requestedCrownNeutralPresent @140 :Bool;
+    appliedCrownNeutralMonoTime @141 :UInt64;
+    appliedCrownNeutralPresent @142 :Bool;
+    unwindCrownCommandDelayS @143 :Float32;
+    wheelProgress5MonoTime @144 :UInt64;
+    wheelProgress5Present @145 :Bool;
+    wheelProgress20MonoTime @146 :UInt64;
+    wheelProgress20Present @147 :Bool;
+    wheelProgress50MonoTime @148 :UInt64;
+    wheelProgress50Present @149 :Bool;
+    unwindReboundMaxMagnitude @150 :Float32;
+    unwindReboundStartMonoTime @151 :UInt64;
+    unwindReboundStartPresent @152 :Bool;
+    unwindReboundDurationS @153 :Float32;
+    unwindReboundSameEpisode @154 :Bool;
+    driverActiveBeforeDeficit @155 :Bool;
+    driverActiveAtDeficitStart @156 :Bool;
+    driverActiveDuringEvaluation @157 :Bool;
+    driverIntervenedAfterDeficit @158 :Bool;
+    driverInterventionAcceleratedProgress @159 :Bool;
+    driverCausation @160 :Text;  # driverCreated | interventionBacked | autonomousOnly | mixed | "".
+    turnStopPreDwellProgressDeg @161 :Float32;
+    turnStopPostDwellProgressDeg @162 :Float32;
+    roadEvidenceWindowStartMonoTime @163 :UInt64;  # Clamped start actually covered by the road metrics.
+    roadEvidenceWindowStartPresent @164 :Bool;
+    driverAssistRawTorqueOnly @165 :Bool;
 
     enum DriverInteraction {
       none @0;

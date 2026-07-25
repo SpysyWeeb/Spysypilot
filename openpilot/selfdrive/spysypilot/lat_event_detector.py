@@ -10,11 +10,12 @@ from collections import deque
 from dataclasses import dataclass
 
 
-DETECTOR_VERSION = 5
+DETECTOR_VERSION = 6
 EVENT_COOLDOWN = 8.0
 STALL_RELEASE_WINDOW_S = 6.0
 STALL_TRANSITION_HYSTERESIS_S = 0.25
-EVIDENCE_HISTORY_S = 15.0
+EVIDENCE_HISTORY_S = 25.0
+SAMPLE_GAP_RESET_S = 1.0
 
 CENTER_ESTABLISHED_DEG = 25.0
 CENTER_RATE_THRESHOLD_DEG_S = 120.0
@@ -56,6 +57,28 @@ UNWIND_LOW_BAND_MAX_DEG = 120.0
 UNWIND_MID_BAND_MAX_DEG = 240.0
 UNWIND_END_ANGLE_DEG = 25.0
 
+OLD_TURN_SIGN_PHASE_DIRECTION_MIN = 0.5
+CROWN_NEUTRAL_TOLERANCE = 0.05
+CROWN_NEUTRAL_HOLD_S = 0.10
+HIGH_ANGLE_SCALE_EPSILON = 1e-3
+WHEEL_PROGRESS_MARKS_DEG = (5.0, 20.0, 50.0)
+UNWIND_REBOUND_MIN_COMPONENT = 0.10
+
+DRIVER_AT_START_WINDOW_S = 0.20
+DRIVER_ASSIST_ACCELERATION_MIN_DEG_S = 10.0
+
+DRIVER_CAUSATION_DRIVER_CREATED = "driverCreated"
+DRIVER_CAUSATION_INTERVENTION_BACKED = "interventionBacked"
+DRIVER_CAUSATION_AUTONOMOUS_ONLY = "autonomousOnly"
+DRIVER_CAUSATION_MIXED = "mixed"
+
+EPISODE_CENTER_CLOSE_DEG = 15.0
+EPISODE_CENTER_CLOSE_S = 0.5
+EPISODE_MAX_LIFETIME_S = 20.0
+EPISODE_ACTIVE_RATE_DEG_S = 8.0
+EPISODE_ACTIVE_PHASE = 0.2
+EPISODE_QUIET_GAP_S = 2.0
+
 TURN_STOP_MOVING_RATE_DEG_S = 30.0
 TURN_STOP_ARM_ANGLE_DEG = 25.0
 TURN_STOP_ABSOLUTE_DWELL_RATE_DEG_S = 8.0
@@ -68,6 +91,9 @@ TURN_STOP_STRONG_TORQUE = 0.80
 TURN_STOP_TRACKING_ERROR = 0.15
 TURN_STOP_RELEASE_OBSERVATION_S = 0.25
 TURN_STOP_CLUSTER_SELECTION_S = 2.1
+TURN_STOP_MAX_DWELL_S = 2.75
+TURN_STOP_MIN_PRE_PROGRESS_DEG = 10.0
+TURN_STOP_MIN_POST_PROGRESS_DEG = 10.0
 
 DRIVER_CONFOUND_TORQUE = 1
 DRIVER_CONFOUND_STEERING_PRESSED = 2
@@ -119,6 +145,15 @@ class LateralSample:
   sustain_floor_contribution: float | None = None
   damping_version: int | None = None
 
+  # Crown-neutral torque context (stock schema degrades both to 0.0).
+  unwind_neutral_torque: float = 0.0
+  unwind_phase_direction: float = 0.0
+  # Optional high-angle unwind evidence. None means the running schema lacks the fields.
+  high_angle_unwind_scale: float | None = None
+  torque_command_before_high_angle_exit: float | None = None
+  high_angle_unwind_old_torque_correction: float | None = None
+  high_angle_unwind_old_direction_torque: float | None = None
+
   @property
   def applied_target_gap(self) -> float:
     return abs(self.applied_torque - self.reference_target_torque)
@@ -151,6 +186,18 @@ class StallReleaseEvidence:
   driver_evidence_active: bool
   road_evidence_active: bool
   phase: str
+
+
+@dataclass(frozen=True)
+class DriverCausationSummary:
+  """Granular driver-causation evidence (unwindProgressDeficit / turnStopTurn only)."""
+  active_before_deficit: bool = False
+  active_at_deficit_start: bool = False
+  active_during_evaluation: bool = False
+  intervened_after_deficit: bool = False
+  intervention_accelerated_progress: bool = False
+  assist_raw_torque_only: bool = False
+  causation: str = ""
 
 
 @dataclass(frozen=True)
@@ -258,6 +305,43 @@ class LateralEvidence:
   turn_stop_breakaway_latch: float | None = None
   turn_stop_sustain_floor_contribution: float | None = None
   turn_stop_damping_version: int | None = None
+
+  # v6 crown-neutral trigger snapshots (payload @127-@134).
+  unwind_neutral_torque: float = 0.0
+  unwind_phase_direction: float = 0.0
+  high_angle_evidence_valid: bool = False
+  high_angle_unwind_scale: float = 0.0
+  torque_command_before_high_angle_exit: float = 0.0
+  high_angle_unwind_old_torque_correction: float = 0.0
+  high_angle_unwind_old_direction_torque: float = 0.0
+  old_turn_sign: float = 0.0
+  # v6 per-episode timestamps (payload @135-@149).
+  future_unwind_commit_mono_time: float | None = None
+  high_angle_exit_first_nonzero_mono_time: float | None = None
+  requested_crown_neutral_mono_time: float | None = None
+  applied_crown_neutral_mono_time: float | None = None
+  unwind_crown_command_delay_s: float = 0.0
+  wheel_progress_5_mono_time: float | None = None
+  wheel_progress_20_mono_time: float | None = None
+  wheel_progress_50_mono_time: float | None = None
+  # v6 old-torque rebound tracker snapshot (payload @150-@154).
+  unwind_rebound_max_magnitude: float = 0.0
+  unwind_rebound_start_mono_time: float | None = None
+  unwind_rebound_duration_s: float = 0.0
+  unwind_rebound_same_episode: bool = False
+  # v6 driver causation (payload @155-@160, @165).
+  driver_active_before_deficit: bool = False
+  driver_active_at_deficit_start: bool = False
+  driver_active_during_evaluation: bool = False
+  driver_intervened_after_deficit: bool = False
+  driver_intervention_accelerated_progress: bool = False
+  driver_causation: str = ""
+  # v6 turn-stop lifetime progress (payload @161-@162).
+  turn_stop_pre_dwell_progress_deg: float = 0.0
+  turn_stop_post_dwell_progress_deg: float = 0.0
+  # v6 consolidated road-metrics window start actually covered (payload @163-@164).
+  road_evidence_window_start_mono_time: float | None = None
+  driver_assist_raw_torque_only: bool = False
 
   @property
   def driver_confounded_any(self) -> bool:
@@ -367,6 +451,33 @@ class UnwindProgressEpisode:
   steering_pressed_was_active: bool = False
   raw_driver_assist_since: float | None = None
   raw_driver_assist_start_rate_deg_s: float = 0.0
+  # v6: episode identity snapshot at arm (A2) and crown-neutral machinery.
+  episode_start_snapshot: float = 0.0
+  old_turn_sign: float = 0.0
+  future_unwind_commit_mono_time: float | None = None
+  high_angle_exit_first_nonzero_mono_time: float | None = None
+  requested_crown_candidate_start: float | None = None
+  requested_crown_neutral_mono_time: float | None = None
+  applied_crown_candidate_start: float | None = None
+  applied_crown_neutral_mono_time: float | None = None
+  wheel_progress_5_mono_time: float | None = None
+  wheel_progress_20_mono_time: float | None = None
+  wheel_progress_50_mono_time: float | None = None
+  # v6: old-torque rebound tracker (armed at first requested crown candidate).
+  rebound_armed_mono_time: float | None = None
+  rebound_start_mono_time: float | None = None
+  rebound_max_magnitude: float = 0.0
+  rebound_duration_s: float = 0.0
+  rebound_same_episode: bool = False
+  rebound_previous_above: bool = False
+  # v6: crown/high-angle trigger snapshots.
+  trigger_unwind_neutral_torque: float = 0.0
+  trigger_unwind_phase_direction: float = 0.0
+  trigger_high_angle_valid: bool = False
+  trigger_high_angle_unwind_scale: float = 0.0
+  trigger_torque_command_before_high_angle_exit: float = 0.0
+  trigger_high_angle_old_torque_correction: float = 0.0
+  trigger_high_angle_old_direction_torque: float = 0.0
 
 
 @dataclass
@@ -391,6 +502,10 @@ class TurnStopEpisode:
   release_peak_rate_deg_s: float = 0.0
   restart_classification: str = ""
   driver_involved_after_dwell: bool = False
+  # v6: episode identity snapshot at creation (A2) and lifetime progress.
+  episode_start_snapshot: float = 0.0
+  creation_angle_deg: float = 0.0
+  pre_dwell_progress_deg: float = 0.0
 
 
 @dataclass
@@ -401,6 +516,7 @@ class PendingTurnStopCandidate:
   deadline_mono_time: float
   previous_phase: float
   previous_same_episode: bool
+  post_release_progress_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -472,10 +588,14 @@ class LateralEventDetector:
     self.history: deque[tuple[float, bool, float, bool, bool, bool, float, float, float, float, float]] = deque()
     self.episode_start: float | None = None
     self.episode_last_activity = -math.inf
+    self.episode_center_since: float | None = None
+    self.episode_center_closed = False
     self.unwind_progress_episode: UnwindProgressEpisode | None = None
     self.unwind_progress_latched = False
     self.turn_stop_episode: TurnStopEpisode | None = None
     self.pending_turn_stop_candidate: PendingTurnStopCandidate | None = None
+    # Dedicated route-discontinuity clock; previous_sample skips exactly-zero-angle samples.
+    self.last_sample_mono_time: float | None = None
 
   def reset_temporal(self) -> None:
     self.previous_sample = None
@@ -491,10 +611,19 @@ class LateralEventDetector:
     self.releases.clear()
     self.episode_start = None
     self.episode_last_activity = -math.inf
+    self.episode_center_since = None
+    self.episode_center_closed = False
     self.unwind_progress_episode = None
     self.unwind_progress_latched = False
     self.turn_stop_episode = None
     self.pending_turn_stop_candidate = None
+
+  def reset_discontinuity(self) -> None:
+    # Backwards time leaves future-stamped cooldowns that would suppress
+    # everything, and pre-gap history would contaminate post-gap evidence.
+    self.reset_temporal()
+    self.history.clear()
+    self.last_event_times.clear()
 
   def _update_history(self, sample: LateralSample) -> None:
     tracking_active = abs(sample.reference_rate) > 0.2 or abs(sample.desired_lateral_accel - sample.actual_lateral_accel) > 0.15
@@ -515,17 +644,51 @@ class LateralEventDetector:
       self.history.popleft()
 
   def _update_episode(self, sample: LateralSample, tracking_active: bool) -> None:
+    in_center_band = abs(sample.steering_angle_deg) <= EPISODE_CENTER_CLOSE_DEG
+    if in_center_band:
+      if self.episode_center_since is None:
+        self.episode_center_since = sample.mono_time
+    else:
+      self.episode_center_since = None
+      self.episode_center_closed = False
+
+    if self.episode_start is not None:
+      if (
+        self.episode_center_since is not None
+        and sample.mono_time - self.episode_center_since >= EPISODE_CENTER_CLOSE_S
+      ):
+        # Sustained near-center settles the physical maneuver regardless of
+        # other activity bits; a fresh episode needs a fresh sustained period.
+        self.episode_start = None
+        self.episode_center_closed = True
+        self.episode_center_since = sample.mono_time
+      elif sample.mono_time - self.episode_start > EPISODE_MAX_LIFETIME_S:
+        self.episode_start = None
+
     active_shape = (
-      abs(sample.steering_angle_deg) > 15.0
-      or abs(sample.steering_rate_deg) > 8.0
-      or sample.unwind_effective_phase > 0.2
+      abs(sample.steering_angle_deg) > EPISODE_CENTER_CLOSE_DEG
+      or abs(sample.steering_rate_deg) > EPISODE_ACTIVE_RATE_DEG_S
+      or sample.unwind_effective_phase > EPISODE_ACTIVE_PHASE
       or tracking_active
     )
     if active_shape:
-      if self.episode_start is None or sample.mono_time - self.episode_last_activity > 2.0:
+      if self.episode_start is None:
+        # After a center-close, tracking_active alone may not re-arm while the
+        # wheel stays settled in the center band (A2 churn guard).
+        if (
+          not self.episode_center_closed
+          or abs(sample.steering_angle_deg) > EPISODE_CENTER_CLOSE_DEG
+          or abs(sample.steering_rate_deg) > EPISODE_ACTIVE_RATE_DEG_S
+        ):
+          self.episode_start = sample.mono_time
+          self.episode_center_closed = False
+          self.episode_last_activity = sample.mono_time
+      elif sample.mono_time - self.episode_last_activity > EPISODE_QUIET_GAP_S:
         self.episode_start = sample.mono_time
-      self.episode_last_activity = sample.mono_time
-    elif self.episode_start is not None and sample.mono_time - self.episode_last_activity > 2.0:
+        self.episode_last_activity = sample.mono_time
+      else:
+        self.episode_last_activity = sample.mono_time
+    elif self.episode_start is not None and sample.mono_time - self.episode_last_activity > EPISODE_QUIET_GAP_S:
       self.episode_start = None
 
   @staticmethod
@@ -573,7 +736,14 @@ class LateralEventDetector:
                 driver_assist_sample: LateralSample | None = None,
                 wheel_rate_increase_after_assist: float = 0.0,
                 turn_stop_release_sample: LateralSample | None = None,
-                turn_stop_restart_classification: str = "") -> LateralEvidence:
+                turn_stop_restart_classification: str = "",
+                episode_start_snapshot: float | None = None,
+                driver_causation: DriverCausationSummary | None = None,
+                turn_stop_post_progress_deg: float = 0.0) -> LateralEvidence:
+    if self.history:
+      # The serialized window must equal the window the evidence actually
+      # covered (history starts after boot or a route discontinuity).
+      evidence_start = max(evidence_start, self.history[0][0])
     samples = [entry for entry in self.history if entry[0] >= evidence_start]
     if not samples:
       samples = [(
@@ -591,7 +761,6 @@ class LateralEventDetector:
       )]
     driver_count = sum(entry[1] for entry in samples)
     raw_torque_count = sum(abs(entry[2]) > DRIVER_RAW_TORQUE_THRESHOLD for entry in samples)
-    road_count = sum(entry[4] for entry in samples)
     steering_pressed_count = sum(entry[3] for entry in samples)
     steering_pressed_any = steering_pressed_count > 0
     max_abs_driver_torque = max(abs(entry[2]) for entry in samples)
@@ -613,8 +782,21 @@ class LateralEventDetector:
 
     trigger_time = sample.mono_time if occurred_time is None else occurred_time
     trigger = self._trigger_entry(trigger_time)
-    longest_road = self._longest_true_duration(samples, 4)
-    road_fraction = road_count / len(samples)
+
+    episode_start = (
+      episode_start_snapshot if episode_start_snapshot is not None
+      else self.episode_start if self.episode_start is not None
+      else evidence_start
+    )
+    # Road metrics cover the consolidated physical-maneuver window, clamped
+    # to the oldest history actually available at emission (A6).
+    road_window_start = min(episode_start, evidence_start)
+    if self.history:
+      road_window_start = max(road_window_start, self.history[0][0])
+    road_samples = [entry for entry in self.history if entry[0] >= road_window_start] or samples
+    road_count = sum(entry[4] for entry in road_samples)
+    longest_road = self._longest_true_duration(road_samples, 4)
+    road_fraction = road_count / len(road_samples)
     road_interaction = (
       ROAD_INTERACTION_SUBSTANTIAL
       if road_fraction >= ROAD_SUBSTANTIAL_FRACTION
@@ -622,7 +804,6 @@ class LateralEventDetector:
     )
 
     before, after = self._analysis_window(event_type)
-    episode_start = self.episode_start if self.episode_start is not None else evidence_start
     releases = stall_releases or []
     phases = {release.phase for release in releases}
     stall_phase = next(iter(phases)) if len(phases) == 1 else ("mixed" if phases else "")
@@ -682,7 +863,7 @@ class LateralEventDetector:
       steering_pressed_at_trigger=bool(trigger[3]),
       driver_interaction=driver_interaction,
       road_confounded_at_trigger=bool(trigger[4]),
-      max_vertical_accel_deviation=max(entry[6] for entry in samples),
+      max_vertical_accel_deviation=max(entry[6] for entry in road_samples),
       longest_road_confounded_duration_s=longest_road,
       road_interaction=road_interaction,
       center_crossing_mono_time=crossing.mono_time if crossing is not None else None,
@@ -890,6 +1071,97 @@ class LateralEventDetector:
       turn_stop_damping_version=(
         turn_stop_release_sample.damping_version if turn_stop_release_sample is not None else None
       ),
+      unwind_neutral_torque=(
+        unwind_episode.trigger_unwind_neutral_torque if unwind_episode is not None else 0.0
+      ),
+      unwind_phase_direction=(
+        unwind_episode.trigger_unwind_phase_direction if unwind_episode is not None else 0.0
+      ),
+      high_angle_evidence_valid=(
+        unwind_episode.trigger_high_angle_valid if unwind_episode is not None else False
+      ),
+      high_angle_unwind_scale=(
+        unwind_episode.trigger_high_angle_unwind_scale if unwind_episode is not None else 0.0
+      ),
+      torque_command_before_high_angle_exit=(
+        unwind_episode.trigger_torque_command_before_high_angle_exit
+        if unwind_episode is not None else 0.0
+      ),
+      high_angle_unwind_old_torque_correction=(
+        unwind_episode.trigger_high_angle_old_torque_correction
+        if unwind_episode is not None else 0.0
+      ),
+      high_angle_unwind_old_direction_torque=(
+        unwind_episode.trigger_high_angle_old_direction_torque
+        if unwind_episode is not None else 0.0
+      ),
+      old_turn_sign=unwind_episode.old_turn_sign if unwind_episode is not None else 0.0,
+      future_unwind_commit_mono_time=(
+        unwind_episode.future_unwind_commit_mono_time if unwind_episode is not None else None
+      ),
+      high_angle_exit_first_nonzero_mono_time=(
+        unwind_episode.high_angle_exit_first_nonzero_mono_time
+        if unwind_episode is not None else None
+      ),
+      requested_crown_neutral_mono_time=(
+        unwind_episode.requested_crown_neutral_mono_time if unwind_episode is not None else None
+      ),
+      applied_crown_neutral_mono_time=(
+        unwind_episode.applied_crown_neutral_mono_time if unwind_episode is not None else None
+      ),
+      unwind_crown_command_delay_s=(
+        unwind_episode.requested_crown_neutral_mono_time - unwind_episode.start_mono_time
+        if (
+          unwind_episode is not None
+          and unwind_episode.requested_crown_neutral_mono_time is not None
+        ) else 0.0
+      ),
+      wheel_progress_5_mono_time=(
+        unwind_episode.wheel_progress_5_mono_time if unwind_episode is not None else None
+      ),
+      wheel_progress_20_mono_time=(
+        unwind_episode.wheel_progress_20_mono_time if unwind_episode is not None else None
+      ),
+      wheel_progress_50_mono_time=(
+        unwind_episode.wheel_progress_50_mono_time if unwind_episode is not None else None
+      ),
+      unwind_rebound_max_magnitude=(
+        unwind_episode.rebound_max_magnitude if unwind_episode is not None else 0.0
+      ),
+      unwind_rebound_start_mono_time=(
+        unwind_episode.rebound_start_mono_time if unwind_episode is not None else None
+      ),
+      unwind_rebound_duration_s=(
+        unwind_episode.rebound_duration_s if unwind_episode is not None else 0.0
+      ),
+      unwind_rebound_same_episode=(
+        unwind_episode.rebound_same_episode if unwind_episode is not None else False
+      ),
+      driver_active_before_deficit=(
+        driver_causation.active_before_deficit if driver_causation is not None else False
+      ),
+      driver_active_at_deficit_start=(
+        driver_causation.active_at_deficit_start if driver_causation is not None else False
+      ),
+      driver_active_during_evaluation=(
+        driver_causation.active_during_evaluation if driver_causation is not None else False
+      ),
+      driver_intervened_after_deficit=(
+        driver_causation.intervened_after_deficit if driver_causation is not None else False
+      ),
+      driver_intervention_accelerated_progress=(
+        driver_causation.intervention_accelerated_progress
+        if driver_causation is not None else False
+      ),
+      driver_causation=driver_causation.causation if driver_causation is not None else "",
+      turn_stop_pre_dwell_progress_deg=(
+        turn_stop_episode.pre_dwell_progress_deg if turn_stop_episode is not None else 0.0
+      ),
+      turn_stop_post_dwell_progress_deg=turn_stop_post_progress_deg,
+      road_evidence_window_start_mono_time=road_window_start,
+      driver_assist_raw_torque_only=(
+        driver_causation.assist_raw_torque_only if driver_causation is not None else False
+      ),
     )
 
   def _reversal_commit_time(self, crossing: PendingCrossing, now: float) -> float | None:
@@ -956,7 +1228,10 @@ class LateralEventDetector:
             driver_assist_sample: LateralSample | None = None,
             wheel_rate_increase_after_assist: float = 0.0,
             turn_stop_release_sample: LateralSample | None = None,
-            turn_stop_restart_classification: str = "") -> LateralDetection | None:
+            turn_stop_restart_classification: str = "",
+            episode_start_snapshot: float | None = None,
+            driver_causation: DriverCausationSummary | None = None,
+            turn_stop_post_progress_deg: float = 0.0) -> LateralDetection | None:
     if sample.mono_time - self.last_event_times.get(event_type, -math.inf) < self.cooldown:
       return None
     self.last_event_times[event_type] = sample.mono_time
@@ -987,6 +1262,9 @@ class LateralEventDetector:
       wheel_rate_increase_after_assist,
       turn_stop_release_sample,
       turn_stop_restart_classification,
+      episode_start_snapshot,
+      driver_causation,
+      turn_stop_post_progress_deg,
     )
     return LateralDetection(
       event_type,
@@ -1193,6 +1471,7 @@ class LateralEventDetector:
         crossing.previous_same_episode,
         crossing=crossing,
         handoff_time=crossing.associated_handoff_time,
+        episode_start_snapshot=crossing.episode_start,
       )
     if not committed and legacy_overshoot_shape:
       return self._emit(
@@ -1206,6 +1485,7 @@ class LateralEventDetector:
         crossing.previous_same_episode,
         crossing=crossing,
         handoff_time=crossing.associated_handoff_time,
+        episode_start_snapshot=crossing.episode_start,
       )
     return None
 
@@ -1224,6 +1504,7 @@ class LateralEventDetector:
       handoff.previous_phase,
       handoff.previous_same_episode,
       handoff_time=handoff.mono_time,
+      episode_start_snapshot=handoff.episode_start,
     )
 
   @staticmethod
@@ -1289,6 +1570,154 @@ class LateralEventDetector:
     episode.trigger_applied_torque = sample.applied_torque
     episode.trigger_reference_target_torque = sample.reference_target_torque
     episode.trigger_applied_target_gap = sample.applied_target_gap
+    episode.trigger_unwind_neutral_torque = sample.unwind_neutral_torque
+    episode.trigger_unwind_phase_direction = sample.unwind_phase_direction
+    episode.trigger_high_angle_valid = (
+      sample.high_angle_unwind_scale is not None
+      and sample.torque_command_before_high_angle_exit is not None
+      and sample.high_angle_unwind_old_torque_correction is not None
+      and sample.high_angle_unwind_old_direction_torque is not None
+    )
+    episode.trigger_high_angle_unwind_scale = (
+      sample.high_angle_unwind_scale if sample.high_angle_unwind_scale is not None else 0.0
+    )
+    episode.trigger_torque_command_before_high_angle_exit = (
+      sample.torque_command_before_high_angle_exit
+      if sample.torque_command_before_high_angle_exit is not None else 0.0
+    )
+    episode.trigger_high_angle_old_torque_correction = (
+      sample.high_angle_unwind_old_torque_correction
+      if sample.high_angle_unwind_old_torque_correction is not None else 0.0
+    )
+    episode.trigger_high_angle_old_direction_torque = (
+      sample.high_angle_unwind_old_direction_torque
+      if sample.high_angle_unwind_old_direction_torque is not None else 0.0
+    )
+
+  @staticmethod
+  def _old_direction_component(torque: float, neutral: float, old_turn_sign: float) -> float:
+    # Torque remaining in the original turn direction, measured against the
+    # CURRENT crown-neutral (the neutral slews; never cache a route constant).
+    return max((torque - neutral) * old_turn_sign, 0.0)
+
+  def _update_unwind_crown_tracking(self, episode: UnwindProgressEpisode,
+                                    sample: LateralSample) -> None:
+    if episode.high_angle_exit_first_nonzero_mono_time is None and (
+      sample.high_angle_unwind_scale is not None
+      and sample.high_angle_unwind_scale > HIGH_ANGLE_SCALE_EPSILON
+    ):
+      episode.high_angle_exit_first_nonzero_mono_time = sample.mono_time
+
+    requested_component = self._old_direction_component(
+      sample.request_torque, sample.unwind_neutral_torque, episode.old_turn_sign,
+    )
+    if requested_component < CROWN_NEUTRAL_TOLERANCE:
+      if episode.requested_crown_candidate_start is None:
+        episode.requested_crown_candidate_start = sample.mono_time
+      if (
+        episode.requested_crown_neutral_mono_time is None
+        and sample.mono_time - episode.requested_crown_candidate_start >= CROWN_NEUTRAL_HOLD_S
+      ):
+        episode.requested_crown_neutral_mono_time = episode.requested_crown_candidate_start
+    else:
+      episode.requested_crown_candidate_start = None
+
+    applied_component = self._old_direction_component(
+      sample.applied_torque, sample.unwind_neutral_torque, episode.old_turn_sign,
+    )
+    if applied_component < CROWN_NEUTRAL_TOLERANCE:
+      if episode.applied_crown_candidate_start is None:
+        episode.applied_crown_candidate_start = sample.mono_time
+      if (
+        episode.applied_crown_neutral_mono_time is None
+        and sample.mono_time - episode.applied_crown_candidate_start >= CROWN_NEUTRAL_HOLD_S
+      ):
+        episode.applied_crown_neutral_mono_time = episode.applied_crown_candidate_start
+    else:
+      episode.applied_crown_candidate_start = None
+
+    # Rebound tracker arms at the first requested crown-neutral candidate (no
+    # hold requirement) and then watches for old-direction re-excursions.
+    if episode.rebound_armed_mono_time is None:
+      if requested_component < CROWN_NEUTRAL_TOLERANCE:
+        episode.rebound_armed_mono_time = sample.mono_time
+      return
+    if requested_component > UNWIND_REBOUND_MIN_COMPONENT:
+      if episode.rebound_start_mono_time is None:
+        episode.rebound_start_mono_time = sample.mono_time
+        episode.rebound_same_episode = True
+      episode.rebound_max_magnitude = max(episode.rebound_max_magnitude, requested_component)
+      if episode.rebound_previous_above:
+        episode.rebound_duration_s += max(0.0, sample.mono_time - episode.previous_mono_time)
+      episode.rebound_previous_above = True
+    else:
+      episode.rebound_previous_above = False
+
+  def _unwind_driver_causation(self, episode: UnwindProgressEpisode, sample: LateralSample,
+                               assist_confirmed: bool, steering_press_began: bool,
+                               raw_assist_confirmed: bool,
+                               wheel_rate_increase_after_assist: float) -> DriverCausationSummary:
+    deficit_start = episode.deficit_start_mono_time
+    if deficit_start is None:
+      deficit_start = (
+        episode.mature_mono_time if episode.mature_mono_time is not None
+        else episode.start_mono_time
+      )
+    evaluation_end = (
+      episode.mature_mono_time if episode.mature_mono_time is not None else sample.mono_time
+    )
+    active_before = any(
+      entry[1] for entry in self.history
+      if episode.start_mono_time <= entry[0] < deficit_start
+    )
+    active_at_start = any(
+      entry[1] for entry in self.history
+      if deficit_start - DRIVER_AT_START_WINDOW_S <= entry[0] <= deficit_start
+    )
+    active_during = any(
+      entry[1] for entry in self.history
+      if deficit_start <= entry[0] <= evaluation_end
+    )
+    intervened_after = assist_confirmed or (
+      not active_at_start
+      and any(
+        entry[1] for entry in self.history
+        if deficit_start < entry[0] <= sample.mono_time
+      )
+    )
+    accelerated = wheel_rate_increase_after_assist >= DRIVER_ASSIST_ACCELERATION_MIN_DEG_S
+    if active_before and active_at_start and active_during:
+      causation = DRIVER_CAUSATION_DRIVER_CREATED
+    elif not active_at_start and (assist_confirmed or (intervened_after and accelerated)):
+      causation = DRIVER_CAUSATION_INTERVENTION_BACKED
+    elif not (active_before or active_at_start or active_during or intervened_after):
+      causation = DRIVER_CAUSATION_AUTONOMOUS_ONLY
+    else:
+      causation = DRIVER_CAUSATION_MIXED
+    return DriverCausationSummary(
+      active_before_deficit=active_before,
+      active_at_deficit_start=active_at_start,
+      active_during_evaluation=active_during,
+      intervened_after_deficit=intervened_after,
+      intervention_accelerated_progress=accelerated,
+      assist_raw_torque_only=raw_assist_confirmed and not steering_press_began,
+      causation=causation,
+    )
+
+  @staticmethod
+  def _turn_stop_driver_causation(episode: TurnStopEpisode) -> DriverCausationSummary:
+    involved = (
+      episode.driver_involved_before_dwell,
+      episode.driver_involved_during_dwell,
+      episode.driver_involved_after_dwell,
+    )
+    if all(involved):
+      causation = DRIVER_CAUSATION_DRIVER_CREATED
+    elif not any(involved):
+      causation = DRIVER_CAUSATION_AUTONOMOUS_ONLY
+    else:
+      causation = DRIVER_CAUSATION_MIXED
+    return DriverCausationSummary(causation=causation)
 
   def _update_unwind_progress(self, sample: LateralSample, previous_phase: float,
                               previous_same_episode: bool) -> LateralDetection | None:
@@ -1315,6 +1744,13 @@ class LateralEventDetector:
           self._recent_wheel_rate_peak(sample.mono_time),
         ),
       )
+      # The phase-direction field is authoritative for the original turn's
+      # torque sign when populated; otherwise fall back to the wheel side.
+      old_turn_sign = (
+        (1.0 if sample.unwind_phase_direction > 0 else -1.0)
+        if abs(sample.unwind_phase_direction) > OLD_TURN_SIGN_PHASE_DIRECTION_MIN
+        else (1.0 if sample.steering_angle_deg > 0.0 else -1.0)
+      )
       episode = UnwindProgressEpisode(
         start_mono_time=sample.mono_time,
         initial_steering_angle_deg=sample.steering_angle_deg,
@@ -1326,6 +1762,12 @@ class LateralEventDetector:
         previous_mono_time=sample.mono_time,
         recent_toward_rates=deque(),
         steering_pressed_was_active=sample.steering_pressed,
+        episode_start_snapshot=(
+          self.episode_start if self.episode_start is not None else sample.mono_time
+        ),
+        old_turn_sign=old_turn_sign,
+        # Arming requires the committed reference, so the commit is the arm time.
+        future_unwind_commit_mono_time=sample.mono_time,
       )
       self.unwind_progress_episode = episode
 
@@ -1365,6 +1807,7 @@ class LateralEventDetector:
         sample.mono_time,
         sample.applied_torque,
       )
+    self._update_unwind_crown_tracking(episode, sample)
     episode.previous_request_torque = sample.request_torque
     episode.previous_applied_torque = sample.applied_torque
     episode.previous_mono_time = sample.mono_time
@@ -1378,6 +1821,12 @@ class LateralEventDetector:
       0.0,
       abs(episode.initial_steering_angle_deg) - abs(sample.steering_angle_deg),
     )
+    if episode.wheel_progress_5_mono_time is None and actual_progress >= WHEEL_PROGRESS_MARKS_DEG[0]:
+      episode.wheel_progress_5_mono_time = sample.mono_time
+    if episode.wheel_progress_20_mono_time is None and actual_progress >= WHEEL_PROGRESS_MARKS_DEG[1]:
+      episode.wheel_progress_20_mono_time = sample.mono_time
+    if episode.wheel_progress_50_mono_time is None and actual_progress >= WHEEL_PROGRESS_MARKS_DEG[2]:
+      episode.wheel_progress_50_mono_time = sample.mono_time
     progress_ratio = actual_progress / max(expected_progress, 1e-3)
     deficit = (
       expected_progress >= UNWIND_DEFICIT_ELIGIBLE_S * episode.expected_rate_deg_s
@@ -1447,6 +1896,13 @@ class LateralEventDetector:
           progress_ratio,
         )
       occurred_time = episode.deficit_start_mono_time
+      wheel_rate_increase = max(
+        0.0,
+        toward_rate - (
+          episode.raw_driver_assist_start_rate_deg_s
+          if raw_assist_confirmed else previous_toward_rate
+        ),
+      )
       detection = self._emit(
         sample,
         "unwindProgressDeficit",
@@ -1458,12 +1914,15 @@ class LateralEventDetector:
         previous_same_episode,
         unwind_episode=episode,
         driver_assist_sample=sample,
-        wheel_rate_increase_after_assist=max(
-          0.0,
-          toward_rate - (
-            episode.raw_driver_assist_start_rate_deg_s
-            if raw_assist_confirmed else previous_toward_rate
-          ),
+        wheel_rate_increase_after_assist=wheel_rate_increase,
+        episode_start_snapshot=episode.episode_start_snapshot,
+        driver_causation=self._unwind_driver_causation(
+          episode,
+          sample,
+          True,
+          steering_press_began,
+          raw_assist_confirmed,
+          wheel_rate_increase,
         ),
       )
       self.unwind_progress_episode = None
@@ -1489,6 +1948,15 @@ class LateralEventDetector:
         previous_phase,
         previous_same_episode,
         unwind_episode=episode,
+        episode_start_snapshot=episode.episode_start_snapshot,
+        driver_causation=self._unwind_driver_causation(
+          episode,
+          sample,
+          False,
+          False,
+          False,
+          0.0,
+        ),
       )
       self.unwind_progress_episode = None
       self.unwind_progress_latched = True
@@ -1514,21 +1982,33 @@ class LateralEventDetector:
                              previous_phase: float,
                              previous_same_episode: bool) -> LateralDetection | None:
     pending = self.pending_turn_stop_candidate
-    if pending is not None and sample.mono_time >= pending.deadline_mono_time:
-      self.pending_turn_stop_candidate = None
-      return self._emit(
-        sample,
-        "turnStopTurn",
-        "warning",
-        0.90,
-        "steering motion slowed into a sustained high-demand dwell before releasing",
-        pending.episode.release_mono_time,
-        pending.previous_phase,
-        pending.previous_same_episode,
-        turn_stop_episode=pending.episode,
-        turn_stop_release_sample=pending.release_sample,
-        turn_stop_restart_classification=pending.episode.restart_classification,
+    if pending is not None:
+      pending.post_release_progress_deg = max(
+        pending.post_release_progress_deg,
+        abs(sample.steering_angle_deg - pending.episode.dwell_steering_angle_deg),
       )
+      if sample.mono_time >= pending.deadline_mono_time:
+        self.pending_turn_stop_candidate = None
+        if pending.post_release_progress_deg < TURN_STOP_MIN_POST_PROGRESS_DEG:
+          # The wheel never meaningfully moved on after the release; drop the
+          # candidate instead of publishing it.
+          return None
+        return self._emit(
+          sample,
+          "turnStopTurn",
+          "warning",
+          0.90,
+          "steering motion slowed into a sustained high-demand dwell before releasing",
+          pending.episode.release_mono_time,
+          pending.previous_phase,
+          pending.previous_same_episode,
+          turn_stop_episode=pending.episode,
+          turn_stop_release_sample=pending.release_sample,
+          turn_stop_restart_classification=pending.episode.restart_classification,
+          episode_start_snapshot=pending.episode.episode_start_snapshot,
+          driver_causation=self._turn_stop_driver_causation(pending.episode),
+          turn_stop_post_progress_deg=pending.post_release_progress_deg,
+        )
 
     episode = self.turn_stop_episode
     rate = sample.steering_rate_deg
@@ -1554,6 +2034,10 @@ class LateralEventDetector:
         pre_dwell_peak_signed_rate_deg_s=rate,
         pre_dwell_peak_rate_deg_s=abs_rate,
         driver_involved_before_dwell=sample.driver_confounded,
+        episode_start_snapshot=(
+          self.episode_start if self.episode_start is not None else sample.mono_time
+        ),
+        creation_angle_deg=sample.steering_angle_deg,
       )
       return None
 
@@ -1577,6 +2061,10 @@ class LateralEventDetector:
           pre_dwell_peak_signed_rate_deg_s=rate,
           pre_dwell_peak_rate_deg_s=abs_rate,
           driver_involved_before_dwell=sample.driver_confounded,
+          episode_start_snapshot=(
+            self.episode_start if self.episode_start is not None else sample.mono_time
+          ),
+          creation_angle_deg=sample.steering_angle_deg,
         )
         return None
       episode.driver_involved_before_dwell |= sample.driver_confounded
@@ -1589,7 +2077,14 @@ class LateralEventDetector:
         TURN_STOP_DWELL_RATE_FRACTION * episode.pre_dwell_peak_rate_deg_s,
       )
       if abs_rate <= dwell_limit:
+        pre_dwell_progress = abs(sample.steering_angle_deg - episode.creation_angle_deg)
+        if pre_dwell_progress < TURN_STOP_MIN_PRE_PROGRESS_DEG:
+          # Too little travel since this episode's creation to be a real turn
+          # stop; keep the movement bookkeeping without opening a dwell.
+          episode.state = "slowing"
+          return None
         episode.state = "dwell"
+        episode.pre_dwell_progress_deg = pre_dwell_progress
         episode.dwell_start_mono_time = sample.mono_time
         episode.dwell_steering_angle_deg = sample.steering_angle_deg
         episode.minimum_dwell_rate_deg_s = abs_rate
@@ -1607,6 +2102,11 @@ class LateralEventDetector:
 
     assert episode.dwell_start_mono_time is not None
     dwell_duration = sample.mono_time - episode.dwell_start_mono_time
+    if dwell_duration > TURN_STOP_MAX_DWELL_S:
+      # A steady curve that outlives the cap is forgotten entirely; a later
+      # movement must never publish it.
+      self.turn_stop_episode = None
+      return None
     released = (
       dwell_duration >= TURN_STOP_MIN_DWELL_S
       and abs_rate > TURN_STOP_MOVING_RATE_DEG_S
@@ -1617,6 +2117,28 @@ class LateralEventDetector:
       )
     )
     if not released:
+      # A1: the strong-release condition has precedence; these resets apply
+      # only to samples that do NOT satisfy it.
+      if abs(sample.steering_angle_deg) <= TURN_STOP_ARM_ANGLE_DEG and not meaningful_demand:
+        # Mirrors the entry gate: the wheel drifted back into the center band
+        # without any demand keeping the dwell meaningful.
+        self.turn_stop_episode = None
+        return None
+      current_direction = 1 if rate > 0.0 else -1
+      if abs_rate > TURN_STOP_MOVING_RATE_DEG_S and current_direction != episode.movement_direction:
+        self.turn_stop_episode = TurnStopEpisode(
+          state="moving",
+          movement_start_mono_time=sample.mono_time,
+          movement_direction=current_direction,
+          pre_dwell_peak_signed_rate_deg_s=rate,
+          pre_dwell_peak_rate_deg_s=abs_rate,
+          driver_involved_before_dwell=sample.driver_confounded,
+          episode_start_snapshot=(
+            self.episode_start if self.episode_start is not None else sample.mono_time
+          ),
+          creation_angle_deg=sample.steering_angle_deg,
+        )
+        return None
       episode.minimum_dwell_rate_deg_s = min(episode.minimum_dwell_rate_deg_s, abs_rate)
       if abs(sample.steering_angle_deg) > abs(episode.dwell_steering_angle_deg):
         episode.dwell_steering_angle_deg = sample.steering_angle_deg
@@ -1677,6 +2199,7 @@ class LateralEventDetector:
       )
       + episode.release_peak_rate_deg_s / 200.0
     )
+    release_progress = abs(sample.steering_angle_deg - episode.dwell_steering_angle_deg)
     pending = self.pending_turn_stop_candidate
     if pending is None:
       self.pending_turn_stop_candidate = PendingTurnStopCandidate(
@@ -1686,6 +2209,7 @@ class LateralEventDetector:
         deadline_mono_time=sample.mono_time + TURN_STOP_CLUSTER_SELECTION_S,
         previous_phase=previous_phase,
         previous_same_episode=previous_same_episode,
+        post_release_progress_deg=release_progress,
       )
     elif sample.mono_time <= pending.deadline_mono_time and score > pending.score:
       # Preserve the strongest dwell/release in a short sawtooth cluster.
@@ -1701,10 +2225,18 @@ class LateralEventDetector:
         ),
         previous_phase=previous_phase,
         previous_same_episode=previous_same_episode,
+        post_release_progress_deg=release_progress,
       )
     return None
 
   def update(self, sample: LateralSample) -> LateralDetection | None:
+    if self.last_sample_mono_time is not None and (
+      sample.mono_time < self.last_sample_mono_time
+      or sample.mono_time - self.last_sample_mono_time > SAMPLE_GAP_RESET_S
+    ):
+      self.reset_discontinuity()
+    self.last_sample_mono_time = sample.mono_time
+
     previous_phase = self.prev_phase
     previous_same_episode = self.prev_same_episode
     phase_handoff = previous_phase > 0.6 and (
