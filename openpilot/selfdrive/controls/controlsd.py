@@ -225,6 +225,7 @@ class Controls:
         reference_log.output_curvature * CS.vEgo**2,
         reference_log.episode_lateral_accel,
         (reference_log.trajectory_curvature_rate if reference_log.trajectory_rate_valid else None),
+        reference_log.scalar_anchor_active,
       )
     else:
       steer, lateral_output, lac_log = self.LaC.update(
@@ -252,6 +253,8 @@ class Controls:
       lac_log.referenceSustainedUnwindScale = float(reference_log.sustained_unwind_scale)
       lac_log.referenceEpisodeTargetTorque = float(reference_log.episode_target_torque)
       lac_log.referenceEpisodeLateralAccel = float(reference_log.episode_lateral_accel)
+      lac_log.scalarAnchorDeviation = float(reference_log.scalar_anchor_deviation)
+      lac_log.referencePersistenceGateHold = bool(reference_log.persistence_gate_hold)
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)

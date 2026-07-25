@@ -951,6 +951,8 @@ struct ControlsState @0x97ff69c53601abf1 {
     referenceSustainedUnwindScale @71 :Float32;           # unwind confidence sustained across the release-preview horizon
     referenceEpisodeTargetTorque @72 :Float32;           # later geometric torque used to confirm episode handoff
     referenceEpisodeLateralAccel @73 :Float32;           # later geometric lateral acceleration used to reject friction-only sign flips
+    scalarAnchorDeviation @74 :Float32;                   # final reference minus raw scalar action, m/s^2
+    referencePersistenceGateHold @75 :Bool;               # planner reference held while a replan is quarantined or stale
    }
 
   struct LateralAngleState {
