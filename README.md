@@ -30,12 +30,21 @@ rolling. It remains separate from the standstill lead-launch detector and will
 not be considered complete until replay calibration and new field logs have
 been reviewed.
 
-🚧 **Lateral detector version 5 is in progress.** Version 4's reversal,
-handoff, driver, road, and stall-release evidence remains intact. Version 5
-adds progress-based bad-unwind detection and a sensitive single
-turn–stop–turn detector without changing steering behavior. Route 93 replay is
-complete; it will remain in progress until new field collection has been
+🚧 **Lateral detector version 6 is in progress.** Route-94 field review of
+version 5 found four calibration/bookkeeping problems that version 6
+addresses without changing steering behavior: crown-neutral-aware unwind
+release timing (literal torque zero and the road's actual crown-neutral
+offset are measurably different moments, by up to 1.3 s on route 94), a bounded
+turn–stop–turn state lifetime (long steady curves produced 7–32 s "dwells"),
+physical-maneuver grouping with one primary event per group, and separating
+driver causation from driver rescue. Route 94 is the primary regression
+fixture; version 6 remains in progress until new field collection has been
 reviewed.
+
+Version 5 history: progress-based bad-unwind detection and the sensitive
+single turn–stop–turn detector were added on top of version 4's reversal,
+handoff, driver, road, and stall-release evidence. Route 93 and route 94
+replays are complete; version 5 events remain decodable and indexable.
 
 ## What it does
 
@@ -425,8 +434,8 @@ Current versions:
 
 | component | version |
 |---|---:|
-| universal event envelope | 2 |
-| lateral detector | 4 |
+| universal event envelope | 3 |
+| lateral detector | 6 |
 | lead-launch detector | 2 |
 | rolling lead-response detector | 1 |
 | smooth-stop jolt detector | 1 |
