@@ -219,7 +219,6 @@ class Controls:
         lat_delay,
         applied_torque,
         reference_log.unwind_scale,
-        reference_log.sustained_unwind_scale,
         reference_log.target_torque,
         reference_log.geometric_target_torque,
         reference_log.episode_target_torque,

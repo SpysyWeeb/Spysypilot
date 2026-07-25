@@ -951,58 +951,6 @@ struct ControlsState @0x97ff69c53601abf1 {
     referenceSustainedUnwindScale @71 :Float32;           # unwind confidence sustained across the release-preview horizon
     referenceEpisodeTargetTorque @72 :Float32;           # later geometric torque used to confirm episode handoff
     referenceEpisodeLateralAccel @73 :Float32;           # later geometric lateral acceleration used to reject friction-only sign flips
-    handoffCommitted @74 :Bool;                           # selected and later future geometry sustained an opposite maneuver
-    handoffTime @75 :Float32;                             # seconds since committed ownership transfer
-    torqueCommandBeforeHandoffCap @76 :Float32;           # normalized controller request before old-direction limiting
-    handoffOldDirectionLimit @77 :Float32;                # allowed old-turn component beyond crown-neutral
-    handoffTorqueCapScale @78 :Float32;                   # smooth post-commit ramp from zero to full cap
-    handoffTorqueCorrection @79 :Float32;                 # signed normalized correction applied by the cap
-    highAngleUnwindScale @80 :Float32;                    # persisted low-speed/high-angle exit urgency
-    torqueCommandBeforeHighAngleExit @81 :Float32;        # normalized request after legacy unwind blend, before exit urgency
-    highAngleUnwindOldTorqueCorrection @82 :Float32;      # signed correction removing old-turn torque toward crown-neutral
-    highAngleUnwindOldDirectionTorque @83 :Float32;       # pre-cap old-turn component beyond crown-neutral
-    highAngleUnwindLatchedScale @84 :Float32;              # monotonic release authority retained for the owned episode
-    highAngleUnwindOldDirectionLimit @85 :Float32;         # crown-relative maximum old-turn command retained by the latch
-    highAngleUnwindTurnInGuard @86 :Float32;               # diagnostic strength of present plateau/undertracking protection before commitment
-    highAngleUnwindEvidenceHeld @87 :Bool;                 # confirmed release retained through a short evidence dropout
-    highAngleUnwindEvidenceDropoutTime @88 :Float32;       # seconds since future unwind evidence was last eligible
-    highAngleUnwindAppliedOldDirectionTorque @89 :Float32; # crown-relative old-turn component still applied by the EPS
-    highAngleUnwindAppliedNeutral @90 :Bool;               # applied torque is within the breakout crown-neutral tolerance
-    highAngleUnwindNeutralDwell @91 :Float32;              # elapsed progress-window time since the first qualifying crown-neutral sample
-    highAngleUnwindProgressDeg @92 :Float32;               # wheel unwind progress since applied crown-neutral
-    highAngleUnwindBreakoutScale @93 :Float32;             # bounded extreme-angle opposite-assist scale
-    highAngleUnwindBreakoutCorrection @94 :Float32;        # signed normalized opposite correction added by breakout
-    highAngleUnwindPresentDemandRate @95 :Float32;         # delay-aligned present lateral-demand rate, m/s^3
-    highAngleUnwindReleaseCommitted @96 :Bool;              # present-turn demand has persistently released; monotonic exit authority may begin
-    highAngleUnwindReleaseCandidateTime @97 :Float32;       # continuous seconds satisfying the present-demand release gate
-    highAngleUnwindPresentOldDemand @98 :Float32;           # strongest present request still pointing into the owned turn, m/s^2
-    highAngleUnwindPresentPeakDemand @99 :Float32;          # recent peak old-turn request used for release hysteresis, m/s^2
-    highAngleUnwindPresentReleaseAmount @100 :Float32;      # recent peak minus current old-turn request, m/s^2
-    highAngleUnwindPresentTotalDemandRate @101 :Float32;    # delay-aligned request rate in the old-turn direction, m/s^3
-    highAngleUnwindBreakoutEarned @102 :Bool;               # insufficient post-neutral wheel progress earned bounded opposite assist
-    highAngleUnwindBreakoutCompleted @103 :Bool;            # rate recovery or safe angle exit ended breakout for this episode
-    highAngleUnwindBreakoutCatchTime @104 :Float32;         # continuous measured wheel-rate recovery, seconds
-    highAngleUnwindBreakoutPlannedRate @105 :Float32;       # planned lateral-acceleration rate out of the owned turn, m/s^3
-    highAngleUnwindBreakoutActualRate @106 :Float32;        # measured lateral-acceleration rate out of the owned turn, m/s^3
-    highAngleUnwindBreakoutSteeringRate @107 :Float32;      # raw steering-wheel rate out of the owned turn, deg/s
-    highAngleUnwindFutureConfirmed @108 :Bool;               # future unwind intent was confirmed while waiting for present demand to release
-    highAngleUnwindWaitingForPresent @109 :Bool;              # future intent is confirmed but high-angle torque action is still hard-disabled
-    highAngleUnwindBreakoutProgressEvaluated @110 :Bool;      # the fixed post-neutral progress window has been evaluated for this episode
-    highAngleUnwindBreakoutTargetScale @111 :Float32;         # latched breakout target before bounded ramping
-    highAngleUnwindNeutralDelivered @112 :Bool;                # applied old-turn torque completed crown-neutral confirmation
-    highAngleUnwindFutureWaitAge @113 :Float32;                 # age of remembered precommit intent since the last fully confirmed future evidence
-    catchupMode @114 :UInt8;                                    # catch-up observer mode
-    catchupCandidateTime @115 :Float32;                          # continuous seconds satisfying the catch-up entry gates
-    catchupActive @116 :Bool;                                    # bounded catch-up correction is active
-    catchupScale @117 :Float32;                                  # ramped catch-up authority
-    catchupCorrection @118 :Float32;                             # signed normalized correction applied by catch-up
-    catchupPlannedRate @119 :Float32;                            # planned lateral-acceleration rate in the tracked direction, m/s^3
-    catchupActualRate @120 :Float32;                             # measured lateral-acceleration rate in the tracked direction, m/s^3
-    catchupPositionError @121 :Float32;                          # tracked lateral-acceleration position error, m/s^2
-    catchupTerminationReason @122 :UInt8;                        # reason the most recent catch-up episode ended
-    catchupCooldown @123 :Float32;                               # remaining catch-up rearm delay, seconds
-    catchupSignedSteeringRate @124 :Float32;                     # filtered signed steering-wheel rate derived from angle delta, deg/s
-    catchupUnderperform @125 :Bool;                              # planned-versus-actual progress gate is satisfied
    }
 
   struct LateralAngleState {
