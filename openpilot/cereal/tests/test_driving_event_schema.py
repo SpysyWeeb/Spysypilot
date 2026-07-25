@@ -137,6 +137,37 @@ def test_lateral_payload_round_trip():
     "unwind_reference_target_torque_at_trigger": -0.12,
     "unwind_applied_target_gap_at_trigger": 0.30,
     "unwind_peak_applied_target_gap": 0.35,
+    # v6 census (@127-@165): distinct nonzero values for every new field.
+    "unwind_neutral_torque": 0.18,
+    "unwind_phase_direction": -1.0,
+    "high_angle_evidence_valid": True,
+    "high_angle_unwind_scale": 0.42,
+    "torque_command_before_high_angle_exit": 0.33,
+    "high_angle_unwind_old_torque_correction": 0.11,
+    "high_angle_unwind_old_direction_torque": 0.09,
+    "old_turn_sign": -1.0,
+    "future_unwind_commit_mono_time": 0.05,
+    "high_angle_exit_first_nonzero_mono_time": 0.15,
+    "requested_crown_neutral_mono_time": 0.48,
+    "applied_crown_neutral_mono_time": 0.62,
+    "unwind_crown_command_delay_s": 0.38,
+    "wheel_progress_5_mono_time": 0.22,
+    "wheel_progress_20_mono_time": 0.55,
+    "wheel_progress_50_mono_time": 0.95,
+    "unwind_rebound_max_magnitude": 0.55,
+    "unwind_rebound_start_mono_time": 0.72,
+    "unwind_rebound_duration_s": 0.28,
+    "unwind_rebound_same_episode": True,
+    "driver_active_before_deficit": True,
+    "driver_active_at_deficit_start": False,
+    "driver_active_during_evaluation": True,
+    "driver_intervened_after_deficit": True,
+    "driver_intervention_accelerated_progress": True,
+    "driver_causation": "interventionBacked",
+    "turn_stop_pre_dwell_progress_deg": 14.5,
+    "turn_stop_post_dwell_progress_deg": 22.5,
+    "road_evidence_window_start_mono_time": 0.08,
+    "driver_assist_raw_torque_only": True,
   }))
   candidate = lateral_candidate(sample, LateralDetection(
     "committedHandoffHarshness", "warning", 0.9, "reason", evidence,
@@ -222,6 +253,78 @@ def test_lateral_payload_round_trip():
   assert release.dampingApplied == 0.0
   assert release.turnInBlocked
   assert event.episodeKey == "lat:episode"
+  # v6 census (@127-@165): full field census, Present-bit pins, ns-conversion
+  # pins for every new mono time.
+  assert event.payload.lateral.unwindNeutralTorque == pytest.approx(0.18)
+  assert event.payload.lateral.unwindPhaseDirection == pytest.approx(-1.0)
+  assert event.payload.lateral.highAngleEvidenceValid
+  assert event.payload.lateral.highAngleUnwindScale == pytest.approx(0.42)
+  assert event.payload.lateral.torqueCommandBeforeHighAngleExit == pytest.approx(0.33)
+  assert event.payload.lateral.highAngleUnwindOldTorqueCorrection == pytest.approx(0.11)
+  assert event.payload.lateral.highAngleUnwindOldDirectionTorque == pytest.approx(0.09)
+  assert event.payload.lateral.oldTurnSign == pytest.approx(-1.0)
+  assert event.payload.lateral.futureUnwindCommitPresent
+  assert event.payload.lateral.futureUnwindCommitMonoTime == 50_000_000
+  assert event.payload.lateral.highAngleExitFirstNonzeroPresent
+  assert event.payload.lateral.highAngleExitFirstNonzeroMonoTime == 150_000_000
+  assert event.payload.lateral.requestedCrownNeutralPresent
+  assert event.payload.lateral.requestedCrownNeutralMonoTime == 480_000_000
+  assert event.payload.lateral.appliedCrownNeutralPresent
+  assert event.payload.lateral.appliedCrownNeutralMonoTime == 620_000_000
+  assert event.payload.lateral.unwindCrownCommandDelayS == pytest.approx(0.38)
+  assert event.payload.lateral.wheelProgress5Present
+  assert event.payload.lateral.wheelProgress5MonoTime == 220_000_000
+  assert event.payload.lateral.wheelProgress20Present
+  assert event.payload.lateral.wheelProgress20MonoTime == 550_000_000
+  assert event.payload.lateral.wheelProgress50Present
+  assert event.payload.lateral.wheelProgress50MonoTime == 950_000_000
+  assert event.payload.lateral.unwindReboundMaxMagnitude == pytest.approx(0.55)
+  assert event.payload.lateral.unwindReboundStartPresent
+  assert event.payload.lateral.unwindReboundStartMonoTime == 720_000_000
+  assert event.payload.lateral.unwindReboundDurationS == pytest.approx(0.28)
+  assert event.payload.lateral.unwindReboundSameEpisode
+  assert event.payload.lateral.driverActiveBeforeDeficit
+  assert not event.payload.lateral.driverActiveAtDeficitStart
+  assert event.payload.lateral.driverActiveDuringEvaluation
+  assert event.payload.lateral.driverIntervenedAfterDeficit
+  assert event.payload.lateral.driverInterventionAcceleratedProgress
+  assert event.payload.lateral.driverCausation == "interventionBacked"
+  assert event.payload.lateral.turnStopPreDwellProgressDeg == pytest.approx(14.5)
+  assert event.payload.lateral.turnStopPostDwellProgressDeg == pytest.approx(22.5)
+  assert event.payload.lateral.roadEvidenceWindowStartPresent
+  assert event.payload.lateral.roadEvidenceWindowStartMonoTime == 80_000_000
+  assert event.payload.lateral.driverAssistRawTorqueOnly
+
+
+def test_lateral_payload_v6_optional_evidence_absent_serializes_present_false():
+  # Companion to the census above: when the detector never populates a v6
+  # optional field (e.g. no rebound re-excursion occurred), the Present bit
+  # must read False and the mono time 0 — distinct from the `is not None`
+  # semantics pinned above where an explicit 0.0 mono time still reads
+  # Present true.
+  sample = LateralSample(1.0)
+  evidence = LateralEvidence(
+    0.0, 1.0, 0.0, 0.0, False, 0.0, 0, 0.0, "lat:episode", 2.0, 2.0,
+  )
+  candidate = lateral_candidate(sample, LateralDetection(
+    "centerOvershoot", "warning", 0.9, "reason", evidence,
+    occurred_mono_time=0.5, detected_mono_time=0.5,
+  ))
+  event = round_trip(build_message(AcceptedEvent("lat", "group", candidate))).drivingEvent
+  assert not event.payload.lateral.highAngleEvidenceValid
+  assert event.payload.lateral.highAngleUnwindScale == 0.0
+  assert not event.payload.lateral.futureUnwindCommitPresent
+  assert event.payload.lateral.futureUnwindCommitMonoTime == 0
+  assert not event.payload.lateral.requestedCrownNeutralPresent
+  assert not event.payload.lateral.appliedCrownNeutralPresent
+  assert not event.payload.lateral.wheelProgress5Present
+  assert not event.payload.lateral.wheelProgress20Present
+  assert not event.payload.lateral.wheelProgress50Present
+  assert not event.payload.lateral.unwindReboundStartPresent
+  assert event.payload.lateral.unwindReboundMaxMagnitude == 0.0
+  assert event.payload.lateral.driverCausation == ""
+  assert not event.payload.lateral.driverAssistRawTorqueOnly
+  assert not event.payload.lateral.roadEvidenceWindowStartPresent
 
 
 def test_longitudinal_payload_round_trip():
