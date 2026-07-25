@@ -74,78 +74,6 @@ UNWIND_PHASE_RELEASE_TIME = 0.35  # seconds; smoothly restore direct P after del
 UNWIND_EPISODE_TORQUE_DEADBAND = 0.08  # normalized geometric torque beyond crown-neutral
 UNWIND_EPISODE_LATERAL_ACCEL_DEADBAND = 0.20  # m/s^2; excludes friction-sign flips around a nearly straight path
 UNWIND_EPISODE_OPPOSITE_TIME = 0.20  # seconds a horizon-confirmed new maneuver must persist before handoff
-HIGH_ANGLE_UNWIND_START_DEG = 120.0
-HIGH_ANGLE_UNWIND_FULL_DEG = 240.0
-HIGH_ANGLE_UNWIND_EXIT_DEG = 80.0
-HIGH_ANGLE_UNWIND_EXIT_TIME = 0.10
-HIGH_ANGLE_UNWIND_MIN_SPEED = 0.3
-HIGH_ANGLE_UNWIND_FULL_SPEED = 12.0 * CV.MPH_TO_MS
-HIGH_ANGLE_UNWIND_MAX_SPEED = 20.0 * CV.MPH_TO_MS
-HIGH_ANGLE_UNWIND_PHASE_MIN = 0.60
-HIGH_ANGLE_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
-HIGH_ANGLE_UNWIND_RATE_FULL = 0.80  # m/s^3 at the common tracking speed
-HIGH_ANGLE_UNWIND_CONFIRM_TIME = 0.15  # seconds of persistent future-path evidence
-HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME = 0.25
-HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME = 1.75  # bounded wait for the route-confirmed present-demand release lag
-HIGH_ANGLE_UNWIND_RAMP_IN_TIME = 0.20
-HIGH_ANGLE_UNWIND_PRESENT_DEMAND_MIN = 0.20  # m/s^2 in the owned turn direction
-HIGH_ANGLE_UNWIND_PRESENT_PEAK_TIME = 0.75
-HIGH_ANGLE_UNWIND_PRESENT_RELEASE_MIN = 0.20  # m/s^2 below the recent old-turn peak
-HIGH_ANGLE_UNWIND_PRESENT_RELEASE_FRACTION = 0.15
-HIGH_ANGLE_UNWIND_PRESENT_RELEASE_RATE = -0.20  # m/s^3 in the old-turn lateral-acceleration direction
-HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME = 0.15
-HIGH_ANGLE_UNWIND_EXTREME_RELEASE_TIME = 0.10
-HIGH_ANGLE_UNWIND_PRESENT_RELEASE_DEMAND_MAX = 0.50  # m/s^2 still requested into the old turn
-HIGH_ANGLE_UNWIND_PRESENT_PLATEAU_MIN = 0.50
-HIGH_ANGLE_UNWIND_PRESENT_ERROR_START = 0.08  # m/s^2 at the common tracking speed
-HIGH_ANGLE_UNWIND_PRESENT_ERROR_FULL = 0.30
-HIGH_ANGLE_UNWIND_HANDOFF_BRIDGE_TIME = UNWIND_EPISODE_OPPOSITE_TIME + 0.15
-HIGH_ANGLE_BREAKOUT_START_DEG = 300.0
-HIGH_ANGLE_BREAKOUT_FULL_DEG = 360.0
-HIGH_ANGLE_BREAKOUT_EXIT_DEG = 280.0
-HIGH_ANGLE_BREAKOUT_RELEASE_SCALE_MIN = 0.75
-HIGH_ANGLE_BREAKOUT_APPLIED_NEUTRAL_TOL = 0.05
-HIGH_ANGLE_BREAKOUT_NEUTRAL_DWELL_TIME = 0.10
-HIGH_ANGLE_BREAKOUT_PROGRESS_TIME = 0.30
-HIGH_ANGLE_BREAKOUT_PROGRESS_MIN_DEG = 30.0
-HIGH_ANGLE_BREAKOUT_REFERENCE_RATE_MIN = 0.35
-HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_MIN = 0.35
-HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_FRACTION = 0.80
-HIGH_ANGLE_BREAKOUT_STEERING_RATE_MIN = 60.0  # deg/s out of the old turn
-HIGH_ANGLE_BREAKOUT_RATE_RECOVERY_TIME = 0.15
-HIGH_ANGLE_BREAKOUT_TORQUE_MAX = 0.15
-HIGH_ANGLE_BREAKOUT_RAMP_IN_TIME = 0.20
-HIGH_ANGLE_BREAKOUT_RAMP_OUT_TIME = 0.15
-CATCHUP_SURGE_MIN_SPEED = 0.3
-CATCHUP_SURGE_MAX_SPEED = 6.0
-CATCHUP_SURGE_DRIVER_TORQUE_MAX = 100.0
-CATCHUP_SURGE_QUALIFY_TIME = 0.20
-CATCHUP_SURGE_TORQUE_MAX = 0.15
-CATCHUP_SURGE_RAMP_IN_TIME = 0.10
-CATCHUP_SURGE_RAMP_OUT_TIME = 0.15
-CATCHUP_SURGE_MAX_ACTIVE_TIME = 0.30
-CATCHUP_SURGE_RECOVERY_TIME = 0.10
-CATCHUP_SURGE_COOLDOWN_TIME = 0.50
-CATCHUP_SURGE_REARM_HEALTHY_TIME = 0.25
-CATCHUP_SURGE_PROGRESS_DEG = 10.0
-CATCHUP_SURGE_POSITION_EXIT = 0.08
-CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG = 120.0
-CATCHUP_SURGE_TURN_IN_ANGLE_FULL_DEG = 300.0
-CATCHUP_SURGE_TURN_IN_DEMAND_MIN = 0.50
-CATCHUP_SURGE_TURN_IN_ERROR_START = 0.20
-CATCHUP_SURGE_TURN_IN_ERROR_FULL = 0.50
-CATCHUP_SURGE_UNWIND_PEAK_DEG = 300.0
-CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG = 280.0
-CATCHUP_SURGE_UNWIND_ANGLE_FULL_DEG = 360.0
-CATCHUP_SURGE_UNWIND_PRESENT_MAX = 0.50
-CATCHUP_SURGE_UNWIND_STRONG_RELEASE_MAX = 0.20
-CATCHUP_SURGE_UNWIND_PEAK_DEMAND_MIN = 0.35
-CATCHUP_SURGE_UNWIND_EXCESS_MIN = 0.25
-CATCHUP_SURGE_UNWIND_EXCESS_FULL = 0.50
-CATCHUP_SURGE_RATE_MIN = 0.35
-CATCHUP_SURGE_RATE_RECOVERY_FRACTION = 0.80
-SIGNED_STEERING_RATE_FILTER_TAU = 0.08
-HANDOFF_TORQUE_CAP_RAMP_TIME = 0.15  # seconds; CAN slew remains the final actuator-rate boundary
 DAMPING_TURN_IN_POSITION_ERROR_MIN = 0.08  # m/s^2 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_RATE_MIN = 0.15  # m/s^3 at the common tracking speed
 DAMPING_TURN_IN_UNWIND_SCALE_MIN = 0.20
@@ -159,7 +87,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 19
+VERSION = 14
 
 
 def smoothstep(value: float) -> float:
@@ -291,75 +219,6 @@ def get_future_unwind_brake(
   return p_scale_factor, torque_blend, brake_activation, torque_neutral_time, projected_position_error
 
 
-def get_high_angle_unwind_exit(
-  torque_command: float,
-  neutral_torque: float,
-  old_turn_torque_sign: float,
-  exit_scale: float,
-) -> tuple[float, float, float]:
-  """Move only stale old-turn command toward crown-neutral without crossing it."""
-  scale = clip_scalar(exit_scale, 0.0, 1.0)
-  if scale <= 0.0 or old_turn_torque_sign == 0.0:
-    return torque_command, 0.0, 0.0
-
-  old_sign = math.copysign(1.0, old_turn_torque_sign)
-  old_direction_command = max((torque_command - neutral_torque) * old_sign, 0.0)
-  old_release = old_direction_command * scale
-  old_direction_correction = -old_sign * old_release
-  return torque_command + old_direction_correction, old_direction_correction, old_direction_command
-
-
-def apply_high_angle_unwind_limits(
-  torque_command: float,
-  neutral_torque: float,
-  old_turn_torque_sign: float,
-  old_direction_limit: float | None,
-  breakout_scale: float,
-) -> tuple[float, float, float, float]:
-  """Apply a monotonic old-turn ceiling and an optional bounded opposite breakout target."""
-  if old_turn_torque_sign == 0.0:
-    return torque_command, 0.0, 0.0, 0.0
-
-  old_sign = math.copysign(1.0, old_turn_torque_sign)
-  command_coordinate = (torque_command - neutral_torque) * old_sign
-  old_direction_command = max(command_coordinate, 0.0)
-  limited_coordinate = command_coordinate
-  if old_direction_limit is not None:
-    limited_coordinate = min(limited_coordinate, max(old_direction_limit, 0.0))
-  old_direction_correction = old_sign * (limited_coordinate - command_coordinate)
-
-  breakout_magnitude = HIGH_ANGLE_BREAKOUT_TORQUE_MAX * clip_scalar(breakout_scale, 0.0, 1.0)
-  breakout_coordinate = -breakout_magnitude
-  final_coordinate = min(limited_coordinate, breakout_coordinate) if breakout_magnitude > 0.0 else limited_coordinate
-  limited_command = neutral_torque + old_sign * limited_coordinate
-  final_command = neutral_torque + old_sign * final_coordinate
-  if breakout_magnitude > 0.0:
-    final_command = clip_scalar(final_command, -1.0, 1.0)
-  breakout_correction = final_command - limited_command
-  return final_command, old_direction_correction, old_direction_command, breakout_correction
-
-
-def get_committed_handoff_torque_cap(
-  torque_command: float,
-  reference_target_torque: float,
-  neutral_torque: float,
-  old_turn_torque_sign: float,
-  committed: bool,
-  handoff_time: float,
-) -> tuple[float, float, float, float]:
-  """Progressively remove command beyond the reachable old-turn target after a confirmed handoff."""
-  if not committed or old_turn_torque_sign == 0.0:
-    return torque_command, 0.0, 0.0, 0.0
-
-  old_sign = math.copysign(1.0, old_turn_torque_sign)
-  old_direction_command = max((torque_command - neutral_torque) * old_sign, 0.0)
-  old_direction_limit = max((reference_target_torque - neutral_torque) * old_sign, 0.0)
-  cap_scale = smoothstep(handoff_time / HANDOFF_TORQUE_CAP_RAMP_TIME)
-  excess = max(old_direction_command - old_direction_limit, 0.0)
-  correction = -old_sign * excess * cap_scale
-  return torque_command + correction, correction, old_direction_limit, cap_scale
-
-
 class UnwindPhaseState(NamedTuple):
   phase: float
   turn_torque_sign: float
@@ -368,714 +227,6 @@ class UnwindPhaseState(NamedTuple):
   same_episode: bool
   opposite_time: float
   episode_armed: bool
-
-
-class SignedSteeringRateFilter:
-  """Derive signed wheel rate from angle; Hyundai's reported steering rate is unsigned."""
-
-  def __init__(self, dt: float):
-    self.dt = dt
-    self.filter = FirstOrderFilter(0.0, SIGNED_STEERING_RATE_FILTER_TAU, dt, initialized=True)
-    self.previous_angle: float | None = None
-
-  def reset(self) -> None:
-    self.filter.x = 0.0
-    self.filter.initialized = True
-    self.previous_angle = None
-
-  def update(self, steering_angle_deg: float, enabled: bool) -> float:
-    if not enabled:
-      self.reset()
-      return 0.0
-    if self.previous_angle is None:
-      self.previous_angle = steering_angle_deg
-      return 0.0
-
-    raw_rate = (steering_angle_deg - self.previous_angle) / self.dt
-    self.previous_angle = steering_angle_deg
-    return float(self.filter.update(raw_rate))
-
-
-class HighAngleUnwindExitState:
-  """Latch a crown-relative unwind ceiling and gate bounded EPS breakout assistance."""
-
-  def __init__(self, dt: float):
-    self.dt = dt
-    self.present_demand_history: deque[float] = deque(maxlen=max(1, int(round(HIGH_ANGLE_UNWIND_PRESENT_PEAK_TIME / dt))))
-    self.confirmed_time = 0.0
-    self.future_confirmed = False
-    self.future_wait_age = 0.0
-    self.confirmed_target_scale = 0.0
-    self.release_candidate_time = 0.0
-    self.release_committed = False
-    self.present_old_demand = 0.0
-    self.present_peak_demand = 0.0
-    self.present_release_amount = 0.0
-    self.present_total_demand_rate = 0.0
-    self.ineligible_time = 0.0
-    self.low_angle_time = 0.0
-    self.target_scale = 0.0
-    self.scale = 0.0
-    self.latched_scale = 0.0
-    self.turn_in_guard = 0.0
-    self.old_direction_limit: float | None = None
-    self.old_turn_torque_sign = 0.0
-    self.release_owned = False
-    self.handoff_bridge_time = 0.0
-    self.applied_old_direction_torque = 0.0
-    self.applied_neutral = False
-    self.neutral_delivered = False
-    self.neutral_dwell_time = 0.0
-    self.neutral_entry_angle = 0.0
-    self.progress_deg = 0.0
-    self.peak_aligned_angle = 0.0
-    self.breakout_target_scale = 0.0
-    self.breakout_scale = 0.0
-    self.breakout_progress_evaluated = False
-    self.breakout_earned = False
-    self.breakout_catch_time = 0.0
-    self.breakout_completed = False
-    self.breakout_planned_rate = 0.0
-    self.breakout_actual_rate = 0.0
-    self.breakout_steering_rate = 0.0
-    self.evidence_held = False
-
-  def reset(self) -> None:
-    self.present_demand_history.clear()
-    self.confirmed_time = 0.0
-    self.future_confirmed = False
-    self.future_wait_age = 0.0
-    self.confirmed_target_scale = 0.0
-    self.release_candidate_time = 0.0
-    self.release_committed = False
-    self.present_old_demand = 0.0
-    self.present_peak_demand = 0.0
-    self.present_release_amount = 0.0
-    self.present_total_demand_rate = 0.0
-    self.ineligible_time = 0.0
-    self.low_angle_time = 0.0
-    self.target_scale = 0.0
-    self.scale = 0.0
-    self.latched_scale = 0.0
-    self.turn_in_guard = 0.0
-    self.old_direction_limit = None
-    self.old_turn_torque_sign = 0.0
-    self.release_owned = False
-    self.handoff_bridge_time = 0.0
-    self.applied_old_direction_torque = 0.0
-    self.applied_neutral = False
-    self.neutral_delivered = False
-    self.neutral_dwell_time = 0.0
-    self.neutral_entry_angle = 0.0
-    self.progress_deg = 0.0
-    self.peak_aligned_angle = 0.0
-    self.breakout_target_scale = 0.0
-    self.breakout_scale = 0.0
-    self.breakout_progress_evaluated = False
-    self.breakout_earned = False
-    self.breakout_catch_time = 0.0
-    self.breakout_completed = False
-    self.breakout_planned_rate = 0.0
-    self.breakout_actual_rate = 0.0
-    self.breakout_steering_rate = 0.0
-    self.evidence_held = False
-
-  def _reset_release(self, preserve_limit_for_handoff: bool) -> None:
-    if preserve_limit_for_handoff and self.old_direction_limit is not None:
-      self.handoff_bridge_time = HIGH_ANGLE_UNWIND_HANDOFF_BRIDGE_TIME
-    else:
-      self.old_direction_limit = None
-      self.old_turn_torque_sign = 0.0
-      self.handoff_bridge_time = 0.0
-    self.confirmed_time = 0.0
-    self.future_confirmed = False
-    self.future_wait_age = 0.0
-    self.confirmed_target_scale = 0.0
-    self.release_candidate_time = 0.0
-    self.release_committed = False
-    self.present_demand_history.clear()
-    self.present_old_demand = 0.0
-    self.present_peak_demand = 0.0
-    self.present_release_amount = 0.0
-    self.present_total_demand_rate = 0.0
-    self.ineligible_time = 0.0
-    self.low_angle_time = 0.0
-    self.target_scale = 0.0
-    self.scale = 0.0
-    self.latched_scale = 0.0
-    self.turn_in_guard = 0.0
-    self.release_owned = False
-    self.applied_old_direction_torque = 0.0
-    self.applied_neutral = False
-    self.neutral_delivered = False
-    self.neutral_dwell_time = 0.0
-    self.neutral_entry_angle = 0.0
-    self.progress_deg = 0.0
-    self.peak_aligned_angle = 0.0
-    self.breakout_target_scale = 0.0
-    self.breakout_scale = 0.0
-    self.breakout_progress_evaluated = False
-    self.breakout_earned = False
-    self.breakout_catch_time = 0.0
-    self.breakout_completed = False
-    self.breakout_planned_rate = 0.0
-    self.breakout_actual_rate = 0.0
-    self.breakout_steering_rate = 0.0
-    self.evidence_held = False
-
-  def update(
-    self,
-    enabled: bool,
-    steering_angle_deg: float,
-    v_ego: float,
-    sustained_unwind_scale: float,
-    effective_unwind_phase: float,
-    same_episode: bool,
-    old_turn_torque_sign: float,
-    reference_rate: float,
-    present_demand_rate: float = 0.0,
-    tracking_position_error: float = 0.0,
-    delayed_lateral_accel: float = 0.0,
-    current_lateral_accel: float = 0.0,
-    geometric_lateral_accel: float | None = None,
-    tracking_measurement_rate: float = 0.0,
-    signed_steering_rate_deg: float = 0.0,
-    applied_torque: float = 0.0,
-    neutral_torque: float = 0.0,
-  ) -> float:
-    if not enabled:
-      self.reset()
-      return 0.0
-
-    if self.handoff_bridge_time > 0.0:
-      self.handoff_bridge_time = max(self.handoff_bridge_time - self.dt, 0.0)
-      if self.handoff_bridge_time == 0.0 and not self.release_owned:
-        self.old_direction_limit = None
-        self.old_turn_torque_sign = 0.0
-
-    sign_changed = (
-      self.old_turn_torque_sign != 0.0
-      and old_turn_torque_sign != 0.0
-      and math.copysign(1.0, old_turn_torque_sign) != math.copysign(1.0, self.old_turn_torque_sign)
-    )
-    if not same_episode or old_turn_torque_sign == 0.0 or sign_changed:
-      if self.release_owned:
-        self._reset_release(preserve_limit_for_handoff=True)
-      elif self.handoff_bridge_time == 0.0:
-        self._reset_release(preserve_limit_for_handoff=False)
-      return 0.0
-
-    old_sign = math.copysign(1.0, old_turn_torque_sign)
-    if not self.release_owned and self.handoff_bridge_time > 0.0 and self.old_turn_torque_sign != old_sign:
-      self.old_direction_limit = None
-      self.handoff_bridge_time = 0.0
-    self.old_turn_torque_sign = old_sign
-
-    aligned_angle = steering_angle_deg * old_sign
-    active_angle_floor = HIGH_ANGLE_UNWIND_EXIT_DEG if self.release_owned else HIGH_ANGLE_UNWIND_START_DEG
-    if aligned_angle <= active_angle_floor or not (HIGH_ANGLE_UNWIND_MIN_SPEED <= v_ego < HIGH_ANGLE_UNWIND_MAX_SPEED):
-      if self.release_owned and aligned_angle <= HIGH_ANGLE_UNWIND_EXIT_DEG:
-        self.low_angle_time += self.dt
-        if self.low_angle_time < HIGH_ANGLE_UNWIND_EXIT_TIME:
-          self.breakout_target_scale = 0.0
-          self.breakout_scale = 0.0
-          return self.scale
-      self._reset_release(preserve_limit_for_handoff=False)
-      return 0.0
-    self.low_angle_time = 0.0
-    self.peak_aligned_angle = max(self.peak_aligned_angle, aligned_angle)
-
-    angle_scale = smoothstep((aligned_angle - HIGH_ANGLE_UNWIND_START_DEG) / (HIGH_ANGLE_UNWIND_FULL_DEG - HIGH_ANGLE_UNWIND_START_DEG))
-    speed_scale = 1.0 - smoothstep((v_ego - HIGH_ANGLE_UNWIND_FULL_SPEED) / (HIGH_ANGLE_UNWIND_MAX_SPEED - HIGH_ANGLE_UNWIND_FULL_SPEED))
-    sustained_scale = smoothstep((sustained_unwind_scale - HIGH_ANGLE_UNWIND_PHASE_MIN) / (1.0 - HIGH_ANGLE_UNWIND_PHASE_MIN))
-    phase_scale = smoothstep((effective_unwind_phase - HIGH_ANGLE_UNWIND_PHASE_MIN) / (1.0 - HIGH_ANGLE_UNWIND_PHASE_MIN))
-    unloading_rate = reference_rate * old_sign
-    rate_scale = smoothstep((unloading_rate - HIGH_ANGLE_UNWIND_RATE_MIN) / (HIGH_ANGLE_UNWIND_RATE_FULL - HIGH_ANGLE_UNWIND_RATE_MIN))
-
-    old_lateral_accel_sign = -old_sign
-    demand_candidates = (delayed_lateral_accel, current_lateral_accel)
-    if geometric_lateral_accel is not None and np.isfinite(geometric_lateral_accel):
-      demand_candidates += (geometric_lateral_accel,)
-    self.present_old_demand = max(*(demand * old_lateral_accel_sign for demand in demand_candidates), 0.0)
-    self.present_demand_history.append(self.present_old_demand)
-    self.present_peak_demand = max(self.present_demand_history, default=0.0)
-    self.present_release_amount = max(self.present_peak_demand - self.present_old_demand, 0.0)
-    self.present_total_demand_rate = present_demand_rate * old_lateral_accel_sign
-    present_undertrack = max(tracking_position_error * old_lateral_accel_sign, 0.0)
-    undertrack_guard = smoothstep(
-      (present_undertrack - HIGH_ANGLE_UNWIND_PRESENT_ERROR_START) / (HIGH_ANGLE_UNWIND_PRESENT_ERROR_FULL - HIGH_ANGLE_UNWIND_PRESENT_ERROR_START)
-    )
-    plateau_guard = float(
-      self.present_old_demand >= HIGH_ANGLE_UNWIND_PRESENT_PLATEAU_MIN and self.present_total_demand_rate > HIGH_ANGLE_UNWIND_PRESENT_RELEASE_RATE
-    )
-    self.turn_in_guard = 0.0 if self.release_committed else max(plateau_guard, undertrack_guard)
-
-    eligible = speed_scale > 0.0 and sustained_scale > 0.0 and phase_scale > 0.0 and rate_scale > 0.0
-    if eligible:
-      raw_target = angle_scale * speed_scale * sustained_scale * phase_scale * rate_scale
-      self.confirmed_time += self.dt
-      self.ineligible_time = 0.0
-      if self.confirmed_time >= HIGH_ANGLE_UNWIND_CONFIRM_TIME:
-        self.future_confirmed = True
-        self.future_wait_age = 0.0
-        self.confirmed_target_scale = max(self.confirmed_target_scale, raw_target)
-      elif self.future_confirmed and not self.release_committed:
-        self.future_wait_age += self.dt
-      if self.release_committed:
-        self.latched_scale = max(self.latched_scale, raw_target)
-    else:
-      self.ineligible_time += self.dt
-      if self.future_confirmed and not self.release_committed:
-        self.future_wait_age += self.dt
-      if self.ineligible_time >= HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME:
-        # The preview intent stays remembered while this geometric episode is
-        # owned, but stronger authority still requires fresh future evidence.
-        self.confirmed_time = 0.0
-      if not self.release_committed and self.future_wait_age >= HIGH_ANGLE_UNWIND_FUTURE_WAIT_TIME:
-        self.future_confirmed = False
-        self.future_wait_age = 0.0
-        self.confirmed_target_scale = 0.0
-        self.release_candidate_time = 0.0
-
-    required_release = max(
-      HIGH_ANGLE_UNWIND_PRESENT_RELEASE_MIN,
-      HIGH_ANGLE_UNWIND_PRESENT_RELEASE_FRACTION * self.present_peak_demand,
-    )
-    materially_declining = (
-      self.present_release_amount >= required_release
-      and self.present_total_demand_rate <= HIGH_ANGLE_UNWIND_PRESENT_RELEASE_RATE
-      and self.present_old_demand <= HIGH_ANGLE_UNWIND_PRESENT_RELEASE_DEMAND_MAX
-    )
-    near_neutral = self.present_old_demand <= HIGH_ANGLE_UNWIND_PRESENT_DEMAND_MIN
-    release_candidate = not self.release_committed and self.future_confirmed and (near_neutral or materially_declining)
-    self.release_candidate_time = self.release_candidate_time + self.dt if release_candidate else 0.0
-    required_release_time = (
-      HIGH_ANGLE_UNWIND_EXTREME_RELEASE_TIME if self.peak_aligned_angle >= HIGH_ANGLE_BREAKOUT_FULL_DEG else HIGH_ANGLE_UNWIND_PRESENT_RELEASE_TIME
-    )
-    if self.release_candidate_time >= required_release_time:
-      self.release_committed = True
-      current_angle_speed_authority = angle_scale * speed_scale
-      self.latched_scale = max(self.latched_scale, min(self.confirmed_target_scale, current_angle_speed_authority))
-      self.release_owned = self.latched_scale > 0.0
-      self.turn_in_guard = 0.0
-
-    self.evidence_held = self.release_committed and not eligible and self.ineligible_time < HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME
-    self.target_scale = self.latched_scale
-    self.scale += clip_scalar(self.target_scale - self.scale, 0.0, self.dt / HIGH_ANGLE_UNWIND_RAMP_IN_TIME)
-
-    self.applied_old_direction_torque = max((applied_torque - neutral_torque) * old_sign, 0.0)
-    self.breakout_planned_rate = unloading_rate
-    self.breakout_actual_rate = tracking_measurement_rate * old_sign
-    self.breakout_steering_rate = -signed_steering_rate_deg * old_sign
-    breakout_structural_scope = (
-      self.release_committed
-      and self.release_owned
-      and self.latched_scale >= HIGH_ANGLE_BREAKOUT_RELEASE_SCALE_MIN
-      and self.peak_aligned_angle >= HIGH_ANGLE_BREAKOUT_START_DEG
-      and aligned_angle >= HIGH_ANGLE_BREAKOUT_EXIT_DEG
-      and HIGH_ANGLE_UNWIND_MIN_SPEED <= v_ego < HIGH_ANGLE_UNWIND_MAX_SPEED
-    )
-    strengthening_allowed = (
-      breakout_structural_scope
-      and eligible
-      and unloading_rate > HIGH_ANGLE_BREAKOUT_REFERENCE_RATE_MIN
-      and self.present_old_demand <= HIGH_ANGLE_UNWIND_PRESENT_DEMAND_MIN
-    )
-    self.applied_neutral = breakout_structural_scope and self.applied_old_direction_torque <= HIGH_ANGLE_BREAKOUT_APPLIED_NEUTRAL_TOL
-    if breakout_structural_scope and not self.neutral_delivered:
-      if self.applied_neutral:
-        if self.neutral_dwell_time == 0.0:
-          self.neutral_entry_angle = aligned_angle
-        self.neutral_dwell_time += self.dt
-        self.progress_deg = max(self.neutral_entry_angle - aligned_angle, 0.0)
-        if self.neutral_dwell_time >= HIGH_ANGLE_BREAKOUT_NEUTRAL_DWELL_TIME:
-          self.neutral_delivered = True
-      elif self.applied_old_direction_torque > HIGH_ANGLE_BREAKOUT_APPLIED_NEUTRAL_TOL + 0.03:
-        self.neutral_dwell_time = 0.0
-        self.neutral_entry_angle = 0.0
-        self.progress_deg = 0.0
-    elif breakout_structural_scope and self.neutral_delivered:
-      self.neutral_dwell_time += self.dt
-      self.progress_deg = max(self.neutral_entry_angle - aligned_angle, 0.0)
-
-    if (
-      breakout_structural_scope
-      and self.neutral_delivered
-      and not self.breakout_progress_evaluated
-      and self.neutral_dwell_time >= HIGH_ANGLE_BREAKOUT_PROGRESS_TIME
-    ):
-      self.breakout_progress_evaluated = True
-      if self.progress_deg < HIGH_ANGLE_BREAKOUT_PROGRESS_MIN_DEG:
-        angle_breakout_scale = smoothstep(
-          (self.peak_aligned_angle - HIGH_ANGLE_BREAKOUT_START_DEG) / (HIGH_ANGLE_BREAKOUT_FULL_DEG - HIGH_ANGLE_BREAKOUT_START_DEG)
-        )
-        self.breakout_target_scale = angle_breakout_scale * speed_scale
-        self.breakout_earned = self.breakout_target_scale > 0.0
-
-    rate_recovered = (
-      self.breakout_actual_rate >= max(HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_MIN, HIGH_ANGLE_BREAKOUT_ACTUAL_RATE_FRACTION * unloading_rate)
-      and self.breakout_steering_rate >= HIGH_ANGLE_BREAKOUT_STEERING_RATE_MIN
-    )
-    if self.breakout_earned and not self.breakout_completed:
-      if strengthening_allowed:
-        self.breakout_catch_time = self.breakout_catch_time + self.dt if rate_recovered else 0.0
-      if self.breakout_catch_time >= HIGH_ANGLE_BREAKOUT_RATE_RECOVERY_TIME:
-        self.breakout_completed = True
-        self.breakout_target_scale = 0.0
-
-    if not breakout_structural_scope and self.release_committed:
-      if aligned_angle < HIGH_ANGLE_BREAKOUT_EXIT_DEG and (self.breakout_earned or self.neutral_delivered):
-        self.breakout_completed = True
-      self.breakout_target_scale = 0.0
-
-    if self.breakout_earned and not self.breakout_completed and not strengthening_allowed:
-      breakout_delta = 0.0
-    else:
-      breakout_ramp_time = HIGH_ANGLE_BREAKOUT_RAMP_IN_TIME if self.breakout_target_scale > self.breakout_scale else HIGH_ANGLE_BREAKOUT_RAMP_OUT_TIME
-      breakout_delta = clip_scalar(
-        self.breakout_target_scale - self.breakout_scale,
-        -self.dt / breakout_ramp_time,
-        self.dt / breakout_ramp_time,
-      )
-    self.breakout_scale += breakout_delta
-    return self.scale
-
-  def apply(self, torque_command: float, neutral_torque: float) -> tuple[float, float, float, float]:
-    if self.old_turn_torque_sign == 0.0:
-      return torque_command, 0.0, 0.0, 0.0
-
-    old_sign = self.old_turn_torque_sign
-    old_direction_command = max((torque_command - neutral_torque) * old_sign, 0.0)
-    if self.release_owned and self.scale > 0.0:
-      candidate_limit = old_direction_command * (1.0 - self.scale)
-      self.old_direction_limit = candidate_limit if self.old_direction_limit is None else min(self.old_direction_limit, candidate_limit)
-
-    active_limit = self.old_direction_limit if self.release_owned or self.handoff_bridge_time > 0.0 else None
-    active_breakout = self.breakout_scale if self.release_owned else 0.0
-    return apply_high_angle_unwind_limits(
-      torque_command,
-      neutral_torque,
-      old_sign,
-      active_limit,
-      active_breakout,
-    )
-
-
-class CatchupSurgeState:
-  """Issue one bounded low-speed pulse when normal control proves severe under-response."""
-
-  MODE_NONE = 0
-  MODE_TURN_IN = 1
-  MODE_UNWIND = 2
-
-  TERMINATION_NONE = 0
-  TERMINATION_RECOVERED = 1
-  TERMINATION_POSITION = 2
-  TERMINATION_PROGRESS = 3
-  TERMINATION_TIMEOUT = 4
-  TERMINATION_DRIVER = 5
-  TERMINATION_INACTIVE = 6
-  TERMINATION_INTENT = 7
-  TERMINATION_SPEED = 8
-  TERMINATION_EPISODE = 9
-
-  def __init__(self, dt: float):
-    self.dt = dt
-    self.reset()
-
-  def reset(self) -> None:
-    self.mode = self.MODE_NONE
-    self.candidate_mode = self.MODE_NONE
-    self.candidate_direction = 0.0
-    self.candidate_time = 0.0
-    self.candidate_valid = False
-    self.active = False
-    self.pulse_active = False
-    self.scale = 0.0
-    self.target_scale = 0.0
-    self.correction = 0.0
-    self.planned_rate = 0.0
-    self.actual_rate = 0.0
-    self.position_error = 0.0
-    self.termination_reason = self.TERMINATION_NONE
-    self.cooldown = 0.0
-    self.signed_steering_rate = 0.0
-    self.underperform = False
-    self.direction = 0.0
-    self.active_time = 0.0
-    self.recovery_time = 0.0
-    self.healthy_time = 0.0
-    self.start_angle = 0.0
-    self.trigger_position_error = 0.0
-    self.used = False
-    self.used_mode = self.MODE_NONE
-
-  def _terminate(self, reason: int, immediate: bool = False) -> None:
-    if self.pulse_active or self.scale > 0.0:
-      self.termination_reason = reason
-      self.cooldown = CATCHUP_SURGE_COOLDOWN_TIME
-      self.healthy_time = 0.0
-      self.used = True
-    self.pulse_active = False
-    self.target_scale = 0.0
-    self.candidate_time = 0.0
-    self.candidate_mode = self.MODE_NONE
-    self.candidate_direction = 0.0
-    if immediate:
-      self.scale = 0.0
-      self.active = False
-      self.mode = self.MODE_NONE
-      self.direction = 0.0
-      self.candidate_valid = False
-      self.underperform = False
-
-  def update(
-    self,
-    enabled: bool,
-    steering_pressed: bool,
-    driver_torque: float,
-    steering_angle_deg: float,
-    signed_steering_rate: float,
-    v_ego: float,
-    delayed_lateral_accel: float,
-    current_lateral_accel: float,
-    measured_lateral_accel: float,
-    tracking_position_error: float,
-    reference_rate: float,
-    tracking_measurement_rate: float,
-    torque_command: float,
-    neutral_torque: float,
-    handoff_committed: bool,
-    unwind_same_episode: bool,
-    unwind_direction: float,
-    high_angle_state: HighAngleUnwindExitState,
-  ) -> float:
-    self.correction = 0.0
-    self.signed_steering_rate = signed_steering_rate
-    self.cooldown = max(self.cooldown - self.dt, 0.0)
-
-    if steering_pressed or abs(driver_torque) >= CATCHUP_SURGE_DRIVER_TORQUE_MAX:
-      self._terminate(self.TERMINATION_DRIVER, immediate=True)
-      return torque_command
-    if not enabled:
-      self._terminate(self.TERMINATION_INACTIVE, immediate=True)
-      return torque_command
-    if not (CATCHUP_SURGE_MIN_SPEED <= v_ego < CATCHUP_SURGE_MAX_SPEED):
-      self._terminate(self.TERMINATION_SPEED, immediate=True)
-      return torque_command
-
-    angle_magnitude = abs(steering_angle_deg)
-    turn_lateral_sign = 0.0 if abs(current_lateral_accel) < CATCHUP_SURGE_TURN_IN_DEMAND_MIN else math.copysign(1.0, current_lateral_accel)
-    turn_direction = -turn_lateral_sign
-    turn_consistent = turn_lateral_sign != 0.0 and delayed_lateral_accel * turn_lateral_sign >= CATCHUP_SURGE_TURN_IN_DEMAND_MIN
-    turn_position_error = max(tracking_position_error * turn_lateral_sign, 0.0)
-    turn_underperform = turn_position_error
-    turn_planned_rate = reference_rate * turn_lateral_sign
-    turn_actual_rate = tracking_measurement_rate * turn_lateral_sign
-    turn_base_coordinate = (torque_command - neutral_torque) * turn_direction
-    turn_structure = (
-      turn_consistent
-      and steering_angle_deg * turn_direction >= CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG
-      and turn_base_coordinate > 0.0
-      and not handoff_committed
-      and not high_angle_state.release_committed
-    )
-    turn_qualifies = turn_structure and turn_underperform >= CATCHUP_SURGE_TURN_IN_ERROR_START
-    turn_angle_scale = smoothstep(
-      (angle_magnitude - CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG)
-      / (CATCHUP_SURGE_TURN_IN_ANGLE_FULL_DEG - CATCHUP_SURGE_TURN_IN_ANGLE_START_DEG)
-    )
-    turn_deficit_scale = smoothstep(
-      (turn_underperform - CATCHUP_SURGE_TURN_IN_ERROR_START)
-      / (CATCHUP_SURGE_TURN_IN_ERROR_FULL - CATCHUP_SURGE_TURN_IN_ERROR_START)
-    )
-    turn_authority = turn_angle_scale * turn_deficit_scale
-
-    old_sign = 0.0 if unwind_direction == 0.0 else math.copysign(1.0, unwind_direction)
-    old_lateral_sign = -old_sign
-    aligned_angle = steering_angle_deg * old_sign
-    current_old_demand = max(current_lateral_accel * old_lateral_sign, 0.0)
-    measured_old_demand = measured_lateral_accel * old_lateral_sign
-    unwind_excess = max(measured_old_demand - current_old_demand, 0.0)
-    unwind_position_error = max(unwind_excess, -tracking_position_error * old_lateral_sign, 0.0)
-    unwind_planned_rate = reference_rate * old_sign
-    unwind_actual_rate = tracking_measurement_rate * old_sign
-    unwind_direction_sign = -old_sign
-    unwind_base_coordinate = (torque_command - neutral_torque) * old_sign
-    fresh_future = high_angle_state.future_confirmed and high_angle_state.ineligible_time < HIGH_ANGLE_UNWIND_EVIDENCE_HOLD_TIME
-    model_release_agreement = (
-      fresh_future
-      and current_old_demand <= CATCHUP_SURGE_UNWIND_PRESENT_MAX
-      and unwind_excess >= CATCHUP_SURGE_UNWIND_EXCESS_MIN
-    )
-    strong_present_release = (
-      current_old_demand <= CATCHUP_SURGE_UNWIND_STRONG_RELEASE_MAX
-      and high_angle_state.present_old_demand <= CATCHUP_SURGE_UNWIND_STRONG_RELEASE_MAX
-      and high_angle_state.present_peak_demand >= CATCHUP_SURGE_UNWIND_PEAK_DEMAND_MIN
-    )
-    unwind_structure = (
-      old_sign != 0.0
-      and unwind_same_episode
-      and high_angle_state.peak_aligned_angle >= CATCHUP_SURGE_UNWIND_PEAK_DEG
-      and aligned_angle >= CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG
-      and (model_release_agreement or strong_present_release)
-      and unwind_base_coordinate <= 0.0
-      and unwind_planned_rate > CATCHUP_SURGE_RATE_MIN
-    )
-    unwind_active_structure = (
-      old_sign != 0.0
-      and unwind_same_episode
-      and aligned_angle >= CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG
-      and current_old_demand <= CATCHUP_SURGE_UNWIND_PRESENT_MAX
-      and unwind_base_coordinate <= 0.0
-      and unwind_planned_rate > CATCHUP_SURGE_RATE_MIN
-    )
-    unwind_qualifies = (
-      unwind_structure
-      and unwind_actual_rate < CATCHUP_SURGE_RATE_RECOVERY_FRACTION * unwind_planned_rate
-    )
-    unwind_angle_scale = smoothstep(
-      (aligned_angle - CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG)
-      / (CATCHUP_SURGE_UNWIND_ANGLE_FULL_DEG - CATCHUP_SURGE_UNWIND_ANGLE_EXIT_DEG)
-    )
-    unwind_rate_deficit = max(unwind_planned_rate - unwind_actual_rate, 0.0)
-    unwind_rate_scale = smoothstep(unwind_rate_deficit / max(0.5 * unwind_planned_rate, 1e-3))
-    unwind_excess_scale = smoothstep(
-      (unwind_excess - CATCHUP_SURGE_UNWIND_EXCESS_MIN)
-      / (CATCHUP_SURGE_UNWIND_EXCESS_FULL - CATCHUP_SURGE_UNWIND_EXCESS_MIN)
-    )
-    unwind_authority = unwind_angle_scale * max(unwind_rate_scale, unwind_excess_scale)
-
-    if unwind_qualifies:
-      candidate_mode = self.MODE_UNWIND
-      candidate_direction = unwind_direction_sign
-      candidate_authority = unwind_authority
-      candidate_planned_rate = unwind_planned_rate
-      candidate_actual_rate = unwind_actual_rate
-      candidate_position_error = unwind_position_error
-    elif turn_qualifies:
-      candidate_mode = self.MODE_TURN_IN
-      candidate_direction = turn_direction
-      candidate_authority = turn_authority
-      candidate_planned_rate = turn_planned_rate
-      candidate_actual_rate = turn_actual_rate
-      candidate_position_error = turn_underperform
-    else:
-      candidate_mode = self.MODE_NONE
-      candidate_direction = 0.0
-      candidate_authority = 0.0
-      candidate_planned_rate = 0.0
-      candidate_actual_rate = 0.0
-      candidate_position_error = 0.0
-
-    self.candidate_valid = candidate_mode != self.MODE_NONE and candidate_authority > 0.0
-    self.planned_rate = candidate_planned_rate
-    self.actual_rate = candidate_actual_rate
-    self.position_error = candidate_position_error
-    self.underperform = self.candidate_valid
-    if not self.pulse_active and self.scale <= 0.0:
-      if self.used_mode == self.MODE_UNWIND:
-        healthy = (
-          not unwind_same_episode
-          or unwind_position_error < CATCHUP_SURGE_POSITION_EXIT
-          or (
-            unwind_planned_rate > CATCHUP_SURGE_RATE_MIN
-            and unwind_actual_rate >= CATCHUP_SURGE_RATE_RECOVERY_FRACTION * unwind_planned_rate
-          )
-        )
-      elif self.used_mode == self.MODE_TURN_IN:
-        healthy = (
-          not turn_consistent
-          or turn_position_error < CATCHUP_SURGE_POSITION_EXIT
-          or (
-            turn_planned_rate > CATCHUP_SURGE_RATE_MIN
-            and turn_actual_rate >= CATCHUP_SURGE_RATE_RECOVERY_FRACTION * turn_planned_rate
-          )
-        )
-      else:
-        healthy = not self.candidate_valid
-      self.healthy_time = self.healthy_time + self.dt if healthy else 0.0
-      if self.used and self.cooldown <= 0.0 and self.healthy_time >= CATCHUP_SURGE_REARM_HEALTHY_TIME:
-        self.used = False
-        self.used_mode = self.MODE_NONE
-        self.termination_reason = self.TERMINATION_NONE
-
-    if not self.pulse_active and not self.used and self.candidate_valid:
-      same_candidate = self.candidate_mode == candidate_mode and self.candidate_direction == candidate_direction
-      self.candidate_time = self.candidate_time + self.dt if same_candidate else self.dt
-      self.candidate_mode = candidate_mode
-      self.candidate_direction = candidate_direction
-      if self.candidate_time >= CATCHUP_SURGE_QUALIFY_TIME:
-        self.mode = candidate_mode
-        self.direction = candidate_direction
-        self.pulse_active = True
-        self.active_time = 0.0
-        self.recovery_time = 0.0
-        self.start_angle = steering_angle_deg
-        self.trigger_position_error = candidate_position_error
-        self.target_scale = candidate_authority
-        self.used = True
-        self.used_mode = candidate_mode
-        self.termination_reason = self.TERMINATION_NONE
-    elif not self.pulse_active:
-      self.candidate_time = 0.0
-      self.candidate_mode = self.MODE_NONE
-      self.candidate_direction = 0.0
-
-    if self.pulse_active:
-      active_structure = unwind_active_structure if self.mode == self.MODE_UNWIND else turn_structure
-      active_direction = unwind_direction_sign if self.mode == self.MODE_UNWIND else turn_direction
-      if not active_structure or active_direction != self.direction:
-        reason = self.TERMINATION_EPISODE if self.mode == self.MODE_UNWIND else self.TERMINATION_INTENT
-        self._terminate(reason, immediate=True)
-        return torque_command
-
-      if self.mode == self.MODE_UNWIND:
-        self.planned_rate = unwind_planned_rate
-        self.actual_rate = unwind_actual_rate
-        self.position_error = unwind_position_error
-        self.underperform = unwind_qualifies
-        self.target_scale = max(self.target_scale, unwind_authority)
-      else:
-        self.planned_rate = turn_planned_rate
-        self.actual_rate = turn_actual_rate
-        self.position_error = turn_underperform
-        self.underperform = turn_qualifies
-        self.target_scale = max(self.target_scale, turn_authority)
-
-      self.active_time += self.dt
-      recovered = self.planned_rate > CATCHUP_SURGE_RATE_MIN and (
-        self.actual_rate >= CATCHUP_SURGE_RATE_RECOVERY_FRACTION * self.planned_rate
-      )
-      self.recovery_time = self.recovery_time + self.dt if recovered else 0.0
-      progress = max((steering_angle_deg - self.start_angle) * self.direction, 0.0)
-      position_exit = max(CATCHUP_SURGE_POSITION_EXIT, 0.5 * self.trigger_position_error)
-      if self.recovery_time >= CATCHUP_SURGE_RECOVERY_TIME:
-        self._terminate(self.TERMINATION_RECOVERED)
-      elif self.position_error < position_exit:
-        self._terminate(self.TERMINATION_POSITION)
-      elif progress >= CATCHUP_SURGE_PROGRESS_DEG:
-        self._terminate(self.TERMINATION_PROGRESS)
-      elif self.active_time >= CATCHUP_SURGE_MAX_ACTIVE_TIME:
-        self._terminate(self.TERMINATION_TIMEOUT)
-
-    ramp_time = CATCHUP_SURGE_RAMP_IN_TIME if self.pulse_active else CATCHUP_SURGE_RAMP_OUT_TIME
-    scale_delta = clip_scalar(self.target_scale - self.scale, -self.dt / ramp_time, self.dt / ramp_time)
-    self.scale = clip_scalar(self.scale + scale_delta, 0.0, 1.0)
-    self.active = self.pulse_active or self.scale > 0.0
-    if not self.active:
-      self.mode = self.MODE_NONE
-      self.direction = 0.0
-
-    command_coordinate = (torque_command - neutral_torque) * self.direction
-    direction_agrees = command_coordinate > 0.0 or (self.mode == self.MODE_UNWIND and command_coordinate >= 0.0)
-    if self.scale > 0.0 and direction_agrees:
-      breakout_reserve = HIGH_ANGLE_BREAKOUT_TORQUE_MAX * high_angle_state.breakout_scale
-      correction_budget = max(CATCHUP_SURGE_TORQUE_MAX - breakout_reserve, 0.0)
-      corrected_command = clip_scalar(torque_command + self.direction * correction_budget * self.scale, -1.0, 1.0)
-      self.correction = corrected_command - torque_command
-      return corrected_command
-    return torque_command
 
 
 class UnwindPhaseTracker:
@@ -1090,7 +241,6 @@ class UnwindPhaseTracker:
     self.same_episode = False
     self.opposite_time = 0.0
     self.episode_armed = True
-    self.handoff_time = 0.0
 
   def reset(self) -> None:
     self.phase = 0.0
@@ -1100,7 +250,6 @@ class UnwindPhaseTracker:
     self.same_episode = False
     self.opposite_time = 0.0
     self.episode_armed = True
-    self.handoff_time = 0.0
 
   def update(
     self,
@@ -1166,10 +315,6 @@ class UnwindPhaseTracker:
         # delivery or overspeed holds for the old turn while its phase fades.
         self.same_episode = False
         self.episode_armed = False
-    if not self.same_episode and self.opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME:
-      self.handoff_time += self.dt
-    else:
-      self.handoff_time = 0.0
 
     episode_geometry_scale = geometry_scale if self.same_episode and not opposite_maneuver else 0.0
     # Delivery is complete only when applied torque reaches the selected
@@ -1196,7 +341,6 @@ class UnwindPhaseTracker:
       self.overspeed = 0.0
       self.same_episode = False
       self.opposite_time = 0.0
-      self.handoff_time = 0.0
     return self._state()
 
   def _state(self) -> UnwindPhaseState:
@@ -1261,17 +405,13 @@ class LatControlTorque(LatControl):
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
     self.measurement_rate_filter = MeasurementRateFilter(self.dt)
     self.reference_rate_filter = MeasurementRateFilter(self.dt)
-    self.present_demand_rate_filter = MeasurementRateFilter(self.dt)
     self.reference_rate_innovation_filter = FirstOrderFilter(
       0.0,
       REFERENCE_RATE_INNOVATION_FILTER_TAU,
       self.dt,
       initialized=False,
     )
-    self.signed_steering_rate_filter = SignedSteeringRateFilter(self.dt)
     self.unwind_phase_tracker = UnwindPhaseTracker(self.dt)
-    self.high_angle_unwind_exit_state = HighAngleUnwindExitState(self.dt)
-    self.catchup_surge_state = CatchupSurgeState(self.dt)
     # Route-derived for the affected Hyundai EPS. Other torque platforms keep
     # their existing controller behavior until they are analyzed independently.
     self.reference_rate_tracking_enabled = CP.brand == "hyundai"
@@ -1284,10 +424,7 @@ class LatControlTorque(LatControl):
 
   def reset(self):
     super().reset()
-    self.signed_steering_rate_filter.reset()
     self.unwind_phase_tracker.reset()
-    self.high_angle_unwind_exit_state.reset()
-    self.catchup_surge_state.reset()
     self.reference_rate_innovation_filter.initialized = False
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
@@ -1311,7 +448,6 @@ class LatControlTorque(LatControl):
     lat_delay,
     applied_torque=0.0,
     reference_unwind_scale=0.0,
-    reference_sustained_unwind_scale=0.0,
     reference_target_torque=0.0,
     reference_geometric_target_torque: float | None = None,
     reference_episode_target_torque: float | None = None,
@@ -1321,15 +457,7 @@ class LatControlTorque(LatControl):
   ):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
-    steering_angle_deg = CS.steeringAngleDeg - params.angleOffsetDeg
-    signed_steering_rate = self.signed_steering_rate_filter.update(
-      steering_angle_deg,
-      self.reference_rate_tracking_enabled
-      and active
-      and not CS.steeringPressed
-      and abs(CS.steeringTorque) < CATCHUP_SURGE_DRIVER_TORQUE_MAX,
-    )
-    measured_curvature = -VM.calc_curvature(math.radians(steering_angle_deg), CS.vEgo, params.roll)
+    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     measurement = measured_curvature * CS.vEgo**2
     measurement_rate = self.measurement_rate_filter.update(measured_curvature, CS.vEgo, active)
     self.reference_rate_filter.update(desired_curvature, CS.vEgo, active)
@@ -1376,7 +504,6 @@ class LatControlTorque(LatControl):
     setpoint = expected_lateral_accel
     error = setpoint - measurement
     tracking_position_error = (delayed_desired_curvature - measured_curvature) * rate_reference_speed**2
-    present_demand_rate = self.present_demand_rate_filter.update(delayed_desired_curvature, rate_reference_speed, active)
     applied_lateral_accel = -applied_torque * self.torque_params.latAccelFactor
     neutral_torque = calculate_neutral_torque(
       params.roll,
@@ -1404,42 +531,11 @@ class LatControlTorque(LatControl):
     unwind_same_episode = phase_state.same_episode
     unwind_opposite_time = phase_state.opposite_time
     unwind_episode_armed = phase_state.episode_armed
-    handoff_time = self.unwind_phase_tracker.handoff_time
-    handoff_committed = (
-      self.reference_rate_tracking_enabled
-      and not unwind_same_episode
-      and unwind_opposite_time >= UNWIND_EPISODE_OPPOSITE_TIME
-      and unwind_phase_direction != 0.0
-    )
-    high_angle_unwind_scale = self.high_angle_unwind_exit_state.update(
-      self.reference_rate_tracking_enabled and active and not CS.steeringPressed,
-      steering_angle_deg,
-      CS.vEgo,
-      reference_sustained_unwind_scale,
-      effective_unwind_scale,
-      unwind_same_episode,
-      unwind_phase_direction,
+    damping_turn_in_blocked = self.reference_rate_tracking_enabled and should_block_undertracked_turn_in_damping(
+      delayed_desired_curvature,
+      tracking_position_error,
       reference_rate,
-      present_demand_rate=present_demand_rate,
-      tracking_position_error=tracking_position_error,
-      delayed_lateral_accel=expected_lateral_accel,
-      current_lateral_accel=current_speed_desired_lateral_accel,
-      geometric_lateral_accel=reference_geometric_lateral_accel,
-      tracking_measurement_rate=tracking_measurement_rate,
-      signed_steering_rate_deg=signed_steering_rate,
-      applied_torque=applied_torque,
-      neutral_torque=neutral_torque,
-    )
-    high_angle_unwind_breakout_scale = self.high_angle_unwind_exit_state.breakout_scale
-    high_angle_unwind_turn_in_guard = self.high_angle_unwind_exit_state.turn_in_guard
-    damping_turn_in_blocked = self.reference_rate_tracking_enabled and (
-      should_block_undertracked_turn_in_damping(
-        delayed_desired_curvature,
-        tracking_position_error,
-        reference_rate,
-        effective_unwind_scale,
-      )
-      or high_angle_unwind_turn_in_guard > 0.0
+      effective_unwind_scale,
     )
 
     lookahead_idx = int(clip_scalar(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len + 1, -2))
@@ -1453,26 +549,6 @@ class LatControlTorque(LatControl):
 
     if not active:
       torque_command = 0.0
-      self.catchup_surge_state.update(
-        False,
-        CS.steeringPressed,
-        CS.steeringTorque,
-        steering_angle_deg,
-        signed_steering_rate,
-        CS.vEgo,
-        expected_lateral_accel,
-        current_speed_desired_lateral_accel,
-        measurement,
-        tracking_position_error,
-        reference_rate,
-        tracking_measurement_rate,
-        torque_command,
-        neutral_torque,
-        handoff_committed,
-        unwind_same_episode,
-        unwind_phase_direction,
-        self.high_angle_unwind_exit_state,
-      )
       pid_log.active = False
       rate_tracking_correction = 0.0
       actuator_state_correction = 0.0
@@ -1488,27 +564,11 @@ class LatControlTorque(LatControl):
       cascade_rate_error = 0.0
       base_direct_p_scale = cascade_p_scale(CS.vEgo) if self.reference_rate_tracking_enabled else 1.0
       direct_p_scale = base_direct_p_scale
-      torque_command_before_handoff_cap = torque_command
-      torque_command_before_high_angle_exit = torque_command
-      high_angle_unwind_old_torque_correction = 0.0
-      high_angle_unwind_old_direction_torque = 0.0
-      high_angle_unwind_breakout_correction = 0.0
-      handoff_torque_correction = 0.0
-      handoff_old_direction_limit = 0.0
-      handoff_torque_cap_scale = 0.0
     else:
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
 
-      freeze_integrator = (
-        steer_limited_by_safety
-        or CS.steeringPressed
-        or CS.vEgo < 5
-        or high_angle_unwind_scale > 0.0
-        or high_angle_unwind_breakout_scale > 0.0
-        or self.high_angle_unwind_exit_state.old_direction_limit is not None
-        or self.catchup_surge_state.active
-      )
+      freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
       rate_tracking_correction = 0.0
       actuator_state_correction = 0.0
       unwind_torque_blend = 0.0
@@ -1549,43 +609,6 @@ class LatControlTorque(LatControl):
       if unwind_torque_blend > 0.0:
         unwind_torque_correction = unwind_torque_blend * (reference_target_torque - torque_command)
         torque_command += unwind_torque_correction
-      torque_command = self.catchup_surge_state.update(
-        self.reference_rate_tracking_enabled and active,
-        CS.steeringPressed,
-        CS.steeringTorque,
-        steering_angle_deg,
-        signed_steering_rate,
-        CS.vEgo,
-        expected_lateral_accel,
-        current_speed_desired_lateral_accel,
-        measurement,
-        tracking_position_error,
-        reference_rate,
-        tracking_measurement_rate,
-        torque_command,
-        neutral_torque,
-        handoff_committed,
-        unwind_same_episode,
-        unwind_phase_direction,
-        self.high_angle_unwind_exit_state,
-      )
-      damping_turn_in_blocked = damping_turn_in_blocked or self.catchup_surge_state.active
-      torque_command_before_high_angle_exit = torque_command
-      torque_command, high_angle_unwind_old_torque_correction, high_angle_unwind_old_direction_torque, high_angle_unwind_breakout_correction = (
-        self.high_angle_unwind_exit_state.apply(
-          torque_command,
-          neutral_torque,
-        )
-      )
-      torque_command_before_handoff_cap = torque_command
-      torque_command, handoff_torque_correction, handoff_old_direction_limit, handoff_torque_cap_scale = get_committed_handoff_torque_cap(
-        torque_command,
-        reference_target_torque,
-        neutral_torque,
-        unwind_phase_direction,
-        handoff_committed and not CS.steeringPressed,
-        handoff_time,
-      )
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
@@ -1645,60 +668,6 @@ class LatControlTorque(LatControl):
     pid_log.unwindSameEpisode = bool(unwind_same_episode)
     pid_log.unwindOppositeTime = float(unwind_opposite_time)
     pid_log.unwindEpisodeArmed = bool(unwind_episode_armed)
-    pid_log.handoffCommitted = bool(handoff_committed)
-    pid_log.handoffTime = float(handoff_time)
-    pid_log.torqueCommandBeforeHandoffCap = float(torque_command_before_handoff_cap)
-    pid_log.handoffOldDirectionLimit = float(handoff_old_direction_limit)
-    pid_log.handoffTorqueCapScale = float(handoff_torque_cap_scale)
-    pid_log.handoffTorqueCorrection = float(handoff_torque_correction)
-    pid_log.highAngleUnwindScale = float(high_angle_unwind_scale)
-    pid_log.torqueCommandBeforeHighAngleExit = float(torque_command_before_high_angle_exit)
-    pid_log.highAngleUnwindOldTorqueCorrection = float(high_angle_unwind_old_torque_correction)
-    pid_log.highAngleUnwindOldDirectionTorque = float(high_angle_unwind_old_direction_torque)
-    pid_log.highAngleUnwindLatchedScale = float(self.high_angle_unwind_exit_state.latched_scale)
-    pid_log.highAngleUnwindOldDirectionLimit = float(self.high_angle_unwind_exit_state.old_direction_limit or 0.0)
-    pid_log.highAngleUnwindTurnInGuard = float(high_angle_unwind_turn_in_guard)
-    pid_log.highAngleUnwindEvidenceHeld = bool(self.high_angle_unwind_exit_state.evidence_held)
-    pid_log.highAngleUnwindEvidenceDropoutTime = float(self.high_angle_unwind_exit_state.ineligible_time)
-    pid_log.highAngleUnwindAppliedOldDirectionTorque = float(self.high_angle_unwind_exit_state.applied_old_direction_torque)
-    pid_log.highAngleUnwindAppliedNeutral = bool(self.high_angle_unwind_exit_state.applied_neutral)
-    pid_log.highAngleUnwindNeutralDwell = float(self.high_angle_unwind_exit_state.neutral_dwell_time)
-    pid_log.highAngleUnwindProgressDeg = float(self.high_angle_unwind_exit_state.progress_deg)
-    pid_log.highAngleUnwindBreakoutScale = float(high_angle_unwind_breakout_scale)
-    pid_log.highAngleUnwindBreakoutCorrection = float(high_angle_unwind_breakout_correction)
-    pid_log.highAngleUnwindPresentDemandRate = float(present_demand_rate)
-    pid_log.highAngleUnwindReleaseCommitted = bool(self.high_angle_unwind_exit_state.release_committed)
-    pid_log.highAngleUnwindReleaseCandidateTime = float(self.high_angle_unwind_exit_state.release_candidate_time)
-    pid_log.highAngleUnwindPresentOldDemand = float(self.high_angle_unwind_exit_state.present_old_demand)
-    pid_log.highAngleUnwindPresentPeakDemand = float(self.high_angle_unwind_exit_state.present_peak_demand)
-    pid_log.highAngleUnwindPresentReleaseAmount = float(self.high_angle_unwind_exit_state.present_release_amount)
-    pid_log.highAngleUnwindPresentTotalDemandRate = float(self.high_angle_unwind_exit_state.present_total_demand_rate)
-    pid_log.highAngleUnwindBreakoutEarned = bool(self.high_angle_unwind_exit_state.breakout_earned)
-    pid_log.highAngleUnwindBreakoutCompleted = bool(self.high_angle_unwind_exit_state.breakout_completed)
-    pid_log.highAngleUnwindBreakoutCatchTime = float(self.high_angle_unwind_exit_state.breakout_catch_time)
-    pid_log.highAngleUnwindBreakoutPlannedRate = float(self.high_angle_unwind_exit_state.breakout_planned_rate)
-    pid_log.highAngleUnwindBreakoutActualRate = float(self.high_angle_unwind_exit_state.breakout_actual_rate)
-    pid_log.highAngleUnwindBreakoutSteeringRate = float(self.high_angle_unwind_exit_state.breakout_steering_rate)
-    pid_log.highAngleUnwindFutureConfirmed = bool(self.high_angle_unwind_exit_state.future_confirmed)
-    pid_log.highAngleUnwindWaitingForPresent = bool(
-      self.high_angle_unwind_exit_state.future_confirmed and not self.high_angle_unwind_exit_state.release_committed
-    )
-    pid_log.highAngleUnwindBreakoutProgressEvaluated = bool(self.high_angle_unwind_exit_state.breakout_progress_evaluated)
-    pid_log.highAngleUnwindBreakoutTargetScale = float(self.high_angle_unwind_exit_state.breakout_target_scale)
-    pid_log.highAngleUnwindNeutralDelivered = bool(self.high_angle_unwind_exit_state.neutral_delivered)
-    pid_log.highAngleUnwindFutureWaitAge = float(self.high_angle_unwind_exit_state.future_wait_age)
-    pid_log.catchupMode = int(self.catchup_surge_state.mode)
-    pid_log.catchupCandidateTime = float(self.catchup_surge_state.candidate_time)
-    pid_log.catchupActive = bool(self.catchup_surge_state.active)
-    pid_log.catchupScale = float(self.catchup_surge_state.scale)
-    pid_log.catchupCorrection = float(self.catchup_surge_state.correction)
-    pid_log.catchupPlannedRate = float(self.catchup_surge_state.planned_rate)
-    pid_log.catchupActualRate = float(self.catchup_surge_state.actual_rate)
-    pid_log.catchupPositionError = float(self.catchup_surge_state.position_error)
-    pid_log.catchupTerminationReason = int(self.catchup_surge_state.termination_reason)
-    pid_log.catchupCooldown = float(self.catchup_surge_state.cooldown)
-    pid_log.catchupSignedSteeringRate = float(self.catchup_surge_state.signed_steering_rate)
-    pid_log.catchupUnderperform = bool(self.catchup_surge_state.underperform)
 
     # TODO left is positive in this convention
     return torque_command, 0.0, pid_log
