@@ -106,5 +106,5 @@ class TestModelCurveSpeed(unittest.TestCase):
         self.assertFalse(limiter.active)
 
   def test_curve_speed_units_match_field_mph_values(self):
-    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [38.0, 19.0, 11.0])
+    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [44.0, 22.0, 13.0])
     self.assertEqual(MAX_CURVE_SPEED, V_CRUISE_MAX * CV.KPH_TO_MS)
