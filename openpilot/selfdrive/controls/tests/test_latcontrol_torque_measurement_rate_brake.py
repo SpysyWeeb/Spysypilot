@@ -18,7 +18,6 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   CASCADE_P_SCALES,
   CASCADE_P_SCALE_SPEEDS,
   CASCADE_RATE_CORRECTION_MAX,
-  REFERENCE_RATE_INNOVATION_FILTER_TAU,
   REFERENCE_RATE_MIN_SPEED,
   REFERENCE_RATE_TRACKING_SCALES,
   REFERENCE_RATE_TRACKING_SPEEDS,
@@ -39,7 +38,6 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   should_block_undertracked_turn_in_damping,
   torque_transition_time,
 )
-from openpilot.selfdrive.controls.lib.lateral_reference_planner import LOW_SPEED_REFERENCE_SPEED
 
 
 def get_controller(car_name):
@@ -666,104 +664,6 @@ class TestReferenceRateTrackingIntegration:
     assert torque_log.referenceRate == pytest.approx(
       torque_log.referenceCurvatureRate * REFERENCE_RATE_MIN_SPEED**2,
     )
-
-  def test_anchored_reference_filters_full_finite_difference_rate(self):
-    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    car_state = car.CarState.new_message()
-    car_state.vEgo = LOW_SPEED_REFERENCE_SPEED + DT_CTRL
-    params = log.LiveParametersData.new_message()
-
-    controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2, scalar_anchor_active=True)
-    _, _, first = controller.update(
-      True, car_state, vehicle_model, params, False, DT_CTRL, False, 0.2, scalar_anchor_active=True
-    )
-    _, _, second = controller.update(
-      True, car_state, vehicle_model, params, False, 2.0 * DT_CTRL, False, 0.2, scalar_anchor_active=True
-    )
-
-    alpha = DT_CTRL / (REFERENCE_RATE_INNOVATION_FILTER_TAU + DT_CTRL)
-    expected_second = (1.0 - alpha) * first.referenceCurvatureRate + alpha * second.finiteDifferenceReferenceCurvatureRate
-    assert not first.trajectoryReferenceRateValid
-    assert first.trajectoryReferenceInnovation == pytest.approx(first.finiteDifferenceReferenceCurvatureRate)
-    assert first.filteredTrajectoryReferenceInnovation == pytest.approx(first.referenceCurvatureRate)
-    assert 0.0 < first.referenceCurvatureRate < first.finiteDifferenceReferenceCurvatureRate
-    assert second.referenceCurvatureRate == pytest.approx(expected_second)
-
-  def test_anchor_rate_filter_resets_on_engagement_and_planner_validity(self):
-    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    car_state = car.CarState.new_message()
-    car_state.vEgo = LOW_SPEED_REFERENCE_SPEED + DT_CTRL
-    params = log.LiveParametersData.new_message()
-
-    controller.update(True, car_state, vehicle_model, params, False, 0.0, False, 0.2, scalar_anchor_active=True)
-    controller.update(True, car_state, vehicle_model, params, False, DT_CTRL, False, 0.2, scalar_anchor_active=True)
-    controller.update(False, car_state, vehicle_model, params, False, 2.0 * DT_CTRL, False, 0.2, scalar_anchor_active=True)
-    _, _, engaged = controller.update(
-      True, car_state, vehicle_model, params, False, 3.0 * DT_CTRL, False, 0.2, scalar_anchor_active=True
-    )
-    assert engaged.referenceCurvatureRate == pytest.approx(engaged.finiteDifferenceReferenceCurvatureRate)
-
-    controller.update(
-      True, car_state, vehicle_model, params, False, 4.0 * DT_CTRL, False, 0.2, scalar_anchor_active=False
-    )
-    _, _, valid_again = controller.update(
-      True, car_state, vehicle_model, params, False, 5.0 * DT_CTRL, False, 0.2, scalar_anchor_active=True
-    )
-    assert valid_again.referenceCurvatureRate == pytest.approx(valid_again.finiteDifferenceReferenceCurvatureRate)
-
-    controller.update(
-      True, car_state, vehicle_model, params, False, 6.0 * DT_CTRL, False, 0.2, scalar_anchor_active=True
-    )
-    controller.reset()
-    _, _, reset_entry = controller.update(
-      True, car_state, vehicle_model, params, False, 7.0 * DT_CTRL, False, 0.2, scalar_anchor_active=True
-    )
-    assert reset_entry.referenceCurvatureRate == pytest.approx(reset_entry.finiteDifferenceReferenceCurvatureRate)
-
-  def test_anchor_rate_filter_resets_across_low_speed_boundary(self):
-    controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    car_state = car.CarState.new_message()
-    car_state.vEgo = LOW_SPEED_REFERENCE_SPEED
-    params = log.LiveParametersData.new_message()
-
-    controller.update(
-      True, car_state, vehicle_model, params, False, 0.0, False, 0.2, trajectory_reference_curvature_rate=0.0
-    )
-    _, _, low_speed = controller.update(
-      True,
-      car_state,
-      vehicle_model,
-      params,
-      False,
-      DT_CTRL,
-      False,
-      0.2,
-      trajectory_reference_curvature_rate=DT_CTRL,
-    )
-    assert low_speed.trajectoryReferenceRateValid
-    assert low_speed.referenceCurvatureRate != pytest.approx(low_speed.finiteDifferenceReferenceCurvatureRate)
-
-    car_state.vEgo = LOW_SPEED_REFERENCE_SPEED + DT_CTRL
-    _, _, upward = controller.update(
-      True, car_state, vehicle_model, params, False, 2.0 * DT_CTRL, False, 0.2, scalar_anchor_active=True
-    )
-    assert not upward.trajectoryReferenceRateValid
-    assert upward.referenceCurvatureRate == pytest.approx(upward.finiteDifferenceReferenceCurvatureRate)
-
-    car_state.vEgo = LOW_SPEED_REFERENCE_SPEED
-    _, _, downward = controller.update(
-      True,
-      car_state,
-      vehicle_model,
-      params,
-      False,
-      3.0 * DT_CTRL,
-      False,
-      0.2,
-      trajectory_reference_curvature_rate=0.0,
-    )
-    assert downward.trajectoryReferenceRateValid
-    assert downward.referenceCurvatureRate == pytest.approx(downward.finiteDifferenceReferenceCurvatureRate)
 
   def test_feedforward_projection_is_logged_separately(self):
     controller, vehicle_model = get_controller(HYUNDAI.HYUNDAI_PALISADE)

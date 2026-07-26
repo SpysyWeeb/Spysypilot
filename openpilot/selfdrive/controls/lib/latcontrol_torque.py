@@ -87,7 +87,7 @@ ACTUATION_SPEED_PROJECTION_MAX_DELTA = 0.75  # m/s
 ACTUATION_SPEED_PROJECTION_ACCEL_MIN = -4.0  # m/s^2
 ACTUATION_SPEED_PROJECTION_ACCEL_MAX = 3.0  # m/s^2
 ACTUATION_LATERAL_ACCEL_CORRECTION_MAX = 0.20  # m/s^2
-VERSION = 15
+VERSION = 14
 
 
 def smoothstep(value: float) -> float:
@@ -411,7 +411,6 @@ class LatControlTorque(LatControl):
       self.dt,
       initialized=False,
     )
-    self.scalar_anchor_rate_active = False
     self.unwind_phase_tracker = UnwindPhaseTracker(self.dt)
     # Route-derived for the affected Hyundai EPS. Other torque platforms keep
     # their existing controller behavior until they are analyzed independently.
@@ -427,7 +426,6 @@ class LatControlTorque(LatControl):
     super().reset()
     self.unwind_phase_tracker.reset()
     self.reference_rate_innovation_filter.initialized = False
-    self.scalar_anchor_rate_active = False
 
   def update_live_torque_params(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -456,7 +454,6 @@ class LatControlTorque(LatControl):
     reference_geometric_lateral_accel: float | None = None,
     reference_episode_lateral_accel: float | None = None,
     trajectory_reference_curvature_rate: float | None = None,
-    scalar_anchor_active: bool = False,
   ):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
@@ -468,10 +465,6 @@ class LatControlTorque(LatControl):
     tracking_measurement_rate = self.measurement_rate_filter.curvature_rate * rate_reference_speed**2
     finite_difference_reference_curvature_rate = self.reference_rate_filter.curvature_rate
     trajectory_reference_rate_valid = trajectory_reference_curvature_rate is not None and np.isfinite(trajectory_reference_curvature_rate)
-    scalar_anchor_rate_active = bool(active and scalar_anchor_active)
-    if scalar_anchor_rate_active != self.scalar_anchor_rate_active:
-      self.reference_rate_innovation_filter.initialized = False
-    self.scalar_anchor_rate_active = scalar_anchor_rate_active
     trajectory_reference_innovation = 0.0
     filtered_trajectory_reference_innovation = 0.0
     if trajectory_reference_rate_valid:
@@ -482,10 +475,6 @@ class LatControlTorque(LatControl):
       trajectory_reference_innovation = finite_difference_reference_curvature_rate - float(trajectory_reference_curvature_rate)
       filtered_trajectory_reference_innovation = float(self.reference_rate_innovation_filter.update(trajectory_reference_innovation))
       reference_curvature_rate = float(trajectory_reference_curvature_rate) + filtered_trajectory_reference_innovation
-    elif scalar_anchor_rate_active:
-      trajectory_reference_innovation = finite_difference_reference_curvature_rate
-      filtered_trajectory_reference_innovation = float(self.reference_rate_innovation_filter.update(trajectory_reference_innovation))
-      reference_curvature_rate = filtered_trajectory_reference_innovation
     else:
       self.reference_rate_innovation_filter.initialized = False
       reference_curvature_rate = finite_difference_reference_curvature_rate
