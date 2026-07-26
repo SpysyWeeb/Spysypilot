@@ -6,48 +6,12 @@ Companion longitudinal branch: [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/
 
 ## Status
 
-⚠️ **In progress.** Phase 1 controller v15 at `498d8d6d06` passed all four
-frozen-route replay gates in route-audit commit `4aca096`, but failed its field
-test. Routes 9d/9f attribute the failure to the planner persistence gate:
-ordinary replan noise repeatedly crosses the 0.02 m/s² quarantine threshold,
-creating chained holds and concentrated torque-rate bursts even though
-aggregate roughness remains acceptable.
-
-V15.1 measurement work is in progress before any controller change. The
-route-audit harness is appending 9d/9f with their exact recorded schemas,
-adding worst rolling one-second torque-rate RMS as a fifth gate, deriving a
-replacement innovation threshold from clean engaged-driving percentiles, and
-reconstructing why same-direction fast maneuvers can remain quarantined across
-multiple replans. Nothing will merge until the expanded v14/v15 table is
-committed. Later phases remain in progress under the same replay-and-field
-requirements.
-
-Replay rows are identified by both the Spysypilot commit and opendbc commit,
-not by the logged controller `VERSION` alone. Beginning with v15, every
-behavior-affecting controller change must bump `VERSION` in the same commit;
-two builds that steer differently must never report the same version.
-
-For v15 above 12 mph, the raw planner trajectory is washout input only; every
-surviving downstream reference consumer must follow the final scalar-anchored
-reference. Accordingly, `trajectoryReferenceRateValid = false` is nominal
-above 12 mph and selects the controller's finite-difference rate from the
-anchored command through the existing 0.18-second reference-rate innovation
-filter—it does not indicate planner failure. The v14 trajectory-rate path
-remains unchanged through 12 mph. The unanchored unwind and torque-target
-diagnostics are a documented temporary exception pending their Phase 2
-deletion.
-
-Phase 2 must derive the slew-feasible feedforward's rate content analytically
-from the plan through the scalar-anchor transform. Numerically differentiating
-a replan-discontinuous command is prohibited: v15 demonstrated that even a
-filtered finite difference can turn model-update boundaries into actuator-rate
-roughness. This requirement carries forward independently of the temporary
-v15 rate-cascade adapter, which Phase 3 deletes with the cascade itself.
-
-The cumulative Phase 1 controller-source diff is +276/-65 lines (net +211),
-within the approved Phase 1 whitelist. Phase 2's mandated mechanism deletions
-must make the cumulative Phase 1–2 controller-source total net-negative at its
-gate.
+⚠️ **In progress.** BLaT has returned to the field-tested controller v14 tree
+from rollback authority commit `5e533e3ec6`. The later v15 scalar-anchor and
+uncommitted v15.1 persistence-gate work have been removed after failing field
+feel and replay gates. The v14 baseline remains the active foundation and must
+still be explicitly signed off after another on-car check before this task can
+be considered done.
 
 Automated rollback validation currently covers 87 lateral-controller/reference
 tests, 16 Hyundai damping tests, and 1,367 Hyundai panda safety tests. These

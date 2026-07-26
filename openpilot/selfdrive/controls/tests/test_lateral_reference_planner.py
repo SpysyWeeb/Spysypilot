@@ -8,9 +8,6 @@ from openpilot.selfdrive.controls.lib.lateral_reference_planner import (
   EPISODE_COMMITMENT_LOOKAHEAD,
   LateralReferencePlanner,
   MAX_PREVIEW_LATERAL_ACCEL_DELTA,
-  LOW_SPEED_REFERENCE_SPEED,
-  SCALAR_ANCHOR_LATERAL_ACCEL_TOLERANCE,
-  SCALAR_ANCHOR_TAU,
   TRAJECTORY_DT,
   TRAJECTORY_T,
   UNWIND_RELEASE_PREVIEW_TIME,
@@ -96,13 +93,8 @@ class TestLateralReferencePlanner:
     speed = 30.0
     future_turn_yaw = np.where(MODEL_T < 0.5, 0.0, speed * 0.001 * (MODEL_T - 0.5))
     planner = LateralReferencePlanner()
-    assert planner.update(build_model(np.zeros_like(MODEL_T), speed), 0.0, speed)
-    assert planner.get_curvature(0.0, speed, LATERAL_DELAY) == 0.0
-    for _ in range(2):
-      assert planner.update(build_model(future_turn_yaw, speed), 0.0, speed)
-      output = planner.get_curvature(0.0, speed, LATERAL_DELAY)
-    assert output > 0.0
-    assert output * speed**2 <= SCALAR_ANCHOR_LATERAL_ACCEL_TOLERANCE
+    assert planner.update(build_model(future_turn_yaw, speed), 0.0, speed)
+    assert planner.get_curvature(0.0, speed, LATERAL_DELAY) > 0.0002
 
   def test_low_speed_sharp_turn_behavior_is_preserved(self):
     speed = 12.0 * 0.44704
@@ -217,8 +209,8 @@ class TestLateralReferencePlanner:
     assert planner.diagnostics.extra_time == 0.0
     assert planner.diagnostics.authority_restored > 0.0
 
-  def test_low_speed_boundary_preserves_trajectory_rate(self):
-    speed = LOW_SPEED_REFERENCE_SPEED
+  def test_trajectory_rate_preserves_quick_planned_motion(self):
+    speed = 10.0
     curvature_rate = 0.001
     # Integral of yaw_rate = speed * curvature_rate * time.
     yaws = 0.5 * speed * curvature_rate * MODEL_T**2
@@ -228,19 +220,6 @@ class TestLateralReferencePlanner:
     planner.get_curvature(0.0, speed, LATERAL_DELAY)
     assert planner.diagnostics.trajectory_rate_valid
     assert planner.diagnostics.trajectory_curvature_rate == pytest.approx(curvature_rate, rel=0.10)
-
-  def test_high_speed_anchor_uses_final_command_rate(self):
-    speed = 10.0
-    curvature_rate = 0.001
-    yaws = 0.5 * speed * curvature_rate * MODEL_T**2
-    planner = LateralReferencePlanner()
-    assert planner.update(build_model(yaws, speed), 0.0, speed)
-
-    raw_curvature = 0.0002
-    output = planner.get_curvature(raw_curvature, speed, LATERAL_DELAY)
-    assert not planner.diagnostics.trajectory_rate_valid
-    assert planner.diagnostics.output_curvature == output
-    assert planner.diagnostics.scalar_anchor_deviation == pytest.approx((output - raw_curvature) * speed**2)
 
   def test_trajectory_rate_rejects_constant_curve_replan_step(self):
     speed = 10.0
@@ -256,7 +235,7 @@ class TestLateralReferencePlanner:
     assert planner.update(constant_curvature_model(0.0035, speed), 0.003, speed)
     output = planner.get_curvature(0.0035, speed, LATERAL_DELAY)
     finite_difference_rate = (output - previous_output) / planner.dt
-    assert abs(finite_difference_rate) > 0.001
+    assert abs(finite_difference_rate) > 0.01
     assert abs(planner.diagnostics.trajectory_curvature_rate) < 0.001
 
   def test_actuator_transition_accounts_for_slow_sign_reversal(self):
@@ -393,7 +372,7 @@ class TestLateralReferencePlanner:
     assert planner.diagnostics.unwind_scale == pytest.approx(0.0, abs=1e-6)
     assert planner.diagnostics.extra_time == pytest.approx(0.0, abs=1e-6)
 
-  def test_anchor_initializes_at_scalar_above_low_speed_boundary(self):
+  def test_reference_becomes_fully_active_by_15_mph(self):
     outputs = []
     for speed_mph in (12.0, 13.5, 15.0):
       speed = speed_mph * 0.44704
@@ -402,8 +381,8 @@ class TestLateralReferencePlanner:
       outputs.append(planner.get_curvature(0.04, speed, LATERAL_DELAY))
 
     assert outputs[0] == pytest.approx(0.04)
-    assert outputs[1] == pytest.approx(0.04)
-    assert outputs[2] == pytest.approx(0.04)
+    assert outputs[0] > outputs[1] > outputs[2]
+    assert outputs[2] == pytest.approx(0.01, rel=0.05)
 
   def test_speed_scaled_replan_responds_immediately(self):
     lateral_accel = 0.6
@@ -455,178 +434,3 @@ class TestLateralReferencePlanner:
     planner.reset()
     assert planner.get_curvature(-0.004, V_EGO, LATERAL_DELAY) == -0.004
     assert not planner.diagnostics.trajectory_rate_valid
-
-  def test_low_speed_boundary_resets_anchor_and_matches_fresh_planner(self):
-    low_speed_model = constant_curvature_model(0.02, LOW_SPEED_REFERENCE_SPEED)
-    crossed = LateralReferencePlanner()
-    crossed.configure_actuator(HYUNDAI_ACTUATOR)
-    crossed.update(constant_curvature_model(0.003, 10.0), 0.0, 10.0)
-    crossed.get_curvature(0.002, 10.0, LATERAL_DELAY)
-    crossed.update(low_speed_model, 0.02, LOW_SPEED_REFERENCE_SPEED)
-
-    crossed_output = crossed.get_curvature(0.02, LOW_SPEED_REFERENCE_SPEED, LATERAL_DELAY, lat_accel_factor=2.5, friction=0.115)
-
-    assert crossed_output == pytest.approx(0.02)
-    assert crossed.solution_age == pytest.approx(crossed.dt)
-    assert crossed.anchor_input is None
-    assert crossed.pending_solution is None
-    assert not crossed.high_speed_active
-
-    crossed.update(constant_curvature_model(0.003, 10.0), 0.02, 10.0)
-    assert crossed.get_curvature(0.002, 10.0, LATERAL_DELAY) == 0.002
-    assert crossed.diagnostics.scalar_anchor_deviation == 0.0
-
-  def test_anchor_entry_is_zero_then_impulse_decays_at_control_rate(self):
-    speed = 10.0
-    planner = LateralReferencePlanner()
-    scalar = 0.001
-    planner.scalar_trend = 1
-    planner.scalar_quasi_steady = False
-    assert planner._anchor_curvature(scalar, scalar + 0.001, speed) == scalar
-
-    planner.anchor_input = 0.0
-    first = planner._anchor_curvature(scalar, scalar + 0.001, speed) - scalar
-    second = planner._anchor_curvature(scalar, scalar + 0.001, speed) - scalar
-    assert first > 0.0
-    assert second == pytest.approx(first * SCALAR_ANCHOR_TAU / (SCALAR_ANCHOR_TAU + planner.dt), rel=1e-3)
-
-  @pytest.mark.parametrize("sign", (-1.0, 1.0))
-  def test_anchor_directional_and_quasi_steady_clamps(self, sign):
-    speed = 10.0
-    scalar = sign * 0.002
-    planner = LateralReferencePlanner()
-    planner.anchor_input = 0.0
-    planner.scalar_trend = 1
-    planner.scalar_quasi_steady = False
-    assert abs(planner._anchor_curvature(scalar, scalar + sign * 0.001, speed)) > abs(scalar)
-
-    planner.anchor_input = 0.0
-    planner.anchor_correction = 0.0
-    planner.scalar_trend = -1
-    planner.scalar_quasi_steady = False
-    assert planner._anchor_curvature(scalar, scalar + sign * 0.001, speed) == scalar
-    reduced = planner._anchor_curvature(scalar, scalar - sign * 0.001, speed)
-    assert 0.0 <= sign * reduced < abs(scalar)
-
-    planner.anchor_input = 0.0
-    planner.anchor_correction = 0.0
-    planner.scalar_trend = 0
-    planner.scalar_quasi_steady = True
-    steady = planner._anchor_curvature(scalar, scalar - sign * 0.001, speed)
-    assert abs((steady - scalar) * speed**2) <= SCALAR_ANCHOR_LATERAL_ACCEL_TOLERANCE + 1e-12
-
-  def test_small_replan_innovation_is_accepted_immediately(self):
-    speed = 10.0
-    planner = LateralReferencePlanner()
-    planner.update(constant_curvature_model(0.001, speed), 0.0, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    old_solution = planner.solution
-
-    planner.update(constant_curvature_model(0.0011, speed), 0.001, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    assert planner.solution is not old_solution
-    assert not planner.diagnostics.persistence_gate_hold
-
-  def test_large_one_plan_spike_matches_dropped_plan(self):
-    speed = 10.0
-    spike = LateralReferencePlanner()
-    dropped = LateralReferencePlanner()
-    for planner in (spike, dropped):
-      planner.update(constant_curvature_model(0.001, speed), 0.0, speed)
-      planner.get_curvature(0.001, speed, LATERAL_DELAY)
-
-    accepted = spike.solution
-    spike.update(constant_curvature_model(0.01, speed), 0.001, speed)
-    spike_output = spike.get_curvature(0.001, speed, LATERAL_DELAY)
-    dropped_output = dropped.get_curvature(0.001, speed, LATERAL_DELAY)
-    assert spike.solution is accepted
-    assert spike_output == dropped_output
-    assert spike.diagnostics.persistence_gate_hold
-
-    spike.update(constant_curvature_model(0.001, speed), 0.001, speed)
-    dropped.update(constant_curvature_model(0.001, speed), 0.001, speed)
-    assert spike.get_curvature(0.001, speed, LATERAL_DELAY) == pytest.approx(dropped.get_curvature(0.001, speed, LATERAL_DELAY), abs=1e-12)
-    assert not spike.diagnostics.persistence_gate_hold
-
-  def test_preview_only_large_innovation_is_quarantined(self):
-    speed = 6.0
-    lateral_delay = 0.2
-    accepted = np.where(TRAJECTORY_T < 0.35, 0.04, 0.0)
-    candidate = np.where(TRAJECTORY_T < 0.35, 0.04, -0.04)
-    speeds = np.full_like(TRAJECTORY_T, speed)
-    base_time = lateral_delay + 1.5 * TRAJECTORY_DT
-
-    planner = LateralReferencePlanner()
-    planner.configure_actuator(HYUNDAI_ACTUATOR)
-    planner.solution = accepted
-    planner.predicted_speeds = speeds
-    planner.high_speed_active = True
-    planner.candidate_solution = candidate
-    planner.candidate_speeds = speeds
-
-    assert np.interp(base_time, TRAJECTORY_T, candidate) == np.interp(base_time, TRAJECTORY_T, accepted)
-    accepted_command = planner._select_curvature(accepted, speeds, 0.0, speed, lateral_delay, -0.8, 2.7, 0.13, 0.0, 0.0)[2]
-    candidate_command = planner._select_curvature(candidate, speeds, 0.0, speed, lateral_delay, -0.8, 2.7, 0.13, 0.0, 0.0)[2]
-    assert (candidate_command - accepted_command) * speed**2 == pytest.approx(1.44)
-
-    planner.get_curvature(0.04, speed, lateral_delay, applied_torque=-0.8, lat_accel_factor=2.7, friction=0.13)
-    assert planner.solution is accepted
-    assert planner.pending_solution is candidate
-    assert planner.diagnostics.persistence_gate_hold
-
-  def test_second_same_direction_plan_confirms_newest(self):
-    speed = 10.0
-    planner = LateralReferencePlanner()
-    planner.update(constant_curvature_model(0.001, speed), 0.0, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    accepted = planner.solution
-
-    planner.update(constant_curvature_model(0.005, speed), 0.001, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    assert planner.solution is accepted
-    planner.update(constant_curvature_model(0.006, speed), 0.001, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    assert planner.solution is not accepted
-    assert np.interp(LATERAL_DELAY, TRAJECTORY_T, planner.solution) > 0.005
-    assert not planner.diagnostics.persistence_gate_hold
-
-  def test_failed_confirmation_does_not_contaminate_accepted_plan(self):
-    speed = 10.0
-    planner = LateralReferencePlanner()
-    planner.update(constant_curvature_model(0.001, speed), 0.0, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    accepted = planner.solution
-
-    planner.update(constant_curvature_model(0.005, speed), 0.001, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    planner.update(constant_curvature_model(-0.005, speed), 0.001, speed)
-    planner.get_curvature(0.001, speed, LATERAL_DELAY)
-    assert planner.solution is accepted
-    assert planner.pending_solution is not None
-    assert planner.diagnostics.persistence_gate_hold
-
-  def test_stale_accepted_plan_falls_back_to_scalar(self):
-    speed = 10.0
-    scalar = 0.001
-    planner = LateralReferencePlanner()
-    planner.update(constant_curvature_model(scalar, speed), 0.0, speed)
-    planner.get_curvature(scalar, speed, LATERAL_DELAY)
-    for _ in range(int(SCALAR_ANCHOR_TAU / planner.dt) + 2):
-      output = planner.get_curvature(scalar, speed, LATERAL_DELAY)
-
-    assert output == scalar
-    assert planner.solution is None
-    assert planner.diagnostics.persistence_gate_hold
-    assert planner.diagnostics.scalar_anchor_deviation == 0.0
-
-  def test_anchor_diagnostics_match_output(self):
-    speed = 10.0
-    scalar = 0.001
-    planner = LateralReferencePlanner()
-    planner.update(constant_curvature_model(scalar, speed), 0.0, speed)
-    output = planner.get_curvature(scalar, speed, LATERAL_DELAY)
-
-    assert planner.diagnostics.version == 6
-    assert planner.diagnostics.scalar_anchor_deviation == pytest.approx((output - scalar) * speed**2)
-    assert not planner.diagnostics.persistence_gate_hold
-    assert planner.diagnostics.scalar_anchor_active
