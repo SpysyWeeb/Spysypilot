@@ -168,8 +168,46 @@ class LongitudinalPlanner:
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
-    # Force Stops: hold the model to a stop it planned (red-light indecision / e2e crawl)
-    v_cruise = min(v_cruise, self.force_stops.update(sm))
+    # Green-light anticipation: at a hold, the model's path length explodes (2-5m stub ->
+    # 30-60m) about 1.5-2s BEFORE its shouldStop bit releases (field data, routes 37/38).
+    # Read the path instead of the laggy bit -- the same trick Force Stops uses for stop
+    # intent, mirrored for launch intent. Clearing shouldStop releases the hold; the car
+    # creeps off, the model sees motion and commits its plan, and the launch assist below
+    # takes it from there. If the path re-collapses, the hold re-engages at creep speed.
+    xs = sm['modelV2'].position.x
+    model_length = float(xs[-1]) if len(xs) else 0.0
+    self.launch_open.update(1.0 if model_length > LAUNCH_OPEN_LENGTH else 0.0)
+    if (sm['carState'].standstill and output_should_stop_e2e and
+        sm['selfdriveState'].experimentalMode and self.launch_open.x > LAUNCH_OPEN_CONFIRM):
+      self.anticipating = True
+    if self.anticipating:
+      if model_length < LAUNCH_CLOSE_LENGTH or v_ego > LAUNCH_DISARM_SPEED or not sm['selfdriveState'].experimentalMode:
+        self.anticipating = False
+      else:
+        output_should_stop_e2e = False
+
+    if sm['carState'].standstill:
+      self.launch_armed = True
+    elif v_ego > LAUNCH_DISARM_SPEED:
+      self.launch_armed = False
+    model_vel = sm['modelV2'].velocity.x
+    model_acc = sm['modelV2'].acceleration.x
+    if len(model_vel) == len(ModelConstants.T_IDXS) and len(model_acc) == len(ModelConstants.T_IDXS):
+      model_v = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_vel)
+      model_a = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_acc)
+    else:
+      model_v = np.zeros(len(T_IDXS_MPC))
+      model_a = np.zeros(len(T_IDXS_MPC))
+    if (self.launch_armed and sm['selfdriveState'].experimentalMode and not output_should_stop_e2e and
+        np.interp(LAUNCH_COMMIT_T, T_IDXS_MPC, model_v) > LAUNCH_DISARM_SPEED):
+      t_cut = min(float(T_IDXS_MPC[np.argmax(model_v > LAUNCH_MOVING_SPEED)]), LAUNCH_COMMIT_T)
+      t_shifted = T_IDXS_MPC + t_cut
+      v_shifted = np.interp(t_shifted, T_IDXS_MPC, model_v)
+      a_shifted = np.interp(t_shifted, T_IDXS_MPC, model_a)
+      a_launch = get_accel_from_plan(v_shifted, a_shifted, T_IDXS_MPC, action_t=action_t)
+      a_launch_max = np.interp(v_ego, [LAUNCH_MOVING_SPEED, LAUNCH_DISARM_SPEED], [LAUNCH_MAX_ACCEL, 0.])
+      output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
+
     self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle)
