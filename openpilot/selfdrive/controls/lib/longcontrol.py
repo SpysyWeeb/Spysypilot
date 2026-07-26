@@ -54,7 +54,6 @@ class LongControl:
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
-<<<<<<< HEAD
     # Smooth Stops owns the final approach: while the plan wants to stop but the car is
     # still rolling, defer the hold clamp and settle in the pid branch below. The clamp
     # (stopping state) only arms once we're actually stopped, so it never headbangs.
