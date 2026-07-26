@@ -118,6 +118,7 @@ procs = [
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
   PythonProcess("driving_event_indexer", "openpilot.selfdrive.spysypilot.driving_event_indexer", only_offroad),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", always_run),
+  PythonProcess("drive_statsd", "openpilot.selfdrive.spysypilot.drive_statsd", only_offroad),
 
   # debug procs
   NativeProcess("bridge", "openpilot/cereal/messaging", ["./bridge"], notcar),
