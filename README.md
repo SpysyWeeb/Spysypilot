@@ -1,53 +1,26 @@
-# Spysypilot
+# force-stops
 
-This fork is **entirely vibe-coded using [Claude Code](https://claude.com/claude-code)** — including this README.
+Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded with [Claude Code](https://claude.com/claude-code), is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-It's a personal side project for SpysyWeeb. It is **not meant for others to use**, but it's available for anyone who wants to try it **at their own risk**.
+## What it does
 
-Any and all code and features generated in this project are free for others to use. SpysyWeeb can't take credit for the code itself, but if you build on an idea from here, a little credit for the idea would be appreciated. 🙏
+Makes the car **actually stop at red lights and stop signs in experimental mode** instead of the model's indecisive crawl. The stock end-to-end model often plans a stop but never commits — its `shouldStop` bit dithers and the car creeps toward the line indefinitely. Force Stops reads the model's stop *intent* and holds it to it.
 
-## Branches
+*(original concept from IQPilot's IQForceStops, reimplemented from scratch)*
 
-- **`stock`** — clean commaai/openpilot base, no changes
-- **`combo`** — all features merged together for testing
-- Feature branches are cut from `stock` and merged into `combo` when ready; each feature branch's own README explains that feature in depth
+## How it works
 
-### Combo variants
+The tell is the model's planned **path length**: when it intends to stop, the path endpoint closes in to a few meters even while the stop bit flickers. A filtered detector watches for `path end < v_ego × 3s` with no lead being tracked (a wider 4.5 s window applies while the model is actively braking, to catch back-loaded lead-less red lights). When the detector latches, the model's stop point is frozen and the cruise speed is capped at what reaches zero at that point — the real ACC MPC then shapes the deceleration, and its own `shouldStop` asserts naturally as the plan speed falls. Force Stops decides *that/where*, the MPC *shapes*, and (on combo) Smooth Stops *lands* the last meter.
 
-Copies of `combo` that differ only in the driving model they run:
+Safety/comfort properties baked in:
 
-| branch | driving model |
-|---|---|
-| [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) | stock comma release model |
-| [`deep-rl3-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/deep-rl3-combo) | comma's [`deep_rl3`](https://github.com/commaai/openpilot/tree/deep_rl3) experimental RL model |
-| [`divided-rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/divided-rl-combo) | comma's [`divided-rl`](https://github.com/commaai/openpilot/tree/divided-rl) experimental RL model |
-| [`michael-rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/michael-rl-combo) | comma's [`michael-rl`](https://github.com/commaai/openpilot/tree/michael-rl) experimental RL model |
+- The cap drives the real MPC, never a synthetic brake command — a false detection is just a gentle, plan-shaped slowdown that unwinds when the detector drops (e.g. the light turns green).
+- The cap may never sit more than 2 m/s below current speed, so a collapsing model path can't command a slam.
+- Before the latch, a live comfort envelope (√(2·1.2·d)) shapes lead-less red-light approaches onto the owner's fitted braking curve instead of the model's late ramp.
+- The latched stop point follows the model's endpoint forward at a bounded rate (so a mid-collapse latch doesn't park the car short) and, below 3 m/s, downward too (so a stale latch can't roll past the model's stop line into a crosswalk).
+- Driver gas cancels forcing for 10 s; at standstill the module steps aside entirely and the normal hold clamp owns the stop.
 
-[`rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rl-combo) is a special case: it runs comma's Rebel Legion release model but is **not** a pure copy of `combo` — it also merges upstream `commaai/openpilot` master ahead of `stock`, plus small tuning deltas (e.g. `LONG_SMOOTH` 0.0), so expect it to differ beyond the model swap.
+## What changed
 
-## To-Do
-
-Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
-
-Each feature links to its branch — the branch README has the full "what/how/what changed" story.
-
-- ⚠️ **[Sometimes-On-Lateral (SOL)](https://github.com/SpysyWeeb/Spysypilot/tree/SOL)** — steering is toggled separately from cruise control, so the driver can use op lateral without enabling op long, or op long without enabling op lateral; runs its own state machine beside selfdrived's, with real panda/opendbc safety-layer support via the SpysyWeeb submodule forks; formerly Always-On-Lateral (AOL), which the code identifiers still use &nbsp;*(personal idea)*
-- ✅ **[Hot-swap button between Chill/Experimental mode](https://github.com/SpysyWeeb/Spysypilot/tree/hot-swap-experimental)** — hold the steering-wheel distance button 0.5s to toggle Chill/Experimental without going into settings; a tap still cycles the follow personality &nbsp;*(inspired by sunnypilot)*
-- ⚠️ **[Side panel quick-action buttons](https://github.com/SpysyWeeb/Spysypilot/tree/side-buttons)** — the home screen's right column is a stack of quick-access buttons: experimental-mode toggle, an update button with live download/install status, a screen-always-on toggle, and an error-log shortcut &nbsp;*(personal idea)*
-- ⚠️ **[Nudgeless lane changes](https://github.com/SpysyWeeb/Spysypilot/tree/nudgless-lane-changes)** — lane changes trigger on turn signal alone, one automatic change per blinker event; pressing the brake cancels auto for that blinker event entirely (manual nudge still works) &nbsp;*(inspired by sunnypilot)*
-- ✅\* **[Smooth stops](https://github.com/SpysyWeeb/Spysypilot/tree/smooth-stops)** — feathers the brake down to a true standstill instead of stock's early −2 m/s² clamp, killing the Palisade's end-of-stop headbang; lead-aware with an anti-creep ratchet &nbsp;*(personal idea)*
-- ✅\* **[Better boot screen](https://github.com/SpysyWeeb/Spysypilot/tree/better-boot-screen)** — the boot spinner shows live console output (build/manager), so hangs are immediately diagnosable from the device screen &nbsp;*(personal idea)*
-- ✅ **[Error log viewer](https://github.com/SpysyWeeb/Spysypilot/tree/error-log-viewer)** — crashes are saved to an on-device log; a dev-menu button views it before/during/after a drive, with delete-on-close &nbsp;*(inspired by sunnypilot)*
-- ✅ **[Auto-update](https://github.com/SpysyWeeb/Spysypilot/tree/auto-update)** — tapping "Check" automatically checks, downloads if an update is found, and reboots to install; background downloads (which already happen every ~1.5 hrs on non-metered connections) also auto-install the moment they finish while the car is parked &nbsp;*(personal idea)*
-- ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with tap-to-cycle windows: driver engagement stats (last drive + lifetime, computed on-device from stored routes by a new `drive_statsd` service), a driving breakdown (turn/curve/straight overrides), a live openpilot terminal, and system usage graphs &nbsp;*(personal idea)*
-- ✅ **[Swapped cruise speed adjustments](https://github.com/SpysyWeeb/Spysypilot/tree/swapped-cruise-speed)** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(personal idea)*
-- ❌ **Quiet mode** — silence the engage and disengage sounds while leaving safety alerts audible; no branch yet &nbsp;*(inspired by sunnypilot)*
-- ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — makes experimental mode actually commit to red lights and stop signs instead of the model's indecisive crawl, by latching the model's own planned stop point and capping cruise speed to reach it &nbsp;*(inspired by IQPilot)*
-- ⚠️ **[Better green lights](https://github.com/SpysyWeeb/Spysypilot/tree/better-green-lights)** — experimental-mode green-light launches start ~1.5–2s sooner by reading the model's path-length explosion instead of its laggy shouldStop bit, plus a launch assist that skips the dead time at the head of the model's speed plan &nbsp;*(personal idea)*
-- ⚠️ **[Better longitudinal tune (BLoT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLoT)** — make braking and acceleration feel like my own driving: a necessity supervisor that drives the MPC's runtime knobs, model-predicted lead trajectories (comma PR [#37824](https://github.com/commaai/openpilot/pull/37824)), proportional launch control, and standstill lead pre-release that starts the Palisade's brake bleed from a sustained predicted departure without changing the acceleration curve; see [docs/BLoT.md](docs/BLoT.md); step 1 was [op-model-grader](https://github.com/SpysyWeeb/op-model-grader), which grades the model's driving from rlogs against my own manual driving &nbsp;*(personal idea)*
-- ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
-- ⚠️ **[Universal driving-event logger](https://github.com/SpysyWeeb/Spysypilot/tree/driving-event-platform)** — one rlog-first platform records automatic lateral and longitudinal failures plus general manual bookmarks, confirms preservation before showing UI success, and builds a bounded/reconstructable SSH manifest; see [docs/DrivingEventPlatform.md](docs/DrivingEventPlatform.md) &nbsp;*(personal idea)*
-- 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
-- ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
-
-_\* = functional but could be better_
+- `openpilot/selfdrive/controls/lib/force_stops.py` *(new)* — the `ForceStops` class: filtered path-length detector, latch with forward-ratchet/down-follow, comfort envelope, gas override.
+- `openpilot/selfdrive/controls/lib/longitudinal_planner.py` — one hook: `v_cruise = min(v_cruise, force_stops.update(sm))`.
