@@ -1,7 +1,4 @@
-import math
-
-import pytest
-
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized
 
 from openpilot.cereal import log
@@ -21,11 +18,7 @@ def get_controller(car_name):
   controller = LatControlTorque(CP.as_reader(), CI, DT_CTRL)
   return controller, VM
 
-
-class TestLatControlTorqueBuffer:
-  @staticmethod
-  def set_curvature(car_state, vehicle_model, curvature):
-    car_state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, car_state.vEgo, 0.0))
+class TestLatControlTorqueBuffer(OpenpilotTestCase):
 
   @parameterized.expand([(TOYOTA.TOYOTA_COROLLA_TSS2,)])
   def test_request_buffer_consistency(self, car_name):

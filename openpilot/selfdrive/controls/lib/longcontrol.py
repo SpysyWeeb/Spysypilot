@@ -15,8 +15,7 @@ START_ACCEL_MIN = 0.6  # m/s^2, floor on the proportional starting command -- en
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
 
-def long_control_state_trans(CP, active, long_control_state, v_ego,
-                             should_stop, brake_pressed, cruise_standstill):
+def long_control_state_trans(active, long_control_state, should_stop, brake_pressed, cruise_standstill):
   starting_condition = (not should_stop and
                         not cruise_standstill and
                         not brake_pressed)
@@ -28,22 +27,17 @@ def long_control_state_trans(CP, active, long_control_state, v_ego,
     if long_control_state == LongCtrlState.off:
       if not starting_condition:
         long_control_state = LongCtrlState.stopping
-      elif CP.startingState:
-        long_control_state = LongCtrlState.starting
       else:
         long_control_state = LongCtrlState.pid
 
     elif long_control_state == LongCtrlState.stopping:
-      if starting_condition and CP.startingState:
-        long_control_state = LongCtrlState.starting
-      elif starting_condition:
+      if starting_condition:
         long_control_state = LongCtrlState.pid
 
-    elif long_control_state in [LongCtrlState.starting, LongCtrlState.pid]:
+    elif long_control_state == LongCtrlState.pid:
       if should_stop:
         long_control_state = LongCtrlState.stopping
-      elif v_ego > CP.vEgoStarting:
-        long_control_state = LongCtrlState.pid
+
   return long_control_state
 
 class LongControl:
@@ -81,12 +75,12 @@ class LongControl:
       stop_now = should_stop
 
     prev_state = self.long_control_state
-    self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
+    self.long_control_state = long_control_state_trans(active, self.long_control_state,
                                                        stop_now, CS.brakePressed,
                                                        CS.cruiseState.standstill)
     if self.long_control_state == LongCtrlState.stopping and prev_state != LongCtrlState.stopping:
       # every entry into the hold gets a fresh release debounce -- the stock edges
-      # (off/starting -> stopping) bypass want_hold, and a stale counter from the previous
+      # (off -> stopping) bypass want_hold, and a stale counter from the previous
       # stop would let a one-frame should_stop flicker release the hold instantly
       self.smooth.arm_hold()
     if self.long_control_state == LongCtrlState.off:
@@ -98,18 +92,8 @@ class LongControl:
       output_accel = self.last_output_accel
       if output_accel > self.CP.stopAccel:
         output_accel = min(output_accel, 0.0)
-        output_accel -= self.CP.stoppingDecelRate * DT_CTRL
-      self.reset()
-      self.smooth.reset()
-
-    elif self.long_control_state == LongCtrlState.starting:
-      # Spysypilot: the plan drives the launch; startAccel is the CEILING, not the value.
-      # aTarget already scales with the situation (lead forecast + MPC:
-      # ~0.1 for a lead that hasn't moved yet, 0.5-0.9 for a hesitant roll-away, 2+ for
-      # a committed launch; e2e launch assist covers no-lead greens) -- the stock fixed
-      # command blasted full startAccel at every exit regardless, then the guard caught
-      # it (route 63: lunge-and-catch on every slow lead)
-      output_accel = float(np.clip(a_target, START_ACCEL_MIN, self.CP.startAccel))
+        # TODO: can we just go straight to stopAccel?
+        output_accel -= 1.0 * DT_CTRL  # m/s^2/s while trying to stop
       self.reset()
       self.smooth.reset()
 

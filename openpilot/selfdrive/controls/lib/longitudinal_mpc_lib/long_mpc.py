@@ -24,7 +24,7 @@ EXPORT_DIR = os.path.join(LONG_MPC_DIR, "c_generated_code")
 JSON_FILE = os.path.join(LONG_MPC_DIR, "acados_ocp_long.json")
 
 LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
-MPC_SOURCES = (LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1, LongitudinalPlanSource.cruise)
+MPC_SOURCES = (LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1)
 
 X_DIM = 3
 U_DIM = 1
@@ -55,10 +55,7 @@ T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
-STOP_DISTANCE = 7.0  # stock 6.0; +1m per owner preference -- a constant term of the desired-gap
-                     # cost at every horizon node, so the whole decel plan lands 1m earlier
-CRUISE_MIN_ACCEL = -1.2
-CRUISE_MAX_ACCEL = 3.2  # Spysypilot: doubled with the cruise accel schedule
+STOP_DISTANCE = 6.0
 MIN_X_LEAD_FACTOR = 0.5
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
@@ -307,15 +304,8 @@ class LongitudinalMpc:
     x_lead_traj[0] = max(x_lead_traj[0], min_x_lead)
     v_lead_traj = np.clip(v_lead_traj, 0.0, 1e8)
 
-    x_lead_mpc = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead_traj))
-    v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
-    return np.column_stack((x_lead_mpc, v_lead_mpc))
-
-  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard,
-             t_follow=None, model_leads=None):
-    if t_follow is None:
-      t_follow = get_T_FOLLOW(personality)
-    v_ego = self.x0[1]
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard):
+    t_follow = get_T_FOLLOW(personality)
 
     ml0 = model_leads[0] if model_leads is not None else None
     ml1 = model_leads[1] if model_leads is not None else None
@@ -328,15 +318,7 @@ class LongitudinalMpc:
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
-    # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
-    # when the leads are no factor.
-    v_lower = v_ego + (T_IDXS * CRUISE_MIN_ACCEL * 1.05)
-    # TODO does this make sense when max_a is negative?
-    v_upper = v_ego + (T_IDXS * CRUISE_MAX_ACCEL * 1.05)
-    v_cruise_clipped = np.clip(v_cruise * np.ones(N+1), v_lower, v_upper)
-    cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
-
-    x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle])
+    x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]
 
     self.yref[:,:] = 0.0
