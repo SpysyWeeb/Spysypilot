@@ -1,26 +1,26 @@
-# custom-main-menu
+# SOL — Sometimes-On-Lateral
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded with [Claude Code](https://claude.com/claude-code), is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
+> Formerly known as **Always-On-Lateral (AOL)** — the community-standard term — but renamed because the steering isn't literally always on; it's on when *you* toggle it. The code identifiers (`aol`, `AolDriver`, the cereal `aol` message, the `aol.h` safety layer) keep the original name.
+
 ## What it does
 
-Replaces the useless "upgrade to comma prime" panel on the home screen with a set of **cycling info windows** — tap the panel to flip through them:
+**Decouples steering from cruise control.** With SOL, openpilot's lateral and longitudinal control are each usable without the other: press cruise MAIN and the car steers while the driver keeps (or takes) the pedals — or run op long without op steering by leaving SOL toggled off. This lets you use openpilot's lane keeping everywhere, including situations where you don't want it managing speed, and vice versa.
 
-- **Driver status** — engaged vs. manual miles for the last drive and lifetime, computed from the routes stored on the device.
-- **Driving breakdown** — where overrides happen (turns vs. curves vs. straight-line lane-position nudges), lane-change counts, average steering divergence, and turn-in/unwind timing versus the model.
-- **Live terminal** — a scrolling console of openpilot's own output, colorized, right on the home screen.
-- **System usage** — CPU/RAM/power/fan history graphs plus storage used/total.
-
-*(personal idea)*
+*(personal idea; the safety-layer concept follows the community's MADS work)*
 
 ## How it works
 
-A new off-road service, `drive_statsd`, polls for completed routes, parses their logs (engagement events, override events, steering angles), classifies each override by maneuver type — a "turn" is a low-speed ≥90° episode, a "curve" is model-steered road geometry, small commanded angles are lane-position preference — and writes per-drive and lifetime aggregates to Params (`SpysyLastDriveStats`, `SpysyLifetimeStats`, with an analyzer version stamp that forces reanalysis when the semantics change). The UI widgets are pure readers of those params, so the heavy log parsing never runs in the UI process; the terminal and system windows sample live sources (process output, `/sys` counters) on their own timers.
+A dedicated state machine (`AolDriver` + `AolStateMachine`) runs alongside selfdrived's main one. When SOL is active, controlsd consults `aol.active` instead of `selfdriveState.active` to decide whether to send steering commands, while the main state machine continues to own longitudinal engagement, alerts, and safety events. SOL state is published on its own cereal service, rendered in the UI (steering-active indication without full engagement), and — critically — mirrored into the **panda safety layer**: the safety code has to permit lateral-only actuation, so this branch overrides the `opendbc` and `panda` submodules to the SpysyWeeb forks carrying the real SOL/MADS safety-mode changes. Lane-change alerts that stock openpilot only shows while fully engaged are surfaced during SOL-only steering too, and edge cases (ignition-on phantom engagement, cruise-available edges at boot) are latched out.
 
 ## What changed
 
-- `openpilot/selfdrive/spysypilot/drive_statsd.py` *(new, the bulk of the branch)* — the stats analyzer/aggregator service, registered in `process_config.py` to run offroad.
-- `openpilot/selfdrive/ui/layouts/home.py` — prime widget replaced by the tap-to-cycle window stack.
-- `openpilot/selfdrive/ui/widgets/` *(new widgets)* — `drive_stats`, `override_stats`, `turn_stats`, `curve_stats`, `straight_stats`, `stats_common`, `terminal_widget`, `system_stats`.
-- `openpilot/common/params_keys.h` — `Spysy*` stats params.
-- `openpilot/common/swaglog.py` — log tee the terminal widget reads from.
+- `openpilot/spysypilot/aol/` *(new)* — `aol.py` (the `AolDriver` state machine and alert plumbing), `state.py` (`AolStateMachine`, active/enabled states), `helpers.py` (Hyundai always-allow detection).
+- `openpilot/selfdrive/selfdrived/selfdrived.py`, `controlsd.py`, `controlsd_ext.py`, `card.py` — SOL driver wired beside the main state machine; lateral-allowed decision routed through it.
+- `openpilot/cereal/custom.capnp`, `log.capnp`, `services.py` — SOL state message/service (named `aol` on the wire).
+- `openpilot/selfdrive/pandad/` (`panda.cc/h`, `pandad.cc`) — safety-param plumbing so the panda knows SOL mode.
+- `openpilot/selfdrive/ui/` (`ui_state.py`, `augmented_road_view.py`) — steering-active-without-engagement rendering.
+- `.gitmodules` + submodule pointers — `opendbc` and `panda` point at the SpysyWeeb forks (branch `Spysypilot`) carrying the SOL safety-mode code.
+
+> Note: this branch is a collaborator's area of the fork — changes land here on request only.
