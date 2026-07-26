@@ -270,6 +270,10 @@ def too_distracted_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubM
   return NoEntryAlert("Pay Attention to Engage", priority=Priority.HIGH)
 
 
+def user_bookmark_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
+  return NormalPermanentAlert("Bookmark Saved", "", duration=1.5, priority=Priority.LOWER)
+
+
 # *** debug alerts ***
 
 def out_of_space_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
