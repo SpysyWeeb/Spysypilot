@@ -17,8 +17,10 @@ from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
-A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
-A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
+A_CRUISE_MAX_VALS = [4.0, 2.4, 1.2, 0.6]  # Spysypilot: launch-tapered (owner request) -- full
+A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]    # ACCEL_MAX off the line, decaying to stock by 40 m/s
+                                          # (2.5x/2x/1.5x/1x stock; needs ACCEL_MAX=4.0 + panda
+                                          # safety bump in opendbc, both already in place)
 J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
 A_CRUISE_MIN = -1.2
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -73,7 +75,7 @@ class LongitudinalPlanner:
 
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
-    self.force_stops = ForceStops(dt=self.dt)
+    self.blt = BLTSupervisor()
     self.a_cruise = 0.0
     self.output_a_target = 0.0
     self.output_should_stop = False
@@ -145,9 +147,14 @@ class LongitudinalPlanner:
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
-    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
+    # BLT necessity supervisor: modulates the solver's own runtime knobs (see docs/BLoT.md)
+    personality = sm['selfdriveState'].personality
+    jerk_scale, t_follow_blt = self.blt.update(sm, self.a_desired, get_T_FOLLOW(personality))
+    model_leads = sm['modelV2'].leadsV3 if len(sm['modelV2'].leadsV3) > 1 else None
+    self.mpc.set_weights(prev_accel_constraint, personality=personality, jerk_factor_scale=jerk_scale)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality)
+    self.mpc.update(sm['radarState'], personality=personality,
+                    t_follow=t_follow_blt, model_leads=model_leads)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -165,6 +172,15 @@ class LongitudinalPlanner:
     output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                               action_t=action_t)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
+    # Route 8d: the Palisade took ~2.1 s from a positive post-controller request to
+    # wheel motion at standstill, while the normal planner action horizon is ~0.55 s.
+    # Start only the hold-release/brake-bleed leg from the radar-anchored predicted
+    # lead departure; preserve the MPC aTarget so this does not retune the launch curve.
+    pre_release = self.lead_departure.update(
+      sm, active=self.CP.openpilotLongitudinalControl and not long_control_off,
+    )
+    if pre_release:
+      output_should_stop_mpc = False
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
