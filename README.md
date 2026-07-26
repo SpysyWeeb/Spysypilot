@@ -26,6 +26,12 @@ The new shadow event is `blatV2Shadow`, version 1. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, validity, and per-frame runtime.
 
+All fields except `computeTimeSeconds` are deterministic replay fields and
+must match the route-audit harness at the Float64 bit level. Runtime is an
+environment measurement: only values logged during real onroad operation on
+comma hardware gate the 2 ms p99 and 5 ms hard-maximum budgets. Workstation
+replay timing is diagnostic only.
+
 ## Hyundai limits
 
 This branch points `opendbc_repo` to

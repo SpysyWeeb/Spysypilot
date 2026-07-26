@@ -40,6 +40,7 @@ _services: dict[str, tuple] = {
   "liveCalibration": (True, 4., 4),
   "liveTorqueParameters": (True, 4., 1),
   "liveDelay": (True, 4., 1),
+  "blatV2Shadow": (True, 100., 10),
   "operatingSystemLog": (True, 0.),
   "carState": (True, 100., 10),
   "carControl": (True, 100., 10),
