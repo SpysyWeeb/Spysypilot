@@ -6,16 +6,15 @@ Companion longitudinal branch: [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/
 
 ## Status
 
-⚠️ **In progress.** BLaT has returned to the field-tested controller v14 tree
-from rollback authority commit `5e533e3ec6`. The later v15 scalar-anchor and
-uncommitted v15.1 persistence-gate work have been removed after failing field
-feel and replay gates. The v14 baseline remains the active foundation and must
-still be explicitly signed off after another on-car check before this task can
-be considered done.
+🔒 **Frozen reference implementation.** BLaT is locked to the field-tested
+controller v14 tree from rollback authority commit `5e533e3ec6`. The rejected
+v15.x series is closed permanently: no further corrections, thresholds, or
+gate work belong on this branch. New lateral-controller development starts
+from `stock` on `BLaTv2`; it does not evolve this implementation.
 
 Automated rollback validation currently covers 87 lateral-controller/reference
 tests, 16 Hyundai damping tests, and 1,367 Hyundai panda safety tests. These
-checks confirm the restored V14 code and bounds, not its on-road steering feel.
+checks preserve the frozen V14 code and bounds.
 
 ## What it does
 
