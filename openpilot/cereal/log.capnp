@@ -3044,6 +3044,18 @@ struct AudioData {
   sampleRate @1 :UInt32;
 }
 
+struct BlatV2Shadow {
+  shadowVersion @0 :UInt16;
+  valid @1 :Bool;
+  referenceCurvature @2 :Float64;
+  torqueDemand @3 :Float64;
+  feasibleTorque @4 :Float64;
+  plantResidual @5 :Float64;
+  scalarPlanDisagreement @6 :Float64;
+  horizon @7 :Float64;
+  computeTimeSeconds @8 :Float64;
+}
+
 struct Touch {
   sec @0 :Int64;
   usec @1 :Int64;
@@ -3092,6 +3104,7 @@ struct Event {
     liveParameters @61 :LiveParametersData;
     liveTorqueParameters @94 :LiveTorqueParametersData;
     liveDelay @146 : LiveDelayData;
+    blatV2Shadow @155 :BlatV2Shadow;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
     onroadEvents @134: List(OnroadEvent);
