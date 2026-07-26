@@ -165,7 +165,7 @@ class LeadDeparturePreRelease:
 
   def update(self, sm, active: bool) -> bool:
     lead = sm['radarState'].leadOne
-    if not (active and sm['carState'].standstill and sm.valid['radarState'] and lead.status):
+    if not (active and sm['carState'].standstill and sm.valid['radarState'] and lead.present):
       self.reset()
       return False
 
@@ -226,7 +226,7 @@ class BLTSupervisor:
 
     scale_target, pad_target = 1.0, 0.0
 
-    if lead.status and sm.valid['radarState'] and v_ego > MIN_SPEED:
+    if lead.present and sm.valid['radarState'] and v_ego > MIN_SPEED:
       v_lead = max(float(lead.vLeadK), 0.0)
       d_rel = float(lead.dRel)
       a_lead = float(lead.aLeadK)
