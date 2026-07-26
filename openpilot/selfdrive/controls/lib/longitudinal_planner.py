@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
@@ -26,6 +27,11 @@ A_CRUISE_MIN = -1.2
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+
+# Spysypilot: keep the BLoT launch envelope's total-acceleration budget. Lateral
+# acceleration still consumes this budget through the upstream turn limiter.
+_A_TOTAL_MAX_V = [4.0, 4.0]
+_A_TOTAL_MAX_BP = [20., 40.]
 
 LAUNCH_DISARM_SPEED = 2.0
 LAUNCH_COMMIT_T = 3.5
