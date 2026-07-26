@@ -11,7 +11,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 # These differ slightly from vehicle curvature measured by livePose, since the
 # online limiter must be calibrated in the same model space it consumes.
 CURVATURE_BP = np.array([0.00501, 0.04666, 0.08188])
-CURVE_SPEED_V = np.array([38.0, 19.0, 11.0]) * CV.MPH_TO_MS
+CURVE_SPEED_V = np.array([44.0, 22.0, 13.0]) * CV.MPH_TO_MS
 
 APPROACH_DECEL = 1.0  # m/s^2
 MIN_CURVATURE = 1e-4

@@ -26,13 +26,15 @@ recorded on 2026-07-24:
 
 | Measured vehicle curvature | Model-path curvature | Maximum speed |
 |---:|---:|---:|
-| 0.00524 1/m | 0.00501 1/m | 38 mph |
-| 0.04339 1/m | 0.04666 1/m | 19 mph |
-| 0.07056 1/m | 0.08188 1/m | 11 mph |
+| 0.00524 1/m | 0.00501 1/m | 44 mph |
+| 0.04339 1/m | 0.04666 1/m | 22 mph |
+| 0.07056 1/m | 0.08188 1/m | 13 mph |
 
 The model-path values are used by the online limiter because that is its input;
 the measured vehicle values document the physical curves that produced them.
-These are field-test starting points, not completed tuning.
+On 2026-07-25, the owner requested a 15% increase from the initial 38/19/11
+mph envelope, with each configured value rounded up to a whole mph. These are
+field-test starting points, not completed tuning.
 
 ## Design
 
