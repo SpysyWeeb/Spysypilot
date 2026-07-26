@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "provisional": true,
+  "provenance": "Owner-authorized order-of-magnitude seed; replace with the reviewed excitation-drive fit.",
+  "k_t": 4000.0,
+  "b_steer": 10.0,
+  "t_breakaway": 0.05,
+  "actuation_delay": 0.12,
+  "units": {
+    "k_t": "steering-wheel deg/s^2 per normalized torque",
+    "b_steer": "1/s",
+    "t_breakaway": "normalized torque",
+    "actuation_delay": "s"
+  }
+}
