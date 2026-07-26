@@ -11,6 +11,14 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
+class _SubMasterShim(dict):
+  """BLoT's supervisor reads SubMaster.valid; the plant's plain dict stands in for
+  SubMaster during maneuver sims, so expose an all-valid mapping."""
+  @property
+  def valid(self):
+    return {k: True for k in self}
+
+
 class Plant:
   messaging_initialized = False
 
@@ -143,13 +151,13 @@ class Plant:
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = {'radarState': radar.radarState,
+    sm = _SubMasterShim({'radarState': radar.radarState,
           'carState': car_state.carState,
           'carControl': car_control.carControl,
           'controlsState': control.controlsState,
           'selfdriveState': ss.selfdriveState,
           'liveParameters': lp.liveParameters,
-          'modelV2': model.modelV2}
+          'modelV2': model.modelV2})
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
