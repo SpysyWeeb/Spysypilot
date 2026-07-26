@@ -55,7 +55,8 @@ T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
-STOP_DISTANCE = 6.0
+STOP_DISTANCE = 7.0  # stock 6.0; +1m per owner preference -- a constant term of the desired-gap
+                     # cost at every horizon node, so the whole decel plan lands 1m earlier
 MIN_X_LEAD_FACTOR = 0.5
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
@@ -304,8 +305,15 @@ class LongitudinalMpc:
     x_lead_traj[0] = max(x_lead_traj[0], min_x_lead)
     v_lead_traj = np.clip(v_lead_traj, 0.0, 1e8)
 
-  def update(self, radarstate, personality=log.LongitudinalPersonality.standard):
-    t_follow = get_T_FOLLOW(personality)
+    x_lead_mpc = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead_traj))
+    v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
+    return np.column_stack((x_lead_mpc, v_lead_mpc))
+
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
+             t_follow=None, model_leads=None):
+    if t_follow is None:
+      t_follow = get_T_FOLLOW(personality)
+    v_ego = self.x0[1]
 
     ml0 = model_leads[0] if model_leads is not None else None
     ml1 = model_leads[1] if model_leads is not None else None
