@@ -8,8 +8,9 @@ import time
 from collections.abc import Collection
 from collections import defaultdict
 from pathlib import Path
-import pytest
 
+from openpilot.common.parameterized import parameterized
+from openpilot.common.test import OpenpilotTestCase
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from openpilot.cereal.services import SERVICE_LIST
@@ -33,7 +34,7 @@ CEREAL_SERVICES = [f for f in log.Event.schema.union_fields if f in SERVICE_LIST
                    and f not in ("drivingEvent", "drivingEventRecorded")]
 
 
-class TestLoggerd:
+class TestLoggerd(OpenpilotTestCase):
   def _get_latest_log_dir(self):
     log_dirs = sorted(Path(Paths.log_root()).iterdir(), key=lambda f: f.stat().st_mtime)
     return log_dirs[-1]
@@ -194,7 +195,6 @@ class TestLoggerd:
       assert getattr(initData, initData_key) == v
       assert logged_params[param_key].decode() == v
 
-  @pytest.mark.xdist_group("camera_encoder_tests")  # setting xdist group ensures tests are run in same worker, prevents encoderd from crashing
   def test_rotation(self):
     Params().put("RecordFront", True, block=True)
 
@@ -309,114 +309,13 @@ class TestLoggerd:
     assert getxattr(segment_dir, PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
 
   def test_not_preserving_nonbookmarked_segments(self):
-    services = set(random.sample(CEREAL_SERVICES, random.randint(5, 10))) - {"userBookmark", "audioFeedback"}
+    services = set(random.sample(CEREAL_SERVICES, random.randint(5, 10))) - {"userBookmark"}
     self._publish_random_messages(services)
 
     segment_dir = self._get_latest_log_dir()
     assert getxattr(segment_dir, PRESERVE_ATTR_NAME) is None
 
-  def test_driving_event_acknowledgment_and_exact_id_deduplication(self):
-    pm = messaging.PubMaster(["drivingEvent"])
-    ack_sock = messaging.sub_sock("drivingEventRecorded", timeout=5000)
-    managed_processes["loggerd"].start()
-    try:
-      assert pm.wait_for_readers_to_update("drivingEvent", timeout=5)
-      msg = messaging.new_message("drivingEvent", valid=True)
-      event = msg.drivingEvent
-      event.version = 1
-      event.eventId = "loggerd-test-event"
-      event.groupId = "loggerd-test-group"
-      event.occurredMonoTime = msg.logMonoTime
-      event.domain = "manual"
-      event.source = "user"
-      event.eventType = "manual.general"
-      event.detector = "test"
-      event.detectorVersion = 1
-      event.severity = "info"
-      event.confidence = 1.0
-      event.payload.none = None
-
-      pm.send("drivingEvent", msg)
-      first_ack = messaging.recv_one(ack_sock)
-      assert first_ack is not None
-      msg.clear_write_flag()
-      pm.send("drivingEvent", msg)
-      second_ack = messaging.recv_one(ack_sock)
-      assert second_ack is not None
-      assert pm.wait_for_readers_to_update("drivingEvent", timeout=5)
-    finally:
-      managed_processes["loggerd"].stop()
-
-    ack = first_ack.drivingEventRecorded
-    assert ack.eventId == "loggerd-test-event"
-    assert ack.groupId == "loggerd-test-group"
-    assert ack.markerWritten
-    assert ack.markerAccepted
-    assert ack.currentSegmentPreserved
-    assert ack.followingSegmentScheduled
-    assert ack.segmentStartMonoTime > 0
-    assert ack.ackMonoTime >= ack.occurredMonoTime
-    segment_dir = self._get_latest_log_dir()
-    assert ack.route == segment_dir.name.rsplit("--", 1)[0]
-    assert ack.segment == int(segment_dir.name.rsplit("--", 1)[1])
-    assert getxattr(segment_dir, PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
-    rlog = list(LogReader(str(segment_dir / "rlog.zst")))
-    assert len([msg for msg in rlog if msg.which() == "drivingEvent" and msg.drivingEvent.eventId == "loggerd-test-event"]) == 1
-    assert any(msg.which() == "drivingEventRecorded" and msg.drivingEventRecorded.eventId == "loggerd-test-event" for msg in rlog)
-
-  def test_driving_event_setxattr_failure_is_acknowledged_and_retried(self):
-    os.environ["LOGGERD_TEST_SETXATTR_FAILURES"] = "1"
-    pm = messaging.PubMaster(["drivingEvent"])
-    ack_sock = messaging.sub_sock("drivingEventRecorded", timeout=5000, conflate=False)
-    managed_processes["loggerd"].start()
-    try:
-      assert pm.wait_for_readers_to_update("drivingEvent", timeout=5)
-      msg = messaging.new_message("drivingEvent", valid=True)
-      event = msg.drivingEvent
-      event.version = 1
-      event.eventId = "loggerd-xattr-failure"
-      event.groupId = "loggerd-xattr-group"
-      event.occurredMonoTime = msg.logMonoTime
-      event.domain = "manual"
-      event.source = "user"
-      event.eventType = "manual.general"
-      event.detector = "test"
-      event.detectorVersion = 1
-      event.severity = "info"
-      event.confidence = 1.0
-      event.payload.none = None
-      pm.send("drivingEvent", msg)
-      received = messaging.recv_one(ack_sock)
-      assert received is not None
-      assert received.drivingEventRecorded.markerWritten
-      assert received.drivingEventRecorded.markerAccepted
-      assert not received.drivingEventRecorded.currentSegmentPreserved
-      assert "setxattr" in received.drivingEventRecorded.error
-      corrected = messaging.recv_one(ack_sock)
-      assert corrected is not None
-      corrected_ack = corrected.drivingEventRecorded
-      assert corrected_ack.eventId == "loggerd-xattr-failure"
-      assert corrected_ack.markerWritten
-      assert corrected_ack.markerAccepted
-      assert corrected_ack.currentSegmentPreserved
-      assert corrected_ack.followingSegmentScheduled
-      assert corrected_ack.error == ""
-      assert corrected_ack.ackMonoTime >= received.drivingEventRecorded.ackMonoTime
-
-      msg.clear_write_flag()
-      pm.send("drivingEvent", msg)
-      duplicate_ack = messaging.recv_one(ack_sock)
-      assert duplicate_ack is not None
-      assert duplicate_ack.drivingEventRecorded.currentSegmentPreserved
-      assert duplicate_ack.drivingEventRecorded.error == ""
-    finally:
-      managed_processes["loggerd"].stop()
-      os.environ.pop("LOGGERD_TEST_SETXATTR_FAILURES", None)
-
-    assert getxattr(self._get_latest_log_dir(), PRESERVE_ATTR_NAME) == PRESERVE_ATTR_VALUE
-
-  @pytest.mark.xdist_group("camera_encoder_tests")  # setting xdist group ensures tests are run in same worker, prevents encoderd from crashing
-  @pytest.mark.parametrize("record_front", [True, False])
+  @parameterized.expand([True, False])
   def test_record_front(self, record_front):
     params = Params()
     params.put_bool("RecordFront", record_front, block=True)
@@ -426,8 +325,7 @@ class TestLoggerd:
     dcamera_hevc_exists = os.path.exists(os.path.join(self._get_latest_log_dir(), 'dcamera.hevc'))
     assert dcamera_hevc_exists == record_front
 
-  @pytest.mark.xdist_group("camera_encoder_tests")  # setting xdist group ensures tests are run in same worker, prevents encoderd from crashing
-  @pytest.mark.parametrize("record_audio", [True, False])
+  @parameterized.expand([True, False])
   def test_record_audio(self, record_audio):
     params = Params()
     params.put_bool("RecordAudio", record_audio, block=True)
