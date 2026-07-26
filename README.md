@@ -6,19 +6,21 @@ Companion longitudinal branch: [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/
 
 ## Status
 
-⚠️ **In progress.** BLaT has returned to the field-tested final controller v14
-baseline from commit `e1a010eeef`. The v15–v19 committed-handoff, high-angle
-release, breakout, remembered-intent, and catch-up interventions remain
-removed.
+⚠️ **In progress.** Phase 1 controller v15 at `498d8d6d06` passed all four
+frozen-route replay gates in route-audit commit `4aca096`, but failed its field
+test. Routes 9d/9f attribute the failure to the planner persistence gate:
+ordinary replan noise repeatedly crosses the 0.02 m/s² quarantine threshold,
+creating chained holds and concentrated torque-rate bursts even though
+aggregate roughness remains acceptable.
 
-The next architecture restructure has emitted and versioned its Phase 0
-counterfactual replay baseline from frozen routes `0000008f--429bc635f2` and
-`0000009b--217a1b70db` in route-audit commit `acdc165`. Phase 1 controller v15
-remains in progress. Its scalar-anchored washout, one-replan quarantine, and
-anchored-rate adapter have provisionally cleared the frozen-route replay gate;
-the result remains subject to regeneration against the exact committed build
-and a separate field drive followed by explicit sign-off. Later phases remain
-in progress under the same replay-and-field requirements.
+V15.1 measurement work is in progress before any controller change. The
+route-audit harness is appending 9d/9f with their exact recorded schemas,
+adding worst rolling one-second torque-rate RMS as a fifth gate, deriving a
+replacement innovation threshold from clean engaged-driving percentiles, and
+reconstructing why same-direction fast maneuvers can remain quarantined across
+multiple replans. Nothing will merge until the expanded v14/v15 table is
+committed. Later phases remain in progress under the same replay-and-field
+requirements.
 
 Replay rows are identified by both the Spysypilot commit and opendbc commit,
 not by the logged controller `VERSION` alone. Beginning with v15, every
