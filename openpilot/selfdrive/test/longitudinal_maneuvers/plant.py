@@ -117,12 +117,20 @@ class Plant:
     model.modelV2.acceleration = acceleration
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
-    # model lead predictions for the lead-trajectory MPC: constant-velocity continuation
-    # of the simulated lead (the radar anchor supplies h=0, the model supplies the deltas)
+    # The plant's model-lead must be as predictive as the real model, else the sim
+    # exercises a controller input that never occurs on the road.
+    lead_times = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
+    if a_lead < 0.0:
+      integration_times = np.minimum(lead_times, max(-v_lead / a_lead, 0.0))
+    else:
+      integration_times = lead_times
+    lead_velocities = np.maximum(v_lead + a_lead * lead_times, 0.0)
+    lead_positions = d_rel + v_lead * integration_times + 0.5 * a_lead * np.square(integration_times)
+
     lead_v3 = log.ModelDataV2.LeadDataV3.new_message()
     lead_v3.prob = float(prob_lead) if self.lead_relevancy else 0.0
-    lead_v3.x = [float(d_rel + v_lead * t) for t in ModelConstants.LEAD_T_IDXS]
-    lead_v3.v = [float(v_lead) for _ in ModelConstants.LEAD_T_IDXS]
+    lead_v3.x = [float(x) for x in lead_positions]
+    lead_v3.v = [float(v) for v in lead_velocities]
     model.modelV2.leadsV3 = [lead_v3, lead_v3, lead_v3]
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off

@@ -281,19 +281,34 @@ class LongitudinalMpc:
         self.solver.set(i, 'x', self.x0)
 
   @staticmethod
+  def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau):
+    a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.)
+    v_lead_traj = np.clip(v_lead + np.cumsum(T_DIFFS * a_lead_traj), 0.0, 1e8)
+    x_lead_traj = x_lead + np.cumsum(T_DIFFS * v_lead_traj)
+    return np.column_stack((x_lead_traj, v_lead_traj))
+
+  @staticmethod
   def process_lead_model(model_lead, radar_lead, v_ego):
-    """NewLeadMpc (upstream PR #37824, via IQPilot): feed the solver the driving model's full
-    predicted lead trajectory instead of a kinematic extrapolation of the current radar state.
-    The model anticipates launches and slowdowns from vision seconds before the radar can
-    measure them -- this is the single deepest lead-reaction-time lever in the stack.
-    Anchored at the radar's trusted h=0 measurement; the model contributes the deltas.
-    Stock PR form: trust ledger + pull-away floor removed 2026-07-18 for an A/B field
-    test of the unmodified PR (both live in git history if reinstated)."""
+    """Build the lead trajectory with three explicit trust tiers.
+
+    A valid model lead anchored by a present radar lead uses the model prediction.
+    If the model lead is invalid while radar still sees a lead, stock radar-physics
+    extrapolation preserves braking for the real vehicle. Only when radar sees no
+    lead do we use the fake-fast-lead trajectory that keeps the solver in-mode.
+    """
     if model_lead is not None and model_lead.prob > 0.5 and radar_lead.present:
       x = np.asarray(model_lead.x, dtype=np.float64)
       v = np.asarray(model_lead.v, dtype=np.float64)
       x_lead_traj = float(radar_lead.dRel) + (x - x[0])
       v_lead_traj = float(radar_lead.vLead) + (v - v[0])
+    elif radar_lead.present:
+      x_lead = float(radar_lead.dRel)
+      v_lead = float(radar_lead.vLead)
+      a_lead = np.clip(float(radar_lead.aLeadK), -10.0, 5.0)
+      min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead) * (v_ego - v_lead) / (-ACCEL_MIN * 2)
+      x_lead = np.clip(x_lead, min_x_lead, 1e8)
+      v_lead = np.clip(v_lead, 0.0, 1e8)
+      return LongitudinalMpc.extrapolate_lead(x_lead, v_lead, a_lead, radar_lead.aLeadTau)
     else:
       # Fake a fast lead so the MPC stays in the same mode
       x_lead_traj = 50.0 + (v_ego + 10.0) * LEAD_T_IDXS_MODEL
