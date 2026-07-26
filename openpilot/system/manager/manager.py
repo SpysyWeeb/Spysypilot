@@ -92,15 +92,6 @@ def manager_init(boot_spinner: Spinner | None = None) -> None:
                        dirty=build_metadata.openpilot.is_dirty,
                        device=HARDWARE.get_device_type())
 
-  # preimport all processes
-  if boot_spinner:
-    boot_spinner.log("Preloading processes...")
-  for p in managed_processes.values():
-    if boot_spinner:
-      boot_spinner.log(f"  {p.name}")
-    p.prepare()
-
-
 def manager_cleanup() -> None:
   # send signals to kill all procs
   for p in managed_processes.values():
