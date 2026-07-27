@@ -3,9 +3,11 @@ import math
 import tracemalloc
 from types import SimpleNamespace
 
+import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore
+from openpilot.selfdrive.controls.blatv2_shadowd import populate_shadow_message
 
 
 def namespace(**kwargs):
@@ -100,6 +102,59 @@ def test_shared_core_is_deterministic_and_residual_valid_after_bootstrap():
     left_result.fallback_command_torque,
     left_result.fallback_optimality_residual,
   ))
+
+
+def test_valid_core_result_serializes_at_capnp_publish_boundary():
+  params = PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+  torque = namespace(
+    latAccelFactor=2.5,
+    latAccelOffset=0.0,
+    friction=0.1,
+  )
+  car_state = namespace(
+    vEgo=10.0,
+    steeringAngleDeg=2.0,
+    steeringRateDeg=0.5,
+    steeringPressed=False,
+    standstill=False,
+  )
+  car_output = namespace(actuatorsOutput=namespace(torque=-0.1))
+  live = namespace(
+    roll=0.01,
+    angleOffsetDeg=0.2,
+    stiffnessFactor=0.9,
+    steerRatio=15.5,
+  )
+  core = ShadowCore(params, torque, car_params(), controller_params())
+
+  core.compute(
+    model(), car_state, car_control(), car_output, live, True, 0.12, True,
+  )
+  result = core.compute(
+    model(), car_state, car_control(), car_output, live, True, 0.12, True,
+  )
+  assert result.valid
+
+  message = messaging.new_message("blatV2Shadow")
+  populate_shadow_message(
+    message,
+    message.blatV2Shadow,
+    result,
+    log_mono_time_ns=123,
+    message_valid=True,
+    compute_seconds=0.001,
+    mpc_compute_seconds=0.0008,
+    fallback_compute_seconds=0.0002,
+  )
+  serialized = message.to_bytes()
+
+  assert serialized
+  assert message.blatV2Shadow.mpcOptimalityResidual == float(
+    result.mpc_optimality_residual
+  )
+  assert message.blatV2Shadow.fallbackOptimalityResidual == float(
+    result.fallback_optimality_residual
+  )
 
 
 def test_shared_core_has_no_unbounded_allocation_growth():

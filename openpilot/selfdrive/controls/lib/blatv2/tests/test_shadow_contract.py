@@ -23,7 +23,8 @@ def test_shadow_subscriptions_are_pinned():
 
 def test_shadow_process_is_registered_onroad_without_toggle():
   config = Path("openpilot/system/manager/process_config.py").read_text()
-  assert 'PythonProcess("blatv2_shadowd", "openpilot.selfdrive.controls.blatv2_shadowd", only_onroad)' in config
+  registration = 'PythonProcess("blatv2_shadowd", "openpilot.selfdrive.controls.blatv2_shadowd", only_onroad, restart_if_crash=True)'
+  assert registration in config
 
 
 def test_shadow_v3_schema_has_candidate_and_observer_fields():
