@@ -33,3 +33,10 @@ Three cooperating pieces:
 - `opendbc_repo` (SpysyWeeb/opendbc, branch `BLoT`) — Hyundai `startAccel` 1.5 and starting-state CAN jerk limit 5.0.
 
 Step 1 of this effort was [op-model-grader](https://github.com/SpysyWeeb/op-model-grader), a standalone tool that grades the model's longitudinal (and lateral) performance from rlogs against the owner's manual driving.
+
+## Test deviations from upstream
+
+- `maneuver.py` `ensure_start`: scoped to the launch phase (v_ego < 0.5 m/s). Upstream's
+  proxy (lead faster + no positive accel, sustained) false-fires on BLoT's post-catch-up
+  gap settling at full lead speed. Trace-verified that the check's intent (launch on
+  resume) passes; approved by owner 2026-07-26.
