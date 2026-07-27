@@ -109,11 +109,6 @@ MIN_TTC = 3.5            # s, below this every intervention stands down (stock s
 MIN_SPEED = 1.0          # m/s, nothing to supervise at crawl (settle/hold own that)
 
 
-def _service_valid(sm, service: str) -> bool:
-  """SubMaster validity with deterministic test-dictionary compatibility."""
-  return sm.valid[service] if hasattr(sm, "valid") else True
-
-
 class DebouncedTrigger:
   """Shared arm/hold/reset bookkeeping for the boost triggers: accrues time while `arm`
   holds, resets when `disarm` holds, and HOLDS the accrued time in the hysteresis band
@@ -170,7 +165,7 @@ class LeadDeparturePreRelease:
 
   def update(self, sm, active: bool) -> bool:
     lead = sm['radarState'].leadOne
-    if not (active and sm['carState'].standstill and _service_valid(sm, 'radarState') and lead.present):
+    if not (active and sm['carState'].standstill and sm.valid['radarState'] and lead.present):
       self.reset()
       return False
 
@@ -231,7 +226,7 @@ class BLTSupervisor:
 
     scale_target, pad_target = 1.0, 0.0
 
-    if lead.present and _service_valid(sm, 'radarState') and v_ego > MIN_SPEED:
+    if lead.present and sm.valid['radarState'] and v_ego > MIN_SPEED:
       v_lead = max(float(lead.vLeadK), 0.0)
       d_rel = float(lead.dRel)
       a_lead = float(lead.aLeadK)

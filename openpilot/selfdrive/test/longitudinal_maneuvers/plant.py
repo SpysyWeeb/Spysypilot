@@ -11,6 +11,14 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
+class _SubMasterShim(dict):
+  """BLoT's supervisor reads SubMaster.valid; the plant's plain dict stands in for
+  SubMaster during maneuver sims, so expose an all-valid mapping."""
+  @property
+  def valid(self):
+    return {k: True for k in self}
+
+
 class Plant:
   messaging_initialized = False
 
@@ -117,12 +125,20 @@ class Plant:
     model.modelV2.acceleration = acceleration
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
-    # model lead predictions for the lead-trajectory MPC: constant-velocity continuation
-    # of the simulated lead (the radar anchor supplies h=0, the model supplies the deltas)
+    # The plant's model-lead must be as predictive as the real model, else the sim
+    # exercises a controller input that never occurs on the road.
+    lead_times = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
+    if a_lead < 0.0:
+      integration_times = np.minimum(lead_times, max(-v_lead / a_lead, 0.0))
+    else:
+      integration_times = lead_times
+    lead_velocities = np.maximum(v_lead + a_lead * lead_times, 0.0)
+    lead_positions = d_rel + v_lead * integration_times + 0.5 * a_lead * np.square(integration_times)
+
     lead_v3 = log.ModelDataV2.LeadDataV3.new_message()
     lead_v3.prob = float(prob_lead) if self.lead_relevancy else 0.0
-    lead_v3.x = [float(d_rel + v_lead * t) for t in ModelConstants.LEAD_T_IDXS]
-    lead_v3.v = [float(v_lead) for _ in ModelConstants.LEAD_T_IDXS]
+    lead_v3.x = [float(x) for x in lead_positions]
+    lead_v3.v = [float(v) for v in lead_velocities]
     model.modelV2.leadsV3 = [lead_v3, lead_v3, lead_v3]
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
@@ -135,13 +151,13 @@ class Plant:
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = {'radarState': radar.radarState,
+    sm = _SubMasterShim({'radarState': radar.radarState,
           'carState': car_state.carState,
           'carControl': car_control.carControl,
           'controlsState': control.controlsState,
           'selfdriveState': ss.selfdriveState,
           'liveParameters': lp.liveParameters,
-          'modelV2': model.modelV2}
+          'modelV2': model.modelV2})
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
