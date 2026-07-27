@@ -13,10 +13,11 @@ import time
 import openpilot.cereal.messaging as messaging
 from opendbc.car.hyundai.values import CarControllerParams
 from opendbc.car.structs import car
+from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore, ShadowResult
 
-SHADOW_VERSION = 2
+SHADOW_VERSION = 3
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -28,6 +29,7 @@ SUBSCRIBED_SERVICES = (
   "liveDelay",
 )
 SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "plant_seed_params.json"
+CONTROLLER_SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "controller_seed_params.json"
 
 
 class BlatV2Shadow:
@@ -42,8 +44,9 @@ class BlatV2Shadow:
     cp_bytes = params.get("CarParams", block=True)
     self.CP = messaging.log_from_bytes(cp_bytes, car.CarParams)
     self.seed_params = PlantParams.from_seed_file(SEED_PATH, CarControllerParams(self.CP))
+    self.controller_params = ControllerParams.from_seed_file(CONTROLLER_SEED_PATH)
     self.torque_params = self.CP.lateralTuning.torque
-    self.core = ShadowCore(self.seed_params, self.torque_params, self.CP)
+    self.core = ShadowCore(self.seed_params, self.torque_params, self.CP, self.controller_params)
 
     self.subscribed_services = list(SUBSCRIBED_SERVICES)
     self.sm = messaging.SubMaster(self.subscribed_services, poll="controlsState")
@@ -51,15 +54,17 @@ class BlatV2Shadow:
     self.message = messaging.new_message("blatV2Shadow")
     self.shadow = self.message.blatV2Shadow
 
-  def _compute(self) -> ShadowResult:
-    return self.core.compute(
+  def _begin_frame(self) -> ShadowResult:
+    return self.core.begin_frame(
       self.sm["modelV2"],
       self.sm["carState"],
+      self.sm["carControl"],
       self.sm["carOutput"],
       self.sm["liveParameters"],
       self.sm.valid["liveParameters"],
       float(self.sm["liveDelay"].lateralDelay),
       self.sm.valid["liveDelay"],
+      self.sm.valid["modelV2"],
     )
 
   def step(self) -> None:
@@ -68,12 +73,35 @@ class BlatV2Shadow:
       return
 
     started_ns = time.perf_counter_ns()
+    mpc_compute_seconds = 0.0
+    fallback_compute_seconds = 0.0
     try:
-      result = self._compute()
-    except (ValueError, OverflowError):
+      common_started_ns = time.perf_counter_ns()
+      result = self._begin_frame()
+      common_compute_ns = time.perf_counter_ns() - common_started_ns
+
+      candidate_started_ns = time.perf_counter_ns()
+      self.core.compute_mpc()
+      mpc_compute_seconds = (common_compute_ns + time.perf_counter_ns() - candidate_started_ns) * 1e-9
+
+      candidate_started_ns = time.perf_counter_ns()
+      self.core.compute_fallback()
+      fallback_compute_seconds = (common_compute_ns + time.perf_counter_ns() - candidate_started_ns) * 1e-9
+      result = self.core.end_frame()
+    except (RuntimeError, ValueError, OverflowError):
       result = self.core.invalid_result()
+      failed_compute_seconds = (time.perf_counter_ns() - started_ns) * 1e-9
+      mpc_compute_seconds = failed_compute_seconds
+      fallback_compute_seconds = failed_compute_seconds
     compute_seconds = (time.perf_counter_ns() - started_ns) * 1e-9
-    assert math.isfinite(compute_seconds) and compute_seconds >= 0.0
+    assert (
+      math.isfinite(compute_seconds)
+      and math.isfinite(mpc_compute_seconds)
+      and math.isfinite(fallback_compute_seconds)
+      and compute_seconds >= 0.0
+      and mpc_compute_seconds >= 0.0
+      and fallback_compute_seconds >= 0.0
+    )
 
     message = self.message
     message.logMonoTime = int(time.monotonic() * 1e9)
@@ -91,6 +119,19 @@ class BlatV2Shadow:
     shadow.vEgo = result.v_ego
     shadow.aligningTorque = result.aligning_torque
     shadow.alignInputsValid = result.align_inputs_valid
+    shadow.disturbanceEstimate = result.disturbance_estimate
+    shadow.observerStatus = result.observer_status
+    shadow.observerUnconstrainedUpdate = result.observer_unconstrained_update
+    shadow.mpcCommandTorque = result.mpc_command_torque
+    shadow.mpcStatus = result.mpc_status
+    shadow.mpcCandidateCount = result.mpc_candidate_count
+    shadow.mpcOptimalityResidual = result.mpc_optimality_residual
+    shadow.mpcComputeTimeSeconds = float(mpc_compute_seconds)
+    shadow.fallbackCommandTorque = result.fallback_command_torque
+    shadow.fallbackStatus = result.fallback_status
+    shadow.fallbackCandidateCount = result.fallback_candidate_count
+    shadow.fallbackOptimalityResidual = result.fallback_optimality_residual
+    shadow.fallbackComputeTimeSeconds = float(fallback_compute_seconds)
     self.pm.send("blatV2Shadow", message)
 
   def run(self) -> None:

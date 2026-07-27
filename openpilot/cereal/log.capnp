@@ -2500,6 +2500,19 @@ struct BlatV2Shadow {
   vEgo @9 :Float64;
   aligningTorque @10 :Float64;
   alignInputsValid @11 :Bool;
+  disturbanceEstimate @12 :Float64;
+  observerStatus @13 :UInt8;
+  observerUnconstrainedUpdate @14 :Float64;
+  mpcCommandTorque @15 :Float64;
+  mpcStatus @16 :UInt8;
+  mpcCandidateCount @17 :UInt16;
+  mpcOptimalityResidual @18 :Float64;
+  mpcComputeTimeSeconds @19 :Float64;
+  fallbackCommandTorque @20 :Float64;
+  fallbackStatus @21 :UInt8;
+  fallbackCandidateCount @22 :UInt16;
+  fallbackOptimalityResidual @23 :Float64;
+  fallbackComputeTimeSeconds @24 :Float64;
 }
 
 struct Touch {

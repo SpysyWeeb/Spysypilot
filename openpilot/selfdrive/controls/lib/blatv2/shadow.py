@@ -18,6 +18,14 @@ from typing import Any
 
 import numpy as np
 
+from openpilot.selfdrive.controls.lib.blatv2.controller import (
+  CandidateStatus,
+  ControllerParams,
+  ObserverStatus,
+)
+from openpilot.selfdrive.controls.lib.blatv2.fallback import InverseEpsLQIFallback
+from openpilot.selfdrive.controls.lib.blatv2.mpc import ModelFollowingTorqueMPC
+from openpilot.selfdrive.controls.lib.blatv2.observer import DisturbanceObserver
 from openpilot.selfdrive.controls.lib.blatv2.plant import (
   AlignInputs,
   AlignParams,
@@ -48,16 +56,37 @@ class ShadowResult:
   v_ego: float = 0.0
   aligning_torque: float = 0.0
   align_inputs_valid: bool = False
+  disturbance_estimate: float = 0.0
+  observer_status: int = int(ObserverStatus.RESET_LATERAL_INVALID)
+  observer_unconstrained_update: float = 0.0
+  mpc_command_torque: float = 0.0
+  mpc_status: int = int(CandidateStatus.INPUT_INVALID)
+  mpc_candidate_count: int = 0
+  mpc_optimality_residual: float = 0.0
+  fallback_command_torque: float = 0.0
+  fallback_status: int = int(CandidateStatus.INPUT_INVALID)
+  fallback_candidate_count: int = 0
+  fallback_optimality_residual: float = 0.0
 
 
 class ShadowCore:
   """Preallocated shadow core; state exists only for one-step residuals."""
 
-  def __init__(self, seed_params: PlantParams, torque_params: Any, car_params: Any):
+  def __init__(
+    self,
+    seed_params: PlantParams,
+    torque_params: Any,
+    car_params: Any,
+    controller_params: ControllerParams,
+  ):
     self.seed_params = seed_params
     self.torque_params = torque_params
     self.align_params = AlignParams.from_car_params(car_params, torque_params)
     self.twin = PlantTwin(seed_params, self.align_params)
+    self.controller_params = controller_params
+    self.observer = DisturbanceObserver(seed_params, controller_params)
+    self.mpc = ModelFollowingTorqueMPC(self.twin, controller_params)
+    self.fallback = InverseEpsLQIFallback(self.twin, controller_params)
     self.default_horizon = horizon(seed_params)
 
     capacity = len(ModelConstants.T_IDXS)
@@ -76,9 +105,17 @@ class ShadowCore:
     )
     self.has_previous_state = False
     self.result = ShadowResult(horizon=self.default_horizon)
+    self.reference_count = 0
+    self.horizon_seconds = self.default_horizon
+    self.actuation_delay = self.seed_params.actuation_delay
+    self.frame_prepared = False
 
   def reset(self) -> None:
     self.has_previous_state = False
+    self.frame_prepared = False
+    self.observer.reset()
+    self.mpc.result.invalidate()
+    self.fallback.reset()
 
   def invalid_result(self) -> ShadowResult:
     self.reset()
@@ -93,6 +130,17 @@ class ShadowCore:
     result.v_ego = 0.0
     result.aligning_torque = 0.0
     result.align_inputs_valid = False
+    result.disturbance_estimate = 0.0
+    result.observer_status = int(self.observer.status)
+    result.observer_unconstrained_update = 0.0
+    result.mpc_command_torque = 0.0
+    result.mpc_status = int(CandidateStatus.INPUT_INVALID)
+    result.mpc_candidate_count = 0
+    result.mpc_optimality_residual = 0.0
+    result.fallback_command_torque = 0.0
+    result.fallback_status = int(CandidateStatus.INPUT_INVALID)
+    result.fallback_candidate_count = 0
+    result.fallback_optimality_residual = 0.0
     return result
 
   def frame_actuation_delay(self, lateral_delay: float, lateral_delay_valid: bool) -> float:
@@ -130,16 +178,20 @@ class ShadowCore:
     target.steer_ratio = self.align_params.nominal_steer_ratio
     target.valid = False
 
-  def compute(
+  def begin_frame(
     self,
     model: Any,
     car_state: Any,
+    car_control: Any,
     car_output: Any,
     live_parameters: Any,
     live_parameters_valid: bool,
     lateral_delay: float,
     lateral_delay_valid: bool,
+    model_valid: bool,
   ) -> ShadowResult:
+    if self.frame_prepared:
+      raise RuntimeError("previous BLaTv2 shadow frame was not finalized")
     actuation_delay = self.frame_actuation_delay(lateral_delay, lateral_delay_valid)
 
     scalar = float(model.action.desiredCurvature)
@@ -223,7 +275,8 @@ class ShadowCore:
 
     result = self.result
     result.valid = bool(
-      plan_valid
+      model_valid
+      and plan_valid
       and residual_valid
       and math.isfinite(reference_now_delay)
       and math.isfinite(demand)
@@ -244,8 +297,114 @@ class ShadowCore:
     result.v_ego = float(residual_v_ego)
     result.aligning_torque = float(residual_aligning_torque)
     result.align_inputs_valid = residual_align_inputs_valid
+    requested = float(car_control.actuators.torque)
+    recorded_constraint_active = not math.isfinite(requested) or requested != applied
+    disturbance = self.observer.update(
+      residual,
+      residual_valid,
+      bool(car_control.latActive),
+      bool(car_state.steeringPressed),
+      bool(car_state.standstill),
+      bool(model_valid and plan_valid),
+      recorded_constraint_active,
+    )
+    result.disturbance_estimate = disturbance
+    result.observer_status = int(self.observer.status)
+    result.observer_unconstrained_update = self.observer.unconstrained_update
+    result.mpc_command_torque = applied
+    result.mpc_status = int(CandidateStatus.INPUT_INVALID)
+    result.mpc_candidate_count = 0
+    result.mpc_optimality_residual = 0.0
+    result.fallback_command_torque = applied
+    result.fallback_status = int(CandidateStatus.INPUT_INVALID)
+    result.fallback_candidate_count = 0
+    result.fallback_optimality_residual = 0.0
 
+    self.reference_count = reference_count
+    self.horizon_seconds = horizon_seconds
+    self.actuation_delay = actuation_delay
+    self.frame_prepared = True
+    return result
+
+  def compute_mpc(self) -> ShadowResult:
+    if not self.frame_prepared:
+      raise RuntimeError("BLaTv2 shadow frame has not been prepared")
+    result = self.result
+    if result.valid:
+      candidate = self.mpc.compute(
+        self.current_state,
+        self.current_align_inputs,
+        self.reference_times,
+        self.reference_curvatures,
+        self.reference_count,
+        self.horizon_seconds,
+        self.actuation_delay,
+        result.disturbance_estimate,
+      )
+      result.mpc_command_torque = candidate.command_torque
+      result.mpc_status = int(candidate.status)
+      result.mpc_candidate_count = candidate.candidate_count
+      result.mpc_optimality_residual = candidate.optimality_residual
+    else:
+      self.mpc.result.invalidate(self.current_state.applied_torque)
+    return result
+
+  def compute_fallback(self) -> ShadowResult:
+    if not self.frame_prepared:
+      raise RuntimeError("BLaTv2 shadow frame has not been prepared")
+    result = self.result
+    if result.valid:
+      candidate = self.fallback.compute(
+        self.current_state,
+        self.current_align_inputs,
+        self.reference_times,
+        self.reference_curvatures,
+        self.reference_count,
+        self.horizon_seconds,
+        self.actuation_delay,
+        result.disturbance_estimate,
+        self.observer.status,
+      )
+      result.fallback_command_torque = candidate.command_torque
+      result.fallback_status = int(candidate.status)
+      result.fallback_candidate_count = candidate.candidate_count
+      result.fallback_optimality_residual = candidate.optimality_residual
+    else:
+      self.fallback.reset()
+    return result
+
+  def end_frame(self) -> ShadowResult:
+    if not self.frame_prepared:
+      raise RuntimeError("BLaTv2 shadow frame has not been prepared")
     self.previous_state, self.current_state = self.current_state, self.previous_state
     self.previous_align_inputs, self.current_align_inputs = self.current_align_inputs, self.previous_align_inputs
     self.has_previous_state = True
-    return result
+    self.frame_prepared = False
+    return self.result
+
+  def compute(
+    self,
+    model: Any,
+    car_state: Any,
+    car_control: Any,
+    car_output: Any,
+    live_parameters: Any,
+    live_parameters_valid: bool,
+    lateral_delay: float,
+    lateral_delay_valid: bool,
+    model_valid: bool = True,
+  ) -> ShadowResult:
+    self.begin_frame(
+      model,
+      car_state,
+      car_control,
+      car_output,
+      live_parameters,
+      live_parameters_valid,
+      lateral_delay,
+      lateral_delay_valid,
+      model_valid,
+    )
+    self.compute_mpc()
+    self.compute_fallback()
+    return self.end_frame()
