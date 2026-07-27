@@ -57,7 +57,11 @@ telemetry streams.
 The 100 Hz path constructs `PlantParams`, `PlantTwin`, the observer, both
 candidates, fixed-size numpy workspaces, two plant-state slots, one result, and
 one Cap'n Proto message builder once at startup. Each frame overwrites that
-storage.
+storage. The device publisher converts every core result to its native Python
+`float`, `int`, or `bool` type at the Cap'n Proto boundary because solver
+outputs may be numpy scalars. `blatv2_shadowd` is manager-restartable: it is a
+structurally passive telemetry process, so recovery after a crash preserves
+route data without introducing a control path.
 
 All result fields except the three compute-time fields are deterministic replay
 fields and must match the route-audit harness at the Float64/typed-integer bit
