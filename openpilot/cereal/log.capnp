@@ -2497,6 +2497,9 @@ struct BlatV2Shadow {
   scalarPlanDisagreement @6 :Float64;
   horizon @7 :Float64;
   computeTimeSeconds @8 :Float64;
+  vEgo @9 :Float64;
+  aligningTorque @10 :Float64;
+  alignInputsValid @11 :Bool;
 }
 
 struct Touch {

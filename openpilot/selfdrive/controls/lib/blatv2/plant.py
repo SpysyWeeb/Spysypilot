@@ -2,12 +2,21 @@
 
 Numerical contract
 ------------------
-* All arithmetic is Python ``float`` (IEEE-754 binary64); no numpy, BLAS, or
+* Plant arithmetic is Python ``float`` (IEEE-754 binary64); no BLAS or
   platform-selected math kernels are used.
 * ``PlantState`` is steering-wheel angle in degrees, steering-wheel rate in
-  degrees/second, and normalized torque on [-1, 1].
+  degrees/second, normalized torque on [-1, 1], and vehicle speed in m/s.
 * ``k_t`` is deg/s² per normalized effective torque, ``b_steer`` is 1/s, and
   ``t_breakaway`` is normalized torque.
+* Tire self-aligning load mirrors frozen-v14's measurement convention exactly:
+  offset-corrected steering angle enters the vehicle model with live roll,
+  stiffness, and steer ratio; measured curvature becomes lateral acceleration;
+  roll gravity and ``latAccelOffset`` are removed; and ``latAccelFactor`` maps
+  that acceleration to normalized torque. Calibration friction is deliberately
+  excluded because ``t_breakaway`` owns Coulomb friction.
+* Aligning torque is subtracted from applied torque before ``k_t``. Invalid live
+  parameters use zero roll/angle offset and nominal stiffness/steer ratio for
+  that frame only; inputs are explicit and never retained by the plant.
 * Integration is semi-implicit Euler: rate is advanced before angle.
 * At exactly zero rate, torque inside the breakaway envelope produces no
   motion. Above it, Coulomb torque is removed in the demand direction. While
@@ -38,6 +47,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 
 
@@ -87,23 +97,106 @@ class PlantParams:
       raise ValueError("actuator limits must be positive")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class AlignParams:
+  mass: float
+  wheelbase: float
+  center_to_front: float
+  tire_stiffness_front: float
+  tire_stiffness_rear: float
+  nominal_steer_ratio: float
+  steer_ratio_rear: float
+  lat_accel_factor: float
+  lat_accel_offset: float
+
+  @classmethod
+  def from_car_params(cls, car_params: Any, torque_params: Any) -> AlignParams:
+    params = cls(
+      mass=float(car_params.mass),
+      wheelbase=float(car_params.wheelbase),
+      center_to_front=float(car_params.centerToFront),
+      tire_stiffness_front=float(car_params.tireStiffnessFront),
+      tire_stiffness_rear=float(car_params.tireStiffnessRear),
+      nominal_steer_ratio=float(car_params.steerRatio),
+      steer_ratio_rear=float(car_params.steerRatioRear),
+      lat_accel_factor=float(torque_params.latAccelFactor),
+      lat_accel_offset=float(torque_params.latAccelOffset),
+    )
+    params._validate()
+    return params
+
+  def _validate(self) -> None:
+    values = (
+      self.mass,
+      self.wheelbase,
+      self.center_to_front,
+      self.tire_stiffness_front,
+      self.tire_stiffness_rear,
+      self.nominal_steer_ratio,
+      self.steer_ratio_rear,
+      self.lat_accel_factor,
+      self.lat_accel_offset,
+    )
+    if not all(math.isfinite(value) for value in values):
+      raise ValueError("alignment parameters must be finite")
+    if (
+      self.mass <= 0.0
+      or self.wheelbase <= 0.0
+      or not 0.0 < self.center_to_front < self.wheelbase
+      or self.tire_stiffness_front <= 0.0
+      or self.tire_stiffness_rear <= 0.0
+      or self.nominal_steer_ratio <= 0.0
+      or self.lat_accel_factor <= 0.0
+    ):
+      raise ValueError("alignment parameters are outside their physical domain")
+
+
+@dataclass(slots=True)
+class AlignInputs:
+  roll: float
+  angle_offset_deg: float
+  stiffness_factor: float
+  steer_ratio: float
+  valid: bool
+
+  def validate(self) -> None:
+    if not (
+      math.isfinite(self.roll)
+      and math.isfinite(self.angle_offset_deg)
+      and math.isfinite(self.stiffness_factor)
+      and math.isfinite(self.steer_ratio)
+    ):
+      raise ValueError("alignment inputs must be finite")
+    if self.stiffness_factor <= 0.0 or self.steer_ratio <= 0.0:
+      raise ValueError("alignment stiffness and steer ratio must be positive")
+
+
+@dataclass(slots=True)
 class PlantState:
   angle_deg: float
   rate_deg_s: float
   applied_torque: float
+  v_ego: float
 
   def __post_init__(self) -> None:
-    if not all(math.isfinite(value) for value in (self.angle_deg, self.rate_deg_s, self.applied_torque)):
+    if not all(math.isfinite(value) for value in (self.angle_deg, self.rate_deg_s, self.applied_torque, self.v_ego)):
       raise ValueError("plant state must be finite")
 
 
 class PlantTwin:
-  def __init__(self, params: PlantParams, residual_dt: float = DT_CTRL):
+  def __init__(self, params: PlantParams, align_params: AlignParams, residual_dt: float = DT_CTRL):
     if not math.isfinite(residual_dt) or residual_dt <= 0.0:
       raise ValueError("residual_dt must be finite and positive")
     self.params = params
+    self.align_params = align_params
     self.residual_dt = float(residual_dt)
+    self.nominal_align_inputs = AlignInputs(
+      roll=0.0,
+      angle_offset_deg=0.0,
+      stiffness_factor=1.0,
+      steer_ratio=align_params.nominal_steer_ratio,
+      valid=False,
+    )
 
   @staticmethod
   def _clip(value: float, lower: float, upper: float) -> float:
@@ -132,24 +225,91 @@ class PlantTwin:
     built = min(abs(target), build * remaining_fraction)
     return math.copysign(built, target)
 
-  def _advance(self, angle: float, rate: float, applied_torque: float, dt: float) -> tuple[float, float]:
+  def aligning_torque(self, state: PlantState, align_inputs: AlignInputs) -> float:
+    """Return the frozen-v14 steady torque required at the measured wheel angle."""
+    return self._aligning_torque(state.angle_deg, state.v_ego, align_inputs)
+
+  def _aligning_torque(self, angle_deg: float, v_ego: float, align_inputs: AlignInputs) -> float:
+    align_inputs.validate()
+    p = self.align_params
+    speed = float(v_ego)
+    front_stiffness = align_inputs.stiffness_factor * p.tire_stiffness_front
+    rear_stiffness = align_inputs.stiffness_factor * p.tire_stiffness_rear
+    center_to_rear = p.wheelbase - p.center_to_front
+    slip_factor = (
+      p.mass * (front_stiffness * p.center_to_front - rear_stiffness * center_to_rear)
+      / (p.wheelbase * p.wheelbase * front_stiffness * rear_stiffness)
+    )
+    curvature_denominator = 1.0 - slip_factor * speed * speed
+    if curvature_denominator == 0.0:
+      raise ValueError("vehicle-model curvature denominator is zero")
+    curvature_factor = (1.0 - p.steer_ratio_rear) / curvature_denominator / p.wheelbase
+    if abs(slip_factor) < 1e-6:
+      roll_compensation = 0.0
+    else:
+      roll_denominator = 1.0 / slip_factor - speed * speed
+      if roll_denominator == 0.0:
+        raise ValueError("vehicle-model roll denominator is zero")
+      roll_compensation = ACCELERATION_DUE_TO_GRAVITY * align_inputs.roll / roll_denominator
+
+    steering_angle_rad = math.radians(angle_deg - align_inputs.angle_offset_deg)
+    vehicle_model_curvature = curvature_factor * steering_angle_rad / align_inputs.steer_ratio + roll_compensation
+    measured_curvature = -vehicle_model_curvature
+    measured_lateral_accel = measured_curvature * speed * speed
+    gravity_adjusted = (
+      measured_lateral_accel
+      - align_inputs.roll * ACCELERATION_DUE_TO_GRAVITY
+      - p.lat_accel_offset
+    )
+    # Controller output is the negative of torque_from_lateral_accel.
+    return -(gravity_adjusted / p.lat_accel_factor)
+
+  def _next_rate(
+    self,
+    angle: float,
+    rate: float,
+    applied_torque: float,
+    v_ego: float,
+    align_inputs: AlignInputs,
+    dt: float,
+  ) -> float:
     torque = self._clip(applied_torque, -1.0, 1.0)
+    aligning_torque = self._aligning_torque(angle, v_ego, align_inputs)
+    net_torque = torque - aligning_torque
     if rate == 0.0:
-      if abs(torque) <= self.params.t_breakaway:
+      if abs(net_torque) <= self.params.t_breakaway:
         effective_torque = 0.0
       else:
-        effective_torque = torque - math.copysign(self.params.t_breakaway, torque)
+        effective_torque = net_torque - math.copysign(self.params.t_breakaway, net_torque)
     else:
-      effective_torque = torque - math.copysign(self.params.t_breakaway, rate)
+      effective_torque = net_torque - math.copysign(self.params.t_breakaway, rate)
 
     acceleration = self.params.k_t * effective_torque - self.params.b_steer * rate
     next_rate = rate + acceleration * dt
     if rate != 0.0 and next_rate * rate < 0.0:
       next_rate = 0.0
+    return next_rate
+
+  def _advance(
+    self,
+    angle: float,
+    rate: float,
+    applied_torque: float,
+    v_ego: float,
+    align_inputs: AlignInputs,
+    dt: float,
+  ) -> tuple[float, float]:
+    next_rate = self._next_rate(angle, rate, applied_torque, v_ego, align_inputs, dt)
     next_angle = angle + next_rate * dt
     return next_angle, next_rate
 
-  def predict(self, state: PlantState, torque_sequence: Sequence[float], dt: float) -> tuple[tuple[float, ...], tuple[float, ...]]:
+  def predict(
+    self,
+    state: PlantState,
+    torque_sequence: Sequence[float],
+    dt: float,
+    align_inputs: AlignInputs | None = None,
+  ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     if not math.isfinite(dt) or dt <= 0.0:
       raise ValueError("dt must be finite and positive")
 
@@ -165,6 +325,7 @@ class PlantTwin:
 
     angle = float(state.angle_deg)
     rate = float(state.rate_deg_s)
+    inputs = self.nominal_align_inputs if align_inputs is None else align_inputs
     angles: list[float] = []
     rates: list[float] = []
     for index in range(len(requested)):
@@ -174,17 +335,26 @@ class PlantTwin:
       else:
         delayed_index = min(int(delayed_time / dt), len(applied_sequence) - 1)
         delayed_torque = applied_sequence[delayed_index]
-      angle, rate = self._advance(angle, rate, delayed_torque, dt)
+      angle, rate = self._advance(angle, rate, delayed_torque, state.v_ego, inputs, dt)
       angles.append(angle)
       rates.append(rate)
 
     return tuple(angles), tuple(rates)
 
-  def one_step_residual(self, state_t: PlantState, applied_torque_t: float, state_t1: PlantState) -> float:
-    _, predicted_rate = self._advance(
+  def one_step_residual(
+    self,
+    state_t: PlantState,
+    applied_torque_t: float,
+    state_t1: PlantState,
+    align_inputs: AlignInputs | None = None,
+  ) -> float:
+    inputs = self.nominal_align_inputs if align_inputs is None else align_inputs
+    predicted_rate = self._next_rate(
       state_t.angle_deg,
       state_t.rate_deg_s,
       float(applied_torque_t),
+      state_t.v_ego,
+      inputs,
       self.residual_dt,
     )
     return float(state_t1.rate_deg_s - predicted_rate)

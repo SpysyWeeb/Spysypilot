@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from openpilot.selfdrive.controls.blatv2_shadowd import PUBLISHED_SERVICES, SUBSCRIBED_SERVICES
+from openpilot.selfdrive.controls.blatv2_shadowd import PUBLISHED_SERVICES, SHADOW_VERSION, SUBSCRIBED_SERVICES
 
 
 def test_shadow_is_structurally_telemetry_only():
@@ -24,3 +24,11 @@ def test_shadow_subscriptions_are_pinned():
 def test_shadow_process_is_registered_onroad_without_toggle():
   config = Path("openpilot/system/manager/process_config.py").read_text()
   assert 'PythonProcess("blatv2_shadowd", "openpilot.selfdrive.controls.blatv2_shadowd", only_onroad)' in config
+
+
+def test_shadow_v2_schema_has_alignment_decomposition_fields():
+  assert SHADOW_VERSION == 2
+  schema = Path("openpilot/cereal/log.capnp").read_text()
+  assert "vEgo @9 :Float64;" in schema
+  assert "aligningTorque @10 :Float64;" in schema
+  assert "alignInputsValid @11 :Bool;" in schema
