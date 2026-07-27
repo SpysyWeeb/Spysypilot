@@ -31,8 +31,9 @@ Numerical contract
   ``torque_transition_time``: same-sign growth uses ``delta_up``, same-sign
   release uses ``delta_down``, and a sign crossing spends decay budget reaching
   zero before using the remaining frame fraction to build the new sign.
-* Seed delay is a deterministic fallback. A valid ``liveDelay`` value replaces
-  it by constructing a per-frame ``PlantParams`` copy.
+* Seed delay is a deterministic fallback. A valid ``liveDelay`` value is passed
+  explicitly to the allocation-free rollout; the frozen ``PlantParams`` and
+  ``PlantTwin`` are never reconstructed on the hot path.
 
 These rules are shared verbatim by the device shadow and route-audit replay.
 Changing any rule is a behavior change and requires a shadow-version bump.
@@ -229,6 +230,64 @@ class PlantTwin:
     """Return the frozen-v14 steady torque required at the measured wheel angle."""
     return self._aligning_torque(state.angle_deg, state.v_ego, align_inputs)
 
+  def aligning_torque_values(self, angle_deg: float, v_ego: float, align_inputs: AlignInputs) -> float:
+    """Allocation-free scalar form used by both shadow candidates."""
+    return self._aligning_torque(float(angle_deg), float(v_ego), align_inputs)
+
+  def curvature_from_angle(self, angle_deg: float, v_ego: float, align_inputs: AlignInputs) -> float:
+    """Mirror the frozen-v14 offset/roll vehicle-model measurement pipeline."""
+    align_inputs.validate()
+    p = self.align_params
+    speed = float(v_ego)
+    front_stiffness = align_inputs.stiffness_factor * p.tire_stiffness_front
+    rear_stiffness = align_inputs.stiffness_factor * p.tire_stiffness_rear
+    center_to_rear = p.wheelbase - p.center_to_front
+    slip_factor = (
+      p.mass * (front_stiffness * p.center_to_front - rear_stiffness * center_to_rear)
+      / (p.wheelbase * p.wheelbase * front_stiffness * rear_stiffness)
+    )
+    curvature_denominator = 1.0 - slip_factor * speed * speed
+    if curvature_denominator == 0.0:
+      raise ValueError("vehicle-model curvature denominator is zero")
+    curvature_factor = (1.0 - p.steer_ratio_rear) / curvature_denominator / p.wheelbase
+    if abs(slip_factor) < 1e-6:
+      roll_compensation = 0.0
+    else:
+      roll_denominator = 1.0 / slip_factor - speed * speed
+      if roll_denominator == 0.0:
+        raise ValueError("vehicle-model roll denominator is zero")
+      roll_compensation = ACCELERATION_DUE_TO_GRAVITY * align_inputs.roll / roll_denominator
+    steering_angle_rad = math.radians(float(angle_deg) - align_inputs.angle_offset_deg)
+    return -(curvature_factor * steering_angle_rad / align_inputs.steer_ratio + roll_compensation)
+
+  def angle_from_curvature(self, curvature: float, v_ego: float, align_inputs: AlignInputs) -> float:
+    """Exact scalar inverse of :meth:`curvature_from_angle`."""
+    align_inputs.validate()
+    p = self.align_params
+    speed = float(v_ego)
+    front_stiffness = align_inputs.stiffness_factor * p.tire_stiffness_front
+    rear_stiffness = align_inputs.stiffness_factor * p.tire_stiffness_rear
+    center_to_rear = p.wheelbase - p.center_to_front
+    slip_factor = (
+      p.mass * (front_stiffness * p.center_to_front - rear_stiffness * center_to_rear)
+      / (p.wheelbase * p.wheelbase * front_stiffness * rear_stiffness)
+    )
+    curvature_denominator = 1.0 - slip_factor * speed * speed
+    if curvature_denominator == 0.0:
+      raise ValueError("vehicle-model curvature denominator is zero")
+    curvature_factor = (1.0 - p.steer_ratio_rear) / curvature_denominator / p.wheelbase
+    if curvature_factor == 0.0:
+      raise ValueError("vehicle-model curvature factor is zero")
+    if abs(slip_factor) < 1e-6:
+      roll_compensation = 0.0
+    else:
+      roll_denominator = 1.0 / slip_factor - speed * speed
+      if roll_denominator == 0.0:
+        raise ValueError("vehicle-model roll denominator is zero")
+      roll_compensation = ACCELERATION_DUE_TO_GRAVITY * align_inputs.roll / roll_denominator
+    steering_angle_rad = (-float(curvature) - roll_compensation) * align_inputs.steer_ratio / curvature_factor
+    return math.degrees(steering_angle_rad) + align_inputs.angle_offset_deg
+
   def _aligning_torque(self, angle_deg: float, v_ego: float, align_inputs: AlignInputs) -> float:
     align_inputs.validate()
     p = self.align_params
@@ -272,10 +331,14 @@ class PlantTwin:
     v_ego: float,
     align_inputs: AlignInputs,
     dt: float,
+    disturbance_torque: float = 0.0,
   ) -> float:
     torque = self._clip(applied_torque, -1.0, 1.0)
     aligning_torque = self._aligning_torque(angle, v_ego, align_inputs)
-    net_torque = torque - aligning_torque
+    disturbance = float(disturbance_torque)
+    if not math.isfinite(disturbance):
+      raise ValueError("disturbance torque must be finite")
+    net_torque = torque - aligning_torque - disturbance
     if rate == 0.0:
       if abs(net_torque) <= self.params.t_breakaway:
         effective_torque = 0.0
@@ -298,8 +361,9 @@ class PlantTwin:
     v_ego: float,
     align_inputs: AlignInputs,
     dt: float,
+    disturbance_torque: float = 0.0,
   ) -> tuple[float, float]:
-    next_rate = self._next_rate(angle, rate, applied_torque, v_ego, align_inputs, dt)
+    next_rate = self._next_rate(angle, rate, applied_torque, v_ego, align_inputs, dt, disturbance_torque)
     next_angle = angle + next_rate * dt
     return next_angle, next_rate
 
@@ -340,6 +404,60 @@ class PlantTwin:
       rates.append(rate)
 
     return tuple(angles), tuple(rates)
+
+  def predict_into(
+    self,
+    state: PlantState,
+    torque_sequence: Sequence[float],
+    count: int,
+    dt: float,
+    align_inputs: AlignInputs,
+    applied_out: Any,
+    angle_out: Any,
+    rate_out: Any,
+    disturbance_torque: float = 0.0,
+    actuation_delay: float | None = None,
+  ) -> None:
+    """Allocation-free exact limiter/delay/plant rollout into caller buffers."""
+    if not math.isfinite(dt) or dt <= 0.0:
+      raise ValueError("dt must be finite and positive")
+    if count <= 0 or count > len(torque_sequence) or count > len(applied_out) or count > len(angle_out) or count > len(rate_out):
+      raise ValueError("prediction count is outside buffer bounds")
+
+    delay = self.params.actuation_delay if actuation_delay is None else float(actuation_delay)
+    if not math.isfinite(delay) or delay < 0.0:
+      raise ValueError("actuation delay must be finite and non-negative")
+
+    applied = self._clip(state.applied_torque, -1.0, 1.0)
+    for index in range(count):
+      demand = float(torque_sequence[index])
+      if not math.isfinite(demand):
+        raise ValueError("torque_sequence must be finite")
+      applied = self.apply_slew(applied, demand)
+      applied_out[index] = applied
+
+    angle = float(state.angle_deg)
+    rate = float(state.rate_deg_s)
+    for index in range(count):
+      delayed_time = index * dt - delay
+      if delayed_time < 0.0:
+        delayed_torque = state.applied_torque
+      else:
+        delayed_index = min(int(delayed_time / dt), count - 1)
+        delayed_torque = float(applied_out[delayed_index])
+      next_rate = self._next_rate(
+        angle,
+        rate,
+        delayed_torque,
+        state.v_ego,
+        align_inputs,
+        dt,
+        disturbance_torque,
+      )
+      angle += next_rate * dt
+      rate = next_rate
+      angle_out[index] = angle
+      rate_out[index] = rate
 
   def one_step_residual(
     self,

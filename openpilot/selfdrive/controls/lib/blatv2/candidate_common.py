@@ -1,0 +1,117 @@
+"""Preallocated reference/feedforward workspace shared by both candidates."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from openpilot.common.realtime import DT_CTRL
+from openpilot.selfdrive.controls.lib.blatv2.controller import DECISION_DT
+from openpilot.selfdrive.controls.lib.blatv2.plant import AlignInputs, PlantState, PlantTwin
+from openpilot.selfdrive.controls.lib.blatv2.reference import interpolate_buffer
+from openpilot.selfdrive.modeld.constants import ModelConstants
+
+
+MAX_REFERENCE_TIME = float(ModelConstants.T_IDXS[-1])
+MAX_DECISION_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DECISION_DT)) + 2
+MAX_CONTROL_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DT_CTRL)) + 2
+# One reference schedule plus early/late placement for every possible adjacent
+# sign crossing. Capacity is derived from the runtime horizon grid, not tuned.
+MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
+
+
+class CandidateWorkspace:
+  """Fixed buffers for the shared scalar-pinned reference and inverse EPS map."""
+
+  def __init__(self) -> None:
+    self.decision_times = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.reference_curvatures = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.desired_angles = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.desired_rates = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.feedforward = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.control_reference = np.empty(MAX_CONTROL_STEPS, dtype=np.float64)
+    self.decision_count = 0
+    self.control_count = 0
+
+  def fill(
+    self,
+    twin: PlantTwin,
+    state: PlantState,
+    align_inputs: AlignInputs,
+    reference_times: np.ndarray,
+    reference_curvatures: np.ndarray,
+    reference_count: int,
+    horizon_seconds: float,
+    disturbance_torque: float,
+  ) -> None:
+    """Build the 50 ms decision grid and conservative inverse-EPS feedforward.
+
+    Friction is never credited as helpful. The full provisional
+    ``t_breakaway`` is added in the intended motion direction, while the
+    independent disturbance estimate may consume another ``t_breakaway``.
+    This explicitly tolerates two breakaway-equivalent loads until casual-drive
+    event identification can tighten the physical bound.
+    """
+    horizon = min(float(horizon_seconds), MAX_REFERENCE_TIME)
+    if not math.isfinite(horizon) or horizon < 0.0:
+      raise ValueError("candidate horizon must be finite and non-negative")
+
+    decision_count = min(int(math.floor(horizon / DECISION_DT)) + 1, MAX_DECISION_STEPS)
+    control_count = min(int(math.floor(horizon / DT_CTRL)) + 1, MAX_CONTROL_STEPS)
+    if decision_count < 2 or control_count < 2:
+      raise ValueError("candidate horizon is too short")
+
+    for index in range(decision_count):
+      time_value = index * DECISION_DT
+      curvature = interpolate_buffer(reference_times, reference_curvatures, reference_count, time_value)
+      self.decision_times[index] = time_value
+      self.reference_curvatures[index] = curvature
+      self.desired_angles[index] = twin.angle_from_curvature(curvature, state.v_ego, align_inputs)
+
+    for index in range(decision_count):
+      if index == 0:
+        rate = (self.desired_angles[1] - self.desired_angles[0]) / DECISION_DT
+      elif index == decision_count - 1:
+        rate = (self.desired_angles[index] - self.desired_angles[index - 1]) / DECISION_DT
+      else:
+        rate = (self.desired_angles[index + 1] - self.desired_angles[index - 1]) / (2.0 * DECISION_DT)
+      self.desired_rates[index] = rate
+
+    for index in range(decision_count):
+      if index == 0:
+        acceleration = (self.desired_rates[1] - self.desired_rates[0]) / DECISION_DT
+      elif index == decision_count - 1:
+        acceleration = (self.desired_rates[index] - self.desired_rates[index - 1]) / DECISION_DT
+      else:
+        acceleration = (self.desired_rates[index + 1] - self.desired_rates[index - 1]) / (2.0 * DECISION_DT)
+
+      rate = self.desired_rates[index]
+      direction = rate
+      if direction == 0.0:
+        direction = acceleration
+      if direction == 0.0:
+        direction = self.desired_angles[index] - state.angle_deg
+      friction = 0.0 if direction == 0.0 else math.copysign(twin.params.t_breakaway, direction)
+      aligning = twin.aligning_torque_values(self.desired_angles[index], state.v_ego, align_inputs)
+      dynamic = (acceleration + twin.params.b_steer * rate) / twin.params.k_t
+      demand = aligning + dynamic + friction + float(disturbance_torque)
+      self.feedforward[index] = min(max(demand, -1.0), 1.0)
+
+    for index in range(control_count):
+      self.control_reference[index] = interpolate_buffer(
+        reference_times,
+        reference_curvatures,
+        reference_count,
+        index * DT_CTRL,
+      )
+
+    self.decision_count = decision_count
+    self.control_count = control_count
+
+  def expand_decisions_zoh(self, decisions: np.ndarray, output: np.ndarray) -> None:
+    if self.decision_count <= 0 or self.control_count <= 0:
+      raise ValueError("workspace has not been populated")
+    for index in range(self.control_count):
+      decision_index = min(int((index * DT_CTRL) / DECISION_DT), self.decision_count - 1)
+      output[index] = float(decisions[decision_index])

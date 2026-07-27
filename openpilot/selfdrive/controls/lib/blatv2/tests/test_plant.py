@@ -96,6 +96,19 @@ class TestPlantTwin(unittest.TestCase):
     self.assertEqual(rates[:2], (0.0, 0.0))
     self.assertGreater(rates[7], 0.0)
 
+  def test_allocation_free_rollout_accepts_live_delay_without_rebuilding_twin(self) -> None:
+    twin = PlantTwin(params(), align_params())
+    state = PlantState(0.0, 0.0, 0.0, 0.0)
+    inputs = AlignInputs(roll=0.0, angle_offset_deg=0.0, stiffness_factor=1.0, steer_ratio=15.0, valid=True)
+    requested = [1.0] * 20
+    applied = [0.0] * 20
+    angles = [0.0] * 20
+    no_delay_rates = [0.0] * 20
+    delayed_rates = [0.0] * 20
+    twin.predict_into(state, requested, 20, 0.01, inputs, applied, angles, no_delay_rates, actuation_delay=0.0)
+    twin.predict_into(state, requested, 20, 0.01, inputs, applied, angles, delayed_rates, actuation_delay=0.1)
+    self.assertGreater(no_delay_rates[5], delayed_rates[5])
+
   def test_aligning_load_uses_offset_corrected_angle_and_live_roll(self) -> None:
     twin = PlantTwin(params(), align_params())
     state = PlantState(-10.0, 0.0, 0.0, 15.0)

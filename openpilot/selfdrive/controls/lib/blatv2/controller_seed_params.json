@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "provisional": true,
+  "provenance": "Owner-approved shadow-tournament starting values; revise only from owner field-feel review.",
+  "sigma_y": {
+    "value": 0.05,
+    "units": "m",
+    "owner_feel_dial": true,
+    "provisional": true
+  },
+  "sigma_heading": {
+    "value": 0.01,
+    "units": "rad",
+    "owner_feel_dial": true,
+    "provisional": true
+  },
+  "sigma_torque_rate": {
+    "value": 0.5,
+    "units": "normalized torque/s",
+    "owner_feel_dial": true,
+    "provisional": true
+  },
+  "tau_disturbance": {
+    "value": 0.5,
+    "units": "s",
+    "owner_feel_dial": false,
+    "provisional": true
+  }
+}
