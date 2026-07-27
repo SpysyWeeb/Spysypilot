@@ -2,12 +2,16 @@ import math
 from types import SimpleNamespace
 import unittest
 
-from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams, PlantTwin
+from openpilot.selfdrive.controls.lib.blatv2.plant import AlignParams, PlantParams, PlantTwin
 from openpilot.selfdrive.controls.lib.blatv2.reference import build_reference, horizon, torque_demand
 
 
 def params() -> PlantParams:
   return PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+
+
+def align_params() -> AlignParams:
+  return AlignParams(2000.0, 3.0, 1.2, 100000.0, 110000.0, 15.0, 0.0, 2.5, 0.0)
 
 
 class TestReference(unittest.TestCase):
@@ -21,7 +25,7 @@ class TestReference(unittest.TestCase):
     self.assertTrue(math.isclose(horizon(params()), expected))
 
   def test_transparency_for_already_feasible_smooth_demand(self) -> None:
-    twin = PlantTwin(params())
+    twin = PlantTwin(params(), align_params())
     torque_params = SimpleNamespace(latAccelFactor=3.0, latAccelOffset=0.0, friction=0.0)
     raw = torque_demand(-0.0001, 10.0, 0.0, torque_params)
     self.assertLess(abs(raw), 4 / 409)
