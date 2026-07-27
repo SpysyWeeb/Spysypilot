@@ -65,11 +65,21 @@ outputs may be numpy scalars. `blatv2_shadowd` is manager-restartable: it is a
 structurally passive telemetry process, so recovery after a crash preserves
 route data without introducing a control path.
 
-All result fields except the three compute-time fields are deterministic replay
+On-device stage profiling found the candidate floor in Python horizon loops,
+not LDLT or object construction. The candidate workspace now walks the
+monotonic reference once instead of binary-searching every sample. The fallback
+uses a scalar-unrolled, arithmetic-order-preserving 3×3 Riccati recursion. When
+MPC has one sign schedule, it skips the 100 Hz rollout cost because that cost
+only ranks competing schedules; the converged schedule is already the unique
+winner. Seven device-side cases covering workspace, fallback, and one-schedule
+MPC outputs remained bit-exact to the pre-optimization implementation. No
+tuning constant or candidate command changed.
+
+All result fields except the four compute-time fields are deterministic replay
 fields and must match the route-audit harness at the Float64/typed-integer bit
-level. Runtime is an environment measurement: only per-candidate values logged
-during real onroad operation on comma hardware gate the 2 ms p99 and 5 ms
-hard-maximum budgets. Workstation replay timing is diagnostic only.
+level. Runtime is an environment measurement: only shared-plus-candidate values
+logged during real onroad operation on comma hardware gate the 2 ms p99 and
+5 ms hard-maximum budgets. Workstation replay timing is diagnostic only.
 
 The candidates share one observer driven exclusively by recorded applied
 torque and measured steering response; candidates read its estimate and never

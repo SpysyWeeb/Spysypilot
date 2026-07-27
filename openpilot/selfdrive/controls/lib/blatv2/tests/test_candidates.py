@@ -4,11 +4,17 @@ from pathlib import Path
 
 import numpy as np
 
+from openpilot.common.realtime import DT_CTRL
+from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
+  CandidateWorkspace,
+)
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
+  DECISION_DT,
   CandidateStatus,
   ControllerParams,
   ObserverStatus,
 )
+from openpilot.selfdrive.controls.lib.blatv2.reference import interpolate_buffer
 from openpilot.selfdrive.controls.lib.blatv2.fallback import InverseEpsLQIFallback
 from openpilot.selfdrive.controls.lib.blatv2.mpc import ModelFollowingTorqueMPC
 from openpilot.selfdrive.controls.lib.blatv2.plant import (
@@ -82,6 +88,75 @@ def test_fallback_transparency_for_already_feasible_smooth_reference():
   )
   assert result.status == CandidateStatus.OK
   assert math.isclose(result.command_torque, candidate.workspace.feedforward[0], abs_tol=1e-9)
+
+
+def test_monotonic_workspace_interpolation_is_bit_exact_to_scalar_contract():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = feasible_steady_state(twin)
+  times = np.asarray((0.0, 0.1, 0.3, 0.8, 1.0), dtype=np.float64)
+  curvatures = np.asarray(
+    (0.0, 0.001, -0.002, 0.003, 0.001),
+    dtype=np.float64,
+  )
+  workspace = CandidateWorkspace()
+  workspace.fill(
+    twin,
+    state,
+    ALIGN_INPUTS,
+    times,
+    curvatures,
+    len(times),
+    1.0,
+    0.0,
+  )
+
+  expected_decisions = np.asarray([
+    interpolate_buffer(
+      times, curvatures, len(times), index * DECISION_DT,
+    )
+    for index in range(workspace.decision_count)
+  ], dtype=np.float64)
+  expected_controls = np.asarray([
+    interpolate_buffer(
+      times, curvatures, len(times), index * DT_CTRL,
+    )
+    for index in range(workspace.control_count)
+  ], dtype=np.float64)
+  assert (
+    workspace.reference_curvatures[:workspace.decision_count].tobytes()
+    == expected_decisions.tobytes()
+  )
+  assert (
+    workspace.control_reference[:workspace.control_count].tobytes()
+    == expected_controls.tobytes()
+  )
+
+
+def test_single_schedule_mpc_does_not_run_comparison_rollout():
+  class SingleScheduleMPC(ModelFollowingTorqueMPC):
+    def _rollout_cost(
+      self,
+      _disturbance_torque: float,
+      _actuation_delay: float,
+    ) -> float:
+      raise AssertionError("one schedule has no competing rollout to rank")
+
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = feasible_steady_state(twin)
+  candidate = SingleScheduleMPC(twin, CONTROLLER_PARAMS)
+  result = candidate.compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    REFERENCE_CURVATURES,
+    3,
+    1.0,
+    0.0,
+    0.0,
+  )
+  assert result.status == CandidateStatus.OK
+  assert result.candidate_count == 1
+  assert candidate.winning_schedule_index == 0
 
 
 def test_equal_cost_mpc_schedules_choose_lowest_index():
