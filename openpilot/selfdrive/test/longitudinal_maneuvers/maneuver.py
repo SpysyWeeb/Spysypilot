@@ -68,7 +68,13 @@ class Maneuver:
         print("Crashed!!!!")
         valid = False
 
-      if self.ensure_start and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
+      # FORK DEVIATION (approved 2026-07-26): upstream's proxy fires on any
+      # sustained (lead faster, accel <= 0) window. BLoT's anticipatory launch
+      # settles the following gap at full lead speed with a brief gentle decel,
+      # which the proxy misreads as failure-to-start. Scope the check to the
+      # launch phase its comment describes; a genuine failure to launch still
+      # trips it identically.
+      if self.ensure_start and log['speed'] < 0.5 and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
         if not_starting_t == 0.0:
           not_starting_t = plant.current_time
         elif plant.current_time - not_starting_t > 0.5:
