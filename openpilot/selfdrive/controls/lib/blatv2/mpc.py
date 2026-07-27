@@ -341,6 +341,16 @@ class ModelFollowingTorqueMPC:
       if status != CandidateStatus.OK:
         non_converged_count += 1
         continue
+      if schedule_count == 1:
+        # Cost exists only to rank competing sign schedules. With one
+        # schedule, its converged active-set solution is already the unique
+        # winner; a 100 Hz plant rollout cannot change that ordering.
+        best_cost = 0.0
+        best_residual = self._solve_residual
+        self.winning_schedule_index = 0
+        for index in range(count):
+          self.best_solution[index] = self.solution[index]
+        break
       try:
         cost = self._rollout_cost(disturbance_torque, actuation_delay)
       except (ValueError, OverflowError):
