@@ -26,15 +26,17 @@ ground-up design and does not inherit that controller.
 - an onroad `blatv2_shadowd` process that publishes diagnostics only;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 3. It reports reference and
+The shadow event is `blatV2Shadow`, version 4. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 3 adds the shared disturbance estimate and, for each candidate, the
-commanded torque, status, candidate count, optimality residual, and isolated
-device runtime. Solver status distinguishes invalid input, infeasibility,
-non-convergence, and enumeration exhaustion. Equal-cost MPC schedules select
-the lowest schedule index deterministically.
+Version 4 splits runtime into shared `begin_frame` setup, MPC-only solve,
+fallback-only solve, and total dual-candidate frame time; candidate timing no
+longer includes shared setup. Version 3 added the shared disturbance estimate
+and, for each candidate, the commanded torque, status, candidate count,
+optimality residual, and isolated device runtime. Solver status distinguishes
+invalid input, infeasibility, non-convergence, and enumeration exhaustion.
+Equal-cost MPC schedules select the lowest schedule index deterministically.
 
 Candidate status values are `0=ok`, `1=input invalid`, `2=infeasible`,
 `3=non-converged`, and `4=enumeration exhausted`. Observer status values are

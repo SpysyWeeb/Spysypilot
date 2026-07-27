@@ -2513,6 +2513,7 @@ struct BlatV2Shadow {
   fallbackCandidateCount @22 :UInt16;
   fallbackOptimalityResidual @23 :Float64;
   fallbackComputeTimeSeconds @24 :Float64;
+  sharedComputeTimeSeconds @25 :Float64;
 }
 
 struct Touch {

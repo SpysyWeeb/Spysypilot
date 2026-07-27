@@ -143,12 +143,14 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     log_mono_time_ns=123,
     message_valid=True,
     compute_seconds=0.001,
+    shared_compute_seconds=0.0001,
     mpc_compute_seconds=0.0008,
     fallback_compute_seconds=0.0002,
   )
   serialized = message.to_bytes()
 
   assert serialized
+  assert message.blatV2Shadow.sharedComputeTimeSeconds == 0.0001
   assert message.blatV2Shadow.mpcOptimalityResidual == float(
     result.mpc_optimality_residual
   )
