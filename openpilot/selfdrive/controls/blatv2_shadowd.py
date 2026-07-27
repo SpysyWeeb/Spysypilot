@@ -18,7 +18,7 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore, ShadowResult
 
-SHADOW_VERSION = 3
+SHADOW_VERSION = 4
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -41,6 +41,7 @@ def populate_shadow_message(
   log_mono_time_ns: int,
   message_valid: bool,
   compute_seconds: float,
+  shared_compute_seconds: float,
   mpc_compute_seconds: float,
   fallback_compute_seconds: float,
 ) -> None:
@@ -61,6 +62,7 @@ def populate_shadow_message(
   shadow.scalarPlanDisagreement = float(result.scalar_plan_disagreement)
   shadow.horizon = float(result.horizon)
   shadow.computeTimeSeconds = float(compute_seconds)
+  shadow.sharedComputeTimeSeconds = float(shared_compute_seconds)
   shadow.vEgo = float(result.v_ego)
   shadow.aligningTorque = float(result.aligning_torque)
   shadow.alignInputsValid = bool(result.align_inputs_valid)
@@ -124,32 +126,54 @@ class BlatV2Shadow:
       return
 
     started_ns = time.perf_counter_ns()
+    shared_compute_seconds = 0.0
     mpc_compute_seconds = 0.0
     fallback_compute_seconds = 0.0
+    phase = "shared"
+    phase_started_ns = time.perf_counter_ns()
     try:
-      common_started_ns = time.perf_counter_ns()
       result = self._begin_frame()
-      common_compute_ns = time.perf_counter_ns() - common_started_ns
+      phase_finished_ns = time.perf_counter_ns()
+      shared_compute_seconds = (
+        phase_finished_ns - phase_started_ns
+      ) * 1e-9
 
-      candidate_started_ns = time.perf_counter_ns()
+      phase = "mpc"
+      phase_started_ns = phase_finished_ns
       self.core.compute_mpc()
-      mpc_compute_seconds = (common_compute_ns + time.perf_counter_ns() - candidate_started_ns) * 1e-9
+      phase_finished_ns = time.perf_counter_ns()
+      mpc_compute_seconds = (
+        phase_finished_ns - phase_started_ns
+      ) * 1e-9
 
-      candidate_started_ns = time.perf_counter_ns()
+      phase = "fallback"
+      phase_started_ns = phase_finished_ns
       self.core.compute_fallback()
-      fallback_compute_seconds = (common_compute_ns + time.perf_counter_ns() - candidate_started_ns) * 1e-9
+      phase_finished_ns = time.perf_counter_ns()
+      fallback_compute_seconds = (
+        phase_finished_ns - phase_started_ns
+      ) * 1e-9
+      phase = "finalize"
       result = self.core.end_frame()
     except (RuntimeError, ValueError, OverflowError):
+      failed_phase_seconds = (
+        time.perf_counter_ns() - phase_started_ns
+      ) * 1e-9
+      if phase == "shared":
+        shared_compute_seconds = failed_phase_seconds
+      elif phase == "mpc":
+        mpc_compute_seconds = failed_phase_seconds
+      elif phase == "fallback":
+        fallback_compute_seconds = failed_phase_seconds
       result = self.core.invalid_result()
-      failed_compute_seconds = (time.perf_counter_ns() - started_ns) * 1e-9
-      mpc_compute_seconds = failed_compute_seconds
-      fallback_compute_seconds = failed_compute_seconds
     compute_seconds = (time.perf_counter_ns() - started_ns) * 1e-9
     assert (
       math.isfinite(compute_seconds)
+      and math.isfinite(shared_compute_seconds)
       and math.isfinite(mpc_compute_seconds)
       and math.isfinite(fallback_compute_seconds)
       and compute_seconds >= 0.0
+      and shared_compute_seconds >= 0.0
       and mpc_compute_seconds >= 0.0
       and fallback_compute_seconds >= 0.0
     )
@@ -163,6 +187,7 @@ class BlatV2Shadow:
         result.valid and self.sm.all_checks(self.subscribed_services)
       ),
       compute_seconds=compute_seconds,
+      shared_compute_seconds=shared_compute_seconds,
       mpc_compute_seconds=mpc_compute_seconds,
       fallback_compute_seconds=fallback_compute_seconds,
     )
