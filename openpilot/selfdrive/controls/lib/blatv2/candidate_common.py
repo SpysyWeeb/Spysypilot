@@ -9,7 +9,6 @@ import numpy as np
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.blatv2.controller import DECISION_DT
 from openpilot.selfdrive.controls.lib.blatv2.plant import AlignInputs, PlantState, PlantTwin
-from openpilot.selfdrive.controls.lib.blatv2.reference import interpolate_buffer
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
@@ -62,9 +61,29 @@ class CandidateWorkspace:
     if decision_count < 2 or control_count < 2:
       raise ValueError("candidate horizon is too short")
 
+    reference_index = 0
+    first_reference_time = float(reference_times[0])
+    last_reference_time = float(reference_times[reference_count - 1])
     for index in range(decision_count):
       time_value = index * DECISION_DT
-      curvature = interpolate_buffer(reference_times, reference_curvatures, reference_count, time_value)
+      if time_value <= first_reference_time:
+        curvature = float(reference_curvatures[0])
+      elif time_value >= last_reference_time:
+        curvature = float(reference_curvatures[reference_count - 1])
+      else:
+        while (
+          reference_index + 1 < reference_count
+          and float(reference_times[reference_index + 1]) <= time_value
+        ):
+          reference_index += 1
+        upper_index = reference_index + 1
+        lower_time = float(reference_times[reference_index])
+        upper_time = float(reference_times[upper_index])
+        fraction = (time_value - lower_time) / (upper_time - lower_time)
+        lower_value = float(reference_curvatures[reference_index])
+        curvature = lower_value + fraction * (
+          float(reference_curvatures[upper_index]) - lower_value
+        )
       self.decision_times[index] = time_value
       self.reference_curvatures[index] = curvature
       self.desired_angles[index] = twin.angle_from_curvature(curvature, state.v_ego, align_inputs)
@@ -98,13 +117,28 @@ class CandidateWorkspace:
       demand = aligning + dynamic + friction + float(disturbance_torque)
       self.feedforward[index] = min(max(demand, -1.0), 1.0)
 
+    reference_index = 0
     for index in range(control_count):
-      self.control_reference[index] = interpolate_buffer(
-        reference_times,
-        reference_curvatures,
-        reference_count,
-        index * DT_CTRL,
-      )
+      time_value = index * DT_CTRL
+      if time_value <= first_reference_time:
+        curvature = float(reference_curvatures[0])
+      elif time_value >= last_reference_time:
+        curvature = float(reference_curvatures[reference_count - 1])
+      else:
+        while (
+          reference_index + 1 < reference_count
+          and float(reference_times[reference_index + 1]) <= time_value
+        ):
+          reference_index += 1
+        upper_index = reference_index + 1
+        lower_time = float(reference_times[reference_index])
+        upper_time = float(reference_times[upper_index])
+        fraction = (time_value - lower_time) / (upper_time - lower_time)
+        lower_value = float(reference_curvatures[reference_index])
+        curvature = lower_value + fraction * (
+          float(reference_curvatures[upper_index]) - lower_value
+        )
+      self.control_reference[index] = curvature
 
     self.decision_count = decision_count
     self.control_count = control_count
