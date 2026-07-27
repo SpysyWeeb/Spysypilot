@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 import time
+from typing import Any
 
 import openpilot.cereal.messaging as messaging
 from opendbc.car.hyundai.values import CarControllerParams
@@ -30,6 +31,56 @@ SUBSCRIBED_SERVICES = (
 )
 SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "plant_seed_params.json"
 CONTROLLER_SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "controller_seed_params.json"
+
+
+def populate_shadow_message(
+  message: Any,
+  shadow: Any,
+  result: ShadowResult,
+  *,
+  log_mono_time_ns: int,
+  message_valid: bool,
+  compute_seconds: float,
+  mpc_compute_seconds: float,
+  fallback_compute_seconds: float,
+) -> None:
+  """Normalize the numerical core at the Cap'n Proto type boundary.
+
+  Solver fields may be numpy scalar types. Cap'n Proto accepts only native
+  Python scalar values, so every published field is converted here rather
+  than relying on the type produced by any particular solver path.
+  """
+  message.logMonoTime = int(log_mono_time_ns)
+  message.valid = bool(message_valid)
+  shadow.shadowVersion = int(SHADOW_VERSION)
+  shadow.valid = bool(result.valid)
+  shadow.referenceCurvature = float(result.reference_curvature)
+  shadow.torqueDemand = float(result.torque_demand)
+  shadow.feasibleTorque = float(result.feasible_torque)
+  shadow.plantResidual = float(result.plant_residual)
+  shadow.scalarPlanDisagreement = float(result.scalar_plan_disagreement)
+  shadow.horizon = float(result.horizon)
+  shadow.computeTimeSeconds = float(compute_seconds)
+  shadow.vEgo = float(result.v_ego)
+  shadow.aligningTorque = float(result.aligning_torque)
+  shadow.alignInputsValid = bool(result.align_inputs_valid)
+  shadow.disturbanceEstimate = float(result.disturbance_estimate)
+  shadow.observerStatus = int(result.observer_status)
+  shadow.observerUnconstrainedUpdate = float(
+    result.observer_unconstrained_update
+  )
+  shadow.mpcCommandTorque = float(result.mpc_command_torque)
+  shadow.mpcStatus = int(result.mpc_status)
+  shadow.mpcCandidateCount = int(result.mpc_candidate_count)
+  shadow.mpcOptimalityResidual = float(result.mpc_optimality_residual)
+  shadow.mpcComputeTimeSeconds = float(mpc_compute_seconds)
+  shadow.fallbackCommandTorque = float(result.fallback_command_torque)
+  shadow.fallbackStatus = int(result.fallback_status)
+  shadow.fallbackCandidateCount = int(result.fallback_candidate_count)
+  shadow.fallbackOptimalityResidual = float(
+    result.fallback_optimality_residual
+  )
+  shadow.fallbackComputeTimeSeconds = float(fallback_compute_seconds)
 
 
 class BlatV2Shadow:
@@ -103,36 +154,19 @@ class BlatV2Shadow:
       and fallback_compute_seconds >= 0.0
     )
 
-    message = self.message
-    message.logMonoTime = int(time.monotonic() * 1e9)
-    message.valid = bool(result.valid and self.sm.all_checks(self.subscribed_services))
-    shadow = self.shadow
-    shadow.shadowVersion = SHADOW_VERSION
-    shadow.valid = result.valid
-    shadow.referenceCurvature = result.reference_curvature
-    shadow.torqueDemand = result.torque_demand
-    shadow.feasibleTorque = result.feasible_torque
-    shadow.plantResidual = result.plant_residual
-    shadow.scalarPlanDisagreement = result.scalar_plan_disagreement
-    shadow.horizon = result.horizon
-    shadow.computeTimeSeconds = float(compute_seconds)
-    shadow.vEgo = result.v_ego
-    shadow.aligningTorque = result.aligning_torque
-    shadow.alignInputsValid = result.align_inputs_valid
-    shadow.disturbanceEstimate = result.disturbance_estimate
-    shadow.observerStatus = result.observer_status
-    shadow.observerUnconstrainedUpdate = result.observer_unconstrained_update
-    shadow.mpcCommandTorque = result.mpc_command_torque
-    shadow.mpcStatus = result.mpc_status
-    shadow.mpcCandidateCount = result.mpc_candidate_count
-    shadow.mpcOptimalityResidual = result.mpc_optimality_residual
-    shadow.mpcComputeTimeSeconds = float(mpc_compute_seconds)
-    shadow.fallbackCommandTorque = result.fallback_command_torque
-    shadow.fallbackStatus = result.fallback_status
-    shadow.fallbackCandidateCount = result.fallback_candidate_count
-    shadow.fallbackOptimalityResidual = result.fallback_optimality_residual
-    shadow.fallbackComputeTimeSeconds = float(fallback_compute_seconds)
-    self.pm.send("blatV2Shadow", message)
+    populate_shadow_message(
+      self.message,
+      self.shadow,
+      result,
+      log_mono_time_ns=int(time.monotonic() * 1e9),
+      message_valid=bool(
+        result.valid and self.sm.all_checks(self.subscribed_services)
+      ),
+      compute_seconds=compute_seconds,
+      mpc_compute_seconds=mpc_compute_seconds,
+      fallback_compute_seconds=fallback_compute_seconds,
+    )
+    self.pm.send("blatV2Shadow", self.message)
 
   def run(self) -> None:
     while True:
