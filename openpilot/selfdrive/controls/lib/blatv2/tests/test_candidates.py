@@ -7,6 +7,7 @@ import numpy as np
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
   decision_cell_coulomb_direction,
+  decision_cell_friction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   DECISION_DT,
@@ -71,6 +72,13 @@ def test_shared_sigma_values_are_marked_as_provisional_owner_feel_dials():
     "sigma_y": (0.05, True, True),
     "sigma_heading": (0.01, True, True),
     "sigma_torque_rate": (0.5, True, True),
+    "sigma_curvature": (0.00091683, True, True),
+  }
+  assert payload["kinetic_friction"] == {
+    "value": 0.03,
+    "units": "normalized torque",
+    "owner_feel_dial": False,
+    "provisional": True,
   }
 
 
@@ -153,6 +161,40 @@ def test_coulomb_feedforward_retains_full_breakaway_from_stiction():
   assert decision_cell_coulomb_direction(0.0, 0.0, 2.0) == 1.0
   assert decision_cell_coulomb_direction(0.0, 0.0, -2.0) == -1.0
   assert decision_cell_coulomb_direction(0.0, 0.0, 0.0) == 0.0
+
+
+def test_feedforward_uses_static_breakaway_only_until_rack_moves():
+  static = decision_cell_friction(0.0, 0.0, 2.0, 0.09, 0.03)
+  moving = decision_cell_friction(2.0, 1.0, 0.0, 0.09, 0.03)
+  crossing = decision_cell_friction(1.0, -3.0, 0.0, 0.09, 0.03)
+  assert static == 0.09
+  assert moving == 0.03
+  assert crossing == -0.015
+
+
+def test_curvature_tolerance_adds_speed_rolled_angle_feedback():
+  params = ControllerParams(
+    0.05, 0.01, 0.5, 0.5, True,
+    sigma_curvature=0.00075,
+    kinetic_friction=0.03,
+  )
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  candidate = InverseEpsLQIFallback(twin, params)
+  gains = []
+  curvature_per_degrees = []
+  for speed in (3.0, 25.0):
+    state = PlantState(0.0, 0.0, 0.0, speed)
+    candidate._compute_gain(state, ALIGN_INPUTS, 30)
+    gains.append(float(candidate.gain[0]))
+    curvature_per_degrees.append(
+      twin.curvature_from_angle(1.0, speed, ALIGN_INPUTS)
+      - twin.curvature_from_angle(0.0, speed, ALIGN_INPUTS)
+    )
+  assert gains[0] > gains[1]
+  curvature_weight_ratio = (
+    curvature_per_degrees[1] / curvature_per_degrees[0]
+  ) ** 2
+  assert 0.0 < curvature_weight_ratio < 0.5
 
 
 def test_coulomb_feedforward_rejects_non_finite_inputs():

@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 202
+LIVE_CONTROLLER_VERSION = 203
 
 
 class CandidateStatus(IntEnum):
@@ -49,13 +49,21 @@ class ObserverStatus(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class ControllerParams:
-  """The three provisional owner feel-dials plus the physical observer time scale."""
+  """Controller tolerances plus the physical observer time scale.
+
+  ``sigma_curvature`` and ``kinetic_friction`` are the b7 response-surface
+  axes selected for v203. A zero curvature tolerance remains available to
+  reproduce the pre-selection controller in replay; the kinetic default
+  preserves its full-breakaway feedforward.
+  """
 
   sigma_y: float
   sigma_heading: float
   sigma_torque_rate: float
   tau_disturbance: float
   provisional: bool
+  sigma_curvature: float = 0.0
+  kinetic_friction: float = 0.09
 
   @classmethod
   def from_seed_file(cls, path: str | Path) -> ControllerParams:
@@ -67,6 +75,8 @@ class ControllerParams:
       sigma_torque_rate=float(seed["sigma_torque_rate"]["value"]),
       tau_disturbance=float(seed["tau_disturbance"]["value"]),
       provisional=bool(seed["provisional"]),
+      sigma_curvature=float(seed.get("sigma_curvature", {}).get("value", 0.0)),
+      kinetic_friction=float(seed.get("kinetic_friction", {}).get("value", 0.09)),
     )
     params.validate()
     return params
@@ -75,6 +85,10 @@ class ControllerParams:
     values = (self.sigma_y, self.sigma_heading, self.sigma_torque_rate, self.tau_disturbance)
     if not all(math.isfinite(value) and value > 0.0 for value in values):
       raise ValueError("controller scales must be finite and positive")
+    if not math.isfinite(self.sigma_curvature) or self.sigma_curvature < 0.0:
+      raise ValueError("sigma_curvature must be finite and non-negative")
+    if not math.isfinite(self.kinetic_friction) or self.kinetic_friction < 0.0:
+      raise ValueError("kinetic_friction must be finite and non-negative")
 
 
 @dataclass(slots=True)

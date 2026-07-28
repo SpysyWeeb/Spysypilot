@@ -41,7 +41,7 @@ def test_shadow_runs_below_controlsd_without_competing_on_one_core():
 
 def test_shadow_v8_schema_has_live_lqi_and_exact_v14_fields():
   assert SHADOW_VERSION == 8
-  assert LIVE_CONTROLLER_VERSION == 202
+  assert LIVE_CONTROLLER_VERSION == 203
   schema = Path("openpilot/cereal/log.capnp").read_text()
   shadow_source = Path(
     "openpilot/selfdrive/controls/blatv2_shadowd.py",
