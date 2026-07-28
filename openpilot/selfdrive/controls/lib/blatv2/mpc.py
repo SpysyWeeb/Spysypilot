@@ -12,10 +12,11 @@ platform-selected factorization, or unordered collection participates.
 Solving and rolling out every plausible sign-crossing placement made runtime
 scale linearly on 6.84% of an ordinary field route (nine schedules cost 59 ms
 median). Runtime is therefore hard-bounded to one active-set solve per frame.
-The selected schedule is the lowest-index schedule whose sign sequence is
-closest to the previous converged solution; bootstrap and lifecycle resets use
-the base schedule. This deterministic warm start preserves exact limiter
-semantics for the selected schedule without making wall time data-dependent.
+The selected schedule reuses the previous frame's winning schedule index when
+that early/late crossing ordinal still exists; bootstrap, lifecycle resets, and
+an out-of-range prior index use the base schedule. This O(1) warm start
+preserves exact limiter semantics for the selected schedule without making wall
+time data-dependent.
 Telemetry reports both the one evaluated candidate and the number of schedules
 that were available before the bound.
 
@@ -82,13 +83,11 @@ class ModelFollowingTorqueMPC:
     self._solve_residual = 0.0
     self.winning_schedule_index = -1
     self.has_warm_start = False
-    self.warm_start_count = 0
 
   def reset(self) -> None:
     self.result.invalidate()
     self.winning_schedule_index = -1
     self.has_warm_start = False
-    self.warm_start_count = 0
 
   @staticmethod
   def _sign(value: float) -> int:
@@ -147,43 +146,14 @@ class ModelFollowingTorqueMPC:
     self.diagonal[0] += rate_weight
     self.rhs[0] += rate_weight * float(previous_torque)
 
-  def _select_warm_schedule(self, schedule_count: int, count: int) -> int:
-    """Choose one schedule by distance to the prior converged solution.
-
-    Zero-valued prior decisions carry no directional information and do not
-    contribute to the distance. Strict comparison pins equal-distance
-    selection to the lowest schedule index.
-    """
-    if not self.has_warm_start or schedule_count <= 1:
-      return 0
-
-    base = self.schedules[0]
-    base_distance = 0
-    comparable_count = min(count, self.warm_start_count)
-    for index in range(comparable_count):
-      previous_sign = self._sign(float(self.best_solution[index]))
-      if previous_sign != 0 and int(base[index]) != previous_sign:
-        base_distance += 1
-
-    best_index = 0
-    best_distance = base_distance
-    for schedule_index in range(1, schedule_count):
-      changed_index = int(self.schedule_change_indices[schedule_index])
-      previous_sign = (
-        self._sign(float(self.best_solution[changed_index]))
-        if changed_index < comparable_count
-        else 0
-      )
-      distance = base_distance
-      if previous_sign != 0:
-        if int(base[changed_index]) != previous_sign:
-          distance -= 1
-        if int(self.schedule_change_signs[schedule_index]) != previous_sign:
-          distance += 1
-      if distance < best_distance:
-        best_distance = distance
-        best_index = schedule_index
-    return best_index
+  def _select_warm_schedule(self, schedule_count: int) -> int:
+    """Reuse the prior winning ordinal in O(1), or bootstrap from base."""
+    if (
+      self.has_warm_start
+      and 0 <= self.winning_schedule_index < schedule_count
+    ):
+      return self.winning_schedule_index
+    return 0
 
   def _materialize_schedule(
     self,
@@ -362,7 +332,7 @@ class ModelFollowingTorqueMPC:
       return result
 
     selected_schedule = self._select_warm_schedule(
-      schedule_count, count,
+      schedule_count,
     )
     self._materialize_schedule(selected_schedule, count)
     self.winning_schedule_index = -1
@@ -372,7 +342,6 @@ class ModelFollowingTorqueMPC:
       result.candidate_count = 1
       result.available_schedule_count = schedule_count
       self.has_warm_start = False
-      self.warm_start_count = 0
       return result
 
     best_residual = self._solve_residual
@@ -380,7 +349,6 @@ class ModelFollowingTorqueMPC:
     for index in range(count):
       self.best_solution[index] = self.solution[index]
     self.has_warm_start = True
-    self.warm_start_count = count
 
     result.command_torque = self.twin.apply_slew(state.applied_torque, float(self.best_solution[0]))
     result.status = CandidateStatus.OK

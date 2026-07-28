@@ -26,11 +26,14 @@ ground-up design and does not inherit that controller.
 - an onroad `blatv2_shadowd` process that publishes diagnostics only;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 5. It reports reference and
+The shadow event is `blatV2Shadow`, version 6. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 5 prepares the identical candidate workspace once in shared setup and
+Version 6 makes MPC warm selection literal O(1): it reuses the previous
+winning schedule ordinal when that ordinal still exists and otherwise selects
+base schedule zero. Version 5 prepares the identical candidate workspace once
+in shared setup and
 lets both candidates consume it read-only. It also hard-bounds MPC to one
 active-set solve per frame: `mpcCandidateCount` is the evaluated count and
 `mpcAvailableScheduleCount` reports how many base/early/late schedules existed
@@ -114,6 +117,14 @@ authority, while unrelated ordinary onroad work no longer interrupts whichever
 candidate phase happens to be running. The standard real-time setup also
 disables cyclic GC before the hot loop. No custom priority or affinity constant
 was added.
+
+Route `000000b4--ef6ec45105` showed that version 5's solve bound was not enough:
+MPC time still rose monotonically from 0.73 ms with one available schedule to
+38 ms with 23, while shared and fallback time did not correlate with schedule
+population. Version 6 removes the remaining schedule-population scan entirely.
+CPU 4 affinity remains unchanged for this experiment so the next route can
+separate selector cost from the independently observed controlsState throughput
+loss; affinity is reconsidered only after the O(1) selector is measured.
 
 All result fields except the four compute-time fields are deterministic replay
 fields and must match the route-audit harness at the Float64/typed-integer bit
