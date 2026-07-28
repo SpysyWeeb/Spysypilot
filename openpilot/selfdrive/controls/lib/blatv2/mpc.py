@@ -318,6 +318,7 @@ class ModelFollowingTorqueMPC:
           reference_count,
           horizon_seconds,
           disturbance_torque,
+          self.params.kinetic_friction,
         )
       count = self.workspace.decision_count
       schedule_count = self._build_schedules(count)
