@@ -18,6 +18,36 @@ MAX_DECISION_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DECISION_DT)) + 2
 MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
 
 
+def decision_cell_coulomb_direction(
+  left_rate: float,
+  right_rate: float,
+  departure_direction: float,
+) -> float:
+  """Return the exact mean Coulomb direction over one linear-rate cell.
+
+  Away from a zero crossing this is exactly ``±1``. Across a crossing it is
+  the positive-motion fraction minus the negative-motion fraction, so the
+  inverse feedforward passes continuously through zero instead of commanding
+  an instantaneous ``+t_breakaway`` to ``-t_breakaway`` flip. When the rack is
+  stationary for the whole cell, the requested departure direction retains
+  full breakaway authority; a zero departure remains in stiction.
+
+  The transition width is the existing decision cell, not a new tuning
+  constant or filter state.
+  """
+  left = float(left_rate)
+  right = float(right_rate)
+  departure = float(departure_direction)
+  if not all(math.isfinite(value) for value in (left, right, departure)):
+    raise ValueError("Coulomb direction inputs must be finite")
+  magnitude = abs(left) + abs(right)
+  if magnitude == 0.0:
+    if departure == 0.0:
+      return 0.0
+    return math.copysign(1.0, departure)
+  return (left + right) / magnitude
+
+
 class CandidateWorkspace:
   """Fixed buffers for the shared scalar-pinned reference and inverse EPS map."""
 
@@ -26,6 +56,7 @@ class CandidateWorkspace:
     self.reference_curvatures = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.desired_angles = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.desired_rates = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.friction_directions = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.feedforward = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.decision_count = 0
 
@@ -42,8 +73,10 @@ class CandidateWorkspace:
   ) -> None:
     """Build the 50 ms decision grid and conservative inverse-EPS feedforward.
 
-    Friction is never credited as helpful. The full provisional
-    ``t_breakaway`` is added in the intended motion direction, while the
+    Friction is never credited as helpful. Full ``t_breakaway`` is added while
+    moving and when departing stiction. A decision cell containing a rack-rate
+    zero crossing uses the exact cell-average Coulomb direction, preventing a
+    non-physical hard sign flip while preserving the same friction bound. The
     independent disturbance estimate may consume another ``t_breakaway``.
     This explicitly tolerates two breakaway-equivalent loads until casual-drive
     event identification can tighten the physical bound.
@@ -101,12 +134,24 @@ class CandidateWorkspace:
         acceleration = (self.desired_rates[index + 1] - self.desired_rates[index - 1]) / (2.0 * DECISION_DT)
 
       rate = self.desired_rates[index]
-      direction = rate
-      if direction == 0.0:
-        direction = acceleration
-      if direction == 0.0:
-        direction = self.desired_angles[index] - state.angle_deg
-      friction = 0.0 if direction == 0.0 else math.copysign(twin.params.t_breakaway, direction)
+      left_rate = (
+        rate
+        if index == 0
+        else 0.5 * (self.desired_rates[index - 1] + rate)
+      )
+      right_rate = (
+        rate
+        if index == decision_count - 1
+        else 0.5 * (rate + self.desired_rates[index + 1])
+      )
+      departure = acceleration
+      if departure == 0.0:
+        departure = self.desired_angles[index] - state.angle_deg
+      direction = decision_cell_coulomb_direction(
+        left_rate, right_rate, departure
+      )
+      self.friction_directions[index] = direction
+      friction = twin.params.t_breakaway * direction
       aligning = twin.aligning_torque_values(self.desired_angles[index], state.v_ego, align_inputs)
       dynamic = (acceleration + twin.params.b_steer * rate) / twin.params.k_t
       demand = aligning + dynamic + friction + float(disturbance_torque)
