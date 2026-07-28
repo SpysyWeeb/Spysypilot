@@ -18,27 +18,25 @@ MAX_DECISION_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DECISION_DT)) + 2
 MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
 
 
-def linear_rate_coulomb_direction(
-  measured_rate: float,
-  desired_rate: float,
+def decision_cell_coulomb_direction(
+  left_rate: float,
+  right_rate: float,
   departure_direction: float,
 ) -> float:
-  """Return mean Coulomb direction from measured to desired rack rate.
+  """Return the exact mean Coulomb direction over one linear-rate cell.
 
-  The predicted rate transition is linear from the measured physical rack
-  state to the desired rate at each horizon point. Away from a zero crossing
-  this is exactly ``±1``. Across a crossing it is the positive-motion fraction
-  minus the negative-motion fraction, so replan derivative noise cannot
-  command an instantaneous ``+t_breakaway`` to ``-t_breakaway`` flip while the
-  rack is still moving in its old direction. When both endpoints are
-  stationary, the requested departure direction retains full breakaway
-  authority; a zero departure remains in stiction.
+  Away from a zero crossing this is exactly ``±1``. Across a crossing it is
+  the positive-motion fraction minus the negative-motion fraction, so the
+  inverse feedforward passes continuously through zero instead of commanding
+  an instantaneous ``+t_breakaway`` to ``-t_breakaway`` flip. When the rack is
+  stationary for the whole cell, the requested departure direction retains
+  full breakaway authority; a zero departure remains in stiction.
 
-  This is the exact integral of ``sign(rate)`` over the linear transition, not
-  a tuned smoothing band, filter, threshold, or retained state.
+  The transition width is the existing decision cell, not a new tuning
+  constant or filter state.
   """
-  left = float(measured_rate)
-  right = float(desired_rate)
+  left = float(left_rate)
+  right = float(right_rate)
   departure = float(departure_direction)
   if not all(math.isfinite(value) for value in (left, right, departure)):
     raise ValueError("Coulomb direction inputs must be finite")
@@ -76,12 +74,10 @@ class CandidateWorkspace:
     """Build the 50 ms decision grid and conservative inverse-EPS feedforward.
 
     Friction is never credited as helpful. Full ``t_breakaway`` is added while
-    measured and desired rack motion agree and when departing stiction. A
-    measured-to-desired transition containing a rack-rate zero crossing uses
-    the exact transition-average Coulomb direction, preventing replan noise
-    from flipping the load ahead of the physical rack while preserving the
-    same friction bound. The independent disturbance estimate may consume
-    another ``t_breakaway``.
+    moving and when departing stiction. A decision cell containing a rack-rate
+    zero crossing uses the exact cell-average Coulomb direction, preventing a
+    non-physical hard sign flip while preserving the same friction bound. The
+    independent disturbance estimate may consume another ``t_breakaway``.
     This explicitly tolerates two breakaway-equivalent loads until casual-drive
     event identification can tighten the physical bound.
     """
@@ -138,11 +134,21 @@ class CandidateWorkspace:
         acceleration = (self.desired_rates[index + 1] - self.desired_rates[index - 1]) / (2.0 * DECISION_DT)
 
       rate = self.desired_rates[index]
+      left_rate = (
+        rate
+        if index == 0
+        else 0.5 * (self.desired_rates[index - 1] + rate)
+      )
+      right_rate = (
+        rate
+        if index == decision_count - 1
+        else 0.5 * (rate + self.desired_rates[index + 1])
+      )
       departure = acceleration
       if departure == 0.0:
         departure = self.desired_angles[index] - state.angle_deg
-      direction = linear_rate_coulomb_direction(
-        state.rate_deg_s, rate, departure
+      direction = decision_cell_coulomb_direction(
+        left_rate, right_rate, departure
       )
       self.friction_directions[index] = direction
       friction = twin.params.t_breakaway * direction

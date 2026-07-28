@@ -6,7 +6,7 @@ import numpy as np
 
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
-  linear_rate_coulomb_direction,
+  decision_cell_coulomb_direction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   DECISION_DT,
@@ -138,11 +138,11 @@ def test_monotonic_workspace_interpolation_is_bit_exact_to_scalar_contract():
 
 def test_coulomb_feedforward_crosses_zero_without_hard_sign_flip():
   directions = (
-    linear_rate_coulomb_direction(2.0, 1.0, 0.0),
-    linear_rate_coulomb_direction(2.0, -2.0, 0.0),
-    linear_rate_coulomb_direction(2.0, -6.0, 0.0),
+    decision_cell_coulomb_direction(2.0, 1.0, 0.0),
+    decision_cell_coulomb_direction(1.0, -1.0, 0.0),
+    decision_cell_coulomb_direction(-1.0, -2.0, 0.0),
   )
-  assert directions == (1.0, 0.0, -0.5)
+  assert directions == (1.0, 0.0, -1.0)
   assert max(
     abs(right - left)
     for left, right in zip(directions, directions[1:], strict=False)
@@ -150,9 +150,9 @@ def test_coulomb_feedforward_crosses_zero_without_hard_sign_flip():
 
 
 def test_coulomb_feedforward_retains_full_breakaway_from_stiction():
-  assert linear_rate_coulomb_direction(0.0, 0.0, 2.0) == 1.0
-  assert linear_rate_coulomb_direction(0.0, 0.0, -2.0) == -1.0
-  assert linear_rate_coulomb_direction(0.0, 0.0, 0.0) == 0.0
+  assert decision_cell_coulomb_direction(0.0, 0.0, 2.0) == 1.0
+  assert decision_cell_coulomb_direction(0.0, 0.0, -2.0) == -1.0
+  assert decision_cell_coulomb_direction(0.0, 0.0, 0.0) == 0.0
 
 
 def test_coulomb_feedforward_rejects_non_finite_inputs():
@@ -162,7 +162,7 @@ def test_coulomb_feedforward_rejects_non_finite_inputs():
     (0.0, 0.0, -math.inf),
   ):
     with np.testing.assert_raises(ValueError):
-      linear_rate_coulomb_direction(*values)
+      decision_cell_coulomb_direction(*values)
 
 
 def test_mpc_solves_only_one_warm_selected_schedule():
