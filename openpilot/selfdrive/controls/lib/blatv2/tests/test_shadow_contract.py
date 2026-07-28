@@ -17,7 +17,9 @@ def test_shadow_subscriptions_are_pinned():
     "carOutput",
     "controlsState",
     "liveParameters",
+    "liveTorqueParameters",
     "liveDelay",
+    "lateralManeuverPlan",
   )
 
 
@@ -35,23 +37,20 @@ def test_shadow_runs_below_controlsd_on_the_same_realtime_core():
   assert "config_realtime_process(4, Priority.CTRL_HIGH)" not in source
 
 
-def test_shadow_v6_schema_has_bounded_mpc_and_split_timing_fields():
-  assert SHADOW_VERSION == 6
+def test_shadow_v7_schema_has_live_lqi_and_exact_v14_fields():
+  assert SHADOW_VERSION == 7
   schema = Path("openpilot/cereal/log.capnp").read_text()
   assert "vEgo @9 :Float64;" in schema
   assert "aligningTorque @10 :Float64;" in schema
   assert "alignInputsValid @11 :Bool;" in schema
   assert "disturbanceEstimate @12 :Float64;" in schema
   assert "observerStatus @13 :UInt8;" in schema
-  assert "mpcCommandTorque @15 :Float64;" in schema
-  assert "mpcStatus @16 :UInt8;" in schema
-  assert "mpcCandidateCount @17 :UInt16;" in schema
-  assert "mpcOptimalityResidual @18 :Float64;" in schema
-  assert "mpcComputeTimeSeconds @19 :Float64;" in schema
-  assert "fallbackCommandTorque @20 :Float64;" in schema
-  assert "fallbackStatus @21 :UInt8;" in schema
-  assert "fallbackCandidateCount @22 :UInt16;" in schema
-  assert "fallbackOptimalityResidual @23 :Float64;" in schema
-  assert "fallbackComputeTimeSeconds @24 :Float64;" in schema
   assert "sharedComputeTimeSeconds @25 :Float64;" in schema
-  assert "mpcAvailableScheduleCount @26 :UInt16;" in schema
+  assert "liveLqiCommandTorque @27 :Float64;" in schema
+  assert "liveLqiStatus @28 :UInt8;" in schema
+  assert "liveLqiComputeTimeSeconds @29 :Float64;" in schema
+  assert "v14CommandTorque @33 :Float64;" in schema
+  assert "v14ControllerVersion @35 :Int32;" in schema
+  assert "liveLqiControllerVersion @38 :Int32;" in schema
+  assert "mpcCommandTorque" not in schema
+  assert "fallbackCommandTorque" not in schema

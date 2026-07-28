@@ -8,6 +8,7 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore
 from openpilot.selfdrive.controls.blatv2_shadowd import populate_shadow_message
+from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import V14ShadowResult
 
 
 def namespace(**kwargs):
@@ -145,23 +146,25 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     message_valid=True,
     compute_seconds=0.001,
     shared_compute_seconds=0.0001,
-    mpc_compute_seconds=0.0008,
-    fallback_compute_seconds=0.0002,
+    live_lqi_command_torque=-0.08,
+    live_lqi_status=0,
+    live_lqi_compute_seconds=0.0008,
+    live_lqi_output_valid=True,
+    live_lqi_invalid_frames=0,
+    live_lqi_recovery_ok_frames=10,
+    live_lqi_controller_version=200,
+    v14_result=V14ShadowResult(-0.07, 0.01, True, 14),
+    v14_compute_seconds=0.0002,
   )
   serialized = message.to_bytes()
 
   assert serialized
   assert message.blatV2Shadow.sharedComputeTimeSeconds == 0.0001
-  assert (
-    message.blatV2Shadow.mpcAvailableScheduleCount
-    == result.mpc_available_schedule_count
-  )
-  assert message.blatV2Shadow.mpcOptimalityResidual == float(
-    result.mpc_optimality_residual
-  )
-  assert message.blatV2Shadow.fallbackOptimalityResidual == float(
-    result.fallback_optimality_residual
-  )
+  assert message.blatV2Shadow.liveLqiCommandTorque == -0.08
+  assert message.blatV2Shadow.liveLqiComputeTimeSeconds == 0.0008
+  assert message.blatV2Shadow.liveLqiControllerVersion == 200
+  assert message.blatV2Shadow.v14CommandTorque == -0.07
+  assert message.blatV2Shadow.v14ControllerVersion == 14
 
 
 def test_shared_core_has_no_unbounded_allocation_growth():

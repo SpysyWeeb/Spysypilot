@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telemetry-only BLaTv2 plant/reference shadow.
+"""Telemetry-only BLaTv2 plant/reference and frozen-v14 shadow.
 
 This process owns no actuator publisher. Its sole output is ``blatV2Shadow``.
 """
@@ -12,14 +12,18 @@ import time
 from typing import Any
 
 import openpilot.cereal.messaging as messaging
-from opendbc.car.hyundai.values import CarControllerParams
+from opendbc.car.car_helpers import interfaces
 from opendbc.car.structs import car
 from openpilot.common.realtime import config_realtime_process, Priority
 from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore, ShadowResult
+from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
+  FrozenV14ShadowController,
+  V14ShadowResult,
+)
 
-SHADOW_VERSION = 6
+SHADOW_VERSION = 7
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -28,7 +32,9 @@ SUBSCRIBED_SERVICES = (
   "carOutput",
   "controlsState",
   "liveParameters",
+  "liveTorqueParameters",
   "liveDelay",
+  "lateralManeuverPlan",
 )
 SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "plant_seed_params.json"
 CONTROLLER_SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "controller_seed_params.json"
@@ -43,8 +49,15 @@ def populate_shadow_message(
   message_valid: bool,
   compute_seconds: float,
   shared_compute_seconds: float,
-  mpc_compute_seconds: float,
-  fallback_compute_seconds: float,
+  live_lqi_command_torque: float,
+  live_lqi_status: int,
+  live_lqi_compute_seconds: float,
+  live_lqi_output_valid: bool,
+  live_lqi_invalid_frames: int,
+  live_lqi_recovery_ok_frames: int,
+  live_lqi_controller_version: int,
+  v14_result: V14ShadowResult,
+  v14_compute_seconds: float,
 ) -> None:
   """Normalize the numerical core at the Cap'n Proto type boundary.
 
@@ -72,21 +85,18 @@ def populate_shadow_message(
   shadow.observerUnconstrainedUpdate = float(
     result.observer_unconstrained_update
   )
-  shadow.mpcCommandTorque = float(result.mpc_command_torque)
-  shadow.mpcStatus = int(result.mpc_status)
-  shadow.mpcCandidateCount = int(result.mpc_candidate_count)
-  shadow.mpcAvailableScheduleCount = int(
-    result.mpc_available_schedule_count
-  )
-  shadow.mpcOptimalityResidual = float(result.mpc_optimality_residual)
-  shadow.mpcComputeTimeSeconds = float(mpc_compute_seconds)
-  shadow.fallbackCommandTorque = float(result.fallback_command_torque)
-  shadow.fallbackStatus = int(result.fallback_status)
-  shadow.fallbackCandidateCount = int(result.fallback_candidate_count)
-  shadow.fallbackOptimalityResidual = float(
-    result.fallback_optimality_residual
-  )
-  shadow.fallbackComputeTimeSeconds = float(fallback_compute_seconds)
+  shadow.liveLqiCommandTorque = float(live_lqi_command_torque)
+  shadow.liveLqiStatus = int(live_lqi_status)
+  shadow.liveLqiComputeTimeSeconds = float(live_lqi_compute_seconds)
+  shadow.liveLqiOutputValid = bool(live_lqi_output_valid)
+  shadow.liveLqiInvalidFrames = int(live_lqi_invalid_frames)
+  shadow.liveLqiRecoveryOkFrames = int(live_lqi_recovery_ok_frames)
+  shadow.liveLqiControllerVersion = int(live_lqi_controller_version)
+  shadow.v14CommandTorque = float(v14_result.command_torque)
+  shadow.v14DesiredCurvature = float(v14_result.desired_curvature)
+  shadow.v14ControllerVersion = int(v14_result.controller_version)
+  shadow.v14Valid = bool(v14_result.valid)
+  shadow.v14ComputeTimeSeconds = float(v14_compute_seconds)
 
 
 class BlatV2Shadow:
@@ -100,10 +110,14 @@ class BlatV2Shadow:
     params = Params()
     cp_bytes = params.get("CarParams", block=True)
     self.CP = messaging.log_from_bytes(cp_bytes, car.CarParams)
-    self.seed_params = PlantParams.from_seed_file(SEED_PATH, CarControllerParams(self.CP))
+    self.CI = interfaces[self.CP.carFingerprint](self.CP)
+    self.seed_params = PlantParams.from_seed_file(
+      SEED_PATH, self.CI.CC.params,
+    )
     self.controller_params = ControllerParams.from_seed_file(CONTROLLER_SEED_PATH)
     self.torque_params = self.CP.lateralTuning.torque
     self.core = ShadowCore(self.seed_params, self.torque_params, self.CP, self.controller_params)
+    self.v14 = FrozenV14ShadowController(self.CP, self.CI)
 
     self.subscribed_services = list(SUBSCRIBED_SERVICES)
     self.sm = messaging.SubMaster(self.subscribed_services, poll="controlsState")
@@ -131,8 +145,7 @@ class BlatV2Shadow:
 
     started_ns = time.perf_counter_ns()
     shared_compute_seconds = 0.0
-    mpc_compute_seconds = 0.0
-    fallback_compute_seconds = 0.0
+    v14_compute_seconds = 0.0
     phase = "shared"
     phase_started_ns = time.perf_counter_ns()
     try:
@@ -142,21 +155,6 @@ class BlatV2Shadow:
         phase_finished_ns - phase_started_ns
       ) * 1e-9
 
-      phase = "mpc"
-      phase_started_ns = phase_finished_ns
-      self.core.compute_mpc()
-      phase_finished_ns = time.perf_counter_ns()
-      mpc_compute_seconds = (
-        phase_finished_ns - phase_started_ns
-      ) * 1e-9
-
-      phase = "fallback"
-      phase_started_ns = phase_finished_ns
-      self.core.compute_fallback()
-      phase_finished_ns = time.perf_counter_ns()
-      fallback_compute_seconds = (
-        phase_finished_ns - phase_started_ns
-      ) * 1e-9
       phase = "finalize"
       result = self.core.end_frame()
     except (RuntimeError, ValueError, OverflowError):
@@ -165,21 +163,75 @@ class BlatV2Shadow:
       ) * 1e-9
       if phase == "shared":
         shared_compute_seconds = failed_phase_seconds
-      elif phase == "mpc":
-        mpc_compute_seconds = failed_phase_seconds
-      elif phase == "fallback":
-        fallback_compute_seconds = failed_phase_seconds
       result = self.core.invalid_result()
+
+    controls_state = self.sm["controlsState"]
+    torque_state_valid = (
+      controls_state.lateralControlState.which() == "torqueState"
+    )
+    torque_state = controls_state.lateralControlState.torqueState
+    live_lateral_active = bool(
+      torque_state.active if torque_state_valid else False
+    )
+
+    v14_started_ns = time.perf_counter_ns()
+    try:
+      v14_result = self.v14.step(
+        self.sm["modelV2"],
+        self.sm.valid["modelV2"],
+        self.sm.updated["modelV2"],
+        self.sm["carState"],
+        self.sm["carOutput"],
+        live_lateral_active,
+        self.sm["liveParameters"],
+        self.sm["liveTorqueParameters"],
+        self.sm.all_checks(["liveTorqueParameters"]),
+        float(self.sm["liveDelay"].lateralDelay),
+        self.sm["lateralManeuverPlan"],
+        self.sm.valid["lateralManeuverPlan"],
+      )
+    except (RuntimeError, ValueError, OverflowError):
+      self.v14.reset()
+      v14_result = self.v14.result
+    v14_compute_seconds = (time.perf_counter_ns() - v14_started_ns) * 1e-9
+
+    live_lqi_command = (
+      float(torque_state.blatV2CommandTorque)
+      if torque_state_valid else 0.0
+    )
+    live_lqi_status = (
+      int(torque_state.blatV2Status)
+      if torque_state_valid else 1
+    )
+    live_lqi_compute_seconds = (
+      float(torque_state.blatV2ComputeTimeSeconds)
+      if torque_state_valid else 0.0
+    )
+    live_lqi_output_valid = (
+      bool(torque_state.blatV2OutputValid)
+      if torque_state_valid else False
+    )
+    live_lqi_invalid_frames = (
+      int(torque_state.blatV2InvalidFrames)
+      if torque_state_valid else 0
+    )
+    live_lqi_recovery_ok_frames = (
+      int(torque_state.blatV2RecoveryOkFrames)
+      if torque_state_valid else 0
+    )
+    live_lqi_controller_version = (
+      int(torque_state.version) if torque_state_valid else 0
+    )
     compute_seconds = (time.perf_counter_ns() - started_ns) * 1e-9
     assert (
       math.isfinite(compute_seconds)
       and math.isfinite(shared_compute_seconds)
-      and math.isfinite(mpc_compute_seconds)
-      and math.isfinite(fallback_compute_seconds)
+      and math.isfinite(live_lqi_compute_seconds)
+      and math.isfinite(v14_compute_seconds)
       and compute_seconds >= 0.0
       and shared_compute_seconds >= 0.0
-      and mpc_compute_seconds >= 0.0
-      and fallback_compute_seconds >= 0.0
+      and live_lqi_compute_seconds >= 0.0
+      and v14_compute_seconds >= 0.0
     )
 
     populate_shadow_message(
@@ -192,8 +244,15 @@ class BlatV2Shadow:
       ),
       compute_seconds=compute_seconds,
       shared_compute_seconds=shared_compute_seconds,
-      mpc_compute_seconds=mpc_compute_seconds,
-      fallback_compute_seconds=fallback_compute_seconds,
+      live_lqi_command_torque=live_lqi_command,
+      live_lqi_status=live_lqi_status,
+      live_lqi_compute_seconds=live_lqi_compute_seconds,
+      live_lqi_output_valid=live_lqi_output_valid,
+      live_lqi_invalid_frames=live_lqi_invalid_frames,
+      live_lqi_recovery_ok_frames=live_lqi_recovery_ok_frames,
+      live_lqi_controller_version=live_lqi_controller_version,
+      v14_result=v14_result,
+      v14_compute_seconds=v14_compute_seconds,
     )
     self.pm.send("blatV2Shadow", self.message)
 
