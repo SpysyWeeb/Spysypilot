@@ -18,7 +18,7 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore, ShadowResult
 
-SHADOW_VERSION = 4
+SHADOW_VERSION = 5
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -74,6 +74,9 @@ def populate_shadow_message(
   shadow.mpcCommandTorque = float(result.mpc_command_torque)
   shadow.mpcStatus = int(result.mpc_status)
   shadow.mpcCandidateCount = int(result.mpc_candidate_count)
+  shadow.mpcAvailableScheduleCount = int(
+    result.mpc_available_schedule_count
+  )
   shadow.mpcOptimalityResidual = float(result.mpc_optimality_residual)
   shadow.mpcComputeTimeSeconds = float(mpc_compute_seconds)
   shadow.fallbackCommandTorque = float(result.fallback_command_torque)

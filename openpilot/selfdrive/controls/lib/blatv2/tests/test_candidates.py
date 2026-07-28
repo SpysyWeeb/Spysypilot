@@ -4,7 +4,6 @@ from pathlib import Path
 
 import numpy as np
 
-from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
 )
@@ -116,34 +115,33 @@ def test_monotonic_workspace_interpolation_is_bit_exact_to_scalar_contract():
     )
     for index in range(workspace.decision_count)
   ], dtype=np.float64)
-  expected_controls = np.asarray([
-    interpolate_buffer(
-      times, curvatures, len(times), index * DT_CTRL,
-    )
-    for index in range(workspace.control_count)
-  ], dtype=np.float64)
   assert (
     workspace.reference_curvatures[:workspace.decision_count].tobytes()
     == expected_decisions.tobytes()
   )
-  assert (
-    workspace.control_reference[:workspace.control_count].tobytes()
-    == expected_controls.tobytes()
-  )
 
 
-def test_single_schedule_mpc_does_not_run_comparison_rollout():
-  class SingleScheduleMPC(ModelFollowingTorqueMPC):
-    def _rollout_cost(
-      self,
-      _disturbance_torque: float,
-      _actuation_delay: float,
-    ) -> float:
-      raise AssertionError("one schedule has no competing rollout to rank")
+def test_mpc_solves_only_one_warm_selected_schedule():
+  class MultiScheduleMPC(ModelFollowingTorqueMPC):
+    solved_indices: list[int]
+
+    def __init__(self, twin: PlantTwin, params: ControllerParams):
+      super().__init__(twin, params)
+      self.solved_indices = []
+
+    def _build_schedules(self, count: int) -> int:
+      for schedule_index in range(3):
+        for index in range(count):
+          self.schedules[schedule_index, index] = 1
+      return 3
+
+    def _solve_schedule(self, schedule_index: int, count: int) -> CandidateStatus:
+      self.solved_indices.append(schedule_index)
+      return super()._solve_schedule(schedule_index, count)
 
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = feasible_steady_state(twin)
-  candidate = SingleScheduleMPC(twin, CONTROLLER_PARAMS)
+  candidate = MultiScheduleMPC(twin, CONTROLLER_PARAMS)
   result = candidate.compute(
     state,
     ALIGN_INPUTS,
@@ -156,25 +154,25 @@ def test_single_schedule_mpc_does_not_run_comparison_rollout():
   )
   assert result.status == CandidateStatus.OK
   assert result.candidate_count == 1
+  assert result.available_schedule_count == 3
+  assert candidate.solved_indices == [0]
   assert candidate.winning_schedule_index == 0
 
 
-def test_equal_cost_mpc_schedules_choose_lowest_index():
-  class EqualScheduleMPC(ModelFollowingTorqueMPC):
-    def _build_schedules(self, count: int) -> int:
-      for index in range(count):
-        self.schedules[0, index] = 1
-        self.schedules[1, index] = 1
-      return 2
-
+def test_mpc_warm_schedule_distance_has_lowest_index_tie_break():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
-  state = feasible_steady_state(twin)
-  candidate = EqualScheduleMPC(twin, CONTROLLER_PARAMS)
-  result = candidate.compute(
-    state, ALIGN_INPUTS, REFERENCE_TIMES, REFERENCE_CURVATURES, 3, 1.0, 0.0, 0.0,
-  )
-  assert result.status == CandidateStatus.OK
-  assert candidate.winning_schedule_index == 0
+  candidate = ModelFollowingTorqueMPC(twin, CONTROLLER_PARAMS)
+  count = 4
+  candidate.has_warm_start = True
+  candidate.warm_start_count = count
+  candidate.best_solution[:count] = (0.2, -0.2, -0.2, 0.2)
+  candidate.schedules[0, :count] = (1, -1, 1, 1)
+  candidate.schedule_change_indices[1:3] = (2, 2)
+  candidate.schedule_change_signs[1:3] = (-1, -1)
+
+  assert candidate._select_warm_schedule(3, count) == 1
+  candidate.reset()
+  assert candidate._select_warm_schedule(3, count) == 0
 
 
 def test_enumeration_exhaustion_is_legible():

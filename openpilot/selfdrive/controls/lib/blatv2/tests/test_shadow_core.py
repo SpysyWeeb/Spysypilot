@@ -60,6 +60,7 @@ def result_values(result):
     result.mpc_command_torque,
     result.mpc_status,
     result.mpc_candidate_count,
+    result.mpc_available_schedule_count,
     result.mpc_optimality_residual,
     result.fallback_command_torque,
     result.fallback_status,
@@ -151,6 +152,10 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
 
   assert serialized
   assert message.blatV2Shadow.sharedComputeTimeSeconds == 0.0001
+  assert (
+    message.blatV2Shadow.mpcAvailableScheduleCount
+    == result.mpc_available_schedule_count
+  )
   assert message.blatV2Shadow.mpcOptimalityResidual == float(
     result.mpc_optimality_residual
   )
@@ -173,6 +178,7 @@ def test_shared_core_has_no_unbounded_allocation_growth():
   fallback_identity = id(core.fallback)
   mpc_workspace_identity = id(core.mpc.workspace)
   fallback_workspace_identity = id(core.fallback.workspace)
+  shared_workspace_identity = id(core.candidate_workspace)
 
   tracemalloc.start()
   try:
@@ -194,8 +200,9 @@ def test_shared_core_has_no_unbounded_allocation_growth():
   assert id(core.observer) == observer_identity
   assert id(core.mpc) == mpc_identity
   assert id(core.fallback) == fallback_identity
-  assert id(core.mpc.workspace) == mpc_workspace_identity
-  assert id(core.fallback.workspace) == fallback_workspace_identity
+  assert id(core.candidate_workspace) == shared_workspace_identity
+  assert id(core.mpc.workspace) == mpc_workspace_identity == shared_workspace_identity
+  assert id(core.fallback.workspace) == fallback_workspace_identity == shared_workspace_identity
 
 
 def test_invalid_live_parameters_use_zero_inputs_without_stale_carryover():

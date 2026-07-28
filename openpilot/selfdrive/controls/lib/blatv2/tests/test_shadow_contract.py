@@ -27,8 +27,8 @@ def test_shadow_process_is_registered_onroad_without_toggle():
   assert registration in config
 
 
-def test_shadow_v4_schema_has_candidate_observer_and_split_timing_fields():
-  assert SHADOW_VERSION == 4
+def test_shadow_v5_schema_has_bounded_mpc_and_split_timing_fields():
+  assert SHADOW_VERSION == 5
   schema = Path("openpilot/cereal/log.capnp").read_text()
   assert "vEgo @9 :Float64;" in schema
   assert "aligningTorque @10 :Float64;" in schema
@@ -46,3 +46,4 @@ def test_shadow_v4_schema_has_candidate_observer_and_split_timing_fields():
   assert "fallbackOptimalityResidual @23 :Float64;" in schema
   assert "fallbackComputeTimeSeconds @24 :Float64;" in schema
   assert "sharedComputeTimeSeconds @25 :Float64;" in schema
+  assert "mpcAvailableScheduleCount @26 :UInt16;" in schema
