@@ -81,10 +81,12 @@ class CandidateResult:
   command_torque: float = 0.0
   status: CandidateStatus = CandidateStatus.INPUT_INVALID
   candidate_count: int = 0
+  available_schedule_count: int = 0
   optimality_residual: float = 0.0
 
   def invalidate(self, applied_torque: float = 0.0, status: CandidateStatus = CandidateStatus.INPUT_INVALID) -> None:
     self.command_torque = float(applied_torque)
     self.status = status
     self.candidate_count = 0
+    self.available_schedule_count = 0
     self.optimality_residual = 0.0

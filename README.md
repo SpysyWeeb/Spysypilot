@@ -26,17 +26,23 @@ ground-up design and does not inherit that controller.
 - an onroad `blatv2_shadowd` process that publishes diagnostics only;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 4. It reports reference and
+The shadow event is `blatV2Shadow`, version 5. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 4 splits runtime into shared `begin_frame` setup, MPC-only solve,
-fallback-only solve, and total dual-candidate frame time; candidate timing no
-longer includes shared setup. Version 3 added the shared disturbance estimate
+Version 5 prepares the identical candidate workspace once in shared setup and
+lets both candidates consume it read-only. It also hard-bounds MPC to one
+active-set solve per frame: `mpcCandidateCount` is the evaluated count and
+`mpcAvailableScheduleCount` reports how many base/early/late schedules existed
+before the bound. The selected schedule is the lowest-index sign sequence
+closest to the previous converged solution; lifecycle resets return to the base
+schedule. Version 4 split runtime into shared `begin_frame` setup, MPC-only
+solve, fallback-only solve, and total dual-candidate frame time. Starting in
+version 5, shared setup includes the once-per-frame candidate workspace;
+candidate timings exclude it. Version 3 added the shared disturbance estimate
 and, for each candidate, the commanded torque, status, candidate count,
 optimality residual, and isolated device runtime. Solver status distinguishes
 invalid input, infeasibility, non-convergence, and enumeration exhaustion.
-Equal-cost MPC schedules select the lowest schedule index deterministically.
 
 Candidate status values are `0=ok`, `1=input invalid`, `2=infeasible`,
 `3=non-converged`, and `4=enumeration exhausted`. Observer status values are
@@ -69,11 +75,33 @@ On-device stage profiling found the candidate floor in Python horizon loops,
 not LDLT or object construction. The candidate workspace now walks the
 monotonic reference once instead of binary-searching every sample. The fallback
 uses a scalar-unrolled, arithmetic-order-preserving 3×3 Riccati recursion. When
-MPC has one sign schedule, it skips the 100 Hz rollout cost because that cost
-only ranks competing schedules; the converged schedule is already the unique
-winner. Seven device-side cases covering workspace, fallback, and one-schedule
-MPC outputs remained bit-exact to the pre-optimization implementation. No
-tuning constant or candidate command changed.
+MPC has one sign schedule, version 4 skips the 100 Hz rollout cost because that
+cost only ranks competing schedules; the converged schedule is already the
+unique winner. Seven device-side cases covering workspace, fallback, and
+one-schedule MPC outputs remained bit-exact to the pre-optimization
+implementation. That version-4 optimization changed no tuning constant or
+candidate command; version 5's bounded multi-schedule selection is the
+subsequent, explicitly telemetered architecture change.
+
+Route `000000b2--be389808d5` showed that the remaining fallback tail was not a
+fallback branch: timing had negligible correlation with candidate count,
+speed, reference, torque demand, constraints, observer status, same-frame MPC
+time, or adjacent MPC load. A sustained device benchmark recorded zero Python
+garbage collections. Direct stage timing assigned about 80% of fallback CPU to
+the candidate workspace (2.14 ms median offroad) and about 20% to Riccati
+(0.52 ms). Version 5 therefore removes the duplicate workspace construction
+and deletes the 100 Hz comparison-reference grid that became unused once MPC
+comparison rollouts were bounded. The next ordinary drive remains the
+authority for the 2 ms/5 ms runtime gates.
+
+The same route found multiple schedules on 6.84% of frames, with nine
+schedules costing 59 ms median and 17 costing 117 ms. Version 5 never makes
+solve count depend on that population. Available schedules are represented as
+one changed sign relative to base; warm selection is O(horizon + crossings),
+and only the selected schedule is materialized and solved. A deliberately
+harsh 23-schedule device benchmark reduced MPC solve median from 3.88 ms with a
+schedule-wide warm scan to 1.46 ms with the compact representation. This is a
+runtime architecture bound, not a feel dial or tuning constant.
 
 All result fields except the four compute-time fields are deterministic replay
 fields and must match the route-audit harness at the Float64/typed-integer bit
