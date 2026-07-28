@@ -367,6 +367,39 @@ class PlantTwin:
     next_angle = angle + next_rate * dt
     return next_angle, next_rate
 
+  def advance_applied(
+    self,
+    state: PlantState,
+    applied_torque: float,
+    dt: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float = 0.0,
+  ) -> PlantState:
+    """Advance one already-applied sample for delivered-path reconstruction.
+
+    The caller owns actuator slew and pure-delay history. This method therefore
+    applies neither a second limiter nor a second delay; it is the public,
+    allocation-minimal counterpart of the one-step residual dynamics used by
+    the promotion harness.
+    """
+    if not math.isfinite(dt) or dt <= 0.0:
+      raise ValueError("dt must be finite and positive")
+    angle, rate = self._advance(
+      float(state.angle_deg),
+      float(state.rate_deg_s),
+      float(applied_torque),
+      float(state.v_ego),
+      align_inputs,
+      float(dt),
+      float(disturbance_torque),
+    )
+    return PlantState(
+      angle_deg=angle,
+      rate_deg_s=rate,
+      applied_torque=float(applied_torque),
+      v_ego=float(state.v_ego),
+    )
+
   def predict(
     self,
     state: PlantState,

@@ -1,0 +1,18 @@
+{
+  "source_branch": "BLaT",
+  "source_authority_commit": "5e533e3ec6ccc58c9e18402d69b2c0b364c1ccac",
+  "files": {
+    "latcontrol_torque.py": {
+      "git_blob": "9f9f2b9cda1c302a4e02fb6448f33eb45008f381",
+      "sha256": "f042bde83638f0f536eadae593f3e1b8516cd3e1ae92bf313d46239df9b032e2"
+    },
+    "lateral_reference_planner.py": {
+      "git_blob": "31a7f183eba1be69069e89a37ec4236880813a49",
+      "sha256": "99c9ef94cf9609a63d85934fbd8c8bea19a9909639c968eebe0813aa44bb56b5"
+    },
+    "openpilot/selfdrive/controls/lib/lateral_torque_utils.py": {
+      "git_blob": "552eb12e596f8b51cce4b4a57e02549970bb49e9",
+      "sha256": "c87b2416b80f278c5fa5e2d4a492a8ee3cece12527233cb5aa0f9e49a27c8b21"
+    }
+  }
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import math
 from numbers import Number
+import time
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
@@ -18,6 +19,11 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
+from openpilot.selfdrive.controls.lib.blatv2.live import LiveLQIController
+from openpilot.selfdrive.controls.lib.blatv2.controller import (
+  CandidateStatus,
+  LIVE_CONTROLLER_VERSION,
+)
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
@@ -46,14 +52,33 @@ class Controls:
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.blatv2_compute_time_seconds = 0.0
+    self.blatv2_status = int(CandidateStatus.INPUT_INVALID)
+    self.blatv2_output_valid = True
+    self.blatv2_invalid_frames = 0
+    self.blatv2_recovery_ok_frames = 0
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
 
     self.LoC = LongControl(self.CP)
     self.VM = VehicleModel(self.CP)
+    self.is_blatv2 = (
+      self.CP.brand == "hyundai"
+      and self.CP.steerControlType
+      == car.CarParams.SteerControlType.torque
+      and self.CP.lateralTuning.which() == "torque"
+    )
+    self.blatv2: LiveLQIController | None = None
     self.LaC: LatControl
-    if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
+    if self.is_blatv2:
+      self.blatv2 = LiveLQIController(
+        self.CP, self.CI.CC.params, self.CP.lateralTuning.torque,
+      )
+      # Kept only for the non-BLaTv2 branch below; the promoted Hyundai path
+      # never constructs or invokes a second lateral controller.
+      self.LaC = None  # type: ignore[assignment]
+    elif self.CP.steerControlType == car.CarParams.SteerControlType.angle:
       self.LaC = LatControlAngle(self.CP, self.CI, DT_CTRL)
     elif self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       self.LaC = LatControlCurvature(self.CP, self.CI, DT_CTRL)
@@ -83,7 +108,7 @@ class Controls:
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
 
     # Update Torque Params
-    if self.CP.lateralTuning.which() == 'torque':
+    if not self.is_blatv2 and self.CP.lateralTuning.which() == 'torque':
       torque_params = self.sm['liveTorqueParameters']
       if self.sm.all_checks(['liveTorqueParameters']) and torque_params.useParams:
         self.LaC.update_live_torque_params(torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered,
@@ -109,7 +134,7 @@ class Controls:
       CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
       CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
 
-    if not CC.latActive:
+    if not CC.latActive and not self.is_blatv2:
       self.LaC.reset()
     if not CC.longActive:
       self.LoC.reset()
@@ -118,24 +143,75 @@ class Controls:
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
     actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits))
 
-    # Steering PID loop and lateral MPC
-    # Reset desired curvature to current to avoid violating the limits on engage
-    if self.sm.valid['lateralManeuverPlan']:
-      new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
-    else:
-      new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-    self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
-    lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    if self.is_blatv2:
+      assert self.blatv2 is not None
+      # The observer compares the previous request with the live applied
+      # response. Reuse this frame's preallocated CarControl builder as that
+      # request carrier before overwriting it with the new command.
+      actuators.torque = float(self.blatv2.command_torque)
+      started_ns = time.perf_counter_ns()
+      result = self.blatv2.step(
+        model_v2,
+        CS,
+        CC,
+        self.sm["carOutput"],
+        lp,
+        self.sm.valid["liveParameters"],
+        float(self.sm["liveDelay"].lateralDelay),
+        self.sm.valid["liveDelay"],
+        self.sm.valid["modelV2"],
+        CC.latActive,
+      )
+      self.blatv2_compute_time_seconds = (
+        time.perf_counter_ns() - started_ns
+      ) * 1e-9
+      self.blatv2_status = int(result.status)
+      self.blatv2_output_valid = bool(result.output_valid)
+      self.blatv2_invalid_frames = int(result.invalid_frames)
+      self.blatv2_recovery_ok_frames = int(result.recovery_ok_frames)
+      self.desired_curvature = float(result.reference_curvature)
+      actuators.curvature = self.desired_curvature
+      actuators.torque = float(result.command_torque)
+      actuators.steeringAngleDeg = 0.0
 
-    actuators.curvature = self.desired_curvature
-    steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                     self.steer_limited_by_safety, self.desired_curvature,
-                                                     curvature_limited, lat_delay)
-    actuators.torque = float(steer)
-    if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
-      actuators.curvature = float(lateral_output)
+      lac_log = log.ControlsState.LateralTorqueState.new_message()
+      lac_log.active = bool(CC.latActive)
+      lac_log.actualLateralAccel = float(self.curvature * CS.vEgo**2)
+      lac_log.desiredLateralAccel = float(
+        self.desired_curvature * CS.vEgo**2
+      )
+      lac_log.error = float(
+        lac_log.desiredLateralAccel - lac_log.actualLateralAccel
+      )
+      lac_log.output = float(result.command_torque)
+      lac_log.version = LIVE_CONTROLLER_VERSION
+      lac_log.blatV2Status = int(result.status)
+      lac_log.blatV2ComputeTimeSeconds = float(
+        self.blatv2_compute_time_seconds
+      )
+      lac_log.blatV2OutputValid = bool(result.output_valid)
+      lac_log.blatV2InvalidFrames = int(result.invalid_frames)
+      lac_log.blatV2RecoveryOkFrames = int(result.recovery_ok_frames)
+      lac_log.blatV2CommandTorque = float(result.command_torque)
     else:
-      actuators.steeringAngleDeg = float(lateral_output)
+      # Reset desired curvature to current to avoid violating the limits on
+      # engage for every non-BLaTv2 lateral controller.
+      if self.sm.valid['lateralManeuverPlan']:
+        new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
+      else:
+        new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
+      lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+
+      actuators.curvature = self.desired_curvature
+      steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                       self.steer_limited_by_safety, self.desired_curvature,
+                                                       curvature_limited, lat_delay)
+      actuators.torque = float(steer)
+      if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
+        actuators.curvature = float(lateral_output)
+      else:
+        actuators.steeringAngleDeg = float(lateral_output)
     # Ensure no NaNs/Infs
     for p in ACTUATOR_FIELDS:
       attr = getattr(actuators, p)
@@ -189,7 +265,10 @@ class Controls:
 
     # controlsState
     dat = messaging.new_message('controlsState')
-    dat.valid = CS.canValid
+    controls_output_valid = bool(
+      CS.canValid and (not self.is_blatv2 or self.blatv2_output_valid)
+    )
+    dat.valid = controls_output_valid
     cs = dat.controlsState
 
     cs.curvature = self.curvature
@@ -220,7 +299,7 @@ class Controls:
 
     # carControl
     cc_send = messaging.new_message('carControl')
-    cc_send.valid = CS.canValid
+    cc_send.valid = controls_output_valid
     cc_send.carControl = CC
     self.pm.send('carControl', cc_send)
 

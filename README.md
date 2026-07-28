@@ -7,10 +7,15 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — shadow controller tournament.** This branch computes two
-BLaTv2 controller candidates as telemetry-only passengers. Neither candidate
-publishes `carControl` or changes actuation. The shadow daemon is carried in
-`combo` so ordinary drives can collect plant-fit and A/B evidence.
+⚠️ **In progress — LQI promotion build.** The tournament selected the analytic
+inverse-EPS finite-horizon LQI. On Hyundai torque cars this branch now runs the
+shared BLaTv2 reference, observer, plant workspace, and LQI directly inside
+controlsd at its existing CTRL_HIGH 100 Hz position. Those numerical files are
+the same artifact imported by route-audit; there is no separate live variant.
+
+The MPC is retired from onroad execution. Its implementation and tests remain
+in the repository so it can re-enter a future tournament after its real-world
+schedule-construction cost is fixed.
 
 The frozen v14 implementation remains on
 [`BLaT`](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT). BLaTv2 is a
@@ -21,18 +26,44 @@ ground-up design and does not inherit that controller.
 - a deterministic float64 steering-rack plant twin;
 - a stateless scalar-anchored future-path reference;
 - one shared recorded-response disturbance observer;
-- a deterministic sign-schedule torque MPC candidate;
-- an analytic inverse-EPS finite-horizon LQI fallback candidate;
-- an onroad `blatv2_shadowd` process that publishes diagnostics only;
+- a retained, non-running sign-schedule torque MPC challenger;
+- the promoted analytic inverse-EPS finite-horizon LQI controller;
+- an onroad `blatv2_shadowd` process that runs the complete frozen-v14
+  controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 6. It reports reference and
+The shadow event is `blatV2Shadow`, version 7. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 6 makes MPC warm selection literal O(1): it reuses the previous
+Version 7 removes both tournament candidates from shadowd. It copies the live
+LQI command, status, recovery state, and in-controlsd compute time from
+`controlsState`, and logs the command from the complete frozen-v14 pipeline.
+The promoted controller reports version `200` in the same behavior commit.
+The v14 controller and reference-planner source files are byte-identical to
+frozen authority commit `5e533e3ec6`; the passive adapter does not substitute a
+terminal FF/PID hybrid.
+
+### Live invalid-output contract
+
+An active non-OK or non-finite LQI result holds the previous request for one
+frame, then decays it toward zero with the runtime actuator down-rate. At
+250 ms continuously invalid, controlsd requests zero and publishes both
+`controlsState.valid = false` and `carControl.valid = false`. This deliberately
+surfaces as the existing `commIssue` event. It is not a communication defect:
+for this branch, `commIssue` can mean the lateral controller remained invalid.
+
+That tested event path produces the standard full-screen
+**TAKE CONTROL IMMEDIATELY** visual alert, steering-required visual signal, and
+`warningSoft` audible alert while the three-second soft-disable state counts
+down; it also supplies the existing no-entry alert while invalid. Both the
+controller and no-entry condition clear only after ten consecutive finite OK
+frames. Re-entry resets the LQI integral and resumes through the same asymmetric
+slew limiter from current applied torque.
+
+Version 6 made MPC warm selection literal O(1): it reuses the previous
 winning schedule ordinal when that ordinal still exists and otherwise selects
-base schedule zero. Version 5 prepares the identical candidate workspace once
+base schedule zero. Version 5 prepared the identical candidate workspace once
 in shared setup and
 lets both candidates consume it read-only. It also hard-bounds MPC to one
 active-set solve per frame: `mpcCandidateCount` is the evaluated count and
@@ -157,10 +188,9 @@ damping.
 
 ## Not implemented
 
-- any BLaTv2 actuation path;
 - excitation module;
 - UI;
-- candidate feel tuning or architecture selection.
+- post-promotion feel tuning.
 
-Shadow-foundation work stays **in progress** until device/harness bit-exactness,
-the 2 ms p99 runtime budget, and the owner review all pass.
+Promotion stays **in progress** until identity replay, delivered-curvature
+gates, full test suites, device timing, and the first owner drive pass.

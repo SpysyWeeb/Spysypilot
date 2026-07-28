@@ -893,6 +893,77 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
+    measurementRate @13 :Float32;
+    rateBrake @14 :Float32;
+    rateBrakeScale @15 :Float32;
+    delayedDesiredCurvature @16 :Float32;
+    legacyDesiredLateralAccel @17 :Float32;
+    speedAlignmentCorrection @18 :Float32;
+    actuationSpeed @19 :Float32;
+    currentSpeedDesiredLateralAccel @20 :Float32;
+    speedProjectionCorrection @21 :Float32;
+    longitudinalLateralAccelRate @22 :Float32;
+    rateBrakeSpeedScale @23 :Float32;
+    referenceVersion @24 :Int32;
+    referenceBaseCurvature @25 :Float32;
+    referenceOutputCurvature @26 :Float32;
+    referencePreviewTime @27 :Float32;
+    referencePreviewExtraTime @28 :Float32;
+    referenceTargetTorque @29 :Float32;
+    referenceAppliedTorque @30 :Float32;
+    referenceUnwindScale @31 :Float32;
+    referenceAuthorityRestored @32 :Float32;
+    referencePreviewCorrection @33 :Float32;
+    referenceRate @34 :Float32;
+    trackingMeasurementRate @35 :Float32;
+    rateTrackingError @36 :Float32;
+    rateTrackingCorrection @37 :Float32;
+    rateTrackingSpeedScale @38 :Float32;
+    referenceCurvatureRate @39 :Float32;
+    measurementCurvatureRate @40 :Float32;
+    cascadePositionError @41 :Float32;
+    cascadeCatchupRate @42 :Float32;
+    cascadeDesiredRate @43 :Float32;
+    cascadeRateError @44 :Float32;
+    actuatorAppliedLateralAccel @45 :Float32;
+    actuatorStateCorrection @46 :Float32;
+    cascadePScale @47 :Float32;
+    unwindBrakeActivation @48 :Float32;
+    unwindTorqueZeroTime @49 :Float32;
+    unwindProjectedPositionError @50 :Float32;
+    unwindTorqueCorrection @51 :Float32;
+    cascadeBasePScale @52 :Float32;
+    dampingTurnInBlocked @53 :Bool;
+    referenceGeometricTargetTorque @54 :Float32;
+    referenceNeutralTorque @55 :Float32;
+    referenceReachableTargetTorque @56 :Float32;
+    unwindEffectivePhase @57 :Float32;
+    unwindPhaseDirection @58 :Float32;
+    unwindDeliveryGap @59 :Float32;
+    unwindPhaseOverspeed @60 :Float32;
+    unwindNeutralTorque @61 :Float32;
+    unwindTorqueNeutralTime @62 :Float32;
+    unwindSameEpisode @63 :Bool;
+    unwindOppositeTime @64 :Float32;
+    unwindEpisodeArmed @65 :Bool;
+    finiteDifferenceReferenceCurvatureRate @66 :Float32;
+    trajectoryReferenceCurvatureRate @67 :Float32;
+    trajectoryReferenceRateValid @68 :Bool;
+    trajectoryReferenceInnovation @69 :Float32;
+    filteredTrajectoryReferenceInnovation @70 :Float32;
+    referenceSustainedUnwindScale @71 :Float32;
+    referenceEpisodeTargetTorque @72 :Float32;
+    referenceEpisodeLateralAccel @73 :Float32;
+
+    # BLaTv2 live promotion telemetry. Invalid output at 250 ms makes the
+    # parent controlsState/carControl messages invalid, intentionally
+    # surfacing through selfdrived's existing commIssue contract.
+    blatV2Status @74 :UInt8;
+    blatV2ComputeTimeSeconds @75 :Float64;
+    blatV2OutputValid @76 :Bool;
+    blatV2InvalidFrames @77 :UInt16;
+    blatV2RecoveryOkFrames @78 :UInt8;
+    blatV2CommandTorque @79 :Float64;
    }
 
   struct LateralAngleState {
@@ -2503,18 +2574,33 @@ struct BlatV2Shadow {
   disturbanceEstimate @12 :Float64;
   observerStatus @13 :UInt8;
   observerUnconstrainedUpdate @14 :Float64;
-  mpcCommandTorque @15 :Float64;
-  mpcStatus @16 :UInt8;
-  mpcCandidateCount @17 :UInt16;
-  mpcOptimalityResidual @18 :Float64;
-  mpcComputeTimeSeconds @19 :Float64;
-  fallbackCommandTorque @20 :Float64;
-  fallbackStatus @21 :UInt8;
-  fallbackCandidateCount @22 :UInt16;
-  fallbackOptimalityResidual @23 :Float64;
-  fallbackComputeTimeSeconds @24 :Float64;
+  # Version 7 retired both tournament candidates from onroad shadow execution.
+  # Preserve their wire ordinals as Void so this evolving fork schema remains
+  # sequential without retaining any candidate telemetry surface.
+  retiredCandidateField15 @15 :Void;
+  retiredCandidateField16 @16 :Void;
+  retiredCandidateField17 @17 :Void;
+  retiredCandidateField18 @18 :Void;
+  retiredCandidateField19 @19 :Void;
+  retiredCandidateField20 @20 :Void;
+  retiredCandidateField21 @21 :Void;
+  retiredCandidateField22 @22 :Void;
+  retiredCandidateField23 @23 :Void;
+  retiredCandidateField24 @24 :Void;
   sharedComputeTimeSeconds @25 :Float64;
-  mpcAvailableScheduleCount @26 :UInt16;
+  retiredCandidateField26 @26 :Void;
+  liveLqiCommandTorque @27 :Float64;
+  liveLqiStatus @28 :UInt8;
+  liveLqiComputeTimeSeconds @29 :Float64;
+  liveLqiOutputValid @30 :Bool;
+  liveLqiInvalidFrames @31 :UInt16;
+  liveLqiRecoveryOkFrames @32 :UInt8;
+  v14CommandTorque @33 :Float64;
+  v14DesiredCurvature @34 :Float64;
+  v14ControllerVersion @35 :Int32;
+  v14Valid @36 :Bool;
+  v14ComputeTimeSeconds @37 :Float64;
+  liveLqiControllerVersion @38 :Int32;
 }
 
 struct Touch {
