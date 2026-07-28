@@ -42,9 +42,9 @@ LQI command, status, recovery state, and in-controlsd compute time from
 `controlsState`, and logs the command from the complete frozen-v14 pipeline.
 The recalibrated promoted controller reports version `202`. Version 202 keeps
 plant stiction and the observer clamp at the measured `0.09` while replacing
-the inverse feedforward's hard Coulomb sign flip with exact zero-crossing
-averaging from measured to desired rack rate. Full breakaway remains available
-when departing stiction, and no sigma feel dial changes in this iteration.
+the inverse feedforward's hard Coulomb sign flip with exact decision-cell
+zero-crossing averaging. Full breakaway remains available when departing
+stiction, and no sigma feel dial changes in this iteration.
 The v14 controller and reference-planner source files are byte-identical to
 frozen authority commit `5e533e3ec6`; the passive adapter does not substitute a
 terminal FF/PID hybrid.
