@@ -159,20 +159,16 @@ def test_mpc_solves_only_one_warm_selected_schedule():
   assert candidate.winning_schedule_index == 0
 
 
-def test_mpc_warm_schedule_distance_has_lowest_index_tie_break():
+def test_mpc_warm_schedule_reuses_prior_winner_or_falls_back_to_base():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   candidate = ModelFollowingTorqueMPC(twin, CONTROLLER_PARAMS)
-  count = 4
   candidate.has_warm_start = True
-  candidate.warm_start_count = count
-  candidate.best_solution[:count] = (0.2, -0.2, -0.2, 0.2)
-  candidate.schedules[0, :count] = (1, -1, 1, 1)
-  candidate.schedule_change_indices[1:3] = (2, 2)
-  candidate.schedule_change_signs[1:3] = (-1, -1)
+  candidate.winning_schedule_index = 2
 
-  assert candidate._select_warm_schedule(3, count) == 1
+  assert candidate._select_warm_schedule(3) == 2
+  assert candidate._select_warm_schedule(2) == 0
   candidate.reset()
-  assert candidate._select_warm_schedule(3, count) == 0
+  assert candidate._select_warm_schedule(3) == 0
 
 
 def test_enumeration_exhaustion_is_legible():
