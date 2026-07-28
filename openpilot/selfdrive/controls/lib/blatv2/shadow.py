@@ -346,6 +346,7 @@ class ShadowCore:
           self.reference_count,
           self.horizon_seconds,
           result.disturbance_estimate,
+          self.controller_params.kinetic_friction,
         )
         self.candidate_workspace_valid = True
       except (ValueError, OverflowError):

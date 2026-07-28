@@ -45,6 +45,20 @@ plant stiction and the observer clamp at the measured `0.09` while replacing
 the inverse feedforward's hard Coulomb sign flip with exact decision-cell
 zero-crossing averaging. Full breakaway remains available when departing
 stiction, and no sigma feel dial changes in this iteration.
+
+### b7 response-surface iteration
+
+The next candidate iteration is measurement-only until one cell clears the
+committed gates. It separates static breakaway from moving-friction
+feedforward: plant stiction and the observer clamp remain `0.09`, departure
+from a stationary rack retains `0.09`, and only moving decision cells consume
+the swept kinetic value. It also adds a curvature-space tracking tolerance,
+whose angle-state weight naturally falls with the vehicle model's
+curvature-per-steering-degree response at speed. The shipped seed omits both
+overrides so this scaffolding reproduces version 202 unless route-audit
+explicitly supplies a response-surface cell. No cell is authorized for live
+actuation until the b7 W1/W2/W3 completion evidence and signed turn-in,
+oscillation, and regression gates select it.
 The v14 controller and reference-planner source files are byte-identical to
 frozen authority commit `5e533e3ec6`; the passive adapter does not substitute a
 terminal FF/PID hybrid.

@@ -48,6 +48,30 @@ def decision_cell_coulomb_direction(
   return (left + right) / magnitude
 
 
+def decision_cell_friction(
+  left_rate: float,
+  right_rate: float,
+  departure_direction: float,
+  static_breakaway: float,
+  kinetic_friction: float,
+) -> float:
+  """Return distinct stick/slip feedforward friction.
+
+  A stationary cell departing stiction receives full static breakaway. Any
+  cell containing rack motion receives the response-surface kinetic value,
+  including the exact zero-crossing average. Plant stiction and the observer
+  clamp remain independent at the static ``t_breakaway`` value.
+  """
+  direction = decision_cell_coulomb_direction(
+    left_rate, right_rate, departure_direction,
+  )
+  stationary = abs(float(left_rate)) + abs(float(right_rate)) == 0.0
+  magnitude = float(static_breakaway) if stationary and direction != 0.0 else float(kinetic_friction)
+  if not math.isfinite(magnitude) or magnitude < 0.0:
+    raise ValueError("friction magnitudes must be finite and non-negative")
+  return magnitude * direction
+
+
 class CandidateWorkspace:
   """Fixed buffers for the shared scalar-pinned reference and inverse EPS map."""
 
@@ -70,16 +94,15 @@ class CandidateWorkspace:
     reference_count: int,
     horizon_seconds: float,
     disturbance_torque: float,
+    kinetic_friction: float | None = None,
   ) -> None:
-    """Build the 50 ms decision grid and conservative inverse-EPS feedforward.
+    """Build the 50 ms decision grid and inverse-EPS feedforward.
 
-    Friction is never credited as helpful. Full ``t_breakaway`` is added while
-    moving and when departing stiction. A decision cell containing a rack-rate
-    zero crossing uses the exact cell-average Coulomb direction, preventing a
-    non-physical hard sign flip while preserving the same friction bound. The
-    independent disturbance estimate may consume another ``t_breakaway``.
-    This explicitly tolerates two breakaway-equivalent loads until casual-drive
-    event identification can tighten the physical bound.
+    Full ``t_breakaway`` is retained only for departure from stiction. Moving
+    cells use the independently supplied kinetic-friction response-surface
+    value. A cell containing a rack-rate zero crossing uses the exact
+    cell-average direction. With no override, kinetic friction defaults to
+    ``t_breakaway`` and reproduces the shipped controller behavior.
     """
     horizon = min(float(horizon_seconds), MAX_REFERENCE_TIME)
     if not math.isfinite(horizon) or horizon < 0.0:
@@ -151,7 +174,18 @@ class CandidateWorkspace:
         left_rate, right_rate, departure
       )
       self.friction_directions[index] = direction
-      friction = twin.params.t_breakaway * direction
+      moving_friction = (
+        twin.params.t_breakaway
+        if kinetic_friction is None
+        else float(kinetic_friction)
+      )
+      friction = decision_cell_friction(
+        left_rate,
+        right_rate,
+        departure,
+        twin.params.t_breakaway,
+        moving_friction,
+      )
       aligning = twin.aligning_torque_values(self.desired_angles[index], state.v_ego, align_inputs)
       dynamic = (acceleration + twin.params.b_steer * rate) / twin.params.k_t
       demand = aligning + dynamic + friction + float(disturbance_torque)

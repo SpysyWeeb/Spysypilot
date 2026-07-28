@@ -93,6 +93,9 @@ class InverseEpsLQIFallback:
     heading_angle_scale = state.v_ego * curvature_per_degree * dt / self.params.sigma_heading
     heading_rate_scale = state.v_ego * curvature_per_degree * dt * dt / self.params.sigma_heading
     self.q[0] = heading_angle_scale * heading_angle_scale
+    if self.params.sigma_curvature > 0.0:
+      curvature_angle_scale = curvature_per_degree / self.params.sigma_curvature
+      self.q[0] += curvature_angle_scale * curvature_angle_scale
     self.q[1] = heading_rate_scale * heading_rate_scale
     self.q[2] = 1.0 / (self.params.sigma_y * self.params.sigma_y)
     control_weight = 1.0 / (self.params.sigma_torque_rate * dt) ** 2
@@ -274,6 +277,7 @@ class InverseEpsLQIFallback:
           reference_count,
           horizon_seconds,
           disturbance_torque,
+          self.params.kinetic_friction,
         )
       sample_position = min(
         max(float(actuation_delay) / DECISION_DT, 0.0),
