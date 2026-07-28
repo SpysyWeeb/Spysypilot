@@ -154,6 +154,19 @@ class TestPlantTwin(unittest.TestCase):
     self.assertEqual(rates[:2], (0.0, 0.0))
     self.assertGreater(rates[15], 0.0)
 
+  def test_held_state_prediction_is_identity_at_zero_delay(self) -> None:
+    twin = PlantTwin(params(), align_params())
+    inputs = AlignInputs(0.01, 0.2, 0.9, 15.5, True)
+    state = PlantState(12.0, -4.0, 0.3, 5.0)
+    target = PlantState(0.0, 0.0, 0.0, 0.0)
+    twin.predict_held_state_into(
+      state, 0.0, inputs, 0.05, target, 0.05,
+    )
+    self.assertEqual(
+      (target.angle_deg, target.rate_deg_s, target.applied_torque, target.v_ego),
+      (state.angle_deg, state.rate_deg_s, state.applied_torque, state.v_ego),
+    )
+
   def test_allocation_free_rollout_accepts_live_delay_without_rebuilding_twin(self) -> None:
     twin = PlantTwin(params(), align_params())
     state = PlantState(0.0, 0.0, 0.0, 0.0)

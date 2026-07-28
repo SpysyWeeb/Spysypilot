@@ -7,15 +7,38 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — LQI promotion build.** The tournament selected the analytic
-inverse-EPS finite-horizon LQI. On Hyundai torque cars this branch now runs the
-shared BLaTv2 reference, observer, plant workspace, and LQI directly inside
-controlsd at its existing CTRL_HIGH 100 Hz position. Those numerical files are
-the same artifact imported by route-audit; there is no separate live variant.
+⚠️ **In progress — v205 action-point inverse controller.** Field routes b9/ba
+showed that v203 was smooth but slow and weak. Version 205 replaces the LQI
+cost trade with a direct inverse-rack action controller inside controlsd at its
+existing CTRL_HIGH 100 Hz position. The model scalar action remains the
+unmodified path authority: v205 does not move the path earlier, preserve a
+turn longer, or sample farther into the plan to create lead.
+
+The controller predicts the measured rack only through the physical actuator
+delay, then uses inverse rack dynamics to command the acceleration needed by
+the scalar angle and its local model-authored rate. Tracking is no longer
+traded against a torque-rate cost or an artificial arrival time. The request
+may use the full normalized torque range and the exact Hyundai 409/4/7 command
+limiter is the sole smoothing authority. The same numerical files are
+imported by route-audit; there is no separate live variant.
 
 The MPC is retired from onroad execution. Its implementation and tests remain
 in the repository so it can re-enter a future tournament after its real-world
 schedule-construction cost is fixed.
+
+### What LQI means
+
+**LQI** means **Linear–Quadratic control with Integral action**. It predicts
+how the steering rack responds, then chooses feedback that balances two costs:
+tracking the requested path and avoiding excessive control effort. The
+integral state gradually corrects a persistent tracking bias.
+
+BLaTv2 versions through v203 used that architecture. It was smooth, but its
+path-error-versus-torque trade made it reluctant to spend torque at low speed;
+the wheel could remain far behind the requested angle while substantial EPS
+authority went unused. LQI is therefore historical in v205. The active v205
+controller has no LQI cost matrix and no integral state: it directly inverts
+the physical rack dynamics for the model scalar action.
 
 The frozen v14 implementation remains on
 [`BLaT`](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT). BLaTv2 is a
@@ -27,25 +50,89 @@ ground-up design and does not inherit that controller.
 - a stateless scalar-anchored future-path reference;
 - one shared recorded-response disturbance observer;
 - a retained, non-running sign-schedule torque MPC challenger;
-- the promoted analytic inverse-EPS finite-horizon LQI controller;
+- the promoted delay-compensated inverse-EPS action controller;
 - an onroad `blatv2_shadowd` process that runs the complete frozen-v14
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 8. It reports reference and
+The shadow event is `blatV2Shadow`, version 9. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 8 uses the live-field-calibrated plant schedule described below.
+Version 9 adds the live v205 torque decomposition, action-point target, and
+delay-predicted rack state. Version 8 uses the live-field-calibrated plant
+schedule described below.
 Version 7 removed both tournament candidates from shadowd. It copies the live
 LQI command, status, recovery state, and in-controlsd compute time from
 `controlsState`, and logs the command from the complete frozen-v14 pipeline.
-The selected response-surface controller reports version `203`. Version 203 keeps
+The prior response-surface controller reports version `203`. Version 203 keeps
 plant stiction and the observer clamp at the measured `0.09` while replacing
 the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 `0.09` breakaway remains available when departing stiction. It adds the
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
+
+### v205 timing and authority contract
+
+The action time is derived from the same modeld contract used by controlsd:
+`liveDelay.lateralDelay + LAT_SMOOTH_SECONDS + 1.5 × DT_MDL`. The scalar action
+and its local angle/rate/acceleration stencil are sampled at that one time.
+Changing any plan point beyond the local stencil cannot affect the current
+command.
+
+The controller advances the measured steering-wheel angle/rate through only
+the physical `liveDelay` while holding measured applied torque. It then uses
+computed-torque pole placement: the inverse cancels rack damping and puts both
+angle/rate tracking-error poles at the plant's identified physical damping
+rate `b_steer`. That physical parameter is already part of the rack twin; v205
+adds no response-time or authority dial.
+
+The scalar action alone sets steering position. Only the rate and acceleration
+at that same action point enter the dynamic feedforward; later plan samples
+cannot lead the turn. The inverse has no path-preview torque boost,
+speed-scheduled feedback gain, torque-motion cost, arrival horizon, or
+integral. Smoothness is the exact 409/4/7 actuator trajectory. Low-speed
+authority arises naturally because the same curvature requires much more
+steering-wheel angle at low speed, so the physical angle error asks for more
+torque and may saturate.
+
+Palisade steering rate is quantized in 4 deg/s increments. Current-frame
+friction therefore uses measured/predicted rack motion, not exact-zero planned
+motion: it blends continuously from static breakaway `0.09` at rest to kinetic
+friction `0.03` across one measured rate quantum. The rate quantum is a sensor
+resolution, not a feel dial. A b9/ba attempt to identify an additional
+road-wheel-angle scrub term was rejected: the two low-speed route fits did not
+cross-validate, so v205 adds no unsupported coefficient.
+
+### v205 pre-field acceptance
+
+The clean feature artifact at `14cac1022f` passes 48 BLaTv2 unit tests plus
+12 parameterized subtests. A 6,000-frame 9d shadow A/A replay is bit-exact for
+all deterministic fields. A 20,000-frame workstation diagnostic measured
+0.134 ms median and 0.178 ms p99 for shared preparation plus the active solve;
+only device-logged in-controlsd timing can satisfy the field timing gate.
+
+The four-route counterfactual replay deliberately records three open
+pre-field deviations instead of relabeling them as passes:
+
+- the unconstrained internal target is substantially rougher than v14
+  (12.370/s versus 2.315/s RMS), but it is not the command controlsd sends;
+- the emitted/post-slew trajectory is modestly more active than v14
+  (1.091/s versus 1.029/s RMS; worst one-second 1.423/s versus 1.329/s);
+- delivered turn-in is 453.5 ms versus v14's 302.9 ms on the frozen set.
+  V14's preview mechanisms include early/corner-cutting events; v205 refuses
+  to move the scalar position target. The first v205 drive must determine
+  whether the remaining replay lag is real with the controller observing its
+  own rack response.
+
+The newest field routes are diagnostic rather than formal gates because each
+contains only nine `lat.turnStopTurn` events. Replaying v205 against their
+recorded inputs shows the intended authority change: on b9, the internal target
+is at or above 0.95 on 68.3% of sharp low-speed frames and the emitted command
+is at or above 0.95 on 39.8%; on ba the corresponding figures are 89.7% and
+15.6%. Median emitted torque in those sharp sets is 0.780 and 0.675. This is
+the field-test reason to stage v205: it is no longer leaving large torque
+headroom unused in the turns that convicted v203.
 
 ### b7 response-surface selection and accepted deviations
 
@@ -76,7 +163,7 @@ terminal FF/PID hybrid.
 
 ### Live invalid-output contract
 
-An active non-OK or non-finite LQI result holds the previous request for one
+An active non-OK or non-finite action-controller result holds the previous request for one
 frame, then decays it toward zero with the runtime actuator down-rate. At
 250 ms continuously invalid, controlsd requests zero and publishes both
 `controlsState.valid = false` and `carControl.valid = false`. This deliberately
@@ -88,7 +175,7 @@ That tested event path produces the standard full-screen
 `warningSoft` audible alert while the three-second soft-disable state counts
 down; it also supplies the existing no-entry alert while invalid. Both the
 controller and no-entry condition clear only after ten consecutive finite OK
-frames. Re-entry resets the LQI integral and resumes through the same asymmetric
+frames. Re-entry resets the controller and resumes through the same asymmetric
 slew limiter from current applied torque.
 
 Version 6 made MPC warm selection literal O(1): it reuses the previous
@@ -217,7 +304,9 @@ The candidates share one observer driven exclusively by recorded applied
 torque and measured steering response; candidates read its estimate and never
 write it. Observer learning resets on lateral/model invalidity, engagement,
 steering press, and standstill, and freezes when the recorded actuator is
-constrained. The fallback integral obeys the same reset/freeze lifecycle.
+constrained. The retired fallback integral obeys the same reset/freeze
+lifecycle. The v205 action controller has no integral state; it consumes the
+observer estimate read-only.
 
 `SIGMA_Y = 0.05 m`, `SIGMA_HEADING = 0.01 rad`, and
 `SIGMA_TORQUE_RATE = 0.5 normalized-torque/s` are provisional owner feel-dials
@@ -240,7 +329,7 @@ damping.
 
 - excitation module;
 - UI;
-- post-promotion feel tuning.
+- unsupported scrub/load coefficients.
 
-Promotion stays **in progress** until identity replay, delivered-curvature
-gates, full test suites, device timing, and the first owner drive pass.
+Version 205 stays **in progress** until identity replay, route gates, full test
+suites, device timing, and the first owner drive pass.

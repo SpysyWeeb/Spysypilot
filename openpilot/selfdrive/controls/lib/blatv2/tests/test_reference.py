@@ -3,7 +3,14 @@ from types import SimpleNamespace
 import unittest
 
 from openpilot.selfdrive.controls.lib.blatv2.plant import AlignParams, PlantParams, PlantTwin
-from openpilot.selfdrive.controls.lib.blatv2.reference import build_reference, horizon, torque_demand
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.blatv2.reference import (
+  build_reference,
+  horizon,
+  model_action_time,
+  torque_demand,
+)
+from openpilot.selfdrive.modeld.timing import LAT_SMOOTH_SECONDS
 
 
 def params() -> PlantParams:
@@ -37,6 +44,12 @@ class TestReference(unittest.TestCase):
   def test_horizon_is_runtime_limit_derived(self) -> None:
     expected = (409 / 7 + 409 / 4) * 0.01 + 0.12 + 0.2
     self.assertTrue(math.isclose(horizon(params()), expected))
+
+  def test_action_time_matches_modeld_scalar_timing(self) -> None:
+    self.assertEqual(
+      model_action_time(0.12),
+      0.12 + LAT_SMOOTH_SECONDS + 1.5 * DT_MDL,
+    )
 
   def test_transparency_for_already_feasible_smooth_demand(self) -> None:
     twin = PlantTwin(params(), align_params())

@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
   V14ShadowResult,
 )
 
-SHADOW_VERSION = 8
+SHADOW_VERSION = 9
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -56,6 +56,21 @@ def populate_shadow_message(
   live_lqi_invalid_frames: int,
   live_lqi_recovery_ok_frames: int,
   live_lqi_controller_version: int,
+  live_action_raw_command_torque: float,
+  live_action_feedforward_torque: float,
+  live_action_feedback_torque: float,
+  live_action_desired_angle_deg: float,
+  live_action_desired_rate_deg_s: float,
+  live_action_desired_acceleration_deg_s2: float,
+  live_action_predicted_angle_deg: float,
+  live_action_predicted_rate_deg_s: float,
+  live_action_required_acceleration_deg_s2: float,
+  live_action_speed_mps: float,
+  live_action_aligning_torque: float,
+  live_action_friction_torque: float,
+  live_action_dynamic_torque: float,
+  live_action_time_seconds: float,
+  live_action_slew_constrained: bool,
   v14_result: V14ShadowResult,
   v14_compute_seconds: float,
 ) -> None:
@@ -92,6 +107,33 @@ def populate_shadow_message(
   shadow.liveLqiInvalidFrames = int(live_lqi_invalid_frames)
   shadow.liveLqiRecoveryOkFrames = int(live_lqi_recovery_ok_frames)
   shadow.liveLqiControllerVersion = int(live_lqi_controller_version)
+  shadow.liveActionRawCommandTorque = float(
+    live_action_raw_command_torque
+  )
+  shadow.liveActionFeedforwardTorque = float(
+    live_action_feedforward_torque
+  )
+  shadow.liveActionFeedbackTorque = float(live_action_feedback_torque)
+  shadow.liveActionDesiredAngleDeg = float(live_action_desired_angle_deg)
+  shadow.liveActionDesiredRateDegS = float(live_action_desired_rate_deg_s)
+  shadow.liveActionDesiredAccelerationDegS2 = float(
+    live_action_desired_acceleration_deg_s2
+  )
+  shadow.liveActionPredictedAngleDeg = float(
+    live_action_predicted_angle_deg
+  )
+  shadow.liveActionPredictedRateDegS = float(
+    live_action_predicted_rate_deg_s
+  )
+  shadow.liveActionRequiredAccelerationDegS2 = float(
+    live_action_required_acceleration_deg_s2
+  )
+  shadow.liveActionSpeedMps = float(live_action_speed_mps)
+  shadow.liveActionAligningTorque = float(live_action_aligning_torque)
+  shadow.liveActionFrictionTorque = float(live_action_friction_torque)
+  shadow.liveActionDynamicTorque = float(live_action_dynamic_torque)
+  shadow.liveActionTimeSeconds = float(live_action_time_seconds)
+  shadow.liveActionSlewConstrained = bool(live_action_slew_constrained)
   shadow.v14CommandTorque = float(v14_result.command_torque)
   shadow.v14DesiredCurvature = float(v14_result.desired_curvature)
   shadow.v14ControllerVersion = int(v14_result.controller_version)
@@ -251,6 +293,66 @@ class BlatV2Shadow:
       live_lqi_invalid_frames=live_lqi_invalid_frames,
       live_lqi_recovery_ok_frames=live_lqi_recovery_ok_frames,
       live_lqi_controller_version=live_lqi_controller_version,
+      live_action_raw_command_torque=(
+        float(torque_state.blatV2RawCommandTorque)
+        if torque_state_valid else 0.0
+      ),
+      live_action_feedforward_torque=(
+        float(torque_state.blatV2FeedforwardTorque)
+        if torque_state_valid else 0.0
+      ),
+      live_action_feedback_torque=(
+        float(torque_state.blatV2FeedbackTorque)
+        if torque_state_valid else 0.0
+      ),
+      live_action_desired_angle_deg=(
+        float(torque_state.blatV2DesiredAngleDeg)
+        if torque_state_valid else 0.0
+      ),
+      live_action_desired_rate_deg_s=(
+        float(torque_state.blatV2DesiredRateDegS)
+        if torque_state_valid else 0.0
+      ),
+      live_action_desired_acceleration_deg_s2=(
+        float(torque_state.blatV2DesiredAccelerationDegS2)
+        if torque_state_valid else 0.0
+      ),
+      live_action_predicted_angle_deg=(
+        float(torque_state.blatV2PredictedAngleDeg)
+        if torque_state_valid else 0.0
+      ),
+      live_action_predicted_rate_deg_s=(
+        float(torque_state.blatV2PredictedRateDegS)
+        if torque_state_valid else 0.0
+      ),
+      live_action_required_acceleration_deg_s2=(
+        float(torque_state.blatV2RequiredAccelerationDegS2)
+        if torque_state_valid else 0.0
+      ),
+      live_action_speed_mps=(
+        float(torque_state.blatV2ActionSpeedMps)
+        if torque_state_valid else 0.0
+      ),
+      live_action_aligning_torque=(
+        float(torque_state.blatV2AligningTorque)
+        if torque_state_valid else 0.0
+      ),
+      live_action_friction_torque=(
+        float(torque_state.blatV2FrictionTorque)
+        if torque_state_valid else 0.0
+      ),
+      live_action_dynamic_torque=(
+        float(torque_state.blatV2DynamicTorque)
+        if torque_state_valid else 0.0
+      ),
+      live_action_time_seconds=(
+        float(torque_state.blatV2ActionTimeSeconds)
+        if torque_state_valid else 0.0
+      ),
+      live_action_slew_constrained=(
+        bool(torque_state.blatV2SlewConstrained)
+        if torque_state_valid else False
+      ),
       v14_result=v14_result,
       v14_compute_seconds=v14_compute_seconds,
     )

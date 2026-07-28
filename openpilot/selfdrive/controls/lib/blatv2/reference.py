@@ -11,9 +11,13 @@ import numpy as np
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
+from openpilot.selfdrive.modeld.timing import LAT_SMOOTH_SECONDS
 
 HORIZON_MARGIN_SECONDS = 0.2
-MODEL_ACTION_OFFSET = 1.5 * DT_MDL
+# modeld's scalar action is authored for this point. Keeping the model's own
+# smoothing latency in the shared definition prevents controlsd, shadowd, and
+# the replay harness from sampling different physical times.
+MODEL_ACTION_OFFSET = LAT_SMOOTH_SECONDS + 1.5 * DT_MDL
 
 
 def _as_finite_tuple(values: Sequence[float], name: str) -> tuple[float, ...]:
