@@ -30,12 +30,13 @@ def test_shadow_process_is_registered_onroad_without_toggle():
   assert registration in config
 
 
-def test_shadow_runs_below_controlsd_on_the_same_realtime_core():
+def test_shadow_runs_below_controlsd_without_competing_on_one_core():
   source = Path(
     "openpilot/selfdrive/controls/blatv2_shadowd.py",
   ).read_text()
-  assert "config_realtime_process(4, Priority.CTRL_LOW)" in source
-  assert "config_realtime_process(4, Priority.CTRL_HIGH)" not in source
+  assert "config_realtime_process([0, 1, 2, 3, 4], Priority.CTRL_LOW)" in source
+  assert "config_realtime_process(4, Priority.CTRL_LOW)" not in source
+  assert "Priority.CTRL_HIGH" not in source
 
 
 def test_shadow_v8_schema_has_live_lqi_and_exact_v14_fields():
