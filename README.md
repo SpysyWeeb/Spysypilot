@@ -30,16 +30,16 @@ rolling. It remains separate from the standstill lead-launch detector and will
 not be considered complete until replay calibration and new field logs have
 been reviewed.
 
-🚧 **Lateral detector version 6 is in progress.** Route-94 field review of
-version 5 found four calibration/bookkeeping problems that version 6
-addresses without changing steering behavior: crown-neutral-aware unwind
-release timing (literal torque zero and the road's actual crown-neutral
-offset are measurably different moments, by up to 1.3 s on route 94), a bounded
-turn–stop–turn state lifetime (long steady curves produced 7–32 s "dwells"),
-physical-maneuver grouping with one primary event per group, and separating
-driver causation from driver rescue. Route 94 is the primary regression
-fixture; version 6 remains in progress until new field collection has been
-reviewed.
+🚧 **Lateral detector version 7 is in progress.** Route b7 exposed two blind
+spots in version 6: BLaTv2 could under-command a failed turn without ever
+reaching the old saturation-based authority detector, and a confirmed driver
+takeover was recorded only as confounding evidence. Version 7 adds
+`lat.torqueUnderDelivery` for sustained tracking deficit with unused torque
+headroom and `lat.driverTakeover` as unsuppressible driver ground truth. Its
+thresholds and 0.30-second takeover confirmation were derived from b7, and
+W1/W2/W3 now surface automatically. Route 94 remains the historical
+regression fixture; b7 adds committed authority/takeover windows. Version 7
+remains in progress until new on-device field collection has been reviewed.
 
 Version 5 history: progress-based bad-unwind detection and the sensitive
 single turn–stop–turn detector were added on top of version 4's reversal,
@@ -67,7 +67,7 @@ manifest, or directly notify another orchestrator.
 | source | recorded event types | purpose |
 |---|---|---|
 | Manual sidebar flag | `manual.general` | Mark any moment the driver wants reviewed |
-| BLaT lateral detector | `lat.stallRelease`, `lat.lateUnwind`, `lat.unwindProgressDeficit`, `lat.turnStopTurn`, `lat.handoffMismatch`, `lat.centerOvershoot`, `lat.committedHandoffHarshness`, `lat.torqueAuthority` | Capture known steering failure shapes and their controller/actuator evidence |
+| BLaT lateral detector | `lat.stallRelease`, `lat.lateUnwind`, `lat.unwindProgressDeficit`, `lat.turnStopTurn`, `lat.handoffMismatch`, `lat.centerOvershoot`, `lat.committedHandoffHarshness`, `lat.torqueAuthority`, `lat.torqueUnderDelivery`, `lat.driverTakeover` | Capture known steering failure shapes, unused authority, driver takeovers, and their controller/actuator evidence |
 | Lead-launch detector | `long.lateLeadLaunchPlanner`, `long.lateLeadLaunchController`, `long.lateLeadLaunchVehicle`, `long.leadLaunchStall` | Capture a delayed launch and attribute where the response chain lagged |
 | Rolling lead-response detector | `long.lateRollingLeadResponsePlanner`, `long.lateRollingLeadResponseController`, `long.lateRollingLeadResponseVehicle` | Capture a continuously tracked lead pulling away from an already-rolling ego while the response chain lags |
 | Smooth-stop jolt detector | `long.stopJolt` | Capture an abrupt brake grab or brake-release rebound during the final low-speed landing |
@@ -434,8 +434,8 @@ Current versions:
 
 | component | version |
 |---|---:|
-| universal event envelope | 3 |
-| lateral detector | 6 |
+| universal event envelope | 4 |
+| lateral detector | 7 |
 | lead-launch detector | 2 |
 | rolling lead-response detector | 1 |
 | smooth-stop jolt detector | 1 |

@@ -307,6 +307,31 @@ def test_manual_lateral_and_longitudinal_coexist():
   assert next(event for event in events if event.candidate.domain == "longitudinal").candidate.attribution == "mixed"
 
 
+def test_simultaneous_lateral_detections_are_all_retained():
+  evidence = LateralEvidence(
+    0.0, 1.0, 0.0, 0.0, False, 0.0, 0, 0.0, "lat:episode", 3.0, 2.0,
+  )
+  lateral = FixedDetector((
+    LateralDetection(
+      "torqueUnderDelivery", "critical", 0.9, "authority unused", evidence,
+      occurred_mono_time=0.0, detected_mono_time=1.0,
+    ),
+    LateralDetection(
+      "driverTakeover", "critical", 0.95, "driver override", evidence,
+      occurred_mono_time=0.5, detected_mono_time=1.0,
+    ),
+  ))
+  platform = DrivingEventPlatform(
+    recorder=EventRecorder(iter(("group", "under", "takeover")).__next__),
+    lateral_detector=lateral,
+  )
+  events = platform.update(lateral_sample=LateralSample(1.0))
+  assert [event.candidate.event_type for event in events] == [
+    "lat.torqueUnderDelivery", "lat.driverTakeover",
+  ]
+  assert {event.group_id for event in events} == {"group"}
+
+
 def test_detector_exception_isolation():
   errors = []
   platform = DrivingEventPlatform(
@@ -530,6 +555,42 @@ def test_lateral_candidate_uses_physical_crossing_and_later_confirmation_times()
   assert candidate.event_type == "lat.committedHandoffHarshness"
 
 
+def test_driver_takeover_is_driver_ground_truth_not_driver_or_road_confounded():
+  evidence = LateralEvidence(
+    1.0, 2.0, 1.0, 250.0, True, 1.0, 3, 0.5, "lat:takeover", 3.0, 2.0,
+    driver_interaction="confirmedSteeringPressed",
+    road_interaction="substantial",
+    demanded_curvature=0.12,
+    delivered_curvature_fraction=0.65,
+    torque_headroom=0.384,
+    signed_tracking_deficit=0.42,
+    takeover_confirmation_duration_s=0.30,
+  )
+  detection = LateralDetection(
+    "driverTakeover", "critical", 0.95, "driver override", evidence,
+    occurred_mono_time=1.5, detected_mono_time=1.8,
+  )
+  candidate = lateral_candidate(
+    LateralSample(1.8, steering_pressed=True, road_confounded=True),
+    detection,
+  )
+  assert candidate.event_type == "lat.driverTakeover"
+  assert candidate.attribution == "driver"
+  assert not candidate.driver_confounded
+  assert candidate.road_confounded
+  assert candidate.confidence == 0.95
+
+  msg = build_message(AcceptedEvent("takeover", "group", candidate)).as_reader().drivingEvent
+  assert msg.version == 4
+  assert msg.attribution == "driver"
+  assert not msg.driverConfounded
+  assert msg.payload.lateral.demandedCurvature == pytest.approx(0.12)
+  assert msg.payload.lateral.deliveredCurvatureFraction == pytest.approx(0.65)
+  assert msg.payload.lateral.torqueHeadroom == pytest.approx(0.384)
+  assert msg.payload.lateral.signedTrackingDeficit == pytest.approx(0.42)
+  assert msg.payload.lateral.takeoverConfirmationDurationS == pytest.approx(0.30)
+
+
 def test_road_confidence_penalty_applies_to_non_rescued_substantial_road_events():
   evidence = LateralEvidence(
     1.0, 2.0, 0.0, 0.0, False, 0.0, 0, 0.5, "lat:episode", 2.0, 2.0,
@@ -697,10 +758,10 @@ def test_lateral_names_times_windows_and_missing_optional_evidence_are_safe(inte
   candidate = lateral_candidate(LateralSample(2.5), detection)
   msg = build_message(AcceptedEvent("v5", "group", candidate)).as_reader().drivingEvent
 
-  assert LAT_DETECTOR_VERSION == 6
+  assert LAT_DETECTOR_VERSION == 7
   assert candidate.event_type == public_name
   assert msg.eventType == public_name
-  assert msg.detectorVersion == 6
+  assert msg.detectorVersion == 7
   assert msg.occurredMonoTime == 1_250_000_000
   assert msg.detectedMonoTime == 2_500_000_000
   assert msg.analysisWindowBeforeS == 6.0
@@ -728,6 +789,19 @@ def test_lateral_names_times_windows_and_missing_optional_evidence_are_safe(inte
   assert msg.payload.lateral.unwindReboundMaxMagnitude == 0.0
   assert msg.payload.lateral.driverCausation == ""
   assert not msg.payload.lateral.driverAssistRawTorqueOnly
+  # v7 optional context is safe for legacy-shaped evidence.
+  assert msg.payload.lateral.demandedCurvature == 0.0
+  assert msg.payload.lateral.deliveredCurvatureFraction == 0.0
+  assert msg.payload.lateral.torqueHeadroom == 0.0
+  assert msg.payload.lateral.signedTrackingDeficit == 0.0
+  assert msg.payload.lateral.authorityUnderDeliveryDurationS == 0.0
+  assert msg.payload.lateral.takeoverConfirmationDurationS == 0.0
+  assert msg.payload.lateral.demandedCurvature == 0.0
+  assert msg.payload.lateral.deliveredCurvatureFraction == 0.0
+  assert msg.payload.lateral.torqueHeadroom == 0.0
+  assert msg.payload.lateral.signedTrackingDeficit == 0.0
+  assert msg.payload.lateral.authorityUnderDeliveryDurationS == 0.0
+  assert msg.payload.lateral.takeoverConfirmationDurationS == 0.0
   assert not msg.payload.lateral.roadEvidenceWindowStartPresent
 
 

@@ -1,0 +1,57 @@
+{
+  "_doc": [
+    "Committed detector-v7 regression fixture from route 000000b7--a6b3b1f175.",
+    "The source is the route's canonical controlsState witness stream, with carState,",
+    "carControl, and carOutput held exactly as driving_eventd consumes them. The route",
+    "was decoded with its combo-v203 schema and each LateralSample input was serialized",
+    "without numeric rounding. Only three bounded windows are retained.",
+    "A separate continuous full-route replay established the census used for acceptance:",
+    "v6 = 26 events (23 turnStopTurn, 2 committedHandoffHarshness, 1 stallRelease);",
+    "v7 = those same 26 plus 18 torqueUnderDelivery and 41 driverTakeover events.",
+    "The three windows below are the owner-identified failed turns W1/W2/W3. They pin",
+    "the automatic evidence that replaces hand-matching takeover timestamps."
+  ],
+  "route": "000000b7--a6b3b1f175",
+  "fixture_csv": "b7_authority_windows.csv.zst",
+  "fixture_sha256": "dd8da3d215b39a4efaa671076a5f1cdcfec4ef16de92623db954bb1876b2f5ac",
+  "full_route_before_census": {
+    "turnStopTurn": 23,
+    "committedHandoffHarshness": 2,
+    "stallRelease": 1,
+    "torqueAuthority": 0
+  },
+  "full_route_after_census": {
+    "turnStopTurn": 23,
+    "committedHandoffHarshness": 2,
+    "stallRelease": 1,
+    "torqueAuthority": 0,
+    "torqueUnderDelivery": 18,
+    "driverTakeover": 41
+  },
+  "windows": [
+    {
+      "label": "W1",
+      "route_start_s": 92.0,
+      "route_end_s": 100.5,
+      "torque_under_delivery_occurred_s": 95.189,
+      "driver_takeover_occurred_s": 97.378,
+      "expected_takeover_severity": "critical"
+    },
+    {
+      "label": "W2",
+      "route_start_s": 377.0,
+      "route_end_s": 386.5,
+      "torque_under_delivery_occurred_s": 382.942,
+      "driver_takeover_occurred_s": 381.830,
+      "expected_takeover_severity": "critical"
+    },
+    {
+      "label": "W3",
+      "route_start_s": 634.0,
+      "route_end_s": 645.0,
+      "torque_under_delivery_occurred_s": 638.902,
+      "driver_takeover_occurred_s": 640.983,
+      "expected_takeover_severity": "critical"
+    }
+  ]
+}
