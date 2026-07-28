@@ -40,25 +40,36 @@ Version 8 uses the live-field-calibrated plant schedule described below.
 Version 7 removed both tournament candidates from shadowd. It copies the live
 LQI command, status, recovery state, and in-controlsd compute time from
 `controlsState`, and logs the command from the complete frozen-v14 pipeline.
-The recalibrated promoted controller reports version `202`. Version 202 keeps
+The selected response-surface controller reports version `203`. Version 203 keeps
 plant stiction and the observer clamp at the measured `0.09` while replacing
-the inverse feedforward's hard Coulomb sign flip with exact decision-cell
-zero-crossing averaging. Full breakaway remains available when departing
-stiction, and no sigma feel dial changes in this iteration.
+the moving-friction feedforward magnitude with the b7-selected `0.03`; full
+`0.09` breakaway remains available when departing stiction. It adds the
+curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
+leaving the three original sigma dials unchanged.
 
-### b7 response-surface iteration
+### b7 response-surface selection and accepted deviations
 
-The next candidate iteration is measurement-only until one cell clears the
-committed gates. It separates static breakaway from moving-friction
-feedforward: plant stiction and the observer clamp remain `0.09`, departure
-from a stationary rack retains `0.09`, and only moving decision cells consume
-the swept kinetic value. It also adds a curvature-space tracking tolerance,
-whose angle-state weight naturally falls with the vehicle model's
-curvature-per-steering-degree response at speed. The shipped seed omits both
-overrides so this scaffolding reproduces version 202 unless route-audit
-explicitly supplies a response-surface cell. No cell is authorized for live
-actuation until the b7 W1/W2/W3 completion evidence and signed turn-in,
-oscillation, and regression gates select it.
+The owner selected kinetic feedforward `0.03` and
+`sigma_curvature = 0.00091683 1/m` from the 16-cell b7 surface for staged field
+evaluation. Plant stiction and the observer clamp remain `0.09`; only moving
+decision cells use `0.03`. Curvature-space weighting naturally rolls tracking
+authority down with the vehicle model's curvature-per-steering-degree response
+at speed.
+
+Two failed gates are owner-authorized deviations, not passes:
+
+1. Raw worst-1-second torque-rate RMS is `28.89/s` versus v14's `26.08/s`.
+   The applied domain—the slew-limited signal reaching the rack—passes all
+   five metrics against v14, and the controller now reaches full authority in
+   sharp turns by design. The owner chose field evidence over another replay
+   iteration.
+2. The required 20–25, 25–30, and >30 m/s oscillation bands are unscoreable on
+   sole field route `000000b7--a6b3b1f175`, whose maximum speed is
+   `18.43 m/s`. In the measurable 15.6–20.1 m/s band, v203 is the calmest of
+   candidate/live/v14 (`0.02427 / 0.04268 / 0.05258` RMS). The
+   curvature-per-angle term gives approximately `0.41×` high-speed weight at
+   25 m/s versus low speed. The owner explicitly waived the unsatisfiable
+   coverage gate and elected staged field evaluation.
 The v14 controller and reference-planner source files are byte-identical to
 frozen authority commit `5e533e3ec6`; the passive adapter does not substitute a
 terminal FF/PID hybrid.

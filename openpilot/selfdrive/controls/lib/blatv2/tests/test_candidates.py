@@ -72,6 +72,13 @@ def test_shared_sigma_values_are_marked_as_provisional_owner_feel_dials():
     "sigma_y": (0.05, True, True),
     "sigma_heading": (0.01, True, True),
     "sigma_torque_rate": (0.5, True, True),
+    "sigma_curvature": (0.00091683, True, True),
+  }
+  assert payload["kinetic_friction"] == {
+    "value": 0.03,
+    "units": "normalized torque",
+    "owner_feel_dial": False,
+    "provisional": True,
   }
 
 

@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 202
+LIVE_CONTROLLER_VERSION = 203
 
 
 class CandidateStatus(IntEnum):
@@ -51,10 +51,10 @@ class ObserverStatus(IntEnum):
 class ControllerParams:
   """Controller tolerances plus the physical observer time scale.
 
-  ``sigma_curvature`` and ``kinetic_friction`` are response-surface overrides
-  until a measured cell is selected. A zero curvature tolerance disables the
-  additive tracking term; the kinetic default preserves the shipped
-  full-breakaway feedforward.
+  ``sigma_curvature`` and ``kinetic_friction`` are the b7 response-surface
+  axes selected for v203. A zero curvature tolerance remains available to
+  reproduce the pre-selection controller in replay; the kinetic default
+  preserves its full-breakaway feedforward.
   """
 
   sigma_y: float
