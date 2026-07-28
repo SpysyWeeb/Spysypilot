@@ -8,12 +8,13 @@ Numerical contract
   degrees/second, normalized torque on [-1, 1], and vehicle speed in m/s.
 * ``k_t`` is deg/s² per normalized effective torque, ``b_steer`` is 1/s, and
   ``t_breakaway`` is normalized torque.
-* Tire self-aligning load mirrors frozen-v14's measurement convention exactly:
+* Tire self-aligning load preserves frozen-v14's measurement convention:
   offset-corrected steering angle enters the vehicle model with live roll,
   stiffness, and steer ratio; measured curvature becomes lateral acceleration;
-  roll gravity and ``latAccelOffset`` are removed; and ``latAccelFactor`` maps
-  that acceleration to normalized torque. Calibration friction is deliberately
-  excluded because ``t_breakaway`` owns Coulomb friction.
+  and roll gravity plus ``latAccelOffset`` are removed. A seed-file schedule
+  then maps that acceleration to normalized torque with linear interpolation
+  between speed nodes and flat extrapolation beyond them. Calibration friction
+  is deliberately excluded because ``t_breakaway`` owns Coulomb friction.
 * Aligning torque is subtracted from applied torque before ``k_t``. Invalid live
   parameters use zero roll/angle offset and nominal stiffness/steer ratio for
   that frame only; inputs are explicit and never retained by the plant.
@@ -63,12 +64,15 @@ class PlantParams:
   delta_down: int
   steer_step: int
   provisional: bool
+  torque_per_lataccel_speed_nodes: tuple[float, ...]
+  torque_per_lataccel_values: tuple[float, ...]
 
   @classmethod
   def from_seed_file(cls, path: str | Path, controller_params: Any) -> PlantParams:
     with Path(path).open(encoding="utf-8") as stream:
       seed = json.load(stream)
 
+    steady_state = seed["steady_state_torque_per_lateral_accel"]
     params = cls(
       k_t=float(seed["k_t"]),
       b_steer=float(seed["b_steer"]),
@@ -79,6 +83,12 @@ class PlantParams:
       delta_down=int(controller_params.STEER_DELTA_DOWN),
       steer_step=int(controller_params.STEER_STEP),
       provisional=bool(seed["provisional"]),
+      torque_per_lataccel_speed_nodes=tuple(
+        float(value) for value in steady_state["speed_nodes_mps"]
+      ),
+      torque_per_lataccel_values=tuple(
+        float(value) for value in steady_state["torque_per_mps2"]
+      ),
     )
     params._validate()
     return params
@@ -96,6 +106,31 @@ class PlantParams:
       raise ValueError("plant physical parameters are outside their valid domain")
     if self.steer_max <= 0 or self.delta_up <= 0 or self.delta_down <= 0 or self.steer_step <= 0:
       raise ValueError("actuator limits must be positive")
+    nodes = self.torque_per_lataccel_speed_nodes
+    values = self.torque_per_lataccel_values
+    if len(nodes) < 2 or len(nodes) != len(values):
+      raise ValueError("steady-state torque schedule must have equal-length nodes and values")
+    if not all(math.isfinite(value) for value in (*nodes, *values)):
+      raise ValueError("steady-state torque schedule must be finite")
+    if nodes[0] < 0.0 or any(right <= left for left, right in zip(nodes, nodes[1:], strict=False)):
+      raise ValueError("steady-state torque speed nodes must be non-negative and strictly increasing")
+    if any(value <= 0.0 for value in values):
+      raise ValueError("steady-state torque gains must be positive")
+
+  def torque_per_lateral_accel(self, v_ego: float) -> float:
+    """Return the calibrated steady-state gain with pinned flat extrapolation."""
+    speed = abs(float(v_ego))
+    if not math.isfinite(speed):
+      raise ValueError("vehicle speed must be finite")
+    nodes = self.torque_per_lataccel_speed_nodes
+    values = self.torque_per_lataccel_values
+    if speed <= nodes[0]:
+      return values[0]
+    for index in range(1, len(nodes)):
+      if speed <= nodes[index]:
+        fraction = (speed - nodes[index - 1]) / (nodes[index] - nodes[index - 1])
+        return values[index - 1] + fraction * (values[index] - values[index - 1])
+    return values[-1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +142,6 @@ class AlignParams:
   tire_stiffness_rear: float
   nominal_steer_ratio: float
   steer_ratio_rear: float
-  lat_accel_factor: float
   lat_accel_offset: float
 
   @classmethod
@@ -120,7 +154,6 @@ class AlignParams:
       tire_stiffness_rear=float(car_params.tireStiffnessRear),
       nominal_steer_ratio=float(car_params.steerRatio),
       steer_ratio_rear=float(car_params.steerRatioRear),
-      lat_accel_factor=float(torque_params.latAccelFactor),
       lat_accel_offset=float(torque_params.latAccelOffset),
     )
     params._validate()
@@ -135,7 +168,6 @@ class AlignParams:
       self.tire_stiffness_rear,
       self.nominal_steer_ratio,
       self.steer_ratio_rear,
-      self.lat_accel_factor,
       self.lat_accel_offset,
     )
     if not all(math.isfinite(value) for value in values):
@@ -147,7 +179,6 @@ class AlignParams:
       or self.tire_stiffness_front <= 0.0
       or self.tire_stiffness_rear <= 0.0
       or self.nominal_steer_ratio <= 0.0
-      or self.lat_accel_factor <= 0.0
     ):
       raise ValueError("alignment parameters are outside their physical domain")
 
@@ -320,8 +351,12 @@ class PlantTwin:
       - align_inputs.roll * ACCELERATION_DUE_TO_GRAVITY
       - p.lat_accel_offset
     )
-    # Controller output is the negative of torque_from_lateral_accel.
-    return -(gravity_adjusted / p.lat_accel_factor)
+    # Platform output is the negative of the signed log-space fit. The gain is
+    # a magnitude; rate-sign hysteresis is modeled separately by t_breakaway.
+    return -(
+      gravity_adjusted
+      * self.params.torque_per_lateral_accel(speed)
+    )
 
   def _next_rate(
     self,

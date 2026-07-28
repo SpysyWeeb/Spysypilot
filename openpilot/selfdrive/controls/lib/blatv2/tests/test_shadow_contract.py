@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from openpilot.selfdrive.controls.blatv2_shadowd import PUBLISHED_SERVICES, SHADOW_VERSION, SUBSCRIBED_SERVICES
+from openpilot.selfdrive.controls.lib.blatv2.controller import LIVE_CONTROLLER_VERSION
 
 
 def test_shadow_is_structurally_telemetry_only():
@@ -37,8 +38,9 @@ def test_shadow_runs_below_controlsd_on_the_same_realtime_core():
   assert "config_realtime_process(4, Priority.CTRL_HIGH)" not in source
 
 
-def test_shadow_v7_schema_has_live_lqi_and_exact_v14_fields():
-  assert SHADOW_VERSION == 7
+def test_shadow_v8_schema_has_live_lqi_and_exact_v14_fields():
+  assert SHADOW_VERSION == 8
+  assert LIVE_CONTROLLER_VERSION == 201
   schema = Path("openpilot/cereal/log.capnp").read_text()
   shadow_source = Path(
     "openpilot/selfdrive/controls/blatv2_shadowd.py",
@@ -70,7 +72,7 @@ def test_shadow_v7_schema_has_live_lqi_and_exact_v14_fields():
   assert "v14CommandTorque @33 :Float64;" in schema
   assert "v14ControllerVersion @35 :Int32;" in schema
   assert "liveLqiControllerVersion @38 :Int32;" in schema
-  # The old wire slots decode historical routes but shadow v7 neither solves
+  # The old wire slots decode historical routes but shadow v8 neither solves
   # nor publishes either retired tournament candidate.
   assert "self.core.compute_mpc()" not in shadow_source
   assert "self.core.compute_fallback()" not in shadow_source

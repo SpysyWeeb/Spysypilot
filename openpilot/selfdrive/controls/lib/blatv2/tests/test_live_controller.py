@@ -101,7 +101,6 @@ def test_invalid_holds_once_decays_then_latches_comm_issue():
   first_output_valid = bool(first.output_valid)
   assert first_torque == 0.5
   assert first_output_valid
-
   second = step(live, model_valid=False)
   second_torque = float(second.command_torque)
   assert second_torque == 0.5 - 7.0 / 409.0

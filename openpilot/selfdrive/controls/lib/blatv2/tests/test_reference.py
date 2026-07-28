@@ -7,11 +7,25 @@ from openpilot.selfdrive.controls.lib.blatv2.reference import build_reference, h
 
 
 def params() -> PlantParams:
-  return PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+  return PlantParams(
+    4000.0,
+    10.0,
+    0.09,
+    0.12,
+    409,
+    4,
+    7,
+    1,
+    True,
+    (2.5, 5.5, 8.5, 12.0, 16.5, 21.0),
+    (0.85, 0.39, 0.38, 0.36, 0.286, 0.288),
+  )
 
 
 def align_params() -> AlignParams:
-  return AlignParams(2000.0, 3.0, 1.2, 100000.0, 110000.0, 15.0, 0.0, 2.5, 0.0)
+  return AlignParams(
+    2000.0, 3.0, 1.2, 100000.0, 110000.0, 15.0, 0.0, 0.0
+  )
 
 
 class TestReference(unittest.TestCase):

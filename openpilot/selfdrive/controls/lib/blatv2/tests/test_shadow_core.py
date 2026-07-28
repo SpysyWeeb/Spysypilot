@@ -11,6 +11,22 @@ from openpilot.selfdrive.controls.blatv2_shadowd import populate_shadow_message
 from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import V14ShadowResult
 
 
+def plant_params() -> PlantParams:
+  return PlantParams(
+    4000.0,
+    10.0,
+    0.09,
+    0.12,
+    409,
+    4,
+    7,
+    1,
+    True,
+    (2.5, 5.5, 8.5, 12.0, 16.5, 21.0),
+    (0.85, 0.39, 0.38, 0.36, 0.286, 0.288),
+  )
+
+
 def namespace(**kwargs):
   return SimpleNamespace(**kwargs)
 
@@ -71,7 +87,7 @@ def result_values(result):
 
 
 def test_shared_core_is_deterministic_and_residual_valid_after_bootstrap():
-  params = PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+  params = plant_params()
   torque = namespace(latAccelFactor=2.5, latAccelOffset=0.0, friction=0.1)
   car_state = namespace(vEgo=10.0, steeringAngleDeg=2.0, steeringRateDeg=0.5, steeringPressed=False, standstill=False)
   car_output = namespace(actuatorsOutput=namespace(torque=-0.1))
@@ -107,7 +123,7 @@ def test_shared_core_is_deterministic_and_residual_valid_after_bootstrap():
 
 
 def test_valid_core_result_serializes_at_capnp_publish_boundary():
-  params = PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+  params = plant_params()
   torque = namespace(
     latAccelFactor=2.5,
     latAccelOffset=0.0,
@@ -152,7 +168,7 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     live_lqi_output_valid=True,
     live_lqi_invalid_frames=0,
     live_lqi_recovery_ok_frames=10,
-    live_lqi_controller_version=200,
+    live_lqi_controller_version=201,
     v14_result=V14ShadowResult(-0.07, 0.01, True, 14),
     v14_compute_seconds=0.0002,
   )
@@ -162,13 +178,13 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
   assert message.blatV2Shadow.sharedComputeTimeSeconds == 0.0001
   assert message.blatV2Shadow.liveLqiCommandTorque == -0.08
   assert message.blatV2Shadow.liveLqiComputeTimeSeconds == 0.0008
-  assert message.blatV2Shadow.liveLqiControllerVersion == 200
+  assert message.blatV2Shadow.liveLqiControllerVersion == 201
   assert message.blatV2Shadow.v14CommandTorque == -0.07
   assert message.blatV2Shadow.v14ControllerVersion == 14
 
 
 def test_shared_core_has_no_unbounded_allocation_growth():
-  params = PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+  params = plant_params()
   torque = namespace(latAccelFactor=2.5, latAccelOffset=0.0, friction=0.1)
   car_state = namespace(vEgo=10.0, steeringAngleDeg=2.0, steeringRateDeg=0.5, steeringPressed=False, standstill=False)
   car_output = namespace(actuatorsOutput=namespace(torque=-0.1))
@@ -209,7 +225,7 @@ def test_shared_core_has_no_unbounded_allocation_growth():
 
 
 def test_invalid_live_parameters_use_zero_inputs_without_stale_carryover():
-  params = PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+  params = plant_params()
   torque = namespace(latAccelFactor=2.5, latAccelOffset=0.0, friction=0.1)
   car_state = namespace(vEgo=10.0, steeringAngleDeg=2.0, steeringRateDeg=0.5, steeringPressed=False, standstill=False)
   car_output = namespace(actuatorsOutput=namespace(torque=-0.1))
