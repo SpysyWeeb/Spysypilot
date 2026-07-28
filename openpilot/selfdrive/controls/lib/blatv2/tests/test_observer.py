@@ -3,7 +3,19 @@ from openpilot.selfdrive.controls.lib.blatv2.observer import DisturbanceObserver
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 
 
-PLANT_PARAMS = PlantParams(4000.0, 10.0, 0.05, 0.12, 409, 4, 7, 1, True)
+PLANT_PARAMS = PlantParams(
+  4000.0,
+  10.0,
+  0.09,
+  0.12,
+  409,
+  4,
+  7,
+  1,
+  True,
+  (2.5, 5.5, 8.5, 12.0, 16.5, 21.0),
+  (0.85, 0.39, 0.38, 0.36, 0.286, 0.288),
+)
 CONTROLLER_PARAMS = ControllerParams(0.05, 0.01, 0.5, 0.5, True)
 
 
