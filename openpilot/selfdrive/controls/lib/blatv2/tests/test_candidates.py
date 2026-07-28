@@ -25,8 +25,22 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import (
 )
 
 
-PLANT_PARAMS = PlantParams(4000.0, 10.0, 0.05, 0.0, 409, 4, 7, 1, True)
-ALIGN_PARAMS = AlignParams(2000.0, 3.0, 1.2, 100000.0, 110000.0, 15.0, 0.0, 2.5, 0.0)
+PLANT_PARAMS = PlantParams(
+  4000.0,
+  10.0,
+  0.09,
+  0.0,
+  409,
+  4,
+  7,
+  1,
+  True,
+  (2.5, 5.5, 8.5, 12.0, 16.5, 21.0),
+  (0.85, 0.39, 0.38, 0.36, 0.286, 0.288),
+)
+ALIGN_PARAMS = AlignParams(
+  2000.0, 3.0, 1.2, 100000.0, 110000.0, 15.0, 0.0, 0.0
+)
 CONTROLLER_PARAMS = ControllerParams(0.05, 0.01, 0.5, 0.5, True)
 ALIGN_INPUTS = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
 REFERENCE_TIMES = np.asarray((0.0, 0.5, 1.0), dtype=np.float64)

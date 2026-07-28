@@ -32,14 +32,16 @@ ground-up design and does not inherit that controller.
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 7. It reports reference and
+The shadow event is `blatV2Shadow`, version 8. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 7 removes both tournament candidates from shadowd. It copies the live
+Version 8 uses the live-field-calibrated plant schedule described below.
+Version 7 removed both tournament candidates from shadowd. It copies the live
 LQI command, status, recovery state, and in-controlsd compute time from
 `controlsState`, and logs the command from the complete frozen-v14 pipeline.
-The promoted controller reports version `200` in the same behavior commit.
+The recalibrated promoted controller reports version `201` in the same
+behavior commit.
 The v14 controller and reference-planner source files are byte-identical to
 frozen authority commit `5e533e3ec6`; the passive adapter does not substitute a
 terminal FF/PID hybrid.
@@ -86,11 +88,25 @@ reset reasons, respectively.
 
 Version 2 added the self-aligning tire load omitted by version 1. It mirrors
 frozen-v14's measurement pipeline: offset-corrected steering angle enters the
-vehicle model with live roll/stiffness/steer ratio, and the resulting lateral
-acceleration is mapped through the existing torque calibration without its
-friction term. `t_breakaway` remains the sole Coulomb-friction model. Invalid
-`liveParameters` uses zero roll/angle offset and nominal vehicle parameters for
-that frame, with `alignInputsValid = false`; no stale values are carried.
+vehicle model with live roll/stiffness/steer ratio. Version 8 retains that
+geometry, roll, offset, and platform-sign convention, but replaces the
+constant live-calibration slope with the measured steady-state
+torque-per-lateral-acceleration schedule in `plant_seed_params.json`. The six
+nodes are 2.5/5.5/8.5/12.0/16.5/21.0 m/s with gains
+0.85/0.39/0.38/0.36/0.286/0.288 normalized torque per m/s². Interpolation is
+linear and extrapolation is flat. The fit used 104k clean engaged frames from
+LQI route `000000b6--6d24c922f5` with v14 route
+`000000b5--751a540298` as controller-independent cross-validation; the
+low-speed node is b5-weighted because b6 was under-actuated there. The method
+authority is route-audit `phase0/plant_fit_reference.py` at `313de6b`.
+
+`t_breakaway = 0.09` remains the sole Coulomb-friction model and automatically
+bounds the observer to ±0.09. `k_t = 4000 deg/s²`, `b_steer = 10 1/s`, the
+0.12 s seed delay, and all sigma feel dials are unchanged. The plant parameters
+remain provisional under continuous calibration from future casual routes.
+Invalid `liveParameters` uses zero roll/angle offset and nominal vehicle
+parameters for that frame, with `alignInputsValid = false`; no stale values are
+carried.
 `vEgo`, `aligningTorque`, and `alignInputsValid` describe the state-t side of
 the reported state-t → state-t+1 residual (the bootstrap frame reports its
 current state), so fit tooling can decompose each residual without shifting

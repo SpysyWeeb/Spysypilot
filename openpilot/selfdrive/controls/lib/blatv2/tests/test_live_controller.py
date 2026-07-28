@@ -95,10 +95,16 @@ def test_invalid_holds_once_decays_then_latches_comm_issue():
   live.command_torque = 0.5
 
   first = step(live, model_valid=False)
-  assert first.command_torque == 0.5
-  assert first.output_valid
+  # LiveLQIController intentionally reuses one preallocated result object.
+  # Snapshot values before the next step mutates that same object.
+  first_torque = float(first.command_torque)
+  first_output_valid = bool(first.output_valid)
+  assert first_torque == 0.5
+  assert first_output_valid
   second = step(live, model_valid=False)
-  assert 0.0 < second.command_torque < first.command_torque
+  second_torque = float(second.command_torque)
+  assert second_torque == 0.5 - 7.0 / 409.0
+  assert 0.0 < second_torque < first_torque
 
   result = second
   for _ in range(INVALID_DISENGAGE_FRAMES - 2):
@@ -106,6 +112,14 @@ def test_invalid_holds_once_decays_then_latches_comm_issue():
   assert result.command_torque == 0.0
   assert not result.output_valid
   assert result.invalid_frames == INVALID_DISENGAGE_FRAMES
+
+  for expected in range(1, RECOVERY_OK_FRAMES):
+    recovering = step(live, model_valid=True, lateral_active=False)
+    assert recovering.recovery_ok_frames == expected
+    assert not recovering.output_valid
+  recovered = step(live, model_valid=True, lateral_active=False)
+  assert recovered.recovery_ok_frames == RECOVERY_OK_FRAMES
+  assert recovered.output_valid
 
 
 def test_comm_issue_and_controller_recover_on_same_tenth_ok_frame():
