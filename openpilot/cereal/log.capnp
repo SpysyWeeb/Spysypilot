@@ -954,6 +954,15 @@ struct ControlsState @0x97ff69c53601abf1 {
     referenceSustainedUnwindScale @71 :Float32;           # unwind confidence sustained across the release-preview horizon
     referenceEpisodeTargetTorque @72 :Float32;           # later geometric torque used to confirm episode handoff
     referenceEpisodeLateralAccel @73 :Float32;           # later geometric lateral acceleration used to reject friction-only sign flips
+    # BLaTv2 live promotion telemetry. The preceding frozen-v14 slots remain
+    # permanently assigned for old-route wire compatibility even when the
+    # active controller leaves them unpopulated.
+    blatV2Status @74 :UInt8;
+    blatV2ComputeTimeSeconds @75 :Float64;
+    blatV2OutputValid @76 :Bool;
+    blatV2InvalidFrames @77 :UInt16;
+    blatV2RecoveryOkFrames @78 :UInt8;
+    blatV2CommandTorque @79 :Float64;
    }
 
   struct LateralAngleState {
@@ -3072,6 +3081,18 @@ struct BlatV2Shadow {
   fallbackComputeTimeSeconds @24 :Float64;
   sharedComputeTimeSeconds @25 :Float64;
   mpcAvailableScheduleCount @26 :UInt16;
+  liveLqiCommandTorque @27 :Float64;
+  liveLqiStatus @28 :UInt8;
+  liveLqiComputeTimeSeconds @29 :Float64;
+  liveLqiOutputValid @30 :Bool;
+  liveLqiInvalidFrames @31 :UInt16;
+  liveLqiRecoveryOkFrames @32 :UInt8;
+  v14CommandTorque @33 :Float64;
+  v14DesiredCurvature @34 :Float64;
+  v14ControllerVersion @35 :Int32;
+  v14Valid @36 :Bool;
+  v14ComputeTimeSeconds @37 :Float64;
+  liveLqiControllerVersion @38 :Int32;
 }
 
 struct Touch {
