@@ -349,6 +349,12 @@ def test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence():
   payload.unwindReferenceTargetTorqueAtTrigger = -0.12
   payload.unwindAppliedTargetGapAtTrigger = 0.30
   payload.unwindPeakAppliedTargetGap = 0.35
+  payload.demandedCurvature = 0.123456
+  payload.deliveredCurvatureFraction = 0.65
+  payload.torqueHeadroom = 0.384
+  payload.signedTrackingDeficit = 0.42
+  payload.authorityUnderDeliveryDurationS = 1.01
+  payload.takeoverConfirmationDurationS = 0.30
 
   record = event_to_record(
     msg.as_reader().drivingEvent, None, "route", 1, event.detectedMonoTime,
@@ -409,6 +415,12 @@ def test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence():
   assert serialized["unwind_reference_target_torque_at_trigger"] == -0.12
   assert serialized["unwind_applied_target_gap_at_trigger"] == 0.3
   assert serialized["unwind_peak_applied_target_gap"] == 0.35
+  assert serialized["demanded_curvature"] == 0.123456
+  assert serialized["delivered_curvature_fraction"] == 0.65
+  assert serialized["torque_headroom"] == 0.384
+  assert serialized["signed_tracking_deficit"] == 0.42
+  assert serialized["authority_under_delivery_duration_s"] == 1.01
+  assert serialized["takeover_confirmation_duration_s"] == 0.3
 
 
 def test_old_lateral_payload_defaults_remain_indexable_and_v5_release_is_structured():
@@ -662,17 +674,18 @@ def test_designation_priority_ordering_manual_outranks_everything(tmp_path):
       driving_event_message(
         "assistedunwind", "group", "lat.unwindProgressDeficit", base + 6, driver_assisted_unwind=True,
       ),
-      driving_event_message("manual", "group", "manual.general", base + 7, domain="manual"),
+      driving_event_message("takeover", "group", "lat.driverTakeover", base + 7),
+      driving_event_message("manual", "group", "manual.general", base + 8, domain="manual"),
     ]
 
-  assert scan_once(log_root, event_root, reader) == 7
+  assert scan_once(log_root, event_root, reader) == 8
   records = {
     json.loads(line)["event_id"]: json.loads(line)
     for line in (event_root / MANIFEST_NAME).read_text().splitlines()
   }
   assert records["manual"]["group_role"] == "primary"
   assert records["manual"]["primary_event_id"] == "manual"
-  for event_id in ("stall", "long", "turnstop", "handoff", "autounwind", "assistedunwind"):
+  for event_id in ("stall", "long", "turnstop", "handoff", "autounwind", "assistedunwind", "takeover"):
     assert records[event_id]["group_role"] == "secondary"
     assert records[event_id]["primary_event_id"] == "manual"
 
@@ -698,17 +711,18 @@ def test_designation_priority_ordering_among_automatic_tiers(tmp_path):
       driving_event_message(
         "assistedunwind", "group", "lat.unwindProgressDeficit", base + 6, driver_assisted_unwind=True,
       ),
+      driving_event_message("takeover", "group", "lat.driverTakeover", base + 7),
     ]
 
-  assert scan_once(log_root, event_root, reader) == 6
+  assert scan_once(log_root, event_root, reader) == 7
   records = {
     json.loads(line)["event_id"]: json.loads(line)
     for line in (event_root / MANIFEST_NAME).read_text().splitlines()
   }
-  assert records["assistedunwind"]["group_role"] == "primary"
-  for event_id in ("stall", "long", "turnstop", "handoff", "autounwind"):
+  assert records["takeover"]["group_role"] == "primary"
+  for event_id in ("stall", "long", "turnstop", "handoff", "autounwind", "assistedunwind"):
     assert records[event_id]["group_role"] == "secondary"
-    assert records[event_id]["primary_event_id"] == "assistedunwind"
+    assert records[event_id]["primary_event_id"] == "takeover"
   # driver_causation == "interventionBacked" is equivalent to the
   # driver_assisted_unwind flag for this priority tier.
   assert records["autounwind"]["group_role"] == "secondary"

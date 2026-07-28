@@ -31,6 +31,7 @@ CONTEXT_AFTER = 1
 # older (v5-era and earlier) records always self-designate as primary.
 DESIGNATION_MIN_VERSION = 3
 GROUP_PRIMARY_PRIORITY_MANUAL = 110
+GROUP_PRIMARY_PRIORITY_DRIVER_TAKEOVER = 105
 GROUP_PRIMARY_PRIORITY_DRIVER_ASSISTED_UNWIND = 100
 GROUP_PRIMARY_PRIORITY_AUTONOMOUS_UNWIND = 90
 GROUP_PRIMARY_PRIORITY_HANDOFF = 80
@@ -42,6 +43,8 @@ GROUP_PRIMARY_PRIORITY_DEFAULT = 0
 GROUP_PRIMARY_PRIORITY: dict[str, int] = {
   "manual.general": GROUP_PRIMARY_PRIORITY_MANUAL,
   "lat.unwindProgressDeficit": GROUP_PRIMARY_PRIORITY_AUTONOMOUS_UNWIND,
+  "lat.driverTakeover": GROUP_PRIMARY_PRIORITY_DRIVER_TAKEOVER,
+  "lat.torqueUnderDelivery": GROUP_PRIMARY_PRIORITY_AUTONOMOUS_UNWIND,
   "lat.handoffMismatch": GROUP_PRIMARY_PRIORITY_HANDOFF,
   "lat.centerOvershoot": GROUP_PRIMARY_PRIORITY_HANDOFF,
   "lat.committedHandoffHarshness": GROUP_PRIMARY_PRIORITY_HANDOFF,
@@ -278,6 +281,12 @@ def _payload(event: Any) -> dict[str, Any]:
       "road_evidence_window_start_mono_time": int(value.roadEvidenceWindowStartMonoTime),
       "road_evidence_window_start_present": bool(value.roadEvidenceWindowStartPresent),
       "driver_assist_raw_torque_only": bool(value.driverAssistRawTorqueOnly),
+      "demanded_curvature": round(float(value.demandedCurvature), 6),
+      "delivered_curvature_fraction": round(float(value.deliveredCurvatureFraction), 4),
+      "torque_headroom": round(float(value.torqueHeadroom), 4),
+      "signed_tracking_deficit": round(float(value.signedTrackingDeficit), 4),
+      "authority_under_delivery_duration_s": round(float(value.authorityUnderDeliveryDurationS), 4),
+      "takeover_confirmation_duration_s": round(float(value.takeoverConfirmationDurationS), 4),
       "stall_releases": [{
         "release_mono_time": int(release.releaseMonoTime),
         "offset_from_trigger_s": round(float(release.offsetFromTriggerS), 4),

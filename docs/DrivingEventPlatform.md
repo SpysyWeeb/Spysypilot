@@ -63,7 +63,7 @@ indexer repairs the current and following xattrs, retaining the requested
 two-before/current/one-after window without consuming four preservation-quota
 entries per event.
 
-The lateral detector version 5 is in progress. It preserves version 4's
+The lateral detector version 7 is in progress. Version 5 preserves version 4's
 interpolated signed steering
 center crossing only after the wheel was established outside 25 degrees, then
 waits for desired-trajectory commitment evidence. A requested reversal may
@@ -405,6 +405,62 @@ physical events are about 95 seconds apart. Route 92 pull-aways near 09:06:49
 and 09:17:10 both cross rolling-lead trigger criteria, with replay evidence
 currently attributing the lag downstream/vehicle rather than forcing the
 provisional planner expectation.
+
+### Lateral detector version 7
+
+Route `000000b7--a6b3b1f175` showed that the original
+`lat.torqueAuthority` condition encodes a controller-specific assumption:
+both requested and applied torque must remain above 0.95 for one second while
+tracking error grows. That remains the correct saturated-authority event, but
+it cannot see a controller that leaves authority unused. W2, the route's
+tightest failed turn, peaked at only 0.616 requested torque while delivering
+65% of demanded curvature. W3 peaked at 0.733 while delivering 85%. W1
+briefly approached saturation, but only five of 739 hands-off frames reached
+full authority; it did not satisfy the existing detector's sustained
+saturation requirement.
+
+Version 7 adds the complementary `lat.torqueUnderDelivery` condition. It
+requires all of the following continuously for 1.0 second:
+
+- absolute desired lateral acceleration above 0.35 m/s²;
+- direction-normalized lateral-acceleration deficit above 0.15 m/s²;
+- delivered fraction at or below 0.80; and
+- requested-torque headroom of at least 0.25.
+
+The headroom and delivered-fraction envelope was selected from a b7 threshold
+sweep, not by feel. It is the strongest tested envelope that retained W2 and
+W3 without flooding; the continuous replay emits 18 events, while looser
+candidate envelopes emitted 25–34. W1, W2, and W3 all surface.
+
+Version 7 also emits `lat.driverTakeover` when `steeringPressed` begins while
+lateral control is active and remains asserted for 0.30 seconds. B7 contained
+75 raw active press onsets and 41 lasting at least 0.30 seconds, matching the
+route's roughly forty genuine override episodes while rejecting incidental
+touches. The event occurrence time is the press onset, detection time is the
+later confirmation, and it is emitted once per continuous press. Its severity
+uses the preceding two seconds of demand, tracking deficit, delivery, and
+headroom context. The event is attributed to the driver and never suppressed,
+downgraded, or marked driver-confounded: the interaction is the evidence, not
+contamination of other evidence.
+
+The universal envelope is now version 4. New `LateralPayload` fields are
+strictly appended at `@166`–`@171`: demanded curvature, delivered-curvature
+fraction, torque headroom, signed tracking deficit, under-delivery duration,
+and takeover-confirmation duration. Existing ordinals and meanings are
+unchanged.
+
+Full b7 replay preserves the version-6 census exactly (23
+`turnStopTurn`, two `committedHandoffHarshness`, one `stallRelease`, and zero
+`torqueAuthority`) and adds 18 `torqueUnderDelivery` plus 41
+`driverTakeover`. The committed W1/W2/W3 fixture pins both new events at each
+owner-identified failed turn. Detector-only timing over 121,102 b7 frames
+moves from 1.46 to 1.95 microseconds median and 2.72 to 3.38 microseconds p99;
+the added checks do not create a material on-device scheduling load.
+
+`turnStopTurn` keeps its existing six-second-before/two-second-after
+detection window. Gate-side phase extension already owns complete-phase
+measurement; widening every on-device event would duplicate that solution
+and increase preserved/uploaded context.
 
 ## Reviews
 
