@@ -40,7 +40,7 @@ from openpilot.selfdrive.spysypilot.stop_jolt_detector import (
 )
 
 
-EVENT_VERSION = 3
+EVENT_VERSION = 4
 GROUP_WINDOW_NS = 2_500_000_000
 # Strictly greater than lat_event_detector.EPISODE_MAX_LIFETIME_S (20.0 s) plus
 # occurred-time slack: a keyed group's physical episode can never legitimately
@@ -202,25 +202,36 @@ def manual_candidate(occurred_mono_time: int) -> EventCandidate:
 
 
 def lateral_candidate(sample: LateralSample, detection: LateralDetection) -> EventCandidate:
-  attribution = "actuator" if detection.event_type == "torqueAuthority" else "controller"
+  is_takeover = detection.event_type == "driverTakeover"
+  attribution = (
+    "driver" if is_takeover
+    else "actuator" if detection.event_type == "torqueAuthority"
+    else "controller"
+  )
   normalized_event_types = {
     "unwind_progress_deficit": "unwindProgressDeficit",
     "turn_stop_turn": "turnStopTurn",
   }
   event_type = normalized_event_types.get(detection.event_type, detection.event_type)
   evidence = detection.evidence
-  driver_confounded = evidence.driver_confounded_any if evidence is not None else sample.driver_confounded
+  # A takeover is the driver-interaction ground truth itself, not an
+  # otherwise-valid controller event contaminated by driver input.
+  driver_confounded = (
+    False if is_takeover
+    else evidence.driver_confounded_any if evidence is not None
+    else sample.driver_confounded
+  )
   road_confounded = evidence.road_confounded_any if evidence is not None else sample.road_confounded
   substantial_driver = evidence is not None and evidence.driver_interaction == "confirmedSteeringPressed"
   substantial_road = evidence is not None and evidence.road_interaction == "substantial"
-  if substantial_driver or substantial_road:
+  if not is_takeover and (substantial_driver or substantial_road):
     attribution = "mixed"
   # A7: bounded confidence penalty for substantial road confounding, applied
   # BEFORE constructing the frozen EventCandidate; never applied to an
   # intervention-backed / driver-assisted unwind rescue (the 0.95-confidence
   # literal wins there). The floor is an invariant, not a claimed engagement.
   confidence = detection.confidence
-  if substantial_road:
+  if substantial_road and not is_takeover:
     rescued = evidence.driver_causation == "interventionBacked" or evidence.driver_assisted_unwind
     if not rescued:
       confidence = max(confidence - ROAD_SUBSTANTIAL_CONFIDENCE_PENALTY, ROAD_CONFIDENCE_FLOOR)
@@ -360,7 +371,10 @@ class DrivingEventPlatform:
       try:
         detection = self.lateral_detector.update(lateral_sample)
         if detection is not None:
-          candidates.append(lateral_candidate(lateral_sample, detection))
+          detections = detection if isinstance(detection, (list, tuple)) else (detection,)
+          candidates.extend(
+            lateral_candidate(lateral_sample, item) for item in detections
+          )
       except Exception:
         self.on_error("lateral")
 
@@ -732,6 +746,21 @@ def build_message(event: AcceptedEvent, git_commit: str = "", git_branch: str = 
       payload.roadEvidenceWindowStartPresent = road_evidence_window_start_present
       payload.roadEvidenceWindowStartMonoTime = (
         round(float(road_evidence_window_start) * 1e9) if road_evidence_window_start_present else 0
+      )
+      # v7 under-delivery/takeover onset context (@166-@171).
+      payload.demandedCurvature = float(getattr(evidence, "demanded_curvature", 0.0))
+      payload.deliveredCurvatureFraction = float(
+        getattr(evidence, "delivered_curvature_fraction", 0.0),
+      )
+      payload.torqueHeadroom = float(getattr(evidence, "torque_headroom", 0.0))
+      payload.signedTrackingDeficit = float(
+        getattr(evidence, "signed_tracking_deficit", 0.0),
+      )
+      payload.authorityUnderDeliveryDurationS = float(
+        getattr(evidence, "authority_under_delivery_duration_s", 0.0),
+      )
+      payload.takeoverConfirmationDurationS = float(
+        getattr(evidence, "takeover_confirmation_duration_s", 0.0),
       )
       releases = payload.init("stallReleases", len(evidence.stall_releases))
       for index, release in enumerate(evidence.stall_releases):

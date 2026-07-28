@@ -138,8 +138,8 @@ def stall_release_event(detector: LateralEventDetector, *,
   return event
 
 
-def test_lateral_detector_version_six():
-  assert DETECTOR_VERSION == 6
+def test_lateral_detector_version_seven():
+  assert DETECTOR_VERSION == 7
 
 
 def test_inactive_never_triggers():
@@ -147,6 +147,124 @@ def test_inactive_never_triggers():
   for i in range(200):
     event = detector.update(sample(i * 0.01, active=False, steering_rate_deg=200.0, request_torque=1.0, applied_torque=1.0))
     assert event is None
+
+
+def test_torque_under_delivery_requires_sustained_error_and_unused_headroom():
+  detector = LateralEventDetector(cooldown=0.0)
+  event = None
+  for index in range(102):
+    result = detector.update(sample(
+      index * 0.01,
+      v_ego=4.0,
+      desired_lateral_accel=1.0,
+      actual_lateral_accel=0.5,
+      request_torque=0.6,
+      applied_torque=0.6,
+    ))
+    if result is not None:
+      batch = result if isinstance(result, (list, tuple)) else (result,)
+      event = next(
+        (item for item in batch if item.event_type == "torqueUnderDelivery"),
+        event,
+      )
+  assert event is not None and event.evidence is not None
+  assert event.occurred_mono_time == pytest.approx(0.0)
+  assert event.detected_mono_time == pytest.approx(1.0)
+  assert event.evidence.authority_under_delivery_duration_s == pytest.approx(1.0)
+  assert event.evidence.demanded_curvature == pytest.approx(0.0625)
+  assert event.evidence.delivered_curvature_fraction == pytest.approx(0.5)
+  assert event.evidence.torque_headroom == pytest.approx(0.4)
+  assert event.evidence.signed_tracking_deficit == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("changes", [
+  {"request_torque": 0.76},       # 24% headroom, below the b7-derived 25%.
+  {"actual_lateral_accel": 0.81}, # More than 80% delivered.
+  {"desired_lateral_accel": 0.34, "actual_lateral_accel": 0.0},
+])
+def test_torque_under_delivery_each_envelope_boundary_is_required(changes):
+  detector = LateralEventDetector(cooldown=0.0)
+  kwargs = {
+    "v_ego": 4.0,
+    "desired_lateral_accel": 1.0,
+    "actual_lateral_accel": 0.5,
+    "request_torque": 0.6,
+    "applied_torque": 0.6,
+  }
+  kwargs.update(changes)
+  for index in range(130):
+    result = detector.update(sample(index * 0.01, **kwargs))
+    batch = result if isinstance(result, (list, tuple)) else (result,)
+    assert not any(
+      item is not None and item.event_type == "torqueUnderDelivery"
+      for item in batch
+    )
+
+
+def test_takeover_requires_300ms_and_emits_once_per_confirmed_press():
+  detector = LateralEventDetector(cooldown=0.0)
+  events = []
+  for index in range(80):
+    pressed = 10 <= index <= 55
+    result = detector.update(sample(
+      index * 0.01,
+      v_ego=4.0,
+      steering_pressed=pressed,
+      steering_angle_deg=80.0,
+      desired_lateral_accel=1.0,
+      actual_lateral_accel=0.5,
+      request_torque=0.6,
+    ))
+    if result is not None:
+      batch = result if isinstance(result, (list, tuple)) else (result,)
+      events.extend(item for item in batch if item.event_type == "driverTakeover")
+  assert len(events) == 1
+  event = events[0]
+  assert event.occurred_mono_time == pytest.approx(0.10)
+  assert event.detected_mono_time == pytest.approx(0.40)
+  assert event.severity == "critical"
+  assert event.evidence is not None
+  assert event.evidence.takeover_confirmation_duration_s == pytest.approx(0.30)
+  assert event.evidence.demanded_curvature == pytest.approx(0.0625)
+  assert event.evidence.torque_headroom == pytest.approx(0.4)
+
+
+def test_short_or_inactive_steering_press_is_not_a_takeover():
+  detector = LateralEventDetector(cooldown=0.0)
+  for index in range(100):
+    result = detector.update(sample(
+      index * 0.01,
+      active=index >= 50,
+      steering_pressed=(10 <= index < 40) or (60 <= index < 89),
+    ))
+    batch = result if isinstance(result, (list, tuple)) else (result,)
+    assert not any(
+      item is not None and item.event_type == "driverTakeover"
+      for item in batch
+    )
+
+
+def test_takeover_and_under_delivery_on_same_frame_are_both_retained():
+  detector = LateralEventDetector(cooldown=0.0)
+  simultaneous = None
+  for index in range(102):
+    result = detector.update(sample(
+      index * 0.01,
+      v_ego=4.0,
+      # Start one frame before the mathematically exact 0.70 s boundary so
+      # binary float representation cannot defer the 0.30 s confirmation by
+      # one frame; both detectors must mature on the 1.00 s sample.
+      steering_pressed=index >= 69,
+      desired_lateral_accel=1.0,
+      actual_lateral_accel=0.4,
+      request_torque=0.5,
+    ))
+    if isinstance(result, tuple) and len(result) > 1:
+      simultaneous = result
+  assert simultaneous is not None
+  assert {event.event_type for event in simultaneous} == {
+    "torqueUnderDelivery", "driverTakeover",
+  }
 
 
 def test_late_unwind():
@@ -1080,7 +1198,8 @@ def test_short_weak_turn_stop_dwell_is_silent():
 
 def test_turn_stop_dwell_past_max_never_emits():
   event = turn_stop_turn_event(dwell_s=TURN_STOP_MAX_DWELL_S + 0.45)
-  assert event is None
+  batch = event if isinstance(event, (list, tuple)) else (event,)
+  assert not any(item is not None and item.event_type == "turnStopTurn" for item in batch)
 
 
 def test_turn_stop_dwell_just_under_max_with_valid_release_emits():

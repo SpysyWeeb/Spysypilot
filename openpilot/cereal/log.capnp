@@ -2836,6 +2836,12 @@ struct DrivingEvent @0xd9f3c9b84f67a2e1 {
     roadEvidenceWindowStartMonoTime @163 :UInt64;  # Clamped start actually covered by the road metrics.
     roadEvidenceWindowStartPresent @164 :Bool;
     driverAssistRawTorqueOnly @165 :Bool;
+    demandedCurvature @166 :Float32;
+    deliveredCurvatureFraction @167 :Float32;
+    torqueHeadroom @168 :Float32;
+    signedTrackingDeficit @169 :Float32;
+    authorityUnderDeliveryDurationS @170 :Float32;
+    takeoverConfirmationDurationS @171 :Float32;
 
     enum DriverInteraction {
       none @0;

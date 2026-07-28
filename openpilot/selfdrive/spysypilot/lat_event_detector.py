@@ -1,16 +1,16 @@
 """Pure lateral driving-event detection and signal conditioning.
 
 This module intentionally owns no messaging, Params, filesystem, UI, process
-lifecycle, or actuation behavior. Detector v5 distinguishes an intentionally
-requested center crossing from an unrequested overshoot and keeps driver/road
-interaction as attribution evidence rather than an event-suppression rule.
+lifecycle, or actuation behavior. Detector v7 adds controller-independent
+under-delivery and confirmed driver-takeover evidence while preserving the
+crossing, unwind, turn-stop-turn, driver, and road semantics from v5/v6.
 """
 import math
 from collections import deque
 from dataclasses import dataclass
 
 
-DETECTOR_VERSION = 6
+DETECTOR_VERSION = 7
 EVENT_COOLDOWN = 8.0
 STALL_RELEASE_WINDOW_S = 6.0
 STALL_TRANSITION_HYSTERESIS_S = 0.25
@@ -33,6 +33,18 @@ TRACKING_ERROR_THRESHOLD = 0.35
 TRACKING_ERROR_PERSIST_S = 0.15
 DRIVER_RAW_TORQUE_THRESHOLD = 50.0
 ROAD_SUBSTANTIAL_FRACTION = 0.25
+
+# Route b7 data-derived authority/takeover thresholds.  The strongest
+# headroom rule that retained W2/W3 was 0.25; combining it with <=80%
+# delivered authority and one-second persistence produced 18 detector events
+# over the route (a simple pre-cooldown sweep predicted 19; looser candidates
+# produced 25-34).  A 0.30 s steeringPressed hold
+# retained W1/W2/W3 and reduced 75 raw onsets to the observed ~40 takeovers.
+UNDER_DELIVERY_MIN_HEADROOM = 0.25
+UNDER_DELIVERY_MAX_DELIVERED_FRACTION = 0.80
+UNDER_DELIVERY_PERSIST_S = 1.0
+TAKEOVER_CONFIRM_S = 0.30
+TAKEOVER_CONTEXT_LOOKBACK_S = 2.0
 
 UNWIND_ARM_ANGLE_DEG = 45.0
 UNWIND_REFERENCE_SCALE = 0.6
@@ -161,6 +173,34 @@ class LateralSample:
   @property
   def driver_confounded(self) -> bool:
     return self.steering_pressed or abs(self.driver_torque) > DRIVER_RAW_TORQUE_THRESHOLD
+
+  @property
+  def signed_tracking_deficit(self) -> float:
+    if self.desired_lateral_accel > 0.0:
+      return self.desired_lateral_accel - self.actual_lateral_accel
+    if self.desired_lateral_accel < 0.0:
+      return self.actual_lateral_accel - self.desired_lateral_accel
+    return 0.0
+
+  @property
+  def delivered_fraction(self) -> float:
+    magnitude = abs(self.desired_lateral_accel)
+    # Near-neutral ratios explode on harmless sensor/controller quantization.
+    # Zero means "not meaningful at this demand"; the raw desired/actual
+    # acceleration fields remain available to consumers.
+    if magnitude < DESIRED_REVERSAL_EPS:
+      return 0.0
+    direction = 1.0 if self.desired_lateral_accel > 0.0 else -1.0
+    return direction * self.actual_lateral_accel / magnitude
+
+  @property
+  def torque_headroom(self) -> float:
+    return max(0.0, 1.0 - abs(self.request_torque))
+
+  @property
+  def demanded_curvature(self) -> float:
+    speed_squared = self.v_ego * self.v_ego
+    return self.desired_lateral_accel / speed_squared if speed_squared > 1e-4 else 0.0
 
 
 @dataclass(frozen=True)
@@ -342,6 +382,13 @@ class LateralEvidence:
   # v6 consolidated road-metrics window start actually covered (payload @163-@164).
   road_evidence_window_start_mono_time: float | None = None
   driver_assist_raw_torque_only: bool = False
+  # v7 authority/takeover context (payload @166-@171).
+  demanded_curvature: float = 0.0
+  delivered_curvature_fraction: float = 0.0
+  torque_headroom: float = 0.0
+  signed_tracking_deficit: float = 0.0
+  authority_under_delivery_duration_s: float = 0.0
+  takeover_confirmation_duration_s: float = 0.0
 
   @property
   def driver_confounded_any(self) -> bool:
@@ -583,11 +630,16 @@ class LateralEventDetector:
     self.armed_stall_duration = 0.0
     self.late_unwind_since: float | None = None
     self.authority_since: float | None = None
+    self.under_delivery_since: float | None = None
+    self.under_delivery_start_sample: LateralSample | None = None
+    self.takeover_start_sample: LateralSample | None = None
+    self.takeover_emitted = False
+    self.previous_steering_pressed = False
     self.releases: deque[StallRelease] = deque()
     # time, driver-any, torque, pressed, road, tracking, vertical deviation,
-    # desired lateral acceleration, tracking error, applied-target gap, and
-    # signed wheel rate.
-    self.history: deque[tuple[float, bool, float, bool, bool, bool, float, float, float, float, float]] = deque()
+    # desired lateral acceleration, tracking error, applied-target gap, signed
+    # wheel rate, demand, signed deficit, delivered fraction, and headroom.
+    self.history: deque[tuple] = deque()
     self.episode_start: float | None = None
     self.episode_last_activity = -math.inf
     self.episode_center_since: float | None = None
@@ -610,6 +662,11 @@ class LateralEventDetector:
     self.armed_stall_duration = 0.0
     self.late_unwind_since = None
     self.authority_since = None
+    self.under_delivery_since = None
+    self.under_delivery_start_sample = None
+    self.takeover_start_sample = None
+    self.takeover_emitted = False
+    self.previous_steering_pressed = False
     self.releases.clear()
     self.episode_start = None
     self.episode_last_activity = -math.inf
@@ -641,6 +698,10 @@ class LateralEventDetector:
       abs(sample.desired_lateral_accel - sample.actual_lateral_accel),
       sample.applied_target_gap,
       sample.steering_rate_deg,
+      abs(sample.desired_lateral_accel),
+      sample.signed_tracking_deficit,
+      sample.delivered_fraction,
+      sample.torque_headroom,
     ))
     while self.history and sample.mono_time - self.history[0][0] > EVIDENCE_HISTORY_S:
       self.history.popleft()
@@ -702,6 +763,8 @@ class LateralEventDetector:
       "committedHandoffHarshness": (2.0, 2.0),
       "handoffMismatch": (2.0, 2.0),
       "torqueAuthority": (2.0, 2.0),
+      "torqueUnderDelivery": (3.0, 2.0),
+      "driverTakeover": (3.0, 2.0),
       "unwindProgressDeficit": (6.0, 2.0),
       "turnStopTurn": (6.0, 2.0),
     }[event_type]
@@ -741,7 +804,10 @@ class LateralEventDetector:
                 turn_stop_restart_classification: str = "",
                 episode_start_snapshot: float | None = None,
                 driver_causation: DriverCausationSummary | None = None,
-                turn_stop_post_progress_deg: float = 0.0) -> LateralEvidence:
+                turn_stop_post_progress_deg: float = 0.0,
+                context_sample: LateralSample | None = None,
+                authority_under_delivery_duration_s: float = 0.0,
+                takeover_confirmation_duration_s: float = 0.0) -> LateralEvidence:
     if self.history:
       # The serialized window must equal the window the evidence actually
       # covered (history starts after boot or a route discontinuity).
@@ -806,6 +872,7 @@ class LateralEventDetector:
     )
 
     before, after = self._analysis_window(event_type)
+    context = context_sample if context_sample is not None else sample
     releases = stall_releases or []
     phases = {release.phase for release in releases}
     stall_phase = next(iter(phases)) if len(phases) == 1 else ("mixed" if phases else "")
@@ -1164,6 +1231,12 @@ class LateralEventDetector:
       driver_assist_raw_torque_only=(
         driver_causation.assist_raw_torque_only if driver_causation is not None else False
       ),
+      demanded_curvature=context.demanded_curvature,
+      delivered_curvature_fraction=context.delivered_fraction,
+      torque_headroom=context.torque_headroom,
+      signed_tracking_deficit=context.signed_tracking_deficit,
+      authority_under_delivery_duration_s=authority_under_delivery_duration_s,
+      takeover_confirmation_duration_s=takeover_confirmation_duration_s,
     )
 
   def _reversal_commit_time(self, crossing: PendingCrossing, now: float) -> float | None:
@@ -1233,8 +1306,15 @@ class LateralEventDetector:
             turn_stop_restart_classification: str = "",
             episode_start_snapshot: float | None = None,
             driver_causation: DriverCausationSummary | None = None,
-            turn_stop_post_progress_deg: float = 0.0) -> LateralDetection | None:
-    if sample.mono_time - self.last_event_times.get(event_type, -math.inf) < self.cooldown:
+            turn_stop_post_progress_deg: float = 0.0,
+            context_sample: LateralSample | None = None,
+            authority_under_delivery_duration_s: float = 0.0,
+            takeover_confirmation_duration_s: float = 0.0,
+            bypass_cooldown: bool = False) -> LateralDetection | None:
+    if (
+      not bypass_cooldown
+      and sample.mono_time - self.last_event_times.get(event_type, -math.inf) < self.cooldown
+    ):
       return None
     self.last_event_times[event_type] = sample.mono_time
     evidence_start = {
@@ -1244,6 +1324,8 @@ class LateralEventDetector:
       "committedHandoffHarshness": occurred_time - 2.0,
       "handoffMismatch": occurred_time - 2.0,
       "torqueAuthority": sample.mono_time - 2.0,
+      "torqueUnderDelivery": occurred_time - 3.0,
+      "driverTakeover": occurred_time - 3.0,
       "unwindProgressDeficit": occurred_time - 6.0,
       "turnStopTurn": occurred_time - 6.0,
     }[event_type]
@@ -1267,6 +1349,9 @@ class LateralEventDetector:
       episode_start_snapshot,
       driver_causation,
       turn_stop_post_progress_deg,
+      context_sample,
+      authority_under_delivery_duration_s,
+      takeover_confirmation_duration_s,
     )
     return LateralDetection(
       event_type,
@@ -2256,7 +2341,86 @@ class LateralEventDetector:
       )
     return None
 
-  def update(self, sample: LateralSample) -> LateralDetection | None:
+  @staticmethod
+  def _combine_detections(
+    first: LateralDetection | tuple[LateralDetection, ...] | None,
+    second: LateralDetection | None,
+  ) -> LateralDetection | tuple[LateralDetection, ...] | None:
+    """Preserve simultaneous evidence without allocating on ordinary frames."""
+    if second is None:
+      return first
+    if first is None:
+      return second
+    if isinstance(first, tuple):
+      return (*first, second)
+    return (first, second)
+
+  def _takeover_severity(self, sample: LateralSample) -> tuple[str, float]:
+    recent = (
+      entry for entry in self.history
+      if sample.mono_time - entry[0] <= TAKEOVER_CONTEXT_LOOKBACK_S
+    )
+    critical = any(
+      entry[11] > TRACKING_ERROR_THRESHOLD
+      and entry[12] > TURN_STOP_TRACKING_ERROR
+      and entry[13] <= UNDER_DELIVERY_MAX_DELIVERED_FRACTION
+      and entry[14] >= UNDER_DELIVERY_MIN_HEADROOM
+      for entry in recent
+    )
+    if critical:
+      return "critical", 0.95
+    if (
+      abs(sample.desired_lateral_accel) > DESIRED_REVERSAL_EPS
+      or abs(sample.steering_angle_deg) > EPISODE_CENTER_CLOSE_DEG
+    ):
+      return "warning", 0.95
+    return "info", 0.90
+
+  def _update_driver_takeover(
+    self,
+    sample: LateralSample,
+    previous_phase: float,
+    previous_same_episode: bool,
+  ) -> LateralDetection | None:
+    if sample.steering_pressed and not self.previous_steering_pressed:
+      self.takeover_start_sample = sample
+      self.takeover_emitted = False
+    elif not sample.steering_pressed:
+      self.takeover_start_sample = None
+      self.takeover_emitted = False
+    self.previous_steering_pressed = sample.steering_pressed
+
+    start = self.takeover_start_sample
+    if (
+      start is None
+      or self.takeover_emitted
+      or sample.mono_time - start.mono_time < TAKEOVER_CONFIRM_S
+    ):
+      return None
+    self.takeover_emitted = True
+    severity, confidence = self._takeover_severity(sample)
+    return self._emit(
+      sample,
+      "driverTakeover",
+      severity,
+      confidence,
+      "driver steering override persisted during active lateral control",
+      start.mono_time,
+      previous_phase,
+      previous_same_episode,
+      context_sample=start,
+      takeover_confirmation_duration_s=sample.mono_time - start.mono_time,
+      episode_start_snapshot=(
+        self.episode_start if self.episode_start is not None else start.mono_time
+      ),
+      # A takeover is ground truth, not a noisy detector episode. Distinct
+      # confirmed presses must never suppress each other through cooldown.
+      bypass_cooldown=True,
+    )
+
+  def update(
+    self, sample: LateralSample,
+  ) -> LateralDetection | tuple[LateralDetection, ...] | None:
     if self.last_sample_mono_time is not None and (
       sample.mono_time < self.last_sample_mono_time
       or sample.mono_time - self.last_sample_mono_time > SAMPLE_GAP_RESET_S
@@ -2279,6 +2443,9 @@ class LateralEventDetector:
 
     tracking_active = abs(sample.reference_rate) > 0.2 or abs(sample.desired_lateral_accel - sample.actual_lateral_accel) > 0.15
     self._update_episode(sample, tracking_active)
+    takeover_detection = self._update_driver_takeover(
+      sample, previous_phase, previous_same_episode,
+    )
     self._observe_center_crossing(sample, previous_phase, previous_same_episode)
     if phase_handoff and abs(sample.steering_rate_deg) > HANDOFF_RATE_THRESHOLD_DEG_S and sample.applied_target_gap > HANDOFF_APPLIED_TARGET_GAP:
       episode_start = self.episode_start if self.episode_start is not None else sample.mono_time
@@ -2436,8 +2603,8 @@ class LateralEventDetector:
         self.authority_since = sample.mono_time
     else:
       self.authority_since = None
-    if detection is None and self.authority_since is not None and sample.mono_time - self.authority_since > 1.0:
-      detection = self._emit(
+    if self.authority_since is not None and sample.mono_time - self.authority_since > 1.0:
+      authority_detection = self._emit(
         sample,
         "torqueAuthority",
         "critical",
@@ -2447,7 +2614,44 @@ class LateralEventDetector:
         previous_phase,
         previous_same_episode,
       )
+      detection = self._combine_detections(detection, authority_detection)
       self.authority_since = None
+
+    under_delivering = (
+      abs(sample.desired_lateral_accel) > TRACKING_ERROR_THRESHOLD
+      and sample.signed_tracking_deficit > TURN_STOP_TRACKING_ERROR
+      and sample.delivered_fraction <= UNDER_DELIVERY_MAX_DELIVERED_FRACTION
+      and sample.torque_headroom >= UNDER_DELIVERY_MIN_HEADROOM
+    )
+    if under_delivering:
+      if self.under_delivery_since is None:
+        self.under_delivery_since = sample.mono_time
+        self.under_delivery_start_sample = sample
+    else:
+      self.under_delivery_since = None
+      self.under_delivery_start_sample = None
+    if (
+      self.under_delivery_since is not None
+      and sample.mono_time - self.under_delivery_since >= UNDER_DELIVERY_PERSIST_S
+    ):
+      duration = sample.mono_time - self.under_delivery_since
+      under_delivery_detection = self._emit(
+        sample,
+        "torqueUnderDelivery",
+        "critical",
+        0.90,
+        "lateral tracking stayed below 80% while at least 25% torque authority remained unused",
+        self.under_delivery_since,
+        previous_phase,
+        previous_same_episode,
+        context_sample=self.under_delivery_start_sample,
+        authority_under_delivery_duration_s=duration,
+      )
+      detection = self._combine_detections(detection, under_delivery_detection)
+      self.under_delivery_since = None
+      self.under_delivery_start_sample = None
+
+    detection = self._combine_detections(detection, takeover_detection)
 
     # Keep the last non-zero angle so an exactly-zero wheel sample does not
     # erase the bracketing sample needed to interpolate the physical crossing.

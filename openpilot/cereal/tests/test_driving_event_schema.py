@@ -1,3 +1,5 @@
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +23,20 @@ from openpilot.selfdrive.spysypilot.long_event_detector import LaunchSample, Lon
 
 def round_trip(msg):
   return messaging.log_from_bytes(msg.to_bytes())
+
+
+def test_lateral_v7_fields_use_fresh_append_only_ordinals():
+  schema = (Path(__file__).parents[1] / "log.capnp").read_text()
+  expected = {
+    "demandedCurvature": 166,
+    "deliveredCurvatureFraction": 167,
+    "torqueHeadroom": 168,
+    "signedTrackingDeficit": 169,
+    "authorityUnderDeliveryDurationS": 170,
+    "takeoverConfirmationDurationS": 171,
+  }
+  for field, ordinal in expected.items():
+    assert re.search(rf"^\s*{field}\s+@{ordinal}\s+:", schema, re.MULTILINE)
 
 
 def test_manual_event_round_trip():
@@ -168,6 +184,13 @@ def test_lateral_payload_round_trip():
     "turn_stop_post_dwell_progress_deg": 22.5,
     "road_evidence_window_start_mono_time": 0.08,
     "driver_assist_raw_torque_only": True,
+    # v7 authority/takeover onset context (@166-@171).
+    "demanded_curvature": 0.123456,
+    "delivered_curvature_fraction": 0.65,
+    "torque_headroom": 0.384,
+    "signed_tracking_deficit": 0.42,
+    "authority_under_delivery_duration_s": 1.01,
+    "takeover_confirmation_duration_s": 0.30,
   }))
   candidate = lateral_candidate(sample, LateralDetection(
     "committedHandoffHarshness", "warning", 0.9, "reason", evidence,
@@ -294,6 +317,13 @@ def test_lateral_payload_round_trip():
   assert event.payload.lateral.roadEvidenceWindowStartPresent
   assert event.payload.lateral.roadEvidenceWindowStartMonoTime == 80_000_000
   assert event.payload.lateral.driverAssistRawTorqueOnly
+  # v7 context census (@166-@171).
+  assert event.payload.lateral.demandedCurvature == pytest.approx(0.123456)
+  assert event.payload.lateral.deliveredCurvatureFraction == pytest.approx(0.65)
+  assert event.payload.lateral.torqueHeadroom == pytest.approx(0.384)
+  assert event.payload.lateral.signedTrackingDeficit == pytest.approx(0.42)
+  assert event.payload.lateral.authorityUnderDeliveryDurationS == pytest.approx(1.01)
+  assert event.payload.lateral.takeoverConfirmationDurationS == pytest.approx(0.30)
 
 
 def test_lateral_payload_v6_optional_evidence_absent_serializes_present_false():
@@ -325,6 +355,12 @@ def test_lateral_payload_v6_optional_evidence_absent_serializes_present_false():
   assert event.payload.lateral.driverCausation == ""
   assert not event.payload.lateral.driverAssistRawTorqueOnly
   assert not event.payload.lateral.roadEvidenceWindowStartPresent
+  assert event.payload.lateral.demandedCurvature == 0.0
+  assert event.payload.lateral.deliveredCurvatureFraction == 0.0
+  assert event.payload.lateral.torqueHeadroom == 0.0
+  assert event.payload.lateral.signedTrackingDeficit == 0.0
+  assert event.payload.lateral.authorityUnderDeliveryDurationS == 0.0
+  assert event.payload.lateral.takeoverConfirmationDurationS == 0.0
 
 
 def test_longitudinal_payload_round_trip():
