@@ -172,9 +172,15 @@ Route `000000b4--ef6ec45105` showed that version 5's solve bound was not enough:
 MPC time still rose monotonically from 0.73 ms with one available schedule to
 38 ms with 23, while shared and fallback time did not correlate with schedule
 population. Version 6 removes the remaining schedule-population scan entirely.
-CPU 4 affinity remains unchanged for this experiment so the next route can
-separate selector cost from the independently observed controlsState throughput
-loss; affinity is reconsidered only after the O(1) selector is measured.
+That route also showed CPU 4 pinning doubling shadow inter-frame time from
+9.5 ms to 19.0 ms. Route `000000b7--a6b3b1f175` then confirmed only about
+32 shadow frames per second against controlsd's 100 Hz stream. The affinity is
+therefore removed: shadowd retains `Priority.CTRL_LOW`/`SCHED_FIFO` but may roam
+across cores 0-4. Core 5 is excluded because it carries equal-priority planning
+work; cores 6 and 7 are excluded for camera/model workloads. Until a field
+route demonstrates near-100 Hz throughput and materially improves the current
+0.284 normalized-torque v14-shadow consistency RMS, logged v14 commands are
+diagnostic only and never the A/B baseline.
 
 All result fields except the four compute-time fields are deterministic replay
 fields and must match the route-audit harness at the Float64/typed-integer bit
