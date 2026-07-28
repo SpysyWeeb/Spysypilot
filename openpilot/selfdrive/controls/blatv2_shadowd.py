@@ -14,6 +14,7 @@ from typing import Any
 import openpilot.cereal.messaging as messaging
 from opendbc.car.hyundai.values import CarControllerParams
 from opendbc.car.structs import car
+from openpilot.common.realtime import config_realtime_process, Priority
 from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
 from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore, ShadowResult
@@ -202,6 +203,11 @@ class BlatV2Shadow:
 
 
 def main() -> None:
+  # Measure candidates in the same deterministic scheduling environment they
+  # would inherit inside controlsd. CTRL_LOW on core 4 can never delay
+  # CTRL_HIGH controlsd, which always preempts this telemetry-only passenger.
+  # config_realtime_process also disables cyclic GC before the hot loop.
+  config_realtime_process(4, Priority.CTRL_LOW)
   BlatV2Shadow().run()
 
 
