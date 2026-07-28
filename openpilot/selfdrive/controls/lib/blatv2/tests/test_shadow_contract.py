@@ -40,7 +40,7 @@ def test_shadow_runs_below_controlsd_on_the_same_realtime_core():
 
 def test_shadow_v8_schema_has_live_lqi_and_exact_v14_fields():
   assert SHADOW_VERSION == 8
-  assert LIVE_CONTROLLER_VERSION == 201
+  assert LIVE_CONTROLLER_VERSION == 202
   schema = Path("openpilot/cereal/log.capnp").read_text()
   assert "vEgo @9 :Float64;" in schema
   assert "aligningTorque @10 :Float64;" in schema
