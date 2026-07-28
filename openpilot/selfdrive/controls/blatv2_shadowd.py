@@ -262,11 +262,12 @@ class BlatV2Shadow:
 
 
 def main() -> None:
-  # Measure candidates in the same deterministic scheduling environment they
-  # would inherit inside controlsd. CTRL_LOW on core 4 can never delay
-  # CTRL_HIGH controlsd, which always preempts this telemetry-only passenger.
-  # config_realtime_process also disables cyclic GC before the hot loop.
-  config_realtime_process(4, Priority.CTRL_LOW)
+  # CTRL_LOW preserves controlsd's preemption guarantee without forcing this
+  # passive process to compete with CTRL_HIGH on core 4 every cycle. Roam only
+  # on cores 0-4: core 5 carries equal-priority planning work, while 6/7 are
+  # reserved for camera/model workloads. The standard setup also disables
+  # cyclic GC before the hot loop.
+  config_realtime_process([0, 1, 2, 3, 4], Priority.CTRL_LOW)
   BlatV2Shadow().run()
 
 
