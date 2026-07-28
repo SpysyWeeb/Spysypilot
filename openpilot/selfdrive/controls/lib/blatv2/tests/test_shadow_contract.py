@@ -35,8 +35,8 @@ def test_shadow_runs_below_controlsd_on_the_same_realtime_core():
   assert "config_realtime_process(4, Priority.CTRL_HIGH)" not in source
 
 
-def test_shadow_v5_schema_has_bounded_mpc_and_split_timing_fields():
-  assert SHADOW_VERSION == 5
+def test_shadow_v6_schema_has_bounded_mpc_and_split_timing_fields():
+  assert SHADOW_VERSION == 6
   schema = Path("openpilot/cereal/log.capnp").read_text()
   assert "vEgo @9 :Float64;" in schema
   assert "aligningTorque @10 :Float64;" in schema
