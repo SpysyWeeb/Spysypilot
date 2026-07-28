@@ -168,7 +168,7 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     live_lqi_output_valid=True,
     live_lqi_invalid_frames=0,
     live_lqi_recovery_ok_frames=10,
-    live_lqi_controller_version=201,
+    live_lqi_controller_version=202,
     v14_result=V14ShadowResult(-0.07, 0.01, True, 14),
     v14_compute_seconds=0.0002,
   )
@@ -178,7 +178,7 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
   assert message.blatV2Shadow.sharedComputeTimeSeconds == 0.0001
   assert message.blatV2Shadow.liveLqiCommandTorque == -0.08
   assert message.blatV2Shadow.liveLqiComputeTimeSeconds == 0.0008
-  assert message.blatV2Shadow.liveLqiControllerVersion == 201
+  assert message.blatV2Shadow.liveLqiControllerVersion == 202
   assert message.blatV2Shadow.v14CommandTorque == -0.07
   assert message.blatV2Shadow.v14ControllerVersion == 14
 
