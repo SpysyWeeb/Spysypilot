@@ -27,6 +27,14 @@ def test_shadow_process_is_registered_onroad_without_toggle():
   assert registration in config
 
 
+def test_shadow_runs_below_controlsd_on_the_same_realtime_core():
+  source = Path(
+    "openpilot/selfdrive/controls/blatv2_shadowd.py",
+  ).read_text()
+  assert "config_realtime_process(4, Priority.CTRL_LOW)" in source
+  assert "config_realtime_process(4, Priority.CTRL_HIGH)" not in source
+
+
 def test_shadow_v5_schema_has_bounded_mpc_and_split_timing_fields():
   assert SHADOW_VERSION == 5
   schema = Path("openpilot/cereal/log.capnp").read_text()

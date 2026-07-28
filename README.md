@@ -103,6 +103,18 @@ harsh 23-schedule device benchmark reduced MPC solve median from 3.88 ms with a
 schedule-wide warm scan to 1.46 ms with the compact representation. This is a
 runtime architecture bound, not a feel dial or tuning constant.
 
+Route `000000b3--618af36e75` verified that the algorithmic floor was gone
+(shared/MPC/fallback medians 0.94/0.73/0.45 ms), but all three independent
+phases retained an uncorrelated 9–12 ms p99 tail. Its `procLog` records
+`blatv2_shadowd` as an ordinary priority-20 process migrating across CPUs
+0/1/2/4/5, while `controlsd` is real-time on CPU 4 and planners are real-time
+on CPU 5. Shadowd now uses the existing low-control real-time priority on CPU
+4. The higher-priority `controlsd` always preempts it, preserving control
+authority, while unrelated ordinary onroad work no longer interrupts whichever
+candidate phase happens to be running. The standard real-time setup also
+disables cyclic GC before the hot loop. No custom priority or affinity constant
+was added.
+
 All result fields except the four compute-time fields are deterministic replay
 fields and must match the route-audit harness at the Float64/typed-integer bit
 level. Runtime is an environment measurement: only shared-plus-candidate values
