@@ -6,7 +6,6 @@ import math
 
 import numpy as np
 
-from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.blatv2.controller import DECISION_DT
 from openpilot.selfdrive.controls.lib.blatv2.plant import AlignInputs, PlantState, PlantTwin
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -14,7 +13,6 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 MAX_REFERENCE_TIME = float(ModelConstants.T_IDXS[-1])
 MAX_DECISION_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DECISION_DT)) + 2
-MAX_CONTROL_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DT_CTRL)) + 2
 # One reference schedule plus early/late placement for every possible adjacent
 # sign crossing. Capacity is derived from the runtime horizon grid, not tuned.
 MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
@@ -29,9 +27,7 @@ class CandidateWorkspace:
     self.desired_angles = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.desired_rates = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.feedforward = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
-    self.control_reference = np.empty(MAX_CONTROL_STEPS, dtype=np.float64)
     self.decision_count = 0
-    self.control_count = 0
 
   def fill(
     self,
@@ -57,8 +53,7 @@ class CandidateWorkspace:
       raise ValueError("candidate horizon must be finite and non-negative")
 
     decision_count = min(int(math.floor(horizon / DECISION_DT)) + 1, MAX_DECISION_STEPS)
-    control_count = min(int(math.floor(horizon / DT_CTRL)) + 1, MAX_CONTROL_STEPS)
-    if decision_count < 2 or control_count < 2:
+    if decision_count < 2:
       raise ValueError("candidate horizon is too short")
 
     reference_index = 0
@@ -117,35 +112,4 @@ class CandidateWorkspace:
       demand = aligning + dynamic + friction + float(disturbance_torque)
       self.feedforward[index] = min(max(demand, -1.0), 1.0)
 
-    reference_index = 0
-    for index in range(control_count):
-      time_value = index * DT_CTRL
-      if time_value <= first_reference_time:
-        curvature = float(reference_curvatures[0])
-      elif time_value >= last_reference_time:
-        curvature = float(reference_curvatures[reference_count - 1])
-      else:
-        while (
-          reference_index + 1 < reference_count
-          and float(reference_times[reference_index + 1]) <= time_value
-        ):
-          reference_index += 1
-        upper_index = reference_index + 1
-        lower_time = float(reference_times[reference_index])
-        upper_time = float(reference_times[upper_index])
-        fraction = (time_value - lower_time) / (upper_time - lower_time)
-        lower_value = float(reference_curvatures[reference_index])
-        curvature = lower_value + fraction * (
-          float(reference_curvatures[upper_index]) - lower_value
-        )
-      self.control_reference[index] = curvature
-
     self.decision_count = decision_count
-    self.control_count = control_count
-
-  def expand_decisions_zoh(self, decisions: np.ndarray, output: np.ndarray) -> None:
-    if self.decision_count <= 0 or self.control_count <= 0:
-      raise ValueError("workspace has not been populated")
-    for index in range(self.control_count):
-      decision_index = min(int((index * DT_CTRL) / DECISION_DT), self.decision_count - 1)
-      output[index] = float(decisions[decision_index])

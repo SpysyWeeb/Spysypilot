@@ -1,21 +1,29 @@
 """Model-Following Torque MPC shadow candidate.
 
 The decision variable is requested normalized Hyundai steering torque on a
-50 ms grid. Each decision is zero-order held and expanded to the 100 Hz plant
-grid, where :class:`PlantTwin` applies the exact asymmetric runtime limiter,
+50 ms grid. The first decision is sampled on every 100 Hz controller frame,
+where :class:`PlantTwin` applies the exact asymmetric runtime limiter,
 including decay-before-build sign crossings.
 
 The convex subproblem for each deterministic torque-sign schedule is a
 tridiagonal quadratic solved by scalar IEEE-754 binary64 LDLT. No BLAS,
 platform-selected factorization, or unordered collection participates.
-Equal-cost schedules retain the lowest index by updating the winner only for a
-strictly smaller cost.
+
+Solving and rolling out every plausible sign-crossing placement made runtime
+scale linearly on 6.84% of an ordinary field route (nine schedules cost 59 ms
+median). Runtime is therefore hard-bounded to one active-set solve per frame.
+The selected schedule is the lowest-index schedule whose sign sequence is
+closest to the previous converged solution; bootstrap and lifecycle resets use
+the base schedule. This deterministic warm start preserves exact limiter
+semantics for the selected schedule without making wall time data-dependent.
+Telemetry reports both the one evaluated candidate and the number of schedules
+that were available before the bound.
 
 Friction is conservative by construction while ``t_breakaway`` remains
-provisional: the rollout always uses the full ``±t_breakaway`` Coulomb model
-opposing predicted motion and the inverse feedforward never credits friction as
-helpful. The independent recorded-response disturbance estimate is separately
-bounded to ``±t_breakaway``. The resulting deliberate design tolerance is two
+provisional: the inverse feedforward charges the full ``±t_breakaway`` Coulomb
+model against intended motion and never credits friction as helpful. The
+independent recorded-response disturbance estimate is separately bounded to
+``±t_breakaway``. The resulting deliberate design tolerance is two
 breakaway-equivalent loads; event-anchored identification may tighten it later,
 but argument or feel may not.
 """
@@ -26,9 +34,7 @@ import math
 
 import numpy as np
 
-from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
-  MAX_CONTROL_STEPS,
   MAX_DECISION_STEPS,
   MAX_SIGN_SCHEDULES,
   CandidateWorkspace,
@@ -43,13 +49,23 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import AlignInputs, PlantStat
 
 
 class ModelFollowingTorqueMPC:
-  def __init__(self, twin: PlantTwin, controller_params: ControllerParams):
+  def __init__(
+    self,
+    twin: PlantTwin,
+    controller_params: ControllerParams,
+    workspace: CandidateWorkspace | None = None,
+  ):
     self.twin = twin
     self.params = controller_params
-    self.workspace = CandidateWorkspace()
+    self.workspace = CandidateWorkspace() if workspace is None else workspace
     self.result = CandidateResult()
 
     self.schedules = np.zeros((MAX_SIGN_SCHEDULES, MAX_DECISION_STEPS), dtype=np.int8)
+    self.crossing_indices = np.empty(MAX_DECISION_STEPS, dtype=np.int16)
+    self.schedule_change_indices = np.full(
+      MAX_SIGN_SCHEDULES, -1, dtype=np.int16,
+    )
+    self.schedule_change_signs = np.zeros(MAX_SIGN_SCHEDULES, dtype=np.int8)
     self.diagonal = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.off_diagonal = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.rhs = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
@@ -62,16 +78,17 @@ class ModelFollowingTorqueMPC:
     self.fixed = np.zeros(MAX_DECISION_STEPS, dtype=np.bool_)
     self.fixed_value = np.zeros(MAX_DECISION_STEPS, dtype=np.float64)
 
-    self.requested_100hz = np.empty(MAX_CONTROL_STEPS, dtype=np.float64)
-    self.applied_100hz = np.empty(MAX_CONTROL_STEPS, dtype=np.float64)
-    self.angle_100hz = np.empty(MAX_CONTROL_STEPS, dtype=np.float64)
-    self.rate_100hz = np.empty(MAX_CONTROL_STEPS, dtype=np.float64)
     self._state = PlantState(0.0, 0.0, 0.0, 0.0)
-    self._align_inputs = AlignInputs(
-      0.0, 0.0, 1.0, twin.align_params.nominal_steer_ratio, False,
-    )
     self._solve_residual = 0.0
     self.winning_schedule_index = -1
+    self.has_warm_start = False
+    self.warm_start_count = 0
+
+  def reset(self) -> None:
+    self.result.invalidate()
+    self.winning_schedule_index = -1
+    self.has_warm_start = False
+    self.warm_start_count = 0
 
   @staticmethod
   def _sign(value: float) -> int:
@@ -81,14 +98,13 @@ class ModelFollowingTorqueMPC:
     base = self.schedules[0]
     previous_nonzero = 0
     crossing_count = 0
-    crossing_indices = self.ldlt_diagonal  # borrowed integer-exact float workspace
     for index in range(count):
       sign = self._sign(float(self.workspace.feedforward[index]))
       base[index] = sign
       if sign != 0:
         if previous_nonzero != 0 and sign != previous_nonzero:
           if crossing_count < MAX_DECISION_STEPS:
-            crossing_indices[crossing_count] = index
+            self.crossing_indices[crossing_count] = index
           crossing_count += 1
         previous_nonzero = sign
 
@@ -96,20 +112,18 @@ class ModelFollowingTorqueMPC:
     if required > MAX_SIGN_SCHEDULES:
       return -required
 
+    self.schedule_change_indices[0] = -1
+    self.schedule_change_signs[0] = 0
     schedule_count = 1
     for crossing_number in range(crossing_count):
-      crossing = int(crossing_indices[crossing_number])
+      crossing = int(self.crossing_indices[crossing_number])
       old_sign = int(base[crossing - 1])
       new_sign = int(base[crossing])
 
-      earlier = self.schedules[schedule_count]
-      later = self.schedules[schedule_count + 1]
-      for index in range(count):
-        value = base[index]
-        earlier[index] = value
-        later[index] = value
-      earlier[crossing - 1] = new_sign
-      later[crossing] = old_sign
+      self.schedule_change_indices[schedule_count] = crossing - 1
+      self.schedule_change_signs[schedule_count] = new_sign
+      self.schedule_change_indices[schedule_count + 1] = crossing
+      self.schedule_change_signs[schedule_count + 1] = old_sign
       schedule_count += 2
     return schedule_count
 
@@ -132,6 +146,58 @@ class ModelFollowingTorqueMPC:
 
     self.diagonal[0] += rate_weight
     self.rhs[0] += rate_weight * float(previous_torque)
+
+  def _select_warm_schedule(self, schedule_count: int, count: int) -> int:
+    """Choose one schedule by distance to the prior converged solution.
+
+    Zero-valued prior decisions carry no directional information and do not
+    contribute to the distance. Strict comparison pins equal-distance
+    selection to the lowest schedule index.
+    """
+    if not self.has_warm_start or schedule_count <= 1:
+      return 0
+
+    base = self.schedules[0]
+    base_distance = 0
+    comparable_count = min(count, self.warm_start_count)
+    for index in range(comparable_count):
+      previous_sign = self._sign(float(self.best_solution[index]))
+      if previous_sign != 0 and int(base[index]) != previous_sign:
+        base_distance += 1
+
+    best_index = 0
+    best_distance = base_distance
+    for schedule_index in range(1, schedule_count):
+      changed_index = int(self.schedule_change_indices[schedule_index])
+      previous_sign = (
+        self._sign(float(self.best_solution[changed_index]))
+        if changed_index < comparable_count
+        else 0
+      )
+      distance = base_distance
+      if previous_sign != 0:
+        if int(base[changed_index]) != previous_sign:
+          distance -= 1
+        if int(self.schedule_change_signs[schedule_index]) != previous_sign:
+          distance += 1
+      if distance < best_distance:
+        best_distance = distance
+        best_index = schedule_index
+    return best_index
+
+  def _materialize_schedule(
+    self,
+    schedule_index: int,
+    count: int,
+  ) -> None:
+    if schedule_index == 0:
+      return
+    selected = self.schedules[schedule_index]
+    base = self.schedules[0]
+    for index in range(count):
+      selected[index] = base[index]
+    changed_index = int(self.schedule_change_indices[schedule_index])
+    selected[changed_index] = self.schedule_change_signs[schedule_index]
 
   def _solve_free_segments(self, count: int) -> bool:
     index = 0
@@ -256,44 +322,6 @@ class ModelFollowingTorqueMPC:
       return CandidateStatus.OK
     return CandidateStatus.NON_CONVERGED
 
-  def _rollout_cost(self, disturbance_torque: float, actuation_delay: float) -> float:
-    self.workspace.expand_decisions_zoh(self.solution, self.requested_100hz)
-    control_count = self.workspace.control_count
-    self.twin.predict_into(
-      self._state,
-      self.requested_100hz,
-      control_count,
-      DT_CTRL,
-      self._align_inputs,
-      self.applied_100hz,
-      self.angle_100hz,
-      self.rate_100hz,
-      disturbance_torque,
-      actuation_delay,
-    )
-
-    heading_error = 0.0
-    lateral_error = 0.0
-    previous_applied = self._state.applied_torque
-    cost = 0.0
-    for index in range(control_count):
-      predicted_curvature = self.twin.curvature_from_angle(
-        float(self.angle_100hz[index]),
-        self._state.v_ego,
-        self._align_inputs,
-      )
-      curvature_error = predicted_curvature - float(self.workspace.control_reference[index])
-      heading_error += self._state.v_ego * curvature_error * DT_CTRL
-      lateral_error += self._state.v_ego * heading_error * DT_CTRL
-      torque_rate = (float(self.applied_100hz[index]) - previous_applied) / DT_CTRL
-      previous_applied = float(self.applied_100hz[index])
-      cost += (
-        (lateral_error / self.params.sigma_y) ** 2
-        + (heading_error / self.params.sigma_heading) ** 2
-        + (torque_rate / self.params.sigma_torque_rate) ** 2
-      )
-    return cost
-
   def compute(
     self,
     state: PlantState,
@@ -304,74 +332,59 @@ class ModelFollowingTorqueMPC:
     horizon_seconds: float,
     actuation_delay: float,
     disturbance_torque: float,
+    *,
+    workspace_prepared: bool = False,
   ) -> CandidateResult:
     result = self.result
     self._state = state
-    self._align_inputs = align_inputs
     try:
-      self.workspace.fill(
-        self.twin,
-        state,
-        align_inputs,
-        reference_times,
-        reference_curvatures,
-        reference_count,
-        horizon_seconds,
-        disturbance_torque,
-      )
+      if not workspace_prepared:
+        self.workspace.fill(
+          self.twin,
+          state,
+          align_inputs,
+          reference_times,
+          reference_curvatures,
+          reference_count,
+          horizon_seconds,
+          disturbance_torque,
+        )
       count = self.workspace.decision_count
       schedule_count = self._build_schedules(count)
       if schedule_count < 0:
         result.invalidate(state.applied_torque, CandidateStatus.ENUMERATION_EXHAUSTED)
         result.candidate_count = -schedule_count
+        result.available_schedule_count = -schedule_count
         return result
       self._assemble_quadratic(count, state.applied_torque)
     except (ValueError, OverflowError):
       result.invalidate(state.applied_torque, CandidateStatus.INPUT_INVALID)
       return result
 
-    best_cost = math.inf
-    best_residual = 0.0
+    selected_schedule = self._select_warm_schedule(
+      schedule_count, count,
+    )
+    self._materialize_schedule(selected_schedule, count)
     self.winning_schedule_index = -1
-    solved_count = 0
-    non_converged_count = 0
-    for schedule_index in range(schedule_count):
-      status = self._solve_schedule(schedule_index, count)
-      solved_count += 1
-      if status != CandidateStatus.OK:
-        non_converged_count += 1
-        continue
-      if schedule_count == 1:
-        # Cost exists only to rank competing sign schedules. With one
-        # schedule, its converged active-set solution is already the unique
-        # winner; a 100 Hz plant rollout cannot change that ordering.
-        best_cost = 0.0
-        best_residual = self._solve_residual
-        self.winning_schedule_index = 0
-        for index in range(count):
-          self.best_solution[index] = self.solution[index]
-        break
-      try:
-        cost = self._rollout_cost(disturbance_torque, actuation_delay)
-      except (ValueError, OverflowError):
-        non_converged_count += 1
-        continue
-      # Strict comparison pins equal-cost tie-breaking to the lower schedule.
-      if math.isfinite(cost) and cost < best_cost:
-        best_cost = cost
-        best_residual = self._solve_residual
-        self.winning_schedule_index = schedule_index
-        for index in range(count):
-          self.best_solution[index] = self.solution[index]
-
-    if not math.isfinite(best_cost):
-      failure = CandidateStatus.NON_CONVERGED if non_converged_count == solved_count else CandidateStatus.INFEASIBLE
-      result.invalidate(state.applied_torque, failure)
-      result.candidate_count = solved_count
+    status = self._solve_schedule(selected_schedule, count)
+    if status != CandidateStatus.OK:
+      result.invalidate(state.applied_torque, status)
+      result.candidate_count = 1
+      result.available_schedule_count = schedule_count
+      self.has_warm_start = False
+      self.warm_start_count = 0
       return result
+
+    best_residual = self._solve_residual
+    self.winning_schedule_index = selected_schedule
+    for index in range(count):
+      self.best_solution[index] = self.solution[index]
+    self.has_warm_start = True
+    self.warm_start_count = count
 
     result.command_torque = self.twin.apply_slew(state.applied_torque, float(self.best_solution[0]))
     result.status = CandidateStatus.OK
-    result.candidate_count = solved_count
+    result.candidate_count = 1
+    result.available_schedule_count = schedule_count
     result.optimality_residual = best_residual
     return result

@@ -23,6 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import (
   ControllerParams,
   ObserverStatus,
 )
+from openpilot.selfdrive.controls.lib.blatv2.candidate_common import CandidateWorkspace
 from openpilot.selfdrive.controls.lib.blatv2.fallback import InverseEpsLQIFallback
 from openpilot.selfdrive.controls.lib.blatv2.mpc import ModelFollowingTorqueMPC
 from openpilot.selfdrive.controls.lib.blatv2.observer import DisturbanceObserver
@@ -62,6 +63,7 @@ class ShadowResult:
   mpc_command_torque: float = 0.0
   mpc_status: int = int(CandidateStatus.INPUT_INVALID)
   mpc_candidate_count: int = 0
+  mpc_available_schedule_count: int = 0
   mpc_optimality_residual: float = 0.0
   fallback_command_torque: float = 0.0
   fallback_status: int = int(CandidateStatus.INPUT_INVALID)
@@ -85,8 +87,13 @@ class ShadowCore:
     self.twin = PlantTwin(seed_params, self.align_params)
     self.controller_params = controller_params
     self.observer = DisturbanceObserver(seed_params, controller_params)
-    self.mpc = ModelFollowingTorqueMPC(self.twin, controller_params)
-    self.fallback = InverseEpsLQIFallback(self.twin, controller_params)
+    self.candidate_workspace = CandidateWorkspace()
+    self.mpc = ModelFollowingTorqueMPC(
+      self.twin, controller_params, self.candidate_workspace,
+    )
+    self.fallback = InverseEpsLQIFallback(
+      self.twin, controller_params, self.candidate_workspace,
+    )
     self.default_horizon = horizon(seed_params)
 
     capacity = len(ModelConstants.T_IDXS)
@@ -109,12 +116,14 @@ class ShadowCore:
     self.horizon_seconds = self.default_horizon
     self.actuation_delay = self.seed_params.actuation_delay
     self.frame_prepared = False
+    self.candidate_workspace_valid = False
 
   def reset(self) -> None:
     self.has_previous_state = False
     self.frame_prepared = False
+    self.candidate_workspace_valid = False
     self.observer.reset()
-    self.mpc.result.invalidate()
+    self.mpc.reset()
     self.fallback.reset()
 
   def invalid_result(self) -> ShadowResult:
@@ -136,6 +145,7 @@ class ShadowCore:
     result.mpc_command_torque = 0.0
     result.mpc_status = int(CandidateStatus.INPUT_INVALID)
     result.mpc_candidate_count = 0
+    result.mpc_available_schedule_count = 0
     result.mpc_optimality_residual = 0.0
     result.fallback_command_torque = 0.0
     result.fallback_status = int(CandidateStatus.INPUT_INVALID)
@@ -314,6 +324,7 @@ class ShadowCore:
     result.mpc_command_torque = applied
     result.mpc_status = int(CandidateStatus.INPUT_INVALID)
     result.mpc_candidate_count = 0
+    result.mpc_available_schedule_count = 0
     result.mpc_optimality_residual = 0.0
     result.fallback_command_torque = applied
     result.fallback_status = int(CandidateStatus.INPUT_INVALID)
@@ -323,6 +334,22 @@ class ShadowCore:
     self.reference_count = reference_count
     self.horizon_seconds = horizon_seconds
     self.actuation_delay = actuation_delay
+    self.candidate_workspace_valid = False
+    if result.valid:
+      try:
+        self.candidate_workspace.fill(
+          self.twin,
+          self.current_state,
+          self.current_align_inputs,
+          self.reference_times,
+          self.reference_curvatures,
+          self.reference_count,
+          self.horizon_seconds,
+          result.disturbance_estimate,
+        )
+        self.candidate_workspace_valid = True
+      except (ValueError, OverflowError):
+        pass
     self.frame_prepared = True
     return result
 
@@ -330,7 +357,9 @@ class ShadowCore:
     if not self.frame_prepared:
       raise RuntimeError("BLaTv2 shadow frame has not been prepared")
     result = self.result
-    if result.valid:
+    if result.valid and self.candidate_workspace_valid:
+      if self.observer.status.reset:
+        self.mpc.reset()
       candidate = self.mpc.compute(
         self.current_state,
         self.current_align_inputs,
@@ -340,12 +369,15 @@ class ShadowCore:
         self.horizon_seconds,
         self.actuation_delay,
         result.disturbance_estimate,
+        workspace_prepared=True,
       )
       result.mpc_command_torque = candidate.command_torque
       result.mpc_status = int(candidate.status)
       result.mpc_candidate_count = candidate.candidate_count
+      result.mpc_available_schedule_count = candidate.available_schedule_count
       result.mpc_optimality_residual = candidate.optimality_residual
     else:
+      self.mpc.reset()
       self.mpc.result.invalidate(self.current_state.applied_torque)
     return result
 
@@ -353,7 +385,7 @@ class ShadowCore:
     if not self.frame_prepared:
       raise RuntimeError("BLaTv2 shadow frame has not been prepared")
     result = self.result
-    if result.valid:
+    if result.valid and self.candidate_workspace_valid:
       candidate = self.fallback.compute(
         self.current_state,
         self.current_align_inputs,
@@ -364,6 +396,7 @@ class ShadowCore:
         self.actuation_delay,
         result.disturbance_estimate,
         self.observer.status,
+        workspace_prepared=True,
       )
       result.fallback_command_torque = candidate.command_torque
       result.fallback_status = int(candidate.status)

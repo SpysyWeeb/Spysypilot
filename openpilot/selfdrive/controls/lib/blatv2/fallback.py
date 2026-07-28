@@ -33,10 +33,15 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import AlignInputs, PlantStat
 class InverseEpsLQIFallback:
   STATE_DIM = 3
 
-  def __init__(self, twin: PlantTwin, controller_params: ControllerParams):
+  def __init__(
+    self,
+    twin: PlantTwin,
+    controller_params: ControllerParams,
+    workspace: CandidateWorkspace | None = None,
+  ):
     self.twin = twin
     self.params = controller_params
-    self.workspace = CandidateWorkspace()
+    self.workspace = CandidateWorkspace() if workspace is None else workspace
     self.result = CandidateResult()
     self.integral_lateral_error = 0.0
 
@@ -254,19 +259,22 @@ class InverseEpsLQIFallback:
     actuation_delay: float,
     disturbance_torque: float,
     observer_status: ObserverStatus,
+    *,
+    workspace_prepared: bool = False,
   ) -> CandidateResult:
     result = self.result
     try:
-      self.workspace.fill(
-        self.twin,
-        state,
-        align_inputs,
-        reference_times,
-        reference_curvatures,
-        reference_count,
-        horizon_seconds,
-        disturbance_torque,
-      )
+      if not workspace_prepared:
+        self.workspace.fill(
+          self.twin,
+          state,
+          align_inputs,
+          reference_times,
+          reference_curvatures,
+          reference_count,
+          horizon_seconds,
+          disturbance_torque,
+        )
       sample_position = min(
         max(float(actuation_delay) / DECISION_DT, 0.0),
         float(self.workspace.decision_count - 1),
@@ -289,6 +297,7 @@ class InverseEpsLQIFallback:
       if not math.isfinite(residual):
         result.invalidate(state.applied_torque, CandidateStatus.NON_CONVERGED)
         result.candidate_count = 1
+        result.available_schedule_count = 1
         return result
 
       angle_error = state.angle_deg - desired_angle
@@ -305,11 +314,13 @@ class InverseEpsLQIFallback:
       if not math.isfinite(raw_command):
         result.invalidate(state.applied_torque, CandidateStatus.NON_CONVERGED)
         result.candidate_count = 1
+        result.available_schedule_count = 1
         return result
 
       result.command_torque = self.twin.apply_slew(state.applied_torque, min(max(raw_command, -1.0), 1.0))
       result.status = CandidateStatus.OK
       result.candidate_count = 1
+      result.available_schedule_count = 1
       result.optimality_residual = residual
       return result
     except (ValueError, OverflowError):
