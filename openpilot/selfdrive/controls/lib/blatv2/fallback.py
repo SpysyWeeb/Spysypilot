@@ -9,6 +9,12 @@ predicted through the physical actuator delay, then inverse rack dynamics
 cancel the measured load and place both tracking-error poles at the rack's
 identified physical damping rate.
 
+Two clocks are deliberately independent. ``action_time`` selects the
+model-authored scalar target and includes the learned end-to-end lateral lag.
+``prediction_delay`` advances the measured rack only until this command can
+physically affect it. Treating the learned lag as pure rack transport predicts
+the rack response twice and can make feedback cancel valid feedforward.
+
 This is not an arrival-time controller and has no tracking-versus-smoothness
 cost. Position error therefore asks for whatever torque the physical model
 requires now, including full normalized authority. The exact Hyundai 409/4/7
@@ -239,7 +245,7 @@ class InverseEpsActionController:
     reference_curvatures: np.ndarray,
     reference_count: int,
     horizon_seconds: float,
-    actuation_delay: float,
+    prediction_delay: float,
     disturbance_torque: float,
     observer_status: ObserverStatus,
     *,
@@ -263,12 +269,20 @@ class InverseEpsActionController:
         )
 
       action_sample_time = (
-        float(actuation_delay) + MODEL_ACTION_OFFSET
+        float(prediction_delay) + MODEL_ACTION_OFFSET
         if action_time is None
         else float(action_time)
       )
       if not math.isfinite(action_sample_time) or action_sample_time < 0.0:
         raise ValueError("model action point must be finite and non-negative")
+      physical_prediction_delay = float(prediction_delay)
+      if (
+        not math.isfinite(physical_prediction_delay)
+        or physical_prediction_delay < 0.0
+      ):
+        raise ValueError(
+          "physical prediction delay must be finite and non-negative"
+        )
 
       sample_position = action_sample_time / DECISION_DT
       count = self.workspace.decision_count
@@ -291,7 +305,7 @@ class InverseEpsActionController:
       # estimation, not path lead: the position target remains the scalar.
       self.twin.predict_held_state_into(
         state,
-        float(actuation_delay),
+        physical_prediction_delay,
         align_inputs,
         float(disturbance_torque),
         self.predicted_state,
@@ -455,6 +469,7 @@ class InverseEpsActionController:
       result.friction_torque = friction
       result.dynamic_torque = dynamic
       result.action_time_seconds = action_sample_time
+      result.prediction_delay_seconds = physical_prediction_delay
       result.slew_constrained = command != torque_target
       result.breakaway_active = self.breakaway_active
       result.breakaway_persistence_frames = (

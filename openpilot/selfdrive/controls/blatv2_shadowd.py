@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
   V14ShadowResult,
 )
 
-SHADOW_VERSION = 10
+SHADOW_VERSION = 11
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -70,6 +70,7 @@ def populate_shadow_message(
   live_action_friction_torque: float,
   live_action_dynamic_torque: float,
   live_action_time_seconds: float,
+  live_action_prediction_delay_seconds: float,
   live_action_slew_constrained: bool,
   live_action_breakaway_active: bool,
   live_action_breakaway_persistence_frames: int,
@@ -139,6 +140,9 @@ def populate_shadow_message(
   shadow.liveActionFrictionTorque = float(live_action_friction_torque)
   shadow.liveActionDynamicTorque = float(live_action_dynamic_torque)
   shadow.liveActionTimeSeconds = float(live_action_time_seconds)
+  shadow.liveActionPredictionDelaySeconds = float(
+    live_action_prediction_delay_seconds
+  )
   shadow.liveActionSlewConstrained = bool(live_action_slew_constrained)
   shadow.liveActionBreakawayActive = bool(
     live_action_breakaway_active
@@ -369,6 +373,10 @@ class BlatV2Shadow:
       ),
       live_action_time_seconds=(
         float(torque_state.blatV2ActionTimeSeconds)
+        if torque_state_valid else 0.0
+      ),
+      live_action_prediction_delay_seconds=(
+        float(torque_state.blatV2PredictionDelaySeconds)
         if torque_state_valid else 0.0
       ),
       live_action_slew_constrained=(

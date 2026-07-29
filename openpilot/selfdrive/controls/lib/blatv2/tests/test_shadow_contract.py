@@ -39,9 +39,9 @@ def test_shadow_runs_below_controlsd_without_competing_on_one_core():
   assert "Priority.CTRL_HIGH" not in source
 
 
-def test_shadow_v10_schema_has_live_action_and_exact_v14_fields():
-  assert SHADOW_VERSION == 10
-  assert LIVE_CONTROLLER_VERSION == 207
+def test_shadow_v11_schema_has_split_delay_and_exact_v14_fields():
+  assert SHADOW_VERSION == 11
+  assert LIVE_CONTROLLER_VERSION == 208
   schema = Path("openpilot/cereal/log.capnp").read_text()
   assert "vEgo @9 :Float64;" in schema
   assert "aligningTorque @10 :Float64;" in schema
@@ -62,10 +62,12 @@ def test_shadow_v10_schema_has_live_action_and_exact_v14_fields():
   assert "liveActionBreakawayActive @54 :Bool;" in schema
   assert "liveActionHorizonAssistActive @56 :Bool;" in schema
   assert "liveActionNoLeadLimited @59 :Bool;" in schema
+  assert "liveActionPredictionDelaySeconds @60 :Float64;" in schema
   assert "blatV2RawCommandTorque @80 :Float64;" in schema
   assert "blatV2SlewConstrained @94 :Bool;" in schema
   assert "blatV2BreakawayActive @95 :Bool;" in schema
   assert "blatV2HorizonAssistActive @97 :Bool;" in schema
   assert "blatV2NoLeadLimited @100 :Bool;" in schema
+  assert "blatV2PredictionDelaySeconds @101 :Float64;" in schema
   assert "mpcCommandTorque" not in schema
   assert "fallbackCommandTorque" not in schema

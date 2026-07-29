@@ -7,7 +7,14 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v207 horizon-feasible action controller.** Route bb showed
+⚠️ **In progress — v208 split-delay action controller.** Route bc exposed a
+structural timing error in v207: the learned end-to-end lateral lag was also
+used as the rack twin's pure command-transport delay. That advanced the
+predicted rack response twice and could make valid feedforward and feedback
+cancel. Version 208 keeps the model-authored action time unchanged while
+predicting the measured rack through only the plant seed's physical delay.
+
+Route bb showed
 that v206's inverse target was strong but its one-frame slew projection
 delivered sharp-turn torque late, while continuous static-friction
 compensation caused near-center activity. Version 207 is replacing those
@@ -27,8 +34,8 @@ BLaTv2's fixed scalar-action timestamp no longer imports or depends on that
 filter setting. A future smoothing change therefore cannot silently alter the
 controller's reference timing.
 
-The controller predicts the measured rack only through the physical actuator
-delay, then uses inverse rack dynamics to command the acceleration needed by
+The controller predicts the measured rack only through the physical command
+transport delay, then uses inverse rack dynamics to command the acceleration needed by
 the scalar angle and its model-authored motion. Version 207 also checks the
 future torque workspace against the exact 409/4/7 reachable envelope. When a
 same-direction future demand cannot be reached by waiting, otherwise-idle slew
@@ -89,16 +96,23 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v207 timing and authority contract
+### v208 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
 move BLaTv2's reference. The scalar action and its local
 angle/rate/acceleration stencil are sampled at that one time. Changing any plan
-point beyond the local stencil cannot affect the current command.
+point beyond the local stencil cannot move that target; later samples can only
+request otherwise-idle slew authority through the separately logged
+reachability guard.
 
-The controller advances the measured steering-wheel angle/rate through only
-the physical `liveDelay` while holding measured applied torque. It then uses
+`liveDelay` is the measured desired-curvature-to-yaw lag and selects the model
+reference; it is not a pure actuator transport delay. The controller advances
+the measured steering-wheel angle/rate through only the independent physical
+plant-seed delay (`0.12 s` provisionally) while holding measured applied
+torque. `blatV2ActionTimeSeconds` and
+`blatV2PredictionDelaySeconds` log both clocks independently so this contract
+is per-frame auditable. It then uses
 computed-torque pole placement: the inverse cancels rack damping and puts both
 angle/rate tracking-error poles at the plant's identified physical damping
 rate `b_steer`. That physical parameter is already part of the rack twin; v205

@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
-from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
+from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams, PlantState
+from openpilot.selfdrive.controls.lib.blatv2.reference import (
+  horizon,
+  model_action_time,
+)
 from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore
 from openpilot.selfdrive.controls.blatv2_shadowd import populate_shadow_message
 from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import V14ShadowResult
@@ -122,6 +126,62 @@ def test_shared_core_is_deterministic_and_residual_valid_after_bootstrap():
   ))
 
 
+def test_learned_reference_lag_never_becomes_rack_prediction_delay():
+  params = plant_params()
+  torque = namespace(
+    latAccelFactor=2.5, latAccelOffset=0.0, friction=0.1,
+  )
+  car_state = namespace(
+    vEgo=10.0,
+    steeringAngleDeg=2.0,
+    steeringRateDeg=0.5,
+    steeringPressed=False,
+    standstill=False,
+  )
+  car_output = namespace(actuatorsOutput=namespace(torque=-0.1))
+  live = namespace(
+    roll=0.01,
+    angleOffsetDeg=0.2,
+    stiffnessFactor=0.9,
+    steerRatio=15.5,
+  )
+  learned_end_to_end_lag = 0.40
+  core = ShadowCore(params, torque, car_params(), controller_params())
+
+  # Bootstrap the one-step residual, then inspect a valid controller frame.
+  core.compute(
+    model(), car_state, car_control(), car_output, live, True,
+    learned_end_to_end_lag, True,
+  )
+  result = core.compute(
+    model(), car_state, car_control(), car_output, live, True,
+    learned_end_to_end_lag, True,
+  )
+  candidate = core.fallback.result
+
+  assert result.valid
+  assert core.reference_delay == learned_end_to_end_lag
+  assert core.action_time == model_action_time(learned_end_to_end_lag)
+  assert core.actuation_delay == params.actuation_delay
+  assert result.horizon == horizon(params)
+  assert candidate.action_time_seconds == model_action_time(
+    learned_end_to_end_lag
+  )
+  assert candidate.prediction_delay_seconds == params.actuation_delay
+
+  expected = PlantState(0.0, 0.0, 0.0, 0.0)
+  core.twin.predict_held_state_into(
+    PlantState(2.0, 0.5, -0.1, 10.0),
+    params.actuation_delay,
+    core.previous_align_inputs,
+    result.disturbance_estimate,
+    expected,
+    0.05,
+  )
+  assert candidate.predicted_angle_deg == expected.angle_deg
+  assert candidate.predicted_rate_deg_s == expected.rate_deg_s
+
+
 def test_valid_core_result_serializes_at_capnp_publish_boundary():
   params = plant_params()
   torque = namespace(
@@ -183,6 +243,7 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     live_action_friction_torque=-0.02,
     live_action_dynamic_torque=-0.04,
     live_action_time_seconds=0.295,
+    live_action_prediction_delay_seconds=0.12,
     live_action_slew_constrained=True,
     live_action_breakaway_active=True,
     live_action_breakaway_persistence_frames=5,
@@ -202,6 +263,7 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
   assert message.blatV2Shadow.liveLqiControllerVersion == 207
   assert message.blatV2Shadow.liveActionRawCommandTorque == -0.09
   assert message.blatV2Shadow.liveActionDesiredAngleDeg == 12.0
+  assert message.blatV2Shadow.liveActionPredictionDelaySeconds == 0.12
   assert message.blatV2Shadow.liveActionSlewConstrained
   assert message.blatV2Shadow.liveActionBreakawayActive
   assert message.blatV2Shadow.liveActionBreakawayPersistenceFrames == 5

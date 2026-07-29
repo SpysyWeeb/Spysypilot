@@ -61,6 +61,7 @@ class LiveActionResult:
   friction_torque: float = 0.0
   dynamic_torque: float = 0.0
   action_time_seconds: float = 0.0
+  prediction_delay_seconds: float = 0.0
   slew_constrained: bool = False
   breakaway_active: bool = False
   breakaway_persistence_frames: int = 0
@@ -246,6 +247,9 @@ class LiveActionController:
     result.friction_torque = float(candidate.friction_torque)
     result.dynamic_torque = float(candidate.dynamic_torque)
     result.action_time_seconds = float(candidate.action_time_seconds)
+    result.prediction_delay_seconds = float(
+      candidate.prediction_delay_seconds
+    )
     result.slew_constrained = bool(candidate.slew_constrained)
     result.breakaway_active = bool(candidate.breakaway_active)
     result.breakaway_persistence_frames = int(

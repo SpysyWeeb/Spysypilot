@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 207
+LIVE_CONTROLLER_VERSION = 208
 
 
 class CandidateStatus(IntEnum):
@@ -108,6 +108,7 @@ class CandidateResult:
   friction_torque: float = 0.0
   dynamic_torque: float = 0.0
   action_time_seconds: float = 0.0
+  prediction_delay_seconds: float = 0.0
   slew_constrained: bool = False
   breakaway_active: bool = False
   breakaway_persistence_frames: int = 0
@@ -136,6 +137,7 @@ class CandidateResult:
     self.friction_torque = 0.0
     self.dynamic_torque = 0.0
     self.action_time_seconds = 0.0
+    self.prediction_delay_seconds = 0.0
     self.slew_constrained = False
     self.breakaway_active = False
     self.breakaway_persistence_frames = 0

@@ -32,9 +32,10 @@ Numerical contract
   ``torque_transition_time``: same-sign growth uses ``delta_up``, same-sign
   release uses ``delta_down``, and a sign crossing spends decay budget reaching
   zero before using the remaining frame fraction to build the new sign.
-* Seed delay is a deterministic fallback. A valid ``liveDelay`` value is passed
-  explicitly to the allocation-free rollout; the frozen ``PlantParams`` and
-  ``PlantTwin`` are never reconstructed on the hot path.
+* Seed delay is the physical command-transport delay used by the rack rollout.
+  ``liveDelay`` is an independent end-to-end reference-timing input and must
+  never replace it. The frozen ``PlantParams`` and ``PlantTwin`` are never
+  reconstructed on the hot path.
 
 These rules are shared verbatim by the device shadow and route-audit replay.
 Changing any rule is a behavior change and requires a shadow-version bump.
