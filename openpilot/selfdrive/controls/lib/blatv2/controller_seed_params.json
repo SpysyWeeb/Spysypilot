@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "provisional": true,
   "provenance": "v203 response-surface selection on sole field route 000000b7--a6b3b1f175; owner authorized staged field evaluation with the raw-burst and high-speed-coverage deviations documented in the branch README and route-audit acceptance record.",
   "sigma_y": {
@@ -33,11 +33,18 @@
     "provisional": true
   },
   "tracking_stiffness": {
-    "value": 0.12,
+    "value": 0.025,
     "units": "normalized torque/deg",
     "owner_feel_dial": true,
     "provisional": true,
-    "provenance": "v215 direct-handoff evidence: 0.12 normalized torque/deg supplies the measured 0.09 static-breakaway authority at 0.75 deg error; rack-rate damping is independently bounded by one actuator build step per 4 deg/s sensor quantum."
+    "provenance": "v217 restores the calm small-error stiffness after route bc showed that a stronger global proportional gain amplified routine plan error into correction activity."
+  },
+  "authority_transition_error_deg": {
+    "value": 1.0,
+    "units": "steering-wheel deg",
+    "owner_feel_dial": true,
+    "provisional": true,
+    "provenance": "v217 route-bc and 9f sweep selected 1.0 degree: it materially improves every unsaturated bc named turn, matches v14's 9f direct-handoff delivered fraction, and remains calmer than v14 in the 15.6-20.1 m/s band. It adds no timer, latch, integral, or second command path."
   },
   "tau_disturbance": {
     "value": 0.5,

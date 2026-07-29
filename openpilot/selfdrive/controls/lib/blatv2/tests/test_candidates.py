@@ -49,7 +49,7 @@ ALIGN_PARAMS = AlignParams(
 )
 CONTROLLER_PARAMS = ControllerParams(0.05, 0.01, 0.5, 0.5, True)
 ACTION_PARAMS = ControllerParams(
-  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.12,
+  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.025, 1.0,
 )
 ALIGN_INPUTS = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
 REFERENCE_TIMES = np.asarray((0.0, 0.5, 1.0), dtype=np.float64)
@@ -88,15 +88,26 @@ def test_shared_sigma_values_are_marked_as_provisional_owner_feel_dials():
     "provisional": True,
   }
   assert payload["tracking_stiffness"] == {
-    "value": 0.12,
+    "value": 0.025,
     "units": "normalized torque/deg",
     "owner_feel_dial": True,
     "provisional": True,
     "provenance": (
-      "v215 direct-handoff evidence: 0.12 normalized torque/deg supplies the "
-      "measured 0.09 static-breakaway authority at 0.75 deg error; rack-rate "
-      "damping is independently bounded by one actuator build step per 4 "
-      "deg/s sensor quantum."
+      "v217 restores the calm small-error stiffness after route bc showed "
+      "that a stronger global proportional gain amplified routine plan error "
+      "into correction activity."
+    ),
+  }
+  assert payload["authority_transition_error_deg"] == {
+    "value": 1.0,
+    "units": "steering-wheel deg",
+    "owner_feel_dial": True,
+    "provisional": True,
+    "provenance": (
+      "v217 route-bc and 9f sweep selected 1.0 degree: it materially improves "
+      "every unsaturated bc named turn, matches v14's 9f direct-handoff "
+      "delivered fraction, and remains calmer than v14 in the 15.6-20.1 m/s "
+      "band. It adds no timer, latch, integral, or second command path."
     ),
   }
 
@@ -215,13 +226,30 @@ def test_action_feedback_separates_position_stiffness_from_rate_damping():
     ObserverStatus.ACTIVE,
     action_time=0.20,
   )
+  angle_error = result.desired_angle_deg - result.predicted_angle_deg
+  transition_fraction = min(
+    abs(angle_error) / ACTION_PARAMS.authority_transition_error_deg, 1.0,
+  )
+  smoothstep = transition_fraction * transition_fraction * (
+    3.0 - 2.0 * transition_fraction
+  )
+  static_authority = max(
+    PLANT_PARAMS.t_breakaway
+    - ACTION_PARAMS.tracking_stiffness
+      * ACTION_PARAMS.authority_transition_error_deg,
+    0.0,
+  )
+  position_feedback = math.copysign(
+    ACTION_PARAMS.tracking_stiffness * abs(angle_error)
+    + static_authority * smoothstep,
+    angle_error,
+  )
   expected = (
     result.desired_acceleration_deg_s2
     + PLANT_PARAMS.b_steer
       * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
     + PLANT_PARAMS.k_t * (
-      ACTION_PARAMS.tracking_stiffness
-        * (result.desired_angle_deg - result.predicted_angle_deg)
+      position_feedback
       + (PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max / 4.0)
         * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
     )
@@ -229,11 +257,11 @@ def test_action_feedback_separates_position_stiffness_from_rate_damping():
   assert math.isclose(result.required_acceleration_deg_s2, expected, abs_tol=1e-12)
 
 
-def test_tracking_stiffness_changes_feedback_without_changing_feedforward():
+def test_tracking_stiffness_changes_small_error_feedback_without_changing_feedforward():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   reference = np.full(3, 0.001, dtype=np.float64)
-  slow = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+  calm = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
     ALIGN_INPUTS,
     REFERENCE_TIMES,
@@ -245,9 +273,12 @@ def test_tracking_stiffness_changes_feedback_without_changing_feedforward():
     ObserverStatus.ACTIVE,
     action_time=0.20,
   )
-  slow_feedforward = slow.feedforward_torque
-  slow_feedback = slow.feedback_torque
-  fast = InverseEpsActionController(twin, ACTION_PARAMS).compute(
+  calm_feedforward = calm.feedforward_torque
+  calm_feedback = calm.feedback_torque
+  stiffer_params = ControllerParams(
+    0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.05, 1.0,
+  )
+  stiffer = InverseEpsActionController(twin, stiffer_params).compute(
     state,
     ALIGN_INPUTS,
     REFERENCE_TIMES,
@@ -259,8 +290,8 @@ def test_tracking_stiffness_changes_feedback_without_changing_feedforward():
     ObserverStatus.ACTIVE,
     action_time=0.20,
   )
-  assert fast.feedforward_torque == slow_feedforward
-  assert abs(fast.feedback_torque) > abs(slow_feedback)
+  assert stiffer.feedforward_torque == calm_feedforward
+  assert abs(stiffer.feedback_torque) > abs(calm_feedback)
 
 
 def test_tracking_stiffness_must_be_finite_and_positive():
@@ -274,6 +305,20 @@ def test_tracking_stiffness_must_be_finite_and_positive():
       pass
     else:
       raise AssertionError(f"accepted invalid tracking stiffness {value!r}")
+
+
+def test_authority_transition_error_must_be_finite_and_positive():
+  for value in (0.0, -1.0, math.inf, math.nan):
+    params = ControllerParams(
+      0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.025,
+      value,
+    )
+    try:
+      params.validate()
+    except ValueError:
+      pass
+    else:
+      raise AssertionError(f"accepted invalid authority transition {value!r}")
 
 
 def test_rate_feedback_quantum_is_bounded_to_one_torque_build_step():
@@ -331,34 +376,90 @@ def test_action_far_future_does_not_pull_current_torque_or_position():
   assert second.horizon_demand_time_seconds == 0.0
 
 
-def test_action_breakaway_requires_persistent_large_error():
+def test_action_authority_curve_reaches_static_load_at_transition():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
-  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
-  curvatures = np.full(3, 0.01, dtype=np.float64)
+  curvature = twin.curvature_from_angle(
+    ACTION_PARAMS.authority_transition_error_deg, 5.0, ALIGN_INPUTS,
+  )
+  curvatures = np.full(3, curvature, dtype=np.float64)
+  result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
+    state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
+    0.0, ObserverStatus.ACTIVE, action_time=0.20,
+  )
+  rate_feedback = (
+    PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max / 4.0
+  ) * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
+  assert math.isclose(
+    result.feedback_torque - rate_feedback,
+    PLANT_PARAMS.t_breakaway,
+    abs_tol=1e-12,
+  )
+  assert not result.breakaway_active
+  assert result.breakaway_persistence_frames == 0
 
-  for frame in range(1, 5):
-    result = candidate.compute(
+
+def test_action_authority_curve_is_continuous_at_transition():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  transition = ACTION_PARAMS.authority_transition_error_deg
+  epsilon = 1e-5
+  position_feedback = []
+  for angle in (transition - epsilon, transition, transition + epsilon):
+    curvature = twin.curvature_from_angle(angle, 5.0, ALIGN_INPUTS)
+    result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
       state,
       ALIGN_INPUTS,
       REFERENCE_TIMES,
-      curvatures,
+      np.full(3, curvature, dtype=np.float64),
       3,
       1.0,
-      0.0,
-      0.0,
-      ObserverStatus.ACTIVE,
-      action_time=0.20,
+      0.0, 0.0, ObserverStatus.ACTIVE, action_time=0.20,
     )
-    assert not result.breakaway_active
-    assert result.breakaway_persistence_frames == frame
-    assert result.friction_torque == 0.0
+    rate_feedback = (
+      PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max / 4.0
+    ) * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
+    position_feedback.append(result.feedback_torque - rate_feedback)
+  assert position_feedback[0] < position_feedback[1] < position_feedback[2]
+  assert math.isclose(
+    (position_feedback[2] - position_feedback[1]) / epsilon,
+    ACTION_PARAMS.tracking_stiffness,
+    rel_tol=1e-9,
+  )
+  assert math.isclose(
+    (position_feedback[1] - position_feedback[0]) / epsilon,
+    ACTION_PARAMS.tracking_stiffness,
+    rel_tol=1e-4,
+  )
 
-  result = candidate.compute(
+
+def test_action_authority_curve_is_stateless_across_reversals():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  curvature = twin.curvature_from_angle(1.0, 5.0, ALIGN_INPUTS)
+  positive = candidate.compute(
+    state, ALIGN_INPUTS, REFERENCE_TIMES,
+    np.full(3, curvature, dtype=np.float64), 3, 1.0, 0.0, 0.0,
+    ObserverStatus.ACTIVE, action_time=0.20,
+  )
+  positive_raw = positive.raw_command_torque
+  negative = candidate.compute(
+    state, ALIGN_INPUTS, REFERENCE_TIMES,
+    np.full(3, -curvature, dtype=np.float64), 3, 1.0, 0.0, 0.0,
+    ObserverStatus.RESET_STEERING_PRESSED, action_time=0.20,
+  )
+  assert math.isclose(negative.raw_command_torque, -positive_raw, abs_tol=1e-12)
+
+
+def test_action_moving_rack_uses_signed_kinetic_friction_only():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, -4.0, 0.0, 5.0)
+  result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
     ALIGN_INPUTS,
     REFERENCE_TIMES,
-    curvatures,
+    REFERENCE_CURVATURES,
     3,
     1.0,
     0.0,
@@ -366,59 +467,7 @@ def test_action_breakaway_requires_persistent_large_error():
     ObserverStatus.ACTIVE,
     action_time=0.20,
   )
-  assert result.breakaway_active
-  assert result.breakaway_persistence_frames == 5
-  assert abs(result.friction_torque) == PLANT_PARAMS.t_breakaway
-
-
-def test_action_subthreshold_center_noise_never_arms_breakaway():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
-  state = PlantState(0.0, 0.0, 0.0, 17.0)
-  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
-  for frame in range(20):
-    curvature = 0.0001 if frame % 2 == 0 else -0.0001
-    result = candidate.compute(
-      state,
-      ALIGN_INPUTS,
-      REFERENCE_TIMES,
-      np.full(3, curvature, dtype=np.float64),
-      3,
-      1.0,
-      0.0,
-      0.0,
-      ObserverStatus.ACTIVE,
-      action_time=0.20,
-    )
-    assert not result.breakaway_active
-    assert result.friction_torque == 0.0
-
-
-def test_action_breakaway_transitions_continuously_to_kinetic_friction():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
-  state = PlantState(0.0, 0.0, 0.0, 5.0)
-  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
-  curvatures = np.full(3, 0.01, dtype=np.float64)
-  for _ in range(5):
-    result = candidate.compute(
-      state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
-      0.0, ObserverStatus.ACTIVE, action_time=0.20,
-    )
-  assert abs(result.friction_torque) == 0.09
-
-  state.rate_deg_s = -2.0
-  result = candidate.compute(
-    state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
-    0.0, ObserverStatus.ACTIVE, action_time=0.20,
-  )
-  assert math.isclose(abs(result.friction_torque), 0.06)
-  assert result.breakaway_active
-
-  state.rate_deg_s = -4.0
-  result = candidate.compute(
-    state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
-    0.0, ObserverStatus.ACTIVE, action_time=0.20,
-  )
-  assert math.isclose(abs(result.friction_torque), 0.03)
+  assert result.friction_torque == -ACTION_PARAMS.kinetic_friction
   assert not result.breakaway_active
 
 
@@ -576,30 +625,23 @@ def test_action_controller_has_no_observer_writable_state():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = feasible_steady_state(twin)
   state.angle_deg += 1.0
-  candidate = InverseEpsActionController(twin, CONTROLLER_PARAMS)
-  active = candidate.compute(
+  first = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state, ALIGN_INPUTS, REFERENCE_TIMES, REFERENCE_CURVATURES, 3, 1.0, 0.0, 0.0, ObserverStatus.ACTIVE,
+  )
+  first_values = (
+    first.command_torque,
+    first.raw_command_torque,
+    first.required_acceleration_deg_s2,
+  )
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  active = candidate.compute(
+    state, ALIGN_INPUTS, REFERENCE_TIMES, REFERENCE_CURVATURES, 3,
+    1.0, 0.0, 0.0, ObserverStatus.ACTIVE,
   )
   active_values = (
     active.command_torque,
     active.raw_command_torque,
     active.required_acceleration_deg_s2,
-  )
-  frozen = candidate.compute(
-    state,
-    ALIGN_INPUTS,
-    REFERENCE_TIMES,
-    REFERENCE_CURVATURES,
-    3,
-    1.0,
-    0.0,
-    0.0,
-    ObserverStatus.FROZEN_RECORDED_CONSTRAINT,
-  )
-  assert active_values == (
-    frozen.command_torque,
-    frozen.raw_command_torque,
-    frozen.required_acceleration_deg_s2,
   )
   reset = candidate.compute(
     state,
@@ -612,6 +654,7 @@ def test_action_controller_has_no_observer_writable_state():
     0.0,
     ObserverStatus.RESET_STEERING_PRESSED,
   )
+  assert first_values == active_values
   assert active_values == (
     reset.command_torque,
     reset.raw_command_torque,

@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
   "provisional": true,
-  "provenance": "Owner-approved live-field signed least-squares fit on routes 000000b6--6d24c922f5 (LQI) and 000000b5--751a540298 (v14 cross-validation), 104k clean engaged frames; method authority spysypilot-route-audit phase0/plant_fit_reference.py at 313de6b. Low-speed node is b5-weighted because b6 was under-actuated. Parameters remain provisional under continuous casual-route calibration.",
-  "k_t": 4000.0,
+  "provenance": "Steady-load schedule: owner-approved signed least-squares fit on routes 000000b6--6d24c922f5 and 000000b5--751a540298; method authority route-audit phase0/plant_fit_reference.py at 313de6b. Transient gain: one-step signed-rate residual census on sole-evidence route 000000bc--081b9d5b5a; k_t=1500 lowers residual RMS from 5.38 deg/s at the provisional 4000 seed to 3.90 deg/s, with independent route halves selecting 1200 and 1600. b_steer remains provisional.",
+  "k_t": 1500.0,
   "b_steer": 10.0,
   "t_breakaway": 0.09,
   "actuation_delay": 0.12,

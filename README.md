@@ -7,7 +7,29 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v216 desired-load action controller.** Route bc exposed a
+⚠️ **In progress — v217 single-path inverse-EPS controller.** Version 217
+keeps one torque equation and removes every experimental second authority:
+there is no preview scheduler, breakaway episode, persistence timer, boost,
+integral, or alternate low-speed controller. Small model-angle errors use a
+calm `0.025 normalized-torque/deg` linear stiffness. Error then enters one
+stateless C1-continuous smoothstep which reaches the measured `0.09` static
+load at `1.0 deg`; beyond it, the same linear law continues naturally to full
+normalized torque. The 409/4/7 Hyundai limiter is the only command slew
+mechanism.
+
+The transient rack gain is now `k_t = 1500 deg/s² per normalized torque`.
+On sole-evidence route `000000bc--081b9d5b5a`, that lowers signed one-step
+plant-residual RMS from `5.38 deg/s` at the provisional `4000` seed to
+`3.90 deg/s`; independent route halves selected `1200` and `1600`. This
+strengthens the existing model-authored rate/acceleration feedforward rather
+than advancing the path or adding a turn detector. With the `1.0 deg`
+authority transition, route 9f direct-handoff delivered fraction is `0.604`
+versus v14's `0.599`, while 15.6–20.1 m/s command oscillation is `0.0254`
+versus `0.0284`. On route bc, every unsaturated named turn receives more
+torque than v216 while complaint-band oscillation remains below v14
+(`0.0353` versus `0.0479`).
+
+Route bc also exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
 used as the rack twin's pure command-transport delay. That advanced the
 predicted rack response twice and could make valid feedforward and feedback
@@ -109,18 +131,19 @@ ground-up design and does not inherit that controller.
 
 - a deterministic float64 steering-rack plant twin;
 - a stateless scalar-anchored future-path reference;
-- one shared recorded-response disturbance observer;
+- one live-response disturbance observer;
 - a retained, non-running sign-schedule torque MPC challenger;
 - the promoted delay-compensated inverse-EPS action controller;
 - an onroad `blatv2_shadowd` process that runs the complete frozen-v14
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 12. It reports reference and
+The shadow event is `blatV2Shadow`, version 13. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 12 adds the reconstructed signed Hyundai rack rate used by the live
+Version 13 identifies the v217 controller data. Version 12 adds the
+reconstructed signed Hyundai rack rate used by the live
 controller and every twin/observer calculation.
 Version 11 separates the logged model action time from the physical rack
 prediction delay. Version 10 added event-breakaway state and the now-retired
@@ -139,7 +162,7 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v216 timing and authority contract
+### v217 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
@@ -181,23 +204,24 @@ complete motion command. Letting later curvature pull current torque would
 change path timing rather than reduce controller delay.
 
 The inverse has no speed-scheduled feedback gain, torque-motion cost, arrival
-horizon, or integral. `tracking_stiffness` is one continuous physical response
-dial, not a smoothing or boost schedule. Smoothness is the exact 409/4/7
-actuator trajectory. Low-speed authority arises naturally because the same
-curvature requires much more steering-wheel angle at low speed, so the
-physical angle error asks for more torque and may saturate.
+horizon, timer, latch, or integral. `tracking_stiffness` is the calm
+small-error slope. `authority_transition_error_deg` controls only where that
+same position law smoothly acquires the measured static-load authority; it is
+not a second command source. The map and its first derivative are continuous,
+so crossing the threshold cannot create a torque step or retain state after a
+reversal. Smoothness is the exact 409/4/7 actuator trajectory. Low-speed
+authority arises naturally because the same curvature requires much more
+steering-wheel angle at low speed, so physical angle error asks for more
+torque and may saturate.
 
-Palisade steering rate is quantized in 4 deg/s increments. Version 207 does not
-treat every zero-rate frame as stiction. Static breakaway arms only after one
-model period of persistent same-direction curvature error at least as large as
-the existing `sigma_curvature`, while measured rack rate is inside half a
-sensor quantum. During that physical breakout episode it blends continuously
-from static `0.09` to kinetic `0.03` across one full measured-rate quantum.
-Sub-threshold center noise receives no static compensation. The persistence
-period and rate quantum come from existing model timing and sensor resolution;
-neither is a feel dial. A b9/ba attempt to identify an additional
-road-wheel-angle scrub term was rejected: the two low-speed route fits did not
-cross-validate, so v205 adds no unsupported coefficient.
+Palisade steering rate is an unsigned 4 deg/s-quantized magnitude. Version 216
+reconstructs its sign once from steering-angle motion. The active controller
+uses kinetic `0.03` friction only when the measured signed rack is moving
+faster than half a sensor quantum; stationary authority comes from the one
+continuous position law above, not a repeated static-friction pulse. A b9/ba
+attempt to identify an additional road-wheel-angle scrub term was rejected:
+the two low-speed route fits did not cross-validate, so v217 adds no
+unsupported coefficient.
 
 ### v207 route-bb staging record
 

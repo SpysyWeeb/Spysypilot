@@ -25,11 +25,10 @@ import math
 
 import numpy as np
 
-from openpilot.common.realtime import DT_CTRL, DT_MDL
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
   RACK_RATE_QUANTUM_DEG_S,
-  measured_rack_friction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   DECISION_DT,
@@ -47,7 +46,15 @@ from openpilot.selfdrive.controls.lib.blatv2.reference import MODEL_ACTION_OFFSE
 
 
 class InverseEpsActionController:
-  """Scalar-faithful inverse with event breakaway and slew reachability."""
+  """One scalar-faithful inverse-EPS command path.
+
+  The linear position term keeps small corrections calm. A stateless,
+  continuously differentiable authority map supplies the rack's identified
+  static-load envelope as model-angle error becomes physically meaningful.
+  There is no persistence gate, boost state, integral, or preview scheduler:
+  the same error-to-torque law handles center corrections, sharp turns, and
+  unwinds.
+  """
 
   def __init__(
     self,
@@ -56,22 +63,13 @@ class InverseEpsActionController:
     workspace: CandidateWorkspace | None = None,
   ):
     self.twin = twin
-    # Retained in the constructor because the shared artifact and seed contract
-    # are also consumed by the retired tournament MPC. The active action
-    # controller uses only the physical kinetic-friction parameter.
     self.params = controller_params
     self.workspace = CandidateWorkspace() if workspace is None else workspace
     self.result = CandidateResult()
     self.predicted_state = PlantState(0.0, 0.0, 0.0, 0.0)
-    self.breakaway_direction = 0.0
-    self.breakaway_persistence_frames = 0
-    self.breakaway_active = False
 
   def reset(self) -> None:
     self.result.invalidate()
-    self.breakaway_direction = 0.0
-    self.breakaway_persistence_frames = 0
-    self.breakaway_active = False
 
   @staticmethod
   def _interpolate(values: np.ndarray, position: float, count: int) -> float:
@@ -82,64 +80,6 @@ class InverseEpsActionController:
     return float(values[lower]) + fraction * (
       float(values[upper]) - float(values[lower])
     )
-
-  def _update_breakaway(
-    self,
-    measured_rate_deg_s: float,
-    curvature_error: float,
-    departure_direction: float,
-  ) -> float:
-    """Return friction for a real stick/slip episode, never plan jitter.
-
-    Route bb showed that treating every sub-quantum rate as static applied
-    nearly full breakaway on 99.6% of highway frames. Static compensation is
-    now armed only by one model period of persistent, same-direction tracking
-    error while the measured rack is inside half a sensor quantum. It remains
-    active through the first full quantum so the 0.09 -> 0.03 transition is
-    continuous, then moving-rack compensation is kinetic only.
-    """
-    measured_rate = float(measured_rate_deg_s)
-    error = float(curvature_error)
-    departure = float(departure_direction)
-    direction = 0.0 if departure == 0.0 else math.copysign(1.0, departure)
-    stationary = abs(measured_rate) <= 0.5 * RACK_RATE_QUANTUM_DEG_S
-    error_large = abs(error) >= self.params.sigma_curvature
-    same_direction = direction != 0.0 and direction == self.breakaway_direction
-
-    if self.breakaway_active:
-      if (
-        direction == 0.0
-        or direction != self.breakaway_direction
-        or not error_large
-      ):
-        self.breakaway_active = False
-        self.breakaway_persistence_frames = 0
-        self.breakaway_direction = direction
-      elif abs(measured_rate) >= RACK_RATE_QUANTUM_DEG_S:
-        self.breakaway_active = False
-        self.breakaway_persistence_frames = 0
-    elif stationary and error_large and direction != 0.0:
-      if same_direction:
-        self.breakaway_persistence_frames += 1
-      else:
-        self.breakaway_direction = direction
-        self.breakaway_persistence_frames = 1
-      if self.breakaway_persistence_frames >= int(round(DT_MDL / DT_CTRL)):
-        self.breakaway_active = True
-    else:
-      self.breakaway_persistence_frames = 0
-      self.breakaway_direction = direction
-
-    if self.breakaway_active:
-      return measured_rack_friction(
-        measured_rate,
-        self.breakaway_direction,
-        self.twin.params.t_breakaway,
-        self.params.kinetic_friction,
-      )
-    if abs(measured_rate) > 0.5 * RACK_RATE_QUANTUM_DEG_S:
-      return math.copysign(self.params.kinetic_friction, measured_rate)
-    return 0.0
 
   def compute(
     self,
@@ -156,7 +96,7 @@ class InverseEpsActionController:
     workspace_prepared: bool = False,
     action_time: float | None = None,
   ) -> CandidateResult:
-    del observer_status  # The action controller has no integral state to freeze.
+    del observer_status  # This controller has no observer-writable state.
     result = self.result
     try:
       if not workspace_prepared:
@@ -199,9 +139,6 @@ class InverseEpsActionController:
       desired_acceleration = self._interpolate(
         self.workspace.desired_accelerations, sample_position, count,
       )
-      desired_curvature = self._interpolate(
-        self.workspace.reference_curvatures, sample_position, count,
-      )
       action_speed = self._interpolate(
         self.workspace.reference_speeds, sample_position, count,
       )
@@ -230,10 +167,28 @@ class InverseEpsActionController:
         / self.twin.params.steer_max
         / RACK_RATE_QUANTUM_DEG_S
       )
-      feedback = (
-        self.params.tracking_stiffness * angle_error
-        + rate_damping * rate_error
+      transition_error_deg = self.params.authority_transition_error_deg
+      normalized_error = min(
+        abs(angle_error) / transition_error_deg, 1.0,
       )
+      smoothstep = normalized_error * normalized_error * (
+        3.0 - 2.0 * normalized_error
+      )
+      static_authority = max(
+        self.twin.params.t_breakaway
+        - self.params.tracking_stiffness * transition_error_deg,
+        0.0,
+      )
+      position_feedback = (
+        math.copysign(
+          self.params.tracking_stiffness * abs(angle_error)
+          + static_authority * smoothstep,
+          angle_error,
+        )
+        if angle_error != 0.0
+        else 0.0
+      )
+      feedback = position_feedback + rate_damping * rate_error
       required_acceleration = (
         desired_acceleration
         + self.twin.params.b_steer * rate_error
@@ -251,15 +206,10 @@ class InverseEpsActionController:
         action_speed,
         align_inputs,
       )
-      predicted_curvature = self.twin.curvature_from_angle(
-        self.predicted_state.angle_deg,
-        action_speed,
-        align_inputs,
-      )
-      friction = self._update_breakaway(
-        state.rate_deg_s,
-        desired_curvature - predicted_curvature,
-        angle_error,
+      friction = (
+        math.copysign(self.params.kinetic_friction, state.rate_deg_s)
+        if abs(state.rate_deg_s) > 0.5 * RACK_RATE_QUANTUM_DEG_S
+        else 0.0
       )
       nominal_dynamic = (
         desired_acceleration
@@ -305,10 +255,8 @@ class InverseEpsActionController:
       result.action_time_seconds = action_sample_time
       result.prediction_delay_seconds = physical_prediction_delay
       result.slew_constrained = command != local_target
-      result.breakaway_active = self.breakaway_active
-      result.breakaway_persistence_frames = (
-        self.breakaway_persistence_frames
-      )
+      result.breakaway_active = False
+      result.breakaway_persistence_frames = 0
       # Wire-compatible retired-v207 diagnostics. The corresponding ordinals
       # remain reserved, but the second torque authority is gone.
       result.horizon_assist_active = False

@@ -39,9 +39,9 @@ def test_shadow_runs_below_controlsd_without_competing_on_one_core():
   assert "Priority.CTRL_HIGH" not in source
 
 
-def test_shadow_v12_schema_has_signed_rate_split_delay_and_exact_v14_fields():
-  assert SHADOW_VERSION == 12
-  assert LIVE_CONTROLLER_VERSION == 216
+def test_shadow_v13_schema_has_signed_rate_and_exact_v14_fields():
+  assert SHADOW_VERSION == 13
+  assert LIVE_CONTROLLER_VERSION == 217
   schema = Path("openpilot/cereal/log.capnp").read_text()
   assert "vEgo @9 :Float64;" in schema
   assert "aligningTorque @10 :Float64;" in schema
