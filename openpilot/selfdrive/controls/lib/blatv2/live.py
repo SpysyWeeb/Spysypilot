@@ -1,7 +1,7 @@
-"""Live BLaTv2 LQI adapter and its explicit invalid-output contract.
+"""Live BLaTv2 action-controller adapter and invalid-output contract.
 
 The numerical controller remains :class:`ShadowCore`: controlsd calls the same
-reference, observer, plant, workspace, and LQI implementation imported by the
+reference, observer, plant, workspace, and action controller imported by the
 route-audit harness.  This module owns only the live failure policy around that
 artifact.
 
@@ -9,9 +9,8 @@ An active invalid result holds the previous request for one frame, then decays
 toward zero through the plant's runtime 409/4/7 limiter.  At 250 ms it requests
 zero and marks both controlsState and carControl invalid; selfdrived therefore
 uses its existing ``commIssue`` soft-disable/no-entry path.  Recovery requires
-ten consecutive finite OK solves.  The LQI integral resets on the recovery
-frame and the resumed command remains slew-feasible from measured applied
-torque.
+ten consecutive finite OK solves.  The controller resets on the recovery frame
+and the resumed command remains slew-feasible from measured applied torque.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ CONTROLLER_SEED_PATH = (
 
 
 @dataclass(slots=True)
-class LiveLQIResult:
+class LiveActionResult:
   command_torque: float = 0.0
   reference_curvature: float = 0.0
   status: int = int(CandidateStatus.INPUT_INVALID)
@@ -48,9 +47,24 @@ class LiveLQIResult:
   invalid_frames: int = 0
   recovery_ok_frames: int = 0
   internal_ok: bool = False
+  raw_command_torque: float = 0.0
+  feedforward_torque: float = 0.0
+  feedback_torque: float = 0.0
+  desired_angle_deg: float = 0.0
+  desired_rate_deg_s: float = 0.0
+  desired_acceleration_deg_s2: float = 0.0
+  predicted_angle_deg: float = 0.0
+  predicted_rate_deg_s: float = 0.0
+  required_acceleration_deg_s2: float = 0.0
+  action_speed_mps: float = 0.0
+  aligning_torque: float = 0.0
+  friction_torque: float = 0.0
+  dynamic_torque: float = 0.0
+  action_time_seconds: float = 0.0
+  slew_constrained: bool = False
 
 
-class LiveLQIController:
+class LiveActionController:
   """Thin stateful safety adapter around the shared tournament artifact."""
 
   def __init__(
@@ -66,7 +80,7 @@ class LiveLQIController:
     self.core = ShadowCore(
       plant_params, torque_params, car_params, controller_params,
     )
-    self.result = LiveLQIResult()
+    self.result = LiveActionResult()
     self.command_torque = 0.0
     self.invalid_frames = 0
     self.recovery_ok_frames = 0
@@ -99,7 +113,7 @@ class LiveLQIController:
     lateral_delay_valid: bool,
     model_valid: bool,
     lateral_active: bool,
-  ) -> LiveLQIResult:
+  ) -> LiveActionResult:
     """Compute one frame and apply the pinned live invalid/re-entry policy."""
     common = self.core.result
     prepared = False
@@ -207,4 +221,30 @@ class LiveLQIController:
     result.invalid_frames = int(self.invalid_frames)
     result.recovery_ok_frames = int(self.recovery_ok_frames)
     result.internal_ok = bool(internal_ok)
+    candidate = self.core.fallback.result
+    result.raw_command_torque = float(candidate.raw_command_torque)
+    result.feedforward_torque = float(candidate.feedforward_torque)
+    result.feedback_torque = float(candidate.feedback_torque)
+    result.desired_angle_deg = float(candidate.desired_angle_deg)
+    result.desired_rate_deg_s = float(candidate.desired_rate_deg_s)
+    result.desired_acceleration_deg_s2 = float(
+      candidate.desired_acceleration_deg_s2
+    )
+    result.predicted_angle_deg = float(candidate.predicted_angle_deg)
+    result.predicted_rate_deg_s = float(candidate.predicted_rate_deg_s)
+    result.required_acceleration_deg_s2 = float(
+      candidate.required_acceleration_deg_s2
+    )
+    result.action_speed_mps = float(candidate.action_speed_mps)
+    result.aligning_torque = float(candidate.aligning_torque)
+    result.friction_torque = float(candidate.friction_torque)
+    result.dynamic_torque = float(candidate.dynamic_torque)
+    result.action_time_seconds = float(candidate.action_time_seconds)
+    result.slew_constrained = bool(candidate.slew_constrained)
     return result
+
+
+# Historical import compatibility for replay and rollback tooling. Both names
+# resolve to the same numerical artifact; there is no second implementation.
+LiveLQIResult = LiveActionResult
+LiveLQIController = LiveActionController

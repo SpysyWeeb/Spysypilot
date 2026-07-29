@@ -963,6 +963,21 @@ struct ControlsState @0x97ff69c53601abf1 {
     blatV2InvalidFrames @77 :UInt16;
     blatV2RecoveryOkFrames @78 :UInt8;
     blatV2CommandTorque @79 :Float64;
+    blatV2RawCommandTorque @80 :Float64;
+    blatV2FeedforwardTorque @81 :Float64;
+    blatV2FeedbackTorque @82 :Float64;
+    blatV2DesiredAngleDeg @83 :Float64;
+    blatV2DesiredRateDegS @84 :Float64;
+    blatV2DesiredAccelerationDegS2 @85 :Float64;
+    blatV2PredictedAngleDeg @86 :Float64;
+    blatV2PredictedRateDegS @87 :Float64;
+    blatV2RequiredAccelerationDegS2 @88 :Float64;
+    blatV2ActionSpeedMps @89 :Float64;
+    blatV2AligningTorque @90 :Float64;
+    blatV2FrictionTorque @91 :Float64;
+    blatV2DynamicTorque @92 :Float64;
+    blatV2ActionTimeSeconds @93 :Float64;
+    blatV2SlewConstrained @94 :Bool;
    }
 
   struct LateralAngleState {
@@ -3099,6 +3114,21 @@ struct BlatV2Shadow {
   v14Valid @36 :Bool;
   v14ComputeTimeSeconds @37 :Float64;
   liveLqiControllerVersion @38 :Int32;
+  liveActionRawCommandTorque @39 :Float64;
+  liveActionFeedforwardTorque @40 :Float64;
+  liveActionFeedbackTorque @41 :Float64;
+  liveActionDesiredAngleDeg @42 :Float64;
+  liveActionDesiredRateDegS @43 :Float64;
+  liveActionDesiredAccelerationDegS2 @44 :Float64;
+  liveActionPredictedAngleDeg @45 :Float64;
+  liveActionPredictedRateDegS @46 :Float64;
+  liveActionRequiredAccelerationDegS2 @47 :Float64;
+  liveActionSpeedMps @48 :Float64;
+  liveActionAligningTorque @49 :Float64;
+  liveActionFrictionTorque @50 :Float64;
+  liveActionDynamicTorque @51 :Float64;
+  liveActionTimeSeconds @52 :Float64;
+  liveActionSlewConstrained @53 :Bool;
 }
 
 struct Touch {

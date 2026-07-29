@@ -435,6 +435,94 @@ class PlantTwin:
       v_ego=float(state.v_ego),
     )
 
+  def predict_held_state_into(
+    self,
+    state: PlantState,
+    duration: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+    target: PlantState,
+    max_step: float,
+  ) -> None:
+    """Predict the measured rack to the actuator action time.
+
+    This is delay compensation, not future-path preview: the already-applied
+    torque is held while the measured rack state advances only through the
+    latency that separates this control decision from rack response. The
+    caller supplies reusable storage so the live path allocates nothing.
+    """
+    remaining = float(duration)
+    step_limit = float(max_step)
+    if not math.isfinite(remaining) or remaining < 0.0:
+      raise ValueError("prediction duration must be finite and non-negative")
+    if not math.isfinite(step_limit) or step_limit <= 0.0:
+      raise ValueError("prediction step must be finite and positive")
+    angle = float(state.angle_deg)
+    rate = float(state.rate_deg_s)
+    while remaining > 0.0:
+      step = min(remaining, step_limit)
+      angle, rate = self._advance(
+        angle,
+        rate,
+        state.applied_torque,
+        state.v_ego,
+        align_inputs,
+        step,
+        disturbance_torque,
+      )
+      remaining -= step
+    target.angle_deg = angle
+    target.rate_deg_s = rate
+    target.applied_torque = float(state.applied_torque)
+    target.v_ego = float(state.v_ego)
+
+  def predict_constant_request_into(
+    self,
+    state: PlantState,
+    duration: float,
+    requested_torque: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+    target: PlantState,
+    max_step: float = DT_CTRL,
+  ) -> None:
+    """Roll out one constant request through the exact 409/4/7 limiter.
+
+    This is the scalar numerical primitive for the live action-point inverse.
+    It allocates no trajectory and applies one actuator update at the start of
+    each controller interval before advancing the rack with ZOH torque.
+    """
+    remaining = float(duration)
+    step_limit = float(max_step)
+    request = float(requested_torque)
+    if not math.isfinite(remaining) or remaining < 0.0:
+      raise ValueError("prediction duration must be finite and non-negative")
+    if not math.isfinite(step_limit) or step_limit <= 0.0:
+      raise ValueError("prediction step must be finite and positive")
+    if not math.isfinite(request):
+      raise ValueError("requested torque must be finite")
+
+    angle = float(state.angle_deg)
+    rate = float(state.rate_deg_s)
+    applied = float(state.applied_torque)
+    while remaining > 0.0:
+      step = min(remaining, step_limit)
+      applied = self.apply_slew(applied, request)
+      angle, rate = self._advance(
+        angle,
+        rate,
+        applied,
+        state.v_ego,
+        align_inputs,
+        step,
+        disturbance_torque,
+      )
+      remaining -= step
+    target.angle_deg = angle
+    target.rate_deg_s = rate
+    target.applied_torque = applied
+    target.v_ego = float(state.v_ego)
+
   def predict(
     self,
     state: PlantState,

@@ -168,7 +168,22 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     live_lqi_output_valid=True,
     live_lqi_invalid_frames=0,
     live_lqi_recovery_ok_frames=10,
-    live_lqi_controller_version=203,
+    live_lqi_controller_version=205,
+    live_action_raw_command_torque=-0.09,
+    live_action_feedforward_torque=-0.04,
+    live_action_feedback_torque=-0.05,
+    live_action_desired_angle_deg=12.0,
+    live_action_desired_rate_deg_s=3.0,
+    live_action_desired_acceleration_deg_s2=4.0,
+    live_action_predicted_angle_deg=10.0,
+    live_action_predicted_rate_deg_s=2.0,
+    live_action_required_acceleration_deg_s2=5.0,
+    live_action_speed_mps=6.0,
+    live_action_aligning_torque=-0.03,
+    live_action_friction_torque=-0.02,
+    live_action_dynamic_torque=-0.04,
+    live_action_time_seconds=0.295,
+    live_action_slew_constrained=True,
     v14_result=V14ShadowResult(-0.07, 0.01, True, 14),
     v14_compute_seconds=0.0002,
   )
@@ -178,7 +193,10 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
   assert message.blatV2Shadow.sharedComputeTimeSeconds == 0.0001
   assert message.blatV2Shadow.liveLqiCommandTorque == -0.08
   assert message.blatV2Shadow.liveLqiComputeTimeSeconds == 0.0008
-  assert message.blatV2Shadow.liveLqiControllerVersion == 203
+  assert message.blatV2Shadow.liveLqiControllerVersion == 205
+  assert message.blatV2Shadow.liveActionRawCommandTorque == -0.09
+  assert message.blatV2Shadow.liveActionDesiredAngleDeg == 12.0
+  assert message.blatV2Shadow.liveActionSlewConstrained
   assert message.blatV2Shadow.v14CommandTorque == -0.07
   assert message.blatV2Shadow.v14ControllerVersion == 14
 

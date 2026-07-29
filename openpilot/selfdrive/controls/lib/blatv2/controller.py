@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 203
+LIVE_CONTROLLER_VERSION = 205
 
 
 class CandidateStatus(IntEnum):
@@ -94,6 +94,21 @@ class ControllerParams:
 @dataclass(slots=True)
 class CandidateResult:
   command_torque: float = 0.0
+  raw_command_torque: float = 0.0
+  feedforward_torque: float = 0.0
+  feedback_torque: float = 0.0
+  desired_angle_deg: float = 0.0
+  desired_rate_deg_s: float = 0.0
+  desired_acceleration_deg_s2: float = 0.0
+  predicted_angle_deg: float = 0.0
+  predicted_rate_deg_s: float = 0.0
+  required_acceleration_deg_s2: float = 0.0
+  action_speed_mps: float = 0.0
+  aligning_torque: float = 0.0
+  friction_torque: float = 0.0
+  dynamic_torque: float = 0.0
+  action_time_seconds: float = 0.0
+  slew_constrained: bool = False
   status: CandidateStatus = CandidateStatus.INPUT_INVALID
   candidate_count: int = 0
   available_schedule_count: int = 0
@@ -101,6 +116,21 @@ class CandidateResult:
 
   def invalidate(self, applied_torque: float = 0.0, status: CandidateStatus = CandidateStatus.INPUT_INVALID) -> None:
     self.command_torque = float(applied_torque)
+    self.raw_command_torque = float(applied_torque)
+    self.feedforward_torque = 0.0
+    self.feedback_torque = 0.0
+    self.desired_angle_deg = 0.0
+    self.desired_rate_deg_s = 0.0
+    self.desired_acceleration_deg_s2 = 0.0
+    self.predicted_angle_deg = 0.0
+    self.predicted_rate_deg_s = 0.0
+    self.required_acceleration_deg_s2 = 0.0
+    self.action_speed_mps = 0.0
+    self.aligning_torque = 0.0
+    self.friction_torque = 0.0
+    self.dynamic_torque = 0.0
+    self.action_time_seconds = 0.0
+    self.slew_constrained = False
     self.status = status
     self.candidate_count = 0
     self.available_schedule_count = 0
