@@ -16,6 +16,7 @@ from openpilot.selfdrive.spysypilot.driving_eventd import (
   lateral_candidate,
   lateral_sample,
   live_pose_sample,
+  log_retry_warning,
   longitudinal_sample,
   manual_candidate,
   rolling_lead_candidate,
@@ -458,6 +459,28 @@ def test_submitter_retries_stable_id_until_acknowledged():
   assert submitter.pending["event"].attempts == 2
   assert submitter.acknowledge("event")
   assert submitter.retry_due(now_ns=2_000) == []
+
+
+def test_retry_warning_coerces_dynamic_id_at_log_boundary(monkeypatch):
+  class DynamicId:
+    def __str__(self):
+      return "event-from-dynamic-struct"
+
+  messages = []
+  monkeypatch.setattr(
+    log_retry_warning.__globals__["cloudlog"], "warning", messages.append,
+  )
+  log_retry_warning(DynamicId())
+  assert messages == [
+    "driving_eventd: retrying unacknowledged event "
+    "event-from-dynamic-struct",
+  ]
+
+
+def test_driving_eventd_is_restartable_after_passive_logger_failure():
+  from openpilot.system.manager.process_config import managed_processes
+
+  assert managed_processes["driving_eventd"].restart_if_crash
 
 
 def test_submit_failure_remains_pending_for_retry():

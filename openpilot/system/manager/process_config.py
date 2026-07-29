@@ -96,7 +96,7 @@ procs = [
   PythonProcess("calibrationd", "openpilot.selfdrive.locationd.calibrationd", only_onroad),
   PythonProcess("torqued", "openpilot.selfdrive.locationd.torqued", only_onroad),
   PythonProcess("controlsd", "openpilot.selfdrive.controls.controlsd", and_(not_joystick, iscar)),
-  PythonProcess("driving_eventd", "openpilot.selfdrive.spysypilot.driving_eventd", iscar),
+  PythonProcess("driving_eventd", "openpilot.selfdrive.spysypilot.driving_eventd", iscar, restart_if_crash=True),
   PythonProcess("blatv2_shadowd", "openpilot.selfdrive.controls.blatv2_shadowd", only_onroad, restart_if_crash=True),
   PythonProcess("joystickd", "openpilot.tools.joystick.joystickd", or_(joystick, notcar)),
   PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
