@@ -29,6 +29,17 @@ versus `0.0284`. On route bc, every unsaturated named turn receives more
 torque than v216 while complaint-band oscillation remains below v14
 (`0.0353` versus `0.0479`).
 
+The four-route counterfactual acceptance is bit-reproducible and passes all
+five delivered-curvature metrics against v14. Post-slew applied torque also
+passes all five. The raw internal target's worst 1-second torque-rate RMS is
+an explicit accepted deviation: `5.0236 /s` versus v14's `4.7682 /s`.
+That target is never sent directly to the rack; Hyundai's exact command
+envelope turns it into an applied result of `1.2231 /s`, better than v14's
+`1.3286 /s`. The deviation is retained deliberately because swift authority
+requires the inverse controller to state the torque it needs, while the one
+physical slew limiter—not another smoothing controller—keeps delivery smooth.
+Field validation remains required before v217 can leave in-progress status.
+
 Route bc also exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
 used as the rack twin's pure command-transport delay. That advanced the
