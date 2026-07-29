@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 213
+LIVE_CONTROLLER_VERSION = 214
 
 
 class CandidateStatus(IntEnum):
@@ -49,7 +49,7 @@ class ObserverStatus(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class ControllerParams:
-  """Controller tolerances plus the physical observer time scale.
+  """Controller tolerances, tracking bandwidth, and observer time scale.
 
   ``sigma_curvature`` and ``kinetic_friction`` are the b7 response-surface
   axes selected for v203. A zero curvature tolerance remains available to
@@ -64,6 +64,7 @@ class ControllerParams:
   provisional: bool
   sigma_curvature: float = 0.0
   kinetic_friction: float = 0.09
+  tracking_bandwidth: float = 10.0
 
   @classmethod
   def from_seed_file(cls, path: str | Path) -> ControllerParams:
@@ -77,6 +78,7 @@ class ControllerParams:
       provisional=bool(seed["provisional"]),
       sigma_curvature=float(seed.get("sigma_curvature", {}).get("value", 0.0)),
       kinetic_friction=float(seed.get("kinetic_friction", {}).get("value", 0.09)),
+      tracking_bandwidth=float(seed.get("tracking_bandwidth", {}).get("value", 10.0)),
     )
     params.validate()
     return params
@@ -89,6 +91,8 @@ class ControllerParams:
       raise ValueError("sigma_curvature must be finite and non-negative")
     if not math.isfinite(self.kinetic_friction) or self.kinetic_friction < 0.0:
       raise ValueError("kinetic_friction must be finite and non-negative")
+    if not math.isfinite(self.tracking_bandwidth) or self.tracking_bandwidth <= 0.0:
+      raise ValueError("tracking_bandwidth must be finite and positive")
 
 
 @dataclass(slots=True)

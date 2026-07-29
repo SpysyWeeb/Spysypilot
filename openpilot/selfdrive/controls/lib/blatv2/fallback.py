@@ -217,12 +217,13 @@ class InverseEpsActionController:
       )
       self.predicted_state.v_ego = action_speed
 
-      # Computed-torque pole placement using the plant's physical damping.
-      # There is deliberately no response-time constant. Cancelling the rack
-      # pole and placing both error poles at b_steer makes authority
-      # speed-independent while curvature-to-angle geometry naturally asks for
-      # more wheel travel, and therefore more torque, at low speed.
-      pole_rate = self.twin.params.b_steer
+      # Computed-torque pole placement uses an explicit closed-loop bandwidth.
+      # Plant damping describes the rack; it does not define how quickly the
+      # controller must remove a tracking error. Conflating the two left small
+      # errors below rack stiction and made corrections feel lazy. The single
+      # bandwidth sets both error poles continuously, without a speed schedule,
+      # preview authority, threshold, or discrete torque boost.
+      pole_rate = self.params.tracking_bandwidth
       angle_error = desired_angle - self.predicted_state.angle_deg
       rate_error = desired_rate - self.predicted_state.rate_deg_s
       required_acceleration = (

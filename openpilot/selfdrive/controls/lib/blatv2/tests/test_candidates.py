@@ -49,7 +49,7 @@ ALIGN_PARAMS = AlignParams(
 )
 CONTROLLER_PARAMS = ControllerParams(0.05, 0.01, 0.5, 0.5, True)
 ACTION_PARAMS = ControllerParams(
-  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03,
+  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 20.0,
 )
 ALIGN_INPUTS = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
 REFERENCE_TIMES = np.asarray((0.0, 0.5, 1.0), dtype=np.float64)
@@ -86,6 +86,17 @@ def test_shared_sigma_values_are_marked_as_provisional_owner_feel_dials():
     "units": "normalized torque",
     "owner_feel_dial": False,
     "provisional": True,
+  }
+  assert payload["tracking_bandwidth"] == {
+    "value": 20.0,
+    "units": "1/s",
+    "owner_feel_dial": True,
+    "provisional": True,
+    "provenance": (
+      "v214 separates closed-loop tracking response from provisional plant "
+      "damping; 20 1/s raises sub-stiction continuous correction authority "
+      "while retaining one speed-independent controller."
+    ),
   }
 
 
@@ -188,10 +199,10 @@ def test_measured_rack_stick_to_slip_transition_is_continuous():
   assert measured_rack_friction(0.0, -1.0, 0.09, 0.03) == -0.09
 
 
-def test_action_computed_torque_places_error_poles_at_physical_rack_rate():
+def test_action_computed_torque_places_error_poles_at_tracking_bandwidth():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
-  result = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+  result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
     ALIGN_INPUTS,
     REFERENCE_TIMES,
@@ -205,12 +216,59 @@ def test_action_computed_torque_places_error_poles_at_physical_rack_rate():
   )
   expected = (
     result.desired_acceleration_deg_s2
-    + 2.0 * PLANT_PARAMS.b_steer
+    + 2.0 * ACTION_PARAMS.tracking_bandwidth
       * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
-    + PLANT_PARAMS.b_steer * PLANT_PARAMS.b_steer
+    + ACTION_PARAMS.tracking_bandwidth * ACTION_PARAMS.tracking_bandwidth
       * (result.desired_angle_deg - result.predicted_angle_deg)
   )
   assert math.isclose(result.required_acceleration_deg_s2, expected, abs_tol=1e-12)
+
+
+def test_tracking_bandwidth_changes_feedback_without_changing_feedforward():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  reference = np.full(3, 0.001, dtype=np.float64)
+  slow = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    reference,
+    3,
+    1.0,
+    0.0,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  slow_feedforward = slow.feedforward_torque
+  slow_feedback = slow.feedback_torque
+  fast = InverseEpsActionController(twin, ACTION_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    reference,
+    3,
+    1.0,
+    0.0,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  assert fast.feedforward_torque == slow_feedforward
+  assert abs(fast.feedback_torque) > abs(slow_feedback)
+
+
+def test_tracking_bandwidth_must_be_finite_and_positive():
+  for value in (0.0, -1.0, math.inf, math.nan):
+    params = ControllerParams(
+      0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, value,
+    )
+    try:
+      params.validate()
+    except ValueError:
+      pass
+    else:
+      raise AssertionError(f"accepted invalid tracking bandwidth {value!r}")
 
 
 def test_action_far_future_does_not_pull_current_torque_or_position():
