@@ -7,7 +7,14 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v206 action-point inverse controller.** Field routes b9/ba
+⚠️ **In progress — v207 horizon-feasible action controller.** Route bb showed
+that v206's inverse target was strong but its one-frame slew projection
+delivered sharp-turn torque late, while continuous static-friction
+compensation caused near-center activity. Version 207 is replacing those
+conflicting mechanisms with event-based breakaway and a deterministic
+horizon-reachability scheduler guarded against path lead.
+
+Field routes b9/ba
 showed that v203 was smooth but slow and weak. Version 205 replaced the LQI
 cost trade with a direct inverse-rack action controller inside controlsd at its
 existing CTRL_HIGH 100 Hz position. The model scalar action remains the
@@ -22,11 +29,13 @@ controller's reference timing.
 
 The controller predicts the measured rack only through the physical actuator
 delay, then uses inverse rack dynamics to command the acceleration needed by
-the scalar angle and its local model-authored rate. Tracking is no longer
-traded against a torque-rate cost or an artificial arrival time. The request
-may use the full normalized torque range and the exact Hyundai 409/4/7 command
-limiter is the sole smoothing authority. The same numerical files are
-imported by route-audit; there is no separate live variant.
+the scalar angle and its model-authored motion. Version 207 also checks the
+future torque workspace against the exact 409/4/7 reachable envelope. When a
+same-direction future demand cannot be reached by waiting, otherwise-idle slew
+capacity may be used now; a predicted-rack guard prevents that extra torque
+from moving the wheel beyond the scalar-pinned path. Tracking is not traded
+against a torque-rate cost or an artificial arrival time. The same numerical
+files are imported by route-audit; there is no separate live variant.
 
 The MPC is retired from onroad execution. Its implementation and tests remain
 in the repository so it can re-enter a future tournament after its real-world
@@ -61,10 +70,12 @@ ground-up design and does not inherit that controller.
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 9. It reports reference and
+The shadow event is `blatV2Shadow`, version 10. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
+Version 10 adds event-breakaway state, horizon-reachability demand/time, and
+the no-path-lead clamp state.
 Version 9 adds the live v205 torque decomposition, action-point target, and
 delay-predicted rack state. Version 8 uses the live-field-calibrated plant
 schedule described below.
@@ -78,7 +89,7 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v206 timing and authority contract
+### v207 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
@@ -93,20 +104,31 @@ angle/rate tracking-error poles at the plant's identified physical damping
 rate `b_steer`. That physical parameter is already part of the rack twin; v205
 adds no response-time or authority dial.
 
-The scalar action alone sets steering position. Only the rate and acceleration
-at that same action point enter the dynamic feedforward; later plan samples
-cannot lead the turn. The inverse has no path-preview torque boost,
-speed-scheduled feedback gain, torque-motion cost, arrival horizon, or
-integral. Smoothness is the exact 409/4/7 actuator trajectory. Low-speed
-authority arises naturally because the same curvature requires much more
-steering-wheel angle at low speed, so the physical angle error asks for more
-torque and may saturate.
+The scalar action alone sets steering position. A fixed five-point quadratic
+stencil derives coherent rate and acceleration from the native 50 ms model
+grid; it adds no state, smoothing delay, or feel constant. Later plan samples
+are used only to answer a physical question: can their predicted torque demand
+still be reached through the exact asymmetric slew limiter if the controller
+waits? The first same-direction unreachable demand may start the actuator ramp
+now. A one-step rack prediction clips only that anticipatory increment if it
+would pass the next scalar-pinned desired angle. Thus prediction removes
+actuator delay without shifting the path or corner timing.
 
-Palisade steering rate is quantized in 4 deg/s increments. Current-frame
-friction therefore uses measured/predicted rack motion, not exact-zero planned
-motion: it blends continuously from static breakaway `0.09` at rest to kinetic
-friction `0.03` across one measured rate quantum. The rate quantum is a sensor
-resolution, not a feel dial. A b9/ba attempt to identify an additional
+The inverse has no speed-scheduled feedback gain, torque-motion cost, arrival
+horizon, or integral. Smoothness is the exact 409/4/7 actuator trajectory.
+Low-speed authority arises naturally because the same curvature requires much
+more steering-wheel angle at low speed, so the physical angle error asks for
+more torque and may saturate.
+
+Palisade steering rate is quantized in 4 deg/s increments. Version 207 does not
+treat every zero-rate frame as stiction. Static breakaway arms only after one
+model period of persistent same-direction curvature error at least as large as
+the existing `sigma_curvature`, while measured rack rate is inside half a
+sensor quantum. During that physical breakout episode it blends continuously
+from static `0.09` to kinetic `0.03` across one full measured-rate quantum.
+Sub-threshold center noise receives no static compensation. The persistence
+period and rate quantum come from existing model timing and sensor resolution;
+neither is a feel dial. A b9/ba attempt to identify an additional
 road-wheel-angle scrub term was rejected: the two low-speed route fits did not
 cross-validate, so v205 adds no unsupported coefficient.
 
@@ -337,5 +359,5 @@ damping.
 - UI;
 - unsupported scrub/load coefficients.
 
-Version 206 stays **in progress** until identity replay, route gates, full test
+Version 207 stays **in progress** until identity replay, route gates, full test
 suites, device timing, and the first owner drive pass.

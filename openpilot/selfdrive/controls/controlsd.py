@@ -212,6 +212,20 @@ class Controls:
       lac_log.blatV2DynamicTorque = float(result.dynamic_torque)
       lac_log.blatV2ActionTimeSeconds = float(result.action_time_seconds)
       lac_log.blatV2SlewConstrained = bool(result.slew_constrained)
+      lac_log.blatV2BreakawayActive = bool(result.breakaway_active)
+      lac_log.blatV2BreakawayPersistenceFrames = int(
+        result.breakaway_persistence_frames
+      )
+      lac_log.blatV2HorizonAssistActive = bool(
+        result.horizon_assist_active
+      )
+      lac_log.blatV2HorizonTorqueDemand = float(
+        result.horizon_torque_demand
+      )
+      lac_log.blatV2HorizonDemandTimeSeconds = float(
+        result.horizon_demand_time_seconds
+      )
+      lac_log.blatV2NoLeadLimited = bool(result.no_lead_limited)
     else:
       # Reset desired curvature to current to avoid violating the limits on
       # engage for every non-BLaTv2 lateral controller.

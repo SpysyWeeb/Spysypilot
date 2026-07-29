@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
   V14ShadowResult,
 )
 
-SHADOW_VERSION = 9
+SHADOW_VERSION = 10
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -71,6 +71,12 @@ def populate_shadow_message(
   live_action_dynamic_torque: float,
   live_action_time_seconds: float,
   live_action_slew_constrained: bool,
+  live_action_breakaway_active: bool,
+  live_action_breakaway_persistence_frames: int,
+  live_action_horizon_assist_active: bool,
+  live_action_horizon_torque_demand: float,
+  live_action_horizon_demand_time_seconds: float,
+  live_action_no_lead_limited: bool,
   v14_result: V14ShadowResult,
   v14_compute_seconds: float,
 ) -> None:
@@ -134,6 +140,22 @@ def populate_shadow_message(
   shadow.liveActionDynamicTorque = float(live_action_dynamic_torque)
   shadow.liveActionTimeSeconds = float(live_action_time_seconds)
   shadow.liveActionSlewConstrained = bool(live_action_slew_constrained)
+  shadow.liveActionBreakawayActive = bool(
+    live_action_breakaway_active
+  )
+  shadow.liveActionBreakawayPersistenceFrames = int(
+    live_action_breakaway_persistence_frames
+  )
+  shadow.liveActionHorizonAssistActive = bool(
+    live_action_horizon_assist_active
+  )
+  shadow.liveActionHorizonTorqueDemand = float(
+    live_action_horizon_torque_demand
+  )
+  shadow.liveActionHorizonDemandTimeSeconds = float(
+    live_action_horizon_demand_time_seconds
+  )
+  shadow.liveActionNoLeadLimited = bool(live_action_no_lead_limited)
   shadow.v14CommandTorque = float(v14_result.command_torque)
   shadow.v14DesiredCurvature = float(v14_result.desired_curvature)
   shadow.v14ControllerVersion = int(v14_result.controller_version)
@@ -351,6 +373,30 @@ class BlatV2Shadow:
       ),
       live_action_slew_constrained=(
         bool(torque_state.blatV2SlewConstrained)
+        if torque_state_valid else False
+      ),
+      live_action_breakaway_active=(
+        bool(torque_state.blatV2BreakawayActive)
+        if torque_state_valid else False
+      ),
+      live_action_breakaway_persistence_frames=(
+        int(torque_state.blatV2BreakawayPersistenceFrames)
+        if torque_state_valid else 0
+      ),
+      live_action_horizon_assist_active=(
+        bool(torque_state.blatV2HorizonAssistActive)
+        if torque_state_valid else False
+      ),
+      live_action_horizon_torque_demand=(
+        float(torque_state.blatV2HorizonTorqueDemand)
+        if torque_state_valid else 0.0
+      ),
+      live_action_horizon_demand_time_seconds=(
+        float(torque_state.blatV2HorizonDemandTimeSeconds)
+        if torque_state_valid else 0.0
+      ),
+      live_action_no_lead_limited=(
+        bool(torque_state.blatV2NoLeadLimited)
         if torque_state_valid else False
       ),
       v14_result=v14_result,

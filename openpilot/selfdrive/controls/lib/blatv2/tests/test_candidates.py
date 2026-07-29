@@ -48,6 +48,9 @@ ALIGN_PARAMS = AlignParams(
   2000.0, 3.0, 1.2, 100000.0, 110000.0, 15.0, 0.0, 0.0
 )
 CONTROLLER_PARAMS = ControllerParams(0.05, 0.01, 0.5, 0.5, True)
+ACTION_PARAMS = ControllerParams(
+  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03,
+)
 ALIGN_INPUTS = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
 REFERENCE_TIMES = np.asarray((0.0, 0.5, 1.0), dtype=np.float64)
 REFERENCE_CURVATURES = np.asarray((0.001, 0.001, 0.001), dtype=np.float64)
@@ -210,14 +213,16 @@ def test_action_computed_torque_places_error_poles_at_physical_rack_rate():
   assert math.isclose(result.required_acceleration_deg_s2, expected, abs_tol=1e-12)
 
 
-def test_action_command_ignores_plan_beyond_local_action_stencil():
+def test_action_horizon_changes_torque_reachability_not_position_authority():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
-  base = np.linspace(0.0, 0.03, len(times), dtype=np.float64)
+  base = np.full(len(times), 0.00001, dtype=np.float64)
   mutated = base.copy()
-  mutated[times >= 0.35] *= -8.0
-  first = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+  mutated[times >= 0.35] = np.linspace(
+    0.00001, 0.15, np.count_nonzero(times >= 0.35),
+  )
+  first = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
     ALIGN_INPUTS,
     times,
@@ -229,13 +234,9 @@ def test_action_command_ignores_plan_beyond_local_action_stencil():
     ObserverStatus.ACTIVE,
     action_time=0.20,
   )
-  first_values = (
-    first.raw_command_torque,
-    first.desired_angle_deg,
-    first.desired_rate_deg_s,
-    first.desired_acceleration_deg_s2,
-  )
-  second = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+  first_position = first.desired_angle_deg
+  first_command = first.command_torque
+  second = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
     ALIGN_INPUTS,
     times,
@@ -247,11 +248,142 @@ def test_action_command_ignores_plan_beyond_local_action_stencil():
     ObserverStatus.ACTIVE,
     action_time=0.20,
   )
-  assert first_values == (
-    second.raw_command_torque,
-    second.desired_angle_deg,
-    second.desired_rate_deg_s,
-    second.desired_acceleration_deg_s2,
+  assert second.desired_angle_deg == first_position
+  assert second.horizon_assist_active
+  assert second.horizon_demand_time_seconds > 0.20
+  assert abs(second.command_torque) > abs(first_command)
+  assert abs(second.raw_command_torque) == 1.0
+
+
+def test_action_breakaway_requires_persistent_large_error():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  curvatures = np.full(3, 0.01, dtype=np.float64)
+
+  for frame in range(1, 5):
+    result = candidate.compute(
+      state,
+      ALIGN_INPUTS,
+      REFERENCE_TIMES,
+      curvatures,
+      3,
+      1.0,
+      0.0,
+      0.0,
+      ObserverStatus.ACTIVE,
+      action_time=0.20,
+    )
+    assert not result.breakaway_active
+    assert result.breakaway_persistence_frames == frame
+    assert result.friction_torque == 0.0
+
+  result = candidate.compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    curvatures,
+    3,
+    1.0,
+    0.0,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  assert result.breakaway_active
+  assert result.breakaway_persistence_frames == 5
+  assert abs(result.friction_torque) == PLANT_PARAMS.t_breakaway
+
+
+def test_action_subthreshold_center_noise_never_arms_breakaway():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 17.0)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  for frame in range(20):
+    curvature = 0.0001 if frame % 2 == 0 else -0.0001
+    result = candidate.compute(
+      state,
+      ALIGN_INPUTS,
+      REFERENCE_TIMES,
+      np.full(3, curvature, dtype=np.float64),
+      3,
+      1.0,
+      0.0,
+      0.0,
+      ObserverStatus.ACTIVE,
+      action_time=0.20,
+    )
+    assert not result.breakaway_active
+    assert result.friction_torque == 0.0
+
+
+def test_action_breakaway_transitions_continuously_to_kinetic_friction():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  curvatures = np.full(3, 0.01, dtype=np.float64)
+  for _ in range(5):
+    result = candidate.compute(
+      state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
+      0.0, ObserverStatus.ACTIVE, action_time=0.20,
+    )
+  assert abs(result.friction_torque) == 0.09
+
+  state.rate_deg_s = -2.0
+  result = candidate.compute(
+    state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
+    0.0, ObserverStatus.ACTIVE, action_time=0.20,
+  )
+  assert math.isclose(abs(result.friction_torque), 0.06)
+  assert result.breakaway_active
+
+  state.rate_deg_s = -4.0
+  result = candidate.compute(
+    state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
+    0.0, ObserverStatus.ACTIVE, action_time=0.20,
+  )
+  assert math.isclose(abs(result.friction_torque), 0.03)
+  assert not result.breakaway_active
+
+
+def test_action_horizon_assist_is_clamped_before_predicted_path_lead():
+  fast_params = PlantParams(
+    400000.0,
+    PLANT_PARAMS.b_steer,
+    0.0,
+    PLANT_PARAMS.actuation_delay,
+    PLANT_PARAMS.steer_max,
+    PLANT_PARAMS.delta_up,
+    PLANT_PARAMS.delta_down,
+    PLANT_PARAMS.steer_step,
+    PLANT_PARAMS.provisional,
+    PLANT_PARAMS.torque_per_lataccel_speed_nodes,
+    PLANT_PARAMS.torque_per_lataccel_values,
+  )
+  twin = PlantTwin(fast_params, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 3.0)
+  times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
+  curvatures = np.full(len(times), 0.00001, dtype=np.float64)
+  curvatures[times >= 0.35] = np.linspace(
+    0.00001, 0.15, np.count_nonzero(times >= 0.35),
+  )
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  result = candidate.compute(
+    state, ALIGN_INPUTS, times, curvatures, len(times), 1.0, 0.05, 0.0,
+    ObserverStatus.ACTIVE, action_time=0.20,
+  )
+  assert result.horizon_assist_active
+  assert result.no_lead_limited
+  next_angle = candidate._next_angle(result.command_torque, ALIGN_INPUTS, 0.0)
+  next_desired = candidate._interpolate(
+    candidate.workspace.desired_angles,
+    (0.20 + 0.01) / DECISION_DT,
+    candidate.workspace.decision_count,
+  )
+  direction = math.copysign(1.0, result.desired_angle_deg)
+  assert direction * (next_angle - next_desired) <= 1e-9
+  assert result.command_torque == twin.apply_slew(
+    state.applied_torque, result.raw_command_torque,
   )
 
 

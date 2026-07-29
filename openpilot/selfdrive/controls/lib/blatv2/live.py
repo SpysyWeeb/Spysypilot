@@ -62,6 +62,12 @@ class LiveActionResult:
   dynamic_torque: float = 0.0
   action_time_seconds: float = 0.0
   slew_constrained: bool = False
+  breakaway_active: bool = False
+  breakaway_persistence_frames: int = 0
+  horizon_assist_active: bool = False
+  horizon_torque_demand: float = 0.0
+  horizon_demand_time_seconds: float = 0.0
+  no_lead_limited: bool = False
 
 
 class LiveActionController:
@@ -241,6 +247,20 @@ class LiveActionController:
     result.dynamic_torque = float(candidate.dynamic_torque)
     result.action_time_seconds = float(candidate.action_time_seconds)
     result.slew_constrained = bool(candidate.slew_constrained)
+    result.breakaway_active = bool(candidate.breakaway_active)
+    result.breakaway_persistence_frames = int(
+      candidate.breakaway_persistence_frames
+    )
+    result.horizon_assist_active = bool(
+      candidate.horizon_assist_active
+    )
+    result.horizon_torque_demand = float(
+      candidate.horizon_torque_demand
+    )
+    result.horizon_demand_time_seconds = float(
+      candidate.horizon_demand_time_seconds
+    )
+    result.no_lead_limited = bool(candidate.no_lead_limited)
     return result
 
 
