@@ -200,8 +200,23 @@ class CandidateWorkspace:
         curvature, self.reference_speeds[index], align_inputs,
       )
 
+    # The model replans at 20 Hz. A three-point second difference made the
+    # action controller respond to individual plan samples as acceleration,
+    # which route bb exposed as near-center activity. Interior cells use the
+    # derivative of one quadratic least-squares fit over five native model
+    # samples. This is a fixed numerical stencil, not a feel/timing filter:
+    # position remains the untouched scalar-pinned reference and the fit only
+    # makes its local rate/acceleration coherent.
     for index in range(decision_count):
-      if index == 0:
+      if 2 <= index < decision_count - 2:
+        center_angle = self.desired_angles[index]
+        rate = (
+          -2.0 * (self.desired_angles[index - 2] - center_angle)
+          - (self.desired_angles[index - 1] - center_angle)
+          + (self.desired_angles[index + 1] - center_angle)
+          + 2.0 * (self.desired_angles[index + 2] - center_angle)
+        ) / (10.0 * DECISION_DT)
+      elif index == 0:
         rate = (self.desired_angles[1] - self.desired_angles[0]) / DECISION_DT
       elif index == decision_count - 1:
         rate = (self.desired_angles[index] - self.desired_angles[index - 1]) / DECISION_DT
@@ -210,7 +225,15 @@ class CandidateWorkspace:
       self.desired_rates[index] = rate
 
     for index in range(decision_count):
-      if index == 0:
+      if 2 <= index < decision_count - 2:
+        center_angle = self.desired_angles[index]
+        acceleration = (
+          2.0 * (self.desired_angles[index - 2] - center_angle)
+          - (self.desired_angles[index - 1] - center_angle)
+          - (self.desired_angles[index + 1] - center_angle)
+          + 2.0 * (self.desired_angles[index + 2] - center_angle)
+        ) / (7.0 * DECISION_DT * DECISION_DT)
+      elif index == 0:
         acceleration = (self.desired_rates[1] - self.desired_rates[0]) / DECISION_DT
       elif index == decision_count - 1:
         acceleration = (self.desired_rates[index] - self.desired_rates[index - 1]) / DECISION_DT

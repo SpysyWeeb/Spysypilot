@@ -168,7 +168,7 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     live_lqi_output_valid=True,
     live_lqi_invalid_frames=0,
     live_lqi_recovery_ok_frames=10,
-    live_lqi_controller_version=205,
+    live_lqi_controller_version=207,
     live_action_raw_command_torque=-0.09,
     live_action_feedforward_torque=-0.04,
     live_action_feedback_torque=-0.05,
@@ -184,6 +184,12 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     live_action_dynamic_torque=-0.04,
     live_action_time_seconds=0.295,
     live_action_slew_constrained=True,
+    live_action_breakaway_active=True,
+    live_action_breakaway_persistence_frames=5,
+    live_action_horizon_assist_active=True,
+    live_action_horizon_torque_demand=-0.8,
+    live_action_horizon_demand_time_seconds=0.45,
+    live_action_no_lead_limited=False,
     v14_result=V14ShadowResult(-0.07, 0.01, True, 14),
     v14_compute_seconds=0.0002,
   )
@@ -193,10 +199,16 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
   assert message.blatV2Shadow.sharedComputeTimeSeconds == 0.0001
   assert message.blatV2Shadow.liveLqiCommandTorque == -0.08
   assert message.blatV2Shadow.liveLqiComputeTimeSeconds == 0.0008
-  assert message.blatV2Shadow.liveLqiControllerVersion == 205
+  assert message.blatV2Shadow.liveLqiControllerVersion == 207
   assert message.blatV2Shadow.liveActionRawCommandTorque == -0.09
   assert message.blatV2Shadow.liveActionDesiredAngleDeg == 12.0
   assert message.blatV2Shadow.liveActionSlewConstrained
+  assert message.blatV2Shadow.liveActionBreakawayActive
+  assert message.blatV2Shadow.liveActionBreakawayPersistenceFrames == 5
+  assert message.blatV2Shadow.liveActionHorizonAssistActive
+  assert message.blatV2Shadow.liveActionHorizonTorqueDemand == -0.8
+  assert message.blatV2Shadow.liveActionHorizonDemandTimeSeconds == 0.45
+  assert not message.blatV2Shadow.liveActionNoLeadLimited
   assert message.blatV2Shadow.v14CommandTorque == -0.07
   assert message.blatV2Shadow.v14ControllerVersion == 14
 
