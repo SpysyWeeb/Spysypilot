@@ -7,7 +7,7 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v210 unified inverse action controller.** Route bc exposed a
+⚠️ **In progress — v211 desired-load action controller.** Route bc exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
 used as the rack twin's pure command-transport delay. That advanced the
 predicted rack response twice and could make valid feedforward and feedback
@@ -16,11 +16,14 @@ predicting the measured rack through only the plant seed's physical delay.
 Version 209 also removes the remaining feedforward/feedback conflict: the
 steady aligning-load feedforward is evaluated at the model-requested rack
 position, rather than at the lagging measured position whose old-direction
-load could cancel entry or reversal feedback. Version 210 decouples physical
-breakaway from the historical path-tolerance dial: a persistent requested rack
-displacement is judged against the platform's measured 0.1-degree angle
-resolution, so a small but consequential highway correction can overcome
-static friction instead of waiting for lane-scale curvature error.
+load could cancel entry or reversal feedback.
+
+A v210 experiment decoupled breakaway from `sigma_curvature` and armed it from
+the measured 0.1-degree rack-angle resolution. It is reverted in v211: on 9f
+it improved the direct-handoff delivered fraction but armed on 43% of valid
+frames and raised 15.6–20.1 m/s command oscillation from `0.0145` to `0.0474`,
+worse than v14 on that route. Repeated full-static-friction pulses are not the
+smooth solution to a small-correction deadband.
 
 Route bb showed that v206's inverse target was strong but its one-frame slew
 projection delivered sharp-turn torque late, while continuous static-friction
@@ -106,7 +109,7 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v210 timing and authority contract
+### v211 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
@@ -145,19 +148,17 @@ Low-speed authority arises naturally because the same curvature requires much
 more steering-wheel angle at low speed, so the physical angle error asks for
 more torque and may saturate.
 
-Palisade steering rate is quantized in 4 deg/s increments and wheel angle in
-0.1-degree increments. Version 210 does not treat every zero-rate frame as
-stiction. Static breakaway arms only after one model period of persistent,
-same-direction rack-position error of at least one measured angle count while
-the rack rate is inside half a rate count. During that physical breakout
-episode it blends continuously from static `0.09` to kinetic `0.03` across one
-full measured-rate quantum. Sub-resolution center noise receives no static
-compensation. Path tolerance no longer controls whether physical friction
-exists. The persistence period and both quanta come from existing model timing
-and sensor resolution; none is a feel dial. A b9/ba attempt to identify an
-additional road-wheel-angle scrub term was rejected: the two low-speed route
-fits did not cross-validate, so the active controller adds no unsupported
-coefficient.
+Palisade steering rate is quantized in 4 deg/s increments. Version 207 does not
+treat every zero-rate frame as stiction. Static breakaway arms only after one
+model period of persistent same-direction curvature error at least as large as
+the existing `sigma_curvature`, while measured rack rate is inside half a
+sensor quantum. During that physical breakout episode it blends continuously
+from static `0.09` to kinetic `0.03` across one full measured-rate quantum.
+Sub-threshold center noise receives no static compensation. The persistence
+period and rate quantum come from existing model timing and sensor resolution;
+neither is a feel dial. A b9/ba attempt to identify an additional
+road-wheel-angle scrub term was rejected: the two low-speed route fits did not
+cross-validate, so v205 adds no unsupported coefficient.
 
 ### v207 route-bb staging record
 

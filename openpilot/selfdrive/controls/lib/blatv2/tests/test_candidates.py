@@ -6,7 +6,6 @@ import numpy as np
 
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
-  RACK_ANGLE_QUANTUM_DEG,
   decision_cell_coulomb_direction,
   decision_cell_friction,
   measured_rack_friction,
@@ -301,7 +300,7 @@ def test_action_subthreshold_center_noise_never_arms_breakaway():
   state = PlantState(0.0, 0.0, 0.0, 17.0)
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   for frame in range(20):
-    curvature = 0.00001 if frame % 2 == 0 else -0.00001
+    curvature = 0.0001 if frame % 2 == 0 else -0.0001
     result = candidate.compute(
       state,
       ALIGN_INPUTS,
@@ -316,38 +315,6 @@ def test_action_subthreshold_center_noise_never_arms_breakaway():
     )
     assert not result.breakaway_active
     assert result.friction_torque == 0.0
-
-
-def test_action_breakaway_uses_rack_resolution_not_path_tolerance():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
-  # This high-speed curvature is below sigma_curvature, but it requests a
-  # clearly measurable rack displacement. Reusing the path tolerance here
-  # caused the 9f direct handoff to remain stuck indefinitely.
-  curvature = 0.000575
-  state = PlantState(1.0, 0.0, 0.0, 20.7)
-  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
-  result = None
-  for _ in range(5):
-    result = candidate.compute(
-      state,
-      ALIGN_INPUTS,
-      REFERENCE_TIMES,
-      np.full(3, curvature, dtype=np.float64),
-      3,
-      1.0,
-      0.0,
-      0.0,
-      ObserverStatus.ACTIVE,
-      action_time=0.20,
-    )
-  assert result is not None
-  assert ACTION_PARAMS.sigma_curvature > curvature
-  assert (
-    abs(result.desired_angle_deg - result.predicted_angle_deg)
-    >= RACK_ANGLE_QUANTUM_DEG
-  )
-  assert result.breakaway_active
-  assert abs(result.friction_torque) == PLANT_PARAMS.t_breakaway
 
 
 def test_action_breakaway_transitions_continuously_to_kinetic_friction():

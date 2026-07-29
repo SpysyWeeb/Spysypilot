@@ -20,11 +20,6 @@ MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
 # resolution, not a feel dial. Blending across one quantum makes static-to-slip
 # compensation continuous without adding filter state or hysteresis timing.
 RACK_RATE_QUANTUM_DEG_S = 4.0
-# Steering-wheel angle reports in 0.1 degree quanta on the same platform.
-# Static friction must not borrow a path-tuning tolerance: a persistent
-# displacement smaller than one measured angle count is unobservable, while
-# any larger displacement is a real rack-position request at every speed.
-RACK_ANGLE_QUANTUM_DEG = 0.1
 
 
 def decision_cell_coulomb_direction(
