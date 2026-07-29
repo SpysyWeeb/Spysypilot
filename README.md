@@ -7,12 +7,18 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v205 action-point inverse controller.** Field routes b9/ba
-showed that v203 was smooth but slow and weak. Version 205 replaces the LQI
+⚠️ **In progress — v206 action-point inverse controller.** Field routes b9/ba
+showed that v203 was smooth but slow and weak. Version 205 replaced the LQI
 cost trade with a direct inverse-rack action controller inside controlsd at its
 existing CTRL_HIGH 100 Hz position. The model scalar action remains the
 unmodified path authority: v205 does not move the path earlier, preserve a
 turn longer, or sample farther into the plan to create lead.
+
+Version 206 removes a branch inconsistency inherited from the stock base:
+modeld's lateral output smoothing is explicitly zero, matching combo, and
+BLaTv2's fixed scalar-action timestamp no longer imports or depends on that
+filter setting. A future smoothing change therefore cannot silently alter the
+controller's reference timing.
 
 The controller predicts the measured rack only through the physical actuator
 delay, then uses inverse rack dynamics to command the acceleration needed by
@@ -72,13 +78,13 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v205 timing and authority contract
+### v206 timing and authority contract
 
-The action time is derived from the same modeld contract used by controlsd:
-`liveDelay.lateralDelay + LAT_SMOOTH_SECONDS + 1.5 × DT_MDL`. The scalar action
-and its local angle/rate/acceleration stencil are sampled at that one time.
-Changing any plan point beyond the local stencil cannot affect the current
-command.
+The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
+offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
+move BLaTv2's reference. The scalar action and its local
+angle/rate/acceleration stencil are sampled at that one time. Changing any plan
+point beyond the local stencil cannot affect the current command.
 
 The controller advances the measured steering-wheel angle/rate through only
 the physical `liveDelay` while holding measured applied torque. It then uses
@@ -331,5 +337,5 @@ damping.
 - UI;
 - unsupported scrub/load coefficients.
 
-Version 205 stays **in progress** until identity replay, route gates, full test
+Version 206 stays **in progress** until identity replay, route gates, full test
 suites, device timing, and the first owner drive pass.
