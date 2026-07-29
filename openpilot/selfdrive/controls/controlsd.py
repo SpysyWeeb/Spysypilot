@@ -19,7 +19,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
-from openpilot.selfdrive.controls.lib.blatv2.live import LiveLQIController
+from openpilot.selfdrive.controls.lib.blatv2.live import LiveActionController
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   CandidateStatus,
   LIVE_CONTROLLER_VERSION,
@@ -101,10 +101,10 @@ class Controls:
       and self.CP.steerControlType == car.CarParams.SteerControlType.torque
       and self.is_torque_lateral
     )
-    self.blatv2: LiveLQIController | None = None
+    self.blatv2: LiveActionController | None = None
     self.LaC: LatControl | None
     if self.is_blatv2:
-      self.blatv2 = LiveLQIController(
+      self.blatv2 = LiveActionController(
         self.CP, self.CI.CC.params, self.CP.lateralTuning.torque,
       )
       self.LaC = None
@@ -252,6 +252,25 @@ class Controls:
       lac_log.blatV2InvalidFrames = int(result.invalid_frames)
       lac_log.blatV2RecoveryOkFrames = int(result.recovery_ok_frames)
       lac_log.blatV2CommandTorque = float(result.command_torque)
+      lac_log.blatV2RawCommandTorque = float(result.raw_command_torque)
+      lac_log.blatV2FeedforwardTorque = float(result.feedforward_torque)
+      lac_log.blatV2FeedbackTorque = float(result.feedback_torque)
+      lac_log.blatV2DesiredAngleDeg = float(result.desired_angle_deg)
+      lac_log.blatV2DesiredRateDegS = float(result.desired_rate_deg_s)
+      lac_log.blatV2DesiredAccelerationDegS2 = float(
+        result.desired_acceleration_deg_s2
+      )
+      lac_log.blatV2PredictedAngleDeg = float(result.predicted_angle_deg)
+      lac_log.blatV2PredictedRateDegS = float(result.predicted_rate_deg_s)
+      lac_log.blatV2RequiredAccelerationDegS2 = float(
+        result.required_acceleration_deg_s2
+      )
+      lac_log.blatV2ActionSpeedMps = float(result.action_speed_mps)
+      lac_log.blatV2AligningTorque = float(result.aligning_torque)
+      lac_log.blatV2FrictionTorque = float(result.friction_torque)
+      lac_log.blatV2DynamicTorque = float(result.dynamic_torque)
+      lac_log.blatV2ActionTimeSeconds = float(result.action_time_seconds)
+      lac_log.blatV2SlewConstrained = bool(result.slew_constrained)
     else:
       assert self.LaC is not None
       # Existing combo lateral stack, retained for every non-BLaTv2 platform.

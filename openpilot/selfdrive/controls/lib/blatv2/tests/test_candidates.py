@@ -8,6 +8,7 @@ from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
   decision_cell_coulomb_direction,
   decision_cell_friction,
+  measured_rack_friction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   DECISION_DT,
@@ -16,7 +17,10 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import (
   ObserverStatus,
 )
 from openpilot.selfdrive.controls.lib.blatv2.reference import interpolate_buffer
-from openpilot.selfdrive.controls.lib.blatv2.fallback import InverseEpsLQIFallback
+from openpilot.selfdrive.controls.lib.blatv2.fallback import (
+  InverseEpsActionController,
+  InverseEpsLQIFallback,
+)
 from openpilot.selfdrive.controls.lib.blatv2.mpc import ModelFollowingTorqueMPC
 from openpilot.selfdrive.controls.lib.blatv2.plant import (
   AlignInputs,
@@ -172,29 +176,134 @@ def test_feedforward_uses_static_breakaway_only_until_rack_moves():
   assert crossing == -0.015
 
 
-def test_curvature_tolerance_adds_speed_rolled_angle_feedback():
-  params = ControllerParams(
-    0.05, 0.01, 0.5, 0.5, True,
-    sigma_curvature=0.00075,
-    kinetic_friction=0.03,
+def test_measured_rack_stick_to_slip_transition_is_continuous():
+  values = tuple(
+    measured_rack_friction(rate, 1.0, 0.09, 0.03)
+    for rate in (0.0, 1.0, 2.0, 3.0, 4.0, 8.0)
   )
+  assert values == (0.09, 0.075, 0.06, 0.045, 0.03, 0.03)
+  assert measured_rack_friction(0.0, -1.0, 0.09, 0.03) == -0.09
+
+
+def test_action_computed_torque_places_error_poles_at_physical_rack_rate():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
-  candidate = InverseEpsLQIFallback(twin, params)
-  gains = []
-  curvature_per_degrees = []
-  for speed in (3.0, 25.0):
-    state = PlantState(0.0, 0.0, 0.0, speed)
-    candidate._compute_gain(state, ALIGN_INPUTS, 30)
-    gains.append(float(candidate.gain[0]))
-    curvature_per_degrees.append(
-      twin.curvature_from_angle(1.0, speed, ALIGN_INPUTS)
-      - twin.curvature_from_angle(0.0, speed, ALIGN_INPUTS)
-    )
-  assert gains[0] > gains[1]
-  curvature_weight_ratio = (
-    curvature_per_degrees[1] / curvature_per_degrees[0]
-  ) ** 2
-  assert 0.0 < curvature_weight_ratio < 0.5
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  result = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    np.full(3, 0.001, dtype=np.float64),
+    3,
+    1.0,
+    0.0,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  expected = (
+    result.desired_acceleration_deg_s2
+    + 2.0 * PLANT_PARAMS.b_steer
+      * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
+    + PLANT_PARAMS.b_steer * PLANT_PARAMS.b_steer
+      * (result.desired_angle_deg - result.predicted_angle_deg)
+  )
+  assert math.isclose(result.required_acceleration_deg_s2, expected, abs_tol=1e-12)
+
+
+def test_action_command_ignores_plan_beyond_local_action_stencil():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
+  base = np.linspace(0.0, 0.03, len(times), dtype=np.float64)
+  mutated = base.copy()
+  mutated[times >= 0.35] *= -8.0
+  first = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    times,
+    base,
+    len(times),
+    1.0,
+    0.05,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  first_values = (
+    first.raw_command_torque,
+    first.desired_angle_deg,
+    first.desired_rate_deg_s,
+    first.desired_acceleration_deg_s2,
+  )
+  second = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    times,
+    mutated,
+    len(times),
+    1.0,
+    0.05,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  assert first_values == (
+    second.raw_command_torque,
+    second.desired_angle_deg,
+    second.desired_rate_deg_s,
+    second.desired_acceleration_deg_s2,
+  )
+
+
+def test_action_controller_uses_full_authority_for_large_low_speed_error():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 3.0)
+  result = InverseEpsActionController(twin, CONTROLLER_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    np.full(3, 0.15, dtype=np.float64),
+    3,
+    1.0,
+    0.05,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  assert result.status == CandidateStatus.OK
+  assert abs(result.raw_command_torque) == 1.0
+  assert result.command_torque == twin.apply_slew(
+    state.applied_torque, result.raw_command_torque,
+  )
+  assert result.slew_constrained
+
+
+def test_action_inverse_cancels_rack_damping_at_predicted_state():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 8.0)
+  curvatures = np.full(3, 0.00003, dtype=np.float64)
+  candidate = InverseEpsActionController(twin, CONTROLLER_PARAMS)
+  result = candidate.compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    curvatures,
+    3,
+    1.0,
+    0.05,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  recovered_acceleration = (
+    result.dynamic_torque * PLANT_PARAMS.k_t
+    - PLANT_PARAMS.b_steer * result.predicted_rate_deg_s
+  )
+  assert math.isclose(
+    recovered_acceleration,
+    result.required_acceleration_deg_s2,
+    abs_tol=1e-12,
+  )
 
 
 def test_coulomb_feedforward_rejects_non_finite_inputs():
@@ -270,18 +379,20 @@ def test_enumeration_exhaustion_is_legible():
   assert result.status == CandidateStatus.ENUMERATION_EXHAUSTED
 
 
-def test_fallback_integral_freezes_and_resets_with_observer_lifecycle():
+def test_action_controller_has_no_observer_writable_state():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = feasible_steady_state(twin)
   state.angle_deg += 1.0
-  candidate = InverseEpsLQIFallback(twin, CONTROLLER_PARAMS)
-
-  candidate.compute(
+  candidate = InverseEpsActionController(twin, CONTROLLER_PARAMS)
+  active = candidate.compute(
     state, ALIGN_INPUTS, REFERENCE_TIMES, REFERENCE_CURVATURES, 3, 1.0, 0.0, 0.0, ObserverStatus.ACTIVE,
   )
-  learned = candidate.integral_lateral_error
-  assert learned != 0.0
-  candidate.compute(
+  active_values = (
+    active.command_torque,
+    active.raw_command_torque,
+    active.required_acceleration_deg_s2,
+  )
+  frozen = candidate.compute(
     state,
     ALIGN_INPUTS,
     REFERENCE_TIMES,
@@ -292,8 +403,12 @@ def test_fallback_integral_freezes_and_resets_with_observer_lifecycle():
     0.0,
     ObserverStatus.FROZEN_RECORDED_CONSTRAINT,
   )
-  assert candidate.integral_lateral_error == learned
-  candidate.compute(
+  assert active_values == (
+    frozen.command_torque,
+    frozen.raw_command_torque,
+    frozen.required_acceleration_deg_s2,
+  )
+  reset = candidate.compute(
     state,
     ALIGN_INPUTS,
     REFERENCE_TIMES,
@@ -304,4 +419,8 @@ def test_fallback_integral_freezes_and_resets_with_observer_lifecycle():
     0.0,
     ObserverStatus.RESET_STEERING_PRESSED,
   )
-  assert candidate.integral_lateral_error == 0.0
+  assert active_values == (
+    reset.command_torque,
+    reset.raw_command_torque,
+    reset.required_acceleration_deg_s2,
+  )

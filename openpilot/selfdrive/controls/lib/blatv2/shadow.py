@@ -101,6 +101,7 @@ class ShadowCore:
     self.plan_curvatures = np.empty(capacity, dtype=np.float64)
     self.reference_times = np.empty(capacity, dtype=np.float64)
     self.reference_curvatures = np.empty(capacity, dtype=np.float64)
+    self.reference_speeds = np.empty(capacity, dtype=np.float64)
 
     self.previous_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.current_state = PlantState(0.0, 0.0, 0.0, 0.0)
@@ -115,6 +116,7 @@ class ShadowCore:
     self.reference_count = 0
     self.horizon_seconds = self.default_horizon
     self.actuation_delay = self.seed_params.actuation_delay
+    self.action_time = model_action_time(self.actuation_delay)
     self.frame_prepared = False
     self.candidate_workspace_valid = False
 
@@ -188,6 +190,39 @@ class ShadowCore:
     target.steer_ratio = self.align_params.nominal_steer_ratio
     target.valid = False
 
+  def _build_reference_speeds(
+    self,
+    model: Any,
+    plan_count: int,
+    reference_count: int,
+    horizon_seconds: float,
+    v_ego: float,
+  ) -> None:
+    """Preserve the model's speed changes on the scalar-pinned time grid.
+
+    The model plan is camera-time based. Its first predicted speed is therefore
+    shifted to the measured current speed, matching the established v14
+    convention, while every future delta remains model-authored.
+    """
+    model_speeds = model.velocity.x
+    if len(model_speeds) < plan_count:
+      raise ValueError("model speed plan is shorter than its curvature plan")
+    first_speed = float(model_speeds[0])
+    speed_offset = float(v_ego) - first_speed
+    output_index = 0
+    for index in range(plan_count):
+      time_value = float(self.plan_times[index])
+      if 0.0 <= time_value <= horizon_seconds:
+        if output_index >= reference_count:
+          raise ValueError("reference speed count exceeds reference curvature count")
+        speed_value = float(model_speeds[index]) + speed_offset
+        if not math.isfinite(speed_value):
+          raise ValueError("model speed plan must be finite")
+        self.reference_speeds[output_index] = max(speed_value, 0.0)
+        output_index += 1
+    if output_index != reference_count:
+      raise ValueError("reference speed and curvature grids do not align")
+
   def begin_frame(
     self,
     model: Any,
@@ -205,6 +240,7 @@ class ShadowCore:
     actuation_delay = self.frame_actuation_delay(lateral_delay, lateral_delay_valid)
 
     scalar = float(model.action.desiredCurvature)
+    v_ego = float(car_state.vEgo)
     signed_plan_count = plan_curvatures_from_model_into(
       model,
       scalar,
@@ -225,6 +261,13 @@ class ShadowCore:
       self.reference_times,
       self.reference_curvatures,
     )
+    self._build_reference_speeds(
+      model,
+      plan_count,
+      reference_count,
+      horizon_seconds,
+      v_ego,
+    )
     reference_now_delay = interpolate_buffer(
       self.reference_times,
       self.reference_curvatures,
@@ -240,7 +283,6 @@ class ShadowCore:
     disagreement = plan_at_action - scalar
 
     self._set_align_inputs(self.current_align_inputs, live_parameters, live_parameters_valid)
-    v_ego = float(car_state.vEgo)
     demand = torque_demand(
       reference_now_delay,
       v_ego,
@@ -334,6 +376,7 @@ class ShadowCore:
     self.reference_count = reference_count
     self.horizon_seconds = horizon_seconds
     self.actuation_delay = actuation_delay
+    self.action_time = action_time
     self.candidate_workspace_valid = False
     if result.valid:
       try:
@@ -347,6 +390,7 @@ class ShadowCore:
           self.horizon_seconds,
           result.disturbance_estimate,
           self.controller_params.kinetic_friction,
+          self.reference_speeds,
         )
         self.candidate_workspace_valid = True
       except (ValueError, OverflowError):
@@ -398,6 +442,7 @@ class ShadowCore:
         result.disturbance_estimate,
         self.observer.status,
         workspace_prepared=True,
+        action_time=self.action_time,
       )
       result.fallback_command_torque = candidate.command_torque
       result.fallback_status = int(candidate.status)

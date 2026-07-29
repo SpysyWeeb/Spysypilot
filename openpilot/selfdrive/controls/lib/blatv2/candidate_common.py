@@ -16,6 +16,10 @@ MAX_DECISION_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DECISION_DT)) + 2
 # One reference schedule plus early/late placement for every possible adjacent
 # sign crossing. Capacity is derived from the runtime horizon grid, not tuned.
 MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
+# Palisade steering-rate reports in 4 deg/s quanta. This is a measurement
+# resolution, not a feel dial. Blending across one quantum makes static-to-slip
+# compensation continuous without adding filter state or hysteresis timing.
+RACK_RATE_QUANTUM_DEG_S = 4.0
 
 
 def decision_cell_coulomb_direction(
@@ -72,15 +76,51 @@ def decision_cell_friction(
   return magnitude * direction
 
 
+def measured_rack_friction(
+  measured_rate: float,
+  departure_direction: float,
+  static_breakaway: float,
+  kinetic_friction: float,
+) -> float:
+  """Continuous stick/slip compensation from measured rack motion.
+
+  The current command is governed by whether the rack is physically stuck,
+  not whether the future reference happens to have an exactly-zero derivative.
+  At zero measured rate it receives full breakaway compensation. Across the
+  first sensor quantum the magnitude linearly blends to kinetic friction.
+  """
+  rate = float(measured_rate)
+  departure = float(departure_direction)
+  static = float(static_breakaway)
+  kinetic = float(kinetic_friction)
+  if not all(math.isfinite(value) for value in (rate, departure, static, kinetic)):
+    raise ValueError("measured rack friction inputs must be finite")
+  if static < 0.0 or kinetic < 0.0:
+    raise ValueError("friction magnitudes must be non-negative")
+
+  if abs(rate) > 0.0:
+    direction = math.copysign(1.0, rate)
+  elif departure != 0.0:
+    direction = math.copysign(1.0, departure)
+  else:
+    return 0.0
+  slip_fraction = min(abs(rate) / RACK_RATE_QUANTUM_DEG_S, 1.0)
+  magnitude = static + slip_fraction * (kinetic - static)
+  return direction * magnitude
+
+
 class CandidateWorkspace:
   """Fixed buffers for the shared scalar-pinned reference and inverse EPS map."""
 
   def __init__(self) -> None:
     self.decision_times = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.reference_curvatures = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.reference_speeds = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.desired_angles = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.desired_rates = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.desired_accelerations = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.friction_directions = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.friction_torques = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.feedforward = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.decision_count = 0
 
@@ -95,6 +135,7 @@ class CandidateWorkspace:
     horizon_seconds: float,
     disturbance_torque: float,
     kinetic_friction: float | None = None,
+    reference_speeds: np.ndarray | None = None,
   ) -> None:
     """Build the 50 ms decision grid and inverse-EPS feedforward.
 
@@ -111,6 +152,9 @@ class CandidateWorkspace:
     decision_count = min(int(math.floor(horizon / DECISION_DT)) + 1, MAX_DECISION_STEPS)
     if decision_count < 2:
       raise ValueError("candidate horizon is too short")
+
+    if reference_speeds is not None and len(reference_speeds) < reference_count:
+      raise ValueError("reference speed buffer is shorter than the reference")
 
     reference_index = 0
     first_reference_time = float(reference_times[0])
@@ -137,7 +181,24 @@ class CandidateWorkspace:
         )
       self.decision_times[index] = time_value
       self.reference_curvatures[index] = curvature
-      self.desired_angles[index] = twin.angle_from_curvature(curvature, state.v_ego, align_inputs)
+      if reference_speeds is None:
+        speed = state.v_ego
+      elif time_value <= first_reference_time:
+        speed = float(reference_speeds[0])
+      elif time_value >= last_reference_time:
+        speed = float(reference_speeds[reference_count - 1])
+      else:
+        lower_time = float(reference_times[reference_index])
+        upper_time = float(reference_times[reference_index + 1])
+        fraction = (time_value - lower_time) / (upper_time - lower_time)
+        speed = float(reference_speeds[reference_index]) + fraction * (
+          float(reference_speeds[reference_index + 1])
+          - float(reference_speeds[reference_index])
+        )
+      self.reference_speeds[index] = max(speed, 0.0)
+      self.desired_angles[index] = twin.angle_from_curvature(
+        curvature, self.reference_speeds[index], align_inputs,
+      )
 
     for index in range(decision_count):
       if index == 0:
@@ -157,6 +218,7 @@ class CandidateWorkspace:
         acceleration = (self.desired_rates[index + 1] - self.desired_rates[index - 1]) / (2.0 * DECISION_DT)
 
       rate = self.desired_rates[index]
+      self.desired_accelerations[index] = acceleration
       left_rate = (
         rate
         if index == 0
@@ -186,7 +248,10 @@ class CandidateWorkspace:
         twin.params.t_breakaway,
         moving_friction,
       )
-      aligning = twin.aligning_torque_values(self.desired_angles[index], state.v_ego, align_inputs)
+      self.friction_torques[index] = friction
+      aligning = twin.aligning_torque_values(
+        self.desired_angles[index], self.reference_speeds[index], align_inputs,
+      )
       dynamic = (acceleration + twin.params.b_steer * rate) / twin.params.k_t
       demand = aligning + dynamic + friction + float(disturbance_torque)
       self.feedforward[index] = min(max(demand, -1.0), 1.0)

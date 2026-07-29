@@ -17,7 +17,7 @@ from openpilot.selfdrive.controls.lib.blatv2.v14.lateral_reference_planner impor
   LateralReferencePlanner,
 )
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
-from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
+from openpilot.selfdrive.modeld.timing import LAT_SMOOTH_SECONDS
 
 
 @dataclass(slots=True)
