@@ -47,6 +47,21 @@ def align_params() -> AlignParams:
   )
 
 
+def assert_state_close(
+  case: unittest.TestCase,
+  actual: PlantState,
+  expected: PlantState,
+) -> None:
+  case.assertTrue(
+    math.isclose(actual.angle_deg, expected.angle_deg, abs_tol=1e-12),
+  )
+  case.assertTrue(
+    math.isclose(actual.rate_deg_s, expected.rate_deg_s, abs_tol=1e-12),
+  )
+  case.assertEqual(actual.applied_torque, expected.applied_torque)
+  case.assertEqual(actual.v_ego, expected.v_ego)
+
+
 class TestPlantTwin(unittest.TestCase):
   def test_hyundai_unsigned_rack_rate_recovers_angle_direction(self) -> None:
     rate = SignedRackRate()
@@ -196,6 +211,58 @@ class TestPlantTwin(unittest.TestCase):
       (target.angle_deg, target.rate_deg_s, target.applied_torque, target.v_ego),
       (state.angle_deg, state.rate_deg_s, state.applied_torque, state.v_ego),
     )
+
+  def test_applied_history_prediction_uses_queued_torque_in_order(self) -> None:
+    twin = PlantTwin(params(), align_params())
+    inputs = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
+    state = PlantState(0.0, 0.0, 0.0, 0.0)
+    history = [0.1, 0.2, 0.3]
+    predicted = PlantState(0.0, 0.0, 0.0, 0.0)
+    expected = PlantState(0.0, 0.0, 0.0, 0.0)
+    twin.predict_applied_history_into(
+      state, 0.03, history, 0, 3, inputs, 0.0, predicted, 0.01,
+    )
+    for applied in history:
+      expected = twin.advance_applied(
+        expected, applied, 0.01, inputs,
+      )
+    assert_state_close(self, predicted, expected)
+
+  def test_applied_history_prediction_holds_current_torque_for_unfilled_prefix(
+    self,
+  ) -> None:
+    twin = PlantTwin(params(), align_params())
+    inputs = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
+    state = PlantState(0.0, 0.0, 0.2, 0.0)
+    history = [0.8, 99.0, 99.0]
+    predicted = PlantState(0.0, 0.0, 0.0, 0.0)
+    expected = PlantState(0.0, 0.0, 0.2, 0.0)
+    twin.predict_applied_history_into(
+      state, 0.03, history, 0, 1, inputs, 0.0, predicted, 0.01,
+    )
+    for applied in (0.2, 0.2, 0.8):
+      expected = twin.advance_applied(
+        expected, applied, 0.01, inputs,
+      )
+    assert_state_close(self, predicted, expected)
+
+  def test_applied_history_prediction_reads_circular_buffer_oldest_first(
+    self,
+  ) -> None:
+    twin = PlantTwin(params(), align_params())
+    inputs = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
+    state = PlantState(0.0, 0.0, 0.0, 0.0)
+    history = [0.3, 0.1, 0.2]
+    predicted = PlantState(0.0, 0.0, 0.0, 0.0)
+    expected = PlantState(0.0, 0.0, 0.0, 0.0)
+    twin.predict_applied_history_into(
+      state, 0.03, history, 1, 3, inputs, 0.0, predicted, 0.01,
+    )
+    for applied in (0.1, 0.2, 0.3):
+      expected = twin.advance_applied(
+        expected, applied, 0.01, inputs,
+      )
+    assert_state_close(self, predicted, expected)
 
   def test_allocation_free_rollout_accepts_live_delay_without_rebuilding_twin(self) -> None:
     twin = PlantTwin(params(), align_params())

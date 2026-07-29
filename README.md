@@ -7,25 +7,27 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v219 scalar-anchored, state/slew-feasible inverse-EPS
-controller.** Version 219 keeps one torque trajectory and no competing
+⚠️ **In progress — v220 scalar-anchored, state/slew-feasible inverse-EPS
+controller.** Version 220 keeps one torque trajectory and no competing
 authority mechanisms: there is no turn detector, preview boost, persistence
 timer, breakaway episode, integral, torque-rate filter, or alternate
 low-speed controller.
 
 The model's scalar action still anchors steering position at its authored
 action time; BLaTv2 does not move or reshape that path. The plant twin solves
-the request needed to reach that scalar angle at its authored time, then rolls
-the surrounding plan through the same inverse-EPS law. A backward reachability
-pass applies the exact asymmetric 409/4/7 limits and starts each build,
-release, or sign handoff at the latest physically feasible instant. This is
-predictive torque timing, not predictive path timing. A one-frame plant
-invariant prevents the future increment from moving the rack beyond the
+the request needed to reach both the scalar angle and model-authored rack
+speed at that time. The surrounding cells are the model-authored inverse-EPS
+feedforward—not simulated future feedback corrections. A backward
+reachability pass applies the exact asymmetric 409/4/7 limits and starts each
+build, release, or sign handoff at the latest physically feasible instant.
+This is predictive torque timing, not predictive path timing. A one-frame
+plant invariant prevents the future increment from moving the rack beyond the
 time-aligned model reference.
 
-Measured rack state is predicted only to the physical torque-effect time and
-compared with the reference at that same instant. One calm linear residual
-term corrects plant/model mismatch. Requested-path feedforward—not tracking
+Measured rack state is predicted through the actual history of commands
+already queued inside the physical torque delay, then compared with the
+reference at that same effect time. One calm linear residual term corrects
+plant/model mismatch exactly once. Requested-path feedforward—not tracking
 error remaining nonzero—owns the torque needed to hold a curve, so useful
 authority no longer disappears merely because the wheel briefly catches the
 target. The exact Hyundai limiter remains the only smoothing authority.
@@ -34,7 +36,7 @@ The design directly addresses the paired-route evidence from controller route
 `000000be--90a99b4f6d` and human-driven route
 `000000bf--9b8b8f9db3`: v217 began low-level motion about four metres earlier
 than the human yet reached meaningful turn-in later, and its feedback shed
-about `0.14` normalized torque before the model requested release. Version 219
+about `0.14` normalized torque before the model requested release. Version 220
 removes that mismatched clock and error-dependent holding behavior rather than
 adding another correction layer.
 
@@ -56,8 +58,14 @@ although deterministic and smoother than v14 after the limiter, it failed the
 committed `9d_r1_turn_in` delivered threshold. Its future path assumed the rack
 was already on the feedforward state and therefore left authority unused.
 Version 219 makes state arrival part of the same physical trajectory and
-requires a fresh bit-reproducible acceptance. Field validation remains
-required before v219 can leave in-progress status.
+exposed a second conflict in replay: its future projector simulated
+closed-loop corrections against its own predicted response, then propagated
+those not-yet-real corrections backward into the current request. Version 220
+keeps measured feedback at the current physical-effect state only, replays the
+real queued torque during the transport delay, and gives the future projector
+only the authored inverse feedforward plus scalar terminal state. It requires
+a fresh bit-reproducible acceptance and field validation before leaving
+in-progress status.
 
 Route bc also exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
@@ -169,11 +177,13 @@ ground-up design and does not inherit that controller.
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 15. It reports reference and
+The shadow event is `blatV2Shadow`, version 16. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 15 identifies the v219 state/slew-feasible controller. Version 14
+Version 16 identifies the v220 single-feedback, queued-delay controller.
+Version 15 identifies the rejected v219 state/slew-feasible controller.
+Version 14
 identifies the rejected v218 torque-only trajectory and reactivates the
 existing horizon/no-lead diagnostic slots with their original meanings.
 Version 13 identifies the v217 controller data. Version 12 adds the
@@ -196,7 +206,7 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v219 timing and authority contract
+### v220 timing and authority contract
 
 The scalar action time remains
 `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model offset is independent
@@ -207,9 +217,10 @@ but it cannot independently change the requested path.
 `liveDelay` is the measured desired-curvature-to-yaw lag and selects the model
 scalar action; it is not a pure actuator transport delay. The controller
 advances the measured steering-wheel angle/rate through only the independent
-physical plant-seed delay (`0.12 s` provisionally) while holding measured
-applied torque. Crucially, it samples the scalar-pinned reference at that same
-physical-effect time for feedback. `blatV2ActionTimeSeconds` and
+physical plant-seed delay (`0.12 s` provisionally), replaying the
+already-issued applied-torque queue in chronological order. Crucially, it
+samples the scalar-pinned reference at that same physical-effect time for
+feedback. `blatV2ActionTimeSeconds` and
 `blatV2PredictionDelaySeconds` log both clocks independently so this contract
 is per-frame auditable. The inverse combines the calibrated steady load at the
 requested rack position with desired motion and direct position/rate feedback.
@@ -232,14 +243,15 @@ The scalar action alone sets steering position. A fixed five-point quadratic
 stencil derives coherent rate and acceleration from the native 50 ms model
 grid; it adds no state, smoothing delay, or feel constant. Those samples map
 to inverse physical torque. The scalar action supplies the terminal angle at
-its existing timestamp; a deterministic plant solve finds the request that
-reaches it, while the forward rollout exposes state error caused by finite
-rack dynamics. Starting at the physical-effect time, an analytic
+its existing timestamp, and the plan supplies terminal rack speed; a
+deterministic plant solve finds the least request satisfying both in the
+authored motion direction. Starting at the physical-effect time, an analytic
 backward-reachable interval projects that sequence through the exact Hyundai
 build, decay, and decay-then-build sign-crossing limits. Future demand changes
-the current request only through the authored state target or when waiting
-would make a later demand unreachable. This cancels controller delay without
-moving the model path itself.
+the current request only through the authored inverse feedforward or when
+waiting would make a later demand unreachable. No predicted future feedback
+is allowed to become a second controller. This cancels controller delay
+without moving the model path itself.
 
 The inverse has no speed-scheduled feedback gain, torque-motion cost, arbitrary
 arrival horizon, timer, latch, or integral. `tracking_stiffness` is the one
@@ -505,5 +517,5 @@ damping.
 - UI;
 - unsupported scrub/load coefficients.
 
-Version 219 stays **in progress** until identity replay, route gates, full test
+Version 220 stays **in progress** until identity replay, route gates, full test
 suites, device timing, and the first owner drive pass.

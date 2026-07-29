@@ -218,15 +218,15 @@ def test_action_feedback_is_linear_and_separates_position_from_rate_damping():
     action_time=0.20,
   )
   angle_error = result.desired_angle_deg - result.predicted_angle_deg
+  rate_error = result.desired_rate_deg_s - result.predicted_rate_deg_s
   position_feedback = ACTION_PARAMS.tracking_stiffness * angle_error
   expected = (
     result.desired_acceleration_deg_s2
-    + PLANT_PARAMS.b_steer
-      * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
+    + PLANT_PARAMS.b_steer * rate_error
     + PLANT_PARAMS.k_t * (
       position_feedback
       + (PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max / 4.0)
-        * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
+        * rate_error
     )
   )
   assert math.isclose(result.required_acceleration_deg_s2, expected, abs_tol=1e-12)
@@ -337,15 +337,52 @@ def test_trajectory_predecessor_is_latest_value_that_reaches_next_cell():
   ) > DECISION_DT
 
 
-def test_action_point_target_reaches_authored_angle_or_uses_full_authority():
+def test_future_slew_projection_uses_only_planned_inverse_feedforward():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  workspace = CandidateWorkspace()
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  workspace.fill(
+    twin,
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    np.asarray((0.0, 0.004, -0.002), dtype=np.float64),
+    3,
+    1.0,
+    0.0,
+    ACTION_PARAMS.kinetic_friction,
+  )
+  candidate = InverseEpsActionController(
+    twin, ACTION_PARAMS, workspace,
+  )
+  action_target = 0.123
+  candidate._project_inverse_trajectory(
+    0.0, 0.0, action_target, 0.20,
+  )
+  assert candidate.trajectory_demands[0] == action_target
+  for index in range(1, workspace.decision_count):
+    assert math.isclose(
+      candidate.trajectory_demands[index],
+      workspace.feedforward[index],
+      abs_tol=1e-15,
+    )
+
+
+def test_action_point_feedforward_reaches_authored_angle_or_uses_full_authority():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
-  candidate.predicted_state.angle_deg = 0.0
-  candidate.predicted_state.rate_deg_s = 0.0
   candidate.predicted_state.applied_torque = 0.0
-  candidate.predicted_state.v_ego = 5.0
-  target = candidate._action_point_target(
-    0.30, 0.0, 3.0, 5.0, 0.0, ALIGN_INPUTS, 0.0,
+  target = candidate._action_point_feedforward(
+    0.30,
+    0.0,
+    0.0,
+    0.0,
+    3.0,
+    0.0,
+    5.0,
+    0.0,
+    ALIGN_INPUTS,
+    0.0,
   )
   source = PlantState(0.0, 0.0, 0.0, 5.0)
   reached = PlantState(0.0, 0.0, 0.0, 5.0)
@@ -353,9 +390,145 @@ def test_action_point_target_reaches_authored_angle_or_uses_full_authority():
     source, 0.30, target, ALIGN_INPUTS, 0.0, reached, 0.01,
   )
   assert abs(reached.angle_deg - 3.0) < 0.01
-  assert candidate._action_point_target(
-    0.30, 0.0, 100.0, 5.0, 0.0, ALIGN_INPUTS, 0.0,
+  assert candidate._action_point_feedforward(
+    0.30,
+    0.0,
+    0.0,
+    0.0,
+    100.0,
+    0.0,
+    5.0,
+    0.0,
+    ALIGN_INPUTS,
+    0.0,
   ) == 1.0
+
+
+def test_action_feedforward_is_independent_of_measured_rack_error():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  candidate.predicted_state.applied_torque = 0.25
+  candidate.predicted_state.angle_deg = -50.0
+  candidate.predicted_state.rate_deg_s = -20.0
+  first = candidate._action_point_feedforward(
+    0.30,
+    0.0,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    5.0,
+    0.1,
+    ALIGN_INPUTS,
+    0.0,
+  )
+  candidate.predicted_state.angle_deg = 50.0
+  candidate.predicted_state.rate_deg_s = 20.0
+  second = candidate._action_point_feedforward(
+    0.30,
+    0.0,
+    1.0,
+    2.0,
+    4.0,
+    8.0,
+    5.0,
+    0.1,
+    ALIGN_INPUTS,
+    0.0,
+  )
+  assert first == second
+
+
+def test_action_feedforward_preserves_terminal_rack_momentum():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  candidate.predicted_state.applied_torque = 0.0
+  target = candidate._action_point_feedforward(
+    0.30,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    8.0,
+    5.0,
+    0.0,
+    ALIGN_INPUTS,
+    0.0,
+  )
+  source = PlantState(0.0, 0.0, 0.0, 5.0)
+  reached = PlantState(0.0, 0.0, 0.0, 5.0)
+  twin.predict_constant_request_into(
+    source, 0.30, target, ALIGN_INPUTS, 0.0, reached, 0.01,
+  )
+  assert reached.angle_deg >= 1.0 - 0.01
+  assert reached.rate_deg_s >= 8.0 - 0.01
+
+  reverse_target = candidate._action_point_feedforward(
+    0.30,
+    0.0,
+    0.0,
+    0.0,
+    -1.0,
+    -8.0,
+    5.0,
+    0.0,
+    ALIGN_INPUTS,
+    0.0,
+  )
+  twin.predict_constant_request_into(
+    source,
+    0.30,
+    reverse_target,
+    ALIGN_INPUTS,
+    0.0,
+    reached,
+    0.01,
+  )
+  assert reached.angle_deg <= -1.0 + 0.01
+  assert reached.rate_deg_s <= -8.0 + 0.01
+
+
+def test_action_effect_prediction_replays_queued_commands_not_latest_hold():
+  delayed_params = PLANT_PARAMS.with_actuation_delay(0.03)
+  twin = PlantTwin(delayed_params, ALIGN_PARAMS)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  candidate._remember_applied_torque(0.1)
+  candidate._remember_applied_torque(0.2)
+  candidate._remember_applied_torque(0.3)
+  candidate._predict_to_effect_time(state, 0.03, ALIGN_INPUTS, 0.0)
+
+  expected = PlantState(0.0, 0.0, 0.0, 5.0)
+  for applied in (0.1, 0.2, 0.3):
+    expected = twin.advance_applied(
+      expected, applied, 0.01, ALIGN_INPUTS,
+    )
+  held = PlantState(0.0, 0.0, 0.0, 5.0)
+  twin.predict_held_state_into(
+    state, 0.03, ALIGN_INPUTS, 0.0, held, 0.01,
+  )
+  assert math.isclose(
+    candidate.predicted_state.angle_deg, expected.angle_deg, abs_tol=1e-12,
+  )
+  assert math.isclose(
+    candidate.predicted_state.rate_deg_s, expected.rate_deg_s, abs_tol=1e-12,
+  )
+  assert candidate.predicted_state.applied_torque == expected.applied_torque
+  assert candidate.predicted_state.v_ego == expected.v_ego
+  assert candidate.predicted_state != held
+
+
+def test_action_reset_discards_queued_commands_at_regime_boundary():
+  delayed_params = PLANT_PARAMS.with_actuation_delay(0.03)
+  candidate = InverseEpsActionController(
+    PlantTwin(delayed_params, ALIGN_PARAMS), ACTION_PARAMS,
+  )
+  candidate._remember_applied_torque(0.1)
+  candidate._remember_applied_torque(0.2)
+  assert candidate.command_history_count == 2
+  candidate.reset()
+  assert candidate.command_history_count == 0
+  assert candidate.command_history_start == 0
 
 
 def test_action_tracks_reference_at_physical_effect_time_not_later_scalar_time():

@@ -172,13 +172,16 @@ def test_learned_reference_lag_never_becomes_rack_prediction_delay():
   assert candidate.prediction_delay_seconds == params.actuation_delay
 
   expected = PlantState(0.0, 0.0, 0.0, 0.0)
-  core.twin.predict_held_state_into(
+  core.twin.predict_applied_history_into(
     PlantState(2.0, 0.0, -0.1, 10.0),
     params.actuation_delay,
+    (),
+    0,
+    0,
     core.previous_align_inputs,
     result.disturbance_estimate,
     expected,
-    0.05,
+    0.01,
   )
   assert candidate.predicted_angle_deg == expected.angle_deg
   assert candidate.predicted_rate_deg_s == expected.rate_deg_s

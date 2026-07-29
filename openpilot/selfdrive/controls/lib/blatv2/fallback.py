@@ -86,21 +86,64 @@ class InverseEpsActionController:
     self.predicted_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.command_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.command_next_state = PlantState(0.0, 0.0, 0.0, 0.0)
-    self.rollout_state = PlantState(0.0, 0.0, 0.0, 0.0)
-    self.rollout_next_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.arrival_source_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.arrival_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.local_terms = _InverseTerms()
-    self.rollout_terms = _InverseTerms()
     self.trajectory_times = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.trajectory_demands = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.trajectory_targets = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
     self.trajectory_constraint_indices = np.empty(
       MAX_DECISION_STEPS, dtype=np.int32,
     )
+    self.command_history_capacity = int(
+      math.ceil(self.twin.params.actuation_delay / DT_CTRL)
+    )
+    self.command_history = np.empty(
+      max(self.command_history_capacity, 1), dtype=np.float64,
+    )
+    self.command_history_start = 0
+    self.command_history_count = 0
 
   def reset(self) -> None:
     self.result.invalidate()
+    self.command_history_start = 0
+    self.command_history_count = 0
+
+  def _remember_applied_torque(self, applied_torque: float) -> None:
+    """Append the last hardware/safety-limited command to the delay line."""
+    if self.command_history_capacity == 0:
+      return
+    if self.command_history_count < self.command_history_capacity:
+      index = (
+        self.command_history_start + self.command_history_count
+      ) % self.command_history_capacity
+      self.command_history_count += 1
+    else:
+      index = self.command_history_start
+      self.command_history_start = (
+        self.command_history_start + 1
+      ) % self.command_history_capacity
+    self.command_history[index] = float(applied_torque)
+
+  def _predict_to_effect_time(
+    self,
+    state: PlantState,
+    duration: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> None:
+    """Advance through commands already committed inside the pure delay."""
+    self.twin.predict_applied_history_into(
+      state,
+      duration,
+      self.command_history,
+      self.command_history_start,
+      self.command_history_count,
+      align_inputs,
+      disturbance_torque,
+      self.predicted_state,
+      DT_CTRL,
+    )
 
   @staticmethod
   def _interpolate(values: np.ndarray, position: float, count: int) -> float:
@@ -185,10 +228,16 @@ class InverseEpsActionController:
     local_target: float,
     action_target: float,
     action_time: float,
-    align_inputs: AlignInputs,
-    disturbance_torque: float,
   ) -> tuple[float, bool, float, float]:
-    """Return the current target of the latest state/slew-feasible path."""
+    """Return the current target of one planned, slew-feasible torque path.
+
+    The future cells are the model-authored inverse-EPS feedforward, not a
+    second closed-loop controller simulated against its own predictions.
+    Current measured-rack error is already applied once in ``action_target``;
+    feeding predicted future error backward through the slew projector makes
+    the present request chase corrections that have not happened. Receding
+    100 Hz evaluation handles the real residual on the next frame.
+    """
     count = self.workspace.decision_count
     last_time = float(self.workspace.decision_times[count - 1])
     start_time = min(max(float(physical_effect_time), 0.0), last_time)
@@ -199,56 +248,18 @@ class InverseEpsActionController:
     if trajectory_count <= 0:
       return float(local_target), False, 0.0, 0.0
 
-    rollout = self.rollout_state
-    rollout.angle_deg = self.predicted_state.angle_deg
-    rollout.rate_deg_s = self.predicted_state.rate_deg_s
-    rollout.applied_torque = self.predicted_state.applied_torque
-    rollout.v_ego = self.predicted_state.v_ego
-    next_rollout = self.rollout_next_state
     for index in range(trajectory_count):
       sample_time = start_time + index * DECISION_DT
       self.trajectory_times[index] = sample_time
       sample_position = sample_time / DECISION_DT
-      desired_angle = self._interpolate(
-        self.workspace.desired_angles, sample_position, count,
+      demand = self._interpolate(
+        self.workspace.feedforward, sample_position, count,
       )
-      desired_rate = self._interpolate(
-        self.workspace.desired_rates, sample_position, count,
-      )
-      desired_acceleration = self._interpolate(
-        self.workspace.desired_accelerations, sample_position, count,
-      )
-      sample_speed = self._interpolate(
-        self.workspace.reference_speeds, sample_position, count,
-      )
-      rollout.v_ego = sample_speed
-      self._fill_inverse_terms(
-        self.rollout_terms,
-        rollout,
-        desired_angle,
-        desired_rate,
-        desired_acceleration,
-        sample_speed,
-        align_inputs,
-        disturbance_torque,
-      )
-      demand = self.rollout_terms.target
       if index == 0:
-        # The action-point solver supplies the first target; the forward
-        # rollout then exposes any later state-feedback demand caused by it.
+        # The scalar-pinned terminal solve supplies this frame's planned target
+        # with the one measured-rack correction already included.
         demand = float(action_target)
       self.trajectory_demands[index] = min(max(demand, -1.0), 1.0)
-      if index + 1 < trajectory_count:
-        self.twin.predict_constant_request_into(
-          rollout,
-          DECISION_DT,
-          self.trajectory_demands[index],
-          align_inputs,
-          disturbance_torque,
-          next_rollout,
-          DT_CTRL,
-        )
-        rollout, next_rollout = next_rollout, rollout
 
     last = trajectory_count - 1
     self.trajectory_targets[last] = self.trajectory_demands[last]
@@ -286,58 +297,70 @@ class InverseEpsActionController:
       binding_time,
     )
 
-  def _action_point_target(
+  def _solve_terminal_request(
     self,
-    action_time: float,
-    physical_effect_time: float,
-    desired_action_angle: float,
-    action_speed: float,
-    local_target: float,
+    source: PlantState,
+    duration: float,
+    target_value: float,
+    nominal_request: float,
+    rate_target: bool,
     align_inputs: AlignInputs,
     disturbance_torque: float,
   ) -> float:
-    """Solve the constant request that reaches the scalar action on time.
-
-    The model owns the terminal angle and timestamp. The plant owns how much
-    torque is needed to get there. Receding-horizon evaluation at 100 Hz means
-    only this frame's exact slew step is committed; subsequent frames solve
-    again from measured response. Twelve fixed bisections resolve finer than
-    one Hyundai torque count and introduce no response-time or feel constant.
-    """
-    duration = float(action_time) - float(physical_effect_time)
-    if duration <= 0.0:
-      return float(local_target)
-    low = -1.0
-    high = 1.0
-    source = self.arrival_source_state
-    source.angle_deg = self.predicted_state.angle_deg
-    source.rate_deg_s = self.predicted_state.rate_deg_s
-    source.applied_torque = self.predicted_state.applied_torque
-    source.v_ego = float(action_speed)
+    """Return the least change from nominal that reaches one terminal state."""
+    nominal = min(max(float(nominal_request), -1.0), 1.0)
     self.twin.predict_constant_request_into(
       source,
       duration,
-      low,
+      nominal,
       align_inputs,
       disturbance_torque,
       self.arrival_state,
       DT_CTRL,
     )
-    low_angle = self.arrival_state.angle_deg
-    self.twin.predict_constant_request_into(
-      source,
-      duration,
-      high,
-      align_inputs,
-      disturbance_torque,
-      self.arrival_state,
-      DT_CTRL,
+    nominal_value = (
+      self.arrival_state.rate_deg_s
+      if rate_target else self.arrival_state.angle_deg
     )
-    high_angle = self.arrival_state.angle_deg
-    if desired_action_angle <= low_angle:
-      return low
-    if desired_action_angle >= high_angle:
-      return high
+    target = float(target_value)
+    if nominal_value == target:
+      return nominal
+    if nominal_value < target:
+      low = nominal
+      high = 1.0
+      self.twin.predict_constant_request_into(
+        source,
+        duration,
+        high,
+        align_inputs,
+        disturbance_torque,
+        self.arrival_state,
+        DT_CTRL,
+      )
+      high_value = (
+        self.arrival_state.rate_deg_s
+        if rate_target else self.arrival_state.angle_deg
+      )
+      if target >= high_value:
+        return high
+    else:
+      low = -1.0
+      high = nominal
+      self.twin.predict_constant_request_into(
+        source,
+        duration,
+        low,
+        align_inputs,
+        disturbance_torque,
+        self.arrival_state,
+        DT_CTRL,
+      )
+      low_value = (
+        self.arrival_state.rate_deg_s
+        if rate_target else self.arrival_state.angle_deg
+      )
+      if target <= low_value:
+        return low
     for _ in range(12):
       request = 0.5 * (low + high)
       self.twin.predict_constant_request_into(
@@ -349,11 +372,73 @@ class InverseEpsActionController:
         self.arrival_state,
         DT_CTRL,
       )
-      if self.arrival_state.angle_deg < float(desired_action_angle):
+      value = (
+        self.arrival_state.rate_deg_s
+        if rate_target else self.arrival_state.angle_deg
+      )
+      if value < target:
         low = request
       else:
         high = request
     return 0.5 * (low + high)
+
+  def _action_point_feedforward(
+    self,
+    action_time: float,
+    physical_effect_time: float,
+    desired_start_angle: float,
+    desired_start_rate: float,
+    desired_action_angle: float,
+    desired_action_rate: float,
+    action_speed: float,
+    local_feedforward: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> float:
+    """Solve planned torque that carries the desired rack to the scalar.
+
+    Feedforward starts on the model-authored rack trajectory, not on the
+    measured rack. This keeps requested-path torque independent of tracking
+    error; the one linear residual term is added exactly once by ``compute``.
+    The actuator state remains the real queued state, so the solve still owns
+    the torque needed to overcome current slew lag. Twelve fixed bisections
+    resolve finer than one Hyundai torque count and introduce no response-time
+    or feel constant.
+    """
+    duration = float(action_time) - float(physical_effect_time)
+    if duration <= 0.0:
+      return float(local_feedforward)
+    source = self.arrival_source_state
+    source.angle_deg = float(desired_start_angle)
+    source.rate_deg_s = float(desired_start_rate)
+    source.applied_torque = self.predicted_state.applied_torque
+    source.v_ego = float(action_speed)
+    angle_request = self._solve_terminal_request(
+      source,
+      duration,
+      desired_action_angle,
+      local_feedforward,
+      False,
+      align_inputs,
+      disturbance_torque,
+    )
+    rate_request = self._solve_terminal_request(
+      source,
+      duration,
+      desired_action_rate,
+      local_feedforward,
+      True,
+      align_inputs,
+      disturbance_torque,
+    )
+    motion = float(desired_action_angle) - float(desired_start_angle)
+    if motion == 0.0:
+      motion = float(desired_action_rate) - float(desired_start_rate)
+    if motion > 0.0:
+      return max(angle_request, rate_request)
+    if motion < 0.0:
+      return min(angle_request, rate_request)
+    return angle_request
 
   def _fill_inverse_terms(
     self,
@@ -555,18 +640,23 @@ class InverseEpsActionController:
       desired_action_angle = self._interpolate(
         self.workspace.desired_angles, action_position, count,
       )
+      desired_action_rate = self._interpolate(
+        self.workspace.desired_rates, action_position, count,
+      )
       action_point_speed = self._interpolate(
         self.workspace.reference_speeds, action_position, count,
       )
-      # Compensate only the physical control-to-rack delay. This is state
-      # estimation, not path lead: the position target remains the scalar.
-      self.twin.predict_held_state_into(
+      # Compensate only the physical control-to-rack delay. Commands emitted
+      # during that interval are already queued, so replay their actual
+      # trajectory rather than pretending the newest torque was present for
+      # the whole delay. This is state estimation, not path lead: the position
+      # target remains the scalar at its authored action timestamp.
+      self._remember_applied_torque(state.applied_torque)
+      self._predict_to_effect_time(
         state,
         physical_prediction_delay,
         align_inputs,
         float(disturbance_torque),
-        self.predicted_state,
-        DECISION_DT,
       )
       self.predicted_state.v_ego = action_speed
 
@@ -595,15 +685,22 @@ class InverseEpsActionController:
       local_command = self.twin.apply_slew(
         state.applied_torque, local_target,
       )
-      action_target = self._action_point_target(
+      action_feedforward = self._action_point_feedforward(
         action_sample_time,
         tracking_sample_time,
+        desired_angle,
+        desired_rate,
         desired_action_angle,
+        desired_action_rate,
         action_point_speed,
-        local_target,
+        self.local_terms.feedforward,
         align_inputs,
         disturbance_torque,
       )
+      action_target = min(max(
+        action_feedforward + self.local_terms.feedback,
+        -1.0,
+      ), 1.0)
       (
         trajectory_target,
         trajectory_active,
@@ -614,8 +711,6 @@ class InverseEpsActionController:
         local_target,
         action_target,
         action_sample_time,
-        align_inputs,
-        disturbance_torque,
       )
       trajectory_command = self.twin.apply_slew(
         state.applied_torque, trajectory_target,
@@ -688,6 +783,8 @@ class InverseEpsActionController:
       result.optimality_residual = 0.0
       return result
     except (ValueError, OverflowError):
+      self.command_history_start = 0
+      self.command_history_count = 0
       result.invalidate(state.applied_torque, CandidateStatus.INPUT_INVALID)
       return result
 
