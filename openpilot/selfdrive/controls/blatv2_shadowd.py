@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
   V14ShadowResult,
 )
 
-SHADOW_VERSION = 11
+SHADOW_VERSION = 12
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -107,6 +107,7 @@ def populate_shadow_message(
   shadow.observerUnconstrainedUpdate = float(
     result.observer_unconstrained_update
   )
+  shadow.signedRackRateDegS = float(result.signed_rack_rate_deg_s)
   shadow.liveLqiCommandTorque = float(live_lqi_command_torque)
   shadow.liveLqiStatus = int(live_lqi_status)
   shadow.liveLqiComputeTimeSeconds = float(live_lqi_compute_seconds)

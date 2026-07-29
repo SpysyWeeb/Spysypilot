@@ -69,6 +69,7 @@ class LiveActionResult:
   horizon_torque_demand: float = 0.0
   horizon_demand_time_seconds: float = 0.0
   no_lead_limited: bool = False
+  signed_rack_rate_deg_s: float = 0.0
 
 
 class LiveActionController:
@@ -265,6 +266,9 @@ class LiveActionController:
       candidate.horizon_demand_time_seconds
     )
     result.no_lead_limited = bool(candidate.no_lead_limited)
+    result.signed_rack_rate_deg_s = float(
+      common.signed_rack_rate_deg_s
+    )
     return result
 
 

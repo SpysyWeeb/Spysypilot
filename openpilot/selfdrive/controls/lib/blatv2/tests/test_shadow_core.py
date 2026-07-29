@@ -87,6 +87,7 @@ def result_values(result):
     result.fallback_status,
     result.fallback_candidate_count,
     result.fallback_optimality_residual,
+    result.signed_rack_rate_deg_s,
   )
 
 
@@ -123,6 +124,7 @@ def test_shared_core_is_deterministic_and_residual_valid_after_bootstrap():
     left_result.mpc_optimality_residual,
     left_result.fallback_command_torque,
     left_result.fallback_optimality_residual,
+    left_result.signed_rack_rate_deg_s,
   ))
 
 
@@ -171,7 +173,7 @@ def test_learned_reference_lag_never_becomes_rack_prediction_delay():
 
   expected = PlantState(0.0, 0.0, 0.0, 0.0)
   core.twin.predict_held_state_into(
-    PlantState(2.0, 0.5, -0.1, 10.0),
+    PlantState(2.0, 0.0, -0.1, 10.0),
     params.actuation_delay,
     core.previous_align_inputs,
     result.disturbance_estimate,
@@ -180,6 +182,43 @@ def test_learned_reference_lag_never_becomes_rack_prediction_delay():
   )
   assert candidate.predicted_angle_deg == expected.angle_deg
   assert candidate.predicted_rate_deg_s == expected.rate_deg_s
+
+
+def test_shared_core_reconstructs_negative_hyundai_rack_rate_from_angle():
+  params = plant_params()
+  torque = namespace(
+    latAccelFactor=2.5, latAccelOffset=0.0, friction=0.1,
+  )
+  output = namespace(actuatorsOutput=namespace(torque=-0.1))
+  live = namespace(
+    roll=0.0,
+    angleOffsetDeg=0.0,
+    stiffnessFactor=1.0,
+    steerRatio=15.0,
+  )
+  core = ShadowCore(params, torque, car_params(), controller_params())
+  first = namespace(
+    vEgo=10.0,
+    steeringAngleDeg=2.0,
+    steeringRateDeg=4.0,
+    steeringPressed=False,
+    standstill=False,
+  )
+  second = namespace(
+    vEgo=10.0,
+    steeringAngleDeg=1.9,
+    steeringRateDeg=4.0,
+    steeringPressed=False,
+    standstill=False,
+  )
+  core.compute(
+    model(), first, car_control(), output, live, True, 0.12, True,
+  )
+  result = core.compute(
+    model(), second, car_control(), output, live, True, 0.12, True,
+  )
+  assert result.signed_rack_rate_deg_s == -4.0
+  assert core.previous_state.rate_deg_s == -4.0
 
 
 def test_valid_core_result_serializes_at_capnp_publish_boundary():
@@ -264,6 +303,10 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
   assert message.blatV2Shadow.liveActionRawCommandTorque == -0.09
   assert message.blatV2Shadow.liveActionDesiredAngleDeg == 12.0
   assert message.blatV2Shadow.liveActionPredictionDelaySeconds == 0.12
+  assert (
+    message.blatV2Shadow.signedRackRateDegS
+    == result.signed_rack_rate_deg_s
+  )
   assert message.blatV2Shadow.liveActionSlewConstrained
   assert message.blatV2Shadow.liveActionBreakawayActive
   assert message.blatV2Shadow.liveActionBreakawayPersistenceFrames == 5

@@ -6,6 +6,9 @@ Numerical contract
   platform-selected math kernels are used.
 * ``PlantState`` is steering-wheel angle in degrees, steering-wheel rate in
   degrees/second, normalized torque on [-1, 1], and vehicle speed in m/s.
+* Hyundai ``SAS_Speed`` is an unsigned 4 deg/s magnitude. ``SignedRackRate``
+  restores direction from consecutive steering-angle measurements before the
+  value enters any plant, friction, observer, or controller arithmetic.
 * ``k_t`` is deg/s² per normalized effective torque, ``b_steer`` is 1/s, and
   ``t_breakaway`` is normalized torque.
 * Tire self-aligning load preserves frozen-v14's measurement convention:
@@ -214,6 +217,49 @@ class PlantState:
   def __post_init__(self) -> None:
     if not all(math.isfinite(value) for value in (self.angle_deg, self.rate_deg_s, self.applied_torque, self.v_ego)):
       raise ValueError("plant state must be finite")
+
+
+@dataclass(slots=True)
+class SignedRackRate:
+  """Recover Hyundai rack-rate direction without filtering its magnitude.
+
+  Hyundai's classic ``SAS11.SAS_Speed`` field contains only an unsigned
+  magnitude. Steering angle supplies the missing direction. When angle
+  quantization produces a zero delta while the magnitude is nonzero, the last
+  observed motion direction is retained; a zero magnitude reports zero rate
+  without forgetting that direction. An explicitly negative input remains
+  negative so the shared artifact also accepts platforms/tests that already
+  provide a signed rate.
+  """
+
+  previous_angle_deg: float = 0.0
+  direction: float = 0.0
+  initialized: bool = False
+
+  def reset(self) -> None:
+    self.previous_angle_deg = 0.0
+    self.direction = 0.0
+    self.initialized = False
+
+  def update(self, angle_deg: float, reported_rate_deg_s: float) -> float:
+    angle = float(angle_deg)
+    reported = float(reported_rate_deg_s)
+    if not math.isfinite(angle) or not math.isfinite(reported):
+      raise ValueError("rack-rate inputs must be finite")
+
+    magnitude = abs(reported)
+    if reported < 0.0:
+      self.direction = -1.0
+    elif self.initialized:
+      angle_delta = angle - self.previous_angle_deg
+      if angle_delta != 0.0:
+        self.direction = math.copysign(1.0, angle_delta)
+
+    self.previous_angle_deg = angle
+    self.initialized = True
+    if magnitude == 0.0 or self.direction == 0.0:
+      return 0.0
+    return self.direction * magnitude
 
 
 class PlantTwin:

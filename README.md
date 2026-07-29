@@ -7,7 +7,7 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v215 desired-load action controller.** Route bc exposed a
+⚠️ **In progress — v216 desired-load action controller.** Route bc exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
 used as the rack twin's pure command-transport delay. That advanced the
 predicted rack response twice and could make valid feedforward and feedback
@@ -18,15 +18,26 @@ steady aligning-load feedforward is evaluated at the model-requested rack
 position, rather than at the lagging measured position whose old-direction
 load could cancel entry or reversal feedback.
 
-Version 214 tested separating closed-loop bandwidth from the plant twin's
+Versions 214–215 tested separating closed-loop bandwidth from the plant twin's
 provisional damping estimate. It exposed another conflation: one bandwidth
 raised useful position authority and noisy rate feedback together. At
 `20 1/s`, 9f complaint-band oscillation rose above v14 (`0.0315` versus
-`0.0284`) and bc applied roughness also exceeded v14. Version 215 replaces the
+`0.0284`) and bc applied roughness also exceeded v14. Version 215 replaced the
 coupled pole dial with an explicit position stiffness. Rate damping is derived
 independently so one 4 deg/s sensor quantum can change feedback by no more than
-one Hyundai torque build step. This preserves continuous path-error authority
-without amplifying the quantized rate signal into another correction module.
+one Hyundai torque build step. Its sweep was halted rather than shipped: the
+minimum stiffness that cleared the 9f handoff still amplified bc's position
+error into excess activity.
+
+That sweep exposed the more fundamental v216 defect. Hyundai
+`SAS11.SAS_Speed` is an unsigned magnitude, but every earlier BLaTv2 controller
+treated it as a signed rack rate. On route bc, nonzero motion is split almost
+evenly between directions while the recorded rate is never negative. Version
+216 reconstructs direction once at the shared input boundary from consecutive
+steering-angle samples; plant prediction, friction, observer residuals,
+feedforward, feedback, live control, and replay now consume the same signed
+state. Magnitude is not filtered. During a zero angle-quantization delta, the
+last observed direction is retained; zero reported speed remains zero.
 
 A v210 experiment decoupled breakaway from `sigma_curvature` and armed it from
 the measured 0.1-degree rack-angle resolution. It is reverted in v211: on 9f
@@ -105,10 +116,12 @@ ground-up design and does not inherit that controller.
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 11. It reports reference and
+The shadow event is `blatV2Shadow`, version 12. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
+Version 12 adds the reconstructed signed Hyundai rack rate used by the live
+controller and every twin/observer calculation.
 Version 11 separates the logged model action time from the physical rack
 prediction delay. Version 10 added event-breakaway state and the now-retired
 horizon-helper diagnostics; their wire ordinals remain reserved and v209
@@ -126,7 +139,7 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v215 timing and authority contract
+### v216 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
@@ -152,6 +165,11 @@ turn entry or reversal it preserved old-direction torque while feedback tried
 to leave it. The requested-position load removes that cancellation; the
 independent stiffness supplies continuous authority without making rate
 quantization authoritative.
+
+The Hyundai rate magnitude is signed exactly once before this calculation.
+No downstream consumer guesses direction independently. Both signed rate and
+the original desired/predicted rates are logged, making a sign mismatch
+auditable on every frame.
 
 The scalar action alone sets steering position. A fixed five-point quadratic
 stencil derives coherent rate and acceleration from the native 50 ms model
