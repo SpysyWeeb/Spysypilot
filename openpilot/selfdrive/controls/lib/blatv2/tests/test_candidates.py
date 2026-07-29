@@ -213,14 +213,14 @@ def test_action_computed_torque_places_error_poles_at_physical_rack_rate():
   assert math.isclose(result.required_acceleration_deg_s2, expected, abs_tol=1e-12)
 
 
-def test_action_horizon_changes_torque_reachability_not_position_authority():
+def test_action_far_future_does_not_pull_current_torque_or_position():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
   base = np.full(len(times), 0.00001, dtype=np.float64)
   mutated = base.copy()
-  mutated[times >= 0.35] = np.linspace(
-    0.00001, 0.15, np.count_nonzero(times >= 0.35),
+  mutated[times >= 0.40] = np.linspace(
+    0.00001, 0.15, np.count_nonzero(times >= 0.40),
   )
   first = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
@@ -249,10 +249,10 @@ def test_action_horizon_changes_torque_reachability_not_position_authority():
     action_time=0.20,
   )
   assert second.desired_angle_deg == first_position
-  assert second.horizon_assist_active
-  assert second.horizon_demand_time_seconds > 0.20
-  assert abs(second.command_torque) > abs(first_command)
-  assert abs(second.raw_command_torque) == 1.0
+  assert second.command_torque == first_command
+  assert second.raw_command_torque == first.raw_command_torque
+  assert not second.horizon_assist_active
+  assert second.horizon_demand_time_seconds == 0.0
 
 
 def test_action_breakaway_requires_persistent_large_error():
@@ -346,45 +346,30 @@ def test_action_breakaway_transitions_continuously_to_kinetic_friction():
   assert not result.breakaway_active
 
 
-def test_action_horizon_assist_is_clamped_before_predicted_path_lead():
-  fast_params = PlantParams(
-    400000.0,
-    PLANT_PARAMS.b_steer,
+def test_action_requested_load_is_evaluated_at_desired_rack_position():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(25.0, 0.0, 0.0, 10.0)
+  curvatures = np.full(3, 0.005, dtype=np.float64)
+  result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    curvatures,
+    3,
+    1.0,
     0.0,
-    PLANT_PARAMS.actuation_delay,
-    PLANT_PARAMS.steer_max,
-    PLANT_PARAMS.delta_up,
-    PLANT_PARAMS.delta_down,
-    PLANT_PARAMS.steer_step,
-    PLANT_PARAMS.provisional,
-    PLANT_PARAMS.torque_per_lataccel_speed_nodes,
-    PLANT_PARAMS.torque_per_lataccel_values,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
   )
-  twin = PlantTwin(fast_params, ALIGN_PARAMS)
-  state = PlantState(0.0, 0.0, 0.0, 3.0)
-  times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
-  curvatures = np.full(len(times), 0.00001, dtype=np.float64)
-  curvatures[times >= 0.35] = np.linspace(
-    0.00001, 0.15, np.count_nonzero(times >= 0.35),
+  desired_load = twin.aligning_torque_values(
+    result.desired_angle_deg, result.action_speed_mps, ALIGN_INPUTS,
   )
-  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
-  result = candidate.compute(
-    state, ALIGN_INPUTS, times, curvatures, len(times), 1.0, 0.05, 0.0,
-    ObserverStatus.ACTIVE, action_time=0.20,
+  measured_load = twin.aligning_torque_values(
+    result.predicted_angle_deg, result.action_speed_mps, ALIGN_INPUTS,
   )
-  assert result.horizon_assist_active
-  assert result.no_lead_limited
-  next_angle = candidate._next_angle(result.command_torque, ALIGN_INPUTS, 0.0)
-  next_desired = candidate._interpolate(
-    candidate.workspace.desired_angles,
-    (0.20 + 0.01) / DECISION_DT,
-    candidate.workspace.decision_count,
-  )
-  direction = math.copysign(1.0, result.desired_angle_deg)
-  assert direction * (next_angle - next_desired) <= 1e-9
-  assert result.command_torque == twin.apply_slew(
-    state.applied_torque, result.raw_command_torque,
-  )
+  assert result.aligning_torque == desired_load
+  assert result.aligning_torque != measured_load
 
 
 def test_action_controller_uses_full_authority_for_large_low_speed_error():

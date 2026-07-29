@@ -1,13 +1,10 @@
 """Delay-compensated inverse-EPS computed-torque controller.
 
 The model scalar action is the authoritative steering-position target. The
-plan supplies coherent rate/acceleration at that action point and a future
-physical-torque workspace. Future samples may start using otherwise-idle slew
-capacity only when their same-direction demand is unreachable if the controller
-waits; they never move the scalar-pinned position target. The measured rack is
-predicted through the physical actuator delay, then inverse rack dynamics
-cancel the measured load and place both tracking-error poles at the rack's
-identified physical damping rate.
+plan supplies coherent rate/acceleration at that action point. The measured
+rack is predicted through the physical actuator delay, then inverse rack
+dynamics combine the requested-position load, desired motion, and tracking
+error into one torque request.
 
 Two clocks are deliberately independent. ``action_time`` selects the
 model-authored scalar target and includes the learned end-to-end lateral lag.
@@ -15,10 +12,11 @@ model-authored scalar target and includes the learned end-to-end lateral lag.
 physically affect it. Treating the learned lag as pure rack transport predicts
 the rack response twice and can make feedback cancel valid feedforward.
 
-This is not an arrival-time controller and has no tracking-versus-smoothness
-cost. Position error therefore asks for whatever torque the physical model
-requires now, including full normalized authority. The exact Hyundai 409/4/7
-limiter remains the sole command-smoothing authority.
+This is not an arrival-time controller, preview boost, or
+tracking-versus-smoothness cost. Far-future curvature cannot pull the wheel
+ahead of the scalar action. Position error therefore asks for whatever torque
+the physical model requires now, including full normalized authority. The
+exact Hyundai 409/4/7 limiter remains the sole command-smoothing authority.
 """
 
 from __future__ import annotations
@@ -65,8 +63,6 @@ class InverseEpsActionController:
     self.workspace = CandidateWorkspace() if workspace is None else workspace
     self.result = CandidateResult()
     self.predicted_state = PlantState(0.0, 0.0, 0.0, 0.0)
-    self.command_state = PlantState(0.0, 0.0, 0.0, 0.0)
-    self.command_next_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.breakaway_direction = 0.0
     self.breakaway_persistence_frames = 0
     self.breakaway_active = False
@@ -144,98 +140,6 @@ class InverseEpsActionController:
     if abs(measured_rate) > 0.5 * RACK_RATE_QUANTUM_DEG_S:
       return math.copysign(self.params.kinetic_friction, measured_rate)
     return 0.0
-
-  def _unreachable_future_demand(
-    self,
-    applied_torque: float,
-    action_sample_time: float,
-    position_direction: float,
-  ) -> tuple[bool, float, float]:
-    """Find the first same-direction demand outside the exact slew envelope."""
-    if position_direction == 0.0:
-      return False, 0.0, 0.0
-    positive = float(applied_torque)
-    negative = float(applied_torque)
-    decision_index = max(
-      int(math.ceil(action_sample_time / DECISION_DT - 1e-12)), 0,
-    )
-    decision_index = min(decision_index, self.workspace.decision_count - 1)
-    max_steps = int(math.ceil(
-      float(self.workspace.decision_times[self.workspace.decision_count - 1])
-      / DT_CTRL
-    ))
-    for step in range(1, max_steps + 1):
-      positive = self.twin.apply_slew(positive, 1.0)
-      negative = self.twin.apply_slew(negative, -1.0)
-      reachable_time = step * DT_CTRL
-      while (
-        decision_index < self.workspace.decision_count
-        and float(self.workspace.decision_times[decision_index])
-        <= reachable_time + 1e-12
-      ):
-        # The workspace retains static departure friction for the retired MPC.
-        # A future *prediction* cannot know that the measured rack is stuck,
-        # so the active controller removes that cell term and restores only
-        # kinetic friction when the planned rack is actually moving. Static
-        # authority is owned exclusively by this controller's measured-rack
-        # breakaway state machine.
-        desired_rate = float(
-          self.workspace.desired_rates[decision_index]
-        )
-        desired_acceleration = float(
-          self.workspace.desired_accelerations[decision_index]
-        )
-        motion_direction = desired_rate
-        if motion_direction == 0.0:
-          motion_direction = desired_acceleration
-        future_friction = (
-          0.0
-          if motion_direction == 0.0
-          else math.copysign(
-            self.params.kinetic_friction, motion_direction,
-          )
-        )
-        demand = min(max(
-          float(self.workspace.feedforward[decision_index])
-          - float(self.workspace.friction_torques[decision_index])
-          + future_friction,
-          -1.0,
-        ), 1.0)
-        if (
-          math.copysign(1.0, demand) == position_direction
-          and (
-            demand > positive + 1e-12
-            or demand < negative - 1e-12
-          )
-        ):
-          return True, demand, float(
-            self.workspace.decision_times[decision_index]
-          )
-        decision_index += 1
-      if decision_index >= self.workspace.decision_count:
-        break
-    return False, 0.0, 0.0
-
-  def _next_angle(
-    self,
-    command: float,
-    align_inputs: AlignInputs,
-    disturbance_torque: float,
-  ) -> float:
-    state = self.command_state
-    state.angle_deg = self.predicted_state.angle_deg
-    state.rate_deg_s = self.predicted_state.rate_deg_s
-    state.applied_torque = float(command)
-    state.v_ego = self.predicted_state.v_ego
-    self.twin.predict_held_state_into(
-      state,
-      DT_CTRL,
-      align_inputs,
-      disturbance_torque,
-      self.command_next_state,
-      DT_CTRL,
-    )
-    return self.command_next_state.angle_deg
 
   def compute(
     self,
@@ -375,93 +279,11 @@ class InverseEpsActionController:
         return result
 
       local_target = min(max(raw_command, -1.0), 1.0)
-      local_command = self.twin.apply_slew(
+      command = self.twin.apply_slew(
         state.applied_torque, local_target,
       )
-      position_direction = (
-        0.0 if angle_error == 0.0 else math.copysign(1.0, angle_error)
-      )
-      (
-        horizon_assist,
-        horizon_demand,
-        horizon_demand_time,
-      ) = self._unreachable_future_demand(
-        state.applied_torque,
-        action_sample_time,
-        position_direction,
-      )
-      torque_target = horizon_demand if horizon_assist else local_target
-      command = self.twin.apply_slew(state.applied_torque, torque_target)
-      horizon_assist = bool(
-        horizon_assist
-        and position_direction * (command - local_command) > 0.0
-      )
-      if not horizon_assist:
-        torque_target = local_target
-        command = local_command
-        horizon_demand = 0.0
-        horizon_demand_time = 0.0
-
-      # Prediction may spend torque earlier, but it may never move the wheel
-      # past the scalar-pinned path. Restrict only the anticipatory increment;
-      # the local inverse remains the fallback at the exact action point.
-      no_lead_limited = False
-      if horizon_assist:
-        next_sample_position = (
-          action_sample_time + DT_CTRL
-        ) / DECISION_DT
-        next_desired_angle = self._interpolate(
-          self.workspace.desired_angles,
-          next_sample_position,
-          count,
-        )
-        if (
-          position_direction
-          * (
-            self._next_angle(
-              command, align_inputs, disturbance_torque,
-            )
-            - next_desired_angle
-          )
-          > 0.0
-        ):
-          no_lead_limited = True
-          low = local_command
-          high = command
-          if position_direction < 0.0:
-            low, high = high, low
-          # Twelve deterministic bisections resolve far below one normalized
-          # torque count without introducing a tuning tolerance.
-          for _ in range(12):
-            middle = 0.5 * (low + high)
-            leads = (
-              position_direction
-              * (
-                self._next_angle(
-                  middle, align_inputs, disturbance_torque,
-                )
-                - next_desired_angle
-              )
-              > 0.0
-            )
-            if position_direction > 0.0:
-              if leads:
-                high = middle
-              else:
-                low = middle
-            elif leads:
-              low = middle
-            else:
-              high = middle
-          command = low if position_direction > 0.0 else high
-          # ``raw_command_torque`` is the final pre-actuator request, not the
-          # rejected horizon demand. The bisection result is already inside
-          # this frame's reachable interval, so requesting it reproduces the
-          # selected command exactly through apply_slew. Keep the original
-          # unreachable demand in its dedicated diagnostic.
-          torque_target = command
       result.command_torque = command
-      result.raw_command_torque = torque_target
+      result.raw_command_torque = local_target
       result.feedforward_torque = feedforward
       result.feedback_torque = dynamic - nominal_dynamic
       result.desired_angle_deg = desired_angle
@@ -476,15 +298,17 @@ class InverseEpsActionController:
       result.dynamic_torque = dynamic
       result.action_time_seconds = action_sample_time
       result.prediction_delay_seconds = physical_prediction_delay
-      result.slew_constrained = command != torque_target
+      result.slew_constrained = command != local_target
       result.breakaway_active = self.breakaway_active
       result.breakaway_persistence_frames = (
         self.breakaway_persistence_frames
       )
-      result.horizon_assist_active = horizon_assist
-      result.horizon_torque_demand = horizon_demand
-      result.horizon_demand_time_seconds = horizon_demand_time
-      result.no_lead_limited = no_lead_limited
+      # Wire-compatible retired-v207 diagnostics. The corresponding ordinals
+      # remain reserved, but the second torque authority is gone.
+      result.horizon_assist_active = False
+      result.horizon_torque_demand = 0.0
+      result.horizon_demand_time_seconds = 0.0
+      result.no_lead_limited = False
       result.status = CandidateStatus.OK
       result.candidate_count = 1
       result.available_schedule_count = 1

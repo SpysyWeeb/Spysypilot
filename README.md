@@ -18,12 +18,14 @@ steady aligning-load feedforward is evaluated at the model-requested rack
 position, rather than at the lagging measured position whose old-direction
 load could cancel entry or reversal feedback.
 
-Route bb showed
-that v206's inverse target was strong but its one-frame slew projection
-delivered sharp-turn torque late, while continuous static-friction
-compensation caused near-center activity. Version 207 is replacing those
-conflicting mechanisms with event-based breakaway and a deterministic
-horizon-reachability scheduler guarded against path lead.
+Route bb showed that v206's inverse target was strong but its one-frame slew
+projection delivered sharp-turn torque late, while continuous static-friction
+compensation caused near-center activity. Version 207 tried event-based
+breakaway plus a horizon-reachability helper. Route bc proved the helper was
+not a controller: it affected only four of 96,489 valid active replay frames,
+while the real under-delivery was the local inverse's old-position load.
+Version 209 deletes that second torque authority and retains event breakaway
+only for the physical stiction it represents.
 
 Field routes b9/ba
 showed that v203 was smooth but slow and weak. Version 205 replaced the LQI
@@ -39,14 +41,12 @@ filter setting. A future smoothing change therefore cannot silently alter the
 controller's reference timing.
 
 The controller predicts the measured rack only through the physical command
-transport delay, then uses inverse rack dynamics to command the acceleration needed by
-the scalar angle and its model-authored motion. Version 207 also checks the
-future torque workspace against the exact 409/4/7 reachable envelope. When a
-same-direction future demand cannot be reached by waiting, otherwise-idle slew
-capacity may be used now; a predicted-rack guard prevents that extra torque
-from moving the wheel beyond the scalar-pinned path. Tracking is not traded
-against a torque-rate cost or an artificial arrival time. The same numerical
-files are imported by route-audit; there is no separate live variant.
+transport delay, then uses one inverse-rack equation to combine the load at
+the model-requested wheel position, the model-authored rate/acceleration, and
+measured tracking error. Far-future curvature never pulls the current command
+ahead of the scalar action. Tracking is not traded against a torque-rate cost
+or an artificial arrival time. The same numerical files are imported by
+route-audit; there is no separate live variant.
 
 The MPC is retired from onroad execution. Its implementation and tests remain
 in the repository so it can re-enter a future tournament after its real-world
@@ -81,12 +81,14 @@ ground-up design and does not inherit that controller.
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 10. It reports reference and
+The shadow event is `blatV2Shadow`, version 11. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 10 adds event-breakaway state, horizon-reachability demand/time, and
-the no-path-lead clamp state.
+Version 11 separates the logged model action time from the physical rack
+prediction delay. Version 10 added event-breakaway state and the now-retired
+horizon-helper diagnostics; their wire ordinals remain reserved and v209
+publishes them as inactive zeros.
 Version 9 adds the live v205 torque decomposition, action-point target, and
 delay-predicted rack state. Version 8 uses the live-field-calibrated plant
 schedule described below.
@@ -100,15 +102,14 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v208 timing and authority contract
+### v209 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
 move BLaTv2's reference. The scalar action and its local
 angle/rate/acceleration stencil are sampled at that one time. Changing any plan
-point beyond the local stencil cannot move that target; later samples can only
-request otherwise-idle slew authority through the separately logged
-reachability guard.
+point beyond the local stencil cannot move that target or the current torque
+request.
 
 `liveDelay` is the measured desired-curvature-to-yaw lag and selects the model
 reference; it is not a pure actuator transport delay. The controller advances
@@ -116,21 +117,23 @@ the measured steering-wheel angle/rate through only the independent physical
 plant-seed delay (`0.12 s` provisionally) while holding measured applied
 torque. `blatV2ActionTimeSeconds` and
 `blatV2PredictionDelaySeconds` log both clocks independently so this contract
-is per-frame auditable. It then uses
-computed-torque pole placement: the inverse cancels rack damping and puts both
-angle/rate tracking-error poles at the plant's identified physical damping
-rate `b_steer`. That physical parameter is already part of the rack twin; v205
-adds no response-time or authority dial.
+is per-frame auditable. It then uses computed-torque pole placement: the
+inverse combines the calibrated steady load at the requested rack position
+with desired motion and puts both angle/rate tracking-error poles at the
+plant's identified physical damping rate `b_steer`. Evaluating the load at the
+old measured position was the v207 conflict: during turn entry or reversal it
+preserved old-direction torque while feedback tried to leave it. The
+requested-position load removes that cancellation without a boost, speed
+schedule, or new feel constant.
 
 The scalar action alone sets steering position. A fixed five-point quadratic
 stencil derives coherent rate and acceleration from the native 50 ms model
-grid; it adds no state, smoothing delay, or feel constant. Later plan samples
-are used only to answer a physical question: can their predicted torque demand
-still be reached through the exact asymmetric slew limiter if the controller
-waits? The first same-direction unreachable demand may start the actuator ramp
-now. A one-step rack prediction clips only that anticipatory increment if it
-would pass the next scalar-pinned desired angle. Thus prediction removes
-actuator delay without shifting the path or corner timing.
+grid; it adds no state, smoothing delay, or feel constant. The rest of the
+far-future path remains available to the shared reference and harness, but it
+has no independent torque authority. This is deliberate: for a second-order
+rack, position, rate, and acceleration at the model action point are the
+complete motion command. Letting later curvature pull current torque would
+change path timing rather than reduce controller delay.
 
 The inverse has no speed-scheduled feedback gain, torque-motion cost, arrival
 horizon, or integral. Smoothness is the exact 409/4/7 actuator trajectory.
