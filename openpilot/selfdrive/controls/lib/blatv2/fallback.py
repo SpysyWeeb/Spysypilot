@@ -217,19 +217,27 @@ class InverseEpsActionController:
       )
       self.predicted_state.v_ego = action_speed
 
-      # Computed-torque pole placement uses an explicit closed-loop bandwidth.
-      # Plant damping describes the rack; it does not define how quickly the
-      # controller must remove a tracking error. Conflating the two left small
-      # errors below rack stiction and made corrections feel lazy. The single
-      # bandwidth sets both error poles continuously, without a speed schedule,
-      # preview authority, threshold, or discrete torque boost.
-      pole_rate = self.params.tracking_bandwidth
+      # Position stiffness and rate damping have different physical jobs and
+      # different measurement quality. Versions through v214 tied both to one
+      # pole-rate dial; raising useful angle authority also amplified the
+      # 4-deg/s-quantized rack-rate signal into highway chatter. Position
+      # stiffness is explicit. Rate damping is bounded so one sensor quantum
+      # can change feedback by at most one Hyundai torque build step.
       angle_error = desired_angle - self.predicted_state.angle_deg
       rate_error = desired_rate - self.predicted_state.rate_deg_s
+      rate_damping = (
+        self.twin.params.delta_up
+        / self.twin.params.steer_max
+        / RACK_RATE_QUANTUM_DEG_S
+      )
+      feedback = (
+        self.params.tracking_stiffness * angle_error
+        + rate_damping * rate_error
+      )
       required_acceleration = (
         desired_acceleration
-        + 2.0 * pole_rate * rate_error
-        + pole_rate * pole_rate * angle_error
+        + self.twin.params.b_steer * rate_error
+        + self.twin.params.k_t * feedback
       )
 
       # Feed the load required by the model-requested rack position, not the
@@ -253,14 +261,11 @@ class InverseEpsActionController:
         desired_curvature - predicted_curvature,
         angle_error,
       )
-      dynamic = (
-        required_acceleration
-        + self.twin.params.b_steer * self.predicted_state.rate_deg_s
-      ) / self.twin.params.k_t
       nominal_dynamic = (
         desired_acceleration
         + self.twin.params.b_steer * desired_rate
       ) / self.twin.params.k_t
+      dynamic = nominal_dynamic + feedback
       feedforward = (
         aligning
         + float(disturbance_torque)
@@ -286,7 +291,7 @@ class InverseEpsActionController:
       result.command_torque = command
       result.raw_command_torque = local_target
       result.feedforward_torque = feedforward
-      result.feedback_torque = dynamic - nominal_dynamic
+      result.feedback_torque = feedback
       result.desired_angle_deg = desired_angle
       result.desired_rate_deg_s = desired_rate
       result.desired_acceleration_deg_s2 = desired_acceleration

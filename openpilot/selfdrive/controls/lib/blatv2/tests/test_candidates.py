@@ -49,7 +49,7 @@ ALIGN_PARAMS = AlignParams(
 )
 CONTROLLER_PARAMS = ControllerParams(0.05, 0.01, 0.5, 0.5, True)
 ACTION_PARAMS = ControllerParams(
-  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 20.0,
+  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.12,
 )
 ALIGN_INPUTS = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
 REFERENCE_TIMES = np.asarray((0.0, 0.5, 1.0), dtype=np.float64)
@@ -87,15 +87,16 @@ def test_shared_sigma_values_are_marked_as_provisional_owner_feel_dials():
     "owner_feel_dial": False,
     "provisional": True,
   }
-  assert payload["tracking_bandwidth"] == {
-    "value": 20.0,
-    "units": "1/s",
+  assert payload["tracking_stiffness"] == {
+    "value": 0.12,
+    "units": "normalized torque/deg",
     "owner_feel_dial": True,
     "provisional": True,
     "provenance": (
-      "v214 separates closed-loop tracking response from provisional plant "
-      "damping; 20 1/s raises sub-stiction continuous correction authority "
-      "while retaining one speed-independent controller."
+      "v215 direct-handoff evidence: 0.12 normalized torque/deg supplies the "
+      "measured 0.09 static-breakaway authority at 0.75 deg error; rack-rate "
+      "damping is independently bounded by one actuator build step per 4 "
+      "deg/s sensor quantum."
     ),
   }
 
@@ -199,7 +200,7 @@ def test_measured_rack_stick_to_slip_transition_is_continuous():
   assert measured_rack_friction(0.0, -1.0, 0.09, 0.03) == -0.09
 
 
-def test_action_computed_torque_places_error_poles_at_tracking_bandwidth():
+def test_action_feedback_separates_position_stiffness_from_rate_damping():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
@@ -216,15 +217,19 @@ def test_action_computed_torque_places_error_poles_at_tracking_bandwidth():
   )
   expected = (
     result.desired_acceleration_deg_s2
-    + 2.0 * ACTION_PARAMS.tracking_bandwidth
+    + PLANT_PARAMS.b_steer
       * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
-    + ACTION_PARAMS.tracking_bandwidth * ACTION_PARAMS.tracking_bandwidth
-      * (result.desired_angle_deg - result.predicted_angle_deg)
+    + PLANT_PARAMS.k_t * (
+      ACTION_PARAMS.tracking_stiffness
+        * (result.desired_angle_deg - result.predicted_angle_deg)
+      + (PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max / 4.0)
+        * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
+    )
   )
   assert math.isclose(result.required_acceleration_deg_s2, expected, abs_tol=1e-12)
 
 
-def test_tracking_bandwidth_changes_feedback_without_changing_feedforward():
+def test_tracking_stiffness_changes_feedback_without_changing_feedforward():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   reference = np.full(3, 0.001, dtype=np.float64)
@@ -258,7 +263,7 @@ def test_tracking_bandwidth_changes_feedback_without_changing_feedforward():
   assert abs(fast.feedback_torque) > abs(slow_feedback)
 
 
-def test_tracking_bandwidth_must_be_finite_and_positive():
+def test_tracking_stiffness_must_be_finite_and_positive():
   for value in (0.0, -1.0, math.inf, math.nan):
     params = ControllerParams(
       0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, value,
@@ -268,7 +273,20 @@ def test_tracking_bandwidth_must_be_finite_and_positive():
     except ValueError:
       pass
     else:
-      raise AssertionError(f"accepted invalid tracking bandwidth {value!r}")
+      raise AssertionError(f"accepted invalid tracking stiffness {value!r}")
+
+
+def test_rate_feedback_quantum_is_bounded_to_one_torque_build_step():
+  rate_damping = (
+    PLANT_PARAMS.delta_up
+    / PLANT_PARAMS.steer_max
+    / 4.0
+  )
+  assert math.isclose(
+    rate_damping * 4.0,
+    PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max,
+    abs_tol=1e-15,
+  )
 
 
 def test_action_far_future_does_not_pull_current_torque_or_position():

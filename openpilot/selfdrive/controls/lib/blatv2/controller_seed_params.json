@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "provisional": true,
   "provenance": "v203 response-surface selection on sole field route 000000b7--a6b3b1f175; owner authorized staged field evaluation with the raw-burst and high-speed-coverage deviations documented in the branch README and route-audit acceptance record.",
   "sigma_y": {
@@ -32,12 +32,12 @@
     "owner_feel_dial": false,
     "provisional": true
   },
-  "tracking_bandwidth": {
-    "value": 20.0,
-    "units": "1/s",
+  "tracking_stiffness": {
+    "value": 0.12,
+    "units": "normalized torque/deg",
     "owner_feel_dial": true,
     "provisional": true,
-    "provenance": "v214 separates closed-loop tracking response from provisional plant damping; 20 1/s raises sub-stiction continuous correction authority while retaining one speed-independent controller."
+    "provenance": "v215 direct-handoff evidence: 0.12 normalized torque/deg supplies the measured 0.09 static-breakaway authority at 0.75 deg error; rack-rate damping is independently bounded by one actuator build step per 4 deg/s sensor quantum."
   },
   "tau_disturbance": {
     "value": 0.5,

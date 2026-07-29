@@ -7,7 +7,7 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v214 desired-load action controller.** Route bc exposed a
+⚠️ **In progress — v215 desired-load action controller.** Route bc exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
 used as the rack twin's pure command-transport delay. That advanced the
 predicted rack response twice and could make valid feedforward and feedback
@@ -18,14 +18,15 @@ steady aligning-load feedforward is evaluated at the model-requested rack
 position, rather than at the lagging measured position whose old-direction
 load could cancel entry or reversal feedback.
 
-Version 214 separates the controller's closed-loop tracking bandwidth from the
-plant twin's provisional damping estimate. Versions through 213 silently used
-`b_steer = 10 1/s` for both meanings. That made a 0.75-degree tracking error
-worth only about `0.019` normalized torque—less than measured static
-breakaway—so small corrections could remain lazy even though the controller
-had unused authority. The explicit provisional `tracking_bandwidth = 20 1/s`
-raises continuous angle/rate correction authority without adding preview
-lead, a speed schedule, a threshold, a filter, or a second torque mechanism.
+Version 214 tested separating closed-loop bandwidth from the plant twin's
+provisional damping estimate. It exposed another conflation: one bandwidth
+raised useful position authority and noisy rate feedback together. At
+`20 1/s`, 9f complaint-band oscillation rose above v14 (`0.0315` versus
+`0.0284`) and bc applied roughness also exceeded v14. Version 215 replaces the
+coupled pole dial with an explicit position stiffness. Rate damping is derived
+independently so one 4 deg/s sensor quantum can change feedback by no more than
+one Hyundai torque build step. This preserves continuous path-error authority
+without amplifying the quantized rate signal into another correction module.
 
 A v210 experiment decoupled breakaway from `sigma_curvature` and armed it from
 the measured 0.1-degree rack-angle resolution. It is reverted in v211: on 9f
@@ -125,7 +126,7 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v214 timing and authority contract
+### v215 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
@@ -140,15 +141,17 @@ the measured steering-wheel angle/rate through only the independent physical
 plant-seed delay (`0.12 s` provisionally) while holding measured applied
 torque. `blatV2ActionTimeSeconds` and
 `blatV2PredictionDelaySeconds` log both clocks independently so this contract
-is per-frame auditable. It then uses computed-torque pole placement: the
-inverse combines the calibrated steady load at the requested rack position
-with desired motion and puts both angle/rate tracking-error poles at the
-explicit `tracking_bandwidth`. Plant damping `b_steer` remains only a physical
-rack-model parameter. Evaluating the load at the old measured position was
-the v207 conflict: during turn entry or reversal it preserved old-direction
-torque while feedback tried to leave it. The requested-position load removes
-that cancellation; the independent bandwidth determines how swiftly the one
-controller removes the remaining measured error.
+is per-frame auditable. The inverse combines the calibrated steady load at the
+requested rack position with desired motion and direct position/rate feedback.
+Plant damping `b_steer` remains only a physical rack-model parameter.
+`tracking_stiffness` determines how strongly the controller removes measured
+position error. Rate damping is not another feel dial: it is derived from the
+runtime torque build step and the measured 4 deg/s rack-rate quantum.
+Evaluating the load at the old measured position was the v207 conflict: during
+turn entry or reversal it preserved old-direction torque while feedback tried
+to leave it. The requested-position load removes that cancellation; the
+independent stiffness supplies continuous authority without making rate
+quantization authoritative.
 
 The scalar action alone sets steering position. A fixed five-point quadratic
 stencil derives coherent rate and acceleration from the native 50 ms model
@@ -160,7 +163,7 @@ complete motion command. Letting later curvature pull current torque would
 change path timing rather than reduce controller delay.
 
 The inverse has no speed-scheduled feedback gain, torque-motion cost, arrival
-horizon, or integral. `tracking_bandwidth` is one continuous physical response
+horizon, or integral. `tracking_stiffness` is one continuous physical response
 dial, not a smoothing or boost schedule. Smoothness is the exact 409/4/7
 actuator trajectory. Low-speed authority arises naturally because the same
 curvature requires much more steering-wheel angle at low speed, so the
