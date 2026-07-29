@@ -7,7 +7,7 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v212 unified inverse action controller.** Route bc exposed a
+⚠️ **In progress — v213 desired-load action controller.** Route bc exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
 used as the rack twin's pure command-transport delay. That advanced the
 predicted rack response twice and could make valid feedforward and feedback
@@ -23,11 +23,14 @@ the measured 0.1-degree rack-angle resolution. It is reverted in v211: on 9f
 it improved the direct-handoff delivered fraction but armed on 43% of valid
 frames and raised 15.6–20.1 m/s command oscillation from `0.0145` to `0.0474`,
 worse than v14 on that route. Repeated full-static-friction pulses are not the
-smooth solution to a small-correction deadband. Version 212 corrects the
-episode logic rather than restoring the old path threshold: after one
-successful breakout, static compensation latches complete until the tracking
-error resolves or reverses. A continuous same-direction correction therefore
-gets one physical breakout, never a train of 0.09-torque pulses.
+smooth solution to a small-correction deadband.
+
+V212 added a one-breakout-per-error-direction latch. It also remains rejected:
+the 9f complaint-band oscillation improved from v210's `0.0474` only to
+`0.0413`, still worse than v14's `0.0284` and v209's `0.0145`. Static
+breakaway therefore remains reserved for large, persistent stiction events;
+small continuous path error belongs to proportional feedback, not repeated or
+latched friction compensation.
 
 Route bb showed that v206's inverse target was strong but its one-frame slew
 projection delivered sharp-turn torque late, while continuous static-friction
@@ -113,7 +116,7 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v212 timing and authority contract
+### v213 timing and authority contract
 
 The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
 offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently

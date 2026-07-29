@@ -20,9 +20,6 @@ MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
 # resolution, not a feel dial. Blending across one quantum makes static-to-slip
 # compensation continuous without adding filter state or hysteresis timing.
 RACK_RATE_QUANTUM_DEG_S = 4.0
-# Palisade steering-wheel angle reports in 0.1 degree quanta. This is a
-# measurement resolution, not a feel dial.
-RACK_ANGLE_QUANTUM_DEG = 0.1
 
 
 def decision_cell_coulomb_direction(
