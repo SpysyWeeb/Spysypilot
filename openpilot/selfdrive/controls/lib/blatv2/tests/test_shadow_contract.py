@@ -39,9 +39,9 @@ def test_shadow_runs_below_controlsd_without_competing_on_one_core():
   assert "Priority.CTRL_HIGH" not in source
 
 
-def test_shadow_v9_schema_has_live_action_and_exact_v14_fields():
-  assert SHADOW_VERSION == 9
-  assert LIVE_CONTROLLER_VERSION == 206
+def test_shadow_v10_schema_has_live_action_and_exact_v14_fields():
+  assert SHADOW_VERSION == 10
+  assert LIVE_CONTROLLER_VERSION == 207
   schema = Path("openpilot/cereal/log.capnp").read_text()
   shadow_source = Path(
     "openpilot/selfdrive/controls/blatv2_shadowd.py",
@@ -73,7 +73,7 @@ def test_shadow_v9_schema_has_live_action_and_exact_v14_fields():
   assert "v14CommandTorque @33 :Float64;" in schema
   assert "v14ControllerVersion @35 :Int32;" in schema
   assert "liveLqiControllerVersion @38 :Int32;" in schema
-  # The old wire slots decode historical routes but shadow v9 neither solves
+  # The old wire slots decode historical routes but shadow v10 neither solves
   # nor publishes either retired tournament candidate.
   assert "self.core.compute_mpc()" not in shadow_source
   assert "self.core.compute_fallback()" not in shadow_source
@@ -83,5 +83,17 @@ def test_shadow_v9_schema_has_live_action_and_exact_v14_fields():
   assert "liveActionDesiredAngleDeg @42 :Float64;" in schema
   assert "liveActionRequiredAccelerationDegS2 @47 :Float64;" in schema
   assert "liveActionSlewConstrained @53 :Bool;" in schema
+  assert "liveActionBreakawayActive @54 :Bool;" in schema
+  assert "liveActionBreakawayPersistenceFrames @55 :UInt16;" in schema
+  assert "liveActionHorizonAssistActive @56 :Bool;" in schema
+  assert "liveActionHorizonTorqueDemand @57 :Float64;" in schema
+  assert "liveActionHorizonDemandTimeSeconds @58 :Float64;" in schema
+  assert "liveActionNoLeadLimited @59 :Bool;" in schema
   assert "blatV2RawCommandTorque @80 :Float64;" in schema
   assert "blatV2SlewConstrained @94 :Bool;" in schema
+  assert "blatV2BreakawayActive @95 :Bool;" in schema
+  assert "blatV2BreakawayPersistenceFrames @96 :UInt16;" in schema
+  assert "blatV2HorizonAssistActive @97 :Bool;" in schema
+  assert "blatV2HorizonTorqueDemand @98 :Float64;" in schema
+  assert "blatV2HorizonDemandTimeSeconds @99 :Float64;" in schema
+  assert "blatV2NoLeadLimited @100 :Bool;" in schema
