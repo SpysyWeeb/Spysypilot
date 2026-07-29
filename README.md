@@ -137,7 +137,7 @@ cross-validate, so v205 adds no unsupported coefficient.
 Version 207 remains **in progress** pending field testing. The four frozen
 routes pass every raw and applied regression metric against v14, and their A/A
 replay is bit-exact. On route bb, hands-off controller evidence is encouraging:
-global applied torque-rate RMS is `0.881/s` versus v14's `0.971/s`, and command
+global applied torque-rate RMS is `0.798/s` versus v14's `0.971/s`, and command
 oscillation in the reported 15.6–20.1 m/s band is `0.0184` versus `0.0727`.
 Sharp low-speed events reach the full raw torque target where the physical
 need calls for it.
