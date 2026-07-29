@@ -7,12 +7,16 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v208 split-delay action controller.** Route bc exposed a
+⚠️ **In progress — v209 desired-load action controller.** Route bc exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
 used as the rack twin's pure command-transport delay. That advanced the
 predicted rack response twice and could make valid feedforward and feedback
 cancel. Version 208 keeps the model-authored action time unchanged while
 predicting the measured rack through only the plant seed's physical delay.
+Version 209 also removes the remaining feedforward/feedback conflict: the
+steady aligning-load feedforward is evaluated at the model-requested rack
+position, rather than at the lagging measured position whose old-direction
+load could cancel entry or reversal feedback.
 
 Route bb showed
 that v206's inverse target was strong but its one-frame slew projection

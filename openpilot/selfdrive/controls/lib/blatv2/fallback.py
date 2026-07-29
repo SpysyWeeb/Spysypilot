@@ -327,8 +327,14 @@ class InverseEpsActionController:
         + pole_rate * pole_rate * angle_error
       )
 
+      # Feed the load required by the model-requested rack position, not the
+      # load at the lagging measured position. Using the latter makes the
+      # steady-load term preserve the old turn while feedback tries to enter
+      # or reverse it; route bc exposed that cancellation directly. The
+      # calibrated aligning map is already the inverse static plant, so its
+      # desired-state value is the physically required trajectory feedforward.
       aligning = self.twin.aligning_torque_values(
-        self.predicted_state.angle_deg,
+        desired_angle,
         action_speed,
         align_inputs,
       )
