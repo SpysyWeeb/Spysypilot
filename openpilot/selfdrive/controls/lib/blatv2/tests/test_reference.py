@@ -10,7 +10,7 @@ from openpilot.selfdrive.controls.lib.blatv2.reference import (
   model_action_time,
   torque_demand,
 )
-from openpilot.selfdrive.modeld.timing import LAT_SMOOTH_SECONDS
+from openpilot.selfdrive.modeld import timing
 
 
 def params() -> PlantParams:
@@ -45,11 +45,16 @@ class TestReference(unittest.TestCase):
     expected = (409 / 7 + 409 / 4) * 0.01 + 0.12 + 0.2
     self.assertTrue(math.isclose(horizon(params()), expected))
 
-  def test_action_time_matches_modeld_scalar_timing(self) -> None:
-    self.assertEqual(
-      model_action_time(0.12),
-      0.12 + LAT_SMOOTH_SECONDS + 1.5 * DT_MDL,
-    )
+  def test_action_time_is_fixed_model_offset(self) -> None:
+    self.assertEqual(model_action_time(0.12), 0.12 + 1.5 * DT_MDL)
+
+  def test_action_time_is_independent_of_model_smoothing(self) -> None:
+    original = timing.LAT_SMOOTH_SECONDS
+    try:
+      timing.LAT_SMOOTH_SECONDS = 0.37
+      self.assertEqual(model_action_time(0.12), 0.12 + 1.5 * DT_MDL)
+    finally:
+      timing.LAT_SMOOTH_SECONDS = original
 
   def test_transparency_for_already_feasible_smooth_demand(self) -> None:
     twin = PlantTwin(params(), align_params())
