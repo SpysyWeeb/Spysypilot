@@ -4,7 +4,14 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from openpilot.selfdrive.controls.lib.blatv2.plant import AlignInputs, AlignParams, PlantParams, PlantState, PlantTwin
+from openpilot.selfdrive.controls.lib.blatv2.plant import (
+  AlignInputs,
+  AlignParams,
+  PlantParams,
+  PlantState,
+  PlantTwin,
+  SignedRackRate,
+)
 
 
 SPEED_NODES = (2.5, 5.5, 8.5, 12.0, 16.5, 21.0)
@@ -41,6 +48,29 @@ def align_params() -> AlignParams:
 
 
 class TestPlantTwin(unittest.TestCase):
+  def test_hyundai_unsigned_rack_rate_recovers_angle_direction(self) -> None:
+    rate = SignedRackRate()
+    self.assertEqual(rate.update(10.0, 4.0), 0.0)
+    self.assertEqual(rate.update(10.1, 4.0), 4.0)
+    self.assertEqual(rate.update(10.1, 4.0), 4.0)
+    self.assertEqual(rate.update(10.1, 0.0), 0.0)
+    self.assertEqual(rate.update(10.0, 4.0), -4.0)
+    self.assertEqual(rate.update(10.0, 8.0), -8.0)
+
+  def test_already_signed_negative_rack_rate_is_preserved(self) -> None:
+    rate = SignedRackRate()
+    self.assertEqual(rate.update(0.0, -12.0), -12.0)
+    self.assertEqual(rate.update(0.0, 12.0), -12.0)
+    rate.reset()
+    self.assertEqual(rate.update(0.0, 12.0), 0.0)
+
+  def test_signed_rack_rate_rejects_nonfinite_inputs(self) -> None:
+    rate = SignedRackRate()
+    for angle, reported in ((math.nan, 0.0), (0.0, math.inf)):
+      with self.subTest(angle=angle, reported=reported):
+        with self.assertRaises(ValueError):
+          rate.update(angle, reported)
+
   def test_load_seed_uses_runtime_limits(self) -> None:
     with tempfile.TemporaryDirectory() as directory:
       seed = Path(directory) / "seed.json"

@@ -33,6 +33,7 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import (
   PlantParams,
   PlantState,
   PlantTwin,
+  SignedRackRate,
 )
 from openpilot.selfdrive.controls.lib.blatv2.reference import (
   build_reference_into,
@@ -69,6 +70,7 @@ class ShadowResult:
   fallback_status: int = int(CandidateStatus.INPUT_INVALID)
   fallback_candidate_count: int = 0
   fallback_optimality_residual: float = 0.0
+  signed_rack_rate_deg_s: float = 0.0
 
 
 class ShadowCore:
@@ -105,6 +107,7 @@ class ShadowCore:
 
     self.previous_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.current_state = PlantState(0.0, 0.0, 0.0, 0.0)
+    self.signed_rack_rate = SignedRackRate()
     self.previous_align_inputs = AlignInputs(
       0.0, 0.0, 1.0, self.align_params.nominal_steer_ratio, False,
     )
@@ -115,8 +118,13 @@ class ShadowCore:
     self.result = ShadowResult(horizon=self.default_horizon)
     self.reference_count = 0
     self.horizon_seconds = self.default_horizon
+    # ``reference_delay`` is the learned desired-curvature -> yaw lag used by
+    # modeld to select its scalar action. ``actuation_delay`` is only the
+    # physical command transport represented by the plant seed. They must
+    # never be substituted for one another.
+    self.reference_delay = self.seed_params.actuation_delay
     self.actuation_delay = self.seed_params.actuation_delay
-    self.action_time = model_action_time(self.actuation_delay)
+    self.action_time = model_action_time(self.reference_delay)
     self.frame_prepared = False
     self.candidate_workspace_valid = False
 
@@ -127,6 +135,7 @@ class ShadowCore:
     self.observer.reset()
     self.mpc.reset()
     self.fallback.reset()
+    self.signed_rack_rate.reset()
 
   def invalid_result(self) -> ShadowResult:
     self.reset()
@@ -153,9 +162,12 @@ class ShadowCore:
     result.fallback_status = int(CandidateStatus.INPUT_INVALID)
     result.fallback_candidate_count = 0
     result.fallback_optimality_residual = 0.0
+    result.signed_rack_rate_deg_s = 0.0
     return result
 
-  def frame_actuation_delay(self, lateral_delay: float, lateral_delay_valid: bool) -> float:
+  def frame_reference_delay(
+    self, lateral_delay: float, lateral_delay_valid: bool,
+  ) -> float:
     delay = float(lateral_delay)
     if lateral_delay_valid and math.isfinite(delay) and delay >= 0.0:
       return delay
@@ -237,7 +249,10 @@ class ShadowCore:
   ) -> ShadowResult:
     if self.frame_prepared:
       raise RuntimeError("previous BLaTv2 shadow frame was not finalized")
-    actuation_delay = self.frame_actuation_delay(lateral_delay, lateral_delay_valid)
+    reference_delay = self.frame_reference_delay(
+      lateral_delay, lateral_delay_valid,
+    )
+    physical_prediction_delay = self.seed_params.actuation_delay
 
     scalar = float(model.action.desiredCurvature)
     v_ego = float(car_state.vEgo)
@@ -249,8 +264,10 @@ class ShadowCore:
     )
     plan_valid = signed_plan_count > 0
     plan_count = abs(signed_plan_count)
-    action_time = model_action_time(actuation_delay)
-    horizon_seconds = horizon(self.seed_params, actuation_delay)
+    action_time = model_action_time(reference_delay)
+    horizon_seconds = horizon(
+      self.seed_params, physical_prediction_delay,
+    )
     reference_count = build_reference_into(
       scalar,
       self.plan_times,
@@ -294,7 +311,9 @@ class ShadowCore:
 
     state = self.current_state
     state.angle_deg = float(car_state.steeringAngleDeg)
-    state.rate_deg_s = float(car_state.steeringRateDeg)
+    state.rate_deg_s = self.signed_rack_rate.update(
+      state.angle_deg, float(car_state.steeringRateDeg),
+    )
     state.applied_torque = applied
     state.v_ego = v_ego
     if not (
@@ -349,6 +368,7 @@ class ShadowCore:
     result.v_ego = float(residual_v_ego)
     result.aligning_torque = float(residual_aligning_torque)
     result.align_inputs_valid = residual_align_inputs_valid
+    result.signed_rack_rate_deg_s = float(state.rate_deg_s)
     requested = float(car_control.actuators.torque)
     recorded_constraint_active = not math.isfinite(requested) or requested != applied
     disturbance = self.observer.update(
@@ -375,7 +395,8 @@ class ShadowCore:
 
     self.reference_count = reference_count
     self.horizon_seconds = horizon_seconds
-    self.actuation_delay = actuation_delay
+    self.reference_delay = reference_delay
+    self.actuation_delay = physical_prediction_delay
     self.action_time = action_time
     self.candidate_workspace_valid = False
     if result.valid:

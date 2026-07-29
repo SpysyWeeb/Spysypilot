@@ -270,6 +270,12 @@ class Controls:
       lac_log.blatV2FrictionTorque = float(result.friction_torque)
       lac_log.blatV2DynamicTorque = float(result.dynamic_torque)
       lac_log.blatV2ActionTimeSeconds = float(result.action_time_seconds)
+      lac_log.blatV2PredictionDelaySeconds = float(
+        result.prediction_delay_seconds
+      )
+      lac_log.blatV2SignedRackRateDegS = float(
+        result.signed_rack_rate_deg_s
+      )
       lac_log.blatV2SlewConstrained = bool(result.slew_constrained)
       lac_log.blatV2BreakawayActive = bool(result.breakaway_active)
       lac_log.blatV2BreakawayPersistenceFrames = int(
