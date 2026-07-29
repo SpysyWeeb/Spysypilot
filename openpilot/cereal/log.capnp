@@ -984,6 +984,8 @@ struct ControlsState @0x97ff69c53601abf1 {
     blatV2HorizonTorqueDemand @98 :Float64;
     blatV2HorizonDemandTimeSeconds @99 :Float64;
     blatV2NoLeadLimited @100 :Bool;
+    blatV2PredictionDelaySeconds @101 :Float64;
+    blatV2SignedRackRateDegS @102 :Float64;
    }
 
   struct LateralAngleState {
@@ -3141,6 +3143,8 @@ struct BlatV2Shadow {
   liveActionHorizonTorqueDemand @57 :Float64;
   liveActionHorizonDemandTimeSeconds @58 :Float64;
   liveActionNoLeadLimited @59 :Bool;
+  liveActionPredictionDelaySeconds @60 :Float64;
+  signedRackRateDegS @61 :Float64;
 }
 
 struct Touch {

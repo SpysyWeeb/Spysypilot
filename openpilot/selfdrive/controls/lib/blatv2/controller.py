@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 207
+LIVE_CONTROLLER_VERSION = 217
 
 
 class CandidateStatus(IntEnum):
@@ -49,7 +49,7 @@ class ObserverStatus(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class ControllerParams:
-  """Controller tolerances plus the physical observer time scale.
+  """Controller tolerances, tracking stiffness, and observer time scale.
 
   ``sigma_curvature`` and ``kinetic_friction`` are the b7 response-surface
   axes selected for v203. A zero curvature tolerance remains available to
@@ -64,6 +64,8 @@ class ControllerParams:
   provisional: bool
   sigma_curvature: float = 0.0
   kinetic_friction: float = 0.09
+  tracking_stiffness: float = 0.025
+  authority_transition_error_deg: float = 1.0
 
   @classmethod
   def from_seed_file(cls, path: str | Path) -> ControllerParams:
@@ -77,6 +79,10 @@ class ControllerParams:
       provisional=bool(seed["provisional"]),
       sigma_curvature=float(seed.get("sigma_curvature", {}).get("value", 0.0)),
       kinetic_friction=float(seed.get("kinetic_friction", {}).get("value", 0.09)),
+      tracking_stiffness=float(seed.get("tracking_stiffness", {}).get("value", 0.025)),
+      authority_transition_error_deg=float(
+        seed.get("authority_transition_error_deg", {}).get("value", 1.0)
+      ),
     )
     params.validate()
     return params
@@ -89,6 +95,15 @@ class ControllerParams:
       raise ValueError("sigma_curvature must be finite and non-negative")
     if not math.isfinite(self.kinetic_friction) or self.kinetic_friction < 0.0:
       raise ValueError("kinetic_friction must be finite and non-negative")
+    if not math.isfinite(self.tracking_stiffness) or self.tracking_stiffness <= 0.0:
+      raise ValueError("tracking_stiffness must be finite and positive")
+    if (
+      not math.isfinite(self.authority_transition_error_deg)
+      or self.authority_transition_error_deg <= 0.0
+    ):
+      raise ValueError(
+        "authority transition error must be finite and positive"
+      )
 
 
 @dataclass(slots=True)
@@ -108,6 +123,7 @@ class CandidateResult:
   friction_torque: float = 0.0
   dynamic_torque: float = 0.0
   action_time_seconds: float = 0.0
+  prediction_delay_seconds: float = 0.0
   slew_constrained: bool = False
   breakaway_active: bool = False
   breakaway_persistence_frames: int = 0
@@ -136,6 +152,7 @@ class CandidateResult:
     self.friction_torque = 0.0
     self.dynamic_torque = 0.0
     self.action_time_seconds = 0.0
+    self.prediction_delay_seconds = 0.0
     self.slew_constrained = False
     self.breakaway_active = False
     self.breakaway_persistence_frames = 0
