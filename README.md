@@ -41,6 +41,13 @@ W1/W2/W3 now surface automatically. Route 94 remains the historical
 regression fixture; b7 adds committed authority/takeover windows. Version 7
 remains in progress until new on-device field collection has been reviewed.
 
+Route bc exposed a process-lifetime defect after detection: the retry warning
+passed a Cap'n Proto/string-like event ID through the standard logger's
+structured-keyword path, which can terminate `driving_eventd`. The retry ID is
+now rendered to text at the logging boundary, and the passive logger process
+is manager-restartable. A logging failure can therefore no longer silently
+discard the remainder of an otherwise useful route.
+
 Version 5 history: progress-based bad-unwind detection and the sensitive
 single turn–stop–turn detector were added on top of version 4's reversal,
 handoff, driver, road, and stall-release evidence. Route 93 and route 94
