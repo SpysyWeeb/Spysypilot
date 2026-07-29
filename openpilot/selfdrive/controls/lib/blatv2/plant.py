@@ -523,6 +523,79 @@ class PlantTwin:
     target.applied_torque = float(state.applied_torque)
     target.v_ego = float(state.v_ego)
 
+  def predict_applied_history_into(
+    self,
+    state: PlantState,
+    duration: float,
+    applied_history: Any,
+    history_start: int,
+    history_count: int,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+    target: PlantState,
+    max_step: float,
+  ) -> None:
+    """Predict to this request's effect time through already-queued torque.
+
+    ``state`` is the measured rack now. Commands emitted during the preceding
+    pure-delay interval are already committed and will reach the rack before
+    the command being computed now can do so. They are supplied oldest first
+    through a caller-owned circular buffer. If engagement has not yet filled
+    the delay line, the unknown prefix holds the currently applied torque.
+
+    History samples are already slew-limited actuator commands. This method
+    therefore applies neither another limiter nor another delay, and allocates
+    no temporary sequence.
+    """
+    duration_value = float(duration)
+    step_limit = float(max_step)
+    start = int(history_start)
+    count = int(history_count)
+    capacity = len(applied_history)
+    if not math.isfinite(duration_value) or duration_value < 0.0:
+      raise ValueError("prediction duration must be finite and non-negative")
+    if not math.isfinite(step_limit) or step_limit <= 0.0:
+      raise ValueError("prediction step must be finite and positive")
+    if count < 0 or count > capacity:
+      raise ValueError("applied history count is outside buffer bounds")
+    if capacity == 0 and count != 0:
+      raise ValueError("empty applied history cannot contain samples")
+    if capacity and not 0 <= start < capacity:
+      raise ValueError("applied history start is outside buffer bounds")
+
+    step_count = int(math.ceil(duration_value / step_limit))
+    retained_count = min(count, step_count)
+    missing_count = step_count - retained_count
+    retained_start = count - retained_count
+    angle = float(state.angle_deg)
+    rate = float(state.rate_deg_s)
+    applied = float(state.applied_torque)
+    for step_index in range(step_count):
+      step = (
+        step_limit
+        if step_index + 1 < step_count
+        else duration_value - step_limit * (step_count - 1)
+      )
+      if step_index >= missing_count:
+        logical_index = retained_start + step_index - missing_count
+        physical_index = (start + logical_index) % capacity
+        applied = float(applied_history[physical_index])
+      if not math.isfinite(applied):
+        raise ValueError("applied history must be finite")
+      angle, rate = self._advance(
+        angle,
+        rate,
+        applied,
+        state.v_ego,
+        align_inputs,
+        step,
+        disturbance_torque,
+      )
+    target.angle_deg = angle
+    target.rate_deg_s = rate
+    target.applied_torque = applied
+    target.v_ego = float(state.v_ego)
+
   def predict_constant_request_into(
     self,
     state: PlantState,

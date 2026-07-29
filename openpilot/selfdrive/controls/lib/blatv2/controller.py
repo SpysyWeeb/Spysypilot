@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 217
+LIVE_CONTROLLER_VERSION = 220
 
 
 class CandidateStatus(IntEnum):
@@ -65,7 +65,6 @@ class ControllerParams:
   sigma_curvature: float = 0.0
   kinetic_friction: float = 0.09
   tracking_stiffness: float = 0.025
-  authority_transition_error_deg: float = 1.0
 
   @classmethod
   def from_seed_file(cls, path: str | Path) -> ControllerParams:
@@ -80,9 +79,6 @@ class ControllerParams:
       sigma_curvature=float(seed.get("sigma_curvature", {}).get("value", 0.0)),
       kinetic_friction=float(seed.get("kinetic_friction", {}).get("value", 0.09)),
       tracking_stiffness=float(seed.get("tracking_stiffness", {}).get("value", 0.025)),
-      authority_transition_error_deg=float(
-        seed.get("authority_transition_error_deg", {}).get("value", 1.0)
-      ),
     )
     params.validate()
     return params
@@ -97,13 +93,6 @@ class ControllerParams:
       raise ValueError("kinetic_friction must be finite and non-negative")
     if not math.isfinite(self.tracking_stiffness) or self.tracking_stiffness <= 0.0:
       raise ValueError("tracking_stiffness must be finite and positive")
-    if (
-      not math.isfinite(self.authority_transition_error_deg)
-      or self.authority_transition_error_deg <= 0.0
-    ):
-      raise ValueError(
-        "authority transition error must be finite and positive"
-      )
 
 
 @dataclass(slots=True)
