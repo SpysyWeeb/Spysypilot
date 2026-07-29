@@ -7,15 +7,35 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v217 single-path inverse-EPS controller.** Version 217
-keeps one torque equation and removes every experimental second authority:
-there is no preview scheduler, breakaway episode, persistence timer, boost,
-integral, or alternate low-speed controller. Small model-angle errors use a
-calm `0.025 normalized-torque/deg` linear stiffness. Error then enters one
-stateless C1-continuous smoothstep which reaches the measured `0.09` static
-load at `1.0 deg`; beyond it, the same linear law continues naturally to full
-normalized torque. The 409/4/7 Hyundai limiter is the only command slew
-mechanism.
+⚠️ **In progress — v218 scalar-anchored, slew-feasible inverse-EPS
+controller.** Version 218 keeps one torque trajectory and no competing
+authority mechanisms: there is no turn detector, preview boost, persistence
+timer, breakaway episode, integral, torque-rate filter, or alternate
+low-speed controller.
+
+The model's scalar action still anchors steering position at its authored
+action time; BLaTv2 does not move or reshape that path. The surrounding model
+plan is converted to the physical inverse-EPS torque it will require. A
+backward reachability pass then applies the exact asymmetric 409/4/7 limits
+and starts each build, release, or sign handoff at the latest instant from
+which that demand is physically reachable. This is predictive torque timing,
+not predictive path timing. A one-frame plant invariant prevents the future
+increment from moving the rack beyond the time-aligned model reference.
+
+Measured rack state is predicted only to the physical torque-effect time and
+compared with the reference at that same instant. One calm linear residual
+term corrects plant/model mismatch. Requested-path feedforward—not tracking
+error remaining nonzero—owns the torque needed to hold a curve, so useful
+authority no longer disappears merely because the wheel briefly catches the
+target. The exact Hyundai limiter remains the only smoothing authority.
+
+The design directly addresses the paired-route evidence from controller route
+`000000be--90a99b4f6d` and human-driven route
+`000000bf--9b8b8f9db3`: v217 began low-level motion about four metres earlier
+than the human yet reached meaningful turn-in later, and its feedback shed
+about `0.14` normalized torque before the model requested release. Version 218
+removes that mismatched clock and error-dependent holding behavior rather than
+adding another correction layer.
 
 The transient rack gain is now `k_t = 1500 deg/s² per normalized torque`.
 On sole-evidence route `000000bc--081b9d5b5a`, that lowers signed one-step
@@ -29,16 +49,10 @@ versus `0.0284`. On route bc, every unsaturated named turn receives more
 torque than v216 while complaint-band oscillation remains below v14
 (`0.0353` versus `0.0479`).
 
-The four-route counterfactual acceptance is bit-reproducible and passes all
-five delivered-curvature metrics against v14. Post-slew applied torque also
-passes all five. The raw internal target's worst 1-second torque-rate RMS is
-an explicit accepted deviation: `5.0236 /s` versus v14's `4.7682 /s`.
-That target is never sent directly to the rack; Hyundai's exact command
-envelope turns it into an applied result of `1.2231 /s`, better than v14's
-`1.3286 /s`. The deviation is retained deliberately because swift authority
-requires the inverse controller to state the torque it needs, while the one
-physical slew limiter—not another smoothing controller—keeps delivery smooth.
-Field validation remains required before v217 can leave in-progress status.
+The v217 acceptance record remains historical evidence for its shipped
+controller. Version 218 requires a fresh bit-reproducible counterfactual
+acceptance because its command arrays intentionally change. Field validation
+remains required before v218 can leave in-progress status.
 
 Route bc also exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
@@ -144,15 +158,17 @@ ground-up design and does not inherit that controller.
 - a stateless scalar-anchored future-path reference;
 - one live-response disturbance observer;
 - a retained, non-running sign-schedule torque MPC challenger;
-- the promoted delay-compensated inverse-EPS action controller;
+- the promoted scalar-anchored, slew-feasible inverse-EPS action controller;
 - an onroad `blatv2_shadowd` process that runs the complete frozen-v14
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 13. It reports reference and
+The shadow event is `blatV2Shadow`, version 14. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
+Version 14 identifies the v218 trajectory controller data and reactivates the
+existing horizon/no-lead diagnostic slots with their original meanings.
 Version 13 identifies the v217 controller data. Version 12 adds the
 reconstructed signed Hyundai rack rate used by the live
 controller and every twin/observer calculation.
@@ -173,20 +189,20 @@ the moving-friction feedforward magnitude with the b7-selected `0.03`; full
 curvature-space tracking tolerance `sigma_curvature = 0.00091683 1/m` while
 leaving the three original sigma dials unchanged.
 
-### v217 timing and authority contract
+### v218 timing and authority contract
 
-The action time is `liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model
-offset is independent of `LAT_SMOOTH_SECONDS`; model filtering cannot silently
-move BLaTv2's reference. The scalar action and its local
-angle/rate/acceleration stencil are sampled at that one time. Changing any plan
-point beyond the local stencil cannot move that target or the current torque
-request.
+The scalar action time remains
+`liveDelay.lateralDelay + 1.5 × DT_MDL`. The fixed model offset is independent
+of `LAT_SMOOTH_SECONDS`; model filtering cannot silently move BLaTv2's scalar
+anchor. The full scalar-pinned plan supplies the inverse torque trajectory,
+but it cannot independently change the requested path.
 
 `liveDelay` is the measured desired-curvature-to-yaw lag and selects the model
-reference; it is not a pure actuator transport delay. The controller advances
-the measured steering-wheel angle/rate through only the independent physical
-plant-seed delay (`0.12 s` provisionally) while holding measured applied
-torque. `blatV2ActionTimeSeconds` and
+scalar action; it is not a pure actuator transport delay. The controller
+advances the measured steering-wheel angle/rate through only the independent
+physical plant-seed delay (`0.12 s` provisionally) while holding measured
+applied torque. Crucially, it samples the scalar-pinned reference at that same
+physical-effect time for feedback. `blatV2ActionTimeSeconds` and
 `blatV2PredictionDelaySeconds` log both clocks independently so this contract
 is per-frame auditable. The inverse combines the calibrated steady load at the
 requested rack position with desired motion and direct position/rate feedback.
@@ -207,31 +223,28 @@ auditable on every frame.
 
 The scalar action alone sets steering position. A fixed five-point quadratic
 stencil derives coherent rate and acceleration from the native 50 ms model
-grid; it adds no state, smoothing delay, or feel constant. The rest of the
-far-future path remains available to the shared reference and harness, but it
-has no independent torque authority. This is deliberate: for a second-order
-rack, position, rate, and acceleration at the model action point are the
-complete motion command. Letting later curvature pull current torque would
-change path timing rather than reduce controller delay.
+grid; it adds no state, smoothing delay, or feel constant. Those samples map
+to inverse physical torque. Starting at the physical-effect time, an analytic
+backward-reachable interval projects the sequence through the exact Hyundai
+build, decay, and decay-then-build sign-crossing limits. Future demand changes
+the current request only when waiting would make that demand unreachable.
+This supplies the torque needed to cancel real actuator delay without asking
+the path to occur earlier.
 
-The inverse has no speed-scheduled feedback gain, torque-motion cost, arrival
-horizon, timer, latch, or integral. `tracking_stiffness` is the calm
-small-error slope. `authority_transition_error_deg` controls only where that
-same position law smoothly acquires the measured static-load authority; it is
-not a second command source. The map and its first derivative are continuous,
-so crossing the threshold cannot create a torque step or retain state after a
-reversal. Smoothness is the exact 409/4/7 actuator trajectory. Low-speed
-authority arises naturally because the same curvature requires much more
-steering-wheel angle at low speed, so physical angle error asks for more
-torque and may saturate.
+The inverse has no speed-scheduled feedback gain, torque-motion cost, arbitrary
+arrival horizon, timer, latch, or integral. `tracking_stiffness` is the one
+linear measured-rack residual slope. Smoothness is the one feasible 409/4/7
+trajectory; swiftness is its latest feasible transition; strength is the full
+inverse demand up to normalized saturation.
 
 Palisade steering rate is an unsigned 4 deg/s-quantized magnitude. Version 216
 reconstructs its sign once from steering-angle motion. The active controller
-uses kinetic `0.03` friction only when the measured signed rack is moving
-faster than half a sensor quantum; stationary authority comes from the one
-continuous position law above, not a repeated static-friction pulse. A b9/ba
+uses full static `0.09` compensation at measured standstill and blends
+continuously to kinetic `0.03` across the existing 4 deg/s sensor quantum.
+Future cells use their planned rack motion because no measured future state
+exists. A b9/ba
 attempt to identify an additional road-wheel-angle scrub term was rejected:
-the two low-speed route fits did not cross-validate, so v217 adds no
+the two low-speed route fits did not cross-validate, so v218 adds no
 unsupported coefficient.
 
 ### v207 route-bb staging record
@@ -366,9 +379,10 @@ low-speed node is b5-weighted because b6 was under-actuated there. The method
 authority is route-audit `phase0/plant_fit_reference.py` at `313de6b`.
 
 `t_breakaway = 0.09` remains the sole Coulomb-friction model and automatically
-bounds the observer to ±0.09. `k_t = 4000 deg/s²`, `b_steer = 10 1/s`, the
-0.12 s seed delay, and all sigma feel dials are unchanged. The plant parameters
-remain provisional under continuous calibration from future casual routes.
+bounds the observer to ±0.09. `k_t = 1500 deg/s²`,
+`b_steer = 10 1/s`, the 0.12 s seed delay, and all sigma feel dials remain
+provisional. The plant parameters remain under continuous calibration from
+future casual routes.
 Invalid `liveParameters` uses zero roll/angle offset and nominal vehicle
 parameters for that frame, with `alignInputsValid = false`; no stale values are
 carried.
@@ -481,5 +495,5 @@ damping.
 - UI;
 - unsupported scrub/load coefficients.
 
-Version 207 stays **in progress** until identity replay, route gates, full test
+Version 218 stays **in progress** until identity replay, route gates, full test
 suites, device timing, and the first owner drive pass.

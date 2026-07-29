@@ -49,7 +49,7 @@ ALIGN_PARAMS = AlignParams(
 )
 CONTROLLER_PARAMS = ControllerParams(0.05, 0.01, 0.5, 0.5, True)
 ACTION_PARAMS = ControllerParams(
-  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.025, 1.0,
+  0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.025,
 )
 ALIGN_INPUTS = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
 REFERENCE_TIMES = np.asarray((0.0, 0.5, 1.0), dtype=np.float64)
@@ -93,23 +93,13 @@ def test_shared_sigma_values_are_marked_as_provisional_owner_feel_dials():
     "owner_feel_dial": True,
     "provisional": True,
     "provenance": (
-      "v217 restores the calm small-error stiffness after route bc showed "
-      "that a stronger global proportional gain amplified routine plan error "
-      "into correction activity."
+      "v218 uses the existing calm slope only for linear measured-rack " +
+      "residual correction at the physical-effect time. Requested-path " +
+      "feedforward and its exact slew-feasible trajectory own build, hold, " +
+      "release, and full authority."
     ),
   }
-  assert payload["authority_transition_error_deg"] == {
-    "value": 1.0,
-    "units": "steering-wheel deg",
-    "owner_feel_dial": True,
-    "provisional": True,
-    "provenance": (
-      "v217 route-bc and 9f sweep selected 1.0 degree: it materially improves "
-      "every unsaturated bc named turn, matches v14's 9f direct-handoff "
-      "delivered fraction, and remains calmer than v14 in the 15.6-20.1 m/s "
-      "band. It adds no timer, latch, integral, or second command path."
-    ),
-  }
+  assert "authority_transition_error_deg" not in payload
 
 
 def test_mpc_transparency_for_already_feasible_smooth_reference():
@@ -211,7 +201,7 @@ def test_measured_rack_stick_to_slip_transition_is_continuous():
   assert measured_rack_friction(0.0, -1.0, 0.09, 0.03) == -0.09
 
 
-def test_action_feedback_separates_position_stiffness_from_rate_damping():
+def test_action_feedback_is_linear_and_separates_position_from_rate_damping():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
@@ -227,23 +217,7 @@ def test_action_feedback_separates_position_stiffness_from_rate_damping():
     action_time=0.20,
   )
   angle_error = result.desired_angle_deg - result.predicted_angle_deg
-  transition_fraction = min(
-    abs(angle_error) / ACTION_PARAMS.authority_transition_error_deg, 1.0,
-  )
-  smoothstep = transition_fraction * transition_fraction * (
-    3.0 - 2.0 * transition_fraction
-  )
-  static_authority = max(
-    PLANT_PARAMS.t_breakaway
-    - ACTION_PARAMS.tracking_stiffness
-      * ACTION_PARAMS.authority_transition_error_deg,
-    0.0,
-  )
-  position_feedback = math.copysign(
-    ACTION_PARAMS.tracking_stiffness * abs(angle_error)
-    + static_authority * smoothstep,
-    angle_error,
-  )
+  position_feedback = ACTION_PARAMS.tracking_stiffness * angle_error
   expected = (
     result.desired_acceleration_deg_s2
     + PLANT_PARAMS.b_steer
@@ -276,7 +250,7 @@ def test_tracking_stiffness_changes_small_error_feedback_without_changing_feedfo
   calm_feedforward = calm.feedforward_torque
   calm_feedback = calm.feedback_torque
   stiffer_params = ControllerParams(
-    0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.05, 1.0,
+    0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.05,
   )
   stiffer = InverseEpsActionController(twin, stiffer_params).compute(
     state,
@@ -307,20 +281,6 @@ def test_tracking_stiffness_must_be_finite_and_positive():
       raise AssertionError(f"accepted invalid tracking stiffness {value!r}")
 
 
-def test_authority_transition_error_must_be_finite_and_positive():
-  for value in (0.0, -1.0, math.inf, math.nan):
-    params = ControllerParams(
-      0.05, 0.01, 0.5, 0.5, True, 0.00091683, 0.03, 0.025,
-      value,
-    )
-    try:
-      params.validate()
-    except ValueError:
-      pass
-    else:
-      raise AssertionError(f"accepted invalid authority transition {value!r}")
-
-
 def test_rate_feedback_quantum_is_bounded_to_one_torque_build_step():
   rate_damping = (
     PLANT_PARAMS.delta_up
@@ -334,15 +294,127 @@ def test_rate_feedback_quantum_is_bounded_to_one_torque_build_step():
   )
 
 
-def test_action_far_future_does_not_pull_current_torque_or_position():
+def test_trajectory_transition_time_matches_exact_asymmetric_limits():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  frame_seconds = 0.01
+  assert math.isclose(
+    candidate._torque_transition_time(0.0, 1.0),
+    PLANT_PARAMS.steer_max / PLANT_PARAMS.delta_up * frame_seconds,
+    abs_tol=1e-15,
+  )
+  assert math.isclose(
+    candidate._torque_transition_time(1.0, 0.0),
+    PLANT_PARAMS.steer_max / PLANT_PARAMS.delta_down * frame_seconds,
+    abs_tol=1e-15,
+  )
+  assert math.isclose(
+    candidate._torque_transition_time(0.5, -0.5),
+    (
+      0.5 * PLANT_PARAMS.steer_max / PLANT_PARAMS.delta_down
+      + 0.5 * PLANT_PARAMS.steer_max / PLANT_PARAMS.delta_up
+    ) * frame_seconds,
+    abs_tol=1e-15,
+  )
+
+
+def test_trajectory_predecessor_is_latest_value_that_reaches_next_cell():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  predecessor = candidate._latest_feasible_predecessor(
+    0.0, 1.0, DECISION_DT,
+  )
+  expected = 1.0 - (
+    DECISION_DT / 0.01
+  ) * PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max
+  assert math.isclose(predecessor, expected, abs_tol=1e-7)
+  assert candidate._torque_transition_time(
+    predecessor, 1.0,
+  ) <= DECISION_DT + 1e-12
+  assert candidate._torque_transition_time(
+    predecessor - 1e-5, 1.0,
+  ) > DECISION_DT
+
+
+def test_action_tracks_reference_at_physical_effect_time_not_later_scalar_time():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(0.0, 0.0, 0.0, 5.0)
+  times = np.arange(0.0, 0.55, 0.05, dtype=np.float64)
+  curvatures = np.linspace(0.0, 0.02, len(times), dtype=np.float64)
+  workspace = CandidateWorkspace()
+  workspace.fill(
+    twin,
+    state,
+    ALIGN_INPUTS,
+    times,
+    curvatures,
+    len(times),
+    0.5,
+    0.0,
+    ACTION_PARAMS.kinetic_friction,
+  )
+  candidate = InverseEpsActionController(
+    twin, ACTION_PARAMS, workspace,
+  )
+  physical_time = 0.05
+  scalar_time = 0.20
+  expected_physical = candidate._interpolate(
+    workspace.desired_angles,
+    physical_time / DECISION_DT,
+    workspace.decision_count,
+  )
+  later_scalar_position = candidate._interpolate(
+    workspace.desired_angles,
+    scalar_time / DECISION_DT,
+    workspace.decision_count,
+  )
+  result = candidate.compute(
+    state,
+    ALIGN_INPUTS,
+    times,
+    curvatures,
+    len(times),
+    0.5,
+    physical_time,
+    0.0,
+    ObserverStatus.ACTIVE,
+    workspace_prepared=True,
+    action_time=scalar_time,
+  )
+  assert expected_physical != later_scalar_position
+  assert result.desired_angle_deg == expected_physical
+  assert result.action_time_seconds == scalar_time
+  assert result.prediction_delay_seconds == physical_time
+
+
+def test_steady_turn_holding_torque_survives_zero_tracking_error():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = feasible_steady_state(twin)
+  result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
+    state,
+    ALIGN_INPUTS,
+    REFERENCE_TIMES,
+    REFERENCE_CURVATURES,
+    3,
+    1.0,
+    0.0,
+    0.0,
+    ObserverStatus.ACTIVE,
+    action_time=0.20,
+  )
+  assert result.feedback_torque == 0.0
+  assert result.feedforward_torque == state.applied_torque
+  assert result.raw_command_torque == state.applied_torque
+  assert result.command_torque == state.applied_torque
+
+
+def test_action_uses_future_torque_only_when_exact_slew_requires_it():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
   base = np.full(len(times), 0.00001, dtype=np.float64)
   mutated = base.copy()
-  mutated[times >= 0.40] = np.linspace(
-    0.00001, 0.15, np.count_nonzero(times >= 0.40),
-  )
+  mutated[times >= 0.40] = 0.15
   first = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
     ALIGN_INPUTS,
@@ -357,6 +429,7 @@ def test_action_far_future_does_not_pull_current_torque_or_position():
   )
   first_position = first.desired_angle_deg
   first_command = first.command_torque
+  first_raw = first.raw_command_torque
   second = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
     ALIGN_INPUTS,
@@ -370,70 +443,42 @@ def test_action_far_future_does_not_pull_current_torque_or_position():
     action_time=0.20,
   )
   assert second.desired_angle_deg == first_position
+  # Both requests exceed one build step from zero, so their first emitted
+  # command is intentionally the same exact actuator limit.
   assert second.command_torque == first_command
-  assert second.raw_command_torque == first.raw_command_torque
-  assert not second.horizon_assist_active
-  assert second.horizon_demand_time_seconds == 0.0
+  assert second.raw_command_torque != first_raw
+  assert second.horizon_assist_active
+  # The five-point inverse stencil sees the 0.40 s curvature step beginning at
+  # 0.30 s; that derived physical demand is the first binding cell.
+  assert second.horizon_demand_time_seconds >= 0.30
 
 
-def test_action_authority_curve_reaches_static_load_at_transition():
+def test_future_turn_cannot_move_rack_before_time_aligned_reference():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
-  curvature = twin.curvature_from_angle(
-    ACTION_PARAMS.authority_transition_error_deg, 5.0, ALIGN_INPUTS,
-  )
-  curvatures = np.full(3, curvature, dtype=np.float64)
-  result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
-    state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
-    0.0, ObserverStatus.ACTIVE, action_time=0.20,
-  )
-  rate_feedback = (
-    PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max / 4.0
-  ) * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
-  assert math.isclose(
-    result.feedback_torque - rate_feedback,
-    PLANT_PARAMS.t_breakaway,
-    abs_tol=1e-12,
-  )
-  assert not result.breakaway_active
-  assert result.breakaway_persistence_frames == 0
-
-
-def test_action_authority_curve_is_continuous_at_transition():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
-  state = PlantState(0.0, 0.0, 0.0, 5.0)
-  transition = ACTION_PARAMS.authority_transition_error_deg
-  epsilon = 1e-5
-  position_feedback = []
-  for angle in (transition - epsilon, transition, transition + epsilon):
-    curvature = twin.curvature_from_angle(angle, 5.0, ALIGN_INPUTS)
+  times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
+  for direction in (-1.0, 1.0):
+    curvatures = np.zeros(len(times), dtype=np.float64)
+    curvatures[times >= 0.40] = direction * 0.15
     result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
       state,
       ALIGN_INPUTS,
-      REFERENCE_TIMES,
-      np.full(3, curvature, dtype=np.float64),
-      3,
+      times,
+      curvatures,
+      len(times),
       1.0,
-      0.0, 0.0, ObserverStatus.ACTIVE, action_time=0.20,
+      0.05,
+      0.0,
+      ObserverStatus.ACTIVE,
+      action_time=0.20,
     )
-    rate_feedback = (
-      PLANT_PARAMS.delta_up / PLANT_PARAMS.steer_max / 4.0
-    ) * (result.desired_rate_deg_s - result.predicted_rate_deg_s)
-    position_feedback.append(result.feedback_torque - rate_feedback)
-  assert position_feedback[0] < position_feedback[1] < position_feedback[2]
-  assert math.isclose(
-    (position_feedback[2] - position_feedback[1]) / epsilon,
-    ACTION_PARAMS.tracking_stiffness,
-    rel_tol=1e-9,
-  )
-  assert math.isclose(
-    (position_feedback[1] - position_feedback[0]) / epsilon,
-    ACTION_PARAMS.tracking_stiffness,
-    rel_tol=1e-4,
-  )
+    assert result.desired_angle_deg == 0.0
+    assert result.command_torque == 0.0
+    assert result.raw_command_torque == 0.0
+    assert result.no_lead_limited
 
 
-def test_action_authority_curve_is_stateless_across_reversals():
+def test_action_linear_residual_is_stateless_across_reversals():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
