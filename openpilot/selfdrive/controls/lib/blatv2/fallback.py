@@ -1,34 +1,45 @@
-"""Delay-compensated inverse-EPS computed-torque controller.
+"""Scalar-anchored, actuator-feasible inverse-EPS trajectory controller.
 
-The model scalar action is the authoritative steering-position target. The
-plan supplies coherent rate/acceleration at that action point. The measured
-rack is predicted through the physical actuator delay, then inverse rack
-dynamics combine the requested-position load, desired motion, and tracking
-error into one torque request.
+The model scalar remains the authoritative curvature at ``action_time``.
+The surrounding plan supplies the time-indexed rack position, rate,
+acceleration, and inverse physical torque on both sides of that anchor. The
+measured rack is predicted only to ``prediction_delay``, the instant this
+frame's request can affect it, and is compared with the reference at that same
+instant. Earlier versions compared the rack at the physical-effect time with
+the later scalar-action position. That made the wheel begin a turn early while
+the error-grown authority map and one-frame limiter still delivered its useful
+torque late.
 
-Two clocks are deliberately independent. ``action_time`` selects the
-model-authored scalar target and includes the learned end-to-end lateral lag.
-``prediction_delay`` advances the measured rack only until this command can
-physically affect it. Treating the learned lag as pure rack transport predicts
-the rack response twice and can make feedback cancel valid feedforward.
+The full inverse-torque path is now the command path, not a helper. The plant
+twin solves the request that reaches the scalar action at its existing
+authored timestamp, then rolls the same inverse law across the surrounding
+plan so finite rack dynamics are part of the demand. A deterministic backward
+reachability pass applies the exact asymmetric 409/4/7 transition physics and
+moves each build, release, or sign handoff no earlier than required. One
+linear residual term corrects measured and predicted rack error; steady
+holding authority comes from the requested-path load, never from tracking
+error remaining nonzero. A one-frame plant check prevents an anticipatory
+increment from moving the rack beyond the time-aligned model reference.
 
-This is not an arrival-time controller, preview boost, or
-tracking-versus-smoothness cost. Far-future curvature cannot pull the wheel
-ahead of the scalar action. Position error therefore asks for whatever torque
-the physical model requires now, including full normalized authority. The
-exact Hyundai 409/4/7 limiter remains the sole command-smoothing authority.
+There is no turn detector, persistence timer, preview boost, low-speed branch,
+integral, or torque-rate smoothing controller. Smoothness is the single exact
+actuator-feasible trajectory; swiftness is its latest feasible transition;
+strength is the unclipped inverse demand up to the normalized torque limit.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import numpy as np
 
-from openpilot.common.realtime import DT_MDL
+from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
+  MAX_DECISION_STEPS,
   RACK_RATE_QUANTUM_DEG_S,
+  measured_rack_friction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   DECISION_DT,
@@ -45,16 +56,22 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import (
 from openpilot.selfdrive.controls.lib.blatv2.reference import MODEL_ACTION_OFFSET
 
 
-class InverseEpsActionController:
-  """One scalar-faithful inverse-EPS command path.
+@dataclass(slots=True)
+class _InverseTerms:
+  angle_error: float = 0.0
+  rate_error: float = 0.0
+  required_acceleration: float = 0.0
+  aligning: float = 0.0
+  friction: float = 0.0
+  nominal_dynamic: float = 0.0
+  feedback: float = 0.0
+  feedforward: float = 0.0
+  dynamic: float = 0.0
+  target: float = 0.0
 
-  The linear position term keeps small corrections calm. A stateless,
-  continuously differentiable authority map supplies the rack's identified
-  static-load envelope as model-angle error becomes physically meaningful.
-  There is no persistence gate, boost state, integral, or preview scheduler:
-  the same error-to-torque law handles center corrections, sharp turns, and
-  unwinds.
-  """
+
+class InverseEpsActionController:
+  """One scalar-faithful, slew-feasible inverse-EPS command path."""
 
   def __init__(
     self,
@@ -67,9 +84,66 @@ class InverseEpsActionController:
     self.workspace = CandidateWorkspace() if workspace is None else workspace
     self.result = CandidateResult()
     self.predicted_state = PlantState(0.0, 0.0, 0.0, 0.0)
+    self.command_state = PlantState(0.0, 0.0, 0.0, 0.0)
+    self.command_next_state = PlantState(0.0, 0.0, 0.0, 0.0)
+    self.arrival_source_state = PlantState(0.0, 0.0, 0.0, 0.0)
+    self.arrival_state = PlantState(0.0, 0.0, 0.0, 0.0)
+    self.local_terms = _InverseTerms()
+    self.trajectory_times = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.trajectory_demands = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.trajectory_targets = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
+    self.trajectory_constraint_indices = np.empty(
+      MAX_DECISION_STEPS, dtype=np.int32,
+    )
+    self.command_history_capacity = int(
+      math.ceil(self.twin.params.actuation_delay / DT_CTRL)
+    )
+    self.command_history = np.empty(
+      max(self.command_history_capacity, 1), dtype=np.float64,
+    )
+    self.command_history_start = 0
+    self.command_history_count = 0
 
   def reset(self) -> None:
     self.result.invalidate()
+    self.command_history_start = 0
+    self.command_history_count = 0
+
+  def _remember_applied_torque(self, applied_torque: float) -> None:
+    """Append the last hardware/safety-limited command to the delay line."""
+    if self.command_history_capacity == 0:
+      return
+    if self.command_history_count < self.command_history_capacity:
+      index = (
+        self.command_history_start + self.command_history_count
+      ) % self.command_history_capacity
+      self.command_history_count += 1
+    else:
+      index = self.command_history_start
+      self.command_history_start = (
+        self.command_history_start + 1
+      ) % self.command_history_capacity
+    self.command_history[index] = float(applied_torque)
+
+  def _predict_to_effect_time(
+    self,
+    state: PlantState,
+    duration: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> None:
+    """Advance through commands already committed inside the pure delay."""
+    self.twin.predict_applied_history_into(
+      state,
+      duration,
+      self.command_history,
+      self.command_history_start,
+      self.command_history_count,
+      align_inputs,
+      disturbance_torque,
+      self.predicted_state,
+      DT_CTRL,
+    )
 
   @staticmethod
   def _interpolate(values: np.ndarray, position: float, count: int) -> float:
@@ -80,6 +154,418 @@ class InverseEpsActionController:
     return float(values[lower]) + fraction * (
       float(values[upper]) - float(values[lower])
     )
+
+  def _torque_transition_time(self, source: float, target: float) -> float:
+    """Exact continuous-time counterpart of :meth:`PlantTwin.apply_slew`."""
+    start = min(max(float(source), -1.0), 1.0)
+    finish = min(max(float(target), -1.0), 1.0)
+    if start == finish:
+      return 0.0
+    frame_seconds = DT_CTRL * self.twin.params.steer_step
+    build = self.twin.params.delta_up / self.twin.params.steer_max
+    decay = self.twin.params.delta_down / self.twin.params.steer_max
+    if start * finish >= 0.0:
+      budget = build if abs(finish) > abs(start) else decay
+      return abs(finish - start) / budget * frame_seconds
+    return (
+      abs(start) / decay + abs(finish) / build
+    ) * frame_seconds
+
+  def _latest_feasible_predecessor(
+    self,
+    desired_now: float,
+    feasible_next: float,
+    interval: float,
+  ) -> float:
+    """Move ``desired_now`` only enough to reach ``feasible_next`` on time."""
+    current = min(max(float(desired_now), -1.0), 1.0)
+    future = min(max(float(feasible_next), -1.0), 1.0)
+    duration = float(interval)
+    if not math.isfinite(duration) or duration <= 0.0:
+      raise ValueError("trajectory interval must be finite and positive")
+
+    # Solve the target's exact backward-reachable interval analytically. This
+    # is the inverse of apply_slew's decay-then-build sign crossing: going
+    # backward from a positive target first consumes build time down to zero,
+    # then permits an opposite-sign predecessor at the decay rate (mirrored
+    # for a negative target). Clamping the model demand to this interval is the
+    # unique latest feasible predecessor, with no search or tuning parameter.
+    frame_seconds = DT_CTRL * self.twin.params.steer_step
+    build_rate = (
+      self.twin.params.delta_up
+      / self.twin.params.steer_max
+      / frame_seconds
+    )
+    decay_rate = (
+      self.twin.params.delta_down
+      / self.twin.params.steer_max
+      / frame_seconds
+    )
+    if future > 0.0:
+      build_to_zero_time = future / build_rate
+      lower = (
+        future - build_rate * duration
+        if duration <= build_to_zero_time
+        else -decay_rate * (duration - build_to_zero_time)
+      )
+      upper = future + decay_rate * duration
+    elif future < 0.0:
+      build_to_zero_time = -future / build_rate
+      lower = future - decay_rate * duration
+      upper = (
+        future + build_rate * duration
+        if duration <= build_to_zero_time
+        else decay_rate * (duration - build_to_zero_time)
+      )
+    else:
+      lower = -decay_rate * duration
+      upper = decay_rate * duration
+    return min(max(current, max(lower, -1.0)), min(upper, 1.0))
+
+  def _project_inverse_trajectory(
+    self,
+    physical_effect_time: float,
+    local_target: float,
+    action_target: float,
+    action_time: float,
+  ) -> tuple[float, bool, float, float]:
+    """Return the current target of one planned, slew-feasible torque path.
+
+    The future cells are the model-authored inverse-EPS feedforward, not a
+    second closed-loop controller simulated against its own predictions.
+    Current measured-rack error is already applied once in ``action_target``;
+    feeding predicted future error backward through the slew projector makes
+    the present request chase corrections that have not happened. Receding
+    100 Hz evaluation handles the real residual on the next frame.
+    """
+    count = self.workspace.decision_count
+    last_time = float(self.workspace.decision_times[count - 1])
+    start_time = min(max(float(physical_effect_time), 0.0), last_time)
+    trajectory_count = min(
+      int(math.floor((last_time - start_time) / DECISION_DT + 1e-12)) + 1,
+      MAX_DECISION_STEPS,
+    )
+    if trajectory_count <= 0:
+      return float(local_target), False, 0.0, 0.0
+
+    for index in range(trajectory_count):
+      sample_time = start_time + index * DECISION_DT
+      self.trajectory_times[index] = sample_time
+      sample_position = sample_time / DECISION_DT
+      demand = self._interpolate(
+        self.workspace.feedforward, sample_position, count,
+      )
+      if index == 0:
+        # The scalar-pinned terminal solve supplies this frame's planned target
+        # with the one measured-rack correction already included.
+        demand = float(action_target)
+      self.trajectory_demands[index] = min(max(demand, -1.0), 1.0)
+
+    last = trajectory_count - 1
+    self.trajectory_targets[last] = self.trajectory_demands[last]
+    self.trajectory_constraint_indices[last] = last
+    for index in range(last - 1, -1, -1):
+      desired = float(self.trajectory_demands[index])
+      future = float(self.trajectory_targets[index + 1])
+      projected = self._latest_feasible_predecessor(
+        desired, future, DECISION_DT,
+      )
+      self.trajectory_targets[index] = projected
+      if projected == desired:
+        self.trajectory_constraint_indices[index] = index
+      else:
+        self.trajectory_constraint_indices[index] = (
+          self.trajectory_constraint_indices[index + 1]
+        )
+
+    target = float(self.trajectory_targets[0])
+    projected = target != float(self.trajectory_demands[0])
+    active = target != float(local_target)
+    if not active:
+      return target, False, 0.0, 0.0
+    if projected:
+      constraint_index = int(self.trajectory_constraint_indices[0])
+      binding_demand = float(self.trajectory_demands[constraint_index])
+      binding_time = float(self.trajectory_times[constraint_index])
+    else:
+      binding_demand = float(action_target)
+      binding_time = float(action_time)
+    return (
+      target,
+      True,
+      binding_demand,
+      binding_time,
+    )
+
+  def _solve_terminal_request(
+    self,
+    source: PlantState,
+    duration: float,
+    target_value: float,
+    nominal_request: float,
+    rate_target: bool,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> float:
+    """Return the least change from nominal that reaches one terminal state."""
+    nominal = min(max(float(nominal_request), -1.0), 1.0)
+    self.twin.predict_constant_request_into(
+      source,
+      duration,
+      nominal,
+      align_inputs,
+      disturbance_torque,
+      self.arrival_state,
+      DT_CTRL,
+    )
+    nominal_value = (
+      self.arrival_state.rate_deg_s
+      if rate_target else self.arrival_state.angle_deg
+    )
+    target = float(target_value)
+    if nominal_value == target:
+      return nominal
+    if nominal_value < target:
+      low = nominal
+      high = 1.0
+      self.twin.predict_constant_request_into(
+        source,
+        duration,
+        high,
+        align_inputs,
+        disturbance_torque,
+        self.arrival_state,
+        DT_CTRL,
+      )
+      high_value = (
+        self.arrival_state.rate_deg_s
+        if rate_target else self.arrival_state.angle_deg
+      )
+      if target >= high_value:
+        return high
+    else:
+      low = -1.0
+      high = nominal
+      self.twin.predict_constant_request_into(
+        source,
+        duration,
+        low,
+        align_inputs,
+        disturbance_torque,
+        self.arrival_state,
+        DT_CTRL,
+      )
+      low_value = (
+        self.arrival_state.rate_deg_s
+        if rate_target else self.arrival_state.angle_deg
+      )
+      if target <= low_value:
+        return low
+    for _ in range(12):
+      request = 0.5 * (low + high)
+      self.twin.predict_constant_request_into(
+        source,
+        duration,
+        request,
+        align_inputs,
+        disturbance_torque,
+        self.arrival_state,
+        DT_CTRL,
+      )
+      value = (
+        self.arrival_state.rate_deg_s
+        if rate_target else self.arrival_state.angle_deg
+      )
+      if value < target:
+        low = request
+      else:
+        high = request
+    return 0.5 * (low + high)
+
+  def _action_point_feedforward(
+    self,
+    action_time: float,
+    physical_effect_time: float,
+    desired_start_angle: float,
+    desired_start_rate: float,
+    desired_action_angle: float,
+    desired_action_rate: float,
+    action_speed: float,
+    local_feedforward: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> float:
+    """Solve planned torque that carries the desired rack to the scalar.
+
+    Feedforward starts on the model-authored rack trajectory, not on the
+    measured rack. This keeps requested-path torque independent of tracking
+    error; the one linear residual term is added exactly once by ``compute``.
+    The actuator state remains the real queued state, so the solve still owns
+    the torque needed to overcome current slew lag. Twelve fixed bisections
+    resolve finer than one Hyundai torque count and introduce no response-time
+    or feel constant.
+    """
+    duration = float(action_time) - float(physical_effect_time)
+    if duration <= 0.0:
+      return float(local_feedforward)
+    source = self.arrival_source_state
+    source.angle_deg = float(desired_start_angle)
+    source.rate_deg_s = float(desired_start_rate)
+    source.applied_torque = self.predicted_state.applied_torque
+    source.v_ego = float(action_speed)
+    angle_request = self._solve_terminal_request(
+      source,
+      duration,
+      desired_action_angle,
+      local_feedforward,
+      False,
+      align_inputs,
+      disturbance_torque,
+    )
+    rate_request = self._solve_terminal_request(
+      source,
+      duration,
+      desired_action_rate,
+      local_feedforward,
+      True,
+      align_inputs,
+      disturbance_torque,
+    )
+    motion = float(desired_action_angle) - float(desired_start_angle)
+    if motion == 0.0:
+      motion = float(desired_action_rate) - float(desired_start_rate)
+    if motion > 0.0:
+      return max(angle_request, rate_request)
+    if motion < 0.0:
+      return min(angle_request, rate_request)
+    return angle_request
+
+  def _fill_inverse_terms(
+    self,
+    terms: _InverseTerms,
+    rack_state: PlantState,
+    desired_angle: float,
+    desired_rate: float,
+    desired_acceleration: float,
+    speed: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> None:
+    """Evaluate the one inverse-EPS law for measured or predicted rack state."""
+    angle_error = float(desired_angle) - rack_state.angle_deg
+    rate_error = float(desired_rate) - rack_state.rate_deg_s
+    rate_damping = (
+      self.twin.params.delta_up
+      / self.twin.params.steer_max
+      / RACK_RATE_QUANTUM_DEG_S
+    )
+    feedback = self.params.tracking_stiffness * angle_error
+    feedback += rate_damping * rate_error
+    required_acceleration = (
+      float(desired_acceleration)
+      + self.twin.params.b_steer * rate_error
+      + self.twin.params.k_t * feedback
+    )
+    aligning = self.twin.aligning_torque_values(
+      desired_angle, speed, align_inputs,
+    )
+    friction = measured_rack_friction(
+      rack_state.rate_deg_s,
+      required_acceleration,
+      self.twin.params.t_breakaway,
+      self.params.kinetic_friction,
+    )
+    nominal_dynamic = (
+      float(desired_acceleration)
+      + self.twin.params.b_steer * float(desired_rate)
+    ) / self.twin.params.k_t
+    feedforward = (
+      aligning
+      + float(disturbance_torque)
+      + friction
+      + nominal_dynamic
+    )
+    terms.angle_error = angle_error
+    terms.rate_error = rate_error
+    terms.required_acceleration = required_acceleration
+    terms.aligning = aligning
+    terms.friction = friction
+    terms.nominal_dynamic = nominal_dynamic
+    terms.feedback = feedback
+    terms.feedforward = feedforward
+    terms.dynamic = nominal_dynamic + feedback
+    terms.target = feedforward + feedback
+
+  def _next_angle(
+    self,
+    command: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> float:
+    state = self.command_state
+    state.angle_deg = self.predicted_state.angle_deg
+    state.rate_deg_s = self.predicted_state.rate_deg_s
+    state.applied_torque = float(command)
+    state.v_ego = self.predicted_state.v_ego
+    self.twin.predict_held_state_into(
+      state,
+      DT_CTRL,
+      align_inputs,
+      disturbance_torque,
+      self.command_next_state,
+      DT_CTRL,
+    )
+    return self.command_next_state.angle_deg
+
+  def _limit_anticipatory_lead(
+    self,
+    applied_torque: float,
+    local_command: float,
+    trajectory_command: float,
+    desired_next_angle: float,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+  ) -> tuple[float, bool]:
+    """Prevent only the future-trajectory increment from leading the path."""
+    path_delta = desired_next_angle - self.predicted_state.angle_deg
+    if path_delta == 0.0:
+      return local_command, trajectory_command != local_command
+    direction = math.copysign(1.0, path_delta)
+    if direction * (trajectory_command - local_command) <= 0.0:
+      return trajectory_command, False
+    if direction * (
+      self._next_angle(
+        trajectory_command, align_inputs, disturbance_torque,
+      )
+      - desired_next_angle
+    ) <= 0.0:
+      return trajectory_command, False
+
+    # The local time-aligned inverse is the lower-authority bound. Restricting
+    # the future increment can never make the local controller less capable.
+    safe = float(local_command)
+    leading = float(trajectory_command)
+    if direction < 0.0:
+      safe, leading = leading, safe
+    for _ in range(20):
+      middle = 0.5 * (safe + leading)
+      leads = direction * (
+        self._next_angle(middle, align_inputs, disturbance_torque)
+        - desired_next_angle
+      ) > 0.0
+      if direction > 0.0:
+        if leads:
+          leading = middle
+        else:
+          safe = middle
+      elif leads:
+        safe = middle
+      else:
+        leading = middle
+    target = safe if direction > 0.0 else leading
+    reachable_low = self.twin.apply_slew(applied_torque, -1.0)
+    reachable_high = self.twin.apply_slew(applied_torque, 1.0)
+    return min(max(target, reachable_low), reachable_high), True
 
   def compute(
     self,
@@ -128,8 +614,16 @@ class InverseEpsActionController:
           "physical prediction delay must be finite and non-negative"
         )
 
-      sample_position = action_sample_time / DECISION_DT
       count = self.workspace.decision_count
+      # The scalar is anchored at action_sample_time, but the command computed
+      # now first affects the rack at physical_prediction_delay. Compare states
+      # at that same physical instant; never ask the earlier rack state to be
+      # at the later scalar position.
+      tracking_sample_time = min(
+        physical_prediction_delay,
+        float(self.workspace.decision_times[count - 1]),
+      )
+      sample_position = tracking_sample_time / DECISION_DT
       desired_angle = self._interpolate(
         self.workspace.desired_angles, sample_position, count,
       )
@@ -142,92 +636,45 @@ class InverseEpsActionController:
       action_speed = self._interpolate(
         self.workspace.reference_speeds, sample_position, count,
       )
-      # Compensate only the physical control-to-rack delay. This is state
-      # estimation, not path lead: the position target remains the scalar.
-      self.twin.predict_held_state_into(
+      action_position = action_sample_time / DECISION_DT
+      desired_action_angle = self._interpolate(
+        self.workspace.desired_angles, action_position, count,
+      )
+      desired_action_rate = self._interpolate(
+        self.workspace.desired_rates, action_position, count,
+      )
+      action_point_speed = self._interpolate(
+        self.workspace.reference_speeds, action_position, count,
+      )
+      # Compensate only the physical control-to-rack delay. Commands emitted
+      # during that interval are already queued, so replay their actual
+      # trajectory rather than pretending the newest torque was present for
+      # the whole delay. This is state estimation, not path lead: the position
+      # target remains the scalar at its authored action timestamp.
+      self._remember_applied_torque(state.applied_torque)
+      self._predict_to_effect_time(
         state,
         physical_prediction_delay,
         align_inputs,
         float(disturbance_torque),
-        self.predicted_state,
-        DECISION_DT,
       )
       self.predicted_state.v_ego = action_speed
 
-      # Position stiffness and rate damping have different physical jobs and
-      # different measurement quality. Versions through v214 tied both to one
-      # pole-rate dial; raising useful angle authority also amplified the
-      # 4-deg/s-quantized rack-rate signal into highway chatter. Position
-      # stiffness is explicit. Rate damping is bounded so one sensor quantum
-      # can change feedback by at most one Hyundai torque build step.
-      angle_error = desired_angle - self.predicted_state.angle_deg
-      rate_error = desired_rate - self.predicted_state.rate_deg_s
-      rate_damping = (
-        self.twin.params.delta_up
-        / self.twin.params.steer_max
-        / RACK_RATE_QUANTUM_DEG_S
-      )
-      transition_error_deg = self.params.authority_transition_error_deg
-      normalized_error = min(
-        abs(angle_error) / transition_error_deg, 1.0,
-      )
-      smoothstep = normalized_error * normalized_error * (
-        3.0 - 2.0 * normalized_error
-      )
-      static_authority = max(
-        self.twin.params.t_breakaway
-        - self.params.tracking_stiffness * transition_error_deg,
-        0.0,
-      )
-      position_feedback = (
-        math.copysign(
-          self.params.tracking_stiffness * abs(angle_error)
-          + static_authority * smoothstep,
-          angle_error,
-        )
-        if angle_error != 0.0
-        else 0.0
-      )
-      feedback = position_feedback + rate_damping * rate_error
-      required_acceleration = (
-        desired_acceleration
-        + self.twin.params.b_steer * rate_error
-        + self.twin.params.k_t * feedback
-      )
-
-      # Feed the load required by the model-requested rack position, not the
-      # load at the lagging measured position. Using the latter makes the
-      # steady-load term preserve the old turn while feedback tries to enter
-      # or reverse it; route bc exposed that cancellation directly. The
-      # calibrated aligning map is already the inverse static plant, so its
-      # desired-state value is the physically required trajectory feedforward.
-      aligning = self.twin.aligning_torque_values(
+      # The same inverse law evaluates the measured state now and each
+      # predicted state in the horizon. The rollout therefore exposes future
+      # tracking demand before the slew projection, instead of assuming the
+      # rack will remain exactly on the feedforward trajectory.
+      self._fill_inverse_terms(
+        self.local_terms,
+        self.predicted_state,
         desired_angle,
+        desired_rate,
+        desired_acceleration,
         action_speed,
         align_inputs,
+        disturbance_torque,
       )
-      friction = (
-        math.copysign(self.params.kinetic_friction, state.rate_deg_s)
-        if abs(state.rate_deg_s) > 0.5 * RACK_RATE_QUANTUM_DEG_S
-        else 0.0
-      )
-      nominal_dynamic = (
-        desired_acceleration
-        + self.twin.params.b_steer * desired_rate
-      ) / self.twin.params.k_t
-      dynamic = nominal_dynamic + feedback
-      feedforward = (
-        aligning
-        + float(disturbance_torque)
-        + friction
-        + nominal_dynamic
-      )
-      raw_command = (
-        aligning
-        + float(disturbance_torque)
-        + friction
-        + dynamic
-      )
+      raw_command = self.local_terms.target
       if not math.isfinite(raw_command):
         result.invalidate(state.applied_torque, CandidateStatus.NON_CONVERGED)
         result.candidate_count = 1
@@ -235,40 +682,109 @@ class InverseEpsActionController:
         return result
 
       local_target = min(max(raw_command, -1.0), 1.0)
-      command = self.twin.apply_slew(
+      local_command = self.twin.apply_slew(
         state.applied_torque, local_target,
       )
+      action_feedforward = self._action_point_feedforward(
+        action_sample_time,
+        tracking_sample_time,
+        desired_angle,
+        desired_rate,
+        desired_action_angle,
+        desired_action_rate,
+        action_point_speed,
+        self.local_terms.feedforward,
+        align_inputs,
+        disturbance_torque,
+      )
+      action_target = min(max(
+        action_feedforward + self.local_terms.feedback,
+        -1.0,
+      ), 1.0)
+      (
+        trajectory_target,
+        trajectory_active,
+        trajectory_demand,
+        trajectory_demand_time,
+      ) = self._project_inverse_trajectory(
+        tracking_sample_time,
+        local_target,
+        action_target,
+        action_sample_time,
+      )
+      trajectory_command = self.twin.apply_slew(
+        state.applied_torque, trajectory_target,
+      )
+      no_lead_limited = False
+      final_target = trajectory_target
+      if trajectory_active and trajectory_command != local_command:
+        next_sample_position = (
+          tracking_sample_time + DT_CTRL
+        ) / DECISION_DT
+        desired_next_angle = self._interpolate(
+          self.workspace.desired_angles,
+          next_sample_position,
+          count,
+        )
+        final_target, no_lead_limited = self._limit_anticipatory_lead(
+          state.applied_torque,
+          local_command,
+          trajectory_command,
+          desired_next_angle,
+          align_inputs,
+          disturbance_torque,
+        )
+      command = self.twin.apply_slew(
+        state.applied_torque, final_target,
+      )
+      trajectory_active = bool(
+        trajectory_active
+        and (
+          command != local_command
+          if no_lead_limited
+          else trajectory_target != local_target
+        )
+      )
+      if not trajectory_active:
+        trajectory_demand = 0.0
+        trajectory_demand_time = 0.0
+
       result.command_torque = command
-      result.raw_command_torque = local_target
-      result.feedforward_torque = feedforward
-      result.feedback_torque = feedback
+      result.raw_command_torque = final_target
+      result.feedforward_torque = self.local_terms.feedforward
+      result.feedback_torque = self.local_terms.feedback
       result.desired_angle_deg = desired_angle
       result.desired_rate_deg_s = desired_rate
       result.desired_acceleration_deg_s2 = desired_acceleration
       result.predicted_angle_deg = self.predicted_state.angle_deg
       result.predicted_rate_deg_s = self.predicted_state.rate_deg_s
-      result.required_acceleration_deg_s2 = required_acceleration
+      result.required_acceleration_deg_s2 = (
+        self.local_terms.required_acceleration
+      )
       result.action_speed_mps = action_speed
-      result.aligning_torque = aligning
-      result.friction_torque = friction
-      result.dynamic_torque = dynamic
+      result.aligning_torque = self.local_terms.aligning
+      result.friction_torque = self.local_terms.friction
+      result.dynamic_torque = self.local_terms.dynamic
       result.action_time_seconds = action_sample_time
       result.prediction_delay_seconds = physical_prediction_delay
-      result.slew_constrained = command != local_target
+      result.slew_constrained = command != final_target
       result.breakaway_active = False
       result.breakaway_persistence_frames = 0
-      # Wire-compatible retired-v207 diagnostics. The corresponding ordinals
-      # remain reserved, but the second torque authority is gone.
-      result.horizon_assist_active = False
-      result.horizon_torque_demand = 0.0
-      result.horizon_demand_time_seconds = 0.0
-      result.no_lead_limited = False
+      # Re-activate the original wire meanings. These diagnostics describe the
+      # future demand that made the current exact-slew trajectory differ from
+      # the local inverse; they are no longer a second command authority.
+      result.horizon_assist_active = trajectory_active
+      result.horizon_torque_demand = trajectory_demand
+      result.horizon_demand_time_seconds = trajectory_demand_time
+      result.no_lead_limited = no_lead_limited
       result.status = CandidateStatus.OK
       result.candidate_count = 1
       result.available_schedule_count = 1
       result.optimality_residual = 0.0
       return result
     except (ValueError, OverflowError):
+      self.command_history_start = 0
+      self.command_history_count = 0
       result.invalidate(state.applied_torque, CandidateStatus.INPUT_INVALID)
       return result
 
