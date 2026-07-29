@@ -40,8 +40,8 @@ def test_shadow_runs_below_controlsd_without_competing_on_one_core():
 
 
 def test_shadow_v13_schema_has_signed_rate_and_exact_v14_fields():
-  assert SHADOW_VERSION == 14
-  assert LIVE_CONTROLLER_VERSION == 218
+  assert SHADOW_VERSION == 15
+  assert LIVE_CONTROLLER_VERSION == 219
   schema = Path("openpilot/cereal/log.capnp").read_text()
   assert "vEgo @9 :Float64;" in schema
   assert "aligningTorque @10 :Float64;" in schema

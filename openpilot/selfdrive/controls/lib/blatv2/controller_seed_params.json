@@ -37,7 +37,7 @@
     "units": "normalized torque/deg",
     "owner_feel_dial": true,
     "provisional": true,
-    "provenance": "v218 uses the existing calm slope only for linear measured-rack residual correction at the physical-effect time. Requested-path feedforward and its exact slew-feasible trajectory own build, hold, release, and full authority."
+    "provenance": "v219 uses the existing calm slope only for linear measured-rack residual correction at the physical-effect time. Requested-path feedforward and its exact state/slew-feasible trajectory own build, hold, release, and full authority."
   },
   "tau_disturbance": {
     "value": 0.5,

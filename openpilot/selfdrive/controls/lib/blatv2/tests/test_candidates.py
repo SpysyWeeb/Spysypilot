@@ -1,6 +1,7 @@
 import json
 import math
 from pathlib import Path
+import struct
 
 import numpy as np
 
@@ -93,9 +94,9 @@ def test_shared_sigma_values_are_marked_as_provisional_owner_feel_dials():
     "owner_feel_dial": True,
     "provisional": True,
     "provenance": (
-      "v218 uses the existing calm slope only for linear measured-rack " +
+      "v219 uses the existing calm slope only for linear measured-rack " +
       "residual correction at the physical-effect time. Requested-path " +
-      "feedforward and its exact slew-feasible trajectory own build, hold, " +
+      "feedforward and its exact state/slew-feasible trajectory own build, hold, " +
       "release, and full authority."
     ),
   }
@@ -336,6 +337,27 @@ def test_trajectory_predecessor_is_latest_value_that_reaches_next_cell():
   ) > DECISION_DT
 
 
+def test_action_point_target_reaches_authored_angle_or_uses_full_authority():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  candidate.predicted_state.angle_deg = 0.0
+  candidate.predicted_state.rate_deg_s = 0.0
+  candidate.predicted_state.applied_torque = 0.0
+  candidate.predicted_state.v_ego = 5.0
+  target = candidate._action_point_target(
+    0.30, 0.0, 3.0, 5.0, 0.0, ALIGN_INPUTS, 0.0,
+  )
+  source = PlantState(0.0, 0.0, 0.0, 5.0)
+  reached = PlantState(0.0, 0.0, 0.0, 5.0)
+  twin.predict_constant_request_into(
+    source, 0.30, target, ALIGN_INPUTS, 0.0, reached, 0.01,
+  )
+  assert abs(reached.angle_deg - 3.0) < 0.01
+  assert candidate._action_point_target(
+    0.30, 0.0, 100.0, 5.0, 0.0, ALIGN_INPUTS, 0.0,
+  ) == 1.0
+
+
 def test_action_tracks_reference_at_physical_effect_time_not_later_scalar_time():
   twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
@@ -476,6 +498,40 @@ def test_future_turn_cannot_move_rack_before_time_aligned_reference():
     assert result.command_torque == 0.0
     assert result.raw_command_torque == 0.0
     assert result.no_lead_limited
+
+
+def test_action_raw_request_reproduces_reported_slew_command_bit_exactly():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
+  random = np.random.default_rng(219)
+  for _ in range(32):
+    state = PlantState(
+      float(random.uniform(-20.0, 20.0)),
+      float(random.uniform(-12.0, 12.0)),
+      float(random.uniform(-1.0, 1.0)),
+      float(random.uniform(2.0, 25.0)),
+    )
+    curvatures = np.cumsum(
+      random.normal(0.0, 0.0015, len(times)),
+    )
+    result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
+      state,
+      ALIGN_INPUTS,
+      times,
+      curvatures,
+      len(times),
+      1.0,
+      float(random.uniform(0.05, 0.20)),
+      0.0,
+      ObserverStatus.ACTIVE,
+      action_time=float(random.uniform(0.25, 0.60)),
+    )
+    replayed = twin.apply_slew(
+      state.applied_torque, result.raw_command_torque,
+    )
+    assert struct.pack("<d", replayed) == struct.pack(
+      "<d", result.command_torque,
+    )
 
 
 def test_action_linear_residual_is_stateless_across_reversals():

@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
   V14ShadowResult,
 )
 
-SHADOW_VERSION = 14
+SHADOW_VERSION = 15
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
