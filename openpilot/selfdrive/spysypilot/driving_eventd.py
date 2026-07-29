@@ -970,6 +970,20 @@ class EventSubmitter:
     return retried
 
 
+def log_retry_warning(event_id: object) -> None:
+  """Log a retry after converting Cap'n Proto/string-like IDs at the boundary.
+
+  ``cloudlog.warning`` is the standard logging interface, not the structured
+  ``cloudlog.event`` interface. Passing a DynamicStruct (or any other
+  non-primitive) as a keyword argument reaches the cereal encoder and can
+  terminate this passive process. Rendering here keeps the log useful and the
+  process independent of the ID object's implementation type.
+  """
+  cloudlog.warning(
+    f"driving_eventd: retrying unacknowledged event {event_id}"
+  )
+
+
 def longitudinal_sample(sm: messaging.SubMaster) -> LaunchSample:
   lead = sm["radarState"].leadOne
   leads_v3 = sm["modelV2"].leadsV3
@@ -1260,7 +1274,7 @@ def main() -> None:
       cloudlog.event("driving_event", event_id=event.event_id, group_id=event.group_id,
                      domain=event.candidate.domain, event_type=event.candidate.event_type)
     for event_id in submitter.retry_due():
-      cloudlog.warning("driving_eventd: retrying unacknowledged event", event_id=event_id)
+      log_retry_warning(event_id)
 
 
 if __name__ == "__main__":
