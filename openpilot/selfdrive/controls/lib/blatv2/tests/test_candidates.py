@@ -6,6 +6,8 @@ import numpy as np
 
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
+  RACK_ANGLE_QUANTUM_DEG,
+  RACK_RATE_QUANTUM_DEG_S,
   decision_cell_coulomb_direction,
   decision_cell_friction,
   measured_rack_friction,
@@ -300,7 +302,7 @@ def test_action_subthreshold_center_noise_never_arms_breakaway():
   state = PlantState(0.0, 0.0, 0.0, 17.0)
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   for frame in range(20):
-    curvature = 0.0001 if frame % 2 == 0 else -0.0001
+    curvature = 0.00001 if frame % 2 == 0 else -0.00001
     result = candidate.compute(
       state,
       ALIGN_INPUTS,
@@ -315,6 +317,51 @@ def test_action_subthreshold_center_noise_never_arms_breakaway():
     )
     assert not result.breakaway_active
     assert result.friction_torque == 0.0
+
+
+def test_action_breakaway_is_one_shot_until_error_resolves_or_reverses():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  state = PlantState(1.0, 0.0, 0.0, 20.7)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  curvatures = np.full(3, 0.000575, dtype=np.float64)
+
+  for _ in range(5):
+    result = candidate.compute(
+      state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
+      0.0, ObserverStatus.ACTIVE, action_time=0.20,
+    )
+  assert ACTION_PARAMS.sigma_curvature > curvatures[0]
+  assert (
+    abs(result.desired_angle_deg - result.predicted_angle_deg)
+    >= RACK_ANGLE_QUANTUM_DEG
+  )
+  assert result.breakaway_active
+  assert abs(result.friction_torque) == PLANT_PARAMS.t_breakaway
+
+  state.rate_deg_s = -RACK_RATE_QUANTUM_DEG_S
+  result = candidate.compute(
+    state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
+    0.0, ObserverStatus.ACTIVE, action_time=0.20,
+  )
+  assert not result.breakaway_active
+  assert candidate.breakaway_completed
+
+  state.rate_deg_s = 0.0
+  for _ in range(20):
+    result = candidate.compute(
+      state, ALIGN_INPUTS, REFERENCE_TIMES, curvatures, 3, 1.0, 0.0,
+      0.0, ObserverStatus.ACTIVE, action_time=0.20,
+    )
+    assert not result.breakaway_active
+    assert result.friction_torque == 0.0
+
+  reverse = np.full(3, -0.000575, dtype=np.float64)
+  for _ in range(5):
+    result = candidate.compute(
+      state, ALIGN_INPUTS, REFERENCE_TIMES, reverse, 3, 1.0, 0.0,
+      0.0, ObserverStatus.ACTIVE, action_time=0.20,
+    )
+  assert result.breakaway_active
 
 
 def test_action_breakaway_transitions_continuously_to_kinetic_friction():

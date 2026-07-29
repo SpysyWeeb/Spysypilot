@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 211
+LIVE_CONTROLLER_VERSION = 212
 
 
 class CandidateStatus(IntEnum):
