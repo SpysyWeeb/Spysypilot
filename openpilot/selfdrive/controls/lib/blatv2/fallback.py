@@ -28,6 +28,7 @@ import numpy as np
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
+  RACK_ANGLE_QUANTUM_DEG,
   RACK_RATE_QUANTUM_DEG_S,
   measured_rack_friction,
 )
@@ -86,7 +87,6 @@ class InverseEpsActionController:
   def _update_breakaway(
     self,
     measured_rate_deg_s: float,
-    curvature_error: float,
     departure_direction: float,
   ) -> float:
     """Return friction for a real stick/slip episode, never plan jitter.
@@ -94,23 +94,23 @@ class InverseEpsActionController:
     Route bb showed that treating every sub-quantum rate as static applied
     nearly full breakaway on 99.6% of highway frames. Static compensation is
     now armed only by one model period of persistent, same-direction tracking
-    error while the measured rack is inside half a sensor quantum. It remains
-    active through the first full quantum so the 0.09 -> 0.03 transition is
-    continuous, then moving-rack compensation is kinetic only.
+    displacement of at least one measured angle count while the rack is inside
+    half a rate count. It remains active through the first full rate count so
+    the 0.09 -> 0.03 transition is continuous, then moving-rack compensation
+    is kinetic only.
     """
     measured_rate = float(measured_rate_deg_s)
-    error = float(curvature_error)
     departure = float(departure_direction)
     direction = 0.0 if departure == 0.0 else math.copysign(1.0, departure)
     stationary = abs(measured_rate) <= 0.5 * RACK_RATE_QUANTUM_DEG_S
-    error_large = abs(error) >= self.params.sigma_curvature
+    displacement_resolved = abs(departure) >= RACK_ANGLE_QUANTUM_DEG
     same_direction = direction != 0.0 and direction == self.breakaway_direction
 
     if self.breakaway_active:
       if (
         direction == 0.0
         or direction != self.breakaway_direction
-        or not error_large
+        or not displacement_resolved
       ):
         self.breakaway_active = False
         self.breakaway_persistence_frames = 0
@@ -118,7 +118,7 @@ class InverseEpsActionController:
       elif abs(measured_rate) >= RACK_RATE_QUANTUM_DEG_S:
         self.breakaway_active = False
         self.breakaway_persistence_frames = 0
-    elif stationary and error_large and direction != 0.0:
+    elif stationary and displacement_resolved and direction != 0.0:
       if same_direction:
         self.breakaway_persistence_frames += 1
       else:
@@ -199,9 +199,6 @@ class InverseEpsActionController:
       desired_acceleration = self._interpolate(
         self.workspace.desired_accelerations, sample_position, count,
       )
-      desired_curvature = self._interpolate(
-        self.workspace.reference_curvatures, sample_position, count,
-      )
       action_speed = self._interpolate(
         self.workspace.reference_speeds, sample_position, count,
       )
@@ -242,14 +239,8 @@ class InverseEpsActionController:
         action_speed,
         align_inputs,
       )
-      predicted_curvature = self.twin.curvature_from_angle(
-        self.predicted_state.angle_deg,
-        action_speed,
-        align_inputs,
-      )
       friction = self._update_breakaway(
         state.rate_deg_s,
-        desired_curvature - predicted_curvature,
         angle_error,
       )
       dynamic = (
