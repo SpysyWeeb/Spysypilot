@@ -16,9 +16,11 @@ import re
 
 LEARNING_STATUS_SCHEMA_VERSION = 1
 LIFECYCLE_STATUS_SCHEMA_VERSION = 1
+LEARNING_OPERATION_STATUS_SCHEMA_VERSION = 1
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_OPERATION_ID_RE = re.compile(r"[0-9a-f]{32}")
 _TOP_LEVEL_KEYS = frozenset((
   "schema_version",
   "informational_only",
@@ -79,6 +81,28 @@ _LIFECYCLE_KEYS = frozenset((
   "staged_profile",
   "rejected_profile_count",
 ))
+_OPERATION_KEYS = frozenset((
+  "schema_version",
+  "informational_only",
+  "state",
+  "diagnostic",
+  "operation_id",
+  "sequence",
+  "started_mono_ns",
+  "updated_mono_ns",
+  "terminal",
+  "vehicle_identity",
+  "runtime_identity_sha256",
+  "current_route_identity",
+  "current_route_index",
+  "total_route_count",
+  "last_route_identity",
+  "accepted_sample_count",
+  "rejected_sample_count",
+  "retry_count",
+  "evidence_sha256",
+  "ledger_sha256",
+))
 _PROFILE_IDENTITY_KEYS = frozenset((
   "artifact_sha256",
   "profile_sha256",
@@ -138,6 +162,68 @@ _ARTIFACT_DIAGNOSTICS = frozenset((
   "state_invalid",
   "state_stale_build",
 ))
+_OPERATION_STATE_DIAGNOSTICS = {
+  "preparing": frozenset(("waiting_for_car_params", "restoring_runtime")),
+  "ready_no_evidence": frozenset(("ready_for_first_drive",)),
+  "collecting": frozenset(("collecting_current_drive",)),
+  "finalizing": frozenset((
+    "finalizing_drive",
+    "verifying_backfill",
+    "publishing_backfill",
+  )),
+  "retry_pending": frozenset(("persist_retry_pending",)),
+  "backfilling": frozenset(("scanning_routes", "replaying_route")),
+  "idle": frozenset((
+    "evidence_ready",
+    "backfill_complete",
+    "backfill_complete_late_older_skipped",
+    "backfill_complete_with_rejections",
+  )),
+  "drive_skipped_identity_mismatch": frozenset(("car_params_identity_mismatch",)),
+  "failed": frozenset((
+    "runtime_restore_failed",
+    "backfill_reader_unavailable",
+    "backfill_route_incompatible",
+    "backfill_corrupt_log",
+    "backfill_nondeterministic",
+    "backfill_publish_failed",
+    "backfill_untracked_evidence",
+    "backfill_no_complete_routes",
+    "unexpected_error",
+  )),
+}
+_TERMINAL_OPERATION_STATES = frozenset((
+  "ready_no_evidence",
+  "idle",
+  "drive_skipped_identity_mismatch",
+  "failed",
+))
+_OPERATION_DIAGNOSTIC_LABELS = {
+  "waiting_for_car_params": "Waiting for vehicle configuration",
+  "restoring_runtime": "Restoring the prepared learning runtime",
+  "ready_for_first_drive": "Ready to collect the first drive",
+  "collecting_current_drive": "Collecting clean evidence from this drive",
+  "finalizing_drive": "Validating and saving the completed drive",
+  "verifying_backfill": "Verifying replayed route evidence",
+  "publishing_backfill": "Publishing the rebuilt evidence snapshot",
+  "persist_retry_pending": "Saving failed; a safe retry is pending",
+  "scanning_routes": "Scanning compatible routes on device",
+  "replaying_route": "Replaying a compatible historical route",
+  "evidence_ready": "Validated learning evidence is ready",
+  "backfill_complete": "Historical route processing is complete",
+  "backfill_complete_late_older_skipped": ("Backfill complete; late older routes were safely skipped"),
+  "backfill_complete_with_rejections": ("Backfill complete; incompatible routes were rejected"),
+  "car_params_identity_mismatch": ("Vehicle configuration changed; prepared for the next drive"),
+  "runtime_restore_failed": "Prepared learner runtime could not be restored",
+  "backfill_reader_unavailable": "Historical route reader is unavailable",
+  "backfill_route_incompatible": "A historical route is incompatible",
+  "backfill_corrupt_log": "A historical route log is corrupt",
+  "backfill_nondeterministic": "Historical replay did not reproduce exactly",
+  "backfill_publish_failed": "Rebuilt evidence could not be published",
+  "backfill_untracked_evidence": ("Backfill unavailable: stored evidence has no route ledger"),
+  "backfill_no_complete_routes": "No complete compatible routes were found",
+  "unexpected_error": "The learner reported an unexpected error",
+}
 
 
 class LearningStatusError(ValueError):
@@ -235,6 +321,44 @@ class LearningStatus:
   @property
   def qualified_node_count(self) -> int:
     return sum(node.qualified for node in self.nodes)
+
+
+@dataclass(frozen=True, slots=True)
+class LearningOperationStatus:
+  """Display-only state of learner collection, finalization, and backfill."""
+
+  state: str
+  diagnostic: str
+  operation_id: str
+  sequence: int
+  started_mono_ns: int
+  updated_mono_ns: int
+  terminal: bool
+  vehicle_identity: str | None
+  runtime_identity_sha256: str | None
+  current_route_identity: str | None
+  current_route_index: int | None
+  total_route_count: int | None
+  last_route_identity: str | None
+  accepted_sample_count: int
+  rejected_sample_count: int
+  retry_count: int
+  evidence_sha256: str | None
+  ledger_sha256: str | None
+
+  @property
+  def active(self) -> bool:
+    return not self.terminal
+
+
+@dataclass(frozen=True, slots=True)
+class OperationPresentation:
+  """Pure presentation model shared by both dashboard pages."""
+
+  title: str
+  detail: str
+  tone: str
+  show_banner: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,12 +469,31 @@ def _text(value: object, field: str) -> str:
   return value.strip()
 
 
+def _nullable_text(value: object, field: str) -> str | None:
+  if value is None:
+    return None
+  result = _text(value, field)
+  if len(result) > 256:
+    raise LearningStatusError("malformed", f"{field} exceeds 256 characters")
+  return result
+
+
 def _sha256(value: object, field: str, *, nullable: bool = False) -> str | None:
   if nullable and value is None:
     return None
   result = _text(value, field)
   if _SHA256_RE.fullmatch(result) is None:
     raise LearningStatusError("malformed", f"{field} must be lowercase SHA-256")
+  return result
+
+
+def _operation_id(value: object, field: str) -> str:
+  result = _text(value, field)
+  if _OPERATION_ID_RE.fullmatch(result) is None:
+    raise LearningStatusError(
+      "malformed",
+      f"{field} must be 32 lowercase hexadecimal characters",
+    )
   return result
 
 
@@ -635,6 +778,285 @@ def parse_learning_status(
   )
 
 
+def parse_learning_operation_status(
+  raw: object,
+  *,
+  expected_vehicle_identity: str | None,
+  expected_runtime_identity_sha256: str | None,
+  now_mono_ns: int,
+) -> LearningOperationStatus:
+  """Decode the learner's operational projection without inferring history.
+
+  The status is rebuildable and display-only. Its monotonic timestamps share
+  the current manager boot because the Params key clears on manager start.
+  There is deliberately no UI-defined age timeout: the backend owns
+  transitions, retry, and failure. A timestamp from a future monotonic epoch
+  is rejected as stale rather than displayed indefinitely.
+  """
+  if raw is None:
+    raise LearningStatusError(
+      "operation_absent",
+      "Learner operation status has not been published",
+    )
+  if type(now_mono_ns) is not int or now_mono_ns < 0:
+    raise ValueError("now_mono_ns must be a non-negative integer")
+  if type(raw) is not dict:
+    raise LearningStatusError(
+      "malformed",
+      "learner operation status must be a Params JSON object",
+    )
+  if (
+    type(raw.get("schema_version")) is not int
+    or raw["schema_version"] != LEARNING_OPERATION_STATUS_SCHEMA_VERSION
+  ):
+    raise LearningStatusError(
+      "schema_mismatch",
+      "Learner operation status version is not supported",
+    )
+  data = _exact_object(raw, _OPERATION_KEYS, "learner operation status")
+  if data["informational_only"] is not True:
+    raise LearningStatusError(
+      "malformed",
+      "Learner operation status is not marked display-only",
+    )
+
+  state = _text(data["state"], "state")
+  if state not in _OPERATION_STATE_DIAGNOSTICS:
+    raise LearningStatusError("malformed", "operation state is not recognized")
+  diagnostic = _text(data["diagnostic"], "diagnostic")
+  if diagnostic not in _OPERATION_STATE_DIAGNOSTICS[state]:
+    raise LearningStatusError(
+      "malformed",
+      "operation diagnostic does not match its state",
+    )
+
+  terminal = _bool(data["terminal"], "terminal")
+  if terminal != (state in _TERMINAL_OPERATION_STATES):
+    raise LearningStatusError(
+      "malformed",
+      "operation terminal flag does not match its state",
+    )
+
+  started_mono_ns = _integer(data["started_mono_ns"], "started_mono_ns")
+  updated_mono_ns = _integer(data["updated_mono_ns"], "updated_mono_ns")
+  if updated_mono_ns < started_mono_ns:
+    raise LearningStatusError(
+      "stale",
+      "Learner operation timestamp precedes its start",
+    )
+  if updated_mono_ns > now_mono_ns:
+    raise LearningStatusError(
+      "stale",
+      "Learner operation status belongs to another monotonic epoch",
+    )
+
+  vehicle_identity = _nullable_text(
+    data["vehicle_identity"],
+    "vehicle_identity",
+  )
+  identity_optional_states = frozenset(("preparing", "failed"))
+  if vehicle_identity is None and state not in identity_optional_states:
+    raise LearningStatusError(
+      "malformed",
+      "operation state requires a vehicle identity",
+    )
+  if vehicle_identity is not None:
+    if expected_vehicle_identity is None or not expected_vehicle_identity.strip():
+      raise LearningStatusError(
+        "vehicle_unavailable",
+        "Current vehicle identity is unavailable",
+      )
+    if vehicle_identity != expected_vehicle_identity.strip():
+      raise LearningStatusError(
+        "wrong_vehicle",
+        "Learner operation belongs to a different vehicle",
+      )
+
+  runtime_identity = _sha256(
+    data["runtime_identity_sha256"],
+    "runtime_identity_sha256",
+    nullable=True,
+  )
+  runtime_optional_states = frozenset((
+    "preparing",
+    "failed",
+    "drive_skipped_identity_mismatch",
+  ))
+  if runtime_identity is None and state not in runtime_optional_states:
+    raise LearningStatusError(
+      "malformed",
+      "operation state requires a runtime identity",
+    )
+  if (
+    runtime_identity is not None
+    and expected_runtime_identity_sha256 is not None
+    and runtime_identity != expected_runtime_identity_sha256
+  ):
+    raise LearningStatusError(
+      "runtime_mismatch",
+      "Learning snapshot and operation describe different runtimes",
+    )
+
+  current_route_identity = _sha256(
+    data["current_route_identity"],
+    "current_route_identity",
+    nullable=True,
+  )
+  current_route_index = _integer(
+    data["current_route_index"],
+    "current_route_index",
+    nullable=True,
+  )
+  total_route_count = _integer(
+    data["total_route_count"],
+    "total_route_count",
+    nullable=True,
+  )
+  index_pair_complete = (
+    current_route_index is not None and total_route_count is not None
+  )
+  index_pair_empty = current_route_index is None and total_route_count is None
+  if not (index_pair_complete or index_pair_empty):
+    raise LearningStatusError(
+      "malformed",
+      "route index and total must both be present or absent",
+    )
+  if index_pair_complete and (
+    current_route_index < 1
+    or total_route_count < 1
+    or current_route_index > total_route_count
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "route progress is outside its one-based bounds",
+    )
+  if index_pair_complete and current_route_identity is None:
+    raise LearningStatusError(
+      "malformed",
+      "indexed route progress lacks a route identity",
+    )
+  if state != "backfilling" and not index_pair_empty:
+    raise LearningStatusError(
+      "malformed",
+      "only backfill operations may publish route progress",
+    )
+  if (
+    current_route_identity is not None
+    and state not in ("collecting", "backfilling")
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "operation state cannot claim a current route",
+    )
+  if (
+    state == "backfilling"
+    and diagnostic == "replaying_route"
+    and (not index_pair_complete or current_route_identity is None)
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "route replay requires complete progress",
+    )
+  if (
+    state == "backfilling"
+    and diagnostic == "scanning_routes"
+    and (not index_pair_empty or current_route_identity is not None)
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "route scanning cannot claim replay progress",
+    )
+
+  evidence_sha256 = _sha256(
+    data["evidence_sha256"],
+    "evidence_sha256",
+    nullable=True,
+  )
+  ledger_sha256 = _sha256(
+    data["ledger_sha256"],
+    "ledger_sha256",
+    nullable=True,
+  )
+  if state == "idle" and evidence_sha256 is None:
+    raise LearningStatusError(
+      "malformed",
+      "idle operation status lacks persisted evidence identity",
+    )
+  if state == "ready_no_evidence" and (
+    evidence_sha256 is not None
+    or ledger_sha256 is not None
+    or data["accepted_sample_count"] != 0
+    or data["rejected_sample_count"] != 0
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "ready-no-evidence operation unexpectedly claims evidence",
+    )
+  if ledger_sha256 is not None and evidence_sha256 is None:
+    raise LearningStatusError(
+      "malformed",
+      "backfill ledger identity lacks persisted evidence identity",
+    )
+
+  return LearningOperationStatus(
+    state=state,
+    diagnostic=diagnostic,
+    operation_id=_operation_id(data["operation_id"], "operation_id"),
+    sequence=_integer(data["sequence"], "sequence"),
+    started_mono_ns=started_mono_ns,
+    updated_mono_ns=updated_mono_ns,
+    terminal=terminal,
+    vehicle_identity=vehicle_identity,
+    runtime_identity_sha256=runtime_identity,
+    current_route_identity=current_route_identity,
+    current_route_index=current_route_index,
+    total_route_count=total_route_count,
+    last_route_identity=_sha256(
+      data["last_route_identity"],
+      "last_route_identity",
+      nullable=True,
+    ),
+    accepted_sample_count=_integer(
+      data["accepted_sample_count"],
+      "accepted_sample_count",
+    ),
+    rejected_sample_count=_integer(
+      data["rejected_sample_count"],
+      "rejected_sample_count",
+    ),
+    retry_count=_integer(data["retry_count"], "retry_count"),
+    evidence_sha256=evidence_sha256,
+    ledger_sha256=ledger_sha256,
+  )
+
+
+def validate_operation_update(
+  previous: LearningOperationStatus | None,
+  current: LearningOperationStatus,
+) -> None:
+  """Reject a regressed or mutated sequence within one operation."""
+  if previous is None or previous.operation_id != current.operation_id:
+    return
+  if current.sequence < previous.sequence:
+    raise LearningStatusError(
+      "stale",
+      "Learner operation sequence moved backward",
+    )
+  if current.sequence == previous.sequence and current != previous:
+    raise LearningStatusError(
+      "stale",
+      "Learner operation changed without advancing its sequence",
+    )
+  if (
+    current.sequence > previous.sequence
+    and current.updated_mono_ns <= previous.updated_mono_ns
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Learner operation advanced with a stale timestamp",
+    )
+
+
 def _profile_identity(value: object, field: str) -> ProfileIdentity | None:
   if value is None:
     return None
@@ -809,6 +1231,138 @@ def parse_lifecycle_status(
       "rejected_profile_count",
     ),
   )
+
+
+def operation_presentation(
+  status: LearningOperationStatus | None,
+  *,
+  error_code: str | None,
+  error_message: str | None,
+  has_learning_snapshot: bool,
+) -> OperationPresentation:
+  """Return truthful copy without treating absence as an empty history."""
+  if status is None:
+    unavailable = error_message or "Awaiting the learner's current status"
+    if error_code == "operation_absent":
+      unavailable = "Awaiting learner status; drive history is unknown"
+    return OperationPresentation(
+      title="LEARNER STATUS UNAVAILABLE",
+      detail=unavailable,
+      tone=("gray" if error_code in (None, "operation_absent", "vehicle_unavailable") else "red"),
+      show_banner=has_learning_snapshot,
+    )
+
+  prior = "Prior snapshot shown · " if has_learning_snapshot and status.active else ""
+  counts = f"{status.accepted_sample_count:,} accepted · {status.rejected_sample_count:,} rejected"
+  diagnostic = _OPERATION_DIAGNOSTIC_LABELS[status.diagnostic]
+
+  if status.state == "preparing":
+    return OperationPresentation(
+      title="PREPARING LEARNER",
+      detail=f"{prior}{diagnostic}",
+      tone="blue",
+      show_banner=has_learning_snapshot,
+    )
+  if status.state == "ready_no_evidence":
+    return OperationPresentation(
+      title="READY FOR FIRST DRIVE",
+      detail="Complete one drive to begin collecting clean support",
+      tone="blue",
+      show_banner=has_learning_snapshot,
+    )
+  if status.state == "collecting":
+    return OperationPresentation(
+      title="COLLECTING THIS DRIVE",
+      detail=f"{prior}{counts}",
+      tone="blue",
+      show_banner=has_learning_snapshot,
+    )
+  if status.state == "finalizing":
+    return OperationPresentation(
+      title="FINALIZING LEARNING DATA",
+      detail=f"{prior}{diagnostic}",
+      tone="blue",
+      show_banner=has_learning_snapshot,
+    )
+  if status.state == "retry_pending":
+    retry = f"Retry {status.retry_count} pending"
+    return OperationPresentation(
+      title="SAVE RETRY PENDING",
+      detail=f"{prior}{retry} · {counts}",
+      tone="amber",
+      show_banner=has_learning_snapshot,
+    )
+  if status.state == "backfilling":
+    if status.diagnostic == "scanning_routes":
+      progress = "Scanning compatible routes"
+    else:
+      progress = f"Route {status.current_route_index}/{status.total_route_count}"
+    return OperationPresentation(
+      title="PROCESSING PRIOR ROUTES",
+      detail=f"{prior}{progress} · {counts}",
+      tone="blue",
+      show_banner=has_learning_snapshot,
+    )
+  if status.state == "idle":
+    return OperationPresentation(
+      title="LEARNER READY",
+      detail=diagnostic,
+      tone="green",
+      show_banner=has_learning_snapshot,
+    )
+  if status.state == "drive_skipped_identity_mismatch":
+    return OperationPresentation(
+      title="DRIVE SKIPPED · NEXT DRIVE READY",
+      detail=diagnostic,
+      tone="amber",
+      show_banner=has_learning_snapshot,
+    )
+  return OperationPresentation(
+    title="LEARNER FAILED",
+    detail=diagnostic,
+    tone="red",
+    show_banner=has_learning_snapshot,
+  )
+
+
+def learning_panel_presentation(
+  status: LearningOperationStatus | None,
+  *,
+  operation_error_code: str | None,
+  operation_error_message: str | None,
+  learning_error_code: str | None,
+  learning_error_message: str | None,
+  has_learning_snapshot: bool,
+) -> OperationPresentation:
+  """Plan the banner or empty state without discarding a valid snapshot."""
+  operation = operation_presentation(
+    status,
+    error_code=operation_error_code,
+    error_message=operation_error_message,
+    has_learning_snapshot=has_learning_snapshot,
+  )
+  if has_learning_snapshot:
+    return operation
+
+  # An explicit ready_no_evidence status is the only authority for first-drive
+  # copy. Missing caches reveal nothing about drive history.
+  if status is not None and status.state != "idle":
+    return operation
+  if learning_error_code not in (None, "absent", "vehicle_unavailable"):
+    return OperationPresentation(
+      title="LEARNING DATA UNAVAILABLE",
+      detail=(learning_error_message or "Validated current-build data could not be read"),
+      tone="red",
+      show_banner=False,
+    )
+  if status is not None and status.state == "idle":
+    return OperationPresentation(
+      title="LEARNING SNAPSHOT UNAVAILABLE",
+      detail=(learning_error_message or "Learner is ready, but its validated snapshot is unavailable"),
+      tone="red",
+      show_banner=False,
+    )
+  return operation
 
 
 def reason_label(reason: str) -> str:

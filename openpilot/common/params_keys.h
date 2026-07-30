@@ -129,6 +129,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"UsbGpuActive", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"UsbGpuLoading", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"Version", {PERSISTENT, STRING}},
+    {"BLaTv2LearningOperationStatus", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2LearningStatus", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2LifecycleStatus", {CLEAR_ON_MANAGER_START, JSON}},
 };

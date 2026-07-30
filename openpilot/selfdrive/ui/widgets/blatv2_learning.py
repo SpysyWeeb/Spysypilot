@@ -12,6 +12,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   GridCell,
+  LearningOperationStatus,
   LearningNodeStatus,
   LearningStatus,
   LearningStatusError,
@@ -19,10 +20,13 @@ from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   format_duration,
   format_speed,
   grid_cells,
+  learning_panel_presentation,
+  parse_learning_operation_status,
   parse_learning_status,
   parse_lifecycle_status,
   reason_label,
   select_value_provider,
+  validate_operation_update,
 )
 from openpilot.system.ui.lib.application import FontWeight, gui_app
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -49,6 +53,9 @@ class DashboardSnapshot:
   learning: LearningStatus | None
   learning_error_code: str | None
   learning_error: str | None
+  operation: LearningOperationStatus | None
+  operation_error_code: str | None
+  operation_error: str | None
   lifecycle: LifecycleStatus | None
   lifecycle_error_code: str | None
   lifecycle_error: str | None
@@ -84,6 +91,9 @@ class BLaTv2LearningStatusSource:
       learning=None,
       learning_error_code="absent",
       learning_error="Learning data is not available yet",
+      operation=None,
+      operation_error_code="operation_absent",
+      operation_error="Learner operation status has not been published",
       lifecycle=None,
       lifecycle_error_code="activation_absent",
       lifecycle_error="Controller status is not available yet",
@@ -133,6 +143,49 @@ class BLaTv2LearningStatusSource:
       learning_error_code = "malformed"
       learning_error = "Learning snapshot could not be read"
 
+    operation: LearningOperationStatus | None = None
+    operation_error_code: str | None = None
+    operation_error: str | None = None
+    try:
+      operation = parse_learning_operation_status(
+        self._read_param("BLaTv2LearningOperationStatus"),
+        expected_vehicle_identity=expected_vehicle,
+        expected_runtime_identity_sha256=(
+          learning.runtime_identity_sha256
+          if learning is not None
+          else (
+            self._snapshot.learning.runtime_identity_sha256
+            if self._snapshot.learning is not None
+            else None
+          )
+        ),
+        now_mono_ns=time.monotonic_ns(),
+      )
+      validate_operation_update(self._snapshot.operation, operation)
+    except LearningStatusError as exc:
+      operation_error_code = exc.code
+      operation_error = str(exc)
+    except Exception:
+      operation_error_code = "malformed"
+      operation_error = "Learner operation status could not be read"
+
+    # Params snapshots are atomic individually, not across keys. If an active
+    # operation is observed between its status writes, preserve the most
+    # recent validated in-memory learning snapshot rather than blanking the
+    # dashboard. Runtime and vehicle identity must still match.
+    prior_learning = self._snapshot.learning
+    if (
+      learning is None
+      and learning_error_code == "absent"
+      and operation is not None
+      and operation.active
+      and prior_learning is not None
+      and operation.vehicle_identity == prior_learning.vehicle_identity
+      and operation.runtime_identity_sha256
+      == prior_learning.runtime_identity_sha256
+    ):
+      learning = prior_learning
+
     lifecycle: LifecycleStatus | None = None
     lifecycle_error_code: str | None = None
     lifecycle_error: str | None = None
@@ -160,6 +213,9 @@ class BLaTv2LearningStatusSource:
       learning=learning,
       learning_error_code=learning_error_code,
       learning_error=learning_error,
+      operation=operation,
+      operation_error_code=operation_error_code,
+      operation_error=operation_error,
       lifecycle=lifecycle,
       lifecycle_error_code=lifecycle_error_code,
       lifecycle_error=lifecycle_error,
@@ -200,9 +256,26 @@ class _BLaTv2Page(Widget):
   def _error_color(code: str | None) -> rl.Color:
     return (
       _RED
-      if code not in (None, "absent", "activation_absent", "vehicle_unavailable")
+      if code
+      not in (
+        None,
+        "absent",
+        "activation_absent",
+        "operation_absent",
+        "vehicle_unavailable",
+      )
       else _GRAY
     )
+
+  @staticmethod
+  def _tone_color(tone: str) -> rl.Color:
+    return {
+      "gray": _GRAY,
+      "blue": _BLUE,
+      "amber": _AMBER,
+      "green": _GREEN,
+      "red": _RED,
+    }.get(tone, _RED)
 
   @staticmethod
   def _lifecycle_color(lifecycle: LifecycleStatus | None) -> rl.Color:
@@ -274,19 +347,76 @@ class _BLaTv2Page(Widget):
     )
     return rect.y + 72
 
+  def _draw_operation_banner(
+    self,
+    rect: rl.Rectangle,
+    y: float,
+    snapshot: DashboardSnapshot,
+  ) -> float:
+    presentation = learning_panel_presentation(
+      snapshot.operation,
+      operation_error_code=snapshot.operation_error_code,
+      operation_error_message=snapshot.operation_error,
+      learning_error_code=snapshot.learning_error_code,
+      learning_error_message=snapshot.learning_error,
+      has_learning_snapshot=snapshot.learning is not None,
+    )
+    if not presentation.show_banner:
+      return y
+
+    color = self._tone_color(presentation.tone)
+    banner = rl.Rectangle(rect.x + 32, y, rect.width - 64, 58)
+    rl.draw_rectangle_rounded(banner, 0.15, 8, rl.fade(color, 0.16))
+    rl.draw_rectangle_rounded_lines_ex(banner, 0.15, 8, 1, color)
+    medium = gui_app.font(FontWeight.MEDIUM)
+    normal = gui_app.font(FontWeight.NORMAL)
+    rl.draw_text_ex(
+      medium,
+      presentation.title,
+      rl.Vector2(int(banner.x + 16), int(banner.y + 7)),
+      18,
+      0,
+      color,
+    )
+    detail_font_size = 18
+    detail_width = measure_text_cached(
+      normal,
+      presentation.detail,
+      detail_font_size,
+    ).x
+    if detail_width > banner.width - 32:
+      detail_font_size = max(
+        14,
+        int(detail_font_size * (banner.width - 32) / detail_width),
+      )
+    rl.draw_text_ex(
+      normal,
+      presentation.detail,
+      rl.Vector2(int(banner.x + 16), int(banner.y + 32)),
+      detail_font_size,
+      0,
+      _DIM,
+    )
+    return y + 68
+
   def _draw_unavailable(
     self,
     rect: rl.Rectangle,
-    *,
-    code: str | None,
-    message: str | None,
+    snapshot: DashboardSnapshot,
   ) -> None:
     font = gui_app.font(FontWeight.NORMAL)
     bold = gui_app.font(FontWeight.BOLD)
-    color = self._error_color(code)
+    presentation = learning_panel_presentation(
+      snapshot.operation,
+      operation_error_code=snapshot.operation_error_code,
+      operation_error_message=snapshot.operation_error,
+      learning_error_code=snapshot.learning_error_code,
+      learning_error_message=snapshot.learning_error,
+      has_learning_snapshot=False,
+    )
+    color = self._tone_color(presentation.tone)
     center_y = int(rect.y + rect.height * 0.46)
-    first_drive = code == "absent"
-    title = "NO LEARNING DATA YET" if first_drive else "LEARNING DATA UNAVAILABLE"
+    title = presentation.title
     title_size = measure_text_cached(bold, title, 36)
     rl.draw_text_ex(
       bold,
@@ -299,12 +429,15 @@ class _BLaTv2Page(Widget):
       0,
       color,
     )
-    detail = (
-      "Complete one drive to begin collecting clean support"
-      if first_drive
-      else message or "Validated current-build data has not been published"
-    )
-    detail_size = measure_text_cached(font, detail, 27)
+    detail = presentation.detail
+    detail_font_size = 27
+    detail_size = measure_text_cached(font, detail, detail_font_size)
+    if detail_size.x > rect.width - 80:
+      detail_font_size = max(
+        18,
+        int(detail_font_size * (rect.width - 80) / detail_size.x),
+      )
+      detail_size = measure_text_cached(font, detail, detail_font_size)
     rl.draw_text_ex(
       font,
       detail,
@@ -312,7 +445,7 @@ class _BLaTv2Page(Widget):
         int(rect.x + (rect.width - detail_size.x) / 2),
         center_y + 54,
       ),
-      27,
+      detail_font_size,
       0,
       _DIM,
     )
@@ -327,12 +460,9 @@ class BLaTv2LearningOverviewWidget(_BLaTv2Page):
     content_y = self._draw_header(rect, "BLATV2 LEARNING", snapshot)
     learning = snapshot.learning
     if learning is None:
-      self._draw_unavailable(
-        rect,
-        code=snapshot.learning_error_code,
-        message=snapshot.learning_error,
-      )
+      self._draw_unavailable(rect, snapshot)
       return
+    content_y = self._draw_operation_banner(rect, content_y, snapshot)
 
     normal = gui_app.font(FontWeight.NORMAL)
     bold = gui_app.font(FontWeight.BOLD)
@@ -504,12 +634,9 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
     )
     learning = snapshot.learning
     if learning is None:
-      self._draw_unavailable(
-        rect,
-        code=snapshot.learning_error_code,
-        message=snapshot.learning_error,
-      )
+      self._draw_unavailable(rect, snapshot)
       return
+    content_y = self._draw_operation_banner(rect, content_y, snapshot)
 
     pad = 32
     x = rect.x + pad

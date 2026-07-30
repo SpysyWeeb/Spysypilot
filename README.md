@@ -14,7 +14,9 @@ cycling windows. Tap the left half to go back or the right half to advance:
 
 1. **BLaTv2 Learning** — a two-column grid of the vehicle's learned speed
    nodes. Each node shows credited clean support, its node-specific minimum,
-   qualification state, and the last completed drive's contribution.
+   qualification state, and the last completed drive's contribution. A
+   prominent banner reports live collection, finalization, retry, and
+   historical-route processing without replacing the last validated snapshot.
 2. **Readiness & Activation** — time, held-out validation, motion/excitation,
    and fit status for every node, plus an independent controller lifecycle
    rail.
@@ -30,10 +32,15 @@ continuously, so a node is not a hard speed-mode switch.
 ## How it works
 
 The two BLaTv2 pages share one rate-limited reader. It polls no faster than
-once every two seconds and strictly decodes two versioned JSON Params caches:
+once every two seconds and strictly decodes three versioned JSON Params caches:
 
 - `BLaTv2LearningStatus` is an informational projection of persisted learner
   evidence and qualification reports.
+- `BLaTv2LearningOperationStatus` is a separate, display-only projection of
+  what the learner is doing now. It reports preparation, live collection,
+  finalization, retry, deterministic historical-route backfill, completion,
+  skip, and failure states. Backfill progress uses one-based route counts and
+  cumulative accepted/rejected sample counts.
 - `BLaTv2LifecycleStatus` is a sanitized projection produced by the owner of
   the validated activation state. The UI deliberately never parses
   `BLaTv2ActivationState` itself.
@@ -42,6 +49,14 @@ Both caches clear at manager start and remain unavailable until the current
 build republishes them. The reader cross-checks their vehicle and runtime
 identity. Missing, malformed, incompatible, or wrong-vehicle data is shown as
 unavailable and never guessed.
+
+Operational status never replaces persisted results. While a drive is being
+finalized or older compatible routes are being replayed, both learning pages
+continue to show the prior validated `BLaTv2LearningStatus` snapshot beneath
+the processing banner. Missing operational and learning caches mean only
+**status unavailable / awaiting learner**; they do not prove that the vehicle
+has never driven. The first-drive instruction appears only when the learner
+explicitly publishes `ready_no_evidence`.
 
 The UI never parses rlogs, evidence, manifests, or profiles. It never trains,
 fits, stages, approves, resets, or writes learning state. A full time bar means
@@ -59,6 +74,15 @@ Only `BLaTv2LifecycleStatus` may label a controller provisional or approved.
 - **Red:** an actual fit rejection, corrupt snapshot, or rollback condition.
 - **Gray:** no evidence or unavailable current-build status.
 
+Learner operation colors follow the same vocabulary: blue for active
+preparation/collection/processing, amber for a pending retry or an
+identity-change drive skip, green for ready persisted evidence, and red for an
+explicit backend failure or rejected status schema. An identity-change skip
+states that the learner is prepared for the next drive. Historical routes
+older than the committed append-only watermark are reported as safely skipped;
+legacy evidence without a route ledger reports backfill unavailable rather
+than risking double-counting.
+
 The activation rail is:
 
 `Collecting → Complete profile → Replay/safety approval → Provisional → Approved`
@@ -72,10 +96,12 @@ shows **Stock active**; rollback pending also reports effective stock.
 - `openpilot/selfdrive/ui/layouts/home.py` — four-page carousel with two BLaTv2
   pages followed by the existing terminal and system pages.
 - `openpilot/selfdrive/ui/widgets/blatv2_learning_status.py` — dependency-free,
-  strict display schema parser and formatting/layout helpers.
+  strict learning, operation, and lifecycle display-schema parsers plus
+  formatting/layout helpers.
 - `openpilot/selfdrive/ui/widgets/blatv2_learning.py` — the two pure-reader
   pages and shared two-second cache.
-- `openpilot/common/params_keys.h` — rebuildable display-status JSON keys.
+- `openpilot/common/params_keys.h` — rebuildable learning, operation, and
+  lifecycle display-status JSON keys.
 - Removed the five route-analyzer widgets, `drive_statsd`, its process
   registration, and its now-unused `Spysy*Stats` Params.
 - `terminal_widget.py`, `system_stats.py`, and their behavior are unchanged.
