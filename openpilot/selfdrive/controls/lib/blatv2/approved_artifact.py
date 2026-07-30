@@ -734,6 +734,13 @@ class PersistentProfileActivation:
   def rejected_profile_identities(self) -> tuple[ProfileIdentity, ...]:
     return self._state.rejected_profile_identities
 
+  @property
+  def state_sha256(self) -> str | None:
+    """Identity of the already-validated activation state for display caches."""
+    if not self._state_valid:
+      return None
+    return _sha256_text(_canonical_json(self._state.to_param()))
+
   def _parse_artifact(
     self,
     value: object,
