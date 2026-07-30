@@ -488,6 +488,10 @@ def setRouteViewed(route: str) -> dict[str, int | str]:
 
 def startLocalProxy(global_end_event: threading.Event, remote_ws_uri: str, local_port: int) -> dict[str, int]:
   try:
+    # migration, can be removed once 0.9.8 is out for a while
+    if local_port == 8022:
+      local_port = 22
+
     if local_port not in LOCAL_PORT_WHITELIST:
       raise Exception("Requested local port not whitelisted")
 
@@ -576,7 +580,7 @@ def startStream(sdp: str, enabled: bool) -> dict:
       if CP.notCar:
         bridge_services_in.append("testJoystick")
   else:
-      raise Exception("failed to get CarParamsPersistent")
+    raise Exception("failed to get CarParamsPersistent")
 
   if params.get_bool("IsOffroad"):
     # manager owns camerad/stream_encoderd/webrtcd; flip the param and let it bring them up.
@@ -585,7 +589,7 @@ def startStream(sdp: str, enabled: bool) -> dict:
     # wait for webrtcd end points to wake up
     wait_for_webrtcd()
 
-  return post_stream_request(StreamRequestBody(sdp, "wideRoad", enabled, bridge_services_in, ["carState", "deviceState"]))
+  return post_stream_request(StreamRequestBody(sdp, ["wideRoad"], enabled, bridge_services_in, ["carState", "deviceState"]))
 
 
 def get_logs_to_send_sorted() -> list[str]:

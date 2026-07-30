@@ -1,7 +1,6 @@
 import math
 
-import pytest
-
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized
 
 from openpilot.cereal import log
@@ -21,8 +20,7 @@ def get_controller(car_name):
   controller = LatControlTorque(CP.as_reader(), CI, DT_CTRL)
   return controller, VM
 
-
-class TestLatControlTorqueBuffer:
+class TestLatControlTorqueBuffer(OpenpilotTestCase):
   @staticmethod
   def set_curvature(car_state, vehicle_model, curvature):
     car_state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, car_state.vEgo, 0.0))
@@ -47,7 +45,7 @@ class TestLatControlTorqueBuffer:
     assert all(val == 0 for val in controller.lat_accel_request_buffer)
     assert all(val == 0 for val in controller.curvature_request_buffer)
 
-  @pytest.mark.parametrize(("buffer_speed", "feedback_speed"), [(10.0, 20.0), (20.0, 10.0)])
+  @parameterized.expand([(10.0, 20.0), (20.0, 10.0)])
   def test_feedback_uses_current_speed_for_delayed_curvature(self, buffer_speed, feedback_speed):
     controller, vehicle_model = get_controller(TOYOTA.TOYOTA_COROLLA_TSS2)
     car_state = car.CarState.new_message()
@@ -69,12 +67,12 @@ class TestLatControlTorqueBuffer:
     aligned_reference = curvature * feedback_speed**2
     legacy_reference = curvature * buffer_speed**2
     assert torque_log.version == VERSION
-    assert torque_log.error == pytest.approx(0.0, abs=1e-6)
-    assert torque_log.desiredLateralAccel == pytest.approx(aligned_reference)
-    assert torque_log.actualLateralAccel == pytest.approx(aligned_reference)
-    assert torque_log.delayedDesiredCurvature == pytest.approx(curvature)
-    assert torque_log.legacyDesiredLateralAccel == pytest.approx(legacy_reference)
-    assert torque_log.speedAlignmentCorrection == pytest.approx(aligned_reference - legacy_reference)
+    self.assertAlmostEqual(torque_log.error, 0.0, delta=1e-6)
+    self.assertAlmostEqual(torque_log.desiredLateralAccel, aligned_reference, delta=1e-6)
+    self.assertAlmostEqual(torque_log.actualLateralAccel, aligned_reference, delta=1e-6)
+    self.assertAlmostEqual(torque_log.delayedDesiredCurvature, curvature, delta=1e-6)
+    self.assertAlmostEqual(torque_log.legacyDesiredLateralAccel, legacy_reference, delta=1e-6)
+    self.assertAlmostEqual(torque_log.speedAlignmentCorrection, aligned_reference - legacy_reference, delta=1e-6)
 
   def test_constant_speed_reference_is_unchanged(self):
     controller, vehicle_model = get_controller(TOYOTA.TOYOTA_COROLLA_TSS2)
@@ -92,7 +90,7 @@ class TestLatControlTorqueBuffer:
 
     assert torque_log is not None
     expected_lateral_accel = curvature * car_state.vEgo**2
-    assert torque_log.error == pytest.approx(0.0, abs=1e-6)
-    assert torque_log.desiredLateralAccel == pytest.approx(expected_lateral_accel)
-    assert torque_log.legacyDesiredLateralAccel == pytest.approx(expected_lateral_accel)
-    assert torque_log.speedAlignmentCorrection == pytest.approx(0.0, abs=1e-7)
+    self.assertAlmostEqual(torque_log.error, 0.0, delta=1e-6)
+    self.assertAlmostEqual(torque_log.desiredLateralAccel, expected_lateral_accel, delta=1e-6)
+    self.assertAlmostEqual(torque_log.legacyDesiredLateralAccel, expected_lateral_accel, delta=1e-6)
+    self.assertAlmostEqual(torque_log.speedAlignmentCorrection, 0.0, delta=1e-7)

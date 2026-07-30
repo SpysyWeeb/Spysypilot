@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-import pytest
-
+from openpilot.common.parameterized import parameterized
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.spysypilot.rolling_lead_response_detector import (
   EPISODE_COOLDOWN_S,
   RollingLeadResponseDetector,
@@ -84,7 +84,7 @@ def run(detector: RollingLeadResponseDetector, end: float, state_fn, start: floa
   return events
 
 
-class TestRollingLeadResponseDetector:
+class TestRollingLeadResponseDetector(OpenpilotTestCase):
   def test_planner_late_while_gap_opens(self):
     detector = RollingLeadResponseDetector()
     events = run(detector, 5.0, lambda t: pullaway_sample(t, plan_onset=2.8, output_onset=2.9, ego_onset=3.0))
@@ -172,7 +172,7 @@ class TestRollingLeadResponseDetector:
 
     assert run(detector, 5.0, state) == []
 
-  @pytest.mark.parametrize("failure", ["track", "cutin"])
+  @parameterized.expand(["track", "cutin"])
   def test_track_change_or_cutin_is_silent(self, failure):
     detector = RollingLeadResponseDetector()
 
@@ -197,7 +197,7 @@ class TestRollingLeadResponseDetector:
 
     assert run(detector, 5.0, state) == []
 
-  @pytest.mark.parametrize("pedal", ["gas_pressed", "brake_pressed"])
+  @parameterized.expand(["gas_pressed", "brake_pressed"])
   def test_driver_input_cancels(self, pedal):
     detector = RollingLeadResponseDetector()
 
@@ -244,8 +244,7 @@ class TestRollingLeadResponseDetector:
     assert len(events) == 2
     assert events[1].occurred_mono_time - events[0].detected_mono_time >= EPISODE_COOLDOWN_S
 
-  @pytest.mark.parametrize(
-    ("label", "lead_accel", "plan_onset"),
+  @parameterized.expand(
     [
       ("route92_09_06_49", 2.2, 2.85),
       ("route92_09_17_10", 2.8, 2.75),

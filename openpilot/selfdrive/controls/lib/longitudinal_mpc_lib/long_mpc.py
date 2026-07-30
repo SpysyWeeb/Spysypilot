@@ -24,7 +24,7 @@ EXPORT_DIR = os.path.join(LONG_MPC_DIR, "c_generated_code")
 JSON_FILE = os.path.join(LONG_MPC_DIR, "acados_ocp_long.json")
 
 LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
-MPC_SOURCES = (LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1, LongitudinalPlanSource.cruise)
+MPC_SOURCES = (LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1)
 
 X_DIM = 3
 U_DIM = 1
@@ -57,8 +57,6 @@ T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 7.0  # stock 6.0; +1m per owner preference -- a constant term of the desired-gap
                      # cost at every horizon node, so the whole decel plan lands 1m earlier
-CRUISE_MIN_ACCEL = -1.2
-CRUISE_MAX_ACCEL = 3.2  # Spysypilot: doubled with the cruise accel schedule
 MIN_X_LEAD_FACTOR = 0.5
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
@@ -283,19 +281,34 @@ class LongitudinalMpc:
         self.solver.set(i, 'x', self.x0)
 
   @staticmethod
+  def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau):
+    a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.)
+    v_lead_traj = np.clip(v_lead + np.cumsum(T_DIFFS * a_lead_traj), 0.0, 1e8)
+    x_lead_traj = x_lead + np.cumsum(T_DIFFS * v_lead_traj)
+    return np.column_stack((x_lead_traj, v_lead_traj))
+
+  @staticmethod
   def process_lead_model(model_lead, radar_lead, v_ego):
-    """NewLeadMpc (upstream PR #37824, via IQPilot): feed the solver the driving model's full
-    predicted lead trajectory instead of a kinematic extrapolation of the current radar state.
-    The model anticipates launches and slowdowns from vision seconds before the radar can
-    measure them -- this is the single deepest lead-reaction-time lever in the stack.
-    Anchored at the radar's trusted h=0 measurement; the model contributes the deltas.
-    Stock PR form: trust ledger + pull-away floor removed 2026-07-18 for an A/B field
-    test of the unmodified PR (both live in git history if reinstated)."""
+    """Build the lead trajectory with three explicit trust tiers.
+
+    A valid model lead anchored by a present radar lead uses the model prediction.
+    If the model lead is invalid while radar still sees a lead, stock radar-physics
+    extrapolation preserves braking for the real vehicle. Only when radar sees no
+    lead do we use the fake-fast-lead trajectory that keeps the solver in-mode.
+    """
     if model_lead is not None and model_lead.prob > 0.5 and radar_lead.present:
       x = np.asarray(model_lead.x, dtype=np.float64)
       v = np.asarray(model_lead.v, dtype=np.float64)
       x_lead_traj = float(radar_lead.dRel) + (x - x[0])
       v_lead_traj = float(radar_lead.vLead) + (v - v[0])
+    elif radar_lead.present:
+      x_lead = float(radar_lead.dRel)
+      v_lead = float(radar_lead.vLead)
+      a_lead = np.clip(float(radar_lead.aLeadK), -10.0, 5.0)
+      min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead) * (v_ego - v_lead) / (-ACCEL_MIN * 2)
+      x_lead = np.clip(x_lead, min_x_lead, 1e8)
+      v_lead = np.clip(v_lead, 0.0, 1e8)
+      return LongitudinalMpc.extrapolate_lead(x_lead, v_lead, a_lead, radar_lead.aLeadTau)
     else:
       # Fake a fast lead so the MPC stays in the same mode
       x_lead_traj = 50.0 + (v_ego + 10.0) * LEAD_T_IDXS_MODEL
@@ -311,7 +324,7 @@ class LongitudinalMpc:
     v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
     return np.column_stack((x_lead_mpc, v_lead_mpc))
 
-  def update(self, radarstate, v_cruise, personality=log.LongitudinalPersonality.standard,
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
              t_follow=None, model_leads=None):
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
@@ -328,15 +341,7 @@ class LongitudinalMpc:
     lead_0_obstacle = lead_xv_0[:,0] + get_stopped_equivalence_factor(lead_xv_0[:,1])
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
-    # Fake an obstacle for cruise, this ensures smooth acceleration to set speed
-    # when the leads are no factor.
-    v_lower = v_ego + (T_IDXS * CRUISE_MIN_ACCEL * 1.05)
-    # TODO does this make sense when max_a is negative?
-    v_upper = v_ego + (T_IDXS * CRUISE_MAX_ACCEL * 1.05)
-    v_cruise_clipped = np.clip(v_cruise * np.ones(N+1), v_lower, v_upper)
-    cruise_obstacle = np.cumsum(T_DIFFS * v_cruise_clipped) + get_safe_obstacle_distance(v_cruise_clipped, t_follow)
-
-    x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle])
+    x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]
 
     self.yref[:,:] = 0.0

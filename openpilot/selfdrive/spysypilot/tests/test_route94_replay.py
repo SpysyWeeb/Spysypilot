@@ -41,7 +41,7 @@ route94_lat_windows_meta.json):
 
 Replay style deliberately follows this suite's established 100 Hz-builder
 convention (test_lat_event_detector.py) as closely as a real-telemetry
-replay allows: no pytest fixtures, no wall-clock, one small `_replay` helper
+replay allows: no runner-specific fixtures, no wall-clock, one small `_replay` helper
 stepping `detector.update(...)` over real ordered samples instead of a
 synthetic waveform. Unlike the rest of the suite, replay uses the DEFAULT
 `LateralEventDetector()` (EVENT_COOLDOWN=8.0s active, not cooldown=0) --
@@ -50,12 +50,14 @@ required to reproduce the real cooldown-consumption behavior above.
 import csv
 import io
 import json
+import math
 from pathlib import Path
 
-import pytest
 import zstandard
 
 from openpilot.cereal import messaging
+from openpilot.common.parameterized import parameterized
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.spysypilot.driving_event_indexer import _assign_group_role, event_to_record
 from openpilot.selfdrive.spysypilot.lat_event_detector import LateralEventDetector, LateralSample
 
@@ -63,6 +65,20 @@ from openpilot.selfdrive.spysypilot.lat_event_detector import LateralEventDetect
 DATA_DIR = Path(__file__).parent / "data"
 META = json.loads((DATA_DIR / "route94_lat_windows_meta.json").read_text())
 WINDOWS_BY_LABEL = {window["label"]: window for window in META["windows"]}
+
+
+class _Approx:
+  def __init__(self, expected: float, rel: float, abs_tol: float):
+    self.expected = expected
+    self.rel = rel
+    self.abs_tol = abs_tol
+
+  def __eq__(self, actual):
+    return math.isclose(actual, self.expected, rel_tol=self.rel, abs_tol=self.abs_tol)
+
+
+def approx(expected: float, *, rel: float = 1e-6, abs_tol: float = 1e-12):
+  return _Approx(expected, rel, abs_tol)
 
 
 def _load_fixture_rows() -> list[dict[str, str]]:
@@ -165,20 +181,19 @@ def _replay(start: float, end: float, *, track_dwell: bool = False):
 UNWIND_WINDOWS = [window for window in META["windows"] if window["kind"] == "unwind_keep"]
 
 
-@pytest.mark.parametrize("window", UNWIND_WINDOWS, ids=[w["label"] for w in UNWIND_WINDOWS])
-def test_unwind_deficit_keeps_fire_with_expected_evidence(window):
+def _test_unwind_deficit_keeps_fire_with_expected_evidence(window):
   events, _ = _replay(window["mono_start"], window["mono_end"])
   matches = [
     event for event in events
     if event.event_type == "unwindProgressDeficit"
-    and event.occurred_mono_time == pytest.approx(window["anchor_mono"], abs=0.01)
+    and event.occurred_mono_time == approx(window["anchor_mono"], abs_tol=0.01)
   ]
   assert len(matches) == 1, f"expected exactly one unwindProgressDeficit near {window['anchor_mono']}, got {events}"
   event = matches[0]
   expect = window["expect"]
   ev = event.evidence
 
-  assert event.confidence == pytest.approx(expect["confidence"])
+  assert event.confidence == approx(expect["confidence"])
   assert ev.driver_causation == expect["driver_causation"]
   assert ev.driver_assisted_unwind == expect["driver_assisted_unwind"]
   assert ev.driver_assist_raw_torque_only == expect["driver_assist_raw_torque_only"]
@@ -188,30 +203,30 @@ def test_unwind_deficit_keeps_fire_with_expected_evidence(window):
   if expect["requested_crown_neutral_mono_time"] is None:
     assert ev.requested_crown_neutral_mono_time is None
   else:
-    assert ev.requested_crown_neutral_mono_time == pytest.approx(expect["requested_crown_neutral_mono_time"], abs=0.01)
+    assert ev.requested_crown_neutral_mono_time == approx(expect["requested_crown_neutral_mono_time"], abs_tol=0.01)
   if expect["applied_crown_neutral_mono_time"] is None:
     assert ev.applied_crown_neutral_mono_time is None
   else:
-    assert ev.applied_crown_neutral_mono_time == pytest.approx(expect["applied_crown_neutral_mono_time"], abs=0.01)
+    assert ev.applied_crown_neutral_mono_time == approx(expect["applied_crown_neutral_mono_time"], abs_tol=0.01)
 
   # Meaningful crown-vs-literal-zero deltas (report section E), where the
   # report found one -- demonstrates the crown-aware fix actually changes
   # the answer on these specific episodes.
   if "requested_vs_literal_delta_s" in expect:
     delta = ev.requested_crown_neutral_mono_time - ev.requested_torque_neutral_cross_mono_time
-    assert delta == pytest.approx(expect["requested_vs_literal_delta_s"], abs=0.01)
+    assert delta == approx(expect["requested_vs_literal_delta_s"], abs_tol=0.01)
 
   # Rebound tracker: pinned exactly for the 2 confirmed rebounds (report
   # section F) and asserted zero/absent for the anchors that have none.
-  assert ev.unwind_rebound_max_magnitude == pytest.approx(expect["rebound_max_magnitude"], abs=0.001)
+  assert ev.unwind_rebound_max_magnitude == approx(expect["rebound_max_magnitude"], abs_tol=0.001)
   if expect["rebound_start_mono_time"] is None:
     assert ev.unwind_rebound_start_mono_time is None
   else:
-    assert ev.unwind_rebound_start_mono_time == pytest.approx(expect["rebound_start_mono_time"], abs=0.01)
-  assert ev.unwind_rebound_duration_s == pytest.approx(expect["rebound_duration_s"], abs=0.001)
+    assert ev.unwind_rebound_start_mono_time == approx(expect["rebound_start_mono_time"], abs_tol=0.01)
+  assert ev.unwind_rebound_duration_s == approx(expect["rebound_duration_s"], abs_tol=0.001)
 
   if "detected_mono_time" in expect:
-    assert event.detected_mono_time == pytest.approx(expect["detected_mono_time"], abs=0.1)
+    assert event.detected_mono_time == approx(expect["detected_mono_time"], abs_tol=0.1)
 
 
 # --------------------------------------------------------------------------
@@ -221,7 +236,7 @@ def test_unwind_deficit_keeps_fire_with_expected_evidence(window):
 #    and are deliberately NOT part of this fixture -- see meta.json).
 # --------------------------------------------------------------------------
 
-def test_reject_06_38_9_never_enters_dwell_near_anchor():
+def _test_reject_06_38_9_never_enters_dwell_near_anchor():
   """v6-specific mechanism: the episode DOES become active (moving/slowing)
   essentially at the anchor, but never forms a 'dwell' there at all -- the
   pre-dwell-progress/episode-identity gates suppress candidate FORMATION,
@@ -233,7 +248,7 @@ def test_reject_06_38_9_never_enters_dwell_near_anchor():
 
   probe = window["anti_vacuity_probe"]
   moving_entries = [t for t, state in trace if state == "moving"]
-  assert any(t == pytest.approx(probe["expected_moving_entry_mono"], abs=0.05) for t in moving_entries), (
+  assert any(t == approx(probe["expected_moving_entry_mono"], abs_tol=0.05) for t in moving_entries), (
     "anti-vacuity guard failed: the detector never even entered 'moving' near the anchor"
   )
   dwell_entries = [t for t, state in trace if state == "dwell"]
@@ -241,10 +256,10 @@ def test_reject_06_38_9_never_enters_dwell_near_anchor():
   assert all(abs(t - window["anchor_mono"]) > probe["no_dwell_within_s_of_anchor"] for t in dwell_entries), (
     "a dwell was entered too close to the anchor -- this would falsify the never-enters-dwell mechanism"
   )
-  assert dwell_entries[0] == pytest.approx(probe["nearest_dwell_entry_mono"], abs=0.05)
+  assert dwell_entries[0] == approx(probe["nearest_dwell_entry_mono"], abs_tol=0.05)
 
 
-def test_reject_08_33_7_center_band_reset_never_releases():
+def _test_reject_08_33_7_center_band_reset_never_releases():
   """v6-specific mechanism: a dwell IS entered (state machine reached
   'dwell', not silently absent), but resets DIRECTLY to no-episode after
   ~1.1s when the wheel drifts back inside the center band with no
@@ -258,16 +273,16 @@ def test_reject_08_33_7_center_band_reset_never_releases():
   dwell_entries = [(t, state) for t, state in trace if state == "dwell"]
   assert len(dwell_entries) == 1, "anti-vacuity guard failed: expected exactly one dwell entry"
   dwell_mono, _ = dwell_entries[0]
-  assert dwell_mono == pytest.approx(probe["expected_dwell_entry_mono"], abs=0.01)
+  assert dwell_mono == approx(probe["expected_dwell_entry_mono"], abs_tol=0.01)
 
   index = trace.index((dwell_mono, "dwell"))
   next_mono, next_state = trace[index + 1]
   assert next_state is None, "dwell must reset directly to no-episode, never to 'released'"
-  assert next_mono == pytest.approx(probe["expected_dwell_exit_mono"], abs=0.01)
-  assert (next_mono - dwell_mono) == pytest.approx(probe["expected_dwell_duration_s"], abs=0.01)
+  assert next_mono == approx(probe["expected_dwell_exit_mono"], abs_tol=0.01)
+  assert (next_mono - dwell_mono) == approx(probe["expected_dwell_duration_s"], abs_tol=0.01)
 
 
-def test_reject_seg9_649_0_fragmentation_and_byproduct_event():
+def _test_reject_seg9_649_0_fragmentation_and_byproduct_event():
   """v6-specific mechanism: instead of one sustained ~7.1s dwell, the state
   machine cycles rapidly through moving/slowing/short-dwell/released
   fragments. The anchor's OWN attempted dwell never survives as itself, but
@@ -288,16 +303,16 @@ def test_reject_seg9_649_0_fragmentation_and_byproduct_event():
   dwell_entries = [t for t, state in trace if state == "dwell"]
   assert len(dwell_entries) >= probe["min_fragment_count"], "anti-vacuity guard failed: not enough fragmented dwell cycles observed"
   for expected_mono in probe["expected_dwell_entries_mono"]:
-    assert any(t == pytest.approx(expected_mono, abs=0.01) for t in dwell_entries)
+    assert any(t == approx(expected_mono, abs_tol=0.01) for t in dwell_entries)
 
   byproduct = window["byproduct_event"]
   assert len(turn_stop_events) == 1, "expected exactly the one documented byproduct turnStopTurn, nothing else"
   event = turn_stop_events[0]
-  assert event.occurred_mono_time == pytest.approx(byproduct["occurred_mono_time"], abs=0.005)
-  assert event.detected_mono_time == pytest.approx(byproduct["detected_mono_time"], abs=0.1)
+  assert event.occurred_mono_time == approx(byproduct["occurred_mono_time"], abs_tol=0.005)
+  assert event.detected_mono_time == approx(byproduct["detected_mono_time"], abs_tol=0.1)
   ev = event.evidence
-  assert ev.dwell_duration_s == pytest.approx(byproduct["dwell_duration_s"], abs=0.005)
-  assert ev.dwell_steering_angle_deg == pytest.approx(byproduct["dwell_steering_angle_deg"], abs=0.5)
+  assert ev.dwell_duration_s == approx(byproduct["dwell_duration_s"], abs_tol=0.005)
+  assert ev.dwell_steering_angle_deg == approx(byproduct["dwell_steering_angle_deg"], abs_tol=0.5)
   assert ev.restart_classification == byproduct["restart_classification"]
 
 
@@ -309,18 +324,17 @@ def test_reject_seg9_649_0_fragmentation_and_byproduct_event():
 KEEP_WINDOWS = [window for window in META["windows"] if window["kind"] == "turn_stop_keep"]
 
 
-@pytest.mark.parametrize("window", KEEP_WINDOWS, ids=[w["label"] for w in KEEP_WINDOWS])
-def test_short_dwell_turn_stop_keeps_fire(window):
+def _test_short_dwell_turn_stop_keeps_fire(window):
   events, _ = _replay(window["mono_start"], window["mono_end"])
   matches = [
     event for event in events
     if event.event_type == "turnStopTurn"
-    and event.occurred_mono_time == pytest.approx(window["expect_occurred_mono_time"], abs=0.01)
+    and event.occurred_mono_time == approx(window["expect_occurred_mono_time"], abs_tol=0.01)
   ]
   assert len(matches) == 1, f"expected exactly one turnStopTurn near {window['expect_occurred_mono_time']}, got {events}"
 
 
-def test_cooldown_pair_731_977_fires_735_289_does_not():
+def _test_cooldown_pair_731_977_fires_735_289_does_not():
   """Amendment A10, documented not as a bug: a genuinely NEW v6-only
   turnStopTurn at mono ~731.977 fires and consumes the shared 8s per-type
   EVENT_COOLDOWN. The 20th short-dwell keep (v5 anchor mono 735.289) then
@@ -340,15 +354,15 @@ def test_cooldown_pair_731_977_fires_735_289_does_not():
     abs(event.occurred_mono_time - does_not_fire["anchor_mono"]) < 1.0 for event in turn_stop_events
   ), "735.289 correctly must not fire -- if it did, the cooldown-consumption tradeoff would no longer hold"
 
-  matches = [event for event in turn_stop_events if event.occurred_mono_time == pytest.approx(fires["anchor_mono"], abs=0.01)]
+  matches = [event for event in turn_stop_events if event.occurred_mono_time == approx(fires["anchor_mono"], abs_tol=0.01)]
   assert len(matches) == 1
   event = matches[0]
-  assert event.detected_mono_time == pytest.approx(fires["detected_mono_time"], abs=0.1)
+  assert event.detected_mono_time == approx(fires["detected_mono_time"], abs_tol=0.1)
   ev = event.evidence
-  assert ev.dwell_duration_s == pytest.approx(fires["dwell_duration_s"], abs=0.005)
-  assert ev.dwell_steering_angle_deg == pytest.approx(fires["dwell_steering_angle_deg"], abs=0.5)
-  assert ev.turn_stop_pre_dwell_progress_deg == pytest.approx(fires["turn_stop_pre_dwell_progress_deg"], abs=0.5)
-  assert ev.turn_stop_post_dwell_progress_deg == pytest.approx(fires["turn_stop_post_dwell_progress_deg"], abs=0.5)
+  assert ev.dwell_duration_s == approx(fires["dwell_duration_s"], abs_tol=0.005)
+  assert ev.dwell_steering_angle_deg == approx(fires["dwell_steering_angle_deg"], abs_tol=0.5)
+  assert ev.turn_stop_pre_dwell_progress_deg == approx(fires["turn_stop_pre_dwell_progress_deg"], abs_tol=0.5)
+  assert ev.turn_stop_post_dwell_progress_deg == approx(fires["turn_stop_post_dwell_progress_deg"], abs_tol=0.5)
   assert ev.restart_classification == fires["restart_classification"]
 
 
@@ -356,7 +370,7 @@ def test_cooldown_pair_731_977_fires_735_289_does_not():
 # D. Old (pre-v6) manifest lines must keep decoding safely (append-only).
 # --------------------------------------------------------------------------
 
-def test_old_v5_manifest_lines_still_decode_safely():
+def _test_old_v5_manifest_lines_still_decode_safely():
   """Synthesized (NOT real-device) envelope-version</detector-version-2-5
   DrivingEvent messages, shaped like a real v5 manifest line (device ran
   branch combo, detector_version 5, detector blatLateralEventDetector --
@@ -427,3 +441,24 @@ def test_old_v5_manifest_lines_still_decode_safely():
     _assign_group_role(record, {}, {})
     assert record["group_role"] == "primary"
     assert record["primary_event_id"] == event_id
+
+
+class TestRoute94Replay(OpenpilotTestCase):
+  @parameterized.expand(UNWIND_WINDOWS, ids=lambda window: window["label"])
+  def test_unwind_deficit_keeps_fire_with_expected_evidence(self, window):
+    _test_unwind_deficit_keeps_fire_with_expected_evidence(window)
+
+  test_reject_06_38_9_never_enters_dwell_near_anchor = staticmethod(
+    _test_reject_06_38_9_never_enters_dwell_near_anchor)
+  test_reject_08_33_7_center_band_reset_never_releases = staticmethod(
+    _test_reject_08_33_7_center_band_reset_never_releases)
+  test_reject_seg9_649_0_fragmentation_and_byproduct_event = staticmethod(
+    _test_reject_seg9_649_0_fragmentation_and_byproduct_event)
+
+  @parameterized.expand(KEEP_WINDOWS, ids=lambda window: window["label"])
+  def test_short_dwell_turn_stop_keeps_fire(self, window):
+    _test_short_dwell_turn_stop_keeps_fire(window)
+
+  test_cooldown_pair_731_977_fires_735_289_does_not = staticmethod(
+    _test_cooldown_pair_731_977_fires_735_289_does_not)
+  test_old_v5_manifest_lines_still_decode_safely = staticmethod(_test_old_v5_manifest_lines_still_decode_safely)

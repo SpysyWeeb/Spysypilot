@@ -111,9 +111,8 @@ class MainLayout(Widget):
     self.open_settings(PanelType.DEVICE)
 
   def _on_bookmark_clicked(self):
-    user_bookmark = messaging.new_message('bookmarkButton')
-    user_bookmark.valid = True
-    self._pm.send('bookmarkButton', user_bookmark)
+    msg = messaging.new_message('bookmarkButton', valid=True)
+    self._pm.send('bookmarkButton', msg)
 
   def _on_onroad_clicked(self):
     self._sidebar.set_visible(not self._sidebar.is_visible)

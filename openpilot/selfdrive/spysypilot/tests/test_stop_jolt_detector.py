@@ -1,13 +1,17 @@
 from collections.abc import Callable
 
-import pytest
-
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.spysypilot.stop_jolt_detector import (
   StopJoltCarSample,
   StopJoltDetector,
   StopJoltEvent,
   StopJoltImuSample,
 )
+
+
+def _assert_approx_equal(test_case: OpenpilotTestCase, actual: float, expected: float, *, delta: float | None = None) -> None:
+  tolerance = max(abs(expected) * 1e-6, 1e-12) if delta is None else delta
+  test_case.assertAlmostEqual(actual, expected, delta=tolerance)
 
 
 AccelProfile = Callable[[float], float]
@@ -92,146 +96,131 @@ def run_stop(
   return events
 
 
-def test_smooth_tapered_stop_remains_silent():
-  assert run_stop(smooth_accel) == []
+class TestStopJoltDetector(OpenpilotTestCase):
+  def test_smooth_tapered_stop_remains_silent(self):
+    assert run_stop(smooth_accel) == []
 
+  def test_abrupt_final_brake_grab_triggers(self):
+    events = run_stop(brake_grab_accel)
+    assert len(events) == 1
+    assert events[0].classification in ("brakeGrab", "grabAndRebound")
+    assert events[0].imu_jerk < 0.0
+    assert events[0].a_ego_jerk < 0.0
 
-def test_abrupt_final_brake_grab_triggers():
-  events = run_stop(brake_grab_accel)
-  assert len(events) == 1
-  assert events[0].classification in ("brakeGrab", "grabAndRebound")
-  assert events[0].imu_jerk < 0.0
-  assert events[0].a_ego_jerk < 0.0
+  def test_approach_history_survives_until_late_should_stop_arming(self):
+    events = run_stop(brake_grab_accel, should_stop_at=2.7)
+    assert len(events) == 1
+    assert events[0].episode_start_mono_time < 1.0
 
+  def test_abrupt_release_rebound_triggers(self):
+    events = run_stop(release_snap_accel)
+    assert len(events) == 1
+    assert events[0].classification == "releaseSnap"
+    assert events[0].imu_jerk > 0.0
+    assert events[0].a_ego_jerk > 0.0
 
-def test_approach_history_survives_until_late_should_stop_arming():
-  events = run_stop(brake_grab_accel, should_stop_at=2.7)
-  assert len(events) == 1
-  assert events[0].episode_start_mono_time < 1.0
+  def test_imu_dominant_delayed_release_shape_from_replay_triggers(self):
+    def delayed_a_ego(t: float) -> float:
+      return -0.3 if t < 3.1 else 0.1
 
+    def imu_rebound(t: float) -> float:
+      return -0.5 if t < 3.0 else 0.7
 
-def test_abrupt_release_rebound_triggers():
-  events = run_stop(release_snap_accel)
-  assert len(events) == 1
-  assert events[0].classification == "releaseSnap"
-  assert events[0].imu_jerk > 0.0
-  assert events[0].a_ego_jerk > 0.0
+    events = run_stop(delayed_a_ego, imu_rebound)
+    assert len(events) == 1
+    assert events[0].classification == "releaseSnap"
+    assert events[0].imu_jerk >= 3.0
+    assert 0.75 <= events[0].a_ego_jerk < 2.5
+    _assert_approx_equal(self, events[0].confidence, 0.82)
 
+  def test_one_frame_acceleration_spike_remains_silent(self):
+    def spike(t: float) -> float:
+      return -2.5 if abs(t - 2.5) < 0.005 else -0.4
 
-def test_imu_dominant_delayed_release_shape_from_replay_triggers():
-  def delayed_a_ego(t: float) -> float:
-    return -0.3 if t < 3.1 else 0.1
+    assert run_stop(spike, spike) == []
 
-  def imu_rebound(t: float) -> float:
-    return -0.5 if t < 3.0 else 0.7
+  def test_wheel_speed_estimator_snap_without_imu_confirmation_remains_silent(self):
+    assert run_stop(brake_grab_accel, smooth_accel) == []
 
-  events = run_stop(delayed_a_ego, imu_rebound)
-  assert len(events) == 1
-  assert events[0].classification == "releaseSnap"
-  assert events[0].imu_jerk >= 3.0
-  assert 0.75 <= events[0].a_ego_jerk < 2.5
-  assert events[0].confidence == pytest.approx(0.82)
+  def test_strict_a_ego_fallback_works_when_imu_unavailable(self):
+    events = run_stop(brake_grab_accel, imu_valid=False)
+    assert len(events) == 1
+    assert not events[0].imu_valid
+    assert events[0].confidence < 0.8
 
+  def test_driver_braking_does_not_create_smooth_stops_event(self):
+    assert run_stop(brake_grab_accel, driver_brake_at=2.3) == []
 
-def test_one_frame_acceleration_spike_remains_silent():
-  def spike(t: float) -> float:
-    return -2.5 if abs(t - 2.5) < 0.005 else -0.4
+  def test_required_message_invalidity_blocks_the_episode(self):
+    assert run_stop(brake_grab_accel, invalid_at=2.3) == []
 
-  assert run_stop(spike, spike) == []
+  def test_vertical_road_bump_suppresses_warning_level_event(self):
+    def warning_jolt(t: float) -> float:
+      return -0.3 if t < 2.0 else (-1.5 if t < 2.35 else -0.2)
 
+    unconfounded = run_stop(warning_jolt)
+    assert len(unconfounded) == 1
+    assert unconfounded[0].severity == "warning"
+    assert run_stop(warning_jolt, road_at=2.5) == []
 
-def test_wheel_speed_estimator_snap_without_imu_confirmation_remains_silent():
-  assert run_stop(brake_grab_accel, smooth_accel) == []
+  def test_severe_road_confounded_event_is_retained_with_reduced_confidence(self):
+    def severe(t: float) -> float:
+      return -0.4 if t < 2.35 else (-2.4 if t < 2.75 else 0.0)
 
+    events = run_stop(severe, road_at=2.5)
+    assert len(events) == 1
+    assert events[0].road_confounded
+    assert events[0].severity == "critical"
+    assert events[0].confidence < 0.9
 
-def test_strict_a_ego_fallback_works_when_imu_unavailable():
-  events = run_stop(brake_grab_accel, imu_valid=False)
-  assert len(events) == 1
-  assert not events[0].imu_valid
-  assert events[0].confidence < 0.8
+  def test_hard_braking_above_landing_speed_window_remains_silent(self):
+    def high_speed_brake(t: float) -> float:
+      if 0.2 <= t < 0.6:
+        return -2.5
+      return smooth_accel(t)
 
+    assert run_stop(high_speed_brake) == []
 
-def test_driver_braking_does_not_create_smooth_stops_event():
-  assert run_stop(brake_grab_accel, driver_brake_at=2.3) == []
+  def test_creeping_queue_does_not_finalize_before_true_standstill(self):
+    detector = StopJoltDetector()
+    event = None
+    for frame in range(500):
+      t = frame / 100.0
+      v_ego = max(0.12, 2.0 - t)
+      accel = brake_grab_accel(min(t, 2.7))
+      if frame % 5 == 0:
+        detector.update_imu(StopJoltImuSample(t, accel, True))
+      event = detector.update_car(StopJoltCarSample(
+        t, True, True, True, v_ego, accel, False, False, False, False,
+        accel, accel, accel, "stopping", True, 3.0, 0.0, True,
+      ))
+    assert event is None
 
+    events = []
+    for frame in range(500, 580):
+      t = frame / 100.0
+      accel = 0.0
+      if frame % 5 == 0:
+        detector.update_imu(StopJoltImuSample(t, accel, True))
+      event = detector.update_car(StopJoltCarSample(
+        t, True, True, True, 0.0, accel, True, False, False, True,
+        accel, accel, accel, "pid", True, 3.0, 0.0, True,
+      ))
+      if event is not None:
+        events.append(event)
+    assert len(events) == 1
 
-def test_required_message_invalidity_blocks_the_episode():
-  assert run_stop(brake_grab_accel, invalid_at=2.3) == []
+  def test_only_one_event_is_emitted_per_stop(self):
+    assert len(run_stop(brake_grab_accel, end=6.0)) == 1
 
+  def test_peak_occurrence_precedes_later_detection(self):
+    event = run_stop(brake_grab_accel)[0]
+    assert event.peak_jolt_mono_time < event.standstill_mono_time
+    assert event.detection_mono_time >= event.standstill_mono_time + 0.45
 
-def test_vertical_road_bump_suppresses_warning_level_event():
-  def warning_jolt(t: float) -> float:
-    return -0.3 if t < 2.0 else (-1.5 if t < 2.35 else -0.2)
-
-  unconfounded = run_stop(warning_jolt)
-  assert len(unconfounded) == 1
-  assert unconfounded[0].severity == "warning"
-  assert run_stop(warning_jolt, road_at=2.5) == []
-
-
-def test_severe_road_confounded_event_is_retained_with_reduced_confidence():
-  def severe(t: float) -> float:
-    return -0.4 if t < 2.35 else (-2.4 if t < 2.75 else 0.0)
-
-  events = run_stop(severe, road_at=2.5)
-  assert len(events) == 1
-  assert events[0].road_confounded
-  assert events[0].severity == "critical"
-  assert events[0].confidence < 0.9
-
-
-def test_hard_braking_above_landing_speed_window_remains_silent():
-  def high_speed_brake(t: float) -> float:
-    if 0.2 <= t < 0.6:
-      return -2.5
-    return smooth_accel(t)
-
-  assert run_stop(high_speed_brake) == []
-
-
-def test_creeping_queue_does_not_finalize_before_true_standstill():
-  detector = StopJoltDetector()
-  event = None
-  for frame in range(500):
-    t = frame / 100.0
-    v_ego = max(0.12, 2.0 - t)
-    accel = brake_grab_accel(min(t, 2.7))
-    if frame % 5 == 0:
-      detector.update_imu(StopJoltImuSample(t, accel, True))
-    event = detector.update_car(StopJoltCarSample(
-      t, True, True, True, v_ego, accel, False, False, False, False,
-      accel, accel, accel, "stopping", True, 3.0, 0.0, True,
-    ))
-  assert event is None
-
-  events = []
-  for frame in range(500, 580):
-    t = frame / 100.0
-    accel = 0.0
-    if frame % 5 == 0:
-      detector.update_imu(StopJoltImuSample(t, accel, True))
-    event = detector.update_car(StopJoltCarSample(
-      t, True, True, True, 0.0, accel, True, False, False, True,
-      accel, accel, accel, "pid", True, 3.0, 0.0, True,
-    ))
-    if event is not None:
-      events.append(event)
-  assert len(events) == 1
-
-
-def test_only_one_event_is_emitted_per_stop():
-  assert len(run_stop(brake_grab_accel, end=6.0)) == 1
-
-
-def test_peak_occurrence_precedes_later_detection():
-  event = run_stop(brake_grab_accel)[0]
-  assert event.peak_jolt_mono_time < event.standstill_mono_time
-  assert event.detection_mono_time >= event.standstill_mono_time + 0.45
-
-
-def test_duplicate_held_imu_timestamp_is_ignored():
-  detector = StopJoltDetector()
-  detector.update_imu(StopJoltImuSample(1.0, -0.5, True))
-  detector.update_imu(StopJoltImuSample(1.0, -9.0, True))
-  assert len(detector.imu_history) == 1
-  assert detector.imu_history[0].accel_x == pytest.approx(-0.5)
+  def test_duplicate_held_imu_timestamp_is_ignored(self):
+    detector = StopJoltDetector()
+    detector.update_imu(StopJoltImuSample(1.0, -0.5, True))
+    detector.update_imu(StopJoltImuSample(1.0, -9.0, True))
+    assert len(detector.imu_history) == 1
+    _assert_approx_equal(self, detector.imu_history[0].accel_x, -0.5)

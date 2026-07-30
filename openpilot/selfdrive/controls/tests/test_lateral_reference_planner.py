@@ -1,8 +1,9 @@
 import numpy as np
-import pytest
 
 from openpilot.cereal import log
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
+from openpilot.common.parameterized import parameterized
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.lateral_reference_planner import (
   ActuatorPreviewConfig,
   EPISODE_COMMITMENT_LOOKAHEAD,
@@ -34,17 +35,20 @@ def constant_curvature_model(curvature, speed=V_EGO):
   return build_model(speed * curvature * MODEL_T, speed)
 
 
-class TestLateralReferencePlanner:
+class TestLateralReferencePlanner(OpenpilotTestCase):
+  def assertApproxEqual(self, actual, expected, *, rel=1e-6, abs_=1e-12):
+    self.assertAlmostEqual(actual, expected, delta=max(abs_, rel * abs(expected)))
+
   def test_straight(self):
     planner = LateralReferencePlanner()
     assert planner.update(constant_curvature_model(0.0), 0.0, V_EGO)
-    assert planner.get_curvature(0.0, V_EGO, LATERAL_DELAY) == pytest.approx(0.0, abs=1e-10)
+    self.assertApproxEqual(planner.get_curvature(0.0, V_EGO, LATERAL_DELAY), 0.0, abs_=1e-10)
 
-  @pytest.mark.parametrize(("speed", "curvature"), [(3.0, -0.01), (3.0, 0.01), (15.0, 0.002), (30.0, 0.0005)])
+  @parameterized.expand([(3.0, -0.01), (3.0, 0.01), (15.0, 0.002), (30.0, 0.0005)])
   def test_constant_curvature(self, speed, curvature):
     planner = LateralReferencePlanner()
     assert planner.update(constant_curvature_model(curvature, speed), 0.0, speed)
-    assert planner.get_curvature(curvature, speed, LATERAL_DELAY) == pytest.approx(curvature, rel=0.05)
+    self.assertApproxEqual(planner.get_curvature(curvature, speed, LATERAL_DELAY), curvature, rel=0.05)
 
   def test_symmetry(self):
     outputs = []
@@ -52,7 +56,7 @@ class TestLateralReferencePlanner:
       planner = LateralReferencePlanner()
       planner.update(constant_curvature_model(sign * 0.01), 0.0, V_EGO)
       outputs.append(planner.get_curvature(sign * 0.01, V_EGO, LATERAL_DELAY))
-    assert outputs[0] == pytest.approx(-outputs[1], abs=1e-10)
+    self.assertApproxEqual(outputs[0], -outputs[1], abs_=1e-10)
 
   def test_uses_trajectory_beyond_action_time(self):
     straight = build_model(np.zeros_like(MODEL_T))
@@ -66,7 +70,7 @@ class TestLateralReferencePlanner:
 
     straight_output = straight_planner.get_curvature(0.0, V_EGO, LATERAL_DELAY)
     turn_output = turn_planner.get_curvature(0.0, V_EGO, LATERAL_DELAY)
-    assert straight_output == pytest.approx(0.0, abs=1e-10)
+    self.assertApproxEqual(straight_output, 0.0, abs_=1e-10)
     assert turn_output > 0.005
 
   def test_replan_reduces_reference_jump(self):
@@ -100,7 +104,7 @@ class TestLateralReferencePlanner:
     speed = 12.0 * 0.44704
     planner = LateralReferencePlanner()
     assert planner.update(constant_curvature_model(0.01, speed), 0.0, speed)
-    assert planner.get_curvature(0.04, speed, LATERAL_DELAY) == pytest.approx(0.04)
+    self.assertApproxEqual(planner.get_curvature(0.04, speed, LATERAL_DELAY), 0.04)
     assert planner.solution is None
 
   def test_actuator_preview_leads_low_speed_sharp_unwind_without_erasing_turn(self):
@@ -160,13 +164,13 @@ class TestLateralReferencePlanner:
     )
     diagnostics = planner.diagnostics
     assert diagnostics.sustained_unwind_scale > 0.9
-    assert diagnostics.extra_time == pytest.approx(UNWIND_RELEASE_PREVIEW_TIME)
+    self.assertApproxEqual(diagnostics.extra_time, UNWIND_RELEASE_PREVIEW_TIME)
     assert output < diagnostics.base_curvature
     assert abs(diagnostics.preview_correction) <= MAX_PREVIEW_LATERAL_ACCEL_DELTA + 1e-9
 
     _, reachable = planner._reachable_torque_trajectory(speed, 2.7, 0.13, 0.05, -0.1)
     expected_target = np.interp(diagnostics.sample_time, np.arange(len(reachable)) * 0.05, reachable)
-    assert diagnostics.reachable_target_torque == pytest.approx(expected_target)
+    self.assertApproxEqual(diagnostics.reachable_target_torque, expected_target)
 
   def test_episode_target_samples_later_horizon_for_handoff_commitment(self):
     speed = 4.0
@@ -219,7 +223,7 @@ class TestLateralReferencePlanner:
 
     planner.get_curvature(0.0, speed, LATERAL_DELAY)
     assert planner.diagnostics.trajectory_rate_valid
-    assert planner.diagnostics.trajectory_curvature_rate == pytest.approx(curvature_rate, rel=0.10)
+    self.assertApproxEqual(planner.diagnostics.trajectory_curvature_rate, curvature_rate, rel=0.10)
 
   def test_trajectory_rate_rejects_constant_curve_replan_step(self):
     speed = 10.0
@@ -273,7 +277,7 @@ class TestLateralReferencePlanner:
             infeasible_fraction = fraction
         expected = reachable_next + feasible_fraction * (desired_previous - reachable_next)
 
-      assert actual == pytest.approx(expected, abs=1e-12)
+      self.assertApproxEqual(actual, expected, abs_=1e-12)
       assert planner._transition_time(actual, reachable_next) <= duration + 1e-12
 
   def test_vectorized_torque_demand_matches_scalar_definition(self):
@@ -334,7 +338,7 @@ class TestLateralReferencePlanner:
     assert diagnostics.unwind_scale > 0.9
     # A sustained path release now selects a bounded future sample even when
     # applied torque and the old scalar target are both saturated.
-    assert diagnostics.extra_time == pytest.approx(UNWIND_RELEASE_PREVIEW_TIME)
+    self.assertApproxEqual(diagnostics.extra_time, UNWIND_RELEASE_PREVIEW_TIME)
 
   def test_reference_target_includes_crown_adjusted_neutral(self):
     speed = 5.0
@@ -344,9 +348,9 @@ class TestLateralReferencePlanner:
 
     planner.get_curvature(0.0, speed, 0.2, applied_torque=0.0, lat_accel_factor=2.7, friction=0.13, roll=0.07, lat_accel_offset=-0.103)
     expected_neutral = (0.07 * ACCELERATION_DUE_TO_GRAVITY - 0.103) / 2.7
-    assert planner.diagnostics.neutral_torque == pytest.approx(expected_neutral)
-    assert planner.diagnostics.geometric_target_torque == pytest.approx(expected_neutral, abs=1e-6)
-    assert planner.diagnostics.reachable_target_torque == pytest.approx(expected_neutral, abs=1e-6)
+    self.assertApproxEqual(planner.diagnostics.neutral_torque, expected_neutral)
+    self.assertApproxEqual(planner.diagnostics.geometric_target_torque, expected_neutral, abs_=1e-6)
+    self.assertApproxEqual(planner.diagnostics.reachable_target_torque, expected_neutral, abs_=1e-6)
 
   def test_backward_torque_envelope_is_rate_reachable(self):
     speed = 6.0
@@ -369,8 +373,8 @@ class TestLateralReferencePlanner:
     assert planner.update(build_model(speed * curvature * MODEL_T, speeds), curvature, speed)
 
     planner.get_curvature(curvature, speed, LATERAL_DELAY, applied_torque=-0.4, lat_accel_factor=2.5, friction=0.115)
-    assert planner.diagnostics.unwind_scale == pytest.approx(0.0, abs=1e-6)
-    assert planner.diagnostics.extra_time == pytest.approx(0.0, abs=1e-6)
+    self.assertApproxEqual(planner.diagnostics.unwind_scale, 0.0, abs_=1e-6)
+    self.assertApproxEqual(planner.diagnostics.extra_time, 0.0, abs_=1e-6)
 
   def test_reference_becomes_fully_active_by_15_mph(self):
     outputs = []
@@ -380,9 +384,9 @@ class TestLateralReferencePlanner:
       assert planner.update(constant_curvature_model(0.01, speed), 0.0, speed)
       outputs.append(planner.get_curvature(0.04, speed, LATERAL_DELAY))
 
-    assert outputs[0] == pytest.approx(0.04)
+    self.assertApproxEqual(outputs[0], 0.04)
     assert outputs[0] > outputs[1] > outputs[2]
-    assert outputs[2] == pytest.approx(0.01, rel=0.05)
+    self.assertApproxEqual(outputs[2], 0.01, rel=0.05)
 
   def test_speed_scaled_replan_responds_immediately(self):
     lateral_accel = 0.6
@@ -399,13 +403,13 @@ class TestLateralReferencePlanner:
       assert new_output < 0.0
       assert abs(new_output - old_output) * speed**2 > 0.5
 
-  @pytest.mark.parametrize(("speed", "curvature"), [(30.0, 0.02), (20.0, 0.03), (3.0, 0.3)])
+  @parameterized.expand([(30.0, 0.02), (20.0, 0.03), (3.0, 0.3)])
   def test_unphysical_solution_falls_back(self, speed, curvature):
     planner = LateralReferencePlanner()
     assert not planner.update(constant_curvature_model(curvature, speed), 0.0, speed)
     assert planner.get_curvature(curvature, speed, LATERAL_DELAY) == curvature
 
-  @pytest.mark.parametrize("malformed", ["empty", "nan"])
+  @parameterized.expand(["empty", "nan"])
   def test_invalid_model_falls_back(self, malformed):
     planner = LateralReferencePlanner()
     planner.update(constant_curvature_model(0.01), 0.0, V_EGO)

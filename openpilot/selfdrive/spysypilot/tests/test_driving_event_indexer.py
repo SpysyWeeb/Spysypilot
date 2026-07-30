@@ -1,10 +1,11 @@
 import json
 import os
+import tempfile
 from pathlib import Path
 
-import pytest
-
 from openpilot.cereal import messaging
+from openpilot.common.parameterized import parameterized
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.spysypilot.driving_event_indexer import (
   MANIFEST_NAME,
   PRESERVE_ATTR_NAME,
@@ -18,6 +19,21 @@ from openpilot.selfdrive.spysypilot.driving_event_indexer import (
   scan_once,
 )
 from openpilot.selfdrive.spysypilot.driving_eventd import AcceptedEvent, build_message, manual_candidate
+
+
+def _unittest_test(test):
+  def wrapped(_self):
+    test()
+
+  return wrapped
+
+
+def _unittest_tmp_path_test(test):
+  def wrapped(_self):
+    with tempfile.TemporaryDirectory() as directory:
+      test(Path(directory))
+
+  return wrapped
 
 
 def make_segments(log_root: Path, route: str, count: int):
@@ -139,7 +155,7 @@ def driving_event_message(event_id, group_id, event_type, occurred, *, version=3
   return msg.as_reader()
 
 
-def test_indexes_exact_segment_offset_ack_and_context_once(tmp_path):
+def _test_indexes_exact_segment_offset_ack_and_context_once(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -175,7 +191,7 @@ def test_indexes_exact_segment_offset_ack_and_context_once(tmp_path):
   assert (event_root / REVIEWS_NAME).exists()
 
 
-def test_segment_offset_uses_authoritative_ack_start_not_cached_init_data(tmp_path):
+def _test_segment_offset_uses_authoritative_ack_start_not_cached_init_data(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -199,7 +215,7 @@ def test_segment_offset_uses_authoritative_ack_start_not_cached_init_data(tmp_pa
   assert record["segment_offset_s"] == 1.5
 
 
-def test_stop_jolt_payload_serializes_to_manifest(tmp_path):
+def _test_stop_jolt_payload_serializes_to_manifest(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -224,7 +240,7 @@ def test_stop_jolt_payload_serializes_to_manifest(tmp_path):
   assert record["payload"]["peak_jolt_mono_time"] == record["occurred_mono_time"]
 
 
-def test_rolling_lead_payload_serializes_commit_and_response_evidence():
+def _test_rolling_lead_payload_serializes_commit_and_response_evidence():
   occurred = 100_000_000_000
   msg = messaging.new_message("drivingEvent", valid=True)
   event = msg.drivingEvent
@@ -274,7 +290,7 @@ def test_rolling_lead_payload_serializes_commit_and_response_evidence():
   assert record["payload"]["onsets"][0]["kind"] == "leadCommit"
 
 
-def test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence():
+def _test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence():
   occurred = 100_000_000_000
   msg = messaging.new_message("drivingEvent", valid=True)
   event = msg.drivingEvent
@@ -411,7 +427,7 @@ def test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence():
   assert serialized["unwind_peak_applied_target_gap"] == 0.35
 
 
-def test_old_lateral_payload_defaults_remain_indexable_and_v5_release_is_structured():
+def _test_old_lateral_payload_defaults_remain_indexable_and_v5_release_is_structured():
   occurred = 100_000_000_000
   for detector_version in (2, 3, 4):
     old_msg = messaging.new_message("drivingEvent", valid=True)
@@ -491,7 +507,7 @@ def test_old_lateral_payload_defaults_remain_indexable_and_v5_release_is_structu
   assert new_record["payload"]["road_confound_extent"] == "substantial"
 
 
-def test_joins_latest_acknowledgment_across_segment_boundary(tmp_path):
+def _test_joins_latest_acknowledgment_across_segment_boundary(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -516,7 +532,7 @@ def test_joins_latest_acknowledgment_across_segment_boundary(tmp_path):
   assert record["logger_acknowledgment"]["current_segment_preserved"]
 
 
-def test_requested_context_is_honored_and_clamped(tmp_path):
+def _test_requested_context_is_honored_and_clamped(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -536,7 +552,7 @@ def test_requested_context_is_honored_and_clamped(tmp_path):
   assert record["context_segments"] == [f"{route}--{index}" for index in range(4)]
 
 
-def test_rebuild_scans_unpreserved_full_rlogs(tmp_path):
+def _test_rebuild_scans_unpreserved_full_rlogs(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -559,7 +575,7 @@ def test_rebuild_scans_unpreserved_full_rlogs(tmp_path):
   assert indexed_ids == ["event"]
 
 
-def test_rebuild_never_erases_reviews(tmp_path):
+def _test_rebuild_never_erases_reviews(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -575,7 +591,7 @@ def test_rebuild_never_erases_reviews(tmp_path):
   assert (event_root / REVIEWS_NAME).read_text() == review
 
 
-def test_manifest_rotation_and_dedup_across_rotated_file(tmp_path):
+def _test_manifest_rotation_and_dedup_across_rotated_file(tmp_path):
   manifest = tmp_path / MANIFEST_NAME
   rotated = tmp_path / ROTATED_MANIFEST_NAME
   known = set()
@@ -588,7 +604,7 @@ def test_manifest_rotation_and_dedup_across_rotated_file(tmp_path):
   assert loaded == {"one", "two"}
 
 
-def test_corrupt_manifest_and_state_do_not_stop_scan(tmp_path):
+def _test_corrupt_manifest_and_state_do_not_stop_scan(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -604,8 +620,7 @@ def test_corrupt_manifest_and_state_do_not_stop_scan(tmp_path):
   assert scan_once(log_root, event_root, reader) == 1
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
-def test_designation_version_gate_legacy_always_primary_current_computes_role(tmp_path, version):
+def _test_designation_version_gate_legacy_always_primary_current_computes_role(tmp_path, version):
   # A4: designation applies ONLY to version >= 3 (DESIGNATION_MIN_VERSION).
   # Legacy (v5-era and earlier) records always self-designate as primary,
   # regardless of any higher-priority sibling sharing their group_id.
@@ -641,7 +656,7 @@ def test_designation_version_gate_legacy_always_primary_current_computes_role(tm
     assert records["low"]["primary_event_id"] == "high"
 
 
-def test_designation_priority_ordering_manual_outranks_everything(tmp_path):
+def _test_designation_priority_ordering_manual_outranks_everything(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -677,7 +692,7 @@ def test_designation_priority_ordering_manual_outranks_everything(tmp_path):
     assert records[event_id]["primary_event_id"] == "manual"
 
 
-def test_designation_priority_ordering_among_automatic_tiers(tmp_path):
+def _test_designation_priority_ordering_among_automatic_tiers(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -714,7 +729,7 @@ def test_designation_priority_ordering_among_automatic_tiers(tmp_path):
   assert records["autounwind"]["group_role"] == "secondary"
 
 
-def test_designation_driver_causation_intervention_backed_equivalent_to_flag(tmp_path):
+def _test_designation_driver_causation_intervention_backed_equivalent_to_flag(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -741,7 +756,7 @@ def test_designation_driver_causation_intervention_backed_equivalent_to_flag(tmp
   assert records["handoff"]["primary_event_id"] == "rescued"
 
 
-def test_designation_tie_break_by_earliest_occurred_time(tmp_path):
+def _test_designation_tie_break_by_earliest_occurred_time(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -768,7 +783,7 @@ def test_designation_tie_break_by_earliest_occurred_time(tmp_path):
   assert records["aaa-late"]["primary_event_id"] == "zzz-early"
 
 
-def test_designation_tie_break_lexicographic_event_id_when_occurred_matches(tmp_path):
+def _test_designation_tie_break_lexicographic_event_id_when_occurred_matches(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -793,7 +808,7 @@ def test_designation_tie_break_lexicographic_event_id_when_occurred_matches(tmp_
   assert records["bbb"]["primary_event_id"] == "aaa"
 
 
-def test_designation_segment_boundary_straddling_matches_rebuild(tmp_path):
+def _test_designation_segment_boundary_straddling_matches_rebuild(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -853,7 +868,7 @@ def test_designation_segment_boundary_straddling_matches_rebuild(tmp_path):
     assert rebuilt_by_id[event_id]["primary_event_id"] == incremental_by_id[event_id]["primary_event_id"]
 
 
-def test_rebuild_recomputes_designation_ignoring_stale_prior_manifest(tmp_path):
+def _test_rebuild_recomputes_designation_ignoring_stale_prior_manifest(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -888,7 +903,7 @@ def test_rebuild_recomputes_designation_ignoring_stale_prior_manifest(tmp_path):
   assert records["low"]["primary_event_id"] == "high"
 
 
-def test_designation_persists_across_manifest_rotation(tmp_path):
+def _test_designation_persists_across_manifest_rotation(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -945,7 +960,7 @@ def test_designation_persists_across_manifest_rotation(tmp_path):
   assert later_record["primary_event_id"] == "high"
 
 
-def test_designation_count_message_reports_primary_subset(tmp_path, caplog):
+def _test_designation_count_message_reports_primary_subset(tmp_path):
   log_root = tmp_path / "realdata"
   event_root = tmp_path / "events"
   route = "abc|2026-01-01--00-00-00"
@@ -966,3 +981,50 @@ def test_designation_count_message_reports_primary_subset(tmp_path, caplog):
   }
   primary_count = sum(1 for record in records.values() if record["group_role"] != "secondary")
   assert primary_count == 1
+
+
+class TestDrivingEventIndexer(OpenpilotTestCase):
+  test_indexes_exact_segment_offset_ack_and_context_once = _unittest_tmp_path_test(
+    _test_indexes_exact_segment_offset_ack_and_context_once)
+  test_segment_offset_uses_authoritative_ack_start_not_cached_init_data = _unittest_tmp_path_test(
+    _test_segment_offset_uses_authoritative_ack_start_not_cached_init_data)
+  test_stop_jolt_payload_serializes_to_manifest = _unittest_tmp_path_test(_test_stop_jolt_payload_serializes_to_manifest)
+  test_rolling_lead_payload_serializes_commit_and_response_evidence = _unittest_test(
+    _test_rolling_lead_payload_serializes_commit_and_response_evidence)
+  test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence = _unittest_test(
+    _test_lateral_v5_payload_serializes_unwind_and_turn_stop_turn_evidence)
+  test_old_lateral_payload_defaults_remain_indexable_and_v5_release_is_structured = _unittest_test(
+    _test_old_lateral_payload_defaults_remain_indexable_and_v5_release_is_structured)
+  test_joins_latest_acknowledgment_across_segment_boundary = _unittest_tmp_path_test(
+    _test_joins_latest_acknowledgment_across_segment_boundary)
+  test_requested_context_is_honored_and_clamped = _unittest_tmp_path_test(_test_requested_context_is_honored_and_clamped)
+  test_rebuild_scans_unpreserved_full_rlogs = _unittest_tmp_path_test(_test_rebuild_scans_unpreserved_full_rlogs)
+  test_rebuild_never_erases_reviews = _unittest_tmp_path_test(_test_rebuild_never_erases_reviews)
+  test_manifest_rotation_and_dedup_across_rotated_file = _unittest_tmp_path_test(
+    _test_manifest_rotation_and_dedup_across_rotated_file)
+  test_corrupt_manifest_and_state_do_not_stop_scan = _unittest_tmp_path_test(
+    _test_corrupt_manifest_and_state_do_not_stop_scan)
+
+  @parameterized.expand([1, 2, 3, 4, 5], names=("version",))
+  def test_designation_version_gate_legacy_always_primary_current_computes_role(self, version):
+    with tempfile.TemporaryDirectory() as directory:
+      _test_designation_version_gate_legacy_always_primary_current_computes_role(Path(directory), version)
+
+  test_designation_priority_ordering_manual_outranks_everything = _unittest_tmp_path_test(
+    _test_designation_priority_ordering_manual_outranks_everything)
+  test_designation_priority_ordering_among_automatic_tiers = _unittest_tmp_path_test(
+    _test_designation_priority_ordering_among_automatic_tiers)
+  test_designation_driver_causation_intervention_backed_equivalent_to_flag = _unittest_tmp_path_test(
+    _test_designation_driver_causation_intervention_backed_equivalent_to_flag)
+  test_designation_tie_break_by_earliest_occurred_time = _unittest_tmp_path_test(
+    _test_designation_tie_break_by_earliest_occurred_time)
+  test_designation_tie_break_lexicographic_event_id_when_occurred_matches = _unittest_tmp_path_test(
+    _test_designation_tie_break_lexicographic_event_id_when_occurred_matches)
+  test_designation_segment_boundary_straddling_matches_rebuild = _unittest_tmp_path_test(
+    _test_designation_segment_boundary_straddling_matches_rebuild)
+  test_rebuild_recomputes_designation_ignoring_stale_prior_manifest = _unittest_tmp_path_test(
+    _test_rebuild_recomputes_designation_ignoring_stale_prior_manifest)
+  test_designation_persists_across_manifest_rotation = _unittest_tmp_path_test(
+    _test_designation_persists_across_manifest_rotation)
+  test_designation_count_message_reports_primary_subset = _unittest_tmp_path_test(
+    _test_designation_count_message_reports_primary_subset)

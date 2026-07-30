@@ -6,9 +6,9 @@ times, hysteresis holds, the whiplash ratchet, the emergency stand-down, and sle
 continuity. Scenario numbers are chosen to isolate one mechanism at a time -- each
 test states which gates the other mechanisms are held clear of.
 """
-import pytest
-
+from openpilot.common.parameterized import parameterized
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.blt import (BLTSupervisor, DebouncedTrigger, LeadDeparturePreRelease,
                                                   JERK_SCALE_MIN, JERK_SCALE_RATE,
                                                   LEAD_DEPARTURE_CANCEL, LEAD_DEPARTURE_CONFIRM,
@@ -62,7 +62,7 @@ def frames(seconds):
   return round(seconds / DT_MDL)
 
 
-class TestDebouncedTrigger:
+class TestDebouncedTrigger(OpenpilotTestCase):
   def test_arms_only_after_debounce(self):
     # float accumulation: 8 x 0.05 sums just under 0.4, so arming lands one frame later
     trig = DebouncedTrigger(0.4)
@@ -87,7 +87,7 @@ class TestDebouncedTrigger:
     assert not trig.step(arm=True, disarm=False)
 
 
-class TestInert:
+class TestInert(OpenpilotTestCase):
   def test_no_lead(self):
     sup = BLTSupervisor()
     js, tf = run(sup, make_sm(status=False), a_plan=-3.0, n=frames(2.0))
@@ -107,7 +107,7 @@ class TestInert:
     assert tf == T_FOLLOW_BASE
 
 
-class TestRecoveryBoost:
+class TestRecoveryBoost(OpenpilotTestCase):
   # steady following (a_req ~ 0), plan holding deep braking -> stale deceleration
   def test_arms_on_sustained_excess(self):
     sup = BLTSupervisor()
@@ -115,7 +115,7 @@ class TestRecoveryBoost:
     js, _ = run(sup, sm, a_plan=-2.0, n=frames(0.35))
     assert js == 1.0  # debounce (0.4s) not yet met -- no movement at all
     js, _ = run(sup, sm, a_plan=-2.0, n=frames(1.0))
-    assert js == pytest.approx(JERK_SCALE_MIN)
+    self.assertAlmostEqual(js, JERK_SCALE_MIN)
 
   def test_ignores_small_trims(self):
     sup = BLTSupervisor()
@@ -130,13 +130,13 @@ class TestRecoveryBoost:
     assert js == 1.0
 
 
-class TestModelEarlyArm:
+class TestModelEarlyArm(OpenpilotTestCase):
   # model forecasts a hard lead decel (leadsV3 0->2s slope) before radar measures one
   def test_arms_on_predicted_hard_decel(self):
     sup = BLTSupervisor()
     sm = make_sm(model_v=[15.0, 11.0, 8.0, 6.0, 5.0, 5.0])  # slope -2.0 m/s^2
     js, _ = run(sup, sm, a_plan=0.0, n=frames(1.0))
-    assert js == pytest.approx(JERK_SCALE_MIN)
+    self.assertAlmostEqual(js, JERK_SCALE_MIN)
 
   def test_silent_when_model_unconfident(self):
     sup = BLTSupervisor()
@@ -151,9 +151,9 @@ class TestModelEarlyArm:
     assert js == 1.0
 
 
-class TestLaunchBoost:
+class TestLaunchBoost(OpenpilotTestCase):
   # lead pulling away AND accelerating, necessity zero, plan accel lagging the lead's
-  LAUNCH = dict(v_ego=3.0, v_lead=5.0, d_rel=10.0, a_lead=2.0)
+  LAUNCH = {"v_ego": 3.0, "v_lead": 5.0, "d_rel": 10.0, "a_lead": 2.0}
 
   def test_arms_on_lagging_launch(self):
     sup = BLTSupervisor()
@@ -161,7 +161,7 @@ class TestLaunchBoost:
     js, _ = run(sup, sm, a_plan=0.2, n=frames(0.35))
     assert js == 1.0  # debounce not yet met
     js, _ = run(sup, sm, a_plan=0.2, n=frames(1.0))
-    assert js == pytest.approx(JERK_SCALE_MIN)
+    self.assertAlmostEqual(js, JERK_SCALE_MIN)
 
   def test_no_arm_on_constant_speed_pullaway(self):
     sup = BLTSupervisor()
@@ -177,11 +177,17 @@ class TestLaunchBoost:
     assert js == 1.0
 
 
-class TestLeadDeparturePreRelease:
+class TestLeadDeparturePreRelease(OpenpilotTestCase):
   @staticmethod
   def launch_sm(**kwargs):
-    defaults = dict(v_ego=0.0, v_lead=0.0, v_lead_raw=0.0, d_rel=6.0,
-                    model_v=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], standstill=True)
+    defaults = {
+      "v_ego": 0.0,
+      "v_lead": 0.0,
+      "v_lead_raw": 0.0,
+      "d_rel": 6.0,
+      "model_v": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+      "standstill": True,
+    }
     defaults.update(kwargs)
     return make_sm(**defaults)
 
@@ -225,7 +231,7 @@ class TestLeadDeparturePreRelease:
     stopped_lead = self.launch_sm(model_v=[0.0] * 6)
     assert not run_pre_release(release, stopped_lead, frames(LEAD_DEPARTURE_CANCEL))
 
-  @pytest.mark.parametrize("kwargs,active", [
+  @parameterized.expand([
     ({"status": False}, True),
     ({"radar_valid": False}, True),
     ({"standstill": False, "v_ego": 0.2}, True),
@@ -239,11 +245,11 @@ class TestLeadDeparturePreRelease:
       assert not release.update(sm, active=active)
 
 
-class TestWhiplashRatchet:
+class TestWhiplashRatchet(OpenpilotTestCase):
   def _armed_launch(self):
     sup = BLTSupervisor()
     run(sup, make_sm(**TestLaunchBoost.LAUNCH), a_plan=0.2, n=frames(1.5))
-    assert sup.jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    self.assertAlmostEqual(sup.jerk_scale, JERK_SCALE_MIN)
     return sup
 
   def test_holds_relaxed_while_lead_brakes_and_closing(self):
@@ -252,7 +258,7 @@ class TestWhiplashRatchet:
     # (a_req = 1.0 + 1/22 ~ 1.05 < 1.5 -> non-emergency path)
     sm = make_sm(v_ego=5.0, v_lead=4.0, d_rel=15.0, a_lead=-1.0)
     js, _ = run(sup, sm, a_plan=0.0, n=frames(1.0))
-    assert js == pytest.approx(JERK_SCALE_MIN)
+    self.assertAlmostEqual(js, JERK_SCALE_MIN)
 
   def test_releases_when_lead_stops_braking(self):
     sup = self._armed_launch()
@@ -271,7 +277,7 @@ class TestWhiplashRatchet:
     assert js == 1.0
 
 
-class TestSlewContinuity:
+class TestSlewContinuity(OpenpilotTestCase):
   def test_jerk_scale_never_steps(self):
     sup = BLTSupervisor()
     sm_boost = make_sm()
@@ -297,13 +303,13 @@ class TestSlewContinuity:
       prev = pad
 
 
-class TestDynamicOnset:
+class TestDynamicOnset(OpenpilotTestCase):
   def test_pad_proportional_to_lead_decel(self):
     sup = BLTSupervisor()
     # lead braking at half of ONSET_FULL_DECEL -> half of ONSET_PAD_MAX
     sm = make_sm(v_ego=15.0, v_lead=14.0, d_rel=40.0, a_lead=-0.75)
     _, tf = run(sup, sm, a_plan=-0.5, n=frames(2.0))
-    assert tf - T_FOLLOW_BASE == pytest.approx(ONSET_PAD_MAX * 0.5)
+    self.assertAlmostEqual(tf - T_FOLLOW_BASE, ONSET_PAD_MAX * 0.5)
 
   def test_no_pad_while_recovering(self):
     sup = BLTSupervisor()
@@ -319,7 +325,7 @@ class TestDynamicOnset:
     sm = make_sm(v_ego=6.0, v_lead=0.0, d_rel=20.0, a_lead=0.0)
     _, tf = run(sup, sm, a_plan=-0.5, n=frames(2.0))
     expected = ONSET_PAD_MAX * min(1.125 / 1.2, 1.0)
-    assert tf - T_FOLLOW_BASE == pytest.approx(expected, abs=1e-3)
+    self.assertAlmostEqual(tf - T_FOLLOW_BASE, expected, delta=1e-3)
 
   def test_base_passthrough_same_frame(self):
     sup = BLTSupervisor()

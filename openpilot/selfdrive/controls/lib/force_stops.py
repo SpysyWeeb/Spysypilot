@@ -8,12 +8,13 @@ line indefinitely. The tell is the model's planned *path*: its endpoint closes i
 few meters while the stop intent flickers. This module reads that intent directly --
 when the model's path ends within a few seconds of travel and there is no lead, latch
 the model's own stop point and hold the plan to it by capping the cruise speed at
-(remaining distance / ramp time). The ACC MPC then shapes the deceleration itself, its
-shouldStop asserts as the plan speed falls below vEgoStopping, and Smooth Stops lands
-the last meter. Force Stops decides that/where, the MPC shapes, Smooth Stops lands.
+(remaining distance / ramp time). The planner's cruise candidate then shapes the
+deceleration, the shared stop gate asserts near standstill, and Smooth Stops lands the
+last meter. Force Stops decides that/where, the planner shapes, Smooth Stops lands.
 
 A false detection only produces a gentle, plan-shaped slowdown that unwinds when the
-filtered detector drops -- the cap drives the real MPC, never a synthetic brake command.
+filtered detector drops -- the cap drives the real cruise candidate, never a synthetic
+brake command.
 """
 import math
 
@@ -38,7 +39,7 @@ PRE_LATCH_GATE = 0.35     # filtered detector level that turns on pre-latch shap
                           # roll past the model's final stop point
 DV_MAX = 2.0              # m/s, the cap may never sit further below current speed while shaping
                           # (same bounded-error lesson as smooth_approach: v_cruise is a target the
-                          # MPC erases in seconds; unbounded, a collapsing path commands a slam).
+                          # planner closes quickly; unbounded, a collapsing path commands a slam).
                           # Inside ~2 m/s of a stop the bound is moot and the commit ramp expresses
                           # fully, so the guaranteed-stop property is untouched
 LATCH_SETBACK = 1.0       # m, latch this far short of the model's endpoint (the owner's "stop a

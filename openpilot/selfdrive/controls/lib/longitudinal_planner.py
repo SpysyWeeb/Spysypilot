@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
@@ -12,7 +13,7 @@ from openpilot.selfdrive.controls.lib.blt import BLTSupervisor, LeadDeparturePre
 from openpilot.selfdrive.controls.lib.model_curve_speed import ModelCurveSpeedLimiter
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
-from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
 from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
@@ -21,9 +22,16 @@ A_CRUISE_MAX_VALS = [4.0, 2.4, 1.2, 0.6]  # Spysypilot: launch-tapered (owner re
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]    # ACCEL_MAX off the line, decaying to stock by 40 m/s
                                           # (2.5x/2x/1.5x/1x stock; needs ACCEL_MAX=4.0 + panda
                                           # safety bump in opendbc, both already in place)
+J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
+A_CRUISE_MIN = -1.2
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+
+# Keep upstream's instantaneous in-turn safety envelope while allowing the
+# fork's 4.0 m/s^2 straight-line launch schedule.
+_A_TOTAL_MAX_V = [4.0, 4.0]
+_A_TOTAL_MAX_BP = [20., 40.]
 
 LAUNCH_DISARM_SPEED = 2.0
 LAUNCH_COMMIT_T = 3.5
@@ -40,6 +48,27 @@ def get_max_accel(v_ego):
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
+def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle):
+  max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
+
+  if not e2e:
+    a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
+    a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
+    a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
+    max_accel = min(max_accel, a_x_allowed)
+    if not allow_throttle:
+      clipped_accel_coast = max(accel_coast, ACCEL_MIN)
+      coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [max_accel, clipped_accel_coast])
+      max_accel = min(max_accel, coast_limit)
+
+  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel)
+  if not e2e:
+    j_cruise = np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS)
+    target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
+
+  return target_accel
+
+
 class LongitudinalPlanner:
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
     self.CP = CP
@@ -54,7 +83,7 @@ class LongitudinalPlanner:
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.force_stops = ForceStops(dt=self.dt)
     self.blt = BLTSupervisor()
-    self.prev_accel_clip = [ACCEL_MIN, ACCEL_MAX]
+    self.a_cruise = 0.0
     self.output_a_target = 0.0
     self.output_should_stop = False
     self.launch_armed = False
@@ -98,44 +127,32 @@ class LongitudinalPlanner:
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
-    v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
-
-    long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
-    force_slow_decel = sm['controlsState'].forceDecel
-
-    # Reset current state when not engaged, or user is controlling the speed
-    reset_state = long_control_off if self.CP.openpilotLongitudinalControl else not sm['selfdriveState'].enabled
-    # PCM cruise speed may be updated a few cycles later, check if initialized
-    reset_state = reset_state or not v_cruise_initialized
-
-    # No change cost when user is controlling the speed, or when standstill
-    prev_accel_constraint = not (reset_state or sm['carState'].standstill)
-
-    accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
-
-    if reset_state:
-      self.v_desired_filter.x = v_ego
-      # Clip aEgo to cruise limits to prevent large accelerations when becoming active
-      self.a_desired = np.clip(sm['carState'].aEgo, accel_clip[0], accel_clip[1])
-
-    # Prevent divergence, smooth in current v_ego
-    self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
-    _, model_v, model_a, _, throttle_prob = self.parse_model(sm['modelV2'])
-    # Don't clip at low speeds since throttle_prob doesn't account for creep
-    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
-
-    if not self.allow_throttle:
-      clipped_accel_coast = max(accel_coast, accel_clip[0])
-      clipped_accel_coast_interp = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [accel_clip[1], clipped_accel_coast])
-      accel_clip[1] = min(accel_clip[1], clipped_accel_coast_interp)
-
-    if force_slow_decel:
+    if sm['controlsState'].forceDecel:
       v_cruise = 0.0
     else:
       v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise)
 
-    # Force Stops: hold the model to a stop it planned (red-light indecision / e2e crawl)
-    v_cruise = min(v_cruise, self.force_stops.update(sm))
+    long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
+
+    # Reset current state when not engaged, or user is controlling the speed
+    reset_state = long_control_off if self.CP.openpilotLongitudinalControl else not sm['selfdriveState'].enabled
+    # PCM cruise speed may be updated a few cycles later, check if initialized
+    v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
+    reset_state = reset_state or not v_cruise_initialized
+
+    _, model_v, model_a, _, throttle_prob = self.parse_model(sm['modelV2'])
+    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
+    steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
+
+    if reset_state:
+      self.v_desired_filter.x = v_ego
+      self.a_desired = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
+
+    # Prevent divergence, smooth in current v_ego
+    self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
+
+    # No change cost when user is controlling the speed, or when standstill
+    prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
     # BLT necessity supervisor: modulates the solver's own runtime knobs (see docs/BLoT.md)
     personality = sm['selfdriveState'].personality
@@ -143,7 +160,7 @@ class LongitudinalPlanner:
     model_leads = sm['modelV2'].leadsV3 if len(sm['modelV2'].leadsV3) > 1 else None
     self.mpc.set_weights(prev_accel_constraint, personality=personality, jerk_factor_scale=jerk_scale)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(sm['radarState'], v_cruise, personality=personality,
+    self.mpc.update(sm['radarState'], personality=personality,
                     t_follow=t_follow_blt, model_leads=model_leads)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
@@ -155,14 +172,13 @@ class LongitudinalPlanner:
     if self.fcw:
       cloudlog.info("FCW triggered")
 
-    # Interpolate 0.05 seconds and save as starting point for next iteration
+    # Save starting point for next iteration
     a_prev = self.a_desired
-    self.a_desired = float(np.interp(self.dt, CONTROL_N_T_IDX, self.a_desired_trajectory))
-    self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.a_desired + a_prev) / 2.0
 
     action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
-    output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
-                                                                        action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
+    output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
+                                              action_t=action_t)
+    output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
     # Route 8d: the Palisade took ~2.1 s from a positive post-controller request to
     # wheel motion at standstill, while the normal planner action horizon is ~0.55 s.
     # Start only the hold-release/brake-bleed leg from the radar-anchored predicted
@@ -179,9 +195,8 @@ class LongitudinalPlanner:
     # 30-60m) about 1.5-2s BEFORE its shouldStop bit releases (field data, routes 37/38).
     # Read the path instead of the laggy bit -- the same trick Force Stops uses for stop
     # intent, mirrored for launch intent. Clearing shouldStop releases the hold; the car
-    # creeps off on startAccel, the model sees motion and commits its plan, and the launch
-    # assist below takes it from there. If the path re-collapses (the model changed its
-    # mind), the bit passes through again and the hold re-engages at creep speed.
+    # creeps off, the model sees motion and commits its plan, and the launch assist below
+    # takes it from there. If the path re-collapses, the hold re-engages at creep speed.
     xs = sm['modelV2'].position.x
     model_length = float(xs[-1]) if len(xs) else 0.0
     self.launch_open.update(1.0 if model_length > LAUNCH_OPEN_LENGTH else 0.0)
@@ -204,23 +219,28 @@ class LongitudinalPlanner:
       t_shifted = T_IDXS_MPC + t_cut
       v_shifted = np.interp(t_shifted, T_IDXS_MPC, model_v)
       a_shifted = np.interp(t_shifted, T_IDXS_MPC, model_a)
-      a_launch = get_accel_from_plan(v_shifted, a_shifted, T_IDXS_MPC, action_t=action_t, vEgoStopping=self.CP.vEgoStopping)[0]
+      a_launch = get_accel_from_plan(v_shifted, a_shifted, T_IDXS_MPC, action_t=action_t)
       a_launch_max = np.interp(v_ego, [LAUNCH_MOVING_SPEED, LAUNCH_DISARM_SPEED], [LAUNCH_MAX_ACCEL, 0.])
       output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
 
-    if sm['selfdriveState'].experimentalMode:
-      output_a_target = min(output_a_target_e2e, output_a_target_mpc)
-      self.output_should_stop = output_should_stop_e2e or output_should_stop_mpc
-      if output_a_target < output_a_target_mpc:
-        self.mpc.source = LongitudinalPlanSource.e2e
-    else:
-      output_a_target = output_a_target_mpc
-      self.output_should_stop = output_should_stop_mpc
+    # Force Stops: hold the model to a stop it planned (red-light indecision / e2e crawl)
+    v_cruise = min(v_cruise, self.force_stops.update(sm))
+    self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
+                                     self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
+                                     accel_coast, self.allow_throttle)
+    cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
-    for idx in range(2):
-      accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
-    self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
-    self.prev_accel_clip = accel_clip
+    candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
+                  (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
+    if sm['selfdriveState'].experimentalMode:
+      candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
+
+    output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
+    self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+    self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
+
+    self.a_desired = float(self.output_a_target)
+    self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')

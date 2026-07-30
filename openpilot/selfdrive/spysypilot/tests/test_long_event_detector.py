@@ -1,7 +1,6 @@
 from dataclasses import replace
 
-import pytest
-
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.spysypilot.long_event_detector import LaunchSample, LeadLaunchDetector
 
 
@@ -41,7 +40,7 @@ def run_scenario(detector: LeadLaunchDetector, end: float, state_fn):
   return None
 
 
-class TestLeadLaunchDetector:
+class TestLeadLaunchDetector(OpenpilotTestCase):
   def test_attributes_early_command_late_wheel_motion_to_vehicle(self):
     detector = LeadLaunchDetector()
 
@@ -61,11 +60,11 @@ class TestLeadLaunchDetector:
     event = run_scenario(detector, 4.0, state)
     assert event is not None
     assert event.event_type == "late_lead_launch_vehicle"
-    assert event.lead_to_ego_s == pytest.approx(1.2)
-    assert event.command_to_ego_s == pytest.approx(2.2)
-    assert event.plan_to_lead_s == pytest.approx(-1.0)
-    assert event.forecast_to_lead_s == pytest.approx(-1.2)
-    assert event.confidence == pytest.approx(0.95)
+    self.assertAlmostEqual(event.lead_to_ego_s, 1.2)
+    self.assertAlmostEqual(event.command_to_ego_s, 2.2)
+    self.assertAlmostEqual(event.plan_to_lead_s, -1.0)
+    self.assertAlmostEqual(event.forecast_to_lead_s, -1.2)
+    self.assertAlmostEqual(event.confidence, 0.95)
     assert event.attribution_detail == "downstream/vehicle response"
     assert event.episode_start_mono_time == 0.0
     assert {onset.kind for onset in event.onsets} >= {
@@ -89,7 +88,7 @@ class TestLeadLaunchDetector:
     event = run_scenario(detector, 4.0, state)
     assert event is not None
     assert event.event_type == "late_lead_launch_planner"
-    assert event.plan_to_lead_s == pytest.approx(0.5)
+    self.assertAlmostEqual(event.plan_to_lead_s, 0.5)
 
   def test_does_not_flag_a_swift_launch(self):
     detector = LeadLaunchDetector()
@@ -125,7 +124,7 @@ class TestLeadLaunchDetector:
 
     event = run_scenario(detector, 4.0, state)
     assert event is not None
-    assert event.confidence == pytest.approx(0.55)
+    self.assertAlmostEqual(event.confidence, 0.55)
 
   def test_logs_stall_once(self):
     detector = LeadLaunchDetector()

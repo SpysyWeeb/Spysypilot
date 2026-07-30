@@ -1,11 +1,11 @@
 [submodule "panda"]
   path = panda
   url = ../../SpysyWeeb/panda.git
-  branch = Spysypilot
+  branch = combo-locked
 [submodule "opendbc"]
   path = opendbc_repo
   url = ../../SpysyWeeb/opendbc.git
-  branch = Combo
+  branch = combo-locked
 [submodule "msgq"]
   path = msgq_repo
   url = ../../commaai/msgq.git

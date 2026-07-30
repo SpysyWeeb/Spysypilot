@@ -45,9 +45,9 @@ class SmoothStopController:
   """
   Owns the final approach to a stop, inside longcontrol (control rate, true v_ego).
 
-  The harsh "headbang" stop is the stock handoff: the moment the plan's speed drops
-  below vEgoStopping, the state machine jumps to the `stopping` state and ramps the
-  command to stopAccel (-2.0 m/s^2) -- while the car is usually still rolling. This
+  The harsh "headbang" stop is the stock handoff: once the shared near-standstill
+  stop gate fires, the state machine jumps to the `stopping` state and ramps the
+  command to stopAccel (-2.0 m/s^2) -- while the car can still be rolling. This
   controller instead keeps the car in a closed-loop *settle* feather that decelerates
   it smoothly to a true standstill, and only lets the hold clamp engage once stopped:
 
@@ -58,13 +58,13 @@ class SmoothStopController:
                       progress (anti-creep), escalating faster the tighter the remaining gap
                       to a lead is -- a stall that's eating into a close gap is urgent, not
                       just uncomfortable. Only the settle pressure is feathered -- braking
-                      demanded by the MPC's plan (which owns collision avoidance) is applied
+                      demanded by the selected planner target (which owns collision avoidance) is applied
                       immediately, so full braking force is never delayed.
     want_hold()    -- request the stopping/hold clamp only once v_ego is at/below
                       STANDSTILL_SPEED (or the car reports standstill), so the clamp lands
                       on a stopped car. Pure query, no state.
     arm_hold()     -- called by longcontrol on every transition into the stopping state
-                      (including the stock off/starting edges that bypass want_hold), so
+                      (including the stock off edge that bypasses want_hold), so
                       the hold always starts with a fresh release debounce.
     hold_release() -- once holding, require should_stop to stay false for HOLD_RELEASE_FRAMES
                       before releasing, so a one-frame plan flicker can't blip the brake.
@@ -97,7 +97,7 @@ class SmoothStopController:
 
   def arm_hold(self) -> None:
     # Fresh release debounce for a new hold. Longcontrol calls this on every transition
-    # into the stopping state -- the stock edges (off/starting -> stopping) never go
+    # into the stopping state -- the stock off -> stopping edge never goes
     # through want_hold, and a counter left >= HOLD_RELEASE_FRAMES by the previous stop
     # would let a one-frame should_stop flicker release the new hold instantly.
     self._no_stop_frames = 0
@@ -105,7 +105,7 @@ class SmoothStopController:
   def hold_release(self, should_stop: bool) -> bool:
     # Debounce the hold exit: the plan's should_stop can flicker false for a frame while
     # stopped (seen with e2e in experimental mode), which would blip the state machine to
-    # starting and release brake pressure at standstill. Only release once should_stop has
+    # pid and release brake pressure at standstill. Only release once should_stop has
     # been false for HOLD_RELEASE_FRAMES straight. The counter is deliberately NOT cleared
     # by reset() -- reset() runs every frame while holding, which would defeat the debounce.
     if should_stop:
@@ -155,6 +155,6 @@ class SmoothStopController:
     step = SETTLE_JERK * DT_CTRL
     a_settle = min(max(a_settle, last_output - step), last_output + step)
 
-    # never brake softer than the MPC's plan -- it owns collision avoidance, so its demand
+    # never brake softer than the selected planner target -- it owns collision avoidance, so its demand
     # is applied immediately, unfeathered (full braking force is never delayed)
     return min(a_settle, a_target)

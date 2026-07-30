@@ -133,8 +133,9 @@ class LeadDeparturePreRelease:
 
   NewLeadMpc anchors the model trajectory to radar at t=0; use the same anchoring
   here and inspect its first future sample (2 s). A sustained predicted departure
-  releases only the MPC's shouldStop bit, allowing the existing starting state to
-  begin brake bleed while leaving aTarget and the driving curve unchanged.
+  releases only the lead/MPC candidate's shouldStop bit, allowing planner arbitration
+  to release the hold when the other candidates agree. PID then begins brake bleed
+  while aTarget and the driving curve remain unchanged.
 
   Loss of both predicted and measured departure evidence cancels after a short
   confirmation, preventing a release-rehold pulse on a one-frame model/radar dropout.

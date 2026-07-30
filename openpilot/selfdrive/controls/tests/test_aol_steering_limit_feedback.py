@@ -1,8 +1,9 @@
 from opendbc.car.structs import car
+from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.controlsd import get_steer_limited_by_safety
 
 
-class TestAolSteeringLimitFeedback:
+class TestAolSteeringLimitFeedback(OpenpilotTestCase):
   def test_torque_limit_is_updated_from_lat_active(self):
     CP = car.CarParams.new_message()
     CP.steerControlType = car.CarParams.SteerControlType.torque
