@@ -1,3 +1,98 @@
+# BLaTv2 — modular adaptive lateral control
+
+Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot),
+created from the current untouched `stock` tip.
+
+## Status
+
+**In progress — ground-up replacement. Not field eligible.**
+
+This branch replaces the previous BLaTv2 controller architecture. Git history
+and useful test infrastructure remain available for audit, but no previous
+BLaTv2 controller mechanism is part of the new active design by default.
+Until the complete modular candidate passes replay, safety, timing, and
+portability gates, the stock openpilot torque controller remains the only
+active controller. The candidate may run in shadow, but it cannot actuate.
+
+The product target is **Smooth. Swift. Strong.**
+
+- **Smooth:** the requested wheel motion is continuous and intentional, without
+  jitter, ping-pong, or modules correcting one another.
+- **Swift:** useful torque is requested quickly enough to meet the model's
+  authored path timing. The path is not moved earlier to conceal controller
+  delay.
+- **Strong:** the controller uses the vehicle's available authority when the
+  model path requires it and does not accept persistent tracking error merely
+  to keep the torque trace quiet.
+
+The architecture, module contracts, learning policy, opendbc boundary, and
+acceptance sequence are documented in
+[`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
+[`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
+
+No BLaTv1 controller code or `HyundaiLowSpeedTorqueDamping` is inherited.
+Vehicle-specific magnitude/rate limits come from the active opendbc
+`CarControllerParams`; the controller contains no Palisade limit literals.
+opendbc may enforce platform command limits and panda safety, but it may not
+damp, boost, filter, or otherwise reinterpret the controller's normalized
+request.
+
+### What is built
+
+The replacement is split into independently testable owners:
+
+- a model-time/intent adapter and stateless scalar-anchored future reference;
+- one measured rack mapping and forward/inverse physical plant;
+- one computed-torque core;
+- one exact opendbc command envelope and invalid-output guard;
+- a measured-response shadow and a speed-local slow learner;
+- an offroad-only artifact, feedback, promotion, and rollback lifecycle.
+
+The previous **LQI** controller—“Linear Quadratic Integral,” a state-feedback
+controller with an integral error state—is retired. It is not the controller
+being built here. The replacement core directly computes the torque required
+by the authored rack position, rate, and acceleration using one learned
+physical profile, so a tuning module does not have to correct another tuning
+module.
+
+The first combo build contains no approved modular profile. It therefore
+drives with the exact current stock torque-controller algorithm while the
+shadow and learner collect measured response. On opendbc's validated
+Palisade/Telluride platform, that stock request passes through the
+platform-selected **409/4/7** opendbc/panda envelope. Other cars keep their
+own stock limits and remain stock-controlled unless their opendbc port
+explicitly validates the complete modular command-envelope and rack-sensor
+contract.
+
+## Activation and learning
+
+The first drive on a vehicle is stock-controlled. The modular candidate
+collects clean, speed-local physical response data in shadow. A candidate
+profile is trained offroad and becomes eligible only when every required speed
+region has enough excitation, independent validation, and bounded uncertainty.
+Highway mileage cannot overwrite low-speed knowledge because samples update
+only their neighboring speed nodes.
+
+Profiles never change mid-drive. A newly qualified profile is promoted only at
+an engagement boundary and can be rolled back at the next disengagement. After
+the first active validation drive, the offroad review asks:
+
+> Compared with the previous steering profile, how did steering feel?
+
+The choices are **Better**, **About same**, **Worse**, and **Not sure**.
+`Worse` deactivates the provisional profile for the next engagement but keeps
+the data for diagnosis. Driver overrides are evidence bookmarks, not automatic
+proof that a controller is bad.
+
+Profile revisions are opaque, monotonically increasing evidence generations,
+not contiguous release numbers. Identical restored evidence produces the same
+revision and hash; any additional accepted clean sample advances the next
+qualified candidate. This lets later casual drives refine the profile without
+rebasing accumulated physical statistics or letting highway data overwrite
+low-speed nodes.
+
+---
+
 <div align="center" style="text-align: center;">
 
 <h1>openpilot</h1>
