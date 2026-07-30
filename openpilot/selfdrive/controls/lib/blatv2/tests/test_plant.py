@@ -7,7 +7,9 @@ import unittest
 from openpilot.selfdrive.controls.lib.blatv2.plant import (
   AlignInputs,
   AlignParams,
+  AlignRuntimeTerms,
   PlantParams,
+  PlantSensitivity,
   PlantState,
   PlantTwin,
   SignedRackRate,
@@ -263,6 +265,74 @@ class TestPlantTwin(unittest.TestCase):
         expected, applied, 0.01, inputs,
       )
     assert_state_close(self, predicted, expected)
+
+  def test_prepared_applied_history_matches_public_plant_contract(self) -> None:
+    twin = PlantTwin(params(), align_params())
+    inputs = AlignInputs(0.015, -0.3, 0.92, 15.7, True)
+    state = PlantState(37.0, -8.0, 0.21, 6.5)
+    history = [0.18, 0.14, 0.08, -0.02, -0.09]
+    expected = PlantState(0.0, 0.0, 0.0, 0.0)
+    prepared = PlantState(0.0, 0.0, 0.0, 0.0)
+    terms = AlignRuntimeTerms()
+    twin.predict_applied_history_into(
+      state, 0.05, history, 3, 5, inputs, 0.025, expected, 0.01,
+    )
+    twin.prepare_align_runtime_terms(state.v_ego, inputs, terms)
+    twin.predict_applied_history_prepared_into(
+      state,
+      0.05,
+      history,
+      3,
+      5,
+      0.025,
+      terms,
+      prepared,
+      0.01,
+    )
+    assert_state_close(self, prepared, expected)
+
+  def test_terminal_sensitivity_matches_neighboring_prepared_rollout(self) -> None:
+    twin = PlantTwin(params(), align_params())
+    inputs = AlignInputs(0.01, 0.2, 0.95, 15.2, True)
+    state = PlantState(14.0, 4.0, 0.12, 5.0)
+    terms = AlignRuntimeTerms()
+    target = PlantState(0.0, 0.0, 0.0, 0.0)
+    sensitivity = PlantSensitivity()
+    twin.prepare_align_runtime_terms(state.v_ego, inputs, terms)
+    request = 0.31
+    epsilon = 1e-7
+    twin.predict_constant_request_sensitivity_into(
+      state,
+      0.27,
+      request,
+      0.02,
+      terms,
+      target,
+      sensitivity,
+      0.01,
+    )
+    neighbor = PlantState(0.0, 0.0, 0.0, 0.0)
+    twin.predict_constant_request_prepared_into(
+      state,
+      0.27,
+      request + epsilon,
+      0.02,
+      terms,
+      neighbor,
+      0.01,
+    )
+    self.assertTrue(math.isclose(
+      (neighbor.angle_deg - target.angle_deg) / epsilon,
+      sensitivity.angle_per_torque,
+      rel_tol=2e-5,
+      abs_tol=2e-5,
+    ))
+    self.assertTrue(math.isclose(
+      (neighbor.rate_deg_s - target.rate_deg_s) / epsilon,
+      sensitivity.rate_per_torque,
+      rel_tol=2e-5,
+      abs_tol=2e-5,
+    ))
 
   def test_allocation_free_rollout_accepts_live_delay_without_rebuilding_twin(self) -> None:
     twin = PlantTwin(params(), align_params())

@@ -49,7 +49,9 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import (
   ObserverStatus,
 )
 from openpilot.selfdrive.controls.lib.blatv2.plant import (
+  AlignRuntimeTerms,
   AlignInputs,
+  PlantSensitivity,
   PlantState,
   PlantTwin,
 )
@@ -88,21 +90,37 @@ class InverseEpsActionController:
     self.command_next_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.arrival_source_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.arrival_state = PlantState(0.0, 0.0, 0.0, 0.0)
+    self.arrival_align_terms = AlignRuntimeTerms()
+    self.arrival_sensitivity = PlantSensitivity()
+    self.arrival_low_request = -1.0
+    self.arrival_high_request = 1.0
     self.local_terms = _InverseTerms()
-    self.trajectory_times = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
-    self.trajectory_demands = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
-    self.trajectory_targets = np.empty(MAX_DECISION_STEPS, dtype=np.float64)
-    self.trajectory_constraint_indices = np.empty(
-      MAX_DECISION_STEPS, dtype=np.int32,
-    )
+    self.trajectory_demands = [0.0] * MAX_DECISION_STEPS
     self.command_history_capacity = int(
       math.ceil(self.twin.params.actuation_delay / DT_CTRL)
     )
-    self.command_history = np.empty(
-      max(self.command_history_capacity, 1), dtype=np.float64,
+    self.command_history = [0.0] * max(
+      self.command_history_capacity, 1,
     )
     self.command_history_start = 0
     self.command_history_count = 0
+    frame_seconds = DT_CTRL * self.twin.params.steer_step
+    self.trajectory_build_rate = (
+      self.twin.params.delta_up
+      / self.twin.params.steer_max
+      / frame_seconds
+    )
+    self.trajectory_decay_rate = (
+      self.twin.params.delta_down
+      / self.twin.params.steer_max
+      / frame_seconds
+    )
+    self.trajectory_build_delta = (
+      self.trajectory_build_rate * DECISION_DT
+    )
+    self.trajectory_decay_delta = (
+      self.trajectory_decay_rate * DECISION_DT
+    )
 
   def reset(self) -> None:
     self.result.invalidate()
@@ -133,14 +151,19 @@ class InverseEpsActionController:
     disturbance_torque: float,
   ) -> None:
     """Advance through commands already committed inside the pure delay."""
-    self.twin.predict_applied_history_into(
+    self.twin.prepare_align_runtime_terms(
+      state.v_ego,
+      align_inputs,
+      self.arrival_align_terms,
+    )
+    self.twin.predict_applied_history_prepared_into(
       state,
       duration,
       self.command_history,
       self.command_history_start,
       self.command_history_count,
-      align_inputs,
       disturbance_torque,
+      self.arrival_align_terms,
       self.predicted_state,
       DT_CTRL,
     )
@@ -170,6 +193,38 @@ class InverseEpsActionController:
     return (
       abs(start) / decay + abs(finish) / build
     ) * frame_seconds
+
+  def _constant_request_endpoint(
+    self,
+    source: float,
+    direction: float,
+    frame_count: int,
+  ) -> float:
+    """Exact endpoint of repeated full-authority slew applications.
+
+    This is the closed form of calling ``apply_slew(source, direction)`` once
+    per controller frame. It is used only to remove requests that produce an
+    identical terminal rollout; the plant rollout itself still applies the
+    limiter frame by frame.
+    """
+    start = min(max(float(source), -1.0), 1.0)
+    sign = math.copysign(1.0, float(direction))
+    count = int(frame_count)
+    if count <= 0:
+      return start
+    build = self.twin.params.delta_up / self.twin.params.steer_max
+    decay = self.twin.params.delta_down / self.twin.params.steer_max
+    oriented_start = sign * start
+    if oriented_start >= 0.0:
+      return sign * min(oriented_start + count * build, 1.0)
+    decay_frames = -oriented_start / decay
+    if count <= decay_frames:
+      remaining = -oriented_start - count * decay
+      return -sign * remaining
+    return sign * min(
+      (count - decay_frames) * build,
+      1.0,
+    )
 
   def _latest_feasible_predecessor(
     self,
@@ -239,8 +294,12 @@ class InverseEpsActionController:
     100 Hz evaluation handles the real residual on the next frame.
     """
     count = self.workspace.decision_count
-    last_time = float(self.workspace.decision_times[count - 1])
-    start_time = min(max(float(physical_effect_time), 0.0), last_time)
+    last_time = self.workspace.decision_times[count - 1]
+    start_time = float(physical_effect_time)
+    if start_time < 0.0:
+      start_time = 0.0
+    elif start_time > last_time:
+      start_time = last_time
     trajectory_count = min(
       int(math.floor((last_time - start_time) / DECISION_DT + 1e-12)) + 1,
       MAX_DECISION_STEPS,
@@ -248,45 +307,81 @@ class InverseEpsActionController:
     if trajectory_count <= 0:
       return float(local_target), False, 0.0, 0.0
 
+    start_position = start_time / DECISION_DT
+    lower_index = int(start_position)
+    sample_fraction = start_position - lower_index
     for index in range(trajectory_count):
-      sample_time = start_time + index * DECISION_DT
-      self.trajectory_times[index] = sample_time
-      sample_position = sample_time / DECISION_DT
-      demand = self._interpolate(
-        self.workspace.feedforward, sample_position, count,
+      sample_index = min(lower_index + index, count - 1)
+      upper_index = min(sample_index + 1, count - 1)
+      lower_demand = self.workspace.feedforward[sample_index]
+      demand = lower_demand + sample_fraction * (
+        self.workspace.feedforward[upper_index]
+        - lower_demand
       )
       if index == 0:
         # The scalar-pinned terminal solve supplies this frame's planned target
         # with the one measured-rack correction already included.
         demand = float(action_target)
-      self.trajectory_demands[index] = min(max(demand, -1.0), 1.0)
+      if demand < -1.0:
+        demand = -1.0
+      elif demand > 1.0:
+        demand = 1.0
+      self.trajectory_demands[index] = demand
 
     last = trajectory_count - 1
-    self.trajectory_targets[last] = self.trajectory_demands[last]
-    self.trajectory_constraint_indices[last] = last
+    future = self.trajectory_demands[last]
+    constraint_index = last
+    build_rate = self.trajectory_build_rate
+    decay_rate = self.trajectory_decay_rate
+    build_delta = self.trajectory_build_delta
+    decay_delta = self.trajectory_decay_delta
     for index in range(last - 1, -1, -1):
-      desired = float(self.trajectory_demands[index])
-      future = float(self.trajectory_targets[index + 1])
-      projected = self._latest_feasible_predecessor(
-        desired, future, DECISION_DT,
-      )
-      self.trajectory_targets[index] = projected
-      if projected == desired:
-        self.trajectory_constraint_indices[index] = index
-      else:
-        self.trajectory_constraint_indices[index] = (
-          self.trajectory_constraint_indices[index + 1]
+      desired = self.trajectory_demands[index]
+      if future > 0.0:
+        build_to_zero_time = future / build_rate
+        lower = (
+          future - build_delta
+          if DECISION_DT <= build_to_zero_time
+          else -decay_rate * (
+            DECISION_DT - build_to_zero_time
+          )
         )
+        upper = future + decay_delta
+      elif future < 0.0:
+        build_to_zero_time = -future / build_rate
+        lower = future - decay_delta
+        upper = (
+          future + build_delta
+          if DECISION_DT <= build_to_zero_time
+          else decay_rate * (
+            DECISION_DT - build_to_zero_time
+          )
+        )
+      else:
+        lower = -decay_delta
+        upper = decay_delta
+      if lower < -1.0:
+        lower = -1.0
+      if upper > 1.0:
+        upper = 1.0
+      if desired < lower:
+        projected = lower
+      elif desired > upper:
+        projected = upper
+      else:
+        projected = desired
+      if projected == desired:
+        constraint_index = index
+      future = projected
 
-    target = float(self.trajectory_targets[0])
-    projected = target != float(self.trajectory_demands[0])
+    target = future
+    projected = target != self.trajectory_demands[0]
     active = target != float(local_target)
     if not active:
       return target, False, 0.0, 0.0
     if projected:
-      constraint_index = int(self.trajectory_constraint_indices[0])
-      binding_demand = float(self.trajectory_demands[constraint_index])
-      binding_time = float(self.trajectory_times[constraint_index])
+      binding_demand = self.trajectory_demands[constraint_index]
+      binding_time = start_time + constraint_index * DECISION_DT
     else:
       binding_demand = float(action_target)
       binding_time = float(action_time)
@@ -297,90 +392,391 @@ class InverseEpsActionController:
       binding_time,
     )
 
-  def _solve_terminal_request(
+  def _solve_terminal_state_request(
     self,
     source: PlantState,
     duration: float,
-    target_value: float,
+    target_angle: float,
+    target_rate: float,
     nominal_request: float,
-    rate_target: bool,
-    align_inputs: AlignInputs,
     disturbance_torque: float,
+    direction: float,
+    enforce_rate: bool = True,
   ) -> float:
-    """Return the least change from nominal that reaches one terminal state."""
-    nominal = min(max(float(nominal_request), -1.0), 1.0)
-    self.twin.predict_constant_request_into(
+    """Return the least request reaching both terminal rack constraints.
+
+    The rack and limiter are piecewise affine in a constant request. Their
+    exact local sensitivities solve terminal angle and rate together. Earlier
+    code independently rebuilt the identical 30-step plant rollout for each
+    constraint, then selected the more authoritative request. In the oriented
+    direction of motion that selection is exactly the smallest request for
+    which both constraints hold, so one safeguarded solve is equivalent.
+
+    Equal-cost roots resolve toward the angle constraint by the fixed
+    ``>=`` comparison below. Secant and midpoint fallbacks preserve
+    convergence across slew, stiction, and zero-rate branch boundaries.
+    Precision is derived from one quarter of a physical Hyundai torque count;
+    it is numerical, not a steering-feel dial. Three evaluated corrections
+    plus one final local-affine extrapolation cap plant work, so
+    an unusual stiction branch cannot consume a variable part of the 10 ms
+    control frame.
+    """
+    low_request = self.arrival_low_request
+    high_request = self.arrival_high_request
+    target_angle_value = float(target_angle)
+    target_rate_value = float(target_rate)
+    direction_value = float(direction)
+    endpoint_prepared = direction_value != 0.0
+    if endpoint_prepared:
+      motion_direction = math.copysign(1.0, direction_value)
+      oriented_low = min(
+        motion_direction * low_request,
+        motion_direction * high_request,
+      )
+      oriented_high = max(
+        motion_direction * low_request,
+        motion_direction * high_request,
+      )
+      # Fast maneuvers dominate the fault route, and most action targets are
+      # physically unreachable inside one scalar-action interval. Prove that
+      # from the maximum reachable endpoint first: one rollout then replaces
+      # the old nominal-plus-endpoint pair on every saturated frame.
+      endpoint_request = motion_direction * oriented_high
+      self.twin.predict_constant_request_prepared_into(
+        source,
+        duration,
+        endpoint_request,
+        disturbance_torque,
+        self.arrival_align_terms,
+        self.arrival_state,
+        DT_CTRL,
+      )
+      high_angle_error = motion_direction * (
+        self.arrival_state.angle_deg - target_angle_value
+      )
+      high_rate_error = (
+        motion_direction * (
+          self.arrival_state.rate_deg_s - target_rate_value
+        )
+        if enforce_rate else math.inf
+      )
+      if high_angle_error < 0.0 or high_rate_error < 0.0:
+        return motion_direction
+
+    bounded_nominal = min(max(
+      min(max(float(nominal_request), -1.0), 1.0),
+      low_request,
+    ), high_request)
+    self.twin.predict_constant_request_sensitivity_into(
       source,
       duration,
-      nominal,
-      align_inputs,
+      bounded_nominal,
       disturbance_torque,
+      self.arrival_align_terms,
       self.arrival_state,
+      self.arrival_sensitivity,
       DT_CTRL,
     )
-    nominal_value = (
-      self.arrival_state.rate_deg_s
-      if rate_target else self.arrival_state.angle_deg
+    if direction_value == 0.0:
+      # A steady authored rack target has no motion sign. Its sole angle root
+      # still has a physical direction relative to the nominal terminal state.
+      angle_delta = target_angle_value - self.arrival_state.angle_deg
+      if angle_delta == 0.0:
+        return bounded_nominal
+      direction_value = angle_delta
+      motion_direction = math.copysign(1.0, direction_value)
+      oriented_low = min(
+        motion_direction * low_request,
+        motion_direction * high_request,
+      )
+      oriented_high = max(
+        motion_direction * low_request,
+        motion_direction * high_request,
+      )
+    oriented_nominal = motion_direction * bounded_nominal
+    angle_error = motion_direction * (
+      self.arrival_state.angle_deg - target_angle_value
     )
-    target = float(target_value)
-    if nominal_value == target:
-      return nominal
-    if nominal_value < target:
-      low = nominal
-      high = 1.0
-      self.twin.predict_constant_request_into(
-        source,
-        duration,
-        high,
-        align_inputs,
-        disturbance_torque,
-        self.arrival_state,
-        DT_CTRL,
+    rate_error = (
+      motion_direction * (
+        self.arrival_state.rate_deg_s - target_rate_value
       )
-      high_value = (
-        self.arrival_state.rate_deg_s
-        if rate_target else self.arrival_state.angle_deg
-      )
-      if target >= high_value:
-        return high
-    else:
-      low = -1.0
-      high = nominal
-      self.twin.predict_constant_request_into(
-        source,
-        duration,
-        low,
-        align_inputs,
-        disturbance_torque,
-        self.arrival_state,
-        DT_CTRL,
-      )
-      low_value = (
-        self.arrival_state.rate_deg_s
-        if rate_target else self.arrival_state.angle_deg
-      )
-      if target <= low_value:
-        return low
-    for _ in range(12):
-      request = 0.5 * (low + high)
-      self.twin.predict_constant_request_into(
+      if enforce_rate else math.inf
+    )
+    angle_sensitivity = self.arrival_sensitivity.angle_per_torque
+    rate_sensitivity = self.arrival_sensitivity.rate_per_torque
+    nominal_satisfies = angle_error >= 0.0 and rate_error >= 0.0
+
+    if nominal_satisfies:
+      oriented_high = oriented_nominal
+      high_angle_error = angle_error
+      high_rate_error = rate_error
+      request = motion_direction * oriented_low
+      self.twin.predict_constant_request_sensitivity_into(
         source,
         duration,
         request,
-        align_inputs,
         disturbance_torque,
+        self.arrival_align_terms,
         self.arrival_state,
+        self.arrival_sensitivity,
         DT_CTRL,
       )
-      value = (
-        self.arrival_state.rate_deg_s
-        if rate_target else self.arrival_state.angle_deg
+      low_angle_error = motion_direction * (
+        self.arrival_state.angle_deg - target_angle_value
       )
-      if value < target:
-        low = request
+      low_rate_error = (
+        motion_direction * (
+          self.arrival_state.rate_deg_s - target_rate_value
+        )
+        if enforce_rate else math.inf
+      )
+      if low_angle_error >= 0.0 and low_rate_error >= 0.0:
+        # Match the former independent solvers' full-authority saturation
+        # result when even the opposite reachable endpoint exceeds the target.
+        return -motion_direction
+      oriented_current = oriented_low
+      angle_error = low_angle_error
+      rate_error = low_rate_error
+      angle_sensitivity = self.arrival_sensitivity.angle_per_torque
+      rate_sensitivity = self.arrival_sensitivity.rate_per_torque
+    else:
+      oriented_low = oriented_nominal
+      low_angle_error = angle_error
+      low_rate_error = rate_error
+      if not endpoint_prepared:
+        request = motion_direction * oriented_high
+        self.twin.predict_constant_request_sensitivity_into(
+          source,
+          duration,
+          request,
+          disturbance_torque,
+          self.arrival_align_terms,
+          self.arrival_state,
+          self.arrival_sensitivity,
+          DT_CTRL,
+        )
+        high_angle_error = motion_direction * (
+          self.arrival_state.angle_deg - target_angle_value
+        )
+        high_rate_error = (
+          motion_direction * (
+            self.arrival_state.rate_deg_s - target_rate_value
+          )
+          if enforce_rate else math.inf
+        )
+        if high_angle_error < 0.0 or high_rate_error < 0.0:
+          return motion_direction
+      oriented_current = oriented_nominal
+
+    torque_resolution = 0.25 / self.twin.params.steer_max
+    for _ in range(3):
+      if oriented_high - oriented_low <= torque_resolution:
+        break
+
+      if angle_sensitivity > 0.0 and math.isfinite(angle_sensitivity):
+        angle_root = (
+          oriented_current - angle_error / angle_sensitivity
+        )
+      elif high_angle_error > low_angle_error:
+        angle_root = oriented_low + (
+          -low_angle_error
+          * (oriented_high - oriented_low)
+          / (high_angle_error - low_angle_error)
+        )
       else:
-        high = request
-    return 0.5 * (low + high)
+        angle_root = 0.5 * (oriented_low + oriented_high)
+
+      if not enforce_rate:
+        rate_root = oriented_low
+      elif rate_sensitivity > 0.0 and math.isfinite(rate_sensitivity):
+        rate_root = (
+          oriented_current - rate_error / rate_sensitivity
+        )
+      elif high_rate_error > low_rate_error:
+        rate_root = oriented_low + (
+          -low_rate_error
+          * (oriented_high - oriented_low)
+          / (high_rate_error - low_rate_error)
+        )
+      else:
+        rate_root = 0.5 * (oriented_low + oriented_high)
+
+      # Both terminal constraints become monotone in oriented request. The
+      # later root is therefore the exact counterpart of max(angle, rate) for
+      # positive motion and min(angle, rate) for negative motion.
+      proposed = max(angle_root, rate_root)
+      if (
+        not oriented_low < proposed < oriented_high
+        or proposed == oriented_current
+        or not math.isfinite(proposed)
+      ):
+        proposed = 0.5 * (oriented_low + oriented_high)
+
+      request = motion_direction * proposed
+      self.twin.predict_constant_request_sensitivity_into(
+        source,
+        duration,
+        request,
+        disturbance_torque,
+        self.arrival_align_terms,
+        self.arrival_state,
+        self.arrival_sensitivity,
+        DT_CTRL,
+      )
+      proposed_angle_error = motion_direction * (
+        self.arrival_state.angle_deg - target_angle_value
+      )
+      proposed_rate_error = (
+        motion_direction * (
+          self.arrival_state.rate_deg_s - target_rate_value
+        )
+        if enforce_rate else math.inf
+      )
+      proposed_angle_sensitivity = (
+        self.arrival_sensitivity.angle_per_torque
+      )
+      proposed_rate_sensitivity = (
+        self.arrival_sensitivity.rate_per_torque
+      )
+      angle_close = (
+        proposed_angle_error >= 0.0
+        or (
+          proposed_angle_sensitivity > 0.0
+          and proposed_angle_error
+          >= -proposed_angle_sensitivity * torque_resolution
+        )
+      )
+      rate_close = not enforce_rate or (
+        proposed_rate_error >= 0.0
+        or (
+          proposed_rate_sensitivity > 0.0
+          and proposed_rate_error
+          >= -proposed_rate_sensitivity * torque_resolution
+        )
+      )
+      if angle_close and rate_close and (
+        abs(proposed_angle_error)
+        <= proposed_angle_sensitivity * torque_resolution
+        or (
+          enforce_rate
+          and abs(proposed_rate_error)
+          <= proposed_rate_sensitivity * torque_resolution
+        )
+      ):
+        return request
+
+      if proposed_angle_error >= 0.0 and proposed_rate_error >= 0.0:
+        oriented_high = proposed
+        high_angle_error = proposed_angle_error
+        high_rate_error = proposed_rate_error
+      else:
+        oriented_low = proposed
+        low_angle_error = proposed_angle_error
+        low_rate_error = proposed_rate_error
+      oriented_current = proposed
+      angle_error = proposed_angle_error
+      rate_error = proposed_rate_error
+      angle_sensitivity = proposed_angle_sensitivity
+      rate_sensitivity = proposed_rate_sensitivity
+
+    # The selected branch is affine. Use its last exact sensitivity for the
+    # final sub-count estimate without spending another complete rack rollout;
+    # clamp to the proven bracket if the estimate crosses a branch boundary.
+    if angle_sensitivity > 0.0 and math.isfinite(angle_sensitivity):
+      angle_root = oriented_current - angle_error / angle_sensitivity
+    elif high_angle_error > low_angle_error:
+      angle_root = oriented_low + (
+        -low_angle_error
+        * (oriented_high - oriented_low)
+        / (high_angle_error - low_angle_error)
+      )
+    else:
+      angle_root = 0.5 * (oriented_low + oriented_high)
+    if not enforce_rate:
+      rate_root = oriented_low
+    elif rate_sensitivity > 0.0 and math.isfinite(rate_sensitivity):
+      rate_root = oriented_current - rate_error / rate_sensitivity
+    elif high_rate_error > low_rate_error:
+      rate_root = oriented_low + (
+        -low_rate_error
+        * (oriented_high - oriented_low)
+        / (high_rate_error - low_rate_error)
+      )
+    else:
+      rate_root = 0.5 * (oriented_low + oriented_high)
+    final_request = max(angle_root, rate_root)
+    if not math.isfinite(final_request):
+      final_request = 0.5 * (oriented_low + oriented_high)
+    final_request = min(max(
+      final_request,
+      oriented_low,
+    ), oriented_high)
+    hardware_count = 1.0 / self.twin.params.steer_max
+    if abs(final_request - oriented_current) > hardware_count:
+      # A branch extrapolation larger than one command count is not locally
+      # trustworthy. Verify only those rare cases, then extrapolate once more
+      # from the observed branch. Ordinary frames retain the fixed fast path.
+      request = motion_direction * final_request
+      self.twin.predict_constant_request_sensitivity_into(
+        source,
+        duration,
+        request,
+        disturbance_torque,
+        self.arrival_align_terms,
+        self.arrival_state,
+        self.arrival_sensitivity,
+        DT_CTRL,
+      )
+      angle_error = motion_direction * (
+        self.arrival_state.angle_deg - target_angle_value
+      )
+      rate_error = (
+        motion_direction * (
+          self.arrival_state.rate_deg_s - target_rate_value
+        )
+        if enforce_rate else math.inf
+      )
+      angle_sensitivity = self.arrival_sensitivity.angle_per_torque
+      rate_sensitivity = self.arrival_sensitivity.rate_per_torque
+      if angle_error >= 0.0 and rate_error >= 0.0:
+        oriented_high = final_request
+        high_angle_error = angle_error
+        high_rate_error = rate_error
+      else:
+        oriented_low = final_request
+        low_angle_error = angle_error
+        low_rate_error = rate_error
+      if angle_sensitivity > 0.0 and math.isfinite(angle_sensitivity):
+        angle_root = final_request - angle_error / angle_sensitivity
+      elif high_angle_error > low_angle_error:
+        angle_root = oriented_low + (
+          -low_angle_error
+          * (oriented_high - oriented_low)
+          / (high_angle_error - low_angle_error)
+        )
+      else:
+        angle_root = 0.5 * (oriented_low + oriented_high)
+      if not enforce_rate:
+        rate_root = oriented_low
+      elif rate_sensitivity > 0.0 and math.isfinite(rate_sensitivity):
+        rate_root = final_request - rate_error / rate_sensitivity
+      elif high_rate_error > low_rate_error:
+        rate_root = oriented_low + (
+          -low_rate_error
+          * (oriented_high - oriented_low)
+          / (high_rate_error - low_rate_error)
+        )
+      else:
+        rate_root = 0.5 * (oriented_low + oriented_high)
+      final_request = max(angle_root, rate_root)
+      if not math.isfinite(final_request):
+        final_request = 0.5 * (oriented_low + oriented_high)
+      final_request = min(max(
+        final_request,
+        oriented_low,
+      ), oriented_high)
+    return motion_direction * final_request
 
   def _action_point_feedforward(
     self,
@@ -413,32 +809,36 @@ class InverseEpsActionController:
     source.rate_deg_s = float(desired_start_rate)
     source.applied_torque = self.predicted_state.applied_torque
     source.v_ego = float(action_speed)
-    angle_request = self._solve_terminal_request(
-      source,
-      duration,
-      desired_action_angle,
-      local_feedforward,
-      False,
-      align_inputs,
-      disturbance_torque,
+    frame_count = int(math.ceil(duration / DT_CTRL))
+    self.arrival_low_request = self._constant_request_endpoint(
+      source.applied_torque,
+      -1.0,
+      frame_count,
     )
-    rate_request = self._solve_terminal_request(
-      source,
-      duration,
-      desired_action_rate,
-      local_feedforward,
-      True,
+    self.arrival_high_request = self._constant_request_endpoint(
+      source.applied_torque,
+      1.0,
+      frame_count,
+    )
+    self.twin.prepare_align_runtime_terms(
+      source.v_ego,
       align_inputs,
-      disturbance_torque,
+      self.arrival_align_terms,
     )
     motion = float(desired_action_angle) - float(desired_start_angle)
     if motion == 0.0:
       motion = float(desired_action_rate) - float(desired_start_rate)
-    if motion > 0.0:
-      return max(angle_request, rate_request)
-    if motion < 0.0:
-      return min(angle_request, rate_request)
-    return angle_request
+    enforce_rate = motion != 0.0
+    return self._solve_terminal_state_request(
+      source,
+      duration,
+      desired_action_angle,
+      desired_action_rate,
+      local_feedforward,
+      disturbance_torque,
+      motion,
+      enforce_rate,
+    )
 
   def _fill_inverse_terms(
     self,
