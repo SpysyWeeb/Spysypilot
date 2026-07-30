@@ -23,12 +23,6 @@ MAX_DECISION_STEPS = int(math.ceil(MAX_REFERENCE_TIME / DECISION_DT)) + 2
 # One reference schedule plus early/late placement for every possible adjacent
 # sign crossing. Capacity is derived from the runtime horizon grid, not tuned.
 MAX_SIGN_SCHEDULES = 1 + 2 * (MAX_DECISION_STEPS - 1)
-# Palisade steering-rate reports in 4 deg/s quanta. This is a measurement
-# resolution, not a feel dial. Blending across one quantum makes static-to-slip
-# compensation continuous without adding filter state or hysteresis timing.
-RACK_RATE_QUANTUM_DEG_S = 4.0
-
-
 def decision_cell_coulomb_direction(
   left_rate: float,
   right_rate: float,
@@ -59,61 +53,30 @@ def decision_cell_coulomb_direction(
   return (left + right) / magnitude
 
 
-def decision_cell_friction(
+def planned_rack_friction(
   left_rate: float,
   right_rate: float,
   departure_direction: float,
-  static_breakaway: float,
   kinetic_friction: float,
 ) -> float:
-  """Return distinct stick/slip feedforward friction.
+  """Return the one moving-friction feedforward over a reference cell.
 
-  A stationary cell departing stiction receives full static breakaway. Any
-  cell containing rack motion receives the response-surface kinetic value,
-  including the exact zero-crossing average. Plant stiction and the observer
-  clamp remain independent at the static ``t_breakaway`` value.
+  A reference derivative cannot establish whether the physical rack is
+  stuck. Static load therefore belongs exclusively to ``PlantTwin``'s
+  measured state. The planned inverse uses kinetic friction for every cell,
+  including departures and the exact zero-crossing average; the plant solve
+  supplies whatever additional request is physically needed to break the
+  measured rack free.
   """
   direction = decision_cell_coulomb_direction(
     left_rate, right_rate, departure_direction,
   )
-  stationary = abs(float(left_rate)) + abs(float(right_rate)) == 0.0
-  magnitude = float(static_breakaway) if stationary and direction != 0.0 else float(kinetic_friction)
+  magnitude = float(kinetic_friction)
   if not math.isfinite(magnitude) or magnitude < 0.0:
-    raise ValueError("friction magnitudes must be finite and non-negative")
+    raise ValueError(
+      "kinetic friction must be finite and non-negative"
+    )
   return magnitude * direction
-
-
-def measured_rack_friction(
-  measured_rate: float,
-  departure_direction: float,
-  static_breakaway: float,
-  kinetic_friction: float,
-) -> float:
-  """Continuous stick/slip compensation from measured rack motion.
-
-  The current command is governed by whether the rack is physically stuck,
-  not whether the future reference happens to have an exactly-zero derivative.
-  At zero measured rate it receives full breakaway compensation. Across the
-  first sensor quantum the magnitude linearly blends to kinetic friction.
-  """
-  rate = float(measured_rate)
-  departure = float(departure_direction)
-  static = float(static_breakaway)
-  kinetic = float(kinetic_friction)
-  if not all(math.isfinite(value) for value in (rate, departure, static, kinetic)):
-    raise ValueError("measured rack friction inputs must be finite")
-  if static < 0.0 or kinetic < 0.0:
-    raise ValueError("friction magnitudes must be non-negative")
-
-  if abs(rate) > 0.0:
-    direction = math.copysign(1.0, rate)
-  elif departure != 0.0:
-    direction = math.copysign(1.0, departure)
-  else:
-    return 0.0
-  slip_fraction = min(abs(rate) / RACK_RATE_QUANTUM_DEG_S, 1.0)
-  magnitude = static + slip_fraction * (kinetic - static)
-  return direction * magnitude
 
 
 class CandidateWorkspace:
@@ -153,17 +116,15 @@ class CandidateWorkspace:
     reference_count: int,
     horizon_seconds: float,
     disturbance_torque: float,
-    kinetic_friction: float | None = None,
     reference_speeds: np.ndarray | None = None,
     reference_times_changed: bool | None = None,
   ) -> None:
     """Build the 50 ms decision grid and inverse-EPS feedforward.
 
-    Full ``t_breakaway`` is retained only for departure from stiction. Moving
-    cells use the independently supplied kinetic-friction response-surface
-    value. A cell containing a rack-rate zero crossing uses the exact
-    cell-average direction. With no override, kinetic friction defaults to
-    ``t_breakaway`` and reproduces the shipped controller behavior.
+    Every planned cell uses the plant twin's single kinetic-friction value.
+    Static load is a measured plant state and is handled only by the plant
+    rollouts. A cell containing a rack-rate zero crossing uses the exact
+    cell-average direction.
     """
     horizon = min(float(horizon_seconds), MAX_REFERENCE_TIME)
     if not math.isfinite(horizon) or horizon < 0.0:
@@ -347,16 +308,11 @@ class CandidateWorkspace:
     # samples. This is a fixed numerical stencil, not a feel/timing filter:
     # position remains the untouched scalar-pinned reference and the fit only
     # makes its local rate/acceleration coherent.
-    moving_friction = (
-      twin.params.t_breakaway
-      if kinetic_friction is None
-      else float(kinetic_friction)
-    )
+    moving_friction = twin.kinetic_friction
     if not math.isfinite(moving_friction) or moving_friction < 0.0:
       raise ValueError(
         "kinetic friction must be finite and non-negative"
       )
-    static_breakaway = twin.params.t_breakaway
     damping = twin.params.b_steer
     torque_acceleration = twin.params.k_t
     disturbance = float(disturbance_torque)
@@ -430,12 +386,7 @@ class CandidateWorkspace:
       else:
         direction = (left_rate + right_rate) / magnitude
       friction_directions[index] = direction
-      friction_magnitude = (
-        static_breakaway
-        if magnitude == 0.0 and direction != 0.0
-        else moving_friction
-      )
-      friction = friction_magnitude * direction
+      friction = moving_friction * direction
       friction_torques[index] = friction
       dynamic = (
         acceleration + damping * rate

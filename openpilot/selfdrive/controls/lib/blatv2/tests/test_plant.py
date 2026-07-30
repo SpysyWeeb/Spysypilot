@@ -12,6 +12,7 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import (
   PlantSensitivity,
   PlantState,
   PlantTwin,
+  RACK_RATE_QUANTUM_DEG_S,
   SignedRackRate,
 )
 
@@ -62,6 +63,9 @@ def assert_state_close(
   )
   case.assertEqual(actual.applied_torque, expected.applied_torque)
   case.assertEqual(actual.v_ego, expected.v_ego)
+  case.assertEqual(
+    actual.held_static_load, expected.held_static_load,
+  )
 
 
 class TestPlantTwin(unittest.TestCase):
@@ -73,6 +77,15 @@ class TestPlantTwin(unittest.TestCase):
     self.assertEqual(rate.update(10.1, 0.0), 0.0)
     self.assertEqual(rate.update(10.0, 4.0), -4.0)
     self.assertEqual(rate.update(10.0, 8.0), -8.0)
+
+  def test_zero_rate_with_angle_motion_is_not_classified_as_stiction(self) -> None:
+    rate = SignedRackRate()
+    rate.update(10.0, 0.0)
+    self.assertTrue(rate.stationary)
+    self.assertEqual(rate.update(10.1, 0.0), 0.0)
+    self.assertFalse(rate.stationary)
+    self.assertEqual(rate.update(10.1, 0.0), 0.0)
+    self.assertTrue(rate.stationary)
 
   def test_already_signed_negative_rack_rate_is_preserved(self) -> None:
     rate = SignedRackRate()
@@ -137,6 +150,115 @@ class TestPlantTwin(unittest.TestCase):
     moving = PlantState(0.0, 1.0, 0.0, 0.0)
     _, moving_rate = twin.predict(moving, [-1.0] * 20, 0.01)
     self.assertTrue(all(value >= 0.0 for value in moving_rate[:12]))
+
+  def test_measured_held_load_replaces_angle_triggered_breakaway_boost(self) -> None:
+    twin = PlantTwin(
+      params(), align_params(), kinetic_friction=0.03,
+    )
+    inputs = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
+    state = PlantState(
+      angle_deg=0.0,
+      rate_deg_s=0.0,
+      applied_torque=0.30,
+      v_ego=0.0,
+    )
+    measured = twin.observed_held_static_load(
+      state,
+      inputs,
+      disturbance_torque=0.0,
+      rack_stationary=True,
+      eligible=True,
+    )
+    self.assertEqual(measured, 0.30)
+
+    state.held_static_load = measured
+    still_held = twin.advance_applied(
+      state, 0.29, 0.01, inputs,
+    )
+    released = twin.advance_applied(
+      state, 0.31, 0.01, inputs,
+    )
+    self.assertEqual(still_held.rate_deg_s, 0.0)
+    self.assertEqual(still_held.held_static_load, 0.30)
+    self.assertGreater(released.rate_deg_s, 0.0)
+    self.assertEqual(
+      released.held_static_load, measured,
+    )
+    moving = twin.advance_applied(
+      released, 0.50, 0.01, inputs,
+    )
+    self.assertGreaterEqual(
+      abs(moving.rate_deg_s), RACK_RATE_QUANTUM_DEG_S,
+    )
+    self.assertEqual(
+      moving.held_static_load, twin.params.t_breakaway,
+    )
+
+  def test_measured_load_is_not_clipped_to_actuator_authority(self) -> None:
+    twin = PlantTwin(
+      params(), align_params(), kinetic_friction=0.03,
+    )
+    inputs = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
+    state = PlantState(0.0, 0.0, 1.0, 0.0)
+    self.assertEqual(
+      twin.observed_held_static_load(
+        state,
+        inputs,
+        disturbance_torque=-0.4,
+        rack_stationary=True,
+        eligible=True,
+      ),
+      1.4,
+    )
+
+  def test_inverse_and_forward_plant_share_one_stick_slip_law(self) -> None:
+    twin = PlantTwin(
+      params(), align_params(), kinetic_friction=0.03,
+    )
+    expected = (0.30, 0.2325, 0.165, 0.0975, 0.03)
+    for rate, magnitude in zip(
+      (0.0, 1.0, 2.0, 3.0, 4.0), expected, strict=True,
+    ):
+      state = PlantState(0.0, rate, 0.0, 0.0, 0.30)
+      with self.subTest(rate=rate):
+        self.assertTrue(math.isclose(
+          twin.inverse_friction_torque(state, 1.0),
+          magnitude,
+          abs_tol=1e-15,
+        ))
+
+    stuck = PlantState(0.0, 0.0, 0.0, 0.0, 0.30)
+    self.assertEqual(
+      twin.inverse_friction_torque(stuck, -1.0), -0.30,
+    )
+    self.assertEqual(
+      twin.advance_applied(
+        stuck,
+        -0.30,
+        0.01,
+        AlignInputs(0.0, 0.0, 1.0, 15.0, True),
+      ).rate_deg_s,
+      0.0,
+    )
+
+  def test_held_load_inference_rejects_driver_or_moving_equilibria(self) -> None:
+    twin = PlantTwin(
+      params(), align_params(), kinetic_friction=0.03,
+    )
+    inputs = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
+    state = PlantState(0.0, 0.0, 0.30, 0.0)
+    self.assertEqual(
+      twin.observed_held_static_load(
+        state, inputs, 0.0, True, False,
+      ),
+      twin.params.t_breakaway,
+    )
+    self.assertEqual(
+      twin.observed_held_static_load(
+        state, inputs, 0.0, False, True,
+      ),
+      twin.params.t_breakaway,
+    )
 
   def test_calibrated_steady_state_gain_at_every_speed_node(self) -> None:
     twin = PlantTwin(params(), align_params())

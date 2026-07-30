@@ -8,8 +8,7 @@ import numpy as np
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
   decision_cell_coulomb_direction,
-  decision_cell_friction,
-  measured_rack_friction,
+  planned_rack_friction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   DECISION_DT,
@@ -55,6 +54,16 @@ ACTION_PARAMS = ControllerParams(
 ALIGN_INPUTS = AlignInputs(0.0, 0.0, 1.0, 15.0, True)
 REFERENCE_TIMES = np.asarray((0.0, 0.5, 1.0), dtype=np.float64)
 REFERENCE_CURVATURES = np.asarray((0.001, 0.001, 0.001), dtype=np.float64)
+
+
+def action_twin(
+  plant_params: PlantParams = PLANT_PARAMS,
+) -> PlantTwin:
+  return PlantTwin(
+    plant_params,
+    ALIGN_PARAMS,
+    kinetic_friction=ACTION_PARAMS.kinetic_friction,
+  )
 
 
 def feasible_steady_state(twin: PlantTwin) -> PlantState:
@@ -187,26 +196,70 @@ def test_coulomb_feedforward_retains_full_breakaway_from_stiction():
   assert decision_cell_coulomb_direction(0.0, 0.0, 0.0) == 0.0
 
 
-def test_feedforward_uses_static_breakaway_only_until_rack_moves():
-  static = decision_cell_friction(0.0, 0.0, 2.0, 0.09, 0.03)
-  moving = decision_cell_friction(2.0, 1.0, 0.0, 0.09, 0.03)
-  crossing = decision_cell_friction(1.0, -3.0, 0.0, 0.09, 0.03)
-  assert static == 0.09
+def test_planned_feedforward_never_guesses_static_rack_state():
+  static_reference = planned_rack_friction(
+    0.0, 0.0, 2.0, 0.03,
+  )
+  moving = planned_rack_friction(2.0, 1.0, 0.0, 0.03)
+  crossing = planned_rack_friction(1.0, -3.0, 0.0, 0.03)
+  assert static_reference == 0.03
   assert moving == 0.03
   assert crossing == -0.015
 
 
-def test_measured_rack_stick_to_slip_transition_is_continuous():
-  values = tuple(
-    measured_rack_friction(rate, 1.0, 0.09, 0.03)
-    for rate in (0.0, 1.0, 2.0, 3.0, 4.0, 8.0)
+def test_planned_friction_has_no_zero_to_four_degree_quantum_step():
+  stuck_reference = planned_rack_friction(
+    0.0, 0.0, 1.0, 0.03,
   )
-  assert values == (0.09, 0.075, 0.06, 0.045, 0.03, 0.03)
-  assert measured_rack_friction(0.0, -1.0, 0.09, 0.03) == -0.09
+  moving_reference = planned_rack_friction(
+    4.0, 4.0, 0.0, 0.03,
+  )
+  assert stuck_reference == moving_reference == 0.03
+
+
+def test_action_inverse_uses_measured_held_load_without_angle_gate():
+  twin = action_twin()
+  times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
+  for angle in (0.0, 450.0):
+    desired_angle = angle - 1.0
+    reference = np.full(
+      len(times),
+      twin.curvature_from_angle(
+        desired_angle, 0.0, ALIGN_INPUTS,
+      ),
+      dtype=np.float64,
+    )
+    result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
+      PlantState(angle, 0.0, 0.30, 0.0, 0.30),
+      ALIGN_INPUTS,
+      times,
+      reference,
+      len(times),
+      1.0,
+      0.12,
+      0.0,
+      ObserverStatus.ACTIVE,
+    )
+    assert result.friction_torque == -0.30
+
+
+def test_action_controller_rejects_a_second_kinetic_friction_law():
+  mismatched = PlantTwin(
+    PLANT_PARAMS, ALIGN_PARAMS, kinetic_friction=0.09,
+  )
+  try:
+    InverseEpsActionController(mismatched, ACTION_PARAMS)
+  except ValueError as error:
+    assert (
+      "controller and plant must share one kinetic-friction value"
+      in str(error)
+    )
+  else:
+    raise AssertionError("mismatched kinetic-friction law was accepted")
 
 
 def test_action_feedback_is_linear_and_separates_position_from_rate_damping():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
@@ -236,7 +289,7 @@ def test_action_feedback_is_linear_and_separates_position_from_rate_damping():
 
 
 def test_tracking_stiffness_changes_small_error_feedback_without_changing_feedforward():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   reference = np.full(3, 0.001, dtype=np.float64)
   calm = InverseEpsActionController(twin, ACTION_PARAMS).compute(
@@ -299,7 +352,7 @@ def test_rate_feedback_quantum_is_bounded_to_one_torque_build_step():
 
 
 def test_trajectory_transition_time_matches_exact_asymmetric_limits():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   frame_seconds = 0.01
   assert math.isclose(
@@ -323,7 +376,7 @@ def test_trajectory_transition_time_matches_exact_asymmetric_limits():
 
 
 def test_trajectory_predecessor_is_latest_value_that_reaches_next_cell():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   predecessor = candidate._latest_feasible_predecessor(
     0.0, 1.0, DECISION_DT,
@@ -341,7 +394,7 @@ def test_trajectory_predecessor_is_latest_value_that_reaches_next_cell():
 
 
 def test_future_slew_projection_uses_only_planned_inverse_feedforward():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   workspace = CandidateWorkspace()
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   workspace.fill(
@@ -353,7 +406,6 @@ def test_future_slew_projection_uses_only_planned_inverse_feedforward():
     3,
     1.0,
     0.0,
-    ACTION_PARAMS.kinetic_friction,
   )
   candidate = InverseEpsActionController(
     twin, ACTION_PARAMS, workspace,
@@ -372,7 +424,7 @@ def test_future_slew_projection_uses_only_planned_inverse_feedforward():
 
 
 def test_action_point_feedforward_reaches_authored_angle_or_uses_full_authority():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   candidate.predicted_state.applied_torque = 0.0
   target = candidate._action_point_feedforward(
@@ -408,7 +460,7 @@ def test_action_point_feedforward_reaches_authored_angle_or_uses_full_authority(
 
 
 def test_constant_request_endpoint_matches_exact_repeated_limiter():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   for source in (-1.0, -0.5, -2 / 409, 0.0, 2 / 409, 0.5, 1.0):
     for direction in (-1.0, 1.0):
@@ -423,7 +475,7 @@ def test_constant_request_endpoint_matches_exact_repeated_limiter():
 
 
 def test_action_feedforward_is_independent_of_measured_rack_error():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   candidate.predicted_state.applied_torque = 0.25
   candidate.predicted_state.angle_deg = -50.0
@@ -458,7 +510,7 @@ def test_action_feedforward_is_independent_of_measured_rack_error():
 
 
 def test_action_feedforward_preserves_terminal_rack_momentum():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   candidate.predicted_state.applied_torque = 0.0
   target = candidate._action_point_feedforward(
@@ -508,7 +560,7 @@ def test_action_feedforward_preserves_terminal_rack_momentum():
 
 def test_action_effect_prediction_replays_queued_commands_not_latest_hold():
   delayed_params = PLANT_PARAMS.with_actuation_delay(0.03)
-  twin = PlantTwin(delayed_params, ALIGN_PARAMS)
+  twin = action_twin(delayed_params)
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   candidate._remember_applied_torque(0.1)
@@ -539,7 +591,7 @@ def test_action_effect_prediction_replays_queued_commands_not_latest_hold():
 def test_action_reset_discards_queued_commands_at_regime_boundary():
   delayed_params = PLANT_PARAMS.with_actuation_delay(0.03)
   candidate = InverseEpsActionController(
-    PlantTwin(delayed_params, ALIGN_PARAMS), ACTION_PARAMS,
+    action_twin(delayed_params), ACTION_PARAMS,
   )
   candidate._remember_applied_torque(0.1)
   candidate._remember_applied_torque(0.2)
@@ -550,7 +602,7 @@ def test_action_reset_discards_queued_commands_at_regime_boundary():
 
 
 def test_action_tracks_reference_at_physical_effect_time_not_later_scalar_time():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   times = np.arange(0.0, 0.55, 0.05, dtype=np.float64)
   curvatures = np.linspace(0.0, 0.02, len(times), dtype=np.float64)
@@ -564,7 +616,6 @@ def test_action_tracks_reference_at_physical_effect_time_not_later_scalar_time()
     len(times),
     0.5,
     0.0,
-    ACTION_PARAMS.kinetic_friction,
   )
   candidate = InverseEpsActionController(
     twin, ACTION_PARAMS, workspace,
@@ -601,7 +652,7 @@ def test_action_tracks_reference_at_physical_effect_time_not_later_scalar_time()
 
 
 def test_steady_turn_holding_torque_survives_zero_tracking_error():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = feasible_steady_state(twin)
   result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
@@ -622,7 +673,7 @@ def test_steady_turn_holding_torque_survives_zero_tracking_error():
 
 
 def test_action_uses_future_torque_only_when_exact_slew_requires_it():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
   base = np.full(len(times), 0.00001, dtype=np.float64)
@@ -667,7 +718,7 @@ def test_action_uses_future_torque_only_when_exact_slew_requires_it():
 
 
 def test_future_turn_cannot_move_rack_before_time_aligned_reference():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
   for direction in (-1.0, 1.0):
@@ -692,7 +743,7 @@ def test_future_turn_cannot_move_rack_before_time_aligned_reference():
 
 
 def test_action_raw_request_reproduces_reported_slew_command_bit_exactly():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   times = np.arange(0.0, 1.05, 0.05, dtype=np.float64)
   random = np.random.default_rng(219)
   for _ in range(32):
@@ -726,7 +777,7 @@ def test_action_raw_request_reproduces_reported_slew_command_bit_exactly():
 
 
 def test_action_linear_residual_is_stateless_across_reversals():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(0.0, 0.0, 0.0, 5.0)
   candidate = InverseEpsActionController(twin, ACTION_PARAMS)
   curvature = twin.curvature_from_angle(1.0, 5.0, ALIGN_INPUTS)
@@ -745,7 +796,7 @@ def test_action_linear_residual_is_stateless_across_reversals():
 
 
 def test_action_moving_rack_uses_signed_kinetic_friction_only():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(0.0, -4.0, 0.0, 5.0)
   result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
     state,
@@ -764,7 +815,7 @@ def test_action_moving_rack_uses_signed_kinetic_friction_only():
 
 
 def test_action_requested_load_is_evaluated_at_desired_rack_position():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = PlantState(25.0, 0.0, 0.0, 10.0)
   curvatures = np.full(3, 0.005, dtype=np.float64)
   result = InverseEpsActionController(twin, ACTION_PARAMS).compute(
@@ -914,7 +965,7 @@ def test_enumeration_exhaustion_is_legible():
 
 
 def test_action_controller_has_no_observer_writable_state():
-  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  twin = action_twin()
   state = feasible_steady_state(twin)
   state.angle_deg += 1.0
   first = InverseEpsActionController(twin, ACTION_PARAMS).compute(

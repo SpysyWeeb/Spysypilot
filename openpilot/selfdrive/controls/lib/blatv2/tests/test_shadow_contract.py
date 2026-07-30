@@ -39,9 +39,9 @@ def test_shadow_runs_below_controlsd_without_competing_on_one_core():
   assert "Priority.CTRL_HIGH" not in source
 
 
-def test_shadow_v13_schema_has_signed_rate_and_exact_v14_fields():
-  assert SHADOW_VERSION == 16
-  assert LIVE_CONTROLLER_VERSION == 221
+def test_shadow_v17_schema_has_held_load_and_exact_v14_fields():
+  assert SHADOW_VERSION == 17
+  assert LIVE_CONTROLLER_VERSION == 222
   schema = Path("openpilot/cereal/log.capnp").read_text()
   shadow_source = Path(
     "openpilot/selfdrive/controls/blatv2_shadowd.py",
@@ -100,4 +100,8 @@ def test_shadow_v13_schema_has_signed_rate_and_exact_v14_fields():
   assert "blatV2NoLeadLimited @100 :Bool;" in schema
   assert "blatV2PredictionDelaySeconds @101 :Float64;" in schema
   assert "blatV2SignedRackRateDegS @102 :Float64;" in schema
+  assert "blatV2HeldStaticLoad @103 :Float64;" in schema
+  assert "blatV2RackStationary @104 :Bool;" in schema
+  assert "liveActionHeldStaticLoad @62 :Float64;" in schema
+  assert "rackStationary @63 :Bool;" in schema
   assert "signedRackRateDegS @61 :Float64;" in schema

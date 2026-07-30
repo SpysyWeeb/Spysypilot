@@ -56,6 +56,10 @@ class ModelFollowingTorqueMPC:
     controller_params: ControllerParams,
     workspace: CandidateWorkspace | None = None,
   ):
+    if twin.kinetic_friction != controller_params.kinetic_friction:
+      raise ValueError(
+        "controller and plant must share one kinetic-friction value"
+      )
     self.twin = twin
     self.params = controller_params
     self.workspace = CandidateWorkspace() if workspace is None else workspace
@@ -318,7 +322,6 @@ class ModelFollowingTorqueMPC:
           reference_count,
           horizon_seconds,
           disturbance_torque,
-          self.params.kinetic_friction,
         )
       count = self.workspace.decision_count
       schedule_count = self._build_schedules(count)
