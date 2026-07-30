@@ -88,6 +88,8 @@ def result_values(result):
     result.fallback_candidate_count,
     result.fallback_optimality_residual,
     result.signed_rack_rate_deg_s,
+    result.held_static_load,
+    result.rack_stationary,
   )
 
 
@@ -297,6 +299,8 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
     live_action_horizon_torque_demand=-0.8,
     live_action_horizon_demand_time_seconds=0.45,
     live_action_no_lead_limited=False,
+    live_action_held_static_load=0.22,
+    rack_stationary=True,
     v14_result=V14ShadowResult(-0.07, 0.01, True, 14),
     v14_compute_seconds=0.0002,
   )
@@ -321,6 +325,8 @@ def test_valid_core_result_serializes_at_capnp_publish_boundary():
   assert message.blatV2Shadow.liveActionHorizonTorqueDemand == -0.8
   assert message.blatV2Shadow.liveActionHorizonDemandTimeSeconds == 0.45
   assert not message.blatV2Shadow.liveActionNoLeadLimited
+  assert message.blatV2Shadow.liveActionHeldStaticLoad == 0.22
+  assert message.blatV2Shadow.rackStationary
   assert message.blatV2Shadow.v14CommandTorque == -0.07
   assert message.blatV2Shadow.v14ControllerVersion == 14
 

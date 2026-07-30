@@ -38,8 +38,6 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.blatv2.candidate_common import (
   CandidateWorkspace,
   MAX_DECISION_STEPS,
-  RACK_RATE_QUANTUM_DEG_S,
-  measured_rack_friction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   DECISION_DT,
@@ -54,6 +52,7 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import (
   PlantSensitivity,
   PlantState,
   PlantTwin,
+  RACK_RATE_QUANTUM_DEG_S,
 )
 from openpilot.selfdrive.controls.lib.blatv2.reference import MODEL_ACTION_OFFSET
 
@@ -81,6 +80,10 @@ class InverseEpsActionController:
     controller_params: ControllerParams,
     workspace: CandidateWorkspace | None = None,
   ):
+    if twin.kinetic_friction != controller_params.kinetic_friction:
+      raise ValueError(
+        "controller and plant must share one kinetic-friction value"
+      )
     self.twin = twin
     self.params = controller_params
     self.workspace = CandidateWorkspace() if workspace is None else workspace
@@ -795,11 +798,9 @@ class InverseEpsActionController:
 
     Feedforward starts on the model-authored rack trajectory, not on the
     measured rack. This keeps requested-path torque independent of tracking
-    error; the one linear residual term is added exactly once by ``compute``.
-    The actuator state remains the real queued state, so the solve still owns
-    the torque needed to overcome current slew lag. Twelve fixed bisections
-    resolve finer than one Hyundai torque count and introduce no response-time
-    or feel constant.
+    error; the one physical inverse-residual term is added exactly once by
+    ``compute``. The actuator state remains the real queued state, so the solve
+    still owns the torque needed to overcome current slew lag.
     """
     duration = float(action_time) - float(physical_effect_time)
     if duration <= 0.0:
@@ -809,6 +810,10 @@ class InverseEpsActionController:
     source.rate_deg_s = float(desired_start_rate)
     source.applied_torque = self.predicted_state.applied_torque
     source.v_ego = float(action_speed)
+    # This is a synthetic point on the authored trajectory, not a measured
+    # held rack. Static load cannot be imported from the current physical
+    # position into it.
+    source.held_static_load = self.twin.params.t_breakaway
     frame_count = int(math.ceil(duration / DT_CTRL))
     self.arrival_low_request = self._constant_request_endpoint(
       source.applied_torque,
@@ -869,11 +874,8 @@ class InverseEpsActionController:
     aligning = self.twin.aligning_torque_values(
       desired_angle, speed, align_inputs,
     )
-    friction = measured_rack_friction(
-      rack_state.rate_deg_s,
-      required_acceleration,
-      self.twin.params.t_breakaway,
-      self.params.kinetic_friction,
+    friction = self.twin.inverse_friction_torque(
+      rack_state, required_acceleration,
     )
     nominal_dynamic = (
       float(desired_acceleration)
@@ -907,6 +909,7 @@ class InverseEpsActionController:
     state.rate_deg_s = self.predicted_state.rate_deg_s
     state.applied_torque = float(command)
     state.v_ego = self.predicted_state.v_ego
+    state.held_static_load = self.predicted_state.held_static_load
     self.twin.predict_held_state_into(
       state,
       DT_CTRL,
@@ -995,7 +998,6 @@ class InverseEpsActionController:
           reference_count,
           horizon_seconds,
           disturbance_torque,
-          self.params.kinetic_friction,
         )
 
       action_sample_time = (
@@ -1177,6 +1179,11 @@ class InverseEpsActionController:
       result.horizon_torque_demand = trajectory_demand
       result.horizon_demand_time_seconds = trajectory_demand_time
       result.no_lead_limited = no_lead_limited
+      result.held_static_load = state.held_static_load
+      result.rack_stationary = bool(
+        state.rate_deg_s == 0.0
+        and state.held_static_load > self.twin.params.t_breakaway
+      )
       result.status = CandidateStatus.OK
       result.candidate_count = 1
       result.available_schedule_count = 1

@@ -71,6 +71,8 @@ class ShadowResult:
   fallback_candidate_count: int = 0
   fallback_optimality_residual: float = 0.0
   signed_rack_rate_deg_s: float = 0.0
+  held_static_load: float = 0.0
+  rack_stationary: bool = False
 
 
 class ShadowCore:
@@ -86,7 +88,11 @@ class ShadowCore:
     self.seed_params = seed_params
     self.torque_params = torque_params
     self.align_params = AlignParams.from_car_params(car_params, torque_params)
-    self.twin = PlantTwin(seed_params, self.align_params)
+    self.twin = PlantTwin(
+      seed_params,
+      self.align_params,
+      kinetic_friction=controller_params.kinetic_friction,
+    )
     self.controller_params = controller_params
     self.observer = DisturbanceObserver(seed_params, controller_params)
     self.candidate_workspace = CandidateWorkspace()
@@ -181,6 +187,8 @@ class ShadowCore:
     result.fallback_candidate_count = 0
     result.fallback_optimality_residual = 0.0
     result.signed_rack_rate_deg_s = 0.0
+    result.held_static_load = 0.0
+    result.rack_stationary = False
     return result
 
   def frame_reference_delay(
@@ -395,6 +403,9 @@ class ShadowCore:
     )
     state.applied_torque = applied
     state.v_ego = v_ego
+    # Always overwrite borrowed state before it can enter a residual. The
+    # measured held-load lower bound is populated after the observer update.
+    state.held_static_load = self.seed_params.t_breakaway
     if not (
       math.isfinite(state.angle_deg)
       and math.isfinite(state.rate_deg_s)
@@ -462,6 +473,23 @@ class ShadowCore:
     result.disturbance_estimate = disturbance
     result.observer_status = int(self.observer.status)
     result.observer_unconstrained_update = self.observer.unconstrained_update
+    rack_stationary = bool(self.signed_rack_rate.stationary)
+    state.held_static_load = self.twin.observed_held_static_load(
+      state,
+      self.current_align_inputs,
+      disturbance,
+      rack_stationary,
+      bool(
+        car_control.latActive
+        and not car_state.steeringPressed
+        and not car_state.standstill
+        and model_valid
+        and plan_valid
+        and residual_valid
+      ),
+    )
+    result.held_static_load = state.held_static_load
+    result.rack_stationary = rack_stationary
     result.mpc_command_torque = applied
     result.mpc_status = int(CandidateStatus.INPUT_INVALID)
     result.mpc_candidate_count = 0
@@ -489,7 +517,6 @@ class ShadowCore:
           self.reference_count,
           self.horizon_seconds,
           result.disturbance_estimate,
-          self.controller_params.kinetic_friction,
           self.reference_speeds,
           reference_changed,
         )

@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
   V14ShadowResult,
 )
 
-SHADOW_VERSION = 16
+SHADOW_VERSION = 17
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -78,6 +78,8 @@ def populate_shadow_message(
   live_action_horizon_torque_demand: float,
   live_action_horizon_demand_time_seconds: float,
   live_action_no_lead_limited: bool,
+  live_action_held_static_load: float,
+  rack_stationary: bool,
   v14_result: V14ShadowResult,
   v14_compute_seconds: float,
 ) -> None:
@@ -108,6 +110,10 @@ def populate_shadow_message(
     result.observer_unconstrained_update
   )
   shadow.signedRackRateDegS = float(result.signed_rack_rate_deg_s)
+  shadow.liveActionHeldStaticLoad = float(
+    live_action_held_static_load
+  )
+  shadow.rackStationary = bool(rack_stationary)
   shadow.liveLqiCommandTorque = float(live_lqi_command_torque)
   shadow.liveLqiStatus = int(live_lqi_status)
   shadow.liveLqiComputeTimeSeconds = float(live_lqi_compute_seconds)
@@ -406,6 +412,14 @@ class BlatV2Shadow:
       ),
       live_action_no_lead_limited=(
         bool(torque_state.blatV2NoLeadLimited)
+        if torque_state_valid else False
+      ),
+      live_action_held_static_load=(
+        float(torque_state.blatV2HeldStaticLoad)
+        if torque_state_valid else 0.0
+      ),
+      rack_stationary=(
+        bool(torque_state.blatV2RackStationary)
         if torque_state_valid else False
       ),
       v14_result=v14_result,
