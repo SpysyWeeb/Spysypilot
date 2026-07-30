@@ -25,6 +25,44 @@ Copies of `combo` that differ only in the driving model they run:
 
 [`rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rl-combo) is a special case: it runs comma's Rebel Legion release model but is **not** a pure copy of `combo` — it also merges upstream `commaai/openpilot` master ahead of `stock`, plus small tuning deltas (e.g. `LONG_SMOOTH` 0.0), so expect it to differ beyond the model swap.
 
+## BLaTv2 modular replacement
+
+**Status: in progress.** The previous LQI-based BLaTv2 controller is retired.
+LQI means “Linear Quadratic Integral”: state feedback plus an integral-error
+state. The replacement is a ground-up, modular adaptive torque controller
+whose target is **Smooth. Swift. Strong.**
+
+The system separates model-time intent, a stateless future reference, measured
+rack mapping, physical plant/inverse torque, the exact opendbc command
+envelope, invalid-output safety, shadow measurement, and speed-local learning.
+Each owner has a narrow interface so it can be audited, tuned, or replaced
+without layering a compensating controller on another controller.
+
+This first merged build deliberately contains no approved learned profile.
+Consequently, its active lateral controller is the byte-identical current
+stock openpilot `LatControlTorque`; the modular candidate is structurally
+unable to actuate and runs only as shadow/learning infrastructure. On the
+validated Palisade/Telluride platform, the stock request uses the
+platform-selected 409/4/7 opendbc and panda envelope. Other vehicles retain
+their stock limits and stock controller until their own opendbc port validates
+the full command-envelope and rack-sensor contract.
+
+Learning is measured-response-only and speed-local. Evidence at one speed
+updates only neighboring speed nodes, so highway mileage cannot overwrite
+low-speed knowledge. Candidates are trained and qualified offroad, require
+enough evidence in every speed region, and never change during a drive. An
+artifact can actuate only after independent raw/applied replay, delivered
+replay, deterministic A/A, safety, and comma-device timing gates all pass.
+Driver feedback after a provisional validation drive can approve, retain, or
+roll back a profile at an engagement boundary.
+
+No BLaTv1 controller code or `HyundaiLowSpeedTorqueDamping` is inherited.
+Vehicle limits come from runtime `CarControllerParams`; BLaTv2 contains no
+Palisade limit literals. Full architecture, contracts, learning policy,
+acceptance gates, and rollback behavior are documented in
+[`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
+[`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
+
 ## To-Do
 
 Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
@@ -48,7 +86,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
 - ⚠️ **[Universal driving-event logger](https://github.com/SpysyWeeb/Spysypilot/tree/driving-event-platform)** — one rlog-first platform records automatic lateral and longitudinal failures plus general manual bookmarks, confirms preservation before showing UI success, and builds a bounded/reconstructable SSH manifest; lateral detector v7 adds b7-derived unused-authority and confirmed-driver-takeover events and remains in field validation; see [docs/DrivingEventPlatform.md](docs/DrivingEventPlatform.md) &nbsp;*(personal idea)*
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
-- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — v222 replaces conflicting planned/static friction branches with one measured rack-load state and one continuous stick/slip law shared by the controller and plant twin; it adds no turn detector, torque boost, angle gate, timer, path lead, smoothing controller, or low-speed controller, while preserving the 409/4/7 envelope and v221 real-time implementation; field validation remains in progress &nbsp;*(personal idea)*
+- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — ground-up modular adaptive lateral foundation; stock torque control is the active bootstrap while passive speed-local learning builds a fully gated vehicle profile; no learned controller can actuate until replay, delivered-response, deterministic, safety, and device-timing approval all pass &nbsp;*(personal idea)*
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_
