@@ -33,6 +33,11 @@ from openpilot.selfdrive.controls.lib.blatv2.feedback import (
   FeedbackRequest,
   FeedbackResponse,
 )
+from openpilot.selfdrive.controls.lib.blatv2.lifecycle_status import (
+  LIFECYCLE_STATUS_PARAM,
+  build_lifecycle_status_bytes,
+  build_lifecycle_status_payload,
+)
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   PhysicalParameters,
@@ -66,6 +71,8 @@ class MemoryParams:
     if self.onroad:
       self.onroad_writes.append(key)
       raise AssertionError("profile daemon attempted an onroad Params write")
+    if key == LIFECYCLE_STATUS_PARAM:
+      assert type(value) is dict
     self.values[key] = copy.deepcopy(value)
     self.puts.append((key, copy.deepcopy(value), block))
 
@@ -281,9 +288,331 @@ def prepare_provisional_daemon():
   return params, sm, daemon
 
 
+def lifecycle_payload(activation):
+  return build_lifecycle_status_payload(
+    activation=activation,
+    vehicle_identity=VEHICLE,
+    runtime_identity_sha256=RUNTIME_HASH,
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+  )
+
+
+def test_lifecycle_display_projection_maps_every_effective_state():
+  params = MemoryParams()
+  manager = context_for(params).activation
+  stock = lifecycle_payload(manager)
+  assert stock["controller_state"] == "stock"
+  assert stock["effective_controller"] == "stock"
+  assert stock["active_profile"] is None
+  assert stock["staged_profile"] is None
+  assert stock["activation_state_sha256"] == manager.state_sha256
+  assert build_lifecycle_status_bytes(
+    activation=manager,
+    vehicle_identity=VEHICLE,
+    runtime_identity_sha256=RUNTIME_HASH,
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+  ) == build_lifecycle_status_bytes(
+    activation=manager,
+    vehicle_identity=VEHICLE,
+    runtime_identity_sha256=RUNTIME_HASH,
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+  )
+
+  manager.stage(artifact(), offroad=True)
+  staged = lifecycle_payload(manager)
+  assert staged["controller_state"] == "staged"
+  assert staged["effective_controller"] == "stock"
+  assert staged["active_profile"] is None
+  assert staged["staged_profile"]["profile_revision"] == 1
+
+  manager.prepare_offroad(offroad=True)
+  provisional = lifecycle_payload(manager)
+  assert provisional["controller_state"] == "provisional"
+  assert provisional["effective_controller"] == "modular"
+  assert provisional["active_profile"]["profile_revision"] == 1
+  assert provisional["staged_profile"] is None
+
+  active = manager.active_artifact
+  identity = ProfileIdentity.from_artifact(active)
+  request = FeedbackRequest(
+    artifact_sha256=identity.artifact_sha256,
+    profile_sha256=identity.profile_sha256,
+    profile_revision=identity.profile_revision,
+  )
+  params.values[FEEDBACK_REQUEST_PARAM] = request.to_param()
+  params.values[FEEDBACK_RESPONSE_PARAM] = (
+    FeedbackResponse.for_request(
+      request,
+      FeedbackChoice.WORSE,
+    ).to_param()
+  )
+  assert manager.consume_feedback(offroad=True) is FeedbackChoice.WORSE
+  rollback = lifecycle_payload(manager)
+  assert rollback["controller_state"] == "rollback_pending"
+  assert rollback["effective_controller"] == "stock"
+  assert rollback["rejected_profile_count"] == 1
+
+  manager.prepare_offroad(offroad=True)
+  rolled_back = lifecycle_payload(manager)
+  assert rolled_back["controller_state"] == "stock"
+  assert rolled_back["effective_controller"] == "stock"
+
+  approved_params = MemoryParams()
+  approved_manager = context_for(approved_params).activation
+  approved_manager.stage(artifact(), offroad=True)
+  approved_manager.prepare_offroad(offroad=True)
+  approved_active = approved_manager.active_artifact
+  approved_identity = ProfileIdentity.from_artifact(approved_active)
+  approved_request = FeedbackRequest(
+    artifact_sha256=approved_identity.artifact_sha256,
+    profile_sha256=approved_identity.profile_sha256,
+    profile_revision=approved_identity.profile_revision,
+  )
+  approved_params.values[FEEDBACK_REQUEST_PARAM] = approved_request.to_param()
+  approved_params.values[FEEDBACK_RESPONSE_PARAM] = (
+    FeedbackResponse.for_request(
+      approved_request,
+      FeedbackChoice.BETTER,
+    ).to_param()
+  )
+  assert (
+    approved_manager.consume_feedback(offroad=True)
+    is FeedbackChoice.BETTER
+  )
+  approved = lifecycle_payload(approved_manager)
+  assert approved["controller_state"] == "approved"
+  assert approved["effective_controller"] == "modular"
+
+
+def test_lifecycle_display_invalid_stale_and_unverified_fail_closed():
+  malformed_params = MemoryParams()
+  malformed_params.values[ACTIVATION_STATE_PARAM] = {"not": "canonical"}
+  malformed = context_for(malformed_params).activation
+  invalid = lifecycle_payload(malformed)
+  assert invalid["controller_state"] == "unavailable"
+  assert invalid["effective_controller"] == "stock"
+  assert invalid["diagnostic"] == ArtifactDiagnostic.STATE_INVALID.value
+  assert invalid["active_profile"] is None
+  assert invalid["activation_state_sha256"] is None
+
+  stale_params = MemoryParams()
+  old_source = "6" * 40
+  old_artifact = ApprovedProfileArtifact(
+    vehicle_profile=artifact().vehicle_profile,
+    controller_policy=artifact().controller_policy,
+    runtime_vehicle_identity_sha256=RUNTIME_HASH,
+    source_openpilot_commit=old_source,
+    opendbc_commit=OPENDBC_COMMIT,
+    learner_evidence_sha256=EVIDENCE_HASH,
+    replay_harness_commit=HARNESS_COMMIT,
+    replay_passed=True,
+    delivered_replay_passed=True,
+    safety_passed=True,
+    deterministic_aa_passed=True,
+    device_timing_passed=True,
+  )
+  old_manager = PersistentProfileActivation(
+    stale_params,
+    expected_vehicle_identity=VEHICLE,
+    expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
+    expected_source_openpilot_commit=old_source,
+    expected_opendbc_commit=OPENDBC_COMMIT,
+    production_envelope_verified=True,
+  )
+  old_manager.stage(old_artifact, offroad=True)
+  old_manager.prepare_offroad(offroad=True)
+  stale = context_for(stale_params).activation
+  stale_status = lifecycle_payload(stale)
+  assert stale_status["controller_state"] == "unavailable"
+  assert stale_status["diagnostic"] == ArtifactDiagnostic.STATE_STALE_BUILD.value
+  assert stale_status["effective_controller"] == "stock"
+
+  unverified_params = MemoryParams()
+  prepared = context_for(unverified_params).activation
+  prepared.stage(artifact(), offroad=True)
+  prepared.prepare_offroad(offroad=True)
+  unverified = context_for(
+    unverified_params,
+    envelope_verified=False,
+  ).activation
+  unverified_status = lifecycle_payload(unverified)
+  assert unverified_status["controller_state"] == "unavailable"
+  assert unverified_status["effective_controller"] == "stock"
+  assert (
+    unverified_status["diagnostic"]
+    == ArtifactDiagnostic.UNVERIFIED_ACTUATION_ENVELOPE.value
+  )
+  assert unverified_status["active_profile"] is None
+
+
+def test_lifecycle_cache_skips_unchanged_offroad_writes_but_tracks_transition():
+  params = MemoryParams()
+  sm = FakeSubMaster()
+  daemon = daemon_for(params, sm)
+  step(daemon, params, sm, started=False)
+  lifecycle_puts = [
+    put for put in params.puts if put[0] == LIFECYCLE_STATUS_PARAM
+  ]
+  assert len(lifecycle_puts) == 1
+  assert lifecycle_puts[0][1]["controller_state"] == "stock"
+
+  for _ in range(3):
+    step(daemon, params, sm, started=False)
+  assert len([
+    put for put in params.puts if put[0] == LIFECYCLE_STATUS_PARAM
+  ]) == 1
+
+  params.values[APPROVED_ARTIFACT_PARAM] = artifact().to_param()
+  step(daemon, params, sm, started=False)
+  lifecycle_puts = [
+    put for put in params.puts if put[0] == LIFECYCLE_STATUS_PARAM
+  ]
+  assert len(lifecycle_puts) == 2
+  assert lifecycle_puts[-1][1]["controller_state"] == "provisional"
+
+
+def _fingerprint_daemon(params, sm, *, fail_fingerprint):
+  def decode(encoded):
+    return SimpleNamespace(carFingerprint=encoded.decode("ascii"))
+
+  def context_factory(cp, lifecycle_params):
+    if cp.carFingerprint == fail_fingerprint:
+      return None
+    return context_for(lifecycle_params)
+
+  return BlatV2ProfileDaemon(
+    sm=sm,
+    params=params,
+    car_params_decoder=decode,
+    context_factory=context_factory,
+    logger=FakeLogger(),
+  )
+
+
+def test_known_fingerprint_failure_clears_old_context_and_cache_offroad():
+  params = MemoryParams()
+  params.values["CarParamsPersistent"] = b"vehicle-a"
+  sm = FakeSubMaster()
+  daemon = _fingerprint_daemon(
+    params,
+    sm,
+    fail_fingerprint="vehicle-b",
+  )
+  step(daemon, params, sm, started=False)
+  original_context = daemon.context
+  original_status = copy.deepcopy(params.values[LIFECYCLE_STATUS_PARAM])
+
+  # Temporary loss of both identities preserves the already-validated owner
+  # and its cache.
+  params.values.pop("CarParamsPersistent")
+  params.values.pop("CarParams", None)
+  step(daemon, params, sm, started=False)
+  assert daemon.context is original_context
+  assert params.values[LIFECYCLE_STATUS_PARAM] == original_status
+
+  # A definitively decoded different fingerprint that cannot construct a
+  # current owner invalidates both.
+  params.values["CarParamsPersistent"] = b"vehicle-b"
+  step(daemon, params, sm, started=False)
+  assert daemon.context is None
+  assert LIFECYCLE_STATUS_PARAM not in params.values
+  assert LIFECYCLE_STATUS_PARAM in params.removes
+  assert daemon._last_lifecycle_status_bytes is None
+
+
+def test_same_fingerprint_changed_exact_carparams_rebuilds_context():
+  params = MemoryParams()
+  params.values["CarParamsPersistent"] = b"same-model-runtime-a"
+  sm = FakeSubMaster()
+  factory_inputs: list[bytes] = []
+
+  def context_factory(_cp, lifecycle_params):
+    factory_inputs.append(lifecycle_params.values["CarParamsPersistent"])
+    return context_for(lifecycle_params)
+
+  daemon = BlatV2ProfileDaemon(
+    sm=sm,
+    params=params,
+    car_params_decoder=lambda _encoded: SimpleNamespace(
+      carFingerprint="SAME MODEL",
+    ),
+    context_factory=context_factory,
+    logger=FakeLogger(),
+  )
+  step(daemon, params, sm, started=False)
+  first_context = daemon.context
+  assert factory_inputs == [b"same-model-runtime-a"]
+  assert daemon._context_car_params_bytes == b"same-model-runtime-a"
+
+  params.values["CarParamsPersistent"] = b"same-model-runtime-b"
+  step(daemon, params, sm, started=False)
+  assert factory_inputs == [
+    b"same-model-runtime-a",
+    b"same-model-runtime-b",
+  ]
+  assert daemon.context is not first_context
+  assert daemon._context_car_params_bytes == b"same-model-runtime-b"
+  assert LIFECYCLE_STATUS_PARAM in params.removes
+  lifecycle_puts = [
+    put for put in params.puts if put[0] == LIFECYCLE_STATUS_PARAM
+  ]
+  assert len(lifecycle_puts) == 2
+
+
+def test_restart_factory_failure_removes_preseeded_stale_lifecycle_cache():
+  params = MemoryParams()
+  params.values["CarParamsPersistent"] = b"vehicle-b"
+  params.values[LIFECYCLE_STATUS_PARAM] = {"stale": "display cache"}
+  sm = FakeSubMaster()
+  daemon = _fingerprint_daemon(
+    params,
+    sm,
+    fail_fingerprint="vehicle-b",
+  )
+  step(daemon, params, sm, started=False)
+  assert daemon.context is None
+  assert LIFECYCLE_STATUS_PARAM not in params.values
+  assert params.removes == [LIFECYCLE_STATUS_PARAM]
+
+
+def test_known_identity_failure_onroad_defers_cache_clear_until_offroad():
+  params = MemoryParams()
+  params.values["CarParamsPersistent"] = b"vehicle-a"
+  sm = FakeSubMaster()
+  daemon = _fingerprint_daemon(
+    params,
+    sm,
+    fail_fingerprint="vehicle-b",
+  )
+  step(daemon, params, sm, started=False)
+  status = copy.deepcopy(params.values[LIFECYCLE_STATUS_PARAM])
+  step(daemon, params, sm, started=True)
+
+  params.values["CarParamsPersistent"] = b"vehicle-b"
+  step(daemon, params, sm, started=True)
+  assert daemon.context is None
+  assert params.values[LIFECYCLE_STATUS_PARAM] == status
+  assert params.onroad_writes == []
+  assert daemon._lifecycle_status_clear_pending
+
+  step(daemon, params, sm, started=False)
+  assert LIFECYCLE_STATUS_PARAM not in params.values
+  assert params.onroad_writes == []
+  assert not daemon._lifecycle_status_clear_pending
+
+
 def test_exact_lifecycle_is_prepared_offroad_and_live_path_is_read_only():
   params, sm, daemon = prepare_provisional_daemon()
   activation = daemon.context.activation
+  display = params.values[LIFECYCLE_STATUS_PARAM]
+  assert type(display) is dict
+  assert display["controller_state"] == "provisional"
+  assert display["effective_controller"] == "modular"
+  assert params.puts[-1][0] == LIFECYCLE_STATUS_PARAM
+  assert params.puts[-1][2] is True
   selected = activation.active_artifact
   assert selected is not None
   assert activation.staged_artifact is None

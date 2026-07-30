@@ -235,6 +235,38 @@ Turn-in, release, overshoot, roughness, burst, driver feedback, and event
 bookmarks supervise a proposed profile. They are not directly learned torque
 gains.
 
+### Display-only learning and lifecycle status
+
+The offroad UI reads two rebuildable JSON caches:
+
+- `BLaTv2LearningStatus` is projected by `blatv2_learnerd` only after the
+  exact evidence, optional candidate, and manifest have persisted. It reports
+  cumulative node evidence, truthful per-drive deltas when an offroad-to-
+  onroad baseline was observed, qualification reasons, and only the four
+  parameters the regression actually fits. Seed-carried delay, static
+  friction, and rack-rate resolution are never labeled learned.
+- `BLaTv2LifecycleStatus` is projected by `blatv2_profiled` only while
+  offroad, after `PersistentProfileActivation` validates the current vehicle,
+  runtime, source, opendbc, and activation state. It distinguishes staged
+  lifecycle progress from the effective controller, so a staged profile and
+  a rollback-pending profile both correctly report stock actuation.
+
+Both keys are `CLEAR_ON_MANAGER_START` display caches. They are repopulated
+from current-build, current-vehicle authorities and are never persistent
+authorities themselves. Neither cache may be consumed by fitting, candidate
+creation, approval, controller selection, feedback, rollback, the live
+controller, or a safety path. Missing, stale, malformed, deleted, or edited
+display data therefore cannot change steering. The UI must not parse the raw
+`BLaTv2ActivationState`; lifecycle projection belongs exclusively to its
+validated owner.
+
+The learner may use `CarParamsPersistent` to restore an exact offroad
+evidence owner, but it cannot collect from that identity alone. Each drive
+waits for live `CarParams` and binds only when its fingerprint and canonical
+bytes exactly match the prepared runtime. Pre-bind witnesses are unresolved;
+a confirmed mismatch closes collection for that entire drive. This prevents
+same-model but different-runtime frames from crossing vehicle evidence.
+
 Evidence stays cumulative against its immutable physical fit seed. A
 qualified candidate's revision is an opaque monotone function of persisted
 accepted evidence, so later qualified candidates advance across restarts

@@ -91,6 +91,13 @@ qualified candidate. This lets later casual drives refine the profile without
 rebasing accumulated physical statistics or letting highway data overwrite
 low-speed nodes.
 
+The home-screen learning display reads rebuildable
+`BLaTv2LearningStatus` and `BLaTv2LifecycleStatus` caches. They are cleared
+at manager start and republished offroad only after the learner and activation
+owners validate the current vehicle/build state. They are informational only:
+neither key is an approval, profile, controller-selection, or safety input,
+and editing or deleting either one cannot change steering.
+
 ---
 
 <div align="center" style="text-align: center;">
