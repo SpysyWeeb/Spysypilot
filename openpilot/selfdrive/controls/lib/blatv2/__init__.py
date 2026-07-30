@@ -1,2 +1,1 @@
-"""BLaTv2 shadow-only reference and plant libraries."""
-
+"""Shared numerical modules for the modular BLaTv2 controller."""

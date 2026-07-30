@@ -1,429 +1,954 @@
 #!/usr/bin/env python3
-"""Telemetry-only BLaTv2 plant/reference and frozen-v14 shadow.
+"""Passive modular-BLaTv2 shadow runner.
 
-This process owns no actuator publisher. Its sole output is ``blatV2Shadow``.
+The process publishes telemetry only. It owns no actuator publisher and the
+one-step actuator projection is diagnostic: the projected torque is never
+fed back into :class:`ModularControllerCore`.
+
+Model timing is consumed without controller-side reconstruction:
+
+* ``modelV2.timestampEof`` is the native-plan origin;
+* ``modelV2``'s event ``logMonoTime`` is publication time;
+* ``modelV2.action.desiredCurvatureTime`` is the exact published scalar time;
+* ``modelV2.orientationRate.t`` is the current published native grid; and
+* the ``carState`` event ``logMonoTime`` is the sampled rack-state time; and
+* a direct monotonic capture immediately before core computation is the
+  controller witness.
+
+No ``LAT_SMOOTH_SECONDS``, ``DT_MDL``, or ``liveDelay`` value participates in
+the timing contract.
 """
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import math
 from pathlib import Path
 import time
 from typing import Any
 
-import openpilot.cereal.messaging as messaging
-from opendbc.car.car_helpers import interfaces
 from opendbc.car.structs import car
-from openpilot.common.realtime import config_realtime_process, Priority
-from openpilot.selfdrive.controls.lib.blatv2.controller import ControllerParams
-from openpilot.selfdrive.controls.lib.blatv2.plant import PlantParams
-from openpilot.selfdrive.controls.lib.blatv2.shadow import ShadowCore, ShadowResult
-from openpilot.selfdrive.controls.lib.blatv2.v14_shadow import (
-  FrozenV14ShadowController,
-  V14ShadowResult,
+from opendbc.car.vehicle_model import VehicleModel
+from openpilot.common.realtime import (
+  DT_CTRL,
+  Priority,
+  config_realtime_process,
+)
+from openpilot.selfdrive.controls.lib.blatv2.actuator import (
+  apply_torque_envelope,
+)
+from openpilot.selfdrive.controls.lib.blatv2.bootstrap import profile_sha256
+from openpilot.selfdrive.controls.lib.blatv2.core import (
+  CoreResult,
+  ModularControllerCore,
+)
+from openpilot.selfdrive.controls.lib.blatv2.intent import (
+  INTENT_CAPACITY,
+  IntentAdaptation,
+  IntentBuildStatus,
+  adapt_model_intent_into,
+)
+from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
+from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
+  RackMappingSnapshot,
+)
+from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
+  ProvisionalRackDynamics,
+  RuntimeVehicleBundle,
+  build_runtime_vehicle_bundle,
 )
 
-SHADOW_VERSION = 17
+
+MODULAR_SHADOW_SCHEMA_VERSION = 2
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
   "carState",
   "carControl",
   "carOutput",
+  "selfdriveState",
   "controlsState",
   "liveParameters",
-  "liveTorqueParameters",
-  "liveDelay",
-  "lateralManeuverPlan",
 )
-SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "plant_seed_params.json"
-CONTROLLER_SEED_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "controller_seed_params.json"
+PROVISIONAL_RACK_DYNAMICS_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_rack_dynamics.json"
+PROVISIONAL_POLICY_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_controller_policy.json"
+MAX_RACK_DERIVATIVE_GAP_S = 0.015
+RECORDED_ACTUATOR_CONSTRAINT_TOLERANCE = 1e-2
+_CONTROLLER_LIMIT_FIELDS = (
+  "STEER_MAX",
+  "STEER_DELTA_UP",
+  "STEER_DELTA_DOWN",
+  "STEER_STEP",
+  "STEER_DRIVER_ALLOWANCE",
+  "STEER_DRIVER_MULTIPLIER",
+  "STEER_DRIVER_FACTOR",
+)
+
+
+def _control_witness_mono_ns() -> int:
+  """Capture the same monotonic boot-time clock used by Event.logMonoTime."""
+  clock_id = getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)
+  return time.clock_gettime_ns(clock_id)
+
+
+def assert_no_actuation_publishers(
+  services: tuple[str, ...] = PUBLISHED_SERVICES,
+) -> None:
+  """Pin the process's structural inability to publish an actuator command."""
+  assert services == ("blatV2Shadow",)
+  assert "carControl" not in services
+
+
+def _messaging_module() -> Any:
+  # Import lazily so the deterministic numerical/publisher tests do not
+  # require the native msgq extension. The managed process always has it.
+  import openpilot.cereal.messaging as messaging
+
+  return messaging
+
+
+def _has_controller_limits(candidate: object) -> bool:
+  return all(hasattr(candidate, name) for name in _CONTROLLER_LIMIT_FIELDS)
+
+
+def controller_params_from_interface(
+  car_interface: object,
+  car_params: car.CarParams,
+) -> object:
+  """Construct the detected platform's controller parameters generically.
+
+  Opendbc's detected ``CarInterface`` owns the production ``CarController``
+  class. Its controller module imports the matching ``CarControllerParams``;
+  resolving that class through the detected controller is the same dynamic
+  platform selection used by ``interfaces[CP.carFingerprint]``. No platform
+  package is imported or named here.
+  """
+  controller_class = getattr(car_interface, "CarController", None)
+  if controller_class is None:
+    raise RuntimeError("detected CarInterface has no CarController class")
+  controller_module = importlib.import_module(controller_class.__module__)
+  controller_params_class = getattr(
+    controller_module,
+    "CarControllerParams",
+    None,
+  )
+  if controller_params_class is None:
+    raise RuntimeError(
+      "detected CarController does not expose CarControllerParams",
+    )
+
+  signature = inspect.signature(controller_params_class)
+  positional = tuple(
+    parameter
+    for parameter in signature.parameters.values()
+    if parameter.kind
+    in (
+      inspect.Parameter.POSITIONAL_ONLY,
+      inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+  )
+  if len(positional) == 0:
+    controller_params = controller_params_class()
+  elif len(positional) == 1:
+    controller_params = controller_params_class(car_params)
+  else:
+    raise RuntimeError(
+      "detected CarControllerParams has an unsupported constructor",
+    )
+  if not _has_controller_limits(controller_params):
+    raise RuntimeError(
+      "detected CarControllerParams lacks the torque-envelope contract",
+    )
+  return controller_params
+
+
+class _RackAcceleration:
+  """Timestamped measured-rate derivative with explicit gap invalidation."""
+
+  __slots__ = ("_previous_time_s", "_previous_rate_deg_s")
+
+  def __init__(self) -> None:
+    self._previous_time_s: float | None = None
+    self._previous_rate_deg_s = 0.0
+
+  def reset(self) -> None:
+    self._previous_time_s = None
+    self._previous_rate_deg_s = 0.0
+
+  def update(
+    self,
+    *,
+    sample_mono_ns: int,
+    rack_rate_deg_s: float,
+    inputs_valid: bool,
+  ) -> tuple[float, bool]:
+    try:
+      sample_time_s = int(sample_mono_ns) * 1e-9
+      rate_deg_s = float(rack_rate_deg_s)
+    except (TypeError, ValueError, OverflowError):
+      self.reset()
+      return 0.0, False
+    if not inputs_valid or sample_mono_ns < 0 or not math.isfinite(sample_time_s) or not math.isfinite(rate_deg_s):
+      self.reset()
+      return 0.0, False
+
+    acceleration = 0.0
+    valid = False
+    if self._previous_time_s is not None:
+      dt_s = sample_time_s - self._previous_time_s
+      valid = 0.0 < dt_s <= MAX_RACK_DERIVATIVE_GAP_S
+      if valid:
+        acceleration = (rate_deg_s - self._previous_rate_deg_s) / dt_s
+    self._previous_time_s = sample_time_s
+    self._previous_rate_deg_s = rate_deg_s
+    return acceleration, valid
+
+
+class _CanonicalModelSelector:
+  """Resolve the exact model snapshot witnessed by controlsd.
+
+  ``SubMaster`` drains its non-polled model socket after receiving the
+  controlsState poll witness. The current model can therefore be one
+  publication newer than the message controlsd consumed. controlsState's
+  ``lateralPlanMonoTime`` is the exact model event timestamp; only an exact
+  current or one-snapshot cached match is accepted.
+  """
+
+  __slots__ = (
+    "_cached_message",
+    "_cached_mono_ns",
+    "_cached_valid",
+    "_cached_alive",
+    "selected_message",
+    "selected_mono_ns",
+    "selected_valid",
+    "selected_alive",
+  )
+
+  def __init__(self) -> None:
+    self._cached_message: Any | None = None
+    self._cached_mono_ns = 0
+    self._cached_valid = False
+    self._cached_alive = False
+    self.selected_message: Any | None = None
+    self.selected_mono_ns = 0
+    self.selected_valid = False
+    self.selected_alive = False
+
+  def select(
+    self,
+    *,
+    controls_model_mono_ns: int,
+    current_message: Any,
+    current_mono_ns: int,
+    current_valid: bool,
+    current_alive: bool,
+    current_available: bool,
+  ) -> bool:
+    target = int(controls_model_mono_ns)
+    current_time = int(current_mono_ns)
+    self.selected_message = None
+    self.selected_mono_ns = 0
+    self.selected_valid = False
+    self.selected_alive = False
+
+    matched = False
+    if target > 0 and current_available and current_time == target:
+      self.selected_message = current_message
+      self.selected_mono_ns = current_time
+      self.selected_valid = bool(current_valid)
+      self.selected_alive = bool(current_alive)
+      matched = True
+    elif target > 0 and self._cached_message is not None and self._cached_mono_ns == target:
+      self.selected_message = self._cached_message
+      self.selected_mono_ns = self._cached_mono_ns
+      self.selected_valid = self._cached_valid
+      self.selected_alive = self._cached_alive
+      matched = True
+
+    if current_available and current_time > 0 and current_time != self._cached_mono_ns:
+      # A model publication is only 20 Hz. One retained builder is enough to
+      # resolve the known one-update race without retaining an arbitrary plan.
+      self._cached_message = current_message.as_builder()
+      self._cached_mono_ns = current_time
+      self._cached_valid = bool(current_valid)
+      self._cached_alive = bool(current_alive)
+    return matched
+
+
+class ModularShadowRunner:
+  """Preconstructed numerical artifacts and reusable per-frame storage."""
+
+  def __init__(
+    self,
+    *,
+    car_params: car.CarParams,
+    car_interface: object,
+    controller_params: object,
+    runtime_bundle: RuntimeVehicleBundle,
+    policy: ControllerPolicy,
+  ) -> None:
+    self.car_params = car_params
+    self.car_interface = car_interface
+    self.controller_params = controller_params
+    self.runtime_bundle = runtime_bundle
+    self.policy = policy
+    self.profile = runtime_bundle.seed_profile
+    self.vehicle_model = VehicleModel(car_params)
+    self.core = ModularControllerCore(
+      fixed_dt_s=DT_CTRL,
+      profile=self.profile,
+      tracking_policy=policy.tracking_policy,
+      observer_policy=policy.observer_policy,
+      nominal_mapping=runtime_bundle.nominal_rack_mapping,
+      plan_capacity=INTENT_CAPACITY,
+    )
+
+    self.plan_times_s = [0.0] * INTENT_CAPACITY
+    self.orientation_rates_z = [0.0] * INTENT_CAPACITY
+    self.velocities_x = [0.0] * INTENT_CAPACITY
+    self.plan_curvatures = [0.0] * INTENT_CAPACITY
+    self.rack_acceleration = _RackAcceleration()
+
+    self.runtime_vehicle_identity_hash = runtime_bundle.identity_sha256
+    self.policy_hash = policy.sha256
+    self.profile_hash = profile_sha256(self.profile)
+    self.intent_adaptation: IntentAdaptation | None = None
+    self.core_result: CoreResult = self.core.result
+    self.measured_acceleration_deg_s2 = 0.0
+    self.measured_previous_applied_torque = 0.0
+    self.measured_driver_torque = 0.0
+    self.feasible_torque = 0.0
+    self.unmet_torque = 0.0
+    self.feasibility_constrained = False
+    self.recorded_actuator_constrained = False
+    self.live_parameters_valid = False
+    self.model_input_valid = False
+    self.vehicle_state_valid = False
+    self.lateral_active = False
+    self.lateral_valid = False
+    self.profile_lower_node_speed_mps = self.profile.nodes[0].speed_mps
+    self.profile_upper_node_speed_mps = self.profile.nodes[0].speed_mps
+    self.profile_confidence = 0.0
+    self.state_sample_mono_ns = 0
+    self.control_witness_mono_ns = 0
+    self.valid = False
+    self._previous_lateral_active = False
+
+  @classmethod
+  def from_car_params(
+    cls,
+    car_params: car.CarParams,
+  ) -> ModularShadowRunner:
+    from opendbc.car.car_helpers import interfaces
+
+    interface_class = interfaces[str(car_params.carFingerprint)]
+    car_interface = interface_class(car_params)
+    controller_params = controller_params_from_interface(
+      car_interface,
+      car_params,
+    )
+    dynamics = ProvisionalRackDynamics.from_json_file(
+      PROVISIONAL_RACK_DYNAMICS_PATH,
+    )
+    policy = ControllerPolicy.from_json_file(PROVISIONAL_POLICY_PATH)
+    runtime_bundle = build_runtime_vehicle_bundle(
+      car_params=car_params,
+      car_interface_or_callback=car_interface,
+      controller_params=controller_params,
+      vehicle_identity=str(car_params.carFingerprint),
+      provisional_rack_dynamics=dynamics,
+    )
+    return cls(
+      car_params=car_params,
+      car_interface=car_interface,
+      controller_params=controller_params,
+      runtime_bundle=runtime_bundle,
+      policy=policy,
+    )
+
+  def _live_mapping(
+    self,
+    live_parameters: Any,
+    *,
+    inputs_valid: bool,
+  ) -> RackMappingSnapshot | None:
+    self.live_parameters_valid = False
+    if not inputs_valid:
+      return None
+    try:
+      valid = (
+        bool(live_parameters.valid)
+        and bool(live_parameters.angleOffsetValid)
+        and bool(live_parameters.steerRatioValid)
+        and bool(live_parameters.stiffnessFactorValid)
+      )
+      if not valid:
+        return None
+      stiffness_factor = float(live_parameters.stiffnessFactor)
+      steer_ratio = float(live_parameters.steerRatio)
+      roll = float(live_parameters.roll)
+      angle_offset = float(live_parameters.angleOffsetDeg)
+      if not all(
+        math.isfinite(value)
+        for value in (
+          stiffness_factor,
+          steer_ratio,
+          roll,
+          angle_offset,
+        )
+      ):
+        return None
+      self.vehicle_model.update_params(
+        max(stiffness_factor, 0.1),
+        max(steer_ratio, 0.1),
+      )
+      mapping = RackMappingSnapshot.from_vehicle_model(
+        self.vehicle_model,
+        roll_rad=roll,
+        angle_offset_deg=angle_offset,
+        valid=True,
+      )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+      return None
+    self.live_parameters_valid = True
+    return mapping
+
+  def _adapt_intent(
+    self,
+    *,
+    state_sample_mono_ns: int,
+    control_witness_mono_ns: int,
+    model_publication_mono_ns: int,
+    model_message: Any,
+    model_message_valid: bool,
+    model_message_alive: bool,
+    current_v_ego_m_s: float,
+    transport_delay_s: float,
+  ) -> tuple[IntentAdaptation, float]:
+    try:
+      native_plan_times = model_message.orientationRate.t
+      native_orientation_rates = model_message.orientationRate.z
+      native_velocities = model_message.velocity.x
+      velocity_times = model_message.velocity.t
+      scalar_curvature = float(
+        model_message.action.desiredCurvature,
+      )
+      same_native_grid = len(native_plan_times) == len(velocity_times) and all(
+        float(left) == float(right)
+        for left, right in zip(
+          native_plan_times,
+          velocity_times,
+          strict=True,
+        )
+      )
+      if not same_native_grid:
+        native_velocities = ()
+      adaptation = adapt_model_intent_into(
+        state_sample_mono_ns=state_sample_mono_ns,
+        control_witness_mono_ns=control_witness_mono_ns,
+        model_publication_mono_ns=model_publication_mono_ns,
+        plan_origin_mono_ns=int(model_message.timestampEof),
+        model_frame_id=int(model_message.frameId),
+        message_valid=model_message_valid,
+        message_alive=model_message_alive,
+        scalar_desired_curvature=scalar_curvature,
+        published_desired_curvature_time_s=float(
+          model_message.action.desiredCurvatureTime,
+        ),
+        native_plan_times_s=native_plan_times,
+        native_orientation_rates_z=native_orientation_rates,
+        native_velocities_x=native_velocities,
+        current_v_ego_m_s=current_v_ego_m_s,
+        physical_transport_delay_s=transport_delay_s,
+        output_plan_times_s=self.plan_times_s,
+        output_orientation_rates_z=self.orientation_rates_z,
+        output_velocities_x=self.velocities_x,
+        output_plan_curvatures=self.plan_curvatures,
+      )
+      return adaptation, scalar_curvature
+    except (AttributeError, TypeError, ValueError, OverflowError):
+      # The adapter clears every output buffer before inspecting inputs. This
+      # second call pins the same no-stale-plan property when message field
+      # extraction itself failed before the adapter could run.
+      adaptation = adapt_model_intent_into(
+        state_sample_mono_ns=int(state_sample_mono_ns),
+        control_witness_mono_ns=int(control_witness_mono_ns),
+        model_publication_mono_ns=0,
+        plan_origin_mono_ns=0,
+        model_frame_id=0,
+        message_valid=False,
+        message_alive=False,
+        scalar_desired_curvature=math.nan,
+        published_desired_curvature_time_s=0.0,
+        native_plan_times_s=(),
+        native_orientation_rates_z=(),
+        native_velocities_x=(),
+        current_v_ego_m_s=math.nan,
+        physical_transport_delay_s=float(transport_delay_s),
+        output_plan_times_s=self.plan_times_s,
+        output_orientation_rates_z=self.orientation_rates_z,
+        output_velocities_x=self.velocities_x,
+        output_plan_curvatures=self.plan_curvatures,
+      )
+      return adaptation, math.nan
+
+  def update(
+    self,
+    *,
+    state_sample_mono_ns: int,
+    control_witness_mono_ns: int,
+    model_publication_mono_ns: int,
+    model_message: Any,
+    car_state: Any,
+    car_control: Any,
+    car_output: Any,
+    selfdrive_state: Any,
+    live_parameters: Any,
+    model_message_valid: bool,
+    model_message_alive: bool,
+    vehicle_inputs_valid: bool,
+    live_parameters_inputs_valid: bool,
+  ) -> CoreResult:
+    """Compute one passive frame from recorded response and model intent."""
+    self.state_sample_mono_ns = int(state_sample_mono_ns)
+    self.control_witness_mono_ns = int(control_witness_mono_ns)
+    try:
+      current_speed = float(car_state.vEgo)
+      measured_angle = float(car_state.steeringAngleDeg)
+      measured_rate = float(car_state.steeringRateDeg)
+      applied_torque = float(car_output.actuatorsOutput.torque)
+      requested_torque = float(car_control.actuators.torque)
+      driver_torque = float(car_state.steeringTorque)
+      steering_pressed = bool(car_state.steeringPressed)
+      standstill = bool(car_state.standstill)
+      lateral_active = bool(car_control.latActive)
+      selfdrive_active = bool(selfdrive_state.active)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+      current_speed = math.nan
+      measured_angle = math.nan
+      measured_rate = math.nan
+      applied_torque = math.nan
+      requested_torque = math.nan
+      driver_torque = math.nan
+      steering_pressed = False
+      standstill = False
+      lateral_active = False
+      selfdrive_active = False
+      vehicle_inputs_valid = False
+
+    numeric_vehicle_inputs_valid = bool(vehicle_inputs_valid) and all(
+      math.isfinite(value)
+      for value in (
+        current_speed,
+        measured_angle,
+        measured_rate,
+        applied_torque,
+        requested_torque,
+        driver_torque,
+      )
+    )
+    self.vehicle_state_valid = numeric_vehicle_inputs_valid and current_speed >= 0.0
+    self.lateral_active = self.vehicle_state_valid and lateral_active and selfdrive_active
+    measured_acceleration, acceleration_valid = self.rack_acceleration.update(
+      sample_mono_ns=state_sample_mono_ns,
+      rack_rate_deg_s=measured_rate,
+      inputs_valid=self.vehicle_state_valid,
+    )
+    self.measured_acceleration_deg_s2 = measured_acceleration
+    self.lateral_valid = self.vehicle_state_valid and acceleration_valid
+    engagement_boundary = self.lateral_active != self._previous_lateral_active
+    self._previous_lateral_active = self.lateral_active
+
+    live_mapping = self._live_mapping(
+      live_parameters,
+      inputs_valid=live_parameters_inputs_valid,
+    )
+    profile_speed = current_speed if self.vehicle_state_valid else self.profile.nodes[0].speed_mps
+    transport_delay = self.profile.parameters_at(
+      profile_speed,
+    ).parameters.transport_delay_s
+    adaptation, scalar_curvature = self._adapt_intent(
+      state_sample_mono_ns=state_sample_mono_ns,
+      control_witness_mono_ns=control_witness_mono_ns,
+      model_publication_mono_ns=model_publication_mono_ns,
+      model_message=model_message,
+      model_message_valid=model_message_valid,
+      model_message_alive=model_message_alive,
+      current_v_ego_m_s=(current_speed if self.vehicle_state_valid else math.nan),
+      transport_delay_s=transport_delay,
+    )
+    self.intent_adaptation = adaptation
+    self.model_input_valid = bool(adaptation.frame is not None and adaptation.frame.validity.model_valid)
+
+    self.recorded_actuator_constrained = self.vehicle_state_valid and abs(requested_torque - applied_torque) > RECORDED_ACTUATOR_CONSTRAINT_TOLERANCE
+    lateral_accel_offset = float(
+      self.car_params.lateralTuning.torque.latAccelOffset,
+    )
+    result = self.core.update(
+      frame=adaptation.frame,
+      intent_status=adaptation.status,
+      intent_plan_times_s=self.plan_times_s,
+      intent_orientation_rates_z=self.orientation_rates_z,
+      intent_velocities_x=self.velocities_x,
+      scalar_curvature=(scalar_curvature if self.model_input_valid else math.nan),
+      current_v_ego_m_s=(current_speed if self.vehicle_state_valid else math.nan),
+      measured_rack_angle_deg=measured_angle,
+      measured_rack_rate_deg_s=measured_rate,
+      measured_rack_acceleration_deg_s2=measured_acceleration,
+      recorded_applied_torque=applied_torque,
+      lateral_accel_offset=lateral_accel_offset,
+      live_mapping=live_mapping,
+      lateral_active=self.lateral_active,
+      lateral_valid=self.lateral_valid,
+      engagement_boundary=engagement_boundary,
+      live_parameters_valid=self.live_parameters_valid,
+      steering_pressed=steering_pressed,
+      actuator_constrained=self.recorded_actuator_constrained,
+      # A passive shadow has no constrained output. The one-step feasibility
+      # projection below is diagnostic and must never influence the observer.
+      output_constrained=False,
+      standstill=standstill,
+    )
+    self.core_result = result
+    self.measured_previous_applied_torque = applied_torque if math.isfinite(applied_torque) else 0.0
+    self.measured_driver_torque = driver_torque if math.isfinite(driver_torque) else 0.0
+    self.feasible_torque = 0.0
+    self.unmet_torque = 0.0
+    self.feasibility_constrained = False
+    feasibility_valid = result.valid and math.isfinite(result.raw_torque) and math.isfinite(applied_torque) and math.isfinite(driver_torque)
+    if feasibility_valid:
+      try:
+        envelope = apply_torque_envelope(
+          self.runtime_bundle.torque_limits,
+          result.raw_torque,
+          applied_torque,
+          driver_torque,
+        )
+        self.feasible_torque = envelope.applied_torque
+        self.unmet_torque = result.raw_torque - envelope.applied_torque
+        self.feasibility_constrained = envelope.constrained
+      except (TypeError, ValueError, OverflowError):
+        feasibility_valid = False
+
+    lower_index = min(
+      max(int(result.profile_lower_node), 0),
+      len(self.profile.nodes) - 1,
+    )
+    upper_index = min(
+      max(int(result.profile_upper_node), 0),
+      len(self.profile.nodes) - 1,
+    )
+    lower_node = self.profile.nodes[lower_index]
+    upper_node = self.profile.nodes[upper_index]
+    self.profile_lower_node_speed_mps = lower_node.speed_mps
+    self.profile_upper_node_speed_mps = upper_node.speed_mps
+    self.profile_confidence = lower_node.parameters.confidence + result.profile_upper_weight * (
+      upper_node.parameters.confidence - lower_node.parameters.confidence
+    )
+    self.valid = bool(result.valid and feasibility_valid and self.vehicle_state_valid and self.model_input_valid)
+    return result
+
+
+def _finite_or_zero(value: object) -> float:
+  try:
+    converted = float(value)
+  except (TypeError, ValueError, OverflowError):
+    return 0.0
+  return converted if math.isfinite(converted) else 0.0
+
+
+def _uint64_or_zero(value: object) -> int:
+  try:
+    converted = int(value)
+  except (TypeError, ValueError, OverflowError):
+    return 0
+  return converted if 0 <= converted <= (1 << 64) - 1 else 0
 
 
 def populate_shadow_message(
   message: Any,
   shadow: Any,
-  result: ShadowResult,
+  runner: ModularShadowRunner,
   *,
   log_mono_time_ns: int,
-  message_valid: bool,
-  compute_seconds: float,
-  shared_compute_seconds: float,
-  live_lqi_command_torque: float,
-  live_lqi_status: int,
-  live_lqi_compute_seconds: float,
-  live_lqi_output_valid: bool,
-  live_lqi_invalid_frames: int,
-  live_lqi_recovery_ok_frames: int,
-  live_lqi_controller_version: int,
-  live_action_raw_command_torque: float,
-  live_action_feedforward_torque: float,
-  live_action_feedback_torque: float,
-  live_action_desired_angle_deg: float,
-  live_action_desired_rate_deg_s: float,
-  live_action_desired_acceleration_deg_s2: float,
-  live_action_predicted_angle_deg: float,
-  live_action_predicted_rate_deg_s: float,
-  live_action_required_acceleration_deg_s2: float,
-  live_action_speed_mps: float,
-  live_action_aligning_torque: float,
-  live_action_friction_torque: float,
-  live_action_dynamic_torque: float,
-  live_action_time_seconds: float,
-  live_action_prediction_delay_seconds: float,
-  live_action_slew_constrained: bool,
-  live_action_breakaway_active: bool,
-  live_action_breakaway_persistence_frames: int,
-  live_action_horizon_assist_active: bool,
-  live_action_horizon_torque_demand: float,
-  live_action_horizon_demand_time_seconds: float,
-  live_action_no_lead_limited: bool,
-  live_action_held_static_load: float,
-  rack_stationary: bool,
-  v14_result: V14ShadowResult,
-  v14_compute_seconds: float,
+  compute_time_seconds: float,
 ) -> None:
-  """Normalize the numerical core at the Cap'n Proto type boundary.
+  """Populate and normalize the raw-core-to-Cap'n-Proto boundary."""
+  result = runner.core_result
+  adaptation = runner.intent_adaptation
+  intent_status: IntentBuildStatus | None = None if adaptation is None else adaptation.status
 
-  Solver fields may be numpy scalar types. Cap'n Proto accepts only native
-  Python scalar values, so every published field is converted here rather
-  than relying on the type produced by any particular solver path.
-  """
   message.logMonoTime = int(log_mono_time_ns)
-  message.valid = bool(message_valid)
-  shadow.shadowVersion = int(SHADOW_VERSION)
-  shadow.valid = bool(result.valid)
-  shadow.referenceCurvature = float(result.reference_curvature)
-  shadow.torqueDemand = float(result.torque_demand)
-  shadow.feasibleTorque = float(result.feasible_torque)
-  shadow.plantResidual = float(result.plant_residual)
-  shadow.scalarPlanDisagreement = float(result.scalar_plan_disagreement)
-  shadow.horizon = float(result.horizon)
-  shadow.computeTimeSeconds = float(compute_seconds)
-  shadow.sharedComputeTimeSeconds = float(shared_compute_seconds)
-  shadow.vEgo = float(result.v_ego)
-  shadow.aligningTorque = float(result.aligning_torque)
-  shadow.alignInputsValid = bool(result.align_inputs_valid)
-  shadow.disturbanceEstimate = float(result.disturbance_estimate)
-  shadow.observerStatus = int(result.observer_status)
-  shadow.observerUnconstrainedUpdate = float(
-    result.observer_unconstrained_update
+  message.valid = bool(runner.valid)
+  shadow.modularSchemaVersion = int(MODULAR_SHADOW_SCHEMA_VERSION)
+  shadow.modularRuntimeVehicleIdentityHash = str(
+    runner.runtime_vehicle_identity_hash,
   )
-  shadow.signedRackRateDegS = float(result.signed_rack_rate_deg_s)
-  shadow.liveActionHeldStaticLoad = float(
-    live_action_held_static_load
+  shadow.modularPolicyHash = str(runner.policy_hash)
+  shadow.modularProfileHash = str(runner.profile_hash)
+  shadow.modularModelFrameId = int(result.model_frame_id)
+  shadow.modularIntentStatus = int(result.intent_code)
+  shadow.modularCoreStatus = int(result.status)
+  shadow.modularValid = bool(runner.valid)
+  shadow.modularIntentUsable = bool(intent_status is not None and intent_status.usable)
+  shadow.modularProfileQualified = bool(result.profile_qualified)
+  shadow.modularReferenceValid = bool(result.reference_valid)
+  shadow.modularScalarOnly = bool(result.reference_scalar_only)
+  shadow.modularNominalMappingUsed = bool(result.reference_valid and not result.rack_mapping_valid)
+  shadow.modularLiveParametersValid = bool(
+    runner.live_parameters_valid,
   )
-  shadow.rackStationary = bool(rack_stationary)
-  shadow.liveLqiCommandTorque = float(live_lqi_command_torque)
-  shadow.liveLqiStatus = int(live_lqi_status)
-  shadow.liveLqiComputeTimeSeconds = float(live_lqi_compute_seconds)
-  shadow.liveLqiOutputValid = bool(live_lqi_output_valid)
-  shadow.liveLqiInvalidFrames = int(live_lqi_invalid_frames)
-  shadow.liveLqiRecoveryOkFrames = int(live_lqi_recovery_ok_frames)
-  shadow.liveLqiControllerVersion = int(live_lqi_controller_version)
-  shadow.liveActionRawCommandTorque = float(
-    live_action_raw_command_torque
+  shadow.modularRecordedActuatorConstrained = bool(
+    runner.recorded_actuator_constrained,
   )
-  shadow.liveActionFeedforwardTorque = float(
-    live_action_feedforward_torque
+  shadow.modularFeasibilityConstrained = bool(
+    runner.feasibility_constrained,
   )
-  shadow.liveActionFeedbackTorque = float(live_action_feedback_torque)
-  shadow.liveActionDesiredAngleDeg = float(live_action_desired_angle_deg)
-  shadow.liveActionDesiredRateDegS = float(live_action_desired_rate_deg_s)
-  shadow.liveActionDesiredAccelerationDegS2 = float(
-    live_action_desired_acceleration_deg_s2
+  shadow.modularObserverSaturated = bool(result.observer_saturated)
+  shadow.modularRawTorque = _finite_or_zero(result.raw_torque)
+  shadow.modularFeasibleTorque = _finite_or_zero(
+    runner.feasible_torque,
   )
-  shadow.liveActionPredictedAngleDeg = float(
-    live_action_predicted_angle_deg
+  shadow.modularUnmetTorque = _finite_or_zero(runner.unmet_torque)
+  shadow.modularAligningTorque = _finite_or_zero(
+    result.aligning_torque,
   )
-  shadow.liveActionPredictedRateDegS = float(
-    live_action_predicted_rate_deg_s
+  shadow.modularFrictionTorque = _finite_or_zero(
+    result.friction_torque,
   )
-  shadow.liveActionRequiredAccelerationDegS2 = float(
-    live_action_required_acceleration_deg_s2
+  shadow.modularMotionFeedforwardTorque = _finite_or_zero(
+    result.motion_feedforward_torque,
   )
-  shadow.liveActionSpeedMps = float(live_action_speed_mps)
-  shadow.liveActionAligningTorque = float(live_action_aligning_torque)
-  shadow.liveActionFrictionTorque = float(live_action_friction_torque)
-  shadow.liveActionDynamicTorque = float(live_action_dynamic_torque)
-  shadow.liveActionTimeSeconds = float(live_action_time_seconds)
-  shadow.liveActionPredictionDelaySeconds = float(
-    live_action_prediction_delay_seconds
+  shadow.modularPositionFeedbackTorque = _finite_or_zero(
+    result.position_feedback_torque,
   )
-  shadow.liveActionSlewConstrained = bool(live_action_slew_constrained)
-  shadow.liveActionBreakawayActive = bool(
-    live_action_breakaway_active
+  shadow.modularRateFeedbackTorque = _finite_or_zero(
+    result.rate_feedback_torque,
   )
-  shadow.liveActionBreakawayPersistenceFrames = int(
-    live_action_breakaway_persistence_frames
+  shadow.modularDisturbanceTorque = _finite_or_zero(
+    result.disturbance_torque,
   )
-  shadow.liveActionHorizonAssistActive = bool(
-    live_action_horizon_assist_active
+  shadow.modularDesiredCurvature = _finite_or_zero(
+    result.desired_curvature,
   )
-  shadow.liveActionHorizonTorqueDemand = float(
-    live_action_horizon_torque_demand
+  shadow.modularDesiredCurvatureRate = _finite_or_zero(
+    result.desired_curvature_rate,
   )
-  shadow.liveActionHorizonDemandTimeSeconds = float(
-    live_action_horizon_demand_time_seconds
+  shadow.modularDesiredCurvatureAcceleration = _finite_or_zero(
+    result.desired_curvature_acceleration,
   )
-  shadow.liveActionNoLeadLimited = bool(live_action_no_lead_limited)
-  shadow.v14CommandTorque = float(v14_result.command_torque)
-  shadow.v14DesiredCurvature = float(v14_result.desired_curvature)
-  shadow.v14ControllerVersion = int(v14_result.controller_version)
-  shadow.v14Valid = bool(v14_result.valid)
-  shadow.v14ComputeTimeSeconds = float(v14_compute_seconds)
+  shadow.modularDesiredAngleDeg = _finite_or_zero(
+    result.desired_angle_deg,
+  )
+  shadow.modularDesiredRateDegS = _finite_or_zero(
+    result.desired_rate_deg_s,
+  )
+  shadow.modularDesiredAccelerationDegS2 = _finite_or_zero(
+    result.desired_acceleration_deg_s2,
+  )
+  shadow.modularMeasuredAngleDeg = _finite_or_zero(
+    result.measured_angle_deg,
+  )
+  shadow.modularMeasuredRateDegS = _finite_or_zero(
+    result.measured_rate_deg_s,
+  )
+  shadow.modularMeasuredAccelerationDegS2 = _finite_or_zero(
+    runner.measured_acceleration_deg_s2,
+  )
+  shadow.modularPredictedAngleDeg = _finite_or_zero(
+    result.predicted_angle_deg,
+  )
+  shadow.modularPredictedRateDegS = _finite_or_zero(
+    result.predicted_rate_deg_s,
+  )
+  shadow.modularPositionErrorDeg = _finite_or_zero(
+    result.position_error_deg,
+  )
+  shadow.modularRateErrorDegS = _finite_or_zero(
+    result.rate_error_deg_s,
+  )
+  shadow.modularRequiredAccelerationDegS2 = _finite_or_zero(
+    result.required_acceleration_deg_s2,
+  )
+  shadow.modularObserverEstimateTorque = _finite_or_zero(
+    result.observer_estimated_disturbance_torque,
+  )
+  shadow.modularObserverInstantaneousTorque = _finite_or_zero(
+    result.observer_instantaneous_disturbance_torque,
+  )
+  shadow.modularObserverStatus = int(result.observer_status)
+  shadow.modularProfileLowerNodeSpeedMps = _finite_or_zero(
+    runner.profile_lower_node_speed_mps,
+  )
+  shadow.modularProfileUpperNodeSpeedMps = _finite_or_zero(
+    runner.profile_upper_node_speed_mps,
+  )
+  shadow.modularProfileUpperWeight = _finite_or_zero(
+    result.profile_upper_weight,
+  )
+  shadow.modularTorquePerLateralAccel = _finite_or_zero(
+    result.torque_per_lateral_accel,
+  )
+  shadow.modularRackGainDegS2PerTorque = _finite_or_zero(
+    result.rack_gain_deg_s2_per_torque,
+  )
+  shadow.modularRackDampingPerS = _finite_or_zero(
+    result.rack_damping_per_s,
+  )
+  shadow.modularTransportDelaySeconds = _finite_or_zero(
+    result.transport_delay_s,
+  )
+  shadow.modularStaticFrictionTorque = _finite_or_zero(
+    result.static_friction_torque,
+  )
+  shadow.modularKineticFrictionTorque = _finite_or_zero(
+    result.kinetic_friction_torque,
+  )
+  shadow.modularRackRateResolutionDegS = _finite_or_zero(
+    result.rack_rate_resolution_deg_s,
+  )
+  shadow.modularProfileConfidence = _finite_or_zero(
+    runner.profile_confidence,
+  )
+  shadow.modularPlanAgeSeconds = _finite_or_zero(
+    0.0 if intent_status is None else intent_status.publication_age_s,
+  )
+  shadow.modularDesiredCurvatureTimeSeconds = _finite_or_zero(
+    0.0 if adaptation is None or adaptation.frame is None else adaptation.frame.timing.scalar_action_plan_s,
+  )
+  shadow.modularPlanTimeNowSeconds = _finite_or_zero(
+    result.plan_time_now_s,
+  )
+  shadow.modularPhysicalEffectPlanSeconds = _finite_or_zero(
+    result.physical_effect_plan_s,
+  )
+  shadow.modularCurrentSpeedMps = _finite_or_zero(
+    result.current_speed_mps,
+  )
+  shadow.modularEffectSpeedMps = _finite_or_zero(
+    result.effect_speed_mps,
+  )
+  shadow.modularMeasuredPreviousAppliedTorque = _finite_or_zero(
+    runner.measured_previous_applied_torque,
+  )
+  shadow.modularMeasuredDriverTorque = _finite_or_zero(
+    runner.measured_driver_torque,
+  )
+  shadow.modularComputeTimeSeconds = _finite_or_zero(
+    compute_time_seconds,
+  )
+  shadow.modularModelInputValid = bool(runner.model_input_valid)
+  shadow.modularVehicleStateValid = bool(
+    runner.vehicle_state_valid,
+  )
+  shadow.modularLateralActive = bool(runner.lateral_active)
+  shadow.modularLateralValid = bool(runner.lateral_valid)
+  shadow.modularActuationEnvelopeVerified = bool(
+    runner.runtime_bundle.torque_limits.production_envelope_verified,
+  )
+  shadow.modularStateSampleMonoTime = _uint64_or_zero(
+    runner.state_sample_mono_ns,
+  )
+  shadow.modularControlWitnessMonoTime = _uint64_or_zero(
+    runner.control_witness_mono_ns,
+  )
+  shadow.modularStateAgeSeconds = _finite_or_zero(
+    result.state_age_s,
+  )
+  shadow.modularTotalPredictionHorizonSeconds = _finite_or_zero(
+    result.total_prediction_horizon_s,
+  )
 
 
 class BlatV2Shadow:
+  """Messaging wrapper around the preconstructed passive runner."""
+
   def __init__(self) -> None:
+    assert_no_actuation_publishers()
+    messaging = _messaging_module()
     from openpilot.common.params import Params
 
-    # This is a structural actuation boundary, not merely a convention.
-    assert "carControl" not in PUBLISHED_SERVICES
-    assert "sendcan" not in PUBLISHED_SERVICES
-
     params = Params()
-    cp_bytes = params.get("CarParams", block=True)
-    self.CP = messaging.log_from_bytes(cp_bytes, car.CarParams)
-    self.CI = interfaces[self.CP.carFingerprint](self.CP)
-    self.seed_params = PlantParams.from_seed_file(
-      SEED_PATH, self.CI.CC.params,
+    car_params = messaging.log_from_bytes(
+      params.get("CarParams", block=True),
+      car.CarParams,
     )
-    self.controller_params = ControllerParams.from_seed_file(CONTROLLER_SEED_PATH)
-    self.torque_params = self.CP.lateralTuning.torque
-    self.core = ShadowCore(self.seed_params, self.torque_params, self.CP, self.controller_params)
-    self.v14 = FrozenV14ShadowController(self.CP, self.CI)
-
-    self.subscribed_services = list(SUBSCRIBED_SERVICES)
-    self.sm = messaging.SubMaster(self.subscribed_services, poll="controlsState")
+    self.runner = ModularShadowRunner.from_car_params(car_params)
+    self.sm = messaging.SubMaster(
+      list(SUBSCRIBED_SERVICES),
+      poll="controlsState",
+    )
     self.pm = messaging.PubMaster(list(PUBLISHED_SERVICES))
+    assert set(self.pm.sock) == {"blatV2Shadow"}
+    assert "carControl" not in self.pm.sock
     self.message = messaging.new_message("blatV2Shadow")
     self.shadow = self.message.blatV2Shadow
+    self.model_selector = _CanonicalModelSelector()
 
-  def _begin_frame(self) -> ShadowResult:
-    return self.core.begin_frame(
-      self.sm["modelV2"],
-      self.sm["carState"],
-      self.sm["carControl"],
-      self.sm["carOutput"],
-      self.sm["liveParameters"],
-      self.sm.valid["liveParameters"],
-      float(self.sm["liveDelay"].lateralDelay),
-      self.sm.valid["liveDelay"],
-      self.sm.valid["modelV2"],
-    )
+  @staticmethod
+  def _checks(sm: Any, services: tuple[str, ...]) -> bool:
+    return bool(all(sm.seen[service] for service in services) and sm.all_checks(list(services)))
 
   def step(self) -> None:
     self.sm.update()
     if not self.sm.updated["controlsState"]:
       return
 
-    started_ns = time.perf_counter_ns()
-    shared_compute_seconds = 0.0
-    v14_compute_seconds = 0.0
-    phase = "shared"
-    phase_started_ns = time.perf_counter_ns()
-    try:
-      result = self._begin_frame()
-      phase_finished_ns = time.perf_counter_ns()
-      shared_compute_seconds = (
-        phase_finished_ns - phase_started_ns
-      ) * 1e-9
-
-      phase = "finalize"
-      result = self.core.end_frame()
-    except (RuntimeError, ValueError, OverflowError):
-      failed_phase_seconds = (
-        time.perf_counter_ns() - phase_started_ns
-      ) * 1e-9
-      if phase == "shared":
-        shared_compute_seconds = failed_phase_seconds
-      result = self.core.invalid_result()
-
-    controls_state = self.sm["controlsState"]
-    torque_state_valid = (
-      controls_state.lateralControlState.which() == "torqueState"
+    vehicle_services = (
+      "carState",
+      "carControl",
+      "carOutput",
+      "selfdriveState",
+      "controlsState",
     )
-    torque_state = controls_state.lateralControlState.torqueState
-    live_lateral_active = bool(
-      torque_state.active if torque_state_valid else False
+    controls_model_mono_ns = int(
+      self.sm["controlsState"].lateralPlanMonoTime,
     )
-
-    v14_started_ns = time.perf_counter_ns()
-    try:
-      v14_result = self.v14.step(
-        self.sm["modelV2"],
-        self.sm.valid["modelV2"],
-        self.sm.updated["modelV2"],
-        self.sm["carState"],
-        self.sm["carOutput"],
-        live_lateral_active,
-        self.sm["liveParameters"],
-        self.sm["liveTorqueParameters"],
-        self.sm.all_checks(["liveTorqueParameters"]),
-        float(self.sm["liveDelay"].lateralDelay),
-        self.sm["lateralManeuverPlan"],
-        self.sm.valid["lateralManeuverPlan"],
-      )
-    except (RuntimeError, ValueError, OverflowError):
-      self.v14.reset()
-      v14_result = self.v14.result
-    v14_compute_seconds = (time.perf_counter_ns() - v14_started_ns) * 1e-9
-
-    live_lqi_command = (
-      float(torque_state.blatV2CommandTorque)
-      if torque_state_valid else 0.0
+    model_resolved = self.model_selector.select(
+      controls_model_mono_ns=controls_model_mono_ns,
+      current_message=self.sm["modelV2"],
+      current_mono_ns=int(self.sm.logMonoTime["modelV2"]),
+      current_valid=bool(self.sm.valid["modelV2"]),
+      current_alive=bool(self.sm.alive["modelV2"]),
+      current_available=bool(self.sm.seen["modelV2"]),
     )
-    live_lqi_status = (
-      int(torque_state.blatV2Status)
-      if torque_state_valid else 1
+    selected_model = self.model_selector.selected_message
+    # This witness shares the monotonic log clock and is captured immediately
+    # before numerical computation. controlsState.logMonoTime is only a poll
+    # event timestamp and can predate work performed by this process.
+    control_witness_mono_ns = _control_witness_mono_ns()
+    start = time.perf_counter()
+    self.runner.update(
+      state_sample_mono_ns=int(self.sm.logMonoTime["carState"]),
+      control_witness_mono_ns=control_witness_mono_ns,
+      model_publication_mono_ns=(self.model_selector.selected_mono_ns if model_resolved else 0),
+      model_message=selected_model,
+      car_state=self.sm["carState"],
+      car_control=self.sm["carControl"],
+      car_output=self.sm["carOutput"],
+      selfdrive_state=self.sm["selfdriveState"],
+      live_parameters=self.sm["liveParameters"],
+      model_message_valid=bool(
+        model_resolved and self.model_selector.selected_valid,
+      ),
+      model_message_alive=bool(
+        model_resolved and self.model_selector.selected_alive,
+      ),
+      vehicle_inputs_valid=self._checks(self.sm, vehicle_services),
+      live_parameters_inputs_valid=self._checks(
+        self.sm,
+        ("liveParameters",),
+      ),
     )
-    live_lqi_compute_seconds = (
-      float(torque_state.blatV2ComputeTimeSeconds)
-      if torque_state_valid else 0.0
-    )
-    live_lqi_output_valid = (
-      bool(torque_state.blatV2OutputValid)
-      if torque_state_valid else False
-    )
-    live_lqi_invalid_frames = (
-      int(torque_state.blatV2InvalidFrames)
-      if torque_state_valid else 0
-    )
-    live_lqi_recovery_ok_frames = (
-      int(torque_state.blatV2RecoveryOkFrames)
-      if torque_state_valid else 0
-    )
-    live_lqi_controller_version = (
-      int(torque_state.version) if torque_state_valid else 0
-    )
-    compute_seconds = (time.perf_counter_ns() - started_ns) * 1e-9
-    assert (
-      math.isfinite(compute_seconds)
-      and math.isfinite(shared_compute_seconds)
-      and math.isfinite(live_lqi_compute_seconds)
-      and math.isfinite(v14_compute_seconds)
-      and compute_seconds >= 0.0
-      and shared_compute_seconds >= 0.0
-      and live_lqi_compute_seconds >= 0.0
-      and v14_compute_seconds >= 0.0
-    )
-
+    compute_time_seconds = time.perf_counter() - start
     populate_shadow_message(
       self.message,
       self.shadow,
-      result,
-      log_mono_time_ns=int(time.monotonic() * 1e9),
-      message_valid=bool(
-        result.valid and self.sm.all_checks(self.subscribed_services)
-      ),
-      compute_seconds=compute_seconds,
-      shared_compute_seconds=shared_compute_seconds,
-      live_lqi_command_torque=live_lqi_command,
-      live_lqi_status=live_lqi_status,
-      live_lqi_compute_seconds=live_lqi_compute_seconds,
-      live_lqi_output_valid=live_lqi_output_valid,
-      live_lqi_invalid_frames=live_lqi_invalid_frames,
-      live_lqi_recovery_ok_frames=live_lqi_recovery_ok_frames,
-      live_lqi_controller_version=live_lqi_controller_version,
-      live_action_raw_command_torque=(
-        float(torque_state.blatV2RawCommandTorque)
-        if torque_state_valid else 0.0
-      ),
-      live_action_feedforward_torque=(
-        float(torque_state.blatV2FeedforwardTorque)
-        if torque_state_valid else 0.0
-      ),
-      live_action_feedback_torque=(
-        float(torque_state.blatV2FeedbackTorque)
-        if torque_state_valid else 0.0
-      ),
-      live_action_desired_angle_deg=(
-        float(torque_state.blatV2DesiredAngleDeg)
-        if torque_state_valid else 0.0
-      ),
-      live_action_desired_rate_deg_s=(
-        float(torque_state.blatV2DesiredRateDegS)
-        if torque_state_valid else 0.0
-      ),
-      live_action_desired_acceleration_deg_s2=(
-        float(torque_state.blatV2DesiredAccelerationDegS2)
-        if torque_state_valid else 0.0
-      ),
-      live_action_predicted_angle_deg=(
-        float(torque_state.blatV2PredictedAngleDeg)
-        if torque_state_valid else 0.0
-      ),
-      live_action_predicted_rate_deg_s=(
-        float(torque_state.blatV2PredictedRateDegS)
-        if torque_state_valid else 0.0
-      ),
-      live_action_required_acceleration_deg_s2=(
-        float(torque_state.blatV2RequiredAccelerationDegS2)
-        if torque_state_valid else 0.0
-      ),
-      live_action_speed_mps=(
-        float(torque_state.blatV2ActionSpeedMps)
-        if torque_state_valid else 0.0
-      ),
-      live_action_aligning_torque=(
-        float(torque_state.blatV2AligningTorque)
-        if torque_state_valid else 0.0
-      ),
-      live_action_friction_torque=(
-        float(torque_state.blatV2FrictionTorque)
-        if torque_state_valid else 0.0
-      ),
-      live_action_dynamic_torque=(
-        float(torque_state.blatV2DynamicTorque)
-        if torque_state_valid else 0.0
-      ),
-      live_action_time_seconds=(
-        float(torque_state.blatV2ActionTimeSeconds)
-        if torque_state_valid else 0.0
-      ),
-      live_action_prediction_delay_seconds=(
-        float(torque_state.blatV2PredictionDelaySeconds)
-        if torque_state_valid else 0.0
-      ),
-      live_action_slew_constrained=(
-        bool(torque_state.blatV2SlewConstrained)
-        if torque_state_valid else False
-      ),
-      live_action_breakaway_active=(
-        bool(torque_state.blatV2BreakawayActive)
-        if torque_state_valid else False
-      ),
-      live_action_breakaway_persistence_frames=(
-        int(torque_state.blatV2BreakawayPersistenceFrames)
-        if torque_state_valid else 0
-      ),
-      live_action_horizon_assist_active=(
-        bool(torque_state.blatV2HorizonAssistActive)
-        if torque_state_valid else False
-      ),
-      live_action_horizon_torque_demand=(
-        float(torque_state.blatV2HorizonTorqueDemand)
-        if torque_state_valid else 0.0
-      ),
-      live_action_horizon_demand_time_seconds=(
-        float(torque_state.blatV2HorizonDemandTimeSeconds)
-        if torque_state_valid else 0.0
-      ),
-      live_action_no_lead_limited=(
-        bool(torque_state.blatV2NoLeadLimited)
-        if torque_state_valid else False
-      ),
-      live_action_held_static_load=(
-        float(torque_state.blatV2HeldStaticLoad)
-        if torque_state_valid else 0.0
-      ),
-      rack_stationary=(
-        bool(torque_state.blatV2RackStationary)
-        if torque_state_valid else False
-      ),
-      v14_result=v14_result,
-      v14_compute_seconds=v14_compute_seconds,
+      self.runner,
+      log_mono_time_ns=control_witness_mono_ns,
+      compute_time_seconds=compute_time_seconds,
     )
     self.pm.send("blatV2Shadow", self.message)
 
@@ -433,11 +958,8 @@ class BlatV2Shadow:
 
 
 def main() -> None:
-  # CTRL_LOW preserves controlsd's preemption guarantee without forcing this
-  # passive process to compete with CTRL_HIGH on core 4 every cycle. Roam only
-  # on cores 0-4: core 5 carries equal-priority planning work, while 6/7 are
-  # reserved for camera/model workloads. The standard setup also disables
-  # cyclic GC before the hot loop.
+  # Roam only on cores 0-4. Core 5 hosts equal-priority planning work and
+  # cores 6-7 host camera/model workloads; CTRL_LOW always yields to controlsd.
   config_realtime_process([0, 1, 2, 3, 4], Priority.CTRL_LOW)
   BlatV2Shadow().run()
 
