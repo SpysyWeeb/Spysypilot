@@ -46,6 +46,7 @@ Changing any rule is a behavior change and requires a shadow-version bump.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import json
@@ -130,11 +131,17 @@ class PlantParams:
     values = self.torque_per_lataccel_values
     if speed <= nodes[0]:
       return values[0]
-    for index in range(1, len(nodes)):
-      if speed <= nodes[index]:
-        fraction = (speed - nodes[index - 1]) / (nodes[index] - nodes[index - 1])
-        return values[index - 1] + fraction * (values[index] - values[index - 1])
-    return values[-1]
+    index = bisect_left(nodes, speed, 1)
+    if index >= len(nodes):
+      return values[-1]
+    fraction = (
+      (speed - nodes[index - 1])
+      / (nodes[index] - nodes[index - 1])
+    )
+    return (
+      values[index - 1]
+      + fraction * (values[index] - values[index - 1])
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +224,45 @@ class PlantState:
   def __post_init__(self) -> None:
     if not all(math.isfinite(value) for value in (self.angle_deg, self.rate_deg_s, self.applied_torque, self.v_ego)):
       raise ValueError("plant state must be finite")
+
+
+@dataclass(slots=True)
+class PlantSensitivity:
+  """Terminal state derivative with respect to one constant request."""
+
+  angle_per_torque: float = 0.0
+  rate_per_torque: float = 0.0
+
+
+@dataclass(slots=True)
+class AlignRuntimeTerms:
+  """Caller-owned invariants for repeated dynamics at one speed/alignment.
+
+  Terminal inverse solves advance the same state through several 10 ms steps
+  and repeat that rollout for multiple requests. These vehicle-model terms are
+  constant throughout. Caller-owned storage keeps the live path allocation
+  free while removing redundant validation and coefficient construction.
+  """
+
+  speed_squared: float = 0.0
+  curvature_factor: float = 0.0
+  roll_compensation: float = 0.0
+  steer_ratio: float = 1.0
+  angle_offset_deg: float = 0.0
+  roll_gravity: float = 0.0
+  torque_gain: float = 0.0
+  torque_per_angle: float = 0.0
+  aligning_torque_offset: float = 0.0
+
+
+@dataclass(slots=True)
+class AlignBatchTerms:
+  """Alignment invariants shared by every speed cell in one frame."""
+
+  slip_factor: float = 0.0
+  roll: float = 0.0
+  steer_ratio: float = 1.0
+  angle_offset_deg: float = 0.0
 
 
 @dataclass(slots=True)
@@ -311,6 +357,233 @@ class PlantTwin:
   def aligning_torque_values(self, angle_deg: float, v_ego: float, align_inputs: AlignInputs) -> float:
     """Allocation-free scalar form used by both shadow candidates."""
     return self._aligning_torque(float(angle_deg), float(v_ego), align_inputs)
+
+  def prepare_align_runtime_terms(
+    self,
+    v_ego: float,
+    align_inputs: AlignInputs,
+    target: AlignRuntimeTerms,
+  ) -> None:
+    """Prepare invariant vehicle-model terms for repeated rack rollouts."""
+    align_inputs.validate()
+    self._prepare_align_runtime_terms(
+      v_ego,
+      align_inputs,
+      target,
+    )
+
+  def prepare_align_batch_terms(
+    self,
+    align_inputs: AlignInputs,
+    target: AlignBatchTerms,
+  ) -> None:
+    """Prepare frame-wide alignment invariants for a speed trajectory."""
+    align_inputs.validate()
+    p = self.align_params
+    front_stiffness = (
+      align_inputs.stiffness_factor * p.tire_stiffness_front
+    )
+    rear_stiffness = (
+      align_inputs.stiffness_factor * p.tire_stiffness_rear
+    )
+    center_to_rear = p.wheelbase - p.center_to_front
+    target.slip_factor = (
+      p.mass
+      * (
+        front_stiffness * p.center_to_front
+        - rear_stiffness * center_to_rear
+      )
+      / (
+        p.wheelbase
+        * p.wheelbase
+        * front_stiffness
+        * rear_stiffness
+      )
+    )
+    target.roll = align_inputs.roll
+    target.steer_ratio = align_inputs.steer_ratio
+    target.angle_offset_deg = align_inputs.angle_offset_deg
+
+  def prepare_align_speed_terms(
+    self,
+    v_ego: float,
+    batch: AlignBatchTerms,
+    target: AlignRuntimeTerms,
+  ) -> None:
+    """Prepare speed-varying terms from frame-wide alignment invariants."""
+    p = self.align_params
+    speed = float(v_ego)
+    if not math.isfinite(speed):
+      raise ValueError("vehicle speed must be finite")
+    slip_factor = batch.slip_factor
+    curvature_denominator = 1.0 - slip_factor * speed * speed
+    if curvature_denominator == 0.0:
+      raise ValueError("vehicle-model curvature denominator is zero")
+    target.curvature_factor = (
+      (1.0 - p.steer_ratio_rear)
+      / curvature_denominator
+      / p.wheelbase
+    )
+    if abs(slip_factor) < 1e-6:
+      target.roll_compensation = 0.0
+    else:
+      roll_denominator = 1.0 / slip_factor - speed * speed
+      if roll_denominator == 0.0:
+        raise ValueError("vehicle-model roll denominator is zero")
+      target.roll_compensation = (
+        ACCELERATION_DUE_TO_GRAVITY
+        * batch.roll
+        / roll_denominator
+      )
+    target.speed_squared = speed * speed
+    target.steer_ratio = batch.steer_ratio
+    target.angle_offset_deg = batch.angle_offset_deg
+    target.roll_gravity = batch.roll * ACCELERATION_DUE_TO_GRAVITY
+    target.torque_gain = self.params.torque_per_lateral_accel(speed)
+    target.torque_per_angle = (
+      target.curvature_factor
+      * math.radians(1.0)
+      / batch.steer_ratio
+      * target.speed_squared
+      * target.torque_gain
+    )
+    zero_angle_curvature = -(
+      target.curvature_factor
+      * math.radians(-target.angle_offset_deg)
+      / target.steer_ratio
+      + target.roll_compensation
+    )
+    target.aligning_torque_offset = -(
+      (
+        zero_angle_curvature * target.speed_squared
+        - target.roll_gravity
+        - self.align_params.lat_accel_offset
+      )
+      * target.torque_gain
+    )
+
+  def _prepare_align_runtime_terms(
+    self,
+    v_ego: float,
+    align_inputs: AlignInputs,
+    target: AlignRuntimeTerms,
+  ) -> None:
+    """Prepared-term implementation for callers validating once per batch."""
+    p = self.align_params
+    speed = float(v_ego)
+    if not math.isfinite(speed):
+      raise ValueError("vehicle speed must be finite")
+    front_stiffness = (
+      align_inputs.stiffness_factor * p.tire_stiffness_front
+    )
+    rear_stiffness = (
+      align_inputs.stiffness_factor * p.tire_stiffness_rear
+    )
+    center_to_rear = p.wheelbase - p.center_to_front
+    slip_factor = (
+      p.mass
+      * (
+        front_stiffness * p.center_to_front
+        - rear_stiffness * center_to_rear
+      )
+      / (
+        p.wheelbase
+        * p.wheelbase
+        * front_stiffness
+        * rear_stiffness
+      )
+    )
+    curvature_denominator = 1.0 - slip_factor * speed * speed
+    if curvature_denominator == 0.0:
+      raise ValueError("vehicle-model curvature denominator is zero")
+    curvature_factor = (
+      (1.0 - p.steer_ratio_rear)
+      / curvature_denominator
+      / p.wheelbase
+    )
+    if abs(slip_factor) < 1e-6:
+      roll_compensation = 0.0
+    else:
+      roll_denominator = 1.0 / slip_factor - speed * speed
+      if roll_denominator == 0.0:
+        raise ValueError("vehicle-model roll denominator is zero")
+      roll_compensation = (
+        ACCELERATION_DUE_TO_GRAVITY
+        * align_inputs.roll
+        / roll_denominator
+      )
+
+    target.speed_squared = speed * speed
+    target.curvature_factor = curvature_factor
+    target.roll_compensation = roll_compensation
+    target.steer_ratio = align_inputs.steer_ratio
+    target.angle_offset_deg = align_inputs.angle_offset_deg
+    target.roll_gravity = (
+      align_inputs.roll * ACCELERATION_DUE_TO_GRAVITY
+    )
+    target.torque_gain = self.params.torque_per_lateral_accel(speed)
+    target.torque_per_angle = (
+      curvature_factor
+      * math.radians(1.0)
+      / align_inputs.steer_ratio
+      * target.speed_squared
+      * target.torque_gain
+    )
+    zero_angle_curvature = -(
+      curvature_factor
+      * math.radians(-target.angle_offset_deg)
+      / target.steer_ratio
+      + roll_compensation
+    )
+    target.aligning_torque_offset = -(
+      (
+        zero_angle_curvature * target.speed_squared
+        - target.roll_gravity
+        - self.align_params.lat_accel_offset
+      )
+      * target.torque_gain
+    )
+
+  @staticmethod
+  def angle_from_curvature_prepared(
+    curvature: float,
+    terms: AlignRuntimeTerms,
+  ) -> float:
+    """Exact inverse vehicle-model angle from prepared invariant terms."""
+    if terms.curvature_factor == 0.0:
+      raise ValueError("vehicle-model curvature factor is zero")
+    steering_angle_rad = (
+      (-float(curvature) - terms.roll_compensation)
+      * terms.steer_ratio
+      / terms.curvature_factor
+    )
+    return (
+      math.degrees(steering_angle_rad) + terms.angle_offset_deg
+    )
+
+  def _aligning_torque_prepared(
+    self,
+    angle_deg: float,
+    terms: AlignRuntimeTerms,
+  ) -> float:
+    """Evaluate the exact aligning map from prepared invariant terms."""
+    return (
+      terms.torque_per_angle * float(angle_deg)
+      + terms.aligning_torque_offset
+    )
+
+  def aligning_torque_from_curvature_prepared(
+    self,
+    curvature: float,
+    terms: AlignRuntimeTerms,
+  ) -> float:
+    """Steady torque for a desired curvature on the same prepared map."""
+    gravity_adjusted = (
+      float(curvature) * terms.speed_squared
+      - terms.roll_gravity
+      - self.align_params.lat_accel_offset
+    )
+    return -(gravity_adjusted * terms.torque_gain)
 
   def curvature_from_angle(self, angle_deg: float, v_ego: float, align_inputs: AlignInputs) -> float:
     """Mirror the frozen-v14 offset/roll vehicle-model measurement pipeline."""
@@ -434,6 +707,71 @@ class PlantTwin:
     if rate != 0.0 and next_rate * rate < 0.0:
       next_rate = 0.0
     return next_rate
+
+  def _next_rate_prepared(
+    self,
+    angle: float,
+    rate: float,
+    applied_torque: float,
+    dt: float,
+    disturbance_torque: float,
+    terms: AlignRuntimeTerms,
+  ) -> float:
+    """Hot-path counterpart of :meth:`_next_rate` for prepared rollouts."""
+    aligning_torque = self._aligning_torque_prepared(angle, terms)
+    net_torque = (
+      applied_torque - aligning_torque - disturbance_torque
+    )
+    if rate == 0.0:
+      if abs(net_torque) <= self.params.t_breakaway:
+        effective_torque = 0.0
+      else:
+        effective_torque = (
+          net_torque
+          - math.copysign(self.params.t_breakaway, net_torque)
+        )
+    else:
+      effective_torque = (
+        net_torque - math.copysign(self.params.t_breakaway, rate)
+      )
+
+    acceleration = (
+      self.params.k_t * effective_torque
+      - self.params.b_steer * rate
+    )
+    next_rate = rate + acceleration * dt
+    if rate != 0.0 and next_rate * rate < 0.0:
+      next_rate = 0.0
+    return next_rate
+
+  def _apply_slew_bounded(
+    self,
+    prev_torque: float,
+    target: float,
+  ) -> float:
+    """Exact limiter for inputs already proven to be within [-1, 1]."""
+    if target == prev_torque:
+      return target
+
+    build = self.params.delta_up / self.params.steer_max
+    decay = self.params.delta_down / self.params.steer_max
+    if prev_torque * target >= 0.0:
+      budget = (
+        build if abs(target) > abs(prev_torque) else decay
+      )
+      return prev_torque + math.copysign(
+        min(abs(target - prev_torque), budget),
+        target - prev_torque,
+      )
+
+    decay_fraction = abs(prev_torque) / decay
+    if decay_fraction >= 1.0:
+      return math.copysign(
+        abs(prev_torque) - decay, prev_torque,
+      )
+    remaining_fraction = 1.0 - decay_fraction
+    built = min(abs(target), build * remaining_fraction)
+    return math.copysign(built, target)
 
   def _advance(
     self,
@@ -596,6 +934,80 @@ class PlantTwin:
     target.applied_torque = applied
     target.v_ego = float(state.v_ego)
 
+  def predict_applied_history_prepared_into(
+    self,
+    state: PlantState,
+    duration: float,
+    applied_history: Any,
+    history_start: int,
+    history_count: int,
+    disturbance_torque: float,
+    runtime_terms: AlignRuntimeTerms,
+    target: PlantState,
+    max_step: float,
+  ) -> None:
+    """Prepared hot-path form of :meth:`predict_applied_history_into`.
+
+    The vehicle speed and live alignment inputs are invariant throughout the
+    pure-delay rollout. Preparing their exact coefficients once removes a
+    complete vehicle-model reconstruction from every 10 ms history sample;
+    limiter, friction, integration, and history-selection semantics remain
+    identical.
+    """
+    duration_value = float(duration)
+    step_limit = float(max_step)
+    start = int(history_start)
+    count = int(history_count)
+    capacity = len(applied_history)
+    disturbance = float(disturbance_torque)
+    if not math.isfinite(duration_value) or duration_value < 0.0:
+      raise ValueError(
+        "prediction duration must be finite and non-negative"
+      )
+    if not math.isfinite(step_limit) or step_limit <= 0.0:
+      raise ValueError("prediction step must be finite and positive")
+    if not math.isfinite(disturbance):
+      raise ValueError("disturbance torque must be finite")
+    if count < 0 or count > capacity:
+      raise ValueError("applied history count is outside buffer bounds")
+    if capacity == 0 and count != 0:
+      raise ValueError("empty applied history cannot contain samples")
+    if capacity and not 0 <= start < capacity:
+      raise ValueError("applied history start is outside buffer bounds")
+
+    step_count = int(math.ceil(duration_value / step_limit))
+    retained_count = min(count, step_count)
+    missing_count = step_count - retained_count
+    retained_start = count - retained_count
+    angle = float(state.angle_deg)
+    rate = float(state.rate_deg_s)
+    applied = float(state.applied_torque)
+    for step_index in range(step_count):
+      step = (
+        step_limit
+        if step_index + 1 < step_count
+        else duration_value - step_limit * (step_count - 1)
+      )
+      if step_index >= missing_count:
+        logical_index = retained_start + step_index - missing_count
+        physical_index = (start + logical_index) % capacity
+        applied = float(applied_history[physical_index])
+      if not math.isfinite(applied):
+        raise ValueError("applied history must be finite")
+      rate = self._next_rate_prepared(
+        angle,
+        rate,
+        applied,
+        step,
+        disturbance,
+        runtime_terms,
+      )
+      angle += rate * step
+    target.angle_deg = angle
+    target.rate_deg_s = rate
+    target.applied_torque = applied
+    target.v_ego = float(state.v_ego)
+
   def predict_constant_request_into(
     self,
     state: PlantState,
@@ -642,6 +1054,238 @@ class PlantTwin:
     target.rate_deg_s = rate
     target.applied_torque = applied
     target.v_ego = float(state.v_ego)
+
+  def predict_constant_request_prepared_into(
+    self,
+    state: PlantState,
+    duration: float,
+    requested_torque: float,
+    disturbance_torque: float,
+    runtime_terms: AlignRuntimeTerms,
+    target: PlantState,
+    max_step: float = DT_CTRL,
+  ) -> None:
+    """Prepared form of :meth:`predict_constant_request_into`.
+
+    Limiter, integration, stiction, and zero-rate semantics are unchanged.
+    Only invariant validation and vehicle-model coefficient construction move
+    outside the terminal inverse's repeated request evaluations.
+    """
+    remaining = float(duration)
+    step_limit = float(max_step)
+    request = float(requested_torque)
+    if request < -1.0:
+      request = -1.0
+    elif request > 1.0:
+      request = 1.0
+    disturbance = float(disturbance_torque)
+    if not math.isfinite(remaining) or remaining < 0.0:
+      raise ValueError(
+        "prediction duration must be finite and non-negative"
+      )
+    if not math.isfinite(step_limit) or step_limit <= 0.0:
+      raise ValueError("prediction step must be finite and positive")
+    if not math.isfinite(request) or not math.isfinite(disturbance):
+      raise ValueError(
+        "requested and disturbance torque must be finite"
+      )
+
+    angle = float(state.angle_deg)
+    rate = float(state.rate_deg_s)
+    applied = float(state.applied_torque)
+    if applied < -1.0:
+      applied = -1.0
+    elif applied > 1.0:
+      applied = 1.0
+    build = self.params.delta_up / self.params.steer_max
+    decay = self.params.delta_down / self.params.steer_max
+    breakaway = self.params.t_breakaway
+    torque_gain = self.params.k_t
+    damping = self.params.b_steer
+    align_slope = runtime_terms.torque_per_angle
+    align_offset = runtime_terms.aligning_torque_offset
+    while remaining > 0.0:
+      step = step_limit if remaining > step_limit else remaining
+      if request != applied:
+        if applied * request >= 0.0:
+          budget = (
+            build if abs(request) > abs(applied) else decay
+          )
+          difference = request - applied
+          if abs(difference) <= budget:
+            applied = request
+          else:
+            applied += math.copysign(budget, difference)
+        else:
+          decay_fraction = abs(applied) / decay
+          if decay_fraction >= 1.0:
+            applied = math.copysign(
+              abs(applied) - decay, applied,
+            )
+          else:
+            build_limit = build * (1.0 - decay_fraction)
+            if abs(request) <= build_limit:
+              applied = request
+            else:
+              applied = math.copysign(build_limit, request)
+
+      aligning_torque = align_slope * angle + align_offset
+      net_torque = applied - aligning_torque - disturbance
+      if rate == 0.0:
+        if abs(net_torque) <= breakaway:
+          effective_torque = 0.0
+        else:
+          effective_torque = (
+            net_torque - math.copysign(breakaway, net_torque)
+          )
+      else:
+        effective_torque = (
+          net_torque - math.copysign(breakaway, rate)
+        )
+      acceleration = torque_gain * effective_torque - damping * rate
+      next_rate = rate + acceleration * step
+      if rate != 0.0 and next_rate * rate < 0.0:
+        next_rate = 0.0
+      rate = next_rate
+      angle += rate * step
+      remaining -= step
+    target.angle_deg = angle
+    target.rate_deg_s = rate
+    target.applied_torque = applied
+    target.v_ego = float(state.v_ego)
+
+  def predict_constant_request_sensitivity_into(
+    self,
+    state: PlantState,
+    duration: float,
+    requested_torque: float,
+    disturbance_torque: float,
+    runtime_terms: AlignRuntimeTerms,
+    target: PlantState,
+    sensitivity: PlantSensitivity,
+    max_step: float = DT_CTRL,
+  ) -> None:
+    """Prepared rollout plus its exact local request sensitivity.
+
+    The rack and limiter are piecewise affine. This propagates the derivative
+    through the same selected slew, stiction, and zero-crossing branches as
+    the ordinary prediction. A safeguarded terminal inverse can therefore
+    jump directly to a branch's solution instead of rebuilding the full plant
+    twelve times by blind bisection.
+    """
+    remaining = float(duration)
+    step_limit = float(max_step)
+    request = float(requested_torque)
+    if request < -1.0:
+      request = -1.0
+    elif request > 1.0:
+      request = 1.0
+    disturbance = float(disturbance_torque)
+    if not math.isfinite(remaining) or remaining < 0.0:
+      raise ValueError(
+        "prediction duration must be finite and non-negative"
+      )
+    if not math.isfinite(step_limit) or step_limit <= 0.0:
+      raise ValueError("prediction step must be finite and positive")
+    if not math.isfinite(request) or not math.isfinite(disturbance):
+      raise ValueError(
+        "requested and disturbance torque must be finite"
+      )
+
+    angle = float(state.angle_deg)
+    rate = float(state.rate_deg_s)
+    applied = float(state.applied_torque)
+    if applied < -1.0:
+      applied = -1.0
+    elif applied > 1.0:
+      applied = 1.0
+    angle_sensitivity = 0.0
+    rate_sensitivity = 0.0
+    applied_sensitivity = 0.0
+    build = self.params.delta_up / self.params.steer_max
+    decay = self.params.delta_down / self.params.steer_max
+    build_over_decay = build / decay
+    breakaway = self.params.t_breakaway
+    torque_gain = self.params.k_t
+    damping = self.params.b_steer
+    align_slope = runtime_terms.torque_per_angle
+    align_offset = runtime_terms.aligning_torque_offset
+    while remaining > 0.0:
+      step = step_limit if remaining > step_limit else remaining
+
+      if request == applied:
+        applied = request
+        applied_sensitivity = 1.0
+      elif applied * request >= 0.0:
+        budget = build if abs(request) > abs(applied) else decay
+        if abs(request - applied) <= budget:
+          applied = request
+          applied_sensitivity = 1.0
+        else:
+          applied += math.copysign(budget, request - applied)
+      else:
+        decay_fraction = abs(applied) / decay
+        if decay_fraction >= 1.0:
+          applied = math.copysign(
+            abs(applied) - decay, applied,
+          )
+        else:
+          remaining_fraction = 1.0 - decay_fraction
+          build_limit = build * remaining_fraction
+          if abs(request) <= build_limit:
+            applied = request
+            applied_sensitivity = 1.0
+          else:
+            applied = math.copysign(build_limit, request)
+            applied_sensitivity *= build_over_decay
+
+      aligning_torque = align_slope * angle + align_offset
+      net_torque = applied - aligning_torque - disturbance
+      net_sensitivity = (
+        applied_sensitivity
+        - align_slope * angle_sensitivity
+      )
+      if rate == 0.0 and abs(net_torque) <= breakaway:
+        effective_torque = 0.0
+        effective_sensitivity = 0.0
+      else:
+        friction_direction = net_torque if rate == 0.0 else rate
+        effective_torque = (
+          net_torque
+          - math.copysign(
+            breakaway,
+            friction_direction,
+          )
+        )
+        effective_sensitivity = net_sensitivity
+
+      acceleration = (
+        torque_gain * effective_torque
+        - damping * rate
+      )
+      acceleration_sensitivity = (
+        torque_gain * effective_sensitivity
+        - damping * rate_sensitivity
+      )
+      next_rate = rate + acceleration * step
+      next_rate_sensitivity = (
+        rate_sensitivity + acceleration_sensitivity * step
+      )
+      if rate != 0.0 and next_rate * rate < 0.0:
+        next_rate = 0.0
+        next_rate_sensitivity = 0.0
+      rate = next_rate
+      rate_sensitivity = next_rate_sensitivity
+      angle += rate * step
+      angle_sensitivity += rate_sensitivity * step
+      remaining -= step
+
+    target.angle_deg = angle
+    target.rate_deg_s = rate
+    target.applied_torque = applied
+    target.v_ego = float(state.v_ego)
+    sensitivity.angle_per_torque = angle_sensitivity
+    sensitivity.rate_per_torque = rate_sensitivity
 
   def predict(
     self,

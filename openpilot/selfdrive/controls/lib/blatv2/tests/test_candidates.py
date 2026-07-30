@@ -160,7 +160,10 @@ def test_monotonic_workspace_interpolation_is_bit_exact_to_scalar_contract():
     for index in range(workspace.decision_count)
   ], dtype=np.float64)
   assert (
-    workspace.reference_curvatures[:workspace.decision_count].tobytes()
+    np.asarray(
+      workspace.reference_curvatures[:workspace.decision_count],
+      dtype=np.float64,
+    ).tobytes()
     == expected_decisions.tobytes()
   )
 
@@ -402,6 +405,21 @@ def test_action_point_feedforward_reaches_authored_angle_or_uses_full_authority(
     ALIGN_INPUTS,
     0.0,
   ) == 1.0
+
+
+def test_constant_request_endpoint_matches_exact_repeated_limiter():
+  twin = PlantTwin(PLANT_PARAMS, ALIGN_PARAMS)
+  candidate = InverseEpsActionController(twin, ACTION_PARAMS)
+  for source in (-1.0, -0.5, -2 / 409, 0.0, 2 / 409, 0.5, 1.0):
+    for direction in (-1.0, 1.0):
+      for frame_count in (0, 1, 2, 7, 31, 200):
+        expected = source
+        for _ in range(frame_count):
+          expected = twin.apply_slew(expected, direction)
+        actual = candidate._constant_request_endpoint(
+          source, direction, frame_count,
+        )
+        assert math.isclose(actual, expected, abs_tol=2e-15)
 
 
 def test_action_feedforward_is_independent_of_measured_rack_error():
