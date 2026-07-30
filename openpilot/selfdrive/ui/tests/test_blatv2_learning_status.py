@@ -1,5 +1,10 @@
 from copy import deepcopy
+import importlib.util
+from pathlib import Path
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   LearningStatusError,
@@ -504,6 +509,45 @@ class TestLearningOperationStatusParser(unittest.TestCase):
     advanced = self.parse(advanced_payload)
     validate_operation_update(previous, advanced)
 
+  def test_cumulative_progress_cannot_regress_within_an_operation(self) -> None:
+    previous = self.parse(operation_fixture("backfilling"))
+    mutations = (
+      {"accepted_sample_count": previous.accepted_sample_count - 1},
+      {"rejected_sample_count": previous.rejected_sample_count - 1},
+      {"current_route_index": previous.current_route_index - 1},
+      {"total_route_count": previous.total_route_count + 1},
+    )
+    for mutation in mutations:
+      with self.subTest(mutation=mutation):
+        payload = operation_fixture("backfilling")
+        payload.update(mutation)
+        payload["sequence"] += 1
+        payload["updated_mono_ns"] += 1
+        with self.assertRaises(LearningStatusError) as stale:
+          validate_operation_update(previous, self.parse(payload))
+        self.assertEqual(stale.exception.code, "stale")
+
+    retry_previous = self.parse(operation_fixture("retry_pending"))
+    retry_payload = operation_fixture("retry_pending")
+    retry_payload["sequence"] += 1
+    retry_payload["updated_mono_ns"] += 1
+    retry_payload["retry_count"] -= 1
+    with self.assertRaises(LearningStatusError) as retry_stale:
+      validate_operation_update(retry_previous, self.parse(retry_payload))
+    self.assertEqual(retry_stale.exception.code, "stale")
+
+  def test_terminal_operation_cannot_resume_without_a_new_identity(self) -> None:
+    previous = self.parse(operation_fixture("idle"))
+    resumed = operation_fixture("preparing")
+    resumed["sequence"] += 1
+    resumed["updated_mono_ns"] += 1
+    with self.assertRaises(LearningStatusError) as stale:
+      validate_operation_update(previous, self.parse(resumed))
+    self.assertEqual(stale.exception.code, "stale")
+
+    resumed["operation_id"] = "a" * 32
+    validate_operation_update(previous, self.parse(resumed))
+
   def test_wrong_vehicle_and_runtime_fail_closed(self) -> None:
     vehicle = operation_fixture()
     vehicle["vehicle_identity"] = "ANOTHER CAR"
@@ -672,6 +716,179 @@ class TestLearningOperationStatusParser(unittest.TestCase):
         )
         self.assertEqual(error_display.tone, "red")
         self.assertEqual(error_display.detail, f"{code} detail")
+
+
+def _load_learning_widget_module():
+  """Load the status source without requiring raylib in an off-car test."""
+  fake_pyray = types.ModuleType("pyray")
+  fake_pyray.Color = lambda *channels: tuple(channels)
+
+  fake_params = types.ModuleType("openpilot.common.params")
+  fake_params.Params = object
+
+  fake_ui_state = types.ModuleType("openpilot.selfdrive.ui.ui_state")
+  fake_ui_state.ui_state = types.SimpleNamespace(is_metric=False, CP=None)
+
+  fake_application = types.ModuleType(
+    "openpilot.system.ui.lib.application",
+  )
+  fake_application.FontWeight = types.SimpleNamespace(
+    BOLD=0,
+    MEDIUM=1,
+    NORMAL=2,
+  )
+  fake_application.gui_app = types.SimpleNamespace()
+
+  fake_text_measure = types.ModuleType(
+    "openpilot.system.ui.lib.text_measure",
+  )
+  fake_text_measure.measure_text_cached = lambda *_args: (
+    types.SimpleNamespace(x=0.0, y=0.0)
+  )
+
+  fake_widgets = types.ModuleType("openpilot.system.ui.widgets")
+  fake_widgets.Widget = type("Widget", (), {})
+
+  module_name = "_blatv2_learning_widget_status_source_test"
+  module_path = (
+    Path(__file__).resolve().parents[1]
+    / "widgets"
+    / "blatv2_learning.py"
+  )
+  spec = importlib.util.spec_from_file_location(module_name, module_path)
+  if spec is None or spec.loader is None:
+    raise RuntimeError("could not load BLaTv2 learning widget module")
+  module = importlib.util.module_from_spec(spec)
+  stubs = {
+    "pyray": fake_pyray,
+    "openpilot.common.params": fake_params,
+    "openpilot.selfdrive.ui.ui_state": fake_ui_state,
+    "openpilot.system.ui.lib.application": fake_application,
+    "openpilot.system.ui.lib.text_measure": fake_text_measure,
+    "openpilot.system.ui.widgets": fake_widgets,
+  }
+  with patch.dict(sys.modules, stubs):
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+  return module
+
+
+class _DashboardParams:
+  def __init__(
+    self,
+    values: dict[str, object],
+    *,
+    failing_key: str | None = None,
+  ):
+    self.values = values
+    self.failing_key = failing_key
+    self.calls: list[str] = []
+
+  def get(self, key: str, *, block: bool) -> object:
+    self.calls.append(key)
+    if key == self.failing_key:
+      raise OSError(f"{key} read failed")
+    return self.values.get(key)
+
+
+class TestLearningStatusSource(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls) -> None:
+    cls.widget_module = _load_learning_widget_module()
+
+  @staticmethod
+  def params_values(operation: dict | None = None) -> dict[str, object]:
+    return {
+      "BLaTv2LearningStatus": learning_fixture(),
+      "BLaTv2LearningOperationStatus": (
+        operation_fixture("idle") if operation is None else operation
+      ),
+      "BLaTv2LifecycleStatus": lifecycle_fixture(),
+    }
+
+  def source(self, params: _DashboardParams):
+    return self.widget_module.BLaTv2LearningStatusSource(
+      params,
+      vehicle_identity_provider=lambda: VEHICLE,
+      metric_provider=lambda: False,
+    )
+
+  def test_param_read_exceptions_remain_distinct_and_render_red(self) -> None:
+    expectations = (
+      ("BLaTv2LearningStatus", "learning_error_code"),
+      ("BLaTv2LearningOperationStatus", "operation_error_code"),
+      ("BLaTv2LifecycleStatus", "lifecycle_error_code"),
+    )
+    for key, error_attribute in expectations:
+      with self.subTest(key=key):
+        snapshot = self.source(
+          _DashboardParams(self.params_values(), failing_key=key),
+        ).snapshot
+        self.assertEqual(
+          getattr(snapshot, error_attribute),
+          "param_read_error",
+        )
+        if key == "BLaTv2LearningOperationStatus":
+          presentation = operation_presentation(
+            snapshot.operation,
+            error_code=snapshot.operation_error_code,
+            error_message=snapshot.operation_error,
+            has_learning_snapshot=snapshot.learning is not None,
+          )
+          self.assertEqual(presentation.tone, "red")
+        elif key == "BLaTv2LearningStatus":
+          presentation = learning_panel_presentation(
+            snapshot.operation,
+            operation_error_code=snapshot.operation_error_code,
+            operation_error_message=snapshot.operation_error,
+            learning_error_code=snapshot.learning_error_code,
+            learning_error_message=snapshot.learning_error,
+            has_learning_snapshot=False,
+          )
+          self.assertEqual(presentation.tone, "red")
+        else:
+          color = self.widget_module._BLaTv2Page._error_color(
+            snapshot.lifecycle_error_code,
+          )
+          self.assertIs(color, self.widget_module._RED)
+
+  def test_reader_refreshes_immediately_then_no_faster_than_two_seconds(
+    self,
+  ) -> None:
+    preparing = operation_fixture("preparing")
+    params = _DashboardParams(self.params_values(preparing))
+    source = self.source(params)
+
+    collecting = operation_fixture("collecting")
+    collecting["sequence"] = preparing["sequence"] + 1
+    collecting["updated_mono_ns"] = preparing["updated_mono_ns"] + 1
+
+    with (
+      patch.object(
+        self.widget_module.time,
+        "monotonic",
+        side_effect=(0.0, 1.999, 2.0),
+      ),
+      patch.object(
+        self.widget_module.time,
+        "monotonic_ns",
+        return_value=NOW_MONO_NS,
+      ),
+    ):
+      first = source.snapshot
+      self.assertEqual(first.operation.state, "preparing")
+      self.assertEqual(len(params.calls), 3)
+
+      params.values["BLaTv2LearningOperationStatus"] = collecting
+      cached = source.snapshot
+      self.assertIs(cached, first)
+      self.assertEqual(cached.operation.state, "preparing")
+      self.assertEqual(len(params.calls), 3)
+
+      refreshed = source.snapshot
+      self.assertIsNot(refreshed, first)
+      self.assertEqual(refreshed.operation.state, "collecting")
+      self.assertEqual(len(params.calls), 6)
 
 
 class TestLifecycleStatusParser(unittest.TestCase):

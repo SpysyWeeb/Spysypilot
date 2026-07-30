@@ -1034,7 +1034,7 @@ def validate_operation_update(
   previous: LearningOperationStatus | None,
   current: LearningOperationStatus,
 ) -> None:
-  """Reject a regressed or mutated sequence within one operation."""
+  """Reject a regressed or internally contradictory sequenced operation."""
   if previous is None or previous.operation_id != current.operation_id:
     return
   if current.sequence < previous.sequence:
@@ -1054,6 +1054,38 @@ def validate_operation_update(
     raise LearningStatusError(
       "stale",
       "Learner operation advanced with a stale timestamp",
+    )
+  if (
+    current.accepted_sample_count < previous.accepted_sample_count
+    or current.rejected_sample_count < previous.rejected_sample_count
+    or current.retry_count < previous.retry_count
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Learner operation cumulative counts moved backward",
+    )
+  if (
+    previous.total_route_count is not None
+    and current.total_route_count is not None
+    and current.total_route_count != previous.total_route_count
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Learner operation route total changed during replay",
+    )
+  if (
+    previous.current_route_index is not None
+    and current.current_route_index is not None
+    and current.current_route_index < previous.current_route_index
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Learner operation route progress moved backward",
+    )
+  if previous.terminal and current.active:
+    raise LearningStatusError(
+      "stale",
+      "Terminal learner operation resumed without a new identity",
     )
 
 

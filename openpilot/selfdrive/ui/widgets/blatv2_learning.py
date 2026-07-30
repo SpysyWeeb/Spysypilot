@@ -119,8 +119,11 @@ class BLaTv2LearningStatusSource:
   def _read_param(self, key: str) -> object:
     try:
       return self._params.get(key, block=False)
-    except Exception:
-      return None
+    except Exception as exc:
+      raise LearningStatusError(
+        "param_read_error",
+        f"{key} could not be read",
+      ) from exc
 
   def _refresh(self) -> None:
     try:
