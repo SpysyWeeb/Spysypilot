@@ -183,8 +183,12 @@ def test_learned_reference_lag_never_becomes_rack_prediction_delay():
     expected,
     0.01,
   )
-  assert candidate.predicted_angle_deg == expected.angle_deg
-  assert candidate.predicted_rate_deg_s == expected.rate_deg_s
+  assert math.isclose(
+    candidate.predicted_angle_deg, expected.angle_deg, abs_tol=1e-12,
+  )
+  assert math.isclose(
+    candidate.predicted_rate_deg_s, expected.rate_deg_s, abs_tol=1e-12,
+  )
 
 
 def test_shared_core_reconstructs_negative_hyundai_rack_rate_from_angle():

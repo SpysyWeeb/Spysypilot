@@ -101,9 +101,13 @@ class ShadowCore:
     capacity = len(ModelConstants.T_IDXS)
     self.plan_times = np.empty(capacity, dtype=np.float64)
     self.plan_curvatures = np.empty(capacity, dtype=np.float64)
+    self.plan_speeds = np.empty(capacity, dtype=np.float64)
     self.reference_times = np.empty(capacity, dtype=np.float64)
     self.reference_curvatures = np.empty(capacity, dtype=np.float64)
     self.reference_speeds = np.empty(capacity, dtype=np.float64)
+    self.reference_speed_plan_indices = np.empty(
+      capacity, dtype=np.int32,
+    )
 
     self.previous_state = PlantState(0.0, 0.0, 0.0, 0.0)
     self.current_state = PlantState(0.0, 0.0, 0.0, 0.0)
@@ -125,11 +129,25 @@ class ShadowCore:
     self.reference_delay = self.seed_params.actuation_delay
     self.actuation_delay = self.seed_params.actuation_delay
     self.action_time = model_action_time(self.reference_delay)
+    self.cached_model_frame_id = -1
+    self.cached_model_scalar = math.nan
+    self.cached_reference_action_time = math.nan
+    self.cached_reference_horizon = math.nan
+    self.cached_plan_count = 0
+    self.cached_plan_valid = False
+    self.cached_reference_count = 0
     self.frame_prepared = False
     self.candidate_workspace_valid = False
 
   def reset(self) -> None:
     self.has_previous_state = False
+    self.cached_model_frame_id = -1
+    self.cached_model_scalar = math.nan
+    self.cached_reference_action_time = math.nan
+    self.cached_reference_horizon = math.nan
+    self.cached_plan_count = 0
+    self.cached_plan_valid = False
+    self.cached_reference_count = 0
     self.frame_prepared = False
     self.candidate_workspace_valid = False
     self.observer.reset()
@@ -202,12 +220,46 @@ class ShadowCore:
     target.steer_ratio = self.align_params.nominal_steer_ratio
     target.valid = False
 
-  def _build_reference_speeds(
+  def _cache_plan_speeds(
     self,
     model: Any,
     plan_count: int,
+  ) -> None:
+    """Copy one new model speed plan out of its capnp reader."""
+    model_speeds = model.velocity.x
+    if len(model_speeds) < plan_count:
+      raise ValueError("model speed plan is shorter than its curvature plan")
+    for index in range(plan_count):
+      speed_value = float(model_speeds[index])
+      if not math.isfinite(speed_value):
+        raise ValueError("model speed plan must be finite")
+      self.plan_speeds[index] = speed_value
+
+  def _map_reference_speed_indices(
+    self,
+    plan_count: int,
     reference_count: int,
     horizon_seconds: float,
+  ) -> None:
+    """Map the filtered reference grid back to its native speed samples."""
+    output_index = 0
+    for index in range(plan_count):
+      time_value = float(self.plan_times[index])
+      if 0.0 <= time_value <= horizon_seconds:
+        if output_index >= reference_count:
+          raise ValueError(
+            "reference speed count exceeds reference curvature count"
+          )
+        self.reference_speed_plan_indices[output_index] = index
+        output_index += 1
+    if output_index != reference_count:
+      raise ValueError(
+        "reference speed and curvature grids do not align"
+      )
+
+  def _build_reference_speeds(
+    self,
+    reference_count: int,
     v_ego: float,
   ) -> None:
     """Preserve the model's speed changes on the scalar-pinned time grid.
@@ -216,24 +268,14 @@ class ShadowCore:
     shifted to the measured current speed, matching the established v14
     convention, while every future delta remains model-authored.
     """
-    model_speeds = model.velocity.x
-    if len(model_speeds) < plan_count:
-      raise ValueError("model speed plan is shorter than its curvature plan")
-    first_speed = float(model_speeds[0])
+    first_speed = float(self.plan_speeds[0])
     speed_offset = float(v_ego) - first_speed
-    output_index = 0
-    for index in range(plan_count):
-      time_value = float(self.plan_times[index])
-      if 0.0 <= time_value <= horizon_seconds:
-        if output_index >= reference_count:
-          raise ValueError("reference speed count exceeds reference curvature count")
-        speed_value = float(model_speeds[index]) + speed_offset
-        if not math.isfinite(speed_value):
-          raise ValueError("model speed plan must be finite")
-        self.reference_speeds[output_index] = max(speed_value, 0.0)
-        output_index += 1
-    if output_index != reference_count:
-      raise ValueError("reference speed and curvature grids do not align")
+    for output_index in range(reference_count):
+      plan_index = int(
+        self.reference_speed_plan_indices[output_index]
+      )
+      speed_value = self.plan_speeds[plan_index] + speed_offset
+      self.reference_speeds[output_index] = max(speed_value, 0.0)
 
   def begin_frame(
     self,
@@ -256,33 +298,70 @@ class ShadowCore:
 
     scalar = float(model.action.desiredCurvature)
     v_ego = float(car_state.vEgo)
-    signed_plan_count = plan_curvatures_from_model_into(
-      model,
-      scalar,
-      self.plan_times,
-      self.plan_curvatures,
-    )
-    plan_valid = signed_plan_count > 0
-    plan_count = abs(signed_plan_count)
     action_time = model_action_time(reference_delay)
     horizon_seconds = horizon(
       self.seed_params, physical_prediction_delay,
     )
-    reference_count = build_reference_into(
-      scalar,
-      self.plan_times,
-      self.plan_curvatures,
-      plan_count,
-      action_time,
-      horizon_seconds,
-      self.reference_times,
-      self.reference_curvatures,
+    # modelV2 is a 20 Hz message consumed by this 100 Hz loop. Its native plan
+    # and scalar cannot change while frameId is unchanged, so rebuilding the
+    # same curvature arrays five times only burns the Hyundai safety budget.
+    # Test fixtures without frameId deliberately bypass this cache.
+    frame_id_value = getattr(model, "frameId", None)
+    cacheable_model = frame_id_value is not None
+    model_frame_id = (
+      int(frame_id_value) if cacheable_model else -1
     )
+    model_changed = bool(
+      not cacheable_model
+      or model_frame_id != self.cached_model_frame_id
+      or scalar != self.cached_model_scalar
+    )
+    if model_changed:
+      signed_plan_count = plan_curvatures_from_model_into(
+        model,
+        scalar,
+        self.plan_times,
+        self.plan_curvatures,
+      )
+      plan_valid = signed_plan_count > 0
+      plan_count = abs(signed_plan_count)
+      self.cached_model_frame_id = model_frame_id
+      self.cached_model_scalar = scalar
+      self.cached_plan_count = plan_count
+      self.cached_plan_valid = plan_valid
+      self._cache_plan_speeds(model, plan_count)
+    else:
+      plan_count = self.cached_plan_count
+      plan_valid = self.cached_plan_valid
+
+    reference_changed = bool(
+      model_changed
+      or action_time != self.cached_reference_action_time
+      or horizon_seconds != self.cached_reference_horizon
+    )
+    if reference_changed:
+      reference_count = build_reference_into(
+        scalar,
+        self.plan_times,
+        self.plan_curvatures,
+        plan_count,
+        action_time,
+        horizon_seconds,
+        self.reference_times,
+        self.reference_curvatures,
+      )
+      self.cached_reference_action_time = action_time
+      self.cached_reference_horizon = horizon_seconds
+      self.cached_reference_count = reference_count
+      self._map_reference_speed_indices(
+        plan_count,
+        reference_count,
+        horizon_seconds,
+      )
+    else:
+      reference_count = self.cached_reference_count
     self._build_reference_speeds(
-      model,
-      plan_count,
       reference_count,
-      horizon_seconds,
       v_ego,
     )
     reference_now_delay = interpolate_buffer(
@@ -412,6 +491,7 @@ class ShadowCore:
           result.disturbance_estimate,
           self.controller_params.kinetic_friction,
           self.reference_speeds,
+          reference_changed,
         )
         self.candidate_workspace_valid = True
       except (ValueError, OverflowError):

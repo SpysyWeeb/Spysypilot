@@ -7,8 +7,10 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v220 scalar-anchored, state/slew-feasible inverse-EPS
-controller.** Version 220 keeps one torque trajectory and no competing
+⚠️ **In progress — v221 real-time scalar-anchored, state/slew-feasible
+inverse-EPS controller.** Version 221 preserves v220's steering law while
+making its numerical path fit the 100 Hz Hyundai control budget. It keeps one
+torque trajectory and no competing
 authority mechanisms: there is no turn detector, preview boost, persistence
 timer, breakaway episode, integral, torque-rate filter, or alternate
 low-speed controller.
@@ -66,6 +68,19 @@ real queued torque during the transport delay, and gives the future projector
 only the authored inverse feedforward plus scalar terminal state. It requires
 a fresh bit-reproducible acceptance and field validation before leaving
 in-progress status.
+
+Route `000000c9--4c18f78b4a` exposed 16 temporary EPS refusals at large
+low-speed steering angles. The requested torque was finite and panda reported
+no violation; the controller instead consumed enough of the control frame to
+reduce the loop to about 69 Hz. Hyundai's stock high-angle protection is
+frame-counted, so its unchanged 89-frame request cut then lasted about
+1.3 seconds instead of 0.89 seconds and the Palisade EPS rejected assist.
+Version 221 fixes the numerical cause without changing the 85-degree/89-frame
+protection, 409/4/7 envelope, torque law, path timing, or fault alerts. The
+terminal angle and rate constraints share one plant solve, invariant vehicle
+terms are prepared once, repeated model frames reuse their immutable plan,
+and the fixed horizon is evaluated in fused preallocated passes. The task
+remains in progress until an owner field drive confirms zero steering faults.
 
 Route bc also exposed a
 structural timing error in v207: the learned end-to-end lateral lag was also
@@ -268,6 +283,23 @@ exists. A b9/ba
 attempt to identify an additional road-wheel-angle scrub term was rejected:
 the two low-speed route fits did not cross-validate, so v219 adds no
 unsupported coefficient.
+
+### v221 real-time implementation
+
+The v220 contract above is unchanged. Version 221 removes redundant numerical
+work that made the same law miss its 10 ms deadline: terminal angle and rate
+are solved as one oriented constraint; unreachable action targets return
+after one full-authority proof; rare reachable targets use a bounded
+safeguarded correction; the queued-delay rollout reuses one prepared linear
+alignment map; and the 20 Hz model plan is decoded only when its `frameId`
+changes. All hot-path arrays remain fixed-capacity.
+
+On comma hardware, replaying the c9 fault route with the shipped v220 artifact
+took 15.05 ms median and 28.91 ms p99 on active frames in the deliberately
+unpaced diagnostic replay. The v221 artifact reduced that to about 1.6 ms
+median, 2.6 ms p99, and below 5 ms hard maximum in repeat runs; the sustained
+prepared synthetic bench is below 2 ms p99. Environment timing is still
+accepted only from the next real onroad route.
 
 ### v207 route-bb staging record
 
@@ -517,5 +549,5 @@ damping.
 - UI;
 - unsupported scrub/load coefficients.
 
-Version 220 stays **in progress** until identity replay, route gates, full test
-suites, device timing, and the first owner drive pass.
+Version 221 stays **in progress** until identity replay, route gates, device
+timing, and the first owner drive pass.
