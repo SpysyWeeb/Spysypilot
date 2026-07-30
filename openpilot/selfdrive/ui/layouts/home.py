@@ -5,11 +5,12 @@ from enum import IntEnum
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAlert
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
-from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsWidget
-from openpilot.selfdrive.ui.widgets.override_stats import OverrideStatsWidget
-from openpilot.selfdrive.ui.widgets.straight_stats import StraightStatsWidget
-from openpilot.selfdrive.ui.widgets.curve_stats import CurveStatsWidget
-from openpilot.selfdrive.ui.widgets.turn_stats import TurnStatsWidget
+from openpilot.selfdrive.ui.widgets.blatv2_learning import (
+  BLaTv2LearningOverviewWidget,
+  BLaTv2LearningStatusSource,
+  BLaTv2ReadinessWidget,
+)
+from openpilot.selfdrive.ui.widgets.blatv2_learning_status import cycle_page_index
 from openpilot.selfdrive.ui.widgets.terminal_widget import TerminalWidget
 from openpilot.selfdrive.ui.widgets.screen_timeout_button import ScreenTimeoutButton
 from openpilot.selfdrive.ui.widgets.update_button import UpdateButton
@@ -65,18 +66,20 @@ class HomeLayout(Widget):
     self.update_notif_rect = rl.Rectangle(0, 0, 200, HEADER_HEIGHT - 10)
     self.alert_notif_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
 
-    self._stats_widget = DriveStatsWidget()
-    self._override_stats_widget = OverrideStatsWidget()
-    self._straight_stats_widget = StraightStatsWidget()
-    self._curve_stats_widget = CurveStatsWidget()
-    self._turn_stats_widget = TurnStatsWidget()
+    self._blatv2_status_source = BLaTv2LearningStatusSource()
+    self._blatv2_learning_widget = BLaTv2LearningOverviewWidget(
+      self._blatv2_status_source,
+    )
+    self._blatv2_readiness_widget = BLaTv2ReadinessWidget(
+      self._blatv2_status_source,
+    )
     self._terminal_widget = TerminalWidget()
     self._system_stats_widget = SystemStatsWidget()
     self._setup_widget = SetupWidget()
 
     self._left_windows: list[Widget] = [
-      self._stats_widget, self._override_stats_widget,
-      self._straight_stats_widget, self._curve_stats_widget, self._turn_stats_widget,
+      self._blatv2_learning_widget,
+      self._blatv2_readiness_widget,
       self._terminal_widget, self._system_stats_widget,
     ]
     self._current_left_idx: int = 0
@@ -117,7 +120,11 @@ class HomeLayout(Widget):
     direction = -1 if mouse_pos.x < midpoint else 1
 
     self._left_windows[self._current_left_idx].hide_event()
-    self._current_left_idx = (self._current_left_idx + direction) % len(self._left_windows)
+    self._current_left_idx = cycle_page_index(
+      self._current_left_idx,
+      direction,
+      len(self._left_windows),
+    )
     self._left_windows[self._current_left_idx].show_event()
 
   def _set_state(self, state: HomeLayoutState):

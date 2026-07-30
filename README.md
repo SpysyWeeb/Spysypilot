@@ -70,6 +70,22 @@ acceptance gates, and rollback behavior are documented in
 [`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
 [`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
 
+## BLaTv2 learning dashboard
+
+**Status: in progress.** The custom home panel now cycles through exactly four
+pages: **BLaTv2 Learning**, **Readiness & Activation**, the existing live
+terminal, and the existing system-usage view. The five old route-analyzer
+pages and their `drive_statsd` service have been removed.
+
+The Learning page shows credited clean support and the last completed drive's
+contribution for every data-driven speed node. The Readiness page keeps time,
+held-out validation, steering excitation, physical-fit state, and controller
+lifecycle visibly separate. Blue means collecting, amber means enough time
+but another evidence gate is blocked, green means a node qualified, red is
+reserved for a real fit/lifecycle failure, and gray means no current validated
+snapshot. A complete learned profile never implies activation: only the
+sanitized lifecycle owner may show provisional or approved BLaTv2 steering.
+
 ## To-Do
 
 Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
@@ -84,7 +100,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ✅\* **[Better boot screen](https://github.com/SpysyWeeb/Spysypilot/tree/better-boot-screen)** — the boot spinner shows live console output (build/manager), so hangs are immediately diagnosable from the device screen &nbsp;*(personal idea)*
 - ✅ **[Error log viewer](https://github.com/SpysyWeeb/Spysypilot/tree/error-log-viewer)** — crashes are saved to an on-device log; a dev-menu button views it before/during/after a drive, with delete-on-close &nbsp;*(inspired by sunnypilot)*
 - ✅ **[Auto-update](https://github.com/SpysyWeeb/Spysypilot/tree/auto-update)** — tapping "Check" automatically checks, downloads if an update is found, and reboots to install; background downloads (which already happen every ~1.5 hrs on non-metered connections) also auto-install the moment they finish while the car is parked &nbsp;*(personal idea)*
-- ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with tap-to-cycle windows: driver engagement stats (last drive + lifetime, computed on-device from stored routes by a new `drive_statsd` service), a driving breakdown (turn/curve/straight overrides), a live openpilot terminal, and system usage graphs &nbsp;*(personal idea)*
+- ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with two display-only BLaTv2 learning/readiness pages plus the existing live terminal and system graphs; the former route analyzer and `drive_statsd` are removed &nbsp;*(personal idea)*
 - ✅ **[Swapped cruise speed adjustments](https://github.com/SpysyWeeb/Spysypilot/tree/swapped-cruise-speed)** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(inspired by sunnypilot)*
 - ❌ **Quiet mode** — silence the engage and disengage sounds while leaving safety alerts audible; no branch yet &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — makes experimental mode actually commit to red lights and stop signs instead of the model's indecisive crawl, by latching the model's own planned stop point and capping cruise speed to reach it &nbsp;*(inspired by IQPilot)*
