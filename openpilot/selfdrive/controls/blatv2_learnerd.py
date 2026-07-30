@@ -28,6 +28,11 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   PersistentLearningRuntime,
   build_persistent_learning_runtime,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
+  LEARNING_STATUS_PARAM,
+  DriveEvidenceBaseline,
+  build_learning_status_payload,
+)
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
 )
@@ -210,10 +215,14 @@ class BlatV2LearnerDaemon:
     self.logger = logger
     self.runtime: PersistentLearningRuntime | None = None
     self._runtime_fingerprint: str | None = None
+    self._prepared_car_params_bytes: bytes | None = None
     self._onroad: bool | None = None
     self._runtime_unavailable_this_drive = False
-    self._offroad_restore_failed_fingerprint: str | None = None
+    self._live_identity_bound = False
+    self._offroad_restore_failed_identity: tuple[str, bytes] | None = None
     self._pending_offroad_persist = False
+    self._learning_status_clear_pending = False
+    self._drive_baseline: DriveEvidenceBaseline | None = None
     self._histories = {
       service: _CanonicalSourceHistory()
       for service in MEASUREMENT_SERVICES
@@ -241,81 +250,191 @@ class BlatV2LearnerDaemon:
     if callable(exception):
       exception(message)
 
-  def _read_car_params(self) -> car.CarParams | None:
+  def _read_offroad_car_params(
+    self,
+  ) -> tuple[car.CarParams, bytes] | None:
+    for key in ("CarParamsPersistent", "CarParams"):
+      try:
+        encoded = self.params.get(key, block=False)
+        if encoded is not None:
+          canonical = bytes(encoded)
+          return self.car_params_decoder(canonical), canonical
+      except Exception:
+        self._log_exception(f"blatv2 learner could not decode {key}")
+    return None
+
+  def _read_live_car_params(self) -> tuple[car.CarParams, bytes] | None:
     try:
       encoded = self.params.get("CarParams", block=False)
       if encoded is None:
         return None
-      return self.car_params_decoder(encoded)
+      canonical = bytes(encoded)
+      return self.car_params_decoder(canonical), canonical
     except Exception:
-      self._log_exception("blatv2 learner could not decode CarParams")
+      self._log_exception("blatv2 learner could not decode live CarParams")
       return None
+
+  def _clear_learning_status_if_pending(self) -> None:
+    if self._onroad is not False or not self._learning_status_clear_pending:
+      return
+    try:
+      self.params.remove(LEARNING_STATUS_PARAM)
+    except (KeyError, TypeError, ValueError, RuntimeError, OSError):
+      self._log_exception("blatv2 learner could not clear stale status")
+      return
+    self._learning_status_clear_pending = False
 
   def _prepare_offroad_runtime(self) -> None:
     """Restore/qualify persistent state only while the device is offroad."""
     if self._onroad is not False:
       return
-    car_params = self._read_car_params()
-    if car_params is None:
+    resolved = self._read_offroad_car_params()
+    if resolved is None:
       return
+    car_params, encoded_car_params = resolved
     fingerprint = str(car_params.carFingerprint)
     if (
       self.runtime is not None
       and self._runtime_fingerprint == fingerprint
+      and self._prepared_car_params_bytes == encoded_car_params
     ):
       return
-    if self._offroad_restore_failed_fingerprint == fingerprint:
+    if self.runtime is not None:
+      # A definitive exact identity change invalidates the previous runtime
+      # and its display cache before any replacement is attempted.
+      self.runtime = None
+      self._runtime_fingerprint = None
+      self._prepared_car_params_bytes = None
+      self._learning_status_clear_pending = True
+      self._clear_learning_status_if_pending()
+    restore_identity = (fingerprint, encoded_car_params)
+    if self._offroad_restore_failed_identity == restore_identity:
       return
     try:
       runtime = self.runtime_factory(car_params, self.storage_root)
     except Exception:
       # Corrupt artifacts are never replaced with an empty learner.
-      self._offroad_restore_failed_fingerprint = fingerprint
+      self.runtime = None
+      self._runtime_fingerprint = None
+      self._prepared_car_params_bytes = None
+      self._offroad_restore_failed_identity = restore_identity
+      # This concrete vehicle's artifacts failed authentication. A display
+      # snapshot left by a process-only restart is therefore stale and must
+      # disappear rather than masquerade as current learning evidence.
+      self._learning_status_clear_pending = True
+      self._clear_learning_status_if_pending()
       self._log_exception("blatv2 learner runtime restore failed closed")
       return
     self.runtime = runtime
     self._runtime_fingerprint = fingerprint
-    self._offroad_restore_failed_fingerprint = None
+    self._prepared_car_params_bytes = encoded_car_params
+    self._offroad_restore_failed_identity = None
+    # Manager-start clears the display cache. Repopulate it only from an
+    # exact artifact set that the runtime just restored and authenticated.
+    # A first-ever empty learner has no persisted authority to project yet.
+    if (
+      runtime.artifact_paths.evidence.is_file()
+      and runtime.artifact_paths.manifest.is_file()
+    ):
+      try:
+        self._write_learning_status(
+          runtime.coordinator.finalize(),
+          drive_baseline=None,
+        )
+      except Exception:
+        self._log_exception(
+          "blatv2 learner status restore projection failed",
+        )
+    else:
+      # A successfully authenticated empty owner has no learning state to
+      # display. Remove any process-restart cache left by an older owner.
+      self._learning_status_clear_pending = True
+      self._clear_learning_status_if_pending()
 
   def _start_prepared_onroad_runtime(self) -> None:
     """Activate only a bundle already restored during an offroad period."""
-    if (
-      self.runtime is not None
-      and self.runtime.coordinator.state.value == "onroad"
-    ):
-      return
     if self._runtime_unavailable_this_drive:
       return
-    car_params = self._read_car_params()
-    if car_params is None:
+    resolved = self._read_live_car_params()
+    if resolved is None:
+      # CarParams may appear shortly after deviceState.started. Waiting is not
+      # an incompatibility and cannot admit an unbound measurement frame.
       return
+    car_params, encoded_car_params = resolved
     fingerprint = str(car_params.carFingerprint)
     if (
-      self.runtime is not None
-      and self._runtime_fingerprint == fingerprint
+      self.runtime is None
+      or self._runtime_fingerprint != fingerprint
+      or self._prepared_car_params_bytes is None
+      or encoded_car_params != self._prepared_car_params_bytes
     ):
-      self.runtime.transition_onroad()
+      # A concrete live identity mismatch invalidates this drive's collection,
+      # but does not mutate the prepared offroad evidence.
+      self._runtime_unavailable_this_drive = True
+      self._live_identity_bound = False
       return
-    # Qualifying/restoring evidence is offroad work. A process that first
-    # appears mid-drive skips that drive and prepares at the next stop.
-    self._runtime_unavailable_this_drive = True
+    if self._live_identity_bound:
+      return
+    if self.runtime.coordinator.state.value == "onroad":
+      raise RuntimeError("onroad learner runtime lacks a live identity binding")
+    self._drive_baseline = DriveEvidenceBaseline.from_support_diagnostics(
+      self.runtime.coordinator.support_diagnostics,
+    )
+    self.runtime.transition_onroad()
+    self._live_identity_bound = True
 
   def _transition(self, started: bool) -> None:
     if self._onroad is not None and bool(started) == self._onroad:
       return
     was_onroad = self._onroad is True
+    was_offroad = self._onroad is False
     self._onroad = bool(started)
     if self._onroad:
       self._runtime_unavailable_this_drive = False
+      self._live_identity_bound = False
       self._pending_offroad_persist = False
+      self._drive_baseline = None
+      if was_offroad:
+        self.controls_witness_count = 0
+        self.unresolved_witness_count = 0
+        self.accepted_sample_count = 0
       self._start_prepared_onroad_runtime()
-    elif was_onroad and self.runtime is not None:
+    elif (
+      was_onroad
+      and self.runtime is not None
+      and self.runtime.coordinator.state.value == "onroad"
+    ):
       try:
-        self.runtime.transition_offroad_and_persist()
+        finalization = self.runtime.transition_offroad_and_persist()
+        # Params is the last atomic display operation after evidence,
+        # optional candidate, and manifest persistence have all succeeded.
+        self._write_learning_status(
+          finalization,
+          drive_baseline=self._drive_baseline,
+        )
         self._pending_offroad_persist = False
+        self._drive_baseline = None
       except Exception:
         self._pending_offroad_persist = True
         self._log_exception("blatv2 learner offroad persist failed")
+      finally:
+        self._live_identity_bound = False
+
+  def _write_learning_status(
+    self,
+    finalization,
+    *,
+    drive_baseline: DriveEvidenceBaseline | None,
+  ) -> None:
+    if self._onroad is not False or self.runtime is None:
+      raise RuntimeError("learning display status may be written only offroad")
+    payload = build_learning_status_payload(
+      finalization=finalization,
+      runtime_bundle=self.runtime.runtime_bundle,
+      drive_baseline=drive_baseline,
+    )
+    self.params.put(LEARNING_STATUS_PARAM, payload, block=True)
+    self._learning_status_clear_pending = False
 
   def _retry_pending_persist(self) -> None:
     if (
@@ -325,8 +444,13 @@ class BlatV2LearnerDaemon:
     ):
       return
     try:
-      self.runtime.persist_offroad()
+      finalization = self.runtime.persist_offroad()
+      self._write_learning_status(
+        finalization,
+        drive_baseline=self._drive_baseline,
+      )
       self._pending_offroad_persist = False
+      self._drive_baseline = None
     except Exception:
       self._log_exception("blatv2 learner offroad persist retry failed")
 
@@ -407,7 +531,13 @@ class BlatV2LearnerDaemon:
       if controls_valid
       else None
     )
-    if sources is None or self.runtime is None:
+    if (
+      sources is None
+      or self.runtime is None
+      or not self._live_identity_bound
+      or self._runtime_unavailable_this_drive
+      or self.runtime.coordinator.state.value != "onroad"
+    ):
       self.unresolved_witness_count += 1
       return
     try:
@@ -430,8 +560,10 @@ class BlatV2LearnerDaemon:
     ):
       self._transition(bool(self.sm["deviceState"].started))
     if self._onroad is False and self.sm.updated["deviceState"]:
+      self._clear_learning_status_if_pending()
       self._retry_pending_persist()
       self._prepare_offroad_runtime()
+      self._clear_learning_status_if_pending()
     if self._onroad is True:
       self._start_prepared_onroad_runtime()
       if self.sm.updated["controlsState"]:

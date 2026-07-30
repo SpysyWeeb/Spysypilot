@@ -56,6 +56,13 @@ replay, deterministic A/A, safety, and comma-device timing gates all pass.
 Driver feedback after a provisional validation drive can approve, retain, or
 roll back a profile at an engagement boundary.
 
+The home-screen learning display reads rebuildable
+`BLaTv2LearningStatus` and `BLaTv2LifecycleStatus` caches. They clear at
+manager start and are republished offroad only after the learner and activation
+owners validate the exact current vehicle/build state. The caches are
+informational only: editing or deleting them cannot train, approve, select, or
+change a steering controller.
+
 No BLaTv1 controller code or `HyundaiLowSpeedTorqueDamping` is inherited.
 Vehicle limits come from runtime `CarControllerParams`; BLaTv2 contains no
 Palisade limit literals. Full architecture, contracts, learning policy,
@@ -78,7 +85,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ✅ **[Error log viewer](https://github.com/SpysyWeeb/Spysypilot/tree/error-log-viewer)** — crashes are saved to an on-device log; a dev-menu button views it before/during/after a drive, with delete-on-close &nbsp;*(inspired by sunnypilot)*
 - ✅ **[Auto-update](https://github.com/SpysyWeeb/Spysypilot/tree/auto-update)** — tapping "Check" automatically checks, downloads if an update is found, and reboots to install; background downloads (which already happen every ~1.5 hrs on non-metered connections) also auto-install the moment they finish while the car is parked &nbsp;*(personal idea)*
 - ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with tap-to-cycle windows: driver engagement stats (last drive + lifetime, computed on-device from stored routes by a new `drive_statsd` service), a driving breakdown (turn/curve/straight overrides), a live openpilot terminal, and system usage graphs &nbsp;*(personal idea)*
-- ✅ **[Swapped cruise speed adjustments](https://github.com/SpysyWeeb/Spysypilot/tree/swapped-cruise-speed)** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(personal idea)*
+- ✅ **[Swapped cruise speed adjustments](https://github.com/SpysyWeeb/Spysypilot/tree/swapped-cruise-speed)** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(inspired by sunnypilot)*
 - ❌ **Quiet mode** — silence the engage and disengage sounds while leaving safety alerts audible; no branch yet &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — makes experimental mode actually commit to red lights and stop signs instead of the model's indecisive crawl, by latching the model's own planned stop point and capping cruise speed to reach it &nbsp;*(inspired by IQPilot)*
 - ⚠️ **[Better green lights](https://github.com/SpysyWeeb/Spysypilot/tree/better-green-lights)** — experimental-mode green-light launches start ~1.5–2s sooner by reading the model's path-length explosion instead of its laggy shouldStop bit, plus a launch assist that skips the dead time at the head of the model's speed plan &nbsp;*(personal idea)*
