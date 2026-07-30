@@ -136,9 +136,4 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"UsbGpuActive", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"UsbGpuLoading", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"Version", {PERSISTENT, STRING}},
-    {"SpysyLifetimeStats", {PERSISTENT, STRING}},
-    {"SpysyLastDriveStats", {PERSISTENT, STRING}},
-    {"SpysyProcessedRoutes", {PERSISTENT, STRING}},
-    {"SpysyStatsStatus", {CLEAR_ON_MANAGER_START, STRING}},
-    {"SpysyForceStatsRefresh", {PERSISTENT, BOOL}},
 };
