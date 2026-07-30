@@ -70,6 +70,8 @@ class LiveActionResult:
   horizon_demand_time_seconds: float = 0.0
   no_lead_limited: bool = False
   signed_rack_rate_deg_s: float = 0.0
+  held_static_load: float = 0.0
+  rack_stationary: bool = False
 
 
 class LiveActionController:
@@ -269,6 +271,8 @@ class LiveActionController:
     result.signed_rack_rate_deg_s = float(
       common.signed_rack_rate_deg_s
     )
+    result.held_static_load = float(common.held_static_load)
+    result.rack_stationary = bool(common.rack_stationary)
     return result
 
 

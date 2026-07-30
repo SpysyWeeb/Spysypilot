@@ -7,13 +7,31 @@ fork overview.
 
 ## Status
 
-⚠️ **In progress — v221 real-time scalar-anchored, state/slew-feasible
-inverse-EPS controller.** Version 221 preserves v220's steering law while
-making its numerical path fit the 100 Hz Hyundai control budget. It keeps one
+⚠️ **In progress — v222 unified stick/slip, state/slew-feasible inverse-EPS
+controller.** Version 222 replaces v221's conflicting friction
+representations with one physical rack law. It keeps one
 torque trajectory and no competing
 authority mechanisms: there is no turn detector, preview boost, persistence
 timer, breakaway episode, integral, torque-rate filter, or alternate
 low-speed controller.
+
+Static load is now a measured rack state, not a torque boost inferred from the
+planned path. When the hands-off rack is physically stationary, applied torque
+minus the calibrated aligning load and disturbance estimate establishes a
+lower bound on the load holding that exact rack position. The plant and its
+inverse share that one stick/slip law: current-state inversion requests exactly
+the measured departure load, every forward rollout enforces the same load, and
+planned future cells use the one kinetic value because no measured future rack
+state exists. It can no longer jump between unrelated `0.09` and `0.03`
+command branches merely because Hyundai's quantized rate changed from exactly
+zero to 4 deg/s.
+
+This same held-load state also replaces angle-triggered unwind assistance.
+Large steering angles require more release torque only when the measured rack
+proves that they do. The state/slew trajectory can unload old-direction torque
+while that measured load still holds the wheel, then predict motion as soon as
+the request exceeds it. There is no steering-angle threshold, full-lock
+detector, timed surge, path lead, or separate unwind controller.
 
 The model's scalar action still anchors steering position at its authored
 action time; BLaTv2 does not move or reshape that path. The plant twin solves
@@ -192,11 +210,13 @@ ground-up design and does not inherit that controller.
   controller passively for honest live A/B telemetry;
 - route-audit replay using the identical library implementation.
 
-The shadow event is `blatV2Shadow`, version 16. It reports reference and
+The shadow event is `blatV2Shadow`, version 17. It reports reference and
 torque-demand values, actuator-feasible torque, one-step plant residual,
 scalar/plan disagreement, horizon, vehicle speed, the self-aligning torque
 estimate, alignment-input validity, overall validity, and per-frame runtime.
-Version 16 identifies the v220 single-feedback, queued-delay controller.
+Version 17 adds the measured held-static-load lower bound and rack-stationary
+state used by v222. Version 16 identifies the v220/v221 single-feedback,
+queued-delay controller.
 Version 15 identifies the rejected v219 state/slew-feasible controller.
 Version 14
 identifies the rejected v218 torque-only trajectory and reactivates the
@@ -276,13 +296,16 @@ inverse demand up to normalized saturation.
 
 Palisade steering rate is an unsigned 4 deg/s-quantized magnitude. Version 216
 reconstructs its sign once from steering-angle motion. The active controller
-uses full static `0.09` compensation at measured standstill and blends
-continuously to kinetic `0.03` across the existing 4 deg/s sensor quantum.
-Future cells use their planned rack motion because no measured future state
-exists. A b9/ba
-attempt to identify an additional road-wheel-angle scrub term was rejected:
-the two low-speed route fits did not cross-validate, so v219 adds no
-unsupported coefficient.
+uses angle delta independently to distinguish a truly stationary rack from a
+zero quantized-rate sample. Planned cells use kinetic `0.03` only. Static
+`0.09` is the plant's fallback envelope; while the measured rack holds, the
+current physical torque equilibrium can raise that envelope without a fitted
+scrub coefficient. That observed lower bound follows the current rack
+position through delay and terminal rollouts, blending to kinetic friction
+across the first observable rack-rate quantum. It is not clipped to normalized
+actuator authority: a physical holding load above 1.0 must make the inverse
+report that the maneuver needs full authority, not make the twin predict
+motion which cannot occur.
 
 ### v221 real-time implementation
 
@@ -529,10 +552,10 @@ observer estimate read-only.
 `SIGMA_Y = 0.05 m`, `SIGMA_HEADING = 0.01 rad`, and
 `SIGMA_TORQUE_RATE = 0.5 normalized-torque/s` are provisional owner feel-dials
 in `controller_seed_params.json`. They are a shared tuning vocabulary for both
-candidates, not separately tuned gains. The provisional friction model always
-charges the full `t_breakaway` against intended motion and independently bounds
-the observer by another `t_breakaway`; the deliberate two-breakaway tolerance
-is conservative until casual-drive evidence identifies a tighter value.
+candidates, not separately tuned gains. The provisional friction model uses
+kinetic friction against intended motion while static breakaway exists once in
+the rack plant. The observer remains independently bounded by `t_breakaway`;
+changing that lifecycle or authority is not part of v222.
 
 ## Hyundai limits
 
@@ -549,5 +572,5 @@ damping.
 - UI;
 - unsupported scrub/load coefficients.
 
-Version 221 stays **in progress** until identity replay, route gates, device
+Version 222 stays **in progress** until identity replay, route gates, device
 timing, and the first owner drive pass.

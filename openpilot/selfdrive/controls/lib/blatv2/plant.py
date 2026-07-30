@@ -5,7 +5,8 @@ Numerical contract
 * Plant arithmetic is Python ``float`` (IEEE-754 binary64); no BLAS or
   platform-selected math kernels are used.
 * ``PlantState`` is steering-wheel angle in degrees, steering-wheel rate in
-  degrees/second, normalized torque on [-1, 1], and vehicle speed in m/s.
+  degrees/second, normalized torque on [-1, 1], vehicle speed in m/s, and the
+  measured lower bound on static rack load at the current held position.
 * Hyundai ``SAS_Speed`` is an unsigned 4 deg/s magnitude. ``SignedRackRate``
   restores direction from consecutive steering-angle measurements before the
   value enters any plant, friction, observer, or controller arithmetic.
@@ -22,10 +23,12 @@ Numerical contract
   parameters use zero roll/angle offset and nominal stiffness/steer ratio for
   that frame only; inputs are explicit and never retained by the plant.
 * Integration is semi-implicit Euler: rate is advanced before angle.
-* At exactly zero rate, torque inside the breakaway envelope produces no
-  motion. Above it, Coulomb torque is removed in the demand direction. While
-  moving, Coulomb torque opposes motion; a numerical rate sign crossing is
-  clamped to zero so friction cannot create a one-frame oscillation.
+* At exactly zero measured motion, the current applied/alignment/disturbance
+  equilibrium supplies a lower bound on the static load at that rack
+  position. It is never inferred from a planned rate and never injected as a
+  second feedforward command. Above that held envelope, motion transitions to
+  the one kinetic-friction law. A numerical rate sign crossing is clamped to
+  zero so friction cannot create a one-frame oscillation.
 * ``predict`` applies the exact asymmetric limiter to requested torque and
   models the pure actuation delay with zero-order-held samples. Before the
   delayed sequence arrives, the state's measured applied torque is held.
@@ -56,6 +59,13 @@ from typing import Any
 
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
+
+
+# Hyundai reports steering-wheel rate in 4 deg/s quanta. This is a sensor
+# resolution, not a feel dial. The plant's presliding friction transition uses
+# exactly one observable quantum so static load cannot disappear
+# discontinuously when predicted motion begins.
+RACK_RATE_QUANTUM_DEG_S = 4.0
 
 
 @dataclass(frozen=True)
@@ -220,10 +230,19 @@ class PlantState:
   rate_deg_s: float
   applied_torque: float
   v_ego: float
+  held_static_load: float = 0.0
 
   def __post_init__(self) -> None:
-    if not all(math.isfinite(value) for value in (self.angle_deg, self.rate_deg_s, self.applied_torque, self.v_ego)):
+    if not all(math.isfinite(value) for value in (
+      self.angle_deg,
+      self.rate_deg_s,
+      self.applied_torque,
+      self.v_ego,
+      self.held_static_load,
+    )):
       raise ValueError("plant state must be finite")
+    if self.held_static_load < 0.0:
+      raise ValueError("held static load must be non-negative")
 
 
 @dataclass(slots=True)
@@ -281,11 +300,13 @@ class SignedRackRate:
   previous_angle_deg: float = 0.0
   direction: float = 0.0
   initialized: bool = False
+  stationary: bool = True
 
   def reset(self) -> None:
     self.previous_angle_deg = 0.0
     self.direction = 0.0
     self.initialized = False
+    self.stationary = True
 
   def update(self, angle_deg: float, reported_rate_deg_s: float) -> float:
     angle = float(angle_deg)
@@ -294,13 +315,20 @@ class SignedRackRate:
       raise ValueError("rack-rate inputs must be finite")
 
     magnitude = abs(reported)
+    angle_delta = (
+      angle - self.previous_angle_deg if self.initialized else 0.0
+    )
     if reported < 0.0:
       self.direction = -1.0
     elif self.initialized:
-      angle_delta = angle - self.previous_angle_deg
       if angle_delta != 0.0:
         self.direction = math.copysign(1.0, angle_delta)
 
+    # A zero Hyundai SAS_Speed sample is not proof of stiction when the
+    # independently measured angle changed. This boolean is used only to
+    # decide whether the current equilibrium can identify held static load;
+    # rate magnitude remains the unfiltered platform measurement.
+    self.stationary = bool(magnitude == 0.0 and angle_delta == 0.0)
     self.previous_angle_deg = angle
     self.initialized = True
     if magnitude == 0.0 or self.direction == 0.0:
@@ -309,11 +337,31 @@ class SignedRackRate:
 
 
 class PlantTwin:
-  def __init__(self, params: PlantParams, align_params: AlignParams, residual_dt: float = DT_CTRL):
+  def __init__(
+    self,
+    params: PlantParams,
+    align_params: AlignParams,
+    residual_dt: float = DT_CTRL,
+    kinetic_friction: float | None = None,
+  ):
     if not math.isfinite(residual_dt) or residual_dt <= 0.0:
       raise ValueError("residual_dt must be finite and positive")
+    kinetic = (
+      params.t_breakaway
+      if kinetic_friction is None
+      else float(kinetic_friction)
+    )
+    if (
+      not math.isfinite(kinetic)
+      or kinetic < 0.0
+      or kinetic > params.t_breakaway
+    ):
+      raise ValueError(
+        "kinetic friction must be finite and within static breakaway"
+      )
     self.params = params
     self.align_params = align_params
+    self.kinetic_friction = kinetic
     self.residual_dt = float(residual_dt)
     self.nominal_align_inputs = AlignInputs(
       roll=0.0,
@@ -357,6 +405,116 @@ class PlantTwin:
   def aligning_torque_values(self, angle_deg: float, v_ego: float, align_inputs: AlignInputs) -> float:
     """Allocation-free scalar form used by both shadow candidates."""
     return self._aligning_torque(float(angle_deg), float(v_ego), align_inputs)
+
+  def observed_held_static_load(
+    self,
+    state: PlantState,
+    align_inputs: AlignInputs,
+    disturbance_torque: float,
+    rack_stationary: bool,
+    eligible: bool,
+  ) -> float:
+    """Return the measured lower bound on load holding the rack stationary.
+
+    Static load is not observable from a planned path derivative. It is
+    observable, without a fitted angle schedule, when the measured rack did
+    not move: applied torque minus the modelled aligning and disturbance loads
+    is the load that the rack just held. The value is a lower bound—not an
+    identified maximum—so it is recomputed from the current physical state
+    every frame and is retained only through the first observable rack-rate
+    quantum while the plant transitions continuously to kinetic friction.
+
+    Driver interaction, inactive control, invalid alignment, and measured
+    motion make the equilibrium ineligible. The physical seed remains the
+    deterministic fallback. The load is deliberately not clipped to actuator
+    authority: aligning load plus scrub can exceed normalized torque 1.0, and
+    that is precisely the condition in which the inverse must request full
+    authority rather than predict motion the rack cannot make.
+    """
+    disturbance = float(disturbance_torque)
+    if not math.isfinite(disturbance):
+      raise ValueError("disturbance torque must be finite")
+    base = self.params.t_breakaway
+    if (
+      not eligible
+      or not rack_stationary
+      or state.rate_deg_s != 0.0
+      or not align_inputs.valid
+    ):
+      return base
+    aligning = self.aligning_torque(state, align_inputs)
+    equilibrium = abs(
+      self._clip(state.applied_torque, -1.0, 1.0)
+      - aligning
+      - disturbance
+    )
+    return max(base, equilibrium)
+
+  def _initial_static_load(self, state: PlantState) -> float:
+    return max(
+      float(state.held_static_load),
+      self.params.t_breakaway,
+    )
+
+  def _advanced_static_load(
+    self,
+    static_load: float,
+    rate: float,
+  ) -> float:
+    return (
+      self.params.t_breakaway
+      if abs(rate) >= RACK_RATE_QUANTUM_DEG_S
+      else static_load
+    )
+
+  def inverse_friction_torque(
+    self,
+    state: PlantState,
+    departure_direction: float,
+  ) -> float:
+    """Return the exact friction term inverted by the controller.
+
+    This is the inverse view of :meth:`_friction_effective_torque`, not a
+    second compensation mechanism. A physically stationary rack uses its
+    measured held-load state in the requested departure direction. A moving
+    rack uses the same continuous presliding-to-kinetic law as every forward
+    rollout. Planned future cells never call this method because they have no
+    measured rack state and use kinetic friction only.
+    """
+    departure = float(departure_direction)
+    if not math.isfinite(departure):
+      raise ValueError("departure direction must be finite")
+    rate = float(state.rate_deg_s)
+    direction = rate if rate != 0.0 else departure
+    if direction == 0.0:
+      return 0.0
+    static_load = self._initial_static_load(state)
+    slip_fraction = min(
+      abs(rate) / RACK_RATE_QUANTUM_DEG_S, 1.0,
+    )
+    friction = static_load + slip_fraction * (
+      self.kinetic_friction - static_load
+    )
+    return math.copysign(friction, direction)
+
+  def _friction_effective_torque(
+    self,
+    net_torque: float,
+    rate: float,
+    static_load: float,
+  ) -> float:
+    """Apply the single stick/slip law used by every plant rollout."""
+    if rate == 0.0:
+      if abs(net_torque) <= static_load:
+        return 0.0
+      direction = net_torque
+    else:
+      direction = rate
+    slip_fraction = min(abs(rate) / RACK_RATE_QUANTUM_DEG_S, 1.0)
+    friction = static_load + slip_fraction * (
+      self.kinetic_friction - static_load
+    )
+    return net_torque - math.copysign(friction, direction)
 
   def prepare_align_runtime_terms(
     self,
@@ -687,6 +845,7 @@ class PlantTwin:
     align_inputs: AlignInputs,
     dt: float,
     disturbance_torque: float = 0.0,
+    static_load: float | None = None,
   ) -> float:
     torque = self._clip(applied_torque, -1.0, 1.0)
     aligning_torque = self._aligning_torque(angle, v_ego, align_inputs)
@@ -694,13 +853,16 @@ class PlantTwin:
     if not math.isfinite(disturbance):
       raise ValueError("disturbance torque must be finite")
     net_torque = torque - aligning_torque - disturbance
-    if rate == 0.0:
-      if abs(net_torque) <= self.params.t_breakaway:
-        effective_torque = 0.0
-      else:
-        effective_torque = net_torque - math.copysign(self.params.t_breakaway, net_torque)
-    else:
-      effective_torque = net_torque - math.copysign(self.params.t_breakaway, rate)
+    breakaway = (
+      self.params.t_breakaway
+      if static_load is None
+      else float(static_load)
+    )
+    if not math.isfinite(breakaway) or breakaway < self.params.t_breakaway:
+      raise ValueError("static load must be finite and at least breakaway")
+    effective_torque = self._friction_effective_torque(
+      net_torque, rate, breakaway,
+    )
 
     acceleration = self.params.k_t * effective_torque - self.params.b_steer * rate
     next_rate = rate + acceleration * dt
@@ -716,24 +878,16 @@ class PlantTwin:
     dt: float,
     disturbance_torque: float,
     terms: AlignRuntimeTerms,
+    static_load: float,
   ) -> float:
     """Hot-path counterpart of :meth:`_next_rate` for prepared rollouts."""
     aligning_torque = self._aligning_torque_prepared(angle, terms)
     net_torque = (
       applied_torque - aligning_torque - disturbance_torque
     )
-    if rate == 0.0:
-      if abs(net_torque) <= self.params.t_breakaway:
-        effective_torque = 0.0
-      else:
-        effective_torque = (
-          net_torque
-          - math.copysign(self.params.t_breakaway, net_torque)
-        )
-    else:
-      effective_torque = (
-        net_torque - math.copysign(self.params.t_breakaway, rate)
-      )
+    effective_torque = self._friction_effective_torque(
+      net_torque, rate, static_load,
+    )
 
     acceleration = (
       self.params.k_t * effective_torque
@@ -782,8 +936,18 @@ class PlantTwin:
     align_inputs: AlignInputs,
     dt: float,
     disturbance_torque: float = 0.0,
+    static_load: float | None = None,
   ) -> tuple[float, float]:
-    next_rate = self._next_rate(angle, rate, applied_torque, v_ego, align_inputs, dt, disturbance_torque)
+    next_rate = self._next_rate(
+      angle,
+      rate,
+      applied_torque,
+      v_ego,
+      align_inputs,
+      dt,
+      disturbance_torque,
+      static_load,
+    )
     next_angle = angle + next_rate * dt
     return next_angle, next_rate
 
@@ -804,6 +968,7 @@ class PlantTwin:
     """
     if not math.isfinite(dt) or dt <= 0.0:
       raise ValueError("dt must be finite and positive")
+    static_load = self._initial_static_load(state)
     angle, rate = self._advance(
       float(state.angle_deg),
       float(state.rate_deg_s),
@@ -812,12 +977,15 @@ class PlantTwin:
       align_inputs,
       float(dt),
       float(disturbance_torque),
+      static_load,
     )
+    static_load = self._advanced_static_load(static_load, rate)
     return PlantState(
       angle_deg=angle,
       rate_deg_s=rate,
       applied_torque=float(applied_torque),
       v_ego=float(state.v_ego),
+      held_static_load=static_load,
     )
 
   def predict_held_state_into(
@@ -844,6 +1012,7 @@ class PlantTwin:
       raise ValueError("prediction step must be finite and positive")
     angle = float(state.angle_deg)
     rate = float(state.rate_deg_s)
+    static_load = self._initial_static_load(state)
     while remaining > 0.0:
       step = min(remaining, step_limit)
       angle, rate = self._advance(
@@ -854,12 +1023,15 @@ class PlantTwin:
         align_inputs,
         step,
         disturbance_torque,
+        static_load,
       )
+      static_load = self._advanced_static_load(static_load, rate)
       remaining -= step
     target.angle_deg = angle
     target.rate_deg_s = rate
     target.applied_torque = float(state.applied_torque)
     target.v_ego = float(state.v_ego)
+    target.held_static_load = static_load
 
   def predict_applied_history_into(
     self,
@@ -908,6 +1080,7 @@ class PlantTwin:
     angle = float(state.angle_deg)
     rate = float(state.rate_deg_s)
     applied = float(state.applied_torque)
+    static_load = self._initial_static_load(state)
     for step_index in range(step_count):
       step = (
         step_limit
@@ -928,11 +1101,14 @@ class PlantTwin:
         align_inputs,
         step,
         disturbance_torque,
+        static_load,
       )
+      static_load = self._advanced_static_load(static_load, rate)
     target.angle_deg = angle
     target.rate_deg_s = rate
     target.applied_torque = applied
     target.v_ego = float(state.v_ego)
+    target.held_static_load = static_load
 
   def predict_applied_history_prepared_into(
     self,
@@ -982,6 +1158,7 @@ class PlantTwin:
     angle = float(state.angle_deg)
     rate = float(state.rate_deg_s)
     applied = float(state.applied_torque)
+    static_load = self._initial_static_load(state)
     for step_index in range(step_count):
       step = (
         step_limit
@@ -1001,12 +1178,15 @@ class PlantTwin:
         step,
         disturbance,
         runtime_terms,
+        static_load,
       )
       angle += rate * step
+      static_load = self._advanced_static_load(static_load, rate)
     target.angle_deg = angle
     target.rate_deg_s = rate
     target.applied_torque = applied
     target.v_ego = float(state.v_ego)
+    target.held_static_load = static_load
 
   def predict_constant_request_into(
     self,
@@ -1037,6 +1217,7 @@ class PlantTwin:
     angle = float(state.angle_deg)
     rate = float(state.rate_deg_s)
     applied = float(state.applied_torque)
+    static_load = self._initial_static_load(state)
     while remaining > 0.0:
       step = min(remaining, step_limit)
       applied = self.apply_slew(applied, request)
@@ -1048,12 +1229,15 @@ class PlantTwin:
         align_inputs,
         step,
         disturbance_torque,
+        static_load,
       )
+      static_load = self._advanced_static_load(static_load, rate)
       remaining -= step
     target.angle_deg = angle
     target.rate_deg_s = rate
     target.applied_torque = applied
     target.v_ego = float(state.v_ego)
+    target.held_static_load = static_load
 
   def predict_constant_request_prepared_into(
     self,
@@ -1099,7 +1283,7 @@ class PlantTwin:
       applied = 1.0
     build = self.params.delta_up / self.params.steer_max
     decay = self.params.delta_down / self.params.steer_max
-    breakaway = self.params.t_breakaway
+    static_load = self._initial_static_load(state)
     torque_gain = self.params.k_t
     damping = self.params.b_steer
     align_slope = runtime_terms.torque_per_angle
@@ -1131,28 +1315,22 @@ class PlantTwin:
 
       aligning_torque = align_slope * angle + align_offset
       net_torque = applied - aligning_torque - disturbance
-      if rate == 0.0:
-        if abs(net_torque) <= breakaway:
-          effective_torque = 0.0
-        else:
-          effective_torque = (
-            net_torque - math.copysign(breakaway, net_torque)
-          )
-      else:
-        effective_torque = (
-          net_torque - math.copysign(breakaway, rate)
-        )
+      effective_torque = self._friction_effective_torque(
+        net_torque, rate, static_load,
+      )
       acceleration = torque_gain * effective_torque - damping * rate
       next_rate = rate + acceleration * step
       if rate != 0.0 and next_rate * rate < 0.0:
         next_rate = 0.0
       rate = next_rate
+      static_load = self._advanced_static_load(static_load, rate)
       angle += rate * step
       remaining -= step
     target.angle_deg = angle
     target.rate_deg_s = rate
     target.applied_torque = applied
     target.v_ego = float(state.v_ego)
+    target.held_static_load = static_load
 
   def predict_constant_request_sensitivity_into(
     self,
@@ -1205,7 +1383,7 @@ class PlantTwin:
     build = self.params.delta_up / self.params.steer_max
     decay = self.params.delta_down / self.params.steer_max
     build_over_decay = build / decay
-    breakaway = self.params.t_breakaway
+    static_load = self._initial_static_load(state)
     torque_gain = self.params.k_t
     damping = self.params.b_steer
     align_slope = runtime_terms.torque_per_angle
@@ -1245,19 +1423,30 @@ class PlantTwin:
         applied_sensitivity
         - align_slope * angle_sensitivity
       )
-      if rate == 0.0 and abs(net_torque) <= breakaway:
+      if rate == 0.0 and abs(net_torque) <= static_load:
         effective_torque = 0.0
         effective_sensitivity = 0.0
       else:
         friction_direction = net_torque if rate == 0.0 else rate
-        effective_torque = (
-          net_torque
-          - math.copysign(
-            breakaway,
-            friction_direction,
-          )
+        slip_fraction = min(
+          abs(rate) / RACK_RATE_QUANTUM_DEG_S, 1.0,
         )
-        effective_sensitivity = net_sensitivity
+        friction = static_load + slip_fraction * (
+          self.kinetic_friction - static_load
+        )
+        effective_torque = net_torque - math.copysign(
+          friction, friction_direction,
+        )
+        if abs(rate) < RACK_RATE_QUANTUM_DEG_S and rate != 0.0:
+          friction_rate_slope = (
+            self.kinetic_friction - static_load
+          ) / RACK_RATE_QUANTUM_DEG_S
+          effective_sensitivity = (
+            net_sensitivity
+            - friction_rate_slope * rate_sensitivity
+          )
+        else:
+          effective_sensitivity = net_sensitivity
 
       acceleration = (
         torque_gain * effective_torque
@@ -1276,6 +1465,7 @@ class PlantTwin:
         next_rate_sensitivity = 0.0
       rate = next_rate
       rate_sensitivity = next_rate_sensitivity
+      static_load = self._advanced_static_load(static_load, rate)
       angle += rate * step
       angle_sensitivity += rate_sensitivity * step
       remaining -= step
@@ -1284,6 +1474,7 @@ class PlantTwin:
     target.rate_deg_s = rate
     target.applied_torque = applied
     target.v_ego = float(state.v_ego)
+    target.held_static_load = static_load
     sensitivity.angle_per_torque = angle_sensitivity
     sensitivity.rate_per_torque = rate_sensitivity
 
@@ -1309,6 +1500,7 @@ class PlantTwin:
 
     angle = float(state.angle_deg)
     rate = float(state.rate_deg_s)
+    static_load = self._initial_static_load(state)
     inputs = self.nominal_align_inputs if align_inputs is None else align_inputs
     angles: list[float] = []
     rates: list[float] = []
@@ -1319,7 +1511,16 @@ class PlantTwin:
       else:
         delayed_index = min(int(delayed_time / dt), len(applied_sequence) - 1)
         delayed_torque = applied_sequence[delayed_index]
-      angle, rate = self._advance(angle, rate, delayed_torque, state.v_ego, inputs, dt)
+      angle, rate = self._advance(
+        angle,
+        rate,
+        delayed_torque,
+        state.v_ego,
+        inputs,
+        dt,
+        static_load=static_load,
+      )
+      static_load = self._advanced_static_load(static_load, rate)
       angles.append(angle)
       rates.append(rate)
 
@@ -1358,6 +1559,7 @@ class PlantTwin:
 
     angle = float(state.angle_deg)
     rate = float(state.rate_deg_s)
+    static_load = self._initial_static_load(state)
     for index in range(count):
       delayed_time = index * dt - delay
       if delayed_time < 0.0:
@@ -1373,9 +1575,11 @@ class PlantTwin:
         align_inputs,
         dt,
         disturbance_torque,
+        static_load,
       )
       angle += next_rate * dt
       rate = next_rate
+      static_load = self._advanced_static_load(static_load, rate)
       angle_out[index] = angle
       rate_out[index] = rate
 
@@ -1394,5 +1598,6 @@ class PlantTwin:
       state_t.v_ego,
       inputs,
       self.residual_dt,
+      static_load=self._initial_static_load(state_t),
     )
     return float(state_t1.rate_deg_s - predicted_rate)

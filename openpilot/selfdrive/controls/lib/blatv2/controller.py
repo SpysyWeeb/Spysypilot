@@ -12,7 +12,7 @@ from openpilot.common.realtime import DT_MDL
 
 
 DECISION_DT = DT_MDL
-LIVE_CONTROLLER_VERSION = 221
+LIVE_CONTROLLER_VERSION = 222
 
 
 class CandidateStatus(IntEnum):
@@ -120,6 +120,8 @@ class CandidateResult:
   horizon_torque_demand: float = 0.0
   horizon_demand_time_seconds: float = 0.0
   no_lead_limited: bool = False
+  held_static_load: float = 0.0
+  rack_stationary: bool = False
   status: CandidateStatus = CandidateStatus.INPUT_INVALID
   candidate_count: int = 0
   available_schedule_count: int = 0
@@ -149,6 +151,8 @@ class CandidateResult:
     self.horizon_torque_demand = 0.0
     self.horizon_demand_time_seconds = 0.0
     self.no_lead_limited = False
+    self.held_static_load = 0.0
+    self.rack_stationary = False
     self.status = status
     self.candidate_count = 0
     self.available_schedule_count = 0
