@@ -37,7 +37,7 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 )
 
 
-LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 1
+LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 2
 
 
 class LearningLifecycleState(StrEnum):
@@ -117,6 +117,27 @@ def _qualification_manifest(
       report.applied_torque_span,
       f"{context}.applied_torque_span",
     ),
+    "authority_candidate_validation_rms": _optional_float_hex(
+      report.authority_candidate_validation_rms,
+      f"{context}.authority_candidate_validation_rms",
+    ),
+    "authority_fit_active": report.authority_fit_active,
+    "authority_fit_sample_count": report.authority_fit_sample_count,
+    "authority_fit_support_s": _finite_float_hex(
+      report.authority_fit_support_s,
+      f"{context}.authority_fit_support_s",
+    ),
+    "authority_sample_count": report.authority_sample_count,
+    "authority_seed_validation_rms": _optional_float_hex(
+      report.authority_seed_validation_rms,
+      f"{context}.authority_seed_validation_rms",
+    ),
+    "authority_support_s": _finite_float_hex(
+      report.authority_support_s,
+      f"{context}.authority_support_s",
+    ),
+    "authority_training_count": report.authority_training_count,
+    "authority_validation_count": report.authority_validation_count,
     "candidate_validation_rms": _optional_float_hex(
       report.candidate_validation_rms,
       f"{context}.candidate_validation_rms",

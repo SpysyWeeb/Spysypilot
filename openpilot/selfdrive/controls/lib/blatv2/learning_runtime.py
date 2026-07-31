@@ -34,6 +34,10 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
   LearningFinalization,
   LearningLifecycleState,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learner import (
+  ActuatorBoundary,
+  _attest_authority_sample,
+)
 from openpilot.selfdrive.controls.lib.blatv2.measurement import (
   MAX_CONTINUOUS_MEASUREMENT_GAP_S,
   LearningMeasurementBuilder,
@@ -49,6 +53,11 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 CASUAL_DRIVING_CANDIDATE_PROVENANCE = "measured casual-driving evidence"
+# Durable evidence is namespaced by its inclusion policy as well as by the
+# physical runtime. A policy change must start from an empty ledger and replay
+# retained full rlogs; it must never reinterpret or mix a predecessor's
+# CURRENT generation in place.
+FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v1"
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
   "STEER_DELTA_UP",
@@ -260,27 +269,59 @@ def build_detected_runtime_bundle(
   return bundle, car_interface, controller_params
 
 
+@dataclass(frozen=True, slots=True)
+class _MeasuredEnvelopeObservation:
+  """Validity and limiter state of one recorded applied-torque transition."""
+
+  valid: bool
+  constrained: bool
+  boundary: ActuatorBoundary
+  magnitude_boundary_dwell_s: float
+
+
 class _MeasuredEnvelopeConstraint:
-  """Conservatively reject applied torque sitting on an opendbc boundary."""
+  """Validate recorded torque transitions and identify reachable boundaries.
+
+  A transition on a driver-free opendbc magnitude or slew boundary is a valid
+  measured plant input: the learner knows the torque that CarController
+  actually emitted. Driver-bound response includes unmodeled human torque and
+  is invalid even before the debounced steeringPressed signal rises. A
+  transition outside the reachable envelope is inconsistent data and remains
+  invalid.
+  """
 
   __slots__ = (
     "_limits",
     "_previous_applied",
+    "_previous_driver_torque",
     "_previous_time_s",
+    "_magnitude_boundary_value",
+    "_magnitude_boundary_dwell_s",
     "_torque_count_tolerance",
+    "_torque_grid_tolerance_counts",
   )
 
   def __init__(self, limits: RuntimeTorqueLimits) -> None:
     self._limits = limits
     self._previous_applied = 0.0
+    self._previous_driver_torque = 0.0
     self._previous_time_s: float | None = None
+    self._magnitude_boundary_value: float | None = None
+    self._magnitude_boundary_dwell_s = 0.0
     # CarController output is normalized after an integer-count limiter. Half
     # a count admits Float32/log round-trip but cannot hide a whole slew step.
     self._torque_count_tolerance = 0.5 / limits.steer_max
+    # carOutput torque is a Cap'n Proto Float32 representation of an
+    # integer-count command. This admits Float32 round-trip error, not an
+    # arbitrary half-count value that merely happens to sit in the envelope.
+    self._torque_grid_tolerance_counts = 4e-5
 
   def reset(self) -> None:
     self._previous_applied = 0.0
+    self._previous_driver_torque = 0.0
     self._previous_time_s = None
+    self._magnitude_boundary_value = None
+    self._magnitude_boundary_dwell_s = 0.0
 
   def update(
     self,
@@ -289,7 +330,7 @@ class _MeasuredEnvelopeConstraint:
     applied_torque: float,
     driver_torque: float,
     inputs_valid: bool,
-  ) -> bool:
+  ) -> _MeasuredEnvelopeObservation:
     values = (sample_time_s, applied_torque, driver_torque)
     if (
       not inputs_valid
@@ -297,37 +338,152 @@ class _MeasuredEnvelopeConstraint:
       or abs(applied_torque) > 1.0
     ):
       self.reset()
-      return True
+      return _MeasuredEnvelopeObservation(
+        valid=False,
+        constrained=True,
+        boundary=ActuatorBoundary.NONE,
+        magnitude_boundary_dwell_s=0.0,
+      )
 
-    constrained = True
-    if self._previous_time_s is not None:
-      dt_s = sample_time_s - self._previous_time_s
-      if 0.0 < dt_s <= MAX_CONTINUOUS_MEASUREMENT_GAP_S:
-        positive = apply_torque_envelope(
-          self._limits,
-          1.0,
-          self._previous_applied,
-          driver_torque,
-        ).applied_torque
-        negative = apply_torque_envelope(
-          self._limits,
-          -1.0,
-          self._previous_applied,
-          driver_torque,
-        ).applied_torque
-        lower = min(positive, negative)
-        upper = max(positive, negative)
-        tolerance = self._torque_count_tolerance
-        inside = lower - tolerance <= applied_torque <= upper + tolerance
-        on_boundary = (
-          abs(applied_torque - lower) <= tolerance
-          or abs(applied_torque - upper) <= tolerance
+    applied_counts = applied_torque * self._limits.steer_max
+    if (
+      abs(applied_counts - round(applied_counts))
+      > self._torque_grid_tolerance_counts
+    ):
+      self.reset()
+      return _MeasuredEnvelopeObservation(
+        valid=False,
+        constrained=True,
+        boundary=ActuatorBoundary.NONE,
+        magnitude_boundary_dwell_s=0.0,
+      )
+
+    if self._previous_time_s is None:
+      self._previous_time_s = sample_time_s
+      self._previous_applied = applied_torque
+      self._previous_driver_torque = driver_torque
+      return _MeasuredEnvelopeObservation(
+        valid=False,
+        constrained=True,
+        boundary=ActuatorBoundary.NONE,
+        magnitude_boundary_dwell_s=0.0,
+      )
+
+    dt_s = sample_time_s - self._previous_time_s
+    if not 0.0 < dt_s <= MAX_CONTINUOUS_MEASUREMENT_GAP_S:
+      self.reset()
+      return _MeasuredEnvelopeObservation(
+        valid=False,
+        constrained=True,
+        boundary=ActuatorBoundary.NONE,
+        magnitude_boundary_dwell_s=0.0,
+      )
+
+    # carOutput contains the previous CarController result while carState is
+    # the current card cycle. If either adjacent driver-torque sample exceeds
+    # opendbc's allowance, the exact limiter input and the human rack torque
+    # are both ambiguous. Reject conservatively and require a fresh
+    # full-magnitude dwell instead of pretending the joined sample is exact.
+    def driver_exceeds_allowance(value: float) -> bool:
+      # The limiter scales the sensor through DRIVER_FACTOR. Raw torque is
+      # also retained in the veto so factor=0/multiplier=0 platforms cannot
+      # classify obvious human rack input as vehicle-owned evidence.
+      return max(
+        abs(value),
+        abs(value * self._limits.driver_factor),
+      ) > self._limits.driver_allowance
+
+    driver_interaction = (
+      driver_exceeds_allowance(driver_torque)
+      or driver_exceeds_allowance(self._previous_driver_torque)
+    )
+    if driver_interaction:
+      self._previous_time_s = sample_time_s
+      self._previous_applied = applied_torque
+      self._previous_driver_torque = driver_torque
+      self._magnitude_boundary_value = None
+      self._magnitude_boundary_dwell_s = 0.0
+      return _MeasuredEnvelopeObservation(
+        valid=False,
+        constrained=True,
+        boundary=ActuatorBoundary.DRIVER,
+        magnitude_boundary_dwell_s=0.0,
+      )
+
+    positive = apply_torque_envelope(
+      self._limits,
+      1.0,
+      self._previous_applied,
+      0.0,
+    ).applied_torque
+    negative = apply_torque_envelope(
+      self._limits,
+      -1.0,
+      self._previous_applied,
+      0.0,
+    ).applied_torque
+    lower = min(positive, negative)
+    upper = max(positive, negative)
+    tolerance = self._torque_count_tolerance
+    inside = lower - tolerance <= applied_torque <= upper + tolerance
+    if not inside:
+      self.reset()
+      return _MeasuredEnvelopeObservation(
+        valid=False,
+        constrained=True,
+        boundary=ActuatorBoundary.NONE,
+        magnitude_boundary_dwell_s=0.0,
+      )
+
+    lower_distance = abs(applied_torque - lower)
+    upper_distance = abs(applied_torque - upper)
+    on_boundary = lower_distance <= tolerance or upper_distance <= tolerance
+    boundary = ActuatorBoundary.NONE
+    if on_boundary:
+      if abs(abs(applied_torque) - 1.0) <= tolerance:
+        boundary |= ActuatorBoundary.MAGNITUDE
+
+      magnitude_delta = (
+        abs(applied_torque) - abs(self._previous_applied)
+      )
+      crossed_zero = (
+        applied_torque * self._previous_applied < 0.0
+      )
+      if crossed_zero:
+        # The production sign-crossing limiter spends the frame's budget
+        # decaying the old sign and then building the new sign.
+        boundary |= (
+          ActuatorBoundary.SLEW_RELEASE | ActuatorBoundary.SLEW_BUILD
         )
-        constrained = not inside or on_boundary
+      elif magnitude_delta < -tolerance:
+        boundary |= ActuatorBoundary.SLEW_RELEASE
+      elif magnitude_delta > tolerance:
+        boundary |= ActuatorBoundary.SLEW_BUILD
+
+    if boundary & ActuatorBoundary.MAGNITUDE:
+      if (
+        self._magnitude_boundary_value is not None
+        and abs(
+          applied_torque - self._magnitude_boundary_value
+        ) <= tolerance
+      ):
+        self._magnitude_boundary_dwell_s += dt_s
+      else:
+        self._magnitude_boundary_dwell_s = 0.0
+      self._magnitude_boundary_value = applied_torque
+    else:
+      self._magnitude_boundary_value = None
+      self._magnitude_boundary_dwell_s = 0.0
 
     self._previous_time_s = sample_time_s
     self._previous_applied = applied_torque
-    return constrained
+    self._previous_driver_torque = driver_torque
+    return _MeasuredEnvelopeObservation(
+      valid=True,
+      constrained=on_boundary,
+      boundary=boundary,
+      magnitude_boundary_dwell_s=self._magnitude_boundary_dwell_s,
+    )
 
 
 class PersistentLearningRuntime:
@@ -639,12 +795,17 @@ class PersistentLearningRuntime:
         or bool(self.car_params.steerAtStandstill)
       )
     )
-    actuator_constrained = self.envelope_constraint.update(
+    envelope_observation = self.envelope_constraint.update(
       sample_time_s=sample_time_s,
       applied_torque=frame.applied_torque,
       driver_torque=frame.steering_torque,
-      inputs_valid=numeric_valid and lateral_active,
+      inputs_valid=(
+        numeric_valid
+        and lateral_active
+        and not frame.steering_pressed
+      ),
     )
+    actuator_constrained = envelope_observation.constrained
     self.last_actuator_constrained = actuator_constrained
     live_mapping = self._live_mapping(frame)
     torque_tuning = self.car_params.lateralTuning.torque
@@ -652,7 +813,7 @@ class PersistentLearningRuntime:
       numeric_valid
       and self.last_live_mapping_valid
       and not frame.steering_pressed
-      and not actuator_constrained
+      and envelope_observation.valid
     )
     sample = self.measurement_builder.update(
       sample_time_s=sample_time_s,
@@ -664,14 +825,28 @@ class PersistentLearningRuntime:
       live_mapping=live_mapping,
       nominal_mapping=self.runtime_bundle.nominal_rack_mapping,
       engaged=lateral_active,
-      # Driver interaction and an envelope boundary invalidate derivative
-      # history as well as the current frame. The first clean frame afterward
-      # is therefore warm-up, not a fit of the release transient.
+      # Driver interaction and impossible/out-of-envelope transitions
+      # invalidate derivative history as well as the current frame. A valid
+      # limiter-boundary transition remains measured plant evidence.
       inputs_valid=measurement_inputs_valid,
       steering_pressed=frame.steering_pressed,
       actuator_constrained=actuator_constrained,
       standstill=standstill,
     )
+    if (
+      sample.valid
+      and envelope_observation.boundary != ActuatorBoundary.NONE
+      and not bool(
+        envelope_observation.boundary & ActuatorBoundary.DRIVER
+      )
+    ):
+      sample = _attest_authority_sample(
+        sample,
+        boundary=envelope_observation.boundary,
+        magnitude_boundary_dwell_s=(
+          envelope_observation.magnitude_boundary_dwell_s
+        ),
+      )
     accepted = self.coordinator.ingest(sample)
     self.last_sample_accepted = accepted
     return accepted
@@ -681,9 +856,11 @@ def artifact_paths_for_bundle(
   storage_root: str | os.PathLike[str],
   runtime_bundle: RuntimeVehicleBundle,
 ) -> LearningArtifactPaths:
-  """Keep different detected vehicle/seed bundles in separate directories."""
+  """Separate artifacts by physical runtime and evidence-inclusion policy."""
   return LearningArtifactPaths(
-    Path(storage_root) / runtime_bundle.identity_sha256,
+    Path(storage_root)
+    / runtime_bundle.identity_sha256
+    / FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
   )
 
 

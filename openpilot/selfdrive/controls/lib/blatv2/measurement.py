@@ -8,7 +8,11 @@ convention as the plant.
 Rack acceleration is a timestamped finite difference of the measured steering
 rate. The first sample after startup, disengagement, standstill, invalid input,
 or a dropped-frame gap is marked invalid so a discontinuity cannot become
-false plant excitation. No filtering or desired-path signal is introduced.
+false plant excitation. A valid driver-free actuator-limit boundary remains
+authority evidence because the applied torque is measured; its kind and
+full-magnitude dwell are retained so the learner can distinguish a transient
+from a delay-safe settled input. No filtering or desired-path signal is
+introduced.
 """
 
 from __future__ import annotations

@@ -60,6 +60,16 @@ during a drive. An artifact can actuate only after independent raw/applied
 replay, delivered replay, deterministic A/A, safety, and comma-device timing
 gates all pass.
 
+Torque-envelope boundary frames are retained as incorporated authority
+evidence instead of being discarded as merely constrained. Exact slew-limit
+and full-magnitude transitions are classified from the vehicle's runtime
+`CarControllerParams`; driver-influenced or physically impossible transitions
+remain excluded. Slew and stuck-rack samples inform support without being
+misrepresented as instantaneous equality measurements. Only continuously held
+full torque with measurable rack motion, after the identified transport delay,
+may enter the separate authority fit, and that fit must independently improve
+ordinary and authority held-out validation before it can affect a candidate.
+
 The home-screen learning display reads rebuildable
 `BLaTv2LearningOperationStatus` and `BLaTv2LearningStatus` caches. They clear
 at manager start and are republished only by the offroad owner after validating

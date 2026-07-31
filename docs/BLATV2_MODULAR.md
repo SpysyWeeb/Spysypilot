@@ -218,10 +218,18 @@ constraint. The controller reads the estimate but cannot mutate it.
 
 No managed learner runs onroad. Durable training happens offroad when
 `blatv2_backfilld` replays complete, closed full rlogs containing clean,
-hands-off, unconstrained data. Each node tracks support, excitation,
-validation error, uncertainty, and provenance. The live learner adapter is
-retained only for deterministic offline/harness work and cannot contribute
-field evidence.
+hands-off measured data. A recorded applied-torque transition on the
+vehicle-owned magnitude or slew envelope is retained as authority evidence:
+the emitted torque is known exactly and sharp-turn/breakaway response must not
+be discarded. Slew transients do not enter the instantaneous plant equality.
+Settled full-magnitude motion enters a separate fit stratum only after the
+profile's transport delay, and candidates must not regress either the ordinary
+or authority validation stratum. Until an authority stratum has at least four
+held-out rows, it remains stored but cannot alter fitted parameters.
+Driver-limited and unreachable transitions remain invalid. Each node tracks
+ordinary and authority support, excitation, validation error, uncertainty,
+and provenance. The live learner adapter is retained only for deterministic
+offline/harness work and cannot contribute field evidence.
 
 Initial minimum exposure guidelines are:
 

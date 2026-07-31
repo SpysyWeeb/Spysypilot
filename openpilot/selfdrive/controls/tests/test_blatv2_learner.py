@@ -4,13 +4,16 @@ import math
 import unittest
 
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
+  ActuatorBoundary,
   HIGH_SPEED_MIN_CLEAN_SUPPORT_S,
   LOW_SPEED_MIN_CLEAN_SUPPORT_S,
   MID_SPEED_MIN_CLEAN_SUPPORT_S,
+  MIN_AUTHORITY_VALIDATION_SAMPLES,
   TRAIN_VALIDATION_BLOCK_SAMPLES,
   LearningSample,
   ProfileLearner,
   QualificationReason,
+  _attest_authority_sample,
   learning_sample_field_names,
   minimum_clean_support_s,
 )
@@ -97,6 +100,45 @@ def measured_sample(
   )
 
 
+def settled_authority_sample(
+  *,
+  dwell_s: float,
+  dt_s: float = 0.01,
+  rack_rate_deg_s: float = 8.0,
+  torque_per_lataccel: float = TRUE_TORQUE_PER_LATACCEL,
+  rack_gain: float = TRUE_RACK_GAIN,
+  rack_damping: float = TRUE_RACK_DAMPING,
+  kinetic_friction: float = KINETIC_FRICTION,
+) -> LearningSample:
+  lateral_accel = -1.2
+  rack_acceleration = (
+    (
+      1.0
+      - kinetic_friction
+      + torque_per_lataccel * lateral_accel
+      - rack_damping * rack_rate_deg_s / rack_gain
+    )
+    * rack_gain
+  )
+  return _attest_authority_sample(
+    LearningSample(
+      speed_mps=3.0,
+      dt_s=dt_s,
+      applied_torque=1.0,
+      measured_lateral_accel_mps2=lateral_accel,
+      rack_rate_deg_s=rack_rate_deg_s,
+      rack_acceleration_deg_s2=rack_acceleration,
+      engaged=True,
+      valid=True,
+      steering_pressed=False,
+      actuator_constrained=True,
+      standstill=False,
+    ),
+    boundary=ActuatorBoundary.MAGNITUDE,
+    magnitude_boundary_dwell_s=dwell_s,
+  )
+
+
 def add_qualified_node_data(
   learner: ProfileLearner,
   node_index: int,
@@ -170,6 +212,147 @@ class TestBLaTv2Learner(unittest.TestCase):
       for index in range(len(DEFAULT_SPEED_NODES_MPS))
     )
     self.assertEqual(after, before)
+
+  def test_valid_slew_boundary_is_separate_authority_evidence(self) -> None:
+    first = ProfileLearner(seed_profile())
+    second = ProfileLearner(seed_profile())
+    before = first.evidence_for_node(0).to_bytes()
+
+    for index in range(16):
+      sample = _attest_authority_sample(
+        measured_sample(
+          3.0,
+          index,
+          actuator_constrained=True,
+        ),
+        boundary=ActuatorBoundary.SLEW_BUILD,
+        magnitude_boundary_dwell_s=0.0,
+      )
+      self.assertFalse(sample.clean)
+      self.assertTrue(sample.authority_evidence)
+      self.assertTrue(first.add_sample(sample))
+      self.assertTrue(second.add_sample(sample))
+
+    snapshot = first.evidence_for_node(0)
+    self.assertNotEqual(snapshot.to_bytes(), before)
+    self.assertEqual(snapshot.supported_sample_count, 0)
+    self.assertEqual(snapshot.authority_sample_count, 16)
+    self.assertEqual(snapshot.authority_slew_build_sample_count, 16)
+    self.assertEqual(snapshot.authority_fit_sample_count, 0)
+    encoded = first.export_evidence()
+    self.assertEqual(encoded, second.export_evidence())
+    restored = ProfileLearner.from_evidence(seed_profile(), encoded)
+    self.assertEqual(
+      restored.evidence_for_node(0).to_bytes(),
+      snapshot.to_bytes(),
+    )
+
+  def test_settled_magnitude_motion_enters_authority_fit(self) -> None:
+    learner = ProfileLearner(seed_profile())
+    before_delay = settled_authority_sample(dwell_s=0.129)
+    at_delay = settled_authority_sample(dwell_s=0.13)
+
+    self.assertTrue(before_delay.authority_evidence)
+    self.assertTrue(learner.add_sample(before_delay))
+    self.assertEqual(
+      learner.evidence_for_node(0).authority_fit_sample_count,
+      0,
+    )
+    self.assertTrue(learner.add_sample(at_delay))
+    snapshot = learner.evidence_for_node(0)
+    self.assertEqual(snapshot.authority_magnitude_sample_count, 2)
+    self.assertEqual(snapshot.authority_fit_sample_count, 1)
+    self.assertEqual(snapshot.authority_unresolved_sample_count, 0)
+    self.assertEqual(snapshot.supported_sample_count, 0)
+
+    stuck = settled_authority_sample(
+      dwell_s=0.4,
+      rack_rate_deg_s=0.0,
+    )
+    self.assertTrue(learner.add_sample(stuck))
+    stuck_snapshot = learner.evidence_for_node(0)
+    self.assertEqual(stuck_snapshot.authority_fit_sample_count, 1)
+    self.assertEqual(stuck_snapshot.authority_unresolved_sample_count, 1)
+
+  def test_sparse_authority_fit_cannot_move_unvalidated_candidate(self) -> None:
+    ordinary = ProfileLearner(seed_profile())
+    with_sparse_authority = ProfileLearner(seed_profile())
+    for node_index in range(len(DEFAULT_SPEED_NODES_MPS)):
+      add_qualified_node_data(ordinary, node_index)
+      add_qualified_node_data(with_sparse_authority, node_index)
+    for _ in range(64):
+      self.assertTrue(with_sparse_authority.add_sample(
+        settled_authority_sample(dwell_s=0.2),
+      ))
+
+    baseline = ordinary.qualify("ordinary baseline")
+    candidate = with_sparse_authority.qualify("authority deferred")
+    self.assertIsNotNone(baseline.candidate_profile)
+    self.assertIsNotNone(candidate.candidate_profile)
+    baseline_parameters = tuple(
+      node.parameters for node in baseline.candidate_profile.nodes
+    )
+    candidate_parameters = tuple(
+      node.parameters for node in candidate.candidate_profile.nodes
+    )
+    self.assertEqual(candidate_parameters, baseline_parameters)
+    self.assertFalse(candidate.node_reports[0].authority_fit_active)
+    self.assertEqual(
+      candidate.node_reports[0].authority_training_count,
+      64,
+    )
+    self.assertEqual(
+      candidate.node_reports[0].authority_validation_count,
+      0,
+    )
+
+  def test_authority_fit_activates_only_with_held_out_rows(self) -> None:
+    learner = ProfileLearner(seed_profile())
+    for node_index in range(len(DEFAULT_SPEED_NODES_MPS)):
+      add_qualified_node_data(learner, node_index)
+    for _ in range(
+      TRAIN_VALIDATION_BLOCK_SAMPLES + MIN_AUTHORITY_VALIDATION_SAMPLES
+    ):
+      self.assertTrue(learner.add_sample(
+        settled_authority_sample(dwell_s=0.2),
+      ))
+
+    result = learner.qualify("authority validation ready")
+    report = result.node_reports[0]
+    self.assertTrue(report.authority_fit_active)
+    self.assertEqual(
+      report.authority_training_count,
+      TRAIN_VALIDATION_BLOCK_SAMPLES,
+    )
+    self.assertEqual(
+      report.authority_validation_count,
+      MIN_AUTHORITY_VALIDATION_SAMPLES,
+    )
+    self.assertIsNotNone(report.authority_seed_validation_rms)
+    self.assertIsNotNone(report.authority_candidate_validation_rms)
+
+  def test_authority_validation_regression_blocks_profile(self) -> None:
+    learner = ProfileLearner(seed_profile())
+    for node_index in range(len(DEFAULT_SPEED_NODES_MPS)):
+      add_qualified_node_data(learner, node_index)
+    for _ in range(TRAIN_VALIDATION_BLOCK_SAMPLES):
+      self.assertTrue(learner.add_sample(
+        settled_authority_sample(dwell_s=0.2),
+      ))
+    for _ in range(MIN_AUTHORITY_VALIDATION_SAMPLES):
+      self.assertTrue(learner.add_sample(settled_authority_sample(
+        dwell_s=0.2,
+        torque_per_lataccel=SEED_TORQUE_PER_LATACCEL,
+        rack_gain=SEED_RACK_GAIN,
+        rack_damping=SEED_RACK_DAMPING,
+      )))
+
+    result = learner.qualify("authority held-out regression")
+    self.assertIsNone(result.candidate_profile)
+    self.assertIn(
+      QualificationReason.AUTHORITY_VALIDATION_REGRESSION,
+      result.node_reports[0].reasons,
+    )
 
   def test_sample_supports_only_adjacent_nodes(self) -> None:
     learner = ProfileLearner(seed_profile())
