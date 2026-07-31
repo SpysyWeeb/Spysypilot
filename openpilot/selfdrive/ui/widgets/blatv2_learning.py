@@ -934,7 +934,10 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
       return "WAITING"
     if "invalid_parameters" in node.reasons:
       return "REJECTED"
-    if "validation_regression" in node.reasons:
+    if (
+      "validation_regression" in node.reasons
+      or "authority_validation_regression" in node.reasons
+    ):
       return "REGRESSED"
     if "singular_fit" in node.reasons:
       return "UNSTABLE"

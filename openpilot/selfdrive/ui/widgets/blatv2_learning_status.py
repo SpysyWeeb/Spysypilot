@@ -138,6 +138,7 @@ _REASONS = frozenset((
   "singular_fit",
   "invalid_parameters",
   "validation_regression",
+  "authority_validation_regression",
 ))
 _REASON_LABELS = {
   "qualified": "Qualified",
@@ -147,12 +148,16 @@ _REASON_LABELS = {
   "singular_fit": "Fit not identifiable",
   "invalid_parameters": "Rejected: invalid fit",
   "validation_regression": "Rejected: validation regressed",
+  "authority_validation_regression": (
+    "Rejected: authority validation regressed"
+  ),
 }
 _REASON_PRIORITY = (
   "insufficient_support",
   "insufficient_validation",
   "insufficient_excitation",
   "invalid_parameters",
+  "authority_validation_regression",
   "validation_regression",
   "singular_fit",
   "qualified",
