@@ -136,6 +136,26 @@ def _test_real_palisade_uses_detected_opendbc_facts(
 
   friction = float(palisade_cp.lateralTuning.torque.friction)
   delay = float(palisade_cp.steerActuatorDelay)
+  assert not bundle.calibration_seed_profile.qualified
+  assert all(
+    not node.parameters.qualified
+    for node in bundle.calibration_seed_profile.nodes
+  )
+  for node in bundle.calibration_seed_profile.nodes:
+    parameters = node.parameters
+    assert parameters.torque_per_lateral_accel == expected_slope
+    assert parameters.lateral_accel_offset_correction_mps2 == 0.0
+    # This is already normalized torque in current opendbc. A callback-slope
+    # multiplication here would silently shrink or enlarge breakaway support.
+    assert parameters.static_breakaway_torque == friction
+    assert parameters.kinetic_friction_torque == friction
+    assert parameters.transport_delay_s == delay
+    assert (
+      parameters.rack_rate_resolution_deg_s
+      == source_limits.BLATV2_RACK_RATE_RESOLUTION_DEG_S
+    )
+    assert not hasattr(parameters, "rack_gain_deg_s2_per_torque")
+    assert not hasattr(parameters, "rack_damping_per_s")
   assert not bundle.seed_profile.qualified
   assert all(not node.parameters.qualified for node in bundle.seed_profile.nodes)
   assert all(node.sample_count == 0 for node in bundle.seed_profile.nodes)
@@ -387,11 +407,135 @@ def _test_bundle_json_and_identity_are_deterministic(
   first = build_palisade(palisade_cp, rack_dynamics)
   second = build_palisade(palisade_cp, rack_dynamics)
   assert first == second
+  assert first.to_dict()["schema_version"] == 1
+  assert "calibration_seed_profile" not in first.to_dict()
   assert first.to_json() == second.to_json()
   assert first.identity_sha256 == second.identity_sha256
+  assert (
+    first.calibration_identity_sha256
+    == second.calibration_identity_sha256
+  )
   assert first.identity_sha256 == hashlib.sha256(
     first.to_json().encode("utf-8"),
   ).hexdigest()
+
+  changed_legacy_dynamics = build_palisade(
+    palisade_cp,
+    ProvisionalRackDynamics(
+      rack_gain_deg_s2_per_torque=(
+        rack_dynamics.rack_gain_deg_s2_per_torque * 2.0
+      ),
+      rack_damping_per_s=rack_dynamics.rack_damping_per_s + 1.0,
+      rack_rate_resolution_deg_s=(
+        rack_dynamics.rack_rate_resolution_deg_s
+      ),
+      provenance="different retired rack seed",
+    ),
+  )
+  assert changed_legacy_dynamics.identity_sha256 != first.identity_sha256
+  assert (
+    changed_legacy_dynamics.calibration_identity_sha256
+    == first.calibration_identity_sha256
+  )
+  assert (
+    first.calibration_identity_dict()["calibration_seed_profile"]
+    == first.calibration_seed_profile.to_dict()
+  )
+
+
+def _test_calibration_identity_tracks_stock_lateral_accel_offset(
+  palisade_cp,
+  rack_dynamics,
+) -> None:
+  baseline = build_palisade(palisade_cp, rack_dynamics)
+  changed_cp = palisade_cp.copy()
+  changed_cp.lateralTuning.torque.latAccelOffset = (
+    float(palisade_cp.lateralTuning.torque.latAccelOffset) + 0.125
+  )
+  changed = build_palisade(changed_cp, rack_dynamics)
+
+  assert baseline.stock_lateral_accel_offset_mps2 == float(
+    palisade_cp.lateralTuning.torque.latAccelOffset,
+  )
+  assert changed.stock_lateral_accel_offset_mps2 == float(
+    changed_cp.lateralTuning.torque.latAccelOffset,
+  )
+  assert "stock_lateral_accel_offset_mps2" not in baseline.to_dict()
+  assert baseline.to_dict() == changed.to_dict()
+  assert baseline.identity_sha256 == changed.identity_sha256
+  assert (
+    baseline.calibration_identity_sha256
+    != changed.calibration_identity_sha256
+  )
+
+
+def _test_unverified_calibration_identity_excludes_provisional_rack_dynamics(
+  palisade_cp,
+) -> None:
+  controller_params = SimpleNamespace(
+    STEER_MAX=137,
+    STEER_DELTA_UP=6,
+    STEER_DELTA_DOWN=9,
+    STEER_STEP=2,
+    STEER_DRIVER_ALLOWANCE=17,
+    STEER_DRIVER_MULTIPLIER=3,
+    STEER_DRIVER_FACTOR=2,
+  )
+
+  def callback(lateral_accel, _torque_tuning):
+    return 0.25 * lateral_accel
+
+  first_dynamics = ProvisionalRackDynamics(
+    rack_gain_deg_s2_per_torque=4000.0,
+    rack_damping_per_s=10.0,
+    rack_rate_resolution_deg_s=4.0,
+    provenance="first provisional rack dynamics",
+  )
+  changed_dynamics = ProvisionalRackDynamics(
+    rack_gain_deg_s2_per_torque=8000.0,
+    rack_damping_per_s=25.0,
+    rack_rate_resolution_deg_s=4.0,
+    provenance="second provisional rack dynamics",
+  )
+  first = build_palisade(
+    palisade_cp,
+    first_dynamics,
+    car_interface_or_callback=callback,
+    controller_params=controller_params,
+    vehicle_identity="unverified-calibration-platform",
+  )
+  changed = build_palisade(
+    palisade_cp,
+    changed_dynamics,
+    car_interface_or_callback=callback,
+    controller_params=controller_params,
+    vehicle_identity="unverified-calibration-platform",
+  )
+
+  assert first.identity_sha256 != changed.identity_sha256
+  assert first.calibration_identity_sha256 == changed.calibration_identity_sha256
+  assert first.calibration_seed_profile.provenance.endswith(
+    "rack_rate_resolution_source=provisional",
+  )
+  assert first_dynamics.provenance not in first.calibration_seed_profile.provenance
+  assert changed_dynamics.provenance not in changed.calibration_seed_profile.provenance
+
+  changed_resolution = build_palisade(
+    palisade_cp,
+    ProvisionalRackDynamics(
+      rack_gain_deg_s2_per_torque=first_dynamics.rack_gain_deg_s2_per_torque,
+      rack_damping_per_s=first_dynamics.rack_damping_per_s,
+      rack_rate_resolution_deg_s=5.0,
+      provenance="resolution-only provisional change",
+    ),
+    car_interface_or_callback=callback,
+    controller_params=controller_params,
+    vehicle_identity="unverified-calibration-platform",
+  )
+  assert (
+    first.calibration_identity_sha256
+    != changed_resolution.calibration_identity_sha256
+  )
 
 
 def _test_committed_provisional_seed_is_explicit_and_unqualified(
@@ -461,6 +605,19 @@ class TestBlatV2RuntimeVehicle(unittest.TestCase):
     _test_real_palisade_uses_detected_opendbc_facts(
       self.palisade_cp,
       self.rack_dynamics,
+    )
+
+  def test_calibration_identity_tracks_stock_lateral_accel_offset(self):
+    _test_calibration_identity_tracks_stock_lateral_accel_offset(
+      self.palisade_cp,
+      self.rack_dynamics,
+    )
+
+  def test_unverified_calibration_identity_excludes_provisional_rack_dynamics(
+    self,
+  ):
+    _test_unverified_calibration_identity_excludes_provisional_rack_dynamics(
+      self.palisade_cp,
     )
 
   def test_alternate_limits_and_linear_callback_propagate_generically(self):

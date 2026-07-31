@@ -32,43 +32,35 @@ LQI means “Linear Quadratic Integral”: state feedback plus an integral-error
 state. The replacement is a ground-up, modular adaptive torque controller
 whose target is **Smooth. Swift. Strong.**
 
-The system separates model-time intent, a stateless future reference, measured
-rack mapping, physical plant/inverse torque, the exact opendbc command
-envelope, invalid-output safety, offline shadow measurement, and speed-local
-learning from closed full rlogs. Each owner has a narrow interface so it can
-be audited, tuned, or replaced without layering a compensating controller on
-another controller.
+This milestone deliberately has no approved learned profile or calibration
+activation path. The active lateral controller remains the exact current stock
+`LatControlTorque`, and no BLaTv2 helper runs onroad. On the validated
+Palisade/Telluride platform that stock request uses the vehicle-selected
+409/4/7 opendbc/panda envelope; other vehicles keep their own stock limits.
 
-This first merged build deliberately contains no approved learned profile.
-Consequently, its active lateral controller is the byte-identical current
-stock openpilot `LatControlTorque`. No BLaTv2 helper process runs while the
-car is onroad. Normal loggerd full rlogs retain the measured inputs, and the
-real-car offroad worker replays only complete, closed routes after logger
-finalization. On the validated Palisade/Telluride platform, the stock request
-uses the platform-selected 409/4/7 opendbc and panda envelope. Other vehicles
-retain their stock limits and stock controller until their own opendbc port
-validates the full command-envelope and rack-sensor contract.
+After logger closure, the offroad-only `blatv2_backfilld` replays compatible
+complete full rlogs twice. It commits evidence only when both passes agree
+bit-for-bit. Learning is measured-response-only at 0/5/10/15/20/30 m/s, and a
+sample updates only neighboring nodes, so highway mileage cannot overwrite
+low-speed knowledge. The current `complete_full_rlog_authority_v3` namespace
+starts empty and never migrates or rewrites retired v1/v2 evidence.
 
-Learning is measured-response-only and speed-local. Evidence at one speed
-updates only neighboring speed nodes, so highway mileage cannot overwrite
-low-speed knowledge. `blatv2_backfilld` is the sole durable writer: it checks
-exact route/build/vehicle compatibility, replays each eligible batch twice,
-and commits only bit-identical results. Compatible older full-rlog routes can
-be imported; qlogs, open/incomplete routes, and unreviewed builds cannot.
-Candidates require enough evidence in every speed region and never change
-during a drive. An artifact can actuate only after independent raw/applied
-replay, delivered replay, deterministic A/A, safety, and comma-device timing
-gates all pass.
+The retired dynamic-rack learner is replaced by an observable inverse-torque
+fit: torque per measured lateral acceleration, a signed acceleration-offset
+correction, moving friction, and static breakaway. Base, moving, breakaway,
+held-out validation, and vehicle-owned full-authority evidence remain separate.
+The deterministic constrained solve enforces non-negative gain/friction and
+`static >= kinetic` by re-solving active constraint faces, not by clipping.
+`static == kinetic` explicitly means normal driving did not resolve extra
+breakaway. Slew transitions and a stuck rack remain authority observations;
+only settled full torque with resolved rack motion may join the equality fit.
 
-Torque-envelope boundary frames are retained as incorporated authority
-evidence instead of being discarded as merely constrained. Exact slew-limit
-and full-magnitude transitions are classified from the vehicle's runtime
-`CarControllerParams`; driver-influenced or physically impossible transitions
-remain excluded. Slew and stuck-rack samples inform support without being
-misrepresented as instantaneous equality measurements. Only continuously held
-full torque with measurable rack motion, after the identified transport delay,
-may enter the separate authority fit, and that fit must independently improve
-ordinary and authority held-out validation before it can affect a candidate.
+A candidate file is emitted only if every node has enough independent evidence
+and beats or matches its seed on every applicable held-out population. It is
+still informational and cannot populate `BLaTv2ApprovedArtifact`, stage a
+controller, or change stock selection. Any future consumer requires separate
+raw/applied/delivered replay, deterministic A/A, safety, and device-timing
+review.
 
 The home-screen learning display reads rebuildable
 `BLaTv2LearningOperationStatus` and `BLaTv2LearningStatus` caches. They clear
@@ -94,15 +86,20 @@ pages: **BLaTv2 Learning**, **Readiness & Activation**, the existing live
 terminal, and the existing system-usage view. The five old route-analyzer
 pages and their `drive_statsd` service have been removed.
 
-The Learning page shows credited clean support for every data-driven speed
-node and now distinguishes active offroad processing from an empty evidence
-set. The Readiness page keeps time, held-out validation, steering excitation,
-physical-fit state, and controller lifecycle visibly separate. Blue means
-processing, amber means enough time but another evidence gate is blocked,
-green means a node qualified, red is reserved for a real fit/lifecycle
-failure, and gray means no current validated snapshot. A complete learned
-profile never implies activation; this build reports stock until a separately
-reviewed activation path exists.
+The Learning page distinguishes active processing from an empty evidence set
+and shows overall plus last-drive progress, with base/moving/breakaway/
+authority populations at each speed node. Readiness shows independent motion,
+breakaway, validation, and authority state and, when a fit exists, compact
+gain/offset/kinetic/static values. A complete calibration never implies
+activation; the lifecycle rail reports stock until a separately reviewed
+activation path exists.
+
+The pre-merge b2-b7 production replay was bit-identical across both passes:
+evidence `8f67d9c41d9669f1a82f7abbe4f841c70434403a7235ad4236d3964fca40b81a`,
+manifest `cc8e5387f8c83c6efc57b37e2bbe7d4d2e4651a985d1815d3483ebdd9c29b0d`.
+Nodes 10 and 15 m/s qualified; 5 m/s was withheld by its independent authority
+validation, while 0, 20, and 30 m/s remained evidence-limited or regressing.
+No candidate was emitted.
 
 ## To-Do
 
@@ -130,14 +127,11 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 
   Offroad learning now exposes display-only progress for both deterministic replay passes, including route and segment position, route-application stages, and a conservative ETA once enough read/apply timing samples exist. Progress is never consumed by learning, evidence, candidate selection, or control.
 
-  Evidence v2 reconstructs vehicle-generic signed rack motion without changing
-  its measured magnitude: platforms with unsigned rate sensors derive direction
-  from the offset-corrected steering angle, and physical reversals count toward
-  speed-local coverage without fitting the sign-crossing acceleration impulse.
-  Applied torque is paired causally using the previous `carOutput` publication
-  and the speed-interpolated seed transport delay. Existing v1 artifacts remain
-  byte-for-byte untouched while retained full rlogs replay into an initially
-  empty v2 namespace.
+  Evidence v3 keeps signed rack reconstruction and causal prior-`carOutput`
+  alignment, but replaces the unidentifiable rack-dynamics fit with observable
+  gain, signed offset, moving friction, and breakaway populations. Existing v1
+  and v2 artifacts remain byte-for-byte untouched while retained compatible
+  full rlogs replay into an initially empty v3 namespace.
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

@@ -230,7 +230,7 @@ class BlatV2BackfillDaemon:
     limits = current_runtime.runtime_bundle.torque_limits
     rack_resolutions = {
       float(node.parameters.rack_rate_resolution_deg_s)
-      for node in current_runtime.runtime_bundle.seed_profile.nodes
+      for node in current_runtime.runtime_bundle.calibration_seed_profile.nodes
     }
     if len(rack_resolutions) != 1:
       raise BackfillError(

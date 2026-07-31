@@ -1,0 +1,437 @@
+"""Lifecycle and persistence boundary for observable BLaTv2 calibration.
+
+This module is deliberately parallel to the retired physical-profile learning
+coordinator.  Onroad code may only accumulate measured response in memory.
+Finalization and all filesystem writes are offroad-only, and the manifest is
+written last so it acts as the commit record for the independently atomic
+evidence and optional candidate files.
+
+The coordinator can create an *unapproved* candidate only after every speed
+node qualifies.  It has no API for approval, activation, controller selection,
+or mutation of the profile used by a live controller.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields, is_dataclass
+from enum import Enum, StrEnum
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import tempfile
+
+from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CALIBRATION_EVIDENCE_SCHEMA_VERSION,
+  CalibrationLearningResult,
+  CalibrationProfileLearner,
+  calibration_evidence_sha256,
+  minimum_calibration_support_s,
+)
+from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
+  VehicleCalibrationProfile,
+)
+from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
+
+
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 4
+# Short alias retained for callers that treat this as the only calibration
+# coordinator. Both names identify the same wire artifact, never two schemas.
+CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
+
+
+class CalibrationLearningLifecycleState(StrEnum):
+  OFFROAD = "offroad"
+  ONROAD = "onroad"
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationNodeSupportDiagnostic:
+  """Independent support populations for one speed-local calibration node."""
+
+  node_index: int
+  speed_mps: float
+  minimum_base_support_s: float
+  clean_support_s: float
+  supported_sample_count: int
+  base_support_s: float
+  base_sample_count: int
+  training_support_s: float
+  training_count: int
+  validation_support_s: float
+  validation_count: int
+  moving_support_s: float
+  moving_sample_count: int
+  moving_training_support_s: float
+  moving_training_count: int
+  moving_validation_support_s: float
+  moving_validation_count: int
+  breakaway_support_s: float
+  breakaway_sample_count: int
+  breakaway_training_support_s: float
+  breakaway_training_count: int
+  breakaway_validation_support_s: float
+  breakaway_validation_count: int
+  authority_support_s: float
+  authority_sample_count: int
+  authority_magnitude_sample_count: int
+  authority_slew_build_sample_count: int
+  authority_slew_release_sample_count: int
+  authority_unresolved_sample_count: int
+  authority_fit_support_s: float
+  authority_fit_sample_count: int
+  authority_training_support_s: float
+  authority_training_count: int
+  authority_validation_support_s: float
+  authority_validation_count: int
+  lateral_accel_span_mps2: float
+  applied_torque_span: float
+  lateral_accel_directions: int
+  applied_torque_directions: int
+  rack_reversals: int
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationLearningFinalization:
+  """Canonical evidence, qualification manifest, and optional full profile."""
+
+  manifest_bytes: bytes
+  manifest_sha256: str
+  evidence_bytes: bytes
+  evidence_sha256: str
+  candidate_profile_json: bytes | None
+  candidate_profile_sha256: str | None
+  learning_result: CalibrationLearningResult
+
+  @property
+  def all_nodes_qualified(self) -> bool:
+    return self.candidate_profile_json is not None
+
+
+def _canonical_json_bytes(payload: object) -> bytes:
+  return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _profile_bytes(profile: VehicleCalibrationProfile) -> bytes:
+  return profile.to_json().encode("utf-8")
+
+
+def _profile_sha256(profile: VehicleCalibrationProfile) -> str:
+  return hashlib.sha256(_profile_bytes(profile)).hexdigest()
+
+
+def _finite_float_hex(value: float, field_name: str) -> str:
+  numeric = float(value)
+  if not math.isfinite(numeric):
+    raise ValueError(f"{field_name} must be finite")
+  return numeric.hex()
+
+
+def _manifest_value(value: object, field_name: str) -> object:
+  """Encode a report value without losing a single deterministic field.
+
+  Qualification reports are an audit surface.  Walking their dataclass fields
+  keeps the manifest faithful when a measured-evidence diagnostic is added,
+  while the explicit legacy-name guard prevents retired rack dynamics from
+  silently re-entering the observable-calibration contract.
+  """
+  if value is None or isinstance(value, (str, bool, int)):
+    return value
+  if isinstance(value, float):
+    return _finite_float_hex(value, field_name)
+  if isinstance(value, Enum):
+    return value.value
+  if isinstance(value, (tuple, list)):
+    return [_manifest_value(item, f"{field_name}[]") for item in value]
+  if is_dataclass(value) and not isinstance(value, type):
+    encoded: dict[str, object] = {}
+    for report_field in fields(value):
+      name = report_field.name
+      lowered = name.lower()
+      if any(term in lowered for term in ("rack_gain", "rack_damping", "rack_acceleration", "plant_dynamics")):
+        raise ValueError(f"retired rack-dynamics field is forbidden in calibration manifest: {name}")
+      encoded[name] = _manifest_value(getattr(value, name), f"{field_name}.{name}")
+    return encoded
+  raise TypeError(f"{field_name} has unsupported manifest type {type(value).__name__}")
+
+
+def _qualification_manifest(report: object) -> dict[str, object]:
+  encoded = _manifest_value(report, "node_report")
+  if not isinstance(encoded, dict):
+    raise TypeError("calibration qualification report must be a dataclass")
+  reasons = encoded.get("reasons")
+  if not isinstance(reasons, list) or not all(isinstance(reason, str) for reason in reasons):
+    raise ValueError("calibration qualification reasons are malformed")
+  encoded["moving_reasons"] = [reason for reason in reasons if "moving" in reason]
+  encoded["breakaway_reasons"] = [reason for reason in reasons if "breakaway" in reason]
+  # These fields are the semantic distinction from the physical-profile fit.
+  required = {
+    "base_support_s",
+    "base_sample_count",
+    "moving_support_s",
+    "moving_sample_count",
+    "moving_reasons",
+    "moving_seed_validation_rms",
+    "moving_candidate_validation_rms",
+    "breakaway_support_s",
+    "breakaway_sample_count",
+    "breakaway_reasons",
+    "breakaway_seed_validation_rms",
+    "breakaway_candidate_validation_rms",
+  }
+  missing = required - encoded.keys()
+  if missing:
+    raise ValueError(f"calibration qualification report is incomplete: missing={sorted(missing)}")
+  return encoded
+
+
+def _atomic_write_bytes(path: str | os.PathLike[str], encoded: bytes) -> None:
+  """Atomically replace one artifact and durably commit its directory entry."""
+  if type(encoded) is not bytes:
+    raise TypeError("atomic calibration artifact must be bytes")
+  target = Path(path)
+  parent = target.parent
+  temporary_fd, temporary_name = tempfile.mkstemp(
+    dir=parent,
+    prefix=f".{target.name}.",
+    suffix=".tmp",
+  )
+  try:
+    with os.fdopen(temporary_fd, "wb") as temporary:
+      temporary_fd = -1
+      temporary.write(encoded)
+      temporary.flush()
+      os.fsync(temporary.fileno())
+    os.replace(temporary_name, target)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(parent, directory_flags)
+    try:
+      os.fsync(directory_fd)
+    finally:
+      os.close(directory_fd)
+  except BaseException:
+    if temporary_fd >= 0:
+      os.close(temporary_fd)
+    try:
+      os.unlink(temporary_name)
+    except FileNotFoundError:
+      pass
+    raise
+
+
+class CalibrationLearningCoordinator:
+  """Measured-only in-memory learner with an offroad persistence boundary."""
+
+  def __init__(
+    self,
+    seed_profile: VehicleCalibrationProfile,
+    evidence_bytes: bytes | None = None,
+    *,
+    candidate_provenance: str = "measured observable casual-driving evidence",
+  ) -> None:
+    if not isinstance(seed_profile, VehicleCalibrationProfile):
+      raise TypeError("calibration coordinator requires a VehicleCalibrationProfile")
+    provenance = str(candidate_provenance).strip()
+    if not provenance:
+      raise ValueError("candidate provenance must not be empty")
+
+    self._learner = CalibrationProfileLearner(seed_profile) if evidence_bytes is None else CalibrationProfileLearner.from_evidence(seed_profile, evidence_bytes)
+    self._seed_profile = seed_profile
+    self._candidate_provenance = provenance
+    self._state = CalibrationLearningLifecycleState.OFFROAD
+    self._ingested_sample_count = 0
+    self._clean_sample_count = 0
+    self._accepted_sample_count = 0
+    self._evidence_generation = 0
+    self._finalized_generation = -1
+    self._cached_finalization: CalibrationLearningFinalization | None = None
+
+  @property
+  def state(self) -> CalibrationLearningLifecycleState:
+    return self._state
+
+  @property
+  def vehicle_identity(self) -> str:
+    return self._seed_profile.vehicle_identity
+
+  @property
+  def seed_profile_sha256(self) -> str:
+    return _profile_sha256(self._seed_profile)
+
+  @property
+  def ingested_sample_count(self) -> int:
+    return self._ingested_sample_count
+
+  @property
+  def clean_sample_count(self) -> int:
+    return self._clean_sample_count
+
+  @property
+  def accepted_sample_count(self) -> int:
+    return self._accepted_sample_count
+
+  @property
+  def rejected_sample_count(self) -> int:
+    return self._ingested_sample_count - self._accepted_sample_count
+
+  @property
+  def support_diagnostics(self) -> tuple[CalibrationNodeSupportDiagnostic, ...]:
+    diagnostics: list[CalibrationNodeSupportDiagnostic] = []
+    for node_index, speed_mps in enumerate(self._learner.speed_nodes_mps):
+      evidence = self._learner.evidence_for_node(node_index)
+      diagnostics.append(
+        CalibrationNodeSupportDiagnostic(
+          node_index=node_index,
+          speed_mps=speed_mps,
+          minimum_base_support_s=minimum_calibration_support_s(speed_mps),
+          clean_support_s=evidence.clean_support_s,
+          supported_sample_count=evidence.supported_sample_count,
+          base_support_s=evidence.base_support_s,
+          base_sample_count=evidence.base_sample_count,
+          training_support_s=evidence.training_support_s,
+          training_count=evidence.training_count,
+          validation_support_s=evidence.validation_support_s,
+          validation_count=evidence.validation_count,
+          moving_support_s=evidence.moving_support_s,
+          moving_sample_count=evidence.moving_sample_count,
+          moving_training_support_s=evidence.moving_training_support_s,
+          moving_training_count=evidence.moving_training_count,
+          moving_validation_support_s=evidence.moving_validation_support_s,
+          moving_validation_count=evidence.moving_validation_count,
+          breakaway_support_s=evidence.breakaway_support_s,
+          breakaway_sample_count=evidence.breakaway_sample_count,
+          breakaway_training_support_s=evidence.breakaway_training_support_s,
+          breakaway_training_count=evidence.breakaway_training_count,
+          breakaway_validation_support_s=evidence.breakaway_validation_support_s,
+          breakaway_validation_count=evidence.breakaway_validation_count,
+          authority_support_s=evidence.authority_support_s,
+          authority_sample_count=evidence.authority_sample_count,
+          authority_magnitude_sample_count=evidence.authority_magnitude_sample_count,
+          authority_slew_build_sample_count=evidence.authority_slew_build_sample_count,
+          authority_slew_release_sample_count=evidence.authority_slew_release_sample_count,
+          authority_unresolved_sample_count=evidence.authority_unresolved_sample_count,
+          authority_fit_support_s=evidence.authority_fit_support_s,
+          authority_fit_sample_count=evidence.authority_fit_sample_count,
+          authority_training_support_s=evidence.authority_training_support_s,
+          authority_training_count=evidence.authority_training_count,
+          authority_validation_support_s=evidence.authority_validation_support_s,
+          authority_validation_count=evidence.authority_validation_count,
+          lateral_accel_span_mps2=evidence.lateral_accel_span_mps2,
+          applied_torque_span=evidence.applied_torque_span,
+          lateral_accel_directions=evidence.lateral_accel_directions,
+          applied_torque_directions=evidence.applied_torque_directions,
+          rack_reversals=evidence.rack_reversals,
+        )
+      )
+    return tuple(diagnostics)
+
+  def transition_onroad(self) -> None:
+    if self._state is not CalibrationLearningLifecycleState.OFFROAD:
+      raise RuntimeError("calibration coordinator is already onroad")
+    self._learner.reset_route_transients()
+    self._state = CalibrationLearningLifecycleState.ONROAD
+
+  def transition_offroad(self) -> None:
+    if self._state is not CalibrationLearningLifecycleState.ONROAD:
+      raise RuntimeError("calibration coordinator is already offroad")
+    self._learner.reset_route_transients()
+    self._state = CalibrationLearningLifecycleState.OFFROAD
+
+  def ingest(self, sample: LearningSample) -> bool:
+    """Accumulate measured response in memory; never write or activate."""
+    if self._state is not CalibrationLearningLifecycleState.ONROAD:
+      raise RuntimeError("calibration samples may be ingested only while onroad")
+    if not isinstance(sample, LearningSample):
+      raise TypeError("calibration coordinator requires a measured-only LearningSample")
+
+    self._ingested_sample_count += 1
+    accepted = self._learner.add_sample(sample)
+    if accepted:
+      # Inverse calibration legitimately retains signed reversal rows even
+      # though legacy ``LearningSample.clean`` excludes them for its dynamic
+      # acceleration fit. Authority observations remain a separate population.
+      if not sample.authority_evidence:
+        self._clean_sample_count += 1
+      self._accepted_sample_count += 1
+      self._evidence_generation += 1
+      self._cached_finalization = None
+      self._finalized_generation = -1
+    return accepted
+
+  def finalize(self) -> CalibrationLearningFinalization:
+    """Export canonical evidence and an optional all-node candidate offroad."""
+    if self._state is not CalibrationLearningLifecycleState.OFFROAD:
+      raise RuntimeError("calibration may be finalized only while offroad")
+    if self._cached_finalization is not None and self._finalized_generation == self._evidence_generation:
+      return self._cached_finalization
+
+    evidence_bytes = self._learner.export_evidence()
+    evidence_identity = calibration_evidence_sha256(evidence_bytes)
+    result = self._learner.qualify(self._candidate_provenance)
+    candidate = result.candidate_profile
+    if bool(candidate is not None) != bool(result.all_nodes_qualified):
+      raise ValueError("calibration learner candidate completeness is inconsistent")
+    if candidate is not None and (
+      not candidate.qualified or candidate.vehicle_identity != self.vehicle_identity or candidate.schema_version != self._seed_profile.schema_version
+    ):
+      raise ValueError("calibration learner emitted an incompatible candidate profile")
+    candidate_json = None if candidate is None else _profile_bytes(candidate)
+    candidate_identity = None if candidate_json is None else hashlib.sha256(candidate_json).hexdigest()
+    candidate_manifest: dict[str, object] | None = None
+    if candidate is not None:
+      candidate_manifest = {
+        "profile_sha256": candidate_identity,
+        "provenance": candidate.provenance,
+        "revision": candidate.revision,
+        "schema_version": candidate.schema_version,
+      }
+
+    manifest = {
+      "all_nodes_qualified": result.all_nodes_qualified,
+      "artifact_schema_version": CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
+      "candidate_profile": candidate_manifest,
+      "evidence_schema_version": CALIBRATION_EVIDENCE_SCHEMA_VERSION,
+      "evidence_sha256": evidence_identity,
+      "node_reports": [_qualification_manifest(report) for report in result.node_reports],
+      "seed_profile_revision": self._seed_profile.revision,
+      "seed_profile_schema_version": self._seed_profile.schema_version,
+      "seed_profile_sha256": self.seed_profile_sha256,
+      "vehicle_identity": self.vehicle_identity,
+    }
+    manifest_bytes = _canonical_json_bytes(manifest)
+    finalization = CalibrationLearningFinalization(
+      manifest_bytes=manifest_bytes,
+      manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+      evidence_bytes=evidence_bytes,
+      evidence_sha256=evidence_identity,
+      candidate_profile_json=candidate_json,
+      candidate_profile_sha256=candidate_identity,
+      learning_result=result,
+    )
+    self._cached_finalization = finalization
+    self._finalized_generation = self._evidence_generation
+    return finalization
+
+  def persist_finalized(
+    self,
+    *,
+    evidence_path: str | os.PathLike[str],
+    manifest_path: str | os.PathLike[str],
+    candidate_profile_path: str | os.PathLike[str] | None = None,
+  ) -> CalibrationLearningFinalization:
+    """Persist evidence/candidate atomically, then commit their manifest last."""
+    if self._state is not CalibrationLearningLifecycleState.OFFROAD:
+      raise RuntimeError("calibration artifacts may be written only while offroad")
+    finalization = self.finalize()
+    if candidate_profile_path is not None and finalization.candidate_profile_json is None:
+      raise RuntimeError("partial calibration evidence cannot emit a candidate profile")
+
+    _atomic_write_bytes(evidence_path, finalization.evidence_bytes)
+    if candidate_profile_path is not None:
+      candidate_json = finalization.candidate_profile_json
+      if candidate_json is None:
+        raise AssertionError("candidate profile disappeared after preflight")
+      _atomic_write_bytes(candidate_profile_path, candidate_json)
+    _atomic_write_bytes(manifest_path, finalization.manifest_bytes)
+    return finalization

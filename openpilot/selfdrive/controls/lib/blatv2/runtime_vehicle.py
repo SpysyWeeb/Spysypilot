@@ -24,6 +24,10 @@ from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   RuntimeTorqueLimits,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
+  VehicleCalibrationProfile,
+  make_calibration_seed_profile,
+)
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
 )
@@ -34,6 +38,7 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 
 
 RUNTIME_VEHICLE_SCHEMA_VERSION = 1
+CALIBRATION_RUNTIME_IDENTITY_SCHEMA_VERSION = 1
 PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION = 1
 # This multiplier admits only accumulated binary64/API representation error.
 # It is not a steering tolerance or feel dial.
@@ -177,7 +182,9 @@ class RuntimeVehicleBundle:
   provisional_rack_provenance: str
   torque_limits: RuntimeTorqueLimits
   nominal_rack_mapping: RackMappingSnapshot
+  calibration_seed_profile: VehicleCalibrationProfile
   seed_profile: VehicleProfile
+  stock_lateral_accel_offset_mps2: float
   torque_callback_slope: float
   torque_callback_max_abs_residual: float
   torque_callback_representation_tolerance: float
@@ -236,6 +243,47 @@ class RuntimeVehicleBundle:
       sort_keys=True,
       separators=(",", ":"),
     )
+
+  def calibration_identity_dict(self) -> dict[str, Any]:
+    """Return only facts that can change observable calibration evidence.
+
+    The retired rack-gain/damping seed remains in ``to_dict`` for legacy
+    controller-artifact compatibility, but it is deliberately absent here.
+    Changing an unidentifiable provisional rack model must not invalidate or
+    fork an otherwise identical inverse-torque evidence set.
+    """
+    payload = self.to_dict()
+    return {
+      "calibration_identity_schema_version": (
+        CALIBRATION_RUNTIME_IDENTITY_SCHEMA_VERSION
+      ),
+      "calibration_seed_profile": (
+        self.calibration_seed_profile.to_dict()
+      ),
+      "car_fingerprint": payload["car_fingerprint"],
+      "nominal_rack_mapping": payload["nominal_rack_mapping"],
+      "stock_lateral_accel_offset_mps2": (
+        self.stock_lateral_accel_offset_mps2
+      ),
+      "torque_callback_max_abs_residual": (
+        payload["torque_callback_max_abs_residual"]
+      ),
+      "torque_callback_representation_tolerance": (
+        payload["torque_callback_representation_tolerance"]
+      ),
+      "torque_callback_slope": payload["torque_callback_slope"],
+      "torque_limits": payload["torque_limits"],
+      "vehicle_identity": payload["vehicle_identity"],
+    }
+
+  @property
+  def calibration_identity_sha256(self) -> str:
+    encoded = json.dumps(
+      self.calibration_identity_dict(),
+      sort_keys=True,
+      separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
   @property
   def identity_sha256(self) -> str:
@@ -562,10 +610,16 @@ def build_runtime_vehicle_bundle(
 
   torque_tuning = car_params.lateralTuning.torque
   friction = float(torque_tuning.friction)
+  stock_lateral_accel_offset = float(torque_tuning.latAccelOffset)
   if not math.isfinite(friction) or friction < 0.0:
     _fail(
       RuntimeVehicleCompatibility.INVALID_VEHICLE_CALIBRATION,
       "stock normalized friction must be finite and non-negative",
+    )
+  if not math.isfinite(stock_lateral_accel_offset):
+    _fail(
+      RuntimeVehicleCompatibility.INVALID_VEHICLE_CALIBRATION,
+      "stock lateral-acceleration offset must be finite",
     )
   callback = _resolve_torque_callback(car_interface_or_callback)
   verified_mapping = _verify_linear_torque_mapping(
@@ -585,6 +639,32 @@ def build_runtime_vehicle_bundle(
     static_friction_torque=friction,
     kinetic_friction_torque=friction,
     rack_rate_resolution_deg_s=rack_rate_resolution,
+  )
+  calibration_seed_profile = make_calibration_seed_profile(
+    vehicle_identity=identity,
+    torque_callback_slope=verified_mapping.slope,
+    # opendbc currently stores this value in normalized-torque space. Its
+    # stock friction helper temporarily converts it to lateral acceleration,
+    # and the torque callback converts it back before actuation.
+    stock_friction_torque=friction,
+    transport_delay_s=delay,
+    rack_rate_resolution_deg_s=rack_rate_resolution,
+  )
+  calibration_rack_resolution_source = (
+    "provisional"
+    if rack_resolution_source.startswith("provisional:")
+    else rack_resolution_source
+  )
+  calibration_seed_profile = VehicleCalibrationProfile(
+    vehicle_identity=calibration_seed_profile.vehicle_identity,
+    revision=calibration_seed_profile.revision,
+    provenance="; ".join((
+      "unqualified observable detected-opendbc calibration seed",
+      f"car_fingerprint={car_fingerprint}",
+      f"rack_rate_resolution_source={calibration_rack_resolution_source}",
+    )),
+    nodes=calibration_seed_profile.nodes,
+    schema_version=calibration_seed_profile.schema_version,
   )
   seed_profile = VehicleProfile(
     vehicle_identity=base_seed.vehicle_identity,
@@ -606,7 +686,9 @@ def build_runtime_vehicle_bundle(
     ),
     torque_limits=limits,
     nominal_rack_mapping=nominal_mapping,
+    calibration_seed_profile=calibration_seed_profile,
     seed_profile=seed_profile,
+    stock_lateral_accel_offset_mps2=stock_lateral_accel_offset,
     torque_callback_slope=verified_mapping.slope,
     torque_callback_max_abs_residual=(
       verified_mapping.max_abs_residual

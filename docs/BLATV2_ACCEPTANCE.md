@@ -70,7 +70,8 @@ offroad importer below.
 
 Training and artifact writes occur only offroad. `blatv2_backfilld` is the
 sole durable evidence writer. Evidence is bound to the vehicle identity,
-speed-node grid, seed profile, profile schema, and learner schema.
+speed-node grid, observable calibration seed, profile schema, and learner
+schema.
 
 The importer accepts only complete, closed full rlogs; qlogs are insufficient.
 It may discover routes recorded before the importer existed, but each route
@@ -85,13 +86,37 @@ late-skipped route to its content and disposition so a route is never counted
 twice. Publication writes a complete immutable generation before atomically
 switching its `CURRENT` pointer.
 
+The current observable-calibration contract is profile schema 2, evidence
+schema 5, coordinator artifact schema 4, and namespace
+`complete_full_rlog_authority_v3`. It starts from empty evidence. Retired v1
+and v2 artifact bytes are immutable and cannot be migrated into v3.
+
 Each speed node independently requires its documented clean support,
-excitation, chronological train/validation split, physically valid fit, and
-held-out improvement. Samples affect only adjacent interpolation nodes.
-Consequently, extended highway use cannot overwrite low-speed evidence.
+bidirectional excitation, chronological train/validation split, valid inverse
+torque fit, and held-out improvement. Base, resolved-motion, first-motion-after
+dwell (breakaway), and actuator-authority populations remain distinguishable.
+Slew and stationary-full-torque observations cannot become equality-fit rows;
+settled full magnitude may join only with resolved rack motion. Samples affect
+only adjacent interpolation nodes. Consequently, extended highway use cannot
+overwrite low-speed evidence.
+
+The candidate may contain only torque per lateral acceleration, signed
+lateral-acceleration offset correction, moving friction, and static breakaway,
+plus seed delay/rate-resolution metadata. Casual driving may not promote rack
+gain, rack damping, or another unidentifiable transient parameter. Changing
+the retired provisional dynamics cannot change calibration identity.
+The observable fit is constrained by construction to positive gain,
+non-negative moving friction, and static breakaway no smaller than moving
+friction. A boundary solution is re-solved on that physical face and remains
+visible as `static == kinetic`; post-fit clipping is forbidden.
 
 A candidate profile is emitted only when every required node qualifies.
 Partial profiles remain evidence, not control artifacts.
+
+Learning-status schema 2 is a strict display projection of those exact
+populations and candidate values. Legacy rack-fit fields or an unknown schema
+fail closed in the UI. The cache remains informational and has no approval or
+activation authority.
 
 `BLaTv2LearningOperationStatus` may expose logger finalization, historical
 scanning/replay progress, and terminal diagnostics. No managed onroad process
@@ -141,9 +166,15 @@ The modular candidate must improve the intended failure class without
 regressing another core value. “Smooth. Swift. Strong.” is a joint contract,
 not a weighted score that permits trading one word away.
 
-## Activation and rollback gate
+## Future-only activation and rollback gate
 
-An exact profile hash may be staged only when raw/applied replay,
+The current observable-learning milestone does not execute this section. Its
+all-node candidate is informational and hash-addressed only; it cannot write
+`BLaTv2ApprovedArtifact`, stage a controller, or change stock selection. This
+section pins the acceptance contract for a separately reviewed future
+consumer.
+
+An exact profile hash may eventually be staged only when raw/applied replay,
 delivered-curvature replay, deterministic A/A, comma-device timing, and
 safety approval all identify that same hash and source pair. Each result is a
 separate fail-closed field in the canonical approval artifact; omitted,
