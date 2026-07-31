@@ -12,6 +12,7 @@ from unittest.mock import patch
 from openpilot.selfdrive.controls.lib.blatv2 import learning_backfill
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BACKFILL_COMMIT_SCHEMA_VERSION,
+  CANONICAL_JOIN_SCHEMA_VERSION,
   BACKFILL_LEDGER_SCHEMA_VERSION,
   BACKFILL_POINTER_SCHEMA_VERSION,
   BackfillError,
@@ -22,8 +23,12 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   load_ledger,
   publish_generation,
 )
-from openpilot.selfdrive.controls.lib.blatv2.learner import LearningResult
+from openpilot.selfdrive.controls.lib.blatv2.learner import (
+  LEARNING_EVIDENCE_SCHEMA_VERSION,
+  LearningResult,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
+  LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
   LearningFinalization,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
@@ -99,7 +104,7 @@ def replay_result(
     disposition="ingested",
     diagnostic="ingested",
     provenance={
-      "canonical_join_schema_version": 1,
+      "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
       "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
       "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
       "extractor_schema_version": 1,
@@ -141,6 +146,19 @@ def publish(
 
 
 class TestBLaTv2BackfillGeneration(unittest.TestCase):
+  def test_signed_causal_learning_contract_versions_move_together(
+    self,
+  ) -> None:
+    self.assertEqual(
+      (
+        LEARNING_EVIDENCE_SCHEMA_VERSION,
+        LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
+        CANONICAL_JOIN_SCHEMA_VERSION,
+        FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
+      ),
+      (4, 3, 2, "complete_full_rlog_authority_v2"),
+    )
+
   def test_inclusion_policy_namespace_ignores_legacy_runtime_root(
     self,
   ) -> None:
@@ -157,6 +175,39 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       (legacy_root / "backfill_current.json").write_bytes(legacy_pointer)
       (legacy_root / "evidence.json").write_bytes(legacy_evidence)
       (legacy_root / "manifest.json").write_bytes(legacy_manifest)
+      predecessor_namespace = (
+        legacy_root / "complete_full_rlog_authority_v1"
+      )
+      predecessor_namespace.mkdir()
+      predecessor_pointer = canonical_json_bytes({
+        "generation_sha256": hashlib.sha256(
+          b"predecessor-generation",
+        ).hexdigest(),
+        "schema_version": BACKFILL_POINTER_SCHEMA_VERSION,
+      })
+      predecessor_evidence = b'{"v1":"evidence"}'
+      predecessor_manifest = b'{"v1":"manifest"}'
+      (predecessor_namespace / "backfill_current.json").write_bytes(
+        predecessor_pointer,
+      )
+      (predecessor_namespace / "evidence.json").write_bytes(
+        predecessor_evidence,
+      )
+      (predecessor_namespace / "manifest.json").write_bytes(
+        predecessor_manifest,
+      )
+      predecessor_generation = (
+        predecessor_namespace / "generations" / "frozen-v1"
+      )
+      predecessor_generation.mkdir(parents=True)
+      (predecessor_generation / "commit.json").write_bytes(
+        b'{"v1":"commit"}',
+      )
+      predecessor_before = {
+        path.relative_to(predecessor_namespace): path.read_bytes()
+        for path in predecessor_namespace.rglob("*")
+        if path.is_file()
+      }
 
       paths = artifact_paths_for_bundle(
         storage_root,
@@ -188,6 +239,33 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
         (legacy_root / "manifest.json").read_bytes(),
         legacy_manifest,
       )
+      self.assertEqual(
+        (
+          predecessor_namespace / "backfill_current.json"
+        ).read_bytes(),
+        predecessor_pointer,
+      )
+      self.assertEqual(
+        (predecessor_namespace / "evidence.json").read_bytes(),
+        predecessor_evidence,
+      )
+      self.assertEqual(
+        (predecessor_namespace / "manifest.json").read_bytes(),
+        predecessor_manifest,
+      )
+
+      publish(
+        paths,
+        make_finalization("v2"),
+        empty_ledger(),
+      )
+      self.assertTrue(paths.backfill_pointer.is_file())
+      predecessor_after = {
+        path.relative_to(predecessor_namespace): path.read_bytes()
+        for path in predecessor_namespace.rglob("*")
+        if path.is_file()
+      }
+      self.assertEqual(predecessor_after, predecessor_before)
 
   def test_publish_is_content_addressed_and_hash_bound(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:

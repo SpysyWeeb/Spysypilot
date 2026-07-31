@@ -12,8 +12,10 @@ For each speed node, moving-rack samples fit the linear inverse plant
     + rack_damping * rack_rate / rack_gain
     + kinetic_friction * sign(rack_rate)
 
-using deterministic scalar normal equations. Static friction, transport
-delay, and measured rack-rate resolution remain exactly the seed values.
+using deterministic scalar normal equations. Applied torque is causally
+aligned to rack response with the immutable seed transport delay before a row
+reaches this module. Static friction, transport delay, and measured rack-rate
+resolution remain exactly the seed values.
 Moving friction is independently fit from already-moving samples. A candidate
 must improve or match the complete seed model on held-out chronological
 blocks. Driver-free limiter boundaries are retained separately: slew
@@ -82,7 +84,7 @@ VALIDATION_RMS_ABSOLUTE_TOLERANCE = 1e-12
 
 # Evidence is not a learned profile. This independent schema identifies the
 # exact sufficient statistics needed to continue fitting across drives.
-LEARNING_EVIDENCE_SCHEMA_VERSION = 3
+LEARNING_EVIDENCE_SCHEMA_VERSION = 4
 
 _EMPTY_POSITIVE_SENTINEL = {"empty": "positive_infinity"}
 _EMPTY_NEGATIVE_SENTINEL = {"empty": "negative_infinity"}
@@ -132,6 +134,9 @@ class LearningSample:
   steering_pressed: bool
   actuator_constrained: bool
   standstill: bool
+  # A signed physical reversal is valid coverage evidence, but the
+  # quantized sign-crossing acceleration is not a plant-regression row.
+  rack_direction_reversal: bool = False
   actuator_boundary: ActuatorBoundary = field(
     default=ActuatorBoundary.NONE,
     init=False,
@@ -184,6 +189,7 @@ class LearningSample:
     """Whether this sample may enter the unconstrained equality regression."""
     return (
       self._base_valid
+      and not self.rack_direction_reversal
       and not self.actuator_constrained
       and self.actuator_boundary == ActuatorBoundary.NONE
       and self.magnitude_boundary_dwell_s == 0.0
@@ -194,6 +200,7 @@ class LearningSample:
     """Whether this is valid, driver-free vehicle-boundary evidence."""
     return (
       self._base_valid
+      and not self.rack_direction_reversal
       and self._authority_attested
       and self.actuator_constrained
       and self.actuator_boundary != ActuatorBoundary.NONE
@@ -1295,6 +1302,54 @@ class ProfileLearner:
 
   def add_sample(self, sample: LearningSample) -> bool:
     """Add one measured sample to its physical or authority evidence stratum."""
+    if (
+      not sample.valid
+      or not sample.engaged
+      or sample.steering_pressed
+      or sample.standstill
+    ):
+      # Rack direction is meaningful only within one uninterrupted measured
+      # lifecycle. A gap, driver override, fault, disengagement, or derivative
+      # warm-up must not turn the first motion of the next epoch into a
+      # fabricated reversal.
+      for node in self._nodes:
+        node.last_rack_direction = 0
+      return False
+    if sample.rack_direction_reversal:
+      # Direction belongs to this uninterrupted measured lifecycle, but
+      # differentiating a quantized rate through its sign crossing would
+      # create a false acceleration impulse. Retain only speed-local reversal
+      # coverage and never admit this frame to either equality fit.
+      if not sample._base_valid:
+        for node in self._nodes:
+          node.last_rack_direction = 0
+        return False
+      accepted = False
+      for node_index, node_weight in self._node_support(sample.speed_mps):
+        if node_weight < MIN_EXCITATION_NODE_WEIGHT:
+          continue
+        node = self._nodes[node_index]
+        seed = self.seed_profile.nodes[node_index].parameters
+        motion_threshold = max(
+          seed.rack_rate_resolution_deg_s, 1e-12,
+        )
+        rack_direction = (
+          1
+          if sample.rack_rate_deg_s >= motion_threshold
+          else -1
+          if sample.rack_rate_deg_s <= -motion_threshold
+          else 0
+        )
+        if rack_direction == 0:
+          continue
+        if (
+          node.last_rack_direction != 0
+          and rack_direction != node.last_rack_direction
+        ):
+          node.rack_reversals += 1
+        node.last_rack_direction = rack_direction
+        accepted = True
+      return accepted
     if not sample.clean and not sample.authority_evidence:
       return False
 
@@ -1319,7 +1374,7 @@ class ProfileLearner:
         settled_magnitude = (
           sample.actuator_boundary == ActuatorBoundary.MAGNITUDE
           and sample.magnitude_boundary_dwell_s + 1e-12
-          >= seed.transport_delay_s + sample.dt_s
+          >= sample.dt_s
         )
         if settled_magnitude and (
           abs(sample.rack_rate_deg_s) > motion_threshold
@@ -1381,9 +1436,9 @@ class ProfileLearner:
         )
         rack_direction = (
           1
-          if sample.rack_rate_deg_s > motion_threshold
+          if sample.rack_rate_deg_s >= motion_threshold
           else -1
-          if sample.rack_rate_deg_s < -motion_threshold
+          if sample.rack_rate_deg_s <= -motion_threshold
           else 0
         )
         if rack_direction != 0:

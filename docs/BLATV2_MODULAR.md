@@ -222,14 +222,33 @@ hands-off measured data. A recorded applied-torque transition on the
 vehicle-owned magnitude or slew envelope is retained as authority evidence:
 the emitted torque is known exactly and sharp-turn/breakaway response must not
 be discarded. Slew transients do not enter the instantaneous plant equality.
-Settled full-magnitude motion enters a separate fit stratum only after the
-profile's transport delay, and candidates must not regress either the ordinary
-or authority validation stratum. Until an authority stratum has at least four
-held-out rows, it remains stored but cannot alter fitted parameters.
+The learner retains controls-witness, response, torque-report, and
+torque-effective clocks independently. Because `carOutput` carries the prior
+card-cycle result, its payload is effective at the preceding publication.
+Response at `t` uses the newest exact zero-order-held torque effective no later
+than `t - profile_transport_delay(speed)`; response physics and speed-node
+weights stay at `t`. Settled full-magnitude motion enters a separate fit
+stratum after one aligned response interval of command-side dwell, and
+candidates must not regress either the ordinary or authority validation
+stratum. Until an authority stratum has at least four held-out rows, it
+remains stored but cannot alter fitted parameters.
 Driver-limited and unreachable transitions remain invalid. Each node tracks
 ordinary and authority support, excitation, validation error, uncertainty,
 and provenance. The live learner adapter is retained only for deterministic
 offline/harness work and cannot contribute field evidence.
+
+The learner uses one vehicle-generic signed rack coordinate. Native negative
+rate values prove a signed source. Otherwise the raw rate remains a magnitude
+and offset-corrected measured steering-angle motion establishes and
+revalidates direction without changing that magnitude. A physical reversal
+contributes speed-local direction coverage while its quantized sign-crossing
+acceleration is excluded from regression. Exact zero clears unsigned-source
+sign inference. A lifecycle break, source gap, driver override, standstill,
+fault, or failed rack mapping clears cross-frame reversal continuity.
+Evidence schema v4, coordinator artifact schema v3, canonical join schema v2,
+and inclusion namespace `complete_full_rlog_authority_v2` bind this contract.
+The authenticated v1 namespace is preserved unchanged; retained full rlogs
+are replayed into an initially empty v2 ledger.
 
 Initial minimum exposure guidelines are:
 

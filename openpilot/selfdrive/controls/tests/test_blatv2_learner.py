@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import unittest
 
@@ -173,6 +174,7 @@ class TestBLaTv2Learner(unittest.TestCase):
       "steering_pressed",
       "actuator_constrained",
       "standstill",
+      "rack_direction_reversal",
     ))
     self.assertFalse(any("desired" in name for name in names))
     self.assertFalse(any("candidate" in name for name in names))
@@ -247,18 +249,96 @@ class TestBLaTv2Learner(unittest.TestCase):
       snapshot.to_bytes(),
     )
 
+  def test_lifecycle_break_cannot_fabricate_rack_reversal(self) -> None:
+    learner = ProfileLearner(seed_profile())
+    self.assertTrue(learner.add_sample(measured_sample(3.0, 1)))
+    self.assertFalse(learner.add_sample(measured_sample(
+      3.0,
+      2,
+      valid=False,
+    )))
+    self.assertTrue(learner.add_sample(measured_sample(3.0, 0)))
+    self.assertEqual(learner.evidence_for_node(0).rack_reversals, 0)
+
+    # A real opposite-direction clean sample in the same epoch still counts.
+    self.assertTrue(learner.add_sample(measured_sample(3.0, 1)))
+    self.assertEqual(learner.evidence_for_node(0).rack_reversals, 1)
+
+  def test_sensor_quantum_motion_counts_for_reversal_coverage(self) -> None:
+    learner = ProfileLearner(seed_profile())
+
+    def sample(rate: float) -> LearningSample:
+      return LearningSample(
+        speed_mps=3.0,
+        dt_s=0.01,
+        applied_torque=0.0,
+        measured_lateral_accel_mps2=0.0,
+        rack_rate_deg_s=rate,
+        rack_acceleration_deg_s2=0.0,
+        engaged=True,
+        valid=True,
+        steering_pressed=False,
+        actuator_constrained=False,
+        standstill=False,
+      )
+
+    self.assertTrue(learner.add_sample(sample(RATE_RESOLUTION)))
+    self.assertTrue(learner.add_sample(sample(-RATE_RESOLUTION)))
+    evidence = learner.evidence_for_node(0)
+    self.assertEqual(evidence.rack_reversals, 1)
+    # Equality at the resolution quantum establishes excitation direction but
+    # remains excluded from the strict moving-rack regression population.
+    self.assertEqual(
+      evidence.training_values[-1] + evidence.validation_values[-1],
+      0.0,
+    )
+
+  def test_reversal_coverage_never_enters_regression(self) -> None:
+    learner = ProfileLearner(seed_profile())
+    forward = LearningSample(
+      speed_mps=3.0,
+      dt_s=0.01,
+      applied_torque=0.1,
+      measured_lateral_accel_mps2=0.4,
+      rack_rate_deg_s=8.0,
+      rack_acceleration_deg_s2=20.0,
+      engaged=True,
+      valid=True,
+      steering_pressed=False,
+      actuator_constrained=False,
+      standstill=False,
+    )
+    reversal = replace(
+      forward,
+      rack_rate_deg_s=-8.0,
+      rack_acceleration_deg_s2=0.0,
+      rack_direction_reversal=True,
+    )
+
+    self.assertTrue(learner.add_sample(forward))
+    before = learner.evidence_for_node(0)
+    self.assertTrue(learner.add_sample(reversal))
+    after = learner.evidence_for_node(0)
+    self.assertEqual(after.rack_reversals, before.rack_reversals + 1)
+    self.assertEqual(
+      after.supported_sample_count,
+      before.supported_sample_count,
+    )
+    self.assertEqual(after.training_values, before.training_values)
+    self.assertEqual(after.validation_values, before.validation_values)
+
   def test_settled_magnitude_motion_enters_authority_fit(self) -> None:
     learner = ProfileLearner(seed_profile())
-    before_delay = settled_authority_sample(dwell_s=0.129)
-    at_delay = settled_authority_sample(dwell_s=0.13)
+    before_response_interval = settled_authority_sample(dwell_s=0.009)
+    at_response_interval = settled_authority_sample(dwell_s=0.01)
 
-    self.assertTrue(before_delay.authority_evidence)
-    self.assertTrue(learner.add_sample(before_delay))
+    self.assertTrue(before_response_interval.authority_evidence)
+    self.assertTrue(learner.add_sample(before_response_interval))
     self.assertEqual(
       learner.evidence_for_node(0).authority_fit_sample_count,
       0,
     )
-    self.assertTrue(learner.add_sample(at_delay))
+    self.assertTrue(learner.add_sample(at_response_interval))
     snapshot = learner.evidence_for_node(0)
     self.assertEqual(snapshot.authority_magnitude_sample_count, 2)
     self.assertEqual(snapshot.authority_fit_sample_count, 1)

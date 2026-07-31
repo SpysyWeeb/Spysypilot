@@ -301,6 +301,16 @@ class TestBLaTv2LearningStore(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "evidence schema"):
       ProfileLearner.from_evidence(profile, version_two_evidence)
 
+    version_three_evidence = resign(
+      encoded,
+      lambda payload: payload.__setitem__(
+        "evidence_schema_version",
+        3,
+      ),
+    )
+    with self.assertRaisesRegex(ValueError, "evidence schema"):
+      ProfileLearner.from_evidence(profile, version_three_evidence)
+
     wrong_profile_schema = resign(
       encoded,
       lambda payload: payload.__setitem__(

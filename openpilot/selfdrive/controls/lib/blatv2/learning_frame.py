@@ -26,6 +26,7 @@ def _copy_message(message: Any) -> Any:
 class CanonicalSourceSnapshot:
   message: Any
   mono_ns: int
+  previous_mono_ns: int | None
   valid: bool
   alive: bool
 
@@ -50,22 +51,55 @@ class CanonicalSourceHistory:
     timestamp = int(mono_ns)
     if timestamp <= 0:
       return
-    snapshot = CanonicalSourceSnapshot(
-      message=_copy_message(message),
-      mono_ns=timestamp,
-      valid=bool(valid),
-      alive=bool(alive),
-    )
+    copied_message = _copy_message(message)
     if self._current is None or timestamp > self._current.mono_ns:
       self._previous = self._current
-      self._current = snapshot
+      self._current = CanonicalSourceSnapshot(
+        message=copied_message,
+        mono_ns=timestamp,
+        previous_mono_ns=(
+          None if self._previous is None else self._previous.mono_ns
+        ),
+        valid=bool(valid),
+        alive=bool(alive),
+      )
     elif timestamp == self._current.mono_ns:
-      self._current = snapshot
+      self._current = CanonicalSourceSnapshot(
+        message=copied_message,
+        mono_ns=timestamp,
+        previous_mono_ns=self._current.previous_mono_ns,
+        valid=bool(valid),
+        alive=bool(alive),
+      )
     elif (
       self._previous is None
       or timestamp >= self._previous.mono_ns
     ):
-      self._previous = snapshot
+      # A late, out-of-order source publication can still be the canonical
+      # predecessor of the current snapshot. Insert it into timestamp order:
+      # its predecessor is the formerly retained previous snapshot, while it
+      # becomes the current snapshot's predecessor. An equal-timestamp
+      # replacement retains the already-established predecessor.
+      if self._previous is None:
+        previous_mono_ns = None
+      elif timestamp == self._previous.mono_ns:
+        previous_mono_ns = self._previous.previous_mono_ns
+      else:
+        previous_mono_ns = self._previous.mono_ns
+      self._previous = CanonicalSourceSnapshot(
+        message=copied_message,
+        mono_ns=timestamp,
+        previous_mono_ns=previous_mono_ns,
+        valid=bool(valid),
+        alive=bool(alive),
+      )
+      self._current = CanonicalSourceSnapshot(
+        message=self._current.message,
+        mono_ns=self._current.mono_ns,
+        previous_mono_ns=timestamp,
+        valid=self._current.valid,
+        alive=self._current.alive,
+      )
 
   def select(
     self,
@@ -104,14 +138,34 @@ def maximum_source_age_ns(service: str) -> int:
 def measured_learning_frame(
   *,
   witness_mono_ns: int,
+  car_state_mono_ns: int,
+  car_output_mono_ns: int,
+  previous_car_output_mono_ns: int | None,
   car_state: Any,
   car_control: Any,
   car_output: Any,
   live_parameters: Any,
 ) -> MeasuredLearningFrame:
-  """Copy only measured response and validity facts into learner input."""
+  """Copy measured response plus its source clocks into learner input.
+
+  ``carOutput`` publishes the actuator result from the preceding card cycle.
+  Its effective command time is therefore the preceding carOutput publication
+  timestamp, while ``car_output_mono_ns`` remains the report identity used for
+  duplicate detection. No source clock is replaced by controlsState time.
+  """
+  witness = int(witness_mono_ns)
+  response = int(car_state_mono_ns)
+  applied_report = int(car_output_mono_ns)
+  applied_effective = (
+    0
+    if previous_car_output_mono_ns is None
+    else int(previous_car_output_mono_ns)
+  )
   return MeasuredLearningFrame(
-    sample_mono_ns=int(witness_mono_ns),
+    sample_mono_ns=witness,
+    response_mono_ns=response,
+    applied_report_mono_ns=applied_report,
+    applied_effective_mono_ns=applied_effective,
     speed_mps=float(car_state.vEgo),
     steering_angle_deg=float(car_state.steeringAngleDeg),
     steering_rate_deg_s=float(car_state.steeringRateDeg),
@@ -135,5 +189,13 @@ def measured_learning_frame(
     steer_ratio=float(live_parameters.steerRatio),
     stiffness_factor=float(live_parameters.stiffnessFactor),
     roll_rad=float(live_parameters.roll),
-    inputs_valid=True,
+    inputs_valid=(
+      witness > 0
+      and 0 < response <= witness
+      and 0 < applied_report <= witness
+      and (
+        applied_effective == 0
+        or 0 < applied_effective < applied_report
+      )
+    ),
   )
