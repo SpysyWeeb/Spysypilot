@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest  # noqa: TID251
 
+from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
+  RouteCandidate,
+  RouteSegment,
+  _BackfillProgressTracker,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
   BACKFILL_PROGRESS_PARAM,
   BACKFILL_PROGRESS_SCHEMA_VERSION,
@@ -197,3 +204,96 @@ def test_publisher_binds_operation_and_allows_pass_two_route_reset() -> None:
 
   publisher.clear()
   assert BACKFILL_PROGRESS_PARAM not in params.values
+
+
+def test_tracker_counts_each_completed_segment_before_next_read() -> None:
+  segments = (
+    RouteSegment(
+      index=0,
+      path=Path("/route/rlog--00"),
+      sha256="2" * 64,
+      size_bytes=10,
+    ),
+    RouteSegment(
+      index=1,
+      path=Path("/route/rlog--01"),
+      sha256="3" * 64,
+      size_bytes=20,
+    ),
+  )
+  route = RouteCandidate(
+    route_name="00000001--0000000001",
+    route_counter=1,
+    segments=segments,
+  )
+  params = FakeParams()
+  publisher = BackfillProgressPublisher(
+    params,
+    monotonic_ns=iter((100, 200)).__next__,
+  )
+  tracker = _BackfillProgressTracker(
+    routes=(route,),
+    operation_status=SimpleNamespace(last_payload=operation()),
+    publisher=publisher,
+    abort_requested=lambda: False,
+    monotonic_ns=iter((1_000, 2_000, 3_000)).__next__,
+  )
+
+  tracker.segment_started(
+    pass_index=1,
+    route=route,
+    segment=segments[0],
+    segment_index=1,
+    segment_count=2,
+  )
+  tracker.segment_completed(
+    pass_index=1,
+    route=route,
+    segment=segments[0],
+    segment_index=1,
+    segment_count=2,
+  )
+  tracker.segment_started(
+    pass_index=1,
+    route=route,
+    segment=segments[1],
+    segment_index=2,
+    segment_count=2,
+  )
+
+  latest = params.values[BACKFILL_PROGRESS_PARAM]
+  assert type(latest) is dict
+  assert latest["completed_replay_segment_count"] == 1
+  assert latest["completed_work_units"] == 10
+  assert latest["current_segment_index"] == 2
+
+
+def test_eta_requires_three_independent_samples_and_uses_medians() -> None:
+  segment = RouteSegment(
+    index=0,
+    path=Path("/route/rlog--00"),
+    sha256="2" * 64,
+    size_bytes=30,
+  )
+  tracker = _BackfillProgressTracker(
+    routes=(RouteCandidate(
+      route_name="00000001--0000000001",
+      route_counter=1,
+      segments=(segment,),
+    ),),
+    operation_status=SimpleNamespace(last_payload=operation()),
+    publisher=BackfillProgressPublisher(FakeParams()),
+    abort_requested=lambda: False,
+  )
+  tracker._completed_read_units = 10
+  tracker._read_rates = [1.0, 3.0]
+  tracker._apply_rates = [4.0, 6.0]
+
+  assert tracker._remaining_seconds() is None
+
+  tracker._read_rates.append(2.0)
+  tracker._apply_rates.append(2.0)
+
+  # Two passes contain 60 read and 60 apply byte-units. Ten read units are
+  # complete, so median rates produce 50*2 + 60*4 = 340 seconds.
+  assert tracker._remaining_seconds() == 340

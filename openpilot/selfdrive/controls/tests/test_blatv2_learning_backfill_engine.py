@@ -58,6 +58,30 @@ class FakeParams:
     self.values.pop(key, None)
 
 
+class FaultInjectedProgressParams(FakeParams):
+  def __init__(self, failure_mode: str) -> None:
+    super().__init__()
+    self.failure_mode = failure_mode
+    self.remove_count = 0
+
+  def put(
+    self,
+    key: str,
+    value: dict[str, object],
+    *,
+    block: bool,
+  ) -> None:
+    if self.failure_mode == "put":
+      raise OSError("injected display-only progress write failure")
+    super().put(key, value, block=block)
+
+  def remove(self, key: str) -> None:
+    self.remove_count += 1
+    if self.failure_mode == "final_clear" and self.remove_count >= 2:
+      raise OSError("injected display-only progress clear failure")
+    super().remove(key)
+
+
 def descriptor() -> BuildDescriptor:
   return BuildDescriptor(
     superproject_commit="1" * 40,
@@ -396,6 +420,71 @@ def test_progress_reports_both_passes_without_double_counting(
   assert operation_updates[-1]["accepted_sample_count"] == 2
 
 
+def test_rejected_route_resolves_progress_without_eta_samples(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  log_root = tmp_path / "logs"
+  rejected_name, _ = add_route(log_root, 0x10, segment_count=2)
+  add_route(log_root, 0x20)
+  engine, params, _, _ = make_engine(
+    tmp_path,
+    monkeypatch,
+    with_progress=True,
+  )
+  original_prepare = engine._prepare
+
+  def reject_first_route(runtime, route, **kwargs):
+    if route.route_name == rejected_name:
+      kwargs["segment_started"](
+        route.segments[0],
+        1,
+        len(route.segments),
+      )
+      raise RouteRejected(
+        "invalid_route_version",
+        "representative rejection after one segment began",
+      )
+    return original_prepare(runtime, route, **kwargs)
+
+  engine._prepare = reject_first_route
+  result = engine.run_once()
+
+  assert result.publication is not None
+  assert result.publication.diagnostic == (
+    "backfill_complete_with_rejections"
+  )
+  updates = [
+    value
+    for key, value, _ in params.puts
+    if key == BACKFILL_PROGRESS_PARAM
+  ]
+  good_route_starts = [
+    value
+    for value in updates
+    if (
+      value["phase"] == "reading_segment"
+      and value["current_route_index"] == 2
+      and value["current_segment_index"] == 1
+    )
+  ]
+  assert [value["completed_replay_segment_count"] for value in good_route_starts] == [
+    2,
+    5,
+  ]
+  assert all(
+    value["approximate_remaining_seconds"] is None
+    for value in updates
+    if value["phase"] in {"reading_segment", "applying_route"}
+  )
+  assert updates[-1]["completed_replay_segment_count"] == updates[-1][
+    "total_replay_segment_count"
+  ]
+  assert updates[-1]["completed_work_units"] == updates[-1][
+    "total_work_units"
+  ]
+
+
 def test_progress_projection_does_not_change_replay_artifacts(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
@@ -433,6 +522,55 @@ def test_progress_projection_does_not_change_replay_artifacts(
   assert observed.publication.ledger_sha256 == (
     baseline.publication.ledger_sha256
   )
+
+
+@pytest.mark.parametrize("failure_mode", ("put", "final_clear"))
+def test_broken_progress_projection_is_fail_open(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  failure_mode: str,
+) -> None:
+  baseline_root = tmp_path / "baseline"
+  add_route(baseline_root / "logs", 0x10, segment_count=2)
+  baseline_engine, _, _, baseline_runtime_factory = make_engine(
+    baseline_root,
+    monkeypatch,
+  )
+  baseline = baseline_engine.run_once()
+  assert baseline.publication is not None
+  baseline_runtime = baseline_runtime_factory()
+  baseline_ledger = baseline_runtime.artifact_paths.backfill_ledger.read_bytes()
+
+  observed_root = tmp_path / "observed"
+  add_route(observed_root / "logs", 0x10, segment_count=2)
+  observed_engine, operation_params, _, observed_runtime_factory = (
+    make_engine(
+      observed_root,
+      monkeypatch,
+    )
+  )
+  observed_engine.backfill_progress = BackfillProgressPublisher(
+    FaultInjectedProgressParams(failure_mode),
+  )
+  observed = observed_engine.run_once()
+  assert observed.publication is not None
+  observed_runtime = observed_runtime_factory()
+  observed_ledger = observed_runtime.artifact_paths.backfill_ledger.read_bytes()
+
+  assert observed.publication.finalization == (
+    baseline.publication.finalization
+  )
+  assert observed_ledger == baseline_ledger
+  assert observed.publication.generation_sha256 == (
+    baseline.publication.generation_sha256
+  )
+  assert observed.publication.ledger_sha256 == (
+    baseline.publication.ledger_sha256
+  )
+  operation = operation_params.values[LEARNING_OPERATION_STATUS_PARAM]
+  assert type(operation) is dict
+  assert operation["state"] == "idle"
+  assert operation["terminal"] is True
 
 
 def test_publication_plus_locked_route_leaves_truthful_finalizing_status(
