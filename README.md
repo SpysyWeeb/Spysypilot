@@ -101,6 +101,27 @@ learning process runs during the drive. After the route is closed,
 `blatv2_backfilld` replays its complete full rlog twice and atomically commits
 evidence only if both replays and all compatibility checks agree. It is the
 sole managed BLaTv2 process and the sole durable learning writer.
+
+**Two-worker backfill is in progress pending an on-device resource check.** The
+offroad importer runs its two already-required deterministic replay passes in
+separate forked processes with independent replay state. Each pass reads,
+decodes, joins, and learns the complete canonical route stream, so the
+CPU-heavy Python work—not only native decompression—can occupy two cores. The
+verification worker has no durable-writer authority; the parent alone compares
+both results, extends the ledger, and atomically publishes. No prepared data or
+mutable learner state is shared.
+The existing progress UI is deliberately unchanged: it projects the primary
+pass, then moves to verification while the independently reconstructed pass
+finishes. Production remains fixed at two workers. A future four-worker step
+requires bounded route spooling plus device measurements of elapsed time,
+process-group peak memory, storage contention, thermals, responsiveness, and
+identical hashes; it is not enabled by this change.
+On the 21-segment `000000b7--a6b3b1f175` reference route, the same desktop
+host completed the two passes in 17.594 s serially and 9.717 s with two
+workers (1.81x), with identical evidence, manifest, and ledger content. That
+is supporting evidence only; comma-device resource measurements remain the
+field gate.
+
 Its separate display-only progress projection reports the current pass,
 route, segment, and whether the route is being read or applied. A cumulative
 bar spans both passes without reaching a pass boundary before the prepared

@@ -17,11 +17,13 @@ import fcntl
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import re
 import select
 import shutil
+import signal
 import statistics
 import struct
 import subprocess
@@ -72,6 +74,14 @@ MAXIMUM_UNRESOLVED_FRACTION = 0.01
 EXTRACTOR_IO_TIMEOUT_S = 60.0
 EXTRACTOR_EXIT_TIMEOUT_S = 5.0
 MAXIMUM_CONTROL_GAP_NS = 15_000_000
+# Each worker owns one complete deterministic replay. Two workers therefore
+# use the two already-required A/A passes as the safe multicore boundary while
+# keeping every pass's route/frame learner chronology serial and unchanged.
+BACKFILL_REPLAY_WORKER_COUNT = 2
+MAXIMUM_BACKFILL_REPLAY_WORKERS = 2
+REPLAY_WORKER_STARTUP_TIMEOUT_S = 1.0
+REPLAY_WORKER_COOPERATIVE_STOP_S = 0.75
+REPLAY_WORKER_SIGNAL_STOP_S = 0.5
 NOMINAL_CONTROL_PERIOD_NS = int(
   round(1e9 / SERVICE_LIST["controlsState"].frequency),
 )
@@ -1736,6 +1746,12 @@ class ExclusiveBackfillWriter(AbstractContextManager["ExclusiveBackfillWriter"])
       self._stream.close()
       self._stream = None
 
+  @property
+  def fileno(self) -> int:
+    if self._stream is None:
+      raise RuntimeError("backfill writer lock is not active")
+    return int(self._stream.fileno())
+
 
 def _write_fsynced(path: Path, encoded: bytes) -> None:
   with path.open("xb") as stream:
@@ -2038,6 +2054,288 @@ def verify_replay_passes(first: ReplayPass, second: ReplayPass) -> None:
       "backfill_nondeterministic",
       "independent historical replays were not byte-identical",
     )
+
+
+def _forked_replay_entry(
+  connection: Any,
+  replay: Callable[[Callable[[], bool]], ReplayPass],
+  cancel_requested: Any,
+  start_requested: Any,
+  transaction_abort_requested: Callable[[], bool],
+  inherited_close_fds: tuple[int, ...],
+  expected_parent_pid: int,
+) -> None:
+  """Run one complete verification replay in an isolated Linux worker."""
+
+  def parent_lost() -> bool:
+    return os.getppid() != expected_parent_pid
+
+  def worker_abort_requested() -> bool:
+    return (
+      bool(cancel_requested.is_set())
+      or parent_lost()
+      or bool(transaction_abort_requested())
+    )
+
+  try:
+    for descriptor in inherited_close_fds:
+      os.close(descriptor)
+    os.setsid()
+    connection.send(("ready", os.getpid()))
+    # Do not spawn the native extractor until the parent knows this PID owns
+    # the worker process group. That closes the startup cancellation race in
+    # which only the Python worker, but not a new grandchild, could be killed.
+    while not start_requested.wait(timeout=0.05):
+      if worker_abort_requested():
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker aborted before startup acknowledgement",
+        )
+    result = replay(worker_abort_requested)
+    connection.send(("ok", result))
+  except BackfillError as exc:
+    connection.send(("backfill_error", exc.diagnostic, str(exc)))
+  except BaseException as exc:
+    connection.send((
+      "unexpected_error",
+      type(exc).__name__,
+      str(exc),
+    ))
+  finally:
+    connection.close()
+
+
+class _ForkedReplayWorker:
+  """One cancellable pass worker; no writer or progress authority."""
+
+  def __init__(
+    self,
+    *,
+    replay: Callable[[Callable[[], bool]], ReplayPass],
+    abort_requested: Callable[[], bool],
+    inherited_close_fds: tuple[int, ...] = (),
+  ) -> None:
+    try:
+      context = multiprocessing.get_context("fork")
+    except ValueError as exc:
+      raise BackfillError(
+        "backfill_reader_unavailable",
+        "two-worker replay requires the Linux fork process context",
+      ) from exc
+    receive = None
+    send = None
+    try:
+      receive, send = context.Pipe(duplex=False)
+      cancel_requested = context.Event()
+      start_requested = context.Event()
+      process = context.Process(
+        target=_forked_replay_entry,
+        args=(
+          send,
+          replay,
+          cancel_requested,
+          start_requested,
+          abort_requested,
+          tuple(int(descriptor) for descriptor in inherited_close_fds),
+          os.getpid(),
+        ),
+        name="blatv2-replay-2",
+      )
+    except BaseException as exc:
+      if receive is not None:
+        receive.close()
+      if send is not None:
+        send.close()
+      raise BackfillError(
+        "unexpected_error",
+        "verification replay worker resources could not be created",
+      ) from exc
+    self._receive = receive
+    self._cancel_requested = cancel_requested
+    self._start_requested = start_requested
+    self._abort_requested = abort_requested
+    self._closed = False
+    self._started = False
+    self._group_ready = False
+    self._process = process
+    try:
+      self._process.start()
+      self._started = True
+      send.close()
+      deadline = time.monotonic() + REPLAY_WORKER_STARTUP_TIMEOUT_S
+      while not self._receive.poll(0.1):
+        _abort_if_requested(
+          self._abort_requested,
+          "backfill aborted while starting verification replay",
+        )
+        if not self._process.is_alive():
+          raise BackfillError(
+            "unexpected_error",
+            "verification replay worker exited during startup",
+          )
+        if time.monotonic() >= deadline:
+          raise BackfillError(
+            "unexpected_error",
+            "verification replay worker startup timed out",
+          )
+      try:
+        ready = self._receive.recv()
+      except (EOFError, OSError) as exc:
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker startup channel failed",
+        ) from exc
+      if (
+        type(ready) is not tuple
+        or len(ready) != 2
+        or ready[0] != "ready"
+        or ready[1] != self._process.pid
+      ):
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker did not establish isolation",
+        )
+      self._group_ready = True
+      self._start_requested.set()
+    except BaseException as exc:
+      try:
+        send.close()
+      except OSError:
+        pass
+      try:
+        self._stop()
+      except BaseException as cleanup_exc:
+        self._receive.close()
+        self._closed = True
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker failed startup cleanup",
+        ) from cleanup_exc
+      self._receive.close()
+      self._closed = True
+      if isinstance(exc, BackfillError):
+        raise
+      raise BackfillError(
+        "unexpected_error",
+        "verification replay worker could not start",
+      ) from exc
+
+  def _signal_process_group(self, signal_number: int) -> None:
+    if not self._started:
+      return
+    if self._group_ready:
+      try:
+        os.killpg(self._process.pid, signal_number)
+      except ProcessLookupError:
+        pass
+      return
+    if not self._process.is_alive():
+      return
+    if signal_number == signal.SIGTERM:
+      self._process.terminate()
+    else:
+      self._process.kill()
+
+  def _stop(self) -> None:
+    self._cancel_requested.set()
+    if not self._started:
+      return
+    self._process.join(timeout=REPLAY_WORKER_COOPERATIVE_STOP_S)
+    # Signal the complete session even when the replay worker has already
+    # died: a force-killed worker must not leave its native extractor behind.
+    self._signal_process_group(signal.SIGTERM)
+    self._process.join(timeout=REPLAY_WORKER_SIGNAL_STOP_S)
+    self._signal_process_group(signal.SIGKILL)
+    self._process.join(timeout=REPLAY_WORKER_SIGNAL_STOP_S)
+    if self._process.is_alive():
+      raise BackfillError(
+        "unexpected_error",
+        "verification replay worker could not be reaped",
+      )
+
+  def cancel(self) -> None:
+    if self._closed:
+      return
+    self._stop()
+    self._receive.close()
+    self._closed = True
+
+  def result(self) -> ReplayPass:
+    if self._closed:
+      raise RuntimeError("replay worker result was already consumed")
+    try:
+      while not self._receive.poll(0.1):
+        _abort_if_requested(
+          self._abort_requested,
+          "backfill aborted while waiting for verification replay",
+        )
+        if not self._process.is_alive():
+          raise BackfillError(
+            "unexpected_error",
+            "verification replay worker exited without a result",
+          )
+      try:
+        payload = self._receive.recv()
+      except (EOFError, OSError) as exc:
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker result channel failed",
+        ) from exc
+      self._process.join(timeout=REPLAY_WORKER_SIGNAL_STOP_S)
+      if self._process.is_alive():
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker did not exit after its result",
+        )
+      if self._process.exitcode != 0:
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker exited abnormally",
+        )
+      if (
+        type(payload) is not tuple
+        or not payload
+        or type(payload[0]) is not str
+      ):
+        raise BackfillError(
+          "unexpected_error",
+          "verification replay worker returned a malformed result",
+        )
+      if payload[0] == "ok" and len(payload) == 2:
+        result = payload[1]
+        if not isinstance(result, ReplayPass):
+          raise BackfillError(
+            "unexpected_error",
+            "verification replay worker result has the wrong type",
+          )
+        return result
+      if (
+        payload[0] == "backfill_error"
+        and len(payload) == 3
+        and type(payload[1]) is str
+        and type(payload[2]) is str
+      ):
+        raise BackfillError(payload[1], payload[2])
+      if (
+        payload[0] == "unexpected_error"
+        and len(payload) == 3
+        and type(payload[1]) is str
+        and type(payload[2]) is str
+      ):
+        raise BackfillError(
+          "unexpected_error",
+          f"verification replay worker failed: {payload[1]}: {payload[2]}",
+        )
+      raise BackfillError(
+        "unexpected_error",
+        "verification replay worker returned an unknown result",
+      )
+    except BaseException:
+      self._stop()
+      raise
+    finally:
+      self._receive.close()
+      self._closed = True
 
 
 def ledger_routes(
@@ -2360,6 +2658,26 @@ class _BackfillProgressTracker:
     self._segment_index = 0
     self._publish(BackfillProgressPhase.COMPARING, coordinate=False)
 
+  def parallel_verification_completed(self) -> None:
+    """Advance display-only accounting for the unprojected worker pass."""
+    if (
+      self._active_kind is not None
+      or self._completed_segments != self.segments_per_pass
+      or self._completed_read_units != self.source_bytes_per_pass
+      or self._completed_apply_units != self.source_bytes_per_pass
+    ):
+      raise RuntimeError(
+        "parallel verification completed before primary replay",
+      )
+    self._completed_read_units = 2 * self.source_bytes_per_pass
+    self._completed_apply_units = 2 * self.source_bytes_per_pass
+    self._completed_segments = self.total_replay_segment_count
+    self._pass_index = 2
+    self._route = None
+    self._segment_index = 0
+    self._active_kind = None
+    self._active_work_units = 0
+
   def publishing(self) -> None:
     self._publish(BackfillProgressPhase.PUBLISHING, coordinate=False)
 
@@ -2386,6 +2704,7 @@ class HistoricalLearningBackfill:
     backfill_progress: BackfillProgressPublisher | None = None,
     progress_monotonic_ns: Callable[[], int] = time.monotonic_ns,
     pending_route_identity: str | None = None,
+    replay_worker_count: int = BACKFILL_REPLAY_WORKER_COUNT,
     event_reader: Callable[
       [bytes],
       AbstractContextManager[Any],
@@ -2405,6 +2724,13 @@ class HistoricalLearningBackfill:
     self.abort_requested = abort_requested
     self.pending_route_identity = pending_route_identity
     self._pending_route_quiescence_observed = False
+    if (
+      type(replay_worker_count) is not int
+      or replay_worker_count < 1
+      or replay_worker_count > MAXIMUM_BACKFILL_REPLAY_WORKERS
+    ):
+      raise ValueError("backfill replay worker count is outside its bound")
+    self.replay_worker_count = replay_worker_count
     self.event_reader = event_reader
 
   @staticmethod
@@ -2463,6 +2789,7 @@ class HistoricalLearningBackfill:
     runtime: PersistentLearningRuntime,
     route: RouteCandidate,
     *,
+    abort_requested: Callable[[], bool] | None = None,
     segment_started: Callable[[RouteSegment, int, int], None] | None = None,
     segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
   ) -> PreparedRoute:
@@ -2476,7 +2803,11 @@ class HistoricalLearningBackfill:
       current_car_params=self.current_car_params,
       current_bundle=runtime.runtime_bundle,
       expected_dongle_id=self.expected_dongle_id,
-      abort_requested=self.abort_requested,
+      abort_requested=(
+        self.abort_requested
+        if abort_requested is None
+        else abort_requested
+      ),
       segment_started=segment_started,
       segment_completed=segment_completed,
     )
@@ -2524,7 +2855,7 @@ class HistoricalLearningBackfill:
     runtime_identity = (
       initial_runtime.runtime_bundle.calibration_identity_sha256
     )
-    with ExclusiveBackfillWriter(artifact_paths.root):
+    with ExclusiveBackfillWriter(artifact_paths.root) as writer:
       # Re-resolve under the writer lock in case CURRENT changed between
       # process startup and lock acquisition.
       initial_runtime = self.runtime_factory()
@@ -2711,98 +3042,139 @@ class HistoricalLearningBackfill:
             lambda: progress.route_completed(pass_index=1, route=route),
           )
 
+      def parallel_verification_replay(
+        worker_abort_requested: Callable[[], bool],
+      ) -> ReplayPass:
+        worker_runtime = self.runtime_factory()
+        return replay_routes(
+          runtime=worker_runtime,
+          routes=replay_candidates,
+          prepare=lambda route: self._prepare(
+            worker_runtime,
+            route,
+            abort_requested=worker_abort_requested,
+          ),
+          abort_requested=worker_abort_requested,
+        )
+
+      # Restore the parent runtime before creating any child. A restore
+      # failure must leave no verification worker or inherited resources.
       first_runtime = self.runtime_factory()
-      first = replay_routes(
-        runtime=first_runtime,
-        routes=replay_candidates,
-        prepare=first_prepare,
-        abort_requested=self.abort_requested,
-        route_completed=first_route_completed,
-        route_applying=(
-          None
-          if progress is None
-          else lambda route: project_progress(
-            lambda: progress.route_applying(
-              pass_index=1,
-              route=route,
-            ),
-          )
-        ),
+      verification_worker = (
+        None
+        if self.replay_worker_count == 1
+        else _ForkedReplayWorker(
+          replay=parallel_verification_replay,
+          abort_requested=self.abort_requested,
+          inherited_close_fds=(writer.fileno,),
+        )
       )
+      try:
+        first = replay_routes(
+          runtime=first_runtime,
+          routes=replay_candidates,
+          prepare=first_prepare,
+          abort_requested=self.abort_requested,
+          route_completed=first_route_completed,
+          route_applying=(
+            None
+            if progress is None
+            else lambda route: project_progress(
+              lambda: progress.route_applying(
+                pass_index=1,
+                route=route,
+              ),
+            )
+          ),
+        )
+      except BaseException:
+        if verification_worker is not None:
+          verification_worker.cancel()
+        raise
       last_route_identity = (
         replay_candidates[-1].display_identity
         if replay_candidates
         else None
       )
-      self._publish(
-        initial_runtime,
-        state=LearningOperationState.FINALIZING,
-        diagnostic="verifying_backfill",
-        accepted_sample_count=first.accepted_sample_count,
-        rejected_sample_count=first.rejected_sample_count,
-        last_route_identity=last_route_identity,
-      )
-      second_runtime = self.runtime_factory()
+      try:
+        self._publish(
+          initial_runtime,
+          state=LearningOperationState.FINALIZING,
+          diagnostic="verifying_backfill",
+          accepted_sample_count=first.accepted_sample_count,
+          rejected_sample_count=first.rejected_sample_count,
+          last_route_identity=last_route_identity,
+        )
+      except BaseException:
+        if verification_worker is not None:
+          verification_worker.cancel()
+        raise
+      if verification_worker is not None:
+        second = verification_worker.result()
+        if progress is not None:
+          project_progress(progress.parallel_verification_completed)
+      else:
+        second_runtime = self.runtime_factory()
 
-      def second_prepare(route: RouteCandidate) -> PreparedRoute:
-        return self._prepare(
-          second_runtime,
-          route,
-          segment_started=(
-            None
-            if progress is None
-            else lambda segment, segment_index, segment_count: project_progress(
-              lambda: progress.segment_started(
-                pass_index=2,
-                route=route,
-                segment=segment,
-                segment_index=segment_index,
-                segment_count=segment_count,
+        def second_prepare(route: RouteCandidate) -> PreparedRoute:
+          return self._prepare(
+            second_runtime,
+            route,
+            segment_started=(
+              None
+              if progress is None
+              else lambda segment, segment_index, segment_count: project_progress(
+                lambda: progress.segment_started(
+                  pass_index=2,
+                  route=route,
+                  segment=segment,
+                  segment_index=segment_index,
+                  segment_count=segment_count,
+                )
               )
+            ),
+            segment_completed=(
+              None
+              if progress is None
+              else lambda segment, segment_index, segment_count: project_progress(
+                lambda: progress.segment_completed(
+                  pass_index=2,
+                  route=route,
+                  segment=segment,
+                  segment_index=segment_index,
+                  segment_count=segment_count,
+                )
+              )
+            ),
+          )
+
+        def second_route_completed(
+          route: RouteCandidate,
+          _accepted: int,
+          _rejected: int,
+        ) -> None:
+          if progress is not None:
+            project_progress(
+              lambda: progress.route_completed(pass_index=2, route=route),
             )
-          ),
-          segment_completed=(
+
+        second = replay_routes(
+          runtime=second_runtime,
+          routes=replay_candidates,
+          prepare=second_prepare,
+          abort_requested=self.abort_requested,
+          route_completed=second_route_completed,
+          route_applying=(
             None
             if progress is None
-            else lambda segment, segment_index, segment_count: project_progress(
-              lambda: progress.segment_completed(
+            else lambda route: project_progress(
+              lambda: progress.route_applying(
                 pass_index=2,
                 route=route,
-                segment=segment,
-                segment_index=segment_index,
-                segment_count=segment_count,
-              )
+              ),
             )
           ),
         )
-
-      def second_route_completed(
-        route: RouteCandidate,
-        _accepted: int,
-        _rejected: int,
-      ) -> None:
-        if progress is not None:
-          project_progress(
-            lambda: progress.route_completed(pass_index=2, route=route),
-          )
-
-      second = replay_routes(
-        runtime=second_runtime,
-        routes=replay_candidates,
-        prepare=second_prepare,
-        abort_requested=self.abort_requested,
-        route_completed=second_route_completed,
-        route_applying=(
-          None
-          if progress is None
-          else lambda route: project_progress(
-            lambda: progress.route_applying(
-              pass_index=2,
-              route=route,
-            ),
-          )
-        ),
-      )
       if progress is not None:
         project_progress(progress.comparing)
       verify_replay_passes(first, second)
