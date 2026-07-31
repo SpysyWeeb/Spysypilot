@@ -367,6 +367,29 @@ replacing one `CURRENT` pointer. A rejected route does not block a later
 eligible route. An older route discovered after the durable chronology has
 advanced is recorded as late and skipped.
 
+The two required deterministic replay passes run concurrently in separate
+forked Linux processes with independent replay state. Within each pass,
+segment extraction, decoding,
+source-history joining, frame construction, hash folding, and learner
+ingestion remain strictly serial in canonical route/segment/frame order. The
+workers share no prepared frames or learner state and have no durable-writer
+authority. The parent process alone compares their `ReplayPass` artifacts,
+extends the ledger, and performs the atomic publication. This preserves the
+existing progress schema: it projects the primary replay, then verification,
+without exposing worker scheduling. Production is fixed at two workers. A
+four-worker design is queued only after two-worker device elapsed-time,
+process-group peak-memory, storage-contention, thermal, and responsiveness
+validation. It requires bounded per-route spooling so additional preparation
+workers cannot reorder learning or multiply unbounded in-memory routes. Each
+A/A authority must still prepare its own inputs; sharing one prepared spool
+between the two passes would weaken the independence check.
+
+Desktop reference measurement on the 21-segment
+`000000b7--a6b3b1f175` route: two serial passes took 17.594 s and the
+two-process path took 9.717 s (1.81x), with byte-identical evidence,
+manifest, and ledger entries. On-device elapsed time, process-group RSS, I/O
+contention, thermals, and responsiveness remain the deployment authority.
+
 Each released clean build needs an explicit reviewed descriptor retained in
 `historical_build_descriptors.json` before it becomes historical. The current
 build descriptor can be synthesized only while that build is running; an

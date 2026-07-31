@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 import hashlib
+import os
 from pathlib import Path
 
 import pytest  # noqa: TID251
@@ -181,6 +183,7 @@ def make_engine(
   *,
   pending_route_identity: str | None = None,
   with_progress: bool = False,
+  replay_worker_count: int = 1,
 ) -> tuple[
   HistoricalLearningBackfill,
   FakeParams,
@@ -271,8 +274,50 @@ def make_engine(
     progress_monotonic_ns=lambda: next(progress_clock),
     abort_requested=lambda: False,
     pending_route_identity=pending_route_identity,
+    replay_worker_count=replay_worker_count,
   )
   return engine, params, prepare_calls, runtime_factory
+
+
+@pytest.mark.parametrize("replay_worker_count", (0, 3))
+def test_replay_worker_count_is_bounded(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  replay_worker_count: int,
+) -> None:
+  with pytest.raises(
+    ValueError,
+    match="backfill replay worker count is outside its bound",
+  ):
+    make_engine(
+      tmp_path,
+      monkeypatch,
+      replay_worker_count=replay_worker_count,
+    )
+
+
+def published_artifact_snapshot(runtime_factory) -> dict[str, object]:
+  runtime = runtime_factory()
+  unresolved_paths = runtime.artifact_paths
+  paths = unresolved_paths.resolved()
+  candidates = (
+    tuple(
+      (candidate.name, candidate.read_bytes())
+      for candidate in sorted(paths.candidates.iterdir())
+      if candidate.is_file()
+    )
+    if paths.candidates.is_dir()
+    else ()
+  )
+  return {
+    "pointer": unresolved_paths.backfill_pointer.read_bytes(),
+    "evidence": paths.evidence.read_bytes(),
+    "manifest": paths.manifest.read_bytes(),
+    "candidates": candidates,
+    "ledger": paths.backfill_ledger.read_bytes(),
+    "provenance": paths.backfill_provenance.read_bytes(),
+    "commit": paths.backfill_commit.read_bytes(),
+  }
 
 
 def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
@@ -542,6 +587,161 @@ def test_progress_projection_does_not_change_replay_artifacts(
   )
 
 
+def test_two_replay_workers_publish_exact_single_worker_artifacts(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  serial_root = tmp_path / "serial"
+  add_route(serial_root / "logs", 0x10, segment_count=2)
+  add_route(serial_root / "logs", 0x20)
+  serial_engine, _, _, serial_runtime_factory = make_engine(
+    serial_root,
+    monkeypatch,
+    replay_worker_count=1,
+  )
+  serial = serial_engine.run_once()
+  assert serial.publication is not None
+  serial_artifacts = published_artifact_snapshot(serial_runtime_factory)
+
+  parallel_root = tmp_path / "parallel"
+  add_route(parallel_root / "logs", 0x10, segment_count=2)
+  add_route(parallel_root / "logs", 0x20)
+  parallel_engine, _, _, parallel_runtime_factory = make_engine(
+    parallel_root,
+    monkeypatch,
+    replay_worker_count=2,
+  )
+  parallel = parallel_engine.run_once()
+  assert parallel.publication is not None
+  parallel_artifacts = published_artifact_snapshot(
+    parallel_runtime_factory,
+  )
+
+  assert parallel_artifacts == serial_artifacts
+  assert parallel.publication.finalization.evidence_bytes == (
+    serial.publication.finalization.evidence_bytes
+  )
+  assert parallel.publication.finalization.manifest_bytes == (
+    serial.publication.finalization.manifest_bytes
+  )
+  assert parallel.publication.finalization.candidate_profile_json == (
+    serial.publication.finalization.candidate_profile_json
+  )
+  assert (
+    parallel.publication.accepted_sample_count,
+    parallel.publication.rejected_sample_count,
+  ) == (
+    serial.publication.accepted_sample_count,
+    serial.publication.rejected_sample_count,
+  )
+  assert parallel.publication.generation_sha256 == (
+    serial.publication.generation_sha256
+  )
+  assert parallel.publication.ledger_sha256 == (
+    serial.publication.ledger_sha256
+  )
+
+
+def test_parallel_verification_keeps_existing_progress_schema_consistent(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  baseline_root = tmp_path / "baseline"
+  add_route(baseline_root / "logs", 0x10, segment_count=2)
+  baseline_engine, _, _, baseline_runtime_factory = make_engine(
+    baseline_root,
+    monkeypatch,
+    replay_worker_count=2,
+  )
+  baseline = baseline_engine.run_once()
+  assert baseline.publication is not None
+  baseline_artifacts = published_artifact_snapshot(
+    baseline_runtime_factory,
+  )
+
+  observed_root = tmp_path / "observed"
+  add_route(observed_root / "logs", 0x10, segment_count=2)
+  engine, params, _, observed_runtime_factory = make_engine(
+    observed_root,
+    monkeypatch,
+    with_progress=True,
+    replay_worker_count=2,
+  )
+
+  result = engine.run_once()
+
+  assert result.publication is not None
+  assert published_artifact_snapshot(observed_runtime_factory) == (
+    baseline_artifacts
+  )
+  updates = [
+    value
+    for key, value, _ in params.puts
+    if key == BACKFILL_PROGRESS_PARAM
+  ]
+  assert [value["phase"] for value in updates[-2:]] == [
+    "comparing",
+    "publishing",
+  ]
+  assert updates[-1]["completed_replay_segment_count"] == updates[-1][
+    "total_replay_segment_count"
+  ]
+  assert updates[-1]["completed_work_units"] == updates[-1][
+    "total_work_units"
+  ]
+  assert updates[-2]["pass_index"] == 2
+  assert all(
+    left["completed_work_units"] <= right["completed_work_units"]
+    for left, right in zip(updates, updates[1:], strict=False)
+  )
+  assert all(
+    value["pass_index"] == 1
+    for value in updates
+    if value["phase"] in {"reading_segment", "applying_route"}
+  )
+
+
+def test_second_process_output_difference_is_nondeterministic_and_unpublished(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  log_root = tmp_path / "logs"
+  add_route(log_root, 0x10)
+  engine, _, _, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=2,
+  )
+  parent_pid = os.getpid()
+  deterministic_prepare = learning_backfill.prepare_route
+
+  def process_distinct_prepare(route, **kwargs):
+    prepared = deterministic_prepare(route, **kwargs)
+    if os.getpid() == parent_pid:
+      return prepared
+    provenance = dict(prepared.provenance)
+    provenance["selected_event_stream_sha256"] = hashlib.sha256(
+      f"worker-{os.getpid()}".encode("ascii"),
+    ).hexdigest()
+    return replace(prepared, provenance=provenance)
+
+  monkeypatch.setattr(
+    learning_backfill,
+    "prepare_route",
+    process_distinct_prepare,
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "backfill_nondeterministic"
+  artifact_paths = runtime_factory().artifact_paths
+  assert not artifact_paths.backfill_pointer.exists()
+  assert not artifact_paths.evidence.exists()
+  assert not artifact_paths.manifest.exists()
+  assert not artifact_paths.backfill_ledger.exists()
+
+
 @pytest.mark.parametrize("failure_mode", ("put", "final_clear"))
 def test_broken_progress_projection_is_fail_open(
   tmp_path: Path,
@@ -734,6 +934,261 @@ class AbortRuntime:
 
   def transition_offroad_without_persist(self) -> None:
     return None
+
+
+def test_forked_replay_worker_cancel_reaps_child() -> None:
+  context = learning_backfill.multiprocessing.get_context("fork")
+  entered = context.Event()
+  exited = context.Event()
+  idle_wait = context.Event()
+
+  def cancellable_replay(worker_abort_requested):
+    entered.set()
+    try:
+      while not worker_abort_requested():
+        idle_wait.wait(timeout=0.01)
+      raise BackfillError(
+        "unexpected_error",
+        "test worker observed cancellation",
+      )
+    finally:
+      exited.set()
+
+  worker = learning_backfill._ForkedReplayWorker(
+    replay=cancellable_replay,
+    abort_requested=lambda: False,
+  )
+  process = worker._process
+  assert entered.wait(timeout=5.0)
+
+  worker.cancel()
+
+  assert exited.wait(timeout=5.0)
+  assert not process.is_alive()
+  assert process.exitcode == 0
+
+
+def test_forked_replay_worker_propagates_error_and_reaps_child() -> None:
+  def failing_replay(_worker_abort_requested):
+    raise BackfillError(
+      "injected_worker_failure",
+      "deterministic worker failure",
+    )
+
+  worker = learning_backfill._ForkedReplayWorker(
+    replay=failing_replay,
+    abort_requested=lambda: False,
+  )
+  process = worker._process
+
+  with pytest.raises(BackfillError) as raised:
+    worker.result()
+
+  assert raised.value.diagnostic == "injected_worker_failure"
+  assert not process.is_alive()
+  assert process.exitcode == 0
+
+
+def test_parallel_engine_closes_inherited_writer_lock_in_child(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  engine, _, _, _ = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=2,
+  )
+  parent_pid = os.getpid()
+  deterministic_prepare = learning_backfill.prepare_route
+  forked_worker = learning_backfill._ForkedReplayWorker
+  inherited_writer: list[tuple[int, int, int]] = []
+
+  def capture_writer_lock(**kwargs):
+    inherited_close_fds = kwargs["inherited_close_fds"]
+    assert len(inherited_close_fds) == 1
+    descriptor = inherited_close_fds[0]
+    lock_stat = os.fstat(descriptor)
+    inherited_writer.append((
+      descriptor,
+      lock_stat.st_dev,
+      lock_stat.st_ino,
+    ))
+    return forked_worker(**kwargs)
+
+  def assert_lock_absent_in_child(route, **kwargs):
+    if os.getpid() != parent_pid:
+      descriptor, expected_device, expected_inode = inherited_writer[0]
+      try:
+        child_stat = os.fstat(descriptor)
+      except OSError:
+        child_stat = None
+      if child_stat is not None and (
+        child_stat.st_dev,
+        child_stat.st_ino,
+      ) == (expected_device, expected_inode):
+        raise BackfillError(
+          "inherited_writer_lock_open",
+          "verification worker retained the parent's writer lock",
+        )
+    return deterministic_prepare(route, **kwargs)
+
+  monkeypatch.setattr(
+    learning_backfill,
+    "_ForkedReplayWorker",
+    capture_writer_lock,
+  )
+  monkeypatch.setattr(
+    learning_backfill,
+    "prepare_route",
+    assert_lock_absent_in_child,
+  )
+
+  result = engine.run_once()
+
+  assert result.publication is not None
+  assert len(inherited_writer) == 1
+
+
+def test_forked_replay_process_start_failure_has_no_child(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  context = learning_backfill.multiprocessing.get_context("fork")
+  process_type = type(context.Process())
+  children_before = {
+    child.pid
+    for child in learning_backfill.multiprocessing.active_children()
+  }
+
+  def fail_start(_process) -> None:
+    raise OSError("injected process start failure")
+
+  monkeypatch.setattr(process_type, "start", fail_start)
+
+  with pytest.raises(BackfillError) as raised:
+    learning_backfill._ForkedReplayWorker(
+      replay=lambda _worker_abort_requested: None,
+      abort_requested=lambda: False,
+    )
+
+  assert raised.value.diagnostic == "unexpected_error"
+  assert isinstance(raised.value.__cause__, OSError)
+  assert {
+    child.pid
+    for child in learning_backfill.multiprocessing.active_children()
+  } == children_before
+
+
+def test_forked_replay_pre_ready_failure_reaps_started_child() -> None:
+  children_before = {
+    child.pid
+    for child in learning_backfill.multiprocessing.active_children()
+  }
+
+  with pytest.raises(BackfillError) as raised:
+    learning_backfill._ForkedReplayWorker(
+      replay=lambda _worker_abort_requested: None,
+      abort_requested=lambda: False,
+      inherited_close_fds=(-1,),
+    )
+
+  assert raised.value.diagnostic == "unexpected_error"
+  assert {
+    child.pid
+    for child in learning_backfill.multiprocessing.active_children()
+  } == children_before
+
+
+def test_parent_runtime_restore_failure_starts_no_worker(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  engine, _, _, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=2,
+  )
+  runtime_calls = 0
+  worker_starts = 0
+
+  def fail_parent_replay_runtime():
+    nonlocal runtime_calls
+    runtime_calls += 1
+    if runtime_calls == 3:
+      raise BackfillError(
+        "injected_restore_failure",
+        "primary replay runtime restore failed",
+      )
+    return runtime_factory()
+
+  def count_worker_start(**_kwargs):
+    nonlocal worker_starts
+    worker_starts += 1
+    raise AssertionError("worker started before parent runtime restored")
+
+  engine.runtime_factory = fail_parent_replay_runtime
+  monkeypatch.setattr(
+    learning_backfill,
+    "_ForkedReplayWorker",
+    count_worker_start,
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "injected_restore_failure"
+  assert worker_starts == 0
+  assert not runtime_factory().artifact_paths.backfill_pointer.exists()
+
+
+def test_primary_replay_failure_cancels_and_reaps_parallel_worker(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  engine, _, _, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=2,
+  )
+  context = learning_backfill.multiprocessing.get_context("fork")
+  child_entered = context.Event()
+  child_exited = context.Event()
+  idle_wait = context.Event()
+  parent_pid = os.getpid()
+
+  def fail_primary_while_child_waits(_route, **kwargs):
+    if os.getpid() == parent_pid:
+      assert child_entered.wait(timeout=5.0)
+      raise BackfillError(
+        "injected_primary_failure",
+        "primary replay failed after verification worker started",
+      )
+    worker_abort_requested = kwargs["abort_requested"]
+    child_entered.set()
+    try:
+      while not worker_abort_requested():
+        idle_wait.wait(timeout=0.01)
+      raise BackfillError(
+        "unexpected_error",
+        "verification worker observed cancellation",
+      )
+    finally:
+      child_exited.set()
+
+  monkeypatch.setattr(
+    learning_backfill,
+    "prepare_route",
+    fail_primary_while_child_waits,
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "injected_primary_failure"
+  assert child_exited.wait(timeout=5.0)
+  assert not runtime_factory().artifact_paths.backfill_pointer.exists()
 
 
 def test_replay_aborts_periodically_before_publication() -> None:
