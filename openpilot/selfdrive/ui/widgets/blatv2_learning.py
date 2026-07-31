@@ -900,12 +900,28 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
       "VALIDATION / AUTH",
       "CALIBRATION",
     )
-    for offset, header in zip(columns, headers, strict=True):
+    for column_index, (offset, header) in enumerate(zip(
+      columns,
+      headers,
+      strict=True,
+    )):
+      next_offset = (
+        columns[column_index + 1]
+        if column_index + 1 < len(columns)
+        else 1.0
+      )
+      header_font_size = self._fit_font_size(
+        medium,
+        header,
+        21,
+        11,
+        width * (next_offset - offset) - 8,
+      )
       rl.draw_text_ex(
         medium,
         header,
         rl.Vector2(int(x + width * offset), int(y)),
-        21,
+        header_font_size,
         0,
         _DIM,
       )

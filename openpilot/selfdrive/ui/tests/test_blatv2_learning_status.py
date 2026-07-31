@@ -1354,6 +1354,9 @@ def _load_learning_widget_module():
   fake_pyray.draw_rectangle_rounded_lines_ex = lambda *args: (
     fake_pyray.draw_calls.append(("rounded_lines", args))
   )
+  fake_pyray.draw_line_ex = lambda *args: (
+    fake_pyray.draw_calls.append(("line", args))
+  )
   fake_pyray.draw_text_ex = lambda *args: (
     fake_pyray.draw_calls.append(("text", args))
   )
@@ -1475,6 +1478,44 @@ class TestLearningStatusSource(unittest.TestCase):
     self.assertEqual(text, "G .300 O -.040 K/S .030/.090")
     self.assertNotIn("DAMP", text)
     self.assertNotIn("RACK", text)
+
+  def test_readiness_headers_fit_without_crossing_column_boundaries(self) -> None:
+    learning = parse_learning_status(
+      learning_fixture(),
+      expected_vehicle_identity=VEHICLE,
+    )
+    page = self.widget_module.BLaTv2ReadinessWidget(
+      types.SimpleNamespace(),
+    )
+    width = 600.0
+    columns = (0.00, 0.16, 0.34, 0.54, 0.73)
+    self.widget_module.rl.draw_calls.clear()
+    page._draw_matrix(0.0, 0.0, width, 560.0, learning, False)
+    header_calls = [
+      call[1]
+      for call in self.widget_module.rl.draw_calls
+      if call[0] == "text"
+    ][:5]
+    self.assertEqual(
+      [call[1] for call in header_calls],
+      [
+        "NODE",
+        "MOVING",
+        "BREAKAWAY",
+        "VALIDATION / AUTH",
+        "CALIBRATION",
+      ],
+    )
+    for index, call in enumerate(header_calls):
+      text = call[1]
+      position = call[2]
+      font_size = call[3]
+      next_x = width * (
+        columns[index + 1] if index + 1 < len(columns) else 1.0
+      )
+      rendered_width = len(text) * font_size * 0.5
+      self.assertLessEqual(position.x + rendered_width, next_x - 8.0)
+    self.assertLess(header_calls[3][3], 21)
 
   def test_calibration_and_lifecycle_identity_namespaces_are_independent(
     self,
