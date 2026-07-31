@@ -290,6 +290,22 @@ class TestLearningStatusParser(unittest.TestCase):
     self.assertEqual(node.primary_reason, "singular_fit")
     self.assertTrue(node.collection_complete)
 
+  def test_authority_validation_regression_is_specific_and_complete(
+    self,
+  ) -> None:
+    payload = learning_fixture()
+    payload["nodes"][2]["reasons"] = [
+      "validation_regression",
+      "authority_validation_regression",
+    ]
+    status = parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
+    node = status.nodes[2]
+    self.assertEqual(
+      node.primary_reason,
+      "authority_validation_regression",
+    )
+    self.assertTrue(node.collection_complete)
+
   def test_last_drive_unavailable_is_null_not_zero(self) -> None:
     status = parse_learning_status(
       learning_fixture(last_drive_complete=False),
@@ -1298,6 +1314,20 @@ class TestLearningStatusSource(unittest.TestCase):
       metric_provider=lambda: False,
     )
 
+  def test_authority_validation_regression_renders_as_regressed(self) -> None:
+    payload = learning_fixture()
+    payload["nodes"][2]["reasons"] = [
+      "authority_validation_regression",
+    ]
+    node = parse_learning_status(
+      payload,
+      expected_vehicle_identity=VEHICLE,
+    ).nodes[2]
+    self.assertEqual(
+      self.widget_module.BLaTv2ReadinessWidget._fit_text(node),
+      "REGRESSED",
+    )
+
   def test_param_read_exceptions_remain_distinct_and_render_red(self) -> None:
     expectations = (
       ("BLaTv2LearningStatus", "learning_error_code"),
@@ -1708,9 +1738,14 @@ class TestLearningStatusPresentationHelpers(unittest.TestCase):
         "singular_fit",
         "invalid_parameters",
         "validation_regression",
+        "authority_validation_regression",
       )
     }
-    self.assertEqual(len(labels), 7)
+    self.assertEqual(len(labels), 8)
+    self.assertEqual(
+      reason_label("authority_validation_regression"),
+      "Rejected: authority validation regressed",
+    )
 
   def test_supplied_false_metric_provider_is_not_truth_tested(self) -> None:
     selected = select_value_provider(lambda: True, lambda: False)
