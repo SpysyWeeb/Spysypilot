@@ -127,12 +127,14 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 
   Offroad learning now exposes display-only progress for both deterministic replay passes, including route and segment position, route-application stages, and a conservative ETA once enough read/apply timing samples exist. Progress is never consumed by learning, evidence, candidate selection, or control.
 
-  The two mandatory A/A passes now run in separate forked processes with
-  independent replay state, using two CPU cores while preserving canonical
-  order and parent-only publication. This remains in progress pending
-  comma-device elapsed-time, peak-memory, storage-contention, thermal, and
-  responsiveness measurements. Four-worker route spooling is deliberately
-  not enabled until that two-worker field gate passes.
+  The two mandatory A/A passes remain independent and canonical. Each replay
+  authority now has one private route-preparation helper, allowing up to four
+  Python lanes without creating extra replay passes or parallelizing mutable
+  learner state. Helpers use bounded, hash-verified scratch spools and never
+  receive publication or Params authority; only the parent compares and
+  publishes. Integrated b7/b8/b9/ca replay was byte-identical and 20.3% faster
+  than two workers on the desktop. This remains in progress pending the comma
+  device memory, storage, thermal, and responsiveness check.
 
   Evidence v3 keeps signed rack reconstruction and causal prior-`carOutput`
   alignment, but replaces the unidentifiable rack-dynamics fit with observable

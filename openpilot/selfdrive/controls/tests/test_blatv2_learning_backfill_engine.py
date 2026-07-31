@@ -279,11 +279,30 @@ def make_engine(
   return engine, params, prepare_calls, runtime_factory
 
 
-@pytest.mark.parametrize("replay_worker_count", (0, 3))
-def test_replay_worker_count_is_bounded(
+@pytest.mark.parametrize("replay_worker_count", (1, 2, 4))
+def test_replay_worker_count_accepts_only_supported_integers(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   replay_worker_count: int,
+) -> None:
+  engine, _params, _calls, _runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=replay_worker_count,
+  )
+
+  assert engine.replay_worker_count == replay_worker_count
+  assert type(engine.replay_worker_count) is int
+
+
+@pytest.mark.parametrize(
+  "replay_worker_count",
+  (False, True, 0, 3, 5, 1.0, "2", None),
+)
+def test_replay_worker_count_rejects_unsupported_values(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  replay_worker_count: object,
 ) -> None:
   with pytest.raises(
     ValueError,
@@ -318,6 +337,17 @@ def published_artifact_snapshot(runtime_factory) -> dict[str, object]:
     "provenance": paths.backfill_provenance.read_bytes(),
     "commit": paths.backfill_commit.read_bytes(),
   }
+
+
+def read_atomic_pipe_records(read_descriptor: int) -> list[str]:
+  encoded = bytearray()
+  while True:
+    chunk = os.read(read_descriptor, 4096)
+    if not chunk:
+      break
+    encoded.extend(chunk)
+  os.close(read_descriptor)
+  return encoded.decode("ascii").splitlines()
 
 
 def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
@@ -587,13 +617,16 @@ def test_progress_projection_does_not_change_replay_artifacts(
   )
 
 
-def test_two_replay_workers_publish_exact_single_worker_artifacts(
+@pytest.mark.parametrize("parallel_worker_count", (2, 4))
+def test_parallel_workers_publish_exact_single_worker_artifacts(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
+  parallel_worker_count: int,
 ) -> None:
   serial_root = tmp_path / "serial"
   add_route(serial_root / "logs", 0x10, segment_count=2)
   add_route(serial_root / "logs", 0x20)
+  add_route(serial_root / "logs", 0x30, segment_count=3)
   serial_engine, _, _, serial_runtime_factory = make_engine(
     serial_root,
     monkeypatch,
@@ -606,10 +639,11 @@ def test_two_replay_workers_publish_exact_single_worker_artifacts(
   parallel_root = tmp_path / "parallel"
   add_route(parallel_root / "logs", 0x10, segment_count=2)
   add_route(parallel_root / "logs", 0x20)
+  add_route(parallel_root / "logs", 0x30, segment_count=3)
   parallel_engine, _, _, parallel_runtime_factory = make_engine(
     parallel_root,
     monkeypatch,
-    replay_worker_count=2,
+    replay_worker_count=parallel_worker_count,
   )
   parallel = parallel_engine.run_once()
   assert parallel.publication is not None
@@ -642,16 +676,330 @@ def test_two_replay_workers_publish_exact_single_worker_artifacts(
   )
 
 
-def test_parallel_verification_keeps_existing_progress_schema_consistent(
+def test_four_worker_two_route_topology_has_four_independent_prepare_lanes(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+  first_name, _ = add_route(tmp_path / "logs", 0x10)
+  second_name, _ = add_route(tmp_path / "logs", 0x20)
+  engine, _params, _calls, _runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=4,
+  )
+  deterministic_prepare = learning_backfill.prepare_route
+  read_descriptor, write_descriptor = os.pipe()
+
+  def record_prepare(route, **kwargs):
+    process = learning_backfill.multiprocessing.current_process()
+    record = "|".join((
+      process.name,
+      str(os.getpid()),
+      str(os.getppid()),
+      route.route_name,
+    )).encode("ascii") + b"\n"
+    assert len(record) < 4096
+    assert os.write(write_descriptor, record) == len(record)
+    return deterministic_prepare(route, **kwargs)
+
+  monkeypatch.setattr(learning_backfill, "prepare_route", record_prepare)
+  try:
+    result = engine.run_once()
+  finally:
+    os.close(write_descriptor)
+  assert result.publication is not None
+
+  records = [
+    (name, int(pid), int(ppid), route_name)
+    for name, pid, ppid, route_name in (
+      record.split("|")
+      for record in read_atomic_pipe_records(read_descriptor)
+    )
+  ]
+  parent_name = learning_backfill.multiprocessing.current_process().name
+  assert len(records) == 4
+  assert {record[0] for record in records} == {
+    parent_name,
+    "blatv2-replay-2",
+    "blatv2-prepare-1",
+    "blatv2-prepare-2",
+  }
+  assert len({record[1] for record in records}) == 4
+  assert Counter(record[3] for record in records) == Counter({
+    first_name: 2,
+    second_name: 2,
+  })
+  assert {
+    record[0]: record[3]
+    for record in records
+  } == {
+    parent_name: first_name,
+    "blatv2-replay-2": first_name,
+    "blatv2-prepare-1": second_name,
+    "blatv2-prepare-2": second_name,
+  }
+  by_name = {record[0]: record for record in records}
+  assert by_name[parent_name][1] == os.getpid()
+  assert by_name["blatv2-replay-2"][2] == os.getpid()
+  assert by_name["blatv2-prepare-1"][2] == os.getpid()
+  assert by_name["blatv2-prepare-2"][2] == (
+    by_name["blatv2-replay-2"][1]
+  )
+
+
+def test_four_worker_single_route_starts_no_prepare_helpers(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  route_name, _ = add_route(tmp_path / "logs", 0x10)
+  engine, _params, _calls, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=4,
+  )
+  deterministic_prepare = learning_backfill.prepare_route
+  read_descriptor, write_descriptor = os.pipe()
+
+  def record_prepare(route, **kwargs):
+    process = learning_backfill.multiprocessing.current_process()
+    record = (
+      f"{process.name}|{os.getpid()}|{route.route_name}\n"
+    ).encode("ascii")
+    assert os.write(write_descriptor, record) == len(record)
+    return deterministic_prepare(route, **kwargs)
+
+  monkeypatch.setattr(learning_backfill, "prepare_route", record_prepare)
+  try:
+    result = engine.run_once()
+  finally:
+    os.close(write_descriptor)
+  assert result.publication is not None
+
+  records = [record.split("|") for record in read_atomic_pipe_records(
+    read_descriptor,
+  )]
+  assert len(records) == 2
+  assert {record[0] for record in records} == {
+    learning_backfill.multiprocessing.current_process().name,
+    "blatv2-replay-2",
+  }
+  assert {record[2] for record in records} == {route_name}
+  artifact_root = runtime_factory().artifact_paths.root
+  assert not tuple(artifact_root.glob(
+    f"{learning_backfill.BACKFILL_SPOOL_DIRECTORY_PREFIX}*",
+  ))
+
+
+def test_four_worker_prefetched_rejection_matches_serial_and_keeps_later_route(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  def run(worker_count: int, root: Path):
+    add_route(root / "logs", 0x10)
+    rejected_name, _ = add_route(root / "logs", 0x20)
+    later_name, _ = add_route(root / "logs", 0x30)
+    engine, _params, _calls, runtime_factory = make_engine(
+      root,
+      monkeypatch,
+      replay_worker_count=worker_count,
+    )
+    deterministic_prepare = learning_backfill.prepare_route
+
+    def reject_middle(route, **kwargs):
+      if route.route_name == rejected_name:
+        raise RouteRejected(
+          "invalid_route_version",
+          "deterministic prefetched-route rejection",
+        )
+      return deterministic_prepare(route, **kwargs)
+
+    monkeypatch.setattr(learning_backfill, "prepare_route", reject_middle)
+    result = engine.run_once()
+    assert result.publication is not None
+    ledger = load_ledger(
+      runtime_factory().artifact_paths,
+      runtime_identity_sha256=(
+        runtime_factory().runtime_bundle.calibration_identity_sha256
+      ),
+    )
+    assert [entry["route_name"] for entry in ledger["entries"]] == [
+      "00000010--0000000010",
+      rejected_name,
+      later_name,
+    ]
+    assert [entry["disposition"] for entry in ledger["entries"]] == [
+      "ingested",
+      "rejected",
+      "ingested",
+    ]
+    assert ledger["entries"][1]["diagnostic"] == "invalid_route_version"
+    return result, published_artifact_snapshot(runtime_factory)
+
+  serial_result, serial_artifacts = run(1, tmp_path / "serial")
+  parallel_result, parallel_artifacts = run(4, tmp_path / "parallel")
+
+  assert parallel_artifacts == serial_artifacts
+  assert parallel_result.publication is not None
+  assert serial_result.publication is not None
+  assert parallel_result.publication.finalization == (
+    serial_result.publication.finalization
+  )
+  assert (
+    parallel_result.publication.accepted_sample_count,
+    parallel_result.publication.rejected_sample_count,
+  ) == (
+    serial_result.publication.accepted_sample_count,
+    serial_result.publication.rejected_sample_count,
+  )
+
+
+def test_four_worker_helper_provenance_difference_is_unpublished(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  add_route(tmp_path / "logs", 0x20)
+  engine, _params, _calls, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=4,
+  )
+  deterministic_prepare = learning_backfill.prepare_route
+
+  def helper_distinct_prepare(route, **kwargs):
+    prepared = deterministic_prepare(route, **kwargs)
+    process_name = learning_backfill.multiprocessing.current_process().name
+    if process_name.startswith("blatv2-prepare-"):
+      provenance = dict(prepared.provenance)
+      provenance["selected_event_stream_sha256"] = hashlib.sha256(
+        process_name.encode("ascii"),
+      ).hexdigest()
+      return replace(prepared, provenance=provenance)
+    return prepared
+
+  monkeypatch.setattr(
+    learning_backfill,
+    "prepare_route",
+    helper_distinct_prepare,
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "backfill_nondeterministic"
+  paths = runtime_factory().artifact_paths
+  assert not paths.backfill_pointer.exists()
+  assert not paths.evidence.exists()
+  assert not paths.manifest.exists()
+  assert not paths.backfill_ledger.exists()
+
+
+def test_stale_prepared_route_scratch_is_scavenged_selectively(
+  tmp_path: Path,
+) -> None:
+  artifact_root = tmp_path / "artifact"
+  artifact_root.mkdir()
+  stale = artifact_root / (
+    f"{learning_backfill.BACKFILL_SPOOL_DIRECTORY_PREFIX}1-deadbeef"
+  )
+  stale.mkdir()
+  (stale / "abandoned.blatspool").write_bytes(b"partial")
+  unrelated = artifact_root / ".another-component-scratch"
+  unrelated.mkdir()
+  (unrelated / "keep").write_bytes(b"owned elsewhere")
+
+  learning_backfill.cleanup_stale_prepared_route_spools(artifact_root)
+
+  assert not stale.exists()
+  assert unrelated.is_dir()
+  assert (unrelated / "keep").read_bytes() == b"owned elsewhere"
+
+
+@pytest.mark.parametrize("unsafe_kind", ("file", "symlink"))
+def test_stale_prepared_route_scratch_unsafe_type_fails_closed(
+  tmp_path: Path,
+  unsafe_kind: str,
+) -> None:
+  artifact_root = tmp_path / "artifact"
+  artifact_root.mkdir()
+  unsafe = artifact_root / (
+    f"{learning_backfill.BACKFILL_SPOOL_DIRECTORY_PREFIX}2-bad0cafe"
+  )
+  target = tmp_path / "outside"
+  target.mkdir()
+  if unsafe_kind == "file":
+    unsafe.write_bytes(b"not a private directory")
+  else:
+    unsafe.symlink_to(target, target_is_directory=True)
+
+  with pytest.raises(BackfillError) as raised:
+    learning_backfill.cleanup_stale_prepared_route_spools(artifact_root)
+
+  assert raised.value.diagnostic == "backfill_spool_invalid"
+  assert os.path.lexists(unsafe)
+  assert target.is_dir()
+
+
+def test_four_worker_helper_failure_reaps_every_child_and_publishes_nothing(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  add_route(tmp_path / "logs", 0x20)
+  engine, _params, _calls, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    replay_worker_count=4,
+  )
+  deterministic_prepare = learning_backfill.prepare_route
+  children_before = {
+    child.pid
+    for child in learning_backfill.multiprocessing.active_children()
+  }
+
+  def fail_in_helper(route, **kwargs):
+    if learning_backfill.multiprocessing.current_process().name.startswith(
+      "blatv2-prepare-",
+    ):
+      raise BackfillError(
+        "injected_helper_failure",
+        f"helper rejected {route.route_name}",
+      )
+    return deterministic_prepare(route, **kwargs)
+
+  monkeypatch.setattr(learning_backfill, "prepare_route", fail_in_helper)
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "injected_helper_failure"
+  assert {
+    child.pid
+    for child in learning_backfill.multiprocessing.active_children()
+  } == children_before
+  paths = runtime_factory().artifact_paths
+  assert not paths.backfill_pointer.exists()
+  assert not paths.evidence.exists()
+  assert not paths.manifest.exists()
+  assert not paths.backfill_ledger.exists()
+  assert not tuple(paths.root.glob(
+    f"{learning_backfill.BACKFILL_SPOOL_DIRECTORY_PREFIX}*",
+  ))
+
+
+@pytest.mark.parametrize("parallel_worker_count", (2, 4))
+def test_parallel_verification_keeps_existing_progress_schema_consistent(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  parallel_worker_count: int,
+) -> None:
   baseline_root = tmp_path / "baseline"
   add_route(baseline_root / "logs", 0x10, segment_count=2)
+  add_route(baseline_root / "logs", 0x20)
   baseline_engine, _, _, baseline_runtime_factory = make_engine(
     baseline_root,
     monkeypatch,
-    replay_worker_count=2,
+    replay_worker_count=parallel_worker_count,
   )
   baseline = baseline_engine.run_once()
   assert baseline.publication is not None
@@ -661,11 +1009,12 @@ def test_parallel_verification_keeps_existing_progress_schema_consistent(
 
   observed_root = tmp_path / "observed"
   add_route(observed_root / "logs", 0x10, segment_count=2)
+  add_route(observed_root / "logs", 0x20)
   engine, params, _, observed_runtime_factory = make_engine(
     observed_root,
     monkeypatch,
     with_progress=True,
-    replay_worker_count=2,
+    replay_worker_count=parallel_worker_count,
   )
 
   result = engine.run_once()
@@ -699,6 +1048,7 @@ def test_parallel_verification_keeps_existing_progress_schema_consistent(
     for value in updates
     if value["phase"] in {"reading_segment", "applying_route"}
   )
+  assert {value["pass_count"] for value in updates} == {2}
 
 
 def test_second_process_output_difference_is_nondeterministic_and_unpublished(
@@ -989,15 +1339,18 @@ def test_forked_replay_worker_propagates_error_and_reaps_child() -> None:
   assert process.exitcode == 0
 
 
-def test_parallel_engine_closes_inherited_writer_lock_in_child(
+@pytest.mark.parametrize("parallel_worker_count", (2, 4))
+def test_parallel_engine_closes_inherited_writer_lock_in_every_child(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
+  parallel_worker_count: int,
 ) -> None:
   add_route(tmp_path / "logs", 0x10)
+  add_route(tmp_path / "logs", 0x20)
   engine, _, _, _ = make_engine(
     tmp_path,
     monkeypatch,
-    replay_worker_count=2,
+    replay_worker_count=parallel_worker_count,
   )
   parent_pid = os.getpid()
   deterministic_prepare = learning_backfill.prepare_route
@@ -1029,7 +1382,7 @@ def test_parallel_engine_closes_inherited_writer_lock_in_child(
       ) == (expected_device, expected_inode):
         raise BackfillError(
           "inherited_writer_lock_open",
-          "verification worker retained the parent's writer lock",
+          "replay child retained the parent's writer lock",
         )
     return deterministic_prepare(route, **kwargs)
 
