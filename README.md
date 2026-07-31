@@ -20,9 +20,10 @@ longitudinal planner/MPC policy. Its joint product target is:
   platform safety limits.
 
 The current test revision retains up to `4.0 m/s²` at launch. Field feedback
-from route `000000d2--a62f0c1831` adds an urban-speed comfort taper after
-`10 m/s` while leaving the low-speed envelope and reaction-time jerk tune
-unchanged. Requested authority remains clamped to the deployed opendbc limit.
+from route `000000d2--a62f0c1831` now fades that extra launch authority into
+openpilot's stock acceleration gate by `10 m/s` (about `22 mph`) and follows
+the stock ceiling above it. The reaction-time jerk tune remains unchanged.
+Requested authority remains clamped to the deployed opendbc limit.
 
 Each physical decision has one owner. The planner/MPC owns trajectory
 necessity, Smooth Stops owns only the final low-speed approach and hold

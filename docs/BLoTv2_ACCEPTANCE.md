@@ -48,8 +48,8 @@ Replay must use the real production classes, not copied equations.
 - [ ] ACC and experimental-mode candidate arbitration is reviewed.
 - [x] Route `000000d2--a62f0c1831` identifies cruise authority—not PID or
   Smooth Stops—as the source of excessive 40-to-45 mph acceleration.
-- [ ] The route-derived urban taper is repeated on-road without excessive
-  throttle feel, delayed response, or added speed overshoot.
+- [ ] The route-derived stock-gate handoff is repeated on-road without
+  excessive throttle feel, delayed response, or added speed overshoot.
 
 Report at least:
 
