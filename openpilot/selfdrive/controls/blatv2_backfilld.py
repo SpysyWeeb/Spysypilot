@@ -298,7 +298,10 @@ class BlatV2BackfillDaemon:
     # the cancelled offroad transaction and must not overwrite live status.
     if self._abort_requested():
       return
-    self.backfill_progress.clear()
+    try:
+      self.backfill_progress.clear()
+    except Exception:
+      cloudlog.exception("blatv2 backfill progress cleanup failed")
     last = self.operation_status.last_payload
     continuing_operation = last is not None and last["terminal"] is False
     context: dict[str, object] = {
@@ -365,10 +368,11 @@ class BlatV2BackfillDaemon:
       )
 
   def run(self) -> None:
-    car_params = self._wait_for_car_params()
-    if car_params is None:
-      return
+    car_params = None
     try:
+      car_params = self._wait_for_car_params()
+      if car_params is None:
+        return
       engine = self._build_engine(car_params)
       while not self._abort_requested():
         result = engine.run_once()
@@ -406,6 +410,14 @@ class BlatV2BackfillDaemon:
       if not self._abort_requested():
         self._publish_failure("unexpected_error", car_params)
         cloudlog.exception("blatv2 backfill failed unexpectedly")
+    finally:
+      # Progress belongs only to this offroad process. Clear it even when an
+      # onroad handoff or SIGTERM deliberately suppresses operation-status
+      # writes, so stale route coordinates cannot survive into a drive.
+      try:
+        self.backfill_progress.clear()
+      except Exception:
+        cloudlog.exception("blatv2 backfill progress cleanup failed")
 
 
 def main() -> None:

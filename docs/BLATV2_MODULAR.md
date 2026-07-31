@@ -248,7 +248,7 @@ gains.
 
 ### Display-only learning and lifecycle status
 
-The current field UI reads two rebuildable JSON caches:
+The current field UI reads three rebuildable JSON caches:
 
 - `BLaTv2LearningOperationStatus` reports the current operation instead of
   treating an unfinished replay as an empty learner. `blatv2_backfilld` owns
