@@ -383,7 +383,8 @@ class TestLearningOperationStatusParser(unittest.TestCase):
     )
     self.assertEqual(presentation.title, "PROCESSING PRIOR ROUTES")
     self.assertIn("Route 2/5", presentation.detail)
-    self.assertIn("12,345 accepted", presentation.detail)
+    self.assertIn("12,345 incorporated", presentation.detail)
+    self.assertIn("678 excluded", presentation.detail)
 
   def test_scanning_has_no_invented_route_progress(self) -> None:
     payload = operation_fixture(
@@ -698,7 +699,7 @@ class TestLearningOperationStatusParser(unittest.TestCase):
     )
     self.assertEqual(
       presentation.detail,
-      "Route 1/20 | 0 accepted | 0 rejected",
+      "Route 1/20 | 0 incorporated | 0 excluded",
     )
     self.assertTrue(presentation.title.isascii())
     self.assertTrue(presentation.detail.isascii())

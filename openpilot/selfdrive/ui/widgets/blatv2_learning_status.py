@@ -1285,7 +1285,10 @@ def operation_presentation(
     )
 
   prior = "Prior snapshot shown | " if has_learning_snapshot and status.active else ""
-  counts = f"{status.accepted_sample_count:,} accepted | {status.rejected_sample_count:,} rejected"
+  counts = " | ".join((
+    f"{status.accepted_sample_count:,} incorporated",
+    f"{status.rejected_sample_count:,} excluded",
+  ))
   diagnostic = _OPERATION_DIAGNOSTIC_LABELS[status.diagnostic]
 
   if status.state == "preparing":
