@@ -14,7 +14,7 @@ import math
 import re
 
 
-LEARNING_STATUS_SCHEMA_VERSION = 1
+LEARNING_STATUS_SCHEMA_VERSION = 2
 LIFECYCLE_STATUS_SCHEMA_VERSION = 1
 LEARNING_OPERATION_STATUS_SCHEMA_VERSION = 1
 BACKFILL_PROGRESS_SCHEMA_VERSION = 1
@@ -37,34 +37,68 @@ _TOP_LEVEL_KEYS = frozenset((
   "nodes",
 ))
 _NODE_KEYS = frozenset((
-  "node_index",
-  "speed_mps",
-  "minimum_support_s",
+  "applied_torque_directions",
+  "applied_torque_span",
+  "authority_candidate_validation_rms",
+  "authority_fit_sample_count",
+  "authority_fit_support_s",
+  "authority_sample_count",
+  "authority_seed_validation_rms",
+  "authority_support_s",
+  "authority_training_count",
+  "authority_validation_count",
+  "base_sample_count",
+  "base_support_s",
+  "breakaway_candidate_validation_rms",
+  "breakaway_sample_count",
+  "breakaway_seed_validation_rms",
+  "breakaway_support_s",
+  "breakaway_training_count",
+  "breakaway_validation_count",
+  "candidate_parameters",
+  "candidate_validation_rms",
   "clean_support_s",
-  "last_drive_clean_support_s",
-  "supported_sample_count",
+  "confidence",
   "last_drive_accepted_sample_count",
+  "last_drive_authority_fit_sample_count",
+  "last_drive_authority_fit_support_s",
+  "last_drive_authority_sample_count",
+  "last_drive_authority_support_s",
+  "last_drive_base_sample_count",
+  "last_drive_base_support_s",
+  "last_drive_breakaway_sample_count",
+  "last_drive_breakaway_support_s",
+  "last_drive_clean_support_s",
+  "last_drive_moving_sample_count",
+  "last_drive_moving_support_s",
+  "lateral_accel_directions",
+  "lateral_accel_rms_mps2",
+  "lateral_accel_span_mps2",
+  "minimum_support_s",
+  "minimum_validation_support_s",
+  "moving_candidate_validation_rms",
+  "moving_sample_count",
+  "moving_seed_validation_rms",
+  "moving_support_s",
+  "moving_training_count",
+  "moving_validation_count",
+  "node_index",
+  "qualified",
+  "rack_reversals",
+  "rack_travel_deg",
+  "reasons",
+  "seed_validation_rms",
+  "speed_mps",
+  "supported_sample_count",
   "training_count",
   "validation_count",
   "validation_support_s",
-  "minimum_validation_support_s",
-  "lateral_accel_span_mps2",
-  "lateral_accel_rms_mps2",
-  "rack_travel_deg",
-  "applied_torque_span",
-  "rack_reversals",
-  "seed_validation_rms",
-  "candidate_validation_rms",
-  "confidence",
-  "qualified",
-  "reasons",
-  "candidate_parameters",
 ))
 _PARAMETER_KEYS = frozenset((
-  "torque_per_lateral_accel",
-  "rack_gain_deg_s2_per_torque",
-  "rack_damping_per_s",
   "kinetic_friction_torque",
+  "lateral_accel_offset_correction_mps2",
+  "static_breakaway_torque",
+  "torque_per_lateral_accel",
 ))
 _LIFECYCLE_KEYS = frozenset((
   "schema_version",
@@ -135,9 +169,13 @@ _REASONS = frozenset((
   "insufficient_support",
   "insufficient_validation",
   "insufficient_excitation",
+  "insufficient_moving_evidence",
+  "insufficient_breakaway_evidence",
   "singular_fit",
   "invalid_parameters",
   "validation_regression",
+  "moving_validation_regression",
+  "breakaway_validation_regression",
   "authority_validation_regression",
 ))
 _REASON_LABELS = {
@@ -145,9 +183,13 @@ _REASON_LABELS = {
   "insufficient_support": "Collecting clean driving",
   "insufficient_validation": "Needs held-out validation",
   "insufficient_excitation": "Needs more steering variety",
+  "insufficient_moving_evidence": "Needs moving-rack evidence",
+  "insufficient_breakaway_evidence": "Needs breakaway evidence",
   "singular_fit": "Fit not identifiable",
   "invalid_parameters": "Rejected: invalid fit",
   "validation_regression": "Rejected: validation regressed",
+  "moving_validation_regression": "Rejected: moving fit regressed",
+  "breakaway_validation_regression": "Rejected: breakaway fit regressed",
   "authority_validation_regression": (
     "Rejected: authority validation regressed"
   ),
@@ -156,8 +198,12 @@ _REASON_PRIORITY = (
   "insufficient_support",
   "insufficient_validation",
   "insufficient_excitation",
+  "insufficient_moving_evidence",
+  "insufficient_breakaway_evidence",
   "invalid_parameters",
   "authority_validation_regression",
+  "breakaway_validation_regression",
+  "moving_validation_regression",
   "validation_regression",
   "singular_fit",
   "qualified",
@@ -270,9 +316,9 @@ class LearningStatusError(ValueError):
 @dataclass(frozen=True, slots=True)
 class CandidateParameters:
   torque_per_lateral_accel: float
-  rack_gain_deg_s2_per_torque: float
-  rack_damping_per_s: float
+  lateral_accel_offset_correction_mps2: float
   kinetic_friction_torque: float
+  static_breakaway_torque: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +330,32 @@ class LearningNodeStatus:
   last_drive_clean_support_s: float | None
   supported_sample_count: int
   last_drive_accepted_sample_count: int | None
+  base_support_s: float
+  base_sample_count: int
+  last_drive_base_support_s: float | None
+  last_drive_base_sample_count: int | None
+  moving_support_s: float
+  moving_sample_count: int
+  moving_training_count: int
+  moving_validation_count: int
+  last_drive_moving_support_s: float | None
+  last_drive_moving_sample_count: int | None
+  breakaway_support_s: float
+  breakaway_sample_count: int
+  breakaway_training_count: int
+  breakaway_validation_count: int
+  last_drive_breakaway_support_s: float | None
+  last_drive_breakaway_sample_count: int | None
+  authority_support_s: float
+  authority_sample_count: int
+  authority_fit_support_s: float
+  authority_fit_sample_count: int
+  authority_training_count: int
+  authority_validation_count: int
+  last_drive_authority_support_s: float | None
+  last_drive_authority_sample_count: int | None
+  last_drive_authority_fit_support_s: float | None
+  last_drive_authority_fit_sample_count: int | None
   training_count: int
   validation_count: int
   validation_support_s: float
@@ -293,8 +365,16 @@ class LearningNodeStatus:
   rack_travel_deg: float
   applied_torque_span: float
   rack_reversals: int
+  lateral_accel_directions: int
+  applied_torque_directions: int
   seed_validation_rms: float | None
   candidate_validation_rms: float | None
+  moving_seed_validation_rms: float | None
+  moving_candidate_validation_rms: float | None
+  breakaway_seed_validation_rms: float | None
+  breakaway_candidate_validation_rms: float | None
+  authority_seed_validation_rms: float | None
+  authority_candidate_validation_rms: float | None
   confidence: float
   qualified: bool
   reasons: tuple[str, ...]
@@ -334,8 +414,18 @@ class LearningNodeStatus:
         "insufficient_support",
         "insufficient_validation",
         "insufficient_excitation",
+        "insufficient_moving_evidence",
+        "insufficient_breakaway_evidence",
       )
     )
+
+  @property
+  def moving_ready(self) -> bool:
+    return "insufficient_moving_evidence" not in self.reasons
+
+  @property
+  def breakaway_ready(self) -> bool:
+    return "insufficient_breakaway_evidence" not in self.reasons
 
 
 @dataclass(frozen=True, slots=True)
@@ -527,6 +617,15 @@ def _number(value: object, field: str, *, nullable: bool = False) -> float | Non
   return result
 
 
+def _signed_number(value: object, field: str) -> float:
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise LearningStatusError("malformed", f"{field} must be numeric")
+  result = float(value)
+  if not math.isfinite(result):
+    raise LearningStatusError("malformed", f"{field} must be finite")
+  return 0.0 if result == 0.0 else result
+
+
 def _text(value: object, field: str) -> str:
   if type(value) is not str or not value.strip():
     raise LearningStatusError("malformed", f"{field} must be non-empty text")
@@ -575,24 +674,35 @@ def _candidate_parameters(
   if value is None:
     return None
   payload = _exact_object(value, _PARAMETER_KEYS, field)
-  return CandidateParameters(
+  parameters = CandidateParameters(
     torque_per_lateral_accel=_number(
       payload["torque_per_lateral_accel"],
       f"{field}.torque_per_lateral_accel",
     ),
-    rack_gain_deg_s2_per_torque=_number(
-      payload["rack_gain_deg_s2_per_torque"],
-      f"{field}.rack_gain_deg_s2_per_torque",
-    ),
-    rack_damping_per_s=_number(
-      payload["rack_damping_per_s"],
-      f"{field}.rack_damping_per_s",
+    lateral_accel_offset_correction_mps2=_signed_number(
+      payload["lateral_accel_offset_correction_mps2"],
+      f"{field}.lateral_accel_offset_correction_mps2",
     ),
     kinetic_friction_torque=_number(
       payload["kinetic_friction_torque"],
       f"{field}.kinetic_friction_torque",
     ),
+    static_breakaway_torque=_number(
+      payload["static_breakaway_torque"],
+      f"{field}.static_breakaway_torque",
+    ),
   )
+  if parameters.torque_per_lateral_accel <= 0.0:
+    raise LearningStatusError(
+      "malformed",
+      f"{field}.torque_per_lateral_accel must be positive",
+    )
+  if parameters.kinetic_friction_torque > parameters.static_breakaway_torque:
+    raise LearningStatusError(
+      "malformed",
+      f"{field} kinetic friction exceeds static breakaway",
+    )
+  return parameters
 
 
 def _node(value: object, position: int) -> LearningNodeStatus:
@@ -626,7 +736,7 @@ def _node(value: object, position: int) -> LearningNodeStatus:
   if confidence > 1.0:
     raise LearningStatusError("malformed", f"{field}.confidence exceeds one")
 
-  return LearningNodeStatus(
+  node = LearningNodeStatus(
     node_index=index,
     speed_mps=_number(payload["speed_mps"], f"{field}.speed_mps"),
     minimum_support_s=_number(
@@ -649,6 +759,120 @@ def _node(value: object, position: int) -> LearningNodeStatus:
     last_drive_accepted_sample_count=_integer(
       payload["last_drive_accepted_sample_count"],
       f"{field}.last_drive_accepted_sample_count",
+      nullable=True,
+    ),
+    base_support_s=_number(
+      payload["base_support_s"],
+      f"{field}.base_support_s",
+    ),
+    base_sample_count=_integer(
+      payload["base_sample_count"],
+      f"{field}.base_sample_count",
+    ),
+    last_drive_base_support_s=_number(
+      payload["last_drive_base_support_s"],
+      f"{field}.last_drive_base_support_s",
+      nullable=True,
+    ),
+    last_drive_base_sample_count=_integer(
+      payload["last_drive_base_sample_count"],
+      f"{field}.last_drive_base_sample_count",
+      nullable=True,
+    ),
+    moving_support_s=_number(
+      payload["moving_support_s"],
+      f"{field}.moving_support_s",
+    ),
+    moving_sample_count=_integer(
+      payload["moving_sample_count"],
+      f"{field}.moving_sample_count",
+    ),
+    moving_training_count=_integer(
+      payload["moving_training_count"],
+      f"{field}.moving_training_count",
+    ),
+    moving_validation_count=_integer(
+      payload["moving_validation_count"],
+      f"{field}.moving_validation_count",
+    ),
+    last_drive_moving_support_s=_number(
+      payload["last_drive_moving_support_s"],
+      f"{field}.last_drive_moving_support_s",
+      nullable=True,
+    ),
+    last_drive_moving_sample_count=_integer(
+      payload["last_drive_moving_sample_count"],
+      f"{field}.last_drive_moving_sample_count",
+      nullable=True,
+    ),
+    breakaway_support_s=_number(
+      payload["breakaway_support_s"],
+      f"{field}.breakaway_support_s",
+    ),
+    breakaway_sample_count=_integer(
+      payload["breakaway_sample_count"],
+      f"{field}.breakaway_sample_count",
+    ),
+    breakaway_training_count=_integer(
+      payload["breakaway_training_count"],
+      f"{field}.breakaway_training_count",
+    ),
+    breakaway_validation_count=_integer(
+      payload["breakaway_validation_count"],
+      f"{field}.breakaway_validation_count",
+    ),
+    last_drive_breakaway_support_s=_number(
+      payload["last_drive_breakaway_support_s"],
+      f"{field}.last_drive_breakaway_support_s",
+      nullable=True,
+    ),
+    last_drive_breakaway_sample_count=_integer(
+      payload["last_drive_breakaway_sample_count"],
+      f"{field}.last_drive_breakaway_sample_count",
+      nullable=True,
+    ),
+    authority_support_s=_number(
+      payload["authority_support_s"],
+      f"{field}.authority_support_s",
+    ),
+    authority_sample_count=_integer(
+      payload["authority_sample_count"],
+      f"{field}.authority_sample_count",
+    ),
+    authority_fit_support_s=_number(
+      payload["authority_fit_support_s"],
+      f"{field}.authority_fit_support_s",
+    ),
+    authority_fit_sample_count=_integer(
+      payload["authority_fit_sample_count"],
+      f"{field}.authority_fit_sample_count",
+    ),
+    authority_training_count=_integer(
+      payload["authority_training_count"],
+      f"{field}.authority_training_count",
+    ),
+    authority_validation_count=_integer(
+      payload["authority_validation_count"],
+      f"{field}.authority_validation_count",
+    ),
+    last_drive_authority_support_s=_number(
+      payload["last_drive_authority_support_s"],
+      f"{field}.last_drive_authority_support_s",
+      nullable=True,
+    ),
+    last_drive_authority_sample_count=_integer(
+      payload["last_drive_authority_sample_count"],
+      f"{field}.last_drive_authority_sample_count",
+      nullable=True,
+    ),
+    last_drive_authority_fit_support_s=_number(
+      payload["last_drive_authority_fit_support_s"],
+      f"{field}.last_drive_authority_fit_support_s",
+      nullable=True,
+    ),
+    last_drive_authority_fit_sample_count=_integer(
+      payload["last_drive_authority_fit_sample_count"],
+      f"{field}.last_drive_authority_fit_sample_count",
       nullable=True,
     ),
     training_count=_integer(
@@ -687,6 +911,14 @@ def _node(value: object, position: int) -> LearningNodeStatus:
       payload["rack_reversals"],
       f"{field}.rack_reversals",
     ),
+    lateral_accel_directions=_integer(
+      payload["lateral_accel_directions"],
+      f"{field}.lateral_accel_directions",
+    ),
+    applied_torque_directions=_integer(
+      payload["applied_torque_directions"],
+      f"{field}.applied_torque_directions",
+    ),
     seed_validation_rms=_number(
       payload["seed_validation_rms"],
       f"{field}.seed_validation_rms",
@@ -697,6 +929,36 @@ def _node(value: object, position: int) -> LearningNodeStatus:
       f"{field}.candidate_validation_rms",
       nullable=True,
     ),
+    moving_seed_validation_rms=_number(
+      payload["moving_seed_validation_rms"],
+      f"{field}.moving_seed_validation_rms",
+      nullable=True,
+    ),
+    moving_candidate_validation_rms=_number(
+      payload["moving_candidate_validation_rms"],
+      f"{field}.moving_candidate_validation_rms",
+      nullable=True,
+    ),
+    breakaway_seed_validation_rms=_number(
+      payload["breakaway_seed_validation_rms"],
+      f"{field}.breakaway_seed_validation_rms",
+      nullable=True,
+    ),
+    breakaway_candidate_validation_rms=_number(
+      payload["breakaway_candidate_validation_rms"],
+      f"{field}.breakaway_candidate_validation_rms",
+      nullable=True,
+    ),
+    authority_seed_validation_rms=_number(
+      payload["authority_seed_validation_rms"],
+      f"{field}.authority_seed_validation_rms",
+      nullable=True,
+    ),
+    authority_candidate_validation_rms=_number(
+      payload["authority_candidate_validation_rms"],
+      f"{field}.authority_candidate_validation_rms",
+      nullable=True,
+    ),
     confidence=confidence,
     qualified=qualified,
     reasons=tuple(reasons),
@@ -705,6 +967,39 @@ def _node(value: object, position: int) -> LearningNodeStatus:
       f"{field}.candidate_parameters",
     ),
   )
+  if not math.isclose(
+    node.clean_support_s,
+    node.base_support_s + node.moving_support_s + node.breakaway_support_s,
+    rel_tol=0.0,
+    abs_tol=1e-12,
+  ):
+    raise LearningStatusError(
+      "malformed",
+      f"{field} clean support populations disagree",
+    )
+  if node.supported_sample_count != (
+    node.base_sample_count
+    + node.moving_sample_count
+    + node.breakaway_sample_count
+  ):
+    raise LearningStatusError(
+      "malformed",
+      f"{field} clean sample populations disagree",
+    )
+  if (
+    node.authority_fit_support_s > node.authority_support_s + 1e-12
+    or node.authority_fit_sample_count > node.authority_sample_count
+  ):
+    raise LearningStatusError(
+      "malformed",
+      f"{field} authority fit exceeds authority evidence",
+    )
+  if node.qualified and node.candidate_parameters is None:
+    raise LearningStatusError(
+      "malformed",
+      f"{field} qualified node lacks candidate parameters",
+    )
+  return node
 
 
 def parse_learning_status(
@@ -770,14 +1065,22 @@ def parse_learning_status(
     "last_drive_complete",
   )
   for node in nodes:
-    node_complete = (
-      node.last_drive_clean_support_s is not None
-      and node.last_drive_accepted_sample_count is not None
+    delta_values = (
+      node.last_drive_clean_support_s,
+      node.last_drive_accepted_sample_count,
+      node.last_drive_base_support_s,
+      node.last_drive_base_sample_count,
+      node.last_drive_moving_support_s,
+      node.last_drive_moving_sample_count,
+      node.last_drive_breakaway_support_s,
+      node.last_drive_breakaway_sample_count,
+      node.last_drive_authority_support_s,
+      node.last_drive_authority_sample_count,
+      node.last_drive_authority_fit_support_s,
+      node.last_drive_authority_fit_sample_count,
     )
-    node_empty = (
-      node.last_drive_clean_support_s is None
-      and node.last_drive_accepted_sample_count is None
-    )
+    node_complete = all(value is not None for value in delta_values)
+    node_empty = all(value is None for value in delta_values)
     if (last_drive_complete and not node_complete) or (
       not last_drive_complete and not node_empty
     ):
@@ -785,7 +1088,6 @@ def parse_learning_status(
         "malformed",
         "last-drive completeness and node deltas disagree",
       )
-
   all_nodes_qualified = _bool(
     data["all_nodes_qualified"],
     "all_nodes_qualified",

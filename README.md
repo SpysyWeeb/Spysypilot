@@ -13,12 +13,15 @@ Replaces the "upgrade to comma prime" panel on the home screen with four
 cycling windows. Tap the left half to go back or the right half to advance:
 
 1. **BLaTv2 Learning** — a two-column grid of the vehicle's learned speed
-   nodes. Each node shows credited clean support, its node-specific minimum,
-   qualification state, and the last completed drive's contribution. A
+   nodes. Each node shows overall clean support, independent base/moving/
+   breakaway/authority evidence, its node-specific minimum, qualification
+   state, and the last completed drive's contribution. A
    prominent banner reports live collection, finalization, retry, and
    historical-route processing without replacing the last validated snapshot.
-2. **Readiness & Activation** — time, held-out validation, motion/excitation,
-   and fit status for every node, plus an independent controller lifecycle
+2. **Readiness & Activation** — moving, breakaway, held-out validation, and
+   authority evidence for every node. When a candidate exists it shows the
+   observable inverse-torque gain, signed lateral-acceleration offset, and
+   kinetic/static friction values, plus an independent controller lifecycle
    rail.
 3. **Live terminal** — a scrolling, colorized console of openpilot output.
 4. **System usage** — CPU/RAM/power/fan history plus storage used/total.
@@ -50,6 +53,11 @@ build republishes them. The reader cross-checks their vehicle and runtime
 identity. Missing, malformed, incompatible, or wrong-vehicle data is shown as
 unavailable and never guessed.
 
+Learning schema v2 uses the observable-calibration runtime identity, while the
+lifecycle projection uses the independently gated live-controller artifact
+identity. The UI validates both hashes and the common vehicle identity, but
+does not equate those deliberately separate identity namespaces.
+
 Operational status never replaces persisted results. While a drive is being
 finalized or older compatible routes are being replayed, both learning pages
 continue to show the prior validated `BLaTv2LearningStatus` snapshot beneath
@@ -60,9 +68,10 @@ explicitly publishes `ready_no_evidence`.
 
 The UI never parses rlogs, evidence, manifests, or profiles. It never trains,
 fits, stages, approves, resets, or writes learning state. A full time bar means
-only that the clean-support minimum is met; validation, steering variety, and
-a physically valid fit remain separately visible. Likewise,
-`all_nodes_qualified` means a complete fit exists, not that it is steering.
+only that the clean-support minimum is met; moving-rack, breakaway, authority,
+held-out validation, steering variety, and a valid observable calibration
+remain separately visible. Likewise, `all_nodes_qualified` means a complete
+calibration exists, not that it is steering.
 Only `BLaTv2LifecycleStatus` may label a controller provisional or approved.
 
 ## Status semantics

@@ -44,14 +44,44 @@ def node_fixture(
   reasons: list[str] | None = None,
   last_drive_complete: bool = True,
 ) -> dict:
+  base_support_s = clean_support_s * 0.5
+  moving_support_s = clean_support_s * 0.3
+  breakaway_support_s = clean_support_s - base_support_s - moving_support_s
+  last_drive_clean_support_s = 12.5 if last_drive_complete else None
   return {
     "node_index": index,
     "speed_mps": float((0, 5, 10, 15, 20, 30)[index]),
     "minimum_support_s": minimum_support_s,
     "clean_support_s": clean_support_s,
-    "last_drive_clean_support_s": 12.5 if last_drive_complete else None,
+    "last_drive_clean_support_s": last_drive_clean_support_s,
     "supported_sample_count": 6000,
     "last_drive_accepted_sample_count": 1250 if last_drive_complete else None,
+    "base_support_s": base_support_s,
+    "base_sample_count": 3000,
+    "last_drive_base_support_s": 6.25 if last_drive_complete else None,
+    "last_drive_base_sample_count": 625 if last_drive_complete else None,
+    "moving_support_s": moving_support_s,
+    "moving_sample_count": 1800,
+    "moving_training_count": 1440,
+    "moving_validation_count": 360,
+    "last_drive_moving_support_s": 3.75 if last_drive_complete else None,
+    "last_drive_moving_sample_count": 375 if last_drive_complete else None,
+    "breakaway_support_s": breakaway_support_s,
+    "breakaway_sample_count": 1200,
+    "breakaway_training_count": 960,
+    "breakaway_validation_count": 240,
+    "last_drive_breakaway_support_s": 2.5 if last_drive_complete else None,
+    "last_drive_breakaway_sample_count": 250 if last_drive_complete else None,
+    "authority_support_s": 5.0,
+    "authority_sample_count": 500,
+    "authority_fit_support_s": 3.0,
+    "authority_fit_sample_count": 300,
+    "authority_training_count": 240,
+    "authority_validation_count": 60,
+    "last_drive_authority_support_s": 1.0 if last_drive_complete else None,
+    "last_drive_authority_sample_count": 100 if last_drive_complete else None,
+    "last_drive_authority_fit_support_s": 0.8 if last_drive_complete else None,
+    "last_drive_authority_fit_sample_count": 80 if last_drive_complete else None,
     "training_count": 4800,
     "validation_count": 1200,
     "validation_support_s": 24.0,
@@ -61,8 +91,16 @@ def node_fixture(
     "rack_travel_deg": 200.0,
     "applied_torque_span": 0.2,
     "rack_reversals": 6,
+    "lateral_accel_directions": 2,
+    "applied_torque_directions": 2,
     "seed_validation_rms": 0.1,
     "candidate_validation_rms": 0.08,
+    "moving_seed_validation_rms": 0.11,
+    "moving_candidate_validation_rms": 0.07,
+    "breakaway_seed_validation_rms": 0.12,
+    "breakaway_candidate_validation_rms": 0.075,
+    "authority_seed_validation_rms": 0.13,
+    "authority_candidate_validation_rms": 0.09,
     "confidence": 0.8,
     "qualified": qualified,
     "reasons": (
@@ -75,9 +113,9 @@ def node_fixture(
     "candidate_parameters": (
       {
         "torque_per_lateral_accel": 0.3,
-        "rack_gain_deg_s2_per_torque": 4000.0,
-        "rack_damping_per_s": 10.0,
+        "lateral_accel_offset_correction_mps2": -0.04,
         "kinetic_friction_torque": 0.03,
+        "static_breakaway_torque": 0.09,
       }
       if qualified
       else None
@@ -106,7 +144,7 @@ def learning_fixture(*, last_drive_complete: bool = True) -> dict:
     last_drive_complete=last_drive_complete,
   )
   return {
-    "schema_version": 1,
+    "schema_version": 2,
     "informational_only": True,
     "vehicle_identity": VEHICLE,
     "runtime_identity_sha256": RUNTIME_HASH,
@@ -258,6 +296,51 @@ def backfill_progress_fixture(
 
 
 class TestLearningStatusParser(unittest.TestCase):
+  def test_schema_v2_exposes_observable_calibration_and_evidence(self) -> None:
+    status = parse_learning_status(
+      learning_fixture(),
+      expected_vehicle_identity=VEHICLE,
+    )
+    node = status.nodes[1]
+    self.assertEqual(node.base_support_s, 75.0)
+    self.assertEqual(node.moving_support_s, 45.0)
+    self.assertEqual(node.breakaway_support_s, 30.0)
+    self.assertEqual(node.authority_fit_sample_count, 300)
+    self.assertEqual(node.last_drive_base_sample_count, 625)
+    self.assertEqual(node.last_drive_moving_sample_count, 375)
+    self.assertEqual(node.last_drive_breakaway_sample_count, 250)
+    self.assertEqual(node.last_drive_authority_fit_sample_count, 80)
+    self.assertEqual(node.moving_candidate_validation_rms, 0.07)
+    self.assertEqual(node.breakaway_candidate_validation_rms, 0.075)
+    self.assertEqual(node.authority_candidate_validation_rms, 0.09)
+    self.assertIsNotNone(node.candidate_parameters)
+    self.assertEqual(
+      node.candidate_parameters.lateral_accel_offset_correction_mps2,
+      -0.04,
+    )
+    self.assertEqual(node.candidate_parameters.static_breakaway_torque, 0.09)
+    self.assertFalse(hasattr(node.candidate_parameters, "rack_gain_deg_s2_per_torque"))
+
+  def test_schema_v2_rejects_legacy_rack_parameters(self) -> None:
+    payload = learning_fixture()
+    parameters = payload["nodes"][1]["candidate_parameters"]
+    parameters["rack_gain_deg_s2_per_torque"] = 4000.0
+    with self.assertRaisesRegex(LearningStatusError, "keys do not match"):
+      parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
+
+  def test_population_invariants_fail_closed(self) -> None:
+    mutations = (
+      ("clean_support_s", 61.0, "clean support populations"),
+      ("supported_sample_count", 6001, "clean sample populations"),
+      ("authority_fit_sample_count", 501, "authority fit exceeds"),
+    )
+    for field, value, message in mutations:
+      with self.subTest(field=field):
+        payload = learning_fixture()
+        payload["nodes"][2][field] = value
+        with self.assertRaisesRegex(LearningStatusError, message):
+          parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
+
   def test_six_node_fixture_and_full_time_blocked_node(self) -> None:
     status = parse_learning_status(
       learning_fixture(),
@@ -290,6 +373,21 @@ class TestLearningStatusParser(unittest.TestCase):
     self.assertEqual(node.primary_reason, "singular_fit")
     self.assertTrue(node.collection_complete)
 
+  def test_moving_and_breakaway_are_independent_readiness_blockers(self) -> None:
+    payload = learning_fixture()
+    payload["nodes"][2]["reasons"] = [
+      "insufficient_moving_evidence",
+      "insufficient_breakaway_evidence",
+    ]
+    node = parse_learning_status(
+      payload,
+      expected_vehicle_identity=VEHICLE,
+    ).nodes[2]
+    self.assertEqual(node.primary_reason, "insufficient_moving_evidence")
+    self.assertFalse(node.moving_ready)
+    self.assertFalse(node.breakaway_ready)
+    self.assertFalse(node.collection_complete)
+
   def test_authority_validation_regression_is_specific_and_complete(
     self,
   ) -> None:
@@ -321,6 +419,15 @@ class TestLearningStatusParser(unittest.TestCase):
         for node in status.nodes
       ),
     )
+    self.assertTrue(
+      all(
+        node.last_drive_base_support_s is None
+        and node.last_drive_moving_support_s is None
+        and node.last_drive_breakaway_support_s is None
+        and node.last_drive_authority_support_s is None
+        for node in status.nodes
+      ),
+    )
 
   def test_mixed_last_drive_completeness_is_rejected(self) -> None:
     payload = learning_fixture(last_drive_complete=False)
@@ -337,7 +444,7 @@ class TestLearningStatusParser(unittest.TestCase):
     self.assertEqual(malformed.exception.code, "malformed")
 
     payload = learning_fixture()
-    payload["schema_version"] = 2
+    payload["schema_version"] = 1
     with self.assertRaises(LearningStatusError) as mismatch:
       parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
     self.assertEqual(mismatch.exception.code, "schema_mismatch")
@@ -368,9 +475,9 @@ class TestLearningStatusParser(unittest.TestCase):
       node["reasons"] = ["qualified"]
       node["candidate_parameters"] = {
         "torque_per_lateral_accel": 0.3,
-        "rack_gain_deg_s2_per_torque": 4000.0,
-        "rack_damping_per_s": 10.0,
+        "lateral_accel_offset_correction_mps2": -0.04,
         "kinetic_friction_torque": 0.03,
+        "static_breakaway_torque": 0.09,
       }
     payload["all_nodes_qualified"] = True
     payload["candidate_profile_sha256"] = "c" * 64
@@ -1327,6 +1434,33 @@ class TestLearningStatusSource(unittest.TestCase):
       self.widget_module.BLaTv2ReadinessWidget._fit_text(node),
       "REGRESSED",
     )
+
+  def test_calibration_text_reports_only_observable_values(self) -> None:
+    node = parse_learning_status(
+      learning_fixture(),
+      expected_vehicle_identity=VEHICLE,
+    ).nodes[1]
+    text = self.widget_module.BLaTv2ReadinessWidget._calibration_text(node)
+    self.assertEqual(text, "G .300 O -.040 K/S .030/.090")
+    self.assertNotIn("DAMP", text)
+    self.assertNotIn("RACK", text)
+
+  def test_calibration_and_lifecycle_identity_namespaces_are_independent(
+    self,
+  ) -> None:
+    values = self.params_values()
+    values["BLaTv2LifecycleStatus"] = lifecycle_fixture(
+      runtime_hash="f" * 64,
+    )
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      snapshot = self.source(_DashboardParams(values)).snapshot
+    self.assertEqual(snapshot.learning.runtime_identity_sha256, RUNTIME_HASH)
+    self.assertEqual(snapshot.lifecycle.runtime_identity_sha256, "f" * 64)
+    self.assertIsNone(snapshot.lifecycle_error_code)
 
   def test_param_read_exceptions_remain_distinct_and_render_red(self) -> None:
     expectations = (
