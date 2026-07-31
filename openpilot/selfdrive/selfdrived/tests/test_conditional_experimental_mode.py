@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import openpilot.selfdrive.selfdrived.selfdrived as selfdrived
+from openpilot.selfdrive.controls.lib.conditional_experimental_mode import ConditionalExperimentalMode
 from openpilot.selfdrive.selfdrived.selfdrived import SelfdriveD
 
 
@@ -75,6 +76,38 @@ def test_driver_override_has_priority_over_manual_and_conditional_requests():
 def test_mode_is_disabled_without_openpilot_longitudinal_control():
   instance = selfdrive_for_mode_update(conditional_request=True, manual_request=True, longitudinal=False)
   instance.update_experimental_mode(SimpleNamespace())
+  assert not instance.experimental_mode
+
+
+def test_real_stop_detector_request_reaches_effective_mode_and_releases():
+  instance = selfdrive_for_mode_update(conditional_request=False)
+  instance.conditional_experimental_mode = ConditionalExperimentalMode(control_dt=0.05, model_dt=0.05)
+  instance.sm['modelV2'] = SimpleNamespace(
+    action=SimpleNamespace(shouldStop=False, desiredAcceleration=-0.3, desiredCurvature=0.0),
+    position=SimpleNamespace(x=[0.0, 30.0]),
+    velocity=SimpleNamespace(x=[10.0, 0.2]),
+  )
+  instance.sm['radarState'] = SimpleNamespace(leadOne=SimpleNamespace(present=False, dRel=1000.0))
+  CS = SimpleNamespace(
+    vEgo=10.0,
+    standstill=False,
+    gasPressed=False,
+    brakePressed=False,
+    leftBlinker=False,
+    rightBlinker=False,
+    steeringAngleDeg=0.0,
+  )
+
+  for _ in range(30):
+    instance.update_experimental_mode(CS)
+  assert instance.experimental_mode
+
+  instance.sm['modelV2'].action.shouldStop = False
+  instance.sm['modelV2'].action.desiredAcceleration = 0.0
+  instance.sm['modelV2'].position.x = [0.0, 90.0]
+  instance.sm['modelV2'].velocity.x = [10.0, 10.0]
+  for _ in range(60):
+    instance.update_experimental_mode(CS)
   assert not instance.experimental_mode
 
 
