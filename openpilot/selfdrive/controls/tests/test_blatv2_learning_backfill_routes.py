@@ -154,8 +154,12 @@ def source_message(service: str, cp: car.CarParams) -> object:
 def extracted_fixture(
   cp: car.CarParams,
   *,
+  base_ns: int = 1_000_000_000,
   control_count: int = 200,
+  encoded_prefix: str = "event",
+  end_sentinel: str = "endOfRoute",
   source_mode: str = "all",
+  start_sentinel: str = "startOfRoute",
   invalid_kind: str | None = None,
   dirty: bool = False,
   dongle_id: str = DONGLE_ID,
@@ -183,7 +187,7 @@ def extracted_fixture(
       payload=payload,
     ))
 
-  base = 1_000_000_000
+  base = base_ns
   if structure != "missing_init":
     add(
       "initData",
@@ -211,7 +215,7 @@ def extracted_fixture(
   add(
     "sentinel",
     base - 20_000_000,
-    payload="startOfRoute",
+    payload=start_sentinel,
   )
   add(
     "carParams",
@@ -254,7 +258,7 @@ def extracted_fixture(
     add("controlsState", timestamp)
 
   end_time = base + control_count * 10_000_000 + 40_000_000
-  add("sentinel", end_time, payload="endOfRoute")
+  add("sentinel", end_time, payload=end_sentinel)
   if structure == "payload_after_end":
     add(
       "carState",
@@ -265,7 +269,7 @@ def extracted_fixture(
   mapping: dict[bytes, FakeEvent] = {}
   records = []
   for ordinal, event in enumerate(events):
-    encoded = f"event-{ordinal}".encode("ascii")
+    encoded = f"{encoded_prefix}-{ordinal}".encode("ascii")
     mapping[encoded] = event
     records.append(ExtractedEvent(
       which=learning_backfill._EVENT_WHICH[event.which()],
@@ -378,6 +382,80 @@ def test_segment_progress_callbacks_do_not_change_prepared_route(
   assert callbacks == [
     ("started", 0, 1, 1),
     ("completed", 0, 1, 1),
+  ]
+
+
+def test_segment_progress_callbacks_cover_real_two_segment_prepare(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  palisade_cp: car.CarParams,
+) -> None:
+  first_records, first_events = extracted_fixture(
+    palisade_cp,
+    control_count=100,
+    encoded_prefix="segment-0",
+    end_sentinel="endOfSegment",
+  )
+  second_records, second_events = extracted_fixture(
+    palisade_cp,
+    base_ns=2_000_000_000,
+    control_count=100,
+    encoded_prefix="segment-1",
+    start_sentinel="startOfSegment",
+  )
+  events = {**first_events, **second_events}
+  records_by_path: dict[Path, tuple[ExtractedEvent, ...]] = {}
+  segments = []
+  for index, records in enumerate((first_records, second_records)):
+    path = tmp_path / f"rlog--{index:02d}"
+    path.write_bytes(f"immutable-rlog-{index}".encode("ascii"))
+    segments.append(RouteSegment(
+      index=index,
+      path=path,
+      sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+      size_bytes=path.stat().st_size,
+    ))
+    records_by_path[path] = records
+  route = RouteCandidate(
+    route_name="00000001--0000000001",
+    route_counter=1,
+    segments=tuple(segments),
+  )
+  current_bundle, _, _ = build_detected_runtime_bundle(
+    car_params=palisade_cp,
+    provisional_rack_dynamics=rack_dynamics(),
+  )
+  monkeypatch.setattr(
+    learning_backfill,
+    "extract_segment_events",
+    lambda _extractor, path, **_kwargs: records_by_path[Path(path)],
+  )
+  callbacks: list[tuple[str, int, int, int]] = []
+
+  prepared = prepare_route(
+    route,
+    extractor_path=tmp_path / "unused-extractor",
+    event_reader=lambda encoded: FakeEventContext(events[encoded]),
+    car_params_decoder=lambda _encoded: palisade_cp,
+    descriptor_registry=BuildDescriptorRegistry((reviewed_descriptor(),)),
+    route_bundle_factory=lambda _route_cp, _descriptor: current_bundle,
+    current_car_params=palisade_cp,
+    current_bundle=current_bundle,
+    expected_dongle_id=DONGLE_ID,
+    segment_started=lambda segment, index, count: callbacks.append(
+      ("started", segment.index, index, count),
+    ),
+    segment_completed=lambda segment, index, count: callbacks.append(
+      ("completed", segment.index, index, count),
+    ),
+  )
+
+  assert len(prepared.frames) == 200
+  assert callbacks == [
+    ("started", 0, 1, 2),
+    ("completed", 0, 1, 2),
+    ("started", 1, 2, 2),
+    ("completed", 1, 2, 2),
   ]
 
 

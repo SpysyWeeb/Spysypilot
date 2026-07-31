@@ -312,6 +312,44 @@ def test_daemon_stays_healthy_after_noop_without_rescanning(
   daemon._project_learning_status.assert_called_once_with(engine, None)
 
 
+def test_onroad_handoff_clears_progress_without_overwriting_live_status(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    extractor_path=tmp_path / "extractor",
+    descriptor_path=tmp_path / "descriptors.json",
+  )
+  params.values[BACKFILL_PROGRESS_PARAM] = {"active": "offroad-progress"}
+  engine = SimpleNamespace(
+    run_once=MagicMock(
+      return_value=BackfillRunResult(
+        publication=None,
+        pending_logger_close=False,
+      ),
+    ),
+  )
+  daemon._wait_for_car_params = MagicMock(return_value=object())
+  daemon._build_engine = MagicMock(return_value=engine)
+  live_status = {"owner": "live-manager-transition"}
+
+  def transition_onroad(
+    _engine: object,
+    _publication: object,
+  ) -> None:
+    params.values["IsOffroad"] = False
+    params.values[LEARNING_OPERATION_STATUS_PARAM] = live_status
+
+  daemon._project_learning_status = transition_onroad
+  daemon.run()
+
+  assert BACKFILL_PROGRESS_PARAM not in params.values
+  assert params.values[LEARNING_OPERATION_STATUS_PARAM] is live_status
+
+
 def test_daemon_waits_full_poll_after_first_unlocked_discovery(
   tmp_path: Path,
 ) -> None:

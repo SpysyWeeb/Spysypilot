@@ -1118,7 +1118,7 @@ def prepare_route(
 
     sentinels = []
     segment_init_seen = False
-    segment_started = False
+    segment_payload_started = False
     segment_ended = False
     decoded_records = []
     for selected_index, record in enumerate(records):
@@ -1149,7 +1149,7 @@ def prepare_route(
         if (
           selected_index != 0
           or segment_init_seen
-          or segment_started
+          or segment_payload_started
           or segment_ended
         ):
           raise RouteRejected(
@@ -1213,16 +1213,16 @@ def prepare_route(
         if sentinel_type in {"startOfRoute", "startOfSegment"}:
           if (
             not segment_init_seen
-            or segment_started
+            or segment_payload_started
             or segment_ended
           ):
             raise RouteRejected(
               "route_structure_mismatch",
               "segment start sentinel is missing, duplicated, or misordered",
             )
-          segment_started = True
+          segment_payload_started = True
         elif sentinel_type in {"endOfRoute", "endOfSegment"}:
-          if not segment_started or segment_ended:
+          if not segment_payload_started or segment_ended:
             raise RouteRejected(
               "route_structure_mismatch",
               "segment end sentinel is duplicated or misordered",
@@ -1236,7 +1236,7 @@ def prepare_route(
         sentinels.append(sentinel_type)
         continue
 
-      if not segment_started or segment_ended:
+      if not segment_payload_started or segment_ended:
         raise RouteRejected(
           "route_structure_mismatch",
           "learner payload appears outside segment sentinels",
@@ -1311,7 +1311,7 @@ def prepare_route(
     )
     if (
       not segment_init_seen
-      or not segment_started
+      or not segment_payload_started
       or not segment_ended
       or sentinels != [expected_start, expected_end]
     ):
@@ -2252,6 +2252,12 @@ class _BackfillProgressTracker:
     if elapsed_s > 0.0:
       self._read_rates.append(elapsed_s / segment.size_bytes)
     self._completed_read_units += segment.size_bytes
+    pass_segment_base = (pass_index - 1) * self.segments_per_pass
+    route_segment_prefix = self.route_segment_prefixes[route.route_name]
+    self._completed_segments = max(
+      self._completed_segments,
+      pass_segment_base + route_segment_prefix + segment_index,
+    )
     self._active_kind = None
     self._active_work_units = 0
 
@@ -2471,8 +2477,32 @@ class HistoricalLearningBackfill:
         "unexpected_error",
         "backfill cannot start onroad",
       )
+    progress_enabled = self.backfill_progress is not None
+
+    def disable_progress() -> None:
+      nonlocal progress_enabled
+      progress_enabled = False
+      if self.backfill_progress is not None:
+        try:
+          self.backfill_progress.clear()
+        except Exception:
+          pass
+
+    def project_progress(action: Callable[[], None]) -> None:
+      """Run display-only work without coupling it to learning liveness."""
+      if not progress_enabled:
+        return
+      try:
+        action()
+      except BackfillError:
+        # Tracker publication checks the same onroad-cancellation source as
+        # replay. That handoff remains authoritative and must not be hidden.
+        raise
+      except Exception:
+        disable_progress()
+
     if self.backfill_progress is not None:
-      self.backfill_progress.clear()
+      project_progress(self.backfill_progress.clear)
     initial_runtime = self.runtime_factory()
     self._publish(
       initial_runtime,
@@ -2541,17 +2571,24 @@ class HistoricalLearningBackfill:
         for route in unprocessed
         if watermark is None or route.route_counter > watermark
       )
-      progress = (
-        None
-        if self.backfill_progress is None or not replay_candidates
-        else _BackfillProgressTracker(
-          routes=replay_candidates,
-          operation_status=self.operation_status,
-          publisher=self.backfill_progress,
-          abort_requested=self.abort_requested,
-          monotonic_ns=self.progress_monotonic_ns,
-        )
-      )
+      progress = None
+      if (
+        progress_enabled
+        and self.backfill_progress is not None
+        and replay_candidates
+      ):
+        try:
+          progress = _BackfillProgressTracker(
+            routes=replay_candidates,
+            operation_status=self.operation_status,
+            publisher=self.backfill_progress,
+            abort_requested=self.abort_requested,
+            monotonic_ns=self.progress_monotonic_ns,
+          )
+        except BackfillError:
+          raise
+        except Exception:
+          disable_progress()
 
       if not unprocessed:
         if pending_close:
@@ -2612,8 +2649,8 @@ class HistoricalLearningBackfill:
           segment_started=(
             None
             if progress is None
-            else lambda segment, segment_index, segment_count: (
-              progress.segment_started(
+            else lambda segment, segment_index, segment_count: project_progress(
+              lambda: progress.segment_started(
                 pass_index=1,
                 route=route,
                 segment=segment,
@@ -2625,8 +2662,8 @@ class HistoricalLearningBackfill:
           segment_completed=(
             None
             if progress is None
-            else lambda segment, segment_index, segment_count: (
-              progress.segment_completed(
+            else lambda segment, segment_index, segment_count: project_progress(
+              lambda: progress.segment_completed(
                 pass_index=1,
                 route=route,
                 segment=segment,
@@ -2656,7 +2693,9 @@ class HistoricalLearningBackfill:
           rejected_sample_count=rejected,
         )
         if progress is not None:
-          progress.route_completed(pass_index=1, route=route)
+          project_progress(
+            lambda: progress.route_completed(pass_index=1, route=route),
+          )
 
       first_runtime = self.runtime_factory()
       first = replay_routes(
@@ -2668,9 +2707,11 @@ class HistoricalLearningBackfill:
         route_applying=(
           None
           if progress is None
-          else lambda route: progress.route_applying(
-            pass_index=1,
-            route=route,
+          else lambda route: project_progress(
+            lambda: progress.route_applying(
+              pass_index=1,
+              route=route,
+            ),
           )
         ),
       )
@@ -2696,8 +2737,8 @@ class HistoricalLearningBackfill:
           segment_started=(
             None
             if progress is None
-            else lambda segment, segment_index, segment_count: (
-              progress.segment_started(
+            else lambda segment, segment_index, segment_count: project_progress(
+              lambda: progress.segment_started(
                 pass_index=2,
                 route=route,
                 segment=segment,
@@ -2709,8 +2750,8 @@ class HistoricalLearningBackfill:
           segment_completed=(
             None
             if progress is None
-            else lambda segment, segment_index, segment_count: (
-              progress.segment_completed(
+            else lambda segment, segment_index, segment_count: project_progress(
+              lambda: progress.segment_completed(
                 pass_index=2,
                 route=route,
                 segment=segment,
@@ -2727,7 +2768,9 @@ class HistoricalLearningBackfill:
         _rejected: int,
       ) -> None:
         if progress is not None:
-          progress.route_completed(pass_index=2, route=route)
+          project_progress(
+            lambda: progress.route_completed(pass_index=2, route=route),
+          )
 
       second = replay_routes(
         runtime=second_runtime,
@@ -2738,14 +2781,16 @@ class HistoricalLearningBackfill:
         route_applying=(
           None
           if progress is None
-          else lambda route: progress.route_applying(
-            pass_index=2,
-            route=route,
+          else lambda route: project_progress(
+            lambda: progress.route_applying(
+              pass_index=2,
+              route=route,
+            ),
           )
         ),
       )
       if progress is not None:
-        progress.comparing()
+        project_progress(progress.comparing)
       verify_replay_passes(first, second)
       new_ledger = extend_ledger(
         ledger,
@@ -2761,7 +2806,7 @@ class HistoricalLearningBackfill:
         last_route_identity=last_route_identity,
       )
       if progress is not None:
-        progress.publishing()
+        project_progress(progress.publishing)
       extractor_sha256 = _sha256_file(
         self.extractor_path,
         abort_requested=self.abort_requested,
@@ -2798,7 +2843,7 @@ class HistoricalLearningBackfill:
         last_route_identity=last_route_identity,
       )
       if self.backfill_progress is not None:
-        self.backfill_progress.clear()
+        project_progress(self.backfill_progress.clear)
       if pending_close:
         # The committed generation is complete, but loggerd is still closing
         # another route. Replace the terminal publication operation with a
