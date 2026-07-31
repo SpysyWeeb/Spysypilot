@@ -11,21 +11,25 @@ import pyray as rl
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
+  BackfillProgressStatus,
   GridCell,
   LearningOperationStatus,
   LearningNodeStatus,
   LearningStatus,
   LearningStatusError,
   LifecycleStatus,
+  OperationPresentation,
   format_duration,
   format_speed,
   grid_cells,
   learning_panel_presentation,
+  parse_backfill_progress_status,
   parse_learning_operation_status,
   parse_learning_status,
   parse_lifecycle_status,
   reason_label,
   select_value_provider,
+  validate_backfill_progress_update,
   validate_operation_update,
 )
 from openpilot.system.ui.lib.application import FontWeight, gui_app
@@ -56,6 +60,9 @@ class DashboardSnapshot:
   operation: LearningOperationStatus | None
   operation_error_code: str | None
   operation_error: str | None
+  backfill_progress: BackfillProgressStatus | None
+  backfill_progress_error_code: str | None
+  backfill_progress_error: str | None
   lifecycle: LifecycleStatus | None
   lifecycle_error_code: str | None
   lifecycle_error: str | None
@@ -87,6 +94,7 @@ class BLaTv2LearningStatusSource:
       metric_provider,
     )
     self._last_refresh = float("-inf")
+    self._last_backfill_progress: BackfillProgressStatus | None = None
     self._snapshot = DashboardSnapshot(
       learning=None,
       learning_error_code="absent",
@@ -94,6 +102,9 @@ class BLaTv2LearningStatusSource:
       operation=None,
       operation_error_code="operation_absent",
       operation_error="Learner operation status has not been published",
+      backfill_progress=None,
+      backfill_progress_error_code="progress_absent",
+      backfill_progress_error="Detailed backfill progress has not been published",
       lifecycle=None,
       lifecycle_error_code="activation_absent",
       lifecycle_error="Controller status is not available yet",
@@ -150,8 +161,10 @@ class BLaTv2LearningStatusSource:
     operation_error_code: str | None = None
     operation_error: str | None = None
     try:
-      operation = parse_learning_operation_status(
-        self._read_param("BLaTv2LearningOperationStatus"),
+      raw_operation = self._read_param("BLaTv2LearningOperationStatus")
+      operation_now_mono_ns = time.monotonic_ns()
+      candidate_operation = parse_learning_operation_status(
+        raw_operation,
         expected_vehicle_identity=expected_vehicle,
         expected_runtime_identity_sha256=(
           learning.runtime_identity_sha256
@@ -162,15 +175,53 @@ class BLaTv2LearningStatusSource:
             else None
           )
         ),
-        now_mono_ns=time.monotonic_ns(),
+        now_mono_ns=operation_now_mono_ns,
       )
-      validate_operation_update(self._snapshot.operation, operation)
+      validate_operation_update(self._snapshot.operation, candidate_operation)
+      operation = candidate_operation
     except LearningStatusError as exc:
       operation_error_code = exc.code
       operation_error = str(exc)
     except Exception:
       operation_error_code = "malformed"
       operation_error = "Learner operation status could not be read"
+
+    if (
+      operation is not None
+      and (
+        operation.terminal
+        or (
+          self._last_backfill_progress is not None
+          and self._last_backfill_progress.operation_id
+          != operation.operation_id
+        )
+      )
+    ):
+      self._last_backfill_progress = None
+
+    backfill_progress: BackfillProgressStatus | None = None
+    backfill_progress_error_code: str | None = None
+    backfill_progress_error: str | None = None
+    try:
+      raw_backfill_progress = self._read_param("BLaTv2BackfillProgress")
+      progress_now_mono_ns = time.monotonic_ns()
+      candidate_progress = parse_backfill_progress_status(
+        raw_backfill_progress,
+        operation_status=operation,
+        now_mono_ns=progress_now_mono_ns,
+      )
+      validate_backfill_progress_update(
+        self._last_backfill_progress,
+        candidate_progress,
+      )
+      backfill_progress = candidate_progress
+      self._last_backfill_progress = backfill_progress
+    except LearningStatusError as exc:
+      backfill_progress_error_code = exc.code
+      backfill_progress_error = str(exc)
+    except Exception:
+      backfill_progress_error_code = "malformed"
+      backfill_progress_error = "Detailed backfill progress could not be read"
 
     # Params snapshots are atomic individually, not across keys. If an active
     # operation is observed between its status writes, preserve the most
@@ -219,6 +270,9 @@ class BLaTv2LearningStatusSource:
       operation=operation,
       operation_error_code=operation_error_code,
       operation_error=operation_error,
+      backfill_progress=backfill_progress,
+      backfill_progress_error_code=backfill_progress_error_code,
+      backfill_progress_error=backfill_progress_error,
       lifecycle=lifecycle,
       lifecycle_error_code=lifecycle_error_code,
       lifecycle_error=lifecycle_error,
@@ -302,6 +356,38 @@ class _BLaTv2Page(Widget):
   def _draw_background(self, rect: rl.Rectangle) -> None:
     rl.draw_rectangle_rounded(rect, 0.025, 10, _BG)
 
+  @staticmethod
+  def _fit_font_size(
+    font,
+    text: str,
+    desired: int,
+    minimum: int,
+    maximum_width: float,
+  ) -> int:
+    width = measure_text_cached(font, text, desired).x
+    if width <= maximum_width or width <= 0.0:
+      return desired
+    return max(minimum, int(desired * maximum_width / width))
+
+  @staticmethod
+  def _progress_secondary_lines(
+    presentation: OperationPresentation,
+    font,
+    maximum_width: float,
+  ) -> tuple[str, ...]:
+    phase = presentation.phase_detail
+    meta = presentation.meta
+    compact_meta = presentation.compact_meta
+    full = " | ".join(value for value in (phase, meta) if value)
+    if measure_text_cached(font, full, 14).x <= maximum_width:
+      return (full,)
+    compact = " | ".join(
+      value for value in (phase, compact_meta) if value
+    )
+    if measure_text_cached(font, compact, 14).x <= maximum_width:
+      return (compact,)
+    return tuple(value for value in (phase, compact_meta) if value)
+
   def _draw_header(
     self,
     rect: rl.Rectangle,
@@ -363,16 +449,34 @@ class _BLaTv2Page(Widget):
       learning_error_code=snapshot.learning_error_code,
       learning_error_message=snapshot.learning_error,
       has_learning_snapshot=snapshot.learning is not None,
+      backfill_progress=snapshot.backfill_progress,
     )
     if not presentation.show_banner:
       return y
 
     color = self._tone_color(presentation.tone)
-    banner = rl.Rectangle(rect.x + 32, y, rect.width - 64, 58)
+    normal = gui_app.font(FontWeight.NORMAL)
+    progress_lines: tuple[str, ...] = ()
+    if presentation.progress_fraction is not None:
+      progress_lines = self._progress_secondary_lines(
+        presentation,
+        normal,
+        rect.width - 96,
+      )
+    banner_height = (
+      89 + max(0, len(progress_lines) - 1) * 19
+      if progress_lines
+      else 58
+    )
+    banner = rl.Rectangle(
+      rect.x + 32,
+      y,
+      rect.width - 64,
+      banner_height,
+    )
     rl.draw_rectangle_rounded(banner, 0.15, 8, rl.fade(color, 0.16))
     rl.draw_rectangle_rounded_lines_ex(banner, 0.15, 8, 1, color)
     medium = gui_app.font(FontWeight.MEDIUM)
-    normal = gui_app.font(FontWeight.NORMAL)
     rl.draw_text_ex(
       medium,
       presentation.title,
@@ -381,17 +485,13 @@ class _BLaTv2Page(Widget):
       0,
       color,
     )
-    detail_font_size = 18
-    detail_width = measure_text_cached(
+    detail_font_size = self._fit_font_size(
       normal,
       presentation.detail,
-      detail_font_size,
-    ).x
-    if detail_width > banner.width - 32:
-      detail_font_size = max(
-        14,
-        int(detail_font_size * (banner.width - 32) / detail_width),
-      )
+      18,
+      14,
+      banner.width - 32,
+    )
     rl.draw_text_ex(
       normal,
       presentation.detail,
@@ -400,7 +500,47 @@ class _BLaTv2Page(Widget):
       0,
       _DIM,
     )
-    return y + 68
+    if progress_lines:
+      for line_index, line in enumerate(progress_lines):
+        line_size = self._fit_font_size(
+          normal,
+          line,
+          14,
+          12,
+          banner.width - 32,
+        )
+        rl.draw_text_ex(
+          normal,
+          line,
+          rl.Vector2(
+            int(banner.x + 16),
+            int(banner.y + 54 + line_index * 19),
+          ),
+          line_size,
+          0,
+          _DIM,
+        )
+      track = rl.Rectangle(
+        banner.x + 16,
+        banner.y + banner.height - 12,
+        banner.width - 32,
+        7,
+      )
+      rl.draw_rectangle_rounded(track, 0.5, 6, _TRACK)
+      fill_width = track.width * presentation.progress_fraction
+      if fill_width > 1.0:
+        rl.draw_rectangle_rounded(
+          rl.Rectangle(
+            track.x,
+            track.y,
+            fill_width,
+            track.height,
+          ),
+          0.5,
+          6,
+          color,
+        )
+    return y + banner.height + 10
 
   def _draw_unavailable(
     self,
@@ -416,9 +556,11 @@ class _BLaTv2Page(Widget):
       learning_error_code=snapshot.learning_error_code,
       learning_error_message=snapshot.learning_error,
       has_learning_snapshot=False,
+      backfill_progress=snapshot.backfill_progress,
     )
     color = self._tone_color(presentation.tone)
-    center_y = int(rect.y + rect.height * 0.46)
+    has_progress = presentation.progress_fraction is not None
+    center_y = int(rect.y + rect.height * (0.34 if has_progress else 0.46))
     title = presentation.title
     title_size = measure_text_cached(bold, title, 36)
     rl.draw_text_ex(
@@ -433,14 +575,14 @@ class _BLaTv2Page(Widget):
       color,
     )
     detail = presentation.detail
-    detail_font_size = 27
+    detail_font_size = self._fit_font_size(
+      font,
+      detail,
+      27,
+      18,
+      rect.width - 80,
+    )
     detail_size = measure_text_cached(font, detail, detail_font_size)
-    if detail_size.x > rect.width - 80:
-      detail_font_size = max(
-        18,
-        int(detail_font_size * (rect.width - 80) / detail_size.x),
-      )
-      detail_size = measure_text_cached(font, detail, detail_font_size)
     rl.draw_text_ex(
       font,
       detail,
@@ -452,6 +594,54 @@ class _BLaTv2Page(Widget):
       0,
       _DIM,
     )
+    if has_progress:
+      secondary_lines = self._progress_secondary_lines(
+        presentation,
+        font,
+        rect.width - 120,
+      )
+      line_y = center_y + 96
+      for line_index, line in enumerate(secondary_lines):
+        line_size = self._fit_font_size(
+          font,
+          line,
+          19,
+          15,
+          rect.width - 120,
+        )
+        measured = measure_text_cached(font, line, line_size)
+        rl.draw_text_ex(
+          font,
+          line,
+          rl.Vector2(
+            int(rect.x + (rect.width - measured.x) / 2),
+            line_y + line_index * 27,
+          ),
+          line_size,
+          0,
+          _DIM,
+        )
+      track_width = max(1.0, min(rect.width - 160, 820))
+      track = rl.Rectangle(
+        rect.x + (rect.width - track_width) / 2,
+        line_y + len(secondary_lines) * 27 + 16,
+        track_width,
+        12,
+      )
+      rl.draw_rectangle_rounded(track, 0.5, 6, _TRACK)
+      fill_width = track.width * presentation.progress_fraction
+      if fill_width > 1.0:
+        rl.draw_rectangle_rounded(
+          rl.Rectangle(
+            track.x,
+            track.y,
+            fill_width,
+            track.height,
+          ),
+          0.5,
+          6,
+          color,
+        )
 
 
 class BLaTv2LearningOverviewWidget(_BLaTv2Page):
