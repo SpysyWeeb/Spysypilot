@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 import hashlib
+import math
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
@@ -146,8 +147,11 @@ def measured_frame(
 ) -> MeasuredLearningFrame:
   values = {
     "sample_mono_ns": sample_mono_ns,
+    "response_mono_ns": sample_mono_ns - 1_000_000,
+    "applied_report_mono_ns": sample_mono_ns - 500_000,
+    "applied_effective_mono_ns": sample_mono_ns - 10_500_000,
     "speed_mps": 10.0,
-    "steering_angle_deg": 0.0,
+    "steering_angle_deg": 5.0 * sample_mono_ns * 1e-9,
     "steering_rate_deg_s": 5.0,
     "steering_torque": 0.0,
     "steering_pressed": False,
@@ -170,6 +174,52 @@ def measured_frame(
   }
   values.update(overrides)
   return MeasuredLearningFrame(**values)
+
+
+FRAME_DT_NS = 10_000_000
+
+
+def warm_runtime_to_first_causal_sample(
+  runtime: PersistentLearningRuntime,
+  cp,
+  base_mono_ns: int,
+  *,
+  start_index: int = 0,
+  **overrides,
+) -> int:
+  """Advance through command delay plus signed-derivative warm-up."""
+  accepted_before = runtime.coordinator.accepted_sample_count
+  delay_s = (
+    runtime.runtime_bundle.seed_profile.parameters_at(10.0)
+    .parameters.transport_delay_s
+  )
+  maximum_frames = math.ceil(delay_s / (FRAME_DT_NS * 1e-9)) + 6
+  first_valid_command = measured_frame(
+    cp,
+    base_mono_ns + (start_index + 1) * FRAME_DT_NS,
+    **overrides,
+  )
+  earliest_causal_response_ns = (
+    first_valid_command.applied_effective_mono_ns
+    + round(delay_s * 1e9)
+  )
+  for offset in range(maximum_frames):
+    index = start_index + offset
+    frame_overrides = dict(overrides)
+    if start_index == 0 and offset == 0:
+      frame_overrides["applied_effective_mono_ns"] = 0
+    frame = measured_frame(
+      cp,
+      base_mono_ns + index * FRAME_DT_NS,
+      **frame_overrides,
+    )
+    accepted = runtime.ingest(frame)
+    if accepted:
+      assert frame.response_mono_ns >= earliest_causal_response_ns
+      assert runtime.coordinator.accepted_sample_count == accepted_before + 1
+      return index + 1
+    assert runtime.coordinator.accepted_sample_count == accepted_before
+  raise AssertionError("causal learner did not accept within computed bound")
 
 
 def _test_palisade_409_4_7_boundary_classifier() -> None:
@@ -505,9 +555,7 @@ def _test_runtime_collects_only_onroad_and_persists_only_offroad(
   with patch(
     "openpilot.selfdrive.controls.lib.blatv2.learning_coordinator._atomic_write_bytes",
   ) as write:
-    assert not runtime.ingest(measured_frame(cp, 1_000_000_000))
-    assert not runtime.ingest(measured_frame(cp, 1_010_000_000))
-    assert runtime.ingest(measured_frame(cp, 1_020_000_000))
+    warm_runtime_to_first_causal_sample(runtime, cp, 1_000_000_000)
     write.assert_not_called()
   assert not artifact_root.exists()
 
@@ -530,9 +578,7 @@ def _test_restart_restores_exact_cross_drive_evidence(
   first = build_generic_runtime(tmp_path, generic_controller_module)
   cp = first.car_params
   first.transition_onroad()
-  assert not first.ingest(measured_frame(cp, 1_000_000_000))
-  assert not first.ingest(measured_frame(cp, 1_010_000_000))
-  assert first.ingest(measured_frame(cp, 1_020_000_000))
+  warm_runtime_to_first_causal_sample(first, cp, 1_000_000_000)
   saved = first.transition_offroad_and_persist()
 
   restored = build_generic_runtime(tmp_path, generic_controller_module)
@@ -544,9 +590,7 @@ def _test_restart_restores_exact_cross_drive_evidence(
     saved.manifest_bytes
   )
   restored.transition_onroad()
-  assert not restored.ingest(measured_frame(cp, 2_000_000_000))
-  assert not restored.ingest(measured_frame(cp, 2_010_000_000))
-  assert restored.ingest(measured_frame(cp, 2_020_000_000))
+  warm_runtime_to_first_causal_sample(restored, cp, 2_000_000_000)
   second = restored.transition_offroad_and_persist()
   assert second.evidence_bytes != saved.evidence_bytes
 
@@ -558,9 +602,11 @@ def _test_restore_corruption_and_seed_mismatch_fail_closed(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   runtime.transition_onroad()
-  runtime.ingest(measured_frame(runtime.car_params, 1_000_000_000))
-  runtime.ingest(measured_frame(runtime.car_params, 1_010_000_000))
-  runtime.ingest(measured_frame(runtime.car_params, 1_020_000_000))
+  warm_runtime_to_first_causal_sample(
+    runtime,
+    runtime.car_params,
+    1_000_000_000,
+  )
   runtime.transition_offroad_and_persist()
   paths = runtime.artifact_paths
   original = paths.evidence.read_bytes()
@@ -599,42 +645,48 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
   runtime.transition_onroad()
   base = 1_000_000_000
 
-  assert not runtime.ingest(measured_frame(cp, base))
-  assert not runtime.ingest(measured_frame(cp, base + 10_000_000))
-  assert runtime.ingest(measured_frame(cp, base + 20_000_000))
+  frame_index = warm_runtime_to_first_causal_sample(runtime, cp, base)
   accepted = runtime.coordinator.accepted_sample_count
 
   assert not runtime.ingest(measured_frame(
     cp,
-    base + 30_000_000,
+    base + frame_index * FRAME_DT_NS,
     steering_pressed=True,
   ))
+  frame_index += 1
   assert not runtime.ingest(measured_frame(
     cp,
-    base + 40_000_000,
+    base + frame_index * FRAME_DT_NS,
     lateral_active=False,
   ))
+  frame_index += 1
   assert not runtime.ingest(measured_frame(
     cp,
-    base + 50_000_000,
+    base + frame_index * FRAME_DT_NS,
     standstill=True,
   ))
+  frame_index += 1
   assert not runtime.ingest(measured_frame(
     cp,
-    base + 60_000_000,
+    base + frame_index * FRAME_DT_NS,
     live_parameters_valid=False,
   ))
+  frame_index += 1
   assert not runtime.ingest(measured_frame(
     cp,
-    base + 70_000_000,
+    base + frame_index * FRAME_DT_NS,
     can_valid=False,
   ))
+  frame_index += 1
   assert runtime.coordinator.accepted_sample_count == accepted
 
-  # Envelope history and the measured derivative each warm independently.
-  assert not runtime.ingest(measured_frame(cp, base + 80_000_000))
-  assert not runtime.ingest(measured_frame(cp, base + 90_000_000))
-  assert runtime.ingest(measured_frame(cp, base + 100_000_000))
+  # Envelope, causal command history, and signed derivative warm independently.
+  frame_index = warm_runtime_to_first_causal_sample(
+    runtime,
+    cp,
+    base,
+    start_index=frame_index,
+  )
   accepted += 1
 
   upper_boundary = (
@@ -643,25 +695,42 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
   )
   assert runtime.ingest(measured_frame(
     cp,
-    base + 110_000_000,
+    base + frame_index * FRAME_DT_NS,
     applied_torque=upper_boundary,
   ))
-  assert runtime.last_actuator_constrained
+  frame_index += 1
   accepted += 1
+
+  # The boundary becomes response evidence only after the physical transport
+  # delay. The current-frame command must not be mislabeled as causal input.
+  constrained_seen = False
+  for _ in range(12):
+    assert runtime.ingest(measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+    ))
+    frame_index += 1
+    accepted += 1
+    constrained_seen |= runtime.last_actuator_constrained
+  assert constrained_seen
   assert runtime.coordinator.accepted_sample_count == accepted
 
   # A finite value that could not have crossed the vehicle-owned envelope in
   # one frame is corrupt input, not constrained evidence.
   assert not runtime.ingest(measured_frame(
     cp,
-    base + 120_000_000,
+    base + frame_index * FRAME_DT_NS,
     applied_torque=0.5,
   ))
+  frame_index += 1
   assert runtime.last_actuator_constrained
   assert runtime.coordinator.accepted_sample_count == accepted
 
   # A dropped controls frame cannot be compressed into a 10 ms derivative.
-  assert not runtime.ingest(measured_frame(cp, base + 140_000_000))
+  assert not runtime.ingest(measured_frame(
+    cp,
+    base + (frame_index + 1) * FRAME_DT_NS,
+  ))
   assert runtime.coordinator.accepted_sample_count == accepted
 
 
@@ -675,13 +744,10 @@ def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
   base = 1_000_000_000
 
   # Prime the measured envelope and derivative using ordinary interior input.
-  assert not runtime.ingest(measured_frame(cp, base))
-  assert not runtime.ingest(measured_frame(cp, base + 10_000_000))
-  assert runtime.ingest(measured_frame(cp, base + 20_000_000))
+  frame_index = warm_runtime_to_first_causal_sample(runtime, cp, base)
   accepted = runtime.coordinator.accepted_sample_count
 
   applied = 0.0
-  frame_index = 3
   while applied < 1.0:
     applied = apply_torque_envelope(
       runtime.runtime_bundle.torque_limits,
@@ -691,22 +757,32 @@ def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
     ).applied_torque
     assert runtime.ingest(measured_frame(
       cp,
-      base + frame_index * 10_000_000,
+      base + frame_index * FRAME_DT_NS,
       applied_torque=applied,
     ))
-    assert runtime.last_actuator_constrained
     accepted += 1
     frame_index += 1
 
-  # Full magnitude is still a known applied input, not invalid telemetry.
+  # Hold long enough for the full-magnitude command to become the aligned
+  # input. All source commands remain exact, vehicle-owned envelope points.
   assert applied == 1.0
-  assert runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * 10_000_000,
-    applied_torque=1.0,
-  ))
-  assert runtime.last_actuator_constrained
-  accepted += 1
+  full_magnitude_seen = False
+  for _ in range(14):
+    assert runtime.ingest(measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      applied_torque=1.0,
+    ))
+    frame_index += 1
+    accepted += 1
+    full_magnitude_seen |= any(
+      runtime.coordinator._learner.evidence_for_node(node_index)
+      .authority_magnitude_sample_count > 0
+      for node_index in range(
+        len(runtime.runtime_bundle.seed_profile.nodes),
+      )
+    )
+  assert full_magnitude_seen
   assert runtime.coordinator.accepted_sample_count == accepted
 
 
@@ -725,9 +801,16 @@ def _test_input_contract_and_subscriptions_exclude_intent_and_requests() -> None
 
 
 def _test_canonical_history_resolves_one_update_race_and_rejects_stale() -> None:
+  older = SimpleNamespace(name="older")
   first = SimpleNamespace(name="first")
   future = SimpleNamespace(name="future")
   history = _CanonicalSourceHistory()
+  history.update(
+    message=older,
+    mono_ns=80_000_000,
+    valid=True,
+    alive=True,
+  )
   history.update(
     message=first,
     mono_ns=90_000_000,
@@ -747,6 +830,41 @@ def _test_canonical_history_resolves_one_update_race_and_rejects_stale() -> None
   assert selected is not None
   assert selected.message.name == "first"
   assert selected.mono_ns == 90_000_000
+  assert selected.previous_mono_ns == 80_000_000
+
+  late_insert = _CanonicalSourceHistory()
+  late_insert.update(
+    message=older,
+    mono_ns=80_000_000,
+    valid=True,
+    alive=True,
+  )
+  late_insert.update(
+    message=future,
+    mono_ns=110_000_000,
+    valid=True,
+    alive=True,
+  )
+  late_insert.update(
+    message=first,
+    mono_ns=90_000_000,
+    valid=True,
+    alive=True,
+  )
+  inserted = late_insert.select(
+    witness_mono_ns=100_000_000,
+    maximum_age_ns=15_000_000,
+  )
+  assert inserted is not None
+  assert inserted.message.name == "first"
+  assert inserted.previous_mono_ns == 80_000_000
+  inserted_current = late_insert.select(
+    witness_mono_ns=115_000_000,
+    maximum_age_ns=15_000_000,
+  )
+  assert inserted_current is not None
+  assert inserted_current.message.name == "future"
+  assert inserted_current.previous_mono_ns == 90_000_000
 
   future_only = _CanonicalSourceHistory()
   future_only.update(
@@ -771,6 +889,113 @@ def _test_canonical_history_resolves_one_update_race_and_rejects_stale() -> None
     witness_mono_ns=100_000_000,
     maximum_age_ns=15_000_000,
   ) is None
+
+
+def _test_runtime_uses_delayed_command_not_same_frame_torque(
+  tmp_path: Path,
+  generic_controller_module,
+) -> None:
+  runtime = build_generic_runtime(tmp_path, generic_controller_module)
+  cp = runtime.car_params
+  runtime.transition_onroad()
+  base = 1_000_000_000
+  captured = []
+  original_ingest = runtime.coordinator.ingest
+
+  def capture(sample):
+    captured.append(sample)
+    return original_ingest(sample)
+
+  runtime.coordinator.ingest = capture
+  frames = []
+  for index in range(18):
+    overrides = {
+      "applied_torque": (
+        index / runtime.runtime_bundle.torque_limits.steer_max
+      ),
+    }
+    if index == 0:
+      overrides["applied_effective_mono_ns"] = 0
+    frame = measured_frame(
+      cp,
+      base + index * FRAME_DT_NS,
+      **overrides,
+    )
+    frames.append(frame)
+    runtime.ingest(frame)
+
+  valid_index = next(
+    index for index, sample in enumerate(captured) if sample.valid
+  )
+  valid_sample = captured[valid_index]
+  response_time_s = frames[valid_index].response_mono_ns * 1e-9
+  delay_s = (
+    runtime.runtime_bundle.seed_profile.parameters_at(
+      frames[valid_index].speed_mps,
+    ).parameters.transport_delay_s
+  )
+  causal_target_s = response_time_s - delay_s
+  eligible_indices = [
+    index
+    for index, frame in enumerate(frames[:valid_index + 1])
+    if (
+      index > 0
+      and frame.applied_effective_mono_ns * 1e-9
+      <= causal_target_s + 1e-12
+    )
+  ]
+  expected_index = max(eligible_indices)
+
+  assert valid_sample.applied_torque == frames[expected_index].applied_torque
+  assert expected_index < valid_index
+  assert valid_sample.applied_torque != frames[valid_index].applied_torque
+
+
+def _test_runtime_retains_unsigned_reversal_without_fitting_it(
+  tmp_path: Path,
+  generic_controller_module,
+) -> None:
+  runtime = build_generic_runtime(tmp_path, generic_controller_module)
+  cp = runtime.car_params
+  runtime.transition_onroad()
+  base = 1_000_000_000
+  next_index = warm_runtime_to_first_causal_sample(
+    runtime,
+    cp,
+    base,
+  )
+  forward_mono_ns = base + next_index * FRAME_DT_NS
+  forward = measured_frame(
+    cp,
+    forward_mono_ns,
+    steering_rate_deg_s=8.0,
+  )
+  assert runtime.ingest(forward)
+
+  before_reversals = sum(
+    item.rack_reversals
+    for item in runtime.coordinator.support_diagnostics
+  )
+  before_supported = sum(
+    item.supported_sample_count
+    for item in runtime.coordinator.support_diagnostics
+  )
+  before_clean = runtime.coordinator.clean_sample_count
+  before_accepted = runtime.coordinator.accepted_sample_count
+  reversal = measured_frame(
+    cp,
+    forward_mono_ns + FRAME_DT_NS,
+    steering_angle_deg=forward.steering_angle_deg - 0.1,
+    # The positive raw magnitude models an unsigned platform signal.
+    steering_rate_deg_s=8.0,
+  )
+  assert runtime.ingest(reversal)
+
+  after = runtime.coordinator.support_diagnostics
+  assert sum(item.rack_reversals for item in after) > before_reversals
+  assert sum(item.supported_sample_count for item in after) == before_supported
+  assert runtime.coordinator.clean_sample_count == before_clean
+  assert runtime.coordinator.accepted_sample_count == before_accepted + 1
 
 
 class FakeParams:
@@ -887,10 +1112,36 @@ def fake_messages(cp, *, started: bool, active: bool = True):
 
 def publish_frame(sm: FakeSubMaster, cp, mono_ns: int) -> None:
   messages = fake_messages(cp, started=True)
+  messages["carState"].steeringAngleDeg = 5.0 * mono_ns * 1e-9
   sm.publish({
     service: (messages[service], mono_ns)
     for service in SUBSCRIBED_SERVICES
   })
+
+
+def publish_causal_frames(
+  daemon: BlatV2LearnerDaemon,
+  sm: FakeSubMaster,
+  cp,
+  *,
+  base_mono_ns: int,
+  start_index: int = 0,
+) -> int:
+  if daemon.runtime is None:
+    raise AssertionError("daemon runtime must be prepared before warm-up")
+  accepted_before = daemon.accepted_sample_count
+  delay_s = (
+    daemon.runtime.runtime_bundle.seed_profile.parameters_at(10.0)
+    .parameters.transport_delay_s
+  )
+  maximum_frames = math.ceil(delay_s / (FRAME_DT_NS * 1e-9)) + 7
+  for offset in range(maximum_frames):
+    index = start_index + offset
+    publish_frame(sm, cp, base_mono_ns + index * FRAME_DT_NS)
+    daemon.step()
+    if daemon.accepted_sample_count > accepted_before:
+      return index + 1
+  raise AssertionError("daemon did not accept within computed causal bound")
 
 
 def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
@@ -955,13 +1206,13 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
   assert created[0].coordinator.state is LearningLifecycleState.ONROAD
   assert not (tmp_path / "learning").exists()
 
-  publish_frame(sm, cp, 1_000_000_000)
-  daemon.step()
-  publish_frame(sm, cp, 1_010_000_000)
-  daemon.step()
-  publish_frame(sm, cp, 1_020_000_000)
-  daemon.step()
-  assert daemon.controls_witness_count == 3
+  daemon_next_index = publish_causal_frames(
+    daemon,
+    sm,
+    cp,
+    base_mono_ns=1_000_000_000,
+  )
+  assert daemon.controls_witness_count == daemon_next_index
   assert daemon.accepted_sample_count == 1
   assert not (tmp_path / "learning").exists()
 
@@ -1257,26 +1508,38 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
   assert not late._runtime_unavailable_this_drive
 
   late_params.values["CarParams"] = b"vehicle-a"
-  for mono_ns in (4_030_000_000, 4_040_000_000, 4_050_000_000):
-    publish_frame(late_sm, cp_a, mono_ns)
-    late.step()
+  late_next_index = publish_causal_frames(
+    late,
+    late_sm,
+    cp_a,
+    base_mono_ns=4_030_000_000,
+  )
   assert late._live_identity_bound
   assert late.runtime.coordinator.state is LearningLifecycleState.ONROAD
-  assert late.accepted_sample_count == 1
+  accepted_before_identity_change = late.accepted_sample_count
+  assert accepted_before_identity_change >= 1
 
   # A confirmed identity change after binding closes collection before that
   # witness reaches A's evidence, and the drive cannot reopen.
   late_params.values["CarParams"] = b"vehicle-b"
-  publish_frame(late_sm, cp_a, 4_060_000_000)
+  publish_frame(
+    late_sm,
+    cp_a,
+    4_030_000_000 + late_next_index * FRAME_DT_NS,
+  )
   late.step()
   assert late._runtime_unavailable_this_drive
   assert not late._live_identity_bound
-  assert late.accepted_sample_count == 1
+  assert late.accepted_sample_count == accepted_before_identity_change
   unresolved_after_change = late.unresolved_witness_count
   late_params.values["CarParams"] = b"vehicle-a"
-  publish_frame(late_sm, cp_a, 4_070_000_000)
+  publish_frame(
+    late_sm,
+    cp_a,
+    4_030_000_000 + (late_next_index + 1) * FRAME_DT_NS,
+  )
   late.step()
-  assert late.accepted_sample_count == 1
+  assert late.accepted_sample_count == accepted_before_identity_change
   assert late.unresolved_witness_count == unresolved_after_change + 1
 
 
@@ -1330,6 +1593,32 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
   invalid_reason["nodes"][0]["reasons"] = ["qualified"]
   with test_case.assertRaisesRegex(ValueError, "reasons disagree"):
     validate_learning_status_payload(invalid_reason)
+
+  authority_reports = (
+    replace(
+      before.learning_result.node_reports[0],
+      reasons=(
+        QualificationReason.AUTHORITY_VALIDATION_REGRESSION,
+      ),
+    ),
+    *before.learning_result.node_reports[1:],
+  )
+  authority_finalization = replace(
+    before,
+    learning_result=LearningResult(
+      node_reports=authority_reports,
+      candidate_profile=None,
+    ),
+  )
+  authority_payload = build_learning_status_payload(
+    finalization=authority_finalization,
+    runtime_bundle=runtime.runtime_bundle,
+    drive_baseline=None,
+  )
+  assert authority_payload["nodes"][0]["reasons"] == [
+    QualificationReason.AUTHORITY_VALIDATION_REGRESSION.value,
+  ]
+  validate_learning_status_payload(authority_payload)
 
   learned_nodes = tuple(
     replace(
@@ -1408,9 +1697,7 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
 
   runtime.transition_onroad()
   cp = runtime.car_params
-  assert not runtime.ingest(measured_frame(cp, 1_000_000_000))
-  assert not runtime.ingest(measured_frame(cp, 1_010_000_000))
-  assert runtime.ingest(measured_frame(cp, 1_020_000_000))
+  warm_runtime_to_first_causal_sample(runtime, cp, 1_000_000_000)
   after = runtime.transition_offroad_and_persist()
   driven = build_learning_status_payload(
     finalization=after,
@@ -1754,6 +2041,18 @@ class TestBlatV2LearnerDaemon(unittest.TestCase):
 
   def test_canonical_history_resolves_one_update_race_and_rejects_stale(self):
     _test_canonical_history_resolves_one_update_race_and_rejects_stale()
+
+  def test_runtime_uses_delayed_command_not_same_frame_torque(self):
+    _test_runtime_uses_delayed_command_not_same_frame_torque(
+      self.tmp_path,
+      None,
+    )
+
+  def test_runtime_retains_unsigned_reversal_without_fitting_it(self):
+    _test_runtime_retains_unsigned_reversal_without_fitting_it(
+      self.tmp_path,
+      None,
+    )
 
   def test_daemon_observes_offroad_without_onroad_poll_and_restores(self):
     _test_daemon_observes_offroad_without_onroad_poll_and_restores(

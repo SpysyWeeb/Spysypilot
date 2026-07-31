@@ -117,11 +117,26 @@ low-speed nodes.
 Measured evidence includes reachable, driver-free vehicle-owned torque
 boundaries. Full-torque and maximum-slew frames are retained in a separate
 speed-local authority stratum rather than being discarded. Slew transients
-remain out of the instantaneous equality fit because the rack response is
-transport-delayed; settled full-torque motion enters that fit only after the
-seed transport delay has elapsed. Driver-limited and physically impossible
-transitions remain excluded. This keeps sharp-turn/breakaway evidence without
-turning limiter timing or human torque into false plant parameters.
+remain out of the instantaneous equality fit. Every response frame is paired
+causally with the newest recorded torque effective no later than
+`response time - seed transport delay`; it is never paired with the convenient
+same-frame `carOutput`. `carOutput` itself reports the prior card cycle, so the
+effective input clock is the preceding `carOutput` publication. Once aligned,
+settled full-torque motion needs one response interval of command-side dwell,
+not a second copy of the transport delay. Driver-limited and physically
+impossible transitions remain excluded. This keeps sharp-turn/breakaway
+evidence without turning limiter timing or human torque into false plant
+parameters.
+
+Vehicle steering-rate signals are also normalized before fitting. A natively
+signed source keeps its sign. An unsigned magnitude source, including the
+Palisade SAS rate, preserves the sensor magnitude and derives direction from
+offset-corrected measured steering-angle motion. Quantized plateaus may retain
+direction only within one continuous validity epoch. A measured reversal is
+retained as speed-local coverage but its sign-crossing acceleration never
+enters a fit. Zero motion clears the unsigned-source direction latch; gaps,
+disengagement, driver override, standstill, faults, and mapping failures break
+cross-frame reversal continuity.
 Settled authority rows cannot influence a candidate until their own held-out
 validation block exists; incomplete authority evidence stays durable and
 deferred.

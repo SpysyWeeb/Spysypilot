@@ -655,6 +655,11 @@ class BlatV2LearnerDaemon:
     live_parameters = sources["liveParameters"].message
     return measured_learning_frame(
       witness_mono_ns=witness_mono_ns,
+      car_state_mono_ns=sources["carState"].mono_ns,
+      car_output_mono_ns=sources["carOutput"].mono_ns,
+      previous_car_output_mono_ns=(
+        sources["carOutput"].previous_mono_ns
+      ),
       car_state=car_state,
       car_control=car_control,
       car_output=car_output,

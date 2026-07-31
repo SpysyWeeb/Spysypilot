@@ -11,6 +11,7 @@ from opendbc.car.hyundai.values import CAR
 from openpilot.selfdrive.controls.lib.blatv2 import learning_backfill
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BACKFILL_LEDGER_SCHEMA_VERSION,
+  CANONICAL_JOIN_SCHEMA_VERSION,
   BackfillError,
   BuildDescriptor,
   BuildDescriptorRegistry,
@@ -37,6 +38,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
 )
+
+
+CAUSAL_ROUTE_FRAME_COUNT = 15
 
 
 class FakeParams:
@@ -110,11 +114,21 @@ def dynamics() -> ProvisionalRackDynamics:
   )
 
 
-def route_frame(cp, mono_ns: int) -> MeasuredLearningFrame:
+def route_frame(
+  cp,
+  mono_ns: int,
+  *,
+  first_in_route: bool = False,
+) -> MeasuredLearningFrame:
   return MeasuredLearningFrame(
     sample_mono_ns=mono_ns,
+    response_mono_ns=mono_ns - 1_000_000,
+    applied_report_mono_ns=mono_ns - 500_000,
+    applied_effective_mono_ns=(
+      0 if first_in_route else mono_ns - 10_500_000
+    ),
     speed_mps=10.0,
-    steering_angle_deg=0.0,
+    steering_angle_deg=5.0 * mono_ns * 1e-9,
     steering_rate_deg_s=5.0,
     steering_torque=0.0,
     steering_pressed=False,
@@ -204,14 +218,18 @@ def make_engine(
     base = (route.route_counter + 1) * 1_000_000_000
     return PreparedRoute(
       frames=tuple(
-        route_frame(cp, base + index * 10_000_000)
-        for index in range(3)
+        route_frame(
+          cp,
+          base + index * 10_000_000,
+          first_in_route=index == 0,
+        )
+        for index in range(CAUSAL_ROUTE_FRAME_COUNT)
       ),
-      controls_witness_count=3,
+      controls_witness_count=CAUSAL_ROUTE_FRAME_COUNT,
       unresolved_witness_count=0,
       gap_count=0,
       provenance={
-        "canonical_join_schema_version": 1,
+        "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
         "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
         "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
         "extractor_schema_version": 1,
@@ -771,14 +789,15 @@ def test_route_local_rejection_does_not_block_later_good_route(
         route_frame(
           cp,
           1_000_000_000 + index * 10_000_000,
+          first_in_route=index == 0,
         )
-        for index in range(3)
+        for index in range(CAUSAL_ROUTE_FRAME_COUNT)
       ),
-      controls_witness_count=3,
+      controls_witness_count=CAUSAL_ROUTE_FRAME_COUNT,
       unresolved_witness_count=0,
       gap_count=0,
       provenance={
-        "canonical_join_schema_version": 1,
+        "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
         "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
         "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
         "extractor_schema_version": 1,
