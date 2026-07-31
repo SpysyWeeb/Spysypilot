@@ -21,6 +21,7 @@ from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
+from openpilot.selfdrive.controls.lib.conditional_experimental_mode import ConditionalExperimentalMode
 
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
@@ -123,7 +124,9 @@ class SelfdriveD:
     self.events_prev = []
     self.logged_comm_issue = None
     self.not_running_prev = None
-    self.experimental_mode = False
+    self.conditional_experimental_mode = ConditionalExperimentalMode()
+    self.manual_experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
+    self.experimental_mode = self.manual_experimental_mode
     self.personality = self.params.get("LongitudinalPersonality", return_default=True)
     self.recalibrating_seen = False
     self.dm_lockout_set = False
@@ -541,11 +544,27 @@ class SelfdriveD:
       self.pm.send('onroadEvents', ce_send)
     self.events_prev = self.events.names.copy()
 
+  def update_experimental_mode(self, CS):
+    conditional_mode = self.conditional_experimental_mode.update(
+      self.sm['modelV2'],
+      CS,
+      self.sm['radarState'],
+      controls_enabled=self.enabled and self.CP.openpilotLongitudinalControl,
+      model_updated=bool(self.sm.updated['modelV2']),
+      model_valid=bool(self.sm.valid['modelV2'] and self.sm.alive['modelV2'] and self.sm.freq_ok['modelV2']),
+    )
+    self.experimental_mode = bool(
+      self.CP.openpilotLongitudinalControl and
+      not self.conditional_experimental_mode.driver_override_active and
+      (self.manual_experimental_mode or conditional_mode)
+    )
+
   def step(self):
     CS = self.data_sample()
     self.update_events(CS)
     if not self.CP.passive and self.initialized:
       self.enabled, self.active = self.state_machine.update(self.events)
+    self.update_experimental_mode(CS)
     self.update_alerts(CS)
 
     self.publish_selfdriveState(CS)
@@ -557,7 +576,7 @@ class SelfdriveD:
       self.is_metric = self.params.get_bool("IsMetric")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
-      self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
+      self.manual_experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
       self.personality = self.params.get("LongitudinalPersonality", return_default=True)
       time.sleep(0.1)
 
