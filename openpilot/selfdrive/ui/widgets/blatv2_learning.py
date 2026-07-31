@@ -247,9 +247,11 @@ class BLaTv2LearningStatusSource:
       lifecycle = parse_lifecycle_status(
         self._read_param("BLaTv2LifecycleStatus"),
         expected_vehicle_identity=expected_vehicle,
-        expected_runtime_identity_sha256=(
-          None if learning is None else learning.runtime_identity_sha256
-        ),
+        # Learning schema v2 identifies the observable-calibration runtime;
+        # lifecycle status identifies the separately gated live-controller
+        # artifact runtime. Both hashes are strict and vehicle-bound, but they
+        # are intentionally different namespaces and must not be equated.
+        expected_runtime_identity_sha256=None,
       )
     except LearningStatusError as exc:
       lifecycle_error_code = exc.code
@@ -300,6 +302,9 @@ class _BLaTv2Page(Widget):
     if node.collection_complete and node.primary_reason in (
       "invalid_parameters",
       "validation_regression",
+      "moving_validation_regression",
+      "breakaway_validation_regression",
+      "authority_validation_regression",
       "singular_fit",
     ):
       return _RED
@@ -672,9 +677,9 @@ class BLaTv2LearningOverviewWidget(_BLaTv2Page):
       _WHITE,
     )
     summary_detail = (
-      "Complete physical fit; activation is tracked separately"
+      "Complete observable calibration; activation is tracked separately"
       if learning.all_nodes_qualified
-      else "Clean support is credited between neighboring speed nodes"
+      else "Overall, moving, breakaway, and authority evidence are tracked independently"
     )
     rl.draw_text_ex(
       normal,
@@ -711,7 +716,7 @@ class BLaTv2LearningOverviewWidget(_BLaTv2Page):
         learning.last_drive_complete,
       )
 
-    footer = "Nodes blend continuously. Full time can still need motion, validation, or a valid fit."
+    footer = "Nodes blend continuously. Full time can still need motion, breakaway, validation, or a valid calibration."
     rl.draw_text_ex(
       normal,
       footer,
@@ -796,13 +801,37 @@ class BLaTv2LearningOverviewWidget(_BLaTv2Page):
         tone,
       )
 
+    evidence_text = "".join((
+      f"BASE {format_duration(node.base_support_s)} | ",
+      f"MOVE {format_duration(node.moving_support_s)} | ",
+      f"BREAK {node.breakaway_sample_count:,} | ",
+      f"AUTH {node.authority_fit_sample_count:,}",
+    ))
+    evidence_y = y + (84 if compact else 94)
+    if evidence_y + (13 if compact else 17) <= rect.y + rect.height - 4:
+      evidence_size = self._fit_font_size(
+        normal,
+        evidence_text,
+        13 if compact else 17,
+        11,
+        rect.width - pad * 2,
+      )
+      rl.draw_text_ex(
+        normal,
+        evidence_text,
+        rl.Vector2(int(x), int(evidence_y)),
+        evidence_size,
+        0,
+        _DIM,
+      )
+
     if last_drive_complete and node.last_drive_clean_support_s is not None:
       drive_text = (
         f"+{format_duration(node.last_drive_clean_support_s)} LAST DRIVE"
       )
     else:
       drive_text = "LAST-DRIVE CONTRIBUTION UNAVAILABLE"
-    drive_y = y + (84 if compact else 94)
+    drive_y = evidence_y + (17 if compact else 22)
     if drive_y + (14 if compact else 19) <= rect.y + rect.height - 4:
       rl.draw_text_ex(
         normal,
@@ -863,8 +892,14 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
   ) -> None:
     normal = gui_app.font(FontWeight.NORMAL)
     medium = gui_app.font(FontWeight.MEDIUM)
-    columns = (0.00, 0.18, 0.37, 0.58, 0.78)
-    headers = ("NODE", "TIME", "VALIDATION", "MOTION", "FIT / STATE")
+    columns = (0.00, 0.16, 0.34, 0.54, 0.73)
+    headers = (
+      "NODE",
+      "MOVING",
+      "BREAKAWAY",
+      "VALIDATION / AUTH",
+      "CALIBRATION",
+    )
     for offset, header in zip(columns, headers, strict=True):
       rl.draw_text_ex(
         medium,
@@ -897,31 +932,54 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
       tone = self._tone_for_node(node)
       values = (
         format_speed(node.speed_mps, metric=metric),
-        f"{node.support_fraction * 100:.0f}%",
         (
           "READY"
+          if node.moving_ready
+          else f"{node.moving_sample_count:,} ROWS"
+        ),
+        (
+          "READY"
+          if node.breakaway_ready
+          else f"{node.breakaway_sample_count:,} EVENTS"
+        ),
+        (
+          "".join((
+            f"V READY | A {node.authority_fit_sample_count:,}/",
+            f"{node.authority_sample_count:,}",
+          ))
           if "insufficient_validation" not in node.reasons
-          else f"{node.validation_fraction * 100:.0f}%"
+          else "".join((
+            f"V {node.validation_fraction * 100:.0f}% | ",
+            f"A {node.authority_fit_sample_count:,}/",
+            f"{node.authority_sample_count:,}",
+          ))
         ),
-        (
-          "READY"
-          if "insufficient_excitation" not in node.reasons
-          else "MORE RANGE"
-        ),
-        self._fit_text(node),
+        self._calibration_text(node),
       )
       value_colors = (_WHITE, tone, tone, tone, tone)
-      for offset, value, color in zip(
+      for column_index, (offset, value, color) in enumerate(zip(
         columns,
         values,
         value_colors,
         strict=True,
-      ):
+      )):
+        next_offset = (
+          columns[column_index + 1]
+          if column_index + 1 < len(columns)
+          else 1.0
+        )
+        value_font_size = self._fit_font_size(
+          normal,
+          value,
+          row_font_size,
+          11,
+          width * (next_offset - offset) - 8,
+        )
         rl.draw_text_ex(
           normal,
           value,
           rl.Vector2(int(x + width * offset), int(text_y)),
-          row_font_size,
+          value_font_size,
           0,
           color,
         )
@@ -936,12 +994,32 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
       return "REJECTED"
     if (
       "validation_regression" in node.reasons
+      or "moving_validation_regression" in node.reasons
+      or "breakaway_validation_regression" in node.reasons
       or "authority_validation_regression" in node.reasons
     ):
       return "REGRESSED"
     if "singular_fit" in node.reasons:
       return "UNSTABLE"
     return "WAITING"
+
+  @classmethod
+  def _calibration_text(cls, node: LearningNodeStatus) -> str:
+    parameters = node.candidate_parameters
+    if parameters is None:
+      return cls._fit_text(node)
+    gain = f"{parameters.torque_per_lateral_accel:.3f}".removeprefix("0")
+    offset = (
+      f"{parameters.lateral_accel_offset_correction_mps2:+.3f}"
+      .replace("+0.", "+.")
+      .replace("-0.", "-.")
+    )
+    kinetic = f"{parameters.kinetic_friction_torque:.3f}".removeprefix("0")
+    static = f"{parameters.static_breakaway_torque:.3f}".removeprefix("0")
+    return "".join((
+      f"G {gain} O {offset} K/S {kinetic}/",
+      static,
+    ))
 
   def _draw_lifecycle(
     self,
