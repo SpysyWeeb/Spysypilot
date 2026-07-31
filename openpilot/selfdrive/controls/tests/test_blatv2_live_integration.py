@@ -21,6 +21,9 @@ from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
 from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
   ControllerSelection,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
+  make_calibration_seed_profile,
+)
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   CandidateStatus,
 )
@@ -145,6 +148,14 @@ def runtime_bundle(
   verified: bool = True,
 ) -> RuntimeVehicleBundle:
   profile = qualified_profile()
+  calibration_seed = make_calibration_seed_profile(
+    vehicle_identity=profile.vehicle_identity,
+    torque_callback_slope=1.0 / 3.0,
+    stock_friction_torque=0.09,
+    transport_delay_s=0.12,
+    rack_rate_resolution_deg_s=4.0,
+    speed_nodes_mps=(0.0, 30.0),
+  )
   return RuntimeVehicleBundle(
     vehicle_identity=profile.vehicle_identity,
     car_fingerprint=profile.vehicle_identity,
@@ -160,7 +171,9 @@ def runtime_bundle(
       production_envelope_verified=verified,
     ),
     nominal_rack_mapping=mapping(),
+    calibration_seed_profile=calibration_seed,
     seed_profile=profile,
+    stock_lateral_accel_offset_mps2=0.0,
     torque_callback_slope=1.0 / 3.0,
     torque_callback_max_abs_residual=0.0,
     torque_callback_representation_tolerance=1e-14,

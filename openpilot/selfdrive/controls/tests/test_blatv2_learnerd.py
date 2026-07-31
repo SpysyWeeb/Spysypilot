@@ -27,14 +27,13 @@ from openpilot.selfdrive.controls.blatv2_learnerd import (
   assert_no_actuation_publishers,
   default_learning_storage_root,
 )
-from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
-  LearningFinalization,
-  LearningLifecycleState,
+from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
+  CalibrationLearningFinalization,
+  CalibrationLearningLifecycleState,
 )
-from openpilot.selfdrive.controls.lib.blatv2.learner import (
-  LearningResult,
-  NodeQualificationReport,
-  QualificationReason,
+from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CalibrationLearningResult,
+  CalibrationQualificationReason,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   _MeasuredEnvelopeConstraint,
@@ -189,20 +188,14 @@ def warm_runtime_to_first_causal_sample(
 ) -> int:
   """Advance through command delay plus signed-derivative warm-up."""
   accepted_before = runtime.coordinator.accepted_sample_count
-  delay_s = (
-    runtime.runtime_bundle.seed_profile.parameters_at(10.0)
-    .parameters.transport_delay_s
-  )
+  delay_s = runtime.runtime_bundle.calibration_seed_profile.parameters_at(10.0).parameters.transport_delay_s
   maximum_frames = math.ceil(delay_s / (FRAME_DT_NS * 1e-9)) + 6
   first_valid_command = measured_frame(
     cp,
     base_mono_ns + (start_index + 1) * FRAME_DT_NS,
     **overrides,
   )
-  earliest_causal_response_ns = (
-    first_valid_command.applied_effective_mono_ns
-    + round(delay_s * 1e9)
-  )
+  earliest_causal_response_ns = first_valid_command.applied_effective_mono_ns + round(delay_s * 1e9)
   for offset in range(maximum_frames):
     index = start_index + offset
     frame_overrides = dict(overrides)
@@ -548,25 +541,21 @@ def _test_runtime_collects_only_onroad_and_persists_only_offroad(
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
   artifact_root = runtime.artifact_paths.root
-  assert runtime.coordinator.state is LearningLifecycleState.OFFROAD
+  assert runtime.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   assert not artifact_root.exists()
 
   runtime.transition_onroad()
   with patch(
-    "openpilot.selfdrive.controls.lib.blatv2.learning_coordinator._atomic_write_bytes",
+    "openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator._atomic_write_bytes",
   ) as write:
     warm_runtime_to_first_causal_sample(runtime, cp, 1_000_000_000)
     write.assert_not_called()
   assert not artifact_root.exists()
 
   finalization = runtime.transition_offroad_and_persist()
-  assert runtime.coordinator.state is LearningLifecycleState.OFFROAD
-  assert runtime.artifact_paths.evidence.read_bytes() == (
-    finalization.evidence_bytes
-  )
-  assert runtime.artifact_paths.manifest.read_bytes() == (
-    finalization.manifest_bytes
-  )
+  assert runtime.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
+  assert runtime.artifact_paths.evidence.read_bytes() == (finalization.evidence_bytes)
+  assert runtime.artifact_paths.manifest.read_bytes() == (finalization.manifest_bytes)
   assert finalization.candidate_profile_json is None
   assert not runtime.artifact_paths.candidates.exists()
 
@@ -582,13 +571,9 @@ def _test_restart_restores_exact_cross_drive_evidence(
   saved = first.transition_offroad_and_persist()
 
   restored = build_generic_runtime(tmp_path, generic_controller_module)
-  assert restored.coordinator.state is LearningLifecycleState.OFFROAD
-  assert restored.coordinator.finalize().evidence_bytes == (
-    saved.evidence_bytes
-  )
-  assert restored.coordinator.finalize().manifest_bytes == (
-    saved.manifest_bytes
-  )
+  assert restored.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
+  assert restored.coordinator.finalize().evidence_bytes == (saved.evidence_bytes)
+  assert restored.coordinator.finalize().manifest_bytes == (saved.manifest_bytes)
   restored.transition_onroad()
   warm_runtime_to_first_causal_sample(restored, cp, 2_000_000_000)
   second = restored.transition_offroad_and_persist()
@@ -621,12 +606,12 @@ def _test_restore_corruption_and_seed_mismatch_fail_closed(
 
   paths.evidence.write_bytes(original)
   different_seed = replace(
-    runtime.runtime_bundle.seed_profile,
+    runtime.runtime_bundle.calibration_seed_profile,
     provenance="different exact seed provenance",
   )
   different_bundle = replace(
     runtime.runtime_bundle,
-    seed_profile=different_seed,
+    calibration_seed_profile=different_seed,
   )
   with test_case.assertRaisesRegex(LearningRestoreError, "canonical restore"):
     PersistentLearningRuntime.restore(
@@ -648,35 +633,45 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
   frame_index = warm_runtime_to_first_causal_sample(runtime, cp, base)
   accepted = runtime.coordinator.accepted_sample_count
 
-  assert not runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * FRAME_DT_NS,
-    steering_pressed=True,
-  ))
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      steering_pressed=True,
+    )
+  )
   frame_index += 1
-  assert not runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * FRAME_DT_NS,
-    lateral_active=False,
-  ))
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      lateral_active=False,
+    )
+  )
   frame_index += 1
-  assert not runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * FRAME_DT_NS,
-    standstill=True,
-  ))
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      standstill=True,
+    )
+  )
   frame_index += 1
-  assert not runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * FRAME_DT_NS,
-    live_parameters_valid=False,
-  ))
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      live_parameters_valid=False,
+    )
+  )
   frame_index += 1
-  assert not runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * FRAME_DT_NS,
-    can_valid=False,
-  ))
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      can_valid=False,
+    )
+  )
   frame_index += 1
   assert runtime.coordinator.accepted_sample_count == accepted
 
@@ -689,15 +684,14 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
   )
   accepted += 1
 
-  upper_boundary = (
-    runtime.runtime_bundle.torque_limits.delta_up
-    / runtime.runtime_bundle.torque_limits.steer_max
+  upper_boundary = runtime.runtime_bundle.torque_limits.delta_up / runtime.runtime_bundle.torque_limits.steer_max
+  assert runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      applied_torque=upper_boundary,
+    )
   )
-  assert runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * FRAME_DT_NS,
-    applied_torque=upper_boundary,
-  ))
   frame_index += 1
   accepted += 1
 
@@ -705,10 +699,12 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
   # delay. The current-frame command must not be mislabeled as causal input.
   constrained_seen = False
   for _ in range(12):
-    assert runtime.ingest(measured_frame(
-      cp,
-      base + frame_index * FRAME_DT_NS,
-    ))
+    assert runtime.ingest(
+      measured_frame(
+        cp,
+        base + frame_index * FRAME_DT_NS,
+      )
+    )
     frame_index += 1
     accepted += 1
     constrained_seen |= runtime.last_actuator_constrained
@@ -717,20 +713,24 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
 
   # A finite value that could not have crossed the vehicle-owned envelope in
   # one frame is corrupt input, not constrained evidence.
-  assert not runtime.ingest(measured_frame(
-    cp,
-    base + frame_index * FRAME_DT_NS,
-    applied_torque=0.5,
-  ))
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      applied_torque=0.5,
+    )
+  )
   frame_index += 1
   assert runtime.last_actuator_constrained
   assert runtime.coordinator.accepted_sample_count == accepted
 
   # A dropped controls frame cannot be compressed into a 10 ms derivative.
-  assert not runtime.ingest(measured_frame(
-    cp,
-    base + (frame_index + 1) * FRAME_DT_NS,
-  ))
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + (frame_index + 1) * FRAME_DT_NS,
+    )
+  )
   assert runtime.coordinator.accepted_sample_count == accepted
 
 
@@ -755,11 +755,13 @@ def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
       applied,
       0.0,
     ).applied_torque
-    assert runtime.ingest(measured_frame(
-      cp,
-      base + frame_index * FRAME_DT_NS,
-      applied_torque=applied,
-    ))
+    assert runtime.ingest(
+      measured_frame(
+        cp,
+        base + frame_index * FRAME_DT_NS,
+        applied_torque=applied,
+      )
+    )
     accepted += 1
     frame_index += 1
 
@@ -768,18 +770,19 @@ def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
   assert applied == 1.0
   full_magnitude_seen = False
   for _ in range(14):
-    assert runtime.ingest(measured_frame(
-      cp,
-      base + frame_index * FRAME_DT_NS,
-      applied_torque=1.0,
-    ))
+    assert runtime.ingest(
+      measured_frame(
+        cp,
+        base + frame_index * FRAME_DT_NS,
+        applied_torque=1.0,
+      )
+    )
     frame_index += 1
     accepted += 1
     full_magnitude_seen |= any(
-      runtime.coordinator._learner.evidence_for_node(node_index)
-      .authority_magnitude_sample_count > 0
+      runtime.coordinator._learner.evidence_for_node(node_index).authority_magnitude_sample_count > 0
       for node_index in range(
-        len(runtime.runtime_bundle.seed_profile.nodes),
+        len(runtime.runtime_bundle.calibration_seed_profile.nodes),
       )
     )
   assert full_magnitude_seen
@@ -793,11 +796,7 @@ def _test_input_contract_and_subscriptions_exclude_intent_and_requests() -> None
   assert "modelV2" not in SUBSCRIBED_SERVICES
   forbidden = ("desired", "request", "candidate", "model", "reference")
   frame_fields = tuple(MeasuredLearningFrame.__dataclass_fields__)
-  assert not any(
-    token in field.lower()
-    for field in frame_fields
-    for token in forbidden
-  )
+  assert not any(token in field.lower() for field in frame_fields for token in forbidden)
 
 
 def _test_canonical_history_resolves_one_update_race_and_rejects_stale() -> None:
@@ -873,10 +872,13 @@ def _test_canonical_history_resolves_one_update_race_and_rejects_stale() -> None
     valid=True,
     alive=True,
   )
-  assert future_only.select(
-    witness_mono_ns=100_000_000,
-    maximum_age_ns=15_000_000,
-  ) is None
+  assert (
+    future_only.select(
+      witness_mono_ns=100_000_000,
+      maximum_age_ns=15_000_000,
+    )
+    is None
+  )
 
   stale = _CanonicalSourceHistory()
   stale.update(
@@ -885,10 +887,13 @@ def _test_canonical_history_resolves_one_update_race_and_rejects_stale() -> None
     valid=True,
     alive=True,
   )
-  assert stale.select(
-    witness_mono_ns=100_000_000,
-    maximum_age_ns=15_000_000,
-  ) is None
+  assert (
+    stale.select(
+      witness_mono_ns=100_000_000,
+      maximum_age_ns=15_000_000,
+    )
+    is None
+  )
 
 
 def _test_runtime_uses_delayed_command_not_same_frame_torque(
@@ -910,9 +915,7 @@ def _test_runtime_uses_delayed_command_not_same_frame_torque(
   frames = []
   for index in range(18):
     overrides = {
-      "applied_torque": (
-        index / runtime.runtime_bundle.torque_limits.steer_max
-      ),
+      "applied_torque": (index / runtime.runtime_bundle.torque_limits.steer_max),
     }
     if index == 0:
       overrides["applied_effective_mono_ns"] = 0
@@ -924,25 +927,15 @@ def _test_runtime_uses_delayed_command_not_same_frame_torque(
     frames.append(frame)
     runtime.ingest(frame)
 
-  valid_index = next(
-    index for index, sample in enumerate(captured) if sample.valid
-  )
+  valid_index = next(index for index, sample in enumerate(captured) if sample.valid)
   valid_sample = captured[valid_index]
   response_time_s = frames[valid_index].response_mono_ns * 1e-9
-  delay_s = (
-    runtime.runtime_bundle.seed_profile.parameters_at(
-      frames[valid_index].speed_mps,
-    ).parameters.transport_delay_s
-  )
+  delay_s = runtime.runtime_bundle.calibration_seed_profile.parameters_at(
+    frames[valid_index].speed_mps,
+  ).parameters.transport_delay_s
   causal_target_s = response_time_s - delay_s
   eligible_indices = [
-    index
-    for index, frame in enumerate(frames[:valid_index + 1])
-    if (
-      index > 0
-      and frame.applied_effective_mono_ns * 1e-9
-      <= causal_target_s + 1e-12
-    )
+    index for index, frame in enumerate(frames[: valid_index + 1]) if (index > 0 and frame.applied_effective_mono_ns * 1e-9 <= causal_target_s + 1e-12)
   ]
   expected_index = max(eligible_indices)
 
@@ -972,14 +965,10 @@ def _test_runtime_retains_unsigned_reversal_without_fitting_it(
   )
   assert runtime.ingest(forward)
 
-  before_reversals = sum(
-    item.rack_reversals
-    for item in runtime.coordinator.support_diagnostics
-  )
-  before_supported = sum(
-    item.supported_sample_count
-    for item in runtime.coordinator.support_diagnostics
-  )
+  before_reversals = sum(item.rack_reversals for item in runtime.coordinator.support_diagnostics)
+  before_supported = sum(item.supported_sample_count for item in runtime.coordinator.support_diagnostics)
+  before_moving = sum(item.moving_sample_count for item in runtime.coordinator.support_diagnostics)
+  before_breakaway = sum(item.breakaway_sample_count for item in runtime.coordinator.support_diagnostics)
   before_clean = runtime.coordinator.clean_sample_count
   before_accepted = runtime.coordinator.accepted_sample_count
   reversal = measured_frame(
@@ -993,8 +982,10 @@ def _test_runtime_retains_unsigned_reversal_without_fitting_it(
 
   after = runtime.coordinator.support_diagnostics
   assert sum(item.rack_reversals for item in after) > before_reversals
-  assert sum(item.supported_sample_count for item in after) == before_supported
-  assert runtime.coordinator.clean_sample_count == before_clean
+  assert sum(item.supported_sample_count for item in after) > before_supported
+  assert sum(item.moving_sample_count for item in after) > before_moving
+  assert sum(item.breakaway_sample_count for item in after) == before_breakaway
+  assert runtime.coordinator.clean_sample_count == before_clean + 1
   assert runtime.coordinator.accepted_sample_count == before_accepted + 1
 
 
@@ -1049,10 +1040,7 @@ class FakeLogger:
 
 class FakeSubMaster:
   def __init__(self) -> None:
-    self.data = {
-      service: SimpleNamespace()
-      for service in SUBSCRIBED_SERVICES
-    }
+    self.data = {service: SimpleNamespace() for service in SUBSCRIBED_SERVICES}
     self.updated = dict.fromkeys(SUBSCRIBED_SERVICES, False)
     self.seen = dict.fromkeys(SUBSCRIBED_SERVICES, False)
     self.valid = dict.fromkeys(SUBSCRIBED_SERVICES, False)
@@ -1113,10 +1101,7 @@ def fake_messages(cp, *, started: bool, active: bool = True):
 def publish_frame(sm: FakeSubMaster, cp, mono_ns: int) -> None:
   messages = fake_messages(cp, started=True)
   messages["carState"].steeringAngleDeg = 5.0 * mono_ns * 1e-9
-  sm.publish({
-    service: (messages[service], mono_ns)
-    for service in SUBSCRIBED_SERVICES
-  })
+  sm.publish({service: (messages[service], mono_ns) for service in SUBSCRIBED_SERVICES})
 
 
 def publish_causal_frames(
@@ -1130,10 +1115,7 @@ def publish_causal_frames(
   if daemon.runtime is None:
     raise AssertionError("daemon runtime must be prepared before warm-up")
   accepted_before = daemon.accepted_sample_count
-  delay_s = (
-    daemon.runtime.runtime_bundle.seed_profile.parameters_at(10.0)
-    .parameters.transport_delay_s
-  )
+  delay_s = daemon.runtime.runtime_bundle.calibration_seed_profile.parameters_at(10.0).parameters.transport_delay_s
   maximum_frames = math.ceil(delay_s / (FRAME_DT_NS * 1e-9)) + 7
   for offset in range(maximum_frames):
     index = start_index + offset
@@ -1173,37 +1155,37 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
     sm=sm,
     params=params,
     storage_root=tmp_path / "learning",
-    car_params_decoder=lambda encoded: (
-      decoded_values.append(encoded) or cp
-    ),
+    car_params_decoder=lambda encoded: decoded_values.append(encoded) or cp,
     runtime_factory=runtime_factory,
     logger=logger,
     route_owned_persistence=False,
   )
-  assert default_learning_storage_root(params) == (
-    tmp_path / "params" / "blatv2-learning"
-  )
+  assert default_learning_storage_root(params) == (tmp_path / "params" / "blatv2-learning")
 
   # The always-running process prepares and authenticates evidence offroad;
   # qualification is never smuggled into the first onroad frame.
   offroad_messages = fake_messages(cp, started=False)
-  sm.publish({
-    "deviceState": (offroad_messages["deviceState"], 800_000_000),
-  })
+  sm.publish(
+    {
+      "deviceState": (offroad_messages["deviceState"], 800_000_000),
+    }
+  )
   daemon.step()
   assert len(created) == 1
   assert decoded_values == [b"current-route-car-params"]
-  assert created[0].coordinator.state is LearningLifecycleState.OFFROAD
+  assert created[0].coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   assert not (tmp_path / "learning").exists()
 
   params.values["CarParams"] = b"current-route-car-params"
   start_messages = fake_messages(cp, started=True)
-  sm.publish({
-    "deviceState": (start_messages["deviceState"], 900_000_000),
-  })
+  sm.publish(
+    {
+      "deviceState": (start_messages["deviceState"], 900_000_000),
+    }
+  )
   daemon.step()
   assert len(created) == 1
-  assert created[0].coordinator.state is LearningLifecycleState.ONROAD
+  assert created[0].coordinator.state is CalibrationLearningLifecycleState.ONROAD
   assert not (tmp_path / "learning").exists()
 
   daemon_next_index = publish_causal_frames(
@@ -1225,21 +1207,19 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
 
   params.before_put = assert_artifacts_precede_status
   stop_messages = fake_messages(cp, started=False)
-  sm.publish({
-    "deviceState": (stop_messages["deviceState"], 2_000_000_000),
-  })
+  sm.publish(
+    {
+      "deviceState": (stop_messages["deviceState"], 2_000_000_000),
+    }
+  )
   daemon.step()
-  assert created[0].coordinator.state is LearningLifecycleState.OFFROAD
+  assert created[0].coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   assert created[0].artifact_paths.evidence.is_file()
   assert created[0].artifact_paths.manifest.is_file()
   status = params.values[LEARNING_STATUS_PARAM]
   assert type(status) is dict
   assert status["last_drive_complete"] is True
-  assert all(
-    node["last_drive_clean_support_s"] is not None
-    and node["last_drive_accepted_sample_count"] is not None
-    for node in status["nodes"]
-  )
+  assert all(node["last_drive_clean_support_s"] is not None and node["last_drive_accepted_sample_count"] is not None for node in status["nodes"])
   assert params.puts[-1][0] == LEARNING_OPERATION_STATUS_PARAM
   assert params.puts[-1][1]["state"] == "idle"
   assert params.puts[-1][1]["diagnostic"] == "evidence_ready"
@@ -1250,9 +1230,7 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
 
   # A reconstructed daemon/runtime restores the exact persisted evidence.
   restored = runtime_factory(cp, tmp_path / "learning")
-  assert restored.coordinator.finalize().evidence_bytes == (
-    created[0].coordinator.finalize().evidence_bytes
-  )
+  assert restored.coordinator.finalize().evidence_bytes == (created[0].coordinator.finalize().evidence_bytes)
 
   # Manager-start clears the cache; verified offroad restore republishes the
   # cumulative state without inventing unknowable per-drive deltas.
@@ -1267,17 +1245,15 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
     logger=FakeLogger(),
     route_owned_persistence=False,
   )
-  restart_sm.publish({
-    "deviceState": (offroad_messages["deviceState"], 3_000_000_000),
-  })
+  restart_sm.publish(
+    {
+      "deviceState": (offroad_messages["deviceState"], 3_000_000_000),
+    }
+  )
   restarted.step()
   restored_status = restart_params.values[LEARNING_STATUS_PARAM]
   assert restored_status["last_drive_complete"] is False
-  assert all(
-    node["last_drive_clean_support_s"] is None
-    and node["last_drive_accepted_sample_count"] is None
-    for node in restored_status["nodes"]
-  )
+  assert all(node["last_drive_clean_support_s"] is None and node["last_drive_accepted_sample_count"] is None for node in restored_status["nodes"])
 
 
 def _test_mid_drive_start_skips_collection_until_offroad_preparation(
@@ -1325,12 +1301,12 @@ def _test_mid_drive_start_skips_collection_until_offroad_preparation(
   daemon.step()
   assert factory_calls == [True]
   assert daemon.runtime is not None
-  assert daemon.runtime.coordinator.state is LearningLifecycleState.OFFROAD
+  assert daemon.runtime.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
 
   params.values["CarParams"] = b"car-params"
   sm.publish({"deviceState": (started["deviceState"], 3_000_000_000)})
   daemon.step()
-  assert daemon.runtime.coordinator.state is LearningLifecycleState.ONROAD
+  assert daemon.runtime.coordinator.state is CalibrationLearningLifecycleState.ONROAD
 
 
 def _test_car_params_precedence_fallback_and_transient_absence(
@@ -1356,9 +1332,11 @@ def _test_car_params_precedence_fallback_and_transient_absence(
     route_owned_persistence=False,
   )
   stopped = fake_messages(cp, started=False)
-  missing_sm.publish({
-    "deviceState": (stopped["deviceState"], 1_000_000_000),
-  })
+  missing_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 1_000_000_000),
+    }
+  )
   missing.step()
   assert missing.runtime is None
   assert missing_params.values[LEARNING_STATUS_PARAM] is preserved_status
@@ -1388,9 +1366,11 @@ def _test_car_params_precedence_fallback_and_transient_absence(
     logger=FakeLogger(),
     route_owned_persistence=False,
   )
-  fallback_sm.publish({
-    "deviceState": (stopped["deviceState"], 2_000_000_000),
-  })
+  fallback_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 2_000_000_000),
+    }
+  )
   fallback.step()
   assert calls == [b"manager-scoped-car-params"]
   assert fallback.runtime is not None
@@ -1399,19 +1379,18 @@ def _test_car_params_precedence_fallback_and_transient_absence(
   # The model fingerprint alone is not the runtime identity. A changed exact
   # canonical CarParams for the same fingerprint rebuilds the prepared owner.
   fallback_params.values["CarParams"] = b"changed-same-fingerprint"
-  fallback_sm.publish({
-    "deviceState": (stopped["deviceState"], 2_100_000_000),
-  })
+  fallback_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 2_100_000_000),
+    }
+  )
   fallback.step()
   assert calls == [
     b"manager-scoped-car-params",
     b"changed-same-fingerprint",
   ]
   assert fallback.runtime is not first_runtime
-  assert (
-    fallback._prepared_car_params_bytes
-    == b"changed-same-fingerprint"
-  )
+  assert fallback._prepared_car_params_bytes == b"changed-same-fingerprint"
 
 
 def _test_live_identity_late_and_mismatch_never_cross_contaminate(
@@ -1450,22 +1429,23 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
   )
   stopped = fake_messages(cp_a, started=False)
   started = fake_messages(cp_a, started=True)
-  mismatch_sm.publish({
-    "deviceState": (stopped["deviceState"], 1_000_000_000),
-  })
+  mismatch_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 1_000_000_000),
+    }
+  )
   mismatch.step()
   assert mismatch.runtime is not None
   mismatch_params.values["CarParams"] = b"vehicle-b"
-  mismatch_sm.publish({
-    "deviceState": (started["deviceState"], 2_000_000_000),
-  })
+  mismatch_sm.publish(
+    {
+      "deviceState": (started["deviceState"], 2_000_000_000),
+    }
+  )
   mismatch.step()
   assert mismatch._runtime_unavailable_this_drive
   assert not mismatch._live_identity_bound
-  assert (
-    mismatch.runtime.coordinator.state
-    is LearningLifecycleState.OFFROAD
-  )
+  assert mismatch.runtime.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   mismatch_params.values["CarParams"] = b"vehicle-a"
   for mono_ns in (2_010_000_000, 2_020_000_000, 2_030_000_000):
     publish_frame(mismatch_sm, cp_a, mono_ns)
@@ -1489,16 +1469,20 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
     logger=FakeLogger(),
     route_owned_persistence=False,
   )
-  late_sm.publish({
-    "deviceState": (stopped["deviceState"], 3_000_000_000),
-  })
+  late_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 3_000_000_000),
+    }
+  )
   late.step()
-  late_sm.publish({
-    "deviceState": (started["deviceState"], 4_000_000_000),
-  })
+  late_sm.publish(
+    {
+      "deviceState": (started["deviceState"], 4_000_000_000),
+    }
+  )
   late.step()
   assert late.runtime is not None
-  assert late.runtime.coordinator.state is LearningLifecycleState.OFFROAD
+  assert late.runtime.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   for mono_ns in (4_010_000_000, 4_020_000_000):
     publish_frame(late_sm, cp_a, mono_ns)
     late.step()
@@ -1515,7 +1499,7 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
     base_mono_ns=4_030_000_000,
   )
   assert late._live_identity_bound
-  assert late.runtime.coordinator.state is LearningLifecycleState.ONROAD
+  assert late.runtime.coordinator.state is CalibrationLearningLifecycleState.ONROAD
   accepted_before_identity_change = late.accepted_sample_count
   assert accepted_before_identity_change >= 1
 
@@ -1573,13 +1557,15 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
   assert empty_payload["all_nodes_qualified"] is False
   assert empty_payload["candidate_profile_sha256"] is None
   assert empty_payload["candidate_profile_revision"] is None
-  assert [node["node_index"] for node in empty_payload["nodes"]] == (
-    list(range(len(runtime.runtime_bundle.seed_profile.nodes)))
-  )
+  assert [node["node_index"] for node in empty_payload["nodes"]] == (list(range(len(runtime.runtime_bundle.calibration_seed_profile.nodes))))
   assert all(node["reasons"] for node in empty_payload["nodes"])
   assert all(
     node["candidate_parameters"] is None
     and node["last_drive_clean_support_s"] is None
+    and node["last_drive_base_support_s"] is None
+    and node["last_drive_moving_support_s"] is None
+    and node["last_drive_breakaway_support_s"] is None
+    and node["last_drive_authority_support_s"] is None
     and node["last_drive_accepted_sample_count"] is None
     for node in empty_payload["nodes"]
   )
@@ -1597,15 +1583,13 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
   authority_reports = (
     replace(
       before.learning_result.node_reports[0],
-      reasons=(
-        QualificationReason.AUTHORITY_VALIDATION_REGRESSION,
-      ),
+      reasons=(CalibrationQualificationReason.AUTHORITY_VALIDATION_REGRESSION,),
     ),
     *before.learning_result.node_reports[1:],
   )
   authority_finalization = replace(
     before,
-    learning_result=LearningResult(
+    learning_result=CalibrationLearningResult(
       node_reports=authority_reports,
       candidate_profile=None,
     ),
@@ -1616,7 +1600,7 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
     drive_baseline=None,
   )
   assert authority_payload["nodes"][0]["reasons"] == [
-    QualificationReason.AUTHORITY_VALIDATION_REGRESSION.value,
+    CalibrationQualificationReason.AUTHORITY_VALIDATION_REGRESSION.value,
   ]
   validate_learning_status_payload(authority_payload)
 
@@ -1626,53 +1610,68 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
       parameters=replace(
         node.parameters,
         torque_per_lateral_accel=0.4,
-        rack_gain_deg_s2_per_torque=1500.0,
-        rack_damping_per_s=8.0,
+        lateral_accel_offset_correction_mps2=-0.03,
         kinetic_friction_torque=0.03,
+        static_breakaway_torque=0.09,
         confidence=1.0,
         qualified=True,
       ),
     )
-    for node in runtime.runtime_bundle.seed_profile.nodes
+    for node in runtime.runtime_bundle.calibration_seed_profile.nodes
   )
   learned_profile = replace(
-    runtime.runtime_bundle.seed_profile,
-    revision=runtime.runtime_bundle.seed_profile.revision + 1,
+    runtime.runtime_bundle.calibration_seed_profile,
+    revision=runtime.runtime_bundle.calibration_seed_profile.revision + 1,
     provenance="test-only fully qualified evidence",
     nodes=learned_nodes,
   )
   learned_reports = tuple(
-    NodeQualificationReport(
-      node_index=index,
-      speed_mps=node.speed_mps,
+    replace(
+      before.learning_result.node_reports[index],
       minimum_support_s=150.0,
       clean_support_s=180.0,
       supported_sample_count=18000,
       training_count=14400,
       validation_count=3600,
       validation_support_s=36.0,
+      base_support_s=60.0,
+      base_sample_count=6000,
+      moving_support_s=60.0,
+      moving_sample_count=6000,
+      moving_training_count=4800,
+      moving_validation_count=1200,
+      breakaway_support_s=60.0,
+      breakaway_sample_count=6000,
+      breakaway_training_count=4800,
+      breakaway_validation_count=1200,
       lateral_accel_span_mps2=1.0,
       lateral_accel_rms_mps2=0.3,
       rack_travel_deg=240.0,
       applied_torque_span=0.4,
       rack_reversals=8,
+      lateral_accel_directions=2,
+      applied_torque_directions=2,
       seed_validation_rms=0.2,
       candidate_validation_rms=0.1,
+      moving_seed_validation_rms=0.2,
+      moving_candidate_validation_rms=0.1,
+      breakaway_seed_validation_rms=0.2,
+      breakaway_candidate_validation_rms=0.1,
       confidence=1.0,
-      reasons=(QualificationReason.QUALIFIED,),
+      reasons=(CalibrationQualificationReason.QUALIFIED,),
       candidate_parameters=node.parameters,
     )
     for index, node in enumerate(learned_nodes)
   )
   candidate_json = learned_profile.to_json().encode("utf-8")
-  qualified_finalization = LearningFinalization(
+  qualified_finalization = CalibrationLearningFinalization(
     manifest_bytes=b"test manifest",
     manifest_sha256="b" * 64,
     evidence_bytes=b"test evidence",
     evidence_sha256="c" * 64,
     candidate_profile_json=candidate_json,
     candidate_profile_sha256=hashlib.sha256(candidate_json).hexdigest(),
-    learning_result=LearningResult(
+    learning_result=CalibrationLearningResult(
       node_reports=learned_reports,
       candidate_profile=learned_profile,
     ),
@@ -1686,12 +1685,18 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
   assert qualified["candidate_profile_revision"] == learned_profile.revision
   assert all(node["qualified"] for node in qualified["nodes"])
   assert all(
-    set(node["candidate_parameters"]) == {
+    set(node["candidate_parameters"])
+    == {
       "torque_per_lateral_accel",
-      "rack_gain_deg_s2_per_torque",
-      "rack_damping_per_s",
+      "lateral_accel_offset_correction_mps2",
       "kinetic_friction_torque",
+      "static_breakaway_torque",
     }
+    for node in qualified["nodes"]
+  )
+  assert all(
+    node["candidate_parameters"]["lateral_accel_offset_correction_mps2"]
+    == -0.03
     for node in qualified["nodes"]
   )
 
@@ -1707,21 +1712,22 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
   assert driven["last_drive_complete"] is True
   assert all(
     node["last_drive_clean_support_s"] is not None
+    and node["last_drive_base_support_s"] is not None
+    and node["last_drive_moving_support_s"] is not None
+    and node["last_drive_breakaway_support_s"] is not None
+    and node["last_drive_authority_support_s"] is not None
     and node["last_drive_accepted_sample_count"] is not None
     for node in driven["nodes"]
   )
-  assert sum(
-    node["last_drive_accepted_sample_count"]
-    for node in driven["nodes"]
-  ) >= 1
+  assert sum(node["last_drive_accepted_sample_count"] for node in driven["nodes"]) >= 1
 
   mismatched_seed = replace(
-    runtime.runtime_bundle.seed_profile,
-    nodes=runtime.runtime_bundle.seed_profile.nodes[:-1],
+    runtime.runtime_bundle.calibration_seed_profile,
+    nodes=runtime.runtime_bundle.calibration_seed_profile.nodes[:-1],
   )
   mismatched_bundle = replace(
     runtime.runtime_bundle,
-    seed_profile=mismatched_seed,
+    calibration_seed_profile=mismatched_seed,
   )
   with test_case.assertRaisesRegex(
     ValueError,
@@ -1808,9 +1814,11 @@ def _test_status_write_failures_and_corrupt_restore_fail_closed(
     logger=FakeLogger(),
     route_owned_persistence=False,
   )
-  corrupt_sm.publish({
-    "deviceState": (stopped["deviceState"], 4_000_000_000),
-  })
+  corrupt_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 4_000_000_000),
+    }
+  )
   corrupt.step()
   assert corrupt.runtime is None
   assert corrupt_params.values[LEARNING_STATUS_PARAM] is previous_status
@@ -1819,19 +1827,16 @@ def _test_status_write_failures_and_corrupt_restore_fail_closed(
 
   # Restore attempts remain suppressed for the known-bad fingerprint, but the
   # non-authoritative stale-cache removal retries independently.
-  corrupt_sm.publish({
-    "deviceState": (stopped["deviceState"], 4_100_000_000),
-  })
+  corrupt_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 4_100_000_000),
+    }
+  )
   corrupt.step()
   assert LEARNING_STATUS_PARAM not in corrupt_params.values
-  assert not any(
-    key == LEARNING_STATUS_PARAM
-    for key, _, _ in corrupt_params.puts
-  )
+  assert not any(key == LEARNING_STATUS_PARAM for key, _, _ in corrupt_params.puts)
   assert any(
-    key == LEARNING_OPERATION_STATUS_PARAM
-    and value["state"] == "failed"
-    and value["diagnostic"] == "runtime_restore_failed"
+    key == LEARNING_OPERATION_STATUS_PARAM and value["state"] == "failed" and value["diagnostic"] == "runtime_restore_failed"
     for key, value, _ in corrupt_params.puts
   )
   assert corrupt_params.removes == [LEARNING_STATUS_PARAM]
@@ -1875,34 +1880,27 @@ def _test_route_owned_learner_never_overwrites_offroad_backfill_status(
   revisions = iter((b"generation-a", b"generation-b", b"generation-b"))
   cold._artifact_revision = lambda _runtime: next(revisions)
   stopped = fake_messages(cp, started=False)
-  cold_sm.publish({
-    "deviceState": (stopped["deviceState"], 1_000_000_000),
-  })
+  cold_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 1_000_000_000),
+    }
+  )
   cold.step()
   assert len(cold_created) == 1
   assert cold_params.values[LEARNING_OPERATION_STATUS_PARAM] is cold_status
-  assert not any(
-    key == LEARNING_OPERATION_STATUS_PARAM
-    for key, _, _ in cold_params.puts
-  )
+  assert not any(key == LEARNING_OPERATION_STATUS_PARAM for key, _, _ in cold_params.puts)
 
   pointer_flip_status = {"owner": "backfill-pointer-flip"}
-  cold_params.values[LEARNING_OPERATION_STATUS_PARAM] = (
-    pointer_flip_status
+  cold_params.values[LEARNING_OPERATION_STATUS_PARAM] = pointer_flip_status
+  cold_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 1_100_000_000),
+    }
   )
-  cold_sm.publish({
-    "deviceState": (stopped["deviceState"], 1_100_000_000),
-  })
   cold.step()
   assert len(cold_created) == 2
-  assert (
-    cold_params.values[LEARNING_OPERATION_STATUS_PARAM]
-    is pointer_flip_status
-  )
-  assert not any(
-    key == LEARNING_OPERATION_STATUS_PARAM
-    for key, _, _ in cold_params.puts
-  )
+  assert cold_params.values[LEARNING_OPERATION_STATUS_PARAM] is pointer_flip_status
+  assert not any(key == LEARNING_OPERATION_STATUS_PARAM for key, _, _ in cold_params.puts)
 
   # A confirmed exact live-CarParams mismatch leaves the runtime unbound.
   # Returning offroad with a changed persistent identity must not let learnerd
@@ -1921,43 +1919,36 @@ def _test_route_owned_learner_never_overwrites_offroad_backfill_status(
     runtime_factory=make_runtime_factory(mismatch_created),
     logger=FakeLogger(),
   )
-  mismatch_sm.publish({
-    "deviceState": (stopped["deviceState"], 2_000_000_000),
-  })
+  mismatch_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 2_000_000_000),
+    }
+  )
   mismatch.step()
   mismatch_params.values["CarParams"] = b"live-mismatch"
   started = fake_messages(cp, started=True)
-  mismatch_sm.publish({
-    "deviceState": (started["deviceState"], 3_000_000_000),
-  })
+  mismatch_sm.publish(
+    {
+      "deviceState": (started["deviceState"], 3_000_000_000),
+    }
+  )
   mismatch.step()
   assert mismatch._runtime_unavailable_this_drive
-  assert mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM][
-    "state"
-  ] == "drive_skipped_identity_mismatch"
+  assert mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM]["state"] == "drive_skipped_identity_mismatch"
 
   offroad_owner_status = {"owner": "backfill-after-skipped-drive"}
-  mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] = (
-    offroad_owner_status
-  )
+  mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] = offroad_owner_status
   mismatch_params.values["CarParamsPersistent"] = b"replacement-identity"
-  prior_operation_puts = sum(
-    key == LEARNING_OPERATION_STATUS_PARAM
-    for key, _, _ in mismatch_params.puts
+  prior_operation_puts = sum(key == LEARNING_OPERATION_STATUS_PARAM for key, _, _ in mismatch_params.puts)
+  mismatch_sm.publish(
+    {
+      "deviceState": (stopped["deviceState"], 4_000_000_000),
+    }
   )
-  mismatch_sm.publish({
-    "deviceState": (stopped["deviceState"], 4_000_000_000),
-  })
   mismatch.step()
   assert len(mismatch_created) == 2
-  assert (
-    mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM]
-    is offroad_owner_status
-  )
-  assert sum(
-    key == LEARNING_OPERATION_STATUS_PARAM
-    for key, _, _ in mismatch_params.puts
-  ) == prior_operation_puts
+  assert mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] is offroad_owner_status
+  assert sum(key == LEARNING_OPERATION_STATUS_PARAM for key, _, _ in mismatch_params.puts) == prior_operation_puts
 
   # Manager flips IsOffroad before the last deviceState update reaches the
   # live process. Its stale local `_onroad` observation must not let that
@@ -1965,25 +1956,14 @@ def _test_route_owned_learner_never_overwrites_offroad_backfill_status(
   mismatch._onroad = True
   mismatch_params.values["IsOffroad"] = True
   transition_owner_status = {"owner": "backfill-manager-transition"}
-  mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] = (
-    transition_owner_status
-  )
-  prior_operation_puts = sum(
-    key == LEARNING_OPERATION_STATUS_PARAM
-    for key, _, _ in mismatch_params.puts
-  )
+  mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] = transition_owner_status
+  prior_operation_puts = sum(key == LEARNING_OPERATION_STATUS_PARAM for key, _, _ in mismatch_params.puts)
   mismatch._publish_operation_status(
     state=LearningOperationState.COLLECTING,
     diagnostic="collecting_current_drive",
   )
-  assert (
-    mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM]
-    is transition_owner_status
-  )
-  assert sum(
-    key == LEARNING_OPERATION_STATUS_PARAM
-    for key, _, _ in mismatch_params.puts
-  ) == prior_operation_puts
+  assert mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] is transition_owner_status
+  assert sum(key == LEARNING_OPERATION_STATUS_PARAM for key, _, _ in mismatch_params.puts) == prior_operation_puts
 
 
 class TestBlatV2LearnerDaemon(unittest.TestCase):

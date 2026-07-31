@@ -29,10 +29,10 @@ from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   RuntimeTorqueLimits,
   apply_torque_envelope,
 )
-from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
-  LearningCoordinator,
-  LearningFinalization,
-  LearningLifecycleState,
+from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
+  CalibrationLearningCoordinator,
+  CalibrationLearningFinalization,
+  CalibrationLearningLifecycleState,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
   ActuatorBoundary,
@@ -60,7 +60,7 @@ CASUAL_DRIVING_CANDIDATE_PROVENANCE = "measured casual-driving evidence"
 # physical runtime. A policy change must start from an empty ledger and replay
 # retained full rlogs; it must never reinterpret or mix a predecessor's
 # CURRENT generation in place.
-FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v2"
+FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v3"
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
   "STEER_DELTA_UP",
@@ -507,11 +507,11 @@ class PersistentLearningRuntime:
     car_params: car.CarParams,
     runtime_bundle: RuntimeVehicleBundle,
     artifact_paths: LearningArtifactPaths,
-    coordinator: LearningCoordinator,
+    coordinator: CalibrationLearningCoordinator,
   ) -> None:
     if (
       coordinator.vehicle_identity
-      != runtime_bundle.seed_profile.vehicle_identity
+      != runtime_bundle.calibration_seed_profile.vehicle_identity
     ):
       raise ValueError("coordinator and runtime bundle vehicle mismatch")
     self.car_params = car_params
@@ -526,7 +526,7 @@ class PersistentLearningRuntime:
     self.torque_response_aligner = CausalTorqueResponseAligner(
       maximum_transport_delay_s=max(
         node.parameters.transport_delay_s
-        for node in runtime_bundle.seed_profile.nodes
+        for node in runtime_bundle.calibration_seed_profile.nodes
       ),
       maximum_gap_s=MAX_CONTINUOUS_MEASUREMENT_GAP_S,
     )
@@ -568,8 +568,8 @@ class PersistentLearningRuntime:
       )
 
     if not evidence_exists:
-      coordinator = LearningCoordinator(
-        runtime_bundle.seed_profile,
+      coordinator = CalibrationLearningCoordinator(
+        runtime_bundle.calibration_seed_profile,
         candidate_provenance=CASUAL_DRIVING_CANDIDATE_PROVENANCE,
       )
       return cls(
@@ -582,8 +582,8 @@ class PersistentLearningRuntime:
     try:
       evidence_bytes = artifact_paths.evidence.read_bytes()
       manifest_bytes = artifact_paths.manifest.read_bytes()
-      coordinator = LearningCoordinator(
-        runtime_bundle.seed_profile,
+      coordinator = CalibrationLearningCoordinator(
+        runtime_bundle.calibration_seed_profile,
         evidence_bytes,
         candidate_provenance=CASUAL_DRIVING_CANDIDATE_PROVENANCE,
       )
@@ -669,7 +669,10 @@ class PersistentLearningRuntime:
           f"backfill {name} does not match commit record",
         )
 
-    if commit["runtime_identity_sha256"] != runtime_bundle.identity_sha256:
+    if (
+      commit["runtime_identity_sha256"]
+      != runtime_bundle.calibration_identity_sha256
+    ):
       raise LearningRestoreError(
         "backfill generation belongs to another runtime",
       )
@@ -709,7 +712,9 @@ class PersistentLearningRuntime:
     self._last_reported_applied_torque = 0.0
     self.coordinator.transition_onroad()
 
-  def transition_offroad_and_persist(self) -> LearningFinalization:
+  def transition_offroad_and_persist(
+    self,
+  ) -> CalibrationLearningFinalization:
     self.coordinator.transition_offroad()
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
@@ -727,9 +732,12 @@ class PersistentLearningRuntime:
     self._last_applied_report_mono_ns = 0
     self._last_reported_applied_torque = 0.0
 
-  def persist_offroad(self) -> LearningFinalization:
+  def persist_offroad(self) -> CalibrationLearningFinalization:
     """Persist the current finalized state; safe to retry after I/O failure."""
-    if self.coordinator.state is not LearningLifecycleState.OFFROAD:
+    if (
+      self.coordinator.state
+      is not CalibrationLearningLifecycleState.OFFROAD
+    ):
       raise RuntimeError("learner persistence is permitted only offroad")
     if self.artifact_paths.backfill_pointer.is_file():
       raise RuntimeError(
@@ -794,7 +802,10 @@ class PersistentLearningRuntime:
     return mapping
 
   def ingest(self, frame: MeasuredLearningFrame) -> bool:
-    if self.coordinator.state is not LearningLifecycleState.ONROAD:
+    if (
+      self.coordinator.state
+      is not CalibrationLearningLifecycleState.ONROAD
+    ):
       raise RuntimeError("measured frames may be ingested only while onroad")
     if not isinstance(frame, MeasuredLearningFrame):
       raise TypeError("persistent learner requires MeasuredLearningFrame")
@@ -903,9 +914,11 @@ class PersistentLearningRuntime:
       self.envelope_constraint.reset()
       self.torque_response_aligner.reset()
 
-    seed_parameters = self.runtime_bundle.seed_profile.parameters_at(
-      frame.speed_mps,
-    ).parameters
+    seed_parameters = (
+      self.runtime_bundle.calibration_seed_profile.parameters_at(
+        frame.speed_mps,
+      ).parameters
+    )
     aligned_torque = (
       self.torque_response_aligner.aligned(
         response_time_s=sample_time_s,
@@ -973,7 +986,7 @@ def artifact_paths_for_bundle(
   """Separate artifacts by physical runtime and evidence-inclusion policy."""
   return LearningArtifactPaths(
     Path(storage_root)
-    / runtime_bundle.identity_sha256
+    / runtime_bundle.calibration_identity_sha256
     / FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
   )
 

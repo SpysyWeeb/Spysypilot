@@ -46,16 +46,41 @@ The replacement is split into independently testable owners:
 - one measured rack mapping and forward/inverse physical plant;
 - one computed-torque core;
 - one exact opendbc command envelope and invalid-output guard;
-- an offline measured-response shadow and an offroad full-rlog importer for
-  durable speed-local learning;
-- an offroad-only artifact, feedback, promotion, and rollback lifecycle.
+- an offroad full-rlog importer and observable, speed-local inverse-torque
+  learner;
+- offline-only artifact, feedback, promotion, and rollback test surfaces for a
+  future reviewed consumer; none is manager-launched in this milestone.
+
+The current learning milestone replaces the rejected dynamic-rack fit. Normal
+driving did not independently identify rack gain and damping, so those
+provisional values are no longer learned or allowed to influence learning
+identity. Evidence schema 5 instead learns only quantities the logs directly
+support at the `0/5/10/15/20/30 m/s` nodes:
+
+- normalized torque per measured lateral acceleration;
+- a signed residual lateral-acceleration offset correction;
+- moving (kinetic) friction from resolved rack motion; and
+- static breakaway torque from the first resolved motion after a measured
+  stationary dwell.
+
+The fit is deterministic constrained least squares. Gain, moving friction,
+and the excess of static over moving friction are non-negative by physical
+construction; the signed offset remains free. This is not a post-fit clamp:
+each active constraint is re-solved. If ordinary driving cannot distinguish
+extra breakaway, the reported boundary is `static == kinetic` rather than an
+invented stiction value.
+
+Stationary settled response, moving response, breakaway events, held-out
+validation, and actuator-authority observations remain separate populations.
+No partial node set can emit a candidate, and no candidate produced by this
+milestone has an approval or activation path.
 
 The previous **LQI** controller—“Linear Quadratic Integral,” a state-feedback
 controller with an integral error state—is retired. It is not the controller
-being built here. The replacement core directly computes the torque required
-by the authored rack position, rate, and acceleration using one learned
-physical profile, so a tuning module does not have to correct another tuning
-module.
+being built here. This milestone changes only offline calibration. The exact
+stock torque-controller algorithm remains the active bootstrap, and a future
+controller must consume one qualified calibration map in place of its stock
+map—not add another correction loop around it.
 
 The first combo build contains no approved modular profile. It therefore
 drives with the exact current stock torque-controller algorithm and launches
@@ -96,16 +121,29 @@ has enough excitation, independent validation, and bounded uncertainty.
 Highway mileage cannot overwrite low-speed knowledge because samples update
 only their neighboring speed nodes.
 
-Profiles never change mid-drive. A newly qualified profile is promoted only at
-an engagement boundary and can be rolled back at the next disengagement. After
-the first active validation drive, the offroad review asks:
+The learner's current evidence namespace is
+`complete_full_rlog_authority_v3`. It starts empty by design. The retired v1
+and v2 namespaces and their artifact bytes are never migrated, edited, or
+interpreted as schema-5 evidence; compatible retained full rlogs are replayed
+from source. Runtime identity for this namespace excludes the retired
+provisional rack-gain/damping seed while remaining bound to the detected
+vehicle, torque mapping, rack mapping, sensor resolution, and opendbc command
+envelope.
+
+This milestone stops at an unapproved, informational candidate file. It does
+not promote, activate, or roll back that file, and stock remains selected even
+when every node qualifies. The following lifecycle is the separately gated
+future consumer contract, not current behavior: a reviewed profile could
+change only at an engagement boundary, and after its first active validation
+drive the offroad review would ask:
 
 > Compared with the previous steering profile, how did steering feel?
 
 The choices are **Better**, **About same**, **Worse**, and **Not sure**.
-`Worse` deactivates the provisional profile for the next engagement but keeps
-the data for diagnosis. Driver overrides are evidence bookmarks, not automatic
-proof that a controller is bad.
+Under that future contract, `Worse` would deactivate the provisional profile
+for the next engagement while retaining its data for diagnosis. Driver
+overrides remain evidence bookmarks, not automatic proof that a controller is
+bad.
 
 Profile revisions are opaque, monotonically increasing evidence generations,
 not contiguous release numbers. Identical restored evidence produces the same
@@ -117,7 +155,9 @@ low-speed nodes.
 Measured evidence includes reachable, driver-free vehicle-owned torque
 boundaries. Full-torque and maximum-slew frames are retained in a separate
 speed-local authority stratum rather than being discarded. Slew transients
-remain out of the instantaneous equality fit. Every response frame is paired
+and stationary full-torque rows remain observations, not equality-fit rows;
+only settled magnitude-boundary rows with resolved rack motion may join the
+fit. Every response frame is paired
 causally with the newest recorded torque effective no later than
 `response time - seed transport delay`; it is never paired with the convenient
 same-frame `carOutput`. `carOutput` itself reports the prior card cycle, so the
@@ -132,9 +172,11 @@ Vehicle steering-rate signals are also normalized before fitting. A natively
 signed source keeps its sign. An unsigned magnitude source, including the
 Palisade SAS rate, preserves the sensor magnitude and derives direction from
 offset-corrected measured steering-angle motion. Quantized plateaus may retain
-direction only within one continuous validity epoch. A measured reversal is
-retained as speed-local coverage but its sign-crossing acceleration never
-enters a fit. Zero motion clears the unsigned-source direction latch; gaps,
+direction only within one continuous validity epoch. Because the observable
+inverse map does not use rack acceleration, a valid measured reversal remains
+a moving-response row and direction-coverage event without importing a
+quantized acceleration impulse. It cannot manufacture a breakaway event from
+stale dwell. Zero motion clears the unsigned-source direction latch; gaps,
 disengagement, driver override, standstill, faults, and mapping failures break
 cross-frame reversal continuity.
 Settled authority rows cannot influence a candidate until their own held-out
@@ -147,6 +189,12 @@ offroad importer owns both. Operation status distinguishes logger
 finalization, historical route scanning/replay progress, idle evidence, an
 eligible empty state, and fail-closed diagnostics.
 
+Learning-status schema 2 reports each speed node's total/base/moving/
+breakaway/authority populations, train/validation state, and—only when a fit
+exists—the four observable candidate values above. It never labels the
+retired rack gain or damping as learned. These values remain informational;
+the UI cannot approve or activate them.
+
 Both caches are cleared at manager start and published only after the offroad
 owner validates its phase and current vehicle/build authority. They are
 informational only: neither is evidence, approval, a profile,
@@ -155,6 +203,19 @@ cannot change steering. The `BLaTv2LifecycleStatus` schema and
 `blatv2_profiled` implementation remain available for offline lifecycle
 testing, but the stock-only field manager does not launch that process or
 publish that cache.
+
+### Pre-merge real-route audit
+
+Routes b2 through b7 were replayed twice through the production importer with
+the current vehicle-selected 409/4/7 envelope. Both passes produced identical
+evidence (`8f67d9c41d9669f1a82f7abbe4f841c70434403a7235ad4236d3964fca40b81a`)
+and manifest (`cc8e5387f8c83c6efc57b37e2bbe7d4d2e4651a985d1815d3483ebdd9c29b0d`)
+hashes. The 10 and 15 m/s nodes qualified. The 5 m/s node had enough ordinary
+evidence but correctly failed its independent full-authority validation; 0,
+20, and 30 m/s remained evidence-limited or non-regressing. Every solvable
+node selected the honest `static == kinetic` active-set boundary. Because the
+six-node contract was incomplete, no candidate file was emitted and stock
+selection was unchanged.
 
 ---
 

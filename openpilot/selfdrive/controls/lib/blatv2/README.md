@@ -6,6 +6,20 @@ drive, the offroad-only `blatv2_backfilld` waits for loggerd to close the
 route, reads the complete local full rlog, independently replays it twice,
 and atomically publishes one authenticated evidence generation.
 
+The current generation learns an observable inverse-torque calibration, not
+the retired dynamic rack model. At each `0/5/10/15/20/30 m/s` node it keeps
+stationary/base, resolved-moving, first-motion-after-dwell breakaway, held-out
+validation, and actuator-authority populations separate. The only fitted
+values are torque per lateral acceleration, signed lateral-acceleration offset
+correction, moving friction, and static breakaway. Rack gain and damping are
+neither fitted nor part of the calibration identity.
+
+The numerical fit is deterministic constrained least squares. It
+reparameterizes static breakaway as moving friction plus non-negative excess
+and re-solves every active constraint face. A `static == kinetic` result is an
+explicit statement that ordinary driving did not identify additional
+breakaway; it is not a clipped or feel-tuned number.
+
 This means the UI can report `finalizing`, `backfilling`, and exact pass,
 route, and segment progress instead of continuing to say that a first drive
 is required while work is in progress. `BLaTv2BackfillProgress` is a separate
@@ -28,8 +42,9 @@ Historical replay intentionally fails closed. A route is eligible only when:
   superproject, opendbc, panda, and log-schema provenance;
 - it belongs to the same dongle, vehicle fingerprint, and VIN when both VINs
   are available;
-- its reviewed steering limits, rack-rate resolution, seed profile, nominal
-  mapping, and torque interpretation match the current physical runtime;
+- its reviewed steering limits, rack-rate resolution, observable calibration
+  seed, nominal mapping, and torque interpretation match the current physical
+  runtime;
 - CarParams are present and consistent throughout the route;
 - all required measurement services cover the controls witnesses, with no more
   than one percent unresolved witnesses or inferred control gaps; and
@@ -89,10 +104,11 @@ exactly-once route ownership and rejects changed content for an already known
 route.
 
 `accepted_sample_count` means a valid hands-off measured-response frame
-incorporated into ordinary or authority evidence. Reachable driver-free full
+incorporated into base, moving, breakaway, or authority evidence. Reachable driver-free full
 magnitude and maximum-slew boundaries are retained because `carOutput`
 records the actual CarController input to the rack. Slew rows are authority
-observations only.
+observations only; stationary full-torque rows likewise remain unresolved
+authority observations rather than equality-fit data.
 
 The replay retains distinct controls-witness, car-state response,
 `carOutput` report, and applied-command effective timestamps. Since `card.py`
@@ -101,8 +117,8 @@ publishes `last_actuators_output` before applying its next output, a
 For rack response at time `t`, the input is the newest exact zero-order-held
 command effective at or before `t - transport_delay(speed)`. No future,
 interpolated, or same-frame command can enter the fit. Speed, mapping,
-lateral acceleration, rack rate/acceleration, and node weights remain at
-response time. Full-magnitude rows enter the separate authority equality fit
+lateral acceleration, rack rate, and node weights remain at response time.
+Rack acceleration is not an input to the observable fit. Full-magnitude rows enter the separate authority equality fit
 after one aligned response interval of settled command-side dwell and only
 when the rack is measurably moving. They remain deferred until at least four
 held-out authority rows exist, then free and authority validation must each
@@ -114,10 +130,21 @@ Some vehicle interfaces publish signed steering rate; others publish only a
 magnitude. Learning preserves that measured magnitude and reconstructs sign
 from offset-corrected steering-angle motion when necessary. It rechecks angle
 direction across nonzero reversals and bridges only sensor-quantization
-plateaus. A reversal counts as coverage but its sign-crossing acceleration is
-not fit; lifecycle and mapping discontinuities clear cross-frame direction.
-Evidence schema v4 and canonical join schema v2 establish these sign and
-timing semantics; older evidence is never reinterpreted or mixed silently.
+plateaus. A valid reversal remains moving-response and direction-coverage
+evidence because rack acceleration is not fitted; it clears prior dwell so it
+cannot fabricate a breakaway. Lifecycle and mapping discontinuities clear
+cross-frame direction.
+
+Calibration profile schema v2, evidence schema v5, coordinator artifact schema
+v4, learning-status schema v2, and canonical join schema v2 establish these
+semantics. Older evidence is never reinterpreted or mixed silently.
+
+A candidate is emitted only when all six speed nodes qualify. It remains an
+unapproved, informational, content-addressed file: calibration code does not
+write Params, cannot populate `BLaTv2ApprovedArtifact`, and has no approval or
+activation API. Partial evidence emits no candidate, and even a complete
+candidate leaves the exact stock torque controller selected until a separate
+controller and its full acceptance contract are reviewed.
 
 Immutable generations are not garbage-collected yet. A future collector must
 be scoped to an offroad/boot reader lifetime, wait until no resolved artifact
@@ -126,8 +153,8 @@ its predecessor. Until that reader-lifetime contract exists, retaining all
 generations is the safe behavior.
 
 Durable storage is also versioned by evidence-inclusion policy:
-`<storage root>/<runtime identity>/complete_full_rlog_authority_v2`. The
-predecessor `complete_full_rlog_authority_v1` and any earlier unnamespaced
-runtime directory remain byte-untouched and are never restored or mixed into
-this policy. Version 2 always starts with an empty ledger and independently
-replays every still-local eligible full rlog.
+`<storage root>/<calibration runtime identity>/complete_full_rlog_authority_v3`.
+The predecessor v1/v2 namespaces and any earlier unnamespaced runtime
+directory remain byte-untouched and are never restored or mixed into this
+policy. Version 3 always starts with an empty ledger and independently replays
+every still-local eligible full rlog.
