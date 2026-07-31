@@ -25,6 +25,16 @@ openpilot's stock acceleration gate by `10 m/s` (about `22 mph`) and follows
 the stock ceiling above it. The reaction-time jerk tune remains unchanged.
 Requested authority remains clamped to the deployed opendbc limit.
 
+Conditional Experimental Mode is **in progress**. Its target behavior is to
+keep BLoTv2 in Chill mode during ordinary driving, hand the existing
+longitudinal planner to Experimental mode for a confirmed, lead-free model
+stop prediction, hold that handoff through the stop, and return to Chill after
+a stable release or driver override. This branch has no standalone traffic
+light or stop-sign classifier, so the detector uses the model's existing
+`action.shouldStop`, path-end, and desired-acceleration signals. The feature
+will publish only through `selfdriveState.experimentalMode`; it adds no UI or
+user-facing Params and does not own target speed or braking.
+
 Each physical decision has one owner. The planner/MPC owns trajectory
 necessity, Smooth Stops owns only the final low-speed approach and hold
 handoff, and the stock long controller and platform safety layers retain
