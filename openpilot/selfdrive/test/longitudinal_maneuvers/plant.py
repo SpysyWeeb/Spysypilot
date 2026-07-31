@@ -12,11 +12,11 @@ from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
 class _SubMasterShim(dict):
-  """BLoT's supervisor reads SubMaster.valid; the plant's plain dict stands in for
-  SubMaster during maneuver sims, so expose an all-valid mapping."""
-  @property
-  def valid(self):
-    return {k: True for k in self}
+  """Expose the liveness contract consumed by the production planner."""
+
+  def all_checks(self, service_list=None):
+    services = self.keys() if service_list is None else service_list
+    return all(service in self for service in services)
 
 
 class Plant:
@@ -125,8 +125,6 @@ class Plant:
     model.modelV2.acceleration = acceleration
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
-    # The plant's model-lead must be as predictive as the real model, else the sim
-    # exercises a controller input that never occurs on the road.
     lead_times = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
     if a_lead < 0.0:
       integration_times = np.minimum(lead_times, max(-v_lead / a_lead, 0.0))
@@ -151,13 +149,15 @@ class Plant:
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = _SubMasterShim({'radarState': radar.radarState,
-          'carState': car_state.carState,
-          'carControl': car_control.carControl,
-          'controlsState': control.controlsState,
-          'selfdriveState': ss.selfdriveState,
-          'liveParameters': lp.liveParameters,
-          'modelV2': model.modelV2})
+    sm = _SubMasterShim({
+      'radarState': radar.radarState,
+      'carState': car_state.carState,
+      'carControl': car_control.carControl,
+      'controlsState': control.controlsState,
+      'selfdriveState': ss.selfdriveState,
+      'liveParameters': lp.liveParameters,
+      'modelV2': model.modelV2,
+    })
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:

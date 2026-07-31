@@ -32,6 +32,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
@@ -241,12 +242,13 @@ class Controls:
 
     # accel PID loop
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
-    radar_lead = self.sm['radarState'].leadOne
-    # all_checks (alive + freq + valid), not just valid: valid only updates when a message
-    # arrives, so a dead radard would leave the last lead frozen-but-"valid" forever
-    has_lead = bool(radar_lead.present) and self.sm.all_checks(['radarState'])
-    actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits,
-                                           radar_lead.dRel, has_lead, max(float(radar_lead.vLeadK), 0.0)))
+    lead = LeadObservation.from_radar(
+      self.sm['radarState'].leadOne,
+      self.sm.all_checks(['radarState']),
+    )
+    actuators.accel = float(self.LoC.update(
+      CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits, lead,
+    ))
 
     # Steering controller. The STOCK arm below is the existing stock block:
     # modular state, exceptions, and telemetry never participate in it.
