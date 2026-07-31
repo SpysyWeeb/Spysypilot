@@ -10,8 +10,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR
+from openpilot.selfdrive.controls.lib.blatv2.actuator import (
+  RuntimeTorqueLimits,
+  apply_torque_envelope,
+)
 from openpilot.selfdrive.controls.blatv2_learnerd import (
   PUBLISHED_SERVICES,
   SUBSCRIBED_SERVICES,
@@ -30,12 +36,14 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
   QualificationReason,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
+  _MeasuredEnvelopeConstraint,
   LearningRestoreError,
   MeasuredLearningFrame,
   PersistentLearningRuntime,
   build_detected_runtime_bundle,
   build_persistent_learning_runtime,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learner import ActuatorBoundary
 from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
   LEARNING_OPERATION_STATUS_PARAM,
   LearningOperationState,
@@ -164,6 +172,305 @@ def measured_frame(
   return MeasuredLearningFrame(**values)
 
 
+def _test_palisade_409_4_7_boundary_classifier() -> None:
+  limits = RuntimeTorqueLimits(
+    steer_max=409,
+    delta_up=4,
+    delta_down=7,
+    steer_step=1,
+    driver_allowance=50,
+    driver_multiplier=2,
+    driver_factor=1,
+  )
+  classifier = _MeasuredEnvelopeConstraint(limits)
+  time_s = 1.0
+
+  first = classifier.update(
+    sample_time_s=time_s,
+    applied_torque=0.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert not first.valid
+  time_s += 0.01
+  interior = classifier.update(
+    sample_time_s=time_s,
+    applied_torque=0.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert interior.valid and not interior.constrained
+
+  applied = 0.0
+  while applied < 1.0:
+    previous = applied
+    applied = apply_torque_envelope(
+      limits,
+      1.0,
+      previous,
+      0.0,
+    ).applied_torque
+    time_s += 0.01
+    observation = classifier.update(
+      sample_time_s=time_s,
+      # Exercise the exact Float32 value present in an rlog.
+      applied_torque=float(np.float32(applied)),
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    assert observation.valid and observation.constrained
+    assert observation.boundary & ActuatorBoundary.SLEW_BUILD
+  assert observation.boundary & ActuatorBoundary.MAGNITUDE
+  assert observation.magnitude_boundary_dwell_s == 0.0
+
+  for hold_index in range(13):
+    time_s += 0.01
+    held = classifier.update(
+      sample_time_s=time_s,
+      applied_torque=1.0,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    assert held.valid and held.constrained
+    assert held.boundary == ActuatorBoundary.MAGNITUDE
+    assert abs(held.magnitude_boundary_dwell_s - 0.01 * (hold_index + 1)) < 1e-12
+
+  applied = apply_torque_envelope(
+    limits,
+    -1.0,
+    applied,
+    0.0,
+  ).applied_torque
+  time_s += 0.01
+  release = classifier.update(
+    sample_time_s=time_s,
+    applied_torque=applied,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert release.valid and release.constrained
+  assert release.boundary == ActuatorBoundary.SLEW_RELEASE
+
+  saw_crossing = False
+  saw_negative_build = False
+  while applied > -1.0:
+    previous = applied
+    applied = apply_torque_envelope(
+      limits,
+      -1.0,
+      previous,
+      0.0,
+    ).applied_torque
+    time_s += 0.01
+    negative = classifier.update(
+      sample_time_s=time_s,
+      applied_torque=applied,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    assert negative.valid and negative.constrained
+    if previous >= 0.0 and applied < 0.0:
+      saw_crossing = True
+      assert negative.boundary & ActuatorBoundary.SLEW_RELEASE
+      assert negative.boundary & ActuatorBoundary.SLEW_BUILD
+    elif abs(applied) > abs(previous):
+      saw_negative_build = True
+      assert negative.boundary & ActuatorBoundary.SLEW_BUILD
+  assert saw_crossing and saw_negative_build
+  assert negative.boundary & ActuatorBoundary.MAGNITUDE
+  time_s += 0.01
+  negative_held = classifier.update(
+    sample_time_s=time_s,
+    applied_torque=-1.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert negative_held.valid
+  assert negative_held.boundary == ActuatorBoundary.MAGNITUDE
+
+  saw_positive_crossing = False
+  while applied < 1.0:
+    previous = applied
+    applied = apply_torque_envelope(
+      limits,
+      1.0,
+      previous,
+      0.0,
+    ).applied_torque
+    time_s += 0.01
+    positive_again = classifier.update(
+      sample_time_s=time_s,
+      applied_torque=applied,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    assert positive_again.valid and positive_again.constrained
+    if previous <= 0.0 and applied > 0.0:
+      saw_positive_crossing = True
+      assert positive_again.boundary & ActuatorBoundary.SLEW_RELEASE
+      assert positive_again.boundary & ActuatorBoundary.SLEW_BUILD
+  assert saw_positive_crossing
+
+  # Every count that a Float32 rlog can carry survives count-grid validation;
+  # 267 counts is the worst round-trip error for this 409-count envelope.
+  for count in range(-409, 410):
+    grid = _MeasuredEnvelopeConstraint(limits)
+    encoded = float(np.float32(count / 409))
+    grid.update(
+      sample_time_s=1.0,
+      applied_torque=encoded,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    same = grid.update(
+      sample_time_s=1.01,
+      applied_torque=encoded,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    assert same.valid
+
+  # A driver-limited endpoint is reachable but not vehicle-only evidence.
+  driver_classifier = _MeasuredEnvelopeConstraint(limits)
+  previous = 390 / 409
+  driver_classifier.update(
+    sample_time_s=2.0,
+    applied_torque=previous,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  driver_endpoint = apply_torque_envelope(
+    limits,
+    1.0,
+    previous,
+    -60.0,
+  ).applied_torque
+  driver_bound = driver_classifier.update(
+    sample_time_s=2.01,
+    applied_torque=driver_endpoint,
+    driver_torque=-60.0,
+    inputs_valid=True,
+  )
+  assert not driver_bound.valid
+  assert driver_bound.boundary & ActuatorBoundary.DRIVER
+
+  # Real card ordering can pair the current driver torque with the prior
+  # carOutput. Reject both adjacent samples conservatively; otherwise these
+  # collapsed endpoints are indistinguishable without request intent.
+  for previous, driver in ((7 / 409, -500.0), (-7 / 409, 500.0)):
+    collapsed = _MeasuredEnvelopeConstraint(limits)
+    collapsed.update(
+      sample_time_s=2.0,
+      applied_torque=previous,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    endpoint = apply_torque_envelope(
+      limits,
+      1.0 if driver < 0.0 else -1.0,
+      previous,
+      driver,
+    ).applied_torque
+    observation = collapsed.update(
+      sample_time_s=2.01,
+      applied_torque=endpoint,
+      driver_torque=driver,
+      inputs_valid=True,
+    )
+    assert not observation.valid
+    assert observation.boundary == ActuatorBoundary.DRIVER
+
+  dwell = _MeasuredEnvelopeConstraint(limits)
+  dwell.update(
+    sample_time_s=5.0,
+    applied_torque=1.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  for index in range(14):
+    settled = dwell.update(
+      sample_time_s=5.01 + index * 0.01,
+      applied_torque=1.0,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+  assert abs(settled.magnitude_boundary_dwell_s - 0.13) < 1e-12
+  contaminated = dwell.update(
+    sample_time_s=5.15,
+    applied_torque=1.0,
+    driver_torque=60.0,
+    inputs_valid=True,
+  )
+  assert not contaminated.valid
+  assert contaminated.magnitude_boundary_dwell_s == 0.0
+  # The adjacent-driver veto consumes one extra frame for card/carOutput
+  # scheduling ambiguity, then magnitude dwell starts over from zero.
+  adjacent = dwell.update(
+    sample_time_s=5.16,
+    applied_torque=1.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert not adjacent.valid
+  restarted = dwell.update(
+    sample_time_s=5.17,
+    applied_torque=1.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert restarted.valid
+  assert restarted.magnitude_boundary_dwell_s == 0.0
+  lifecycle_reset = dwell.update(
+    sample_time_s=5.18,
+    applied_torque=1.0,
+    driver_torque=0.0,
+    inputs_valid=False,
+  )
+  assert not lifecycle_reset.valid
+  first_after_reset = dwell.update(
+    sample_time_s=5.19,
+    applied_torque=1.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert not first_after_reset.valid
+
+  for bad_time, bad_torque in (
+    (3.0, 0.5),
+    (3.01, 410 / 409),
+    (3.02, float("nan")),
+  ):
+    invalid_classifier = _MeasuredEnvelopeConstraint(limits)
+    invalid_classifier.update(
+      sample_time_s=2.99,
+      applied_torque=0.0,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    invalid = invalid_classifier.update(
+      sample_time_s=bad_time,
+      applied_torque=bad_torque,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+    assert not invalid.valid
+
+  gap_classifier = _MeasuredEnvelopeConstraint(limits)
+  gap_classifier.update(
+    sample_time_s=4.0,
+    applied_torque=0.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  gap = gap_classifier.update(
+    sample_time_s=4.016,
+    applied_torque=0.0,
+    driver_torque=0.0,
+    inputs_valid=True,
+  )
+  assert not gap.valid
+
+
 def _test_generic_non_hyundai_construction_uses_detected_opendbc_limits(
   generic_controller_module,
 ) -> None:
@@ -283,7 +590,7 @@ def _test_restore_corruption_and_seed_mismatch_fail_closed(
     )
 
 
-def _test_clean_frame_filters_reject_driver_inactive_invalid_gap_and_constraint(
+def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
   tmp_path: Path,
   generic_controller_module,
 ) -> None:
@@ -334,16 +641,72 @@ def _test_clean_frame_filters_reject_driver_inactive_invalid_gap_and_constraint(
     runtime.runtime_bundle.torque_limits.delta_up
     / runtime.runtime_bundle.torque_limits.steer_max
   )
-  assert not runtime.ingest(measured_frame(
+  assert runtime.ingest(measured_frame(
     cp,
     base + 110_000_000,
     applied_torque=upper_boundary,
+  ))
+  assert runtime.last_actuator_constrained
+  accepted += 1
+  assert runtime.coordinator.accepted_sample_count == accepted
+
+  # A finite value that could not have crossed the vehicle-owned envelope in
+  # one frame is corrupt input, not constrained evidence.
+  assert not runtime.ingest(measured_frame(
+    cp,
+    base + 120_000_000,
+    applied_torque=0.5,
   ))
   assert runtime.last_actuator_constrained
   assert runtime.coordinator.accepted_sample_count == accepted
 
   # A dropped controls frame cannot be compressed into a 10 ms derivative.
   assert not runtime.ingest(measured_frame(cp, base + 140_000_000))
+  assert runtime.coordinator.accepted_sample_count == accepted
+
+
+def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
+  tmp_path: Path,
+  generic_controller_module,
+) -> None:
+  runtime = build_generic_runtime(tmp_path, generic_controller_module)
+  cp = runtime.car_params
+  runtime.transition_onroad()
+  base = 1_000_000_000
+
+  # Prime the measured envelope and derivative using ordinary interior input.
+  assert not runtime.ingest(measured_frame(cp, base))
+  assert not runtime.ingest(measured_frame(cp, base + 10_000_000))
+  assert runtime.ingest(measured_frame(cp, base + 20_000_000))
+  accepted = runtime.coordinator.accepted_sample_count
+
+  applied = 0.0
+  frame_index = 3
+  while applied < 1.0:
+    applied = apply_torque_envelope(
+      runtime.runtime_bundle.torque_limits,
+      1.0,
+      applied,
+      0.0,
+    ).applied_torque
+    assert runtime.ingest(measured_frame(
+      cp,
+      base + frame_index * 10_000_000,
+      applied_torque=applied,
+    ))
+    assert runtime.last_actuator_constrained
+    accepted += 1
+    frame_index += 1
+
+  # Full magnitude is still a known applied input, not invalid telemetry.
+  assert applied == 1.0
+  assert runtime.ingest(measured_frame(
+    cp,
+    base + frame_index * 10_000_000,
+    applied_torque=1.0,
+  ))
+  assert runtime.last_actuator_constrained
+  accepted += 1
   assert runtime.coordinator.accepted_sample_count == accepted
 
 
@@ -1352,6 +1715,9 @@ class TestBlatV2LearnerDaemon(unittest.TestCase):
     self.module_patcher.stop()
     self.temporary_directory.cleanup()
 
+  def test_palisade_409_4_7_boundary_classifier(self):
+    _test_palisade_409_4_7_boundary_classifier()
+
   def test_generic_non_hyundai_construction_uses_detected_opendbc_limits(self):
     _test_generic_non_hyundai_construction_uses_detected_opendbc_limits(None)
 
@@ -1371,8 +1737,14 @@ class TestBlatV2LearnerDaemon(unittest.TestCase):
       self,
     )
 
-  def test_clean_frame_filters_reject_driver_inactive_invalid_gap_and_constraint(self):
-    _test_clean_frame_filters_reject_driver_inactive_invalid_gap_and_constraint(
+  def test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(self):
+    _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
+      self.tmp_path,
+      None,
+    )
+
+  def test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(self):
+    _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
       self.tmp_path,
       None,
     )

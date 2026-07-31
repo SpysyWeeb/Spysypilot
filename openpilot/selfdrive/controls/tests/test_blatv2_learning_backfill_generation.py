@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -26,7 +27,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
   LearningFinalization,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
+  FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
   LearningArtifactPaths,
+  artifact_paths_for_bundle,
 )
 
 
@@ -138,6 +141,54 @@ def publish(
 
 
 class TestBLaTv2BackfillGeneration(unittest.TestCase):
+  def test_inclusion_policy_namespace_ignores_legacy_runtime_root(
+    self,
+  ) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      storage_root = Path(temporary)
+      legacy_root = storage_root / RUNTIME_IDENTITY
+      legacy_root.mkdir()
+      legacy_pointer = canonical_json_bytes({
+        "generation_sha256": hashlib.sha256(b"legacy").hexdigest(),
+        "schema_version": BACKFILL_POINTER_SCHEMA_VERSION,
+      })
+      legacy_evidence = b'{"legacy":"evidence"}'
+      legacy_manifest = b'{"legacy":"manifest"}'
+      (legacy_root / "backfill_current.json").write_bytes(legacy_pointer)
+      (legacy_root / "evidence.json").write_bytes(legacy_evidence)
+      (legacy_root / "manifest.json").write_bytes(legacy_manifest)
+
+      paths = artifact_paths_for_bundle(
+        storage_root,
+        SimpleNamespace(identity_sha256=RUNTIME_IDENTITY),
+      )
+
+      self.assertEqual(
+        paths.root,
+        legacy_root / FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
+      )
+      self.assertFalse(paths.root.exists())
+      self.assertFalse(paths.backfill_pointer.exists())
+      self.assertEqual(
+        load_ledger(
+          paths,
+          runtime_identity_sha256=RUNTIME_IDENTITY,
+        ),
+        empty_ledger(),
+      )
+      self.assertEqual(
+        (legacy_root / "backfill_current.json").read_bytes(),
+        legacy_pointer,
+      )
+      self.assertEqual(
+        (legacy_root / "evidence.json").read_bytes(),
+        legacy_evidence,
+      )
+      self.assertEqual(
+        (legacy_root / "manifest.json").read_bytes(),
+        legacy_manifest,
+      )
+
   def test_publish_is_content_addressed_and_hash_bound(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:
       paths = LearningArtifactPaths(Path(temporary))

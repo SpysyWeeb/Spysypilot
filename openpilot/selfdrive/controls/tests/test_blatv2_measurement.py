@@ -7,6 +7,10 @@ from openpilot.selfdrive.controls.lib.blatv2.measurement import (
   MAX_CONTINUOUS_MEASUREMENT_GAP_S,
   LearningMeasurementBuilder,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learner import (
+  ActuatorBoundary,
+  _attest_authority_sample,
+)
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
   curvature_from_measured_angle,
@@ -95,19 +99,29 @@ def test_measured_rate_acceleration_and_gravity_convention_are_exact():
   )
 
 
-def test_driver_and_constraint_flags_exclude_without_poisoning_derivative():
+def test_driver_excludes_but_valid_constraint_is_continuous_evidence():
   builder = LearningMeasurementBuilder()
   update(builder, timestamp=1.0, rate=0.0)
   pressed = update(
     builder, timestamp=1.01, rate=1.0, steering_pressed=True,
   )
-  constrained = update(
-    builder, timestamp=1.02, rate=2.0, constrained=True,
+  constrained_raw = update(
+    builder,
+    timestamp=1.02,
+    rate=2.0,
+    constrained=True,
+  )
+  constrained = _attest_authority_sample(
+    constrained_raw,
+    boundary=ActuatorBoundary.SLEW_BUILD,
+    magnitude_boundary_dwell_s=0.0,
   )
   recovered = update(builder, timestamp=1.03, rate=3.0)
 
   assert pressed.valid and not pressed.clean
   assert constrained.valid and not constrained.clean
+  assert constrained.authority_evidence
+  assert constrained.actuator_constrained
   assert recovered.clean
   assert math.isclose(recovered.rack_acceleration_deg_s2, 100.0)
 
