@@ -113,6 +113,23 @@ _CANDIDATE_PARAMETER_KEYS = {
   "static_breakaway_torque",
   "torque_per_lateral_accel",
 }
+_SUPPORT_SUM_REL_TOL = 1e-12
+_SUPPORT_SUM_ABS_TOL = 1e-12
+
+
+def _support_populations_match(
+  clean_support_s: float,
+  base_support_s: float,
+  moving_support_s: float,
+  breakaway_support_s: float,
+) -> bool:
+  """Match the authoritative evidence validator's accumulation tolerance."""
+  return math.isclose(
+    clean_support_s,
+    base_support_s + moving_support_s + breakaway_support_s,
+    rel_tol=_SUPPORT_SUM_REL_TOL,
+    abs_tol=_SUPPORT_SUM_ABS_TOL,
+  )
 
 
 def _finite_float(value: object, name: str) -> float:
@@ -260,14 +277,11 @@ class DriveEvidenceBaseline:
         ),
       ))
       node = nodes[-1]
-      clean_parts = (
-        node.base_support_s + node.moving_support_s + node.breakaway_support_s
-      )
-      if not math.isclose(
+      if not _support_populations_match(
         node.clean_support_s,
-        clean_parts,
-        rel_tol=0.0,
-        abs_tol=1e-12,
+        node.base_support_s,
+        node.moving_support_s,
+        node.breakaway_support_s,
       ):
         raise ValueError(f"{context} clean support populations disagree")
       if node.supported_sample_count != (
@@ -724,16 +738,11 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       "applied_torque_directions",
     ):
       _nonnegative_int(node[field], f"{context}.{field}")
-    clean_parts = (
-      float(node["base_support_s"])
-      + float(node["moving_support_s"])
-      + float(node["breakaway_support_s"])
-    )
-    if not math.isclose(
+    if not _support_populations_match(
       float(node["clean_support_s"]),
-      clean_parts,
-      rel_tol=0.0,
-      abs_tol=1e-12,
+      float(node["base_support_s"]),
+      float(node["moving_support_s"]),
+      float(node["breakaway_support_s"]),
     ):
       raise ValueError(f"{context} clean support populations disagree")
     if node["supported_sample_count"] != (
