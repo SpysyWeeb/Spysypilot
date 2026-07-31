@@ -52,22 +52,38 @@ Before shadow collection:
 
 ## Shadow gate
 
-Shadow mode is structurally incapable of publishing `carControl`. It may
-observe the stock-controlled vehicle and emit modular diagnostics only.
+Shadow mode is structurally incapable of publishing `carControl`. In the
+current field graph it is an offline replay/harness surface only; manager
+does not launch `blatv2_shadowd` onroad.
 
 Device and harness recomputation must be bit-identical for deterministic
 fields. Environment measurements, such as compute time, are excluded from
 bit-exact comparison and reported separately. The device timing authority is
 the on-device measurement, not workstation replay.
 
-Shadow data may accumulate slow-learner evidence. It cannot change a live
-profile or controller selection.
+An offline shadow run may update an in-process slow-learner preview. That
+preview is non-durable and cannot change a live profile or controller
+selection. Field evidence comes only from a closed full rlog that passes the
+offroad importer below.
 
 ## Learned-profile qualification
 
-Training and artifact writes occur only offroad. Evidence is bound to the
-vehicle identity, speed-node grid, seed profile, profile schema, and learner
-schema.
+Training and artifact writes occur only offroad. `blatv2_backfilld` is the
+sole durable evidence writer. Evidence is bound to the vehicle identity,
+speed-node grid, seed profile, profile schema, and learner schema.
+
+The importer accepts only complete, closed full rlogs; qlogs are insufficient.
+It may discover routes recorded before the importer existed, but each route
+must pass exact reviewed build/schema provenance, dongle/vehicle identity,
+CarParams, controller-envelope, sensor-resolution, segment-continuity, and
+source-coverage checks. A route-local rejection cannot prevent a later valid
+route from being considered.
+
+Each eligible batch is replayed twice in fresh runtimes and both results must
+be byte-identical. An authenticated ledger binds every accepted, rejected, or
+late-skipped route to its content and disposition so a route is never counted
+twice. Publication writes a complete immutable generation before atomically
+switching its `CURRENT` pointer.
 
 Each speed node independently requires its documented clean support,
 excitation, chronological train/validation split, physically valid fit, and
@@ -76,6 +92,28 @@ Consequently, extended highway use cannot overwrite low-speed evidence.
 
 A candidate profile is emitted only when every required node qualifies.
 Partial profiles remain evidence, not control artifacts.
+
+`BLaTv2LearningOperationStatus` may expose logger finalization, historical
+scanning/replay progress, and terminal diagnostics. No managed onroad process
+publishes live collection state. It is a clear-on-manager-start display
+cache, never evidence, approval, or a controller-selection input.
+
+The field manager must contain exactly one BLaTv2 process on a real car:
+`blatv2_backfilld`, and its predicate must be offroad-only. The shadow,
+live-learner, and profile-lifecycle adapters remain unregistered offline
+tools while stock is the sole active controller. A future activation build
+must first add a reviewed offroad witness for exact provisional-profile
+exercise and feedback; it may not restore an always-on lifecycle observer by
+assumption.
+
+This isolation is a measured field-load decision. On route `d1` from combo
+build `ff842`, `blatv2_shadowd` exited with status `-6` 302 times at roughly a
+5.5-second cadence and averaged 26.18% of one CPU core; `blatv2_learnerd`
+averaged another 20.55%. Reused-`Text` Cap'n Proto arena accumulation is one
+possible explanation for the shadow failures, but it is a hypothesis rather
+than a proven cause. The acceptance invariant follows from the observed load,
+not from that hypothesis: manager launches zero BLaTv2 processes while
+started/onroad.
 
 ## Replay promotion gate
 

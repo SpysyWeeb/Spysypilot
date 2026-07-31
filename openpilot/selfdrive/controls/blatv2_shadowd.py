@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Passive modular-BLaTv2 shadow runner.
+"""Passive modular-BLaTv2 shadow runner for offline/harness validation.
 
-The process publishes telemetry only. It owns no actuator publisher and the
-one-step actuator projection is diagnostic: the projected torque is never
-fed back into :class:`ModularControllerCore`.
+The stock-only field manager does not launch this module. When invoked by
+replay or a harness, it publishes telemetry only. It owns no actuator
+publisher and the one-step actuator projection is diagnostic: the projected
+torque is never fed back into :class:`ModularControllerCore`.
 
 Model timing is consumed without controller-side reconstruction:
 

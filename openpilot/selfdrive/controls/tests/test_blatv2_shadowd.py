@@ -382,7 +382,7 @@ def test_no_actuation_structure_and_startup_assertion() -> None:
     blatv2_shadowd.BlatV2Shadow()
 
 
-def test_process_registration_is_real_car_restartable_and_toggle_free() -> None:
+def test_shadow_runner_is_not_manager_registered() -> None:
   config_path = Path(__file__).parents[3] / "system" / "manager" / "process_config.py"
   tree = ast.parse(config_path.read_text(encoding="utf-8"))
   calls = [
@@ -395,15 +395,7 @@ def test_process_registration_is_real_car_restartable_and_toggle_free() -> None:
     and isinstance(node.args[0], ast.Constant)
     and node.args[0].value == "blatv2_shadowd"
   ]
-  assert len(calls) == 1
-  call = calls[0]
-  assert isinstance(call.args[1], ast.Constant)
-  assert call.args[1].value == ("openpilot.selfdrive.controls.blatv2_shadowd")
-  assert isinstance(call.args[2], ast.Name)
-  assert call.args[2].id == "iscar"
-  keywords = {keyword.arg: keyword.value for keyword in call.keywords}
-  assert isinstance(keywords["restart_if_crash"], ast.Constant)
-  assert keywords["restart_if_crash"].value is True
+  assert calls == []
 
 
 def test_main_uses_roaming_low_priority_affinity() -> None:

@@ -290,11 +290,15 @@ class LearningCoordinator:
   def transition_onroad(self) -> None:
     if self._state is not LearningLifecycleState.OFFROAD:
       raise RuntimeError("learning coordinator is already onroad")
+    # Separate drives/routes have unrelated derivative and rack-direction
+    # histories. Cumulative support and train/validation ordinals remain.
+    self._learner.reset_route_transients()
     self._state = LearningLifecycleState.ONROAD
 
   def transition_offroad(self) -> None:
     if self._state is not LearningLifecycleState.ONROAD:
       raise RuntimeError("learning coordinator is already offroad")
+    self._learner.reset_route_transients()
     self._state = LearningLifecycleState.OFFROAD
 
   def ingest(self, sample: LearningSample) -> bool:
