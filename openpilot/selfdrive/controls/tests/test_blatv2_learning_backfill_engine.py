@@ -295,7 +295,7 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   runtime = runtime_factory()
   ledger = load_ledger(
     runtime.artifact_paths,
-    runtime_identity_sha256=runtime.runtime_bundle.identity_sha256,
+    runtime_identity_sha256=runtime.runtime_bundle.calibration_identity_sha256,
   )
   assert [entry["route_name"] for entry in ledger["entries"]] == [
     first_name,
@@ -330,7 +330,7 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   runtime = runtime_factory()
   extended = load_ledger(
     runtime.artifact_paths,
-    runtime_identity_sha256=runtime.runtime_bundle.identity_sha256,
+    runtime_identity_sha256=runtime.runtime_bundle.calibration_identity_sha256,
   )
   assert [entry["route_name"] for entry in extended["entries"]] == [
     first_name,
@@ -839,7 +839,7 @@ def test_route_local_rejection_does_not_block_later_good_route(
   assert ingested.accepted_sample_count > 0
   assert replay.finalization.evidence_sha256 != baseline
 
-  runtime_identity = runtime.runtime_bundle.identity_sha256
+  runtime_identity = runtime.runtime_bundle.calibration_identity_sha256
   ledger = extend_ledger(
     {
       "entries": [],

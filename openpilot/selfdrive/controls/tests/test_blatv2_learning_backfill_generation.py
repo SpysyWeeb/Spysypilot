@@ -24,11 +24,15 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   publish_generation,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
-  LEARNING_EVIDENCE_SCHEMA_VERSION,
   LearningResult,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CALIBRATION_EVIDENCE_SCHEMA_VERSION,
+)
+from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
+  CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
-  LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
   LearningFinalization,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
@@ -151,12 +155,12 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
   ) -> None:
     self.assertEqual(
       (
-        LEARNING_EVIDENCE_SCHEMA_VERSION,
-        LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
+        CALIBRATION_EVIDENCE_SCHEMA_VERSION,
+        CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
         CANONICAL_JOIN_SCHEMA_VERSION,
         FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
       ),
-      (4, 3, 2, "complete_full_rlog_authority_v2"),
+      (5, 4, 2, "complete_full_rlog_authority_v3"),
     )
 
   def test_inclusion_policy_namespace_ignores_legacy_runtime_root(
@@ -175,43 +179,47 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       (legacy_root / "backfill_current.json").write_bytes(legacy_pointer)
       (legacy_root / "evidence.json").write_bytes(legacy_evidence)
       (legacy_root / "manifest.json").write_bytes(legacy_manifest)
-      predecessor_namespace = (
-        legacy_root / "complete_full_rlog_authority_v1"
-      )
-      predecessor_namespace.mkdir()
-      predecessor_pointer = canonical_json_bytes({
-        "generation_sha256": hashlib.sha256(
-          b"predecessor-generation",
-        ).hexdigest(),
-        "schema_version": BACKFILL_POINTER_SCHEMA_VERSION,
-      })
-      predecessor_evidence = b'{"v1":"evidence"}'
-      predecessor_manifest = b'{"v1":"manifest"}'
-      (predecessor_namespace / "backfill_current.json").write_bytes(
-        predecessor_pointer,
-      )
-      (predecessor_namespace / "evidence.json").write_bytes(
-        predecessor_evidence,
-      )
-      (predecessor_namespace / "manifest.json").write_bytes(
-        predecessor_manifest,
-      )
-      predecessor_generation = (
-        predecessor_namespace / "generations" / "frozen-v1"
-      )
-      predecessor_generation.mkdir(parents=True)
-      (predecessor_generation / "commit.json").write_bytes(
-        b'{"v1":"commit"}',
-      )
-      predecessor_before = {
-        path.relative_to(predecessor_namespace): path.read_bytes()
-        for path in predecessor_namespace.rglob("*")
-        if path.is_file()
-      }
+      predecessor_namespaces = []
+      predecessor_before = {}
+      for version in (1, 2):
+        predecessor_namespace = (
+          legacy_root / f"complete_full_rlog_authority_v{version}"
+        )
+        predecessor_namespace.mkdir()
+        predecessor_pointer = canonical_json_bytes({
+          "generation_sha256": hashlib.sha256(
+            f"predecessor-generation-v{version}".encode(),
+          ).hexdigest(),
+          "schema_version": BACKFILL_POINTER_SCHEMA_VERSION,
+        })
+        (predecessor_namespace / "backfill_current.json").write_bytes(
+          predecessor_pointer,
+        )
+        (predecessor_namespace / "evidence.json").write_bytes(
+          f'{{"v{version}":"evidence"}}'.encode(),
+        )
+        (predecessor_namespace / "manifest.json").write_bytes(
+          f'{{"v{version}":"manifest"}}'.encode(),
+        )
+        predecessor_generation = (
+          predecessor_namespace
+          / "generations"
+          / f"frozen-v{version}"
+        )
+        predecessor_generation.mkdir(parents=True)
+        (predecessor_generation / "commit.json").write_bytes(
+          f'{{"v{version}":"commit"}}'.encode(),
+        )
+        predecessor_namespaces.append(predecessor_namespace)
+        predecessor_before[version] = {
+          path.relative_to(predecessor_namespace): path.read_bytes()
+          for path in predecessor_namespace.rglob("*")
+          if path.is_file()
+        }
 
       paths = artifact_paths_for_bundle(
         storage_root,
-        SimpleNamespace(identity_sha256=RUNTIME_IDENTITY),
+        SimpleNamespace(calibration_identity_sha256=RUNTIME_IDENTITY),
       )
 
       self.assertEqual(
@@ -239,33 +247,21 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
         (legacy_root / "manifest.json").read_bytes(),
         legacy_manifest,
       )
-      self.assertEqual(
-        (
-          predecessor_namespace / "backfill_current.json"
-        ).read_bytes(),
-        predecessor_pointer,
-      )
-      self.assertEqual(
-        (predecessor_namespace / "evidence.json").read_bytes(),
-        predecessor_evidence,
-      )
-      self.assertEqual(
-        (predecessor_namespace / "manifest.json").read_bytes(),
-        predecessor_manifest,
-      )
-
       publish(
         paths,
-        make_finalization("v2"),
+        make_finalization("v3"),
         empty_ledger(),
       )
       self.assertTrue(paths.backfill_pointer.is_file())
-      predecessor_after = {
-        path.relative_to(predecessor_namespace): path.read_bytes()
-        for path in predecessor_namespace.rglob("*")
-        if path.is_file()
-      }
-      self.assertEqual(predecessor_after, predecessor_before)
+      for version, predecessor_namespace in zip(
+        (1, 2), predecessor_namespaces, strict=True,
+      ):
+        predecessor_after = {
+          path.relative_to(predecessor_namespace): path.read_bytes()
+          for path in predecessor_namespace.rglob("*")
+          if path.is_file()
+        }
+        self.assertEqual(predecessor_after, predecessor_before[version])
 
   def test_publish_is_content_addressed_and_hash_bound(self) -> None:
     with tempfile.TemporaryDirectory() as temporary:

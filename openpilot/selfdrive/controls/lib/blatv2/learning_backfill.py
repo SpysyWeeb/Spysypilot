@@ -30,8 +30,8 @@ import time
 from typing import Any
 
 from openpilot.cereal.services import SERVICE_LIST
-from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
-  LearningFinalization,
+from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
+  CalibrationLearningFinalization,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_frame import (
   CanonicalSourceHistory,
@@ -451,7 +451,7 @@ class ReplayResult:
 
 @dataclass(frozen=True, slots=True)
 class ReplayPass:
-  finalization: LearningFinalization
+  finalization: CalibrationLearningFinalization
   results: tuple[ReplayResult, ...]
   accepted_sample_count: int
   rejected_sample_count: int
@@ -461,7 +461,7 @@ class ReplayPass:
 class BackfillPublication:
   generation_sha256: str
   ledger_sha256: str
-  finalization: LearningFinalization
+  finalization: CalibrationLearningFinalization
   accepted_sample_count: int
   rejected_sample_count: int
   diagnostic: str
@@ -867,7 +867,7 @@ def _bundle_physical_projection(
   payload = bundle.to_dict()
   rack_resolutions = {
     float(node.parameters.rack_rate_resolution_deg_s)
-    for node in bundle.seed_profile.nodes
+    for node in bundle.calibration_seed_profile.nodes
   }
   if len(rack_resolutions) != 1:
     raise ValueError("runtime seed has inconsistent rack-rate resolution")
@@ -875,7 +875,12 @@ def _bundle_physical_projection(
     "car_fingerprint": payload["car_fingerprint"],
     "nominal_rack_mapping": payload["nominal_rack_mapping"],
     "rack_rate_resolution_deg_s": rack_resolutions.pop(),
-    "seed_profile": payload["seed_profile"],
+    "calibration_seed_profile": (
+      bundle.calibration_seed_profile.to_dict()
+    ),
+    "stock_lateral_accel_offset_mps2": (
+      bundle.stock_lateral_accel_offset_mps2
+    ),
     "torque_callback_slope": payload["torque_callback_slope"],
     "torque_limits": payload["torque_limits"],
     "vehicle_identity": payload["vehicle_identity"],
@@ -1788,7 +1793,7 @@ def publish_generation(
   *,
   artifact_paths: LearningArtifactPaths,
   runtime_identity_sha256: str,
-  finalization: LearningFinalization,
+  finalization: CalibrationLearningFinalization,
   ledger: dict[str, object],
   descriptor_registry_sha256: str,
   extractor_sha256: str,
@@ -2408,7 +2413,7 @@ class HistoricalLearningBackfill:
   ) -> dict[str, object]:
     return {
       "runtime_identity_sha256": (
-        runtime.runtime_bundle.identity_sha256
+        runtime.runtime_bundle.calibration_identity_sha256
       ),
       "vehicle_identity": runtime.runtime_bundle.vehicle_identity,
     }
@@ -2516,13 +2521,17 @@ class HistoricalLearningBackfill:
       new_operation=True,
     )
     artifact_paths = initial_runtime.artifact_paths
-    runtime_identity = initial_runtime.runtime_bundle.identity_sha256
+    runtime_identity = (
+      initial_runtime.runtime_bundle.calibration_identity_sha256
+    )
     with ExclusiveBackfillWriter(artifact_paths.root):
       # Re-resolve under the writer lock in case CURRENT changed between
       # process startup and lock acquisition.
       initial_runtime = self.runtime_factory()
       artifact_paths = initial_runtime.artifact_paths
-      runtime_identity = initial_runtime.runtime_bundle.identity_sha256
+      runtime_identity = (
+        initial_runtime.runtime_bundle.calibration_identity_sha256
+      )
       ledger = load_ledger(
         artifact_paths,
         runtime_identity_sha256=runtime_identity,

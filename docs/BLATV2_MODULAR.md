@@ -123,14 +123,23 @@ data yields an explicit scalar-only reference, never a retained old plan.
 
 ### Vehicle profile
 
-The profile is a versioned snapshot of physical quantities at ordered speed
-nodes. Values interpolate continuously; extrapolation is explicit. Initially
-it may contain:
+The active learning artifact is a versioned observable calibration at ordered
+`0/5/10/15/20/30 m/s` speed nodes. Values interpolate continuously and hold
+flat beyond the end nodes. Each node contains:
 
-- steady torque per lateral acceleration;
-- rack response gain and damping;
-- transport delay;
-- tracking authority derived from physical uncertainty.
+- normalized torque per measured lateral acceleration;
+- a signed residual lateral-acceleration offset correction;
+- normalized moving-friction torque;
+- normalized static breakaway torque;
+- seed transport delay and measured rack-rate resolution as metadata; and
+- evidence, held-out error, confidence, and qualification state.
+
+Rack response gain and damping are deliberately absent. Casual road data
+proved unable to identify them independently: the retired fit pinned
+parameters at physical bounds and produced sign-invalid inverse gains. A
+provisional transient model may remain in experimental code, but it is not a
+learned fact, does not enter calibration identity, and cannot be emitted by
+the observable learner.
 
 Samples support only neighboring nodes, so driving at one speed cannot change
 distant speed behavior. The controller has no hard low/high-speed mode.
@@ -141,7 +150,7 @@ One artifact owns forward prediction and inverse torque physics. Feedforward,
 feedback prediction, feasibility, live control, and replay use the same units,
 signs, roll convention, offset-corrected rack state, and profile.
 
-The plant separates:
+Any future plant used by an actuating controller must separate:
 
 - steady road/tire load;
 - commanded rack acceleration;
@@ -150,8 +159,9 @@ The plant separates:
 - transport delay.
 
 Forward/inverse reciprocity and deterministic float64 results are contract
-tests. A physical seed may be provisional; its uncertainty must be visible
-rather than hidden by a controller patch.
+tests. A transient seed may be provisional; its uncertainty must be visible
+rather than hidden by a controller patch. This learning milestone does not
+claim casual driving has calibrated transient rack dynamics.
 
 ### Computed-torque core
 
@@ -218,10 +228,37 @@ constraint. The controller reads the estimate but cannot mutate it.
 
 No managed learner runs onroad. Durable training happens offroad when
 `blatv2_backfilld` replays complete, closed full rlogs containing clean,
-hands-off measured data. A recorded applied-torque transition on the
-vehicle-owned magnitude or slew envelope is retained as authority evidence:
-the emitted torque is known exactly and sharp-turn/breakaway response must not
-be discarded. Slew transients do not enter the instantaneous plant equality.
+hands-off measured data. At each speed node it fits the directly observable
+inverse relation:
+
+```text
+applied torque =
+    gain * (-measured lateral acceleration + offset correction)
+  + kinetic friction * moving direction
+  + static breakaway * breakaway direction
+```
+
+The learner solves this as deterministic constrained least squares with
+`gain >= 0`, `kinetic >= 0`, and
+`static = kinetic + nonnegative breakaway excess`. It enumerates and re-solves
+the finite active-set faces; it never clamps an unconstrained answer after the
+fact. `static == kinetic` therefore means the route evidence did not resolve
+additional breakaway, not that a separate value was guessed.
+
+Stationary/quantized rows set both direction terms to zero and identify the
+effective settled inverse map; they are not presented as a pure decomposition
+of every tire force. A resolved rate at or above the declared sensor quantum
+is motion. The first resolved motion after a continuous stationary dwell of
+at least the seed transport delay is breakaway; later motion is kinetic.
+Lifecycle gaps, driver override, invalid input, disengagement, and standstill
+clear dwell and direction continuity.
+
+A recorded applied-torque transition on the vehicle-owned magnitude or slew
+envelope is retained as authority evidence: the emitted torque is known
+exactly and sharp-turn response must not be discarded. Slew transients and
+stationary full-magnitude rows remain observations rather than equality-fit
+rows. Settled full-magnitude response may enter the separate authority fit
+only with resolved rack motion.
 The learner retains controls-witness, response, torque-report, and
 torque-effective clocks independently. Because `carOutput` carries the prior
 card-cycle result, its payload is effective at the preceding publication.
@@ -233,22 +270,30 @@ candidates must not regress either the ordinary or authority validation
 stratum. Until an authority stratum has at least four held-out rows, it
 remains stored but cannot alter fitted parameters.
 Driver-limited and unreachable transitions remain invalid. Each node tracks
-ordinary and authority support, excitation, validation error, uncertainty,
-and provenance. The live learner adapter is retained only for deterministic
-offline/harness work and cannot contribute field evidence.
+disjoint base, moving, breakaway, and authority support; chronological
+training/validation; excitation in both directions; validation error;
+confidence; and provenance. The live learner adapter is retained only for
+deterministic offline/harness work and cannot contribute field evidence.
 
 The learner uses one vehicle-generic signed rack coordinate. Native negative
 rate values prove a signed source. Otherwise the raw rate remains a magnitude
 and offset-corrected measured steering-angle motion establishes and
-revalidates direction without changing that magnitude. A physical reversal
-contributes speed-local direction coverage while its quantized sign-crossing
-acceleration is excluded from regression. Exact zero clears unsigned-source
-sign inference. A lifecycle break, source gap, driver override, standstill,
-fault, or failed rack mapping clears cross-frame reversal continuity.
-Evidence schema v4, coordinator artifact schema v3, canonical join schema v2,
-and inclusion namespace `complete_full_rlog_authority_v2` bind this contract.
-The authenticated v1 namespace is preserved unchanged; retained full rlogs
-are replayed into an initially empty v2 ledger.
+revalidates direction without changing that magnitude. The observable fit
+does not consume rack acceleration, so a valid physical reversal can remain a
+moving row and direction-coverage event without importing the quantized
+sign-crossing acceleration. A reversal clears prior dwell and cannot fabricate
+breakaway. Exact zero clears unsigned-source sign inference. A lifecycle
+break, source gap, driver override, standstill, fault, or failed rack mapping
+clears cross-frame continuity.
+
+Calibration profile schema v2, evidence schema v5, coordinator artifact
+schema v4, learning-status schema v2, canonical join schema v2, and inclusion
+namespace `complete_full_rlog_authority_v3` bind this contract. The retired
+v1 and v2 namespaces remain byte-untouched and are never migrated or restored
+as v3; retained compatible full rlogs are replayed into an initially empty v3
+ledger. The separate calibration runtime identity excludes provisional rack
+gain/damping but remains bound to the actual vehicle, measured mapping,
+opendbc torque calibration and limits, delay, and rack-rate resolution.
 
 Initial minimum exposure guidelines are:
 
@@ -258,8 +303,11 @@ Initial minimum exposure guidelines are:
 - highway: 5–10 minutes of actual curved or steering-active data.
 
 Elapsed time is only a floor. A node qualifies only with enough information
-and held-out validation. A profile is promoted only when all required speed
-regions qualify, never mid-drive.
+and held-out validation. The current milestone may emit an unapproved
+candidate only when all required speed regions qualify; it has no promotion
+or activation path and stock remains active. A future consumer would still be
+required to promote a separately approved profile only at an engagement
+boundary, never mid-drive.
 
 Turn-in, release, overshoot, roughness, burst, driver feedback, and event
 bookmarks supervise a proposed profile. They are not directly learned torque
@@ -282,9 +330,11 @@ The current field UI reads three rebuildable JSON caches:
   comparison, fitting, or actuation.
 - `BLaTv2LearningStatus` is projected by `blatv2_backfilld` only after the
   exact evidence, optional candidate, ledger, and manifest have persisted.
-  It reports cumulative node evidence, qualification reasons, and only the
-  four parameters the regression actually fits. Seed-carried delay, static
-  friction, and rack-rate resolution are never labeled learned.
+  Schema 2 reports cumulative and last-drive base, moving, breakaway, and
+  authority populations, qualification reasons, held-out errors, and only
+  the four parameters the observable regression fits. Seed-carried delay and
+  rack-rate resolution are never labeled learned; retired rack-gain/damping
+  fields are rejected rather than compatibility-mapped.
 
 All display keys are `CLEAR_ON_MANAGER_START` caches and are never
 persistent authorities themselves. They are published only by the offroad
@@ -301,7 +351,7 @@ active profile or infer provisional-drive feedback. Re-enabling that
 lifecycle requires a separately reviewed offroad exercise witness; the UI
 must never infer it from raw activation Params.
 
-Evidence stays cumulative against its immutable physical fit seed. A
+Evidence stays cumulative against its immutable observable calibration seed. A
 qualified candidate's revision is an opaque monotone function of persisted
 accepted evidence, so later qualified candidates advance across restarts
 without pretending the already-accumulated sufficient statistics were
@@ -330,14 +380,16 @@ evidence writer and publishes learning/operation status. Manager never starts
 tests remain offline/harness tools. Consequently, BLaTv2 contributes no
 managed process load while started/onroad.
 
-All numerical actuation remains synchronous inside controlsd so device and
-replay import the same artifact and share one control-frame clock.
+Any future modular actuation must remain synchronous inside controlsd so
+device and replay import the same artifact and share one control-frame clock.
+The current controlsd selection remains stock.
 
-## Bootstrap and rollback
+## Future bootstrap and rollback contract
 
-With no qualified profile, the exact stock torque controller actuates while
-the modular controller is evaluated offline. The first candidate is trained
-only after coverage is complete. It must pass:
+The exact stock torque controller actuates throughout this learning milestone.
+An all-node calibration is emitted only as an unapproved offline candidate.
+Before a future controller consumer could use it, the exact candidate would
+have to pass:
 
 1. deterministic unit and contract tests;
 2. device/harness A/A parity;
@@ -346,9 +398,10 @@ only after coverage is complete. It must pass:
 5. runtime actuator-limit agreement with opendbc;
 6. shadow validation on held-out data.
 
-Activation occurs only at an engagement boundary. A provisional profile is
-atomically versioned and rollback remains available. `Worse` feedback
-deactivates it at the next engagement without deleting evidence.
+Under that future contract, activation could occur only at an engagement
+boundary. A provisional profile would be atomically versioned and rollback
+would remain available. `Worse` feedback would deactivate it at the next
+engagement without deleting evidence.
 
 ## Replacement and tuning discipline
 

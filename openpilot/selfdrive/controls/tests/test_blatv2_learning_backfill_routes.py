@@ -720,6 +720,39 @@ def test_obsolete_384_envelope_is_rejected(
   assert raised.value.reason == "controller_limits_mismatch"
 
 
+def test_stock_lateral_accel_offset_is_a_route_compatibility_fact(
+  palisade_cp: car.CarParams,
+) -> None:
+  descriptor = reviewed_descriptor()
+  current_bundle, _, _ = build_detected_runtime_bundle(
+    car_params=palisade_cp,
+    provisional_rack_dynamics=rack_dynamics(),
+  )
+  route_cp = palisade_cp.copy()
+  route_cp.lateralTuning.torque.latAccelOffset = (
+    float(palisade_cp.lateralTuning.torque.latAccelOffset) + 0.125
+  )
+  route_bundle, _, _ = build_detected_runtime_bundle(
+    car_params=route_cp,
+    provisional_rack_dynamics=rack_dynamics(),
+  )
+
+  assert route_bundle.identity_sha256 == current_bundle.identity_sha256
+  assert (
+    route_bundle.calibration_identity_sha256
+    != current_bundle.calibration_identity_sha256
+  )
+  with pytest.raises(RouteRejected) as raised:
+    _validate_route_bundle(
+      route_car_params=route_cp,
+      route_bundle=route_bundle,
+      current_car_params=palisade_cp,
+      current_bundle=current_bundle,
+      descriptor=descriptor,
+    )
+  assert raised.value.reason == "physical_runtime_mismatch"
+
+
 def test_descriptor_proxy_recovers_reviewed_envelope_from_old_cp_flags(
   palisade_cp: car.CarParams,
 ) -> None:
