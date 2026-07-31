@@ -352,7 +352,7 @@ class TestLearningOperationStatusParser(unittest.TestCase):
       "backfilling": ("PROCESSING PRIOR ROUTES", "blue"),
       "idle": ("LEARNER READY", "green"),
       "drive_skipped_identity_mismatch": (
-        "DRIVE SKIPPED · NEXT DRIVE READY",
+        "DRIVE SKIPPED | NEXT DRIVE READY",
         "amber",
       ),
       "failed": ("LEARNER FAILED", "red"),
@@ -683,6 +683,26 @@ class TestLearningOperationStatusParser(unittest.TestCase):
         self.assertTrue(presentation.show_banner)
         self.assertIn("Prior snapshot shown", presentation.detail)
 
+  def test_backfill_progress_uses_display_safe_ascii_separators(self) -> None:
+    payload = operation_fixture("backfilling")
+    payload["current_route_index"] = 1
+    payload["total_route_count"] = 20
+    payload["accepted_sample_count"] = 0
+    payload["rejected_sample_count"] = 0
+    status = self.parse(payload)
+    presentation = operation_presentation(
+      status,
+      error_code=None,
+      error_message=None,
+      has_learning_snapshot=False,
+    )
+    self.assertEqual(
+      presentation.detail,
+      "Route 1/20 | 0 accepted | 0 rejected",
+    )
+    self.assertTrue(presentation.title.isascii())
+    self.assertTrue(presentation.detail.isascii())
+
   def test_skipped_and_failed_messages_have_distinct_error_tones(self) -> None:
     skipped = self.parse(
       operation_fixture("drive_skipped_identity_mismatch"),
@@ -898,7 +918,7 @@ class TestLifecycleStatusParser(unittest.TestCase):
       "staged": ("STOCK ACTIVE", "stock"),
       "provisional": ("BLATV2 PROVISIONAL", "modular"),
       "approved": ("BLATV2 APPROVED", "modular"),
-      "rollback_pending": ("ROLLBACK PENDING · STOCK ACTIVE", "stock"),
+      "rollback_pending": ("ROLLBACK PENDING | STOCK ACTIVE", "stock"),
     }
     for state, (badge, effective) in expected.items():
       with self.subTest(state=state):

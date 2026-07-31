@@ -390,7 +390,7 @@ class LifecycleStatus:
       "staged": "STOCK ACTIVE",
       "provisional": "BLATV2 PROVISIONAL",
       "approved": "BLATV2 APPROVED",
-      "rollback_pending": "ROLLBACK PENDING · STOCK ACTIVE",
+      "rollback_pending": "ROLLBACK PENDING | STOCK ACTIVE",
       "unavailable": "CONTROLLER STATUS UNAVAILABLE",
     }[self.controller_state]
 
@@ -1284,8 +1284,8 @@ def operation_presentation(
       show_banner=has_learning_snapshot,
     )
 
-  prior = "Prior snapshot shown · " if has_learning_snapshot and status.active else ""
-  counts = f"{status.accepted_sample_count:,} accepted · {status.rejected_sample_count:,} rejected"
+  prior = "Prior snapshot shown | " if has_learning_snapshot and status.active else ""
+  counts = f"{status.accepted_sample_count:,} accepted | {status.rejected_sample_count:,} rejected"
   diagnostic = _OPERATION_DIAGNOSTIC_LABELS[status.diagnostic]
 
   if status.state == "preparing":
@@ -1320,7 +1320,7 @@ def operation_presentation(
     retry = f"Retry {status.retry_count} pending"
     return OperationPresentation(
       title="SAVE RETRY PENDING",
-      detail=f"{prior}{retry} · {counts}",
+      detail=f"{prior}{retry} | {counts}",
       tone="amber",
       show_banner=has_learning_snapshot,
     )
@@ -1331,7 +1331,7 @@ def operation_presentation(
       progress = f"Route {status.current_route_index}/{status.total_route_count}"
     return OperationPresentation(
       title="PROCESSING PRIOR ROUTES",
-      detail=f"{prior}{progress} · {counts}",
+      detail=f"{prior}{progress} | {counts}",
       tone="blue",
       show_banner=has_learning_snapshot,
     )
@@ -1344,7 +1344,7 @@ def operation_presentation(
     )
   if status.state == "drive_skipped_identity_mismatch":
     return OperationPresentation(
-      title="DRIVE SKIPPED · NEXT DRIVE READY",
+      title="DRIVE SKIPPED | NEXT DRIVE READY",
       detail=diagnostic,
       tone="amber",
       show_banner=has_learning_snapshot,
