@@ -3,8 +3,9 @@ import unittest
 
 import numpy as np
 from opendbc.car.interfaces import ACCEL_MAX
-from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
+from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX
 
+from openpilot.selfdrive.controls.lib import longitudinal_planner
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   LEAD_T_IDXS_MODEL,
   T_IDXS,
@@ -97,14 +98,28 @@ class TestModelLeadTrajectory(unittest.TestCase):
 
 
 class TestStrongCruiseEnvelope(unittest.TestCase):
-  def test_low_speed_uses_but_never_exceeds_stock_platform_limit(self):
-    self.assertEqual(BLOTV2_ACCEL_MAX, min(ACCEL_MAX, 2.0))
+  def test_low_speed_requests_blotv1_authority_with_platform_clamp(self):
+    self.assertEqual(BLOTV2_ACCEL_REQUEST_MAX, 4.0)
+    self.assertEqual(BLOTV2_ACCEL_MAX, min(ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX))
     self.assertEqual(get_max_accel(0.0), BLOTV2_ACCEL_MAX)
     speeds = np.linspace(0.0, 50.0, 101)
     self.assertLessEqual(max(get_max_accel(speed) for speed in speeds), BLOTV2_ACCEL_MAX)
 
-  def test_schedule_tapers_to_stock_highway_value(self):
+  def test_launch_schedule_tapers_to_stock_highway_value(self):
+    np.testing.assert_allclose(
+      longitudinal_planner.A_CRUISE_MAX_VALS,
+      [4.0, 2.4, 1.2, 0.6],
+    )
     self.assertAlmostEqual(get_max_accel(40.0), 0.6)
+
+  def test_turn_budget_does_not_clip_straight_launch(self):
+    np.testing.assert_allclose(longitudinal_planner._A_TOTAL_MAX_V, [4.0, 4.0])
+
+  def test_existing_blotv2_jerk_tune_is_preserved(self):
+    np.testing.assert_allclose(
+      longitudinal_planner.J_CRUISE_VALS,
+      [2.0, 1.6, 1.0, 0.6],
+    )
 
 
 if __name__ == "__main__":

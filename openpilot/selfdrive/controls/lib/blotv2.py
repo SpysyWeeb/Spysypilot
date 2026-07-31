@@ -23,9 +23,11 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 D_MIN = 4.0
 MIN_GAP_BUDGET = 1.0
 
-# BLoTv2 deliberately keeps stock openpilot's longitudinal ceiling even when
-# integrated into a fork that still exposes a higher legacy BLoT limit.
-BLOTV2_ACCEL_MAX = min(ACCEL_MAX, 2.0)
+# BLoTv2 requests BLoT v1's proven launch authority, but the deployed opendbc
+# envelope remains the source of truth. This keeps the stock-based feature
+# branch at 2.0 m/s² while allowing combo's existing 4.0 m/s² safety lineage.
+BLOTV2_ACCEL_REQUEST_MAX = 4.0
+BLOTV2_ACCEL_MAX = min(ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX)
 
 # Recovery and model-forecast response.
 MIN_BOOST_BRAKE = 0.8

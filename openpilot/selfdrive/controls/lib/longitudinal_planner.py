@@ -10,6 +10,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.blotv2 import (
   BLOTV2_ACCEL_MAX,
+  BLOTV2_ACCEL_REQUEST_MAX,
   BLoTv2Supervisor,
   LeadDeparturePreRelease,
   model_predicted_acceleration,
@@ -29,8 +30,10 @@ from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
-A_CRUISE_MAX_VALS = [2.0, 1.6, 1.0, 0.6]
+A_CRUISE_MAX_VALS = [BLOTV2_ACCEL_REQUEST_MAX, 2.4, 1.2, 0.6]
 A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
+# Keep BLoTv2's existing acceleration ramp for the first 4.0 m/s² field pass.
+# Authority and jerk are deliberately separate tuning axes.
 J_CRUISE_VALS = [2.0, 1.6, 1.0, 0.6]
 A_CRUISE_MIN = -1.2
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -38,10 +41,9 @@ ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
 # Lookup table for turns
-# Use the full stock platform acceleration allowance when straight at low
-# speed. This is stronger than the stock comfort schedule, but never raises
-# opendbc or panda's existing 2.0 m/s² safety envelope.
-_A_TOTAL_MAX_V = [2.0, 3.2]
+# Do not let the turn budget clip the requested straight-line launch authority.
+# Lateral acceleration still consumes this shared budget in a turn.
+_A_TOTAL_MAX_V = [BLOTV2_ACCEL_REQUEST_MAX, BLOTV2_ACCEL_REQUEST_MAX]
 _A_TOTAL_MAX_BP = [20., 40.]
 
 LAUNCH_DISARM_SPEED = 2.0
@@ -54,7 +56,8 @@ LAUNCH_OPEN_CONFIRM = 0.7   # filtered (RC 0.3s) open level to trust -- ~0.5s of
 LAUNCH_CLOSE_LENGTH = 10.0  # m, path re-collapse below this cancels anticipation (model changed its mind)
 
 def get_max_accel(v_ego):
-  return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
+  requested_accel = float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
+  return min(requested_accel, BLOTV2_ACCEL_MAX)
 
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py

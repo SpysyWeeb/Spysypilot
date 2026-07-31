@@ -195,7 +195,8 @@ closed.
 ## Strong
 
 The stock cruise comfort schedule leaves some existing platform authority
-unused at low speed. BLoTv2 changes the schedule from:
+unused at low speed. BLoTv2 restores BLoT v1's launch-tapered request, changing
+the schedule from:
 
 ```text
 [1.6, 1.2, 0.8, 0.6] m/s²
@@ -204,19 +205,31 @@ unused at low speed. BLoTv2 changes the schedule from:
 to:
 
 ```text
-[2.0, 1.6, 1.0, 0.6] m/s²
+[4.0, 2.4, 1.2, 0.6] m/s²
 at [0, 10, 25, 40] m/s
 ```
 
-The low-speed jerk schedule follows the same taper. Straight-line total
-acceleration allows `2.0 m/s²` at low speed.
+Authority and jerk remain separate tuning axes. The existing BLoTv2 jerk
+schedule stays `[2.0, 1.6, 1.0, 0.6] m/s³`; it is not doubled with the
+acceleration request. The straight-line total-acceleration budget is
+`4.0 m/s²`, while lateral acceleration still consumes that shared budget in a
+turn.
 
-This reaches, but never exceeds, stock `ACCEL_MAX = 2.0 m/s²`. A local
-`BLOTV2_ACCEL_MAX = min(ACCEL_MAX, 2.0)` compatibility guard applies the same
-ceiling to cruise, experimental/e2e, MPC bounds, and the final longitudinal
-PID command when BLoTv2 is integrated into a fork that still exposes BLoT v1's
-raised limit. Unlike BLoT v1, BLoTv2 changes no opendbc submodule, panda
-submodule, platform safety constant, or CAN jerk limit. Strong braking remains
+`BLOTV2_ACCEL_REQUEST_MAX = 4.0 m/s²` records the requested policy.
+`BLOTV2_ACCEL_MAX = min(ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX)` applies the
+deployed platform envelope to cruise, experimental/e2e, MPC bounds, and the
+final longitudinal PID command. The stock-based feature branch therefore
+remains limited to stock authority when run with its stock opendbc pointer.
+`combo` already carries BLoT v1's opendbc and panda `4.0 m/s²` safety lineage,
+so the same code can use the full request there without changing either
+submodule in BLoTv2.
+
+The necessity supervisor and MPC costs are unchanged. Their inputs are
+relative lead physics, required deceleration, and the previous MPC solution,
+not a fixed fraction of the positive acceleration ceiling, so no speculative
+cost retune is needed merely to expose more positive authority. The resulting
+launch feel, delivered acceleration, saturation duty, and speed overshoot still
+require route review and owner field validation. Strong braking remains
 available because Smooth Stops passes stronger plan braking through.
 
 Aggressive personality retains BLoT's `1.0 s` base follow setting; standard and
@@ -244,7 +257,7 @@ Automated coverage includes:
 - true-stop handoff and hold-release debounce;
 - every supervisor trigger, hysteresis, emergency stand-down, and slew rate;
 - model lead anchoring and exact stock fallback for malformed/non-finite input;
-- cruise authority bounded by stock `ACCEL_MAX`;
+- BLoT v1 launch request and deployed-platform acceleration clamping;
 - low-speed radar track qualification;
 - the full stock longitudinal maneuver matrix in ACC and experimental modes.
 
@@ -256,4 +269,4 @@ See `BLoTv2_ACCEPTANCE.md` for remaining replay, device, and field gates.
 - overriding e2e acceleration or stop intent;
 - raising vehicle or panda safety limits;
 - changing the lateral controller;
-- merging into `combo` as part of branch construction.
+- declaring the `4.0 m/s²` tune field-proven before owner testing.
