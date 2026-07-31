@@ -341,6 +341,37 @@ class TestLearningStatusParser(unittest.TestCase):
         with self.assertRaisesRegex(LearningStatusError, message):
           parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
 
+  def test_device_accumulation_rounding_remains_displayable(self) -> None:
+    # Exact six-node support values from the first four-worker device
+    # generation. The producer's authoritative validator accepts these
+    # ordinary binary64 accumulation differences, so the UI must as well.
+    populations = (
+      ("0x1.0a44139e49b93p+8", "0x1.d3042eaf59bcfp+7", "0x1.fd8f2a8005819p+4", "0x1.d2133d3905d82p-1"),
+      ("0x1.62b638afc1237p+9", "0x1.3bfb958f8bbd7p+9", "0x1.2dba9292cfb84p+6", "0x1.0350cddb6e06dp+1"),
+      ("0x1.03a6a45be81c4p+10", "0x1.d8618befd2dcap+9", "0x1.6d15043517f6ap+6", "0x1.491c415a53a3bp+1"),
+      ("0x1.22eb64ebea10ep+10", "0x1.0e8ec3b25b6e8p+10", "0x1.3be940d524edfp+6", "0x1.3c1a5878ad3f9p+1"),
+      ("0x1.8de1131e56d21p+9", "0x1.77a8f0c2c4053p+9", "0x1.5a9fb39f2b29fp+5", "0x1.1c4e434035d3dp+0"),
+      ("0x1.21c8b4ef5f334p+8", "0x1.1730de571cafcp+8", "0x1.38815f1017158p+3", "0x1.a7973f83963a6p-1"),
+    )
+    for node_index, encoded in enumerate(populations):
+      with self.subTest(node_index=node_index):
+        payload = learning_fixture()
+        node = payload["nodes"][node_index]
+        (
+          node["clean_support_s"],
+          node["base_support_s"],
+          node["moving_support_s"],
+          node["breakaway_support_s"],
+        ) = tuple(float.fromhex(value) for value in encoded)
+        parsed = parse_learning_status(
+          payload,
+          expected_vehicle_identity=VEHICLE,
+        )
+        self.assertEqual(
+          parsed.nodes[node_index].clean_support_s,
+          float.fromhex(encoded[0]),
+        )
+
   def test_six_node_fixture_and_full_time_blocked_node(self) -> None:
     status = parse_learning_status(
       learning_fixture(),

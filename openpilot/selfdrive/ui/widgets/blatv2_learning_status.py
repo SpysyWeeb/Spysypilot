@@ -100,6 +100,8 @@ _PARAMETER_KEYS = frozenset((
   "static_breakaway_torque",
   "torque_per_lateral_accel",
 ))
+_SUPPORT_SUM_REL_TOL = 1e-12
+_SUPPORT_SUM_ABS_TOL = 1e-12
 _LIFECYCLE_KEYS = frozenset((
   "schema_version",
   "informational_only",
@@ -967,11 +969,14 @@ def _node(value: object, position: int) -> LearningNodeStatus:
       f"{field}.candidate_parameters",
     ),
   )
+  # Mirror the authoritative evidence and display-projection tolerance.
+  # Long binary64 accumulations can differ from the sum of their mutually
+  # exclusive populations by several ULPs without losing any evidence.
   if not math.isclose(
     node.clean_support_s,
     node.base_support_s + node.moving_support_s + node.breakaway_support_s,
-    rel_tol=0.0,
-    abs_tol=1e-12,
+    rel_tol=_SUPPORT_SUM_REL_TOL,
+    abs_tol=_SUPPORT_SUM_ABS_TOL,
   ):
     raise LearningStatusError(
       "malformed",
