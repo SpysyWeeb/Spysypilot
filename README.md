@@ -1,3 +1,38 @@
+# BLoTv2 — Better Longitudinal Tune v2
+
+Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot),
+created from the current untouched `stock` tip.
+
+## Status
+
+**In progress — not field validated.**
+
+BLoTv2 is a ground-up longitudinal control iteration that combines an
+improved Smooth Stops final-approach controller with an improved
+longitudinal planner/MPC policy. Its joint product target is:
+
+- **Smooth:** continuous acceleration and jerk through following, braking,
+  final approach, hold, and release.
+- **Swift:** prompt response to real lead and model intent changes, without
+  stale state or hidden delay.
+- **Strong:** proportional use of the safe acceleration envelope when the
+  situation requires it, without weakening stock emergency braking or
+  platform safety limits.
+
+Each physical decision has one owner. The planner/MPC owns trajectory
+necessity, Smooth Stops owns only the final low-speed approach and hold
+handoff, and the stock long controller and platform safety layers retain
+their existing command-envelope responsibilities.
+
+The design, exact mechanisms, known risks, and field plan are documented in
+[`docs/BLoTv2.md`](docs/BLoTv2.md). Promotion gates are tracked in
+[`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
+
+This status remains **in progress** until the owner completes a field test and
+explicitly authorizes changing it.
+
+---
+
 <div align="center" style="text-align: center;">
 
 <h1>openpilot</h1>

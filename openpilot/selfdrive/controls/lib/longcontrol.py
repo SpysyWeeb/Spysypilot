@@ -3,6 +3,8 @@ from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
+from openpilot.selfdrive.controls.lib.smooth_stops import SmoothStopController
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -43,19 +45,36 @@ class LongControl:
                              (CP.longitudinalTuning.kiBP, CP.longitudinalTuning.kiV),
                              rate=1 / DT_CTRL)
     self.last_output_accel = 0.0
+    self.smooth_stop = SmoothStopController()
 
   def reset(self):
     self.pid.reset()
 
-  def update(self, active, CS, a_target, should_stop, accel_limits):
+  def update(self, active, CS, a_target, should_stop, accel_limits, lead: LeadObservation | None = None):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
-    self.long_control_state = long_control_state_trans(active, self.long_control_state, should_stop,
+    # Smooth Stops owns only a rolling final approach. This is safe from both
+    # pid and off: current openpilot has no separate starting command that can
+    # blip on the off -> pid edge. Once truly stopped, the stock stopping clamp
+    # takes over. Hold release remains debounced against one-frame plan flicker.
+    if active and should_stop and self.long_control_state in (LongCtrlState.off, LongCtrlState.pid):
+      stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo, CS.standstill)
+    elif active and self.long_control_state == LongCtrlState.stopping:
+      stop_now = not self.smooth_stop.hold_release(should_stop)
+    else:
+      stop_now = should_stop
+
+    previous_state = self.long_control_state
+    self.long_control_state = long_control_state_trans(active, self.long_control_state, stop_now,
                                                        CS.brakePressed, CS.cruiseState.standstill)
+    if self.long_control_state == LongCtrlState.stopping and previous_state != LongCtrlState.stopping:
+      self.smooth_stop.arm_hold()
+
     if self.long_control_state == LongCtrlState.off:
       self.reset()
+      self.smooth_stop.reset()
       output_accel = 0.
 
     elif self.long_control_state == LongCtrlState.stopping:
@@ -65,11 +84,17 @@ class LongControl:
         # TODO: can we just go straight to stopAccel?
         output_accel -= 1.0 * DT_CTRL  # m/s^2/s while trying to stop
       self.reset()
+      self.smooth_stop.reset()
 
     else:  # LongCtrlState.pid
-      error = a_target - CS.aEgo
-      output_accel = self.pid.update(error, speed=CS.vEgo,
-                                     feedforward=a_target)
+      if active and should_stop:
+        output_accel = self.smooth_stop.settle(a_target, CS.vEgo, self.last_output_accel, lead)
+        self.reset()
+      else:
+        error = a_target - CS.aEgo
+        output_accel = self.pid.update(error, speed=CS.vEgo,
+                                       feedforward=a_target)
+        self.smooth_stop.reset()
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel

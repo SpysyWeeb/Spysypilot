@@ -22,6 +22,7 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 
 # stationary qualification parameters
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
+LOW_SPEED_LEAD_MIN_CNT = 20  # ~1 s at 20 Hz before an unconfirmed close radar track can override vision
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
@@ -98,7 +99,15 @@ class Track:
   def potential_low_speed_lead(self, v_ego: float):
     # stop for stuff in front of you and low speed, even without model confirmation
     # Radar points closer than 0.75, are almost always glitches on toyota radars
-    return abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (0.75 < self.dRel < 25)
+    # Vision-confirmed leads bypass this override. Require an unconfirmed track
+    # to persist before it can command a close-range stop; this rejects brief
+    # clutter/cross-traffic tracks that first appear beside a stopped vehicle.
+    return (
+      abs(self.yRel) < 1.0
+      and v_ego < V_EGO_STATIONARY
+      and 0.75 < self.dRel < 25
+      and self.cnt >= LOW_SPEED_LEAD_MIN_CNT
+    )
 
   def __str__(self):
     ret = f"x: {self.dRel:4.1f}  y: {self.yRel:4.1f}  v: {self.vRel:4.1f}  a: {self.aLeadK:4.1f}"

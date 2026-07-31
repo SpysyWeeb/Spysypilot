@@ -7,8 +7,10 @@ from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 # WARNING: imports outside of constants will not trigger a rebuild
-from openpilot.selfdrive.modeld.constants import index_function
+from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+
+LEAD_T_IDXS_MODEL = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
 
 if __name__ == '__main__':  # generating code
   from acados.acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
@@ -54,7 +56,7 @@ T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
-STOP_DISTANCE = 6.0
+STOP_DISTANCE = 7.0
 MIN_X_LEAD_FACTOR = 0.5
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
@@ -74,7 +76,7 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
   elif personality==log.LongitudinalPersonality.standard:
     return 1.45
   elif personality==log.LongitudinalPersonality.aggressive:
-    return 1.25
+    return 1.0
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
@@ -261,8 +263,13 @@ class LongitudinalMpc:
     for i in range(N):
       self.solver.cost_set(i, 'Zl', Zl)
 
-  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard):
-    jerk_factor = get_jerk_factor(personality)
+  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard,
+                  jerk_factor_scale=1.0):
+    # BLoTv2 changes the cost of changing acceleration, never acceleration
+    # constraints. Bound the runtime input so an invalid policy cannot silently
+    # remove the solver's smoothness cost or make it stiffer than stock.
+    jerk_factor_scale = float(np.clip(jerk_factor_scale, 0.3, 1.0))
+    jerk_factor = get_jerk_factor(personality) * jerk_factor_scale
     a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
     cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
     constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
@@ -307,11 +314,47 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, personality=log.LongitudinalPersonality.standard):
-    t_follow = get_T_FOLLOW(personality)
+  def process_lead_model(self, model_lead, radar_lead):
+    """Use a finite model lead trajectory anchored to radar, else exact stock fallback."""
+    trajectory_valid = False
+    if model_lead is not None and radar_lead is not None and radar_lead.present:
+      try:
+        x_model = np.asarray(model_lead.x, dtype=np.float64)
+        v_model = np.asarray(model_lead.v, dtype=np.float64)
+        trajectory_valid = (
+          float(model_lead.prob) > 0.5
+          and x_model.shape == LEAD_T_IDXS_MODEL.shape
+          and v_model.shape == LEAD_T_IDXS_MODEL.shape
+          and np.all(np.isfinite(x_model))
+          and np.all(np.isfinite(v_model))
+        )
+      except (AttributeError, TypeError, ValueError):
+        trajectory_valid = False
 
-    lead_xv_0 = self.process_lead(radarstate.leadOne)
-    lead_xv_1 = self.process_lead(radarstate.leadTwo)
+    if not trajectory_valid:
+      return self.process_lead(radar_lead)
+
+    v_ego = self.x0[1]
+    x_lead = float(radar_lead.dRel) + x_model - x_model[0]
+    v_lead = float(radar_lead.vLead) + v_model - v_model[0]
+
+    # The solver cannot converge on an immediate expected crash. Preserve the
+    # stock h=0 lift, then interpolate the authored future lead motion.
+    min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead[0]) * (v_ego - v_lead[0]) / (-ACCEL_MIN * 2)
+    x_lead[0] = max(x_lead[0], min_x_lead)
+    x_lead = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead))
+    v_lead = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, np.clip(v_lead, 0.0, 1e8))
+    return np.column_stack((x_lead, v_lead))
+
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
+             t_follow=None, model_leads=None):
+    if t_follow is None:
+      t_follow = get_T_FOLLOW(personality)
+
+    model_lead_0 = model_leads[0] if model_leads is not None and len(model_leads) > 0 else None
+    model_lead_1 = model_leads[1] if model_leads is not None and len(model_leads) > 1 else None
+    lead_xv_0 = self.process_lead_model(model_lead_0, radarstate.leadOne)
+    lead_xv_1 = self.process_lead_model(model_lead_1, radarstate.leadTwo)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
@@ -336,7 +379,7 @@ class LongitudinalMpc:
 
     self.run()
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
-            radarstate.leadOne.modelProb > 0.9):
+            radarstate.leadOne.present and radarstate.leadOne.modelProb > 0.9):
       self.crash_cnt += 1
     else:
       self.crash_cnt = 0

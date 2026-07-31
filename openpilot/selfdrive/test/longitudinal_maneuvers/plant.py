@@ -11,6 +11,14 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
+class _SubMasterShim(dict):
+  """Expose the liveness contract consumed by the production planner."""
+
+  def all_checks(self, service_list=None):
+    services = self.keys() if service_list is None else service_list
+    return all(service in self for service in services)
+
+
 class Plant:
   messaging_initialized = False
 
@@ -117,6 +125,20 @@ class Plant:
     model.modelV2.acceleration = acceleration
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
+    lead_times = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
+    if a_lead < 0.0:
+      integration_times = np.minimum(lead_times, max(-v_lead / a_lead, 0.0))
+    else:
+      integration_times = lead_times
+    lead_velocities = np.maximum(v_lead + a_lead * lead_times, 0.0)
+    lead_positions = d_rel + v_lead * integration_times + 0.5 * a_lead * np.square(integration_times)
+
+    lead_v3 = log.ModelDataV2.LeadDataV3.new_message()
+    lead_v3.prob = float(prob_lead) if self.lead_relevancy else 0.0
+    lead_v3.x = [float(x) for x in lead_positions]
+    lead_v3.v = [float(v) for v in lead_velocities]
+    model.modelV2.leadsV3 = [lead_v3, lead_v3, lead_v3]
+
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
     ss.selfdriveState.experimentalMode = self.e2e
     ss.selfdriveState.personality = self.personality
@@ -127,13 +149,15 @@ class Plant:
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = {'radarState': radar.radarState,
-          'carState': car_state.carState,
-          'carControl': car_control.carControl,
-          'controlsState': control.controlsState,
-          'selfdriveState': ss.selfdriveState,
-          'liveParameters': lp.liveParameters,
-          'modelV2': model.modelV2}
+    sm = _SubMasterShim({
+      'radarState': radar.radarState,
+      'carState': car_state.carState,
+      'carControl': car_control.carControl,
+      'controlsState': control.controlsState,
+      'selfdriveState': ss.selfdriveState,
+      'liveParameters': lp.liveParameters,
+      'modelV2': model.modelV2,
+    })
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
