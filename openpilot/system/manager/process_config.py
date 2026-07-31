@@ -52,16 +52,14 @@ def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
 
-def blatv2_learning(started: bool, params: Params, CP: car.CarParams) -> bool:
-  # The learner must observe both sides of the onroad/offroad boundary. It
-  # remains inert without real-car CarParams and never publishes actuation.
-  return not CP.notCar
-
 def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
+
+def blatv2_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return not started and not CP.notCar
 
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
@@ -102,9 +100,12 @@ procs = [
   PythonProcess("torqued", "openpilot.selfdrive.locationd.torqued", only_onroad),
   PythonProcess("controlsd", "openpilot.selfdrive.controls.controlsd", and_(not_joystick, iscar)),
   PythonProcess("driving_eventd", "openpilot.selfdrive.spysypilot.driving_eventd", iscar, restart_if_crash=True),
-  PythonProcess("blatv2_shadowd", "openpilot.selfdrive.controls.blatv2_shadowd", iscar, restart_if_crash=True),
-  PythonProcess("blatv2_learnerd", "openpilot.selfdrive.controls.blatv2_learnerd", blatv2_learning, restart_if_crash=True),
-  PythonProcess("blatv2_profiled", "openpilot.selfdrive.controls.blatv2_profiled", blatv2_learning, restart_if_crash=True),
+  # The current field graph has no managed BLaTv2 process onroad. Shadow,
+  # live-learner, and profile-lifecycle adapters remain available only to
+  # offline replay/harness tests while stock is the sole active controller.
+  # One offroad scan cycle replays complete closed full rlogs, then idles
+  # without repeatedly rescanning until the next road-state transition.
+  PythonProcess("blatv2_backfilld", "openpilot.selfdrive.controls.blatv2_backfilld", blatv2_offroad),
   PythonProcess("joystickd", "openpilot.tools.joystick.joystickd", or_(joystick, notcar)),
   PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
