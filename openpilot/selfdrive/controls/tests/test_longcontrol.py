@@ -67,7 +67,7 @@ def car_state(v_ego, standstill=False):
 
 
 class TestSmoothStopLongControlIntegration(OpenpilotTestCase):
-  def test_raised_legacy_limit_cannot_escape_blotv2_ceiling(self):
+  def test_final_command_honors_blotv2_platform_ceiling(self):
     control = long_control()
     CS = car_state(5.0)
     CS.aEgo = -2.0
@@ -76,7 +76,7 @@ class TestSmoothStopLongControlIntegration(OpenpilotTestCase):
       CS,
       BLOTV2_ACCEL_MAX,
       False,
-      (-3.5, 4.0),
+      (-3.5, 10.0),
       LeadObservation(),
     )
     assert control.pid.pos_limit == BLOTV2_ACCEL_MAX

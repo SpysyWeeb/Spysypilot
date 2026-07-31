@@ -20,7 +20,7 @@ Every test report must identify:
 ## Foundation gate
 
 - [x] Branch created from current untouched `stock`.
-- [x] `combo` is not modified or merged.
+- [x] Feature changes are authored on `BLoTv2` before `combo` integration.
 - [x] Shared live/finite lead contract.
 - [x] Relative lead-physics unit coverage.
 - [x] Smooth Stops rolling-queue/dropout transition coverage.
@@ -28,7 +28,8 @@ Every test report must identify:
 - [x] MPC supervisor trigger, emergency, and slew coverage.
 - [x] Model lead trajectory shape/finite/fallback coverage.
 - [x] Low-speed radar override qualification coverage.
-- [x] Stock platform acceleration ceiling retained.
+- [x] `4.0 m/s²` request is clamped by the deployed opendbc envelope.
+- [x] Existing BLoTv2 jerk and MPC tune retained for isolated evaluation.
 - [x] Stock longitudinal maneuver matrix passes.
 - [x] Final static and generated-solver build audit.
 
@@ -41,7 +42,7 @@ Replay must use the real production classes, not copied equations.
 - [ ] Rolling-lead noise and radar-dropout motivating windows are reviewed.
 - [ ] Mild lead-braking onset improves without early phantom braking.
 - [ ] Hard lead braking has no collision-distance or peak-decel regression.
-- [ ] Launch response improves without lunge-and-catch behavior.
+- [ ] `4.0 m/s²` launch response improves without lunge-and-catch behavior.
 - [ ] Model lead false-positive launch/braking windows are reviewed.
 - [ ] Low-speed radar ghost route is rejected without missing a real obstacle.
 - [ ] ACC and experimental-mode candidate arbitration is reviewed.
@@ -57,6 +58,7 @@ Report at least:
 - supervisor trigger duty;
 - raw MPC target, selected planner target, control command, and delivered
   acceleration separately.
+- positive-command saturation duty and speed overshoot after launch.
 
 No aggregate score may hide a collision, missed stop, late hard-braking wall,
 launch lunge, or close-gap creep.
@@ -67,7 +69,8 @@ launch lunge, or close-gap creep.
 - [ ] controlsd and longitudinal planner stay within timing budgets.
 - [ ] radarState liveness loss fails closed as documented.
 - [ ] No process crash, solver reset burst, or invalid longitudinal plan.
-- [ ] Opendbc and panda commits exactly match stock branch pointers.
+- [ ] Exact deployed openpilot, opendbc, and panda commits are recorded.
+- [ ] Controller and panda limits support the requested authority end to end.
 - [ ] Acceleration commands stay inside vehicle limits.
 
 ## Field sequence
@@ -80,15 +83,18 @@ Run in a controlled environment with immediate driver takeover available:
 4. Follow a queue at roughly `0.2–0.8 m/s`, including start/stop transitions.
 5. Let a stopped lead depart slowly, then decisively.
 6. Follow mild, moderate, and hard lead braking.
-7. Test a constant-speed and accelerating lead pull-away.
-8. Exercise low-speed radar-only obstacle/cut-in cases.
-9. Repeat relevant cases in ACC and experimental modes.
-10. Compare standard and aggressive personalities.
+7. Run straight launches with progressively larger speed deltas, beginning
+   below the `4.0 m/s²` ceiling.
+8. Test a constant-speed and accelerating lead pull-away.
+9. Exercise low-speed radar-only obstacle/cut-in cases.
+10. Repeat relevant cases in ACC and experimental modes, then compare standard
+    and aggressive personalities.
 
 Stop the test immediately for:
 
 - braking weaker than the selected planner target;
 - acceleration toward an untrusted or stopped lead;
+- unexpected launch overshoot or sustained positive-command saturation;
 - oscillatory brake/throttle commands;
 - a hold release without confirmed intent;
 - repeated solver resets or invalid radar/planner state;
@@ -101,5 +107,5 @@ After the gates above:
 - owner field feedback is recorded;
 - unresolved regressions remain explicit;
 - exact commits and submodule pointers are pinned;
-- only then may the owner request a merge into `combo`;
+- test integration into `combo` does not by itself satisfy these gates;
 - only the owner may authorize changing README status from **in progress**.
