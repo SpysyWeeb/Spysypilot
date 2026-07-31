@@ -26,6 +26,10 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
   LearningOperationStatusPublisher,
   route_identity_sha256,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
+  BACKFILL_PROGRESS_PARAM,
+  BackfillProgressPublisher,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   MeasuredLearningFrame,
   build_persistent_learning_runtime,
@@ -49,6 +53,9 @@ class FakeParams:
   ) -> None:
     self.values[key] = dict(value)
     self.puts.append((key, dict(value), block))
+
+  def remove(self, key: str) -> None:
+    self.values.pop(key, None)
 
 
 def descriptor() -> BuildDescriptor:
@@ -111,15 +118,23 @@ def add_route(
   counter: int,
   *,
   locked: bool = False,
+  segment_count: int = 1,
 ) -> tuple[str, Path]:
   route_name = f"{counter:08x}--{counter:010x}"
-  directory = log_root / f"{route_name}--0"
-  directory.mkdir(parents=True)
-  rlog = directory / "rlog"
-  rlog.write_bytes(f"route-{counter}".encode("ascii"))
-  if locked:
-    (directory / "rlog.lock").touch()
-  return route_name, rlog
+  first_rlog: Path | None = None
+  for segment_index in range(segment_count):
+    directory = log_root / f"{route_name}--{segment_index}"
+    directory.mkdir(parents=True)
+    rlog = directory / "rlog"
+    rlog.write_bytes(
+      f"route-{counter}-segment-{segment_index}".encode("ascii"),
+    )
+    if segment_index == 0:
+      first_rlog = rlog
+    if locked:
+      (directory / "rlog.lock").touch()
+  assert first_rlog is not None
+  return route_name, first_rlog
 
 
 def make_engine(
@@ -127,6 +142,7 @@ def make_engine(
   monkeypatch: pytest.MonkeyPatch,
   *,
   pending_route_identity: str | None = None,
+  with_progress: bool = False,
 ) -> tuple[
   HistoricalLearningBackfill,
   FakeParams,
@@ -146,8 +162,21 @@ def make_engine(
 
   prepare_calls: Counter[str] = Counter()
 
-  def fake_prepare(route, **_kwargs):
+  def fake_prepare(route, **kwargs):
     prepare_calls[route.route_name] += 1
+    for position, segment in enumerate(route.segments, start=1):
+      if kwargs.get("segment_started") is not None:
+        kwargs["segment_started"](
+          segment,
+          position,
+          len(route.segments),
+        )
+      if kwargs.get("segment_completed") is not None:
+        kwargs["segment_completed"](
+          segment,
+          position,
+          len(route.segments),
+        )
     base = (route.route_counter + 1) * 1_000_000_000
     return PreparedRoute(
       frames=tuple(
@@ -181,6 +210,7 @@ def make_engine(
   extractor.write_bytes(b"reviewed native extractor")
   extractor.chmod(0o755)
   params = FakeParams()
+  progress_clock = iter(range(1_000_000_000, 10_000_000_000, 100_000_000))
   engine = HistoricalLearningBackfill(
     log_root=tmp_path / "logs",
     extractor_path=extractor,
@@ -193,6 +223,10 @@ def make_engine(
     descriptor_registry=BuildDescriptorRegistry((descriptor(),)),
     expected_dongle_id="dongle",
     operation_status=LearningOperationStatusPublisher(params),
+    backfill_progress=(
+      BackfillProgressPublisher(params) if with_progress else None
+    ),
+    progress_monotonic_ns=lambda: next(progress_clock),
     abort_requested=lambda: False,
     pending_route_identity=pending_route_identity,
   )
@@ -283,6 +317,122 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   with pytest.raises(BackfillError) as changed:
     engine.run_once()
   assert changed.value.diagnostic == "backfill_untracked_evidence"
+
+
+def test_progress_reports_both_passes_without_double_counting(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  log_root = tmp_path / "logs"
+  add_route(log_root, 0x10, segment_count=2)
+  add_route(log_root, 0x20)
+  engine, params, prepare_calls, _ = make_engine(
+    tmp_path,
+    monkeypatch,
+    with_progress=True,
+  )
+
+  result = engine.run_once()
+
+  assert result.publication is not None
+  assert result.publication.accepted_sample_count == 2
+  assert prepare_calls == Counter({
+    "00000010--0000000010": 2,
+    "00000020--0000000020": 2,
+  })
+  updates = [
+    value
+    for key, value, _ in params.puts
+    if key == BACKFILL_PROGRESS_PARAM
+  ]
+  assert [
+    (
+      value["pass_index"],
+      value["current_route_index"],
+      value["current_segment_index"],
+      value["current_route_segment_count"],
+    )
+    for value in updates
+    if value["phase"] in {"reading_segment", "applying_route"}
+  ] == [
+    (1, 1, 1, 2),
+    (1, 1, 2, 2),
+    (1, 1, 2, 2),
+    (1, 2, 1, 1),
+    (1, 2, 1, 1),
+    (2, 1, 1, 2),
+    (2, 1, 2, 2),
+    (2, 1, 2, 2),
+    (2, 2, 1, 1),
+    (2, 2, 1, 1),
+  ]
+  assert [value["phase"] for value in updates[-2:]] == [
+    "comparing",
+    "publishing",
+  ]
+  assert updates[-1]["completed_replay_segment_count"] == 6
+  assert updates[-1]["completed_work_units"] == updates[-1][
+    "total_work_units"
+  ]
+  replay_updates = [
+    value
+    for value in updates
+    if value["phase"] in {"reading_segment", "applying_route"}
+  ]
+  assert any(
+    value["approximate_remaining_seconds"] is not None
+    for value in replay_updates
+  )
+  assert all(
+    left["completed_work_units"] <= right["completed_work_units"]
+    for left, right in zip(updates, updates[1:], strict=False)
+  )
+  assert BACKFILL_PROGRESS_PARAM not in params.values
+  operation_updates = [
+    value
+    for key, value, _ in params.puts
+    if key == LEARNING_OPERATION_STATUS_PARAM
+  ]
+  assert operation_updates[-1]["accepted_sample_count"] == 2
+
+
+def test_progress_projection_does_not_change_replay_artifacts(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  baseline_root = tmp_path / "baseline"
+  add_route(baseline_root / "logs", 0x10, segment_count=2)
+  baseline_engine, _, _, baseline_runtime_factory = make_engine(
+    baseline_root,
+    monkeypatch,
+  )
+  baseline = baseline_engine.run_once()
+  assert baseline.publication is not None
+  baseline_runtime = baseline_runtime_factory()
+  baseline_ledger = baseline_runtime.artifact_paths.backfill_ledger.read_bytes()
+
+  observed_root = tmp_path / "observed"
+  add_route(observed_root / "logs", 0x10, segment_count=2)
+  observed_engine, _, _, observed_runtime_factory = make_engine(
+    observed_root,
+    monkeypatch,
+    with_progress=True,
+  )
+  observed = observed_engine.run_once()
+  assert observed.publication is not None
+  observed_runtime = observed_runtime_factory()
+  observed_ledger = observed_runtime.artifact_paths.backfill_ledger.read_bytes()
+
+  assert observed.publication.finalization == (
+    baseline.publication.finalization
+  )
+  assert observed_ledger == baseline_ledger
+  assert observed.publication.generation_sha256 == (
+    baseline.publication.generation_sha256
+  )
+  assert observed.publication.ledger_sha256 == (
+    baseline.publication.ledger_sha256
+  )
 
 
 def test_publication_plus_locked_route_leaves_truthful_finalizing_status(

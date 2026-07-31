@@ -6,10 +6,14 @@ drive, the offroad-only `blatv2_backfilld` waits for loggerd to close the
 route, reads the complete local full rlog, independently replays it twice,
 and atomically publishes one authenticated evidence generation.
 
-This means the UI can report `finalizing`, `backfilling`, and route-by-route
-replay progress instead of continuing to say that a first drive is required
-while work is in progress. The operation status is informational only. It is
-never an approval, evidence, or controller-selection input.
+This means the UI can report `finalizing`, `backfilling`, and exact pass,
+route, and segment progress instead of continuing to say that a first drive
+is required while work is in progress. `BLaTv2BackfillProgress` is a separate
+display-only projection bound to the current operation identity. Its work bar
+includes both compressed-segment reading and prepared-route application for
+both passes. Its approximate remaining time stays unavailable until each kind
+of work has independent timing support. Operation and progress status are
+never approval, evidence, or controller-selection inputs.
 
 ## Can previous routes be used?
 
@@ -56,8 +60,8 @@ unreviewed.
 | --- | --- |
 | `preparing` | Waiting for exact CarParams or restoring the runtime. |
 | `ready_no_evidence` | No eligible committed route exists yet. |
-| `finalizing` | Waiting for logger closure, verifying the second replay, or publishing. |
-| `backfilling` | Scanning complete routes or replaying a displayed route index/count. |
+| `finalizing` | Waiting for logger closure, verifying pass 2/2 with route/segment progress, comparing, or publishing. |
+| `backfilling` | Scanning complete routes or replaying pass 1/2 with route/segment progress. |
 | `idle` | Authenticated evidence and its route ledger are committed. |
 | `failed` | The stable diagnostic explains the fail-closed operation error. |
 
@@ -65,6 +69,9 @@ The historical process owns status only while manager Params says offroad and
 checks that ownership again at each write boundary. `collecting` and
 `drive_skipped_identity_mismatch` remain schema values for offline adapter
 tests, but the current manager graph never launches their onroad publisher.
+The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
+operation id and sequence to reject torn reads, and is removed at terminal
+idle/failure. Older UI code continues to use the coarse operation status.
 
 ## Determinism and storage
 

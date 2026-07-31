@@ -76,6 +76,12 @@ learning process runs during the drive. After the route is closed,
 `blatv2_backfilld` replays its complete full rlog twice and atomically commits
 evidence only if both replays and all compatibility checks agree. It is the
 sole managed BLaTv2 process and the sole durable learning writer.
+Its separate display-only progress projection reports the current pass,
+route, segment, and whether the route is being read or applied. A cumulative
+bar spans both passes without reaching a pass boundary before the prepared
+route has actually been ingested. An approximate remaining time appears only
+after independent reading and application rates have enough observations;
+none of these timing fields enter evidence or determinism comparisons.
 
 The importer can also use older local routes, including routes recorded before
 this importer existed, when their complete full rlogs remain on the device and
