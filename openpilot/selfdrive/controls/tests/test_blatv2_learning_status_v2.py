@@ -29,6 +29,25 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
 )
 
 
+# Exact support populations from the first four-worker device generation.
+# Repeated binary64 accumulation puts the independently tracked clean total a
+# few ULPs away from the sum of its mutually exclusive populations. The
+# authoritative evidence validator accepts this ordinary rounding pattern,
+# so the display-only projection must accept the same bytes.
+_DEVICE_SUPPORT_POPULATIONS_HEX = (
+  ("0x1.0a44139e49b93p+8", "0x1.d3042eaf59bcfp+7", "0x1.fd8f2a8005819p+4", "0x1.d2133d3905d82p-1"),
+  ("0x1.62b638afc1237p+9", "0x1.3bfb958f8bbd7p+9", "0x1.2dba9292cfb84p+6", "0x1.0350cddb6e06dp+1"),
+  ("0x1.03a6a45be81c4p+10", "0x1.d8618befd2dcap+9", "0x1.6d15043517f6ap+6", "0x1.491c415a53a3bp+1"),
+  ("0x1.22eb64ebea10ep+10", "0x1.0e8ec3b25b6e8p+10", "0x1.3be940d524edfp+6", "0x1.3c1a5878ad3f9p+1"),
+  ("0x1.8de1131e56d21p+9", "0x1.77a8f0c2c4053p+9", "0x1.5a9fb39f2b29fp+5", "0x1.1c4e434035d3dp+0"),
+  ("0x1.21c8b4ef5f334p+8", "0x1.1730de571cafcp+8", "0x1.38815f1017158p+3", "0x1.a7973f83963a6p-1"),
+)
+_DEVICE_SUPPORT_POPULATIONS = tuple(
+  tuple(float.fromhex(value) for value in population)
+  for population in _DEVICE_SUPPORT_POPULATIONS_HEX
+)
+
+
 @dataclass(frozen=True)
 class _RuntimeBundle:
   vehicle_identity: str
@@ -244,6 +263,71 @@ def test_schema_v2_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert node["last_drive_authority_sample_count"] == 10
   assert node["last_drive_authority_fit_support_s"] == 1.0
   assert node["last_drive_authority_fit_sample_count"] == 10
+
+
+def test_device_accumulation_rounding_projects_without_hiding_snapshot() -> None:
+  diagnostics = tuple(
+    SimpleNamespace(
+      node_index=index,
+      speed_mps=speed,
+      clean_support_s=population[0],
+      supported_sample_count=3,
+      base_support_s=population[1],
+      base_sample_count=1,
+      moving_support_s=population[2],
+      moving_sample_count=1,
+      breakaway_support_s=population[3],
+      breakaway_sample_count=1,
+      authority_support_s=1.0,
+      authority_sample_count=1,
+      authority_fit_support_s=0.5,
+      authority_fit_sample_count=1,
+    )
+    for index, (speed, population) in enumerate(zip(
+      (0.0, 5.0, 10.0, 15.0, 20.0, 30.0),
+      _DEVICE_SUPPORT_POPULATIONS,
+      strict=True,
+    ))
+  )
+  baseline = DriveEvidenceBaseline.from_support_diagnostics(diagnostics)
+  assert tuple(node.clean_support_s for node in baseline.nodes) == tuple(
+    population[0] for population in _DEVICE_SUPPORT_POPULATIONS
+  )
+
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  node = payload["nodes"][0]
+  for clean, base, moving, breakaway in _DEVICE_SUPPORT_POPULATIONS:
+    node["clean_support_s"] = clean
+    node["base_support_s"] = base
+    node["moving_support_s"] = moving
+    node["breakaway_support_s"] = breakaway
+    validate_learning_status_payload(payload)
+
+
+def test_display_rejects_material_support_population_disagreement() -> None:
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  node = payload["nodes"][0]
+  node["clean_support_s"] = (
+    node["base_support_s"]
+    + node["moving_support_s"]
+    + node["breakaway_support_s"]
+    + 1e-6
+  )
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "clean support populations disagree",
+  ):
+    validate_learning_status_payload(payload)
 
 
 def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None:
