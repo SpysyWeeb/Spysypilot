@@ -621,6 +621,11 @@ class ProfileLearner:
   def evidence_for_node(self, node_index: int) -> NodeEvidenceSnapshot:
     return self._nodes[node_index].snapshot()
 
+  def reset_route_transients(self) -> None:
+    """Break reversal continuity without changing cumulative evidence."""
+    for node in self._nodes:
+      node.last_rack_direction = 0
+
   def export_evidence(self) -> bytes:
     """Export exact fitting evidence as a canonical, self-verifying artifact."""
     seed_profile_json = self.seed_profile.to_json()

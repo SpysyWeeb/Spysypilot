@@ -942,7 +942,7 @@ def test_unresolved_runtime_identity_never_stages_or_writes():
   assert ACTIVATION_STATE_PARAM not in params.values
 
 
-def test_process_is_passive_portable_and_registered_across_road_state():
+def test_process_is_passive_portable_and_not_manager_registered():
   assert_passive_process_contract()
   assert PUBLISHED_SERVICES == ()
   assert SUBSCRIBED_SERVICES == (
@@ -962,15 +962,7 @@ def test_process_is_passive_portable_and_registered_across_road_state():
     / "manager"
     / "process_config.py"
   ).read_text()
-  assert "def blatv2_learning(started: bool, params: Params, CP: car.CarParams)" in process_config
-  assert "return not CP.notCar" in process_config
-  assert (
-    "".join((
-      'PythonProcess("blatv2_profiled", ',
-      '"openpilot.selfdrive.controls.blatv2_profiled", ',
-      "blatv2_learning, restart_if_crash=True)",
-    ))
-  ) in process_config
+  assert 'PythonProcess("blatv2_profiled",' not in process_config
 
 
 def test_activation_state_writes_are_offroad_and_atomic_json():

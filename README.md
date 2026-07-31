@@ -12,7 +12,8 @@ and useful test infrastructure remain available for audit, but no previous
 BLaTv2 controller mechanism is part of the new active design by default.
 Until the complete modular candidate passes replay, safety, timing, and
 portability gates, the stock openpilot torque controller remains the only
-active controller. The candidate may run in shadow, but it cannot actuate.
+active controller. The candidate is evaluated in offline replay and harness
+tests; the field manager does not launch a BLaTv2 shadow process onroad.
 
 The product target is **Smooth. Swift. Strong.**
 
@@ -45,7 +46,8 @@ The replacement is split into independently testable owners:
 - one measured rack mapping and forward/inverse physical plant;
 - one computed-torque core;
 - one exact opendbc command envelope and invalid-output guard;
-- a measured-response shadow and a speed-local slow learner;
+- an offline measured-response shadow and an offroad full-rlog importer for
+  durable speed-local learning;
 - an offroad-only artifact, feedback, promotion, and rollback lifecycle.
 
 The previous **LQI** controller—“Linear Quadratic Integral,” a state-feedback
@@ -56,9 +58,12 @@ physical profile, so a tuning module does not have to correct another tuning
 module.
 
 The first combo build contains no approved modular profile. It therefore
-drives with the exact current stock torque-controller algorithm while the
-shadow and learner collect measured response. On opendbc's validated
-Palisade/Telluride platform, that stock request passes through the
+drives with the exact current stock torque-controller algorithm and launches
+no dedicated BLaTv2 process onroad. Normal loggerd full rlogs retain the
+measured services needed for later learning. After logger closure, the
+offroad importer independently replays the complete full rlog before any
+evidence can become durable. On opendbc's validated Palisade/Telluride
+platform, that stock request passes through the
 platform-selected **409/4/7** opendbc/panda envelope. Other cars keep their
 own stock limits and remain stock-controlled unless their opendbc port
 explicitly validates the complete modular command-envelope and rack-sensor
@@ -66,10 +71,22 @@ contract.
 
 ## Activation and learning
 
-The first drive on a vehicle is stock-controlled. The modular candidate
-collects clean, speed-local physical response data in shadow. A candidate
-profile is trained offroad and becomes eligible only when every required speed
-region has enough excitation, independent validation, and bounded uncertainty.
+The first drive on a vehicle is stock-controlled. No BLaTv2 collection or
+learning process runs during the drive. After the route is closed,
+`blatv2_backfilld` replays its complete full rlog twice and atomically commits
+evidence only if both replays and all compatibility checks agree. It is the
+sole managed BLaTv2 process and the sole durable learning writer.
+
+The importer can also use older local routes, including routes recorded before
+this importer existed, when their complete full rlogs remain on the device and
+their exact build/schema, dongle, vehicle, CarParams, controller-envelope,
+sensor-resolution, and source-coverage checks pass. Qlogs, incomplete or
+open routes, unreviewed builds, incompatible routes, and late-discovered older
+routes are not imported. A rejected route does not block a later compatible
+one.
+
+A candidate profile becomes eligible only when every required speed region
+has enough excitation, independent validation, and bounded uncertainty.
 Highway mileage cannot overwrite low-speed knowledge because samples update
 only their neighboring speed nodes.
 
@@ -92,11 +109,19 @@ rebasing accumulated physical statistics or letting highway data overwrite
 low-speed nodes.
 
 The home-screen learning display reads rebuildable
-`BLaTv2LearningStatus` and `BLaTv2LifecycleStatus` caches. They are cleared
-at manager start and republished offroad only after the learner and activation
-owners validate the current vehicle/build state. They are informational only:
-neither key is an approval, profile, controller-selection, or safety input,
-and editing or deleting either one cannot change steering.
+`BLaTv2LearningOperationStatus` and `BLaTv2LearningStatus` caches. The
+offroad importer owns both. Operation status distinguishes logger
+finalization, historical route scanning/replay progress, idle evidence, an
+eligible empty state, and fail-closed diagnostics.
+
+Both caches are cleared at manager start and published only after the offroad
+owner validates its phase and current vehicle/build authority. They are
+informational only: neither is evidence, approval, a profile,
+controller-selection, or a safety input, and editing or deleting either one
+cannot change steering. The `BLaTv2LifecycleStatus` schema and
+`blatv2_profiled` implementation remain available for offline lifecycle
+testing, but the stock-only field manager does not launch that process or
+publish that cache.
 
 ---
 

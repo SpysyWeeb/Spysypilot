@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Passive offroad lifecycle owner for approved modular BLaTv2 profiles.
+"""Profile lifecycle adapter retained for offline/harness validation.
 
-This process publishes nothing and polls ``deviceState`` while passively
-observing ``selfdriveState.enabled`` plus the exact modular-selection witness
-in ``controlsState``. It stays alive across the onroad/offroad boundary so
-every blocking Params mutation is performed offroad:
+The current stock-only field manager does not launch this module. Its
+finite-poll implementation remains available to test the intended lifecycle,
+including passive observation of ``selfdriveState.enabled`` plus the exact
+modular-selection witness in ``controlsState``. Every blocking Params
+mutation is constrained to offroad:
 
 * validate and stage an externally-approved exact artifact;
 * atomically prepare promotion or exact rollback;
@@ -12,9 +13,9 @@ every blocking Params mutation is performed offroad:
 * consume only a matching explicit response.
 
 It never constructs an approval, marks a gate passed, consumes learner
-candidates, infers feedback from interventions, or publishes actuation.
-Onroad work is limited to read-only runtime restoration and an in-memory
-record of the already-prepared provisional profile.
+candidates, infers feedback from interventions, or publishes actuation. A
+future field activation needs a separately reviewed offroad witness for exact
+provisional-profile exercise before this lifecycle may be manager-registered.
 """
 
 from __future__ import annotations

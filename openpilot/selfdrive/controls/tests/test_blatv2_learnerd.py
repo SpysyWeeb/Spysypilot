@@ -36,6 +36,10 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   build_detected_runtime_bundle,
   build_persistent_learning_runtime,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
+  LEARNING_OPERATION_STATUS_PARAM,
+  LearningOperationState,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   LEARNING_STATUS_PARAM,
   DriveEvidenceBaseline,
@@ -413,6 +417,7 @@ class FakeParams:
     # is manager-cleared and cannot be the learner's sole restore source.
     self.values: dict[str, object] = {
       "CarParamsPersistent": car_params_bytes,
+      "IsOffroad": False,
     }
     self.puts: list[tuple[str, object, bool]] = []
     self.removes: list[str] = []
@@ -423,6 +428,10 @@ class FakeParams:
     return str(self.root / "params" / "d")
 
   def get(self, key: str, block: bool = False):
+    assert block is False
+    return self.values.get(key)
+
+  def get_bool(self, key: str, block: bool = False):
     assert block is False
     return self.values.get(key)
 
@@ -530,7 +539,8 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
   params = FakeParams(tmp_path)
   assert "CarParams" not in params.values
   assert params.values["CarParamsPersistent"] == b"car-params"
-  params.values["CarParams"] = b"manager-scoped-must-not-win"
+  params.values["CarParamsPersistent"] = b"stale-persistent-car-params"
+  params.values["CarParams"] = b"current-route-car-params"
   logger = FakeLogger()
   created: list[PersistentLearningRuntime] = []
   decoded_values: list[bytes] = []
@@ -554,6 +564,7 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
     ),
     runtime_factory=runtime_factory,
     logger=logger,
+    route_owned_persistence=False,
   )
   assert default_learning_storage_root(params) == (
     tmp_path / "params" / "blatv2-learning"
@@ -567,11 +578,11 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
   })
   daemon.step()
   assert len(created) == 1
-  assert decoded_values == [b"car-params"]
+  assert decoded_values == [b"current-route-car-params"]
   assert created[0].coordinator.state is LearningLifecycleState.OFFROAD
   assert not (tmp_path / "learning").exists()
 
-  params.values["CarParams"] = b"car-params"
+  params.values["CarParams"] = b"current-route-car-params"
   start_messages = fake_messages(cp, started=True)
   sm.publish({
     "deviceState": (start_messages["deviceState"], 900_000_000),
@@ -592,6 +603,8 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
   assert not (tmp_path / "learning").exists()
 
   def assert_artifacts_precede_status(key, _value):
+    if key == LEARNING_OPERATION_STATUS_PARAM:
+      return
     assert key == LEARNING_STATUS_PARAM
     assert created[0].artifact_paths.evidence.is_file()
     assert created[0].artifact_paths.manifest.is_file()
@@ -613,7 +626,10 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
     and node["last_drive_accepted_sample_count"] is not None
     for node in status["nodes"]
   )
-  assert params.puts[-1][0] == LEARNING_STATUS_PARAM
+  assert params.puts[-1][0] == LEARNING_OPERATION_STATUS_PARAM
+  assert params.puts[-1][1]["state"] == "idle"
+  assert params.puts[-1][1]["diagnostic"] == "evidence_ready"
+  assert any(key == LEARNING_STATUS_PARAM for key, _, _ in params.puts)
   assert params.puts[-1][2] is True
   assert all(timeout == 100 for timeout in sm.timeouts)
   assert logger.exceptions == []
@@ -635,6 +651,7 @@ def _test_daemon_observes_offroad_without_onroad_poll_and_restores(
     car_params_decoder=lambda _encoded: cp,
     runtime_factory=runtime_factory,
     logger=FakeLogger(),
+    route_owned_persistence=False,
   )
   restart_sm.publish({
     "deviceState": (offroad_messages["deviceState"], 3_000_000_000),
@@ -675,6 +692,7 @@ def _test_mid_drive_start_skips_collection_until_offroad_preparation(
     car_params_decoder=lambda _encoded: cp,
     runtime_factory=runtime_factory,
     logger=logger,
+    route_owned_persistence=False,
   )
   started = fake_messages(cp, started=True)
   sm.publish({"deviceState": (started["deviceState"], 1_000_000_000)})
@@ -721,6 +739,7 @@ def _test_car_params_precedence_fallback_and_transient_absence(
       AssertionError("runtime factory needs a concrete CarParams"),
     ),
     logger=FakeLogger(),
+    route_owned_persistence=False,
   )
   stopped = fake_messages(cp, started=False)
   missing_sm.publish({
@@ -753,6 +772,7 @@ def _test_car_params_precedence_fallback_and_transient_absence(
     car_params_decoder=lambda _encoded: cp,
     runtime_factory=runtime_factory,
     logger=FakeLogger(),
+    route_owned_persistence=False,
   )
   fallback_sm.publish({
     "deviceState": (stopped["deviceState"], 2_000_000_000),
@@ -804,7 +824,6 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
     tmp_path / "mismatch",
     car_params_bytes=b"vehicle-a",
   )
-  mismatch_params.values["CarParams"] = b"vehicle-b"
   mismatch_sm = FakeSubMaster()
   mismatch = BlatV2LearnerDaemon(
     sm=mismatch_sm,
@@ -813,6 +832,7 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
     car_params_decoder=decoder,
     runtime_factory=runtime_factory,
     logger=FakeLogger(),
+    route_owned_persistence=False,
   )
   stopped = fake_messages(cp_a, started=False)
   started = fake_messages(cp_a, started=True)
@@ -821,6 +841,7 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
   })
   mismatch.step()
   assert mismatch.runtime is not None
+  mismatch_params.values["CarParams"] = b"vehicle-b"
   mismatch_sm.publish({
     "deviceState": (started["deviceState"], 2_000_000_000),
   })
@@ -852,6 +873,7 @@ def _test_live_identity_late_and_mismatch_never_cross_contaminate(
     car_params_decoder=decoder,
     runtime_factory=runtime_factory,
     logger=FakeLogger(),
+    route_owned_persistence=False,
   )
   late_sm.publish({
     "deviceState": (stopped["deviceState"], 3_000_000_000),
@@ -1086,6 +1108,7 @@ def _test_status_write_failures_and_corrupt_restore_fail_closed(
     car_params_decoder=lambda _encoded: cp,
     runtime_factory=runtime_factory,
     logger=logger,
+    route_owned_persistence=False,
   )
   stopped = fake_messages(cp, started=False)
   started = fake_messages(cp, started=True)
@@ -1133,6 +1156,7 @@ def _test_status_write_failures_and_corrupt_restore_fail_closed(
     car_params_decoder=lambda _encoded: cp,
     runtime_factory=runtime_factory,
     logger=FakeLogger(),
+    route_owned_persistence=False,
   )
   corrupt_sm.publish({
     "deviceState": (stopped["deviceState"], 4_000_000_000),
@@ -1150,9 +1174,166 @@ def _test_status_write_failures_and_corrupt_restore_fail_closed(
   })
   corrupt.step()
   assert LEARNING_STATUS_PARAM not in corrupt_params.values
-  assert not corrupt_params.puts
+  assert not any(
+    key == LEARNING_STATUS_PARAM
+    for key, _, _ in corrupt_params.puts
+  )
+  assert any(
+    key == LEARNING_OPERATION_STATUS_PARAM
+    and value["state"] == "failed"
+    and value["diagnostic"] == "runtime_restore_failed"
+    for key, value, _ in corrupt_params.puts
+  )
   assert corrupt_params.removes == [LEARNING_STATUS_PARAM]
   assert not corrupt._learning_status_clear_pending
+
+
+def _test_route_owned_learner_never_overwrites_offroad_backfill_status(
+  tmp_path: Path,
+  generic_controller_module,
+) -> None:
+  cp = generic_car_params()
+
+  def make_runtime_factory(created):
+    def runtime_factory(car_params, storage_root):
+      runtime = build_persistent_learning_runtime(
+        car_params=car_params,
+        storage_root=storage_root,
+        provisional_rack_dynamics=rack_dynamics(),
+        interface_registry=generic_registry(),
+      )
+      created.append(runtime)
+      return runtime
+
+    return runtime_factory
+
+  # Cold restore and a subsequent CURRENT revision reload both happen while
+  # the backfill process exclusively owns the offroad operation projection.
+  cold_params = FakeParams(tmp_path / "cold")
+  cold_status = {"owner": "backfill-cold-scan"}
+  cold_params.values[LEARNING_OPERATION_STATUS_PARAM] = cold_status
+  cold_sm = FakeSubMaster()
+  cold_created: list[PersistentLearningRuntime] = []
+  cold = BlatV2LearnerDaemon(
+    sm=cold_sm,
+    params=cold_params,
+    storage_root=tmp_path / "cold-learning",
+    car_params_decoder=lambda _encoded: cp,
+    runtime_factory=make_runtime_factory(cold_created),
+    logger=FakeLogger(),
+  )
+  revisions = iter((b"generation-a", b"generation-b", b"generation-b"))
+  cold._artifact_revision = lambda _runtime: next(revisions)
+  stopped = fake_messages(cp, started=False)
+  cold_sm.publish({
+    "deviceState": (stopped["deviceState"], 1_000_000_000),
+  })
+  cold.step()
+  assert len(cold_created) == 1
+  assert cold_params.values[LEARNING_OPERATION_STATUS_PARAM] is cold_status
+  assert not any(
+    key == LEARNING_OPERATION_STATUS_PARAM
+    for key, _, _ in cold_params.puts
+  )
+
+  pointer_flip_status = {"owner": "backfill-pointer-flip"}
+  cold_params.values[LEARNING_OPERATION_STATUS_PARAM] = (
+    pointer_flip_status
+  )
+  cold_sm.publish({
+    "deviceState": (stopped["deviceState"], 1_100_000_000),
+  })
+  cold.step()
+  assert len(cold_created) == 2
+  assert (
+    cold_params.values[LEARNING_OPERATION_STATUS_PARAM]
+    is pointer_flip_status
+  )
+  assert not any(
+    key == LEARNING_OPERATION_STATUS_PARAM
+    for key, _, _ in cold_params.puts
+  )
+
+  # A confirmed exact live-CarParams mismatch leaves the runtime unbound.
+  # Returning offroad with a changed persistent identity must not let learnerd
+  # overwrite the status that backfilld publishes between those transitions.
+  mismatch_params = FakeParams(
+    tmp_path / "failed-bind",
+    car_params_bytes=b"prepared-car-params",
+  )
+  mismatch_sm = FakeSubMaster()
+  mismatch_created: list[PersistentLearningRuntime] = []
+  mismatch = BlatV2LearnerDaemon(
+    sm=mismatch_sm,
+    params=mismatch_params,
+    storage_root=tmp_path / "failed-bind-learning",
+    car_params_decoder=lambda _encoded: cp,
+    runtime_factory=make_runtime_factory(mismatch_created),
+    logger=FakeLogger(),
+  )
+  mismatch_sm.publish({
+    "deviceState": (stopped["deviceState"], 2_000_000_000),
+  })
+  mismatch.step()
+  mismatch_params.values["CarParams"] = b"live-mismatch"
+  started = fake_messages(cp, started=True)
+  mismatch_sm.publish({
+    "deviceState": (started["deviceState"], 3_000_000_000),
+  })
+  mismatch.step()
+  assert mismatch._runtime_unavailable_this_drive
+  assert mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM][
+    "state"
+  ] == "drive_skipped_identity_mismatch"
+
+  offroad_owner_status = {"owner": "backfill-after-skipped-drive"}
+  mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] = (
+    offroad_owner_status
+  )
+  mismatch_params.values["CarParamsPersistent"] = b"replacement-identity"
+  prior_operation_puts = sum(
+    key == LEARNING_OPERATION_STATUS_PARAM
+    for key, _, _ in mismatch_params.puts
+  )
+  mismatch_sm.publish({
+    "deviceState": (stopped["deviceState"], 4_000_000_000),
+  })
+  mismatch.step()
+  assert len(mismatch_created) == 2
+  assert (
+    mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM]
+    is offroad_owner_status
+  )
+  assert sum(
+    key == LEARNING_OPERATION_STATUS_PARAM
+    for key, _, _ in mismatch_params.puts
+  ) == prior_operation_puts
+
+  # Manager flips IsOffroad before the last deviceState update reaches the
+  # live process. Its stale local `_onroad` observation must not let that
+  # process overwrite the newly active backfill owner.
+  mismatch._onroad = True
+  mismatch_params.values["IsOffroad"] = True
+  transition_owner_status = {"owner": "backfill-manager-transition"}
+  mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM] = (
+    transition_owner_status
+  )
+  prior_operation_puts = sum(
+    key == LEARNING_OPERATION_STATUS_PARAM
+    for key, _, _ in mismatch_params.puts
+  )
+  mismatch._publish_operation_status(
+    state=LearningOperationState.COLLECTING,
+    diagnostic="collecting_current_drive",
+  )
+  assert (
+    mismatch_params.values[LEARNING_OPERATION_STATUS_PARAM]
+    is transition_owner_status
+  )
+  assert sum(
+    key == LEARNING_OPERATION_STATUS_PARAM
+    for key, _, _ in mismatch_params.puts
+  ) == prior_operation_puts
 
 
 class TestBlatV2LearnerDaemon(unittest.TestCase):
@@ -1235,6 +1416,12 @@ class TestBlatV2LearnerDaemon(unittest.TestCase):
 
   def test_status_write_failures_and_corrupt_restore_fail_closed(self):
     _test_status_write_failures_and_corrupt_restore_fail_closed(
+      self.tmp_path,
+      None,
+    )
+
+  def test_route_owned_learner_never_overwrites_offroad_backfill_status(self):
+    _test_route_owned_learner_never_overwrites_offroad_backfill_status(
       self.tmp_path,
       None,
     )

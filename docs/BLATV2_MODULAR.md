@@ -216,9 +216,12 @@ constraint. The controller reads the estimate but cannot mutate it.
 
 ### Slow learner
 
-The slow learner writes candidate profile snapshots, never live torque.
-Training happens offroad from clean, hands-off, unconstrained data. Each node
-tracks support, excitation, validation error, uncertainty, and provenance.
+No managed learner runs onroad. Durable training happens offroad when
+`blatv2_backfilld` replays complete, closed full rlogs containing clean,
+hands-off, unconstrained data. Each node tracks support, excitation,
+validation error, uncertainty, and provenance. The live learner adapter is
+retained only for deterministic offline/harness work and cannot contribute
+field evidence.
 
 Initial minimum exposure guidelines are:
 
@@ -237,35 +240,33 @@ gains.
 
 ### Display-only learning and lifecycle status
 
-The offroad UI reads two rebuildable JSON caches:
+The current field UI reads two rebuildable JSON caches:
 
-- `BLaTv2LearningStatus` is projected by `blatv2_learnerd` only after the
-  exact evidence, optional candidate, and manifest have persisted. It reports
-  cumulative node evidence, truthful per-drive deltas when an offroad-to-
-  onroad baseline was observed, qualification reasons, and only the four
-  parameters the regression actually fits. Seed-carried delay, static
+- `BLaTv2LearningOperationStatus` reports the current operation instead of
+  treating an unfinished replay as an empty learner. `blatv2_backfilld` owns
+  offroad `preparing`, `finalizing`, `backfilling`, route progress, terminal
+  idle/empty results, and failures. Route identities are hashed before
+  publication. No managed process publishes live collection state.
+- `BLaTv2LearningStatus` is projected by `blatv2_backfilld` only after the
+  exact evidence, optional candidate, ledger, and manifest have persisted.
+  It reports cumulative node evidence, qualification reasons, and only the
+  four parameters the regression actually fits. Seed-carried delay, static
   friction, and rack-rate resolution are never labeled learned.
-- `BLaTv2LifecycleStatus` is projected by `blatv2_profiled` only while
-  offroad, after `PersistentProfileActivation` validates the current vehicle,
-  runtime, source, opendbc, and activation state. It distinguishes staged
-  lifecycle progress from the effective controller, so a staged profile and
-  a rollback-pending profile both correctly report stock actuation.
 
-Both keys are `CLEAR_ON_MANAGER_START` display caches. They are repopulated
-from current-build, current-vehicle authorities and are never persistent
-authorities themselves. Neither cache may be consumed by fitting, candidate
-creation, approval, controller selection, feedback, rollback, the live
-controller, or a safety path. Missing, stale, malformed, deleted, or edited
-display data therefore cannot change steering. The UI must not parse the raw
-`BLaTv2ActivationState`; lifecycle projection belongs exclusively to its
-validated owner.
+Both keys are `CLEAR_ON_MANAGER_START` display caches and are never
+persistent authorities themselves. They are published only by the offroad
+process owner from authenticated current-build, current-vehicle authorities.
+No cache may be consumed by fitting, candidate creation, approval, controller
+selection, feedback, rollback, the live controller, or a safety path.
+Missing, stale, malformed, deleted, or edited display data therefore cannot
+change steering.
 
-The learner may use `CarParamsPersistent` to restore an exact offroad
-evidence owner, but it cannot collect from that identity alone. Each drive
-waits for live `CarParams` and binds only when its fingerprint and canonical
-bytes exactly match the prepared runtime. Pre-bind witnesses are unresolved;
-a confirmed mismatch closes collection for that entire drive. This prevents
-same-model but different-runtime frames from crossing vehicle evidence.
+The retained `BLaTv2LifecycleStatus` schema and `blatv2_profiled`
+implementation are offline lifecycle-test surfaces in the current stock-only
+field graph. Manager does not launch that process, so it cannot stage an
+active profile or infer provisional-drive feedback. Re-enabling that
+lifecycle requires a separately reviewed offroad exercise witness; the UI
+must never infer it from raw activation Params.
 
 Evidence stays cumulative against its immutable physical fit seed. A
 qualified candidate's revision is an opaque monotone function of persisted
@@ -273,13 +274,28 @@ accepted evidence, so later qualified candidates advance across restarts
 without pretending the already-accumulated sufficient statistics were
 collected against a newer learned seed.
 
-Three passive processes own the non-control lifecycle:
+Complete local routes from previous software runs may be imported, but only
+from full rlogs. Qlogs, incomplete or still-open routes, dirty or unreviewed
+build provenance, identity/envelope mismatches, corrupt logs, and
+nondeterministic replays fail closed. The importer replays every eligible
+batch twice in fresh runtimes, records exactly-once route provenance in an
+authenticated ledger, and publishes an immutable generation by atomically
+replacing one `CURRENT` pointer. A rejected route does not block a later
+eligible route. An older route discovered after the durable chronology has
+advanced is recorded as late and skipped.
 
-- `blatv2_shadowd` publishes diagnostics and has no actuation publisher;
-- `blatv2_learnerd` keeps measured evidence in memory onroad and writes only
-  after returning offroad; and
-- `blatv2_profiled` performs exact artifact staging, feedback, promotion, and
-  rollback only offroad.
+Each released clean build needs an explicit reviewed descriptor retained in
+`historical_build_descriptors.json` before it becomes historical. The current
+build descriptor can be synthesized only while that build is running; an
+older route without its pinned descriptor correctly fails closed as
+unreviewed.
+
+The current manager process graph has exactly one BLaTv2 process:
+`blatv2_backfilld`, offroad on a real car only. It is the sole durable
+evidence writer and publishes learning/operation status. Manager never starts
+`blatv2_shadowd`, `blatv2_learnerd`, or `blatv2_profiled`; their sources and
+tests remain offline/harness tools. Consequently, BLaTv2 contributes no
+managed process load while started/onroad.
 
 All numerical actuation remains synchronous inside controlsd so device and
 replay import the same artifact and share one control-frame clock.
@@ -287,8 +303,8 @@ replay import the same artifact and share one control-frame clock.
 ## Bootstrap and rollback
 
 With no qualified profile, the exact stock torque controller actuates while
-the modular controller shadows. The first candidate is trained only after
-coverage is complete. It must pass:
+the modular controller is evaluated offline. The first candidate is trained
+only after coverage is complete. It must pass:
 
 1. deterministic unit and contract tests;
 2. device/harness A/A parity;

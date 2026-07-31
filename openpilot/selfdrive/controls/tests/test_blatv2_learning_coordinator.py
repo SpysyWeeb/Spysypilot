@@ -161,7 +161,13 @@ class TestBLaTv2LearningCoordinator(unittest.TestCase):
 
     uninterrupted = LearningCoordinator(profile)
     uninterrupted.transition_onroad()
-    for sample in stream:
+    for sample in stream[:317]:
+      self.assertTrue(uninterrupted.ingest(sample))
+    # Match the real route boundary without serializing/restoring. Transient
+    # rack-direction continuity deliberately ends between drives.
+    uninterrupted.transition_offroad()
+    uninterrupted.transition_onroad()
+    for sample in stream[317:]:
       self.assertTrue(uninterrupted.ingest(sample))
     uninterrupted.transition_offroad()
     uninterrupted_final = uninterrupted.finalize()

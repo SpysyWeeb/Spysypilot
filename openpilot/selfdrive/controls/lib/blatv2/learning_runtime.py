@@ -14,9 +14,11 @@ an incomplete or corrupt artifact set raises instead of silently starting over.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
 import importlib
 import inspect
+import json
 import math
 import os
 from pathlib import Path
@@ -67,18 +69,82 @@ class LearningArtifactPaths:
   """Caller-selected artifact directory with hash-addressed candidates."""
 
   root: Path
+  # A runtime restore snapshots CURRENT exactly once. The hidden resolved root
+  # prevents one restore from mixing two immutable generations if CURRENT
+  # flips between evidence/manifest/candidate reads.
+  _resolved_root: Path | None = field(
+    default=None,
+    repr=False,
+    compare=False,
+  )
+
+  @property
+  def backfill_pointer(self) -> Path:
+    return self.root / "backfill_current.json"
+
+  @property
+  def backfill_generations(self) -> Path:
+    return self.root / "backfill_generations"
+
+  def _active_root(self) -> Path:
+    if self._resolved_root is not None:
+      return self._resolved_root
+    if not self.backfill_pointer.is_file():
+      return self.root
+    encoded = self.backfill_pointer.read_bytes()
+    payload = json.loads(encoded)
+    expected_keys = {"generation_sha256", "schema_version"}
+    if (
+      type(payload) is not dict
+      or set(payload) != expected_keys
+      or type(payload["schema_version"]) is not int
+      or payload["schema_version"] != 1
+      or type(payload["generation_sha256"]) is not str
+      or len(payload["generation_sha256"]) != 64
+      or any(
+        character not in "0123456789abcdef"
+        for character in payload["generation_sha256"]
+      )
+      or encoded != json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+      ).encode("utf-8")
+    ):
+      raise ValueError("backfill pointer is not canonical")
+    return self.backfill_generations / payload["generation_sha256"]
+
+  def resolved(self) -> LearningArtifactPaths:
+    if self._resolved_root is not None:
+      return self
+    return LearningArtifactPaths(
+      root=self.root,
+      _resolved_root=self._active_root(),
+    )
 
   @property
   def evidence(self) -> Path:
-    return self.root / "evidence.json"
+    return self._active_root() / "evidence.json"
 
   @property
   def manifest(self) -> Path:
-    return self.root / "manifest.json"
+    return self._active_root() / "manifest.json"
 
   @property
   def candidates(self) -> Path:
-    return self.root / "candidates"
+    return self._active_root() / "candidates"
+
+  @property
+  def backfill_ledger(self) -> Path:
+    return self._active_root() / "ledger.json"
+
+  @property
+  def backfill_provenance(self) -> Path:
+    return self._active_root() / "provenance.json"
+
+  @property
+  def backfill_commit(self) -> Path:
+    return self._active_root() / "commit.json"
 
   def candidate(self, profile_sha256: str) -> Path:
     identity = str(profile_sha256)
@@ -301,6 +367,22 @@ class PersistentLearningRuntime:
     runtime_bundle: RuntimeVehicleBundle,
     artifact_paths: LearningArtifactPaths,
   ) -> PersistentLearningRuntime:
+    # Resolve the generation once for this transaction. The returned runtime
+    # continues to reference that immutable generation until rebuilt.
+    artifact_paths = artifact_paths.resolved()
+    try:
+      if artifact_paths.backfill_pointer.is_file():
+        cls._validate_backfill_generation(
+          artifact_paths=artifact_paths,
+          runtime_bundle=runtime_bundle,
+        )
+    except LearningRestoreError:
+      raise
+    except (OSError, TypeError, ValueError) as exc:
+      raise LearningRestoreError(
+        "stored backfill generation failed canonical restore",
+      ) from exc
+
     evidence_exists = artifact_paths.evidence.is_file()
     manifest_exists = artifact_paths.manifest.is_file()
     if evidence_exists != manifest_exists:
@@ -360,6 +442,88 @@ class PersistentLearningRuntime:
       coordinator=coordinator,
     )
 
+  @staticmethod
+  def _validate_backfill_generation(
+    *,
+    artifact_paths: LearningArtifactPaths,
+    runtime_bundle: RuntimeVehicleBundle,
+  ) -> None:
+    commit_path = artifact_paths.backfill_commit
+    if not commit_path.is_file():
+      raise LearningRestoreError("backfill generation lacks commit record")
+    commit_bytes = commit_path.read_bytes()
+    commit = json.loads(commit_bytes)
+    expected_keys = {
+      "candidate_profile_sha256",
+      "evidence_sha256",
+      "ledger_sha256",
+      "manifest_sha256",
+      "provenance_sha256",
+      "runtime_identity_sha256",
+      "schema_version",
+    }
+    if (
+      type(commit) is not dict
+      or set(commit) != expected_keys
+      or type(commit["schema_version"]) is not int
+      or commit["schema_version"] != 1
+      or commit_bytes != json.dumps(
+        commit,
+        sort_keys=True,
+        separators=(",", ":"),
+      ).encode("utf-8")
+    ):
+      raise LearningRestoreError("backfill commit record is not canonical")
+    generation_identity = hashlib.sha256(commit_bytes).hexdigest()
+    if artifact_paths.backfill_commit.parent.name != generation_identity:
+      raise LearningRestoreError(
+        "backfill generation directory does not match commit identity",
+      )
+
+    def verify_file(path: Path, expected: object, name: str) -> None:
+      if (
+        type(expected) is not str
+        or len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+        or not path.is_file()
+        or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+      ):
+        raise LearningRestoreError(
+          f"backfill {name} does not match commit record",
+        )
+
+    if commit["runtime_identity_sha256"] != runtime_bundle.identity_sha256:
+      raise LearningRestoreError(
+        "backfill generation belongs to another runtime",
+      )
+    verify_file(
+      artifact_paths.evidence,
+      commit["evidence_sha256"],
+      "evidence",
+    )
+    verify_file(
+      artifact_paths.manifest,
+      commit["manifest_sha256"],
+      "manifest",
+    )
+    verify_file(
+      artifact_paths.backfill_ledger,
+      commit["ledger_sha256"],
+      "ledger",
+    )
+    verify_file(
+      artifact_paths.backfill_provenance,
+      commit["provenance_sha256"],
+      "provenance",
+    )
+    candidate_identity = commit["candidate_profile_sha256"]
+    if candidate_identity is not None:
+      verify_file(
+        artifact_paths.candidate(candidate_identity),
+        candidate_identity,
+        "candidate",
+      )
+
   def transition_onroad(self) -> None:
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
@@ -371,10 +535,20 @@ class PersistentLearningRuntime:
     self.envelope_constraint.reset()
     return self.persist_offroad()
 
+  def transition_offroad_without_persist(self) -> None:
+    """End a live preview drive without claiming durable route ownership."""
+    self.coordinator.transition_offroad()
+    self.measurement_builder.reset()
+    self.envelope_constraint.reset()
+
   def persist_offroad(self) -> LearningFinalization:
     """Persist the current finalized state; safe to retry after I/O failure."""
     if self.coordinator.state is not LearningLifecycleState.OFFROAD:
       raise RuntimeError("learner persistence is permitted only offroad")
+    if self.artifact_paths.backfill_pointer.is_file():
+      raise RuntimeError(
+        "ledger-owned evidence may only be persisted by backfill",
+      )
     finalization = self.coordinator.finalize()
 
     # No directory creation is reachable while the coordinator is onroad.
