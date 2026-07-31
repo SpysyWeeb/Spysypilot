@@ -61,7 +61,7 @@ BACKFILL_PROVENANCE_SCHEMA_VERSION = 1
 BACKFILL_COMMIT_SCHEMA_VERSION = 1
 BACKFILL_POINTER_SCHEMA_VERSION = 1
 NATIVE_EXTRACTOR_SCHEMA_VERSION = 1
-CANONICAL_JOIN_SCHEMA_VERSION = 1
+CANONICAL_JOIN_SCHEMA_VERSION = 2
 MAXIMUM_EVENT_BYTES = 64 * 1024 * 1024
 MAXIMUM_EVENT_TRAVERSAL_WORDS = MAXIMUM_EVENT_BYTES // 8
 MAXIMUM_SELECTED_RECORDS_PER_SEGMENT = 100_000
@@ -1360,6 +1360,11 @@ def prepare_route(
       try:
         all_frames.append(measured_learning_frame(
           witness_mono_ns=mono_ns,
+          car_state_mono_ns=selected["carState"].mono_ns,
+          car_output_mono_ns=selected["carOutput"].mono_ns,
+          previous_car_output_mono_ns=(
+            selected["carOutput"].previous_mono_ns
+          ),
           car_state=selected["carState"].message,
           car_control=selected["carControl"].message,
           car_output=selected["carOutput"].message,

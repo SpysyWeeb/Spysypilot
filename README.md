@@ -129,6 +129,15 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — ground-up modular adaptive lateral foundation; stock torque control is the active bootstrap, no BLaTv2 process runs onroad, and an offroad full-rlog importer builds the fully gated speed-local vehicle profile; no learned controller can actuate until replay, delivered-response, deterministic, safety, and device-timing approval all pass &nbsp;*(personal idea)*
 
   Offroad learning now exposes display-only progress for both deterministic replay passes, including route and segment position, route-application stages, and a conservative ETA once enough read/apply timing samples exist. Progress is never consumed by learning, evidence, candidate selection, or control.
+
+  Evidence v2 reconstructs vehicle-generic signed rack motion without changing
+  its measured magnitude: platforms with unsigned rate sensors derive direction
+  from the offset-corrected steering angle, and physical reversals count toward
+  speed-local coverage without fitting the sign-crossing acceleration impulse.
+  Applied torque is paired causally using the previous `carOutput` publication
+  and the speed-interpolated seed transport delay. Existing v1 artifacts remain
+  byte-for-byte untouched while retained full rlogs replay into an initially
+  empty v2 namespace.
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

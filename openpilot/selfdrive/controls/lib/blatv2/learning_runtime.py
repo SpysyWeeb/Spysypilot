@@ -45,6 +45,9 @@ from openpilot.selfdrive.controls.lib.blatv2.measurement import (
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
 )
+from openpilot.selfdrive.controls.lib.blatv2.response_alignment import (
+  CausalTorqueResponseAligner,
+)
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
   RuntimeVehicleBundle,
@@ -57,7 +60,7 @@ CASUAL_DRIVING_CANDIDATE_PROVENANCE = "measured casual-driving evidence"
 # physical runtime. A policy change must start from an empty ledger and replay
 # retained full rlogs; it must never reinterpret or mix a predecessor's
 # CURRENT generation in place.
-FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v1"
+FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v2"
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
   "STEER_DELTA_UP",
@@ -169,7 +172,12 @@ class LearningArtifactPaths:
 class MeasuredLearningFrame:
   """One time-aligned physical-response frame; no command intent is accepted."""
 
+  # controlsState is the canonical race witness. Physical regression uses the
+  # independent response and effective applied-command clocks below.
   sample_mono_ns: int
+  response_mono_ns: int
+  applied_report_mono_ns: int
+  applied_effective_mono_ns: int
   speed_mps: float
   steering_angle_deg: float
   steering_rate_deg_s: float
@@ -323,6 +331,19 @@ class _MeasuredEnvelopeConstraint:
     self._magnitude_boundary_value = None
     self._magnitude_boundary_dwell_s = 0.0
 
+  def driver_exceeds_allowance(self, value: float) -> bool:
+    """Whether raw measured driver torque makes rack input ambiguous."""
+    numeric = float(value)
+    if not math.isfinite(numeric):
+      return True
+    # The limiter scales the sensor through DRIVER_FACTOR. Raw torque is also
+    # retained in the veto so factor=0/multiplier=0 platforms cannot classify
+    # obvious human rack input as vehicle-owned evidence.
+    return max(
+      abs(numeric),
+      abs(numeric * self._limits.driver_factor),
+    ) > self._limits.driver_allowance
+
   def update(
     self,
     *,
@@ -384,18 +405,9 @@ class _MeasuredEnvelopeConstraint:
     # opendbc's allowance, the exact limiter input and the human rack torque
     # are both ambiguous. Reject conservatively and require a fresh
     # full-magnitude dwell instead of pretending the joined sample is exact.
-    def driver_exceeds_allowance(value: float) -> bool:
-      # The limiter scales the sensor through DRIVER_FACTOR. Raw torque is
-      # also retained in the veto so factor=0/multiplier=0 platforms cannot
-      # classify obvious human rack input as vehicle-owned evidence.
-      return max(
-        abs(value),
-        abs(value * self._limits.driver_factor),
-      ) > self._limits.driver_allowance
-
     driver_interaction = (
-      driver_exceeds_allowance(driver_torque)
-      or driver_exceeds_allowance(self._previous_driver_torque)
+      self.driver_exceeds_allowance(driver_torque)
+      or self.driver_exceeds_allowance(self._previous_driver_torque)
     )
     if driver_interaction:
       self._previous_time_s = sample_time_s
@@ -511,6 +523,15 @@ class PersistentLearningRuntime:
     self.envelope_constraint = _MeasuredEnvelopeConstraint(
       runtime_bundle.torque_limits,
     )
+    self.torque_response_aligner = CausalTorqueResponseAligner(
+      maximum_transport_delay_s=max(
+        node.parameters.transport_delay_s
+        for node in runtime_bundle.seed_profile.nodes
+      ),
+      maximum_gap_s=MAX_CONTINUOUS_MEASUREMENT_GAP_S,
+    )
+    self._last_applied_report_mono_ns = 0
+    self._last_reported_applied_torque = 0.0
     self.last_sample_accepted = False
     self.last_actuator_constrained = True
     self.last_live_mapping_valid = False
@@ -683,12 +704,18 @@ class PersistentLearningRuntime:
   def transition_onroad(self) -> None:
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
+    self.torque_response_aligner.reset()
+    self._last_applied_report_mono_ns = 0
+    self._last_reported_applied_torque = 0.0
     self.coordinator.transition_onroad()
 
   def transition_offroad_and_persist(self) -> LearningFinalization:
     self.coordinator.transition_offroad()
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
+    self.torque_response_aligner.reset()
+    self._last_applied_report_mono_ns = 0
+    self._last_reported_applied_torque = 0.0
     return self.persist_offroad()
 
   def transition_offroad_without_persist(self) -> None:
@@ -696,6 +723,9 @@ class PersistentLearningRuntime:
     self.coordinator.transition_offroad()
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
+    self.torque_response_aligner.reset()
+    self._last_applied_report_mono_ns = 0
+    self._last_reported_applied_torque = 0.0
 
   def persist_offroad(self) -> LearningFinalization:
     """Persist the current finalized state; safe to retry after I/O failure."""
@@ -769,15 +799,31 @@ class PersistentLearningRuntime:
     if not isinstance(frame, MeasuredLearningFrame):
       raise TypeError("persistent learner requires MeasuredLearningFrame")
 
-    sample_time_s = int(frame.sample_mono_ns) * 1e-9
+    witness_mono_ns = int(frame.sample_mono_ns)
+    response_mono_ns = int(frame.response_mono_ns)
+    applied_report_mono_ns = int(frame.applied_report_mono_ns)
+    applied_effective_mono_ns = int(frame.applied_effective_mono_ns)
+    sample_time_s = response_mono_ns * 1e-9
+    applied_report_time_s = applied_report_mono_ns * 1e-9
+    applied_effective_time_s = applied_effective_mono_ns * 1e-9
     numeric_valid = frame.inputs_valid and all(math.isfinite(value) for value in (
       sample_time_s,
+      applied_report_time_s,
+      applied_effective_time_s,
       frame.speed_mps,
       frame.steering_angle_deg,
       frame.steering_rate_deg_s,
       frame.steering_torque,
       frame.applied_torque,
-    ))
+    )) and (
+      witness_mono_ns > 0
+      and 0 < response_mono_ns <= witness_mono_ns
+      and 0 < applied_report_mono_ns <= witness_mono_ns
+      and (
+        applied_effective_mono_ns == 0
+        or 0 < applied_effective_mono_ns < applied_report_mono_ns
+      )
+    )
     standstill = bool(frame.standstill)
     below_steer_speed = abs(frame.speed_mps) <= max(
       float(self.car_params.minSteerSpeed),
@@ -795,32 +841,99 @@ class PersistentLearningRuntime:
         or bool(self.car_params.steerAtStandstill)
       )
     )
-    envelope_observation = self.envelope_constraint.update(
-      sample_time_s=sample_time_s,
-      applied_torque=frame.applied_torque,
-      driver_torque=frame.steering_torque,
-      inputs_valid=(
-        numeric_valid
-        and lateral_active
-        and not frame.steering_pressed
-      ),
-    )
-    actuator_constrained = envelope_observation.constrained
-    self.last_actuator_constrained = actuator_constrained
     live_mapping = self._live_mapping(frame)
     torque_tuning = self.car_params.lateralTuning.torque
-    measurement_inputs_valid = (
+    response_inputs_valid = (
       numeric_valid
+      and lateral_active
       and self.last_live_mapping_valid
       and not frame.steering_pressed
-      and envelope_observation.valid
+      and not self.envelope_constraint.driver_exceeds_allowance(
+        frame.steering_torque,
+      )
     )
+    if not response_inputs_valid:
+      self.envelope_constraint.reset()
+      self.torque_response_aligner.reset()
+      self._last_applied_report_mono_ns = 0
+      self._last_reported_applied_torque = 0.0
+
+    command_observation_valid = response_inputs_valid
+    if (
+      command_observation_valid
+      and applied_report_mono_ns != self._last_applied_report_mono_ns
+    ):
+      if (
+        self._last_applied_report_mono_ns != 0
+        and applied_report_mono_ns < self._last_applied_report_mono_ns
+      ):
+        command_observation_valid = False
+        self.envelope_constraint.reset()
+        self.torque_response_aligner.reset()
+      envelope_observation = self.envelope_constraint.update(
+        sample_time_s=applied_effective_time_s,
+        applied_torque=frame.applied_torque,
+        driver_torque=frame.steering_torque,
+        inputs_valid=(
+          command_observation_valid
+          and applied_effective_mono_ns > 0
+        ),
+      )
+      command_observation_valid = self.torque_response_aligner.record(
+        report_time_s=applied_report_time_s,
+        effective_time_s=applied_effective_time_s,
+        applied_torque=frame.applied_torque,
+        actuator_constrained=envelope_observation.constrained,
+        boundary=envelope_observation.boundary,
+        magnitude_boundary_dwell_s=(
+          envelope_observation.magnitude_boundary_dwell_s
+        ),
+        valid=command_observation_valid and envelope_observation.valid,
+      )
+      self._last_applied_report_mono_ns = applied_report_mono_ns
+      self._last_reported_applied_torque = frame.applied_torque
+    elif (
+      command_observation_valid
+      and (
+        frame.applied_torque != self._last_reported_applied_torque
+        or self._last_applied_report_mono_ns == 0
+      )
+    ):
+      command_observation_valid = False
+      self.envelope_constraint.reset()
+      self.torque_response_aligner.reset()
+
+    seed_parameters = self.runtime_bundle.seed_profile.parameters_at(
+      frame.speed_mps,
+    ).parameters
+    aligned_torque = (
+      self.torque_response_aligner.aligned(
+        response_time_s=sample_time_s,
+        transport_delay_s=seed_parameters.transport_delay_s,
+      )
+      if command_observation_valid
+      else None
+    )
+    measurement_inputs_valid = (
+      response_inputs_valid and aligned_torque is not None
+    )
+    actuator_constrained = (
+      True
+      if aligned_torque is None
+      else aligned_torque.actuator_constrained
+    )
+    self.last_actuator_constrained = actuator_constrained
     sample = self.measurement_builder.update(
       sample_time_s=sample_time_s,
       speed_mps=frame.speed_mps,
       measured_rack_angle_deg=frame.steering_angle_deg,
       measured_rack_rate_deg_s=frame.steering_rate_deg_s,
-      applied_torque=frame.applied_torque,
+      rack_rate_resolution_deg_s=(
+        seed_parameters.rack_rate_resolution_deg_s
+      ),
+      applied_torque=(
+        0.0 if aligned_torque is None else aligned_torque.applied_torque
+      ),
       lateral_accel_offset=float(torque_tuning.latAccelOffset),
       live_mapping=live_mapping,
       nominal_mapping=self.runtime_bundle.nominal_rack_mapping,
@@ -835,16 +948,17 @@ class PersistentLearningRuntime:
     )
     if (
       sample.valid
-      and envelope_observation.boundary != ActuatorBoundary.NONE
+      and aligned_torque is not None
+      and aligned_torque.boundary != ActuatorBoundary.NONE
       and not bool(
-        envelope_observation.boundary & ActuatorBoundary.DRIVER
+        aligned_torque.boundary & ActuatorBoundary.DRIVER
       )
     ):
       sample = _attest_authority_sample(
         sample,
-        boundary=envelope_observation.boundary,
+        boundary=aligned_torque.boundary,
         magnitude_boundary_dwell_s=(
-          envelope_observation.magnitude_boundary_dwell_s
+          aligned_torque.magnitude_boundary_dwell_s
         ),
       )
     accepted = self.coordinator.ingest(sample)

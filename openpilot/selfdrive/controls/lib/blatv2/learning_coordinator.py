@@ -37,7 +37,7 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 )
 
 
-LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 2
+LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 3
 
 
 class LearningLifecycleState(StrEnum):
