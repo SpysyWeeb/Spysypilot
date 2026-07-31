@@ -17,6 +17,7 @@ import re
 LEARNING_STATUS_SCHEMA_VERSION = 1
 LIFECYCLE_STATUS_SCHEMA_VERSION = 1
 LEARNING_OPERATION_STATUS_SCHEMA_VERSION = 1
+BACKFILL_PROGRESS_SCHEMA_VERSION = 1
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -102,6 +103,27 @@ _OPERATION_KEYS = frozenset((
   "retry_count",
   "evidence_sha256",
   "ledger_sha256",
+))
+_BACKFILL_PROGRESS_KEYS = frozenset((
+  "schema_version",
+  "informational_only",
+  "operation_id",
+  "operation_sequence",
+  "sequence",
+  "updated_mono_ns",
+  "phase",
+  "pass_index",
+  "pass_count",
+  "current_route_identity",
+  "current_route_index",
+  "total_route_count",
+  "current_segment_index",
+  "current_route_segment_count",
+  "completed_replay_segment_count",
+  "total_replay_segment_count",
+  "completed_work_units",
+  "total_work_units",
+  "approximate_remaining_seconds",
 ))
 _PROFILE_IDENTITY_KEYS = frozenset((
   "artifact_sha256",
@@ -197,6 +219,12 @@ _TERMINAL_OPERATION_STATES = frozenset((
   "idle",
   "drive_skipped_identity_mismatch",
   "failed",
+))
+_BACKFILL_PROGRESS_PHASES = frozenset((
+  "reading_segment",
+  "applying_route",
+  "comparing",
+  "publishing",
 ))
 _OPERATION_DIAGNOSTIC_LABELS = {
   "waiting_for_car_params": "Waiting for vehicle configuration",
@@ -352,6 +380,33 @@ class LearningOperationStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class BackfillProgressStatus:
+  """Optional display-only detail bound to one operation-status snapshot."""
+
+  operation_id: str
+  operation_sequence: int
+  sequence: int
+  updated_mono_ns: int
+  phase: str
+  pass_index: int
+  pass_count: int
+  current_route_identity: str | None
+  current_route_index: int | None
+  total_route_count: int
+  current_segment_index: int | None
+  current_route_segment_count: int | None
+  completed_replay_segment_count: int
+  total_replay_segment_count: int
+  completed_work_units: int
+  total_work_units: int
+  approximate_remaining_seconds: int | None
+
+  @property
+  def progress_fraction(self) -> float:
+    return self.completed_work_units / self.total_work_units
+
+
+@dataclass(frozen=True, slots=True)
 class OperationPresentation:
   """Pure presentation model shared by both dashboard pages."""
 
@@ -359,6 +414,10 @@ class OperationPresentation:
   detail: str
   tone: str
   show_banner: bool
+  phase_detail: str | None = None
+  meta: str | None = None
+  compact_meta: str | None = None
+  progress_fraction: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1030,6 +1089,363 @@ def parse_learning_operation_status(
   )
 
 
+def parse_backfill_progress_status(
+  raw: object,
+  *,
+  operation_status: LearningOperationStatus | None,
+  now_mono_ns: int,
+) -> BackfillProgressStatus:
+  """Decode optional replay detail only when it binds to the current operation.
+
+  This projection may improve display detail, but it is never evidence that
+  learning, publication, or controller activation occurred. Any torn,
+  malformed, or stale companion read is discarded by the caller in favor of
+  the coarse operation-status presentation.
+  """
+  if raw is None:
+    raise LearningStatusError(
+      "progress_absent",
+      "Detailed backfill progress has not been published",
+    )
+  if type(now_mono_ns) is not int or now_mono_ns < 0:
+    raise ValueError("now_mono_ns must be a non-negative integer")
+  if type(raw) is not dict:
+    raise LearningStatusError(
+      "malformed",
+      "backfill progress must be a Params JSON object",
+    )
+  if (
+    type(raw.get("schema_version")) is not int
+    or raw["schema_version"] != BACKFILL_PROGRESS_SCHEMA_VERSION
+  ):
+    raise LearningStatusError(
+      "schema_mismatch",
+      "Backfill progress version is not supported",
+    )
+  data = _exact_object(raw, _BACKFILL_PROGRESS_KEYS, "backfill progress")
+  if data["informational_only"] is not True:
+    raise LearningStatusError(
+      "malformed",
+      "Backfill progress is not marked display-only",
+    )
+
+  operation_id = _operation_id(data["operation_id"], "operation_id")
+  operation_sequence = _integer(
+    data["operation_sequence"],
+    "operation_sequence",
+  )
+  if (
+    operation_status is None
+    or operation_id != operation_status.operation_id
+    or operation_sequence != operation_status.sequence
+  ):
+    raise LearningStatusError(
+      "progress_mismatch",
+      "Backfill progress does not match the current learner operation",
+    )
+
+  updated_mono_ns = _integer(data["updated_mono_ns"], "updated_mono_ns")
+  if (
+    updated_mono_ns < operation_status.started_mono_ns
+    or updated_mono_ns < operation_status.updated_mono_ns
+    or updated_mono_ns > now_mono_ns
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Backfill progress timestamp is stale",
+    )
+
+  phase = _text(data["phase"], "phase")
+  if phase not in _BACKFILL_PROGRESS_PHASES:
+    raise LearningStatusError("malformed", "backfill phase is not recognized")
+
+  pass_index = _integer(data["pass_index"], "pass_index")
+  pass_count = _integer(data["pass_count"], "pass_count")
+  if pass_count != 2 or pass_index < 1 or pass_index > pass_count:
+    raise LearningStatusError(
+      "malformed",
+      "backfill pass progress is outside its bounds",
+    )
+
+  total_route_count = _integer(
+    data["total_route_count"],
+    "total_route_count",
+  )
+  if total_route_count < 1:
+    raise LearningStatusError(
+      "malformed",
+      "backfill route total must be positive",
+    )
+  current_route_identity = _sha256(
+    data["current_route_identity"],
+    "current_route_identity",
+    nullable=True,
+  )
+  current_route_index = _integer(
+    data["current_route_index"],
+    "current_route_index",
+    nullable=True,
+  )
+  current_segment_index = _integer(
+    data["current_segment_index"],
+    "current_segment_index",
+    nullable=True,
+  )
+  current_route_segment_count = _integer(
+    data["current_route_segment_count"],
+    "current_route_segment_count",
+    nullable=True,
+  )
+  route_phase = phase in ("reading_segment", "applying_route")
+  route_group_complete = (
+    current_route_identity is not None
+    and current_route_index is not None
+  )
+  segment_group_complete = (
+    current_segment_index is not None
+    and current_route_segment_count is not None
+  )
+  if route_phase:
+    if not route_group_complete or not segment_group_complete:
+      raise LearningStatusError(
+        "malformed",
+        "active replay progress requires route and segment coordinates",
+      )
+    if current_route_index < 1 or current_route_index > total_route_count:
+      raise LearningStatusError(
+        "malformed",
+        "backfill route progress is outside its bounds",
+      )
+    if (
+      current_segment_index < 1
+      or current_route_segment_count < 1
+      or current_segment_index > current_route_segment_count
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "backfill segment progress is outside its bounds",
+      )
+    if (
+      phase == "applying_route"
+      and current_segment_index != current_route_segment_count
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "route application must retain the final segment coordinate",
+      )
+  elif route_group_complete or segment_group_complete or any((
+    current_route_identity is not None,
+    current_route_index is not None,
+    current_segment_index is not None,
+    current_route_segment_count is not None,
+  )):
+    raise LearningStatusError(
+      "malformed",
+      "comparison and publication cannot claim a current route or segment",
+    )
+
+  completed_segments = _integer(
+    data["completed_replay_segment_count"],
+    "completed_replay_segment_count",
+  )
+  total_segments = _integer(
+    data["total_replay_segment_count"],
+    "total_replay_segment_count",
+  )
+  completed_work = _integer(
+    data["completed_work_units"],
+    "completed_work_units",
+  )
+  total_work = _integer(data["total_work_units"], "total_work_units")
+  if (
+    total_segments < 1
+    or completed_segments > total_segments
+    or total_work < 1
+    or completed_work > total_work
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "backfill cumulative progress is outside its bounds",
+    )
+
+  approximate_remaining_seconds = _integer(
+    data["approximate_remaining_seconds"],
+    "approximate_remaining_seconds",
+    nullable=True,
+  )
+  if route_phase:
+    if completed_work >= total_work:
+      raise LearningStatusError(
+        "malformed",
+        "active replay progress cannot claim all work is complete",
+      )
+    expected_state = (
+      ("backfilling", "replaying_route")
+      if pass_index == 1
+      else ("finalizing", "verifying_backfill")
+    )
+    if (operation_status.state, operation_status.diagnostic) != expected_state:
+      raise LearningStatusError(
+        "progress_mismatch",
+        "Backfill phase does not match the learner operation state",
+      )
+    if pass_index == 1 and (
+      current_route_identity != operation_status.current_route_identity
+      or current_route_index != operation_status.current_route_index
+      or total_route_count != operation_status.total_route_count
+    ):
+      raise LearningStatusError(
+        "progress_mismatch",
+        "Pass-one detail does not match coarse route progress",
+      )
+  else:
+    expected_diagnostic = (
+      "verifying_backfill" if phase == "comparing" else "publishing_backfill"
+    )
+    if (
+      pass_index != 2
+      or operation_status.state != "finalizing"
+      or operation_status.diagnostic != expected_diagnostic
+    ):
+      raise LearningStatusError(
+        "progress_mismatch",
+        "Final backfill phase does not match the learner operation state",
+      )
+    if (
+      completed_segments != total_segments
+      or completed_work != total_work
+      or approximate_remaining_seconds is not None
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "final backfill phase must report complete replay work without an ETA",
+      )
+
+  return BackfillProgressStatus(
+    operation_id=operation_id,
+    operation_sequence=operation_sequence,
+    sequence=_integer(data["sequence"], "sequence"),
+    updated_mono_ns=updated_mono_ns,
+    phase=phase,
+    pass_index=pass_index,
+    pass_count=pass_count,
+    current_route_identity=current_route_identity,
+    current_route_index=current_route_index,
+    total_route_count=total_route_count,
+    current_segment_index=current_segment_index,
+    current_route_segment_count=current_route_segment_count,
+    completed_replay_segment_count=completed_segments,
+    total_replay_segment_count=total_segments,
+    completed_work_units=completed_work,
+    total_work_units=total_work,
+    approximate_remaining_seconds=approximate_remaining_seconds,
+  )
+
+
+def validate_backfill_progress_update(
+  previous: BackfillProgressStatus | None,
+  current: BackfillProgressStatus,
+) -> None:
+  """Reject a regressed companion projection within one learner operation."""
+  if previous is None or previous.operation_id != current.operation_id:
+    return
+  if current.operation_sequence < previous.operation_sequence:
+    raise LearningStatusError(
+      "stale",
+      "Backfill progress operation sequence moved backward",
+    )
+  if current.sequence < previous.sequence:
+    raise LearningStatusError(
+      "stale",
+      "Backfill progress sequence moved backward",
+    )
+  if current.sequence == previous.sequence and current != previous:
+    raise LearningStatusError(
+      "stale",
+      "Backfill progress changed without advancing its sequence",
+    )
+  if (
+    current.sequence > previous.sequence
+    and current.updated_mono_ns < previous.updated_mono_ns
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Backfill progress advanced with a stale timestamp",
+    )
+  if (
+    current.pass_count != previous.pass_count
+    or current.total_route_count != previous.total_route_count
+    or current.total_replay_segment_count
+    != previous.total_replay_segment_count
+    or current.total_work_units != previous.total_work_units
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Backfill progress totals changed during replay",
+    )
+  if (
+    current.completed_replay_segment_count
+    < previous.completed_replay_segment_count
+    or current.completed_work_units < previous.completed_work_units
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Backfill cumulative progress moved backward",
+    )
+  if current.pass_index < previous.pass_index:
+    raise LearningStatusError(
+      "stale",
+      "Backfill pass progress moved backward",
+    )
+  if (
+    current.pass_index == previous.pass_index
+    and previous.current_route_index is not None
+    and current.current_route_index is not None
+  ):
+    if current.current_route_index < previous.current_route_index:
+      raise LearningStatusError(
+        "stale",
+        "Backfill route progress moved backward",
+      )
+    if current.current_route_index == previous.current_route_index:
+      if (
+        current.current_route_identity != previous.current_route_identity
+        or current.current_route_segment_count
+        != previous.current_route_segment_count
+      ):
+        raise LearningStatusError(
+          "stale",
+          "Backfill current-route identity or total changed",
+        )
+      if (
+        previous.current_segment_index is not None
+        and current.current_segment_index is not None
+        and current.current_segment_index < previous.current_segment_index
+      ):
+        raise LearningStatusError(
+          "stale",
+          "Backfill segment progress moved backward",
+        )
+      if previous.phase == "applying_route" and current.phase == "reading_segment":
+        raise LearningStatusError(
+          "stale",
+          "Backfill returned to reading an applied route",
+        )
+  if previous.phase == "comparing" and current.phase not in (
+    "comparing",
+    "publishing",
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Backfill resumed replay after comparison",
+    )
+  if previous.phase == "publishing" and current.phase != "publishing":
+    raise LearningStatusError(
+      "stale",
+      "Backfill resumed work after publication began",
+    )
+
+
 def validate_operation_update(
   previous: LearningOperationStatus | None,
   current: LearningOperationStatus,
@@ -1271,6 +1687,7 @@ def operation_presentation(
   error_code: str | None,
   error_message: str | None,
   has_learning_snapshot: bool,
+  backfill_progress: BackfillProgressStatus | None = None,
 ) -> OperationPresentation:
   """Return truthful copy without treating absence as an empty history."""
   if status is None:
@@ -1284,12 +1701,70 @@ def operation_presentation(
       show_banner=has_learning_snapshot,
     )
 
+  if backfill_progress is not None and (
+    backfill_progress.operation_id != status.operation_id
+    or backfill_progress.operation_sequence != status.sequence
+  ):
+    backfill_progress = None
+
   prior = "Prior snapshot shown | " if has_learning_snapshot and status.active else ""
   counts = " | ".join((
     f"{status.accepted_sample_count:,} incorporated",
     f"{status.rejected_sample_count:,} excluded",
   ))
   diagnostic = _OPERATION_DIAGNOSTIC_LABELS[status.diagnostic]
+
+  if backfill_progress is not None:
+    progress = backfill_progress
+    if progress.phase in ("reading_segment", "applying_route"):
+      title = (
+        "PROCESSING PRIOR ROUTES"
+        if progress.pass_index == 1
+        else "VERIFYING PRIOR ROUTES"
+      )
+      detail = " | ".join((
+        f"Pass {progress.pass_index}/{progress.pass_count}",
+        f"Route {progress.current_route_index}/{progress.total_route_count}",
+        f"Segment {progress.current_segment_index}/{progress.current_route_segment_count}",
+      ))
+      phase_detail = (
+        "Reading and validating this route segment"
+        if progress.phase == "reading_segment"
+        else "Applying validated route evidence"
+      )
+      if has_learning_snapshot:
+        phase_detail += " | Prior snapshot shown"
+      if progress.approximate_remaining_seconds is None:
+        compact_meta = "Estimating time"
+      else:
+        percentage = int(progress.progress_fraction * 100.0)
+        minutes = (
+          progress.approximate_remaining_seconds + 59
+        ) // 60
+        compact_meta = f"{percentage}% | About {minutes} min left"
+      return OperationPresentation(
+        title=title,
+        detail=detail,
+        tone="blue",
+        show_banner=has_learning_snapshot,
+        phase_detail=phase_detail,
+        meta=f"{compact_meta} | {counts}",
+        compact_meta=compact_meta,
+        progress_fraction=progress.progress_fraction,
+      )
+    if progress.phase == "comparing":
+      return OperationPresentation(
+        title="COMPARING REPLAY PASSES",
+        detail="Checking that both independent replay passes match exactly",
+        tone="blue",
+        show_banner=has_learning_snapshot,
+      )
+    return OperationPresentation(
+      title="SAVING VERIFIED LEARNING DATA",
+      detail="Replay passes matched; publishing the verified snapshot",
+      tone="blue",
+      show_banner=has_learning_snapshot,
+    )
 
   if status.state == "preparing":
     return OperationPresentation(
@@ -1368,6 +1843,7 @@ def learning_panel_presentation(
   learning_error_code: str | None,
   learning_error_message: str | None,
   has_learning_snapshot: bool,
+  backfill_progress: BackfillProgressStatus | None = None,
 ) -> OperationPresentation:
   """Plan the banner or empty state without discarding a valid snapshot."""
   operation = operation_presentation(
@@ -1375,6 +1851,7 @@ def learning_panel_presentation(
     error_code=operation_error_code,
     error_message=operation_error_message,
     has_learning_snapshot=has_learning_snapshot,
+    backfill_progress=backfill_progress,
   )
   if has_learning_snapshot:
     return operation

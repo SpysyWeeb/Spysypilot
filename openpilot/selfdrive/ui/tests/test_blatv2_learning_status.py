@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 import importlib.util
 from pathlib import Path
 import sys
@@ -14,11 +15,13 @@ from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   grid_cells,
   learning_panel_presentation,
   operation_presentation,
+  parse_backfill_progress_status,
   parse_learning_operation_status,
   parse_learning_status,
   parse_lifecycle_status,
   reason_label,
   select_value_provider,
+  validate_backfill_progress_update,
   validate_operation_update,
 )
 
@@ -211,6 +214,46 @@ def operation_fixture(
     "retry_count": 2 if state == "retry_pending" else 0,
     "evidence_sha256": HASH if idle else None,
     "ledger_sha256": None,
+  }
+
+
+def backfill_progress_fixture(
+  phase: str = "reading_segment",
+  *,
+  pass_index: int = 1,
+  operation_sequence: int = 7,
+  approximate_remaining_seconds: int | None = None,
+) -> dict:
+  replaying = phase in ("reading_segment", "applying_route")
+  final = phase in ("comparing", "publishing")
+  return {
+    "schema_version": 1,
+    "informational_only": True,
+    "operation_id": OPERATION_ID,
+    "operation_sequence": operation_sequence,
+    "sequence": 11,
+    "updated_mono_ns": NOW_MONO_NS - 50_000_000,
+    "phase": phase,
+    "pass_index": 2 if final else pass_index,
+    "pass_count": 2,
+    "current_route_identity": ROUTE_HASH if replaying else None,
+    "current_route_index": 2 if replaying else None,
+    "total_route_count": 5,
+    "current_segment_index": (
+      26 if phase == "applying_route" else 4 if replaying else None
+    ),
+    "current_route_segment_count": 26 if replaying else None,
+    "completed_replay_segment_count": (
+      400 if final else 242 if pass_index == 2 else 42
+    ),
+    "total_replay_segment_count": 400,
+    "completed_work_units": (
+      1000 if final else 650 if pass_index == 2 else 250
+    ),
+    "total_work_units": 1000,
+    "approximate_remaining_seconds": (
+      None if final else approximate_remaining_seconds
+    ),
   }
 
 
@@ -739,10 +782,427 @@ class TestLearningOperationStatusParser(unittest.TestCase):
         self.assertEqual(error_display.detail, f"{code} detail")
 
 
+class TestBackfillProgressStatusParser(unittest.TestCase):
+  @staticmethod
+  def operation(
+    state: str = "backfilling",
+    *,
+    diagnostic: str | None = None,
+  ):
+    return parse_learning_operation_status(
+      operation_fixture(state, diagnostic=diagnostic),
+      expected_vehicle_identity=VEHICLE,
+      expected_runtime_identity_sha256=RUNTIME_HASH,
+      now_mono_ns=NOW_MONO_NS,
+    )
+
+  def parse(self, payload: object, operation=None):
+    return parse_backfill_progress_status(
+      payload,
+      operation_status=self.operation() if operation is None else operation,
+      now_mono_ns=NOW_MONO_NS,
+    )
+
+  def test_pass_one_and_pass_two_detail_bind_to_the_operation(self) -> None:
+    first = self.parse(backfill_progress_fixture())
+    self.assertEqual(first.pass_index, 1)
+    self.assertEqual(first.current_segment_index, 4)
+    self.assertEqual(first.progress_fraction, 0.25)
+
+    verifying = self.operation(
+      "finalizing",
+      diagnostic="verifying_backfill",
+    )
+    second = self.parse(
+      backfill_progress_fixture(pass_index=2),
+      operation=verifying,
+    )
+    self.assertEqual(second.pass_index, 2)
+    self.assertEqual(second.completed_work_units, 650)
+
+  def test_route_segment_pass_and_work_bounds_fail_closed(self) -> None:
+    mutations = (
+      {"pass_index": 0},
+      {"pass_count": 3},
+      {"current_route_index": None},
+      {"current_route_index": 0},
+      {"current_route_index": 6},
+      {"current_segment_index": None},
+      {"current_segment_index": 0},
+      {"current_segment_index": 27},
+      {"current_route_segment_count": 0},
+      {"completed_replay_segment_count": 401},
+      {"total_replay_segment_count": 0},
+      {"completed_work_units": 1000},
+      {"total_work_units": 0},
+    )
+    for mutation in mutations:
+      with self.subTest(mutation=mutation):
+        payload = backfill_progress_fixture()
+        payload.update(mutation)
+        with self.assertRaises(LearningStatusError) as malformed:
+          self.parse(payload)
+        self.assertEqual(malformed.exception.code, "malformed")
+
+    applying = backfill_progress_fixture("applying_route")
+    applying["current_segment_index"] = 25
+    with self.assertRaises(LearningStatusError) as malformed_applying:
+      self.parse(applying)
+    self.assertEqual(malformed_applying.exception.code, "malformed")
+
+  def test_exact_schema_phase_and_informational_marker_are_strict(self) -> None:
+    payloads = []
+    extra = backfill_progress_fixture()
+    extra["surprise"] = True
+    payloads.append(extra)
+    schema = backfill_progress_fixture()
+    schema["schema_version"] = 2
+    payloads.append(schema)
+    marker = backfill_progress_fixture()
+    marker["informational_only"] = False
+    payloads.append(marker)
+    phase = backfill_progress_fixture()
+    phase["phase"] = "estimating"
+    payloads.append(phase)
+
+    for position, payload in enumerate(payloads):
+      with self.subTest(position=position):
+        with self.assertRaises(LearningStatusError):
+          self.parse(payload)
+
+  def test_comparing_and_publishing_have_complete_work_but_no_bar_eta_or_route(
+    self,
+  ) -> None:
+    cases = (
+      (
+        "comparing",
+        self.operation("finalizing", diagnostic="verifying_backfill"),
+      ),
+      (
+        "publishing",
+        self.operation("finalizing", diagnostic="publishing_backfill"),
+      ),
+    )
+    for phase, operation in cases:
+      with self.subTest(phase=phase):
+        status = self.parse(
+          backfill_progress_fixture(phase),
+          operation=operation,
+        )
+        self.assertIsNone(status.current_route_identity)
+        self.assertIsNone(status.current_segment_index)
+        self.assertEqual(
+          status.completed_work_units,
+          status.total_work_units,
+        )
+        self.assertIsNone(status.approximate_remaining_seconds)
+
+    invalid = backfill_progress_fixture("comparing")
+    invalid["current_route_identity"] = ROUTE_HASH
+    with self.assertRaises(LearningStatusError):
+      self.parse(
+        invalid,
+        operation=self.operation(
+          "finalizing",
+          diagnostic="verifying_backfill",
+        ),
+      )
+
+  def test_operation_binding_state_and_monotonic_epoch_fail_closed(self) -> None:
+    wrong_id = backfill_progress_fixture()
+    wrong_id["operation_id"] = "a" * 32
+    wrong_sequence = backfill_progress_fixture()
+    wrong_sequence["operation_sequence"] += 1
+    wrong_state = backfill_progress_fixture()
+    future = backfill_progress_fixture()
+    future["updated_mono_ns"] = NOW_MONO_NS + 1
+    before_operation = backfill_progress_fixture()
+    before_operation["updated_mono_ns"] = (
+      operation_fixture()["updated_mono_ns"] - 1
+    )
+
+    for payload, operation, code in (
+      (wrong_id, self.operation(), "progress_mismatch"),
+      (wrong_sequence, self.operation(), "progress_mismatch"),
+      (
+        wrong_state,
+        self.operation("finalizing", diagnostic="verifying_backfill"),
+        "progress_mismatch",
+      ),
+      (future, self.operation(), "stale"),
+      (before_operation, self.operation(), "stale"),
+    ):
+      with self.subTest(code=code, payload=payload):
+        with self.assertRaises(LearningStatusError) as error:
+          self.parse(payload, operation=operation)
+        self.assertEqual(error.exception.code, code)
+
+  def test_progress_update_totals_coordinates_and_work_cannot_regress(
+    self,
+  ) -> None:
+    previous = self.parse(backfill_progress_fixture())
+    advanced = replace(
+      previous,
+      sequence=previous.sequence + 1,
+      updated_mono_ns=previous.updated_mono_ns + 1,
+      current_segment_index=previous.current_segment_index + 1,
+      completed_replay_segment_count=(
+        previous.completed_replay_segment_count + 1
+      ),
+      completed_work_units=previous.completed_work_units + 10,
+    )
+    validate_backfill_progress_update(previous, advanced)
+    validate_backfill_progress_update(
+      previous,
+      replace(advanced, updated_mono_ns=previous.updated_mono_ns),
+    )
+
+    regressions = (
+      {"sequence": previous.sequence - 1},
+      {"pass_index": 0},
+      {"current_route_index": previous.current_route_index - 1},
+      {"current_segment_index": previous.current_segment_index - 1},
+      {
+        "completed_replay_segment_count":
+          previous.completed_replay_segment_count - 1,
+      },
+      {"completed_work_units": previous.completed_work_units - 1},
+      {"total_route_count": previous.total_route_count + 1},
+      {"total_replay_segment_count": previous.total_replay_segment_count + 1},
+      {"total_work_units": previous.total_work_units + 1},
+    )
+    for mutation in regressions:
+      with self.subTest(mutation=mutation):
+        fields = {
+          "sequence": previous.sequence + 1,
+          "updated_mono_ns": previous.updated_mono_ns + 1,
+        }
+        fields.update(mutation)
+        current = replace(previous, **fields)
+        with self.assertRaises(LearningStatusError) as stale:
+          validate_backfill_progress_update(previous, current)
+        self.assertEqual(stale.exception.code, "stale")
+
+  def test_route_index_can_reset_only_when_the_pass_advances(self) -> None:
+    first = self.parse(backfill_progress_fixture())
+    verifying = self.operation(
+      "finalizing",
+      diagnostic="verifying_backfill",
+    )
+    payload = backfill_progress_fixture(pass_index=2)
+    payload["sequence"] = first.sequence + 1
+    payload["updated_mono_ns"] = first.updated_mono_ns + 1
+    payload["current_route_index"] = 1
+    second = self.parse(payload, operation=verifying)
+    validate_backfill_progress_update(first, second)
+
+    same_pass = replace(second, current_route_index=0)
+    with self.assertRaises(LearningStatusError):
+      validate_backfill_progress_update(second, same_pass)
+
+
+class TestBackfillProgressPresentation(unittest.TestCase):
+  @staticmethod
+  def operation(
+    state: str = "backfilling",
+    *,
+    diagnostic: str | None = None,
+  ):
+    return parse_learning_operation_status(
+      operation_fixture(state, diagnostic=diagnostic),
+      expected_vehicle_identity=VEHICLE,
+      expected_runtime_identity_sha256=RUNTIME_HASH,
+      now_mono_ns=NOW_MONO_NS,
+    )
+
+  @staticmethod
+  def progress(payload: dict, operation):
+    return parse_backfill_progress_status(
+      payload,
+      operation_status=operation,
+      now_mono_ns=NOW_MONO_NS,
+    )
+
+  def presentation(self, operation, progress, *, has_snapshot: bool = True):
+    return operation_presentation(
+      operation,
+      error_code=None,
+      error_message=None,
+      has_learning_snapshot=has_snapshot,
+      backfill_progress=progress,
+    )
+
+  def test_both_passes_have_exact_primary_copy_and_determinate_bar(self) -> None:
+    first_operation = self.operation()
+    first_progress = self.progress(
+      backfill_progress_fixture(),
+      first_operation,
+    )
+    first = self.presentation(first_operation, first_progress)
+    self.assertEqual(first.title, "PROCESSING PRIOR ROUTES")
+    self.assertEqual(
+      first.detail,
+      "Pass 1/2 | Route 2/5 | Segment 4/26",
+    )
+    self.assertIn("Reading and validating", first.phase_detail)
+    self.assertEqual(first.compact_meta, "Estimating time")
+    self.assertNotIn("%", first.meta)
+    self.assertEqual(first.progress_fraction, 0.25)
+
+    second_operation = self.operation(
+      "finalizing",
+      diagnostic="verifying_backfill",
+    )
+    payload = backfill_progress_fixture(
+      pass_index=2,
+      approximate_remaining_seconds=601,
+    )
+    payload["current_route_index"] = 3
+    payload["total_route_count"] = 20
+    second_progress = self.progress(payload, second_operation)
+    second = self.presentation(second_operation, second_progress)
+    self.assertEqual(second.title, "VERIFYING PRIOR ROUTES")
+    self.assertEqual(
+      second.detail,
+      "Pass 2/2 | Route 3/20 | Segment 4/26",
+    )
+    self.assertEqual(second.progress_fraction, 0.65)
+    self.assertEqual(second.compact_meta, "65% | About 11 min left")
+    self.assertIn("12,345 incorporated", second.meta)
+    self.assertIn("678 excluded", second.meta)
+
+  def test_applying_phase_and_initial_no_snapshot_screen_keep_detail(self) -> None:
+    operation = self.operation()
+    progress = self.progress(
+      backfill_progress_fixture("applying_route"),
+      operation,
+    )
+    presentation = self.presentation(
+      operation,
+      progress,
+      has_snapshot=False,
+    )
+    self.assertFalse(presentation.show_banner)
+    self.assertEqual(
+      presentation.detail,
+      "Pass 1/2 | Route 2/5 | Segment 26/26",
+    )
+    self.assertEqual(
+      presentation.phase_detail,
+      "Applying validated route evidence",
+    )
+    self.assertIsNotNone(presentation.progress_fraction)
+
+  def test_comparing_and_publishing_are_distinct_and_have_no_false_bar(
+    self,
+  ) -> None:
+    cases = (
+      (
+        "comparing",
+        "verifying_backfill",
+        "COMPARING REPLAY PASSES",
+      ),
+      (
+        "publishing",
+        "publishing_backfill",
+        "SAVING VERIFIED LEARNING DATA",
+      ),
+    )
+    for phase, diagnostic, title in cases:
+      with self.subTest(phase=phase):
+        operation = self.operation("finalizing", diagnostic=diagnostic)
+        progress = self.progress(
+          backfill_progress_fixture(phase),
+          operation,
+        )
+        presentation = self.presentation(operation, progress)
+        self.assertEqual(presentation.title, title)
+        self.assertIsNone(presentation.progress_fraction)
+
+  def test_missing_or_mismatched_progress_uses_existing_coarse_copy(self) -> None:
+    scanning = self.operation("backfilling", diagnostic="scanning_routes")
+    fallback = self.presentation(scanning, None)
+    self.assertEqual(fallback.title, "PROCESSING PRIOR ROUTES")
+    self.assertIn("Scanning compatible routes", fallback.detail)
+    self.assertIsNone(fallback.progress_fraction)
+
+    operation = self.operation()
+    progress = self.progress(backfill_progress_fixture(), operation)
+    mismatched = replace(progress, operation_sequence=operation.sequence + 1)
+    fallback = self.presentation(operation, mismatched)
+    self.assertEqual(
+      fallback.detail,
+      " | ".join((
+        "Prior snapshot shown",
+        "Route 2/5",
+        "12,345 incorporated",
+        "678 excluded",
+      )),
+    )
+    self.assertIsNone(fallback.progress_fraction)
+
+  def test_progress_copy_is_ascii_only(self) -> None:
+    operation = self.operation()
+    progress = self.progress(
+      backfill_progress_fixture(
+        approximate_remaining_seconds=120,
+      ),
+      operation,
+    )
+    presentation = self.presentation(operation, progress)
+    for value in (
+      presentation.title,
+      presentation.detail,
+      presentation.phase_detail,
+      presentation.meta,
+      presentation.compact_meta,
+    ):
+      self.assertTrue(value.isascii())
+
+  def test_large_backend_eta_formats_without_float_overflow(self) -> None:
+    operation = self.operation()
+    progress = self.progress(
+      backfill_progress_fixture(
+        approximate_remaining_seconds=10**400,
+      ),
+      operation,
+    )
+    presentation = self.presentation(operation, progress)
+    self.assertTrue(presentation.compact_meta.startswith("25% | About "))
+    self.assertTrue(presentation.compact_meta.endswith(" min left"))
+
+
 def _load_learning_widget_module():
   """Load the status source without requiring raylib in an off-car test."""
   fake_pyray = types.ModuleType("pyray")
   fake_pyray.Color = lambda *channels: tuple(channels)
+  fake_pyray.draw_calls = []
+
+  class FakeRectangle:
+    def __init__(self, x, y, width, height):
+      self.x = x
+      self.y = y
+      self.width = width
+      self.height = height
+
+  class FakeVector2:
+    def __init__(self, x, y):
+      self.x = x
+      self.y = y
+
+  def record_rounded(rect, *args):
+    fake_pyray.draw_calls.append(("rounded", rect, args))
+
+  fake_pyray.Rectangle = FakeRectangle
+  fake_pyray.Vector2 = FakeVector2
+  fake_pyray.fade = lambda color, _alpha: color
+  fake_pyray.draw_rectangle_rounded = record_rounded
+  fake_pyray.draw_rectangle_rounded_lines_ex = lambda *args: (
+    fake_pyray.draw_calls.append(("rounded_lines", args))
+  )
+  fake_pyray.draw_text_ex = lambda *args: (
+    fake_pyray.draw_calls.append(("text", args))
+  )
 
   fake_params = types.ModuleType("openpilot.common.params")
   fake_params.Params = object
@@ -758,13 +1218,13 @@ def _load_learning_widget_module():
     MEDIUM=1,
     NORMAL=2,
   )
-  fake_application.gui_app = types.SimpleNamespace()
+  fake_application.gui_app = types.SimpleNamespace(font=lambda _weight: object())
 
   fake_text_measure = types.ModuleType(
     "openpilot.system.ui.lib.text_measure",
   )
-  fake_text_measure.measure_text_cached = lambda *_args: (
-    types.SimpleNamespace(x=0.0, y=0.0)
+  fake_text_measure.measure_text_cached = lambda _font, text, size: (
+    types.SimpleNamespace(x=len(text) * size * 0.5, y=float(size))
   )
 
   fake_widgets = types.ModuleType("openpilot.system.ui.widgets")
@@ -818,12 +1278,16 @@ class TestLearningStatusSource(unittest.TestCase):
     cls.widget_module = _load_learning_widget_module()
 
   @staticmethod
-  def params_values(operation: dict | None = None) -> dict[str, object]:
+  def params_values(
+    operation: dict | None = None,
+    backfill_progress: dict | None = None,
+  ) -> dict[str, object]:
     return {
       "BLaTv2LearningStatus": learning_fixture(),
       "BLaTv2LearningOperationStatus": (
         operation_fixture("idle") if operation is None else operation
       ),
+      "BLaTv2BackfillProgress": backfill_progress,
       "BLaTv2LifecycleStatus": lifecycle_fixture(),
     }
 
@@ -873,6 +1337,145 @@ class TestLearningStatusSource(unittest.TestCase):
           )
           self.assertIs(color, self.widget_module._RED)
 
+  def test_optional_progress_failure_falls_back_without_poisoning_operation(
+    self,
+  ) -> None:
+    operation = operation_fixture("backfilling")
+    values = self.params_values(
+      operation,
+      backfill_progress=backfill_progress_fixture(),
+    )
+    for raw_progress in (
+      {"malformed": True},
+      backfill_progress_fixture(operation_sequence=operation["sequence"] + 1),
+    ):
+      values["BLaTv2BackfillProgress"] = raw_progress
+      source = self.source(_DashboardParams(values))
+      with patch.object(
+        self.widget_module.time,
+        "monotonic_ns",
+        return_value=NOW_MONO_NS,
+      ):
+        snapshot = source.snapshot
+      self.assertIsNotNone(snapshot.operation)
+      self.assertIsNone(snapshot.backfill_progress)
+      presentation = operation_presentation(
+        snapshot.operation,
+        error_code=snapshot.operation_error_code,
+        error_message=snapshot.operation_error,
+        has_learning_snapshot=True,
+        backfill_progress=snapshot.backfill_progress,
+      )
+      self.assertEqual(presentation.title, "PROCESSING PRIOR ROUTES")
+      self.assertIsNone(presentation.progress_fraction)
+
+  def test_source_exposes_only_progress_bound_to_the_current_operation(
+    self,
+  ) -> None:
+    operation = operation_fixture("backfilling")
+    progress = backfill_progress_fixture(
+      operation_sequence=operation["sequence"],
+    )
+    source = self.source(
+      _DashboardParams(self.params_values(operation, progress)),
+    )
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      snapshot = source.snapshot
+    self.assertIsNotNone(snapshot.backfill_progress)
+    self.assertEqual(snapshot.backfill_progress.operation_id, OPERATION_ID)
+
+  def test_rejected_operation_update_is_not_exposed_to_the_dashboard(
+    self,
+  ) -> None:
+    operation = operation_fixture("collecting")
+    params = _DashboardParams(self.params_values(operation))
+    source = self.source(params)
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      self.assertIsNotNone(source.snapshot.operation)
+      mutated = deepcopy(operation)
+      mutated["accepted_sample_count"] += 1
+      params.values["BLaTv2LearningOperationStatus"] = mutated
+      source._refresh()
+    self.assertIsNone(source._snapshot.operation)
+    self.assertEqual(source._snapshot.operation_error_code, "stale")
+
+  def test_transient_fallback_does_not_discard_the_validation_watermark(
+    self,
+  ) -> None:
+    operation = operation_fixture("backfilling")
+    progress = backfill_progress_fixture()
+    params = _DashboardParams(self.params_values(operation, progress))
+    source = self.source(params)
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      first = source.snapshot
+      self.assertIsNotNone(first.backfill_progress)
+
+      params.values["BLaTv2BackfillProgress"] = {"malformed": True}
+      source._refresh()
+      self.assertIsNone(source._snapshot.backfill_progress)
+      self.assertEqual(
+        source._last_backfill_progress.completed_work_units,
+        progress["completed_work_units"],
+      )
+
+      regressed = backfill_progress_fixture()
+      regressed["sequence"] = progress["sequence"] + 1
+      regressed["updated_mono_ns"] = progress["updated_mono_ns"] + 1
+      regressed["completed_work_units"] -= 1
+      params.values["BLaTv2BackfillProgress"] = regressed
+      source._refresh()
+      self.assertIsNone(source._snapshot.backfill_progress)
+      self.assertEqual(
+        source._snapshot.backfill_progress_error_code,
+        "stale",
+      )
+
+  def test_monotonic_epoch_is_sampled_after_each_companion_read(self) -> None:
+    events: list[str] = []
+    operation = operation_fixture("backfilling")
+    progress = backfill_progress_fixture()
+    params = _DashboardParams(self.params_values(operation, progress))
+    original_get = params.get
+
+    def recording_get(key: str, *, block: bool):
+      events.append(f"read:{key}")
+      return original_get(key, block=block)
+
+    def recording_clock() -> int:
+      events.append("clock")
+      return NOW_MONO_NS
+
+    params.get = recording_get
+    source = self.source(params)
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      side_effect=recording_clock,
+    ):
+      snapshot = source.snapshot
+    self.assertIsNotNone(snapshot.backfill_progress)
+    self.assertLess(
+      events.index("read:BLaTv2LearningOperationStatus"),
+      events.index("clock"),
+    )
+    first_clock = events.index("clock")
+    self.assertLess(
+      events.index("read:BLaTv2BackfillProgress"),
+      events.index("clock", first_clock + 1),
+    )
+
   def test_reader_refreshes_immediately_then_no_faster_than_two_seconds(
     self,
   ) -> None:
@@ -898,18 +1501,102 @@ class TestLearningStatusSource(unittest.TestCase):
     ):
       first = source.snapshot
       self.assertEqual(first.operation.state, "preparing")
-      self.assertEqual(len(params.calls), 3)
+      self.assertEqual(len(params.calls), 4)
 
       params.values["BLaTv2LearningOperationStatus"] = collecting
       cached = source.snapshot
       self.assertIs(cached, first)
       self.assertEqual(cached.operation.state, "preparing")
-      self.assertEqual(len(params.calls), 3)
+      self.assertEqual(len(params.calls), 4)
 
       refreshed = source.snapshot
       self.assertIsNot(refreshed, first)
       self.assertEqual(refreshed.operation.state, "collecting")
-      self.assertEqual(len(params.calls), 6)
+      self.assertEqual(len(params.calls), 8)
+
+
+class TestBackfillProgressRendering(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls) -> None:
+    cls.widget_module = _load_learning_widget_module()
+
+  def snapshot(self, *, has_learning: bool):
+    operation = parse_learning_operation_status(
+      operation_fixture("backfilling"),
+      expected_vehicle_identity=VEHICLE,
+      expected_runtime_identity_sha256=RUNTIME_HASH,
+      now_mono_ns=NOW_MONO_NS,
+    )
+    progress = parse_backfill_progress_status(
+      backfill_progress_fixture(),
+      operation_status=operation,
+      now_mono_ns=NOW_MONO_NS,
+    )
+    learning = (
+      parse_learning_status(
+        learning_fixture(),
+        expected_vehicle_identity=VEHICLE,
+      )
+      if has_learning
+      else None
+    )
+    return self.widget_module.DashboardSnapshot(
+      learning=learning,
+      learning_error_code=None if has_learning else "absent",
+      learning_error=None if has_learning else "not published",
+      operation=operation,
+      operation_error_code=None,
+      operation_error=None,
+      backfill_progress=progress,
+      backfill_progress_error_code=None,
+      backfill_progress_error=None,
+      lifecycle=None,
+      lifecycle_error_code="activation_absent",
+      lifecycle_error="not published",
+      metric=False,
+    )
+
+  def test_both_snapshot_pages_draw_the_same_determinate_track(self) -> None:
+    snapshot = self.snapshot(has_learning=True)
+    rectangle = self.widget_module.rl.Rectangle(0, 0, 1305, 855)
+    for page_class in (
+      self.widget_module.BLaTv2LearningOverviewWidget,
+      self.widget_module.BLaTv2ReadinessWidget,
+    ):
+      with self.subTest(page=page_class.__name__):
+        self.widget_module.rl.draw_calls.clear()
+        page = page_class(types.SimpleNamespace(snapshot=snapshot))
+        bottom = page._draw_operation_banner(rectangle, 72, snapshot)
+        tracks = [
+          call[1]
+          for call in self.widget_module.rl.draw_calls
+          if call[0] == "rounded" and call[1].height == 7
+        ]
+        self.assertEqual(len(tracks), 2)
+        self.assertAlmostEqual(
+          tracks[1].width / tracks[0].width,
+          snapshot.backfill_progress.progress_fraction,
+        )
+        self.assertGreater(bottom, 72 + 68)
+
+  def test_initial_no_snapshot_screen_draws_the_determinate_track(self) -> None:
+    snapshot = self.snapshot(has_learning=False)
+    rectangle = self.widget_module.rl.Rectangle(0, 0, 1305, 855)
+    self.widget_module.rl.draw_calls.clear()
+    page = self.widget_module.BLaTv2LearningOverviewWidget(
+      types.SimpleNamespace(snapshot=snapshot),
+    )
+    page._draw_unavailable(rectangle, snapshot)
+    tracks = [
+      call[1]
+      for call in self.widget_module.rl.draw_calls
+      if call[0] == "rounded" and call[1].height == 12
+    ]
+    self.assertEqual(len(tracks), 2)
+    self.assertAlmostEqual(
+      tracks[1].width / tracks[0].width,
+      snapshot.backfill_progress.progress_fraction,
+    )
 
 
 class TestLifecycleStatusParser(unittest.TestCase):
