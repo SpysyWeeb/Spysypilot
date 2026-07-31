@@ -3,6 +3,7 @@ import unittest
 
 import numpy as np
 from opendbc.car.interfaces import ACCEL_MAX
+from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
 
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   LEAD_T_IDXS_MODEL,
@@ -97,9 +98,10 @@ class TestModelLeadTrajectory(unittest.TestCase):
 
 class TestStrongCruiseEnvelope(unittest.TestCase):
   def test_low_speed_uses_but_never_exceeds_stock_platform_limit(self):
-    self.assertEqual(get_max_accel(0.0), ACCEL_MAX)
+    self.assertEqual(BLOTV2_ACCEL_MAX, min(ACCEL_MAX, 2.0))
+    self.assertEqual(get_max_accel(0.0), BLOTV2_ACCEL_MAX)
     speeds = np.linspace(0.0, 50.0, 101)
-    self.assertLessEqual(max(get_max_accel(speed) for speed in speeds), ACCEL_MAX)
+    self.assertLessEqual(max(get_max_accel(speed) for speed in speeds), BLOTV2_ACCEL_MAX)
 
   def test_schedule_tapers_to_stock_highway_value(self):
     self.assertAlmostEqual(get_max_accel(40.0), 0.6)

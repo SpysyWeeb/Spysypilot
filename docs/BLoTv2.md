@@ -211,9 +211,12 @@ at [0, 10, 25, 40] m/s
 The low-speed jerk schedule follows the same taper. Straight-line total
 acceleration allows `2.0 m/s²` at low speed.
 
-This reaches, but never exceeds, stock `ACCEL_MAX = 2.0 m/s²`. Unlike BLoT v1,
-BLoTv2 changes no opendbc submodule, panda submodule, platform safety constant,
-or CAN jerk limit. Strong braking remains available because Smooth Stops passes
+This reaches, but never exceeds, stock `ACCEL_MAX = 2.0 m/s²`. A local
+`BLOTV2_ACCEL_MAX = min(ACCEL_MAX, 2.0)` compatibility guard applies the same
+ceiling to cruise, experimental/e2e, and MPC bounds when BLoTv2 is integrated
+into a fork that still exposes BLoT v1's raised limit. Unlike BLoT v1, BLoTv2
+changes no opendbc submodule, panda submodule, platform safety constant, or CAN
+jerk limit. Strong braking remains available because Smooth Stops passes
 stronger plan braking through.
 
 Aggressive personality retains BLoT's `1.0 s` base follow setting; standard and

@@ -3,12 +3,13 @@ import math
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
-from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
+from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.blotv2 import (
+  BLOTV2_ACCEL_MAX,
   BLoTv2Supervisor,
   LeadDeparturePreRelease,
   model_predicted_acceleration,
@@ -48,7 +49,7 @@ def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle):
-  max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
+  max_accel = BLOTV2_ACCEL_MAX if e2e else get_max_accel(v_ego)
 
   if not e2e:
     a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
@@ -93,7 +94,7 @@ class LongitudinalPlanner:
     if len(sm['carControl'].orientationNED) == 3:
       accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
     else:
-      accel_coast = ACCEL_MAX
+      accel_coast = BLOTV2_ACCEL_MAX
 
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
@@ -117,7 +118,7 @@ class LongitudinalPlanner:
 
     if reset_state:
       self.v_desired_filter.x = v_ego
-      self.a_desired = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
+      self.a_desired = np.clip(sm['carState'].aEgo, ACCEL_MIN, BLOTV2_ACCEL_MAX)
       self.last_mpc_a_target = float(self.a_desired)
       self.blotv2.reset()
       self.lead_departure.reset()
@@ -195,7 +196,7 @@ class LongitudinalPlanner:
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
-    self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
+    self.output_a_target = np.clip(output_a_target, ACCEL_MIN, BLOTV2_ACCEL_MAX)
 
     self.a_desired = float(self.output_a_target)
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0

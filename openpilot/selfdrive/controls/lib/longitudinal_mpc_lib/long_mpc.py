@@ -3,9 +3,10 @@ import os
 import time
 import numpy as np
 from openpilot.cereal import log
-from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
+from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
@@ -371,7 +372,7 @@ class LongitudinalMpc:
     self.solver.set(N, "yref", self.yref[N][:COST_E_DIM])
 
     self.params[:,0] = ACCEL_MIN
-    self.params[:,1] = ACCEL_MAX
+    self.params[:,1] = BLOTV2_ACCEL_MAX
     self.params[:,2] = np.min(x_obstacles, axis=1)
     self.params[:,3] = np.copy(self.a_prev)
     self.params[:,4] = t_follow

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import math
 from typing import Any
 
+from opendbc.car.interfaces import ACCEL_MAX
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import (
   LeadObservation,
@@ -21,6 +22,10 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 # Shared necessity frame.
 D_MIN = 4.0
 MIN_GAP_BUDGET = 1.0
+
+# BLoTv2 deliberately keeps stock openpilot's longitudinal ceiling even when
+# integrated into a fork that still exposes a higher legacy BLoT limit.
+BLOTV2_ACCEL_MAX = min(ACCEL_MAX, 2.0)
 
 # Recovery and model-forecast response.
 MIN_BOOST_BRAKE = 0.8
