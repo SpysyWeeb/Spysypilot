@@ -102,25 +102,39 @@ learning process runs during the drive. After the route is closed,
 evidence only if both replays and all compatibility checks agree. It is the
 sole managed BLaTv2 process and the sole durable learning writer.
 
-**Two-worker backfill is in progress pending an on-device resource check.** The
-offroad importer runs its two already-required deterministic replay passes in
-separate forked processes with independent replay state. Each pass reads,
-decodes, joins, and learns the complete canonical route stream, so the
-CPU-heavy Python work—not only native decompression—can occupy two cores. The
-verification worker has no durable-writer authority; the parent alone compares
-both results, extends the ledger, and atomically publishes. No prepared data or
-mutable learner state is shared.
+**Four-worker backfill expansion is in progress pending its device resource
+check.** The offroad importer still has exactly two independent deterministic
+replay authorities: the parent and a verification process. Each authority now
+has one private route-preparation lane that may decode the next route while its
+owner applies the current route, so up to four Python lanes can use the four
+comma CPU cores without parallelizing the learner's causal route/frame state.
+Each helper writes one versioned, hash-bound, fixed-record scratch spool; it
+never sends a route-sized Python object over IPC, never shares prepared data
+with the other replay, and never receives durable-writer or Params authority.
+Only the parent compares the two results, extends the ledger, and atomically
+publishes. One prefetched route per authority bounds memory and scratch usage.
+While a prefetched route is being applied, its helper may already be writing
+the following route, so the hard scratch bound is two spools per authority:
+about 464 MiB total at the one-million-frame safety limit (ordinary routes are
+far smaller). Device validation measures the actual high-water mark.
 The existing progress UI is deliberately unchanged: it projects the primary
 pass, then moves to verification while the independently reconstructed pass
-finishes. Production remains fixed at two workers. A future four-worker step
-requires bounded route spooling plus device measurements of elapsed time,
-process-group peak memory, storage contention, thermals, responsiveness, and
-identical hashes; it is not enabled by this change.
+finishes; helper work is accounted in canonical route order and is not exposed
+as a third or fourth replay pass. Four lanes improve a multi-route backlog but
+cannot accelerate a single newly completed route because there is no next
+route to prepare. Worker counts 1 and 2 remain deterministic diagnostic modes;
+3 is rejected because it would make the A/A authorities asymmetric.
 On the 21-segment `000000b7--a6b3b1f175` reference route, the same desktop
 host completed the two passes in 17.594 s serially and 9.717 s with two
 workers (1.81x), with identical evidence, manifest, and ledger content. That
-is supporting evidence only; comma-device resource measurements remain the
-field gate.
+is supporting evidence only. The integrated native-extractor/A/A/publication
+benchmark over b7, b8, b9, and ca took a 33.754 s four-lane median versus a
+42.359 s two-lane median: 20.3% less wall time (1.25x throughput), with exact
+evidence, manifest, ledger, provenance, and generation hashes. Four lanes
+peaked at about 1.21 GiB process-tree PSS and 26.8 MiB scratch, then left no
+children or scratch behind. The comma device has no swap, so elapsed time,
+peak memory/scratch I/O, thermals, responsiveness, and identical published
+hashes remain the field gate; the task stays in progress until that check.
 
 Its separate display-only progress projection reports the current pass,
 route, segment, and whether the route is being read or applied. A cumulative

@@ -24,10 +24,12 @@ import re
 import select
 import shutil
 import signal
+import stat
 import statistics
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -43,6 +45,13 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_frame import (
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
   BackfillProgressPhase,
   BackfillProgressPublisher,
+)
+from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
+  PreparedRouteSpool,
+  PreparedRouteSpoolDescriptor,
+  SpoolFormatError,
+  open_prepared_route_spool,
+  write_prepared_route_spool,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
   LearningOperationState,
@@ -74,11 +83,15 @@ MAXIMUM_UNRESOLVED_FRACTION = 0.01
 EXTRACTOR_IO_TIMEOUT_S = 60.0
 EXTRACTOR_EXIT_TIMEOUT_S = 5.0
 MAXIMUM_CONTROL_GAP_NS = 15_000_000
-# Each worker owns one complete deterministic replay. Two workers therefore
-# use the two already-required A/A passes as the safe multicore boundary while
-# keeping every pass's route/frame learner chronology serial and unchanged.
-BACKFILL_REPLAY_WORKER_COUNT = 2
-MAXIMUM_BACKFILL_REPLAY_WORKERS = 2
+# Two workers are the independent A/A replay authorities. Four adds one
+# private, one-route-ahead preparation lane to each authority; application
+# remains serial within each pass and prepared data is never shared across it.
+BACKFILL_REPLAY_WORKER_COUNT = 4
+SUPPORTED_BACKFILL_REPLAY_WORKER_COUNTS = (1, 2, 4)
+BACKFILL_SPOOL_DIRECTORY_PREFIX = ".blatv2-backfill-prepare-"
+_BACKFILL_SPOOL_DIRECTORY_RE = re.compile(
+  rf"{re.escape(BACKFILL_SPOOL_DIRECTORY_PREFIX)}[12]-[a-z0-9_]{{8}}\Z",
+)
 REPLAY_WORKER_STARTUP_TIMEOUT_S = 1.0
 REPLAY_WORKER_COOPERATIVE_STOP_S = 0.75
 REPLAY_WORKER_SIGNAL_STOP_S = 0.5
@@ -1753,6 +1766,39 @@ class ExclusiveBackfillWriter(AbstractContextManager["ExclusiveBackfillWriter"])
     return int(self._stream.fileno())
 
 
+def cleanup_stale_prepared_route_spools(artifact_root: Path) -> None:
+  """Remove only abandoned four-lane scratch dirs under the writer lock."""
+  removed = False
+  try:
+    entries = tuple(artifact_root.iterdir())
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_reader_unavailable",
+      "prepared-route scratch inventory is unavailable",
+    ) from exc
+  for entry in entries:
+    if _BACKFILL_SPOOL_DIRECTORY_RE.fullmatch(entry.name) is None:
+      continue
+    try:
+      entry_stat = entry.lstat()
+      if not stat.S_ISDIR(entry_stat.st_mode) or entry.is_symlink():
+        raise BackfillError(
+          "backfill_spool_invalid",
+          "prepared-route scratch path has an unsafe type",
+        )
+      shutil.rmtree(entry)
+      removed = True
+    except BackfillError:
+      raise
+    except OSError as exc:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "abandoned prepared-route scratch cleanup failed",
+      ) from exc
+  if removed:
+    _fsync_directory(artifact_root)
+
+
 def _write_fsynced(path: Path, encoded: bytes) -> None:
   with path.open("xb") as stream:
     stream.write(encoded)
@@ -1955,7 +2001,10 @@ def replay_routes(
   *,
   runtime: PersistentLearningRuntime,
   routes: tuple[RouteCandidate, ...],
-  prepare: Callable[[RouteCandidate], PreparedRoute],
+  prepare: Callable[
+    [RouteCandidate],
+    PreparedRoute | PreparedRouteSpool,
+  ],
   abort_requested: Callable[[], bool] = lambda: False,
   route_completed: Callable[
     [RouteCandidate, int, int],
@@ -1967,6 +2016,7 @@ def replay_routes(
   accepted_total = 0
   rejected_total = 0
   for route in routes:
+    prepared: PreparedRoute | PreparedRouteSpool | None = None
     _abort_if_requested(
       abort_requested,
       "backfill aborted before replaying a route",
@@ -1987,48 +2037,68 @@ def replay_routes(
       if route_completed is not None:
         route_completed(route, accepted_total, rejected_total)
       continue
-    before_ingested = runtime.coordinator.ingested_sample_count
-    before_accepted = runtime.coordinator.accepted_sample_count
-    if route_applying is not None:
-      route_applying(route)
-    runtime.transition_onroad()
-    for frame_index, frame in enumerate(prepared.frames):
-      if frame_index % 256 == 0:
-        _abort_if_requested(
-          abort_requested,
-          "backfill aborted while replaying route frames",
-        )
-      runtime.ingest(frame)
-    _abort_if_requested(
-      abort_requested,
-      "backfill aborted after replaying route frames",
-    )
-    runtime.transition_offroad_without_persist()
-    ingested = (
-      runtime.coordinator.ingested_sample_count - before_ingested
-    )
-    accepted = (
-      runtime.coordinator.accepted_sample_count - before_accepted
-    )
-    rejected = (
-      ingested - accepted
-      + prepared.unresolved_witness_count
-      + prepared.gap_count
-    )
-    accepted_total += accepted
-    rejected_total += rejected
-    results.append(ReplayResult(
-      route=route,
-      disposition="ingested",
-      diagnostic="ingested",
-      provenance=prepared.provenance,
-      accepted_sample_count=accepted,
-      rejected_sample_count=rejected,
-      controls_witness_count=prepared.controls_witness_count,
-      unresolved_witness_count=prepared.unresolved_witness_count,
-    ))
-    if route_completed is not None:
-      route_completed(route, accepted_total, rejected_total)
+    try:
+      before_ingested = runtime.coordinator.ingested_sample_count
+      before_accepted = runtime.coordinator.accepted_sample_count
+      if route_applying is not None:
+        route_applying(route)
+      runtime.transition_onroad()
+      frames = (
+        prepared.frames
+        if isinstance(prepared, PreparedRoute)
+        else prepared.iter_frames()
+      )
+      for frame_index, frame in enumerate(frames):
+        if frame_index % 256 == 0:
+          _abort_if_requested(
+            abort_requested,
+            "backfill aborted while replaying route frames",
+          )
+        runtime.ingest(frame)
+      _abort_if_requested(
+        abort_requested,
+        "backfill aborted after replaying route frames",
+      )
+      runtime.transition_offroad_without_persist()
+      ingested = (
+        runtime.coordinator.ingested_sample_count - before_ingested
+      )
+      accepted = (
+        runtime.coordinator.accepted_sample_count - before_accepted
+      )
+      rejected = (
+        ingested - accepted
+        + prepared.unresolved_witness_count
+        + prepared.gap_count
+      )
+      accepted_total += accepted
+      rejected_total += rejected
+      results.append(ReplayResult(
+        route=route,
+        disposition="ingested",
+        diagnostic="ingested",
+        provenance=prepared.provenance,
+        accepted_sample_count=accepted,
+        rejected_sample_count=rejected,
+        controls_witness_count=prepared.controls_witness_count,
+        unresolved_witness_count=prepared.unresolved_witness_count,
+      ))
+      if route_completed is not None:
+        route_completed(route, accepted_total, rejected_total)
+    except SpoolFormatError as exc:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        f"prepared route spool is invalid: {exc}",
+      ) from exc
+    finally:
+      if isinstance(prepared, PreparedRouteSpool):
+        try:
+          prepared.cleanup()
+        except SpoolFormatError as exc:
+          raise BackfillError(
+            "backfill_spool_invalid",
+            f"prepared route spool cleanup failed: {exc}",
+          ) from exc
   return ReplayPass(
     finalization=runtime.coordinator.finalize(),
     results=tuple(results),
@@ -2056,16 +2126,23 @@ def verify_replay_passes(first: ReplayPass, second: ReplayPass) -> None:
     )
 
 
-def _forked_replay_entry(
+_FORK_CHILD_ONLY_IPC_FDS: tuple[int, ...] = ()
+
+
+def _forked_task_entry(
   connection: Any,
-  replay: Callable[[Callable[[], bool]], ReplayPass],
+  task: Callable[[Callable[[], bool]], object],
   cancel_requested: Any,
   start_requested: Any,
   transaction_abort_requested: Callable[[], bool],
   inherited_close_fds: tuple[int, ...],
   expected_parent_pid: int,
+  isolate_process_group: bool,
+  task_description: str,
 ) -> None:
-  """Run one complete verification replay in an isolated Linux worker."""
+  """Run one cancellable task without inheriting another worker's IPC."""
+
+  global _FORK_CHILD_ONLY_IPC_FDS
 
   def parent_lost() -> bool:
     return os.getppid() != expected_parent_pid
@@ -2080,19 +2157,39 @@ def _forked_replay_entry(
   try:
     for descriptor in inherited_close_fds:
       os.close(descriptor)
-    os.setsid()
-    connection.send(("ready", os.getpid()))
+    # These descriptors belonged to an enclosing worker in the address space
+    # from which this process was forked. They are closed here and must not be
+    # carried into a still-deeper fork after their descriptor numbers can be
+    # reused. Only this worker's own result channel is registered below.
+    _FORK_CHILD_ONLY_IPC_FDS = ()
+    if isolate_process_group:
+      os.setsid()
+    connection.send((
+      "ready",
+      os.getpid(),
+      os.getsid(0),
+      os.getpgrp(),
+    ))
     # Do not spawn the native extractor until the parent knows this PID owns
-    # the worker process group. That closes the startup cancellation race in
+    # the intended process group. This closes the startup cancellation race in
     # which only the Python worker, but not a new grandchild, could be killed.
     while not start_requested.wait(timeout=0.05):
       if worker_abort_requested():
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker aborted before startup acknowledgement",
+          f"{task_description} worker aborted before startup acknowledgement",
         )
-    result = replay(worker_abort_requested)
-    connection.send(("ok", result))
+    if worker_abort_requested():
+      raise BackfillError(
+        "unexpected_error",
+        f"{task_description} worker aborted at startup acknowledgement",
+      )
+    _FORK_CHILD_ONLY_IPC_FDS = (connection.fileno(),)
+    try:
+      result = task(worker_abort_requested)
+      connection.send(("ok", result))
+    finally:
+      _FORK_CHILD_ONLY_IPC_FDS = ()
   except BackfillError as exc:
     connection.send(("backfill_error", exc.diagnostic, str(exc)))
   except BaseException as exc:
@@ -2105,41 +2202,90 @@ def _forked_replay_entry(
     connection.close()
 
 
-class _ForkedReplayWorker:
-  """One cancellable pass worker; no writer or progress authority."""
+def _forked_replay_entry(
+  connection: Any,
+  replay: Callable[[Callable[[], bool]], ReplayPass],
+  cancel_requested: Any,
+  start_requested: Any,
+  transaction_abort_requested: Callable[[], bool],
+  inherited_close_fds: tuple[int, ...],
+  expected_parent_pid: int,
+) -> None:
+  """Backward-compatible entry point for one isolated replay pass."""
+
+  _forked_task_entry(
+    connection,
+    replay,
+    cancel_requested,
+    start_requested,
+    transaction_abort_requested,
+    inherited_close_fds,
+    expected_parent_pid,
+    True,
+    "verification replay",
+  )
+
+
+class _ForkedTaskWorker:
+  """One cancellable fork task with explicit process-group ownership."""
 
   def __init__(
     self,
     *,
-    replay: Callable[[Callable[[], bool]], ReplayPass],
+    task: Callable[[Callable[[], bool]], object],
+    expected_result_type: type[Any],
     abort_requested: Callable[[], bool],
     inherited_close_fds: tuple[int, ...] = (),
+    isolate_process_group: bool = True,
+    process_name: str = "blatv2-task-worker",
+    task_description: str = "background task",
   ) -> None:
+    current_process = multiprocessing.current_process()
+    if current_process.daemon:
+      raise BackfillError(
+        "unexpected_error",
+        f"{task_description} worker cannot fork from a daemon process",
+      )
+    if threading.active_count() != 1:
+      raise BackfillError(
+        "unexpected_error",
+        f"{task_description} worker cannot fork from a multithreaded process",
+      )
+    if not isinstance(expected_result_type, type):
+      raise TypeError("expected_result_type must be a type")
     try:
       context = multiprocessing.get_context("fork")
     except ValueError as exc:
       raise BackfillError(
         "backfill_reader_unavailable",
-        "two-worker replay requires the Linux fork process context",
+        f"{task_description} requires the Linux fork process context",
       ) from exc
     receive = None
     send = None
+    close_fds = tuple(dict.fromkeys((
+      *(int(descriptor) for descriptor in inherited_close_fds),
+      *_FORK_CHILD_ONLY_IPC_FDS,
+    )))
+    expected_session_id = os.getsid(0)
+    expected_process_group_id = os.getpgrp()
     try:
       receive, send = context.Pipe(duplex=False)
       cancel_requested = context.Event()
       start_requested = context.Event()
       process = context.Process(
-        target=_forked_replay_entry,
+        target=_forked_task_entry,
         args=(
           send,
-          replay,
+          task,
           cancel_requested,
           start_requested,
           abort_requested,
-          tuple(int(descriptor) for descriptor in inherited_close_fds),
+          close_fds,
           os.getpid(),
+          isolate_process_group,
+          task_description,
         ),
-        name="blatv2-replay-2",
+        name=process_name,
       )
     except BaseException as exc:
       if receive is not None:
@@ -2148,12 +2294,17 @@ class _ForkedReplayWorker:
         send.close()
       raise BackfillError(
         "unexpected_error",
-        "verification replay worker resources could not be created",
+        f"{task_description} worker resources could not be created",
       ) from exc
     self._receive = receive
     self._cancel_requested = cancel_requested
     self._start_requested = start_requested
     self._abort_requested = abort_requested
+    self._expected_result_type = expected_result_type
+    self._expected_session_id = expected_session_id
+    self._expected_process_group_id = expected_process_group_id
+    self._isolate_process_group = isolate_process_group
+    self._task_description = task_description
     self._closed = False
     self._started = False
     self._group_ready = False
@@ -2166,36 +2317,52 @@ class _ForkedReplayWorker:
       while not self._receive.poll(0.1):
         _abort_if_requested(
           self._abort_requested,
-          "backfill aborted while starting verification replay",
+          f"backfill aborted while starting {self._task_description}",
         )
         if not self._process.is_alive():
           raise BackfillError(
             "unexpected_error",
-            "verification replay worker exited during startup",
+            f"{self._task_description} worker exited during startup",
           )
         if time.monotonic() >= deadline:
           raise BackfillError(
             "unexpected_error",
-            "verification replay worker startup timed out",
+            f"{self._task_description} worker startup timed out",
           )
       try:
         ready = self._receive.recv()
       except (EOFError, OSError) as exc:
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker startup channel failed",
+          f"{self._task_description} worker startup channel failed",
         ) from exc
       if (
         type(ready) is not tuple
-        or len(ready) != 2
+        or len(ready) != 4
         or ready[0] != "ready"
         or ready[1] != self._process.pid
+        or type(ready[2]) is not int
+        or type(ready[3]) is not int
       ):
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker did not establish isolation",
+          f"{self._task_description} worker returned an invalid startup identity",
         )
-      self._group_ready = True
+      expected_isolation = (
+        ready[2] == self._process.pid
+        and ready[3] == self._process.pid
+        if self._isolate_process_group
+        else (
+          ready[2] == self._expected_session_id
+          and ready[3] == self._expected_process_group_id
+        )
+      )
+      if not expected_isolation:
+        raise BackfillError(
+          "unexpected_error",
+          f"{self._task_description} worker did not establish its expected process-group isolation",
+        )
+      self._group_ready = self._isolate_process_group
       self._start_requested.set()
     except BaseException as exc:
       try:
@@ -2209,7 +2376,7 @@ class _ForkedReplayWorker:
         self._closed = True
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker failed startup cleanup",
+          f"{self._task_description} worker failed startup cleanup",
         ) from cleanup_exc
       self._receive.close()
       self._closed = True
@@ -2217,13 +2384,13 @@ class _ForkedReplayWorker:
         raise
       raise BackfillError(
         "unexpected_error",
-        "verification replay worker could not start",
+        f"{self._task_description} worker could not start",
       ) from exc
 
-  def _signal_process_group(self, signal_number: int) -> None:
+  def _signal_worker(self, signal_number: int) -> None:
     if not self._started:
       return
-    if self._group_ready:
+    if self._isolate_process_group and self._group_ready:
       try:
         os.killpg(self._process.pid, signal_number)
       except ProcessLookupError:
@@ -2241,16 +2408,17 @@ class _ForkedReplayWorker:
     if not self._started:
       return
     self._process.join(timeout=REPLAY_WORKER_COOPERATIVE_STOP_S)
-    # Signal the complete session even when the replay worker has already
-    # died: a force-killed worker must not leave its native extractor behind.
-    self._signal_process_group(signal.SIGTERM)
+    # Isolated workers own the whole process group, including their native
+    # extractor. A nested worker inherits its parent's group and must signal
+    # only its own Python process; killing that group would kill its parent.
+    self._signal_worker(signal.SIGTERM)
     self._process.join(timeout=REPLAY_WORKER_SIGNAL_STOP_S)
-    self._signal_process_group(signal.SIGKILL)
+    self._signal_worker(signal.SIGKILL)
     self._process.join(timeout=REPLAY_WORKER_SIGNAL_STOP_S)
     if self._process.is_alive():
       raise BackfillError(
         "unexpected_error",
-        "verification replay worker could not be reaped",
+        f"{self._task_description} worker could not be reaped",
       )
 
   def cancel(self) -> None:
@@ -2260,37 +2428,39 @@ class _ForkedReplayWorker:
     self._receive.close()
     self._closed = True
 
-  def result(self) -> ReplayPass:
+  def result(self) -> object:
     if self._closed:
-      raise RuntimeError("replay worker result was already consumed")
+      raise RuntimeError(
+        f"{self._task_description} worker result was already consumed",
+      )
     try:
       while not self._receive.poll(0.1):
         _abort_if_requested(
           self._abort_requested,
-          "backfill aborted while waiting for verification replay",
+          f"backfill aborted while waiting for {self._task_description}",
         )
         if not self._process.is_alive():
           raise BackfillError(
             "unexpected_error",
-            "verification replay worker exited without a result",
+            f"{self._task_description} worker exited without a result",
           )
       try:
         payload = self._receive.recv()
       except (EOFError, OSError) as exc:
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker result channel failed",
+          f"{self._task_description} worker result channel failed",
         ) from exc
       self._process.join(timeout=REPLAY_WORKER_SIGNAL_STOP_S)
       if self._process.is_alive():
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker did not exit after its result",
+          f"{self._task_description} worker did not exit after its result",
         )
       if self._process.exitcode != 0:
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker exited abnormally",
+          f"{self._task_description} worker exited abnormally",
         )
       if (
         type(payload) is not tuple
@@ -2299,14 +2469,14 @@ class _ForkedReplayWorker:
       ):
         raise BackfillError(
           "unexpected_error",
-          "verification replay worker returned a malformed result",
+          f"{self._task_description} worker returned a malformed result",
         )
       if payload[0] == "ok" and len(payload) == 2:
         result = payload[1]
-        if not isinstance(result, ReplayPass):
+        if not isinstance(result, self._expected_result_type):
           raise BackfillError(
             "unexpected_error",
-            "verification replay worker result has the wrong type",
+            f"{self._task_description} worker result has the wrong type",
           )
         return result
       if (
@@ -2324,11 +2494,11 @@ class _ForkedReplayWorker:
       ):
         raise BackfillError(
           "unexpected_error",
-          f"verification replay worker failed: {payload[1]}: {payload[2]}",
+          f"{self._task_description} worker failed: {payload[1]}: {payload[2]}",
         )
       raise BackfillError(
         "unexpected_error",
-        "verification replay worker returned an unknown result",
+        f"{self._task_description} worker returned an unknown result",
       )
     except BaseException:
       self._stop()
@@ -2336,6 +2506,336 @@ class _ForkedReplayWorker:
     finally:
       self._receive.close()
       self._closed = True
+
+
+class _ForkedReplayWorker(_ForkedTaskWorker):
+  """Backward-compatible isolated verification replay worker."""
+
+  def __init__(
+    self,
+    *,
+    replay: Callable[[Callable[[], bool]], ReplayPass],
+    abort_requested: Callable[[], bool],
+    inherited_close_fds: tuple[int, ...] = (),
+  ) -> None:
+    super().__init__(
+      task=replay,
+      expected_result_type=ReplayPass,
+      abort_requested=abort_requested,
+      inherited_close_fds=inherited_close_fds,
+      isolate_process_group=True,
+      process_name="blatv2-replay-2",
+      task_description="verification replay",
+    )
+
+  def result(self) -> ReplayPass:
+    result = super().result()
+    if not isinstance(result, ReplayPass):
+      raise AssertionError("generic replay worker type check was bypassed")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class _RoutePreparationOutcome:
+  """Small IPC result for one independently prepared route."""
+
+  route_name: str
+  descriptor: PreparedRouteSpoolDescriptor | None
+  rejection_reason: str | None
+  rejection_message: str | None
+
+
+def _prepare_route_to_spool(
+  *,
+  route: RouteCandidate,
+  prepare: Callable[
+    [RouteCandidate, Callable[[], bool]],
+    PreparedRoute,
+  ],
+  spool_directory: Path,
+  abort_requested: Callable[[], bool],
+) -> _RoutePreparationOutcome:
+  """Prepare one route completely and expose only its bounded descriptor."""
+  try:
+    prepared = prepare(route, abort_requested)
+  except RouteRejected as exc:
+    return _RoutePreparationOutcome(
+      route_name=route.route_name,
+      descriptor=None,
+      rejection_reason=exc.reason,
+      rejection_message=str(exc),
+    )
+  try:
+    descriptor = write_prepared_route_spool(
+      spool_directory,
+      route.route_name,
+      prepared.frames,
+      controls_witness_count=prepared.controls_witness_count,
+      unresolved_witness_count=prepared.unresolved_witness_count,
+      gap_count=prepared.gap_count,
+      provenance=prepared.provenance,
+      max_frames=MAXIMUM_ROUTE_FRAMES,
+      abort_requested=abort_requested,
+    )
+  except SpoolFormatError as exc:
+    if abort_requested():
+      raise BackfillError(
+        "unexpected_error",
+        "backfill aborted while writing a prepared route spool",
+      ) from exc
+    raise BackfillError(
+      "backfill_spool_invalid",
+      f"prepared route spool could not be encoded: {exc}",
+    ) from exc
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_reader_unavailable",
+      "prepared route spool could not be written",
+    ) from exc
+  return _RoutePreparationOutcome(
+    route_name=route.route_name,
+    descriptor=descriptor,
+    rejection_reason=None,
+    rejection_message=None,
+  )
+
+
+class _PrefetchingRoutePreparer:
+  """One-route-ahead private preparation lane for one replay authority.
+
+  The first route is prepared by the authority itself. While that route is
+  applied, one helper prepares the next route into a fixed-record scratch
+  spool. No prepared bytes cross authorities and application order remains
+  canonical. A single-route operation starts no helper at all.
+  """
+
+  def __init__(
+    self,
+    *,
+    authority_index: int,
+    routes: tuple[RouteCandidate, ...],
+    local_prepare: Callable[[RouteCandidate], PreparedRoute],
+    helper_prepare: Callable[
+      [RouteCandidate, Callable[[], bool]],
+      PreparedRoute,
+    ],
+    scratch_parent: Path,
+    abort_requested: Callable[[], bool],
+    helper_transaction_abort_requested: Callable[[], bool] | None = None,
+    inherited_close_fds: tuple[int, ...] = (),
+    prefetched_route_ready: Callable[[RouteCandidate], None] | None = None,
+  ) -> None:
+    if authority_index not in (1, 2):
+      raise ValueError("preparation authority index must be one or two")
+    self.authority_index = authority_index
+    self._routes = routes
+    self._local_prepare = local_prepare
+    self._helper_prepare = helper_prepare
+    self._scratch_parent = scratch_parent
+    self._abort_requested = abort_requested
+    self._helper_transaction_abort_requested = (
+      abort_requested
+      if helper_transaction_abort_requested is None
+      else helper_transaction_abort_requested
+    )
+    self._inherited_close_fds = inherited_close_fds
+    self._prefetched_route_ready = prefetched_route_ready
+    self._position = 0
+    self._pending_route: RouteCandidate | None = None
+    self._pending_worker: _ForkedTaskWorker | None = None
+    self._scratch_directory: Path | None = None
+    self._closed = False
+
+  def _ensure_scratch_directory(self) -> Path:
+    if self._scratch_directory is None:
+      try:
+        self._scratch_directory = Path(tempfile.mkdtemp(
+          dir=self._scratch_parent,
+          prefix=(
+            f"{BACKFILL_SPOOL_DIRECTORY_PREFIX}{self.authority_index}-"
+          ),
+        ))
+      except OSError as exc:
+        raise BackfillError(
+          "backfill_reader_unavailable",
+          "private prepared-route scratch directory is unavailable",
+        ) from exc
+    return self._scratch_directory
+
+  def _start_helper(self, route: RouteCandidate) -> None:
+    if self._pending_worker is not None or self._pending_route is not None:
+      raise RuntimeError("prepared-route helper already owns a route")
+    spool_directory = self._ensure_scratch_directory()
+    prepare = self._helper_prepare
+
+    def task(
+      worker_abort_requested: Callable[[], bool],
+    ) -> _RoutePreparationOutcome:
+      return _prepare_route_to_spool(
+        route=route,
+        prepare=prepare,
+        spool_directory=spool_directory,
+        abort_requested=worker_abort_requested,
+      )
+
+    # Authority 1's helper owns an isolated group so parent cancellation also
+    # kills its native extractor. Authority 2's helper stays in the isolated
+    # verification group; the root worker's killpg then reaps both together.
+    self._pending_worker = _ForkedTaskWorker(
+      task=task,
+      expected_result_type=_RoutePreparationOutcome,
+      abort_requested=self._helper_transaction_abort_requested,
+      inherited_close_fds=self._inherited_close_fds,
+      isolate_process_group=self.authority_index == 1,
+      process_name=f"blatv2-prepare-{self.authority_index}",
+      task_description=(
+        f"replay authority {self.authority_index} route preparation"
+      ),
+    )
+    self._pending_route = route
+
+  def _receive_prefetched(
+    self,
+    route: RouteCandidate,
+  ) -> PreparedRouteSpool:
+    worker = self._pending_worker
+    if worker is None or self._pending_route != route:
+      raise RuntimeError("prepared-route helper result is out of order")
+    try:
+      outcome = worker.result()
+    finally:
+      self._pending_worker = None
+      self._pending_route = None
+    if not isinstance(outcome, _RoutePreparationOutcome):
+      raise AssertionError("generic preparation worker type check was bypassed")
+    if outcome.route_name != route.route_name:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared route helper returned a different route",
+      )
+    if self._prefetched_route_ready is not None:
+      self._prefetched_route_ready(route)
+    if outcome.rejection_reason is not None:
+      if (
+        outcome.descriptor is not None
+        or outcome.rejection_message is None
+      ):
+        raise BackfillError(
+          "backfill_spool_invalid",
+          "prepared route rejection result is malformed",
+        )
+      raise RouteRejected(
+        outcome.rejection_reason,
+        outcome.rejection_message,
+      )
+    if (
+      outcome.descriptor is None
+      or outcome.rejection_message is not None
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared route success result is malformed",
+      )
+    try:
+      return open_prepared_route_spool(
+        self._ensure_scratch_directory(),
+        outcome.descriptor,
+        expected_route_name=route.route_name,
+        max_frames=MAXIMUM_ROUTE_FRAMES,
+      )
+    except SpoolFormatError as exc:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        f"prepared route helper result is invalid: {exc}",
+      ) from exc
+
+  def __call__(
+    self,
+    route: RouteCandidate,
+  ) -> PreparedRoute | PreparedRouteSpool:
+    if self._closed:
+      raise RuntimeError("prepared-route helper lane is closed")
+    if (
+      self._position >= len(self._routes)
+      or self._routes[self._position] != route
+    ):
+      raise RuntimeError("prepared-route helper call is out of order")
+
+    # Fill the pipeline before the first route's local read. This is the only
+    # point where both preparation lanes can overlap immediately; subsequent
+    # calls already have their one-route-ahead helper in flight.
+    if (
+      self._position == 0
+      and len(self._routes) > 1
+      and self._pending_worker is None
+    ):
+      self._start_helper(self._routes[1])
+
+    rejection: RouteRejected | None = None
+    prepared: PreparedRoute | PreparedRouteSpool | None = None
+    if self._pending_route != route:
+      try:
+        prepared = self._local_prepare(route)
+      except RouteRejected as exc:
+        rejection = exc
+    else:
+      try:
+        prepared = self._receive_prefetched(route)
+      except RouteRejected as exc:
+        rejection = exc
+
+    self._position += 1
+    if (
+      self._position < len(self._routes)
+      and self._pending_worker is None
+    ):
+      try:
+        self._start_helper(self._routes[self._position])
+      except BaseException:
+        if isinstance(prepared, PreparedRouteSpool):
+          prepared.cleanup()
+        raise
+
+    if rejection is not None:
+      raise rejection
+    if prepared is None:
+      raise AssertionError("route preparation produced no result")
+    return prepared
+
+  def close(self) -> None:
+    if self._closed:
+      return
+    worker = self._pending_worker
+    self._pending_worker = None
+    self._pending_route = None
+    cleanup_error: BaseException | None = None
+    try:
+      if worker is not None:
+        worker.cancel()
+    except BaseException as exc:
+      cleanup_error = exc
+    try:
+      if (
+        self._scratch_directory is not None
+        and self._scratch_directory.exists()
+      ):
+        shutil.rmtree(self._scratch_directory)
+    except OSError as exc:
+      if cleanup_error is None:
+        cleanup_error = BackfillError(
+          "backfill_spool_invalid",
+          "prepared route scratch cleanup failed",
+        )
+        cleanup_error.__cause__ = exc
+    self._closed = True
+    if cleanup_error is not None:
+      raise cleanup_error
+
+  def __enter__(self) -> _PrefetchingRoutePreparer:
+    return self
+
+  def __exit__(self, *exc_info: object) -> None:
+    self.close()
 
 
 def ledger_routes(
@@ -2590,6 +3090,40 @@ class _BackfillProgressTracker:
     )
     self._publish(BackfillProgressPhase.APPLYING_ROUTE, coordinate=True)
 
+  def route_prepared(
+    self,
+    *,
+    pass_index: int,
+    route: RouteCandidate,
+  ) -> None:
+    """Account for a private helper's completed canonical route read.
+
+    Helpers deliberately have no Params/progress authority. The parent calls
+    this immediately before applying the returned spool so the existing
+    two-pass projection remains ordered and monotonic without exposing helper
+    scheduling in the UI or changing the progress schema.
+    """
+    if pass_index not in (1, 2) or self._active_kind is not None:
+      raise RuntimeError("backfill prepared-route progress is incoherent")
+    route_bytes = sum(segment.size_bytes for segment in route.segments)
+    pass_byte_base = (pass_index - 1) * self.source_bytes_per_pass
+    route_byte_end = self.route_byte_prefixes[route.route_name] + route_bytes
+    pass_segment_base = (pass_index - 1) * self.segments_per_pass
+    route_segment_end = (
+      self.route_segment_prefixes[route.route_name] + len(route.segments)
+    )
+    self._completed_read_units = max(
+      self._completed_read_units,
+      pass_byte_base + route_byte_end,
+    )
+    self._completed_segments = max(
+      self._completed_segments,
+      pass_segment_base + route_segment_end,
+    )
+    self._pass_index = pass_index
+    self._route = route
+    self._segment_index = len(route.segments)
+
   def route_completed(
     self,
     *,
@@ -2726,8 +3260,7 @@ class HistoricalLearningBackfill:
     self._pending_route_quiescence_observed = False
     if (
       type(replay_worker_count) is not int
-      or replay_worker_count < 1
-      or replay_worker_count > MAXIMUM_BACKFILL_REPLAY_WORKERS
+      or replay_worker_count not in SUPPORTED_BACKFILL_REPLAY_WORKER_COUNTS
     ):
       raise ValueError("backfill replay worker count is outside its bound")
     self.replay_worker_count = replay_worker_count
@@ -2863,6 +3396,7 @@ class HistoricalLearningBackfill:
       runtime_identity = (
         initial_runtime.runtime_bundle.calibration_identity_sha256
       )
+      cleanup_stale_prepared_route_spools(artifact_paths.root)
       ledger = load_ledger(
         artifact_paths,
         runtime_identity_sha256=runtime_identity,
@@ -3042,18 +3576,62 @@ class HistoricalLearningBackfill:
             lambda: progress.route_completed(pass_index=1, route=route),
           )
 
+      def first_prefetched_route_ready(route: RouteCandidate) -> None:
+        self._publish(
+          initial_runtime,
+          state=LearningOperationState.BACKFILLING,
+          diagnostic="replaying_route",
+          current_route_identity=route.display_identity,
+          current_route_index=route_indexes[route.route_name],
+          total_route_count=len(replay_candidates),
+          accepted_sample_count=first_progress_accepted,
+          rejected_sample_count=first_progress_rejected,
+        )
+        if progress is not None:
+          project_progress(
+            lambda: progress.route_prepared(
+              pass_index=1,
+              route=route,
+            ),
+          )
+
       def parallel_verification_replay(
         worker_abort_requested: Callable[[], bool],
       ) -> ReplayPass:
         worker_runtime = self.runtime_factory()
-        return replay_routes(
-          runtime=worker_runtime,
-          routes=replay_candidates,
-          prepare=lambda route: self._prepare(
+        def verification_prepare(route: RouteCandidate) -> PreparedRoute:
+          return self._prepare(
             worker_runtime,
             route,
             abort_requested=worker_abort_requested,
-          ),
+          )
+
+        if self.replay_worker_count == 4:
+          with _PrefetchingRoutePreparer(
+            authority_index=2,
+            routes=replay_candidates,
+            local_prepare=verification_prepare,
+            helper_prepare=(
+              lambda route, helper_abort_requested: self._prepare(
+                worker_runtime,
+                route,
+                abort_requested=helper_abort_requested,
+              )
+            ),
+            scratch_parent=artifact_paths.root,
+            abort_requested=worker_abort_requested,
+            helper_transaction_abort_requested=self.abort_requested,
+          ) as verification_preparer:
+            return replay_routes(
+              runtime=worker_runtime,
+              routes=replay_candidates,
+              prepare=verification_preparer,
+              abort_requested=worker_abort_requested,
+            )
+        return replay_routes(
+          runtime=worker_runtime,
+          routes=replay_candidates,
+          prepare=verification_prepare,
           abort_requested=worker_abort_requested,
         )
 
@@ -3070,23 +3648,50 @@ class HistoricalLearningBackfill:
         )
       )
       try:
-        first = replay_routes(
-          runtime=first_runtime,
-          routes=replay_candidates,
-          prepare=first_prepare,
-          abort_requested=self.abort_requested,
-          route_completed=first_route_completed,
-          route_applying=(
-            None
-            if progress is None
-            else lambda route: project_progress(
-              lambda: progress.route_applying(
-                pass_index=1,
-                route=route,
-              ),
-            )
-          ),
+        first_route_applying = (
+          None
+          if progress is None
+          else lambda route: project_progress(
+            lambda: progress.route_applying(
+              pass_index=1,
+              route=route,
+            ),
+          )
         )
+        if self.replay_worker_count == 4:
+          with _PrefetchingRoutePreparer(
+            authority_index=1,
+            routes=replay_candidates,
+            local_prepare=first_prepare,
+            helper_prepare=(
+              lambda route, helper_abort_requested: self._prepare(
+                first_runtime,
+                route,
+                abort_requested=helper_abort_requested,
+              )
+            ),
+            scratch_parent=artifact_paths.root,
+            abort_requested=self.abort_requested,
+            inherited_close_fds=(writer.fileno,),
+            prefetched_route_ready=first_prefetched_route_ready,
+          ) as first_preparer:
+            first = replay_routes(
+              runtime=first_runtime,
+              routes=replay_candidates,
+              prepare=first_preparer,
+              abort_requested=self.abort_requested,
+              route_completed=first_route_completed,
+              route_applying=first_route_applying,
+            )
+        else:
+          first = replay_routes(
+            runtime=first_runtime,
+            routes=replay_candidates,
+            prepare=first_prepare,
+            abort_requested=self.abort_requested,
+            route_completed=first_route_completed,
+            route_applying=first_route_applying,
+          )
       except BaseException:
         if verification_worker is not None:
           verification_worker.cancel()
