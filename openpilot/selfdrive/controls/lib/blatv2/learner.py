@@ -16,7 +16,10 @@ using deterministic scalar normal equations. Static friction, transport
 delay, and measured rack-rate resolution remain exactly the seed values.
 Moving friction is independently fit from already-moving samples. A candidate
 must improve or match the complete seed model on held-out chronological
-blocks.
+blocks. Driver-free limiter boundaries are retained separately: slew
+transients are authority observations, while settled full-magnitude motion may
+join the fit only after the seed transport delay and with resolved rack motion.
+Free and authority validation are checked independently.
 
 Readiness thresholds below describe data coverage and matrix validity, not
 steering feel. Learning never changes the live profile and promotion remains a
@@ -25,8 +28,8 @@ separate engagement-boundary operation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-from enum import StrEnum
+from dataclasses import dataclass, field, fields, replace
+from enum import IntFlag, StrEnum
 import hashlib
 import hmac
 import json
@@ -55,6 +58,8 @@ HIGH_SPEED_MIN_CLEAN_SUPPORT_S = 420.0
 # not a controller or feel parameter.
 TRAIN_VALIDATION_BLOCK_SAMPLES = 128
 MIN_VALIDATION_SUPPORT_FRACTION = 0.20
+MIN_AUTHORITY_TRAINING_SAMPLES = 4
+MIN_AUTHORITY_VALIDATION_SAMPLES = 4
 
 # A sample gap longer than ten 100 Hz frames is not continuous evidence and
 # cannot be allowed to manufacture minutes of support.
@@ -77,7 +82,7 @@ VALIDATION_RMS_ABSOLUTE_TOLERANCE = 1e-12
 
 # Evidence is not a learned profile. This independent schema identifies the
 # exact sufficient statistics needed to continue fitting across drives.
-LEARNING_EVIDENCE_SCHEMA_VERSION = 2
+LEARNING_EVIDENCE_SCHEMA_VERSION = 3
 
 _EMPTY_POSITIVE_SENTINEL = {"empty": "positive_infinity"}
 _EMPTY_NEGATIVE_SENTINEL = {"empty": "negative_infinity"}
@@ -91,6 +96,25 @@ class QualificationReason(StrEnum):
   SINGULAR_FIT = "singular_fit"
   INVALID_PARAMETERS = "invalid_parameters"
   VALIDATION_REGRESSION = "validation_regression"
+  AUTHORITY_VALIDATION_REGRESSION = "authority_validation_regression"
+
+
+class ActuatorBoundary(IntFlag):
+  """Measured vehicle-owned torque-envelope boundary classification."""
+
+  NONE = 0
+  MAGNITUDE = 1
+  SLEW_BUILD = 2
+  SLEW_RELEASE = 4
+  DRIVER = 8
+
+
+_KNOWN_ACTUATOR_BOUNDARIES = (
+  ActuatorBoundary.MAGNITUDE
+  | ActuatorBoundary.SLEW_BUILD
+  | ActuatorBoundary.SLEW_RELEASE
+  | ActuatorBoundary.DRIVER
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,9 +132,20 @@ class LearningSample:
   steering_pressed: bool
   actuator_constrained: bool
   standstill: bool
+  actuator_boundary: ActuatorBoundary = field(
+    default=ActuatorBoundary.NONE,
+    init=False,
+  )
+  magnitude_boundary_dwell_s: float = field(default=0.0, init=False)
+  _authority_attested: bool = field(
+    default=False,
+    init=False,
+    repr=False,
+    compare=False,
+  )
 
   @property
-  def clean(self) -> bool:
+  def _base_valid(self) -> bool:
     numeric_values = (
       self.speed_mps,
       self.dt_s,
@@ -118,18 +153,96 @@ class LearningSample:
       self.measured_lateral_accel_mps2,
       self.rack_rate_deg_s,
       self.rack_acceleration_deg_s2,
+      self.magnitude_boundary_dwell_s,
     )
     return (
       all(math.isfinite(value) for value in numeric_values)
       and self.speed_mps >= 0.0
       and 0.0 < self.dt_s <= MAX_CLEAN_SAMPLE_DT_S
       and abs(self.applied_torque) <= MAX_NORMALIZED_TORQUE
+      and self.magnitude_boundary_dwell_s >= 0.0
       and self.engaged
       and self.valid
       and not self.steering_pressed
-      and not self.actuator_constrained
       and not self.standstill
+      and not (
+        int(self.actuator_boundary)
+        & ~int(_KNOWN_ACTUATOR_BOUNDARIES)
+      )
+      and (
+        not bool(self.actuator_boundary & ActuatorBoundary.MAGNITUDE)
+        or abs(abs(self.applied_torque) - 1.0) <= 1e-6
+      )
+      and (
+        bool(self.actuator_boundary & ActuatorBoundary.MAGNITUDE)
+        or self.magnitude_boundary_dwell_s == 0.0
+      )
     )
+
+  @property
+  def clean(self) -> bool:
+    """Whether this sample may enter the unconstrained equality regression."""
+    return (
+      self._base_valid
+      and not self.actuator_constrained
+      and self.actuator_boundary == ActuatorBoundary.NONE
+      and self.magnitude_boundary_dwell_s == 0.0
+    )
+
+  @property
+  def authority_evidence(self) -> bool:
+    """Whether this is valid, driver-free vehicle-boundary evidence."""
+    return (
+      self._base_valid
+      and self._authority_attested
+      and self.actuator_constrained
+      and self.actuator_boundary != ActuatorBoundary.NONE
+      and not bool(self.actuator_boundary & ActuatorBoundary.DRIVER)
+      and (
+        bool(self.actuator_boundary & ActuatorBoundary.MAGNITUDE)
+        or self.magnitude_boundary_dwell_s == 0.0
+      )
+    )
+
+
+def _attest_authority_sample(
+  sample: LearningSample,
+  *,
+  boundary: ActuatorBoundary,
+  magnitude_boundary_dwell_s: float,
+) -> LearningSample:
+  """Attach runtime-classified authority facts to one physical sample.
+
+  This is deliberately private. Public measurement callers can flag a sample
+  as constrained, but only the exact runtime envelope classifier may attest
+  its boundary kind and dwell for authority accumulation or fitting.
+  """
+  if not isinstance(sample, LearningSample):
+    raise TypeError("authority attestation requires a LearningSample")
+  if (
+    not sample.actuator_constrained
+    or boundary == ActuatorBoundary.NONE
+    or bool(boundary & ActuatorBoundary.DRIVER)
+    or int(boundary) & ~int(_KNOWN_ACTUATOR_BOUNDARIES)
+    or not math.isfinite(magnitude_boundary_dwell_s)
+    or magnitude_boundary_dwell_s < 0.0
+  ):
+    raise ValueError("authority attestation is not driver-free boundary data")
+  if (
+    not bool(boundary & ActuatorBoundary.MAGNITUDE)
+    and magnitude_boundary_dwell_s != 0.0
+  ):
+    raise ValueError("only a magnitude boundary may carry dwell")
+
+  attested = replace(sample)
+  object.__setattr__(attested, "actuator_boundary", boundary)
+  object.__setattr__(
+    attested,
+    "magnitude_boundary_dwell_s",
+    float(magnitude_boundary_dwell_s),
+  )
+  object.__setattr__(attested, "_authority_attested", True)
+  return attested
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +251,14 @@ class NodeEvidenceSnapshot:
 
   clean_support_s: float
   supported_sample_count: int
+  authority_support_s: float
+  authority_sample_count: int
+  authority_magnitude_sample_count: int
+  authority_slew_build_sample_count: int
+  authority_slew_release_sample_count: int
+  authority_fit_support_s: float
+  authority_fit_sample_count: int
+  authority_unresolved_sample_count: int
   lateral_accel_min_mps2: float
   lateral_accel_max_mps2: float
   lateral_accel_energy_mps4_s: float
@@ -148,11 +269,21 @@ class NodeEvidenceSnapshot:
   last_rack_direction: int
   training_values: tuple[float, ...]
   validation_values: tuple[float, ...]
+  authority_training_values: tuple[float, ...]
+  authority_validation_values: tuple[float, ...]
 
   def to_bytes(self) -> bytes:
     scalar_values = (
       self.clean_support_s,
       float(self.supported_sample_count),
+      self.authority_support_s,
+      float(self.authority_sample_count),
+      float(self.authority_magnitude_sample_count),
+      float(self.authority_slew_build_sample_count),
+      float(self.authority_slew_release_sample_count),
+      self.authority_fit_support_s,
+      float(self.authority_fit_sample_count),
+      float(self.authority_unresolved_sample_count),
       self.lateral_accel_min_mps2,
       self.lateral_accel_max_mps2,
       self.lateral_accel_energy_mps4_s,
@@ -163,6 +294,8 @@ class NodeEvidenceSnapshot:
       float(self.last_rack_direction),
       *self.training_values,
       *self.validation_values,
+      *self.authority_training_values,
+      *self.authority_validation_values,
     )
     return struct.pack(f"<{len(scalar_values)}d", *scalar_values)
 
@@ -187,6 +320,15 @@ class NodeQualificationReport:
   confidence: float
   reasons: tuple[QualificationReason, ...]
   candidate_parameters: PhysicalParameters | None
+  authority_support_s: float = 0.0
+  authority_sample_count: int = 0
+  authority_fit_support_s: float = 0.0
+  authority_fit_sample_count: int = 0
+  authority_training_count: int = 0
+  authority_validation_count: int = 0
+  authority_fit_active: bool = False
+  authority_seed_validation_rms: float | None = None
+  authority_candidate_validation_rms: float | None = None
 
   @property
   def qualified(self) -> bool:
@@ -263,10 +405,38 @@ class _RegressionEvidence:
     return math.sqrt(squared_error / self.weight_s)
 
 
+def _combined_regression(
+  primary: _RegressionEvidence,
+  authority: _RegressionEvidence,
+) -> _RegressionEvidence:
+  """Combine fixed-order sufficient statistics without mutating evidence."""
+  combined = _RegressionEvidence()
+  for index in range(16):
+    combined.normal[index] = (
+      primary.normal[index] + authority.normal[index]
+    )
+  for index in range(4):
+    combined.rhs[index] = primary.rhs[index] + authority.rhs[index]
+  combined.target_squared = (
+    primary.target_squared + authority.target_squared
+  )
+  combined.weight_s = primary.weight_s + authority.weight_s
+  combined.count = primary.count + authority.count
+  return combined
+
+
 class _NodeAccumulator:
   __slots__ = (
     "clean_support_s",
     "supported_sample_count",
+    "authority_support_s",
+    "authority_sample_count",
+    "authority_magnitude_sample_count",
+    "authority_slew_build_sample_count",
+    "authority_slew_release_sample_count",
+    "authority_fit_support_s",
+    "authority_fit_sample_count",
+    "authority_unresolved_sample_count",
     "lateral_accel_min",
     "lateral_accel_max",
     "lateral_accel_energy",
@@ -277,11 +447,21 @@ class _NodeAccumulator:
     "last_rack_direction",
     "training",
     "validation",
+    "authority_training",
+    "authority_validation",
   )
 
   def __init__(self) -> None:
     self.clean_support_s = 0.0
     self.supported_sample_count = 0
+    self.authority_support_s = 0.0
+    self.authority_sample_count = 0
+    self.authority_magnitude_sample_count = 0
+    self.authority_slew_build_sample_count = 0
+    self.authority_slew_release_sample_count = 0
+    self.authority_fit_support_s = 0.0
+    self.authority_fit_sample_count = 0
+    self.authority_unresolved_sample_count = 0
     self.lateral_accel_min = math.inf
     self.lateral_accel_max = -math.inf
     self.lateral_accel_energy = 0.0
@@ -292,11 +472,29 @@ class _NodeAccumulator:
     self.last_rack_direction = 0
     self.training = _RegressionEvidence()
     self.validation = _RegressionEvidence()
+    self.authority_training = _RegressionEvidence()
+    self.authority_validation = _RegressionEvidence()
 
   def snapshot(self) -> NodeEvidenceSnapshot:
     return NodeEvidenceSnapshot(
       clean_support_s=self.clean_support_s,
       supported_sample_count=self.supported_sample_count,
+      authority_support_s=self.authority_support_s,
+      authority_sample_count=self.authority_sample_count,
+      authority_magnitude_sample_count=(
+        self.authority_magnitude_sample_count
+      ),
+      authority_slew_build_sample_count=(
+        self.authority_slew_build_sample_count
+      ),
+      authority_slew_release_sample_count=(
+        self.authority_slew_release_sample_count
+      ),
+      authority_fit_support_s=self.authority_fit_support_s,
+      authority_fit_sample_count=self.authority_fit_sample_count,
+      authority_unresolved_sample_count=(
+        self.authority_unresolved_sample_count
+      ),
       lateral_accel_min_mps2=self.lateral_accel_min,
       lateral_accel_max_mps2=self.lateral_accel_max,
       lateral_accel_energy_mps4_s=self.lateral_accel_energy,
@@ -307,6 +505,8 @@ class _NodeAccumulator:
       last_rack_direction=self.last_rack_direction,
       training_values=self.training.values(),
       validation_values=self.validation.values(),
+      authority_training_values=self.authority_training.values(),
+      authority_validation_values=self.authority_validation.values(),
     )
 
 
@@ -642,6 +842,32 @@ class ProfileLearner:
           "clean_support_s": _encode_finite_float(
             node.clean_support_s,
           ),
+          "authority_fit_sample_count": node.authority_fit_sample_count,
+          "authority_fit_support_s": _encode_finite_float(
+            node.authority_fit_support_s,
+          ),
+          "authority_magnitude_sample_count": (
+            node.authority_magnitude_sample_count
+          ),
+          "authority_sample_count": node.authority_sample_count,
+          "authority_slew_build_sample_count": (
+            node.authority_slew_build_sample_count
+          ),
+          "authority_slew_release_sample_count": (
+            node.authority_slew_release_sample_count
+          ),
+          "authority_support_s": _encode_finite_float(
+            node.authority_support_s,
+          ),
+          "authority_training": _encode_regression(
+            node.authority_training,
+          ),
+          "authority_unresolved_sample_count": (
+            node.authority_unresolved_sample_count
+          ),
+          "authority_validation": _encode_regression(
+            node.authority_validation,
+          ),
           "last_rack_direction": node.last_rack_direction,
           "lateral_accel_energy_mps4_s": _encode_finite_float(
             node.lateral_accel_energy,
@@ -794,6 +1020,16 @@ class ProfileLearner:
     node_keys = frozenset({
       "applied_torque_max",
       "applied_torque_min",
+      "authority_fit_sample_count",
+      "authority_fit_support_s",
+      "authority_magnitude_sample_count",
+      "authority_sample_count",
+      "authority_slew_build_sample_count",
+      "authority_slew_release_sample_count",
+      "authority_support_s",
+      "authority_training",
+      "authority_unresolved_sample_count",
+      "authority_validation",
       "clean_support_s",
       "last_rack_direction",
       "lateral_accel_energy_mps4_s",
@@ -826,6 +1062,38 @@ class ProfileLearner:
       supported_sample_count = _require_int(
         node_payload["supported_sample_count"],
         f"nodes[{node_index}].supported_sample_count",
+      )
+      authority_support_s = _decode_finite_float(
+        node_payload["authority_support_s"],
+        f"nodes[{node_index}].authority_support_s",
+      )
+      authority_sample_count = _require_int(
+        node_payload["authority_sample_count"],
+        f"nodes[{node_index}].authority_sample_count",
+      )
+      authority_magnitude_sample_count = _require_int(
+        node_payload["authority_magnitude_sample_count"],
+        f"nodes[{node_index}].authority_magnitude_sample_count",
+      )
+      authority_slew_build_sample_count = _require_int(
+        node_payload["authority_slew_build_sample_count"],
+        f"nodes[{node_index}].authority_slew_build_sample_count",
+      )
+      authority_slew_release_sample_count = _require_int(
+        node_payload["authority_slew_release_sample_count"],
+        f"nodes[{node_index}].authority_slew_release_sample_count",
+      )
+      authority_fit_support_s = _decode_finite_float(
+        node_payload["authority_fit_support_s"],
+        f"nodes[{node_index}].authority_fit_support_s",
+      )
+      authority_fit_sample_count = _require_int(
+        node_payload["authority_fit_sample_count"],
+        f"nodes[{node_index}].authority_fit_sample_count",
+      )
+      authority_unresolved_sample_count = _require_int(
+        node_payload["authority_unresolved_sample_count"],
+        f"nodes[{node_index}].authority_unresolved_sample_count",
       )
       lateral_accel_min = _decode_extreme(
         node_payload["lateral_accel_min_mps2"],
@@ -869,9 +1137,19 @@ class ProfileLearner:
         node_payload["validation"],
         f"nodes[{node_index}].validation",
       )
+      authority_training = _restore_regression(
+        node_payload["authority_training"],
+        f"nodes[{node_index}].authority_training",
+      )
+      authority_validation = _restore_regression(
+        node_payload["authority_validation"],
+        f"nodes[{node_index}].authority_validation",
+      )
 
       if (
         clean_support_s < 0.0
+        or authority_support_s < 0.0
+        or authority_fit_support_s < 0.0
         or lateral_accel_energy < 0.0
         or rack_travel_deg < 0.0
       ):
@@ -890,6 +1168,35 @@ class ProfileLearner:
         raise ValueError("rack reversal count exceeds sample count")
       if training.count + validation.count > supported_sample_count:
         raise ValueError("regression count exceeds supported sample count")
+      if (
+        authority_magnitude_sample_count > authority_sample_count
+        or authority_slew_build_sample_count > authority_sample_count
+        or authority_slew_release_sample_count > authority_sample_count
+        or (
+          authority_magnitude_sample_count
+          + authority_slew_build_sample_count
+          + authority_slew_release_sample_count
+          < authority_sample_count
+        )
+        or authority_fit_sample_count > authority_magnitude_sample_count
+        or (
+          authority_fit_sample_count + authority_unresolved_sample_count
+          > authority_magnitude_sample_count
+        )
+        or authority_training.count + authority_validation.count
+        != authority_fit_sample_count
+        or authority_fit_support_s > authority_support_s + 1e-12
+        or not math.isclose(
+          authority_fit_support_s,
+          (
+            authority_training.weight_s
+            + authority_validation.weight_s
+          ),
+          rel_tol=1e-12,
+          abs_tol=1e-12,
+        )
+      ):
+        raise ValueError("authority evidence counts are inconsistent")
       if supported_sample_count == 0 and (
         clean_support_s != 0.0
         or lateral_accel_energy != 0.0
@@ -906,10 +1213,50 @@ class ProfileLearner:
         raise ValueError("empty node evidence is internally inconsistent")
       if supported_sample_count > 0 and clean_support_s <= 0.0:
         raise ValueError("populated node evidence needs positive support")
+      if authority_sample_count == 0 and (
+        authority_support_s != 0.0
+        or authority_fit_support_s != 0.0
+        or authority_fit_sample_count != 0
+        or authority_magnitude_sample_count != 0
+        or authority_slew_build_sample_count != 0
+        or authority_slew_release_sample_count != 0
+        or authority_unresolved_sample_count != 0
+        or authority_training.count != 0
+        or authority_validation.count != 0
+      ):
+        raise ValueError("empty authority evidence is internally inconsistent")
+      if authority_sample_count > 0 and authority_support_s <= 0.0:
+        raise ValueError("populated authority evidence needs positive support")
+      if (
+        authority_fit_sample_count == 0
+        and authority_fit_support_s != 0.0
+      ):
+        raise ValueError("empty authority fit has nonzero support")
+      if (
+        authority_fit_sample_count > 0
+        and authority_fit_support_s <= 0.0
+      ):
+        raise ValueError("populated authority fit needs positive support")
 
       node = learner._nodes[node_index]
       node.clean_support_s = clean_support_s
       node.supported_sample_count = supported_sample_count
+      node.authority_support_s = authority_support_s
+      node.authority_sample_count = authority_sample_count
+      node.authority_magnitude_sample_count = (
+        authority_magnitude_sample_count
+      )
+      node.authority_slew_build_sample_count = (
+        authority_slew_build_sample_count
+      )
+      node.authority_slew_release_sample_count = (
+        authority_slew_release_sample_count
+      )
+      node.authority_fit_support_s = authority_fit_support_s
+      node.authority_fit_sample_count = authority_fit_sample_count
+      node.authority_unresolved_sample_count = (
+        authority_unresolved_sample_count
+      )
       node.lateral_accel_min = lateral_accel_min
       node.lateral_accel_max = lateral_accel_max
       node.lateral_accel_energy = lateral_accel_energy
@@ -920,6 +1267,8 @@ class ProfileLearner:
       node.last_rack_direction = last_rack_direction
       node.training = training
       node.validation = validation
+      node.authority_training = authority_training
+      node.authority_validation = authority_validation
     return learner
 
   def _node_support(
@@ -945,14 +1294,61 @@ class ProfileLearner:
     return ((lower, 1.0 - upper_weight), (upper, upper_weight))
 
   def add_sample(self, sample: LearningSample) -> bool:
-    """Add one clean measurement to only its adjacent interpolation nodes."""
-    if not sample.clean:
+    """Add one measured sample to its physical or authority evidence stratum."""
+    if not sample.clean and not sample.authority_evidence:
       return False
 
     for node_index, node_weight in self._node_support(sample.speed_mps):
       node = self._nodes[node_index]
       seed = self.seed_profile.nodes[node_index].parameters
       weight_s = sample.dt_s * node_weight
+
+      if sample.authority_evidence:
+        node.authority_support_s += weight_s
+        node.authority_sample_count += 1
+        if sample.actuator_boundary & ActuatorBoundary.MAGNITUDE:
+          node.authority_magnitude_sample_count += 1
+        if sample.actuator_boundary & ActuatorBoundary.SLEW_BUILD:
+          node.authority_slew_build_sample_count += 1
+        if sample.actuator_boundary & ActuatorBoundary.SLEW_RELEASE:
+          node.authority_slew_release_sample_count += 1
+
+        motion_threshold = max(
+          seed.rack_rate_resolution_deg_s, 1e-12,
+        )
+        settled_magnitude = (
+          sample.actuator_boundary == ActuatorBoundary.MAGNITUDE
+          and sample.magnitude_boundary_dwell_s + 1e-12
+          >= seed.transport_delay_s + sample.dt_s
+        )
+        if settled_magnitude and (
+          abs(sample.rack_rate_deg_s) > motion_threshold
+        ):
+          validation_block = (
+            node.authority_fit_sample_count
+            // TRAIN_VALIDATION_BLOCK_SAMPLES
+          ) % 2 == 1
+          predictors = (
+            -sample.measured_lateral_accel_mps2,
+            sample.rack_acceleration_deg_s2,
+            sample.rack_rate_deg_s,
+            math.copysign(1.0, sample.rack_rate_deg_s),
+          )
+          evidence = (
+            node.authority_validation
+            if validation_block
+            else node.authority_training
+          )
+          evidence.add(predictors, sample.applied_torque, weight_s)
+          node.authority_fit_support_s += weight_s
+          node.authority_fit_sample_count += 1
+        elif settled_magnitude:
+          # At full torque with a quantized/stationary rack, the input is
+          # known but friction direction is not. Preserve it as stiction/
+          # scrub evidence without pretending it is an equality row.
+          node.authority_unresolved_sample_count += 1
+        continue
+
       validation_block = (
         node.supported_sample_count // TRAIN_VALIDATION_BLOCK_SAMPLES
       ) % 2 == 1
@@ -1050,10 +1446,35 @@ class ProfileLearner:
     ):
       reasons.append(QualificationReason.INSUFFICIENT_EXCITATION)
 
-    coefficients = _solve_scaled_normal_equations(node.training)
+    authority_fit_active = (
+      node.authority_training.count >= MIN_AUTHORITY_TRAINING_SAMPLES
+      and node.authority_validation.count
+      >= MIN_AUTHORITY_VALIDATION_SAMPLES
+    )
+    empty_authority = _RegressionEvidence()
+    active_authority_training = (
+      node.authority_training
+      if authority_fit_active
+      else empty_authority
+    )
+    active_authority_validation = (
+      node.authority_validation
+      if authority_fit_active
+      else empty_authority
+    )
+    combined_training = _combined_regression(
+      node.training,
+      active_authority_training,
+    )
+    combined_validation = _combined_regression(
+      node.validation,
+      active_authority_validation,
+    )
+    coefficients = _solve_scaled_normal_equations(combined_training)
     candidate_parameters: PhysicalParameters | None = None
     candidate_rms: float | None = None
-    seed_rms = node.validation.rms(_seed_coefficients(seed))
+    seed_coefficients = _seed_coefficients(seed)
+    seed_rms = combined_validation.rms(seed_coefficients)
     if coefficients is None:
       reasons.append(QualificationReason.SINGULAR_FIT)
     else:
@@ -1083,7 +1504,7 @@ class ProfileLearner:
         ):
           reasons.append(QualificationReason.INVALID_PARAMETERS)
         else:
-          candidate_rms = node.validation.rms(coefficients)
+          candidate_rms = combined_validation.rms(coefficients)
           if candidate_rms is None or seed_rms is None:
             if QualificationReason.INSUFFICIENT_VALIDATION not in reasons:
               reasons.append(QualificationReason.INSUFFICIENT_VALIDATION)
@@ -1092,6 +1513,32 @@ class ProfileLearner:
             > seed_rms + VALIDATION_RMS_ABSOLUTE_TOLERANCE
           ):
             reasons.append(QualificationReason.VALIDATION_REGRESSION)
+          free_seed_rms = node.validation.rms(seed_coefficients)
+          free_candidate_rms = node.validation.rms(coefficients)
+          if (
+            free_seed_rms is not None
+            and free_candidate_rms is not None
+            and free_candidate_rms
+            > free_seed_rms + VALIDATION_RMS_ABSOLUTE_TOLERANCE
+          ):
+            reasons.append(QualificationReason.VALIDATION_REGRESSION)
+          authority_seed_rms = node.authority_validation.rms(
+            seed_coefficients,
+          )
+          authority_candidate_rms = node.authority_validation.rms(
+            coefficients,
+          )
+          if (
+            authority_fit_active
+            and
+            authority_seed_rms is not None
+            and authority_candidate_rms is not None
+            and authority_candidate_rms
+            > authority_seed_rms + VALIDATION_RMS_ABSOLUTE_TOLERANCE
+          ):
+            reasons.append(
+              QualificationReason.AUTHORITY_VALIDATION_REGRESSION,
+            )
 
           ratios = (
             node.clean_support_s / minimum_support,
@@ -1139,9 +1586,9 @@ class ProfileLearner:
       minimum_support_s=minimum_support,
       clean_support_s=node.clean_support_s,
       supported_sample_count=node.supported_sample_count,
-      training_count=node.training.count,
-      validation_count=node.validation.count,
-      validation_support_s=node.validation.weight_s,
+      training_count=combined_training.count,
+      validation_count=combined_validation.count,
+      validation_support_s=combined_validation.weight_s,
       lateral_accel_span_mps2=lateral_span,
       lateral_accel_rms_mps2=lateral_rms,
       rack_travel_deg=node.rack_travel_deg,
@@ -1160,6 +1607,21 @@ class ProfileLearner:
         else unique_reasons
       ),
       candidate_parameters=candidate_parameters,
+      authority_support_s=node.authority_support_s,
+      authority_sample_count=node.authority_sample_count,
+      authority_fit_support_s=node.authority_fit_support_s,
+      authority_fit_sample_count=node.authority_fit_sample_count,
+      authority_training_count=node.authority_training.count,
+      authority_validation_count=node.authority_validation.count,
+      authority_fit_active=authority_fit_active,
+      authority_seed_validation_rms=(
+        node.authority_validation.rms(seed_coefficients)
+      ),
+      authority_candidate_validation_rms=(
+        None
+        if coefficients is None
+        else node.authority_validation.rms(coefficients)
+      ),
     )
 
   def qualify(self, provenance: str) -> LearningResult:
@@ -1197,13 +1659,16 @@ class ProfileLearner:
     evidence_revision = (
       self.seed_profile.revision
       + 1
-      + sum(node.supported_sample_count for node in self._nodes)
+      + sum(
+        node.supported_sample_count + node.authority_sample_count
+        for node in self._nodes
+      )
     )
     candidate = VehicleProfile(
       vehicle_identity=self.seed_profile.vehicle_identity,
       revision=evidence_revision,
       provenance=(
-        f"{source}; modular-offroad-learner-v2; " +
+        f"{source}; modular-offroad-learner-v3; " +
         f"fit_seed_revision={self.seed_profile.revision}; " +
         f"evidence_revision={evidence_revision}"
       ),
@@ -1214,4 +1679,4 @@ class ProfileLearner:
 
 def learning_sample_field_names() -> tuple[str, ...]:
   """Expose the physical-only input contract for audit/tests."""
-  return tuple(field.name for field in fields(LearningSample))
+  return tuple(field.name for field in fields(LearningSample) if field.init)

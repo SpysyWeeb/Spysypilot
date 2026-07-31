@@ -81,8 +81,27 @@ with one atomic `CURRENT` pointer replacement. The SHA-bound ledger provides
 exactly-once route ownership and rejects changed content for an already known
 route.
 
+`accepted_sample_count` means a valid hands-off measured-response frame
+incorporated into ordinary or authority evidence. Reachable driver-free full
+magnitude and maximum-slew boundaries are retained because `carOutput`
+records the actual CarController input to the rack. Slew rows are authority
+observations only. Full-magnitude rows enter the separate authority equality
+fit only after they have remained settled for the seed transport delay and
+the rack is measurably moving. They remain deferred until at least four
+held-out authority rows exist, then free and authority validation must each
+beat or match the seed independently. Driver-limited, lateral-inactive,
+standstill, invalid/gapped, and physically unreachable transitions are
+excluded. Evidence schema v3 establishes this interpretation; older evidence
+is never mixed silently.
+
 Immutable generations are not garbage-collected yet. A future collector must
 be scoped to an offroad/boot reader lifetime, wait until no resolved artifact
 paths can still reference an old generation, and retain at least `CURRENT` and
 its predecessor. Until that reader-lifetime contract exists, retaining all
 generations is the safe behavior.
+
+Durable storage is also versioned by evidence-inclusion policy:
+`<storage root>/<runtime identity>/complete_full_rlog_authority_v1`. An earlier
+unnamespaced runtime directory is preserved but never restored or mixed into
+this policy. A future inclusion-policy change must select a new namespace,
+start with an empty ledger, and replay every still-local eligible full rlog.

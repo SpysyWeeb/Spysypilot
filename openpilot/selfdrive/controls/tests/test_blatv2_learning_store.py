@@ -10,10 +10,12 @@ import unittest
 from unittest.mock import patch
 
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
+  ActuatorBoundary,
   LEARNING_EVIDENCE_SCHEMA_VERSION,
   TRAIN_VALIDATION_BLOCK_SAMPLES,
   LearningSample,
   ProfileLearner,
+  _attest_authority_sample,
   learner_evidence_sha256,
   minimum_clean_support_s,
 )
@@ -88,6 +90,26 @@ def measured_sample(speed_mps: float, index: int) -> LearningSample:
     steering_pressed=False,
     actuator_constrained=False,
     standstill=False,
+  )
+
+
+def authority_sample() -> LearningSample:
+  return _attest_authority_sample(
+    LearningSample(
+      speed_mps=2.5,
+      dt_s=0.01,
+      applied_torque=1.0,
+      measured_lateral_accel_mps2=-1.2,
+      rack_rate_deg_s=8.0,
+      rack_acceleration_deg_s2=1000.0,
+      engaged=True,
+      valid=True,
+      steering_pressed=False,
+      actuator_constrained=True,
+      standstill=False,
+    ),
+    boundary=ActuatorBoundary.MAGNITUDE,
+    magnitude_boundary_dwell_s=0.2,
   )
 
 
@@ -269,6 +291,16 @@ class TestBLaTv2LearningStore(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "evidence schema"):
       ProfileLearner.from_evidence(profile, version_one_evidence)
 
+    version_two_evidence = resign(
+      encoded,
+      lambda payload: payload.__setitem__(
+        "evidence_schema_version",
+        2,
+      ),
+    )
+    with self.assertRaisesRegex(ValueError, "evidence schema"):
+      ProfileLearner.from_evidence(profile, version_two_evidence)
+
     wrong_profile_schema = resign(
       encoded,
       lambda payload: payload.__setitem__(
@@ -323,6 +355,34 @@ class TestBLaTv2LearningStore(unittest.TestCase):
         malformed = resign(encoded, mutation)
         with self.assertRaises(ValueError):
           ProfileLearner.from_evidence(profile, malformed)
+
+  def test_authority_evidence_invariants_are_strictly_restored(self) -> None:
+    profile = seed_profile()
+    learner = ProfileLearner(profile)
+    for _ in range(TRAIN_VALIDATION_BLOCK_SAMPLES + 4):
+      self.assertTrue(learner.add_sample(authority_sample()))
+    encoded = learner.export_evidence()
+
+    missing_category = resign(
+      encoded,
+      lambda payload: payload["nodes"][0].update({
+        "authority_magnitude_sample_count": 0,
+        "authority_slew_build_sample_count": 0,
+        "authority_slew_release_sample_count": 0,
+      }),
+    )
+    with self.assertRaisesRegex(ValueError, "authority evidence counts"):
+      ProfileLearner.from_evidence(profile, missing_category)
+
+    support_mismatch = resign(
+      encoded,
+      lambda payload: payload["nodes"][0].__setitem__(
+        "authority_fit_support_s",
+        (9.0).hex(),
+      ),
+    )
+    with self.assertRaisesRegex(ValueError, "authority evidence counts"):
+      ProfileLearner.from_evidence(profile, support_mismatch)
 
   def test_onroad_write_is_refused_without_touching_path(self) -> None:
     learner = ProfileLearner(seed_profile())

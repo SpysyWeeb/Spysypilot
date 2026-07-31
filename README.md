@@ -108,6 +108,18 @@ qualified candidate. This lets later casual drives refine the profile without
 rebasing accumulated physical statistics or letting highway data overwrite
 low-speed nodes.
 
+Measured evidence includes reachable, driver-free vehicle-owned torque
+boundaries. Full-torque and maximum-slew frames are retained in a separate
+speed-local authority stratum rather than being discarded. Slew transients
+remain out of the instantaneous equality fit because the rack response is
+transport-delayed; settled full-torque motion enters that fit only after the
+seed transport delay has elapsed. Driver-limited and physically impossible
+transitions remain excluded. This keeps sharp-turn/breakaway evidence without
+turning limiter timing or human torque into false plant parameters.
+Settled authority rows cannot influence a candidate until their own held-out
+validation block exists; incomplete authority evidence stays durable and
+deferred.
+
 The home-screen learning display reads rebuildable
 `BLaTv2LearningOperationStatus` and `BLaTv2LearningStatus` caches. The
 offroad importer owns both. Operation status distinguishes logger
