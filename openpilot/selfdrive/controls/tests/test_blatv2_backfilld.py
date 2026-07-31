@@ -19,6 +19,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
   LEARNING_OPERATION_STATUS_PARAM,
   LearningOperationState,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
+  BACKFILL_PROGRESS_PARAM,
+)
 
 
 RUNTIME_IDENTITY = hashlib.sha256(b"runtime").hexdigest()
@@ -47,6 +50,9 @@ class FakeParams:
     assert block is False
     return self.values.get(key)
 
+  def remove(self, key: str) -> None:
+    self.values.pop(key, None)
+
 
 def test_terminal_failure_preserves_same_operation_progress(
   tmp_path: Path,
@@ -72,6 +78,7 @@ def test_terminal_failure_preserves_same_operation_progress(
   )
   before = daemon.operation_status.last_payload
   assert before is not None
+  params.values[BACKFILL_PROGRESS_PARAM] = {"stale": "progress"}
 
   daemon._publish_failure(
     "backfill_publish_failed",
@@ -93,6 +100,7 @@ def test_terminal_failure_preserves_same_operation_progress(
   assert failed["current_route_identity"] is None
   assert failed["current_route_index"] is None
   assert failed["total_route_count"] is None
+  assert BACKFILL_PROGRESS_PARAM not in params.values
 
 
 def test_terminal_failure_cannot_overwrite_live_onroad_owner(

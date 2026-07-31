@@ -255,13 +255,19 @@ The current field UI reads two rebuildable JSON caches:
   offroad `preparing`, `finalizing`, `backfilling`, route progress, terminal
   idle/empty results, and failures. Route identities are hashed before
   publication. No managed process publishes live collection state.
+- `BLaTv2BackfillProgress` optionally adds pass, route, segment, read/apply
+  phase, cumulative work, and an approximate remaining time. It is bound to
+  the operation id and sequence so a torn two-key read falls back to the
+  coarse status. Work spans reading and route application across both replay
+  passes; timing never enters evidence, ledgers, replay ordering, A/A
+  comparison, fitting, or actuation.
 - `BLaTv2LearningStatus` is projected by `blatv2_backfilld` only after the
   exact evidence, optional candidate, ledger, and manifest have persisted.
   It reports cumulative node evidence, qualification reasons, and only the
   four parameters the regression actually fits. Seed-carried delay, static
   friction, and rack-rate resolution are never labeled learned.
 
-Both keys are `CLEAR_ON_MANAGER_START` display caches and are never
+All display keys are `CLEAR_ON_MANAGER_START` caches and are never
 persistent authorities themselves. They are published only by the offroad
 process owner from authenticated current-build, current-vehicle authorities.
 No cache may be consumed by fitting, candidate creation, approval, controller
