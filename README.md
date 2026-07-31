@@ -19,10 +19,10 @@ longitudinal planner/MPC policy. Its joint product target is:
   situation requires it, without weakening stock emergency braking or
   platform safety limits.
 
-The current test revision restores BLoT v1's launch-tapered request up to
-`4.0 m/s²`. The requested authority remains clamped to the deployed opendbc
-limit, and the existing BLoTv2 jerk/MPC tune is intentionally unchanged until
-route data and owner field feedback justify a tune change.
+The current test revision retains up to `4.0 m/s²` at launch. Field feedback
+from route `000000d2--a62f0c1831` adds an urban-speed comfort taper after
+`10 m/s` while leaving the low-speed envelope and reaction-time jerk tune
+unchanged. Requested authority remains clamped to the deployed opendbc limit.
 
 Each physical decision has one owner. The planner/MPC owns trajectory
 necessity, Smooth Stops owns only the final low-speed approach and hold

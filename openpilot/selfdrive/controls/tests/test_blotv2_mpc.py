@@ -108,14 +108,34 @@ class TestStrongCruiseEnvelope(unittest.TestCase):
   def test_launch_schedule_tapers_to_stock_highway_value(self):
     np.testing.assert_allclose(
       longitudinal_planner.A_CRUISE_MAX_VALS,
-      [4.0, 2.4, 1.2, 0.6],
+      [4.0, 2.4, 1.2, 0.8, 0.6],
+    )
+    np.testing.assert_allclose(
+      longitudinal_planner.A_CRUISE_MAX_BP,
+      [0.0, 10.0, 15.0, 25.0, 40.0],
     )
     self.assertAlmostEqual(get_max_accel(40.0), 0.6)
+
+  def test_route_d2_urban_cruise_cap(self):
+    # Route 000000d2--a62f0c1831 reached 1.79 m/s² near 40 mph for a
+    # 5.4 mph set-speed error. Preserve the strong <=10 m/s launch envelope,
+    # then keep this urban correction near stock comfort authority.
+    requested_at_10 = np.interp(
+      10.0,
+      longitudinal_planner.A_CRUISE_MAX_BP,
+      longitudinal_planner.A_CRUISE_MAX_VALS,
+    )
+    self.assertAlmostEqual(requested_at_10, 2.4)
+    self.assertLessEqual(get_max_accel(40.0 * 0.44704), 1.1)
 
   def test_turn_budget_does_not_clip_straight_launch(self):
     np.testing.assert_allclose(longitudinal_planner._A_TOTAL_MAX_V, [4.0, 4.0])
 
   def test_existing_blotv2_jerk_tune_is_preserved(self):
+    np.testing.assert_allclose(
+      longitudinal_planner.J_CRUISE_BP,
+      [0.0, 10.0, 25.0, 40.0],
+    )
     np.testing.assert_allclose(
       longitudinal_planner.J_CRUISE_VALS,
       [2.0, 1.6, 1.0, 0.6],

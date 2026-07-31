@@ -195,8 +195,8 @@ closed.
 ## Strong
 
 The stock cruise comfort schedule leaves some existing platform authority
-unused at low speed. BLoTv2 restores BLoT v1's launch-tapered request, changing
-the schedule from:
+unused at low speed. BLoTv2 keeps BLoT v1's launch authority while tapering
+back toward stock comfort at urban speed, changing the schedule from:
 
 ```text
 [1.6, 1.2, 0.8, 0.6] m/s²
@@ -205,15 +205,33 @@ the schedule from:
 to:
 
 ```text
-[4.0, 2.4, 1.2, 0.6] m/s²
-at [0, 10, 25, 40] m/s
+[4.0, 2.4, 1.2, 0.8, 0.6] m/s²
+at [0, 10, 15, 25, 40] m/s
 ```
 
 Authority and jerk remain separate tuning axes. The existing BLoTv2 jerk
 schedule stays `[2.0, 1.6, 1.0, 0.6] m/s³`; it is not doubled with the
-acceleration request. The straight-line total-acceleration budget is
-`4.0 m/s²`, while lateral acceleration still consumes that shared budget in a
-turn.
+acceleration request and retains its original `[0, 10, 25, 40] m/s`
+breakpoints. The acceleration envelope is therefore unchanged through
+`10 m/s` (about `22 mph`), preserving prompt low-speed response, while its new
+`15 m/s` point brings normal urban corrections back toward stock comfort. The
+straight-line total-acceleration budget is `4.0 m/s²`, while lateral
+acceleration still consumes that shared budget in a turn.
+
+### Route `000000d2--a62f0c1831` urban-speed refinement
+
+The full-resolution route was recorded on `combo` commit `c43e130059`. Three
+40-to-45 mph corrections reached approximately `1.31`, `1.64`, and
+`1.79 m/s²`. In the strongest event, cruise selected `1.79 m/s²` at `39.4 mph`
+for only a `5.4 mph` set-speed error; the planner target and final command
+matched, so this was not PID overshoot or Smooth Stops behavior.
+
+The new schedule limits the same 40 mph operating point to about `1.08 m/s²`
+without changing the envelope at or below `10 m/s`. The separate jerk schedule
+is unchanged, so a valid change still begins promptly; “Swift” describes
+reaction time and low-speed launch response, not sustained high throttle for a
+small urban-speed correction. This counterfactual cap is route-derived, not a
+claim of field validation, and remains an explicit owner test item.
 
 `BLOTV2_ACCEL_REQUEST_MAX = 4.0 m/s²` records the requested policy.
 `BLOTV2_ACCEL_MAX = min(ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX)` applies the
