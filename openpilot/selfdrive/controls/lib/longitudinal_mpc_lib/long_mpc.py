@@ -3,13 +3,15 @@ import os
 import time
 import numpy as np
 from openpilot.cereal import log
-from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
+from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
+from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
-LEAD_T_IDXS_MODEL = np.array(ModelConstants.LEAD_T_IDXS)  # [0, 2, 4, 6, 8, 10]s
+LEAD_T_IDXS_MODEL = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
 
 if __name__ == '__main__':  # generating code
   from acados.acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
@@ -55,8 +57,7 @@ T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
-STOP_DISTANCE = 7.0  # stock 6.0; +1m per owner preference -- a constant term of the desired-gap
-                     # cost at every horizon node, so the whole decel plan lands 1m earlier
+STOP_DISTANCE = 7.0
 MIN_X_LEAD_FACTOR = 0.5
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
@@ -76,7 +77,7 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
   elif personality==log.LongitudinalPersonality.standard:
     return 1.45
   elif personality==log.LongitudinalPersonality.aggressive:
-    return 1.00
+    return 1.0
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
@@ -263,9 +264,12 @@ class LongitudinalMpc:
     for i in range(N):
       self.solver.cost_set(i, 'Zl', Zl)
 
-  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard, jerk_factor_scale=1.0):
-    # jerk_factor_scale: BLT's recovery boost -- <1.0 lets the solver relax (or deepen)
-    # its own solution faster; 1.0 is byte-for-byte stock
+  def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard,
+                  jerk_factor_scale=1.0):
+    # BLoTv2 changes the cost of changing acceleration, never acceleration
+    # constraints. Bound the runtime input so an invalid policy cannot silently
+    # remove the solver's smoothness cost or make it stiffer than stock.
+    jerk_factor_scale = float(np.clip(jerk_factor_scale, 0.3, 1.0))
     jerk_factor = get_jerk_factor(personality) * jerk_factor_scale
     a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
     cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
@@ -285,55 +289,73 @@ class LongitudinalMpc:
     a_lead_traj = a_lead * np.exp(-a_lead_tau * (T_IDXS**2)/2.)
     v_lead_traj = np.clip(v_lead + np.cumsum(T_DIFFS * a_lead_traj), 0.0, 1e8)
     x_lead_traj = x_lead + np.cumsum(T_DIFFS * v_lead_traj)
-    return np.column_stack((x_lead_traj, v_lead_traj))
+    lead_xv = np.column_stack((x_lead_traj, v_lead_traj))
+    return lead_xv
 
-  @staticmethod
-  def process_lead_model(model_lead, radar_lead, v_ego):
-    """Build the lead trajectory with three explicit trust tiers.
-
-    A valid model lead anchored by a present radar lead uses the model prediction.
-    If the model lead is invalid while radar still sees a lead, stock radar-physics
-    extrapolation preserves braking for the real vehicle. Only when radar sees no
-    lead do we use the fake-fast-lead trajectory that keeps the solver in-mode.
-    """
-    if model_lead is not None and model_lead.prob > 0.5 and radar_lead.present:
-      x = np.asarray(model_lead.x, dtype=np.float64)
-      v = np.asarray(model_lead.v, dtype=np.float64)
-      x_lead_traj = float(radar_lead.dRel) + (x - x[0])
-      v_lead_traj = float(radar_lead.vLead) + (v - v[0])
-    elif radar_lead.present:
-      x_lead = float(radar_lead.dRel)
-      v_lead = float(radar_lead.vLead)
-      a_lead = np.clip(float(radar_lead.aLeadK), -10.0, 5.0)
-      min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead) * (v_ego - v_lead) / (-ACCEL_MIN * 2)
-      x_lead = np.clip(x_lead, min_x_lead, 1e8)
-      v_lead = np.clip(v_lead, 0.0, 1e8)
-      return LongitudinalMpc.extrapolate_lead(x_lead, v_lead, a_lead, radar_lead.aLeadTau)
+  def process_lead(self, lead):
+    v_ego = self.x0[1]
+    if lead is not None and lead.present:
+      x_lead = lead.dRel
+      v_lead = lead.vLead
+      a_lead = lead.aLeadK
+      a_lead_tau = lead.aLeadTau
     else:
-      # Fake a fast lead so the MPC stays in the same mode
-      x_lead_traj = 50.0 + (v_ego + 10.0) * LEAD_T_IDXS_MODEL
-      v_lead_traj = np.full_like(LEAD_T_IDXS_MODEL, v_ego + 10.0)
+      # Fake a fast lead car, so mpc can keep running in the same mode
+      x_lead = 50.0
+      v_lead = v_ego + 10.0
+      a_lead = 0.0
+      a_lead_tau = _LEAD_ACCEL_TAU
 
-    # MPC won't converge on an immediate expected crash; lift h=0 to min braking distance
-    v_lead_0 = v_lead_traj[0]
-    min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead_0) * (v_ego - v_lead_0) / (-ACCEL_MIN * 2)
-    x_lead_traj[0] = max(x_lead_traj[0], min_x_lead)
-    v_lead_traj = np.clip(v_lead_traj, 0.0, 1e8)
+    # MPC will not converge if immediate crash is expected
+    # Clip lead distance to what is still possible to brake for
+    min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead) * (v_ego - v_lead) / (-ACCEL_MIN * 2)
+    x_lead = np.clip(x_lead, min_x_lead, 1e8)
+    v_lead = np.clip(v_lead, 0.0, 1e8)
+    a_lead = np.clip(a_lead, -10., 5.)
+    lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
+    return lead_xv
 
-    x_lead_mpc = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead_traj))
-    v_lead_mpc = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead_traj)
-    return np.column_stack((x_lead_mpc, v_lead_mpc))
+  def process_lead_model(self, model_lead, radar_lead):
+    """Use a finite model lead trajectory anchored to radar, else exact stock fallback."""
+    trajectory_valid = False
+    if model_lead is not None and radar_lead is not None and radar_lead.present:
+      try:
+        x_model = np.asarray(model_lead.x, dtype=np.float64)
+        v_model = np.asarray(model_lead.v, dtype=np.float64)
+        trajectory_valid = (
+          float(model_lead.prob) > 0.5
+          and x_model.shape == LEAD_T_IDXS_MODEL.shape
+          and v_model.shape == LEAD_T_IDXS_MODEL.shape
+          and np.all(np.isfinite(x_model))
+          and np.all(np.isfinite(v_model))
+        )
+      except (AttributeError, TypeError, ValueError):
+        trajectory_valid = False
+
+    if not trajectory_valid:
+      return self.process_lead(radar_lead)
+
+    v_ego = self.x0[1]
+    x_lead = float(radar_lead.dRel) + x_model - x_model[0]
+    v_lead = float(radar_lead.vLead) + v_model - v_model[0]
+
+    # The solver cannot converge on an immediate expected crash. Preserve the
+    # stock h=0 lift, then interpolate the authored future lead motion.
+    min_x_lead = MIN_X_LEAD_FACTOR * (v_ego + v_lead[0]) * (v_ego - v_lead[0]) / (-ACCEL_MIN * 2)
+    x_lead[0] = max(x_lead[0], min_x_lead)
+    x_lead = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead))
+    v_lead = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, np.clip(v_lead, 0.0, 1e8))
+    return np.column_stack((x_lead, v_lead))
 
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
              t_follow=None, model_leads=None):
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
-    v_ego = self.x0[1]
 
-    ml0 = model_leads[0] if model_leads is not None else None
-    ml1 = model_leads[1] if model_leads is not None else None
-    lead_xv_0 = self.process_lead_model(ml0, radarstate.leadOne, v_ego)
-    lead_xv_1 = self.process_lead_model(ml1, radarstate.leadTwo, v_ego)
+    model_lead_0 = model_leads[0] if model_leads is not None and len(model_leads) > 0 else None
+    model_lead_1 = model_leads[1] if model_leads is not None and len(model_leads) > 1 else None
+    lead_xv_0 = self.process_lead_model(model_lead_0, radarstate.leadOne)
+    lead_xv_1 = self.process_lead_model(model_lead_1, radarstate.leadTwo)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
@@ -350,18 +372,15 @@ class LongitudinalMpc:
     self.solver.set(N, "yref", self.yref[N][:COST_E_DIM])
 
     self.params[:,0] = ACCEL_MIN
-    self.params[:,1] = ACCEL_MAX
+    self.params[:,1] = BLOTV2_ACCEL_MAX
     self.params[:,2] = np.min(x_obstacles, axis=1)
     self.params[:,3] = np.copy(self.a_prev)
     self.params[:,4] = t_follow
     self.params[:,5] = LEAD_DANGER_FACTOR
 
     self.run()
-    # FCW confidence gate follows the trajectory source (PR #37824): the crash check compares
-    # against lead_xv_0, so gate on the same source's confidence
-    lead_prob_ok = ml0 is not None and ml0.prob > 0.9
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
-            lead_prob_ok):
+            radarstate.leadOne.present and radarstate.leadOne.modelProb > 0.9):
       self.crash_cnt += 1
     else:
       self.crash_cnt = 0
