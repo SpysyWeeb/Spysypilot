@@ -3,6 +3,7 @@ from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
+from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.smooth_stops import SmoothStopController
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -52,8 +53,9 @@ class LongControl:
 
   def update(self, active, CS, a_target, should_stop, accel_limits, lead: LeadObservation | None = None):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
+    pos_limit = min(accel_limits[1], BLOTV2_ACCEL_MAX)
     self.pid.neg_limit = accel_limits[0]
-    self.pid.pos_limit = accel_limits[1]
+    self.pid.pos_limit = pos_limit
 
     # Smooth Stops owns only a rolling final approach. This is safe from both
     # pid and off: current openpilot has no separate starting command that can
@@ -96,5 +98,5 @@ class LongControl:
                                        feedforward=a_target)
         self.smooth_stop.reset()
 
-    self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
+    self.last_output_accel = np.clip(output_accel, accel_limits[0], pos_limit)
     return self.last_output_accel

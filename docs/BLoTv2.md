@@ -213,11 +213,11 @@ acceleration allows `2.0 m/s²` at low speed.
 
 This reaches, but never exceeds, stock `ACCEL_MAX = 2.0 m/s²`. A local
 `BLOTV2_ACCEL_MAX = min(ACCEL_MAX, 2.0)` compatibility guard applies the same
-ceiling to cruise, experimental/e2e, and MPC bounds when BLoTv2 is integrated
-into a fork that still exposes BLoT v1's raised limit. Unlike BLoT v1, BLoTv2
-changes no opendbc submodule, panda submodule, platform safety constant, or CAN
-jerk limit. Strong braking remains available because Smooth Stops passes
-stronger plan braking through.
+ceiling to cruise, experimental/e2e, MPC bounds, and the final longitudinal
+PID command when BLoTv2 is integrated into a fork that still exposes BLoT v1's
+raised limit. Unlike BLoT v1, BLoTv2 changes no opendbc submodule, panda
+submodule, platform safety constant, or CAN jerk limit. Strong braking remains
+available because Smooth Stops passes stronger plan braking through.
 
 Aggressive personality retains BLoT's `1.0 s` base follow setting; standard and
 relaxed remain `1.45 s` and `1.75 s`. Dynamic onset can only add headway.
