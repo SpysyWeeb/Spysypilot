@@ -32,8 +32,10 @@ stop prediction, hold that handoff through the stop, and return to Chill after
 a stable release or driver override. This branch has no standalone traffic
 light or stop-sign classifier, so the detector uses the model's existing
 `action.shouldStop`, path-end, and desired-acceleration signals. The feature
-will publish only through `selfdriveState.experimentalMode`; it adds no UI or
+publishes only through `selfdriveState.experimentalMode`; it adds no UI or
 user-facing Params and does not own target speed or braking.
+The implementation and signal mapping are documented in
+[`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 
 Each physical decision has one owner. The planner/MPC owns trajectory
 necessity, Smooth Stops owns only the final low-speed approach and hold
