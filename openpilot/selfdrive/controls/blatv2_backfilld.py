@@ -36,6 +36,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
   LearningOperationStatusPublisher,
   route_identity_sha256,
 )
+from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
+  BackfillProgressPublisher,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   build_persistent_learning_runtime,
 )
@@ -111,6 +114,7 @@ class BlatV2BackfillDaemon:
     self.descriptor_path = Path(descriptor_path)
     self.current_build_clean = current_build_clean
     self.operation_status = LearningOperationStatusPublisher(self.params)
+    self.backfill_progress = BackfillProgressPublisher(self.params)
     self._stopping = False
 
   def stop(self, *_args: object) -> None:
@@ -280,6 +284,7 @@ class BlatV2BackfillDaemon:
       descriptor_registry=registry,
       expected_dongle_id=dongle_id,
       operation_status=self.operation_status,
+      backfill_progress=self.backfill_progress,
       abort_requested=self._abort_requested,
       pending_route_identity=pending_route_identity,
     )
@@ -293,6 +298,7 @@ class BlatV2BackfillDaemon:
     # the cancelled offroad transaction and must not overwrite live status.
     if self._abort_requested():
       return
+    self.backfill_progress.clear()
     last = self.operation_status.last_payload
     continuing_operation = last is not None and last["terminal"] is False
     context: dict[str, object] = {

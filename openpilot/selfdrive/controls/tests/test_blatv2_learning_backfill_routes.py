@@ -286,6 +286,8 @@ def prepare_fixture(
   descriptor: BuildDescriptor | None = None,
   car_params_decoder=lambda _encoded: None,
   route_bundle_factory=None,
+  segment_started=None,
+  segment_completed=None,
 ):
   segment_path = tmp_path / "rlog"
   segment_path.write_bytes(b"immutable-rlog")
@@ -330,6 +332,8 @@ def prepare_fixture(
     current_car_params=cp,
     current_bundle=current_bundle,
     expected_dongle_id=DONGLE_ID,
+    segment_started=segment_started,
+    segment_completed=segment_completed,
   )
 
 
@@ -338,6 +342,43 @@ def palisade_cp() -> car.CarParams:
   cp = CarInterface.get_non_essential_params(CAR.HYUNDAI_PALISADE)
   cp.carVin = "KM8R74HE0LU000001"
   return cp
+
+
+def test_segment_progress_callbacks_do_not_change_prepared_route(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  palisade_cp: car.CarParams,
+) -> None:
+  records, events = extracted_fixture(palisade_cp)
+  baseline = prepare_fixture(
+    tmp_path,
+    monkeypatch,
+    records=records,
+    events=events,
+    cp=palisade_cp,
+    car_params_decoder=None,
+  )
+  callbacks: list[tuple[str, int, int, int]] = []
+  observed = prepare_fixture(
+    tmp_path,
+    monkeypatch,
+    records=records,
+    events=events,
+    cp=palisade_cp,
+    car_params_decoder=None,
+    segment_started=lambda segment, index, count: callbacks.append(
+      ("started", segment.index, index, count),
+    ),
+    segment_completed=lambda segment, index, count: callbacks.append(
+      ("completed", segment.index, index, count),
+    ),
+  )
+
+  assert observed == baseline
+  assert callbacks == [
+    ("started", 0, 1, 1),
+    ("completed", 0, 1, 1),
+  ]
 
 
 def test_equal_timestamp_join_uses_original_record_order(
