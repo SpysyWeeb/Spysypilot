@@ -26,7 +26,6 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
 )
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
-from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
@@ -98,7 +97,6 @@ class LongitudinalPlanner:
     self.a_desired = init_a
     self.last_mpc_a_target = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
-    self.force_stops = ForceStops(dt=self.dt)
     self.a_cruise = 0.0
     self.output_a_target = 0.0
     self.output_should_stop = False
@@ -261,9 +259,6 @@ class LongitudinalPlanner:
       a_launch_max = np.interp(v_ego, [LAUNCH_MOVING_SPEED, LAUNCH_DISARM_SPEED], [LAUNCH_MAX_ACCEL, 0.])
       output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
 
-    # Force Stops caps only the cruise candidate; MPC and e2e retain their own
-    # obstacle and stop-intent ownership.
-    v_cruise = min(v_cruise, self.force_stops.update(sm))
     self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle)

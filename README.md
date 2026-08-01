@@ -25,6 +25,22 @@ Copies of `combo` that differ only in the driving model they run:
 
 [`rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rl-combo) is a special case: it runs comma's Rebel Legion release model but is **not** a pure copy of `combo` — it also merges upstream `commaai/openpilot` master ahead of `stock`, plus small tuning deltas (e.g. `LONG_SMOOTH` 0.0), so expect it to differ beyond the model swap.
 
+## BLoTv2 Conditional Experimental Mode
+
+**Status: in progress; awaiting field validation.** Combo normally remains in
+Chill mode, then hands its existing longitudinal planner to Experimental mode
+for a confirmed, lead-free model stop prediction. It holds that handoff through
+the stop and returns to Chill after a stable release or driver override.
+
+There is no standalone traffic-light or stop-sign classifier in this build, so
+the detector uses the model's existing `action.shouldStop`, path-end, and
+desired-acceleration signals. The effective state has one owner and publishes
+through `selfdriveState.experimentalMode`, which drives both the stock on-road
+icon and planner strategy. The feature adds no UI or user-facing Params and
+does not own target speed or braking. The implementation, signal mapping, and
+ownership boundaries are documented in
+[`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
+
 ## BLaTv2 modular replacement
 
 **Status: in progress.** The previous LQI-based BLaTv2 controller is retired.
@@ -124,7 +140,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with two display-only BLaTv2 learning/readiness pages plus the existing live terminal and system graphs; the former route analyzer and `drive_statsd` are removed &nbsp;*(personal idea)*
 - ✅ **[Swapped cruise speed adjustments](https://github.com/SpysyWeeb/Spysypilot/tree/swapped-cruise-speed)** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(inspired by sunnypilot)*
 - ❌ **Quiet mode** — silence the engage and disengage sounds while leaving safety alerts audible; no branch yet &nbsp;*(inspired by sunnypilot)*
-- ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — makes experimental mode actually commit to red lights and stop signs instead of the model's indecisive crawl, by latching the model's own planned stop point and capping cruise speed to reach it &nbsp;*(inspired by IQPilot)*
+- ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — legacy stop-strategy branch retained for reference; its independent cruise-speed cap is intentionally removed from `combo` and superseded there by BLoTv2 Conditional Experimental Mode &nbsp;*(inspired by IQPilot)*
 - ⚠️ **[Better green lights](https://github.com/SpysyWeeb/Spysypilot/tree/better-green-lights)** — experimental-mode green-light launches start ~1.5–2s sooner by reading the model's path-length explosion instead of its laggy shouldStop bit, plus a launch assist that skips the dead time at the head of the model's speed plan &nbsp;*(personal idea)*
 - ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
 - ⚠️ **[Universal driving-event logger](https://github.com/SpysyWeeb/Spysypilot/tree/driving-event-platform)** — one rlog-first platform records automatic lateral and longitudinal failures plus general manual bookmarks, confirms preservation before showing UI success, and builds a bounded/reconstructable SSH manifest; lateral detector v7 adds b7-derived unused-authority and confirmed-driver-takeover events and remains in field validation; see [docs/DrivingEventPlatform.md](docs/DrivingEventPlatform.md) &nbsp;*(personal idea)*

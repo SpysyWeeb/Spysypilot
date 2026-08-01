@@ -30,6 +30,7 @@ The product target is **Smooth. Swift. Strong.**
 | Final rolling landing | `SmoothStopController` |
 | Standstill hold | stock `LongCtrlState.stopping` |
 | Acceleration tracking | stock longitudinal PID |
+| Effective Chill/Experimental mode | `selfdrived` |
 | Vehicle command limits | opendbc |
 | Independent safety ceiling | panda |
 
@@ -38,6 +39,8 @@ layer's decision. In particular:
 
 - the supervisor never commands acceleration;
 - Smooth Stops never weakens a stronger planner brake request;
+- Conditional Experimental Mode never commands a speed, acceleration, brake,
+  or stop point;
 - BLoTv2 does not raise opendbc or panda limits;
 - model-independent BLoTv2 policy does not override the experimental/e2e
   acceleration candidate.
@@ -192,6 +195,67 @@ the same. The MPC acceleration target remains unchanged, and an e2e stop
 candidate is never overridden. Invalid radar, disengagement, or ego motion fails
 closed.
 
+## Conditional Experimental Mode
+
+**Status: in progress; not field validated.** Ordinary driving requests Chill.
+A temporally confirmed, lead-free model stop prediction requests Experimental
+early enough for the existing e2e candidate to participate. `selfdrived`
+remains the only effective-mode owner and publishes the result through the
+unchanged `selfdriveState.experimentalMode` field:
+
+```text
+modelV2 + radarState + carState
+              |
+   filtered stop-intent request
+              |
+          selfdrived
+              |
+ selfdriveState.experimentalMode
+        |                 |
+ longitudinal planner    stock on-road icon
+```
+
+The existing stock `ExperimentalMode` Param remains only a manual request.
+The Params thread no longer writes the effective mode asynchronously;
+`selfdrived` resolves manual and conditional requests in one place, with a
+driver pedal override taking priority.
+
+### BLoTv2 signal mapping
+
+This model/cereal revision has no traffic-light class, stop-sign class,
+dashboard stop signal, or calibrated stop-object probability. The detector
+therefore describes a **generic model stop intent**, not a semantic claim about
+what caused it.
+
+| Stop evidence | BLoTv2 signal and use |
+|---|---|
+| Direct final-approach intent | `modelV2.action.shouldStop` |
+| Early prediction | `position.x[-1]` is inside a `5.0 s` ego-speed horizon and `velocity.x[-1] <= 1.0 m/s` |
+| Missing-velocity fallback | short path plus `action.desiredAcceleration <= -0.5 m/s²` |
+| Lead ownership | relevant `radarState.leadOne` blocks a new handoff |
+| Committed turn guard | low-speed blinker plus large steering angle/model curvature blocks a new handoff |
+| Release/override | stable model clear, resumed motion, gas, brake, invalid model, or disengagement |
+
+The evidence filter uses a `0.30 s` time constant, separate entry/release
+thresholds, `0.20 s` entry debounce, and `0.75 s` release hysteresis. A mode
+handoff has a `1.0 s` minimum latch. Once standstill is reached, the generic
+stop latch is held for at least `1.0 s`; it remains active indefinitely while
+stop evidence stays valid, then releases after the same stable-clear test. A
+resume above `0.8 m/s` releases immediately. Gas or brake suppresses a new
+handoff for `2.0 s`, and a completed stop gets the same `2.0 s` re-entry guard.
+All values live together in `conditional_experimental_mode.py`; no tuning Param
+or UI control is added.
+
+### Force Stops replacement
+
+The BLoTv2 tree has no `force_stops.py`, `ForceStops` planner member, or cruise
+speed cap. Conditional Experimental Mode replaces that strategy by selecting
+the already-existing e2e planner candidate; the planner, MPC, Smooth Stops,
+longitudinal PID, opendbc, and panda keep their existing responsibilities.
+When BLoTv2 is integrated into a tree that still contains the older Force Stops
+feature, its file, import, constructor hook, and `v_cruise` cap call must be
+removed. The two mechanisms must not run together.
+
 ## Strong
 
 The stock cruise comfort schedule leaves some existing platform authority
@@ -277,6 +341,9 @@ Automated coverage includes:
 - anti-creep progress, noisy rolling-lead thresholds, radar dropout, and
   stopped-to-moving queue transitions;
 - true-stop handoff and hold-release debounce;
+- Conditional Experimental entry filtering, release hysteresis, standstill
+  latch, model-health failure, lead/turn entry vetoes, pedal override, reset,
+  and `selfdriveState.experimentalMode` publication;
 - every supervisor trigger, hysteresis, emergency stand-down, and slew rate;
 - model lead anchoring and exact stock fallback for malformed/non-finite input;
 - BLoT v1 launch request and deployed-platform acceleration clamping;
@@ -291,4 +358,6 @@ See `BLoTv2_ACCEPTANCE.md` for remaining replay, device, and field gates.
 - overriding e2e acceleration or stop intent;
 - raising vehicle or panda safety limits;
 - changing the lateral controller;
+- classifying red lights or stop signs when the model publishes no such class;
+- adding a second stop-point, target-speed, or brake-command owner;
 - declaring the `4.0 m/s²` tune field-proven before owner testing.

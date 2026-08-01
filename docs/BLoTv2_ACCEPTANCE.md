@@ -30,6 +30,12 @@ Every test report must identify:
 - [x] Low-speed radar override qualification coverage.
 - [x] `4.0 m/s²` request is clamped by the deployed opendbc envelope.
 - [x] Existing BLoTv2 jerk and MPC tune retained for isolated evaluation.
+- [x] Conditional Experimental Mode uses only existing BLoTv2 model/cereal
+  signals and publishes through `selfdriveState.experimentalMode`.
+- [x] Conditional mode filtering, debounce, hysteresis, latch, lead/turn
+  guards, pedal override, invalid-model release, reset, and publication have
+  deterministic unit coverage.
+- [x] BLoTv2 contains no legacy Force Stops speed-cap owner or planner hook.
 - [x] Stock longitudinal maneuver matrix passes.
 - [x] Final static and generated-solver build audit.
 
@@ -50,6 +56,12 @@ Replay must use the real production classes, not copied equations.
   Smooth Stops—as the source of excessive 40-to-45 mph acceleration.
 - [ ] The route-derived stock-gate handoff is repeated on-road without
   excessive throttle feel, delayed response, or added speed overshoot.
+- [ ] Ordinary no-stop driving remains in Chill without mode flicker.
+- [ ] Lead-free red-light and stop-sign approaches enter Experimental before
+  braking is needed and remain there through the stop.
+- [ ] Green/resume and driver-pedal releases return to Chill without a
+  one-frame relatch or delayed launch.
+- [ ] Leads, curves, and signaled turns produce no false conditional handoff.
 
 Report at least:
 
@@ -76,6 +88,8 @@ launch lunge, or close-gap creep.
 - [ ] Exact deployed openpilot, opendbc, and panda commits are recorded.
 - [ ] Controller and panda limits support the requested authority end to end.
 - [ ] Acceleration commands stay inside vehicle limits.
+- [ ] The stock on-road icon matches `selfdriveState.experimentalMode` through
+  entry, standstill, and release transitions.
 
 ## Field sequence
 
