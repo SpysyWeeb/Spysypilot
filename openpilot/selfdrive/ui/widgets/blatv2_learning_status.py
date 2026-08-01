@@ -18,6 +18,7 @@ LEARNING_STATUS_SCHEMA_VERSION = 3
 LIFECYCLE_STATUS_SCHEMA_VERSION = 1
 LEARNING_OPERATION_STATUS_SCHEMA_VERSION = 1
 BACKFILL_PROGRESS_SCHEMA_VERSION = 1
+OFFDEVICE_PROGRESS_SCHEMA_VERSION = 1
 BEHAVIOR_LEARNING_STATUS_SCHEMA_VERSION = 1
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -197,6 +198,59 @@ _BACKFILL_PROGRESS_KEYS = frozenset((
   "total_work_units",
   "approximate_remaining_seconds",
 ))
+_OFFDEVICE_PROGRESS_KEYS = frozenset((
+  "completed_artifact_count",
+  "completed_bytes",
+  "certified_domain_count",
+  "certified_route_count",
+  "fallback_reason_code",
+  "informational_only",
+  "phase",
+  "remote_authority_count",
+  "remote_authority_index",
+  "remote_only_rejection_excluded_count",
+  "remote_route_count",
+  "remote_route_index",
+  "schema_version",
+  "sequence",
+  "session_id",
+  "total_artifact_count",
+  "total_bytes",
+  "total_certification_domain_count",
+  "total_certification_route_count",
+  "updated_mono_ns",
+))
+_OFFDEVICE_PROGRESS_PHASES = frozenset((
+  "remote_processing",
+  "downloading",
+  "arm_certifying",
+  "remote_ready",
+  "local_fallback",
+))
+_OFFDEVICE_FALLBACK_REASONS = frozenset((
+  "worker_unavailable",
+  "worker_busy",
+  "network_interrupted",
+  "remote_job_failed",
+  "remote_job_canceled",
+  "remote_route_limit",
+  "remote_artifact_unavailable",
+  "remote_certification_unavailable",
+  "remote_preparation_unavailable",
+))
+_OFFDEVICE_PHASE_TRANSITIONS = {
+  "remote_processing": frozenset((
+    "remote_processing", "downloading", "arm_certifying", "local_fallback",
+  )),
+  "downloading": frozenset((
+    "downloading", "arm_certifying", "local_fallback",
+  )),
+  "arm_certifying": frozenset((
+    "arm_certifying", "remote_ready", "local_fallback",
+  )),
+  "remote_ready": frozenset(("remote_ready",)),
+  "local_fallback": frozenset(("local_fallback",)),
+}
 _PROFILE_IDENTITY_KEYS = frozenset((
   "artifact_sha256",
   "profile_sha256",
@@ -793,6 +847,65 @@ class BackfillProgressStatus:
   @property
   def progress_fraction(self) -> float:
     return self.completed_work_units / self.total_work_units
+
+
+@dataclass(frozen=True, slots=True)
+class OffdeviceProgressStatus:
+  """Optional display-only detail for PC-assisted route preparation."""
+
+  session_id: str
+  sequence: int
+  updated_mono_ns: int
+  phase: str
+  remote_authority_count: int | None
+  remote_authority_index: int | None
+  remote_route_count: int | None
+  remote_route_index: int | None
+  completed_artifact_count: int | None
+  completed_bytes: int | None
+  total_artifact_count: int | None
+  total_bytes: int | None
+  certified_domain_count: int | None
+  certified_route_count: int | None
+  remote_only_rejection_excluded_count: int | None
+  total_certification_domain_count: int | None
+  total_certification_route_count: int | None
+  fallback_reason_code: str | None
+
+  @property
+  def progress_fraction(self) -> float | None:
+    if self.phase == "remote_processing":
+      assert self.remote_authority_count is not None
+      assert self.remote_authority_index is not None
+      assert self.remote_route_count is not None
+      assert self.remote_route_index is not None
+      total = self.remote_authority_count * self.remote_route_count
+      completed = (
+        max(0, self.remote_authority_index - 1) * self.remote_route_count
+        + max(0, self.remote_route_index - 1)
+      )
+      return min(1.0, completed / total)
+    if self.phase == "downloading":
+      assert self.completed_bytes is not None
+      assert self.total_bytes is not None
+      return self.completed_bytes / self.total_bytes
+    if self.phase in ("arm_certifying", "remote_ready"):
+      assert self.certified_domain_count is not None
+      assert self.certified_route_count is not None
+      assert self.remote_only_rejection_excluded_count is not None
+      assert self.total_certification_domain_count is not None
+      assert self.total_certification_route_count is not None
+      completed = (
+        self.certified_domain_count
+        + self.certified_route_count
+        + self.remote_only_rejection_excluded_count
+      )
+      total = (
+        self.total_certification_domain_count
+        + self.total_certification_route_count
+      )
+      return 1.0 if total == 0 else min(1.0, completed / total)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2422,6 +2535,358 @@ def validate_backfill_progress_update(
     )
 
 
+def _offdevice_optional_integer(data: dict[str, object], name: str) -> int | None:
+  return _integer(data[name], name, nullable=True)
+
+
+def _offdevice_certification_values(
+  data: dict[str, object],
+  *,
+  required: bool,
+) -> tuple[int, int, int, int, int] | None:
+  names = (
+    "certified_domain_count",
+    "certified_route_count",
+    "remote_only_rejection_excluded_count",
+    "total_certification_domain_count",
+    "total_certification_route_count",
+  )
+  values = tuple(_offdevice_optional_integer(data, name) for name in names)
+  present = tuple(value is not None for value in values)
+  if required and not all(present):
+    raise LearningStatusError(
+      "malformed",
+      "Off-device certification requires every counter",
+    )
+  if not required and not any(present):
+    return None
+  if not all(present):
+    raise LearningStatusError(
+      "malformed",
+      "Off-device certification counters are incomplete",
+    )
+  certified_domains, certified_routes, excluded_routes, total_domains, total_routes = values
+  assert certified_domains is not None
+  assert certified_routes is not None
+  assert excluded_routes is not None
+  assert total_domains is not None
+  assert total_routes is not None
+  if (
+    total_routes == 0
+    or certified_domains > total_domains
+    or certified_routes > total_routes
+    or excluded_routes > total_routes
+    or certified_routes + excluded_routes > total_routes
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "Off-device certification progress is outside its bounds",
+    )
+  return (
+    certified_domains,
+    certified_routes,
+    excluded_routes,
+    total_domains,
+    total_routes,
+  )
+
+
+def parse_offdevice_progress_status(
+  raw: object,
+  *,
+  now_mono_ns: int,
+) -> OffdeviceProgressStatus:
+  """Strictly decode the optional, informational PC-bridge projection."""
+  if raw is None:
+    raise LearningStatusError(
+      "offdevice_absent",
+      "PC processing progress has not been published",
+    )
+  if type(now_mono_ns) is not int or now_mono_ns < 0:
+    raise ValueError("now_mono_ns must be a non-negative integer")
+  if type(raw) is not dict:
+    raise LearningStatusError(
+      "malformed",
+      "Off-device progress must be a Params JSON object",
+    )
+  if (
+    type(raw.get("schema_version")) is not int
+    or raw["schema_version"] != OFFDEVICE_PROGRESS_SCHEMA_VERSION
+  ):
+    raise LearningStatusError(
+      "schema_mismatch",
+      "Off-device progress version is not supported",
+    )
+  data = _exact_object(raw, _OFFDEVICE_PROGRESS_KEYS, "off-device progress")
+  if data["informational_only"] is not True:
+    raise LearningStatusError(
+      "malformed",
+      "Off-device progress is not marked display-only",
+    )
+
+  session_id = data["session_id"]
+  if type(session_id) is not str or _OPERATION_ID_RE.fullmatch(session_id) is None:
+    raise LearningStatusError(
+      "malformed",
+      "session_id must be 32 lowercase hexadecimal characters",
+    )
+  sequence = _integer(data["sequence"], "sequence")
+  updated_mono_ns = _integer(data["updated_mono_ns"], "updated_mono_ns")
+  if updated_mono_ns > now_mono_ns:
+    raise LearningStatusError("stale", "Off-device progress timestamp is stale")
+  phase = data["phase"]
+  if type(phase) is not str or phase not in _OFFDEVICE_PROGRESS_PHASES:
+    raise LearningStatusError("malformed", "Off-device phase is not recognized")
+
+  remote_names = (
+    "remote_authority_count",
+    "remote_authority_index",
+    "remote_route_count",
+    "remote_route_index",
+  )
+  download_names = (
+    "completed_artifact_count",
+    "completed_bytes",
+    "total_artifact_count",
+    "total_bytes",
+  )
+  remote_values = tuple(
+    _offdevice_optional_integer(data, name) for name in remote_names
+  )
+  download_values = tuple(
+    _offdevice_optional_integer(data, name) for name in download_names
+  )
+
+  fallback_reason = data["fallback_reason_code"]
+  if fallback_reason is not None and type(fallback_reason) is not str:
+    raise LearningStatusError(
+      "malformed",
+      "fallback_reason_code must be text or null",
+    )
+  if phase == "local_fallback":
+    if fallback_reason not in _OFFDEVICE_FALLBACK_REASONS:
+      raise LearningStatusError(
+        "malformed",
+        "Local fallback requires a stable reason code",
+      )
+  elif fallback_reason is not None:
+    raise LearningStatusError(
+      "malformed",
+      "Fallback reason is valid only during local fallback",
+    )
+
+  if phase == "remote_processing":
+    if any(value is None for value in remote_values):
+      raise LearningStatusError(
+        "malformed",
+        "PC processing requires every route coordinate",
+      )
+    authority_count, authority_index, route_count, route_index = remote_values
+    assert authority_count is not None
+    assert authority_index is not None
+    assert route_count is not None
+    assert route_index is not None
+    if (
+      authority_count != 2
+      or route_count == 0
+      or authority_index > authority_count
+      or route_index > route_count
+      or ((authority_index == 0) != (route_index == 0))
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "PC processing coordinate is outside its bounds",
+      )
+    if any(value is not None for value in download_values):
+      raise LearningStatusError("malformed", "PC processing includes download counters")
+    certification = _offdevice_certification_values(data, required=False)
+    if certification is not None:
+      raise LearningStatusError("malformed", "PC processing includes certification counters")
+  elif phase == "downloading":
+    if any(value is None for value in download_values):
+      raise LearningStatusError(
+        "malformed",
+        "Prepared-data download requires every transfer counter",
+      )
+    completed_artifacts, completed_bytes, total_artifacts, total_bytes = download_values
+    assert completed_artifacts is not None
+    assert completed_bytes is not None
+    assert total_artifacts is not None
+    assert total_bytes is not None
+    if (
+      total_artifacts == 0
+      or total_bytes == 0
+      or completed_artifacts > total_artifacts
+      or completed_bytes > total_bytes
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "Prepared-data download is outside its bounds",
+      )
+    if any(value is not None for value in remote_values):
+      raise LearningStatusError("malformed", "Download includes PC route counters")
+    certification = _offdevice_certification_values(data, required=False)
+    if certification is not None:
+      raise LearningStatusError("malformed", "Download includes certification counters")
+  elif phase == "arm_certifying":
+    if any(value is not None for value in (*remote_values, *download_values)):
+      raise LearningStatusError("malformed", "ARM verification includes unrelated counters")
+    _offdevice_certification_values(data, required=True)
+  elif phase == "remote_ready":
+    if any(value is not None for value in (*remote_values, *download_values)):
+      raise LearningStatusError("malformed", "Prepared data includes unrelated counters")
+    certification = _offdevice_certification_values(data, required=True)
+    assert certification is not None
+    certified_domains, certified_routes, excluded_routes, total_domains, total_routes = certification
+    if certified_domains != total_domains or certified_routes + excluded_routes != total_routes:
+      raise LearningStatusError(
+        "malformed",
+        "Prepared-data status lacks complete verification coverage",
+      )
+  else:
+    if any(value is not None for value in (*remote_values, *download_values)):
+      raise LearningStatusError("malformed", "Local fallback includes unrelated counters")
+    _offdevice_certification_values(data, required=False)
+
+  return OffdeviceProgressStatus(
+    session_id=session_id,
+    sequence=sequence,
+    updated_mono_ns=updated_mono_ns,
+    phase=phase,
+    remote_authority_count=remote_values[0],
+    remote_authority_index=remote_values[1],
+    remote_route_count=remote_values[2],
+    remote_route_index=remote_values[3],
+    completed_artifact_count=download_values[0],
+    completed_bytes=download_values[1],
+    total_artifact_count=download_values[2],
+    total_bytes=download_values[3],
+    certified_domain_count=_offdevice_optional_integer(data, "certified_domain_count"),
+    certified_route_count=_offdevice_optional_integer(data, "certified_route_count"),
+    remote_only_rejection_excluded_count=_offdevice_optional_integer(
+      data,
+      "remote_only_rejection_excluded_count",
+    ),
+    total_certification_domain_count=_offdevice_optional_integer(
+      data,
+      "total_certification_domain_count",
+    ),
+    total_certification_route_count=_offdevice_optional_integer(
+      data,
+      "total_certification_route_count",
+    ),
+    fallback_reason_code=fallback_reason,
+  )
+
+
+def validate_offdevice_progress_update(
+  previous: OffdeviceProgressStatus | None,
+  current: OffdeviceProgressStatus,
+) -> None:
+  """Reject torn or regressed bridge sessions without affecting learning."""
+  if previous is None:
+    return
+  if previous.session_id != current.session_id:
+    if (
+      current.phase not in ("remote_processing", "local_fallback")
+      or current.sequence != 0
+    ):
+      raise LearningStatusError(
+        "stale",
+        "New PC processing session did not begin at a valid initial phase",
+      )
+    return
+  if current.sequence < previous.sequence:
+    raise LearningStatusError("stale", "Off-device progress sequence moved backward")
+  if current.sequence == previous.sequence:
+    if current != previous:
+      raise LearningStatusError(
+        "stale",
+        "Off-device progress changed without advancing its sequence",
+      )
+    return
+  if current.updated_mono_ns <= previous.updated_mono_ns:
+    raise LearningStatusError(
+      "stale",
+      "Off-device progress advanced with a stale timestamp",
+    )
+  if current.phase not in _OFFDEVICE_PHASE_TRANSITIONS[previous.phase]:
+    raise LearningStatusError("stale", "Off-device progress phase moved backward")
+
+  if previous.phase == current.phase == "remote_processing":
+    assert previous.remote_authority_index is not None
+    assert previous.remote_route_index is not None
+    assert current.remote_authority_index is not None
+    assert current.remote_route_index is not None
+    if (
+      previous.remote_authority_count != current.remote_authority_count
+      or previous.remote_route_count != current.remote_route_count
+      or (
+        current.remote_authority_index,
+        current.remote_route_index,
+      ) < (
+        previous.remote_authority_index,
+        previous.remote_route_index,
+      )
+    ):
+      raise LearningStatusError("stale", "PC route progress moved backward")
+  if previous.phase == current.phase == "downloading":
+    assert previous.completed_artifact_count is not None
+    assert previous.completed_bytes is not None
+    assert current.completed_artifact_count is not None
+    assert current.completed_bytes is not None
+    if (
+      previous.total_artifact_count != current.total_artifact_count
+      or previous.total_bytes != current.total_bytes
+      or current.completed_artifact_count < previous.completed_artifact_count
+      or current.completed_bytes < previous.completed_bytes
+    ):
+      raise LearningStatusError("stale", "Prepared-data download moved backward")
+
+  previous_certification = (
+    previous.certified_domain_count,
+    previous.certified_route_count,
+    previous.remote_only_rejection_excluded_count,
+    previous.total_certification_domain_count,
+    previous.total_certification_route_count,
+  )
+  current_certification = (
+    current.certified_domain_count,
+    current.certified_route_count,
+    current.remote_only_rejection_excluded_count,
+    current.total_certification_domain_count,
+    current.total_certification_route_count,
+  )
+  if any(value is not None for value in previous_certification):
+    if any(value is None for value in current_certification):
+      raise LearningStatusError("stale", "ARM verification progress disappeared")
+    previous_domains, previous_routes, previous_excluded, previous_total_domains, previous_total_routes = previous_certification
+    current_domains, current_routes, current_excluded, current_total_domains, current_total_routes = current_certification
+    assert previous_domains is not None
+    assert previous_routes is not None
+    assert previous_excluded is not None
+    assert previous_total_domains is not None
+    assert previous_total_routes is not None
+    assert current_domains is not None
+    assert current_routes is not None
+    assert current_excluded is not None
+    assert current_total_domains is not None
+    assert current_total_routes is not None
+    if (
+      current_total_domains != previous_total_domains
+      or current_total_routes != previous_total_routes
+      or current_domains < previous_domains
+      or current_routes < previous_routes
+      or current_excluded < previous_excluded
+    ):
+      raise LearningStatusError("stale", "ARM verification progress moved backward")
+  if (
+    previous.phase == current.phase == "local_fallback"
+    and previous.fallback_reason_code != current.fallback_reason_code
+  ):
+    raise LearningStatusError("stale", "Local fallback reason changed")
+
+
 def validate_operation_update(
   previous: LearningOperationStatus | None,
   current: LearningOperationStatus,
@@ -3125,6 +3590,153 @@ def parse_lifecycle_status(
   )
 
 
+_OFFDEVICE_FALLBACK_LABELS = {
+  "worker_unavailable": "PC worker unavailable",
+  "worker_busy": "PC worker busy",
+  "network_interrupted": "Network connection interrupted",
+  "remote_job_failed": "PC processing failed",
+  "remote_job_canceled": "PC processing canceled",
+  "remote_route_limit": "PC route limit reached",
+  "remote_artifact_unavailable": "Prepared PC data unavailable",
+  "remote_certification_unavailable": "On-device verification unavailable",
+  "remote_preparation_unavailable": "PC preparation unavailable",
+}
+
+
+def _format_byte_count(value: int) -> str:
+  amount = float(value)
+  for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+    if amount < 1024.0 or unit == "TiB":
+      return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+    amount /= 1024.0
+  raise AssertionError("byte unit loop did not terminate")
+
+
+def _offdevice_presentation(
+  progress: OffdeviceProgressStatus,
+  *,
+  status: LearningOperationStatus | None,
+  error_code: str | None,
+  error_message: str | None,
+  has_learning_snapshot: bool,
+  backfill_progress: BackfillProgressStatus | None,
+) -> OperationPresentation:
+  if progress.phase == "local_fallback":
+    local = operation_presentation(
+      status,
+      error_code=error_code,
+      error_message=error_message,
+      has_learning_snapshot=has_learning_snapshot,
+      backfill_progress=backfill_progress,
+      offdevice_progress=None,
+    )
+    assert progress.fallback_reason_code is not None
+    reason = _OFFDEVICE_FALLBACK_LABELS[progress.fallback_reason_code]
+    if backfill_progress is not None and local.progress_fraction is not None:
+      phase_detail = reason
+      if local.phase_detail is not None:
+        phase_detail += f" | {local.phase_detail}"
+      return OperationPresentation(
+        title="PROCESSING LOCALLY",
+        detail=local.detail,
+        tone="amber",
+        show_banner=local.show_banner,
+        phase_detail=phase_detail,
+        meta=local.meta,
+        compact_meta=local.compact_meta,
+        progress_fraction=local.progress_fraction,
+      )
+    return OperationPresentation(
+      title="PROCESSING LOCALLY",
+      detail=f"{reason} | {local.detail}",
+      tone="amber",
+      show_banner=local.show_banner,
+    )
+
+  if progress.phase == "remote_processing":
+    assert progress.remote_authority_count is not None
+    assert progress.remote_authority_index is not None
+    assert progress.remote_route_count is not None
+    assert progress.remote_route_index is not None
+    if progress.remote_authority_index == 0:
+      detail = "PC worker preparing route inventory"
+    else:
+      detail_fields = [
+        f"Pass {progress.remote_authority_index}/{progress.remote_authority_count}",
+        f"Route {progress.remote_route_index}/{progress.remote_route_count}",
+      ]
+      if (
+        backfill_progress is not None
+        and status is not None
+        and backfill_progress.operation_id == status.operation_id
+        and backfill_progress.operation_sequence == status.sequence
+        and backfill_progress.pass_index == progress.remote_authority_index
+        and backfill_progress.current_route_index == progress.remote_route_index
+        and backfill_progress.current_segment_index is not None
+        and backfill_progress.current_route_segment_count is not None
+      ):
+        segment_index = backfill_progress.current_segment_index
+        segment_count = backfill_progress.current_route_segment_count
+        detail_fields.append(
+          f"Segment {segment_index}/{segment_count}",
+        )
+      detail = " | ".join(detail_fields)
+    return OperationPresentation(
+      title="PC PROCESSING",
+      detail=detail,
+      tone="blue",
+      show_banner=has_learning_snapshot,
+      phase_detail="Preparing validated route data on the connected PC",
+      progress_fraction=progress.progress_fraction,
+    )
+
+  if progress.phase == "downloading":
+    assert progress.completed_artifact_count is not None
+    assert progress.total_artifact_count is not None
+    assert progress.completed_bytes is not None
+    assert progress.total_bytes is not None
+    detail = " | ".join((
+      f"{progress.completed_artifact_count}/{progress.total_artifact_count} artifacts",
+      f"{_format_byte_count(progress.completed_bytes)} / {_format_byte_count(progress.total_bytes)}",
+    ))
+    return OperationPresentation(
+      title="DOWNLOADING PREPARED DATA",
+      detail=detail,
+      tone="blue",
+      show_banner=has_learning_snapshot,
+      phase_detail="Copying content-addressed prepared artifacts to this device",
+      progress_fraction=progress.progress_fraction,
+    )
+
+  assert progress.certified_domain_count is not None
+  assert progress.total_certification_domain_count is not None
+  assert progress.certified_route_count is not None
+  assert progress.total_certification_route_count is not None
+  assert progress.remote_only_rejection_excluded_count is not None
+  certification_detail = " | ".join((
+    f"{progress.certified_route_count}/{progress.total_certification_route_count} routes",
+    f"{progress.certified_domain_count}/{progress.total_certification_domain_count} domains",
+    f"{progress.remote_only_rejection_excluded_count} remote-only excluded",
+  ))
+  if progress.phase == "arm_certifying":
+    return OperationPresentation(
+      title="VERIFYING ON DEVICE",
+      detail=certification_detail,
+      tone="blue",
+      show_banner=has_learning_snapshot,
+      phase_detail="ARM certification uses only locally reproducible routes",
+      progress_fraction=progress.progress_fraction,
+    )
+  return OperationPresentation(
+    title="PREPARED DATA READY",
+    detail=certification_detail,
+    tone="green",
+    show_banner=has_learning_snapshot,
+    phase_detail="Prepared artifacts passed on-device certification",
+    progress_fraction=1.0,
+  )
+
+
 def operation_presentation(
   status: LearningOperationStatus | None,
   *,
@@ -3132,8 +3744,29 @@ def operation_presentation(
   error_message: str | None,
   has_learning_snapshot: bool,
   backfill_progress: BackfillProgressStatus | None = None,
+  offdevice_progress: OffdeviceProgressStatus | None = None,
 ) -> OperationPresentation:
   """Return truthful copy without treating absence as an empty history."""
+  if (
+    offdevice_progress is not None
+    and offdevice_progress.phase == "remote_ready"
+    and backfill_progress is not None
+    and backfill_progress.updated_mono_ns
+    > offdevice_progress.updated_mono_ns
+  ):
+    # Once the device begins consuming the certified artifacts, its newer
+    # replay/application projection owns the display. REMOTE_READY describes
+    # the handoff boundary, not the rest of finalization.
+    offdevice_progress = None
+  if offdevice_progress is not None:
+    return _offdevice_presentation(
+      offdevice_progress,
+      status=status,
+      error_code=error_code,
+      error_message=error_message,
+      has_learning_snapshot=has_learning_snapshot,
+      backfill_progress=backfill_progress,
+    )
   if status is None:
     unavailable = error_message or "Awaiting the learner's current status"
     if error_code == "operation_absent":
@@ -3288,6 +3921,7 @@ def learning_panel_presentation(
   learning_error_message: str | None,
   has_learning_snapshot: bool,
   backfill_progress: BackfillProgressStatus | None = None,
+  offdevice_progress: OffdeviceProgressStatus | None = None,
 ) -> OperationPresentation:
   """Plan the banner or empty state without discarding a valid snapshot."""
   operation = operation_presentation(
@@ -3296,6 +3930,7 @@ def learning_panel_presentation(
     error_message=operation_error_message,
     has_learning_snapshot=has_learning_snapshot,
     backfill_progress=backfill_progress,
+    offdevice_progress=offdevice_progress,
   )
   if has_learning_snapshot:
     return operation

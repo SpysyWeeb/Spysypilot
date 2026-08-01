@@ -27,11 +27,18 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
   BACKFILL_PROGRESS_PARAM,
 )
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
+  BridgeFallbackUnavailableError,
+)
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeCorruptError,
   BridgeIncompatibleError,
   BridgeRemoteError,
   BridgeUnavailableError,
+)
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_progress import (
+  OFFDEVICE_PROGRESS_PARAM,
+  OffdeviceFallbackReason,
 )
 
 
@@ -90,6 +97,7 @@ def test_terminal_failure_preserves_same_operation_progress(
   before = daemon.operation_status.last_payload
   assert before is not None
   params.values[BACKFILL_PROGRESS_PARAM] = {"stale": "progress"}
+  params.values[OFFDEVICE_PROGRESS_PARAM] = {"stale": "offdevice"}
 
   daemon._publish_failure(
     "backfill_publish_failed",
@@ -112,6 +120,7 @@ def test_terminal_failure_preserves_same_operation_progress(
   assert failed["current_route_index"] is None
   assert failed["total_route_count"] is None
   assert BACKFILL_PROGRESS_PARAM not in params.values
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
 
 
 def test_terminal_failure_cannot_overwrite_live_onroad_owner(
@@ -223,7 +232,48 @@ def test_missing_remote_config_falls_back_to_local_without_current(
     assert daemon._prepare_remote(engine, object(), b"encoded") is None
 
   assert BACKFILL_PROGRESS_PARAM not in params.values
+  offdevice = params.values[OFFDEVICE_PROGRESS_PARAM]
+  assert type(offdevice) is dict
+  assert offdevice["phase"] == "local_fallback"
+  assert offdevice["fallback_reason_code"] == "worker_unavailable"
   assert not (storage / "CURRENT").exists()
+
+
+def test_offdevice_progress_io_failure_cannot_block_local_fallback(
+  tmp_path: Path,
+) -> None:
+  class FailingProgressParams(FakeParams):
+    def put(self, key: str, value: dict[str, object], *, block: bool) -> None:
+      if key == OFFDEVICE_PROGRESS_PARAM:
+        raise OSError("display storage unavailable")
+      super().put(key, value, block=block)
+
+    def remove(self, key: str) -> None:
+      if key == OFFDEVICE_PROGRESS_PARAM:
+        raise OSError("display storage unavailable")
+      super().remove(key)
+
+  daemon = BlatV2BackfillDaemon(
+    params=FailingProgressParams(),
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+  )
+  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "missing-config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      side_effect=BridgeUnavailableError("not configured"),
+    ),
+  ):
+    assert daemon._prepare_remote(
+      SimpleNamespace(expected_dongle_id="f" * 16),
+      object(),
+      b"encoded",
+    ) is None
 
 
 def test_remote_preparation_passes_protected_worker_host_to_discovery(
@@ -330,6 +380,70 @@ def test_authenticated_worker_availability_error_falls_back_local(
     assert daemon._prepare_remote(engine, object(), b"encoded") is None
 
   assert BACKFILL_PROGRESS_PARAM not in params.values
+  offdevice = params.values[OFFDEVICE_PROGRESS_PARAM]
+  assert type(offdevice) is dict
+  assert offdevice["phase"] == "local_fallback"
+  expected_reason = {
+    "artifact_not_found": "remote_artifact_unavailable",
+    "busy": "worker_busy",
+    "internal_error": "remote_job_failed",
+    "job_failed": "remote_job_failed",
+    "job_not_found": "network_interrupted",
+    "route_unavailable": "remote_artifact_unavailable",
+  }[code]
+  assert offdevice["fallback_reason_code"] == expected_reason
+
+
+def test_reason_carrying_unavailable_error_survives_local_fallback(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+  )
+  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
+  engine = SimpleNamespace(
+    expected_dongle_id="f" * 16,
+    runtime_factory=MagicMock(return_value=runtime),
+  )
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value=None,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
+      return_value=object(),
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.OffdeviceBridgeClient",
+      return_value=object(),
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.prepare_remote_session",
+      side_effect=BridgeFallbackUnavailableError(
+        "route limit",
+        OffdeviceFallbackReason.REMOTE_ROUTE_LIMIT,
+      ),
+    ),
+  ):
+    assert daemon._prepare_remote(engine, object(), b"encoded") is None
+
+  offdevice = params.values[OFFDEVICE_PROGRESS_PARAM]
+  assert type(offdevice) is dict
+  assert offdevice["phase"] == "local_fallback"
+  assert offdevice["fallback_reason_code"] == "remote_route_limit"
 
 
 @pytest.mark.parametrize(
@@ -656,6 +770,7 @@ def test_onroad_handoff_clears_progress_without_overwriting_live_status(
     descriptor_path=tmp_path / "descriptors.json",
   )
   params.values[BACKFILL_PROGRESS_PARAM] = {"active": "offroad-progress"}
+  params.values[OFFDEVICE_PROGRESS_PARAM] = {"active": "pc-progress"}
   engine = SimpleNamespace(
     run_once=MagicMock(
       return_value=BackfillRunResult(
@@ -684,6 +799,7 @@ def test_onroad_handoff_clears_progress_without_overwriting_live_status(
   daemon.run()
 
   assert BACKFILL_PROGRESS_PARAM not in params.values
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
   assert params.values[LEARNING_OPERATION_STATUS_PARAM] is live_status
 
 

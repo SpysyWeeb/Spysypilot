@@ -864,6 +864,7 @@ class OffdeviceBridgeClient:
     expected_size_bytes: int,
     expected_sha256: str,
     sink: BinaryIO | None = None,
+    progress: Callable[[int, int], None] | None = None,
   ) -> bytes | None:
     """Download, bound, and hash one artifact without accepting a remote path."""
     if (
@@ -897,6 +898,8 @@ class OffdeviceBridgeClient:
         if written is not None and written != len(body):
           raise BridgeCorruptError("artifact sink accepted a partial write")
       offset += len(body)
+      if progress is not None:
+        progress(offset, expected_size_bytes)
     if digest.hexdigest() != expected_sha256:
       raise BridgeCorruptError("complete artifact SHA-256 is incorrect")
     return bytes(collected) if collected is not None else None

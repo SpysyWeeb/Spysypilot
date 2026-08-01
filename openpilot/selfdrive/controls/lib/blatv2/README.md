@@ -51,6 +51,16 @@ both passes. Its approximate remaining time stays unavailable until each kind
 of work has independent timing support. Operation and progress status are
 never approval, evidence, or controller-selection inputs.
 
+When the optional PC bridge is used, `BLaTv2OffdeviceProgress` independently
+reports PC processing, bounded artifact download, ARM certification,
+prepared-data handoff, or a stable local-fallback reason. A PC-only route that
+both remote authorities reject cannot be certified without local bytes, so it
+is excluded before effective discovery rather than recorded as a rejection.
+It contributes no learner evidence, ledger entry, watermark movement,
+readiness count, or behavior-cohort vote. Locally retained rejections still
+require exact ARM reproduction. After certified artifacts are handed off, the
+ordinary local progress projection again owns route/application detail.
+
 ## Can previous routes be used?
 
 Yes, including routes that predate this importer, when their full rlogs still
@@ -208,7 +218,8 @@ backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v6`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
-cross-architecture certification are `1/2`; future feedback/lifecycle and
+cross-architecture certification are `1/2`, and off-device display progress
+is `1`; future feedback/lifecycle and
 approved-artifact/selection/activation contracts are `2/2` and `5/2/1`.
 Older evidence is never
 reinterpreted or mixed silently.

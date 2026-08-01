@@ -55,8 +55,10 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_pipeline import (
   OffroadBehaviorLearningPipeline,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
+  BridgeFallbackUnavailableError,
   RemotePreparationSession,
   prepare_remote_session,
+  remote_error_fallback_reason,
   remote_error_is_unavailable,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
@@ -65,6 +67,11 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
   discover_worker,
   load_bridge_secret,
   load_bridge_worker_host,
+)
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_progress import (
+  OffdeviceFallbackReason,
+  OffdeviceProgressPhase,
+  OffdeviceProgressPublisher,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeAbortedError,
@@ -93,6 +100,36 @@ NATIVE_EXTRACTOR_PATH = (
   / "blatv2_rlog_extract"
 )
 PENDING_ROUTE_POLL_S = 1.0
+
+
+class _BestEffortOffdeviceProgress:
+  """Keep an informational Params failure outside the learning transaction."""
+
+  def __init__(self, publisher: OffdeviceProgressPublisher) -> None:
+    self._publisher = publisher
+    self._disabled = False
+
+  @property
+  def last_payload(self) -> dict[str, object] | None:
+    return None if self._disabled else self._publisher.last_payload
+
+  def clear(self) -> None:
+    self._disabled = False
+    try:
+      self._publisher.clear()
+    except Exception:
+      self._disabled = True
+      cloudlog.exception("blatv2 off-device progress write disabled")
+
+  def publish(self, **fields: object) -> bytes | None:
+    if self._disabled:
+      return None
+    try:
+      return self._publisher.publish(**fields)
+    except Exception:
+      self._disabled = True
+      cloudlog.exception("blatv2 off-device progress write disabled")
+      return None
 
 
 def _manager_declares_clean_build() -> bool:
@@ -152,6 +189,9 @@ class BlatV2BackfillDaemon:
     self.operation_status = LearningOperationStatusPublisher(self.params)
     self.behavior_status = BehaviorLearningStatusPublisher(self.params)
     self.backfill_progress = BackfillProgressPublisher(self.params)
+    self.offdevice_progress = _BestEffortOffdeviceProgress(
+      OffdeviceProgressPublisher(self.params),
+    )
     self._stopping = False
 
   def stop(self, *_args: object) -> None:
@@ -357,6 +397,10 @@ class BlatV2BackfillDaemon:
     encoded_car_params: bytes,
   ) -> RemotePreparationSession | None:
     """Return a PC-prepared session, or None for normal local fallback."""
+    try:
+      self.offdevice_progress.clear()
+    except Exception:
+      cloudlog.exception("blatv2 off-device progress cleanup failed")
     contract = self._remote_contract(engine, car_params, encoded_car_params)
     try:
       bridge_config = default_bridge_config_directory(self.params)
@@ -375,13 +419,27 @@ class BlatV2BackfillDaemon:
         abort_requested=self._abort_requested,
       )
       runtime = engine.runtime_factory()
-      return prepare_remote_session(
+      session = prepare_remote_session(
         engine=engine,
         client=client,
         contract=contract,
         scratch_parent=runtime.artifact_paths.root,
         abort_requested=self._abort_requested,
+        offdevice_progress=self.offdevice_progress,
       )
+      exclusions = tuple(getattr(session, "unverified_exclusions", ()))
+      if exclusions:
+        cloudlog.info(
+          "blatv2 excluded %d unverified PC-only route rejection(s)",
+          len(exclusions),
+        )
+        for exclusion in exclusions:
+          cloudlog.info(
+            "blatv2 unverified PC-only exclusion route=%s reason=%s",
+            exclusion.route_identity_sha256,
+            exclusion.rejection_reason,
+          )
+      return session
     except BridgeUnavailableError as exc:
       # Absence, a busy worker, or an interrupted connection is not a learner
       # failure. The device immediately retains its original local backend.
@@ -390,6 +448,9 @@ class BlatV2BackfillDaemon:
         self.backfill_progress.clear()
       except Exception:
         pass
+      self._publish_local_fallback(
+        self._bridge_unavailable_reason(exc),
+      )
       return None
     except BridgeAbortedError as exc:
       raise BackfillError(
@@ -415,6 +476,9 @@ class BlatV2BackfillDaemon:
           self.backfill_progress.clear()
         except Exception:
           pass
+        self._publish_local_fallback(
+          remote_error_fallback_reason(exc),
+        )
         return None
       diagnostic = (
         "backfill_route_incompatible"
@@ -425,6 +489,56 @@ class BlatV2BackfillDaemon:
         diagnostic,
         f"remote preparation worker rejected the job: {exc}",
       ) from exc
+
+  def _bridge_unavailable_reason(
+    self,
+    error: BridgeUnavailableError,
+  ) -> OffdeviceFallbackReason:
+    """Classify a fallback by its last completed display-only phase."""
+    if isinstance(error, BridgeFallbackUnavailableError):
+      return error.fallback_reason
+    last = self.offdevice_progress.last_payload
+    if last is None:
+      return OffdeviceFallbackReason.WORKER_UNAVAILABLE
+    phase = OffdeviceProgressPhase(last["phase"])
+    if phase is OffdeviceProgressPhase.DOWNLOADING:
+      return OffdeviceFallbackReason.NETWORK_INTERRUPTED
+    if phase is OffdeviceProgressPhase.ARM_CERTIFYING:
+      return OffdeviceFallbackReason.REMOTE_CERTIFICATION_UNAVAILABLE
+    return OffdeviceFallbackReason.REMOTE_PREPARATION_UNAVAILABLE
+
+  def _publish_local_fallback(
+    self,
+    reason: OffdeviceFallbackReason,
+  ) -> None:
+    """Project fallback without granting the display any learner authority."""
+    try:
+      last = self.offdevice_progress.last_payload
+      certification_fields: dict[str, object] = {}
+      if last is not None and last["certified_route_count"] is not None:
+        certification_fields = {
+          "certified_domain_count": last["certified_domain_count"],
+          "certified_route_count": last["certified_route_count"],
+          "remote_only_rejection_excluded_count": (
+            last["remote_only_rejection_excluded_count"]
+          ),
+          "total_certification_domain_count": (
+            last["total_certification_domain_count"]
+          ),
+          "total_certification_route_count": (
+            last["total_certification_route_count"]
+          ),
+        }
+      self.offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.LOCAL_FALLBACK,
+        new_session=last is None,
+        fallback_reason_code=reason,
+        **certification_fields,
+      )
+    except Exception:
+      # This projection is informational. A Params/UI failure must never
+      # change whether the authoritative local replay runs.
+      cloudlog.exception("blatv2 off-device fallback status write failed")
 
   def _publish_failure(
     self,
@@ -439,6 +553,10 @@ class BlatV2BackfillDaemon:
       self.backfill_progress.clear()
     except Exception:
       cloudlog.exception("blatv2 backfill progress cleanup failed")
+    try:
+      self.offdevice_progress.clear()
+    except Exception:
+      cloudlog.exception("blatv2 off-device progress cleanup failed")
     last = self.operation_status.last_payload
     continuing_operation = last is not None and last["terminal"] is False
     context: dict[str, object] = {
@@ -593,6 +711,11 @@ class BlatV2BackfillDaemon:
           engine = local_engine if remote_engine is None else remote_engine
           result = engine.run_once()
           self._project_learning_status(engine, result.publication)
+          if not result.pending_logger_close:
+            try:
+              self.offdevice_progress.clear()
+            except Exception:
+              cloudlog.exception("blatv2 off-device progress cleanup failed")
         finally:
           if session is not None:
             try:
@@ -649,6 +772,10 @@ class BlatV2BackfillDaemon:
         self.backfill_progress.clear()
       except Exception:
         cloudlog.exception("blatv2 backfill progress cleanup failed")
+      try:
+        self.offdevice_progress.clear()
+      except Exception:
+        cloudlog.exception("blatv2 off-device progress cleanup failed")
 
 
 def main() -> None:
