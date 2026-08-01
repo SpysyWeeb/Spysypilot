@@ -115,9 +115,25 @@ activation; the lifecycle rail reports stock until a separately reviewed
 activation path exists.
 
 The historical learner registry now includes the verified 409/4/7 combo
-builds recorded by routes d2-d6 (`3849a2f`, `2447667`, and `9338f5b`). Older
-archived 384/3/7 builds remain fail-closed rather than being mislabeled to
-admit their data.
+builds recorded by routes d2-d6 (`3849a2f`, `2447667`, and `9338f5b`) plus
+`fdd5560`, the clean combo build running immediately before the off-device
+bridge landed. Older archived 384/3/7 builds remain fail-closed rather than
+being mislabeled to admit their data.
+
+### Off-device preparation bridge
+
+**Status: in progress.** When its separately versioned worker is reachable on
+the trusted private LAN, the comma may offload only deterministic full-rlog
+preparation to `/home/alex/Documents/blatv2-remote-worker`. Uploaded segments
+remain private and resumable until an authenticated exact route manifest
+atomically publishes the whole route, so an interrupted prefix never appears
+complete.
+
+The device still freezes the manifest, runs both learner authorities, checks
+A/A equality, owns the ledger/finalizer, and is the only profile publisher.
+The PC has no Params, controller-selection, or actuation API. If the worker is
+unavailable, the unchanged four-worker local path runs instead. See the BLaTv2
+architecture and acceptance documents for the complete trust boundary.
 
 The pre-merge b7/b8/b9/ca production replay was byte-identical with two and
 four workers: generation

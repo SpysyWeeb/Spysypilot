@@ -326,9 +326,12 @@ def prepare_fixture(
     if route_bundle_factory is None
     else route_bundle_factory
   )
+  extractor = tmp_path / "unused-extractor"
+  extractor.write_bytes(b"#!/bin/sh\nexit 0\n")
+  extractor.chmod(0o755)
   return prepare_route(
     route,
-    extractor_path=tmp_path / "unused-extractor",
+    extractor_path=extractor,
     event_reader=lambda encoded: FakeEventContext(events[encoded]),
     car_params_decoder=decoder,
     descriptor_registry=BuildDescriptorRegistry((selected_descriptor,)),
@@ -430,11 +433,14 @@ def test_segment_progress_callbacks_cover_real_two_segment_prepare(
     "extract_segment_events",
     lambda _extractor, path, **_kwargs: records_by_path[Path(path)],
   )
+  extractor = tmp_path / "unused-extractor"
+  extractor.write_bytes(b"#!/bin/sh\nexit 0\n")
+  extractor.chmod(0o755)
   callbacks: list[tuple[str, int, int, int]] = []
 
   prepared = prepare_route(
     route,
-    extractor_path=tmp_path / "unused-extractor",
+    extractor_path=extractor,
     event_reader=lambda encoded: FakeEventContext(events[encoded]),
     car_params_decoder=lambda _encoded: palisade_cp,
     descriptor_registry=BuildDescriptorRegistry((reviewed_descriptor(),)),
@@ -871,20 +877,21 @@ def test_route_pruning_after_discovery_is_route_local_rejection(
   palisade_cp: car.CarParams,
 ) -> None:
   records, events = extracted_fixture(palisade_cp)
-  original_hash = learning_backfill._sha256_file
-  hash_calls = 0
+  original_verify = learning_backfill._verify_open_route_segment
 
-  def disappear_before_second_hash(path: Path, **kwargs) -> str:
-    nonlocal hash_calls
-    hash_calls += 1
-    if hash_calls == 2:
-      path.unlink()
-    return original_hash(path, **kwargs)
+  def disappear_before_post_extract_verification(
+    segment: RouteSegment,
+    descriptor: int,
+    opened_stat,
+    **kwargs,
+  ) -> None:
+    segment.path.unlink()
+    original_verify(segment, descriptor, opened_stat, **kwargs)
 
   monkeypatch.setattr(
     learning_backfill,
-    "_sha256_file",
-    disappear_before_second_hash,
+    "_verify_open_route_segment",
+    disappear_before_post_extract_verification,
   )
   with pytest.raises(RouteRejected) as raised:
     prepare_fixture(

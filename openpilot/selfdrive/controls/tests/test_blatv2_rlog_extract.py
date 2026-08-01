@@ -7,6 +7,7 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import pytest  # noqa: TID251
@@ -18,8 +19,11 @@ from openpilot.selfdrive.controls.lib.blatv2 import learning_backfill
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   MAXIMUM_EVENT_BYTES,
   BackfillError,
+  RouteSegment,
   RouteRejected,
   extract_segment_events,
+  open_verified_extractor,
+  verify_open_extractor,
 )
 
 
@@ -154,7 +158,19 @@ def test_native_matches_independent_pycapnp_on_reviewed_legacy_fixture(
     else raw
   )
 
-  extracted = extract_segment_events(native_extractor, segment)
+  extractor = open_verified_extractor(native_extractor)
+  descriptor = os.open(segment, os.O_RDONLY | os.O_NOFOLLOW)
+  try:
+    extracted = extract_segment_events(
+      native_extractor,
+      segment,
+      extractor_fd=extractor.descriptor,
+      segment_fd=descriptor,
+    )
+    verify_open_extractor(extractor)
+  finally:
+    os.close(descriptor)
+    os.close(extractor.descriptor)
 
   assert tuple(
     (record.which, record.mono_ns, record.encoded)
@@ -297,6 +313,193 @@ raise SystemExit({exit_code})
   )
   executable.chmod(0o755)
   return executable
+
+
+def test_held_segment_fd_closes_child_open_toctou(
+  tmp_path: Path,
+) -> None:
+  """The child consumes the inode already hashed, never a swapped pathname."""
+  segment_path = tmp_path / "rlog.zst"
+  saved_path = tmp_path / "rlog.saved"
+  ready_path = tmp_path / "extractor.ready"
+  go_path = tmp_path / "extractor.go"
+  read_path = tmp_path / "extractor.read"
+  expected = b"expected immutable route bytes"
+  alternate = b"alternate bytes consumed only by the vulnerable path"
+  segment_path.write_bytes(expected)
+  segment = RouteSegment(
+    index=0,
+    path=segment_path,
+    sha256=hashlib.sha256(expected).hexdigest(),
+    size_bytes=len(expected),
+  )
+  extractor = tmp_path / "race-extractor"
+  extractor.write_text(
+    f"""#!{sys.executable}
+from pathlib import Path
+import struct
+import sys
+import time
+ready = Path({str(ready_path)!r})
+go = Path({str(go_path)!r})
+read = Path({str(read_path)!r})
+ready.touch()
+while not go.exists():
+  time.sleep(0.001)
+payload = Path(sys.argv[1]).read_bytes()
+read.touch()
+out = sys.stdout.buffer
+out.write(struct.pack("<8sII", b"BLATV2R1", 1, 0))
+out.write(struct.pack("<IIQ", len(payload), 1, 123))
+out.write(payload)
+out.write(struct.pack("<IIQ", 0, 0xffffffff, 1))
+out.flush()
+""",
+  )
+  extractor.chmod(0o755)
+  descriptor, opened_stat = learning_backfill._open_verified_route_segment(
+    segment,
+    abort_requested=lambda: False,
+  )
+  swap_error: list[BaseException] = []
+
+  def swap_path_during_child_open() -> None:
+    try:
+      assert ready_path.exists() or _wait_for_path(ready_path)
+      segment_path.rename(saved_path)
+      segment_path.write_bytes(alternate)
+      go_path.touch()
+      assert read_path.exists() or _wait_for_path(read_path)
+      segment_path.unlink()
+      saved_path.rename(segment_path)
+    except BaseException as exc:
+      swap_error.append(exc)
+      go_path.touch()
+
+  thread = threading.Thread(target=swap_path_during_child_open)
+  thread.start()
+  try:
+    records = extract_segment_events(
+      extractor,
+      segment_path,
+      segment_fd=descriptor,
+    )
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not swap_error
+    assert records[0].encoded == expected
+    assert records[0].encoded != alternate
+    # Even though the child read the correct held inode, any path mutation is
+    # rejected rather than silently accepted as an immutable route snapshot.
+    with pytest.raises(RouteRejected) as raised:
+      learning_backfill._verify_open_route_segment(
+        segment,
+        descriptor,
+        opened_stat,
+        abort_requested=lambda: False,
+      )
+    assert raised.value.reason == "segment_changed"
+  finally:
+    go_path.touch()
+    thread.join(timeout=5)
+    os.close(descriptor)
+
+
+def test_held_extractor_fd_closes_child_exec_toctou(
+  tmp_path: Path,
+) -> None:
+  """A timed pathname swap cannot execute bytes outside the held hash."""
+  extractor_path = tmp_path / "extractor"
+  saved_path = tmp_path / "extractor.saved"
+  alternate_path = tmp_path / "extractor.alternate"
+  original_started = tmp_path / "original.started"
+  alternate_started = tmp_path / "alternate.started"
+  go_path = tmp_path / "extractor.go"
+  segment = tmp_path / "segment"
+  segment.write_bytes(b"unused")
+
+  def script(marker: Path) -> str:
+    return f"""#!{sys.executable}
+from pathlib import Path
+import struct
+import sys
+import time
+Path({str(marker)!r}).touch()
+while not Path({str(go_path)!r}).exists():
+  time.sleep(0.001)
+out = sys.stdout.buffer
+out.write(struct.pack("<8sII", b"BLATV2R1", 1, 0))
+out.write(struct.pack("<IIQ", 0, 0xffffffff, 0))
+out.flush()
+"""
+
+  extractor_path.write_text(script(original_started))
+  alternate_path.write_text(script(alternate_started))
+  extractor_path.chmod(0o755)
+  alternate_path.chmod(0o755)
+  expected_sha256 = hashlib.sha256(extractor_path.read_bytes()).hexdigest()
+  extractor = open_verified_extractor(
+    extractor_path,
+    expected_sha256=expected_sha256,
+  )
+  swapped = threading.Event()
+  swap_error: list[BaseException] = []
+
+  def swap_only_while_child_starts() -> None:
+    try:
+      extractor_path.rename(saved_path)
+      alternate_path.rename(extractor_path)
+      swapped.set()
+      deadline = time.monotonic() + 5.0
+      while (
+        not original_started.exists()
+        and not alternate_started.exists()
+        and time.monotonic() < deadline
+      ):
+        time.sleep(0.001)
+      assert original_started.exists() or alternate_started.exists()
+      extractor_path.rename(alternate_path)
+      saved_path.rename(extractor_path)
+      go_path.touch()
+    except BaseException as exc:
+      swap_error.append(exc)
+      swapped.set()
+      go_path.touch()
+
+  thread = threading.Thread(target=swap_only_while_child_starts)
+  thread.start()
+  try:
+    assert swapped.wait(timeout=5)
+    records = extract_segment_events(
+      extractor_path,
+      segment,
+      extractor_fd=extractor.descriptor,
+    )
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not swap_error
+    assert records == ()
+    assert original_started.exists()
+    assert not alternate_started.exists()
+    assert hashlib.sha256(extractor_path.read_bytes()).hexdigest() == (
+      expected_sha256
+    )
+    with pytest.raises(BackfillError) as raised:
+      verify_open_extractor(extractor)
+    assert raised.value.diagnostic == "backfill_reader_unavailable"
+  finally:
+    go_path.touch()
+    thread.join(timeout=5)
+    os.close(extractor.descriptor)
+
+
+def _wait_for_path(path: Path) -> bool:
+  deadline = time.monotonic() + 5.0
+  while time.monotonic() < deadline:
+    if path.exists():
+      return True
+    time.sleep(0.001)
+  return False
 
 
 @pytest.mark.parametrize(
