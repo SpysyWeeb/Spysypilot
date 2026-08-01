@@ -449,7 +449,11 @@ _ARTIFACT_DIAGNOSTICS = frozenset((
   "state_stale_build",
 ))
 _OPERATION_STATE_DIAGNOSTICS = {
-  "preparing": frozenset(("waiting_for_car_params", "restoring_runtime")),
+  "preparing": frozenset((
+    "waiting_for_car_params",
+    "restoring_runtime",
+    "discovering_remote_worker",
+  )),
   "ready_no_evidence": frozenset(("ready_for_first_drive",)),
   "collecting": frozenset(("collecting_current_drive",)),
   "finalizing": frozenset((
@@ -493,6 +497,7 @@ _BACKFILL_PROGRESS_PHASES = frozenset((
 _OPERATION_DIAGNOSTIC_LABELS = {
   "waiting_for_car_params": "Waiting for vehicle configuration",
   "restoring_runtime": "Restoring the prepared learning runtime",
+  "discovering_remote_worker": "Waiting for the PC worker to join the network",
   "ready_for_first_drive": "Ready to collect the first drive",
   "collecting_current_drive": "Collecting clean evidence from this drive",
   "finalizing_drive": "Validating and saving the completed drive",

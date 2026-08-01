@@ -1066,6 +1066,24 @@ class TestLearningOperationStatusParser(unittest.TestCase):
         self.assertEqual(presentation.title, title)
         self.assertEqual(presentation.tone, tone)
 
+  def test_remote_discovery_preflight_has_truthful_display_copy(self) -> None:
+    status = self.parse(operation_fixture(
+      "preparing",
+      diagnostic="discovering_remote_worker",
+    ))
+    presentation = operation_presentation(
+      status,
+      error_code=None,
+      error_message=None,
+      has_learning_snapshot=False,
+    )
+    self.assertEqual(presentation.title, "PREPARING LEARNER")
+    self.assertEqual(presentation.tone, "blue")
+    self.assertEqual(
+      presentation.detail,
+      "Waiting for the PC worker to join the network",
+    )
+
   def test_backfill_progress_is_one_based_and_cumulative(self) -> None:
     status = self.parse(operation_fixture("backfilling"))
     self.assertEqual(status.current_route_index, 2)
