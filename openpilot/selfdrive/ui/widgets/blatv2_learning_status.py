@@ -18,7 +18,8 @@ LEARNING_STATUS_SCHEMA_VERSION = 3
 LIFECYCLE_STATUS_SCHEMA_VERSION = 1
 LEARNING_OPERATION_STATUS_SCHEMA_VERSION = 1
 BACKFILL_PROGRESS_SCHEMA_VERSION = 1
-OFFDEVICE_PROGRESS_SCHEMA_VERSION = 1
+OFFDEVICE_PROGRESS_SCHEMA_VERSION = 2
+_SUPPORTED_OFFDEVICE_PROGRESS_SCHEMA_VERSIONS = frozenset((1, 2))
 BEHAVIOR_LEARNING_STATUS_SCHEMA_VERSION = 1
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -198,7 +199,7 @@ _BACKFILL_PROGRESS_KEYS = frozenset((
   "total_work_units",
   "approximate_remaining_seconds",
 ))
-_OFFDEVICE_PROGRESS_KEYS = frozenset((
+_OFFDEVICE_PROGRESS_V1_KEYS = frozenset((
   "completed_artifact_count",
   "completed_bytes",
   "certified_domain_count",
@@ -219,6 +220,13 @@ _OFFDEVICE_PROGRESS_KEYS = frozenset((
   "total_certification_domain_count",
   "total_certification_route_count",
   "updated_mono_ns",
+))
+_OFFDEVICE_PROGRESS_V2_KEYS = _OFFDEVICE_PROGRESS_V1_KEYS | frozenset((
+  "architecture_domain_count",
+  "architecture_domain_index",
+  "architecture_route_identity_sha256",
+  "architecture_segment_count",
+  "architecture_segment_index",
 ))
 _OFFDEVICE_PROGRESS_PHASES = frozenset((
   "remote_processing",
@@ -858,6 +866,7 @@ class BackfillProgressStatus:
 class OffdeviceProgressStatus:
   """Optional display-only detail for PC-assisted route preparation."""
 
+  schema_version: int
   session_id: str
   sequence: int
   updated_mono_ns: int
@@ -875,6 +884,11 @@ class OffdeviceProgressStatus:
   remote_only_rejection_excluded_count: int | None
   total_certification_domain_count: int | None
   total_certification_route_count: int | None
+  architecture_domain_count: int | None
+  architecture_domain_index: int | None
+  architecture_route_identity_sha256: str | None
+  architecture_segment_count: int | None
+  architecture_segment_index: int | None
   fallback_reason_code: str | None
 
   @property
@@ -2596,6 +2610,87 @@ def _offdevice_certification_values(
   )
 
 
+def _offdevice_architecture_values(
+  data: dict[str, object],
+  *,
+  schema_version: int,
+  required: bool,
+) -> tuple[int, int, str | None, int | None, int | None] | None:
+  """Decode the bounded architecture-verification coordinate in schema v2."""
+  if schema_version == 1:
+    if required:
+      return None
+    return None
+
+  names = (
+    "architecture_domain_count",
+    "architecture_domain_index",
+    "architecture_route_identity_sha256",
+    "architecture_segment_count",
+    "architecture_segment_index",
+  )
+  raw = tuple(data[name] for name in names)
+  if not required and all(value is None for value in raw):
+    return None
+
+  domain_count = _integer(raw[0], "architecture_domain_count")
+  domain_index = _integer(raw[1], "architecture_domain_index")
+  assert domain_count is not None
+  assert domain_index is not None
+  if domain_index > domain_count:
+    raise LearningStatusError(
+      "malformed",
+      "Architecture verification domain is outside its bounds",
+    )
+
+  route_identity = _sha256(
+    raw[2],
+    "architecture_route_identity_sha256",
+    nullable=True,
+  )
+  segment_count = _integer(
+    raw[3],
+    "architecture_segment_count",
+    nullable=True,
+  )
+  segment_index = _integer(
+    raw[4],
+    "architecture_segment_index",
+    nullable=True,
+  )
+  if (segment_count is None) != (segment_index is None):
+    raise LearningStatusError(
+      "malformed",
+      "Architecture verification segment coordinate is incomplete",
+    )
+  if segment_count is not None and (
+    segment_count == 0
+    or segment_index is None
+    or not 1 <= segment_index <= segment_count <= 3
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "Architecture verification segment is outside its bounds",
+    )
+  if route_identity is None and segment_count is not None:
+    raise LearningStatusError(
+      "malformed",
+      "Architecture verification segment requires a route identity",
+    )
+  if route_identity is not None and domain_index == 0:
+    raise LearningStatusError(
+      "malformed",
+      "Architecture verification route requires an active domain",
+    )
+  return (
+    domain_count,
+    domain_index,
+    route_identity,
+    segment_count,
+    segment_index,
+  )
+
+
 def parse_offdevice_progress_status(
   raw: object,
   *,
@@ -2614,15 +2709,21 @@ def parse_offdevice_progress_status(
       "malformed",
       "Off-device progress must be a Params JSON object",
     )
+  schema_version = raw.get("schema_version")
   if (
-    type(raw.get("schema_version")) is not int
-    or raw["schema_version"] != OFFDEVICE_PROGRESS_SCHEMA_VERSION
+    type(schema_version) is not int
+    or schema_version not in _SUPPORTED_OFFDEVICE_PROGRESS_SCHEMA_VERSIONS
   ):
     raise LearningStatusError(
       "schema_mismatch",
       "Off-device progress version is not supported",
     )
-  data = _exact_object(raw, _OFFDEVICE_PROGRESS_KEYS, "off-device progress")
+  expected_keys = (
+    _OFFDEVICE_PROGRESS_V1_KEYS
+    if schema_version == 1
+    else _OFFDEVICE_PROGRESS_V2_KEYS
+  )
+  data = _exact_object(raw, expected_keys, "off-device progress")
   if data["informational_only"] is not True:
     raise LearningStatusError(
       "malformed",
@@ -2707,6 +2808,15 @@ def parse_offdevice_progress_status(
     certification = _offdevice_certification_values(data, required=False)
     if certification is not None:
       raise LearningStatusError("malformed", "PC processing includes certification counters")
+    if _offdevice_architecture_values(
+      data,
+      schema_version=schema_version,
+      required=False,
+    ) is not None:
+      raise LearningStatusError(
+        "malformed",
+        "PC processing includes architecture coordinates",
+      )
   elif phase == "downloading":
     if any(value is None for value in download_values):
       raise LearningStatusError(
@@ -2733,10 +2843,30 @@ def parse_offdevice_progress_status(
     certification = _offdevice_certification_values(data, required=False)
     if certification is not None:
       raise LearningStatusError("malformed", "Download includes certification counters")
+    if _offdevice_architecture_values(
+      data,
+      schema_version=schema_version,
+      required=False,
+    ) is not None:
+      raise LearningStatusError(
+        "malformed",
+        "Download includes architecture coordinates",
+      )
   elif phase == "arm_certifying":
     if any(value is not None for value in (*remote_values, *download_values)):
-      raise LearningStatusError("malformed", "ARM verification includes unrelated counters")
-    _offdevice_certification_values(data, required=True)
+      raise LearningStatusError("malformed", "Architecture verification includes unrelated counters")
+    certification = _offdevice_certification_values(data, required=True)
+    assert certification is not None
+    architecture = _offdevice_architecture_values(
+      data,
+      schema_version=schema_version,
+      required=schema_version == 2,
+    )
+    if architecture is not None and architecture[0] != certification[3]:
+      raise LearningStatusError(
+        "malformed",
+        "Architecture and certification domain totals disagree",
+      )
   elif phase == "remote_ready":
     if any(value is not None for value in (*remote_values, *download_values)):
       raise LearningStatusError("malformed", "Prepared data includes unrelated counters")
@@ -2748,12 +2878,37 @@ def parse_offdevice_progress_status(
         "malformed",
         "Prepared-data status lacks complete verification coverage",
       )
+    if _offdevice_architecture_values(
+      data,
+      schema_version=schema_version,
+      required=False,
+    ) is not None:
+      raise LearningStatusError(
+        "malformed",
+        "Prepared data includes architecture coordinates",
+      )
   else:
     if any(value is not None for value in (*remote_values, *download_values)):
       raise LearningStatusError("malformed", "Local fallback includes unrelated counters")
     _offdevice_certification_values(data, required=False)
+    if _offdevice_architecture_values(
+      data,
+      schema_version=schema_version,
+      required=False,
+    ) is not None:
+      raise LearningStatusError(
+        "malformed",
+        "Off-device phase includes architecture coordinates",
+      )
+
+  architecture = _offdevice_architecture_values(
+    data,
+    schema_version=schema_version,
+    required=False,
+  )
 
   return OffdeviceProgressStatus(
+    schema_version=schema_version,
     session_id=session_id,
     sequence=sequence,
     updated_mono_ns=updated_mono_ns,
@@ -2780,6 +2935,13 @@ def parse_offdevice_progress_status(
       data,
       "total_certification_route_count",
     ),
+    architecture_domain_count=(None if architecture is None else architecture[0]),
+    architecture_domain_index=(None if architecture is None else architecture[1]),
+    architecture_route_identity_sha256=(
+      None if architecture is None else architecture[2]
+    ),
+    architecture_segment_count=(None if architecture is None else architecture[3]),
+    architecture_segment_index=(None if architecture is None else architecture[4]),
     fallback_reason_code=fallback_reason,
   )
 
@@ -2801,6 +2963,11 @@ def validate_offdevice_progress_update(
         "New PC processing session did not begin at a valid initial phase",
       )
     return
+  if current.schema_version != previous.schema_version:
+    raise LearningStatusError(
+      "stale",
+      "Off-device progress schema changed inside one session",
+    )
   if current.sequence < previous.sequence:
     raise LearningStatusError("stale", "Off-device progress sequence moved backward")
   if current.sequence == previous.sequence:
@@ -2885,6 +3052,39 @@ def validate_offdevice_progress_update(
       or current_excluded < previous_excluded
     ):
       raise LearningStatusError("stale", "ARM verification progress moved backward")
+
+  if (
+    previous.phase == current.phase == "arm_certifying"
+    and previous.schema_version == current.schema_version == 2
+  ):
+    assert previous.architecture_domain_count is not None
+    assert previous.architecture_domain_index is not None
+    assert current.architecture_domain_count is not None
+    assert current.architecture_domain_index is not None
+    if (
+      current.architecture_domain_count
+      != previous.architecture_domain_count
+      or current.architecture_domain_index
+      < previous.architecture_domain_index
+    ):
+      raise LearningStatusError(
+        "stale",
+        "Architecture verification domain moved backward",
+      )
+    if (
+      current.architecture_domain_index
+      == previous.architecture_domain_index
+      and current.architecture_route_identity_sha256
+      == previous.architecture_route_identity_sha256
+      and current.architecture_segment_index is not None
+      and previous.architecture_segment_index is not None
+      and current.architecture_segment_index
+      < previous.architecture_segment_index
+    ):
+      raise LearningStatusError(
+        "stale",
+        "Architecture verification segment moved backward",
+      )
   if (
     previous.phase == current.phase == "local_fallback"
     and previous.fallback_reason_code != current.fallback_reason_code
@@ -3687,7 +3887,7 @@ def _offdevice_presentation(
         )
       detail = " | ".join(detail_fields)
     return OperationPresentation(
-      title="PC PROCESSING",
+      title="PC PREPARING DATA",
       detail=detail,
       tone="blue",
       show_banner=has_learning_snapshot,
@@ -3718,26 +3918,58 @@ def _offdevice_presentation(
   assert progress.certified_route_count is not None
   assert progress.total_certification_route_count is not None
   assert progress.remote_only_rejection_excluded_count is not None
-  certification_detail = " | ".join((
-    f"{progress.certified_route_count}/{progress.total_certification_route_count} routes",
-    f"{progress.certified_domain_count}/{progress.total_certification_domain_count} domains",
-    f"{progress.remote_only_rejection_excluded_count} remote-only excluded",
-  ))
+  certification_fields = [
+    f"Routes {progress.certified_route_count}/{progress.total_certification_route_count}",
+    f"Domains {progress.certified_domain_count}/{progress.total_certification_domain_count}",
+  ]
+  if progress.remote_only_rejection_excluded_count:
+    certification_fields.append(
+      f"{progress.remote_only_rejection_excluded_count} PC-only excluded",
+    )
+  certification_detail = " | ".join(certification_fields)
   if progress.phase == "arm_certifying":
+    if progress.schema_version == 2:
+      assert progress.architecture_domain_count is not None
+      assert progress.architecture_domain_index is not None
+      if progress.architecture_domain_index == 0:
+        verification_fields = [
+          "Preparing bounded device check",
+          f"Domains 0/{progress.architecture_domain_count}",
+          f"Routes {progress.certified_route_count}/{progress.total_certification_route_count}",
+        ]
+      else:
+        verification_fields = [
+          f"Domain {progress.architecture_domain_index}/{progress.architecture_domain_count}",
+          f"Routes {progress.certified_route_count}/{progress.total_certification_route_count}",
+        ]
+        if progress.architecture_segment_index is not None:
+          assert progress.architecture_segment_count is not None
+          verification_fields.append(
+            f"Segment {progress.architecture_segment_index}/{progress.architecture_segment_count}",
+          )
+      if progress.remote_only_rejection_excluded_count:
+        verification_fields.append(
+          f"{progress.remote_only_rejection_excluded_count} PC-only excluded",
+        )
+      certification_detail = " | ".join(verification_fields)
     return OperationPresentation(
-      title="VERIFYING ON DEVICE",
+      title="VERIFYING PC RESULT",
       detail=certification_detail,
       tone="blue",
       show_banner=has_learning_snapshot,
-      phase_detail="ARM certification uses only locally reproducible routes",
+      phase_detail=(
+        "Bounded device check of PC-prepared route evidence"
+        if progress.schema_version == 2
+        else "Checking PC-prepared route evidence on this device"
+      ),
       progress_fraction=progress.progress_fraction,
     )
   return OperationPresentation(
-    title="PREPARED DATA READY",
+    title="PC RESULT VERIFIED",
     detail=certification_detail,
     tone="green",
     show_banner=has_learning_snapshot,
-    phase_detail="Prepared artifacts passed on-device certification",
+    phase_detail="PC-prepared artifacts passed on-device verification",
     progress_fraction=1.0,
   )
 

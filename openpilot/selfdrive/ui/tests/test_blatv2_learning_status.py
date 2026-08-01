@@ -479,11 +479,17 @@ def backfill_progress_fixture(
 def offdevice_progress_fixture(
   phase: str = "remote_processing",
   *,
+  schema_version: int = 2,
   sequence: int = 3,
   session_id: str = "f" * 32,
   fallback_reason: str = "network_interrupted",
 ) -> dict:
   payload = {
+    "architecture_domain_count": None,
+    "architecture_domain_index": None,
+    "architecture_route_identity_sha256": None,
+    "architecture_segment_count": None,
+    "architecture_segment_index": None,
     "completed_artifact_count": None,
     "completed_bytes": None,
     "certified_domain_count": None,
@@ -496,7 +502,7 @@ def offdevice_progress_fixture(
     "remote_only_rejection_excluded_count": None,
     "remote_route_count": None,
     "remote_route_index": None,
-    "schema_version": 1,
+    "schema_version": schema_version,
     "sequence": sequence,
     "session_id": session_id,
     "total_artifact_count": None,
@@ -527,8 +533,25 @@ def offdevice_progress_fixture(
       "total_certification_domain_count": 4,
       "total_certification_route_count": 8,
     })
+    if phase == "arm_certifying" and schema_version == 2:
+      payload.update({
+        "architecture_domain_count": 4,
+        "architecture_domain_index": 2,
+        "architecture_route_identity_sha256": ROUTE_HASH,
+        "architecture_segment_count": 3,
+        "architecture_segment_index": 2,
+      })
   elif phase == "local_fallback":
     payload["fallback_reason_code"] = fallback_reason
+  if schema_version == 1:
+    for name in (
+      "architecture_domain_count",
+      "architecture_domain_index",
+      "architecture_route_identity_sha256",
+      "architecture_segment_count",
+      "architecture_segment_index",
+    ):
+      del payload[name]
   return payload
 
 
@@ -1861,10 +1884,38 @@ class TestOffdeviceProgressStatus(unittest.TestCase):
     for phase, expected_fraction in expected_fractions.items():
       with self.subTest(phase=phase):
         status = self.parse(offdevice_progress_fixture(phase))
+        self.assertEqual(status.schema_version, 2)
         self.assertEqual(status.phase, phase)
         self.assertEqual(status.progress_fraction, expected_fraction)
+    certifying = self.parse(offdevice_progress_fixture("arm_certifying"))
+    self.assertEqual(certifying.architecture_domain_index, 2)
+    self.assertEqual(certifying.architecture_segment_index, 2)
     ready = self.parse(offdevice_progress_fixture("remote_ready"))
     self.assertEqual(ready.remote_only_rejection_excluded_count, 2)
+
+  def test_schema_v1_remains_strictly_compatible_during_rollout(self) -> None:
+    for phase in (
+      "remote_processing",
+      "downloading",
+      "arm_certifying",
+      "remote_ready",
+      "local_fallback",
+    ):
+      with self.subTest(phase=phase):
+        status = self.parse(offdevice_progress_fixture(
+          phase,
+          schema_version=1,
+        ))
+        self.assertEqual(status.schema_version, 1)
+        self.assertEqual(status.phase, phase)
+        self.assertIsNone(status.architecture_domain_count)
+        self.assertIsNone(status.architecture_segment_index)
+
+    contaminated_v1 = offdevice_progress_fixture(schema_version=1)
+    contaminated_v1["architecture_domain_count"] = None
+    with self.assertRaises(LearningStatusError) as raised:
+      self.parse(contaminated_v1)
+    self.assertEqual(raised.exception.code, "malformed")
 
   def test_missing_malformed_and_future_status_fail_closed(self) -> None:
     malformed = offdevice_progress_fixture()
@@ -1878,11 +1929,68 @@ class TestOffdeviceProgressStatus(unittest.TestCase):
       (malformed, "malformed"),
       (future, "stale"),
       (contaminated, "malformed"),
+      (offdevice_progress_fixture(schema_version=3), "schema_mismatch"),
     ):
       with self.subTest(code=code):
         with self.assertRaises(LearningStatusError) as raised:
           self.parse(payload)
         self.assertEqual(raised.exception.code, code)
+
+  def test_schema_v2_architecture_coordinates_fail_closed_when_malformed(
+    self,
+  ) -> None:
+    missing_key = offdevice_progress_fixture("arm_certifying")
+    del missing_key["architecture_segment_index"]
+    partial_segment = offdevice_progress_fixture("arm_certifying")
+    partial_segment["architecture_segment_index"] = None
+    bad_segment = offdevice_progress_fixture("arm_certifying")
+    bad_segment["architecture_segment_index"] = 4
+    bad_domain = offdevice_progress_fixture("arm_certifying")
+    bad_domain["architecture_domain_index"] = 5
+    route_without_domain = offdevice_progress_fixture("arm_certifying")
+    route_without_domain["architecture_domain_index"] = 0
+    contaminated_download = offdevice_progress_fixture("downloading")
+    contaminated_download["architecture_domain_count"] = 4
+    contaminated_download["architecture_domain_index"] = 0
+    for payload in (
+      missing_key,
+      partial_segment,
+      bad_segment,
+      bad_domain,
+      route_without_domain,
+      contaminated_download,
+    ):
+      with self.subTest(payload=payload):
+        with self.assertRaises(LearningStatusError) as raised:
+          self.parse(payload)
+        self.assertEqual(raised.exception.code, "malformed")
+
+  def test_schema_v2_allows_zero_and_unknown_active_coordinates(self) -> None:
+    preparing = offdevice_progress_fixture("arm_certifying")
+    preparing.update({
+      "architecture_domain_count": 0,
+      "architecture_domain_index": 0,
+      "architecture_route_identity_sha256": None,
+      "architecture_segment_count": None,
+      "architecture_segment_index": None,
+      "certified_domain_count": 0,
+      "certified_route_count": 0,
+      "total_certification_domain_count": 0,
+    })
+    preparing_status = self.parse(preparing)
+    self.assertEqual(preparing_status.architecture_domain_count, 0)
+    self.assertEqual(preparing_status.architecture_domain_index, 0)
+    self.assertIsNone(preparing_status.architecture_route_identity_sha256)
+
+    transition = offdevice_progress_fixture("arm_certifying")
+    transition.update({
+      "architecture_route_identity_sha256": None,
+      "architecture_segment_count": None,
+      "architecture_segment_index": None,
+    })
+    transition_status = self.parse(transition)
+    self.assertEqual(transition_status.architecture_domain_index, 2)
+    self.assertIsNone(transition_status.architecture_segment_count)
 
   def test_session_sequence_phase_and_counters_cannot_regress(self) -> None:
     previous = self.parse(offdevice_progress_fixture())
@@ -1947,18 +2055,18 @@ class TestOffdeviceProgressPresentation(unittest.TestCase):
 
   def test_bridge_phases_have_clear_copy_and_remote_exclusion_count(self) -> None:
     expected = {
-      "remote_processing": ("PC PROCESSING", "Pass 1/2 | Route 3/8"),
+      "remote_processing": ("PC PREPARING DATA", "Pass 1/2 | Route 3/8"),
       "downloading": (
         "DOWNLOADING PREPARED DATA",
         "3/8 artifacts | 2.0 MiB / 8.0 MiB",
       ),
       "arm_certifying": (
-        "VERIFYING ON DEVICE",
-        "3/8 routes | 2/4 domains | 1 remote-only excluded",
+        "VERIFYING PC RESULT",
+        "Domain 2/4 | Routes 3/8 | Segment 2/3 | 1 PC-only excluded",
       ),
       "remote_ready": (
-        "PREPARED DATA READY",
-        "6/8 routes | 4/4 domains | 2 remote-only excluded",
+        "PC RESULT VERIFIED",
+        "Routes 6/8 | Domains 4/4 | 2 PC-only excluded",
       ),
     }
     for phase, (title, detail) in expected.items():
@@ -1966,6 +2074,65 @@ class TestOffdeviceProgressPresentation(unittest.TestCase):
         presentation = self.presentation(phase)
         self.assertEqual(presentation.title, title)
         self.assertEqual(presentation.detail, detail)
+
+  def test_v1_verification_label_is_clear_without_v2_coordinates(self) -> None:
+    presentation = operation_presentation(
+      self.operation(),
+      error_code=None,
+      error_message=None,
+      has_learning_snapshot=True,
+      offdevice_progress=parse_offdevice_progress_status(
+        offdevice_progress_fixture("arm_certifying", schema_version=1),
+        now_mono_ns=NOW_MONO_NS,
+      ),
+    )
+    self.assertEqual(presentation.title, "VERIFYING PC RESULT")
+    self.assertEqual(
+      presentation.detail,
+      "Routes 3/8 | Domains 2/4 | 1 PC-only excluded",
+    )
+    self.assertIn("PC-prepared route evidence", presentation.phase_detail)
+
+  def test_v2_preparation_and_transition_coordinates_render_safely(self) -> None:
+    for payload, detail in (
+      (
+        {
+          **offdevice_progress_fixture("arm_certifying"),
+          "architecture_domain_count": 0,
+          "architecture_domain_index": 0,
+          "architecture_route_identity_sha256": None,
+          "architecture_segment_count": None,
+          "architecture_segment_index": None,
+          "certified_domain_count": 0,
+          "certified_route_count": 0,
+          "total_certification_domain_count": 0,
+        },
+        "Preparing bounded device check | Domains 0/0 | Routes 0/8 | 1 PC-only excluded",
+      ),
+      (
+        {
+          **offdevice_progress_fixture("arm_certifying"),
+          "architecture_route_identity_sha256": None,
+          "architecture_segment_count": None,
+          "architecture_segment_index": None,
+        },
+        "Domain 2/4 | Routes 3/8 | 1 PC-only excluded",
+      ),
+    ):
+      with self.subTest(detail=detail):
+        presentation = operation_presentation(
+          self.operation(),
+          error_code=None,
+          error_message=None,
+          has_learning_snapshot=True,
+          offdevice_progress=parse_offdevice_progress_status(
+            payload,
+            now_mono_ns=NOW_MONO_NS,
+          ),
+        )
+        self.assertEqual(presentation.title, "VERIFYING PC RESULT")
+        self.assertEqual(presentation.detail, detail)
+        self.assertTrue(presentation.detail.isascii())
 
   def test_local_fallback_decorates_live_local_route_detail(self) -> None:
     operation = self.operation()
