@@ -333,6 +333,56 @@ throttle for a small urban-speed correction. This counterfactual cap is
 route-derived, not a claim of field validation, and remains an explicit owner
 test item.
 
+### Route `000000d9--6040563d1d` ordinary-cruise comfort refinement
+
+The route was recorded on `combo` commit `095714fd87` and contains three
+comparable, engaged, lead-free Chill cruise corrections. Both 75-to-80 mph
+increases selected about `+0.69 m/s²`; delivered acceleration peaked near
+`+1.01` and `+0.80 m/s²`. The 80-to-75 mph reduction selected and commanded
+`-1.20 m/s²`, delivered about `-1.54 m/s²`, crossed below the new set speed,
+and then requested positive acceleration to recover. Its pitch-compensated
+natural-coast estimate was only about `-0.36` to `-0.39 m/s²`.
+
+The source in each comparable window was cruise. The planner target and
+longitudinal command agreed, with no lead and Experimental mode off, so the
+behavior did not originate in Smooth Stops, MPC lead following, Conditional
+Experimental Mode, the curve-speed limiter, or an anomalous PID request. The
+cause was the cruise candidate's unity-gain speed error: a 5 mph error is large
+enough to saturate either the road-speed acceleration gate or the complete
+`-1.2 m/s²` cruise deceleration limit. The jerk schedule delayed those limits
+but did not reduce their sustained magnitude.
+
+For ordinary Chill cruise, BLoTv2 now changes that candidate to:
+
+```text
+target acceleration = 0.18 s⁻¹ × set-speed error
+```
+
+At road speed, a 5 mph correction therefore requests about `0.40 m/s²` in
+either direction instead of saturating. The target falls continuously as the
+speed error closes. During a reduction, the proportional target blends toward
+a full pitch-compensated throttle lift by a 5 mph error; this permits natural
+uphill coast-down without adding gas, while a downhill still receives the
+gentle proportional deceleration request. The response blends from the legacy
+candidate at `8 m/s` to the comfort candidate at `15 m/s`, preserving the
+existing low-speed launch behavior. Larger errors naturally reach the same
+legacy limits—roughly 8–12 mph upward depending on road speed and about 15 mph
+downward—so this is not a global authority reduction.
+
+The comfort path is eligible only with healthy radar, no radar lead, Chill
+mode, and no forced deceleration. In `combo`, an active model curve-speed limit
+also disables it. Those paths retain the exact legacy cruise calculation, and
+the planner's MPC/e2e candidate arbitration is unchanged. The existing jerk
+schedule still governs onset and release, so “Swift” remains reaction time and
+low-speed response while a routine five-mph correction becomes softer.
+
+A production-function trace replay—not a copied equation—matched the recorded
+legacy peaks (`+0.688`, `-1.200`, and `+0.685 m/s²`) and changed the same input
+timelines to `+0.400`, `-0.401`, and `+0.353 m/s²`. The third value closes
+earlier because this command-only replay retains the vehicle trajectory
+produced by the stronger recorded command. It is not a closed-loop prediction
+of vehicle speed or delivered acceleration and is not field validation.
+
 `BLOTV2_ACCEL_REQUEST_MAX = 4.0 m/s²` records the requested policy.
 `BLOTV2_ACCEL_MAX = min(ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX)` applies the
 deployed platform envelope to cruise, experimental/e2e, MPC bounds, and the
@@ -380,6 +430,8 @@ Automated coverage includes:
 - every supervisor trigger, hysteresis, emergency stand-down, and slew rate;
 - model lead anchoring and exact stock fallback for malformed/non-finite input;
 - BLoT v1 launch request and deployed-platform acceleration clamping;
+- route-derived ordinary-cruise proportional response, coast-down behavior,
+  low-speed blend, large-error authority, jerk bounds, and strategy bypasses;
 - low-speed radar track qualification;
 - the full stock longitudinal maneuver matrix in ACC and experimental modes.
 
