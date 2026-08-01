@@ -185,6 +185,8 @@ def make_engine(
   pending_route_identity: str | None = None,
   with_progress: bool = False,
   replay_worker_count: int = 1,
+  route_discovery=None,
+  prepared_route_source=None,
 ) -> tuple[
   HistoricalLearningBackfill,
   FakeParams,
@@ -276,8 +278,50 @@ def make_engine(
     abort_requested=lambda: False,
     pending_route_identity=pending_route_identity,
     replay_worker_count=replay_worker_count,
+    route_discovery=route_discovery,
+    prepared_route_source=prepared_route_source,
   )
   return engine, params, prepare_calls, runtime_factory
+
+
+def test_extractor_identity_is_pinned_across_entire_transaction(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  add_route(tmp_path / "logs", 0x20)
+  engine, _, _, runtime_factory = make_engine(tmp_path, monkeypatch)
+  fake_prepare = learning_backfill.prepare_route
+  prepared_count = 0
+
+  def checked_prepare(route, **kwargs):
+    nonlocal prepared_count
+    expected = kwargs["expected_extractor_sha256"]
+    extractor = learning_backfill.open_verified_extractor(
+      engine.extractor_path,
+      expected_sha256=expected,
+    )
+    try:
+      learning_backfill.verify_open_extractor(extractor)
+    finally:
+      os.close(extractor.descriptor)
+    prepared = fake_prepare(route, **kwargs)
+    prepared_count += 1
+    if prepared_count == 1:
+      replacement = engine.extractor_path.with_suffix(".replacement")
+      replacement.write_bytes(b"different native extractor bytes")
+      replacement.chmod(0o755)
+      os.replace(replacement, engine.extractor_path)
+    return prepared
+
+  monkeypatch.setattr(learning_backfill, "prepare_route", checked_prepare)
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "backfill_reader_unavailable"
+  assert prepared_count == 1
+  assert not runtime_factory().artifact_paths.backfill_pointer.exists()
 
 
 @pytest.mark.parametrize("replay_worker_count", (1, 2, 4))
@@ -349,6 +393,328 @@ def read_atomic_pipe_records(read_descriptor: int) -> list[str]:
     encoded.extend(chunk)
   os.close(read_descriptor)
   return encoded.decode("ascii").splitlines()
+
+
+def test_optional_sources_match_default_and_preserve_a_a_authority_order(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  baseline_root = tmp_path / "baseline"
+  add_route(baseline_root / "logs", 0x10)
+  add_route(baseline_root / "logs", 0x20)
+  (
+    baseline_engine,
+    _,
+    baseline_prepare_calls,
+    baseline_runtime_factory,
+  ) = make_engine(baseline_root, monkeypatch)
+
+  baseline = baseline_engine.run_once()
+  assert baseline.publication is not None
+  baseline_artifacts = published_artifact_snapshot(
+    baseline_runtime_factory,
+  )
+
+  injected_root = tmp_path / "injected"
+  add_route(injected_root / "logs", 0x10)
+  add_route(injected_root / "logs", 0x20)
+  candidates = discover_complete_route_candidates(
+    injected_root / "logs",
+  )
+  discovery_abort_callbacks = []
+  source_calls = []
+
+  def injected_discovery(abort_requested):
+    discovery_abort_callbacks.append(abort_requested)
+    return learning_backfill.FullRlogDiscovery(candidates, False)
+
+  def injected_source(authority_index, route, abort_requested):
+    source_calls.append((
+      authority_index,
+      route.route_name,
+      route.display_identity,
+      abort_requested,
+    ))
+    assert not abort_requested()
+    return learning_backfill.prepare_route(route)
+
+  (
+    injected_engine,
+    _,
+    injected_prepare_calls,
+    injected_runtime_factory,
+  ) = make_engine(
+    injected_root,
+    monkeypatch,
+    route_discovery=injected_discovery,
+    prepared_route_source=injected_source,
+  )
+
+  injected = injected_engine.run_once()
+
+  assert injected.publication is not None
+  assert discovery_abort_callbacks == [injected_engine.abort_requested]
+  expected_route_identity = [
+    (route.route_name, route.display_identity)
+    for route in candidates
+  ]
+  assert [
+    (route_name, route_identity)
+    for _, route_name, route_identity, _ in source_calls
+  ] == 2 * expected_route_identity
+  assert [authority for authority, *_ in source_calls] == [1, 1, 2, 2]
+  assert all(
+    callback is injected_engine.abort_requested
+    for *_, callback in source_calls
+  )
+  assert baseline_prepare_calls == injected_prepare_calls
+  assert published_artifact_snapshot(injected_runtime_factory) == (
+    baseline_artifacts
+  )
+  assert injected.publication.finalization == (
+    baseline.publication.finalization
+  )
+
+
+def test_injected_discovery_wrong_type_fails_closed_without_publication(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  engine, _, _, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    route_discovery=lambda _abort_requested: (),
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "backfill_route_incompatible"
+  assert not runtime_factory().artifact_paths.backfill_pointer.exists()
+
+
+@pytest.mark.parametrize("wrong_kind", ("object", "subclass"))
+def test_injected_preparation_wrong_type_fails_closed_without_publication(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  wrong_kind: str,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+
+  class DerivedPreparedRoute(PreparedRoute):
+    pass
+
+  def invalid_source(_authority, route, _abort_requested):
+    if wrong_kind == "object":
+      return object()
+    prepared = learning_backfill.prepare_route(route)
+    return DerivedPreparedRoute(
+      frames=prepared.frames,
+      controls_witness_count=prepared.controls_witness_count,
+      unresolved_witness_count=prepared.unresolved_witness_count,
+      gap_count=prepared.gap_count,
+      provenance=prepared.provenance,
+    )
+
+  engine, _, _, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    prepared_route_source=invalid_source,
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "backfill_route_incompatible"
+  assert not runtime_factory().artifact_paths.backfill_pointer.exists()
+
+
+def test_injected_prepared_route_spool_exact_type_is_accepted(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  route_name, _ = add_route(tmp_path / "logs", 0x10)
+  source_calls = []
+
+  def injected_source(authority_index, route, abort_requested):
+    source_calls.append((authority_index, route.route_name))
+    prepared = learning_backfill.prepare_route(route)
+    spool_root = tmp_path / f"remote-spool-{authority_index}"
+    spool_root.mkdir(mode=0o700, exist_ok=True)
+    descriptor = learning_backfill.write_prepared_route_spool(
+      spool_root,
+      route.route_name,
+      prepared.frames,
+      controls_witness_count=prepared.controls_witness_count,
+      unresolved_witness_count=prepared.unresolved_witness_count,
+      gap_count=prepared.gap_count,
+      provenance=prepared.provenance,
+      max_frames=learning_backfill.MAXIMUM_ROUTE_FRAMES,
+      abort_requested=abort_requested,
+    )
+    return learning_backfill.open_prepared_route_spool(
+      spool_root,
+      descriptor,
+      expected_route_name=route.route_name,
+      max_frames=learning_backfill.MAXIMUM_ROUTE_FRAMES,
+    )
+
+  engine, _, _, _ = make_engine(
+    tmp_path,
+    monkeypatch,
+    prepared_route_source=injected_source,
+  )
+
+  result = engine.run_once()
+
+  assert result.publication is not None
+  assert source_calls == [(1, route_name), (2, route_name)]
+  assert not tuple(tmp_path.glob("remote-spool-*/*.blatspool"))
+
+
+@pytest.mark.parametrize("abort_position", ("before", "after"))
+def test_injected_preparation_abort_checks_bracket_callback_and_never_publish(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  abort_position: str,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  abort_state = {"requested": abort_position == "before"}
+  source_calls = 0
+
+  def abort_requested() -> bool:
+    return abort_state["requested"]
+
+  def injected_source(authority_index, route, callback_abort_requested):
+    nonlocal source_calls
+    source_calls += 1
+    assert authority_index == 1
+    assert callback_abort_requested is abort_requested
+    prepared = learning_backfill.prepare_route(route)
+    abort_state["requested"] = abort_position == "after"
+    return prepared
+
+  engine, _, _, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    prepared_route_source=injected_source,
+  )
+  route = discover_complete_route_candidates(tmp_path / "logs")[0]
+
+  with pytest.raises(BackfillError) as raised:
+    engine._prepare(
+      runtime_factory(),
+      route,
+      authority_index=1,
+      abort_requested=abort_requested,
+    )
+
+  assert raised.value.diagnostic == "unexpected_error"
+  assert source_calls == (0 if abort_position == "before" else 1)
+  assert not runtime_factory().artifact_paths.backfill_pointer.exists()
+
+
+@pytest.mark.parametrize("abort_position", ("before", "after"))
+def test_injected_discovery_abort_checks_bracket_callback_and_never_publish(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  abort_position: str,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  abort_state = {"requested": False}
+  discovery_calls = 0
+
+  def abort_requested() -> bool:
+    return abort_state["requested"]
+
+  engine, _, _, runtime_factory = make_engine(tmp_path, monkeypatch)
+  original_runtime_factory = engine.runtime_factory
+  runtime_factory_calls = 0
+
+  def cancellation_aware_runtime_factory():
+    nonlocal runtime_factory_calls
+    runtime_factory_calls += 1
+    runtime = original_runtime_factory()
+    if runtime_factory_calls == 2 and abort_position == "before":
+      abort_state["requested"] = True
+    return runtime
+
+  def injected_discovery(callback_abort_requested):
+    nonlocal discovery_calls
+    discovery_calls += 1
+    assert callback_abort_requested is abort_requested
+    candidates = discover_complete_route_candidates(tmp_path / "logs")
+    abort_state["requested"] = abort_position == "after"
+    return learning_backfill.FullRlogDiscovery(candidates, False)
+
+  engine.runtime_factory = cancellation_aware_runtime_factory
+  engine.abort_requested = abort_requested
+  engine.route_discovery = injected_discovery
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "unexpected_error"
+  assert discovery_calls == (0 if abort_position == "before" else 1)
+  assert not runtime_factory().artifact_paths.backfill_pointer.exists()
+
+
+def test_injected_route_rejection_keeps_stable_ledger_semantics(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  rejected_name, _ = add_route(tmp_path / "logs", 0x10)
+  accepted_name, _ = add_route(tmp_path / "logs", 0x20)
+  source_calls = []
+
+  def injected_source(authority_index, route, abort_requested):
+    source_calls.append((authority_index, route.route_name))
+    assert not abort_requested()
+    if route.route_name == rejected_name:
+      raise RouteRejected(
+        "remote_route_rejected",
+        "deterministic injected preparation rejection",
+      )
+    return learning_backfill.prepare_route(route)
+
+  engine, _, _, runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+    prepared_route_source=injected_source,
+  )
+
+  result = engine.run_once()
+
+  assert result.publication is not None
+  assert result.publication.diagnostic == (
+    "backfill_complete_with_rejections"
+  )
+  assert source_calls == [
+    (1, rejected_name),
+    (1, accepted_name),
+    (2, rejected_name),
+    (2, accepted_name),
+  ]
+  runtime = runtime_factory()
+  ledger = load_ledger(
+    runtime.artifact_paths,
+    runtime_identity_sha256=(
+      runtime.runtime_bundle.calibration_identity_sha256
+    ),
+  )
+  assert [entry["route_name"] for entry in ledger["entries"]] == [
+    rejected_name,
+    accepted_name,
+  ]
+  assert [entry["disposition"] for entry in ledger["entries"]] == [
+    "rejected",
+    "ingested",
+  ]
+  assert ledger["entries"][0]["diagnostic"] == "remote_route_rejected"
+  assert ledger["entries"][0]["provenance"] is None
+  assert ledger["entries"][0]["accepted_sample_count"] == 0
+  assert ledger["entries"][0]["rejected_sample_count"] == 0
 
 
 def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(

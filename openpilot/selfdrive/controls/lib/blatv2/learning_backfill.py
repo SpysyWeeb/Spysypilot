@@ -391,12 +391,63 @@ class BuildDescriptorRegistry:
     }))
 
 
+def build_current_historical_descriptor(
+  *,
+  source_commit: str,
+  opendbc_commit: str,
+  panda_commit: str,
+  log_schema_path: str | Path,
+  current_car_params: Any,
+  current_runtime_bundle: RuntimeVehicleBundle,
+) -> BuildDescriptor:
+  """Build the effective current-build descriptor from runtime facts.
+
+  The device and an authenticated off-device preparation worker must perform
+  exactly the same construction before extending the reviewed, file-backed
+  historical registry.  Keep this helper free of Params and device state so
+  both architectures import these exact bytes and arithmetic.
+  """
+  rack_resolutions = {
+    float(node.parameters.rack_rate_resolution_deg_s)
+    for node in current_runtime_bundle.calibration_seed_profile.nodes
+  }
+  if len(rack_resolutions) != 1:
+    raise ValueError("current runtime has inconsistent rack-rate resolution")
+  limits = current_runtime_bundle.torque_limits
+  return BuildDescriptor(
+    superproject_commit=source_commit,
+    opendbc_commit=opendbc_commit,
+    panda_commit=panda_commit,
+    log_schema_blob=git_blob_sha1(log_schema_path),
+    supported_vehicle_identity=str(current_car_params.carFingerprint),
+    steer_max=limits.steer_max,
+    steer_delta_up=limits.delta_up,
+    steer_delta_down=limits.delta_down,
+    steer_step=limits.steer_step,
+    driver_allowance=limits.driver_allowance,
+    driver_multiplier=limits.driver_multiplier,
+    driver_factor=limits.driver_factor,
+    production_envelope_verified=limits.production_envelope_verified,
+    rack_rate_resolution_deg_s=rack_resolutions.pop(),
+  )
+
+
 @dataclass(frozen=True, slots=True)
 class ExtractedEvent:
   which: int
   mono_ns: int
   ordinal: int
   encoded: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedExtractor:
+  """One executable inode whose hash and child execution are inseparable."""
+
+  path: Path
+  descriptor: int
+  opened_stat: os.stat_result
+  sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,6 +599,223 @@ def _sha256_file(
         break
       digest.update(chunk)
   return digest.hexdigest()
+
+
+def _sha256_open_file(
+  descriptor: int,
+  *,
+  abort_requested: Callable[[], bool],
+) -> str:
+  """Hash one already-open regular file without changing its file offset."""
+  digest = hashlib.sha256()
+  offset = 0
+  while True:
+    _abort_if_requested(
+      abort_requested,
+      "backfill aborted while hashing an open route segment",
+    )
+    chunk = os.pread(descriptor, 1024 * 1024, offset)
+    _abort_if_requested(
+      abort_requested,
+      "backfill aborted while hashing an open route segment",
+    )
+    if not chunk:
+      break
+    digest.update(chunk)
+    offset += len(chunk)
+  return digest.hexdigest()
+
+
+def _extractor_stat_is_executable(
+  file_stat: os.stat_result,
+  descriptor: int,
+) -> bool:
+  return (
+    stat.S_ISREG(file_stat.st_mode)
+    and stat.S_IMODE(file_stat.st_mode) & 0o111 != 0
+    and os.access(f"/proc/self/fd/{descriptor}", os.X_OK)
+  )
+
+
+def open_verified_extractor(
+  extractor_path: str | Path,
+  *,
+  expected_sha256: str | None = None,
+  abort_requested: Callable[[], bool] = lambda: False,
+) -> VerifiedExtractor:
+  """Open and hash the exact executable inode later inherited by children."""
+  if (
+    expected_sha256 is not None
+    and (
+      type(expected_sha256) is not str
+      or _SHA256_RE.fullmatch(expected_sha256) is None
+    )
+  ):
+    raise ValueError("expected extractor SHA-256 is invalid")
+  path = Path(extractor_path)
+  descriptor = -1
+  try:
+    _abort_if_requested(
+      abort_requested,
+      "backfill aborted before opening the native extractor",
+    )
+    path_stat = path.lstat()
+    if not stat.S_ISREG(path_stat.st_mode) or path.is_symlink():
+      raise OSError("native extractor is not a regular file")
+    descriptor = os.open(
+      path,
+      os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    opened_stat = os.fstat(descriptor)
+    observed_sha256 = _sha256_open_file(
+      descriptor,
+      abort_requested=abort_requested,
+    )
+    if (
+      not _same_open_segment_identity(path_stat, opened_stat)
+      or path_stat.st_mode != opened_stat.st_mode
+      or not _extractor_stat_is_executable(opened_stat, descriptor)
+      or (
+        expected_sha256 is not None
+        and observed_sha256 != expected_sha256
+      )
+    ):
+      raise OSError("native extractor identity does not match its contract")
+    return VerifiedExtractor(
+      path=path,
+      descriptor=descriptor,
+      opened_stat=opened_stat,
+      sha256=observed_sha256,
+    )
+  except BackfillError:
+    if descriptor >= 0:
+      os.close(descriptor)
+    raise
+  except OSError as exc:
+    if descriptor >= 0:
+      os.close(descriptor)
+    raise BackfillError(
+      "backfill_reader_unavailable",
+      "native rlog extractor is unavailable or changed",
+    ) from exc
+
+
+def verify_open_extractor(
+  extractor: VerifiedExtractor,
+  *,
+  abort_requested: Callable[[], bool] = lambda: False,
+) -> None:
+  """Verify the held executable and its pathname after route preparation."""
+  try:
+    after = os.fstat(extractor.descriptor)
+    path_after = extractor.path.lstat()
+    if (
+      not _same_open_segment_identity(extractor.opened_stat, after)
+      or not _same_open_segment_identity(extractor.opened_stat, path_after)
+      or extractor.opened_stat.st_mode != after.st_mode
+      or extractor.opened_stat.st_mode != path_after.st_mode
+      or not _extractor_stat_is_executable(after, extractor.descriptor)
+      or _sha256_open_file(
+        extractor.descriptor,
+        abort_requested=abort_requested,
+      ) != extractor.sha256
+    ):
+      raise OSError("native extractor changed during route preparation")
+  except BackfillError:
+    raise
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_reader_unavailable",
+      "native rlog extractor changed during route preparation",
+    ) from exc
+
+
+def _same_open_segment_identity(
+  left: os.stat_result,
+  right: os.stat_result,
+) -> bool:
+  return (
+    stat.S_ISREG(right.st_mode)
+    and left.st_dev == right.st_dev
+    and left.st_ino == right.st_ino
+    and left.st_size == right.st_size
+    and left.st_mtime_ns == right.st_mtime_ns
+    and left.st_ctime_ns == right.st_ctime_ns
+  )
+
+
+def _open_verified_route_segment(
+  segment: RouteSegment,
+  *,
+  abort_requested: Callable[[], bool],
+) -> tuple[int, os.stat_result]:
+  """Open, identify, and hash the exact inode the extractor will consume."""
+  _abort_if_requested(
+    abort_requested,
+    "backfill aborted before opening a route segment",
+  )
+  descriptor = -1
+  try:
+    path_stat = segment.path.lstat()
+    if not stat.S_ISREG(path_stat.st_mode) or segment.path.is_symlink():
+      raise OSError("route segment is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(
+      os,
+      "O_CLOEXEC",
+      0,
+    )
+    descriptor = os.open(segment.path, flags)
+    opened_stat = os.fstat(descriptor)
+    if (
+      not _same_open_segment_identity(path_stat, opened_stat)
+      or opened_stat.st_size != segment.size_bytes
+      or _sha256_open_file(
+        descriptor,
+        abort_requested=abort_requested,
+      ) != segment.sha256
+    ):
+      raise OSError("route segment identity does not match discovery")
+    return descriptor, opened_stat
+  except BackfillError:
+    if descriptor >= 0:
+      os.close(descriptor)
+    raise
+  except OSError as exc:
+    if descriptor >= 0:
+      os.close(descriptor)
+    raise RouteRejected(
+      "segment_changed",
+      "route segment changed after discovery",
+    ) from exc
+
+
+def _verify_open_route_segment(
+  segment: RouteSegment,
+  descriptor: int,
+  opened_stat: os.stat_result,
+  *,
+  abort_requested: Callable[[], bool],
+) -> None:
+  """Reject mutation/replacement of the held inode during extraction."""
+  try:
+    after = os.fstat(descriptor)
+    path_after = segment.path.lstat()
+    if (
+      not _same_open_segment_identity(opened_stat, after)
+      or not _same_open_segment_identity(opened_stat, path_after)
+      or _sha256_open_file(
+        descriptor,
+        abort_requested=abort_requested,
+      ) != segment.sha256
+    ):
+      raise OSError("route segment changed during extraction")
+  except BackfillError:
+    raise
+  except OSError as exc:
+    raise RouteRejected(
+      "segment_changed",
+      "route segment changed during extraction",
+    ) from exc
 
 
 def git_blob_sha1(path: str | Path) -> str:
@@ -759,20 +1027,50 @@ def extract_segment_events(
   segment_path: str | Path,
   *,
   abort_requested: Callable[[], bool] = lambda: False,
+  extractor_fd: int | None = None,
+  segment_fd: int | None = None,
 ) -> tuple[ExtractedEvent, ...]:
-  """Buffer one selected segment only after a verified native trailer/exit."""
-  extractor = Path(extractor_path)
-  if not extractor.is_file() or not os.access(extractor, os.X_OK):
-    raise BackfillError(
-      "backfill_reader_unavailable",
-      "native rlog extractor is unavailable",
-    )
+  """Buffer one selected segment only after a verified native trailer/exit.
+
+  ``prepare_route`` supplies a held, pre-hashed descriptor. ``/proc/self/fd``
+  makes the native child open that exact inode instead of resolving a mutable
+  pathname between the parent's before/after checks.
+  """
+  if extractor_fd is not None:
+    if type(extractor_fd) is not int or extractor_fd < 0:
+      raise ValueError("extractor descriptor is invalid")
+    extractor_stat = os.fstat(extractor_fd)
+    if not _extractor_stat_is_executable(extractor_stat, extractor_fd):
+      raise ValueError("extractor descriptor is not executable")
+    extractor_argument_path = f"/proc/self/fd/{extractor_fd}"
+    inherited_fds = [extractor_fd]
+  else:
+    # Direct pathname mode remains for isolated protocol tests. Production
+    # route preparation always supplies the verified held descriptor above.
+    extractor = Path(extractor_path)
+    if not extractor.is_file() or not os.access(extractor, os.X_OK):
+      raise BackfillError(
+        "backfill_reader_unavailable",
+        "native rlog extractor is unavailable",
+      )
+    extractor_argument_path = str(extractor)
+    inherited_fds = []
+  if segment_fd is not None:
+    if type(segment_fd) is not int or segment_fd < 0:
+      raise ValueError("segment descriptor is invalid")
+    if not stat.S_ISREG(os.fstat(segment_fd).st_mode):
+      raise ValueError("segment descriptor is not a regular file")
+    extractor_argument = f"/proc/self/fd/{segment_fd}"
+    inherited_fds.append(segment_fd)
+  else:
+    extractor_argument = str(segment_path)
   with tempfile.TemporaryFile() as errors:
     process = subprocess.Popen(
-      (str(extractor), str(segment_path)),
+      (extractor_argument_path, extractor_argument),
       stdin=subprocess.DEVNULL,
       stdout=subprocess.PIPE,
       stderr=errors,
+      pass_fds=tuple(inherited_fds),
     )
     if process.stdout is None:
       process.kill()
@@ -1062,10 +1360,11 @@ def _decode_extracted_event(
     ) from exc
 
 
-def prepare_route(
+def _prepare_route_with_extractor(
   route: RouteCandidate,
   *,
   extractor_path: str | Path,
+  extractor_fd: int,
   event_reader: Callable[[bytes], AbstractContextManager[Any]],
   car_params_decoder: Callable[[bytes], Any],
   descriptor_registry: BuildDescriptorRegistry,
@@ -1108,41 +1407,28 @@ def prepare_route(
       )
     if segment_started is not None:
       segment_started(segment, segment_position, segment_count)
+    segment_descriptor = -1
     try:
-      before_sha = _sha256_file(
-        segment.path,
+      segment_descriptor, opened_stat = _open_verified_route_segment(
+        segment,
         abort_requested=abort_requested,
       )
-    except OSError as exc:
-      raise RouteRejected(
-        "segment_changed",
-        "route segment disappeared after discovery",
-      ) from exc
-    if before_sha != segment.sha256:
-      raise RouteRejected(
-        "segment_changed",
-        "route segment changed after discovery",
-      )
-    records = extract_segment_events(
-      extractor_path,
-      segment.path,
-      abort_requested=abort_requested,
-    )
-    try:
-      after_sha = _sha256_file(
+      records = extract_segment_events(
+        extractor_path,
         segment.path,
         abort_requested=abort_requested,
+        extractor_fd=extractor_fd,
+        segment_fd=segment_descriptor,
       )
-    except OSError as exc:
-      raise RouteRejected(
-        "segment_changed",
-        "route segment disappeared during extraction",
-      ) from exc
-    if after_sha != segment.sha256:
-      raise RouteRejected(
-        "segment_changed",
-        "route segment changed during extraction",
+      _verify_open_route_segment(
+        segment,
+        segment_descriptor,
+        opened_stat,
+        abort_requested=abort_requested,
       )
+    finally:
+      if segment_descriptor >= 0:
+        os.close(segment_descriptor)
 
     sentinels = []
     segment_init_seen = False
@@ -1495,6 +1781,57 @@ def prepare_route(
     gap_count=gap_count,
     provenance=provenance,
   )
+
+
+def prepare_route(
+  route: RouteCandidate,
+  *,
+  extractor_path: str | Path,
+  event_reader: Callable[[bytes], AbstractContextManager[Any]],
+  car_params_decoder: Callable[[bytes], Any],
+  descriptor_registry: BuildDescriptorRegistry,
+  route_bundle_factory: Callable[
+    [Any, BuildDescriptor],
+    RuntimeVehicleBundle,
+  ],
+  current_car_params: Any,
+  current_bundle: RuntimeVehicleBundle,
+  expected_dongle_id: str,
+  expected_extractor_sha256: str | None = None,
+  abort_requested: Callable[[], bool] = lambda: False,
+  segment_started: Callable[[RouteSegment, int, int], None] | None = None,
+  segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
+) -> PreparedRoute:
+  """Prepare one route with one hash-bound extractor inode held throughout."""
+  extractor = open_verified_extractor(
+    extractor_path,
+    expected_sha256=expected_extractor_sha256,
+    abort_requested=abort_requested,
+  )
+  try:
+    return _prepare_route_with_extractor(
+      route,
+      extractor_path=extractor_path,
+      extractor_fd=extractor.descriptor,
+      event_reader=event_reader,
+      car_params_decoder=car_params_decoder,
+      descriptor_registry=descriptor_registry,
+      route_bundle_factory=route_bundle_factory,
+      current_car_params=current_car_params,
+      current_bundle=current_bundle,
+      expected_dongle_id=expected_dongle_id,
+      abort_requested=abort_requested,
+      segment_started=segment_started,
+      segment_completed=segment_completed,
+    )
+  finally:
+    try:
+      verify_open_extractor(
+        extractor,
+        abort_requested=abort_requested,
+      )
+    finally:
+      os.close(extractor.descriptor)
 
 
 def _empty_ledger(runtime_identity_sha256: str) -> dict[str, object]:
@@ -3239,6 +3576,14 @@ class HistoricalLearningBackfill:
     progress_monotonic_ns: Callable[[], int] = time.monotonic_ns,
     pending_route_identity: str | None = None,
     replay_worker_count: int = BACKFILL_REPLAY_WORKER_COUNT,
+    route_discovery: Callable[
+      [Callable[[], bool]], FullRlogDiscovery
+    ] | None = None,
+    prepared_route_source: Callable[
+      [int, RouteCandidate, Callable[[], bool]],
+      PreparedRoute | PreparedRouteSpool,
+    ] | None = None,
+    preparation_extractor_sha256: str | None = None,
     event_reader: Callable[
       [bytes],
       AbstractContextManager[Any],
@@ -3264,7 +3609,39 @@ class HistoricalLearningBackfill:
     ):
       raise ValueError("backfill replay worker count is outside its bound")
     self.replay_worker_count = replay_worker_count
+    # These two seams let an authenticated off-device worker replace only
+    # immutable route discovery and preparation.  Learner application,
+    # A/A verification, ledger mutation, finalization, and atomic publication
+    # remain in this process on the device.  The default path below is the
+    # original local-rlog behavior byte-for-byte.
+    self.route_discovery = route_discovery
+    self.prepared_route_source = prepared_route_source
+    if (
+      preparation_extractor_sha256 is not None
+      and (
+        type(preparation_extractor_sha256) is not str
+        or _SHA256_RE.fullmatch(preparation_extractor_sha256) is None
+      )
+    ):
+      raise ValueError("preparation extractor identity is invalid")
+    # A remote preparation authority runs a different architecture-specific
+    # extractor binary. Publication must name the binary that actually decoded
+    # the route, never the unused local executable merely because it publishes.
+    self.preparation_extractor_sha256 = preparation_extractor_sha256
+    self._active_local_extractor_sha256: str | None = None
     self.event_reader = event_reader
+
+  @property
+  def pending_route_quiescence_observed(self) -> bool:
+    return self._pending_route_quiescence_observed
+
+  def preserve_pending_route_quiescence(self, observed: bool) -> None:
+    """Carry the one-poll logger-close guard across backend transactions."""
+    if type(observed) is not bool:
+      raise TypeError("pending-route quiescence state must be boolean")
+    self._pending_route_quiescence_observed = (
+      self._pending_route_quiescence_observed or observed
+    )
 
   @staticmethod
   def _runtime_context(
@@ -3322,10 +3699,39 @@ class HistoricalLearningBackfill:
     runtime: PersistentLearningRuntime,
     route: RouteCandidate,
     *,
+    authority_index: int = 1,
+    expected_extractor_sha256: str | None = None,
     abort_requested: Callable[[], bool] | None = None,
     segment_started: Callable[[RouteSegment, int, int], None] | None = None,
     segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
-  ) -> PreparedRoute:
+  ) -> PreparedRoute | PreparedRouteSpool:
+    selected_abort = (
+      self.abort_requested
+      if abort_requested is None
+      else abort_requested
+    )
+    if authority_index not in (1, 2):
+      raise ValueError("backfill preparation authority must be one or two")
+    if self.prepared_route_source is not None:
+      _abort_if_requested(
+        selected_abort,
+        "backfill aborted before prepared-route retrieval",
+      )
+      prepared = self.prepared_route_source(
+        authority_index,
+        route,
+        selected_abort,
+      )
+      if type(prepared) not in (PreparedRoute, PreparedRouteSpool):
+        raise BackfillError(
+          "backfill_route_incompatible",
+          "prepared-route source returned an invalid result",
+        )
+      _abort_if_requested(
+        selected_abort,
+        "backfill aborted after prepared-route retrieval",
+      )
+      return prepared
     return prepare_route(
       route,
       extractor_path=self.extractor_path,
@@ -3336,16 +3742,17 @@ class HistoricalLearningBackfill:
       current_car_params=self.current_car_params,
       current_bundle=runtime.runtime_bundle,
       expected_dongle_id=self.expected_dongle_id,
-      abort_requested=(
-        self.abort_requested
-        if abort_requested is None
-        else abort_requested
+      expected_extractor_sha256=(
+        self._active_local_extractor_sha256
+        if expected_extractor_sha256 is None
+        else expected_extractor_sha256
       ),
+      abort_requested=selected_abort,
       segment_started=segment_started,
       segment_completed=segment_completed,
     )
 
-  def run_once(self) -> BackfillRunResult:
+  def _run_once_with_extractor_identity(self) -> BackfillRunResult:
     if self.abort_requested():
       raise BackfillError(
         "unexpected_error",
@@ -3401,10 +3808,26 @@ class HistoricalLearningBackfill:
         artifact_paths,
         runtime_identity_sha256=runtime_identity,
       )
-      discovery = discover_full_rlog_state(
-        self.log_root,
-        abort_requested=self.abort_requested,
-      )
+      if self.route_discovery is None:
+        discovery = discover_full_rlog_state(
+          self.log_root,
+          abort_requested=self.abort_requested,
+        )
+      else:
+        _abort_if_requested(
+          self.abort_requested,
+          "backfill aborted before remote route discovery",
+        )
+        discovery = self.route_discovery(self.abort_requested)
+        _abort_if_requested(
+          self.abort_requested,
+          "backfill aborted after remote route discovery",
+        )
+      if type(discovery) is not FullRlogDiscovery:
+        raise BackfillError(
+          "backfill_route_incompatible",
+          "route discovery source returned an invalid inventory",
+        )
       discovered = discovery.candidates
       pending_close = discovery.pending_logger_close
       verify_known_route_hashes(ledger, discovered)
@@ -3525,6 +3948,7 @@ class HistoricalLearningBackfill:
         return self._prepare(
           initial_runtime,
           route,
+          authority_index=1,
           segment_started=(
             None
             if progress is None
@@ -3603,6 +4027,7 @@ class HistoricalLearningBackfill:
           return self._prepare(
             worker_runtime,
             route,
+            authority_index=2,
             abort_requested=worker_abort_requested,
           )
 
@@ -3615,6 +4040,7 @@ class HistoricalLearningBackfill:
               lambda route, helper_abort_requested: self._prepare(
                 worker_runtime,
                 route,
+                authority_index=2,
                 abort_requested=helper_abort_requested,
               )
             ),
@@ -3667,6 +4093,7 @@ class HistoricalLearningBackfill:
               lambda route, helper_abort_requested: self._prepare(
                 first_runtime,
                 route,
+                authority_index=1,
                 abort_requested=helper_abort_requested,
               )
             ),
@@ -3725,6 +4152,7 @@ class HistoricalLearningBackfill:
           return self._prepare(
             second_runtime,
             route,
+            authority_index=2,
             segment_started=(
               None
               if progress is None
@@ -3798,10 +4226,14 @@ class HistoricalLearningBackfill:
       )
       if progress is not None:
         project_progress(progress.publishing)
-      extractor_sha256 = _sha256_file(
-        self.extractor_path,
-        abort_requested=self.abort_requested,
-      )
+      extractor_sha256 = self.preparation_extractor_sha256
+      if extractor_sha256 is None:
+        extractor_sha256 = self._active_local_extractor_sha256
+      if extractor_sha256 is None:
+        raise BackfillError(
+          "backfill_reader_unavailable",
+          "native extractor transaction identity is unavailable",
+        )
       generation_sha256, ledger_sha256 = publish_generation(
         artifact_paths=artifact_paths,
         runtime_identity_sha256=runtime_identity,
@@ -3860,3 +4292,32 @@ class HistoricalLearningBackfill:
         ),
         pending_logger_close=pending_close,
       )
+
+  def run_once(self) -> BackfillRunResult:
+    """Run one transaction under one pinned local extractor identity."""
+    if (
+      self.prepared_route_source is not None
+      and self.preparation_extractor_sha256 is not None
+    ):
+      return self._run_once_with_extractor_identity()
+    if self._active_local_extractor_sha256 is not None:
+      raise BackfillError(
+        "unexpected_error",
+        "native extractor transaction is already active",
+      )
+    extractor = open_verified_extractor(
+      self.extractor_path,
+      abort_requested=self.abort_requested,
+    )
+    self._active_local_extractor_sha256 = extractor.sha256
+    try:
+      return self._run_once_with_extractor_identity()
+    finally:
+      try:
+        verify_open_extractor(
+          extractor,
+          abort_requested=self.abort_requested,
+        )
+      finally:
+        self._active_local_extractor_sha256 = None
+        os.close(extractor.descriptor)
