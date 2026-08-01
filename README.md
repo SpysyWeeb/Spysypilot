@@ -31,7 +31,13 @@ longitudinal planner to Experimental mode for a confirmed, lead-free model
 stop prediction, hold that handoff through the stop, and return to Chill after
 a stable release or driver override. This branch has no standalone traffic
 light or stop-sign classifier, so the detector uses the model's existing
-`action.shouldStop`, path-end, and desired-acceleration signals. The feature
+`action.shouldStop`, predicted position/velocity/orientation, and action
+signals. A route-derived high-speed tier now recognizes a straight, lead-free
+near-stop trajectory before the terminal prediction reaches zero; weaker
+evidence only precharges its existing temporal filter. Replay of route
+`000000d7--cc6308b4d0` moves the first handoff from `39.1 mph` to `42.2 mph`
+without admitting its highway-exit slowdown or brief radar-dropout window.
+This is counterfactual replay evidence, not field validation. The feature
 publishes only through `selfdriveState.experimentalMode`; it adds no UI or
 user-facing Params and does not own target speed or braking.
 The implementation and signal mapping are documented in

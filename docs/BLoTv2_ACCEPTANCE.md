@@ -35,6 +35,9 @@ Every test report must identify:
 - [x] Conditional mode filtering, debounce, hysteresis, latch, lead/turn
   guards, pedal override, invalid-model release, reset, and publication have
   deterministic unit coverage.
+- [x] High-speed early intent, filter-only hints, comfort-distance gating,
+  geometry validity, highway-slowdown rejection, and recent-lead hysteresis
+  have deterministic unit coverage.
 - [x] BLoTv2 contains no legacy Force Stops speed-cap owner or planner hook.
 - [x] Stock longitudinal maneuver matrix passes.
 - [x] Final static and generated-solver build audit.
@@ -54,6 +57,12 @@ Replay must use the real production classes, not copied equations.
 - [ ] ACC and experimental-mode candidate arbitration is reviewed.
 - [x] Route `000000d2--a62f0c1831` identifies cruise authority—not PID or
   Smooth Stops—as the source of excessive 40-to-45 mph acceleration.
+- [x] Route `000000d7--cc6308b4d0` identifies late CEM recognition—not planner
+  handoff latency—as the first high-speed red-light failure and replays the
+  production class at `42.2 mph` instead of `39.1 mph`.
+- [x] All 62 segments of that route reject the observed highway-exit slowdown
+  and transient lead-dropout window while retaining both intended stop
+  handoffs.
 - [ ] The route-derived stock-gate handoff is repeated on-road without
   excessive throttle feel, delayed response, or added speed overshoot.
 - [ ] Ordinary no-stop driving remains in Chill without mode flicker.
