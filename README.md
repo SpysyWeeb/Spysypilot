@@ -430,6 +430,13 @@ cannot change steering. The `BLaTv2LifecycleStatus` schema and
 testing, but the stock-only field manager does not launch that process or
 publish that cache.
 
+On cold boot, `blatv2_backfilld` publishes a
+vehicle-bound **PREPARING LEARNER** projection immediately after it decodes
+CarParams and before runtime construction, route discovery, PC inventory, or
+uploads. Expensive preflight work therefore cannot be misreported as
+**LEARNER STATUS UNAVAILABLE**; the cache still conveys no durable-learning
+authority until authenticated evidence is restored or committed.
+
 ### Pre-merge real-route audit
 
 Routes b7, b8, b9, and ca were replayed through the complete native-extractor,

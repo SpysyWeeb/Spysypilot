@@ -72,6 +72,65 @@ class FakeParams:
     self.values.pop(key, None)
 
 
+def test_immediate_car_params_publish_preflight_before_return(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    extractor_path=tmp_path / "extractor",
+    descriptor_path=tmp_path / "descriptors.json",
+  )
+  car_params = SimpleNamespace(carFingerprint="CAR")
+  daemon._read_car_params = MagicMock(return_value=car_params)
+
+  assert daemon._wait_for_car_params() is car_params
+
+  status = params.values[LEARNING_OPERATION_STATUS_PARAM]
+  assert type(status) is dict
+  assert status["state"] == "preparing"
+  assert status["diagnostic"] == "restoring_runtime"
+  assert status["vehicle_identity"] == "CAR"
+  assert status["sequence"] == 0
+
+
+def test_delayed_car_params_advance_one_preflight_operation(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    extractor_path=tmp_path / "extractor",
+    descriptor_path=tmp_path / "descriptors.json",
+  )
+  car_params = SimpleNamespace(carFingerprint="CAR")
+  daemon._read_car_params = MagicMock(side_effect=(None, car_params))
+  operation_ids: list[str] = []
+
+  def observe_wait(_seconds: float) -> None:
+    waiting = params.values[LEARNING_OPERATION_STATUS_PARAM]
+    assert type(waiting) is dict
+    assert waiting["diagnostic"] == "waiting_for_car_params"
+    operation_ids.append(str(waiting["operation_id"]))
+
+  with patch(
+    "openpilot.selfdrive.controls.blatv2_backfilld.time.sleep",
+    side_effect=observe_wait,
+  ):
+    assert daemon._wait_for_car_params() is car_params
+
+  status = params.values[LEARNING_OPERATION_STATUS_PARAM]
+  assert type(status) is dict
+  assert status["diagnostic"] == "restoring_runtime"
+  assert status["vehicle_identity"] == "CAR"
+  assert status["sequence"] == 1
+  assert status["operation_id"] == operation_ids[0]
+
+
 def test_terminal_failure_preserves_same_operation_progress(
   tmp_path: Path,
 ) -> None:
