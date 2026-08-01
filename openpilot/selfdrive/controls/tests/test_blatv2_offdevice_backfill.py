@@ -1243,10 +1243,17 @@ def accepted_spool_outcomes(
   scratch: Path,
   candidate: RouteCandidate,
   provenance: dict[str, object],
+  *,
+  runtime_identity: str | None = None,
 ) -> dict[tuple[int, str], _PreparedOutcome]:
   result: dict[tuple[int, str], _PreparedOutcome] = {}
   for authority in (1, 2):
-    evidence = route_evidence_for_frames(candidate.route_name, (), provenance)
+    evidence = route_evidence_for_frames(
+      candidate.route_name,
+      (),
+      provenance,
+      runtime_identity=runtime_identity,
+    )
     descriptor = write_prepared_route_spool(
       scratch,
       candidate.route_name,
@@ -1257,7 +1264,7 @@ def accepted_spool_outcomes(
       provenance=provenance,
       max_frames=1,
       abort_requested=lambda: False,
-      filename=f"a{authority}-route.spool",
+      filename=f"a{authority}-{candidate.route_name}.spool",
       route_evidence=evidence,
     )
     result[(authority, candidate.route_name)] = _PreparedOutcome(
@@ -1271,11 +1278,16 @@ def accepted_spool_outcomes(
 def empty_prepared_route(
   candidate: RouteCandidate,
   provenance: dict[str, object],
+  *,
+  runtime_identity: str | None = None,
 ) -> PreparedRoute:
   return PreparedRoute(
     (), 0, 0, 0, provenance,
     route_evidence=route_evidence_for_frames(
-      candidate.route_name, (), provenance,
+      candidate.route_name,
+      (),
+      provenance,
+      runtime_identity=runtime_identity,
     ),
   )
 
@@ -1343,7 +1355,9 @@ def test_accepted_domain_requires_one_byte_exact_arm_certification(
   )
   assert engine.prepare_count == 2
 
-  # A worker restart is a new environment boundary and must recertify.
+  # A service restart changes only the authenticated transport session. The
+  # same source, implementation, extractor, and semantic domain reuse the
+  # durable ARM numerical certificate.
   _certify_preparation_domains(
     engine=engine,
     plan=certification_plan(candidate),
@@ -1355,7 +1369,118 @@ def test_accepted_domain_requires_one_byte_exact_arm_certification(
     secret=SECRET,
     abort_requested=lambda: False,
   )
-  assert engine.prepare_count == 3
+  assert engine.prepare_count == 2
+
+
+def test_full_car_params_hash_does_not_fragment_physical_domain(
+  tmp_path: Path,
+) -> None:
+  scratch = tmp_path / ".blatv2-remote-prepare-cert"
+  scratch.mkdir(mode=0o700)
+  archived = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  local = route(tmp_path, "00000003--3333333333", ("3" * 64,))
+  archived_provenance = prepared_provenance()
+  local_provenance = dict(archived_provenance)
+  local_provenance["car_params_sha256"] = "f" * 64
+  local_provenance["selected_event_stream_sha256"] = "e" * 64
+  outcomes = {
+    **accepted_spool_outcomes(
+      scratch,
+      archived,
+      archived_provenance,
+    ),
+    **accepted_spool_outcomes(scratch, local, local_provenance),
+  }
+  plan = RemoteRoutePlan(
+    discovery=FullRlogDiscovery((archived, local), False),
+    replay_candidates=(archived, local),
+    late_candidates=(),
+    upload_candidates=(),
+    locally_available_route_names=frozenset({local.route_name}),
+  )
+  engine = CertificationEngine(
+    tmp_path,
+    empty_prepared_route(local, local_provenance),
+  )
+
+  certified = _certify_preparation_domains(
+    engine=engine,
+    plan=plan,
+    scratch_directory=scratch,
+    outcomes=outcomes,
+    contract=contract(),
+    worker_extractor_sha256=WORKER_EXTRACTOR,
+    worker_instance_id=WORKER_INSTANCE,
+    secret=SECRET,
+    abort_requested=lambda: False,
+  )
+
+  assert engine.prepare_count == 1
+  assert len(list(
+    (tmp_path / ".blatv2-offdevice-certifications").glob("*.json"),
+  )) == 1
+  identities = {
+    outcome.certification_identity_sha256
+    for outcome in certified.values()
+  }
+  assert None not in identities
+  assert len(identities) == 1
+
+
+def test_runtime_vehicle_semantics_remain_a_certification_boundary(
+  tmp_path: Path,
+) -> None:
+  scratch = tmp_path / ".blatv2-remote-prepare-cert"
+  scratch.mkdir(mode=0o700)
+  archived = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  local = route(tmp_path, "00000003--3333333333", ("3" * 64,))
+  archived_provenance = prepared_provenance()
+  local_provenance = dict(archived_provenance)
+  local_provenance["car_params_sha256"] = "f" * 64
+  local_provenance["selected_event_stream_sha256"] = "e" * 64
+  archived_runtime = "a" * 64
+  local_runtime = "b" * 64
+  outcomes = {
+    **accepted_spool_outcomes(
+      scratch,
+      archived,
+      archived_provenance,
+      runtime_identity=archived_runtime,
+    ),
+    **accepted_spool_outcomes(
+      scratch,
+      local,
+      local_provenance,
+      runtime_identity=local_runtime,
+    ),
+  }
+  plan = RemoteRoutePlan(
+    discovery=FullRlogDiscovery((archived, local), False),
+    replay_candidates=(archived, local),
+    late_candidates=(),
+    upload_candidates=(),
+    locally_available_route_names=frozenset({local.route_name}),
+  )
+
+  with pytest.raises(BridgeUnavailableError, match="no local"):
+    _certify_preparation_domains(
+      engine=CertificationEngine(
+        tmp_path,
+        empty_prepared_route(
+          local,
+          local_provenance,
+          runtime_identity=local_runtime,
+        ),
+      ),
+      plan=plan,
+      scratch_directory=scratch,
+      outcomes=outcomes,
+      contract=contract(),
+      worker_extractor_sha256=WORKER_EXTRACTOR,
+      worker_instance_id=WORKER_INSTANCE,
+      secret=SECRET,
+      abort_requested=lambda: False,
+    )
 
 
 def test_corrupt_or_nonlocal_accepted_domain_never_reaches_learner(
