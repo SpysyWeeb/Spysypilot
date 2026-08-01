@@ -42,18 +42,22 @@ After logger closure, the offroad-only `blatv2_backfilld` replays compatible
 complete full rlogs twice. It commits evidence only when both passes agree
 bit-for-bit. Learning is measured-response-only at 0/5/10/15/20/30 m/s, and a
 sample updates only neighboring nodes, so highway mileage cannot overwrite
-low-speed knowledge. The current `complete_full_rlog_authority_v3` namespace
-starts empty and never migrates or rewrites retired v1/v2 evidence.
+low-speed knowledge. The current `complete_full_rlog_authority_v4` namespace
+starts empty and never migrates or rewrites retired v1/v2/v3 evidence.
 
 The retired dynamic-rack learner is replaced by an observable inverse-torque
 fit: torque per measured lateral acceleration, a signed acceleration-offset
 correction, moving friction, and static breakaway. Base, moving, breakaway,
 held-out validation, and vehicle-owned full-authority evidence remain separate.
-The deterministic constrained solve enforces non-negative gain/friction and
-`static >= kinetic` by re-solving active constraint faces, not by clipping.
-`static == kinetic` explicitly means normal driving did not resolve extra
-breakaway. Slew transitions and a stuck rack remain authority observations;
-only settled full torque with resolved rack motion may join the equality fit.
+Breakaway is reconstructed as one physical episode: raw steering-angle motion
+at half a rate quantum marks onset, and same-direction measured rate must
+confirm it within the existing transport delay. Whole routes alternate between
+training and validation by immutable route counter, so one maneuver cannot
+train and validate itself. Training evaluates nested static-only, friction,
+offset-plus-friction, and full-map models. The seed is comparator-only; a model
+must improve something without regressing any populated category before its
+frozen held-route check. Dense ordinary samples therefore cannot outvote rare
+breakaway or authority failures.
 
 A candidate file is emitted only if every node has enough independent evidence
 and beats or matches its seed on every applicable held-out population. It is
@@ -94,12 +98,14 @@ gain/offset/kinetic/static values. A complete calibration never implies
 activation; the lifecycle rail reports stock until a separately reviewed
 activation path exists.
 
-The pre-merge b2-b7 production replay was bit-identical across both passes:
-evidence `8f67d9c41d9669f1a82f7abbe4f841c70434403a7235ad4236d3964fca40b81a`,
-manifest `cc8e5387f8c83c6efc57b37e2bbe7d4d2e4651a985d1815d3483ebdd9c29b0d`.
-Nodes 10 and 15 m/s qualified; 5 m/s was withheld by its independent authority
-validation, while 0, 20, and 30 m/s remained evidence-limited or regressing.
-No candidate was emitted.
+The pre-merge b7/b8/b9/ca production replay was byte-identical with two and
+four workers: generation
+`1ff42b06de6480fc1e744702175167bd725849321e6e99d3e714596e16e56809`,
+evidence `ad59ed7bc85a6d06d164185673110c592df80b44971377fe86b0bb4204993aa9`,
+and manifest `3c0f072a6af25d44ae447a19b0011ed27435fb21d523cdd7d607b39f1f384631`.
+Nodes 10 and 15 m/s qualified. The 5 m/s training fit selected a minimal
+static-only change, but held routes rejected it; 0, 20, and 30 m/s remained
+support- or episode-limited in this regression set. No candidate was emitted.
 
 ## To-Do
 
@@ -133,14 +139,14 @@ Each feature links to its branch — the branch README has the full "what/how/wh
   learner state. Helpers use bounded, hash-verified scratch spools and never
   receive publication or Params authority; only the parent compares and
   publishes. Integrated b7/b8/b9/ca replay was byte-identical and 20.3% faster
-  than two workers on the desktop. This remains in progress pending the comma
-  device memory, storage, thermal, and responsiveness check.
+  than two workers on the desktop, and four-worker processing has completed on
+  the comma without changing deterministic artifacts.
 
-  Evidence v3 keeps signed rack reconstruction and causal prior-`carOutput`
-  alignment, but replaces the unidentifiable rack-dynamics fit with observable
-  gain, signed offset, moving friction, and breakaway populations. Existing v1
-  and v2 artifacts remain byte-for-byte untouched while retained compatible
-  full rlogs replay into an initially empty v3 namespace.
+  Evidence v6 in namespace v4 adds vehicle-global, angle-assisted physical
+  breakaway episodes, whole-route held-out validation, and a nested
+  no-regression model family. Existing v1/v2/v3 artifacts remain byte-for-byte
+  untouched while retained compatible full rlogs replay into an empty v4
+  namespace.
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

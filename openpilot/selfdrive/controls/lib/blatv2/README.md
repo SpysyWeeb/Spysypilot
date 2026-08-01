@@ -8,17 +8,28 @@ and atomically publishes one authenticated evidence generation.
 
 The current generation learns an observable inverse-torque calibration, not
 the retired dynamic rack model. At each `0/5/10/15/20/30 m/s` node it keeps
-stationary/base, resolved-moving, first-motion-after-dwell breakaway, held-out
+stationary/base, resolved-moving, confirmed stuck-to-motion breakaway, held-out
 validation, and actuator-authority populations separate. The only fitted
 values are torque per lateral acceleration, signed lateral-acceleration offset
 correction, moving friction, and static breakaway. Rack gain and damping are
 neither fitted nor part of the calibration identity.
 
-The numerical fit is deterministic constrained least squares. It
-reparameterizes static breakaway as moving friction plus non-negative excess
-and re-solves every active constraint face. A `static == kinetic` result is an
-explicit statement that ordinary driving did not identify additional
-breakaway; it is not a clipped or feel-tuned number.
+Breakaway is a vehicle-global physical episode, not one zero-rate frame. Raw
+measured steering-angle displacement at half a declared rate quantum marks
+the earliest possible motion, then a same-direction rate quantum must confirm
+it within the existing transport delay. The midpoint of the last stuck and
+first moving responses identifies static friction once per episode.
+
+The numerical fit is deterministic constrained least squares. Training
+routes evaluate a nested `static only -> friction -> offset + friction -> full
+map` family. Every populated training category must beat or match the seed and
+at least one must improve; a richer candidate replaces a simpler one only by
+Pareto dominance. The seed is comparison authority, never a selectable
+candidate. The winner is frozen before validation and receives exactly one
+held-route check—there is no fallback selection after seeing validation.
+The immutable route counter assigns an entire route to training or validation
+before any prepared frame is applied. Base, moving, breakaway, and authority
+parts of one maneuver can therefore never leak across the boundary.
 
 This means the UI can report `finalizing`, `backfilling`, and exact pass,
 route, and segment progress instead of continuing to say that a first drive
@@ -118,11 +129,13 @@ For rack response at time `t`, the input is the newest exact zero-order-held
 command effective at or before `t - transport_delay(speed)`. No future,
 interpolated, or same-frame command can enter the fit. Speed, mapping,
 lateral acceleration, rack rate, and node weights remain at response time.
-Rack acceleration is not an input to the observable fit. Full-magnitude rows enter the separate authority equality fit
-after one aligned response interval of settled command-side dwell and only
-when the rack is measurably moving. They remain deferred until at least four
-held-out authority rows exist, then free and authority validation must each
-beat or match the seed independently. Driver-limited, lateral-inactive,
+Rack acceleration is not an input to the observable fit. Full-magnitude rows
+enter the separate authority equality fit after one aligned response interval
+of settled command-side dwell and only when the rack is measurably moving.
+Every populated authority stratum can veto a regressing model. Authority rows
+alter the fit only after four training observations; that fitted use then
+requires four independent held-out observations before qualification.
+Driver-limited, lateral-inactive,
 standstill, invalid/gapped, and physically unreachable transitions are
 excluded.
 
@@ -135,8 +148,8 @@ evidence because rack acceleration is not fitted; it clears prior dwell so it
 cannot fabricate a breakaway. Lifecycle and mapping discontinuities clear
 cross-frame direction.
 
-Calibration profile schema v2, evidence schema v5, coordinator artifact schema
-v4, learning-status schema v2, and canonical join schema v2 establish these
+Calibration profile schema v2, evidence schema v6, coordinator artifact schema
+v5, learning-status schema v2, and canonical join schema v2 establish these
 semantics. Older evidence is never reinterpreted or mixed silently.
 
 A candidate is emitted only when all six speed nodes qualify. It remains an
@@ -153,8 +166,8 @@ its predecessor. Until that reader-lifetime contract exists, retaining all
 generations is the safe behavior.
 
 Durable storage is also versioned by evidence-inclusion policy:
-`<storage root>/<calibration runtime identity>/complete_full_rlog_authority_v3`.
-The predecessor v1/v2 namespaces and any earlier unnamespaced runtime
+`<storage root>/<calibration runtime identity>/complete_full_rlog_authority_v4`.
+The predecessor v1/v2/v3 namespaces and any earlier unnamespaced runtime
 directory remain byte-untouched and are never restored or mixed into this
-policy. Version 3 always starts with an empty ledger and independently replays
+policy. Version 4 always starts with an empty ledger and independently replays
 every still-local eligible full rlog.

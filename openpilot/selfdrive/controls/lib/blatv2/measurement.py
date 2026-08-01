@@ -183,4 +183,7 @@ class LearningMeasurementBuilder:
       actuator_constrained=bool(actuator_constrained),
       standstill=bool(standstill),
       rack_direction_reversal=motion.direction_reversal,
+      measured_rack_angle_deg=(
+        angle if math.isfinite(angle) else 0.0
+      ),
     )

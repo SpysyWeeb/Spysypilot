@@ -2042,7 +2042,7 @@ def replay_routes(
       before_accepted = runtime.coordinator.accepted_sample_count
       if route_applying is not None:
         route_applying(route)
-      runtime.transition_onroad()
+      runtime.transition_onroad(route.route_counter)
       frames = (
         prepared.frames
         if isinstance(prepared, PreparedRoute)

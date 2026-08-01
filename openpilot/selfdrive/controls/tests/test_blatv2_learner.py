@@ -175,6 +175,7 @@ class TestBLaTv2Learner(unittest.TestCase):
       "actuator_constrained",
       "standstill",
       "rack_direction_reversal",
+      "measured_rack_angle_deg",
     ))
     self.assertFalse(any("desired" in name for name in names))
     self.assertFalse(any("candidate" in name for name in names))
