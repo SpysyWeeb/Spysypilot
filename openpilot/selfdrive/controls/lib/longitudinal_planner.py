@@ -35,6 +35,13 @@ A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
 J_CRUISE_VALS = [2.0, 1.6, 1.0, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
 A_CRUISE_MIN = -1.2
+# Ordinary set-speed corrections use proportional authority at road speed.
+# This keeps a 5 mph correction near 0.4 m/s^2 while retaining the existing
+# acceleration envelope for larger errors and low-speed launches.
+CRUISE_COMFORT_ACCEL_KP = 0.18
+CRUISE_COMFORT_SPEED_BP = [8.0, 15.0]
+CRUISE_COMFORT_BLEND_V = [0.0, 1.0]
+CRUISE_COMFORT_COAST_FULL_ERROR = 5.0 * CV.MPH_TO_MS
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
@@ -52,7 +59,29 @@ def get_max_accel(v_ego):
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
-def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle):
+
+def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, lead_present, speed_limiter_active=False):
+  """Limit comfort shaping to healthy, lead-free Chill cruise."""
+  return not (experimental_mode or force_decel or not radar_valid or lead_present or speed_limiter_active)
+
+
+def get_cruise_comfort_accel(v_cruise, v_ego, accel_coast):
+  """Return the proportional acceleration target for an ordinary cruise correction."""
+  speed_error = v_cruise - v_ego
+  target_accel = CRUISE_COMFORT_ACCEL_KP * speed_error
+
+  if speed_error < 0.0 and np.isfinite(accel_coast):
+    # Blend toward a full throttle lift as the requested reduction reaches
+    # 5 mph. On an uphill this permits natural coast-down without adding gas;
+    # on a downhill the proportional target still requests gentle braking.
+    coast_weight = np.interp(-speed_error, [0.0, CRUISE_COMFORT_COAST_FULL_ERROR], [0.0, 1.0])
+    target_accel = min(target_accel, accel_coast * coast_weight)
+
+  return float(target_accel)
+
+
+def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle,
+                     comfort_enabled=False):
   max_accel = BLOTV2_ACCEL_MAX if e2e else get_max_accel(v_ego)
 
   if not e2e:
@@ -65,7 +94,14 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, 
       coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [max_accel, clipped_accel_coast])
       max_accel = min(max_accel, coast_limit)
 
-  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel)
+  legacy_target_accel = float(np.clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel))
+  target_accel = legacy_target_accel
+  if comfort_enabled:
+    comfort_target_accel = float(np.clip(get_cruise_comfort_accel(v_cruise, v_ego, accel_coast),
+                                         A_CRUISE_MIN, max_accel))
+    comfort_weight = float(np.interp(v_ego, CRUISE_COMFORT_SPEED_BP, CRUISE_COMFORT_BLEND_V))
+    target_accel = float(np.interp(comfort_weight, [0.0, 1.0], [legacy_target_accel, comfort_target_accel]))
+
   if not e2e:
     j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
     target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
@@ -103,7 +139,8 @@ class LongitudinalPlanner:
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
-    if sm['controlsState'].forceDecel:
+    force_decel = sm['controlsState'].forceDecel
+    if force_decel:
       v_cruise = 0.0
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
@@ -136,6 +173,7 @@ class LongitudinalPlanner:
     personality = sm['selfdriveState'].personality
     radar_valid = sm.all_checks(['radarState'])
     lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
+    radar_has_lead = radar_valid and (sm['radarState'].leadOne.present or sm['radarState'].leadTwo.present)
     model_leads = sm['modelV2'].leadsV3
     model_lead_0 = model_leads[0] if len(model_leads) > 0 else None
     policy = self.blotv2.update(
@@ -188,14 +226,21 @@ class LongitudinalPlanner:
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
-    self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
+    experimental_mode = sm['selfdriveState'].experimentalMode
+    comfort_enabled = ordinary_cruise_comfort_enabled(
+      experimental_mode,
+      force_decel,
+      radar_valid,
+      radar_has_lead,
+    )
+    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle)
+                                     accel_coast, self.allow_throttle, comfort_enabled=comfort_enabled)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
-    if sm['selfdriveState'].experimentalMode:
+    if experimental_mode:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])

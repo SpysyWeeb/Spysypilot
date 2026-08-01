@@ -3,6 +3,7 @@ import unittest
 
 import numpy as np
 from opendbc.car.interfaces import ACCEL_MAX
+from openpilot.common.constants import CV
 from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX
 
 from openpilot.selfdrive.controls.lib import longitudinal_planner
@@ -11,7 +12,12 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   T_IDXS,
   LongitudinalMpc,
 )
-from openpilot.selfdrive.controls.lib.longitudinal_planner import get_max_accel
+from openpilot.selfdrive.controls.lib.longitudinal_planner import (
+  get_cruise_accel,
+  get_cruise_comfort_accel,
+  get_max_accel,
+  ordinary_cruise_comfort_enabled,
+)
 
 
 def radar_lead(**overrides):
@@ -147,6 +153,117 @@ class TestStrongCruiseEnvelope(unittest.TestCase):
     np.testing.assert_allclose(
       longitudinal_planner.J_CRUISE_VALS,
       [2.0, 1.6, 1.0, 0.6],
+    )
+
+
+class TestOrdinaryCruiseComfort(unittest.TestCase):
+  CP = SimpleNamespace(steerRatio=15.0, wheelbase=2.7)
+  DT = 0.05
+
+  def settled_target(self, v_cruise, v_ego, accel_coast=-0.3, comfort_enabled=True, e2e=False):
+    target = 0.0
+    for _ in range(200):
+      target = get_cruise_accel(
+        e2e,
+        v_cruise,
+        v_ego,
+        target,
+        0.0,
+        self.CP,
+        self.DT,
+        accel_coast,
+        True,
+        comfort_enabled=comfort_enabled,
+      )
+    return target
+
+  def test_route_d9_five_mph_increase_uses_proportional_target(self):
+    v_ego = 74.5 * CV.MPH_TO_MS
+    v_cruise = 79.5 * CV.MPH_TO_MS
+    expected = longitudinal_planner.CRUISE_COMFORT_ACCEL_KP * (v_cruise - v_ego)
+
+    self.assertAlmostEqual(self.settled_target(v_cruise, v_ego, accel_coast=-0.25), expected)
+    self.assertAlmostEqual(expected, 0.402336, places=6)
+    self.assertLess(expected, get_max_accel(v_ego))
+
+  def test_route_d9_five_mph_reduction_coasts_instead_of_saturating_brakes(self):
+    v_ego = 79.6 * CV.MPH_TO_MS
+    v_cruise = 74.6 * CV.MPH_TO_MS
+    target = self.settled_target(v_cruise, v_ego, accel_coast=-0.39)
+
+    self.assertAlmostEqual(target, -0.402336, places=6)
+    self.assertGreater(target, longitudinal_planner.A_CRUISE_MIN)
+
+  def test_reduction_uses_natural_uphill_coast_and_not_downhill_acceleration(self):
+    v_ego = 80.0 * CV.MPH_TO_MS
+    v_cruise = 75.0 * CV.MPH_TO_MS
+
+    self.assertAlmostEqual(get_cruise_comfort_accel(v_cruise, v_ego, -0.6), -0.6)
+    self.assertAlmostEqual(get_cruise_comfort_accel(v_cruise, v_ego, 0.2), -0.402336, places=6)
+
+  def test_small_corrections_taper_continuously(self):
+    v_ego = 75.0 * CV.MPH_TO_MS
+    target_2_5_mph = get_cruise_comfort_accel(v_ego + 2.5 * CV.MPH_TO_MS, v_ego, -0.3)
+    target_5_mph = get_cruise_comfort_accel(v_ego + 5.0 * CV.MPH_TO_MS, v_ego, -0.3)
+
+    self.assertAlmostEqual(target_2_5_mph, target_5_mph / 2.0)
+
+  def test_large_errors_retain_existing_acceleration_and_braking_limits(self):
+    v_ego = 75.0 * CV.MPH_TO_MS
+
+    self.assertAlmostEqual(
+      self.settled_target(v_ego + 15.0 * CV.MPH_TO_MS, v_ego),
+      get_max_accel(v_ego),
+    )
+    self.assertAlmostEqual(
+      self.settled_target(v_ego - 15.0 * CV.MPH_TO_MS, v_ego),
+      longitudinal_planner.A_CRUISE_MIN,
+    )
+
+  def test_low_speed_launch_retains_legacy_authority(self):
+    v_ego = 5.0
+    v_cruise = v_ego + 5.0 * CV.MPH_TO_MS
+
+    comfort = self.settled_target(v_cruise, v_ego, comfort_enabled=True)
+    legacy = self.settled_target(v_cruise, v_ego, comfort_enabled=False)
+    self.assertAlmostEqual(comfort, legacy)
+
+  def test_existing_jerk_schedule_still_bounds_response(self):
+    v_ego = 75.0 * CV.MPH_TO_MS
+    jerk = np.interp(v_ego, longitudinal_planner.J_CRUISE_BP, longitudinal_planner.J_CRUISE_VALS)
+    first_target = get_cruise_accel(
+      False,
+      v_ego + 5.0 * CV.MPH_TO_MS,
+      v_ego,
+      0.0,
+      0.0,
+      self.CP,
+      self.DT,
+      -0.3,
+      True,
+      comfort_enabled=True,
+    )
+
+    self.assertAlmostEqual(first_target, jerk * self.DT)
+
+  def test_comfort_eligibility_preserves_other_longitudinal_strategies(self):
+    self.assertTrue(ordinary_cruise_comfort_enabled(False, False, True, False))
+    self.assertFalse(ordinary_cruise_comfort_enabled(True, False, True, False))
+    self.assertFalse(ordinary_cruise_comfort_enabled(False, True, True, False))
+    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, False, False))
+    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, True, True))
+    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, True, False, speed_limiter_active=True))
+
+  def test_disabled_comfort_matches_legacy_targets(self):
+    v_ego = 80.0 * CV.MPH_TO_MS
+
+    self.assertAlmostEqual(
+      self.settled_target(v_ego + 5.0 * CV.MPH_TO_MS, v_ego, comfort_enabled=False),
+      get_max_accel(v_ego),
+    )
+    self.assertAlmostEqual(
+      self.settled_target(v_ego - 5.0 * CV.MPH_TO_MS, v_ego, comfort_enabled=False),
+      longitudinal_planner.A_CRUISE_MIN,
     )
 
 
