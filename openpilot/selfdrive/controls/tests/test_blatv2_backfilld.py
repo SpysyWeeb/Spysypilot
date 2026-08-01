@@ -178,6 +178,53 @@ def test_missing_remote_config_falls_back_to_local_without_current(
   assert not (storage / "CURRENT").exists()
 
 
+def test_remote_preparation_passes_protected_worker_host_to_discovery(
+  tmp_path: Path,
+) -> None:
+  daemon = BlatV2BackfillDaemon(
+    params=FakeParams(),
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+  )
+  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
+  engine = SimpleNamespace(
+    expected_dongle_id="f" * 16,
+    runtime_factory=MagicMock(return_value=runtime),
+  )
+  session = object()
+  discovery = MagicMock(return_value=object())
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value="192.168.1.241",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
+      discovery,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.OffdeviceBridgeClient",
+      return_value=object(),
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.prepare_remote_session",
+      return_value=session,
+    ),
+  ):
+    assert daemon._prepare_remote(engine, object()) is session
+
+  assert discovery.call_args.kwargs["configured_host"] == "192.168.1.241"
+
+
 @pytest.mark.parametrize(
   "code",
   [
@@ -214,6 +261,10 @@ def test_authenticated_worker_availability_error_falls_back_local(
     patch(
       "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
       return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value=None,
     ),
     patch(
       "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
@@ -281,6 +332,10 @@ def test_authenticated_remote_contract_failure_maps_without_current(
     patch(
       "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
       return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value=None,
     ),
     patch(
       "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",

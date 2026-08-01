@@ -338,6 +338,13 @@ size-bounded and content addressed. The PC produces one private spool for
 each independent preparation authority; an authority never consumes the
 other authority's prepared bytes.
 
+The transport normally discovers the worker with a signed UDP broadcast. A
+protected optional `worker_host.txt` beside the device secret supplies one
+private IPv4 unicast target on mixed networks that suppress broadcasts. A
+configured target is authoritative (responses from any other source fail
+closed), but it changes no authentication or compatibility rule; lack of a
+response remains a clean fallback to local preparation.
+
 The native extractor follows the same content-authority rule as the rlogs.
 Preparation hashes an `O_NOFOLLOW`-opened executable descriptor, invokes that
 exact descriptor via `/proc/self/fd`, and verifies the held inode and pathname
