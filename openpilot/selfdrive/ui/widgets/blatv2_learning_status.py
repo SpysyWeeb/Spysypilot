@@ -3752,6 +3752,7 @@ def operation_presentation(
   offdevice_progress: OffdeviceProgressStatus | None = None,
 ) -> OperationPresentation:
   """Return truthful copy without treating absence as an empty history."""
+  applying_remote_preparation = False
   if (
     offdevice_progress is not None
     and offdevice_progress.phase == "remote_ready"
@@ -3759,9 +3760,11 @@ def operation_presentation(
     and backfill_progress.updated_mono_ns
     > offdevice_progress.updated_mono_ns
   ):
-    # Once the device begins consuming the certified artifacts, its newer
-    # replay/application projection owns the display. REMOTE_READY describes
-    # the handoff boundary, not the rest of finalization.
+    # REMOTE_READY is the handoff boundary. The newer replay/application
+    # projection owns coordinates from here, while this flag preserves the
+    # important fact that the device is consuming PC-prepared artifacts. It
+    # must never look like the heavyweight local route-preparation fallback.
+    applying_remote_preparation = True
     offdevice_progress = None
   if offdevice_progress is not None:
     return _offdevice_presentation(
@@ -3799,20 +3802,35 @@ def operation_presentation(
   if backfill_progress is not None:
     progress = backfill_progress
     if progress.phase in ("reading_segment", "applying_route"):
-      title = (
-        "PROCESSING PRIOR ROUTES"
-        if progress.pass_index == 1
-        else "VERIFYING PRIOR ROUTES"
-      )
+      if applying_remote_preparation:
+        title = (
+          "APPLYING PC-PREPARED DATA"
+          if progress.pass_index == 1
+          else "VERIFYING LEARNING RESULT"
+        )
+      else:
+        title = (
+          "PROCESSING PRIOR ROUTES"
+          if progress.pass_index == 1
+          else "VERIFYING PRIOR ROUTES"
+        )
       detail = " | ".join((
         f"Pass {progress.pass_index}/{progress.pass_count}",
         f"Route {progress.current_route_index}/{progress.total_route_count}",
         f"Segment {progress.current_segment_index}/{progress.current_route_segment_count}",
       ))
       phase_detail = (
-        "Reading and validating this route segment"
+        (
+          "Reading the authenticated PC-prepared route evidence"
+          if applying_remote_preparation
+          else "Reading and validating this route segment"
+        )
         if progress.phase == "reading_segment"
-        else "Applying validated route evidence"
+        else (
+          "Applying authenticated PC-prepared route evidence"
+          if applying_remote_preparation
+          else "Applying validated route evidence"
+        )
       )
       if has_learning_snapshot:
         phase_detail += " | Prior snapshot shown"
@@ -3836,8 +3854,16 @@ def operation_presentation(
       )
     if progress.phase == "comparing":
       return OperationPresentation(
-        title="COMPARING REPLAY PASSES",
-        detail="Checking that both independent replay passes match exactly",
+        title=(
+          "VERIFYING LEARNING RESULT"
+          if applying_remote_preparation
+          else "COMPARING REPLAY PASSES"
+        ),
+        detail=(
+          "Checking that both independent applications of the PC data match exactly"
+          if applying_remote_preparation
+          else "Checking that both independent replay passes match exactly"
+        ),
         tone="blue",
         show_banner=has_learning_snapshot,
       )

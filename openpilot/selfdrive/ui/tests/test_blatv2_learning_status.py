@@ -2011,7 +2011,7 @@ class TestOffdeviceProgressPresentation(unittest.TestCase):
       "Pass 1/2 | Route 2/8 | Segment 4/26",
     )
 
-  def test_device_replay_takes_display_after_remote_ready_handoff(self) -> None:
+  def test_pc_prepared_application_is_not_mislabeled_as_local_replay(self) -> None:
     operation = self.operation()
     local_payload = backfill_progress_fixture(pass_index=1)
     local_payload["updated_mono_ns"] = NOW_MONO_NS - 1
@@ -2021,11 +2021,47 @@ class TestOffdeviceProgressPresentation(unittest.TestCase):
       now_mono_ns=NOW_MONO_NS,
     )
     presentation = self.presentation("remote_ready", local=local)
-    self.assertEqual(presentation.title, "PROCESSING PRIOR ROUTES")
+    self.assertEqual(presentation.title, "APPLYING PC-PREPARED DATA")
     self.assertEqual(
       presentation.detail,
       "Pass 1/2 | Route 2/5 | Segment 4/26",
     )
+    self.assertIn("PC-prepared route evidence", presentation.phase_detail)
+
+  def test_pc_prepared_second_pass_and_comparison_remain_explicit(self) -> None:
+    for phase, title in (
+      ("reading_segment", "VERIFYING LEARNING RESULT"),
+      ("comparing", "VERIFYING LEARNING RESULT"),
+    ):
+      with self.subTest(phase=phase):
+        operation = parse_learning_operation_status(
+          operation_fixture(
+            "finalizing",
+            diagnostic="verifying_backfill",
+          ),
+          expected_vehicle_identity=VEHICLE,
+          expected_runtime_identity_sha256=RUNTIME_HASH,
+          now_mono_ns=NOW_MONO_NS,
+        )
+        local_payload = backfill_progress_fixture(phase, pass_index=2)
+        local_payload["updated_mono_ns"] = NOW_MONO_NS - 1
+        local = parse_backfill_progress_status(
+          local_payload,
+          operation_status=operation,
+          now_mono_ns=NOW_MONO_NS,
+        )
+        presentation = operation_presentation(
+          operation,
+          error_code=None,
+          error_message=None,
+          has_learning_snapshot=True,
+          backfill_progress=local,
+          offdevice_progress=parse_offdevice_progress_status(
+            offdevice_progress_fixture("remote_ready"),
+            now_mono_ns=NOW_MONO_NS,
+          ),
+        )
+        self.assertEqual(presentation.title, title)
 
 
 def _load_learning_widget_module():
