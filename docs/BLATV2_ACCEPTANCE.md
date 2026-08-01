@@ -86,6 +86,68 @@ late-skipped route to its content and disposition so a route is never counted
 twice. Publication writes a complete immutable generation before atomically
 switching its `CURRENT` pointer.
 
+An off-device worker may accelerate only route preparation. Before it is
+field eligible, acceptance must additionally prove:
+
+1. authenticated discovery, requests, progress, uploads, and downloads reject
+   invalid HMACs, stale timestamps, replayed nonces, unknown keys, oversized
+   bodies, path traversal, hash mismatches, and incompatible build/runtime
+   identities;
+2. a PC job reconstructs each route independently for both preparation
+   authorities, while the device alone applies frames, compares A/A results,
+   mutates the ledger, finalizes, and publishes;
+3. local and remote preparation feed the identical device learner and yield
+   byte-identical replay results, evidence, manifest, candidate, and ledger
+   for the same frozen manifest; each mode is independently A/A exact;
+4. disconnect, cancellation, service restart, PC-only-route rejection, and
+   device onroad transition leave the previous `CURRENT` generation intact
+   and do not leak scratch artifacts;
+5. remote progress is monotonic after device-side restamping but remains
+   display-only; and
+6. with the worker absent, the original local importer remains fully
+   functional without a toggle or recovery action.
+
+Extractor identity is an execution property, not a pathname observation.
+Both architectures must open the executable with `O_NOFOLLOW`, hash the held
+file descriptor, execute that descriptor through `/proc/self/fd` with explicit
+descriptor inheritance, and verify its inode, pathname, mode, and hash after
+preparation. One extractor SHA is pinned for the entire learner transaction;
+a pathname swap or a binary change between routes is a stable reader failure.
+
+For each unseen accepted preparation-compatibility domain, the device first
+prepares one locally retained test-vector route with the ARM extractor and
+requires whole-spool SHA, size, frame count, and bytes to equal the PC
+authority spool. The atomic HMAC-bound certificate is keyed by source,
+opendbc, panda, runtime, historical/effective descriptor registries, both
+extractors, the worker process instance, canonical join/extractor schemas, log
+schema, CarParams, and physical compatibility. A worker restart therefore
+forces recertification. A rejected route is consumable only after the same
+local ARM preparation rejects it with the identical stable reason and message;
+PC-only routes in an uncertified accepted or rejected domain fall back local.
+
+Protocol v1 has a single-job 128-route bound and no batching. Exceeding it is
+remote-unavailable and preserves the complete local transaction. Device
+inventory itself is not truncated at that bound: authenticated, exclusive-
+cursor pages enumerate the complete append-only PC archive. Every complete,
+quiescent local route missing there is resumably archived, with routes needed
+by the active job first. Completed segments remain private staging until an
+authenticated exact ordered route manifest is re-hashed and atomically commits
+the whole route; a partial prefix never enters inventory. This transfer cannot
+select evidence or publish.
+Device onroad handoff performs no network traffic; the server expires an abandoned
+job after 30 seconds without authenticated status polling. Late-only ledger
+updates preserve the prior authenticated generation's actual extractor
+identity.
+
+Cross-architecture equality is certified at the device-produced artifacts,
+not by allowing an x86 worker to authorize its own final profile. The worker
+has no Params, ledger, publication, controller-selection, or actuation API.
+The final generation identity deliberately differs between local and remote
+preparation because its provenance names the architecture-specific extractor
+binary that actually decoded the rlogs. Treating those two binaries as the
+same artifact would make provenance dishonest; semantic artifact equality is
+the portability gate.
+
 The current observable-calibration contract is profile schema 2, evidence
 schema 6, coordinator artifact schema 5, and namespace
 `complete_full_rlog_authority_v4`. It starts from empty evidence. Retired v1,

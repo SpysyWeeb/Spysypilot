@@ -321,6 +321,71 @@ Turn-in, release, overshoot, roughness, burst, driver feedback, and event
 bookmarks supervise a proposed profile. They are not directly learned torque
 gains.
 
+#### Off-device preparation boundary
+
+The optional LAN worker replaces only the immutable, computationally costly
+full-rlog decode and canonical-join stage. It does not replace the learner.
+The device remains the sole owner of route selection, causal learner state,
+the two-authority equality decision, durable ledger extension, finalization,
+and atomic generation publication.
+
+Every protocol message uses a versioned canonical-JSON envelope authenticated
+with a dedicated 256-bit pre-shared secret. Requests are timestamp bounded and
+nonce replay protected across worker restarts. Job creation binds the exact
+superproject, opendbc, panda, descriptor-registry, runtime, vehicle, dongle,
+and CarParams identities. Uploaded route segments and returned spools are
+size-bounded and content addressed. The PC produces one private spool for
+each independent preparation authority; an authority never consumes the
+other authority's prepared bytes.
+
+The native extractor follows the same content-authority rule as the rlogs.
+Preparation hashes an `O_NOFOLLOW`-opened executable descriptor, invokes that
+exact descriptor via `/proc/self/fd`, and verifies the held inode and pathname
+afterward. The learner pins one extractor SHA across its complete transaction,
+so neither a launch-time pathname swap nor a binary change between routes can
+produce mixed evidence or dishonest publication provenance.
+
+Cross-architecture trust is established before prepared frames are consumed.
+For every unseen accepted compatibility domain, one locally retained route is
+prepared with the device ARM extractor and its entire deterministic spool must
+match the x86 spool byte-for-byte. The device stores a private, atomic,
+HMAC-bound certificate tied to the two extractor binaries, worker process
+instance, build/runtime/registry identities, decode schemas, CarParams, and
+physical compatibility; immutable route hashes and selected-stream identity
+remain the recorded test vector. Rejections get a route-specific certificate
+only when ARM independently produces the same stable reason and message.
+Archive-only unseen domains fall back local because protocol v1 has no rlog
+download path.
+
+The device projects remote progress onto its own monotonic clock and existing
+display-only status. PC progress is never evidence. Loss of discovery or a
+transient connection cancels the remote attempt and selects the unchanged
+local preparation backend. Authentication, compatibility, content, or spool
+validation failures are not downgraded to success. An onroad transition or
+manager stop cancels either backend before publication.
+
+One protocol-v1 job is limited to 128 selected routes; no batching is allowed
+inside one atomic learner transaction, so a larger set uses the complete local
+backend. The archive inventory uses authenticated, strictly monotonic
+exclusive-cursor pages of at most 128 routes, so the job bound never truncates
+the durable archive. The device resumably uploads every complete quiescent
+local route missing from that archive, prioritizing active-job routes; archive
+sync is transport only and has no selection, ledger, or publication authority.
+Each uploaded segment remains in private worker staging. An explicit commit
+binds and re-hashes the exact ordered segment manifest before atomically making
+the complete route inventory-visible, so an interrupted prefix is always
+resumable and never masquerades as a short complete route.
+The device never sends cleanup traffic after an onroad transition.
+The PC instead leases running work to authenticated status polling and expires
+an abandoned job after 30 seconds. Ledger-only late-route publication names
+the prior generation's actual extractor rather than either unused current
+binary.
+
+The worker's archive and implementation live outside the openpilot checkout
+at `/home/alex/Documents/blatv2-remote-worker`, with full rlogs under
+`data/routes/`. This keeps recordings out of temporary storage and prevents
+source updates from pruning the archive.
+
 ### Display-only learning and lifecycle status
 
 The current field UI reads three rebuildable JSON caches:

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import base64
+import hashlib
 import os
 import signal
 from pathlib import Path
@@ -25,10 +27,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   MAXIMUM_EVENT_TRAVERSAL_WORDS,
   BackfillPublication,
   BackfillError,
-  BuildDescriptor,
   BuildDescriptorRegistry,
   HistoricalLearningBackfill,
-  git_blob_sha1,
+  build_current_historical_descriptor,
   has_pending_full_rlog,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
@@ -45,6 +46,24 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
 from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   LEARNING_STATUS_PARAM,
   build_learning_status_payload,
+)
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
+  RemotePreparationSession,
+  prepare_remote_session,
+  remote_error_is_unavailable,
+)
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
+  OffdeviceBridgeClient,
+  default_bridge_config_directory,
+  discover_worker,
+  load_bridge_secret,
+)
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
+  BridgeAbortedError,
+  BridgeCorruptError,
+  BridgeIncompatibleError,
+  BridgeRemoteError,
+  BridgeUnavailableError,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
@@ -227,36 +246,20 @@ class BlatV2BackfillDaemon:
         "backfill_route_incompatible",
         "current build provenance is unavailable",
       )
-    limits = current_runtime.runtime_bundle.torque_limits
-    rack_resolutions = {
-      float(node.parameters.rack_rate_resolution_deg_s)
-      for node in current_runtime.runtime_bundle.calibration_seed_profile.nodes
-    }
-    if len(rack_resolutions) != 1:
+    try:
+      current_descriptor = build_current_historical_descriptor(
+        source_commit=root_commit,
+        opendbc_commit=opendbc_commit,
+        panda_commit=panda_commit,
+        log_schema_path=Path(BASEDIR) / "openpilot" / "cereal" / "log.capnp",
+        current_car_params=car_params,
+        current_runtime_bundle=current_runtime.runtime_bundle,
+      )
+    except ValueError as exc:
       raise BackfillError(
         "backfill_route_incompatible",
-        "current runtime has inconsistent rack-rate resolution",
-      )
-    current_descriptor = BuildDescriptor(
-      superproject_commit=root_commit,
-      opendbc_commit=opendbc_commit,
-      panda_commit=panda_commit,
-      log_schema_blob=git_blob_sha1(
-        Path(BASEDIR) / "openpilot" / "cereal" / "log.capnp",
-      ),
-      supported_vehicle_identity=str(car_params.carFingerprint),
-      steer_max=limits.steer_max,
-      steer_delta_up=limits.delta_up,
-      steer_delta_down=limits.delta_down,
-      steer_step=limits.steer_step,
-      driver_allowance=limits.driver_allowance,
-      driver_multiplier=limits.driver_multiplier,
-      driver_factor=limits.driver_factor,
-      production_envelope_verified=(
-        limits.production_envelope_verified
-      ),
-      rack_rate_resolution_deg_s=rack_resolutions.pop(),
-    )
+        str(exc),
+      ) from exc
     registry = BuildDescriptorRegistry.from_json_file(
       self.descriptor_path,
     ).with_descriptor(current_descriptor)
@@ -288,6 +291,121 @@ class BlatV2BackfillDaemon:
       abort_requested=self._abort_requested,
       pending_route_identity=pending_route_identity,
     )
+
+  def _remote_contract(
+    self,
+    engine: HistoricalLearningBackfill,
+    car_params: car.CarParams,
+  ) -> dict[str, object]:
+    """Bind one remote preparation job to this exact device runtime."""
+    root_commit = _decode_text(self.params.get("GitCommit", block=False))
+    opendbc_commit = get_commit(str(Path(BASEDIR) / "opendbc_repo"))
+    panda_commit = get_commit(str(Path(BASEDIR) / "panda"))
+    if (
+      root_commit is None
+      or len(root_commit) != 40
+      or len(opendbc_commit) != 40
+      or len(panda_commit) != 40
+    ):
+      raise BackfillError(
+        "backfill_route_incompatible",
+        "remote preparation provenance is unavailable",
+      )
+    encoded_car_params = bytes(car_params.as_builder().to_bytes())
+    runtime = engine.runtime_factory()
+    return {
+      "car_params_b64": base64.b64encode(encoded_car_params).decode("ascii"),
+      "car_params_sha256": hashlib.sha256(encoded_car_params).hexdigest(),
+      "descriptor_registry_sha256": engine.descriptor_registry.identity_sha256,
+      "historical_descriptor_registry_sha256": (
+        BuildDescriptorRegistry.from_json_file(
+          self.descriptor_path,
+        ).identity_sha256
+      ),
+      "dongle_id": engine.expected_dongle_id,
+      "opendbc_commit": opendbc_commit,
+      "panda_commit": panda_commit,
+      "runtime_identity_sha256": (
+        runtime.runtime_bundle.calibration_identity_sha256
+      ),
+      "source_commit": root_commit,
+      "vehicle_fingerprint": str(car_params.carFingerprint),
+    }
+
+  def _prepare_remote(
+    self,
+    engine: HistoricalLearningBackfill,
+    car_params: car.CarParams,
+  ) -> RemotePreparationSession | None:
+    """Return a PC-prepared session, or None for normal local fallback."""
+    contract = self._remote_contract(engine, car_params)
+    try:
+      secret = load_bridge_secret(
+        default_bridge_config_directory(self.params),
+      )
+      worker = discover_worker(
+        secret=secret,
+        client_id=f"comma-{engine.expected_dongle_id}",
+        expected_source_commit=str(contract["source_commit"]),
+        abort_requested=self._abort_requested,
+      )
+      client = OffdeviceBridgeClient(
+        worker=worker,
+        secret=secret,
+        client_id=f"comma-{engine.expected_dongle_id}",
+        abort_requested=self._abort_requested,
+      )
+      runtime = engine.runtime_factory()
+      return prepare_remote_session(
+        engine=engine,
+        client=client,
+        contract=contract,
+        scratch_parent=runtime.artifact_paths.root,
+        abort_requested=self._abort_requested,
+      )
+    except BridgeUnavailableError as exc:
+      # Absence, a busy worker, or an interrupted connection is not a learner
+      # failure. The device immediately retains its original local backend.
+      cloudlog.info(f"blatv2 remote worker unavailable; using local replay: {exc}")
+      try:
+        self.backfill_progress.clear()
+      except Exception:
+        pass
+      return None
+    except BridgeAbortedError as exc:
+      raise BackfillError(
+        "unexpected_error",
+        "offroad ownership ended during remote preparation",
+      ) from exc
+    except BridgeIncompatibleError as exc:
+      raise BackfillError(
+        "backfill_route_incompatible",
+        f"remote preparation contract is incompatible: {exc}",
+      ) from exc
+    except BridgeCorruptError as exc:
+      raise BackfillError(
+        "backfill_corrupt_log",
+        f"remote preparation data is corrupt: {exc}",
+      ) from exc
+    except BridgeRemoteError as exc:
+      if remote_error_is_unavailable(exc):
+        cloudlog.info(
+          f"blatv2 remote worker busy; using local replay: {exc}",
+        )
+        try:
+          self.backfill_progress.clear()
+        except Exception:
+          pass
+        return None
+      diagnostic = (
+        "backfill_route_incompatible"
+        if exc.code in {"source_mismatch", "contract_mismatch"}
+        else "backfill_reader_unavailable"
+      )
+      raise BackfillError(
+        diagnostic,
+        f"remote preparation worker rejected the job: {exc}",
+      ) from exc
 
   def _publish_failure(
     self,
@@ -373,10 +491,26 @@ class BlatV2BackfillDaemon:
       car_params = self._wait_for_car_params()
       if car_params is None:
         return
-      engine = self._build_engine(car_params)
+      local_engine = self._build_engine(car_params)
       while not self._abort_requested():
-        result = engine.run_once()
-        self._project_learning_status(engine, result.publication)
+        session = self._prepare_remote(local_engine, car_params)
+        remote_engine: HistoricalLearningBackfill | None = None
+        try:
+          if session is not None:
+            remote_engine = session.build_engine()
+          engine = local_engine if remote_engine is None else remote_engine
+          result = engine.run_once()
+          self._project_learning_status(engine, result.publication)
+        finally:
+          if session is not None:
+            try:
+              if remote_engine is not None:
+                session.preserve_transaction_state(remote_engine)
+            finally:
+              # Downloaded spools are private transaction scratch. They must
+              # not survive a constructor, replay, projection, or preserve
+              # failure, and are never inputs to a later daemon operation.
+              session.close()
         if not result.pending_logger_close:
           # Stay healthy under manager's offroad predicate without rescanning.
           # A new drive requires an onroad transition, which aborts this

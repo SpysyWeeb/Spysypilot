@@ -163,10 +163,13 @@ routes are not imported. A rejected route does not block a later compatible
 one.
 
 The reviewed historical registry includes the `3849a2f`, `2447667`, and
-`9338f5b` combo builds recorded by routes d2-d6. Their schema and Palisade
-command/panda envelope are verified as the same 409/4/7 contract used by the
-current learner. Older archived builds that actually used the stock 384/3/7
-envelope remain fail-closed; they are not mislabeled to make their data pass.
+`9338f5b` combo builds recorded by routes d2-d6. It also retains `fdd5560`,
+the clean combo build running immediately before this bridge landed, so any
+of its remaining routes stay reviewable after the update. Their schema and
+Palisade command/panda envelope are verified as the same 409/4/7 contract
+used by the current learner. Older archived builds that actually used the
+stock 384/3/7 envelope remain fail-closed; they are not mislabeled to make
+their data pass.
 
 A candidate profile becomes eligible only when every required speed region
 has enough excitation, independent validation, and bounded uncertainty.
@@ -181,6 +184,60 @@ from source. Runtime identity for this namespace excludes the retired
 provisional rack-gain/damping seed while remaining bound to the detected
 vehicle, torque mapping, rack mapping, sensor resolution, and opendbc command
 envelope.
+
+### Off-device preparation bridge
+
+**In progress.** A paired PC worker may take over the expensive immutable
+route-preparation stage when it is reachable on the local network. The
+standalone worker project lives at
+`/home/alex/Documents/blatv2-remote-worker`; its durable full-rlog archive is
+the `data/routes/` subdirectory. The comma remains authoritative:
+
+- the device freezes the ordered route manifest and explicitly selects any
+  archive-only routes offered by the PC;
+- authenticated inventory is read in strictly ordered 128-route pages, while
+  every complete quiescent local route absent from the PC is resumably copied
+  to private staging (job-required routes first). After every segment matches,
+  the device submits the exact ordered route manifest and the worker atomically
+  publishes the whole route into `data/routes/`; an interrupted prefix is never
+  inventory-visible. Archive synchronization has no learner or publication
+  authority;
+- the PC authenticates every request, verifies exact source/runtime/build
+  identities, and independently decodes/joins each selected route twice with
+  four preparation workers;
+- each ARM or x86 preparation opens its native extractor once with
+  `O_NOFOLLOW`, hashes that held executable inode, and runs that exact inode
+  through `/proc/self/fd`; a transaction pins one extractor hash across every
+  route so pathname swaps or mixed extractor versions fail closed;
+- the device downloads bounded, hash-bound prepared-route spools, applies
+  both authorities through its own exact learner, performs the A/A comparison,
+  extends the ledger, finalizes, and atomically publishes `CURRENT`;
+- before any accepted x86-prepared domain can reach that learner, the device
+  prepares one locally retained route with its ARM extractor and requires the
+  complete spool bytes to match. A private atomic HMAC-bound certificate is
+  scoped to both extractor binaries, the worker process instance, build and
+  runtime identities, and the route's decode/vehicle compatibility domain;
+  rejected routes likewise require the same ARM reason and message;
+- remote progress is restamped by the device into the existing informational
+  status projection, so PC clocks and job identifiers never become evidence;
+  and
+- an unavailable or interrupted worker falls back to the existing local
+  importer without changing the last authenticated generation. Incompatible,
+  unauthenticated, replayed, oversized, or corrupt responses fail closed.
+
+Protocol v1 deliberately does not split one publication across worker jobs.
+More than 128 selected replay routes therefore makes the remote backend
+unavailable and runs the complete local transaction. Onroad handoff performs
+no cleanup network I/O; a PC job left behind by that ownership transition is
+stopped by the worker's 30-second authenticated-status-poll lease and can
+never publish on the device. A late-only ledger generation carries forward
+the extractor identity from the authenticated generation whose evidence it
+retains rather than claiming an unused binary.
+
+This boundary is intentional. ARM and x86 may share deterministic route
+records, but the PC is never allowed to publish a learned profile for the car,
+write device Params, select a controller, or actuate. Local processing remains
+fully functional when the PC is absent.
 
 This milestone stops at an unapproved, informational candidate file. It does
 not promote, activate, or roll back that file, and stock remains selected even
