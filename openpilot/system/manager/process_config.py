@@ -58,6 +58,9 @@ def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
+def blatv2_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return not started and not CP.notCar
+
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
@@ -96,6 +99,12 @@ procs = [
   PythonProcess("calibrationd", "openpilot.selfdrive.locationd.calibrationd", only_onroad),
   PythonProcess("torqued", "openpilot.selfdrive.locationd.torqued", only_onroad),
   PythonProcess("controlsd", "openpilot.selfdrive.controls.controlsd", and_(not_joystick, iscar)),
+  # The current field graph has no managed BLaTv2 process onroad. Shadow,
+  # live-learner, and profile-lifecycle adapters remain available only to
+  # offline replay/harness tests while stock is the sole active controller.
+  # One offroad scan cycle replays complete closed full rlogs, then idles
+  # without repeatedly rescanning until the next road-state transition.
+  PythonProcess("blatv2_backfilld", "openpilot.selfdrive.controls.blatv2_backfilld", blatv2_offroad),
   PythonProcess("joystickd", "openpilot.tools.joystick.joystickd", or_(joystick, notcar)),
   PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),

@@ -10,6 +10,7 @@ from openpilot.selfdrive.ui.body.layouts.onroad import BodyLayout
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 from openpilot.system.ui.lib.application import gui_app
+from openpilot.selfdrive.ui.widgets.blatv2_feedback import BlatV2FeedbackPrompt
 
 
 ONROAD_DELAY = 2.5  # seconds
@@ -52,6 +53,19 @@ class MiciMainLayout(Scroller):
 
     # Set callbacks
     self._setup_callbacks()
+    self._feedback_prompt = BlatV2FeedbackPrompt(
+      self,
+      # Wait for the first deviceState poll; UIState defaults to offroad before
+      # it knows the device state, which must not flash this modal onroad.
+      is_offroad=lambda: (
+        ui_state.sm.frame > 0
+        and ui_state.sm.valid["deviceState"]
+        and not ui_state.sm["deviceState"].started
+      ),
+      params=ui_state.params,
+    )
+    ui_state.add_offroad_transition_callback(self._feedback_prompt.update)
+    gui_app.add_nav_stack_tick(self._feedback_prompt.update)
 
     gui_app.add_nav_stack_tick(self._handle_transitions)
     gui_app.push_widget(self)
