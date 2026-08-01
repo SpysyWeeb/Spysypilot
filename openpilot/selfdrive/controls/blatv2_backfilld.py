@@ -237,6 +237,27 @@ class BlatV2BackfillDaemon:
     while not self._abort_requested():
       car_params = self._read_car_params()
       if car_params is not None:
+        # Manager-start deliberately clears every display projection. Publish
+        # before runtime construction, route discovery, worker inventory, or
+        # uploads can begin so a cold boot never spends that bounded-but-long
+        # preflight interval claiming that learner status is unavailable.
+        # When CarParams arrived after a wait, advance the operation that
+        # already owns ``waiting_for_car_params`` instead of inventing a
+        # second operation for the same boot transaction.
+        try:
+          if self._abort_requested():
+            return None
+          self.operation_status.publish(
+            state=LearningOperationState.PREPARING,
+            diagnostic="restoring_runtime",
+            new_operation=not preparing_started,
+            vehicle_identity=str(car_params.carFingerprint),
+          )
+        except Exception:
+          # Status is informational and must never become a prerequisite for
+          # the authoritative replay. The outer failure path will still own
+          # any real preflight failure.
+          cloudlog.exception("blatv2 backfill preflight status write failed")
         return car_params
       if not preparing_started:
         try:

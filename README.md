@@ -103,6 +103,13 @@ gates, and rollback behavior are documented in
 [`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
 [`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
 
+On cold boot, `blatv2_backfilld` publishes a vehicle-bound **PREPARING
+LEARNER** projection immediately after it decodes CarParams and before runtime
+construction, route discovery, PC inventory, or uploads. Expensive preflight
+work therefore cannot be misreported as **LEARNER STATUS UNAVAILABLE**; the
+display cache still conveys no durable-learning authority until authenticated
+evidence is restored or committed.
+
 ## To-Do
 
 Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
