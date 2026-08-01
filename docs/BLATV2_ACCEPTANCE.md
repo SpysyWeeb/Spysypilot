@@ -132,11 +132,16 @@ a pathname swap or a binary change between routes is a stable reader failure.
 For each unseen accepted preparation-compatibility domain, the device first
 prepares one locally retained test-vector route with the ARM extractor and
 requires whole-artifact SHA, size, frame count, and bytes to equal the PC
-authority route-evidence artifact. The atomic HMAC-bound certificate is keyed by source,
-opendbc, panda, runtime, historical/effective descriptor registries, both
-extractors, the worker process instance, canonical join/extractor schemas, log
-schema, CarParams, and physical compatibility. A worker restart therefore
-forces recertification. A rejected route is consumable only after the same
+authority route-evidence artifact. The atomic HMAC-bound certificate is keyed
+by source, opendbc, panda, runtime, historical/effective descriptor registries,
+both extractors, worker implementation, canonical join/extractor schemas, log
+schema, the complete runtime-vehicle bundle identity, and the validated
+physical-vehicle projection. Full recorded
+CarParams bytes remain content-addressed per route but are not a separate
+cross-architecture numerical domain when that physical projection is equal.
+An otherwise identical worker restart therefore reuses the certificate; its
+instance identity remains authenticated per job but is not a numerical input.
+A rejected route is consumable only after the same
 local ARM preparation rejects it with the identical stable reason and message.
 An identically rejected PC-only route is not consumable and is instead
 excluded before the effective route set reaches either learner authority; it
@@ -184,7 +189,7 @@ The current contract identities are:
 | behavior learning status | 1 |
 | future feedback / lifecycle status | 2 / 2 |
 | future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
-| off-device protocol / certification | 1 / 2 |
+| off-device protocol / certification | 1 / 3 |
 | off-device display progress | 1 |
 
 The v6 physical namespace starts from empty evidence. Retired v1 through v5

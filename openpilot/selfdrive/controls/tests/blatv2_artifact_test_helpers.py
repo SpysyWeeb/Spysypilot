@@ -41,6 +41,9 @@ def route_evidence_for_frames(
   route_name: str,
   frames: tuple[MeasuredLearningFrame, ...],
   provenance: Mapping[str, object],
+  *,
+  car_params_bytes: bytes = b"test-canonical-car-params",
+  runtime_identity: str | None = None,
 ) -> RouteEvidenceArtifact:
   """Build complete but behavior-ineligible v2 evidence for unit fixtures."""
   route_hash = hashlib.sha256(route_name.encode()).hexdigest()
@@ -57,7 +60,11 @@ def route_evidence_for_frames(
     behavior_eligible=False,
     behavior_ineligible_reason="test_fixture_has_no_behavior_plane",
     vehicle_identity="test-vehicle",
-    runtime_identity=hashlib.sha256(b"test-runtime").hexdigest(),
+    runtime_identity=(
+      hashlib.sha256(b"test-runtime").hexdigest()
+      if runtime_identity is None
+      else runtime_identity
+    ),
     schema_versions={"route_evidence": 2},
     preparation_provenance=dict(provenance),
     physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
@@ -101,7 +108,7 @@ def route_evidence_for_frames(
     for index, frame in enumerate(frames)
   )
   return RouteEvidenceArtifact(
-    source, b"test-canonical-car-params",
+    source, car_params_bytes,
     b"".join(_encode_frame(frame) for frame in frames), (), controls,
   )
 
