@@ -19,6 +19,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BuildDescriptorRegistry,
   HistoricalLearningBackfill,
   PreparedRoute,
+  RouteCandidate,
   RouteRejected,
   discover_complete_route_candidates,
   extend_ledger,
@@ -1275,9 +1276,10 @@ class AbortRuntime:
   def __init__(self) -> None:
     self.coordinator = AbortCoordinator()
     self.ingest_calls = 0
+    self.route_counters: list[int] = []
 
-  def transition_onroad(self) -> None:
-    return None
+  def transition_onroad(self, route_counter: int) -> None:
+    self.route_counters.append(route_counter)
 
   def ingest(self, _frame: object) -> None:
     self.ingest_calls += 1
@@ -1545,7 +1547,11 @@ def test_primary_replay_failure_cancels_and_reaps_parallel_worker(
 
 
 def test_replay_aborts_periodically_before_publication() -> None:
-  route = SimpleRoute()
+  route = RouteCandidate(
+    route_name="0000002a--000000002a",
+    route_counter=0x2A,
+    segments=(),
+  )
   runtime = AbortRuntime()
   abort_checks = 0
 
@@ -1568,6 +1574,7 @@ def test_replay_aborts_periodically_before_publication() -> None:
       abort_requested=abort_requested,
     )
   assert runtime.ingest_calls == 256
+  assert runtime.route_counters == [route.route_counter]
 
 
 def test_route_local_rejection_does_not_block_later_good_route(

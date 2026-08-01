@@ -160,7 +160,7 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
         CANONICAL_JOIN_SCHEMA_VERSION,
         FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
       ),
-      (5, 4, 2, "complete_full_rlog_authority_v3"),
+      (6, 5, 2, "complete_full_rlog_authority_v4"),
     )
 
   def test_inclusion_policy_namespace_ignores_legacy_runtime_root(
@@ -181,7 +181,7 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       (legacy_root / "manifest.json").write_bytes(legacy_manifest)
       predecessor_namespaces = []
       predecessor_before = {}
-      for version in (1, 2):
+      for version in (1, 2, 3):
         predecessor_namespace = (
           legacy_root / f"complete_full_rlog_authority_v{version}"
         )
@@ -249,12 +249,12 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       )
       publish(
         paths,
-        make_finalization("v3"),
+        make_finalization("v4"),
         empty_ledger(),
       )
       self.assertTrue(paths.backfill_pointer.is_file())
       for version, predecessor_namespace in zip(
-        (1, 2), predecessor_namespaces, strict=True,
+        (1, 2, 3), predecessor_namespaces, strict=True,
       ):
         predecessor_after = {
           path.relative_to(predecessor_namespace): path.read_bytes()

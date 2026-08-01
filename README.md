@@ -54,21 +54,31 @@ The replacement is split into independently testable owners:
 The current learning milestone replaces the rejected dynamic-rack fit. Normal
 driving did not independently identify rack gain and damping, so those
 provisional values are no longer learned or allowed to influence learning
-identity. Evidence schema 5 instead learns only quantities the logs directly
+identity. Evidence schema 6 instead learns only quantities the logs directly
 support at the `0/5/10/15/20/30 m/s` nodes:
 
 - normalized torque per measured lateral acceleration;
 - a signed residual lateral-acceleration offset correction;
 - moving (kinetic) friction from resolved rack motion; and
-- static breakaway torque from the first resolved motion after a measured
-  stationary dwell.
+- static breakaway torque from a complete stuck-to-moving episode.
 
-The fit is deterministic constrained least squares. Gain, moving friction,
-and the excess of static over moving friction are non-negative by physical
-construction; the signed offset remains free. This is not a post-fit clamp:
-each active constraint is re-solved. If ordinary driving cannot distinguish
-extra breakaway, the reported boundary is `static == kinetic` rather than an
-invented stiction value.
+The fit is deterministic constrained least squares. A vehicle-global episode
+detector uses raw measured steering-angle motion at half one declared
+steering-rate quantum, then requires same-direction measured-rate confirmation
+within the existing transport delay. This observes physical breakout before a
+coarse rate sensor changes. Gain, moving friction, and the excess of static
+over moving friction are non-negative by construction; the signed offset
+remains free. This is not a post-fit clamp: each active constraint is
+re-solved.
+
+Whole routes—not adjacent frames—alternate between training and validation by
+their immutable route counter. The training side evaluates a nested model
+family (`static only`, `friction`, `offset + friction`, then `full map`). The
+seed is a comparator, never a candidate. A model may advance only if it
+improves at least one populated training category without worsening any other;
+the frozen winner is checked once on held-out routes. Dense straight-driving
+samples therefore cannot buy a lower average error by sacrificing rare
+breakaway or full-authority behavior.
 
 Stationary settled response, moving response, breakaway events, held-out
 validation, and actuator-authority observations remain separate populations.
@@ -102,8 +112,8 @@ learning process runs during the drive. After the route is closed,
 evidence only if both replays and all compatibility checks agree. It is the
 sole managed BLaTv2 process and the sole durable learning writer.
 
-**Four-worker backfill expansion is in progress pending its device resource
-check.** The offroad importer still has exactly two independent deterministic
+The offroad importer uses four worker lanes while retaining exactly two
+independent deterministic
 replay authorities: the parent and a verification process. Each authority now
 has one private route-preparation lane that may decode the next route while its
 owner applies the current route, so up to four Python lanes can use the four
@@ -132,9 +142,10 @@ benchmark over b7, b8, b9, and ca took a 33.754 s four-lane median versus a
 42.359 s two-lane median: 20.3% less wall time (1.25x throughput), with exact
 evidence, manifest, ledger, provenance, and generation hashes. Four lanes
 peaked at about 1.21 GiB process-tree PSS and 26.8 MiB scratch, then left no
-children or scratch behind. The comma device has no swap, so elapsed time,
-peak memory/scratch I/O, thermals, responsiveness, and identical published
-hashes remain the field gate; the task stays in progress until that check.
+children or scratch behind. Four-worker processing has since completed on the
+comma without changing deterministic artifacts; two-worker mode remains the
+bounded fallback. The learner itself remains in progress because no candidate
+may activate before every speed node and held-out gate qualifies.
 
 Its separate display-only progress projection reports the current pass,
 route, segment, and whether the route is being read or applied. A cumulative
@@ -157,9 +168,9 @@ Highway mileage cannot overwrite low-speed knowledge because samples update
 only their neighboring speed nodes.
 
 The learner's current evidence namespace is
-`complete_full_rlog_authority_v3`. It starts empty by design. The retired v1
-and v2 namespaces and their artifact bytes are never migrated, edited, or
-interpreted as schema-5 evidence; compatible retained full rlogs are replayed
+`complete_full_rlog_authority_v4`. It starts empty by design. The retired v1,
+v2, and v3 namespaces and their artifact bytes are never migrated, edited, or
+interpreted as schema-6 evidence; compatible retained full rlogs are replayed
 from source. Runtime identity for this namespace excludes the retired
 provisional rack-gain/damping seed while remaining bound to the detected
 vehicle, torque mapping, rack mapping, sensor resolution, and opendbc command
@@ -214,9 +225,11 @@ quantized acceleration impulse. It cannot manufacture a breakaway event from
 stale dwell. Zero motion clears the unsigned-source direction latch; gaps,
 disengagement, driver override, standstill, faults, and mapping failures break
 cross-frame reversal continuity.
-Settled authority rows cannot influence a candidate until their own held-out
-validation block exists; incomplete authority evidence stays durable and
-deferred.
+Every populated authority category is a no-regression surface. At least four
+training authority rows are required before authority data may influence the
+fit itself; if that happens, at least four independent validation rows are
+required before qualification. Sparse authority evidence stays durable and
+can reject a regressing model, but it cannot steer the fit.
 
 The home-screen learning display reads rebuildable
 `BLaTv2LearningOperationStatus` and `BLaTv2LearningStatus` caches. The
@@ -241,16 +254,22 @@ publish that cache.
 
 ### Pre-merge real-route audit
 
-Routes b2 through b7 were replayed twice through the production importer with
-the current vehicle-selected 409/4/7 envelope. Both passes produced identical
-evidence (`8f67d9c41d9669f1a82f7abbe4f841c70434403a7235ad4236d3964fca40b81a`)
-and manifest (`cc8e5387f8c83c6efc57b37e2bbe7d4d2e4651a985d1815d3483ebdd9c29b0d`)
-hashes. The 10 and 15 m/s nodes qualified. The 5 m/s node had enough ordinary
-evidence but correctly failed its independent full-authority validation; 0,
-20, and 30 m/s remained evidence-limited or non-regressing. Every solvable
-node selected the honest `static == kinetic` active-set boundary. Because the
-six-node contract was incomplete, no candidate file was emitted and stock
-selection was unchanged.
+Routes b7, b8, b9, and ca were replayed through the complete native-extractor,
+A/A, ledger, and publication path with both two and four worker lanes. Both
+topologies accepted 207,629 and rejected 222,910 measured frames and produced
+the same generation
+`1ff42b06de6480fc1e744702175167bd725849321e6e99d3e714596e16e56809`,
+evidence `ad59ed7bc85a6d06d164185673110c592df80b44971377fe86b0bb4204993aa9`,
+manifest `3c0f072a6af25d44ae447a19b0011ed27435fb21d523cdd7d607b39f1f384631`,
+and ledger `14fbd9db68bf01c8bbea05983d8aa2f083355f0146343a500c468aeadf90343d`
+hashes. Four workers completed in 35.00 s versus 44.15 s for two.
+
+The 10 and 15 m/s nodes qualified. The 5 m/s training routes selected the
+minimal `static_only` model, but the independently frozen validation routes
+showed overall and breakaway regression, so it was rejected rather than
+retuned against its holdout. The 0, 20, and 30 m/s nodes remained support- or
+episode-limited in this four-route regression set. No six-node candidate was
+emitted, and the exact stock controller remained selected.
 
 ---
 

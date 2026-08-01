@@ -60,7 +60,7 @@ CASUAL_DRIVING_CANDIDATE_PROVENANCE = "measured casual-driving evidence"
 # physical runtime. A policy change must start from an empty ledger and replay
 # retained full rlogs; it must never reinterpret or mix a predecessor's
 # CURRENT generation in place.
-FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v3"
+FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v4"
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
   "STEER_DELTA_UP",
@@ -704,13 +704,13 @@ class PersistentLearningRuntime:
         "candidate",
       )
 
-  def transition_onroad(self) -> None:
+  def transition_onroad(self, route_counter: int = 0) -> None:
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
     self.torque_response_aligner.reset()
     self._last_applied_report_mono_ns = 0
     self._last_reported_applied_torque = 0.0
-    self.coordinator.transition_onroad()
+    self.coordinator.transition_onroad(route_counter)
 
   def transition_offroad_and_persist(
     self,

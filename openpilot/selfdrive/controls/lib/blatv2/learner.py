@@ -137,6 +137,10 @@ class LearningSample:
   # A signed physical reversal is valid coverage evidence, but the
   # quantized sign-crossing acceleration is not a plant-regression row.
   rack_direction_reversal: bool = False
+  # Raw physical steering-angle sensor coordinate.  It is retained solely so
+  # the calibration learner can observe sub-rate-quantum rack motion; desired
+  # angle, model path, and controller request remain absent from this contract.
+  measured_rack_angle_deg: float = 0.0
   actuator_boundary: ActuatorBoundary = field(
     default=ActuatorBoundary.NONE,
     init=False,
@@ -158,6 +162,7 @@ class LearningSample:
       self.measured_lateral_accel_mps2,
       self.rack_rate_deg_s,
       self.rack_acceleration_deg_s2,
+      self.measured_rack_angle_deg,
       self.magnitude_boundary_dwell_s,
     )
     return (

@@ -240,18 +240,23 @@ applied torque =
 
 The learner solves this as deterministic constrained least squares with
 `gain >= 0`, `kinetic >= 0`, and
-`static = kinetic + nonnegative breakaway excess`. It enumerates and re-solves
-the finite active-set faces; it never clamps an unconstrained answer after the
-fact. `static == kinetic` therefore means the route evidence did not resolve
-additional breakaway, not that a separate value was guessed.
+`static = kinetic + nonnegative breakaway excess`. Training routes evaluate a
+nested model family: static only, friction, offset plus friction, then the full
+map. Every populated training category must beat or match the seed and at
+least one must improve; richer models replace simpler models only by Pareto
+dominance. The seed is a comparator, never a candidate. The selected model is
+frozen before one held-route validation pass, with no post-validation fallback.
 
 Stationary/quantized rows set both direction terms to zero and identify the
 effective settled inverse map; they are not presented as a pure decomposition
-of every tire force. A resolved rate at or above the declared sensor quantum
-is motion. The first resolved motion after a continuous stationary dwell of
-at least the seed transport delay is breakaway; later motion is kinetic.
-Lifecycle gaps, driver override, invalid input, disengagement, and standstill
-clear dwell and direction continuity.
+of every tire force. Breakaway is reconstructed once per vehicle-global
+episode. Raw measured steering-angle motion at half one rate quantum marks the
+earliest possible onset after a continuous dwell; a same-direction measured
+rate quantum must confirm it within the existing transport delay. The midpoint
+of last-stuck and first-motion response identifies static friction. Unconfirmed
+or sensor-disagreeing episodes do not enter equality fitting. Lifecycle gaps,
+driver override, invalid input, disengagement, and standstill clear episode and
+direction continuity.
 
 A recorded applied-torque transition on the vehicle-owned magnitude or slew
 envelope is retained as authority evidence: the emitted torque is known
@@ -267,13 +272,16 @@ than `t - profile_transport_delay(speed)`; response physics and speed-node
 weights stay at `t`. Settled full-magnitude motion enters a separate fit
 stratum after one aligned response interval of command-side dwell, and
 candidates must not regress either the ordinary or authority validation
-stratum. Until an authority stratum has at least four held-out rows, it
-remains stored but cannot alter fitted parameters.
+stratum. Every populated authority stratum can veto a regression. Authority
+data enters fitting only at four training rows, and fitted authority use then
+requires four independent validation rows.
 Driver-limited and unreachable transitions remain invalid. Each node tracks
-disjoint base, moving, breakaway, and authority support; chronological
-training/validation; excitation in both directions; validation error;
-confidence; and provenance. The live learner adapter is retained only for
-deterministic offline/harness work and cannot contribute field evidence.
+disjoint base, moving, breakaway, and authority support; whole-route
+training/validation by immutable route-counter parity; excitation in both
+directions; validation error; confidence; and provenance. No maneuver can
+contribute frames to both fit and validation. The live learner adapter is
+retained only for deterministic offline/harness work and cannot contribute
+field evidence.
 
 The learner uses one vehicle-generic signed rack coordinate. Native negative
 rate values prove a signed source. Otherwise the raw rate remains a magnitude
@@ -286,11 +294,11 @@ breakaway. Exact zero clears unsigned-source sign inference. A lifecycle
 break, source gap, driver override, standstill, fault, or failed rack mapping
 clears cross-frame continuity.
 
-Calibration profile schema v2, evidence schema v5, coordinator artifact
-schema v4, learning-status schema v2, canonical join schema v2, and inclusion
-namespace `complete_full_rlog_authority_v3` bind this contract. The retired
-v1 and v2 namespaces remain byte-untouched and are never migrated or restored
-as v3; retained compatible full rlogs are replayed into an initially empty v3
+Calibration profile schema v2, evidence schema v6, coordinator artifact
+schema v5, learning-status schema v2, canonical join schema v2, and inclusion
+namespace `complete_full_rlog_authority_v4` bind this contract. The retired
+v1, v2, and v3 namespaces remain byte-untouched and are never migrated or restored
+as v4; retained compatible full rlogs are replayed into an initially empty v4
 ledger. The separate calibration runtime identity excludes provisional rack
 gain/damping but remains bound to the actual vehicle, measured mapping,
 opendbc torque calibration and limits, delay, and rack-rate resolution.
