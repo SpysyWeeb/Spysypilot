@@ -162,6 +162,12 @@ open routes, unreviewed builds, incompatible routes, and late-discovered older
 routes are not imported. A rejected route does not block a later compatible
 one.
 
+The reviewed historical registry includes the `3849a2f`, `2447667`, and
+`9338f5b` combo builds recorded by routes d2-d6. Their schema and Palisade
+command/panda envelope are verified as the same 409/4/7 contract used by the
+current learner. Older archived builds that actually used the stock 384/3/7
+envelope remain fail-closed; they are not mislabeled to make their data pass.
+
 A candidate profile becomes eligible only when every required speed region
 has enough excitation, independent validation, and bounded uncertainty.
 Highway mileage cannot overwrite low-speed knowledge because samples update
