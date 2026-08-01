@@ -13,6 +13,7 @@ from openpilot.selfdrive.controls.lib.blatv2 import learning_backfill
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BACKFILL_COMMIT_SCHEMA_VERSION,
   CANONICAL_JOIN_SCHEMA_VERSION,
+  NATIVE_EXTRACTOR_SCHEMA_VERSION,
   BACKFILL_LEDGER_SCHEMA_VERSION,
   BACKFILL_POINTER_SCHEMA_VERSION,
   BackfillError,
@@ -38,7 +39,12 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_coordinator import (
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
   LearningArtifactPaths,
+  LearningRestoreError,
+  PersistentLearningRuntime,
   artifact_paths_for_bundle,
+)
+from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
+  LEARNING_STATUS_SCHEMA_VERSION,
 )
 
 
@@ -69,6 +75,31 @@ def make_finalization(tag: str) -> LearningFinalization:
       node_reports=(),
       candidate_profile=None,
     ),
+  )
+
+
+def make_schema8_selected_finalization(
+  tag: str,
+  *,
+  learned_change: bool = False,
+) -> SimpleNamespace:
+  evidence = canonical_json_bytes({"evidence": tag})
+  profile = canonical_json_bytes({"selected_profile": tag})
+  profile_sha256 = hashlib.sha256(profile).hexdigest()
+  manifest = canonical_json_bytes({
+    "manifest": tag,
+    "selected_profile_sha256": profile_sha256,
+  })
+  return SimpleNamespace(
+    manifest_bytes=manifest,
+    manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+    evidence_bytes=evidence,
+    evidence_sha256=hashlib.sha256(evidence).hexdigest(),
+    selected_profile_json=profile,
+    selected_profile_sha256=profile_sha256,
+    candidate_profile_json=(profile if learned_change else None),
+    candidate_profile_sha256=(profile_sha256 if learned_change else None),
+    all_nodes_qualified=True,
   )
 
 
@@ -111,7 +142,7 @@ def replay_result(
       "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
       "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
       "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
-      "extractor_schema_version": 1,
+      "extractor_schema_version": NATIVE_EXTRACTOR_SCHEMA_VERSION,
       "log_schema_blob": "4" * 40,
       "opendbc_commit": "2" * 40,
       "panda_commit": "3" * 40,
@@ -150,6 +181,75 @@ def publish(
 
 
 class TestBLaTv2BackfillGeneration(unittest.TestCase):
+  def test_all_seed_selection_is_committed_without_a_candidate(self) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+      paths = LearningArtifactPaths(Path(temporary))
+      finalization = make_schema8_selected_finalization("all-seed")
+
+      generation_identity, _ = publish(
+        paths,
+        finalization,
+        empty_ledger(),
+      )
+
+      generation = paths.backfill_generations / generation_identity
+      commit = json.loads((generation / "commit.json").read_bytes())
+      selected_identity = finalization.selected_profile_sha256
+      self.assertEqual(commit["selected_profile_sha256"], selected_identity)
+      self.assertIsNone(commit["candidate_profile_sha256"])
+      self.assertEqual(
+        (generation / "selected_profiles" / f"{selected_identity}.json").read_bytes(),
+        finalization.selected_profile_json,
+      )
+      self.assertFalse((generation / "candidates").exists())
+      PersistentLearningRuntime._validate_backfill_generation(
+        artifact_paths=paths.resolved(),
+        runtime_bundle=SimpleNamespace(
+          calibration_identity_sha256=RUNTIME_IDENTITY,
+        ),
+      )
+
+  def test_selected_profile_set_rejects_missing_and_extra_files(self) -> None:
+    for corruption in ("missing", "extra", "symlink"):
+      with self.subTest(corruption=corruption):
+        with tempfile.TemporaryDirectory() as temporary:
+          paths = LearningArtifactPaths(Path(temporary))
+          finalization = make_schema8_selected_finalization("selected-set")
+          generation_identity, _ = publish(
+            paths,
+            finalization,
+            empty_ledger(),
+          )
+          selected_directory = (
+            paths.backfill_generations
+            / generation_identity
+            / "selected_profiles"
+          )
+          if corruption == "missing":
+            (
+              selected_directory
+              / f"{finalization.selected_profile_sha256}.json"
+            ).unlink()
+          elif corruption == "extra":
+            (selected_directory / f"{'f' * 64}.json").write_bytes(b"extra")
+          else:
+            selected_path = (
+              selected_directory
+              / f"{finalization.selected_profile_sha256}.json"
+            )
+            selected_path.unlink()
+            external = Path(temporary) / "external-selected.json"
+            external.write_bytes(finalization.selected_profile_json)
+            selected_path.symlink_to(external)
+
+          with self.assertRaises(LearningRestoreError):
+            PersistentLearningRuntime._validate_backfill_generation(
+              artifact_paths=paths.resolved(),
+              runtime_bundle=SimpleNamespace(
+                calibration_identity_sha256=RUNTIME_IDENTITY,
+              ),
+            )
+
   def test_signed_causal_learning_contract_versions_move_together(
     self,
   ) -> None:
@@ -157,10 +257,11 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       (
         CALIBRATION_EVIDENCE_SCHEMA_VERSION,
         CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
+        LEARNING_STATUS_SCHEMA_VERSION,
         CANONICAL_JOIN_SCHEMA_VERSION,
         FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
       ),
-      (6, 5, 2, "complete_full_rlog_authority_v4"),
+        (8, 8, 3, 3, "complete_full_rlog_authority_v6"),
     )
 
   def test_inclusion_policy_namespace_ignores_legacy_runtime_root(
@@ -181,7 +282,7 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       (legacy_root / "manifest.json").write_bytes(legacy_manifest)
       predecessor_namespaces = []
       predecessor_before = {}
-      for version in (1, 2, 3):
+      for version in (1, 2, 3, 4):
         predecessor_namespace = (
           legacy_root / f"complete_full_rlog_authority_v{version}"
         )
@@ -249,12 +350,12 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       )
       publish(
         paths,
-        make_finalization("v4"),
+        make_finalization("v5"),
         empty_ledger(),
       )
       self.assertTrue(paths.backfill_pointer.is_file())
       for version, predecessor_namespace in zip(
-        (1, 2, 3), predecessor_namespaces, strict=True,
+        (1, 2, 3, 4), predecessor_namespaces, strict=True,
       ):
         predecessor_after = {
           path.relative_to(predecessor_namespace): path.read_bytes()

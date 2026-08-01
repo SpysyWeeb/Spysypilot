@@ -4,10 +4,12 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 2 deliberately rejects the retired physical rack-fit vocabulary.  The
+Schema 3 deliberately rejects the retired physical rack-fit vocabulary.  The
 only candidate values it exposes are the four observable inverse-torque
 calibration values, while independent base, moving, breakaway, and authority
-populations remain visible for audit and UI progress reporting.
+populations remain visible for audit and UI progress reporting. It also keeps
+"fully evaluated" separate from "new artifact available": retaining the seed
+at every node is a successful, qualified result with no redundant candidate.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   MIN_VALIDATION_SUPPORT_FRACTION,
+  CalibrationFitStatus,
+  CalibrationModelId,
   CalibrationNodeQualificationReport,
   CalibrationQualificationReason,
 )
@@ -33,14 +37,18 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 2
+LEARNING_STATUS_SCHEMA_VERSION = 3
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
+  "all_intervals_qualified",
+  "all_nodes_evaluated",
   "all_nodes_qualified",
+  "candidate_profile_available",
   "candidate_profile_revision",
   "candidate_profile_sha256",
   "evidence_sha256",
   "informational_only",
+  "interpolation_reports",
   "last_drive_complete",
   "manifest_sha256",
   "nodes",
@@ -72,6 +80,8 @@ _NODE_KEYS = {
   "candidate_validation_rms",
   "clean_support_s",
   "confidence",
+  "evaluation_status",
+  "fit_diagnostics",
   "last_drive_accepted_sample_count",
   "last_drive_authority_fit_sample_count",
   "last_drive_authority_fit_support_s",
@@ -104,8 +114,37 @@ _NODE_KEYS = {
   "speed_mps",
   "supported_sample_count",
   "training_count",
+  "training_outcome",
+  "training_paired_loss",
   "validation_count",
+  "validation_paired_loss",
   "validation_support_s",
+}
+_FIT_DIAGNOSTIC_KEYS = {
+  "breakaway_parameter_count",
+  "breakaway_rank",
+  "condition_estimate",
+  "model",
+  "moving_parameter_count",
+  "moving_rank",
+  "status",
+}
+_PAIRED_LOSS_KEYS = {
+  "lower_bound_mse",
+  "mean_candidate_minus_seed_mse",
+  "numerical_tolerance_mse",
+  "route_count",
+  "uncertainty_mse",
+  "upper_bound_mse",
+}
+_INTERPOLATION_KEYS = {
+  "interval_index",
+  "lower_speed_mps",
+  "qualified",
+  "reasons",
+  "training_paired_loss",
+  "upper_speed_mps",
+  "validation_paired_loss",
 }
 _CANDIDATE_PARAMETER_KEYS = {
   "kinetic_friction_torque",
@@ -115,6 +154,17 @@ _CANDIDATE_PARAMETER_KEYS = {
 }
 _SUPPORT_SUM_REL_TOL = 1e-12
 _SUPPORT_SUM_ABS_TOL = 1e-12
+_EVALUATION_STATUSES = {
+  "evidence_insufficient",
+  "ill_conditioned",
+  "invalid_parameters",
+  "learned",
+  "numerical_failure",
+  "rank_deficient",
+  "seed_retained",
+  "validation_inconclusive",
+  "validation_regressed",
+}
 
 
 def _support_populations_match(
@@ -348,6 +398,107 @@ def _optional_rms(value: float | None, name: str) -> float | None:
   return None if value is None else _nonnegative_float(value, name)
 
 
+def _paired_loss_payload(diagnostic: object | None, context: str) -> dict[str, object] | None:
+  if diagnostic is None:
+    return None
+  return {
+    "lower_bound_mse": (
+      None
+      if diagnostic.lower_bound_mse is None
+      else _finite_float(diagnostic.lower_bound_mse, f"{context}.lower_bound_mse")
+    ),
+    "mean_candidate_minus_seed_mse": (
+      None
+      if diagnostic.mean_candidate_minus_seed_mse is None
+      else _finite_float(
+        diagnostic.mean_candidate_minus_seed_mse,
+        f"{context}.mean_candidate_minus_seed_mse",
+      )
+    ),
+    "numerical_tolerance_mse": (
+      None
+      if diagnostic.numerical_tolerance_mse is None
+      else _nonnegative_float(
+        diagnostic.numerical_tolerance_mse,
+        f"{context}.numerical_tolerance_mse",
+      )
+    ),
+    "route_count": _nonnegative_int(
+      diagnostic.route_count,
+      f"{context}.route_count",
+    ),
+    "uncertainty_mse": (
+      None
+      if diagnostic.uncertainty_mse is None
+      else _nonnegative_float(
+        diagnostic.uncertainty_mse,
+        f"{context}.uncertainty_mse",
+      )
+    ),
+    "upper_bound_mse": (
+      None
+      if diagnostic.upper_bound_mse is None
+      else _finite_float(diagnostic.upper_bound_mse, f"{context}.upper_bound_mse")
+    ),
+  }
+
+
+def _fit_diagnostics_payload(report: CalibrationNodeQualificationReport) -> list[dict[str, object]]:
+  result: list[dict[str, object]] = []
+  for index, diagnostic in enumerate(report.fit_diagnostics):
+    context = f"nodes[{report.node_index}].fit_diagnostics[{index}]"
+    result.append({
+      "breakaway_parameter_count": _nonnegative_int(
+        diagnostic.breakaway_parameter_count,
+        f"{context}.breakaway_parameter_count",
+      ),
+      "breakaway_rank": _nonnegative_int(
+        diagnostic.breakaway_rank,
+        f"{context}.breakaway_rank",
+      ),
+      "condition_estimate": (
+        None
+        if diagnostic.condition_estimate is None
+        else _nonnegative_float(
+          diagnostic.condition_estimate,
+          f"{context}.condition_estimate",
+        )
+      ),
+      "model": diagnostic.model.value,
+      "moving_parameter_count": _nonnegative_int(
+        diagnostic.moving_parameter_count,
+        f"{context}.moving_parameter_count",
+      ),
+      "moving_rank": _nonnegative_int(
+        diagnostic.moving_rank,
+        f"{context}.moving_rank",
+      ),
+      "status": diagnostic.status.value,
+    })
+  return result
+
+
+def _node_evaluation_status(report: CalibrationNodeQualificationReport) -> str:
+  if report.seed_retained:
+    return "seed_retained"
+  if report.learned:
+    return "learned"
+  reasons = set(report.reasons)
+  if any(reason.value.startswith("insufficient_") for reason in reasons):
+    return "evidence_insufficient"
+  if CalibrationQualificationReason.RANK_DEFICIENT_FIT in reasons:
+    return "rank_deficient"
+  if CalibrationQualificationReason.ILL_CONDITIONED_FIT in reasons:
+    return "ill_conditioned"
+  if CalibrationQualificationReason.VALIDATION_INCONCLUSIVE in reasons:
+    return "validation_inconclusive"
+  if any("validation_regression" in reason.value for reason in reasons):
+    return "validation_regressed"
+  if CalibrationQualificationReason.INVALID_PARAMETERS in reasons:
+    return "invalid_parameters"
+  return "numerical_failure"
+
+
 def _node_payload(
   report: CalibrationNodeQualificationReport,
   baseline: DriveNodeBaseline | None,
@@ -523,6 +674,8 @@ def _node_payload(
       report.confidence,
       f"{context}.confidence",
     ),
+    "evaluation_status": _node_evaluation_status(report),
+    "fit_diagnostics": _fit_diagnostics_payload(report),
     **last_values,
     "lateral_accel_directions": _nonnegative_int(
       report.lateral_accel_directions,
@@ -588,13 +741,52 @@ def _node_payload(
       report.training_count,
       f"{context}.training_count",
     ),
+    "training_outcome": (
+      None if report.training_outcome is None else report.training_outcome.value
+    ),
+    "training_paired_loss": _paired_loss_payload(
+      report.training_paired_loss,
+      f"{context}.training_paired_loss",
+    ),
     "validation_count": _nonnegative_int(
       report.validation_count,
       f"{context}.validation_count",
     ),
+    "validation_paired_loss": _paired_loss_payload(
+      report.validation_paired_loss,
+      f"{context}.validation_paired_loss",
+    ),
     "validation_support_s": _nonnegative_float(
       report.validation_support_s,
       f"{context}.validation_support_s",
+    ),
+  }
+
+
+def _interpolation_payload(report: object) -> dict[str, object]:
+  context = f"interpolation_reports[{report.interval_index}]"
+  return {
+    "interval_index": _nonnegative_int(
+      report.interval_index,
+      f"{context}.interval_index",
+    ),
+    "lower_speed_mps": _nonnegative_float(
+      report.lower_speed_mps,
+      f"{context}.lower_speed_mps",
+    ),
+    "qualified": report.qualified,
+    "reasons": [reason.value for reason in report.reasons],
+    "training_paired_loss": _paired_loss_payload(
+      report.training_paired_loss,
+      f"{context}.training_paired_loss",
+    ),
+    "upper_speed_mps": _nonnegative_float(
+      report.upper_speed_mps,
+      f"{context}.upper_speed_mps",
+    ),
+    "validation_paired_loss": _paired_loss_payload(
+      report.validation_paired_loss,
+      f"{context}.validation_paired_loss",
     ),
   }
 
@@ -627,21 +819,51 @@ def build_learning_status_payload(
     baselines = drive_baseline.nodes
 
   candidate = finalization.learning_result.candidate_profile
-  all_qualified = all(report.qualified for report in reports)
+  interpolation_reports = finalization.learning_result.interpolation_reports
+  # Every emitted report is a terminal evaluation, including explicit
+  # insufficient/rank/validation-regression outcomes. Qualification is a
+  # separate fact; conflating the two made a fully processed rejection look
+  # like the learner had not run.
+  all_nodes_evaluated = all(bool(report.reasons) for report in reports)
+  all_nodes_qualified = all(report.qualified for report in reports)
+  if interpolation_reports and len(interpolation_reports) != len(reports) - 1:
+    raise ValueError("interpolation reports and runtime speed grid differ")
+  if not all_nodes_qualified and interpolation_reports:
+    raise ValueError("unqualified node grid cannot carry interpolation reports")
+  if all_nodes_qualified and len(interpolation_reports) != len(reports) - 1:
+    raise ValueError("qualified node grid lacks interpolation reports")
+  all_intervals_qualified = (
+    len(interpolation_reports) == len(reports) - 1
+    and all(report.qualified for report in interpolation_reports)
+  )
+  all_qualified = all_nodes_qualified and all_intervals_qualified
   if finalization.all_nodes_qualified != all_qualified:
-    raise ValueError("candidate identity and node qualification disagree")
-  if all_qualified != (candidate is not None):
-    raise ValueError("candidate profile and node qualification disagree")
+    raise ValueError("final qualification and interval reports disagree")
+  candidate_available = candidate is not None
+  if candidate_available and not all_qualified:
+    raise ValueError("candidate profile exists before full qualification")
+  if (
+    all_qualified
+    and finalization.learning_result.contains_learned_change
+    and not candidate_available
+  ):
+    raise ValueError("qualified learned values lack a candidate profile")
   candidate_hash = finalization.candidate_profile_sha256
-  if all_qualified != (candidate_hash is not None):
-    raise ValueError("candidate hash and node qualification disagree")
+  if candidate_available != (candidate_hash is not None):
+    raise ValueError("candidate hash and profile availability disagree")
 
   payload = {
-    "all_nodes_qualified": all_qualified,
+    "all_intervals_qualified": all_intervals_qualified,
+    "all_nodes_evaluated": all_nodes_evaluated,
+    "all_nodes_qualified": all_nodes_qualified,
+    "candidate_profile_available": candidate_available,
     "candidate_profile_revision": None if candidate is None else candidate.revision,
     "candidate_profile_sha256": candidate_hash,
     "evidence_sha256": _sha256(finalization.evidence_sha256, "evidence_sha256"),
     "informational_only": True,
+    "interpolation_reports": [
+      _interpolation_payload(report) for report in interpolation_reports
+    ],
     "last_drive_complete": drive_baseline is not None,
     "manifest_sha256": _sha256(finalization.manifest_sha256, "manifest_sha256"),
     "nodes": [
@@ -683,6 +905,101 @@ def _optional_nonnegative_float(value: object, name: str) -> None:
     _nonnegative_float(value, name)
 
 
+def _validate_paired_loss(value: object, context: str, *, optional: bool) -> None:
+  if value is None:
+    if optional:
+      return
+    raise ValueError(f"{context} must be present")
+  if type(value) is not dict or set(value) != _PAIRED_LOSS_KEYS:
+    raise ValueError(f"{context} schema does not match")
+  route_count = _nonnegative_int(value["route_count"], f"{context}.route_count")
+  mean = value["mean_candidate_minus_seed_mse"]
+  tolerance = value["numerical_tolerance_mse"]
+  uncertainty = value["uncertainty_mse"]
+  lower = value["lower_bound_mse"]
+  upper = value["upper_bound_mse"]
+  if route_count == 0:
+    if any(item is not None for item in (mean, tolerance, uncertainty, lower, upper)):
+      raise ValueError(f"{context} empty route loss carries values")
+    return
+  mean_value = _finite_float(mean, f"{context}.mean_candidate_minus_seed_mse")
+  _nonnegative_float(tolerance, f"{context}.numerical_tolerance_mse")
+  if route_count == 1:
+    if any(item is not None for item in (uncertainty, lower, upper)):
+      raise ValueError(f"{context} one-route loss invents uncertainty")
+    return
+  uncertainty_value = _nonnegative_float(
+    uncertainty,
+    f"{context}.uncertainty_mse",
+  )
+  lower_value = _finite_float(lower, f"{context}.lower_bound_mse")
+  upper_value = _finite_float(upper, f"{context}.upper_bound_mse")
+  if lower_value > upper_value or uncertainty_value < 0.0:
+    raise ValueError(f"{context} uncertainty bounds are invalid")
+  if not math.isclose(
+    lower_value,
+    mean_value - uncertainty_value,
+    rel_tol=1e-12,
+    abs_tol=1e-12,
+  ) or not math.isclose(
+    upper_value,
+    mean_value + uncertainty_value,
+    rel_tol=1e-12,
+    abs_tol=1e-12,
+  ):
+    raise ValueError(f"{context} uncertainty bounds disagree")
+
+
+def _validate_fit_diagnostics(value: object, context: str) -> set[str]:
+  if type(value) is not list or not value:
+    raise ValueError(f"{context} must be a nonempty list")
+  expected_models = {model.value for model in CalibrationModelId}
+  statuses = {status.value for status in CalibrationFitStatus}
+  observed_models: set[str] = set()
+  observed_statuses: set[str] = set()
+  for index, diagnostic in enumerate(value):
+    item_context = f"{context}[{index}]"
+    if type(diagnostic) is not dict or set(diagnostic) != _FIT_DIAGNOSTIC_KEYS:
+      raise ValueError(f"{item_context} schema does not match")
+    model = diagnostic["model"]
+    if type(model) is not str or model not in expected_models or model in observed_models:
+      raise ValueError(f"{item_context}.model is invalid or duplicated")
+    observed_models.add(model)
+    if type(diagnostic["status"]) is not str or diagnostic["status"] not in statuses:
+      raise ValueError(f"{item_context}.status is invalid")
+    status = diagnostic["status"]
+    observed_statuses.add(status)
+    moving_rank = _nonnegative_int(
+      diagnostic["moving_rank"], f"{item_context}.moving_rank"
+    )
+    moving_count = _nonnegative_int(
+      diagnostic["moving_parameter_count"],
+      f"{item_context}.moving_parameter_count",
+    )
+    breakaway_rank = _nonnegative_int(
+      diagnostic["breakaway_rank"], f"{item_context}.breakaway_rank"
+    )
+    breakaway_count = _nonnegative_int(
+      diagnostic["breakaway_parameter_count"],
+      f"{item_context}.breakaway_parameter_count",
+    )
+    if moving_rank > moving_count or breakaway_rank > breakaway_count:
+      raise ValueError(f"{item_context} rank exceeds parameter count")
+    if diagnostic["condition_estimate"] is not None:
+      _nonnegative_float(
+        diagnostic["condition_estimate"],
+        f"{item_context}.condition_estimate",
+      )
+    full_rank = moving_rank == moving_count and breakaway_rank == breakaway_count
+    if status == CalibrationFitStatus.IDENTIFIABLE.value and not full_rank:
+      raise ValueError(f"{item_context} identifiable fit lacks full rank")
+    if status == CalibrationFitStatus.RANK_DEFICIENT.value and full_rank:
+      raise ValueError(f"{item_context} rank-deficient fit has full rank")
+  if observed_models != expected_models:
+    raise ValueError(f"{context} model family is incomplete")
+  return observed_statuses
+
+
 def validate_learning_status_payload(payload: object) -> dict[str, object]:
   """Strictly validate an existing display snapshot; extra keys fail closed."""
   if type(payload) is not dict or set(payload) != _TOP_LEVEL_KEYS:
@@ -697,7 +1014,16 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     raise ValueError("learning status vehicle identity is invalid")
   for field in ("runtime_identity_sha256", "seed_profile_sha256", "evidence_sha256", "manifest_sha256"):
     _sha256(payload[field], field)
-  if type(payload["all_nodes_qualified"]) is not bool or type(payload["last_drive_complete"]) is not bool:
+  if any(
+    type(payload[field]) is not bool
+    for field in (
+      "all_intervals_qualified",
+      "all_nodes_evaluated",
+      "all_nodes_qualified",
+      "candidate_profile_available",
+      "last_drive_complete",
+    )
+  ):
     raise ValueError("learning status booleans are invalid")
 
   nodes = payload["nodes"]
@@ -797,13 +1123,50 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     if type(node["qualified"]) is not bool:
       raise ValueError(f"{context}.qualified must be boolean")
     qualified.append(node["qualified"])
+    evaluation_status = node["evaluation_status"]
+    if type(evaluation_status) is not str or evaluation_status not in _EVALUATION_STATUSES:
+      raise ValueError(f"{context}.evaluation_status is invalid")
+    fit_statuses = _validate_fit_diagnostics(
+      node["fit_diagnostics"], f"{context}.fit_diagnostics"
+    )
+    if evaluation_status == "rank_deficient" and CalibrationFitStatus.RANK_DEFICIENT.value not in fit_statuses:
+      raise ValueError(f"{context}.rank-deficient status lacks fit evidence")
+    if evaluation_status == "ill_conditioned" and CalibrationFitStatus.ILL_CONDITIONED.value not in fit_statuses:
+      raise ValueError(f"{context}.ill-conditioned status lacks fit evidence")
+    training_outcome = node["training_outcome"]
+    if training_outcome not in (
+      None,
+      CalibrationQualificationReason.LEARNED.value,
+      CalibrationQualificationReason.SEED_RETAINED.value,
+    ):
+      raise ValueError(f"{context}.training_outcome is invalid")
+    _validate_paired_loss(
+      node["training_paired_loss"],
+      f"{context}.training_paired_loss",
+      optional=True,
+    )
+    _validate_paired_loss(
+      node["validation_paired_loss"],
+      f"{context}.validation_paired_loss",
+      optional=True,
+    )
     reasons = node["reasons"]
     if type(reasons) is not list or not reasons or any(type(reason) is not str or not reason for reason in reasons):
       raise ValueError(f"{context}.reasons must be nonempty text values")
-    if node["qualified"] != (reasons == [CalibrationQualificationReason.QUALIFIED.value]):
+    qualified_reason = reasons in (
+      [CalibrationQualificationReason.LEARNED.value],
+      [CalibrationQualificationReason.SEED_RETAINED.value],
+    )
+    if node["qualified"] != qualified_reason:
       raise ValueError(f"{context}.qualification reasons disagree")
     if any(reason not in reason_values for reason in reasons):
       raise ValueError(f"{context}.qualification reason is unknown")
+    if node["qualified"] and (
+      evaluation_status != reasons[0] or training_outcome != reasons[0]
+    ):
+      raise ValueError(f"{context}.qualified outcome projection disagrees")
+    if not node["qualified"] and evaluation_status in ("learned", "seed_retained"):
+      raise ValueError(f"{context}.failed node has a qualified status")
 
     parameters = node["candidate_parameters"]
     if node["qualified"] and parameters is None:
@@ -836,9 +1199,72 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     raise ValueError("last-drive completeness and node deltas disagree")
   if len(set(drive_values_present)) != 1:
     raise ValueError("last-drive node deltas cannot be partially present")
-  all_qualified = payload["all_nodes_qualified"]
-  if all(qualified) != all_qualified:
-    raise ValueError("all-node qualification invariant failed")
+  interpolation_reports = payload["interpolation_reports"]
+  if type(interpolation_reports) is not list:
+    raise ValueError("interpolation reports must be a list")
+  interval_qualified: list[bool] = []
+  for index, report in enumerate(interpolation_reports):
+    context = f"interpolation_reports[{index}]"
+    if type(report) is not dict or set(report) != _INTERPOLATION_KEYS:
+      raise ValueError(f"{context} schema does not match")
+    if type(report["interval_index"]) is not int or report["interval_index"] != index:
+      raise ValueError(f"{context}.interval_index is invalid")
+    lower_speed = _nonnegative_float(
+      report["lower_speed_mps"], f"{context}.lower_speed_mps"
+    )
+    upper_speed = _nonnegative_float(
+      report["upper_speed_mps"], f"{context}.upper_speed_mps"
+    )
+    if (
+      index + 1 >= len(nodes)
+      or lower_speed != nodes[index]["speed_mps"]
+      or upper_speed != nodes[index + 1]["speed_mps"]
+    ):
+      raise ValueError(f"{context} speed bounds disagree with node grid")
+    if type(report["qualified"]) is not bool:
+      raise ValueError(f"{context}.qualified must be boolean")
+    interval_qualified.append(report["qualified"])
+    reasons = report["reasons"]
+    if type(reasons) is not list or not reasons or any(
+      type(reason) is not str or reason not in reason_values
+      for reason in reasons
+    ):
+      raise ValueError(f"{context}.reasons are invalid")
+    if report["qualified"] != (
+      reasons == [CalibrationQualificationReason.QUALIFIED.value]
+    ):
+      raise ValueError(f"{context}.qualification reasons disagree")
+    _validate_paired_loss(
+      report["training_paired_loss"],
+      f"{context}.training_paired_loss",
+      optional=False,
+    )
+    _validate_paired_loss(
+      report["validation_paired_loss"],
+      f"{context}.validation_paired_loss",
+      optional=False,
+    )
+  all_nodes_evaluated = all(
+    type(node["evaluation_status"]) is str
+    and bool(node["evaluation_status"])
+    and type(node["reasons"]) is list
+    and bool(node["reasons"])
+    for node in nodes
+  )
+  all_nodes_qualified = all(qualified)
+  if not all_nodes_qualified and interpolation_reports:
+    raise ValueError("unqualified node grid carries interpolation reports")
+  if payload["all_nodes_evaluated"] != all_nodes_evaluated:
+    raise ValueError("all-node evaluation invariant failed")
+  all_intervals_qualified = (
+    len(interpolation_reports) == len(nodes) - 1
+    and all(interval_qualified)
+  )
+  if payload["all_intervals_qualified"] != all_intervals_qualified:
+    raise ValueError("all-interval qualification invariant failed")
+  if payload["all_nodes_qualified"] != all_nodes_qualified:
+    raise ValueError("node qualification invariant failed")
+  all_qualified = all_nodes_qualified and all_intervals_qualified
   candidate_hash = payload["candidate_profile_sha256"]
   candidate_revision = payload["candidate_profile_revision"]
   candidate_present = candidate_hash is not None
@@ -847,8 +1273,15 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     _nonnegative_int(candidate_revision, "candidate_profile_revision")
   elif candidate_revision is not None:
     raise ValueError("candidate revision exists without candidate hash")
-  if candidate_present != all_qualified:
-    raise ValueError("candidate identity and qualification disagree")
+  if payload["candidate_profile_available"] != candidate_present:
+    raise ValueError("candidate availability and identity disagree")
+  if candidate_present and not all_qualified:
+    raise ValueError("candidate exists before full qualification")
+  if all_qualified and not candidate_present and any(
+    node["training_outcome"] == CalibrationQualificationReason.LEARNED.value
+    for node in nodes
+  ):
+    raise ValueError("qualified learned node lacks candidate artifact")
   return payload
 
 

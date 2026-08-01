@@ -49,114 +49,59 @@ implementation, signal mapping, and ownership boundaries are documented in
 
 ## BLaTv2 modular replacement
 
-**Status: in progress.** The previous LQI-based BLaTv2 controller is retired.
-LQI means “Linear Quadratic Integral”: state feedback plus an integral-error
-state. The replacement is a ground-up, modular adaptive torque controller
-whose target is **Smooth. Swift. Strong.**
+**Status: in progress; collecting evidence while stock torque control remains
+active.** The previous LQI controller is retired. LQI means “Linear Quadratic
+Integral”: state feedback with an integral-error state. The replacement is a
+modular learning system aimed at **Smooth. Swift. Strong.**, but this milestone
+does not authorize learned steering. There is no approved profile, no automatic
+activation path, and no BLaTv2 process runs onroad. `LatControlTorque` remains
+byte-identical to the stock bootstrap. The validated Palisade/Telluride uses
+the runtime-selected 409/4/7 opendbc/panda envelope; every other vehicle keeps
+the limits supplied by its own `CarControllerParams`.
 
-This milestone deliberately has no approved learned profile or calibration
-activation path. The active lateral controller remains the exact current stock
-`LatControlTorque`, and no BLaTv2 helper runs onroad. On the validated
-Palisade/Telluride platform that stock request uses the vehicle-selected
-409/4/7 opendbc/panda envelope; other vehicles keep their own stock limits.
+After a route closes, offroad-only `blatv2_backfilld` converts compatible full
+rlogs into immutable `BLATRE02` route evidence (format v2, evidence schema 8,
+namespace `complete_full_rlog_authority_v6`). Two independent authorities must
+produce the same canonical artifacts before anything is committed. The local
+path uses up to four isolated workers, owns and reaps every worker process
+group on abort/onroad transition, and never parallelizes mutable learner state.
+An authenticated PC bridge may prepare the same complete evidence artifact;
+the device still validates it, performs both A/A authorities, owns finalization,
+and remains the only possible publisher. An unavailable worker falls back to
+the unchanged local path.
 
-After logger closure, the offroad-only `blatv2_backfilld` replays compatible
-complete full rlogs twice. It commits evidence only when both passes agree
-bit-for-bit. Learning is measured-response-only at 0/5/10/15/20/30 m/s, and a
-sample updates only neighboring nodes, so highway mileage cannot overwrite
-low-speed knowledge. The current `complete_full_rlog_authority_v4` namespace
-starts empty and never migrates or rewrites retired v1/v2/v3 evidence.
+Physical calibration and behavioral qualification are deliberately separate.
+The physical learner estimates only observable quantities—torque per measured
+lateral acceleration, signed offset, moving friction, and static breakaway—at
+0/5/10/15/20/30 m/s. Samples update adjacent nodes only, interpolation requires
+support on both sides, and seed retention is a valid qualified result; long
+highway drives therefore cannot erase low-speed knowledge. Support, numerical
+rank/conditioning, training, held-route validation, and full-authority evidence
+are reported independently.
 
-The retired dynamic-rack learner is replaced by an observable inverse-torque
-fit: torque per measured lateral acceleration, a signed acceleration-offset
-correction, moving friction, and static breakaway. Base, moving, breakaway,
-held-out validation, and vehicle-owned full-authority evidence remain separate.
-Breakaway is reconstructed as one physical episode: raw steering-angle motion
-at half a rate quantum marks onset, and same-direction measured rate must
-confirm it within the existing transport delay. Whole routes alternate between
-training and validation by immutable route counter, so one maneuver cannot
-train and validate itself. Training evaluates nested static-only, friction,
-offset-plus-friction, and full-map models. The seed is comparator-only; a model
-must improve something without regressing any populated category before its
-frozen held-route check. Dense ordinary samples therefore cannot outvote rare
-breakaway or authority failures.
+The behavior learner consumes a homogeneous, immutable route cohort (at least
+four whole routes) and replays exact stock, incumbent, and candidate controllers
+against the same inputs. It may adjust only global natural frequency and
+damping, then must independently satisfy the Smooth, Swift, and Strong gates on
+held-out routes. Driver interventions censor contaminated evidence rather than
+voting a candidate up or down, and event logs locate windows but never define
+the desired path. A complete physical fit or passing behavior candidate remains
+informational: neither can populate an approved artifact or change actuation
+without a later, separately reviewed activation phase.
 
-A candidate file is emitted only if every node has enough independent evidence
-and beats or matches its seed on every applicable held-out population. It is
-still informational and cannot populate `BLaTv2ApprovedArtifact`, stage a
-controller, or change stock selection. Any future consumer requires separate
-raw/applied/delivered replay, deterministic A/A, safety, and device-timing
-review.
+The custom home panel replaces the old route-analyzer pages with two BLaTv2
+pages, followed by the existing terminal and system-usage views. **Learning**
+shows route/segment/pass progress plus per-node physical evidence. **Readiness
+& Behavior** keeps physical qualification, behavior-cohort progress, individual
+Smooth/Swift/Strong verdicts, and activation status visibly separate. These
+Params are rebuildable display caches only; editing or deleting them cannot
+train, approve, or select a controller.
 
-The home-screen learning display reads rebuildable
-`BLaTv2LearningOperationStatus` and `BLaTv2LearningStatus` caches. They clear
-at manager start and are republished only by the offroad owner after validating
-the current vehicle/build state. The operation cache distinguishes logger
-finalization, historical scanning/replay, idle evidence, and fail-closed
-diagnostics. Both caches are informational only: editing or deleting them
-cannot train, approve, select, or change a steering controller. The retained
-profile-lifecycle code is an offline test surface and is not manager-launched
-while stock remains mandatory.
-
-No BLaTv1 controller code or `HyundaiLowSpeedTorqueDamping` is inherited.
-Vehicle limits come from runtime `CarControllerParams`; BLaTv2 contains no
-Palisade limit literals. Full architecture, contracts, learning policy,
-acceptance gates, and rollback behavior are documented in
+No BLaTv1 controller code or `HyundaiLowSpeedTorqueDamping` is inherited. Full
+module boundaries, evidence contracts, process-safety rules, trust boundaries,
+gates, and rollback behavior are documented in
 [`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
 [`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
-
-## BLaTv2 learning dashboard
-
-**Status: in progress.** The custom home panel now cycles through exactly four
-pages: **BLaTv2 Learning**, **Readiness & Activation**, the existing live
-terminal, and the existing system-usage view. The five old route-analyzer
-pages and their `drive_statsd` service have been removed.
-
-The Learning page distinguishes active processing from an empty evidence set
-and shows overall plus last-drive progress, with base/moving/breakaway/
-authority populations at each speed node. Readiness shows independent motion,
-breakaway, validation, and authority state and, when a fit exists, compact
-gain/offset/kinetic/static values. A complete calibration never implies
-activation; the lifecycle rail reports stock until a separately reviewed
-activation path exists.
-
-The historical learner registry now includes the verified 409/4/7 combo
-builds recorded by routes d2-d6 (`3849a2f`, `2447667`, and `9338f5b`) plus
-`fdd5560`, the clean combo build running immediately before the off-device
-bridge landed. Older archived 384/3/7 builds remain fail-closed rather than
-being mislabeled to admit their data.
-
-### Off-device preparation bridge
-
-**Status: in progress.** When its separately versioned worker is reachable on
-the trusted private LAN, the comma may offload only deterministic full-rlog
-preparation to `/home/alex/Documents/blatv2-remote-worker`. Uploaded segments
-remain private and resumable until an authenticated exact route manifest
-atomically publishes the whole route, so an interrupted prefix never appears
-complete.
-
-The device still freezes the manifest, runs both learner authorities, checks
-A/A equality, owns the ledger/finalizer, and is the only profile publisher.
-The PC has no Params, controller-selection, or actuation API. If the worker is
-unavailable, the unchanged four-worker local path runs instead. See the BLaTv2
-architecture and acceptance documents for the complete trust boundary.
-
-Discovery normally uses a signed LAN broadcast. Networks that suppress
-broadcasts between Wi-Fi and Ethernet may instead place one canonical RFC1918
-IPv4 address in the protected device file
-`/data/params/blatv2-offdevice-bridge/worker_host.txt` (mode `0600`, beside the
-raw 32-byte secret). That pin replaces only the UDP destination: discovery
-remains HMAC-authenticated, source-pinned, timestamped, and source-commit-bound.
-An unreachable pinned worker retains the four-worker local fallback.
-
-The pre-merge b7/b8/b9/ca production replay was byte-identical with two and
-four workers: generation
-`1ff42b06de6480fc1e744702175167bd725849321e6e99d3e714596e16e56809`,
-evidence `ad59ed7bc85a6d06d164185673110c592df80b44971377fe86b0bb4204993aa9`,
-and manifest `3c0f072a6af25d44ae447a19b0011ed27435fb21d523cdd7d607b39f1f384631`.
-Nodes 10 and 15 m/s qualified. The 5 m/s training fit selected a minimal
-static-only change, but held routes rejected it; 0, 20, and 30 m/s remained
-support- or episode-limited in this regression set. No candidate was emitted.
 
 ## To-Do
 
@@ -182,22 +127,15 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
 - ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — ground-up modular adaptive lateral foundation; stock torque control is the active bootstrap, no BLaTv2 process runs onroad, and an offroad full-rlog importer builds the fully gated speed-local vehicle profile; no learned controller can actuate until replay, delivered-response, deterministic, safety, and device-timing approval all pass &nbsp;*(personal idea)*
 
-  Offroad learning now exposes display-only progress for both deterministic replay passes, including route and segment position, route-application stages, and a conservative ETA once enough read/apply timing samples exist. Progress is never consumed by learning, evidence, candidate selection, or control.
-
-  The two mandatory A/A passes remain independent and canonical. Each replay
-  authority now has one private route-preparation helper, allowing up to four
-  Python lanes without creating extra replay passes or parallelizing mutable
-  learner state. Helpers use bounded, hash-verified scratch spools and never
-  receive publication or Params authority; only the parent compares and
-  publishes. Integrated b7/b8/b9/ca replay was byte-identical and 20.3% faster
-  than two workers on the desktop, and four-worker processing has completed on
-  the comma without changing deterministic artifacts.
-
-  Evidence v6 in namespace v4 adds vehicle-global, angle-assisted physical
-  breakaway episodes, whole-route held-out validation, and a nested
-  no-regression model family. Existing v1/v2/v3 artifacts remain byte-for-byte
-  untouched while retained compatible full rlogs replay into an empty v4
-  namespace.
+  Offroad learning exposes display-only route/segment/pass progress and a
+  conservative ETA. The two canonical authorities use separate preparation
+  workers and must agree bit-for-bit; workers have no publication or Params
+  authority and are killed and reaped as a unit if the car goes onroad. The
+  immutable evidence format is `BLATRE02` v2 in schema-8 namespace
+  `complete_full_rlog_authority_v6`. Physical calibration and behavior tuning
+  have independent readiness and gates, and the behavior search may change
+  only global natural frequency and damping after a homogeneous four-route
+  cohort exists. No result auto-activates.
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

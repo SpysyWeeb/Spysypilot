@@ -188,6 +188,38 @@ def current_event(which: str, mono_ns: int) -> bytes:
   return event.to_bytes()
 
 
+def test_native_retains_complete_shared_evidence_input_set(
+  native_extractor: Path,
+  tmp_path: Path,
+) -> None:
+  """The shared preparation pass owns both learning evidence planes."""
+  raw = b"".join((
+    current_event("modelV2", 100),
+    current_event("selfdriveState", 110),
+    current_event("liveTorqueParameters", 120),
+    current_event("liveDelay", 130),
+    current_event("lateralManeuverPlan", 140),
+    current_event("drivingEvent", 150),
+  ))
+  segment = tmp_path / "behavior-rlog"
+  segment.write_bytes(raw)
+
+  extracted = extract_segment_events(native_extractor, segment)
+
+  assert tuple(
+    (record.which, record.mono_ns, record.encoded)
+    for record in extracted
+  ) == independently_selected(raw)
+  assert [record.which for record in extracted] == [
+    learning_backfill._EVENT_WHICH["modelV2"],
+    learning_backfill._EVENT_WHICH["selfdriveState"],
+    learning_backfill._EVENT_WHICH["liveTorqueParameters"],
+    learning_backfill._EVENT_WHICH["liveDelay"],
+    learning_backfill._EVENT_WHICH["lateralManeuverPlan"],
+    learning_backfill._EVENT_WHICH["drivingEvent"],
+  ]
+
+
 @pytest.mark.parametrize(
   "corrupt",
   (
@@ -349,7 +381,7 @@ while not go.exists():
 payload = Path(sys.argv[1]).read_bytes()
 read.touch()
 out = sys.stdout.buffer
-out.write(struct.pack("<8sII", b"BLATV2R1", 1, 0))
+out.write(struct.pack("<8sII", b"BLATV2R1", {learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION}, 0))
 out.write(struct.pack("<IIQ", len(payload), 1, 123))
 out.write(payload)
 out.write(struct.pack("<IIQ", 0, 0xffffffff, 1))
@@ -428,7 +460,7 @@ Path({str(marker)!r}).touch()
 while not Path({str(go_path)!r}).exists():
   time.sleep(0.001)
 out = sys.stdout.buffer
-out.write(struct.pack("<8sII", b"BLATV2R1", 1, 0))
+out.write(struct.pack("<8sII", b"BLATV2R1", {learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION}, 0))
 out.write(struct.pack("<IIQ", 0, 0xffffffff, 0))
 out.flush()
 """

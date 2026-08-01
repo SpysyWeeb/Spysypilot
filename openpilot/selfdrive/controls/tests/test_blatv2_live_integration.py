@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import inspect
 import math
 from pathlib import Path
@@ -57,12 +58,21 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   PhysicalParameters,
   ProfileNode,
   VehicleProfile,
+  compose_controller_profile,
+  make_seed_profile,
+)
+from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
+  calibration_profile_for_controller,
+  calibration_selection_manifest,
+  passed_behavior_finalization,
 )
 
 
 SOURCE_COMMIT = "1" * 40
 OPENDBC_COMMIT = "2" * 40
+PANDA_COMMIT = "3" * 40
 EVIDENCE_HASH = "3" * 64
+CALIBRATION_MANIFEST_HASH = "5" * 64
 HARNESS_COMMIT = "4" * 40
 BASE_NS = 10_000_000_000
 
@@ -181,21 +191,38 @@ def runtime_bundle(
 
 
 def artifact(bundle: RuntimeVehicleBundle) -> ApprovedProfileArtifact:
+  calibration_profile = calibration_profile_for_controller(
+    qualified_profile(identity=bundle.vehicle_identity),
+  )
+  selected_profile = compose_controller_profile(
+    calibration_profile,
+    bundle.seed_profile,
+  )
+  selected_policy = policy()
   return ApprovedProfileArtifact(
-    vehicle_profile=qualified_profile(
-      identity=bundle.vehicle_identity,
-    ),
-    controller_policy=policy(),
+    vehicle_profile=selected_profile,
+    calibration_profile=calibration_profile,
+    controller_policy=selected_policy,
     runtime_vehicle_identity_sha256=bundle.identity_sha256,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
-    learner_evidence_sha256=EVIDENCE_HASH,
+    panda_commit=PANDA_COMMIT,
+    calibration_selection_manifest=calibration_selection_manifest(
+      selected_profile,
+      learner_evidence_sha256=EVIDENCE_HASH,
+      qualification_manifest_sha256=CALIBRATION_MANIFEST_HASH,
+      calibration_profile=calibration_profile,
+    ),
+    behavior_finalization=passed_behavior_finalization(selected_policy),
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
     safety_passed=True,
     deterministic_aa_passed=True,
     device_timing_passed=True,
+    smooth_passed=True,
+    swift_passed=True,
+    strong_passed=True,
   )
 
 
@@ -220,6 +247,7 @@ def live(
     artifact_diagnostic=diagnostic,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
   )
 
 
@@ -353,6 +381,13 @@ def test_absent_invalid_mismatched_and_unverified_are_exact_stock() -> None:
       runtime_vehicle_identity_sha256="f" * 64,
     ),
   )
+  panda_mismatched = live(
+    bundle=bundle,
+    selected_artifact=replace(
+      artifact(bundle),
+      panda_commit="f" * 40,
+    ),
+  )
   unverified_bundle = runtime_bundle(verified=False)
   unverified = live(
     bundle=unverified_bundle,
@@ -364,7 +399,14 @@ def test_absent_invalid_mismatched_and_unverified_are_exact_stock() -> None:
     diagnostic=ArtifactDiagnostic.STATE_INVALID,
   )
 
-  for controller in (absent, mismatched, unverified, malformed):
+  assert panda_mismatched.eligibility == LiveEligibility.PANDA_COMMIT_MISMATCH
+  for controller in (
+    absent,
+    mismatched,
+    panda_mismatched,
+    unverified,
+    malformed,
+  ):
     state, output, _ = vehicle_messages()
     controller.observe_previous_applied(output)
     selection = controller.update_engagement(
@@ -376,6 +418,86 @@ def test_absent_invalid_mismatched_and_unverified_are_exact_stock() -> None:
     assert controller.candidate_result is None
     assert controller.messages_valid
     assert controller.selection == ControllerSelection.STOCK
+
+
+def test_altered_transient_rack_values_fail_to_exact_stock() -> None:
+  bundle = runtime_bundle()
+  approved = artifact(bundle)
+  for field_name, replacement in (
+    ("rack_gain_deg_s2_per_torque", 3999.0),
+    ("rack_damping_per_s", 9.5),
+  ):
+    nodes = tuple(
+      replace(
+        node,
+        parameters=replace(node.parameters, **{field_name: replacement}),
+      )
+      for node in approved.vehicle_profile.nodes
+    )
+    changed_profile = replace(approved.vehicle_profile, nodes=nodes)
+    changed_manifest = replace(
+      approved.calibration_selection_manifest,
+      selected_controller_profile_sha256=hashlib.sha256(
+        changed_profile.to_json().encode(),
+      ).hexdigest(),
+    )
+    internally_bound = replace(
+      approved,
+      vehicle_profile=changed_profile,
+      calibration_selection_manifest=changed_manifest,
+    )
+    selected = live(
+      bundle=bundle,
+      selected_artifact=internally_bound,
+    )
+
+    assert (
+      selected.eligibility
+      == LiveEligibility.CALIBRATION_COMPOSITION_MISMATCH
+    )
+    assert selected.update_engagement(
+      enabled=True,
+      lateral_active=True,
+      lateral_maneuver_active=False,
+    ) == ControllerSelection.STOCK
+    assert selected.candidate is None
+
+
+def test_runtime_seed_grid_mismatch_fails_to_exact_stock() -> None:
+  bundle = runtime_bundle()
+  approved = artifact(bundle)
+  seed = bundle.seed_profile.nodes[0].parameters
+  different_grid = make_seed_profile(
+    bundle.vehicle_identity,
+    seed.torque_per_lateral_accel,
+    seed.rack_gain_deg_s2_per_torque,
+    seed.rack_damping_per_s,
+    seed.transport_delay_s,
+    seed.static_friction_torque,
+    seed.kinetic_friction_torque,
+    seed.rack_rate_resolution_deg_s,
+    speed_nodes_mps=(0.0, 15.0, 30.0),
+  )
+  mismatched_bundle = replace(bundle, seed_profile=different_grid)
+  runtime_bound = replace(
+    approved,
+    runtime_vehicle_identity_sha256=mismatched_bundle.identity_sha256,
+  )
+  selected = live(
+    bundle=mismatched_bundle,
+    selected_artifact=runtime_bound,
+  )
+
+  assert (
+    selected.eligibility
+    == LiveEligibility.CALIBRATION_COMPOSITION_MISMATCH
+  )
+  assert selected.update_engagement(
+    enabled=True,
+    lateral_active=True,
+    lateral_maneuver_active=False,
+  ) == ControllerSelection.STOCK
+  assert selected.candidate is None
 
 
 def test_exact_artifact_is_only_modular_selection_and_boundary_is_immutable() -> None:

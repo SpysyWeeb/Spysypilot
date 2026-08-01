@@ -1,0 +1,1032 @@
+"""Bounded, deterministic offroad search for BLaTv2 response policy.
+
+Only two physically meaningful controller dials are eligible here:
+speed-independent closed-loop natural frequency and damping ratio.  This
+module cannot alter the model reference or its timing, vehicle calibration,
+friction, observer, torque envelope, safety limits, or any live state.
+
+Training chooses at most one frozen winner.  Held-out validation receives only
+that winner and may accept or reject it; it has no fallback-selection API.
+Smooth, Swift, and Strong remain independent contracts throughout.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
+from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
+from enum import StrEnum
+import hashlib
+import math
+import sys
+from typing import TYPE_CHECKING, Any
+
+from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import canonical_json
+from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
+  BehaviorContract,
+  BehaviorMetricName,
+  BehaviorScorecard,
+  behavior_metric_contract,
+)
+
+if TYPE_CHECKING:
+  from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
+
+
+class MetricPreference(StrEnum):
+  LOWER_IS_BETTER = "lower_is_better"
+  HIGHER_IS_BETTER = "higher_is_better"
+
+
+PAIRED_ROUTE_UNCERTAINTY_METHOD = "observed_whole_route_envelope_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorPolicy:
+  """The complete behavior-learning parameter surface, initially two dials."""
+
+  natural_frequency_per_s: float
+  damping_ratio: float
+
+  def __post_init__(self) -> None:
+    if (
+      not math.isfinite(self.natural_frequency_per_s)
+      or self.natural_frequency_per_s <= 0.0
+      or not math.isfinite(self.damping_ratio)
+      or self.damping_ratio <= 0.0
+    ):
+      raise ValueError("behavior policy values must be finite and positive")
+
+  def to_dict(self) -> dict[str, float]:
+    return {
+      "dampingRatio": self.damping_ratio,
+      "naturalFrequencyPerS": self.natural_frequency_per_s,
+    }
+
+  def to_json(self) -> str:
+    return canonical_json(self.to_dict())
+
+  @property
+  def sha256(self) -> str:
+    return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+  @classmethod
+  def from_controller_policy(cls, policy: ControllerPolicy) -> BehaviorPolicy:
+    """Extract only tracking semantics from the versioned live artifact."""
+    return cls(
+      natural_frequency_per_s=policy.natural_frequency_per_s,
+      damping_ratio=policy.damping_ratio,
+    )
+
+  def into_controller_policy(self, template: ControllerPolicy) -> ControllerPolicy:
+    """Replace tracking dials while preserving observer and artifact metadata.
+
+    ``dataclasses.replace`` deliberately leaves every non-behavior field on
+    the template untouched.  The behavior learner therefore neither copies
+    nor owns disturbance-observer semantics.
+    """
+    return replace(
+      template,
+      natural_frequency_per_s=self.natural_frequency_per_s,
+      damping_ratio=self.damping_ratio,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyGridSpec:
+  """Explicit log-space offsets and physical bounds around an incumbent."""
+
+  incumbent: BehaviorPolicy
+  natural_frequency_log_offsets: tuple[float, ...]
+  damping_ratio_log_offsets: tuple[float, ...]
+  minimum_natural_frequency_per_s: float
+  maximum_natural_frequency_per_s: float
+  minimum_damping_ratio: float
+  maximum_damping_ratio: float
+
+  def __post_init__(self) -> None:
+    for name, offsets in (
+      ("natural_frequency_log_offsets", self.natural_frequency_log_offsets),
+      ("damping_ratio_log_offsets", self.damping_ratio_log_offsets),
+    ):
+      if not offsets or 0.0 not in offsets:
+        raise ValueError(f"{name} must be non-empty and include zero")
+      if any(not math.isfinite(value) for value in offsets) or any(
+        right <= left
+        for left, right in zip(offsets, offsets[1:], strict=False)
+      ):
+        raise ValueError(f"{name} must be finite and strictly increasing")
+    bounds = (
+      self.minimum_natural_frequency_per_s,
+      self.maximum_natural_frequency_per_s,
+      self.minimum_damping_ratio,
+      self.maximum_damping_ratio,
+    )
+    if not all(math.isfinite(value) and value > 0.0 for value in bounds):
+      raise ValueError("policy bounds must be finite and positive")
+    if self.minimum_natural_frequency_per_s >= self.maximum_natural_frequency_per_s:
+      raise ValueError("natural-frequency bounds are inverted")
+    if self.minimum_damping_ratio >= self.maximum_damping_ratio:
+      raise ValueError("damping-ratio bounds are inverted")
+    if not (
+      self.minimum_natural_frequency_per_s
+      <= self.incumbent.natural_frequency_per_s
+      <= self.maximum_natural_frequency_per_s
+      and self.minimum_damping_ratio
+      <= self.incumbent.damping_ratio
+      <= self.maximum_damping_ratio
+    ):
+      raise ValueError("incumbent must lie inside policy bounds")
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyCandidate:
+  canonical_index: int
+  policy: BehaviorPolicy
+  squared_log_displacement: float
+
+
+_GRID_DECIMAL_CONTEXT = Context(prec=50, rounding=ROUND_HALF_EVEN)
+
+
+def _deterministic_exp_scale(base: float, offset: float) -> float:
+  """Deterministic decimal exp before one correctly rounded binary64 cast."""
+  with localcontext(_GRID_DECIMAL_CONTEXT):
+    value = Decimal.from_float(base) * Decimal.from_float(offset).exp()
+  return float(value)
+
+
+def build_candidate_grid(spec: PolicyGridSpec) -> tuple[PolicyCandidate, ...]:
+  candidates: list[PolicyCandidate] = []
+  seen: set[BehaviorPolicy] = set()
+  canonical_index = 0
+  for frequency_offset in spec.natural_frequency_log_offsets:
+    frequency = _deterministic_exp_scale(
+      spec.incumbent.natural_frequency_per_s,
+      frequency_offset,
+    )
+    for damping_offset in spec.damping_ratio_log_offsets:
+      damping = _deterministic_exp_scale(
+        spec.incumbent.damping_ratio,
+        damping_offset,
+      )
+      if not (
+        spec.minimum_natural_frequency_per_s <= frequency <= spec.maximum_natural_frequency_per_s
+        and spec.minimum_damping_ratio <= damping <= spec.maximum_damping_ratio
+      ):
+        canonical_index += 1
+        continue
+      policy = BehaviorPolicy(
+        natural_frequency_per_s=frequency,
+        damping_ratio=damping,
+      )
+      if policy in seen:
+        raise ValueError("candidate grid produced a duplicate policy")
+      seen.add(policy)
+      candidates.append(PolicyCandidate(
+        canonical_index=canonical_index,
+        policy=policy,
+        squared_log_displacement=(
+          frequency_offset * frequency_offset
+          + damping_offset * damping_offset
+        ),
+      ))
+      canonical_index += 1
+  if not candidates or spec.incumbent not in seen:
+    raise ValueError("bounded candidate grid excluded the incumbent")
+  return tuple(candidates)
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyMetric:
+  name: str
+  value: float | None
+  denominator: int
+  exclusions: tuple[str, ...]
+  route_count: int
+  window_count: int
+  weighted_support: float
+  coverage_identity_sha256: str
+  strata: tuple[str, ...]
+  physical_failure_window_ids: tuple[str, ...]
+  route_values: tuple[tuple[str, float], ...]
+
+  def __post_init__(self) -> None:
+    try:
+      BehaviorMetricName(self.name)
+    except ValueError as exc:
+      raise ValueError("policy metric name is not registered") from exc
+    if self.value is not None and not math.isfinite(self.value):
+      raise ValueError("policy metric value must be finite")
+    if self.denominator < 0:
+      raise ValueError("policy metric denominator must be non-negative")
+    if self.route_count < 0 or self.window_count < 0:
+      raise ValueError("policy metric coverage counts must be non-negative")
+    if not math.isfinite(self.weighted_support) or self.weighted_support < 0.0:
+      raise ValueError("policy metric weighted support must be finite and non-negative")
+    if len(self.coverage_identity_sha256) != 64 or any(
+      character not in "0123456789abcdef"
+      for character in self.coverage_identity_sha256
+    ):
+      raise ValueError("policy metric coverage identity must be lowercase SHA-256")
+    if tuple(sorted(set(self.strata))) != self.strata:
+      raise ValueError("policy metric strata must be unique and sorted")
+    if tuple(sorted(set(self.physical_failure_window_ids))) != self.physical_failure_window_ids:
+      raise ValueError("physical failure window IDs must be unique and sorted")
+    route_value_ids = tuple(route_id for route_id, _ in self.route_values)
+    if route_value_ids != tuple(sorted(set(route_value_ids))):
+      raise ValueError("policy metric route values must be unique and sorted")
+    if any(not math.isfinite(value) for _, value in self.route_values):
+      raise ValueError("policy metric route values must be finite")
+    if self.defined:
+      if len(route_value_ids) != self.route_count:
+        raise ValueError("defined policy metric route values must match route count")
+    elif self.route_values:
+      raise ValueError("undefined policy metric cannot expose route values")
+    if self.value is None and not self.exclusions:
+      raise ValueError("undefined policy metrics need an exclusion reason")
+
+  @property
+  def defined(self) -> bool:
+    return self.value is not None
+
+  @property
+  def route_ids(self) -> tuple[str, ...]:
+    return tuple(route_id for route_id, _ in self.route_values)
+
+  @property
+  def route_values_by_id(self) -> dict[str, float]:
+    return dict(self.route_values)
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "defined": self.defined,
+      "denominator": self.denominator,
+      "exclusions": list(self.exclusions),
+      "name": self.name,
+      "routeCount": self.route_count,
+      "windowCount": self.window_count,
+      "weightedSupport": self.weighted_support,
+      "coverageIdentitySha256": self.coverage_identity_sha256,
+      "strata": list(self.strata),
+      "physicalFailureWindowIds": list(self.physical_failure_window_ids),
+      "routeValues": [
+        {"routeId": route_id, "value": value}
+        for route_id, value in self.route_values
+      ],
+      "value": self.value,
+    }
+
+  @classmethod
+  def from_dict(cls, payload: object) -> PolicyMetric:
+    keys = frozenset((
+      "coverageIdentitySha256",
+      "defined",
+      "denominator",
+      "exclusions",
+      "name",
+      "physicalFailureWindowIds",
+      "routeCount",
+      "routeValues",
+      "strata",
+      "value",
+      "weightedSupport",
+      "windowCount",
+    ))
+    if type(payload) is not dict or frozenset(payload) != keys:
+      raise ValueError("policy metric keys do not match schema")
+    for key in ("exclusions", "physicalFailureWindowIds", "strata"):
+      if type(payload[key]) is not list or any(
+        type(value) is not str for value in payload[key]
+      ):
+        raise ValueError(f"policy metric {key} must be a text array")
+    route_values_payload = payload["routeValues"]
+    if type(route_values_payload) is not list:
+      raise ValueError("policy metric routeValues must be an array")
+    route_values: list[tuple[str, float]] = []
+    for value in route_values_payload:
+      if type(value) is not dict or frozenset(value) != {"routeId", "value"}:
+        raise ValueError("policy metric route value keys do not match schema")
+      if type(value["routeId"]) is not str or type(value["value"]) not in (int, float):
+        raise ValueError("policy metric route value has invalid types")
+      route_values.append((value["routeId"], float(value["value"])))
+    for key in ("denominator", "routeCount", "windowCount"):
+      if type(payload[key]) is not int:
+        raise ValueError(f"policy metric {key} must be integer")
+    if type(payload["weightedSupport"]) not in (int, float):
+      raise ValueError("policy metric weightedSupport must be numeric")
+    if payload["value"] is not None and type(payload["value"]) not in (int, float):
+      raise ValueError("policy metric value must be numeric or null")
+    if type(payload["defined"]) is not bool:
+      raise ValueError("policy metric defined must be boolean")
+    metric = cls(
+      name=payload["name"],
+      value=None if payload["value"] is None else float(payload["value"]),
+      denominator=payload["denominator"],
+      exclusions=tuple(payload["exclusions"]),
+      route_count=payload["routeCount"],
+      window_count=payload["windowCount"],
+      weighted_support=float(payload["weightedSupport"]),
+      coverage_identity_sha256=payload["coverageIdentitySha256"],
+      strata=tuple(payload["strata"]),
+      physical_failure_window_ids=tuple(payload["physicalFailureWindowIds"]),
+      route_values=tuple(route_values),
+    )
+    if payload["defined"] != metric.defined:
+      raise ValueError("policy metric defined flag disagrees with value")
+    return metric
+
+  @classmethod
+  def from_scorecard(
+    cls,
+    scorecard: BehaviorScorecard,
+    name: BehaviorMetricName,
+  ) -> PolicyMetric:
+    aggregate = next(metric for metric in scorecard.balanced_metrics if metric.name is name)
+    strata = tuple(sorted(
+      f"{stratum.key.speed_node_mps:g}:{stratum.key.maneuver_class.value}"
+      for stratum in scorecard.strata
+      if next(metric for metric in stratum.metrics if metric.name is name).defined
+    ))
+    return cls(
+      name=name.value,
+      value=aggregate.value,
+      denominator=aggregate.window_count,
+      exclusions=aggregate.exclusions,
+      route_count=aggregate.route_count,
+      window_count=aggregate.window_count,
+      weighted_support=aggregate.weighted_support,
+      coverage_identity_sha256=aggregate.coverage_identity_sha256,
+      strata=strata,
+      physical_failure_window_ids=aggregate.physical_failure_window_ids,
+      route_values=aggregate.route_values,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyEvaluation:
+  """Replay result for one exact artifact over one route partition."""
+
+  artifact_identity: str
+  policy: BehaviorPolicy | None
+  route_ids: tuple[str, ...]
+  metrics: tuple[PolicyMetric, ...]
+
+  def __post_init__(self) -> None:
+    if not self.artifact_identity.strip():
+      raise ValueError("artifact_identity must not be empty")
+    if not self.route_ids or tuple(sorted(set(self.route_ids))) != self.route_ids:
+      raise ValueError("route_ids must be non-empty, unique, and sorted")
+    names = tuple(metric.name for metric in self.metrics)
+    if not names or len(set(names)) != len(names):
+      raise ValueError("policy evaluation metrics must be non-empty and unique")
+
+  def metric(self, name: str) -> PolicyMetric:
+    try:
+      return next(metric for metric in self.metrics if metric.name == name)
+    except StopIteration as exc:
+      raise ValueError(f"evaluation lacks metric {name}") from exc
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "artifactIdentity": self.artifact_identity,
+      "metrics": [metric.to_dict() for metric in sorted(self.metrics, key=lambda metric: metric.name)],
+      "policy": None if self.policy is None else self.policy.to_dict(),
+      "routeIds": list(self.route_ids),
+    }
+
+  def to_json(self) -> str:
+    return canonical_json(self.to_dict())
+
+  @property
+  def sha256(self) -> str:
+    return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+  @classmethod
+  def from_dict(cls, payload: object) -> PolicyEvaluation:
+    keys = frozenset(("artifactIdentity", "metrics", "policy", "routeIds"))
+    if type(payload) is not dict or frozenset(payload) != keys:
+      raise ValueError("policy evaluation keys do not match schema")
+    route_ids = payload["routeIds"]
+    metrics = payload["metrics"]
+    if type(payload["artifactIdentity"]) is not str:
+      raise ValueError("policy evaluation artifact identity must be text")
+    if type(route_ids) is not list or any(type(value) is not str for value in route_ids):
+      raise ValueError("policy evaluation routeIds must be a text array")
+    if type(metrics) is not list:
+      raise ValueError("policy evaluation metrics must be an array")
+    policy_payload = payload["policy"]
+    policy = None
+    if policy_payload is not None:
+      if type(policy_payload) is not dict or frozenset(policy_payload) != {
+        "dampingRatio",
+        "naturalFrequencyPerS",
+      }:
+        raise ValueError("policy evaluation behavior policy keys do not match schema")
+      if any(type(value) not in (int, float) for value in policy_payload.values()):
+        raise ValueError("policy evaluation behavior policy values must be numeric")
+      policy = BehaviorPolicy(
+        natural_frequency_per_s=float(policy_payload["naturalFrequencyPerS"]),
+        damping_ratio=float(policy_payload["dampingRatio"]),
+      )
+    return cls(
+      artifact_identity=payload["artifactIdentity"],
+      policy=policy,
+      route_ids=tuple(route_ids),
+      metrics=tuple(PolicyMetric.from_dict(value) for value in metrics),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MetricGateRule:
+  """Explicit physical bound, comparison uncertainty, and normalization."""
+
+  metric_name: str
+  contract: BehaviorContract
+  preference: MetricPreference
+  noise_floor: float
+  margin_normalization: float
+  minimum_allowed: float | None
+  maximum_allowed: float | None
+  minimum_route_count: int
+  minimum_window_count: int
+  minimum_weighted_support: float
+  required_strata: tuple[str, ...]
+
+  def __post_init__(self) -> None:
+    try:
+      expected_contract = behavior_metric_contract(self.metric_name)
+    except ValueError as exc:
+      raise ValueError("gate metric is not registered") from exc
+    if self.contract is not expected_contract:
+      raise ValueError("gate metric assigned to the wrong behavior contract")
+    if not math.isfinite(self.noise_floor) or self.noise_floor < 0.0:
+      raise ValueError("metric noise floor must be finite and non-negative")
+    if not math.isfinite(self.margin_normalization) or self.margin_normalization <= 0.0:
+      raise ValueError("metric margin normalization must be finite and positive")
+    for value in (self.minimum_allowed, self.maximum_allowed):
+      if value is not None and not math.isfinite(value):
+        raise ValueError("metric bounds must be finite when present")
+    if (
+      self.minimum_allowed is not None
+      and self.maximum_allowed is not None
+      and self.minimum_allowed > self.maximum_allowed
+    ):
+      raise ValueError("metric bounds are inverted")
+    if self.minimum_route_count <= 0 or self.minimum_window_count <= 0:
+      raise ValueError("metric coverage counts must be positive")
+    if (
+      not math.isfinite(self.minimum_weighted_support)
+      or self.minimum_weighted_support <= 0.0
+    ):
+      raise ValueError("minimum weighted support must be finite and positive")
+    if not self.required_strata or tuple(sorted(set(self.required_strata))) != self.required_strata:
+      raise ValueError("required strata must be non-empty, unique, and sorted")
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "contract": self.contract.value,
+      "marginNormalization": self.margin_normalization,
+      "maximumAllowed": self.maximum_allowed,
+      "metricName": self.metric_name,
+      "minimumAllowed": self.minimum_allowed,
+      "minimumRouteCount": self.minimum_route_count,
+      "minimumWindowCount": self.minimum_window_count,
+      "minimumWeightedSupport": self.minimum_weighted_support,
+      "noiseFloor": self.noise_floor,
+      "preference": self.preference.value,
+      "requiredStrata": list(self.required_strata),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class PairedRouteUncertainty:
+  """Observed envelope of preference-normalized whole-route deltas."""
+
+  route_ids: tuple[str, ...]
+  mean: float
+  uncertainty: float
+  lower: float
+  upper: float
+  tolerance: float
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "lower": self.lower,
+      "mean": self.mean,
+      "routeCount": len(self.route_ids),
+      "routeIds": list(self.route_ids),
+      "tolerance": self.tolerance,
+      "uncertainty": self.uncertainty,
+      "upper": self.upper,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class MetricGateVerdict:
+  metric_name: str
+  contract: BehaviorContract
+  passed: bool
+  margin: float | None
+  reasons: tuple[str, ...]
+  paired_against_stock: PairedRouteUncertainty | None = None
+  paired_against_accepted: PairedRouteUncertainty | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContractGateVerdict:
+  contract: BehaviorContract
+  passed: bool
+  margin: float | None
+  metrics: tuple[MetricGateVerdict, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateGateVerdict:
+  candidate: PolicyCandidate
+  passed: bool
+  target_metric_name: str
+  target_improvement: float | None
+  target_noise_floor: float
+  target_materially_improved: bool
+  worst_contract_margin: float | None
+  contracts: tuple[ContractGateVerdict, ...]
+  route_ids: tuple[str, ...]
+  candidate_evaluation_sha256: str
+  exact_stock_evaluation_sha256: str
+  accepted_evaluation_sha256: str
+  gate_spec_sha256: str
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "candidate": {
+        "canonicalIndex": self.candidate.canonical_index,
+        "squaredLogDisplacement": self.candidate.squared_log_displacement,
+        "policy": self.candidate.policy.to_dict(),
+      },
+      "candidateEvaluationSha256": self.candidate_evaluation_sha256,
+      "contracts": [
+        {
+          "contract": contract.contract.value,
+          "margin": contract.margin,
+          "metrics": [
+            {
+              "contract": metric.contract.value,
+              "margin": metric.margin,
+              "metricName": metric.metric_name,
+              "pairedAgainstAccepted": (
+                None
+                if metric.paired_against_accepted is None
+                else metric.paired_against_accepted.to_dict()
+              ),
+              "pairedAgainstStock": (
+                None
+                if metric.paired_against_stock is None
+                else metric.paired_against_stock.to_dict()
+              ),
+              "passed": metric.passed,
+              "reasons": list(metric.reasons),
+            }
+            for metric in contract.metrics
+          ],
+          "passed": contract.passed,
+        }
+        for contract in self.contracts
+      ],
+      "passed": self.passed,
+      "acceptedEvaluationSha256": self.accepted_evaluation_sha256,
+      "exactStockEvaluationSha256": self.exact_stock_evaluation_sha256,
+      "gateSpecSha256": self.gate_spec_sha256,
+      "routeIds": list(self.route_ids),
+      "targetImprovement": self.target_improvement,
+      "targetMateriallyImproved": self.target_materially_improved,
+      "targetMetricName": self.target_metric_name,
+      "targetNoiseFloor": self.target_noise_floor,
+      "worstContractMargin": self.worst_contract_margin,
+    }
+
+
+def _paired_route_uncertainty(
+  candidate: PolicyMetric,
+  reference: PolicyMetric,
+  preference: MetricPreference,
+  method: str,
+  minimum_paired_route_count: int,
+) -> tuple[PairedRouteUncertainty | None, str | None]:
+  if method != PAIRED_ROUTE_UNCERTAINTY_METHOD:
+    return None, "paired_uncertainty_method_unsupported"
+  candidate_values = candidate.route_values_by_id
+  reference_values = reference.route_values_by_id
+  if tuple(candidate_values) != tuple(reference_values):
+    return None, "paired_route_values_mismatch"
+  route_ids = tuple(candidate_values)
+  if len(route_ids) < minimum_paired_route_count:
+    return None, "paired_route_count_below_minimum"
+  deltas: list[float] = []
+  tolerances: list[float] = []
+  for route_id in route_ids:
+    candidate_value = candidate_values[route_id]
+    reference_value = reference_values[route_id]
+    delta = (
+      reference_value - candidate_value
+      if preference is MetricPreference.LOWER_IS_BETTER
+      else candidate_value - reference_value
+    )
+    tolerance = (
+      64.0
+      * sys.float_info.epsilon
+      * max(abs(candidate_value), abs(reference_value), 1.0)
+    )
+    if abs(delta) <= tolerance:
+      delta = 0.0
+    deltas.append(delta)
+    tolerances.append(tolerance)
+  mean = math.fsum(deltas) / len(deltas)
+  uncertainty = max(abs(delta - mean) for delta in deltas)
+  return PairedRouteUncertainty(
+    route_ids=route_ids,
+    mean=mean,
+    uncertainty=uncertainty,
+    lower=mean - uncertainty,
+    upper=mean + uncertainty,
+    tolerance=max(tolerances),
+  ), None
+
+
+def _metric_margin(
+  candidate: PolicyMetric,
+  stock: PolicyMetric,
+  accepted: PolicyMetric,
+  rule: MetricGateRule,
+  paired_uncertainty_method: str,
+  minimum_paired_route_count: int,
+) -> MetricGateVerdict:
+  reasons: list[str] = []
+  if candidate.physical_failure_window_ids:
+    reasons.extend(
+      f"candidate_physical_unscoreable:{window_id}"
+      for window_id in candidate.physical_failure_window_ids
+    )
+  identities = {
+    candidate.coverage_identity_sha256,
+    stock.coverage_identity_sha256,
+    accepted.coverage_identity_sha256,
+  }
+  if len(identities) != 1:
+    reasons.append("candidate_reference_coverage_mismatch")
+  for label, metric in (
+    ("candidate", candidate),
+    ("stock", stock),
+    ("accepted", accepted),
+  ):
+    if metric.route_count < rule.minimum_route_count:
+      reasons.append(f"{label}_route_coverage_below_minimum")
+    if metric.window_count < rule.minimum_window_count:
+      reasons.append(f"{label}_window_coverage_below_minimum")
+    if metric.weighted_support < rule.minimum_weighted_support:
+      reasons.append(f"{label}_weighted_support_below_minimum")
+    missing_strata = tuple(sorted(set(rule.required_strata) - set(metric.strata)))
+    reasons.extend(f"{label}_missing_required_stratum:{value}" for value in missing_strata)
+  if reasons:
+    return MetricGateVerdict(
+      metric_name=rule.metric_name,
+      contract=rule.contract,
+      passed=False,
+      margin=None,
+      reasons=tuple(reasons),
+    )
+  if not candidate.defined:
+    return MetricGateVerdict(
+      metric_name=rule.metric_name,
+      contract=rule.contract,
+      passed=False,
+      margin=None,
+      reasons=("candidate_metric_undefined", *candidate.exclusions),
+    )
+  if not stock.defined or not accepted.defined:
+    missing = (
+      *(("stock_metric_undefined",) if not stock.defined else ()),
+      *(("accepted_metric_undefined",) if not accepted.defined else ()),
+    )
+    return MetricGateVerdict(
+      metric_name=rule.metric_name,
+      contract=rule.contract,
+      passed=False,
+      margin=None,
+      reasons=missing,
+    )
+  assert candidate.value is not None
+  assert stock.value is not None
+  assert accepted.value is not None
+  stock_pair, stock_pair_error = _paired_route_uncertainty(
+    candidate,
+    stock,
+    rule.preference,
+    paired_uncertainty_method,
+    minimum_paired_route_count,
+  )
+  accepted_pair, accepted_pair_error = _paired_route_uncertainty(
+    candidate,
+    accepted,
+    rule.preference,
+    paired_uncertainty_method,
+    minimum_paired_route_count,
+  )
+  if stock_pair_error is not None:
+    reasons.append(f"stock_{stock_pair_error}")
+  if accepted_pair_error is not None:
+    reasons.append(f"accepted_{accepted_pair_error}")
+  if reasons:
+    return MetricGateVerdict(
+      metric_name=rule.metric_name,
+      contract=rule.contract,
+      passed=False,
+      margin=None,
+      reasons=tuple(reasons),
+      paired_against_stock=stock_pair,
+      paired_against_accepted=accepted_pair,
+    )
+  assert stock_pair is not None
+  assert accepted_pair is not None
+  margins: list[float] = []
+  if rule.minimum_allowed is not None:
+    margins.append((candidate.value - rule.minimum_allowed) / rule.margin_normalization)
+    if candidate.value < rule.minimum_allowed:
+      reasons.append("below_absolute_minimum")
+  if rule.maximum_allowed is not None:
+    margins.append((rule.maximum_allowed - candidate.value) / rule.margin_normalization)
+    if candidate.value > rule.maximum_allowed:
+      reasons.append("above_absolute_maximum")
+  for label, paired in (("stock", stock_pair), ("accepted", accepted_pair)):
+    comparison = paired.lower + rule.noise_floor
+    margins.append(comparison / rule.margin_normalization)
+    if paired.lower < -rule.noise_floor:
+      reasons.append(f"regressed_vs_{label}")
+  margin = min(margins) if margins else 0.0
+  return MetricGateVerdict(
+    metric_name=rule.metric_name,
+    contract=rule.contract,
+    passed=not reasons,
+    margin=margin,
+    reasons=tuple(reasons),
+    paired_against_stock=stock_pair,
+    paired_against_accepted=accepted_pair,
+  )
+
+
+def evaluate_candidate(
+  candidate: PolicyCandidate,
+  candidate_evaluation: PolicyEvaluation,
+  exact_stock_evaluation: PolicyEvaluation,
+  accepted_evaluation: PolicyEvaluation,
+  rules: tuple[MetricGateRule, ...],
+  target_metric_name: str,
+  paired_uncertainty_method: str,
+  minimum_paired_route_count: int,
+) -> CandidateGateVerdict:
+  """Evaluate three non-tradeable contracts against both reference artifacts."""
+  if paired_uncertainty_method != PAIRED_ROUTE_UNCERTAINTY_METHOD:
+    raise ValueError("paired route uncertainty method is unsupported")
+  if minimum_paired_route_count < 2:
+    raise ValueError("paired route uncertainty requires at least two routes")
+  if candidate_evaluation.policy != candidate.policy:
+    raise ValueError("candidate evaluation policy identity mismatch")
+  if not (
+    candidate_evaluation.route_ids
+    == exact_stock_evaluation.route_ids
+    == accepted_evaluation.route_ids
+  ):
+    raise ValueError("candidate and references must use the same route partition")
+  if len({rule.metric_name for rule in rules}) != len(rules):
+    raise ValueError("gate rule metric names must be unique")
+  if {rule.contract for rule in rules} != set(BehaviorContract):
+    raise ValueError("every Smooth/Swift/Strong contract needs at least one rule")
+  ordered_rules = tuple(sorted(rules, key=lambda rule: rule.metric_name))
+  target_rules = tuple(rule for rule in ordered_rules if rule.metric_name == target_metric_name)
+  if len(target_rules) != 1:
+    raise ValueError("declared target must identify exactly one gate rule")
+
+  metric_verdicts = tuple(
+    _metric_margin(
+      candidate_evaluation.metric(rule.metric_name),
+      exact_stock_evaluation.metric(rule.metric_name),
+      accepted_evaluation.metric(rule.metric_name),
+      rule,
+      paired_uncertainty_method,
+      minimum_paired_route_count,
+    )
+    for rule in ordered_rules
+  )
+  contract_verdicts: list[ContractGateVerdict] = []
+  for contract in BehaviorContract:
+    metrics = tuple(verdict for verdict in metric_verdicts if verdict.contract is contract)
+    finite_margins = tuple(metric.margin for metric in metrics if metric.margin is not None)
+    contract_verdicts.append(ContractGateVerdict(
+      contract=contract,
+      passed=all(metric.passed for metric in metrics),
+      margin=min(finite_margins) if len(finite_margins) == len(metrics) else None,
+      metrics=metrics,
+    ))
+
+  target_rule = target_rules[0]
+  target_verdict = next(
+    verdict
+    for verdict in metric_verdicts
+    if verdict.metric_name == target_metric_name
+  )
+  target_improvement: float | None = None
+  target_material = False
+  if target_verdict.paired_against_accepted is not None:
+    target_improvement = target_verdict.paired_against_accepted.mean
+    target_material = (
+      target_verdict.paired_against_accepted.lower
+      > target_rule.noise_floor
+    )
+  contract_margins = tuple(
+    contract.margin
+    for contract in contract_verdicts
+    if contract.margin is not None
+  )
+  worst_margin = (
+    min(contract_margins)
+    if len(contract_margins) == len(contract_verdicts)
+    else None
+  )
+  if target_improvement is not None and worst_margin is not None:
+    assert target_verdict.paired_against_accepted is not None
+    worst_margin = min(
+      worst_margin,
+      (
+        target_verdict.paired_against_accepted.lower
+        - target_rule.noise_floor
+      ) / target_rule.margin_normalization,
+    )
+  passed = all(contract.passed for contract in contract_verdicts) and target_material
+  gate_spec_sha256 = hashlib.sha256(canonical_json({
+    "rules": [rule.to_dict() for rule in ordered_rules],
+    "minimumPairedRouteCount": minimum_paired_route_count,
+    "pairedUncertaintyMethod": paired_uncertainty_method,
+    "targetMetricName": target_metric_name,
+  }).encode("utf-8")).hexdigest()
+  return CandidateGateVerdict(
+    candidate=candidate,
+    passed=passed,
+    target_metric_name=target_metric_name,
+    target_improvement=target_improvement,
+    target_noise_floor=target_rule.noise_floor,
+    target_materially_improved=target_material,
+    worst_contract_margin=worst_margin,
+    contracts=tuple(contract_verdicts),
+    route_ids=candidate_evaluation.route_ids,
+    candidate_evaluation_sha256=candidate_evaluation.sha256,
+    exact_stock_evaluation_sha256=exact_stock_evaluation.sha256,
+    accepted_evaluation_sha256=accepted_evaluation.sha256,
+    gate_spec_sha256=gate_spec_sha256,
+  )
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingSelection:
+  training_route_ids: tuple[str, ...]
+  winner: PolicyCandidate
+  winner_verdict: CandidateGateVerdict
+  all_verdicts: tuple[CandidateGateVerdict, ...]
+  candidate_grid_sha256: str
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "allVerdicts": [verdict.to_dict() for verdict in self.all_verdicts],
+      "candidateGridSha256": self.candidate_grid_sha256,
+      "trainingRouteIds": list(self.training_route_ids),
+      "winnerCanonicalIndex": self.winner.canonical_index,
+      "winnerPolicy": self.winner.policy.to_dict(),
+      "winnerVerdict": self.winner_verdict.to_dict(),
+    }
+
+  def to_json(self) -> str:
+    return canonical_json(self.to_dict())
+
+  @property
+  def sha256(self) -> str:
+    return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+
+def _required_margin(verdict: CandidateGateVerdict) -> float:
+  if verdict.worst_contract_margin is None:
+    raise AssertionError("a passing candidate must have a defined gate margin")
+  return verdict.worst_contract_margin
+
+
+def select_training_winner(
+  grid: tuple[PolicyCandidate, ...],
+  candidate_evaluations: Iterable[PolicyEvaluation],
+  exact_stock_evaluation: PolicyEvaluation,
+  accepted_evaluation: PolicyEvaluation,
+  rules: tuple[MetricGateRule, ...],
+  target_metric_name: str,
+  paired_uncertainty_method: str,
+  minimum_paired_route_count: int,
+) -> TrainingSelection | None:
+  """Freeze one training winner using canonical, fully deterministic ties."""
+  evaluations = tuple(candidate_evaluations)
+  evaluation_by_policy = {
+    evaluation.policy: evaluation
+    for evaluation in evaluations
+  }
+  if len(evaluation_by_policy) != len(evaluations):
+    raise ValueError("candidate evaluations contain duplicate policy identities")
+  if None in evaluation_by_policy:
+    raise ValueError("candidate evaluations must identify their policy")
+  if set(evaluation_by_policy) != {candidate.policy for candidate in grid}:
+    raise ValueError("candidate evaluations must cover the exact bounded grid")
+  verdicts = tuple(
+    evaluate_candidate(
+      candidate,
+      evaluation_by_policy[candidate.policy],
+      exact_stock_evaluation,
+      accepted_evaluation,
+      rules,
+      target_metric_name,
+      paired_uncertainty_method,
+      minimum_paired_route_count,
+    )
+    for candidate in grid
+  )
+  passing = tuple(verdict for verdict in verdicts if verdict.passed)
+  if not passing:
+    return None
+  winner_verdict = min(
+    passing,
+    key=lambda verdict: (
+      -_required_margin(verdict),
+      verdict.candidate.squared_log_displacement,
+      verdict.candidate.canonical_index,
+    ),
+  )
+  return TrainingSelection(
+    training_route_ids=exact_stock_evaluation.route_ids,
+    winner=winner_verdict.candidate,
+    winner_verdict=winner_verdict,
+    all_verdicts=verdicts,
+    candidate_grid_sha256=hashlib.sha256(canonical_json([
+      {
+        "canonicalIndex": candidate.canonical_index,
+        "squaredLogDisplacement": candidate.squared_log_displacement,
+        "policy": candidate.policy.to_dict(),
+      }
+      for candidate in grid
+    ]).encode("utf-8")).hexdigest(),
+  )
+
+
+@dataclass(frozen=True, slots=True)
+class HeldOutValidation:
+  selection_sha256: str
+  validation_route_ids: tuple[str, ...]
+  accepted: bool
+  frozen_winner_verdict: CandidateGateVerdict
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "accepted": self.accepted,
+      "frozenWinnerVerdict": self.frozen_winner_verdict.to_dict(),
+      "selectionSha256": self.selection_sha256,
+      "validationRouteIds": list(self.validation_route_ids),
+    }
+
+  def to_json(self) -> str:
+    return canonical_json(self.to_dict())
+
+
+def validate_frozen_winner(
+  selection: TrainingSelection,
+  frozen_winner_evaluation: PolicyEvaluation,
+  exact_stock_evaluation: PolicyEvaluation,
+  accepted_evaluation: PolicyEvaluation,
+  rules: tuple[MetricGateRule, ...],
+  target_metric_name: str,
+  paired_uncertainty_method: str,
+  minimum_paired_route_count: int,
+) -> HeldOutValidation:
+  """Accept or reject only the training winner on disjoint held-out routes."""
+  validation_routes = frozen_winner_evaluation.route_ids
+  if set(selection.training_route_ids) & set(validation_routes):
+    raise ValueError("training and held-out routes must be disjoint")
+  if frozen_winner_evaluation.policy != selection.winner.policy:
+    raise ValueError("held-out evaluation is not the frozen training winner")
+  verdict = evaluate_candidate(
+    selection.winner,
+    frozen_winner_evaluation,
+    exact_stock_evaluation,
+    accepted_evaluation,
+    rules,
+    target_metric_name,
+    paired_uncertainty_method,
+    minimum_paired_route_count,
+  )
+  return HeldOutValidation(
+    selection_sha256=selection.sha256,
+    validation_route_ids=validation_routes,
+    accepted=verdict.passed,
+    frozen_winner_verdict=verdict,
+  )

@@ -14,14 +14,17 @@ by a same-direction rate quantum. Later moving rows identify kinetic motion.
 
 Inputs are the measured-only :class:`learner.LearningSample`. Slew build and
 release frames are authority evidence but never equality-fit. Evidence schema
-6 is deliberately incompatible with schema 5 because older evidence has no
-whole-route partition or physical breakaway episodes.
+8 is deliberately incompatible with older evidence because route uncertainty
+is bound to immutable route/content identities as well as per-route sufficient
+statistics. The route boundary, rather than individual
+100 Hz samples, is the uncertainty unit used by selection and validation.
 
 The inverse map is selected from a deterministic nested family. Every model
-is fit on training routes only and must be no worse than the seed in every
-training stratum; a denser population can therefore never buy improvement by
-sacrificing rare breakaway evidence. The selected model is then checked once
-against wholly held-out routes. Validation never participates in selection.
+is fit on training routes only and must clear the paired whole-route loss
+envelope in every training stratum; a denser population can therefore never
+buy improvement by sacrificing rare breakaway evidence. The selected model is
+then frozen and checked once against wholly held-out routes. Validation never
+participates in selection or fallback choice.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ import hashlib
 import hmac
 import json
 import math
+import sys
 from typing import Any
 
 from openpilot.selfdrive.controls.lib.blatv2.breakaway_episode import (
@@ -55,12 +59,15 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 6
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 8
 MIN_VALIDATION_SUPPORT_FRACTION = 0.20
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_STRATUM_VALIDATION_ROWS = 4
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
-VALIDATION_RMS_ABSOLUTE_TOLERANCE = 1e-12
+# Floating-point cancellation guard only. Physical acceptance uses the
+# route-level paired uncertainty interval implemented below.
+NUMERICAL_LOSS_EPSILON_MULTIPLIER = 64.0
+FIT_CONDITION_LIMIT = 1.0 / math.sqrt(sys.float_info.epsilon)
 
 
 class CalibrationModelId(StrEnum):
@@ -72,17 +79,54 @@ class CalibrationModelId(StrEnum):
 
 class CalibrationQualificationReason(StrEnum):
   QUALIFIED = "qualified"
+  LEARNED = "learned"
+  SEED_RETAINED = "seed_retained"
   INSUFFICIENT_SUPPORT = "insufficient_support"
   INSUFFICIENT_VALIDATION = "insufficient_validation"
   INSUFFICIENT_EXCITATION = "insufficient_excitation"
   INSUFFICIENT_MOVING_EVIDENCE = "insufficient_moving_evidence"
   INSUFFICIENT_BREAKAWAY_EVIDENCE = "insufficient_breakaway_evidence"
+  RANK_DEFICIENT_FIT = "rank_deficient_fit"
+  ILL_CONDITIONED_FIT = "ill_conditioned_fit"
   SINGULAR_FIT = "singular_fit"
   INVALID_PARAMETERS = "invalid_parameters"
+  VALIDATION_INCONCLUSIVE = "validation_inconclusive"
   VALIDATION_REGRESSION = "validation_regression"
   MOVING_VALIDATION_REGRESSION = "moving_validation_regression"
   BREAKAWAY_VALIDATION_REGRESSION = "breakaway_validation_regression"
   AUTHORITY_VALIDATION_REGRESSION = "authority_validation_regression"
+  INTERPOLATION_TRAINING_INCONCLUSIVE = "interpolation_training_inconclusive"
+  INTERPOLATION_TRAINING_REGRESSION = "interpolation_training_regression"
+  INTERPOLATION_VALIDATION_INCONCLUSIVE = "interpolation_validation_inconclusive"
+  INTERPOLATION_VALIDATION_REGRESSION = "interpolation_validation_regression"
+
+
+class CalibrationFitStatus(StrEnum):
+  IDENTIFIABLE = "identifiable"
+  RANK_DEFICIENT = "rank_deficient"
+  ILL_CONDITIONED = "ill_conditioned"
+  NO_SOLUTION = "no_solution"
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationModelFitDiagnostic:
+  model: CalibrationModelId
+  status: CalibrationFitStatus
+  moving_rank: int
+  moving_parameter_count: int
+  condition_estimate: float | None
+  breakaway_rank: int
+  breakaway_parameter_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationPairedLossDiagnostic:
+  route_count: int
+  mean_candidate_minus_seed_mse: float | None
+  uncertainty_mse: float | None
+  lower_bound_mse: float | None
+  upper_bound_mse: float | None
+  numerical_tolerance_mse: float | None
 
 
 class _Regression:
@@ -115,6 +159,12 @@ class _Regression:
       error = 0.0
     return None if error < 0.0 or not math.isfinite(error) else math.sqrt(error / self.weight_s)
 
+  def mse(self, coefficients: tuple[float, float, float, float]) -> float | None:
+    error = _weighted_error(self, coefficients)
+    if error is None or self.weight_s <= 0.0:
+      return None
+    return error / self.weight_s
+
   def encoded(self) -> dict[str, Any]:
     return {
       "count": self.count,
@@ -142,6 +192,171 @@ class _Regression:
     if result.count == 0 and any(value != 0.0 for value in (*normal, *rhs, result.target_squared)):
       raise ValueError(f"{context} empty statistics are nonzero")
     return result
+
+
+class _JointRegression:
+  """Sufficient statistics for the exact runtime interpolation interval.
+
+  Runtime interpolates gain and lateral-acceleration offset independently,
+  then multiplies them in ``gain * (-lataccel + offset)``.  The resulting
+  offset torque is quadratic in speed weight; linearly interpolating the four
+  regression coefficients would therefore validate a controller that does
+  not exist.  Ten expanded predictors retain the exact endpoint monomials
+  ``g0``, ``g1``, ``g0*o0``, ``g0*o1``, ``g1*o0``, ``g1*o1``, plus the two
+  endpoint values for moving and static friction.  This is profile validation,
+  not a joint constrained fitter: endpoint models remain independently fit
+  and any incoherent runtime interpolation is rejected.
+  """
+
+  __slots__ = ("normal", "rhs", "target_squared", "weight_s", "count")
+
+  def __init__(self) -> None:
+    self.normal = [0.0] * 100
+    self.rhs = [0.0] * 10
+    self.target_squared = 0.0
+    self.weight_s = 0.0
+    self.count = 0
+
+  def add(
+    self,
+    x: tuple[float, float, float, float],
+    y: float,
+    weight: float,
+    upper_weight: float,
+  ) -> None:
+    lower_weight = 1.0 - upper_weight
+    cross_weight = lower_weight * upper_weight
+    predictors = (
+      lower_weight * x[0],
+      upper_weight * x[0],
+      lower_weight * lower_weight * x[1],
+      cross_weight * x[1],
+      cross_weight * x[1],
+      upper_weight * upper_weight * x[1],
+      lower_weight * x[2],
+      upper_weight * x[2],
+      lower_weight * x[3],
+      upper_weight * x[3],
+    )
+    for row in range(10):
+      self.rhs[row] += weight * predictors[row] * y
+      for column in range(10):
+        self.normal[row * 10 + column] += (
+          weight * predictors[row] * predictors[column]
+        )
+    self.target_squared += weight * y * y
+    self.weight_s += weight
+    self.count += 1
+
+  def mse(
+    self,
+    lower: CalibrationParameters,
+    upper: CalibrationParameters,
+  ) -> float | None:
+    if self.weight_s <= 0.0:
+      return None
+    coefficients = (
+      lower.torque_per_lateral_accel,
+      upper.torque_per_lateral_accel,
+      lower.torque_per_lateral_accel
+      * lower.lateral_accel_offset_correction_mps2,
+      lower.torque_per_lateral_accel
+      * upper.lateral_accel_offset_correction_mps2,
+      upper.torque_per_lateral_accel
+      * lower.lateral_accel_offset_correction_mps2,
+      upper.torque_per_lateral_accel
+      * upper.lateral_accel_offset_correction_mps2,
+      lower.kinetic_friction_torque,
+      upper.kinetic_friction_torque,
+      lower.static_breakaway_torque,
+      upper.static_breakaway_torque,
+    )
+    linear = sum(coefficients[index] * self.rhs[index] for index in range(10))
+    quadratic = sum(
+      coefficients[row]
+      * self.normal[row * 10 + column]
+      * coefficients[column]
+      for row in range(10)
+      for column in range(10)
+    )
+    error = self.target_squared - 2.0 * linear + quadratic
+    scale = max(self.target_squared, quadratic, 1.0)
+    if error < 0.0 and abs(error) <= 1e-12 * scale:
+      error = 0.0
+    return (
+      error / self.weight_s
+      if error >= 0.0 and math.isfinite(error)
+      else None
+    )
+
+  def encoded(self) -> dict[str, Any]:
+    return {
+      "count": self.count,
+      "normal": [value.hex() for value in self.normal],
+      "rhs": [value.hex() for value in self.rhs],
+      "target_squared": self.target_squared.hex(),
+      "weight_s": self.weight_s.hex(),
+    }
+
+  @classmethod
+  def decoded(cls, raw: object, context: str) -> _JointRegression:
+    payload = _exact(
+      raw,
+      {"count", "normal", "rhs", "target_squared", "weight_s"},
+      context,
+    )
+    if type(payload["count"]) is not int or payload["count"] < 0:
+      raise ValueError(f"{context}.count is invalid")
+    result = cls()
+    result.count = payload["count"]
+    result.normal[:] = _hex_list(payload["normal"], 100, f"{context}.normal")
+    result.rhs[:] = _hex_list(payload["rhs"], 10, f"{context}.rhs")
+    result.target_squared = _hex(
+      payload["target_squared"], f"{context}.target_squared"
+    )
+    result.weight_s = _hex(payload["weight_s"], f"{context}.weight_s")
+    if (
+      result.target_squared < 0.0
+      or result.weight_s < 0.0
+      or (result.count > 0) != (result.weight_s > 0.0)
+    ):
+      raise ValueError(f"{context} has inconsistent support")
+    if result.count == 0 and any(
+      value != 0.0
+      for value in (*result.normal, *result.rhs, result.target_squared)
+    ):
+      raise ValueError(f"{context} empty statistics are nonzero")
+    return result
+
+
+class _RouteNodeRegressions:
+  __slots__ = (
+    "training",
+    "moving_training",
+    "breakaway_training",
+    "breakaway_episode_training",
+    "authority_training",
+  )
+
+  def __init__(self) -> None:
+    # Names retain their aggregate counterparts. The route's population is
+    # carried separately, so these are training or validation according to
+    # _RouteEvidence.validation.
+    self.training = _Regression()
+    self.moving_training = _Regression()
+    self.breakaway_training = _Regression()
+    self.breakaway_episode_training = _Regression()
+    self.authority_training = _Regression()
+
+
+@dataclass(slots=True)
+class _RouteEvidence:
+  route_index: int
+  route_identity_sha256: str
+  route_content_sha256: str
+  validation: bool
+  nodes: tuple[_RouteNodeRegressions, ...]
+  intervals: tuple[_JointRegression, ...]
 
 
 def _combine(*parts: _Regression) -> _Regression:
@@ -342,6 +557,36 @@ class CalibrationNodeQualificationReport:
   breakaway_episode_seed_validation_rms: float | None = None
   breakaway_episode_candidate_validation_rms: float | None = None
   breakaway_mean_bracket_width: float | None = None
+  fit_diagnostics: tuple[CalibrationModelFitDiagnostic, ...] = ()
+  training_paired_loss: CalibrationPairedLossDiagnostic | None = None
+  validation_paired_loss: CalibrationPairedLossDiagnostic | None = None
+  training_outcome: CalibrationQualificationReason | None = None
+
+  @property
+  def qualified(self) -> bool:
+    return self.reasons in (
+      (CalibrationQualificationReason.QUALIFIED,),
+      (CalibrationQualificationReason.LEARNED,),
+      (CalibrationQualificationReason.SEED_RETAINED,),
+    )
+
+  @property
+  def learned(self) -> bool:
+    return self.reasons == (CalibrationQualificationReason.LEARNED,)
+
+  @property
+  def seed_retained(self) -> bool:
+    return self.reasons == (CalibrationQualificationReason.SEED_RETAINED,)
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationInterpolationQualificationReport:
+  interval_index: int
+  lower_speed_mps: float
+  upper_speed_mps: float
+  training_paired_loss: CalibrationPairedLossDiagnostic
+  validation_paired_loss: CalibrationPairedLossDiagnostic
+  reasons: tuple[CalibrationQualificationReason, ...]
 
   @property
   def qualified(self) -> bool:
@@ -352,10 +597,25 @@ class CalibrationNodeQualificationReport:
 class CalibrationLearningResult:
   node_reports: tuple[CalibrationNodeQualificationReport, ...]
   candidate_profile: VehicleCalibrationProfile | None
+  interpolation_reports: tuple[
+    CalibrationInterpolationQualificationReport, ...
+  ] = ()
+  # The evidence-qualified physical map selected by training and held-out
+  # validation.  This exists for both learned and all-seed outcomes.  A
+  # separate ``candidate_profile`` exists only when a controller-affecting
+  # physical value changed, preserving the UI/artifact meaning of "new
+  # calibration" without throwing away the proof needed by behavior replay.
+  selected_profile: VehicleCalibrationProfile | None = None
 
   @property
   def all_nodes_qualified(self) -> bool:
-    return self.candidate_profile is not None
+    return all(report.qualified for report in self.node_reports) and all(
+      report.qualified for report in self.interpolation_reports
+    )
+
+  @property
+  def contains_learned_change(self) -> bool:
+    return any(report.learned for report in self.node_reports)
 
 
 def _canonical(payload: object) -> bytes:
@@ -443,6 +703,84 @@ def _solve_free_system(
         matrix[row][c] -= factor * matrix[column][c]
   answer = tuple(matrix[index][size] / scales[index] for index in range(size))
   return answer if all(math.isfinite(value) for value in answer) else None
+
+
+def _matrix_rank_and_condition(
+  evidence: _Regression,
+  free: tuple[int, ...],
+) -> tuple[int, float | None]:
+  """Return deterministic scaled rank and a pivot-ratio condition estimate.
+
+  This is diagnostic and eligibility logic only. No ridge term or other
+  regularization is permitted: an unidentifiable model must yield to a simpler
+  nested family, never be manufactured into identifiability.
+  """
+  size = len(free)
+  if size == 0:
+    return 0, 1.0
+  scales: list[float] = []
+  for index in free:
+    diagonal = evidence.normal[index * 4 + index]
+    if not math.isfinite(diagonal) or diagonal <= 0.0:
+      return 0, None
+    scales.append(math.sqrt(diagonal))
+  matrix = [
+    [
+      evidence.normal[row * 4 + column] / (scales[r] * scales[c])
+      for c, column in enumerate(free)
+    ]
+    for r, row in enumerate(free)
+  ]
+  pivots: list[float] = []
+  rank = 0
+  for column in range(size):
+    pivot = max(range(column, size), key=lambda row: abs(matrix[row][column]))
+    magnitude = abs(matrix[pivot][column])
+    if magnitude < NORMAL_MATRIX_RELATIVE_PIVOT_MIN:
+      continue
+    matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+    divisor = matrix[column][column]
+    pivots.append(abs(divisor))
+    rank += 1
+    for row in range(column + 1, size):
+      factor = matrix[row][column] / divisor
+      for c in range(column, size):
+        matrix[row][c] -= factor * matrix[column][c]
+  condition = None if not pivots else max(pivots) / min(pivots)
+  return rank, condition
+
+
+def _model_fit_diagnostic(
+  model: CalibrationModelId,
+  moving: _Regression,
+  episodes: _Regression,
+  free: tuple[int, ...],
+  solved: tuple[float, float, float, float] | None,
+) -> CalibrationModelFitDiagnostic:
+  moving_rank, condition = _matrix_rank_and_condition(moving, free)
+  moving_count = len(free)
+  breakaway_rank = int(
+    episodes.count > 0
+    and math.isfinite(episodes.normal[15])
+    and episodes.normal[15] > 0.0
+  )
+  if moving_rank < moving_count or breakaway_rank < 1:
+    status = CalibrationFitStatus.RANK_DEFICIENT
+  elif condition is not None and condition > FIT_CONDITION_LIMIT:
+    status = CalibrationFitStatus.ILL_CONDITIONED
+  elif solved is None:
+    status = CalibrationFitStatus.NO_SOLUTION
+  else:
+    status = CalibrationFitStatus.IDENTIFIABLE
+  return CalibrationModelFitDiagnostic(
+    model=model,
+    status=status,
+    moving_rank=moving_rank,
+    moving_parameter_count=moving_count,
+    condition_estimate=condition,
+    breakaway_rank=breakaway_rank,
+    breakaway_parameter_count=1,
+  )
 
 
 def _weighted_error(
@@ -665,30 +1003,183 @@ def _rms_vector(
   return tuple(values)
 
 
-def _safe_against(
-  candidate: tuple[float, ...],
-  comparator: tuple[float, ...],
+class _PairedLossVerdict(StrEnum):
+  IMPROVED = "improved"
+  NO_REGRESSION = "no_regression"
+  INCONCLUSIVE = "inconclusive"
+  REGRESSION = "regression"
+  NO_DATA = "no_data"
+
+
+def _loss_tolerance(candidate_mse: float, comparator_mse: float) -> float:
+  return (
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER
+    * sys.float_info.epsilon
+    * max(abs(candidate_mse), abs(comparator_mse), 1.0)
+  )
+
+
+def _paired_route_losses(
+  regressions: tuple[_Regression, ...],
+  candidate: tuple[float, float, float, float],
+  comparator: tuple[float, float, float, float],
+) -> CalibrationPairedLossDiagnostic:
+  deltas: list[float] = []
+  tolerance = 0.0
+  for evidence in regressions:
+    if evidence.count == 0:
+      continue
+    candidate_mse = evidence.mse(candidate)
+    comparator_mse = evidence.mse(comparator)
+    if candidate_mse is None or comparator_mse is None:
+      continue
+    route_tolerance = _loss_tolerance(candidate_mse, comparator_mse)
+    tolerance = max(tolerance, route_tolerance)
+    delta = candidate_mse - comparator_mse
+    deltas.append(0.0 if abs(delta) <= route_tolerance else delta)
+  if not deltas:
+    return CalibrationPairedLossDiagnostic(0, None, None, None, None, None)
+  mean = math.fsum(deltas) / len(deltas)
+  if len(deltas) < 2:
+    uncertainty = None
+    lower = None
+    upper = None
+  else:
+    # The observed whole-route envelope is the uncertainty margin. It does not
+    # shrink merely because more correlated 100 Hz rows (or more similar
+    # routes) arrive, and it introduces no selected confidence multiplier.
+    # Thus a supported improvement must survive every observed route.
+    uncertainty = max(abs(delta - mean) for delta in deltas)
+    lower = mean - uncertainty
+    upper = mean + uncertainty
+  return CalibrationPairedLossDiagnostic(
+    len(deltas), mean, uncertainty, lower, upper, tolerance
+  )
+
+
+def _paired_loss_verdict(
+  diagnostic: CalibrationPairedLossDiagnostic,
   *,
+  identical: bool = False,
+) -> _PairedLossVerdict:
+  if identical:
+    return _PairedLossVerdict.NO_REGRESSION
+  if diagnostic.route_count == 0:
+    return _PairedLossVerdict.NO_DATA
+  if diagnostic.upper_bound_mse is None or diagnostic.lower_bound_mse is None:
+    return _PairedLossVerdict.INCONCLUSIVE
+  tolerance = diagnostic.numerical_tolerance_mse or 0.0
+  if diagnostic.lower_bound_mse > tolerance:
+    return _PairedLossVerdict.REGRESSION
+  if diagnostic.upper_bound_mse < -tolerance:
+    return _PairedLossVerdict.IMPROVED
+  if diagnostic.upper_bound_mse <= tolerance:
+    return _PairedLossVerdict.NO_REGRESSION
+  return _PairedLossVerdict.INCONCLUSIVE
+
+
+def _route_regressions_for_node(
+  routes: tuple[_RouteEvidence, ...],
+  node_index: int,
+  field: str,
+  *,
+  validation: bool,
+) -> tuple[_Regression, ...]:
+  result: list[_Regression] = []
+  for route in routes:
+    if route.validation != validation:
+      continue
+    route_node = route.nodes[node_index]
+    if field == "base_training":
+      regression = _subtract(
+        route_node.training,
+        route_node.moving_training,
+        route_node.breakaway_training,
+      )
+    else:
+      regression = getattr(route_node, field)
+    if regression.count > 0:
+      result.append(regression)
+  return tuple(result)
+
+
+def _safe_on_route_strata(
+  routes: tuple[_RouteEvidence, ...],
+  node_index: int,
+  fields: tuple[str, ...],
+  candidate: tuple[float, float, float, float],
+  comparator: tuple[float, float, float, float],
+  *,
+  validation: bool,
   require_improvement: bool,
-) -> bool:
-  if len(candidate) != len(comparator) or not candidate:
-    return False
-  no_regression = all(
-    value <= reference + VALIDATION_RMS_ABSOLUTE_TOLERANCE
-    for value, reference in zip(candidate, comparator, strict=True)
+) -> tuple[bool, tuple[CalibrationPairedLossDiagnostic, ...]]:
+  diagnostics = tuple(
+    _paired_route_losses(
+      _route_regressions_for_node(
+        routes, node_index, field, validation=validation
+      ),
+      candidate,
+      comparator,
+    )
+    for field in fields
   )
-  improved = any(
-    value < reference - VALIDATION_RMS_ABSOLUTE_TOLERANCE
-    for value, reference in zip(candidate, comparator, strict=True)
+  verdicts = tuple(
+    _paired_loss_verdict(
+      diagnostic,
+      identical=candidate == comparator,
+    )
+    for diagnostic in diagnostics
   )
-  return no_regression and (improved or not require_improvement)
+  if not diagnostics or any(
+    verdict in (
+      _PairedLossVerdict.REGRESSION,
+      _PairedLossVerdict.INCONCLUSIVE,
+      _PairedLossVerdict.NO_DATA,
+    )
+    for verdict in verdicts
+  ):
+    return False, diagnostics
+  improved = any(verdict is _PairedLossVerdict.IMPROVED for verdict in verdicts)
+  return improved or not require_improvement, diagnostics
 
 
-def _pareto_dominates(
-  candidate: tuple[float, ...],
-  incumbent: tuple[float, ...],
-) -> bool:
-  return _safe_against(candidate, incumbent, require_improvement=True)
+def _paired_joint_route_losses(
+  routes: tuple[_RouteEvidence, ...],
+  interval_index: int,
+  candidate_lower: CalibrationParameters,
+  candidate_upper: CalibrationParameters,
+  seed_lower: CalibrationParameters,
+  seed_upper: CalibrationParameters,
+  *,
+  validation: bool,
+) -> CalibrationPairedLossDiagnostic:
+  deltas: list[float] = []
+  tolerance = 0.0
+  for route in routes:
+    if route.validation != validation:
+      continue
+    evidence = route.intervals[interval_index]
+    if evidence.count == 0:
+      continue
+    candidate_mse = evidence.mse(candidate_lower, candidate_upper)
+    seed_mse = evidence.mse(seed_lower, seed_upper)
+    if candidate_mse is None or seed_mse is None:
+      continue
+    route_tolerance = _loss_tolerance(candidate_mse, seed_mse)
+    tolerance = max(tolerance, route_tolerance)
+    delta = candidate_mse - seed_mse
+    deltas.append(0.0 if abs(delta) <= route_tolerance else delta)
+  if not deltas:
+    return CalibrationPairedLossDiagnostic(0, None, None, None, None, None)
+  mean = math.fsum(deltas) / len(deltas)
+  if len(deltas) < 2:
+    uncertainty = lower = upper = None
+  else:
+    uncertainty = max(abs(delta - mean) for delta in deltas)
+    lower, upper = mean - uncertainty, mean + uncertainty
+  return CalibrationPairedLossDiagnostic(
+    len(deltas), mean, uncertainty, lower, upper, tolerance
+  )
 
 
 def minimum_calibration_support_s(speed_mps: float) -> float:
@@ -699,6 +1190,16 @@ def calibration_evidence_sha256(encoded: bytes) -> str:
   if type(encoded) is not bytes:
     raise TypeError("calibration evidence identity requires bytes")
   return hashlib.sha256(encoded).hexdigest()
+
+
+def _route_sha256(value: str, name: str) -> str:
+  if (
+    type(value) is not str
+    or len(value) != 64
+    or any(character not in "0123456789abcdef" for character in value)
+  ):
+    raise ValueError(f"calibration {name} must be lowercase SHA-256")
+  return value
 
 
 class CalibrationProfileLearner:
@@ -714,6 +1215,11 @@ class CalibrationProfileLearner:
     self._breakaway_detector = BreakawayEpisodeDetector()
     self._route_active = False
     self._route_validation = False
+    self._active_route_identity_sha256: str | None = None
+    self._active_route_content_sha256: str | None = None
+    self._routes: list[_RouteEvidence] = []
+    self._active_route_nodes: tuple[_RouteNodeRegressions, ...] | None = None
+    self._active_route_intervals: tuple[_JointRegression, ...] | None = None
 
   @property
   def speed_nodes_mps(self) -> tuple[float, ...]:
@@ -784,21 +1290,108 @@ class CalibrationProfileLearner:
       node.stationary_dwell_s = 0.0
       node.last_direction = 0
 
-  def begin_route(self, route_counter: int) -> None:
-    """Pin one complete route to one evidence population before decoding."""
+  def begin_route(
+    self,
+    route_identity_sha256: str,
+    route_content_sha256: str | None = None,
+  ) -> None:
+    """Pin one independent route identity before decoding any samples."""
     if self._route_active:
       raise RuntimeError("calibration learner route is already active")
-    if type(route_counter) is not int or route_counter < 0:
-      raise ValueError("calibration route counter must be nonnegative")
+    route_identity = _route_sha256(route_identity_sha256, "route identity")
+    route_content = _route_sha256(
+      route_identity if route_content_sha256 is None else route_content_sha256,
+      "route content identity",
+    )
+    if any(
+      route.route_identity_sha256 == route_identity
+      or route.route_content_sha256 == route_content
+      for route in self._routes
+    ):
+      raise ValueError("calibration route identity was already ingested")
     self.reset_route_transients()
-    self._route_validation = bool(route_counter & 1)
+    self._route_validation = bool(int(route_identity[-1], 16) & 1)
+    self._active_route_identity_sha256 = route_identity
+    self._active_route_content_sha256 = route_content
+    self._active_route_nodes = tuple(
+      _RouteNodeRegressions() for _ in self._nodes
+    )
+    self._active_route_intervals = tuple(
+      _JointRegression() for _ in range(len(self._nodes) - 1)
+    )
     self._route_active = True
 
   def end_route(self) -> None:
     if not self._route_active:
       raise RuntimeError("calibration learner route is not active")
+    route_nodes = self._active_route_nodes
+    route_intervals = self._active_route_intervals
+    if route_nodes is None or route_intervals is None:
+      raise AssertionError("active calibration route lacks route statistics")
+    if self._active_route_identity_sha256 is None or self._active_route_content_sha256 is None:
+      raise AssertionError("active calibration route lacks immutable identity")
+    self._routes.append(
+      _RouteEvidence(
+        route_index=len(self._routes),
+        route_identity_sha256=self._active_route_identity_sha256,
+        route_content_sha256=self._active_route_content_sha256,
+        validation=self._route_validation,
+        nodes=route_nodes,
+        intervals=route_intervals,
+      )
+    )
     self.reset_route_transients()
+    self._active_route_nodes = None
+    self._active_route_intervals = None
+    self._active_route_identity_sha256 = None
+    self._active_route_content_sha256 = None
     self._route_active = False
+
+  def _add_regression(
+    self,
+    node_index: int,
+    aggregate_field: str,
+    predictors: tuple[float, float, float, float],
+    target: float,
+    weight: float,
+  ) -> None:
+    getattr(self._nodes[node_index], aggregate_field).add(
+      predictors, target, weight
+    )
+    route_nodes = self._active_route_nodes
+    if route_nodes is None:
+      raise AssertionError("calibration route regression lacks active route")
+    route_field = aggregate_field.replace("validation", "training")
+    getattr(route_nodes[node_index], route_field).add(
+      predictors, target, weight
+    )
+
+  def _interval_support(self, speed: float) -> tuple[int, float]:
+    nodes = self.speed_nodes_mps
+    if speed <= nodes[0]:
+      return 0, 0.0
+    if speed >= nodes[-1]:
+      return len(nodes) - 2, 1.0
+    upper = 1
+    while nodes[upper] < speed:
+      upper += 1
+    lower = upper - 1
+    return lower, (speed - nodes[lower]) / (nodes[upper] - nodes[lower])
+
+  def _add_joint_regression(
+    self,
+    speed: float,
+    predictors: tuple[float, float, float, float],
+    target: float,
+    weight: float,
+  ) -> None:
+    intervals = self._active_route_intervals
+    if intervals is None:
+      raise AssertionError("joint calibration regression lacks active route")
+    interval, upper_weight = self._interval_support(speed)
+    intervals[interval].add(
+      predictors, target, weight, upper_weight
+    )
 
   def _supports(self, speed: float) -> tuple[tuple[int, float], ...]:
     nodes = self.speed_nodes_mps
@@ -892,6 +1485,19 @@ class CalibrationProfileLearner:
       # A limiter boundary interrupts free breakaway causality. Settled,
       # full-magnitude motion may still identify the moving map.
       self._breakaway_detector.reset()
+      seed_at_speed = self.seed_profile.parameters_at(sample.speed_mps).parameters
+      joint_direction = self._rate_direction(sample, seed_at_speed)
+      if (
+        sample.actuator_boundary == ActuatorBoundary.MAGNITUDE
+        and sample.magnitude_boundary_dwell_s + 1e-12 >= sample.dt_s
+        and joint_direction != 0
+      ):
+        self._add_joint_regression(
+          sample.speed_mps,
+          self._row(sample, "moving", joint_direction),
+          sample.applied_torque,
+          sample.dt_s,
+        )
       accepted = False
       for node_index, node_weight in self._supports(sample.speed_mps):
         node = self._nodes[node_index]
@@ -922,12 +1528,13 @@ class CalibrationProfileLearner:
           accepted = True
           continue
         predictors = self._row(sample, "moving", direction)
-        evidence = (
-          node.authority_validation
-          if validation
-          else node.authority_training
+        self._add_regression(
+          node_index,
+          "authority_validation" if validation else "authority_training",
+          predictors,
+          sample.applied_torque,
+          weight,
         )
-        evidence.add(predictors, sample.applied_torque, weight)
         node.authority_fit_count += 1
         node.authority_fit_sample_count += 1
         node.authority_fit_support_s += weight
@@ -954,6 +1561,28 @@ class CalibrationProfileLearner:
     support_speed = (
       episode.onset_speed_mps if episode is not None else sample.speed_mps
     )
+    if category != "pending":
+      joint_torque = sample.applied_torque
+      joint_weight = sample.dt_s
+      if category == "breakaway":
+        if episode is None:
+          raise AssertionError("breakaway category lacks a complete episode")
+        joint_predictors = (
+          -episode.first_motion.measured_lateral_accel_mps2,
+          1.0,
+          0.0,
+          float(direction),
+        )
+        joint_torque = episode.first_motion.applied_torque
+        joint_weight = episode.first_motion.dt_s
+      else:
+        joint_predictors = self._row(sample, category, direction)
+      self._add_joint_regression(
+        support_speed,
+        joint_predictors,
+        joint_torque,
+        joint_weight,
+      )
     accepted = False
     for node_index, node_weight in self._supports(support_speed):
       node = self._nodes[node_index]
@@ -992,8 +1621,13 @@ class CalibrationProfileLearner:
           fit_weight = episode.first_motion.dt_s * node_weight
         else:
           predictors = self._row(sample, category, direction)
-        total = node.validation if validation else node.training
-        total.add(predictors, fit_torque, fit_weight)
+        self._add_regression(
+          node_index,
+          "validation" if validation else "training",
+          predictors,
+          fit_torque,
+          fit_weight,
+        )
         node.fit_count += 1
         if category == "base":
           node.base_support_s += weight
@@ -1010,31 +1644,40 @@ class CalibrationProfileLearner:
             node.moving_training_direction_mask |= (
               1 if direction < 0 else 2
             )
-          (
-            node.moving_validation
-            if validation
-            else node.moving_training
-          ).add(predictors, sample.applied_torque, weight)
+          self._add_regression(
+            node_index,
+            "moving_validation" if validation else "moving_training",
+            predictors,
+            sample.applied_torque,
+            weight,
+          )
         else:
           node.breakaway_support_s += weight
           node.breakaway_sample_count += 1
           node.breakaway_direction_mask |= 1 if direction < 0 else 2
-          (
-            node.breakaway_validation
-            if validation
-            else node.breakaway_training
-          ).add(predictors, fit_torque, fit_weight)
+          self._add_regression(
+            node_index,
+            (
+              "breakaway_validation"
+              if validation
+              else "breakaway_training"
+            ),
+            predictors,
+            fit_torque,
+            fit_weight,
+          )
 
           episode_predictors, episode_torque = self._episode_row(episode)
-          episode_evidence = (
-            node.breakaway_episode_validation
-            if validation
-            else node.breakaway_episode_training
-          )
           # One physical episode gets unit total weight, split only by its
           # onset-speed interpolation. Dwell length cannot outvote independent
           # episodes.
-          episode_evidence.add(
+          self._add_regression(
+            node_index,
+            (
+              "breakaway_episode_validation"
+              if validation
+              else "breakaway_episode_training"
+            ),
             episode_predictors,
             episode_torque,
             node_weight,
@@ -1154,15 +1797,25 @@ class CalibrationProfileLearner:
       training_strata,
       seed_coefficients,
     )
+    training_fields = (
+      "base_training",
+      "moving_training",
+      "breakaway_training",
+      "breakaway_episode_training",
+      *(("authority_training",) if node.authority_training.count > 0 else ()),
+      "training",
+    )
     selected: _ModelCandidate | None = None
-    generated: list[
+    generated_raw: list[
       tuple[
         CalibrationModelId,
+        tuple[int, ...],
         tuple[float, float, float, float] | None,
       ]
     ] = [
       (
         CalibrationModelId.STATIC_ONLY,
+        (),
         _fit_episode_static(
           node.breakaway_episode_training,
           seed_coefficients,
@@ -1179,8 +1832,9 @@ class CalibrationProfileLearner:
         seed_coefficients,
         free,
       )
-      generated.append((
+      generated_raw.append((
         model,
+        free,
         (
           None
           if moving_coefficients is None
@@ -1190,28 +1844,67 @@ class CalibrationProfileLearner:
           )
         ),
       ))
+    fit_diagnostics = tuple(
+      _model_fit_diagnostic(
+        model,
+        moving_fit,
+        node.breakaway_episode_training,
+        free,
+        coefficients,
+      )
+      for model, free, coefficients in generated_raw
+    )
+    generated = tuple(
+      (model, coefficients)
+      for (model, _, coefficients), diagnostic in zip(
+        generated_raw, fit_diagnostics, strict=True
+      )
+      if diagnostic.status is CalibrationFitStatus.IDENTIFIABLE
+    )
     if seed_training_vector is not None:
       for model, coefficients in generated:
         if coefficients is None:
           continue
         vector = _rms_vector(training_strata, coefficients)
-        if (
-          vector is None
-          or not _safe_against(
-            vector,
-            seed_training_vector,
-            require_improvement=True,
-          )
-        ):
+        safe_against_seed, _ = _safe_on_route_strata(
+          tuple(self._routes),
+          index,
+          training_fields,
+          coefficients,
+          seed_coefficients,
+          validation=False,
+          require_improvement=True,
+        )
+        if vector is None or not safe_against_seed:
           continue
         candidate = _ModelCandidate(model, coefficients, vector)
-        if (
-          selected is None
-          or _pareto_dominates(vector, selected.training_rms)
-        ):
+        if selected is None:
+          selected = candidate
+          continue
+        dominates, _ = _safe_on_route_strata(
+          tuple(self._routes),
+          index,
+          training_fields,
+          coefficients,
+          selected.coefficients,
+          validation=False,
+          require_improvement=True,
+        )
+        if dominates:
           selected = candidate
 
-    coefficients = None if selected is None else selected.coefficients
+    identifiable_model_exists = any(
+      diagnostic.status is CalibrationFitStatus.IDENTIFIABLE
+      for diagnostic in fit_diagnostics
+    )
+    seed_retained = selected is None and identifiable_model_exists
+    coefficients = (
+      selected.coefficients
+      if selected is not None
+      else seed_coefficients
+      if seed_retained
+      else None
+    )
     seed_rms = node.validation.rms(seed_coefficients)
     candidate_rms = node.validation.rms(coefficients) if coefficients is not None else None
     base_seed = base_validation.rms(seed_coefficients)
@@ -1228,9 +1921,37 @@ class CalibrationProfileLearner:
     )
     authority_seed = node.authority_validation.rms(seed_coefficients)
     authority_candidate = node.authority_validation.rms(coefficients) if coefficients is not None else None
+    training_paired_loss = (
+      None
+      if coefficients is None
+      else _paired_route_losses(
+        _route_regressions_for_node(
+          tuple(self._routes), index, "training", validation=False
+        ),
+        coefficients,
+        seed_coefficients,
+      )
+    )
+    validation_paired_loss = (
+      None
+      if coefficients is None
+      else _paired_route_losses(
+        _route_regressions_for_node(
+          tuple(self._routes), index, "training", validation=True
+        ),
+        coefficients,
+        seed_coefficients,
+      )
+    )
     candidate_parameters: CalibrationParameters | None = None
     if coefficients is None:
-      reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
+      statuses = {diagnostic.status for diagnostic in fit_diagnostics}
+      if CalibrationFitStatus.ILL_CONDITIONED in statuses:
+        reasons.append(CalibrationQualificationReason.ILL_CONDITIONED_FIT)
+      elif CalibrationFitStatus.RANK_DEFICIENT in statuses:
+        reasons.append(CalibrationQualificationReason.RANK_DEFICIENT_FIT)
+      else:
+        reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
     else:
       gain, intercept, kinetic, static = coefficients
       offset = intercept / gain if gain != 0.0 else math.inf
@@ -1238,25 +1959,37 @@ class CalibrationProfileLearner:
       if not all(math.isfinite(value) for value in (*coefficients, offset)) or gain <= 0.0 or static < kinetic or kinetic < 0.0 or abs(offset) > offset_bound:
         reasons.append(CalibrationQualificationReason.INVALID_PARAMETERS)
       else:
-        comparisons = (
-          (node.validation, candidate_rms, seed_rms, CalibrationQualificationReason.VALIDATION_REGRESSION),
-          (base_validation, base_candidate, base_seed, CalibrationQualificationReason.VALIDATION_REGRESSION),
-          (node.moving_validation, moving_candidate, moving_seed, CalibrationQualificationReason.MOVING_VALIDATION_REGRESSION),
-          (node.breakaway_validation, breakaway_candidate, breakaway_seed, CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
-          (node.breakaway_episode_validation, episode_candidate, episode_seed, CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
+        validation_comparisons = (
+          ("training", CalibrationQualificationReason.VALIDATION_REGRESSION),
+          ("base_training", CalibrationQualificationReason.VALIDATION_REGRESSION),
+          ("moving_training", CalibrationQualificationReason.MOVING_VALIDATION_REGRESSION),
+          ("breakaway_training", CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
+          ("breakaway_episode_training", CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
+          *((
+            ("authority_training", CalibrationQualificationReason.AUTHORITY_VALIDATION_REGRESSION),
+          ) if node.authority_validation.count > 0 else ()),
         )
-        for evidence, candidate_value, seed_value, reason in comparisons:
-          if evidence.count > 0 and (
-            candidate_value is None or seed_value is None
+        for field, regression_reason in validation_comparisons:
+          diagnostic = _paired_route_losses(
+            _route_regressions_for_node(
+              tuple(self._routes), index, field, validation=True
+            ),
+            coefficients,
+            seed_coefficients,
+          )
+          verdict = _paired_loss_verdict(
+            diagnostic,
+            identical=seed_retained,
+          )
+          if verdict is _PairedLossVerdict.REGRESSION:
+            reasons.append(regression_reason)
+          elif verdict in (
+            _PairedLossVerdict.INCONCLUSIVE,
+            _PairedLossVerdict.NO_DATA,
           ):
-            reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
-          elif candidate_value is not None and seed_value is not None and candidate_value > seed_value + VALIDATION_RMS_ABSOLUTE_TOLERANCE:
-            reasons.append(reason)
-        if node.authority_validation.count > 0:
-          if authority_candidate is None or authority_seed is None:
-            reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
-          elif authority_candidate > authority_seed + VALIDATION_RMS_ABSOLUTE_TOLERANCE:
-            reasons.append(CalibrationQualificationReason.AUTHORITY_VALIDATION_REGRESSION)
+            reasons.append(
+              CalibrationQualificationReason.VALIDATION_INCONCLUSIVE
+            )
         confidence = min(
           1.0,
           max(
@@ -1271,10 +2004,20 @@ class CalibrationProfileLearner:
           ),
         )
         candidate_parameters = CalibrationParameters(
-          torque_per_lateral_accel=gain,
-          lateral_accel_offset_correction_mps2=offset,
-          kinetic_friction_torque=kinetic,
-          static_breakaway_torque=static,
+          torque_per_lateral_accel=(
+            seed.torque_per_lateral_accel if seed_retained else gain
+          ),
+          lateral_accel_offset_correction_mps2=(
+            seed.lateral_accel_offset_correction_mps2
+            if seed_retained
+            else offset
+          ),
+          kinetic_friction_torque=(
+            seed.kinetic_friction_torque if seed_retained else kinetic
+          ),
+          static_breakaway_torque=(
+            seed.static_breakaway_torque if seed_retained else static
+          ),
           transport_delay_s=seed.transport_delay_s,
           rack_rate_resolution_deg_s=seed.rack_rate_resolution_deg_s,
           confidence=confidence,
@@ -1282,6 +2025,13 @@ class CalibrationProfileLearner:
         )
     unique = tuple(dict.fromkeys(reasons))
     qualified = not unique
+    training_outcome = (
+      CalibrationQualificationReason.SEED_RETAINED
+      if seed_retained
+      else CalibrationQualificationReason.LEARNED
+      if selected is not None
+      else None
+    )
     if candidate_parameters is not None and qualified:
       candidate_parameters = CalibrationParameters(
         candidate_parameters.torque_per_lateral_accel,
@@ -1293,6 +2043,13 @@ class CalibrationProfileLearner:
         candidate_parameters.confidence,
         True,
       )
+    report_reasons = (
+      (training_outcome,)
+      if qualified and training_outcome is not None
+      else (CalibrationQualificationReason.QUALIFIED,)
+      if qualified
+      else unique
+    )
     return CalibrationNodeQualificationReport(
       index,
       speed,
@@ -1326,7 +2083,7 @@ class CalibrationProfileLearner:
       breakaway_seed,
       breakaway_candidate,
       candidate_parameters.confidence if candidate_parameters is not None else 0.0,
-      (CalibrationQualificationReason.QUALIFIED,) if qualified else unique,
+      report_reasons,
       candidate_parameters,
       node.authority_support_s,
       node.authority_sample_count,
@@ -1361,6 +2118,10 @@ class CalibrationProfileLearner:
           + node.breakaway_episode_validation.weight_s
         )
       ),
+      fit_diagnostics,
+      training_paired_loss,
+      validation_paired_loss,
+      training_outcome,
     )
 
   def qualify(self, provenance: str) -> CalibrationLearningResult:
@@ -1372,6 +2133,85 @@ class CalibrationProfileLearner:
     reports = tuple(self._node_report(index) for index in range(len(self._nodes)))
     if not all(report.qualified for report in reports):
       return CalibrationLearningResult(reports, None)
+    candidate_parameters = tuple(
+      report.candidate_parameters  # type: ignore[misc]
+      for report in reports
+    )
+    if any(parameters is None for parameters in candidate_parameters):
+      raise AssertionError("qualified node lacks calibration parameters")
+    candidate_parameters = tuple(
+      parameters for parameters in candidate_parameters if parameters is not None
+    )
+    seed_parameters = tuple(node.parameters for node in self.seed_profile.nodes)
+    # Confidence/support are evidence metadata and legitimately advance even
+    # when the four physical values remain the exact seed. Artifact emission
+    # is keyed only to values that change controller behavior.
+    profile_identical = tuple(
+      _seed_coefficients(parameters) for parameters in candidate_parameters
+    ) == tuple(
+      _seed_coefficients(parameters) for parameters in seed_parameters
+    )
+    interpolation_reports: list[CalibrationInterpolationQualificationReport] = []
+    for interval_index in range(len(self._nodes) - 1):
+      training = _paired_joint_route_losses(
+        tuple(self._routes),
+        interval_index,
+        candidate_parameters[interval_index],
+        candidate_parameters[interval_index + 1],
+        seed_parameters[interval_index],
+        seed_parameters[interval_index + 1],
+        validation=False,
+      )
+      validation = _paired_joint_route_losses(
+        tuple(self._routes),
+        interval_index,
+        candidate_parameters[interval_index],
+        candidate_parameters[interval_index + 1],
+        seed_parameters[interval_index],
+        seed_parameters[interval_index + 1],
+        validation=True,
+      )
+      interval_reasons: list[CalibrationQualificationReason] = []
+      for diagnostic, regression_reason, inconclusive_reason in (
+        (
+          training,
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION,
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE,
+        ),
+        (
+          validation,
+          CalibrationQualificationReason.INTERPOLATION_VALIDATION_REGRESSION,
+          CalibrationQualificationReason.INTERPOLATION_VALIDATION_INCONCLUSIVE,
+        ),
+      ):
+        verdict = _paired_loss_verdict(
+          diagnostic,
+          identical=profile_identical,
+        )
+        if verdict is _PairedLossVerdict.REGRESSION:
+          interval_reasons.append(regression_reason)
+        elif verdict in (
+          _PairedLossVerdict.INCONCLUSIVE,
+          _PairedLossVerdict.NO_DATA,
+        ):
+          interval_reasons.append(inconclusive_reason)
+      interpolation_reports.append(
+        CalibrationInterpolationQualificationReport(
+          interval_index=interval_index,
+          lower_speed_mps=self.speed_nodes_mps[interval_index],
+          upper_speed_mps=self.speed_nodes_mps[interval_index + 1],
+          training_paired_loss=training,
+          validation_paired_loss=validation,
+          reasons=(
+            (CalibrationQualificationReason.QUALIFIED,)
+            if not interval_reasons
+            else tuple(dict.fromkeys(interval_reasons))
+          ),
+        )
+      )
+    interpolation_tuple = tuple(interpolation_reports)
+    if not all(report.qualified for report in interpolation_tuple):
+      return CalibrationLearningResult(reports, None, interpolation_tuple)
     revision = self.seed_profile.revision + 1 + sum(node.supported_sample_count + node.authority_sample_count for node in self._nodes)
     nodes = tuple(
       CalibrationProfileNode(
@@ -1404,7 +2244,12 @@ class CalibrationProfileLearner:
       candidate_provenance,
       nodes,
     )
-    return CalibrationLearningResult(reports, profile)
+    return CalibrationLearningResult(
+      reports,
+      None if profile_identical else profile,
+      interpolation_tuple,
+      selected_profile=profile,
+    )
 
   def export_evidence(self) -> bytes:
     if self._route_active:
@@ -1460,6 +2305,13 @@ class CalibrationProfileLearner:
       "authority_training",
       "authority_validation",
     )
+    route_regression_fields = (
+      "training",
+      "moving_training",
+      "breakaway_training",
+      "breakaway_episode_training",
+      "authority_training",
+    )
     nodes = []
     for index, node in enumerate(self._nodes):
       raw: dict[str, Any] = {
@@ -1475,6 +2327,23 @@ class CalibrationProfileLearner:
       for name in regression_fields:
         raw[name] = getattr(node, name).encoded()
       nodes.append(raw)
+    routes = [
+      {
+        "route_index": route.route_index,
+        "route_identity_sha256": route.route_identity_sha256,
+        "route_content_sha256": route.route_content_sha256,
+        "validation": route.validation,
+        "nodes": [
+          {
+            name: getattr(route_node, name).encoded()
+            for name in route_regression_fields
+          }
+          for route_node in route.nodes
+        ],
+        "intervals": [interval.encoded() for interval in route.intervals],
+      }
+      for route in self._routes
+    ]
     payload = {
       "evidence_schema_version": CALIBRATION_EVIDENCE_SCHEMA_VERSION,
       "profile_schema_version": self.seed_profile.schema_version,
@@ -1483,6 +2352,7 @@ class CalibrationProfileLearner:
       "seed_profile_sha256": hashlib.sha256(seed_json.encode()).hexdigest(),
       "speed_nodes_mps": [speed.hex() for speed in self.speed_nodes_mps],
       "nodes": nodes,
+      "routes": routes,
     }
     envelope = {"payload": payload, "payload_sha256": hashlib.sha256(_canonical(payload)).hexdigest()}
     return _canonical(envelope)
@@ -1500,7 +2370,16 @@ class CalibrationProfileLearner:
       raise ValueError("calibration evidence is not canonical")
     payload = _exact(
       envelope["payload"],
-      {"evidence_schema_version", "profile_schema_version", "vehicle_identity", "seed_profile_json", "seed_profile_sha256", "speed_nodes_mps", "nodes"},
+      {
+        "evidence_schema_version",
+        "profile_schema_version",
+        "vehicle_identity",
+        "seed_profile_json",
+        "seed_profile_sha256",
+        "speed_nodes_mps",
+        "nodes",
+        "routes",
+      },
       "evidence payload",
     )
     if payload["evidence_schema_version"] != CALIBRATION_EVIDENCE_SCHEMA_VERSION:
@@ -1672,6 +2551,141 @@ class CalibrationProfileLearner:
         raise ValueError("applied-torque extrema are inconsistent")
       if (lat_empty and node.lateral_accel_direction_mask != 0) or (torque_empty and node.applied_torque_direction_mask != 0):
         raise ValueError("empty calibration extrema carry a direction mask")
+    raw_routes = payload["routes"]
+    if type(raw_routes) is not list:
+      raise ValueError("calibration route statistics must be a list")
+    route_regression_fields = (
+      "training",
+      "moving_training",
+      "breakaway_training",
+      "breakaway_episode_training",
+      "authority_training",
+    )
+    for route_index, raw_route in enumerate(raw_routes):
+      route_payload = _exact(
+        raw_route,
+        {
+          "route_index",
+          "route_identity_sha256",
+          "route_content_sha256",
+          "validation",
+          "nodes",
+          "intervals",
+        },
+        f"routes[{route_index}]",
+      )
+      if route_payload["route_index"] != route_index:
+        raise ValueError("calibration route ordering is corrupt")
+      if type(route_payload["validation"]) is not bool:
+        raise ValueError("calibration route partition is invalid")
+      route_identity = _route_sha256(
+        route_payload["route_identity_sha256"],
+        "route identity",
+      )
+      route_content = _route_sha256(
+        route_payload["route_content_sha256"],
+        "route content identity",
+      )
+      if route_payload["validation"] != bool(int(route_identity[-1], 16) & 1):
+        raise ValueError("calibration route partition does not match identity")
+      if any(
+        route.route_identity_sha256 == route_identity
+        or route.route_content_sha256 == route_content
+        for route in learner._routes
+      ):
+        raise ValueError("calibration evidence contains a duplicate route")
+      raw_route_nodes = route_payload["nodes"]
+      if type(raw_route_nodes) is not list or len(raw_route_nodes) != len(
+        learner._nodes
+      ):
+        raise ValueError("calibration route node count is incompatible")
+      route_nodes: list[_RouteNodeRegressions] = []
+      for node_index, raw_route_node in enumerate(raw_route_nodes):
+        route_node_payload = _exact(
+          raw_route_node,
+          set(route_regression_fields),
+          f"routes[{route_index}].nodes[{node_index}]",
+        )
+        route_node = _RouteNodeRegressions()
+        for name in route_regression_fields:
+          setattr(
+            route_node,
+            name,
+            _Regression.decoded(
+              route_node_payload[name],
+              f"routes[{route_index}].nodes[{node_index}].{name}",
+            ),
+          )
+        route_nodes.append(route_node)
+      raw_intervals = route_payload["intervals"]
+      if type(raw_intervals) is not list or len(raw_intervals) != len(
+        learner._nodes
+      ) - 1:
+        raise ValueError("calibration route interval count is incompatible")
+      route_intervals = tuple(
+        _JointRegression.decoded(
+          raw_interval,
+          f"routes[{route_index}].intervals[{interval_index}]",
+        )
+        for interval_index, raw_interval in enumerate(raw_intervals)
+      )
+      learner._routes.append(
+        _RouteEvidence(
+          route_index=route_index,
+          route_identity_sha256=route_identity,
+          route_content_sha256=route_content,
+          validation=route_payload["validation"],
+          nodes=tuple(route_nodes),
+          intervals=route_intervals,
+        )
+      )
+
+    aggregate_pairs = (
+      ("training", "training", False),
+      ("validation", "training", True),
+      ("moving_training", "moving_training", False),
+      ("moving_validation", "moving_training", True),
+      ("breakaway_training", "breakaway_training", False),
+      ("breakaway_validation", "breakaway_training", True),
+      (
+        "breakaway_episode_training",
+        "breakaway_episode_training",
+        False,
+      ),
+      (
+        "breakaway_episode_validation",
+        "breakaway_episode_training",
+        True,
+      ),
+      ("authority_training", "authority_training", False),
+      ("authority_validation", "authority_training", True),
+    )
+    for node_index, node in enumerate(learner._nodes):
+      for aggregate_name, route_name, validation in aggregate_pairs:
+        parts = tuple(
+          getattr(route.nodes[node_index], route_name)
+          for route in learner._routes
+          if route.validation == validation
+        )
+        reconstructed = _combine(*parts)
+        aggregate = getattr(node, aggregate_name)
+        if reconstructed.count != aggregate.count or not math.isclose(
+          reconstructed.weight_s,
+          aggregate.weight_s,
+          rel_tol=1e-12,
+          abs_tol=1e-12,
+        ):
+          raise ValueError("route-level calibration counts are inconsistent")
+        values = (
+          (reconstructed.target_squared, aggregate.target_squared),
+          *zip(reconstructed.normal, aggregate.normal, strict=True),
+          *zip(reconstructed.rhs, aggregate.rhs, strict=True),
+        )
+        if any(
+          not math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
+          for left, right in values
+        ):
+          raise ValueError("route-level calibration statistics are inconsistent")
     return learner
 
 

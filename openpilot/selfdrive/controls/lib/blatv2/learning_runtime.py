@@ -60,7 +60,7 @@ CASUAL_DRIVING_CANDIDATE_PROVENANCE = "measured casual-driving evidence"
 # physical runtime. A policy change must start from an empty ledger and replay
 # retained full rlogs; it must never reinterpret or mix a predecessor's
 # CURRENT generation in place.
-FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v4"
+FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v6"
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
   "STEER_DELTA_UP",
@@ -147,6 +147,11 @@ class LearningArtifactPaths:
     return self._active_root() / "candidates"
 
   @property
+  def selected_profiles(self) -> Path:
+    """Hash-addressed physical profile selected by schema-8 qualification."""
+    return self._active_root() / "selected_profiles"
+
+  @property
   def backfill_ledger(self) -> Path:
     return self._active_root() / "ledger.json"
 
@@ -166,6 +171,15 @@ class LearningArtifactPaths:
     ):
       raise ValueError("candidate profile identity must be lowercase SHA-256")
     return self.candidates / f"{identity}.json"
+
+  def selected_profile(self, profile_sha256: str) -> Path:
+    identity = str(profile_sha256)
+    if (
+      len(identity) != 64
+      or any(character not in "0123456789abcdef" for character in identity)
+    ):
+      raise ValueError("selected profile identity must be lowercase SHA-256")
+    return self.selected_profiles / f"{identity}.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,6 +606,19 @@ class PersistentLearningRuntime:
         raise LearningRestoreError(
           "stored learner manifest does not identify the exact evidence",
         )
+      selected_json = finalization.selected_profile_json
+      selected_identity = finalization.selected_profile_sha256
+      if selected_json is not None:
+        if selected_identity is None:
+          raise AssertionError("selected profile JSON lacks its canonical identity")
+        selected_path = artifact_paths.selected_profile(selected_identity)
+        if (
+          not selected_path.is_file()
+          or selected_path.read_bytes() != selected_json
+        ):
+          raise LearningRestoreError(
+            "stored selected profile is missing or does not match manifest",
+          )
       candidate_json = finalization.candidate_profile_json
       candidate_identity = finalization.candidate_profile_sha256
       if candidate_json is not None:
@@ -637,13 +664,14 @@ class PersistentLearningRuntime:
       "manifest_sha256",
       "provenance_sha256",
       "runtime_identity_sha256",
+      "selected_profile_sha256",
       "schema_version",
     }
     if (
       type(commit) is not dict
       or set(commit) != expected_keys
       or type(commit["schema_version"]) is not int
-      or commit["schema_version"] != 1
+      or commit["schema_version"] != 2
       or commit_bytes != json.dumps(
         commit,
         sort_keys=True,
@@ -662,6 +690,7 @@ class PersistentLearningRuntime:
         type(expected) is not str
         or len(expected) != 64
         or any(character not in "0123456789abcdef" for character in expected)
+        or path.is_symlink()
         or not path.is_file()
         or hashlib.sha256(path.read_bytes()).hexdigest() != expected
       ):
@@ -703,14 +732,47 @@ class PersistentLearningRuntime:
         candidate_identity,
         "candidate",
       )
+    selected_identity = commit["selected_profile_sha256"]
+    if artifact_paths.selected_profiles.is_symlink() or (
+      artifact_paths.selected_profiles.exists()
+      and not artifact_paths.selected_profiles.is_dir()
+    ):
+      raise LearningRestoreError(
+        "backfill selected profile directory has an unsafe type",
+      )
+    selected_files = (
+      set(artifact_paths.selected_profiles.iterdir())
+      if artifact_paths.selected_profiles.is_dir()
+      else set()
+    )
+    if selected_identity is None:
+      if selected_files:
+        raise LearningRestoreError(
+          "backfill generation has uncommitted selected profiles",
+        )
+    else:
+      selected_path = artifact_paths.selected_profile(selected_identity)
+      if selected_files != {selected_path}:
+        raise LearningRestoreError(
+          "backfill selected profile set does not match commit record",
+        )
+      verify_file(selected_path, selected_identity, "selected profile")
 
-  def transition_onroad(self, route_counter: int = 0) -> None:
+  def transition_onroad(
+    self,
+    route_identity_sha256: str,
+    route_content_sha256: str | None = None,
+  ) -> None:
+    """Begin one immutable route identity; never synthesize from a counter."""
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
     self.torque_response_aligner.reset()
     self._last_applied_report_mono_ns = 0
     self._last_reported_applied_torque = 0.0
-    self.coordinator.transition_onroad(route_counter)
+    self.coordinator.transition_onroad(
+      route_identity_sha256,
+      route_content_sha256,
+    )
 
   def transition_offroad_and_persist(
     self,
@@ -747,6 +809,12 @@ class PersistentLearningRuntime:
 
     # No directory creation is reachable while the coordinator is onroad.
     self.artifact_paths.root.mkdir(parents=True, exist_ok=True)
+    selected_path: Path | None = None
+    if finalization.selected_profile_sha256 is not None:
+      self.artifact_paths.selected_profiles.mkdir(parents=True, exist_ok=True)
+      selected_path = self.artifact_paths.selected_profile(
+        finalization.selected_profile_sha256,
+      )
     candidate_path: Path | None = None
     if finalization.candidate_profile_sha256 is not None:
       self.artifact_paths.candidates.mkdir(parents=True, exist_ok=True)
@@ -756,6 +824,7 @@ class PersistentLearningRuntime:
     return self.coordinator.persist_finalized(
       evidence_path=self.artifact_paths.evidence,
       manifest_path=self.artifact_paths.manifest,
+      selected_profile_path=selected_path,
       candidate_profile_path=candidate_path,
     )
 

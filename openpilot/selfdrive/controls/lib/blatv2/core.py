@@ -94,6 +94,8 @@ class CoreResult:
     "profile_upper_node",
     "profile_upper_weight",
     "torque_per_lateral_accel",
+    "lateral_accel_offset_correction_mps2",
+    "effective_lateral_accel_offset_mps2",
     "rack_gain_deg_s2_per_torque",
     "rack_damping_per_s",
     "static_friction_torque",
@@ -166,6 +168,8 @@ class CoreResult:
     self.profile_upper_node = 0
     self.profile_upper_weight = 0.0
     self.torque_per_lateral_accel = 0.0
+    self.lateral_accel_offset_correction_mps2 = 0.0
+    self.effective_lateral_accel_offset_mps2 = 0.0
     self.rack_gain_deg_s2_per_torque = 0.0
     self.rack_damping_per_s = 0.0
     self.static_friction_torque = 0.0
@@ -543,6 +547,10 @@ class ModularControllerCore:
     self._record_applied_torque(recorded_applied_torque)
     current_profile = self.profile.parameters_at(current_v_ego_m_s)
     current_parameters = current_profile.parameters
+    current_lateral_accel_offset = (
+      lateral_accel_offset
+      + current_parameters.lateral_accel_offset_correction_mps2
+    )
     selected_mapping = (
       live_mapping
       if live_mapping is not None and live_mapping.valid
@@ -576,7 +584,7 @@ class ModularControllerCore:
           measured_curvature,
           current_v_ego_m_s,
           selected_mapping.roll_rad,
-          lateral_accel_offset,
+          current_lateral_accel_offset,
           current_parameters.torque_per_lateral_accel,
         )
         observer_friction = departure_friction_torque(
@@ -695,6 +703,16 @@ class ModularControllerCore:
     self.result.torque_per_lateral_accel = (
       effect_parameters.torque_per_lateral_accel
     )
+    self.result.lateral_accel_offset_correction_mps2 = (
+      effect_parameters.lateral_accel_offset_correction_mps2
+    )
+    effect_lateral_accel_offset = (
+      lateral_accel_offset
+      + effect_parameters.lateral_accel_offset_correction_mps2
+    )
+    self.result.effective_lateral_accel_offset_mps2 = (
+      effect_lateral_accel_offset
+    )
     self.result.rack_gain_deg_s2_per_torque = (
       effect_parameters.rack_gain_deg_s2_per_torque
     )
@@ -767,7 +785,7 @@ class ModularControllerCore:
           self._reference_speeds[0],
           selected_mapping,
           self.nominal_mapping,
-          lateral_accel_offset,
+          effect_lateral_accel_offset,
           effect_parameters,
           self.observer.estimate_torque,
           fractional_dt,
@@ -784,7 +802,7 @@ class ModularControllerCore:
         self._reference_speeds[0],
         selected_mapping,
         self.nominal_mapping,
-        lateral_accel_offset,
+        effect_lateral_accel_offset,
         effect_parameters,
         self.observer.estimate_torque,
         self.fixed_dt_s,
@@ -797,7 +815,7 @@ class ModularControllerCore:
         self._rack_accelerations[0],
         self._reference_speeds[0],
         selected_mapping.roll_rad,
-        lateral_accel_offset,
+        effect_lateral_accel_offset,
         effect_parameters,
         self.tracking_policy,
         self.observer.estimate_torque,
