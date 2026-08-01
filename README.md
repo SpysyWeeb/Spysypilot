@@ -55,6 +55,12 @@ once every two seconds and strictly decodes versioned JSON Params caches:
   cumulative accepted/rejected sample counts.
 - `BLaTv2BackfillProgress` adds segment, pass, work-unit, and estimated-time
   detail for the current physical replay operation only.
+- `BLaTv2OffdeviceProgress` independently identifies PC processing, prepared
+  artifact download, ARM certification, prepared-data handoff, or an explicit
+  local-fallback reason. During PC processing it retains the device-restamped
+  pass/route/segment coordinate; after handoff the newer local replay status
+  retakes the display. Archive-only PC rejections appear only as an unverified
+  exclusion count and are never presented as learner evidence.
 - `BLaTv2BehaviorLearningStatus` is the independent, informational-only
   behavior transaction projection. It reports homogeneous-route readiness,
   training and held-out-validation replay progress, immutable result hashes,
