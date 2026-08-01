@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -1244,6 +1245,7 @@ def accepted_spool_outcomes(
   candidate: RouteCandidate,
   provenance: dict[str, object],
   *,
+  car_params_bytes: bytes = b"test-canonical-car-params",
   runtime_identity: str | None = None,
 ) -> dict[tuple[int, str], _PreparedOutcome]:
   result: dict[tuple[int, str], _PreparedOutcome] = {}
@@ -1252,6 +1254,7 @@ def accepted_spool_outcomes(
       candidate.route_name,
       (),
       provenance,
+      car_params_bytes=car_params_bytes,
       runtime_identity=runtime_identity,
     )
     descriptor = write_prepared_route_spool(
@@ -1279,6 +1282,7 @@ def empty_prepared_route(
   candidate: RouteCandidate,
   provenance: dict[str, object],
   *,
+  car_params_bytes: bytes = b"test-canonical-car-params",
   runtime_identity: str | None = None,
 ) -> PreparedRoute:
   return PreparedRoute(
@@ -1287,6 +1291,7 @@ def empty_prepared_route(
       candidate.route_name,
       (),
       provenance,
+      car_params_bytes=car_params_bytes,
       runtime_identity=runtime_identity,
     ),
   )
@@ -1379,17 +1384,30 @@ def test_full_car_params_hash_does_not_fragment_physical_domain(
   scratch.mkdir(mode=0o700)
   archived = route(tmp_path, "00000002--2222222222", ("2" * 64,))
   local = route(tmp_path, "00000003--3333333333", ("3" * 64,))
+  archived_car_params = b"archived-route-car-params"
+  local_car_params = b"local-canary-car-params"
   archived_provenance = prepared_provenance()
+  archived_provenance["car_params_sha256"] = hashlib.sha256(
+    archived_car_params,
+  ).hexdigest()
   local_provenance = dict(archived_provenance)
-  local_provenance["car_params_sha256"] = "f" * 64
+  local_provenance["car_params_sha256"] = hashlib.sha256(
+    local_car_params,
+  ).hexdigest()
   local_provenance["selected_event_stream_sha256"] = "e" * 64
   outcomes = {
     **accepted_spool_outcomes(
       scratch,
       archived,
       archived_provenance,
+      car_params_bytes=archived_car_params,
     ),
-    **accepted_spool_outcomes(scratch, local, local_provenance),
+    **accepted_spool_outcomes(
+      scratch,
+      local,
+      local_provenance,
+      car_params_bytes=local_car_params,
+    ),
   }
   plan = RemoteRoutePlan(
     discovery=FullRlogDiscovery((archived, local), False),
@@ -1400,7 +1418,11 @@ def test_full_car_params_hash_does_not_fragment_physical_domain(
   )
   engine = CertificationEngine(
     tmp_path,
-    empty_prepared_route(local, local_provenance),
+    empty_prepared_route(
+      local,
+      local_provenance,
+      car_params_bytes=local_car_params,
+    ),
   )
 
   certified = _certify_preparation_domains(
