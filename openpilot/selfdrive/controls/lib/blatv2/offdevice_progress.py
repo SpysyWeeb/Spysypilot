@@ -22,10 +22,15 @@ from typing import Any
 
 
 OFFDEVICE_PROGRESS_PARAM = "BLaTv2OffdeviceProgress"
-OFFDEVICE_PROGRESS_SCHEMA_VERSION = 1
+OFFDEVICE_PROGRESS_SCHEMA_VERSION = 2
 
 _HEX_32_RE = re.compile(r"[0-9a-f]{32}")
 _TOP_LEVEL_KEYS = {
+  "architecture_domain_count",
+  "architecture_domain_index",
+  "architecture_route_identity_sha256",
+  "architecture_segment_count",
+  "architecture_segment_index",
   "completed_artifact_count",
   "completed_bytes",
   "certified_domain_count",
@@ -53,6 +58,9 @@ class OffdeviceProgressPhase(StrEnum):
   REMOTE_PROCESSING = "remote_processing"
   DOWNLOADING = "downloading"
   ARM_CERTIFYING = "arm_certifying"
+  # Wire spelling is retained for display compatibility.  The operation is a
+  # bounded cross-architecture verification, not a full ARM route replay.
+  ARCHITECTURE_VERIFYING = "arm_certifying"
   REMOTE_READY = "remote_ready"
   LOCAL_FALLBACK = "local_fallback"
 
@@ -112,6 +120,13 @@ _CERTIFICATION_FIELDS = (
   "remote_only_rejection_excluded_count",
   "total_certification_domain_count",
   "total_certification_route_count",
+)
+_ARCHITECTURE_FIELDS = (
+  "architecture_domain_count",
+  "architecture_domain_index",
+  "architecture_route_identity_sha256",
+  "architecture_segment_count",
+  "architecture_segment_index",
 )
 
 
@@ -173,6 +188,53 @@ def _certification_values(
   )
 
 
+def _architecture_values(
+  payload: dict[str, object],
+  *,
+  required: bool,
+) -> tuple[int, int, str | None, int | None, int | None] | None:
+  raw = tuple(payload[name] for name in _ARCHITECTURE_FIELDS)
+  if not required and all(value is None for value in raw):
+    return None
+  domain_count = _nonnegative_int(raw[0], "architecture_domain_count")
+  domain_index = _nonnegative_int(raw[1], "architecture_domain_index")
+  route_identity = raw[2]
+  segment_count = _optional_nonnegative_int(
+    raw[3],
+    "architecture_segment_count",
+  )
+  segment_index = _optional_nonnegative_int(
+    raw[4],
+    "architecture_segment_index",
+  )
+  if domain_index > domain_count:
+    raise ValueError("architecture domain coordinate is outside its bounds")
+  if route_identity is not None and (
+    type(route_identity) is not str
+    or re.fullmatch(r"[0-9a-f]{64}", route_identity) is None
+  ):
+    raise ValueError("architecture route identity is invalid")
+  if (segment_count is None) != (segment_index is None):
+    raise ValueError("architecture segment coordinate must be all present or null")
+  if segment_count is not None and (
+    segment_count == 0
+    or segment_index is None
+    or not 1 <= segment_index <= segment_count <= 3
+  ):
+    raise ValueError("architecture segment coordinate is outside its bounds")
+  if route_identity is None and segment_count is not None:
+    raise ValueError("architecture segment progress requires a route identity")
+  if route_identity is not None and domain_index == 0:
+    raise ValueError("architecture route requires an active domain")
+  return (
+    domain_count,
+    domain_index,
+    route_identity,
+    segment_count,
+    segment_index,
+  )
+
+
 def validate_offdevice_progress_payload(payload: object) -> dict[str, object]:
   """Validate and normalize the exact informational schema."""
   if type(payload) is not dict or set(payload) != _TOP_LEVEL_KEYS:
@@ -231,6 +293,7 @@ def validate_offdevice_progress_payload(payload: object) -> dict[str, object]:
       raise ValueError("remote processing coordinate is outside its bounds")
     _require_null(payload, _DOWNLOAD_FIELDS, phase.value)
     _require_null(payload, _CERTIFICATION_FIELDS, phase.value)
+    _require_null(payload, _ARCHITECTURE_FIELDS, phase.value)
   elif phase is OffdeviceProgressPhase.DOWNLOADING:
     if any(value is None for value in download_values):
       raise ValueError("artifact download requires every transfer counter")
@@ -248,10 +311,15 @@ def validate_offdevice_progress_payload(payload: object) -> dict[str, object]:
       raise ValueError("artifact download progress is outside its bounds")
     _require_null(payload, _REMOTE_FIELDS, phase.value)
     _require_null(payload, _CERTIFICATION_FIELDS, phase.value)
+    _require_null(payload, _ARCHITECTURE_FIELDS, phase.value)
   elif phase is OffdeviceProgressPhase.ARM_CERTIFYING:
     _require_null(payload, _REMOTE_FIELDS, phase.value)
     _require_null(payload, _DOWNLOAD_FIELDS, phase.value)
     _certification_values(payload, required=True)
+    architecture = _architecture_values(payload, required=True)
+    assert architecture is not None
+    if architecture[0] != payload["total_certification_domain_count"]:
+      raise ValueError("architecture and certification domain totals disagree")
   elif phase is OffdeviceProgressPhase.REMOTE_READY:
     _require_null(payload, _REMOTE_FIELDS, phase.value)
     _require_null(payload, _DOWNLOAD_FIELDS, phase.value)
@@ -260,10 +328,12 @@ def validate_offdevice_progress_payload(payload: object) -> dict[str, object]:
     certified_domains, certified_routes, excluded_routes, total_domains, total_routes = certification
     if certified_domains != total_domains or certified_routes + excluded_routes != total_routes:
       raise ValueError("remote-ready progress requires complete certification coverage")
+    _require_null(payload, _ARCHITECTURE_FIELDS, phase.value)
   else:
     _require_null(payload, _REMOTE_FIELDS, phase.value)
     _require_null(payload, _DOWNLOAD_FIELDS, phase.value)
     _certification_values(payload, required=False)
+    _require_null(payload, _ARCHITECTURE_FIELDS, phase.value)
 
   normalized = dict(payload)
   normalized.update({
@@ -377,6 +447,24 @@ class OffdeviceProgressPublisher:
       ):
         raise ValueError("certification progress moved backward")
 
+    previous_architecture = _architecture_values(previous, required=False)
+    current_architecture = _architecture_values(current, required=False)
+    if previous_architecture is not None and current_architecture is not None:
+      if current_architecture[0] != previous_architecture[0]:
+        raise ValueError("architecture verification inventory changed")
+      previous_domain = previous_architecture[1]
+      current_domain = current_architecture[1]
+      if current_domain < previous_domain:
+        raise ValueError("architecture verification domain moved backward")
+      if (
+        current_domain == previous_domain
+        and current_architecture[2] == previous_architecture[2]
+        and current_architecture[4] is not None
+        and previous_architecture[4] is not None
+        and current_architecture[4] < previous_architecture[4]
+      ):
+        raise ValueError("architecture verification segment moved backward")
+
     if previous_phase is OffdeviceProgressPhase.LOCAL_FALLBACK:
       if current["fallback_reason_code"] != previous["fallback_reason_code"]:
         raise ValueError("local fallback reason changed")
@@ -399,6 +487,11 @@ class OffdeviceProgressPublisher:
     remote_only_rejection_excluded_count: int | None = None,
     total_certification_domain_count: int | None = None,
     total_certification_route_count: int | None = None,
+    architecture_domain_count: int | None = None,
+    architecture_domain_index: int | None = None,
+    architecture_route_identity_sha256: str | None = None,
+    architecture_segment_count: int | None = None,
+    architecture_segment_index: int | None = None,
     fallback_reason_code: OffdeviceFallbackReason | str | None = None,
   ) -> bytes:
     resolved_phase = OffdeviceProgressPhase(phase)
@@ -424,6 +517,13 @@ class OffdeviceProgressPublisher:
 
     now = int(self._monotonic_ns())
     encoded = build_offdevice_progress_bytes(
+      architecture_domain_count=architecture_domain_count,
+      architecture_domain_index=architecture_domain_index,
+      architecture_route_identity_sha256=(
+        architecture_route_identity_sha256
+      ),
+      architecture_segment_count=architecture_segment_count,
+      architecture_segment_index=architecture_segment_index,
       completed_artifact_count=completed_artifact_count,
       completed_bytes=completed_bytes,
       certified_domain_count=certified_domain_count,

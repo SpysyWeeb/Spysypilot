@@ -416,7 +416,7 @@ class OffdeviceBridgeClient:
     self.wall_time_ms = wall_time_ms
     self.nonce_factory = nonce_factory
     self.replay_guard = ResponseReplayGuard()
-    self._worker_implementation_identity: tuple[str, str, str] | None = None
+    self._worker_implementation_identity: tuple[str, ...] | None = None
 
   def _check_worker_implementation_identity(
     self,
@@ -428,6 +428,9 @@ class OffdeviceBridgeClient:
       str(payload["worker_instance_id"]),
       str(payload["worker_implementation_commit"]),
       str(payload["worker_implementation_sha256"]),
+      str(payload["preparation_implementation_sha256"]),
+      str(payload["worker_numerical_environment_sha256"]),
+      str(payload["worker_preparation_implementation_sha256"]),
     )
     expected = self._worker_implementation_identity
     if expected is None:

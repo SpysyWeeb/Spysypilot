@@ -2,7 +2,7 @@
 
 This module is deliberately standard-library-only and independent of Params,
 the learner, messaging, and every actuating path.  It defines protocol version
-1 exactly; changing a key, type, limit, or authentication rule requires a new
+2 exactly; changing a key, type, limit, or authentication rule requires a new
 protocol version.
 
 HMAC authenticates the canonical JSON bytes.  It does not make the LAN traffic
@@ -23,7 +23,7 @@ import time
 from typing import Final
 
 
-PROTOCOL_VERSION: Final = 1
+PROTOCOL_VERSION: Final = 2
 DISCOVERY_PORT: Final = 47831
 HTTP_PORT: Final = 47830
 MAX_CLOCK_SKEW_MS: Final = 30_000
@@ -531,7 +531,8 @@ def _validate_outcome(value: object) -> None:
   disposition = disposition_value
   if disposition == "prepared":
     outcome = _exact_dict(value, "prepared outcome", {
-      "authority_index", "descriptor", "disposition", "route_name",
+      "authority_index", "certification_vector", "descriptor", "disposition",
+      "route_name",
     })
     descriptor = _exact_dict(outcome["descriptor"], "artifact descriptor", {
       "artifact_id",
@@ -553,6 +554,46 @@ def _validate_outcome(value: object) -> None:
     _integer(descriptor["frame_count"], "frame_count", maximum=MAX_PROGRESS_COUNT)
     if type(descriptor["provenance"]) is not dict:
       raise BridgeCorruptError("artifact provenance must be an object")
+    vector = _exact_dict(
+      outcome["certification_vector"],
+      "certification vector descriptor",
+      {
+        "artifact_id",
+        "route_name",
+        "selected_controls_witnesses",
+        "selected_segment_count",
+        "selection_identity_sha256",
+        "sha256",
+        "size_bytes",
+      },
+    )
+    _matching_string(vector["artifact_id"], "vector artifact_id", _HEX_64_RE)
+    _matching_string(vector["sha256"], "vector sha256", _HEX_64_RE)
+    _matching_string(
+      vector["selection_identity_sha256"],
+      "vector selection identity",
+      _HEX_64_RE,
+    )
+    _validate_route(vector["route_name"])
+    if vector["route_name"] != outcome["route_name"]:
+      raise BridgeCorruptError("vector route does not match outcome route")
+    _integer(
+      vector["size_bytes"],
+      "vector artifact size",
+      minimum=1,
+      maximum=MAX_ARTIFACT_HEADER_BYTES,
+    )
+    _integer(
+      vector["selected_segment_count"],
+      "vector selected segment count",
+      minimum=1,
+      maximum=3,
+    )
+    _integer(
+      vector["selected_controls_witnesses"],
+      "vector selected controls witnesses",
+      maximum=30_000,
+    )
   else:
     outcome = _exact_dict(value, "rejected outcome", {
       "authority_index", "disposition", "message", "reason", "route_name",
@@ -586,12 +627,15 @@ def validate_response_payload(operation: str, status: str, payload: object) -> N
       "historical_descriptor_registry_sha256",
       "opendbc_commit",
       "panda_commit",
+      "preparation_implementation_sha256",
       "source_commit",
       "state",
       "worker_extractor_sha256",
       "worker_implementation_commit",
       "worker_implementation_sha256",
       "worker_instance_id",
+      "worker_numerical_environment_sha256",
+      "worker_preparation_implementation_sha256",
       "worker_count",
     })
     if body["state"] != "ready" or type(body["state"]) is not str:
@@ -618,6 +662,12 @@ def validate_response_payload(operation: str, status: str, payload: object) -> N
       "worker_implementation_sha256",
       _HEX_64_RE,
     )
+    for key in (
+      "preparation_implementation_sha256",
+      "worker_numerical_environment_sha256",
+      "worker_preparation_implementation_sha256",
+    ):
+      _matching_string(body[key], key, _HEX_64_RE)
     _matching_string(body["worker_instance_id"], "worker_instance_id", _HEX_64_RE)
     if body["worker_count"] != 4 or type(body["worker_count"]) is not int:
       raise BridgeIncompatibleError("worker count is incompatible")
@@ -667,11 +717,14 @@ def validate_response_payload(operation: str, status: str, payload: object) -> N
   elif operation == "job_create":
     body = _exact_dict(payload, "job create response", {
       "job_id",
+      "preparation_implementation_sha256",
       "route_count",
       "state",
       "worker_implementation_commit",
       "worker_implementation_sha256",
       "worker_instance_id",
+      "worker_numerical_environment_sha256",
+      "worker_preparation_implementation_sha256",
     })
     _matching_string(body["job_id"], "job_id", _HEX_32_RE)
     _matching_string(
@@ -685,6 +738,12 @@ def validate_response_payload(operation: str, status: str, payload: object) -> N
       _HEX_64_RE,
     )
     _matching_string(body["worker_instance_id"], "worker_instance_id", _HEX_64_RE)
+    for key in (
+      "preparation_implementation_sha256",
+      "worker_numerical_environment_sha256",
+      "worker_preparation_implementation_sha256",
+    ):
+      _matching_string(body[key], key, _HEX_64_RE)
     # Idempotent create may return the durable result of an earlier request
     # whose acknowledgement was lost, including a terminal failure/cancel.
     if type(body["state"]) is not str or body["state"] not in JOB_STATES:
@@ -701,6 +760,7 @@ def validate_response_payload(operation: str, status: str, payload: object) -> N
       "error",
       "job_id",
       "outcomes",
+      "preparation_implementation_sha256",
       "progress",
       "state",
       "updated_unix_ms",
@@ -708,6 +768,8 @@ def validate_response_payload(operation: str, status: str, payload: object) -> N
       "worker_implementation_commit",
       "worker_implementation_sha256",
       "worker_instance_id",
+      "worker_numerical_environment_sha256",
+      "worker_preparation_implementation_sha256",
     })
     _matching_string(body["job_id"], "job_id", _HEX_32_RE)
     if type(body["state"]) is not str or body["state"] not in JOB_STATES:
@@ -736,6 +798,12 @@ def validate_response_payload(operation: str, status: str, payload: object) -> N
       _HEX_64_RE,
     )
     _matching_string(body["worker_instance_id"], "worker_instance_id", _HEX_64_RE)
+    for key in (
+      "preparation_implementation_sha256",
+      "worker_numerical_environment_sha256",
+      "worker_preparation_implementation_sha256",
+    ):
+      _matching_string(body[key], key, _HEX_64_RE)
     _validate_progress(body["progress"])
     outcomes = body["outcomes"]
     if type(outcomes) is not list or len(outcomes) > 2 * MAX_ROUTE_COUNT:

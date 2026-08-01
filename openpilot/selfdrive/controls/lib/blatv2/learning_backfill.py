@@ -56,8 +56,10 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   LearningArtifactPaths,
-  MeasuredLearningFrame,
   PersistentLearningRuntime,
+)
+from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import (
+  MeasuredLearningFrame,
 )
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ControlsWitness,
@@ -659,6 +661,7 @@ class ReplayResult:
   route_evidence_model_publication_count: int = 0
   route_evidence_control_witness_count: int = 0
   route_evidence_event_locator_count: int = 0
+  route_evidence_source_key: str | None = None
 
   def ledger_entry(self) -> dict[str, object]:
     return {
@@ -2613,8 +2616,39 @@ def _prepare_route_with_extractor(
   abort_requested: Callable[[], bool] = lambda: False,
   segment_started: Callable[[RouteSegment, int, int], None] | None = None,
   segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
+  structural_first_segment_index: int | None = None,
+  structural_last_segment_index: int | None = None,
+  maximum_controls_witnesses: int = MAXIMUM_ROUTE_FRAMES,
+  route_car_params_seed: bytes | None = None,
 ) -> PreparedRoute:
   """Validate one complete route before exposing any frame to the learner."""
+  if (
+    type(maximum_controls_witnesses) is not int
+    or maximum_controls_witnesses <= 0
+    or maximum_controls_witnesses > MAXIMUM_ROUTE_FRAMES
+  ):
+    raise ValueError("maximum controls witness bound is invalid")
+  first_segment_index = (
+    route.segments[0].index
+    if structural_first_segment_index is None
+    else structural_first_segment_index
+  )
+  last_segment_index = (
+    route.segments[-1].index
+    if structural_last_segment_index is None
+    else structural_last_segment_index
+  )
+  if (
+    type(first_segment_index) is not int
+    or type(last_segment_index) is not int
+    or first_segment_index < 0
+    or last_segment_index < first_segment_index
+    or any(
+      segment.index < first_segment_index or segment.index > last_segment_index
+      for segment in route.segments
+    )
+  ):
+    raise ValueError("route structural boundary indices are invalid")
   route_records: dict[str, list[_TimedRouteRecord]] = {
     service: []
     for service in (
@@ -2625,8 +2659,20 @@ def _prepare_route_with_extractor(
   }
   first_source_time: dict[str, int] = {}
   decoded_controls_count = 0
-  route_car_params_bytes: bytes | None = None
+  if route_car_params_seed is not None and type(route_car_params_seed) is not bytes:
+    raise ValueError("route CarParams seed must be immutable bytes")
+  route_car_params_bytes: bytes | None = route_car_params_seed
   route_car_params: Any | None = None
+  if route_car_params_bytes is not None:
+    try:
+      route_car_params = car_params_decoder(route_car_params_bytes)
+    except BackfillError:
+      raise
+    except Exception as exc:
+      raise RouteRejected(
+        "car_params_decode_failed",
+        "route CarParams seed could not be decoded",
+      ) from exc
   route_descriptor: BuildDescriptor | None = None
   route_init_identity: tuple[object, ...] | None = None
   route_time_origin_mono_ns: int | None = None
@@ -2841,18 +2887,20 @@ def _prepare_route_with_extractor(
           first_source_time.setdefault(which, record.mono_ns)
         if which == "controlsState":
           decoded_controls_count += 1
-          if decoded_controls_count > MAXIMUM_ROUTE_FRAMES:
+          if decoded_controls_count > maximum_controls_witnesses:
             raise RouteRejected(
               "route_too_large",
               "route exceeds bounded controls witness count",
             )
 
     expected_start = (
-      "startOfRoute" if segment.index == 0 else "startOfSegment"
+      "startOfRoute"
+      if segment.index == first_segment_index
+      else "startOfSegment"
     )
     expected_end = (
       "endOfRoute"
-      if segment.index == route.segments[-1].index
+      if segment.index == last_segment_index
       else "endOfSegment"
     )
     if (
@@ -3030,6 +3078,10 @@ def prepare_route(
   abort_requested: Callable[[], bool] = lambda: False,
   segment_started: Callable[[RouteSegment, int, int], None] | None = None,
   segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
+  structural_first_segment_index: int | None = None,
+  structural_last_segment_index: int | None = None,
+  maximum_controls_witnesses: int = MAXIMUM_ROUTE_FRAMES,
+  route_car_params_seed: bytes | None = None,
 ) -> PreparedRoute:
   """Prepare one route with one hash-bound extractor inode held throughout."""
   extractor = open_verified_extractor(
@@ -3052,6 +3104,10 @@ def prepare_route(
       abort_requested=abort_requested,
       segment_started=segment_started,
       segment_completed=segment_completed,
+      structural_first_segment_index=structural_first_segment_index,
+      structural_last_segment_index=structural_last_segment_index,
+      maximum_controls_witnesses=maximum_controls_witnesses,
+      route_car_params_seed=route_car_params_seed,
     )
   finally:
     try:
@@ -3831,16 +3887,17 @@ def publish_generation(
 
 def _prepared_route_evidence_summary(
   prepared: PreparedRoute | PreparedRouteSpool,
-) -> tuple[str | None, int, int, int]:
+) -> tuple[str | None, int, int, int, str | None]:
   artifact = getattr(prepared, "route_evidence", None)
   if artifact is None:
-    return None, 0, 0, 0
+    return None, 0, 0, 0, None
   manifest = artifact.manifest
   return (
     str(artifact.sha256),
     int(manifest["model_publication_count"]),
     int(manifest["control_witness_count"]),
     int(manifest["driving_event_locator_count"]),
+    str(artifact.source_key),
   )
 
 
@@ -3932,6 +3989,7 @@ def replay_routes(
         route_evidence_model_count,
         route_evidence_control_count,
         route_evidence_event_count,
+        route_evidence_source_key,
       ) = _prepared_route_evidence_summary(prepared)
       accepted_total += accepted
       rejected_total += rejected
@@ -3952,6 +4010,7 @@ def replay_routes(
           route_evidence_control_count
         ),
         route_evidence_event_locator_count=route_evidence_event_count,
+        route_evidence_source_key=route_evidence_source_key,
       ))
       if route_completed is not None:
         route_completed(route, accepted_total, rejected_total)
@@ -4038,7 +4097,21 @@ def _stage_route_evidence(
   path = _route_evidence_staging_path(root, authority_index, artifact.sha256)
   path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
   if path.exists():
-    if path.is_symlink() or not path.is_file() or path.read_bytes() != artifact.canonical_bytes:
+    digest = hashlib.sha256()
+    try:
+      with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+          digest.update(block)
+    except OSError as error:
+      raise BackfillError(
+        "backfill_nondeterministic",
+        "route-evidence staging object cannot be inspected",
+      ) from error
+    if (
+      path.is_symlink()
+      or not path.is_file()
+      or digest.hexdigest() != artifact.sha256
+    ):
       raise BackfillError(
         "backfill_nondeterministic",
         "route-evidence staging object is not immutable",
@@ -4074,6 +4147,97 @@ def _stage_route_evidence(
       pass
 
 
+def _stage_route_evidence_spool(
+  *,
+  root: Path,
+  authority_index: int,
+  spool: PreparedRouteSpool,
+) -> None:
+  """Stage a complete remote artifact with constant-size copy buffers."""
+  artifact = spool.route_evidence
+  path = _route_evidence_staging_path(root, authority_index, artifact.sha256)
+  path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  source = spool.canonical_path
+  if path.exists():
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+      while block := stream.read(1024 * 1024):
+        digest.update(block)
+    if path.is_symlink() or not path.is_file() or digest.hexdigest() != artifact.sha256:
+      raise BackfillError(
+        "backfill_nondeterministic",
+        "route-evidence staging object is not immutable",
+      )
+    return
+  source_info = source.lstat()
+  expected_source = (
+    artifact.st_dev, artifact.st_ino, artifact.st_size,
+    artifact.st_mtime_ns, artifact.st_ctime_ns,
+  )
+  if (
+    source_info.st_dev, source_info.st_ino, source_info.st_size,
+    source_info.st_mtime_ns, source_info.st_ctime_ns,
+  ) != expected_source or source.is_symlink():
+    raise BackfillError(
+      "backfill_nondeterministic",
+      "remote route-evidence source changed before staging",
+    )
+  # Do not hard-link the downloaded spool: link/unlink changes inode ctime and
+  # would invalidate the held PreparedRouteSpool identity before its physical
+  # plane is streamed.  A bounded-buffer copy keeps the source immutable and
+  # preserves the exact A/A application contract.
+  descriptor, temporary_name = tempfile.mkstemp(
+    dir=path.parent, prefix=f".{path.name}.", suffix=".partial",
+  )
+  temporary = Path(temporary_name)
+  source_descriptor = -1
+  try:
+    os.fchmod(descriptor, 0o600)
+    source_descriptor = os.open(
+      source,
+      os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    opened_source = os.fstat(source_descriptor)
+    if (
+      opened_source.st_dev, opened_source.st_ino, opened_source.st_size,
+      opened_source.st_mtime_ns, opened_source.st_ctime_ns,
+    ) != expected_source:
+      raise BackfillError(
+        "backfill_nondeterministic",
+        "remote route-evidence source changed during staging",
+      )
+    while block := os.read(source_descriptor, 1024 * 1024):
+      view = memoryview(block)
+      while view:
+        count = os.write(descriptor, view)
+        if count <= 0:
+          raise OSError("short route-evidence staging write")
+        view = view[count:]
+    after_source = os.fstat(source_descriptor)
+    if (
+      after_source.st_dev, after_source.st_ino, after_source.st_size,
+      after_source.st_mtime_ns, after_source.st_ctime_ns,
+    ) != expected_source:
+      raise BackfillError(
+        "backfill_nondeterministic",
+        "remote route-evidence source changed during staging",
+      )
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = -1
+    os.replace(temporary, path)
+    _fsync_directory(path.parent)
+  finally:
+    if source_descriptor >= 0:
+      os.close(source_descriptor)
+    if descriptor >= 0:
+      os.close(descriptor)
+    try:
+      temporary.unlink()
+    except FileNotFoundError:
+      pass
+
+
 def _publish_route_evidence_after_aa(
   *,
   root: Path,
@@ -4095,6 +4259,9 @@ def _publish_route_evidence_after_aa(
       or second_result.disposition != "ingested"
       or first_result.route_evidence_sha256 is None
       or second_result.route_evidence_sha256 != first_result.route_evidence_sha256
+      or first_result.route_evidence_source_key is None
+      or second_result.route_evidence_source_key
+      != first_result.route_evidence_source_key
     ):
       raise BackfillError(
         "backfill_nondeterministic",
@@ -4104,13 +4271,12 @@ def _publish_route_evidence_after_aa(
     first_path = _route_evidence_staging_path(root, 1, sha)
     second_path = _route_evidence_staging_path(root, 2, sha)
     try:
-      first_artifact = RouteEvidenceArtifact.from_bytes(
-        first_path.read_bytes(),
+      store.publish_files(
+        first_path,
+        second_path,
+        sha256=sha,
+        source_key=first_result.route_evidence_source_key,
       )
-      second_artifact = RouteEvidenceArtifact.from_bytes(
-        second_path.read_bytes(),
-      )
-      store.publish(first_artifact, second_artifact)
       # The authority files are transaction scratch, not a third durable copy
       # of every route.  Remove them only after the content-addressed store has
       # fsynced its exact A/A result.
@@ -5429,16 +5595,23 @@ class HistoricalLearningBackfill:
         segment_completed=segment_completed,
       )
     artifact = getattr(prepared, "route_evidence", None)
-    if type(artifact) is not RouteEvidenceArtifact:
+    if isinstance(prepared, PreparedRouteSpool):
+      _stage_route_evidence_spool(
+        root=runtime.artifact_paths.root,
+        authority_index=authority_index,
+        spool=prepared,
+      )
+    elif type(artifact) is RouteEvidenceArtifact:
+      _stage_route_evidence(
+        root=runtime.artifact_paths.root,
+        authority_index=authority_index,
+        artifact=artifact,
+      )
+    else:
       raise BackfillError(
         "backfill_route_incompatible",
         "prepared route lacks complete shared route evidence v2",
       )
-    _stage_route_evidence(
-      root=runtime.artifact_paths.root,
-      authority_index=authority_index,
-      artifact=artifact,
-    )
     return prepared
 
   def _run_once_with_extractor_identity(self) -> BackfillRunResult:

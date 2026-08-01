@@ -44,6 +44,11 @@ class FakeParams:
 
 def empty_payload(**changes: object) -> dict[str, object]:
   payload: dict[str, object] = {
+    "architecture_domain_count": None,
+    "architecture_domain_index": None,
+    "architecture_route_identity_sha256": None,
+    "architecture_segment_count": None,
+    "architecture_segment_index": None,
     "completed_artifact_count": None,
     "completed_bytes": None,
     "certified_domain_count": None,
@@ -87,6 +92,8 @@ def downloading_payload(**changes: object) -> dict[str, object]:
 
 def certifying_payload(**changes: object) -> dict[str, object]:
   payload = empty_payload(
+    architecture_domain_count=5,
+    architecture_domain_index=2,
     certified_domain_count=2,
     certified_route_count=17,
     phase="arm_certifying",
@@ -104,6 +111,8 @@ def certifying_payload(**changes: object) -> dict[str, object]:
 
 def ready_payload(**changes: object) -> dict[str, object]:
   payload = certifying_payload(
+    architecture_domain_count=None,
+    architecture_domain_index=None,
     certified_domain_count=5,
     certified_route_count=37,
     phase="remote_ready",
@@ -166,6 +175,8 @@ def publish_certification(
 ) -> dict[str, object]:
   return decode_offdevice_progress(publisher.publish(
     phase=OffdeviceProgressPhase.ARM_CERTIFYING,
+    architecture_domain_count=5,
+    architecture_domain_index=domains,
     certified_domain_count=domains,
     certified_route_count=routes,
     remote_only_rejection_excluded_count=excluded,
@@ -219,7 +230,7 @@ def test_every_legal_phase_shape_round_trips(payload: dict[str, object]) -> None
 @pytest.mark.parametrize(
   ("changes", "message"),
   (
-    ({"schema_version": 2}, "schema"),
+    ({"schema_version": 3}, "schema"),
     ({"schema_version": True}, "schema"),
     ({"informational_only": False}, "schema"),
     ({"session_id": "A" * 32}, "session_id"),
@@ -313,6 +324,35 @@ def test_remote_only_exclusions_are_explicit_in_certification_ready_and_fallback
   assert decode_offdevice_progress(
     build_offdevice_progress_bytes(**certification),
   )["remote_only_rejection_excluded_count"] == 20
+
+
+def test_architecture_verification_reports_active_route_and_vector_segment() -> None:
+  payload = certifying_payload(
+    architecture_domain_index=3,
+    architecture_route_identity_sha256="ab" * 32,
+    architecture_segment_count=3,
+    architecture_segment_index=2,
+    certified_domain_count=2,
+  )
+  decoded = decode_offdevice_progress(
+    build_offdevice_progress_bytes(**payload),
+  )
+  assert decoded["phase"] == "arm_certifying"
+  assert decoded["architecture_domain_index"] == 3
+  assert decoded["architecture_route_identity_sha256"] == "ab" * 32
+  assert decoded["architecture_segment_index"] == 2
+  assert decoded["architecture_segment_count"] == 3
+
+  with pytest.raises(ValueError, match="outside its bounds"):
+    build_offdevice_progress_bytes(**{
+      **payload,
+      "architecture_segment_index": 4,
+    })
+  with pytest.raises(ValueError, match="requires a route"):
+    build_offdevice_progress_bytes(**{
+      **payload,
+      "architecture_route_identity_sha256": None,
+    })
 
   ready = ready_payload(certified_route_count=18, remote_only_rejection_excluded_count=20)
   assert decode_offdevice_progress(

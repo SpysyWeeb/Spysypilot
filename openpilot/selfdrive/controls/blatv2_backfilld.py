@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import base64
 import hashlib
+import json
 import os
 import signal
 from pathlib import Path
@@ -24,7 +25,6 @@ from openpilot.selfdrive.controls.blatv2_learnerd import (
   default_learning_storage_root,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
-  MAXIMUM_EVENT_TRAVERSAL_WORDS,
   BackfillPublication,
   BackfillError,
   BuildDescriptorRegistry,
@@ -33,8 +33,10 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   has_pending_full_rlog,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
+  LEARNING_OPERATION_STATUS_PARAM,
   LearningOperationState,
   LearningOperationStatusPublisher,
+  decode_learning_operation_status,
   route_identity_sha256,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
@@ -55,6 +57,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_pipeline import (
   OffroadBehaviorLearningPipeline,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
+  ArchitectureVerificationError,
   BridgeFallbackUnavailableError,
   RemotePreparationSession,
   prepare_remote_session,
@@ -69,9 +72,11 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
   load_bridge_worker_host,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_progress import (
+  OFFDEVICE_PROGRESS_PARAM,
   OffdeviceFallbackReason,
   OffdeviceProgressPhase,
   OffdeviceProgressPublisher,
+  decode_offdevice_progress,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeAbortedError,
@@ -80,26 +85,28 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeRemoteError,
   BridgeUnavailableError,
 )
+from openpilot.selfdrive.controls.lib.blatv2.preparation_identity import (
+  PreparationIdentityError,
+  numerical_environment_sha256,
+  preparation_implementation_sha256,
+)
+from openpilot.selfdrive.controls.lib.blatv2.preparation_contract import (
+  HISTORICAL_BUILD_DESCRIPTORS,
+  NATIVE_EXTRACTOR_PATH,
+  PROVISIONAL_RACK_DYNAMICS_PATH,
+  decode_car_params as _decode_car_params,
+)
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
   build_runtime_vehicle_bundle,
 )
 
 
-HISTORICAL_BUILD_DESCRIPTORS = (
-  Path(__file__).resolve().parent
-  / "lib"
-  / "blatv2"
-  / "historical_build_descriptors.json"
-)
-NATIVE_EXTRACTOR_PATH = (
-  Path(BASEDIR)
-  / "openpilot"
-  / "selfdrive"
-  / "controls"
-  / "blatv2_rlog_extract"
-)
 PENDING_ROUTE_POLL_S = 1.0
+# A decoded CE-sized route can approach one GiB.  The optional PC worker keeps
+# four-way throughput, but comma's complete local fallback intentionally owns
+# one route at a time so loss of the worker cannot OOM the offroad daemon.
+DEVICE_LOCAL_BACKFILL_REPLAY_WORKER_COUNT = 1
 
 
 class _BestEffortOffdeviceProgress:
@@ -145,15 +152,6 @@ def _decode_text(value: object) -> str | None:
   return None
 
 
-def _decode_car_params(encoded: bytes) -> car.CarParams:
-  with car.CarParams.from_bytes(
-    encoded,
-    traversal_limit_in_words=MAXIMUM_EVENT_TRAVERSAL_WORDS,
-    nesting_limit=64,
-  ) as reader:
-    return reader.as_builder()
-
-
 def _serialize_owned_car_params(car_params: car.CarParams) -> bytes:
   """Serialize the owned builder once before any retryable remote work."""
   return bytes(car_params.to_bytes())
@@ -193,6 +191,48 @@ class BlatV2BackfillDaemon:
       OffdeviceProgressPublisher(self.params),
     )
     self._stopping = False
+    self._recover_interrupted_architecture_verification()
+
+  def _recover_interrupted_architecture_verification(self) -> None:
+    """Replace a SIGKILL-stale verifying projection with a terminal fact."""
+    try:
+      raw_progress = self.params.get(OFFDEVICE_PROGRESS_PARAM, block=False)
+      raw_operation = self.params.get(
+        LEARNING_OPERATION_STATUS_PARAM,
+        block=False,
+      )
+      if raw_progress is None or raw_operation is None:
+        return
+      try:
+        progress = decode_offdevice_progress(raw_progress)
+      except ValueError:
+        # Schema-v1 verification progress can survive a process-only restart.
+        # It is display-only; recognize only its terminally meaningful phase.
+        legacy = json.loads(raw_progress)
+        if type(legacy) is not dict or legacy.get("phase") != "arm_certifying":
+          return
+        progress = {"phase": "arm_certifying"}
+      operation = decode_learning_operation_status(raw_operation)
+      if (
+        progress["phase"] != OffdeviceProgressPhase.ARM_CERTIFYING.value
+        or operation["terminal"] is True
+      ):
+        return
+      self.operation_status.publish(
+        state=LearningOperationState.FAILED,
+        diagnostic="architecture_verification_interrupted",
+        new_operation=True,
+        accepted_sample_count=operation["accepted_sample_count"],
+        rejected_sample_count=operation["rejected_sample_count"],
+        retry_count=operation["retry_count"],
+        runtime_identity_sha256=operation["runtime_identity_sha256"],
+        vehicle_identity=operation["vehicle_identity"],
+      )
+      self.offdevice_progress.clear()
+    except Exception:
+      # Recovery is display-only and must not prevent the next fresh offroad
+      # transaction from reporting its own authoritative failure.
+      cloudlog.exception("blatv2 interrupted verification recovery failed")
 
   def stop(self, *_args: object) -> None:
     self._stopping = True
@@ -369,6 +409,7 @@ class BlatV2BackfillDaemon:
       backfill_progress=self.backfill_progress,
       abort_requested=self._abort_requested,
       pending_route_identity=pending_route_identity,
+      replay_worker_count=DEVICE_LOCAL_BACKFILL_REPLAY_WORKER_COUNT,
     )
 
   def _remote_contract(
@@ -424,6 +465,18 @@ class BlatV2BackfillDaemon:
       cloudlog.exception("blatv2 off-device progress cleanup failed")
     contract = self._remote_contract(engine, car_params, encoded_car_params)
     try:
+      preparation_identity = preparation_implementation_sha256(
+        BASEDIR,
+        opendbc_commit=str(contract["opendbc_commit"]),
+        panda_commit=str(contract["panda_commit"]),
+      )
+      device_environment_identity = numerical_environment_sha256()
+    except PreparationIdentityError as exc:
+      raise BackfillError(
+        "backfill_route_incompatible",
+        f"route-preparation implementation identity is unavailable: {exc}",
+      ) from exc
+    try:
       bridge_config = default_bridge_config_directory(self.params)
       secret = load_bridge_secret(bridge_config)
       worker = discover_worker(
@@ -444,6 +497,8 @@ class BlatV2BackfillDaemon:
         engine=engine,
         client=client,
         contract=contract,
+        preparation_implementation_sha256=preparation_identity,
+        device_numerical_environment_sha256=device_environment_identity,
         scratch_parent=runtime.artifact_paths.root,
         abort_requested=self._abort_requested,
         offdevice_progress=self.offdevice_progress,
@@ -477,6 +532,11 @@ class BlatV2BackfillDaemon:
       raise BackfillError(
         "unexpected_error",
         "offroad ownership ended during remote preparation",
+      ) from exc
+    except ArchitectureVerificationError as exc:
+      raise BackfillError(
+        "architecture_verification_failed",
+        f"bounded architecture verification failed: {exc.reason}",
       ) from exc
     except BridgeIncompatibleError as exc:
       raise BackfillError(

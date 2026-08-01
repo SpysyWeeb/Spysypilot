@@ -46,6 +46,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   DriveEvidenceBaseline,
   build_learning_status_payload,
 )
+from openpilot.selfdrive.controls.lib.blatv2.preparation_contract import (
+  PROVISIONAL_RACK_DYNAMICS_PATH,
+)
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
 )
@@ -65,12 +68,6 @@ MEASUREMENT_SERVICES = (
   "carState",
   "carOutput",
   "liveParameters",
-)
-PROVISIONAL_RACK_DYNAMICS_PATH = (
-  Path(__file__).resolve().parent
-  / "lib"
-  / "blatv2"
-  / "provisional_rack_dynamics.json"
 )
 STEP_TIMEOUT_MS = 100
 OPERATION_STATUS_REFRESH_WITNESSES = int(

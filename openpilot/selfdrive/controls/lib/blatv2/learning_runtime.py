@@ -42,6 +42,9 @@ from openpilot.selfdrive.controls.lib.blatv2.measurement import (
   MAX_CONTINUOUS_MEASUREMENT_GAP_S,
   LearningMeasurementBuilder,
 )
+from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import (
+  MeasuredLearningFrame,
+)
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
 )
@@ -180,39 +183,6 @@ class LearningArtifactPaths:
     ):
       raise ValueError("selected profile identity must be lowercase SHA-256")
     return self.selected_profiles / f"{identity}.json"
-
-
-@dataclass(frozen=True, slots=True)
-class MeasuredLearningFrame:
-  """One time-aligned physical-response frame; no command intent is accepted."""
-
-  # controlsState is the canonical race witness. Physical regression uses the
-  # independent response and effective applied-command clocks below.
-  sample_mono_ns: int
-  response_mono_ns: int
-  applied_report_mono_ns: int
-  applied_effective_mono_ns: int
-  speed_mps: float
-  steering_angle_deg: float
-  steering_rate_deg_s: float
-  steering_torque: float
-  steering_pressed: bool
-  standstill: bool
-  steer_fault_temporary: bool
-  steer_fault_permanent: bool
-  can_valid: bool
-  can_timeout: bool
-  applied_torque: float
-  lateral_active: bool
-  live_parameters_valid: bool
-  angle_offset_valid: bool
-  steer_ratio_valid: bool
-  stiffness_factor_valid: bool
-  angle_offset_deg: float
-  steer_ratio: float
-  stiffness_factor: float
-  roll_rad: float
-  inputs_valid: bool
 
 
 def controller_params_from_detected_interface(
