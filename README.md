@@ -25,6 +25,18 @@ openpilot's stock acceleration gate by `10 m/s` (about `22 mph`) and follows
 the stock ceiling above it. The reaction-time jerk tune remains unchanged.
 Requested authority remains clamped to the deployed opendbc limit.
 
+Route `000000d9--6040563d1d` showed that the stock ceiling alone still makes a
+small highway set-speed correction use all available acceleration or the full
+`-1.2 m/s²` cruise deceleration limit. The current in-progress tune adds a
+lead-free Chill cruise comfort response: above `15 m/s`, a `5 mph` error asks
+for about `0.40 m/s²`, tapers continuously as the error closes, and uses the
+pitch-compensated coast estimate during speed reductions. It blends in from
+`8–15 m/s`, so low-speed launch response is retained, while larger errors can
+still reach the existing acceleration and braking envelope. Experimental
+mode, forced deceleration, radar-invalid or lead-following operation, and an
+active model curve-speed limit bypass this shaping. The jerk schedule remains
+unchanged. This is route-replay tuning and still requires owner field testing.
+
 Conditional Experimental Mode is **in progress**. Its target behavior is to
 keep BLoTv2 in Chill mode during ordinary driving, hand the existing
 longitudinal planner to Experimental mode for a confirmed, lead-free model
