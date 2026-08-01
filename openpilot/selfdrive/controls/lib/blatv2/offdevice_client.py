@@ -46,6 +46,7 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
 
 BRIDGE_CONFIG_DIRECTORY: Final = "blatv2-offdevice-bridge"
 BRIDGE_SECRET_FILE: Final = "shared_secret.bin"
+BRIDGE_WORKER_HOST_FILE: Final = "worker_host.txt"
 DISCOVERY_BROADCAST: Final = "255.255.255.255"
 DISCOVERY_TIMEOUT_S: Final = 2.0
 HTTP_TIMEOUT_S: Final = 10.0
@@ -58,6 +59,10 @@ ARTIFACT_RESPONSE_HEADER: Final = "X-BLATV2-Response"
 # decoded-chunk bound for canonical envelope metadata and future-safe framing.
 MAX_SAFE_UPLOAD_CHUNK_BYTES: Final = 4 * 1024 * 1024 - 4096
 _DEFAULT_LIMITS: Final = ProtocolLimits()
+_RFC1918_NETWORKS: Final = tuple(
+  ipaddress.ip_network(value)
+  for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 
 _HTTP_ENDPOINTS: Final = {
   "health": "/v1/health",
@@ -105,15 +110,7 @@ def default_bridge_config_directory(params: Any) -> Path:
   return active_params_directory.parent / BRIDGE_CONFIG_DIRECTORY
 
 
-def load_bridge_secret(config_directory: str | Path) -> bytes:
-  """Load the raw 32-byte secret from a 0700 directory and 0600 file.
-
-  Directories require execute permission to be traversable; therefore the
-  dedicated directory is exactly 0700 while the credential itself is exactly
-  0600.  Missing configuration means the optional PC worker is unavailable.
-  Symlinks, wrong ownership, permissive modes, and malformed credentials fail
-  closed as corrupt configuration.
-  """
+def _validated_bridge_config_directory(config_directory: str | Path) -> Path:
   directory = Path(config_directory)
   try:
     directory_stat = directory.lstat()
@@ -127,6 +124,19 @@ def load_bridge_secret(config_directory: str | Path) -> bytes:
     raise BridgeCorruptError("bridge config directory mode must be 0700")
   if directory_stat.st_uid != os.geteuid():
     raise BridgeCorruptError("bridge config directory owner is incorrect")
+  return directory
+
+
+def load_bridge_secret(config_directory: str | Path) -> bytes:
+  """Load the raw 32-byte secret from a 0700 directory and 0600 file.
+
+  Directories require execute permission to be traversable; therefore the
+  dedicated directory is exactly 0700 while the credential itself is exactly
+  0600.  Missing configuration means the optional PC worker is unavailable.
+  Symlinks, wrong ownership, permissive modes, and malformed credentials fail
+  closed as corrupt configuration.
+  """
+  directory = _validated_bridge_config_directory(config_directory)
 
   secret_path = directory / BRIDGE_SECRET_FILE
   try:
@@ -165,6 +175,72 @@ def load_bridge_secret_for_params(params: Any) -> bytes:
   return load_bridge_secret(default_bridge_config_directory(params))
 
 
+def load_bridge_worker_host(config_directory: str | Path) -> str | None:
+  """Load an optional protected static worker IPv4 address.
+
+  Some mixed Ethernet/Wi-Fi networks suppress layer-2 broadcasts even though
+  direct LAN traffic is available.  A paired installation may therefore pin
+  one worker address beside the secret.  Absence keeps broadcast discovery;
+  a present but unsafe file is configuration corruption, never a reason to
+  silently ignore the pin.
+  """
+  directory = _validated_bridge_config_directory(config_directory)
+  host_path = directory / BRIDGE_WORKER_HOST_FILE
+  try:
+    host_stat = host_path.lstat()
+  except FileNotFoundError:
+    return None
+  except OSError as exc:
+    raise BridgeCorruptError("bridge worker host cannot be inspected") from exc
+  if (
+    not stat.S_ISREG(host_stat.st_mode)
+    or host_path.is_symlink()
+    or stat.S_IMODE(host_stat.st_mode) != 0o600
+    or host_stat.st_uid != os.geteuid()
+    or not (1 <= host_stat.st_size <= 65)
+  ):
+    raise BridgeCorruptError("bridge worker host file is not protected")
+  flags = os.O_RDONLY
+  if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+  try:
+    descriptor = os.open(host_path, flags)
+    try:
+      encoded = os.read(descriptor, 66)
+      after = os.fstat(descriptor)
+    finally:
+      os.close(descriptor)
+  except OSError as exc:
+    raise BridgeCorruptError("bridge worker host could not be read safely") from exc
+  if (
+    after.st_dev != host_stat.st_dev
+    or after.st_ino != host_stat.st_ino
+    or not stat.S_ISREG(after.st_mode)
+    or stat.S_IMODE(after.st_mode) != 0o600
+    or after.st_uid != os.geteuid()
+    or after.st_size != host_stat.st_size
+    or len(encoded) != after.st_size
+  ):
+    raise BridgeCorruptError("bridge worker host changed while being read")
+  try:
+    text = encoded.decode("ascii")
+  except UnicodeDecodeError as exc:
+    raise BridgeCorruptError("bridge worker host is not ASCII") from exc
+  value = text[:-1] if text.endswith("\n") else text
+  if not value or text not in {value, value + "\n"}:
+    raise BridgeCorruptError("bridge worker host encoding is not canonical")
+  try:
+    address = ipaddress.ip_address(value)
+  except ValueError as exc:
+    raise BridgeCorruptError("bridge worker host is not an IP literal") from exc
+  if (
+    not isinstance(address, ipaddress.IPv4Address)
+    or not any(address in network for network in _RFC1918_NETWORKS)
+  ):
+    raise BridgeCorruptError("bridge worker host is not an RFC1918 IPv4 address")
+  return str(address)
+
+
 def _default_udp_socket() -> _SocketLike:
   return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -189,6 +265,7 @@ def discover_worker(
   client_id: str,
   expected_source_commit: str,
   abort_requested: Callable[[], bool],
+  configured_host: str | None = None,
   timeout_s: float = DISCOVERY_TIMEOUT_S,
   socket_factory: Callable[[], _SocketLike] = _default_udp_socket,
   monotonic: Callable[[], float] = time.monotonic,
@@ -199,11 +276,22 @@ def discover_worker(
 
   Unauthenticated LAN packets are ignored.  Once a packet authenticates, any
   schema, time, nonce, source, or build mismatch fails closed rather than
-  allowing a spoofable downgrade to local replay.
+  allowing a spoofable downgrade to local replay.  A protected configured
+  host replaces broadcast transport on networks that suppress broadcasts;
+  the signed discovery exchange and all identity checks remain unchanged.
   """
   if type(timeout_s) not in (int, float) or not 0.0 < timeout_s <= MAX_DISCOVERY_TIMEOUT_S:
     raise ValueError("discovery timeout is outside its bound")
   check_abort(abort_requested)
+  target_host = DISCOVERY_BROADCAST
+  if configured_host is not None:
+    target_host = _private_ip_literal(configured_host, "configured worker host")
+    target_address = ipaddress.ip_address(target_host)
+    if (
+      not isinstance(target_address, ipaddress.IPv4Address)
+      or not any(target_address in network for network in _RFC1918_NETWORKS)
+    ):
+      raise BridgeCorruptError("configured worker host must be RFC1918 IPv4")
   nonce = nonce_factory()
   request = build_request(
     secret=secret,
@@ -221,9 +309,10 @@ def discover_worker(
   except OSError as exc:
     raise BridgeUnavailableError("UDP discovery socket is unavailable") from exc
   try:
-    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    if configured_host is None:
+      udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     udp_socket.settimeout(min(0.1, float(timeout_s)))
-    sent = udp_socket.sendto(request, (DISCOVERY_BROADCAST, DISCOVERY_PORT))
+    sent = udp_socket.sendto(request, (target_host, DISCOVERY_PORT))
     if sent != len(request):
       raise BridgeUnavailableError("UDP discovery request was truncated")
     while monotonic() < deadline:
@@ -244,9 +333,18 @@ def discover_worker(
         maximum_bytes=MAX_DISCOVERY_BYTES,
       ):
         continue
-      if type(source) is not tuple or not source:
+      if (
+        type(source) is not tuple
+        or len(source) < 2
+        or type(source[1]) is not int
+        or source[1] != DISCOVERY_PORT
+      ):
         raise BridgeCorruptError("authenticated discovery source is malformed")
       source_host = _private_ip_literal(source[0], "UDP source")
+      if configured_host is not None and source_host != target_host:
+        raise BridgeCorruptError(
+          "authenticated discovery source is not the configured worker",
+        )
       envelope = validate_response(
         response,
         secret=secret,

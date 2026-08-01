@@ -225,6 +225,15 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   importer without changing the last authenticated generation. Incompatible,
   unauthenticated, replayed, oversized, or corrupt responses fail closed.
 
+Discovery normally uses a signed LAN broadcast. Networks that suppress
+broadcasts between Wi-Fi and Ethernet may instead place one canonical private
+IPv4 address in the protected device file
+`/data/params/blatv2-offdevice-bridge/worker_host.txt` (mode `0600`, beside the
+raw 32-byte secret). When present, that address replaces only the UDP transport
+target: discovery is still HMAC-authenticated, source-pinned, timestamped, and
+bound to the exact source commit. An unreachable configured host is ordinary
+worker unavailability and retains the four-worker local fallback.
+
 Protocol v1 deliberately does not split one publication across worker jobs.
 More than 128 selected replay routes therefore makes the remote backend
 unavailable and runs the complete local transaction. Onroad handoff performs
