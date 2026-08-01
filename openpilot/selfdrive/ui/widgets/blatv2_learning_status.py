@@ -14,10 +14,11 @@ import math
 import re
 
 
-LEARNING_STATUS_SCHEMA_VERSION = 2
+LEARNING_STATUS_SCHEMA_VERSION = 3
 LIFECYCLE_STATUS_SCHEMA_VERSION = 1
 LEARNING_OPERATION_STATUS_SCHEMA_VERSION = 1
 BACKFILL_PROGRESS_SCHEMA_VERSION = 1
+BEHAVIOR_LEARNING_STATUS_SCHEMA_VERSION = 1
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -30,9 +31,13 @@ _TOP_LEVEL_KEYS = frozenset((
   "seed_profile_sha256",
   "evidence_sha256",
   "manifest_sha256",
+  "all_intervals_qualified",
+  "all_nodes_evaluated",
   "all_nodes_qualified",
+  "candidate_profile_available",
   "candidate_profile_sha256",
   "candidate_profile_revision",
+  "interpolation_reports",
   "last_drive_complete",
   "nodes",
 ))
@@ -59,6 +64,8 @@ _NODE_KEYS = frozenset((
   "candidate_validation_rms",
   "clean_support_s",
   "confidence",
+  "evaluation_status",
+  "fit_diagnostics",
   "last_drive_accepted_sample_count",
   "last_drive_authority_fit_sample_count",
   "last_drive_authority_fit_support_s",
@@ -91,8 +98,37 @@ _NODE_KEYS = frozenset((
   "speed_mps",
   "supported_sample_count",
   "training_count",
+  "training_outcome",
+  "training_paired_loss",
   "validation_count",
+  "validation_paired_loss",
   "validation_support_s",
+))
+_FIT_DIAGNOSTIC_KEYS = frozenset((
+  "breakaway_parameter_count",
+  "breakaway_rank",
+  "condition_estimate",
+  "model",
+  "moving_parameter_count",
+  "moving_rank",
+  "status",
+))
+_PAIRED_LOSS_KEYS = frozenset((
+  "lower_bound_mse",
+  "mean_candidate_minus_seed_mse",
+  "numerical_tolerance_mse",
+  "route_count",
+  "uncertainty_mse",
+  "upper_bound_mse",
+))
+_INTERPOLATION_KEYS = frozenset((
+  "interval_index",
+  "lower_speed_mps",
+  "qualified",
+  "reasons",
+  "training_paired_loss",
+  "upper_speed_mps",
+  "validation_paired_loss",
 ))
 _PARAMETER_KEYS = frozenset((
   "kinetic_friction_torque",
@@ -166,35 +202,117 @@ _PROFILE_IDENTITY_KEYS = frozenset((
   "profile_sha256",
   "profile_revision",
 ))
+_BEHAVIOR_STATUS_KEYS = frozenset((
+  "behaviorFinalizationSha256",
+  "behaviorSelectionSha256",
+  "completedReplayJobs",
+  "currentCandidateIndex",
+  "currentRouteIdentity",
+  "currentRouteIndex",
+  "diagnostic",
+  "eligibleRouteCount",
+  "gateSpecSha256",
+  "informationalOnly",
+  "operationId",
+  "physicalGenerationSha256",
+  "physicalProfileSha256",
+  "qualificationDisposition",
+  "reasons",
+  "recordedSourceIdentitySha256",
+  "requiredRouteCount",
+  "runtimeVehicleIdentitySha256",
+  "schemaVersion",
+  "segmentationConfigSha256",
+  "selectedBehaviorPolicySha256",
+  "sequence",
+  "smoothPassed",
+  "startedMonoNs",
+  "state",
+  "strongPassed",
+  "swiftPassed",
+  "targetMateriallyImproved",
+  "terminal",
+  "totalCandidateCount",
+  "totalReplayJobs",
+  "totalRouteCount",
+  "trainingRouteCount",
+  "transactionSha256",
+  "updatedMonoNs",
+  "validationRouteCount",
+  "vehicleIdentity",
+))
+_BEHAVIOR_STATE_DIAGNOSTICS = {
+  "waiting_for_physical_profile": frozenset((
+    "physical_profile_unqualified",
+  )),
+  "waiting_for_routes": frozenset((
+    "insufficient_homogeneous_routes",
+  )),
+  "preparing": frozenset(("validating_route_evidence",)),
+  "training": frozenset(("replaying_training_grid",)),
+  "selecting": frozenset(("selecting_training_winner",)),
+  "validating": frozenset(("replaying_frozen_winner",)),
+  "publishing": frozenset(("publishing_behavior_generation",)),
+  "complete": frozenset(("candidate_qualified", "stock_retained")),
+  "failed": frozenset((
+    "route_evidence_invalid",
+    "replay_nondeterministic",
+    "behavior_transaction_failed",
+    "behavior_publish_failed",
+  )),
+}
+_BEHAVIOR_TERMINAL_STATES = frozenset(("complete", "failed"))
+_BEHAVIOR_DISPOSITIONS = frozenset((
+  "stock_retained",
+  "qualified_candidate_available",
+))
 _REASONS = frozenset((
   "qualified",
+  "learned",
+  "seed_retained",
   "insufficient_support",
   "insufficient_validation",
   "insufficient_excitation",
   "insufficient_moving_evidence",
   "insufficient_breakaway_evidence",
+  "rank_deficient_fit",
+  "ill_conditioned_fit",
   "singular_fit",
   "invalid_parameters",
+  "validation_inconclusive",
   "validation_regression",
   "moving_validation_regression",
   "breakaway_validation_regression",
   "authority_validation_regression",
+  "interpolation_training_inconclusive",
+  "interpolation_training_regression",
+  "interpolation_validation_inconclusive",
+  "interpolation_validation_regression",
 ))
 _REASON_LABELS = {
   "qualified": "Qualified",
+  "learned": "Learned",
+  "seed_retained": "Seed retained (calibration already good)",
   "insufficient_support": "Collecting clean driving",
   "insufficient_validation": "Needs held-out validation",
   "insufficient_excitation": "Needs more steering variety",
   "insufficient_moving_evidence": "Needs moving-rack evidence",
   "insufficient_breakaway_evidence": "Needs breakaway evidence",
+  "rank_deficient_fit": "Rank deficient",
+  "ill_conditioned_fit": "Ill conditioned",
   "singular_fit": "Fit not identifiable",
   "invalid_parameters": "Rejected: invalid fit",
+  "validation_inconclusive": "Validation inconclusive",
   "validation_regression": "Rejected: validation regressed",
   "moving_validation_regression": "Rejected: moving fit regressed",
   "breakaway_validation_regression": "Rejected: breakaway fit regressed",
   "authority_validation_regression": (
     "Rejected: authority validation regressed"
   ),
+  "interpolation_training_inconclusive": "Interpolation training inconclusive",
+  "interpolation_training_regression": "Interpolation training regressed",
+  "interpolation_validation_inconclusive": "Interpolation validation inconclusive",
+  "interpolation_validation_regression": "Interpolation validation regressed",
 }
 _REASON_PRIORITY = (
   "insufficient_support",
@@ -202,14 +320,53 @@ _REASON_PRIORITY = (
   "insufficient_excitation",
   "insufficient_moving_evidence",
   "insufficient_breakaway_evidence",
+  "rank_deficient_fit",
+  "ill_conditioned_fit",
   "invalid_parameters",
+  "validation_inconclusive",
   "authority_validation_regression",
   "breakaway_validation_regression",
   "moving_validation_regression",
   "validation_regression",
   "singular_fit",
+  "learned",
+  "seed_retained",
   "qualified",
 )
+_EVALUATION_STATUSES = frozenset((
+  "evidence_insufficient",
+  "ill_conditioned",
+  "invalid_parameters",
+  "learned",
+  "numerical_failure",
+  "rank_deficient",
+  "seed_retained",
+  "validation_inconclusive",
+  "validation_regressed",
+))
+_FIT_MODELS = frozenset((
+  "static_only",
+  "friction_map",
+  "offset_and_friction",
+  "full_map",
+))
+_FIT_STATUSES = frozenset((
+  "identifiable",
+  "rank_deficient",
+  "ill_conditioned",
+  "no_solution",
+))
+_NODE_OUTCOME_LABELS = {
+  "learned": "Learned",
+  "seed_retained": "Seed retained (calibration already good)",
+  "evidence_insufficient": "Needs more/varied evidence",
+  "rank_deficient": "Rank deficient",
+  "ill_conditioned": "Ill conditioned",
+  "validation_inconclusive": "Validation inconclusive",
+  "validation_regressed": "Validation regressed",
+  "invalid_parameters": "Calibration invalid",
+  "numerical_failure": "Numerical fit failure",
+}
 _CONTROLLER_STATES = frozenset((
   "stock",
   "staged",
@@ -324,6 +481,46 @@ class CandidateParameters:
 
 
 @dataclass(frozen=True, slots=True)
+class FitDiagnostic:
+  model: str
+  status: str
+  moving_rank: int
+  moving_parameter_count: int
+  condition_estimate: float | None
+  breakaway_rank: int
+  breakaway_parameter_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PairedLoss:
+  route_count: int
+  mean_candidate_minus_seed_mse: float | None
+  numerical_tolerance_mse: float | None
+  uncertainty_mse: float | None
+  lower_bound_mse: float | None
+  upper_bound_mse: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class InterpolationStatus:
+  interval_index: int
+  lower_speed_mps: float
+  upper_speed_mps: float
+  qualified: bool
+  reasons: tuple[str, ...]
+  training_paired_loss: PairedLoss
+  validation_paired_loss: PairedLoss
+
+  @property
+  def outcome(self) -> str:
+    if self.qualified:
+      return "qualified"
+    if any("regression" in reason for reason in self.reasons):
+      return "regressed"
+    return "inconclusive"
+
+
+@dataclass(frozen=True, slots=True)
 class LearningNodeStatus:
   node_index: int
   speed_mps: float
@@ -379,6 +576,11 @@ class LearningNodeStatus:
   authority_candidate_validation_rms: float | None
   confidence: float
   qualified: bool
+  evaluation_status: str
+  fit_diagnostics: tuple[FitDiagnostic, ...]
+  training_outcome: str | None
+  training_paired_loss: PairedLoss | None
+  validation_paired_loss: PairedLoss | None
   reasons: tuple[str, ...]
   candidate_parameters: CandidateParameters | None
 
@@ -409,6 +611,10 @@ class LearningNodeStatus:
     return "insufficient_support"
 
   @property
+  def outcome_label(self) -> str:
+    return _NODE_OUTCOME_LABELS[self.evaluation_status]
+
+  @property
   def collection_complete(self) -> bool:
     return not any(
       reason in self.reasons
@@ -437,15 +643,101 @@ class LearningStatus:
   seed_profile_sha256: str
   evidence_sha256: str
   manifest_sha256: str
+  all_nodes_evaluated: bool
+  all_intervals_qualified: bool
   all_nodes_qualified: bool
+  candidate_profile_available: bool
   candidate_profile_sha256: str | None
   candidate_profile_revision: int | None
   last_drive_complete: bool
   nodes: tuple[LearningNodeStatus, ...]
+  interpolation_reports: tuple[InterpolationStatus, ...]
 
   @property
   def qualified_node_count(self) -> int:
     return sum(node.qualified for node in self.nodes)
+
+  @property
+  def learned_node_count(self) -> int:
+    return sum(node.evaluation_status == "learned" for node in self.nodes)
+
+  @property
+  def retained_node_count(self) -> int:
+    return sum(node.evaluation_status == "seed_retained" for node in self.nodes)
+
+
+@dataclass(frozen=True, slots=True)
+class LearningSummaryLine:
+  text: str
+  tone: str
+
+
+def node_outcome_tone(node: LearningNodeStatus) -> str:
+  """Map the learner's explicit node verdict to the dashboard color grammar."""
+  if node.evaluation_status in ("learned", "seed_retained"):
+    return "green"
+  if node.evaluation_status == "evidence_insufficient":
+    return "gray" if node.clean_support_s <= 0.0 else "blue"
+  if node.evaluation_status == "validation_inconclusive":
+    return "amber"
+  return "red"
+
+
+def learning_summary_lines(status: LearningStatus) -> tuple[LearningSummaryLine, ...]:
+  """Return three independent rows: node results, artifact, interpolation."""
+  unresolved = len(status.nodes) - status.qualified_node_count
+  node_parts = (
+    f"{status.learned_node_count} LEARNED",
+    f"{status.retained_node_count} SEED RETAINED",
+    f"{unresolved} NEED REVIEW",
+  )
+  node_tone = "green" if unresolved == 0 else "blue"
+
+  if status.candidate_profile_available:
+    artifact = LearningSummaryLine(
+      "NEW CANDIDATE ARTIFACT AVAILABLE",
+      "green",
+    )
+  elif status.all_nodes_qualified:
+    artifact = LearningSummaryLine(
+      "SEED PROFILE RETAINED | NO NEW ARTIFACT NEEDED",
+      "green",
+    )
+  elif status.all_nodes_evaluated:
+    artifact = LearningSummaryLine(
+      "NO CANDIDATE ARTIFACT | INTERPOLATION NOT QUALIFIED",
+      "amber",
+    )
+  else:
+    artifact = LearningSummaryLine(
+      "CANDIDATE ARTIFACT PENDING NODE EVALUATION",
+      "gray",
+    )
+
+  if not status.interpolation_reports:
+    interpolation = LearningSummaryLine("INTERPOLATION PENDING", "gray")
+  else:
+    qualified = sum(report.qualified for report in status.interpolation_reports)
+    regressed = sum(report.outcome == "regressed" for report in status.interpolation_reports)
+    inconclusive = sum(report.outcome == "inconclusive" for report in status.interpolation_reports)
+    if status.all_intervals_qualified:
+      text = f"INTERPOLATION {qualified}/{len(status.interpolation_reports)} QUALIFIED"
+      tone = "green"
+    else:
+      details = []
+      if inconclusive:
+        details.append(f"{inconclusive} INCONCLUSIVE")
+      if regressed:
+        details.append(f"{regressed} REGRESSED")
+      text = "INTERPOLATION | " + " | ".join(details)
+      tone = "red" if regressed else "amber"
+    interpolation = LearningSummaryLine(text, tone)
+
+  return (
+    LearningSummaryLine(" | ".join(node_parts), node_tone),
+    artifact,
+    interpolation,
+  )
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +793,73 @@ class BackfillProgressStatus:
   @property
   def progress_fraction(self) -> float:
     return self.completed_work_units / self.total_work_units
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorLearningStatus:
+  """Display-only projection of one immutable behavior-learning operation."""
+
+  operation_id: str
+  sequence: int
+  state: str
+  diagnostic: str
+  terminal: bool
+  started_mono_ns: int
+  updated_mono_ns: int
+  vehicle_identity: str
+  runtime_vehicle_identity_sha256: str
+  physical_generation_sha256: str | None
+  physical_profile_sha256: str | None
+  recorded_source_identity_sha256: str | None
+  eligible_route_count: int
+  required_route_count: int
+  training_route_count: int
+  validation_route_count: int
+  current_route_identity: str | None
+  current_route_index: int | None
+  total_route_count: int
+  current_candidate_index: int | None
+  total_candidate_count: int
+  completed_replay_jobs: int
+  total_replay_jobs: int
+  gate_spec_sha256: str
+  segmentation_config_sha256: str
+  transaction_sha256: str | None
+  behavior_finalization_sha256: str | None
+  behavior_selection_sha256: str | None
+  selected_behavior_policy_sha256: str | None
+  smooth_passed: bool | None
+  swift_passed: bool | None
+  strong_passed: bool | None
+  target_materially_improved: bool | None
+  qualification_disposition: str | None
+  reasons: tuple[str, ...]
+
+  @property
+  def active(self) -> bool:
+    return not self.terminal
+
+  @property
+  def route_readiness_fraction(self) -> float:
+    if self.required_route_count <= 0:
+      return 0.0
+    return min(1.0, self.eligible_route_count / self.required_route_count)
+
+  @property
+  def replay_progress_fraction(self) -> float:
+    if self.total_replay_jobs <= 0:
+      return 0.0
+    return self.completed_replay_jobs / self.total_replay_jobs
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorPresentation:
+  """Pure copy/color model; never an activation decision."""
+
+  title: str
+  detail: str
+  tone: str
+  progress_fraction: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +987,10 @@ def _signed_number(value: object, field: str) -> float:
   return 0.0 if result == 0.0 else result
 
 
+def _nullable_signed_number(value: object, field: str) -> float | None:
+  return None if value is None else _signed_number(value, field)
+
+
 def _text(value: object, field: str) -> str:
   if type(value) is not str or not value.strip():
     raise LearningStatusError("malformed", f"{field} must be non-empty text")
@@ -707,6 +1070,183 @@ def _candidate_parameters(
   return parameters
 
 
+def _paired_loss(
+  value: object,
+  field: str,
+  *,
+  optional: bool,
+) -> PairedLoss | None:
+  if value is None:
+    if optional:
+      return None
+    raise LearningStatusError("malformed", f"{field} must be present")
+  payload = _exact_object(value, _PAIRED_LOSS_KEYS, field)
+  result = PairedLoss(
+    route_count=_integer(payload["route_count"], f"{field}.route_count"),
+    mean_candidate_minus_seed_mse=_nullable_signed_number(
+      payload["mean_candidate_minus_seed_mse"],
+      f"{field}.mean_candidate_minus_seed_mse",
+    ),
+    numerical_tolerance_mse=_number(
+      payload["numerical_tolerance_mse"],
+      f"{field}.numerical_tolerance_mse",
+      nullable=True,
+    ),
+    uncertainty_mse=_number(
+      payload["uncertainty_mse"],
+      f"{field}.uncertainty_mse",
+      nullable=True,
+    ),
+    lower_bound_mse=_nullable_signed_number(
+      payload["lower_bound_mse"],
+      f"{field}.lower_bound_mse",
+    ),
+    upper_bound_mse=_nullable_signed_number(
+      payload["upper_bound_mse"],
+      f"{field}.upper_bound_mse",
+    ),
+  )
+  values = (
+    result.mean_candidate_minus_seed_mse,
+    result.numerical_tolerance_mse,
+    result.uncertainty_mse,
+    result.lower_bound_mse,
+    result.upper_bound_mse,
+  )
+  if result.route_count == 0:
+    if any(item is not None for item in values):
+      raise LearningStatusError("malformed", f"{field} empty loss has values")
+  elif result.route_count == 1:
+    if (
+      result.mean_candidate_minus_seed_mse is None
+      or result.numerical_tolerance_mse is None
+      or any(item is not None for item in values[2:])
+    ):
+      raise LearningStatusError("malformed", f"{field} one-route loss is inconsistent")
+  elif any(item is None for item in values):
+    raise LearningStatusError("malformed", f"{field} multi-route loss is incomplete")
+  else:
+    assert result.mean_candidate_minus_seed_mse is not None
+    assert result.uncertainty_mse is not None
+    assert result.lower_bound_mse is not None
+    assert result.upper_bound_mse is not None
+    if (
+      not math.isclose(
+        result.lower_bound_mse,
+        result.mean_candidate_minus_seed_mse - result.uncertainty_mse,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+      )
+      or not math.isclose(
+        result.upper_bound_mse,
+        result.mean_candidate_minus_seed_mse + result.uncertainty_mse,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+      )
+    ):
+      raise LearningStatusError("malformed", f"{field} uncertainty bounds disagree")
+  return result
+
+
+def _fit_diagnostics(value: object, field: str) -> tuple[FitDiagnostic, ...]:
+  if type(value) is not list or not value:
+    raise LearningStatusError("malformed", f"{field} must be a non-empty list")
+  result: list[FitDiagnostic] = []
+  for position, item in enumerate(value):
+    context = f"{field}[{position}]"
+    payload = _exact_object(item, _FIT_DIAGNOSTIC_KEYS, context)
+    model = _text(payload["model"], f"{context}.model")
+    status = _text(payload["status"], f"{context}.status")
+    if model not in _FIT_MODELS or any(existing.model == model for existing in result):
+      raise LearningStatusError("malformed", f"{context}.model is invalid or duplicated")
+    if status not in _FIT_STATUSES:
+      raise LearningStatusError("malformed", f"{context}.status is invalid")
+    diagnostic = FitDiagnostic(
+      model=model,
+      status=status,
+      moving_rank=_integer(payload["moving_rank"], f"{context}.moving_rank"),
+      moving_parameter_count=_integer(
+        payload["moving_parameter_count"],
+        f"{context}.moving_parameter_count",
+      ),
+      condition_estimate=_number(
+        payload["condition_estimate"],
+        f"{context}.condition_estimate",
+        nullable=True,
+      ),
+      breakaway_rank=_integer(
+        payload["breakaway_rank"],
+        f"{context}.breakaway_rank",
+      ),
+      breakaway_parameter_count=_integer(
+        payload["breakaway_parameter_count"],
+        f"{context}.breakaway_parameter_count",
+      ),
+    )
+    if (
+      diagnostic.moving_rank > diagnostic.moving_parameter_count
+      or diagnostic.breakaway_rank > diagnostic.breakaway_parameter_count
+    ):
+      raise LearningStatusError("malformed", f"{context} rank exceeds parameter count")
+    full_rank = (
+      diagnostic.moving_rank == diagnostic.moving_parameter_count
+      and diagnostic.breakaway_rank == diagnostic.breakaway_parameter_count
+    )
+    if status == "identifiable" and not full_rank:
+      raise LearningStatusError("malformed", f"{context} identifiable fit lacks full rank")
+    if status == "rank_deficient" and full_rank:
+      raise LearningStatusError("malformed", f"{context} rank-deficient fit is full rank")
+    result.append(diagnostic)
+  if {diagnostic.model for diagnostic in result} != _FIT_MODELS:
+    raise LearningStatusError("malformed", f"{field} model family is incomplete")
+  return tuple(result)
+
+
+def _interpolation_status(
+  value: object,
+  position: int,
+  nodes: tuple[LearningNodeStatus, ...],
+) -> InterpolationStatus:
+  field = f"interpolation_reports[{position}]"
+  payload = _exact_object(value, _INTERPOLATION_KEYS, field)
+  index = _integer(payload["interval_index"], f"{field}.interval_index")
+  if index != position or position + 1 >= len(nodes):
+    raise LearningStatusError("malformed", f"{field}.interval_index is invalid")
+  lower = _number(payload["lower_speed_mps"], f"{field}.lower_speed_mps")
+  upper = _number(payload["upper_speed_mps"], f"{field}.upper_speed_mps")
+  if lower != nodes[position].speed_mps or upper != nodes[position + 1].speed_mps:
+    raise LearningStatusError("malformed", f"{field} speed bounds disagree")
+  raw_reasons = payload["reasons"]
+  if type(raw_reasons) is not list or not raw_reasons:
+    raise LearningStatusError("malformed", f"{field}.reasons must be non-empty")
+  reasons = tuple(_text(reason, f"{field}.reasons") for reason in raw_reasons)
+  if len(set(reasons)) != len(reasons) or any(reason not in _REASONS for reason in reasons):
+    raise LearningStatusError("malformed", f"{field}.reasons are invalid")
+  qualified = _bool(payload["qualified"], f"{field}.qualified")
+  if qualified != (reasons == ("qualified",)):
+    raise LearningStatusError("malformed", f"{field}.qualification reasons disagree")
+  training = _paired_loss(
+    payload["training_paired_loss"],
+    f"{field}.training_paired_loss",
+    optional=False,
+  )
+  validation = _paired_loss(
+    payload["validation_paired_loss"],
+    f"{field}.validation_paired_loss",
+    optional=False,
+  )
+  assert training is not None and validation is not None
+  return InterpolationStatus(
+    interval_index=index,
+    lower_speed_mps=lower,
+    upper_speed_mps=upper,
+    qualified=qualified,
+    reasons=reasons,
+    training_paired_loss=training,
+    validation_paired_loss=validation,
+  )
+
+
 def _node(value: object, position: int) -> LearningNodeStatus:
   field = f"nodes[{position}]"
   payload = _exact_object(value, _NODE_KEYS, field)
@@ -728,10 +1268,64 @@ def _node(value: object, position: int) -> LearningNodeStatus:
     reasons.append(reason)
 
   qualified = _bool(payload["qualified"], f"{field}.qualified")
-  if qualified != (tuple(reasons) == ("qualified",)):
+  if qualified != (tuple(reasons) in (("learned",), ("seed_retained",))):
     raise LearningStatusError(
       "malformed",
       f"{field} qualified flag and reasons disagree",
+    )
+
+  evaluation_status = _text(
+    payload["evaluation_status"],
+    f"{field}.evaluation_status",
+  )
+  if evaluation_status not in _EVALUATION_STATUSES:
+    raise LearningStatusError(
+      "malformed",
+      f"{field}.evaluation_status is invalid",
+    )
+  fit_diagnostics = _fit_diagnostics(
+    payload["fit_diagnostics"],
+    f"{field}.fit_diagnostics",
+  )
+  fit_statuses = {diagnostic.status for diagnostic in fit_diagnostics}
+  if evaluation_status == "rank_deficient" and "rank_deficient" not in fit_statuses:
+    raise LearningStatusError(
+      "malformed",
+      f"{field}.rank-deficient status lacks fit evidence",
+    )
+  if evaluation_status == "ill_conditioned" and "ill_conditioned" not in fit_statuses:
+    raise LearningStatusError(
+      "malformed",
+      f"{field}.ill-conditioned status lacks fit evidence",
+    )
+
+  training_outcome = payload["training_outcome"]
+  if training_outcome not in (None, "learned", "seed_retained"):
+    raise LearningStatusError(
+      "malformed",
+      f"{field}.training_outcome is invalid",
+    )
+  training_paired_loss = _paired_loss(
+    payload["training_paired_loss"],
+    f"{field}.training_paired_loss",
+    optional=True,
+  )
+  validation_paired_loss = _paired_loss(
+    payload["validation_paired_loss"],
+    f"{field}.validation_paired_loss",
+    optional=True,
+  )
+  if qualified and (
+    evaluation_status != reasons[0] or training_outcome != reasons[0]
+  ):
+    raise LearningStatusError(
+      "malformed",
+      f"{field}.qualified outcome projection disagrees",
+    )
+  if not qualified and evaluation_status in ("learned", "seed_retained"):
+    raise LearningStatusError(
+      "malformed",
+      f"{field}.failed node has a qualified status",
     )
 
   confidence = _number(payload["confidence"], f"{field}.confidence")
@@ -963,6 +1557,11 @@ def _node(value: object, position: int) -> LearningNodeStatus:
     ),
     confidence=confidence,
     qualified=qualified,
+    evaluation_status=evaluation_status,
+    fit_diagnostics=fit_diagnostics,
+    training_outcome=training_outcome,
+    training_paired_loss=training_paired_loss,
+    validation_paired_loss=validation_paired_loss,
     reasons=tuple(reasons),
     candidate_parameters=_candidate_parameters(
       payload["candidate_parameters"],
@@ -1097,11 +1696,52 @@ def parse_learning_status(
     data["all_nodes_qualified"],
     "all_nodes_qualified",
   )
-  if all_nodes_qualified != all(node.qualified for node in nodes):
+  all_nodes_evaluated = _bool(
+    data["all_nodes_evaluated"],
+    "all_nodes_evaluated",
+  )
+  expected_nodes_evaluated = all(node.qualified for node in nodes)
+  if all_nodes_evaluated != expected_nodes_evaluated:
     raise LearningStatusError(
       "malformed",
-      "all_nodes_qualified disagrees with node reports",
+      "all_nodes_evaluated disagrees with node reports",
     )
+
+  raw_interpolation_reports = data["interpolation_reports"]
+  if type(raw_interpolation_reports) is not list:
+    raise LearningStatusError(
+      "malformed",
+      "interpolation_reports must be a list",
+    )
+  if not all_nodes_evaluated and raw_interpolation_reports:
+    raise LearningStatusError(
+      "malformed",
+      "unevaluated node grid carries interpolation reports",
+    )
+  interpolation_reports = tuple(
+    _interpolation_status(value, index, nodes)
+    for index, value in enumerate(raw_interpolation_reports)
+  )
+  expected_intervals_qualified = (
+    len(interpolation_reports) == len(nodes) - 1
+    and all(report.qualified for report in interpolation_reports)
+  )
+  all_intervals_qualified = _bool(
+    data["all_intervals_qualified"],
+    "all_intervals_qualified",
+  )
+  if all_intervals_qualified != expected_intervals_qualified:
+    raise LearningStatusError(
+      "malformed",
+      "all_intervals_qualified disagrees with interval reports",
+    )
+  expected_all_qualified = all_nodes_evaluated and all_intervals_qualified
+  if all_nodes_qualified != expected_all_qualified:
+    raise LearningStatusError(
+      "malformed",
+      "all_nodes_qualified disagrees with node and interval reports",
+    )
+
   candidate_sha = _sha256(
     data["candidate_profile_sha256"],
     "candidate_profile_sha256",
@@ -1114,13 +1754,33 @@ def parse_learning_status(
   )
   candidate_complete = candidate_sha is not None and candidate_revision is not None
   candidate_empty = candidate_sha is None and candidate_revision is None
+  if not candidate_complete and not candidate_empty:
+    raise LearningStatusError(
+      "malformed",
+      "candidate hash and revision completeness disagree",
+    )
+  candidate_profile_available = _bool(
+    data["candidate_profile_available"],
+    "candidate_profile_available",
+  )
+  if candidate_profile_available != candidate_complete:
+    raise LearningStatusError(
+      "malformed",
+      "candidate availability and identity disagree",
+    )
+  if candidate_complete and not all_nodes_qualified:
+    raise LearningStatusError(
+      "malformed",
+      "candidate exists before full qualification",
+    )
   if (
-    (all_nodes_qualified and not candidate_complete)
-    or (not all_nodes_qualified and not candidate_empty)
+    all_nodes_qualified
+    and not candidate_complete
+    and any(node.training_outcome == "learned" for node in nodes)
   ):
     raise LearningStatusError(
       "malformed",
-      "candidate identity and qualification state disagree",
+      "qualified learned node lacks candidate artifact",
     )
 
   return LearningStatus(
@@ -1141,11 +1801,15 @@ def parse_learning_status(
       data["manifest_sha256"],
       "manifest_sha256",
     ),
+    all_nodes_evaluated=all_nodes_evaluated,
+    all_intervals_qualified=all_intervals_qualified,
     all_nodes_qualified=all_nodes_qualified,
+    candidate_profile_available=candidate_profile_available,
     candidate_profile_sha256=candidate_sha,
     candidate_profile_revision=candidate_revision,
     last_drive_complete=last_drive_complete,
     nodes=nodes,
+    interpolation_reports=interpolation_reports,
   )
 
 
@@ -1815,6 +2479,474 @@ def validate_operation_update(
       "stale",
       "Terminal learner operation resumed without a new identity",
     )
+
+
+def parse_behavior_learning_status(
+  raw: object,
+  *,
+  expected_vehicle_identity: str | None,
+  expected_runtime_vehicle_identity_sha256: str | None,
+  now_mono_ns: int,
+) -> BehaviorLearningStatus:
+  """Decode the exact behavior display schema without importing its owner.
+
+  The status can explain qualification progress, but is never authority for
+  controller staging or activation. Its monotonic timestamps are accepted
+  only in the current manager epoch, and identity is checked whenever the
+  physical dashboard has supplied the matching runtime identity.
+  """
+  if raw is None:
+    raise LearningStatusError(
+      "behavior_absent",
+      "Behavior learning status has not been published",
+    )
+  if type(now_mono_ns) is not int or now_mono_ns < 0:
+    raise ValueError("now_mono_ns must be a non-negative integer")
+  if expected_vehicle_identity is None or not expected_vehicle_identity.strip():
+    raise LearningStatusError(
+      "vehicle_unavailable",
+      "Current vehicle identity is unavailable",
+    )
+  if type(raw) is not dict:
+    raise LearningStatusError(
+      "malformed",
+      "behavior learning status must be a Params JSON object",
+    )
+  if (
+    type(raw.get("schemaVersion")) is not int
+    or raw["schemaVersion"] != BEHAVIOR_LEARNING_STATUS_SCHEMA_VERSION
+  ):
+    raise LearningStatusError(
+      "schema_mismatch",
+      "Behavior learning status version is not supported",
+    )
+  data = _exact_object(raw, _BEHAVIOR_STATUS_KEYS, "behavior learning status")
+  if data["informationalOnly"] is not True:
+    raise LearningStatusError(
+      "malformed",
+      "Behavior learning status is not marked display-only",
+    )
+
+  vehicle_identity = _text(data["vehicleIdentity"], "vehicleIdentity")
+  if vehicle_identity != expected_vehicle_identity.strip():
+    raise LearningStatusError(
+      "wrong_vehicle",
+      "Behavior learning data belongs to a different vehicle",
+    )
+  runtime_identity = _sha256(
+    data["runtimeVehicleIdentitySha256"],
+    "runtimeVehicleIdentitySha256",
+  )
+  if (
+    expected_runtime_vehicle_identity_sha256 is not None
+    and runtime_identity != expected_runtime_vehicle_identity_sha256
+  ):
+    raise LearningStatusError(
+      "runtime_mismatch",
+      "Physical and behavior learning describe different runtimes",
+    )
+
+  state = _text(data["state"], "state")
+  if state not in _BEHAVIOR_STATE_DIAGNOSTICS:
+    raise LearningStatusError("malformed", "behavior state is not recognized")
+  diagnostic = _text(data["diagnostic"], "diagnostic")
+  if diagnostic not in _BEHAVIOR_STATE_DIAGNOSTICS[state]:
+    raise LearningStatusError(
+      "malformed",
+      "behavior diagnostic does not match its state",
+    )
+  terminal = _bool(data["terminal"], "terminal")
+  if terminal != (state in _BEHAVIOR_TERMINAL_STATES):
+    raise LearningStatusError(
+      "malformed",
+      "behavior terminal flag does not match its state",
+    )
+
+  started_mono_ns = _integer(data["startedMonoNs"], "startedMonoNs")
+  updated_mono_ns = _integer(data["updatedMonoNs"], "updatedMonoNs")
+  if updated_mono_ns < started_mono_ns or updated_mono_ns > now_mono_ns:
+    raise LearningStatusError(
+      "stale",
+      "Behavior learning status belongs to an invalid monotonic epoch",
+    )
+
+  counts = {
+    name: _integer(data[key], key)
+    for name, key in (
+      ("eligible_route_count", "eligibleRouteCount"),
+      ("required_route_count", "requiredRouteCount"),
+      ("training_route_count", "trainingRouteCount"),
+      ("validation_route_count", "validationRouteCount"),
+      ("total_route_count", "totalRouteCount"),
+      ("total_candidate_count", "totalCandidateCount"),
+      ("completed_replay_jobs", "completedReplayJobs"),
+      ("total_replay_jobs", "totalReplayJobs"),
+    )
+  }
+  if (
+    counts["training_route_count"] + counts["validation_route_count"]
+    > counts["eligible_route_count"]
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "behavior route partitions exceed homogeneous eligible evidence",
+    )
+  if counts["completed_replay_jobs"] > counts["total_replay_jobs"]:
+    raise LearningStatusError(
+      "malformed",
+      "completed behavior replay jobs exceed the total",
+    )
+
+  current_route_identity = _nullable_text(
+    data["currentRouteIdentity"],
+    "currentRouteIdentity",
+  )
+  current_route_index = _integer(
+    data["currentRouteIndex"],
+    "currentRouteIndex",
+    nullable=True,
+  )
+  if (current_route_identity is None) != (current_route_index is None):
+    raise LearningStatusError(
+      "malformed",
+      "behavior route identity and index completeness disagree",
+    )
+  if current_route_index is not None and not (
+    0 <= current_route_index < counts["total_route_count"]
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "behavior route index is outside its zero-based bounds",
+    )
+
+  current_candidate_index = _integer(
+    data["currentCandidateIndex"],
+    "currentCandidateIndex",
+    nullable=True,
+  )
+  if current_candidate_index is not None and not (
+    0 <= current_candidate_index < counts["total_candidate_count"]
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "behavior candidate index is outside its zero-based bounds",
+    )
+
+  gates = tuple(
+    None if data[key] is None else _bool(data[key], key)
+    for key in (
+      "smoothPassed",
+      "swiftPassed",
+      "strongPassed",
+      "targetMateriallyImproved",
+    )
+  )
+  disposition = _nullable_text(
+    data["qualificationDisposition"],
+    "qualificationDisposition",
+  )
+  if disposition is not None and disposition not in _BEHAVIOR_DISPOSITIONS:
+    raise LearningStatusError(
+      "malformed",
+      "behavior qualification disposition is not recognized",
+    )
+  raw_reasons = data["reasons"]
+  if (
+    type(raw_reasons) is not list
+    or any(type(reason) is not str or not reason.strip() for reason in raw_reasons)
+    or raw_reasons != sorted(set(raw_reasons))
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "behavior reasons must be non-empty, unique, sorted text",
+    )
+  reasons = tuple(raw_reasons)
+
+  transaction_sha256 = _sha256(
+    data["transactionSha256"], "transactionSha256", nullable=True,
+  )
+  finalization_sha256 = _sha256(
+    data["behaviorFinalizationSha256"],
+    "behaviorFinalizationSha256",
+    nullable=True,
+  )
+  selection_sha256 = _sha256(
+    data["behaviorSelectionSha256"],
+    "behaviorSelectionSha256",
+    nullable=True,
+  )
+  policy_sha256 = _sha256(
+    data["selectedBehaviorPolicySha256"],
+    "selectedBehaviorPolicySha256",
+    nullable=True,
+  )
+  if not terminal:
+    if (
+      any(value is not None for value in gates)
+      or disposition is not None
+      or reasons
+      or any(value is not None for value in (
+        transaction_sha256,
+        finalization_sha256,
+        selection_sha256,
+        policy_sha256,
+      ))
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "active behavior status exposes terminal qualification data",
+      )
+  else:
+    if disposition is None or not reasons:
+      raise LearningStatusError(
+        "malformed",
+        "terminal behavior status lacks a disposition or reasons",
+      )
+    if state == "complete" and (
+      any(type(value) is not bool for value in gates)
+      or transaction_sha256 is None
+      or finalization_sha256 is None
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "completed behavior status lacks gate or transaction provenance",
+      )
+    qualified = disposition == "qualified_candidate_available"
+    if qualified and (
+      gates != (True, True, True, True)
+      or state != "complete"
+      or selection_sha256 is None
+      or policy_sha256 is None
+    ):
+      raise LearningStatusError(
+        "malformed",
+        "qualified behavior candidate lacks passing gates or provenance",
+      )
+    if not qualified and (selection_sha256 is not None or policy_sha256 is not None):
+      raise LearningStatusError(
+        "malformed",
+        "stock-retained behavior status exposes a selected policy",
+      )
+
+  return BehaviorLearningStatus(
+    operation_id=_operation_id(data["operationId"], "operationId"),
+    sequence=_integer(data["sequence"], "sequence"),
+    state=state,
+    diagnostic=diagnostic,
+    terminal=terminal,
+    started_mono_ns=started_mono_ns,
+    updated_mono_ns=updated_mono_ns,
+    vehicle_identity=vehicle_identity,
+    runtime_vehicle_identity_sha256=runtime_identity,
+    physical_generation_sha256=_sha256(
+      data["physicalGenerationSha256"],
+      "physicalGenerationSha256",
+      nullable=True,
+    ),
+    physical_profile_sha256=_sha256(
+      data["physicalProfileSha256"],
+      "physicalProfileSha256",
+      nullable=True,
+    ),
+    recorded_source_identity_sha256=_sha256(
+      data["recordedSourceIdentitySha256"],
+      "recordedSourceIdentitySha256",
+      nullable=True,
+    ),
+    current_route_identity=current_route_identity,
+    current_route_index=current_route_index,
+    current_candidate_index=current_candidate_index,
+    gate_spec_sha256=_sha256(data["gateSpecSha256"], "gateSpecSha256"),
+    segmentation_config_sha256=_sha256(
+      data["segmentationConfigSha256"],
+      "segmentationConfigSha256",
+    ),
+    transaction_sha256=transaction_sha256,
+    behavior_finalization_sha256=finalization_sha256,
+    behavior_selection_sha256=selection_sha256,
+    selected_behavior_policy_sha256=policy_sha256,
+    smooth_passed=gates[0],
+    swift_passed=gates[1],
+    strong_passed=gates[2],
+    target_materially_improved=gates[3],
+    qualification_disposition=disposition,
+    reasons=reasons,
+    **counts,
+  )
+
+
+def validate_behavior_status_update(
+  previous: BehaviorLearningStatus | None,
+  current: BehaviorLearningStatus,
+) -> None:
+  """Reject torn or regressed snapshots within one immutable operation."""
+  if previous is None or previous.operation_id != current.operation_id:
+    return
+  if current.sequence < previous.sequence:
+    raise LearningStatusError("stale", "Behavior sequence moved backward")
+  if current.sequence == previous.sequence and current != previous:
+    raise LearningStatusError(
+      "stale",
+      "Behavior status changed without advancing its sequence",
+    )
+  if current.sequence > previous.sequence and (
+    current.updated_mono_ns <= previous.updated_mono_ns
+  ):
+    raise LearningStatusError(
+      "stale",
+      "Behavior status advanced with a stale timestamp",
+    )
+  immutable_fields = (
+    "started_mono_ns",
+    "vehicle_identity",
+    "runtime_vehicle_identity_sha256",
+    "gate_spec_sha256",
+    "segmentation_config_sha256",
+  )
+  if any(getattr(previous, name) != getattr(current, name) for name in immutable_fields):
+    raise LearningStatusError(
+      "stale",
+      "Behavior operation identity or immutable inputs changed",
+    )
+  for name in (
+    "physical_generation_sha256",
+    "physical_profile_sha256",
+    "recorded_source_identity_sha256",
+  ):
+    prior_value = getattr(previous, name)
+    if prior_value is not None and getattr(current, name) != prior_value:
+      raise LearningStatusError(
+        "stale",
+        "Established behavior provenance changed",
+      )
+  for name in (
+    "eligible_route_count",
+    "required_route_count",
+    "training_route_count",
+    "validation_route_count",
+    "total_route_count",
+    "total_candidate_count",
+    "total_replay_jobs",
+  ):
+    prior_value = getattr(previous, name)
+    current_value = getattr(current, name)
+    if prior_value != 0 and current_value != prior_value:
+      raise LearningStatusError(
+        "stale",
+        "Established behavior totals changed",
+      )
+  if current.completed_replay_jobs < previous.completed_replay_jobs:
+    raise LearningStatusError("stale", "Behavior progress moved backward")
+  state_order = {
+    "waiting_for_physical_profile": 0,
+    "waiting_for_routes": 1,
+    "preparing": 2,
+    "training": 3,
+    "selecting": 4,
+    "validating": 5,
+    "publishing": 6,
+    "complete": 7,
+  }
+  if (
+    previous.state != "failed"
+    and current.state != "failed"
+    and state_order[current.state] < state_order[previous.state]
+  ):
+    raise LearningStatusError("stale", "Behavior state moved backward")
+  if previous.terminal and current.sequence > previous.sequence:
+    raise LearningStatusError(
+      "stale",
+      "Terminal behavior operation changed without a new identity",
+    )
+
+
+def behavior_presentation(
+  status: BehaviorLearningStatus | None,
+  *,
+  error_code: str | None,
+  error_message: str | None,
+) -> BehaviorPresentation:
+  """Describe behavior qualification without implying activation."""
+  if status is None:
+    return BehaviorPresentation(
+      title="BEHAVIOR STATUS UNAVAILABLE",
+      detail=error_message or "Awaiting behavior learner status",
+      tone=(
+        "gray"
+        if error_code in (None, "behavior_absent", "vehicle_unavailable")
+        else "red"
+      ),
+      progress_fraction=None,
+    )
+  if status.state == "waiting_for_physical_profile":
+    return BehaviorPresentation(
+      "BEHAVIOR LEARNING WAITING",
+      "Physical calibration must qualify before behavior replay",
+      "gray",
+      None,
+    )
+  if status.state == "waiting_for_routes":
+    return BehaviorPresentation(
+      "WAITING FOR HOMOGENEOUS ROUTES",
+      f"{status.eligible_route_count}/{status.required_route_count} compatible routes ready",
+      "blue",
+      status.route_readiness_fraction,
+    )
+  if status.state == "preparing":
+    return BehaviorPresentation(
+      "VALIDATING BEHAVIOR EVIDENCE",
+      f"{status.eligible_route_count} homogeneous routes | training and validation remain separate",
+      "blue",
+      None,
+    )
+  if status.state == "training":
+    return BehaviorPresentation(
+      "TRAINING BEHAVIOR POLICY",
+      f"{status.completed_replay_jobs}/{status.total_replay_jobs} replay jobs | candidate grid {status.total_candidate_count}",
+      "blue",
+      status.replay_progress_fraction,
+    )
+  if status.state == "selecting":
+    return BehaviorPresentation(
+      "SELECTING TRAINING WINNER",
+      f"{status.completed_replay_jobs}/{status.total_replay_jobs} replay jobs | held-out routes remain unopened",
+      "blue",
+      status.replay_progress_fraction,
+    )
+  if status.state == "validating":
+    return BehaviorPresentation(
+      "VALIDATING FROZEN WINNER",
+      f"{status.completed_replay_jobs}/{status.total_replay_jobs} replay jobs | {status.validation_route_count} held-out routes",
+      "blue",
+      status.replay_progress_fraction,
+    )
+  if status.state == "publishing":
+    return BehaviorPresentation(
+      "SAVING BEHAVIOR RESULT",
+      "Publishing immutable informational qualification",
+      "blue",
+      status.replay_progress_fraction,
+    )
+  if status.state == "failed":
+    return BehaviorPresentation(
+      "BEHAVIOR LEARNING FAILED",
+      status.diagnostic.replace("_", " ").upper(),
+      "red",
+      None,
+    )
+  if status.qualification_disposition == "qualified_candidate_available":
+    return BehaviorPresentation(
+      "BEHAVIOR CANDIDATE QUALIFIED",
+      "Smooth PASS | Swift PASS | Strong PASS | informational only",
+      "green",
+      1.0,
+    )
+  return BehaviorPresentation(
+    "STOCK BEHAVIOR RETAINED",
+    "Behavior candidate did not clear every independent gate",
+    "amber",
+    1.0,
+  )
 
 
 def _profile_identity(value: object, field: str) -> ProfileIdentity | None:

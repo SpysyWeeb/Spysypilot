@@ -14,15 +14,24 @@ cycling windows. Tap the left half to go back or the right half to advance:
 
 1. **BLaTv2 Learning** — a two-column grid of the vehicle's learned speed
    nodes. Each node shows overall clean support, independent base/moving/
-   breakaway/authority evidence, its node-specific minimum, qualification
-   state, and the last completed drive's contribution. A
+   breakaway/authority evidence, its node-specific minimum, its explicit
+   evaluation outcome, and the last completed drive's contribution. Separate
+   summary rows report node outcomes, candidate-artifact availability, and
+   interpolation qualification without conflating them. A
    prominent banner reports live collection, finalization, retry, and
    historical-route processing without replacing the last validated snapshot.
-2. **Readiness & Activation** — moving, breakaway, held-out validation, and
-   authority evidence for every node. When a candidate exists it shows the
-   observable inverse-torque gain, signed lateral-acceleration offset, and
-   kinetic/static friction values, plus an independent controller lifecycle
-   rail.
+   A separate behavior panel reports whether a homogeneous route cohort is
+   waiting, training, selecting, or undergoing held-out validation. Physical
+   calibration and behavior qualification are deliberately never presented as
+   the same operation.
+2. **Readiness & Activation** — moving, breakaway, held-out validation,
+   authority evidence, and the learner's plain-language result for every
+   node. When a candidate exists it shows the observable inverse-torque gain,
+   signed lateral-acceleration offset, and kinetic/static friction values,
+   plus interval-level interpolation status. Independent **Smooth**, **Swift**,
+   and **Strong** behavior gates appear below the physical matrix, followed by
+   the independent controller lifecycle rail. A qualified behavior candidate
+   is explicitly informational; only lifecycle status can say what is steering.
 3. **Live terminal** — a scrolling, colorized console of openpilot output.
 4. **System usage** — CPU/RAM/power/fan history plus storage used/total.
 
@@ -35,7 +44,7 @@ continuously, so a node is not a hard speed-mode switch.
 ## How it works
 
 The two BLaTv2 pages share one rate-limited reader. It polls no faster than
-once every two seconds and strictly decodes three versioned JSON Params caches:
+once every two seconds and strictly decodes versioned JSON Params caches:
 
 - `BLaTv2LearningStatus` is an informational projection of persisted learner
   evidence and qualification reports.
@@ -44,19 +53,36 @@ once every two seconds and strictly decodes three versioned JSON Params caches:
   finalization, retry, deterministic historical-route backfill, completion,
   skip, and failure states. Backfill progress uses one-based route counts and
   cumulative accepted/rejected sample counts.
+- `BLaTv2BackfillProgress` adds segment, pass, work-unit, and estimated-time
+  detail for the current physical replay operation only.
+- `BLaTv2BehaviorLearningStatus` is the independent, informational-only
+  behavior transaction projection. It reports homogeneous-route readiness,
+  training and held-out-validation replay progress, immutable result hashes,
+  and separate Smooth/Swift/Strong verdicts. A successful result means only
+  that a candidate is available for external review; it does not stage or
+  activate that candidate.
 - `BLaTv2LifecycleStatus` is a sanitized projection produced by the owner of
   the validated activation state. The UI deliberately never parses
   `BLaTv2ActivationState` itself.
 
-Both caches clear at manager start and remain unavailable until the current
-build republishes them. The reader cross-checks their vehicle and runtime
-identity. Missing, malformed, incompatible, or wrong-vehicle data is shown as
-unavailable and never guessed.
+These caches clear at manager start and remain unavailable until the current
+build republishes them. The reader cross-checks the common vehicle identity and
+strictly validates each runtime hash within its own schema. Missing, malformed,
+incompatible, or wrong-vehicle data is shown as unavailable and never guessed.
 
-Learning schema v2 uses the observable-calibration runtime identity, while the
-lifecycle projection uses the independently gated live-controller artifact
-identity. The UI validates both hashes and the common vehicle identity, but
-does not equate those deliberately separate identity namespaces.
+Learning schema v3 uses the observable-calibration runtime identity, behavior
+status uses the full runtime-vehicle replay identity, and lifecycle status uses
+the independently gated live-controller artifact identity. The UI strictly
+validates every hash and their common vehicle identity, but does not equate
+these deliberately separate identity namespaces.
+
+Schema v3 keeps three decisions independent. A node may be **Learned** or
+**Seed retained (calibration already good)**; either is a successful node
+evaluation. Neighboring-node interpolation is then evaluated separately.
+Finally, candidate-artifact availability says only whether learning produced
+new calibration bytes. If every node and interval qualifies by retaining the
+seed, completion is green and the UI says no new artifact is needed—it does
+not report an unavailable snapshot or an error.
 
 Operational status never replaces persisted results. While a drive is being
 finalized or older compatible routes are being replayed, both learning pages
@@ -70,9 +96,13 @@ The UI never parses rlogs, evidence, manifests, or profiles. It never trains,
 fits, stages, approves, resets, or writes learning state. A full time bar means
 only that the clean-support minimum is met; moving-rack, breakaway, authority,
 held-out validation, steering variety, and a valid observable calibration
-remain separately visible. Likewise, `all_nodes_qualified` means a complete
-calibration exists, not that it is steering.
+remain separately visible. Likewise, `all_nodes_qualified` means every node
+has a successful outcome and every interpolation interval qualifies, not that
+new calibration was required or that it is steering.
 Only `BLaTv2LifecycleStatus` may label a controller provisional or approved.
+Behavior qualification cannot advance the activation rail and the dashboard
+never opens route logs, evidence, profiles, or behavior artifacts to infer a
+different result.
 
 ## Status semantics
 
@@ -92,6 +122,14 @@ older than the committed append-only watermark are reported as safely skipped;
 legacy evidence without a route ledger reports backfill unavailable rather
 than risking double-counting.
 
+Behavior gates stay independent: **Smooth** covers command roughness and burst
+quality, **Swift** covers signed turn-in/release timing without rewarding early
+corner-cutting, and **Strong** covers delivered authority and tracking. A green
+behavior candidate must pass all three plus the material-improvement target on
+its frozen validation routes. A stock-retained result is a valid completed
+transaction, not a missing snapshot and not permission to activate a weaker
+candidate.
+
 The activation rail is:
 
 `Collecting → Complete profile → Replay/safety approval → Provisional → Approved`
@@ -105,8 +143,8 @@ shows **Stock active**; rollback pending also reports effective stock.
 - `openpilot/selfdrive/ui/layouts/home.py` — four-page carousel with two BLaTv2
   pages followed by the existing terminal and system pages.
 - `openpilot/selfdrive/ui/widgets/blatv2_learning_status.py` — dependency-free,
-  strict learning, operation, and lifecycle display-schema parsers plus
-  formatting/layout helpers.
+  strict physical-learning, behavior-learning, operation, and lifecycle
+  display-schema parsers plus formatting/layout helpers.
 - `openpilot/selfdrive/ui/widgets/blatv2_learning.py` — the two pure-reader
   pages and shared two-second cache.
 - `openpilot/common/params_keys.h` — rebuildable learning, operation, and

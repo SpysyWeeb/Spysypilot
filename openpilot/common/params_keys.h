@@ -132,5 +132,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BLaTv2BackfillProgress", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2LearningOperationStatus", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2LearningStatus", {CLEAR_ON_MANAGER_START, JSON}},
+    {"BLaTv2BehaviorLearningStatus", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2LifecycleStatus", {CLEAR_ON_MANAGER_START, JSON}},
 };
