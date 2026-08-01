@@ -1313,6 +1313,7 @@ def test_route_evidence_is_not_durable_until_both_authorities_match(
     controls_witness_count=1,
     unresolved_witness_count=0,
     route_evidence_sha256=evidence.sha256,
+    route_evidence_source_key=evidence.source_key,
   )
 
   learning_backfill._stage_route_evidence(

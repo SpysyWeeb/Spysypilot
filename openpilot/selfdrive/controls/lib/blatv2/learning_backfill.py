@@ -2618,10 +2618,12 @@ def _prepare_route_with_extractor(
   segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
   structural_first_segment_index: int | None = None,
   structural_last_segment_index: int | None = None,
-  maximum_controls_witnesses: int = MAXIMUM_ROUTE_FRAMES,
+  maximum_controls_witnesses: int | None = None,
   route_car_params_seed: bytes | None = None,
 ) -> PreparedRoute:
   """Validate one complete route before exposing any frame to the learner."""
+  if maximum_controls_witnesses is None:
+    maximum_controls_witnesses = MAXIMUM_ROUTE_FRAMES
   if (
     type(maximum_controls_witnesses) is not int
     or maximum_controls_witnesses <= 0
@@ -3080,7 +3082,7 @@ def prepare_route(
   segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
   structural_first_segment_index: int | None = None,
   structural_last_segment_index: int | None = None,
-  maximum_controls_witnesses: int = MAXIMUM_ROUTE_FRAMES,
+  maximum_controls_witnesses: int | None = None,
   route_car_params_seed: bytes | None = None,
 ) -> PreparedRoute:
   """Prepare one route with one hash-bound extractor inode held throughout."""
