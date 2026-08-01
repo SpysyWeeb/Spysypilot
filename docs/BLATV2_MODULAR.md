@@ -351,7 +351,7 @@ The committed storage/wire identities are:
 | behavior learning status | 1 |
 | future feedback / lifecycle status | 2 / 2 |
 | future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
-| off-device protocol / cross-architecture certificate | 1 / 2 |
+| off-device protocol / cross-architecture certificate | 1 / 3 |
 | off-device display progress | 1 |
 
 These values are code contracts, not display labels. The retired physical v1
@@ -506,19 +506,26 @@ Cross-architecture trust is established before prepared frames are consumed.
 For every unseen accepted compatibility domain, one locally retained route is
 prepared with the device ARM extractor and its entire deterministic artifact
 must match the x86 artifact byte-for-byte. The device stores a private, atomic,
-HMAC-bound certificate tied to the two extractor binaries, worker process
-instance, build/runtime/registry identities, decode schemas, CarParams, and
-physical compatibility; immutable route hashes and selected-stream identity
-remain the recorded test vector. Rejections get a route-specific certificate
+HMAC-bound certificate tied to the two extractor binaries, immutable worker
+implementation, build/runtime/registry identities, decode schemas, the
+complete route runtime-vehicle bundle identity, and the validated
+physical-vehicle projection. Full CarParams bytes remain verified
+and content-addressed in each route artifact, but do not split a physical
+domain merely because unrelated recorded fields changed. The authenticated
+worker instance remains a per-job transport check and an otherwise identical
+service restart reuses the numerical certificate. Immutable route hashes and
+selected-stream identity remain the recorded test vector. Rejections get a route-specific certificate
 only when ARM independently produces the same stable reason and message. A PC
 rejection for an archive-only route is therefore not a device-authoritative
 rejection: after the complete original two-authority outcome set agrees, that
 route is removed from effective discovery and both authority inputs. It
 contributes no ledger entry, watermark movement, learner evidence, readiness
 count, or behavior-cohort vote. The UI may report its count as an unverified
-exclusion. An archive-only accepted compatibility domain with no locally
-retained test vector still falls back local because protocol v1 has no rlog
-download path.
+exclusion. An archive-only accepted route may use a locally certified route
+with the same parser/schema and physical numerical projection even when its
+full CarParams artifact differs. A genuinely new archive-only compatibility
+domain with no locally retained test vector still falls back local because
+protocol v1 has no rlog download path.
 
 The device projects remote progress onto its own monotonic clock in the
 separate display-only `BLaTv2OffdeviceProgress` schema. It identifies PC

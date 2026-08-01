@@ -60,6 +60,12 @@ It contributes no learner evidence, ledger entry, watermark movement,
 readiness count, or behavior-cohort vote. Locally retained rejections still
 require exact ARM reproduction. After certified artifacts are handed off, the
 ordinary local progress projection again owns route/application detail.
+Accepted-route certificates are shared only across equal extractor/join
+schemas, recorded log schema, complete runtime-vehicle bundle identities, and
+validated physical-vehicle projections.
+Full CarParams bytes remain verified per route, but do not create separate
+numerical domains for physically identical recordings; an unchanged worker
+implementation also retains certification across a service restart.
 
 ## Can previous routes be used?
 
@@ -218,7 +224,7 @@ backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v6`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
-cross-architecture certification are `1/2`, and off-device display progress
+cross-architecture certification are `1/3`, and off-device display progress
 is `1`; future feedback/lifecycle and
 approved-artifact/selection/activation contracts are `2/2` and `5/2/1`.
 Older evidence is never

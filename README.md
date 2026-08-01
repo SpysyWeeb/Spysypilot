@@ -284,8 +284,13 @@ the `data/routes/` subdirectory. The comma remains authoritative:
 - before any accepted x86-prepared domain can reach that learner, the device
   prepares one locally retained route with its ARM extractor and requires the
   complete artifact bytes to match. A private atomic HMAC-bound certificate is
-  scoped to both extractor binaries, the worker process instance, build and
-  runtime identities, and the route's decode/vehicle compatibility domain;
+  scoped to both extractor binaries, immutable implementation/build/runtime
+  identities, complete runtime-vehicle bundle, and the route's decode and
+  validated physical-vehicle compatibility domain. The complete recorded CarParams hash remains bound to
+  each route artifact and A/A result, but irrelevant per-drive CarParams bytes
+  do not fragment one physical numerical domain. An otherwise identical
+  worker-service restart reuses the certificate because its authenticated
+  session identity is transport state, not a numerical input;
   locally retained rejected routes likewise require the same ARM reason and
   message. A rejection for an archive-only route cannot be reproduced on ARM,
   so it is excluded from the effective discovery set and from both authority

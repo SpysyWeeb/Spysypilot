@@ -76,7 +76,7 @@ REMOTE_JOB_POLL_SECONDS: Final = 0.25
 REMOTE_SCRATCH_PREFIX: Final = ".blatv2-remote-prepare-"
 _REMOTE_PLACEHOLDER_DIRECTORY: Final = ".blatv2-remote-inventory"
 REMOTE_CERTIFICATION_DIRECTORY: Final = ".blatv2-offdevice-certifications"
-REMOTE_CERTIFICATION_SCHEMA_VERSION: Final = 2
+REMOTE_CERTIFICATION_SCHEMA_VERSION: Final = 3
 REMOTE_UNAVAILABLE_ERROR_CODES: Final = frozenset({
   "artifact_not_found",
   "busy",
@@ -93,8 +93,13 @@ _CERTIFICATION_DOMAIN_KEYS: Final = (
   "extractor_schema_version",
   "log_schema_blob",
   "physical_compatibility_sha256",
-  "car_params_sha256",
 )
+# Full recorded CarParams bytes remain content-addressed in each prepared
+# artifact and must agree across the two PC authorities. They are deliberately
+# absent here. The complete RuntimeVehicleBundle identity is added by
+# ``_certification_domain`` alongside the independently validated physical
+# projection, so every accepted numerical dependency remains covered without
+# letting unrelated serialized fields create near-one-route domains.
 
 
 class BridgeFallbackUnavailableError(BridgeUnavailableError):
@@ -415,7 +420,11 @@ def _spool_files_equal(
       os.close(directory_fd)
 
 
-def _certification_domain(provenance: Mapping[str, object]) -> dict[str, object]:
+def _certification_domain(
+  provenance: Mapping[str, object],
+  *,
+  runtime_vehicle_bundle_sha256: str,
+) -> dict[str, object]:
   try:
     domain = {
       key: provenance[key]
@@ -425,6 +434,9 @@ def _certification_domain(provenance: Mapping[str, object]) -> dict[str, object]
     raise BridgeCorruptError(
       "prepared route lacks certification provenance",
     ) from exc
+  domain["runtime_vehicle_bundle_sha256"] = (
+    runtime_vehicle_bundle_sha256
+  )
   if (
     type(domain["canonical_join_schema_version"]) is not int
     or int(domain["canonical_join_schema_version"]) <= 0
@@ -436,8 +448,10 @@ def _certification_domain(provenance: Mapping[str, object]) -> dict[str, object]
     or _SHA256_RE.fullmatch(
       str(domain["physical_compatibility_sha256"]),
     ) is None
-    or type(domain["car_params_sha256"]) is not str
-    or _SHA256_RE.fullmatch(str(domain["car_params_sha256"])) is None
+    or type(domain["runtime_vehicle_bundle_sha256"]) is not str
+    or _SHA256_RE.fullmatch(
+      str(domain["runtime_vehicle_bundle_sha256"]),
+    ) is None
   ):
     raise BridgeCorruptError("prepared route certification domain is invalid")
   return domain
@@ -452,6 +466,17 @@ def _certification_compatibility(
   worker_implementation_sha256: str,
   worker_instance_id: str,
 ) -> dict[str, object]:
+  # A worker instance identifies one authenticated transport session, not a
+  # numerical implementation. Job status and artifact requests still verify
+  # it on every transaction, but an otherwise identical service restart must
+  # not invalidate a durable ARM implementation certificate.
+  if (
+    type(worker_instance_id) is not str
+    or _SHA256_RE.fullmatch(worker_instance_id) is None
+  ):
+    raise BridgeIncompatibleError(
+      "certification worker_instance_id is invalid",
+    )
   compatibility = {
     "descriptor_registry_sha256": contract["descriptor_registry_sha256"],
     "device_extractor_sha256": device_extractor_sha256,
@@ -465,7 +490,6 @@ def _certification_compatibility(
     "worker_extractor_sha256": worker_extractor_sha256,
     "worker_implementation_commit": worker_implementation_commit,
     "worker_implementation_sha256": worker_implementation_sha256,
-    "worker_instance_id": worker_instance_id,
   }
   for key in (
     "source_commit",
@@ -484,7 +508,6 @@ def _certification_compatibility(
     "runtime_identity_sha256",
     "worker_extractor_sha256",
     "worker_implementation_sha256",
-    "worker_instance_id",
   ):
     if type(compatibility[key]) is not str or _SHA256_RE.fullmatch(
       str(compatibility[key]),
@@ -954,7 +977,12 @@ def _certify_preparation_domains(
       raise BridgeCorruptError(
         f"downloaded certification spool is invalid: {exc}",
       ) from exc
-    domain = _certification_domain(prepared.provenance)
+    domain = _certification_domain(
+      prepared.provenance,
+      runtime_vehicle_bundle_sha256=(
+        prepared.route_evidence.source_identity.runtime_identity
+      ),
+    )
     identity = _certification_identity(compatibility, domain)
     existing = grouped.get(identity)
     if existing is None:
