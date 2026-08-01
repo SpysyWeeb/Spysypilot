@@ -278,19 +278,37 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   `O_NOFOLLOW`, hashes that held executable inode, and runs that exact inode
   through `/proc/self/fd`; a transaction pins one extractor hash across every
   route so pathname swaps or mixed extractor versions fail closed;
-- the device downloads bounded, hash-bound full route-evidence artifacts, applies
-  both authorities through its own exact learner, performs the A/A comparison,
-  extends the ledger, finalizes, and atomically publishes `CURRENT`;
+- the device downloads bounded, hash-bound full route-evidence artifacts and
+  their independently reproduced certification vectors. Full artifacts are
+  authenticated and applied as streams; the comma never calls `read_bytes()`
+  or materializes a complete route object merely to consume PC output. The two
+  authorities still have to match byte-for-byte before the device extends the
+  ledger, finalizes, or atomically publishes `CURRENT`;
 - before any accepted x86-prepared domain can reach that learner, the device
-  prepares one locally retained route with its ARM extractor and requires the
-  complete artifact bytes to match. A private atomic HMAC-bound certificate is
-  scoped to both extractor binaries, immutable implementation/build/runtime
-  identities, complete runtime-vehicle bundle, and the route's decode and
-  validated physical-vehicle compatibility domain. The complete recorded CarParams hash remains bound to
-  each route artifact and A/A result, but irrelevant per-drive CarParams bytes
-  do not fragment one physical numerical domain. An otherwise identical
-  worker-service restart reuses the certificate because its authenticated
-  session identity is transport state, not a numerical input;
+  snapshots and replays a deterministic whole-segment vector with its ARM
+  extractor and requires its exact result to match both PC authorities. The
+  vector always includes segment 0 for authenticated CarParams bootstrap, then
+  chooses hash-stable interior/end coverage with a deterministic fallback. It
+  is capped at three complete segments, 96 MiB of compressed source, 30,000
+  controls witnesses, and a 64 KiB canonical result. This replaced the earlier
+  full-route ARM check after that check exhausted device memory while
+  duplicating hundreds of MiB of decoded route state;
+- certification runs in a killable child with a 120 s deadline, 450 MiB child
+  RSS and 600 MiB combined parent/child RSS ceilings. Source and artifact
+  scratch use private `0700` directories, exact inode identities, bounded copy
+  buffers, and a disk-space preflight. Abandoned scratch is quarantined rather
+  than recursively deleted. A timeout, resource excess, malformed vector, or
+  certificate mismatch is a stable fail-closed result and never falls back to
+  a full local replay of that remote outcome;
+- the private atomic HMAC-bound certificate is scoped to both extractor
+  binaries, the narrow byte-producing preparation implementation, Python
+  executable/native numerical environment, immutable build/runtime identities,
+  complete runtime-vehicle bundle, vector selection/result, and validated
+  physical-vehicle compatibility domain. The complete recorded CarParams hash
+  remains bound to each route artifact and A/A result, but irrelevant per-drive
+  CarParams bytes do not fragment one physical numerical domain. An otherwise
+  identical worker-service restart reuses the certificate because its
+  authenticated session identity is transport state, not a numerical input;
   locally retained rejected routes likewise require the same ARM reason and
   message. A rejection for an archive-only route cannot be reproduced on ARM,
   so it is excluded from the effective discovery set and from both authority
@@ -304,8 +322,10 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   is evidence, and PC clocks and job identifiers never become evidence;
   and
 - an unavailable or interrupted worker falls back to the existing local
-  importer without changing the last authenticated generation. Incompatible,
-  unauthenticated, replayed, oversized, or corrupt responses fail closed.
+  importer without changing the last authenticated generation. Device-local
+  fallback deliberately uses one replay worker to stay inside comma memory;
+  the PC retains four preparation workers. Incompatible, unauthenticated,
+  replayed, oversized, or corrupt responses fail closed.
 
 Discovery normally uses a signed LAN broadcast. Networks that suppress
 broadcasts between Wi-Fi and Ethernet may instead place one canonical private
@@ -316,7 +336,7 @@ target: discovery is still HMAC-authenticated, source-pinned, timestamped, and
 bound to the exact source commit. An unreachable configured host is ordinary
 worker unavailability and retains the four-worker local fallback.
 
-Protocol v1 deliberately does not split one publication across worker jobs.
+Protocol v2 deliberately does not split one publication across worker jobs.
 More than 128 selected replay routes therefore makes the remote backend
 unavailable and runs the complete local transaction. Onroad handoff performs
 no cleanup network I/O; a PC job left behind by that ownership transition is

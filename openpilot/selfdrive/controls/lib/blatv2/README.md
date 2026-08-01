@@ -67,6 +67,18 @@ Full CarParams bytes remain verified per route, but do not create separate
 numerical domains for physically identical recordings; an unchanged worker
 implementation also retains certification across a service restart.
 
+ARM certification is intentionally not another complete-route decode. The PC
+authorities emit one deterministic whole-segment vector per prepared route;
+segment 0 supplies authenticated CarParams and hash-selected interior/end
+segments cover the preparation path. The source vector is capped at three
+segments, 96 MiB compressed, and 30,000 controls witnesses. Its canonical
+result is capped at 64 KiB. A killable child enforces a 120 s deadline, 450 MiB
+child RSS, and 600 MiB combined RSS. The earlier full-route ARM reproduction
+was removed after its overlapping decoded populations exhausted device memory.
+That incident is why complete PC artifacts are now authenticated and applied
+through bounded streams, while unavailable-worker local fallback uses one
+replay worker rather than recreating the four-PC-worker memory shape.
+
 ## Can previous routes be used?
 
 Yes, including routes that predate this importer, when their full rlogs still
@@ -224,8 +236,8 @@ backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v6`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
-cross-architecture certification are `1/3`, and off-device display progress
-is `1`; future feedback/lifecycle and
+cross-architecture certification are `2/5`, and off-device display progress
+is `2`; future feedback/lifecycle and
 approved-artifact/selection/activation contracts are `2/2` and `5/2/1`.
 Older evidence is never
 reinterpreted or mixed silently.
