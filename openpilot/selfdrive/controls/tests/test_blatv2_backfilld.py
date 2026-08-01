@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,12 +8,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest  # noqa: TID251
 
+from opendbc.car.structs import car
 from openpilot.selfdrive.controls.blatv2_backfilld import (
   BlatV2BackfillDaemon,
+  _decode_car_params,
+  _serialize_owned_car_params,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BackfillError,
   BackfillRunResult,
+  BuildDescriptorRegistry,
   discover_complete_route_candidates,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
@@ -149,6 +154,49 @@ def test_dirty_current_build_fails_before_replay(tmp_path: Path) -> None:
   assert "dirty" in str(raised.value)
 
 
+def test_remote_contract_reuses_owned_car_params_wire_bytes(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  params.values["GitCommit"] = "a" * 40
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    descriptor_path=tmp_path / "descriptors.json",
+  )
+  original = car.CarParams.new_message()
+  original.carFingerprint = "TEST CAR"
+  serialized_car_params = bytes(original.to_bytes())
+  car_params = _decode_car_params(serialized_car_params)
+  owned_wire_bytes = _serialize_owned_car_params(car_params)
+  runtime = SimpleNamespace(
+    runtime_bundle=SimpleNamespace(calibration_identity_sha256="d" * 64),
+  )
+  engine = SimpleNamespace(
+    descriptor_registry=SimpleNamespace(identity_sha256="e" * 64),
+    expected_dongle_id="f" * 16,
+    runtime_factory=MagicMock(return_value=runtime),
+  )
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.get_commit",
+      return_value="b" * 40,
+    ),
+    patch.object(
+      BuildDescriptorRegistry,
+      "from_json_file",
+      return_value=SimpleNamespace(identity_sha256="f" * 64),
+    ),
+  ):
+    first = daemon._remote_contract(engine, car_params, owned_wire_bytes)
+    second = daemon._remote_contract(engine, car_params, owned_wire_bytes)
+
+  assert base64.b64decode(first["car_params_b64"]) == serialized_car_params
+  assert first == second
+  assert first["vehicle_fingerprint"] == "TEST CAR"
+
+
 def test_missing_remote_config_falls_back_to_local_without_current(
   tmp_path: Path,
 ) -> None:
@@ -172,7 +220,7 @@ def test_missing_remote_config_falls_back_to_local_without_current(
       side_effect=BridgeUnavailableError("not configured"),
     ),
   ):
-    assert daemon._prepare_remote(engine, object()) is None
+    assert daemon._prepare_remote(engine, object(), b"encoded") is None
 
   assert BACKFILL_PROGRESS_PARAM not in params.values
   assert not (storage / "CURRENT").exists()
@@ -220,7 +268,7 @@ def test_remote_preparation_passes_protected_worker_host_to_discovery(
       return_value=session,
     ),
   ):
-    assert daemon._prepare_remote(engine, object()) is session
+    assert daemon._prepare_remote(engine, object(), b"encoded") is session
 
   assert discovery.call_args.kwargs["configured_host"] == "192.168.1.241"
 
@@ -279,7 +327,7 @@ def test_authenticated_worker_availability_error_falls_back_local(
       side_effect=BridgeRemoteError(code, "retry locally"),
     ),
   ):
-    assert daemon._prepare_remote(engine, object()) is None
+    assert daemon._prepare_remote(engine, object(), b"encoded") is None
 
   assert BACKFILL_PROGRESS_PARAM not in params.values
 
@@ -343,7 +391,7 @@ def test_authenticated_remote_contract_failure_maps_without_current(
     ),
   ):
     with pytest.raises(BackfillError) as raised:
-      daemon._prepare_remote(engine, object())
+      daemon._prepare_remote(engine, object(), b"encoded")
 
   assert raised.value.diagnostic == diagnostic
   assert not (storage / "CURRENT").exists()
@@ -368,7 +416,11 @@ def test_remote_session_closes_after_preserving_transaction_state(
     lambda _engine: events.append("preserve")
   )
   session.close.side_effect = lambda: events.append("close")
-  daemon._wait_for_car_params = MagicMock(return_value=object())
+  car_params = SimpleNamespace(
+    carFingerprint="CAR",
+    to_bytes=MagicMock(return_value=b"encoded"),
+  )
+  daemon._wait_for_car_params = MagicMock(return_value=car_params)
   daemon._build_engine = MagicMock(return_value=local_engine)
   daemon._prepare_remote = MagicMock(return_value=session)
   daemon._project_learning_status = MagicMock()
@@ -397,7 +449,10 @@ def test_remote_session_closes_when_remote_engine_construction_fails(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  car_params = SimpleNamespace(carFingerprint="CAR")
+  car_params = SimpleNamespace(
+    carFingerprint="CAR",
+    to_bytes=MagicMock(return_value=b"encoded"),
+  )
   local_engine = SimpleNamespace(name="local")
   session = MagicMock()
   session.build_engine.side_effect = RuntimeError("constructor failed")
@@ -566,7 +621,11 @@ def test_daemon_stays_healthy_after_noop_without_rescanning(
       ),
     ),
   )
-  daemon._wait_for_car_params = MagicMock(return_value=object())
+  car_params = SimpleNamespace(
+    carFingerprint="CAR",
+    to_bytes=MagicMock(return_value=b"encoded"),
+  )
+  daemon._wait_for_car_params = MagicMock(return_value=car_params)
   daemon._build_engine = MagicMock(return_value=engine)
   daemon._prepare_remote = MagicMock(return_value=None)
   daemon._project_learning_status = MagicMock()
@@ -605,7 +664,11 @@ def test_onroad_handoff_clears_progress_without_overwriting_live_status(
       ),
     ),
   )
-  daemon._wait_for_car_params = MagicMock(return_value=object())
+  car_params = SimpleNamespace(
+    carFingerprint="CAR",
+    to_bytes=MagicMock(return_value=b"encoded"),
+  )
+  daemon._wait_for_car_params = MagicMock(return_value=car_params)
   daemon._build_engine = MagicMock(return_value=engine)
   daemon._prepare_remote = MagicMock(return_value=None)
   live_status = {"owner": "live-manager-transition"}
@@ -658,7 +721,11 @@ def test_daemon_waits_full_poll_after_first_unlocked_discovery(
       ),
     )),
   )
-  daemon._wait_for_car_params = MagicMock(return_value=object())
+  car_params = SimpleNamespace(
+    carFingerprint="CAR",
+    to_bytes=MagicMock(return_value=b"encoded"),
+  )
+  daemon._wait_for_car_params = MagicMock(return_value=car_params)
   daemon._build_engine = MagicMock(return_value=engine)
   daemon._prepare_remote = MagicMock(return_value=None)
   daemon._project_learning_status = MagicMock()
@@ -684,6 +751,12 @@ def test_daemon_waits_full_poll_after_first_unlocked_discovery(
     daemon.run()
 
   assert engine.run_once.call_count == 3
+  car_params.to_bytes.assert_called_once_with()
+  assert daemon._prepare_remote.call_args_list == [
+    ((engine, car_params, b"encoded"),),
+    ((engine, car_params, b"encoded"),),
+    ((engine, car_params, b"encoded"),),
+  ]
   assert daemon._project_learning_status.call_args_list == [
     ((engine, None),),
     ((engine, None),),
