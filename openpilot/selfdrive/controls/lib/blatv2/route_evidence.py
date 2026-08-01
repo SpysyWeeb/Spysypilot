@@ -1143,7 +1143,8 @@ def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
       raise RouteEvidenceError("event section size/count disagree")
     if (
       control_count != source.physical_record_count
-      or control_count != source.controls_witness_count
+      or source.controls_witness_count
+      != control_count + len(source.pre_poll_dropped_timestamps_ns)
     ):
       raise RouteEvidenceError("control and physical-record populations disagree")
     whole_digest = hashlib.sha256()

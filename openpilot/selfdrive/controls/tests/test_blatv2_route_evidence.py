@@ -220,6 +220,34 @@ def test_streamed_inspection_authenticates_shape_and_store_object(tmp_path: Path
   assert store.inspect(expected.sha256).sha256 == expected.sha256
 
 
+@pytest.mark.parametrize("pre_poll_count", (1, 3))
+def test_streamed_inspection_accounts_for_pre_poll_witnesses(
+  tmp_path: Path,
+  pre_poll_count: int,
+) -> None:
+  timestamps = tuple(100 + index for index in range(pre_poll_count))
+  identity = replace(
+    source(),
+    controls_witness_count=2 + pre_poll_count,
+    unresolved_witness_count=pre_poll_count,
+    pre_poll_dropped_timestamps_ns=timestamps,
+  )
+  expected = RouteEvidenceArtifact(
+    identity,
+    CP,
+    PHYSICAL,
+    (model(0), model(1)),
+    (witness(0), witness(1)),
+    TORQUE,
+    DELAY,
+    MANEUVER,
+    EVENTS,
+  )
+  path = tmp_path / f"pre-poll-{pre_poll_count}.route-evidence"
+  path.write_bytes(expected.canonical_bytes)
+  assert inspect_route_evidence_file(path).sha256 == expected.sha256
+
+
 def test_streamed_inspection_rejects_manifest_count_section_disagreement(tmp_path: Path) -> None:
   encoded = artifact().canonical_bytes.replace(
     b'"model_publication_count":2',
