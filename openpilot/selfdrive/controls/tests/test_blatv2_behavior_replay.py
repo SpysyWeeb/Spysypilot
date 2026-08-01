@@ -584,6 +584,23 @@ def test_exact_stock_timing_scalar_is_pinned_to_source() -> None:
     and isinstance(node.targets[0], ast.Name)
     and node.targets[0].id == "LAT_SMOOTH_SECONDS"
   }
+  if "LAT_SMOOTH_SECONDS" not in assignments:
+    assert any(
+      isinstance(node, ast.ImportFrom)
+      and node.module == "openpilot.selfdrive.modeld.timing"
+      and any(alias.name == "LAT_SMOOTH_SECONDS" for alias in node.names)
+      for node in tree.body
+    )
+    timing_path = modeld_path.with_name("timing.py")
+    timing_tree = ast.parse(timing_path.read_text(encoding="utf-8"))
+    assignments = {
+      node.targets[0].id: ast.literal_eval(node.value)
+      for node in timing_tree.body
+      if isinstance(node, ast.Assign)
+      and len(node.targets) == 1
+      and isinstance(node.targets[0], ast.Name)
+      and node.targets[0].id == "LAT_SMOOTH_SECONDS"
+    }
   assert assignments["LAT_SMOOTH_SECONDS"] == SOURCE_LAT_SMOOTH_SECONDS
 
 
