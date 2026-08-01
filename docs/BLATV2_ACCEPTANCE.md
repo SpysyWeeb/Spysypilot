@@ -87,14 +87,16 @@ twice. Publication writes a complete immutable generation before atomically
 switching its `CURRENT` pointer.
 
 The current observable-calibration contract is profile schema 2, evidence
-schema 5, coordinator artifact schema 4, and namespace
-`complete_full_rlog_authority_v3`. It starts from empty evidence. Retired v1
-and v2 artifact bytes are immutable and cannot be migrated into v3.
+schema 6, coordinator artifact schema 5, and namespace
+`complete_full_rlog_authority_v4`. It starts from empty evidence. Retired v1,
+v2, and v3 artifact bytes are immutable and cannot be migrated into v4.
 
 Each speed node independently requires its documented clean support,
-bidirectional excitation, chronological train/validation split, valid inverse
-torque fit, and held-out improvement. Base, resolved-motion, first-motion-after
-dwell (breakaway), and actuator-authority populations remain distinguishable.
+bidirectional excitation, whole-route train/validation split, valid inverse
+torque fit, and held-out improvement. An immutable route-counter parity owns
+every category from a route, so one maneuver cannot train and validate itself.
+Base, resolved-motion, confirmed stuck-to-motion breakaway, and
+actuator-authority populations remain distinguishable.
 Slew and stationary-full-torque observations cannot become equality-fit rows;
 settled full magnitude may join only with resolved rack motion. Samples affect
 only adjacent interpolation nodes. Consequently, extended highway use cannot
@@ -109,6 +111,13 @@ The observable fit is constrained by construction to positive gain,
 non-negative moving friction, and static breakaway no smaller than moving
 friction. A boundary solution is re-solved on that physical face and remains
 visible as `static == kinetic`; post-fit clipping is forbidden.
+
+Raw measured steering-angle onset plus same-direction measured-rate
+confirmation defines one physical breakaway episode. Training considers the
+nested static-only, friction, offset-plus-friction, and full-map models. The
+seed is comparator-only. A dense category cannot outvote a regression in a
+sparse category, and held-out validation can reject only the frozen training
+winner—it cannot choose a fallback model.
 
 A candidate profile is emitted only when every required node qualifies.
 Partial profiles remain evidence, not control artifacts.

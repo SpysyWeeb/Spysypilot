@@ -35,7 +35,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 4
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 5
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
@@ -326,16 +326,16 @@ class CalibrationLearningCoordinator:
       )
     return tuple(diagnostics)
 
-  def transition_onroad(self) -> None:
+  def transition_onroad(self, route_counter: int = 0) -> None:
     if self._state is not CalibrationLearningLifecycleState.OFFROAD:
       raise RuntimeError("calibration coordinator is already onroad")
-    self._learner.reset_route_transients()
+    self._learner.begin_route(route_counter)
     self._state = CalibrationLearningLifecycleState.ONROAD
 
   def transition_offroad(self) -> None:
     if self._state is not CalibrationLearningLifecycleState.ONROAD:
       raise RuntimeError("calibration coordinator is already offroad")
-    self._learner.reset_route_transients()
+    self._learner.end_route()
     self._state = CalibrationLearningLifecycleState.OFFROAD
 
   def ingest(self, sample: LearningSample) -> bool:

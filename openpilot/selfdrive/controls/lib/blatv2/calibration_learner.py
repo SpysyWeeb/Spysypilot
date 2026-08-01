@@ -6,20 +6,22 @@ The fitted law at each speed node is::
             + kinetic * motion_sign
             + static * breakaway_sign
 
-Only one friction sign is nonzero per row. Quantized/stationary rows use both
-signs as zero and intentionally identify an *effective settled inverse map*;
-the coefficients are not claimed to be a pure physical decomposition. The
-first resolved motion following a continuous stationary dwell of at least the
-seed transport delay is a breakaway row. Later moving rows are kinetic rows.
+Only one friction sign is nonzero per row. Quantized/stationary rows remain a
+legacy no-regression surface, but never decide the moving inverse map. Static
+breakaway is identified from a complete physical episode: the causally
+aligned last-stuck response and the earliest angle-resolved motion, confirmed
+by a same-direction rate quantum. Later moving rows identify kinetic motion.
 
 Inputs are the measured-only :class:`learner.LearningSample`. Slew build and
 release frames are authority evidence but never equality-fit. Evidence schema
-5 is deliberately incompatible with the retired dynamic-rack schema 4.
+6 is deliberately incompatible with schema 5 because older evidence has no
+whole-route partition or physical breakaway episodes.
 
-The inverse map is solved as deterministic physically constrained least
-squares. Gain and moving friction are non-negative, and static breakaway is
-moving friction plus a non-negative excess. A boundary solution is re-solved
-on its active face; raw coefficients are never clipped after fitting.
+The inverse map is selected from a deterministic nested family. Every model
+is fit on training routes only and must be no worse than the seed in every
+training stratum; a denser population can therefore never buy improvement by
+sacrificing rare breakaway evidence. The selected model is then checked once
+against wholly held-out routes. Validation never participates in selection.
 """
 
 from __future__ import annotations
@@ -32,6 +34,10 @@ import json
 import math
 from typing import Any
 
+from openpilot.selfdrive.controls.lib.blatv2.breakaway_episode import (
+  BreakawayEpisode,
+  BreakawayEpisodeDetector,
+)
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CALIBRATION_PROFILE_SCHEMA_VERSION,
   CalibrationParameters,
@@ -45,17 +51,23 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
   MIN_EXCITATION_NODE_WEIGHT,
   MIN_LATERAL_ACCEL_RMS_MPS2,
   MIN_LATERAL_ACCEL_SPAN_MPS2,
-  TRAIN_VALIDATION_BLOCK_SAMPLES,
   minimum_clean_support_s,
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 5
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 6
 MIN_VALIDATION_SUPPORT_FRACTION = 0.20
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_STRATUM_VALIDATION_ROWS = 4
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
 VALIDATION_RMS_ABSOLUTE_TOLERANCE = 1e-12
+
+
+class CalibrationModelId(StrEnum):
+  STATIC_ONLY = "static_only"
+  FRICTION_MAP = "friction_map"
+  OFFSET_AND_FRICTION = "offset_and_friction"
+  FULL_MAP = "full_map"
 
 
 class CalibrationQualificationReason(StrEnum):
@@ -145,6 +157,31 @@ def _combine(*parts: _Regression) -> _Regression:
   return result
 
 
+def _subtract(whole: _Regression, *parts: _Regression) -> _Regression:
+  """Recover one exactly accumulated disjoint stratum."""
+  result = _Regression()
+  result.normal[:] = whole.normal
+  result.rhs[:] = whole.rhs
+  result.target_squared = whole.target_squared
+  result.weight_s = whole.weight_s
+  result.count = whole.count
+  for part in parts:
+    for i in range(16):
+      result.normal[i] -= part.normal[i]
+    for i in range(4):
+      result.rhs[i] -= part.rhs[i]
+    result.target_squared -= part.target_squared
+    result.weight_s -= part.weight_s
+    result.count -= part.count
+  if result.count < 0 or result.weight_s < -1e-12:
+    raise ValueError("calibration strata are not a disjoint partition")
+  if result.weight_s < 0.0:
+    result.weight_s = 0.0
+  if result.target_squared < 0.0 and abs(result.target_squared) <= 1e-12:
+    result.target_squared = 0.0
+  return result
+
+
 class _Node:
   def __init__(self) -> None:
     self.clean_support_s = 0.0
@@ -177,13 +214,24 @@ class _Node:
     self.lateral_accel_direction_mask = 0
     self.applied_torque_direction_mask = 0
     self.moving_direction_mask = 0
+    self.moving_training_direction_mask = 0
+    self.moving_validation_direction_mask = 0
     self.breakaway_direction_mask = 0
+    self.breakaway_episode_direction_mask = 0
+    self.breakaway_episode_training_direction_mask = 0
+    self.breakaway_episode_validation_direction_mask = 0
+    self.breakaway_episode_count = 0
+    self.breakaway_episode_dwell_s = 0.0
+    self.breakaway_angle_assisted_count = 0
+    self.breakaway_bracket_width_sum = 0.0
     self.training = _Regression()
     self.validation = _Regression()
     self.moving_training = _Regression()
     self.moving_validation = _Regression()
     self.breakaway_training = _Regression()
     self.breakaway_validation = _Regression()
+    self.breakaway_episode_training = _Regression()
+    self.breakaway_episode_validation = _Regression()
     self.authority_training = _Regression()
     self.authority_validation = _Regression()
 
@@ -219,6 +267,12 @@ class CalibrationNodeEvidenceSnapshot:
   breakaway_training_count: int
   breakaway_validation_support_s: float
   breakaway_validation_count: int
+  breakaway_episode_training_weight: float
+  breakaway_episode_training_count: int
+  breakaway_episode_validation_weight: float
+  breakaway_episode_validation_count: int
+  breakaway_episode_dwell_s: float
+  breakaway_angle_assisted_count: int
   authority_training_support_s: float
   authority_training_count: int
   authority_validation_support_s: float
@@ -278,6 +332,16 @@ class CalibrationNodeQualificationReport:
   authority_slew_build_sample_count: int = 0
   authority_slew_release_sample_count: int = 0
   authority_unresolved_sample_count: int = 0
+  selected_model: CalibrationModelId | None = None
+  base_seed_validation_rms: float | None = None
+  base_candidate_validation_rms: float | None = None
+  breakaway_episode_training_count: int = 0
+  breakaway_episode_validation_count: int = 0
+  breakaway_episode_dwell_s: float = 0.0
+  breakaway_angle_assisted_count: int = 0
+  breakaway_episode_seed_validation_rms: float | None = None
+  breakaway_episode_candidate_validation_rms: float | None = None
+  breakaway_mean_bracket_width: float | None = None
 
   @property
   def qualified(self) -> bool:
@@ -485,6 +549,148 @@ def _seed_coefficients(parameters: CalibrationParameters) -> tuple[float, float,
   )
 
 
+def _fit_bounded_subset(
+  evidence: _Regression,
+  seed: tuple[float, float, float, float],
+  free: tuple[int, ...],
+  *,
+  kinetic_upper: float | None = None,
+) -> tuple[float, float, float, float] | None:
+  """Fit one nested moving-map model on deterministic active faces.
+
+  Gain and kinetic friction carry their physical non-negative bounds.  When
+  static friction remains fixed to the seed, kinetic also cannot exceed that
+  fixed static value.  Coefficients outside ``free`` remain byte-identical to
+  the seed comparator.
+  """
+  if evidence.count == 0:
+    return None
+  if any(index not in range(4) for index in free) or 3 in free:
+    raise ValueError("moving-map subset contains an invalid free coefficient")
+
+  gain_faces: tuple[float | None, ...] = (
+    (None, 0.0) if 0 in free else (seed[0],)
+  )
+  if 2 not in free:
+    kinetic_faces: tuple[float | None, ...] = (seed[2],)
+  elif kinetic_upper is None:
+    kinetic_faces = (None, 0.0)
+  else:
+    kinetic_faces = (None, 0.0, kinetic_upper)
+
+  best: tuple[float, float, float, float] | None = None
+  best_error: float | None = None
+  for gain_face in gain_faces:
+    for kinetic_face in kinetic_faces:
+      coefficients = list(seed)
+      fixed = {index for index in range(4) if index not in free}
+      if 0 in free and gain_face is not None:
+        coefficients[0] = gain_face
+        fixed.add(0)
+      if 2 in free and kinetic_face is not None:
+        coefficients[2] = kinetic_face
+        fixed.add(2)
+      solve_free = tuple(index for index in free if index not in fixed)
+      adjusted_rhs = list(evidence.rhs)
+      for row in solve_free:
+        adjusted_rhs[row] -= sum(
+          evidence.normal[row * 4 + column] * coefficients[column]
+          for column in fixed
+        )
+      solved = _solve_free_system(
+        tuple(evidence.normal),
+        tuple(adjusted_rhs),
+        solve_free,
+      )
+      if solved is None:
+        continue
+      for index, value in zip(solve_free, solved, strict=True):
+        coefficients[index] = value
+      gain = coefficients[0]
+      kinetic = coefficients[2]
+      if gain < 0.0 or kinetic < 0.0:
+        continue
+      if kinetic_upper is not None and kinetic > kinetic_upper:
+        continue
+      candidate = tuple(coefficients)
+      error = _weighted_error(evidence, candidate)
+      if error is not None and (best_error is None or error < best_error):
+        best = candidate
+        best_error = error
+  return best
+
+
+def _fit_episode_static(
+  episode_evidence: _Regression,
+  moving_coefficients: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+  """Fit the static term from one midpoint row per physical episode."""
+  denominator = episode_evidence.normal[15]
+  if episode_evidence.count == 0 or denominator <= 0.0:
+    return None
+  gain, intercept, kinetic, _ = moving_coefficients
+  unconstrained = (
+    episode_evidence.rhs[3]
+    - episode_evidence.normal[12] * gain
+    - episode_evidence.normal[13] * intercept
+    - episode_evidence.normal[14] * kinetic
+  ) / denominator
+  if not math.isfinite(unconstrained):
+    return None
+  # This is the exact active-face solution of S >= K, not post-fit clipping.
+  static = unconstrained if unconstrained >= kinetic else kinetic
+  candidate = (gain, intercept, kinetic, static)
+  return candidate if _weighted_error(episode_evidence, candidate) is not None else None
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelCandidate:
+  model: CalibrationModelId
+  coefficients: tuple[float, float, float, float]
+  training_rms: tuple[float, ...]
+
+
+def _rms_vector(
+  regressions: tuple[_Regression, ...],
+  coefficients: tuple[float, float, float, float],
+) -> tuple[float, ...] | None:
+  values: list[float] = []
+  for regression in regressions:
+    if regression.count == 0:
+      continue
+    value = regression.rms(coefficients)
+    if value is None:
+      return None
+    values.append(value)
+  return tuple(values)
+
+
+def _safe_against(
+  candidate: tuple[float, ...],
+  comparator: tuple[float, ...],
+  *,
+  require_improvement: bool,
+) -> bool:
+  if len(candidate) != len(comparator) or not candidate:
+    return False
+  no_regression = all(
+    value <= reference + VALIDATION_RMS_ABSOLUTE_TOLERANCE
+    for value, reference in zip(candidate, comparator, strict=True)
+  )
+  improved = any(
+    value < reference - VALIDATION_RMS_ABSOLUTE_TOLERANCE
+    for value, reference in zip(candidate, comparator, strict=True)
+  )
+  return no_regression and (improved or not require_improvement)
+
+
+def _pareto_dominates(
+  candidate: tuple[float, ...],
+  incumbent: tuple[float, ...],
+) -> bool:
+  return _safe_against(candidate, incumbent, require_improvement=True)
+
+
 def minimum_calibration_support_s(speed_mps: float) -> float:
   return minimum_clean_support_s(speed_mps)
 
@@ -505,6 +711,9 @@ class CalibrationProfileLearner:
       raise ValueError("calibration seed schema is incompatible")
     self.seed_profile = seed_profile
     self._nodes = tuple(_Node() for _ in seed_profile.nodes)
+    self._breakaway_detector = BreakawayEpisodeDetector()
+    self._route_active = False
+    self._route_validation = False
 
   @property
   def speed_nodes_mps(self) -> tuple[float, ...]:
@@ -544,6 +753,20 @@ class CalibrationProfileLearner:
       breakaway_training_count=node.breakaway_training.count,
       breakaway_validation_support_s=node.breakaway_validation.weight_s,
       breakaway_validation_count=node.breakaway_validation.count,
+      breakaway_episode_training_weight=(
+        node.breakaway_episode_training.weight_s
+      ),
+      breakaway_episode_training_count=(
+        node.breakaway_episode_training.count
+      ),
+      breakaway_episode_validation_weight=(
+        node.breakaway_episode_validation.weight_s
+      ),
+      breakaway_episode_validation_count=(
+        node.breakaway_episode_validation.count
+      ),
+      breakaway_episode_dwell_s=node.breakaway_episode_dwell_s,
+      breakaway_angle_assisted_count=node.breakaway_angle_assisted_count,
       authority_training_support_s=node.authority_training.weight_s,
       authority_training_count=node.authority_training.count,
       authority_validation_support_s=node.authority_validation.weight_s,
@@ -556,9 +779,26 @@ class CalibrationProfileLearner:
     )
 
   def reset_route_transients(self) -> None:
+    self._breakaway_detector.reset()
     for node in self._nodes:
       node.stationary_dwell_s = 0.0
       node.last_direction = 0
+
+  def begin_route(self, route_counter: int) -> None:
+    """Pin one complete route to one evidence population before decoding."""
+    if self._route_active:
+      raise RuntimeError("calibration learner route is already active")
+    if type(route_counter) is not int or route_counter < 0:
+      raise ValueError("calibration route counter must be nonnegative")
+    self.reset_route_transients()
+    self._route_validation = bool(route_counter & 1)
+    self._route_active = True
+
+  def end_route(self) -> None:
+    if not self._route_active:
+      raise RuntimeError("calibration learner route is not active")
+    self.reset_route_transients()
+    self._route_active = False
 
   def _supports(self, speed: float) -> tuple[tuple[int, float], ...]:
     nodes = self.speed_nodes_mps
@@ -577,24 +817,44 @@ class CalibrationProfileLearner:
       return ((upper, 1.0),)
     return ((lower, 1.0 - weight), (upper, weight))
 
-  def _row(self, node: _Node, seed: CalibrationParameters, sample: LearningSample) -> tuple[tuple[float, float, float, float], str]:
+  @staticmethod
+  def _rate_direction(
+    sample: LearningSample,
+    seed: CalibrationParameters,
+  ) -> int:
     threshold = max(seed.rack_rate_resolution_deg_s, 1e-12)
-    # The declared resolution is the first physically resolved sensor value,
-    # not part of the unresolved deadband.
-    direction = 1 if sample.rack_rate_deg_s >= threshold else -1 if sample.rack_rate_deg_s <= -threshold else 0
-    if direction == 0:
-      node.stationary_dwell_s += sample.dt_s
-      return (-sample.measured_lateral_accel_mps2, 1.0, 0.0, 0.0), "base"
-    is_breakaway = node.stationary_dwell_s + 1e-12 >= seed.transport_delay_s
-    node.stationary_dwell_s = 0.0
-    if node.last_direction != 0 and direction != node.last_direction:
-      node.rack_reversals += 1
-    node.last_direction = direction
-    if is_breakaway:
-      node.breakaway_direction_mask |= 1 if direction < 0 else 2
-      return (-sample.measured_lateral_accel_mps2, 1.0, 0.0, float(direction)), "breakaway"
-    node.moving_direction_mask |= 1 if direction < 0 else 2
-    return (-sample.measured_lateral_accel_mps2, 1.0, float(direction), 0.0), "moving"
+    return (
+      1
+      if sample.rack_rate_deg_s >= threshold
+      else -1
+      if sample.rack_rate_deg_s <= -threshold
+      else 0
+    )
+
+  @staticmethod
+  def _row(sample: LearningSample, category: str, direction: int) -> tuple[float, float, float, float]:
+    if category == "moving":
+      return (-sample.measured_lateral_accel_mps2, 1.0, float(direction), 0.0)
+    if category == "breakaway":
+      return (-sample.measured_lateral_accel_mps2, 1.0, 0.0, float(direction))
+    return (-sample.measured_lateral_accel_mps2, 1.0, 0.0, 0.0)
+
+  @staticmethod
+  def _episode_row(
+    episode: BreakawayEpisode,
+  ) -> tuple[tuple[float, float, float, float], float]:
+    lateral_accel = 0.5 * (
+      episode.last_stuck.measured_lateral_accel_mps2
+      + episode.first_motion.measured_lateral_accel_mps2
+    )
+    torque = 0.5 * (
+      episode.last_stuck.applied_torque
+      + episode.first_motion.applied_torque
+    )
+    return (
+      (-lateral_accel, 1.0, 0.0, float(episode.direction)),
+      torque,
+    )
 
   @staticmethod
   def _reset_node(node: _Node) -> None:
@@ -604,6 +864,8 @@ class CalibrationProfileLearner:
   def add_sample(self, sample: LearningSample) -> bool:
     if not isinstance(sample, LearningSample):
       raise TypeError("calibration learner accepts LearningSample only")
+    if not self._route_active:
+      raise RuntimeError("calibration sample has no pinned route partition")
     if not sample.valid or not sample.engaged or sample.steering_pressed or sample.standstill:
       self.reset_route_transients()
       return False
@@ -625,54 +887,180 @@ class CalibrationProfileLearner:
       for node_index, _ in self._supports(sample.speed_mps):
         self._nodes[node_index].rack_reversals += 1
 
-    accepted = False
-    for node_index, node_weight in self._supports(sample.speed_mps):
-      node = self._nodes[node_index]
-      seed = self.seed_profile.nodes[node_index].parameters
-      weight = sample.dt_s * node_weight
-      if sample.authority_evidence:
+    validation = self._route_validation
+    if sample.authority_evidence:
+      # A limiter boundary interrupts free breakaway causality. Settled,
+      # full-magnitude motion may still identify the moving map.
+      self._breakaway_detector.reset()
+      accepted = False
+      for node_index, node_weight in self._supports(sample.speed_mps):
+        node = self._nodes[node_index]
+        seed = self.seed_profile.nodes[node_index].parameters
+        weight = sample.dt_s * node_weight
         node.authority_support_s += weight
         node.authority_sample_count += 1
-        node.authority_magnitude_sample_count += bool(sample.actuator_boundary & ActuatorBoundary.MAGNITUDE)
-        node.authority_slew_build_sample_count += bool(sample.actuator_boundary & ActuatorBoundary.SLEW_BUILD)
-        node.authority_slew_release_sample_count += bool(sample.actuator_boundary & ActuatorBoundary.SLEW_RELEASE)
-        resolved_motion = abs(sample.rack_rate_deg_s) >= max(seed.rack_rate_resolution_deg_s, 1e-12)
-        equality_fit = sample.actuator_boundary == ActuatorBoundary.MAGNITUDE and sample.magnitude_boundary_dwell_s + 1e-12 >= sample.dt_s and resolved_motion
+        node.authority_magnitude_sample_count += bool(
+          sample.actuator_boundary & ActuatorBoundary.MAGNITUDE
+        )
+        node.authority_slew_build_sample_count += bool(
+          sample.actuator_boundary & ActuatorBoundary.SLEW_BUILD
+        )
+        node.authority_slew_release_sample_count += bool(
+          sample.actuator_boundary & ActuatorBoundary.SLEW_RELEASE
+        )
+        direction = self._rate_direction(sample, seed)
+        equality_fit = (
+          sample.actuator_boundary == ActuatorBoundary.MAGNITUDE
+          and sample.magnitude_boundary_dwell_s + 1e-12 >= sample.dt_s
+          and direction != 0
+        )
         if not equality_fit:
-          node.authority_unresolved_sample_count += bool(sample.actuator_boundary & ActuatorBoundary.MAGNITUDE)
+          node.authority_unresolved_sample_count += bool(
+            sample.actuator_boundary & ActuatorBoundary.MAGNITUDE
+          )
           self._reset_node(node)
           accepted = True
           continue
-        predictors, _ = self._row(node, seed, sample)
-        validation = (node.authority_fit_count // TRAIN_VALIDATION_BLOCK_SAMPLES) % 2 == 1
-        evidence = node.authority_validation if validation else node.authority_training
+        predictors = self._row(sample, "moving", direction)
+        evidence = (
+          node.authority_validation
+          if validation
+          else node.authority_training
+        )
         evidence.add(predictors, sample.applied_torque, weight)
         node.authority_fit_count += 1
         node.authority_fit_sample_count += 1
         node.authority_fit_support_s += weight
         accepted = True
-        continue
+      return accepted
 
-      predictors, category = self._row(node, seed, sample)
-      validation = (node.fit_count // TRAIN_VALIDATION_BLOCK_SAMPLES) % 2 == 1
-      total = node.validation if validation else node.training
-      total.add(predictors, sample.applied_torque, weight)
-      node.fit_count += 1
+    seed_at_speed = self.seed_profile.parameters_at(
+      sample.speed_mps,
+    ).parameters
+    decision = self._breakaway_detector.update(
+      sample,
+      rack_rate_resolution_deg_s=(
+        seed_at_speed.rack_rate_resolution_deg_s
+      ),
+      transport_delay_s=seed_at_speed.transport_delay_s,
+    )
+    category = decision.category.value
+    episode = decision.episode
+    if category == "discarded":
+      for node in self._nodes:
+        self._reset_node(node)
+      return False
+    direction = decision.direction
+    support_speed = (
+      episode.onset_speed_mps if episode is not None else sample.speed_mps
+    )
+    accepted = False
+    for node_index, node_weight in self._supports(support_speed):
+      node = self._nodes[node_index]
+      weight = sample.dt_s * node_weight
       node.clean_support_s += weight
       node.supported_sample_count += 1
       node.lat_energy += weight * sample.measured_lateral_accel_mps2**2
       node.rack_travel_deg += weight * abs(sample.rack_rate_deg_s)
-      if category == "base":
+      if direction != 0:
+        if node.last_direction != 0 and direction != node.last_direction:
+          node.rack_reversals += 1
+        node.last_direction = direction
+
+      # An angle-only onset is physical motion that still carries static
+      # breakout. Retain its support, but do not contaminate either equality
+      # model while same-direction rate confirmation is pending.
+      if category == "pending":
         node.base_support_s += weight
         node.base_sample_count += 1
-      elif category == "moving":
-        node.moving_support_s += weight
-        node.moving_sample_count += 1
-        (node.moving_validation if validation else node.moving_training).add(predictors, sample.applied_torque, weight)
       else:
-        node.breakaway_support_s += weight
-        node.breakaway_sample_count += 1
-        (node.breakaway_validation if validation else node.breakaway_training).add(predictors, sample.applied_torque, weight)
+        fit_torque = sample.applied_torque
+        fit_weight = weight
+        if category == "breakaway":
+          if episode is None:
+            raise AssertionError("breakaway category lacks a complete episode")
+          # Angle-assisted onset is intentionally confirmed one or more
+          # frames later.  Keep the legacy breakaway surface tied to the
+          # earliest measured motion, never to that delayed rate quantum.
+          predictors = (
+            -episode.first_motion.measured_lateral_accel_mps2,
+            1.0,
+            0.0,
+            float(direction),
+          )
+          fit_torque = episode.first_motion.applied_torque
+          fit_weight = episode.first_motion.dt_s * node_weight
+        else:
+          predictors = self._row(sample, category, direction)
+        total = node.validation if validation else node.training
+        total.add(predictors, fit_torque, fit_weight)
+        node.fit_count += 1
+        if category == "base":
+          node.base_support_s += weight
+          node.base_sample_count += 1
+        elif category == "moving":
+          node.moving_support_s += weight
+          node.moving_sample_count += 1
+          node.moving_direction_mask |= 1 if direction < 0 else 2
+          if validation:
+            node.moving_validation_direction_mask |= (
+              1 if direction < 0 else 2
+            )
+          else:
+            node.moving_training_direction_mask |= (
+              1 if direction < 0 else 2
+            )
+          (
+            node.moving_validation
+            if validation
+            else node.moving_training
+          ).add(predictors, sample.applied_torque, weight)
+        else:
+          node.breakaway_support_s += weight
+          node.breakaway_sample_count += 1
+          node.breakaway_direction_mask |= 1 if direction < 0 else 2
+          (
+            node.breakaway_validation
+            if validation
+            else node.breakaway_training
+          ).add(predictors, fit_torque, fit_weight)
+
+          episode_predictors, episode_torque = self._episode_row(episode)
+          episode_evidence = (
+            node.breakaway_episode_validation
+            if validation
+            else node.breakaway_episode_training
+          )
+          # One physical episode gets unit total weight, split only by its
+          # onset-speed interpolation. Dwell length cannot outvote independent
+          # episodes.
+          episode_evidence.add(
+            episode_predictors,
+            episode_torque,
+            node_weight,
+          )
+          node.breakaway_episode_count += 1
+          node.breakaway_episode_dwell_s += (
+            episode.dwell_s * node_weight
+          )
+          node.breakaway_angle_assisted_count += int(
+            episode.angle_assisted
+          )
+          node.breakaway_bracket_width_sum += node_weight * abs(
+            episode.first_motion.applied_torque
+            - episode.last_stuck.applied_torque
+          )
+          node.breakaway_episode_direction_mask |= (
+            1 if direction < 0 else 2
+          )
+          if validation:
+            node.breakaway_episode_validation_direction_mask |= (
+              1 if direction < 0 else 2
+            )
+          else:
+            node.breakaway_episode_training_direction_mask |= (
+              1 if direction < 0 else 2
+            )
       if node_weight >= MIN_EXCITATION_NODE_WEIGHT:
         lat = sample.measured_lateral_accel_mps2
         torque = sample.applied_torque
@@ -705,26 +1093,139 @@ class CalibrationProfileLearner:
       or node.applied_torque_direction_mask != 3
     ):
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_EXCITATION)
-    if node.moving_training.count < MIN_STRATUM_TRAINING_ROWS or node.moving_validation.count < MIN_STRATUM_VALIDATION_ROWS or node.moving_direction_mask != 3:
+    if (
+      node.moving_training.count < MIN_STRATUM_TRAINING_ROWS
+      or node.moving_validation.count < MIN_STRATUM_VALIDATION_ROWS
+      or node.moving_training_direction_mask != 3
+      or node.moving_validation_direction_mask != 3
+    ):
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE)
     if (
       node.breakaway_training.count < MIN_STRATUM_TRAINING_ROWS
       or node.breakaway_validation.count < MIN_STRATUM_VALIDATION_ROWS
-      or node.breakaway_direction_mask != 3
+      or node.breakaway_episode_training.count < MIN_STRATUM_TRAINING_ROWS
+      or node.breakaway_episode_validation.count < MIN_STRATUM_VALIDATION_ROWS
+      or node.breakaway_episode_training_direction_mask != 3
+      or node.breakaway_episode_validation_direction_mask != 3
     ):
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE)
 
-    authority_active = node.authority_training.count >= 4 and node.authority_validation.count >= 4
-    training = _combine(node.training, node.authority_training) if authority_active else node.training
-    validation = _combine(node.validation, node.authority_validation) if authority_active else node.validation
-    coefficients = _solve(training)
+    # Whether authority evidence participates in fitting is a training-only
+    # decision.  Held-out row presence may reject that frozen choice, but it
+    # must never change which model or coefficients training selects.
+    authority_fit_active = (
+      node.authority_training.count >= MIN_STRATUM_TRAINING_ROWS
+    )
+    if (
+      authority_fit_active
+      and node.authority_validation.count
+      < MIN_STRATUM_VALIDATION_ROWS
+    ):
+      reasons.append(CalibrationQualificationReason.INSUFFICIENT_VALIDATION)
     seed_coefficients = _seed_coefficients(seed)
-    seed_rms = validation.rms(seed_coefficients)
-    candidate_rms = validation.rms(coefficients) if coefficients is not None else None
+    base_training = _subtract(
+      node.training,
+      node.moving_training,
+      node.breakaway_training,
+    )
+    base_validation = _subtract(
+      node.validation,
+      node.moving_validation,
+      node.breakaway_validation,
+    )
+    moving_fit = (
+      _combine(node.moving_training, node.authority_training)
+      if authority_fit_active
+      else node.moving_training
+    )
+    training_strata = (
+      base_training,
+      node.moving_training,
+      node.breakaway_training,
+      node.breakaway_episode_training,
+      *(
+        (node.authority_training,)
+        if node.authority_training.count > 0
+        else ()
+      ),
+      node.training,
+    )
+    seed_training_vector = _rms_vector(
+      training_strata,
+      seed_coefficients,
+    )
+    selected: _ModelCandidate | None = None
+    generated: list[
+      tuple[
+        CalibrationModelId,
+        tuple[float, float, float, float] | None,
+      ]
+    ] = [
+      (
+        CalibrationModelId.STATIC_ONLY,
+        _fit_episode_static(
+          node.breakaway_episode_training,
+          seed_coefficients,
+        ),
+      ),
+    ]
+    for model, free in (
+      (CalibrationModelId.FRICTION_MAP, (2,)),
+      (CalibrationModelId.OFFSET_AND_FRICTION, (1, 2)),
+      (CalibrationModelId.FULL_MAP, (0, 1, 2)),
+    ):
+      moving_coefficients = _fit_bounded_subset(
+        moving_fit,
+        seed_coefficients,
+        free,
+      )
+      generated.append((
+        model,
+        (
+          None
+          if moving_coefficients is None
+          else _fit_episode_static(
+            node.breakaway_episode_training,
+            moving_coefficients,
+          )
+        ),
+      ))
+    if seed_training_vector is not None:
+      for model, coefficients in generated:
+        if coefficients is None:
+          continue
+        vector = _rms_vector(training_strata, coefficients)
+        if (
+          vector is None
+          or not _safe_against(
+            vector,
+            seed_training_vector,
+            require_improvement=True,
+          )
+        ):
+          continue
+        candidate = _ModelCandidate(model, coefficients, vector)
+        if (
+          selected is None
+          or _pareto_dominates(vector, selected.training_rms)
+        ):
+          selected = candidate
+
+    coefficients = None if selected is None else selected.coefficients
+    seed_rms = node.validation.rms(seed_coefficients)
+    candidate_rms = node.validation.rms(coefficients) if coefficients is not None else None
+    base_seed = base_validation.rms(seed_coefficients)
+    base_candidate = base_validation.rms(coefficients) if coefficients is not None else None
     moving_seed = node.moving_validation.rms(seed_coefficients)
     moving_candidate = node.moving_validation.rms(coefficients) if coefficients is not None else None
     breakaway_seed = node.breakaway_validation.rms(seed_coefficients)
     breakaway_candidate = node.breakaway_validation.rms(coefficients) if coefficients is not None else None
+    episode_seed = node.breakaway_episode_validation.rms(seed_coefficients)
+    episode_candidate = (
+      node.breakaway_episode_validation.rms(coefficients)
+      if coefficients is not None
+      else None
+    )
     authority_seed = node.authority_validation.rms(seed_coefficients)
     authority_candidate = node.authority_validation.rms(coefficients) if coefficients is not None else None
     candidate_parameters: CalibrationParameters | None = None
@@ -738,20 +1239,24 @@ class CalibrationProfileLearner:
         reasons.append(CalibrationQualificationReason.INVALID_PARAMETERS)
       else:
         comparisons = (
-          (candidate_rms, seed_rms, CalibrationQualificationReason.VALIDATION_REGRESSION),
-          (moving_candidate, moving_seed, CalibrationQualificationReason.MOVING_VALIDATION_REGRESSION),
-          (breakaway_candidate, breakaway_seed, CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
+          (node.validation, candidate_rms, seed_rms, CalibrationQualificationReason.VALIDATION_REGRESSION),
+          (base_validation, base_candidate, base_seed, CalibrationQualificationReason.VALIDATION_REGRESSION),
+          (node.moving_validation, moving_candidate, moving_seed, CalibrationQualificationReason.MOVING_VALIDATION_REGRESSION),
+          (node.breakaway_validation, breakaway_candidate, breakaway_seed, CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
+          (node.breakaway_episode_validation, episode_candidate, episode_seed, CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
         )
-        for candidate_value, seed_value, reason in comparisons:
-          if candidate_value is not None and seed_value is not None and candidate_value > seed_value + VALIDATION_RMS_ABSOLUTE_TOLERANCE:
+        for evidence, candidate_value, seed_value, reason in comparisons:
+          if evidence.count > 0 and (
+            candidate_value is None or seed_value is None
+          ):
+            reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
+          elif candidate_value is not None and seed_value is not None and candidate_value > seed_value + VALIDATION_RMS_ABSOLUTE_TOLERANCE:
             reasons.append(reason)
-        if (
-          authority_active
-          and authority_candidate is not None
-          and authority_seed is not None
-          and authority_candidate > authority_seed + VALIDATION_RMS_ABSOLUTE_TOLERANCE
-        ):
-          reasons.append(CalibrationQualificationReason.AUTHORITY_VALIDATION_REGRESSION)
+        if node.authority_validation.count > 0:
+          if authority_candidate is None or authority_seed is None:
+            reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
+          elif authority_candidate > authority_seed + VALIDATION_RMS_ABSOLUTE_TOLERANCE:
+            reasons.append(CalibrationQualificationReason.AUTHORITY_VALIDATION_REGRESSION)
         confidence = min(
           1.0,
           max(
@@ -794,9 +1299,9 @@ class CalibrationProfileLearner:
       minimum,
       node.clean_support_s,
       node.supported_sample_count,
-      training.count,
-      validation.count,
-      validation.weight_s,
+      node.training.count,
+      node.validation.count,
+      node.validation.weight_s,
       node.base_support_s,
       node.base_sample_count,
       node.moving_support_s,
@@ -835,9 +1340,32 @@ class CalibrationProfileLearner:
       node.authority_slew_build_sample_count,
       node.authority_slew_release_sample_count,
       node.authority_unresolved_sample_count,
+      None if selected is None else selected.model,
+      base_seed,
+      base_candidate,
+      node.breakaway_episode_training.count,
+      node.breakaway_episode_validation.count,
+      node.breakaway_episode_dwell_s,
+      node.breakaway_angle_assisted_count,
+      episode_seed,
+      episode_candidate,
+      (
+        None
+        if (
+          node.breakaway_episode_training.weight_s
+          + node.breakaway_episode_validation.weight_s
+        ) <= 0.0
+        else node.breakaway_bracket_width_sum
+        / (
+          node.breakaway_episode_training.weight_s
+          + node.breakaway_episode_validation.weight_s
+        )
+      ),
     )
 
   def qualify(self, provenance: str) -> CalibrationLearningResult:
+    if self._route_active:
+      raise RuntimeError("active route evidence cannot be qualified")
     source = str(provenance).strip()
     if not source:
       raise ValueError("candidate provenance must not be empty")
@@ -861,15 +1389,26 @@ class CalibrationProfileLearner:
       )
       for report in reports
     )
+    model_ids = ",".join(
+      report.selected_model.value
+      for report in reports
+      if report.selected_model is not None
+    )
+    candidate_provenance = (
+      f"{source}; observable-inverse-torque-learner-v2; " +
+      f"models={model_ids}; evidence_revision={revision}"
+    )
     profile = VehicleCalibrationProfile(
       self.seed_profile.vehicle_identity,
       revision,
-      f"{source}; observable-inverse-torque-learner-v1; evidence_revision={revision}",
+      candidate_provenance,
       nodes,
     )
     return CalibrationLearningResult(reports, profile)
 
   def export_evidence(self) -> bytes:
+    if self._route_active:
+      raise RuntimeError("active route evidence cannot be exported")
     seed_json = self.seed_profile.to_json()
     node_fields = (
       "clean_support_s",
@@ -898,7 +1437,16 @@ class CalibrationProfileLearner:
       "lateral_accel_direction_mask",
       "applied_torque_direction_mask",
       "moving_direction_mask",
+      "moving_training_direction_mask",
+      "moving_validation_direction_mask",
       "breakaway_direction_mask",
+      "breakaway_episode_direction_mask",
+      "breakaway_episode_training_direction_mask",
+      "breakaway_episode_validation_direction_mask",
+      "breakaway_episode_count",
+      "breakaway_episode_dwell_s",
+      "breakaway_angle_assisted_count",
+      "breakaway_bracket_width_sum",
     )
     regression_fields = (
       "training",
@@ -907,6 +1455,8 @@ class CalibrationProfileLearner:
       "moving_validation",
       "breakaway_training",
       "breakaway_validation",
+      "breakaway_episode_training",
+      "breakaway_episode_validation",
       "authority_training",
       "authority_validation",
     )
@@ -999,9 +1549,27 @@ class CalibrationProfileLearner:
       "lateral_accel_direction_mask",
       "applied_torque_direction_mask",
       "moving_direction_mask",
+      "moving_training_direction_mask",
+      "moving_validation_direction_mask",
       "breakaway_direction_mask",
+      "breakaway_episode_direction_mask",
+      "breakaway_episode_training_direction_mask",
+      "breakaway_episode_validation_direction_mask",
+      "breakaway_episode_count",
+      "breakaway_episode_dwell_s",
+      "breakaway_angle_assisted_count",
+      "breakaway_bracket_width_sum",
     )
-    float_fields = {name for name in node_fields if name.endswith("_s") or name in {"lat_energy", "rack_travel_deg"}}
+    float_fields = {
+      name
+      for name in node_fields
+      if name.endswith("_s")
+      or name in {
+        "lat_energy",
+        "rack_travel_deg",
+        "breakaway_bracket_width_sum",
+      }
+    }
     regressions = (
       "training",
       "validation",
@@ -1009,6 +1577,8 @@ class CalibrationProfileLearner:
       "moving_validation",
       "breakaway_training",
       "breakaway_validation",
+      "breakaway_episode_training",
+      "breakaway_episode_validation",
       "authority_training",
       "authority_validation",
     )
@@ -1044,6 +1614,15 @@ class CalibrationProfileLearner:
         raise ValueError("moving evidence counts are inconsistent")
       if node.breakaway_sample_count != node.breakaway_training.count + node.breakaway_validation.count:
         raise ValueError("breakaway evidence counts are inconsistent")
+      if (
+        node.breakaway_episode_count != node.breakaway_sample_count
+        or node.breakaway_episode_count
+        != node.breakaway_episode_training.count
+        + node.breakaway_episode_validation.count
+      ):
+        raise ValueError("breakaway episode counts are inconsistent")
+      if node.breakaway_angle_assisted_count > node.breakaway_episode_count:
+        raise ValueError("angle-assisted breakaway count is inconsistent")
       if node.authority_fit_sample_count != node.authority_fit_count or node.authority_fit_sample_count > node.authority_sample_count:
         raise ValueError("authority sample counts are inconsistent")
       if node.authority_unresolved_sample_count > node.authority_magnitude_sample_count:
@@ -1065,6 +1644,8 @@ class CalibrationProfileLearner:
           "stationary_dwell_s",
           "lat_energy",
           "rack_travel_deg",
+          "breakaway_episode_dwell_s",
+          "breakaway_bracket_width_sum",
         )
       ):
         raise ValueError("calibration support or energy is negative")
@@ -1074,7 +1655,12 @@ class CalibrationProfileLearner:
           "lateral_accel_direction_mask",
           "applied_torque_direction_mask",
           "moving_direction_mask",
+          "moving_training_direction_mask",
+          "moving_validation_direction_mask",
           "breakaway_direction_mask",
+          "breakaway_episode_direction_mask",
+          "breakaway_episode_training_direction_mask",
+          "breakaway_episode_validation_direction_mask",
         )
       ):
         raise ValueError("calibration direction mask is invalid")
@@ -1107,4 +1693,5 @@ def calibration_learning_sample_field_names() -> tuple[str, ...]:
     "actuator_constrained",
     "standstill",
     "rack_direction_reversal",
+    "measured_rack_angle_deg",
   )
