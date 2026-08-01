@@ -19,7 +19,10 @@ namespace {
 constexpr std::array<char, 8> kMagic = {
   'B', 'L', 'A', 'T', 'V', '2', 'R', '1',
 };
-constexpr uint32_t kStreamSchemaVersion = 1;
+// v3 completes the single-pass shared-evidence input set.  The Python side
+// compacts these bounded messages into typed binary planes immediately; it
+// never retains route-wide Cap'n Proto builders.
+constexpr uint32_t kStreamSchemaVersion = 3;
 constexpr uint32_t kEndRecord = std::numeric_limits<uint32_t>::max();
 constexpr size_t kInputChunkSize = 256 * 1024;
 constexpr size_t kMaximumSegmentCount = 512;
@@ -71,6 +74,12 @@ bool selected(cereal::Event::Which which) {
     case cereal::Event::CAR_OUTPUT:
     case cereal::Event::LIVE_PARAMETERS:
     case cereal::Event::CAR_PARAMS:
+    case cereal::Event::MODEL_V2:
+    case cereal::Event::DRIVING_EVENT:
+    case cereal::Event::SELFDRIVE_STATE:
+    case cereal::Event::LIVE_TORQUE_PARAMETERS:
+    case cereal::Event::LIVE_DELAY:
+    case cereal::Event::LATERAL_MANEUVER_PLAN:
       return true;
     default:
       return false;

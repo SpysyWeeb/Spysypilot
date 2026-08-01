@@ -12,6 +12,7 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   BackfillProgressStatus,
+  BehaviorLearningStatus,
   GridCell,
   LearningOperationStatus,
   LearningNodeStatus,
@@ -21,15 +22,19 @@ from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   OperationPresentation,
   format_duration,
   format_speed,
+  behavior_presentation,
   grid_cells,
   learning_panel_presentation,
+  learning_summary_lines,
+  node_outcome_tone,
   parse_backfill_progress_status,
+  parse_behavior_learning_status,
   parse_learning_operation_status,
   parse_learning_status,
   parse_lifecycle_status,
-  reason_label,
   select_value_provider,
   validate_backfill_progress_update,
+  validate_behavior_status_update,
   validate_operation_update,
 )
 from openpilot.system.ui.lib.application import FontWeight, gui_app
@@ -67,6 +72,9 @@ class DashboardSnapshot:
   lifecycle_error_code: str | None
   lifecycle_error: str | None
   metric: bool
+  behavior: BehaviorLearningStatus | None = None
+  behavior_error_code: str | None = None
+  behavior_error: str | None = None
 
 
 class BLaTv2LearningStatusSource:
@@ -95,6 +103,7 @@ class BLaTv2LearningStatusSource:
     )
     self._last_refresh = float("-inf")
     self._last_backfill_progress: BackfillProgressStatus | None = None
+    self._last_behavior_status: BehaviorLearningStatus | None = None
     self._snapshot = DashboardSnapshot(
       learning=None,
       learning_error_code="absent",
@@ -109,6 +118,9 @@ class BLaTv2LearningStatusSource:
       lifecycle_error_code="activation_absent",
       lifecycle_error="Controller status is not available yet",
       metric=False,
+      behavior=None,
+      behavior_error_code="behavior_absent",
+      behavior_error="Behavior learning status has not been published",
     )
 
   @staticmethod
@@ -240,6 +252,35 @@ class BLaTv2LearningStatusSource:
     ):
       learning = prior_learning
 
+    behavior: BehaviorLearningStatus | None = None
+    behavior_error_code: str | None = None
+    behavior_error: str | None = None
+    try:
+      raw_behavior = self._read_param("BLaTv2BehaviorLearningStatus")
+      behavior_now_mono_ns = time.monotonic_ns()
+      candidate_behavior = parse_behavior_learning_status(
+        raw_behavior,
+        expected_vehicle_identity=expected_vehicle,
+        # Physical status identifies the observable-calibration runtime;
+        # behavior status identifies the full runtime-vehicle replay bundle.
+        # Both hashes are strict and vehicle-bound, but intentionally inhabit
+        # different namespaces and must not be equated by the UI.
+        expected_runtime_vehicle_identity_sha256=None,
+        now_mono_ns=behavior_now_mono_ns,
+      )
+      validate_behavior_status_update(
+        self._last_behavior_status,
+        candidate_behavior,
+      )
+      behavior = candidate_behavior
+      self._last_behavior_status = candidate_behavior
+    except LearningStatusError as exc:
+      behavior_error_code = exc.code
+      behavior_error = str(exc)
+    except Exception:
+      behavior_error_code = "malformed"
+      behavior_error = "Behavior learning status could not be read"
+
     lifecycle: LifecycleStatus | None = None
     lifecycle_error_code: str | None = None
     lifecycle_error: str | None = None
@@ -247,7 +288,7 @@ class BLaTv2LearningStatusSource:
       lifecycle = parse_lifecycle_status(
         self._read_param("BLaTv2LifecycleStatus"),
         expected_vehicle_identity=expected_vehicle,
-        # Learning schema v2 identifies the observable-calibration runtime;
+        # Learning schema v3 identifies the observable-calibration runtime;
         # lifecycle status identifies the separately gated live-controller
         # artifact runtime. Both hashes are strict and vehicle-bound, but they
         # are intentionally different namespaces and must not be equated.
@@ -279,6 +320,9 @@ class BLaTv2LearningStatusSource:
       lifecycle_error_code=lifecycle_error_code,
       lifecycle_error=lifecycle_error,
       metric=metric,
+      behavior=behavior,
+      behavior_error_code=behavior_error_code,
+      behavior_error=behavior_error,
     )
 
 
@@ -297,22 +341,7 @@ class _BLaTv2Page(Widget):
 
   @staticmethod
   def _tone_for_node(node: LearningNodeStatus) -> rl.Color:
-    if node.qualified:
-      return _GREEN
-    if node.collection_complete and node.primary_reason in (
-      "invalid_parameters",
-      "validation_regression",
-      "moving_validation_regression",
-      "breakaway_validation_regression",
-      "authority_validation_regression",
-      "singular_fit",
-    ):
-      return _RED
-    if node.clean_support_s <= 0.0:
-      return _GRAY
-    if node.support_fraction >= 1.0:
-      return _AMBER
-    return _BLUE
+    return _BLaTv2Page._tone_color(node_outcome_tone(node))
 
   @staticmethod
   def _error_color(code: str | None) -> rl.Color:
@@ -649,6 +678,64 @@ class _BLaTv2Page(Widget):
         )
 
 
+  def _draw_behavior_panel(
+    self,
+    x: float,
+    y: float,
+    width: float,
+    snapshot: DashboardSnapshot,
+  ) -> float:
+    """Draw a compact informational panel without implying activation."""
+    presentation = behavior_presentation(
+      snapshot.behavior,
+      error_code=snapshot.behavior_error_code,
+      error_message=snapshot.behavior_error,
+    )
+    color = self._tone_color(presentation.tone)
+    panel = rl.Rectangle(x, y, width, 68)
+    rl.draw_rectangle_rounded(panel, 0.12, 8, rl.fade(color, 0.12))
+    rl.draw_rectangle_rounded_lines_ex(panel, 0.12, 8, 1, color)
+    medium = gui_app.font(FontWeight.MEDIUM)
+    normal = gui_app.font(FontWeight.NORMAL)
+    title = f"BEHAVIOR | {presentation.title.removeprefix('BEHAVIOR ')}"
+    title_size = self._fit_font_size(medium, title, 18, 12, width - 28)
+    detail_size = self._fit_font_size(
+      normal,
+      presentation.detail,
+      16,
+      11,
+      width - 28,
+    )
+    rl.draw_text_ex(
+      medium,
+      title,
+      rl.Vector2(int(x + 14), int(y + 8)),
+      title_size,
+      0,
+      color,
+    )
+    rl.draw_text_ex(
+      normal,
+      presentation.detail,
+      rl.Vector2(int(x + 14), int(y + 34)),
+      detail_size,
+      0,
+      _DIM,
+    )
+    if presentation.progress_fraction is not None:
+      track = rl.Rectangle(x + 14, y + 59, width - 28, 5)
+      rl.draw_rectangle_rounded(track, 0.5, 6, _TRACK)
+      fill_width = track.width * presentation.progress_fraction
+      if fill_width > 1.0:
+        rl.draw_rectangle_rounded(
+          rl.Rectangle(track.x, track.y, fill_width, track.height),
+          0.5,
+          6,
+          color,
+        )
+    return y + panel.height
+
+
 class BLaTv2LearningOverviewWidget(_BLaTv2Page):
   """Six-node overview; node count and speeds come from the snapshot."""
 
@@ -667,30 +754,41 @@ class BLaTv2LearningOverviewWidget(_BLaTv2Page):
     pad = 32
     x = rect.x + pad
     width = rect.width - pad * 2
-    summary = f"{learning.qualified_node_count} OF {len(learning.nodes)} SPEED NODES QUALIFIED"
     rl.draw_text_ex(
       bold,
-      summary,
+      "PHYSICAL CALIBRATION",
       rl.Vector2(int(x), int(content_y)),
-      25,
-      0,
-      _WHITE,
-    )
-    summary_detail = (
-      "Complete observable calibration; activation is tracked separately"
-      if learning.all_nodes_qualified
-      else "Overall, moving, breakaway, and authority evidence are tracked independently"
-    )
-    rl.draw_text_ex(
-      normal,
-      summary_detail,
-      rl.Vector2(int(x), int(content_y + 33)),
-      22,
+      17,
       0,
       _DIM,
     )
+    summary_lines = learning_summary_lines(learning)
+    for index, line in enumerate(summary_lines):
+      font = bold if index == 0 else normal
+      desired_size = 22 if index == 0 else 18
+      font_size = self._fit_font_size(
+        font,
+        line.text,
+        desired_size,
+        14,
+        width,
+      )
+      rl.draw_text_ex(
+        font,
+        line.text,
+        rl.Vector2(int(x), int(content_y + 23 + index * 28)),
+        font_size,
+        0,
+        self._tone_color(line.tone) if index else _WHITE,
+      )
 
-    grid_y = content_y + 72
+    behavior_bottom = self._draw_behavior_panel(
+      x,
+      content_y + 98,
+      width,
+      snapshot,
+    )
+    grid_y = behavior_bottom + 10
     footer_height = 48
     grid_height = rect.y + rect.height - footer_height - grid_y
     # Six current nodes use the intended 2x3 layout. A future portable
@@ -753,7 +851,7 @@ class BLaTv2LearningOverviewWidget(_BLaTv2Page):
       0,
       _WHITE,
     )
-    reason = reason_label(node.primary_reason).upper()
+    reason = node.outcome_label.upper()
     reason_font_size = 14 if compact else 18
     reason_size = measure_text_cached(medium, reason, reason_font_size)
     reason_x = (
@@ -863,7 +961,7 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
     pad = 32
     x = rect.x + pad
     width = rect.width - pad * 2
-    matrix_bottom = rect.y + rect.height - 165
+    matrix_bottom = rect.y + rect.height - 275
     matrix_height = matrix_bottom - content_y
     self._draw_matrix(
       x,
@@ -873,12 +971,82 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
       learning,
       snapshot.metric,
     )
+    self._draw_behavior_gates(
+      x,
+      matrix_bottom + 12,
+      width,
+      snapshot,
+    )
     self._draw_lifecycle(
       x,
-      matrix_bottom + 18,
+      matrix_bottom + 133,
       width,
       learning,
       snapshot,
+    )
+
+  def _draw_behavior_gates(
+    self,
+    x: float,
+    y: float,
+    width: float,
+    snapshot: DashboardSnapshot,
+  ) -> None:
+    normal = gui_app.font(FontWeight.NORMAL)
+    medium = gui_app.font(FontWeight.MEDIUM)
+    presentation = behavior_presentation(
+      snapshot.behavior,
+      error_code=snapshot.behavior_error_code,
+      error_message=snapshot.behavior_error,
+    )
+    title = "BEHAVIOR QUALIFICATION | INFORMATIONAL ONLY"
+    title_size = self._fit_font_size(medium, title, 18, 12, width)
+    rl.draw_text_ex(
+      medium,
+      title,
+      rl.Vector2(int(x), int(y)),
+      title_size,
+      0,
+      _DIM,
+    )
+    status = snapshot.behavior
+    gates = (
+      ("SMOOTH", None if status is None else status.smooth_passed),
+      ("SWIFT", None if status is None else status.swift_passed),
+      ("STRONG", None if status is None else status.strong_passed),
+    )
+    gate_width = min(190.0, (width - 28) / 3)
+    for index, (label, verdict) in enumerate(gates):
+      color = _GRAY if verdict is None else (_GREEN if verdict else _RED)
+      result = "WAIT" if verdict is None else ("PASS" if verdict else "FAIL")
+      gate_x = x + index * (gate_width + 14)
+      gate = rl.Rectangle(gate_x, y + 27, gate_width, 38)
+      rl.draw_rectangle_rounded(gate, 0.25, 8, rl.fade(color, 0.15))
+      rl.draw_rectangle_rounded_lines_ex(gate, 0.25, 8, 1, color)
+      text = f"{label} {result}"
+      text_size = self._fit_font_size(medium, text, 17, 12, gate.width - 16)
+      rl.draw_text_ex(
+        medium,
+        text,
+        rl.Vector2(int(gate.x + 8), int(gate.y + 8)),
+        text_size,
+        0,
+        color,
+      )
+    detail_size = self._fit_font_size(
+      normal,
+      presentation.title,
+      17,
+      12,
+      width,
+    )
+    rl.draw_text_ex(
+      normal,
+      presentation.title,
+      rl.Vector2(int(x), int(y + 75)),
+      detail_size,
+      0,
+      self._tone_color(presentation.tone),
     )
 
   def _draw_matrix(
@@ -892,12 +1060,12 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
   ) -> None:
     normal = gui_app.font(FontWeight.NORMAL)
     medium = gui_app.font(FontWeight.MEDIUM)
-    columns = (0.00, 0.16, 0.34, 0.54, 0.73)
+    columns = (0.00, 0.14, 0.35, 0.57, 0.78)
     headers = (
       "NODE",
-      "MOVING",
-      "BREAKAWAY",
+      "MOVE / BREAK",
       "VALIDATION / AUTH",
+      "RESULT",
       "CALIBRATION",
     )
     for column_index, (offset, header) in enumerate(zip(
@@ -933,7 +1101,8 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
       _DIVIDER,
     )
 
-    row_height = (height - 34) / len(learning.nodes)
+    interpolation_height = 34
+    row_height = (height - 34 - interpolation_height) / len(learning.nodes)
     row_font_size = max(13, min(21, int(row_height * 0.46)))
     for position, node in enumerate(learning.nodes):
       row_y = line_y + position * row_height
@@ -948,16 +1117,10 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
       tone = self._tone_for_node(node)
       values = (
         format_speed(node.speed_mps, metric=metric),
-        (
-          "READY"
-          if node.moving_ready
-          else f"{node.moving_sample_count:,} ROWS"
-        ),
-        (
-          "READY"
-          if node.breakaway_ready
-          else f"{node.breakaway_sample_count:,} EVENTS"
-        ),
+        " | ".join((
+          "M READY" if node.moving_ready else f"M {node.moving_sample_count:,}",
+          "B READY" if node.breakaway_ready else f"B {node.breakaway_sample_count:,}",
+        )),
         (
           "".join((
             f"V READY | A {node.authority_fit_sample_count:,}/",
@@ -970,6 +1133,7 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
             f"{node.authority_sample_count:,}",
           ))
         ),
+        self._fit_text(node),
         self._calibration_text(node),
       )
       value_colors = (_WHITE, tone, tone, tone, tone)
@@ -1000,30 +1164,39 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
           color,
         )
 
+    summary = learning_summary_lines(learning)[2]
+    summary_y = line_y + len(learning.nodes) * row_height + 9
+    rl.draw_line_ex(
+      rl.Vector2(x, summary_y - 7),
+      rl.Vector2(x + width, summary_y - 7),
+      1,
+      _DIVIDER,
+    )
+    summary_size = self._fit_font_size(
+      medium,
+      summary.text,
+      18,
+      12,
+      width,
+    )
+    rl.draw_text_ex(
+      medium,
+      summary.text,
+      rl.Vector2(int(x), int(summary_y)),
+      summary_size,
+      0,
+      self._tone_color(summary.tone),
+    )
+
   @staticmethod
   def _fit_text(node: LearningNodeStatus) -> str:
-    if node.qualified:
-      return "PASSED"
-    if not node.collection_complete:
-      return "WAITING"
-    if "invalid_parameters" in node.reasons:
-      return "REJECTED"
-    if (
-      "validation_regression" in node.reasons
-      or "moving_validation_regression" in node.reasons
-      or "breakaway_validation_regression" in node.reasons
-      or "authority_validation_regression" in node.reasons
-    ):
-      return "REGRESSED"
-    if "singular_fit" in node.reasons:
-      return "UNSTABLE"
-    return "WAITING"
+    return node.outcome_label.upper()
 
   @classmethod
   def _calibration_text(cls, node: LearningNodeStatus) -> str:
     parameters = node.candidate_parameters
     if parameters is None:
-      return cls._fit_text(node)
+      return "--"
     gain = f"{parameters.torque_per_lateral_accel:.3f}".removeprefix("0")
     offset = (
       f"{parameters.lateral_accel_offset_correction_mps2:+.3f}"
@@ -1047,7 +1220,13 @@ class BLaTv2ReadinessWidget(_BLaTv2Page):
   ) -> None:
     normal = gui_app.font(FontWeight.NORMAL)
     medium = gui_app.font(FontWeight.MEDIUM)
-    labels = ("COLLECT", "PROFILE", "GATES", "PROVISIONAL", "APPROVED")
+    labels = (
+      "COLLECT",
+      "PROFILE",
+      "REPLAY/SAFETY",
+      "PROVISIONAL",
+      "APPROVED",
+    )
     stage = (
       (1 if learning.all_nodes_qualified else 0)
       if snapshot.lifecycle is None

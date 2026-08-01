@@ -13,9 +13,16 @@ from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
   ApprovedArtifactReader,
   ApprovedProfileArtifact,
   ArtifactDiagnostic,
+  CalibrationSelectionManifest,
   PersistentProfileActivation,
   ProfileIdentity,
 )
+from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import (
+  BEHAVIOR_FINALIZATION_SCHEMA_VERSION,
+  BehaviorLearningFinalization,
+  FinalizationReason,
+)
+from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import BehaviorPolicy
 from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
   ControllerSelection,
 )
@@ -27,6 +34,9 @@ from openpilot.selfdrive.controls.lib.blatv2.feedback import (
   FeedbackResponse,
 )
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
+from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
+  calibration_profile_for_controller,
+)
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   PhysicalParameters,
   ProfileNode,
@@ -38,8 +48,10 @@ VEHICLE = "approved-artifact-test-car"
 RUNTIME_HASH = "1" * 64
 SOURCE_COMMIT = "2" * 40
 OPENDBC_COMMIT = "3" * 40
+PANDA_COMMIT = "4" * 40
 EVIDENCE_HASH = "4" * 64
 HARNESS_COMMIT = "5" * 40
+CALIBRATION_MANIFEST_HASH = "5" * 64
 
 
 class MemoryParams:
@@ -80,6 +92,7 @@ def profile(
     rack_rate_resolution_deg_s=4.0,
     confidence=0.9,
     qualified=qualified,
+    lateral_accel_offset_correction_mps2=-0.04,
   )
   return VehicleProfile(
     vehicle_identity=vehicle,
@@ -108,20 +121,85 @@ def policy(
   )
 
 
+def behavior_finalization(
+  selected_policy: ControllerPolicy | None = None,
+  *,
+  smooth_passed: bool = True,
+  swift_passed: bool = True,
+  strong_passed: bool = True,
+) -> BehaviorLearningFinalization:
+  controller = policy() if selected_policy is None else selected_policy
+  behavior = BehaviorPolicy.from_controller_policy(controller)
+  gate_spec = "a" * 64
+  route_partition = "b" * 64
+  recorded_source = "c" * 64
+  training = "d" * 64
+  validation = "e" * 64
+  selection = hashlib.sha256(json.dumps({
+    "finalBehaviorPolicySha256": behavior.sha256,
+    "gateSpecSha256": gate_spec,
+    "recordedSourceIdentitySha256": recorded_source,
+    "routePartitionSha256": route_partition,
+    "trainingSelectionSha256": training,
+    "validationSha256": validation,
+  }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+  passed = smooth_passed and swift_passed and strong_passed
+  return BehaviorLearningFinalization(
+    schema_version=BEHAVIOR_FINALIZATION_SCHEMA_VERSION,
+    gate_spec_sha256=gate_spec,
+    route_partition_sha256=route_partition,
+    recorded_source_identity_sha256=recorded_source,
+    training_selection_sha256=training,
+    validation_sha256=validation,
+    smooth_passed=smooth_passed,
+    swift_passed=swift_passed,
+    strong_passed=strong_passed,
+    target_materially_improved=passed,
+    final_behavior_policy=behavior if passed else None,
+    final_behavior_policy_sha256=behavior.sha256 if passed else None,
+    behavior_selection_sha256=selection if passed else None,
+    reasons=(FinalizationReason.PASSED,) if passed else (
+      FinalizationReason.SMOOTH_VALIDATION_REGRESSION,
+    ),
+  )
+
+
+def calibration_manifest(selected_profile: VehicleProfile) -> CalibrationSelectionManifest:
+  calibration = calibration_profile_for_controller(selected_profile)
+  profile_sha = hashlib.sha256(selected_profile.to_json().encode()).hexdigest()
+  calibration_sha = hashlib.sha256(calibration.to_json().encode()).hexdigest()
+  return CalibrationSelectionManifest(
+    selected_controller_profile_sha256=profile_sha,
+    candidate_calibration_profile_sha256=calibration_sha,
+    learner_evidence_sha256=EVIDENCE_HASH,
+    qualification_manifest_sha256=CALIBRATION_MANIFEST_HASH,
+    all_nodes_qualified=True,
+  )
+
+
 def artifact(revision: int = 1) -> ApprovedProfileArtifact:
+  selected_profile = profile(revision)
+  calibration = calibration_profile_for_controller(selected_profile)
+  selected_policy = policy()
   return ApprovedProfileArtifact(
-    vehicle_profile=profile(revision),
-    controller_policy=policy(),
+    vehicle_profile=selected_profile,
+    calibration_profile=calibration,
+    controller_policy=selected_policy,
     runtime_vehicle_identity_sha256=RUNTIME_HASH,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
-    learner_evidence_sha256=EVIDENCE_HASH,
+    panda_commit=PANDA_COMMIT,
+    calibration_selection_manifest=calibration_manifest(selected_profile),
+    behavior_finalization=behavior_finalization(selected_policy),
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
     safety_passed=True,
     deterministic_aa_passed=True,
     device_timing_passed=True,
+    smooth_passed=True,
+    swift_passed=True,
+    strong_passed=True,
   )
 
 
@@ -131,6 +209,7 @@ def reader_result(params: MemoryParams, **changes):
     "expected_runtime_vehicle_identity_sha256": RUNTIME_HASH,
     "expected_source_openpilot_commit": SOURCE_COMMIT,
     "expected_opendbc_commit": OPENDBC_COMMIT,
+    "expected_panda_commit": PANDA_COMMIT,
   }
   expected.update(changes)
   return ApprovedArtifactReader(params).read(**expected)
@@ -142,6 +221,7 @@ def activation(
   production_envelope_verified: bool = True,
   expected_source_openpilot_commit: str = SOURCE_COMMIT,
   expected_opendbc_commit: str = OPENDBC_COMMIT,
+  expected_panda_commit: str = PANDA_COMMIT,
 ) -> PersistentProfileActivation:
   return PersistentProfileActivation(
     params,
@@ -149,6 +229,7 @@ def activation(
     expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
     expected_source_openpilot_commit=expected_source_openpilot_commit,
     expected_opendbc_commit=expected_opendbc_commit,
+    expected_panda_commit=expected_panda_commit,
     production_envelope_verified=production_envelope_verified,
   )
 
@@ -188,6 +269,10 @@ class TestApprovedProfileArtifact(unittest.TestCase):
     self.assertIs(result.diagnostic, ArtifactDiagnostic.OK)
     self.assertEqual(result.artifact, self.approved)
     self.assertEqual(
+      result.artifact.behavior_selection_sha256,
+      self.approved.behavior_finalization.behavior_selection_sha256,
+    )
+    self.assertEqual(
       result.artifact.artifact_sha256,
       hashlib.sha256(
         json.dumps(
@@ -225,6 +310,9 @@ class TestApprovedProfileArtifact(unittest.TestCase):
     upper_hash = self.approved.to_param()
     upper_hash["learnerEvidenceSha256"] = "A" * 64
     mutations.append(upper_hash)
+    malformed_behavior_hash = self.approved.to_param()
+    malformed_behavior_hash["behaviorSelectionSha256"] = "6" * 63
+    mutations.append(malformed_behavior_hash)
     abbreviated_commit = self.approved.to_param()
     abbreviated_commit["sourceOpenpilotCommit"] = SOURCE_COMMIT[:12]
     mutations.append(abbreviated_commit)
@@ -261,6 +349,93 @@ class TestApprovedProfileArtifact(unittest.TestCase):
       ArtifactDiagnostic.POLICY_HASH_MISMATCH,
     )
 
+    payload = self.approved.to_param()
+    payload["calibrationProfileSha256"] = "8" * 64
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+    )
+
+  def test_calibration_json_tampering_and_dropped_offset_fail_closed(self):
+    payload = self.approved.to_param()
+    calibration = json.loads(payload["calibrationProfileJson"])
+    calibration["nodes"][0]["parameters"][
+      "lateral_accel_offset_correction_mps2"
+    ] = 0.125
+    payload["calibrationProfileJson"] = json.dumps(
+      calibration,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+    )
+
+    # Recomputing the sibling hash is insufficient: the selection preimage
+    # still names the exact qualified calibration that was gated.
+    payload["calibrationProfileSha256"] = hashlib.sha256(
+      payload["calibrationProfileJson"].encode(),
+    ).hexdigest()
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+    )
+
+    dropped = self.approved.to_param()
+    calibration = json.loads(dropped["calibrationProfileJson"])
+    calibration["nodes"][0]["parameters"].pop(
+      "lateral_accel_offset_correction_mps2",
+    )
+    dropped["calibrationProfileJson"] = json.dumps(
+      calibration,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    dropped["calibrationProfileSha256"] = hashlib.sha256(
+      dropped["calibrationProfileJson"].encode(),
+    ).hexdigest()
+    self.params.values[APPROVED_ARTIFACT_PARAM] = dropped
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.MALFORMED,
+    )
+
+  def test_controller_profile_cannot_drop_learned_offset(self):
+    payload = self.approved.to_param()
+    controller = json.loads(payload["vehicleProfileJson"])
+    controller["nodes"][0]["parameters"][
+      "lateral_accel_offset_correction_mps2"
+    ] = 0.25
+    payload["vehicleProfileJson"] = json.dumps(
+      controller,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    payload["vehicleProfileSha256"] = hashlib.sha256(
+      payload["vehicleProfileJson"].encode(),
+    ).hexdigest()
+    selection = json.loads(payload["calibrationSelectionManifestJson"])
+    selection["selectedControllerProfileSha256"] = payload[
+      "vehicleProfileSha256"
+    ]
+    payload["calibrationSelectionManifestJson"] = json.dumps(
+      selection,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    payload["calibrationSelectionManifestSha256"] = hashlib.sha256(
+      payload["calibrationSelectionManifestJson"].encode(),
+    ).hexdigest()
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+    )
+
   def test_unqualified_profile_and_provisional_policy_are_rejected(self):
     payload = self.approved.to_param()
     unqualified_json = profile(qualified=False).to_json()
@@ -286,7 +461,7 @@ class TestApprovedProfileArtifact(unittest.TestCase):
       ArtifactDiagnostic.PROVISIONAL_POLICY,
     )
 
-  def test_vehicle_runtime_source_and_opendbc_mismatch_reasons(self):
+  def test_vehicle_runtime_source_opendbc_and_panda_mismatch_reasons(self):
     cases = (
       (
         {"expected_vehicle_identity": "different-car"},
@@ -304,6 +479,10 @@ class TestApprovedProfileArtifact(unittest.TestCase):
         {"expected_opendbc_commit": "a" * 40},
         ArtifactDiagnostic.OPENDBC_COMMIT_MISMATCH,
       ),
+      (
+        {"expected_panda_commit": "b" * 40},
+        ArtifactDiagnostic.PANDA_COMMIT_MISMATCH,
+      ),
     )
     for changes, expected in cases:
       with self.subTest(changes=changes):
@@ -318,6 +497,9 @@ class TestApprovedProfileArtifact(unittest.TestCase):
       "safetyPassed",
       "deterministicAaPassed",
       "deviceTimingPassed",
+      "smoothPassed",
+      "swiftPassed",
+      "strongPassed",
     ):
       with self.subTest(key=key):
         payload = self.approved.to_param()
@@ -351,6 +533,169 @@ class TestApprovedProfileArtifact(unittest.TestCase):
           result.diagnostic,
           ArtifactDiagnostic.MALFORMED,
         )
+
+  def test_old_schema_artifact_fails_closed_in_reader_and_activation(self):
+    old_payload = self.approved.to_param()
+    old_payload["schemaVersion"] = 3
+    for key in (
+      "pandaCommit",
+      "calibrationSelectionManifestJson",
+      "calibrationSelectionManifestSha256",
+      "behaviorFinalizationJson",
+      "behaviorFinalizationSha256",
+    ):
+      old_payload.pop(key)
+
+    self.params.values[APPROVED_ARTIFACT_PARAM] = old_payload
+    result = reader_result(self.params)
+    self.assertIsNone(result.artifact)
+    self.assertIs(result.diagnostic, ArtifactDiagnostic.MALFORMED)
+
+    old_calibration = self.approved.to_param()
+    calibration = json.loads(old_calibration["calibrationProfileJson"])
+    calibration["schema_version"] = 1
+    old_calibration["calibrationProfileJson"] = json.dumps(
+      calibration,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    old_calibration["calibrationProfileSha256"] = hashlib.sha256(
+      old_calibration["calibrationProfileJson"].encode(),
+    ).hexdigest()
+    self.params.values[APPROVED_ARTIFACT_PARAM] = old_calibration
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.MALFORMED,
+    )
+
+    old_selection = self.approved.to_param()
+    selection = json.loads(old_selection["calibrationSelectionManifestJson"])
+    selection["schemaVersion"] = 1
+    old_selection["calibrationSelectionManifestJson"] = json.dumps(
+      selection,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    old_selection["calibrationSelectionManifestSha256"] = hashlib.sha256(
+      old_selection["calibrationSelectionManifestJson"].encode(),
+    ).hexdigest()
+    self.params.values[APPROVED_ARTIFACT_PARAM] = old_selection
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.MALFORMED,
+    )
+
+    state_params = MemoryParams()
+    manager = activation(state_params)
+    manager.stage(self.approved, offroad=True)
+    persisted = state_params.values[ACTIVATION_STATE_PARAM]
+    persisted["stagedArtifact"]["schemaVersion"] = 3
+    for key in (
+      "pandaCommit",
+      "calibrationSelectionManifestJson",
+      "calibrationSelectionManifestSha256",
+      "behaviorFinalizationJson",
+      "behaviorFinalizationSha256",
+    ):
+      persisted["stagedArtifact"].pop(key)
+    restored = activation(state_params)
+    self.assertIs(restored.diagnostic, ArtifactDiagnostic.STATE_INVALID)
+    self.assertIs(
+      restored.begin_engagement().selection,
+      ControllerSelection.STOCK,
+    )
+    restored.end_engagement()
+
+    current = self.approved.to_param()
+    current["schemaVersion"] = 3
+    self.params.values[APPROVED_ARTIFACT_PARAM] = current
+    result = reader_result(self.params)
+    self.assertIsNone(result.artifact)
+    self.assertIs(result.diagnostic, ArtifactDiagnostic.MALFORMED)
+
+  def test_behavior_selection_identity_is_derived_from_canonical_proof(self):
+    for mutation in (None, "", "A" * 64, "7" * 63, "7" * 64):
+      with self.subTest(mutation=mutation):
+        payload = self.approved.to_param()
+        if mutation is None:
+          payload.pop("behaviorSelectionSha256")
+        else:
+          payload["behaviorSelectionSha256"] = mutation
+        self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+        result = reader_result(self.params)
+        self.assertIsNone(result.artifact)
+        self.assertIn(result.diagnostic, (
+          ArtifactDiagnostic.MALFORMED,
+          ArtifactDiagnostic.BEHAVIOR_PROOF_MISMATCH,
+        ))
+
+  def test_behavior_proof_cannot_be_paired_with_an_unrelated_policy(self):
+    payload = self.approved.to_param()
+    other_policy = ControllerPolicy(
+      revision=2,
+      provenance="different replay-qualified response policy",
+      provisional=False,
+      natural_frequency_per_s=12.0,
+      damping_ratio=0.7,
+      observer_time_constant_s=None,
+      observer_max_abs_disturbance_torque=None,
+    )
+    payload["controllerPolicyJson"] = other_policy.to_json()
+    payload["controllerPolicySha256"] = other_policy.sha256
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.BEHAVIOR_PROOF_MISMATCH,
+    )
+
+  def test_modified_behavior_proof_and_false_proof_gate_fail_closed(self):
+    payload = self.approved.to_param()
+    decoded = json.loads(payload["behaviorFinalizationJson"])
+    decoded["validationSha256"] = "f" * 64
+    payload["behaviorFinalizationJson"] = json.dumps(
+      decoded,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.MALFORMED,
+    )
+
+    failed = behavior_finalization(smooth_passed=False)
+    payload = self.approved.to_param()
+    payload["behaviorFinalizationJson"] = failed.to_json()
+    payload["behaviorFinalizationSha256"] = failed.sha256
+    payload["behaviorSelectionSha256"] = "7" * 64
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.GATE_FAILED,
+    )
+
+  def test_calibration_manifest_is_hash_and_profile_bound(self):
+    payload = self.approved.to_param()
+    payload["calibrationSelectionManifestSha256"] = "7" * 64
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+    )
+
+    payload = self.approved.to_param()
+    decoded = json.loads(payload["calibrationSelectionManifestJson"])
+    decoded["selectedControllerProfileSha256"] = "8" * 64
+    changed = json.dumps(decoded, sort_keys=True, separators=(",", ":"))
+    payload["calibrationSelectionManifestJson"] = changed
+    payload["calibrationSelectionManifestSha256"] = hashlib.sha256(
+      changed.encode(),
+    ).hexdigest()
+    self.params.values[APPROVED_ARTIFACT_PARAM] = payload
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+    )
 
 
 class TestPersistentProfileActivation(unittest.TestCase):
@@ -580,7 +925,7 @@ class TestPersistentProfileActivation(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "verified production"):
       unverified.stage(artifact(2), offroad=True)
 
-  def test_canonical_old_source_or_opendbc_state_retires_offroad(self):
+  def test_canonical_old_source_opendbc_or_panda_state_retires_offroad(self):
     cases = (
       (
         replace(
@@ -600,6 +945,17 @@ class TestPersistentProfileActivation(unittest.TestCase):
         {
           "expected_source_openpilot_commit": SOURCE_COMMIT,
           "expected_opendbc_commit": "7" * 40,
+        },
+      ),
+      (
+        replace(
+          artifact(),
+          panda_commit="8" * 40,
+        ),
+        {
+          "expected_source_openpilot_commit": SOURCE_COMMIT,
+          "expected_opendbc_commit": OPENDBC_COMMIT,
+          "expected_panda_commit": "8" * 40,
         },
       ),
     )

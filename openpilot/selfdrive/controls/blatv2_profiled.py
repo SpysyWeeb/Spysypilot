@@ -93,6 +93,7 @@ def assert_passive_process_contract(
 class RuntimeCommits:
   source_openpilot_commit: str
   opendbc_commit: str
+  panda_commit: str
 
 
 @dataclass(slots=True)
@@ -135,11 +136,12 @@ def resolve_runtime_commits(
       if repository_source is None or repository_source != runtime_source:
         return None
     opendbc = _exact_commit(repository_commit(str(root / "opendbc_repo")))
+    panda = _exact_commit(repository_commit(str(root / "panda")))
   except (KeyError, TypeError, ValueError, RuntimeError, OSError):
     return None
-  if opendbc is None:
+  if opendbc is None or panda is None:
     return None
-  return RuntimeCommits(runtime_source, opendbc)
+  return RuntimeCommits(runtime_source, opendbc, panda)
 
 
 def build_profile_lifecycle_context(
@@ -170,6 +172,7 @@ def build_profile_lifecycle_context(
         commits.source_openpilot_commit
       ),
       expected_opendbc_commit=commits.opendbc_commit,
+      expected_panda_commit=commits.panda_commit,
       production_envelope_verified=(
         bundle.torque_limits.production_envelope_verified
       ),
@@ -440,6 +443,7 @@ class BlatV2ProfileDaemon:
       expected_runtime_vehicle_identity_sha256=bundle.identity_sha256,
       expected_source_openpilot_commit=commits.source_openpilot_commit,
       expected_opendbc_commit=commits.opendbc_commit,
+      expected_panda_commit=commits.panda_commit,
     )
     self.last_artifact_diagnostic = result.diagnostic
     candidate = result.artifact
@@ -522,6 +526,7 @@ class BlatV2ProfileDaemon:
       runtime_identity_sha256=context.runtime_bundle.identity_sha256,
       source_openpilot_commit=context.commits.source_openpilot_commit,
       opendbc_commit=context.commits.opendbc_commit,
+      panda_commit=context.commits.panda_commit,
     )
     encoded = canonical_lifecycle_status_bytes(payload)
     if encoded == self._last_lifecycle_status_bytes:

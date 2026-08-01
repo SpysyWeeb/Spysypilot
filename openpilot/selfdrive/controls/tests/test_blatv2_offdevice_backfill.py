@@ -38,6 +38,9 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeUnavailableError,
   canonical_json_bytes,
 )
+from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
+  route_evidence_for_frames,
+)
 
 
 DONGLE = "f" * 16
@@ -283,6 +286,8 @@ def test_session_opens_exact_spool_and_cleans_it(
   scratch = tmp_path / ".blatv2-remote-prepare-test"
   scratch.mkdir(mode=0o700)
   candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  provenance = {"source": "test"}
+  evidence = route_evidence_for_frames(candidate.route_name, (), provenance)
   descriptor = write_prepared_route_spool(
     scratch,
     candidate.route_name,
@@ -290,10 +295,11 @@ def test_session_opens_exact_spool_and_cleans_it(
     controls_witness_count=0,
     unresolved_witness_count=0,
     gap_count=0,
-    provenance={"source": "test"},
+    provenance=provenance,
     max_frames=1,
     abort_requested=lambda: False,
     filename="a1-route.spool",
+    route_evidence=evidence,
   )
   # Prove the same descriptor is independently valid before handing it to the
   # source callback; the callback/replay owns deletion after this point.
@@ -760,6 +766,7 @@ def accepted_spool_outcomes(
 ) -> dict[tuple[int, str], _PreparedOutcome]:
   result: dict[tuple[int, str], _PreparedOutcome] = {}
   for authority in (1, 2):
+    evidence = route_evidence_for_frames(candidate.route_name, (), provenance)
     descriptor = write_prepared_route_spool(
       scratch,
       candidate.route_name,
@@ -771,6 +778,7 @@ def accepted_spool_outcomes(
       max_frames=1,
       abort_requested=lambda: False,
       filename=f"a{authority}-route.spool",
+      route_evidence=evidence,
     )
     result[(authority, candidate.route_name)] = _PreparedOutcome(
       descriptor=descriptor,
@@ -778,6 +786,18 @@ def accepted_spool_outcomes(
       rejection_message=None,
     )
   return result
+
+
+def empty_prepared_route(
+  candidate: RouteCandidate,
+  provenance: dict[str, object],
+) -> PreparedRoute:
+  return PreparedRoute(
+    (), 0, 0, 0, provenance,
+    route_evidence=route_evidence_for_frames(
+      candidate.route_name, (), provenance,
+    ),
+  )
 
 
 def test_accepted_domain_requires_one_byte_exact_arm_certification(
@@ -790,7 +810,7 @@ def test_accepted_domain_requires_one_byte_exact_arm_certification(
   outcomes = accepted_spool_outcomes(scratch, candidate, provenance)
   engine = CertificationEngine(
     tmp_path,
-    PreparedRoute((), 0, 0, 0, provenance),
+    empty_prepared_route(candidate, provenance),
   )
   certified = _certify_preparation_domains(
     engine=engine,
@@ -868,7 +888,7 @@ def test_corrupt_or_nonlocal_accepted_domain_never_reaches_learner(
   outcomes = accepted_spool_outcomes(scratch, candidate, provenance)
   engine = CertificationEngine(
     tmp_path,
-    PreparedRoute((), 0, 0, 0, provenance),
+    empty_prepared_route(candidate, provenance),
   )
   _certify_preparation_domains(
     engine=engine,
@@ -915,7 +935,7 @@ def test_accepted_domain_arm_byte_mismatch_falls_back(tmp_path: Path) -> None:
     _certify_preparation_domains(
       engine=CertificationEngine(
         tmp_path,
-        PreparedRoute((), 0, 0, 0, local_provenance),
+        empty_prepared_route(candidate, local_provenance),
       ),
       plan=certification_plan(candidate),
       scratch_directory=scratch,
@@ -949,7 +969,7 @@ def test_nonlocal_accepted_domain_falls_back(tmp_path: Path) -> None:
     _certify_preparation_domains(
       engine=CertificationEngine(
         fresh_root,
-        PreparedRoute((), 0, 0, 0, provenance),
+        empty_prepared_route(candidate, provenance),
       ),
       plan=certification_plan(candidate, locally_available=False),
       scratch_directory=fresh_scratch,
@@ -1020,19 +1040,24 @@ def test_rejected_route_requires_identical_local_arm_rejection(
 
 
 @pytest.mark.parametrize(
-  "arm_result",
+  "arm_result_kind",
   [
-    PreparedRoute((), 0, 0, 0, prepared_provenance()),
-    RouteRejected("different_reason", "different message"),
+    "accepted",
+    "different_rejection",
   ],
 )
 def test_rejected_route_arm_disagreement_falls_back(
   tmp_path: Path,
-  arm_result: PreparedRoute | RouteRejected,
+  arm_result_kind: str,
 ) -> None:
   scratch = tmp_path / ".blatv2-remote-prepare-reject"
   scratch.mkdir(mode=0o700)
   candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  arm_result: PreparedRoute | RouteRejected = (
+    empty_prepared_route(candidate, prepared_provenance())
+    if arm_result_kind == "accepted"
+    else RouteRejected("different_reason", "different message")
+  )
   outcomes = {
     (authority, candidate.route_name): _PreparedOutcome(
       descriptor=None,

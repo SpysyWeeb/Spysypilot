@@ -32,7 +32,10 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationLearningLifecycleState,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CalibrationFitStatus,
+  CalibrationInterpolationQualificationReport,
   CalibrationLearningResult,
+  CalibrationPairedLossDiagnostic,
   CalibrationQualificationReason,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
@@ -63,6 +66,10 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 GENERIC_FINGERPRINT = "GENERIC NON-HYUNDAI TORQUE PLATFORM"
 GENERIC_CONTROLLER_MODULE = "test_blatv2_generic_controller"
+
+
+def _test_route_identity(label: str) -> str:
+  return hashlib.sha256(f"blatv2-test-route:{label}".encode()).hexdigest()
 
 
 class GenericControllerParams:
@@ -544,7 +551,7 @@ def _test_runtime_collects_only_onroad_and_persists_only_offroad(
   assert runtime.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   assert not artifact_root.exists()
 
-  runtime.transition_onroad()
+  runtime.transition_onroad(_test_route_identity("collect-and-persist"))
   with patch(
     "openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator._atomic_write_bytes",
   ) as write:
@@ -566,7 +573,7 @@ def _test_restart_restores_exact_cross_drive_evidence(
 ) -> None:
   first = build_generic_runtime(tmp_path, generic_controller_module)
   cp = first.car_params
-  first.transition_onroad()
+  first.transition_onroad(_test_route_identity("restart-first"))
   warm_runtime_to_first_causal_sample(first, cp, 1_000_000_000)
   saved = first.transition_offroad_and_persist()
 
@@ -574,7 +581,7 @@ def _test_restart_restores_exact_cross_drive_evidence(
   assert restored.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   assert restored.coordinator.finalize().evidence_bytes == (saved.evidence_bytes)
   assert restored.coordinator.finalize().manifest_bytes == (saved.manifest_bytes)
-  restored.transition_onroad()
+  restored.transition_onroad(_test_route_identity("restart-second"))
   warm_runtime_to_first_causal_sample(restored, cp, 2_000_000_000)
   second = restored.transition_offroad_and_persist()
   assert second.evidence_bytes != saved.evidence_bytes
@@ -586,7 +593,7 @@ def _test_restore_corruption_and_seed_mismatch_fail_closed(
   test_case: unittest.TestCase,
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
-  runtime.transition_onroad()
+  runtime.transition_onroad(_test_route_identity("corruption-restore"))
   warm_runtime_to_first_causal_sample(
     runtime,
     runtime.car_params,
@@ -627,7 +634,7 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad()
+  runtime.transition_onroad(_test_route_identity("clean-frame-filters"))
   base = 1_000_000_000
 
   frame_index = warm_runtime_to_first_causal_sample(runtime, cp, base)
@@ -740,7 +747,7 @@ def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad()
+  runtime.transition_onroad(_test_route_identity("vehicle-envelope"))
   base = 1_000_000_000
 
   # Prime the measured envelope and derivative using ordinary interior input.
@@ -902,7 +909,7 @@ def _test_runtime_uses_delayed_command_not_same_frame_torque(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad()
+  runtime.transition_onroad(_test_route_identity("delayed-command"))
   base = 1_000_000_000
   captured = []
   original_ingest = runtime.coordinator.ingest
@@ -950,7 +957,7 @@ def _test_runtime_retains_unsigned_reversal_without_fitting_it(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad()
+  runtime.transition_onroad(_test_route_identity("unsigned-reversal"))
   base = 1_000_000_000
   next_index = warm_runtime_to_first_causal_sample(
     runtime,
@@ -996,6 +1003,7 @@ class FakeParams:
     # is manager-cleared and cannot be the learner's sole restore source.
     self.values: dict[str, object] = {
       "CarParamsPersistent": car_params_bytes,
+      "CurrentRoute": "00000000--blatv2-test-route",
       "IsOffroad": False,
     }
     self.puts: list[tuple[str, object, bool]] = []
@@ -1576,7 +1584,7 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
   with test_case.assertRaisesRegex(ValueError, "must not exceed one"):
     validate_learning_status_payload(invalid_confidence)
   invalid_reason = copy.deepcopy(empty_payload)
-  invalid_reason["nodes"][0]["reasons"] = ["qualified"]
+  invalid_reason["nodes"][0]["reasons"] = ["learned"]
   with test_case.assertRaisesRegex(ValueError, "reasons disagree"):
     validate_learning_status_payload(invalid_reason)
 
@@ -1625,6 +1633,14 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
     provenance="test-only fully qualified evidence",
     nodes=learned_nodes,
   )
+  paired_loss = CalibrationPairedLossDiagnostic(
+    2,
+    -0.01,
+    0.002,
+    -0.012,
+    -0.008,
+    1e-14,
+  )
   learned_reports = tuple(
     replace(
       before.learning_result.node_reports[index],
@@ -1658,22 +1674,50 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
       breakaway_seed_validation_rms=0.2,
       breakaway_candidate_validation_rms=0.1,
       confidence=1.0,
-      reasons=(CalibrationQualificationReason.QUALIFIED,),
+      reasons=(CalibrationQualificationReason.LEARNED,),
       candidate_parameters=node.parameters,
+      fit_diagnostics=tuple(
+        replace(
+          diagnostic,
+          status=CalibrationFitStatus.IDENTIFIABLE,
+          moving_rank=diagnostic.moving_parameter_count,
+          condition_estimate=1.0,
+          breakaway_rank=diagnostic.breakaway_parameter_count,
+        )
+        for diagnostic in before.learning_result.node_reports[index].fit_diagnostics
+      ),
+      training_paired_loss=paired_loss,
+      validation_paired_loss=paired_loss,
+      training_outcome=CalibrationQualificationReason.LEARNED,
     )
     for index, node in enumerate(learned_nodes)
   )
   candidate_json = learned_profile.to_json().encode("utf-8")
+  interpolation_reports = tuple(
+    CalibrationInterpolationQualificationReport(
+      interval_index=index,
+      lower_speed_mps=learned_nodes[index].speed_mps,
+      upper_speed_mps=learned_nodes[index + 1].speed_mps,
+      training_paired_loss=paired_loss,
+      validation_paired_loss=paired_loss,
+      reasons=(CalibrationQualificationReason.QUALIFIED,),
+    )
+    for index in range(len(learned_nodes) - 1)
+  )
   qualified_finalization = CalibrationLearningFinalization(
     manifest_bytes=b"test manifest",
     manifest_sha256="b" * 64,
     evidence_bytes=b"test evidence",
     evidence_sha256="c" * 64,
+    selected_profile_json=candidate_json,
+    selected_profile_sha256=hashlib.sha256(candidate_json).hexdigest(),
     candidate_profile_json=candidate_json,
     candidate_profile_sha256=hashlib.sha256(candidate_json).hexdigest(),
     learning_result=CalibrationLearningResult(
       node_reports=learned_reports,
       candidate_profile=learned_profile,
+      interpolation_reports=interpolation_reports,
+      selected_profile=learned_profile,
     ),
   )
   qualified = build_learning_status_payload(
@@ -1700,7 +1744,7 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
     for node in qualified["nodes"]
   )
 
-  runtime.transition_onroad()
+  runtime.transition_onroad(_test_route_identity("status-drive-local"))
   cp = runtime.car_params
   warm_runtime_to_first_causal_sample(runtime, cp, 1_000_000_000)
   after = runtime.transition_offroad_and_persist()

@@ -44,11 +44,18 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   ProfileNode,
   VehicleProfile,
 )
+from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
+  calibration_profile_for_controller,
+  calibration_selection_manifest,
+  passed_behavior_finalization,
+)
 VEHICLE = "GENERIC PORTABLE TORQUE VEHICLE"
 RUNTIME_HASH = "1" * 64
 SOURCE_COMMIT = "2" * 40
 OPENDBC_COMMIT = "3" * 40
+PANDA_COMMIT = "4" * 40
 EVIDENCE_HASH = "4" * 64
+CALIBRATION_MANIFEST_HASH = "5" * 64
 HARNESS_COMMIT = "5" * 40
 
 
@@ -183,27 +190,41 @@ def profile(revision=1):
 
 
 def artifact(revision=1, *, runtime_hash=RUNTIME_HASH):
+  selected_profile = profile(revision)
+  calibration_profile = calibration_profile_for_controller(selected_profile)
+  selected_policy = ControllerPolicy(
+    revision=1,
+    provenance="replay-qualified generic policy",
+    provisional=False,
+    natural_frequency_per_s=8.0,
+    damping_ratio=1.0,
+    observer_time_constant_s=None,
+    observer_max_abs_disturbance_torque=None,
+  )
   return ApprovedProfileArtifact(
-    vehicle_profile=profile(revision),
-    controller_policy=ControllerPolicy(
-      revision=1,
-      provenance="replay-qualified generic policy",
-      provisional=False,
-      natural_frequency_per_s=8.0,
-      damping_ratio=1.0,
-      observer_time_constant_s=None,
-      observer_max_abs_disturbance_torque=None,
-    ),
+    vehicle_profile=selected_profile,
+    calibration_profile=calibration_profile,
+    controller_policy=selected_policy,
     runtime_vehicle_identity_sha256=runtime_hash,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
-    learner_evidence_sha256=EVIDENCE_HASH,
+    panda_commit=PANDA_COMMIT,
+    calibration_selection_manifest=calibration_selection_manifest(
+      selected_profile,
+      learner_evidence_sha256=EVIDENCE_HASH,
+      qualification_manifest_sha256=CALIBRATION_MANIFEST_HASH,
+      calibration_profile=calibration_profile,
+    ),
+    behavior_finalization=passed_behavior_finalization(selected_policy),
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
     safety_passed=True,
     deterministic_aa_passed=True,
     device_timing_passed=True,
+    smooth_passed=True,
+    swift_passed=True,
+    strong_passed=True,
   )
 
 
@@ -219,7 +240,7 @@ def context_for(
       production_envelope_verified=envelope_verified,
     ),
   )
-  commits = RuntimeCommits(SOURCE_COMMIT, OPENDBC_COMMIT)
+  commits = RuntimeCommits(SOURCE_COMMIT, OPENDBC_COMMIT, PANDA_COMMIT)
   return ProfileLifecycleContext(
     runtime_bundle=runtime_bundle,
     commits=commits,
@@ -230,6 +251,7 @@ def context_for(
       expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
       expected_source_openpilot_commit=SOURCE_COMMIT,
       expected_opendbc_commit=OPENDBC_COMMIT,
+      expected_panda_commit=PANDA_COMMIT,
       production_envelope_verified=envelope_verified,
     ),
   )
@@ -295,6 +317,7 @@ def lifecycle_payload(activation):
     runtime_identity_sha256=RUNTIME_HASH,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
   )
 
 
@@ -313,12 +336,14 @@ def test_lifecycle_display_projection_maps_every_effective_state():
     runtime_identity_sha256=RUNTIME_HASH,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
   ) == build_lifecycle_status_bytes(
     activation=manager,
     vehicle_identity=VEHICLE,
     runtime_identity_sha256=RUNTIME_HASH,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
   )
 
   manager.stage(artifact(), offroad=True)
@@ -402,17 +427,23 @@ def test_lifecycle_display_invalid_stale_and_unverified_fail_closed():
   old_source = "6" * 40
   old_artifact = ApprovedProfileArtifact(
     vehicle_profile=artifact().vehicle_profile,
+    calibration_profile=artifact().calibration_profile,
     controller_policy=artifact().controller_policy,
     runtime_vehicle_identity_sha256=RUNTIME_HASH,
     source_openpilot_commit=old_source,
     opendbc_commit=OPENDBC_COMMIT,
-    learner_evidence_sha256=EVIDENCE_HASH,
+    panda_commit=PANDA_COMMIT,
+    calibration_selection_manifest=artifact().calibration_selection_manifest,
+    behavior_finalization=artifact().behavior_finalization,
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
     safety_passed=True,
     deterministic_aa_passed=True,
     device_timing_passed=True,
+    smooth_passed=True,
+    swift_passed=True,
+    strong_passed=True,
   )
   old_manager = PersistentProfileActivation(
     stale_params,
@@ -420,6 +451,7 @@ def test_lifecycle_display_invalid_stale_and_unverified_fail_closed():
     expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
     expected_source_openpilot_commit=old_source,
     expected_opendbc_commit=OPENDBC_COMMIT,
+    expected_panda_commit=PANDA_COMMIT,
     production_envelope_verified=True,
   )
   old_manager.stage(old_artifact, offroad=True)
@@ -768,17 +800,23 @@ def test_daemon_retires_canonical_old_build_then_prepares_current_artifact():
   old_artifact = copy.copy(artifact())
   old_artifact = ApprovedProfileArtifact(
     vehicle_profile=old_artifact.vehicle_profile,
+    calibration_profile=old_artifact.calibration_profile,
     controller_policy=old_artifact.controller_policy,
     runtime_vehicle_identity_sha256=RUNTIME_HASH,
     source_openpilot_commit=old_source,
     opendbc_commit=OPENDBC_COMMIT,
-    learner_evidence_sha256=EVIDENCE_HASH,
+    panda_commit=PANDA_COMMIT,
+    calibration_selection_manifest=old_artifact.calibration_selection_manifest,
+    behavior_finalization=old_artifact.behavior_finalization,
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
     safety_passed=True,
     deterministic_aa_passed=True,
     device_timing_passed=True,
+    smooth_passed=True,
+    swift_passed=True,
+    strong_passed=True,
   )
   old_manager = PersistentProfileActivation(
     params,
@@ -786,6 +824,7 @@ def test_daemon_retires_canonical_old_build_then_prepares_current_artifact():
     expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
     expected_source_openpilot_commit=old_source,
     expected_opendbc_commit=OPENDBC_COMMIT,
+    expected_panda_commit=PANDA_COMMIT,
     production_envelope_verified=True,
   )
   old_manager.stage(old_artifact, offroad=True)
@@ -898,16 +937,18 @@ def test_runtime_commit_resolution_requires_full_exact_agreement(tmp_path):
   params = MemoryParams()
   (tmp_path / ".git").mkdir()
   (tmp_path / "opendbc_repo").mkdir()
+  (tmp_path / "panda").mkdir()
   commits = {
     str(tmp_path): SOURCE_COMMIT,
     str(tmp_path / "opendbc_repo"): OPENDBC_COMMIT,
+    str(tmp_path / "panda"): PANDA_COMMIT,
   }
   resolved = resolve_runtime_commits(
     params,
     basedir=tmp_path,
     repository_commit=lambda path: commits[path],
   )
-  assert resolved == RuntimeCommits(SOURCE_COMMIT, OPENDBC_COMMIT)
+  assert resolved == RuntimeCommits(SOURCE_COMMIT, OPENDBC_COMMIT, PANDA_COMMIT)
 
   params.values["GitCommit"] = SOURCE_COMMIT[:-1]
   assert resolve_runtime_commits(

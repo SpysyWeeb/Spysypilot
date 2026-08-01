@@ -7,8 +7,11 @@ written last so it acts as the commit record for the independently atomic
 evidence and optional candidate files.
 
 The coordinator can create an *unapproved* candidate only after every speed
-node qualifies.  It has no API for approval, activation, controller selection,
-or mutation of the profile used by a live controller.
+node and interpolation interval qualifies. An evaluated all-seed outcome is
+successful and emits an immutable selected-profile proof for downstream
+behavior replay, but it intentionally emits no redundant *new calibration*
+candidate. It has no API for approval, activation, controller selection, or
+mutation of the profile used by a live controller.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 5
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 8
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
@@ -94,19 +97,21 @@ class CalibrationNodeSupportDiagnostic:
 
 @dataclass(frozen=True, slots=True)
 class CalibrationLearningFinalization:
-  """Canonical evidence, qualification manifest, and optional full profile."""
+  """Canonical evidence, selected proof, and optional learned calibration."""
 
   manifest_bytes: bytes
   manifest_sha256: str
   evidence_bytes: bytes
   evidence_sha256: str
+  selected_profile_json: bytes | None
+  selected_profile_sha256: str | None
   candidate_profile_json: bytes | None
   candidate_profile_sha256: str | None
   learning_result: CalibrationLearningResult
 
   @property
   def all_nodes_qualified(self) -> bool:
-    return self.candidate_profile_json is not None
+    return self.learning_result.all_nodes_qualified
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
@@ -326,10 +331,14 @@ class CalibrationLearningCoordinator:
       )
     return tuple(diagnostics)
 
-  def transition_onroad(self, route_counter: int = 0) -> None:
+  def transition_onroad(
+    self,
+    route_identity_sha256: str,
+    route_content_sha256: str | None = None,
+  ) -> None:
     if self._state is not CalibrationLearningLifecycleState.OFFROAD:
       raise RuntimeError("calibration coordinator is already onroad")
-    self._learner.begin_route(route_counter)
+    self._learner.begin_route(route_identity_sha256, route_content_sha256)
     self._state = CalibrationLearningLifecycleState.ONROAD
 
   def transition_offroad(self) -> None:
@@ -337,6 +346,11 @@ class CalibrationLearningCoordinator:
       raise RuntimeError("calibration coordinator is already offroad")
     self._learner.end_route()
     self._state = CalibrationLearningLifecycleState.OFFROAD
+    # Route-level paired uncertainty changes even when every frame in a route
+    # is rejected.  Never retain a finalization across a completed route.
+    self._evidence_generation += 1
+    self._cached_finalization = None
+    self._finalized_generation = -1
 
   def ingest(self, sample: LearningSample) -> bool:
     """Accumulate measured response in memory; never write or activate."""
@@ -370,12 +384,35 @@ class CalibrationLearningCoordinator:
     evidence_identity = calibration_evidence_sha256(evidence_bytes)
     result = self._learner.qualify(self._candidate_provenance)
     candidate = result.candidate_profile
-    if bool(candidate is not None) != bool(result.all_nodes_qualified):
+    # Test doubles and external audit adapters that predate schema 8 may only
+    # expose the learned candidate.  A real schema-8 learner always provides
+    # ``selected_profile`` explicitly; the fallback preserves the same value
+    # for the learned case without inventing an all-seed selection.
+    selected = getattr(result, "selected_profile", candidate)
+    if (selected is not None) != result.all_nodes_qualified:
+      raise ValueError("qualified calibration selection completeness is inconsistent")
+    if candidate is not None and not result.all_nodes_qualified:
       raise ValueError("calibration learner candidate completeness is inconsistent")
+    if (
+      candidate is None
+      and getattr(result, "contains_learned_change", False)
+      and result.all_nodes_qualified
+    ):
+      raise ValueError("qualified learned calibration disappeared before publication")
+    if selected is not None and (
+      not selected.qualified
+      or selected.vehicle_identity != self.vehicle_identity
+      or selected.schema_version != self._seed_profile.schema_version
+    ):
+      raise ValueError("calibration learner emitted an incompatible selected profile")
     if candidate is not None and (
       not candidate.qualified or candidate.vehicle_identity != self.vehicle_identity or candidate.schema_version != self._seed_profile.schema_version
     ):
       raise ValueError("calibration learner emitted an incompatible candidate profile")
+    if candidate is not None and candidate != selected:
+      raise ValueError("learned calibration candidate differs from selected profile")
+    selected_json = None if selected is None else _profile_bytes(selected)
+    selected_identity = None if selected_json is None else hashlib.sha256(selected_json).hexdigest()
     candidate_json = None if candidate is None else _profile_bytes(candidate)
     candidate_identity = None if candidate_json is None else hashlib.sha256(candidate_json).hexdigest()
     candidate_manifest: dict[str, object] | None = None
@@ -394,9 +431,23 @@ class CalibrationLearningCoordinator:
       "evidence_schema_version": CALIBRATION_EVIDENCE_SCHEMA_VERSION,
       "evidence_sha256": evidence_identity,
       "node_reports": [_qualification_manifest(report) for report in result.node_reports],
+      "interpolation_reports": [
+        _manifest_value(report, "interpolation_report")
+        for report in getattr(result, "interpolation_reports", ())
+      ],
       "seed_profile_revision": self._seed_profile.revision,
       "seed_profile_schema_version": self._seed_profile.schema_version,
       "seed_profile_sha256": self.seed_profile_sha256,
+      "selected_profile": (
+        None
+        if selected is None
+        else {
+          "profile_sha256": selected_identity,
+          "provenance": selected.provenance,
+          "revision": selected.revision,
+          "schema_version": selected.schema_version,
+        }
+      ),
       "vehicle_identity": self.vehicle_identity,
     }
     manifest_bytes = _canonical_json_bytes(manifest)
@@ -405,6 +456,8 @@ class CalibrationLearningCoordinator:
       manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
       evidence_bytes=evidence_bytes,
       evidence_sha256=evidence_identity,
+      selected_profile_json=selected_json,
+      selected_profile_sha256=selected_identity,
       candidate_profile_json=candidate_json,
       candidate_profile_sha256=candidate_identity,
       learning_result=result,
@@ -418,20 +471,32 @@ class CalibrationLearningCoordinator:
     *,
     evidence_path: str | os.PathLike[str],
     manifest_path: str | os.PathLike[str],
+    selected_profile_path: str | os.PathLike[str] | None = None,
     candidate_profile_path: str | os.PathLike[str] | None = None,
   ) -> CalibrationLearningFinalization:
-    """Persist evidence/candidate atomically, then commit their manifest last."""
+    """Persist evidence/selection/candidate, then commit the manifest last."""
     if self._state is not CalibrationLearningLifecycleState.OFFROAD:
       raise RuntimeError("calibration artifacts may be written only while offroad")
     finalization = self.finalize()
-    if candidate_profile_path is not None and finalization.candidate_profile_json is None:
+    if (
+      candidate_profile_path is not None
+      and finalization.candidate_profile_json is None
+      and not finalization.all_nodes_qualified
+    ):
       raise RuntimeError("partial calibration evidence cannot emit a candidate profile")
 
     _atomic_write_bytes(evidence_path, finalization.evidence_bytes)
-    if candidate_profile_path is not None:
+    if selected_profile_path is not None:
+      if finalization.selected_profile_json is None:
+        raise RuntimeError(
+          "selected-profile path was supplied without a qualified selection"
+        )
+      _atomic_write_bytes(
+        selected_profile_path,
+        finalization.selected_profile_json,
+      )
+    if candidate_profile_path is not None and finalization.candidate_profile_json is not None:
       candidate_json = finalization.candidate_profile_json
-      if candidate_json is None:
-        raise AssertionError("candidate profile disappeared after preflight")
       _atomic_write_bytes(candidate_profile_path, candidate_json)
     _atomic_write_bytes(manifest_path, finalization.manifest_bytes)
     return finalization

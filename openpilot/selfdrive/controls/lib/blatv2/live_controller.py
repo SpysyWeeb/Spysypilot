@@ -52,6 +52,9 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   RuntimeVehicleBundle,
   build_runtime_vehicle_bundle,
 )
+from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
+  compose_controller_profile,
+)
 
 
 MODULAR_LIVE_ARCHITECTURE = "blatv2.modular.inverse-rack"
@@ -70,12 +73,14 @@ class LiveEligibility(IntEnum):
   RUNTIME_IDENTITY_MISMATCH = 5
   SOURCE_COMMIT_MISMATCH = 6
   OPENDBC_COMMIT_MISMATCH = 7
-  PROVISIONAL_POLICY = 8
-  UNQUALIFIED_PROFILE = 9
-  UNVERIFIED_PRODUCTION_ENVELOPE = 10
-  CONSTRUCTION_FAILED = 11
-  NO_EXACT_APPLIED_COUNT = 12
-  LATERAL_MANEUVER_MODE = 13
+  PANDA_COMMIT_MISMATCH = 8
+  PROVISIONAL_POLICY = 9
+  UNQUALIFIED_PROFILE = 10
+  UNVERIFIED_PRODUCTION_ENVELOPE = 11
+  CONSTRUCTION_FAILED = 12
+  NO_EXACT_APPLIED_COUNT = 13
+  LATERAL_MANEUVER_MODE = 14
+  CALIBRATION_COMPOSITION_MISMATCH = 15
 
 
 def control_witness_mono_ns() -> int:
@@ -96,6 +101,7 @@ class ModularLiveController:
     "artifact_diagnostic",
     "source_openpilot_commit",
     "opendbc_commit",
+    "panda_commit",
     "eligibility",
     "binding_reason",
     "candidate",
@@ -130,6 +136,7 @@ class ModularLiveController:
     artifact_diagnostic: ArtifactDiagnostic,
     source_openpilot_commit: str,
     opendbc_commit: str,
+    panda_commit: str,
     activation: PersistentProfileActivation | None = None,
   ) -> None:
     self.car_params = car_params
@@ -140,6 +147,7 @@ class ModularLiveController:
     self.artifact_diagnostic = artifact_diagnostic
     self.source_openpilot_commit = str(source_openpilot_commit)
     self.opendbc_commit = str(opendbc_commit)
+    self.panda_commit = str(panda_commit)
     self.eligibility = self._validate_eligibility()
     self.binding_reason = self.eligibility
     self.candidate: ModularControllerCandidate | None = None
@@ -198,6 +206,7 @@ class ModularLiveController:
     params: Any,
     source_openpilot_commit: str,
     opendbc_commit: str,
+    panda_commit: str,
   ) -> ModularLiveController:
     """Read/validate once at process construction; never writes activation."""
     runtime_bundle: RuntimeVehicleBundle | None = None
@@ -229,6 +238,7 @@ class ModularLiveController:
         ),
         expected_source_openpilot_commit=source_openpilot_commit,
         expected_opendbc_commit=opendbc_commit,
+        expected_panda_commit=panda_commit,
         production_envelope_verified=(
           runtime_bundle.torque_limits.production_envelope_verified
         ),
@@ -251,6 +261,7 @@ class ModularLiveController:
       artifact_diagnostic=diagnostic,
       source_openpilot_commit=source_openpilot_commit,
       opendbc_commit=opendbc_commit,
+      panda_commit=panda_commit,
     )
 
   def _validate_eligibility(self) -> LiveEligibility:
@@ -277,10 +288,21 @@ class ModularLiveController:
       != bundle.identity_sha256
     ):
       return LiveEligibility.RUNTIME_IDENTITY_MISMATCH
+    try:
+      expected_profile = compose_controller_profile(
+        artifact.calibration_profile,
+        bundle.seed_profile,
+      )
+    except (TypeError, ValueError, OverflowError):
+      return LiveEligibility.CALIBRATION_COMPOSITION_MISMATCH
+    if artifact.vehicle_profile != expected_profile:
+      return LiveEligibility.CALIBRATION_COMPOSITION_MISMATCH
     if artifact.source_openpilot_commit != self.source_openpilot_commit:
       return LiveEligibility.SOURCE_COMMIT_MISMATCH
     if artifact.opendbc_commit != self.opendbc_commit:
       return LiveEligibility.OPENDBC_COMMIT_MISMATCH
+    if artifact.panda_commit != self.panda_commit:
+      return LiveEligibility.PANDA_COMMIT_MISMATCH
     if artifact.controller_policy.provisional:
       return LiveEligibility.PROVISIONAL_POLICY
     if not artifact.vehicle_profile.qualified:
@@ -663,6 +685,7 @@ def construct_modular_live_controller(
   params: Any,
   source_openpilot_commit: str,
   opendbc_commit: str,
+  panda_commit: str,
 ) -> ModularLiveController:
   """Fail closed to stock for any optional modular construction error."""
   try:
@@ -672,6 +695,7 @@ def construct_modular_live_controller(
       params=params,
       source_openpilot_commit=source_openpilot_commit,
       opendbc_commit=opendbc_commit,
+      panda_commit=panda_commit,
     )
   except Exception:
     return ModularLiveController(
@@ -683,4 +707,5 @@ def construct_modular_live_controller(
       artifact_diagnostic=ArtifactDiagnostic.STATE_INVALID,
       source_openpilot_commit=source_openpilot_commit,
       opendbc_commit=opendbc_commit,
+      panda_commit=panda_commit,
     )

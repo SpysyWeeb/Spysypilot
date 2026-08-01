@@ -5,6 +5,7 @@ from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest  # noqa: TID251
 
@@ -19,6 +20,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BuildDescriptorRegistry,
   HistoricalLearningBackfill,
   PreparedRoute,
+  ReplayResult,
   RouteCandidate,
   RouteRejected,
   discover_complete_route_candidates,
@@ -40,6 +42,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
+)
+from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
+  route_evidence_for_frames,
 )
 
 
@@ -222,23 +227,21 @@ def make_engine(
           len(route.segments),
         )
     base = (route.route_counter + 1) * 1_000_000_000
-    return PreparedRoute(
-      frames=tuple(
+    frames = tuple(
         route_frame(
           cp,
           base + index * 10_000_000,
           first_in_route=index == 0,
         )
         for index in range(CAUSAL_ROUTE_FRAME_COUNT)
-      ),
-      controls_witness_count=CAUSAL_ROUTE_FRAME_COUNT,
-      unresolved_witness_count=0,
-      gap_count=0,
-      provenance={
+      )
+    provenance = {
         "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
         "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
         "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
-        "extractor_schema_version": 1,
+        "extractor_schema_version": (
+          learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION
+        ),
         "log_schema_blob": "4" * 40,
         "opendbc_commit": "2" * 40,
         "panda_commit": "3" * 40,
@@ -250,7 +253,16 @@ def make_engine(
           route.route_name.encode("ascii"),
         ).hexdigest(),
         "superproject_commit": "1" * 40,
-      },
+      }
+    return PreparedRoute(
+      frames=frames,
+      controls_witness_count=CAUSAL_ROUTE_FRAME_COUNT,
+      unresolved_witness_count=0,
+      gap_count=0,
+      provenance=provenance,
+      route_evidence=route_evidence_for_frames(
+        route.route_name, frames, provenance,
+      ),
     )
 
   monkeypatch.setattr(learning_backfill, "prepare_route", fake_prepare)
@@ -550,9 +562,10 @@ def test_injected_prepared_route_spool_exact_type_is_accepted(
       unresolved_witness_count=prepared.unresolved_witness_count,
       gap_count=prepared.gap_count,
       provenance=prepared.provenance,
-      max_frames=learning_backfill.MAXIMUM_ROUTE_FRAMES,
-      abort_requested=abort_requested,
-    )
+        max_frames=learning_backfill.MAXIMUM_ROUTE_FRAMES,
+        abort_requested=abort_requested,
+        route_evidence=prepared.route_evidence,
+      )
     return learning_backfill.open_prepared_route_spool(
       spool_root,
       descriptor,
@@ -1241,7 +1254,13 @@ def test_four_worker_helper_provenance_difference_is_unpublished(
       provenance["selected_event_stream_sha256"] = hashlib.sha256(
         process_name.encode("ascii"),
       ).hexdigest()
-      return replace(prepared, provenance=provenance)
+      return replace(
+        prepared,
+        provenance=provenance,
+        route_evidence=route_evidence_for_frames(
+          route.route_name, prepared.frames, provenance,
+        ),
+      )
     return prepared
 
   monkeypatch.setattr(
@@ -1259,6 +1278,67 @@ def test_four_worker_helper_provenance_difference_is_unpublished(
   assert not paths.evidence.exists()
   assert not paths.manifest.exists()
   assert not paths.backfill_ledger.exists()
+
+
+def test_route_evidence_is_not_durable_until_both_authorities_match(
+  tmp_path: Path,
+) -> None:
+  route_name = "00000010--0000000010"
+  route = RouteCandidate(
+    route_name=route_name,
+    route_counter=0x10,
+    segments=(learning_backfill.RouteSegment(
+      index=0,
+      path=tmp_path / "not-read",
+      sha256="a" * 64,
+      size_bytes=1,
+    ),),
+  )
+  evidence = route_evidence_for_frames(
+    route_name,
+    (route_frame(
+      CarInterface.get_non_essential_params(CAR.HYUNDAI_PALISADE),
+      1_000_000_000,
+      first_in_route=True,
+    ),),
+    {"test": "first-authority-publication-boundary"},
+  )
+  result = ReplayResult(
+    route=route,
+    disposition="ingested",
+    diagnostic="ingested",
+    provenance={"test": "first-authority-publication-boundary"},
+    accepted_sample_count=0,
+    rejected_sample_count=1,
+    controls_witness_count=1,
+    unresolved_witness_count=0,
+    route_evidence_sha256=evidence.sha256,
+  )
+
+  learning_backfill._stage_route_evidence(
+    root=tmp_path,
+    authority_index=1,
+    artifact=evidence,
+  )
+  assert not (tmp_path / "route_evidence_v2").exists()
+
+  learning_backfill._stage_route_evidence(
+    root=tmp_path,
+    authority_index=2,
+    artifact=evidence,
+  )
+  replay_pass = SimpleNamespace(results=(result,))
+  learning_backfill._publish_route_evidence_after_aa(
+    root=tmp_path,
+    first=replay_pass,
+    second=replay_pass,
+  )
+
+  stored = learning_backfill.RouteEvidenceStore(
+    tmp_path / "route_evidence_v2",
+  ).load(evidence.sha256)
+  assert stored.canonical_bytes == evidence.canonical_bytes
+  assert not (tmp_path / ".route-evidence-staging-v2").exists()
 
 
 def test_stale_prepared_route_scratch_is_scavenged_selectively(
@@ -1642,10 +1722,14 @@ class AbortRuntime:
   def __init__(self) -> None:
     self.coordinator = AbortCoordinator()
     self.ingest_calls = 0
-    self.route_counters: list[int] = []
+    self.route_counters: list[str] = []
 
-  def transition_onroad(self, route_counter: int) -> None:
-    self.route_counters.append(route_counter)
+  def transition_onroad(
+    self,
+    route_identity_sha256: str,
+    route_content_sha256: str | None,
+  ) -> None:
+    self.route_counters.append(route_identity_sha256)
 
   def ingest(self, _frame: object) -> None:
     self.ingest_calls += 1
@@ -1940,7 +2024,7 @@ def test_replay_aborts_periodically_before_publication() -> None:
       abort_requested=abort_requested,
     )
   assert runtime.ingest_calls == 256
-  assert runtime.route_counters == [route.route_counter]
+  assert runtime.route_counters == [route.display_identity]
 
 
 def test_route_local_rejection_does_not_block_later_good_route(
@@ -1981,7 +2065,9 @@ def test_route_local_rejection_does_not_block_later_good_route(
         "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
         "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
         "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
-        "extractor_schema_version": 1,
+        "extractor_schema_version": (
+          learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION
+        ),
         "log_schema_blob": "4" * 40,
         "opendbc_commit": "2" * 40,
         "panda_commit": "3" * 40,

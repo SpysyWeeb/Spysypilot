@@ -1053,6 +1053,7 @@ def _certify_preparation_domains(
         max_frames=MAXIMUM_ROUTE_FRAMES,
         abort_requested=abort_requested,
         filename=f"cert-local-{identity[:16]}.spool",
+        route_evidence=local_prepared.route_evidence,
       )
       if (
         local_descriptor.sha256 != remote_descriptor.sha256

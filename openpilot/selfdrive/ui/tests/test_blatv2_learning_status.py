@@ -9,19 +9,23 @@ from unittest.mock import patch
 
 from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   LearningStatusError,
+  behavior_presentation,
   cycle_page_index,
   format_duration,
   format_speed,
   grid_cells,
   learning_panel_presentation,
+  learning_summary_lines,
   operation_presentation,
   parse_backfill_progress_status,
+  parse_behavior_learning_status,
   parse_learning_operation_status,
   parse_learning_status,
   parse_lifecycle_status,
   reason_label,
   select_value_provider,
   validate_backfill_progress_update,
+  validate_behavior_status_update,
   validate_operation_update,
 )
 
@@ -35,6 +39,110 @@ OPERATION_ID = "d" * 32
 ROUTE_HASH = "e" * 64
 
 
+def behavior_fixture(
+  state: str = "training",
+  *,
+  disposition: str | None = None,
+) -> dict:
+  diagnostics = {
+    "waiting_for_physical_profile": "physical_profile_unqualified",
+    "waiting_for_routes": "insufficient_homogeneous_routes",
+    "preparing": "validating_route_evidence",
+    "training": "replaying_training_grid",
+    "selecting": "selecting_training_winner",
+    "validating": "replaying_frozen_winner",
+    "publishing": "publishing_behavior_generation",
+    "complete": (
+      "candidate_qualified"
+      if disposition == "qualified_candidate_available"
+      else "stock_retained"
+    ),
+    "failed": "behavior_transaction_failed",
+  }
+  terminal = state in ("complete", "failed")
+  qualified = disposition == "qualified_candidate_available"
+  if terminal and disposition is None:
+    disposition = "stock_retained"
+  complete = state == "complete"
+  return {
+    "behaviorFinalizationSha256": "7" * 64 if complete else None,
+    "behaviorSelectionSha256": "8" * 64 if qualified else None,
+    "completedReplayJobs": 64 if terminal else 12,
+    "currentCandidateIndex": None if terminal else 2,
+    "currentRouteIdentity": None if terminal else "route--behavior",
+    "currentRouteIndex": None if terminal else 1,
+    "diagnostic": diagnostics[state],
+    "eligibleRouteCount": 4,
+    "gateSpecSha256": "4" * 64,
+    "informationalOnly": True,
+    "operationId": "a" * 32,
+    "physicalGenerationSha256": "5" * 64,
+    "physicalProfileSha256": "6" * 64,
+    "qualificationDisposition": disposition if terminal else None,
+    "reasons": (["all_behavior_gates_passed"] if qualified else (["stock_retained"] if terminal else [])),
+    "recordedSourceIdentitySha256": "9" * 64,
+    "requiredRouteCount": 4,
+    "runtimeVehicleIdentitySha256": RUNTIME_HASH,
+    "schemaVersion": 1,
+    "segmentationConfigSha256": "b" * 64,
+    "selectedBehaviorPolicySha256": "c" * 64 if qualified else None,
+    "sequence": 3,
+    "smoothPassed": True if complete else None,
+    "startedMonoNs": 1_000_000,
+    "state": state,
+    "strongPassed": True if qualified else (False if complete else None),
+    "swiftPassed": True if qualified else (False if complete else None),
+    "targetMateriallyImproved": True if qualified else (False if complete else None),
+    "terminal": terminal,
+    "totalCandidateCount": 16,
+    "totalReplayJobs": 64,
+    "totalRouteCount": 4,
+    "trainingRouteCount": 3,
+    "transactionSha256": "d" * 64 if complete else None,
+    "updatedMonoNs": 2_000_000,
+    "validationRouteCount": 1,
+    "vehicleIdentity": VEHICLE,
+  }
+
+
+def paired_loss_fixture(
+  *,
+  mean: float = -0.01,
+  route_count: int = 2,
+) -> dict:
+  uncertainty = 0.002 if route_count > 1 else None
+  return {
+    "lower_bound_mse": mean - uncertainty if uncertainty is not None else None,
+    "mean_candidate_minus_seed_mse": mean if route_count else None,
+    "numerical_tolerance_mse": 1e-9 if route_count else None,
+    "route_count": route_count,
+    "uncertainty_mse": uncertainty,
+    "upper_bound_mse": mean + uncertainty if uncertainty is not None else None,
+  }
+
+
+def fit_diagnostics_fixture(evaluation_status: str) -> list[dict]:
+  result = []
+  for model in ("static_only", "friction_map", "offset_and_friction", "full_map"):
+    status = "identifiable"
+    moving_rank = 2
+    if evaluation_status == "rank_deficient" and model == "full_map":
+      status = "rank_deficient"
+      moving_rank = 1
+    elif evaluation_status == "ill_conditioned" and model == "full_map":
+      status = "ill_conditioned"
+    result.append({
+      "breakaway_parameter_count": 1,
+      "breakaway_rank": 1,
+      "condition_estimate": 10.0,
+      "model": model,
+      "moving_parameter_count": 2,
+      "moving_rank": moving_rank,
+      "status": status,
+    })
+  return result
+
+
 def node_fixture(
   index: int,
   *,
@@ -42,12 +150,20 @@ def node_fixture(
   minimum_support_s: float = 150.0,
   qualified: bool = False,
   reasons: list[str] | None = None,
+  evaluation_status: str | None = None,
+  training_outcome: str | None = None,
   last_drive_complete: bool = True,
 ) -> dict:
   base_support_s = clean_support_s * 0.5
   moving_support_s = clean_support_s * 0.3
   breakaway_support_s = clean_support_s - base_support_s - moving_support_s
   last_drive_clean_support_s = 12.5 if last_drive_complete else None
+  if evaluation_status is None:
+    evaluation_status = "learned" if qualified else "evidence_insufficient"
+  if qualified and training_outcome is None:
+    training_outcome = evaluation_status
+  if reasons is None:
+    reasons = [evaluation_status] if qualified else ["insufficient_support"]
   return {
     "node_index": index,
     "speed_mps": float((0, 5, 10, 15, 20, 30)[index]),
@@ -103,13 +219,12 @@ def node_fixture(
     "authority_candidate_validation_rms": 0.09,
     "confidence": 0.8,
     "qualified": qualified,
-    "reasons": (
-      ["qualified"]
-      if qualified
-      else ["insufficient_support"]
-      if reasons is None
-      else reasons
-    ),
+    "evaluation_status": evaluation_status,
+    "fit_diagnostics": fit_diagnostics_fixture(evaluation_status),
+    "training_outcome": training_outcome,
+    "training_paired_loss": paired_loss_fixture(),
+    "validation_paired_loss": paired_loss_fixture(),
+    "reasons": reasons,
     "candidate_parameters": (
       {
         "torque_per_lateral_accel": 0.3,
@@ -144,19 +259,83 @@ def learning_fixture(*, last_drive_complete: bool = True) -> dict:
     last_drive_complete=last_drive_complete,
   )
   return {
-    "schema_version": 2,
+    "schema_version": 3,
     "informational_only": True,
     "vehicle_identity": VEHICLE,
     "runtime_identity_sha256": RUNTIME_HASH,
     "seed_profile_sha256": HASH,
     "evidence_sha256": "4" * 64,
     "manifest_sha256": "5" * 64,
+    "all_intervals_qualified": False,
+    "all_nodes_evaluated": False,
     "all_nodes_qualified": False,
+    "candidate_profile_available": False,
     "candidate_profile_sha256": None,
     "candidate_profile_revision": None,
+    "interpolation_reports": [],
     "last_drive_complete": last_drive_complete,
     "nodes": nodes,
   }
+
+
+def interpolation_fixture(
+  nodes: list[dict],
+  index: int,
+  *,
+  outcome: str = "qualified",
+) -> dict:
+  reasons = {
+    "qualified": ["qualified"],
+    "inconclusive": ["interpolation_validation_inconclusive"],
+    "regressed": ["interpolation_validation_regression"],
+  }[outcome]
+  return {
+    "interval_index": index,
+    "lower_speed_mps": nodes[index]["speed_mps"],
+    "qualified": outcome == "qualified",
+    "reasons": reasons,
+    "training_paired_loss": paired_loss_fixture(),
+    "upper_speed_mps": nodes[index + 1]["speed_mps"],
+    "validation_paired_loss": paired_loss_fixture(),
+  }
+
+
+def qualify_all_nodes(
+  payload: dict,
+  outcomes: tuple[str, ...],
+  *,
+  interpolation_outcomes: tuple[str, ...] | None = None,
+) -> None:
+  if len(outcomes) != len(payload["nodes"]):
+    raise ValueError("one outcome is required per node")
+  for node, outcome in zip(payload["nodes"], outcomes, strict=True):
+    node["qualified"] = True
+    node["evaluation_status"] = outcome
+    node["training_outcome"] = outcome
+    node["reasons"] = [outcome]
+    node["candidate_parameters"] = {
+      "torque_per_lateral_accel": 0.3,
+      "lateral_accel_offset_correction_mps2": -0.04,
+      "kinetic_friction_torque": 0.03,
+      "static_breakaway_torque": 0.09,
+    }
+  payload["all_nodes_evaluated"] = True
+  if interpolation_outcomes is None:
+    interpolation_outcomes = ("qualified",) * (len(payload["nodes"]) - 1)
+  payload["interpolation_reports"] = [
+    interpolation_fixture(payload["nodes"], index, outcome=outcome)
+    for index, outcome in enumerate(interpolation_outcomes)
+  ]
+  payload["all_intervals_qualified"] = all(
+    outcome == "qualified" for outcome in interpolation_outcomes
+  )
+  payload["all_nodes_qualified"] = payload["all_intervals_qualified"]
+  candidate_available = (
+    payload["all_nodes_qualified"] and "learned" in outcomes
+  )
+  payload["candidate_profile_available"] = candidate_available
+  payload["candidate_profile_sha256"] = "c" * 64 if candidate_available else None
+  payload["candidate_profile_revision"] = 10 if candidate_available else None
 
 
 def lifecycle_fixture(
@@ -475,7 +654,7 @@ class TestLearningStatusParser(unittest.TestCase):
     self.assertEqual(malformed.exception.code, "malformed")
 
     payload = learning_fixture()
-    payload["schema_version"] = 1
+    payload["schema_version"] = 2
     with self.assertRaises(LearningStatusError) as mismatch:
       parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
     self.assertEqual(mismatch.exception.code, "schema_mismatch")
@@ -501,22 +680,286 @@ class TestLearningStatusParser(unittest.TestCase):
 
   def test_qualification_summary_is_not_activation(self) -> None:
     payload = learning_fixture()
-    for node in payload["nodes"]:
-      node["qualified"] = True
-      node["reasons"] = ["qualified"]
-      node["candidate_parameters"] = {
-        "torque_per_lateral_accel": 0.3,
-        "lateral_accel_offset_correction_mps2": -0.04,
-        "kinetic_friction_torque": 0.03,
-        "static_breakaway_torque": 0.09,
-      }
-    payload["all_nodes_qualified"] = True
-    payload["candidate_profile_sha256"] = "c" * 64
-    payload["candidate_profile_revision"] = 10
+    qualify_all_nodes(payload, ("learned",) * len(payload["nodes"]))
     status = parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
     self.assertTrue(status.all_nodes_qualified)
     # LearningStatus intentionally has no active-controller property.
     self.assertFalse(hasattr(status, "active"))
+
+  def test_every_schema_v3_node_outcome_has_plain_display_copy(self) -> None:
+    cases = {
+      "learned": (True, ["learned"], "Learned"),
+      "seed_retained": (
+        True,
+        ["seed_retained"],
+        "Seed retained (calibration already good)",
+      ),
+      "evidence_insufficient": (
+        False,
+        ["insufficient_support"],
+        "Needs more/varied evidence",
+      ),
+      "rank_deficient": (False, ["rank_deficient_fit"], "Rank deficient"),
+      "ill_conditioned": (False, ["ill_conditioned_fit"], "Ill conditioned"),
+      "validation_inconclusive": (
+        False,
+        ["validation_inconclusive"],
+        "Validation inconclusive",
+      ),
+      "validation_regressed": (
+        False,
+        ["validation_regression"],
+        "Validation regressed",
+      ),
+    }
+    for evaluation_status, (qualified, reasons, expected) in cases.items():
+      with self.subTest(evaluation_status=evaluation_status):
+        payload = learning_fixture()
+        payload["nodes"][2] = node_fixture(
+          2,
+          qualified=qualified,
+          reasons=reasons,
+          evaluation_status=evaluation_status,
+        )
+        node = parse_learning_status(
+          payload,
+          expected_vehicle_identity=VEHICLE,
+        ).nodes[2]
+        self.assertEqual(node.outcome_label, expected)
+
+  def test_all_seed_retained_is_complete_without_candidate_artifact(self) -> None:
+    payload = learning_fixture()
+    qualify_all_nodes(payload, ("seed_retained",) * len(payload["nodes"]))
+    status = parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
+    self.assertTrue(status.all_nodes_qualified)
+    self.assertFalse(status.candidate_profile_available)
+    self.assertIsNone(status.candidate_profile_sha256)
+    summary = learning_summary_lines(status)
+    self.assertIn("NO NEW ARTIFACT NEEDED", summary[1].text)
+    self.assertNotIn("UNAVAILABLE", summary[1].text)
+    self.assertNotEqual(summary[1].tone, "red")
+
+  def test_mixed_learned_and_retained_nodes_publish_candidate(self) -> None:
+    payload = learning_fixture()
+    outcomes = ("learned", "seed_retained") * 3
+    qualify_all_nodes(payload, outcomes)
+    status = parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
+    self.assertEqual(status.learned_node_count, 3)
+    self.assertEqual(status.retained_node_count, 3)
+    self.assertTrue(status.candidate_profile_available)
+    self.assertIn("NEW CANDIDATE", learning_summary_lines(status)[1].text)
+
+  def test_interpolation_inconclusive_and_regression_are_visible(self) -> None:
+    payload = learning_fixture()
+    qualify_all_nodes(
+      payload,
+      ("seed_retained",) * len(payload["nodes"]),
+      interpolation_outcomes=(
+        "qualified",
+        "inconclusive",
+        "qualified",
+        "regressed",
+        "qualified",
+      ),
+    )
+    status = parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
+    self.assertTrue(status.all_nodes_evaluated)
+    self.assertFalse(status.all_intervals_qualified)
+    self.assertFalse(status.all_nodes_qualified)
+    summary = learning_summary_lines(status)[2]
+    self.assertIn("1 INCONCLUSIVE", summary.text)
+    self.assertIn("1 REGRESSED", summary.text)
+    self.assertEqual(summary.tone, "red")
+
+
+class TestBehaviorLearningStatusParser(unittest.TestCase):
+  def parse(self, payload: object):
+    return parse_behavior_learning_status(
+      payload,
+      expected_vehicle_identity=VEHICLE,
+      expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
+      now_mono_ns=NOW_MONO_NS,
+    )
+
+  def test_training_status_is_strict_and_reports_progress(self) -> None:
+    status = self.parse(behavior_fixture())
+    self.assertEqual(status.state, "training")
+    self.assertFalse(status.terminal)
+    self.assertAlmostEqual(status.replay_progress_fraction, 12 / 64)
+    self.assertEqual(status.training_route_count, 3)
+    self.assertEqual(status.validation_route_count, 1)
+
+  def test_absent_wrong_vehicle_and_runtime_fail_closed(self) -> None:
+    with self.assertRaisesRegex(LearningStatusError, "not been published"):
+      self.parse(None)
+    wrong_vehicle = behavior_fixture()
+    wrong_vehicle["vehicleIdentity"] = "ANOTHER CAR"
+    with self.assertRaisesRegex(LearningStatusError, "different vehicle"):
+      self.parse(wrong_vehicle)
+    wrong_runtime = behavior_fixture()
+    wrong_runtime["runtimeVehicleIdentitySha256"] = "f" * 64
+    with self.assertRaisesRegex(LearningStatusError, "different runtimes"):
+      self.parse(wrong_runtime)
+
+  def test_unknown_key_and_state_diagnostic_pair_are_rejected(self) -> None:
+    unknown = behavior_fixture()
+    unknown["futureField"] = 1
+    with self.assertRaisesRegex(LearningStatusError, "keys do not match"):
+      self.parse(unknown)
+    wrong_pair = behavior_fixture()
+    wrong_pair["diagnostic"] = "selecting_training_winner"
+    with self.assertRaisesRegex(LearningStatusError, "does not match"):
+      self.parse(wrong_pair)
+
+  def test_future_epoch_and_progress_bounds_are_rejected(self) -> None:
+    future = behavior_fixture()
+    future["updatedMonoNs"] = NOW_MONO_NS + 1
+    with self.assertRaisesRegex(LearningStatusError, "monotonic epoch"):
+      self.parse(future)
+    route_overflow = behavior_fixture()
+    route_overflow["currentRouteIndex"] = 4
+    with self.assertRaisesRegex(LearningStatusError, "route index"):
+      self.parse(route_overflow)
+    replay_overflow = behavior_fixture()
+    replay_overflow["completedReplayJobs"] = 65
+    with self.assertRaisesRegex(LearningStatusError, "exceed"):
+      self.parse(replay_overflow)
+
+  def test_nonterminal_cannot_expose_gate_or_selection_data(self) -> None:
+    payload = behavior_fixture()
+    payload["smoothPassed"] = True
+    with self.assertRaisesRegex(LearningStatusError, "terminal qualification"):
+      self.parse(payload)
+    payload = behavior_fixture()
+    payload["transactionSha256"] = "f" * 64
+    with self.assertRaisesRegex(LearningStatusError, "terminal qualification"):
+      self.parse(payload)
+
+  def test_candidate_and_stock_terminal_presentations_stay_informational(
+    self,
+  ) -> None:
+    candidate = self.parse(behavior_fixture(
+      "complete",
+      disposition="qualified_candidate_available",
+    ))
+    candidate_view = behavior_presentation(
+      candidate,
+      error_code=None,
+      error_message=None,
+    )
+    self.assertEqual(candidate_view.title, "BEHAVIOR CANDIDATE QUALIFIED")
+    self.assertIn("informational only", candidate_view.detail)
+    self.assertNotIn("ACTIVE", candidate_view.title + candidate_view.detail)
+
+    stock = self.parse(behavior_fixture("complete"))
+    stock_view = behavior_presentation(
+      stock,
+      error_code=None,
+      error_message=None,
+    )
+    self.assertEqual(stock_view.title, "STOCK BEHAVIOR RETAINED")
+    self.assertEqual(stock_view.tone, "amber")
+
+  def test_candidate_requires_all_gates_and_immutable_selection(self) -> None:
+    payload = behavior_fixture(
+      "complete",
+      disposition="qualified_candidate_available",
+    )
+    payload["swiftPassed"] = False
+    with self.assertRaisesRegex(LearningStatusError, "passing gates"):
+      self.parse(payload)
+    payload = behavior_fixture(
+      "complete",
+      disposition="qualified_candidate_available",
+    )
+    payload["behaviorSelectionSha256"] = None
+    with self.assertRaisesRegex(LearningStatusError, "provenance"):
+      self.parse(payload)
+
+  def test_reasons_are_sorted_unique_nonempty_text(self) -> None:
+    payload = behavior_fixture("complete")
+    payload["reasons"] = ["z", "a"]
+    with self.assertRaisesRegex(LearningStatusError, "unique, sorted"):
+      self.parse(payload)
+
+  def test_monotonic_update_rejects_torn_or_regressed_operation(self) -> None:
+    first = self.parse(behavior_fixture())
+    same_sequence = behavior_fixture()
+    same_sequence["completedReplayJobs"] += 1
+    with self.assertRaisesRegex(LearningStatusError, "without advancing"):
+      validate_behavior_status_update(first, self.parse(same_sequence))
+
+    regressed = behavior_fixture()
+    regressed["sequence"] += 1
+    regressed["updatedMonoNs"] += 1
+    regressed["completedReplayJobs"] -= 1
+    with self.assertRaisesRegex(LearningStatusError, "progress moved backward"):
+      validate_behavior_status_update(first, self.parse(regressed))
+
+    advanced = behavior_fixture("selecting")
+    advanced["sequence"] += 1
+    advanced["updatedMonoNs"] += 1
+    validate_behavior_status_update(first, self.parse(advanced))
+
+  def test_established_context_is_immutable_but_optional_hash_may_appear(
+    self,
+  ) -> None:
+    first = self.parse(behavior_fixture())
+    changed_total = behavior_fixture()
+    changed_total["sequence"] += 1
+    changed_total["updatedMonoNs"] += 1
+    changed_total["totalReplayJobs"] += 1
+    with self.assertRaisesRegex(LearningStatusError, "totals changed"):
+      validate_behavior_status_update(first, self.parse(changed_total))
+
+    waiting = behavior_fixture("waiting_for_physical_profile")
+    waiting["physicalGenerationSha256"] = None
+    waiting["physicalProfileSha256"] = None
+    waiting["recordedSourceIdentitySha256"] = None
+    waiting["eligibleRouteCount"] = 0
+    waiting["trainingRouteCount"] = 0
+    waiting["validationRouteCount"] = 0
+    waiting["totalRouteCount"] = 0
+    waiting["totalCandidateCount"] = 0
+    waiting["currentCandidateIndex"] = None
+    waiting["currentRouteIdentity"] = None
+    waiting["currentRouteIndex"] = None
+    waiting["completedReplayJobs"] = 0
+    waiting["totalReplayJobs"] = 0
+    before = self.parse(waiting)
+    established = behavior_fixture("preparing")
+    established["sequence"] = waiting["sequence"] + 1
+    established["updatedMonoNs"] = waiting["updatedMonoNs"] + 1
+    established["completedReplayJobs"] = 0
+    established["currentCandidateIndex"] = None
+    established["currentRouteIdentity"] = None
+    established["currentRouteIndex"] = None
+    validate_behavior_status_update(before, self.parse(established))
+
+  def test_new_operation_identity_may_start_a_new_monotonic_sequence(self) -> None:
+    first = self.parse(behavior_fixture())
+    replacement = behavior_fixture("waiting_for_routes")
+    replacement["operationId"] = "f" * 32
+    replacement["sequence"] = 0
+    replacement["eligibleRouteCount"] = 2
+    replacement["trainingRouteCount"] = 1
+    replacement["validationRouteCount"] = 1
+    replacement["currentCandidateIndex"] = None
+    replacement["currentRouteIdentity"] = None
+    replacement["currentRouteIndex"] = None
+    replacement["completedReplayJobs"] = 0
+    validate_behavior_status_update(first, self.parse(replacement))
+
+  def test_terminal_behavior_result_cannot_morph_in_place(self) -> None:
+    terminal = self.parse(behavior_fixture("complete"))
+    changed = behavior_fixture(
+      "complete",
+      disposition="qualified_candidate_available",
+    )
+    changed["sequence"] = terminal.sequence + 1
+    changed["updatedMonoNs"] = terminal.updated_mono_ns + 1
+    with self.assertRaisesRegex(LearningStatusError, "Terminal behavior"):
+      validate_behavior_status_update(terminal, self.parse(changed))
 
 
 class TestLearningOperationStatusParser(unittest.TestCase):
@@ -1445,6 +1888,7 @@ class TestLearningStatusSource(unittest.TestCase):
         operation_fixture("idle") if operation is None else operation
       ),
       "BLaTv2BackfillProgress": backfill_progress,
+      "BLaTv2BehaviorLearningStatus": behavior_fixture(),
       "BLaTv2LifecycleStatus": lifecycle_fixture(),
     }
 
@@ -1460,13 +1904,14 @@ class TestLearningStatusSource(unittest.TestCase):
     payload["nodes"][2]["reasons"] = [
       "authority_validation_regression",
     ]
+    payload["nodes"][2]["evaluation_status"] = "validation_regressed"
     node = parse_learning_status(
       payload,
       expected_vehicle_identity=VEHICLE,
     ).nodes[2]
     self.assertEqual(
       self.widget_module.BLaTv2ReadinessWidget._fit_text(node),
-      "REGRESSED",
+      "VALIDATION REGRESSED",
     )
 
   def test_calibration_text_reports_only_observable_values(self) -> None:
@@ -1488,7 +1933,7 @@ class TestLearningStatusSource(unittest.TestCase):
       types.SimpleNamespace(),
     )
     width = 600.0
-    columns = (0.00, 0.16, 0.34, 0.54, 0.73)
+    columns = (0.00, 0.14, 0.35, 0.57, 0.78)
     self.widget_module.rl.draw_calls.clear()
     page._draw_matrix(0.0, 0.0, width, 560.0, learning, False)
     header_calls = [
@@ -1500,9 +1945,9 @@ class TestLearningStatusSource(unittest.TestCase):
       [call[1] for call in header_calls],
       [
         "NODE",
-        "MOVING",
-        "BREAKAWAY",
+        "MOVE / BREAK",
         "VALIDATION / AUTH",
+        "RESULT",
         "CALIBRATION",
       ],
     )
@@ -1515,7 +1960,48 @@ class TestLearningStatusSource(unittest.TestCase):
       )
       rendered_width = len(text) * font_size * 0.5
       self.assertLessEqual(position.x + rendered_width, next_x - 8.0)
-    self.assertLess(header_calls[3][3], 21)
+    self.assertLess(header_calls[2][3], 21)
+
+  def test_overview_summary_rows_do_not_overlap(self) -> None:
+    learning = parse_learning_status(
+      learning_fixture(),
+      expected_vehicle_identity=VEHICLE,
+    )
+    snapshot = self.widget_module.DashboardSnapshot(
+      learning=learning,
+      learning_error_code=None,
+      learning_error=None,
+      operation=None,
+      operation_error_code="operation_absent",
+      operation_error="Learner operation status has not been published",
+      backfill_progress=None,
+      backfill_progress_error_code="progress_absent",
+      backfill_progress_error="Detailed progress has not been published",
+      lifecycle=None,
+      lifecycle_error_code="activation_absent",
+      lifecycle_error="Controller status is not available yet",
+      metric=False,
+    )
+    page = self.widget_module.BLaTv2LearningOverviewWidget(
+      types.SimpleNamespace(snapshot=snapshot),
+    )
+    expected_lines = [line.text for line in learning_summary_lines(learning)]
+    self.widget_module.rl.draw_calls.clear()
+    page._render(self.widget_module.rl.Rectangle(0, 0, 1200, 900))
+    summary_calls = [
+      call[1]
+      for call in self.widget_module.rl.draw_calls
+      if call[0] == "text" and call[1][1] in expected_lines
+    ]
+    self.assertEqual([call[1] for call in summary_calls], expected_lines)
+    positions = [call[2].y for call in summary_calls]
+    self.assertEqual(len(set(positions)), len(expected_lines))
+    self.assertTrue(
+      all(
+        right - left >= 28
+        for left, right in zip(positions, positions[1:], strict=False)
+      ),
+    )
 
   def test_calibration_and_lifecycle_identity_namespaces_are_independent(
     self,
@@ -1538,6 +2024,7 @@ class TestLearningStatusSource(unittest.TestCase):
     expectations = (
       ("BLaTv2LearningStatus", "learning_error_code"),
       ("BLaTv2LearningOperationStatus", "operation_error_code"),
+      ("BLaTv2BehaviorLearningStatus", "behavior_error_code"),
       ("BLaTv2LifecycleStatus", "lifecycle_error_code"),
     )
     for key, error_attribute in expectations:
@@ -1567,11 +2054,18 @@ class TestLearningStatusSource(unittest.TestCase):
             has_learning_snapshot=False,
           )
           self.assertEqual(presentation.tone, "red")
-        else:
+        elif key == "BLaTv2LifecycleStatus":
           color = self.widget_module._BLaTv2Page._error_color(
             snapshot.lifecycle_error_code,
           )
           self.assertIs(color, self.widget_module._RED)
+        else:
+          presentation = behavior_presentation(
+            snapshot.behavior,
+            error_code=snapshot.behavior_error_code,
+            error_message=snapshot.behavior_error,
+          )
+          self.assertEqual(presentation.tone, "red")
 
   def test_optional_progress_failure_falls_back_without_poisoning_operation(
     self,
@@ -1711,6 +2205,11 @@ class TestLearningStatusSource(unittest.TestCase):
       events.index("read:BLaTv2BackfillProgress"),
       events.index("clock", first_clock + 1),
     )
+    second_clock = events.index("clock", first_clock + 1)
+    self.assertLess(
+      events.index("read:BLaTv2BehaviorLearningStatus"),
+      events.index("clock", second_clock + 1),
+    )
 
   def test_reader_refreshes_immediately_then_no_faster_than_two_seconds(
     self,
@@ -1737,18 +2236,173 @@ class TestLearningStatusSource(unittest.TestCase):
     ):
       first = source.snapshot
       self.assertEqual(first.operation.state, "preparing")
-      self.assertEqual(len(params.calls), 4)
+      self.assertEqual(len(params.calls), 5)
 
       params.values["BLaTv2LearningOperationStatus"] = collecting
       cached = source.snapshot
       self.assertIs(cached, first)
       self.assertEqual(cached.operation.state, "preparing")
-      self.assertEqual(len(params.calls), 4)
+      self.assertEqual(len(params.calls), 5)
 
       refreshed = source.snapshot
       self.assertIsNot(refreshed, first)
       self.assertEqual(refreshed.operation.state, "collecting")
-      self.assertEqual(len(params.calls), 8)
+      self.assertEqual(len(params.calls), 10)
+
+
+  def test_source_exposes_valid_behavior_status_from_params_only(self) -> None:
+    params = _DashboardParams(self.params_values())
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      snapshot = self.source(params).snapshot
+    self.assertEqual(snapshot.behavior.state, "training")
+    self.assertIsNone(snapshot.behavior_error_code)
+    self.assertEqual(
+      params.calls,
+      [
+        "BLaTv2LearningStatus",
+        "BLaTv2LearningOperationStatus",
+        "BLaTv2BackfillProgress",
+        "BLaTv2BehaviorLearningStatus",
+        "BLaTv2LifecycleStatus",
+      ],
+    )
+
+  def test_physical_and_behavior_runtime_namespaces_are_independent(self) -> None:
+    values = self.params_values()
+    values["BLaTv2BehaviorLearningStatus"] = behavior_fixture()
+    values["BLaTv2BehaviorLearningStatus"][
+      "runtimeVehicleIdentitySha256"
+    ] = "f" * 64
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      snapshot = self.source(_DashboardParams(values)).snapshot
+    self.assertEqual(snapshot.learning.runtime_identity_sha256, RUNTIME_HASH)
+    self.assertEqual(
+      snapshot.behavior.runtime_vehicle_identity_sha256,
+      "f" * 64,
+    )
+    self.assertIsNone(snapshot.behavior_error_code)
+
+  def test_rejected_behavior_update_preserves_monotonic_watermark(self) -> None:
+    values = self.params_values()
+    params = _DashboardParams(values)
+    source = self.source(params)
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      first = source.snapshot
+      self.assertIsNotNone(first.behavior)
+      torn = deepcopy(values["BLaTv2BehaviorLearningStatus"])
+      torn["completedReplayJobs"] += 1
+      params.values["BLaTv2BehaviorLearningStatus"] = torn
+      source._refresh()
+      self.assertIsNone(source._snapshot.behavior)
+      self.assertEqual(source._snapshot.behavior_error_code, "stale")
+      self.assertEqual(
+        source._last_behavior_status.completed_replay_jobs,
+        first.behavior.completed_replay_jobs,
+      )
+
+  def test_behavior_display_modules_have_no_controller_or_artifact_dependency(
+    self,
+  ) -> None:
+    widget_dir = Path(__file__).resolve().parents[1] / "widgets"
+    for filename in ("blatv2_learning.py", "blatv2_learning_status.py"):
+      source = (widget_dir / filename).read_text(encoding="utf-8")
+      self.assertNotIn("selfdrive.controls.lib.blatv2", source)
+      self.assertNotIn("RouteReader", source)
+      self.assertNotIn("open(", source)
+
+  def test_behavior_panels_render_ascii_candidate_and_gate_copy(self) -> None:
+    behavior = parse_behavior_learning_status(
+      behavior_fixture(
+        "complete",
+        disposition="qualified_candidate_available",
+      ),
+      expected_vehicle_identity=VEHICLE,
+      expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
+      now_mono_ns=NOW_MONO_NS,
+    )
+    snapshot = self.widget_module.DashboardSnapshot(
+      learning=None,
+      learning_error_code="absent",
+      learning_error="not available",
+      operation=None,
+      operation_error_code="operation_absent",
+      operation_error="not available",
+      backfill_progress=None,
+      backfill_progress_error_code="progress_absent",
+      backfill_progress_error="not available",
+      lifecycle=None,
+      lifecycle_error_code="activation_absent",
+      lifecycle_error="not available",
+      metric=False,
+      behavior=behavior,
+    )
+    page = self.widget_module.BLaTv2ReadinessWidget(
+      types.SimpleNamespace(snapshot=snapshot),
+    )
+    self.widget_module.rl.draw_calls.clear()
+    page._draw_behavior_panel(0.0, 0.0, 900.0, snapshot)
+    page._draw_behavior_gates(0.0, 80.0, 900.0, snapshot)
+    texts = [
+      call[1][1]
+      for call in self.widget_module.rl.draw_calls
+      if call[0] == "text"
+    ]
+    self.assertIn("BEHAVIOR | CANDIDATE QUALIFIED", texts)
+    self.assertIn("SMOOTH PASS", texts)
+    self.assertIn("SWIFT PASS", texts)
+    self.assertIn("STRONG PASS", texts)
+    self.assertIn("BEHAVIOR QUALIFICATION | INFORMATIONAL ONLY", texts)
+    self.assertTrue(all(text.isascii() for text in texts))
+
+  def test_behavior_gate_rendering_distinguishes_wait_from_fail(self) -> None:
+    stock = parse_behavior_learning_status(
+      behavior_fixture("complete"),
+      expected_vehicle_identity=VEHICLE,
+      expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
+      now_mono_ns=NOW_MONO_NS,
+    )
+    snapshot = self.widget_module.DashboardSnapshot(
+      learning=None,
+      learning_error_code="absent",
+      learning_error="not available",
+      operation=None,
+      operation_error_code="operation_absent",
+      operation_error="not available",
+      backfill_progress=None,
+      backfill_progress_error_code="progress_absent",
+      backfill_progress_error="not available",
+      lifecycle=None,
+      lifecycle_error_code="activation_absent",
+      lifecycle_error="not available",
+      metric=False,
+      behavior=stock,
+    )
+    page = self.widget_module.BLaTv2ReadinessWidget(
+      types.SimpleNamespace(snapshot=snapshot),
+    )
+    self.widget_module.rl.draw_calls.clear()
+    page._draw_behavior_gates(0.0, 0.0, 900.0, snapshot)
+    texts = [
+      call[1][1]
+      for call in self.widget_module.rl.draw_calls
+      if call[0] == "text"
+    ]
+    self.assertIn("SMOOTH PASS", texts)
+    self.assertIn("SWIFT FAIL", texts)
+    self.assertIn("STRONG FAIL", texts)
+    self.assertIn("STOCK BEHAVIOR RETAINED", texts)
 
 
 class TestBackfillProgressRendering(unittest.TestCase):

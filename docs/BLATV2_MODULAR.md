@@ -16,6 +16,14 @@ All numerical modules are shared libraries called synchronously from the
 100 Hz control loop and from replay. They are not separate onroad processes.
 This keeps one frame clock and makes device/replay parity testable.
 
+The present field build does not actuate this modular core. With no separately
+approved artifact, controlsd constructs and runs the exact stock openpilot
+torque controller, not a stock-shaped approximation or a modular controller
+with stock values. The retired LQI design is also absent. **LQI** means
+**Linear Quadratic Integral**: state feedback chosen from a mathematical
+tracking/effort cost with an accumulated integral-error state. It is documented
+only to make clear that neither its state nor its gain schedules are inherited.
+
 ## Sole-owner rule
 
 Every physical decision has exactly one owner.
@@ -143,6 +151,28 @@ the observable learner.
 
 Samples support only neighboring nodes, so driving at one speed cannot change
 distant speed behavior. The controller has no hard low/high-speed mode.
+At runtime the two neighboring node values are linearly interpolated; below
+0 m/s and above 30 m/s the endpoint value is held. Interpolation is itself
+validated on exact joint sufficient statistics. Two individually qualified
+endpoints therefore cannot hide a bad mixed response between them.
+
+Support is weighted clean response time rather than elapsed drive time:
+
+| Nodes | Minimum clean support per node | Typical evidence source |
+| --- | ---: | --- |
+| 0 and 5 m/s | 150 s | low-speed turns, reversals, and breakaway episodes |
+| 10 and 15 m/s | 240 s | urban curves and steering-active travel |
+| 20 and 30 m/s | 420 s | genuinely steering-active higher-speed travel |
+
+Every node also needs at least 20% held-out support, bidirectional lateral
+acceleration and torque excitation, and moving plus complete breakaway
+populations on both training and validation routes. Moving and breakaway each
+need at least four training and four validation rows. The low-speed floor is
+shorter because a sharp turn carries dense physical evidence, but waiting at a
+light, driver override, invalid input, or straight motion without excitation
+does not count. Thus “drive longer” is not a universal cure: missing support
+needs more eligible time, missing breakaway needs more stuck-to-moving events,
+and rank/conditioning problems need more varied excitation.
 
 ### Plant
 
@@ -206,6 +236,13 @@ the generic BLaTv2 controller. Other vehicles retain their own limits.
 Panda remains an independent safety ceiling, not an authority discovery
 mechanism.
 
+This runtime lookup is what makes the controller portable. The detected
+CarParams selects the vehicle and opendbc supplies that port's actual maximum,
+build/release rates, cadence, and driver-torque rules. Hardcoding the Palisade's
+409/4/7 values would cause replay and control to disagree on another car and
+would bypass the port review that proves the interface and panda share the same
+contract.
+
 The explicit opendbc compatibility bit covers the complete production
 envelope, including command cadence—not merely the presence of `STEER_MAX`
 fields. An actuation-capable port must also publish its measured rack-rate
@@ -242,10 +279,12 @@ The learner solves this as deterministic constrained least squares with
 `gain >= 0`, `kinetic >= 0`, and
 `static = kinetic + nonnegative breakaway excess`. Training routes evaluate a
 nested model family: static only, friction, offset plus friction, then the full
-map. Every populated training category must beat or match the seed and at
-least one must improve; richer models replace simpler models only by Pareto
-dominance. The seed is a comparator, never a candidate. The selected model is
-frozen before one held-route validation pass, with no post-validation fallback.
+map. The seed is a first-class selectable result. A learned fit replaces it
+only when paired whole-route loss clears route-level uncertainty without
+regressing a populated category; otherwise the node is explicitly qualified
+as `seed_retained`. Rank deficiency, ill conditioning, inconclusive
+validation, and true regression remain different outcomes. The selected model
+is frozen before one held-route validation pass, with no post-validation fallback.
 
 Stationary/quantized rows set both direction terms to zero and identify the
 effective settled inverse map; they are not presented as a pure decomposition
@@ -294,11 +333,29 @@ breakaway. Exact zero clears unsigned-source sign inference. A lifecycle
 break, source gap, driver override, standstill, fault, or failed rack mapping
 clears cross-frame continuity.
 
-Calibration profile schema v2, evidence schema v6, coordinator artifact
-schema v5, learning-status schema v2, canonical join schema v2, and inclusion
-namespace `complete_full_rlog_authority_v4` bind this contract. The retired
-v1, v2, and v3 namespaces remain byte-untouched and are never migrated or restored
-as v4; retained compatible full rlogs are replayed into an initially empty v4
+The committed storage/wire identities are:
+
+| Contract | Current value |
+| --- | --- |
+| calibration profile / evidence / coordinator | 2 / 8 / 8 |
+| runtime vehicle / calibration identity / provisional dynamics | 1 / 1 / 1 |
+| physical learning / operation / progress status | 3 / 1 / 1 |
+| native extractor / canonical join | 3 / 3 |
+| route evidence | `BLATRE02`, version 2 |
+| backfill ledger / commit / pointer | 2 / 2 / 1 |
+| physical inclusion namespace | `complete_full_rlog_authority_v6` |
+| controller policy | 1 |
+| behavior gate spec / segmentation / replay input | 3 / 1 / 1 |
+| behavior transaction / finalization | 2 / 1 |
+| behavior generation / pointer / route-set | 1 / 1 / 1 |
+| behavior learning status | 1 |
+| future feedback / lifecycle status | 2 / 2 |
+| future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
+| off-device protocol / cross-architecture certificate | 1 / 2 |
+
+These values are code contracts, not display labels. The retired physical v1
+through v5 namespaces remain byte-untouched and are never migrated or restored
+as v6; retained compatible full rlogs are replayed into an initially empty v6
 ledger. The separate calibration runtime identity excludes provisional rack
 gain/damping but remains bound to the actual vehicle, measured mapping,
 opendbc torque calibration and limits, delay, and rack-rate resolution.
@@ -317,9 +374,100 @@ or activation path and stock remains active. A future consumer would still be
 required to promote a separately approved profile only at an engagement
 boundary, never mid-drive.
 
-Turn-in, release, overshoot, roughness, burst, driver feedback, and event
-bookmarks supervise a proposed profile. They are not directly learned torque
-gains.
+### Shared route evidence and two qualification stages
+
+One raw route is not decoded independently by every learner. Each of the two
+A/A preparation authorities decodes and canonical-joins it exactly once into a
+content-addressed `BLATRE02` version-2 artifact. That artifact stores the
+physical measured-frame plane once and compact model, controls, live-torque,
+delay, maneuver, and event planes beside it. The old physical-only `BLATSP01`
+format is rejected. The authorities have separate extractor instances and
+scratch artifacts; only byte-identical results may become durable. Physical
+learning consumes the physical plane, while later behavioral replay reloads
+the already authenticated shared artifact instead of parsing the rlog again.
+
+Physical calibration is stage one. It publishes a selected profile only after
+all six nodes and all five interpolation intervals qualify. A selected profile
+can be entirely **seed retained**: that is a successful demonstration that the
+recorded data did not justify changing the known physical map. A separate
+learned candidate exists only when at least one node safely changes. Physical
+publication is complete before behavior starts; a later behavior failure cannot
+rewrite the physical route ledger or relabel its generation.
+
+Behavioral qualification is stage two. Turn-in, release, overshoot, roughness,
+burst, completion, correction latency, and delivered-path measurements are
+scored from the shared route evidence. The learner may alter only two global,
+speed-independent policy values:
+
+- **natural frequency**: how quickly/stiffly the closed loop closes tracking
+  error; and
+- **damping ratio**: how the response settles without ringing or overshoot.
+
+The committed provisional search center is `10.0 1/s` and damping ratio
+`1.0`; it is explicitly unelected. The committed candidate bounds are
+`5.0–15.0 1/s` and damping ratio `0.6–1.5`. These are behavior-search bounds,
+not speed gates or vehicle torque values.
+
+It cannot reinterpret the model path, vehicle calibration, observer, or
+actuator envelope. The target is always the model's scalar-anchored reference;
+lane-line estimates never enter it. Auto-logger events may locate maneuvers but
+are not quality labels. Driver contact censors response after contact, because
+the human then owns the trajectory, but the intervention itself is neither a
+positive nor negative vote.
+
+The behavioral population is the newest contiguous route cohort with one exact
+recorded controller/source identity. A rejected, missing, corrupt, or
+behavior-ineligible route interleaved in that cohort blocks qualification
+instead of being skipped. An exact source boundary may end the cohort; routes
+from different stock/modular builds are never pooled. Explicit
+`late_older_skipped` entries are outside the append-only population and remain
+ignored.
+
+The committed partition keeps two validation routes, and the paired uncertainty
+rule requires at least two routes in both partitions. The resulting minimum is
+four homogeneous routes: two training and two held out. It is a floor, not a
+promise of qualification. Every metric additionally needs its committed speed/
+maneuver strata, at least two routes, and at least three windows, so rare
+low-speed turns and genuine high-speed curves can require more routes.
+
+Training evaluates exact stock, the currently accepted artifact, and the full
+candidate grid against the same frozen segmentation. With no accepted modular
+artifact, exact stock occupies both baseline roles and the provisional policy
+is merely the candidate-grid center. One training winner is frozen before
+held-out data is opened. Validation replays only exact stock, the incumbent,
+and that winner; it cannot select a fallback after seeing the holdout.
+Smooth, Swift, and Strong pass as separate contracts, and the path-error target
+must materially improve beyond the observed whole-route paired uncertainty.
+No weighted score can buy Swift or Strong by sacrificing Smooth, or vice versa.
+
+The complete behavioral transaction is then rerun from independently reloaded
+route artifacts and fresh replay cores. Only byte-identical A/A transaction
+documents may publish. A passing result stores an informational policy; every
+other safe result explicitly stores **stock retained** with no policy file.
+Neither disposition is an activation decision.
+
+### Immutable publication and `CURRENT`
+
+Physical and behavior results have separate immutable generation stores. In
+each store, all payload files are fsynced into a content-addressed generation
+directory before one small `CURRENT` pointer is atomically replaced. Readers
+authenticate the pointer, exact file inventory, every file hash, cross-file
+identity, route set, source commits, physical profile, and configuration. A
+generation whose bytes already exist must match byte-for-byte. An invalid
+existing `CURRENT` is a fail-closed corruption report; publication never
+overwrites it as though learning were starting fresh.
+
+The physical `CURRENT` owns the route ledger, evidence, selected physical
+profile, and optional changed candidate. Behavior uses its own
+`behavior_generations_v1/CURRENT`, bound to that exact physical generation and
+profile. A new physical generation, route cohort, source identity, config, core
+identity, or incumbent policy requires a new behavioral transaction. Old
+generations are deliberately retained because a safe reader-lifetime garbage
+collection contract does not yet exist.
+
+`BLaTv2LearningStatus`, `BLaTv2BehaviorLearningStatus`, and progress Params are
+rebuildable views of these stores. Deleting or editing a display cache cannot
+change `CURRENT`, select a policy, or affect actuation.
 
 #### Off-device preparation boundary
 
@@ -333,10 +481,11 @@ Every protocol message uses a versioned canonical-JSON envelope authenticated
 with a dedicated 256-bit pre-shared secret. Requests are timestamp bounded and
 nonce replay protected across worker restarts. Job creation binds the exact
 superproject, opendbc, panda, descriptor-registry, runtime, vehicle, dongle,
-and CarParams identities. Uploaded route segments and returned spools are
-size-bounded and content addressed. The PC produces one private spool for
-each independent preparation authority; an authority never consumes the
-other authority's prepared bytes.
+and CarParams identities. Uploaded route segments and returned `BLATRE02`
+route-evidence artifacts are size-bounded and content addressed. Each artifact
+contains the exact physical frames once plus the compact behavior planes. The
+PC produces one private artifact for each independent preparation authority;
+an authority never consumes the other authority's prepared bytes.
 
 The transport normally discovers the worker with a signed UDP broadcast. A
 protected optional `worker_host.txt` beside the device secret supplies one
@@ -354,8 +503,8 @@ produce mixed evidence or dishonest publication provenance.
 
 Cross-architecture trust is established before prepared frames are consumed.
 For every unseen accepted compatibility domain, one locally retained route is
-prepared with the device ARM extractor and its entire deterministic spool must
-match the x86 spool byte-for-byte. The device stores a private, atomic,
+prepared with the device ARM extractor and its entire deterministic artifact
+must match the x86 artifact byte-for-byte. The device stores a private, atomic,
 HMAC-bound certificate tied to the two extractor binaries, worker process
 instance, build/runtime/registry identities, decode schemas, CarParams, and
 physical compatibility; immutable route hashes and selected-stream identity
@@ -367,7 +516,7 @@ download path.
 The device projects remote progress onto its own monotonic clock and existing
 display-only status. PC progress is never evidence. Loss of discovery or a
 transient connection cancels the remote attempt and selects the unchanged
-local preparation backend. Authentication, compatibility, content, or spool
+local preparation backend. Authentication, compatibility, content, or artifact
 validation failures are not downgraded to success. An onroad transition or
 manager stop cancels either backend before publication.
 
@@ -395,7 +544,7 @@ source updates from pruning the archive.
 
 ### Display-only learning and lifecycle status
 
-The current field UI reads three rebuildable JSON caches:
+The current field UI reads four rebuildable JSON caches:
 
 - `BLaTv2LearningOperationStatus` reports the current operation instead of
   treating an unfinished replay as an empty learner. `blatv2_backfilld` owns
@@ -410,11 +559,20 @@ The current field UI reads three rebuildable JSON caches:
   comparison, fitting, or actuation.
 - `BLaTv2LearningStatus` is projected by `blatv2_backfilld` only after the
   exact evidence, optional candidate, ledger, and manifest have persisted.
-  Schema 2 reports cumulative and last-drive base, moving, breakaway, and
-  authority populations, qualification reasons, held-out errors, and only
-  the four parameters the observable regression fits. Seed-carried delay and
-  rack-rate resolution are never labeled learned; retired rack-gain/damping
-  fields are rejected rather than compatibility-mapped.
+  Schema 3 reports cumulative and last-drive base, moving, breakaway, and
+  authority populations; explicit learned/seed-retained/evidence/rank/
+  conditioning/validation outcomes; paired route-loss uncertainty; and
+  interpolation qualification. Candidate availability is separate from a
+  successful all-seed evaluation. Seed-carried delay and rack-rate resolution
+  are never labeled learned; retired rack-gain/damping fields are rejected
+  rather than compatibility-mapped.
+- `BLaTv2BehaviorLearningStatus` is a schema-1 projection of the independent
+  behavior stage. It reports waiting for a qualified physical profile or four
+  homogeneous routes, then preparing, training, selecting, held-out
+  validating, publishing, complete, or failed. Route/candidate/replay counts,
+  source/profile hashes, and separate Smooth/Swift/Strong verdicts make the
+  work legible. A complete result distinguishes `stock_retained` from
+  `qualified_candidate_available`; neither means active.
 
 All display keys are `CLEAR_ON_MANAGER_START` caches and are never
 persistent authorities themselves. They are published only by the offroad
@@ -447,28 +605,39 @@ replacing one `CURRENT` pointer. A rejected route does not block a later
 eligible route. An older route discovered after the durable chronology has
 advanced is recorded as late and skipped.
 
-The two required deterministic replay passes run concurrently in separate
-forked Linux processes with independent replay state. Within each pass,
-segment extraction, decoding,
-source-history joining, frame construction, hash folding, and learner
-ingestion remain strictly serial in canonical route/segment/frame order. The
-workers share no prepared frames or learner state and have no durable-writer
-authority. The parent process alone compares their `ReplayPass` artifacts,
-extends the ledger, and performs the atomic publication. This preserves the
-existing progress schema: it projects the primary replay, then verification,
-without exposing worker scheduling. Production is fixed at two workers. A
-four-worker design is queued only after two-worker device elapsed-time,
-process-group peak-memory, storage-contention, thermal, and responsiveness
-validation. It requires bounded per-route spooling so additional preparation
-workers cannot reorder learning or multiply unbounded in-memory routes. Each
-A/A authority must still prepare its own inputs; sharing one prepared spool
-between the two passes would weaken the independence check.
+Physical backfill uses four worker lanes while preserving exactly two
+independent A/A authorities. Each authority owns its causal learner state and
+one private preparation helper. The helper may decode the next route into a
+bounded `BLATRE02` artifact while its owner applies the current route, but
+route application and learner ingestion remain serial in canonical order.
+No authority consumes the other's route artifact, and no helper receives
+ledger, Params, or publication access. The parent alone compares complete
+results, extends the ledger, and atomically publishes. Worker counts 1 and 2
+remain deterministic diagnostic modes; 3 is rejected because it would make the
+two authorities asymmetric.
+
+Behavior transactions independently use up to four fork workers across
+whole-route/controller replay jobs. Results are folded in canonical job order,
+so worker count cannot change transaction bytes. The complete behavior
+transaction then runs a second time from freshly reloaded route artifacts and
+fresh decoder/controller cores. This parallelizes pure replay without sharing
+state between the A/A authorities.
+
+The progress schema continues to project primary preparation/application and
+then verification; helper scheduling is not exposed as extra passes. One
+prefetched route per authority bounds live work, with at most two 512 MiB
+artifacts per authority in the conservative worst case. Four-worker physical
+processing has completed on comma hardware without changing deterministic
+artifacts; two-worker mode remains the bounded fallback.
 
 Desktop reference measurement on the 21-segment
 `000000b7--a6b3b1f175` route: two serial passes took 17.594 s and the
 two-process path took 9.717 s (1.81x), with byte-identical evidence,
-manifest, and ledger entries. On-device elapsed time, process-group RSS, I/O
-contention, thermals, and responsiveness remain the deployment authority.
+manifest, and ledger entries. The integrated native-extractor/A/A/publication
+benchmark across b7, b8, b9, and ca measured a 33.754 s four-lane median versus
+42.359 s with two lanes, with identical hashes. On-device elapsed time,
+process-group RSS, I/O contention, thermals, and responsiveness remain the
+deployment authority.
 
 Each released clean build needs an explicit reviewed descriptor retained in
 `historical_build_descriptors.json` before it becomes historical. The current
@@ -490,9 +659,11 @@ The current controlsd selection remains stock.
 ## Future bootstrap and rollback contract
 
 The exact stock torque controller actuates throughout this learning milestone.
-An all-node calibration is emitted only as an unapproved offline candidate.
-Before a future controller consumer could use it, the exact candidate would
-have to pass:
+A complete all-node physical selection and any qualified behavior policy are
+emitted only as authenticated offline artifacts. An all-seed physical result
+or failed behavior gate explicitly retains stock and emits no redundant policy.
+Before a future controller consumer could use a selected physical profile and
+qualified behavior policy, that exact composed candidate would have to pass:
 
 1. deterministic unit and contract tests;
 2. device/harness A/A parity;
@@ -504,7 +675,9 @@ have to pass:
 Under that future contract, activation could occur only at an engagement
 boundary. A provisional profile would be atomically versioned and rollback
 would remain available. `Worse` feedback would deactivate it at the next
-engagement without deleting evidence.
+engagement without deleting evidence. Driver feedback is contextual only: it
+does not enter either learner and cannot approve an artifact, waive a failed
+objective or safety gate, or turn `stock_retained` into a candidate.
 
 ## Replacement and tuning discipline
 
