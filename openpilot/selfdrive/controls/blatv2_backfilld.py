@@ -110,6 +110,11 @@ def _decode_car_params(encoded: bytes) -> car.CarParams:
     return reader.as_builder()
 
 
+def _serialize_owned_car_params(car_params: car.CarParams) -> bytes:
+  """Serialize the owned builder once before any retryable remote work."""
+  return bytes(car_params.to_bytes())
+
+
 class BlatV2BackfillDaemon:
   def __init__(
     self,
@@ -297,6 +302,7 @@ class BlatV2BackfillDaemon:
     self,
     engine: HistoricalLearningBackfill,
     car_params: car.CarParams,
+    encoded_car_params: bytes,
   ) -> dict[str, object]:
     """Bind one remote preparation job to this exact device runtime."""
     root_commit = _decode_text(self.params.get("GitCommit", block=False))
@@ -312,7 +318,6 @@ class BlatV2BackfillDaemon:
         "backfill_route_incompatible",
         "remote preparation provenance is unavailable",
       )
-    encoded_car_params = bytes(car_params.as_builder().to_bytes())
     runtime = engine.runtime_factory()
     return {
       "car_params_b64": base64.b64encode(encoded_car_params).decode("ascii"),
@@ -337,9 +342,10 @@ class BlatV2BackfillDaemon:
     self,
     engine: HistoricalLearningBackfill,
     car_params: car.CarParams,
+    encoded_car_params: bytes,
   ) -> RemotePreparationSession | None:
     """Return a PC-prepared session, or None for normal local fallback."""
-    contract = self._remote_contract(engine, car_params)
+    contract = self._remote_contract(engine, car_params, encoded_car_params)
     try:
       bridge_config = default_bridge_config_directory(self.params)
       secret = load_bridge_secret(bridge_config)
@@ -493,8 +499,17 @@ class BlatV2BackfillDaemon:
       if car_params is None:
         return
       local_engine = self._build_engine(car_params)
+      # ``_decode_car_params`` returns an owned builder. Pycapnp builders are
+      # write-once unless their internal flag is reset, while pending-logger
+      # handling can retry remote preparation. Freeze the wire bytes exactly
+      # once and reuse them across every retry.
+      encoded_car_params = _serialize_owned_car_params(car_params)
       while not self._abort_requested():
-        session = self._prepare_remote(local_engine, car_params)
+        session = self._prepare_remote(
+          local_engine,
+          car_params,
+          encoded_car_params,
+        )
         remote_engine: HistoricalLearningBackfill | None = None
         try:
           if session is not None:
