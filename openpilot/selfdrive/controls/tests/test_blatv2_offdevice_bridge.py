@@ -9,13 +9,16 @@ import pytest  # noqa: TID251
 
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
   ARTIFACT_RESPONSE_HEADER,
+  DISCOVERY_BROADCAST,
   BRIDGE_SECRET_FILE,
+  BRIDGE_WORKER_HOST_FILE,
   DiscoveredWorker,
   OffdeviceBridgeClient,
   default_bridge_config_directory,
   discover_worker,
   load_bridge_secret,
   load_bridge_secret_for_params,
+  load_bridge_worker_host,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   MAX_CONTROL_BYTES,
@@ -362,6 +365,65 @@ def test_secret_default_is_dedicated_sibling_not_a_params_value(
   assert load_bridge_secret_for_params(FakeParams()) == SECRET
 
 
+def test_worker_host_is_optional_protected_private_ipv4(tmp_path: Path) -> None:
+  config = tmp_path / "bridge"
+  config.mkdir(mode=0o700)
+  assert load_bridge_worker_host(config) is None
+
+  host = config / BRIDGE_WORKER_HOST_FILE
+  host.write_text("192.168.1.241\n", encoding="ascii")
+  host.chmod(0o600)
+  assert load_bridge_worker_host(config) == "192.168.1.241"
+
+  host.chmod(0o644)
+  with pytest.raises(BridgeCorruptError, match="protected"):
+    load_bridge_worker_host(config)
+
+  host.chmod(0o600)
+  config.chmod(0o755)
+  with pytest.raises(BridgeCorruptError, match="0700"):
+    load_bridge_worker_host(config)
+
+
+@pytest.mark.parametrize(
+  "encoded",
+  [
+    b"8.8.8.8\n",
+    b"127.0.0.1\n",
+    b"::1\n",
+    b"192.168.1.241 \n",
+    b"192.168.1.241\r\n",
+    b"192.168.1.241\n\n",
+    b"worker.local\n",
+    b"",
+    b"1" * 66,
+    b"\xff\n",
+  ],
+)
+def test_worker_host_rejects_nonprivate_or_noncanonical_values(
+  tmp_path: Path,
+  encoded: bytes,
+) -> None:
+  config = tmp_path / "bridge"
+  config.mkdir(mode=0o700)
+  host = config / BRIDGE_WORKER_HOST_FILE
+  host.write_bytes(encoded)
+  host.chmod(0o600)
+  with pytest.raises(BridgeCorruptError):
+    load_bridge_worker_host(config)
+
+
+def test_worker_host_rejects_symlink(tmp_path: Path) -> None:
+  config = tmp_path / "bridge"
+  config.mkdir(mode=0o700)
+  target = tmp_path / "host"
+  target.write_text("192.168.1.241\n", encoding="ascii")
+  target.chmod(0o600)
+  (config / BRIDGE_WORKER_HOST_FILE).symlink_to(target)
+  with pytest.raises(BridgeCorruptError, match="protected"):
+    load_bridge_worker_host(config)
+
+
 class FakeClock:
   def __init__(self) -> None:
     self.value = 0.0
@@ -456,7 +518,151 @@ def test_discovery_ignores_spoof_and_uses_udp_source() -> None:
   )
   assert worker.host == "192.168.1.10"
   assert worker.host != "10.0.0.99"
+  assert fake_socket.sent[0][1] == (DISCOVERY_BROADCAST, 47831)
   assert fake_socket.closed
+
+
+def test_configured_discovery_uses_pinned_unicast_and_source() -> None:
+  fake_socket = FakeUDPSocket([])
+
+  def socket_factory():
+    original_send = fake_socket.sendto
+
+    def send(data, address):
+      sent = original_send(data, address)
+      fake_socket.responses.append((
+        discovery_response(data),
+        ("192.168.1.241", 47831),
+      ))
+      return sent
+
+    fake_socket.sendto = send
+    return fake_socket
+
+  worker = discover_worker(
+    secret=SECRET,
+    client_id=CLIENT_ID,
+    expected_source_commit=SOURCE_COMMIT,
+    abort_requested=lambda: False,
+    configured_host="192.168.1.241",
+    timeout_s=0.2,
+    socket_factory=socket_factory,
+    monotonic=FakeClock(),
+    wall_time_ms=lambda: NOW_MS,
+    nonce_factory=lambda: NONCE,
+  )
+  assert worker.host == "192.168.1.241"
+  assert fake_socket.sent[0][1] == ("192.168.1.241", 47831)
+
+  wrong_source = FakeUDPSocket([])
+
+  def wrong_source_factory():
+    original_send = wrong_source.sendto
+
+    def send(data, address):
+      sent = original_send(data, address)
+      wrong_source.responses.append((
+        discovery_response(data),
+        ("192.168.1.242", 47831),
+      ))
+      return sent
+
+    wrong_source.sendto = send
+    return wrong_source
+
+  with pytest.raises(BridgeCorruptError, match="configured worker"):
+    discover_worker(
+      secret=SECRET,
+      client_id=CLIENT_ID,
+      expected_source_commit=SOURCE_COMMIT,
+      abort_requested=lambda: False,
+      configured_host="192.168.1.241",
+      timeout_s=0.2,
+      socket_factory=wrong_source_factory,
+      monotonic=FakeClock(),
+      wall_time_ms=lambda: NOW_MS,
+      nonce_factory=lambda: NONCE,
+    )
+
+
+def test_configured_discovery_does_not_require_broadcast_socket_option() -> None:
+  class NoBroadcastSocket(FakeUDPSocket):
+    def setsockopt(self, *_args) -> None:
+      raise OSError("broadcast is unavailable")
+
+  configured_socket = NoBroadcastSocket([])
+
+  def configured_factory():
+    original_send = configured_socket.sendto
+
+    def send(data, address):
+      sent = original_send(data, address)
+      configured_socket.responses.append((
+        discovery_response(data),
+        ("192.168.1.241", 47831),
+      ))
+      return sent
+
+    configured_socket.sendto = send
+    return configured_socket
+
+  assert discover_worker(
+    secret=SECRET,
+    client_id=CLIENT_ID,
+    expected_source_commit=SOURCE_COMMIT,
+    abort_requested=lambda: False,
+    configured_host="192.168.1.241",
+    timeout_s=0.2,
+    socket_factory=configured_factory,
+    monotonic=FakeClock(),
+    wall_time_ms=lambda: NOW_MS,
+    nonce_factory=lambda: NONCE,
+  ).host == "192.168.1.241"
+
+  with pytest.raises(BridgeUnavailableError):
+    discover_worker(
+      secret=SECRET,
+      client_id=CLIENT_ID,
+      expected_source_commit=SOURCE_COMMIT,
+      abort_requested=lambda: False,
+      timeout_s=0.2,
+      socket_factory=lambda: NoBroadcastSocket([]),
+      monotonic=FakeClock(),
+      wall_time_ms=lambda: NOW_MS,
+      nonce_factory=lambda: NONCE,
+    )
+
+
+def test_configured_discovery_wrong_source_port_fails_closed() -> None:
+  fake_socket = FakeUDPSocket([])
+
+  def socket_factory():
+    original_send = fake_socket.sendto
+
+    def send(data, address):
+      sent = original_send(data, address)
+      fake_socket.responses.append((
+        discovery_response(data),
+        ("192.168.1.241", 47832),
+      ))
+      return sent
+
+    fake_socket.sendto = send
+    return fake_socket
+
+  with pytest.raises(BridgeCorruptError, match="source"):
+    discover_worker(
+      secret=SECRET,
+      client_id=CLIENT_ID,
+      expected_source_commit=SOURCE_COMMIT,
+      abort_requested=lambda: False,
+      configured_host="192.168.1.241",
+      timeout_s=0.2,
+      socket_factory=socket_factory,
+      monotonic=FakeClock(),
+      wall_time_ms=lambda: NOW_MS,
+      nonce_factory=lambda: NONCE,
+    )
 
 
 def test_discovery_authenticated_wrong_nonce_fails_closed() -> None:

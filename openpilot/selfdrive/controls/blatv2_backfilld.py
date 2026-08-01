@@ -57,6 +57,7 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
   default_bridge_config_directory,
   discover_worker,
   load_bridge_secret,
+  load_bridge_worker_host,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeAbortedError,
@@ -340,14 +341,14 @@ class BlatV2BackfillDaemon:
     """Return a PC-prepared session, or None for normal local fallback."""
     contract = self._remote_contract(engine, car_params)
     try:
-      secret = load_bridge_secret(
-        default_bridge_config_directory(self.params),
-      )
+      bridge_config = default_bridge_config_directory(self.params)
+      secret = load_bridge_secret(bridge_config)
       worker = discover_worker(
         secret=secret,
         client_id=f"comma-{engine.expected_dongle_id}",
         expected_source_commit=str(contract["source_commit"]),
         abort_requested=self._abort_requested,
+        configured_host=load_bridge_worker_host(bridge_config),
       )
       client = OffdeviceBridgeClient(
         worker=worker,

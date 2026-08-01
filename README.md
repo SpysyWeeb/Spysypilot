@@ -135,6 +135,14 @@ The PC has no Params, controller-selection, or actuation API. If the worker is
 unavailable, the unchanged four-worker local path runs instead. See the BLaTv2
 architecture and acceptance documents for the complete trust boundary.
 
+Discovery normally uses a signed LAN broadcast. Networks that suppress
+broadcasts between Wi-Fi and Ethernet may instead place one canonical RFC1918
+IPv4 address in the protected device file
+`/data/params/blatv2-offdevice-bridge/worker_host.txt` (mode `0600`, beside the
+raw 32-byte secret). That pin replaces only the UDP destination: discovery
+remains HMAC-authenticated, source-pinned, timestamped, and source-commit-bound.
+An unreachable pinned worker retains the four-worker local fallback.
+
 The pre-merge b7/b8/b9/ca production replay was byte-identical with two and
 four workers: generation
 `1ff42b06de6480fc1e744702175167bd725849321e6e99d3e714596e16e56809`,
