@@ -63,6 +63,7 @@ class LearningOperationState(StrEnum):
 
 DIAGNOSTICS_BY_STATE: dict[LearningOperationState, frozenset[str]] = {
   LearningOperationState.PREPARING: frozenset({
+    "discovering_remote_worker",
     "waiting_for_car_params",
     "restoring_runtime",
   }),

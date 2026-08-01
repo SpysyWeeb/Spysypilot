@@ -65,6 +65,8 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
   remote_error_is_unavailable,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
+  DISCOVERY_TIMEOUT_S,
+  DiscoveredWorker,
   OffdeviceBridgeClient,
   default_bridge_config_directory,
   discover_worker,
@@ -107,6 +109,12 @@ PENDING_ROUTE_POLL_S = 1.0
 # four-way throughput, but comma's complete local fallback intentionally owns
 # one route at a time so loss of the worker cannot OOM the offroad daemon.
 DEVICE_LOCAL_BACKFILL_REPLAY_WORKER_COUNT = 1
+# A comma device can enter the offroad manager predicate before Wi-Fi and the
+# paired PC worker finish joining the LAN. Give that cold-boot race one bounded
+# opportunity to settle without turning a missing optional worker into an
+# unbounded prerequisite for local learning.
+REMOTE_DISCOVERY_STARTUP_GRACE_S = 30.0
+REMOTE_DISCOVERY_RETRY_INTERVAL_S = 0.25
 
 
 class _BestEffortOffdeviceProgress:
@@ -172,6 +180,8 @@ class BlatV2BackfillDaemon:
     behavior_pipeline_factory: Callable[..., Any] = (
       OffroadBehaviorLearningPipeline
     ),
+    discovery_monotonic: Callable[[], float] = time.monotonic,
+    discovery_sleep: Callable[[float], None] = time.sleep,
   ) -> None:
     self.params = Params() if params is None else params
     self.log_root = Path(Paths.log_root() if log_root is None else log_root)
@@ -184,6 +194,8 @@ class BlatV2BackfillDaemon:
     self.descriptor_path = Path(descriptor_path)
     self.current_build_clean = current_build_clean
     self.behavior_pipeline_factory = behavior_pipeline_factory
+    self.discovery_monotonic = discovery_monotonic
+    self.discovery_sleep = discovery_sleep
     self.operation_status = LearningOperationStatusPublisher(self.params)
     self.behavior_status = BehaviorLearningStatusPublisher(self.params)
     self.backfill_progress = BackfillProgressPublisher(self.params)
@@ -191,6 +203,8 @@ class BlatV2BackfillDaemon:
       OffdeviceProgressPublisher(self.params),
     )
     self._stopping = False
+    self._startup_discovery_grace_available = True
+    self._pending_local_fallback_reason: OffdeviceFallbackReason | None = None
     self._recover_interrupted_architecture_verification()
 
   def _recover_interrupted_architecture_verification(self) -> None:
@@ -459,6 +473,9 @@ class BlatV2BackfillDaemon:
     encoded_car_params: bytes,
   ) -> RemotePreparationSession | None:
     """Return a PC-prepared session, or None for normal local fallback."""
+    startup_discovery = self._startup_discovery_grace_available
+    self._startup_discovery_grace_available = False
+    self._pending_local_fallback_reason = None
     try:
       self.offdevice_progress.clear()
     except Exception:
@@ -479,13 +496,24 @@ class BlatV2BackfillDaemon:
     try:
       bridge_config = default_bridge_config_directory(self.params)
       secret = load_bridge_secret(bridge_config)
-      worker = discover_worker(
-        secret=secret,
-        client_id=f"comma-{engine.expected_dongle_id}",
-        expected_source_commit=str(contract["source_commit"]),
-        abort_requested=self._abort_requested,
-        configured_host=load_bridge_worker_host(bridge_config),
-      )
+      configured_host = load_bridge_worker_host(bridge_config)
+      if startup_discovery:
+        self._publish_remote_discovery_preflight(car_params)
+        worker = self._discover_worker_during_startup_grace(
+          secret=secret,
+          client_id=f"comma-{engine.expected_dongle_id}",
+          expected_source_commit=str(contract["source_commit"]),
+          abort_requested=self._abort_requested,
+          configured_host=configured_host,
+        )
+      else:
+        worker = discover_worker(
+          secret=secret,
+          client_id=f"comma-{engine.expected_dongle_id}",
+          expected_source_commit=str(contract["source_commit"]),
+          abort_requested=self._abort_requested,
+          configured_host=configured_host,
+        )
       client = OffdeviceBridgeClient(
         worker=worker,
         secret=secret,
@@ -518,14 +546,17 @@ class BlatV2BackfillDaemon:
       return session
     except BridgeUnavailableError as exc:
       # Absence, a busy worker, or an interrupted connection is not a learner
-      # failure. The device immediately retains its original local backend.
-      cloudlog.info(f"blatv2 remote worker unavailable; using local replay: {exc}")
+      # failure. The device retains its original local backend. Publication is
+      # deferred until run() actually enters that backend, so the display does
+      # not claim local processing while discovery or teardown still owns the
+      # frame.
+      cloudlog.info(f"blatv2 remote worker unavailable; local replay selected: {exc}")
       try:
         self.backfill_progress.clear()
       except Exception:
         pass
-      self._publish_local_fallback(
-        self._bridge_unavailable_reason(exc),
+      self._pending_local_fallback_reason = (
+        self._bridge_unavailable_reason(exc)
       )
       return None
     except BridgeAbortedError as exc:
@@ -557,8 +588,8 @@ class BlatV2BackfillDaemon:
           self.backfill_progress.clear()
         except Exception:
           pass
-        self._publish_local_fallback(
-          remote_error_fallback_reason(exc),
+        self._pending_local_fallback_reason = (
+          remote_error_fallback_reason(exc)
         )
         return None
       diagnostic = (
@@ -570,6 +601,110 @@ class BlatV2BackfillDaemon:
         diagnostic,
         f"remote preparation worker rejected the job: {exc}",
       ) from exc
+
+  def _publish_remote_discovery_preflight(
+    self,
+    car_params: car.CarParams,
+  ) -> None:
+    """Keep the display in preflight while the bounded LAN grace is active."""
+    try:
+      previous = self.operation_status.last_payload
+      continuing = previous is not None and previous["terminal"] is False
+      vehicle_identity = getattr(car_params, "carFingerprint", None)
+      if vehicle_identity is not None:
+        vehicle_identity = str(vehicle_identity)
+      elif continuing:
+        vehicle_identity = previous["vehicle_identity"]
+      if self._abort_requested():
+        raise BridgeAbortedError(
+          "offroad ownership ended before remote discovery status",
+        )
+      self.operation_status.publish(
+        state=LearningOperationState.PREPARING,
+        diagnostic="discovering_remote_worker",
+        new_operation=not continuing,
+        accepted_sample_count=(
+          previous["accepted_sample_count"] if continuing else 0
+        ),
+        rejected_sample_count=(
+          previous["rejected_sample_count"] if continuing else 0
+        ),
+        retry_count=previous["retry_count"] if continuing else 0,
+        vehicle_identity=vehicle_identity,
+      )
+    except BridgeAbortedError:
+      raise
+    except Exception:
+      # Discovery status is informational and cannot make either the remote
+      # or local replay backend unavailable.
+      cloudlog.exception("blatv2 remote discovery status write failed")
+
+  def _discover_worker_during_startup_grace(
+    self,
+    *,
+    secret: bytes,
+    client_id: str,
+    expected_source_commit: str,
+    abort_requested: Callable[[], bool],
+    configured_host: str | None,
+  ) -> DiscoveredWorker:
+    """Retry only transient discovery absence for at most thirty seconds.
+
+    The retry boundary deliberately surrounds ``discover_worker`` alone.
+    Configuration/authentication, authenticated identity/protocol failures,
+    HTTP preparation, artifact transfer, and ARM certification keep their
+    existing immediate failure/fallback behavior.
+    """
+    deadline = (
+      self.discovery_monotonic() + REMOTE_DISCOVERY_STARTUP_GRACE_S
+    )
+    last_unavailable: BridgeUnavailableError | None = None
+    while True:
+      if self._abort_requested():
+        raise BridgeAbortedError(
+          "offroad ownership ended during remote worker discovery",
+        )
+      remaining = deadline - self.discovery_monotonic()
+      if remaining <= 0.0:
+        if last_unavailable is not None:
+          raise last_unavailable
+        raise BridgeUnavailableError(
+          "remote worker discovery grace expired before its first attempt",
+        )
+      try:
+        return discover_worker(
+          secret=secret,
+          client_id=client_id,
+          expected_source_commit=expected_source_commit,
+          abort_requested=abort_requested,
+          configured_host=configured_host,
+          timeout_s=min(DISCOVERY_TIMEOUT_S, remaining),
+        )
+      except BridgeUnavailableError as exc:
+        last_unavailable = exc
+        if self._abort_requested():
+          raise BridgeAbortedError(
+            "offroad ownership ended during remote worker discovery",
+          ) from exc
+        remaining = deadline - self.discovery_monotonic()
+        if remaining <= 0.0:
+          raise
+        self.discovery_sleep(min(
+          REMOTE_DISCOVERY_RETRY_INTERVAL_S,
+          remaining,
+        ))
+
+  def _begin_local_replay(self) -> None:
+    """Publish a deferred fallback exactly when the local backend starts."""
+    reason = self._pending_local_fallback_reason
+    if reason is None:
+      return
+    if self._abort_requested():
+      raise BridgeAbortedError(
+        "offroad ownership ended before local fallback",
+      )
+    self._publish_local_fallback(reason)
+    self._pending_local_fallback_reason = None
 
   def _bridge_unavailable_reason(
     self,
@@ -790,6 +925,12 @@ class BlatV2BackfillDaemon:
           if session is not None:
             remote_engine = session.build_engine()
           engine = local_engine if remote_engine is None else remote_engine
+          if remote_engine is None:
+            self._begin_local_replay()
+          if self._abort_requested():
+            raise BridgeAbortedError(
+              "offroad ownership ended before learning replay",
+            )
           result = engine.run_once()
           self._project_learning_status(engine, result.publication)
           if not result.pending_logger_close:

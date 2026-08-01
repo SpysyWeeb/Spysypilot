@@ -129,7 +129,7 @@ unreviewed.
 
 | State | Meaning |
 | --- | --- |
-| `preparing` | Waiting for exact CarParams or restoring the runtime. |
+| `preparing` | Waiting for exact CarParams, restoring the runtime, or spending the bounded 30-second cold-boot grace discovering the optional PC worker. |
 | `ready_no_evidence` | No eligible committed route exists yet. |
 | `finalizing` | Waiting for logger closure, verifying pass 2/2 with route/segment progress, comparing, or publishing. |
 | `backfilling` | Scanning complete routes or replaying pass 1/2 with route/segment progress. |
