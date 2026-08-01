@@ -352,6 +352,7 @@ The committed storage/wire identities are:
 | future feedback / lifecycle status | 2 / 2 |
 | future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
 | off-device protocol / cross-architecture certificate | 1 / 2 |
+| off-device display progress | 1 |
 
 These values are code contracts, not display labels. The retired physical v1
 through v5 namespaces remain byte-untouched and are never migrated or restored
@@ -509,16 +510,26 @@ HMAC-bound certificate tied to the two extractor binaries, worker process
 instance, build/runtime/registry identities, decode schemas, CarParams, and
 physical compatibility; immutable route hashes and selected-stream identity
 remain the recorded test vector. Rejections get a route-specific certificate
-only when ARM independently produces the same stable reason and message.
-Archive-only unseen domains fall back local because protocol v1 has no rlog
+only when ARM independently produces the same stable reason and message. A PC
+rejection for an archive-only route is therefore not a device-authoritative
+rejection: after the complete original two-authority outcome set agrees, that
+route is removed from effective discovery and both authority inputs. It
+contributes no ledger entry, watermark movement, learner evidence, readiness
+count, or behavior-cohort vote. The UI may report its count as an unverified
+exclusion. An archive-only accepted compatibility domain with no locally
+retained test vector still falls back local because protocol v1 has no rlog
 download path.
 
-The device projects remote progress onto its own monotonic clock and existing
-display-only status. PC progress is never evidence. Loss of discovery or a
-transient connection cancels the remote attempt and selects the unchanged
-local preparation backend. Authentication, compatibility, content, or artifact
-validation failures are not downgraded to success. An onroad transition or
-manager stop cancels either backend before publication.
+The device projects remote progress onto its own monotonic clock in the
+separate display-only `BLaTv2OffdeviceProgress` schema. It identifies PC
+processing, bounded artifact download, ARM certification, prepared-data
+handoff, and local fallback with a stable reason code. The ordinary
+`BLaTv2BackfillProgress` remains the authority for local replay/application;
+after handoff it retakes the display. PC progress is never evidence. Loss of
+discovery or a transient connection cancels the remote attempt and selects the
+unchanged local preparation backend. Authentication, compatibility, content,
+or artifact validation failures are not downgraded to success. An onroad
+transition or manager stop cancels either backend before publication.
 
 One protocol-v1 job is limited to 128 selected routes; no batching is allowed
 inside one atomic learner transaction, so a larger set uses the complete local

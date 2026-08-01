@@ -22,11 +22,13 @@ from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   parse_learning_operation_status,
   parse_learning_status,
   parse_lifecycle_status,
+  parse_offdevice_progress_status,
   reason_label,
   select_value_provider,
   validate_backfill_progress_update,
   validate_behavior_status_update,
   validate_operation_update,
+  validate_offdevice_progress_update,
 )
 
 
@@ -472,6 +474,62 @@ def backfill_progress_fixture(
       None if final else approximate_remaining_seconds
     ),
   }
+
+
+def offdevice_progress_fixture(
+  phase: str = "remote_processing",
+  *,
+  sequence: int = 3,
+  session_id: str = "f" * 32,
+  fallback_reason: str = "network_interrupted",
+) -> dict:
+  payload = {
+    "completed_artifact_count": None,
+    "completed_bytes": None,
+    "certified_domain_count": None,
+    "certified_route_count": None,
+    "fallback_reason_code": None,
+    "informational_only": True,
+    "phase": phase,
+    "remote_authority_count": None,
+    "remote_authority_index": None,
+    "remote_only_rejection_excluded_count": None,
+    "remote_route_count": None,
+    "remote_route_index": None,
+    "schema_version": 1,
+    "sequence": sequence,
+    "session_id": session_id,
+    "total_artifact_count": None,
+    "total_bytes": None,
+    "total_certification_domain_count": None,
+    "total_certification_route_count": None,
+    "updated_mono_ns": NOW_MONO_NS - 25_000_000,
+  }
+  if phase == "remote_processing":
+    payload.update({
+      "remote_authority_count": 2,
+      "remote_authority_index": 1,
+      "remote_route_count": 8,
+      "remote_route_index": 3,
+    })
+  elif phase == "downloading":
+    payload.update({
+      "completed_artifact_count": 3,
+      "completed_bytes": 2 * 1024 * 1024,
+      "total_artifact_count": 8,
+      "total_bytes": 8 * 1024 * 1024,
+    })
+  elif phase in ("arm_certifying", "remote_ready"):
+    payload.update({
+      "certified_domain_count": 4 if phase == "remote_ready" else 2,
+      "certified_route_count": 6 if phase == "remote_ready" else 3,
+      "remote_only_rejection_excluded_count": 2 if phase == "remote_ready" else 1,
+      "total_certification_domain_count": 4,
+      "total_certification_route_count": 8,
+    })
+  elif phase == "local_fallback":
+    payload["fallback_reason_code"] = fallback_reason
+  return payload
 
 
 class TestLearningStatusParser(unittest.TestCase):
@@ -1769,6 +1827,189 @@ class TestBackfillProgressPresentation(unittest.TestCase):
     self.assertTrue(presentation.compact_meta.endswith(" min left"))
 
 
+class TestOffdeviceProgressStatus(unittest.TestCase):
+  @staticmethod
+  def parse(payload: object):
+    return parse_offdevice_progress_status(payload, now_mono_ns=NOW_MONO_NS)
+
+  def test_all_phases_decode_with_exact_backend_schema(self) -> None:
+    expected_fractions = {
+      "remote_processing": 2 / 16,
+      "downloading": 0.25,
+      "arm_certifying": 6 / 12,
+      "remote_ready": 1.0,
+      "local_fallback": None,
+    }
+    for phase, expected_fraction in expected_fractions.items():
+      with self.subTest(phase=phase):
+        status = self.parse(offdevice_progress_fixture(phase))
+        self.assertEqual(status.phase, phase)
+        self.assertEqual(status.progress_fraction, expected_fraction)
+    ready = self.parse(offdevice_progress_fixture("remote_ready"))
+    self.assertEqual(ready.remote_only_rejection_excluded_count, 2)
+
+  def test_missing_malformed_and_future_status_fail_closed(self) -> None:
+    malformed = offdevice_progress_fixture()
+    malformed["unexpected"] = 1
+    future = offdevice_progress_fixture()
+    future["updated_mono_ns"] = NOW_MONO_NS + 1
+    contaminated = offdevice_progress_fixture("downloading")
+    contaminated["remote_route_index"] = 1
+    for payload, code in (
+      (None, "offdevice_absent"),
+      (malformed, "malformed"),
+      (future, "stale"),
+      (contaminated, "malformed"),
+    ):
+      with self.subTest(code=code):
+        with self.assertRaises(LearningStatusError) as raised:
+          self.parse(payload)
+        self.assertEqual(raised.exception.code, code)
+
+  def test_session_sequence_phase_and_counters_cannot_regress(self) -> None:
+    previous = self.parse(offdevice_progress_fixture())
+    advanced_payload = offdevice_progress_fixture(sequence=4)
+    advanced_payload["updated_mono_ns"] += 1
+    advanced_payload["remote_route_index"] = 4
+    advanced = self.parse(advanced_payload)
+    validate_offdevice_progress_update(previous, advanced)
+
+    regressions = (
+      replace(advanced, sequence=2),
+      replace(advanced, sequence=4, remote_route_index=2),
+      replace(
+        advanced,
+        sequence=5,
+        updated_mono_ns=advanced.updated_mono_ns + 1,
+        remote_authority_index=0,
+        remote_route_index=0,
+      ),
+    )
+    for current in regressions:
+      with self.subTest(current=current):
+        with self.assertRaises(LearningStatusError) as raised:
+          validate_offdevice_progress_update(previous, current)
+        self.assertEqual(raised.exception.code, "stale")
+
+    new_session = self.parse(offdevice_progress_fixture(
+      sequence=0,
+      session_id="a" * 32,
+    ))
+    validate_offdevice_progress_update(previous, new_session)
+    direct_fallback = self.parse(offdevice_progress_fixture(
+      "local_fallback",
+      sequence=0,
+      session_id="b" * 32,
+    ))
+    validate_offdevice_progress_update(previous, direct_fallback)
+
+
+class TestOffdeviceProgressPresentation(unittest.TestCase):
+  @staticmethod
+  def operation():
+    return parse_learning_operation_status(
+      operation_fixture("backfilling"),
+      expected_vehicle_identity=VEHICLE,
+      expected_runtime_identity_sha256=RUNTIME_HASH,
+      now_mono_ns=NOW_MONO_NS,
+    )
+
+  def presentation(self, phase: str, *, local=None):
+    return operation_presentation(
+      self.operation(),
+      error_code=None,
+      error_message=None,
+      has_learning_snapshot=True,
+      backfill_progress=local,
+      offdevice_progress=parse_offdevice_progress_status(
+        offdevice_progress_fixture(phase),
+        now_mono_ns=NOW_MONO_NS,
+      ),
+    )
+
+  def test_bridge_phases_have_clear_copy_and_remote_exclusion_count(self) -> None:
+    expected = {
+      "remote_processing": ("PC PROCESSING", "Pass 1/2 | Route 3/8"),
+      "downloading": (
+        "DOWNLOADING PREPARED DATA",
+        "3/8 artifacts | 2.0 MiB / 8.0 MiB",
+      ),
+      "arm_certifying": (
+        "VERIFYING ON DEVICE",
+        "3/8 routes | 2/4 domains | 1 remote-only excluded",
+      ),
+      "remote_ready": (
+        "PREPARED DATA READY",
+        "6/8 routes | 4/4 domains | 2 remote-only excluded",
+      ),
+    }
+    for phase, (title, detail) in expected.items():
+      with self.subTest(phase=phase):
+        presentation = self.presentation(phase)
+        self.assertEqual(presentation.title, title)
+        self.assertEqual(presentation.detail, detail)
+
+  def test_local_fallback_decorates_live_local_route_detail(self) -> None:
+    operation = self.operation()
+    local = parse_backfill_progress_status(
+      backfill_progress_fixture(),
+      operation_status=operation,
+      now_mono_ns=NOW_MONO_NS,
+    )
+    presentation = self.presentation("local_fallback", local=local)
+    self.assertEqual(presentation.title, "PROCESSING LOCALLY")
+    self.assertEqual(
+      presentation.detail,
+      "Pass 1/2 | Route 2/5 | Segment 4/26",
+    )
+    self.assertIn("Network connection interrupted", presentation.phase_detail)
+    self.assertEqual(presentation.progress_fraction, local.progress_fraction)
+
+  def test_pc_processing_retains_segment_detail_from_matching_local_projection(
+    self,
+  ) -> None:
+    operation = self.operation()
+    local_payload = backfill_progress_fixture(pass_index=1)
+    local = parse_backfill_progress_status(
+      local_payload,
+      operation_status=operation,
+      now_mono_ns=NOW_MONO_NS,
+    )
+    offdevice_payload = offdevice_progress_fixture("remote_processing")
+    offdevice_payload["remote_route_index"] = 2
+    presentation = operation_presentation(
+      operation,
+      error_code=None,
+      error_message=None,
+      has_learning_snapshot=True,
+      backfill_progress=local,
+      offdevice_progress=parse_offdevice_progress_status(
+        offdevice_payload,
+        now_mono_ns=NOW_MONO_NS,
+      ),
+    )
+    self.assertEqual(
+      presentation.detail,
+      "Pass 1/2 | Route 2/8 | Segment 4/26",
+    )
+
+  def test_device_replay_takes_display_after_remote_ready_handoff(self) -> None:
+    operation = self.operation()
+    local_payload = backfill_progress_fixture(pass_index=1)
+    local_payload["updated_mono_ns"] = NOW_MONO_NS - 1
+    local = parse_backfill_progress_status(
+      local_payload,
+      operation_status=operation,
+      now_mono_ns=NOW_MONO_NS,
+    )
+    presentation = self.presentation("remote_ready", local=local)
+    self.assertEqual(presentation.title, "PROCESSING PRIOR ROUTES")
+    self.assertEqual(
+      presentation.detail,
+      "Pass 1/2 | Route 2/5 | Segment 4/26",
+    )
+
+
 def _load_learning_widget_module():
   """Load the status source without requiring raylib in an off-car test."""
   fake_pyray = types.ModuleType("pyray")
@@ -1881,6 +2122,7 @@ class TestLearningStatusSource(unittest.TestCase):
   def params_values(
     operation: dict | None = None,
     backfill_progress: dict | None = None,
+    offdevice_progress: dict | None = None,
   ) -> dict[str, object]:
     return {
       "BLaTv2LearningStatus": learning_fixture(),
@@ -1888,6 +2130,7 @@ class TestLearningStatusSource(unittest.TestCase):
         operation_fixture("idle") if operation is None else operation
       ),
       "BLaTv2BackfillProgress": backfill_progress,
+      "BLaTv2OffdeviceProgress": offdevice_progress,
       "BLaTv2BehaviorLearningStatus": behavior_fixture(),
       "BLaTv2LifecycleStatus": lifecycle_fixture(),
     }
@@ -2099,6 +2342,105 @@ class TestLearningStatusSource(unittest.TestCase):
       self.assertEqual(presentation.title, "PROCESSING PRIOR ROUTES")
       self.assertIsNone(presentation.progress_fraction)
 
+  def test_optional_offdevice_status_is_exposed_but_never_poisons_local_status(
+    self,
+  ) -> None:
+    operation = operation_fixture("backfilling")
+    local = backfill_progress_fixture()
+    values = self.params_values(
+      operation,
+      local,
+      offdevice_progress_fixture("remote_processing"),
+    )
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      valid = self.source(_DashboardParams(values)).snapshot
+    self.assertEqual(valid.offdevice_progress.phase, "remote_processing")
+    self.assertIsNotNone(valid.backfill_progress)
+
+    for raw, code in (
+      ({"malformed": True}, "schema_mismatch"),
+      (
+        offdevice_progress_fixture(
+          "remote_ready",
+          sequence=0,
+          session_id="a" * 32,
+        ),
+        None,
+      ),
+    ):
+      with self.subTest(code=code):
+        values["BLaTv2OffdeviceProgress"] = raw
+        with patch.object(
+          self.widget_module.time,
+          "monotonic_ns",
+          return_value=NOW_MONO_NS,
+        ):
+          snapshot = self.source(_DashboardParams(values)).snapshot
+        if code is None:
+          self.assertIsNotNone(snapshot.offdevice_progress)
+        else:
+          self.assertIsNone(snapshot.offdevice_progress)
+          self.assertEqual(snapshot.offdevice_progress_error_code, code)
+        self.assertIsNotNone(snapshot.operation)
+        self.assertIsNotNone(snapshot.backfill_progress)
+
+  def test_missing_offdevice_status_preserves_existing_local_presentation(
+    self,
+  ) -> None:
+    operation = operation_fixture("backfilling")
+    values = self.params_values(operation, backfill_progress_fixture())
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      snapshot = self.source(_DashboardParams(values)).snapshot
+    self.assertIsNone(snapshot.offdevice_progress)
+    self.assertEqual(snapshot.offdevice_progress_error_code, "offdevice_absent")
+    presentation = operation_presentation(
+      snapshot.operation,
+      error_code=snapshot.operation_error_code,
+      error_message=snapshot.operation_error,
+      has_learning_snapshot=True,
+      backfill_progress=snapshot.backfill_progress,
+      offdevice_progress=snapshot.offdevice_progress,
+    )
+    self.assertEqual(presentation.title, "PROCESSING PRIOR ROUTES")
+    self.assertEqual(
+      presentation.detail,
+      "Pass 1/2 | Route 2/5 | Segment 4/26",
+    )
+
+  def test_offdevice_regression_is_ignored_without_discarding_its_watermark(
+    self,
+  ) -> None:
+    operation = operation_fixture("backfilling")
+    progress = offdevice_progress_fixture("remote_processing")
+    params = _DashboardParams(self.params_values(
+      operation,
+      backfill_progress_fixture(),
+      progress,
+    ))
+    source = self.source(params)
+    with patch.object(
+      self.widget_module.time,
+      "monotonic_ns",
+      return_value=NOW_MONO_NS,
+    ):
+      self.assertIsNotNone(source.snapshot.offdevice_progress)
+      regressed = offdevice_progress_fixture("remote_processing", sequence=4)
+      regressed["updated_mono_ns"] = progress["updated_mono_ns"] + 1
+      regressed["remote_route_index"] = 2
+      params.values["BLaTv2OffdeviceProgress"] = regressed
+      source._refresh()
+    self.assertIsNone(source._snapshot.offdevice_progress)
+    self.assertEqual(source._snapshot.offdevice_progress_error_code, "stale")
+    self.assertEqual(source._last_offdevice_progress.remote_route_index, 3)
+
   def test_source_exposes_only_progress_bound_to_the_current_operation(
     self,
   ) -> None:
@@ -2207,8 +2549,13 @@ class TestLearningStatusSource(unittest.TestCase):
     )
     second_clock = events.index("clock", first_clock + 1)
     self.assertLess(
-      events.index("read:BLaTv2BehaviorLearningStatus"),
+      events.index("read:BLaTv2OffdeviceProgress"),
       events.index("clock", second_clock + 1),
+    )
+    third_clock = events.index("clock", second_clock + 1)
+    self.assertLess(
+      events.index("read:BLaTv2BehaviorLearningStatus"),
+      events.index("clock", third_clock + 1),
     )
 
   def test_reader_refreshes_immediately_then_no_faster_than_two_seconds(
@@ -2236,18 +2583,18 @@ class TestLearningStatusSource(unittest.TestCase):
     ):
       first = source.snapshot
       self.assertEqual(first.operation.state, "preparing")
-      self.assertEqual(len(params.calls), 5)
+      self.assertEqual(len(params.calls), 6)
 
       params.values["BLaTv2LearningOperationStatus"] = collecting
       cached = source.snapshot
       self.assertIs(cached, first)
       self.assertEqual(cached.operation.state, "preparing")
-      self.assertEqual(len(params.calls), 5)
+      self.assertEqual(len(params.calls), 6)
 
       refreshed = source.snapshot
       self.assertIsNot(refreshed, first)
       self.assertEqual(refreshed.operation.state, "collecting")
-      self.assertEqual(len(params.calls), 10)
+      self.assertEqual(len(params.calls), 12)
 
 
   def test_source_exposes_valid_behavior_status_from_params_only(self) -> None:
@@ -2266,6 +2613,7 @@ class TestLearningStatusSource(unittest.TestCase):
         "BLaTv2LearningStatus",
         "BLaTv2LearningOperationStatus",
         "BLaTv2BackfillProgress",
+        "BLaTv2OffdeviceProgress",
         "BLaTv2BehaviorLearningStatus",
         "BLaTv2LifecycleStatus",
       ],

@@ -112,11 +112,13 @@ field eligible, acceptance must additionally prove:
 3. local and remote preparation feed the identical device learner and yield
    byte-identical replay results, evidence, manifest, candidate, and ledger
    for the same frozen manifest; each mode is independently A/A exact;
-4. disconnect, cancellation, service restart, PC-only-route rejection, and
-   device onroad transition leave the previous `CURRENT` generation intact
-   and do not leak scratch artifacts;
-5. remote progress is monotonic after device-side restamping but remains
-   display-only; and
+4. disconnect, cancellation, service restart, and device onroad transition
+   leave the previous `CURRENT` generation intact and do not leak scratch
+   artifacts; an A/A-identical PC-only rejection is absent from discovery,
+   both authority inputs, the ledger, watermark, evidence, and cohorts;
+5. remote processing, download, ARM certification, prepared-data handoff, and
+   local-fallback progress are monotonic after device-side restamping but
+   remain display-only; and
 6. with the worker absent, the original local importer remains fully
    functional without a toggle or recovery action.
 
@@ -135,8 +137,11 @@ opendbc, panda, runtime, historical/effective descriptor registries, both
 extractors, the worker process instance, canonical join/extractor schemas, log
 schema, CarParams, and physical compatibility. A worker restart therefore
 forces recertification. A rejected route is consumable only after the same
-local ARM preparation rejects it with the identical stable reason and message;
-PC-only routes in an uncertified accepted or rejected domain fall back local.
+local ARM preparation rejects it with the identical stable reason and message.
+An identically rejected PC-only route is not consumable and is instead
+excluded before the effective route set reaches either learner authority; it
+creates no durable disposition. A PC-only route in an uncertified accepted
+domain falls back local.
 
 Protocol v1 has a single-job 128-route bound and no batching. Exceeding it is
 remote-unavailable and preserves the complete local transaction. Device
@@ -180,6 +185,7 @@ The current contract identities are:
 | future feedback / lifecycle status | 2 / 2 |
 | future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
 | off-device protocol / certification | 1 / 2 |
+| off-device display progress | 1 |
 
 The v6 physical namespace starts from empty evidence. Retired v1 through v5
 artifact bytes are immutable and cannot be migrated into it.

@@ -19,6 +19,7 @@ from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   LearningStatus,
   LearningStatusError,
   LifecycleStatus,
+  OffdeviceProgressStatus,
   OperationPresentation,
   format_duration,
   format_speed,
@@ -32,10 +33,12 @@ from openpilot.selfdrive.ui.widgets.blatv2_learning_status import (
   parse_learning_operation_status,
   parse_learning_status,
   parse_lifecycle_status,
+  parse_offdevice_progress_status,
   select_value_provider,
   validate_backfill_progress_update,
   validate_behavior_status_update,
   validate_operation_update,
+  validate_offdevice_progress_update,
 )
 from openpilot.system.ui.lib.application import FontWeight, gui_app
 from openpilot.system.ui.lib.text_measure import measure_text_cached
@@ -75,6 +78,9 @@ class DashboardSnapshot:
   behavior: BehaviorLearningStatus | None = None
   behavior_error_code: str | None = None
   behavior_error: str | None = None
+  offdevice_progress: OffdeviceProgressStatus | None = None
+  offdevice_progress_error_code: str | None = None
+  offdevice_progress_error: str | None = None
 
 
 class BLaTv2LearningStatusSource:
@@ -103,6 +109,7 @@ class BLaTv2LearningStatusSource:
     )
     self._last_refresh = float("-inf")
     self._last_backfill_progress: BackfillProgressStatus | None = None
+    self._last_offdevice_progress: OffdeviceProgressStatus | None = None
     self._last_behavior_status: BehaviorLearningStatus | None = None
     self._snapshot = DashboardSnapshot(
       learning=None,
@@ -121,6 +128,9 @@ class BLaTv2LearningStatusSource:
       behavior=None,
       behavior_error_code="behavior_absent",
       behavior_error="Behavior learning status has not been published",
+      offdevice_progress=None,
+      offdevice_progress_error_code="offdevice_absent",
+      offdevice_progress_error="PC processing progress has not been published",
     )
 
   @staticmethod
@@ -235,6 +245,29 @@ class BLaTv2LearningStatusSource:
       backfill_progress_error_code = "malformed"
       backfill_progress_error = "Detailed backfill progress could not be read"
 
+    offdevice_progress: OffdeviceProgressStatus | None = None
+    offdevice_progress_error_code: str | None = None
+    offdevice_progress_error: str | None = None
+    try:
+      raw_offdevice_progress = self._read_param("BLaTv2OffdeviceProgress")
+      offdevice_now_mono_ns = time.monotonic_ns()
+      candidate_offdevice_progress = parse_offdevice_progress_status(
+        raw_offdevice_progress,
+        now_mono_ns=offdevice_now_mono_ns,
+      )
+      validate_offdevice_progress_update(
+        self._last_offdevice_progress,
+        candidate_offdevice_progress,
+      )
+      offdevice_progress = candidate_offdevice_progress
+      self._last_offdevice_progress = candidate_offdevice_progress
+    except LearningStatusError as exc:
+      offdevice_progress_error_code = exc.code
+      offdevice_progress_error = str(exc)
+    except Exception:
+      offdevice_progress_error_code = "malformed"
+      offdevice_progress_error = "PC processing progress could not be read"
+
     # Params snapshots are atomic individually, not across keys. If an active
     # operation is observed between its status writes, preserve the most
     # recent validated in-memory learning snapshot rather than blanking the
@@ -323,6 +356,9 @@ class BLaTv2LearningStatusSource:
       behavior=behavior,
       behavior_error_code=behavior_error_code,
       behavior_error=behavior_error,
+      offdevice_progress=offdevice_progress,
+      offdevice_progress_error_code=offdevice_progress_error_code,
+      offdevice_progress_error=offdevice_progress_error,
     )
 
 
@@ -484,6 +520,7 @@ class _BLaTv2Page(Widget):
       learning_error_message=snapshot.learning_error,
       has_learning_snapshot=snapshot.learning is not None,
       backfill_progress=snapshot.backfill_progress,
+      offdevice_progress=snapshot.offdevice_progress,
     )
     if not presentation.show_banner:
       return y
@@ -591,6 +628,7 @@ class _BLaTv2Page(Widget):
       learning_error_message=snapshot.learning_error,
       has_learning_snapshot=False,
       backfill_progress=snapshot.backfill_progress,
+      offdevice_progress=snapshot.offdevice_progress,
     )
     color = self._tone_color(presentation.tone)
     has_progress = presentation.progress_fraction is not None

@@ -55,6 +55,11 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_client import (
   OffdeviceBridgeClient,
 )
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_progress import (
+  OffdeviceFallbackReason,
+  OffdeviceProgressPhase,
+  OffdeviceProgressPublisher,
+)
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   MAX_ROUTE_COUNT,
   BridgeCorruptError,
@@ -92,6 +97,18 @@ _CERTIFICATION_DOMAIN_KEYS: Final = (
 )
 
 
+class BridgeFallbackUnavailableError(BridgeUnavailableError):
+  """Transient fallback carrying a stable, display-only reason code."""
+
+  def __init__(
+    self,
+    message: str,
+    fallback_reason: OffdeviceFallbackReason,
+  ) -> None:
+    super().__init__(message)
+    self.fallback_reason = fallback_reason
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteRoutePlan:
   discovery: FullRlogDiscovery
@@ -99,6 +116,22 @@ class RemoteRoutePlan:
   late_candidates: tuple[RouteCandidate, ...]
   upload_candidates: tuple[RouteCandidate, ...]
   locally_available_route_names: frozenset[str]
+  unverified_exclusions: tuple[RemoteRouteExclusion, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteRouteExclusion:
+  """Display-only record of one unconsumed PC-only rejection.
+
+  This record is deliberately absent from the learning ledger and every
+  qualification input.  It says only that the PC authorities agreed to reject
+  archive bytes which the device could not independently inspect; it never
+  turns that rejection into device-authoritative evidence.
+  """
+
+  route_identity_sha256: str
+  rejection_reason: str
+  rejection_message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,8 +276,9 @@ def build_remote_route_plan(
     # Protocol v1 deliberately has no batching: partial remote transactions
     # would make one learner publication depend on several worker jobs. Keep
     # the original complete local replay transaction instead.
-    raise BridgeUnavailableError(
+    raise BridgeFallbackUnavailableError(
       "remote replay candidate count exceeds protocol-v1 bound",
+      OffdeviceFallbackReason.REMOTE_ROUTE_LIMIT,
     )
   replay_names = {route.route_name for route in replay_candidates}
   pending_identity = (
@@ -869,6 +903,7 @@ def _certify_preparation_domains(
   worker_instance_id: str,
   secret: bytes,
   abort_requested: Callable[[], bool],
+  progress: Callable[[int, int, int, int], None] | None = None,
 ) -> dict[tuple[int, str], _PreparedOutcome]:
   """Certify each accepted preparation-compatibility domain on ARM once."""
   device_extractor_sha256 = _hash_regular_file(
@@ -891,6 +926,8 @@ def _certify_preparation_domains(
     str,
     tuple[dict[str, object], list[tuple[RouteCandidate, _PreparedOutcome]]],
   ] = {}
+  rejected: list[tuple[RouteCandidate, _PreparedOutcome]] = []
+  certified_route_count = 0
   for route in plan.replay_candidates:
     outcome = outcomes[(1, route.route_name)]
     if outcome.rejection_reason is not None:
@@ -901,69 +938,7 @@ def _certify_preparation_domains(
       rejection_message = outcome.rejection_message
       if rejection_message is None:
         raise BridgeCorruptError("rejected outcome lacks a message")
-      rejection_identity = _rejection_certification_identity(
-        compatibility,
-        route,
-      )
-      if not _load_rejection_certification(
-        root=certification_root,
-        identity=rejection_identity,
-        compatibility=compatibility,
-        route=route,
-        reason=outcome.rejection_reason,
-        message=rejection_message,
-        secret=secret,
-      ):
-        check_abort(abort_requested)
-        runtime = engine.runtime_factory()
-        try:
-          engine._prepare(
-            runtime,
-            route,
-            authority_index=1,
-            expected_extractor_sha256=device_extractor_sha256,
-            abort_requested=abort_requested,
-          )
-        except RouteRejected as exc:
-          if (
-            exc.reason != outcome.rejection_reason
-            or str(exc) != rejection_message
-          ):
-            raise BridgeUnavailableError(
-              "ARM and PC preparation disagree on route rejection",
-            ) from exc
-        except BackfillError as exc:
-          check_abort(abort_requested)
-          raise BridgeUnavailableError(
-            "ARM rejection certification preparation failed",
-          ) from exc
-        except Exception as exc:
-          check_abort(abort_requested)
-          raise BridgeUnavailableError(
-            "ARM rejection certification preparation failed",
-          ) from exc
-        else:
-          raise BridgeUnavailableError(
-            "PC rejected a route accepted by ARM preparation",
-          )
-        _write_rejection_certification(
-          root=certification_root,
-          identity=rejection_identity,
-          compatibility=compatibility,
-          route=route,
-          reason=outcome.rejection_reason,
-          message=rejection_message,
-          secret=secret,
-          abort_requested=abort_requested,
-        )
-      for authority in (1, 2):
-        authority_outcome = certified[(authority, route.route_name)]
-        certified[(authority, route.route_name)] = _PreparedOutcome(
-          descriptor=None,
-          rejection_reason=authority_outcome.rejection_reason,
-          rejection_message=authority_outcome.rejection_message,
-          certification_identity_sha256=rejection_identity,
-        )
+      rejected.append((route, outcome))
       continue
     descriptor = outcome.descriptor
     if descriptor is None:
@@ -990,6 +965,90 @@ def _certify_preparation_domains(
       existing[1].append((route, outcome))
 
   certified_identities: set[str] = set()
+  if progress is not None:
+    progress(
+      0,
+      certified_route_count,
+      len(grouped),
+      len(plan.replay_candidates),
+    )
+  for route, outcome in rejected:
+    rejection_message = outcome.rejection_message
+    assert rejection_message is not None
+    rejection_reason = outcome.rejection_reason
+    assert rejection_reason is not None
+    rejection_identity = _rejection_certification_identity(
+      compatibility,
+      route,
+    )
+    if not _load_rejection_certification(
+      root=certification_root,
+      identity=rejection_identity,
+      compatibility=compatibility,
+      route=route,
+      reason=rejection_reason,
+      message=rejection_message,
+      secret=secret,
+    ):
+      check_abort(abort_requested)
+      runtime = engine.runtime_factory()
+      try:
+        engine._prepare(
+          runtime,
+          route,
+          authority_index=1,
+          expected_extractor_sha256=device_extractor_sha256,
+          abort_requested=abort_requested,
+        )
+      except RouteRejected as exc:
+        if (
+          exc.reason != rejection_reason
+          or str(exc) != rejection_message
+        ):
+          raise BridgeUnavailableError(
+            "ARM and PC preparation disagree on route rejection",
+          ) from exc
+      except BackfillError as exc:
+        check_abort(abort_requested)
+        raise BridgeUnavailableError(
+          "ARM rejection certification preparation failed",
+        ) from exc
+      except Exception as exc:
+        check_abort(abort_requested)
+        raise BridgeUnavailableError(
+          "ARM rejection certification preparation failed",
+        ) from exc
+      else:
+        raise BridgeUnavailableError(
+          "PC rejected a route accepted by ARM preparation",
+        )
+      _write_rejection_certification(
+        root=certification_root,
+        identity=rejection_identity,
+        compatibility=compatibility,
+        route=route,
+        reason=rejection_reason,
+        message=rejection_message,
+        secret=secret,
+        abort_requested=abort_requested,
+      )
+    for authority in (1, 2):
+      authority_outcome = certified[(authority, route.route_name)]
+      certified[(authority, route.route_name)] = _PreparedOutcome(
+        descriptor=None,
+        rejection_reason=authority_outcome.rejection_reason,
+        rejection_message=authority_outcome.rejection_message,
+        certification_identity_sha256=rejection_identity,
+      )
+    certified_route_count += 1
+    if progress is not None:
+      progress(
+        0,
+        certified_route_count,
+        len(grouped),
+        len(plan.replay_candidates),
+      )
+
   for identity, (domain, domain_routes) in grouped.items():
     if _load_certification(
       root=certification_root,
@@ -999,6 +1058,14 @@ def _certify_preparation_domains(
       secret=secret,
     ):
       certified_identities.add(identity)
+      certified_route_count += len(domain_routes)
+      if progress is not None:
+        progress(
+          len(certified_identities),
+          certified_route_count,
+          len(grouped),
+          len(plan.replay_candidates),
+        )
       continue
     selected = next((
       item
@@ -1089,6 +1156,14 @@ def _certify_preparation_domains(
         abort_requested=abort_requested,
       )
       certified_identities.add(identity)
+      certified_route_count += len(domain_routes)
+      if progress is not None:
+        progress(
+          len(certified_identities),
+          certified_route_count,
+          len(grouped),
+          len(plan.replay_candidates),
+        )
     except SpoolFormatError as exc:
       raise BridgeUnavailableError(
         "ARM certification spool could not be encoded",
@@ -1125,6 +1200,10 @@ def _certify_preparation_domains(
           rejection_message=outcome.rejection_message,
           certification_identity_sha256=identity,
         )
+  if certified_route_count != len(plan.replay_candidates):
+    raise BridgeUnavailableError(
+      "remote preparation certification coverage is incomplete",
+    )
   return certified
 
 
@@ -1184,9 +1263,11 @@ class _RemoteProgressProjector:
     *,
     engine: HistoricalLearningBackfill,
     routes: tuple[RouteCandidate, ...],
+    offdevice_progress: OffdeviceProgressPublisher | None = None,
   ) -> None:
     self.engine = engine
     self.routes = routes
+    self.offdevice_progress = offdevice_progress
     self.route_indexes = {
       route.route_name: index
       for index, route in enumerate(routes, start=1)
@@ -1221,6 +1302,15 @@ class _RemoteProgressProjector:
 
   def start(self) -> None:
     self._new_device_operation()
+    if self.offdevice_progress is not None:
+      self.offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.REMOTE_PROCESSING,
+        new_session=True,
+        remote_authority_count=2,
+        remote_authority_index=0,
+        remote_route_count=len(self.routes),
+        remote_route_index=0,
+      )
 
   def update(self, progress: Mapping[str, object]) -> None:
     authority = int(progress["authority_index"])
@@ -1246,6 +1336,14 @@ class _RemoteProgressProjector:
     if coordinate < self._last_coordinate:
       raise BridgeCorruptError("worker progress moved backward")
     self._last_coordinate = coordinate
+    if self.offdevice_progress is not None:
+      self.offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.REMOTE_PROCESSING,
+        remote_authority_count=2,
+        remote_authority_index=authority,
+        remote_route_count=len(self.routes),
+        remote_route_index=route_index,
+      )
     if authority != self._status_authority:
       if self._status_authority not in (0, authority - 1):
         raise BridgeCorruptError("worker preparation authority jumped")
@@ -1347,6 +1445,9 @@ class RemotePreparationSession:
     self.scratch_directory = scratch_directory
     self.outcomes = dict(outcomes)
     self.worker_extractor_sha256 = worker_extractor_sha256
+    self.unverified_exclusions = tuple(
+      getattr(plan, "unverified_exclusions", ()),
+    )
     self._closed = False
 
   def _source(
@@ -1540,6 +1641,105 @@ def _validated_outcomes(
   return by_key
 
 
+def _exclude_unverified_remote_rejections(
+  *,
+  plan: RemoteRoutePlan,
+  outcomes: Mapping[tuple[int, str], dict[str, object]],
+) -> tuple[
+  RemoteRoutePlan,
+  dict[tuple[int, str], dict[str, object]],
+]:
+  """Remove only A/A-agreed, PC-only rejections from learner discovery.
+
+  ``_validated_outcomes`` must run first over the original frozen manifest.
+  The resulting exclusion has no ledger disposition, watermark effect, route
+  evidence, learner count, or behavior-cohort vote.  A locally retained route
+  is never eligible: its rejection continues through ARM certification.
+  """
+  expected = {
+    (authority, route.route_name)
+    for authority in (1, 2)
+    for route in plan.replay_candidates
+  }
+  if set(outcomes) != expected:
+    raise BridgeCorruptError(
+      "remote rejection partition requires the complete validated outcome set",
+    )
+
+  excluded_names: set[str] = set()
+  exclusions: list[RemoteRouteExclusion] = []
+  for route in plan.replay_candidates:
+    first = outcomes[(1, route.route_name)]
+    second = outcomes[(2, route.route_name)]
+    if (
+      route.route_name not in plan.locally_available_route_names
+      and first["disposition"] == "rejected"
+    ):
+      # Defense in depth: callers must validate the original A/A result set
+      # before partitioning. Never let a direct helper call weaken that rule.
+      if (
+        second["disposition"] != "rejected"
+        or first["reason"] != second["reason"]
+        or first["message"] != second["message"]
+      ):
+        raise BridgeCorruptError(
+          "preparation authorities disagree on remote-only rejection",
+        )
+      excluded_names.add(route.route_name)
+      exclusions.append(RemoteRouteExclusion(
+        route_identity_sha256=route.display_identity,
+        rejection_reason=str(first["reason"]),
+        rejection_message=str(first["message"]),
+      ))
+
+  if not excluded_names:
+    return plan, dict(outcomes)
+  if (
+    excluded_names & plan.locally_available_route_names
+    or excluded_names & {route.route_name for route in plan.late_candidates}
+    or excluded_names & {route.route_name for route in plan.upload_candidates}
+  ):
+    raise BridgeCorruptError("remote-only exclusion escaped its replay scope")
+
+  effective = RemoteRoutePlan(
+    discovery=FullRlogDiscovery(
+      candidates=tuple(
+        route
+        for route in plan.discovery.candidates
+        if route.route_name not in excluded_names
+      ),
+      pending_logger_close=plan.discovery.pending_logger_close,
+    ),
+    replay_candidates=tuple(
+      route
+      for route in plan.replay_candidates
+      if route.route_name not in excluded_names
+    ),
+    late_candidates=plan.late_candidates,
+    upload_candidates=plan.upload_candidates,
+    locally_available_route_names=plan.locally_available_route_names,
+    unverified_exclusions=(
+      *plan.unverified_exclusions,
+      *exclusions,
+    ),
+  )
+  effective_names = {
+    route.route_name for route in effective.replay_candidates
+  }
+  filtered = {
+    key: value
+    for key, value in outcomes.items()
+    if key[1] in effective_names
+  }
+  if set(filtered) != {
+    (authority, route.route_name)
+    for authority in (1, 2)
+    for route in effective.replay_candidates
+  }:
+    raise BridgeCorruptError("effective remote outcome set is incomplete")
+  return effective, filtered
+
+
 def _download_outcomes(
   *,
   client: OffdeviceBridgeClient,
@@ -1548,6 +1748,7 @@ def _download_outcomes(
   outcomes: Mapping[tuple[int, str], dict[str, object]],
   scratch_parent: Path,
   abort_requested: Callable[[], bool],
+  progress: Callable[[int, int, int, int], None] | None = None,
 ) -> tuple[Path, dict[tuple[int, str], _PreparedOutcome]]:
   scratch_parent.mkdir(parents=True, exist_ok=True)
   root = Path(tempfile.mkdtemp(
@@ -1556,6 +1757,21 @@ def _download_outcomes(
   ))
   os.chmod(root, 0o700)
   resolved: dict[tuple[int, str], _PreparedOutcome] = {}
+  accepted = tuple(
+    (authority, route)
+    for authority in (1, 2)
+    for route in routes
+    if outcomes[(authority, route.route_name)]["disposition"] != "rejected"
+  )
+  total_artifacts = len(accepted)
+  total_bytes = sum(
+    int(outcomes[(authority, route.route_name)]["descriptor"]["size_bytes"])
+    for authority, route in accepted
+  )
+  completed_artifacts = 0
+  completed_bytes = 0
+  if progress is not None and total_artifacts:
+    progress(0, total_artifacts, 0, total_bytes)
   try:
     for authority in (1, 2):
       for route in routes:
@@ -1573,6 +1789,28 @@ def _download_outcomes(
         filename = f"a{authority}-{route.route_name}.spool"
         partial = root / f".{filename}.partial"
         final = root / filename
+        artifact_base_bytes = completed_bytes
+        artifact_count_before = completed_artifacts
+        expected_artifact_bytes = int(remote["size_bytes"])
+
+        def artifact_progress(
+          artifact_bytes: int,
+          artifact_total_bytes: int,
+          *,
+          artifact_base_bytes: int = artifact_base_bytes,
+          artifact_count_before: int = artifact_count_before,
+          expected_artifact_bytes: int = expected_artifact_bytes,
+        ) -> None:
+          if artifact_total_bytes != expected_artifact_bytes:
+            raise BridgeCorruptError("artifact progress total changed")
+          if progress is not None:
+            progress(
+              artifact_count_before,
+              total_artifacts,
+              artifact_base_bytes + artifact_bytes,
+              total_bytes,
+            )
+
         with partial.open("xb") as sink:
           client.download_artifact(
             job_id=job_id,
@@ -1580,6 +1818,7 @@ def _download_outcomes(
             expected_size_bytes=int(remote["size_bytes"]),
             expected_sha256=str(remote["sha256"]),
             sink=sink,
+            progress=artifact_progress,
           )
           sink.flush()
           os.fsync(sink.fileno())
@@ -1610,6 +1849,15 @@ def _download_outcomes(
           rejection_message=None,
           certification_identity_sha256=None,
         )
+        completed_artifacts += 1
+        completed_bytes += int(remote["size_bytes"])
+        if progress is not None:
+          progress(
+            completed_artifacts,
+            total_artifacts,
+            completed_bytes,
+            total_bytes,
+          )
     directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
       os.fsync(directory_fd)
@@ -1631,6 +1879,21 @@ def remote_error_is_unavailable(error: BridgeRemoteError) -> bool:
   return error.code in REMOTE_UNAVAILABLE_ERROR_CODES
 
 
+def remote_error_fallback_reason(
+  error: BridgeRemoteError,
+) -> OffdeviceFallbackReason:
+  """Map authenticated worker failures to stable display-only diagnostics."""
+  if error.code == "busy":
+    return OffdeviceFallbackReason.WORKER_BUSY
+  if error.code in {"artifact_not_found", "route_unavailable"}:
+    return OffdeviceFallbackReason.REMOTE_ARTIFACT_UNAVAILABLE
+  if error.code in {"internal_error", "job_failed"}:
+    return OffdeviceFallbackReason.REMOTE_JOB_FAILED
+  if error.code == "job_not_found":
+    return OffdeviceFallbackReason.NETWORK_INTERRUPTED
+  return OffdeviceFallbackReason.REMOTE_PREPARATION_UNAVAILABLE
+
+
 def prepare_remote_session(
   *,
   engine: HistoricalLearningBackfill,
@@ -1639,6 +1902,7 @@ def prepare_remote_session(
   scratch_parent: str | Path,
   abort_requested: Callable[[], bool],
   sleep: Callable[[float], None] = time.sleep,
+  offdevice_progress: OffdeviceProgressPublisher | None = None,
 ) -> RemotePreparationSession:
   """Prepare a complete remote spool transaction or raise a stable error."""
   check_abort(abort_requested)
@@ -1686,6 +1950,7 @@ def prepare_remote_session(
   projector = _RemoteProgressProjector(
     engine=engine,
     routes=plan.replay_candidates,
+    offdevice_progress=offdevice_progress,
   )
   projector.start()
   client_job_id = secrets.token_hex(16)
@@ -1712,7 +1977,10 @@ def prepare_remote_session(
         status = client.job_status(job_id)
       except BridgeRemoteError as remote_error:
         if remote_error_is_unavailable(remote_error):
-          raise BridgeUnavailableError(str(remote_error)) from remote_error
+          raise BridgeFallbackUnavailableError(
+            str(remote_error),
+            remote_error_fallback_reason(remote_error),
+          ) from remote_error
         raise
       if any(status[key] != health[key] for key in worker_identity_keys):
         raise BridgeUnavailableError(
@@ -1728,10 +1996,16 @@ def prepare_remote_session(
         assert type(error) is dict
         remote_error = BridgeRemoteError(str(error["code"]), str(error["message"]))
         if remote_error_is_unavailable(remote_error):
-          raise BridgeUnavailableError(str(remote_error))
+          raise BridgeFallbackUnavailableError(
+            str(remote_error),
+            remote_error_fallback_reason(remote_error),
+          )
         raise remote_error
       if state == "canceled":
-        raise BridgeUnavailableError("remote preparation job was canceled")
+        raise BridgeFallbackUnavailableError(
+          "remote preparation job was canceled",
+          OffdeviceFallbackReason.REMOTE_JOB_CANCELED,
+        )
       sleep(REMOTE_JOB_POLL_SECONDS)
   except BaseException:
     try:
@@ -1746,6 +2020,61 @@ def prepare_remote_session(
     status=final_status,
     routes=plan.replay_candidates,
   )
+  plan, outcomes = _exclude_unverified_remote_rejections(
+    plan=plan,
+    outcomes=outcomes,
+  )
+  excluded_count = len(plan.unverified_exclusions)
+  total_certification_routes = len(plan.replay_candidates) + excluded_count
+  if not plan.replay_candidates:
+    if offdevice_progress is not None:
+      offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.ARM_CERTIFYING,
+        certified_domain_count=0,
+        certified_route_count=0,
+        remote_only_rejection_excluded_count=excluded_count,
+        total_certification_domain_count=0,
+        total_certification_route_count=total_certification_routes,
+      )
+    prior_extractor = (
+      _prior_generation_extractor_sha256(engine)
+      if plan.late_candidates
+      else None
+    )
+    projector.complete()
+    if offdevice_progress is not None:
+      offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.REMOTE_READY,
+        certified_domain_count=0,
+        certified_route_count=0,
+        remote_only_rejection_excluded_count=excluded_count,
+        total_certification_domain_count=0,
+        total_certification_route_count=total_certification_routes,
+      )
+    return RemotePreparationSession(
+      base_engine=engine,
+      plan=plan,
+      scratch_directory=None,
+      outcomes={},
+      worker_extractor_sha256=prior_extractor,
+    )
+
+  def download_progress(
+    completed_artifacts: int,
+    total_artifacts: int,
+    completed_bytes: int,
+    total_bytes: int,
+  ) -> None:
+    if offdevice_progress is None:
+      return
+    offdevice_progress.publish(
+      phase=OffdeviceProgressPhase.DOWNLOADING,
+      completed_artifact_count=completed_artifacts,
+      completed_bytes=completed_bytes,
+      total_artifact_count=total_artifacts,
+      total_bytes=total_bytes,
+    )
+
   root, downloaded = _download_outcomes(
     client=client,
     job_id=job_id,
@@ -1753,8 +2082,34 @@ def prepare_remote_session(
     outcomes=outcomes,
     scratch_parent=Path(scratch_parent),
     abort_requested=abort_requested,
+    progress=download_progress,
   )
   try:
+    last_certification_progress = [0, 0, 0, len(plan.replay_candidates)]
+
+    def certification_progress(
+      certified_domains: int,
+      certified_routes: int,
+      total_domains: int,
+      total_routes: int,
+    ) -> None:
+      last_certification_progress[:] = [
+        certified_domains,
+        certified_routes,
+        total_domains,
+        total_routes,
+      ]
+      if offdevice_progress is None:
+        return
+      offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.ARM_CERTIFYING,
+        certified_domain_count=certified_domains,
+        certified_route_count=certified_routes,
+        remote_only_rejection_excluded_count=excluded_count,
+        total_certification_domain_count=total_domains,
+        total_certification_route_count=total_routes + excluded_count,
+      )
+
     certified = _certify_preparation_domains(
       engine=engine,
       plan=plan,
@@ -1773,8 +2128,21 @@ def prepare_remote_session(
       worker_instance_id=str(final_status["worker_instance_id"]),
       secret=client.secret,
       abort_requested=abort_requested,
+      progress=certification_progress,
     )
     projector.complete()
+    if offdevice_progress is not None:
+      certified_domains, certified_routes, total_domains, total_routes = (
+        last_certification_progress
+      )
+      offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.REMOTE_READY,
+        certified_domain_count=certified_domains,
+        certified_route_count=certified_routes,
+        remote_only_rejection_excluded_count=excluded_count,
+        total_certification_domain_count=total_domains,
+        total_certification_route_count=total_routes + excluded_count,
+      )
     return RemotePreparationSession(
       base_engine=engine,
       plan=plan,
