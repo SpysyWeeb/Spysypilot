@@ -114,6 +114,11 @@ gain/offset/kinetic/static values. A complete calibration never implies
 activation; the lifecycle rail reports stock until a separately reviewed
 activation path exists.
 
+The historical learner registry now includes the verified 409/4/7 combo
+builds recorded by routes d2-d6 (`3849a2f`, `2447667`, and `9338f5b`). Older
+archived 384/3/7 builds remain fail-closed rather than being mislabeled to
+admit their data.
+
 The pre-merge b7/b8/b9/ca production replay was byte-identical with two and
 four workers: generation
 `1ff42b06de6480fc1e744702175167bd725849321e6e99d3e714596e16e56809`,
