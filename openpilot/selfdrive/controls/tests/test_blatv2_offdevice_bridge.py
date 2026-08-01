@@ -1158,13 +1158,19 @@ def test_artifact_download_chunks_and_verifies_complete_sha() -> None:
     lambda request: artifact_response(request, artifact),
     limits=ProtocolLimits(chunk_bytes=7),
   )
+  progress: list[tuple[int, int]] = []
   result = instance.download_artifact(
     job_id=JOB_ID,
     artifact_id=artifact_id,
     expected_size_bytes=len(artifact),
     expected_sha256=hashlib.sha256(artifact).hexdigest(),
+    progress=lambda completed, total: progress.append((completed, total)),
   )
   assert result == artifact
+  assert progress == [
+    (completed, len(artifact))
+    for completed in range(7, len(artifact), 7)
+  ] + [(len(artifact), len(artifact))]
   assert all(call["url"] == "/v1/artifacts/download" for call in factory.calls)
 
 

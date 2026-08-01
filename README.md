@@ -286,9 +286,17 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   complete artifact bytes to match. A private atomic HMAC-bound certificate is
   scoped to both extractor binaries, the worker process instance, build and
   runtime identities, and the route's decode/vehicle compatibility domain;
-  rejected routes likewise require the same ARM reason and message;
-- remote progress is restamped by the device into the existing informational
-  status projection, so PC clocks and job identifiers never become evidence;
+  locally retained rejected routes likewise require the same ARM reason and
+  message. A rejection for an archive-only route cannot be reproduced on ARM,
+  so it is excluded from the effective discovery set and from both authority
+  outputs. It creates no ledger row, watermark movement, learner count, or
+  behavior-cohort vote; it is reported only as an unverified exclusion;
+- remote progress is restamped by the device onto its monotonic clock. The
+  separate display-only `BLaTv2OffdeviceProgress` projection distinguishes PC
+  processing, artifact download, ARM certification, prepared-data handoff,
+  and an explicit local-fallback reason. The existing local progress resumes
+  ownership once the device consumes prepared artifacts. Neither projection
+  is evidence, and PC clocks and job identifiers never become evidence;
   and
 - an unavailable or interrupted worker falls back to the existing local
   importer without changing the last authenticated generation. Incompatible,

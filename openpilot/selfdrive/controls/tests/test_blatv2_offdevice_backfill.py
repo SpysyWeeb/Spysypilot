@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest  # noqa: TID251
 
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
+  BackfillError,
   BuildDescriptor,
   FullRlogDiscovery,
   PreparedRoute,
@@ -21,11 +22,13 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
   write_prepared_route_spool,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
+  BridgeFallbackUnavailableError,
   RemotePreparationSession,
   RemoteRoutePlan,
   _PreparedOutcome,
   _RemoteProgressProjector,
   _certify_preparation_domains as _certify_preparation_domains_impl,
+  _exclude_unverified_remote_rejections,
   _upload_missing_routes,
   _prior_generation_extractor_sha256,
   _validated_outcomes,
@@ -37,6 +40,11 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeRemoteError,
   BridgeUnavailableError,
   canonical_json_bytes,
+)
+from openpilot.selfdrive.controls.lib.blatv2.offdevice_progress import (
+  OffdeviceFallbackReason,
+  OffdeviceProgressPhase,
+  OffdeviceProgressPublisher,
 )
 from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
   route_evidence_for_frames,
@@ -262,6 +270,22 @@ def prepared_outcome(
   }
 
 
+def rejected_outcome(
+  authority: int,
+  route_name: str,
+  *,
+  reason: str = "event_decode_failed",
+  message: str = "bounded route event could not be decoded",
+) -> dict[str, object]:
+  return {
+    "authority_index": authority,
+    "disposition": "rejected",
+    "message": message,
+    "reason": reason,
+    "route_name": route_name,
+  }
+
+
 def test_completed_job_requires_two_identical_authorities(tmp_path: Path) -> None:
   candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
   status = {
@@ -278,6 +302,422 @@ def test_completed_job_requires_two_identical_authorities(tmp_path: Path) -> Non
   )
   with pytest.raises(BridgeCorruptError, match="artifacts differ"):
     _validated_outcomes(status=status, routes=(candidate,))
+
+
+def test_remote_only_rejection_is_removed_from_effective_transaction(
+  tmp_path: Path,
+) -> None:
+  accepted = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  excluded = route(tmp_path, "00000003--3333333333", ("3" * 64,))
+  late = route(tmp_path, "00000001--1111111111", ("1" * 64,))
+  plan = RemoteRoutePlan(
+    discovery=FullRlogDiscovery((late, accepted, excluded), True),
+    replay_candidates=(accepted, excluded),
+    late_candidates=(late,),
+    upload_candidates=(),
+    locally_available_route_names=frozenset({accepted.route_name}),
+  )
+  raw = {
+    "outcomes": [
+      prepared_outcome(1, accepted.route_name),
+      prepared_outcome(2, accepted.route_name),
+      rejected_outcome(1, excluded.route_name),
+      rejected_outcome(2, excluded.route_name),
+    ],
+  }
+  validated = _validated_outcomes(
+    status=raw,
+    routes=plan.replay_candidates,
+  )
+  effective, outcomes = _exclude_unverified_remote_rejections(
+    plan=plan,
+    outcomes=validated,
+  )
+
+  assert effective.discovery == FullRlogDiscovery((late, accepted), True)
+  assert effective.replay_candidates == (accepted,)
+  assert effective.late_candidates == (late,)
+  assert effective.upload_candidates == ()
+  assert effective.locally_available_route_names == frozenset({accepted.route_name})
+  assert set(outcomes) == {
+    (1, accepted.route_name),
+    (2, accepted.route_name),
+  }
+  assert len(effective.unverified_exclusions) == 1
+  record = effective.unverified_exclusions[0]
+  assert record.route_identity_sha256 == excluded.display_identity
+  assert record.rejection_reason == "event_decode_failed"
+  assert record.rejection_message == "bounded route event could not be decoded"
+
+
+def test_remote_rejection_partition_never_excludes_local_or_unvalidated(
+  tmp_path: Path,
+) -> None:
+  local = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  plan = certification_plan(local)
+  validated = _validated_outcomes(
+    status={
+      "outcomes": [
+        rejected_outcome(1, local.route_name),
+        rejected_outcome(2, local.route_name),
+      ],
+    },
+    routes=plan.replay_candidates,
+  )
+  effective, outcomes = _exclude_unverified_remote_rejections(
+    plan=plan,
+    outcomes=validated,
+  )
+  assert effective == plan
+  assert outcomes == validated
+
+  nonlocal_plan = certification_plan(local, locally_available=False)
+  mismatched = dict(validated)
+  mismatched[(2, local.route_name)] = rejected_outcome(
+    2,
+    local.route_name,
+    reason="different_reason",
+  )
+  with pytest.raises(BridgeCorruptError, match="disagree"):
+    _exclude_unverified_remote_rejections(
+      plan=nonlocal_plan,
+      outcomes=mismatched,
+    )
+  with pytest.raises(BridgeCorruptError, match="complete"):
+    _exclude_unverified_remote_rejections(
+      plan=nonlocal_plan,
+      outcomes={(1, local.route_name): validated[(1, local.route_name)]},
+    )
+
+
+def test_mixed_remote_session_continues_without_unverified_rejection(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  accepted = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  excluded = route(tmp_path, "00000003--3333333333", ("3" * 64,))
+  original_plan = RemoteRoutePlan(
+    discovery=FullRlogDiscovery((accepted, excluded), False),
+    replay_candidates=(accepted, excluded),
+    late_candidates=(),
+    upload_candidates=(),
+    locally_available_route_names=frozenset({accepted.route_name}),
+  )
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.discover_full_rlog_state",
+    lambda *_args, **_kwargs: original_plan.discovery,
+  )
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.build_remote_route_plan",
+    lambda **_kwargs: original_plan,
+  )
+
+  class Projector:
+    complete_count = 0
+
+    def __init__(self, **kwargs) -> None:
+      self.offdevice_progress = kwargs["offdevice_progress"]
+      self.route_count = len(kwargs["routes"])
+
+    def start(self) -> None:
+      self.offdevice_progress.publish(
+        phase=OffdeviceProgressPhase.REMOTE_PROCESSING,
+        new_session=True,
+        remote_authority_count=2,
+        remote_authority_index=0,
+        remote_route_count=self.route_count,
+        remote_route_index=0,
+      )
+
+    def update(self, _progress: object) -> None:
+      pass
+
+    def complete(self) -> None:
+      self.complete_count += 1
+
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._RemoteProgressProjector",
+    Projector,
+  )
+  scratch = tmp_path / ".blatv2-remote-prepare-filtered"
+  downloaded_keys: set[tuple[int, str]] = set()
+
+  def download(*, routes, outcomes, progress, **_kwargs):
+    assert routes == (accepted,)
+    downloaded_keys.update(outcomes)
+    progress(0, 2, 0, 200)
+    progress(2, 2, 200, 200)
+    scratch.mkdir(mode=0o700)
+    provenance = {"source": "mixed-session-test"}
+    evidence = route_evidence_for_frames(accepted.route_name, (), provenance)
+    resolved = {}
+    for authority in (1, 2):
+      descriptor = write_prepared_route_spool(
+        scratch,
+        accepted.route_name,
+        (),
+        controls_witness_count=0,
+        unresolved_witness_count=0,
+        gap_count=0,
+        provenance=provenance,
+        max_frames=1,
+        abort_requested=lambda: False,
+        filename=f"a{authority}-{accepted.route_name}.spool",
+        route_evidence=evidence,
+      )
+      resolved[(authority, accepted.route_name)] = _PreparedOutcome(
+        descriptor=descriptor,
+        rejection_reason=None,
+        rejection_message=None,
+      )
+    return scratch, resolved
+
+  def certify(*, plan, outcomes, progress, **_kwargs):
+    assert plan.replay_candidates == (accepted,)
+    assert plan.discovery.candidates == (accepted,)
+    progress(0, 0, 1, 1)
+    progress(1, 1, 1, 1)
+    return {
+      key: _PreparedOutcome(
+        descriptor=value.descriptor,
+        rejection_reason=value.rejection_reason,
+        rejection_message=value.rejection_message,
+        certification_identity_sha256="a" * 64,
+      )
+      for key, value in outcomes.items()
+    }
+
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._download_outcomes",
+    download,
+  )
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._certify_preparation_domains",
+    certify,
+  )
+
+  class Client:
+    secret = SECRET
+
+    def health(self) -> dict[str, object]:
+      return {
+        **contract(),
+        "state": "ready",
+        "worker_count": 4,
+        "worker_extractor_sha256": WORKER_EXTRACTOR,
+        "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
+        "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_instance_id": WORKER_INSTANCE,
+      }
+
+    def route_inventory(self) -> dict[str, object]:
+      return {"routes": []}
+
+    def create_job(self, **_kwargs) -> dict[str, object]:
+      return {
+        "job_id": "1" * 32,
+        "route_count": 2,
+        "state": "running",
+        "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
+        "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_instance_id": WORKER_INSTANCE,
+      }
+
+    def job_status(self, _job_id: str) -> dict[str, object]:
+      return {
+        "error": None,
+        "outcomes": [
+          prepared_outcome(1, accepted.route_name),
+          prepared_outcome(2, accepted.route_name),
+          rejected_outcome(1, excluded.route_name),
+          rejected_outcome(2, excluded.route_name),
+        ],
+        "progress": {},
+        "state": "completed",
+        "worker_extractor_sha256": WORKER_EXTRACTOR,
+        "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
+        "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_instance_id": WORKER_INSTANCE,
+      }
+
+  engine = FakeEngine(tmp_path)
+  engine.log_root = tmp_path / "logs"
+  class ProgressParams:
+    def __init__(self) -> None:
+      self.values: dict[str, object] = {}
+
+    def put(self, key: str, value: object, *, block: bool) -> None:
+      assert block is True
+      self.values[key] = value
+
+    def remove(self, key: str) -> None:
+      self.values.pop(key, None)
+
+  progress_params = ProgressParams()
+  offdevice_progress = OffdeviceProgressPublisher(progress_params)
+  session = prepare_remote_session(
+    engine=engine,
+    client=Client(),
+    contract=contract(),
+    scratch_parent=tmp_path,
+    abort_requested=lambda: False,
+    offdevice_progress=offdevice_progress,
+  )
+  try:
+    assert session.plan.discovery.candidates == (accepted,)
+    assert session.plan.replay_candidates == (accepted,)
+    assert downloaded_keys == {
+      (1, accepted.route_name),
+      (2, accepted.route_name),
+    }
+    assert session.outcomes.keys() == downloaded_keys
+    assert session.unverified_exclusions == session.plan.unverified_exclusions
+    assert len(session.unverified_exclusions) == 1
+    assert offdevice_progress.last_payload is not None
+    assert offdevice_progress.last_payload["phase"] == "remote_ready"
+    assert offdevice_progress.last_payload["certified_route_count"] == 1
+    assert (
+      offdevice_progress.last_payload[
+        "remote_only_rejection_excluded_count"
+      ]
+      == 1
+    )
+    assert offdevice_progress.last_payload["total_certification_route_count"] == 2
+    prepared = session._source(1, accepted, lambda: False)
+    assert tuple(prepared.iter_frames()) == ()
+    prepared.cleanup()
+    with pytest.raises(BackfillError, match="absent"):
+      session._source(1, excluded, lambda: False)
+  finally:
+    session.close()
+
+
+def test_all_excluded_late_failure_never_claims_remote_ready(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  excluded = route(tmp_path, "00000003--3333333333", ("3" * 64,))
+  late = route(tmp_path, "00000001--1111111111", ("1" * 64,))
+  plan = RemoteRoutePlan(
+    discovery=FullRlogDiscovery((late, excluded), False),
+    replay_candidates=(excluded,),
+    late_candidates=(late,),
+    upload_candidates=(),
+    locally_available_route_names=frozenset(),
+  )
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.discover_full_rlog_state",
+    lambda *_args, **_kwargs: plan.discovery,
+  )
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.build_remote_route_plan",
+    lambda **_kwargs: plan,
+  )
+
+  class Projector:
+    complete_count = 0
+
+    def __init__(self, **kwargs) -> None:
+      self.progress = kwargs["offdevice_progress"]
+
+    def start(self) -> None:
+      self.progress.publish(
+        phase=OffdeviceProgressPhase.REMOTE_PROCESSING,
+        new_session=True,
+        remote_authority_count=2,
+        remote_authority_index=0,
+        remote_route_count=1,
+        remote_route_index=0,
+      )
+
+    def update(self, _progress: object) -> None:
+      pass
+
+    def complete(self) -> None:
+      self.complete_count += 1
+
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._RemoteProgressProjector",
+    Projector,
+  )
+
+  def prior_failure(_engine: object) -> str:
+    raise BridgeUnavailableError("prior extractor unavailable")
+
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._prior_generation_extractor_sha256",
+    prior_failure,
+  )
+
+  class Client:
+    secret = SECRET
+
+    def health(self) -> dict[str, object]:
+      return {
+        **contract(),
+        "state": "ready",
+        "worker_count": 4,
+        "worker_extractor_sha256": WORKER_EXTRACTOR,
+        "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
+        "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_instance_id": WORKER_INSTANCE,
+      }
+
+    def route_inventory(self) -> dict[str, object]:
+      return {"routes": []}
+
+    def create_job(self, **_kwargs) -> dict[str, object]:
+      return {
+        "job_id": "1" * 32,
+        "route_count": 1,
+        "state": "running",
+        "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
+        "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_instance_id": WORKER_INSTANCE,
+      }
+
+    def job_status(self, _job_id: str) -> dict[str, object]:
+      return {
+        "error": None,
+        "outcomes": [
+          rejected_outcome(1, excluded.route_name),
+          rejected_outcome(2, excluded.route_name),
+        ],
+        "progress": {},
+        "state": "completed",
+        "worker_extractor_sha256": WORKER_EXTRACTOR,
+        "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
+        "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_instance_id": WORKER_INSTANCE,
+      }
+
+  class ProgressParams:
+    def __init__(self) -> None:
+      self.values: dict[str, object] = {}
+
+    def put(self, key: str, value: object, *, block: bool) -> None:
+      assert block is True
+      self.values[key] = value
+
+    def remove(self, key: str) -> None:
+      self.values.pop(key, None)
+
+  progress = OffdeviceProgressPublisher(ProgressParams())
+  engine = FakeEngine(tmp_path)
+  engine.log_root = tmp_path / "logs"
+  with pytest.raises(BridgeUnavailableError, match="prior extractor"):
+    prepare_remote_session(
+      engine=engine,
+      client=Client(),
+      contract=contract(),
+      scratch_parent=tmp_path,
+      abort_requested=lambda: False,
+      offdevice_progress=progress,
+    )
+  assert progress.last_payload is not None
+  assert progress.last_payload["phase"] == "arm_certifying"
+  assert progress.last_payload["remote_only_rejection_excluded_count"] == 1
+  assert Projector.complete_count == 0
 
 
 def test_session_opens_exact_spool_and_cleans_it(
@@ -345,7 +785,10 @@ def test_route_plan_over_protocol_bound_falls_back_before_job(
     )
     for index in range(1, 130)
   )
-  with pytest.raises(BridgeUnavailableError, match="count"):
+  with pytest.raises(
+    BridgeFallbackUnavailableError,
+    match="count",
+  ) as raised:
     build_remote_route_plan(
       local_discovery=FullRlogDiscovery(candidates, False),
       inventory_payload={"routes": []},
@@ -353,6 +796,7 @@ def test_route_plan_over_protocol_bound_falls_back_before_job(
       placeholder_root=tmp_path,
       engine=FakeEngine(tmp_path),
     )
+  assert raised.value.fallback_reason is OffdeviceFallbackReason.REMOTE_ROUTE_LIMIT
 
 
 def test_route_plan_identifies_late_only_generation(
@@ -483,7 +927,7 @@ def test_archive_sync_runs_even_when_no_remote_replay_job(
 
 @pytest.mark.parametrize(
   "status_mode",
-  ["failed", "not_found", "implementation_changed"],
+  ["failed", "not_found", "canceled", "implementation_changed"],
 )
 def test_job_status_resource_loss_or_identity_change_falls_back(
   tmp_path: Path,
@@ -552,6 +996,15 @@ def test_job_status_resource_loss_or_identity_change_falls_back(
     def job_status(self, _job_id: str) -> dict[str, object]:
       if status_mode == "not_found":
         raise BridgeRemoteError("job_not_found", "worker restarted")
+      if status_mode == "canceled":
+        return {
+          "error": None,
+          "progress": {},
+          "state": "canceled",
+          "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
+          "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+          "worker_instance_id": WORKER_INSTANCE,
+        }
       return {
         "error": {"code": "job_failed", "message": "worker resource lost"},
         "progress": {},
@@ -572,7 +1025,7 @@ def test_job_status_resource_loss_or_identity_change_falls_back(
   engine = FakeEngine(tmp_path)
   engine.log_root = tmp_path / "logs"
   client = Client()
-  with pytest.raises(BridgeUnavailableError):
+  with pytest.raises(BridgeUnavailableError) as raised:
     prepare_remote_session(
       engine=engine,
       client=client,
@@ -580,6 +1033,16 @@ def test_job_status_resource_loss_or_identity_change_falls_back(
       scratch_parent=tmp_path,
       abort_requested=lambda: False,
     )
+  expected_reason = {
+    "failed": OffdeviceFallbackReason.REMOTE_JOB_FAILED,
+    "not_found": OffdeviceFallbackReason.NETWORK_INTERRUPTED,
+    "canceled": OffdeviceFallbackReason.REMOTE_JOB_CANCELED,
+  }.get(status_mode)
+  if expected_reason is None:
+    assert not isinstance(raised.value, BridgeFallbackUnavailableError)
+  else:
+    assert isinstance(raised.value, BridgeFallbackUnavailableError)
+    assert raised.value.fallback_reason is expected_reason
   assert client.canceled is True
 
 
@@ -639,6 +1102,7 @@ def test_remote_progress_restamps_pass_major_without_evidence_clock(
 
   operation = OperationStatus()
   progress = Progress()
+  offdevice = Progress()
   runtime = SimpleNamespace(
     runtime_bundle=SimpleNamespace(
       calibration_identity_sha256="a" * 64,
@@ -650,7 +1114,11 @@ def test_remote_progress_restamps_pass_major_without_evidence_clock(
     operation_status=operation,
     backfill_progress=progress,
   )
-  projector = _RemoteProgressProjector(engine=engine, routes=(candidate,))
+  projector = _RemoteProgressProjector(
+    engine=engine,
+    routes=(candidate,),
+    offdevice_progress=offdevice,
+  )
   projector.start()
 
   def update(authority: int, segment: int) -> None:
@@ -680,6 +1148,18 @@ def test_remote_progress_restamps_pass_major_without_evidence_clock(
     item["completed_replay_segment_count"] for item in reading
   ] == [0, 1, 2, 3]
   assert progress.publications[-1]["completed_replay_segment_count"] == 4
+  assert offdevice.publications[0] == {
+    "phase": OffdeviceProgressPhase.REMOTE_PROCESSING,
+    "new_session": True,
+    "remote_authority_count": 2,
+    "remote_authority_index": 0,
+    "remote_route_count": 1,
+    "remote_route_index": 0,
+  }
+  assert [
+    (item["remote_authority_index"], item["remote_route_index"])
+    for item in offdevice.publications[1:]
+  ] == [(1, 1), (1, 1), (2, 1), (2, 1)]
 
   with pytest.raises(BridgeCorruptError, match="backward"):
     update(1, 2)
@@ -1003,6 +1483,7 @@ def test_rejected_route_requires_identical_local_arm_rejection(
       "bounded route event could not be decoded",
     ),
   )
+  progress: list[tuple[int, int, int, int]] = []
   certified = _certify_preparation_domains(
     engine=engine,
     plan=certification_plan(candidate),
@@ -1013,8 +1494,10 @@ def test_rejected_route_requires_identical_local_arm_rejection(
     worker_instance_id=WORKER_INSTANCE,
     secret=SECRET,
     abort_requested=lambda: False,
+    progress=lambda *values: progress.append(values),
   )
   assert engine.prepare_count == 1
+  assert progress == [(0, 0, 0, 1), (0, 1, 0, 1)]
   assert all(
     outcome.certification_identity_sha256 is not None
     for outcome in certified.values()

@@ -25,6 +25,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BLaTv2LearningOperationStatus", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2LearningStatus", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2LifecycleStatus", {CLEAR_ON_MANAGER_START, JSON}},
+    {"BLaTv2OffdeviceProgress", {CLEAR_ON_MANAGER_START, JSON}},
     {"CalibrationParams", {PERSISTENT, BYTES}},
     {"CameraDebugExpGain", {CLEAR_ON_MANAGER_START, STRING}},
     {"CameraDebugExpTime", {CLEAR_ON_MANAGER_START, STRING}},
