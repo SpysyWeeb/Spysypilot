@@ -47,6 +47,27 @@ no UI or user-facing Params and does not own target speed or braking. The
 implementation, signal mapping, and ownership boundaries are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 
+## BLoTv2 ordinary cruise comfort
+
+**Status: in progress; awaiting field validation.** Route
+`000000d9--6040563d1d` showed that the stock ceiling alone still makes a small
+highway set-speed correction use all available acceleration or the full
+`-1.2 m/s²` cruise deceleration limit. The current tune adds a lead-free Chill
+cruise comfort response: above `15 m/s`, a `5 mph` error asks for about
+`0.40 m/s²`, tapers continuously as the error closes, and uses the
+pitch-compensated coast estimate during speed reductions. It blends in from
+`8–15 m/s`, retaining low-speed launch response, while larger errors can still
+reach the existing acceleration and braking envelope.
+
+Experimental mode, forced deceleration, invalid radar or lead-following
+operation, and an active model curve-speed limit bypass this shaping. The jerk
+schedule and planner candidate arbitration are unchanged. Production-function
+replay reduced the comparable route targets from approximately `+0.69` and
+`-1.20 m/s²` to approximately `+0.40` and `-0.40 m/s²`; this is command replay,
+not closed-loop or field validation. Design and remaining gates are documented
+in [`docs/BLoTv2.md`](docs/BLoTv2.md#route-000000d9--6040563d1d-ordinary-cruise-comfort-refinement)
+and [`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
+
 ## BLaTv2 modular replacement
 
 **Status: in progress; collecting evidence while stock torque control remains
