@@ -63,6 +63,7 @@ def vehicle_profile(
   qualified: bool = True,
   delays: tuple[float, ...] | None = None,
   torque_gains: tuple[float, ...] | None = None,
+  offset_corrections: tuple[float, ...] | None = None,
 ) -> VehicleProfile:
   selected_delays = (
     (0.0,) * len(DEFAULT_SPEED_NODES_MPS)
@@ -74,9 +75,15 @@ def vehicle_profile(
     if torque_gains is None
     else torque_gains
   )
+  selected_offsets = (
+    (0.0,) * len(DEFAULT_SPEED_NODES_MPS)
+    if offset_corrections is None
+    else offset_corrections
+  )
   if (
     len(selected_delays) != len(DEFAULT_SPEED_NODES_MPS)
     or len(selected_gains) != len(DEFAULT_SPEED_NODES_MPS)
+    or len(selected_offsets) != len(DEFAULT_SPEED_NODES_MPS)
   ):
     raise ValueError("test profile fields must match the speed nodes")
   nodes = []
@@ -91,6 +98,7 @@ def vehicle_profile(
       rack_rate_resolution_deg_s=4.0,
       confidence=1.0 if qualified else 0.0,
       qualified=qualified,
+      lateral_accel_offset_correction_mps2=selected_offsets[index],
     )
     nodes.append(ProfileNode(
       speed_mps=speed,
@@ -321,6 +329,44 @@ class TestBLaTv2Core(unittest.TestCase):
     self.assertGreater(
       result.physical_effect_plan_s,
       adaptation.frame.timing.scalar_action_plan_s,
+    )
+
+  def test_learned_offset_correction_reaches_the_inverse_map(self) -> None:
+    profile = vehicle_profile(offset_corrections=(0.08,) * 6)
+    adaptation, outputs, _ = adapted_intent(
+      profile,
+      scalar_curvature=0.0,
+      constant_curvature=0.0,
+      constant_speed=True,
+    )
+    corrected_core = make_core(profile)
+    corrected = update_core(
+      corrected_core,
+      adaptation,
+      outputs,
+      scalar_curvature=0.0,
+    )
+    baseline_profile = vehicle_profile()
+    baseline_adaptation, baseline_outputs, _ = adapted_intent(
+      baseline_profile,
+      scalar_curvature=0.0,
+      constant_curvature=0.0,
+      constant_speed=True,
+    )
+    baseline = update_core(
+      make_core(baseline_profile),
+      baseline_adaptation,
+      baseline_outputs,
+      scalar_curvature=0.0,
+    )
+
+    self.assertTrue(corrected.valid)
+    self.assertTrue(baseline.valid)
+    self.assertEqual(corrected.lateral_accel_offset_correction_mps2, 0.08)
+    self.assertEqual(corrected.effective_lateral_accel_offset_mps2, 0.08)
+    self.assertAlmostEqual(
+      corrected.aligning_torque - baseline.aligning_torque,
+      0.08 * corrected.torque_per_lateral_accel,
     )
 
   def test_state_age_extends_plant_horizon_not_reference_query_time(self) -> None:

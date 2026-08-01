@@ -38,6 +38,10 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 DT = 0.01
 
 
+def route_sha(counter: int) -> str:
+  return f"{counter:064x}"
+
+
 class _MemoryParams:
   def __init__(self) -> None:
     self.values: dict[str, object] = {}
@@ -169,7 +173,7 @@ class _FakeCalibrationLearner:
   @classmethod
   def from_evidence(cls, seed: VehicleCalibrationProfile, encoded: bytes) -> _FakeCalibrationLearner:
     payload = json.loads(encoded)
-    if payload["evidence_schema_version"] != 6:
+    if payload["evidence_schema_version"] != 8:
       raise ValueError("evidence schema is incompatible")
     if payload["vehicle_identity"] != seed.vehicle_identity:
       raise ValueError("evidence belongs to a different vehicle")
@@ -180,11 +184,15 @@ class _FakeCalibrationLearner:
   def reset_route_transients(self) -> None:
     pass
 
-  def begin_route(self, route_counter: int) -> None:
+  def begin_route(
+    self,
+    route_identity_sha256: str,
+    route_content_sha256: str | None = None,
+  ) -> None:
     if self.active_route_counter is not None:
       raise AssertionError("fake learner already owns a route")
-    if type(route_counter) is not int or route_counter < 0:
-      raise AssertionError("fake learner received an invalid route counter")
+    del route_content_sha256
+    route_counter = int(route_identity_sha256, 16)
     self.active_route_counter = route_counter
     self.begun_route_counters.append(route_counter)
 
@@ -251,7 +259,7 @@ class _FakeCalibrationLearner:
     return json.dumps(
       {
         "counts": self.counts,
-        "evidence_schema_version": 6,
+        "evidence_schema_version": 8,
         "vehicle_identity": self.seed.vehicle_identity,
       },
       sort_keys=True,
@@ -319,6 +327,8 @@ class _FakeCalibrationLearner:
       all_nodes_qualified=all_qualified,
       candidate_profile=candidate,
       node_reports=tuple(reports),
+      interpolation_reports=(),
+      contains_learned_change=all_qualified,
     )
 
 
@@ -350,7 +360,7 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "only while onroad"):
       coordinator.ingest(measured_sample(10.0, 0))
 
-    coordinator.transition_onroad(0x17)
+    coordinator.transition_onroad(route_sha(0x17))
     self.assertEqual(
       coordinator._learner.begun_route_counters,
       [0x17],
@@ -385,7 +395,7 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
   def test_finalize_is_deterministic_cached_and_restorable(self) -> None:
     first = CalibrationLearningCoordinator(seed_profile())
-    first.transition_onroad()
+    first.transition_onroad(route_sha(0))
     self.assertTrue(first.ingest(measured_sample(10.0, 0)))
     first.transition_offroad()
     first_final = first.finalize()
@@ -397,7 +407,7 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
     self.assertEqual(restored_final.evidence_sha256, first_final.evidence_sha256)
     self.assertEqual(restored_final.manifest_bytes, first_final.manifest_bytes)
 
-    restored.transition_onroad()
+    restored.transition_onroad(route_sha(1))
     self.assertTrue(restored.ingest(measured_sample(10.0, 1)))
     restored.transition_offroad()
     advanced = restored.finalize()
@@ -406,7 +416,7 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
   def test_partial_evidence_never_writes_candidate(self) -> None:
     coordinator = CalibrationLearningCoordinator(seed_profile())
-    coordinator.transition_onroad()
+    coordinator.transition_onroad(route_sha(0))
     for index in range(4):
       self.assertTrue(coordinator.ingest(measured_sample(0.0, index)))
     coordinator.transition_offroad()
@@ -427,7 +437,7 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
   def test_full_candidate_has_exact_identity_and_versioned_manifest(self) -> None:
     seed = seed_profile()
     coordinator = CalibrationLearningCoordinator(seed, candidate_provenance="coordinator integration test")
-    coordinator.transition_onroad()
+    coordinator.transition_onroad(route_sha(0))
     for node_index, speed in enumerate(seed.speed_nodes_mps):
       self.assertTrue(coordinator.ingest(measured_sample(speed, node_index * 2)))
       self.assertTrue(coordinator.ingest(measured_sample(speed, node_index * 2 + 1)))
@@ -443,8 +453,8 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
     manifest = json.loads(finalization.manifest_bytes)
     self.assertEqual(manifest["artifact_schema_version"], CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION)
-    self.assertEqual(manifest["artifact_schema_version"], 5)
-    self.assertEqual(manifest["evidence_schema_version"], 6)
+    self.assertEqual(manifest["artifact_schema_version"], 8)
+    self.assertEqual(manifest["evidence_schema_version"], 8)
     self.assertEqual(manifest["seed_profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
     self.assertEqual(manifest["seed_profile_schema_version"], 2)
     self.assertEqual(manifest["seed_profile_sha256"], hashlib.sha256(seed.to_json().encode()).hexdigest())
@@ -495,6 +505,7 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
       expected_runtime_vehicle_identity_sha256="1" * 64,
       expected_source_openpilot_commit="2" * 40,
       expected_opendbc_commit="3" * 40,
+      expected_panda_commit="4" * 40,
     )
     self.assertIs(read_result.diagnostic, ArtifactDiagnostic.ABSENT)
     self.assertIsNone(read_result.artifact)
@@ -512,6 +523,7 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
       expected_runtime_vehicle_identity_sha256="1" * 64,
       expected_source_openpilot_commit="2" * 40,
       expected_opendbc_commit="3" * 40,
+      expected_panda_commit="4" * 40,
       production_envelope_verified=True,
     )
     decision = activation.begin_engagement()
@@ -535,21 +547,22 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
 
 class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
-  def test_real_v6_report_is_manifest_compatible_and_restorable(self) -> None:
+  def test_real_v8_report_is_manifest_compatible_and_restorable(self) -> None:
     seed = seed_profile()
     first = CalibrationLearningCoordinator(seed).finalize()
     restored = CalibrationLearningCoordinator(seed, first.evidence_bytes).finalize()
     self.assertEqual(restored.evidence_bytes, first.evidence_bytes)
     self.assertEqual(restored.manifest_bytes, first.manifest_bytes)
     manifest = json.loads(first.manifest_bytes)
-    self.assertEqual(manifest["artifact_schema_version"], 5)
-    self.assertEqual(manifest["evidence_schema_version"], 6)
+    self.assertEqual(manifest["artifact_schema_version"], 8)
+    self.assertEqual(manifest["evidence_schema_version"], 8)
     self.assertEqual(manifest["seed_profile_schema_version"], 2)
     for report in manifest["node_reports"]:
       self.assertIn("moving_reasons", report)
       self.assertIn("moving_candidate_validation_rms", report)
       self.assertIn("breakaway_reasons", report)
       self.assertIn("breakaway_candidate_validation_rms", report)
+    self.assertEqual(manifest["interpolation_reports"], [])
 
 
 if __name__ == "__main__":

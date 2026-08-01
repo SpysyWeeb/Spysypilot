@@ -89,12 +89,17 @@ class Controls:
       opendbc_commit = get_commit(os.path.join(BASEDIR, "opendbc_repo"))
     except Exception:
       opendbc_commit = ""
+    try:
+      panda_commit = get_commit(os.path.join(BASEDIR, "panda"))
+    except Exception:
+      panda_commit = ""
     self.blatv2_live = construct_modular_live_controller(
       car_params=self.CP,
       car_interface=self.CI,
       params=self.params,
       source_openpilot_commit=source_openpilot_commit,
       opendbc_commit=opendbc_commit,
+      panda_commit=panda_commit,
     )
     self.lateral_maneuver_mode = self.params.get_bool(
       "LateralManeuverMode",

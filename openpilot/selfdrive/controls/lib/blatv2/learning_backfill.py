@@ -9,6 +9,7 @@ atomic CURRENT-pointer replacement.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -37,11 +38,6 @@ from openpilot.cereal.services import SERVICE_LIST
 from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationLearningFinalization,
 )
-from openpilot.selfdrive.controls.lib.blatv2.learning_frame import (
-  CanonicalSourceHistory,
-  maximum_source_age_ns,
-  measured_learning_frame,
-)
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
   BackfillProgressPhase,
   BackfillProgressPublisher,
@@ -60,19 +56,32 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   LearningArtifactPaths,
+  MeasuredLearningFrame,
   PersistentLearningRuntime,
+)
+from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
+  ControlsWitness,
+  DrivingEventLocator,
+  LateralManeuverPlanPublication,
+  LiveDelayPublication,
+  LiveTorqueParametersPublication,
+  ModelPublication,
+  RouteEvidenceArtifact,
+  RouteEvidenceError,
+  RouteEvidenceSourceIdentity,
+  RouteEvidenceStore,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   RuntimeVehicleBundle,
 )
 
 
-BACKFILL_LEDGER_SCHEMA_VERSION = 1
+BACKFILL_LEDGER_SCHEMA_VERSION = 2
 BACKFILL_PROVENANCE_SCHEMA_VERSION = 1
-BACKFILL_COMMIT_SCHEMA_VERSION = 1
+BACKFILL_COMMIT_SCHEMA_VERSION = 2
 BACKFILL_POINTER_SCHEMA_VERSION = 1
-NATIVE_EXTRACTOR_SCHEMA_VERSION = 1
-CANONICAL_JOIN_SCHEMA_VERSION = 2
+NATIVE_EXTRACTOR_SCHEMA_VERSION = 3
+CANONICAL_JOIN_SCHEMA_VERSION = 3
 MAXIMUM_EVENT_BYTES = 64 * 1024 * 1024
 MAXIMUM_EVENT_TRAVERSAL_WORDS = MAXIMUM_EVENT_BYTES // 8
 MAXIMUM_SELECTED_RECORDS_PER_SEGMENT = 100_000
@@ -116,12 +125,32 @@ _EVENT_WHICH = {
   "carParams": 67,
   "sentinel": 71,
   "carOutput": 125,
+  # Event::Which values are union discriminants, not Cap'n Proto field
+  # ordinals; the two deprecated union slots preceding these fields are not
+  # discriminants in the generated enum.
+  "modelV2": 73,
+  "liveTorqueParameters": 92,
+  "selfdriveState": 128,
+  "liveDelay": 144,
+  "lateralManeuverPlan": 148,
+  "drivingEvent": 151,
 }
 _SOURCE_SERVICES = (
   "carControl",
   "carState",
   "carOutput",
   "liveParameters",
+)
+_BEHAVIOR_CONTEXT_SERVICES = (
+  "modelV2",
+  "liveTorqueParameters",
+  "liveDelay",
+  "lateralManeuverPlan",
+  "drivingEvent",
+)
+_CANONICAL_WITNESS_SERVICES = (
+  "controlsState",
+  "selfdriveState",
 )
 _LEDGER_PROVENANCE_KEYS = {
   "canonical_join_schema_version",
@@ -459,6 +488,102 @@ class _DecodedExtractedEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class _RecordedCarState:
+  v_ego: float
+  steering_angle_deg: float
+  steering_rate_deg_s: float
+  steering_torque: float
+  steering_pressed: bool
+  standstill: bool
+  steer_fault_temporary: bool
+  steer_fault_permanent: bool
+  can_valid: bool
+  can_timeout: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedCarControl:
+  lateral_active: bool
+  request_torque: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedCarOutput:
+  applied_torque: float
+  torque_output_can_count: int
+  torque_output_can_valid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedLiveParameters:
+  valid: bool
+  angle_offset_valid: bool
+  steer_ratio_valid: bool
+  stiffness_factor_valid: bool
+  angle_offset_deg: float
+  steer_ratio: float
+  stiffness_factor: float
+  roll_rad: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedControlsState:
+  lateral_plan_mono_ns: int
+  measured_curvature: float
+  desired_curvature: float
+  modular_architecture: str
+  modular_selection: int
+  modular_artifact_sha256: str
+  modular_source_openpilot_commit: str
+  modular_opendbc_commit: str
+  modular_selection_bound: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedModel:
+  frame_id: int
+  timestamp_eof_ns: int
+  scalar_curvature: float
+  desired_curvature_time_s: float
+  plan_times_s: tuple[float, ...]
+  orientation_rate_z: tuple[float, ...]
+  velocity_x: tuple[float, ...]
+  native_grid_valid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedLiveTorqueParameters:
+  live_valid: bool
+  use_params: bool
+  version: int
+  lat_accel_factor: float
+  lat_accel_offset: float
+  friction: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedLiveDelay:
+  lateral_delay_s: float
+  status: str
+  version: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedLateralManeuverPlan:
+  desired_curvature: float
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedDrivingEvent:
+  event_id: str
+  occurred_mono_ns: int
+  analysis_window_before_s: float
+  analysis_window_after_s: float
+  event_type: str
+  severity: str
+
+
+@dataclass(frozen=True, slots=True)
 class RouteSegment:
   index: int
   path: Path
@@ -485,12 +610,39 @@ class RouteCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _TimedRouteRecord:
+  mono_ns: int
+  segment_index: int
+  ordinal: int
+  source_order: int
+  valid: bool
+  payload: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalControlJoin:
+  witness: _TimedRouteRecord
+  poll_mono_ns: int
+  car_state: _TimedRouteRecord
+  live_parameters: _TimedRouteRecord
+  car_output: _TimedRouteRecord
+  previous_car_output_mono_ns: int | None
+  car_control: _TimedRouteRecord | None
+  curvature_unresolved: bool
+  gap_from_previous: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedRoute:
   frames: tuple[Any, ...]
   controls_witness_count: int
   unresolved_witness_count: int
   gap_count: int
   provenance: dict[str, object]
+  route_evidence: Any | None = None
+  pre_poll_dropped_count: int = 0
+  behavior_eligible: bool = False
+  behavior_ineligible_reason: str = "shared_evidence_unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +655,10 @@ class ReplayResult:
   rejected_sample_count: int
   controls_witness_count: int
   unresolved_witness_count: int
+  route_evidence_sha256: str | None = None
+  route_evidence_model_publication_count: int = 0
+  route_evidence_control_witness_count: int = 0
+  route_evidence_event_locator_count: int = 0
 
   def ledger_entry(self) -> dict[str, object]:
     return {
@@ -514,6 +670,16 @@ class ReplayResult:
       "rejected_sample_count": self.rejected_sample_count,
       "route_counter": self.route.route_counter,
       "route_identity_sha256": self.route.display_identity,
+      "route_evidence_control_witness_count": (
+        self.route_evidence_control_witness_count
+      ),
+      "route_evidence_event_locator_count": (
+        self.route_evidence_event_locator_count
+      ),
+      "route_evidence_model_publication_count": (
+        self.route_evidence_model_publication_count
+      ),
+      "route_evidence_sha256": self.route_evidence_sha256,
       "route_name": self.route.route_name,
       "segments": [
         segment.to_ledger_dict()
@@ -545,6 +711,21 @@ class BackfillPublication:
 class BackfillRunResult:
   publication: BackfillPublication | None
   pending_logger_close: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorEvidenceCohortSelection:
+  """Newest complete, contiguous, exact-source behavior population."""
+
+  status: str
+  reason: str
+  blocking_route_name: str | None
+  source_identity_sha256: str | None
+  artifacts: tuple[RouteEvidenceArtifact, ...]
+
+  @property
+  def ready(self) -> bool:
+    return self.status == "ready"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1304,9 +1485,196 @@ def _validate_route_bundle(
   return _sha256(_canonical_json_bytes(projection))
 
 
-def _copy_message(message: Any) -> Any:
-  builder = getattr(message, "as_builder", None)
-  return builder() if callable(builder) else message
+def _copy_car_state(message: Any) -> _RecordedCarState:
+  return _RecordedCarState(
+    v_ego=float(message.vEgo),
+    steering_angle_deg=float(message.steeringAngleDeg),
+    steering_rate_deg_s=float(message.steeringRateDeg),
+    steering_torque=float(message.steeringTorque),
+    steering_pressed=bool(message.steeringPressed),
+    standstill=bool(message.standstill),
+    steer_fault_temporary=bool(message.steerFaultTemporary),
+    steer_fault_permanent=bool(message.steerFaultPermanent),
+    can_valid=bool(message.canValid),
+    can_timeout=bool(message.canTimeout),
+  )
+
+
+def _copy_car_control(message: Any) -> _RecordedCarControl:
+  return _RecordedCarControl(
+    lateral_active=bool(message.latActive),
+    request_torque=float(message.actuators.torque),
+  )
+
+
+def _copy_car_output(message: Any) -> _RecordedCarOutput:
+  raw_can_count = float(message.actuatorsOutput.torqueOutputCan)
+  can_count_valid = (
+    math.isfinite(raw_can_count)
+    and raw_can_count.is_integer()
+    and -(1 << 31) <= raw_can_count <= (1 << 31) - 1
+  )
+  return _RecordedCarOutput(
+    applied_torque=float(message.actuatorsOutput.torque),
+    torque_output_can_count=(int(raw_can_count) if can_count_valid else 0),
+    torque_output_can_valid=can_count_valid,
+  )
+
+
+def _copy_live_parameters(message: Any) -> _RecordedLiveParameters:
+  return _RecordedLiveParameters(
+    valid=bool(message.valid),
+    angle_offset_valid=bool(message.angleOffsetValid),
+    steer_ratio_valid=bool(message.steerRatioValid),
+    stiffness_factor_valid=bool(message.stiffnessFactorValid),
+    angle_offset_deg=float(message.angleOffsetDeg),
+    steer_ratio=float(message.steerRatio),
+    stiffness_factor=float(message.stiffnessFactor),
+    roll_rad=float(message.roll),
+  )
+
+
+def _copy_controls_state(message: Any) -> _RecordedControlsState:
+  artifact = ""
+  architecture = ""
+  selection = -1
+  source_commit = ""
+  opendbc_commit = ""
+  selection_bound = False
+  try:
+    lateral = message.lateralControlState
+    if lateral.which() == "torqueState":
+      torque_state = lateral.torqueState
+      architecture = str(torque_state.modularArchitecture)
+      selection = int(torque_state.modularSelection)
+      artifact = str(torque_state.modularArtifactHash)
+      source_commit = str(torque_state.modularSourceOpenpilotCommit)
+      opendbc_commit = str(torque_state.modularOpendbcCommit)
+      selection_bound = bool(torque_state.modularSelectionBound)
+  except Exception:
+    # Historical schemas have no modular telemetry.  They remain valid for
+    # physical calibration but cannot claim a verified behavior source.
+    pass
+  return _RecordedControlsState(
+    lateral_plan_mono_ns=int(message.lateralPlanMonoTime),
+    measured_curvature=float(message.curvature),
+    desired_curvature=float(message.desiredCurvature),
+    modular_architecture=architecture,
+    modular_selection=selection,
+    modular_artifact_sha256=artifact,
+    modular_source_openpilot_commit=source_commit,
+    modular_opendbc_commit=opendbc_commit,
+    modular_selection_bound=selection_bound,
+  )
+
+
+def _float_tuple(values: Any) -> tuple[float, ...]:
+  return tuple(float(value) for value in values)
+
+
+def _copy_model(message: Any) -> _RecordedModel:
+  plan_times = _float_tuple(message.orientationRate.t)
+  orientation_rate_z = _float_tuple(message.orientationRate.z)
+  velocity_times = _float_tuple(message.velocity.t)
+  velocity_x = _float_tuple(message.velocity.x)
+  native_grid_valid = (
+    bool(plan_times)
+    and plan_times == velocity_times
+    and len(plan_times) == len(orientation_rate_z) == len(velocity_x)
+    and all(math.isfinite(value) for value in (
+      *plan_times,
+      *orientation_rate_z,
+      *velocity_x,
+    ))
+    and all(
+      right > left
+      for left, right in zip(plan_times, plan_times[1:], strict=False)
+    )
+  )
+  return _RecordedModel(
+    frame_id=int(message.frameId),
+    timestamp_eof_ns=int(message.timestampEof),
+    scalar_curvature=float(message.action.desiredCurvature),
+    desired_curvature_time_s=float(
+      message.action.desiredCurvatureTime,
+    ),
+    plan_times_s=plan_times if native_grid_valid else (),
+    orientation_rate_z=(
+      orientation_rate_z if native_grid_valid else ()
+    ),
+    velocity_x=velocity_x if native_grid_valid else (),
+    native_grid_valid=native_grid_valid,
+  )
+
+
+def _copy_live_torque_parameters(
+  message: Any,
+) -> _RecordedLiveTorqueParameters:
+  use_filtered = bool(message.useParams)
+  return _RecordedLiveTorqueParameters(
+    live_valid=bool(message.liveValid),
+    use_params=use_filtered,
+    version=int(message.version),
+    lat_accel_factor=float(
+      message.latAccelFactorFiltered
+      if use_filtered
+      else message.latAccelFactorRaw
+    ),
+    lat_accel_offset=float(
+      message.latAccelOffsetFiltered
+      if use_filtered
+      else message.latAccelOffsetRaw
+    ),
+    friction=float(
+      message.frictionCoefficientFiltered
+      if use_filtered
+      else message.frictionCoefficientRaw
+    ),
+  )
+
+
+def _copy_live_delay(message: Any) -> _RecordedLiveDelay:
+  return _RecordedLiveDelay(
+    lateral_delay_s=float(message.lateralDelay),
+    status=str(message.status),
+    version=int(message.version),
+  )
+
+
+def _copy_lateral_maneuver_plan(
+  message: Any,
+) -> _RecordedLateralManeuverPlan:
+  return _RecordedLateralManeuverPlan(
+    desired_curvature=float(message.desiredCurvature),
+  )
+
+
+def _copy_driving_event(message: Any) -> _RecordedDrivingEvent:
+  return _RecordedDrivingEvent(
+    event_id=str(message.eventId),
+    occurred_mono_ns=int(message.occurredMonoTime),
+    analysis_window_before_s=float(message.analysisWindowBeforeS),
+    analysis_window_after_s=float(message.analysisWindowAfterS),
+    event_type=str(message.eventType),
+    severity=str(message.severity),
+  )
+
+
+def _copy_selected_payload(which: str, message: Any) -> Any:
+  copiers: dict[str, Callable[[Any], Any]] = {
+    "carState": _copy_car_state,
+    "carControl": _copy_car_control,
+    "carOutput": _copy_car_output,
+    "liveParameters": _copy_live_parameters,
+    "controlsState": _copy_controls_state,
+    "modelV2": _copy_model,
+    "liveTorqueParameters": _copy_live_torque_parameters,
+    "liveDelay": _copy_live_delay,
+    "lateralManeuverPlan": _copy_lateral_maneuver_plan,
+    "drivingEvent": _copy_driving_event,
+  }
+  copier = copiers.get(which)
+  return None if copier is None else copier(message)
 
 
 def _decode_extracted_event(
@@ -1341,8 +1709,15 @@ def _decode_extracted_event(
         )
       elif which == "carParams":
         payload = bytes(event.carParams.as_builder().to_bytes())
-      elif which in _SOURCE_SERVICES:
-        payload = _copy_message(getattr(event, which))
+      elif (
+        which in _SOURCE_SERVICES
+        or which in _BEHAVIOR_CONTEXT_SERVICES
+        or which in _CANONICAL_WITNESS_SERVICES
+      ):
+        payload = _copy_selected_payload(
+          which,
+          getattr(event, which),
+        )
       else:
         payload = None
       return _DecodedExtractedEvent(
@@ -1358,6 +1733,866 @@ def _decode_extracted_event(
       "event_decode_failed",
       "bounded route event could not be decoded",
     ) from exc
+
+
+def _float32_bytes(value: float) -> bytes:
+  return struct.pack("<f", float(value))
+
+
+def _evaluate_recorded_curvature(
+  vehicle_model: Any,
+  car_state: _RecordedCarState,
+  live_parameters: _RecordedLiveParameters,
+) -> float:
+  vehicle_model.update_params(
+    max(live_parameters.stiffness_factor, 0.1),
+    max(live_parameters.steer_ratio, 0.1),
+  )
+  return -float(vehicle_model.calc_curvature(
+    math.radians(
+      car_state.steering_angle_deg
+      - live_parameters.angle_offset_deg
+    ),
+    car_state.v_ego,
+    live_parameters.roll_rad,
+  ))
+
+
+def _latest_record_at_or_before(
+  records: tuple[_TimedRouteRecord, ...],
+  timestamps: tuple[int, ...],
+  mono_ns: int,
+) -> _TimedRouteRecord | None:
+  index = bisect_right(timestamps, mono_ns) - 1
+  return None if index < 0 else records[index]
+
+
+def _pair_same_cycle_car_controls(
+  controls: tuple[_TimedRouteRecord, ...],
+  car_controls: tuple[_TimedRouteRecord, ...],
+) -> dict[int, _TimedRouteRecord]:
+  """Pair the first unmatched command in each controlsState cycle.
+
+  controlsd publishes ``controlsState`` before ``carControl``.  Timestamp-only
+  latest-before joining therefore selects the preceding cycle.  This bounded
+  forward pairing reconstructs the actual cycle without allowing a command
+  to be reused by two witnesses.
+  """
+  paired: dict[int, _TimedRouteRecord] = {}
+  command_index = 0
+  for index, witness in enumerate(controls):
+    next_witness_ns = (
+      controls[index + 1].mono_ns
+      if index + 1 < len(controls)
+      else witness.mono_ns + MAXIMUM_CONTROL_GAP_NS + 1
+    )
+    while (
+      command_index < len(car_controls)
+      and car_controls[command_index].mono_ns < witness.mono_ns
+    ):
+      command_index += 1
+    if command_index >= len(car_controls):
+      continue
+    candidate = car_controls[command_index]
+    if (
+      candidate.mono_ns < next_witness_ns
+      and candidate.mono_ns - witness.mono_ns
+      <= MAXIMUM_CONTROL_GAP_NS
+    ):
+      paired[witness.source_order] = candidate
+      command_index += 1
+  return paired
+
+
+def _build_canonical_control_joins(
+  *,
+  route_name: str,
+  controls: tuple[_TimedRouteRecord, ...],
+  polls: tuple[_TimedRouteRecord, ...],
+  car_states: tuple[_TimedRouteRecord, ...],
+  live_parameters: tuple[_TimedRouteRecord, ...],
+  car_outputs: tuple[_TimedRouteRecord, ...],
+  car_controls: tuple[_TimedRouteRecord, ...],
+  vehicle_model: Any,
+) -> tuple[tuple[_CanonicalControlJoin, ...], tuple[int, ...]]:
+  """Freeze the controller-independent SubMaster input race once.
+
+  ``controlsState.curvature`` is a Float32 selection oracle.  It is computed
+  upstream of every controller candidate, so matching its exact Float32 bits
+  reconstructs the recording's source scheduling without tailoring inputs to
+  the learner or a replayed controller.
+  """
+  if not controls:
+    raise RouteRejected(
+      "missing_controls_witness",
+      "route contains no controlsState witnesses",
+    )
+  if not polls:
+    raise RouteRejected(
+      "missing_selfdrive_poll",
+      "route contains no selfdriveState poll witnesses",
+    )
+  if not car_states or not car_outputs:
+    raise RouteRejected(
+      "missing_measurement_service",
+      "route lacks carState or carOutput measurements",
+    )
+
+  ordered_controls = tuple(sorted(
+    controls,
+    key=lambda record: (record.mono_ns, record.source_order),
+  ))
+  ordered_polls = tuple(sorted(
+    polls,
+    key=lambda record: (record.mono_ns, record.source_order),
+  ))
+  ordered_states = tuple(sorted(
+    car_states,
+    key=lambda record: (record.mono_ns, record.source_order),
+  ))
+  ordered_parameters = tuple(sorted(
+    live_parameters,
+    key=lambda record: (record.mono_ns, record.source_order),
+  ))
+  ordered_outputs = tuple(sorted(
+    car_outputs,
+    key=lambda record: (record.mono_ns, record.source_order),
+  ))
+  ordered_commands = tuple(sorted(
+    car_controls,
+    key=lambda record: (record.mono_ns, record.source_order),
+  ))
+  poll_times = tuple(record.mono_ns for record in ordered_polls)
+  state_times = tuple(record.mono_ns for record in ordered_states)
+  parameter_times = tuple(record.mono_ns for record in ordered_parameters)
+  output_times = tuple(record.mono_ns for record in ordered_outputs)
+
+  first_poll = poll_times[0]
+  first_scoreable = 0
+  while (
+    first_scoreable < len(ordered_controls)
+    and ordered_controls[first_scoreable].mono_ns < first_poll
+  ):
+    first_scoreable += 1
+  dropped = tuple(
+    record.mono_ns for record in ordered_controls[:first_scoreable]
+  )
+  scoreable = ordered_controls[first_scoreable:]
+  if not scoreable:
+    raise RouteRejected(
+      "missing_controls_witness",
+      "all controlsState witnesses precede the first selfdriveState poll",
+    )
+  paired_commands = _pair_same_cycle_car_controls(
+    scoreable,
+    ordered_commands,
+  )
+  default_parameters = _TimedRouteRecord(
+    mono_ns=-1,
+    segment_index=0,
+    ordinal=0,
+    source_order=-1,
+    valid=True,
+    payload=_RecordedLiveParameters(
+      valid=False,
+      angle_offset_valid=False,
+      steer_ratio_valid=False,
+      stiffness_factor_valid=False,
+      angle_offset_deg=0.0,
+      steer_ratio=0.0,
+      stiffness_factor=0.0,
+      roll_rad=0.0,
+    ),
+  )
+
+  joins: list[_CanonicalControlJoin] = []
+  previous_witness_ns: int | None = None
+  for witness in scoreable:
+    poll_index = bisect_right(poll_times, witness.mono_ns) - 1
+    if poll_index < 0:
+      raise AssertionError("pre-poll controls prefix was not removed")
+    poll_ns = poll_times[poll_index]
+    baseline_state = _latest_record_at_or_before(
+      ordered_states,
+      state_times,
+      poll_ns,
+    )
+    if baseline_state is None:
+      raise RouteRejected(
+        "measurement_race_unreconstructable",
+        f"{route_name}: selfdriveState poll precedes the first carState",
+      )
+    baseline_parameters = (
+      _latest_record_at_or_before(
+        ordered_parameters,
+        parameter_times,
+        poll_ns,
+      )
+      or default_parameters
+    )
+    car_output = _latest_record_at_or_before(
+      ordered_outputs,
+      output_times,
+      poll_ns,
+    )
+    if car_output is None:
+      raise RouteRejected(
+        "measurement_race_unreconstructable",
+        f"{route_name}: selfdriveState poll precedes the first carOutput",
+      )
+    output_index = bisect_right(output_times, car_output.mono_ns) - 1
+    previous_output_ns = (
+      None
+      if output_index <= 0
+      else ordered_outputs[output_index - 1].mono_ns
+    )
+
+    state_left = bisect_right(state_times, poll_ns)
+    state_right = bisect_right(state_times, witness.mono_ns)
+    parameter_left = bisect_right(parameter_times, poll_ns)
+    parameter_right = bisect_right(
+      parameter_times,
+      witness.mono_ns,
+    )
+    state_candidates = (
+      baseline_state,
+      *ordered_states[state_left:state_right],
+    )
+    parameter_candidates = (
+      baseline_parameters,
+      *ordered_parameters[parameter_left:parameter_right],
+    )
+    controls_payload = witness.payload
+    if not isinstance(controls_payload, _RecordedControlsState):
+      raise RouteRejected(
+        "measurement_race_unreconstructable",
+        "controlsState payload has an invalid compact type",
+      )
+    logged_bits = _float32_bytes(controls_payload.measured_curvature)
+    matches: list[tuple[object, ...]] = []
+    for state_record in state_candidates:
+      state = state_record.payload
+      if not isinstance(state, _RecordedCarState):
+        raise RouteRejected(
+          "measurement_race_unreconstructable",
+          "carState compact payload has an invalid type",
+        )
+      for parameter_record in parameter_candidates:
+        parameters = parameter_record.payload
+        if not isinstance(parameters, _RecordedLiveParameters):
+          raise RouteRejected(
+            "measurement_race_unreconstructable",
+            "liveParameters compact payload has an invalid type",
+          )
+        calculated = _evaluate_recorded_curvature(
+          vehicle_model,
+          state,
+          parameters,
+        )
+        if _float32_bytes(calculated) != logged_bits:
+          continue
+        baseline = (
+          state_record is baseline_state
+          and parameter_record is baseline_parameters
+        )
+        matches.append((
+          abs(calculated - controls_payload.measured_curvature),
+          0 if baseline else 1,
+          state_record.mono_ns,
+          parameter_record.mono_ns,
+          state_record.source_order,
+          parameter_record.source_order,
+          state_record,
+          parameter_record,
+        ))
+    unresolved = not matches
+    if unresolved:
+      selected_state = baseline_state
+      selected_parameters = baseline_parameters
+    else:
+      selected = min(matches, key=lambda item: item[:6])
+      selected_state = selected[6]
+      selected_parameters = selected[7]
+    joins.append(_CanonicalControlJoin(
+      witness=witness,
+      poll_mono_ns=poll_ns,
+      car_state=selected_state,
+      live_parameters=selected_parameters,
+      car_output=car_output,
+      previous_car_output_mono_ns=previous_output_ns,
+      car_control=paired_commands.get(witness.source_order),
+      curvature_unresolved=unresolved,
+      gap_from_previous=(
+        previous_witness_ns is not None
+        and witness.mono_ns - previous_witness_ns
+        > MAXIMUM_CONTROL_GAP_NS
+      ),
+    ))
+    previous_witness_ns = witness.mono_ns
+  return tuple(joins), dropped
+
+
+def _measured_frame_from_join(
+  join: _CanonicalControlJoin,
+) -> MeasuredLearningFrame:
+  car_state = join.car_state.payload
+  live_parameters = join.live_parameters.payload
+  car_output = join.car_output.payload
+  car_control = (
+    None if join.car_control is None else join.car_control.payload
+  )
+  if (
+    not isinstance(car_state, _RecordedCarState)
+    or not isinstance(live_parameters, _RecordedLiveParameters)
+    or not isinstance(car_output, _RecordedCarOutput)
+    or (
+      car_control is not None
+      and not isinstance(car_control, _RecordedCarControl)
+    )
+  ):
+    raise RouteRejected(
+      "measured_frame_invalid",
+      "canonical join contains an invalid compact payload",
+    )
+  applied_effective_ns = (
+    0
+    if join.previous_car_output_mono_ns is None
+    else join.previous_car_output_mono_ns
+  )
+  source_valid = (
+    join.witness.valid
+    and join.car_state.valid
+    and join.live_parameters.valid
+    and join.car_output.valid
+    and join.car_control is not None
+    and join.car_control.valid
+  )
+  return MeasuredLearningFrame(
+    sample_mono_ns=join.witness.mono_ns,
+    response_mono_ns=join.car_state.mono_ns,
+    applied_report_mono_ns=join.car_output.mono_ns,
+    applied_effective_mono_ns=applied_effective_ns,
+    speed_mps=car_state.v_ego,
+    steering_angle_deg=car_state.steering_angle_deg,
+    steering_rate_deg_s=car_state.steering_rate_deg_s,
+    steering_torque=car_state.steering_torque,
+    steering_pressed=car_state.steering_pressed,
+    standstill=car_state.standstill,
+    steer_fault_temporary=car_state.steer_fault_temporary,
+    steer_fault_permanent=car_state.steer_fault_permanent,
+    can_valid=car_state.can_valid,
+    can_timeout=car_state.can_timeout,
+    applied_torque=car_output.applied_torque,
+    lateral_active=(
+      False if car_control is None else car_control.lateral_active
+    ),
+    live_parameters_valid=live_parameters.valid,
+    angle_offset_valid=live_parameters.angle_offset_valid,
+    steer_ratio_valid=live_parameters.steer_ratio_valid,
+    stiffness_factor_valid=live_parameters.stiffness_factor_valid,
+    angle_offset_deg=live_parameters.angle_offset_deg,
+    steer_ratio=live_parameters.steer_ratio,
+    stiffness_factor=live_parameters.stiffness_factor,
+    roll_rad=live_parameters.roll_rad,
+    inputs_valid=(
+      source_valid
+      and not join.curvature_unresolved
+      and 0 < join.car_state.mono_ns <= join.witness.mono_ns
+      and 0 < join.car_output.mono_ns <= join.poll_mono_ns
+      and (
+        applied_effective_ns == 0
+        or 0 < applied_effective_ns < join.car_output.mono_ns
+      )
+    ),
+  )
+
+
+def _exact_model_indices(
+  joins: tuple[_CanonicalControlJoin, ...],
+  model_records: tuple[_TimedRouteRecord, ...],
+) -> tuple[int | None, ...]:
+  """Resolve only the model publication named by lateralPlanMonoTime."""
+  by_publication: dict[int, int | None] = {}
+  for index, record in enumerate(model_records):
+    if record.mono_ns in by_publication:
+      by_publication[record.mono_ns] = None
+    else:
+      by_publication[record.mono_ns] = index
+  indices: list[int | None] = []
+  for join in joins:
+    controls = join.witness.payload
+    if not isinstance(controls, _RecordedControlsState):
+      indices.append(None)
+      continue
+    linked = by_publication.get(controls.lateral_plan_mono_ns)
+    indices.append(linked if isinstance(linked, int) else None)
+  return tuple(indices)
+
+
+def _behavior_controller_source(
+  joins: tuple[_CanonicalControlJoin, ...],
+  *,
+  source_superproject_commit: str,
+  source_opendbc_commit: str,
+  source_panda_commit: str,
+) -> tuple[bool, str, str, str]:
+  """Bind all active behavior frames to one independently verifiable source."""
+  source_payloads: set[bytes] = set()
+  active_count = 0
+  for join in joins:
+    command = None if join.car_control is None else join.car_control.payload
+    if (
+      not isinstance(command, _RecordedCarControl)
+      or not command.lateral_active
+    ):
+      continue
+    active_count += 1
+    controls = join.witness.payload
+    if not isinstance(controls, _RecordedControlsState):
+      return False, "invalid_controls_source", "0" * 64, "ineligible"
+    if controls.modular_selection == 0:
+      if not controls.modular_architecture:
+        return False, "unverified_stock_composition", "0" * 64, "ineligible"
+      payload = _canonical_json_bytes({
+        "architecture": controls.modular_architecture,
+        "kind": "stock_canonical_composition",
+        "opendbc_commit": source_opendbc_commit,
+        "panda_commit": source_panda_commit,
+        "superproject_commit": source_superproject_commit,
+      })
+    elif controls.modular_selection == 1:
+      if (
+        not controls.modular_selection_bound
+        or _SHA256_RE.fullmatch(
+          controls.modular_artifact_sha256,
+        ) is None
+        or controls.modular_source_openpilot_commit
+        != source_superproject_commit
+        or controls.modular_opendbc_commit != source_opendbc_commit
+      ):
+        return False, "unverified_modular_artifact", "0" * 64, "ineligible"
+      payload = _canonical_json_bytes({
+        "artifact_sha256": controls.modular_artifact_sha256,
+        "kind": "verified_modular_artifact",
+        "opendbc_commit": source_opendbc_commit,
+        "panda_commit": source_panda_commit,
+        "superproject_commit": source_superproject_commit,
+      })
+    else:
+      return False, "unverified_controller_source", "0" * 64, "ineligible"
+    source_payloads.add(payload)
+  if active_count == 0:
+    return False, "no_active_lateral_frames", "0" * 64, "ineligible"
+  if len(source_payloads) != 1:
+    return False, "mixed_controller_sources", "0" * 64, "ineligible"
+  payload = source_payloads.pop()
+  source_kind = (
+    "modular_artifact"
+    if b'"kind":"verified_modular_artifact"' in payload
+    else "stock_canonical"
+  )
+  return True, "eligible", _sha256(payload), source_kind
+
+
+def _latest_sparse_indices(
+  joins: tuple[_CanonicalControlJoin, ...],
+  records: tuple[_TimedRouteRecord, ...],
+) -> tuple[int | None, ...]:
+  """Return the last publication owned by each reconstructed poll cycle."""
+  timestamps = tuple(record.mono_ns for record in records)
+  return tuple(
+    (index if (index := bisect_right(timestamps, join.poll_mono_ns) - 1) >= 0 else None)
+    for join in joins
+  )
+
+
+def _reconstruct_live_torque_health(
+  *,
+  poll_mono_ns: int,
+  publication_index: int | None,
+  records: tuple[_TimedRouteRecord, ...],
+) -> tuple[bool, bool]:
+  """Conservatively prove witness-time SubMaster ``all_checks``.
+
+  controlsd receives this 4 Hz non-polled service on the canonical 100 Hz
+  poll.  When every observed publication interval is comfortably inside the
+  FrequencyTracker band, its result is invariant to one-cycle receive jitter.
+  Boundary cases remain explicitly inexact; they are never guessed.
+  """
+  if publication_index is None:
+    return False, True  # unseen static-frequency service is exactly unhealthy
+  latest = records[publication_index]
+  if not latest.valid:
+    return False, True  # all_valid is false regardless of alive/frequency
+  if publication_index == 0:
+    return False, True  # FrequencyTracker has no interval yet
+  nominal_poll_jitter_ns = MAXIMUM_CONTROL_GAP_NS
+  alive_limit_ns = int(10e9 / SERVICE_LIST["liveTorqueParameters"].frequency)
+  age_ns = poll_mono_ns - latest.mono_ns
+  if age_ns < 0:
+    return False, False
+  if age_ns >= alive_limit_ns + nominal_poll_jitter_ns:
+    return False, True
+  if age_ns >= alive_limit_ns - nominal_poll_jitter_ns:
+    return False, False
+  # FrequencyTracker's 4 Hz acceptable range is 3.2..4.8 Hz.  Requiring each
+  # source interval to stay inside the band after +/- one poll proves both its
+  # full and recent moving averages valid without reconstructing wall time.
+  minimum_dt_ns = int(1e9 / (4.8)) + 2 * nominal_poll_jitter_ns
+  maximum_dt_ns = int(1e9 / (3.2)) - 2 * nominal_poll_jitter_ns
+  intervals = (
+    records[index].mono_ns - records[index - 1].mono_ns
+    for index in range(1, publication_index + 1)
+  )
+  if all(minimum_dt_ns <= value <= maximum_dt_ns for value in intervals):
+    return True, True
+  return False, False
+
+
+def _active_witness_missing_exact_model_link(
+  joins: tuple[_CanonicalControlJoin, ...],
+  model_indices: tuple[int | None, ...],
+) -> bool:
+  """Return whether behavior replay lacks a model link while lateral is live.
+
+  Missing model publications before lateral activation are valid startup
+  context and remain in the shared control plane.  Once lateral is active,
+  however, the exact ``lateralPlanMonoTime`` publication is authority data:
+  synthesizing or carrying a nearby plan would make replay non-canonical.
+  """
+  if len(joins) != len(model_indices):
+    raise ValueError("model-link population does not match controls witnesses")
+  return any(
+    model_indices[index] is None
+    and isinstance(join.car_control.payload, _RecordedCarControl)
+    and join.car_control.payload.lateral_active
+    for index, join in enumerate(joins)
+    if join.car_control is not None
+  )
+
+
+def _route_evidence_artifact(
+  *,
+  route: RouteCandidate,
+  route_time_origin_mono_ns: int,
+  route_car_params_bytes: bytes,
+  route_bundle: RuntimeVehicleBundle,
+  route_descriptor: BuildDescriptor,
+  route_records: Mapping[str, list[_TimedRouteRecord]],
+  joins: tuple[_CanonicalControlJoin, ...],
+  frames: tuple[MeasuredLearningFrame, ...],
+  pre_poll_dropped: tuple[int, ...],
+  gap_count: int,
+  provenance: Mapping[str, object],
+) -> RouteEvidenceArtifact:
+  """Encode the one shared physical/behavior preparation result."""
+  from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
+    _encode_frame,
+  )
+
+  models_raw = tuple(sorted(
+    route_records["modelV2"],
+    key=lambda record: (record.mono_ns, record.segment_index, record.ordinal),
+  ))
+  torque_raw = tuple(sorted(
+    route_records["liveTorqueParameters"],
+    key=lambda record: (record.mono_ns, record.segment_index, record.ordinal),
+  ))
+  delay_raw = tuple(sorted(
+    route_records["liveDelay"],
+    key=lambda record: (record.mono_ns, record.segment_index, record.ordinal),
+  ))
+  maneuver_raw = tuple(sorted(
+    route_records["lateralManeuverPlan"],
+    key=lambda record: (record.mono_ns, record.segment_index, record.ordinal),
+  ))
+  model_indices = _exact_model_indices(joins, models_raw)
+  torque_indices = _latest_sparse_indices(joins, torque_raw)
+  delay_indices = _latest_sparse_indices(joins, delay_raw)
+  maneuver_indices = _latest_sparse_indices(joins, maneuver_raw)
+  torque_health = tuple(
+    _reconstruct_live_torque_health(
+      poll_mono_ns=join.poll_mono_ns,
+      publication_index=torque_indices[index],
+      records=torque_raw,
+    )
+    for index, join in enumerate(joins)
+  )
+
+  models = tuple(
+    ModelPublication(
+      segment_index=record.segment_index,
+      ordinal=record.ordinal,
+      mono_time_ns=record.mono_ns,
+      frame_id=payload.frame_id,
+      timestamp_eof_ns=payload.timestamp_eof_ns,
+      scalar_curvature=payload.scalar_curvature,
+      desired_curvature_time_s=payload.desired_curvature_time_s,
+      plan_times=payload.plan_times_s,
+      orientation_rate_z=payload.orientation_rate_z,
+      velocity_x=payload.velocity_x,
+      message_valid=record.valid,
+      native_grid_valid=payload.native_grid_valid,
+    )
+    for record in models_raw
+    if isinstance((payload := record.payload), _RecordedModel)
+  )
+  if len(models) != len(models_raw):
+    raise RouteRejected(
+      "behavior_context_invalid",
+      "model behavior plane contains an invalid compact payload",
+    )
+  torque = tuple(
+    LiveTorqueParametersPublication(
+      segment_index=record.segment_index,
+      ordinal=record.ordinal,
+      mono_time_ns=record.mono_ns,
+      lat_accel_factor=payload.lat_accel_factor,
+      lat_accel_offset=payload.lat_accel_offset,
+      friction=payload.friction,
+      version=payload.version,
+      message_valid=record.valid,
+      live_valid=payload.live_valid,
+      use_params=payload.use_params,
+    )
+    for record in torque_raw
+    if isinstance((payload := record.payload), _RecordedLiveTorqueParameters)
+  )
+  delays = tuple(
+    LiveDelayPublication(
+      segment_index=record.segment_index,
+      ordinal=record.ordinal,
+      mono_time_ns=record.mono_ns,
+      lateral_delay_s=payload.lateral_delay_s,
+      version=payload.version,
+      message_valid=record.valid,
+      status=payload.status,
+    )
+    for record in delay_raw
+    if isinstance((payload := record.payload), _RecordedLiveDelay)
+  )
+  maneuvers = tuple(
+    LateralManeuverPlanPublication(
+      segment_index=record.segment_index,
+      ordinal=record.ordinal,
+      mono_time_ns=record.mono_ns,
+      desired_curvature=payload.desired_curvature,
+      message_valid=record.valid,
+    )
+    for record in maneuver_raw
+    if isinstance((payload := record.payload), _RecordedLateralManeuverPlan)
+  )
+  if len(torque) != len(torque_raw) or len(delays) != len(delay_raw) or len(maneuvers) != len(maneuver_raw):
+    raise RouteRejected(
+      "behavior_context_invalid",
+      "sparse behavior plane contains an invalid compact payload",
+    )
+
+  source_eligible, source_reason, source_hash, source_kind = (
+    _behavior_controller_source(
+      joins,
+      source_superproject_commit=route_descriptor.superproject_commit,
+      source_opendbc_commit=route_descriptor.opendbc_commit,
+      source_panda_commit=route_descriptor.panda_commit,
+    )
+  )
+  model_failure_count = sum(index is None for index in model_indices)
+  active_exact_count_failure = any(
+    isinstance(join.car_control.payload, _RecordedCarControl)
+    and join.car_control.payload.lateral_active
+    and (
+      not isinstance(join.car_output.payload, _RecordedCarOutput)
+      or not join.car_output.payload.torque_output_can_valid
+    )
+    for join in joins
+    if join.car_control is not None
+  )
+  behavior_eligible = source_eligible
+  behavior_reason = source_reason
+  if behavior_eligible and _active_witness_missing_exact_model_link(
+    joins,
+    model_indices,
+  ):
+    behavior_eligible = False
+    behavior_reason = "exact_model_link_missing"
+  elif behavior_eligible and not maneuver_raw:
+    behavior_eligible = False
+    behavior_reason = "lateral_maneuver_plan_missing"
+  elif behavior_eligible and active_exact_count_failure:
+    behavior_eligible = False
+    behavior_reason = "exact_applied_can_count_missing"
+  elif behavior_eligible and source_kind == "stock_canonical" and any(
+    isinstance(join.car_control.payload, _RecordedCarControl)
+    and join.car_control.payload.lateral_active
+    and not torque_health[index][1]
+    for index, join in enumerate(joins)
+    if join.car_control is not None
+  ):
+    behavior_eligible = False
+    behavior_reason = "live_torque_submaster_health_unreconstructable"
+
+  event_by_id: dict[str, DrivingEventLocator] = {}
+  event_conflict = False
+  for record in sorted(
+    route_records["drivingEvent"],
+    key=lambda item: (item.mono_ns, item.segment_index, item.ordinal),
+  ):
+    payload = record.payload
+    if not isinstance(payload, _RecordedDrivingEvent) or not payload.event_id:
+      event_conflict = True
+      continue
+    locator = DrivingEventLocator(
+      segment_index=record.segment_index,
+      ordinal=record.ordinal,
+      publication_mono_time_ns=record.mono_ns,
+      occurred_mono_time_ns=payload.occurred_mono_ns,
+      analysis_window_before_s=payload.analysis_window_before_s,
+      analysis_window_after_s=payload.analysis_window_after_s,
+      event_id=payload.event_id,
+      event_type=payload.event_type,
+      severity=payload.severity,
+      message_valid=record.valid,
+    )
+    existing = event_by_id.get(payload.event_id)
+    if existing is None:
+      event_by_id[payload.event_id] = locator
+    elif existing != locator:
+      event_conflict = True
+  if behavior_eligible and event_conflict:
+    behavior_eligible = False
+    behavior_reason = "driving_event_identity_conflict"
+
+  controls: list[ControlsWitness] = []
+  previous_active = False
+  previous_intervening = False
+  for index, join in enumerate(joins):
+    state = join.car_state.payload
+    output = join.car_output.payload
+    control = None if join.car_control is None else join.car_control.payload
+    controls_state = join.witness.payload
+    if (
+      not isinstance(state, _RecordedCarState)
+      or not isinstance(output, _RecordedCarOutput)
+      or not isinstance(controls_state, _RecordedControlsState)
+      or (control is not None and not isinstance(control, _RecordedCarControl))
+    ):
+      raise RouteRejected(
+        "behavior_context_invalid",
+        "control witness contains an invalid compact payload",
+      )
+    active = control is not None and control.lateral_active
+    intervening = active and state.steering_pressed
+    observed_onset = active and intervening and previous_active and not previous_intervening
+    uncertain_onset = intervening and (
+      not previous_active or join.gap_from_previous
+    )
+    model_index = model_indices[index]
+    model_alive = (
+      model_index is not None
+      and models_raw[model_index].mono_ns <= join.witness.mono_ns
+      and join.witness.mono_ns - models_raw[model_index].mono_ns
+      < int(10e9 / SERVICE_LIST["modelV2"].frequency)
+    )
+    raw_request = 0.0 if control is None else control.request_torque
+    controls.append(ControlsWitness(
+      segment_index=join.witness.segment_index,
+      ordinal=join.witness.ordinal,
+      mono_time_ns=join.witness.mono_ns,
+      physical_record_index=index,
+      model_publication_index=(-1 if model_index is None else model_index),
+      live_torque_parameters_index=(-1 if torque_indices[index] is None else torque_indices[index]),
+      live_delay_index=(-1 if delay_indices[index] is None else delay_indices[index]),
+      lateral_maneuver_plan_index=(-1 if maneuver_indices[index] is None else maneuver_indices[index]),
+      poll_mono_time_ns=join.poll_mono_ns,
+      state_sample_mono_ns=join.car_state.mono_ns,
+      live_parameters_mono_ns=join.live_parameters.mono_ns,
+      car_output_report_mono_ns=join.car_output.mono_ns,
+      car_output_effective_mono_ns=(0 if join.previous_car_output_mono_ns is None else join.previous_car_output_mono_ns),
+      car_control_mono_ns=(-1 if join.car_control is None else join.car_control.mono_ns),
+      raw_request_torque=raw_request,
+      measured_curvature=controls_state.measured_curvature,
+      desired_curvature=controls_state.desired_curvature,
+      envelope_headroom=max(0.0, min(1.0, 1.0 - abs(raw_request))),
+      torque_output_can_count=output.torque_output_can_count,
+      message_valid=join.witness.valid,
+      model_message_alive=model_alive,
+      model_link_valid=model_index is not None,
+      inputs_valid=frames[index].inputs_valid,
+      lateral_active=active,
+      driver_intervening=intervening,
+      steer_fault=state.steer_fault_temporary or state.steer_fault_permanent,
+      intervention_onset=observed_onset,
+      intervention_onset_uncertain=uncertain_onset,
+      race_unresolved=join.curvature_unresolved,
+      gap_from_previous=join.gap_from_previous,
+      car_control_paired=join.car_control is not None,
+      torque_output_can_valid=output.torque_output_can_valid,
+      maneuver_plan_available=maneuver_indices[index] is not None,
+      live_torque_parameters_available=torque_indices[index] is not None,
+      live_delay_available=delay_indices[index] is not None,
+      live_torque_parameters_checks_passed=torque_health[index][0],
+      live_torque_parameters_health_exact=torque_health[index][1],
+    ))
+    previous_active = active
+    previous_intervening = intervening
+
+  cache_payload = {
+    "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
+    "extractor_schema_version": NATIVE_EXTRACTOR_SCHEMA_VERSION,
+    "log_schema_blob": route_descriptor.log_schema_blob,
+    "opendbc_commit": route_descriptor.opendbc_commit,
+    "route_segments": [
+      {"index": segment.index, "sha256": segment.sha256, "size_bytes": segment.size_bytes}
+      for segment in route.segments
+    ],
+    "runtime_bundle_sha256": _sha256(route_bundle.to_json().encode()),
+    "superproject_commit": route_descriptor.superproject_commit,
+  }
+  source = RouteEvidenceSourceIdentity(
+    route_id=route.route_name,
+    route_time_origin_mono_ns=route_time_origin_mono_ns,
+    route_segment_sha256=tuple(segment.sha256 for segment in route.segments),
+    route_segment_size_bytes=tuple(segment.size_bytes for segment in route.segments),
+    source_superproject_commit=route_descriptor.superproject_commit,
+    source_opendbc_commit=route_descriptor.opendbc_commit,
+    source_panda_commit=route_descriptor.panda_commit,
+    controller_source_kind=(source_kind if behavior_eligible else "ineligible"),
+    controller_artifact_sha256=source_hash,
+    behavior_eligible=behavior_eligible,
+    behavior_ineligible_reason=behavior_reason,
+    vehicle_identity=route_bundle.vehicle_identity,
+    runtime_identity=_sha256(route_bundle.to_json().encode()),
+    schema_versions={
+      "canonical_join": CANONICAL_JOIN_SCHEMA_VERSION,
+      "extractor": NATIVE_EXTRACTOR_SCHEMA_VERSION,
+      "route_evidence": 2,
+      "live_torque_health_reconstruction": 1,
+    },
+    preparation_provenance=dict(provenance),
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_record_count=len(frames),
+    preparation_cache_key=_sha256(_canonical_json_bytes(cache_payload)),
+    controls_witness_count=len(joins) + len(pre_poll_dropped),
+    unresolved_witness_count=(
+      sum(join.curvature_unresolved or join.car_control is None for join in joins)
+      + len(pre_poll_dropped)
+    ),
+    gap_count=gap_count,
+    model_link_failure_count=model_failure_count,
+    pre_poll_dropped_timestamps_ns=pre_poll_dropped,
+  )
+  physical = b"".join(_encode_frame(frame) for frame in frames)
+  return RouteEvidenceArtifact(
+    source,
+    route_car_params_bytes,
+    physical,
+    models,
+    tuple(controls),
+    torque,
+    delays,
+    maneuvers,
+    tuple(event_by_id.values()),
+  )
 
 
 def _prepare_route_with_extractor(
@@ -1380,23 +2615,25 @@ def _prepare_route_with_extractor(
   segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
 ) -> PreparedRoute:
   """Validate one complete route before exposing any frame to the learner."""
-  all_frames = []
-  histories = {
-    service: CanonicalSourceHistory()
-    for service in _SOURCE_SERVICES
+  route_records: dict[str, list[_TimedRouteRecord]] = {
+    service: []
+    for service in (
+      *_SOURCE_SERVICES,
+      *_BEHAVIOR_CONTEXT_SERVICES,
+      *_CANONICAL_WITNESS_SERVICES,
+    )
   }
   first_source_time: dict[str, int] = {}
-  unresolved_times: list[int] = []
-  control_times: list[int] = []
-  controls_count = 0
   decoded_controls_count = 0
   route_car_params_bytes: bytes | None = None
   route_car_params: Any | None = None
   route_descriptor: BuildDescriptor | None = None
   route_init_identity: tuple[object, ...] | None = None
+  route_time_origin_mono_ns: int | None = None
   physical_compatibility_sha256: str | None = None
   last_service_time: dict[str, int] = {}
   extraction_digest = hashlib.sha256()
+  source_order = 0
 
   segment_count = len(route.segments)
   for segment_position, segment in enumerate(route.segments, start=1):
@@ -1434,7 +2671,6 @@ def _prepare_route_with_extractor(
     segment_init_seen = False
     segment_payload_started = False
     segment_ended = False
-    decoded_records = []
     for selected_index, record in enumerate(records):
       if selected_index % 256 == 0:
         _abort_if_requested(
@@ -1515,6 +2751,7 @@ def _prepare_route_with_extractor(
         if route_init_identity is None:
           route_init_identity = identity
           route_descriptor = descriptor
+          route_time_origin_mono_ns = decoded.mono_ns
         elif route_init_identity != identity:
           raise RouteRejected(
             "build_provenance_changed",
@@ -1577,43 +2814,38 @@ def _prepare_route_with_extractor(
               "car_params_decode_failed",
               "route CarParams could not be decoded",
             ) from exc
-      elif which in _SOURCE_SERVICES:
-        if record.mono_ns < last_service_time.get(which, 0):
+      elif which in route_records:
+        previous_service_time = last_service_time.get(which, 0)
+        if (
+          record.mono_ns < previous_service_time
+          or (
+            which == "controlsState"
+            and record.mono_ns <= previous_service_time
+          )
+        ):
           raise RouteRejected(
             "service_time_regression",
             "measurement service timestamps move backwards",
           )
         last_service_time[which] = record.mono_ns
-        decoded_records.append((
-          record.mono_ns,
-          segment.index,
-          record.ordinal,
-          which,
-          decoded.valid,
-          decoded.payload,
+        route_records[which].append(_TimedRouteRecord(
+          mono_ns=record.mono_ns,
+          segment_index=segment.index,
+          ordinal=record.ordinal,
+          source_order=source_order,
+          valid=decoded.valid,
+          payload=decoded.payload,
         ))
-        first_source_time.setdefault(which, record.mono_ns)
-      elif which == "controlsState":
-        decoded_controls_count += 1
-        if decoded_controls_count > MAXIMUM_ROUTE_FRAMES:
-          raise RouteRejected(
-            "route_too_large",
-            "route exceeds bounded controls witness count",
-          )
-        if record.mono_ns <= last_service_time.get(which, 0):
-          raise RouteRejected(
-            "control_time_regression",
-            "controls witness timestamps are not strictly increasing",
-          )
-        last_service_time[which] = record.mono_ns
-        decoded_records.append((
-          record.mono_ns,
-          segment.index,
-          record.ordinal,
-          which,
-          decoded.valid,
-          None,
-        ))
+        source_order += 1
+        if which in _SOURCE_SERVICES:
+          first_source_time.setdefault(which, record.mono_ns)
+        if which == "controlsState":
+          decoded_controls_count += 1
+          if decoded_controls_count > MAXIMUM_ROUTE_FRAMES:
+            raise RouteRejected(
+              "route_too_large",
+              "route exceeds bounded controls witness count",
+            )
 
     expected_start = (
       "startOfRoute" if segment.index == 0 else "startOfSegment"
@@ -1634,66 +2866,12 @@ def _prepare_route_with_extractor(
         "full-rlog route is incomplete or has invalid sentinels",
       )
 
-    for join_index, (
-      mono_ns,
-      _,
-      _ordinal,
-      which,
-      valid,
-      message,
-    ) in enumerate(sorted(decoded_records)):
-      if join_index % 256 == 0:
-        _abort_if_requested(
-          abort_requested,
-          "backfill aborted while joining route measurements",
-        )
-      if which in _SOURCE_SERVICES:
-        histories[which].update(
-          message=message,
-          mono_ns=mono_ns,
-          valid=valid,
-          alive=True,
-        )
-        continue
-      controls_count += 1
-      control_times.append(mono_ns)
-      selected = {}
-      if valid and mono_ns > 0:
-        for service, history in histories.items():
-          snapshot = history.select(
-            witness_mono_ns=mono_ns,
-            maximum_age_ns=maximum_source_age_ns(service),
-          )
-          if snapshot is None:
-            selected = {}
-            break
-          selected[service] = snapshot
-      if not selected:
-        unresolved_times.append(mono_ns)
-        continue
-      try:
-        all_frames.append(measured_learning_frame(
-          witness_mono_ns=mono_ns,
-          car_state_mono_ns=selected["carState"].mono_ns,
-          car_output_mono_ns=selected["carOutput"].mono_ns,
-          previous_car_output_mono_ns=(
-            selected["carOutput"].previous_mono_ns
-          ),
-          car_state=selected["carState"].message,
-          car_control=selected["carControl"].message,
-          car_output=selected["carOutput"].message,
-          live_parameters=selected["liveParameters"].message,
-        ))
-      except (AttributeError, TypeError, ValueError, OverflowError) as exc:
-        raise RouteRejected(
-          "measured_frame_invalid",
-          "route measured frame is not representable",
-        ) from exc
     if segment_completed is not None:
       segment_completed(segment, segment_position, segment_count)
   if (
     route_init_identity is None
     or route_descriptor is None
+    or route_time_origin_mono_ns is None
     or route_car_params is None
     or route_car_params_bytes is None
   ):
@@ -1721,6 +2899,31 @@ def _prepare_route_with_extractor(
       "route runtime compatibility could not be reconstructed",
     ) from exc
 
+  try:
+    from opendbc.car.vehicle_model import VehicleModel
+
+    canonical_joins, pre_poll_dropped = _build_canonical_control_joins(
+      route_name=route.route_name,
+      controls=tuple(route_records["controlsState"]),
+      polls=tuple(route_records["selfdriveState"]),
+      car_states=tuple(route_records["carState"]),
+      live_parameters=tuple(route_records["liveParameters"]),
+      car_outputs=tuple(route_records["carOutput"]),
+      car_controls=tuple(route_records["carControl"]),
+      vehicle_model=VehicleModel(route_car_params),
+    )
+    all_frames = tuple(
+      _measured_frame_from_join(join)
+      for join in canonical_joins
+    )
+  except (BackfillError, RouteRejected):
+    raise
+  except Exception as exc:
+    raise RouteRejected(
+      "measurement_race_unreconstructable",
+      "route canonical input race could not be reconstructed",
+    ) from exc
+
   if set(first_source_time) != set(_SOURCE_SERVICES):
     raise RouteRejected(
       "missing_measurement_service",
@@ -1728,8 +2931,13 @@ def _prepare_route_with_extractor(
     )
   # Gate the complete controls population. A late-starting or early-stopping
   # required source must not silently shrink the quality denominator.
-  eligible_controls = control_times
-  unresolved_in_coverage = len(unresolved_times)
+  eligible_controls = tuple(
+    join.witness.mono_ns for join in canonical_joins
+  )
+  unresolved_in_coverage = sum(
+    join.curvature_unresolved or join.car_control is None
+    for join in canonical_joins
+  )
   gap_count = 0
   for left, right in zip(
     eligible_controls,
@@ -1774,12 +2982,33 @@ def _prepare_route_with_extractor(
     "selected_event_stream_sha256": extraction_digest.hexdigest(),
     "superproject_commit": superproject_commit,
   }
-  return PreparedRoute(
-    frames=tuple(all_frames),
-    controls_witness_count=controls_count,
-    unresolved_witness_count=len(unresolved_times),
+  route_evidence = _route_evidence_artifact(
+    route=route,
+    route_time_origin_mono_ns=route_time_origin_mono_ns,
+    route_car_params_bytes=route_car_params_bytes,
+    route_bundle=route_bundle,
+    route_descriptor=route_descriptor,
+    route_records=route_records,
+    joins=canonical_joins,
+    frames=all_frames,
+    pre_poll_dropped=pre_poll_dropped,
     gap_count=gap_count,
     provenance=provenance,
+  )
+  return PreparedRoute(
+    frames=all_frames,
+    controls_witness_count=decoded_controls_count,
+    unresolved_witness_count=(
+      unresolved_in_coverage + len(pre_poll_dropped)
+    ),
+    gap_count=gap_count,
+    provenance=provenance,
+    route_evidence=route_evidence,
+    pre_poll_dropped_count=len(pre_poll_dropped),
+    behavior_eligible=route_evidence.source_identity.behavior_eligible,
+    behavior_ineligible_reason=(
+      route_evidence.source_identity.behavior_ineligible_reason
+    ),
   )
 
 
@@ -1884,6 +3113,10 @@ def validate_ledger(
       "rejected_sample_count",
       "route_counter",
       "route_identity_sha256",
+      "route_evidence_control_witness_count",
+      "route_evidence_event_locator_count",
+      "route_evidence_model_publication_count",
+      "route_evidence_sha256",
       "route_name",
       "segments",
       "unresolved_witness_count",
@@ -1918,6 +3151,9 @@ def validate_ledger(
       "accepted_sample_count",
       "controls_witness_count",
       "rejected_sample_count",
+      "route_evidence_control_witness_count",
+      "route_evidence_event_locator_count",
+      "route_evidence_model_publication_count",
       "unresolved_witness_count",
     ):
       if type(entry[name]) is not int or entry[name] < 0:
@@ -1931,6 +3167,7 @@ def validate_ledger(
     rejected = entry["rejected_sample_count"]
     unresolved = entry["unresolved_witness_count"]
     provenance = entry["provenance"]
+    route_evidence_sha256 = entry["route_evidence_sha256"]
     if disposition == "ingested":
       if (
         entry["diagnostic"] != "ingested"
@@ -1972,6 +3209,13 @@ def validate_ledger(
         or unresolved > controls
         or accepted > controls - unresolved
         or rejected < controls - accepted
+        or (
+          route_evidence_sha256 is not None
+          and (
+            type(route_evidence_sha256) is not str
+            or _SHA256_RE.fullmatch(route_evidence_sha256) is None
+          )
+        )
       ):
         raise BackfillError(
           "backfill_untracked_evidence",
@@ -1983,6 +3227,10 @@ def validate_ledger(
       or controls != 0
       or rejected != 0
       or unresolved != 0
+      or route_evidence_sha256 is not None
+      or entry["route_evidence_control_witness_count"] != 0
+      or entry["route_evidence_event_locator_count"] != 0
+      or entry["route_evidence_model_publication_count"] != 0
       or (
         disposition == "late_older_skipped"
         and entry["diagnostic"] != "late_older_skipped"
@@ -2065,6 +3313,159 @@ def load_ledger(
   return validate_ledger(
     payload,
     runtime_identity_sha256=runtime_identity_sha256,
+  )
+
+
+def _behavior_cohort_source_payload(
+  artifact: RouteEvidenceArtifact,
+) -> dict[str, object]:
+  source = artifact.source_identity
+  return {
+    "controller_artifact_sha256": source.controller_artifact_sha256,
+    "controller_source_kind": source.controller_source_kind,
+    "evidence_schema_version": source.schema_versions.get("route_evidence"),
+    "runtime_identity": source.runtime_identity,
+    "source_opendbc_commit": source.source_opendbc_commit,
+    "source_panda_commit": source.source_panda_commit,
+    "source_superproject_commit": source.source_superproject_commit,
+    "vehicle_identity": source.vehicle_identity,
+  }
+
+
+def _artifact_matches_ledger_entry(
+  artifact: RouteEvidenceArtifact,
+  entry: Mapping[str, object],
+) -> bool:
+  source = artifact.source_identity
+  segments = entry["segments"]
+  if type(segments) is not list:
+    return False
+  return (
+    source.route_id == entry["route_name"]
+    and source.route_segment_sha256
+    == tuple(segment["sha256"] for segment in segments)
+    and source.route_segment_size_bytes
+    == tuple(segment["size_bytes"] for segment in segments)
+    and source.controls_witness_count == entry["controls_witness_count"]
+    and source.unresolved_witness_count
+    == entry["unresolved_witness_count"]
+    and artifact.sha256 == entry["route_evidence_sha256"]
+    and len(artifact.model_publications)
+    == entry["route_evidence_model_publication_count"]
+    and len(artifact.control_witnesses)
+    == entry["route_evidence_control_witness_count"]
+    and len(artifact.event_locators)
+    == entry["route_evidence_event_locator_count"]
+  )
+
+
+def select_homogeneous_behavior_cohort(
+  *,
+  ledger: dict[str, object],
+  store: RouteEvidenceStore,
+) -> BehaviorEvidenceCohortSelection:
+  """Select the newest contiguous exact-source route population.
+
+  This is intentionally stricter than "find enough good routes".  Starting
+  from the newest normal ledger entry, every route must be accounted for
+  until an older, eligible artifact proves an exact controller-source
+  boundary.  Missing, rejected, corrupt, or behavior-ineligible evidence in
+  that current-source population blocks qualification instead of being
+  cherry-picked around.  Explicit late-older skips predate the append-only
+  watermark and are the sole ignored entry class.
+  """
+  validated = validate_ledger(
+    ledger,
+    runtime_identity_sha256=str(ledger.get("runtime_identity_sha256", "")),
+  )
+  entries = sorted(
+    (
+      entry
+      for entry in validated["entries"]
+      if entry["disposition"] != "late_older_skipped"
+    ),
+    key=lambda entry: entry["route_counter"],
+    reverse=True,
+  )
+  if not entries:
+    return BehaviorEvidenceCohortSelection(
+      status="empty",
+      reason="no_ingested_routes",
+      blocking_route_name=None,
+      source_identity_sha256=None,
+      artifacts=(),
+    )
+
+  selected: list[RouteEvidenceArtifact] = []
+  source_payload: dict[str, object] | None = None
+  source_identity: str | None = None
+  for entry in entries:
+    route_name = str(entry["route_name"])
+    if entry["disposition"] != "ingested":
+      return BehaviorEvidenceCohortSelection(
+        status="blocked",
+        reason=(
+          "newest_route_rejected"
+          if source_payload is None
+          else "interleaved_route_rejected"
+        ),
+        blocking_route_name=route_name,
+        source_identity_sha256=source_identity,
+        artifacts=(),
+      )
+    evidence_sha256 = entry["route_evidence_sha256"]
+    if type(evidence_sha256) is not str:
+      return BehaviorEvidenceCohortSelection(
+        status="blocked",
+        reason="route_evidence_missing",
+        blocking_route_name=route_name,
+        source_identity_sha256=source_identity,
+        artifacts=(),
+      )
+    try:
+      artifact = store.load(evidence_sha256)
+    except (OSError, RouteEvidenceError):
+      return BehaviorEvidenceCohortSelection(
+        status="blocked",
+        reason="route_evidence_corrupt",
+        blocking_route_name=route_name,
+        source_identity_sha256=source_identity,
+        artifacts=(),
+      )
+    if not _artifact_matches_ledger_entry(artifact, entry):
+      return BehaviorEvidenceCohortSelection(
+        status="blocked",
+        reason="route_evidence_ledger_mismatch",
+        blocking_route_name=route_name,
+        source_identity_sha256=source_identity,
+        artifacts=(),
+      )
+    if not artifact.source_identity.behavior_eligible:
+      return BehaviorEvidenceCohortSelection(
+        status="blocked",
+        reason=f"route_evidence_ineligible:{artifact.source_identity.behavior_ineligible_reason}",
+        blocking_route_name=route_name,
+        source_identity_sha256=source_identity,
+        artifacts=(),
+      )
+    artifact_source = _behavior_cohort_source_payload(artifact)
+    artifact_source_identity = _sha256(_canonical_json_bytes(artifact_source))
+    if source_payload is None:
+      source_payload = artifact_source
+      source_identity = artifact_source_identity
+    elif artifact_source != source_payload:
+      break
+    selected.append(artifact)
+
+  if not selected or source_identity is None:
+    raise AssertionError("ready behavior cohort lost its source population")
+  selected.reverse()
+  return BehaviorEvidenceCohortSelection(
+    status="ready",
+    reason="ready",
+    blocking_route_name=None,
+    source_identity_sha256=source_identity,
+    artifacts=tuple(selected),
   )
 
 
@@ -2205,6 +3606,52 @@ def publish_generation(
   )
   ledger_bytes = _canonical_json_bytes(ledger)
   ledger_sha256 = _sha256(ledger_bytes)
+  # Schema-8 separates the profile selected for behavior replay from the
+  # optional learned candidate.  An all-seed qualification therefore still
+  # has a selected profile even though it has no candidate change.  The
+  # getattr fallback keeps older audit test doubles honest: their candidate
+  # was also their only possible selection.
+  selected_profile_json = getattr(
+    finalization,
+    "selected_profile_json",
+    finalization.candidate_profile_json,
+  )
+  selected_profile_sha256 = getattr(
+    finalization,
+    "selected_profile_sha256",
+    finalization.candidate_profile_sha256,
+  )
+  if (selected_profile_json is None) != (selected_profile_sha256 is None):
+    raise BackfillError(
+      "backfill_publish_failed",
+      "selected profile JSON and identity are incomplete",
+    )
+  if finalization.all_nodes_qualified != (selected_profile_json is not None):
+    raise BackfillError(
+      "backfill_publish_failed",
+      "fully qualified calibration must commit exactly one selected profile",
+    )
+  if (
+    selected_profile_json is not None
+    and _sha256(selected_profile_json) != selected_profile_sha256
+  ):
+    raise BackfillError(
+      "backfill_publish_failed",
+      "selected profile identity does not match its canonical bytes",
+    )
+  if (
+    finalization.candidate_profile_json is not None
+    and (
+      finalization.candidate_profile_sha256 is None
+      or _sha256(finalization.candidate_profile_json)
+      != finalization.candidate_profile_sha256
+      or finalization.candidate_profile_json != selected_profile_json
+    )
+  ):
+    raise BackfillError(
+      "backfill_publish_failed",
+      "learned candidate is not the committed selected profile",
+    )
   previous_generation = None
   if artifact_paths.backfill_pointer.is_file():
     previous_generation = json.loads(
@@ -2231,6 +3678,7 @@ def publish_generation(
     "provenance_sha256": _sha256(provenance_bytes),
     "runtime_identity_sha256": runtime_identity_sha256,
     "schema_version": BACKFILL_COMMIT_SCHEMA_VERSION,
+    "selected_profile_sha256": selected_profile_sha256,
   })
   generation_sha256 = _sha256(commit_bytes)
   generations = artifact_paths.backfill_generations
@@ -2244,6 +3692,16 @@ def publish_generation(
     _write_fsynced(staging / "manifest.json", finalization.manifest_bytes)
     _write_fsynced(staging / "ledger.json", ledger_bytes)
     _write_fsynced(staging / "provenance.json", provenance_bytes)
+    if selected_profile_json is not None:
+      selected_profiles = staging / "selected_profiles"
+      selected_profiles.mkdir()
+      if selected_profile_sha256 is None:
+        raise AssertionError("selected profile JSON lacks identity")
+      _write_fsynced(
+        selected_profiles / f"{selected_profile_sha256}.json",
+        selected_profile_json,
+      )
+      _fsync_directory(selected_profiles)
     if finalization.candidate_profile_json is not None:
       candidates = staging / "candidates"
       candidates.mkdir()
@@ -2289,6 +3747,43 @@ def publish_generation(
           "backfill_publish_failed",
           "generation identity collision is not byte-identical",
         ) from exc
+      selected_directory = generation / "selected_profiles"
+      expected_selected_names = (
+        set()
+        if selected_profile_sha256 is None
+        else {f"{selected_profile_sha256}.json"}
+      )
+      try:
+        observed_selected_names = (
+          {path.name for path in selected_directory.iterdir()}
+          if selected_directory.is_dir()
+          and not selected_directory.is_symlink()
+          else set()
+        )
+      except OSError:
+        observed_selected_names = set()
+      if observed_selected_names != expected_selected_names or (
+        (selected_directory.exists() or selected_directory.is_symlink())
+        and not expected_selected_names
+      ):
+        raise BackfillError(
+          "backfill_publish_failed",
+          "existing generation selected profile set is corrupt",
+        ) from exc
+      if selected_profile_sha256 is not None:
+        try:
+          selected_matches = (
+            generation
+            / "selected_profiles"
+            / f"{selected_profile_sha256}.json"
+          ).read_bytes() == selected_profile_json
+        except OSError:
+          selected_matches = False
+        if not selected_matches:
+          raise BackfillError(
+            "backfill_publish_failed",
+            "existing generation selected profile is corrupt",
+          ) from exc
       candidate_identity = finalization.candidate_profile_sha256
       if candidate_identity is not None:
         try:
@@ -2334,6 +3829,21 @@ def publish_generation(
     raise
 
 
+def _prepared_route_evidence_summary(
+  prepared: PreparedRoute | PreparedRouteSpool,
+) -> tuple[str | None, int, int, int]:
+  artifact = getattr(prepared, "route_evidence", None)
+  if artifact is None:
+    return None, 0, 0, 0
+  manifest = artifact.manifest
+  return (
+    str(artifact.sha256),
+    int(manifest["model_publication_count"]),
+    int(manifest["control_witness_count"]),
+    int(manifest["driving_event_locator_count"]),
+  )
+
+
 def replay_routes(
   *,
   runtime: PersistentLearningRuntime,
@@ -2375,11 +3885,19 @@ def replay_routes(
         route_completed(route, accepted_total, rejected_total)
       continue
     try:
-      before_ingested = runtime.coordinator.ingested_sample_count
       before_accepted = runtime.coordinator.accepted_sample_count
       if route_applying is not None:
         route_applying(route)
-      runtime.transition_onroad(route.route_counter)
+      route_evidence = getattr(prepared, "route_evidence", None)
+      route_content_sha256 = (
+        None
+        if route_evidence is None
+        else str(route_evidence.sha256)
+      )
+      runtime.transition_onroad(
+        route.display_identity,
+        route_content_sha256,
+      )
       frames = (
         prepared.frames
         if isinstance(prepared, PreparedRoute)
@@ -2397,17 +3915,24 @@ def replay_routes(
         "backfill aborted after replaying route frames",
       )
       runtime.transition_offroad_without_persist()
-      ingested = (
-        runtime.coordinator.ingested_sample_count - before_ingested
-      )
       accepted = (
         runtime.coordinator.accepted_sample_count - before_accepted
       )
+      # Every recorded witness is either accepted or rejected exactly once;
+      # startup-prefix witnesses have no frame to ingest but still belong to
+      # the route's reported denominator. Gaps remain explicit missing-frame
+      # defects in addition to the recorded-witness population.
       rejected = (
-        ingested - accepted
-        + prepared.unresolved_witness_count
+        prepared.controls_witness_count
+        - accepted
         + prepared.gap_count
       )
+      (
+        route_evidence_sha256,
+        route_evidence_model_count,
+        route_evidence_control_count,
+        route_evidence_event_count,
+      ) = _prepared_route_evidence_summary(prepared)
       accepted_total += accepted
       rejected_total += rejected
       results.append(ReplayResult(
@@ -2419,6 +3944,14 @@ def replay_routes(
         rejected_sample_count=rejected,
         controls_witness_count=prepared.controls_witness_count,
         unresolved_witness_count=prepared.unresolved_witness_count,
+        route_evidence_sha256=route_evidence_sha256,
+        route_evidence_model_publication_count=(
+          route_evidence_model_count
+        ),
+        route_evidence_control_witness_count=(
+          route_evidence_control_count
+        ),
+        route_evidence_event_locator_count=route_evidence_event_count,
       ))
       if route_completed is not None:
         route_completed(route, accepted_total, rejected_total)
@@ -2450,6 +3983,26 @@ def verify_replay_passes(first: ReplayPass, second: ReplayPass) -> None:
     != second.finalization.evidence_bytes
     or first.finalization.manifest_bytes
     != second.finalization.manifest_bytes
+    or getattr(
+      first.finalization,
+      "selected_profile_json",
+      first.finalization.candidate_profile_json,
+    )
+    != getattr(
+      second.finalization,
+      "selected_profile_json",
+      second.finalization.candidate_profile_json,
+    )
+    or getattr(
+      first.finalization,
+      "selected_profile_sha256",
+      first.finalization.candidate_profile_sha256,
+    )
+    != getattr(
+      second.finalization,
+      "selected_profile_sha256",
+      second.finalization.candidate_profile_sha256,
+    )
     or first.finalization.candidate_profile_json
     != second.finalization.candidate_profile_json
     or tuple(result.ledger_entry() for result in first.results)
@@ -2461,6 +4014,129 @@ def verify_replay_passes(first: ReplayPass, second: ReplayPass) -> None:
       "backfill_nondeterministic",
       "independent historical replays were not byte-identical",
     )
+
+
+def _route_evidence_staging_path(
+  root: Path,
+  authority_index: int,
+  sha256: str,
+) -> Path:
+  if authority_index not in (1, 2) or _SHA256_RE.fullmatch(sha256) is None:
+    raise BackfillError(
+      "backfill_route_incompatible",
+      "route-evidence staging identity is invalid",
+    )
+  return root / ".route-evidence-staging-v2" / f"authority-{authority_index}" / f"{sha256}.route-evidence"
+
+
+def _stage_route_evidence(
+  *,
+  root: Path,
+  authority_index: int,
+  artifact: RouteEvidenceArtifact,
+) -> None:
+  path = _route_evidence_staging_path(root, authority_index, artifact.sha256)
+  path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  if path.exists():
+    if path.is_symlink() or not path.is_file() or path.read_bytes() != artifact.canonical_bytes:
+      raise BackfillError(
+        "backfill_nondeterministic",
+        "route-evidence staging object is not immutable",
+      )
+    return
+  descriptor, temporary_name = tempfile.mkstemp(
+    dir=path.parent, prefix=f".{path.name}.", suffix=".partial",
+  )
+  temporary = Path(temporary_name)
+  try:
+    os.fchmod(descriptor, 0o600)
+    view = memoryview(artifact.canonical_bytes)
+    while view:
+      count = os.write(descriptor, view)
+      if count <= 0:
+        raise OSError("short route-evidence staging write")
+      view = view[count:]
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = -1
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+      os.fsync(directory)
+    finally:
+      os.close(directory)
+  finally:
+    if descriptor >= 0:
+      os.close(descriptor)
+    try:
+      temporary.unlink()
+    except FileNotFoundError:
+      pass
+
+
+def _publish_route_evidence_after_aa(
+  *,
+  root: Path,
+  first: ReplayPass,
+  second: ReplayPass,
+) -> None:
+  """Publish complete route artifacts only after replay-level A/A passes."""
+  store = RouteEvidenceStore(root / "route_evidence_v2")
+  second_by_route = {
+    result.route.route_name: result
+    for result in second.results
+  }
+  for first_result in first.results:
+    if first_result.disposition != "ingested":
+      continue
+    second_result = second_by_route.get(first_result.route.route_name)
+    if (
+      second_result is None
+      or second_result.disposition != "ingested"
+      or first_result.route_evidence_sha256 is None
+      or second_result.route_evidence_sha256 != first_result.route_evidence_sha256
+    ):
+      raise BackfillError(
+        "backfill_nondeterministic",
+        "route-evidence A/A identities disagree",
+      )
+    sha = first_result.route_evidence_sha256
+    first_path = _route_evidence_staging_path(root, 1, sha)
+    second_path = _route_evidence_staging_path(root, 2, sha)
+    try:
+      first_artifact = RouteEvidenceArtifact.from_bytes(
+        first_path.read_bytes(),
+      )
+      second_artifact = RouteEvidenceArtifact.from_bytes(
+        second_path.read_bytes(),
+      )
+      store.publish(first_artifact, second_artifact)
+      # The authority files are transaction scratch, not a third durable copy
+      # of every route.  Remove them only after the content-addressed store has
+      # fsynced its exact A/A result.
+      for path in (first_path, second_path):
+        path.unlink()
+        _fsync_directory(path.parent)
+    except (OSError, RouteEvidenceError) as error:
+      raise BackfillError(
+        "backfill_nondeterministic",
+        "route-evidence A/A bytes are missing or disagree",
+      ) from error
+  staging_root = root / ".route-evidence-staging-v2"
+  try:
+    for authority_index in (1, 2):
+      (staging_root / f"authority-{authority_index}").rmdir()
+    staging_root.rmdir()
+    _fsync_directory(root)
+  except FileNotFoundError:
+    pass
+  except OSError as error:
+    # A non-empty directory means an unaccounted authority artifact exists;
+    # silently retaining it could mask a later route-population mismatch.
+    raise BackfillError(
+      "backfill_nondeterministic",
+      "route-evidence authority staging was not fully consumed",
+    ) from error
 
 
 _FORK_CHILD_ONLY_IPC_FDS: tuple[int, ...] = ()
@@ -2913,6 +4589,7 @@ def _prepare_route_to_spool(
       provenance=prepared.provenance,
       max_frames=MAXIMUM_ROUTE_FRAMES,
       abort_requested=abort_requested,
+      route_evidence=prepared.route_evidence,
     )
   except SpoolFormatError as exc:
     if abort_requested():
@@ -3731,26 +5408,38 @@ class HistoricalLearningBackfill:
         selected_abort,
         "backfill aborted after prepared-route retrieval",
       )
-      return prepared
-    return prepare_route(
-      route,
-      extractor_path=self.extractor_path,
-      event_reader=self.event_reader,
-      car_params_decoder=self.car_params_decoder,
-      descriptor_registry=self.descriptor_registry,
-      route_bundle_factory=self.route_bundle_factory,
-      current_car_params=self.current_car_params,
-      current_bundle=runtime.runtime_bundle,
-      expected_dongle_id=self.expected_dongle_id,
-      expected_extractor_sha256=(
-        self._active_local_extractor_sha256
-        if expected_extractor_sha256 is None
-        else expected_extractor_sha256
-      ),
-      abort_requested=selected_abort,
-      segment_started=segment_started,
-      segment_completed=segment_completed,
+    else:
+      prepared = prepare_route(
+        route,
+        extractor_path=self.extractor_path,
+        event_reader=self.event_reader,
+        car_params_decoder=self.car_params_decoder,
+        descriptor_registry=self.descriptor_registry,
+        route_bundle_factory=self.route_bundle_factory,
+        current_car_params=self.current_car_params,
+        current_bundle=runtime.runtime_bundle,
+        expected_dongle_id=self.expected_dongle_id,
+        expected_extractor_sha256=(
+          self._active_local_extractor_sha256
+          if expected_extractor_sha256 is None
+          else expected_extractor_sha256
+        ),
+        abort_requested=selected_abort,
+        segment_started=segment_started,
+        segment_completed=segment_completed,
+      )
+    artifact = getattr(prepared, "route_evidence", None)
+    if type(artifact) is not RouteEvidenceArtifact:
+      raise BackfillError(
+        "backfill_route_incompatible",
+        "prepared route lacks complete shared route evidence v2",
+      )
+    _stage_route_evidence(
+      root=runtime.artifact_paths.root,
+      authority_index=authority_index,
+      artifact=artifact,
     )
+    return prepared
 
   def _run_once_with_extractor_identity(self) -> BackfillRunResult:
     if self.abort_requested():
@@ -4211,6 +5900,11 @@ class HistoricalLearningBackfill:
       if progress is not None:
         project_progress(progress.comparing)
       verify_replay_passes(first, second)
+      _publish_route_evidence_after_aa(
+        root=artifact_paths.root,
+        first=first,
+        second=second,
+      )
       new_ledger = extend_ledger(
         ledger,
         late_routes=late_routes,

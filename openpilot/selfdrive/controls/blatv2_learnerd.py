@@ -480,12 +480,21 @@ class BlatV2LearnerDaemon:
       return
     if self._live_identity_bound:
       return
+    if self._current_route_identity is None:
+      # Route-level uncertainty is meaningful only when every observation is
+      # bound to one immutable route.  Never start an anonymous preview and
+      # later relabel its already-collected frames when CurrentRoute appears.
+      self._publish_operation_status(
+        state=LearningOperationState.PREPARING,
+        diagnostic="waiting_for_current_route",
+      )
+      return
     if self.runtime.coordinator.state.value == "onroad":
       raise RuntimeError("onroad learner runtime lacks a live identity binding")
     self._drive_baseline = DriveEvidenceBaseline.from_support_diagnostics(
       self.runtime.coordinator.support_diagnostics,
     )
-    self.runtime.transition_onroad()
+    self.runtime.transition_onroad(self._current_route_identity)
     self._live_identity_bound = True
     self._publish_operation_status(
       state=LearningOperationState.COLLECTING,

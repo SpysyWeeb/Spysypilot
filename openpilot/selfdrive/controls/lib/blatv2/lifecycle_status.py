@@ -2,7 +2,8 @@
 
 Only ``blatv2_profiled`` may write this cache, and only while offroad after
 ``PersistentProfileActivation`` has validated the authoritative activation
-state against the current vehicle, runtime, source, and opendbc identities.
+state against the current vehicle, runtime, source, opendbc, and panda
+identities.
 The cache is never read by controller selection, approval, feedback, rollback,
 or safety code.  The authoritative state remains ``BLaTv2ActivationState``.
 """
@@ -21,7 +22,7 @@ from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
 
 
 LIFECYCLE_STATUS_PARAM = "BLaTv2LifecycleStatus"
-LIFECYCLE_STATUS_SCHEMA_VERSION = 1
+LIFECYCLE_STATUS_SCHEMA_VERSION = 2
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
@@ -68,6 +69,7 @@ def build_lifecycle_status_payload(
   runtime_identity_sha256: str,
   source_openpilot_commit: str,
   opendbc_commit: str,
+  panda_commit: str,
 ) -> dict[str, object]:
   """Map one already-validated activation owner into an inert UI snapshot."""
   if type(vehicle_identity) is not str or not vehicle_identity.strip():
@@ -80,6 +82,7 @@ def build_lifecycle_status_payload(
   for value, name in (
     (source_openpilot_commit, "source openpilot commit"),
     (opendbc_commit, "opendbc commit"),
+    (panda_commit, "panda commit"),
   ):
     if type(value) is not str or _COMMIT_RE.fullmatch(value) is None:
       raise ValueError(f"lifecycle {name} must be an exact commit")
@@ -129,6 +132,7 @@ def build_lifecycle_status_payload(
     "effective_controller": effective.value,
     "informational_only": True,
     "opendbc_commit": opendbc_commit,
+    "panda_commit": panda_commit,
     "production_envelope_verified": envelope_verified,
     "rejected_profile_count": len(
       activation.rejected_profile_identities,
@@ -149,6 +153,7 @@ def build_lifecycle_status_bytes(
   runtime_identity_sha256: str,
   source_openpilot_commit: str,
   opendbc_commit: str,
+  panda_commit: str,
 ) -> bytes:
   return canonical_lifecycle_status_bytes(build_lifecycle_status_payload(
     activation=activation,
@@ -156,4 +161,5 @@ def build_lifecycle_status_bytes(
     runtime_identity_sha256=runtime_identity_sha256,
     source_openpilot_commit=source_openpilot_commit,
     opendbc_commit=opendbc_commit,
+    panda_commit=panda_commit,
   ))

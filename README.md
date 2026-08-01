@@ -53,8 +53,8 @@ The replacement is split into independently testable owners:
 
 The current learning milestone replaces the rejected dynamic-rack fit. Normal
 driving did not independently identify rack gain and damping, so those
-provisional values are no longer learned or allowed to influence learning
-identity. Evidence schema 6 instead learns only quantities the logs directly
+provisional values are no longer learned or allowed to influence calibration
+identity. Evidence schema 8 instead learns only quantities the logs directly
 support at the `0/5/10/15/20/30 m/s` nodes:
 
 - normalized torque per measured lateral acceleration;
@@ -62,7 +62,7 @@ support at the `0/5/10/15/20/30 m/s` nodes:
 - moving (kinetic) friction from resolved rack motion; and
 - static breakaway torque from a complete stuck-to-moving episode.
 
-The fit is deterministic constrained least squares. A vehicle-global episode
+The physical fit is deterministic constrained least squares. A vehicle-global episode
 detector uses raw measured steering-angle motion at half one declared
 steering-rate quantum, then requires same-direction measured-rate confirmation
 within the existing transport delay. This observes physical breakout before a
@@ -74,23 +74,52 @@ re-solved.
 Whole routes—not adjacent frames—alternate between training and validation by
 their immutable route counter. The training side evaluates a nested model
 family (`static only`, `friction`, `offset + friction`, then `full map`). The
-seed is a comparator, never a candidate. A model may advance only if it
-improves at least one populated training category without worsening any other;
-the frozen winner is checked once on held-out routes. Dense straight-driving
-samples therefore cannot buy a lower average error by sacrificing rare
-breakaway or full-authority behavior.
+seed is now a first-class selectable result: if the data cannot prove a
+candidate is better beyond route-level uncertainty, the node is successfully
+qualified as **seed retained** instead of being mislabeled unstable. A learned
+model may advance only when its paired whole-route loss clears that uncertainty
+without sacrificing a populated category; the frozen winner is checked once
+on held-out routes. Dense straight-driving samples therefore cannot buy a
+lower average error by sacrificing rare breakaway or full-authority behavior.
 
 Stationary settled response, moving response, breakaway events, held-out
 validation, and actuator-authority observations remain separate populations.
-No partial node set can emit a candidate, and no candidate produced by this
-milestone has an approval or activation path.
+Rank and conditioning are explicit diagnostics, and exact runtime interpolation
+between neighboring speed nodes is validated as its own response rather than
+being assumed safe from endpoint fits. No partial node set can emit a candidate,
+and no candidate produced by this milestone has an approval or activation path.
 
-The previous **LQI** controller—“Linear Quadratic Integral,” a state-feedback
-controller with an integral error state—is retired. It is not the controller
-being built here. This milestone changes only offline calibration. The exact
-stock torque-controller algorithm remains the active bootstrap, and a future
-controller must consume one qualified calibration map in place of its stock
-map—not add another correction loop around it.
+Controller feel is learned separately from physical calibration. A behavioral
+learner is allowed to change only two global, physically legible response dials:
+closed-loop natural frequency and damping ratio. It evaluates exact stock, the
+currently accepted artifact, and candidates on identical cached route evidence,
+with whole-route train/held-out splits. Smooth, Swift, and Strong are independent
+contracts; no weighted score may trade one away. Auto-logger events locate
+maneuvers but are not quality labels, driver intervention censors response after
+contact but is not itself a good/bad vote, and lane lines never enter the target.
+
+These are two separate qualification stages. Physical calibration first decides
+what torque the detected vehicle needs at each speed. A fully qualified physical
+result may legitimately carry the existing seed at every node when the data do
+not prove a safer replacement. Behavioral qualification starts only after that
+complete selected physical profile exists; it decides how quickly and how well a
+future modular core should track the unchanged model target. A behavior failure
+cannot relabel a successful physical generation, and neither stage can activate
+its own output.
+
+Natural frequency is the global response-speed/stiffness dial: higher values ask
+the closed loop to close tracking error sooner. Damping ratio is the global
+settling dial: it determines how that response settles instead of ringing or
+overshooting. They are one pair for the full speed range, not hidden low/high
+speed gains. Vehicle speed dependence remains in the measured physical profile
+and the vehicle model.
+
+The previous **LQI** controller—“Linear Quadratic Integral,” meaning a controller
+that chose feedback from a mathematical error/effort cost and accumulated an
+integral error state—is retired. It is not the controller being built here.
+The exact stock torque-controller algorithm remains the active bootstrap, and a
+future controller must consume one qualified calibration map in place of its
+stock map—not add another correction loop around it.
 
 The first combo build contains no approved modular profile. It therefore
 drives with the exact current stock torque-controller algorithm and launches
@@ -106,11 +135,12 @@ contract.
 
 ## Activation and learning
 
-The first drive on a vehicle is stock-controlled. No BLaTv2 collection or
-learning process runs during the drive. After the route is closed,
-`blatv2_backfilld` replays its complete full rlog twice and atomically commits
-evidence only if both replays and all compatibility checks agree. It is the
-sole managed BLaTv2 process and the sole durable learning writer.
+The first drive on a vehicle is stock-controlled. No dedicated BLaTv2
+collection or learning process runs during the drive; normal loggerd records the
+full rlog. After the route is closed, `blatv2_backfilld` independently prepares
+and replays its complete full rlog twice and atomically commits evidence only if
+both authorities and all compatibility checks agree. It is the sole managed
+BLaTv2 process and the sole durable learning writer.
 
 The offroad importer uses four worker lanes while retaining exactly two
 independent deterministic
@@ -118,15 +148,19 @@ replay authorities: the parent and a verification process. Each authority now
 has one private route-preparation lane that may decode the next route while its
 owner applies the current route, so up to four Python lanes can use the four
 comma CPU cores without parallelizing the learner's causal route/frame state.
-Each helper writes one versioned, hash-bound, fixed-record scratch spool; it
-never sends a route-sized Python object over IPC, never shares prepared data
-with the other replay, and never receives durable-writer or Params authority.
-Only the parent compares the two results, extends the ledger, and atomically
-publishes. One prefetched route per authority bounds memory and scratch usage.
+Each helper writes one versioned, hash-bound `BLATRE02` route-evidence
+artifact. It contains the exact physical frame plane once plus compact model,
+control, live-torque, delay, maneuver, and event planes; the physical-only
+`BLATSP01` format is rejected. A helper never sends a route-sized Python object
+over IPC, never shares prepared data with the other replay, and never receives
+durable-writer or Params authority. Only the parent compares the complete bytes
+from both authorities, extends the ledger, and atomically publishes. One
+prefetched route per authority bounds memory and scratch usage.
 While a prefetched route is being applied, its helper may already be writing
-the following route, so the hard scratch bound is two spools per authority:
-about 464 MiB total at the one-million-frame safety limit (ordinary routes are
-far smaller). Device validation measures the actual high-water mark.
+the following route, so the hard scratch bound is two artifacts per authority.
+Each artifact is independently capped at 512 MiB, making 2 GiB the deliberately
+conservative four-artifact theoretical scratch ceiling; ordinary routes are
+far smaller. Device validation measures the actual high-water mark.
 The existing progress UI is deliberately unchanged: it projects the primary
 pass, then moves to verification while the independently reconstructed pass
 finishes; helper work is accounted in canonical route order and is not exposed
@@ -171,19 +205,54 @@ used by the current learner. Older archived builds that actually used the
 stock 384/3/7 envelope remain fail-closed; they are not mislabeled to make
 their data pass.
 
-A candidate profile becomes eligible only when every required speed region
-has enough excitation, independent validation, and bounded uncertainty.
-Highway mileage cannot overwrite low-speed knowledge because samples update
-only their neighboring speed nodes.
+A selected physical profile becomes complete only when every speed node and
+every adjacent interpolation interval has enough excitation, independent
+validation, and bounded uncertainty. Runtime values are linearly interpolated
+between the `0/5/10/15/20/30 m/s` nodes and held flat beyond the endpoints.
+Each sample contributes only to its neighboring nodes, so highway mileage
+cannot overwrite low-speed knowledge.
+
+The support floors count accepted, weighted, hands-off response time—not route
+duration. They are 150 s at the 0 and 5 m/s nodes, 240 s at 10 and 15 m/s, and
+420 s at 20 and 30 m/s. Each node also needs at least 20% held-out support,
+bidirectional lateral-acceleration and torque excitation, and independent
+moving and complete breakaway evidence in both directions. Moving and
+breakaway strata each require at least four training and four validation rows.
+Low-speed turns are rare but information-dense: a few meaningful turns can add
+valuable breakaway events, while minutes spent stopped, driver-limited, or
+without useful excitation add no qualifying support. More driving is needed
+only for the specific populations the UI reports as missing; rank-deficient,
+ill-conditioned, inconclusive, or regressing data requires better variety or a
+safer retained seed rather than simply forcing the node through.
 
 The learner's current evidence namespace is
-`complete_full_rlog_authority_v4`. It starts empty by design. The retired v1,
-v2, and v3 namespaces and their artifact bytes are never migrated, edited, or
-interpreted as schema-6 evidence; compatible retained full rlogs are replayed
+`complete_full_rlog_authority_v6`. It starts empty by design. The retired v1
+through v5 namespaces and their artifact bytes are never migrated, edited, or
+interpreted as schema-8 evidence; compatible retained full rlogs are replayed
 from source. Runtime identity for this namespace excludes the retired
 provisional rack-gain/damping seed while remaining bound to the detected
 vehicle, torque mapping, rack mapping, sensor resolution, and opendbc command
 envelope.
+
+After physical publication, behavioral replay uses the newest contiguous
+cohort recorded by one exact controller/source identity. The current gate needs
+at least four homogeneous routes: two whole routes for training and two frozen
+held-out routes. Four is only the partition minimum; every Smooth, Swift, and
+Strong metric also requires its committed maneuver/speed strata, at least two
+routes, and at least three windows, so qualification may need more routes. A
+rejected, missing, corrupt, or behavior-ineligible route interleaved inside the
+newest source cohort blocks qualification rather than being cherry-picked
+around. Routes from an older controller build can form an older cohort, but are
+never mixed into the newest one.
+
+Training replays exact stock, the currently accepted artifact (or exact stock
+again during bootstrap), and the complete candidate grid. It freezes one
+winner before the held-out routes are examined. Held-out replay then evaluates
+only exact stock, the incumbent, and that frozen winner; validation cannot pick
+a fallback. The target must materially improve beyond observed whole-route
+uncertainty while every Smooth, Swift, and Strong gate passes independently.
+Otherwise the immutable result is **stock retained** and contains no behavior
+policy.
 
 ### Off-device preparation bridge
 
@@ -209,12 +278,12 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   `O_NOFOLLOW`, hashes that held executable inode, and runs that exact inode
   through `/proc/self/fd`; a transaction pins one extractor hash across every
   route so pathname swaps or mixed extractor versions fail closed;
-- the device downloads bounded, hash-bound prepared-route spools, applies
+- the device downloads bounded, hash-bound full route-evidence artifacts, applies
   both authorities through its own exact learner, performs the A/A comparison,
   extends the ledger, finalizes, and atomically publishes `CURRENT`;
 - before any accepted x86-prepared domain can reach that learner, the device
   prepares one locally retained route with its ARM extractor and requires the
-  complete spool bytes to match. A private atomic HMAC-bound certificate is
+  complete artifact bytes to match. A private atomic HMAC-bound certificate is
   scoped to both extractor binaries, the worker process instance, build and
   runtime identities, and the route's decode/vehicle compatibility domain;
   rejected routes likewise require the same ARM reason and message;
@@ -248,12 +317,21 @@ records, but the PC is never allowed to publish a learned profile for the car,
 write device Params, select a controller, or actuate. Local processing remains
 fully functional when the PC is absent.
 
-This milestone stops at an unapproved, informational candidate file. It does
-not promote, activate, or roll back that file, and stock remains selected even
-when every node qualifies. The following lifecycle is the separately gated
-future consumer contract, not current behavior: a reviewed profile could
-change only at an engagement boundary, and after its first active validation
-drive the offroad review would ask:
+Both qualification stages stop at immutable, informational results. The
+physical store publishes a content-addressed generation and atomically replaces
+its `CURRENT` pointer only after exact A/A agreement. The behavior store then
+does the same under `behavior_generations_v1`, with its own schema-1 generation
+and `CURRENT` pointer. A behavior generation authenticates the selected physical
+generation/profile, exact route set and source, committed gate/segmentation
+files, both-authority transaction, and optional policy. A corrupt existing
+pointer is never overwritten as if it were an empty cache, and old generations
+are retained for rollback/audit.
+
+Neither stage promotes, activates, or rolls back its output, and stock remains
+selected even when both stages qualify. The following lifecycle is the
+separately gated future consumer contract, not current behavior: a reviewed
+profile could change only at an engagement boundary, and after its first active
+validation drive the offroad review would ask:
 
 > Compared with the previous steering profile, how did steering feel?
 
@@ -261,7 +339,10 @@ The choices are **Better**, **About same**, **Worse**, and **Not sure**.
 Under that future contract, `Worse` would deactivate the provisional profile
 for the next engagement while retaining its data for diagnosis. Driver
 overrides remain evidence bookmarks, not automatic proof that a controller is
-bad.
+bad. The prompt is contextual evidence only: no answer trains the physical or
+behavioral learner, converts a failed gate to a pass, approves an artifact, or
+permits a safety exception. `Better` and `About same` can never override an
+objective regression; `Not sure` leaves the future artifact provisional.
 
 Profile revisions are opaque, monotonically increasing evidence generations,
 not contiguous release numbers. Identical restored evidence produces the same
@@ -304,18 +385,30 @@ required before qualification. Sparse authority evidence stays durable and
 can reject a regressing model, but it cannot steer the fit.
 
 The home-screen learning display reads rebuildable
-`BLaTv2LearningOperationStatus` and `BLaTv2LearningStatus` caches. The
-offroad importer owns both. Operation status distinguishes logger
+`BLaTv2LearningOperationStatus`, `BLaTv2BackfillProgress`,
+`BLaTv2LearningStatus`, and `BLaTv2BehaviorLearningStatus` caches. The
+offroad importer owns all four. Operation status distinguishes logger
 finalization, historical route scanning/replay progress, idle evidence, an
-eligible empty state, and fail-closed diagnostics.
+eligible empty state, and fail-closed diagnostics. Backfill progress shows
+pass/route/segment plus read/apply progress and an evidence-based time estimate.
 
-Learning-status schema 2 reports each speed node's total/base/moving/
-breakaway/authority populations, train/validation state, and—only when a fit
-exists—the four observable candidate values above. It never labels the
-retired rack gain or damping as learned. These values remain informational;
-the UI cannot approve or activate them.
+Physical learning-status schema 3 reports each speed node's total/base/moving/
+breakaway/authority populations, train/validation state, rank and conditioning,
+paired uncertainty, interpolation status, and—only when a fit exists—the four
+observable values above. It distinguishes **learned**, **seed retained**,
+**needs evidence/variety**, **ill-conditioned**, **inconclusive**, and
+**validation regression** rather than calling every non-candidate unstable.
+It never labels retired rack gain or damping as learned.
 
-Both caches are cleared at manager start and published only after the offroad
+Behavior learning-status schema 1 separately shows
+`waiting_for_physical_profile`, `waiting_for_routes`, `preparing`, `training`,
+`selecting`, `validating`, `publishing`, `complete`, or `failed`, together with
+route/candidate/replay counts and the independent Smooth/Swift/Strong verdicts.
+`complete` says either **qualified candidate available** or **stock retained**;
+it never means activated. All displayed values remain informational, and the
+UI cannot approve or select a controller.
+
+All display caches are cleared at manager start and published only after the offroad
 owner validates its phase and current vehicle/build authority. They are
 informational only: neither is evidence, approval, a profile,
 controller-selection, or a safety input, and editing or deleting either one

@@ -28,6 +28,15 @@ from typing import Any, Protocol
 from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
   ControllerSelection,
 )
+from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import (
+  BehaviorLearningFinalization,
+)
+from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
+  BehaviorPolicy,
+)
+from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
+  VehicleCalibrationProfile,
+)
 from openpilot.selfdrive.controls.lib.blatv2.feedback import (
   FEEDBACK_REQUEST_PARAM,
   FEEDBACK_RESPONSE_PARAM,
@@ -41,7 +50,8 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 )
 
 
-APPROVED_ARTIFACT_SCHEMA_VERSION = 2
+APPROVED_ARTIFACT_SCHEMA_VERSION = 5
+CALIBRATION_SELECTION_SCHEMA_VERSION = 2
 ACTIVATION_STATE_SCHEMA_VERSION = 1
 APPROVED_ARTIFACT_PARAM = "BLaTv2ApprovedArtifact"
 ACTIVATION_STATE_PARAM = "BLaTv2ActivationState"
@@ -52,18 +62,29 @@ _ARTIFACT_KEYS = frozenset((
   "schemaVersion",
   "vehicleProfileJson",
   "vehicleProfileSha256",
+  "calibrationProfileJson",
+  "calibrationProfileSha256",
   "controllerPolicyJson",
   "controllerPolicySha256",
   "runtimeVehicleIdentitySha256",
   "sourceOpenpilotCommit",
   "opendbcCommit",
+  "pandaCommit",
+  "calibrationSelectionManifestJson",
+  "calibrationSelectionManifestSha256",
   "learnerEvidenceSha256",
+  "behaviorFinalizationJson",
+  "behaviorFinalizationSha256",
+  "behaviorSelectionSha256",
   "replayHarnessCommit",
   "replayPassed",
   "deliveredReplayPassed",
   "safetyPassed",
   "deterministicAaPassed",
   "deviceTimingPassed",
+  "smoothPassed",
+  "swiftPassed",
+  "strongPassed",
 ))
 _POLICY_KEYS = frozenset((
   "damping_ratio",
@@ -93,6 +114,14 @@ _STATE_KEYS = frozenset((
   "rollbackPending",
   "rejectedProfileIdentities",
 ))
+_CALIBRATION_SELECTION_KEYS = frozenset((
+  "allNodesQualified",
+  "candidateCalibrationProfileSha256",
+  "learnerEvidenceSha256",
+  "qualificationManifestSha256",
+  "schemaVersion",
+  "selectedControllerProfileSha256",
+))
 
 
 class ParamsLike(Protocol):
@@ -110,12 +139,15 @@ class ArtifactDiagnostic(StrEnum):
   MALFORMED = "malformed"
   PROFILE_HASH_MISMATCH = "profile_hash_mismatch"
   POLICY_HASH_MISMATCH = "policy_hash_mismatch"
+  CALIBRATION_PROOF_MISMATCH = "calibration_proof_mismatch"
+  BEHAVIOR_PROOF_MISMATCH = "behavior_proof_mismatch"
   UNQUALIFIED_PROFILE = "unqualified_profile"
   PROVISIONAL_POLICY = "provisional_policy"
   VEHICLE_MISMATCH = "vehicle_mismatch"
   RUNTIME_VEHICLE_MISMATCH = "runtime_vehicle_mismatch"
   SOURCE_COMMIT_MISMATCH = "source_commit_mismatch"
   OPENDBC_COMMIT_MISMATCH = "opendbc_commit_mismatch"
+  PANDA_COMMIT_MISMATCH = "panda_commit_mismatch"
   UNVERIFIED_ACTUATION_ENVELOPE = "unverified_actuation_envelope"
   GATE_FAILED = "gate_failed"
   STATE_INVALID = "state_invalid"
@@ -133,7 +165,12 @@ def _fail(reason: ArtifactDiagnostic, message: str) -> None:
 
 
 def _canonical_json(payload: object) -> str:
-  return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+  return json.dumps(
+    payload,
+    sort_keys=True,
+    separators=(",", ":"),
+    allow_nan=False,
+  )
 
 
 def _sha256_text(encoded: str) -> str:
@@ -298,6 +335,246 @@ def _profile_from_canonical_json(
   return profile
 
 
+def _calibration_profile_from_canonical_json(
+  encoded: object,
+  expected_vehicle_identity: str,
+) -> VehicleCalibrationProfile:
+  if type(encoded) is not str:
+    _fail(
+      ArtifactDiagnostic.MALFORMED,
+      "calibrationProfileJson must be text",
+    )
+  try:
+    profile = VehicleCalibrationProfile.from_json(
+      encoded,
+      expected_vehicle_identity=expected_vehicle_identity,
+    )
+  except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+    message = str(exc)
+    reason = (
+      ArtifactDiagnostic.VEHICLE_MISMATCH
+      if "different vehicle" in message
+      else ArtifactDiagnostic.MALFORMED
+    )
+    raise ArtifactValidationError(
+      reason,
+      "calibrationProfileJson is invalid",
+    ) from exc
+  if profile.to_json() != encoded:
+    _fail(
+      ArtifactDiagnostic.MALFORMED,
+      "calibrationProfileJson is not canonical",
+    )
+  return profile
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationSelectionManifest:
+  """Canonical preimage binding learned evidence to the selected profile.
+
+  The calibration coordinator's complete qualification report remains a
+  separately versioned artifact.  This compact selection manifest is the
+  promotion boundary: its hash is derived here, never supplied without its
+  preimage, and both profile identities must name the exact live profile.
+  """
+
+  selected_controller_profile_sha256: str
+  candidate_calibration_profile_sha256: str
+  learner_evidence_sha256: str
+  qualification_manifest_sha256: str
+  all_nodes_qualified: bool
+  schema_version: int = CALIBRATION_SELECTION_SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    if self.schema_version != CALIBRATION_SELECTION_SCHEMA_VERSION:
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "calibration selection schema is incompatible",
+      )
+    for name, value in (
+      (
+        "selectedControllerProfileSha256",
+        self.selected_controller_profile_sha256,
+      ),
+      (
+        "candidateCalibrationProfileSha256",
+        self.candidate_calibration_profile_sha256,
+      ),
+      ("learnerEvidenceSha256", self.learner_evidence_sha256),
+      ("qualificationManifestSha256", self.qualification_manifest_sha256),
+    ):
+      _strict_sha256(value, name)
+    if type(self.all_nodes_qualified) is not bool:
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "calibration allNodesQualified must be boolean",
+      )
+    if not self.all_nodes_qualified:
+      _fail(
+        ArtifactDiagnostic.GATE_FAILED,
+        "calibration selection requires every node to qualify",
+      )
+  def to_param(self) -> dict[str, object]:
+    return {
+      "allNodesQualified": self.all_nodes_qualified,
+      "candidateCalibrationProfileSha256": (
+        self.candidate_calibration_profile_sha256
+      ),
+      "learnerEvidenceSha256": self.learner_evidence_sha256,
+      "qualificationManifestSha256": self.qualification_manifest_sha256,
+      "schemaVersion": self.schema_version,
+      "selectedControllerProfileSha256": (
+        self.selected_controller_profile_sha256
+      ),
+    }
+
+  def to_json(self) -> str:
+    return _canonical_json(self.to_param())
+
+  @property
+  def sha256(self) -> str:
+    return _sha256_text(self.to_json())
+
+  @classmethod
+  def from_json(cls, encoded: object) -> CalibrationSelectionManifest:
+    if type(encoded) is not str:
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "calibrationSelectionManifestJson must be text",
+      )
+    try:
+      raw = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+      raise ArtifactValidationError(
+        ArtifactDiagnostic.MALFORMED,
+        "calibration selection manifest is invalid JSON",
+      ) from exc
+    payload = _strict_object(
+      raw,
+      _CALIBRATION_SELECTION_KEYS,
+      "calibration selection manifest",
+    )
+    if type(payload["schemaVersion"]) is not int:
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "calibration selection schemaVersion must be integer",
+      )
+    manifest = cls(
+      selected_controller_profile_sha256=_strict_sha256(
+        payload["selectedControllerProfileSha256"],
+        "selectedControllerProfileSha256",
+      ),
+      candidate_calibration_profile_sha256=_strict_sha256(
+        payload["candidateCalibrationProfileSha256"],
+        "candidateCalibrationProfileSha256",
+      ),
+      learner_evidence_sha256=_strict_sha256(
+        payload["learnerEvidenceSha256"],
+        "learnerEvidenceSha256",
+      ),
+      qualification_manifest_sha256=_strict_sha256(
+        payload["qualificationManifestSha256"],
+        "qualificationManifestSha256",
+      ),
+      all_nodes_qualified=_strict_bool(
+        payload["allNodesQualified"],
+        "allNodesQualified",
+      ),
+      schema_version=payload["schemaVersion"],
+    )
+    if manifest.to_json() != encoded:
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "calibrationSelectionManifestJson is not canonical",
+      )
+    return manifest
+
+
+def _behavior_finalization_from_canonical_json(
+  encoded: object,
+) -> BehaviorLearningFinalization:
+  if type(encoded) is not str:
+    _fail(
+      ArtifactDiagnostic.MALFORMED,
+      "behaviorFinalizationJson must be text",
+    )
+  try:
+    finalization = BehaviorLearningFinalization.from_json(encoded)
+  except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+    raise ArtifactValidationError(
+      ArtifactDiagnostic.MALFORMED,
+      "behaviorFinalizationJson is invalid",
+    ) from exc
+  if finalization.to_json() != encoded:
+    _fail(
+      ArtifactDiagnostic.MALFORMED,
+      "behaviorFinalizationJson is not canonical",
+    )
+  return finalization
+
+
+def _controller_profile_matches_calibration(
+  controller: VehicleProfile,
+  calibration: VehicleCalibrationProfile,
+) -> bool:
+  """Verify every learned observable survives controller composition exactly.
+
+  Rack gain and damping are runtime-seed facts and are checked against the
+  detected bundle by ``ModularLiveController``.  Everything learned from road
+  evidence is checked here, including the residual offset that earlier profile
+  formats silently dropped.
+  """
+  if (
+    not isinstance(controller, VehicleProfile)
+    or not isinstance(calibration, VehicleCalibrationProfile)
+    or controller.speed_nodes_mps != calibration.speed_nodes_mps
+    or controller.vehicle_identity != calibration.vehicle_identity
+    or controller.revision != calibration.revision
+    or len(controller.nodes) != len(calibration.nodes)
+  ):
+    return False
+  for controller_node, calibration_node in zip(
+    controller.nodes,
+    calibration.nodes,
+    strict=True,
+  ):
+    physical = controller_node.parameters
+    observable = calibration_node.parameters
+    if (
+      controller_node.speed_mps != calibration_node.speed_mps
+      or physical.torque_per_lateral_accel
+      != observable.torque_per_lateral_accel
+      or physical.lateral_accel_offset_correction_mps2
+      != observable.lateral_accel_offset_correction_mps2
+      or physical.kinetic_friction_torque
+      != observable.kinetic_friction_torque
+      or physical.static_friction_torque
+      != observable.static_breakaway_torque
+      or physical.transport_delay_s != observable.transport_delay_s
+      or physical.rack_rate_resolution_deg_s
+      != observable.rack_rate_resolution_deg_s
+      or physical.confidence != observable.confidence
+      or physical.qualified is not observable.qualified
+      or controller_node.clean_support_s
+      != (
+        calibration_node.base_support_s
+        + calibration_node.moving_support_s
+        + calibration_node.breakaway_support_s
+      )
+      or controller_node.sample_count
+      != (
+        calibration_node.base_sample_count
+        + calibration_node.moving_sample_count
+        + calibration_node.breakaway_sample_count
+      )
+      or controller_node.validation_count != calibration_node.validation_count
+      or controller_node.validation_rms
+      != calibration_node.inverse_calibration_validation_rms
+    ):
+      return False
+  return True
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovedProfileArtifact:
   """Exact, fail-closed proof bundle for one learned controller artifact.
@@ -307,21 +584,34 @@ class ApprovedProfileArtifact:
   separate: it proves the vehicle/twin delivered-curvature gates rather than
   allowing a command-space pass to imply physical path authority.
   ``device_timing_passed`` is also independent because only timing measured on
-  comma hardware can approve the runtime budget. All gates are mandatory.
+  comma hardware can approve the runtime budget. ``smooth_passed``,
+  ``swift_passed``, and ``strong_passed`` are independent behavioral contracts:
+  no aggregate score may trade one product value for another. The exact
+  behavioral selection evidence is bound by the canonical behavioral
+  finalization proof. The physical profile is independently bound to its
+  canonical calibration selection manifest. Neither proof can be replaced by
+  an opaque caller-supplied hash.
+  All gates are mandatory.
   """
 
   vehicle_profile: VehicleProfile
+  calibration_profile: VehicleCalibrationProfile
   controller_policy: ControllerPolicy
   runtime_vehicle_identity_sha256: str
   source_openpilot_commit: str
   opendbc_commit: str
-  learner_evidence_sha256: str
+  panda_commit: str
+  calibration_selection_manifest: CalibrationSelectionManifest
+  behavior_finalization: BehaviorLearningFinalization
   replay_harness_commit: str
   replay_passed: bool
   delivered_replay_passed: bool
   safety_passed: bool
   deterministic_aa_passed: bool
   device_timing_passed: bool
+  smooth_passed: bool
+  swift_passed: bool
+  strong_passed: bool
   schema_version: int = APPROVED_ARTIFACT_SCHEMA_VERSION
 
   def __post_init__(self) -> None:
@@ -334,20 +624,44 @@ class ApprovedProfileArtifact:
       self.runtime_vehicle_identity_sha256,
       "runtimeVehicleIdentitySha256",
     )
-    _strict_sha256(
-      self.learner_evidence_sha256,
-      "learnerEvidenceSha256",
-    )
     _strict_commit(
       self.source_openpilot_commit,
       "sourceOpenpilotCommit",
     )
     _strict_commit(self.opendbc_commit, "opendbcCommit")
+    _strict_commit(self.panda_commit, "pandaCommit")
     _strict_commit(self.replay_harness_commit, "replayHarnessCommit")
+    if not isinstance(self.vehicle_profile, VehicleProfile):
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "approved controller profile has the wrong type",
+      )
     if not self.vehicle_profile.qualified or self.vehicle_profile.revision < 1:
       _fail(
         ArtifactDiagnostic.UNQUALIFIED_PROFILE,
         "approved profile must be complete, qualified, and learned",
+      )
+    if (
+      not isinstance(self.calibration_profile, VehicleCalibrationProfile)
+      or not self.calibration_profile.qualified
+      or self.calibration_profile.revision < 1
+    ):
+      _fail(
+        ArtifactDiagnostic.UNQUALIFIED_PROFILE,
+        "approved observable calibration must be complete and qualified",
+      )
+    if not _controller_profile_matches_calibration(
+      self.vehicle_profile,
+      self.calibration_profile,
+    ):
+      _fail(
+        ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+        "controller profile does not preserve the observable calibration",
+      )
+    if not isinstance(self.controller_policy, ControllerPolicy):
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "approved controller policy has the wrong type",
       )
     if self.controller_policy.provisional:
       _fail(
@@ -360,6 +674,9 @@ class ApprovedProfileArtifact:
       self.safety_passed,
       self.deterministic_aa_passed,
       self.device_timing_passed,
+      self.smooth_passed,
+      self.swift_passed,
+      self.strong_passed,
     )
     if any(type(gate) is not bool for gate in gates):
       _fail(
@@ -371,6 +688,65 @@ class ApprovedProfileArtifact:
         ArtifactDiagnostic.GATE_FAILED,
         "every artifact acceptance gate must pass",
       )
+    if not isinstance(
+      self.calibration_selection_manifest,
+      CalibrationSelectionManifest,
+    ):
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "calibration selection manifest has the wrong type",
+      )
+    if not hmac.compare_digest(
+      self.calibration_selection_manifest.selected_controller_profile_sha256,
+      self.vehicle_profile_sha256,
+    ):
+      _fail(
+        ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+        "calibration selection does not name the active profile",
+      )
+    if not hmac.compare_digest(
+      self.calibration_selection_manifest.candidate_calibration_profile_sha256,
+      self.calibration_profile_sha256,
+    ):
+      _fail(
+        ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+        "calibration selection does not name the learned calibration",
+      )
+    if not isinstance(
+      self.behavior_finalization,
+      BehaviorLearningFinalization,
+    ):
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "behavior finalization has the wrong type",
+      )
+    finalization = self.behavior_finalization
+    if not finalization.passed:
+      _fail(
+        ArtifactDiagnostic.GATE_FAILED,
+        "behavior finalization did not pass every required gate",
+      )
+    behavior_projection = BehaviorPolicy.from_controller_policy(
+      self.controller_policy,
+    )
+    if (
+      finalization.final_behavior_policy != behavior_projection
+      or finalization.final_behavior_policy_sha256
+      != behavior_projection.sha256
+    ):
+      _fail(
+        ArtifactDiagnostic.BEHAVIOR_PROOF_MISMATCH,
+        "behavior finalization does not name the active controller policy",
+      )
+    if (
+      self.smooth_passed != finalization.smooth_passed
+      or self.swift_passed != finalization.swift_passed
+      or self.strong_passed != finalization.strong_passed
+    ):
+      _fail(
+        ArtifactDiagnostic.BEHAVIOR_PROOF_MISMATCH,
+        "artifact behavioral gates disagree with the finalization proof",
+      )
 
   @property
   def vehicle_profile_sha256(self) -> str:
@@ -380,11 +756,28 @@ class ApprovedProfileArtifact:
   def controller_policy_sha256(self) -> str:
     return self.controller_policy.sha256
 
+  @property
+  def calibration_profile_sha256(self) -> str:
+    return _sha256_text(self.calibration_profile.to_json())
+
+  @property
+  def learner_evidence_sha256(self) -> str:
+    return self.calibration_selection_manifest.learner_evidence_sha256
+
+  @property
+  def behavior_selection_sha256(self) -> str:
+    selection = self.behavior_finalization.behavior_selection_sha256
+    if selection is None:
+      raise AssertionError("approved behavior finalization lacks a selection")
+    return selection
+
   def to_param(self) -> dict[str, object]:
     return {
       "schemaVersion": self.schema_version,
       "vehicleProfileJson": self.vehicle_profile.to_json(),
       "vehicleProfileSha256": self.vehicle_profile_sha256,
+      "calibrationProfileJson": self.calibration_profile.to_json(),
+      "calibrationProfileSha256": self.calibration_profile_sha256,
       "controllerPolicyJson": self.controller_policy.to_json(),
       "controllerPolicySha256": self.controller_policy_sha256,
       "runtimeVehicleIdentitySha256": (
@@ -392,13 +785,26 @@ class ApprovedProfileArtifact:
       ),
       "sourceOpenpilotCommit": self.source_openpilot_commit,
       "opendbcCommit": self.opendbc_commit,
+      "pandaCommit": self.panda_commit,
+      "calibrationSelectionManifestJson": (
+        self.calibration_selection_manifest.to_json()
+      ),
+      "calibrationSelectionManifestSha256": (
+        self.calibration_selection_manifest.sha256
+      ),
       "learnerEvidenceSha256": self.learner_evidence_sha256,
+      "behaviorFinalizationJson": self.behavior_finalization.to_json(),
+      "behaviorFinalizationSha256": self.behavior_finalization.sha256,
+      "behaviorSelectionSha256": self.behavior_selection_sha256,
       "replayHarnessCommit": self.replay_harness_commit,
       "replayPassed": self.replay_passed,
       "deliveredReplayPassed": self.delivered_replay_passed,
       "safetyPassed": self.safety_passed,
       "deterministicAaPassed": self.deterministic_aa_passed,
       "deviceTimingPassed": self.device_timing_passed,
+      "smoothPassed": self.smooth_passed,
+      "swiftPassed": self.swift_passed,
+      "strongPassed": self.strong_passed,
     }
 
   @property
@@ -426,6 +832,10 @@ class ApprovedProfileArtifact:
       payload["vehicleProfileSha256"],
       "vehicleProfileSha256",
     )
+    calibration_profile_hash = _strict_sha256(
+      payload["calibrationProfileSha256"],
+      "calibrationProfileSha256",
+    )
     policy_hash = _strict_sha256(
       payload["controllerPolicySha256"],
       "controllerPolicySha256",
@@ -434,8 +844,26 @@ class ApprovedProfileArtifact:
       payload["vehicleProfileJson"],
       expected_vehicle_identity,
     )
+    calibration_profile = _calibration_profile_from_canonical_json(
+      payload["calibrationProfileJson"],
+      expected_vehicle_identity,
+    )
     policy = _policy_from_canonical_json(
       payload["controllerPolicyJson"],
+    )
+    calibration_manifest_hash = _strict_sha256(
+      payload["calibrationSelectionManifestSha256"],
+      "calibrationSelectionManifestSha256",
+    )
+    calibration_manifest = CalibrationSelectionManifest.from_json(
+      payload["calibrationSelectionManifestJson"],
+    )
+    behavior_finalization_hash = _strict_sha256(
+      payload["behaviorFinalizationSha256"],
+      "behaviorFinalizationSha256",
+    )
+    behavior_finalization = _behavior_finalization_from_canonical_json(
+      payload["behaviorFinalizationJson"],
     )
     if not hmac.compare_digest(
       profile_hash,
@@ -445,13 +873,66 @@ class ApprovedProfileArtifact:
         ArtifactDiagnostic.PROFILE_HASH_MISMATCH,
         "vehicle profile hash does not match its JSON",
       )
+    if not hmac.compare_digest(
+      calibration_profile_hash,
+      _sha256_text(calibration_profile.to_json()),
+    ):
+      _fail(
+        ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+        "calibration profile hash does not match its JSON",
+      )
     if not hmac.compare_digest(policy_hash, policy.sha256):
       _fail(
         ArtifactDiagnostic.POLICY_HASH_MISMATCH,
         "controller policy hash does not match its JSON",
       )
+    if not hmac.compare_digest(
+      calibration_manifest_hash,
+      calibration_manifest.sha256,
+    ):
+      _fail(
+        ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+        "calibration selection hash does not match its manifest",
+      )
+    if not hmac.compare_digest(
+      calibration_manifest.learner_evidence_sha256,
+      _strict_sha256(
+        payload["learnerEvidenceSha256"],
+        "learnerEvidenceSha256",
+      ),
+    ):
+      _fail(
+        ArtifactDiagnostic.CALIBRATION_PROOF_MISMATCH,
+        "learner evidence identity does not match calibration selection",
+      )
+    if not hmac.compare_digest(
+      behavior_finalization_hash,
+      behavior_finalization.sha256,
+    ):
+      _fail(
+        ArtifactDiagnostic.BEHAVIOR_PROOF_MISMATCH,
+        "behavior finalization hash does not match its JSON",
+      )
+    if not behavior_finalization.passed:
+      _fail(
+        ArtifactDiagnostic.GATE_FAILED,
+        "behavior finalization did not pass every required gate",
+      )
+    selection_sha = behavior_finalization.behavior_selection_sha256
+    if selection_sha is None or not hmac.compare_digest(
+      selection_sha,
+      _strict_sha256(
+        payload["behaviorSelectionSha256"],
+        "behaviorSelectionSha256",
+      ),
+    ):
+      _fail(
+        ArtifactDiagnostic.BEHAVIOR_PROOF_MISMATCH,
+        "behavior selection identity does not match its finalization",
+      )
     return cls(
       vehicle_profile=profile,
+      calibration_profile=calibration_profile,
       controller_policy=policy,
       runtime_vehicle_identity_sha256=_strict_sha256(
         payload["runtimeVehicleIdentitySha256"],
@@ -465,10 +946,12 @@ class ApprovedProfileArtifact:
         payload["opendbcCommit"],
         "opendbcCommit",
       ),
-      learner_evidence_sha256=_strict_sha256(
-        payload["learnerEvidenceSha256"],
-        "learnerEvidenceSha256",
+      panda_commit=_strict_commit(
+        payload["pandaCommit"],
+        "pandaCommit",
       ),
+      calibration_selection_manifest=calibration_manifest,
+      behavior_finalization=behavior_finalization,
       replay_harness_commit=_strict_commit(
         payload["replayHarnessCommit"],
         "replayHarnessCommit",
@@ -493,6 +976,18 @@ class ApprovedProfileArtifact:
         payload["deviceTimingPassed"],
         "deviceTimingPassed",
       ),
+      smooth_passed=_strict_bool(
+        payload["smoothPassed"],
+        "smoothPassed",
+      ),
+      swift_passed=_strict_bool(
+        payload["swiftPassed"],
+        "swiftPassed",
+      ),
+      strong_passed=_strict_bool(
+        payload["strongPassed"],
+        "strongPassed",
+      ),
       schema_version=payload["schemaVersion"],
     )
 
@@ -516,6 +1011,7 @@ class ApprovedArtifactReader:
     expected_runtime_vehicle_identity_sha256: str,
     expected_source_openpilot_commit: str,
     expected_opendbc_commit: str,
+    expected_panda_commit: str,
   ) -> ArtifactReadResult:
     try:
       value = self._params.get(APPROVED_ARTIFACT_PARAM, block=False)
@@ -542,6 +1038,10 @@ class ApprovedArtifactReader:
         expected_opendbc_commit,
         "expected opendbc commit",
       )
+      expected_panda = _strict_commit(
+        expected_panda_commit,
+        "expected panda commit",
+      )
       artifact = ApprovedProfileArtifact.from_param(
         value,
         expected_vehicle_identity=expected_vehicle_identity,
@@ -563,6 +1063,11 @@ class ApprovedArtifactReader:
         _fail(
           ArtifactDiagnostic.OPENDBC_COMMIT_MISMATCH,
           "approved artifact was gated against another opendbc commit",
+        )
+      if artifact.panda_commit != expected_panda:
+        _fail(
+          ArtifactDiagnostic.PANDA_COMMIT_MISMATCH,
+          "approved artifact was gated against another panda commit",
         )
     except ArtifactValidationError as exc:
       return ArtifactReadResult(artifact=None, diagnostic=exc.reason)
@@ -681,6 +1186,7 @@ class PersistentProfileActivation:
     expected_runtime_vehicle_identity_sha256: str,
     expected_source_openpilot_commit: str,
     expected_opendbc_commit: str,
+    expected_panda_commit: str,
     production_envelope_verified: bool,
   ):
     self._params = params
@@ -692,6 +1198,7 @@ class PersistentProfileActivation:
       expected_source_openpilot_commit
     )
     self._expected_opendbc_commit = expected_opendbc_commit
+    self._expected_panda_commit = expected_panda_commit
     if type(production_envelope_verified) is not bool:
       raise TypeError("production envelope verification must be boolean")
     self._production_envelope_verified = production_envelope_verified
@@ -820,6 +1327,11 @@ class PersistentProfileActivation:
       _fail(
         ArtifactDiagnostic.OPENDBC_COMMIT_MISMATCH,
         "activation artifact opendbc commit does not match",
+      )
+    if artifact.panda_commit != self._expected_panda_commit:
+      _fail(
+        ArtifactDiagnostic.PANDA_COMMIT_MISMATCH,
+        "activation artifact panda commit does not match",
       )
 
   def _state_from_param(self, value: object) -> _ActivationState:
@@ -950,6 +1462,7 @@ class PersistentProfileActivation:
         ArtifactDiagnostic.RUNTIME_VEHICLE_MISMATCH,
         ArtifactDiagnostic.SOURCE_COMMIT_MISMATCH,
         ArtifactDiagnostic.OPENDBC_COMMIT_MISMATCH,
+        ArtifactDiagnostic.PANDA_COMMIT_MISMATCH,
       ):
         self._state_stale_build = True
         self._state_valid = False

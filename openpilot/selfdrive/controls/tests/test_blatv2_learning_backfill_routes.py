@@ -99,7 +99,11 @@ class FakeEvent:
       self.sentinel = SimpleNamespace(type=payload)
     elif which == "carParams":
       self.carParams = FakeCarParamsPayload(bytes(payload))
-    elif which in learning_backfill._SOURCE_SERVICES:
+    elif (
+      which in learning_backfill._SOURCE_SERVICES
+      or which in learning_backfill._BEHAVIOR_CONTEXT_SERVICES
+      or which in learning_backfill._CANONICAL_WITNESS_SERVICES
+    ):
       setattr(self, which, payload)
 
   def which(self) -> str:
@@ -119,7 +123,10 @@ class FakeEventContext(AbstractContextManager[FakeEvent]):
 
 def source_message(service: str, cp: car.CarParams) -> object:
   if service == "carControl":
-    return SimpleNamespace(latActive=True)
+    return SimpleNamespace(
+      latActive=True,
+      actuators=SimpleNamespace(torque=0.1),
+    )
   if service == "carState":
     return SimpleNamespace(
       vEgo=10.0,
@@ -135,7 +142,7 @@ def source_message(service: str, cp: car.CarParams) -> object:
     )
   if service == "carOutput":
     return SimpleNamespace(
-      actuatorsOutput=SimpleNamespace(torque=0.0),
+      actuatorsOutput=SimpleNamespace(torque=0.0, torqueOutputCan=0.0),
     )
   if service == "liveParameters":
     return SimpleNamespace(
@@ -149,6 +156,47 @@ def source_message(service: str, cp: car.CarParams) -> object:
       roll=0.0,
     )
   raise AssertionError(service)
+
+
+class _FakeTorqueState:
+  def __init__(self) -> None:
+    self.modularArchitecture = "blatv2.modular.inverse-rack"
+    self.modularSelection = 0
+    self.modularArtifactHash = ""
+    self.modularSourceOpenpilotCommit = ""
+    self.modularOpendbcCommit = ""
+    self.modularSelectionBound = False
+
+
+class _FakeLateralState:
+  def __init__(self) -> None:
+    self.torqueState = _FakeTorqueState()
+
+  @staticmethod
+  def which() -> str:
+    return "torqueState"
+
+
+def controls_message(model_mono_ns: int) -> object:
+  return SimpleNamespace(
+    lateralPlanMonoTime=model_mono_ns,
+    curvature=-0.0,
+    desiredCurvature=-0.0,
+    lateralControlState=_FakeLateralState(),
+  )
+
+
+def model_message(frame_id: int) -> object:
+  return SimpleNamespace(
+    frameId=frame_id,
+    timestampEof=frame_id,
+    action=SimpleNamespace(
+      desiredCurvature=0.0,
+      desiredCurvatureTime=0.2,
+    ),
+    orientationRate=SimpleNamespace(t=(0.0, 0.05), z=(0.0, 0.0)),
+    velocity=SimpleNamespace(t=(0.0, 0.05), x=(10.0, 10.0)),
+  )
 
 
 def extracted_fixture(
@@ -211,7 +259,11 @@ def extracted_fixture(
       ),
     )
   if structure == "payload_before_start":
-    add("controlsState", base - 22_000_000)
+    add(
+      "controlsState",
+      base - 22_000_000,
+      payload=controls_message(base - 23_000_000),
+    )
   add(
     "sentinel",
     base - 20_000_000,
@@ -228,6 +280,26 @@ def extracted_fixture(
       base - 5_000_000,
       payload=b"canonical-route-car-params",
     )
+  add(
+    "liveTorqueParameters",
+    base - 4_000_000,
+    payload=SimpleNamespace(
+      liveValid=True, useParams=True, version=1,
+      latAccelFactorFiltered=2.5, latAccelOffsetFiltered=0.0,
+      frictionCoefficientFiltered=0.1, latAccelFactorRaw=2.5,
+      latAccelOffsetRaw=0.0, frictionCoefficientRaw=0.1,
+    ),
+  )
+  add(
+    "liveDelay",
+    base - 3_000_000,
+    payload=SimpleNamespace(lateralDelay=0.12, status="valid", version=1),
+  )
+  add(
+    "lateralManeuverPlan",
+    base - 2_000_000,
+    payload=SimpleNamespace(desiredCurvature=0.0),
+  )
 
   for index in range(control_count):
     timestamp = base + index * 10_000_000
@@ -239,8 +311,11 @@ def extracted_fixture(
       or source_mode == "late" and index >= control_count // 2
       or source_mode == "control_before_equal" and index > 0
     )
+    model_mono_ns = timestamp - 1_000_000
+    add("modelV2", model_mono_ns, payload=model_message(index))
+    add("selfdriveState", timestamp, payload=SimpleNamespace())
     if source_mode == "control_before_equal" and index == 0:
-      add("controlsState", timestamp)
+      add("controlsState", timestamp, payload=controls_message(model_mono_ns))
       for service in learning_backfill._SOURCE_SERVICES:
         add(
           service,
@@ -255,7 +330,7 @@ def extracted_fixture(
           timestamp,
           payload=source_message(service, cp),
         )
-    add("controlsState", timestamp)
+    add("controlsState", timestamp, payload=controls_message(model_mono_ns))
 
   end_time = base + control_count * 10_000_000 + 40_000_000
   add("sentinel", end_time, payload=end_sentinel)
@@ -484,9 +559,11 @@ def test_equal_timestamp_join_uses_original_record_order(
   )
 
   assert prepared.controls_witness_count == 200
-  assert prepared.unresolved_witness_count == 1
-  assert len(prepared.frames) == 199
-  assert prepared.frames[0].sample_mono_ns == 1_010_000_000
+  # The canonical selfdrive poll/source-order race resolves the equal-time
+  # source publication rather than treating it as a missing prior sample.
+  assert prepared.unresolved_witness_count == 0
+  assert len(prepared.frames) == 200
+  assert prepared.frames[0].sample_mono_ns == 1_000_000_000
 
 
 @pytest.mark.parametrize("invalid_kind", ["initData", "carParams", "sentinel"])
@@ -583,7 +660,12 @@ def test_quality_gate_covers_all_controls_and_route_tail(
       cp=palisade_cp,
       car_params_decoder=None,
     )
-  assert raised.value.reason == "measurement_continuity_failed"
+  expected = (
+    "measurement_race_unreconstructable"
+    if source_mode == "late"
+    else "measurement_continuity_failed"
+  )
+  assert raised.value.reason == expected
 
 
 @pytest.mark.parametrize(

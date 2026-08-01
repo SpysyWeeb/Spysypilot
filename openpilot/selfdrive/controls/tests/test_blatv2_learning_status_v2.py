@@ -10,8 +10,13 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationLearningFinalization,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CalibrationFitStatus,
+  CalibrationInterpolationQualificationReport,
   CalibrationLearningResult,
+  CalibrationModelFitDiagnostic,
+  CalibrationModelId,
   CalibrationNodeQualificationReport,
+  CalibrationPairedLossDiagnostic,
   CalibrationQualificationReason,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
@@ -110,7 +115,7 @@ def _report(
   qualified: bool = True,
 ) -> CalibrationNodeQualificationReport:
   reasons = (
-    (CalibrationQualificationReason.QUALIFIED,)
+    (CalibrationQualificationReason.LEARNED,)
     if qualified
     else (CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE,)
   )
@@ -157,6 +162,36 @@ def _report(
     authority_validation_count=6,
     authority_seed_validation_rms=0.14,
     authority_candidate_validation_rms=0.09,
+    fit_diagnostics=tuple(
+      CalibrationModelFitDiagnostic(
+        model=model,
+        status=CalibrationFitStatus.IDENTIFIABLE,
+        moving_rank=rank,
+        moving_parameter_count=rank,
+        condition_estimate=1.0,
+        breakaway_rank=1,
+        breakaway_parameter_count=1,
+      )
+      for model, rank in (
+        (CalibrationModelId.STATIC_ONLY, 0),
+        (CalibrationModelId.FRICTION_MAP, 1),
+        (CalibrationModelId.OFFSET_AND_FRICTION, 2),
+        (CalibrationModelId.FULL_MAP, 3),
+      )
+    ),
+    training_paired_loss=(
+      CalibrationPairedLossDiagnostic(2, -0.02, 0.005, -0.025, -0.015, 1e-14)
+      if qualified
+      else None
+    ),
+    validation_paired_loss=(
+      CalibrationPairedLossDiagnostic(2, -0.01, 0.002, -0.012, -0.008, 1e-14)
+      if qualified
+      else None
+    ),
+    training_outcome=(
+      CalibrationQualificationReason.LEARNED if qualified else None
+    ),
   )
 
 
@@ -173,17 +208,44 @@ def _fixtures(*, qualified: bool = True):
     for index, node in enumerate(seed.nodes)
   )
   profile = candidate if qualified else None
+  interpolation_reports = (
+    (
+      CalibrationInterpolationQualificationReport(
+        interval_index=0,
+        lower_speed_mps=seed.nodes[0].speed_mps,
+        upper_speed_mps=seed.nodes[1].speed_mps,
+        training_paired_loss=CalibrationPairedLossDiagnostic(
+          2, -0.02, 0.005, -0.025, -0.015, 1e-14
+        ),
+        validation_paired_loss=CalibrationPairedLossDiagnostic(
+          2, -0.01, 0.002, -0.012, -0.008, 1e-14
+        ),
+        reasons=(CalibrationQualificationReason.QUALIFIED,),
+      ),
+    )
+    if qualified
+    else ()
+  )
   candidate_json = None if profile is None else profile.to_json().encode()
   finalization = CalibrationLearningFinalization(
     manifest_bytes=b"status-v2-manifest",
     manifest_sha256="a" * 64,
     evidence_bytes=b"status-v2-evidence",
     evidence_sha256="b" * 64,
+    selected_profile_json=candidate_json,
+    selected_profile_sha256=(
+      None if candidate_json is None else hashlib.sha256(candidate_json).hexdigest()
+    ),
     candidate_profile_json=candidate_json,
     candidate_profile_sha256=(
       None if candidate_json is None else hashlib.sha256(candidate_json).hexdigest()
     ),
-    learning_result=CalibrationLearningResult(reports, profile),
+    learning_result=CalibrationLearningResult(
+      reports,
+      profile,
+      interpolation_reports,
+      selected_profile=profile,
+    ),
   )
   runtime = _RuntimeBundle(seed.vehicle_identity, "c" * 64, seed)
   return runtime, finalization
@@ -212,7 +274,7 @@ def _baseline() -> DriveEvidenceBaseline:
   return DriveEvidenceBaseline.from_support_diagnostics(diagnostics)
 
 
-def test_schema_v2_roundtrip_identity_observable_parameters_and_deltas() -> None:
+def test_schema_v3_roundtrip_identity_observable_parameters_and_deltas() -> None:
   runtime, finalization = _fixtures()
   baseline = _baseline()
   payload = build_learning_status_payload(
@@ -226,13 +288,16 @@ def test_schema_v2_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 2
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 3
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
     runtime.calibration_seed_profile.to_json().encode(),
   ).hexdigest()
   assert payload["all_nodes_qualified"] is True
+  assert payload["all_nodes_evaluated"] is True
+  assert payload["all_intervals_qualified"] is True
+  assert payload["candidate_profile_available"] is True
   assert payload["candidate_profile_sha256"] == finalization.candidate_profile_sha256
   assert decode_learning_status(encoded) == payload
   with unittest.TestCase().assertRaisesRegex(ValueError, "not canonical"):
@@ -245,6 +310,11 @@ def test_schema_v2_roundtrip_identity_observable_parameters_and_deltas() -> None
   ).encode()
 
   node = payload["nodes"][0]
+  assert node["evaluation_status"] == "learned"
+  assert node["training_outcome"] == "learned"
+  assert len(node["fit_diagnostics"]) == 4
+  assert node["fit_diagnostics"][-1]["moving_rank"] == 3
+  assert node["training_paired_loss"]["route_count"] == 2
   assert node["candidate_parameters"] == {
     "kinetic_friction_torque": 0.03,
     "lateral_accel_offset_correction_mps2": -0.04,
@@ -264,6 +334,36 @@ def test_schema_v2_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert node["last_drive_authority_fit_support_s"] == 1.0
   assert node["last_drive_authority_fit_sample_count"] == 10
 
+
+def test_fully_evaluated_validation_regression_is_not_reported_as_pending() -> None:
+  runtime, finalization = _fixtures(qualified=False)
+  rejected_reports = tuple(
+    replace(
+      report,
+      reasons=(CalibrationQualificationReason.VALIDATION_REGRESSION,),
+      training_outcome=CalibrationQualificationReason.LEARNED,
+    )
+    for report in finalization.learning_result.node_reports
+  )
+  rejected = replace(
+    finalization,
+    learning_result=CalibrationLearningResult(rejected_reports, None, ()),
+  )
+
+  payload = build_learning_status_payload(
+    finalization=rejected,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+
+  assert payload["all_nodes_evaluated"] is True
+  assert payload["all_nodes_qualified"] is False
+  assert payload["all_intervals_qualified"] is False
+  assert payload["candidate_profile_available"] is False
+  assert all(
+    node["evaluation_status"] == "validation_regressed"
+    for node in payload["nodes"]
+  )
 
 def test_device_accumulation_rounding_projects_without_hiding_snapshot() -> None:
   diagnostics = tuple(
@@ -340,7 +440,7 @@ def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None
   )
 
   legacy = json.loads(json.dumps(payload))
-  legacy["schema_version"] = 1
+  legacy["schema_version"] = 2
   with test_case.assertRaisesRegex(ValueError, "version/authority marker"):
     decode_learning_status(json.dumps(legacy, sort_keys=True, separators=(",", ":")))
 
@@ -368,6 +468,7 @@ def test_baseline_rejects_any_population_moving_backwards() -> None:
   bad_result = CalibrationLearningResult(
     (backwards, *finalization.learning_result.node_reports[1:]),
     finalization.learning_result.candidate_profile,
+    finalization.learning_result.interpolation_reports,
   )
   bad_finalization = replace(finalization, learning_result=bad_result)
 
@@ -389,9 +490,120 @@ def test_candidate_identity_requires_every_node_qualified() -> None:
   )["candidate_profile_sha256"] is None
 
   forged = replace(finalization, candidate_profile_sha256="d" * 64)
-  with test_case.assertRaisesRegex(ValueError, "candidate hash and node qualification disagree"):
+  with test_case.assertRaisesRegex(ValueError, "candidate hash and profile availability disagree"):
     build_learning_status_payload(
       finalization=forged,
       runtime_bundle=runtime,
       drive_baseline=None,
     )
+
+
+def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
+  runtime, finalization = _fixtures()
+  zero_loss = CalibrationPairedLossDiagnostic(
+    2, 0.0, 0.0, 0.0, 0.0, 1e-14
+  )
+  reports = tuple(
+    replace(
+      report,
+      reasons=(CalibrationQualificationReason.SEED_RETAINED,),
+      candidate_parameters=runtime.calibration_seed_profile.nodes[index].parameters,
+      training_outcome=CalibrationQualificationReason.SEED_RETAINED,
+      training_paired_loss=zero_loss,
+      validation_paired_loss=zero_loss,
+    )
+    for index, report in enumerate(finalization.learning_result.node_reports)
+  )
+  intervals = tuple(
+    replace(
+      report,
+      training_paired_loss=zero_loss,
+      validation_paired_loss=zero_loss,
+    )
+    for report in finalization.learning_result.interpolation_reports
+  )
+  all_seed = replace(
+    finalization,
+    candidate_profile_json=None,
+    candidate_profile_sha256=None,
+    learning_result=CalibrationLearningResult(reports, None, intervals),
+  )
+  payload = build_learning_status_payload(
+    finalization=all_seed,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  assert payload["all_nodes_evaluated"] is True
+  assert payload["all_intervals_qualified"] is True
+  assert payload["all_nodes_qualified"] is True
+  assert payload["candidate_profile_available"] is False
+  assert payload["candidate_profile_sha256"] is None
+  assert all(node["evaluation_status"] == "seed_retained" for node in payload["nodes"])
+
+
+def test_failure_classifications_remain_distinct() -> None:
+  runtime, finalization = _fixtures(qualified=False)
+  cases = (
+    (
+      CalibrationQualificationReason.INSUFFICIENT_EXCITATION,
+      "evidence_insufficient",
+      None,
+      None,
+    ),
+    (
+      CalibrationQualificationReason.RANK_DEFICIENT_FIT,
+      "rank_deficient",
+      CalibrationFitStatus.RANK_DEFICIENT,
+      None,
+    ),
+    (
+      CalibrationQualificationReason.ILL_CONDITIONED_FIT,
+      "ill_conditioned",
+      CalibrationFitStatus.ILL_CONDITIONED,
+      None,
+    ),
+    (
+      CalibrationQualificationReason.VALIDATION_INCONCLUSIVE,
+      "validation_inconclusive",
+      None,
+      CalibrationQualificationReason.LEARNED,
+    ),
+    (
+      CalibrationQualificationReason.VALIDATION_REGRESSION,
+      "validation_regressed",
+      None,
+      CalibrationQualificationReason.LEARNED,
+    ),
+  )
+  for reason, expected, fit_status, training_outcome in cases:
+    reports = list(finalization.learning_result.node_reports)
+    diagnostics = reports[0].fit_diagnostics
+    if fit_status is not None:
+      diagnostics = (
+        replace(
+          diagnostics[0],
+          status=fit_status,
+          breakaway_rank=(
+            0
+            if fit_status is CalibrationFitStatus.RANK_DEFICIENT
+            else diagnostics[0].breakaway_rank
+          ),
+        ),
+        *diagnostics[1:],
+      )
+    reports[0] = replace(
+      reports[0],
+      reasons=(reason,),
+      fit_diagnostics=diagnostics,
+      training_outcome=training_outcome,
+    )
+    classified = replace(
+      finalization,
+      learning_result=CalibrationLearningResult(tuple(reports), None),
+    )
+    payload = build_learning_status_payload(
+      finalization=classified,
+      runtime_bundle=runtime,
+      drive_baseline=None,
+    )
+    assert payload["nodes"][0]["evaluation_status"] == expected

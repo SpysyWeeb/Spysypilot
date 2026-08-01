@@ -47,6 +47,13 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   LEARNING_STATUS_PARAM,
   build_learning_status_payload,
 )
+from openpilot.selfdrive.controls.lib.blatv2.behavior_learning_status import (
+  BehaviorLearningStatusPublisher,
+)
+from openpilot.selfdrive.controls.lib.blatv2.behavior_pipeline import (
+  BehaviorPipelineResult,
+  OffroadBehaviorLearningPipeline,
+)
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
   RemotePreparationSession,
   prepare_remote_session,
@@ -127,6 +134,9 @@ class BlatV2BackfillDaemon:
     current_build_clean: Callable[[], bool] = (
       _manager_declares_clean_build
     ),
+    behavior_pipeline_factory: Callable[..., Any] = (
+      OffroadBehaviorLearningPipeline
+    ),
   ) -> None:
     self.params = Params() if params is None else params
     self.log_root = Path(Paths.log_root() if log_root is None else log_root)
@@ -138,7 +148,9 @@ class BlatV2BackfillDaemon:
     self.extractor_path = Path(extractor_path)
     self.descriptor_path = Path(descriptor_path)
     self.current_build_clean = current_build_clean
+    self.behavior_pipeline_factory = behavior_pipeline_factory
     self.operation_status = LearningOperationStatusPublisher(self.params)
+    self.behavior_status = BehaviorLearningStatusPublisher(self.params)
     self.backfill_progress = BackfillProgressPublisher(self.params)
     self._stopping = False
 
@@ -492,6 +504,70 @@ class BlatV2BackfillDaemon:
         "blatv2 backfill learning display projection failed",
       )
 
+  def _offroad_confirmed(self) -> bool:
+    """Independent publication guard for informational behavior artifacts."""
+    if self._stopping:
+      return False
+    try:
+      value = self.params.get_bool("IsOffroad")
+    except (
+      AttributeError,
+      KeyError,
+      TypeError,
+      ValueError,
+      RuntimeError,
+      OSError,
+    ):
+      return False
+    return type(value) is bool and value
+
+  def _run_behavior_learning(
+    self,
+    engine: HistoricalLearningBackfill,
+  ) -> BehaviorPipelineResult | None:
+    """Run the independent behavior stage without reclassifying calibration.
+
+    Physical evidence has already committed before this method is reachable.
+    A behavior failure therefore retains stock and is reported through its own
+    Params status; it must not rewrite the successful physical operation as a
+    backfill failure.
+    """
+    if self._abort_requested():
+      return None
+    try:
+      source_commit = _decode_text(self.params.get("GitCommit", block=False))
+      opendbc_commit = get_commit(str(Path(BASEDIR) / "opendbc_repo"))
+      panda_commit = get_commit(str(Path(BASEDIR) / "panda"))
+      if (
+        source_commit is None
+        or len(source_commit) != 40
+        or len(opendbc_commit) != 40
+        or len(panda_commit) != 40
+      ):
+        raise ValueError("behavior replay build provenance is unavailable")
+      dynamics = ProvisionalRackDynamics.from_json_file(
+        PROVISIONAL_RACK_DYNAMICS_PATH,
+      )
+      pipeline = self.behavior_pipeline_factory(
+        params=self.params,
+        status_publisher=self.behavior_status,
+        provisional_dynamics=dynamics,
+        source_openpilot_commit=source_commit,
+        opendbc_commit=opendbc_commit,
+        panda_commit=panda_commit,
+        abort_requested=self._abort_requested,
+        offroad_confirmed=self._offroad_confirmed,
+        logger=cloudlog,
+      )
+      return pipeline.run(engine.runtime_factory())
+    except Exception:
+      # The pipeline itself projects a fail-closed status for expected
+      # transaction failures. This catch protects physical evidence from
+      # construction/provenance errors before the pipeline can own a status.
+      if not self._abort_requested():
+        cloudlog.exception("blatv2 behavior learning failed unexpectedly")
+      return None
+
   def run(self) -> None:
     car_params = None
     try:
@@ -527,6 +603,11 @@ class BlatV2BackfillDaemon:
               # not survive a constructor, replay, projection, or preserve
               # failure, and are never inputs to a later daemon operation.
               session.close()
+        if not result.pending_logger_close:
+          # Close remote preparation/network scratch before behavior replay
+          # forks. Behavioral inputs come only from the durable A/A route
+          # store and the authenticated physical CURRENT generation.
+          self._run_behavior_learning(local_engine)
         if not result.pending_logger_close:
           # Stay healthy under manager's offroad predicate without rescanning.
           # A new drive requires an onroad transition, which aborts this

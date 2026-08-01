@@ -15,6 +15,10 @@ Every report identifies:
 - the controller-policy artifact;
 - the learned vehicle-profile SHA-256;
 - the learner-evidence SHA-256;
+- the physical generation and route-evidence-set SHA-256s;
+- the behavior gate/segmentation, transaction, finalization, and generation
+  SHA-256s when behavioral qualification has run;
+- the exact recorded controller/source cohort identity; and
 - the replay-harness commit and input-timeline hashes.
 
 The controller and replay import the same numerical source. Device-specific
@@ -86,6 +90,15 @@ late-skipped route to its content and disposition so a route is never counted
 twice. Publication writes a complete immutable generation before atomically
 switching its `CURRENT` pointer.
 
+Each authority decodes and canonical-joins each raw route exactly once into an
+independent `BLATRE02` version-2 route-evidence artifact. The physical frame
+plane appears once alongside the compact model, controls, live-torque, delay,
+maneuver, and event planes needed by behavioral replay. The physical-only
+`BLATSP01` format is incompatible. No authority may consume its peer's prepared
+bytes. Four production lanes consist of the two causal authority owners and one
+private route-preparation helper per owner; worker counts 1 and 2 are diagnostic
+modes, and 3 is invalid because it makes the authorities asymmetric.
+
 An off-device worker may accelerate only route preparation. Before it is
 field eligible, acceptance must additionally prove:
 
@@ -116,8 +129,8 @@ a pathname swap or a binary change between routes is a stable reader failure.
 
 For each unseen accepted preparation-compatibility domain, the device first
 prepares one locally retained test-vector route with the ARM extractor and
-requires whole-spool SHA, size, frame count, and bytes to equal the PC
-authority spool. The atomic HMAC-bound certificate is keyed by source,
+requires whole-artifact SHA, size, frame count, and bytes to equal the PC
+authority route-evidence artifact. The atomic HMAC-bound certificate is keyed by source,
 opendbc, panda, runtime, historical/effective descriptor registries, both
 extractors, the worker process instance, canonical join/extractor schemas, log
 schema, CarParams, and physical compatibility. A worker restart therefore
@@ -148,10 +161,28 @@ binary that actually decoded the rlogs. Treating those two binaries as the
 same artifact would make provenance dishonest; semantic artifact equality is
 the portability gate.
 
-The current observable-calibration contract is profile schema 2, evidence
-schema 6, coordinator artifact schema 5, and namespace
-`complete_full_rlog_authority_v4`. It starts from empty evidence. Retired v1,
-v2, and v3 artifact bytes are immutable and cannot be migrated into v4.
+The current contract identities are:
+
+| Contract | Value |
+| --- | --- |
+| calibration profile / evidence / coordinator | 2 / 8 / 8 |
+| runtime vehicle / calibration identity / provisional dynamics | 1 / 1 / 1 |
+| physical learning / operation / progress status | 3 / 1 / 1 |
+| native extractor / canonical join | 3 / 3 |
+| route evidence | `BLATRE02`, version 2 |
+| backfill ledger / commit / pointer | 2 / 2 / 1 |
+| inclusion namespace | `complete_full_rlog_authority_v6` |
+| controller policy | 1 |
+| behavior gate / segmentation / replay input | 3 / 1 / 1 |
+| behavior transaction / finalization | 2 / 1 |
+| behavior generation / pointer / route-set | 1 / 1 / 1 |
+| behavior learning status | 1 |
+| future feedback / lifecycle status | 2 / 2 |
+| future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
+| off-device protocol / certification | 1 / 2 |
+
+The v6 physical namespace starts from empty evidence. Retired v1 through v5
+artifact bytes are immutable and cannot be migrated into it.
 
 Each speed node independently requires its documented clean support,
 bidirectional excitation, whole-route train/validation split, valid inverse
@@ -163,6 +194,17 @@ Slew and stationary-full-torque observations cannot become equality-fit rows;
 settled full magnitude may join only with resolved rack motion. Samples affect
 only adjacent interpolation nodes. Consequently, extended highway use cannot
 overwrite low-speed evidence.
+
+The exact clean-support floors are 150 s at the 0/5 m/s nodes, 240 s at
+10/15 m/s, and 420 s at 20/30 m/s. These are accepted weighted response
+seconds, not drive-clock seconds. Every node also needs at least 20% held-out
+support, bidirectional excitation, and at least four training and four
+validation moving rows plus four training and four validation complete
+breakaway episodes, with both directions represented. The shorter low-speed
+floor recognizes that sharp turns are data-dense; it does not waive rare
+breakaway or validation evidence. Missing support, missing variety, rank
+deficiency, ill conditioning, inconclusive selection, and validation regression
+must remain distinct reported outcomes.
 
 The candidate may contain only torque per lateral acceleration, signed
 lateral-acceleration offset correction, moving friction, and static breakaway,
@@ -177,17 +219,81 @@ visible as `static == kinetic`; post-fit clipping is forbidden.
 Raw measured steering-angle onset plus same-direction measured-rate
 confirmation defines one physical breakaway episode. Training considers the
 nested static-only, friction, offset-plus-friction, and full-map models. The
-seed is comparator-only. A dense category cannot outvote a regression in a
+seed is a selectable safe result, and a learned replacement must clear paired
+whole-route uncertainty. A dense category cannot outvote a regression in a
 sparse category, and held-out validation can reject only the frozen training
-winner—it cannot choose a fallback model.
+winner—it cannot choose a fallback model. Adjacent-node interpolation is
+validated from exact sufficient statistics before a mixed profile qualifies.
 
-A candidate profile is emitted only when every required node qualifies.
+A candidate profile is emitted only when every required node and interpolation
+interval qualifies and at least one node differs from the seed. An all-seed
+result is a complete qualified evaluation, not a candidate or an error.
 Partial profiles remain evidence, not control artifacts.
 
-Learning-status schema 2 is a strict display projection of those exact
+Learning-status schema 3 is a strict display projection of those exact
 populations and candidate values. Legacy rack-fit fields or an unknown schema
 fail closed in the UI. The cache remains informational and has no approval or
 activation authority.
+
+## Behavioral qualification
+
+Behavior starts only after the physical `CURRENT` authenticates a fully
+qualified selected profile. An all-seed physical selection is valid input; a
+partial profile is not. Behavior failure or insufficient routes cannot mutate
+the already published physical generation.
+
+The only behavior dials are one speed-independent closed-loop natural frequency
+and one damping ratio. Natural frequency represents response speed/stiffness;
+damping ratio represents settling and resistance to ringing. No speed schedule,
+maneuver rule, reference offset, observer change, or actuator-limit change is a
+behavior candidate.
+
+The route population must be the newest contiguous cohort with one exact
+recorded controller/source identity. Missing, rejected, corrupt, or ineligible
+evidence interleaved before a proven source boundary is blocking, not skippable.
+The committed partition reserves two whole routes for validation, and paired
+uncertainty requires two routes per side, so four homogeneous routes (two train,
+two held out) is the minimum. Every metric also requires at least two routes,
+three windows, and all of its committed speed/maneuver strata; four routes may
+therefore remain insufficient.
+
+Training scores exact stock, the currently accepted artifact, and every
+candidate on the same scalar-anchored target and segmentation. Exact stock is
+both bootstrap and incumbent when no approved modular artifact exists. One
+winner is frozen before held-out data is examined. Held-out replay scores only
+stock, incumbent, and that winner; it cannot choose a fallback. Logger events
+locate evidence but do not label quality, and driver contact censors only the
+post-contact response. Lane lines and driver interventions never become target
+or vote inputs.
+
+The following gate families are independent:
+
+- **Smooth:** applied torque-rate RMS, worst one-second burst, and release
+  overshoot;
+- **Swift:** correction latency and signed delivered turn-in/release timing;
+  early timing is not accepted as “fast”; and
+- **Strong:** delivered-curvature fraction, maneuver completion, and integrated
+  absolute path error.
+
+Every candidate must satisfy absolute physical bounds, beat or match exact
+stock and the incumbent beyond observed paired whole-route uncertainty, and
+materially improve the committed path-error target. There is no weighted total
+that can trade one contract away.
+
+The entire transaction runs twice from independently reloaded `BLATRE02`
+artifacts and fresh replay cores, using up to four fork workers within each
+authority. Only canonical byte-identical results publish. The behavior store
+uses immutable schema-1 generations under `behavior_generations_v1`; all files
+are hash-bound before its own atomic `CURRENT` replacement. A passing result may
+contain an informational policy. Any non-passing safe result is explicitly
+`stock_retained` and omits `policy.json`. Neither result writes approval Params
+or changes controller selection.
+
+`BLaTv2BehaviorLearningStatus` schema 1 exposes waiting for physical profile,
+waiting for homogeneous routes, preparing, training, selecting, validating,
+publishing, complete, or failed. It reports route/replay progress and separate
+Smooth/Swift/Strong verdicts. Like all status Params, it is a rebuildable UI
+projection, not evidence or authority.
 
 `BLaTv2LearningOperationStatus` may expose logger finalization, historical
 scanning/replay progress, and terminal diagnostics. No managed onroad process
@@ -239,11 +345,12 @@ not a weighted score that permits trading one word away.
 
 ## Future-only activation and rollback gate
 
-The current observable-learning milestone does not execute this section. Its
-all-node candidate is informational and hash-addressed only; it cannot write
-`BLaTv2ApprovedArtifact`, stage a controller, or change stock selection. This
-section pins the acceptance contract for a separately reviewed future
-consumer.
+The current learning milestone does not execute this section. Its selected
+physical profile and optional behavior policy are informational and
+hash-addressed only; neither pipeline can write `BLaTv2ApprovedArtifact`, stage
+a controller, or change stock selection. `stock_retained` deliberately has no
+policy file. This section pins the acceptance contract for a separately
+reviewed future consumer.
 
 An exact profile hash may eventually be staged only when raw/applied replay,
 delivered-curvature replay, deterministic A/A, comma-device timing, and
@@ -261,6 +368,12 @@ or **Not sure**. The answer is evidence:
   objective gates remain valid;
 - **Not sure** keeps the profile provisional;
 - steering overrides are bookmarks, not automatic negative labels.
+
+Feedback is contextual only. It is never a learner input and cannot waive an
+objective, timing, safety, source-identity, or portability gate. In particular,
+**Better** cannot approve a failed artifact, and **About same** cannot erase a
+measured regression. The prompt can request rollback or keep an already
+approved future artifact provisional; it cannot create approval.
 
 Invalid core output follows the tested hold, decay, comm-issue, and
 ten-valid-frame recovery contract. That safety behavior is not a tuning
