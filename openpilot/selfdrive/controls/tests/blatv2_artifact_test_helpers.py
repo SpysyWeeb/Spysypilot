@@ -42,6 +42,7 @@ def route_evidence_for_frames(
   frames: tuple[MeasuredLearningFrame, ...],
   provenance: Mapping[str, object],
   *,
+  car_params_bytes: bytes = b"test-canonical-car-params",
   runtime_identity: str | None = None,
 ) -> RouteEvidenceArtifact:
   """Build complete but behavior-ineligible v2 evidence for unit fixtures."""
@@ -107,7 +108,7 @@ def route_evidence_for_frames(
     for index, frame in enumerate(frames)
   )
   return RouteEvidenceArtifact(
-    source, b"test-canonical-car-params",
+    source, car_params_bytes,
     b"".join(_encode_frame(frame) for frame in frames), (), controls,
   )
 
