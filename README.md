@@ -33,12 +33,18 @@ for a confirmed, lead-free model stop prediction. It holds that handoff through
 the stop and returns to Chill after a stable release or driver override.
 
 There is no standalone traffic-light or stop-sign classifier in this build, so
-the detector uses the model's existing `action.shouldStop`, path-end, and
-desired-acceleration signals. The effective state has one owner and publishes
-through `selfdriveState.experimentalMode`, which drives both the stock on-road
-icon and planner strategy. The feature adds no UI or user-facing Params and
-does not own target speed or braking. The implementation, signal mapping, and
-ownership boundaries are documented in
+the detector uses the model's existing `action.shouldStop`, predicted
+position/velocity/orientation, and action signals. A route-derived high-speed
+tier now recognizes a straight, lead-free near-stop trajectory before the
+terminal prediction reaches zero; weaker evidence only precharges its existing
+temporal filter. Replay of route
+`000000d7--cc6308b4d0` moves the first handoff from `39.1 mph` to `42.2 mph`
+without admitting its highway-exit slowdown or brief radar-dropout window.
+This is counterfactual replay evidence, not field validation. The effective
+state has one owner and publishes through `selfdriveState.experimentalMode`,
+which drives both the stock on-road icon and planner strategy. The feature adds
+no UI or user-facing Params and does not own target speed or braking. The
+implementation, signal mapping, and ownership boundaries are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 
 ## BLaTv2 modular replacement

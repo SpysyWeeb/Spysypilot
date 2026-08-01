@@ -230,9 +230,12 @@ what caused it.
 | Stop evidence | BLoTv2 signal and use |
 |---|---|
 | Direct final-approach intent | `modelV2.action.shouldStop` |
-| Early prediction | `position.x[-1]` is inside a `5.0 s` ego-speed horizon and `velocity.x[-1] <= 1.0 m/s` |
+| Strict prediction | `position.x[-1]` is inside a `5.0 s` ego-speed horizon and `velocity.x[-1] <= 1.0 m/s` |
+| High-speed early prediction | above `13.0 m/s`, the path is inside a `1.3 m/s²` comfort-stop envelope plus `0.5 s` response distance, terminal speed is at most `6.5 m/s` and `35%` of ego speed, and `action.desiredAcceleration <= -0.5 m/s²` |
+| High-speed filter hint | inside an `8.0 s` horizon, terminal speed at most `55%` of ego speed, and desired acceleration at most `-0.25 m/s²`; its `0.45` confidence is below entry qualification and can neither switch modes alone nor sustain an active latch |
+| Early geometry guard | no turn signal, valid `action.desiredCurvature` below `1.0 m/s²` lateral acceleration, and valid terminal `orientation.z` within `20 degrees` |
 | Missing-velocity fallback | short path plus `action.desiredAcceleration <= -0.5 m/s²` |
-| Lead ownership | relevant `radarState.leadOne` blocks a new handoff |
+| Lead ownership | relevant `radarState.leadOne` blocks a new handoff; its veto persists `3.0 s` after loss so radar flicker cannot transfer a lead slowdown to CEM |
 | Committed turn guard | low-speed blinker plus large steering angle/model curvature blocks a new handoff |
 | Release/override | stable model clear, resumed motion, gas, brake, invalid model, or disengagement |
 
@@ -245,6 +248,35 @@ resume above `0.8 m/s` releases immediately. Gas or brake suppresses a new
 handoff for `2.0 s`, and a completed stop gets the same `2.0 s` re-entry guard.
 All values live together in `conditional_experimental_mode.py`; no tuning Param
 or UI control is added.
+
+### Route `000000d7--cc6308b4d0` high-speed refinement
+
+The first field attempt exposed a recognition-delay problem rather than a
+planner handoff delay. At the lead-free red-light approach, the deployed
+strict detector first produced qualifying evidence at `39.7 mph` and switched
+at `39.1 mph`. The planner selected e2e within one model frame, but the driver
+braked about `2.1 s` later because the remaining stop felt too late.
+
+The recorded model had already developed coherent stop intent at `42.4 mph`:
+`position.x[-1] = 138.0 m`, `velocity.x[-1] = 5.85 m/s`,
+`action.desiredAcceleration = -0.50 m/s²`, and an essentially straight
+predicted heading. The production CEM class with the new early tier switches
+at `42.2 mph`, `3.8 s` and roughly `69 m` before the deployed handoff. The
+earlier `44.7 mph` sample is only a filter hint and cannot request Experimental
+on its own.
+
+A scan of all 62 route segments also exposed two ambiguous windows. A
+`55 mph` highway-exit approach predicted slowing to about `8 m/s`, not a stop;
+the `6.5 m/s` absolute terminal cap rejects it. A separate intersection
+window lost a relevant radar lead briefly; the `3.0 s` lead-release guard
+keeps that slowdown lead-owned. Neither guard changes the first red-light
+handoff or the later low-speed stop/green-release result.
+
+This replay reuses recorded model, radar, and vehicle messages. It proves the
+mode decision timing and rejection behavior, but it cannot close the loop to
+show the trajectory the newly selected e2e planner would have driven. The
+high-speed stop and false-handoff behavior therefore remain explicit owner
+field-test gates.
 
 ### Force Stops replacement
 
@@ -342,8 +374,9 @@ Automated coverage includes:
   stopped-to-moving queue transitions;
 - true-stop handoff and hold-release debounce;
 - Conditional Experimental entry filtering, release hysteresis, standstill
-  latch, model-health failure, lead/turn entry vetoes, pedal override, reset,
-  and `selfdriveState.experimentalMode` publication;
+  latch, model-health failure, route-derived high-speed stop intent,
+  highway-slowdown rejection, lead-dropout/curve/turn entry vetoes, pedal
+  override, reset, and `selfdriveState.experimentalMode` publication;
 - every supervisor trigger, hysteresis, emergency stand-down, and slew rate;
 - model lead anchoring and exact stock fallback for malformed/non-finite input;
 - BLoT v1 launch request and deployed-platform acceleration clamping;

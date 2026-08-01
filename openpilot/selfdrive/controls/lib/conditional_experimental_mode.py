@@ -26,10 +26,37 @@ STOP_TERMINAL_SPEED_MAX = 1.0
 STOP_FALLBACK_ACCEL_MAX = -0.5
 STOP_TRAJECTORY_MIN_POINTS = 2
 
+# The strict detector above is intentionally retained for low-speed and
+# ambiguous scenes. At urban-road speed, waiting for the model's ten-second
+# terminal velocity to reach almost zero can leave less than a comfortable
+# stopping distance. The early tier recognizes a sustained *shape* of model
+# intent instead: the path has contracted inside a comfort-deceleration
+# envelope, the terminal velocity has fallen substantially, and the action is
+# already braking. It is limited to straight, unsignaled, lead-free approaches
+# by the scene guards below and by the existing entry veto.
+STOP_EARLY_MIN_SPEED = 13.0
+STOP_EARLY_COMFORT_DECEL = 1.3
+STOP_EARLY_RESPONSE_BUFFER_S = 0.5
+STOP_EARLY_TERMINAL_SPEED_RATIO = 0.35
+STOP_EARLY_TERMINAL_SPEED_MAX = 6.5
+STOP_EARLY_DESIRED_ACCEL_MAX = -0.5
+STOP_EARLY_MAX_LATERAL_ACCEL = 1.0
+STOP_EARLY_MAX_HEADING_CHANGE = math.radians(20.0)
+
+# Weaker evidence may charge the temporal filter but is deliberately below
+# STOP_SAMPLE_MIN_CONFIDENCE, so it can never request Experimental by itself.
+# This avoids spending the full filter delay after a gradually developing
+# high-speed stop becomes strong enough to qualify.
+STOP_EARLY_HINT_HORIZON_S = 8.0
+STOP_EARLY_HINT_TERMINAL_SPEED_RATIO = 0.55
+STOP_EARLY_HINT_DESIRED_ACCEL_MAX = -0.25
+
 # Evidence strengths and temporal qualification.
 STOP_DIRECT_CONFIDENCE = 1.0
 STOP_TRAJECTORY_CONFIDENCE = 0.85
+STOP_EARLY_CONFIDENCE = 0.80
 STOP_FALLBACK_CONFIDENCE = 0.70
+STOP_EARLY_HINT_CONFIDENCE = 0.45
 STOP_SAMPLE_MIN_CONFIDENCE = 0.70
 STOP_FILTER_TIME_CONSTANT_S = 0.30
 STOP_ENTRY_FILTER_THRESHOLD = 0.55
@@ -49,6 +76,7 @@ DRIVER_OVERRIDE_SUPPRESS_S = 2.0
 LEAD_RELEVANCE_MIN_DISTANCE_M = 35.0
 LEAD_RELEVANCE_TIME_S = 3.5
 LEAD_PATH_MARGIN_M = 10.0
+LEAD_RELEASE_HYSTERESIS_S = 3.0
 COMMITTED_TURN_MAX_SPEED = 8.0
 COMMITTED_TURN_MIN_STEERING_DEG = 35.0
 COMMITTED_TURN_MIN_CURVATURE = 0.04
@@ -82,23 +110,59 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
   return parsed if math.isfinite(parsed) else default
 
 
+def _optional_finite_float(value: Any) -> float | None:
+  try:
+    parsed = float(value)
+  except (TypeError, ValueError):
+    return None
+  return parsed if math.isfinite(parsed) else None
+
+
 def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> StopIntentObservation:
   """Translate current BLoTv2 cereal messages into one stop-intent sample."""
   v_ego = max(_finite_float(getattr(car_state, "vEgo", 0.0)), 0.0)
   action = getattr(model, "action", None)
   should_stop = bool(getattr(action, "shouldStop", False))
   desired_accel = _finite_float(getattr(action, "desiredAcceleration", 0.0))
-  desired_curvature = abs(_finite_float(getattr(action, "desiredCurvature", 0.0)))
+  desired_curvature = _optional_finite_float(getattr(action, "desiredCurvature", None))
 
   position = getattr(model, "position", None)
   velocity = getattr(model, "velocity", None)
+  orientation = getattr(model, "orientation", None)
   path_end_m = _last_finite(getattr(position, "x", ()), STOP_TRAJECTORY_MIN_POINTS)
   terminal_speed = _last_finite(getattr(velocity, "x", ()), STOP_TRAJECTORY_MIN_POINTS)
+  terminal_heading = _last_finite(getattr(orientation, "z", ()), STOP_TRAJECTORY_MIN_POINTS)
+
+  blinker = bool(getattr(car_state, "leftBlinker", False) or getattr(car_state, "rightBlinker", False))
+  lateral_accel = abs(desired_curvature) * v_ego ** 2 if desired_curvature is not None else None
+  straight_approach = bool(
+    not blinker and
+    lateral_accel is not None and lateral_accel <= STOP_EARLY_MAX_LATERAL_ACCEL and
+    terminal_heading is not None and abs(terminal_heading) <= STOP_EARLY_MAX_HEADING_CHANGE
+  )
 
   distance_limit = max(STOP_PATH_MIN_DISTANCE_M, v_ego * STOP_PREDICTION_HORIZON_S)
   path_in_horizon = path_end_m is not None and 0.0 < path_end_m <= distance_limit
   trajectory_stop = path_in_horizon and terminal_speed is not None and terminal_speed <= STOP_TERMINAL_SPEED_MAX
   fallback_stop = path_in_horizon and terminal_speed is None and desired_accel <= STOP_FALLBACK_ACCEL_MAX
+
+  early_distance_limit = (
+    v_ego ** 2 / (2.0 * STOP_EARLY_COMFORT_DECEL) + v_ego * STOP_EARLY_RESPONSE_BUFFER_S
+  )
+  early_path = path_end_m is not None and 0.0 < path_end_m <= early_distance_limit
+  early_stop = bool(
+    v_ego >= STOP_EARLY_MIN_SPEED and straight_approach and early_path and
+    terminal_speed is not None and terminal_speed <= STOP_EARLY_TERMINAL_SPEED_MAX and
+    terminal_speed <= v_ego * STOP_EARLY_TERMINAL_SPEED_RATIO and
+    desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX
+  )
+
+  early_hint_path = path_end_m is not None and 0.0 < path_end_m <= v_ego * STOP_EARLY_HINT_HORIZON_S
+  early_hint = bool(
+    v_ego >= STOP_EARLY_MIN_SPEED and straight_approach and early_hint_path and
+    terminal_speed is not None and terminal_speed <= v_ego * STOP_EARLY_HINT_TERMINAL_SPEED_RATIO and
+    desired_accel <= STOP_EARLY_HINT_DESIRED_ACCEL_MAX
+  )
 
   confidence = 0.0
   reason = "none"
@@ -108,9 +172,15 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
   elif trajectory_stop:
     confidence = STOP_TRAJECTORY_CONFIDENCE
     reason = "trajectory"
+  elif early_stop:
+    confidence = STOP_EARLY_CONFIDENCE
+    reason = "earlyTrajectory"
   elif fallback_stop:
     confidence = STOP_FALLBACK_CONFIDENCE
     reason = "path+braking"
+  elif early_hint:
+    confidence = STOP_EARLY_HINT_CONFIDENCE
+    reason = "earlyHint"
 
   lead = getattr(radar_state, "leadOne", None)
   lead_present = bool(getattr(lead, "present", getattr(lead, "status", False)))
@@ -120,11 +190,11 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
     lead_limit = max(lead_limit, path_end_m + LEAD_PATH_MARGIN_M)
   relevant_lead = lead_present and 0.0 <= lead_distance <= lead_limit
 
-  blinker = bool(getattr(car_state, "leftBlinker", False) or getattr(car_state, "rightBlinker", False))
   steering_angle = abs(_finite_float(getattr(car_state, "steeringAngleDeg", 0.0)))
   committed_turn = bool(
     blinker and v_ego <= COMMITTED_TURN_MAX_SPEED and
-    (steering_angle >= COMMITTED_TURN_MIN_STEERING_DEG or desired_curvature >= COMMITTED_TURN_MIN_CURVATURE)
+    (steering_angle >= COMMITTED_TURN_MIN_STEERING_DEG or
+     (desired_curvature is not None and abs(desired_curvature) >= COMMITTED_TURN_MIN_CURVATURE))
   )
 
   return StopIntentObservation(confidence, reason, path_end_m, terminal_speed, relevant_lead, committed_turn)
@@ -149,6 +219,7 @@ class ConditionalExperimentalMode:
     self._standstill_elapsed = 0.0
     self._standstill_seen = False
     self._invalid_elapsed = 0.0
+    self._lead_veto_remaining = 0.0
     self._post_stop_remaining = 0.0
     self._override_remaining = 0.0
 
@@ -178,13 +249,21 @@ class ConditionalExperimentalMode:
     observation = observe_model_stop_intent(model, car_state, radar_state) if model_valid else StopIntentObservation()
     self.last_observation = observation
 
+    # A short radar dropout must not transfer a lead-owned slowdown to CEM.
     # Leads and committed turns veto only a new handoff. Once a model stop has
     # qualified, later scene churn cannot flick the mode off while that model
     # stop evidence itself remains present.
-    entry_veto = observation.relevant_lead or observation.committed_turn
+    if observation.relevant_lead:
+      self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S
+    else:
+      self._lead_veto_remaining = max(self._lead_veto_remaining - self.model_dt, 0.0)
+    entry_veto = self._lead_veto_remaining > 0.0 or observation.committed_turn
     confidence = observation.confidence if self.experimental_mode or not entry_veto else 0.0
-    filtered_confidence = self.intent_filter.update(confidence)
     raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
+    # A filter-only hint can shorten later entry latency, but cannot sustain an
+    # already active latch indefinitely after qualifying evidence disappears.
+    filter_input = confidence if not self.experimental_mode or raw_stop else 0.0
+    filtered_confidence = self.intent_filter.update(filter_input)
 
     if self.experimental_mode:
       self._entry_elapsed = 0.0
