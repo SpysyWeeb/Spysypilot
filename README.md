@@ -245,6 +245,20 @@ newest source cohort blocks qualification rather than being cherry-picked
 around. Routes from an older controller build can form an older cohort, but are
 never mixed into the newest one.
 
+Device behavior qualification is currently **fail-closed pending the
+route-major streaming backend**. Cohort selection authenticates compact,
+file-backed route summaries without decoding the route object graph. Once an
+otherwise eligible cohort reaches the four-route partition minimum, the comma
+reports `behavior_streaming_required` and retains stock before loading any
+eager behavior artifact. This is a memory-safety diagnostic, not a failed
+Smooth/Swift/Strong result and not a request for more driving. The old eager
+path expanded the measured 146,363,115-byte CE evidence file to 909,200 KiB
+before the
+behavior decoder and replay outputs were constructed; no file-size threshold
+can prove the full downstream transaction safe. The exact replacement and its
+acceptance gates are documented in
+[`docs/BLATV2_BEHAVIOR_STREAMING.md`](docs/BLATV2_BEHAVIOR_STREAMING.md).
+
 Training replays exact stock, the currently accepted artifact (or exact stock
 again during bootstrap), and the complete candidate grid. It freezes one
 winner before the held-out routes are examined. Held-out replay then evaluates

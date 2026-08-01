@@ -160,6 +160,24 @@ class TestBehaviorLearningStatus(unittest.TestCase):
     )
     self.assertIsNone(status.selected_behavior_policy_sha256)
 
+  def test_streaming_required_is_a_terminal_stock_retained_diagnostic(self) -> None:
+    status = replace(
+      training_status(),
+      state=BehaviorLearningState.FAILED,
+      diagnostic=BehaviorLearningDiagnostic.BEHAVIOR_STREAMING_REQUIRED,
+      terminal=True,
+      current_route_identity=None,
+      current_route_index=None,
+      current_candidate_index=None,
+      completed_replay_jobs=0,
+      total_replay_jobs=0,
+      qualification_disposition=BehaviorQualificationDisposition.STOCK_RETAINED,
+      reasons=("behavior_streaming_required",),
+    )
+
+    self.assertEqual(BehaviorLearningStatus.from_json(status.to_json()), status)
+    self.assertIsNone(status.smooth_passed)
+
   def test_malformed_unknown_and_authority_smuggling_fail_closed(self) -> None:
     status = training_status()
     payload = json.loads(status.to_json())

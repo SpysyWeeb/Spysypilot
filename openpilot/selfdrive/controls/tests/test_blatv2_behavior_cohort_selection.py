@@ -186,7 +186,7 @@ def test_newest_ineligible_route_blocks_instead_of_scanning_past_it(tmp_path: Pa
   assert selection.status == "blocked"
   assert selection.blocking_route_name == newest.source_identity.route_id
   assert selection.reason == "route_evidence_ineligible:exact_model_link_missing"
-  assert selection.artifacts == ()
+  assert selection.summaries == ()
 
 
 def test_rejected_route_inside_current_source_population_blocks(tmp_path: Path) -> None:
@@ -231,7 +231,7 @@ def test_different_eligible_source_is_a_boundary(tmp_path: Path) -> None:
 
   assert selection.ready
   assert tuple(
-    artifact.source_identity.route_id for artifact in selection.artifacts
+    summary.source_identity.route_id for summary in selection.summaries
   ) == (
     current_one.source_identity.route_id,
     current_two.source_identity.route_id,
@@ -251,4 +251,49 @@ def test_late_older_skips_are_ignored(tmp_path: Path) -> None:
   selection = select_homogeneous_behavior_cohort(ledger=ledger, store=store)
 
   assert selection.ready
-  assert selection.artifacts == (current,)
+  assert len(selection.summaries) == 1
+  assert selection.summaries[0].sha256 == current.sha256
+  assert selection.summaries[0].source_identity == current.source_identity
+
+
+def test_selection_never_constructs_an_eager_route_artifact(tmp_path: Path) -> None:
+  """Even ineligible evidence is classified from a bounded file summary."""
+
+  class SummaryOnlyStore(RouteEvidenceStore):
+    def load(self, sha256: str) -> RouteEvidenceArtifact:  # pragma: no cover - must stay unreachable
+      raise AssertionError(f"eager artifact load attempted for {sha256}")
+
+  newest = _artifact(0x40, eligible=False)
+  store = SummaryOnlyStore(tmp_path / "store")
+  _publish(store, newest)
+  ledger = extend_ledger(
+    _empty_ledger(), late_routes=(), replay_results=(_ingested(newest),),
+  )
+
+  selection = select_homogeneous_behavior_cohort(ledger=ledger, store=store)
+
+  assert selection.status == "blocked"
+  assert selection.reason == "route_evidence_ineligible:exact_model_link_missing"
+
+
+def test_tampered_summary_blocks_before_any_eager_decode(tmp_path: Path) -> None:
+  class SummaryOnlyStore(RouteEvidenceStore):
+    def load(self, sha256: str) -> RouteEvidenceArtifact:  # pragma: no cover - must stay unreachable
+      raise AssertionError(f"eager artifact load attempted for {sha256}")
+
+  artifact = _artifact(0x50)
+  store = SummaryOnlyStore(tmp_path / "store")
+  _publish(store, artifact)
+  ledger = extend_ledger(
+    _empty_ledger(), late_routes=(), replay_results=(_ingested(artifact),),
+  )
+  path = store.root / "objects" / f"{artifact.sha256}.route-evidence"
+  encoded = bytearray(path.read_bytes())
+  encoded[-1] ^= 0x01
+  path.write_bytes(encoded)
+
+  selection = select_homogeneous_behavior_cohort(ledger=ledger, store=store)
+
+  assert selection.status == "blocked"
+  assert selection.reason == "route_evidence_corrupt"
+  assert selection.blocking_route_name == artifact.source_identity.route_id

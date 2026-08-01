@@ -71,6 +71,7 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ModelPublication,
   RouteEvidenceArtifact,
   RouteEvidenceError,
+  RouteEvidenceFileSummary,
   RouteEvidenceSourceIdentity,
   RouteEvidenceStore,
 )
@@ -729,13 +730,18 @@ class BackfillRunResult:
 
 @dataclass(frozen=True, slots=True)
 class BehaviorEvidenceCohortSelection:
-  """Newest complete, contiguous, exact-source behavior population."""
+  """Newest exact-source population as authenticated file summaries.
+
+  This selection object must remain lightweight.  Holding decoded route
+  artifacts here scales parent RSS with cohort duration before the replay
+  transaction has even started.
+  """
 
   status: str
   reason: str
   blocking_route_name: str | None
   source_identity_sha256: str | None
-  artifacts: tuple[RouteEvidenceArtifact, ...]
+  summaries: tuple[RouteEvidenceFileSummary, ...]
 
   @property
   def ready(self) -> bool:
@@ -3386,9 +3392,9 @@ def load_ledger(
 
 
 def _behavior_cohort_source_payload(
-  artifact: RouteEvidenceArtifact,
+  summary: RouteEvidenceFileSummary,
 ) -> dict[str, object]:
-  source = artifact.source_identity
+  source = summary.source_identity
   return {
     "controller_artifact_sha256": source.controller_artifact_sha256,
     "controller_source_kind": source.controller_source_kind,
@@ -3401,11 +3407,11 @@ def _behavior_cohort_source_payload(
   }
 
 
-def _artifact_matches_ledger_entry(
-  artifact: RouteEvidenceArtifact,
+def _summary_matches_ledger_entry(
+  summary: RouteEvidenceFileSummary,
   entry: Mapping[str, object],
 ) -> bool:
-  source = artifact.source_identity
+  source = summary.source_identity
   segments = entry["segments"]
   if type(segments) is not list:
     return False
@@ -3418,12 +3424,12 @@ def _artifact_matches_ledger_entry(
     and source.controls_witness_count == entry["controls_witness_count"]
     and source.unresolved_witness_count
     == entry["unresolved_witness_count"]
-    and artifact.sha256 == entry["route_evidence_sha256"]
-    and len(artifact.model_publications)
+    and summary.sha256 == entry["route_evidence_sha256"]
+    and summary.manifest["model_publication_count"]
     == entry["route_evidence_model_publication_count"]
-    and len(artifact.control_witnesses)
+    and summary.manifest["control_witness_count"]
     == entry["route_evidence_control_witness_count"]
-    and len(artifact.event_locators)
+    and summary.manifest["driving_event_locator_count"]
     == entry["route_evidence_event_locator_count"]
   )
 
@@ -3462,10 +3468,10 @@ def select_homogeneous_behavior_cohort(
       reason="no_ingested_routes",
       blocking_route_name=None,
       source_identity_sha256=None,
-      artifacts=(),
+      summaries=(),
     )
 
-  selected: list[RouteEvidenceArtifact] = []
+  selected: list[RouteEvidenceFileSummary] = []
   source_payload: dict[str, object] | None = None
   source_identity: str | None = None
   for entry in entries:
@@ -3480,7 +3486,7 @@ def select_homogeneous_behavior_cohort(
         ),
         blocking_route_name=route_name,
         source_identity_sha256=source_identity,
-        artifacts=(),
+        summaries=(),
       )
     evidence_sha256 = entry["route_evidence_sha256"]
     if type(evidence_sha256) is not str:
@@ -3489,42 +3495,45 @@ def select_homogeneous_behavior_cohort(
         reason="route_evidence_missing",
         blocking_route_name=route_name,
         source_identity_sha256=source_identity,
-        artifacts=(),
+        summaries=(),
       )
     try:
-      artifact = store.load(evidence_sha256)
+      # Authentication streams each section and validates its canonical
+      # compact records without constructing the hundreds of thousands of
+      # Python dataclasses owned by RouteEvidenceArtifact.from_file().
+      summary = store.inspect(evidence_sha256)
     except (OSError, RouteEvidenceError):
       return BehaviorEvidenceCohortSelection(
         status="blocked",
         reason="route_evidence_corrupt",
         blocking_route_name=route_name,
         source_identity_sha256=source_identity,
-        artifacts=(),
+        summaries=(),
       )
-    if not _artifact_matches_ledger_entry(artifact, entry):
+    if not _summary_matches_ledger_entry(summary, entry):
       return BehaviorEvidenceCohortSelection(
         status="blocked",
         reason="route_evidence_ledger_mismatch",
         blocking_route_name=route_name,
         source_identity_sha256=source_identity,
-        artifacts=(),
+        summaries=(),
       )
-    if not artifact.source_identity.behavior_eligible:
+    if not summary.source_identity.behavior_eligible:
       return BehaviorEvidenceCohortSelection(
         status="blocked",
-        reason=f"route_evidence_ineligible:{artifact.source_identity.behavior_ineligible_reason}",
+        reason=f"route_evidence_ineligible:{summary.source_identity.behavior_ineligible_reason}",
         blocking_route_name=route_name,
         source_identity_sha256=source_identity,
-        artifacts=(),
+        summaries=(),
       )
-    artifact_source = _behavior_cohort_source_payload(artifact)
+    artifact_source = _behavior_cohort_source_payload(summary)
     artifact_source_identity = _sha256(_canonical_json_bytes(artifact_source))
     if source_payload is None:
       source_payload = artifact_source
       source_identity = artifact_source_identity
     elif artifact_source != source_payload:
       break
-    selected.append(artifact)
+    selected.append(summary)
 
   if not selected or source_identity is None:
     raise AssertionError("ready behavior cohort lost its source population")
@@ -3534,7 +3543,7 @@ def select_homogeneous_behavior_cohort(
     reason="ready",
     blocking_route_name=None,
     source_identity_sha256=source_identity,
-    artifacts=tuple(selected),
+    summaries=tuple(selected),
   )
 
 

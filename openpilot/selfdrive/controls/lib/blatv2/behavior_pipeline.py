@@ -8,11 +8,12 @@ activation API.  A successful result is still only an informational candidate;
 stock remains the actuator until the separately reviewed approval lifecycle
 accepts a complete artifact.
 
-Every qualification is run twice from independently reloaded route artifacts.
-Only byte-identical transaction documents can be published.  Exact stock is
-the bootstrap baseline.  If a valid modular artifact is currently active, its
-two behavioral dials become the incumbent and search center; no other part of
-that artifact is learnable here.
+The retired eager implementation expanded whole cohorts into Python object
+graphs and is intentionally absent from this production seam.  Authenticated
+cached generations remain readable, but a new eligible cohort retains stock
+with ``behavior_streaming_required`` until the independently gated route-major
+backend replaces it.  The pure replay/transaction modules remain as the
+numerical reference; they are not called by this device pipeline.
 """
 
 from __future__ import annotations
@@ -45,7 +46,6 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_generation import (
   BehaviorGenerationError,
   LoadedBehaviorGeneration,
   load_current_behavior_generation,
-  publish_behavior_generation,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_learning_status import (
   BehaviorLearningDiagnostic,
@@ -59,18 +59,11 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
   BEHAVIOR_REPLAY_INPUT_SCHEMA_VERSION,
-  behavior_source_identity_from_route_artifact,
-  make_behavior_route_evidence_decoder,
-  make_exact_stock_behavior_replay_core,
-  make_modular_behavior_replay_core,
+  behavior_source_identity_from_route_source,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
   BehaviorLearningTransactionResult,
-  BehaviorReplayProgress,
-  BehaviorReplayProgressPhase,
-  BehaviorTransactionError,
   QualificationDisposition,
-  run_behavior_learning_transaction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
@@ -85,8 +78,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
-  RouteEvidenceArtifact,
-  RouteEvidenceError,
+  RouteEvidenceFileSummary,
   RouteEvidenceStore,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
@@ -94,7 +86,6 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 )
 
 
-BEHAVIOR_REPLAY_WORKER_COUNT = 4
 BEHAVIOR_GENERATION_DIRECTORY = "behavior_generations_v1"
 PROVISIONAL_CONTROLLER_POLICY_PATH = (
   Path(__file__).resolve().parent / "provisional_controller_policy.json"
@@ -282,11 +273,11 @@ def _active_behavior_policy(
 
 
 def _recorded_source(cohort: BehaviorEvidenceCohortSelection) -> BehaviorSourceIdentity:
-  if not cohort.ready or not cohort.artifacts:
+  if not cohort.ready or not cohort.summaries:
     raise BehaviorPipelineError("behavior cohort is not ready")
   sources = tuple(
-    behavior_source_identity_from_route_artifact(artifact)
-    for artifact in cohort.artifacts
+    behavior_source_identity_from_route_source(summary.source_identity)
+    for summary in cohort.summaries
   )
   if len(set(sources)) != 1:
     raise BehaviorPipelineError("cohort source projection is not homogeneous")
@@ -298,7 +289,7 @@ def _generation_matches_inputs(
   *,
   physical_generation_sha256: str,
   physical_profile_sha256: str,
-  route_artifacts: tuple[RouteEvidenceArtifact, ...],
+  route_summaries: tuple[RouteEvidenceFileSummary, ...],
   recorded_source: BehaviorSourceIdentity,
   gate_spec: Any,
   segmentation_config: Any,
@@ -307,8 +298,8 @@ def _generation_matches_inputs(
   accepted_policy: BehaviorPolicy | None,
 ) -> bool:
   route_set = tuple(sorted(
-    (artifact.source_identity.route_id, artifact.sha256)
-    for artifact in route_artifacts
+    (summary.source_identity.route_id, summary.sha256)
+    for summary in route_summaries
   ))
   if (
     generation.physical_generation_sha256 != physical_generation_sha256
@@ -364,19 +355,12 @@ class OffroadBehaviorLearningPipeline:
     panda_commit: str,
     abort_requested: Callable[[], bool],
     offroad_confirmed: Callable[[], bool],
-    worker_count: int = BEHAVIOR_REPLAY_WORKER_COUNT,
     logger: Any | None = None,
-    transaction_runner: Callable[..., BehaviorLearningTransactionResult] = (
-      run_behavior_learning_transaction
-    ),
-    generation_publisher: Callable[..., str] = publish_behavior_generation,
   ) -> None:
     if not isinstance(provisional_dynamics, ProvisionalRackDynamics):
       raise TypeError("behavior pipeline requires provisional rack dynamics")
     if not callable(abort_requested) or not callable(offroad_confirmed):
       raise TypeError("behavior pipeline ownership guards must be callable")
-    if isinstance(worker_count, bool) or not isinstance(worker_count, int) or not 1 <= worker_count <= 4:
-      raise ValueError("behavior pipeline worker count must be in [1, 4]")
     self.params = params
     self.status_publisher = status_publisher
     self.provisional_dynamics = provisional_dynamics
@@ -385,10 +369,7 @@ class OffroadBehaviorLearningPipeline:
     self.panda_commit = panda_commit
     self.abort_requested = abort_requested
     self.offroad_confirmed = offroad_confirmed
-    self.worker_count = worker_count
     self.logger = logger
-    self.transaction_runner = transaction_runner
-    self.generation_publisher = generation_publisher
 
   def _log_exception(self, message: str) -> None:
     callback = getattr(self.logger, "exception", None)
@@ -405,11 +386,6 @@ class OffroadBehaviorLearningPipeline:
       raise BehaviorPipelineAborted("behavior ownership guards must return booleans")
     if aborted or not offroad:
       raise BehaviorPipelineAborted("offroad ownership ended")
-
-  def _transaction_abort_requested(self) -> bool:
-    """Adapt both ownership guards to the transaction's boolean contract."""
-    self._abort_if_needed()
-    return False
 
   def _status(self, state, diagnostic, *, new_operation=False, **context) -> None:
     try:
@@ -554,7 +530,7 @@ class OffroadBehaviorLearningPipeline:
     except Exception as exc:
       raise BehaviorPipelineError("behavior route ledger could not be authenticated") from exc
 
-    route_count = len(cohort.artifacts)
+    route_count = len(cohort.summaries)
     if not cohort.ready:
       if cohort.status == "empty":
         base = self._status_base(
@@ -707,7 +683,7 @@ class OffroadBehaviorLearningPipeline:
       current,
       physical_generation_sha256=physical_generation_sha256,
       physical_profile_sha256=profile_sha256,
-      route_artifacts=cohort.artifacts,
+      route_summaries=cohort.summaries,
       recorded_source=recorded_source,
       gate_spec=gate_spec,
       segmentation_config=segmentation_config,
@@ -734,199 +710,25 @@ class OffroadBehaviorLearningPipeline:
         "behavior_generation_current",
       )
 
+    # The retired eager transaction expanded every route into several complete
+    # Python object graphs before replay.  A single measured artifact reached
+    # 909,200 KiB RSS at the first decode stage alone; the four-route gate
+    # cannot enter that path safely.  Descriptor authentication and cache
+    # restoration are bounded, so stop here and retain stock until the
+    # route-major streaming contract is implemented.  There is deliberately
+    # no compressed-size or free-memory bypass: neither proves the full
+    # downstream transaction safe.
+    streaming_base = dict(base)
+    streaming_base["total_replay_jobs"] = 0
     self._status(
-      BehaviorLearningState.PREPARING,
-      BehaviorLearningDiagnostic.VALIDATING_ROUTE_EVIDENCE,
+      BehaviorLearningState.FAILED,
+      BehaviorLearningDiagnostic.BEHAVIOR_STREAMING_REQUIRED,
       new_operation=True,
-      **base,
+      **streaming_base,
+      completed_replay_jobs=0,
+      qualification_disposition=BehaviorQualificationDisposition.STOCK_RETAINED,
+      reasons=("behavior_streaming_required",),
     )
-
-    completed_jobs = 0
-
-    def make_progress(authority_offset: int):
-      def progress(update: BehaviorReplayProgress) -> None:
-        nonlocal completed_jobs
-        completed_jobs = authority_offset + update.completed_jobs
-        state = (
-          BehaviorLearningState.TRAINING
-          if update.phase is BehaviorReplayProgressPhase.TRAINING
-          else BehaviorLearningState.VALIDATING
-        )
-        diagnostic = (
-          BehaviorLearningDiagnostic.REPLAYING_TRAINING_GRID
-          if update.phase is BehaviorReplayProgressPhase.TRAINING
-          else BehaviorLearningDiagnostic.REPLAYING_FROZEN_WINNER
-        )
-        self._status(
-          state,
-          diagnostic,
-          **base,
-          completed_replay_jobs=completed_jobs,
-        )
-      return progress
-
-    def load_authority_artifacts() -> tuple[RouteEvidenceArtifact, ...]:
-      artifacts = tuple(
-        store.load(artifact.sha256)
-        for artifact in cohort.artifacts
-      )
-      if tuple(artifact.canonical_bytes for artifact in artifacts) != tuple(
-        artifact.canonical_bytes for artifact in cohort.artifacts
-      ):
-        raise BehaviorPipelineError("route evidence changed between authorities")
-      return artifacts
-
-    def make_authority_replay():
-      """Construct one authority's independent executable artifacts.
-
-      Freshly loading route bytes is not enough: decoders and controller
-      adapters may own lifecycle state or caches. Reusing them would let pass
-      one contaminate pass two while still producing superficially matching
-      output. Each numerical authority therefore gets fresh instances.
-      """
-      decoder = make_behavior_route_evidence_decoder(
-        provisional_dynamics=self.provisional_dynamics,
-      )
-      exact_stock = make_exact_stock_behavior_replay_core(
-        stock_identity,
-        provisional_dynamics=self.provisional_dynamics,
-      )
-      modular = make_modular_behavior_replay_core(
-        modular_identity,
-        provisional_dynamics=self.provisional_dynamics,
-      )
-      return decoder, exact_stock, modular
-
-    try:
-      first_decoder, first_stock, first_modular = make_authority_replay()
-      first = self.transaction_runner(
-        route_evidence_artifacts=load_authority_artifacts(),
-        decode_route_evidence=first_decoder,
-        physical_profile=physical_profile,
-        accepted_policy=accepted_policy,
-        search_center_policy=search_center_policy,
-        exact_stock=first_stock,
-        currently_accepted=(
-          None if accepted_policy is None else first_modular
-        ),
-        candidate=first_modular,
-        segmentation_config=segmentation_config,
-        gate_spec=gate_spec,
-        worker_count=self.worker_count,
-        progress_callback=make_progress(0),
-        abort_requested=self._transaction_abort_requested,
-      )
-      first_authority_jobs = _transaction_replay_job_count(first)
-      if first_authority_jobs > authority_jobs:
-        raise BehaviorPipelineError(
-          "first behavior authority exceeded its replay job bound",
-        )
-      completed_jobs = first_authority_jobs
-      self._abort_if_needed()
-      second_authority_offset = first_authority_jobs
-      # A fresh disk load plus fresh whole-route controller instances forms
-      # the second independent numerical authority.
-      second_decoder, second_stock, second_modular = make_authority_replay()
-      second = self.transaction_runner(
-        route_evidence_artifacts=load_authority_artifacts(),
-        decode_route_evidence=second_decoder,
-        physical_profile=physical_profile,
-        accepted_policy=accepted_policy,
-        search_center_policy=search_center_policy,
-        exact_stock=second_stock,
-        currently_accepted=(
-          None if accepted_policy is None else second_modular
-        ),
-        candidate=second_modular,
-        segmentation_config=segmentation_config,
-        gate_spec=gate_spec,
-        worker_count=self.worker_count,
-        progress_callback=make_progress(second_authority_offset),
-        abort_requested=self._transaction_abort_requested,
-      )
-      second_authority_jobs = _transaction_replay_job_count(second)
-      if second_authority_jobs > authority_jobs:
-        raise BehaviorPipelineError(
-          "second behavior authority exceeded its replay job bound",
-        )
-      completed_jobs = first_authority_jobs + second_authority_jobs
-      self._abort_if_needed()
-      if first.to_json().encode("utf-8") != second.to_json().encode("utf-8"):
-        self._status(
-          BehaviorLearningState.FAILED,
-          BehaviorLearningDiagnostic.REPLAY_NONDETERMINISTIC,
-          **base,
-          completed_replay_jobs=completed_jobs,
-          qualification_disposition=BehaviorQualificationDisposition.STOCK_RETAINED,
-          reasons=("independent_replay_mismatch",),
-        )
-        return BehaviorPipelineResult(
-          "failed", None, None, route_count, "replay_nondeterministic",
-        )
-      self._status(
-        BehaviorLearningState.PUBLISHING,
-        BehaviorLearningDiagnostic.PUBLISHING_BEHAVIOR_GENERATION,
-        **base,
-        completed_replay_jobs=completed_jobs,
-      )
-      generation_sha256 = self.generation_publisher(
-        behavior_root=behavior_root,
-        first_authority=first,
-        second_authority=second,
-        physical_generation_sha256=physical_generation_sha256,
-        physical_profile_sha256=profile_sha256,
-        recorded_source=recorded_source,
-        abort_requested=self.abort_requested,
-        offroad_confirmed=self.offroad_confirmed,
-      )
-      self._terminal_status(
-        transaction=first,
-        status_base=base,
-        completed_jobs=completed_jobs,
-      )
-      return BehaviorPipelineResult(
-        "published",
-        generation_sha256,
-        first.sha256,
-        route_count,
-        first.qualification_disposition.value,
-      )
-    except BehaviorPipelineAborted:
-      return BehaviorPipelineResult(
-        "aborted", None, None, route_count, "offroad_ownership_ended",
-      )
-    except (BehaviorTransactionError, BehaviorGenerationError, RouteEvidenceError) as exc:
-      diagnostic = (
-        BehaviorLearningDiagnostic.BEHAVIOR_PUBLISH_FAILED
-        if isinstance(exc, BehaviorGenerationError)
-        else BehaviorLearningDiagnostic.BEHAVIOR_TRANSACTION_FAILED
-      )
-      self._status(
-        BehaviorLearningState.FAILED,
-        diagnostic,
-        **base,
-        completed_replay_jobs=completed_jobs,
-        qualification_disposition=BehaviorQualificationDisposition.STOCK_RETAINED,
-        reasons=(type(exc).__name__,),
-      )
-      self._log_exception("blatv2 behavior qualification failed")
-      return BehaviorPipelineResult(
-        "failed", None, None, route_count, diagnostic.value,
-      )
-    except Exception as exc:
-      # Behavior qualification is an offroad informational subsystem. A
-      # malformed candidate must retain stock without relabeling the already
-      # committed physical generation as failed.
-      self._status(
-        BehaviorLearningState.FAILED,
-        BehaviorLearningDiagnostic.BEHAVIOR_TRANSACTION_FAILED,
-        **base,
-        completed_replay_jobs=completed_jobs,
-        qualification_disposition=BehaviorQualificationDisposition.STOCK_RETAINED,
-        reasons=(type(exc).__name__,),
-      )
-      self._log_exception("blatv2 behavior qualification failed unexpectedly")
-      return BehaviorPipelineResult(
-        "failed", None, None, route_count,
-        BehaviorLearningDiagnostic.BEHAVIOR_TRANSACTION_FAILED.value,
-      )
+    return BehaviorPipelineResult(
+      "failed", None, None, route_count, "behavior_streaming_required",
+    )

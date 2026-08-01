@@ -25,9 +25,6 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_learning_status import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import BehaviorPolicy
 from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
-  BehaviorReplayProgress,
-  BehaviorReplayProgressPhase,
-  BehaviorTransactionError,
   QualificationDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
@@ -116,19 +113,11 @@ def artifacts(count: int) -> tuple[FakeArtifact, ...]:
 class FakeStore:
   def __init__(self, values: tuple[FakeArtifact, ...]) -> None:
     self.values = {value.sha256: value for value in values}
-    self.loads: list[FakeArtifact] = []
+    self.loads: list[str] = []
 
   def load(self, digest: str) -> FakeArtifact:
-    original = self.values[digest]
-    # A load represents an independent disk reconstruction, never the cohort
-    # selector's in-memory object and never the other authority's object.
-    loaded = FakeArtifact(
-      original.sha256,
-      bytes(bytearray(original.canonical_bytes)),
-      original.source_identity,
-    )
-    self.loads.append(loaded)
-    return loaded
+    self.loads.append(digest)
+    raise AssertionError("device behavior pipeline attempted an eager artifact load")
 
 
 class FakePaths:
@@ -237,20 +226,11 @@ class FakeTransaction:
 
 
 @dataclass
-class CoreInstance:
-  identity: object
-  serial: int
-
-
-@dataclass
 class PipelineHarness:
   runtime: FakeRuntime
   pipeline: pipeline.OffroadBehaviorLearningPipeline
   status: StatusRecorder
   store: FakeStore
-  transaction_calls: list[dict]
-  publish_calls: list[dict]
-  factory_calls: dict[str, list[object]]
 
 
 def ready_cohort(count: int = 4) -> BehaviorEvidenceCohortSelection:
@@ -259,7 +239,7 @@ def ready_cohort(count: int = 4) -> BehaviorEvidenceCohortSelection:
     reason="ready",
     blocking_route_name=None,
     source_identity_sha256=RECORDED_SOURCE.sha256,
-    artifacts=artifacts(count),
+    summaries=artifacts(count),
   )
 
 
@@ -269,24 +249,13 @@ def make_harness(
   *,
   cohort: BehaviorEvidenceCohortSelection | None = None,
   physical: bool = True,
-  qualified: bool = True,
-  mismatch: bool = False,
-  worker_count: int = 4,
   status_fail: bool = False,
-  transaction_error: Exception | None = None,
   abort_requested=lambda: False,
 ) -> PipelineHarness:
   selected = ready_cohort() if cohort is None else cohort
-  store = FakeStore(selected.artifacts)
+  store = FakeStore(selected.summaries)
   runtime = FakeRuntime(tmp_path, physical=physical)
   status = StatusRecorder(fail=status_fail)
-  transaction_calls: list[dict] = []
-  publish_calls: list[dict] = []
-  factory_calls: dict[str, list[object]] = {
-    "decoder": [],
-    "stock": [],
-    "modular": [],
-  }
 
   monkeypatch.setattr(pipeline, "PersistentLearningRuntime", FakeRuntime)
   monkeypatch.setattr(pipeline, "load_ledger", lambda *_args, **_kwargs: {})
@@ -298,66 +267,10 @@ def make_harness(
   )
   monkeypatch.setattr(
     pipeline,
-    "behavior_source_identity_from_route_artifact",
-    lambda _artifact: RECORDED_SOURCE,
+    "behavior_source_identity_from_route_source",
+    lambda _source: RECORDED_SOURCE,
   )
   monkeypatch.setattr(pipeline, "_active_behavior_policy", lambda **_kwargs: None)
-
-  def decoder_factory(**_kwargs):
-    value = object()
-    factory_calls["decoder"].append(value)
-    return value
-
-  def core_factory(kind: str):
-    def make(identity, **_kwargs):
-      value = CoreInstance(identity, len(factory_calls[kind]))
-      factory_calls[kind].append(value)
-      return value
-    return make
-
-  monkeypatch.setattr(pipeline, "make_behavior_route_evidence_decoder", decoder_factory)
-  monkeypatch.setattr(pipeline, "make_exact_stock_behavior_replay_core", core_factory("stock"))
-  monkeypatch.setattr(pipeline, "make_modular_behavior_replay_core", core_factory("modular"))
-
-  def run_transaction(**kwargs):
-    transaction_calls.append(kwargs)
-    if transaction_error is not None:
-      raise transaction_error
-    gate_spec = kwargs["gate_spec"]
-    route_count = len(kwargs["route_evidence_artifacts"])
-    training_count, validation_count = pipeline._partition_counts(route_count, gate_spec)
-    candidate_count = len(pipeline.build_candidate_grid(
-      gate_spec.candidate_grid.policy_grid(kwargs["search_center_policy"]),
-    ))
-    training_jobs = (candidate_count + 2) * training_count
-    validation_jobs = 3 * validation_count
-    total_jobs = training_jobs + validation_jobs
-    callback = kwargs["progress_callback"]
-    callback(BehaviorReplayProgress(
-      phase=BehaviorReplayProgressPhase.TRAINING,
-      completed_jobs=training_jobs,
-      total_jobs=total_jobs,
-      phase_completed_jobs=training_jobs,
-      phase_total_jobs=training_jobs,
-    ))
-    if qualified:
-      callback(BehaviorReplayProgress(
-        phase=BehaviorReplayProgressPhase.VALIDATION,
-        completed_jobs=total_jobs,
-        total_jobs=total_jobs,
-        phase_completed_jobs=validation_jobs,
-        phase_total_jobs=validation_jobs,
-      ))
-    token = "different" if mismatch and len(transaction_calls) == 2 else "same"
-    return FakeTransaction(
-      qualified=qualified,
-      token=token,
-      replay_job_count=(total_jobs if qualified else training_jobs),
-    )
-
-  def publish(**kwargs):
-    publish_calls.append(kwargs)
-    return "f" * 64
 
   instance = pipeline.OffroadBehaviorLearningPipeline(
     params=object(),
@@ -368,19 +281,8 @@ def make_harness(
     panda_commit=PANDA_COMMIT,
     abort_requested=abort_requested,
     offroad_confirmed=lambda: True,
-    worker_count=worker_count,
-    transaction_runner=run_transaction,
-    generation_publisher=publish,
   )
-  return PipelineHarness(
-    runtime,
-    instance,
-    status,
-    store,
-    transaction_calls,
-    publish_calls,
-    factory_calls,
-  )
+  return PipelineHarness(runtime, instance, status, store)
 
 
 def test_replay_core_identity_binds_commits_schema_and_contract() -> None:
@@ -424,7 +326,7 @@ def test_minimum_population_and_partition_counts_match_committed_gate() -> None:
 
 
 def test_generation_cache_identity_matches_every_authority_input() -> None:
-  route_artifacts = artifacts(4)
+  route_summaries = artifacts(4)
   gate = pipeline.load_behavior_gate_spec()
   segmentation = pipeline.load_behavior_segmentation_config()
   stock = pipeline.build_replay_core_identity(
@@ -454,8 +356,8 @@ def test_generation_cache_identity_matches_every_authority_input() -> None:
     physical_generation_sha256=GENERATION_SHA,
     physical_profile_sha256=SHA,
     route_evidence_sha256s=tuple(sorted(
-      (artifact.source_identity.route_id, artifact.sha256)
-      for artifact in route_artifacts
+      (summary.source_identity.route_id, summary.sha256)
+      for summary in route_summaries
     )),
     recorded_source=RECORDED_SOURCE,
     gate_spec=gate,
@@ -465,7 +367,7 @@ def test_generation_cache_identity_matches_every_authority_input() -> None:
   inputs = {
     "physical_generation_sha256": GENERATION_SHA,
     "physical_profile_sha256": SHA,
-    "route_artifacts": route_artifacts,
+    "route_summaries": route_summaries,
     "recorded_source": RECORDED_SOURCE,
     "gate_spec": gate,
     "segmentation_config": segmentation,
@@ -499,7 +401,6 @@ def test_unqualified_physical_profile_waits_without_route_or_replay(
   result = harness.pipeline.run(harness.runtime)
   assert result.state == "waiting"
   assert result.diagnostic == "physical_profile_unqualified"
-  assert harness.transaction_calls == []
   assert harness.store.loads == []
   assert harness.status.calls[-1][:2] == (
     BehaviorLearningState.WAITING_FOR_PHYSICAL_PROFILE,
@@ -522,7 +423,7 @@ def test_empty_or_insufficient_cohort_waits(
   result = harness.pipeline.run(harness.runtime)
   assert result.state == "waiting"
   assert result.route_count == count
-  assert harness.transaction_calls == []
+  assert harness.store.loads == []
   _, diagnostic, context = harness.status.calls[-1]
   assert diagnostic is BehaviorLearningDiagnostic.INSUFFICIENT_HOMOGENEOUS_ROUTES
   assert context["eligible_route_count"] == count
@@ -540,83 +441,42 @@ def test_blocked_cohort_is_terminal_and_never_replays(
   harness = make_harness(monkeypatch, tmp_path, cohort=cohort)
   result = harness.pipeline.run(harness.runtime)
   assert result.state == "failed"
-  assert harness.transaction_calls == []
+  assert harness.store.loads == []
   state, diagnostic, context = harness.status.calls[-1]
   assert state is BehaviorLearningState.FAILED
   assert diagnostic is BehaviorLearningDiagnostic.ROUTE_EVIDENCE_INVALID
   assert context["qualification_disposition"] is BehaviorQualificationDisposition.STOCK_RETAINED
 
 
-@pytest.mark.parametrize("worker_count", [1, 4])
-def test_success_runs_two_fresh_authorities_and_publishes_terminal_candidate(
+@pytest.mark.parametrize("route_count", [4, 128])
+def test_ready_cohort_requires_streaming_and_retains_stock_without_eager_load(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
-  worker_count: int,
+  route_count: int,
 ) -> None:
-  harness = make_harness(monkeypatch, tmp_path, worker_count=worker_count)
+  harness = make_harness(monkeypatch, tmp_path, cohort=ready_cohort(route_count))
   result = harness.pipeline.run(harness.runtime)
-  assert result.state == "published"
-  assert result.generation_sha256 == "f" * 64
-  assert len(harness.transaction_calls) == 2
-  assert [call["worker_count"] for call in harness.transaction_calls] == [worker_count, worker_count]
-  assert all(call["abort_requested"]() is False for call in harness.transaction_calls)
-  assert len(harness.store.loads) == 8
-  assert all(
-    first is not second
-    for first, second in zip(harness.store.loads[:4], harness.store.loads[4:], strict=True)
+  assert result == pipeline.BehaviorPipelineResult(
+    "failed", None, None, route_count, "behavior_streaming_required",
   )
-  assert len(harness.factory_calls["decoder"]) == 2
-  assert len(harness.factory_calls["stock"]) == 2
-  assert len(harness.factory_calls["modular"]) == 2
-  assert harness.transaction_calls[0]["decode_route_evidence"] is not harness.transaction_calls[1]["decode_route_evidence"]
-  assert harness.transaction_calls[0]["exact_stock"] is not harness.transaction_calls[1]["exact_stock"]
-  assert harness.transaction_calls[0]["candidate"] is not harness.transaction_calls[1]["candidate"]
-  assert len(harness.publish_calls) == 1
+  assert harness.store.loads == []
   state, diagnostic, context = harness.status.calls[-1]
-  assert state is BehaviorLearningState.COMPLETE
-  assert diagnostic is BehaviorLearningDiagnostic.CANDIDATE_QUALIFIED
-  assert context["completed_replay_jobs"] == context["total_replay_jobs"]
-
-
-def test_failed_qualification_is_published_as_stock_retained_with_skipped_validation_progress(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  harness = make_harness(monkeypatch, tmp_path, qualified=False)
-  result = harness.pipeline.run(harness.runtime)
-  assert result.state == "published"
-  assert len(harness.publish_calls) == 1
-  state, diagnostic, context = harness.status.calls[-1]
-  assert state is BehaviorLearningState.COMPLETE
-  assert diagnostic is BehaviorLearningDiagnostic.STOCK_RETAINED
+  assert state is BehaviorLearningState.FAILED
+  assert diagnostic is BehaviorLearningDiagnostic.BEHAVIOR_STREAMING_REQUIRED
   assert context["qualification_disposition"] is BehaviorQualificationDisposition.STOCK_RETAINED
-  # Each authority completed the complete training grid, but correctly did
-  # not claim the held-out work that was never run after no winner existed.
-  assert context["completed_replay_jobs"] == 72
-  assert context["total_replay_jobs"] == 84
+  assert context["reasons"] == ("behavior_streaming_required",)
+  assert context["completed_replay_jobs"] == 0
+  assert context["total_replay_jobs"] == 0
 
 
-def test_aa_mismatch_never_publishes(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  harness = make_harness(monkeypatch, tmp_path, mismatch=True)
-  result = harness.pipeline.run(harness.runtime)
-  assert result.state == "failed"
-  assert result.diagnostic == "replay_nondeterministic"
-  assert harness.publish_calls == []
-  assert harness.status.calls[-1][1] is BehaviorLearningDiagnostic.REPLAY_NONDETERMINISTIC
-
-
-def test_status_failures_cannot_change_transaction_or_publication(
+def test_status_failure_cannot_bypass_or_change_streaming_guard(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
   harness = make_harness(monkeypatch, tmp_path, status_fail=True)
   result = harness.pipeline.run(harness.runtime)
-  assert result.state == "published"
-  assert len(harness.transaction_calls) == 2
-  assert len(harness.publish_calls) == 1
+  assert result.diagnostic == "behavior_streaming_required"
+  assert harness.store.loads == []
 
 
 def test_current_matching_generation_is_a_cache_hit(
@@ -636,11 +496,9 @@ def test_current_matching_generation_is_a_cache_hit(
   result = harness.pipeline.run(harness.runtime)
   assert result.state == "cached"
   assert result.generation_sha256 == "0" * 64
-  assert harness.transaction_calls == []
-  assert harness.publish_calls == []
-  # Cache validation relies only on hash-bound identities; replay artifacts
-  # are not constructed merely to rediscover an exact current generation.
-  assert all(not calls for calls in harness.factory_calls.values())
+  # Cache validation relies only on hash-bound summary identities; no decoded
+  # route artifact is constructed merely to rediscover an exact generation.
+  assert harness.store.loads == []
 
 
 def test_cached_stock_retained_generation_reports_only_completed_training(
@@ -663,7 +521,7 @@ def test_cached_stock_retained_generation_reports_only_completed_training(
   assert context["total_replay_jobs"] == 84
 
 
-def test_stale_valid_generation_reruns_and_republishes(
+def test_stale_valid_generation_requires_streaming_without_overwrite(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
@@ -676,9 +534,8 @@ def test_stale_valid_generation_reruns_and_republishes(
   )
   monkeypatch.setattr(pipeline, "_generation_matches_inputs", lambda *_args, **_kwargs: False)
   result = harness.pipeline.run(harness.runtime)
-  assert result.state == "published"
-  assert len(harness.transaction_calls) == 2
-  assert len(harness.publish_calls) == 1
+  assert result.diagnostic == "behavior_streaming_required"
+  assert harness.store.loads == []
 
 
 def test_corrupt_existing_current_fails_closed_without_overwrite(
@@ -695,84 +552,21 @@ def test_corrupt_existing_current_fails_closed_without_overwrite(
   result = harness.pipeline.run(harness.runtime)
   assert result.state == "failed"
   assert result.diagnostic == "current_behavior_generation_invalid"
-  assert harness.transaction_calls == []
-  assert harness.publish_calls == []
+  assert harness.store.loads == []
 
 
-def test_abort_between_authorities_never_publishes(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  checks = iter((False, True))
-  harness = make_harness(
-    monkeypatch,
-    tmp_path,
-    abort_requested=lambda: next(checks),
-  )
-  result = harness.pipeline.run(harness.runtime)
-  assert result.state == "aborted"
-  assert len(harness.transaction_calls) == 1
-  assert harness.publish_calls == []
-
-
-def test_transaction_ownership_guard_aborts_inside_replay_without_publication(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  ownership_lost = False
-  harness = make_harness(
-    monkeypatch,
-    tmp_path,
-    abort_requested=lambda: ownership_lost,
-  )
-
-  def abort_inside_transaction(**kwargs):
-    nonlocal ownership_lost
-    harness.transaction_calls.append(kwargs)
-    ownership_lost = True
-    kwargs["abort_requested"]()
-    raise AssertionError("ownership guard did not abort transaction")
-
-  harness.pipeline.transaction_runner = abort_inside_transaction
-  result = harness.pipeline.run(harness.runtime)
-  assert result.state == "aborted"
-  assert len(harness.transaction_calls) == 1
-  assert harness.publish_calls == []
-
-
-def test_generic_transaction_failure_isolated_from_physical_result(
+def test_abort_before_descriptor_selection_stops_without_artifact_load(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
 ) -> None:
   harness = make_harness(
     monkeypatch,
     tmp_path,
-    transaction_error=RuntimeError("candidate bug"),
+    abort_requested=lambda: True,
   )
-  physical_before = harness.runtime.coordinator.finalize().selected_profile_sha256
-  result = harness.pipeline.run(harness.runtime)
-  assert result.state == "failed"
-  assert result.diagnostic == BehaviorLearningDiagnostic.BEHAVIOR_TRANSACTION_FAILED.value
-  assert harness.runtime.coordinator.finalize().selected_profile_sha256 == physical_before
-  assert harness.publish_calls == []
-
-
-def test_typed_transaction_failure_is_fail_closed_and_stock_retained(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  harness = make_harness(
-    monkeypatch,
-    tmp_path,
-    transaction_error=BehaviorTransactionError("bad replay"),
-  )
-  result = harness.pipeline.run(harness.runtime)
-  assert result.state == "failed"
-  state, diagnostic, context = harness.status.calls[-1]
-  assert state is BehaviorLearningState.FAILED
-  assert diagnostic is BehaviorLearningDiagnostic.BEHAVIOR_TRANSACTION_FAILED
-  assert context["qualification_disposition"] is BehaviorQualificationDisposition.STOCK_RETAINED
-  assert harness.publish_calls == []
+  with pytest.raises(pipeline.BehaviorPipelineAborted):
+    harness.pipeline.run(harness.runtime)
+  assert harness.store.loads == []
 
 
 def test_daemon_closes_remote_session_before_one_behavior_stage(
