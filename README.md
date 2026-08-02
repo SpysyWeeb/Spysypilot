@@ -7,6 +7,12 @@ created from the current untouched `stock` tip.
 
 **In progress — ground-up replacement. Not field eligible.**
 
+**Learner correctness milestone — in progress.** The current work fixes the
+off-device progress contract, restores the documented whole-route
+train/validation partition, and makes rejected evidence explainable before the
+physical model is expanded. Controller and actuation behavior are unchanged in
+this milestone.
+
 This branch replaces the previous BLaTv2 controller architecture. Git history
 and useful test infrastructure remain available for audit, but no previous
 BLaTv2 controller mechanism is part of the new active design by default.
@@ -54,7 +60,7 @@ The replacement is split into independently testable owners:
 The current learning milestone replaces the rejected dynamic-rack fit. Normal
 driving did not independently identify rack gain and damping, so those
 provisional values are no longer learned or allowed to influence calibration
-identity. Evidence schema 8 instead learns only quantities the logs directly
+identity. Evidence schema 9 instead learns only quantities the logs directly
 support at the `0/5/10/15/20/30 m/s` nodes:
 
 - normalized torque per measured lateral acceleration;
@@ -72,7 +78,10 @@ remains free. This is not a post-fit clamp: each active constraint is
 re-solved.
 
 Whole routes—not adjacent frames—alternate between training and validation by
-their immutable route counter. The training side evaluates a nested model
+their canonical route counter: even counters train and odd counters validate.
+The counter travels with the route through preparation, replay, persistence,
+and restore; it is never reconstructed from replay order or a content hash.
+The training side evaluates a nested model
 family (`static only`, `friction`, `offset + friction`, then `full map`). The
 seed is now a first-class selectable result: if the data cannot prove a
 candidate is better beyond route-level uncertainty, the node is successfully
@@ -226,9 +235,9 @@ ill-conditioned, inconclusive, or regressing data requires better variety or a
 safer retained seed rather than simply forcing the node through.
 
 The learner's current evidence namespace is
-`complete_full_rlog_authority_v6`. It starts empty by design. The retired v1
-through v5 namespaces and their artifact bytes are never migrated, edited, or
-interpreted as schema-8 evidence; compatible retained full rlogs are replayed
+`complete_full_rlog_authority_v7`. It starts empty by design. The retired v1
+through v6 namespaces and their artifact bytes are never migrated, edited, or
+interpreted as schema-9 evidence; compatible retained full rlogs are replayed
 from source. Runtime identity for this namespace excludes the retired
 provisional rack-gain/damping seed while remaining bound to the detected
 vehicle, torque mapping, rack mapping, sensor resolution, and opendbc command
@@ -447,13 +456,19 @@ finalization, historical route scanning/replay progress, idle evidence, an
 eligible empty state, and fail-closed diagnostics. Backfill progress shows
 pass/route/segment plus read/apply progress and an evidence-based time estimate.
 
-Physical learning-status schema 3 reports each speed node's total/base/moving/
+Physical learning-status schema 4 reports each speed node's total/base/moving/
 breakaway/authority populations, train/validation state, rank and conditioning,
 paired uncertainty, interpolation status, and—only when a fit exists—the four
 observable values above. It distinguishes **learned**, **seed retained**,
 **needs evidence/variety**, **ill-conditioned**, **inconclusive**, and
 **validation regression** rather than calling every non-candidate unstable.
-It never labels retired rack gain or damping as learned.
+It never labels retired rack gain or damping as learned. It also publishes an
+exact first-cause accounting for every prepared physical frame: accepted,
+invalid numeric/timestamp, invalid vehicle input, lateral inactive, ineligible
+speed/standstill, invalid live rack mapping, driver interaction, unavailable
+causal alignment, measurement warm-up/discontinuity, learner-ineligible, or a
+discarded breakaway episode. These counts explain evidence loss; they do not
+change fitting or qualification.
 
 Behavior learning-status schema 1 separately shows
 `waiting_for_physical_profile`, `waiting_for_routes`, `preparing`, `training`,
@@ -481,22 +496,25 @@ authority until authenticated evidence is restored or committed.
 
 ### Pre-merge real-route audit
 
-Routes b7, b8, b9, and ca were replayed through the complete native-extractor,
-A/A, ledger, and publication path with both two and four worker lanes. Both
-topologies accepted 207,629 and rejected 222,910 measured frames and produced
-the same generation
-`1ff42b06de6480fc1e744702175167bd725849321e6e99d3e714596e16e56809`,
-evidence `ad59ed7bc85a6d06d164185673110c592df80b44971377fe86b0bb4204993aa9`,
-manifest `3c0f072a6af25d44ae447a19b0011ed27435fb21d523cdd7d607b39f1f384631`,
-and ledger `14fbd9db68bf01c8bbea05983d8aa2f083355f0146343a500c468aeadf90343d`
-hashes. Four workers completed in 35.00 s versus 44.15 s for two.
+Eighteen retained routes (`bd` through `d7`) were replayed twice from their
+independently certified route-evidence artifacts. Both runs classified all
+2,075,405 prepared frames identically: 820,768 accepted and 1,254,637 rejected.
+The canonical counters formed 10 training routes and 8 validation routes. The
+two runs produced byte-identical evidence
+`cff67d0e984b2b8f8075e61193acd7ed9c5524273025acf27c362363dfc44dac`
+and manifest
+`400c8892ac5f5e41faeceeffa1a44269c10d17b0d058ace0e5fd3c48a70a7f98`.
 
-The 10 and 15 m/s nodes qualified. The 5 m/s training routes selected the
-minimal `static_only` model, but the independently frozen validation routes
-showed overall and breakaway regression, so it was rejected rather than
-retuned against its holdout. The 0, 20, and 30 m/s nodes remained support- or
-episode-limited in this four-route regression set. No six-node candidate was
-emitted, and the exact stock controller remained selected.
+The rejection ledger attributes 626,217 frames to lateral inactivity, 335,819
+to unavailable causal command alignment, 260,313 to driver interaction or
+allowance, 27,629 to measurement warm-up/discontinuity, 1,811 to invalid
+numeric/timestamp input, 1,444 to learner eligibility, 1,401 to invalid vehicle
+input, and 3 to discarded breakaway episodes; no frames failed live rack
+mapping or the standstill/minimum-steer-speed gate in this set. The 0 through
+20 m/s nodes all qualified by retaining their validated seed values. The
+30 m/s node had five training but only three held-out breakaway episodes, below
+the required four, so no six-node candidate was emitted and stock remained
+selected.
 
 ---
 

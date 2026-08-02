@@ -14,9 +14,10 @@ by a same-direction rate quantum. Later moving rows identify kinetic motion.
 
 Inputs are the measured-only :class:`learner.LearningSample`. Slew build and
 release frames are authority evidence but never equality-fit. Evidence schema
-8 is deliberately incompatible with older evidence because route uncertainty
+9 is deliberately incompatible with older evidence because route uncertainty
 is bound to immutable route/content identities as well as per-route sufficient
-statistics. The route boundary, rather than individual
+statistics and the canonical route counter owns the train/validation split.
+The route boundary, rather than individual
 100 Hz samples, is the uncertainty unit used by selection and validation.
 
 The inverse map is selected from a deterministic nested family. Every model
@@ -59,7 +60,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 8
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 9
 MIN_VALIDATION_SUPPORT_FRACTION = 0.20
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_STRATUM_VALIDATION_ROWS = 4
@@ -68,6 +69,144 @@ NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
 # route-level paired uncertainty interval implemented below.
 NUMERICAL_LOSS_EPSILON_MULTIPLIER = 64.0
 FIT_CONDITION_LIMIT = 1.0 / math.sqrt(sys.float_info.epsilon)
+
+
+class CalibrationSampleDisposition(StrEnum):
+  """One bounded, mutually-exclusive outcome for every measured frame.
+
+  The runtime assigns upstream failures in physical pipeline order: malformed
+  input, vehicle validity, lateral lifecycle, speed eligibility, rack mapping,
+  driver interaction, causal command alignment, and measurement continuity.
+  Only frames surviving that chain reach the learner's two terminal rejection
+  outcomes. This first-cause ordering keeps counts additive and reproducible.
+  """
+
+  ACCEPTED = "accepted"
+  INVALID_NUMERIC_OR_TIMESTAMP = "invalid_numeric_or_timestamp"
+  VEHICLE_INPUT_INVALID = "vehicle_input_invalid"
+  LATERAL_INACTIVE = "lateral_inactive"
+  STANDSTILL_OR_BELOW_MIN_STEER_SPEED = "standstill_or_below_min_steer_speed"
+  LIVE_RACK_MAPPING_INVALID = "live_rack_mapping_invalid"
+  DRIVER_OVERRIDE_OR_ALLOWANCE = "driver_override_or_allowance"
+  CAUSAL_COMMAND_ALIGNMENT_UNAVAILABLE = "causal_command_alignment_unavailable"
+  MEASUREMENT_WARMUP_OR_DISCONTINUITY = "measurement_warmup_or_discontinuity"
+  LEARNER_INELIGIBLE = "learner_ineligible"
+  BREAKAWAY_EPISODE_DISCARDED = "breakaway_episode_discarded"
+
+
+_REJECTED_SAMPLE_DISPOSITIONS = tuple(
+  disposition
+  for disposition in CalibrationSampleDisposition
+  if disposition is not CalibrationSampleDisposition.ACCEPTED
+)
+_SAMPLE_DISPOSITIONS = tuple(CalibrationSampleDisposition)
+_SAMPLE_DISPOSITION_INDEX = {
+  disposition: index
+  for index, disposition in enumerate(_SAMPLE_DISPOSITIONS)
+}
+_LEARNER_OWNED_SAMPLE_DISPOSITIONS = frozenset({
+  CalibrationSampleDisposition.LEARNER_INELIGIBLE,
+  CalibrationSampleDisposition.BREAKAWAY_EPISODE_DISCARDED,
+})
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationSampleAccounting:
+  """Canonical durable totals for the finite sample-disposition vocabulary."""
+
+  accepted_sample_count: int
+  rejection_counts: tuple[int, ...]
+
+  def __post_init__(self) -> None:
+    if (
+      type(self.accepted_sample_count) is not int
+      or self.accepted_sample_count < 0
+      or type(self.rejection_counts) is not tuple
+      or len(self.rejection_counts) != len(_REJECTED_SAMPLE_DISPOSITIONS)
+      or any(type(count) is not int or count < 0 for count in self.rejection_counts)
+    ):
+      raise ValueError("calibration sample accounting is invalid")
+
+  @classmethod
+  def empty(cls) -> CalibrationSampleAccounting:
+    return cls(0, (0,) * len(_REJECTED_SAMPLE_DISPOSITIONS))
+
+  @property
+  def rejected_sample_count(self) -> int:
+    return sum(self.rejection_counts)
+
+  @property
+  def ingested_sample_count(self) -> int:
+    return self.accepted_sample_count + self.rejected_sample_count
+
+  def count(self, disposition: CalibrationSampleDisposition) -> int:
+    if disposition is CalibrationSampleDisposition.ACCEPTED:
+      return self.accepted_sample_count
+    return self.rejection_counts[_REJECTED_SAMPLE_DISPOSITIONS.index(disposition)]
+
+  def with_disposition(
+    self,
+    disposition: CalibrationSampleDisposition,
+  ) -> CalibrationSampleAccounting:
+    if not isinstance(disposition, CalibrationSampleDisposition):
+      raise TypeError("sample disposition must be CalibrationSampleDisposition")
+    if disposition is CalibrationSampleDisposition.ACCEPTED:
+      return CalibrationSampleAccounting(
+        self.accepted_sample_count + 1,
+        self.rejection_counts,
+      )
+    index = _REJECTED_SAMPLE_DISPOSITIONS.index(disposition)
+    counts = list(self.rejection_counts)
+    counts[index] += 1
+    return CalibrationSampleAccounting(self.accepted_sample_count, tuple(counts))
+
+  def to_payload(self) -> dict[str, object]:
+    return {
+      "accepted_sample_count": self.accepted_sample_count,
+      "ingested_sample_count": self.ingested_sample_count,
+      "rejected_sample_count": self.rejected_sample_count,
+      "rejection_reasons": {
+        disposition.value: self.rejection_counts[index]
+        for index, disposition in enumerate(_REJECTED_SAMPLE_DISPOSITIONS)
+      },
+    }
+
+  @classmethod
+  def from_payload(cls, raw: object) -> CalibrationSampleAccounting:
+    if type(raw) is not dict or set(raw) != {
+      "accepted_sample_count",
+      "ingested_sample_count",
+      "rejected_sample_count",
+      "rejection_reasons",
+    }:
+      raise ValueError("calibration sample-accounting schema does not match")
+    accepted = raw["accepted_sample_count"]
+    ingested = raw["ingested_sample_count"]
+    rejected = raw["rejected_sample_count"]
+    reasons = raw["rejection_reasons"]
+    expected_reasons = {
+      disposition.value for disposition in _REJECTED_SAMPLE_DISPOSITIONS
+    }
+    if (
+      type(accepted) is not int
+      or accepted < 0
+      or type(ingested) is not int
+      or ingested < 0
+      or type(rejected) is not int
+      or rejected < 0
+      or type(reasons) is not dict
+      or set(reasons) != expected_reasons
+      or any(type(count) is not int or count < 0 for count in reasons.values())
+    ):
+      raise ValueError("calibration sample accounting is invalid")
+    counts = tuple(reasons[disposition.value] for disposition in _REJECTED_SAMPLE_DISPOSITIONS)
+    accounting = cls(accepted, counts)
+    if (
+      accounting.rejected_sample_count != rejected
+      or accounting.ingested_sample_count != ingested
+    ):
+      raise ValueError("calibration sample-accounting totals disagree")
+    return accounting
 
 
 class CalibrationModelId(StrEnum):
@@ -352,6 +491,7 @@ class _RouteNodeRegressions:
 @dataclass(slots=True)
 class _RouteEvidence:
   route_index: int
+  route_counter: int
   route_identity_sha256: str
   route_content_sha256: str
   validation: bool
@@ -1202,6 +1342,12 @@ def _route_sha256(value: str, name: str) -> str:
   return value
 
 
+def _canonical_route_counter(value: int) -> int:
+  if type(value) is not int or value < 0 or value > 0xFFFFFFFF:
+    raise ValueError("calibration route counter must be an unsigned 32-bit integer")
+  return value
+
+
 class CalibrationProfileLearner:
   """Speed-local evidence accumulator and offroad qualification engine."""
 
@@ -1215,15 +1361,31 @@ class CalibrationProfileLearner:
     self._breakaway_detector = BreakawayEpisodeDetector()
     self._route_active = False
     self._route_validation = False
+    self._active_route_counter: int | None = None
     self._active_route_identity_sha256: str | None = None
     self._active_route_content_sha256: str | None = None
     self._routes: list[_RouteEvidence] = []
+    # Single-owner mutable counters keep the 100 Hz path allocation-free.
+    # Immutable snapshots are materialized only for export/status consumers.
+    self._sample_disposition_counts = [0] * len(_SAMPLE_DISPOSITIONS)
     self._active_route_nodes: tuple[_RouteNodeRegressions, ...] | None = None
     self._active_route_intervals: tuple[_JointRegression, ...] | None = None
 
   @property
   def speed_nodes_mps(self) -> tuple[float, ...]:
     return self.seed_profile.speed_nodes_mps
+
+  @property
+  def sample_accounting(self) -> CalibrationSampleAccounting:
+    return CalibrationSampleAccounting(
+      self._sample_disposition_counts[
+        _SAMPLE_DISPOSITION_INDEX[CalibrationSampleDisposition.ACCEPTED]
+      ],
+      tuple(
+        self._sample_disposition_counts[_SAMPLE_DISPOSITION_INDEX[disposition]]
+        for disposition in _REJECTED_SAMPLE_DISPOSITIONS
+      ),
+    )
 
   def evidence_for_node(self, index: int) -> CalibrationNodeEvidenceSnapshot:
     node = self._nodes[index]
@@ -1294,23 +1456,28 @@ class CalibrationProfileLearner:
     self,
     route_identity_sha256: str,
     route_content_sha256: str | None = None,
+    *,
+    route_counter: int,
   ) -> None:
-    """Pin one independent route identity before decoding any samples."""
+    """Pin one canonical route counter and independent identity."""
     if self._route_active:
       raise RuntimeError("calibration learner route is already active")
+    counter = _canonical_route_counter(route_counter)
     route_identity = _route_sha256(route_identity_sha256, "route identity")
     route_content = _route_sha256(
       route_identity if route_content_sha256 is None else route_content_sha256,
       "route content identity",
     )
     if any(
-      route.route_identity_sha256 == route_identity
+      route.route_counter == counter
+      or route.route_identity_sha256 == route_identity
       or route.route_content_sha256 == route_content
       for route in self._routes
     ):
-      raise ValueError("calibration route identity was already ingested")
+      raise ValueError("calibration route counter, identity, or content was already ingested")
     self.reset_route_transients()
-    self._route_validation = bool(int(route_identity[-1], 16) & 1)
+    self._route_validation = bool(counter & 1)
+    self._active_route_counter = counter
     self._active_route_identity_sha256 = route_identity
     self._active_route_content_sha256 = route_content
     self._active_route_nodes = tuple(
@@ -1330,9 +1497,12 @@ class CalibrationProfileLearner:
       raise AssertionError("active calibration route lacks route statistics")
     if self._active_route_identity_sha256 is None or self._active_route_content_sha256 is None:
       raise AssertionError("active calibration route lacks immutable identity")
+    if self._active_route_counter is None:
+      raise AssertionError("active calibration route lacks canonical counter")
     self._routes.append(
       _RouteEvidence(
         route_index=len(self._routes),
+        route_counter=self._active_route_counter,
         route_identity_sha256=self._active_route_identity_sha256,
         route_content_sha256=self._active_route_content_sha256,
         validation=self._route_validation,
@@ -1343,6 +1513,7 @@ class CalibrationProfileLearner:
     self.reset_route_transients()
     self._active_route_nodes = None
     self._active_route_intervals = None
+    self._active_route_counter = None
     self._active_route_identity_sha256 = None
     self._active_route_content_sha256 = None
     self._route_active = False
@@ -1454,14 +1625,17 @@ class CalibrationProfileLearner:
     node.stationary_dwell_s = 0.0
     node.last_direction = 0
 
-  def add_sample(self, sample: LearningSample) -> bool:
+  def _add_sample_without_accounting(
+    self,
+    sample: LearningSample,
+  ) -> CalibrationSampleDisposition:
     if not isinstance(sample, LearningSample):
       raise TypeError("calibration learner accepts LearningSample only")
     if not self._route_active:
       raise RuntimeError("calibration sample has no pinned route partition")
     if not sample.valid or not sample.engaged or sample.steering_pressed or sample.standstill:
       self.reset_route_transients()
-      return False
+      return CalibrationSampleDisposition.LEARNER_INELIGIBLE
     reversal_evidence = (
       sample.rack_direction_reversal
       and sample._base_valid
@@ -1471,7 +1645,7 @@ class CalibrationProfileLearner:
     )
     if not sample.clean and not sample.authority_evidence and not reversal_evidence:
       self.reset_route_transients()
-      return False
+      return CalibrationSampleDisposition.LEARNER_INELIGIBLE
     if reversal_evidence:
       # A signed reversal is valid for the acceleration-free inverse map, but
       # it ends prior dwell/direction continuity. It may be a moving row; it
@@ -1539,7 +1713,11 @@ class CalibrationProfileLearner:
         node.authority_fit_sample_count += 1
         node.authority_fit_support_s += weight
         accepted = True
-      return accepted
+      return (
+        CalibrationSampleDisposition.ACCEPTED
+        if accepted
+        else CalibrationSampleDisposition.LEARNER_INELIGIBLE
+      )
 
     seed_at_speed = self.seed_profile.parameters_at(
       sample.speed_mps,
@@ -1556,7 +1734,7 @@ class CalibrationProfileLearner:
     if category == "discarded":
       for node in self._nodes:
         self._reset_node(node)
-      return False
+      return CalibrationSampleDisposition.BREAKAWAY_EPISODE_DISCARDED
     direction = decision.direction
     support_speed = (
       episode.onset_speed_mps if episode is not None else sample.speed_mps
@@ -1712,7 +1890,50 @@ class CalibrationProfileLearner:
         node.lateral_accel_direction_mask |= 1 if lat < 0.0 else 2 if lat > 0.0 else 0
         node.applied_torque_direction_mask |= 1 if torque < 0.0 else 2 if torque > 0.0 else 0
       accepted = True
-    return accepted
+    return (
+      CalibrationSampleDisposition.ACCEPTED
+      if accepted
+      else CalibrationSampleDisposition.LEARNER_INELIGIBLE
+    )
+
+  def add_sample_with_disposition(
+    self,
+    sample: LearningSample,
+    *,
+    upstream_rejection: CalibrationSampleDisposition | None = None,
+  ) -> CalibrationSampleDisposition:
+    """Accumulate one frame and durably record exactly one first cause."""
+    if upstream_rejection is not None and (
+      not isinstance(upstream_rejection, CalibrationSampleDisposition)
+      or upstream_rejection is CalibrationSampleDisposition.ACCEPTED
+      or upstream_rejection in _LEARNER_OWNED_SAMPLE_DISPOSITIONS
+    ):
+      raise ValueError("upstream rejection must identify an upstream pipeline failure")
+    if not isinstance(sample, LearningSample):
+      raise TypeError("calibration learner accepts LearningSample only")
+    if not self._route_active:
+      raise RuntimeError("calibration sample has no pinned route partition")
+    if upstream_rejection is not None:
+      # Runtime first-cause classification is authoritative. An upstream
+      # failure resets physical continuity and never reaches accumulation,
+      # even if a contradictory test caller attaches it to a clean sample.
+      self.reset_route_transients()
+      self._sample_disposition_counts[
+        _SAMPLE_DISPOSITION_INDEX[upstream_rejection]
+      ] += 1
+      return upstream_rejection
+    learner_disposition = self._add_sample_without_accounting(sample)
+    self._sample_disposition_counts[
+      _SAMPLE_DISPOSITION_INDEX[learner_disposition]
+    ] += 1
+    return learner_disposition
+
+  def add_sample(self, sample: LearningSample) -> bool:
+    """Compatibility wrapper for callers that need only accepted/rejected."""
+    return (
+      self.add_sample_with_disposition(sample)
+      is CalibrationSampleDisposition.ACCEPTED
+    )
 
   def _node_report(self, index: int) -> CalibrationNodeQualificationReport:
     node = self._nodes[index]
@@ -2330,6 +2551,7 @@ class CalibrationProfileLearner:
     routes = [
       {
         "route_index": route.route_index,
+        "route_counter": route.route_counter,
         "route_identity_sha256": route.route_identity_sha256,
         "route_content_sha256": route.route_content_sha256,
         "validation": route.validation,
@@ -2350,6 +2572,7 @@ class CalibrationProfileLearner:
       "vehicle_identity": self.seed_profile.vehicle_identity,
       "seed_profile_json": seed_json,
       "seed_profile_sha256": hashlib.sha256(seed_json.encode()).hexdigest(),
+      "sample_accounting": self.sample_accounting.to_payload(),
       "speed_nodes_mps": [speed.hex() for speed in self.speed_nodes_mps],
       "nodes": nodes,
       "routes": routes,
@@ -2376,6 +2599,7 @@ class CalibrationProfileLearner:
         "vehicle_identity",
         "seed_profile_json",
         "seed_profile_sha256",
+        "sample_accounting",
         "speed_nodes_mps",
         "nodes",
         "routes",
@@ -2398,6 +2622,13 @@ class CalibrationProfileLearner:
     if payload["speed_nodes_mps"] != [speed.hex() for speed in seed_profile.speed_nodes_mps]:
       raise ValueError("calibration speed grid mismatch")
     learner = cls(seed_profile)
+    sample_accounting = CalibrationSampleAccounting.from_payload(
+      payload["sample_accounting"],
+    )
+    learner._sample_disposition_counts = [
+      sample_accounting.count(disposition)
+      for disposition in _SAMPLE_DISPOSITIONS
+    ]
     raw_nodes = payload["nodes"]
     if type(raw_nodes) is not list or len(raw_nodes) != len(learner._nodes):
       raise ValueError("calibration node count mismatch")
@@ -2566,6 +2797,7 @@ class CalibrationProfileLearner:
         raw_route,
         {
           "route_index",
+          "route_counter",
           "route_identity_sha256",
           "route_content_sha256",
           "validation",
@@ -2576,6 +2808,7 @@ class CalibrationProfileLearner:
       )
       if route_payload["route_index"] != route_index:
         raise ValueError("calibration route ordering is corrupt")
+      route_counter = _canonical_route_counter(route_payload["route_counter"])
       if type(route_payload["validation"]) is not bool:
         raise ValueError("calibration route partition is invalid")
       route_identity = _route_sha256(
@@ -2586,10 +2819,11 @@ class CalibrationProfileLearner:
         route_payload["route_content_sha256"],
         "route content identity",
       )
-      if route_payload["validation"] != bool(int(route_identity[-1], 16) & 1):
-        raise ValueError("calibration route partition does not match identity")
+      if route_payload["validation"] != bool(route_counter & 1):
+        raise ValueError("calibration route partition does not match counter")
       if any(
-        route.route_identity_sha256 == route_identity
+        route.route_counter == route_counter
+        or route.route_identity_sha256 == route_identity
         or route.route_content_sha256 == route_content
         for route in learner._routes
       ):
@@ -2632,6 +2866,7 @@ class CalibrationProfileLearner:
       learner._routes.append(
         _RouteEvidence(
           route_index=route_index,
+          route_counter=route_counter,
           route_identity_sha256=route_identity,
           route_content_sha256=route_content,
           validation=route_payload["validation"],

@@ -29,6 +29,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CALIBRATION_EVIDENCE_SCHEMA_VERSION,
   CalibrationLearningResult,
   CalibrationProfileLearner,
+  CalibrationSampleAccounting,
+  CalibrationSampleDisposition,
   calibration_evidence_sha256,
   minimum_calibration_support_s,
 )
@@ -38,7 +40,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 8
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 9
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
@@ -108,6 +110,7 @@ class CalibrationLearningFinalization:
   candidate_profile_json: bytes | None
   candidate_profile_sha256: str | None
   learning_result: CalibrationLearningResult
+  sample_accounting: CalibrationSampleAccounting
 
   @property
   def all_nodes_qualified(self) -> bool:
@@ -242,12 +245,21 @@ class CalibrationLearningCoordinator:
       raise ValueError("candidate provenance must not be empty")
 
     self._learner = CalibrationProfileLearner(seed_profile) if evidence_bytes is None else CalibrationProfileLearner.from_evidence(seed_profile, evidence_bytes)
+    self._add_sample_with_disposition = getattr(
+      self._learner,
+      "add_sample_with_disposition",
+      None,
+    )
+    self._reset_route_transients = getattr(
+      self._learner,
+      "reset_route_transients",
+      None,
+    )
     self._seed_profile = seed_profile
     self._candidate_provenance = provenance
     self._state = CalibrationLearningLifecycleState.OFFROAD
-    self._ingested_sample_count = 0
     self._clean_sample_count = 0
-    self._accepted_sample_count = 0
+    self._fallback_sample_accounting = CalibrationSampleAccounting.empty()
     self._evidence_generation = 0
     self._finalized_generation = -1
     self._cached_finalization: CalibrationLearningFinalization | None = None
@@ -266,7 +278,7 @@ class CalibrationLearningCoordinator:
 
   @property
   def ingested_sample_count(self) -> int:
-    return self._ingested_sample_count
+    return self.sample_accounting.ingested_sample_count
 
   @property
   def clean_sample_count(self) -> int:
@@ -274,11 +286,20 @@ class CalibrationLearningCoordinator:
 
   @property
   def accepted_sample_count(self) -> int:
-    return self._accepted_sample_count
+    return self.sample_accounting.accepted_sample_count
 
   @property
   def rejected_sample_count(self) -> int:
-    return self._ingested_sample_count - self._accepted_sample_count
+    return self.sample_accounting.rejected_sample_count
+
+  @property
+  def sample_accounting(self) -> CalibrationSampleAccounting:
+    accounting = getattr(self._learner, "sample_accounting", None)
+    return (
+      accounting
+      if isinstance(accounting, CalibrationSampleAccounting)
+      else self._fallback_sample_accounting
+    )
 
   @property
   def support_diagnostics(self) -> tuple[CalibrationNodeSupportDiagnostic, ...]:
@@ -335,10 +356,16 @@ class CalibrationLearningCoordinator:
     self,
     route_identity_sha256: str,
     route_content_sha256: str | None = None,
+    *,
+    route_counter: int,
   ) -> None:
     if self._state is not CalibrationLearningLifecycleState.OFFROAD:
       raise RuntimeError("calibration coordinator is already onroad")
-    self._learner.begin_route(route_identity_sha256, route_content_sha256)
+    self._learner.begin_route(
+      route_identity_sha256,
+      route_content_sha256,
+      route_counter=route_counter,
+    )
     self._state = CalibrationLearningLifecycleState.ONROAD
 
   def transition_offroad(self) -> None:
@@ -352,25 +379,54 @@ class CalibrationLearningCoordinator:
     self._cached_finalization = None
     self._finalized_generation = -1
 
-  def ingest(self, sample: LearningSample) -> bool:
-    """Accumulate measured response in memory; never write or activate."""
+  def ingest(
+    self,
+    sample: LearningSample,
+    *,
+    upstream_rejection: CalibrationSampleDisposition | None = None,
+  ) -> bool:
+    """Accumulate and durably classify one measured frame in memory."""
     if self._state is not CalibrationLearningLifecycleState.ONROAD:
       raise RuntimeError("calibration samples may be ingested only while onroad")
     if not isinstance(sample, LearningSample):
       raise TypeError("calibration coordinator requires a measured-only LearningSample")
 
-    self._ingested_sample_count += 1
-    accepted = self._learner.add_sample(sample)
+    if callable(self._add_sample_with_disposition):
+      disposition = self._add_sample_with_disposition(
+        sample,
+        upstream_rejection=upstream_rejection,
+      )
+      if not isinstance(disposition, CalibrationSampleDisposition):
+        raise TypeError("calibration learner emitted an invalid disposition")
+    else:
+      if upstream_rejection is not None:
+        # A legacy test double cannot classify first causes itself. Preserve
+        # physical continuity without ever presenting rejected evidence to its
+        # accumulator.
+        if callable(self._reset_route_transients):
+          self._reset_route_transients()
+        disposition = upstream_rejection
+      else:
+        disposition = (
+          CalibrationSampleDisposition.ACCEPTED
+          if self._learner.add_sample(sample)
+          else CalibrationSampleDisposition.LEARNER_INELIGIBLE
+        )
+      self._fallback_sample_accounting = (
+        self._fallback_sample_accounting.with_disposition(disposition)
+      )
+    accepted = disposition is CalibrationSampleDisposition.ACCEPTED
     if accepted:
       # Inverse calibration legitimately retains signed reversal rows even
       # though legacy ``LearningSample.clean`` excludes them for its dynamic
       # acceleration fit. Authority observations remain a separate population.
       if not sample.authority_evidence:
         self._clean_sample_count += 1
-      self._accepted_sample_count += 1
-      self._evidence_generation += 1
-      self._cached_finalization = None
-      self._finalized_generation = -1
+    # Rejections are durable evidence too. Every disposition invalidates a
+    # cached finalization so persisted accounting can never lag ingestion.
+    self._evidence_generation += 1
+    self._cached_finalization = None
+    self._finalized_generation = -1
     return accepted
 
   def finalize(self) -> CalibrationLearningFinalization:
@@ -384,9 +440,9 @@ class CalibrationLearningCoordinator:
     evidence_identity = calibration_evidence_sha256(evidence_bytes)
     result = self._learner.qualify(self._candidate_provenance)
     candidate = result.candidate_profile
-    # Test doubles and external audit adapters that predate schema 8 may only
-    # expose the learned candidate.  A real schema-8 learner always provides
-    # ``selected_profile`` explicitly; the fallback preserves the same value
+    # Test doubles and external audit adapters that predate selected-profile
+    # publication may expose only the learned candidate. A production learner
+    # provides ``selected_profile`` explicitly; the fallback preserves it
     # for the learned case without inventing an all-seed selection.
     selected = getattr(result, "selected_profile", candidate)
     if (selected is not None) != result.all_nodes_qualified:
@@ -461,6 +517,7 @@ class CalibrationLearningCoordinator:
       candidate_profile_json=candidate_json,
       candidate_profile_sha256=candidate_identity,
       learning_result=result,
+      sample_accounting=self.sample_accounting,
     )
     self._cached_finalization = finalization
     self._finalized_generation = self._evidence_generation

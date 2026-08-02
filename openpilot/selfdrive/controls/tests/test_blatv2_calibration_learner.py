@@ -5,6 +5,13 @@ import hashlib
 import json
 import math
 import unittest
+from unittest.mock import patch
+
+from openpilot.selfdrive.controls.lib.blatv2.breakaway_episode import (
+  BreakawayCategory,
+  BreakawayDecision,
+  BreakawayEpisodeDetector,
+)
 
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CALIBRATION_EVIDENCE_SCHEMA_VERSION,
@@ -12,6 +19,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationModelId,
   CalibrationProfileLearner,
   CalibrationQualificationReason,
+  CalibrationSampleDisposition,
   _JointRegression,
   _Regression,
   _fit_bounded_subset,
@@ -44,7 +52,7 @@ RATE_QUANTUM_DEG_S = 4.0
 
 
 def route_sha(counter: int) -> str:
-  return f"{counter:064x}"
+  return hashlib.sha256(f"route-{counter}".encode()).hexdigest()
 
 
 def seed_profile(vehicle_identity: str = "calibration-learner-test") -> VehicleCalibrationProfile:
@@ -163,7 +171,7 @@ def add_identifiable_route(
   *,
   torque_delta: float = 0.0,
 ) -> None:
-  learner.begin_route(route_sha(route_counter))
+  learner.begin_route(route_sha(route_counter), route_counter=route_counter)
   try:
     add_identifiable_stream(
       learner,
@@ -182,7 +190,7 @@ def add_identifiable_route_for_parameters(
   route_counter: int,
   parameters: CalibrationParameters,
 ) -> None:
-  learner.begin_route(route_sha(route_counter))
+  learner.begin_route(route_sha(route_counter), route_counter=route_counter)
   try:
     index = 0
     while index < sample_count:
@@ -404,8 +412,8 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
 
     first = CalibrationProfileLearner(seed_profile())
     second = CalibrationProfileLearner(seed_profile())
-    first.begin_route(route_sha(0))
-    second.begin_route(route_sha(0))
+    first.begin_route(route_sha(0), route_counter=0)
+    second.begin_route(route_sha(0), route_counter=0)
     for index in range(300):
       direction = -1 if index % 2 else 1
       lateral_accel = direction * (0.3 + 0.01 * (index % 40))
@@ -419,7 +427,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
 
   def test_first_rate_quantum_is_motion_and_reversal_does_not_fake_breakaway(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())
-    learner.begin_route(route_sha(0))
+    learner.begin_route(route_sha(0), route_counter=0)
     self.assertTrue(learner.add_sample(sample(10.0, 0.4, RATE_QUANTUM_DEG_S, moving_sign=1)))
     snapshot = learner.evidence_for_node(2)
     self.assertEqual(snapshot.base_sample_count, 0)
@@ -450,7 +458,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
 
   def test_independent_support_and_authority_counts(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())
-    learner.begin_route(route_sha(0))
+    learner.begin_route(route_sha(0), route_counter=0)
     self.assertTrue(learner.add_sample(sample(10.0, 0.4, 0.0)))
     self.assertTrue(learner.add_sample(sample(10.0, -0.4, 0.0)))
     self.assertTrue(learner.add_sample(sample(10.0, 0.2, 0.0)))
@@ -521,9 +529,10 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     learner.end_route()
 
   def test_route_partition_is_maneuver_atomic_and_active_route_cannot_publish(self) -> None:
+    self.assertEqual(int(route_sha(1)[-1], 16) & 1, 0)
     for route_counter, validation in ((0, False), (1, True)):
       learner = CalibrationProfileLearner(seed_profile())
-      learner.begin_route(route_sha(route_counter))
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
       add_identifiable_stream(learner, 10.0, 24)
 
       with self.assertRaisesRegex(RuntimeError, "active route evidence"):
@@ -560,19 +569,28 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
 
   def test_route_identity_prevents_duplicate_uncertainty_and_partition_leakage(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())
-    learner.begin_route(route_sha(2), "a" * 64)
+    learner.begin_route(route_sha(2), "a" * 64, route_counter=2)
     learner.end_route()
     with self.assertRaisesRegex(ValueError, "already ingested"):
-      learner.begin_route(route_sha(2), "b" * 64)
+      learner.begin_route(route_sha(2), "b" * 64, route_counter=2)
     with self.assertRaisesRegex(ValueError, "already ingested"):
-      learner.begin_route(route_sha(4), "a" * 64)
+      learner.begin_route(route_sha(4), "a" * 64, route_counter=4)
+    with self.assertRaisesRegex(ValueError, "already ingested"):
+      learner.begin_route(route_sha(4), "b" * 64, route_counter=2)
+
+    for invalid_counter in (-1, 0x100000000, True):
+      with self.subTest(route_counter=invalid_counter):
+        with self.assertRaisesRegex(ValueError, "unsigned 32-bit"):
+          CalibrationProfileLearner(seed_profile()).begin_route(
+            route_sha(6), route_counter=invalid_counter,
+          )
 
     restored = CalibrationProfileLearner.from_evidence(
       seed_profile(),
       learner.export_evidence(),
     )
     with self.assertRaisesRegex(ValueError, "already ingested"):
-      restored.begin_route(route_sha(2), "a" * 64)
+      restored.begin_route(route_sha(2), "a" * 64, route_counter=2)
 
   def test_validation_targets_cannot_select_model_or_change_parameter_bytes(self) -> None:
     seed = seed_profile()
@@ -619,7 +637,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     # squares therefore prefers the richer model, but that model makes the
     # rare breakaway population materially worse than the seed.
     for route_counter in (0, 2):
-      learner.begin_route(route_sha(route_counter))
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
       for _ in range(25):
         for x in xs:
           direction = -1 if x < 0.0 else 1
@@ -689,11 +707,11 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       0,
     )
 
-  def test_strict_v8_evidence_is_deterministic_and_restorable(self) -> None:
+  def test_strict_v9_evidence_is_deterministic_and_restorable(self) -> None:
     seed = seed_profile()
     learner = CalibrationProfileLearner(seed)
     for route_counter, direction in ((0, 1), (2, -1), (1, -1), (3, 1)):
-      learner.begin_route(route_sha(route_counter))
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
       add_angle_assisted_episode(learner, 10.0, direction)
       add_identifiable_stream(learner, 10.0, 345)
       learner.end_route()
@@ -702,6 +720,10 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     envelope = json.loads(encoded)
     self.assertEqual(envelope["payload"]["evidence_schema_version"], CALIBRATION_EVIDENCE_SCHEMA_VERSION)
     self.assertEqual(envelope["payload"]["profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
+    self.assertEqual(
+      [route["route_counter"] for route in envelope["payload"]["routes"]],
+      [0, 2, 1, 3],
+    )
 
     restored = CalibrationProfileLearner.from_evidence(seed, encoded)
     self.assertEqual(restored.export_evidence(), encoded)
@@ -743,6 +765,11 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     retired["payload_sha256"] = hashlib.sha256(canonical(retired["payload"])).hexdigest()
     with self.assertRaisesRegex(ValueError, "evidence schema"):
       CalibrationProfileLearner.from_evidence(seed, canonical(retired))
+    wrong_partition = json.loads(encoded)
+    wrong_partition["payload"]["routes"][0]["validation"] = True
+    wrong_partition["payload_sha256"] = hashlib.sha256(canonical(wrong_partition["payload"])).hexdigest()
+    with self.assertRaisesRegex(ValueError, "partition does not match counter"):
+      CalibrationProfileLearner.from_evidence(seed, canonical(wrong_partition))
     inconsistent = json.loads(encoded)
     inconsistent["payload"]["nodes"][2]["supported_sample_count"] += 1
     inconsistent["payload_sha256"] = hashlib.sha256(canonical(inconsistent["payload"])).hexdigest()
@@ -750,6 +777,82 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       CalibrationProfileLearner.from_evidence(seed, canonical(inconsistent))
     with self.assertRaisesRegex(ValueError, "different seed"):
       CalibrationProfileLearner.from_evidence(seed_profile("other-vehicle"), encoded)
+
+  def test_sample_dispositions_are_durable_strict_and_non_mutating(self) -> None:
+    seed = seed_profile()
+    learner = CalibrationProfileLearner(seed)
+    learner.begin_route(route_sha(0), route_counter=0)
+    clean = sample(10.0, 0.4, RATE_QUANTUM_DEG_S, moving_sign=1)
+    before = learner.evidence_for_node(2)
+    disposition = learner.add_sample_with_disposition(
+      clean,
+      upstream_rejection=CalibrationSampleDisposition.LIVE_RACK_MAPPING_INVALID,
+    )
+    self.assertIs(disposition, CalibrationSampleDisposition.LIVE_RACK_MAPPING_INVALID)
+    self.assertEqual(learner.evidence_for_node(2), before)
+    self.assertTrue(learner.add_sample(clean))
+    self.assertFalse(learner.add_sample(replace(clean, valid=False)))
+    with patch.object(
+      BreakawayEpisodeDetector,
+      "update",
+      return_value=BreakawayDecision(BreakawayCategory.DISCARDED),
+    ):
+      self.assertFalse(learner.add_sample(clean))
+    learner.end_route()
+
+    accounting = learner.sample_accounting
+    self.assertEqual(accounting.ingested_sample_count, 4)
+    self.assertEqual(accounting.accepted_sample_count, 1)
+    self.assertEqual(accounting.rejected_sample_count, 3)
+    self.assertEqual(
+      accounting.count(CalibrationSampleDisposition.LIVE_RACK_MAPPING_INVALID),
+      1,
+    )
+    self.assertEqual(
+      accounting.count(CalibrationSampleDisposition.LEARNER_INELIGIBLE),
+      1,
+    )
+    self.assertEqual(
+      accounting.count(CalibrationSampleDisposition.BREAKAWAY_EPISODE_DISCARDED),
+      1,
+    )
+
+    encoded = learner.export_evidence()
+    restored = CalibrationProfileLearner.from_evidence(seed, encoded)
+    self.assertEqual(restored.sample_accounting, accounting)
+    self.assertEqual(restored.export_evidence(), encoded)
+    restored.begin_route(route_sha(1), route_counter=1)
+    restored.add_sample_with_disposition(
+      clean,
+      upstream_rejection=CalibrationSampleDisposition.VEHICLE_INPUT_INVALID,
+    )
+    restored.end_route()
+    continued = restored.export_evidence()
+    continued_accounting = CalibrationProfileLearner.from_evidence(
+      seed,
+      continued,
+    ).sample_accounting
+    self.assertEqual(continued_accounting.ingested_sample_count, 5)
+    self.assertEqual(
+      continued_accounting.count(CalibrationSampleDisposition.VEHICLE_INPUT_INVALID),
+      1,
+    )
+
+    tampered = json.loads(encoded)
+    tampered["payload"]["sample_accounting"]["ingested_sample_count"] += 1
+    tampered["payload_sha256"] = hashlib.sha256(
+      canonical(tampered["payload"]),
+    ).hexdigest()
+    with self.assertRaisesRegex(ValueError, "totals disagree"):
+      CalibrationProfileLearner.from_evidence(seed, canonical(tampered))
+
+    unknown = json.loads(encoded)
+    unknown["payload"]["sample_accounting"]["rejection_reasons"]["other"] = 0
+    unknown["payload_sha256"] = hashlib.sha256(
+      canonical(unknown["payload"]),
+    ).hexdigest()
+    with self.assertRaisesRegex(ValueError, "accounting is invalid"):
+      CalibrationProfileLearner.from_evidence(seed, canonical(unknown))
 
   def test_partial_never_emits_candidate_and_full_fit_qualifies_every_node(self) -> None:
     partial = CalibrationProfileLearner(seed_profile())
@@ -839,7 +942,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     learner = CalibrationProfileLearner(seed_profile())
     # Repeated identical predictors have support but no independent rank.
     for route_counter in (0, 2):
-      learner.begin_route(route_sha(route_counter))
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
       for _ in range(8):
         predictors = (1.0, 1.0, 1.0, 0.0)
         learner._add_regression(2, "training", predictors, 0.2, 1.0)

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import re
 from typing import Any
 
 from opendbc.car.structs import car
@@ -73,6 +74,7 @@ STEP_TIMEOUT_MS = 100
 OPERATION_STATUS_REFRESH_WITNESSES = int(
   round(2.0 * SERVICE_LIST["controlsState"].frequency),
 )
+_CURRENT_ROUTE_RE = re.compile(r"[0-9a-f]{8}--[0-9a-f]{10}\Z")
 
 
 def assert_no_actuation_publishers(
@@ -154,6 +156,7 @@ class BlatV2LearnerDaemon:
     self._learning_status_clear_pending = False
     self._drive_baseline: DriveEvidenceBaseline | None = None
     self._current_route_identity: str | None = None
+    self._current_route_counter: int | None = None
     self._persist_retry_count = 0
     self._histories = {
       service: _CanonicalSourceHistory()
@@ -263,7 +266,10 @@ class BlatV2LearnerDaemon:
         route_name = bytes(encoded).decode("utf-8")
       else:
         raise TypeError("CurrentRoute must be text or UTF-8 bytes")
+      if _CURRENT_ROUTE_RE.fullmatch(route_name) is None:
+        raise ValueError("CurrentRoute is not a canonical route name")
       self._current_route_identity = route_identity_sha256(route_name)
+      self._current_route_counter = int(route_name[:8], 16)
       if self._live_identity_bound and self.runtime is not None:
         self._publish_operation_status(
           state=LearningOperationState.COLLECTING,
@@ -477,7 +483,7 @@ class BlatV2LearnerDaemon:
       return
     if self._live_identity_bound:
       return
-    if self._current_route_identity is None:
+    if self._current_route_identity is None or self._current_route_counter is None:
       # Route-level uncertainty is meaningful only when every observation is
       # bound to one immutable route.  Never start an anonymous preview and
       # later relabel its already-collected frames when CurrentRoute appears.
@@ -491,7 +497,10 @@ class BlatV2LearnerDaemon:
     self._drive_baseline = DriveEvidenceBaseline.from_support_diagnostics(
       self.runtime.coordinator.support_diagnostics,
     )
-    self.runtime.transition_onroad(self._current_route_identity)
+    self.runtime.transition_onroad(
+      self._current_route_identity,
+      route_counter=self._current_route_counter,
+    )
     self._live_identity_bound = True
     self._publish_operation_status(
       state=LearningOperationState.COLLECTING,
@@ -511,6 +520,7 @@ class BlatV2LearnerDaemon:
       self._pending_offroad_persist = False
       self._drive_baseline = None
       self._current_route_identity = None
+      self._current_route_counter = None
       self._persist_retry_count = 0
       self._last_collecting_status_witness_count = 0
       if was_offroad:

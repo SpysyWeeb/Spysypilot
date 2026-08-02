@@ -337,13 +337,13 @@ The committed storage/wire identities are:
 
 | Contract | Current value |
 | --- | --- |
-| calibration profile / evidence / coordinator | 2 / 8 / 8 |
+| calibration profile / evidence / coordinator | 2 / 9 / 9 |
 | runtime vehicle / calibration identity / provisional dynamics | 1 / 1 / 1 |
-| physical learning / operation / progress status | 3 / 1 / 1 |
+| physical learning / operation / progress status | 4 / 1 / 1 |
 | native extractor / canonical join | 3 / 3 |
 | route evidence | `BLATRE02`, version 2 |
 | backfill ledger / commit / pointer | 2 / 2 / 1 |
-| physical inclusion namespace | `complete_full_rlog_authority_v6` |
+| physical inclusion namespace | `complete_full_rlog_authority_v7` |
 | controller policy | 1 |
 | behavior gate spec / segmentation / replay input | 3 / 1 / 1 |
 | behavior transaction / finalization | 2 / 1 |
@@ -351,12 +351,12 @@ The committed storage/wire identities are:
 | behavior learning status | 1 |
 | future feedback / lifecycle status | 2 / 2 |
 | future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
-| off-device protocol / cross-architecture certificate | 1 / 3 |
-| off-device display progress | 1 |
+| off-device protocol / cross-architecture certificate | 2 / 5 |
+| off-device display progress | 2 |
 
 These values are code contracts, not display labels. The retired physical v1
-through v5 namespaces remain byte-untouched and are never migrated or restored
-as v6; retained compatible full rlogs are replayed into an initially empty v6
+through v6 namespaces remain byte-untouched and are never migrated or restored
+as v7; retained compatible full rlogs are replayed into an initially empty v7
 ledger. The separate calibration runtime identity excludes provisional rack
 gain/damping but remains bound to the actual vehicle, measured mapping,
 opendbc torque calibration and limits, delay, and rack-rate resolution.

@@ -37,6 +37,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationLearningResult,
   CalibrationPairedLossDiagnostic,
   CalibrationQualificationReason,
+  CalibrationSampleAccounting,
+  CalibrationSampleDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   _MeasuredEnvelopeConstraint,
@@ -551,7 +553,9 @@ def _test_runtime_collects_only_onroad_and_persists_only_offroad(
   assert runtime.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   assert not artifact_root.exists()
 
-  runtime.transition_onroad(_test_route_identity("collect-and-persist"))
+  runtime.transition_onroad(
+    _test_route_identity("collect-and-persist"), route_counter=0,
+  )
   with patch(
     "openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator._atomic_write_bytes",
   ) as write:
@@ -573,7 +577,7 @@ def _test_restart_restores_exact_cross_drive_evidence(
 ) -> None:
   first = build_generic_runtime(tmp_path, generic_controller_module)
   cp = first.car_params
-  first.transition_onroad(_test_route_identity("restart-first"))
+  first.transition_onroad(_test_route_identity("restart-first"), route_counter=0)
   warm_runtime_to_first_causal_sample(first, cp, 1_000_000_000)
   saved = first.transition_offroad_and_persist()
 
@@ -581,7 +585,7 @@ def _test_restart_restores_exact_cross_drive_evidence(
   assert restored.coordinator.state is CalibrationLearningLifecycleState.OFFROAD
   assert restored.coordinator.finalize().evidence_bytes == (saved.evidence_bytes)
   assert restored.coordinator.finalize().manifest_bytes == (saved.manifest_bytes)
-  restored.transition_onroad(_test_route_identity("restart-second"))
+  restored.transition_onroad(_test_route_identity("restart-second"), route_counter=1)
   warm_runtime_to_first_causal_sample(restored, cp, 2_000_000_000)
   second = restored.transition_offroad_and_persist()
   assert second.evidence_bytes != saved.evidence_bytes
@@ -593,7 +597,9 @@ def _test_restore_corruption_and_seed_mismatch_fail_closed(
   test_case: unittest.TestCase,
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
-  runtime.transition_onroad(_test_route_identity("corruption-restore"))
+  runtime.transition_onroad(
+    _test_route_identity("corruption-restore"), route_counter=0,
+  )
   warm_runtime_to_first_causal_sample(
     runtime,
     runtime.car_params,
@@ -634,7 +640,9 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad(_test_route_identity("clean-frame-filters"))
+  runtime.transition_onroad(
+    _test_route_identity("clean-frame-filters"), route_counter=0,
+  )
   base = 1_000_000_000
 
   frame_index = warm_runtime_to_first_causal_sample(runtime, cp, base)
@@ -647,6 +655,9 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
       steering_pressed=True,
     )
   )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.DRIVER_OVERRIDE_OR_ALLOWANCE,
+  ) == 1
   frame_index += 1
   assert not runtime.ingest(
     measured_frame(
@@ -655,6 +666,9 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
       lateral_active=False,
     )
   )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.LATERAL_INACTIVE,
+  ) == 1
   frame_index += 1
   assert not runtime.ingest(
     measured_frame(
@@ -663,6 +677,9 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
       standstill=True,
     )
   )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.STANDSTILL_OR_BELOW_MIN_STEER_SPEED,
+  ) == 1
   frame_index += 1
   assert not runtime.ingest(
     measured_frame(
@@ -671,6 +688,9 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
       live_parameters_valid=False,
     )
   )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.LIVE_RACK_MAPPING_INVALID,
+  ) == 1
   frame_index += 1
   assert not runtime.ingest(
     measured_frame(
@@ -679,6 +699,42 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
       can_valid=False,
     )
   )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.VEHICLE_INPUT_INVALID,
+  ) == 1
+  frame_index += 1
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      response_mono_ns=0,
+    )
+  )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.INVALID_NUMERIC_OR_TIMESTAMP,
+  ) == 1
+  frame_index += 1
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      steering_torque=float("nan"),
+    )
+  )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.INVALID_NUMERIC_OR_TIMESTAMP,
+  ) == 2
+  frame_index += 1
+  assert not runtime.ingest(
+    measured_frame(
+      cp,
+      base + frame_index * FRAME_DT_NS,
+      speed_mps=float("nan"),
+    )
+  )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.INVALID_NUMERIC_OR_TIMESTAMP,
+  ) == 3
   frame_index += 1
   assert runtime.coordinator.accepted_sample_count == accepted
 
@@ -727,6 +783,9 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
       applied_torque=0.5,
     )
   )
+  assert runtime.coordinator.sample_accounting.count(
+    CalibrationSampleDisposition.CAUSAL_COMMAND_ALIGNMENT_UNAVAILABLE,
+  ) >= 1
   frame_index += 1
   assert runtime.last_actuator_constrained
   assert runtime.coordinator.accepted_sample_count == accepted
@@ -739,6 +798,13 @@ def _test_clean_frame_filters_reject_invalid_but_include_limit_boundaries(
     )
   )
   assert runtime.coordinator.accepted_sample_count == accepted
+  accounting = runtime.coordinator.sample_accounting
+  assert accounting.count(
+    CalibrationSampleDisposition.MEASUREMENT_WARMUP_OR_DISCONTINUITY,
+  ) >= 1
+  assert accounting.ingested_sample_count == (
+    accounting.accepted_sample_count + accounting.rejected_sample_count
+  )
 
 
 def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
@@ -747,7 +813,9 @@ def _test_vehicle_owned_slew_and_full_torque_are_accepted_evidence(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad(_test_route_identity("vehicle-envelope"))
+  runtime.transition_onroad(
+    _test_route_identity("vehicle-envelope"), route_counter=0,
+  )
   base = 1_000_000_000
 
   # Prime the measured envelope and derivative using ordinary interior input.
@@ -909,14 +977,16 @@ def _test_runtime_uses_delayed_command_not_same_frame_torque(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad(_test_route_identity("delayed-command"))
+  runtime.transition_onroad(
+    _test_route_identity("delayed-command"), route_counter=0,
+  )
   base = 1_000_000_000
   captured = []
   original_ingest = runtime.coordinator.ingest
 
-  def capture(sample):
+  def capture(sample, **kwargs):
     captured.append(sample)
-    return original_ingest(sample)
+    return original_ingest(sample, **kwargs)
 
   runtime.coordinator.ingest = capture
   frames = []
@@ -957,7 +1027,9 @@ def _test_runtime_retains_unsigned_reversal_without_fitting_it(
 ) -> None:
   runtime = build_generic_runtime(tmp_path, generic_controller_module)
   cp = runtime.car_params
-  runtime.transition_onroad(_test_route_identity("unsigned-reversal"))
+  runtime.transition_onroad(
+    _test_route_identity("unsigned-reversal"), route_counter=0,
+  )
   base = 1_000_000_000
   next_index = warm_runtime_to_first_causal_sample(
     runtime,
@@ -1003,7 +1075,7 @@ class FakeParams:
     # is manager-cleared and cannot be the learner's sole restore source.
     self.values: dict[str, object] = {
       "CarParamsPersistent": car_params_bytes,
-      "CurrentRoute": "00000000--blatv2-test-route",
+      "CurrentRoute": "00000000--0000000000",
       "IsOffroad": False,
     }
     self.puts: list[tuple[str, object, bool]] = []
@@ -1719,6 +1791,7 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
       interpolation_reports=interpolation_reports,
       selected_profile=learned_profile,
     ),
+    sample_accounting=CalibrationSampleAccounting.empty(),
   )
   qualified = build_learning_status_payload(
     finalization=qualified_finalization,
@@ -1744,7 +1817,9 @@ def _test_learning_status_is_canonical_strict_and_drive_local(
     for node in qualified["nodes"]
   )
 
-  runtime.transition_onroad(_test_route_identity("status-drive-local"))
+  runtime.transition_onroad(
+    _test_route_identity("status-drive-local"), route_counter=0,
+  )
   cp = runtime.car_params
   warm_runtime_to_first_causal_sample(runtime, cp, 1_000_000_000)
   after = runtime.transition_offroad_and_persist()

@@ -4,7 +4,8 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 3 deliberately rejects the retired physical rack-fit vocabulary.  The
+Schema 4 deliberately rejects the retired physical rack-fit vocabulary and
+adds canonical first-cause sample accounting. The
 only candidate values it exposes are the four observable inverse-torque
 calibration values, while independent base, moving, breakaway, and authority
 populations remain visible for audit and UI progress reporting. It also keeps
@@ -30,6 +31,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationModelId,
   CalibrationNodeQualificationReport,
   CalibrationQualificationReason,
+  CalibrationSampleAccounting,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   RuntimeVehicleBundle,
@@ -37,7 +39,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 3
+LEARNING_STATUS_SCHEMA_VERSION = 4
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
   "all_intervals_qualified",
@@ -53,6 +55,7 @@ _TOP_LEVEL_KEYS = {
   "manifest_sha256",
   "nodes",
   "runtime_identity_sha256",
+  "sample_accounting",
   "schema_version",
   "seed_profile_sha256",
   "vehicle_identity",
@@ -874,6 +877,7 @@ def build_learning_status_payload(
       runtime_bundle.calibration_identity_sha256,
       "runtime_identity_sha256",
     ),
+    "sample_accounting": finalization.sample_accounting.to_payload(),
     "schema_version": LEARNING_STATUS_SCHEMA_VERSION,
     "seed_profile_sha256": _sha256(
       hashlib.sha256(
@@ -1014,6 +1018,7 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     raise ValueError("learning status vehicle identity is invalid")
   for field in ("runtime_identity_sha256", "seed_profile_sha256", "evidence_sha256", "manifest_sha256"):
     _sha256(payload[field], field)
+  CalibrationSampleAccounting.from_payload(payload["sample_accounting"])
   if any(
     type(payload[field]) is not bool
     for field in (
