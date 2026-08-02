@@ -7,11 +7,12 @@ created from the current untouched `stock` tip.
 
 **In progress — ground-up replacement. Not field eligible.**
 
-**Learner correctness milestone — in progress.** The current work fixes the
-off-device progress contract, restores the documented whole-route
-train/validation partition, and makes rejected evidence explainable before the
-physical model is expanded. Controller and actuation behavior are unchanged in
-this milestone.
+**PC learner transition — in progress.** Historical replay, physical learning,
+behavioral qualification, and candidate generation now run only on an
+operator-controlled PC. The comma records ordinary full rlogs and may consume
+only a separately reviewed and manually installed artifact. It runs no BLaTv2
+learner and has no automatic Wi-Fi upload or processing fallback. Controller
+and actuation behavior are unchanged in this milestone.
 
 This branch replaces the previous BLaTv2 controller architecture. Git history
 and useful test infrastructure remain available for audit, but no previous
@@ -52,7 +53,7 @@ The replacement is split into independently testable owners:
 - one measured rack mapping and forward/inverse physical plant;
 - one computed-torque core;
 - one exact opendbc command envelope and invalid-output guard;
-- an offroad full-rlog importer and observable, speed-local inverse-torque
+- a PC-only full-rlog importer and observable, speed-local inverse-torque
   learner;
 - offline-only artifact, feedback, promotion, and rollback test surfaces for a
   future reviewed consumer; none is manager-launched in this milestone.
@@ -133,9 +134,11 @@ stock map—not add another correction loop around it.
 The first combo build contains no approved modular profile. It therefore
 drives with the exact current stock torque-controller algorithm and launches
 no dedicated BLaTv2 process onroad. Normal loggerd full rlogs retain the
-measured services needed for later learning. After logger closure, the
-offroad importer independently replays the complete full rlog before any
-evidence can become durable. On opendbc's validated Palisade/Telluride
+measured services needed for later learning. An operator periodically copies
+closed routes from the device over read-only SSH into durable PC storage; no
+device process uploads, replays, fits, or publishes them automatically. The PC
+independently replays each complete full rlog before any evidence can become
+durable. On opendbc's validated Palisade/Telluride
 platform, that stock request passes through the
 platform-selected **409/4/7** opendbc/panda envelope. Other cars keep their
 own stock limits and remain stock-controlled unless their opendbc port
@@ -144,14 +147,40 @@ contract.
 
 ## Activation and learning
 
-The first drive on a vehicle is stock-controlled. No dedicated BLaTv2
-collection or learning process runs during the drive; normal loggerd records the
-full rlog. After the route is closed, `blatv2_backfilld` independently prepares
-and replays its complete full rlog twice and atomically commits evidence only if
-both authorities and all compatibility checks agree. It is the sole managed
-BLaTv2 process and the sole durable learning writer.
+The first drive on a vehicle is stock-controlled. Normal loggerd is the only
+BLaTv2 data source on the comma: it records the same full rlog openpilot already
+uses, with no learner, replay worker, route uploader, or Wi-Fi bridge in the
+manager process graph. Route collection is currently an operator-initiated,
+read-only SSH copy into durable PC storage. The device neither initiates nor
+retries that transfer.
 
-The offroad importer uses four worker lanes while retaining exactly two
+The PC owns historical-route selection, deterministic preparation, both A/A
+replay authorities, physical and behavioral qualification, and immutable
+candidate generation. A candidate is informational until its exact source,
+route set, evidence, gates, and output hashes have been reviewed. Installation
+on the device is a separate manual action after that review; the learner cannot
+write device Params, select a controller, or activate what it produces.
+
+The pure learner, replay, evidence, and publication libraries remain in this
+repository so the PC and later controller review use one numerical artifact.
+The device-side daemons and network transport are retired. Their schema
+ordinals, Params names, historical generation formats, and compatibility
+records remain reserved so prior rlogs and audit records stay decodable.
+
+### Retired on-device importer (historical)
+
+The following records the former offroad importer for provenance and explains
+the retained schemas and generation files. It is not current manager behavior.
+Qualification mathematics described here remains applicable when invoked by
+the PC, but every statement assigning ownership to `blatv2_backfilld`, the
+comma, or a device progress UI is historical.
+
+The retired `blatv2_backfilld` independently prepared and replayed each complete
+full rlog twice and atomically committed evidence only when both authorities and
+all compatibility checks agreed. It was the sole managed BLaTv2 process and
+durable learning writer in that deployment.
+
+The offroad importer used four worker lanes while retaining exactly two
 independent deterministic
 replay authorities: the parent and a verification process. Each authority now
 has one private route-preparation lane that may decode the next route while its
@@ -197,7 +226,7 @@ route has actually been ingested. An approximate remaining time appears only
 after independent reading and application rates have enough observations;
 none of these timing fields enter evidence or determinism comparisons.
 
-The importer can also use older local routes, including routes recorded before
+The importer could also use older local routes, including routes recorded before
 this importer existed, when their complete full rlogs remain on the device and
 their exact build/schema, dongle, vehicle, CarParams, controller-envelope,
 sensor-resolution, and source-coverage checks pass. Qlogs, incomplete or
@@ -213,6 +242,8 @@ Palisade command/panda envelope are verified as the same 409/4/7 contract
 used by the current learner. Older archived builds that actually used the
 stock 384/3/7 envelope remain fail-closed; they are not mislabeled to make
 their data pass.
+
+### PC learner qualification
 
 A selected physical profile becomes complete only when every speed node and
 every adjacent interpolation interval has enough excitation, independent
@@ -254,11 +285,11 @@ newest source cohort blocks qualification rather than being cherry-picked
 around. Routes from an older controller build can form an older cohort, but are
 never mixed into the newest one.
 
-Device behavior qualification is currently **fail-closed pending the
+Behavior qualification is currently **fail-closed pending the
 route-major streaming backend**. Cohort selection authenticates compact,
 file-backed route summaries without decoding the route object graph. Once an
-otherwise eligible cohort reaches the four-route partition minimum, the comma
-reports `behavior_streaming_required` and retains stock before loading any
+otherwise eligible cohort reaches the four-route partition minimum, the PC
+reports `behavior_streaming_required` and emits no candidate before loading any
 eager behavior artifact. This is a memory-safety diagnostic, not a failed
 Smooth/Swift/Strong result and not a request for more driving. The old eager
 path expanded the measured 146,363,115-byte CE evidence file to 909,200 KiB
@@ -277,10 +308,13 @@ uncertainty while every Smooth, Swift, and Strong gate passes independently.
 Otherwise the immutable result is **stock retained** and contains no behavior
 policy.
 
-### Off-device preparation bridge
+### Retired Wi-Fi preparation bridge (historical)
 
-**In progress.** A paired PC worker may take over the expensive immutable
-route-preparation stage when it is reachable on the local network. The
+The automatic LAN bridge is retired and no service attempts discovery, route
+upload, remote job creation, download, certification, or local fallback. The
+following is retained only to explain historical protocol schemas, Params, and
+audit records. The former paired PC worker could take over the expensive
+immutable route-preparation stage when it was reachable on the local network. The
 standalone worker project lives at
 `/home/alex/Documents/blatv2-remote-worker`; its durable full-rlog archive is
 the `data/routes/` subdirectory. The comma remains authoritative:
@@ -391,10 +425,11 @@ never publish on the device. A late-only ledger generation carries forward
 the extractor identity from the authenticated generation whose evidence it
 retains rather than claiming an unused binary.
 
-This boundary is intentional. ARM and x86 may share deterministic route
-records, but the PC is never allowed to publish a learned profile for the car,
-write device Params, select a controller, or actuate. Local processing remains
-fully functional when the PC is absent.
+This boundary was intentional. It is superseded by PC-only processing: the
+device no longer has a local processing fallback, and the PC still has no API
+to write device Params, select a controller, or actuate.
+
+### Offline publication and future activation
 
 Both qualification stages stop at immutable, informational results. The
 physical store publishes a content-addressed generation and atomically replaces
@@ -463,10 +498,10 @@ fit itself; if that happens, at least four independent validation rows are
 required before qualification. Sparse authority evidence stays durable and
 can reject a regressing model, but it cannot steer the fit.
 
-The home-screen learning display reads rebuildable
+The retired home-screen learning display read rebuildable
 `BLaTv2LearningOperationStatus`, `BLaTv2BackfillProgress`,
 `BLaTv2LearningStatus`, and `BLaTv2BehaviorLearningStatus` caches. The
-offroad importer owns all four. Operation status distinguishes logger
+offroad importer owned all four. Operation status distinguished logger
 finalization, historical route scanning/replay progress, idle evidence, an
 eligible empty state, and fail-closed diagnostics. Backfill progress shows
 pass/route/segment plus read/apply progress and an evidence-based time estimate.
@@ -493,8 +528,10 @@ route/candidate/replay counts and the independent Smooth/Swift/Strong verdicts.
 it never means activated. All displayed values remain informational, and the
 UI cannot approve or select a controller.
 
-All display caches are cleared at manager start and published only after the offroad
-owner validates its phase and current vehicle/build authority. They are
+These historical display caches were cleared at manager start and published
+only after the offroad owner validated its phase and current vehicle/build
+authority. Their schema and Params names remain reserved, but no current manager
+process publishes them. They are
 informational only: neither is evidence, approval, a profile,
 controller-selection, or a safety input, and editing or deleting either one
 cannot change steering. The `BLaTv2LifecycleStatus` schema and
@@ -502,7 +539,7 @@ cannot change steering. The `BLaTv2LifecycleStatus` schema and
 testing, but the stock-only field manager does not launch that process or
 publish that cache.
 
-On cold boot, `blatv2_backfilld` publishes a
+Historically, on cold boot `blatv2_backfilld` published a
 vehicle-bound **PREPARING LEARNER** projection immediately after it decodes
 CarParams and before runtime construction, route discovery, PC inventory, or
 uploads. Expensive preflight work therefore cannot be misreported as

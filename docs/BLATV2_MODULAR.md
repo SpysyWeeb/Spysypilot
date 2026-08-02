@@ -16,6 +16,14 @@ All numerical modules are shared libraries called synchronously from the
 100 Hz control loop and from replay. They are not separate onroad processes.
 This keeps one frame clock and makes device/replay parity testable.
 
+The current learner is PC-only. The device records ordinary loggerd full rlogs
+and runs no BLaTv2 learner, historical replay, route uploader, Wi-Fi bridge, or
+local-processing fallback. An operator copies closed routes over read-only SSH
+into durable PC storage. The PC owns deterministic A/A replay, physical and
+behavioral qualification, and informational candidate generation. A candidate
+has no activation path until separate manual review, installation, and the
+remaining controller gates authorize that exact artifact.
+
 The present field build does not actuate this modular core. With no separately
 approved artifact, controlsd constructs and runs the exact stock openpilot
 torque controller, not a stock-shaped approximation or a modular controller
@@ -38,7 +46,7 @@ Every physical decision has exactly one owner.
 | Unconstrained torque request | computed-torque core |
 | Future reachability | optional feasibility constraint |
 | Fast persistent physical bias | disturbance observer |
-| Slow parameter learning | offroad profile learner |
+| Slow parameter learning | PC offline profile learner |
 | Live torque magnitude/rate | one output envelope |
 | Platform command and safety enforcement | opendbc and panda |
 | Quality judgment | replay metrics and event logger |
@@ -263,9 +271,11 @@ constraint. The controller reads the estimate but cannot mutate it.
 
 ### Slow learner
 
-No managed learner runs onroad. Durable training happens offroad when
-`blatv2_backfilld` replays complete, closed full rlogs containing clean,
-hands-off measured data. At each speed node it fits the directly observable
+No managed learner runs on the device. Durable training happens in an
+operator-controlled PC workspace after complete, closed full rlogs are copied
+from the comma over read-only SSH. The PC replays clean, hands-off measured
+data twice with independent deterministic authorities before publication. At
+each speed node the learner fits the directly observable
 inverse relation:
 
 ```text
@@ -470,11 +480,14 @@ collection contract does not yet exist.
 rebuildable views of these stores. Deleting or editing a display cache cannot
 change `CURRENT`, select a policy, or affect actuation.
 
-#### Off-device preparation boundary
+#### Retired device/PC preparation boundary (historical)
 
-The optional LAN worker replaces only the immutable, computationally costly
+The automatic LAN worker and device-local fallback are retired. This section is
+retained only to document old protocol/schema identities and generation
+provenance; it does not describe the current manager graph. The optional LAN
+worker replaced only the immutable, computationally costly
 full-rlog decode and canonical-join stage. It does not replace the learner.
-The device remains the sole owner of route selection, causal learner state,
+The device remained the sole owner of route selection, causal learner state,
 the two-authority equality decision, durable ledger extension, finalization,
 and atomic generation publication.
 
@@ -560,9 +573,11 @@ at `/home/alex/Documents/blatv2-remote-worker`, with full rlogs under
 `data/routes/`. This keeps recordings out of temporary storage and prevents
 source updates from pruning the archive.
 
-### Display-only learning and lifecycle status
+### Retired device learning and lifecycle status (historical)
 
-The current field UI reads four rebuildable JSON caches:
+The former field UI read four rebuildable JSON caches. Their schema ordinals
+and Params names remain reserved, but the current manager publishes none of
+them:
 
 - `BLaTv2LearningOperationStatus` reports the current operation instead of
   treating an unfinished replay as an empty learner. `blatv2_backfilld` owns
@@ -607,13 +622,15 @@ active profile or infer provisional-drive feedback. Re-enabling that
 lifecycle requires a separately reviewed offroad exercise witness; the UI
 must never infer it from raw activation Params.
 
+### PC replay and publication
+
 Evidence stays cumulative against its immutable observable calibration seed. A
 qualified candidate's revision is an opaque monotone function of persisted
 accepted evidence, so later qualified candidates advance across restarts
 without pretending the already-accumulated sufficient statistics were
 collected against a newer learned seed.
 
-Complete local routes from previous software runs may be imported, but only
+Complete archived routes from previous software runs may be imported, but only
 from full rlogs. Qlogs, incomplete or still-open routes, dirty or unreviewed
 build provenance, identity/envelope mismatches, corrupt logs, and
 nondeterministic replays fail closed. The importer replays every eligible
@@ -623,7 +640,7 @@ replacing one `CURRENT` pointer. A rejected route does not block a later
 eligible route. An older route discovered after the durable chronology has
 advanced is recorded as late and skipped.
 
-Physical backfill uses four worker lanes while preserving exactly two
+Physical replay uses four worker lanes while preserving exactly two
 independent A/A authorities. Each authority owns its causal learner state and
 one private preparation helper. The helper may decode the next route into a
 bounded `BLATRE02` artifact while its owner applies the current route, but
@@ -641,21 +658,21 @@ transaction then runs a second time from freshly reloaded route artifacts and
 fresh decoder/controller cores. This parallelizes pure replay without sharing
 state between the A/A authorities.
 
-The progress schema continues to project primary preparation/application and
-then verification; helper scheduling is not exposed as extra passes. One
+The retired progress schema projected primary preparation/application and then
+verification; helper scheduling was not exposed as extra passes. One
 prefetched route per authority bounds live work, with at most two 512 MiB
 artifacts per authority in the conservative worst case. Four-worker physical
-processing has completed on comma hardware without changing deterministic
-artifacts; two-worker mode remains the bounded fallback.
+processing previously completed on comma hardware without changing
+deterministic artifacts; current production replay runs on the PC.
 
 Desktop reference measurement on the 21-segment
 `000000b7--a6b3b1f175` route: two serial passes took 17.594 s and the
 two-process path took 9.717 s (1.81x), with byte-identical evidence,
 manifest, and ledger entries. The integrated native-extractor/A/A/publication
 benchmark across b7, b8, b9, and ca measured a 33.754 s four-lane median versus
-42.359 s with two lanes, with identical hashes. On-device elapsed time,
-process-group RSS, I/O contention, thermals, and responsiveness remain the
-deployment authority.
+42.359 s with two lanes, with identical hashes. These measurements are retained
+as historical determinism and resource evidence, not as a device deployment
+target.
 
 Each released clean build needs an explicit reviewed descriptor retained in
 `historical_build_descriptors.json` before it becomes historical. The current
@@ -663,12 +680,11 @@ build descriptor can be synthesized only while that build is running; an
 older route without its pinned descriptor correctly fails closed as
 unreviewed.
 
-The current manager process graph has exactly one BLaTv2 process:
-`blatv2_backfilld`, offroad on a real car only. It is the sole durable
-evidence writer and publishes learning/operation status. Manager never starts
-`blatv2_shadowd`, `blatv2_learnerd`, or `blatv2_profiled`; their sources and
-tests remain offline/harness tools. Consequently, BLaTv2 contributes no
-managed process load while started/onroad.
+The current manager process graph has zero BLaTv2 background processes.
+Learning, replay, transfer, bridge, shadow, and lifecycle entrypoints are not
+registered. Retained numerical libraries and wire/schema identities are
+offline compatibility surfaces. Consequently, BLaTv2 contributes no managed
+process load onroad or offroad.
 
 Any future modular actuation must remain synchronous inside controlsd so
 device and replay import the same artifact and share one control-frame clock.
