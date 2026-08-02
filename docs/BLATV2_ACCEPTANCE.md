@@ -5,6 +5,13 @@ offline artifact to shadow collection and, eventually, actuation. A later
 stage may not waive an earlier one. Until every activation gate passes, the
 stock openpilot torque controller remains the sole actuator.
 
+All current learning and qualification work is PC-only. The device records
+ordinary full rlogs and runs no BLaTv2 learner, replay worker, route uploader,
+or Wi-Fi bridge. An operator copies closed routes into durable PC storage over
+read-only SSH. Any resulting profile remains informational until offline A/A,
+the applicable gates, and a separate manual review and installation identify
+the exact same artifact.
+
 ## Artifact identity
 
 Every report identifies:
@@ -65,20 +72,24 @@ fields. Environment measurements, such as compute time, are excluded from
 bit-exact comparison and reported separately. The device timing authority is
 the on-device measurement, not workstation replay.
 
-An offline shadow run may update an in-process slow-learner preview. That
+An offline PC shadow run may update an in-process slow-learner preview. That
 preview is non-durable and cannot change a live profile or controller
 selection. Field evidence comes only from a closed full rlog that passes the
-offroad importer below.
+PC importer below.
 
 ## Learned-profile qualification
 
-Training and artifact writes occur only offroad. `blatv2_backfilld` is the
-sole durable evidence writer. Evidence is bound to the vehicle identity,
-speed-node grid, observable calibration seed, profile schema, and learner
-schema.
+Training and artifact writes occur only in the operator-controlled PC
+workspace. One offline transaction owns route selection, both independent A/A
+authorities, durable evidence, qualification, and immutable candidate
+publication. Evidence is bound to the vehicle identity, speed-node grid,
+observable calibration seed, profile schema, and learner schema. No output is
+copied to the device without separate review.
 
 The importer accepts only complete, closed full rlogs; qlogs are insufficient.
-It may discover routes recorded before the importer existed, but each route
+Routes enter its durable archive through an operator-initiated, read-only SSH
+copy; there is no automatic upload. It may use routes recorded before the
+importer existed, but each route
 must pass exact reviewed build/schema provenance, dongle/vehicle identity,
 CarParams, controller-envelope, sensor-resolution, segment-continuity, and
 source-coverage checks. A route-local rejection cannot prevent a later valid
@@ -99,8 +110,15 @@ bytes. Four production lanes consist of the two causal authority owners and one
 private route-preparation helper per owner; worker counts 1 and 2 are diagnostic
 modes, and 3 is invalid because it makes the authorities asymmetric.
 
-An off-device worker may accelerate only route preparation. Before it is
-field eligible, acceptance must additionally prove:
+### Retired device/PC bridge acceptance (historical)
+
+The automatic LAN worker, device-side certification, upload, download, and
+local-processing fallback are retired. The following requirements are retained
+to explain historical protocol schemas and evidence provenance; they are not
+current deployment requirements.
+
+An off-device worker could accelerate only route preparation. Before it was
+field eligible, acceptance additionally had to prove:
 
 1. authenticated discovery, requests, progress, uploads, and downloads reject
    invalid HMACs, stale timestamps, replayed nonces, unknown keys, oversized
@@ -165,11 +183,13 @@ identity.
 Cross-architecture equality is certified at the device-produced artifacts,
 not by allowing an x86 worker to authorize its own final profile. The worker
 has no Params, ledger, publication, controller-selection, or actuation API.
-The final generation identity deliberately differs between local and remote
+The final generation identity deliberately differed between local and remote
 preparation because its provenance names the architecture-specific extractor
 binary that actually decoded the rlogs. Treating those two binaries as the
 same artifact would make provenance dishonest; semantic artifact equality is
 the portability gate.
+
+### Retained contracts and PC qualification
 
 The current contract identities are:
 
@@ -302,21 +322,23 @@ contain an informational policy. Any non-passing safe result is explicitly
 `stock_retained` and omits `policy.json`. Neither result writes approval Params
 or changes controller selection.
 
-`BLaTv2BehaviorLearningStatus` schema 1 exposes waiting for physical profile,
+Retained `BLaTv2BehaviorLearningStatus` schema 1 historically exposed waiting for physical profile,
 waiting for homogeneous routes, preparing, training, selecting, validating,
 publishing, complete, or failed. It reports route/replay progress and separate
 Smooth/Swift/Strong verdicts. Like all status Params, it is a rebuildable UI
-projection, not evidence or authority.
+projection, not evidence or authority. No current device process publishes it.
 
-`BLaTv2LearningOperationStatus` may expose logger finalization, historical
-scanning/replay progress, and terminal diagnostics. No managed onroad process
-publishes live collection state. It is a clear-on-manager-start display
-cache, never evidence, approval, or a controller-selection input.
+`BLaTv2LearningOperationStatus` historically exposed logger finalization,
+historical scanning/replay progress, and terminal diagnostics. Its retained
+schema is a clear-on-manager-start display-cache contract, never evidence,
+approval, or a controller-selection input; no current device process publishes
+it.
 
-The field manager must contain exactly one BLaTv2 process on a real car:
-`blatv2_backfilld`, and its predicate must be offroad-only. The shadow,
-live-learner, and profile-lifecycle adapters remain unregistered offline
-tools while stock is the sole active controller. A future activation build
+The field manager must contain zero BLaTv2 background processes on a real car.
+Shadow, learning, replay, profile-lifecycle, transfer, and bridge entrypoints
+remain absent while stock is the sole active controller. Retained libraries and
+wire/schema identities are offline compatibility surfaces, not managed
+services. A future activation build
 must first add a reviewed offroad witness for exact provisional-profile
 exercise and feedback; it may not restore an always-on lifecycle observer by
 assumption.
