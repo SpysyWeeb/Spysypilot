@@ -10,11 +10,12 @@ not run a learner, fit a profile, or materialize a full ``PreparedRoute``.
 Selection is a pure function of the immutable route manifest.  Every selected
 segment is prepared independently, so state can never leak across a segment
 boundary.  The physical proof plane follows the canonical measured-frame
-input contract without requiring optional behavior context.  A separate
-behavior plane adds the exact model, live calibration/delay, maneuver, and
-carControl links and preserves the route evidence's source eligibility.  Each
-plane owns its counts, timestamps, exclusions, and encoded digest; complete
-source planes remain covered by their production section hashes.
+input contract without requiring optional controller context.  The behavior
+plane proves the recorded controller source and its full context.  A third,
+controller-independent scenario plane proves only the inputs consumed by
+counterfactual replay.  Each plane owns its counts, timestamps, exclusions,
+and encoded digest; complete source planes remain covered by their production
+section hashes.
 """
 
 from __future__ import annotations
@@ -47,6 +48,10 @@ from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ControlsWitness,
+  LateralManeuverPlanPublication,
+  LiveDelayPublication,
+  LiveTorqueParametersPublication,
+  ModelPublication,
   RouteEvidenceArtifact,
   _encode_controls,
 )
@@ -55,14 +60,15 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 )
 
 
-CERTIFICATION_VECTOR_SCHEMA_VERSION: Final = 3
+CERTIFICATION_VECTOR_SCHEMA_VERSION: Final = 4
 CERTIFICATION_VECTOR_MAGIC: Final = b"BLATCV01"
 CERTIFICATION_VECTOR_MAX_SEGMENTS: Final = 3
 CERTIFICATION_VECTOR_MAX_COMPRESSED_BYTES: Final = 96 * 1024 * 1024
 CERTIFICATION_VECTOR_MAX_CONTROLS_WITNESSES: Final = 30_000
 CERTIFICATION_VECTOR_MAX_BYTES: Final = 64 * 1024
-_VECTOR_DOMAIN: Final = b"blatv2-cross-architecture-vector-v3\0"
-_SELECTION_DOMAIN: Final = b"blatv2-certification-segment-selection-v3\0"
+_VECTOR_DOMAIN: Final = b"blatv2-cross-architecture-vector-v4\0"
+_SELECTION_DOMAIN: Final = b"blatv2-certification-segment-selection-v4\0"
+_SCENARIO_PROOF_DOMAIN: Final = b"blatv2-certification-scenario-proof-v4\0"
 _HEADER: Final = struct.Struct("<8sHHI")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -231,7 +237,7 @@ def certification_vector_selection_identity(
 ) -> str:
   chosen = certification_vector_selection(route) if selected is None else selected
   return hashlib.sha256(_canonical_json({
-    "domain": "blatv2-certification-vector-selection-v3",
+    "domain": "blatv2-certification-vector-selection-v4",
     "route_name": route.route_name,
     "source_segments": _source_manifest(route),
     "selected_segments": [
@@ -293,6 +299,119 @@ def _behavior_exclusion_reason(
   return None
 
 
+def _linked_scenario_publication(
+  values: tuple[Any, ...],
+  index: int,
+  available: bool,
+  witness_mono_ns: int,
+) -> Any | None:
+  if available != (index >= 0):
+    return None
+  if index < 0:
+    return None
+  if index >= len(values):
+    raise CertificationVectorError("scenario publication index is out of range")
+  publication = values[index]
+  if publication.mono_time_ns > witness_mono_ns:
+    return None
+  return publication
+
+
+def _scenario_model_payload_valid(model: ModelPublication) -> bool:
+  return (
+    model.frame_id >= 0
+    and 0 <= model.timestamp_eof_ns <= model.mono_time_ns
+    and model.desired_curvature_time_s >= 0.0
+    and model.native_grid_valid
+    and bool(model.plan_times)
+    and model.plan_times[0] >= 0.0
+  )
+
+
+def _scenario_exclusion_reason(
+  witness: ControlsWitness,
+  frame: MeasuredLearningFrame,
+  artifact: RouteEvidenceArtifact,
+) -> str | None:
+  physical_reason = _physical_exclusion_reason(witness, frame)
+  if physical_reason is not None:
+    if physical_reason == "physical_inputs_invalid":
+      return "physical_plane_inputs_invalid"
+    return f"physical_plane_{physical_reason}"
+  if not witness.message_valid:
+    return "scenario_message_invalid"
+
+  model = _linked_scenario_publication(
+    artifact.model_publications,
+    witness.model_publication_index,
+    witness.model_link_valid,
+    witness.mono_time_ns,
+  )
+  if not isinstance(model, ModelPublication):
+    return "model_context_missing"
+  if not model.message_valid:
+    return "model_message_invalid"
+  if not witness.model_message_alive:
+    return "model_not_alive"
+  if not _scenario_model_payload_valid(model):
+    return "model_native_grid_invalid"
+  if not witness.torque_output_can_valid:
+    return "applied_torque_context_missing"
+
+  live_torque = _linked_scenario_publication(
+    artifact.live_torque_parameters,
+    witness.live_torque_parameters_index,
+    witness.live_torque_parameters_available,
+    witness.mono_time_ns,
+  )
+  if not isinstance(live_torque, LiveTorqueParametersPublication):
+    return "live_torque_context_missing"
+  if not witness.live_torque_parameters_health_exact:
+    return "live_torque_health_inexact"
+  if (
+    not live_torque.message_valid
+    or (
+      witness.live_torque_parameters_checks_passed
+      and live_torque.use_params
+      and (
+        live_torque.lat_accel_factor <= 0.0
+        or live_torque.friction < 0.0
+      )
+    )
+  ):
+    return "live_torque_payload_invalid"
+
+  live_delay = _linked_scenario_publication(
+    artifact.live_delays,
+    witness.live_delay_index,
+    witness.live_delay_available,
+    witness.mono_time_ns,
+  )
+  if not isinstance(live_delay, LiveDelayPublication):
+    return "live_delay_context_missing"
+  if not live_delay.message_valid or live_delay.lateral_delay_s < 0.0:
+    return "live_delay_payload_invalid"
+
+  maneuver = _linked_scenario_publication(
+    artifact.lateral_maneuver_plans,
+    witness.lateral_maneuver_plan_index,
+    witness.maneuver_plan_available,
+    witness.mono_time_ns,
+  )
+  maneuver_link_present = (
+    witness.maneuver_plan_available
+    or witness.lateral_maneuver_plan_index >= 0
+  )
+  if maneuver_link_present and not isinstance(
+    maneuver,
+    LateralManeuverPlanPublication,
+  ):
+    return "maneuver_context_invalid"
+  if witness.lateral_active and maneuver is not None and maneuver.message_valid:
+    return "active_maneuver_override"
+  return None
+
+
 def _segment_vector(
   *,
   segment: RouteSegment,
@@ -308,15 +427,21 @@ def _segment_vector(
 
   physical_excluded = Counter[str]()
   behavior_excluded = Counter[str]()
+  scenario_excluded = Counter[str]()
   retained_physical = 0
   retained_behavior = 0
+  retained_scenario = 0
+  retained_active_scenario = 0
   physical_digest = hashlib.sha256()
   physical_controls_digest = hashlib.sha256()
   behavior_controls_digest = hashlib.sha256()
+  scenario_controls_digest = hashlib.sha256()
   physical_first_mono_ns: int | None = None
   physical_last_mono_ns: int | None = None
   behavior_first_mono_ns: int | None = None
   behavior_last_mono_ns: int | None = None
+  scenario_first_mono_ns: int | None = None
+  scenario_last_mono_ns: int | None = None
   for witness, frame in zip(controls, frames, strict=True):
     physical_reason = _physical_exclusion_reason(witness, frame)
     if physical_reason is None:
@@ -344,6 +469,20 @@ def _segment_vector(
       behavior_last_mono_ns = witness.mono_time_ns
     else:
       behavior_excluded[behavior_reason] += 1
+
+    scenario_reason = _scenario_exclusion_reason(witness, frame, artifact)
+    if scenario_reason is None:
+      retained_scenario += 1
+      retained_active_scenario += int(witness.lateral_active)
+      scenario_controls_digest.update(_encode_controls((witness,)))
+      scenario_first_mono_ns = (
+        witness.mono_time_ns
+        if scenario_first_mono_ns is None
+        else scenario_first_mono_ns
+      )
+      scenario_last_mono_ns = witness.mono_time_ns
+    else:
+      scenario_excluded[scenario_reason] += 1
   if retained_physical == 0:
     raise CertificationVectorError(
       "certification segment has no valid physical-learning witnesses",
@@ -408,6 +547,15 @@ def _segment_vector(
       "frames_retained": retained_physical,
       "last_retained_mono_ns": physical_last_mono_ns,
     },
+    "scenario_plane": {
+      "active_controls_retained": retained_active_scenario,
+      "controls_retained": retained_scenario,
+      "encoded_controls_sha256": scenario_controls_digest.hexdigest(),
+      "exclusions": dict(sorted(scenario_excluded.items())),
+      "first_retained_mono_ns": scenario_first_mono_ns,
+      "last_retained_mono_ns": scenario_last_mono_ns,
+      "proof_eligible": retained_scenario > 0,
+    },
     "preparation_domain": {
       "canonical_join_schema_version": prepared.provenance[
         "canonical_join_schema_version"
@@ -433,6 +581,45 @@ def _segment_vector(
     },
     "segment_init_data_mono_ns": source.route_time_origin_mono_ns,
     "source_boundary_exclusions": dict(sorted(source_excluded.items())),
+  }
+
+
+def _scenario_proof_summary(
+  segment_vectors: list[dict[str, object]],
+) -> dict[str, object]:
+  retained = 0
+  active = 0
+  identity_segments: list[dict[str, object]] = []
+  for result in segment_vectors:
+    scenario = result["scenario_plane"]
+    if type(scenario) is not dict:
+      raise CertificationVectorError("scenario proof plane is malformed")
+    retained += int(scenario["controls_retained"])
+    active += int(scenario["active_controls_retained"])
+    identity_segments.append({
+      "car_params_sha256": result["car_params_sha256"],
+      "coverage": result["coverage"],
+      "encoded_source_plane_sha256": result[
+        "encoded_source_plane_sha256"
+      ],
+      "extractor_stream_sha256": result["extractor_stream_sha256"],
+      "physical_plane": result["physical_plane"],
+      "preparation_domain": result["preparation_domain"],
+      "scenario_plane": scenario,
+      "segment": result["segment"],
+      "segment_init_data_mono_ns": result["segment_init_data_mono_ns"],
+      "source_boundary_exclusions": result["source_boundary_exclusions"],
+    })
+  identity = hashlib.sha256(
+    _SCENARIO_PROOF_DOMAIN + _canonical_json(identity_segments),
+  ).hexdigest()
+  # The bounded vector proves the decoder/input contract. Full-route replay,
+  # not this deterministic sample, owns active-driving metric coverage.
+  return {
+    "active_controls_retained": active,
+    "controls_retained": retained,
+    "proof_eligible": retained > 0,
+    "selected_inputs_sha256": identity,
   }
 
 
@@ -533,7 +720,7 @@ def build_certification_vector(
       "selected_compressed_bytes": total_compressed,
       "selected_controls_witnesses": decoded_controls,
     },
-    "domain": "blatv2-cross-architecture-vector-v3",
+    "domain": "blatv2-cross-architecture-vector-v4",
     "route_name": route.route_name,
     "route_provenance_seed": {
       "car_params_sha256": hashlib.sha256(
@@ -542,6 +729,7 @@ def build_certification_vector(
       "source_segment_index": first_index,
       "source_segment_sha256": route.segments[0].sha256,
     },
+    "scenario_proof": _scenario_proof_summary(segment_vectors),
     "schema_version": CERTIFICATION_VECTOR_SCHEMA_VERSION,
     "segment_results": segment_vectors,
     "selection_identity_sha256": certification_vector_selection_identity(
@@ -565,6 +753,7 @@ def _validate_manifest(manifest: dict[str, object]) -> None:
     "domain",
     "route_name",
     "route_provenance_seed",
+    "scenario_proof",
     "schema_version",
     "segment_results",
     "selection_identity_sha256",
@@ -576,7 +765,7 @@ def _validate_manifest(manifest: dict[str, object]) -> None:
     raise CertificationVectorError("certification vector manifest keys differ")
   if (
     manifest["schema_version"] != CERTIFICATION_VECTOR_SCHEMA_VERSION
-    or manifest["domain"] != "blatv2-cross-architecture-vector-v3"
+    or manifest["domain"] != "blatv2-cross-architecture-vector-v4"
     or type(manifest["route_name"]) is not str
     or not manifest["route_name"]
   ):
@@ -743,7 +932,7 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
   expected_result_keys = {
     "behavior_plane", "car_params_sha256", "coverage",
     "encoded_source_plane_sha256", "extractor_stream_sha256",
-    "physical_plane", "preparation_domain", "segment",
+    "physical_plane", "preparation_domain", "scenario_plane", "segment",
     "segment_init_data_mono_ns", "source_boundary_exclusions",
   }
   for result in results:
@@ -909,6 +1098,83 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
       ):
         raise CertificationVectorError("behavior timestamps escape physical coverage")
 
+    scenario = result["scenario_plane"]
+    expected_scenario_keys = {
+      "active_controls_retained", "controls_retained",
+      "encoded_controls_sha256", "exclusions",
+      "first_retained_mono_ns", "last_retained_mono_ns", "proof_eligible",
+    }
+    if type(scenario) is not dict or set(scenario) != expected_scenario_keys:
+      raise CertificationVectorError("scenario proof plane is malformed")
+    scenario_count = _bounded_nonnegative(
+      scenario["controls_retained"],
+      "scenario retained controls",
+      1_000_000,
+    )
+    scenario_active_count = _bounded_nonnegative(
+      scenario["active_controls_retained"],
+      "scenario retained active controls",
+      1_000_000,
+    )
+    scenario_exclusion_total = _exclusion_total(
+      scenario["exclusions"],
+      "scenario plane",
+      frozenset({
+        "active_maneuver_override",
+        "applied_torque_context_missing",
+        "live_delay_context_missing",
+        "live_delay_payload_invalid",
+        "live_torque_context_missing",
+        "live_torque_health_inexact",
+        "live_torque_payload_invalid",
+        "maneuver_context_invalid",
+        "model_context_missing",
+        "model_message_invalid",
+        "model_native_grid_invalid",
+        "model_not_alive",
+        "physical_plane_car_control_context_missing",
+        "physical_plane_inputs_invalid",
+        "physical_plane_race_unresolved",
+        "physical_plane_segment_local_gap",
+        "scenario_message_invalid",
+      }),
+    )
+    if (
+      scenario_count + scenario_exclusion_total != coverage["controls_total"]
+      or scenario_count > physical_count
+      or scenario_active_count > scenario_count
+      or type(scenario["proof_eligible"]) is not bool
+      or scenario["proof_eligible"] != (scenario_count > 0)
+    ):
+      raise CertificationVectorError("scenario proof coverage is not meaningful")
+    _validate_retained_timestamps(
+      scenario["first_retained_mono_ns"],
+      scenario["last_retained_mono_ns"],
+      scenario_count,
+      "scenario plane",
+    )
+    scenario_hash = _hash_value(
+      scenario["encoded_controls_sha256"],
+      "scenario controls plane",
+    )
+    if scenario_count == 0:
+      if scenario_hash != empty_hash:
+        raise CertificationVectorError("empty scenario plane digest is not canonical")
+    elif scenario_hash == empty_hash:
+      raise CertificationVectorError("nonempty scenario plane has an empty digest")
+    if scenario_count:
+      physical_first = physical["first_retained_mono_ns"]
+      physical_last = physical["last_retained_mono_ns"]
+      scenario_first = scenario["first_retained_mono_ns"]
+      scenario_last = scenario["last_retained_mono_ns"]
+      if not all(
+        type(value) is int
+        for value in (physical_first, physical_last, scenario_first, scenario_last)
+      ):
+        raise CertificationVectorError("retained timestamp coverage is invalid")
+      if scenario_first < physical_first or scenario_last > physical_last:
+        raise CertificationVectorError("scenario timestamps escape physical coverage")
+
     hashes = result["encoded_source_plane_sha256"]
     expected_hashes = {
       "driving_events", "lateral_maneuver_plans", "live_delays",
@@ -940,6 +1206,35 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
     for key in ("log_schema_blob", "opendbc_commit", "panda_commit", "source_superproject_commit"):
       if type(domain[key]) is not str or re.fullmatch(r"[0-9a-f]{40}", domain[key]) is None:
         raise CertificationVectorError(f"preparation domain {key} is invalid")
+  scenario_proof = manifest["scenario_proof"]
+  expected_scenario_proof_keys = {
+    "active_controls_retained", "controls_retained", "proof_eligible",
+    "selected_inputs_sha256",
+  }
+  if (
+    type(scenario_proof) is not dict
+    or set(scenario_proof) != expected_scenario_proof_keys
+  ):
+    raise CertificationVectorError("route scenario proof is malformed")
+  _bounded_nonnegative(
+    scenario_proof["active_controls_retained"],
+    "route scenario retained active controls",
+    CERTIFICATION_VECTOR_MAX_CONTROLS_WITNESSES,
+  )
+  _bounded_nonnegative(
+    scenario_proof["controls_retained"],
+    "route scenario retained controls",
+    CERTIFICATION_VECTOR_MAX_CONTROLS_WITNESSES,
+  )
+  _hash_value(
+    scenario_proof["selected_inputs_sha256"],
+    "route scenario selected inputs",
+  )
+  if type(scenario_proof["proof_eligible"]) is not bool:
+    raise CertificationVectorError("route scenario proof eligibility is invalid")
+  rebuilt_scenario_proof = _scenario_proof_summary(results)
+  if scenario_proof != rebuilt_scenario_proof:
+    raise CertificationVectorError("route scenario proof identity mismatch")
   if selected_manifest[0]["index"] != source[0]["index"]:
     raise CertificationVectorError("certification vector omits provenance segment")
   if compressed_total != bounds["selected_compressed_bytes"]:
@@ -947,7 +1242,7 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
   if controls_total != bounds["selected_controls_witnesses"] or controls_total == 0:
     raise CertificationVectorError("selected controls accounting changed")
   expected_selection = hashlib.sha256(_canonical_json({
-    "domain": "blatv2-certification-vector-selection-v3",
+    "domain": "blatv2-certification-vector-selection-v4",
     "route_name": manifest["route_name"],
     "source_segments": source,
     "selected_segments": selected_manifest,

@@ -17,6 +17,7 @@ from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
   CertificationVector,
   CertificationVectorError,
   _VECTOR_DOMAIN,
+  _scenario_proof_summary,
   _segment_vector,
   certification_vector_selection_identity,
 )
@@ -115,6 +116,28 @@ def _without_maneuver_plan(
   )
 
 
+def _with_planes(
+  evidence: RouteEvidenceArtifact,
+  *,
+  controls=None,
+  models=None,
+  torque=None,
+  delay=None,
+  maneuvers=None,
+) -> RouteEvidenceArtifact:
+  return RouteEvidenceArtifact(
+    evidence.source_identity,
+    CP,
+    PHYSICAL,
+    evidence.model_publications if models is None else tuple(models),
+    evidence.control_witnesses if controls is None else tuple(controls),
+    evidence.live_torque_parameters if torque is None else tuple(torque),
+    evidence.live_delays if delay is None else tuple(delay),
+    evidence.lateral_maneuver_plans if maneuvers is None else tuple(maneuvers),
+    EVENTS,
+  )
+
+
 def _signed_vector(result: dict[str, object]) -> CertificationVector:
   candidate = RouteCandidate(ROUTE, 1, (SEGMENT,))
   source_manifest = [SEGMENT.to_ledger_dict()]
@@ -133,13 +156,14 @@ def _signed_vector(result: dict[str, object]) -> CertificationVector:
         + sum(int(value) for value in source_exclusions.values())
       ),
     },
-    "domain": "blatv2-cross-architecture-vector-v3",
+    "domain": "blatv2-cross-architecture-vector-v4",
     "route_name": ROUTE,
     "route_provenance_seed": {
       "car_params_sha256": hashlib.sha256(CP).hexdigest(),
       "source_segment_index": SEGMENT.index,
       "source_segment_sha256": SEGMENT.sha256,
     },
+    "scenario_proof": _scenario_proof_summary([result]),
     "schema_version": CERTIFICATION_VECTOR_SCHEMA_VERSION,
     "segment_results": [result],
     "selection_identity_sha256": certification_vector_selection_identity(
@@ -156,7 +180,7 @@ def _signed_vector(result: dict[str, object]) -> CertificationVector:
   return CertificationVector.from_manifest(manifest)
 
 
-def test_no_maneuver_plan_preserves_physical_proof() -> None:
+def test_no_maneuver_plan_proves_controller_independent_scenario() -> None:
   evidence = _without_maneuver_plan()
   result = _segment_vector(
     segment=SEGMENT,
@@ -165,6 +189,7 @@ def test_no_maneuver_plan_preserves_physical_proof() -> None:
 
   physical = result["physical_plane"]
   behavior = result["behavior_plane"]
+  scenario = result["scenario_plane"]
   assert physical == {
     "encoded_controls_sha256": hashlib.sha256(
       b"".join(
@@ -190,16 +215,32 @@ def test_no_maneuver_plan_preserves_physical_proof() -> None:
     "source_eligible": False,
     "source_eligibility_reason": "lateral_maneuver_plan_missing",
   }
+  assert scenario == {
+    "active_controls_retained": 2,
+    "controls_retained": 2,
+    "encoded_controls_sha256": hashlib.sha256(
+      b"".join(
+        _encode_controls((control,))
+        for control in evidence.control_witnesses
+      ),
+    ).hexdigest(),
+    "exclusions": {},
+    "first_retained_mono_ns": 1_000,
+    "last_retained_mono_ns": 1_010,
+    "proof_eligible": True,
+  }
   restored = CertificationVector.from_bytes(
     _signed_vector(result).canonical_bytes,
   )
   assert restored.manifest["segment_results"][0] == result
+  assert restored.manifest["scenario_proof"]["proof_eligible"] is True
 
 
-def test_behavior_eligible_segment_proves_both_planes() -> None:
+def test_behavior_plane_remains_recorded_controller_proof() -> None:
   result = _segment_vector(segment=SEGMENT, prepared=_prepared(artifact()))
   physical = result["physical_plane"]
   behavior = result["behavior_plane"]
+  scenario = result["scenario_plane"]
   assert physical["frames_retained"] == 2
   assert behavior["controls_retained"] == 2
   assert behavior["proof_eligible"] is True
@@ -207,6 +248,10 @@ def test_behavior_eligible_segment_proves_both_planes() -> None:
   assert behavior["source_eligibility_reason"] == "eligible"
   assert behavior["first_retained_mono_ns"] == physical["first_retained_mono_ns"]
   assert behavior["last_retained_mono_ns"] == physical["last_retained_mono_ns"]
+  assert scenario["controls_retained"] == 0
+  assert scenario["active_controls_retained"] == 0
+  assert scenario["exclusions"] == {"active_maneuver_override": 2}
+  assert scenario["proof_eligible"] is False
 
 
 def test_source_ineligibility_never_presents_context_as_proof() -> None:
@@ -232,6 +277,233 @@ def test_source_ineligibility_never_presents_context_as_proof() -> None:
   assert behavior["controls_retained"] == 2
   assert behavior["source_eligible"] is False
   assert behavior["proof_eligible"] is False
+
+  without_maneuver = _without_maneuver_plan()
+  scenario_evidence = RouteEvidenceArtifact(
+    replace(
+      without_maneuver.source_identity,
+      behavior_ineligible_reason="controller_source_unapproved",
+    ),
+    CP,
+    PHYSICAL,
+    without_maneuver.model_publications,
+    without_maneuver.control_witnesses,
+    TORQUE,
+    DELAY,
+    (),
+    EVENTS,
+  )
+  scenario = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(scenario_evidence),
+  )["scenario_plane"]
+  assert scenario["controls_retained"] == 2
+  assert scenario["proof_eligible"] is True
+
+
+def test_route_scenario_proof_does_not_fit_eligibility_to_active_sample() -> None:
+  evidence = _without_maneuver_plan()
+  inactive_controls = tuple(
+    replace(control, lateral_active=False)
+    for control in evidence.control_witnesses
+  )
+  inactive = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(_with_planes(evidence, controls=inactive_controls)),
+  )
+  active = _segment_vector(segment=SEGMENT, prepared=_prepared(evidence))
+
+  inactive_only = _scenario_proof_summary([inactive])
+  assert inactive_only["controls_retained"] == 2
+  assert inactive_only["active_controls_retained"] == 0
+  assert inactive_only["proof_eligible"] is True
+
+  mixed = _scenario_proof_summary([inactive, active])
+  assert mixed["controls_retained"] == 4
+  assert mixed["active_controls_retained"] == 2
+  assert mixed["proof_eligible"] is True
+  assert mixed["selected_inputs_sha256"] != inactive_only[
+    "selected_inputs_sha256"
+  ]
+
+
+def test_inactive_or_invalid_maneuver_override_is_not_scenario_authority() -> None:
+  evidence = artifact()
+  inactive_controls = tuple(
+    replace(control, lateral_active=False)
+    for control in evidence.control_witnesses
+  )
+  inactive = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(_with_planes(evidence, controls=inactive_controls)),
+  )["scenario_plane"]
+  assert inactive["controls_retained"] == 2
+  assert inactive["active_controls_retained"] == 0
+  assert inactive["proof_eligible"] is True
+
+  invalid_maneuver = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(_with_planes(
+      evidence,
+      maneuvers=(replace(MANEUVER[0], message_valid=False),),
+    )),
+  )["scenario_plane"]
+  assert invalid_maneuver["controls_retained"] == 2
+  assert invalid_maneuver["active_controls_retained"] == 2
+  assert invalid_maneuver["proof_eligible"] is True
+
+
+def test_exact_unhealthy_ignored_torque_payload_remains_authoritative() -> None:
+  evidence = _without_maneuver_plan()
+  controls = tuple(
+    replace(
+      control,
+      live_torque_parameters_checks_passed=False,
+      live_torque_parameters_health_exact=True,
+    )
+    for control in evidence.control_witnesses
+  )
+  ignored_payload = replace(
+    TORQUE[0],
+    lat_accel_factor=-1.0,
+    friction=-1.0,
+  )
+  scenario = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(_with_planes(
+      evidence,
+      controls=controls,
+      torque=(ignored_payload,),
+    )),
+  )["scenario_plane"]
+  assert scenario["controls_retained"] == 2
+  assert scenario["active_controls_retained"] == 2
+  assert scenario["exclusions"] == {}
+  assert scenario["proof_eligible"] is True
+
+
+@pytest.mark.parametrize(
+  ("case", "reason"),
+  (
+    ("message_invalid", "scenario_message_invalid"),
+    ("model_missing", "model_context_missing"),
+    ("model_future", "model_context_missing"),
+    ("model_message_invalid", "model_message_invalid"),
+    ("model_not_alive", "model_not_alive"),
+    ("model_native_grid_invalid", "model_native_grid_invalid"),
+    ("applied_count_missing", "applied_torque_context_missing"),
+    ("live_torque_missing", "live_torque_context_missing"),
+    ("live_torque_health_inexact", "live_torque_health_inexact"),
+    ("live_torque_payload_invalid", "live_torque_payload_invalid"),
+    ("live_delay_missing", "live_delay_context_missing"),
+    ("live_delay_payload_invalid", "live_delay_payload_invalid"),
+    ("maneuver_link_invalid", "maneuver_context_invalid"),
+    ("active_maneuver_override", "active_maneuver_override"),
+  ),
+)
+def test_scenario_plane_excludes_non_authoritative_inputs(
+  case: str,
+  reason: str,
+) -> None:
+  evidence = _without_maneuver_plan()
+  controls = list(evidence.control_witnesses)
+  models = list(evidence.model_publications)
+  torque = list(evidence.live_torque_parameters)
+  delay = list(evidence.live_delays)
+  maneuvers = list(evidence.lateral_maneuver_plans)
+  if case == "message_invalid":
+    controls = [replace(value, message_valid=False) for value in controls]
+  elif case == "model_missing":
+    controls = [
+      replace(value, model_publication_index=-1, model_link_valid=False)
+      for value in controls
+    ]
+  elif case == "model_future":
+    models = [
+      replace(value, mono_time_ns=2_000 + index, timestamp_eof_ns=1_900 + index)
+      for index, value in enumerate(models)
+    ]
+  elif case == "model_message_invalid":
+    models = [replace(value, message_valid=False) for value in models]
+  elif case == "model_not_alive":
+    controls = [replace(value, model_message_alive=False) for value in controls]
+  elif case == "model_native_grid_invalid":
+    models = [
+      replace(
+        value,
+        plan_times=(),
+        orientation_rate_z=(),
+        velocity_x=(),
+        native_grid_valid=False,
+      )
+      for value in models
+    ]
+  elif case == "applied_count_missing":
+    controls = [
+      replace(value, torque_output_can_count=0, torque_output_can_valid=False)
+      for value in controls
+    ]
+  elif case == "live_torque_missing":
+    controls = [
+      replace(
+        value,
+        live_torque_parameters_index=-1,
+        live_torque_parameters_available=False,
+      )
+      for value in controls
+    ]
+  elif case == "live_torque_health_inexact":
+    controls = [
+      replace(value, live_torque_parameters_health_exact=False)
+      for value in controls
+    ]
+  elif case == "live_torque_payload_invalid":
+    torque = [replace(value, lat_accel_factor=-1.0) for value in torque]
+  elif case == "live_delay_missing":
+    controls = [
+      replace(value, live_delay_index=-1, live_delay_available=False)
+      for value in controls
+    ]
+  elif case == "live_delay_payload_invalid":
+    delay = [replace(value, lateral_delay_s=-1.0) for value in delay]
+  elif case == "maneuver_link_invalid":
+    controls = [
+      replace(
+        value,
+        lateral_maneuver_plan_index=0,
+        maneuver_plan_available=False,
+      )
+      for value in controls
+    ]
+    maneuvers = [MANEUVER[0]]
+  elif case == "active_maneuver_override":
+    controls = [
+      replace(
+        value,
+        lateral_maneuver_plan_index=0,
+        maneuver_plan_available=True,
+      )
+      for value in controls
+    ]
+    maneuvers = [MANEUVER[0]]
+  else:
+    raise AssertionError(f"unhandled scenario case: {case}")
+  mutated = _with_planes(
+    evidence,
+    controls=controls,
+    models=models,
+    torque=torque,
+    delay=delay,
+    maneuvers=maneuvers,
+  )
+  scenario = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(mutated),
+  )["scenario_plane"]
+  assert scenario["controls_retained"] == 0
+  assert scenario["active_controls_retained"] == 0
+  assert scenario["exclusions"] == {reason: 2}
+  assert scenario["proof_eligible"] is False
 
 
 def test_empty_physical_plane_and_empty_eligible_behavior_fail_closed() -> None:
@@ -265,6 +537,34 @@ def test_empty_physical_plane_and_empty_eligible_behavior_fail_closed() -> None:
     )
 
 
+def test_scenario_plane_applies_physical_exclusion_first() -> None:
+  evidence = _without_maneuver_plan()
+  frames = (replace(FRAMES[0], inputs_valid=False), FRAMES[1])
+  controls = (
+    replace(evidence.control_witnesses[0], inputs_valid=False),
+    evidence.control_witnesses[1],
+  )
+  physical = b"".join(_encode_frame(frame) for frame in frames)
+  partially_invalid = RouteEvidenceArtifact(
+    evidence.source_identity,
+    CP,
+    physical,
+    evidence.model_publications,
+    controls,
+    TORQUE,
+    DELAY,
+    (),
+    EVENTS,
+  )
+  scenario = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(partially_invalid, frames),
+  )["scenario_plane"]
+  assert scenario["controls_retained"] == 1
+  assert scenario["active_controls_retained"] == 1
+  assert scenario["exclusions"] == {"physical_plane_inputs_invalid": 1}
+
+
 def test_dual_plane_accounting_and_determinism() -> None:
   first = _segment_vector(
     segment=SEGMENT,
@@ -292,6 +592,9 @@ def test_dual_plane_accounting_and_determinism() -> None:
     (("physical_plane", "first_retained_mono_ns"), None, "timestamp"),
     (("behavior_plane", "source_eligible"), True, "source eligibility"),
     (("behavior_plane", "encoded_controls_sha256"), "f" * 64, "empty behavior"),
+    (("scenario_plane", "controls_retained"), 1, "scenario proof coverage"),
+    (("scenario_plane", "active_controls_retained"), 3, "scenario proof coverage"),
+    (("scenario_plane", "proof_eligible"), False, "scenario proof coverage"),
   ),
 )
 def test_manifest_semantic_tampering_fails_closed(
@@ -311,7 +614,27 @@ def test_manifest_semantic_tampering_fails_closed(
     CertificationVector.from_manifest(manifest)
 
 
-def test_signed_hash_tampering_and_v2_header_fail_closed() -> None:
+def test_route_scenario_recount_and_source_identity_tampering_fail_closed() -> None:
+  vector = _signed_vector(_segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(_without_maneuver_plan()),
+  ))
+  manifest = deepcopy(vector.manifest)
+  manifest.pop("vector_identity_sha256")
+  manifest["scenario_proof"]["active_controls_retained"] = 1
+  with pytest.raises(CertificationVectorError, match="scenario proof identity"):
+    CertificationVector.from_manifest(manifest)
+
+  manifest = deepcopy(vector.manifest)
+  manifest.pop("vector_identity_sha256")
+  manifest["segment_results"][0]["encoded_source_plane_sha256"][
+    "models"
+  ] = "f" * 64
+  with pytest.raises(CertificationVectorError, match="scenario proof identity"):
+    CertificationVector.from_manifest(manifest)
+
+
+def test_signed_hash_tampering_and_v3_header_fail_closed() -> None:
   vector = _signed_vector(_segment_vector(
     segment=SEGMENT,
     prepared=_prepared(_without_maneuver_plan()),
@@ -332,7 +655,7 @@ def test_signed_hash_tampering_and_v2_header_fail_closed() -> None:
     CertificationVector.from_bytes(tampered)
 
   old_header = bytearray(vector.canonical_bytes)
-  struct.pack_into("<H", old_header, 8, 2)
+  struct.pack_into("<H", old_header, 8, 3)
   with pytest.raises(CertificationVectorError, match="header"):
     CertificationVector.from_bytes(old_header)
 
