@@ -621,6 +621,8 @@ def _bind_downloaded_artifact_to_vector(
     type(route_seed) is not dict
     or route_seed.get("car_params_sha256")
     != summary.manifest.get("car_params_sha256")
+    or provenance.get("car_params_sha256")
+    != summary.manifest.get("car_params_sha256")
     or route_seed.get("source_segment_index") != route.segments[0].index
     or route_seed.get("source_segment_sha256") != route.segments[0].sha256
   ):

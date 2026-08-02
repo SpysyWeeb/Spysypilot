@@ -1379,6 +1379,8 @@ def accepted_spool_outcomes(
     "source_segments": source_segments,
   }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
   cp_hash = hashlib.sha256(car_params_bytes).hexdigest()
+  artifact_provenance = dict(provenance)
+  artifact_provenance["car_params_sha256"] = cp_hash
   segment_result = {
     "boundary_exclusions": {},
     "car_params_sha256": cp_hash,
@@ -1448,7 +1450,7 @@ def accepted_spool_outcomes(
     base_evidence = route_evidence_for_frames(
       candidate.route_name,
       (),
-      provenance,
+      artifact_provenance,
       car_params_bytes=car_params_bytes,
       runtime_identity=runtime_identity,
     )
@@ -1493,7 +1495,7 @@ def accepted_spool_outcomes(
       controls_witness_count=0,
       unresolved_witness_count=0,
       gap_count=0,
-      provenance=provenance,
+      provenance=artifact_provenance,
       max_frames=1,
       abort_requested=lambda: False,
       filename=f"a{authority}-{candidate.route_name}.spool",
@@ -1679,6 +1681,70 @@ def test_streamed_artifact_vector_binding_rejects_exact_carparams_mix(
       descriptor=second.descriptor,
       summary=second.artifact_summary,
       vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_provenance_cp_mix(
+  tmp_path: Path,
+) -> None:
+  root = tmp_path / "authority"
+  root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  provenance = prepared_provenance()
+  outcome = accepted_spool_outcomes(
+    root,
+    candidate,
+    provenance,
+    car_params_bytes=b"one exact CarParams",
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  assert outcome.descriptor is not None
+  assert outcome.certification_vector is not None
+  original = RouteEvidenceArtifact.from_file(
+    root / outcome.descriptor.filename,
+  )
+  changed_provenance = dict(original.source_identity.preparation_provenance)
+  changed_provenance["car_params_sha256"] = "f" * 64
+  changed_source = replace(
+    original.source_identity,
+    preparation_provenance=changed_provenance,
+  )
+  changed = RouteEvidenceArtifact(
+    changed_source,
+    original.car_params_bytes,
+    original.physical_bytes,
+    original.model_publications,
+    original.control_witnesses,
+    original.live_torque_parameters,
+    original.live_delays,
+    original.lateral_maneuver_plans,
+    original.event_locators,
+  )
+  changed_descriptor = write_prepared_route_spool(
+    root,
+    candidate.route_name,
+    (),
+    controls_witness_count=0,
+    unresolved_witness_count=0,
+    gap_count=0,
+    provenance=changed_provenance,
+    max_frames=1,
+    abort_requested=lambda: False,
+    filename="provenance-mix.route-evidence",
+    route_evidence=changed,
+  )
+  vector = CertificationVector.from_bytes(
+    (root / outcome.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="CarParams seed"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=changed_descriptor,
+      summary=inspect_route_evidence_file(
+        root / changed_descriptor.filename,
+      ),
+      vector_descriptor=outcome.certification_vector,
       vector=vector,
     )
 
