@@ -16,6 +16,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import (
   get_cruise_accel,
   get_cruise_comfort_accel,
   get_max_accel,
+  get_requested_max_accel,
   ordinary_cruise_comfort_enabled,
 )
 
@@ -107,40 +108,47 @@ class TestStrongCruiseEnvelope(unittest.TestCase):
   def test_low_speed_requests_blotv1_authority_with_platform_clamp(self):
     self.assertEqual(BLOTV2_ACCEL_REQUEST_MAX, 4.0)
     self.assertEqual(BLOTV2_ACCEL_MAX, min(ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX))
+    self.assertEqual(get_requested_max_accel(0.0), BLOTV2_ACCEL_REQUEST_MAX)
     self.assertEqual(get_max_accel(0.0), BLOTV2_ACCEL_MAX)
     speeds = np.linspace(0.0, 50.0, 101)
     self.assertLessEqual(max(get_max_accel(speed) for speed in speeds), BLOTV2_ACCEL_MAX)
 
-  def test_launch_schedule_rejoins_stock_gate_at_10_mps(self):
-    np.testing.assert_allclose(
-      longitudinal_planner.A_CRUISE_MAX_VALS,
-      [4.0, 1.2, 0.8, 0.6],
-    )
-    np.testing.assert_allclose(
-      longitudinal_planner.A_CRUISE_MAX_BP,
-      [0.0, 10.0, 25.0, 40.0],
-    )
+  def test_cubic_curve_matches_agreed_speed_samples(self):
+    speeds = np.arange(0.0, 45.0, 5.0)
+    expected = [4.0, 2.877734375, 2.034375, 1.430078125, 1.025,
+                0.779296875, 0.653125, 0.606640625, 0.6]
+    np.testing.assert_allclose([get_requested_max_accel(speed) for speed in speeds], expected)
 
-    stock_bp = [0.0, 10.0, 25.0, 40.0]
-    stock_vals = [1.6, 1.2, 0.8, 0.6]
-    speeds = np.linspace(10.0, 50.0, 81)
-    np.testing.assert_allclose(
-      [get_max_accel(speed) for speed in speeds],
-      np.interp(speeds, stock_bp, stock_vals),
-    )
+  def test_cubic_curve_is_monotonic_convex_and_has_no_speed_node_corners(self):
+    speeds = np.linspace(0.0, longitudinal_planner.A_CRUISE_MAX_CURVE_SPEED, 401)
+    accels = np.array([get_requested_max_accel(speed) for speed in speeds])
+    slopes = np.diff(accels) / np.diff(speeds)
 
-  def test_route_d2_urban_cruise_cap(self):
+    self.assertTrue(np.all(np.diff(accels) <= 0.0))
+    self.assertTrue(np.all(np.diff(slopes) >= -1e-12))
+
+    step = 1e-4
+    for old_node in (10.0, 25.0):
+      left_slope = (get_requested_max_accel(old_node) - get_requested_max_accel(old_node - step)) / step
+      right_slope = (get_requested_max_accel(old_node + step) - get_requested_max_accel(old_node)) / step
+      self.assertAlmostEqual(left_slope, right_slope, places=5)
+
+  def test_curve_reaches_a_smooth_high_speed_floor(self):
+    self.assertEqual(get_requested_max_accel(40.0), 0.6)
+    self.assertEqual(get_requested_max_accel(50.0), 0.6)
+    near_floor_slope = (get_requested_max_accel(40.0) - get_requested_max_accel(39.99)) / 0.01
+    self.assertAlmostEqual(near_floor_slope, 0.0, places=5)
+
+  def test_route_d2_urban_correction_remains_comfort_limited(self):
     # Route 000000d2--a62f0c1831 reached 1.79 m/s² near 40 mph for a
-    # 5.4 mph set-speed error. Fade the extra launch authority out by 10 m/s,
-    # then use stock's speed gate exactly for this urban correction.
-    requested_at_10 = np.interp(
-      10.0,
-      longitudinal_planner.A_CRUISE_MAX_BP,
-      longitudinal_planner.A_CRUISE_MAX_VALS,
-    )
-    self.assertAlmostEqual(requested_at_10, 1.2)
-    stock_at_40_mph = np.interp(40.0 * 0.44704, [0.0, 10.0, 25.0, 40.0], [1.6, 1.2, 0.8, 0.6])
-    self.assertAlmostEqual(get_max_accel(40.0 * 0.44704), stock_at_40_mph)
+    # 5.4 mph set-speed error. The ordinary-cruise response remains below the
+    # new cubic envelope, so smoothing the envelope cannot restore that lunge.
+    v_ego = 40.0 * CV.MPH_TO_MS
+    v_cruise = v_ego + 5.4 * CV.MPH_TO_MS
+    comfort_target = get_cruise_comfort_accel(v_cruise, v_ego, -0.3)
+
+    self.assertAlmostEqual(comfort_target, 0.43452288, places=6)
+    self.assertLess(comfort_target, get_max_accel(v_ego))
 
   def test_turn_budget_does_not_clip_straight_launch(self):
     np.testing.assert_allclose(longitudinal_planner._A_TOTAL_MAX_V, [4.0, 4.0])

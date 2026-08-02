@@ -291,8 +291,8 @@ removed. The two mechanisms must not run together.
 ## Strong
 
 The stock cruise comfort schedule leaves some existing platform authority
-unused at launch. BLoTv2 keeps BLoT v1's launch authority while handing back
-to the exact stock speed gate by `10 m/s`, changing the schedule from:
+unused at launch. An earlier in-progress BLoTv2 revision changed its four
+piecewise-linear nodes from:
 
 ```text
 [1.6, 1.2, 0.8, 0.6] m/s²
@@ -306,15 +306,36 @@ to:
 at [0, 10, 25, 40] m/s
 ```
 
+That revision corrected the route-derived urban lunge, but owner review found
+the 0-to-10 m/s decline too abrupt. It is now superseded by one continuous
+convex envelope:
+
+```text
+a_max(v) = 0.6 + 3.4 × (1 − v/40)³     for 0 ≤ v ≤ 40 m/s
+a_max(v) = 0.6                          for v > 40 m/s
+```
+
+The requested curve is monotonic, has no internal speed-node corners, and
+reaches the high-speed floor with zero slope. Representative requested values
+before the deployed-platform clamp are:
+
+| speed | requested maximum acceleration |
+|---:|---:|
+| 0 m/s (0 mph) | 4.000 m/s² |
+| 5 m/s (11 mph) | 2.878 m/s² |
+| 10 m/s (22 mph) | 2.034 m/s² |
+| 15 m/s (34 mph) | 1.430 m/s² |
+| 20 m/s (45 mph) | 1.025 m/s² |
+| 25 m/s (56 mph) | 0.779 m/s² |
+| 30 m/s (67 mph) | 0.653 m/s² |
+| 35 m/s (78 mph) | 0.607 m/s² |
+| 40 m/s (89 mph) | 0.600 m/s² |
+
 Authority and jerk remain separate tuning axes. The existing BLoTv2 jerk
-schedule stays `[2.0, 1.6, 1.0, 0.6] m/s³`; it is not doubled with the
-acceleration request and retains its original `[0, 10, 25, 40] m/s`
-breakpoints. Only the acceleration schedule's launch endpoint differs from
-stock: interpolation fades the added authority continuously from `4.0 m/s²`
-at standstill to stock's `1.2 m/s²` at `10 m/s` (about `22 mph`). Every
-acceleration ceiling at and above that handoff is exactly stock. The
-straight-line total-acceleration budget is `4.0 m/s²`, while lateral
-acceleration still consumes that shared budget in a turn.
+schedule stays `[2.0, 1.6, 1.0, 0.6] m/s³`; it retains its original
+`[0, 10, 25, 40] m/s` breakpoints and is not replaced by the cubic acceleration
+envelope. The straight-line total-acceleration budget remains `4.0 m/s²`,
+while lateral acceleration still consumes that shared budget in a turn.
 
 ### Route `000000d2--a62f0c1831` urban-speed refinement
 
@@ -324,14 +345,15 @@ The full-resolution route was recorded on `combo` commit `c43e130059`. Three
 for only a `5.4 mph` set-speed error; the planner target and final command
 matched, so this was not PID overshoot or Smooth Stops behavior.
 
-The revised schedule limits the same 40 mph operating point to about
-`0.99 m/s²`, exactly matching stock there. It preserves the `4.0 m/s²` launch
-endpoint but smoothly removes the extra authority by `10 m/s`. The separate
-jerk schedule is unchanged, so a valid change still begins promptly; “Swift”
-describes reaction time and low-speed launch response, not sustained high
-throttle for a small urban-speed correction. This counterfactual cap is
-route-derived, not a claim of field validation, and remains an explicit owner
-test item.
+The intermediate four-node revision limited the same 40 mph operating point
+to about `0.99 m/s²`. The current cubic envelope permits about `1.17 m/s²`
+there, but the later ordinary-cruise comfort response limits the route's
+`5.4 mph` error to about `0.435 m/s²`, well below either ceiling. Smoothing the
+envelope therefore does not restore the original `1.79 m/s²` Chill cruise
+lunge. The separate jerk schedule is unchanged, so a valid change still begins
+promptly; “Swift” describes reaction time and low-speed launch response, not
+sustained high throttle for a small urban-speed correction. This remains
+counterfactual evidence—not field validation—and an explicit owner test item.
 
 ### Route `000000d9--6040563d1d` ordinary-cruise comfort refinement
 
@@ -365,9 +387,10 @@ a full pitch-compensated throttle lift by a 5 mph error; this permits natural
 uphill coast-down without adding gas, while a downhill still receives the
 gentle proportional deceleration request. The response blends from the legacy
 candidate at `8 m/s` to the comfort candidate at `15 m/s`, preserving the
-existing low-speed launch behavior. Larger errors naturally reach the same
-legacy limits—roughly 8–12 mph upward depending on road speed and about 15 mph
-downward—so this is not a global authority reduction.
+existing low-speed launch behavior. Larger errors naturally reach the
+configured cubic ceiling—roughly 8–13 mph upward depending on road speed—and
+the existing `-1.2 m/s²` limit at about 15 mph downward, so this is not a
+global authority reduction.
 
 The comfort path is eligible only with healthy radar, no radar lead, Chill
 mode, and no forced deceleration. In `combo`, an active model curve-speed limit
@@ -376,12 +399,15 @@ the planner's MPC/e2e candidate arbitration is unchanged. The existing jerk
 schedule still governs onset and release, so “Swift” remains reaction time and
 low-speed response while a routine five-mph correction becomes softer.
 
-A production-function trace replay—not a copied equation—matched the recorded
-legacy peaks (`+0.688`, `-1.200`, and `+0.685 m/s²`) and changed the same input
-timelines to `+0.400`, `-0.401`, and `+0.353 m/s²`. The third value closes
-earlier because this command-only replay retains the vehicle trajectory
-produced by the stronger recorded command. It is not a closed-loop prediction
-of vehicle speed or delivered acceleration and is not field validation.
+On the former four-node revision, a production-function trace replay—not a
+copied equation—matched the recorded legacy peaks (`+0.688`, `-1.200`, and
+`+0.685 m/s²`) and changed the same input timelines to `+0.400`, `-0.401`, and
+`+0.353 m/s²`. Repeating that replay with the cubic envelope retains the same
+three comfort-shaped values; they remain below the new ceiling. The third
+value closes earlier because this command-only replay retains the vehicle
+trajectory produced by the stronger recorded command. It is not a closed-loop
+prediction of vehicle speed or delivered acceleration and is not field
+validation.
 
 `BLOTV2_ACCEL_REQUEST_MAX = 4.0 m/s²` records the requested policy.
 `BLOTV2_ACCEL_MAX = min(ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX)` applies the
@@ -430,6 +456,8 @@ Automated coverage includes:
 - every supervisor trigger, hysteresis, emergency stand-down, and slew rate;
 - model lead anchoring and exact stock fallback for malformed/non-finite input;
 - BLoT v1 launch request and deployed-platform acceleration clamping;
+- exact cubic acceleration samples, monotonicity, convexity, corner-free
+  continuity, and smooth high-speed-floor coverage;
 - route-derived ordinary-cruise proportional response, coast-down behavior,
   low-speed blend, large-error authority, jerk bounds, and strategy bypasses;
 - low-speed radar track qualification;
