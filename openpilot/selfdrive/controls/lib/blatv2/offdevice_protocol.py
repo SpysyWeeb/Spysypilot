@@ -230,7 +230,11 @@ def decode_canonical_json(data: bytes, *, maximum_bytes: int) -> dict[str, objec
     )
   except BridgeCorruptError:
     raise
-  except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+  except (
+    UnicodeDecodeError,
+    RecursionError,
+    ValueError,
+  ) as exc:
     raise BridgeCorruptError("invalid canonical JSON") from exc
   if type(decoded) is not dict:
     raise BridgeCorruptError("protocol envelope must be an object")

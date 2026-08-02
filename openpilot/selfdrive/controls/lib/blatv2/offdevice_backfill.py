@@ -31,6 +31,7 @@ from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
   CertificationVectorError,
   build_certification_vector,
   certification_vector_selection,
+  certification_vector_selection_identity,
 )
 
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
@@ -39,7 +40,6 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BackfillError,
   FullRlogDiscovery,
   HistoricalLearningBackfill,
-  PreparedRoute,
   RouteCandidate,
   RouteRejected,
   RouteSegment,
@@ -56,7 +56,6 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
   PreparedRouteSpoolDescriptor,
   SpoolFormatError,
   open_prepared_route_spool,
-  write_prepared_route_spool,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
   LearningOperationState,
@@ -80,6 +79,11 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   check_abort,
   decode_canonical_json,
 )
+from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
+  RouteEvidenceError,
+  RouteEvidenceFileSummary,
+  inspect_route_evidence_file,
+)
 
 
 REMOTE_JOB_POLL_SECONDS: Final = 0.25
@@ -90,6 +94,7 @@ PRIVATE_SCRATCH_MARKER_BYTES: Final = b"blatv2-private-scratch-v1\n"
 PRIVATE_SCRATCH_MAX_CHILDREN: Final = 1024
 PRIVATE_SCRATCH_DISK_MARGIN_BYTES: Final = 16 * 1024 * 1024
 PRIVATE_SCRATCH_QUARANTINE_PREFIX: Final = ".blatv2-private-quarantine-"
+PRIVATE_SCRATCH_MAX_QUARANTINE_BYTES: Final = 4 * 1024 * 1024 * 1024
 _REMOTE_PLACEHOLDER_DIRECTORY: Final = ".blatv2-remote-inventory"
 REMOTE_CERTIFICATION_DIRECTORY: Final = ".blatv2-offdevice-certifications"
 REMOTE_CERTIFICATION_SCHEMA_VERSION: Final = 5
@@ -143,6 +148,16 @@ class ArchitectureVerificationError(BridgeIncompatibleError):
   def __init__(self, reason: str) -> None:
     super().__init__(reason)
     self.reason = reason
+
+
+def _remote_transaction_disk_requirement(
+  total_download_bytes: int,
+  largest_route_artifact_bytes: int,
+) -> int:
+  """Reserve downloads, authority staging, and publication overlap."""
+  if total_download_bytes < 0 or largest_route_artifact_bytes < 0:
+    raise BridgeUnavailableError("remote transaction byte bound is invalid")
+  return 2 * total_download_bytes + largest_route_artifact_bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +253,13 @@ def _create_private_scratch(
     parent_info = parent.lstat()
     if parent.is_symlink() or not stat.S_ISDIR(parent_info.st_mode):
       raise BridgeUnavailableError("private scratch parent is unsafe")
+    if any(
+      entry.name.startswith(PRIVATE_SCRATCH_QUARANTINE_PREFIX)
+      for entry in parent.iterdir()
+    ):
+      raise BridgeCorruptError(
+        "remote scratch quarantine requires operator recovery",
+      )
     filesystem = os.statvfs(parent)
     available = filesystem.f_bavail * filesystem.f_frsize
     if available < required_bytes + PRIVATE_SCRATCH_DISK_MARGIN_BYTES:
@@ -466,6 +488,7 @@ class RemoteRouteExclusion:
 class _PreparedOutcome:
   descriptor: PreparedRouteSpoolDescriptor | None
   certification_vector: _CertificationVectorDescriptor | None = None
+  artifact_summary: RouteEvidenceFileSummary | None = None
   rejection_reason: str | None = None
   rejection_message: str | None = None
   certification_identity_sha256: str | None = None
@@ -487,6 +510,159 @@ class _CertificationBinding:
 
   compatibility: dict[str, object]
   audit: dict[str, object]
+
+
+def _candidate_source_manifest(
+  route: RouteCandidate,
+) -> list[dict[str, object]]:
+  return [
+    {
+      "index": segment.index,
+      "sha256": segment.sha256,
+      "size_bytes": segment.size_bytes,
+    }
+    for segment in route.segments
+  ]
+
+
+def _bind_downloaded_artifact_to_vector(
+  *,
+  route: RouteCandidate,
+  descriptor: PreparedRouteSpoolDescriptor,
+  summary: RouteEvidenceFileSummary,
+  vector_descriptor: _CertificationVectorDescriptor,
+  vector: CertificationVector,
+) -> None:
+  """Cross-bind one streamed authority before learner ingestion.
+
+  The full evidence artifact and bounded ARM vector are independently
+  authenticated downloads.  Authentication alone does not prove that the
+  worker paired the two authorities, routes, or preparation domains correctly,
+  so bind every identity-bearing fact here before `_PreparedOutcome` exists.
+  """
+  source = summary.source_identity
+  manifest = _candidate_source_manifest(route)
+  source_pairs = tuple(
+    zip(
+      source.route_segment_sha256,
+      source.route_segment_size_bytes,
+      strict=True,
+    )
+  )
+  candidate_pairs = tuple(
+    (segment.sha256, segment.size_bytes)
+    for segment in route.segments
+  )
+  if (
+    descriptor.route_name != route.route_name
+    or source.route_id != route.route_name
+    or source_pairs != candidate_pairs
+    or vector.manifest.get("route_name") != route.route_name
+    or vector.manifest.get("source_manifest") != manifest
+    or vector.manifest.get("selection_identity_sha256")
+    != certification_vector_selection_identity(route)
+  ):
+    raise BridgeCorruptError(
+      "route artifact, vector, and selected source manifest disagree",
+    )
+  if (
+    descriptor.sha256 != summary.sha256
+    or descriptor.size_bytes != summary.st_size
+    or descriptor.frame_count != source.physical_record_count
+    or vector_descriptor.sha256 != vector.sha256
+    or vector_descriptor.size_bytes != len(vector.canonical_bytes)
+    or vector_descriptor.selection_identity_sha256
+    != vector.manifest.get("selection_identity_sha256")
+    or vector_descriptor.selected_controls_witnesses
+    != vector.manifest["bounds"]["selected_controls_witnesses"]
+    or vector_descriptor.selected_segment_count
+    != len(vector.manifest["segment_results"])
+  ):
+    raise BridgeCorruptError(
+      "route artifact or certification-vector descriptor disagrees",
+    )
+
+  provenance = source.preparation_provenance
+  try:
+    full_domain = {
+      "canonical_join_schema_version": provenance[
+        "canonical_join_schema_version"
+      ],
+      "extractor_schema_version": provenance["extractor_schema_version"],
+      "log_schema_blob": provenance["log_schema_blob"],
+      "opendbc_commit": provenance["opendbc_commit"],
+      "panda_commit": provenance["panda_commit"],
+      "physical_compatibility_sha256": provenance[
+        "physical_compatibility_sha256"
+      ],
+      "runtime_vehicle_bundle_sha256": source.runtime_identity,
+      "source_superproject_commit": provenance["superproject_commit"],
+    }
+    cache_payload = {
+      "canonical_join_schema_version": provenance[
+        "canonical_join_schema_version"
+      ],
+      "extractor_schema_version": provenance["extractor_schema_version"],
+      "log_schema_blob": provenance["log_schema_blob"],
+      "opendbc_commit": provenance["opendbc_commit"],
+      "route_segments": manifest,
+      "runtime_bundle_sha256": source.runtime_identity,
+      "superproject_commit": provenance["superproject_commit"],
+    }
+  except KeyError as exc:
+    raise BridgeCorruptError(
+      "route artifact lacks binding provenance",
+    ) from exc
+  segment_results = vector.manifest.get("segment_results")
+  route_seed = vector.manifest.get("route_provenance_seed")
+  if type(segment_results) is not list or not segment_results:
+    raise BridgeCorruptError("certification vector has no preparation domain")
+  if (
+    type(route_seed) is not dict
+    or route_seed.get("car_params_sha256")
+    != summary.manifest.get("car_params_sha256")
+    or route_seed.get("source_segment_index") != route.segments[0].index
+    or route_seed.get("source_segment_sha256") != route.segments[0].sha256
+  ):
+    raise BridgeCorruptError(
+      "route artifact and certification-vector CarParams seed disagree",
+    )
+  seed_results = [
+    result
+    for result in segment_results
+    if type(result) is dict
+    and type(result.get("segment")) is dict
+    and result["segment"].get("index") == route.segments[0].index
+  ]
+  if (
+    len(seed_results) != 1
+    or seed_results[0].get("segment_init_data_mono_ns")
+    != source.route_time_origin_mono_ns
+  ):
+    raise BridgeCorruptError(
+      "route artifact and certification-vector time origin disagree",
+    )
+  if any(
+    type(result) is not dict
+    or result.get("preparation_domain") != full_domain
+    for result in segment_results
+  ):
+    raise BridgeCorruptError(
+      "route artifact and certification-vector domains disagree",
+    )
+  expected_source_key = hashlib.sha256(
+    canonical_json_bytes(cache_payload),
+  ).hexdigest()
+  if (
+    source.preparation_cache_key != expected_source_key
+    or source.source_superproject_commit
+    != provenance["superproject_commit"]
+    or source.source_opendbc_commit != provenance["opendbc_commit"]
+    or source.source_panda_commit != provenance["panda_commit"]
+  ):
+    raise BridgeCorruptError(
+      "route artifact preparation source identity disagrees",
+    )
 
 
 def _candidate_from_inventory(
@@ -1959,11 +2135,21 @@ def _certify_preparation_domains(
     if descriptor is None:
       raise BridgeCorruptError("accepted remote outcome lacks a descriptor")
     verification_descriptor = outcomes[(2, route.route_name)].descriptor
+    artifact_summary = outcome.artifact_summary
+    verification_summary = outcomes[
+      (2, route.route_name)
+    ].artifact_summary
     if (
       verification_descriptor is None
+      or artifact_summary is None
+      or verification_summary is None
       or descriptor.sha256 != verification_descriptor.sha256
       or descriptor.size_bytes != verification_descriptor.size_bytes
       or descriptor.frame_count != verification_descriptor.frame_count
+      or artifact_summary.sha256 != verification_summary.sha256
+      or artifact_summary.source_key != verification_summary.source_key
+      or artifact_summary.source_identity.manifest_dict()
+      != verification_summary.source_identity.manifest_dict()
     ):
       raise BridgeCorruptError(
         "accepted preparation authorities disagree before certification",
@@ -2097,15 +2283,22 @@ def _certify_preparation_domains(
       continue
     check_abort(abort_requested)
 
-    def vector_progress(position: int, count: int) -> None:
+    def vector_progress(
+      position: int,
+      count: int,
+      *,
+      certified_count: int = certified_route_count,
+      selected_domain_index: int = domain_index,
+      selected_route_identity: str = route_display_identity,
+    ) -> None:
       if progress is not None:
         progress(
           len(certified_identities),
-          certified_route_count,
+          certified_count,
           len(grouped),
           len(plan.replay_candidates),
-          domain_index,
-          route_display_identity,
+          selected_domain_index,
+          selected_route_identity,
           position,
           count,
         )
@@ -2158,6 +2351,7 @@ def _certify_preparation_domains(
         certified[(authority, route_name)] = _PreparedOutcome(
           descriptor=outcome.descriptor,
           certification_vector=outcome.certification_vector,
+          artifact_summary=outcome.artifact_summary,
           rejection_reason=outcome.rejection_reason,
           rejection_message=outcome.rejection_message,
           certification_identity_sha256=identity,
@@ -2512,9 +2706,10 @@ class RemotePreparationSession:
       progress_monotonic_ns=engine.progress_monotonic_ns,
       abort_requested=engine.abort_requested,
       pending_route_identity=engine.pending_route_identity,
-      # Only the two causal A/A authorities run on ARM. Route preparation has
-      # already happened twice on the four-worker PC and is never shared.
-      replay_worker_count=2,
+      # The PC already prepared both causal A/A authorities with four workers.
+      # ARM consumes their complete streamed artifacts serially so application
+      # cannot recreate the device memory/CPU pressure this bridge removes.
+      replay_worker_count=1,
       route_discovery=lambda abort: self.plan.discovery,
       prepared_route_source=self._source,
       preparation_extractor_sha256=self.worker_extractor_sha256,
@@ -2768,10 +2963,25 @@ def _download_outcomes(
     )
     for authority, route in accepted
   )
+  largest_route_artifact_bytes = max(
+    (
+      int(outcomes[(authority, route.route_name)]["descriptor"]["size_bytes"])
+      for authority, route in accepted
+    ),
+    default=0,
+  )
+  # The downloads remain live while replay creates two authority staging
+  # copies, and publication creates one durable object before those staging
+  # files are removed. Reserve the pessimistic complete transaction footprint,
+  # not merely the bytes downloaded into this private directory.
+  required_transaction_bytes = _remote_transaction_disk_requirement(
+    total_bytes,
+    largest_route_artifact_bytes,
+  )
   owner = _create_private_scratch(
     scratch_parent,
     prefix=REMOTE_SCRATCH_PREFIX,
-    required_bytes=total_bytes,
+    required_bytes=required_transaction_bytes,
   )
   root = owner.path
   completed_artifacts = 0
@@ -2787,6 +2997,7 @@ def _download_outcomes(
           resolved[(authority, route.route_name)] = _PreparedOutcome(
             descriptor=None,
             certification_vector=None,
+            artifact_summary=None,
             rejection_reason=str(raw["reason"]),
             rejection_message=str(raw["message"]),
             certification_identity_sha256=None,
@@ -2844,6 +3055,12 @@ def _download_outcomes(
           size_bytes=int(remote["size_bytes"]),
           frame_count=int(remote["frame_count"]),
         )
+        try:
+          artifact_summary = inspect_route_evidence_file(final)
+        except RouteEvidenceError as exc:
+          raise BridgeCorruptError(
+            "downloaded route evidence is invalid",
+          ) from exc
         completed_artifacts += 1
         completed_bytes += int(remote["size_bytes"])
         if progress is not None:
@@ -2930,9 +3147,17 @@ def _download_outcomes(
             remote_vector["selection_identity_sha256"],
           ),
         )
+        _bind_downloaded_artifact_to_vector(
+          route=route,
+          descriptor=descriptor,
+          summary=artifact_summary,
+          vector_descriptor=vector_descriptor,
+          vector=vector,
+        )
         resolved[(authority, route.route_name)] = _PreparedOutcome(
           descriptor=descriptor,
           certification_vector=vector_descriptor,
+          artifact_summary=artifact_summary,
           rejection_reason=None,
           rejection_message=None,
           certification_identity_sha256=None,
@@ -2991,17 +3216,34 @@ def cleanup_stale_remote_scratch(parent: str | Path) -> int:
   except OSError as exc:
     raise BridgeUnavailableError("remote scratch root is unavailable") from exc
   removed = 0
+  quarantines = tuple(
+    entry
+    for entry in entries
+    if entry.name.startswith(PRIVATE_SCRATCH_QUARANTINE_PREFIX)
+  )
+  if quarantines:
+    raise BridgeCorruptError(
+      "remote scratch quarantine requires operator recovery",
+    )
   owned_prefixes = (
     REMOTE_SCRATCH_PREFIX,
     CERTIFICATION_SOURCE_SNAPSHOT_PREFIX,
   )
-  for entry in entries:
+  stale_entries = tuple(
+    entry
+    for entry in entries
+    if any(entry.name.startswith(prefix) for prefix in owned_prefixes)
+  )
+  if len(stale_entries) > 1:
+    raise BridgeCorruptError(
+      "multiple stale remote scratch roots require operator recovery",
+    )
+  for entry in stale_entries:
     prefix = next(
       (value for value in owned_prefixes if entry.name.startswith(value)),
       None,
     )
-    if prefix is None:
-      continue
+    assert prefix is not None
     owner = _private_scratch_from_path(entry, prefix=prefix)
     directory_fd = os.open(
       entry,
@@ -3018,6 +3260,7 @@ def cleanup_stale_remote_scratch(parent: str | Path) -> int:
         or PRIVATE_SCRATCH_MARKER not in names
       ):
         raise BridgeUnavailableError("stale private scratch is unsafe")
+      total_size = 0
       for name in names:
         child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if (
@@ -3026,6 +3269,11 @@ def cleanup_stale_remote_scratch(parent: str | Path) -> int:
           or stat.S_IMODE(child.st_mode) & 0o077
         ):
           raise BridgeUnavailableError("stale private scratch child is unsafe")
+        total_size += child.st_size
+        if total_size > PRIVATE_SCRATCH_MAX_QUARANTINE_BYTES:
+          raise BridgeUnavailableError(
+            "stale private scratch exceeds quarantine byte bound",
+          )
     finally:
       os.close(directory_fd)
     rebound = entry.lstat()
@@ -3061,7 +3309,10 @@ def prepare_remote_session(
 ) -> RemotePreparationSession:
   """Prepare a complete remote spool transaction or raise a stable error."""
   check_abort(abort_requested)
-  cleanup_stale_remote_scratch(scratch_parent)
+  if cleanup_stale_remote_scratch(scratch_parent):
+    raise BridgeCorruptError(
+      "stale remote scratch was quarantined; operator recovery is required",
+    )
   health = client.health()
   for key in (
     "source_commit",

@@ -6,6 +6,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest  # noqa: TID251
@@ -33,11 +34,13 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
   _PreparedOutcome,
   _CertificationVectorDescriptor,
   _RemoteProgressProjector,
+  _bind_downloaded_artifact_to_vector,
   _create_private_scratch,
   _cleanup_private_scratch,
   cleanup_stale_remote_scratch,
   _run_architecture_verification,
   _register_private_scratch_file,
+  _remote_transaction_disk_requirement,
   _snapshot_certification_route,
   _certify_preparation_domains as _certify_preparation_domains_impl,
   _exclude_unverified_remote_rejections,
@@ -49,6 +52,10 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
   CertificationVector,
+)
+from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
+  RouteEvidenceArtifact,
+  inspect_route_evidence_file,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeCorruptError,
@@ -1386,13 +1393,14 @@ def accepted_spool_outcomes(
       "physical_frames_retained": 1,
       "physical_frames_total": 1,
     },
-    "encoded_plane_sha256": {
-      key: "1" * 64 for key in (
+    "encoded_plane_sha256": dict.fromkeys(
+      (
         "controls_retained", "driving_events", "lateral_maneuver_plans",
         "live_delays", "live_torque_parameters", "models",
         "physical_frames_retained", "route_evidence_complete",
-      )
-    },
+      ),
+      "1" * 64,
+    ),
     "extractor_stream_sha256": provenance["selected_event_stream_sha256"],
     "first_retained_mono_ns": 1,
     "last_retained_mono_ns": 1,
@@ -1437,12 +1445,46 @@ def accepted_spool_outcomes(
   ).hexdigest()
   vector = CertificationVector.from_manifest(manifest)
   for authority in (1, 2):
-    evidence = route_evidence_for_frames(
+    base_evidence = route_evidence_for_frames(
       candidate.route_name,
       (),
       provenance,
       car_params_bytes=car_params_bytes,
       runtime_identity=runtime_identity,
+    )
+    source = replace(
+      base_evidence.source_identity,
+      route_segment_sha256=tuple(
+        segment.sha256 for segment in candidate.segments
+      ),
+      route_segment_size_bytes=tuple(
+        segment.size_bytes for segment in candidate.segments
+      ),
+      source_superproject_commit=str(provenance["superproject_commit"]),
+      source_opendbc_commit=str(provenance["opendbc_commit"]),
+      source_panda_commit=str(provenance["panda_commit"]),
+      preparation_cache_key=hashlib.sha256(canonical_json_bytes({
+        "canonical_join_schema_version": provenance[
+          "canonical_join_schema_version"
+        ],
+        "extractor_schema_version": provenance["extractor_schema_version"],
+        "log_schema_blob": provenance["log_schema_blob"],
+        "opendbc_commit": provenance["opendbc_commit"],
+        "route_segments": source_segments,
+        "runtime_bundle_sha256": runtime,
+        "superproject_commit": provenance["superproject_commit"],
+      })).hexdigest(),
+    )
+    evidence = RouteEvidenceArtifact(
+      source,
+      base_evidence.car_params_bytes,
+      base_evidence.physical_bytes,
+      base_evidence.model_publications,
+      base_evidence.control_witnesses,
+      base_evidence.live_torque_parameters,
+      base_evidence.live_delays,
+      base_evidence.lateral_maneuver_plans,
+      base_evidence.event_locators,
     )
     descriptor = write_prepared_route_spool(
       scratch,
@@ -1466,6 +1508,9 @@ def accepted_spool_outcomes(
         selected_controls_witnesses=1,
         selected_segment_count=1,
         selection_identity_sha256=selection_identity,
+      ),
+      artifact_summary=inspect_route_evidence_file(
+        scratch / descriptor.filename,
       ),
       rejection_reason=None,
       rejection_message=None,
@@ -1493,6 +1538,149 @@ def empty_prepared_route(
       runtime_identity=runtime_identity,
     ),
   )
+
+
+def test_streamed_artifact_vector_binding_rejects_authority_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  changed = route(tmp_path, candidate.route_name, ("3" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(first_root, candidate, provenance)[
+    (1, candidate.route_name)
+  ]
+  second = accepted_spool_outcomes(second_root, changed, provenance)[
+    (1, changed.route_name)
+  ]
+  assert first.descriptor is not None
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="source manifest"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_domain_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(
+    first_root,
+    candidate,
+    provenance,
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  second = accepted_spool_outcomes(
+    second_root,
+    candidate,
+    provenance,
+    runtime_identity="b" * 64,
+  )[(1, candidate.route_name)]
+  assert first.descriptor is not None
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="domains disagree"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_noncanary_route_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  first_route = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  second_route = route(tmp_path, "00000003--3333333333", ("2" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(first_root, first_route, provenance)[
+    (1, first_route.route_name)
+  ]
+  second = accepted_spool_outcomes(second_root, second_route, provenance)[
+    (1, second_route.route_name)
+  ]
+  assert first.descriptor is not None
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="selected source manifest"):
+    _bind_downloaded_artifact_to_vector(
+      route=first_route,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_exact_carparams_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(
+    first_root,
+    candidate,
+    provenance,
+    car_params_bytes=b"first exact CarParams",
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  second = accepted_spool_outcomes(
+    second_root,
+    candidate,
+    provenance,
+    car_params_bytes=b"second exact CarParams",
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="CarParams seed"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
 
 
 def test_accepted_domain_requires_one_byte_exact_arm_certification(
@@ -1823,7 +2011,7 @@ def test_nonlocal_accepted_domain_falls_back(tmp_path: Path) -> None:
     )
 
 
-def test_rejected_route_requires_identical_local_arm_rejection(
+def test_rejected_route_fails_closed_without_full_arm_replay(
   tmp_path: Path,
 ) -> None:
   scratch = tmp_path / ".blatv2-remote-prepare-reject"
@@ -1890,7 +2078,7 @@ def test_rejected_route_requires_identical_local_arm_rejection(
     "different_rejection",
   ],
 )
-def test_rejected_route_arm_disagreement_falls_back(
+def test_rejected_route_arm_result_is_never_consulted(
   tmp_path: Path,
   arm_result_kind: str,
 ) -> None:
@@ -2111,7 +2299,7 @@ def test_stale_private_scratch_cleanup_is_marked_flat_and_bounded(
   sentinel = unmarked / "sentinel"
   sentinel.write_bytes(b"preserve")
   sentinel.chmod(0o600)
-  with pytest.raises(BridgeUnavailableError, match="unavailable|missing"):
+  with pytest.raises(BridgeCorruptError, match="operator recovery"):
     cleanup_stale_remote_scratch(tmp_path)
   assert sentinel.read_bytes() == b"preserve"
 
@@ -2173,6 +2361,29 @@ def test_private_scratch_disk_preflight_fails_before_creating_root(
       tmp_path,
       prefix=".blatv2-remote-prepare-",
       required_bytes=1,
+    )
+  assert not list(tmp_path.glob(".blatv2-remote-prepare-*"))
+
+
+def test_remote_transaction_preflight_includes_staging_and_publication(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  requirement = _remote_transaction_disk_requirement(1_000, 400)
+  assert requirement == 2_400
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.PRIVATE_SCRATCH_DISK_MARGIN_BYTES",
+    0,
+  )
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.os.statvfs",
+    lambda _path: SimpleNamespace(f_bavail=2_000, f_frsize=1),
+  )
+  with pytest.raises(BridgeUnavailableError, match="filesystem is full"):
+    _create_private_scratch(
+      tmp_path,
+      prefix=".blatv2-remote-prepare-",
+      required_bytes=requirement,
     )
   assert not list(tmp_path.glob(".blatv2-remote-prepare-*"))
 

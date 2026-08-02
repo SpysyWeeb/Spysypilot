@@ -1342,6 +1342,68 @@ def test_route_evidence_is_not_durable_until_both_authorities_match(
   assert not (tmp_path / ".route-evidence-staging-v2").exists()
 
 
+def test_stale_route_evidence_staging_is_bounded_and_quarantined(
+  tmp_path: Path,
+) -> None:
+  route_name = "00000010--0000000010"
+  evidence = route_evidence_for_frames(
+    route_name,
+    (route_frame(
+      CarInterface.get_non_essential_params(CAR.HYUNDAI_PALISADE),
+      1_000_000_000,
+      first_in_route=True,
+    ),),
+    {"test": "crash-recovery-staging"},
+  )
+  learning_backfill._stage_route_evidence(
+    root=tmp_path,
+    authority_index=1,
+    artifact=evidence,
+  )
+  staging = tmp_path / learning_backfill.ROUTE_EVIDENCE_STAGING_DIRECTORY
+  staged_file = next((staging / "authority-1").iterdir())
+  staged_bytes = staged_file.read_bytes()
+  second = staging / "authority-2"
+  second.mkdir(mode=0o700)
+  partial = second / f".{evidence.sha256}.route-evidence.deadbeef.partial"
+  partial.write_bytes(b"authenticated-owner-incomplete-copy")
+  partial.chmod(0o600)
+
+  with pytest.raises(BackfillError) as raised:
+    learning_backfill.cleanup_stale_prepared_route_spools(tmp_path)
+
+  assert raised.value.diagnostic == "backfill_spool_invalid"
+  quarantine = (
+    tmp_path / learning_backfill.ROUTE_EVIDENCE_STAGING_QUARANTINE
+  )
+  assert not staging.exists()
+  assert (
+    quarantine / "authority-1" / staged_file.name
+  ).read_bytes() == staged_bytes
+  assert (
+    quarantine / "authority-2" / partial.name
+  ).read_bytes() == b"authenticated-owner-incomplete-copy"
+  with pytest.raises(BackfillError, match="operator recovery"):
+    learning_backfill.cleanup_stale_prepared_route_spools(tmp_path)
+
+
+def test_stale_route_evidence_staging_unknown_child_fails_without_move(
+  tmp_path: Path,
+) -> None:
+  staging = tmp_path / learning_backfill.ROUTE_EVIDENCE_STAGING_DIRECTORY
+  authority = staging / "authority-1"
+  authority.mkdir(mode=0o700, parents=True)
+  (authority / "foreign-file").write_bytes(b"do not delete")
+
+  with pytest.raises(BackfillError, match="unknown child"):
+    learning_backfill.cleanup_stale_prepared_route_spools(tmp_path)
+
+  assert (authority / "foreign-file").read_bytes() == b"do not delete"
+  assert not (
+    tmp_path / learning_backfill.ROUTE_EVIDENCE_STAGING_QUARANTINE
+  ).exists()
+
+
 def test_stale_prepared_route_scratch_is_scavenged_selectively(
   tmp_path: Path,
 ) -> None:

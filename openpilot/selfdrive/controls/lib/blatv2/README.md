@@ -57,8 +57,10 @@ prepared-data handoff, or a stable local-fallback reason. A PC-only route that
 both remote authorities reject cannot be certified without local bytes, so it
 is excluded before effective discovery rather than recorded as a rejection.
 It contributes no learner evidence, ledger entry, watermark movement,
-readiness count, or behavior-cohort vote. Locally retained rejections still
-require exact ARM reproduction. After certified artifacts are handed off, the
+readiness count, or behavior-cohort vote. Locally retained PC rejections fail
+closed as `architecture_verification_rejection_unprovable`; the device never
+recreates the removed full-route ARM replay merely to reproduce a reason and
+message. After certified artifacts are handed off, the
 ordinary local progress projection again owns route/application detail.
 Accepted-route certificates are shared only across equal extractor/join
 schemas, recorded log schema, complete runtime-vehicle bundle identities, and
@@ -75,8 +77,12 @@ segments, 96 MiB compressed, and 30,000 controls witnesses. Its canonical
 result is capped at 64 KiB. A killable child enforces a 120 s deadline, 450 MiB
 child RSS, and 600 MiB combined RSS. The earlier full-route ARM reproduction
 was removed after its overlapping decoded populations exhausted device memory.
-That incident is why complete PC artifacts are now authenticated and applied
-through bounded streams, while unavailable-worker local fallback uses one
+One locally available canary proves each equal preparation/runtime domain on
+ARM; it is an implementation/domain proof, not a claim that every route was
+replayed on ARM. Per-route causality comes from the two independent PC
+preparations and byte-exact route artifacts. That incident is why complete PC
+artifacts are now authenticated and applied through bounded streams, while
+unavailable-worker local fallback and remote artifact application use one
 replay worker rather than recreating the four-PC-worker memory shape.
 
 ## Can previous routes be used?

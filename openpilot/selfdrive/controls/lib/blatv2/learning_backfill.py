@@ -62,6 +62,7 @@ from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import (
   MeasuredLearningFrame,
 )
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
+  MAX_ARTIFACT_BYTES,
   ControlsWitness,
   DrivingEventLocator,
   LateralManeuverPlanPublication,
@@ -102,6 +103,16 @@ SUPPORTED_BACKFILL_REPLAY_WORKER_COUNTS = (1, 2, 4)
 BACKFILL_SPOOL_DIRECTORY_PREFIX = ".blatv2-backfill-prepare-"
 _BACKFILL_SPOOL_DIRECTORY_RE = re.compile(
   rf"{re.escape(BACKFILL_SPOOL_DIRECTORY_PREFIX)}[12]-[a-z0-9_]{{8}}\Z",
+)
+ROUTE_EVIDENCE_STAGING_DIRECTORY = ".route-evidence-staging-v2"
+ROUTE_EVIDENCE_STAGING_QUARANTINE = ".route-evidence-staging-quarantine-v2"
+ROUTE_EVIDENCE_STAGING_MAX_FILES = 4096
+ROUTE_EVIDENCE_STAGING_MAX_BYTES = 4 * 1024 * 1024 * 1024
+_ROUTE_EVIDENCE_STAGED_FILE_RE = re.compile(
+  r"(?P<sha>[0-9a-f]{64})\.route-evidence\Z",
+)
+_ROUTE_EVIDENCE_PARTIAL_FILE_RE = re.compile(
+  r"\.[0-9a-f]{64}\.route-evidence\.[A-Za-z0-9_-]+\.partial\Z",
 )
 REPLAY_WORKER_STARTUP_TIMEOUT_S = 1.0
 REPLAY_WORKER_COOPERATIVE_STOP_S = 0.75
@@ -3562,8 +3573,189 @@ class ExclusiveBackfillWriter(AbstractContextManager["ExclusiveBackfillWriter"])
     return int(self._stream.fileno())
 
 
+def quarantine_stale_route_evidence_staging(artifact_root: Path) -> None:
+  """Fail closed after atomically quarantining exact owned A/A staging.
+
+  This runs under ``ExclusiveBackfillWriter``.  It intentionally does not use
+  recursive deletion: every permitted authority directory and direct child is
+  bounded and inode-checked first.  One fixed quarantine name prevents
+  repeated crashes from silently consuming another route-set worth of disk.
+  """
+  staging = artifact_root / ROUTE_EVIDENCE_STAGING_DIRECTORY
+  quarantine = artifact_root / ROUTE_EVIDENCE_STAGING_QUARANTINE
+  if quarantine.exists() or quarantine.is_symlink():
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "route-evidence staging quarantine requires operator recovery",
+    )
+  try:
+    staging_info = staging.lstat()
+  except FileNotFoundError:
+    return
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "stale route-evidence staging cannot be inspected",
+    ) from exc
+  if (
+    staging.is_symlink()
+    or not stat.S_ISDIR(staging_info.st_mode)
+    or staging_info.st_uid != os.geteuid()
+    or stat.S_IMODE(staging_info.st_mode) & 0o022
+  ):
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "stale route-evidence staging root is unsafe",
+    )
+  try:
+    authorities = tuple(staging.iterdir())
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "stale route-evidence staging inventory is unavailable",
+    ) from exc
+  if (
+    not authorities
+    or len(authorities) > 2
+    or {entry.name for entry in authorities}
+    - {"authority-1", "authority-2"}
+  ):
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "stale route-evidence authority population is unsafe",
+    )
+
+  file_count = 0
+  total_bytes = 0
+  for authority in authorities:
+    try:
+      authority_info = authority.lstat()
+    except OSError as exc:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "stale route-evidence authority cannot be inspected",
+      ) from exc
+    if (
+      authority.is_symlink()
+      or not stat.S_ISDIR(authority_info.st_mode)
+      or authority_info.st_uid != os.geteuid()
+      or stat.S_IMODE(authority_info.st_mode) & 0o077
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "stale route-evidence authority directory is unsafe",
+      )
+    try:
+      children = tuple(authority.iterdir())
+    except OSError as exc:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "stale route-evidence authority inventory is unavailable",
+      ) from exc
+    for child in children:
+      completed = _ROUTE_EVIDENCE_STAGED_FILE_RE.fullmatch(child.name)
+      partial = _ROUTE_EVIDENCE_PARTIAL_FILE_RE.fullmatch(child.name)
+      if completed is None and partial is None:
+        raise BackfillError(
+          "backfill_spool_invalid",
+          "stale route-evidence staging contains an unknown child",
+        )
+      try:
+        before = child.lstat()
+        descriptor = os.open(
+          child,
+          os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+      except OSError as exc:
+        raise BackfillError(
+          "backfill_spool_invalid",
+          "stale route-evidence child cannot be opened safely",
+        ) from exc
+      try:
+        opened = os.fstat(descriptor)
+        if (
+          not stat.S_ISREG(opened.st_mode)
+          or opened.st_uid != os.geteuid()
+          or stat.S_IMODE(opened.st_mode) & 0o077
+          or opened.st_dev != before.st_dev
+          or opened.st_ino != before.st_ino
+          or opened.st_size != before.st_size
+          or opened.st_size > MAX_ARTIFACT_BYTES
+        ):
+          raise BackfillError(
+            "backfill_spool_invalid",
+            "stale route-evidence child identity is unsafe",
+          )
+        digest = hashlib.sha256()
+        while block := os.read(descriptor, 1024 * 1024):
+          digest.update(block)
+        after = os.fstat(descriptor)
+        if (
+          after.st_dev != opened.st_dev
+          or after.st_ino != opened.st_ino
+          or after.st_size != opened.st_size
+          or after.st_mtime_ns != opened.st_mtime_ns
+          or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+          raise BackfillError(
+            "backfill_spool_invalid",
+            "stale route-evidence child changed during inspection",
+          )
+        if completed is not None and digest.hexdigest() != completed["sha"]:
+          raise BackfillError(
+            "backfill_spool_invalid",
+            "stale route-evidence object hash disagrees with its name",
+          )
+      finally:
+        os.close(descriptor)
+      file_count += 1
+      total_bytes += before.st_size
+      if (
+        file_count > ROUTE_EVIDENCE_STAGING_MAX_FILES
+        or total_bytes > ROUTE_EVIDENCE_STAGING_MAX_BYTES
+      ):
+        raise BackfillError(
+          "backfill_spool_invalid",
+          "stale route-evidence staging exceeds recovery bounds",
+        )
+
+  try:
+    rebound = staging.lstat()
+    if (
+      rebound.st_dev != staging_info.st_dev
+      or rebound.st_ino != staging_info.st_ino
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "stale route-evidence staging identity changed",
+      )
+    os.rename(staging, quarantine)
+    quarantined = quarantine.lstat()
+    if (
+      quarantined.st_dev != staging_info.st_dev
+      or quarantined.st_ino != staging_info.st_ino
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "route-evidence quarantine identity changed",
+      )
+    _fsync_directory(artifact_root)
+  except BackfillError:
+    raise
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "stale route-evidence staging quarantine failed",
+    ) from exc
+  raise BackfillError(
+    "backfill_spool_invalid",
+    "stale route-evidence staging was quarantined; operator recovery is required",
+  )
+
+
 def cleanup_stale_prepared_route_spools(artifact_root: Path) -> None:
-  """Remove only abandoned four-lane scratch dirs under the writer lock."""
+  """Recover exact owned staging and remove four-lane preparation scratch."""
+  quarantine_stale_route_evidence_staging(artifact_root)
   removed = False
   try:
     entries = tuple(artifact_root.iterdir())

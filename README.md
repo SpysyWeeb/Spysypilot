@@ -285,8 +285,11 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   authorities still have to match byte-for-byte before the device extends the
   ledger, finalizes, or atomically publishes `CURRENT`;
 - before any accepted x86-prepared domain can reach that learner, the device
-  snapshots and replays a deterministic whole-segment vector with its ARM
-  extractor and requires its exact result to match both PC authorities. The
+  snapshots and replays one deterministic whole-segment canary vector for that
+  implementation/runtime domain with its ARM extractor and requires its exact
+  result to match both PC authorities. This is a domain-level numerical proof,
+  not a per-route ARM replay. Both PC authorities still prepare and compare
+  every complete route independently. The
   vector always includes segment 0 for authenticated CarParams bootstrap, then
   chooses hash-stable interior/end coverage with a deterministic fallback. It
   is capped at three complete segments, 96 MiB of compressed source, 30,000
@@ -295,9 +298,12 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   duplicating hundreds of MiB of decoded route state;
 - certification runs in a killable child with a 120 s deadline, 450 MiB child
   RSS and 600 MiB combined parent/child RSS ceilings. Source and artifact
-  scratch use private `0700` directories, exact inode identities, bounded copy
-  buffers, and a disk-space preflight. Abandoned scratch is quarantined rather
-  than recursively deleted. A timeout, resource excess, malformed vector, or
+  scratch use private directories, exact inode identities, bounded copy
+  buffers, and a full-transaction disk-space preflight covering downloads,
+  authority staging, and publication overlap. Abandoned scratch is quarantined
+  rather than recursively deleted, and one existing quarantine blocks another
+  transaction so repeated crashes cannot silently consume the disk. A timeout,
+  resource excess, malformed vector, or
   certificate mismatch is a stable fail-closed result and never falls back to
   a full local replay of that remote outcome;
 - the private atomic HMAC-bound certificate is scoped to both extractor
@@ -309,11 +315,13 @@ the `data/routes/` subdirectory. The comma remains authoritative:
   CarParams bytes do not fragment one physical numerical domain. An otherwise
   identical worker-service restart reuses the certificate because its
   authenticated session identity is transport state, not a numerical input;
-  locally retained rejected routes likewise require the same ARM reason and
-  message. A rejection for an archive-only route cannot be reproduced on ARM,
-  so it is excluded from the effective discovery set and from both authority
-  outputs. It creates no ledger row, watermark movement, learner count, or
-  behavior-cohort vote; it is reported only as an unverified exclusion;
+  a rejected PC outcome has no bounded numerical result that ARM can compare.
+  The device therefore never performs a hidden full-route ARM rejection replay:
+  a locally retained rejection fails closed as
+  `architecture_verification_rejection_unprovable`; an archive-only rejection
+  is excluded from the effective discovery set and from both authority outputs.
+  It creates no ledger row, watermark movement, learner count, or behavior-
+  cohort vote and is reported only as an unverified exclusion;
 - remote progress is restamped by the device onto its monotonic clock. The
   separate display-only `BLaTv2OffdeviceProgress` projection distinguishes PC
   processing, artifact download, ARM certification, prepared-data handoff,
