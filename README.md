@@ -6,6 +6,8 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see 
 
 **In progress.** The BLaTv2 dashboard is display-only. It does not activate,
 approve, train, fit, reset, or otherwise influence a lateral controller.
+Learning-status schema v4 compatibility is in progress with the learner's
+durable first-cause sample accounting.
 
 ## What it does
 
@@ -47,7 +49,9 @@ The two BLaTv2 pages share one rate-limited reader. It polls no faster than
 once every two seconds and strictly decodes versioned JSON Params caches:
 
 - `BLaTv2LearningStatus` is an informational projection of persisted learner
-  evidence and qualification reports.
+  evidence and qualification reports. Schema v4 also carries strict additive
+  totals for accepted frames and the learner's finite rejected-frame causes;
+  the dashboard retains these values without changing its existing layout.
 - `BLaTv2LearningOperationStatus` is a separate, display-only projection of
   what the learner is doing now. It reports preparation, live collection,
   finalization, retry, deterministic historical-route backfill, completion,
@@ -76,13 +80,13 @@ build republishes them. The reader cross-checks the common vehicle identity and
 strictly validates each runtime hash within its own schema. Missing, malformed,
 incompatible, or wrong-vehicle data is shown as unavailable and never guessed.
 
-Learning schema v3 uses the observable-calibration runtime identity, behavior
+Learning schema v4 uses the observable-calibration runtime identity, behavior
 status uses the full runtime-vehicle replay identity, and lifecycle status uses
 the independently gated live-controller artifact identity. The UI strictly
 validates every hash and their common vehicle identity, but does not equate
 these deliberately separate identity namespaces.
 
-Schema v3 keeps three decisions independent. A node may be **Learned** or
+Schema v4 keeps three decisions independent. A node may be **Learned** or
 **Seed retained (calibration already good)**; either is a successful node
 evaluation. Neighboring-node interpolation is then evaluated separately.
 Finally, candidate-artifact availability says only whether learning produced
@@ -102,9 +106,9 @@ The UI never parses rlogs, evidence, manifests, or profiles. It never trains,
 fits, stages, approves, resets, or writes learning state. A full time bar means
 only that the clean-support minimum is met; moving-rack, breakaway, authority,
 held-out validation, steering variety, and a valid observable calibration
-remain separately visible. Likewise, `all_nodes_qualified` means every node
-has a successful outcome and every interpolation interval qualifies, not that
-new calibration was required or that it is steering.
+remain separately visible. `all_nodes_qualified` covers the node outcomes;
+`all_intervals_qualified` independently covers interpolation between them.
+Neither means new calibration was required or that it is steering.
 Only `BLaTv2LifecycleStatus` may label a controller provisional or approved.
 Behavior qualification cannot advance the activation rail and the dashboard
 never opens route logs, evidence, profiles, or behavior artifacts to infer a
