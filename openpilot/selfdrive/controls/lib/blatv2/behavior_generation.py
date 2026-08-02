@@ -22,7 +22,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 import tempfile
 from typing import Any
@@ -47,6 +46,11 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_segmentation import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
   BehaviorLearningTransactionResult,
+)
+from openpilot.selfdrive.controls.lib.blatv2.owned_scratch import (
+  OwnedScratchError,
+  capture_owned_directory,
+  remove_owned_allowlisted_tree,
 )
 
 
@@ -599,6 +603,24 @@ def publish_behavior_generation(
     dir=generations,
     prefix=".staging-",
   ))
+  staging_identity = capture_owned_directory(staging)
+
+  def cleanup_staging(*, require_complete: bool) -> None:
+    assert staging is not None
+    try:
+      remove_owned_allowlisted_tree(
+        staging,
+        staging_identity,
+        artifact_files,
+        maximum_file_bytes=MAX_BEHAVIOR_GENERATION_FILE_BYTES,
+        maximum_total_bytes=sum(map(len, artifact_files.values())),
+        require_complete=require_complete,
+      )
+    except OwnedScratchError as cleanup_exc:
+      raise BehaviorGenerationError(
+        "behavior generation staging cleanup failed closed",
+      ) from cleanup_exc
+
   try:
     assert staging is not None
     for name, encoded in sorted(artifact_files.items()):
@@ -612,7 +634,7 @@ def publish_behavior_generation(
           raise BehaviorGenerationError(
             "behavior generation identity collision is not byte-identical",
           )
-        shutil.rmtree(staging)
+        cleanup_staging(require_complete=True)
         staging = None
       else:
         os.rename(staging, generation)
@@ -624,7 +646,7 @@ def publish_behavior_generation(
         raise BehaviorGenerationError(
           "behavior generation identity collision is not byte-identical",
         ) from exc
-      shutil.rmtree(staging)
+      cleanup_staging(require_complete=True)
       staging = None
     _fsync_directory(generations)
     pointer = _canonical_bytes({
@@ -639,8 +661,8 @@ def publish_behavior_generation(
     )
     _fsync_directory(root)
   except BaseException as exc:
-    if staging is not None and staging.exists():
-      shutil.rmtree(staging)
+    if staging is not None and os.path.lexists(staging):
+      cleanup_staging(require_complete=False)
     if isinstance(exc, BehaviorGenerationError):
       raise
     raise BehaviorGenerationError("immutable behavior publication failed") from exc

@@ -1404,7 +1404,7 @@ def test_stale_route_evidence_staging_unknown_child_fails_without_move(
   ).exists()
 
 
-def test_stale_prepared_route_scratch_is_scavenged_selectively(
+def test_stale_prepared_route_scratch_is_quarantined_selectively(
   tmp_path: Path,
 ) -> None:
   artifact_root = tmp_path / "artifact"
@@ -1413,16 +1413,86 @@ def test_stale_prepared_route_scratch_is_scavenged_selectively(
     f"{learning_backfill.BACKFILL_SPOOL_DIRECTORY_PREFIX}1-deadbeef"
   )
   stale.mkdir()
-  (stale / "abandoned.blatspool").write_bytes(b"partial")
+  stale.chmod(0o700)
   unrelated = artifact_root / ".another-component-scratch"
   unrelated.mkdir()
   (unrelated / "keep").write_bytes(b"owned elsewhere")
 
-  learning_backfill.cleanup_stale_prepared_route_spools(artifact_root)
+  with pytest.raises(BackfillError, match="operator recovery"):
+    learning_backfill.cleanup_stale_prepared_route_spools(artifact_root)
 
   assert not stale.exists()
+  quarantine = (
+    artifact_root / learning_backfill.PREPARED_ROUTE_SCRATCH_QUARANTINE
+  )
+  assert quarantine.is_dir()
   assert unrelated.is_dir()
   assert (unrelated / "keep").read_bytes() == b"owned elsewhere"
+  with pytest.raises(BackfillError, match="operator recovery"):
+    learning_backfill.cleanup_stale_prepared_route_spools(artifact_root)
+
+
+def test_stale_prepared_route_unknown_child_is_never_moved_or_deleted(
+  tmp_path: Path,
+) -> None:
+  artifact_root = tmp_path / "artifact"
+  artifact_root.mkdir()
+  stale = artifact_root / (
+    f"{learning_backfill.BACKFILL_SPOOL_DIRECTORY_PREFIX}1-deadbeef"
+  )
+  foreign = stale / "foreign"
+  foreign.mkdir(parents=True, mode=0o700)
+  stale.chmod(0o700)
+  sentinel = foreign / "must-survive"
+  sentinel.write_bytes(b"not owned by the learner")
+
+  with pytest.raises(BackfillError, match="unknown child"):
+    learning_backfill.cleanup_stale_prepared_route_spools(artifact_root)
+
+  assert sentinel.read_bytes() == b"not owned by the learner"
+  assert stale.is_dir()
+  assert not (
+    artifact_root / learning_backfill.PREPARED_ROUTE_SCRATCH_QUARANTINE
+  ).exists()
+
+
+def test_stale_prepared_route_path_swap_preserves_replacement_sentinel(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  artifact_root = tmp_path / "artifact"
+  artifact_root.mkdir()
+  stale = artifact_root / (
+    f"{learning_backfill.BACKFILL_SPOOL_DIRECTORY_PREFIX}1-deadbeef"
+  )
+  stale.mkdir(mode=0o700)
+  displaced = artifact_root / "displaced-owned-scratch"
+  real_inventory = learning_backfill._bounded_directory_names
+  swapped = False
+
+  def swap_after_inventory(target, maximum, **kwargs):
+    nonlocal swapped
+    names = real_inventory(target, maximum, **kwargs)
+    if not swapped and kwargs["purpose"] == "prepared-route scratch":
+      swapped = True
+      stale.rename(displaced)
+      stale.mkdir(mode=0o700)
+      (stale / "must-survive").write_bytes(b"replacement")
+    return names
+
+  monkeypatch.setattr(
+    learning_backfill,
+    "_bounded_directory_names",
+    swap_after_inventory,
+  )
+  with pytest.raises(BackfillError, match="path changed"):
+    learning_backfill.cleanup_stale_prepared_route_spools(artifact_root)
+
+  assert (stale / "must-survive").read_bytes() == b"replacement"
+  assert displaced.is_dir()
+  assert not (
+    artifact_root / learning_backfill.PREPARED_ROUTE_SCRATCH_QUARANTINE
+  ).exists()
 
 
 @pytest.mark.parametrize("unsafe_kind", ("file", "symlink"))
@@ -1448,6 +1518,65 @@ def test_stale_prepared_route_scratch_unsafe_type_fails_closed(
   assert raised.value.diagnostic == "backfill_spool_invalid"
   assert os.path.lexists(unsafe)
   assert target.is_dir()
+
+
+def make_empty_prefetch_lane(
+  artifact_root: Path,
+) -> learning_backfill._PrefetchingRoutePreparer:
+  return learning_backfill._PrefetchingRoutePreparer(
+    authority_index=1,
+    routes=(),
+    local_prepare=lambda _route: None,
+    helper_prepare=lambda _route, _abort: None,
+    scratch_parent=artifact_root,
+    abort_requested=lambda: False,
+  )
+
+
+def test_live_prepared_route_close_removes_only_exact_empty_lane(
+  tmp_path: Path,
+) -> None:
+  lane = make_empty_prefetch_lane(tmp_path)
+  scratch = lane._ensure_scratch_directory()
+
+  lane.close()
+
+  assert not scratch.exists()
+
+
+def test_live_prepared_route_close_preserves_unknown_child(
+  tmp_path: Path,
+) -> None:
+  lane = make_empty_prefetch_lane(tmp_path)
+  scratch = lane._ensure_scratch_directory()
+  sentinel = scratch / "foreign-sentinel"
+  sentinel.write_bytes(b"never recursively delete")
+
+  with pytest.raises(BackfillError, match="unknown child"):
+    lane.close()
+
+  assert sentinel.read_bytes() == b"never recursively delete"
+  assert not (
+    tmp_path / learning_backfill.PREPARED_ROUTE_SCRATCH_QUARANTINE
+  ).exists()
+
+
+def test_live_prepared_route_close_path_swap_preserves_sentinel(
+  tmp_path: Path,
+) -> None:
+  lane = make_empty_prefetch_lane(tmp_path)
+  scratch = lane._ensure_scratch_directory()
+  displaced = tmp_path / "displaced-live-scratch"
+  scratch.rename(displaced)
+  scratch.mkdir(mode=0o700)
+  sentinel = scratch / "must-survive"
+  sentinel.write_bytes(b"replacement")
+
+  with pytest.raises(BackfillError, match="inode changed"):
+    lane.close()
+
+  assert sentinel.read_bytes() == b"replacement"
+  assert displaced.is_dir()
 
 
 def test_four_worker_helper_failure_reaps_every_child_and_publishes_nothing(
