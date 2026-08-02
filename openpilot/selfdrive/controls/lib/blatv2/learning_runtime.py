@@ -34,6 +34,9 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationLearningFinalization,
   CalibrationLearningLifecycleState,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CalibrationSampleDisposition,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
   ActuatorBoundary,
   _attest_authority_sample,
@@ -63,7 +66,7 @@ CASUAL_DRIVING_CANDIDATE_PROVENANCE = "measured casual-driving evidence"
 # physical runtime. A policy change must start from an empty ledger and replay
 # retained full rlogs; it must never reinterpret or mix a predecessor's
 # CURRENT generation in place.
-FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v6"
+FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v7"
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
   "STEER_DELTA_UP",
@@ -151,7 +154,7 @@ class LearningArtifactPaths:
 
   @property
   def selected_profiles(self) -> Path:
-    """Hash-addressed physical profile selected by schema-8 qualification."""
+    """Hash-addressed physical profile selected by current qualification."""
     return self._active_root() / "selected_profiles"
 
   @property
@@ -732,8 +735,10 @@ class PersistentLearningRuntime:
     self,
     route_identity_sha256: str,
     route_content_sha256: str | None = None,
+    *,
+    route_counter: int,
   ) -> None:
-    """Begin one immutable route identity; never synthesize from a counter."""
+    """Begin one immutable route identity under its canonical counter."""
     self.measurement_builder.reset()
     self.envelope_constraint.reset()
     self.torque_response_aligner.reset()
@@ -742,6 +747,7 @@ class PersistentLearningRuntime:
     self.coordinator.transition_onroad(
       route_identity_sha256,
       route_content_sha256,
+      route_counter=route_counter,
     )
 
   def transition_offroad_and_persist(
@@ -875,32 +881,54 @@ class PersistentLearningRuntime:
       )
     )
     standstill = bool(frame.standstill)
-    below_steer_speed = abs(frame.speed_mps) <= max(
+    safe_speed_mps = (
+      float(frame.speed_mps)
+      if math.isfinite(frame.speed_mps)
+      else 0.0
+    )
+    below_steer_speed = abs(safe_speed_mps) <= max(
       float(self.car_params.minSteerSpeed),
       0.3,
+    )
+    vehicle_input_valid = (
+      frame.can_valid
+      and not frame.can_timeout
+      and not frame.steer_fault_temporary
+      and not frame.steer_fault_permanent
+    )
+    speed_eligible = (
+      not (standstill or below_steer_speed)
+      or bool(self.car_params.steerAtStandstill)
+    )
+    evidence_speed_ineligible = (
+      standstill
+      or (
+        below_steer_speed
+        and not bool(self.car_params.steerAtStandstill)
+      )
     )
     lateral_active = (
       numeric_valid
       and frame.lateral_active
-      and frame.can_valid
-      and not frame.can_timeout
-      and not frame.steer_fault_temporary
-      and not frame.steer_fault_permanent
-      and (
-        not (standstill or below_steer_speed)
-        or bool(self.car_params.steerAtStandstill)
-      )
+      and vehicle_input_valid
+      and speed_eligible
     )
     live_mapping = self._live_mapping(frame)
     torque_tuning = self.car_params.lateralTuning.torque
+    driver_exceeds_allowance = (
+      numeric_valid
+      and lateral_active
+      and self.last_live_mapping_valid
+      and self.envelope_constraint.driver_exceeds_allowance(
+        frame.steering_torque,
+      )
+    )
     response_inputs_valid = (
       numeric_valid
       and lateral_active
       and self.last_live_mapping_valid
       and not frame.steering_pressed
-      and not self.envelope_constraint.driver_exceeds_allowance(
-        frame.steering_torque,
-      )
+      and not driver_exceeds_allowance
     )
     if not response_inputs_valid:
       self.envelope_constraint.reset()
@@ -955,7 +983,7 @@ class PersistentLearningRuntime:
 
     seed_parameters = (
       self.runtime_bundle.calibration_seed_profile.parameters_at(
-        frame.speed_mps,
+        safe_speed_mps,
       ).parameters
     )
     aligned_torque = (
@@ -1013,7 +1041,29 @@ class PersistentLearningRuntime:
           aligned_torque.magnitude_boundary_dwell_s
         ),
       )
-    accepted = self.coordinator.ingest(sample)
+    # Assign one deterministic first cause. This order mirrors the physical
+    # pipeline above; later failures cannot hide an earlier invalid input.
+    upstream_rejection: CalibrationSampleDisposition | None = None
+    if not numeric_valid:
+      upstream_rejection = CalibrationSampleDisposition.INVALID_NUMERIC_OR_TIMESTAMP
+    elif not vehicle_input_valid:
+      upstream_rejection = CalibrationSampleDisposition.VEHICLE_INPUT_INVALID
+    elif not frame.lateral_active:
+      upstream_rejection = CalibrationSampleDisposition.LATERAL_INACTIVE
+    elif evidence_speed_ineligible:
+      upstream_rejection = CalibrationSampleDisposition.STANDSTILL_OR_BELOW_MIN_STEER_SPEED
+    elif not self.last_live_mapping_valid:
+      upstream_rejection = CalibrationSampleDisposition.LIVE_RACK_MAPPING_INVALID
+    elif frame.steering_pressed or driver_exceeds_allowance:
+      upstream_rejection = CalibrationSampleDisposition.DRIVER_OVERRIDE_OR_ALLOWANCE
+    elif not command_observation_valid or aligned_torque is None:
+      upstream_rejection = CalibrationSampleDisposition.CAUSAL_COMMAND_ALIGNMENT_UNAVAILABLE
+    elif not sample.valid:
+      upstream_rejection = CalibrationSampleDisposition.MEASUREMENT_WARMUP_OR_DISCONTINUITY
+    accepted = self.coordinator.ingest(
+      sample,
+      upstream_rejection=upstream_rejection,
+    )
     self.last_sample_accepted = accepted
     return accepted
 

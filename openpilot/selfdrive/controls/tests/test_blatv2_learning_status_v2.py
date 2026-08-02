@@ -18,6 +18,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationNodeQualificationReport,
   CalibrationPairedLossDiagnostic,
   CalibrationQualificationReason,
+  CalibrationSampleAccounting,
+  CalibrationSampleDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
@@ -227,6 +229,11 @@ def _fixtures(*, qualified: bool = True):
     else ()
   )
   candidate_json = None if profile is None else profile.to_json().encode()
+  sample_accounting = (
+    CalibrationSampleAccounting.empty()
+    .with_disposition(CalibrationSampleDisposition.ACCEPTED)
+    .with_disposition(CalibrationSampleDisposition.LATERAL_INACTIVE)
+  )
   finalization = CalibrationLearningFinalization(
     manifest_bytes=b"status-v2-manifest",
     manifest_sha256="a" * 64,
@@ -246,6 +253,7 @@ def _fixtures(*, qualified: bool = True):
       interpolation_reports,
       selected_profile=profile,
     ),
+    sample_accounting=sample_accounting,
   )
   runtime = _RuntimeBundle(seed.vehicle_identity, "c" * 64, seed)
   return runtime, finalization
@@ -274,7 +282,7 @@ def _baseline() -> DriveEvidenceBaseline:
   return DriveEvidenceBaseline.from_support_diagnostics(diagnostics)
 
 
-def test_schema_v3_roundtrip_identity_observable_parameters_and_deltas() -> None:
+def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None:
   runtime, finalization = _fixtures()
   baseline = _baseline()
   payload = build_learning_status_payload(
@@ -288,7 +296,7 @@ def test_schema_v3_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 3
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 4
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -299,6 +307,7 @@ def test_schema_v3_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert payload["all_intervals_qualified"] is True
   assert payload["candidate_profile_available"] is True
   assert payload["candidate_profile_sha256"] == finalization.candidate_profile_sha256
+  assert payload["sample_accounting"] == finalization.sample_accounting.to_payload()
   assert decode_learning_status(encoded) == payload
   with unittest.TestCase().assertRaisesRegex(ValueError, "not canonical"):
     decode_learning_status(encoded + b" ")
@@ -457,6 +466,18 @@ def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None
   unknown_reason["candidate_profile_revision"] = None
   with test_case.assertRaisesRegex(ValueError, "qualification reason is unknown"):
     validate_learning_status_payload(unknown_reason)
+
+  bad_accounting = json.loads(json.dumps(payload))
+  bad_accounting["sample_accounting"]["rejection_reasons"].pop(
+    CalibrationSampleDisposition.LATERAL_INACTIVE.value,
+  )
+  with test_case.assertRaisesRegex(ValueError, "accounting is invalid"):
+    validate_learning_status_payload(bad_accounting)
+
+  inconsistent_accounting = json.loads(json.dumps(payload))
+  inconsistent_accounting["sample_accounting"]["ingested_sample_count"] = 1
+  with test_case.assertRaisesRegex(ValueError, "totals disagree"):
+    validate_learning_status_payload(inconsistent_accounting)
 
 
 def test_baseline_rejects_any_population_moving_backwards() -> None:

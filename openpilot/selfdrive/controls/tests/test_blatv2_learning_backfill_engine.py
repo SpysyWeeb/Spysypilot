@@ -1914,14 +1914,16 @@ class AbortRuntime:
   def __init__(self) -> None:
     self.coordinator = AbortCoordinator()
     self.ingest_calls = 0
-    self.route_counters: list[str] = []
+    self.routes: list[tuple[int, str, str | None]] = []
 
   def transition_onroad(
     self,
     route_identity_sha256: str,
     route_content_sha256: str | None,
+    *,
+    route_counter: int,
   ) -> None:
-    self.route_counters.append(route_identity_sha256)
+    self.routes.append((route_counter, route_identity_sha256, route_content_sha256))
 
   def ingest(self, _frame: object) -> None:
     self.ingest_calls += 1
@@ -2216,7 +2218,30 @@ def test_replay_aborts_periodically_before_publication() -> None:
       abort_requested=abort_requested,
     )
   assert runtime.ingest_calls == 256
-  assert runtime.route_counters == [route.display_identity]
+  assert runtime.routes == [(route.route_counter, route.display_identity, None)]
+
+
+def test_replay_requires_one_sample_disposition_per_prepared_frame() -> None:
+  route = RouteCandidate(
+    route_name="0000002a--000000002a",
+    route_counter=0x2A,
+    segments=(),
+  )
+  runtime = AbortRuntime()
+  with pytest.raises(BackfillError) as raised:
+    learning_backfill.replay_routes(
+      runtime=runtime,
+      routes=(route,),
+      prepare=lambda _route: PreparedRoute(
+        frames=(object(),),
+        controls_witness_count=1,
+        unresolved_witness_count=0,
+        gap_count=0,
+        provenance={},
+      ),
+    )
+  assert raised.value.diagnostic == "backfill_nondeterministic"
+  assert runtime.ingest_calls == 1
 
 
 def test_route_local_rejection_does_not_block_later_good_route(

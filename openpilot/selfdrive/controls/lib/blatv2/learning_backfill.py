@@ -4513,6 +4513,7 @@ def replay_routes(
       continue
     try:
       before_accepted = runtime.coordinator.accepted_sample_count
+      before_ingested = runtime.coordinator.ingested_sample_count
       if route_applying is not None:
         route_applying(route)
       route_evidence = getattr(prepared, "route_evidence", None)
@@ -4524,12 +4525,14 @@ def replay_routes(
       runtime.transition_onroad(
         route.display_identity,
         route_content_sha256,
+        route_counter=route.route_counter,
       )
       frames = (
         prepared.frames
         if isinstance(prepared, PreparedRoute)
         else prepared.iter_frames()
       )
+      frame_count = 0
       for frame_index, frame in enumerate(frames):
         if frame_index % 256 == 0:
           _abort_if_requested(
@@ -4537,6 +4540,7 @@ def replay_routes(
             "backfill aborted while replaying route frames",
           )
         runtime.ingest(frame)
+        frame_count += 1
       _abort_if_requested(
         abort_requested,
         "backfill aborted after replaying route frames",
@@ -4545,6 +4549,12 @@ def replay_routes(
       accepted = (
         runtime.coordinator.accepted_sample_count - before_accepted
       )
+      ingested = runtime.coordinator.ingested_sample_count - before_ingested
+      if ingested != frame_count:
+        raise BackfillError(
+          "backfill_nondeterministic",
+          "learner sample accounting did not classify every prepared frame",
+        )
       # Every recorded witness is either accepted or rejected exactly once;
       # startup-prefix witnesses have no frame to ingest but still belong to
       # the route's reported denominator. Gaps remain explicit missing-frame

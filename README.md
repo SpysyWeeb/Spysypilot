@@ -81,8 +81,8 @@ the runtime-selected 409/4/7 opendbc/panda envelope; every other vehicle keeps
 the limits supplied by its own `CarControllerParams`.
 
 After a route closes, offroad-only `blatv2_backfilld` converts compatible full
-rlogs into immutable `BLATRE02` route evidence (format v2, evidence schema 8,
-namespace `complete_full_rlog_authority_v6`). Two independent authorities must
+rlogs into immutable `BLATRE02` route evidence (format v2, evidence schema 9,
+namespace `complete_full_rlog_authority_v7`). Two independent authorities must
 produce the same canonical artifacts before anything is committed. The local
 path uses up to four isolated workers, owns and reaps every worker process
 group on abort/onroad transition, and never parallelizes mutable learner state.
@@ -98,7 +98,12 @@ lateral acceleration, signed offset, moving friction, and static breakaway—at
 support on both sides, and seed retention is a valid qualified result; long
 highway drives therefore cannot erase low-speed knowledge. Support, numerical
 rank/conditioning, training, held-route validation, and full-authority evidence
-are reported independently.
+are reported independently. Each canonical route counter owns its complete
+partition (even training, odd validation), and learning-status schema 4
+accounts for every prepared frame as accepted or one explicit first rejection
+cause. Eighteen retained routes reproduced byte-identically in two independent
+passes; the 0–20 m/s nodes safely retained their seeds, while 30 m/s remains one
+held-out breakaway episode short, so no candidate was emitted.
 
 The behavior learner consumes a homogeneous, immutable route cohort (at least
 four whole routes) and replays exact stock, incumbent, and candidate controllers
@@ -171,8 +176,8 @@ Each feature links to its branch — the branch README has the full "what/how/wh
   conservative ETA. The two canonical authorities use separate preparation
   workers and must agree bit-for-bit; workers have no publication or Params
   authority and are killed and reaped as a unit if the car goes onroad. The
-  immutable evidence format is `BLATRE02` v2 in schema-8 namespace
-  `complete_full_rlog_authority_v6`. Physical calibration and behavior tuning
+  immutable evidence format is `BLATRE02` v2 in schema-9 namespace
+  `complete_full_rlog_authority_v7`. Physical calibration and behavior tuning
   have independent readiness and gates, and the behavior search may change
   only global natural frequency and damping after a homogeneous four-route
   cohort exists. No result auto-activates.
