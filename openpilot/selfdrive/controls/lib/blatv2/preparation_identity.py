@@ -9,6 +9,7 @@ UI, transport, and status changes therefore cannot evict a valid proof.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import importlib
 import json
@@ -19,7 +20,7 @@ import re
 import stat
 import subprocess
 import sys
-from typing import Final, Mapping
+from typing import Final
 
 
 PREPARATION_IMPLEMENTATION_SCHEMA_VERSION: Final = 2

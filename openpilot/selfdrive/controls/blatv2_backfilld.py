@@ -21,7 +21,6 @@ from openpilot.common.hardware.hw import Paths
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.blatv2_learnerd import (
-  PROVISIONAL_RACK_DYNAMICS_PATH,
   default_learning_storage_root,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (

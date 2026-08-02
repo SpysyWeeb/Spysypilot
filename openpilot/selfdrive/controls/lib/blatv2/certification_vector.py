@@ -29,7 +29,6 @@ import struct
 from typing import Any, Final
 
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
-  MAXIMUM_ROUTE_FRAMES,
   BuildDescriptor,
   BuildDescriptorRegistry,
   PreparedRoute,
