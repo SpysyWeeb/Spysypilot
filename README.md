@@ -243,6 +243,15 @@ used by the current learner. Older archived builds that actually used the
 stock 384/3/7 envelope remain fail-closed; they are not mislabeled to make
 their data pass.
 
+Route `000000da--db203f8092` records the clean `8cc8a31` combo build. Its 54
+segments agree on the same Palisade CarParams, `d40096f` schema, `ab40b76`
+opendbc, `7f245a8` panda, and reviewed 409/4/7 command envelope as the preceding
+accepted build. The commit only retired the device learner and its UI; the
+controller, actuation, safety, measurement, and physical-learning core bytes
+are unchanged. Its exact descriptor is therefore reviewed and admitted without
+bypassing the `unreviewed_build` gate. BLaTv2 remains in progress pending field
+validation.
+
 ### PC learner qualification
 
 A selected physical profile becomes complete only when every speed node and
