@@ -14,7 +14,7 @@ import math
 import re
 
 
-LEARNING_STATUS_SCHEMA_VERSION = 3
+LEARNING_STATUS_SCHEMA_VERSION = 4
 LIFECYCLE_STATUS_SCHEMA_VERSION = 1
 LEARNING_OPERATION_STATUS_SCHEMA_VERSION = 1
 BACKFILL_PROGRESS_SCHEMA_VERSION = 1
@@ -30,6 +30,7 @@ _TOP_LEVEL_KEYS = frozenset((
   "informational_only",
   "vehicle_identity",
   "runtime_identity_sha256",
+  "sample_accounting",
   "seed_profile_sha256",
   "evidence_sha256",
   "manifest_sha256",
@@ -43,6 +44,25 @@ _TOP_LEVEL_KEYS = frozenset((
   "last_drive_complete",
   "nodes",
 ))
+_SAMPLE_ACCOUNTING_KEYS = frozenset((
+  "accepted_sample_count",
+  "ingested_sample_count",
+  "rejected_sample_count",
+  "rejection_reasons",
+))
+_SAMPLE_REJECTION_REASONS = (
+  "invalid_numeric_or_timestamp",
+  "vehicle_input_invalid",
+  "lateral_inactive",
+  "standstill_or_below_min_steer_speed",
+  "live_rack_mapping_invalid",
+  "driver_override_or_allowance",
+  "causal_command_alignment_unavailable",
+  "measurement_warmup_or_discontinuity",
+  "learner_ineligible",
+  "breakaway_episode_discarded",
+)
+_SAMPLE_REJECTION_REASON_KEYS = frozenset(_SAMPLE_REJECTION_REASONS)
 _NODE_KEYS = frozenset((
   "applied_torque_directions",
   "applied_torque_span",
@@ -588,6 +608,22 @@ class InterpolationStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class SampleAccountingStatus:
+  """Durable first-cause accounting for every frame offered to the learner."""
+
+  accepted_sample_count: int
+  rejected_sample_count: int
+  ingested_sample_count: int
+  rejection_reasons: tuple[tuple[str, int], ...]
+
+  def rejection_count(self, reason: str) -> int:
+    for name, count in self.rejection_reasons:
+      if name == reason:
+        return count
+    raise KeyError(reason)
+
+
+@dataclass(frozen=True, slots=True)
 class LearningNodeStatus:
   node_index: int
   speed_mps: float
@@ -710,6 +746,7 @@ class LearningStatus:
   seed_profile_sha256: str
   evidence_sha256: str
   manifest_sha256: str
+  sample_accounting: SampleAccountingStatus
   all_nodes_evaluated: bool
   all_intervals_qualified: bool
   all_nodes_qualified: bool
@@ -765,7 +802,7 @@ def learning_summary_lines(status: LearningStatus) -> tuple[LearningSummaryLine,
       "NEW CANDIDATE ARTIFACT AVAILABLE",
       "green",
     )
-  elif status.all_nodes_qualified:
+  elif status.all_nodes_qualified and status.all_intervals_qualified:
     artifact = LearningSummaryLine(
       "SEED PROFILE RETAINED | NO NEW ARTIFACT NEEDED",
       "green",
@@ -1094,6 +1131,55 @@ def _integer(value: object, field: str, *, nullable: bool = False) -> int | None
       f"{field} must be a non-negative integer",
     )
   return value
+
+
+def _sample_accounting(value: object) -> SampleAccountingStatus:
+  data = _exact_object(value, _SAMPLE_ACCOUNTING_KEYS, "sample_accounting")
+  raw_reasons = _exact_object(
+    data["rejection_reasons"],
+    _SAMPLE_REJECTION_REASON_KEYS,
+    "sample_accounting.rejection_reasons",
+  )
+  accepted = _integer(
+    data["accepted_sample_count"],
+    "sample_accounting.accepted_sample_count",
+  )
+  rejected = _integer(
+    data["rejected_sample_count"],
+    "sample_accounting.rejected_sample_count",
+  )
+  ingested = _integer(
+    data["ingested_sample_count"],
+    "sample_accounting.ingested_sample_count",
+  )
+  assert accepted is not None and rejected is not None and ingested is not None
+  reasons = tuple(
+    (
+      reason,
+      _integer(
+        raw_reasons[reason],
+        f"sample_accounting.rejection_reasons.{reason}",
+      ),
+    )
+    for reason in _SAMPLE_REJECTION_REASONS
+  )
+  typed_reasons = tuple((reason, count) for reason, count in reasons if count is not None)
+  reason_total = sum(count for _, count in typed_reasons)
+  if (
+    len(typed_reasons) != len(_SAMPLE_REJECTION_REASONS)
+    or reason_total != rejected
+    or accepted + rejected != ingested
+  ):
+    raise LearningStatusError(
+      "malformed",
+      "sample_accounting totals disagree",
+    )
+  return SampleAccountingStatus(
+    accepted_sample_count=accepted,
+    rejected_sample_count=rejected,
+    ingested_sample_count=ingested,
+    rejection_reasons=typed_reasons,
+  )
 
 
 def _number(value: object, field: str, *, nullable: bool = False) -> float | None:
@@ -1782,6 +1868,7 @@ def parse_learning_status(
       "wrong_vehicle",
       "Learning data belongs to a different vehicle",
     )
+  sample_accounting = _sample_accounting(data["sample_accounting"])
 
   raw_nodes = data["nodes"]
   if type(raw_nodes) is not list or not raw_nodes:
@@ -1832,7 +1919,9 @@ def parse_learning_status(
     data["all_nodes_evaluated"],
     "all_nodes_evaluated",
   )
-  expected_nodes_evaluated = all(node.qualified for node in nodes)
+  expected_nodes_evaluated = all(
+    bool(node.evaluation_status) and bool(node.reasons) for node in nodes
+  )
   if all_nodes_evaluated != expected_nodes_evaluated:
     raise LearningStatusError(
       "malformed",
@@ -1845,10 +1934,10 @@ def parse_learning_status(
       "malformed",
       "interpolation_reports must be a list",
     )
-  if not all_nodes_evaluated and raw_interpolation_reports:
+  if not all_nodes_qualified and raw_interpolation_reports:
     raise LearningStatusError(
       "malformed",
-      "unevaluated node grid carries interpolation reports",
+      "unqualified node grid carries interpolation reports",
     )
   interpolation_reports = tuple(
     _interpolation_status(value, index, nodes)
@@ -1867,11 +1956,11 @@ def parse_learning_status(
       "malformed",
       "all_intervals_qualified disagrees with interval reports",
     )
-  expected_all_qualified = all_nodes_evaluated and all_intervals_qualified
-  if all_nodes_qualified != expected_all_qualified:
+  expected_nodes_qualified = all(node.qualified for node in nodes)
+  if all_nodes_qualified != expected_nodes_qualified:
     raise LearningStatusError(
       "malformed",
-      "all_nodes_qualified disagrees with node and interval reports",
+      "all_nodes_qualified disagrees with node reports",
     )
 
   candidate_sha = _sha256(
@@ -1900,13 +1989,14 @@ def parse_learning_status(
       "malformed",
       "candidate availability and identity disagree",
     )
-  if candidate_complete and not all_nodes_qualified:
+  fully_qualified = all_nodes_qualified and all_intervals_qualified
+  if candidate_complete and not fully_qualified:
     raise LearningStatusError(
       "malformed",
       "candidate exists before full qualification",
     )
   if (
-    all_nodes_qualified
+    fully_qualified
     and not candidate_complete
     and any(node.training_outcome == "learned" for node in nodes)
   ):
@@ -1933,6 +2023,7 @@ def parse_learning_status(
       data["manifest_sha256"],
       "manifest_sha256",
     ),
+    sample_accounting=sample_accounting,
     all_nodes_evaluated=all_nodes_evaluated,
     all_intervals_qualified=all_intervals_qualified,
     all_nodes_qualified=all_nodes_qualified,
