@@ -30,6 +30,9 @@ Every test report must identify:
 - [x] Low-speed radar override qualification coverage.
 - [x] `4.0 m/s²` request is clamped by the deployed opendbc envelope.
 - [x] Existing BLoTv2 jerk and MPC tune retained for isolated evaluation.
+- [x] The acceleration ceiling follows the owner-approved cubic envelope with
+  deterministic endpoint, sample, monotonicity, convexity, continuity, and
+  deployed-platform-clamp coverage.
 - [x] Ordinary lead-free Chill cruise uses a route-derived proportional
   response with deterministic coverage for coast-down, low-speed blending,
   large-error authority, jerk, invalid radar, and strategy bypasses.
@@ -66,14 +69,16 @@ Replay must use the real production classes, not copied equations.
 - [x] The production cruise function replays the three comparable route
   timelines at `+0.400`, `-0.401`, and `+0.353 m/s²` instead of `+0.688`,
   `-1.200`, and `+0.685 m/s²`; this is command replay, not closed-loop proof.
+- [x] Replacing the four-node ceiling with the cubic envelope retains those
+  three comfort-shaped route outputs below the available acceleration ceiling.
 - [x] Route `000000d7--cc6308b4d0` identifies late CEM recognition—not planner
   handoff latency—as the first high-speed red-light failure and replays the
   production class at `42.2 mph` instead of `39.1 mph`.
 - [x] All 62 segments of that route reject the observed highway-exit slowdown
   and transient lead-dropout window while retaining both intended stop
   handoffs.
-- [ ] The route-derived stock-gate handoff is repeated on-road without
-  excessive throttle feel, delayed response, or added speed overshoot.
+- [ ] The route-derived cubic envelope is repeated on-road without launch
+  lunge, a 10 m/s authority cliff, delayed response, or added speed overshoot.
 - [ ] Five-mph set-speed increases and reductions at urban and highway speed
   feel soft, do not overshoot, and do not create brake/throttle rebound.
 - [ ] Ordinary no-stop driving remains in Chill without mode flicker.
@@ -122,8 +127,9 @@ Run in a controlled environment with immediate driver takeover available:
 5. Let a stopped lead depart slowly, then decisively.
 6. Follow mild, moderate, and hard lead braking.
 7. Run straight launches with progressively larger speed deltas, beginning
-   below the `4.0 m/s²` ceiling, then repeat five-mph corrections near 45 and
-   80 mph in both directions.
+   below the `4.0 m/s²` ceiling; sample the curve near 11, 22, 34, 45, and
+   56 mph, then repeat five-mph corrections near 45 and 80 mph in both
+   directions.
 8. Test a constant-speed and accelerating lead pull-away.
 9. Exercise low-speed radar-only obstacle/cut-in cases.
 10. Repeat relevant cases in ACC and experimental modes, then compare standard

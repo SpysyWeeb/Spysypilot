@@ -50,7 +50,7 @@ implementation, signal mapping, and ownership boundaries are documented in
 ## BLoTv2 ordinary cruise comfort
 
 **Status: in progress; awaiting field validation.** Route
-`000000d9--6040563d1d` showed that the stock ceiling alone still makes a small
+`000000d9--6040563d1d` showed that an acceleration ceiling alone still makes a small
 highway set-speed correction use all available acceleration or the full
 `-1.2 m/s²` cruise deceleration limit. The current tune adds a lead-free Chill
 cruise comfort response: above `15 m/s`, a `5 mph` error asks for about
@@ -58,6 +58,12 @@ cruise comfort response: above `15 m/s`, a `5 mph` error asks for about
 pitch-compensated coast estimate during speed reductions. It blends in from
 `8–15 m/s`, retaining low-speed launch response, while larger errors can still
 reach the existing acceleration and braking envelope.
+
+The former four-node acceleration gate is now one continuous cubic envelope:
+`a_max = 0.6 + 3.4 × (1 − v/40)³` from `0–40 m/s`, then `0.6 m/s²` above it.
+It retains the `4.0 m/s²` launch request without the abrupt 0-to-10 m/s drop,
+stays near the prior urban-speed tune, and reaches its highway floor smoothly.
+The deployed opendbc limit still clamps the request.
 
 Experimental mode, forced deceleration, invalid radar or lead-following
 operation, and an active model curve-speed limit bypass this shaping. The jerk

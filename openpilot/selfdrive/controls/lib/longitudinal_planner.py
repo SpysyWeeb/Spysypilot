@@ -29,9 +29,11 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
-A_CRUISE_MAX_VALS = [BLOTV2_ACCEL_REQUEST_MAX, 1.2, 0.8, 0.6]
-A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
-# Fade the extra launch authority into stock's cruise comfort gate by 10 m/s.
+# A single convex curve retains launch authority without the sharp slope
+# changes of the former [4.0, 1.2, 0.8, 0.6] piecewise-linear schedule.
+A_CRUISE_MAX_CURVE_SPEED = 40.0
+A_CRUISE_MAX_HIGH_SPEED = 0.6
+A_CRUISE_MAX_CURVE_POWER = 3.0
 # Keep BLoTv2's reaction-time ramp separate from sustained authority.
 J_CRUISE_VALS = [2.0, 1.6, 1.0, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
@@ -62,9 +64,15 @@ LAUNCH_OPEN_LENGTH = 20.0   # m, model path length that reads as "the way ahead 
 LAUNCH_OPEN_CONFIRM = 0.7   # filtered (RC 0.3s) open level to trust -- ~0.5s of sustained open path
 LAUNCH_CLOSE_LENGTH = 10.0  # m, path re-collapse below this cancels anticipation (model changed its mind)
 
+
+def get_requested_max_accel(v_ego):
+  speed_fraction = float(np.clip(v_ego / A_CRUISE_MAX_CURVE_SPEED, 0.0, 1.0))
+  remaining_fraction = 1.0 - speed_fraction
+  return float(A_CRUISE_MAX_HIGH_SPEED +
+               (BLOTV2_ACCEL_REQUEST_MAX - A_CRUISE_MAX_HIGH_SPEED) * remaining_fraction ** A_CRUISE_MAX_CURVE_POWER)
+
 def get_max_accel(v_ego):
-  requested_accel = float(np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
-  return min(requested_accel, BLOTV2_ACCEL_MAX)
+  return min(get_requested_max_accel(v_ego), BLOTV2_ACCEL_MAX)
 
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
