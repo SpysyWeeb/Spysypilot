@@ -34,6 +34,7 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   ProtocolLimits,
   ResponseReplayGuard,
   build_request,
+  canonical_json_bytes,
   check_abort,
   decode_response_header,
   raise_remote_error,
@@ -58,6 +59,8 @@ ARTIFACT_RESPONSE_HEADER: Final = "X-BLATV2-Response"
 # chunks expand under base64. Keep a fixed 4096-byte margin below the 4 MiB
 # decoded-chunk bound for canonical envelope metadata and future-safe framing.
 MAX_SAFE_UPLOAD_CHUNK_BYTES: Final = 4 * 1024 * 1024 - 4096
+MAX_INVENTORY_ROUTE_COUNT: Final = 4096
+MAX_INVENTORY_METADATA_BYTES: Final = 32 * 1024 * 1024
 _DEFAULT_LIMITS: Final = ProtocolLimits()
 _RFC1918_NETWORKS: Final = tuple(
   ipaddress.ip_network(value)
@@ -416,7 +419,7 @@ class OffdeviceBridgeClient:
     self.wall_time_ms = wall_time_ms
     self.nonce_factory = nonce_factory
     self.replay_guard = ResponseReplayGuard()
-    self._worker_implementation_identity: tuple[str, str, str] | None = None
+    self._worker_implementation_identity: tuple[str, ...] | None = None
 
   def _check_worker_implementation_identity(
     self,
@@ -428,6 +431,9 @@ class OffdeviceBridgeClient:
       str(payload["worker_instance_id"]),
       str(payload["worker_implementation_commit"]),
       str(payload["worker_implementation_sha256"]),
+      str(payload["preparation_implementation_sha256"]),
+      str(payload["worker_numerical_environment_sha256"]),
+      str(payload["worker_preparation_implementation_sha256"]),
     )
     expected = self._worker_implementation_identity
     if expected is None:
@@ -586,11 +592,21 @@ class OffdeviceBridgeClient:
   def route_inventory(self) -> dict[str, object]:
     """Read the complete append-only archive through bounded pages."""
     routes: list[object] = []
+    metadata_bytes = 0
     cursor: str | None = None
     while True:
       page = self._request("route_inventory", {"cursor": cursor})
       page_routes = page["routes"]
       assert type(page_routes) is list
+      page_metadata_bytes = len(canonical_json_bytes({"routes": page_routes}))
+      if (
+        len(routes) + len(page_routes) > MAX_INVENTORY_ROUTE_COUNT
+        or metadata_bytes + page_metadata_bytes
+        > MAX_INVENTORY_METADATA_BYTES
+      ):
+        raise BridgeCorruptError(
+          "inventory exceeds the complete archive bound",
+        )
       if page_routes:
         first = str(page_routes[0]["archive_name"])
         if cursor is not None and first <= cursor:
@@ -602,6 +618,7 @@ class OffdeviceBridgeClient:
             "inventory pages are not globally strictly ordered",
           )
         routes.extend(page_routes)
+        metadata_bytes += page_metadata_bytes
       next_cursor = page["next_cursor"]
       if next_cursor is None:
         return {"routes": routes}

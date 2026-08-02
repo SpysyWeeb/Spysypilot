@@ -49,6 +49,7 @@ class BehaviorLearningDiagnostic(StrEnum):
   CANDIDATE_QUALIFIED = "candidate_qualified"
   STOCK_RETAINED = "stock_retained"
   ROUTE_EVIDENCE_INVALID = "route_evidence_invalid"
+  BEHAVIOR_STREAMING_REQUIRED = "behavior_streaming_required"
   REPLAY_NONDETERMINISTIC = "replay_nondeterministic"
   BEHAVIOR_TRANSACTION_FAILED = "behavior_transaction_failed"
   BEHAVIOR_PUBLISH_FAILED = "behavior_publish_failed"
@@ -87,6 +88,7 @@ _STATE_DIAGNOSTICS = {
   },
   BehaviorLearningState.FAILED: {
     BehaviorLearningDiagnostic.ROUTE_EVIDENCE_INVALID,
+    BehaviorLearningDiagnostic.BEHAVIOR_STREAMING_REQUIRED,
     BehaviorLearningDiagnostic.REPLAY_NONDETERMINISTIC,
     BehaviorLearningDiagnostic.BEHAVIOR_TRANSACTION_FAILED,
     BehaviorLearningDiagnostic.BEHAVIOR_PUBLISH_FAILED,

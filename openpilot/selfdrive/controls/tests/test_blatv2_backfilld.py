@@ -11,6 +11,7 @@ import pytest  # noqa: TID251
 from opendbc.car.structs import car
 from openpilot.selfdrive.controls.blatv2_backfilld import (
   BlatV2BackfillDaemon,
+  REMOTE_DISCOVERY_STARTUP_GRACE_S,
   _decode_car_params,
   _serialize_owned_car_params,
 )
@@ -44,6 +45,24 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_progress import (
 
 RUNTIME_IDENTITY = hashlib.sha256(b"runtime").hexdigest()
 ROUTE_IDENTITY = hashlib.sha256(b"route").hexdigest()
+REMOTE_CONTRACT = {
+  "opendbc_commit": "b" * 40,
+  "panda_commit": "c" * 40,
+  "source_commit": "a" * 40,
+}
+
+
+class FakeDiscoveryClock:
+  def __init__(self) -> None:
+    self.now = 0.0
+    self.sleeps: list[float] = []
+
+  def monotonic(self) -> float:
+    return self.now
+
+  def sleep(self, seconds: float) -> None:
+    self.sleeps.append(seconds)
+    self.now += seconds
 
 
 class FakeParams:
@@ -276,7 +295,7 @@ def test_missing_remote_config_falls_back_to_local_without_current(
     log_root=tmp_path / "logs",
     storage_root=storage,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   engine = SimpleNamespace(expected_dongle_id="f" * 16)
   with (
     patch(
@@ -291,6 +310,8 @@ def test_missing_remote_config_falls_back_to_local_without_current(
     assert daemon._prepare_remote(engine, object(), b"encoded") is None
 
   assert BACKFILL_PROGRESS_PARAM not in params.values
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+  daemon._begin_local_replay()
   offdevice = params.values[OFFDEVICE_PROGRESS_PARAM]
   assert type(offdevice) is dict
   assert offdevice["phase"] == "local_fallback"
@@ -317,7 +338,7 @@ def test_offdevice_progress_io_failure_cannot_block_local_fallback(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   with (
     patch(
       "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
@@ -343,7 +364,7 @@ def test_remote_preparation_passes_protected_worker_host_to_discovery(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
   engine = SimpleNamespace(
     expected_dongle_id="f" * 16,
@@ -382,6 +403,297 @@ def test_remote_preparation_passes_protected_worker_host_to_discovery(
   assert discovery.call_args.kwargs["configured_host"] == "192.168.1.241"
 
 
+def test_startup_discovery_unavailable_then_succeeds_without_local_claim(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  clock = FakeDiscoveryClock()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    discovery_monotonic=clock.monotonic,
+    discovery_sleep=clock.sleep,
+  )
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
+  runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
+  engine = SimpleNamespace(
+    expected_dongle_id="f" * 16,
+    runtime_factory=MagicMock(return_value=runtime),
+  )
+  session = object()
+  worker = object()
+  discovery = MagicMock(side_effect=(
+    BridgeUnavailableError("worker not joined yet"),
+    worker,
+  ))
+
+  def observe_retry(seconds: float) -> None:
+    status = params.values[LEARNING_OPERATION_STATUS_PARAM]
+    assert type(status) is dict
+    assert status["state"] == "preparing"
+    assert status["diagnostic"] == "discovering_remote_worker"
+    assert OFFDEVICE_PROGRESS_PARAM not in params.values
+    clock.sleep(seconds)
+
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value=None,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
+      discovery,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.OffdeviceBridgeClient",
+      return_value=object(),
+    ) as client_factory,
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.prepare_remote_session",
+      return_value=session,
+    ),
+  ):
+    daemon.discovery_sleep = observe_retry
+    assert daemon._prepare_remote(
+      engine,
+      SimpleNamespace(carFingerprint="CAR"),
+      b"encoded",
+    ) is session
+
+  assert discovery.call_count == 2
+  assert clock.sleeps == [pytest.approx(0.25)]
+  assert client_factory.call_args.kwargs["worker"] is worker
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+
+
+def test_startup_discovery_exhausts_thirty_seconds_before_local_fallback(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  clock = FakeDiscoveryClock()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    discovery_monotonic=clock.monotonic,
+    discovery_sleep=clock.sleep,
+  )
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
+  engine = SimpleNamespace(expected_dongle_id="f" * 16)
+
+  def consume_attempt(**fields: object) -> None:
+    timeout_s = fields["timeout_s"]
+    assert type(timeout_s) is float
+    clock.now += timeout_s
+    raise BridgeUnavailableError("worker still unavailable")
+
+  discovery = MagicMock(side_effect=consume_attempt)
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value=None,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
+      discovery,
+    ),
+  ):
+    assert daemon._prepare_remote(
+      engine,
+      SimpleNamespace(carFingerprint="CAR"),
+      b"encoded",
+    ) is None
+
+  assert clock.now == pytest.approx(REMOTE_DISCOVERY_STARTUP_GRACE_S)
+  assert discovery.call_count > 1
+  assert all(
+    0.0 < call.kwargs["timeout_s"] <= 2.0
+    for call in discovery.call_args_list
+  )
+  status = params.values[LEARNING_OPERATION_STATUS_PARAM]
+  assert type(status) is dict
+  assert status["diagnostic"] == "discovering_remote_worker"
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+
+  daemon._begin_local_replay()
+  offdevice = params.values[OFFDEVICE_PROGRESS_PARAM]
+  assert type(offdevice) is dict
+  assert offdevice["phase"] == "local_fallback"
+  assert offdevice["fallback_reason_code"] == "worker_unavailable"
+
+
+def test_startup_discovery_source_mismatch_fails_without_retry(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  clock = FakeDiscoveryClock()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    discovery_monotonic=clock.monotonic,
+    discovery_sleep=clock.sleep,
+  )
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
+  discovery = MagicMock(side_effect=BridgeIncompatibleError("wrong source"))
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value=None,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
+      discovery,
+    ),
+  ):
+    with pytest.raises(BackfillError) as raised:
+      daemon._prepare_remote(
+        SimpleNamespace(expected_dongle_id="f" * 16),
+        SimpleNamespace(carFingerprint="CAR"),
+        b"encoded",
+      )
+
+  assert raised.value.diagnostic == "backfill_route_incompatible"
+  discovery.assert_called_once()
+  assert clock.sleeps == []
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+
+
+@pytest.mark.parametrize("abort_mode", ("onroad", "stop"))
+def test_startup_discovery_aborts_on_ownership_end_without_retry(
+  tmp_path: Path,
+  abort_mode: str,
+) -> None:
+  params = FakeParams()
+  clock = FakeDiscoveryClock()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    discovery_monotonic=clock.monotonic,
+    discovery_sleep=clock.sleep,
+  )
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
+
+  def end_ownership(**_fields: object) -> None:
+    if abort_mode == "onroad":
+      params.values["IsOffroad"] = False
+    else:
+      daemon.stop()
+    raise BridgeUnavailableError("network still starting")
+
+  discovery = MagicMock(side_effect=end_ownership)
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      return_value=None,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
+      discovery,
+    ),
+  ):
+    with pytest.raises(BackfillError) as raised:
+      daemon._prepare_remote(
+        SimpleNamespace(expected_dongle_id="f" * 16),
+        SimpleNamespace(carFingerprint="CAR"),
+        b"encoded",
+      )
+
+  assert raised.value.diagnostic == "unexpected_error"
+  discovery.assert_called_once()
+  assert clock.sleeps == []
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+
+
+def test_startup_discovery_status_cannot_cross_onroad_handoff(
+  tmp_path: Path,
+) -> None:
+  params = FakeParams()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+  )
+  daemon.operation_status.publish(
+    state=LearningOperationState.PREPARING,
+    diagnostic="restoring_runtime",
+    new_operation=True,
+    vehicle_identity="CAR",
+  )
+  prior_status = params.values[LEARNING_OPERATION_STATUS_PARAM]
+  assert type(prior_status) is dict
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
+  discovery = MagicMock()
+
+  def transition_onroad(_directory: Path) -> None:
+    params.values["IsOffroad"] = False
+    return None
+
+  with (
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
+      return_value=tmp_path / "config",
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_secret",
+      return_value=b"s" * 32,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.load_bridge_worker_host",
+      side_effect=transition_onroad,
+    ),
+    patch(
+      "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
+      discovery,
+    ),
+  ):
+    with pytest.raises(BackfillError) as raised:
+      daemon._prepare_remote(
+        SimpleNamespace(expected_dongle_id="f" * 16),
+        SimpleNamespace(carFingerprint="CAR"),
+        b"encoded",
+      )
+
+  assert raised.value.diagnostic == "unexpected_error"
+  discovery.assert_not_called()
+  assert params.values[LEARNING_OPERATION_STATUS_PARAM] == prior_status
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+
+
 @pytest.mark.parametrize(
   "code",
   [
@@ -404,7 +716,7 @@ def test_authenticated_worker_availability_error_falls_back_local(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
   engine = SimpleNamespace(
     expected_dongle_id="f" * 16,
@@ -439,6 +751,8 @@ def test_authenticated_worker_availability_error_falls_back_local(
     assert daemon._prepare_remote(engine, object(), b"encoded") is None
 
   assert BACKFILL_PROGRESS_PARAM not in params.values
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+  daemon._begin_local_replay()
   offdevice = params.values[OFFDEVICE_PROGRESS_PARAM]
   assert type(offdevice) is dict
   assert offdevice["phase"] == "local_fallback"
@@ -462,7 +776,7 @@ def test_reason_carrying_unavailable_error_survives_local_fallback(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
   engine = SimpleNamespace(
     expected_dongle_id="f" * 16,
@@ -499,6 +813,8 @@ def test_reason_carrying_unavailable_error_survives_local_fallback(
   ):
     assert daemon._prepare_remote(engine, object(), b"encoded") is None
 
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+  daemon._begin_local_replay()
   offdevice = params.values[OFFDEVICE_PROGRESS_PARAM]
   assert type(offdevice) is dict
   assert offdevice["phase"] == "local_fallback"
@@ -543,7 +859,7 @@ def test_authenticated_remote_contract_failure_maps_without_current(
     log_root=tmp_path / "logs",
     storage_root=storage,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   engine = SimpleNamespace(expected_dongle_id="f" * 16)
   with (
     patch(
@@ -561,12 +877,13 @@ def test_authenticated_remote_contract_failure_maps_without_current(
     patch(
       "openpilot.selfdrive.controls.blatv2_backfilld.discover_worker",
       side_effect=remote_error,
-    ),
+    ) as discovery,
   ):
     with pytest.raises(BackfillError) as raised:
       daemon._prepare_remote(engine, object(), b"encoded")
 
   assert raised.value.diagnostic == diagnostic
+  discovery.assert_called_once()
   assert not (storage / "CURRENT").exists()
 
 
@@ -815,6 +1132,78 @@ def test_daemon_stays_healthy_after_noop_without_rescanning(
 
   engine.run_once.assert_called_once_with()
   daemon._project_learning_status.assert_called_once_with(engine, None)
+
+
+@pytest.mark.parametrize(
+  "handoff_point",
+  ("before_fallback_publication", "after_fallback_publication"),
+)
+def test_onroad_handoff_between_remote_fallback_and_local_replay_aborts(
+  tmp_path: Path,
+  handoff_point: str,
+) -> None:
+  params = FakeParams()
+  daemon = BlatV2BackfillDaemon(
+    params=params,
+    log_root=tmp_path / "logs",
+    storage_root=tmp_path / "learning",
+    extractor_path=tmp_path / "extractor",
+    descriptor_path=tmp_path / "descriptors.json",
+  )
+  engine = SimpleNamespace(run_once=MagicMock())
+  car_params = SimpleNamespace(
+    carFingerprint="CAR",
+    to_bytes=MagicMock(return_value=b"encoded"),
+  )
+  live_status = {"owner": "live-manager-transition"}
+  fallback_payloads: list[dict[str, object]] = []
+  original_publish_local_fallback = daemon._publish_local_fallback
+
+  def prepare_local_fallback(
+    _engine: object,
+    _car_params: object,
+    _encoded: bytes,
+  ) -> None:
+    daemon._pending_local_fallback_reason = (
+      OffdeviceFallbackReason.WORKER_UNAVAILABLE
+    )
+    if handoff_point == "before_fallback_publication":
+      params.values["IsOffroad"] = False
+      params.values[LEARNING_OPERATION_STATUS_PARAM] = live_status
+    return None
+
+  def publish_then_transition(
+    reason: OffdeviceFallbackReason,
+  ) -> None:
+    original_publish_local_fallback(reason)
+    payload = params.values[OFFDEVICE_PROGRESS_PARAM]
+    assert type(payload) is dict
+    fallback_payloads.append(dict(payload))
+    params.values["IsOffroad"] = False
+    params.values[LEARNING_OPERATION_STATUS_PARAM] = live_status
+
+  daemon._wait_for_car_params = MagicMock(return_value=car_params)
+  daemon._build_engine = MagicMock(return_value=engine)
+  daemon._prepare_remote = MagicMock(side_effect=prepare_local_fallback)
+  daemon._publish_local_fallback = MagicMock(
+    side_effect=publish_then_transition,
+  )
+  daemon._publish_failure = MagicMock()
+
+  daemon.run()
+
+  engine.run_once.assert_not_called()
+  daemon._publish_failure.assert_not_called()
+  assert params.values[LEARNING_OPERATION_STATUS_PARAM] is live_status
+  assert OFFDEVICE_PROGRESS_PARAM not in params.values
+  if handoff_point == "before_fallback_publication":
+    daemon._publish_local_fallback.assert_not_called()
+    assert fallback_payloads == []
+  else:
+    daemon._publish_local_fallback.assert_called_once_with(
+      OffdeviceFallbackReason.WORKER_UNAVAILABLE,
+    )
+    assert fallback_payloads[0]["phase"] == "local_fallback"
 
 
 def test_onroad_handoff_clears_progress_without_overwriting_live_status(

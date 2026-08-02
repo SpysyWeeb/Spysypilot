@@ -77,6 +77,7 @@ def test_operation_status_is_canonical_and_informational() -> None:
   ("state", "diagnostic", "terminal"),
   [
     ("preparing", "waiting_for_car_params", False),
+    ("preparing", "discovering_remote_worker", False),
     ("ready_no_evidence", "ready_for_first_drive", True),
     ("collecting", "collecting_current_drive", False),
     ("finalizing", "finalizing_drive", False),

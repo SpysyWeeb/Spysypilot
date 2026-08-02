@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import os
 from pathlib import Path
 import struct
+import tempfile
 
 import pytest  # noqa: TID251
 
@@ -20,6 +22,7 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   RouteEvidenceError,
   RouteEvidenceSourceIdentity,
   RouteEvidenceStore,
+  inspect_route_evidence_file,
 )
 
 
@@ -194,3 +197,101 @@ def test_store_rejects_symlinks(tmp_path: Path) -> None:
   linked.symlink_to(target, target_is_directory=True)
   with pytest.raises(RouteEvidenceError, match="unsafe"):
     RouteEvidenceStore(linked).publish(artifact(), artifact())
+
+
+def test_streamed_inspection_authenticates_shape_and_store_object(tmp_path: Path) -> None:
+  expected = artifact()
+  first = tmp_path / "first.route-evidence"
+  second = tmp_path / "second.route-evidence"
+  first.write_bytes(expected.canonical_bytes)
+  second.write_bytes(expected.canonical_bytes)
+  summary = inspect_route_evidence_file(first)
+  assert summary.sha256 == expected.sha256
+  assert summary.source_identity == expected.source_identity
+  assert summary.physical_size == len(PHYSICAL)
+
+  store = RouteEvidenceStore(tmp_path / "store")
+  store.publish_files(
+    first,
+    second,
+    sha256=expected.sha256,
+    source_key=expected.source_key,
+  )
+  assert store.inspect(expected.sha256).sha256 == expected.sha256
+
+
+@pytest.mark.parametrize("pre_poll_count", (1, 3))
+def test_streamed_inspection_accounts_for_pre_poll_witnesses(
+  tmp_path: Path,
+  pre_poll_count: int,
+) -> None:
+  timestamps = tuple(100 + index for index in range(pre_poll_count))
+  identity = replace(
+    source(),
+    controls_witness_count=2 + pre_poll_count,
+    unresolved_witness_count=pre_poll_count,
+    pre_poll_dropped_timestamps_ns=timestamps,
+  )
+  expected = RouteEvidenceArtifact(
+    identity,
+    CP,
+    PHYSICAL,
+    (model(0), model(1)),
+    (witness(0), witness(1)),
+    TORQUE,
+    DELAY,
+    MANEUVER,
+    EVENTS,
+  )
+  path = tmp_path / f"pre-poll-{pre_poll_count}.route-evidence"
+  path.write_bytes(expected.canonical_bytes)
+  assert inspect_route_evidence_file(path).sha256 == expected.sha256
+
+
+def test_streamed_inspection_rejects_manifest_count_section_disagreement(tmp_path: Path) -> None:
+  encoded = artifact().canonical_bytes.replace(
+    b'"model_publication_count":2',
+    b'"model_publication_count":9',
+  )
+  assert encoded != artifact().canonical_bytes
+  path = tmp_path / "invalid-count.route-evidence"
+  path.write_bytes(encoded)
+  with pytest.raises(RouteEvidenceError, match="model section size/count"):
+    inspect_route_evidence_file(path)
+
+
+def test_publish_files_rejects_same_size_mutation_after_aa(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  expected = artifact()
+  first = tmp_path / "first.route-evidence"
+  second = tmp_path / "second.route-evidence"
+  first.write_bytes(expected.canonical_bytes)
+  second.write_bytes(expected.canonical_bytes)
+  store = RouteEvidenceStore(tmp_path / "store")
+
+  original_mkstemp = tempfile.mkstemp
+  mutated = False
+
+  def mutate_after_aa(*args: object, **kwargs: object) -> tuple[int, str]:
+    nonlocal mutated
+    result = original_mkstemp(*args, **kwargs)
+    if not mutated:
+      mutated = True
+      with first.open("r+b") as stream:
+        stream.seek(-1, 2)
+        stream.write(bytes([expected.canonical_bytes[-1] ^ 1]))
+        stream.flush()
+        os.fsync(stream.fileno())
+    return result
+
+  monkeypatch.setattr(tempfile, "mkstemp", mutate_after_aa)
+  with pytest.raises(RouteEvidenceError, match="changed during publication"):
+    store.publish_files(
+      first,
+      second,
+      sha256=expected.sha256,
+      source_key=expected.source_key,
+    )
+  assert not (store.root / "objects" / f"{expected.sha256}.route-evidence").exists()

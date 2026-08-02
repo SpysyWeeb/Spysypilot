@@ -18,13 +18,15 @@ import stat
 import struct
 import tempfile
 
-from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import MeasuredLearningFrame
+from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import MeasuredLearningFrame
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   MAX_ARTIFACT_BYTES,
   ROUTE_EVIDENCE_MAGIC,
   ROUTE_EVIDENCE_VERSION,
   RouteEvidenceArtifact,
   RouteEvidenceError,
+  RouteEvidenceFileSummary,
+  inspect_route_evidence_file,
 )
 
 
@@ -71,7 +73,7 @@ class PreparedRouteSpool:
     "gap_count", "provenance", "route_name", "unresolved_witness_count",
   )
 
-  def __init__(self, directory: Path, descriptor: PreparedRouteSpoolDescriptor, artifact: RouteEvidenceArtifact) -> None:
+  def __init__(self, directory: Path, descriptor: PreparedRouteSpoolDescriptor, artifact: RouteEvidenceFileSummary) -> None:
     self._directory = directory
     self._descriptor = descriptor
     self._artifact = artifact
@@ -91,27 +93,73 @@ class PreparedRouteSpool:
     return self._descriptor
 
   @property
-  def route_evidence(self) -> RouteEvidenceArtifact:
+  def route_evidence(self) -> RouteEvidenceFileSummary:
     return self._artifact
 
+  @property
+  def canonical_path(self) -> Path:
+    """Private bridge seam for constant-memory A/A staging."""
+    return self._directory / self._descriptor.filename
+
   def iter_frames(self) -> Iterator[MeasuredLearningFrame]:
-    path = self._directory / self._descriptor.filename
-    info = _regular_file_lstat(path)
-    if info.st_size != self._descriptor.size_bytes or _hash_regular_file(path, info) != self._descriptor.sha256:
-      raise SpoolFormatError("spool changed after validation")
-    # Reparse on each iteration so mutation cannot hide behind an in-memory
-    # artifact created when the facade was opened.
+    path = self.canonical_path
+    summary = self._artifact
+    descriptor = os.open(
+      path,
+      os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
-      artifact = RouteEvidenceArtifact.from_bytes(path.read_bytes())
-    except RouteEvidenceError as error:
-      raise SpoolFormatError("spool route evidence is invalid") from error
-    yield from artifact.iter_physical_frames()
+      opened = os.fstat(descriptor)
+      expected_stat = (
+        summary.st_dev, summary.st_ino, summary.st_size,
+        summary.st_mtime_ns, summary.st_ctime_ns,
+      )
+      if (
+        opened.st_dev, opened.st_ino, opened.st_size,
+        opened.st_mtime_ns, opened.st_ctime_ns,
+      ) != expected_stat:
+        raise SpoolFormatError("spool changed after validation")
+      os.lseek(descriptor, summary.physical_offset, os.SEEK_SET)
+      remaining = summary.physical_size
+      records_per_chunk = 1024
+      while remaining:
+        requested = min(
+          remaining,
+          records_per_chunk * SPOOL_RECORD_SIZE,
+        )
+        encoded = os.read(descriptor, requested)
+        if len(encoded) != requested or len(encoded) % SPOOL_RECORD_SIZE:
+          raise SpoolFormatError("spool physical plane is truncated")
+        remaining -= len(encoded)
+        view = memoryview(encoded)
+        for offset in range(0, len(view), SPOOL_RECORD_SIZE):
+          yield _decode_frame(view[offset:offset + SPOOL_RECORD_SIZE])
+      after = os.fstat(descriptor)
+      if (
+        after.st_dev, after.st_ino, after.st_size,
+        after.st_mtime_ns, after.st_ctime_ns,
+      ) != expected_stat:
+        raise SpoolFormatError("spool changed during physical replay")
+    finally:
+      os.close(descriptor)
 
   def __iter__(self) -> Iterator[MeasuredLearningFrame]:
     return self.iter_frames()
 
   def cleanup(self) -> None:
-    self._descriptor.cleanup(self._directory)
+    path = self.canonical_path
+    info = _regular_file_lstat(path)
+    summary = self._artifact
+    if (
+      info.st_dev != summary.st_dev
+      or info.st_ino != summary.st_ino
+      or info.st_size != summary.st_size
+      or info.st_mtime_ns != summary.st_mtime_ns
+      or info.st_ctime_ns != summary.st_ctime_ns
+    ):
+      raise SpoolFormatError("spool cleanup identity mismatch")
+    path.unlink()
+    _fsync_directory(self._directory)
 
 
 def write_prepared_route_spool(
@@ -203,13 +251,17 @@ def open_prepared_route_spool(
     raise SpoolFormatError("spool descriptor route/size mismatch")
   path = root / descriptor.filename
   info = _regular_file_lstat(path)
-  if info.st_size != descriptor.size_bytes or _hash_regular_file(path, info) != descriptor.sha256:
+  if info.st_size != descriptor.size_bytes:
     raise SpoolFormatError("spool descriptor identity mismatch")
   try:
-    artifact = RouteEvidenceArtifact.from_bytes(path.read_bytes())
+    artifact = inspect_route_evidence_file(path)
   except RouteEvidenceError as error:
     raise SpoolFormatError("old/incomplete/corrupt route spool is unsupported") from error
-  if artifact.source_identity.route_id != expected_route_name or artifact.source_identity.physical_record_count != descriptor.frame_count:
+  if (
+    artifact.sha256 != descriptor.sha256
+    or artifact.source_identity.route_id != expected_route_name
+    or artifact.source_identity.physical_record_count != descriptor.frame_count
+  ):
     raise SpoolFormatError("route evidence identity/count mismatch")
   return PreparedRouteSpool(root, descriptor, artifact)
 

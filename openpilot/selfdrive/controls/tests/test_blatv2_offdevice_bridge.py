@@ -51,6 +51,9 @@ EXTRACTOR_SHA = "e" * 64
 WORKER_INSTANCE_ID = "9" * 64
 WORKER_IMPLEMENTATION_COMMIT = "8" * 40
 WORKER_IMPLEMENTATION_SHA = "7" * 64
+PREPARATION_IMPLEMENTATION_SHA = "6" * 64
+WORKER_NUMERICAL_ENVIRONMENT_SHA = "5" * 64
+WORKER_PREPARATION_IMPLEMENTATION_SHA = PREPARATION_IMPLEMENTATION_SHA
 JOB_ID = "34" * 16
 ARTIFACT_ID = hashlib.sha256(b"artifact").hexdigest()
 ROUTE = "000000d6--b52cbf6188"
@@ -63,6 +66,7 @@ def health_payload() -> dict[str, object]:
     "historical_descriptor_registry_sha256": DESCRIPTOR_SHA,
     "opendbc_commit": OPENDBC_COMMIT,
     "panda_commit": PANDA_COMMIT,
+    "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
     "source_commit": SOURCE_COMMIT,
     "state": "ready",
     "worker_count": 4,
@@ -70,6 +74,12 @@ def health_payload() -> dict[str, object]:
     "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
     "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
     "worker_instance_id": WORKER_INSTANCE_ID,
+    "worker_numerical_environment_sha256": (
+      WORKER_NUMERICAL_ENVIRONMENT_SHA
+    ),
+    "worker_preparation_implementation_sha256": (
+      WORKER_PREPARATION_IMPLEMENTATION_SHA
+    ),
   }
 
 
@@ -234,9 +244,9 @@ def test_request_canonical_hmac_and_exact_schema() -> None:
     sent_unix_ms=NOW_MS,
   )
   assert hashlib.sha256(encoded).hexdigest() == (
-    "8f92400c0c3d13c53a393d88e3233b082f76c0ff264a4e87faae0506074db68e"
+    "d1ace73c6ad854df5a79a29aeb563f96eb74dc8a45cd8d4b4fcbabc45ba830ad"
   )
-  assert b'"hmac_sha256":"dc9e8808554c791b9ae8bb49f9646d5f672cfc640b561defa3788bb200934534"' in encoded
+  assert b'"hmac_sha256":"50527cc0c403b66dec89102eb328c1a9c855133288fec93e35975d0df1a01ad4"' in encoded
   assert encoded == canonical_json_bytes(json.loads(encoded))
   decoded = validate_request(
     encoded,
@@ -263,6 +273,15 @@ def test_noncanonical_duplicate_nonfinite_and_oversize_json_fail() -> None:
     decode_canonical_json(b'{"a":NaN}', maximum_bytes=100)
   with pytest.raises(BridgeCorruptError, match="size"):
     decode_canonical_json(b"{}", maximum_bytes=1)
+
+
+def test_plain_json_value_error_is_protocol_corruption(monkeypatch) -> None:
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol.json.loads",
+    lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("decoder")),
+  )
+  with pytest.raises(BridgeCorruptError, match="invalid canonical JSON"):
+    decode_canonical_json(b"{}", maximum_bytes=100)
 
 
 def test_tamper_stale_nonce_and_replay_fail_closed() -> None:
@@ -481,7 +500,7 @@ def discovery_response(
     payload={
       "http_host": "10.0.0.99",
       "http_port": 47830,
-      "protocol_version": 1,
+      "protocol_version": 2,
       "source_commit": source_commit,
     },
     sent_unix_ms=NOW_MS,
@@ -891,6 +910,37 @@ def test_inventory_pagination_reads_past_job_route_bound() -> None:
   assert len(factory.calls) == 2
 
 
+def test_inventory_pagination_rejects_total_archive_overflow(
+  monkeypatch,
+) -> None:
+  archive = [inventory_descriptor(index) for index in range(1, 131)]
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_client.MAX_INVENTORY_ROUTE_COUNT",
+    129,
+  )
+
+  def responder(request):
+    decoded = validate_request(
+      request["body"],
+      secret=SECRET,
+      expected_operation="route_inventory",
+      now_unix_ms=NOW_MS,
+      maximum_bytes=MAX_CONTROL_BYTES,
+    )
+    cursor = decoded["payload"]["cursor"]
+    start = 0 if cursor is None else 128
+    page = archive[start:start + 128]
+    next_cursor = page[-1]["archive_name"] if start == 0 else None
+    return response_for_request(
+      request,
+      {"next_cursor": next_cursor, "routes": page},
+    )
+
+  instance, _ = client(responder)
+  with pytest.raises(BridgeCorruptError, match="complete archive bound"):
+    instance.route_inventory()
+
+
 def test_inventory_pagination_rejects_replayed_page() -> None:
   page = [inventory_descriptor(1)]
 
@@ -1209,6 +1259,7 @@ def test_job_status_validates_worker_extractor_and_progress() -> None:
     "error": None,
     "job_id": JOB_ID,
     "outcomes": [],
+    "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
     "progress": {
       "authority_count": 2,
       "authority_index": 1,
@@ -1227,6 +1278,12 @@ def test_job_status_validates_worker_extractor_and_progress() -> None:
     "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
     "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
     "worker_instance_id": WORKER_INSTANCE_ID,
+    "worker_numerical_environment_sha256": (
+      WORKER_NUMERICAL_ENVIRONMENT_SHA
+    ),
+    "worker_preparation_implementation_sha256": (
+      WORKER_PREPARATION_IMPLEMENTATION_SHA
+    ),
   }
   instance, _ = client(health_then_payload_responder(payload))
   instance.health()
@@ -1245,11 +1302,18 @@ def test_job_status_validates_worker_extractor_and_progress() -> None:
 def test_idempotent_job_create_accepts_prior_terminal_state(state: str) -> None:
   instance, _ = client(health_then_payload_responder({
     "job_id": JOB_ID,
+    "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
     "route_count": 1,
     "state": state,
     "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
     "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
     "worker_instance_id": WORKER_INSTANCE_ID,
+    "worker_numerical_environment_sha256": (
+      WORKER_NUMERICAL_ENVIRONMENT_SHA
+    ),
+    "worker_preparation_implementation_sha256": (
+      WORKER_PREPARATION_IMPLEMENTATION_SHA
+    ),
   }))
   instance.health()
   result = instance.create_job(
@@ -1313,11 +1377,18 @@ def test_client_binds_job_create_to_health_worker_implementation() -> None:
     else:
       payload = {
         "job_id": JOB_ID,
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "route_count": 1,
         "state": "queued",
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": "6" * 64,
         "worker_instance_id": WORKER_INSTANCE_ID,
+        "worker_numerical_environment_sha256": (
+          WORKER_NUMERICAL_ENVIRONMENT_SHA
+        ),
+        "worker_preparation_implementation_sha256": (
+          WORKER_PREPARATION_IMPLEMENTATION_SHA
+        ),
       }
     return response_for_request(request, payload)
 

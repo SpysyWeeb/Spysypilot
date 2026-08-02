@@ -57,8 +57,10 @@ prepared-data handoff, or a stable local-fallback reason. A PC-only route that
 both remote authorities reject cannot be certified without local bytes, so it
 is excluded before effective discovery rather than recorded as a rejection.
 It contributes no learner evidence, ledger entry, watermark movement,
-readiness count, or behavior-cohort vote. Locally retained rejections still
-require exact ARM reproduction. After certified artifacts are handed off, the
+readiness count, or behavior-cohort vote. Locally retained PC rejections fail
+closed as `architecture_verification_rejection_unprovable`; the device never
+recreates the removed full-route ARM replay merely to reproduce a reason and
+message. After certified artifacts are handed off, the
 ordinary local progress projection again owns route/application detail.
 Accepted-route certificates are shared only across equal extractor/join
 schemas, recorded log schema, complete runtime-vehicle bundle identities, and
@@ -66,6 +68,22 @@ validated physical-vehicle projections.
 Full CarParams bytes remain verified per route, but do not create separate
 numerical domains for physically identical recordings; an unchanged worker
 implementation also retains certification across a service restart.
+
+ARM certification is intentionally not another complete-route decode. The PC
+authorities emit one deterministic whole-segment vector per prepared route;
+segment 0 supplies authenticated CarParams and hash-selected interior/end
+segments cover the preparation path. The source vector is capped at three
+segments, 96 MiB compressed, and 30,000 controls witnesses. Its canonical
+result is capped at 64 KiB. A killable child enforces a 120 s deadline, 450 MiB
+child RSS, and 600 MiB combined RSS. The earlier full-route ARM reproduction
+was removed after its overlapping decoded populations exhausted device memory.
+One locally available canary proves each equal preparation/runtime domain on
+ARM; it is an implementation/domain proof, not a claim that every route was
+replayed on ARM. Per-route causality comes from the two independent PC
+preparations and byte-exact route artifacts. That incident is why complete PC
+artifacts are now authenticated and applied through bounded streams, while
+unavailable-worker local fallback and remote artifact application use one
+replay worker rather than recreating the four-PC-worker memory shape.
 
 ## Can previous routes be used?
 
@@ -111,7 +129,7 @@ unreviewed.
 
 | State | Meaning |
 | --- | --- |
-| `preparing` | Waiting for exact CarParams or restoring the runtime. |
+| `preparing` | Waiting for exact CarParams, restoring the runtime, or spending the bounded 30-second cold-boot grace discovering the optional PC worker. |
 | `ready_no_evidence` | No eligible committed route exists yet. |
 | `finalizing` | Waiting for logger closure, verifying pass 2/2 with route/segment progress, comparing, or publishing. |
 | `backfilling` | Scanning complete routes or replaying pass 1/2 with route/segment progress. |
@@ -224,8 +242,8 @@ backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v6`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
-cross-architecture certification are `1/3`, and off-device display progress
-is `1`; future feedback/lifecycle and
+cross-architecture certification are `2/5`, and off-device display progress
+is `2`; future feedback/lifecycle and
 approved-artifact/selection/activation contracts are `2/2` and `5/2/1`.
 Older evidence is never
 reinterpreted or mixed silently.

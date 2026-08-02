@@ -131,6 +131,18 @@ work therefore cannot be misreported as **LEARNER STATUS UNAVAILABLE**; the
 display cache still conveys no durable-learning authority until authenticated
 evidence is restored or committed.
 
+Off-device preparation is bounded and fail-closed. The PC prepares every full
+route twice, byte-compares the independent results, and returns authenticated
+artifacts plus compact certification vectors. The comma verifies the exact
+route/source/runtime/CarParams identity in a killable bounded child, then
+streams the two authorities serially; it never materializes a complete route
+artifact merely to consume PC output. Local fallback deliberately uses one
+worker. Interrupted scratch is quarantined for explicit recovery instead of
+being recursively deleted, and behavior learning remains stock-retained until
+its route-major streaming backend exists. The memory and trust boundaries are
+documented in
+[`docs/BLATV2_BEHAVIOR_STREAMING.md`](docs/BLATV2_BEHAVIOR_STREAMING.md).
+
 ## To-Do
 
 Progress legend: ✅ done &nbsp;•&nbsp; ⚠️ in progress &nbsp;•&nbsp; ❌ not started
