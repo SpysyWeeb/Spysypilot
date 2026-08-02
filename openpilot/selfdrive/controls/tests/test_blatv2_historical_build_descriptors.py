@@ -19,7 +19,7 @@ REGISTRY_PATH = (
   / "historical_build_descriptors.json"
 )
 REVIEWED_REGISTRY_SHA256 = (
-  "07a6cb81141f57236efbbd028536af7fb66aa746615efda20142249bbad4c2b1"
+  "0657f4fae4b51b402090ec61aa2ba5fe7443ebfdb3c6db42b152bbac7b4db225"
 )
 FIRST_DESCRIPTOR_SHA256 = (
   "8ce8026f4ff30b1036206046dcd96aa3b27a47f61f21673a2629154379769684"
@@ -41,6 +41,7 @@ INTENDED_ROOT_COMMITS = {
   "7a1ddfc50c3dbb1a8837f95929474156d8c2ee46",
   "8341af9232c3ff1b0f99163b8a1b5f781d0fd47c",
   "86c85015d75a5272a4b78127ce28fc596708a968",
+  "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
   "9338f5be95d0b6c68bb326945e18c4e21e4b8147",
   "95ee7b64dfca375280519476f26f5500f3ae40d5",
   "9b9e2fa99ca915edd48cfe2767bb99f77240b895",
@@ -115,6 +116,29 @@ def test_checked_in_registry_is_canonical_complete_and_limits_only() -> None:
   assert load_reviewed_registry(REGISTRY_PATH).identity_sha256 == (
     REVIEWED_REGISTRY_SHA256
   )
+
+
+def test_combo_8cc_route_build_has_exact_reviewed_descriptor() -> None:
+  descriptor = load_reviewed_registry(REGISTRY_PATH).resolve(
+    "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
+  )
+  assert descriptor is not None
+  assert descriptor.to_dict() == {
+    "driver_allowance": 50,
+    "driver_factor": 1,
+    "driver_multiplier": 2,
+    "log_schema_blob": "d40096ff46dc7d1b0dec3698e3e9c77a63b3fb72",
+    "opendbc_commit": "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    "panda_commit": "7f245a890f7bc00712ca4ebf903190a084c7f86b",
+    "production_envelope_verified": True,
+    "rack_rate_resolution_deg_s": 4.0,
+    "steer_delta_down": 7,
+    "steer_delta_up": 4,
+    "steer_max": 409,
+    "steer_step": 1,
+    "superproject_commit": "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
+    "supported_vehicle_identity": "HYUNDAI_PALISADE",
+  }
 
 
 def test_duplicate_root_is_rejected(tmp_path: Path) -> None:
