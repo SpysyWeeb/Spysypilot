@@ -51,7 +51,9 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
   prepare_remote_session,
 )
 from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
+  CERTIFICATION_VECTOR_SCHEMA_VERSION,
   CertificationVector,
+  _segment_vector,
 )
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   RouteEvidenceArtifact,
@@ -1367,6 +1369,7 @@ def accepted_spool_outcomes(
   *,
   car_params_bytes: bytes = b"test-canonical-car-params",
   runtime_identity: str | None = None,
+  segment_context_exclusions: int = 0,
 ) -> dict[tuple[int, str], _PreparedOutcome]:
   result: dict[tuple[int, str], _PreparedOutcome] = {}
   runtime = "a" * 64 if runtime_identity is None else runtime_identity
@@ -1382,7 +1385,11 @@ def accepted_spool_outcomes(
   artifact_provenance = dict(provenance)
   artifact_provenance["car_params_sha256"] = cp_hash
   segment_result = {
-    "boundary_exclusions": {},
+    "boundary_exclusions": (
+      {}
+      if segment_context_exclusions == 0
+      else {"segment_local_measurement_context": segment_context_exclusions}
+    ),
     "car_params_sha256": cp_hash,
     "coverage": {
       "controls_retained": 1,
@@ -1425,7 +1432,7 @@ def accepted_spool_outcomes(
       "maximum_controls_witnesses": 30_000,
       "maximum_segments": 3,
       "selected_compressed_bytes": candidate.segments[0].size_bytes,
-      "selected_controls_witnesses": 1,
+      "selected_controls_witnesses": 1 + segment_context_exclusions,
     },
     "domain": "blatv2-cross-architecture-vector-v1",
     "route_name": candidate.route_name,
@@ -1434,7 +1441,7 @@ def accepted_spool_outcomes(
       "source_segment_index": candidate.segments[0].index,
       "source_segment_sha256": candidate.segments[0].sha256,
     },
-    "schema_version": 1,
+    "schema_version": CERTIFICATION_VECTOR_SCHEMA_VERSION,
     "segment_results": [segment_result],
     "selection_identity_sha256": selection_identity,
     "source_manifest": source_segments,
@@ -1507,7 +1514,7 @@ def accepted_spool_outcomes(
         filename=f"a{authority}-{candidate.route_name}.cert-vector",
         sha256=vector.sha256,
         size_bytes=len(vector.canonical_bytes),
-        selected_controls_witnesses=1,
+        selected_controls_witnesses=1 + segment_context_exclusions,
         selected_segment_count=1,
         selection_identity_sha256=selection_identity,
       ),
@@ -1540,6 +1547,52 @@ def empty_prepared_route(
       runtime_identity=runtime_identity,
     ),
   )
+
+
+def test_certification_vector_separates_segment_measurement_context() -> None:
+  candidate = RouteCandidate(
+    route_name="00000002--2222222222",
+    route_counter=2,
+    segments=(RouteSegment(0, Path("rlog"), "2" * 64, 1),),
+  )
+  prepared = replace(
+    empty_prepared_route(candidate, prepared_provenance()),
+    pre_poll_dropped_count=1,
+    segment_local_measurement_context_dropped_count=2,
+  )
+
+  result = _segment_vector(
+    segment=candidate.segments[0],
+    prepared=prepared,
+  )
+
+  assert result["boundary_exclusions"] == {
+    "pre_poll_controls": 1,
+    "segment_local_measurement_context": 2,
+  }
+
+
+def test_certification_manifest_accounts_for_segment_measurement_context(
+  tmp_path: Path,
+) -> None:
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  outcomes = accepted_spool_outcomes(
+    tmp_path,
+    candidate,
+    prepared_provenance(),
+    segment_context_exclusions=2,
+  )
+  descriptor = outcomes[(1, candidate.route_name)].certification_vector
+  assert descriptor is not None
+
+  vector = CertificationVector.from_bytes(
+    (tmp_path / descriptor.filename).read_bytes(),
+  )
+
+  assert vector.manifest["bounds"]["selected_controls_witnesses"] == 3
+  assert vector.manifest["segment_results"][0]["boundary_exclusions"] == {
+    "segment_local_measurement_context": 2,
+  }
 
 
 def test_streamed_artifact_vector_binding_rejects_authority_mix(

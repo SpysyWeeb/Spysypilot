@@ -49,7 +49,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 )
 
 
-CERTIFICATION_VECTOR_SCHEMA_VERSION: Final = 1
+CERTIFICATION_VECTOR_SCHEMA_VERSION: Final = 2
 CERTIFICATION_VECTOR_MAGIC: Final = b"BLATCV01"
 CERTIFICATION_VECTOR_MAX_SEGMENTS: Final = 3
 CERTIFICATION_VECTOR_MAX_COMPRESSED_BYTES: Final = 96 * 1024 * 1024
@@ -291,6 +291,11 @@ def _segment_vector(
   pre_poll_count = prepared.pre_poll_dropped_count
   if pre_poll_count:
     excluded["pre_poll_controls"] += pre_poll_count
+  segment_context_count = (
+    prepared.segment_local_measurement_context_dropped_count
+  )
+  if segment_context_count:
+    excluded["segment_local_measurement_context"] += segment_context_count
 
   source = artifact.source_identity
   section_hashes = artifact.manifest.get("section_sha256")
@@ -411,6 +416,7 @@ def build_certification_vector(
         route_car_params_seed=(
           None if segment.index == first_index else route_car_params_seed
         ),
+        certification_segment_mode=True,
       )
     except ValueError as exc:
       raise CertificationVectorError(
@@ -666,7 +672,7 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
       raise CertificationVectorError("boundary exclusions are malformed")
     controls_total += int(coverage["controls_total"]) + int(
       exclusions.get("pre_poll_controls", 0),
-    )
+    ) + int(exclusions.get("segment_local_measurement_context", 0))
     hashes = result["encoded_plane_sha256"]
     expected_hashes = {
       "controls_retained", "driving_events", "lateral_maneuver_plans",
