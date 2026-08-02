@@ -19,13 +19,15 @@ longitudinal planner/MPC policy. Its joint product target is:
   situation requires it, without weakening stock emergency braking or
   platform safety limits.
 
-The current test revision retains up to `4.0 m/s²` at launch. Field feedback
-from route `000000d2--a62f0c1831` now fades that extra launch authority into
-openpilot's stock acceleration gate by `10 m/s` (about `22 mph`) and follows
-the stock ceiling above it. The reaction-time jerk tune remains unchanged.
-Requested authority remains clamped to the deployed opendbc limit.
+The current test revision retains up to `4.0 m/s²` at launch and replaces the
+former four-node acceleration gate with one continuous cubic envelope:
+`a_max = 0.6 + 3.4 × (1 − v/40)³` from `0–40 m/s`, then `0.6 m/s²` above it.
+This removes the abrupt 0-to-10 m/s authority drop while remaining near the
+previous tune by urban speed and tapering smoothly at highway speed. The
+reaction-time jerk tune remains unchanged. Requested authority remains
+clamped to the deployed opendbc limit.
 
-Route `000000d9--6040563d1d` showed that the stock ceiling alone still makes a
+Route `000000d9--6040563d1d` showed that an acceleration ceiling alone still makes a
 small highway set-speed correction use all available acceleration or the full
 `-1.2 m/s²` cruise deceleration limit. The current in-progress tune adds a
 lead-free Chill cruise comfort response: above `15 m/s`, a `5 mph` error asks
