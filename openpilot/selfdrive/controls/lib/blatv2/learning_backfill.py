@@ -677,6 +677,7 @@ class PreparedRoute:
   pre_poll_dropped_count: int = 0
   behavior_eligible: bool = False
   behavior_ineligible_reason: str = "shared_evidence_unavailable"
+  segment_local_measurement_context_dropped_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1854,13 +1855,20 @@ def _build_canonical_control_joins(
   car_outputs: tuple[_TimedRouteRecord, ...],
   car_controls: tuple[_TimedRouteRecord, ...],
   vehicle_model: Any,
-) -> tuple[tuple[_CanonicalControlJoin, ...], tuple[int, ...]]:
+  certification_segment_mode: bool = False,
+) -> tuple[
+  tuple[_CanonicalControlJoin, ...],
+  tuple[int, ...],
+  tuple[int, ...],
+]:
   """Freeze the controller-independent SubMaster input race once.
 
   ``controlsState.curvature`` is a Float32 selection oracle.  It is computed
   upstream of every controller candidate, so matching its exact Float32 bits
   reconstructs the recording's source scheduling without tailoring inputs to
-  the learner or a replayed controller.
+  the learner or a replayed controller. Certification may remove only the
+  initial witnesses whose selected segment-local poll lacks either measurement
+  baselines; ordinary route preparation remains strict.
   """
   if not controls:
     raise RouteRejected(
@@ -1922,6 +1930,35 @@ def _build_canonical_control_joins(
     raise RouteRejected(
       "missing_controls_witness",
       "all controlsState witnesses precede the first selfdriveState poll",
+    )
+
+  segment_context_count = 0
+  if certification_segment_mode:
+    for witness in scoreable:
+      poll_index = bisect_right(poll_times, witness.mono_ns) - 1
+      if poll_index < 0:
+        raise AssertionError("pre-poll controls prefix was not removed")
+      poll_ns = poll_times[poll_index]
+      if (
+        _latest_record_at_or_before(ordered_states, state_times, poll_ns)
+        is not None
+        and _latest_record_at_or_before(
+          ordered_outputs,
+          output_times,
+          poll_ns,
+        )
+        is not None
+      ):
+        break
+      segment_context_count += 1
+  segment_context_dropped = tuple(
+    record.mono_ns for record in scoreable[:segment_context_count]
+  )
+  scoreable = scoreable[segment_context_count:]
+  if not scoreable:
+    raise RouteRejected(
+      "measurement_race_unreconstructable",
+      f"{route_name}: segment has no controlsState witness with local measurement context",
     )
   paired_commands = _pair_same_cycle_car_controls(
     scoreable,
@@ -2069,7 +2106,7 @@ def _build_canonical_control_joins(
       ),
     ))
     previous_witness_ns = witness.mono_ns
-  return tuple(joins), dropped
+  return tuple(joins), dropped, segment_context_dropped
 
 
 def _measured_frame_from_join(
@@ -2322,6 +2359,7 @@ def _route_evidence_artifact(
   joins: tuple[_CanonicalControlJoin, ...],
   frames: tuple[MeasuredLearningFrame, ...],
   pre_poll_dropped: tuple[int, ...],
+  segment_local_measurement_context_dropped: tuple[int, ...],
   gap_count: int,
   provenance: Mapping[str, object],
 ) -> RouteEvidenceArtifact:
@@ -2612,10 +2650,15 @@ def _route_evidence_artifact(
     physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
     physical_record_count=len(frames),
     preparation_cache_key=_sha256(_canonical_json_bytes(cache_payload)),
-    controls_witness_count=len(joins) + len(pre_poll_dropped),
+    controls_witness_count=(
+      len(joins)
+      + len(pre_poll_dropped)
+      + len(segment_local_measurement_context_dropped)
+    ),
     unresolved_witness_count=(
       sum(join.curvature_unresolved or join.car_control is None for join in joins)
       + len(pre_poll_dropped)
+      + len(segment_local_measurement_context_dropped)
     ),
     gap_count=gap_count,
     model_link_failure_count=model_failure_count,
@@ -2657,8 +2700,11 @@ def _prepare_route_with_extractor(
   structural_last_segment_index: int | None = None,
   maximum_controls_witnesses: int | None = None,
   route_car_params_seed: bytes | None = None,
+  certification_segment_mode: bool = False,
 ) -> PreparedRoute:
   """Validate one complete route before exposing any frame to the learner."""
+  if type(certification_segment_mode) is not bool:
+    raise ValueError("certification segment mode must be boolean")
   if maximum_controls_witnesses is None:
     maximum_controls_witnesses = MAXIMUM_ROUTE_FRAMES
   if (
@@ -2989,7 +3035,11 @@ def _prepare_route_with_extractor(
   try:
     from opendbc.car.vehicle_model import VehicleModel
 
-    canonical_joins, pre_poll_dropped = _build_canonical_control_joins(
+    (
+      canonical_joins,
+      pre_poll_dropped,
+      segment_local_measurement_context_dropped,
+    ) = _build_canonical_control_joins(
       route_name=route.route_name,
       controls=tuple(route_records["controlsState"]),
       polls=tuple(route_records["selfdriveState"]),
@@ -2998,6 +3048,7 @@ def _prepare_route_with_extractor(
       car_outputs=tuple(route_records["carOutput"]),
       car_controls=tuple(route_records["carControl"]),
       vehicle_model=VehicleModel(route_car_params),
+      certification_segment_mode=certification_segment_mode,
     )
     all_frames = tuple(
       _measured_frame_from_join(join)
@@ -3079,6 +3130,9 @@ def _prepare_route_with_extractor(
     joins=canonical_joins,
     frames=all_frames,
     pre_poll_dropped=pre_poll_dropped,
+    segment_local_measurement_context_dropped=(
+      segment_local_measurement_context_dropped
+    ),
     gap_count=gap_count,
     provenance=provenance,
   )
@@ -3087,6 +3141,7 @@ def _prepare_route_with_extractor(
     controls_witness_count=decoded_controls_count,
     unresolved_witness_count=(
       unresolved_in_coverage + len(pre_poll_dropped)
+      + len(segment_local_measurement_context_dropped)
     ),
     gap_count=gap_count,
     provenance=provenance,
@@ -3095,6 +3150,9 @@ def _prepare_route_with_extractor(
     behavior_eligible=route_evidence.source_identity.behavior_eligible,
     behavior_ineligible_reason=(
       route_evidence.source_identity.behavior_ineligible_reason
+    ),
+    segment_local_measurement_context_dropped_count=len(
+      segment_local_measurement_context_dropped,
     ),
   )
 
@@ -3121,8 +3179,11 @@ def prepare_route(
   structural_last_segment_index: int | None = None,
   maximum_controls_witnesses: int | None = None,
   route_car_params_seed: bytes | None = None,
+  certification_segment_mode: bool = False,
 ) -> PreparedRoute:
   """Prepare one route with one hash-bound extractor inode held throughout."""
+  if type(certification_segment_mode) is not bool:
+    raise ValueError("certification segment mode must be boolean")
   extractor = open_verified_extractor(
     extractor_path,
     expected_sha256=expected_extractor_sha256,
@@ -3147,6 +3208,7 @@ def prepare_route(
       structural_last_segment_index=structural_last_segment_index,
       maximum_controls_witnesses=maximum_controls_witnesses,
       route_car_params_seed=route_car_params_seed,
+      certification_segment_mode=certification_segment_mode,
     )
   finally:
     try:

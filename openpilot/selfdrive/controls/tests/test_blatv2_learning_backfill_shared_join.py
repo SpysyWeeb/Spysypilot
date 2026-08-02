@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import struct
 
+import pytest  # noqa: TID251
+
 from openpilot.selfdrive.controls.lib.blatv2 import learning_backfill as backfill
 
 
@@ -97,7 +99,7 @@ def test_canonical_join_uses_float32_oracle_and_poll_owned_output() -> None:
     _controls(95, 0, _logged_curvature(1.0)),
     _controls(110, 1, _logged_curvature(2.0)),
   )
-  joins, dropped = backfill._build_canonical_control_joins(
+  joins, dropped, segment_context_dropped = backfill._build_canonical_control_joins(
     route_name="00000001--0000000001",
     controls=controls,
     polls=(_record(100, 2, None),),
@@ -118,6 +120,7 @@ def test_canonical_join_uses_float32_oracle_and_poll_owned_output() -> None:
   )
 
   assert dropped == (95,)
+  assert segment_context_dropped == ()
   assert len(joins) == 1
   joined = joins[0]
   assert joined.car_state.mono_ns == 105
@@ -130,7 +133,7 @@ def test_canonical_join_uses_float32_oracle_and_poll_owned_output() -> None:
 
 
 def test_canonical_join_no_match_retains_poll_baseline_and_marks_unresolved() -> None:
-  joins, dropped = backfill._build_canonical_control_joins(
+  joins, dropped, segment_context_dropped = backfill._build_canonical_control_joins(
     route_name="00000001--0000000001",
     controls=(_controls(110, 0, 123.0),),
     polls=(_record(100, 1, None),),
@@ -153,6 +156,7 @@ def test_canonical_join_no_match_retains_poll_baseline_and_marks_unresolved() ->
   )
 
   assert dropped == ()
+  assert segment_context_dropped == ()
   assert joins[0].car_state.mono_ns == 90
   assert joins[0].curvature_unresolved is True
   assert backfill._measured_frame_from_join(joins[0]).inputs_valid is False
@@ -163,7 +167,7 @@ def test_same_cycle_car_control_is_not_reused_or_taken_from_next_cycle() -> None
     _controls(110, 0, _logged_curvature(1.0)),
     _controls(120, 1, _logged_curvature(1.0)),
   )
-  joins, _ = backfill._build_canonical_control_joins(
+  joins, _, _ = backfill._build_canonical_control_joins(
     route_name="00000001--0000000001",
     controls=controls,
     polls=(_record(100, 2, None),),
@@ -207,7 +211,7 @@ def test_exact_model_link_ignores_a_newer_publication_in_the_race() -> None:
       modular_selection_bound=False,
     ),
   )
-  joins, _ = backfill._build_canonical_control_joins(
+  joins, _, _ = backfill._build_canonical_control_joins(
     route_name="00000001--0000000001",
     controls=(controls,),
     polls=(_record(120, 1, None),),
@@ -234,7 +238,7 @@ def test_exact_model_link_ignores_a_newer_publication_in_the_race() -> None:
 
 
 def _join_with_activity(*, lateral_active: bool) -> backfill._CanonicalControlJoin:
-  joins, dropped = backfill._build_canonical_control_joins(
+  joins, dropped, segment_context_dropped = backfill._build_canonical_control_joins(
     route_name="00000001--0000000001",
     controls=(_controls(110, 0, _logged_curvature(1.0)),),
     polls=(_record(100, 1, None),),
@@ -253,7 +257,89 @@ def _join_with_activity(*, lateral_active: bool) -> backfill._CanonicalControlJo
     vehicle_model=_FakeVehicleModel(),
   )
   assert dropped == ()
+  assert segment_context_dropped == ()
   return joins[0]
+
+
+def test_certification_drops_only_initial_missing_segment_measurements() -> None:
+  arguments = {
+    "route_name": "00000001--0000000001",
+    "controls": (
+      _controls(110, 0, _logged_curvature(1.0)),
+      _controls(130, 1, _logged_curvature(2.0)),
+    ),
+    "polls": (
+      _record(100, 2, None),
+      _record(120, 3, None),
+    ),
+    # The first segment-local measurements arrive after the first witness.
+    "car_states": (_record(115, 4, _state(2.0)),),
+    "live_parameters": (_record(115, 5, _parameters()),),
+    "car_outputs": (_record(
+      116,
+      6,
+      backfill._RecordedCarOutput(0.1, 41, True),
+    ),),
+    "car_controls": (
+      _record(111, 7, backfill._RecordedCarControl(True, 0.1)),
+      _record(131, 8, backfill._RecordedCarControl(True, 0.2)),
+    ),
+    "vehicle_model": _FakeVehicleModel(),
+  }
+
+  with pytest.raises(
+    backfill.RouteRejected,
+    match="selfdriveState poll precedes the first carState",
+  ):
+    backfill._build_canonical_control_joins(**arguments)
+
+  joins, pre_poll_dropped, segment_context_dropped = (
+    backfill._build_canonical_control_joins(
+      **arguments,
+      certification_segment_mode=True,
+    )
+  )
+  assert pre_poll_dropped == ()
+  assert segment_context_dropped == (110,)
+  assert len(joins) == 1
+  assert joins[0].witness.mono_ns == 130
+  assert joins[0].poll_mono_ns == 120
+
+
+def test_certification_does_not_suppress_later_canonical_error() -> None:
+  with pytest.raises(
+    backfill.RouteRejected,
+    match="carState compact payload has an invalid type",
+  ):
+    backfill._build_canonical_control_joins(
+      route_name="00000001--0000000001",
+      controls=(
+        _controls(110, 0, _logged_curvature(1.0)),
+        _controls(130, 1, _logged_curvature(2.0)),
+        _controls(150, 2, _logged_curvature(3.0)),
+      ),
+      polls=(
+        _record(100, 3, None),
+        _record(120, 4, None),
+        _record(140, 5, None),
+      ),
+      car_states=(
+        _record(115, 6, _state(2.0)),
+        _record(135, 7, object()),
+      ),
+      live_parameters=(_record(115, 8, _parameters()),),
+      car_outputs=(
+        _record(116, 9, backfill._RecordedCarOutput(0.1, 41, True)),
+        _record(136, 10, backfill._RecordedCarOutput(0.2, 82, True)),
+      ),
+      car_controls=(
+        _record(111, 11, backfill._RecordedCarControl(True, 0.1)),
+        _record(131, 12, backfill._RecordedCarControl(True, 0.2)),
+        _record(151, 13, backfill._RecordedCarControl(True, 0.3)),
+      ),
+      vehicle_model=_FakeVehicleModel(),
+      certification_segment_mode=True,
+    )
 
 
 def test_inactive_missing_model_is_retained_startup_context() -> None:

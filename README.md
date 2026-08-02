@@ -181,6 +181,20 @@ Each feature links to its branch — the branch README has the full "what/how/wh
   have independent readiness and gates, and the behavior search may change
   only global natural frequency and damping after a homogeneous four-route
   cohort exists. No result auto-activates.
+
+  The first offroad transaction probes the configured PC worker immediately,
+  then retries transient discovery absence for up to 30 seconds before
+  selecting local replay. This gives Wi-Fi time to associate without delaying
+  an already reachable worker. Offroad ownership is checked around every
+  attempt; authentication, configuration, source, and protocol failures remain
+  fail-closed rather than being hidden by the timer.
+
+  Certification replays selected whole segments independently. A contiguous
+  segment-start controls prefix whose selected poll precedes the first
+  segment-local `carState` or `carOutput` is unscoreable without borrowing state
+  from another segment, so it is excluded and counted explicitly as
+  `segment_local_measurement_context`. Ordinary whole-route canonical input
+  reconstruction remains strict.
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

@@ -367,6 +367,7 @@ def prepare_fixture(
   route_bundle_factory=None,
   segment_started=None,
   segment_completed=None,
+  certification_segment_mode: bool = False,
 ):
   segment_path = tmp_path / "rlog"
   segment_path.write_bytes(b"immutable-rlog")
@@ -416,6 +417,7 @@ def prepare_fixture(
     expected_dongle_id=DONGLE_ID,
     segment_started=segment_started,
     segment_completed=segment_completed,
+    certification_segment_mode=certification_segment_mode,
   )
 
 
@@ -666,6 +668,50 @@ def test_quality_gate_covers_all_controls_and_route_tail(
     else "measurement_continuity_failed"
   )
   assert raised.value.reason == expected
+
+
+def test_certification_mode_removes_only_segment_local_context_prefix(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  palisade_cp: car.CarParams,
+) -> None:
+  records, events = extracted_fixture(
+    palisade_cp,
+    control_count=20,
+    source_mode="late",
+  )
+  prepared = prepare_fixture(
+    tmp_path,
+    monkeypatch,
+    records=records,
+    events=events,
+    cp=palisade_cp,
+    car_params_decoder=None,
+    certification_segment_mode=True,
+  )
+
+  assert prepared.controls_witness_count == 20
+  assert len(prepared.frames) == 10
+  assert prepared.pre_poll_dropped_count == 0
+  assert prepared.segment_local_measurement_context_dropped_count == 10
+
+
+def test_certification_mode_rejects_truthy_non_boolean(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  palisade_cp: car.CarParams,
+) -> None:
+  records, events = extracted_fixture(palisade_cp, control_count=20)
+  with pytest.raises(ValueError, match="must be boolean"):
+    prepare_fixture(
+      tmp_path,
+      monkeypatch,
+      records=records,
+      events=events,
+      cp=palisade_cp,
+      car_params_decoder=None,
+      certification_segment_mode=1,
+    )
 
 
 @pytest.mark.parametrize(
