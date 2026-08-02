@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import os
 from pathlib import Path
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest  # noqa: TID251
@@ -23,11 +27,21 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
   write_prepared_route_spool,
 )
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
+  ArchitectureVerificationError,
   BridgeFallbackUnavailableError,
   RemotePreparationSession,
   RemoteRoutePlan,
   _PreparedOutcome,
+  _CertificationVectorDescriptor,
   _RemoteProgressProjector,
+  _bind_downloaded_artifact_to_vector,
+  _create_private_scratch,
+  _cleanup_private_scratch,
+  cleanup_stale_remote_scratch,
+  _run_architecture_verification,
+  _register_private_scratch_file,
+  _remote_transaction_disk_requirement,
+  _snapshot_certification_route,
   _certify_preparation_domains as _certify_preparation_domains_impl,
   _exclude_unverified_remote_rejections,
   _upload_missing_routes,
@@ -36,8 +50,16 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill import (
   build_remote_route_plan,
   prepare_remote_session,
 )
+from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
+  CertificationVector,
+)
+from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
+  RouteEvidenceArtifact,
+  inspect_route_evidence_file,
+)
 from openpilot.selfdrive.controls.lib.blatv2.offdevice_protocol import (
   BridgeCorruptError,
+  BridgeAbortedError,
   BridgeRemoteError,
   BridgeUnavailableError,
   canonical_json_bytes,
@@ -58,9 +80,29 @@ WORKER_EXTRACTOR = "e" * 64
 WORKER_INSTANCE = "9" * 64
 WORKER_IMPLEMENTATION_COMMIT = "7" * 40
 WORKER_IMPLEMENTATION_SHA = "8" * 64
+PREPARATION_IMPLEMENTATION_SHA = "6" * 64
+DEVICE_NUMERICAL_ENVIRONMENT_SHA = "5" * 64
+WORKER_NUMERICAL_ENVIRONMENT_SHA = "4" * 64
+WORKER_PREPARATION_IMPLEMENTATION_SHA = PREPARATION_IMPLEMENTATION_SHA
 
 
 def _certify_preparation_domains(**arguments):
+  arguments.setdefault(
+    "preparation_implementation_sha256",
+    PREPARATION_IMPLEMENTATION_SHA,
+  )
+  arguments.setdefault(
+    "device_numerical_environment_sha256",
+    DEVICE_NUMERICAL_ENVIRONMENT_SHA,
+  )
+  arguments.setdefault(
+    "worker_numerical_environment_sha256",
+    WORKER_NUMERICAL_ENVIRONMENT_SHA,
+  )
+  arguments.setdefault(
+    "worker_preparation_implementation_sha256",
+    WORKER_PREPARATION_IMPLEMENTATION_SHA,
+  )
   arguments.setdefault(
     "worker_implementation_commit",
     WORKER_IMPLEMENTATION_COMMIT,
@@ -69,6 +111,15 @@ def _certify_preparation_domains(**arguments):
     "worker_implementation_sha256",
     WORKER_IMPLEMENTATION_SHA,
   )
+  if "architecture_verifier" not in arguments:
+    def verifier(*, engine, route, **_kwargs):
+      engine.prepare_count += 1
+      descriptor = arguments["outcomes"][(1, route.route_name)].certification_vector
+      assert descriptor is not None
+      return CertificationVector.from_bytes(
+        (arguments["scratch_directory"] / descriptor.filename).read_bytes(),
+      )
+    arguments["architecture_verifier"] = verifier
   return _certify_preparation_domains_impl(**arguments)
 
 
@@ -266,6 +317,15 @@ def prepared_outcome(
       "sha256": sha,
       "size_bytes": 100,
     },
+    "certification_vector": {
+      "artifact_id": "b" * 64,
+      "route_name": route_name,
+      "selected_controls_witnesses": 1,
+      "selected_segment_count": 1,
+      "selection_identity_sha256": "c" * 64,
+      "sha256": "d" * 64,
+      "size_bytes": 100,
+    },
     "disposition": "prepared",
     "route_name": route_name,
   }
@@ -440,7 +500,6 @@ def test_mixed_remote_session_continues_without_unverified_rejection(
     "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._RemoteProgressProjector",
     Projector,
   )
-  scratch = tmp_path / ".blatv2-remote-prepare-filtered"
   downloaded_keys: set[tuple[int, str]] = set()
 
   def download(*, routes, outcomes, progress, **_kwargs):
@@ -448,7 +507,12 @@ def test_mixed_remote_session_continues_without_unverified_rejection(
     downloaded_keys.update(outcomes)
     progress(0, 2, 0, 200)
     progress(2, 2, 200, 200)
-    scratch.mkdir(mode=0o700)
+    scratch_owner = _create_private_scratch(
+      tmp_path,
+      prefix=".blatv2-remote-prepare-",
+      required_bytes=200,
+    )
+    scratch = scratch_owner.path
     provenance = {"source": "mixed-session-test"}
     evidence = route_evidence_for_frames(accepted.route_name, (), provenance)
     resolved = {}
@@ -466,18 +530,23 @@ def test_mixed_remote_session_continues_without_unverified_rejection(
         filename=f"a{authority}-{accepted.route_name}.spool",
         route_evidence=evidence,
       )
+      _register_private_scratch_file(
+        scratch_owner,
+        scratch / descriptor.filename,
+        stable=True,
+      )
       resolved[(authority, accepted.route_name)] = _PreparedOutcome(
         descriptor=descriptor,
         rejection_reason=None,
         rejection_message=None,
       )
-    return scratch, resolved
+    return scratch_owner, resolved
 
   def certify(*, plan, outcomes, progress, **_kwargs):
     assert plan.replay_candidates == (accepted,)
     assert plan.discovery.candidates == (accepted,)
-    progress(0, 0, 1, 1)
-    progress(1, 1, 1, 1)
+    progress(0, 0, 1, 1, 0, None, None, None)
+    progress(1, 1, 1, 1, 1, None, None, None)
     return {
       key: _PreparedOutcome(
         descriptor=value.descriptor,
@@ -505,9 +574,12 @@ def test_mixed_remote_session_continues_without_unverified_rejection(
         **contract(),
         "state": "ready",
         "worker_count": 4,
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_extractor_sha256": WORKER_EXTRACTOR,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -519,8 +591,11 @@ def test_mixed_remote_session_continues_without_unverified_rejection(
         "job_id": "1" * 32,
         "route_count": 2,
         "state": "running",
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -536,8 +611,11 @@ def test_mixed_remote_session_continues_without_unverified_rejection(
         "progress": {},
         "state": "completed",
         "worker_extractor_sha256": WORKER_EXTRACTOR,
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -560,6 +638,8 @@ def test_mixed_remote_session_continues_without_unverified_rejection(
     engine=engine,
     client=Client(),
     contract=contract(),
+    preparation_implementation_sha256=PREPARATION_IMPLEMENTATION_SHA,
+    device_numerical_environment_sha256=DEVICE_NUMERICAL_ENVIRONMENT_SHA,
     scratch_parent=tmp_path,
     abort_requested=lambda: False,
     offdevice_progress=offdevice_progress,
@@ -658,9 +738,12 @@ def test_all_excluded_late_failure_never_claims_remote_ready(
         **contract(),
         "state": "ready",
         "worker_count": 4,
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_extractor_sha256": WORKER_EXTRACTOR,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -672,8 +755,11 @@ def test_all_excluded_late_failure_never_claims_remote_ready(
         "job_id": "1" * 32,
         "route_count": 1,
         "state": "running",
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -687,8 +773,11 @@ def test_all_excluded_late_failure_never_claims_remote_ready(
         "progress": {},
         "state": "completed",
         "worker_extractor_sha256": WORKER_EXTRACTOR,
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -711,6 +800,8 @@ def test_all_excluded_late_failure_never_claims_remote_ready(
       engine=engine,
       client=Client(),
       contract=contract(),
+      preparation_implementation_sha256=PREPARATION_IMPLEMENTATION_SHA,
+      device_numerical_environment_sha256=DEVICE_NUMERICAL_ENVIRONMENT_SHA,
       scratch_parent=tmp_path,
       abort_requested=lambda: False,
       offdevice_progress=progress,
@@ -724,8 +815,12 @@ def test_all_excluded_late_failure_never_claims_remote_ready(
 def test_session_opens_exact_spool_and_cleans_it(
   tmp_path: Path,
 ) -> None:
-  scratch = tmp_path / ".blatv2-remote-prepare-test"
-  scratch.mkdir(mode=0o700)
+  scratch_owner = _create_private_scratch(
+    tmp_path,
+    prefix=".blatv2-remote-prepare-",
+    required_bytes=0,
+  )
+  scratch = scratch_owner.path
   candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
   provenance = {"source": "test"}
   evidence = route_evidence_for_frames(candidate.route_name, (), provenance)
@@ -741,6 +836,11 @@ def test_session_opens_exact_spool_and_cleans_it(
     abort_requested=lambda: False,
     filename="a1-route.spool",
     route_evidence=evidence,
+  )
+  _register_private_scratch_file(
+    scratch_owner,
+    scratch / descriptor.filename,
+    stable=True,
   )
   # Prove the same descriptor is independently valid before handing it to the
   # source callback; the callback/replay owns deletion after this point.
@@ -764,6 +864,7 @@ def test_session_opens_exact_spool_and_cleans_it(
       ),
     },
     worker_extractor_sha256="a" * 64,
+    scratch_owner=scratch_owner,
   )
   remote = session._source(1, candidate, lambda: False)
   assert tuple(remote.iter_frames()) == ()
@@ -902,9 +1003,12 @@ def test_archive_sync_runs_even_when_no_remote_replay_job(
         **contract(),
         "state": "ready",
         "worker_count": 4,
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_extractor_sha256": WORKER_EXTRACTOR,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -917,6 +1021,8 @@ def test_archive_sync_runs_even_when_no_remote_replay_job(
     engine=engine,
     client=Client(),
     contract=contract(),
+    preparation_implementation_sha256=PREPARATION_IMPLEMENTATION_SHA,
+    device_numerical_environment_sha256=DEVICE_NUMERICAL_ENVIRONMENT_SHA,
     scratch_parent=tmp_path,
     abort_requested=lambda: False,
   )
@@ -975,9 +1081,12 @@ def test_job_status_resource_loss_or_identity_change_falls_back(
         **contract(),
         "state": "ready",
         "worker_count": 4,
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_extractor_sha256": WORKER_EXTRACTOR,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -989,8 +1098,11 @@ def test_job_status_resource_loss_or_identity_change_falls_back(
         "job_id": "1" * 32,
         "route_count": 1,
         "state": "running",
+        "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -1000,22 +1112,28 @@ def test_job_status_resource_loss_or_identity_change_falls_back(
       if status_mode == "canceled":
         return {
           "error": None,
-          "progress": {},
-          "state": "canceled",
+              "progress": {},
+              "state": "canceled",
+              "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
           "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
           "worker_implementation_sha256": WORKER_IMPLEMENTATION_SHA,
+          "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+          "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
           "worker_instance_id": WORKER_INSTANCE,
         }
       return {
         "error": {"code": "job_failed", "message": "worker resource lost"},
-        "progress": {},
-        "state": "failed",
+            "progress": {},
+            "state": "failed",
+            "preparation_implementation_sha256": PREPARATION_IMPLEMENTATION_SHA,
         "worker_implementation_commit": WORKER_IMPLEMENTATION_COMMIT,
         "worker_implementation_sha256": (
           "6" * 64
           if status_mode == "implementation_changed"
           else WORKER_IMPLEMENTATION_SHA
         ),
+        "worker_numerical_environment_sha256": WORKER_NUMERICAL_ENVIRONMENT_SHA,
+        "worker_preparation_implementation_sha256": WORKER_PREPARATION_IMPLEMENTATION_SHA,
         "worker_instance_id": WORKER_INSTANCE,
       }
 
@@ -1031,6 +1149,8 @@ def test_job_status_resource_loss_or_identity_change_falls_back(
       engine=engine,
       client=client,
       contract=contract(),
+      preparation_implementation_sha256=PREPARATION_IMPLEMENTATION_SHA,
+      device_numerical_environment_sha256=DEVICE_NUMERICAL_ENVIRONMENT_SHA,
       scratch_parent=tmp_path,
       abort_requested=lambda: False,
     )
@@ -1249,13 +1369,124 @@ def accepted_spool_outcomes(
   runtime_identity: str | None = None,
 ) -> dict[tuple[int, str], _PreparedOutcome]:
   result: dict[tuple[int, str], _PreparedOutcome] = {}
+  runtime = "a" * 64 if runtime_identity is None else runtime_identity
+  source_segments = [segment.to_ledger_dict() for segment in candidate.segments]
+  selected_segments = [source_segments[0]]
+  selection_identity = hashlib.sha256(json.dumps({
+    "domain": "blatv2-certification-vector-selection-v1",
+    "route_name": candidate.route_name,
+    "selected_segments": selected_segments,
+    "source_segments": source_segments,
+  }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+  cp_hash = hashlib.sha256(car_params_bytes).hexdigest()
+  artifact_provenance = dict(provenance)
+  artifact_provenance["car_params_sha256"] = cp_hash
+  segment_result = {
+    "boundary_exclusions": {},
+    "car_params_sha256": cp_hash,
+    "coverage": {
+      "controls_retained": 1,
+      "controls_total": 1,
+      "driving_events": 0,
+      "lateral_maneuver_plans": 0,
+      "live_delays": 0,
+      "live_torque_parameters": 0,
+      "models": 1,
+      "physical_frames_retained": 1,
+      "physical_frames_total": 1,
+    },
+    "encoded_plane_sha256": dict.fromkeys(
+      (
+        "controls_retained", "driving_events", "lateral_maneuver_plans",
+        "live_delays", "live_torque_parameters", "models",
+        "physical_frames_retained", "route_evidence_complete",
+      ),
+      "1" * 64,
+    ),
+    "extractor_stream_sha256": provenance["selected_event_stream_sha256"],
+    "first_retained_mono_ns": 1,
+    "last_retained_mono_ns": 1,
+    "preparation_domain": {
+      "canonical_join_schema_version": provenance["canonical_join_schema_version"],
+      "extractor_schema_version": provenance["extractor_schema_version"],
+      "log_schema_blob": provenance["log_schema_blob"],
+      "opendbc_commit": provenance["opendbc_commit"],
+      "panda_commit": provenance["panda_commit"],
+      "physical_compatibility_sha256": provenance["physical_compatibility_sha256"],
+      "runtime_vehicle_bundle_sha256": runtime,
+      "source_superproject_commit": provenance["superproject_commit"],
+    },
+    "segment": selected_segments[0],
+    "segment_init_data_mono_ns": 1,
+  }
+  unsigned = {
+    "bounds": {
+      "maximum_compressed_bytes": 96 * 1024 * 1024,
+      "maximum_controls_witnesses": 30_000,
+      "maximum_segments": 3,
+      "selected_compressed_bytes": candidate.segments[0].size_bytes,
+      "selected_controls_witnesses": 1,
+    },
+    "domain": "blatv2-cross-architecture-vector-v1",
+    "route_name": candidate.route_name,
+    "route_provenance_seed": {
+      "car_params_sha256": cp_hash,
+      "source_segment_index": candidate.segments[0].index,
+      "source_segment_sha256": candidate.segments[0].sha256,
+    },
+    "schema_version": 1,
+    "segment_results": [segment_result],
+    "selection_identity_sha256": selection_identity,
+    "source_manifest": source_segments,
+  }
+  unsigned_vector = CertificationVector.from_manifest(unsigned)
+  manifest = dict(unsigned)
+  manifest["vector_identity_sha256"] = hashlib.sha256(
+    b"blatv2-cross-architecture-vector-v1\0"
+    + unsigned_vector.canonical_bytes,
+  ).hexdigest()
+  vector = CertificationVector.from_manifest(manifest)
   for authority in (1, 2):
-    evidence = route_evidence_for_frames(
+    base_evidence = route_evidence_for_frames(
       candidate.route_name,
       (),
-      provenance,
+      artifact_provenance,
       car_params_bytes=car_params_bytes,
       runtime_identity=runtime_identity,
+    )
+    source = replace(
+      base_evidence.source_identity,
+      route_segment_sha256=tuple(
+        segment.sha256 for segment in candidate.segments
+      ),
+      route_segment_size_bytes=tuple(
+        segment.size_bytes for segment in candidate.segments
+      ),
+      source_superproject_commit=str(provenance["superproject_commit"]),
+      source_opendbc_commit=str(provenance["opendbc_commit"]),
+      source_panda_commit=str(provenance["panda_commit"]),
+      preparation_cache_key=hashlib.sha256(canonical_json_bytes({
+        "canonical_join_schema_version": provenance[
+          "canonical_join_schema_version"
+        ],
+        "extractor_schema_version": provenance["extractor_schema_version"],
+        "log_schema_blob": provenance["log_schema_blob"],
+        "opendbc_commit": provenance["opendbc_commit"],
+        "route_segments": source_segments,
+        "runtime_bundle_sha256": runtime,
+        "superproject_commit": provenance["superproject_commit"],
+      })).hexdigest(),
+    )
+    evidence = RouteEvidenceArtifact(
+      source,
+      base_evidence.car_params_bytes,
+      base_evidence.physical_bytes,
+      base_evidence.model_publications,
+      base_evidence.control_witnesses,
+      base_evidence.live_torque_parameters,
+      base_evidence.live_delays,
+      base_evidence.lateral_maneuver_plans,
+      base_evidence.event_locators,
     )
     descriptor = write_prepared_route_spool(
       scratch,
@@ -1264,7 +1495,7 @@ def accepted_spool_outcomes(
       controls_witness_count=0,
       unresolved_witness_count=0,
       gap_count=0,
-      provenance=provenance,
+      provenance=artifact_provenance,
       max_frames=1,
       abort_requested=lambda: False,
       filename=f"a{authority}-{candidate.route_name}.spool",
@@ -1272,8 +1503,22 @@ def accepted_spool_outcomes(
     )
     result[(authority, candidate.route_name)] = _PreparedOutcome(
       descriptor=descriptor,
+      certification_vector=_CertificationVectorDescriptor(
+        filename=f"a{authority}-{candidate.route_name}.cert-vector",
+        sha256=vector.sha256,
+        size_bytes=len(vector.canonical_bytes),
+        selected_controls_witnesses=1,
+        selected_segment_count=1,
+        selection_identity_sha256=selection_identity,
+      ),
+      artifact_summary=inspect_route_evidence_file(
+        scratch / descriptor.filename,
+      ),
       rejection_reason=None,
       rejection_message=None,
+    )
+    (scratch / f"a{authority}-{candidate.route_name}.cert-vector").write_bytes(
+      vector.canonical_bytes,
     )
   return result
 
@@ -1295,6 +1540,213 @@ def empty_prepared_route(
       runtime_identity=runtime_identity,
     ),
   )
+
+
+def test_streamed_artifact_vector_binding_rejects_authority_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  changed = route(tmp_path, candidate.route_name, ("3" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(first_root, candidate, provenance)[
+    (1, candidate.route_name)
+  ]
+  second = accepted_spool_outcomes(second_root, changed, provenance)[
+    (1, changed.route_name)
+  ]
+  assert first.descriptor is not None
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="source manifest"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_domain_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(
+    first_root,
+    candidate,
+    provenance,
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  second = accepted_spool_outcomes(
+    second_root,
+    candidate,
+    provenance,
+    runtime_identity="b" * 64,
+  )[(1, candidate.route_name)]
+  assert first.descriptor is not None
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="domains disagree"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_noncanary_route_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  first_route = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  second_route = route(tmp_path, "00000003--3333333333", ("2" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(first_root, first_route, provenance)[
+    (1, first_route.route_name)
+  ]
+  second = accepted_spool_outcomes(second_root, second_route, provenance)[
+    (1, second_route.route_name)
+  ]
+  assert first.descriptor is not None
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="selected source manifest"):
+    _bind_downloaded_artifact_to_vector(
+      route=first_route,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_exact_carparams_mix(
+  tmp_path: Path,
+) -> None:
+  first_root = tmp_path / "first"
+  second_root = tmp_path / "second"
+  first_root.mkdir(mode=0o700)
+  second_root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  provenance = prepared_provenance()
+  first = accepted_spool_outcomes(
+    first_root,
+    candidate,
+    provenance,
+    car_params_bytes=b"first exact CarParams",
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  second = accepted_spool_outcomes(
+    second_root,
+    candidate,
+    provenance,
+    car_params_bytes=b"second exact CarParams",
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  assert first.certification_vector is not None
+  assert second.descriptor is not None
+  assert second.artifact_summary is not None
+  vector = CertificationVector.from_bytes(
+    (first_root / first.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="CarParams seed"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=second.descriptor,
+      summary=second.artifact_summary,
+      vector_descriptor=first.certification_vector,
+      vector=vector,
+    )
+
+
+def test_streamed_artifact_vector_binding_rejects_provenance_cp_mix(
+  tmp_path: Path,
+) -> None:
+  root = tmp_path / "authority"
+  root.mkdir(mode=0o700)
+  candidate = route(tmp_path, "00000002--2222222222", ("2" * 64,))
+  provenance = prepared_provenance()
+  outcome = accepted_spool_outcomes(
+    root,
+    candidate,
+    provenance,
+    car_params_bytes=b"one exact CarParams",
+    runtime_identity="a" * 64,
+  )[(1, candidate.route_name)]
+  assert outcome.descriptor is not None
+  assert outcome.certification_vector is not None
+  original = RouteEvidenceArtifact.from_file(
+    root / outcome.descriptor.filename,
+  )
+  changed_provenance = dict(original.source_identity.preparation_provenance)
+  changed_provenance["car_params_sha256"] = "f" * 64
+  changed_source = replace(
+    original.source_identity,
+    preparation_provenance=changed_provenance,
+  )
+  changed = RouteEvidenceArtifact(
+    changed_source,
+    original.car_params_bytes,
+    original.physical_bytes,
+    original.model_publications,
+    original.control_witnesses,
+    original.live_torque_parameters,
+    original.live_delays,
+    original.lateral_maneuver_plans,
+    original.event_locators,
+  )
+  changed_descriptor = write_prepared_route_spool(
+    root,
+    candidate.route_name,
+    (),
+    controls_witness_count=0,
+    unresolved_witness_count=0,
+    gap_count=0,
+    provenance=changed_provenance,
+    max_frames=1,
+    abort_requested=lambda: False,
+    filename="provenance-mix.route-evidence",
+    route_evidence=changed,
+  )
+  vector = CertificationVector.from_bytes(
+    (root / outcome.certification_vector.filename).read_bytes(),
+  )
+  with pytest.raises(BridgeCorruptError, match="CarParams seed"):
+    _bind_downloaded_artifact_to_vector(
+      route=candidate,
+      descriptor=changed_descriptor,
+      summary=inspect_route_evidence_file(
+        root / changed_descriptor.filename,
+      ),
+      vector_descriptor=outcome.certification_vector,
+      vector=vector,
+    )
 
 
 def test_accepted_domain_requires_one_byte_exact_arm_certification(
@@ -1344,8 +1796,8 @@ def test_accepted_domain_requires_one_byte_exact_arm_certification(
   )
   assert engine.prepare_count == 1
 
-  # A committed worker-package change under the same process identity is also
-  # a new cross-architecture compatibility boundary.
+  # Whole worker-tree changes are audit provenance, not a durable numerical
+  # boundary when the narrow preparation orchestration identity is unchanged.
   _certify_preparation_domains(
     engine=engine,
     plan=certification_plan(candidate),
@@ -1358,7 +1810,7 @@ def test_accepted_domain_requires_one_byte_exact_arm_certification(
     secret=SECRET,
     abort_requested=lambda: False,
   )
-  assert engine.prepare_count == 2
+  assert engine.prepare_count == 1
 
   # A service restart changes only the authenticated transport session. The
   # same source, implementation, extractor, and semantic domain reuse the
@@ -1374,7 +1826,7 @@ def test_accepted_domain_requires_one_byte_exact_arm_certification(
     secret=SECRET,
     abort_requested=lambda: False,
   )
-  assert engine.prepare_count == 2
+  assert engine.prepare_count == 1
 
 
 def test_full_car_params_hash_does_not_fragment_physical_domain(
@@ -1558,7 +2010,22 @@ def test_accepted_domain_arm_byte_mismatch_falls_back(tmp_path: Path) -> None:
     candidate,
     remote_provenance,
   )
-  with pytest.raises(BridgeUnavailableError, match="byte-exact"):
+  local_scratch = tmp_path / "local-vector"
+  local_scratch.mkdir(mode=0o700)
+  local_outcomes = accepted_spool_outcomes(
+    local_scratch,
+    candidate,
+    local_provenance,
+  )
+  local_descriptor = local_outcomes[(1, candidate.route_name)].certification_vector
+  assert local_descriptor is not None
+  local_vector = CertificationVector.from_bytes(
+    (local_scratch / local_descriptor.filename).read_bytes(),
+  )
+  with pytest.raises(
+    ArchitectureVerificationError,
+    match="byte_mismatch",
+  ):
     _certify_preparation_domains(
       engine=CertificationEngine(
         tmp_path,
@@ -1572,6 +2039,7 @@ def test_accepted_domain_arm_byte_mismatch_falls_back(tmp_path: Path) -> None:
       worker_instance_id=WORKER_INSTANCE,
       secret=SECRET,
       abort_requested=lambda: False,
+      architecture_verifier=lambda **_kwargs: local_vector,
     )
 
 
@@ -1609,7 +2077,7 @@ def test_nonlocal_accepted_domain_falls_back(tmp_path: Path) -> None:
     )
 
 
-def test_rejected_route_requires_identical_local_arm_rejection(
+def test_rejected_route_fails_closed_without_full_arm_replay(
   tmp_path: Path,
 ) -> None:
   scratch = tmp_path / ".blatv2-remote-prepare-reject"
@@ -1630,25 +2098,25 @@ def test_rejected_route_requires_identical_local_arm_rejection(
       "bounded route event could not be decoded",
     ),
   )
-  progress: list[tuple[int, int, int, int]] = []
-  certified = _certify_preparation_domains(
-    engine=engine,
-    plan=certification_plan(candidate),
-    scratch_directory=scratch,
-    outcomes=outcomes,
-    contract=contract(),
-    worker_extractor_sha256=WORKER_EXTRACTOR,
-    worker_instance_id=WORKER_INSTANCE,
-    secret=SECRET,
-    abort_requested=lambda: False,
-    progress=lambda *values: progress.append(values),
-  )
-  assert engine.prepare_count == 1
-  assert progress == [(0, 0, 0, 1), (0, 1, 0, 1)]
-  assert all(
-    outcome.certification_identity_sha256 is not None
-    for outcome in certified.values()
-  )
+  progress: list[tuple[object, ...]] = []
+  with pytest.raises(
+    ArchitectureVerificationError,
+    match="rejection_unprovable",
+  ):
+    _certify_preparation_domains(
+      engine=engine,
+      plan=certification_plan(candidate),
+      scratch_directory=scratch,
+      outcomes=outcomes,
+      contract=contract(),
+      worker_extractor_sha256=WORKER_EXTRACTOR,
+      worker_instance_id=WORKER_INSTANCE,
+      secret=SECRET,
+      abort_requested=lambda: False,
+      progress=lambda *values: progress.append(values),
+    )
+  assert engine.prepare_count == 0
+  assert progress == [(0, 0, 0, 1, 0, None, None, None)]
 
   other_root = tmp_path / "other"
   other_root.mkdir()
@@ -1676,7 +2144,7 @@ def test_rejected_route_requires_identical_local_arm_rejection(
     "different_rejection",
   ],
 )
-def test_rejected_route_arm_disagreement_falls_back(
+def test_rejected_route_arm_result_is_never_consulted(
   tmp_path: Path,
   arm_result_kind: str,
 ) -> None:
@@ -1696,7 +2164,10 @@ def test_rejected_route_arm_disagreement_falls_back(
     )
     for authority in (1, 2)
   }
-  with pytest.raises(BridgeUnavailableError, match="ARM|PC"):
+  with pytest.raises(
+    ArchitectureVerificationError,
+    match="rejection_unprovable",
+  ):
     _certify_preparation_domains(
       engine=CertificationEngine(tmp_path, arm_result),
       plan=certification_plan(candidate),
@@ -1708,6 +2179,279 @@ def test_rejected_route_arm_disagreement_falls_back(
       secret=SECRET,
       abort_requested=lambda: False,
     )
+
+
+def _materialized_route(
+  root: Path,
+  *,
+  segment_count: int = 4,
+  segment_size: int = 4096,
+) -> RouteCandidate:
+  segments: list[RouteSegment] = []
+  for index in range(segment_count):
+    path = root / f"segment-{index}.rlog.zst"
+    payload = bytes([index + 1]) * segment_size
+    path.write_bytes(payload)
+    segments.append(RouteSegment(
+      index=index,
+      path=path,
+      sha256=hashlib.sha256(payload).hexdigest(),
+      size_bytes=len(payload),
+    ))
+  return RouteCandidate(
+    route_name="0000000c--cccccccccc",
+    route_counter=12,
+    segments=tuple(segments),
+  )
+
+
+def test_certification_snapshot_survives_logger_unlink_and_hides_unselected(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  candidate = _materialized_route(
+    tmp_path,
+    segment_size=2 * 1024 * 1024,
+  )
+  source = candidate.segments[0]
+  source_inode = source.path.stat().st_ino
+  real_read = os.read
+  unlinked = False
+
+  def unlink_during_copy(descriptor: int, count: int) -> bytes:
+    nonlocal unlinked
+    block = real_read(descriptor, count)
+    if (
+      block
+      and not unlinked
+      and os.fstat(descriptor).st_ino == source_inode
+    ):
+      source.path.unlink()
+      unlinked = True
+    return block
+
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.os.read",
+    unlink_during_copy,
+  )
+  owner, snapshot = _snapshot_certification_route(
+    candidate,
+    parent=tmp_path,
+    abort_requested=lambda: False,
+  )
+  root = owner.path
+  try:
+    assert unlinked is True
+    assert not source.path.exists()
+    selected = {
+      segment.index
+      for segment in snapshot.segments
+      if segment.path.is_file()
+    }
+    assert 0 in selected
+    assert 1 <= len(selected) <= 3
+    for segment in snapshot.segments:
+      if segment.index in selected:
+        assert hashlib.sha256(segment.path.read_bytes()).hexdigest() == segment.sha256
+      else:
+        assert segment.path.parent == root
+        assert not segment.path.exists()
+  finally:
+    _cleanup_private_scratch(owner)
+
+
+def test_architecture_verification_abort_kills_child_and_cleans_snapshot(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  candidate = _materialized_route(tmp_path, segment_count=1)
+  engine = FakeEngine(tmp_path)
+  baseline_children = {child.pid for child in multiprocessing.active_children()}
+
+  def hanging_child(connection, *_args) -> None:
+    try:
+      while True:
+        time.sleep(0.1)
+    finally:
+      connection.close()
+
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._architecture_vector_child",
+    hanging_child,
+  )
+  checks = 0
+
+  def abort_requested() -> bool:
+    nonlocal checks
+    checks += 1
+    # One check occurs while snapshotting; abort after the child owns work.
+    return checks >= 2
+
+  with pytest.raises(BridgeAbortedError):
+    _run_architecture_verification(
+      engine=engine,
+      route=candidate,
+      expected_extractor_sha256="1" * 64,
+      abort_requested=abort_requested,
+      timeout_seconds=2.0,
+    )
+  assert {child.pid for child in multiprocessing.active_children()} == baseline_children
+  assert not list(tmp_path.glob(".blatv2-cert-vector-source-*"))
+
+
+@pytest.mark.parametrize(
+  ("payload", "reason"),
+  (
+    (b"not-a-vector", "architecture_verification_corrupt_output"),
+    (
+      canonical_json_bytes({"error_type": "MemoryError", "type": "error"}),
+      "architecture_verification_resource_limit",
+    ),
+    (
+      canonical_json_bytes({"error_type": "RuntimeError", "type": "error"}),
+      "architecture_verification_child_failed",
+    ),
+  ),
+)
+def test_architecture_verification_child_failures_are_stable_and_cleanup(
+  tmp_path: Path,
+  monkeypatch,
+  payload: bytes,
+  reason: str,
+) -> None:
+  candidate = _materialized_route(tmp_path, segment_count=1)
+
+  def failing_child(connection, *_args) -> None:
+    try:
+      connection.send_bytes(payload)
+    finally:
+      connection.close()
+
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill._architecture_vector_child",
+    failing_child,
+  )
+  with pytest.raises(ArchitectureVerificationError, match=reason):
+    _run_architecture_verification(
+      engine=FakeEngine(tmp_path),
+      route=candidate,
+      expected_extractor_sha256="1" * 64,
+      abort_requested=lambda: False,
+      timeout_seconds=2.0,
+    )
+  assert not list(tmp_path.glob(".blatv2-cert-vector-source-*"))
+
+
+def test_stale_private_scratch_cleanup_is_marked_flat_and_bounded(
+  tmp_path: Path,
+) -> None:
+  owner = _create_private_scratch(
+    tmp_path,
+    prefix=".blatv2-remote-prepare-",
+    required_bytes=1,
+  )
+  child = owner.path / "a1-route.spool"
+  child.write_bytes(b"evidence")
+  child.chmod(0o600)
+  _register_private_scratch_file(owner, child, stable=True)
+  assert cleanup_stale_remote_scratch(tmp_path) == 1
+  assert not owner.path.exists()
+  quarantines = list(tmp_path.glob(".blatv2-private-quarantine-*"))
+  assert len(quarantines) == 1
+  assert (quarantines[0] / child.name).read_bytes() == b"evidence"
+
+  unmarked = tmp_path / ".blatv2-cert-vector-source-unmarked"
+  unmarked.mkdir(mode=0o700)
+  sentinel = unmarked / "sentinel"
+  sentinel.write_bytes(b"preserve")
+  sentinel.chmod(0o600)
+  with pytest.raises(BridgeCorruptError, match="operator recovery"):
+    cleanup_stale_remote_scratch(tmp_path)
+  assert sentinel.read_bytes() == b"preserve"
+
+
+def test_private_scratch_path_swap_never_deletes_replacement_sentinel(
+  tmp_path: Path,
+) -> None:
+  owner = _create_private_scratch(
+    tmp_path,
+    prefix=".blatv2-remote-prepare-",
+    required_bytes=1,
+  )
+  original = tmp_path / "original-private-root"
+  owner.path.rename(original)
+  owner.path.mkdir(mode=0o700)
+  marker = owner.path / ".blatv2-private-scratch-v1"
+  marker.write_bytes(b"blatv2-private-scratch-v1\n")
+  marker.chmod(0o600)
+  sentinel = owner.path / "sentinel"
+  sentinel.write_bytes(b"must-survive")
+  sentinel.chmod(0o600)
+
+  with pytest.raises(BridgeUnavailableError, match="inode changed"):
+    _cleanup_private_scratch(owner)
+  assert sentinel.read_bytes() == b"must-survive"
+
+
+def test_private_scratch_child_replacement_is_never_deleted(
+  tmp_path: Path,
+) -> None:
+  owner = _create_private_scratch(
+    tmp_path,
+    prefix=".blatv2-remote-prepare-",
+    required_bytes=1,
+  )
+  child = owner.path / "a1-route.spool"
+  child.write_bytes(b"original")
+  child.chmod(0o600)
+  _register_private_scratch_file(owner, child, stable=True)
+  child.unlink()
+  child.write_bytes(b"replacement-sentinel")
+  child.chmod(0o600)
+
+  with pytest.raises(BridgeUnavailableError, match="identity changed"):
+    _cleanup_private_scratch(owner)
+  assert child.read_bytes() == b"replacement-sentinel"
+
+
+def test_private_scratch_disk_preflight_fails_before_creating_root(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.os.statvfs",
+    lambda _path: SimpleNamespace(f_bavail=0, f_frsize=4096),
+  )
+  with pytest.raises(BridgeUnavailableError, match="filesystem is full"):
+    _create_private_scratch(
+      tmp_path,
+      prefix=".blatv2-remote-prepare-",
+      required_bytes=1,
+    )
+  assert not list(tmp_path.glob(".blatv2-remote-prepare-*"))
+
+
+def test_remote_transaction_preflight_includes_staging_and_publication(
+  tmp_path: Path,
+  monkeypatch,
+) -> None:
+  requirement = _remote_transaction_disk_requirement(1_000, 400)
+  assert requirement == 2_400
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.PRIVATE_SCRATCH_DISK_MARGIN_BYTES",
+    0,
+  )
+  monkeypatch.setattr(
+    "openpilot.selfdrive.controls.lib.blatv2.offdevice_backfill.os.statvfs",
+    lambda _path: SimpleNamespace(f_bavail=2_000, f_frsize=1),
+  )
+  with pytest.raises(BridgeUnavailableError, match="filesystem is full"):
+    _create_private_scratch(
+      tmp_path,
+      prefix=".blatv2-remote-prepare-",
+      required_bytes=requirement,
+    )
+  assert not list(tmp_path.glob(".blatv2-remote-prepare-*"))
 
 
 def test_shared_current_descriptor_matches_prior_construction(tmp_path: Path) -> None:

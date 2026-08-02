@@ -63,6 +63,7 @@ class LearningOperationState(StrEnum):
 
 DIAGNOSTICS_BY_STATE: dict[LearningOperationState, frozenset[str]] = {
   LearningOperationState.PREPARING: frozenset({
+    "discovering_remote_worker",
     "waiting_for_car_params",
     "restoring_runtime",
   }),
@@ -94,6 +95,8 @@ DIAGNOSTICS_BY_STATE: dict[LearningOperationState, frozenset[str]] = {
     "car_params_identity_mismatch",
   }),
   LearningOperationState.FAILED: frozenset({
+    "architecture_verification_failed",
+    "architecture_verification_interrupted",
     "runtime_restore_failed",
     "backfill_reader_unavailable",
     "backfill_route_incompatible",

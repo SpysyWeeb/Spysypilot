@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import re
@@ -40,6 +41,7 @@ MAX_EVENT_ID_BYTES = 256
 MAX_EVENT_TYPE_BYTES = 128
 MAX_EVENT_SEVERITY_BYTES = 64
 MAX_STATUS_BYTES = 128
+MAX_ROUTE_EVIDENCE_MANIFEST_BYTES = 4 * 1024 * 1024
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -55,6 +57,27 @@ _EVENT = struct.Struct("<IIQQddBHHH")
 
 class RouteEvidenceError(RuntimeError):
   """An evidence artifact or store operation violates its closed contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class RouteEvidenceFileSummary:
+  """Constant-memory authentication view used by device A/A application."""
+
+  path: Path
+  sha256: str
+  manifest: dict[str, object]
+  source_identity: RouteEvidenceSourceIdentity
+  physical_offset: int
+  physical_size: int
+  st_dev: int
+  st_ino: int
+  st_size: int
+  st_mtime_ns: int
+  st_ctime_ns: int
+
+  @property
+  def source_key(self) -> str:
+    return self.source_identity.preparation_cache_key
 
 
 def _finite(value: object, field: str) -> float:
@@ -641,7 +664,7 @@ class RouteEvidenceArtifact:
     "_canonical_bytes", "_physical_offset", "_physical_size", "source_identity",
     "car_params_bytes", "model_publications", "control_witnesses",
     "live_torque_parameters", "live_delays", "lateral_maneuver_plans",
-    "event_locators", "manifest", "sha256",
+    "event_locators", "manifest", "sha256", "_backing",
   )
 
   def __init__(
@@ -775,10 +798,17 @@ class RouteEvidenceArtifact:
     self.event_locators = event_locators
     self.manifest = manifest
     self.sha256 = hashlib.sha256(canonical).hexdigest()
+    self._backing = None
 
   @property
   def canonical_bytes(self) -> bytes:
-    return self._canonical_bytes
+    # ``from_file`` may retain a read-only mapping for diagnostic callers;
+    # preserve the public artifact contract that canonical_bytes is bytes.
+    return (
+      self._canonical_bytes
+      if type(self._canonical_bytes) is bytes
+      else bytes(self._canonical_bytes)
+    )
 
   @property
   def physical_bytes(self) -> memoryview:
@@ -819,6 +849,49 @@ class RouteEvidenceArtifact:
   @classmethod
   def from_bytes(cls, value: bytes | bytearray | memoryview) -> RouteEvidenceArtifact:
     encoded = bytes(value)
+    return cls._from_buffer(encoded, backing=None)
+
+  @classmethod
+  def from_file(cls, path: str | Path) -> RouteEvidenceArtifact:
+    """Validate an artifact through a read-only mapping without copying it.
+
+    Complete multi-segment evidence can approach the 512 MiB artifact bound.
+    The device A/A application path must therefore never call ``read_bytes``
+    or rebuild a second canonical byte string merely to iterate its physical
+    plane.  The returned object owns the mapping for its lifetime.
+    """
+    selected = Path(path)
+    info = _regular(selected, "route evidence artifact")
+    if info.st_size > MAX_ARTIFACT_BYTES or info.st_size < _HEADER.size:
+      raise RouteEvidenceError("route evidence size is invalid")
+    descriptor = os.open(
+      selected,
+      os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+      opened = os.fstat(descriptor)
+      if (
+        opened.st_dev != info.st_dev
+        or opened.st_ino != info.st_ino
+        or opened.st_size != info.st_size
+      ):
+        raise RouteEvidenceError("route evidence changed while opening")
+      mapped = mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ)
+    finally:
+      os.close(descriptor)
+    try:
+      return cls._from_buffer(mapped, backing=mapped)
+    except BaseException:
+      mapped.close()
+      raise
+
+  @classmethod
+  def _from_buffer(
+    cls,
+    encoded: bytes | mmap.mmap,
+    *,
+    backing: mmap.mmap | None,
+  ) -> RouteEvidenceArtifact:
     if len(encoded) > MAX_ARTIFACT_BYTES or len(encoded) < _HEADER.size:
       raise RouteEvidenceError("route evidence size is invalid")
     header = _HEADER.unpack_from(encoded)
@@ -860,14 +933,14 @@ class RouteEvidenceArtifact:
     except (KeyError, TypeError, ValueError) as error:
       raise RouteEvidenceError("source identity manifest is invalid") from error
     cp = bytes(sections[1])
-    physical = bytes(sections[2])
+    physical = sections[2]
     section_hashes = manifest["section_sha256"]
     section_names = ("car_params", "physical", "models", "controls", "live_torque", "live_delay", "maneuvers", "events")
     if (
       type(section_hashes) is not dict
       or set(section_hashes) != set(section_names)
       or any(
-        section_hashes[name] != hashlib.sha256(bytes(section)).hexdigest()
+        section_hashes[name] != hashlib.sha256(section).hexdigest()
         for name, section in zip(section_names, sections[1:], strict=True)
       )
     ):
@@ -885,10 +958,37 @@ class RouteEvidenceArtifact:
     delays = _decode_delay(sections[6], manifest["live_delay_count"])
     maneuvers = _decode_maneuvers(sections[7], manifest["lateral_maneuver_plan_count"])
     events = _decode_events(sections[8], manifest["driving_event_locator_count"])
-    rebuilt = cls(source, cp, physical, models, controls, torque, delays, maneuvers, events)
-    if rebuilt.canonical_bytes != encoded:
-      raise RouteEvidenceError("route evidence is not canonical")
-    return rebuilt
+    # Decoders reject non-canonical reserved values and malformed records.
+    # Re-encoding each compact section independently proves canonical wire
+    # form while keeping peak memory bounded to one compact plane.  The large
+    # physical plane is fixed-width and validated by size/hash above.
+    for rebuilt_section, section in (
+      (_encode_models(models), sections[3]),
+      (_encode_controls(controls), sections[4]),
+      (_encode_torque(torque), sections[5]),
+      (_encode_delay(delays), sections[6]),
+      (_encode_maneuvers(maneuvers), sections[7]),
+      (_encode_events(events), sections[8]),
+    ):
+      if rebuilt_section != section:
+        raise RouteEvidenceError("route evidence section is not canonical")
+
+    artifact = object.__new__(cls)
+    artifact._canonical_bytes = encoded
+    artifact._physical_offset = offsets[2][0]
+    artifact._physical_size = len(physical)
+    artifact.source_identity = source
+    artifact.car_params_bytes = memoryview(encoded)[offsets[1][0]:offsets[1][1]]
+    artifact.model_publications = models
+    artifact.control_witnesses = controls
+    artifact.live_torque_parameters = torque
+    artifact.live_delays = delays
+    artifact.lateral_maneuver_plans = maneuvers
+    artifact.event_locators = events
+    artifact.manifest = manifest
+    artifact.sha256 = hashlib.sha256(encoded).hexdigest()
+    artifact._backing = backing
+    return artifact
 
 
 def _regular(path: Path, purpose: str) -> os.stat_result:
@@ -899,6 +999,343 @@ def _regular(path: Path, purpose: str) -> os.stat_result:
   if path.is_symlink() or not stat.S_ISREG(result.st_mode):
     raise RouteEvidenceError(f"{purpose} is not a regular file")
   return result
+
+
+def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
+  """Authenticate complete evidence without decoding its compact planes.
+
+  The two workstation authorities have already run the complete production
+  decoder and compared every output byte.  The device separately re-runs that
+  decoder on the bounded architecture vector.  Complete-route application
+  therefore needs the exact artifact identity, canonical manifest, every
+  section digest, and streamed physical records; instantiating hundreds of
+  thousands of context dataclasses here would add no independent proof and
+  can exceed comma's memory budget.
+  """
+  selected = Path(path)
+  expected = _regular(selected, "route evidence artifact")
+  if expected.st_size > MAX_ARTIFACT_BYTES or expected.st_size < _HEADER.size:
+    raise RouteEvidenceError("route evidence size is invalid")
+  descriptor = os.open(
+    selected,
+    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+  )
+  try:
+    def read_exact(size: int) -> bytes:
+      chunks: list[bytes] = []
+      remaining = size
+      while remaining:
+        block = os.read(descriptor, min(1024 * 1024, remaining))
+        if not block:
+          break
+        chunks.append(block)
+        remaining -= len(block)
+      return b"".join(chunks)
+
+    opened = os.fstat(descriptor)
+    if (
+      opened.st_dev != expected.st_dev
+      or opened.st_ino != expected.st_ino
+      or opened.st_size != expected.st_size
+    ):
+      raise RouteEvidenceError("route evidence changed while opening")
+    header_bytes = read_exact(_HEADER.size)
+    if len(header_bytes) != _HEADER.size:
+      raise RouteEvidenceError("route evidence header is truncated")
+    header = _HEADER.unpack(header_bytes)
+    if (
+      header[0] != ROUTE_EVIDENCE_MAGIC
+      or header[1] != ROUTE_EVIDENCE_VERSION
+      or header[2] != 0
+      or _HEADER.size + sum(header[3:]) != opened.st_size
+    ):
+      raise RouteEvidenceError("route evidence header is invalid")
+    sizes = header[3:]
+    if sizes[0] > MAX_ROUTE_EVIDENCE_MANIFEST_BYTES:
+      raise RouteEvidenceError("route evidence manifest exceeds its bound")
+    manifest_bytes = read_exact(sizes[0])
+    if len(manifest_bytes) != sizes[0]:
+      raise RouteEvidenceError("route evidence manifest is truncated")
+    try:
+      manifest: object = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+      raise RouteEvidenceError("manifest is invalid JSON") from error
+    expected_manifest_keys = {
+      "artifact_schema_version", "car_params_sha256", "car_params_size_bytes",
+      "control_witness_count", "driving_event_locator_count", "lateral_maneuver_plan_count",
+      "live_delay_count", "live_torque_parameters_count", "model_publication_count",
+      "physical_plane_sha256", "physical_plane_size_bytes", "section_sha256",
+      "source_identity",
+    }
+    if (
+      type(manifest) is not dict
+      or manifest_bytes != _canonical_json(manifest)
+      or set(manifest) != expected_manifest_keys
+      or manifest["artifact_schema_version"] != ROUTE_EVIDENCE_VERSION
+    ):
+      raise RouteEvidenceError("manifest shape/version is invalid")
+    source_payload = manifest["source_identity"]
+    if type(source_payload) is not dict:
+      raise RouteEvidenceError("source identity manifest is invalid")
+    try:
+      source_values = dict(source_payload)
+      source_values["route_segment_sha256"] = tuple(source_values["route_segment_sha256"])
+      source_values["route_segment_size_bytes"] = tuple(source_values["route_segment_size_bytes"])
+      source_values["pre_poll_dropped_timestamps_ns"] = tuple(source_values["pre_poll_dropped_timestamps_ns"])
+      source = RouteEvidenceSourceIdentity(**source_values)
+    except (KeyError, TypeError, ValueError) as error:
+      raise RouteEvidenceError("source identity manifest is invalid") from error
+
+    model_count = _uint(
+      manifest["model_publication_count"],
+      "model publication count",
+      MAX_MODEL_PUBLICATIONS,
+    )
+    control_count = _uint(
+      manifest["control_witness_count"],
+      "control witness count",
+      MAX_CONTROL_WITNESSES,
+    )
+    torque_count = _uint(
+      manifest["live_torque_parameters_count"],
+      "live torque parameters count",
+      MAX_SPARSE_PUBLICATIONS,
+    )
+    delay_count = _uint(
+      manifest["live_delay_count"],
+      "live delay count",
+      MAX_SPARSE_PUBLICATIONS,
+    )
+    maneuver_count = _uint(
+      manifest["lateral_maneuver_plan_count"],
+      "lateral maneuver plan count",
+      MAX_SPARSE_PUBLICATIONS,
+    )
+    event_count = _uint(
+      manifest["driving_event_locator_count"],
+      "driving event locator count",
+      MAX_EVENT_LOCATORS,
+    )
+    names = (
+      "car_params", "physical", "models", "controls", "live_torque",
+      "live_delay", "maneuvers", "events",
+    )
+    section_hashes = manifest["section_sha256"]
+    if type(section_hashes) is not dict or set(section_hashes) != set(names):
+      raise RouteEvidenceError("route evidence section hashes are invalid")
+    for name in names:
+      _hash(section_hashes[name], f"{name} section hash")
+
+    if sizes[1] == 0 or sizes[1] > MAX_CAR_PARAMS_BYTES:
+      raise RouteEvidenceError("canonical CarParams exceeds its bound")
+    if sizes[3] < model_count * _MODEL.size or sizes[3] > model_count * (_MODEL.size + 3 * MAX_NATIVE_PLAN_SAMPLES * 8):
+      raise RouteEvidenceError("model section size/count disagree")
+    if sizes[4] != control_count * _CONTROL.size:
+      raise RouteEvidenceError("control section size/count disagree")
+    if sizes[5] != torque_count * _TORQUE.size:
+      raise RouteEvidenceError("torque section size/count disagree")
+    if sizes[6] < delay_count * _DELAY.size or sizes[6] > delay_count * (_DELAY.size + MAX_STATUS_BYTES):
+      raise RouteEvidenceError("delay section size/count disagree")
+    if sizes[7] != maneuver_count * _MANEUVER.size:
+      raise RouteEvidenceError("maneuver section size/count disagree")
+    maximum_event_size = _EVENT.size + MAX_EVENT_ID_BYTES + MAX_EVENT_TYPE_BYTES + MAX_EVENT_SEVERITY_BYTES
+    if sizes[8] < event_count * _EVENT.size or sizes[8] > event_count * maximum_event_size:
+      raise RouteEvidenceError("event section size/count disagree")
+    if (
+      control_count != source.physical_record_count
+      or source.controls_witness_count
+      != control_count + len(source.pre_poll_dropped_timestamps_ns)
+    ):
+      raise RouteEvidenceError("control and physical-record populations disagree")
+    whole_digest = hashlib.sha256()
+    whole_digest.update(header_bytes)
+    whole_digest.update(manifest_bytes)
+    section_offset = _HEADER.size + sizes[0]
+    physical_offset = section_offset + sizes[1]
+    for name, size in zip(names, sizes[1:], strict=True):
+      section_digest = hashlib.sha256()
+      remaining = size
+      while remaining:
+        block = os.read(descriptor, min(1024 * 1024, remaining))
+        if not block:
+          raise RouteEvidenceError("route evidence section is truncated")
+        whole_digest.update(block)
+        section_digest.update(block)
+        remaining -= len(block)
+      if section_digest.hexdigest() != section_hashes[name]:
+        raise RouteEvidenceError("route evidence section hash mismatch")
+      section_offset += size
+    if os.read(descriptor, 1):
+      raise RouteEvidenceError("route evidence contains trailing bytes")
+    if (
+      manifest["car_params_size_bytes"] != sizes[1]
+      or manifest["physical_plane_size_bytes"] != sizes[2]
+      or manifest["car_params_sha256"] != section_hashes["car_params"]
+      or manifest["physical_plane_sha256"] != section_hashes["physical"]
+      or source.physical_record_count < 0
+    ):
+      raise RouteEvidenceError("route evidence manifest sizes disagree")
+    from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
+      SPOOL_RECORD_SIZE,
+    )
+    if sizes[2] != source.physical_record_count * SPOOL_RECORD_SIZE:
+      raise RouteEvidenceError("physical plane size/count disagree")
+
+    # Validate the compact wire planes a record at a time.  This gives the
+    # streamed application path the same bounded-count and canonical-record
+    # guarantees as ``RouteEvidenceArtifact.from_file`` without retaining the
+    # populations as Python objects.
+    section_offsets: list[int] = []
+    cursor = _HEADER.size
+    for size in sizes:
+      section_offsets.append(cursor)
+      cursor += size
+
+    def pread_exact(offset: int, size: int, purpose: str) -> bytes:
+      output = bytearray()
+      while len(output) < size:
+        block = os.pread(descriptor, size - len(output), offset + len(output))
+        if not block:
+          raise RouteEvidenceError(f"{purpose} is truncated")
+        output.extend(block)
+      return bytes(output)
+
+    model_cursor = section_offsets[3]
+    previous_model: tuple[int, int, int] | None = None
+    for _ in range(model_count):
+      fixed = pread_exact(model_cursor, _MODEL.size, "model record")
+      row = _MODEL.unpack(fixed)
+      length = row[11]
+      if length > MAX_NATIVE_PLAN_SAMPLES:
+        raise RouteEvidenceError("model native grid length is invalid")
+      record_size = _MODEL.size + 3 * length * 8
+      record = memoryview(pread_exact(model_cursor, record_size, "model record"))
+      decoded = _decode_models(record, 1)[0]
+      if _encode_models((decoded,)) != record:
+        raise RouteEvidenceError("model record is not canonical")
+      key = (decoded.mono_time_ns, decoded.segment_index, decoded.ordinal)
+      if previous_model is not None and key <= previous_model:
+        raise RouteEvidenceError("model records are not ordered")
+      previous_model = key
+      model_cursor += record_size
+    if model_cursor != section_offsets[3] + sizes[3]:
+      raise RouteEvidenceError("model section contains trailing bytes")
+
+    previous_control: tuple[int, int, int] | None = None
+    control_cursor = section_offsets[4]
+    for index in range(control_count):
+      record = memoryview(pread_exact(control_cursor, _CONTROL.size, "control record"))
+      decoded = _decode_controls(record, 1)[0]
+      if _encode_controls((decoded,)) != record:
+        raise RouteEvidenceError("control record is not canonical")
+      if decoded.physical_record_index != index:
+        raise RouteEvidenceError("physical record indices are not canonical")
+      if decoded.model_publication_index >= model_count:
+        raise RouteEvidenceError("model publication index is out of range")
+      if decoded.live_torque_parameters_index >= torque_count:
+        raise RouteEvidenceError("live torque index is out of range")
+      if decoded.live_delay_index >= delay_count:
+        raise RouteEvidenceError("live delay index is out of range")
+      if decoded.lateral_maneuver_plan_index >= maneuver_count:
+        raise RouteEvidenceError("maneuver plan index is out of range")
+      key = (decoded.mono_time_ns, decoded.segment_index, decoded.ordinal)
+      if previous_control is not None and key <= previous_control:
+        raise RouteEvidenceError("control records are not ordered")
+      previous_control = key
+      control_cursor += _CONTROL.size
+
+    torque_cursor = section_offsets[5]
+    previous_sparse: tuple[int, int, int] | None = None
+    for _ in range(torque_count):
+      record = memoryview(pread_exact(torque_cursor, _TORQUE.size, "torque record"))
+      decoded = _decode_torque(record, 1)[0]
+      if _encode_torque((decoded,)) != record:
+        raise RouteEvidenceError("torque record is not canonical")
+      key = (decoded.mono_time_ns, decoded.segment_index, decoded.ordinal)
+      if previous_sparse is not None and key <= previous_sparse:
+        raise RouteEvidenceError("live torque records are not ordered")
+      previous_sparse = key
+      torque_cursor += _TORQUE.size
+
+    delay_cursor = section_offsets[6]
+    previous_sparse = None
+    for _ in range(delay_count):
+      fixed = pread_exact(delay_cursor, _DELAY.size, "delay record")
+      row = _DELAY.unpack(fixed)
+      if row[7] > MAX_STATUS_BYTES:
+        raise RouteEvidenceError("live delay status exceeds its bound")
+      record_size = _DELAY.size + row[7]
+      record = memoryview(pread_exact(delay_cursor, record_size, "delay record"))
+      decoded = _decode_delay(record, 1)[0]
+      if _encode_delay((decoded,)) != record:
+        raise RouteEvidenceError("delay record is not canonical")
+      key = (decoded.mono_time_ns, decoded.segment_index, decoded.ordinal)
+      if previous_sparse is not None and key <= previous_sparse:
+        raise RouteEvidenceError("live delay records are not ordered")
+      previous_sparse = key
+      delay_cursor += record_size
+    if delay_cursor != section_offsets[6] + sizes[6]:
+      raise RouteEvidenceError("delay section contains trailing bytes")
+
+    maneuver_cursor = section_offsets[7]
+    previous_sparse = None
+    for _ in range(maneuver_count):
+      record = memoryview(pread_exact(maneuver_cursor, _MANEUVER.size, "maneuver record"))
+      decoded = _decode_maneuvers(record, 1)[0]
+      if _encode_maneuvers((decoded,)) != record:
+        raise RouteEvidenceError("maneuver record is not canonical")
+      key = (decoded.mono_time_ns, decoded.segment_index, decoded.ordinal)
+      if previous_sparse is not None and key <= previous_sparse:
+        raise RouteEvidenceError("maneuver plan records are not ordered")
+      previous_sparse = key
+      maneuver_cursor += _MANEUVER.size
+
+    event_cursor = section_offsets[8]
+    previous_event: tuple[int, int, int] | None = None
+    for _ in range(event_count):
+      fixed = pread_exact(event_cursor, _EVENT.size, "event record")
+      row = _EVENT.unpack(fixed)
+      if row[7] > MAX_EVENT_ID_BYTES or row[8] > MAX_EVENT_TYPE_BYTES or row[9] > MAX_EVENT_SEVERITY_BYTES:
+        raise RouteEvidenceError("event text exceeds its bound")
+      record_size = _EVENT.size + sum(row[7:10])
+      record = memoryview(pread_exact(event_cursor, record_size, "event record"))
+      decoded = _decode_events(record, 1)[0]
+      if _encode_events((decoded,)) != record:
+        raise RouteEvidenceError("event record is not canonical")
+      if decoded.analysis_window_before_s < 0.0 or decoded.analysis_window_after_s < 0.0:
+        raise RouteEvidenceError("event windows must be nonnegative")
+      key = (decoded.publication_mono_time_ns, decoded.segment_index, decoded.ordinal)
+      if previous_event is not None and key <= previous_event:
+        raise RouteEvidenceError("event records are not ordered")
+      previous_event = key
+      event_cursor += record_size
+    if event_cursor != section_offsets[8] + sizes[8]:
+      raise RouteEvidenceError("event section contains trailing bytes")
+
+    final = os.fstat(descriptor)
+    if (
+      final.st_dev != opened.st_dev
+      or final.st_ino != opened.st_ino
+      or final.st_size != opened.st_size
+      or final.st_mtime_ns != opened.st_mtime_ns
+      or final.st_ctime_ns != opened.st_ctime_ns
+    ):
+      raise RouteEvidenceError("route evidence changed during inspection")
+    return RouteEvidenceFileSummary(
+      path=selected,
+      sha256=whole_digest.hexdigest(),
+      manifest=manifest,
+      source_identity=source,
+      physical_offset=physical_offset,
+      physical_size=sizes[2],
+      st_dev=opened.st_dev,
+      st_ino=opened.st_ino,
+      st_size=opened.st_size,
+      st_mtime_ns=opened.st_mtime_ns,
+      st_ctime_ns=opened.st_ctime_ns,
+    )
+  finally:
+    os.close(descriptor)
 
 
 def _safe_directory(path: Path, create: bool) -> None:
@@ -941,6 +1378,67 @@ def _atomic_write(path: Path, data: bytes) -> None:
       pass
 
 
+def _stream_files_equal(left: Path, right: Path) -> bool:
+  left_info = _regular(left, "first A/A evidence artifact")
+  right_info = _regular(right, "second A/A evidence artifact")
+  if left_info.st_size != right_info.st_size:
+    return False
+  left_fd = os.open(left, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+  right_fd = os.open(right, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+  try:
+    while True:
+      first = os.read(left_fd, 1024 * 1024)
+      second = os.read(right_fd, 1024 * 1024)
+      if first != second:
+        return False
+      if not first:
+        return True
+  finally:
+    os.close(left_fd)
+    os.close(right_fd)
+
+
+def _atomic_copy(path: Path, source: Path) -> None:
+  descriptor, name = tempfile.mkstemp(
+    dir=path.parent,
+    prefix=f".{path.name}.",
+    suffix=".partial",
+  )
+  temporary = Path(name)
+  source_fd = -1
+  try:
+    os.fchmod(descriptor, 0o600)
+    source_fd = os.open(
+      source,
+      os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    while block := os.read(source_fd, 1024 * 1024):
+      view = memoryview(block)
+      while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+          raise OSError("short evidence copy")
+        view = view[written:]
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = -1
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+      os.fsync(directory)
+    finally:
+      os.close(directory)
+  finally:
+    if source_fd >= 0:
+      os.close(source_fd)
+    if descriptor >= 0:
+      os.close(descriptor)
+    try:
+      temporary.unlink()
+    except FileNotFoundError:
+      pass
+
+
 class RouteEvidenceStore:
   """Immutable content store; publication is permitted only after exact A/A."""
 
@@ -974,6 +1472,205 @@ class RouteEvidenceStore:
       _atomic_write(index_path, index)
     return first
 
+  def publish_files(
+    self,
+    first_path: str | Path,
+    second_path: str | Path,
+    *,
+    sha256: str,
+    source_key: str,
+  ) -> None:
+    """Publish complete A/A evidence from held, authenticated descriptors.
+
+    The two inputs are private scratch files, but publication is an integrity
+    boundary.  Keep both descriptors open from equality through hashing and
+    object creation so a pathname swap cannot turn a proved A/A pair into a
+    different immutable object.
+    """
+    _hash(sha256, "route evidence sha256")
+    _hash(source_key, "route evidence source key")
+    first = Path(first_path)
+    second = Path(second_path)
+    first_fd = -1
+    second_fd = -1
+
+    def open_held(path: Path, purpose: str) -> tuple[int, os.stat_result]:
+      expected = _regular(path, purpose)
+      if expected.st_size > MAX_ARTIFACT_BYTES:
+        raise RouteEvidenceError("A/A evidence exceeds its bound")
+      descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+      )
+      observed = os.fstat(descriptor)
+      if (
+        observed.st_dev != expected.st_dev
+        or observed.st_ino != expected.st_ino
+        or observed.st_size != expected.st_size
+        or not stat.S_ISREG(observed.st_mode)
+      ):
+        os.close(descriptor)
+        raise RouteEvidenceError("A/A evidence changed while opening")
+      return descriptor, observed
+
+    def rewind(descriptor: int) -> None:
+      if os.lseek(descriptor, 0, os.SEEK_SET) != 0:
+        raise RouteEvidenceError("A/A evidence could not be rewound")
+
+    def equal_held(left: int, right: int, size: int) -> bool:
+      rewind(left)
+      rewind(right)
+      remaining = size
+      while remaining:
+        count = min(1024 * 1024, remaining)
+        left_block = os.read(left, count)
+        right_block = os.read(right, count)
+        if left_block != right_block or not left_block:
+          return False
+        remaining -= len(left_block)
+      return not os.read(left, 1) and not os.read(right, 1)
+
+    def hash_held(descriptor: int, size: int) -> str:
+      rewind(descriptor)
+      digest = hashlib.sha256()
+      remaining = size
+      while remaining:
+        block = os.read(descriptor, min(1024 * 1024, remaining))
+        if not block:
+          raise RouteEvidenceError("A/A evidence was truncated")
+        digest.update(block)
+        remaining -= len(block)
+      if os.read(descriptor, 1):
+        raise RouteEvidenceError("A/A evidence grew during publication")
+      return digest.hexdigest()
+
+    def stable_info(before: os.stat_result, after: os.stat_result) -> bool:
+      return (
+        before.st_dev == after.st_dev
+        and before.st_ino == after.st_ino
+        and before.st_size == after.st_size
+        and before.st_mtime_ns == after.st_mtime_ns
+        and before.st_ctime_ns == after.st_ctime_ns
+      )
+
+    def copy_held(
+      path: Path,
+      source_fd: int,
+      size: int,
+      expected_sha256: str,
+    ) -> None:
+      descriptor, name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".partial",
+      )
+      temporary = Path(name)
+      try:
+        os.fchmod(descriptor, 0o600)
+        before = os.fstat(source_fd)
+        rewind(source_fd)
+        digest = hashlib.sha256()
+        remaining = size
+        while remaining:
+          block = os.read(source_fd, min(1024 * 1024, remaining))
+          if not block:
+            raise RouteEvidenceError("A/A evidence was truncated")
+          digest.update(block)
+          remaining -= len(block)
+          view = memoryview(block)
+          while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+              raise OSError("short evidence copy")
+            view = view[written:]
+        if os.read(source_fd, 1):
+          raise RouteEvidenceError("A/A evidence grew during publication")
+        after = os.fstat(source_fd)
+        if (
+          digest.hexdigest() != expected_sha256
+          or not stable_info(before, after)
+        ):
+          raise RouteEvidenceError("A/A evidence changed during publication")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+          os.fsync(directory)
+        finally:
+          os.close(directory)
+      finally:
+        if descriptor >= 0:
+          os.close(descriptor)
+        try:
+          temporary.unlink()
+        except FileNotFoundError:
+          pass
+
+    try:
+      first_fd, first_info = open_held(
+        first,
+        "first A/A evidence artifact",
+      )
+      second_fd, second_info = open_held(
+        second,
+        "second A/A evidence artifact",
+      )
+      if (
+        first_info.st_size != second_info.st_size
+        or not equal_held(first_fd, second_fd, first_info.st_size)
+      ):
+        raise RouteEvidenceError("A/A mismatch; evidence was not published")
+      if hash_held(first_fd, first_info.st_size) != sha256:
+        raise RouteEvidenceError("A/A evidence hash disagrees")
+      _safe_directory(self.root, create=True)
+      objects = self.root / "objects"
+      sources = self.root / "sources"
+      _safe_directory(objects, create=True)
+      _safe_directory(sources, create=True)
+      object_path = objects / f"{sha256}.route-evidence"
+      index_path = sources / f"{source_key}.index"
+      if object_path.exists() or object_path.is_symlink():
+        object_fd, object_info = open_held(
+          object_path,
+          "immutable evidence object",
+        )
+        try:
+          if (
+            object_info.st_size != first_info.st_size
+            or not equal_held(object_fd, first_fd, first_info.st_size)
+          ):
+            raise RouteEvidenceError(
+              "immutable evidence object bytes disagree",
+            )
+        finally:
+          os.close(object_fd)
+      else:
+        copy_held(object_path, first_fd, first_info.st_size, sha256)
+      # The second authority must remain the same proved byte stream until the
+      # publication point too.  This closes an in-place mutation race that a
+      # pathname-only A/A check cannot detect.
+      if hash_held(second_fd, second_info.st_size) != sha256:
+        raise RouteEvidenceError("second A/A evidence changed during publication")
+      if (
+        not stable_info(first_info, os.fstat(first_fd))
+        or not stable_info(second_info, os.fstat(second_fd))
+      ):
+        raise RouteEvidenceError("A/A evidence changed during publication")
+      index = f"{sha256}\n".encode("ascii")
+      if index_path.exists() or index_path.is_symlink():
+        _regular(index_path, "evidence source index")
+        if index_path.read_bytes() != index:
+          raise RouteEvidenceError("immutable evidence source index disagrees")
+      else:
+        _atomic_write(index_path, index)
+    finally:
+      if second_fd >= 0:
+        os.close(second_fd)
+      if first_fd >= 0:
+        os.close(first_fd)
+
   def load(self, sha256: str) -> RouteEvidenceArtifact:
     _hash(sha256, "route evidence sha256")
     _safe_directory(self.root, create=False)
@@ -981,10 +1678,29 @@ class RouteEvidenceStore:
     info = _regular(path, "route evidence object")
     if info.st_size > MAX_ARTIFACT_BYTES:
       raise RouteEvidenceError("route evidence object exceeds its bound")
-    data = path.read_bytes()
-    if hashlib.sha256(data).hexdigest() != sha256:
+    descriptor = os.open(
+      path,
+      os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    digest = hashlib.sha256()
+    try:
+      while block := os.read(descriptor, 1024 * 1024):
+        digest.update(block)
+    finally:
+      os.close(descriptor)
+    if digest.hexdigest() != sha256:
       raise RouteEvidenceError("route evidence object hash mismatch")
-    return RouteEvidenceArtifact.from_bytes(data)
+    return RouteEvidenceArtifact.from_file(path)
+
+  def inspect(self, sha256: str) -> RouteEvidenceFileSummary:
+    """Authenticate an immutable object without materializing its planes."""
+    _hash(sha256, "route evidence sha256")
+    _safe_directory(self.root, create=False)
+    path = self.root / "objects" / f"{sha256}.route-evidence"
+    summary = inspect_route_evidence_file(path)
+    if summary.sha256 != sha256:
+      raise RouteEvidenceError("route evidence object hash mismatch")
+    return summary
 
   def lookup(self, source_key: str) -> RouteEvidenceArtifact | None:
     _hash(source_key, "route evidence source key")

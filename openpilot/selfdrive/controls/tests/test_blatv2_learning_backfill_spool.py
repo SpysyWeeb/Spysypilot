@@ -39,7 +39,9 @@ def test_spool_is_exact_full_route_evidence_and_iterates_physical(tmp_path: Path
   opened = open_prepared_route_spool(
     tmp_path, descriptor, expected_route_name=ROUTE, max_frames=10,
   )
-  assert opened.route_evidence.canonical_bytes == evidence.canonical_bytes
+  assert opened.route_evidence.sha256 == evidence.sha256
+  assert opened.route_evidence.manifest["section_sha256"] == evidence.manifest["section_sha256"]
+  assert opened.route_evidence.source_identity == evidence.source_identity
   assert tuple(opened.iter_frames()) == FRAMES
   assert opened.provenance == evidence.source_identity.preparation_provenance
 
@@ -89,7 +91,7 @@ def test_open_and_iteration_detect_corruption(tmp_path: Path) -> None:
   encoded = bytearray(path.read_bytes())
   encoded[-1] ^= 1
   path.write_bytes(encoded)
-  with pytest.raises(SpoolFormatError, match="identity"):
+  with pytest.raises(SpoolFormatError, match="unsupported|identity"):
     open_prepared_route_spool(
       tmp_path, descriptor, expected_route_name=ROUTE, max_frames=10,
     )

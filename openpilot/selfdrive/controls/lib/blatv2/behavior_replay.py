@@ -88,6 +88,7 @@ from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ROUTE_EVIDENCE_VERSION,
   RouteEvidenceArtifact,
+  RouteEvidenceSourceIdentity,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
@@ -554,19 +555,18 @@ def _rack_accelerations(
   return tuple(output)
 
 
-def behavior_source_identity_from_route_artifact(
-  artifact: RouteEvidenceArtifact,
+def behavior_source_identity_from_route_source(
+  source: RouteEvidenceSourceIdentity,
 ) -> BehaviorSourceIdentity:
-  """Project the one canonical behavioral source identity from route bytes.
+  """Project one canonical behavioral identity from authenticated metadata.
 
   Cohort selection and route decoding must bind the exact same source.  Keep
   that projection here, next to the sole route-evidence decoder, so an
   offroad coordinator never grows a subtly different interpretation of the
   controller/build fields recorded in the artifact.
   """
-  if type(artifact) is not RouteEvidenceArtifact:
-    raise TypeError("behavior source projection requires RouteEvidenceArtifact")
-  source = artifact.source_identity
+  if type(source) is not RouteEvidenceSourceIdentity:
+    raise TypeError("behavior source projection requires RouteEvidenceSourceIdentity")
   if not source.behavior_eligible:
     raise BehaviorReplayError(
       f"route evidence is behavior-ineligible: {source.behavior_ineligible_reason}",
@@ -579,6 +579,15 @@ def behavior_source_identity_from_route_artifact(
     panda_commit=source.source_panda_commit,
     evidence_schema_version=ROUTE_EVIDENCE_VERSION,
   )
+
+
+def behavior_source_identity_from_route_artifact(
+  artifact: RouteEvidenceArtifact,
+) -> BehaviorSourceIdentity:
+  """Project the exact source identity from a fully decoded legacy artifact."""
+  if type(artifact) is not RouteEvidenceArtifact:
+    raise TypeError("behavior source projection requires RouteEvidenceArtifact")
+  return behavior_source_identity_from_route_source(artifact.source_identity)
 
 
 def make_behavior_route_evidence_decoder(
