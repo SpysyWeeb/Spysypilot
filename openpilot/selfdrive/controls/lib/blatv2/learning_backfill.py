@@ -23,7 +23,6 @@ import os
 from pathlib import Path
 import re
 import select
-import shutil
 import signal
 import stat
 import statistics
@@ -58,6 +57,12 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   LearningArtifactPaths,
   PersistentLearningRuntime,
 )
+from openpilot.selfdrive.controls.lib.blatv2.owned_scratch import (
+  OwnedDirectoryIdentity,
+  OwnedScratchError,
+  capture_owned_directory,
+  remove_owned_allowlisted_tree,
+)
 from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import (
   MeasuredLearningFrame,
 )
@@ -74,6 +79,7 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   RouteEvidenceFileSummary,
   RouteEvidenceSourceIdentity,
   RouteEvidenceStore,
+  inspect_route_evidence_file,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   RuntimeVehicleBundle,
@@ -104,6 +110,20 @@ SUPPORTED_BACKFILL_REPLAY_WORKER_COUNTS = (1, 2, 4)
 BACKFILL_SPOOL_DIRECTORY_PREFIX = ".blatv2-backfill-prepare-"
 _BACKFILL_SPOOL_DIRECTORY_RE = re.compile(
   rf"{re.escape(BACKFILL_SPOOL_DIRECTORY_PREFIX)}[12]-[a-z0-9_]{{8}}\Z",
+)
+PREPARED_ROUTE_SCRATCH_QUARANTINE = (
+  ".blatv2-backfill-prepare-quarantine-v1"
+)
+PREPARED_ROUTE_SCRATCH_MAX_CHILDREN = 2
+PREPARED_ROUTE_SCRATCH_MAX_BYTES = 2 * MAX_ARTIFACT_BYTES
+_PREPARED_ROUTE_FILE_RE = re.compile(
+  r"prepared-route-[0-9a-f]{24}\.route-evidence\Z",
+)
+_PREPARED_ROUTE_PARTIAL_FILE_RE = re.compile(
+  "".join((
+    r"\.prepared-route-[0-9a-f]{24}\.route-evidence\.",
+    r"[A-Za-z0-9_-]+\.partial\Z",
+  )),
 )
 ROUTE_EVIDENCE_STAGING_DIRECTORY = ".route-evidence-staging-v2"
 ROUTE_EVIDENCE_STAGING_QUARANTINE = ".route-evidence-staging-quarantine-v2"
@@ -3582,6 +3602,36 @@ class ExclusiveBackfillWriter(AbstractContextManager["ExclusiveBackfillWriter"])
     return int(self._stream.fileno())
 
 
+def _bounded_directory_names(
+  directory: int | Path,
+  maximum: int,
+  *,
+  diagnostic: str,
+  purpose: str,
+) -> tuple[str, ...]:
+  """Inventory at most ``maximum`` children without allocating all first."""
+  if maximum < 0:
+    raise BackfillError(diagnostic, f"{purpose} bound is invalid")
+  names: list[str] = []
+  try:
+    with os.scandir(directory) as entries:
+      for entry in entries:
+        if len(names) >= maximum:
+          raise BackfillError(
+            diagnostic,
+            f"{purpose} exceeds its population bound",
+          )
+        names.append(entry.name)
+  except BackfillError:
+    raise
+  except OSError as exc:
+    raise BackfillError(
+      diagnostic,
+      f"{purpose} inventory is unavailable",
+    ) from exc
+  return tuple(names)
+
+
 def quarantine_stale_route_evidence_staging(artifact_root: Path) -> None:
   """Fail closed after atomically quarantining exact owned A/A staging.
 
@@ -3616,13 +3666,13 @@ def quarantine_stale_route_evidence_staging(artifact_root: Path) -> None:
       "backfill_spool_invalid",
       "stale route-evidence staging root is unsafe",
     )
-  try:
-    authorities = tuple(staging.iterdir())
-  except OSError as exc:
-    raise BackfillError(
-      "backfill_spool_invalid",
-      "stale route-evidence staging inventory is unavailable",
-    ) from exc
+  authority_names = _bounded_directory_names(
+    staging,
+    3,
+    diagnostic="backfill_spool_invalid",
+    purpose="stale route-evidence authority population",
+  )
+  authorities = tuple(staging / name for name in authority_names)
   if (
     not authorities
     or len(authorities) > 2
@@ -3654,13 +3704,19 @@ def quarantine_stale_route_evidence_staging(artifact_root: Path) -> None:
         "backfill_spool_invalid",
         "stale route-evidence authority directory is unsafe",
       )
-    try:
-      children = tuple(authority.iterdir())
-    except OSError as exc:
+    remaining_file_count = ROUTE_EVIDENCE_STAGING_MAX_FILES - file_count
+    child_names = _bounded_directory_names(
+      authority,
+      remaining_file_count + 1,
+      diagnostic="backfill_spool_invalid",
+      purpose="stale route-evidence authority population",
+    )
+    if len(child_names) > remaining_file_count:
       raise BackfillError(
         "backfill_spool_invalid",
-        "stale route-evidence authority inventory is unavailable",
-      ) from exc
+        "stale route-evidence staging exceeds recovery bounds",
+      )
+    children = tuple(authority / name for name in child_names)
     for child in children:
       completed = _ROUTE_EVIDENCE_STAGED_FILE_RE.fullmatch(child.name)
       partial = _ROUTE_EVIDENCE_PARTIAL_FILE_RE.fullmatch(child.name)
@@ -3762,38 +3818,314 @@ def quarantine_stale_route_evidence_staging(artifact_root: Path) -> None:
   )
 
 
-def cleanup_stale_prepared_route_spools(artifact_root: Path) -> None:
-  """Recover exact owned staging and remove four-lane preparation scratch."""
-  quarantine_stale_route_evidence_staging(artifact_root)
-  removed = False
+def _validate_prepared_route_scratch_child(
+  scratch: Path,
+  directory_fd: int,
+  name: str,
+) -> int:
+  completed = _PREPARED_ROUTE_FILE_RE.fullmatch(name)
+  partial = _PREPARED_ROUTE_PARTIAL_FILE_RE.fullmatch(name)
+  if completed is None and partial is None:
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "prepared-route scratch contains an unknown child",
+    )
+  descriptor = -1
   try:
-    entries = tuple(artifact_root.iterdir())
+    before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    descriptor = os.open(
+      name,
+      os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+      dir_fd=directory_fd,
+    )
+    opened = os.fstat(descriptor)
+    if (
+      not stat.S_ISREG(opened.st_mode)
+      or opened.st_uid != os.geteuid()
+      or stat.S_IMODE(opened.st_mode) & 0o077
+      or opened.st_dev != before.st_dev
+      or opened.st_ino != before.st_ino
+      or opened.st_size != before.st_size
+      or opened.st_size > MAX_ARTIFACT_BYTES
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch child identity is unsafe",
+      )
+    if completed is not None:
+      try:
+        summary = inspect_route_evidence_file(scratch / name)
+      except RouteEvidenceError as exc:
+        raise BackfillError(
+          "backfill_spool_invalid",
+          "prepared-route scratch artifact is invalid",
+        ) from exc
+      route_digest = hashlib.sha256(
+        summary.source_identity.route_id.encode(),
+      ).hexdigest()[:24]
+      expected_name = f"prepared-route-{route_digest}.route-evidence"
+      if name != expected_name:
+        raise BackfillError(
+          "backfill_spool_invalid",
+          "prepared-route scratch artifact name is invalid",
+        )
+    after = os.fstat(descriptor)
+    rebound = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+      after.st_dev != opened.st_dev
+      or after.st_ino != opened.st_ino
+      or after.st_size != opened.st_size
+      or after.st_mtime_ns != opened.st_mtime_ns
+      or after.st_ctime_ns != opened.st_ctime_ns
+      or rebound.st_dev != opened.st_dev
+      or rebound.st_ino != opened.st_ino
+      or rebound.st_size != opened.st_size
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch child changed during inspection",
+      )
+    return opened.st_size
+  except BackfillError:
+    raise
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "prepared-route scratch child cannot be inspected safely",
+    ) from exc
+  finally:
+    if descriptor >= 0:
+      os.close(descriptor)
+
+
+def _quarantine_prepared_route_scratch(
+  artifact_root: Path,
+  scratch: Path,
+  *,
+  expected_identity: OwnedDirectoryIdentity | None = None,
+) -> None:
+  """Atomically preserve one bounded exact-owned preparation crash tree."""
+  parent_fd = -1
+  directory_fd = -1
+  try:
+    parent_fd = os.open(
+      artifact_root,
+      os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+      | getattr(os, "O_NOFOLLOW", 0),
+    )
+    parent_info = os.fstat(parent_fd)
+    if (
+      not stat.S_ISDIR(parent_info.st_mode)
+      or parent_info.st_uid != os.geteuid()
+      or stat.S_IMODE(parent_info.st_mode) & 0o022
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch parent is unsafe",
+      )
+    try:
+      os.stat(
+        PREPARED_ROUTE_SCRATCH_QUARANTINE,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+      )
+    except FileNotFoundError:
+      pass
+    else:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch quarantine requires operator recovery",
+      )
+    directory_fd = os.open(
+      scratch.name,
+      os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+      | getattr(os, "O_NOFOLLOW", 0),
+      dir_fd=parent_fd,
+    )
+    opened = os.fstat(directory_fd)
+    if (
+      not stat.S_ISDIR(opened.st_mode)
+      or opened.st_uid != os.geteuid()
+      or stat.S_IMODE(opened.st_mode) != 0o700
+      or (
+        expected_identity is not None
+        and (
+          opened.st_dev != expected_identity.st_dev
+          or opened.st_ino != expected_identity.st_ino
+        )
+      )
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch directory identity is unsafe",
+      )
+    names = _bounded_directory_names(
+      directory_fd,
+      PREPARED_ROUTE_SCRATCH_MAX_CHILDREN + 1,
+      diagnostic="backfill_spool_invalid",
+      purpose="prepared-route scratch",
+    )
+    if len(names) > PREPARED_ROUTE_SCRATCH_MAX_CHILDREN:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch exceeds its child bound",
+      )
+    total_bytes = sum(
+      _validate_prepared_route_scratch_child(
+        scratch,
+        directory_fd,
+        name,
+      )
+      for name in names
+    )
+    if total_bytes > PREPARED_ROUTE_SCRATCH_MAX_BYTES:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch exceeds its byte bound",
+      )
+    rebound = os.stat(
+      scratch.name,
+      dir_fd=parent_fd,
+      follow_symlinks=False,
+    )
+    if rebound.st_dev != opened.st_dev or rebound.st_ino != opened.st_ino:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch path changed during inspection",
+      )
+    os.rename(
+      scratch.name,
+      PREPARED_ROUTE_SCRATCH_QUARANTINE,
+      src_dir_fd=parent_fd,
+      dst_dir_fd=parent_fd,
+    )
+    quarantined = os.stat(
+      PREPARED_ROUTE_SCRATCH_QUARANTINE,
+      dir_fd=parent_fd,
+      follow_symlinks=False,
+    )
+    if (
+      quarantined.st_dev != opened.st_dev
+      or quarantined.st_ino != opened.st_ino
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "prepared-route scratch quarantine identity changed",
+      )
+    os.fsync(parent_fd)
+  except BackfillError:
+    raise
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "prepared-route scratch quarantine failed",
+    ) from exc
+  finally:
+    if directory_fd >= 0:
+      os.close(directory_fd)
+    if parent_fd >= 0:
+      os.close(parent_fd)
+  raise BackfillError(
+    "backfill_spool_invalid",
+    "prepared-route scratch was quarantined; operator recovery is required",
+  )
+
+
+def _remove_empty_prepared_route_scratch(
+  scratch: Path,
+  identity: OwnedDirectoryIdentity,
+) -> bool:
+  """Remove the exact empty live lane; return false when data needs quarantine."""
+  parent_fd = -1
+  directory_fd = -1
+  try:
+    parent_fd = os.open(
+      scratch.parent,
+      os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+      | getattr(os, "O_NOFOLLOW", 0),
+    )
+    directory_fd = os.open(
+      scratch.name,
+      os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+      | getattr(os, "O_NOFOLLOW", 0),
+      dir_fd=parent_fd,
+    )
+    opened = os.fstat(directory_fd)
+    if (
+      not stat.S_ISDIR(opened.st_mode)
+      or opened.st_uid != os.geteuid()
+      or stat.S_IMODE(opened.st_mode) != 0o700
+      or opened.st_dev != identity.st_dev
+      or opened.st_ino != identity.st_ino
+    ):
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "live prepared-route scratch inode changed",
+      )
+    if _bounded_directory_names(
+      directory_fd,
+      PREPARED_ROUTE_SCRATCH_MAX_CHILDREN + 1,
+      diagnostic="backfill_spool_invalid",
+      purpose="live prepared-route scratch",
+    ):
+      return False
+    rebound = os.stat(
+      scratch.name,
+      dir_fd=parent_fd,
+      follow_symlinks=False,
+    )
+    if rebound.st_dev != opened.st_dev or rebound.st_ino != opened.st_ino:
+      raise BackfillError(
+        "backfill_spool_invalid",
+        "live prepared-route scratch path changed",
+      )
+    os.rmdir(scratch.name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+    return True
+  except BackfillError:
+    raise
+  except OSError as exc:
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "live prepared-route scratch cleanup failed",
+    ) from exc
+  finally:
+    if directory_fd >= 0:
+      os.close(directory_fd)
+    if parent_fd >= 0:
+      os.close(parent_fd)
+
+
+def cleanup_stale_prepared_route_spools(artifact_root: Path) -> None:
+  """Recover exact A/A staging and quarantine one owned preparation crash."""
+  quarantine_stale_route_evidence_staging(artifact_root)
+  quarantine = artifact_root / PREPARED_ROUTE_SCRATCH_QUARANTINE
+  if quarantine.exists() or quarantine.is_symlink():
+    raise BackfillError(
+      "backfill_spool_invalid",
+      "prepared-route scratch quarantine requires operator recovery",
+    )
+  entries: list[Path] = []
+  try:
+    with os.scandir(artifact_root) as inventory:
+      for entry in inventory:
+        if _BACKFILL_SPOOL_DIRECTORY_RE.fullmatch(entry.name) is None:
+          continue
+        if entries:
+          raise BackfillError(
+            "backfill_spool_invalid",
+            "multiple prepared-route scratch directories require operator recovery",
+          )
+        entries.append(artifact_root / entry.name)
+  except BackfillError:
+    raise
   except OSError as exc:
     raise BackfillError(
       "backfill_reader_unavailable",
       "prepared-route scratch inventory is unavailable",
     ) from exc
-  for entry in entries:
-    if _BACKFILL_SPOOL_DIRECTORY_RE.fullmatch(entry.name) is None:
-      continue
-    try:
-      entry_stat = entry.lstat()
-      if not stat.S_ISDIR(entry_stat.st_mode) or entry.is_symlink():
-        raise BackfillError(
-          "backfill_spool_invalid",
-          "prepared-route scratch path has an unsafe type",
-        )
-      shutil.rmtree(entry)
-      removed = True
-    except BackfillError:
-      raise
-    except OSError as exc:
-      raise BackfillError(
-        "backfill_spool_invalid",
-        "abandoned prepared-route scratch cleanup failed",
-      ) from exc
-  if removed:
-    _fsync_directory(artifact_root)
+  if entries:
+    _quarantine_prepared_route_scratch(artifact_root, entries[0])
 
 
 def _write_fsynced(path: Path, encoded: bytes) -> None:
@@ -3939,6 +4271,23 @@ def publish_generation(
     "schema_version": BACKFILL_COMMIT_SCHEMA_VERSION,
     "selected_profile_sha256": selected_profile_sha256,
   })
+  staging_files: dict[str, bytes] = {
+    "commit.json": commit_bytes,
+    "evidence.json": finalization.evidence_bytes,
+    "ledger.json": ledger_bytes,
+    "manifest.json": finalization.manifest_bytes,
+    "provenance.json": provenance_bytes,
+  }
+  if selected_profile_json is not None:
+    assert selected_profile_sha256 is not None
+    staging_files[
+      f"selected_profiles/{selected_profile_sha256}.json"
+    ] = selected_profile_json
+  if finalization.candidate_profile_json is not None:
+    assert finalization.candidate_profile_sha256 is not None
+    staging_files[
+      f"candidates/{finalization.candidate_profile_sha256}.json"
+    ] = finalization.candidate_profile_json
   generation_sha256 = _sha256(commit_bytes)
   generations = artifact_paths.backfill_generations
   generations.mkdir(parents=True, exist_ok=True)
@@ -3946,6 +4295,24 @@ def publish_generation(
     dir=generations,
     prefix=".staging-",
   ))
+  staging_identity = capture_owned_directory(staging)
+
+  def cleanup_staging(*, require_complete: bool) -> None:
+    try:
+      remove_owned_allowlisted_tree(
+        staging,
+        staging_identity,
+        staging_files,
+        maximum_file_bytes=MAX_ARTIFACT_BYTES,
+        maximum_total_bytes=sum(map(len, staging_files.values())),
+        require_complete=require_complete,
+      )
+    except OwnedScratchError as cleanup_exc:
+      raise BackfillError(
+        "backfill_publish_failed",
+        "immutable generation staging cleanup failed closed",
+      ) from cleanup_exc
+
   try:
     _write_fsynced(staging / "evidence.json", finalization.evidence_bytes)
     _write_fsynced(staging / "manifest.json", finalization.manifest_bytes)
@@ -4058,7 +4425,7 @@ def publish_generation(
             "backfill_publish_failed",
             "existing generation candidate is corrupt",
           ) from exc
-      shutil.rmtree(staging)
+      cleanup_staging(require_complete=True)
     _fsync_directory(generations)
     _abort_if_requested(
       abort_requested,
@@ -4076,8 +4443,8 @@ def publish_generation(
     _fsync_directory(artifact_paths.root)
     return generation_sha256, ledger_sha256
   except BaseException as exc:
-    if staging.exists():
-      shutil.rmtree(staging)
+    if os.path.lexists(staging):
+      cleanup_staging(require_complete=False)
     if isinstance(exc, BackfillError):
       raise
     if isinstance(exc, OSError):
@@ -5027,6 +5394,7 @@ class _PrefetchingRoutePreparer:
     self._pending_route: RouteCandidate | None = None
     self._pending_worker: _ForkedTaskWorker | None = None
     self._scratch_directory: Path | None = None
+    self._scratch_identity: OwnedDirectoryIdentity | None = None
     self._closed = False
 
   def _ensure_scratch_directory(self) -> Path:
@@ -5038,7 +5406,10 @@ class _PrefetchingRoutePreparer:
             f"{BACKFILL_SPOOL_DIRECTORY_PREFIX}{self.authority_index}-"
           ),
         ))
-      except OSError as exc:
+        self._scratch_identity = capture_owned_directory(
+          self._scratch_directory,
+        )
+      except (OSError, OwnedScratchError) as exc:
         raise BackfillError(
           "backfill_reader_unavailable",
           "private prepared-route scratch directory is unavailable",
@@ -5200,16 +5571,32 @@ class _PrefetchingRoutePreparer:
     try:
       if (
         self._scratch_directory is not None
-        and self._scratch_directory.exists()
+        and os.path.lexists(self._scratch_directory)
       ):
-        shutil.rmtree(self._scratch_directory)
-    except OSError as exc:
+        if self._scratch_identity is None:
+          raise BackfillError(
+            "backfill_spool_invalid",
+            "prepared route scratch identity was not captured",
+          )
+        if not _remove_empty_prepared_route_scratch(
+          self._scratch_directory,
+          self._scratch_identity,
+        ):
+          _quarantine_prepared_route_scratch(
+            self._scratch_parent,
+            self._scratch_directory,
+            expected_identity=self._scratch_identity,
+          )
+    except (OSError, BackfillError) as exc:
       if cleanup_error is None:
-        cleanup_error = BackfillError(
-          "backfill_spool_invalid",
-          "prepared route scratch cleanup failed",
-        )
-        cleanup_error.__cause__ = exc
+        if isinstance(exc, BackfillError):
+          cleanup_error = exc
+        else:
+          cleanup_error = BackfillError(
+            "backfill_spool_invalid",
+            "prepared route scratch cleanup failed",
+          )
+          cleanup_error.__cause__ = exc
     self._closed = True
     if cleanup_error is not None:
       raise cleanup_error
