@@ -240,6 +240,29 @@ def node_fixture(
   }
 
 
+def sample_accounting_fixture() -> dict:
+  rejection_reasons = {
+    "invalid_numeric_or_timestamp": 1,
+    "vehicle_input_invalid": 2,
+    "lateral_inactive": 3,
+    "standstill_or_below_min_steer_speed": 4,
+    "live_rack_mapping_invalid": 5,
+    "driver_override_or_allowance": 6,
+    "causal_command_alignment_unavailable": 7,
+    "measurement_warmup_or_discontinuity": 8,
+    "learner_ineligible": 9,
+    "breakaway_episode_discarded": 10,
+  }
+  accepted = 100
+  rejected = sum(rejection_reasons.values())
+  return {
+    "accepted_sample_count": accepted,
+    "ingested_sample_count": accepted + rejected,
+    "rejected_sample_count": rejected,
+    "rejection_reasons": rejection_reasons,
+  }
+
+
 def learning_fixture(*, last_drive_complete: bool = True) -> dict:
   nodes = [
     node_fixture(index, last_drive_complete=last_drive_complete)
@@ -261,7 +284,7 @@ def learning_fixture(*, last_drive_complete: bool = True) -> dict:
     last_drive_complete=last_drive_complete,
   )
   return {
-    "schema_version": 3,
+    "schema_version": 4,
     "informational_only": True,
     "vehicle_identity": VEHICLE,
     "runtime_identity_sha256": RUNTIME_HASH,
@@ -269,7 +292,7 @@ def learning_fixture(*, last_drive_complete: bool = True) -> dict:
     "evidence_sha256": "4" * 64,
     "manifest_sha256": "5" * 64,
     "all_intervals_qualified": False,
-    "all_nodes_evaluated": False,
+    "all_nodes_evaluated": True,
     "all_nodes_qualified": False,
     "candidate_profile_available": False,
     "candidate_profile_sha256": None,
@@ -277,6 +300,7 @@ def learning_fixture(*, last_drive_complete: bool = True) -> dict:
     "interpolation_reports": [],
     "last_drive_complete": last_drive_complete,
     "nodes": nodes,
+    "sample_accounting": sample_accounting_fixture(),
   }
 
 
@@ -331,9 +355,11 @@ def qualify_all_nodes(
   payload["all_intervals_qualified"] = all(
     outcome == "qualified" for outcome in interpolation_outcomes
   )
-  payload["all_nodes_qualified"] = payload["all_intervals_qualified"]
+  payload["all_nodes_qualified"] = True
   candidate_available = (
-    payload["all_nodes_qualified"] and "learned" in outcomes
+    payload["all_nodes_qualified"]
+    and payload["all_intervals_qualified"]
+    and "learned" in outcomes
   )
   payload["candidate_profile_available"] = candidate_available
   payload["candidate_profile_sha256"] = "c" * 64 if candidate_available else None
@@ -556,7 +582,7 @@ def offdevice_progress_fixture(
 
 
 class TestLearningStatusParser(unittest.TestCase):
-  def test_schema_v2_exposes_observable_calibration_and_evidence(self) -> None:
+  def test_schema_v4_exposes_observable_calibration_and_evidence(self) -> None:
     status = parse_learning_status(
       learning_fixture(),
       expected_vehicle_identity=VEHICLE,
@@ -581,7 +607,55 @@ class TestLearningStatusParser(unittest.TestCase):
     self.assertEqual(node.candidate_parameters.static_breakaway_torque, 0.09)
     self.assertFalse(hasattr(node.candidate_parameters, "rack_gain_deg_s2_per_torque"))
 
-  def test_schema_v2_rejects_legacy_rack_parameters(self) -> None:
+  def test_schema_v4_retains_strict_sample_accounting(self) -> None:
+    status = parse_learning_status(
+      learning_fixture(),
+      expected_vehicle_identity=VEHICLE,
+    )
+    accounting = status.sample_accounting
+    self.assertEqual(accounting.accepted_sample_count, 100)
+    self.assertEqual(accounting.rejected_sample_count, 55)
+    self.assertEqual(accounting.ingested_sample_count, 155)
+    self.assertEqual(accounting.rejection_count("learner_ineligible"), 9)
+
+  def test_schema_v4_rejects_malformed_sample_accounting(self) -> None:
+    mutations = []
+
+    missing_top_level = learning_fixture()
+    del missing_top_level["sample_accounting"]
+    mutations.append((missing_top_level, "keys do not match"))
+
+    missing_total = learning_fixture()
+    del missing_total["sample_accounting"]["rejected_sample_count"]
+    mutations.append((missing_total, "keys do not match"))
+
+    unknown_reason = learning_fixture()
+    reasons = unknown_reason["sample_accounting"]["rejection_reasons"]
+    reasons["unknown_rejection"] = reasons.pop("learner_ineligible")
+    mutations.append((unknown_reason, "keys do not match"))
+
+    negative_reason = learning_fixture()
+    negative_reason["sample_accounting"]["rejection_reasons"]["learner_ineligible"] = -1
+    mutations.append((negative_reason, "non-negative integer"))
+
+    non_integer_total = learning_fixture()
+    non_integer_total["sample_accounting"]["accepted_sample_count"] = 100.0
+    mutations.append((non_integer_total, "non-negative integer"))
+
+    rejected_mismatch = learning_fixture()
+    rejected_mismatch["sample_accounting"]["rejected_sample_count"] += 1
+    mutations.append((rejected_mismatch, "totals disagree"))
+
+    ingested_mismatch = learning_fixture()
+    ingested_mismatch["sample_accounting"]["ingested_sample_count"] += 1
+    mutations.append((ingested_mismatch, "totals disagree"))
+
+    for payload, message in mutations:
+      with self.subTest(message=message):
+        with self.assertRaisesRegex(LearningStatusError, message):
+          parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
+
+  def test_schema_v4_rejects_legacy_rack_parameters(self) -> None:
     payload = learning_fixture()
     parameters = payload["nodes"][1]["candidate_parameters"]
     parameters["rack_gain_deg_s2_per_torque"] = 4000.0
@@ -767,7 +841,7 @@ class TestLearningStatusParser(unittest.TestCase):
     # LearningStatus intentionally has no active-controller property.
     self.assertFalse(hasattr(status, "active"))
 
-  def test_every_schema_v3_node_outcome_has_plain_display_copy(self) -> None:
+  def test_every_schema_v4_node_outcome_has_plain_display_copy(self) -> None:
     cases = {
       "learned": (True, ["learned"], "Learned"),
       "seed_retained": (
@@ -846,7 +920,7 @@ class TestLearningStatusParser(unittest.TestCase):
     status = parse_learning_status(payload, expected_vehicle_identity=VEHICLE)
     self.assertTrue(status.all_nodes_evaluated)
     self.assertFalse(status.all_intervals_qualified)
-    self.assertFalse(status.all_nodes_qualified)
+    self.assertTrue(status.all_nodes_qualified)
     summary = learning_summary_lines(status)[2]
     self.assertIn("1 INCONCLUSIVE", summary.text)
     self.assertIn("1 REGRESSED", summary.text)
