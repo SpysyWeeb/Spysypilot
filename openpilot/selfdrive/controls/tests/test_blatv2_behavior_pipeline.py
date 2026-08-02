@@ -4,12 +4,9 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
-
 import pytest  # noqa: TID251
 
 import openpilot.selfdrive.controls.lib.blatv2.behavior_pipeline as pipeline
-import openpilot.selfdrive.controls.blatv2_backfilld as backfilld
 from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import (
   FinalizationReason,
   ReplayArtifactIdentity,
@@ -32,10 +29,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
   VehicleCalibrationProfile,
 )
-from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
-  BackfillRunResult,
-  BehaviorEvidenceCohortSelection,
-)
+from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import BehaviorEvidenceCohortSelection
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
 )
@@ -162,29 +156,6 @@ class StatusRecorder:
     self.calls.append((BehaviorLearningState(state), BehaviorLearningDiagnostic(diagnostic), context))
     if self.fail:
       raise RuntimeError("display-only status failed")
-
-
-class DaemonParams:
-  def __init__(self) -> None:
-    self.values: dict[str, object] = {
-      "IsOffroad": True,
-      "GitCommit": SOURCE_COMMIT,
-    }
-
-  def get_bool(self, key: str, block: bool = False):
-    assert block is False
-    return self.values.get(key)
-
-  def get(self, key: str, *, block: bool):
-    assert block is False
-    return self.values.get(key)
-
-  def put(self, key: str, value, *, block: bool) -> None:
-    assert block is True
-    self.values[key] = value
-
-  def remove(self, key: str) -> None:
-    self.values.pop(key, None)
 
 
 class FakeFinalization:
@@ -567,136 +538,3 @@ def test_abort_before_descriptor_selection_stops_without_artifact_load(
   with pytest.raises(pipeline.BehaviorPipelineAborted):
     harness.pipeline.run(harness.runtime)
   assert harness.store.loads == []
-
-
-def test_daemon_closes_remote_session_before_one_behavior_stage(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  params = DaemonParams()
-  daemon = backfilld.BlatV2BackfillDaemon(
-    params=params,
-    log_root=tmp_path / "logs",
-    storage_root=tmp_path / "learning",
-  )
-  events: list[str] = []
-  result = BackfillRunResult(publication=SimpleNamespace(), pending_logger_close=False)
-  local_engine = SimpleNamespace(name="local")
-  remote_engine = SimpleNamespace(run_once=lambda: result)
-  session = SimpleNamespace(
-    build_engine=lambda: remote_engine,
-    preserve_transaction_state=lambda engine: events.append(
-      "preserve" if engine is remote_engine else "wrong-engine",
-    ),
-    close=lambda: events.append("close"),
-  )
-  car_params = SimpleNamespace(to_bytes=lambda: b"car-params")
-  daemon._wait_for_car_params = lambda: car_params
-  daemon._build_engine = lambda _cp: local_engine
-  daemon._prepare_remote = lambda *_args: session
-  daemon._project_learning_status = lambda *_args: events.append("physical")
-  daemon._run_behavior_learning = lambda engine: events.append(
-    "behavior" if engine is local_engine else "wrong-behavior-engine",
-  )
-
-  def leave_offroad(_delay: float) -> None:
-    params.values["IsOffroad"] = False
-
-  monkeypatch.setattr(backfilld.time, "sleep", leave_offroad)
-  daemon.run()
-  assert events == ["physical", "preserve", "close", "behavior"]
-
-
-def test_daemon_never_runs_behavior_while_logger_close_is_pending(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  params = DaemonParams()
-  daemon = backfilld.BlatV2BackfillDaemon(
-    params=params,
-    log_root=tmp_path / "logs",
-    storage_root=tmp_path / "learning",
-  )
-  results = iter((
-    BackfillRunResult(publication=None, pending_logger_close=True),
-    BackfillRunResult(publication=SimpleNamespace(), pending_logger_close=False),
-  ))
-  engine = SimpleNamespace(run_once=lambda: next(results))
-  car_params = SimpleNamespace(to_bytes=lambda: b"car-params")
-  behavior_calls: list[object] = []
-  daemon._wait_for_car_params = lambda: car_params
-  daemon._build_engine = lambda _cp: engine
-  daemon._prepare_remote = lambda *_args: None
-  daemon._project_learning_status = lambda *_args: None
-  daemon._run_behavior_learning = behavior_calls.append
-  monkeypatch.setattr(backfilld, "has_pending_full_rlog", lambda *_args, **_kwargs: False)
-  sleep_count = 0
-
-  def advance(_delay: float) -> None:
-    nonlocal sleep_count
-    sleep_count += 1
-    if sleep_count == 2:
-      params.values["IsOffroad"] = False
-
-  monkeypatch.setattr(backfilld.time, "sleep", advance)
-  daemon.run()
-  assert behavior_calls == [engine]
-
-
-def test_onroad_transition_before_behavior_prevents_pipeline_construction(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  params = DaemonParams()
-  factories: list[dict] = []
-
-  def factory(**kwargs):
-    factories.append(kwargs)
-    return SimpleNamespace(run=lambda _runtime: None)
-
-  daemon = backfilld.BlatV2BackfillDaemon(
-    params=params,
-    log_root=tmp_path / "logs",
-    storage_root=tmp_path / "learning",
-    behavior_pipeline_factory=factory,
-  )
-  result = BackfillRunResult(publication=SimpleNamespace(), pending_logger_close=False)
-  engine = SimpleNamespace(run_once=lambda: result)
-  car_params = SimpleNamespace(to_bytes=lambda: b"car-params")
-  daemon._wait_for_car_params = lambda: car_params
-  daemon._build_engine = lambda _cp: engine
-  daemon._prepare_remote = lambda *_args: None
-
-  def transition(*_args) -> None:
-    params.values["IsOffroad"] = False
-
-  daemon._project_learning_status = transition
-  daemon.run()
-  assert factories == []
-
-
-def test_behavior_construction_failure_cannot_relabel_physical_success(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-) -> None:
-  params = DaemonParams()
-  physical_status = {"state": "complete", "diagnostic": "profile_selected"}
-  params.values["BLaTv2LearningStatus"] = physical_status
-
-  def fail_factory(**_kwargs):
-    raise RuntimeError("behavior-only construction failure")
-
-  daemon = backfilld.BlatV2BackfillDaemon(
-    params=params,
-    log_root=tmp_path / "logs",
-    storage_root=tmp_path / "learning",
-    behavior_pipeline_factory=fail_factory,
-  )
-  monkeypatch.setattr(backfilld, "get_commit", lambda path: OPENDBC_COMMIT if "opendbc" in path else PANDA_COMMIT)
-  monkeypatch.setattr(
-    backfilld.ProvisionalRackDynamics,
-    "from_json_file",
-    lambda _path: ProvisionalRackDynamics(4000.0, 10.0, 4.0, "test"),
-  )
-  assert daemon._run_behavior_learning(SimpleNamespace(runtime_factory=MagicMock())) is None
-  assert params.values["BLaTv2LearningStatus"] is physical_status

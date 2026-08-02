@@ -70,26 +70,24 @@ and [`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
 
 ## BLaTv2 modular replacement
 
-**Status: in progress; collecting evidence while stock torque control remains
+**Status: in progress; PC-only learning while stock torque control remains
 active.** The previous LQI controller is retired. LQI means “Linear Quadratic
 Integral”: state feedback with an integral-error state. The replacement is a
 modular learning system aimed at **Smooth. Swift. Strong.**, but this milestone
-does not authorize learned steering. There is no approved profile, no automatic
-activation path, and no BLaTv2 process runs onroad. `LatControlTorque` remains
-byte-identical to the stock bootstrap. The validated Palisade/Telluride uses
-the runtime-selected 409/4/7 opendbc/panda envelope; every other vehicle keeps
-the limits supplied by its own `CarControllerParams`.
+does not authorize learned steering. There is no approved profile or automatic
+activation path. `LatControlTorque` remains byte-identical to the stock
+bootstrap. The validated Palisade/Telluride uses the runtime-selected 409/4/7
+opendbc/panda envelope; every other vehicle keeps the limits supplied by its
+own `CarControllerParams`.
 
-After a route closes, offroad-only `blatv2_backfilld` converts compatible full
-rlogs into immutable `BLATRE02` route evidence (format v2, evidence schema 9,
-namespace `complete_full_rlog_authority_v7`). Two independent authorities must
-produce the same canonical artifacts before anything is committed. The local
-path uses up to four isolated workers, owns and reaps every worker process
-group on abort/onroad transition, and never parallelizes mutable learner state.
-An authenticated PC bridge may prepare the same complete evidence artifact;
-the device still validates it, performs both A/A authorities, owns finalization,
-and remains the only possible publisher. An unavailable worker falls back to
-the unchanged local path.
+The comma now has one role in learning: ordinary loggerd records full rlogs.
+No BLaTv2 learner, route replay worker, uploader, Wi-Fi bridge, or processing
+fallback runs in the device manager graph. Closed routes are copied manually
+over read-only SSH into durable PC storage. Historical replay, deterministic
+A/A verification, physical learning, behavioral qualification, and immutable
+candidate generation all run on the PC from a clean, commit-pinned checkout.
+The retired bridge cannot publish Params, install a profile, or activate a
+controller.
 
 Physical calibration and behavioral qualification are deliberately separate.
 The physical learner estimates only observable quantities—torque per measured
@@ -115,38 +113,17 @@ the desired path. A complete physical fit or passing behavior candidate remains
 informational: neither can populate an approved artifact or change actuation
 without a later, separately reviewed activation phase.
 
-The custom home panel replaces the old route-analyzer pages with two BLaTv2
-pages, followed by the existing terminal and system-usage views. **Learning**
-shows route/segment/pass progress plus per-node physical evidence. **Readiness
-& Behavior** keeps physical qualification, behavior-cohort progress, individual
-Smooth/Swift/Strong verdicts, and activation status visibly separate. These
-Params are rebuildable display caches only; editing or deleting them cannot
-train, approve, or select a controller.
+The retired learner/readiness dashboard has been removed because the device no
+longer owns learning state. The home panel retains the live terminal and system
+usage views. The post-drive feedback prompt remains available for a future
+manually installed, PC-generated profile; it cannot train, approve, or activate
+one.
 
 No BLaTv1 controller code or `HyundaiLowSpeedTorqueDamping` is inherited. Full
 module boundaries, evidence contracts, process-safety rules, trust boundaries,
 gates, and rollback behavior are documented in
 [`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
 [`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
-
-On cold boot, `blatv2_backfilld` publishes a vehicle-bound **PREPARING
-LEARNER** projection immediately after it decodes CarParams and before runtime
-construction, route discovery, PC inventory, or uploads. Expensive preflight
-work therefore cannot be misreported as **LEARNER STATUS UNAVAILABLE**; the
-display cache still conveys no durable-learning authority until authenticated
-evidence is restored or committed.
-
-Off-device preparation is bounded and fail-closed. The PC prepares every full
-route twice, byte-compares the independent results, and returns authenticated
-artifacts plus compact certification vectors. The comma verifies the exact
-route/source/runtime/CarParams identity in a killable bounded child, then
-streams the two authorities serially; it never materializes a complete route
-artifact merely to consume PC output. Local fallback deliberately uses one
-worker. Interrupted scratch is quarantined for explicit recovery instead of
-being recursively deleted, and behavior learning remains stock-retained until
-its route-major streaming backend exists. The memory and trust boundaries are
-documented in
-[`docs/BLATV2_BEHAVIOR_STREAMING.md`](docs/BLATV2_BEHAVIOR_STREAMING.md).
 
 ## To-Do
 
@@ -162,7 +139,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ✅\* **[Better boot screen](https://github.com/SpysyWeeb/Spysypilot/tree/better-boot-screen)** — the boot spinner shows live console output (build/manager), so hangs are immediately diagnosable from the device screen &nbsp;*(personal idea)*
 - ✅ **[Error log viewer](https://github.com/SpysyWeeb/Spysypilot/tree/error-log-viewer)** — crashes are saved to an on-device log; a dev-menu button views it before/during/after a drive, with delete-on-close &nbsp;*(inspired by sunnypilot)*
 - ✅ **[Auto-update](https://github.com/SpysyWeeb/Spysypilot/tree/auto-update)** — tapping "Check" automatically checks, downloads if an update is found, and reboots to install; background downloads (which already happen every ~1.5 hrs on non-metered connections) also auto-install the moment they finish while the car is parked &nbsp;*(personal idea)*
-- ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with two display-only BLaTv2 learning/readiness pages plus the existing live terminal and system graphs; the former route analyzer and `drive_statsd` are removed &nbsp;*(personal idea)*
+- ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with the existing live terminal and system graphs; the retired route analyzer, `drive_statsd`, and on-device BLaTv2 learner dashboard are removed &nbsp;*(personal idea)*
 - ✅ **[Swapped cruise speed adjustments](https://github.com/SpysyWeeb/Spysypilot/tree/swapped-cruise-speed)** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(inspired by sunnypilot)*
 - ❌ **Quiet mode** — silence the engage and disengage sounds while leaving safety alerts audible; no branch yet &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — legacy stop-strategy branch retained for reference; its independent cruise-speed cap is intentionally removed from `combo` and superseded there by BLoTv2 Conditional Experimental Mode &nbsp;*(inspired by IQPilot)*
@@ -170,31 +147,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
 - ⚠️ **[Universal driving-event logger](https://github.com/SpysyWeeb/Spysypilot/tree/driving-event-platform)** — one rlog-first platform records automatic lateral and longitudinal failures plus general manual bookmarks, confirms preservation before showing UI success, and builds a bounded/reconstructable SSH manifest; lateral detector v7 adds b7-derived unused-authority and confirmed-driver-takeover events and remains in field validation; see [docs/DrivingEventPlatform.md](docs/DrivingEventPlatform.md) &nbsp;*(personal idea)*
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
-- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — ground-up modular adaptive lateral foundation; stock torque control is the active bootstrap, no BLaTv2 process runs onroad, and an offroad full-rlog importer builds the fully gated speed-local vehicle profile; no learned controller can actuate until replay, delivered-response, deterministic, safety, and device-timing approval all pass &nbsp;*(personal idea)*
-
-  Offroad learning exposes display-only route/segment/pass progress and a
-  conservative ETA. The two canonical authorities use separate preparation
-  workers and must agree bit-for-bit; workers have no publication or Params
-  authority and are killed and reaped as a unit if the car goes onroad. The
-  immutable evidence format is `BLATRE02` v2 in schema-9 namespace
-  `complete_full_rlog_authority_v7`. Physical calibration and behavior tuning
-  have independent readiness and gates, and the behavior search may change
-  only global natural frequency and damping after a homogeneous four-route
-  cohort exists. No result auto-activates.
-
-  The first offroad transaction probes the configured PC worker immediately,
-  then retries transient discovery absence for up to 30 seconds before
-  selecting local replay. This gives Wi-Fi time to associate without delaying
-  an already reachable worker. Offroad ownership is checked around every
-  attempt; authentication, configuration, source, and protocol failures remain
-  fail-closed rather than being hidden by the timer.
-
-  Certification replays selected whole segments independently. A contiguous
-  segment-start controls prefix whose selected poll precedes the first
-  segment-local `carState` or `carOutput` is unscoreable without borrowing state
-  from another segment, so it is excluded and counted explicitly as
-  `segment_local_measurement_context`. Ordinary whole-route canonical input
-  reconstruction remains strict.
+- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — ground-up modular adaptive lateral foundation; stock torque control is the active bootstrap, the comma only records ordinary full rlogs, and all learning now runs manually on the PC from pulled routes with deterministic A/A verification; no background learner or Wi-Fi bridge runs on the device, and no learned controller can actuate until replay, delivered-response, deterministic, safety, device-timing, and manual review gates pass &nbsp;*(personal idea)*
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

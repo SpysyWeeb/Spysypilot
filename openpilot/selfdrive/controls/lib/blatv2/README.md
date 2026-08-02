@@ -1,10 +1,18 @@
 # BLaTv2 learning and historical routes
 
-BLaTv2 performs no managed data collection or learning work onroad. Normal
-loggerd full rlogs contain the measured services needed later. After the
-drive, the offroad-only `blatv2_backfilld` waits for loggerd to close the
-route, reads the complete local full rlog, independently replays it twice,
-and atomically publishes one authenticated evidence generation.
+BLaTv2 performs no managed data collection or learning work on the device.
+Normal loggerd full rlogs contain the measured services needed later. An
+operator copies closed routes over read-only SSH into durable PC storage, then
+runs historical replay, physical learning, behavioral qualification, and
+candidate generation on the PC. There is no automatic Wi-Fi upload, remote-job
+bridge, or device-local fallback.
+
+The numerical learner and replay libraries remain here as the shared offline
+artifact. They produce informational, hash-addressed candidates only. A
+candidate must pass deterministic A/A and the applicable replay/safety gates,
+then receive separate manual review and installation before any device can
+consume it. No learner API writes device Params, selects a controller, or
+actuates.
 
 The current generation learns an observable inverse-torque calibration, not
 the retired dynamic rack model. At each `0/5/10/15/20/30 m/s` node it keeps
@@ -44,7 +52,14 @@ their node. Between nodes, evidence weights and runtime parameters interpolate
 linearly, and every adjacent interval must validate independently. Highway data
 therefore cannot erase a low-speed node.
 
-This means the UI can report `finalizing`, `backfilling`, and exact pass,
+## Retired device processing and bridge (historical)
+
+The following records the former on-device status and LAN-preparation design.
+Its schema ordinals, Params names, protocol versions, and generation formats
+remain reserved for old rlogs and audit records, but manager no longer launches
+the daemons and the current UI does not consume these caches.
+
+The former UI could report `finalizing`, `backfilling`, and exact pass,
 route, and segment progress instead of continuing to say that a first drive
 is required while work is in progress. `BLaTv2BackfillProgress` is a separate
 display-only projection bound to the current operation identity. Its work bar
@@ -53,7 +68,7 @@ both passes. Its approximate remaining time stays unavailable until each kind
 of work has independent timing support. Operation and progress status are
 never approval, evidence, or controller-selection inputs.
 
-When the optional PC bridge is used, `BLaTv2OffdeviceProgress` independently
+When the optional PC bridge was used, `BLaTv2OffdeviceProgress` independently
 reports PC processing, bounded artifact download, ARM certification,
 prepared-data handoff, or a stable local-fallback reason. A PC-only route that
 both remote authorities reject cannot be certified without local bytes, so it
@@ -89,9 +104,10 @@ replay worker rather than recreating the four-PC-worker memory shape.
 
 ## Can previous routes be used?
 
-Yes, including routes that predate this importer, when their full rlogs still
-exist locally and all compatibility checks pass. Qlogs and incomplete or
-currently locked rlogs are not sufficient.
+Yes, including routes that predate this learner, when their complete full rlogs
+exist in durable PC storage and all compatibility checks pass. Qlogs and
+incomplete or currently open rlogs are not sufficient. Route transfer is a
+manual, operator-initiated read-only SSH collection step for now.
 
 Historical replay intentionally fails closed. A route is eligible only when:
 
@@ -127,7 +143,7 @@ descriptor must be retained in `historical_build_descriptors.json`; otherwise
 first-time import of its remaining local routes correctly fails closed as
 unreviewed.
 
-## Status meanings
+## Retired device status meanings (historical)
 
 | State | Meaning |
 | --- | --- |
@@ -138,10 +154,10 @@ unreviewed.
 | `idle` | Authenticated evidence and its route ledger are committed. |
 | `failed` | The stable diagnostic explains the fail-closed operation error. |
 
-The historical process owns status only while manager Params says offroad and
+The historical process owned status only while manager Params said offroad and
 checks that ownership again at each write boundary. `collecting` and
 `drive_skipped_identity_mismatch` remain schema values for offline adapter
-tests, but the current manager graph never launches their onroad publisher.
+tests, but the current manager graph launches no BLaTv2 publisher or learner.
 The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
@@ -162,7 +178,7 @@ mean active. Both status documents are display-only.
 
 ## Determinism and storage
 
-Only complete full-rlog replay owns durable evidence. Routes are ordered by
+Only complete PC full-rlog replay owns durable evidence. Routes are ordered by
 their canonical route counter. Within a route, selected events are ordered by
 `(logMonoTime, segment, recorded ordinal)`, and a controls witness may use only
 a source at or before its timestamp. Recorded ordinal deliberately resolves
@@ -249,7 +265,7 @@ backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
 cross-architecture certification are `2/5`, and off-device display progress
-is `2`; future feedback/lifecycle and
+is `2`; these retired wire identities stay reserved. Future feedback/lifecycle and
 approved-artifact/selection/activation contracts are `2/2` and `5/2/1`.
 Older evidence is never
 reinterpreted or mixed silently.
@@ -297,4 +313,4 @@ Durable storage is also versioned by evidence-inclusion policy:
 The predecessor v1/v2/v3/v4/v5/v6 namespaces and any earlier unnamespaced runtime
 directory remain byte-untouched and are never restored or mixed into this
 policy. Version 7 always starts with an empty ledger and independently replays
-every still-local eligible full rlog.
+every eligible full rlog in the operator-selected PC archive.
