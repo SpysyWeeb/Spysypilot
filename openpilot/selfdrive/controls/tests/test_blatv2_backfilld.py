@@ -45,6 +45,11 @@ from openpilot.selfdrive.controls.lib.blatv2.offdevice_progress import (
 
 RUNTIME_IDENTITY = hashlib.sha256(b"runtime").hexdigest()
 ROUTE_IDENTITY = hashlib.sha256(b"route").hexdigest()
+REMOTE_CONTRACT = {
+  "opendbc_commit": "b" * 40,
+  "panda_commit": "c" * 40,
+  "source_commit": "a" * 40,
+}
 
 
 class FakeDiscoveryClock:
@@ -290,7 +295,7 @@ def test_missing_remote_config_falls_back_to_local_without_current(
     log_root=tmp_path / "logs",
     storage_root=storage,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   engine = SimpleNamespace(expected_dongle_id="f" * 16)
   with (
     patch(
@@ -333,7 +338,7 @@ def test_offdevice_progress_io_failure_cannot_block_local_fallback(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   with (
     patch(
       "openpilot.selfdrive.controls.blatv2_backfilld.default_bridge_config_directory",
@@ -359,7 +364,7 @@ def test_remote_preparation_passes_protected_worker_host_to_discovery(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
   engine = SimpleNamespace(
     expected_dongle_id="f" * 16,
@@ -410,7 +415,7 @@ def test_startup_discovery_unavailable_then_succeeds_without_local_claim(
     discovery_monotonic=clock.monotonic,
     discovery_sleep=clock.sleep,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
   engine = SimpleNamespace(
     expected_dongle_id="f" * 16,
@@ -482,7 +487,7 @@ def test_startup_discovery_exhausts_thirty_seconds_before_local_fallback(
     discovery_monotonic=clock.monotonic,
     discovery_sleep=clock.sleep,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   engine = SimpleNamespace(expected_dongle_id="f" * 16)
 
   def consume_attempt(**fields: object) -> None:
@@ -546,7 +551,7 @@ def test_startup_discovery_source_mismatch_fails_without_retry(
     discovery_monotonic=clock.monotonic,
     discovery_sleep=clock.sleep,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   discovery = MagicMock(side_effect=BridgeIncompatibleError("wrong source"))
   with (
     patch(
@@ -593,7 +598,7 @@ def test_startup_discovery_aborts_on_ownership_end_without_retry(
     discovery_monotonic=clock.monotonic,
     discovery_sleep=clock.sleep,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
 
   def end_ownership(**_fields: object) -> None:
     if abort_mode == "onroad":
@@ -651,7 +656,7 @@ def test_startup_discovery_status_cannot_cross_onroad_handoff(
   )
   prior_status = params.values[LEARNING_OPERATION_STATUS_PARAM]
   assert type(prior_status) is dict
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   discovery = MagicMock()
 
   def transition_onroad(_directory: Path) -> None:
@@ -711,7 +716,7 @@ def test_authenticated_worker_availability_error_falls_back_local(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
   engine = SimpleNamespace(
     expected_dongle_id="f" * 16,
@@ -771,7 +776,7 @@ def test_reason_carrying_unavailable_error_survives_local_fallback(
     log_root=tmp_path / "logs",
     storage_root=tmp_path / "learning",
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   runtime = SimpleNamespace(artifact_paths=SimpleNamespace(root=tmp_path))
   engine = SimpleNamespace(
     expected_dongle_id="f" * 16,
@@ -854,7 +859,7 @@ def test_authenticated_remote_contract_failure_maps_without_current(
     log_root=tmp_path / "logs",
     storage_root=storage,
   )
-  daemon._remote_contract = MagicMock(return_value={"source_commit": "a" * 40})
+  daemon._remote_contract = MagicMock(return_value=REMOTE_CONTRACT)
   engine = SimpleNamespace(expected_dongle_id="f" * 16)
   with (
     patch(
