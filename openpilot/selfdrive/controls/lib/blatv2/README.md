@@ -27,9 +27,11 @@ clear paired whole-route uncertainty without regressing any populated category;
 otherwise the node qualifies as `seed_retained`. The winner is frozen before
 validation and receives exactly one held-route check—there is no fallback
 selection after seeing validation.
-The immutable route counter assigns an entire route to training or validation
-before any prepared frame is applied. Base, moving, breakaway, and authority
-parts of one maneuver can therefore never leak across the boundary.
+The canonical route counter assigns an entire route to training (even) or
+validation (odd) before any prepared frame is applied. The counter is carried
+through preparation, replay, evidence, and restore rather than inferred from
+replay order or a hash. Base, moving, breakaway, and authority parts of one
+maneuver can therefore never leak across the boundary.
 
 The `0/5/10/15/20/30 m/s` support floors are respectively
 `150/150/240/240/420/420` accepted weighted seconds, not wall-clock drive
@@ -144,9 +146,13 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 3 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 4 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
-selection, validation regression, and interpolation state. The separately
+selection, validation regression, and interpolation state. It also carries
+strict first-cause accounting for every prepared frame, so accepted evidence
+plus the finite rejection-reason set always equals the ingested-frame count.
+Frames absent before the first canonical poll and explicit source gaps remain
+route-quality ledger facts because no physical frame exists to classify. The separately
 rebuildable `BLaTv2BehaviorLearningStatus` schema 1 reports
 `waiting_for_physical_profile`, `waiting_for_routes`, `preparing`, `training`,
 `selecting`, `validating`, `publishing`, `complete`, or `failed`, plus route/job
@@ -236,10 +242,10 @@ cannot fabricate a breakaway. Lifecycle and mapping discontinuities clear
 cross-frame direction.
 
 The committed identities are calibration profile/evidence/coordinator
-`2/8/8`, physical learning/operation/progress status `3/1/1`, native
+`2/9/9`, physical learning/operation/progress status `4/1/1`, native
 extractor/canonical join `3/3`, route evidence `BLATRE02` version `2`,
 backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
-`complete_full_rlog_authority_v6`. Behavior uses gate/
+`complete_full_rlog_authority_v7`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
 cross-architecture certification are `2/5`, and off-device display progress
@@ -287,8 +293,8 @@ approved activation lifecycle it may request rollback or leave an artifact
 provisional; it cannot create approval.
 
 Durable storage is also versioned by evidence-inclusion policy:
-`<storage root>/<calibration runtime identity>/complete_full_rlog_authority_v6`.
-The predecessor v1/v2/v3/v4/v5 namespaces and any earlier unnamespaced runtime
+`<storage root>/<calibration runtime identity>/complete_full_rlog_authority_v7`.
+The predecessor v1/v2/v3/v4/v5/v6 namespaces and any earlier unnamespaced runtime
 directory remain byte-untouched and are never restored or mixed into this
-policy. Version 6 always starts with an empty ledger and independently replays
+policy. Version 7 always starts with an empty ledger and independently replays
 every still-local eligible full rlog.

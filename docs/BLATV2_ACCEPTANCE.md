@@ -175,13 +175,13 @@ The current contract identities are:
 
 | Contract | Value |
 | --- | --- |
-| calibration profile / evidence / coordinator | 2 / 8 / 8 |
+| calibration profile / evidence / coordinator | 2 / 9 / 9 |
 | runtime vehicle / calibration identity / provisional dynamics | 1 / 1 / 1 |
-| physical learning / operation / progress status | 3 / 1 / 1 |
+| physical learning / operation / progress status | 4 / 1 / 1 |
 | native extractor / canonical join | 3 / 3 |
 | route evidence | `BLATRE02`, version 2 |
 | backfill ledger / commit / pointer | 2 / 2 / 1 |
-| inclusion namespace | `complete_full_rlog_authority_v6` |
+| inclusion namespace | `complete_full_rlog_authority_v7` |
 | controller policy | 1 |
 | behavior gate / segmentation / replay input | 3 / 1 / 1 |
 | behavior transaction / finalization | 2 / 1 |
@@ -189,10 +189,10 @@ The current contract identities are:
 | behavior learning status | 1 |
 | future feedback / lifecycle status | 2 / 2 |
 | future approved artifact / calibration selection / activation state | 5 / 2 / 1 |
-| off-device protocol / certification | 1 / 3 |
-| off-device display progress | 1 |
+| off-device protocol / certification | 2 / 5 |
+| off-device display progress | 2 |
 
-The v6 physical namespace starts from empty evidence. Retired v1 through v5
+The v7 physical namespace starts from empty evidence. Retired v1 through v6
 artifact bytes are immutable and cannot be migrated into it.
 
 Each speed node independently requires its documented clean support,
@@ -241,10 +241,12 @@ interval qualifies and at least one node differs from the seed. An all-seed
 result is a complete qualified evaluation, not a candidate or an error.
 Partial profiles remain evidence, not control artifacts.
 
-Learning-status schema 3 is a strict display projection of those exact
-populations and candidate values. Legacy rack-fit fields or an unknown schema
-fail closed in the UI. The cache remains informational and has no approval or
-activation authority.
+Learning-status schema 4 is a strict display projection of those exact
+populations, candidate values, and finite first-cause sample accounting.
+Accepted plus every explicit rejection cause must equal the number of prepared
+physical frames ingested. Legacy rack-fit fields, unknown rejection keys, or an
+unknown schema fail closed in the UI. The cache remains informational and has
+no approval or activation authority.
 
 ## Behavioral qualification
 
