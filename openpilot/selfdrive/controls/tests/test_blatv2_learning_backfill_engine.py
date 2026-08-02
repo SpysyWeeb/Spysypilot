@@ -122,6 +122,69 @@ def dynamics() -> ProvisionalRackDynamics:
   )
 
 
+def live_torque_record(mono_ns: int, *, valid: bool = True) -> SimpleNamespace:
+  return SimpleNamespace(mono_ns=mono_ns, valid=valid)
+
+
+def test_live_torque_health_recovers_after_startup_outlier() -> None:
+  records = (
+    live_torque_record(0),
+    live_torque_record(500_000_000),
+    live_torque_record(750_000_000),
+    live_torque_record(1_000_000_000),
+    live_torque_record(1_250_000_000),
+    live_torque_record(1_500_000_000),
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=1_505_000_000,
+    publication_index=5,
+    records=records,
+  ) == (True, True)
+
+
+def test_live_torque_health_stays_inexact_until_recent_window_is_known() -> None:
+  records = tuple(
+    live_torque_record(index * 250_000_000)
+    for index in range(4)
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=755_000_000,
+    publication_index=3,
+    records=records,
+  ) == (False, False)
+
+
+def test_live_torque_health_rejects_bad_recent_interval() -> None:
+  records = (
+    live_torque_record(0),
+    live_torque_record(250_000_000),
+    live_torque_record(500_000_000),
+    live_torque_record(750_000_000),
+    live_torque_record(1_250_000_000),
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=1_255_000_000,
+    publication_index=4,
+    records=records,
+  ) == (False, False)
+
+
+def test_live_torque_health_invalid_latest_is_exactly_unhealthy() -> None:
+  records = tuple(
+    live_torque_record(index * 250_000_000, valid=index != 4)
+    for index in range(5)
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=1_005_000_000,
+    publication_index=4,
+    records=records,
+  ) == (False, True)
+
+
 def route_frame(
   cp,
   mono_ns: int,

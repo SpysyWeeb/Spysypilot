@@ -90,7 +90,7 @@ BACKFILL_LEDGER_SCHEMA_VERSION = 2
 BACKFILL_PROVENANCE_SCHEMA_VERSION = 1
 BACKFILL_COMMIT_SCHEMA_VERSION = 2
 BACKFILL_POINTER_SCHEMA_VERSION = 1
-NATIVE_EXTRACTOR_SCHEMA_VERSION = 3
+NATIVE_EXTRACTOR_SCHEMA_VERSION = 4
 CANONICAL_JOIN_SCHEMA_VERSION = 3
 MAXIMUM_EVENT_BYTES = 64 * 1024 * 1024
 MAXIMUM_EVENT_TRAVERSAL_WORDS = MAXIMUM_EVENT_BYTES // 8
@@ -2292,17 +2292,23 @@ def _reconstruct_live_torque_health(
   """Conservatively prove witness-time SubMaster ``all_checks``.
 
   controlsd receives this 4 Hz non-polled service on the canonical 100 Hz
-  poll.  When every observed publication interval is comfortably inside the
-  FrequencyTracker band, its result is invariant to one-cycle receive jitter.
-  Boundary cases remain explicitly inexact; they are never guessed.
+  poll. FrequencyTracker accepts either its full moving average or its recent
+  ``int(frequency)``-sample average. Proving the recent window healthy is
+  sufficient and lets a bounded startup disturbance age out exactly as it does
+  on the device. Boundary cases remain explicitly inexact; they are never
+  guessed.
   """
   if publication_index is None:
     return False, True  # unseen static-frequency service is exactly unhealthy
   latest = records[publication_index]
   if not latest.valid:
     return False, True  # all_valid is false regardless of alive/frequency
-  if publication_index == 0:
-    return False, True  # FrequencyTracker has no interval yet
+  recent_interval_count = max(
+    int(SERVICE_LIST["liveTorqueParameters"].frequency),
+    1,
+  )
+  if publication_index < recent_interval_count:
+    return False, False  # unknown history may still occupy the recent window
   nominal_poll_jitter_ns = MAXIMUM_CONTROL_GAP_NS
   alive_limit_ns = int(10e9 / SERVICE_LIST["liveTorqueParameters"].frequency)
   age_ns = poll_mono_ns - latest.mono_ns
@@ -2312,14 +2318,16 @@ def _reconstruct_live_torque_health(
     return False, True
   if age_ns >= alive_limit_ns - nominal_poll_jitter_ns:
     return False, False
-  # FrequencyTracker's 4 Hz acceptable range is 3.2..4.8 Hz.  Requiring each
-  # source interval to stay inside the band after +/- one poll proves both its
-  # full and recent moving averages valid without reconstructing wall time.
+  # FrequencyTracker's 4 Hz acceptable range is 3.2..4.8 Hz. Requiring each
+  # source interval in its complete recent window to stay inside the band after
+  # +/- one poll proves the recent moving average valid without reconstructing
+  # wall time or relying on pre-route history.
   minimum_dt_ns = int(1e9 / (4.8)) + 2 * nominal_poll_jitter_ns
   maximum_dt_ns = int(1e9 / (3.2)) - 2 * nominal_poll_jitter_ns
+  first_interval_index = publication_index - recent_interval_count + 1
   intervals = (
     records[index].mono_ns - records[index - 1].mono_ns
-    for index in range(1, publication_index + 1)
+    for index in range(first_interval_index, publication_index + 1)
   )
   if all(minimum_dt_ns <= value <= maximum_dt_ns for value in intervals):
     return True, True
@@ -2644,7 +2652,7 @@ def _route_evidence_artifact(
       "canonical_join": CANONICAL_JOIN_SCHEMA_VERSION,
       "extractor": NATIVE_EXTRACTOR_SCHEMA_VERSION,
       "route_evidence": 2,
-      "live_torque_health_reconstruction": 1,
+      "live_torque_health_reconstruction": 2,
     },
     preparation_provenance=dict(provenance),
     physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
