@@ -367,6 +367,21 @@ target: discovery is still HMAC-authenticated, source-pinned, timestamped, and
 bound to the exact source commit. An unreachable configured host is ordinary
 worker unavailability and retains the four-worker local fallback.
 
+The first offroad transaction probes the worker immediately, then retries only
+transient discovery absence for up to 30 seconds before selecting local replay.
+This bounded grace gives Wi-Fi time to associate without delaying an already
+reachable worker. Offroad ownership is checked around every attempt; an
+authentication, configuration, source, or protocol failure is never hidden by
+the timer.
+
+Certification replays selected whole segments independently. A contiguous
+segment-start controls prefix whose selected poll precedes the first
+segment-local `carState` or `carOutput` is unscoreable without borrowing state
+from another segment, so it is excluded and counted explicitly as
+`segment_local_measurement_context`. The ordinary whole-route canonical input
+builder remains strict; this exception exists only at the certification
+segment boundary.
+
 Protocol v2 deliberately does not split one publication across worker jobs.
 More than 128 selected replay routes therefore makes the remote backend
 unavailable and runs the complete local transaction. Onroad handoff performs
