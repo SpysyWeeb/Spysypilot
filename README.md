@@ -283,39 +283,55 @@ provisional rack-gain/damping seed while remaining bound to the detected
 vehicle, torque mapping, rack mapping, sensor resolution, and opendbc command
 envelope.
 
-After physical publication, behavioral replay uses the newest contiguous
-cohort recorded by one exact controller/source identity. The current gate needs
+Trainer scenario replay is controller-independent. An authenticated older
+route may supply model intent, measured vehicle state, live calibration, and
+applied-torque context even when its recorded controller is not authorized as
+behavioral evidence. The recorded controller identity and original
+ineligibility reason remain immutable provenance; they are never relabeled as
+stock and their commands are never targets. Every experiment hash binds the
+ordered per-route source identities. Corrupt or input-incompatible artifacts,
+unresolved active witnesses, and routes without lateral activity remain
+rejected.
+
+This scenario contract does not weaken the production publication boundary.
+The activation-facing behavior coordinator still uses the newest contiguous
+cohort recorded by one exact controller/source identity. Its current gate needs
 at least four homogeneous routes: two whole routes for training and two frozen
 held-out routes. Four is only the partition minimum; every Smooth, Swift, and
 Strong metric also requires its committed maneuver/speed strata, at least two
 routes, and at least three windows, so qualification may need more routes. A
 rejected, missing, corrupt, or behavior-ineligible route interleaved inside the
-newest source cohort blocks qualification rather than being cherry-picked
-around. Routes from an older controller build can form an older cohort, but are
-never mixed into the newest one.
+newest source cohort blocks publication rather than being cherry-picked
+around. Routes from an older controller build can form an older publication
+cohort, but are never mixed into the newest one.
 
-Behavior qualification is currently **fail-closed pending the
-route-major streaming backend**. Cohort selection authenticates compact,
-file-backed route summaries without decoding the route object graph. Once an
-otherwise eligible cohort reaches the four-route partition minimum, the PC
-reports `behavior_streaming_required` and emits no candidate before loading any
-eager behavior artifact. This is a memory-safety diagnostic, not a failed
-Smooth/Swift/Strong result and not a request for more driving. The old eager
-path expanded the measured 146,363,115-byte CE evidence file to 909,200 KiB
-before the
-behavior decoder and replay outputs were constructed; no file-size threshold
-can prove the full downstream transaction safe. The exact replacement and its
-acceptance gates are documented in
+Behavior qualification remains **fail-closed pending authenticated aggregate
+execution**, although the bounded route-major evaluator is now implemented.
+It authenticates compact, file-backed route evidence, freezes maneuver windows
+once, and evaluates one route/controller pair at a time without decoding the
+route into an unbounded Python object graph. No candidate can become available
+until imported archive evidence proves independent A/A reconstruction and the
+cross-route stock comparison under the pinned source. This is an acceptance
+blocker, not a failed Smooth/Swift/Strong result and not automatically a request
+for more driving. The old eager path expanded the measured 146,363,115-byte CE
+evidence file to 909,200 KiB before the behavior decoder and replay outputs
+were constructed; a file-size threshold alone cannot prove the downstream
+transaction safe. The replacement and its acceptance gates are documented in
 [`docs/BLATV2_BEHAVIOR_STREAMING.md`](docs/BLATV2_BEHAVIOR_STREAMING.md).
 
 Training replays exact stock, the currently accepted artifact (or exact stock
-again during bootstrap), and the complete candidate grid. It freezes one
+again during bootstrap), and the complete candidate grid. Here exact stock is
+the unmodified stock `LatControlTorque` algorithm on the same reconstructed
+model-intent stream and the detected vehicle's runtime `CarControllerParams`
+envelope—not the recorded route command and not a second end-to-end planning
+stack. It freezes one
 winner before the held-out routes are examined. Held-out replay then evaluates
 only exact stock, the incumbent, and that frozen winner; validation cannot pick
 a fallback. The target must materially improve beyond observed whole-route
-uncertainty while every Smooth, Swift, and Strong gate passes independently.
-Otherwise the immutable result is **stock retained** and contains no behavior
-policy.
+uncertainty against exact stock and, after the first promotion, against the
+accepted incumbent too. Every Smooth, Swift, and Strong gate must independently
+non-regress against both. Otherwise the immutable result retains stock or the
+incumbent and contains no newly accepted behavior policy.
 
 ### Retired Wi-Fi preparation bridge (historical)
 

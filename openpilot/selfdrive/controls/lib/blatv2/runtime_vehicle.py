@@ -117,6 +117,23 @@ class ProvisionalRackDynamics:
     )
     object.__setattr__(self, "provenance", provenance)
 
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "provenance": self.provenance,
+      "provisional": True,
+      "rack_damping_per_s": self.rack_damping_per_s,
+      "rack_gain_deg_s2_per_torque": self.rack_gain_deg_s2_per_torque,
+      "rack_rate_resolution_deg_s": self.rack_rate_resolution_deg_s,
+      "schema_version": PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION,
+    }
+
+  def to_json(self) -> str:
+    return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+
+  @property
+  def identity_sha256(self) -> str:
+    return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
   @classmethod
   def from_json_file(
     cls,

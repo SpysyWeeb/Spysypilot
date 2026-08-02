@@ -87,6 +87,33 @@ segmentation hashes, coverage identities, paired-route uncertainty, and final
 transaction JSON must remain byte-identical to the eager reference on bounded
 fixtures.
 
+### Bounded segmentation work authority
+
+The file-backed route evaluator rejects, rather than truncates, a route which
+exceeds any limit in the hashed segmentation configuration. Schema version 2
+admits at most 65,536 raw phase spans, 4,096 qualifying phase windows, 4,096
+event locators, and 65,536 event-to-phase attachments per route. These are
+offline resource limits, not controller tuning values. They prevent the
+one-million-frame wire limit from expanding into minutes of phase churn or an
+unbounded Python descriptor graph; changing one creates a new segmentation
+identity and therefore a new comparison population.
+
+The committed gate can retain at most 240 route windows (six speed nodes ×
+five maneuver classes × eight windows), before overlap between adjacent speed
+nodes reduces that union. The 4,096-window discovery limit leaves more than
+17× headroom over that useful output, the raw-span limit leaves another 16×
+for short rejected phases, and the attachment limit allows 16 event links per
+discovered window. Crossing any limit is evidence corruption/resource
+exhaustion, never permission to choose a convenient subset.
+
+Event lookup uses the ordered non-straight span index, and event attachment is
+an interval-overlap pass. Work is proportional to spans, events, and actual
+attachments, not their Cartesian product. Per-window metric scoring retains
+only the same lowest identity-hash prefix that the existing per-route,
+speed/class-stratum cap selects before reading metric values. This is a
+streaming implementation of the existing value-independent selection rule,
+not a new sampling policy.
+
 ## Acceptance required to remove the guard
 
 - eager-versus-streaming A/A equality for every transaction byte on bounded

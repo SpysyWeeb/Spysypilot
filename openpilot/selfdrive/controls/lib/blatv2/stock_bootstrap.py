@@ -1,4 +1,11 @@
-"""Exact stock-controller construction at modular architecture boundaries."""
+"""Exact stock steering-controller construction at modular boundaries.
+
+"Exact stock" here means the unmodified :class:`LatControlTorque` algorithm
+on the same reconstructed model-intent stream as every candidate. The detected
+vehicle's runtime ``CarControllerParams`` owns its command envelope; replay
+does not substitute a literal end-to-end stock planning stack or hard-code one
+vehicle's limits.
+"""
 
 from __future__ import annotations
 

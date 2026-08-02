@@ -3,8 +3,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import ast
+import hashlib
 import math
 from pathlib import Path
+import struct
 from unittest.mock import patch
 
 from opendbc.car.structs import car
@@ -27,11 +29,17 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import BehaviorPolicy
 from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
+  BehaviorReplayStepper,
+  BehaviorReplayError,
   ReplayFrameInput,
   SOURCE_LAT_SMOOTH_SECONDS,
+  behavior_scenario_set_identity,
   make_behavior_route_evidence_decoder,
+  make_behavior_scenario_route_evidence_decoder,
   make_exact_stock_behavior_replay_core,
   make_modular_behavior_replay_core,
+  reviewed_replay_core_identity,
+  validate_reviewed_behavior_replay_core,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
   CanonicalBehaviorControlInput,
@@ -54,7 +62,6 @@ from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import RackMappingSnaps
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ControlsWitness,
   DrivingEventLocator,
-  LateralManeuverPlanPublication,
   LiveDelayPublication,
   LiveTorqueParametersPublication,
   ModelPublication,
@@ -202,6 +209,15 @@ def core_identity(name: str, token: str) -> ReplayCoreIdentity:
   return ReplayCoreIdentity(
     controller_name=name,
     core_artifact_sha256=token * 64,
+    source_openpilot_commit="1" * 40,
+    opendbc_commit="2" * 40,
+    panda_commit="3" * 40,
+  )
+
+
+def reviewed_core_identity(*, modular: bool) -> ReplayCoreIdentity:
+  return reviewed_replay_core_identity(
+    exact_stock=not modular,
     source_openpilot_commit="1" * 40,
     opendbc_commit="2" * 40,
     panda_commit="3" * 40,
@@ -385,7 +401,7 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
       model_publication_index=index - 1,
       live_torque_parameters_index=0,
       live_delay_index=0,
-      lateral_maneuver_plan_index=0,
+      lateral_maneuver_plan_index=-1,
       poll_mono_time_ns=BASE_NS + index * 10_000_000 - 1_000_000,
       state_sample_mono_ns=BASE_NS + index * 10_000_000 - 2_000_000,
       live_parameters_mono_ns=BASE_NS + index * 10_000_000 - 2_500_000,
@@ -410,7 +426,7 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
       gap_from_previous=False,
       car_control_paired=True,
       torque_output_can_valid=True,
-      maneuver_plan_available=True,
+      maneuver_plan_available=False,
       live_torque_parameters_available=True,
       live_delay_available=True,
       live_torque_parameters_checks_passed=True,
@@ -455,13 +471,50 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
     live_delays=(LiveDelayPublication(
       0, 0, BASE_NS - 19_000_000, 0.12, 1, True, "valid",
     ),),
-    lateral_maneuver_plans=(LateralManeuverPlanPublication(
-      0, 0, BASE_NS - 18_000_000, 0.011, True,
-    ),),
+    lateral_maneuver_plans=(),
     event_locators=(DrivingEventLocator(
       0, 0, BASE_NS + 40_000_000, BASE_NS + 20_000_000,
       1.0, 1.0, "event-1", "lat.turnStopTurn", "warning", True,
     ),),
+  )
+
+
+def replace_route_evidence(
+  artifact: RouteEvidenceArtifact,
+  *,
+  source: RouteEvidenceSourceIdentity | None = None,
+  witnesses: tuple[ControlsWitness, ...] | None = None,
+) -> RouteEvidenceArtifact:
+  return RouteEvidenceArtifact(
+    artifact.source_identity if source is None else source,
+    bytes(artifact.car_params_bytes),
+    bytes(artifact.physical_bytes),
+    artifact.model_publications,
+    artifact.control_witnesses if witnesses is None else witnesses,
+    artifact.live_torque_parameters,
+    artifact.live_delays,
+    artifact.lateral_maneuver_plans,
+    artifact.event_locators,
+  )
+
+
+def output_bytes(outputs) -> bytes:
+  return b"".join(
+    struct.pack(
+      "<Q7d3?",
+      output.mono_time_ns,
+      output.measured_curvature_1pm,
+      output.measured_rack_angle_deg,
+      output.measured_rack_rate_deg_s,
+      output.measured_rack_accel_deg_s2,
+      output.raw_requested_torque,
+      output.envelope_applied_torque,
+      output.torque_headroom,
+      output.actuator_constrained,
+      output.controller_fault,
+      output.response_eligible,
+    )
+    for output in outputs
   )
 
 
@@ -499,7 +552,7 @@ def request(
       ),
     ))
   policy = behavior_policy() if modular else None
-  identity = core_identity("modular" if modular else "stock", "c" if modular else "d")
+  identity = reviewed_core_identity(modular=modular)
   return ControllerReplayRequest(
     artifact_identity=ReplayArtifactIdentity.compose(
       ReplayRole.CANDIDATE if modular else ReplayRole.EXACT_STOCK,
@@ -515,7 +568,7 @@ def request(
 
 def modular_core():
   return make_modular_behavior_replay_core(
-    core_identity("modular", "c"),
+    reviewed_core_identity(modular=True),
     provisional_dynamics=provisional(),
     interface_registry=INTERFACES,
   )
@@ -523,10 +576,81 @@ def modular_core():
 
 def stock_core():
   return make_exact_stock_behavior_replay_core(
-    core_identity("stock", "d"),
+    reviewed_core_identity(modular=False),
     provisional_dynamics=provisional(),
     interface_registry=INTERFACES,
   )
+
+
+def test_reviewed_core_authority_rejects_injected_vehicle_interface() -> None:
+  identity = reviewed_core_identity(modular=False)
+  injected = make_exact_stock_behavior_replay_core(
+    identity,
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )
+  try:
+    validate_reviewed_behavior_replay_core(injected, exact_stock=True)
+  except BehaviorReplayError as error:
+    assert "reviewed execution adapter" in str(error)
+  else:
+    raise AssertionError("injected vehicle interface acquired stock authority")
+
+  production = make_exact_stock_behavior_replay_core(
+    identity,
+    provisional_dynamics=provisional(),
+  )
+  validate_reviewed_behavior_replay_core(production, exact_stock=True)
+
+
+def streaming_stepper(
+  replay_request: ControllerReplayRequest,
+) -> tuple[BehaviorReplayStepper, tuple[ReplayFrameInput, ...]]:
+  inputs = tuple(
+    ReplayFrameInput.from_bytes(control.core_input)
+    for control in replay_request.route.control_inputs
+  )
+  return BehaviorReplayStepper(
+    vehicle_identity=replay_request.route.vehicle_identity,
+    physical_profile=replay_request.physical_profile,
+    policy=replay_request.policy,
+    first_frame_input=inputs[0],
+    nominal_rack_mapping=replay_request.route.control_inputs[0].nominal_rack_mapping,
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  ), inputs
+
+
+def stream_request(
+  replay_request: ControllerReplayRequest,
+  stepper: BehaviorReplayStepper | None = None,
+) -> tuple:
+  if stepper is None:
+    stepper, inputs = streaming_stepper(replay_request)
+  else:
+    inputs = tuple(
+      ReplayFrameInput.from_bytes(control.core_input)
+      for control in replay_request.route.control_inputs
+    )
+  outputs = []
+  for control, frame, reference in zip(
+    replay_request.route.control_inputs,
+    inputs,
+    replay_request.references,
+    strict=True,
+  ):
+    model = (
+      None
+      if control.model_publication_index is None
+      else replay_request.route.model_publications[control.model_publication_index]
+    )
+    outputs.append(stepper.step(
+      control=control,
+      frame_input=frame,
+      model_intent=model,
+      reference=reference,
+    ))
+  return tuple(outputs)
 
 
 def test_replay_frame_input_roundtrip_is_exact_and_strict() -> None:
@@ -571,6 +695,135 @@ def test_decoder_preserves_inactive_premodel_prefix_and_exact_links() -> None:
   assert active.live_torque_inputs_valid
   assert decoded.event_locators[0].event_type == "lat.turnStopTurn"
   assert decoded.route_evidence_sha256 == artifact.sha256
+
+
+def test_scenario_decoder_preserves_unverified_recorded_source_without_relabeling() -> None:
+  base = route_evidence_with_inactive_premodel_prefix()
+  source = replace(
+    base.source_identity,
+    controller_source_kind="ineligible",
+    behavior_eligible=False,
+    behavior_ineligible_reason="unverified_stock_composition",
+  )
+  artifact = replace_route_evidence(base, source=source)
+  strict_decoder = make_behavior_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )
+  scenario_decoder = make_behavior_scenario_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )
+
+  try:
+    strict_decoder(artifact, physical_profile())
+  except BehaviorReplayError as error:
+    assert "behavior-ineligible" in str(error)
+  else:
+    raise AssertionError("strict behavior decoder admitted ineligible evidence")
+
+  decoded = scenario_decoder(artifact, physical_profile())
+  provenance = decoded.scenario_provenance
+  assert provenance is not None
+  assert not provenance.recorded_behavior_eligible
+  assert provenance.recorded_behavior_ineligible_reason == "unverified_stock_composition"
+  assert provenance.recorded_source.controller_name == "ineligible"
+  assert provenance.recorded_source.controller_name != "stock_canonical"
+  assert provenance.route_evidence_sha256 == artifact.sha256
+
+
+def test_scenario_identity_binds_ordered_recorded_sources() -> None:
+  base = route_evidence_with_inactive_premodel_prefix()
+  source = replace(
+    base.source_identity,
+    controller_source_kind="ineligible",
+    behavior_eligible=False,
+    behavior_ineligible_reason="unverified_stock_composition",
+  )
+  artifact = replace_route_evidence(base, source=source)
+  decoder = make_behavior_scenario_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )
+  first = decoder(artifact, physical_profile())
+  assert first.scenario_provenance is not None
+  second_provenance = replace(
+    first.scenario_provenance,
+    route_id="synthetic-evidence-route-2",
+    route_evidence_sha256="7" * 64,
+  )
+  second = replace(
+    first,
+    route_id=second_provenance.route_id,
+    route_evidence_sha256=second_provenance.route_evidence_sha256,
+    scenario_provenance=second_provenance,
+  )
+
+  forward = behavior_scenario_set_identity((first, second))
+  reverse = behavior_scenario_set_identity((second, first))
+  assert forward.sha256 != reverse.sha256
+  assert [
+    value["recordedBehaviorIneligibleReason"]
+    for value in forward.to_dict()["scenarioSources"]
+  ] == ["unverified_stock_composition", "unverified_stock_composition"]
+
+
+def test_scenario_decoder_rejects_incompatible_unresolved_and_inactive_evidence() -> None:
+  base = route_evidence_with_inactive_premodel_prefix()
+  decoder = make_behavior_scenario_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )
+  incompatible_source = replace(
+    base.source_identity,
+    controller_source_kind="ineligible",
+    behavior_eligible=False,
+    behavior_ineligible_reason="exact_model_link_missing",
+  )
+  incompatible = replace_route_evidence(base, source=incompatible_source)
+  try:
+    decoder(incompatible, physical_profile())
+  except BehaviorReplayError as error:
+    assert "scenario-incompatible" in str(error)
+  else:
+    raise AssertionError("scenario decoder admitted incompatible source evidence")
+
+  scenario_source = replace(
+    base.source_identity,
+    controller_source_kind="ineligible",
+    behavior_eligible=False,
+    behavior_ineligible_reason="unverified_stock_composition",
+    unresolved_witness_count=1,
+  )
+  unresolved_witnesses = list(base.control_witnesses)
+  unresolved_witnesses[1] = replace(unresolved_witnesses[1], race_unresolved=True)
+  unresolved = replace_route_evidence(
+    base,
+    source=scenario_source,
+    witnesses=tuple(unresolved_witnesses),
+  )
+  try:
+    decoder(unresolved, physical_profile())
+  except BehaviorReplayError as error:
+    assert "unresolved" in str(error)
+  else:
+    raise AssertionError("scenario decoder admitted unresolved active evidence")
+
+  inactive_witnesses = tuple(
+    replace(witness, lateral_active=False)
+    for witness in base.control_witnesses
+  )
+  inactive = replace_route_evidence(
+    base,
+    source=replace(scenario_source, unresolved_witness_count=0),
+    witnesses=inactive_witnesses,
+  )
+  try:
+    decoder(inactive, physical_profile())
+  except BehaviorReplayError as error:
+    assert "no active lateral" in str(error)
+  else:
+    raise AssertionError("scenario decoder admitted evidence without lateral activity")
 
 
 def test_exact_stock_timing_scalar_is_pinned_to_source() -> None:
@@ -632,6 +885,19 @@ def test_modular_replay_calls_existing_core_and_is_exact_aa() -> None:
   assert any(output.response_eligible for output in first)
 
 
+def test_whole_route_adapters_match_streaming_core_and_legacy_bytes() -> None:
+  legacy_sha256 = {
+    False: "675e78bcc9025b080f1d9b0d6ede0f8ac00570bf047d54591a20180dd0709532",
+    True: "29d6b57e8b1b9e4029aef0466016b830ea32f733e6325c572e24cefa165477be",
+  }
+  for replay_core, modular in ((stock_core(), False), (modular_core(), True)):
+    replay_request = request(decoded_route(), modular=modular)
+    whole_route = tuple(replay_core.replay_route(replay_request))
+    streamed = stream_request(replay_request)
+    assert output_bytes(streamed) == output_bytes(whole_route)
+    assert hashlib.sha256(output_bytes(streamed)).hexdigest() == legacy_sha256[modular]
+
+
 def test_stock_replay_constructs_actual_source_controller() -> None:
   replay_request = request(decoded_route(), modular=False)
   with patch(
@@ -643,6 +909,16 @@ def test_stock_replay_constructs_actual_source_controller() -> None:
   assert constructor.call_count == 1
   assert any(output.response_eligible for output in outputs)
   assert all(math.isfinite(output.raw_requested_torque) for output in outputs)
+
+
+def test_exact_stock_replay_uses_detected_vehicle_envelope() -> None:
+  outputs = tuple(stock_core().replay_route(request(decoded_route(), modular=False)))
+
+  # The synthetic detected port declares the Palisade 409/4/7 contract. The
+  # stock request exceeds one build step, so its first applied command proves
+  # replay used that runtime envelope rather than a controller-side literal.
+  assert outputs[1].envelope_applied_torque == -4 / 409
+  assert outputs[1].actuator_constrained
 
 
 def test_recorded_response_after_bootstrap_cannot_leash_candidate() -> None:
@@ -666,6 +942,21 @@ def test_intervention_censors_episode_and_next_boundary_rebootstraps() -> None:
   assert outputs[20].response_eligible
 
 
+def test_streaming_episode_boundary_intervention_and_rebootstrap() -> None:
+  route = decoded_route(
+    physical_overrides={20: (12.0, -3.0, 80)},
+    intervention_index=10,
+    second_episode=True,
+  )
+  outputs = stream_request(request(route, modular=True))
+
+  assert all(output.response_eligible for output in outputs[1:10])
+  assert all(not output.response_eligible for output in outputs[10:20])
+  assert outputs[20].response_eligible
+  assert outputs[20].measured_rack_angle_deg == 12.0
+  assert outputs[20].measured_rack_rate_deg_s == -3.0
+
+
 def test_uncertain_intervention_onset_conservatively_censors_episode() -> None:
   route = decoded_route(second_episode=True)
   controls = list(route.control_inputs)
@@ -683,6 +974,23 @@ def test_uncertain_intervention_onset_conservatively_censors_episode() -> None:
   assert all(output.response_eligible for output in outputs[1:10])
   assert all(not output.response_eligible for output in outputs[10:20])
   assert outputs[20].response_eligible
+
+
+def test_streaming_invalid_gap_faults_until_a_fresh_episode() -> None:
+  route = decoded_route(second_episode=True)
+  controls = list(route.control_inputs)
+  invalid = ReplayFrameInput.from_bytes(controls[7].core_input)
+  controls[7] = replace(
+    controls[7],
+    core_input=replace(invalid, control_cadence_valid=False).to_bytes(),
+  )
+  route = replace(route, control_inputs=tuple(controls))
+  outputs = stream_request(request(route, modular=True))
+
+  assert all(output.controller_fault for output in outputs[7:18])
+  assert all(not output.response_eligible for output in outputs[7:20])
+  assert outputs[20].response_eligible
+  assert not outputs[20].controller_fault
 
 
 def test_exact_stock_faults_when_submaster_health_is_not_exact() -> None:
@@ -760,3 +1068,53 @@ def test_core_input_ignores_later_recorded_request_and_applied_values() -> None:
   changed = tuple(stock_core().replay_route(request(perturbed, modular=False)))
 
   assert baseline[1:] == changed[1:]
+
+
+def test_recorded_request_cannot_change_stock_or_candidate_counterfactual_bytes() -> None:
+  route = decoded_route(second_episode=True)
+  controls = list(route.control_inputs)
+  for index, control in enumerate(controls):
+    decoded = ReplayFrameInput.from_bytes(control.core_input)
+    controls[index] = replace(
+      control,
+      core_input=replace(
+        decoded,
+        recorded_raw_request_torque=(-0.99 if index % 2 else 0.99),
+      ).to_bytes(),
+    )
+  perturbed = replace(route, control_inputs=tuple(controls))
+
+  for replay_core, modular in ((stock_core(), False), (modular_core(), True)):
+    baseline = tuple(replay_core.replay_route(request(route, modular=modular)))
+    changed = tuple(replay_core.replay_route(request(perturbed, modular=modular)))
+    assert output_bytes(baseline) == output_bytes(changed)
+
+
+def test_streaming_recorded_request_is_metamorphically_inert() -> None:
+  route = decoded_route(second_episode=True)
+  controls = list(route.control_inputs)
+  for index, control in enumerate(controls):
+    decoded = ReplayFrameInput.from_bytes(control.core_input)
+    controls[index] = replace(
+      control,
+      core_input=replace(
+        decoded,
+        recorded_raw_request_torque=(-0.87 if index % 3 else 0.91),
+      ).to_bytes(),
+    )
+  perturbed = replace(route, control_inputs=tuple(controls))
+
+  for modular in (False, True):
+    baseline = stream_request(request(route, modular=modular))
+    changed = stream_request(request(perturbed, modular=modular))
+    assert output_bytes(baseline) == output_bytes(changed)
+
+
+def test_streaming_reset_is_fresh_route_aa() -> None:
+  for modular in (False, True):
+    replay_request = request(decoded_route(second_episode=True), modular=modular)
+    stepper, _ = streaming_stepper(replay_request)
+    first = stream_request(replay_request, stepper)
+    stepper.reset()
+    second = stream_request(replay_request, stepper)
+    assert output_bytes(first) == output_bytes(second)

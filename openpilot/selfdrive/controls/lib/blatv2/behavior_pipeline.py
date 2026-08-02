@@ -60,6 +60,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
 from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
   BEHAVIOR_REPLAY_INPUT_SCHEMA_VERSION,
   behavior_source_identity_from_route_source,
+  reviewed_replay_core_identity,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
   BehaviorLearningTransactionResult,
@@ -139,17 +140,10 @@ def build_replay_core_identity(
     raise BehaviorPipelineError("behavior replay requires full clean-build commits")
   if not controller_name.strip() or not implementation_contract.strip():
     raise BehaviorPipelineError("behavior replay implementation identity is empty")
-  core_sha256 = _sha256_json({
-    "behaviorReplayInputSchemaVersion": BEHAVIOR_REPLAY_INPUT_SCHEMA_VERSION,
-    "controllerName": controller_name,
-    "implementationContract": implementation_contract,
-    "opendbcCommit": opendbc_commit,
-    "pandaCommit": panda_commit,
-    "sourceOpenpilotCommit": source_openpilot_commit,
-  })
-  return ReplayCoreIdentity(
+  return ReplayCoreIdentity.compose(
     controller_name=controller_name,
-    core_artifact_sha256=core_sha256,
+    implementation_contract=implementation_contract,
+    replay_input_schema_version=BEHAVIOR_REPLAY_INPUT_SCHEMA_VERSION,
     source_openpilot_commit=source_openpilot_commit,
     opendbc_commit=opendbc_commit,
     panda_commit=panda_commit,
@@ -644,16 +638,14 @@ class OffroadBehaviorLearningPipeline:
       total_jobs=total_jobs,
     )
 
-    stock_identity = build_replay_core_identity(
-      controller_name="openpilot.LatControlTorque.exact-stock",
-      implementation_contract="behavior-replay-full-stock-v1",
+    stock_identity = reviewed_replay_core_identity(
+      exact_stock=True,
       source_openpilot_commit=self.source_openpilot_commit,
       opendbc_commit=self.opendbc_commit,
       panda_commit=self.panda_commit,
     )
-    modular_identity = build_replay_core_identity(
-      controller_name="blatv2.ModularControllerCore",
-      implementation_contract="behavior-replay-modular-core-v1",
+    modular_identity = reviewed_replay_core_identity(
+      exact_stock=False,
       source_openpilot_commit=self.source_openpilot_commit,
       opendbc_commit=self.opendbc_commit,
       panda_commit=self.panda_commit,

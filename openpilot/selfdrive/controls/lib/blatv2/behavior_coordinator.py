@@ -528,13 +528,49 @@ class ReplayRole(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ReplayCoreIdentity:
-  """Exact shared numerical-core bytes and source commits for replay."""
+  """Declared numerical-core contract and source commits for replay.
+
+  This value is hash identity, not execution authority.  Production replay
+  validates it against a reviewed implementation contract and fixed adapter.
+  """
 
   controller_name: str
   core_artifact_sha256: str
   source_openpilot_commit: str
   opendbc_commit: str
   panda_commit: str
+
+  @classmethod
+  def compose(
+    cls,
+    *,
+    controller_name: str,
+    implementation_contract: str,
+    replay_input_schema_version: int,
+    source_openpilot_commit: str,
+    opendbc_commit: str,
+    panda_commit: str,
+  ) -> ReplayCoreIdentity:
+    """Bind reviewed implementation semantics to exact source commits."""
+    if not controller_name.strip() or not implementation_contract.strip():
+      raise ValueError("replay core implementation identity is empty")
+    if replay_input_schema_version <= 0:
+      raise ValueError("replay input schema version must be positive")
+    core_sha256 = _sha256_json({
+      "behaviorReplayInputSchemaVersion": replay_input_schema_version,
+      "controllerName": controller_name,
+      "implementationContract": implementation_contract,
+      "opendbcCommit": opendbc_commit,
+      "pandaCommit": panda_commit,
+      "sourceOpenpilotCommit": source_openpilot_commit,
+    })
+    return cls(
+      controller_name=controller_name,
+      core_artifact_sha256=core_sha256,
+      source_openpilot_commit=source_openpilot_commit,
+      opendbc_commit=opendbc_commit,
+      panda_commit=panda_commit,
+    )
 
   def __post_init__(self) -> None:
     if not self.controller_name.strip():
@@ -930,6 +966,13 @@ def finalize_behavior_learning(
   replay_evaluate: ReplayEvaluationCallback,
 ) -> BehaviorLearningFinalization:
   """Select on whole training routes, freeze once, then validate once.
+
+  This is a pure selection primitive, not replay authority: its callback is
+  intentionally caller-owned.  Production reaches it only after
+  ``run_behavior_learning_transaction`` has admitted the reviewed fixed replay
+  adapters, or through the compact aggregate path whose route evaluations
+  validate those adapters directly.  Calling this selector with synthetic
+  evaluations is useful in tests but cannot establish an exact-stock row.
 
   Before the first modular artifact is approved, ``accepted_policy`` and
   ``accepted_core`` are both ``None``.  Exact stock then supplies both

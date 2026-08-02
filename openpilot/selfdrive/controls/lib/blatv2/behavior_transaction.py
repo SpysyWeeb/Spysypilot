@@ -21,9 +21,10 @@ invoked independently:
 * no policy is returned for activation unless training and held-out
   Smooth/Swift/Strong gates all pass.
 
-The numerical replay callback is intentionally opaque here.  Production can
-bind it to the shared harness artifact while tests can provide a small pure
-in-memory core.  Its output is still checked frame-for-frame before scoring.
+The private transaction engine keeps numerical replay injectable for small
+pure tests.  The public production entry point admits only the reviewed fixed
+stock/modular adapters and their canonical implementation-contract digests;
+its output is then checked frame-for-frame before scoring.
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
   BehaviorControlResponse,
   BehaviorReferenceAtControl,
   BehaviorSample,
+  BehaviorScenarioProvenance,
   BehaviorSourceIdentity,
   BehaviorWindow,
   EventLocator,
@@ -202,6 +204,7 @@ class DecodedBehaviorRoute:
   model_publications: tuple[SparseModelBehaviorIntent, ...]
   control_inputs: tuple[CanonicalBehaviorControlInput, ...]
   event_locators: tuple[EventLocator, ...]
+  scenario_provenance: BehaviorScenarioProvenance | None = None
 
   def __post_init__(self) -> None:
     if not self.route_id.strip() or not self.vehicle_identity.strip():
@@ -239,6 +242,14 @@ class DecodedBehaviorRoute:
     )
     if event_keys != tuple(sorted(event_keys)):
       raise ValueError("event locators must be in canonical timestamp order")
+    if self.scenario_provenance is not None and (
+      self.scenario_provenance.route_id != self.route_id
+      or self.scenario_provenance.route_evidence_sha256
+      != self.route_evidence_sha256
+      or self.scenario_provenance.recorded_source != self.recorded_source
+      or self.scenario_provenance.vehicle_identity != self.vehicle_identity
+    ):
+      raise ValueError("scenario provenance differs from decoded route identity")
 
   @property
   def identity(self) -> BehaviorRouteEvidenceIdentity:
@@ -312,7 +323,12 @@ type ControllerReplayCallback = Callable[
 
 @dataclass(frozen=True, slots=True)
 class BehaviorReplayCore:
-  """Exact core identity paired with a whole-route, reset-on-call replay."""
+  """Core identity paired with a whole-route, reset-on-call replay.
+
+  Construction alone grants no production authority.  The public transaction
+  validates the reviewed adapter type, canonical digest, and absence of test
+  interface injection before admitting this value.
+  """
 
   identity: ReplayCoreIdentity
   replay_route: ControllerReplayCallback
@@ -497,7 +513,7 @@ class _ReplayJob:
     )
 
 
-def _neutral_response(
+def neutral_behavior_response(
   control: CanonicalBehaviorControlInput,
   physical_profile: VehicleCalibrationProfile,
 ) -> BehaviorControlResponse:
@@ -536,7 +552,7 @@ def _prepare_route(
   for control_index, control in enumerate(route.control_inputs):
     if control_index % 256 == 0:
       _check_replay_abort(abort_requested)
-    neutral = _neutral_response(control, physical_profile)
+    neutral = neutral_behavior_response(control, physical_profile)
     if control.model_publication_index is None:
       # Startup witnesses preceding the first model publication are retained
       # as lifecycle context.  This explicitly invalid sentinel cannot enter
@@ -663,7 +679,7 @@ def _run_replay_job(
       raise BehaviorTransactionError("controller replay emitted an incompatible frame")
     if output.mono_time_ns != control.mono_time_ns:
       raise BehaviorTransactionError("controller replay output timeline mismatch")
-    neutral = _neutral_response(control, physical_profile)
+    neutral = neutral_behavior_response(control, physical_profile)
     response_samples.append(assemble_behavior_sample(
       reference,
       BehaviorControlResponse(
@@ -1100,7 +1116,7 @@ def _decode_and_validate_routes(
   return canonical
 
 
-def run_behavior_learning_transaction(
+def _run_behavior_learning_transaction_unchecked_for_test(
   *,
   route_evidence_artifacts: Iterable[object],
   decode_route_evidence: RouteEvidenceDecoder,
@@ -1116,7 +1132,12 @@ def run_behavior_learning_transaction(
   progress_callback: BehaviorReplayProgressCallback | None = None,
   abort_requested: Callable[[], bool] = lambda: False,
 ) -> BehaviorLearningTransactionResult:
-  """Replay, score, and finalize one non-persisting behavioral transaction.
+  """Injected-core transaction engine used by the pure orchestration tests.
+
+  Production must call :func:`run_behavior_learning_transaction`, which first
+  proves that every callback is the reviewed fixed replay adapter.  Keeping
+  this engine private preserves cheap deterministic test doubles without
+  allowing their output to be mistaken for an authoritative stock floor.
 
   Training evaluates the complete bounded candidate grid in one canonical
   worker-pool batch.  Held-out routes are not even replayed until the training
@@ -1441,4 +1462,84 @@ def run_behavior_learning_transaction(
       if finalization.passed
       else QualificationDisposition.STOCK_RETAINED
     ),
+  )
+
+
+def run_behavior_learning_transaction(
+  *,
+  route_evidence_artifacts: Iterable[object],
+  decode_route_evidence: RouteEvidenceDecoder,
+  physical_profile: VehicleCalibrationProfile,
+  accepted_policy: BehaviorPolicy | None,
+  search_center_policy: BehaviorPolicy,
+  exact_stock: BehaviorReplayCore,
+  currently_accepted: BehaviorReplayCore | None,
+  candidate: BehaviorReplayCore,
+  segmentation_config: SegmentationConfig | None = None,
+  gate_spec: BehaviorGateSpec | None = None,
+  worker_count: int = 1,
+  progress_callback: BehaviorReplayProgressCallback | None = None,
+  abort_requested: Callable[[], bool] = lambda: False,
+) -> BehaviorLearningTransactionResult:
+  """Run a transaction only with the reviewed stock and modular adapters.
+
+  A :class:`BehaviorReplayCore` remains a small injectable value so the pure
+  transaction engine can be tested without a vehicle stack.  That constructor
+  is therefore not authority.  This production entry point admits only the
+  exact private adapter implemented by :mod:`behavior_replay`, and validates
+  its canonical implementation-contract digest before any route is decoded.
+  """
+  # Lazy import avoids the intentional behavior_replay -> transaction type
+  # dependency while keeping this production boundary fail-closed.
+  from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
+    BehaviorReplayError,
+    reviewed_behavior_replay_dynamics,
+  )
+
+  try:
+    stock_dynamics = reviewed_behavior_replay_dynamics(
+      exact_stock,
+      exact_stock=True,
+    )
+    candidate_dynamics = reviewed_behavior_replay_dynamics(
+      candidate,
+      exact_stock=False,
+    )
+    accepted_dynamics = None
+    if currently_accepted is not None:
+      accepted_dynamics = reviewed_behavior_replay_dynamics(
+        currently_accepted,
+        exact_stock=False,
+      )
+  except (BehaviorReplayError, TypeError, ValueError) as error:
+    raise BehaviorTransactionError(
+      "behavior transaction requires reviewed replay-core adapters",
+    ) from error
+  dynamics = tuple(
+    value
+    for value in (stock_dynamics, accepted_dynamics, candidate_dynamics)
+    if value is not None
+  )
+  if any(
+    value != stock_dynamics
+    or value.identity_sha256 != stock_dynamics.identity_sha256
+    for value in dynamics[1:]
+  ):
+    raise BehaviorTransactionError(
+      "reviewed replay opponents require identical provisional rack dynamics",
+    )
+  return _run_behavior_learning_transaction_unchecked_for_test(
+    route_evidence_artifacts=route_evidence_artifacts,
+    decode_route_evidence=decode_route_evidence,
+    physical_profile=physical_profile,
+    accepted_policy=accepted_policy,
+    search_center_policy=search_center_policy,
+    exact_stock=exact_stock,
+    currently_accepted=currently_accepted,
+    candidate=candidate,
+    segmentation_config=segmentation_config,
+    gate_spec=gate_spec,
+    worker_count=worker_count,
+    progress_callback=progress_callback,
+    abort_requested=abort_requested,
   )
