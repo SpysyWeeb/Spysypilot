@@ -478,54 +478,86 @@ def _validate_augmented_gram(
     augmented[row * augmented_dimension + dimension] = rhs[row]
     augmented[dimension * augmented_dimension + row] = rhs[row]
   augmented[-1] = target_squared
-  # Deterministic LDL without pivoting. For a PSD matrix a zero pivot must
-  # have a zero residual row, so no platform-dependent eigen solver is needed.
-  lower = [0.0] * (augmented_dimension * augmented_dimension)
-  diagonal = [0.0] * augmented_dimension
-  for row in range(augmented_dimension):
-    try:
-      residual_terms = tuple(
-        finite_product(
-          lower[row * augmented_dimension + k],
-          lower[row * augmented_dimension + k],
-          diagonal[k],
-        )
-        for k in range(row)
-      )
-      residual = (
-        augmented[row * augmented_dimension + row]
-        - math.fsum(residual_terms)
-      )
-    except OverflowError as exc:
-      raise ValueError(f"{context} arithmetic overflow") from exc
-    if not math.isfinite(residual):
-      raise ValueError(f"{context} arithmetic overflow")
-    if residual < -tolerance:
+  _validate_scaled_psd(augmented, augmented_dimension, context)
+
+
+def _validate_scaled_psd(
+  matrix: list[float],
+  dimension: int,
+  context: str,
+) -> None:
+  """Validate PSD up to a deterministic binary64 backward-error bound.
+
+  Diagonal congruence removes physical units and absolute scale before a
+  max-residual-diagonal pivoted LDL decomposition. This avoids declaring a
+  valid low-energy direction null merely because its raw pivot is below a
+  global absolute tolerance. Equal pivots select the lowest original index.
+  """
+  if len(matrix) != dimension * dimension:
+    raise ValueError(f"{context} PSD matrix dimension is invalid")
+  row_norms = tuple(
+    _finite_fsum(
+      (abs(matrix[row * dimension + column]) for column in range(dimension)),
+      f"{context} PSD row norm",
+    )
+    for row in range(dimension)
+  )
+  matrix_norm = max(row_norms, default=0.0)
+  relative_tolerance = 512.0 * dimension * sys.float_info.epsilon
+  raw_tolerance = relative_tolerance * matrix_norm
+  diagonal = [matrix[index * dimension + index] for index in range(dimension)]
+  for index, value in enumerate(diagonal):
+    if value < -raw_tolerance:
       raise ValueError(f"{context} augmented Gram matrix is not PSD")
-    diagonal[row] = 0.0 if abs(residual) <= tolerance else residual
-    for next_row in range(row + 1, augmented_dimension):
-      try:
-        numerator = (
-          augmented[next_row * augmented_dimension + row]
-          - math.fsum(
-            finite_product(
-              lower[next_row * augmented_dimension + k],
-              lower[row * augmented_dimension + k],
-              diagonal[k],
-            )
-            for k in range(row)
-          )
-        )
-      except OverflowError as exc:
-        raise ValueError(f"{context} arithmetic overflow") from exc
-      if not math.isfinite(numerator):
-        raise ValueError(f"{context} arithmetic overflow")
-      if diagonal[row] == 0.0:
-        if abs(numerator) > tolerance:
+    if value <= 0.0:
+      diagonal[index] = 0.0
+
+  normalized = [0.0] * (dimension * dimension)
+  roots = [math.sqrt(value) for value in diagonal]
+  for row in range(dimension):
+    for column in range(row, dimension):
+      value = matrix[row * dimension + column]
+      if roots[row] == 0.0 or roots[column] == 0.0:
+        if abs(value) > raw_tolerance:
           raise ValueError(f"{context} augmented Gram nullspace is inconsistent")
-        lower[next_row * augmented_dimension + row] = 0.0
+        normalized_value = 0.0
       else:
-        lower[next_row * augmented_dimension + row] = numerator / diagonal[row]
+        normalized_value = value / (roots[row] * roots[column])
+        if not math.isfinite(normalized_value):
+          raise ValueError(f"{context} arithmetic overflow")
+      normalized[row * dimension + column] = normalized_value
+      normalized[column * dimension + row] = normalized_value
+
+  remaining = list(range(dimension))
+  while remaining:
+    pivot_index = min(
+      remaining,
+      key=lambda index: (-normalized[index * dimension + index], index),
+    )
+    pivot = normalized[pivot_index * dimension + pivot_index]
+    if pivot < -relative_tolerance:
+      raise ValueError(f"{context} augmented Gram matrix is not PSD")
+    if pivot <= relative_tolerance:
+      if any(
+        abs(normalized[row * dimension + column]) > relative_tolerance
+        for row in remaining
+        for column in remaining
+      ):
+        raise ValueError(f"{context} augmented Gram nullspace is inconsistent")
+      return
+    remaining.remove(pivot_index)
+    for row_offset, row in enumerate(remaining):
+      for column in remaining[row_offset:]:
+        update = (
+          normalized[row * dimension + pivot_index]
+          * normalized[column * dimension + pivot_index]
+          / pivot
+        )
+        value = normalized[row * dimension + column] - update
+        if not math.isfinite(value):
+          raise ValueError(f"{context} arithmetic overflow")
+        normalized[row * dimension + column] = value
+        normalized[column * dimension + row] = value
 
 
 def _regression_close(left: float, right: float, regression: _Regression) -> bool:

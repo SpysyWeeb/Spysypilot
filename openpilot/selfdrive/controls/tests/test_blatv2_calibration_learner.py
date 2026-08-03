@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 import math
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -37,6 +38,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   _validate_sign_predictor,
   _validate_joint_sign_predictor,
   _validate_joint_predictor_moments,
+  _validate_scaled_psd,
   _solve,
   calibration_evidence_sha256,
   calibration_learning_sample_field_names,
@@ -1673,6 +1675,62 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       _JointRegression.decoded(
         boundary.encoded(),
         f"boundary_joint_{upper_weight}",
+      )
+
+  def test_real_three_row_authority_statistic_roundtrips_at_any_matrix_order(self) -> None:
+    # Exact interval-0 authority rows emitted by 000000b0--efb46d31c3
+    # under the immutable 51-route training runtime CarParams donor.
+    rows = (
+      (
+        ("-0x1.6e38c6f0e6074p-1", "0x1.0000000000000p+0", "-0x1.0000000000000p+0", "0x0.0p+0"),
+        "-0x1.0000000000000p+0", "0x1.4446e3b680000p-7", "0x1.c7a6c9999999ap-1",
+      ),
+      (
+        ("-0x1.7012e4d4b2828p-1", "0x1.0000000000000p+0", "-0x1.0000000000000p+0", "0x0.0p+0"),
+        "-0x1.0000000000000p+0", "0x1.8807357e80000p-7", "0x1.c860a9999999ap-1",
+      ),
+      (
+        ("-0x1.73042172753e0p-1", "0x1.0000000000000p+0", "-0x1.0000000000000p+0", "0x0.0p+0"),
+        "-0x1.0000000000000p+0", "0x1.092d3f1740000p-7", "0x1.c93e9cccccccdp-1",
+      ),
+    )
+    regression = _JointRegression()
+    for predictors, target, weight, upper_weight in rows:
+      regression.add(
+        tuple(float.fromhex(value) for value in predictors),
+        float.fromhex(target),
+        float.fromhex(weight),
+        float.fromhex(upper_weight),
+      )
+    restored = _JointRegression.decoded(regression.encoded(), "real_authority")
+    augmented = [0.0] * 121
+    for row in range(10):
+      for column in range(10):
+        augmented[row * 11 + column] = restored.normal[row * 10 + column]
+      augmented[row * 11 + 10] = restored.rhs[row]
+      augmented[10 * 11 + row] = restored.rhs[row]
+    augmented[-1] = restored.target_squared
+    permutation = (10, 4, 2, 8, 0, 6, 1, 9, 3, 7, 5)
+    permuted = [
+      augmented[permutation[row] * 11 + permutation[column]]
+      for row in range(11)
+      for column in range(11)
+    ]
+    _validate_scaled_psd(augmented, 11, "real_authority")
+    _validate_scaled_psd(permuted, 11, "permuted_real_authority")
+
+  def test_scaled_psd_rejects_just_outside_backward_error(self) -> None:
+    tolerance = 512.0 * 2.0 * sys.float_info.epsilon
+    _validate_scaled_psd(
+      [1.0, 1.0 + 0.25 * tolerance, 1.0 + 0.25 * tolerance, 1.0],
+      2,
+      "inside_backward_error",
+    )
+    with self.assertRaisesRegex(ValueError, "not PSD"):
+      _validate_scaled_psd(
+        [1.0, 1.0 + 0.75 * tolerance, 1.0 + 0.75 * tolerance, 1.0],
+        2,
+        "outside_backward_error",
       )
 
   def test_derived_base_stratum_must_remain_an_augmented_gram(self) -> None:
