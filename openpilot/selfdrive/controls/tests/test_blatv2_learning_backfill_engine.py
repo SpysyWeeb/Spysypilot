@@ -874,15 +874,41 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   assert no_op.publication is None
   assert not no_op.pending_logger_close
   assert prepare_calls == Counter({
-    first_name: 4,
-    second_name: 4,
-    new_name: 2,
+    first_name: 6,
+    second_name: 6,
+    new_name: 4,
   })
 
   first_rlog.write_bytes(b"mutated-known-route")
   with pytest.raises(BackfillError) as changed:
     engine.run_once()
   assert changed.value.diagnostic == "backfill_untracked_evidence"
+
+
+def test_matching_a_a_historical_change_cannot_replace_retained_authority(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  route_name, _ = add_route(tmp_path / "logs", 0x10)
+  engine, _, prepare_calls, _ = make_engine(tmp_path, monkeypatch)
+  first = engine.run_once()
+  assert first.publication is not None
+  assert prepare_calls == Counter({route_name: 2})
+
+  original_prepare = learning_backfill.prepare_route
+
+  def changed_prepare(route, **kwargs):
+    prepared = original_prepare(route, **kwargs)
+    return replace(
+      prepared,
+      provenance={**prepared.provenance, "route_version": "changed-history"},
+    )
+
+  monkeypatch.setattr(learning_backfill, "prepare_route", changed_prepare)
+  with pytest.raises(BackfillError) as changed:
+    engine.run_once()
+  assert changed.value.diagnostic == "backfill_untracked_evidence"
+  assert "fresh historical replay" in str(changed.value)
 
 
 def test_progress_reports_both_passes_without_double_counting(

@@ -32,6 +32,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   _canonical_routes,
   _aggregate_nodes,
   _seed_coefficients,
+  _subtract,
   _validate_sign_predictor,
   _validate_joint_sign_predictor,
   _solve,
@@ -1068,7 +1069,10 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
         fabricated["payload_sha256"] = hashlib.sha256(
           canonical(fabricated["payload"])
         ).hexdigest()
-        with self.assertRaisesRegex(ValueError, "sign-predictor|conservation failed"):
+        with self.assertRaisesRegex(
+          ValueError,
+          "sign-predictor|sign/interpolation|conservation failed",
+        ):
           CalibrationProfileLearner.from_evidence(seed, canonical(fabricated))
 
     coordinated = json.loads(encoded)
@@ -1561,7 +1565,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     fractional = _Regression()
     fractional.add((0.2, 1.0, 0.5, 0.0), 0.1, 1.0)
     fractional = _Regression.decoded(fractional.encoded(), "fractional")
-    with self.assertRaisesRegex(ValueError, "sign-predictor energy"):
+    with self.assertRaisesRegex(ValueError, "sign-predictor|sign/interpolation"):
       _validate_sign_predictor(fractional, 2, "fractional")
 
     crossed = _Regression()
@@ -1592,7 +1596,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     fractional = _JointRegression()
     fractional.add((0.2, 1.0, 0.5, 0.0), 0.1, 1.0, 0.4)
     fractional = _JointRegression.decoded(fractional.encoded(), "fractional_joint")
-    with self.assertRaisesRegex(ValueError, "sign-predictor energy"):
+    with self.assertRaisesRegex(ValueError, "sign-predictor|sign/interpolation"):
       _validate_joint_sign_predictor(fractional, (6, 7), "fractional_joint")
 
     valid = _JointRegression()
@@ -1622,6 +1626,32 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
         (6, 7),
         "intercept_poison",
       )
+
+  def test_joint_interpolation_moments_reject_unrepresentable_psd_row(self) -> None:
+    predictor = (0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0)
+    poison = _JointRegression()
+    poison.count = 1
+    poison.weight_s = 1.0
+    poison.predictor_sums[:] = predictor
+    for row in range(10):
+      for column in range(10):
+        poison.normal[row * 10 + column] = predictor[row] * predictor[column]
+    with self.assertRaisesRegex(ValueError, "polynomial|sign/interpolation"):
+      _JointRegression.decoded(poison.encoded(), "unrepresentable_joint")
+
+  def test_derived_base_stratum_must_remain_an_augmented_gram(self) -> None:
+    whole = _Regression()
+    whole.add((0.0, 1.0, 1.0, 0.0), 0.0, 1.0)
+    moving = _Regression()
+    moving.add((20.0, 1.0, 1.0, 0.0), 0.0, 1.0)
+    with self.assertRaisesRegex(ValueError, "negative predictor energy|PSD"):
+      _subtract(whole, moving)
+
+  def test_wire_count_bound_rejects_huge_integer_without_overflow(self) -> None:
+    encoded = _Regression().encoded()
+    encoded["count"] = 10**10000
+    with self.assertRaisesRegex(ValueError, "schema bound"):
+      _Regression.decoded(encoded, "huge_count")
 
   def test_live_rows_are_structural_only_and_cannot_publish(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())

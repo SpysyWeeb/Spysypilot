@@ -46,7 +46,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 14
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 15
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
@@ -261,21 +261,10 @@ class CalibrationLearningCoordinator:
         evidence_bytes,
         expected_route_commitments=expected_route_commitments,
       )
-    self._add_sample_with_disposition = getattr(
-      self._learner,
-      "add_sample_with_disposition",
-      None,
-    )
-    self._reset_route_transients = getattr(
-      self._learner,
-      "reset_route_transients",
-      None,
-    )
     self._seed_profile = seed_profile
     self._candidate_provenance = provenance
     self._state = CalibrationLearningLifecycleState.OFFROAD
     self._clean_sample_count = 0
-    self._fallback_sample_accounting = CalibrationSampleAccounting.empty()
     self._evidence_generation = 0
     self._finalized_generation = -1
     self._cached_finalization: CalibrationLearningFinalization | None = None
@@ -310,12 +299,10 @@ class CalibrationLearningCoordinator:
 
   @property
   def sample_accounting(self) -> CalibrationSampleAccounting:
-    accounting = getattr(self._learner, "sample_accounting", None)
-    return (
-      accounting
-      if isinstance(accounting, CalibrationSampleAccounting)
-      else self._fallback_sample_accounting
-    )
+    accounting = self._learner.sample_accounting
+    if not isinstance(accounting, CalibrationSampleAccounting):
+      raise TypeError("calibration learner emitted invalid sample accounting")
+    return accounting
 
   @property
   def support_diagnostics(self) -> tuple[CalibrationNodeSupportDiagnostic, ...]:
@@ -405,30 +392,13 @@ class CalibrationLearningCoordinator:
     if not isinstance(sample, LearningSample):
       raise TypeError("calibration coordinator requires a measured-only LearningSample")
 
-    if callable(self._add_sample_with_disposition):
-      arguments = {"upstream_rejection": upstream_rejection}
-      if source_coordinate is not None:
-        arguments["source_coordinate"] = source_coordinate
-      disposition = self._add_sample_with_disposition(sample, **arguments)
-      if not isinstance(disposition, CalibrationSampleDisposition):
-        raise TypeError("calibration learner emitted an invalid disposition")
-    else:
-      if upstream_rejection is not None:
-        # A legacy test double cannot classify first causes itself. Preserve
-        # physical continuity without ever presenting rejected evidence to its
-        # accumulator.
-        if callable(self._reset_route_transients):
-          self._reset_route_transients()
-        disposition = upstream_rejection
-      else:
-        disposition = (
-          CalibrationSampleDisposition.ACCEPTED
-          if self._learner.add_sample(sample)
-          else CalibrationSampleDisposition.LEARNER_INELIGIBLE
-        )
-      self._fallback_sample_accounting = (
-        self._fallback_sample_accounting.with_disposition(disposition)
-      )
+    disposition = self._learner.add_sample_with_disposition(
+      sample,
+      upstream_rejection=upstream_rejection,
+      source_coordinate=source_coordinate,
+    )
+    if not isinstance(disposition, CalibrationSampleDisposition):
+      raise TypeError("calibration learner emitted an invalid disposition")
     accepted = disposition is CalibrationSampleDisposition.ACCEPTED
     if accepted:
       # Inverse calibration legitimately retains signed reversal rows even
@@ -454,18 +424,14 @@ class CalibrationLearningCoordinator:
     evidence_identity = calibration_evidence_sha256(evidence_bytes)
     result = self._learner.qualify(self._candidate_provenance)
     candidate = result.candidate_profile
-    # Test doubles and external audit adapters that predate selected-profile
-    # publication may expose only the learned candidate. A production learner
-    # provides ``selected_profile`` explicitly; the fallback preserves it
-    # for the learned case without inventing an all-seed selection.
-    selected = getattr(result, "selected_profile", candidate)
+    selected = result.selected_profile
     if (selected is not None) != result.all_nodes_qualified:
       raise ValueError("qualified calibration selection completeness is inconsistent")
     if candidate is not None and not result.all_nodes_qualified:
       raise ValueError("calibration learner candidate completeness is inconsistent")
     if (
       candidate is None
-      and getattr(result, "contains_learned_change", False)
+      and result.contains_learned_change
       and result.all_nodes_qualified
     ):
       raise ValueError("qualified learned calibration disappeared before publication")
@@ -503,7 +469,7 @@ class CalibrationLearningCoordinator:
       "node_reports": [_qualification_manifest(report) for report in result.node_reports],
       "interpolation_reports": [
         _manifest_value(report, "interpolation_report")
-        for report in getattr(result, "interpolation_reports", ())
+        for report in result.interpolation_reports
       ],
       "route_commitments": [
         {

@@ -47,7 +47,7 @@ The seed remains a first-class safe result when no family robustly improves.
 Every coefficient-bearing stratum needs two independent contributing routes;
 any nonempty stratum makes its route a cross-fit contributor, while four rows
 are enforced only on each combined fold-fit population after the held route is
-removed. A route with thousands of rows still counts once. Evidence schema 14
+removed. A route with thousands of rows still counts once. Evidence schema 15
 reports independent route counts,
 cross-fit fold failures, paired out-of-fold losses, and the final all-route fit
 separately. Every route also carries a source-assignment ledger whose accepted
@@ -195,7 +195,7 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 8 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 9 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
 selection, cross-fit regression, fold completion, and per-stratum interpolation
 state. The selected or seed-retained result carries its authoritative model

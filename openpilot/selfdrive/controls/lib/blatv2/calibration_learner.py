@@ -64,7 +64,12 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 14
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 15
+MAX_CALIBRATION_ROUTE_COUNT = 1 << 32
+MAX_CALIBRATION_ROWS_PER_ROUTE = 1_000_000
+MAX_CALIBRATION_EVIDENCE_ROWS = (
+  MAX_CALIBRATION_ROUTE_COUNT * MAX_CALIBRATION_ROWS_PER_ROUTE
+)
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_INDEPENDENT_ROUTES = 2
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
@@ -72,6 +77,25 @@ NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
 # route-level paired uncertainty interval implemented below.
 NUMERICAL_LOSS_EPSILON_MULTIPLIER = 64.0
 FIT_CONDITION_LIMIT = 1.0 / math.sqrt(sys.float_info.epsilon)
+
+
+def _bounded_count(value: object, context: str) -> int:
+  if (
+    type(value) is not int
+    or value < 0
+    or value > MAX_CALIBRATION_EVIDENCE_ROWS
+  ):
+    raise ValueError(f"{context} is outside the evidence schema bound")
+  return value
+
+
+def _stat_tolerance(scale: float, count: int, multiplier: float) -> float:
+  """Finite count-scaled tolerance for already-bounded wire statistics."""
+  relative = min(
+    1e-6,
+    multiplier * sys.float_info.epsilon * max(count, 1),
+  )
+  return relative * max(scale, 1.0)
 
 
 class CalibrationSampleDisposition(StrEnum):
@@ -130,10 +154,14 @@ class CalibrationSampleAccounting:
   def __post_init__(self) -> None:
     if (
       type(self.accepted_sample_count) is not int
-      or self.accepted_sample_count < 0
+      or not 0 <= self.accepted_sample_count <= MAX_CALIBRATION_EVIDENCE_ROWS
       or type(self.rejection_counts) is not tuple
       or len(self.rejection_counts) != len(_REJECTED_SAMPLE_DISPOSITIONS)
-      or any(type(count) is not int or count < 0 for count in self.rejection_counts)
+      or any(
+        type(count) is not int
+        or not 0 <= count <= MAX_CALIBRATION_EVIDENCE_ROWS
+        for count in self.rejection_counts
+      )
     ):
       raise ValueError("calibration sample accounting is invalid")
 
@@ -198,18 +226,18 @@ class CalibrationSampleAccounting:
       disposition.value for disposition in _REJECTED_SAMPLE_DISPOSITIONS
     }
     if (
-      type(accepted) is not int
-      or accepted < 0
-      or type(ingested) is not int
-      or ingested < 0
-      or type(rejected) is not int
-      or rejected < 0
-      or type(reasons) is not dict
+      type(reasons) is not dict
       or set(reasons) != expected_reasons
-      or any(type(count) is not int or count < 0 for count in reasons.values())
     ):
       raise ValueError("calibration sample accounting is invalid")
-    counts = tuple(reasons[disposition.value] for disposition in _REJECTED_SAMPLE_DISPOSITIONS)
+    accepted = _bounded_count(accepted, "sample_accounting.accepted_sample_count")
+    ingested = _bounded_count(ingested, "sample_accounting.ingested_sample_count")
+    rejected = _bounded_count(rejected, "sample_accounting.rejected_sample_count")
+    counts_by_reason = {
+      reason: _bounded_count(count, f"sample_accounting.rejection_reasons.{reason}")
+      for reason, count in reasons.items()
+    }
+    counts = tuple(counts_by_reason[disposition.value] for disposition in _REJECTED_SAMPLE_DISPOSITIONS)
     accounting = cls(accepted, counts)
     if (
       accounting.rejected_sample_count != rejected
@@ -397,7 +425,7 @@ def _validate_augmented_gram(
     return result
 
   scale = max([abs(value) for value in (*normal, *rhs, target_squared)], default=1.0)
-  tolerance = 512.0 * sys.float_info.epsilon * max(scale, 1.0) * (dimension + 1)
+  tolerance = _stat_tolerance(scale, 1, 512.0 * (dimension + 1))
   for row in range(dimension):
     diagonal = normal[row * dimension + row]
     if diagonal < -tolerance:
@@ -413,11 +441,21 @@ def _validate_augmented_gram(
         normal[row * dimension + column],
         normal[row * dimension + column],
       )
-      if squared > bound + tolerance * max(scale, 1.0):
+      energy_tolerance = _stat_tolerance(
+        max(bound, squared),
+        1,
+        512.0 * (dimension + 1),
+      )
+      if squared > bound and squared - bound > energy_tolerance:
         raise ValueError(f"{context} violates predictor Cauchy bounds")
     rhs_squared = finite_product(rhs[row], rhs[row])
     target_bound = finite_product(max(diagonal, 0.0), target_squared)
-    if rhs_squared > target_bound + tolerance * max(scale, 1.0):
+    target_tolerance = _stat_tolerance(
+      max(target_bound, rhs_squared),
+      1,
+      512.0 * (dimension + 1),
+    )
+    if rhs_squared > target_bound and rhs_squared - target_bound > target_tolerance:
       raise ValueError(f"{context} violates target Cauchy bounds")
 
   augmented = [0.0] * ((dimension + 1) ** 2)
@@ -479,11 +517,10 @@ def _validate_augmented_gram(
 
 
 def _regression_close(left: float, right: float, regression: _Regression) -> bool:
-  tolerance = (
-    NUMERICAL_LOSS_EPSILON_MULTIPLIER
-    * sys.float_info.epsilon
-    * max(abs(left), abs(right), regression.weight_s, 1.0)
-    * max(regression.count, 1)
+  tolerance = _stat_tolerance(
+    max(abs(left), abs(right), regression.weight_s),
+    regression.count,
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER,
   )
   return abs(left - right) <= tolerance
 
@@ -567,12 +604,11 @@ class _Regression:
   @classmethod
   def decoded(cls, raw: object, context: str) -> _Regression:
     payload = _exact(raw, {"count", "normal", "rhs", "target_squared", "weight_s"}, context)
-    if type(payload["count"]) is not int or payload["count"] < 0:
-      raise ValueError(f"{context}.count is invalid")
+    count = _bounded_count(payload["count"], f"{context}.count")
     normal = _hex_list(payload["normal"], 16, f"{context}.normal")
     rhs = _hex_list(payload["rhs"], 4, f"{context}.rhs")
     result = cls()
-    result.count = payload["count"]
+    result.count = count
     result.normal[:] = normal
     result.rhs[:] = rhs
     result.target_squared = _hex(payload["target_squared"], f"{context}.target_squared")
@@ -610,10 +646,18 @@ class _JointRegression:
   and any incoherent runtime interpolation is rejected.
   """
 
-  __slots__ = ("normal", "rhs", "target_squared", "weight_s", "count")
+  __slots__ = (
+    "normal",
+    "predictor_sums",
+    "rhs",
+    "target_squared",
+    "weight_s",
+    "count",
+  )
 
   def __init__(self) -> None:
     self.normal = [0.0] * 100
+    self.predictor_sums = [0.0] * 10
     self.rhs = [0.0] * 10
     self.target_squared = 0.0
     self.weight_s = 0.0
@@ -641,6 +685,7 @@ class _JointRegression:
       upper_weight * x[3],
     )
     for row in range(10):
+      self.predictor_sums[row] += weight * predictors[row]
       self.rhs[row] += weight * predictors[row] * y
       for column in range(10):
         self.normal[row * 10 + column] += (
@@ -695,6 +740,7 @@ class _JointRegression:
     return {
       "count": self.count,
       "normal": [value.hex() for value in self.normal],
+      "predictor_sums": [value.hex() for value in self.predictor_sums],
       "rhs": [value.hex() for value in self.rhs],
       "target_squared": self.target_squared.hex(),
       "weight_s": self.weight_s.hex(),
@@ -704,14 +750,24 @@ class _JointRegression:
   def decoded(cls, raw: object, context: str) -> _JointRegression:
     payload = _exact(
       raw,
-      {"count", "normal", "rhs", "target_squared", "weight_s"},
+      {
+        "count",
+        "normal",
+        "predictor_sums",
+        "rhs",
+        "target_squared",
+        "weight_s",
+      },
       context,
     )
-    if type(payload["count"]) is not int or payload["count"] < 0:
-      raise ValueError(f"{context}.count is invalid")
     result = cls()
-    result.count = payload["count"]
+    result.count = _bounded_count(payload["count"], f"{context}.count")
     result.normal[:] = _hex_list(payload["normal"], 100, f"{context}.normal")
+    result.predictor_sums[:] = _hex_list(
+      payload["predictor_sums"],
+      10,
+      f"{context}.predictor_sums",
+    )
     result.rhs[:] = _hex_list(payload["rhs"], 10, f"{context}.rhs")
     result.target_squared = _hex(
       payload["target_squared"], f"{context}.target_squared"
@@ -725,7 +781,12 @@ class _JointRegression:
       raise ValueError(f"{context} has inconsistent support")
     if result.count == 0 and any(
       value != 0.0
-      for value in (*result.normal, *result.rhs, result.target_squared)
+      for value in (
+        *result.normal,
+        *result.predictor_sums,
+        *result.rhs,
+        result.target_squared,
+      )
     ):
       raise ValueError(f"{context} empty statistics are nonzero")
     _validate_augmented_gram(
@@ -735,7 +796,47 @@ class _JointRegression:
       10,
       context,
     )
+    _validate_joint_predictor_moments(result, context)
     return result
+
+
+def _validate_joint_predictor_moments(
+  regression: _JointRegression,
+  context: str,
+) -> None:
+  """Bind the expanded interpolation Gram to its exact row algebra."""
+  tolerance = _stat_tolerance(
+    max(
+      regression.weight_s,
+      *(abs(value) for value in regression.predictor_sums),
+      *(abs(value) for value in regression.normal),
+    ),
+    regression.count,
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER,
+  )
+  if abs(regression.predictor_sums[3] - regression.predictor_sums[4]) > tolerance:
+    raise ValueError(f"{context} duplicate interpolation moments disagree")
+  intercept_sum = math.fsum(
+    regression.predictor_sums[index]
+    for index in (2, 3, 4, 5)
+  )
+  if (
+    not math.isfinite(intercept_sum)
+    or abs(intercept_sum - regression.weight_s) > tolerance
+  ):
+    raise ValueError(f"{context} interpolation first moment is invalid")
+  for row in range(10):
+    recovered = math.fsum(
+      regression.normal[row * 10 + column]
+      for column in (2, 3, 4, 5)
+    )
+    if (
+      not math.isfinite(recovered)
+      or abs(recovered - regression.predictor_sums[row]) > tolerance
+    ):
+      raise ValueError(f"{context} interpolation moments are inconsistent")
+  if abs(regression.normal[2 * 10 + 5] - regression.normal[3 * 10 + 3]) > tolerance:
+    raise ValueError(f"{context} interpolation polynomial identity is invalid")
 
 
 def _validate_joint_sign_predictor(
@@ -744,11 +845,10 @@ def _validate_joint_sign_predictor(
   context: str,
 ) -> None:
   """Validate interpolated sign features without assuming a node weight."""
-  tolerance = (
-    NUMERICAL_LOSS_EPSILON_MULTIPLIER
-    * sys.float_info.epsilon
-    * max(regression.weight_s, 1.0)
-    * max(regression.count, 1)
+  tolerance = _stat_tolerance(
+    regression.weight_s,
+    regression.count,
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER,
   )
   active = set(() if active_indices is None else active_indices)
   if abs(regression.rhs[3] - regression.rhs[4]) > tolerance or any(
@@ -784,6 +884,13 @@ def _validate_joint_sign_predictor(
   if active_indices is None:
     return
   lower, upper = active_indices
+  for actual, expected in (
+    (regression.normal[lower * 10 + lower], regression.predictor_sums[2]),
+    (regression.normal[lower * 10 + upper], regression.predictor_sums[3]),
+    (regression.normal[upper * 10 + upper], regression.predictor_sums[5]),
+  ):
+    if abs(actual - expected) > tolerance:
+      raise ValueError(f"{context} sign/interpolation moments disagree")
   energy = math.fsum((
     regression.normal[lower * 10 + lower],
     2.0 * regression.normal[lower * 10 + upper],
@@ -894,10 +1001,13 @@ class _RouteSourceAccounting:
         "pending",
       )
     }
-    if any(type(value) is not int or value < 0 for value in values.values()):
-      raise ValueError(f"{context} counts are invalid")
+    values = {
+      field: _bounded_count(value, f"{context}.{field}")
+      for field, value in values.items()
+    }
     result = cls(**values)
-    if type(payload["accepted"]) is not int or payload["accepted"] != result.accepted:
+    accepted = _bounded_count(payload["accepted"], f"{context}.accepted")
+    if accepted != result.accepted:
       raise ValueError(f"{context} accepted partition disagrees")
     return result
 
@@ -961,6 +1071,22 @@ def _subtract(whole: _Regression, *parts: _Regression) -> _Regression:
     result.weight_s = 0.0
   if result.target_squared < 0.0 and abs(result.target_squared) <= 1e-12:
     result.target_squared = 0.0
+  _validate_augmented_gram(
+    result.normal,
+    result.rhs,
+    result.target_squared,
+    4,
+    "derived calibration stratum",
+  )
+  tolerance = _stat_tolerance(
+    max(result.weight_s, *(abs(value) for value in result.normal)),
+    result.count,
+    512.0,
+  )
+  if abs(result.normal[5] - result.weight_s) > tolerance:
+    raise ValueError("derived calibration stratum intercept is invalid")
+  if abs(result.normal[11]) > tolerance:
+    raise ValueError("derived calibration stratum predictors overlap")
   return result
 
 
@@ -1160,9 +1286,7 @@ def _decode_node_summary(raw: object, node_index: int, context: str) -> _Node:
       raise ValueError(f"{context}.{name} is negative")
     setattr(node, name, value)
   for name in _NODE_INT_SUM_FIELDS:
-    value = payload[name]
-    if type(value) is not int or value < 0:
-      raise ValueError(f"{context}.{name} is invalid")
+    value = _bounded_count(payload[name], f"{context}.{name}")
     setattr(node, name, value)
   for name in _NODE_MASK_FIELDS:
     value = payload[name]
@@ -2057,11 +2181,10 @@ _INTERVAL_NODE_FIELDS = {
 
 
 def _accumulator_close(left: float, right: float, row_count: int) -> bool:
-  tolerance = (
-    NUMERICAL_LOSS_EPSILON_MULTIPLIER
-    * sys.float_info.epsilon
-    * max(abs(left), abs(right), 1.0)
-    * max(row_count, 1)
+  tolerance = _stat_tolerance(
+    max(abs(left), abs(right)),
+    _bounded_count(row_count, "calibration accumulator row_count"),
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER,
   )
   return abs(left - right) <= tolerance
 
@@ -3849,15 +3972,14 @@ class CalibrationProfileLearner:
         route_payload["source_accounting"],
         f"routes[{route_index}].source_accounting",
       )
-      assignment_record_count = route_payload["assignment_record_count"]
-      non_authoritative_count = route_payload["non_authoritative_record_count"]
-      if (
-        type(assignment_record_count) is not int
-        or assignment_record_count < 0
-        or type(non_authoritative_count) is not int
-        or non_authoritative_count < 0
-      ):
-        raise ValueError("calibration route assignment counts are invalid")
+      assignment_record_count = _bounded_count(
+        route_payload["assignment_record_count"],
+        f"routes[{route_index}].assignment_record_count",
+      )
+      non_authoritative_count = _bounded_count(
+        route_payload["non_authoritative_record_count"],
+        f"routes[{route_index}].non_authoritative_record_count",
+      )
       assignment_chain = _route_sha256(
         route_payload["assignment_chain_sha256"],
         "assignment chain",

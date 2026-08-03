@@ -28,6 +28,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationProfileLearner,
+  CalibrationSampleAccounting,
   CalibrationSampleDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
@@ -173,6 +174,7 @@ class _FakeCalibrationLearner:
     self.active_route_counter: int | None = None
     self.begun_route_counters: list[int] = []
     self.ended_route_counters: list[int] = []
+    self._accounting = CalibrationSampleAccounting.empty()
 
   @classmethod
   def from_evidence(cls, seed: VehicleCalibrationProfile, encoded: bytes) -> _FakeCalibrationLearner:
@@ -218,6 +220,28 @@ class _FakeCalibrationLearner:
       return False
     self.counts[self._node(sample.speed_mps)] += 1
     return True
+
+  def add_sample_with_disposition(
+    self,
+    sample: LearningSample,
+    *,
+    upstream_rejection: CalibrationSampleDisposition | None,
+    source_coordinate: CalibrationIngestionCoordinate | None,
+  ) -> CalibrationSampleDisposition:
+    del source_coordinate
+    disposition = (
+      upstream_rejection
+      if upstream_rejection is not None
+      else CalibrationSampleDisposition.ACCEPTED
+      if self.add_sample(sample)
+      else CalibrationSampleDisposition.LEARNER_INELIGIBLE
+    )
+    self._accounting = self._accounting.with_disposition(disposition)
+    return disposition
+
+  @property
+  def sample_accounting(self) -> CalibrationSampleAccounting:
+    return self._accounting
 
   def evidence_for_node(self, node_index: int) -> _Snapshot:
     count = self.counts[node_index]
@@ -336,6 +360,7 @@ class _FakeCalibrationLearner:
     return SimpleNamespace(
       all_nodes_qualified=all_qualified,
       candidate_profile=candidate,
+      selected_profile=candidate,
       node_reports=tuple(reports),
       interpolation_reports=(),
       contains_learned_change=all_qualified,
@@ -495,8 +520,8 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
     manifest = json.loads(finalization.manifest_bytes)
     self.assertEqual(manifest["artifact_schema_version"], CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION)
-    self.assertEqual(manifest["artifact_schema_version"], 14)
-    self.assertEqual(manifest["evidence_schema_version"], 14)
+    self.assertEqual(manifest["artifact_schema_version"], 15)
+    self.assertEqual(manifest["evidence_schema_version"], 15)
     self.assertEqual(manifest["seed_profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
     self.assertEqual(manifest["seed_profile_schema_version"], 3)
     self.assertEqual(manifest["seed_profile_sha256"], hashlib.sha256(seed.to_json().encode()).hexdigest())
@@ -628,8 +653,8 @@ class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
     self.assertEqual(restored.evidence_bytes, first.evidence_bytes)
     self.assertEqual(restored.manifest_bytes, first.manifest_bytes)
     manifest = json.loads(first.manifest_bytes)
-    self.assertEqual(manifest["artifact_schema_version"], 14)
-    self.assertEqual(manifest["evidence_schema_version"], 14)
+    self.assertEqual(manifest["artifact_schema_version"], 15)
+    self.assertEqual(manifest["evidence_schema_version"], 15)
     self.assertEqual(manifest["seed_profile_schema_version"], 3)
     for report in manifest["node_reports"]:
       self.assertIn("moving_reasons", report)

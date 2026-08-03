@@ -4,7 +4,8 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 8 adds the exact per-stratum full-fit proof used to derive the complete
+Schema 9 binds each per-stratum full-fit proof to an explicit population used
+to derive the complete
 ordered qualification reason set. It also rejects the retired rack-fit vocabulary and
 adds canonical first-cause sample accounting. The
 only candidate values it exposes are the four observable inverse-torque
@@ -47,7 +48,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 8
+LEARNING_STATUS_SCHEMA_VERSION = 9
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
   "all_intervals_qualified",
@@ -159,6 +160,7 @@ _PAIRED_LOSS_KEYS = {
   "uncertainty_mse",
   "upper_bound_mse",
 }
+_STRATUM_PAIRED_LOSS_KEYS = {"paired_loss", "stratum"}
 _CROSS_FIT_DIAGNOSTIC_KEYS = {
   "contributing_route_count",
   "failed_fold_count",
@@ -859,13 +861,28 @@ def _node_payload(
       f"{context}.full_fit_paired_loss",
     ),
     "full_fit_stratum_paired_losses": [
-      _paired_loss_payload(
-        diagnostic,
-        f"{context}.full_fit_stratum_paired_losses[{index}]",
-      )
-      for index, diagnostic in enumerate(
-        report.full_fit_stratum_paired_losses
-      )
+      {
+        "paired_loss": _paired_loss_payload(
+          diagnostic,
+          f"{context}.full_fit_stratum_paired_losses[{index}].paired_loss",
+        ),
+        "stratum": stratum.value,
+      }
+      for index, (stratum, diagnostic) in enumerate(zip(
+        (
+          CalibrationIntervalStratum.BASE,
+          CalibrationIntervalStratum.MOVING,
+          CalibrationIntervalStratum.BREAKAWAY_EPISODE,
+          *(
+            (CalibrationIntervalStratum.AUTHORITY,)
+            if report.independent_route_counts is not None
+            and report.independent_route_counts.authority > 0
+            else ()
+          ),
+        )[:len(report.full_fit_stratum_paired_losses)],
+        report.full_fit_stratum_paired_losses,
+        strict=True,
+      ))
     ],
     "cross_fit_route_count": _nonnegative_int(
       report.cross_fit_route_count,
@@ -1537,21 +1554,48 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     stratum_losses = node["full_fit_stratum_paired_losses"]
     if type(stratum_losses) is not list:
       raise ValueError(f"{context}.full_fit_stratum_paired_losses must be a list")
-    stratum_outcomes = tuple(
-      _validate_paired_loss(
-        diagnostic,
-        f"{context}.full_fit_stratum_paired_losses[{index}]",
+    expected_strata = (
+      CalibrationIntervalStratum.BASE,
+      CalibrationIntervalStratum.MOVING,
+      CalibrationIntervalStratum.BREAKAWAY_EPISODE,
+      *(
+        (CalibrationIntervalStratum.AUTHORITY,)
+        if parsed_route_counts["authority"] > 0
+        else ()
+      ),
+    )
+    stratum_outcomes: list[str] = []
+    for loss_index, diagnostic in enumerate(stratum_losses):
+      loss_context = f"{context}.full_fit_stratum_paired_losses[{loss_index}]"
+      if type(diagnostic) is not dict or set(diagnostic) != _STRATUM_PAIRED_LOSS_KEYS:
+        raise ValueError(f"{loss_context} schema does not match")
+      if (
+        loss_index >= len(expected_strata)
+        or diagnostic["stratum"] != expected_strata[loss_index].value
+      ):
+        raise ValueError(f"{loss_context}.stratum ordering is invalid")
+      paired_loss = diagnostic["paired_loss"]
+      outcome = _validate_paired_loss(
+        paired_loss,
+        f"{loss_context}.paired_loss",
         optional=False,
       )
-      for index, diagnostic in enumerate(stratum_losses)
-    )
+      population = (
+        "breakaway_episode"
+        if expected_strata[loss_index]
+        is CalibrationIntervalStratum.BREAKAWAY_EPISODE
+        else expected_strata[loss_index].value
+      )
+      if paired_loss["route_count"] != parsed_route_counts[population]:
+        raise ValueError(f"{loss_context} route population disagrees")
+      stratum_outcomes.append(outcome)
     expects_stratum_losses = (
       selection_outcome == CalibrationQualificationReason.LEARNED.value
       and full_fit_diagnostic is not None
       and full_fit_diagnostic["status"]
       == CalibrationFitStatus.IDENTIFIABLE.value
     )
-    expected_stratum_count = 4 if parsed_route_counts["authority"] > 0 else 3
+    expected_stratum_count = len(expected_strata)
     if (
       expects_stratum_losses
       and len(stratum_outcomes) != expected_stratum_count
@@ -1562,6 +1606,11 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       for outcome in stratum_outcomes
     )
     raw_parameters = node["candidate_parameters"]
+    if raw_parameters is not None and (
+      type(raw_parameters) is not dict
+      or set(raw_parameters) != _CANDIDATE_PARAMETER_KEYS
+    ):
+      raise ValueError(f"{context}.candidate_parameters schema differs")
     parameters_valid = False
     if type(raw_parameters) is dict and set(raw_parameters) == _CANDIDATE_PARAMETER_KEYS:
       raw_values = tuple(raw_parameters.values())
@@ -1603,6 +1652,8 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       parameters_valid=parameters_valid,
     )]
     if node["qualified"]:
+      if expected_reasons:
+        raise ValueError(f"{context}.qualified node carries failed proof")
       expected_reasons = [selection_outcome]
     if reasons != expected_reasons:
       raise ValueError(f"{context}.reasons contradict carried diagnostics")

@@ -6551,37 +6551,23 @@ class HistoricalLearningBackfill:
         except Exception:
           disable_progress()
 
-      if not unprocessed:
-        if pending_close:
-          self._publish(
-            initial_runtime,
-            state=LearningOperationState.FINALIZING,
-            diagnostic="finalizing_drive",
-            last_route_identity=self.pending_route_identity,
-          )
-          return BackfillRunResult(
-            publication=None,
-            pending_logger_close=True,
-          )
-        if artifact_paths.backfill_pointer.is_file():
-          manifest = json.loads(artifact_paths.manifest.read_bytes())
-          evidence_sha256 = manifest["evidence_sha256"]
-          ledger_sha256 = _sha256(
-            artifact_paths.backfill_ledger.read_bytes(),
-          )
-          self._publish(
-            initial_runtime,
-            state=LearningOperationState.IDLE,
-            diagnostic="evidence_ready",
-            evidence_sha256=evidence_sha256,
-            ledger_sha256=ledger_sha256,
-          )
-        else:
-          self._publish(
-            initial_runtime,
-            state=LearningOperationState.READY_NO_EVIDENCE,
-            diagnostic="ready_for_first_drive",
-          )
+      if not unprocessed and pending_close:
+        self._publish(
+          initial_runtime,
+          state=LearningOperationState.FINALIZING,
+          diagnostic="finalizing_drive",
+          last_route_identity=self.pending_route_identity,
+        )
+        return BackfillRunResult(
+          publication=None,
+          pending_logger_close=True,
+        )
+      if not unprocessed and not artifact_paths.backfill_pointer.is_file():
+        self._publish(
+          initial_runtime,
+          state=LearningOperationState.READY_NO_EVIDENCE,
+          diagnostic="ready_for_first_drive",
+        )
         return BackfillRunResult(
           publication=None,
           pending_logger_close=False,
@@ -6871,11 +6857,48 @@ class HistoricalLearningBackfill:
       if progress is not None:
         project_progress(progress.comparing)
       verify_replay_passes(first, second)
+      historical_names = set(historical_route_names)
+      historical_results = tuple(
+        result
+        for result in first.results
+        if result.route.route_name in historical_names
+      )
+      if len(historical_results) != len(historical_route_names) or any(
+        result.ledger_entry() != known[result.route.route_name]
+        for result in historical_results
+      ):
+        raise BackfillError(
+          "backfill_untracked_evidence",
+          "fresh historical replay differs from retained authenticated evidence",
+        )
       _publish_route_evidence_after_aa(
         root=artifact_paths.root,
         first=first,
         second=second,
       )
+      if not unprocessed:
+        if (
+          first.finalization.evidence_bytes != artifact_paths.evidence.read_bytes()
+          or first.finalization.manifest_bytes != artifact_paths.manifest.read_bytes()
+        ):
+          raise BackfillError(
+            "backfill_untracked_evidence",
+            "fresh historical replay differs from retained published artifacts",
+          )
+        ledger_sha256 = _sha256(artifact_paths.backfill_ledger.read_bytes())
+        self._publish(
+          initial_runtime,
+          state=LearningOperationState.IDLE,
+          diagnostic="evidence_ready",
+          accepted_sample_count=first.accepted_sample_count,
+          rejected_sample_count=first.rejected_sample_count,
+          evidence_sha256=first.finalization.evidence_sha256,
+          ledger_sha256=ledger_sha256,
+        )
+        return BackfillRunResult(
+          publication=None,
+          pending_logger_close=False,
+        )
       new_route_names = {
         route.route_name
         for route in replay_candidates

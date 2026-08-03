@@ -168,6 +168,8 @@ def _report(
     breakaway_sample_count=80,
     breakaway_full_fit_count=64,
     breakaway_cross_fit_route_count=2,
+    breakaway_episode_full_fit_count=64 if qualified else 0,
+    breakaway_episode_cross_fit_route_count=2 if qualified else 0,
     lateral_accel_span_mps2=1.2,
     lateral_accel_rms_mps2=0.35,
     rack_travel_deg=240.0,
@@ -342,7 +344,7 @@ def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 8
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 9
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -430,6 +432,40 @@ def test_fully_evaluated_cross_fit_regression_is_not_reported_as_pending() -> No
     node["evaluation_status"] == "cross_fit_regressed"
     for node in payload["nodes"]
   )
+
+
+def test_qualified_stratum_proof_is_identity_ordered_and_non_regressing() -> None:
+  test_case = unittest.TestCase()
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+
+  regressed = json.loads(json.dumps(payload))
+  loss = regressed["nodes"][0]["full_fit_stratum_paired_losses"][0]["paired_loss"]
+  loss.update({
+    "lower_bound_mse": 0.01,
+    "mean_candidate_minus_seed_mse": 0.02,
+    "uncertainty_mse": 0.01,
+    "upper_bound_mse": 0.03,
+  })
+  with test_case.assertRaisesRegex(ValueError, "qualified node carries failed proof"):
+    validate_learning_status_payload(regressed)
+
+  reordered = json.loads(json.dumps(payload))
+  losses = reordered["nodes"][0]["full_fit_stratum_paired_losses"]
+  losses[0], losses[1] = losses[1], losses[0]
+  with test_case.assertRaisesRegex(ValueError, "stratum ordering"):
+    validate_learning_status_payload(reordered)
+
+  wrong_population = json.loads(json.dumps(payload))
+  wrong_population["nodes"][0]["full_fit_stratum_paired_losses"][0][
+    "paired_loss"
+  ]["route_count"] += 1
+  with test_case.assertRaisesRegex(ValueError, "route population disagrees"):
+    validate_learning_status_payload(wrong_population)
 
 def test_device_accumulation_rounding_projects_without_hiding_snapshot() -> None:
   diagnostics = tuple(
