@@ -35,6 +35,16 @@ clear paired whole-route uncertainty without regressing any populated category;
 otherwise the node qualifies as `seed_retained`. The winner is frozen before
 validation and receives exactly one held-route check—there is no fallback
 selection after seeing validation.
+
+The even/odd route-counter split below describes the retained physical learner
+generation and its historical artifacts. The current PC controller trainer
+does not reuse it. Controller training assigns every scenario-usable archived
+route by an append-stable hash of its authenticated whole-route content to
+fixed 6,000/2,000/2,000 training/validation/sealed-test bucket ranges. Physical
+profile regeneration, transient identification, and controller fitting see
+training objects only; validation and test may reject frozen choices but never
+change membership or parameters.
+
 The canonical route counter assigns an entire route to training (even) or
 validation (odd) before any prepared frame is applied. The counter is carried
 through preparation, replay, evidence, and restore rather than inferred from

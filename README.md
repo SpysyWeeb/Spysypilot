@@ -283,13 +283,19 @@ provisional rack-gain/damping seed while remaining bound to the detected
 vehicle, torque mapping, rack mapping, sensor resolution, and opendbc command
 envelope.
 
-Trainer scenario replay is controller-independent. An authenticated older
-route may supply model intent, measured vehicle state, live calibration, and
-applied-torque context even when its recorded controller is not authorized as
-behavioral evidence. The recorded controller identity and original
-ineligibility reason remain immutable provenance; they are never relabeled as
-stock and their commands are never targets. Every experiment hash binds the
-ordered per-route source identities. Corrupt or input-incompatible artifacts,
+Trainer scenario replay is numerically controller-independent: recorded
+commands are provenance, never labels, and exact stock and each candidate are
+recomputed from the same modelV2, scalar-action, live-calibration, delay, and
+measured-state stream. Certification-vector v5 keeps the recorded-controller
+`behavior_plane` as lineage and reproduction provenance and adds an independent
+`scenario_plane` for the exact inputs counterfactual replay consumes. A route
+may therefore train a counterfactual candidate even when its recorded
+controller cannot reproduce in shadow, provided its bounded scenario proof is
+valid. The bounded sample proves the decoder/input contract, not maneuver
+coverage; complete authenticated replay and segmentation independently require
+lateral-active metric support before a route can influence selection. Every
+experiment hash binds the ordered source identities, including physical-only
+and scenario-proof exclusions. Corrupt or input-incompatible artifacts,
 unresolved active witnesses, and routes without lateral activity remain
 rejected.
 
@@ -305,19 +311,47 @@ newest source cohort blocks publication rather than being cherry-picked
 around. Routes from an older controller build can form an older publication
 cohort, but are never mixed into the newest one.
 
-Behavior qualification remains **fail-closed pending authenticated aggregate
-execution**, although the bounded route-major evaluator is now implemented.
-It authenticates compact, file-backed route evidence, freezes maneuver windows
-once, and evaluates one route/controller pair at a time without decoding the
-route into an unbounded Python object graph. No candidate can become available
-until imported archive evidence proves independent A/A reconstruction and the
-cross-route stock comparison under the pinned source. This is an acceptance
-blocker, not a failed Smooth/Swift/Strong result and not automatically a request
-for more driving. The old eager path expanded the measured 146,363,115-byte CE
+Behavior qualification is implemented as a fail-closed authenticated
+aggregate execution. It authenticates compact, file-backed route evidence,
+freezes maneuver windows once, and evaluates one route/controller pair at a
+time without decoding the route into an unbounded Python object graph. A
+candidate remains unavailable unless imported archive evidence proves
+independent A/A reconstruction and the cross-route stock comparison under the
+pinned source. An authentication or coverage failure is an acceptance blocker,
+not a failed Smooth/Swift/Strong result and not automatically a request for
+more driving. The old eager path expanded the measured 146,363,115-byte CE
 evidence file to 909,200 KiB before the behavior decoder and replay outputs
 were constructed; a file-size threshold alone cannot prove the downstream
 transaction safe. The replacement and its acceptance gates are documented in
 [`docs/BLATV2_BEHAVIOR_STREAMING.md`](docs/BLATV2_BEHAVIOR_STREAMING.md).
+
+The authenticated training authority is implemented but remains
+activation-ineligible. Production derives
+the executing clean checkout, HEAD, opendbc/panda gitlinks, and numerical
+runtime bytes rather than trusting caller labels. It accepts only schema-2
+content-addressed imports with independently parsed certification-vector v5
+proofs, records scenario-proof exclusions separately from recorded-controller
+lineage, authenticates the complete immutable
+twin-trust generation and its profile/dynamics provenance, and freezes an
+append-stable training/validation/sealed-test partition. Each stage scans a
+route once while evaluating its bounded policy population in a fixed four-worker
+production pool, then retains every candidate evaluation and selector verdict in the
+transcript even when no winner exists. Validation and sealed-test objects are
+not opened before the preceding gate passes, and the complete epoch is repeated
+for bit-exact A/A before evidence is emitted. Test injection is explicitly
+non-authoritative; no caller-built preparation, replay output, scorecard, or
+aggregate can mint a production receipt. Authority identities also bind the
+committed Python/native module closure actually executing in the parent and
+workers, and that identity is rechecked across epoch and receipt boundaries.
+
+All current training receipts state `activationEligible: false`. The
+authenticated authority evaluates every policy against one immutable
+multi-member transient plant set and requires the worst member to pass Smooth,
+Swift, and Strong in training, validation, and the sealed outer test. This is
+external-review evidence only: it cannot write Params, construct an approved
+artifact, or activate a controller. That boundary is not bypassed by silently
+dropping a route, proof stratum, exact-stock comparison, plant member, or A/A
+execution. This branch is therefore still in progress and not field eligible.
 
 Training replays exact stock, the currently accepted artifact (or exact stock
 again during bootstrap), and the complete candidate grid. Here exact stock is
