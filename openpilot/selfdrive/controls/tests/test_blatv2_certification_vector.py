@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 
 import pytest  # noqa: TID251
 
@@ -17,8 +18,11 @@ from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
   CertificationVector,
   CertificationVectorError,
   _VECTOR_DOMAIN,
+  _scenario_exclusion_reason,
+  _scenario_model_payload_valid,
   _scenario_proof_summary,
   _segment_vector,
+  build_certification_vector_from_prepared_route,
   certification_vector_selection_identity,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
@@ -42,6 +46,7 @@ from openpilot.selfdrive.controls.tests.test_blatv2_route_evidence import (
   PHYSICAL,
   TORQUE,
   artifact,
+  frame,
   model,
   source,
   witness,
@@ -156,7 +161,7 @@ def _signed_vector(result: dict[str, object]) -> CertificationVector:
         + sum(int(value) for value in source_exclusions.values())
       ),
     },
-    "domain": "blatv2-cross-architecture-vector-v4",
+    "domain": "blatv2-cross-architecture-vector-v5",
     "route_name": ROUTE,
     "route_provenance_seed": {
       "car_params_sha256": hashlib.sha256(CP).hexdigest(),
@@ -382,6 +387,59 @@ def test_exact_unhealthy_ignored_torque_payload_remains_authoritative() -> None:
   assert scenario["proof_eligible"] is True
 
 
+@pytest.mark.parametrize("value", (float("nan"), float("inf")))
+def test_scenario_model_payload_rejects_nonfinite_action_and_plan_times(
+  value: float,
+) -> None:
+  action_time = deepcopy(model(0))
+  object.__setattr__(action_time, "desired_curvature_time_s", value)
+  plan_time = deepcopy(model(0))
+  object.__setattr__(
+    plan_time,
+    "plan_times",
+    (value, *plan_time.plan_times[1:]),
+  )
+
+  assert not _scenario_model_payload_valid(action_time)
+  assert not _scenario_model_payload_valid(plan_time)
+
+
+@pytest.mark.parametrize(
+  ("publication", "value", "reason"),
+  (
+    ("lat_accel_factor", float("nan"), "live_torque_payload_invalid"),
+    ("lat_accel_offset", float("inf"), "live_torque_payload_invalid"),
+    ("friction", float("nan"), "live_torque_payload_invalid"),
+    ("lateral_delay_s", float("nan"), "live_delay_payload_invalid"),
+    ("lateral_delay_s", float("inf"), "live_delay_payload_invalid"),
+  ),
+)
+def test_scenario_consumed_calibration_rejects_nonfinite_values(
+  publication: str,
+  value: float,
+  reason: str,
+) -> None:
+  evidence = _without_maneuver_plan()
+  torque = evidence.live_torque_parameters
+  delay = evidence.live_delays
+  if publication == "lateral_delay_s":
+    delay = (replace(delay[0], lateral_delay_s=value),)
+  else:
+    torque = (replace(torque[0], **{publication: value}),)
+  linked = SimpleNamespace(
+    model_publications=evidence.model_publications,
+    live_torque_parameters=torque,
+    live_delays=delay,
+    lateral_maneuver_plans=evidence.lateral_maneuver_plans,
+  )
+
+  assert _scenario_exclusion_reason(
+    evidence.control_witnesses[0],
+    FRAMES[0],
+    linked,
+  ) == reason
+
+
 @pytest.mark.parametrize(
   ("case", "reason"),
   (
@@ -567,22 +625,142 @@ def test_scenario_plane_applies_physical_exclusion_first() -> None:
 
 def test_dual_plane_accounting_and_determinism() -> None:
   first = _segment_vector(
-    segment=SEGMENT,
-    prepared=_prepared(_without_maneuver_plan(), pre_poll=1, segment_context=2),
+    segment=SEGMENT, prepared=_prepared(_without_maneuver_plan(), pre_poll=1),
   )
   second = _segment_vector(
-    segment=SEGMENT,
-    prepared=_prepared(_without_maneuver_plan(), pre_poll=1, segment_context=2),
+    segment=SEGMENT, prepared=_prepared(_without_maneuver_plan(), pre_poll=1),
   )
   assert first == second
-  assert first["source_boundary_exclusions"] == {
-    "pre_poll_controls": 1,
-    "segment_local_measurement_context": 2,
-  }
+  assert first["source_boundary_exclusions"] == {"pre_poll_controls": 1}
   first_vector = _signed_vector(first)
   second_vector = _signed_vector(second)
   assert first_vector.canonical_bytes == second_vector.canonical_bytes
   assert first_vector.sha256 == second_vector.sha256
+
+  reset_segment = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(_without_maneuver_plan(), segment_context=2),
+  )
+  with pytest.raises(CertificationVectorError, match="source boundary"):
+    _signed_vector(reset_segment)
+
+
+def test_full_route_projection_preserves_cross_segment_control_state() -> None:
+  second_segment = RouteSegment(1, Path("rlog-1.zst"), "b" * 64, 2345)
+  route = RouteCandidate(ROUTE, 1, (SEGMENT, second_segment))
+  frames = (*FRAMES, frame(2_000), frame(2_010))
+  models = (
+    model(0),
+    model(1),
+    replace(model(0), segment_index=1, ordinal=0, mono_time_ns=1_950,
+            timestamp_eof_ns=1_940, frame_id=200),
+    replace(model(1), segment_index=1, ordinal=1, mono_time_ns=1_951,
+            timestamp_eof_ns=1_941, frame_id=201),
+  )
+  torque = (
+    *TORQUE,
+    replace(TORQUE[0], segment_index=1, ordinal=0, mono_time_ns=1_940),
+  )
+  delay = (
+    *DELAY,
+    replace(DELAY[0], segment_index=1, ordinal=0, mono_time_ns=1_941),
+  )
+  maneuvers = (
+    *MANEUVER,
+    replace(MANEUVER[0], segment_index=1, ordinal=0, mono_time_ns=1_942),
+  )
+  controls = (
+    witness(0),
+    witness(1),
+    replace(
+      witness(0),
+      segment_index=1,
+      ordinal=0,
+      mono_time_ns=2_000,
+      physical_record_index=2,
+      model_publication_index=2,
+      live_torque_parameters_index=1,
+      live_delay_index=1,
+      lateral_maneuver_plan_index=1,
+      poll_mono_time_ns=1_990,
+      state_sample_mono_ns=1_980,
+      live_parameters_mono_ns=1_970,
+      car_output_report_mono_ns=1_965,
+      car_output_effective_mono_ns=1_955,
+      car_control_mono_ns=2_001,
+      live_torque_parameters_checks_passed=False,
+      live_torque_parameters_health_exact=False,
+    ),
+    replace(
+      witness(1),
+      segment_index=1,
+      ordinal=1,
+      mono_time_ns=2_010,
+      physical_record_index=3,
+      model_publication_index=3,
+      live_torque_parameters_index=1,
+      live_delay_index=1,
+      lateral_maneuver_plan_index=1,
+      poll_mono_time_ns=2_000,
+      state_sample_mono_ns=1_990,
+      live_parameters_mono_ns=1_970,
+      car_output_report_mono_ns=1_975,
+      car_output_effective_mono_ns=1_965,
+      car_control_mono_ns=2_011,
+      live_torque_parameters_checks_passed=False,
+      live_torque_parameters_health_exact=False,
+    ),
+  )
+  identity = replace(
+    source(),
+    route_segment_sha256=(SEGMENT.sha256, second_segment.sha256),
+    route_segment_size_bytes=(SEGMENT.size_bytes, second_segment.size_bytes),
+    preparation_provenance=dict(PROVENANCE),
+    physical_record_count=4,
+    controls_witness_count=4,
+  )
+  evidence = RouteEvidenceArtifact(
+    identity,
+    CP,
+    b"".join(_encode_frame(value) for value in frames),
+    models,
+    controls,
+    torque,
+    delay,
+    maneuvers,
+    EVENTS,
+  )
+  prepared = _prepared(evidence, frames)
+
+  vector = build_certification_vector_from_prepared_route(route, prepared)
+  second = vector.manifest["segment_results"][1]
+  expected_controls = hashlib.sha256(
+    _encode_controls(controls[2:]),
+  ).hexdigest()
+  assert second["physical_plane"] == {
+    "encoded_controls_sha256": expected_controls,
+    "encoded_frames_sha256": hashlib.sha256(
+      b"".join(_encode_frame(value) for value in frames[2:]),
+    ).hexdigest(),
+    "exclusions": {},
+    "first_retained_mono_ns": 2_000,
+    "frames_retained": 2,
+    "last_retained_mono_ns": 2_010,
+  }
+  assert second["source_boundary_exclusions"] == {}
+  reset_controls = tuple(
+    replace(value, physical_record_index=index)
+    for index, value in enumerate(controls[2:])
+  )
+  assert hashlib.sha256(_encode_controls(reset_controls)).hexdigest() != expected_controls
+
+  split_context = deepcopy(vector.manifest)
+  split_context.pop("vector_identity_sha256")
+  split_context["segment_results"][1]["encoded_source_plane_sha256"][
+    "route_evidence_complete"
+  ] = "f" * 64
+  with pytest.raises(CertificationVectorError, match="full-route preparation context"):
+    CertificationVector.from_manifest(split_context)
 
 
 @pytest.mark.parametrize(
@@ -634,7 +812,7 @@ def test_route_scenario_recount_and_source_identity_tampering_fail_closed() -> N
     CertificationVector.from_manifest(manifest)
 
 
-def test_signed_hash_tampering_and_v3_header_fail_closed() -> None:
+def test_signed_hash_tampering_and_v4_header_fail_closed() -> None:
   vector = _signed_vector(_segment_vector(
     segment=SEGMENT,
     prepared=_prepared(_without_maneuver_plan()),
@@ -655,7 +833,7 @@ def test_signed_hash_tampering_and_v3_header_fail_closed() -> None:
     CertificationVector.from_bytes(tampered)
 
   old_header = bytearray(vector.canonical_bytes)
-  struct.pack_into("<H", old_header, 8, 3)
+  struct.pack_into("<H", old_header, 8, 4)
   with pytest.raises(CertificationVectorError, match="header"):
     CertificationVector.from_bytes(old_header)
 

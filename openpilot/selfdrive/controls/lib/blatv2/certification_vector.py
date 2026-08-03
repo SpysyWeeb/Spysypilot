@@ -1,21 +1,25 @@
 """Bounded cross-architecture proof for BLaTv2 route preparation.
 
 The workstation still prepares and byte-compares the *complete* route twice.
-This module proves only the architecture-sensitive part on comma hardware: a
-source-selected set of whole rlog segments is decoded with the production
-extractor, canonical race reconstruction, measured-frame/vehicle-model path,
-route-evidence encoders, and physical spool encoder.  It deliberately does
-not run a learner, fit a profile, or materialize a full ``PreparedRoute``.
+This module projects a source-selected set of whole rlog segments from that
+same canonical full-route preparation context.  The projection covers the
+production extractor, canonical race reconstruction, measured-frame/vehicle-
+model path, route-evidence encoders, and physical spool encoder.  It
+deliberately does not run a learner or fit a profile.
 
-Selection is a pure function of the immutable route manifest.  Every selected
-segment is prepared independently, so state can never leak across a segment
-boundary.  The physical proof plane follows the canonical measured-frame
-input contract without requiring optional controller context.  The behavior
-plane proves the recorded controller source and its full context.  A third,
-controller-independent scenario plane proves only the inputs consumed by
-counterfactual replay.  Each plane owns its counts, timestamps, exclusions,
-and encoded digest; complete source planes remain covered by their production
-section hashes.
+Selection is a pure function of the immutable route manifest.  Preparing a
+selected segment in isolation is intentionally forbidden: SubMaster health,
+the canonical input race, sparse-publication indices, and intervention state
+all carry across rlog segment boundaries.  Reconstructing them from a reset
+segment would certify a different input timeline.  The selected bytes and
+witness populations remain bounded, while the preparation context uses the
+same existing full-route bound as the artifact it proves.  The physical proof
+plane follows the canonical measured-frame input contract without requiring
+optional controller context.  The behavior plane proves the recorded
+controller source and its full context.  A third, controller-independent
+scenario plane proves only the inputs consumed by counterfactual replay.  Each
+plane owns its counts, timestamps, exclusions, and encoded digest; complete
+source planes remain covered by their production section hashes.
 """
 
 from __future__ import annotations
@@ -54,21 +58,29 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ModelPublication,
   RouteEvidenceArtifact,
   _encode_controls,
+  _encode_delay,
+  _encode_events,
+  _encode_maneuvers,
+  _encode_models,
+  _encode_torque,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   RuntimeVehicleBundle,
 )
 
 
-CERTIFICATION_VECTOR_SCHEMA_VERSION: Final = 4
+CERTIFICATION_VECTOR_SCHEMA_VERSION: Final = 5
 CERTIFICATION_VECTOR_MAGIC: Final = b"BLATCV01"
 CERTIFICATION_VECTOR_MAX_SEGMENTS: Final = 3
 CERTIFICATION_VECTOR_MAX_COMPRESSED_BYTES: Final = 96 * 1024 * 1024
 CERTIFICATION_VECTOR_MAX_CONTROLS_WITNESSES: Final = 30_000
 CERTIFICATION_VECTOR_MAX_BYTES: Final = 64 * 1024
-_VECTOR_DOMAIN: Final = b"blatv2-cross-architecture-vector-v4\0"
+_VECTOR_DOMAIN: Final = b"blatv2-cross-architecture-vector-v5\0"
+# Sampling itself did not change in schema 5.  Keep the reviewed v4 sample
+# stable so a proof-semantics upgrade does not silently select different road
+# data; the signed selection *identity* below is independently v5-domain-bound.
 _SELECTION_DOMAIN: Final = b"blatv2-certification-segment-selection-v4\0"
-_SCENARIO_PROOF_DOMAIN: Final = b"blatv2-certification-scenario-proof-v4\0"
+_SCENARIO_PROOF_DOMAIN: Final = b"blatv2-certification-scenario-proof-v5\0"
 _HEADER: Final = struct.Struct("<8sHHI")
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -237,7 +249,7 @@ def certification_vector_selection_identity(
 ) -> str:
   chosen = certification_vector_selection(route) if selected is None else selected
   return hashlib.sha256(_canonical_json({
-    "domain": "blatv2-certification-vector-selection-v4",
+    "domain": "blatv2-certification-vector-selection-v5",
     "route_name": route.route_name,
     "source_segments": _source_manifest(route),
     "selected_segments": [
@@ -321,9 +333,11 @@ def _scenario_model_payload_valid(model: ModelPublication) -> bool:
   return (
     model.frame_id >= 0
     and 0 <= model.timestamp_eof_ns <= model.mono_time_ns
+    and math.isfinite(model.desired_curvature_time_s)
     and model.desired_curvature_time_s >= 0.0
     and model.native_grid_valid
     and bool(model.plan_times)
+    and math.isfinite(model.plan_times[0])
     and model.plan_times[0] >= 0.0
   )
 
@@ -374,7 +388,10 @@ def _scenario_exclusion_reason(
       witness.live_torque_parameters_checks_passed
       and live_torque.use_params
       and (
-        live_torque.lat_accel_factor <= 0.0
+        not math.isfinite(live_torque.lat_accel_factor)
+        or not math.isfinite(live_torque.lat_accel_offset)
+        or not math.isfinite(live_torque.friction)
+        or live_torque.lat_accel_factor <= 0.0
         or live_torque.friction < 0.0
       )
     )
@@ -389,7 +406,11 @@ def _scenario_exclusion_reason(
   )
   if not isinstance(live_delay, LiveDelayPublication):
     return "live_delay_context_missing"
-  if not live_delay.message_valid or live_delay.lateral_delay_s < 0.0:
+  if (
+    not live_delay.message_valid
+    or not math.isfinite(live_delay.lateral_delay_s)
+    or live_delay.lateral_delay_s < 0.0
+  ):
     return "live_delay_payload_invalid"
 
   maneuver = _linked_scenario_publication(
@@ -416,14 +437,45 @@ def _segment_vector(
   *,
   segment: RouteSegment,
   prepared: PreparedRoute,
+  include_pre_poll_exclusions: bool = True,
+  include_segment_context_exclusions: bool = True,
 ) -> dict[str, object]:
+  """Project one segment from a canonical full-route preparation.
+
+  The encoded controls are the unmodified, route-global ``ControlsWitness``
+  records.  In particular, publication indices, physical-record indices,
+  SubMaster health, and transition state are never rebased at the segment
+  boundary.  This makes the proof byte-comparable with the immutable complete
+  route artifact rather than with a second, segment-reset reconstruction.
+
+  The two inclusion flags exist for the single-segment unit fixture and for
+  assigning route-boundary exclusions exactly once.  Production full-route
+  construction enables pre-poll exclusions only on the structural first
+  segment and never creates segment-local context exclusions.
+  """
+  if (
+    type(include_pre_poll_exclusions) is not bool
+    or type(include_segment_context_exclusions) is not bool
+  ):
+    raise CertificationVectorError("segment exclusion ownership is invalid")
   artifact = prepared.route_evidence
   if type(artifact) is not RouteEvidenceArtifact:
     raise CertificationVectorError("segment preparation lacks route evidence")
-  controls = artifact.control_witnesses
-  frames = prepared.frames
-  if len(controls) != len(frames):
-    raise CertificationVectorError("segment control/frame populations disagree")
+  all_controls = artifact.control_witnesses
+  all_frames = prepared.frames
+  if len(all_controls) != len(all_frames):
+    raise CertificationVectorError("route control/frame populations disagree")
+  pairs = tuple(
+    (witness, frame)
+    for witness, frame in zip(all_controls, all_frames, strict=True)
+    if witness.segment_index == segment.index
+  )
+  if not pairs:
+    raise CertificationVectorError(
+      "selected segment has no canonical controls witnesses",
+    )
+  controls = tuple(pair[0] for pair in pairs)
+  frames = tuple(pair[1] for pair in pairs)
 
   physical_excluded = Counter[str]()
   behavior_excluded = Counter[str]()
@@ -493,26 +545,54 @@ def _segment_vector(
     raise CertificationVectorError(
       "behavior-eligible segment has no certification witnesses",
     )
-  pre_poll_count = prepared.pre_poll_dropped_count
+  pre_poll_count = (
+    prepared.pre_poll_dropped_count
+    if include_pre_poll_exclusions
+    else 0
+  )
   source_excluded = Counter[str]()
   if pre_poll_count:
     source_excluded["pre_poll_controls"] += pre_poll_count
   segment_context_count = (
     prepared.segment_local_measurement_context_dropped_count
+    if include_segment_context_exclusions
+    else 0
   )
   if segment_context_count:
     source_excluded["segment_local_measurement_context"] += segment_context_count
 
-  section_hashes = artifact.manifest.get("section_sha256")
-  if type(section_hashes) is not dict:
-    raise CertificationVectorError("segment evidence section hashes are absent")
+  models = tuple(
+    value
+    for value in artifact.model_publications
+    if value.segment_index == segment.index
+  )
+  torque = tuple(
+    value
+    for value in artifact.live_torque_parameters
+    if value.segment_index == segment.index
+  )
+  delays = tuple(
+    value
+    for value in artifact.live_delays
+    if value.segment_index == segment.index
+  )
+  maneuvers = tuple(
+    value
+    for value in artifact.lateral_maneuver_plans
+    if value.segment_index == segment.index
+  )
+  events = tuple(
+    value
+    for value in artifact.event_locators
+    if value.segment_index == segment.index
+  )
   coverage = {
     "controls_total": len(controls),
-    "driving_events": len(artifact.event_locators),
-    "lateral_maneuver_plans": len(artifact.lateral_maneuver_plans),
-    "live_delays": len(artifact.live_delays),
-    "live_torque_parameters": len(artifact.live_torque_parameters),
-    "models": len(artifact.model_publications),
+    "driving_events": len(events),
+    "lateral_maneuver_plans": len(maneuvers),
+    "live_delays": len(delays),
+    "live_torque_parameters": len(torque),
+    "models": len(models),
     "physical_frames_total": len(frames),
   }
   return {
@@ -529,11 +609,15 @@ def _segment_vector(
     "car_params_sha256": artifact.manifest["car_params_sha256"],
     "coverage": coverage,
     "encoded_source_plane_sha256": {
-      "driving_events": section_hashes["events"],
-      "lateral_maneuver_plans": section_hashes["maneuvers"],
-      "live_delays": section_hashes["live_delay"],
-      "live_torque_parameters": section_hashes["live_torque"],
-      "models": section_hashes["models"],
+      "driving_events": hashlib.sha256(_encode_events(events)).hexdigest(),
+      "lateral_maneuver_plans": hashlib.sha256(
+        _encode_maneuvers(maneuvers),
+      ).hexdigest(),
+      "live_delays": hashlib.sha256(_encode_delay(delays)).hexdigest(),
+      "live_torque_parameters": hashlib.sha256(
+        _encode_torque(torque),
+      ).hexdigest(),
+      "models": hashlib.sha256(_encode_models(models)).hexdigest(),
       "route_evidence_complete": artifact.sha256,
     },
     "extractor_stream_sha256": prepared.provenance[
@@ -623,89 +707,87 @@ def _scenario_proof_summary(
   }
 
 
-def build_certification_vector(
+def build_certification_vector_from_prepared_route(
   route: RouteCandidate,
-  *,
-  extractor_path: str | Path,
-  event_reader: Callable[[bytes], AbstractContextManager[Any]],
-  car_params_decoder: Callable[[bytes], Any],
-  descriptor_registry: BuildDescriptorRegistry,
-  route_bundle_factory: Callable[[Any, BuildDescriptor], RuntimeVehicleBundle],
-  current_car_params: Any,
-  current_bundle: RuntimeVehicleBundle,
-  expected_dongle_id: str,
-  expected_extractor_sha256: str | None = None,
-  abort_requested: Callable[[], bool] = lambda: False,
-  segment_started: Callable[[RouteSegment, int, int], None] | None = None,
-  segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
+  prepared: PreparedRoute,
 ) -> CertificationVector:
-  """Build one bounded vector using the production route-preparation core."""
+  """Project one bounded vector from an immutable full-route preparation.
+
+  This function is the canonical construction path for PC preparation
+  authorities.  Callers should invoke it before releasing the ``PreparedRoute``
+  they already produced for the complete route.  It never re-decodes a
+  selected segment with reset state.
+  """
+  if type(route) is not RouteCandidate or type(prepared) is not PreparedRoute:
+    raise CertificationVectorError("certification route preparation is invalid")
   selected = certification_vector_selection(route)
   total_compressed = sum(segment.size_bytes for segment in selected)
   if total_compressed > CERTIFICATION_VECTOR_MAX_COMPRESSED_BYTES:
     raise CertificationVectorError("certification segment bytes exceed the bound")
   source_manifest = _source_manifest(route)
+  artifact = prepared.route_evidence
+  if type(artifact) is not RouteEvidenceArtifact:
+    raise CertificationVectorError("route preparation lacks canonical evidence")
+  source = artifact.source_identity
+  if (
+    source.route_id != route.route_name
+    or source.route_segment_sha256
+    != tuple(segment.sha256 for segment in route.segments)
+    or source.route_segment_size_bytes
+    != tuple(segment.size_bytes for segment in route.segments)
+  ):
+    raise CertificationVectorError(
+      "route preparation differs from certification source identity",
+    )
+  if prepared.segment_local_measurement_context_dropped_count:
+    raise CertificationVectorError(
+      "full-route certification contains segment-reset exclusions",
+    )
+  if (
+    len(prepared.frames) != len(artifact.control_witnesses)
+    or prepared.controls_witness_count != source.controls_witness_count
+    or prepared.unresolved_witness_count != source.unresolved_witness_count
+    or prepared.gap_count != source.gap_count
+    or prepared.pre_poll_dropped_count
+    != len(source.pre_poll_dropped_timestamps_ns)
+    or prepared.behavior_eligible != source.behavior_eligible
+    or prepared.behavior_ineligible_reason
+    != source.behavior_ineligible_reason
+    or prepared.provenance != source.preparation_provenance
+  ):
+    raise CertificationVectorError(
+      "full-route certification populations disagree",
+    )
+  physical_hash = hashlib.sha256()
+  for frame in prepared.frames:
+    physical_hash.update(_encode_frame(frame))
+  if physical_hash.hexdigest() != artifact.manifest["physical_plane_sha256"]:
+    raise CertificationVectorError(
+      "full-route certification physical plane differs from its artifact",
+    )
+
   segment_vectors: list[dict[str, object]] = []
   decoded_controls = 0
-  route_car_params_seed: bytes | None = None
   first_index = route.segments[0].index
-  last_index = route.segments[-1].index
-  for position, segment in enumerate(selected, start=1):
-    remaining = CERTIFICATION_VECTOR_MAX_CONTROLS_WITNESSES - decoded_controls
-    if remaining <= 0:
-      raise CertificationVectorError(
-        "certification controls witness population exceeds its bound",
-      )
-    if segment_started is not None:
-      segment_started(segment, position, len(selected))
-    try:
-      prepared = prepare_route(
-        RouteCandidate(
-          route_name=route.route_name,
-          route_counter=route.route_counter,
-          segments=(segment,),
-        ),
-        extractor_path=extractor_path,
-        event_reader=event_reader,
-        car_params_decoder=car_params_decoder,
-        descriptor_registry=descriptor_registry,
-        route_bundle_factory=route_bundle_factory,
-        current_car_params=current_car_params,
-        current_bundle=current_bundle,
-        expected_dongle_id=expected_dongle_id,
-        expected_extractor_sha256=expected_extractor_sha256,
-        abort_requested=abort_requested,
-        structural_first_segment_index=first_index,
-        structural_last_segment_index=last_index,
-        maximum_controls_witnesses=remaining,
-        route_car_params_seed=(
-          None if segment.index == first_index else route_car_params_seed
-        ),
-        certification_segment_mode=True,
-      )
-    except ValueError as exc:
-      raise CertificationVectorError(
-        "certification segment preparation contract is invalid",
-      ) from exc
-    decoded_controls += prepared.controls_witness_count
+  for segment in selected:
+    result = _segment_vector(
+      segment=segment,
+      prepared=prepared,
+      include_pre_poll_exclusions=(segment.index == first_index),
+      include_segment_context_exclusions=False,
+    )
+    coverage = result["coverage"]
+    source_exclusions = result["source_boundary_exclusions"]
+    if type(coverage) is not dict or type(source_exclusions) is not dict:
+      raise CertificationVectorError("certification segment accounting is invalid")
+    decoded_controls += int(coverage["controls_total"]) + sum(
+      int(value) for value in source_exclusions.values()
+    )
     if decoded_controls > CERTIFICATION_VECTOR_MAX_CONTROLS_WITNESSES:
       raise CertificationVectorError(
         "certification controls witness population exceeds its bound",
       )
-    if segment.index == first_index:
-      route_car_params_seed = bytes(prepared.route_evidence.car_params_bytes)
-      if not route_car_params_seed:
-        raise CertificationVectorError(
-          "certification provenance segment lacks CarParams",
-        )
-    elif route_car_params_seed is None:
-      raise CertificationVectorError(
-        "certification segment precedes its authenticated CarParams seed",
-      )
-    segment_vectors.append(_segment_vector(segment=segment, prepared=prepared))
-    del prepared
-    if segment_completed is not None:
-      segment_completed(segment, position, len(selected))
+    segment_vectors.append(result)
 
   domains = [item["preparation_domain"] for item in segment_vectors]
   if not domains or any(domain != domains[0] for domain in domains[1:]):
@@ -720,11 +802,11 @@ def build_certification_vector(
       "selected_compressed_bytes": total_compressed,
       "selected_controls_witnesses": decoded_controls,
     },
-    "domain": "blatv2-cross-architecture-vector-v4",
+    "domain": "blatv2-cross-architecture-vector-v5",
     "route_name": route.route_name,
     "route_provenance_seed": {
       "car_params_sha256": hashlib.sha256(
-        b"" if route_car_params_seed is None else route_car_params_seed,
+        artifact.car_params_bytes,
       ).hexdigest(),
       "source_segment_index": first_index,
       "source_segment_sha256": route.segments[0].sha256,
@@ -746,6 +828,53 @@ def build_certification_vector(
   return CertificationVector.from_manifest(manifest)
 
 
+def build_certification_vector(
+  route: RouteCandidate,
+  *,
+  extractor_path: str | Path,
+  event_reader: Callable[[bytes], AbstractContextManager[Any]],
+  car_params_decoder: Callable[[bytes], Any],
+  descriptor_registry: BuildDescriptorRegistry,
+  route_bundle_factory: Callable[[Any, BuildDescriptor], RuntimeVehicleBundle],
+  current_car_params: Any,
+  current_bundle: RuntimeVehicleBundle,
+  expected_dongle_id: str,
+  expected_extractor_sha256: str | None = None,
+  abort_requested: Callable[[], bool] = lambda: False,
+  segment_started: Callable[[RouteSegment, int, int], None] | None = None,
+  segment_completed: Callable[[RouteSegment, int, int], None] | None = None,
+) -> CertificationVector:
+  """Prepare one complete route, then project its bounded proof vector.
+
+  This compatibility entry point is PC-only.  The decoded route population is
+  bounded by the normal production preparation contract; only the selected
+  proof population is admitted to the 64 KiB vector.  Production workers that
+  already hold a complete ``PreparedRoute`` should call
+  ``build_certification_vector_from_prepared_route`` instead.
+  """
+  try:
+    prepared = prepare_route(
+      route,
+      extractor_path=extractor_path,
+      event_reader=event_reader,
+      car_params_decoder=car_params_decoder,
+      descriptor_registry=descriptor_registry,
+      route_bundle_factory=route_bundle_factory,
+      current_car_params=current_car_params,
+      current_bundle=current_bundle,
+      expected_dongle_id=expected_dongle_id,
+      expected_extractor_sha256=expected_extractor_sha256,
+      abort_requested=abort_requested,
+      segment_started=segment_started,
+      segment_completed=segment_completed,
+    )
+  except ValueError as exc:
+    raise CertificationVectorError(
+      "certification route preparation contract is invalid",
+    ) from exc
+  return build_certification_vector_from_prepared_route(route, prepared)
+
+
 def _validate_manifest(manifest: dict[str, object]) -> None:
   _validate_json_depth(manifest)
   expected = {
@@ -765,7 +894,7 @@ def _validate_manifest(manifest: dict[str, object]) -> None:
     raise CertificationVectorError("certification vector manifest keys differ")
   if (
     manifest["schema_version"] != CERTIFICATION_VECTOR_SCHEMA_VERSION
-    or manifest["domain"] != "blatv2-cross-architecture-vector-v4"
+    or manifest["domain"] != "blatv2-cross-architecture-vector-v5"
     or type(manifest["route_name"]) is not str
     or not manifest["route_name"]
   ):
@@ -929,6 +1058,7 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
   controls_total = 0
   compressed_total = 0
   previous = -1
+  route_context: dict[str, object] | None = None
   expected_result_keys = {
     "behavior_plane", "car_params_sha256", "coverage",
     "encoded_source_plane_sha256", "extractor_stream_sha256",
@@ -966,11 +1096,12 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
     source_exclusion_total = _exclusion_total(
       result["source_boundary_exclusions"],
       "source boundary",
-      frozenset({
-        "pre_poll_controls",
-        "segment_local_measurement_context",
-      }),
+      frozenset({"pre_poll_controls"}),
     )
+    if index != int(source[0]["index"]) and source_exclusion_total:
+      raise CertificationVectorError(
+        "route-boundary exclusions escaped the provenance segment",
+      )
     controls_total += int(coverage["controls_total"]) + int(
       source_exclusion_total,
     )
@@ -1206,6 +1337,20 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
     for key in ("log_schema_blob", "opendbc_commit", "panda_commit", "source_superproject_commit"):
       if type(domain[key]) is not str or re.fullmatch(r"[0-9a-f]{40}", domain[key]) is None:
         raise CertificationVectorError(f"preparation domain {key} is invalid")
+    candidate_context = {
+      "behavior_source_eligible": behavior["source_eligible"],
+      "behavior_source_reason": behavior["source_eligibility_reason"],
+      "extractor_stream_sha256": result["extractor_stream_sha256"],
+      "preparation_domain": domain,
+      "route_evidence_complete": hashes["route_evidence_complete"],
+      "segment_init_data_mono_ns": result["segment_init_data_mono_ns"],
+    }
+    if route_context is None:
+      route_context = candidate_context
+    elif candidate_context != route_context:
+      raise CertificationVectorError(
+        "selected proofs do not share one full-route preparation context",
+      )
   scenario_proof = manifest["scenario_proof"]
   expected_scenario_proof_keys = {
     "active_controls_retained", "controls_retained", "proof_eligible",
@@ -1242,7 +1387,7 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
   if controls_total != bounds["selected_controls_witnesses"] or controls_total == 0:
     raise CertificationVectorError("selected controls accounting changed")
   expected_selection = hashlib.sha256(_canonical_json({
-    "domain": "blatv2-certification-vector-selection-v4",
+    "domain": "blatv2-certification-vector-selection-v5",
     "route_name": manifest["route_name"],
     "source_segments": source,
     "selected_segments": selected_manifest,
