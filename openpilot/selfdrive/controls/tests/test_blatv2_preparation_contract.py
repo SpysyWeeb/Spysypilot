@@ -12,7 +12,9 @@ def test_decode_car_params_returns_owned_reusable_message() -> None:
   encoded = original.to_bytes()
 
   decoded = decode_car_params(encoded)
-  for _ in range(100_000):
+  # The historical borrowed reader exhausted its cumulative traversal budget
+  # at roughly 1.68 million accesses during the two-pass physical replay.
+  for _ in range(2_000_000):
     float(decoded.lateralTuning.torque.latAccelFactor)
 
   assert decoded.carFingerprint == "TEST_CAR"
