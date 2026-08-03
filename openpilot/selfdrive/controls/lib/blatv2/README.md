@@ -16,8 +16,8 @@ actuates.
 
 The current generation learns an observable inverse-torque calibration, not
 the retired dynamic rack model. At each `0/5/10/15/20/30 m/s` node it keeps
-stationary/base, resolved-moving, confirmed stuck-to-motion breakaway, held-out
-validation, and actuator-authority populations separate. The only fitted
+stationary/base, resolved-moving, confirmed stuck-to-motion breakaway, and
+actuator-authority populations separate per immutable route. The only fitted
 values are torque per lateral acceleration, signed lateral-acceleration offset
 correction, moving friction, and static breakaway. Rack gain and damping are
 neither fitted nor part of the calibration identity.
@@ -28,35 +28,29 @@ the earliest possible motion, then a same-direction rate quantum must confirm
 it within the existing transport delay. The midpoint of the last stuck and
 first moving responses identifies static friction once per episode.
 
-The numerical fit is deterministic constrained least squares. Training
-routes evaluate a nested `static only -> friction -> offset + friction -> full
-map` family. The seed is a first-class safe result. A learned candidate must
-clear paired whole-route uncertainty without regressing any populated category;
-otherwise the node qualifies as `seed_retained`. The winner is frozen before
-validation and receives exactly one held-route check—there is no fallback
-selection after seeing validation.
+The numerical fit is deterministic constrained least squares. Only the
+trainer's immutable global-TRAIN routes enter this learner. It evaluates the
+nested `static only -> friction -> offset + friction -> full map` family with
+route-grouped leave-one-route-out cross-fitting: each fold fits all other
+TRAIN routes and scores only the omitted whole route. The route counter remains
+immutable provenance and has no statistical meaning. Candidate choice uses
+only aggregated out-of-fold paired losses with a whole-route uncertainty
+envelope; global VALIDATION and TEST are inaccessible. After family selection,
+that family is refit once on every TRAIN route for the published parameters.
+The seed remains a first-class safe result when no family robustly improves.
 
-The even/odd route-counter split below describes the retained physical learner
-generation and its historical artifacts. The current PC controller trainer
-does not reuse it. Controller training assigns every scenario-usable archived
-route by an append-stable hash of its authenticated whole-route content to
-fixed 6,000/2,000/2,000 training/validation/sealed-test bucket ranges. Physical
-profile regeneration, transient identification, and controller fitting see
-training objects only; validation and test may reject frozen choices but never
-change membership or parameters.
-
-The canonical route counter assigns an entire route to training (even) or
-validation (odd) before any prepared frame is applied. The counter is carried
-through preparation, replay, evidence, and restore rather than inferred from
-replay order or a hash. Base, moving, breakaway, and authority parts of one
-maneuver can therefore never leak across the boundary.
+Every coefficient-bearing stratum needs two independent contributing routes;
+four rows are only the numerical/rank floor. A route with thousands of rows
+still counts once. Evidence schema 10 reports independent route counts,
+cross-fit fold failures, paired out-of-fold losses, and the final all-route fit
+separately. Schema 9 parity evidence is rejected rather than reinterpreted.
 
 The `0/5/10/15/20/30 m/s` support floors are respectively
 `150/150/240/240/420/420` accepted weighted seconds, not wall-clock drive
-time. Every node also needs at least 20% held-out support, bidirectional torque
-and lateral-acceleration excitation, and at least four training and four
-validation moving rows plus four training and four validation complete
-breakaway episodes in both directions. Low-speed sharp turns are rare but
+time. Every node also needs bidirectional torque and lateral-acceleration
+excitation, at least two independent routes for every required stratum, and at
+least four moving rows plus four complete breakaway episodes as numerical
+floors. Low-speed sharp turns are rare but
 data-dense; waiting, driver override, or unexcited straight travel does not fill
 their node. Between nodes, evidence weights and runtime parameters interpolate
 linearly, and every adjacent interval must validate independently. Highway data

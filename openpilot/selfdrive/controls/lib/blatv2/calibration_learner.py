@@ -14,18 +14,19 @@ by a same-direction rate quantum. Later moving rows identify kinetic motion.
 
 Inputs are the measured-only :class:`learner.LearningSample`. Slew build and
 release frames are authority evidence but never equality-fit. Evidence schema
-9 is deliberately incompatible with older evidence because route uncertainty
-is bound to immutable route/content identities as well as per-route sufficient
-statistics and the canonical route counter owns the train/validation split.
-The route boundary, rather than individual
-100 Hz samples, is the uncertainty unit used by selection and validation.
+10 is deliberately incompatible with older evidence. Route uncertainty is
+bound to immutable route/content identities and per-route sufficient
+statistics. The canonical route counter remains provenance only; it never
+assigns a statistical role. Every route supplied here already belongs to the
+caller's sealed TRAIN partition.
 
-The inverse map is selected from a deterministic nested family. Every model
-is fit on training routes only and must clear the paired whole-route loss
-envelope in every training stratum; a denser population can therefore never
-buy improvement by sacrificing rare breakaway evidence. The selected model is
-then frozen and checked once against wholly held-out routes. Validation never
-participates in selection or fallback choice.
+The inverse map is selected from a deterministic nested family by
+route-grouped leave-one-route-out cross-fitting. Every fold is fit on all but
+one TRAIN route and scored only on the omitted route. Selection uses only
+out-of-fold scores and must clear the conservative paired whole-route loss
+envelope in every required stratum. The frozen family is then refit once on
+all TRAIN routes for publication. Global VALIDATION and TEST are neither
+accepted nor representable by this learner.
 """
 
 from __future__ import annotations
@@ -60,10 +61,13 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 9
-MIN_VALIDATION_SUPPORT_FRACTION = 0.20
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 10
+# Read-only compatibility for the separate status projection. Schema 10 does
+# not create or consume an internal held-out fraction; route-grouped LOO owns
+# validation. The status module must migrate to independent-route counts.
+MIN_VALIDATION_SUPPORT_FRACTION = 0.0
 MIN_STRATUM_TRAINING_ROWS = 4
-MIN_STRATUM_VALIDATION_ROWS = 4
+MIN_INDEPENDENT_ROUTES = 2
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
 # Floating-point cancellation guard only. Physical acceptance uses the
 # route-level paired uncertainty interval implemented below.
@@ -238,6 +242,8 @@ class CalibrationQualificationReason(StrEnum):
   INTERPOLATION_TRAINING_REGRESSION = "interpolation_training_regression"
   INTERPOLATION_VALIDATION_INCONCLUSIVE = "interpolation_validation_inconclusive"
   INTERPOLATION_VALIDATION_REGRESSION = "interpolation_validation_regression"
+  INSUFFICIENT_INDEPENDENT_ROUTES = "insufficient_independent_routes"
+  CROSS_FIT_FOLD_FAILURE = "cross_fit_fold_failure"
 
 
 class CalibrationFitStatus(StrEnum):
@@ -245,6 +251,14 @@ class CalibrationFitStatus(StrEnum):
   RANK_DEFICIENT = "rank_deficient"
   ILL_CONDITIONED = "ill_conditioned"
   NO_SOLUTION = "no_solution"
+
+
+class CalibrationCrossFitStatus(StrEnum):
+  SCORED = "scored"
+  INSUFFICIENT_INDEPENDENT_ROUTES = "insufficient_independent_routes"
+  FOLD_FIT_FAILURE = "fold_fit_failure"
+  HELD_OUT_REGRESSION = "held_out_regression"
+  NO_ROBUST_IMPROVEMENT = "no_robust_improvement"
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +280,26 @@ class CalibrationPairedLossDiagnostic:
   lower_bound_mse: float | None
   upper_bound_mse: float | None
   numerical_tolerance_mse: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationIndependentRouteCounts:
+  all: int
+  base: int
+  moving: int
+  breakaway: int
+  breakaway_episode: int
+  authority: int
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationCrossFitModelDiagnostic:
+  model: CalibrationModelId
+  status: CalibrationCrossFitStatus
+  contributing_route_count: int
+  successful_fold_count: int
+  failed_fold_count: int
+  paired_loss: CalibrationPairedLossDiagnostic
 
 
 class _Regression:
@@ -478,9 +512,8 @@ class _RouteNodeRegressions:
   )
 
   def __init__(self) -> None:
-    # Names retain their aggregate counterparts. The route's population is
-    # carried separately, so these are training or validation according to
-    # _RouteEvidence.validation.
+    # Historical ``training`` suffixes mean full-fit sufficient statistics in
+    # schema 10. Statistical validation is route-grouped and out-of-fold.
     self.training = _Regression()
     self.moving_training = _Regression()
     self.breakaway_training = _Regression()
@@ -494,7 +527,6 @@ class _RouteEvidence:
   route_counter: int
   route_identity_sha256: str
   route_content_sha256: str
-  validation: bool
   nodes: tuple[_RouteNodeRegressions, ...]
   intervals: tuple[_JointRegression, ...]
 
@@ -641,6 +673,14 @@ class CalibrationNodeEvidenceSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class CalibrationNodeQualificationReport:
+  """Schema-10 node result.
+
+  ``training_*``/``validation_*`` fields are retained wire-facing aliases for
+  older status/profile consumers: they now describe the all-TRAIN full-fit
+  population and the same population available to out-of-fold scoring,
+  respectively. ``cross_fit_diagnostics`` and ``independent_route_counts`` are
+  the authoritative statistical semantics; no global validation rows exist.
+  """
   node_index: int
   speed_mps: float
   minimum_support_s: float
@@ -701,6 +741,10 @@ class CalibrationNodeQualificationReport:
   training_paired_loss: CalibrationPairedLossDiagnostic | None = None
   validation_paired_loss: CalibrationPairedLossDiagnostic | None = None
   training_outcome: CalibrationQualificationReason | None = None
+  independent_route_counts: CalibrationIndependentRouteCounts | None = None
+  cross_fit_diagnostics: tuple[CalibrationCrossFitModelDiagnostic, ...] = ()
+  full_fit_diagnostic: CalibrationModelFitDiagnostic | None = None
+  unresolved_diagnostics: tuple[CalibrationQualificationReason, ...] = ()
 
   @property
   def qualified(self) -> bool:
@@ -721,12 +765,18 @@ class CalibrationNodeQualificationReport:
 
 @dataclass(frozen=True, slots=True)
 class CalibrationInterpolationQualificationReport:
+  """Interval full-fit and route-grouped out-of-fold diagnostics.
+
+  The historical field names remain serialized for compatibility: ``training``
+  means the final all-TRAIN refit and ``validation`` means cross-fit scoring.
+  """
   interval_index: int
   lower_speed_mps: float
   upper_speed_mps: float
   training_paired_loss: CalibrationPairedLossDiagnostic
   validation_paired_loss: CalibrationPairedLossDiagnostic
   reasons: tuple[CalibrationQualificationReason, ...]
+  independent_route_count: int = 0
 
   @property
   def qualified(self) -> bool:
@@ -1226,9 +1276,8 @@ def _route_regressions_for_node(
   validation: bool,
 ) -> tuple[_Regression, ...]:
   result: list[_Regression] = []
-  for route in routes:
-    if route.validation != validation:
-      continue
+  del validation  # Schema 10 assigns roles per LOO fold, never by route metadata.
+  for route in _canonical_routes(routes):
     route_node = route.nodes[node_index]
     if field == "base_training":
       regression = _subtract(
@@ -1295,9 +1344,8 @@ def _paired_joint_route_losses(
 ) -> CalibrationPairedLossDiagnostic:
   deltas: list[float] = []
   tolerance = 0.0
-  for route in routes:
-    if route.validation != validation:
-      continue
+  del validation
+  for route in _canonical_routes(routes):
     evidence = route.intervals[interval_index]
     if evidence.count == 0:
       continue
@@ -1320,6 +1368,307 @@ def _paired_joint_route_losses(
   return CalibrationPairedLossDiagnostic(
     len(deltas), mean, uncertainty, lower, upper, tolerance
   )
+
+
+_MODEL_FAMILIES: tuple[tuple[CalibrationModelId, tuple[int, ...]], ...] = (
+  (CalibrationModelId.STATIC_ONLY, ()),
+  (CalibrationModelId.FRICTION_MAP, (2,)),
+  (CalibrationModelId.OFFSET_AND_FRICTION, (1, 2)),
+  (CalibrationModelId.FULL_MAP, (0, 1, 2)),
+)
+
+
+def _canonical_routes(routes: tuple[_RouteEvidence, ...]) -> tuple[_RouteEvidence, ...]:
+  return tuple(sorted(
+    routes,
+    key=lambda route: (
+      route.route_identity_sha256,
+      route.route_content_sha256,
+      route.route_counter,
+    ),
+  ))
+
+
+def _route_node_regression(
+  route: _RouteEvidence,
+  node_index: int,
+  field: str,
+) -> _Regression:
+  node = route.nodes[node_index]
+  if field == "base_training":
+    return _subtract(node.training, node.moving_training, node.breakaway_training)
+  return getattr(node, field)
+
+
+def _contributing_routes(
+  routes: tuple[_RouteEvidence, ...],
+  node_index: int,
+  field: str,
+) -> tuple[_RouteEvidence, ...]:
+  return tuple(
+    route for route in _canonical_routes(routes)
+    if _route_node_regression(route, node_index, field).count >= MIN_STRATUM_TRAINING_ROWS
+  )
+
+
+def _fit_model_family(
+  routes: tuple[_RouteEvidence, ...],
+  node_index: int,
+  model: CalibrationModelId,
+  seed: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float, float] | None, CalibrationModelFitDiagnostic]:
+  route_nodes = tuple(route.nodes[node_index] for route in _canonical_routes(routes))
+  moving = _combine(*(node.moving_training for node in route_nodes))
+  authority_routes = tuple(
+    node.authority_training for node in route_nodes
+    if node.authority_training.count >= MIN_STRATUM_TRAINING_ROWS
+  )
+  if authority_routes:
+    moving = _combine(moving, *authority_routes)
+  episodes = _combine(*(node.breakaway_episode_training for node in route_nodes))
+  free = dict(_MODEL_FAMILIES)[model]
+  if model is CalibrationModelId.STATIC_ONLY:
+    coefficients = _fit_episode_static(episodes, seed)
+  else:
+    moving_coefficients = _fit_bounded_subset(moving, seed, free)
+    coefficients = (
+      None if moving_coefficients is None
+      else _fit_episode_static(episodes, moving_coefficients)
+    )
+  return coefficients, _model_fit_diagnostic(
+    model, moving, episodes, free, coefficients
+  )
+
+
+def _diagnostic_from_deltas(
+  deltas: tuple[tuple[float, float], ...],
+) -> CalibrationPairedLossDiagnostic:
+  if not deltas:
+    return CalibrationPairedLossDiagnostic(0, None, None, None, None, None)
+  values = tuple(delta for delta, _ in deltas)
+  tolerance = max(tolerance for _, tolerance in deltas)
+  mean = math.fsum(values) / len(values)
+  if len(values) < MIN_INDEPENDENT_ROUTES:
+    uncertainty = lower = upper = None
+  else:
+    uncertainty = max(abs(delta - mean) for delta in values)
+    lower, upper = mean - uncertainty, mean + uncertainty
+  return CalibrationPairedLossDiagnostic(
+    len(values), mean, uncertainty, lower, upper, tolerance
+  )
+
+
+@dataclass(frozen=True, slots=True)
+class _CrossFitFamily:
+  model: CalibrationModelId
+  coefficients_by_route: tuple[tuple[str, tuple[float, float, float, float]], ...]
+  diagnostic: CalibrationCrossFitModelDiagnostic
+
+
+def _cross_fit_family(
+  routes: tuple[_RouteEvidence, ...],
+  node_index: int,
+  model: CalibrationModelId,
+  seed: tuple[float, float, float, float],
+  fields: tuple[str, ...],
+) -> _CrossFitFamily:
+  canonical = _canonical_routes(routes)
+  contributing = tuple(
+    route for route in canonical
+    if _route_node_regression(route, node_index, "training").count >= MIN_STRATUM_TRAINING_ROWS
+  )
+  required_independent_fields = (
+    ("breakaway_episode_training",)
+    if model is CalibrationModelId.STATIC_ONLY
+    else ("moving_training", "breakaway_episode_training")
+    if model is CalibrationModelId.FRICTION_MAP
+    else ("base_training", "moving_training", "breakaway_episode_training")
+  )
+  authority_routes = _contributing_routes(
+    canonical, node_index, "authority_training"
+  )
+  lacks_independence = (
+    len(contributing) < MIN_INDEPENDENT_ROUTES
+    or any(
+      len(_contributing_routes(canonical, node_index, field))
+      < MIN_INDEPENDENT_ROUTES
+      for field in required_independent_fields
+    )
+    or (
+      model is not CalibrationModelId.STATIC_ONLY
+      and authority_routes
+      and len(authority_routes) < MIN_INDEPENDENT_ROUTES
+    )
+  )
+  if lacks_independence:
+    return _CrossFitFamily(
+      model,
+      (),
+      CalibrationCrossFitModelDiagnostic(
+        model,
+        CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES,
+        len(contributing),
+        0,
+        len(contributing),
+        _diagnostic_from_deltas(()),
+      ),
+    )
+  fold_coefficients: list[tuple[str, tuple[float, float, float, float]]] = []
+  deltas: list[tuple[float, float]] = []
+  failures = 0
+  heldout_regression = False
+  for held_out in contributing:
+    fit_routes = tuple(route for route in canonical if route is not held_out)
+    coefficients, fit_diagnostic = _fit_model_family(
+      fit_routes, node_index, model, seed
+    )
+    if coefficients is None or fit_diagnostic.status is not CalibrationFitStatus.IDENTIFIABLE:
+      failures += 1
+      continue
+    total_candidate_error = 0.0
+    total_seed_error = 0.0
+    total_weight = 0.0
+    fold_safe = True
+    for field in fields:
+      evidence = _route_node_regression(held_out, node_index, field)
+      if evidence.count == 0:
+        continue
+      candidate_mse = evidence.mse(coefficients)
+      seed_mse = evidence.mse(seed)
+      if candidate_mse is None or seed_mse is None:
+        fold_safe = False
+        break
+      tolerance = _loss_tolerance(candidate_mse, seed_mse)
+      if candidate_mse - seed_mse > tolerance:
+        fold_safe = False
+        heldout_regression = True
+        break
+      total_candidate_error += candidate_mse * evidence.weight_s
+      total_seed_error += seed_mse * evidence.weight_s
+      total_weight += evidence.weight_s
+    if not fold_safe or total_weight <= 0.0:
+      failures += 1
+      continue
+    candidate_mse = total_candidate_error / total_weight
+    seed_mse = total_seed_error / total_weight
+    tolerance = _loss_tolerance(candidate_mse, seed_mse)
+    delta = candidate_mse - seed_mse
+    deltas.append((0.0 if abs(delta) <= tolerance else delta, tolerance))
+    fold_coefficients.append((held_out.route_identity_sha256, coefficients))
+  paired = _diagnostic_from_deltas(tuple(deltas))
+  verdict = _paired_loss_verdict(paired)
+  status = (
+    CalibrationCrossFitStatus.HELD_OUT_REGRESSION
+    if heldout_regression
+    else CalibrationCrossFitStatus.FOLD_FIT_FAILURE
+    if failures
+    else CalibrationCrossFitStatus.SCORED
+    if verdict is _PairedLossVerdict.IMPROVED
+    else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+  )
+  return _CrossFitFamily(
+    model,
+    tuple(fold_coefficients),
+    CalibrationCrossFitModelDiagnostic(
+      model,
+      status,
+      len(contributing),
+      len(fold_coefficients),
+      failures,
+      paired,
+    ),
+  )
+
+
+def _cross_fit_dominates(
+  routes: tuple[_RouteEvidence, ...],
+  node_index: int,
+  candidate: _CrossFitFamily,
+  comparator: _CrossFitFamily,
+) -> bool:
+  candidate_by_route = dict(candidate.coefficients_by_route)
+  comparator_by_route = dict(comparator.coefficients_by_route)
+  if set(candidate_by_route) != set(comparator_by_route):
+    return False
+  deltas: list[tuple[float, float]] = []
+  for route in _canonical_routes(routes):
+    candidate_coefficients = candidate_by_route.get(route.route_identity_sha256)
+    comparator_coefficients = comparator_by_route.get(route.route_identity_sha256)
+    if candidate_coefficients is None or comparator_coefficients is None:
+      continue
+    evidence = route.nodes[node_index].training
+    candidate_mse = evidence.mse(candidate_coefficients)
+    comparator_mse = evidence.mse(comparator_coefficients)
+    if candidate_mse is None or comparator_mse is None:
+      return False
+    tolerance = _loss_tolerance(candidate_mse, comparator_mse)
+    delta = candidate_mse - comparator_mse
+    if delta > tolerance:
+      return False
+    deltas.append((0.0 if abs(delta) <= tolerance else delta, tolerance))
+  return _paired_loss_verdict(_diagnostic_from_deltas(tuple(deltas))) is _PairedLossVerdict.IMPROVED
+
+
+def _cross_fit_interval_loss(
+  routes: tuple[_RouteEvidence, ...],
+  interval_index: int,
+  lower_model: CalibrationModelId | None,
+  upper_model: CalibrationModelId | None,
+  seed_lower: CalibrationParameters,
+  seed_upper: CalibrationParameters,
+) -> tuple[CalibrationPairedLossDiagnostic, int]:
+  canonical = _canonical_routes(routes)
+  contributing = tuple(
+    route for route in canonical
+    if route.intervals[interval_index].count >= MIN_STRATUM_TRAINING_ROWS
+  )
+  if len(contributing) < MIN_INDEPENDENT_ROUTES:
+    return _diagnostic_from_deltas(()), len(contributing)
+  deltas: list[tuple[float, float]] = []
+  for held_out in contributing:
+    fit_routes = tuple(route for route in canonical if route is not held_out)
+    lower_coefficients = _seed_coefficients(seed_lower)
+    upper_coefficients = _seed_coefficients(seed_upper)
+    if lower_model is not None:
+      lower_coefficients, lower_diagnostic = _fit_model_family(
+        fit_routes, interval_index, lower_model, lower_coefficients
+      )
+      if lower_coefficients is None or lower_diagnostic.status is not CalibrationFitStatus.IDENTIFIABLE:
+        return _diagnostic_from_deltas(tuple(deltas)), len(contributing)
+    if upper_model is not None:
+      upper_coefficients, upper_diagnostic = _fit_model_family(
+        fit_routes, interval_index + 1, upper_model, upper_coefficients
+      )
+      if upper_coefficients is None or upper_diagnostic.status is not CalibrationFitStatus.IDENTIFIABLE:
+        return _diagnostic_from_deltas(tuple(deltas)), len(contributing)
+
+    def parameters(
+      seed: CalibrationParameters,
+      coefficients: tuple[float, float, float, float],
+    ) -> CalibrationParameters:
+      gain, intercept, kinetic, static = coefficients
+      return CalibrationParameters(
+        gain,
+        intercept / gain,
+        kinetic,
+        static,
+        seed.transport_delay_s,
+        seed.rack_rate_resolution_deg_s,
+        seed.confidence,
+        False,
+      )
+
+    candidate_mse = held_out.intervals[interval_index].mse(
+      parameters(seed_lower, lower_coefficients),
+      parameters(seed_upper, upper_coefficients),
+    )
+    seed_mse = held_out.intervals[interval_index].mse(seed_lower, seed_upper)
+    if candidate_mse is None or seed_mse is None:
+      return _diagnostic_from_deltas(tuple(deltas)), len(contributing)
+    tolerance = _loss_tolerance(candidate_mse, seed_mse)
+    delta = candidate_mse - seed_mse
+    deltas.append((0.0 if abs(delta) <= tolerance else delta, tolerance))
+  return _diagnostic_from_deltas(tuple(deltas)), len(contributing)
 
 
 def minimum_calibration_support_s(speed_mps: float) -> float:
@@ -1360,7 +1709,6 @@ class CalibrationProfileLearner:
     self._nodes = tuple(_Node() for _ in seed_profile.nodes)
     self._breakaway_detector = BreakawayEpisodeDetector()
     self._route_active = False
-    self._route_validation = False
     self._active_route_counter: int | None = None
     self._active_route_identity_sha256: str | None = None
     self._active_route_content_sha256: str | None = None
@@ -1476,7 +1824,6 @@ class CalibrationProfileLearner:
     ):
       raise ValueError("calibration route counter, identity, or content was already ingested")
     self.reset_route_transients()
-    self._route_validation = bool(counter & 1)
     self._active_route_counter = counter
     self._active_route_identity_sha256 = route_identity
     self._active_route_content_sha256 = route_content
@@ -1505,7 +1852,6 @@ class CalibrationProfileLearner:
         route_counter=self._active_route_counter,
         route_identity_sha256=self._active_route_identity_sha256,
         route_content_sha256=self._active_route_content_sha256,
-        validation=self._route_validation,
         nodes=route_nodes,
         intervals=route_intervals,
       )
@@ -1654,7 +2000,9 @@ class CalibrationProfileLearner:
       for node_index, _ in self._supports(sample.speed_mps):
         self._nodes[node_index].rack_reversals += 1
 
-    validation = self._route_validation
+    # All input routes are members of the caller's sealed TRAIN partition.
+    # Statistical roles are assigned only by route-grouped cross-fitting.
+    validation = False
     if sample.authority_evidence:
       # A limiter boundary interrupts free breakaway causality. Settled,
       # full-magnitude motion may still identify the moving map.
@@ -1938,17 +2286,26 @@ class CalibrationProfileLearner:
   def _node_report(self, index: int) -> CalibrationNodeQualificationReport:
     node = self._nodes[index]
     seed = self.seed_profile.nodes[index].parameters
+    seed_coefficients = _seed_coefficients(seed)
+    routes = _canonical_routes(tuple(self._routes))
     speed = self.speed_nodes_mps[index]
     minimum = minimum_calibration_support_s(speed)
-    min_validation = minimum * MIN_VALIDATION_SUPPORT_FRACTION
     lat_span = 0.0 if not math.isfinite(node.lat_min) else node.lat_max - node.lat_min
     torque_span = 0.0 if not math.isfinite(node.torque_min) else node.torque_max - node.torque_min
     lat_rms = math.sqrt(node.lat_energy / node.clean_support_s) if node.clean_support_s > 0.0 else 0.0
+
+    route_counts = CalibrationIndependentRouteCounts(
+      all=len(_contributing_routes(routes, index, "training")),
+      base=len(_contributing_routes(routes, index, "base_training")),
+      moving=len(_contributing_routes(routes, index, "moving_training")),
+      breakaway=len(_contributing_routes(routes, index, "breakaway_training")),
+      breakaway_episode=len(_contributing_routes(routes, index, "breakaway_episode_training")),
+      authority=len(_contributing_routes(routes, index, "authority_training")),
+    )
     reasons: list[CalibrationQualificationReason] = []
+    unresolved: list[CalibrationQualificationReason] = []
     if node.clean_support_s < minimum:
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_SUPPORT)
-    if node.validation.weight_s < min_validation or node.validation.count < 4:
-      reasons.append(CalibrationQualificationReason.INSUFFICIENT_VALIDATION)
     if (
       lat_span < MIN_LATERAL_ACCEL_SPAN_MPS2
       or lat_rms < MIN_LATERAL_ACCEL_RMS_MPS2
@@ -1957,215 +2314,58 @@ class CalibrationProfileLearner:
       or node.applied_torque_direction_mask != 3
     ):
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_EXCITATION)
-    if (
-      node.moving_training.count < MIN_STRATUM_TRAINING_ROWS
-      or node.moving_validation.count < MIN_STRATUM_VALIDATION_ROWS
-      or node.moving_training_direction_mask != 3
-      or node.moving_validation_direction_mask != 3
-    ):
+    if node.moving_training.count < MIN_STRATUM_TRAINING_ROWS:
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE)
     if (
       node.breakaway_training.count < MIN_STRATUM_TRAINING_ROWS
-      or node.breakaway_validation.count < MIN_STRATUM_VALIDATION_ROWS
       or node.breakaway_episode_training.count < MIN_STRATUM_TRAINING_ROWS
-      or node.breakaway_episode_validation.count < MIN_STRATUM_VALIDATION_ROWS
-      or node.breakaway_episode_training_direction_mask != 3
-      or node.breakaway_episode_validation_direction_mask != 3
     ):
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE)
 
-    # Whether authority evidence participates in fitting is a training-only
-    # decision.  Held-out row presence may reject that frozen choice, but it
-    # must never change which model or coefficients training selects.
-    authority_fit_active = (
-      node.authority_training.count >= MIN_STRATUM_TRAINING_ROWS
+    required_counts = (
+      route_counts.all,
+      route_counts.base,
+      route_counts.moving,
+      route_counts.breakaway,
+      route_counts.breakaway_episode,
     )
-    if (
-      authority_fit_active
-      and node.authority_validation.count
-      < MIN_STRATUM_VALIDATION_ROWS
-    ):
-      reasons.append(CalibrationQualificationReason.INSUFFICIENT_VALIDATION)
-    seed_coefficients = _seed_coefficients(seed)
-    base_training = _subtract(
-      node.training,
-      node.moving_training,
-      node.breakaway_training,
-    )
-    base_validation = _subtract(
-      node.validation,
-      node.moving_validation,
-      node.breakaway_validation,
-    )
-    moving_fit = (
-      _combine(node.moving_training, node.authority_training)
-      if authority_fit_active
-      else node.moving_training
-    )
-    training_strata = (
-      base_training,
-      node.moving_training,
-      node.breakaway_training,
-      node.breakaway_episode_training,
-      *(
-        (node.authority_training,)
-        if node.authority_training.count > 0
-        else ()
-      ),
-      node.training,
-    )
-    seed_training_vector = _rms_vector(
-      training_strata,
-      seed_coefficients,
-    )
-    training_fields = (
+    if any(count < MIN_INDEPENDENT_ROUTES for count in required_counts):
+      reasons.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
+      unresolved.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
+    if 0 < route_counts.authority < MIN_INDEPENDENT_ROUTES:
+      reasons.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
+      unresolved.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
+
+    fields = (
       "base_training",
       "moving_training",
       "breakaway_training",
       "breakaway_episode_training",
-      *(("authority_training",) if node.authority_training.count > 0 else ()),
+      *(("authority_training",) if route_counts.authority else ()),
       "training",
     )
-    selected: _ModelCandidate | None = None
-    generated_raw: list[
-      tuple[
-        CalibrationModelId,
-        tuple[int, ...],
-        tuple[float, float, float, float] | None,
-      ]
-    ] = [
-      (
-        CalibrationModelId.STATIC_ONLY,
-        (),
-        _fit_episode_static(
-          node.breakaway_episode_training,
-          seed_coefficients,
-        ),
-      ),
-    ]
-    for model, free in (
-      (CalibrationModelId.FRICTION_MAP, (2,)),
-      (CalibrationModelId.OFFSET_AND_FRICTION, (1, 2)),
-      (CalibrationModelId.FULL_MAP, (0, 1, 2)),
-    ):
-      moving_coefficients = _fit_bounded_subset(
-        moving_fit,
-        seed_coefficients,
-        free,
-      )
-      generated_raw.append((
-        model,
-        free,
-        (
-          None
-          if moving_coefficients is None
-          else _fit_episode_static(
-            node.breakaway_episode_training,
-            moving_coefficients,
-          )
-        ),
-      ))
-    fit_diagnostics = tuple(
-      _model_fit_diagnostic(
-        model,
-        moving_fit,
-        node.breakaway_episode_training,
-        free,
-        coefficients,
-      )
-      for model, free, coefficients in generated_raw
+    cross_fit_families = tuple(
+      _cross_fit_family(routes, index, model, seed_coefficients, fields)
+      for model, _ in _MODEL_FAMILIES
     )
-    generated = tuple(
-      (model, coefficients)
-      for (model, _, coefficients), diagnostic in zip(
-        generated_raw, fit_diagnostics, strict=True
-      )
-      if diagnostic.status is CalibrationFitStatus.IDENTIFIABLE
-    )
-    if seed_training_vector is not None:
-      for model, coefficients in generated:
-        if coefficients is None:
-          continue
-        vector = _rms_vector(training_strata, coefficients)
-        safe_against_seed, _ = _safe_on_route_strata(
-          tuple(self._routes),
-          index,
-          training_fields,
-          coefficients,
-          seed_coefficients,
-          validation=False,
-          require_improvement=True,
-        )
-        if vector is None or not safe_against_seed:
-          continue
-        candidate = _ModelCandidate(model, coefficients, vector)
-        if selected is None:
-          selected = candidate
-          continue
-        dominates, _ = _safe_on_route_strata(
-          tuple(self._routes),
-          index,
-          training_fields,
-          coefficients,
-          selected.coefficients,
-          validation=False,
-          require_improvement=True,
-        )
-        if dominates:
-          selected = candidate
+    selected_cross_fit: _CrossFitFamily | None = None
+    for family in cross_fit_families:
+      if family.diagnostic.status is not CalibrationCrossFitStatus.SCORED:
+        continue
+      if selected_cross_fit is None or _cross_fit_dominates(
+        routes, index, family, selected_cross_fit
+      ):
+        selected_cross_fit = family
 
-    identifiable_model_exists = any(
+    full_fit_results = tuple(
+      (model, *_fit_model_family(routes, index, model, seed_coefficients))
+      for model, _ in _MODEL_FAMILIES
+    )
+    fit_diagnostics = tuple(result[2] for result in full_fit_results)
+    if not any(
       diagnostic.status is CalibrationFitStatus.IDENTIFIABLE
       for diagnostic in fit_diagnostics
-    )
-    seed_retained = selected is None and identifiable_model_exists
-    coefficients = (
-      selected.coefficients
-      if selected is not None
-      else seed_coefficients
-      if seed_retained
-      else None
-    )
-    seed_rms = node.validation.rms(seed_coefficients)
-    candidate_rms = node.validation.rms(coefficients) if coefficients is not None else None
-    base_seed = base_validation.rms(seed_coefficients)
-    base_candidate = base_validation.rms(coefficients) if coefficients is not None else None
-    moving_seed = node.moving_validation.rms(seed_coefficients)
-    moving_candidate = node.moving_validation.rms(coefficients) if coefficients is not None else None
-    breakaway_seed = node.breakaway_validation.rms(seed_coefficients)
-    breakaway_candidate = node.breakaway_validation.rms(coefficients) if coefficients is not None else None
-    episode_seed = node.breakaway_episode_validation.rms(seed_coefficients)
-    episode_candidate = (
-      node.breakaway_episode_validation.rms(coefficients)
-      if coefficients is not None
-      else None
-    )
-    authority_seed = node.authority_validation.rms(seed_coefficients)
-    authority_candidate = node.authority_validation.rms(coefficients) if coefficients is not None else None
-    training_paired_loss = (
-      None
-      if coefficients is None
-      else _paired_route_losses(
-        _route_regressions_for_node(
-          tuple(self._routes), index, "training", validation=False
-        ),
-        coefficients,
-        seed_coefficients,
-      )
-    )
-    validation_paired_loss = (
-      None
-      if coefficients is None
-      else _paired_route_losses(
-        _route_regressions_for_node(
-          tuple(self._routes), index, "training", validation=True
-        ),
-        coefficients,
-        seed_coefficients,
-      )
-    )
-    candidate_parameters: CalibrationParameters | None = None
-    if coefficients is None:
+    ):
       statuses = {diagnostic.status for diagnostic in fit_diagnostics}
       if CalibrationFitStatus.ILL_CONDITIONED in statuses:
         reasons.append(CalibrationQualificationReason.ILL_CONDITIONED_FIT)
@@ -2173,87 +2373,78 @@ class CalibrationProfileLearner:
         reasons.append(CalibrationQualificationReason.RANK_DEFICIENT_FIT)
       else:
         reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
-    else:
-      gain, intercept, kinetic, static = coefficients
-      offset = intercept / gain if gain != 0.0 else math.inf
-      offset_bound = max(1.0, lat_span)
-      if not all(math.isfinite(value) for value in (*coefficients, offset)) or gain <= 0.0 or static < kinetic or kinetic < 0.0 or abs(offset) > offset_bound:
-        reasons.append(CalibrationQualificationReason.INVALID_PARAMETERS)
+    selected_model = None if selected_cross_fit is None else selected_cross_fit.model
+    selected_full_fit = next(
+      (result for result in full_fit_results if result[0] is selected_model),
+      None,
+    )
+    seed_retained = selected_cross_fit is None
+    coefficients = seed_coefficients
+    full_fit_diagnostic: CalibrationModelFitDiagnostic | None = None
+    if selected_full_fit is not None:
+      _, fitted, full_fit_diagnostic = selected_full_fit
+      if fitted is None or full_fit_diagnostic.status is not CalibrationFitStatus.IDENTIFIABLE:
+        reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
       else:
-        validation_comparisons = (
-          ("training", CalibrationQualificationReason.VALIDATION_REGRESSION),
-          ("base_training", CalibrationQualificationReason.VALIDATION_REGRESSION),
-          ("moving_training", CalibrationQualificationReason.MOVING_VALIDATION_REGRESSION),
-          ("breakaway_training", CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
-          ("breakaway_episode_training", CalibrationQualificationReason.BREAKAWAY_VALIDATION_REGRESSION),
-          *((
-            ("authority_training", CalibrationQualificationReason.AUTHORITY_VALIDATION_REGRESSION),
-          ) if node.authority_validation.count > 0 else ()),
+        coefficients = fitted
+        full_fit_safe, _ = _safe_on_route_strata(
+          routes,
+          index,
+          fields,
+          coefficients,
+          seed_coefficients,
+          validation=False,
+          require_improvement=False,
         )
-        for field, regression_reason in validation_comparisons:
-          diagnostic = _paired_route_losses(
-            _route_regressions_for_node(
-              tuple(self._routes), index, field, validation=True
-            ),
-            coefficients,
-            seed_coefficients,
-          )
-          verdict = _paired_loss_verdict(
-            diagnostic,
-            identical=seed_retained,
-          )
-          if verdict is _PairedLossVerdict.REGRESSION:
-            reasons.append(regression_reason)
-          elif verdict in (
-            _PairedLossVerdict.INCONCLUSIVE,
-            _PairedLossVerdict.NO_DATA,
-          ):
-            reasons.append(
-              CalibrationQualificationReason.VALIDATION_INCONCLUSIVE
-            )
-        confidence = min(
-          1.0,
-          max(
-            0.0,
-            min(
-              node.clean_support_s / minimum,
-              node.validation.weight_s / min_validation,
-              lat_span / MIN_LATERAL_ACCEL_SPAN_MPS2,
-              lat_rms / MIN_LATERAL_ACCEL_RMS_MPS2,
-              torque_span / MIN_APPLIED_TORQUE_SPAN,
-            ),
+        if not full_fit_safe:
+          reasons.append(CalibrationQualificationReason.VALIDATION_REGRESSION)
+
+    gain, intercept, kinetic, static = coefficients
+    offset = intercept / gain if gain != 0.0 else math.inf
+    offset_bound = max(1.0, lat_span)
+    if (
+      not all(math.isfinite(value) for value in (*coefficients, offset))
+      or gain <= 0.0
+      or static < kinetic
+      or kinetic < 0.0
+      or abs(offset) > offset_bound
+    ):
+      reasons.append(CalibrationQualificationReason.INVALID_PARAMETERS)
+
+    all_evidence = node.training
+    base_evidence = _subtract(node.training, node.moving_training, node.breakaway_training)
+    candidate_parameters = CalibrationParameters(
+      torque_per_lateral_accel=seed.torque_per_lateral_accel if seed_retained else gain,
+      lateral_accel_offset_correction_mps2=(
+        seed.lateral_accel_offset_correction_mps2 if seed_retained else offset
+      ),
+      kinetic_friction_torque=seed.kinetic_friction_torque if seed_retained else kinetic,
+      static_breakaway_torque=seed.static_breakaway_torque if seed_retained else static,
+      transport_delay_s=seed.transport_delay_s,
+      rack_rate_resolution_deg_s=seed.rack_rate_resolution_deg_s,
+      confidence=min(
+        1.0,
+        max(
+          0.0,
+          min(
+            node.clean_support_s / minimum,
+            route_counts.all / MIN_INDEPENDENT_ROUTES,
+            lat_span / MIN_LATERAL_ACCEL_SPAN_MPS2,
+            lat_rms / MIN_LATERAL_ACCEL_RMS_MPS2,
+            torque_span / MIN_APPLIED_TORQUE_SPAN,
           ),
-        )
-        candidate_parameters = CalibrationParameters(
-          torque_per_lateral_accel=(
-            seed.torque_per_lateral_accel if seed_retained else gain
-          ),
-          lateral_accel_offset_correction_mps2=(
-            seed.lateral_accel_offset_correction_mps2
-            if seed_retained
-            else offset
-          ),
-          kinetic_friction_torque=(
-            seed.kinetic_friction_torque if seed_retained else kinetic
-          ),
-          static_breakaway_torque=(
-            seed.static_breakaway_torque if seed_retained else static
-          ),
-          transport_delay_s=seed.transport_delay_s,
-          rack_rate_resolution_deg_s=seed.rack_rate_resolution_deg_s,
-          confidence=confidence,
-          qualified=False,
-        )
+        ),
+      ),
+      qualified=False,
+    )
     unique = tuple(dict.fromkeys(reasons))
     qualified = not unique
-    training_outcome = (
+    outcome = (
       CalibrationQualificationReason.SEED_RETAINED
       if seed_retained
       else CalibrationQualificationReason.LEARNED
-      if selected is not None
-      else None
     )
-    if candidate_parameters is not None and qualified:
+    if qualified:
       candidate_parameters = CalibrationParameters(
         candidate_parameters.torque_per_lateral_accel,
         candidate_parameters.lateral_accel_offset_correction_mps2,
@@ -2264,87 +2455,86 @@ class CalibrationProfileLearner:
         candidate_parameters.confidence,
         True,
       )
-    report_reasons = (
-      (training_outcome,)
-      if qualified and training_outcome is not None
-      else (CalibrationQualificationReason.QUALIFIED,)
-      if qualified
-      else unique
+    report_reasons = (outcome,) if qualified else unique
+    full_loss = _paired_route_losses(
+      _route_regressions_for_node(routes, index, "training", validation=False),
+      coefficients,
+      seed_coefficients,
+    )
+    cross_fit_loss = (
+      selected_cross_fit.diagnostic.paired_loss
+      if selected_cross_fit is not None
+      else _diagnostic_from_deltas(())
     )
     return CalibrationNodeQualificationReport(
-      index,
-      speed,
-      minimum,
-      node.clean_support_s,
-      node.supported_sample_count,
-      node.training.count,
-      node.validation.count,
-      node.validation.weight_s,
-      node.base_support_s,
-      node.base_sample_count,
-      node.moving_support_s,
-      node.moving_sample_count,
-      node.moving_training.count,
-      node.moving_validation.count,
-      node.breakaway_support_s,
-      node.breakaway_sample_count,
-      node.breakaway_training.count,
-      node.breakaway_validation.count,
-      lat_span,
-      lat_rms,
-      node.rack_travel_deg,
-      torque_span,
-      node.rack_reversals,
-      node.lateral_accel_direction_mask.bit_count(),
-      node.applied_torque_direction_mask.bit_count(),
-      seed_rms,
-      candidate_rms,
-      moving_seed,
-      moving_candidate,
-      breakaway_seed,
-      breakaway_candidate,
-      candidate_parameters.confidence if candidate_parameters is not None else 0.0,
-      report_reasons,
-      candidate_parameters,
-      node.authority_support_s,
-      node.authority_sample_count,
-      node.authority_fit_support_s,
-      node.authority_fit_sample_count,
-      node.authority_training.count,
-      node.authority_validation.count,
-      authority_seed,
-      authority_candidate,
-      node.authority_magnitude_sample_count,
-      node.authority_slew_build_sample_count,
-      node.authority_slew_release_sample_count,
-      node.authority_unresolved_sample_count,
-      None if selected is None else selected.model,
-      base_seed,
-      base_candidate,
-      node.breakaway_episode_training.count,
-      node.breakaway_episode_validation.count,
-      node.breakaway_episode_dwell_s,
-      node.breakaway_angle_assisted_count,
-      episode_seed,
-      episode_candidate,
-      (
-        None
-        if (
-          node.breakaway_episode_training.weight_s
-          + node.breakaway_episode_validation.weight_s
-        ) <= 0.0
-        else node.breakaway_bracket_width_sum
-        / (
-          node.breakaway_episode_training.weight_s
-          + node.breakaway_episode_validation.weight_s
-        )
+      node_index=index,
+      speed_mps=speed,
+      minimum_support_s=minimum,
+      clean_support_s=node.clean_support_s,
+      supported_sample_count=node.supported_sample_count,
+      training_count=node.training.count,
+      validation_count=node.training.count,
+      validation_support_s=node.training.weight_s,
+      base_support_s=node.base_support_s,
+      base_sample_count=node.base_sample_count,
+      moving_support_s=node.moving_support_s,
+      moving_sample_count=node.moving_sample_count,
+      moving_training_count=node.moving_training.count,
+      moving_validation_count=node.moving_training.count,
+      breakaway_support_s=node.breakaway_support_s,
+      breakaway_sample_count=node.breakaway_sample_count,
+      breakaway_training_count=node.breakaway_training.count,
+      breakaway_validation_count=node.breakaway_training.count,
+      lateral_accel_span_mps2=lat_span,
+      lateral_accel_rms_mps2=lat_rms,
+      rack_travel_deg=node.rack_travel_deg,
+      applied_torque_span=torque_span,
+      rack_reversals=node.rack_reversals,
+      lateral_accel_directions=node.lateral_accel_direction_mask.bit_count(),
+      applied_torque_directions=node.applied_torque_direction_mask.bit_count(),
+      seed_validation_rms=all_evidence.rms(seed_coefficients),
+      candidate_validation_rms=all_evidence.rms(coefficients),
+      moving_seed_validation_rms=node.moving_training.rms(seed_coefficients),
+      moving_candidate_validation_rms=node.moving_training.rms(coefficients),
+      breakaway_seed_validation_rms=node.breakaway_training.rms(seed_coefficients),
+      breakaway_candidate_validation_rms=node.breakaway_training.rms(coefficients),
+      confidence=candidate_parameters.confidence,
+      reasons=report_reasons,
+      candidate_parameters=candidate_parameters,
+      authority_support_s=node.authority_support_s,
+      authority_sample_count=node.authority_sample_count,
+      authority_fit_support_s=node.authority_fit_support_s,
+      authority_fit_sample_count=node.authority_fit_sample_count,
+      authority_training_count=node.authority_training.count,
+      authority_validation_count=node.authority_training.count,
+      authority_seed_validation_rms=node.authority_training.rms(seed_coefficients),
+      authority_candidate_validation_rms=node.authority_training.rms(coefficients),
+      authority_magnitude_sample_count=node.authority_magnitude_sample_count,
+      authority_slew_build_sample_count=node.authority_slew_build_sample_count,
+      authority_slew_release_sample_count=node.authority_slew_release_sample_count,
+      authority_unresolved_sample_count=node.authority_unresolved_sample_count,
+      selected_model=selected_model,
+      base_seed_validation_rms=base_evidence.rms(seed_coefficients),
+      base_candidate_validation_rms=base_evidence.rms(coefficients),
+      breakaway_episode_training_count=node.breakaway_episode_training.count,
+      breakaway_episode_validation_count=node.breakaway_episode_training.count,
+      breakaway_episode_dwell_s=node.breakaway_episode_dwell_s,
+      breakaway_angle_assisted_count=node.breakaway_angle_assisted_count,
+      breakaway_episode_seed_validation_rms=node.breakaway_episode_training.rms(seed_coefficients),
+      breakaway_episode_candidate_validation_rms=node.breakaway_episode_training.rms(coefficients),
+      breakaway_mean_bracket_width=(
+        None if node.breakaway_episode_training.weight_s <= 0.0
+        else node.breakaway_bracket_width_sum / node.breakaway_episode_training.weight_s
       ),
-      fit_diagnostics,
-      training_paired_loss,
-      validation_paired_loss,
-      training_outcome,
+      fit_diagnostics=fit_diagnostics,
+      training_paired_loss=full_loss,
+      validation_paired_loss=cross_fit_loss,
+      training_outcome=outcome,
+      independent_route_counts=route_counts,
+      cross_fit_diagnostics=tuple(family.diagnostic for family in cross_fit_families),
+      full_fit_diagnostic=full_fit_diagnostic,
+      unresolved_diagnostics=tuple(dict.fromkeys(unresolved)),
     )
-
   def qualify(self, provenance: str) -> CalibrationLearningResult:
     if self._route_active:
       raise RuntimeError("active route evidence cannot be qualified")
@@ -2372,10 +2562,11 @@ class CalibrationProfileLearner:
     ) == tuple(
       _seed_coefficients(parameters) for parameters in seed_parameters
     )
+    routes = _canonical_routes(tuple(self._routes))
     interpolation_reports: list[CalibrationInterpolationQualificationReport] = []
     for interval_index in range(len(self._nodes) - 1):
-      training = _paired_joint_route_losses(
-        tuple(self._routes),
+      full_fit = _paired_joint_route_losses(
+        routes,
         interval_index,
         candidate_parameters[interval_index],
         candidate_parameters[interval_index + 1],
@@ -2383,51 +2574,50 @@ class CalibrationProfileLearner:
         seed_parameters[interval_index + 1],
         validation=False,
       )
-      validation = _paired_joint_route_losses(
-        tuple(self._routes),
+      cross_fit, independent_route_count = _cross_fit_interval_loss(
+        routes,
         interval_index,
-        candidate_parameters[interval_index],
-        candidate_parameters[interval_index + 1],
+        reports[interval_index].selected_model,
+        reports[interval_index + 1].selected_model,
         seed_parameters[interval_index],
         seed_parameters[interval_index + 1],
-        validation=True,
       )
       interval_reasons: list[CalibrationQualificationReason] = []
-      for diagnostic, regression_reason, inconclusive_reason in (
-        (
-          training,
-          CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION,
-          CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE,
-        ),
-        (
-          validation,
-          CalibrationQualificationReason.INTERPOLATION_VALIDATION_REGRESSION,
-          CalibrationQualificationReason.INTERPOLATION_VALIDATION_INCONCLUSIVE,
-        ),
-      ):
-        verdict = _paired_loss_verdict(
-          diagnostic,
-          identical=profile_identical,
+      if independent_route_count < MIN_INDEPENDENT_ROUTES:
+        interval_reasons.append(
+          CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES
         )
-        if verdict is _PairedLossVerdict.REGRESSION:
-          interval_reasons.append(regression_reason)
-        elif verdict in (
-          _PairedLossVerdict.INCONCLUSIVE,
-          _PairedLossVerdict.NO_DATA,
-        ):
-          interval_reasons.append(inconclusive_reason)
+      full_fit_verdict = _paired_loss_verdict(full_fit, identical=profile_identical)
+      cross_fit_verdict = _paired_loss_verdict(cross_fit, identical=profile_identical)
+      if full_fit_verdict is _PairedLossVerdict.REGRESSION:
+        interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION
+        )
+      elif full_fit_verdict in (_PairedLossVerdict.INCONCLUSIVE, _PairedLossVerdict.NO_DATA):
+        interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE
+        )
+      if cross_fit_verdict is _PairedLossVerdict.REGRESSION:
+        interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_VALIDATION_REGRESSION
+        )
+      elif cross_fit_verdict in (_PairedLossVerdict.INCONCLUSIVE, _PairedLossVerdict.NO_DATA):
+        interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_VALIDATION_INCONCLUSIVE
+        )
       interpolation_reports.append(
         CalibrationInterpolationQualificationReport(
           interval_index=interval_index,
           lower_speed_mps=self.speed_nodes_mps[interval_index],
           upper_speed_mps=self.speed_nodes_mps[interval_index + 1],
-          training_paired_loss=training,
-          validation_paired_loss=validation,
+          training_paired_loss=full_fit,
+          validation_paired_loss=cross_fit,
           reasons=(
             (CalibrationQualificationReason.QUALIFIED,)
             if not interval_reasons
             else tuple(dict.fromkeys(interval_reasons))
           ),
+          independent_route_count=independent_route_count,
         )
       )
     interpolation_tuple = tuple(interpolation_reports)
@@ -2456,7 +2646,7 @@ class CalibrationProfileLearner:
       if report.selected_model is not None
     )
     candidate_provenance = (
-      f"{source}; observable-inverse-torque-learner-v2; " +
+      f"{source}; observable-inverse-torque-crossfit-v3; " +
       f"models={model_ids}; evidence_revision={revision}"
     )
     profile = VehicleCalibrationProfile(
@@ -2548,13 +2738,20 @@ class CalibrationProfileLearner:
       for name in regression_fields:
         raw[name] = getattr(node, name).encoded()
       nodes.append(raw)
+    canonical_routes = tuple(sorted(
+      self._routes,
+      key=lambda route: (
+        route.route_identity_sha256,
+        route.route_content_sha256,
+        route.route_counter,
+      ),
+    ))
     routes = [
       {
-        "route_index": route.route_index,
+        "route_index": route_index,
         "route_counter": route.route_counter,
         "route_identity_sha256": route.route_identity_sha256,
         "route_content_sha256": route.route_content_sha256,
-        "validation": route.validation,
         "nodes": [
           {
             name: getattr(route_node, name).encoded()
@@ -2564,7 +2761,7 @@ class CalibrationProfileLearner:
         ],
         "intervals": [interval.encoded() for interval in route.intervals],
       }
-      for route in self._routes
+      for route_index, route in enumerate(canonical_routes)
     ]
     payload = {
       "evidence_schema_version": CALIBRATION_EVIDENCE_SCHEMA_VERSION,
@@ -2714,6 +2911,23 @@ class CalibrationProfileLearner:
         raise ValueError("last_direction is invalid")
       for name in regressions:
         setattr(node, name, _Regression.decoded(values[name], name))
+      if any(
+        getattr(node, name).count != 0
+        for name in (
+          "validation",
+          "moving_validation",
+          "breakaway_validation",
+          "breakaway_episode_validation",
+          "authority_validation",
+        )
+      ) or any(
+        getattr(node, name) != 0
+        for name in (
+          "moving_validation_direction_mask",
+          "breakaway_episode_validation_direction_mask",
+        )
+      ):
+        raise ValueError("schema-10 evidence cannot encode a global validation population")
       if node.fit_count != node.training.count + node.validation.count:
         raise ValueError("calibration fit counts are inconsistent")
       if node.authority_fit_count != node.authority_training.count + node.authority_validation.count:
@@ -2800,7 +3014,6 @@ class CalibrationProfileLearner:
           "route_counter",
           "route_identity_sha256",
           "route_content_sha256",
-          "validation",
           "nodes",
           "intervals",
         },
@@ -2809,8 +3022,6 @@ class CalibrationProfileLearner:
       if route_payload["route_index"] != route_index:
         raise ValueError("calibration route ordering is corrupt")
       route_counter = _canonical_route_counter(route_payload["route_counter"])
-      if type(route_payload["validation"]) is not bool:
-        raise ValueError("calibration route partition is invalid")
       route_identity = _route_sha256(
         route_payload["route_identity_sha256"],
         "route identity",
@@ -2819,8 +3030,6 @@ class CalibrationProfileLearner:
         route_payload["route_content_sha256"],
         "route content identity",
       )
-      if route_payload["validation"] != bool(route_counter & 1):
-        raise ValueError("calibration route partition does not match counter")
       if any(
         route.route_counter == route_counter
         or route.route_identity_sha256 == route_identity
@@ -2869,38 +3078,23 @@ class CalibrationProfileLearner:
           route_counter=route_counter,
           route_identity_sha256=route_identity,
           route_content_sha256=route_content,
-          validation=route_payload["validation"],
           nodes=tuple(route_nodes),
           intervals=route_intervals,
         )
       )
 
     aggregate_pairs = (
-      ("training", "training", False),
-      ("validation", "training", True),
-      ("moving_training", "moving_training", False),
-      ("moving_validation", "moving_training", True),
-      ("breakaway_training", "breakaway_training", False),
-      ("breakaway_validation", "breakaway_training", True),
-      (
-        "breakaway_episode_training",
-        "breakaway_episode_training",
-        False,
-      ),
-      (
-        "breakaway_episode_validation",
-        "breakaway_episode_training",
-        True,
-      ),
-      ("authority_training", "authority_training", False),
-      ("authority_validation", "authority_training", True),
+      ("training", "training"),
+      ("moving_training", "moving_training"),
+      ("breakaway_training", "breakaway_training"),
+      ("breakaway_episode_training", "breakaway_episode_training"),
+      ("authority_training", "authority_training"),
     )
     for node_index, node in enumerate(learner._nodes):
-      for aggregate_name, route_name, validation in aggregate_pairs:
+      for aggregate_name, route_name in aggregate_pairs:
         parts = tuple(
           getattr(route.nodes[node_index], route_name)
           for route in learner._routes
-          if route.validation == validation
         )
         reconstructed = _combine(*parts)
         aggregate = getattr(node, aggregate_name)

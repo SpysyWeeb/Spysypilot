@@ -7,7 +7,9 @@ written last so it acts as the commit record for the independently atomic
 evidence and optional candidate files.
 
 The coordinator can create an *unapproved* candidate only after every speed
-node and interpolation interval qualifies. An evaluated all-seed outcome is
+node and interpolation interval qualifies through schema-10 route-grouped
+leave-one-route-out evidence drawn exclusively from the caller's global TRAIN
+partition. An evaluated all-seed outcome is
 successful and emits an immutable selected-profile proof for downstream
 behavior replay, but it intentionally emits no redundant *new calibration*
 candidate. It has no API for approval, activation, controller selection, or
@@ -40,7 +42,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 9
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 10
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION

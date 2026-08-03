@@ -176,7 +176,7 @@ class _FakeCalibrationLearner:
   @classmethod
   def from_evidence(cls, seed: VehicleCalibrationProfile, encoded: bytes) -> _FakeCalibrationLearner:
     payload = json.loads(encoded)
-    if payload["evidence_schema_version"] != 9:
+    if payload["evidence_schema_version"] != 10:
       raise ValueError("evidence schema is incompatible")
     if payload["vehicle_identity"] != seed.vehicle_identity:
       raise ValueError("evidence belongs to a different vehicle")
@@ -264,7 +264,7 @@ class _FakeCalibrationLearner:
     return json.dumps(
       {
         "counts": self.counts,
-        "evidence_schema_version": 9,
+        "evidence_schema_version": 10,
         "vehicle_identity": self.seed.vehicle_identity,
       },
       sort_keys=True,
@@ -487,8 +487,8 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
     manifest = json.loads(finalization.manifest_bytes)
     self.assertEqual(manifest["artifact_schema_version"], CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION)
-    self.assertEqual(manifest["artifact_schema_version"], 9)
-    self.assertEqual(manifest["evidence_schema_version"], 9)
+    self.assertEqual(manifest["artifact_schema_version"], 10)
+    self.assertEqual(manifest["evidence_schema_version"], 10)
     self.assertEqual(manifest["seed_profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
     self.assertEqual(manifest["seed_profile_schema_version"], 2)
     self.assertEqual(manifest["seed_profile_sha256"], hashlib.sha256(seed.to_json().encode()).hexdigest())
@@ -581,21 +581,25 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
 
 class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
-  def test_real_v9_report_is_manifest_compatible_and_restorable(self) -> None:
+  def test_real_v10_report_is_manifest_compatible_and_restorable(self) -> None:
     seed = seed_profile()
     first = CalibrationLearningCoordinator(seed).finalize()
     restored = CalibrationLearningCoordinator(seed, first.evidence_bytes).finalize()
     self.assertEqual(restored.evidence_bytes, first.evidence_bytes)
     self.assertEqual(restored.manifest_bytes, first.manifest_bytes)
     manifest = json.loads(first.manifest_bytes)
-    self.assertEqual(manifest["artifact_schema_version"], 9)
-    self.assertEqual(manifest["evidence_schema_version"], 9)
+    self.assertEqual(manifest["artifact_schema_version"], 10)
+    self.assertEqual(manifest["evidence_schema_version"], 10)
     self.assertEqual(manifest["seed_profile_schema_version"], 2)
     for report in manifest["node_reports"]:
       self.assertIn("moving_reasons", report)
       self.assertIn("moving_candidate_validation_rms", report)
       self.assertIn("breakaway_reasons", report)
       self.assertIn("breakaway_candidate_validation_rms", report)
+      self.assertIn("independent_route_counts", report)
+      self.assertIn("cross_fit_diagnostics", report)
+      self.assertIn("full_fit_diagnostic", report)
+      self.assertIn("unresolved_diagnostics", report)
     self.assertEqual(manifest["interpolation_reports"], [])
 
 
