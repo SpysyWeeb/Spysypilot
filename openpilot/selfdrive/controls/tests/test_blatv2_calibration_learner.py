@@ -17,15 +17,18 @@ from openpilot.selfdrive.controls.lib.blatv2.breakaway_episode import (
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CALIBRATION_EVIDENCE_SCHEMA_VERSION,
   CalibrationCrossFitStatus,
+  CalibrationCrossFitModelDiagnostic,
   CalibrationFitStatus,
   CalibrationIntervalStratum,
   CalibrationModelFitDiagnostic,
   CalibrationModelId,
+  CalibrationPairedLossDiagnostic,
   CalibrationProfileLearner,
   CalibrationQualificationReason,
   CalibrationSampleDisposition,
   _JointRegression,
   _PairedLossVerdict,
+  _CrossFitFamily,
   _Regression,
   _fit_bounded_subset,
   _fit_model_family,
@@ -772,6 +775,84 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertTrue(all(
       diagnostic.status is CalibrationCrossFitStatus.FOLD_FIT_FAILURE
       for diagnostic in report.cross_fit_diagnostics
+    ))
+
+  def test_mixed_fold_failure_and_regression_emit_both_reasons(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    add_complete_evidence(learner)
+    zero_loss = CalibrationPairedLossDiagnostic(3, 0.0, 0.0, 0.0, 0.0, 1e-14)
+
+    def mixed_family(unused_routes, unused_index, model, unused_seed, unused_fields):
+      return _CrossFitFamily(
+        model,
+        (),
+        CalibrationCrossFitModelDiagnostic(
+          model=model,
+          status=CalibrationCrossFitStatus.FOLD_FIT_FAILURE,
+          contributing_route_count=4,
+          successful_fold_count=3,
+          failed_fold_count=1,
+          regressed_fold_count=1,
+          paired_loss=zero_loss,
+        ),
+      )
+
+    with patch(
+      "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._cross_fit_family",
+      side_effect=mixed_family,
+    ):
+      report = learner._node_report(2)
+
+    self.assertFalse(report.qualified)
+    self.assertIn(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE, report.reasons)
+    self.assertIn(CalibrationQualificationReason.CROSS_FIT_REGRESSION, report.reasons)
+    self.assertTrue(all(
+      diagnostic.failed_fold_count == diagnostic.regressed_fold_count == 1
+      for diagnostic in report.cross_fit_diagnostics
+    ))
+
+  def test_safe_alternate_keeps_rejected_family_facts_diagnostic_only(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    add_complete_evidence(learner)
+    safe_loss = CalibrationPairedLossDiagnostic(4, 0.0, 0.0, 0.0, 0.0, 1e-14)
+    mixed_loss = CalibrationPairedLossDiagnostic(3, 0.0, 0.0, 0.0, 0.0, 1e-14)
+
+    def family(unused_routes, unused_index, model, unused_seed, unused_fields):
+      safe = model is CalibrationModelId.STATIC_ONLY
+      return _CrossFitFamily(
+        model,
+        (),
+        CalibrationCrossFitModelDiagnostic(
+          model=model,
+          status=(
+            CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+            if safe
+            else CalibrationCrossFitStatus.FOLD_FIT_FAILURE
+          ),
+          contributing_route_count=4,
+          successful_fold_count=4 if safe else 3,
+          failed_fold_count=0 if safe else 1,
+          regressed_fold_count=0 if safe else 1,
+          paired_loss=safe_loss if safe else mixed_loss,
+        ),
+      )
+
+    with patch(
+      "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._cross_fit_family",
+      side_effect=family,
+    ):
+      report = learner._node_report(2)
+
+    self.assertTrue(report.qualified)
+    self.assertEqual(report.reasons, (CalibrationQualificationReason.SEED_RETAINED,))
+    rejected = tuple(
+      diagnostic for diagnostic in report.cross_fit_diagnostics
+      if diagnostic.model is not CalibrationModelId.STATIC_ONLY
+    )
+    self.assertTrue(rejected)
+    self.assertTrue(all(
+      diagnostic.failed_fold_count == diagnostic.regressed_fold_count == 1
+      for diagnostic in rejected
     ))
 
   def test_interpolation_middle_fold_failure_blocks_profile(self) -> None:
