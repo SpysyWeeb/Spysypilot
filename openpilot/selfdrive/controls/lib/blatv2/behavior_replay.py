@@ -1208,8 +1208,8 @@ def decode_behavior_car_params(encoded: bytes) -> Any:
     raise BehaviorReplayError("route replay lacks canonical CarParams bytes")
   try:
     params = decode_car_params(encoded)
-    # Force the fields used during construction while the capnp reader is in
-    # scope; malformed/non-CarParams payloads fail here rather than later.
+    # Force the fields used during construction so malformed/non-CarParams
+    # payloads fail here rather than later.
     str(params.carFingerprint)
     float(params.mass)
     float(params.wheelbase)

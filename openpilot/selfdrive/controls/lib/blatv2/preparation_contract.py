@@ -34,4 +34,4 @@ def decode_car_params(encoded: bytes) -> car.CarParams:
     str(reader.carFingerprint)
     float(reader.mass)
     float(reader.wheelbase)
-    return reader
+    return reader.as_builder().as_reader()
