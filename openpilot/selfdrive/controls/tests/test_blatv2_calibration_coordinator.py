@@ -27,6 +27,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationLearningLifecycleState,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CalibrationProfileLearner,
   CalibrationSampleDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
@@ -36,6 +37,9 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   make_calibration_seed_profile,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 
 
 DT = 0.01
@@ -264,6 +268,13 @@ class _FakeCalibrationLearner:
       sort_keys=True,
       separators=(",", ":"),
     ).encode()
+
+  def export_authoritative_evidence(self) -> bytes:
+    return self.export_evidence()
+
+  @property
+  def route_commitments(self) -> tuple[object, ...]:
+    return ()
 
   def qualify(self, provenance: str) -> SimpleNamespace:
     reports = []
@@ -578,6 +589,34 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
 
 class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
+  def test_structural_restore_cannot_self_authenticate_embedded_commitments(self) -> None:
+    seed = seed_profile()
+    learner = CalibrationProfileLearner(seed)
+    identity = route_sha(0x61)
+    learner.begin_route(identity, identity, route_counter=0x61)
+    learner.add_sample_with_disposition(
+      measured_sample(10.0, 0),
+      source_coordinate=CalibrationIngestionCoordinate(
+        identity,
+        0,
+        1_000_000_000,
+        0,
+      ),
+    )
+    learner.end_route()
+    encoded = learner.export_authoritative_evidence()
+
+    restored = CalibrationLearningCoordinator(seed, encoded)
+    self.assertFalse(restored._learner.evidence_authoritative)
+    with self.assertRaisesRegex(RuntimeError, "non-authoritative"):
+      restored.finalize()
+
+  def test_finalize_requires_authority_api_and_route_commitments(self) -> None:
+    coordinator = CalibrationLearningCoordinator(seed_profile())
+    coordinator._learner = SimpleNamespace()
+    with self.assertRaises(AttributeError):
+      coordinator.finalize()
+
   def test_real_v12_report_is_manifest_compatible_and_restorable(self) -> None:
     seed = seed_profile()
     first = CalibrationLearningCoordinator(seed).finalize()

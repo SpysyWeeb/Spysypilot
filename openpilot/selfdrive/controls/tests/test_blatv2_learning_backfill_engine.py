@@ -844,8 +844,11 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   second_run = engine.run_once()
   assert second_run.publication is not None
   assert prepare_calls == Counter({
-    first_name: 2,
-    second_name: 2,
+    # A durable snapshot is structural state, not replay authority. Each
+    # publishing transaction independently replays every retained ingested
+    # route through both authorities before adding the new route.
+    first_name: 4,
+    second_name: 4,
     new_name: 2,
   })
   runtime = runtime_factory()
@@ -871,8 +874,8 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   assert no_op.publication is None
   assert not no_op.pending_logger_close
   assert prepare_calls == Counter({
-    first_name: 2,
-    second_name: 2,
+    first_name: 4,
+    second_name: 4,
     new_name: 2,
   })
 

@@ -450,12 +450,7 @@ class CalibrationLearningCoordinator:
     if self._cached_finalization is not None and self._finalized_generation == self._evidence_generation:
       return self._cached_finalization
 
-    authoritative_export = getattr(
-      self._learner,
-      "export_authoritative_evidence",
-      self._learner.export_evidence,
-    )
-    evidence_bytes = authoritative_export()
+    evidence_bytes = self._learner.export_authoritative_evidence()
     evidence_identity = calibration_evidence_sha256(evidence_bytes)
     result = self._learner.qualify(self._candidate_provenance)
     candidate = result.candidate_profile
@@ -520,7 +515,7 @@ class CalibrationLearningCoordinator:
           "route_identity_sha256": commitment.route_identity_sha256,
           "route_index": commitment.route_index,
         }
-        for commitment in getattr(self._learner, "route_commitments", ())
+        for commitment in self._learner.route_commitments
       ],
       "seed_profile_revision": self._seed_profile.revision,
       "seed_profile_schema_version": self._seed_profile.schema_version,

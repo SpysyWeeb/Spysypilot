@@ -35,6 +35,7 @@ from typing import Any
 
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
+  CalibrationLearningCoordinator,
   CalibrationLearningFinalization,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_progress import (
@@ -54,6 +55,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_operation_status import (
   route_identity_sha256,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
+  CASUAL_DRIVING_CANDIDATE_PROVENANCE,
   LearningArtifactPaths,
   PersistentLearningRuntime,
 )
@@ -6243,6 +6245,20 @@ class HistoricalLearningBackfill:
       self._pending_route_quiescence_observed or observed
     )
 
+  def _fresh_authoritative_runtime(self) -> PersistentLearningRuntime:
+    """Create an empty replay authority from detected runtime facts only."""
+    restored = self.runtime_factory()
+    coordinator = CalibrationLearningCoordinator(
+      restored.runtime_bundle.calibration_seed_profile,
+      candidate_provenance=CASUAL_DRIVING_CANDIDATE_PROVENANCE,
+    )
+    return PersistentLearningRuntime(
+      car_params=restored.car_params,
+      runtime_bundle=restored.runtime_bundle,
+      artifact_paths=restored.artifact_paths,
+      coordinator=coordinator,
+    )
+
   @staticmethod
   def _runtime_context(
     runtime: PersistentLearningRuntime,
@@ -6451,6 +6467,29 @@ class HistoricalLearningBackfill:
       pending_close = discovery.pending_logger_close
       verify_known_route_hashes(ledger, discovered)
       known = ledger_routes(ledger)
+      discovered_by_name = {
+        route.route_name: route
+        for route in discovered
+      }
+      historical_route_names = tuple(
+        entry["route_name"]
+        for entry in ledger["entries"]
+        if entry["disposition"] == "ingested"
+      )
+      missing_historical = tuple(
+        route_name
+        for route_name in historical_route_names
+        if route_name not in discovered_by_name
+      )
+      if missing_historical:
+        raise BackfillError(
+          "backfill_untracked_evidence",
+          "previously ingested routes are unavailable for authoritative replay",
+        )
+      historical_routes = tuple(
+        discovered_by_name[route_name]
+        for route_name in historical_route_names
+      )
       unprocessed = tuple(
         route
         for route in discovered
@@ -6492,6 +6531,7 @@ class HistoricalLearningBackfill:
         for route in unprocessed
         if watermark is None or route.route_counter > watermark
       )
+      authority_candidates = historical_routes + replay_candidates
       progress = None
       if (
         progress_enabled
@@ -6500,7 +6540,7 @@ class HistoricalLearningBackfill:
       ):
         try:
           progress = _BackfillProgressTracker(
-            routes=replay_candidates,
+            routes=authority_candidates,
             operation_status=self.operation_status,
             publisher=self.backfill_progress,
             abort_requested=self.abort_requested,
@@ -6524,7 +6564,8 @@ class HistoricalLearningBackfill:
             pending_logger_close=True,
           )
         if artifact_paths.backfill_pointer.is_file():
-          finalization = initial_runtime.coordinator.finalize()
+          manifest = json.loads(artifact_paths.manifest.read_bytes())
+          evidence_sha256 = manifest["evidence_sha256"]
           ledger_sha256 = _sha256(
             artifact_paths.backfill_ledger.read_bytes(),
           )
@@ -6532,7 +6573,7 @@ class HistoricalLearningBackfill:
             initial_runtime,
             state=LearningOperationState.IDLE,
             diagnostic="evidence_ready",
-            evidence_sha256=finalization.evidence_sha256,
+            evidence_sha256=evidence_sha256,
             ledger_sha256=ledger_sha256,
           )
         else:
@@ -6548,7 +6589,7 @@ class HistoricalLearningBackfill:
 
       route_indexes = {
         route.route_name: index
-        for index, route in enumerate(replay_candidates, start=1)
+        for index, route in enumerate(authority_candidates, start=1)
       }
       first_progress_accepted = 0
       first_progress_rejected = 0
@@ -6560,7 +6601,7 @@ class HistoricalLearningBackfill:
           diagnostic="replaying_route",
           current_route_identity=route.display_identity,
           current_route_index=route_indexes[route.route_name],
-          total_route_count=len(replay_candidates),
+          total_route_count=len(authority_candidates),
           accepted_sample_count=first_progress_accepted,
           rejected_sample_count=first_progress_rejected,
         )
@@ -6610,7 +6651,7 @@ class HistoricalLearningBackfill:
           diagnostic="replaying_route",
           current_route_identity=route.display_identity,
           current_route_index=route_indexes[route.route_name],
-          total_route_count=len(replay_candidates),
+          total_route_count=len(authority_candidates),
           accepted_sample_count=accepted,
           rejected_sample_count=rejected,
         )
@@ -6626,7 +6667,7 @@ class HistoricalLearningBackfill:
           diagnostic="replaying_route",
           current_route_identity=route.display_identity,
           current_route_index=route_indexes[route.route_name],
-          total_route_count=len(replay_candidates),
+          total_route_count=len(authority_candidates),
           accepted_sample_count=first_progress_accepted,
           rejected_sample_count=first_progress_rejected,
         )
@@ -6641,7 +6682,7 @@ class HistoricalLearningBackfill:
       def parallel_verification_replay(
         worker_abort_requested: Callable[[], bool],
       ) -> ReplayPass:
-        worker_runtime = self.runtime_factory()
+        worker_runtime = self._fresh_authoritative_runtime()
         def verification_prepare(route: RouteCandidate) -> PreparedRoute:
           return self._prepare(
             worker_runtime,
@@ -6653,7 +6694,7 @@ class HistoricalLearningBackfill:
         if self.replay_worker_count == 4:
           with _PrefetchingRoutePreparer(
             authority_index=2,
-            routes=replay_candidates,
+            routes=authority_candidates,
             local_prepare=verification_prepare,
             helper_prepare=(
               lambda route, helper_abort_requested: self._prepare(
@@ -6669,20 +6710,20 @@ class HistoricalLearningBackfill:
           ) as verification_preparer:
             return replay_routes(
               runtime=worker_runtime,
-              routes=replay_candidates,
+              routes=authority_candidates,
               prepare=verification_preparer,
               abort_requested=worker_abort_requested,
             )
         return replay_routes(
           runtime=worker_runtime,
-          routes=replay_candidates,
+          routes=authority_candidates,
           prepare=verification_prepare,
           abort_requested=worker_abort_requested,
         )
 
       # Restore the parent runtime before creating any child. A restore
       # failure must leave no verification worker or inherited resources.
-      first_runtime = self.runtime_factory()
+      first_runtime = self._fresh_authoritative_runtime()
       verification_worker = (
         None
         if self.replay_worker_count == 1
@@ -6706,7 +6747,7 @@ class HistoricalLearningBackfill:
         if self.replay_worker_count == 4:
           with _PrefetchingRoutePreparer(
             authority_index=1,
-            routes=replay_candidates,
+            routes=authority_candidates,
             local_prepare=first_prepare,
             helper_prepare=(
               lambda route, helper_abort_requested: self._prepare(
@@ -6723,7 +6764,7 @@ class HistoricalLearningBackfill:
           ) as first_preparer:
             first = replay_routes(
               runtime=first_runtime,
-              routes=replay_candidates,
+              routes=authority_candidates,
               prepare=first_preparer,
               abort_requested=self.abort_requested,
               route_completed=first_route_completed,
@@ -6732,7 +6773,7 @@ class HistoricalLearningBackfill:
         else:
           first = replay_routes(
             runtime=first_runtime,
-            routes=replay_candidates,
+            routes=authority_candidates,
             prepare=first_prepare,
             abort_requested=self.abort_requested,
             route_completed=first_route_completed,
@@ -6765,7 +6806,7 @@ class HistoricalLearningBackfill:
         if progress is not None:
           project_progress(progress.parallel_verification_completed)
       else:
-        second_runtime = self.runtime_factory()
+        second_runtime = self._fresh_authoritative_runtime()
 
         def second_prepare(route: RouteCandidate) -> PreparedRoute:
           return self._prepare(
@@ -6812,7 +6853,7 @@ class HistoricalLearningBackfill:
 
         second = replay_routes(
           runtime=second_runtime,
-          routes=replay_candidates,
+          routes=authority_candidates,
           prepare=second_prepare,
           abort_requested=self.abort_requested,
           route_completed=second_route_completed,
@@ -6835,10 +6876,19 @@ class HistoricalLearningBackfill:
         first=first,
         second=second,
       )
+      new_route_names = {
+        route.route_name
+        for route in replay_candidates
+      }
+      new_results = tuple(
+        result
+        for result in first.results
+        if result.route.route_name in new_route_names
+      )
       new_ledger = extend_ledger(
         ledger,
         late_routes=late_routes,
-        replay_results=first.results,
+        replay_results=new_results,
       )
       self._publish(
         initial_runtime,
@@ -6871,7 +6921,7 @@ class HistoricalLearningBackfill:
       )
       rejected = any(
         result.disposition == "rejected"
-        for result in first.results
+        for result in new_results
       )
       if rejected:
         diagnostic = "backfill_complete_with_rejections"

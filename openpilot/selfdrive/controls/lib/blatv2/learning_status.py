@@ -4,7 +4,8 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 7 deliberately rejects the retired physical rack-fit vocabulary and
+Schema 8 adds the exact per-stratum full-fit proof used to derive the complete
+ordered qualification reason set. It also rejects the retired rack-fit vocabulary and
 adds canonical first-cause sample accounting. The
 only candidate values it exposes are the four observable inverse-torque
 calibration values, while independent base, moving, breakaway, and authority
@@ -33,6 +34,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationNodeQualificationReport,
   CalibrationQualificationReason,
   CalibrationSampleAccounting,
+  calibration_node_failure_reasons,
   MIN_INDEPENDENT_ROUTES,
   MIN_STRATUM_TRAINING_ROWS,
   MIN_APPLIED_TORQUE_SPAN,
@@ -45,7 +47,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 7
+LEARNING_STATUS_SCHEMA_VERSION = 8
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
   "all_intervals_qualified",
@@ -132,6 +134,7 @@ _NODE_KEYS = {
   "full_fit_count",
   "selection_outcome",
   "full_fit_paired_loss",
+  "full_fit_stratum_paired_losses",
   "cross_fit_route_count",
   "cross_fit_paired_loss",
   "cross_fit_diagnostics",
@@ -855,6 +858,15 @@ def _node_payload(
       report.full_fit_paired_loss,
       f"{context}.full_fit_paired_loss",
     ),
+    "full_fit_stratum_paired_losses": [
+      _paired_loss_payload(
+        diagnostic,
+        f"{context}.full_fit_stratum_paired_losses[{index}]",
+      )
+      for index, diagnostic in enumerate(
+        report.full_fit_stratum_paired_losses
+      )
+    ],
     "cross_fit_route_count": _nonnegative_int(
       report.cross_fit_route_count,
       f"{context}.cross_fit_route_count",
@@ -1503,18 +1515,111 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       expected_prerequisites.append(
         CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
       )
-    prerequisite_values = {
-      CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value,
-      CalibrationQualificationReason.INSUFFICIENT_EXCITATION.value,
-      CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE.value,
-      CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE.value,
-      CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value,
-    }
-    actual_prerequisites = [
-      reason for reason in reasons if reason in prerequisite_values
-    ]
-    if not node["qualified"] and actual_prerequisites != expected_prerequisites:
-      raise ValueError(f"{context}.reasons contradict carried evidence")
+    cross_fit_values = tuple(cross_fit_diagnostics.values())
+    has_scored_family = any(
+      diagnostic["status"] == CalibrationCrossFitStatus.SCORED.value
+      for diagnostic in cross_fit_values
+    )
+    has_complete_family = any(
+      diagnostic["contributing_route_count"] >= MIN_INDEPENDENT_ROUTES
+      and diagnostic["failed_fold_count"] == 0
+      and diagnostic["successful_fold_count"]
+      == diagnostic["contributing_route_count"]
+      for diagnostic in cross_fit_values
+    )
+    cross_fit_fold_failure = not has_scored_family and not has_complete_family
+    if (
+      full_fit_diagnostic is not None
+      and full_fit_diagnostic["status"]
+      != CalibrationFitStatus.IDENTIFIABLE.value
+    ):
+      cross_fit_fold_failure = True
+    stratum_losses = node["full_fit_stratum_paired_losses"]
+    if type(stratum_losses) is not list:
+      raise ValueError(f"{context}.full_fit_stratum_paired_losses must be a list")
+    stratum_outcomes = tuple(
+      _validate_paired_loss(
+        diagnostic,
+        f"{context}.full_fit_stratum_paired_losses[{index}]",
+        optional=False,
+      )
+      for index, diagnostic in enumerate(stratum_losses)
+    )
+    expects_stratum_losses = (
+      selection_outcome == CalibrationQualificationReason.LEARNED.value
+      and full_fit_diagnostic is not None
+      and full_fit_diagnostic["status"]
+      == CalibrationFitStatus.IDENTIFIABLE.value
+    )
+    expected_stratum_count = 4 if parsed_route_counts["authority"] > 0 else 3
+    if (
+      expects_stratum_losses
+      and len(stratum_outcomes) != expected_stratum_count
+    ) or (not expects_stratum_losses and stratum_outcomes):
+      raise ValueError(f"{context}.full-fit stratum proof is incomplete")
+    full_fit_safe = all(
+      outcome in ("improved", "no_regression")
+      for outcome in stratum_outcomes
+    )
+    raw_parameters = node["candidate_parameters"]
+    parameters_valid = False
+    if type(raw_parameters) is dict and set(raw_parameters) == _CANDIDATE_PARAMETER_KEYS:
+      raw_values = tuple(raw_parameters.values())
+      if all(type(value) in (int, float) for value in raw_values):
+        gain = float(raw_parameters["torque_per_lateral_accel"])
+        offset = float(raw_parameters["lateral_accel_offset_correction_mps2"])
+        kinetic = float(raw_parameters["kinetic_friction_torque"])
+        static = float(raw_parameters["static_breakaway_torque"])
+        parameters_valid = (
+          all(math.isfinite(value) for value in (gain, offset, kinetic, static))
+          and gain > 0.0
+          and static >= kinetic >= 0.0
+          and abs(offset) <= max(1.0, float(node["lateral_accel_span_mps2"]))
+        )
+    expected_reasons = [reason.value for reason in calibration_node_failure_reasons(
+      insufficient_support=(
+        CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value
+        in expected_prerequisites
+      ),
+      insufficient_excitation=(
+        CalibrationQualificationReason.INSUFFICIENT_EXCITATION.value
+        in expected_prerequisites
+      ),
+      insufficient_moving_evidence=(
+        CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE.value
+        in expected_prerequisites
+      ),
+      insufficient_breakaway_evidence=(
+        CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE.value
+        in expected_prerequisites
+      ),
+      insufficient_independent_routes=(
+        CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+        in expected_prerequisites
+      ),
+      cross_fit_fold_failure=cross_fit_fold_failure,
+      fit_statuses=tuple(CalibrationFitStatus(status) for status in fit_statuses),
+      full_fit_safe=full_fit_safe,
+      parameters_valid=parameters_valid,
+    )]
+    if node["qualified"]:
+      expected_reasons = [selection_outcome]
+    if reasons != expected_reasons:
+      raise ValueError(f"{context}.reasons contradict carried diagnostics")
+    expected_unresolved = []
+    if (
+      CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+      in expected_prerequisites
+    ):
+      expected_unresolved.append(
+        CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+      )
+    if not has_scored_family and not has_complete_family:
+      expected_unresolved.append(
+        CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE.value
+      )
+    if unresolved != expected_unresolved:
+      raise ValueError(f"{context}.unresolved diagnostics contradict proof")
     if (
       node["breakaway_angle_assisted_count"]
       > node["breakaway_episode_full_fit_count"]

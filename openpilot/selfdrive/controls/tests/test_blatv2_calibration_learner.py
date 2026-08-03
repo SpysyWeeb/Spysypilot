@@ -32,6 +32,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   _canonical_routes,
   _aggregate_nodes,
   _seed_coefficients,
+  _validate_sign_predictor,
+  _validate_joint_sign_predictor,
   _solve,
   calibration_evidence_sha256,
   calibration_learning_sample_field_names,
@@ -1066,7 +1068,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
         fabricated["payload_sha256"] = hashlib.sha256(
           canonical(fabricated["payload"])
         ).hexdigest()
-        with self.assertRaisesRegex(ValueError, "conservation failed"):
+        with self.assertRaisesRegex(ValueError, "sign-predictor|conservation failed"):
           CalibrationProfileLearner.from_evidence(seed, canonical(fabricated))
 
     coordinated = json.loads(encoded)
@@ -1121,7 +1123,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     coordinated["payload_sha256"] = hashlib.sha256(
       canonical(coordinated["payload"])
     ).hexdigest()
-    with self.assertRaisesRegex(ValueError, "row conservation failed"):
+    with self.assertRaisesRegex(ValueError, "sign-predictor|row conservation failed"):
       CalibrationProfileLearner.from_evidence(seed, canonical(coordinated))
 
     source_total = json.loads(encoded)
@@ -1554,6 +1556,72 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     non_psd["normal"][4] = (2.0).hex()
     with self.assertRaisesRegex(ValueError, "Cauchy|PSD"):
       _Regression.decoded(non_psd, "non_psd")
+
+  def test_sign_predictor_alphabet_rejects_fractional_and_crossed_rows(self) -> None:
+    fractional = _Regression()
+    fractional.add((0.2, 1.0, 0.5, 0.0), 0.1, 1.0)
+    fractional = _Regression.decoded(fractional.encoded(), "fractional")
+    with self.assertRaisesRegex(ValueError, "sign-predictor energy"):
+      _validate_sign_predictor(fractional, 2, "fractional")
+
+    crossed = _Regression()
+    crossed.add((0.2, 1.0, 1.0, 0.25), 0.1, 1.0)
+    with self.assertRaisesRegex(ValueError, "predictors overlap|inactive sign"):
+      crossed = _Regression.decoded(crossed.encoded(), "crossed")
+      _validate_sign_predictor(crossed, 2, "crossed")
+
+    weighted = _Regression()
+    weighted.add((0.2, 1.0, -1.0, 0.0), 0.1, 0.25)
+    weighted.add((-0.2, 1.0, 1.0, 0.0), -0.1, 0.75)
+    weighted = _Regression.decoded(weighted.encoded(), "weighted")
+    _validate_sign_predictor(weighted, 2, "weighted")
+
+  def test_sufficient_statistics_overflow_fails_as_value_error(self) -> None:
+    regression = _Regression()
+    encoded = regression.encoded()
+    encoded["count"] = 1
+    encoded["weight_s"] = 1.0.hex()
+    encoded["normal"][0] = float.fromhex("0x1.fffffffffffffp+1023").hex()
+    encoded["normal"][5] = 1.0.hex()
+    encoded["rhs"][0] = float.fromhex("0x1.fffffffffffffp+1023").hex()
+    encoded["target_squared"] = float.fromhex("0x1.fffffffffffffp+1023").hex()
+    with self.assertRaisesRegex(ValueError, "overflow|Cauchy|PSD"):
+      _Regression.decoded(encoded, "overflow")
+
+  def test_joint_sign_predictor_alphabet_rejects_fractional_rows(self) -> None:
+    fractional = _JointRegression()
+    fractional.add((0.2, 1.0, 0.5, 0.0), 0.1, 1.0, 0.4)
+    fractional = _JointRegression.decoded(fractional.encoded(), "fractional_joint")
+    with self.assertRaisesRegex(ValueError, "sign-predictor energy"):
+      _validate_joint_sign_predictor(fractional, (6, 7), "fractional_joint")
+
+    valid = _JointRegression()
+    valid.add((0.2, 1.0, -1.0, 0.0), 0.1, 0.25, 0.2)
+    valid.add((-0.2, 1.0, 1.0, 0.0), -0.1, 0.75, 0.8)
+    valid = _JointRegression.decoded(valid.encoded(), "valid_joint")
+    _validate_joint_sign_predictor(valid, (6, 7), "valid_joint")
+
+    duplicate_poison = _JointRegression.decoded(
+      valid.encoded(), "duplicate_poison"
+    )
+    duplicate_poison.rhs[3] += 0.01
+    with self.assertRaisesRegex(ValueError, "duplicate interpolation"):
+      _validate_joint_sign_predictor(
+        duplicate_poison,
+        (6, 7),
+        "duplicate_poison",
+      )
+
+    intercept_poison = _JointRegression.decoded(
+      valid.encoded(), "intercept_poison"
+    )
+    intercept_poison.normal[2 * 10 + 2] += 0.01
+    with self.assertRaisesRegex(ValueError, "intercept energy"):
+      _validate_joint_sign_predictor(
+        intercept_poison,
+        (6, 7),
+        "intercept_poison",
+      )
 
   def test_live_rows_are_structural_only_and_cannot_publish(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())

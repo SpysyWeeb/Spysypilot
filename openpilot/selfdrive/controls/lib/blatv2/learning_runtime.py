@@ -30,11 +30,13 @@ from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   apply_torque_envelope,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
+  CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
   CalibrationLearningCoordinator,
   CalibrationLearningFinalization,
   CalibrationLearningLifecycleState,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CALIBRATION_EVIDENCE_SCHEMA_VERSION,
   CalibrationSampleDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
@@ -572,60 +574,60 @@ class PersistentLearningRuntime:
     try:
       evidence_bytes = artifact_paths.evidence.read_bytes()
       manifest_bytes = artifact_paths.manifest.read_bytes()
-      expected_route_commitments: tuple[tuple[str, str], ...] | None = None
-      if artifact_paths.backfill_pointer.is_file():
-        ledger = json.loads(artifact_paths.backfill_ledger.read_bytes())
-        ingested = sorted(
-          (
-            entry for entry in ledger["entries"]
-            if entry["disposition"] == "ingested"
-          ),
-          key=lambda entry: (
-            entry["route_identity_sha256"],
-            entry["route_evidence_sha256"],
-            entry["route_counter"],
-          ),
-        )
-        expected_route_commitments = tuple(
-          (
-            entry["route_identity_sha256"],
-            entry["route_commitment_sha256"],
-          )
-          for entry in ingested
-        )
       coordinator = CalibrationLearningCoordinator(
         runtime_bundle.calibration_seed_profile,
         evidence_bytes,
         candidate_provenance=CASUAL_DRIVING_CANDIDATE_PROVENANCE,
-        expected_route_commitments=expected_route_commitments,
       )
-      finalization = coordinator.finalize()
-      if finalization.manifest_bytes != manifest_bytes:
+      manifest = json.loads(manifest_bytes)
+      if (
+        type(manifest) is not dict
+        or manifest_bytes != json.dumps(
+          manifest,
+          sort_keys=True,
+          separators=(",", ":"),
+        ).encode("utf-8")
+        or manifest.get("artifact_schema_version")
+        != CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION
+        or manifest.get("evidence_schema_version")
+        != CALIBRATION_EVIDENCE_SCHEMA_VERSION
+        or manifest.get("evidence_sha256")
+        != hashlib.sha256(evidence_bytes).hexdigest()
+        or manifest.get("seed_profile_sha256")
+        != coordinator.seed_profile_sha256
+        or manifest.get("vehicle_identity") != coordinator.vehicle_identity
+      ):
         raise LearningRestoreError(
           "stored learner manifest does not identify the exact evidence",
         )
-      selected_json = finalization.selected_profile_json
-      selected_identity = finalization.selected_profile_sha256
-      if selected_json is not None:
-        if selected_identity is None:
-          raise AssertionError("selected profile JSON lacks its canonical identity")
+      selected_manifest = manifest.get("selected_profile")
+      if selected_manifest is not None:
+        if type(selected_manifest) is not dict:
+          raise LearningRestoreError("stored selected profile manifest is invalid")
+        selected_identity = selected_manifest.get("profile_sha256")
+        if type(selected_identity) is not str:
+          raise LearningRestoreError("stored selected profile identity is invalid")
         selected_path = artifact_paths.selected_profile(selected_identity)
         if (
           not selected_path.is_file()
-          or selected_path.read_bytes() != selected_json
+          or hashlib.sha256(selected_path.read_bytes()).hexdigest()
+          != selected_identity
         ):
           raise LearningRestoreError(
             "stored selected profile is missing or does not match manifest",
           )
-      candidate_json = finalization.candidate_profile_json
-      candidate_identity = finalization.candidate_profile_sha256
-      if candidate_json is not None:
-        if candidate_identity is None:
-          raise AssertionError("candidate JSON lacks its canonical identity")
+      candidate_manifest = manifest.get("candidate_profile")
+      if candidate_manifest is not None:
+        if type(candidate_manifest) is not dict:
+          raise LearningRestoreError("stored candidate profile manifest is invalid")
+        candidate_identity = candidate_manifest.get("profile_sha256")
+        if type(candidate_identity) is not str:
+          raise LearningRestoreError("stored candidate profile identity is invalid")
         candidate_path = artifact_paths.candidate(candidate_identity)
         if (
           not candidate_path.is_file()
-          or candidate_path.read_bytes() != candidate_json
+          or hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+          != candidate_identity
         ):
           raise LearningRestoreError(
             "stored learner candidate is missing or does not match manifest",

@@ -195,7 +195,7 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 7 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 8 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
 selection, cross-fit regression, fold completion, and per-stratum interpolation
 state. The selected or seed-retained result carries its authoritative model

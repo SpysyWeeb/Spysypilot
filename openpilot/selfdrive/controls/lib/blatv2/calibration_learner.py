@@ -252,6 +252,64 @@ class CalibrationQualificationReason(StrEnum):
   CROSS_FIT_FOLD_FAILURE = "cross_fit_fold_failure"
 
 
+CALIBRATION_NODE_FAILURE_REASON_ORDER = (
+  CalibrationQualificationReason.INSUFFICIENT_SUPPORT,
+  CalibrationQualificationReason.INSUFFICIENT_EXCITATION,
+  CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE,
+  CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE,
+  CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES,
+  CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE,
+  CalibrationQualificationReason.ILL_CONDITIONED_FIT,
+  CalibrationQualificationReason.RANK_DEFICIENT_FIT,
+  CalibrationQualificationReason.SINGULAR_FIT,
+  CalibrationQualificationReason.CROSS_FIT_REGRESSION,
+  CalibrationQualificationReason.INVALID_PARAMETERS,
+)
+
+
+def calibration_node_failure_reasons(
+  *,
+  insufficient_support: bool,
+  insufficient_excitation: bool,
+  insufficient_moving_evidence: bool,
+  insufficient_breakaway_evidence: bool,
+  insufficient_independent_routes: bool,
+  cross_fit_fold_failure: bool,
+  fit_statuses: tuple[CalibrationFitStatus, ...],
+  full_fit_safe: bool,
+  parameters_valid: bool,
+) -> tuple[CalibrationQualificationReason, ...]:
+  """One ordered qualification-failure vocabulary for producer and decoder."""
+  reasons: set[CalibrationQualificationReason] = set()
+  if insufficient_support:
+    reasons.add(CalibrationQualificationReason.INSUFFICIENT_SUPPORT)
+  if insufficient_excitation:
+    reasons.add(CalibrationQualificationReason.INSUFFICIENT_EXCITATION)
+  if insufficient_moving_evidence:
+    reasons.add(CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE)
+  if insufficient_breakaway_evidence:
+    reasons.add(CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE)
+  if insufficient_independent_routes:
+    reasons.add(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
+  if cross_fit_fold_failure:
+    reasons.add(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
+  if CalibrationFitStatus.IDENTIFIABLE not in fit_statuses:
+    if CalibrationFitStatus.ILL_CONDITIONED in fit_statuses:
+      reasons.add(CalibrationQualificationReason.ILL_CONDITIONED_FIT)
+    elif CalibrationFitStatus.RANK_DEFICIENT in fit_statuses:
+      reasons.add(CalibrationQualificationReason.RANK_DEFICIENT_FIT)
+    else:
+      reasons.add(CalibrationQualificationReason.SINGULAR_FIT)
+  if not full_fit_safe:
+    reasons.add(CalibrationQualificationReason.CROSS_FIT_REGRESSION)
+  if not parameters_valid:
+    reasons.add(CalibrationQualificationReason.INVALID_PARAMETERS)
+  return tuple(
+    reason for reason in CALIBRATION_NODE_FAILURE_REASON_ORDER
+    if reason in reasons
+  )
+
+
 class CalibrationFitStatus(StrEnum):
   IDENTIFIABLE = "identifiable"
   RANK_DEFICIENT = "rank_deficient"
@@ -327,6 +385,17 @@ def _validate_augmented_gram(
   context: str,
 ) -> None:
   """Reject sufficient statistics that no weighted real rows can produce."""
+  def finite_product(*values: float) -> float:
+    result = 1.0
+    try:
+      for value in values:
+        result *= value
+    except OverflowError as exc:
+      raise ValueError(f"{context} arithmetic overflow") from exc
+    if not math.isfinite(result):
+      raise ValueError(f"{context} arithmetic overflow")
+    return result
+
   scale = max([abs(value) for value in (*normal, *rhs, target_squared)], default=1.0)
   tolerance = 512.0 * sys.float_info.epsilon * max(scale, 1.0) * (dimension + 1)
   for row in range(dimension):
@@ -336,10 +405,19 @@ def _validate_augmented_gram(
     for column in range(dimension):
       if abs(normal[row * dimension + column] - normal[column * dimension + row]) > tolerance:
         raise ValueError(f"{context} normal matrix is not symmetric")
-      bound = max(diagonal, 0.0) * max(normal[column * dimension + column], 0.0)
-      if normal[row * dimension + column] ** 2 > bound + tolerance * max(scale, 1.0):
+      bound = finite_product(
+        max(diagonal, 0.0),
+        max(normal[column * dimension + column], 0.0),
+      )
+      squared = finite_product(
+        normal[row * dimension + column],
+        normal[row * dimension + column],
+      )
+      if squared > bound + tolerance * max(scale, 1.0):
         raise ValueError(f"{context} violates predictor Cauchy bounds")
-    if rhs[row] ** 2 > max(diagonal, 0.0) * target_squared + tolerance * max(scale, 1.0):
+    rhs_squared = finite_product(rhs[row], rhs[row])
+    target_bound = finite_product(max(diagonal, 0.0), target_squared)
+    if rhs_squared > target_bound + tolerance * max(scale, 1.0):
       raise ValueError(f"{context} violates target Cauchy bounds")
 
   augmented = [0.0] * ((dimension + 1) ** 2)
@@ -355,26 +433,90 @@ def _validate_augmented_gram(
   lower = [0.0] * (augmented_dimension * augmented_dimension)
   diagonal = [0.0] * augmented_dimension
   for row in range(augmented_dimension):
-    residual = augmented[row * augmented_dimension + row] - math.fsum(
-      lower[row * augmented_dimension + k] ** 2 * diagonal[k]
-      for k in range(row)
-    )
+    try:
+      residual_terms = tuple(
+        finite_product(
+          lower[row * augmented_dimension + k],
+          lower[row * augmented_dimension + k],
+          diagonal[k],
+        )
+        for k in range(row)
+      )
+      residual = (
+        augmented[row * augmented_dimension + row]
+        - math.fsum(residual_terms)
+      )
+    except OverflowError as exc:
+      raise ValueError(f"{context} arithmetic overflow") from exc
+    if not math.isfinite(residual):
+      raise ValueError(f"{context} arithmetic overflow")
     if residual < -tolerance:
       raise ValueError(f"{context} augmented Gram matrix is not PSD")
     diagonal[row] = 0.0 if abs(residual) <= tolerance else residual
     for next_row in range(row + 1, augmented_dimension):
-      numerator = augmented[next_row * augmented_dimension + row] - math.fsum(
-        lower[next_row * augmented_dimension + k]
-        * lower[row * augmented_dimension + k]
-        * diagonal[k]
-        for k in range(row)
-      )
+      try:
+        numerator = (
+          augmented[next_row * augmented_dimension + row]
+          - math.fsum(
+            finite_product(
+              lower[next_row * augmented_dimension + k],
+              lower[row * augmented_dimension + k],
+              diagonal[k],
+            )
+            for k in range(row)
+          )
+        )
+      except OverflowError as exc:
+        raise ValueError(f"{context} arithmetic overflow") from exc
+      if not math.isfinite(numerator):
+        raise ValueError(f"{context} arithmetic overflow")
       if diagonal[row] == 0.0:
         if abs(numerator) > tolerance:
           raise ValueError(f"{context} augmented Gram nullspace is inconsistent")
         lower[next_row * augmented_dimension + row] = 0.0
       else:
         lower[next_row * augmented_dimension + row] = numerator / diagonal[row]
+
+
+def _regression_close(left: float, right: float, regression: _Regression) -> bool:
+  tolerance = (
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER
+    * sys.float_info.epsilon
+    * max(abs(left), abs(right), regression.weight_s, 1.0)
+    * max(regression.count, 1)
+  )
+  return abs(left - right) <= tolerance
+
+
+def _validate_sign_predictor(
+  regression: _Regression,
+  active_index: int | None,
+  context: str,
+) -> None:
+  """Validate the exact {-1, 0, +1} sign-predictor alphabet."""
+  for sign_index in (2, 3):
+    expected_energy = regression.weight_s if sign_index == active_index else 0.0
+    if not _regression_close(
+      regression.normal[sign_index * 4 + sign_index],
+      expected_energy,
+      regression,
+    ):
+      raise ValueError(f"{context} sign-predictor energy is invalid")
+    if sign_index == active_index:
+      continue
+    if not _regression_close(regression.rhs[sign_index], 0.0, regression):
+      raise ValueError(f"{context} inactive sign target cross term is nonzero")
+    for other in range(4):
+      if not _regression_close(
+        regression.normal[sign_index * 4 + other],
+        0.0,
+        regression,
+      ) or not _regression_close(
+        regression.normal[other * 4 + sign_index],
+        0.0,
+        regression,
+      ):
+        raise ValueError(f"{context} inactive sign cross term is nonzero")
 
 
 class _Regression:
@@ -596,6 +738,61 @@ class _JointRegression:
     return result
 
 
+def _validate_joint_sign_predictor(
+  regression: _JointRegression,
+  active_indices: tuple[int, int] | None,
+  context: str,
+) -> None:
+  """Validate interpolated sign features without assuming a node weight."""
+  tolerance = (
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER
+    * sys.float_info.epsilon
+    * max(regression.weight_s, 1.0)
+    * max(regression.count, 1)
+  )
+  active = set(() if active_indices is None else active_indices)
+  if abs(regression.rhs[3] - regression.rhs[4]) > tolerance or any(
+    abs(regression.normal[3 * 10 + index] - regression.normal[4 * 10 + index])
+    > tolerance
+    or abs(regression.normal[index * 10 + 3] - regression.normal[index * 10 + 4])
+    > tolerance
+    for index in range(10)
+  ):
+    raise ValueError(f"{context} duplicate interpolation predictors disagree")
+  try:
+    intercept_energy = math.fsum(
+      regression.normal[row * 10 + column]
+      for row in (2, 3, 4, 5)
+      for column in (2, 3, 4, 5)
+    )
+  except OverflowError as exc:
+    raise ValueError(f"{context} interpolation arithmetic overflow") from exc
+  if (
+    not math.isfinite(intercept_energy)
+    or abs(intercept_energy - regression.weight_s) > tolerance
+  ):
+    raise ValueError(f"{context} interpolation intercept energy is invalid")
+  for index in (6, 7, 8, 9):
+    if index in active:
+      continue
+    if abs(regression.rhs[index]) > tolerance or any(
+      abs(regression.normal[index * 10 + other]) > tolerance
+      or abs(regression.normal[other * 10 + index]) > tolerance
+      for other in range(10)
+    ):
+      raise ValueError(f"{context} inactive sign cross term is nonzero")
+  if active_indices is None:
+    return
+  lower, upper = active_indices
+  energy = math.fsum((
+    regression.normal[lower * 10 + lower],
+    2.0 * regression.normal[lower * 10 + upper],
+    regression.normal[upper * 10 + upper],
+  ))
+  if not math.isfinite(energy) or abs(energy - regression.weight_s) > tolerance:
+    raise ValueError(f"{context} sign-predictor energy is invalid")
+
+
 _INTERVAL_STRATA = tuple(CalibrationIntervalStratum)
 
 
@@ -622,11 +819,23 @@ class _IntervalEvidence:
     payload = _exact(raw, {stratum.value for stratum in _INTERVAL_STRATA}, context)
     result = cls()
     for stratum in _INTERVAL_STRATA:
-      setattr(
-        result,
-        stratum.value,
-        _JointRegression.decoded(payload[stratum.value], f"{context}.{stratum.value}"),
+      regression = _JointRegression.decoded(
+        payload[stratum.value],
+        f"{context}.{stratum.value}",
       )
+      _validate_joint_sign_predictor(
+        regression,
+        (6, 7)
+        if stratum in (
+          CalibrationIntervalStratum.MOVING,
+          CalibrationIntervalStratum.AUTHORITY,
+        )
+        else (8, 9)
+        if stratum is CalibrationIntervalStratum.BREAKAWAY_EPISODE
+        else None,
+        f"{context}.{stratum.value}",
+      )
+      setattr(result, stratum.value, regression)
     return result
 
 
@@ -736,6 +945,16 @@ def _subtract(whole: _Regression, *parts: _Regression) -> _Regression:
     result.target_squared -= part.target_squared
     result.weight_s -= part.weight_s
     result.count -= part.count
+  if not all(
+    math.isfinite(value)
+    for value in (
+      *result.normal,
+      *result.rhs,
+      result.target_squared,
+      result.weight_s,
+    )
+  ):
+    raise ValueError("calibration stratum arithmetic overflow")
   if result.count < 0 or result.weight_s < -1e-12:
     raise ValueError("calibration strata are not a disjoint partition")
   if result.weight_s < 0.0:
@@ -952,6 +1171,20 @@ def _decode_node_summary(raw: object, node_index: int, context: str) -> _Node:
     setattr(node, name, value)
   for name in _NODE_REGRESSION_FIELDS:
     setattr(node, name, _Regression.decoded(payload[name], f"{context}.{name}"))
+  _validate_sign_predictor(node.moving_training, 2, f"{context}.moving_training")
+  _validate_sign_predictor(node.authority_training, 2, f"{context}.authority_training")
+  _validate_sign_predictor(node.breakaway_training, 3, f"{context}.breakaway_training")
+  _validate_sign_predictor(
+    node.breakaway_episode_training,
+    3,
+    f"{context}.breakaway_episode_training",
+  )
+  base_training = _subtract(
+    node.training,
+    node.moving_training,
+    node.breakaway_training,
+  )
+  _validate_sign_predictor(base_training, None, f"{context}.base_training")
   if node.fit_count != node.training.count:
     raise ValueError(f"{context} fit counts are inconsistent")
   if node.authority_fit_count != node.authority_training.count:
@@ -1097,6 +1330,7 @@ class CalibrationNodeQualificationReport:
   cross_fit_diagnostics: tuple[CalibrationCrossFitModelDiagnostic, ...] = ()
   full_fit_diagnostic: CalibrationModelFitDiagnostic | None = None
   unresolved_diagnostics: tuple[CalibrationQualificationReason, ...] = ()
+  full_fit_stratum_paired_losses: tuple[CalibrationPairedLossDiagnostic, ...] = ()
 
   @property
   def qualified(self) -> bool:
@@ -2985,22 +3219,26 @@ class CalibrationProfileLearner:
     route_counts = _independent_route_counts(routes, index)
     reasons: list[CalibrationQualificationReason] = []
     unresolved: list[CalibrationQualificationReason] = []
-    if node.clean_support_s < minimum:
+    insufficient_support = node.clean_support_s < minimum
+    if insufficient_support:
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_SUPPORT)
-    if (
+    insufficient_excitation = (
       lat_span < MIN_LATERAL_ACCEL_SPAN_MPS2
       or lat_rms < MIN_LATERAL_ACCEL_RMS_MPS2
       or torque_span < MIN_APPLIED_TORQUE_SPAN
       or node.lateral_accel_direction_mask != 3
       or node.applied_torque_direction_mask != 3
-    ):
+    )
+    if insufficient_excitation:
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_EXCITATION)
-    if node.moving_training.count < MIN_STRATUM_TRAINING_ROWS:
+    insufficient_moving = node.moving_training.count < MIN_STRATUM_TRAINING_ROWS
+    if insufficient_moving:
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE)
-    if (
+    insufficient_breakaway = (
       node.breakaway_training.count < MIN_STRATUM_TRAINING_ROWS
       or node.breakaway_episode_training.count < MIN_STRATUM_TRAINING_ROWS
-    ):
+    )
+    if insufficient_breakaway:
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE)
 
     required_counts = (
@@ -3010,6 +3248,9 @@ class CalibrationProfileLearner:
       route_counts.breakaway,
       route_counts.breakaway_episode,
     )
+    insufficient_independent = any(
+      count < MIN_INDEPENDENT_ROUTES for count in required_counts
+    ) or 0 < route_counts.authority < MIN_INDEPENDENT_ROUTES
     if any(count < MIN_INDEPENDENT_ROUTES for count in required_counts):
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
       unresolved.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
@@ -3042,6 +3283,7 @@ class CalibrationProfileLearner:
     if selected_cross_fit is None and not complete_cross_fit:
       reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
       unresolved.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
+    cross_fit_fold_failure = selected_cross_fit is None and not complete_cross_fit
 
     include_authority = route_counts.authority > 0
     full_fit_results = tuple(
@@ -3087,13 +3329,16 @@ class CalibrationProfileLearner:
     seed_retained = selected_cross_fit is None and bool(complete_cross_fit)
     coefficients = seed_coefficients
     full_fit_diagnostic: CalibrationModelFitDiagnostic | None = None
+    full_fit_safe = True
+    full_fit_stratum_losses: tuple[CalibrationPairedLossDiagnostic, ...] = ()
     if selected_full_fit is not None:
       _, fitted, full_fit_diagnostic = selected_full_fit
       if fitted is None or full_fit_diagnostic.status is not CalibrationFitStatus.IDENTIFIABLE:
         reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
+        cross_fit_fold_failure = True
       elif not seed_retained:
         coefficients = fitted
-        full_fit_safe, _ = _safe_on_route_strata(
+        full_fit_safe, full_fit_stratum_losses = _safe_on_route_strata(
           routes,
           index,
           fields,
@@ -3107,13 +3352,14 @@ class CalibrationProfileLearner:
     gain, intercept, kinetic, static = coefficients
     offset = intercept / gain if gain != 0.0 else math.inf
     offset_bound = max(1.0, lat_span)
-    if (
+    parameters_valid = not (
       not all(math.isfinite(value) for value in (*coefficients, offset))
       or gain <= 0.0
       or static < kinetic
       or kinetic < 0.0
       or abs(offset) > offset_bound
-    ):
+    )
+    if not parameters_valid:
       reasons.append(CalibrationQualificationReason.INVALID_PARAMETERS)
 
     all_evidence = node.training
@@ -3142,7 +3388,17 @@ class CalibrationProfileLearner:
       ),
       qualified=False,
     )
-    unique = tuple(dict.fromkeys(reasons))
+    unique = calibration_node_failure_reasons(
+      insufficient_support=insufficient_support,
+      insufficient_excitation=insufficient_excitation,
+      insufficient_moving_evidence=insufficient_moving,
+      insufficient_breakaway_evidence=insufficient_breakaway,
+      insufficient_independent_routes=insufficient_independent,
+      cross_fit_fold_failure=cross_fit_fold_failure,
+      fit_statuses=tuple(diagnostic.status for diagnostic in fit_diagnostics),
+      full_fit_safe=full_fit_safe,
+      parameters_valid=parameters_valid,
+    )
     qualified = not unique
     outcome = (
       CalibrationQualificationReason.SEED_RETAINED
@@ -3242,6 +3498,7 @@ class CalibrationProfileLearner:
       cross_fit_diagnostics=tuple(family.diagnostic for family in cross_fit_families),
       full_fit_diagnostic=full_fit_diagnostic,
       unresolved_diagnostics=tuple(dict.fromkeys(unresolved)),
+      full_fit_stratum_paired_losses=full_fit_stratum_losses,
     )
   def qualify(self, provenance: str) -> CalibrationLearningResult:
     if self._route_active:
