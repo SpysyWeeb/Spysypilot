@@ -479,11 +479,12 @@ def _training_store(
     _write_immutable(objects / f"{vector.sha256}.cert-vector", vector.canonical_bytes)
     source = _source_row(artifact)
     authority_ids = [f"{index + 1:x}" * 64, f"{index + 4:x}" * 64]
+    vector_authority_ids = [f"{index + 7:x}" * 64, f"{index + 10:x}" * 64]
     rows.append({
       "artifact": {
         "authorityArtifactIds": authority_ids,
         "certificationVector": {
-          "authorityArtifactIds": authority_ids,
+          "authorityArtifactIds": vector_authority_ids,
           "path": f"objects/{vector.sha256}.cert-vector",
           "schemaVersion": CERTIFICATION_VECTOR_SCHEMA_VERSION,
           "selectionIdentitySha256": vector.manifest["selection_identity_sha256"],

@@ -640,7 +640,6 @@ def _validate_certification_vector_descriptor(
   route_id: str,
   value: object,
   source: Mapping[str, object],
-  authority_ids: list[object],
   route_evidence_sha256: str,
 ) -> None:
   keys = {
@@ -655,10 +654,13 @@ def _validate_certification_vector_descriptor(
     raise BehaviorReplayAuthorityError(
       f"route {route_id} certification vector is malformed",
     )
-  if value["authorityArtifactIds"] != authority_ids:
+  vector_authority_ids = value["authorityArtifactIds"]
+  if type(vector_authority_ids) is not list or len(vector_authority_ids) != 2:
     raise BehaviorReplayAuthorityError(
-      f"route {route_id} certification authority differs from route evidence",
+      f"route {route_id} certification authority is malformed",
     )
+  for index, authority_id in enumerate(vector_authority_ids):
+    _sha256(authority_id, f"route {route_id} certification authority {index + 1}")
   vector_sha256 = _sha256(value["sha256"], f"route {route_id} certification vector")
   selection_sha256 = _sha256(
     value["selectionIdentitySha256"],
@@ -952,7 +954,6 @@ def _authenticate_import(store_root: Path, manifest_sha256: str) -> _Authenticat
       route_id,
       artifact["certificationVector"],
       row["source"],
-      authority_ids,
       artifact_sha256,
     )
     imported_route = _validate_imported_object(

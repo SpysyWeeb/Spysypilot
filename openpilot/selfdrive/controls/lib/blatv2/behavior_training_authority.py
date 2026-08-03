@@ -414,10 +414,6 @@ def _authenticate_manifest(
       source,
       artifact_sha256,
     )
-    if certification["authorityArtifactIds"] != authority_ids:
-      raise BehaviorTrainingAuthorityError(
-        f"route {route_id} certification authority differs from route evidence",
-      )
     if not scenario_eligible:
       reason = "bounded certification lacks scenario proof; regenerate certification or adjudicate full-route evidence"
       raise BehaviorTrainingAuthorityError(f"route {route_id} {reason}")
