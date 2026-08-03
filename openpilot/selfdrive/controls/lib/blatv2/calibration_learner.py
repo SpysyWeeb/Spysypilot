@@ -14,7 +14,7 @@ by a same-direction rate quantum. Later moving rows identify kinetic motion.
 
 Inputs are the measured-only :class:`learner.LearningSample`. Slew build and
 release frames are authority evidence but never equality-fit. Evidence schema
-13 is deliberately incompatible with older evidence. Route uncertainty is
+14 is deliberately incompatible with older evidence. Route uncertainty is
 bound to immutable route/content identities and per-route sufficient
 statistics. The canonical route counter remains provenance only; it never
 assigns a statistical role. Every route supplied here already belongs to the
@@ -31,7 +31,7 @@ accepted nor representable by this learner.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 import hashlib
 import hmac
@@ -50,6 +50,9 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
   VehicleCalibrationProfile,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
   ActuatorBoundary,
   LearningSample,
@@ -61,7 +64,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 13
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 14
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_INDEPENDENT_ROUTES = 2
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
@@ -296,6 +299,17 @@ class CalibrationIndependentRouteCounts:
 
 
 @dataclass(frozen=True, slots=True)
+class CalibrationRouteCommitment:
+  route_index: int
+  route_counter: int
+  route_identity_sha256: str
+  route_content_sha256: str
+  assignment_record_count: int
+  assignment_chain_sha256: str
+  route_commitment_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class CalibrationCrossFitModelDiagnostic:
   model: CalibrationModelId
   status: CalibrationCrossFitStatus
@@ -303,6 +317,64 @@ class CalibrationCrossFitModelDiagnostic:
   successful_fold_count: int
   failed_fold_count: int
   paired_loss: CalibrationPairedLossDiagnostic
+
+
+def _validate_augmented_gram(
+  normal: list[float],
+  rhs: list[float],
+  target_squared: float,
+  dimension: int,
+  context: str,
+) -> None:
+  """Reject sufficient statistics that no weighted real rows can produce."""
+  scale = max([abs(value) for value in (*normal, *rhs, target_squared)], default=1.0)
+  tolerance = 512.0 * sys.float_info.epsilon * max(scale, 1.0) * (dimension + 1)
+  for row in range(dimension):
+    diagonal = normal[row * dimension + row]
+    if diagonal < -tolerance:
+      raise ValueError(f"{context} has a negative predictor energy")
+    for column in range(dimension):
+      if abs(normal[row * dimension + column] - normal[column * dimension + row]) > tolerance:
+        raise ValueError(f"{context} normal matrix is not symmetric")
+      bound = max(diagonal, 0.0) * max(normal[column * dimension + column], 0.0)
+      if normal[row * dimension + column] ** 2 > bound + tolerance * max(scale, 1.0):
+        raise ValueError(f"{context} violates predictor Cauchy bounds")
+    if rhs[row] ** 2 > max(diagonal, 0.0) * target_squared + tolerance * max(scale, 1.0):
+      raise ValueError(f"{context} violates target Cauchy bounds")
+
+  augmented = [0.0] * ((dimension + 1) ** 2)
+  augmented_dimension = dimension + 1
+  for row in range(dimension):
+    for column in range(dimension):
+      augmented[row * augmented_dimension + column] = normal[row * dimension + column]
+    augmented[row * augmented_dimension + dimension] = rhs[row]
+    augmented[dimension * augmented_dimension + row] = rhs[row]
+  augmented[-1] = target_squared
+  # Deterministic LDL without pivoting. For a PSD matrix a zero pivot must
+  # have a zero residual row, so no platform-dependent eigen solver is needed.
+  lower = [0.0] * (augmented_dimension * augmented_dimension)
+  diagonal = [0.0] * augmented_dimension
+  for row in range(augmented_dimension):
+    residual = augmented[row * augmented_dimension + row] - math.fsum(
+      lower[row * augmented_dimension + k] ** 2 * diagonal[k]
+      for k in range(row)
+    )
+    if residual < -tolerance:
+      raise ValueError(f"{context} augmented Gram matrix is not PSD")
+    diagonal[row] = 0.0 if abs(residual) <= tolerance else residual
+    for next_row in range(row + 1, augmented_dimension):
+      numerator = augmented[next_row * augmented_dimension + row] - math.fsum(
+        lower[next_row * augmented_dimension + k]
+        * lower[row * augmented_dimension + k]
+        * diagonal[k]
+        for k in range(row)
+      )
+      if diagonal[row] == 0.0:
+        if abs(numerator) > tolerance:
+          raise ValueError(f"{context} augmented Gram nullspace is inconsistent")
+        lower[next_row * augmented_dimension + row] = 0.0
+      else:
+        lower[next_row * augmented_dimension + row] = numerator / diagonal[row]
 
 
 class _Regression:
@@ -367,6 +439,18 @@ class _Regression:
       raise ValueError(f"{context} has inconsistent support")
     if result.count == 0 and any(value != 0.0 for value in (*normal, *rhs, result.target_squared)):
       raise ValueError(f"{context} empty statistics are nonzero")
+    _validate_augmented_gram(
+      result.normal,
+      result.rhs,
+      result.target_squared,
+      4,
+      context,
+    )
+    tolerance = 512.0 * sys.float_info.epsilon * max(result.weight_s, 1.0)
+    if abs(result.normal[5] - result.weight_s) > tolerance:
+      raise ValueError(f"{context} intercept energy disagrees with support")
+    if abs(result.normal[11]) > tolerance:
+      raise ValueError(f"{context} moving and breakaway predictors overlap")
     return result
 
 
@@ -502,6 +586,13 @@ class _JointRegression:
       for value in (*result.normal, *result.rhs, result.target_squared)
     ):
       raise ValueError(f"{context} empty statistics are nonzero")
+    _validate_augmented_gram(
+      result.normal,
+      result.rhs,
+      result.target_squared,
+      10,
+      context,
+    )
     return result
 
 
@@ -611,6 +702,10 @@ class _RouteEvidence:
   source_accounting: _RouteSourceAccounting
   nodes: tuple[_Node, ...]
   intervals: tuple[_IntervalEvidence, ...]
+  assignment_record_count: int
+  assignment_chain_sha256: str
+  route_commitment_sha256: str
+  non_authoritative_record_count: int
 
 
 def _combine(*parts: _Regression) -> _Regression:
@@ -768,7 +863,7 @@ def _aggregate_nodes(parts: tuple[_Node, ...]) -> _Node:
   result.torque_max = max(finite_torque_max, default=-math.inf)
   for name in _NODE_REGRESSION_FIELDS:
     setattr(result, name, _combine(*(getattr(part, name) for part in parts)))
-  # Schema 12 has no parity/global-validation population or persisted route
+  # Schema 14 has no parity/global-validation population or persisted route
   # transient. These fields remain empty only for compatibility with internal
   # helpers shared by the live accumulator.
   return result
@@ -802,6 +897,33 @@ def _encode_node_summary(node: _Node, node_index: int) -> dict[str, Any]:
   for name in _NODE_REGRESSION_FIELDS:
     result[name] = getattr(node, name).encoded()
   return result
+
+
+def _route_commitment_payload(
+  route: _RouteEvidence,
+) -> dict[str, object]:
+  """Bounded replay commitment; embedded values are structural, not trust."""
+  return {
+    "assignment_chain_sha256": route.assignment_chain_sha256,
+    "assignment_record_count": route.assignment_record_count,
+    "intervals": [interval.encoded() for interval in route.intervals],
+    "nodes": [
+      _encode_node_summary(node, index)
+      for index, node in enumerate(route.nodes)
+    ],
+    "non_authoritative_record_count": route.non_authoritative_record_count,
+    "route_content_sha256": route.route_content_sha256,
+    "route_counter": route.route_counter,
+    "route_identity_sha256": route.route_identity_sha256,
+    "source_accounting": route.source_accounting.encoded(),
+  }
+
+
+def _route_commitment(route: _RouteEvidence) -> str:
+  return hashlib.sha256(
+    b"blatv2-calibration-route-commitment-v1\0"
+    + _canonical(_route_commitment_payload(route))
+  ).hexdigest()
 
 
 def _decode_node_summary(raw: object, node_index: int, context: str) -> _Node:
@@ -911,7 +1033,7 @@ class CalibrationNodeEvidenceSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class CalibrationNodeQualificationReport:
-  """Schema-12 full-fit result plus route-grouped cross-fit diagnostics."""
+  """Schema-14 full-fit result plus route-grouped cross-fit diagnostics."""
   node_index: int
   speed_mps: float
   minimum_support_s: float
@@ -1620,6 +1742,21 @@ def _canonical_routes(routes: tuple[_RouteEvidence, ...]) -> tuple[_RouteEvidenc
   ))
 
 
+def _canonical_committed_routes(
+  routes: tuple[_RouteEvidence, ...],
+) -> tuple[_RouteEvidence, ...]:
+  committed: list[_RouteEvidence] = []
+  for route_index, route in enumerate(_canonical_routes(routes)):
+    canonical = replace(
+      route,
+      route_index=route_index,
+      route_commitment_sha256="",
+    )
+    canonical.route_commitment_sha256 = _route_commitment(canonical)
+    committed.append(canonical)
+  return tuple(committed)
+
+
 def _route_node_regression(
   route: _RouteEvidence,
   node_index: int,
@@ -2100,6 +2237,13 @@ class CalibrationProfileLearner:
     self._active_route_source_accounting: _RouteSourceAccounting | None = None
     self._active_route_nodes: tuple[_Node, ...] | None = None
     self._active_route_intervals: tuple[_IntervalEvidence, ...] | None = None
+    self._active_assignment_count = 0
+    self._active_assignment_chain = b""
+    self._active_last_coordinate: CalibrationIngestionCoordinate | None = None
+    self._active_non_authoritative_count = 0
+    self._last_assignment_category = ""
+    self._last_assignment_episode: BreakawayEpisode | None = None
+    self._restore_authoritative = True
 
   @property
   def speed_nodes_mps(self) -> tuple[float, ...]:
@@ -2115,6 +2259,28 @@ class CalibrationProfileLearner:
         self._sample_disposition_counts[_SAMPLE_DISPOSITION_INDEX[disposition]]
         for disposition in _REJECTED_SAMPLE_DISPOSITIONS
       ),
+    )
+
+  @property
+  def route_commitments(self) -> tuple[CalibrationRouteCommitment, ...]:
+    """Bounded structural commitments for independent authenticated replay."""
+    return tuple(
+      CalibrationRouteCommitment(
+        route.route_index,
+        route.route_counter,
+        route.route_identity_sha256,
+        route.route_content_sha256,
+        route.assignment_record_count,
+        route.assignment_chain_sha256,
+        route.route_commitment_sha256,
+      )
+      for route in _canonical_committed_routes(tuple(self._routes))
+    )
+
+  @property
+  def evidence_authoritative(self) -> bool:
+    return self._restore_authoritative and not any(
+      route.non_authoritative_record_count for route in self._routes
     )
 
   def evidence_for_node(self, index: int) -> CalibrationNodeEvidenceSnapshot:
@@ -2210,6 +2376,17 @@ class CalibrationProfileLearner:
     self._active_route_intervals = tuple(
       _IntervalEvidence() for _ in range(len(self._nodes) - 1)
     )
+    self._active_assignment_count = 0
+    self._active_assignment_chain = hashlib.sha256(
+      b"blatv2-calibration-assignment-chain-v1\0"
+      + _canonical({
+        "route_content_sha256": route_content,
+        "route_counter": counter,
+        "route_identity_sha256": route_identity,
+      })
+    ).digest()
+    self._active_last_coordinate = None
+    self._active_non_authoritative_count = 0
     self._route_active = True
 
   def end_route(self) -> None:
@@ -2224,8 +2401,7 @@ class CalibrationProfileLearner:
       raise AssertionError("active calibration route lacks immutable identity")
     if self._active_route_counter is None:
       raise AssertionError("active calibration route lacks canonical counter")
-    self._routes.append(
-      _RouteEvidence(
+    route = _RouteEvidence(
         route_index=len(self._routes),
         route_counter=self._active_route_counter,
         route_identity_sha256=self._active_route_identity_sha256,
@@ -2233,8 +2409,13 @@ class CalibrationProfileLearner:
         source_accounting=route_source_accounting,
         nodes=route_nodes,
         intervals=route_intervals,
+        assignment_record_count=self._active_assignment_count,
+        assignment_chain_sha256=self._active_assignment_chain.hex(),
+        route_commitment_sha256="",
+        non_authoritative_record_count=self._active_non_authoritative_count,
       )
-    )
+    route.route_commitment_sha256 = _route_commitment(route)
+    self._routes.append(route)
     self.reset_route_transients()
     self._active_route_nodes = None
     self._active_route_source_accounting = None
@@ -2242,6 +2423,10 @@ class CalibrationProfileLearner:
     self._active_route_counter = None
     self._active_route_identity_sha256 = None
     self._active_route_content_sha256 = None
+    self._active_assignment_count = 0
+    self._active_assignment_chain = b""
+    self._active_last_coordinate = None
+    self._active_non_authoritative_count = 0
     self._route_active = False
 
   def _add_regression(
@@ -2256,7 +2441,7 @@ class CalibrationProfileLearner:
     if route_nodes is None:
       raise AssertionError("calibration route regression lacks active route")
     if "validation" in aggregate_field:
-      raise AssertionError("schema-13 learner cannot accumulate validation rows")
+      raise AssertionError("schema-14 learner cannot accumulate validation rows")
     getattr(route_nodes[node_index], aggregate_field).add(
       predictors, target, weight
     )
@@ -2353,11 +2538,14 @@ class CalibrationProfileLearner:
   def _add_sample_without_accounting(
     self,
     sample: LearningSample,
+    source_coordinate: CalibrationIngestionCoordinate | None,
   ) -> CalibrationSampleDisposition:
     if not isinstance(sample, LearningSample):
       raise TypeError("calibration learner accepts LearningSample only")
     if not self._route_active:
       raise RuntimeError("calibration sample has no pinned route partition")
+    self._last_assignment_category = "rejected"
+    self._last_assignment_episode = None
     if not sample.valid or not sample.engaged or sample.steering_pressed or sample.standstill:
       self.reset_route_transients()
       return CalibrationSampleDisposition.LEARNER_INELIGIBLE
@@ -2406,8 +2594,10 @@ class CalibrationProfileLearner:
           sample.dt_s,
         )
         route_source_accounting.authority_fit += 1
+        self._last_assignment_category = "authority_fit"
       else:
         route_source_accounting.authority_unresolved += 1
+        self._last_assignment_category = "authority_unresolved"
       accepted = False
       for node_index, node_weight in self._supports(sample.speed_mps):
         node = route_nodes[node_index]
@@ -2457,9 +2647,12 @@ class CalibrationProfileLearner:
         seed_at_speed.rack_rate_resolution_deg_s
       ),
       transport_delay_s=seed_at_speed.transport_delay_s,
+      source_coordinate=source_coordinate,
     )
     category = decision.category.value
     episode = decision.episode
+    self._last_assignment_category = category
+    self._last_assignment_episode = episode
     if category == "discarded":
       for node in route_nodes:
         self._reset_node(node)
@@ -2622,6 +2815,7 @@ class CalibrationProfileLearner:
     self,
     sample: LearningSample,
     *,
+    source_coordinate: CalibrationIngestionCoordinate | None = None,
     upstream_rejection: CalibrationSampleDisposition | None = None,
   ) -> CalibrationSampleDisposition:
     """Accumulate one frame and durably record exactly one first cause."""
@@ -2635,6 +2829,8 @@ class CalibrationProfileLearner:
       raise TypeError("calibration learner accepts LearningSample only")
     if not self._route_active:
       raise RuntimeError("calibration sample has no pinned route partition")
+    self._last_assignment_category = "rejected"
+    self._last_assignment_episode = None
     if upstream_rejection is not None:
       # Runtime first-cause classification is authoritative. An upstream
       # failure resets physical continuity and never reaches accumulation,
@@ -2643,12 +2839,130 @@ class CalibrationProfileLearner:
       self._sample_disposition_counts[
         _SAMPLE_DISPOSITION_INDEX[upstream_rejection]
       ] += 1
+      self._commit_assignment(sample, upstream_rejection, source_coordinate)
       return upstream_rejection
-    learner_disposition = self._add_sample_without_accounting(sample)
+    learner_disposition = self._add_sample_without_accounting(
+      sample,
+      source_coordinate,
+    )
     self._sample_disposition_counts[
       _SAMPLE_DISPOSITION_INDEX[learner_disposition]
     ] += 1
-    return learner_disposition
+    disposition = learner_disposition
+    self._commit_assignment(sample, disposition, source_coordinate)
+    return disposition
+
+  def _commit_assignment(
+    self,
+    sample: LearningSample,
+    disposition: CalibrationSampleDisposition,
+    source_coordinate: CalibrationIngestionCoordinate | None,
+  ) -> None:
+    if source_coordinate is None:
+      self._active_non_authoritative_count += 1
+      return
+    if source_coordinate.route_content_sha256 != self._active_route_content_sha256:
+      raise ValueError("calibration source coordinate belongs to another route")
+    if (
+      self._active_last_coordinate is not None
+      and source_coordinate.ordering_key
+      <= self._active_last_coordinate.ordering_key
+    ):
+      raise ValueError("calibration source coordinates are duplicate or unordered")
+    self._active_last_coordinate = source_coordinate
+    accepted = disposition is CalibrationSampleDisposition.ACCEPTED
+    category = self._last_assignment_category if accepted else disposition.value
+    episode = self._last_assignment_episode if accepted else None
+    support_speed = episode.onset_speed_mps if episode is not None else sample.speed_mps
+    node_supports = self._supports(support_speed) if accepted else ()
+    contributes_interval = category in (
+      "authority_fit",
+      "base",
+      "breakaway",
+      "moving",
+    )
+    interval_support = (
+      self._interval_support(support_speed)
+      if accepted and contributes_interval
+      else None
+    )
+
+    def node_contribution(index: int, node_weight: float) -> dict[str, object]:
+      support_weight = sample.dt_s * node_weight
+      training_weight: float | None = support_weight
+      episode_weight: float | None = None
+      if category in ("authority_unresolved", "pending"):
+        training_weight = None
+      elif category == "breakaway":
+        if episode is None:
+          raise AssertionError("breakaway category lacks a complete episode")
+        training_weight = episode.first_motion.dt_s * node_weight
+        episode_weight = node_weight
+      return {
+        "episode_training_weight": (
+          None if episode_weight is None else episode_weight.hex()
+        ),
+        "node_index": index,
+        "node_weight": node_weight.hex(),
+        "support_weight": support_weight.hex(),
+        "training_weight": (
+          None if training_weight is None else training_weight.hex()
+        ),
+      }
+
+    payload: dict[str, object] = {
+      "actuator_boundary": int(sample.actuator_boundary),
+      "actuator_constrained": bool(sample.actuator_constrained),
+      "category": category,
+      "coordinate": source_coordinate.payload(),
+      "disposition": disposition.value,
+      "interval_contribution": (
+        {
+          "interval_index": interval_support[0],
+          "upper_weight": interval_support[1].hex(),
+          "weight": (
+            (1.0 if category == "breakaway" else sample.dt_s).hex()
+          ),
+        }
+        if interval_support is not None
+        else None
+      ),
+      "magnitude_boundary_dwell_s": sample.magnitude_boundary_dwell_s.hex(),
+      "node_contributions": [
+        node_contribution(index, weight)
+        for index, weight in node_supports
+      ],
+      "physical": {
+        "applied_torque": sample.applied_torque.hex(),
+        "dt_s": sample.dt_s.hex(),
+        "measured_lateral_accel_mps2": sample.measured_lateral_accel_mps2.hex(),
+        "measured_rack_angle_deg": sample.measured_rack_angle_deg.hex(),
+        "rack_acceleration_deg_s2": sample.rack_acceleration_deg_s2.hex(),
+        "rack_rate_deg_s": sample.rack_rate_deg_s.hex(),
+        "speed_mps": sample.speed_mps.hex(),
+      },
+    }
+    if episode is not None:
+      coordinates = (
+        episode.last_stuck.source_coordinate,
+        episode.first_motion.source_coordinate,
+        episode.rate_confirmation.source_coordinate,
+      )
+      if any(coordinate is None for coordinate in coordinates):
+        raise ValueError("authoritative breakaway lacks endpoint coordinates")
+      payload["breakaway_coordinates"] = [
+        coordinate.payload()
+        for coordinate in coordinates
+        if coordinate is not None
+      ]
+    else:
+      payload["breakaway_coordinates"] = None
+    self._active_assignment_chain = hashlib.sha256(
+      b"blatv2-calibration-assignment-record-v1\0"
+      + self._active_assignment_chain
+      + _canonical(payload)
+    ).digest()
+    self._active_assignment_count += 1
 
   def add_sample(self, sample: LearningSample) -> bool:
     """Compatibility wrapper for callers that need only accepted/rejected."""
@@ -3113,10 +3427,11 @@ class CalibrationProfileLearner:
     )
 
   def export_evidence(self) -> bytes:
+    """Serialize structurally validated evidence without claiming authority."""
     if self._route_active:
       raise RuntimeError("active route evidence cannot be exported")
     seed_json = self.seed_profile.to_json()
-    canonical_routes = _canonical_routes(tuple(self._routes))
+    canonical_routes = _canonical_committed_routes(tuple(self._routes))
     aggregate_nodes = tuple(
       _aggregate_nodes(tuple(route.nodes[index] for route in canonical_routes))
       for index in range(len(self.seed_profile.nodes))
@@ -3137,6 +3452,10 @@ class CalibrationProfileLearner:
           for node_index, route_node in enumerate(route.nodes)
         ],
         "intervals": [interval.encoded() for interval in route.intervals],
+        "assignment_record_count": route.assignment_record_count,
+        "assignment_chain_sha256": route.assignment_chain_sha256,
+        "route_commitment_sha256": route.route_commitment_sha256,
+        "non_authoritative_record_count": route.non_authoritative_record_count,
       }
       for route_index, route in enumerate(canonical_routes)
     ]
@@ -3154,8 +3473,23 @@ class CalibrationProfileLearner:
     envelope = {"payload": payload, "payload_sha256": hashlib.sha256(_canonical(payload)).hexdigest()}
     return _canonical(envelope)
 
+  def export_authoritative_evidence(self) -> bytes:
+    """Export only evidence backed by authenticated historical coordinates."""
+    if not self.evidence_authoritative:
+      raise RuntimeError(
+        "non-authoritative live calibration rows cannot publish offline evidence"
+      )
+    return self.export_evidence()
+
   @classmethod
-  def from_evidence(cls, seed_profile: VehicleCalibrationProfile, encoded: bytes) -> CalibrationProfileLearner:
+  def from_evidence(
+    cls,
+    seed_profile: VehicleCalibrationProfile,
+    encoded: bytes,
+    *,
+    expected_route_commitments: tuple[tuple[str, str], ...] | None = None,
+  ) -> CalibrationProfileLearner:
+    """Restore evidence; only external expected commitments confer authority."""
     if type(encoded) is not bytes:
       raise TypeError("calibration evidence must be bytes")
     try:
@@ -3213,6 +3547,18 @@ class CalibrationProfileLearner:
     raw_routes = payload["routes"]
     if type(raw_routes) is not list:
       raise ValueError("calibration route statistics must be a list")
+    raw_route_keys = tuple(
+      (
+        raw.get("route_identity_sha256"),
+        raw.get("route_content_sha256"),
+        raw.get("route_counter"),
+      )
+      if type(raw) is dict
+      else (None, None, None)
+      for raw in raw_routes
+    )
+    if raw_route_keys != tuple(sorted(raw_route_keys)):
+      raise ValueError("calibration routes are not in canonical identity order")
     for route_index, raw_route in enumerate(raw_routes):
       route_payload = _exact(
         raw_route,
@@ -3224,6 +3570,10 @@ class CalibrationProfileLearner:
           "source_accounting",
           "nodes",
           "intervals",
+          "assignment_record_count",
+          "assignment_chain_sha256",
+          "route_commitment_sha256",
+          "non_authoritative_record_count",
         },
         f"routes[{route_index}]",
       )
@@ -3241,6 +3591,23 @@ class CalibrationProfileLearner:
       source_accounting = _RouteSourceAccounting.decoded(
         route_payload["source_accounting"],
         f"routes[{route_index}].source_accounting",
+      )
+      assignment_record_count = route_payload["assignment_record_count"]
+      non_authoritative_count = route_payload["non_authoritative_record_count"]
+      if (
+        type(assignment_record_count) is not int
+        or assignment_record_count < 0
+        or type(non_authoritative_count) is not int
+        or non_authoritative_count < 0
+      ):
+        raise ValueError("calibration route assignment counts are invalid")
+      assignment_chain = _route_sha256(
+        route_payload["assignment_chain_sha256"],
+        "assignment chain",
+      )
+      route_commitment = _route_sha256(
+        route_payload["route_commitment_sha256"],
+        "route commitment",
       )
       if any(
         route.route_counter == route_counter
@@ -3282,9 +3649,32 @@ class CalibrationProfileLearner:
         source_accounting=source_accounting,
         nodes=route_nodes,
         intervals=route_intervals,
+        assignment_record_count=assignment_record_count,
+        assignment_chain_sha256=assignment_chain,
+        route_commitment_sha256=route_commitment,
+        non_authoritative_record_count=non_authoritative_count,
       )
       _validate_interval_conservation(route)
       learner._routes.append(route)
+    actual_commitments = tuple(
+      (route.route_identity_sha256, route.route_commitment_sha256)
+      for route in learner._routes
+    )
+    if expected_route_commitments is not None:
+      if (
+        type(expected_route_commitments) is not tuple
+        or any(
+          type(item) is not tuple or len(item) != 2
+          for item in expected_route_commitments
+        )
+        or expected_route_commitments != actual_commitments
+      ):
+        raise ValueError("calibration expected route commitments are incomplete or reordered")
+      if any(route.non_authoritative_record_count for route in learner._routes):
+        raise ValueError("non-authoritative calibration rows cannot be authenticated")
+      learner._restore_authoritative = True
+    else:
+      learner._restore_authoritative = False
 
     canonical_keys = tuple(
       (
@@ -3308,6 +3698,20 @@ class CalibrationProfileLearner:
       sample_accounting.accepted_sample_count
     ):
       raise ValueError("calibration route source accounting disagrees with accepted samples")
+    if any(
+      route.source_accounting.accepted
+      > route.assignment_record_count + route.non_authoritative_record_count
+      for route in learner._routes
+    ) or sum(
+      route.assignment_record_count + route.non_authoritative_record_count
+      for route in learner._routes
+    ) != sample_accounting.ingested_sample_count:
+      raise ValueError("calibration route assignment accounting is incomplete")
+    if any(
+      not hmac.compare_digest(route.route_commitment_sha256, _route_commitment(route))
+      for route in learner._routes
+    ):
+      raise ValueError("calibration route commitment disagrees with evidence")
 
     reconstructed_nodes = tuple(
       _aggregate_nodes(tuple(route.nodes[index] for route in learner._routes))

@@ -25,6 +25,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationQualificationReason,
   CalibrationSampleAccounting,
   CalibrationSampleDisposition,
+  MIN_STRATUM_TRAINING_ROWS,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
@@ -326,7 +327,7 @@ def _baseline() -> DriveEvidenceBaseline:
   return DriveEvidenceBaseline.from_support_diagnostics(diagnostics)
 
 
-def test_schema_v6_roundtrip_identity_observable_parameters_and_deltas() -> None:
+def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None:
   runtime, finalization = _fixtures()
   baseline = _baseline()
   payload = build_learning_status_payload(
@@ -340,7 +341,7 @@ def test_schema_v6_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 6
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 7
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -399,6 +400,7 @@ def test_fully_evaluated_cross_fit_regression_is_not_reported_as_pending() -> No
       report,
       reasons=(CalibrationQualificationReason.CROSS_FIT_REGRESSION,),
       selection_outcome=CalibrationQualificationReason.LEARNED,
+      breakaway_episode_full_fit_count=MIN_STRATUM_TRAINING_ROWS,
     )
     for report in finalization.learning_result.node_reports
   )
@@ -533,7 +535,7 @@ def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None
     validate_learning_status_payload(missing_proof)
 
 
-def test_schema_v6_rejects_cross_fit_semantic_tampering() -> None:
+def test_schema_v7_rejects_cross_fit_semantic_tampering() -> None:
   test_case = unittest.TestCase()
   runtime, finalization = _fixtures()
   payload = build_learning_status_payload(
@@ -615,7 +617,7 @@ def test_schema_v6_rejects_cross_fit_semantic_tampering() -> None:
   node_reason["nodes"][0]["reasons"] = [
     CalibrationQualificationReason.SINGULAR_FIT.value
   ]
-  with test_case.assertRaisesRegex(ValueError, "evaluation status contradicts reasons"):
+  with test_case.assertRaisesRegex(ValueError, "reasons contradict carried evidence"):
     validate_learning_status_payload(node_reason)
 
 
@@ -656,6 +658,53 @@ def test_candidate_identity_requires_every_node_qualified() -> None:
       runtime_bundle=runtime,
       drive_baseline=None,
     )
+
+
+def test_unqualified_reason_set_is_derived_from_carried_prerequisites() -> None:
+  runtime, finalization = _fixtures(qualified=False)
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+
+  fabricated = json.loads(json.dumps(payload))
+  fabricated["nodes"][0]["reasons"].append(
+    CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value,
+  )
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried evidence",
+  ):
+    validate_learning_status_payload(fabricated)
+
+  missing = json.loads(json.dumps(payload))
+  missing["nodes"][0]["reasons"] = [
+    CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE.value,
+  ]
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried evidence",
+  ):
+    validate_learning_status_payload(missing)
+
+
+def test_breakaway_population_and_reason_cannot_be_mutated_independently() -> None:
+  runtime, finalization = _fixtures(qualified=False)
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  payload["nodes"][0]["breakaway_episode_full_fit_count"] = (
+    MIN_STRATUM_TRAINING_ROWS
+  )
+
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried evidence",
+  ):
+    validate_learning_status_payload(payload)
 
 
 def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
@@ -772,6 +821,16 @@ def test_failure_classifications_remain_distinct() -> None:
       reasons=(reason,),
       fit_diagnostics=diagnostics,
       selection_outcome=selection_outcome,
+      breakaway_episode_full_fit_count=(
+        0
+        if reason is CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE
+        else MIN_STRATUM_TRAINING_ROWS
+      ),
+      lateral_accel_span_mps2=(
+        0.0
+        if reason is CalibrationQualificationReason.INSUFFICIENT_EXCITATION
+        else reports[0].lateral_accel_span_mps2
+      ),
     )
     classified = replace(
       finalization,

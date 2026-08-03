@@ -7,7 +7,7 @@ written last so it acts as the commit record for the independently atomic
 evidence and optional candidate files.
 
 The coordinator can create an *unapproved* candidate only after every speed
-node and every populated interpolation stratum qualifies through schema-12 route-grouped
+node and every populated interpolation stratum qualifies through schema-14 route-grouped
 leave-one-route-out evidence drawn exclusively from the caller's global TRAIN
 partition. An evaluated all-seed outcome is
 successful and emits an immutable selected-profile proof for downstream
@@ -33,16 +33,20 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationProfileLearner,
   CalibrationSampleAccounting,
   CalibrationSampleDisposition,
+  CalibrationRouteCommitment,
   calibration_evidence_sha256,
   minimum_calibration_support_s,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 13
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 14
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
@@ -236,6 +240,7 @@ class CalibrationLearningCoordinator:
     evidence_bytes: bytes | None = None,
     *,
     candidate_provenance: str = "measured observable casual-driving evidence",
+    expected_route_commitments: tuple[tuple[str, str], ...] | None = None,
   ) -> None:
     if not isinstance(seed_profile, VehicleCalibrationProfile):
       raise TypeError("calibration coordinator requires a VehicleCalibrationProfile")
@@ -243,7 +248,19 @@ class CalibrationLearningCoordinator:
     if not provenance:
       raise ValueError("candidate provenance must not be empty")
 
-    self._learner = CalibrationProfileLearner(seed_profile) if evidence_bytes is None else CalibrationProfileLearner.from_evidence(seed_profile, evidence_bytes)
+    if evidence_bytes is None:
+      self._learner = CalibrationProfileLearner(seed_profile)
+    elif expected_route_commitments is None:
+      self._learner = CalibrationProfileLearner.from_evidence(
+        seed_profile,
+        evidence_bytes,
+      )
+    else:
+      self._learner = CalibrationProfileLearner.from_evidence(
+        seed_profile,
+        evidence_bytes,
+        expected_route_commitments=expected_route_commitments,
+      )
     self._add_sample_with_disposition = getattr(
       self._learner,
       "add_sample_with_disposition",
@@ -379,6 +396,7 @@ class CalibrationLearningCoordinator:
     self,
     sample: LearningSample,
     *,
+    source_coordinate: CalibrationIngestionCoordinate | None = None,
     upstream_rejection: CalibrationSampleDisposition | None = None,
   ) -> bool:
     """Accumulate and durably classify one measured frame in memory."""
@@ -388,10 +406,10 @@ class CalibrationLearningCoordinator:
       raise TypeError("calibration coordinator requires a measured-only LearningSample")
 
     if callable(self._add_sample_with_disposition):
-      disposition = self._add_sample_with_disposition(
-        sample,
-        upstream_rejection=upstream_rejection,
-      )
+      arguments = {"upstream_rejection": upstream_rejection}
+      if source_coordinate is not None:
+        arguments["source_coordinate"] = source_coordinate
+      disposition = self._add_sample_with_disposition(sample, **arguments)
       if not isinstance(disposition, CalibrationSampleDisposition):
         raise TypeError("calibration learner emitted an invalid disposition")
     else:
@@ -432,7 +450,12 @@ class CalibrationLearningCoordinator:
     if self._cached_finalization is not None and self._finalized_generation == self._evidence_generation:
       return self._cached_finalization
 
-    evidence_bytes = self._learner.export_evidence()
+    authoritative_export = getattr(
+      self._learner,
+      "export_authoritative_evidence",
+      self._learner.export_evidence,
+    )
+    evidence_bytes = authoritative_export()
     evidence_identity = calibration_evidence_sha256(evidence_bytes)
     result = self._learner.qualify(self._candidate_provenance)
     candidate = result.candidate_profile
@@ -486,6 +509,18 @@ class CalibrationLearningCoordinator:
       "interpolation_reports": [
         _manifest_value(report, "interpolation_report")
         for report in getattr(result, "interpolation_reports", ())
+      ],
+      "route_commitments": [
+        {
+          "assignment_chain_sha256": commitment.assignment_chain_sha256,
+          "assignment_record_count": commitment.assignment_record_count,
+          "route_commitment_sha256": commitment.route_commitment_sha256,
+          "route_content_sha256": commitment.route_content_sha256,
+          "route_counter": commitment.route_counter,
+          "route_identity_sha256": commitment.route_identity_sha256,
+          "route_index": commitment.route_index,
+        }
+        for commitment in getattr(self._learner, "route_commitments", ())
       ],
       "seed_profile_revision": self._seed_profile.revision,
       "seed_profile_schema_version": self._seed_profile.schema_version,
@@ -553,3 +588,7 @@ class CalibrationLearningCoordinator:
       _atomic_write_bytes(candidate_profile_path, candidate_json)
     _atomic_write_bytes(manifest_path, finalization.manifest_bytes)
     return finalization
+
+  @property
+  def route_commitments(self) -> tuple[CalibrationRouteCommitment, ...]:
+    return self._learner.route_commitments

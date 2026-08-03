@@ -47,7 +47,7 @@ The seed remains a first-class safe result when no family robustly improves.
 Every coefficient-bearing stratum needs two independent contributing routes;
 any nonempty stratum makes its route a cross-fit contributor, while four rows
 are enforced only on each combined fold-fit population after the held route is
-removed. A route with thousands of rows still counts once. Evidence schema 13
+removed. A route with thousands of rows still counts once. Evidence schema 14
 reports independent route counts,
 cross-fit fold failures, paired out-of-fold losses, and the final all-route fit
 separately. Every route also carries a source-assignment ledger whose accepted
@@ -58,6 +58,21 @@ disjoint base, moving, complete-breakaway, and settled-authority strata. Every
 populated stratum must independently avoid regression in every leave-one-route-out fold;
 abundant ordinary rows cannot dilute a sparse physical failure. Earlier
 evidence schemas are rejected rather than reinterpreted.
+
+Historical replay assigns every controls witness a canonical ingestion
+coordinate: route-content SHA-256, segment index, controls mono time, and
+recorded ordinal. Replay verifies the witness against the same indexed
+physical frame before the learner sees it. Every accepted and rejected
+disposition then extends an ordered assignment hash chain. Accepted records
+commit exact hexadecimal physical values and the exact node, interval,
+support, training, and episode weights they contributed; rejected records
+commit an empty contribution set. Each route commitment binds the distinct
+route identity, route-content artifact, assignment chain, source accounting,
+and sufficient statistics. The trainer supplies the complete ordered route
+commitment mapping from its own independent replay; embedded roots are
+structural integrity checks only and are never treated as population
+authority. Live rows have no authenticated historical coordinate and therefore
+cannot publish authoritative calibration evidence.
 
 The `0/5/10/15/20/30 m/s` support floors are respectively
 `150/150/240/240/420/420` accepted weighted seconds, not wall-clock drive
@@ -180,7 +195,7 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 6 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 7 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
 selection, cross-fit regression, fold completion, and per-stratum interpolation
 state. The selected or seed-retained result carries its authoritative model
@@ -283,9 +298,9 @@ cannot fabricate a breakaway. Lifecycle and mapping discontinuities clear
 cross-frame direction.
 
 The committed identities are calibration profile/evidence/coordinator
-`3/13/13`, physical learning/operation/progress status `6/1/1`, native
+`3/14/14`, physical learning/operation/progress status `7/1/1`, native
 extractor/canonical join `4/3`, route evidence `BLATRE02` version `2`,
-backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
+backfill ledger/commit/pointer `3/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v7`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and

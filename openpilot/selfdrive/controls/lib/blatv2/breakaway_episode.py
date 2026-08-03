@@ -29,6 +29,9 @@ import math
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
   LearningSample,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 
 
 class BreakawayCategory(StrEnum):
@@ -51,11 +54,13 @@ class BreakawayEpisodePoint:
   rack_rate_deg_s: float
   rack_acceleration_deg_s2: float
   actuator_constrained: bool
+  source_coordinate: CalibrationIngestionCoordinate | None = None
 
   @classmethod
   def from_sample(
     cls,
     sample: LearningSample,
+    source_coordinate: CalibrationIngestionCoordinate | None = None,
   ) -> BreakawayEpisodePoint:
     return cls(
       speed_mps=sample.speed_mps,
@@ -68,6 +73,7 @@ class BreakawayEpisodePoint:
       rack_rate_deg_s=sample.rack_rate_deg_s,
       rack_acceleration_deg_s2=sample.rack_acceleration_deg_s2,
       actuator_constrained=sample.actuator_constrained,
+      source_coordinate=source_coordinate,
     )
 
 
@@ -93,6 +99,20 @@ class BreakawayEpisode:
       or self.dwell_s < 0.0
     ):
       raise ValueError("breakaway episode values must be finite and physical")
+    coordinates = (
+      self.last_stuck.source_coordinate,
+      self.first_motion.source_coordinate,
+      self.rate_confirmation.source_coordinate,
+    )
+    if any(coordinate is not None for coordinate in coordinates):
+      if any(coordinate is None for coordinate in coordinates):
+        raise ValueError("breakaway coordinates must be complete")
+      complete = tuple(coordinate for coordinate in coordinates if coordinate is not None)
+      if len({coordinate.route_content_sha256 for coordinate in complete}) != 1:
+        raise ValueError("breakaway coordinates must belong to one route")
+      keys = tuple(coordinate.ordering_key for coordinate in complete)
+      if not (keys[0] <= keys[1] <= keys[2]):
+        raise ValueError("breakaway coordinates are not ordered")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +215,7 @@ class BreakawayEpisodeDetector:
     sample: LearningSample,
     rack_rate_resolution_deg_s: float,
     transport_delay_s: float,
+    source_coordinate: CalibrationIngestionCoordinate | None = None,
   ) -> BreakawayDecision:
     """Classify one sample and emit an episode only after physical proof.
 
@@ -220,7 +241,7 @@ class BreakawayEpisodeDetector:
       self.reset()
       return BreakawayDecision(BreakawayCategory.BASE)
 
-    point = BreakawayEpisodePoint.from_sample(sample)
+    point = BreakawayEpisodePoint.from_sample(sample, source_coordinate)
     previous = self._previous_point
     if previous is None:
       self._previous_point = point

@@ -57,6 +57,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   LearningArtifactPaths,
   PersistentLearningRuntime,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 from openpilot.selfdrive.controls.lib.blatv2.owned_scratch import (
   OwnedDirectoryIdentity,
   OwnedScratchError,
@@ -78,6 +81,7 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   RouteEvidenceError,
   RouteEvidenceFileSummary,
   RouteEvidenceSourceIdentity,
+  RouteEvidenceStreamReader,
   RouteEvidenceStore,
   inspect_route_evidence_file,
 )
@@ -86,7 +90,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 )
 
 
-BACKFILL_LEDGER_SCHEMA_VERSION = 2
+BACKFILL_LEDGER_SCHEMA_VERSION = 3
 BACKFILL_PROVENANCE_SCHEMA_VERSION = 1
 BACKFILL_COMMIT_SCHEMA_VERSION = 2
 BACKFILL_POINTER_SCHEMA_VERSION = 1
@@ -695,10 +699,15 @@ class ReplayResult:
   route_evidence_control_witness_count: int = 0
   route_evidence_event_locator_count: int = 0
   route_evidence_source_key: str | None = None
+  assignment_record_count: int = 0
+  assignment_chain_sha256: str | None = None
+  route_commitment_sha256: str | None = None
 
   def ledger_entry(self) -> dict[str, object]:
     return {
       "accepted_sample_count": self.accepted_sample_count,
+      "assignment_chain_sha256": self.assignment_chain_sha256,
+      "assignment_record_count": self.assignment_record_count,
       "controls_witness_count": self.controls_witness_count,
       "diagnostic": self.diagnostic,
       "disposition": self.disposition,
@@ -717,6 +726,7 @@ class ReplayResult:
       ),
       "route_evidence_sha256": self.route_evidence_sha256,
       "route_name": self.route.route_name,
+      "route_commitment_sha256": self.route_commitment_sha256,
       "segments": [
         segment.to_ledger_dict()
         for segment in self.route.segments
@@ -3271,6 +3281,8 @@ def validate_ledger(
   for entry in payload["entries"]:
     if type(entry) is not dict or set(entry) != {
       "accepted_sample_count",
+      "assignment_chain_sha256",
+      "assignment_record_count",
       "controls_witness_count",
       "diagnostic",
       "disposition",
@@ -3283,6 +3295,7 @@ def validate_ledger(
       "route_evidence_model_publication_count",
       "route_evidence_sha256",
       "route_name",
+      "route_commitment_sha256",
       "segments",
       "unresolved_witness_count",
     }:
@@ -3314,6 +3327,7 @@ def validate_ledger(
       )
     for name in (
       "accepted_sample_count",
+      "assignment_record_count",
       "controls_witness_count",
       "rejected_sample_count",
       "route_evidence_control_witness_count",
@@ -3333,6 +3347,8 @@ def validate_ledger(
     unresolved = entry["unresolved_witness_count"]
     provenance = entry["provenance"]
     route_evidence_sha256 = entry["route_evidence_sha256"]
+    assignment_chain_sha256 = entry["assignment_chain_sha256"]
+    route_commitment_sha256 = entry["route_commitment_sha256"]
     if disposition == "ingested":
       if (
         entry["diagnostic"] != "ingested"
@@ -3374,6 +3390,11 @@ def validate_ledger(
         or unresolved > controls
         or accepted > controls - unresolved
         or rejected < controls - accepted
+        or entry["assignment_record_count"] != controls - unresolved
+        or type(assignment_chain_sha256) is not str
+        or _SHA256_RE.fullmatch(assignment_chain_sha256) is None
+        or type(route_commitment_sha256) is not str
+        or _SHA256_RE.fullmatch(route_commitment_sha256) is None
         or (
           route_evidence_sha256 is not None
           and (
@@ -3393,6 +3414,9 @@ def validate_ledger(
       or rejected != 0
       or unresolved != 0
       or route_evidence_sha256 is not None
+      or entry["assignment_record_count"] != 0
+      or assignment_chain_sha256 is not None
+      or route_commitment_sha256 is not None
       or entry["route_evidence_control_witness_count"] != 0
       or entry["route_evidence_event_locator_count"] != 0
       or entry["route_evidence_model_publication_count"] != 0
@@ -4602,20 +4626,80 @@ def replay_routes(
         if isinstance(prepared, PreparedRoute)
         else prepared.iter_frames()
       )
+      authenticated_replay = route_evidence is not None
+      if not authenticated_replay and isinstance(runtime, PersistentLearningRuntime):
+        raise BackfillError(
+          "backfill_missing_route_evidence",
+          "authenticated calibration replay requires route evidence",
+        )
+      if isinstance(route_evidence, RouteEvidenceArtifact):
+        controls_witnesses = route_evidence.iter_control_witnesses()
+      elif isinstance(route_evidence, RouteEvidenceFileSummary):
+        def streamed_controls(path=route_evidence.path):
+          with RouteEvidenceStreamReader(path) as reader:
+            yield from reader.iter_control_witnesses()
+        controls_witnesses = streamed_controls()
+      elif route_evidence is not None:
+        raise BackfillError(
+          "backfill_missing_route_evidence",
+          "route evidence type cannot provide authenticated controls witnesses",
+        )
       frame_count = 0
-      for frame_index, frame in enumerate(frames):
+      paired_frames = (
+        zip(frames, controls_witnesses, strict=True)
+        if authenticated_replay
+        else ((frame, None) for frame in frames)
+      )
+      for frame_index, pair in enumerate(paired_frames):
+        frame, witness = pair
         if frame_index % 256 == 0:
           _abort_if_requested(
             abort_requested,
             "backfill aborted while replaying route frames",
           )
-        runtime.ingest(frame)
+        if witness is not None and (
+          witness.physical_record_index != frame_index
+          or witness.mono_time_ns != frame.sample_mono_ns
+        ):
+          raise BackfillError(
+            "backfill_source_coordinate_mismatch",
+            "physical frame and controls witness are not the same source row",
+          )
+        if witness is None:
+          runtime.ingest(frame)
+        else:
+          runtime.ingest(
+            frame,
+            source_coordinate=CalibrationIngestionCoordinate(
+              route_content_sha256=route_content_sha256,
+              segment_index=witness.segment_index,
+              log_mono_time_ns=witness.mono_time_ns,
+              recorded_ordinal=witness.ordinal,
+            ),
+          )
         frame_count += 1
       _abort_if_requested(
         abort_requested,
         "backfill aborted after replaying route frames",
       )
       runtime.transition_offroad_without_persist()
+      commitment = (
+        next(
+          item
+          for item in runtime.coordinator.route_commitments
+          if item.route_identity_sha256 == route.display_identity
+        )
+        if authenticated_replay
+        else None
+      )
+      if commitment is not None and (
+        commitment.route_identity_sha256 != route.display_identity
+        or commitment.route_content_sha256 != route_content_sha256
+      ):
+        raise BackfillError(
+          "backfill_route_commitment_mismatch",
+          "learner commitment does not identify the replayed route",
+        )
       accepted = (
         runtime.coordinator.accepted_sample_count - before_accepted
       )
@@ -4661,6 +4745,9 @@ def replay_routes(
         ),
         route_evidence_event_locator_count=route_evidence_event_count,
         route_evidence_source_key=route_evidence_source_key,
+        assignment_record_count=(0 if commitment is None else commitment.assignment_record_count),
+        assignment_chain_sha256=(None if commitment is None else commitment.assignment_chain_sha256),
+        route_commitment_sha256=(None if commitment is None else commitment.route_commitment_sha256),
       ))
       if route_completed is not None:
         route_completed(route, accepted_total, rejected_total)

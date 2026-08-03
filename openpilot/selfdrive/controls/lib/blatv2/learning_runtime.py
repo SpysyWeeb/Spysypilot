@@ -37,6 +37,9 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationSampleDisposition,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
   ActuatorBoundary,
   _attest_authority_sample,
@@ -569,10 +572,32 @@ class PersistentLearningRuntime:
     try:
       evidence_bytes = artifact_paths.evidence.read_bytes()
       manifest_bytes = artifact_paths.manifest.read_bytes()
+      expected_route_commitments: tuple[tuple[str, str], ...] | None = None
+      if artifact_paths.backfill_pointer.is_file():
+        ledger = json.loads(artifact_paths.backfill_ledger.read_bytes())
+        ingested = sorted(
+          (
+            entry for entry in ledger["entries"]
+            if entry["disposition"] == "ingested"
+          ),
+          key=lambda entry: (
+            entry["route_identity_sha256"],
+            entry["route_evidence_sha256"],
+            entry["route_counter"],
+          ),
+        )
+        expected_route_commitments = tuple(
+          (
+            entry["route_identity_sha256"],
+            entry["route_commitment_sha256"],
+          )
+          for entry in ingested
+        )
       coordinator = CalibrationLearningCoordinator(
         runtime_bundle.calibration_seed_profile,
         evidence_bytes,
         candidate_provenance=CASUAL_DRIVING_CANDIDATE_PROVENANCE,
+        expected_route_commitments=expected_route_commitments,
       )
       finalization = coordinator.finalize()
       if finalization.manifest_bytes != manifest_bytes:
@@ -846,7 +871,12 @@ class PersistentLearningRuntime:
     self.last_live_mapping_valid = True
     return mapping
 
-  def ingest(self, frame: MeasuredLearningFrame) -> bool:
+  def ingest(
+    self,
+    frame: MeasuredLearningFrame,
+    *,
+    source_coordinate: CalibrationIngestionCoordinate | None = None,
+  ) -> bool:
     if (
       self.coordinator.state
       is not CalibrationLearningLifecycleState.ONROAD
@@ -1062,6 +1092,7 @@ class PersistentLearningRuntime:
       upstream_rejection = CalibrationSampleDisposition.MEASUREMENT_WARMUP_OR_DISCONTINUITY
     accepted = self.coordinator.ingest(
       sample,
+      source_coordinate=source_coordinate,
       upstream_rejection=upstream_rejection,
     )
     self.last_sample_accepted = accepted

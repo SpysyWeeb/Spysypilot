@@ -40,6 +40,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   MeasuredLearningFrame,
   build_persistent_learning_runtime,
 )
+from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
+  RouteEvidenceArtifact,
+)
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
 )
@@ -1343,6 +1346,53 @@ def test_four_worker_helper_provenance_difference_is_unpublished(
   assert not paths.backfill_ledger.exists()
 
 
+def test_authenticated_replay_rejects_witness_from_another_physical_row(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  engine, _params, _calls, _runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+  )
+  deterministic_prepare = learning_backfill.prepare_route
+
+  def mismatched_prepare(route, **kwargs):
+    prepared = deterministic_prepare(route, **kwargs)
+    evidence = prepared.route_evidence
+    assert evidence is not None
+    controls = (
+      replace(
+        evidence.control_witnesses[0],
+        mono_time_ns=evidence.control_witnesses[0].mono_time_ns + 1,
+      ),
+      *evidence.control_witnesses[1:],
+    )
+    mismatched = RouteEvidenceArtifact(
+      evidence.source_identity,
+      evidence.car_params_bytes,
+      evidence.physical_bytes,
+      evidence.model_publications,
+      controls,
+      evidence.live_torque_parameters,
+      evidence.live_delays,
+      evidence.lateral_maneuver_plans,
+      evidence.event_locators,
+    )
+    return replace(prepared, route_evidence=mismatched)
+
+  monkeypatch.setattr(
+    learning_backfill,
+    "prepare_route",
+    mismatched_prepare,
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "backfill_source_coordinate_mismatch"
+
+
 def test_route_evidence_is_not_durable_until_both_authorities_match(
   tmp_path: Path,
 ) -> None:
@@ -2329,37 +2379,38 @@ def test_route_local_rejection_does_not_block_later_good_route(
         "invalid_route_version",
         "representative malformed historical InitData version",
       )
+    frames = tuple(
+      route_frame(
+        cp,
+        1_000_000_000 + index * 10_000_000,
+        first_in_route=index == 0,
+      )
+      for index in range(CAUSAL_ROUTE_FRAME_COUNT)
+    )
+    provenance = {
+      "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
+      "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
+      "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
+      "extractor_schema_version": learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION,
+      "log_schema_blob": "4" * 40,
+      "opendbc_commit": "2" * 40,
+      "panda_commit": "3" * 40,
+      "physical_compatibility_sha256": hashlib.sha256(b"physical").hexdigest(),
+      "route_version": "test-version",
+      "selected_event_stream_sha256": hashlib.sha256(route.route_name.encode("ascii")).hexdigest(),
+      "superproject_commit": "1" * 40,
+    }
     return PreparedRoute(
-      frames=tuple(
-        route_frame(
-          cp,
-          1_000_000_000 + index * 10_000_000,
-          first_in_route=index == 0,
-        )
-        for index in range(CAUSAL_ROUTE_FRAME_COUNT)
-      ),
+      frames=frames,
       controls_witness_count=CAUSAL_ROUTE_FRAME_COUNT,
       unresolved_witness_count=0,
       gap_count=0,
-      provenance={
-        "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
-        "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
-        "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
-        "extractor_schema_version": (
-          learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION
-        ),
-        "log_schema_blob": "4" * 40,
-        "opendbc_commit": "2" * 40,
-        "panda_commit": "3" * 40,
-        "physical_compatibility_sha256": hashlib.sha256(
-          b"physical",
-        ).hexdigest(),
-        "route_version": "test-version",
-        "selected_event_stream_sha256": hashlib.sha256(
-          route.route_name.encode("ascii"),
-        ).hexdigest(),
-        "superproject_commit": "1" * 40,
-      },
+      provenance=provenance,
+      route_evidence=route_evidence_for_frames(
+        route.route_name,
+        frames,
+        provenance,
+      ),
     )
 
   replay = learning_backfill.replay_routes(

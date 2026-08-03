@@ -4,7 +4,7 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 6 deliberately rejects the retired physical rack-fit vocabulary and
+Schema 7 deliberately rejects the retired physical rack-fit vocabulary and
 adds canonical first-cause sample accounting. The
 only candidate values it exposes are the four observable inverse-torque
 calibration values, while independent base, moving, breakaway, and authority
@@ -33,6 +33,11 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationNodeQualificationReport,
   CalibrationQualificationReason,
   CalibrationSampleAccounting,
+  MIN_INDEPENDENT_ROUTES,
+  MIN_STRATUM_TRAINING_ROWS,
+  MIN_APPLIED_TORQUE_SPAN,
+  MIN_LATERAL_ACCEL_RMS_MPS2,
+  MIN_LATERAL_ACCEL_SPAN_MPS2,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   RuntimeVehicleBundle,
@@ -40,7 +45,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 6
+LEARNING_STATUS_SCHEMA_VERSION = 7
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
   "all_intervals_qualified",
@@ -72,6 +77,10 @@ _NODE_KEYS = {
   "authority_support_s",
   "authority_full_fit_count",
   "authority_cross_fit_route_count",
+  "authority_magnitude_sample_count",
+  "authority_slew_build_sample_count",
+  "authority_slew_release_sample_count",
+  "authority_unresolved_sample_count",
   "base_sample_count",
   "base_support_s",
   "breakaway_full_fit_candidate_rms",
@@ -80,6 +89,10 @@ _NODE_KEYS = {
   "breakaway_support_s",
   "breakaway_full_fit_count",
   "breakaway_cross_fit_route_count",
+  "breakaway_episode_full_fit_count",
+  "breakaway_episode_cross_fit_route_count",
+  "breakaway_episode_dwell_s",
+  "breakaway_angle_assisted_count",
   "candidate_parameters",
   "full_fit_candidate_rms",
   "clean_support_s",
@@ -694,6 +707,22 @@ def _node_payload(
       report.authority_cross_fit_route_count,
       f"{context}.authority_cross_fit_route_count",
     ),
+    "authority_magnitude_sample_count": _nonnegative_int(
+      report.authority_magnitude_sample_count,
+      f"{context}.authority_magnitude_sample_count",
+    ),
+    "authority_slew_build_sample_count": _nonnegative_int(
+      report.authority_slew_build_sample_count,
+      f"{context}.authority_slew_build_sample_count",
+    ),
+    "authority_slew_release_sample_count": _nonnegative_int(
+      report.authority_slew_release_sample_count,
+      f"{context}.authority_slew_release_sample_count",
+    ),
+    "authority_unresolved_sample_count": _nonnegative_int(
+      report.authority_unresolved_sample_count,
+      f"{context}.authority_unresolved_sample_count",
+    ),
     "base_sample_count": _nonnegative_int(
       report.base_sample_count,
       f"{context}.base_sample_count",
@@ -725,6 +754,22 @@ def _node_payload(
     "breakaway_cross_fit_route_count": _nonnegative_int(
       report.breakaway_cross_fit_route_count,
       f"{context}.breakaway_cross_fit_route_count",
+    ),
+    "breakaway_episode_full_fit_count": _nonnegative_int(
+      report.breakaway_episode_full_fit_count,
+      f"{context}.breakaway_episode_full_fit_count",
+    ),
+    "breakaway_episode_cross_fit_route_count": _nonnegative_int(
+      report.breakaway_episode_cross_fit_route_count,
+      f"{context}.breakaway_episode_cross_fit_route_count",
+    ),
+    "breakaway_episode_dwell_s": _nonnegative_float(
+      report.breakaway_episode_dwell_s,
+      f"{context}.breakaway_episode_dwell_s",
+    ),
+    "breakaway_angle_assisted_count": _nonnegative_int(
+      report.breakaway_angle_assisted_count,
+      f"{context}.breakaway_angle_assisted_count",
     ),
     "candidate_parameters": _candidate_parameters(report),
     "full_fit_candidate_rms": _optional_rms(
@@ -1417,6 +1462,73 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context}.qualification reasons disagree")
     if any(reason not in reason_values for reason in reasons):
       raise ValueError(f"{context}.qualification reason is unknown")
+    expected_prerequisites: list[str] = []
+    if node["clean_support_s"] < node["minimum_support_s"]:
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value
+      )
+    if (
+      node["lateral_accel_span_mps2"] < MIN_LATERAL_ACCEL_SPAN_MPS2
+      or node["lateral_accel_rms_mps2"] < MIN_LATERAL_ACCEL_RMS_MPS2
+      or node["applied_torque_span"] < MIN_APPLIED_TORQUE_SPAN
+      or node["lateral_accel_directions"] != 2
+      or node["applied_torque_directions"] != 2
+    ):
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_EXCITATION.value
+      )
+    if node["moving_full_fit_count"] < MIN_STRATUM_TRAINING_ROWS:
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE.value
+      )
+    if (
+      node["breakaway_full_fit_count"] < MIN_STRATUM_TRAINING_ROWS
+      or node["breakaway_episode_full_fit_count"]
+      < MIN_STRATUM_TRAINING_ROWS
+    ):
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE.value
+      )
+    required_route_counts = (
+      parsed_route_counts["all"],
+      parsed_route_counts["base"],
+      parsed_route_counts["moving"],
+      parsed_route_counts["breakaway"],
+      parsed_route_counts["breakaway_episode"],
+    )
+    if (
+      any(count < MIN_INDEPENDENT_ROUTES for count in required_route_counts)
+      or 0 < parsed_route_counts["authority"] < MIN_INDEPENDENT_ROUTES
+    ):
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+      )
+    prerequisite_values = {
+      CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value,
+      CalibrationQualificationReason.INSUFFICIENT_EXCITATION.value,
+      CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE.value,
+      CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE.value,
+      CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value,
+    }
+    actual_prerequisites = [
+      reason for reason in reasons if reason in prerequisite_values
+    ]
+    if not node["qualified"] and actual_prerequisites != expected_prerequisites:
+      raise ValueError(f"{context}.reasons contradict carried evidence")
+    if (
+      node["breakaway_angle_assisted_count"]
+      > node["breakaway_episode_full_fit_count"]
+      or node["authority_fit_sample_count"] > node["authority_sample_count"]
+      or node["authority_unresolved_sample_count"]
+      > node["authority_magnitude_sample_count"]
+      or node["authority_magnitude_sample_count"]
+      > node["authority_sample_count"]
+      or node["authority_slew_build_sample_count"]
+      > node["authority_sample_count"]
+      or node["authority_slew_release_sample_count"]
+      > node["authority_sample_count"]
+    ):
+      raise ValueError(f"{context}.carried evidence populations are inconsistent")
     if evaluation_status != _evaluation_status_from_reasons(tuple(reasons)):
       raise ValueError(f"{context}.evaluation status contradicts reasons")
     if node["qualified"] and (

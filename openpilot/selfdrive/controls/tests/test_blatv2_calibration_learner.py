@@ -44,6 +44,9 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
   make_calibration_seed_profile,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
   ActuatorBoundary,
   LearningSample,
@@ -1476,6 +1479,91 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       report.authority_cross_fit_route_count,
       before.authority_completed_route_count + 1,
     )
+
+  def test_authoritative_route_commitment_rejects_relabel_and_mapping_gaps(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    identity = route_sha(950)
+    learner.begin_route(identity, identity, route_counter=950)
+    for ordinal in range(252):
+      direction = -1 if ordinal % 2 else 1
+      learner.add_sample_with_disposition(
+        sample(10.0, direction * 0.4, direction * RATE_QUANTUM_DEG_S, moving_sign=direction),
+        source_coordinate=CalibrationIngestionCoordinate(
+          identity,
+          0,
+          1_000_000_000 + ordinal,
+          ordinal,
+        ),
+      )
+    learner.end_route()
+    encoded = learner.export_authoritative_evidence()
+    expected = tuple(
+      (commitment.route_identity_sha256, commitment.route_commitment_sha256)
+      for commitment in learner.route_commitments
+    )
+    self.assertEqual(
+      CalibrationProfileLearner.from_evidence(
+        learner.seed_profile,
+        encoded,
+        expected_route_commitments=expected,
+      ).export_evidence(),
+      encoded,
+    )
+    with self.assertRaisesRegex(ValueError, "incomplete or reordered"):
+      CalibrationProfileLearner.from_evidence(
+        learner.seed_profile,
+        encoded,
+        expected_route_commitments=(),
+      )
+
+    # A coordinated attacker may rebuild every mutable summary and its
+    # embedded structural root. It still cannot reproduce the independently
+    # replayed route commitment supplied by the authenticated caller.
+    relabeled = json.loads(encoded)
+    route = relabeled["payload"]["routes"][0]
+    route["assignment_chain_sha256"] = "f" * 64
+    commitment_payload = {
+      key: value
+      for key, value in route.items()
+      if key not in {"route_commitment_sha256", "route_index"}
+    }
+    route["route_commitment_sha256"] = hashlib.sha256(
+      b"blatv2-calibration-route-commitment-v1\0"
+      + canonical(commitment_payload)
+    ).hexdigest()
+    relabeled["payload_sha256"] = hashlib.sha256(
+      canonical(relabeled["payload"])
+    ).hexdigest()
+    with self.assertRaisesRegex(ValueError, "incomplete or reordered"):
+      CalibrationProfileLearner.from_evidence(
+        learner.seed_profile,
+        canonical(relabeled),
+        expected_route_commitments=expected,
+      )
+
+  def test_sufficient_statistics_reject_impossible_rhs_and_non_psd_gram(self) -> None:
+    regression = _Regression()
+    regression.add((1.0, 1.0, 0.0, 0.0), 0.5, 1.0)
+    impossible_rhs = regression.encoded()
+    impossible_rhs["rhs"][0] = (float.fromhex(impossible_rhs["rhs"][0]) + 1000.0).hex()
+    with self.assertRaisesRegex(ValueError, "Cauchy|PSD"):
+      _Regression.decoded(impossible_rhs, "impossible_rhs")
+
+    non_psd = regression.encoded()
+    non_psd["normal"][1] = (2.0).hex()
+    non_psd["normal"][4] = (2.0).hex()
+    with self.assertRaisesRegex(ValueError, "Cauchy|PSD"):
+      _Regression.decoded(non_psd, "non_psd")
+
+  def test_live_rows_are_structural_only_and_cannot_publish(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    learner.begin_route(route_sha(951), route_counter=951)
+    learner.add_sample(sample(10.0, 0.2, RATE_QUANTUM_DEG_S, moving_sign=1))
+    learner.end_route()
+    structural = learner.export_evidence()
+    self.assertIsInstance(structural, bytes)
+    with self.assertRaisesRegex(RuntimeError, "non-authoritative live"):
+      learner.export_authoritative_evidence()
 
 
 if __name__ == "__main__":

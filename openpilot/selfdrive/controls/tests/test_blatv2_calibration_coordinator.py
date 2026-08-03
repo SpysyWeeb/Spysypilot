@@ -484,8 +484,8 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
     manifest = json.loads(finalization.manifest_bytes)
     self.assertEqual(manifest["artifact_schema_version"], CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION)
-    self.assertEqual(manifest["artifact_schema_version"], 13)
-    self.assertEqual(manifest["evidence_schema_version"], 13)
+    self.assertEqual(manifest["artifact_schema_version"], 14)
+    self.assertEqual(manifest["evidence_schema_version"], 14)
     self.assertEqual(manifest["seed_profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
     self.assertEqual(manifest["seed_profile_schema_version"], 3)
     self.assertEqual(manifest["seed_profile_sha256"], hashlib.sha256(seed.to_json().encode()).hexdigest())
@@ -581,12 +581,16 @@ class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
   def test_real_v12_report_is_manifest_compatible_and_restorable(self) -> None:
     seed = seed_profile()
     first = CalibrationLearningCoordinator(seed).finalize()
-    restored = CalibrationLearningCoordinator(seed, first.evidence_bytes).finalize()
+    restored = CalibrationLearningCoordinator(
+      seed,
+      first.evidence_bytes,
+      expected_route_commitments=(),
+    ).finalize()
     self.assertEqual(restored.evidence_bytes, first.evidence_bytes)
     self.assertEqual(restored.manifest_bytes, first.manifest_bytes)
     manifest = json.loads(first.manifest_bytes)
-    self.assertEqual(manifest["artifact_schema_version"], 13)
-    self.assertEqual(manifest["evidence_schema_version"], 13)
+    self.assertEqual(manifest["artifact_schema_version"], 14)
+    self.assertEqual(manifest["evidence_schema_version"], 14)
     self.assertEqual(manifest["seed_profile_schema_version"], 3)
     for report in manifest["node_reports"]:
       self.assertIn("moving_reasons", report)

@@ -126,6 +126,12 @@ def _provenance(route_name: str) -> dict[str, object]:
 
 def _ingested(artifact: RouteEvidenceArtifact) -> ReplayResult:
   source = artifact.source_identity
+  assignment_chain_sha256 = hashlib.sha256(
+    f"assignments:{source.route_id}".encode(),
+  ).hexdigest()
+  route_commitment_sha256 = hashlib.sha256(
+    f"commitment:{source.route_id}".encode(),
+  ).hexdigest()
   return ReplayResult(
     route=_route(artifact),
     disposition="ingested",
@@ -139,6 +145,9 @@ def _ingested(artifact: RouteEvidenceArtifact) -> ReplayResult:
     route_evidence_model_publication_count=len(artifact.model_publications),
     route_evidence_control_witness_count=len(artifact.control_witnesses),
     route_evidence_event_locator_count=len(artifact.event_locators),
+    assignment_record_count=source.controls_witness_count,
+    assignment_chain_sha256=assignment_chain_sha256,
+    route_commitment_sha256=route_commitment_sha256,
   )
 
 
