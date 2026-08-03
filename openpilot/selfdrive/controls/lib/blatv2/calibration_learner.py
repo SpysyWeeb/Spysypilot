@@ -31,6 +31,7 @@ accepted nor representable by this learner.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 import hashlib
@@ -70,6 +71,7 @@ MAX_CALIBRATION_ROWS_PER_ROUTE = 1_000_000
 MAX_CALIBRATION_EVIDENCE_ROWS = (
   MAX_CALIBRATION_ROUTE_COUNT * MAX_CALIBRATION_ROWS_PER_ROUTE
 )
+MAX_CALIBRATION_WIRE_FLOAT_ABS = math.sqrt(sys.float_info.max) / 16.0
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_INDEPENDENT_ROUTES = 2
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
@@ -96,6 +98,16 @@ def _stat_tolerance(scale: float, count: int, multiplier: float) -> float:
     multiplier * sys.float_info.epsilon * max(count, 1),
   )
   return relative * max(scale, 1.0)
+
+
+def _finite_fsum(values: Iterable[float], context: str) -> float:
+  try:
+    result = math.fsum(values)
+  except OverflowError as exc:
+    raise ValueError(f"{context} arithmetic overflow") from exc
+  if not math.isfinite(result):
+    raise ValueError(f"{context} arithmetic overflow")
+  return result
 
 
 class CalibrationSampleDisposition(StrEnum):
@@ -816,27 +828,95 @@ def _validate_joint_predictor_moments(
   )
   if abs(regression.predictor_sums[3] - regression.predictor_sums[4]) > tolerance:
     raise ValueError(f"{context} duplicate interpolation moments disagree")
-  intercept_sum = math.fsum(
-    regression.predictor_sums[index]
-    for index in (2, 3, 4, 5)
+  if any(regression.predictor_sums[index] < -tolerance for index in (2, 3, 4, 5)):
+    raise ValueError(f"{context} interpolation basis moment is negative")
+  intercept_sum = _finite_fsum(
+    (regression.predictor_sums[index] for index in (2, 3, 4, 5)),
+    f"{context} interpolation first moment",
   )
-  if (
-    not math.isfinite(intercept_sum)
-    or abs(intercept_sum - regression.weight_s) > tolerance
-  ):
+  if abs(intercept_sum - regression.weight_s) > tolerance:
     raise ValueError(f"{context} interpolation first moment is invalid")
-  for row in range(10):
-    recovered = math.fsum(
-      regression.normal[row * 10 + column]
-      for column in (2, 3, 4, 5)
+
+  # The interpolation basis is [(1-t)^2, t(1-t), t(1-t), t^2] for
+  # t in [0, 1]. Recover its weighted moments through degree four and
+  # validate the finite Hausdorff moment conditions. Positive semidefinite
+  # predictor statistics alone only prove that some real vector generated
+  # the row; these localizing matrices prove that vector is representable by
+  # a bounded interpolation coordinate.
+  moment_0 = regression.weight_s
+  moment_2 = regression.predictor_sums[5]
+  moment_1 = _finite_fsum(
+    (regression.predictor_sums[3], moment_2),
+    f"{context} interpolation linear moment",
+  )
+  moment_4 = regression.normal[5 * 10 + 5]
+  moment_3 = _finite_fsum(
+    (regression.normal[3 * 10 + 5], moment_4),
+    f"{context} interpolation cubic moment",
+  )
+  _validate_augmented_gram(
+    [
+      moment_0, moment_1, moment_2,
+      moment_1, moment_2, moment_3,
+      moment_2, moment_3, moment_4,
+    ],
+    [0.0, 0.0, 0.0],
+    0.0,
+    3,
+    f"{context} interpolation Hausdorff moment matrix",
+  )
+  _validate_augmented_gram(
+    [
+      moment_1 - moment_2, moment_2 - moment_3,
+      moment_2 - moment_3, moment_3 - moment_4,
+    ],
+    [0.0, 0.0],
+    0.0,
+    2,
+    f"{context} interpolation localizing matrix",
+  )
+  expected_basis_gram = (
+    moment_0 - 4.0 * moment_1 + 6.0 * moment_2 - 4.0 * moment_3 + moment_4,
+    moment_1 - 3.0 * moment_2 + 3.0 * moment_3 - moment_4,
+    moment_1 - 3.0 * moment_2 + 3.0 * moment_3 - moment_4,
+    moment_2 - 2.0 * moment_3 + moment_4,
+    moment_1 - 3.0 * moment_2 + 3.0 * moment_3 - moment_4,
+    moment_2 - 2.0 * moment_3 + moment_4,
+    moment_2 - 2.0 * moment_3 + moment_4,
+    moment_3 - moment_4,
+    moment_1 - 3.0 * moment_2 + 3.0 * moment_3 - moment_4,
+    moment_2 - 2.0 * moment_3 + moment_4,
+    moment_2 - 2.0 * moment_3 + moment_4,
+    moment_3 - moment_4,
+    moment_2 - 2.0 * moment_3 + moment_4,
+    moment_3 - moment_4,
+    moment_3 - moment_4,
+    moment_4,
+  )
+  actual_basis_gram = tuple(
+    regression.normal[row * 10 + column]
+    for row in (2, 3, 4, 5)
+    for column in (2, 3, 4, 5)
+  )
+  if any(
+    abs(actual - expected) > tolerance
+    for actual, expected in zip(
+      actual_basis_gram,
+      expected_basis_gram,
+      strict=True,
     )
-    if (
-      not math.isfinite(recovered)
-      or abs(recovered - regression.predictor_sums[row]) > tolerance
-    ):
+  ):
+    raise ValueError(f"{context} interpolation polynomial Gram is invalid")
+  for row in range(10):
+    recovered = _finite_fsum(
+      (
+        regression.normal[row * 10 + column]
+        for column in (2, 3, 4, 5)
+      ),
+      f"{context} interpolation row moment",
+    )
+    if abs(recovered - regression.predictor_sums[row]) > tolerance:
       raise ValueError(f"{context} interpolation moments are inconsistent")
-  if abs(regression.normal[2 * 10 + 5] - regression.normal[3 * 10 + 3]) > tolerance:
-    raise ValueError(f"{context} interpolation polynomial identity is invalid")
 
 
 def _validate_joint_sign_predictor(
@@ -1551,9 +1631,13 @@ def _hex(raw: object, context: str) -> float:
     raise ValueError(f"{context} must be a canonical hexadecimal float")
   try:
     value = float.fromhex(raw)
-  except ValueError as exc:
+  except (OverflowError, ValueError) as exc:
     raise ValueError(f"{context} is invalid") from exc
-  if not math.isfinite(value) or value.hex() != raw:
+  if (
+    not math.isfinite(value)
+    or abs(value) > MAX_CALIBRATION_WIRE_FLOAT_ABS
+    or value.hex() != raw
+  ):
     raise ValueError(f"{context} is not canonical and finite")
   return value
 

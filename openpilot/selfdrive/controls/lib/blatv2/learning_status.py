@@ -35,6 +35,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationNodeQualificationReport,
   CalibrationQualificationReason,
   CalibrationSampleAccounting,
+  MAX_CALIBRATION_EVIDENCE_ROWS,
   calibration_node_failure_reasons,
   MIN_INDEPENDENT_ROUTES,
   MIN_STRATUM_TRAINING_ROWS,
@@ -49,6 +50,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
 LEARNING_STATUS_SCHEMA_VERSION = 9
+MAX_LEARNING_STATUS_FLOAT_ABS = float(MAX_CALIBRATION_EVIDENCE_ROWS)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
   "all_intervals_qualified",
@@ -237,9 +239,12 @@ def _support_populations_match(
 def _finite_float(value: object, name: str) -> float:
   if type(value) not in (int, float):
     raise TypeError(f"{name} must be a JSON number")
-  numeric = float(value)
-  if not math.isfinite(numeric):
-    raise ValueError(f"{name} must be finite")
+  try:
+    numeric = float(value)
+  except OverflowError as exc:
+    raise ValueError(f"{name} exceeds the learning-status numeric bound") from exc
+  if not math.isfinite(numeric) or abs(numeric) > MAX_LEARNING_STATUS_FLOAT_ABS:
+    raise ValueError(f"{name} must be finite and bounded")
   return 0.0 if numeric == 0.0 else numeric
 
 
@@ -258,8 +263,11 @@ def _nonnegative_float(value: object, name: str) -> float:
 
 
 def _nonnegative_int(value: object, name: str) -> int:
-  if type(value) is not int or value < 0:
-    raise ValueError(f"{name} must be a nonnegative integer")
+  if (
+    type(value) is not int
+    or not 0 <= value <= MAX_CALIBRATION_EVIDENCE_ROWS
+  ):
+    raise ValueError(f"{name} must be a bounded nonnegative integer")
   return value
 
 

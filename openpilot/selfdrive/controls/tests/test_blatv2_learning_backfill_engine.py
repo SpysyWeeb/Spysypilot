@@ -796,6 +796,55 @@ def test_injected_route_rejection_keeps_stable_ledger_semantics(
   assert ledger["entries"][0]["rejected_sample_count"] == 0
 
 
+@pytest.mark.parametrize("changed_outcome", ("ingested", "different_rejection"))
+def test_retained_rejection_is_replayed_and_must_match_ledger_exactly(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  changed_outcome: str,
+) -> None:
+  rejected_name, _ = add_route(tmp_path / "logs", 0x10)
+  ingested_name, _ = add_route(tmp_path / "logs", 0x20)
+  source_mode = {"value": "original"}
+  source_calls: list[tuple[int, str]] = []
+
+  def injected_source(authority_index, route, abort_requested):
+    source_calls.append((authority_index, route.route_name))
+    assert not abort_requested()
+    if route.route_name == rejected_name:
+      if source_mode["value"] == "original":
+        raise RouteRejected("remote_route_rejected", "original rejection")
+      if source_mode["value"] == "different_rejection":
+        raise RouteRejected("remote_route_changed", "changed rejection")
+    return learning_backfill.prepare_route(route)
+
+  engine, _, _, _ = make_engine(
+    tmp_path,
+    monkeypatch,
+    prepared_route_source=injected_source,
+  )
+  first = engine.run_once()
+  assert first.publication is not None
+  assert source_calls == [
+    (1, rejected_name),
+    (1, ingested_name),
+    (2, rejected_name),
+    (2, ingested_name),
+  ]
+
+  source_calls.clear()
+  source_mode["value"] = changed_outcome
+  with pytest.raises(BackfillError) as changed:
+    engine.run_once()
+  assert changed.value.diagnostic == "backfill_untracked_evidence"
+  assert "fresh authority replay" in str(changed.value)
+  assert source_calls == [
+    (1, rejected_name),
+    (1, ingested_name),
+    (2, rejected_name),
+    (2, ingested_name),
+  ]
+
+
 def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
@@ -908,7 +957,7 @@ def test_matching_a_a_historical_change_cannot_replace_retained_authority(
   with pytest.raises(BackfillError) as changed:
     engine.run_once()
   assert changed.value.diagnostic == "backfill_untracked_evidence"
-  assert "fresh historical replay" in str(changed.value)
+  assert "fresh authority replay" in str(changed.value)
 
 
 def test_progress_reports_both_passes_without_double_counting(

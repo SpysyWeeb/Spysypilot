@@ -6471,24 +6471,24 @@ class HistoricalLearningBackfill:
         route.route_name: route
         for route in discovered
       }
-      historical_route_names = tuple(
+      retained_authority_route_names = tuple(
         entry["route_name"]
         for entry in ledger["entries"]
-        if entry["disposition"] == "ingested"
+        if entry["disposition"] != "late_older_skipped"
       )
       missing_historical = tuple(
         route_name
-        for route_name in historical_route_names
+        for route_name in retained_authority_route_names
         if route_name not in discovered_by_name
       )
       if missing_historical:
         raise BackfillError(
           "backfill_untracked_evidence",
-          "previously ingested routes are unavailable for authoritative replay",
+          "retained authority routes are unavailable for authoritative replay",
         )
-      historical_routes = tuple(
+      retained_authority_routes = tuple(
         discovered_by_name[route_name]
-        for route_name in historical_route_names
+        for route_name in retained_authority_route_names
       )
       unprocessed = tuple(
         route
@@ -6531,7 +6531,7 @@ class HistoricalLearningBackfill:
         for route in unprocessed
         if watermark is None or route.route_counter > watermark
       )
-      authority_candidates = historical_routes + replay_candidates
+      authority_candidates = retained_authority_routes + replay_candidates
       progress = None
       if (
         progress_enabled
@@ -6857,19 +6857,23 @@ class HistoricalLearningBackfill:
       if progress is not None:
         project_progress(progress.comparing)
       verify_replay_passes(first, second)
-      historical_names = set(historical_route_names)
-      historical_results = tuple(
+      retained_authority_names = set(retained_authority_route_names)
+      retained_authority_results = tuple(
         result
         for result in first.results
-        if result.route.route_name in historical_names
+        if result.route.route_name in retained_authority_names
       )
-      if len(historical_results) != len(historical_route_names) or any(
-        result.ledger_entry() != known[result.route.route_name]
-        for result in historical_results
+      if (
+        tuple(result.route.route_name for result in retained_authority_results)
+        != retained_authority_route_names
+        or any(
+          result.ledger_entry() != known[result.route.route_name]
+          for result in retained_authority_results
+        )
       ):
         raise BackfillError(
           "backfill_untracked_evidence",
-          "fresh historical replay differs from retained authenticated evidence",
+          "fresh authority replay differs from retained authenticated evidence",
         )
       _publish_route_evidence_after_aa(
         root=artifact_paths.root,

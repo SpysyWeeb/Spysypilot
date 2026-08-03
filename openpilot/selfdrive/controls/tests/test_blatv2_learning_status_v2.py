@@ -532,6 +532,25 @@ def test_display_rejects_material_support_population_disagreement() -> None:
     validate_learning_status_payload(payload)
 
 
+def test_display_numeric_domain_rejects_overflow_and_non_numbers() -> None:
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  for value in (10**10000, True, float("nan"), float("inf")):
+    poisoned = json.loads(json.dumps(payload))
+    poisoned["nodes"][0]["speed_mps"] = value
+    with unittest.TestCase().assertRaises((TypeError, ValueError)):
+      validate_learning_status_payload(poisoned)
+
+  huge_count = json.loads(json.dumps(payload))
+  huge_count["nodes"][0]["supported_sample_count"] = 10**10000
+  with unittest.TestCase().assertRaisesRegex(ValueError, "bounded"):
+    validate_learning_status_payload(huge_count)
+
+
 def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None:
   test_case = unittest.TestCase()
   runtime, finalization = _fixtures()

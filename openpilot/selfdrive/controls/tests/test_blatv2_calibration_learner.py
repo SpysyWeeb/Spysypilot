@@ -27,6 +27,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   _Regression,
   _fit_bounded_subset,
   _fit_model_family,
+  _finite_fsum,
   _cross_fit_family,
   _cross_fit_interval_loss,
   _canonical_routes,
@@ -35,6 +36,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   _subtract,
   _validate_sign_predictor,
   _validate_joint_sign_predictor,
+  _validate_joint_predictor_moments,
   _solve,
   calibration_evidence_sha256,
   calibration_learning_sample_field_names,
@@ -1636,8 +1638,42 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     for row in range(10):
       for column in range(10):
         poison.normal[row * 10 + column] = predictor[row] * predictor[column]
-    with self.assertRaisesRegex(ValueError, "polynomial|sign/interpolation"):
+    with self.assertRaisesRegex(ValueError, "polynomial|localizing|sign/interpolation"):
       _JointRegression.decoded(poison.encoded(), "unrepresentable_joint")
+
+    signed_poison = _JointRegression()
+    signed_predictor = (0.0, 0.0, 4.0, -2.0, -2.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    signed_poison.count = 1
+    signed_poison.weight_s = 1.0
+    signed_poison.predictor_sums[:] = signed_predictor
+    for row in range(10):
+      for column in range(10):
+        signed_poison.normal[row * 10 + column] = (
+          signed_predictor[row] * signed_predictor[column]
+        )
+    with self.assertRaisesRegex(ValueError, "basis moment|Hausdorff|polynomial"):
+      _JointRegression.decoded(signed_poison.encoded(), "signed_joint")
+
+    bounded_poison = _JointRegression()
+    bounded_predictor = (0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0)
+    bounded_poison.count = 1
+    bounded_poison.weight_s = 1.0
+    bounded_poison.predictor_sums[:] = bounded_predictor
+    for row in range(10):
+      for column in range(10):
+        bounded_poison.normal[row * 10 + column] = (
+          bounded_predictor[row] * bounded_predictor[column]
+        )
+    with self.assertRaisesRegex(ValueError, "Hausdorff|localizing|polynomial"):
+      _JointRegression.decoded(bounded_poison.encoded(), "bounded_joint")
+
+    for upper_weight in (0.0, 1.0):
+      boundary = _JointRegression()
+      boundary.add((0.2, 1.0, 1.0, 0.0), 0.1, 1.0, upper_weight)
+      _JointRegression.decoded(
+        boundary.encoded(),
+        f"boundary_joint_{upper_weight}",
+      )
 
   def test_derived_base_stratum_must_remain_an_augmented_gram(self) -> None:
     whole = _Regression()
@@ -1652,6 +1688,29 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     encoded["count"] = 10**10000
     with self.assertRaisesRegex(ValueError, "schema bound"):
       _Regression.decoded(encoded, "huge_count")
+
+  def test_external_numeric_overflow_is_normalized_to_value_error(self) -> None:
+    for raw in (
+      True,
+      "nan",
+      "inf",
+      "0x1.0p+999999",
+      "0x0.0000000000001p-1074",
+    ):
+      encoded = _Regression().encoded()
+      encoded["weight_s"] = raw
+      with self.assertRaises(ValueError):
+        _Regression.decoded(encoded, "invalid_numeric")
+
+    joint = _JointRegression()
+    joint.count = 1
+    joint.weight_s = 1.0
+    joint.predictor_sums[:] = [1e308] * 10
+    with self.assertRaisesRegex(ValueError, "overflow"):
+      _validate_joint_predictor_moments(joint, "overflow_joint")
+
+    with self.assertRaisesRegex(ValueError, "overflow"):
+      _finite_fsum((1e308, 1e308), "finite_sum")
 
   def test_live_rows_are_structural_only_and_cannot_publish(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())
