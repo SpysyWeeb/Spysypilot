@@ -23,6 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
   BehaviorControlResponse,
+  BehaviorReferenceAtControl,
   BehaviorSourceIdentity,
   SparseModelBehaviorIntent,
   derive_behavior_reference,
@@ -39,6 +40,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
   make_exact_stock_behavior_replay_core,
   make_modular_behavior_replay_core,
   reviewed_replay_core_identity,
+  validate_behavior_scenario_active_frame,
   validate_reviewed_behavior_replay_core,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
@@ -52,6 +54,10 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
 )
 from openpilot.selfdrive.controls.lib.blatv2.core import ModularControllerCore
+from openpilot.selfdrive.controls.lib.blatv2.counterfactual_plant import (
+  CounterfactualPlantMember,
+  step_counterfactual_plant,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
   _encode_frame,
 )
@@ -189,12 +195,38 @@ def physical_profile() -> VehicleCalibrationProfile:
   )
 
 
+def physical_profile_with_delay(delay_s: float) -> VehicleCalibrationProfile:
+  base = physical_profile()
+  return replace(
+    base,
+    nodes=tuple(
+      replace(node, parameters=replace(node.parameters, transport_delay_s=delay_s))
+      for node in base.nodes
+    ),
+  )
+
+
 def provisional() -> ProvisionalRackDynamics:
   return ProvisionalRackDynamics(
     rack_gain_deg_s2_per_torque=1500.0,
     rack_damping_per_s=8.0,
     rack_rate_resolution_deg_s=4.0,
     provenance="synthetic explicit replay seed",
+  )
+
+
+def plant_member(
+  *,
+  gain: float = 1500.0,
+  damping: float = 8.0,
+  delay: float = 0.0,
+  load: float = 0.0,
+) -> CounterfactualPlantMember:
+  return CounterfactualPlantMember.create(
+    rack_gain_deg_s2_per_torque=gain,
+    rack_damping_per_s=damping,
+    delay_offset_s=delay,
+    unresolved_load_torque=load,
   )
 
 
@@ -526,6 +558,21 @@ def request(
   profile = physical_profile()
   references = []
   for control in route.control_inputs:
+    if control.model_publication_index is None:
+      references.append(BehaviorReferenceAtControl(
+        model_publication_mono_time_ns=0,
+        plan_time_now_s=0.0,
+        physical_effect_plan_s=0.0,
+        scalar_curvature_1pm=0.0,
+        anchored_curvature_1pm=0.0,
+        anchored_curvature_rate_1pm_s=0.0,
+        anchored_curvature_accel_1pm_s2=0.0,
+        desired_rack_angle_deg=0.0,
+        desired_rack_rate_deg_s=0.0,
+        desired_rack_accel_deg_s2=0.0,
+        valid=False,
+      ))
+      continue
     model = route.model_publications[control.model_publication_index]
     references.append(derive_behavior_reference(
       model,
@@ -605,6 +652,8 @@ def test_reviewed_core_authority_rejects_injected_vehicle_interface() -> None:
 
 def streaming_stepper(
   replay_request: ControllerReplayRequest,
+  *,
+  plant_member: CounterfactualPlantMember | None = None,
 ) -> tuple[BehaviorReplayStepper, tuple[ReplayFrameInput, ...]]:
   inputs = tuple(
     ReplayFrameInput.from_bytes(control.core_input)
@@ -617,6 +666,7 @@ def streaming_stepper(
     first_frame_input=inputs[0],
     nominal_rack_mapping=replay_request.route.control_inputs[0].nominal_rack_mapping,
     provisional_dynamics=provisional(),
+    plant_member=plant_member,
     interface_registry=INTERFACES,
   ), inputs
 
@@ -669,6 +719,45 @@ def test_replay_frame_input_roundtrip_is_exact_and_strict() -> None:
       assert "keys" in str(exc)
     else:
       raise AssertionError("strict input schema accepted missing fields")
+
+
+def test_replay_frame_input_validates_live_torque_values_only_when_consumed() -> None:
+  cp_bytes = synthetic_cp().to_bytes()
+  ignored = replace(
+    frame_input(0, cp_bytes),
+    live_torque_friction=-3.0,
+    live_torque_inputs_valid=False,
+    live_torque_use_params=True,
+  )
+  restored = ReplayFrameInput.from_bytes(ignored.to_bytes())
+  assert restored.live_torque_friction == -3.0
+  assert not restored.live_torque_inputs_valid
+
+  def route_with_ignored_friction(friction: float):
+    route = decoded_route()
+    controls = list(route.control_inputs)
+    payload = ReplayFrameInput.from_bytes(controls[1].core_input)
+    controls[1] = replace(
+      controls[1],
+      core_input=replace(
+        payload,
+        live_torque_friction=friction,
+        live_torque_inputs_valid=False,
+        live_torque_use_params=True,
+      ).to_bytes(),
+    )
+    return replace(route, control_inputs=tuple(controls))
+
+  first = tuple(stock_core().replay_route(request(route_with_ignored_friction(-3.0), modular=False)))
+  second = tuple(stock_core().replay_route(request(route_with_ignored_friction(-30.0), modular=False)))
+  assert first == second
+
+  try:
+    replace(ignored, live_torque_inputs_valid=True)
+  except ValueError as error:
+    assert "consumed live torque friction" in str(error)
+  else:
+    raise AssertionError("consumed negative live torque friction was accepted")
 
 
 def test_decoder_preserves_inactive_premodel_prefix_and_exact_links() -> None:
@@ -732,6 +821,61 @@ def test_scenario_decoder_preserves_unverified_recorded_source_without_relabelin
   assert provenance.route_evidence_sha256 == artifact.sha256
 
 
+def test_active_scenario_validation_matches_cert_v5_physical_and_finite_contract() -> None:
+  artifact = route_evidence_with_inactive_premodel_prefix()
+  physical = tuple(artifact.iter_physical_frames())[1]
+  witness = artifact.control_witnesses[1]
+  model = artifact.model_publications[0]
+  torque = artifact.live_torque_parameters[0]
+  delay = artifact.live_delays[0]
+
+  def corrupted(value, field: str, replacement=math.nan):
+    result = replace(value)
+    object.__setattr__(result, field, replacement)
+    return result
+
+  def validate(**changes) -> None:
+    validate_behavior_scenario_active_frame(
+      physical_record_index=1,
+      rack_acceleration_valid=True,
+      witness=changes.get("witness", witness),
+      physical=changes.get("physical", physical),
+      model=changes.get("model", model),
+      live_torque=changes.get("live_torque", torque),
+      live_delay=changes.get("live_delay", delay),
+      maneuver=None,
+    )
+
+  validate()
+  rejected = (
+    {
+      "witness": replace(
+        witness,
+        car_control_paired=False,
+        car_control_mono_ns=-1,
+      ),
+    },
+    {"physical": replace(physical, inputs_valid=False)},
+    {
+      "witness": replace(witness, inputs_valid=False),
+      "physical": replace(physical, inputs_valid=False),
+    },
+    {"model": corrupted(model, "desired_curvature_time_s")},
+    {"model": corrupted(model, "plan_times", (math.nan, 0.05, 0.1))},
+    {"live_torque": corrupted(torque, "lat_accel_factor")},
+    {"live_torque": corrupted(torque, "lat_accel_offset")},
+    {"live_torque": corrupted(torque, "friction")},
+    {"live_delay": corrupted(delay, "lateral_delay_s")},
+  )
+  for values in rejected:
+    try:
+      validate(**values)
+    except BehaviorReplayError:
+      pass
+    else:
+      raise AssertionError(f"cert-v5-invalid active scenario was admitted: {values}")
+
+
 def test_scenario_identity_binds_ordered_recorded_sources() -> None:
   base = route_evidence_with_inactive_premodel_prefix()
   source = replace(
@@ -768,25 +912,30 @@ def test_scenario_identity_binds_ordered_recorded_sources() -> None:
   ] == ["unverified_stock_composition", "unverified_stock_composition"]
 
 
-def test_scenario_decoder_rejects_incompatible_unresolved_and_inactive_evidence() -> None:
+def test_recorded_controller_reason_cannot_veto_valid_scenario_replay() -> None:
   base = route_evidence_with_inactive_premodel_prefix()
   decoder = make_behavior_scenario_route_evidence_decoder(
     provisional_dynamics=provisional(),
     interface_registry=INTERFACES,
   )
-  incompatible_source = replace(
+  recorded_ineligible_source = replace(
     base.source_identity,
     controller_source_kind="ineligible",
     behavior_eligible=False,
-    behavior_ineligible_reason="exact_model_link_missing",
+    behavior_ineligible_reason="lateral_maneuver_plan_missing",
   )
-  incompatible = replace_route_evidence(base, source=incompatible_source)
-  try:
-    decoder(incompatible, physical_profile())
-  except BehaviorReplayError as error:
-    assert "scenario-incompatible" in str(error)
-  else:
-    raise AssertionError("scenario decoder admitted incompatible source evidence")
+  recorded_ineligible = replace_route_evidence(base, source=recorded_ineligible_source)
+  decoded = decoder(recorded_ineligible, physical_profile())
+  assert decoded.scenario_provenance is not None
+  assert not decoded.scenario_provenance.recorded_behavior_eligible
+  assert (
+    decoded.scenario_provenance.recorded_behavior_ineligible_reason
+    == "lateral_maneuver_plan_missing"
+  )
+  for core, modular in ((stock_core(), False), (modular_core(), True)):
+    outputs = tuple(core.replay_route(request(decoded, modular=modular)))
+    assert len(outputs) == len(decoded.control_inputs)
+    assert any(output.response_eligible for output in outputs)
 
   scenario_source = replace(
     base.source_identity,
@@ -933,6 +1082,98 @@ def test_recorded_response_after_bootstrap_cannot_leash_candidate() -> None:
   assert baseline[1:] == perturbed[1:]
 
 
+def test_controller_sees_can_torque_while_rack_response_obeys_positive_delay() -> None:
+  replay_request = request(decoded_route(), modular=True)
+  inputs = tuple(
+    ReplayFrameInput.from_bytes(control.core_input)
+    for control in replay_request.route.control_inputs
+  )
+  stepper = BehaviorReplayStepper(
+    vehicle_identity=replay_request.route.vehicle_identity,
+    physical_profile=physical_profile_with_delay(0.02),
+    policy=replay_request.policy,
+    first_frame_input=inputs[0],
+    nominal_rack_mapping=replay_request.route.control_inputs[0].nominal_rack_mapping,
+    provisional_dynamics=provisional(),
+    plant_member=plant_member(delay=0.0),
+    interface_registry=INTERFACES,
+  )
+  observed_controller_applied: list[float] = []
+  original_update = ModularControllerCore.update
+
+  def traced_update(self, *args, **kwargs):
+    observed_controller_applied.append(kwargs["recorded_applied_torque"])
+    return original_update(self, *args, **kwargs)
+
+  outputs = []
+  rack_effective = []
+  with patch.object(ModularControllerCore, "update", traced_update):
+    for control, frame_input, reference in zip(
+      replay_request.route.control_inputs,
+      inputs,
+      replay_request.references,
+      strict=True,
+    ):
+      model = (
+        None
+        if control.model_publication_index is None
+        else replay_request.route.model_publications[control.model_publication_index]
+      )
+      outputs.append(stepper.step(
+        control=control,
+        frame_input=frame_input,
+        model_intent=model,
+        reference=reference,
+      ))
+      rack_effective.append(
+        None
+        if stepper.state is None
+        else stepper.delay_line.latest_rack_effective_torque
+      )
+
+  assert observed_controller_applied == [
+    output.envelope_applied_torque for output in outputs[:-1]
+  ]
+  assert any(
+    effective is not None and effective != output.envelope_applied_torque
+    for effective, output in zip(rack_effective[1:], outputs[1:], strict=True)
+  )
+
+
+def test_independent_plant_member_changes_response_without_changing_controller_bytes() -> None:
+  replay_request = request(decoded_route(), modular=True)
+  slow, _ = streaming_stepper(
+    replay_request,
+    plant_member=plant_member(gain=500.0, damping=12.0),
+  )
+  fast, _ = streaming_stepper(
+    replay_request,
+    plant_member=plant_member(gain=3000.0, damping=4.0),
+  )
+  slow_outputs = stream_request(replay_request, slow)
+  fast_outputs = stream_request(replay_request, fast)
+  assert slow.plant_member.member_id != fast.plant_member.member_id
+  assert output_bytes(slow_outputs) != output_bytes(fast_outputs)
+
+
+def test_platform_fault_latches_and_freezes_until_next_episode() -> None:
+  replay_request = request(decoded_route(), modular=True)
+  controls = list(replay_request.route.control_inputs)
+  controls[7] = replace(controls[7], platform_fault=True)
+  replay_request = replace(
+    replay_request,
+    route=replace(replay_request.route, control_inputs=tuple(controls)),
+  )
+  outputs = stream_request(replay_request)
+  assert all(output.controller_fault for output in outputs[7:])
+  assert all(not output.response_eligible for output in outputs[7:])
+  assert all(
+    (output.measured_rack_angle_deg, output.measured_rack_rate_deg_s)
+    == (outputs[7].measured_rack_angle_deg, outputs[7].measured_rack_rate_deg_s)
+    for output in outputs[8:]
+  )
+
+
 def test_intervention_censors_episode_and_next_boundary_rebootstraps() -> None:
   route = decoded_route(intervention_index=10, second_episode=True)
   outputs = tuple(modular_core().replay_route(request(route, modular=True)))
@@ -1047,6 +1288,29 @@ def test_nonfinite_core_output_is_finite_fault_and_not_eligible() -> None:
   assert math.isfinite(failed.raw_requested_torque)
   assert failed.controller_fault
   assert not failed.response_eligible
+
+
+def test_final_frame_plant_failure_is_reported_on_that_frame() -> None:
+  replay_request = request(decoded_route(), modular=True)
+  call_count = 0
+  expected_calls = len(replay_request.route.control_inputs) - 1
+
+  def fail_last(**kwargs):
+    nonlocal call_count
+    call_count += 1
+    if call_count == expected_calls:
+      raise ValueError("synthetic final plant failure")
+    return step_counterfactual_plant(**kwargs)
+
+  with patch(
+    "openpilot.selfdrive.controls.lib.blatv2.behavior_replay.step_counterfactual_plant",
+    side_effect=fail_last,
+  ):
+    outputs = tuple(modular_core().replay_route(replay_request))
+
+  assert call_count == expected_calls
+  assert outputs[-1].controller_fault
+  assert not outputs[-1].response_eligible
 
 
 def test_core_input_ignores_later_recorded_request_and_applied_values() -> None:

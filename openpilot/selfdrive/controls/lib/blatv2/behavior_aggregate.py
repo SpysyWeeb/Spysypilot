@@ -66,7 +66,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_route_evaluator import (
 
 
 BEHAVIOR_AGGREGATE_SPEC_SCHEMA_VERSION = 1
-BEHAVIOR_AGGREGATE_ARTIFACT_SCHEMA_VERSION = 1
+BEHAVIOR_AGGREGATE_ARTIFACT_SCHEMA_VERSION = 2
 BEHAVIOR_AGGREGATE_EVALUATION_SCHEMA_VERSION = 1
 BEHAVIOR_TRAINING_COMPARISON_SCHEMA_VERSION = 1
 BEHAVIOR_AGGREGATE_SELECTION_SCHEMA_VERSION = 1
@@ -377,6 +377,7 @@ class BehaviorAggregateArtifactIdentity:
   replay_artifact: ReplayArtifactIdentity
   physical_profile_sha256: str
   provisional_dynamics_sha256: str
+  plant_member_id: str
   metric_config_sha256: str
   segmentation_config_sha256: str
   preparation_schema_version: int
@@ -398,6 +399,7 @@ class BehaviorAggregateArtifactIdentity:
       ("aggregate specification", self.aggregate_spec_sha256),
       ("physical profile", self.physical_profile_sha256),
       ("provisional dynamics", self.provisional_dynamics_sha256),
+      ("plant member", self.plant_member_id),
       ("metric configuration", self.metric_config_sha256),
       ("segmentation configuration", self.segmentation_config_sha256),
     ):
@@ -421,6 +423,7 @@ class BehaviorAggregateArtifactIdentity:
       "metricConfigSha256": self.metric_config_sha256,
       "orderedRoutes": [route.to_dict() for route in self.ordered_routes],
       "physicalProfileSha256": self.physical_profile_sha256,
+      "plantMemberId": self.plant_member_id,
       "preparationSchemaVersion": self.preparation_schema_version,
       "provisionalDynamicsSha256": self.provisional_dynamics_sha256,
       "replayArtifact": self.replay_artifact.to_dict(),
@@ -480,6 +483,7 @@ class BehaviorAggregateEvaluation:
       if (
         result.physical_profile_sha256 != self.identity.physical_profile_sha256
         or result.provisional_dynamics_sha256 != self.identity.provisional_dynamics_sha256
+        or result.plant_member_id != self.identity.plant_member_id
         or result.metric_config_sha256 != self.identity.metric_config_sha256
         or result.segmentation_config_sha256 != self.identity.segmentation_config_sha256
         or result.preparation_schema_version != self.identity.preparation_schema_version
@@ -623,6 +627,8 @@ def aggregate_behavior_route_results(
       raise BehaviorAggregateError("route results mix physical profiles")
     if result.provisional_dynamics_sha256 != spec.provisional_dynamics_sha256:
       raise BehaviorAggregateError("route results mix provisional dynamics")
+    if result.plant_member_id != first.plant_member_id:
+      raise BehaviorAggregateError("route results mix counterfactual plant members")
     if result.metric_config_sha256 != spec.gate_spec.metric_config.sha256:
       raise BehaviorAggregateError("route result metric configuration differs from gate")
     if result.segmentation_config_sha256 != spec.segmentation_config_sha256:
@@ -657,6 +663,7 @@ def aggregate_behavior_route_results(
     replay_artifact=expected_artifact,
     physical_profile_sha256=spec.physical_profile_sha256,
     provisional_dynamics_sha256=spec.provisional_dynamics_sha256,
+    plant_member_id=first.plant_member_id,
     metric_config_sha256=spec.gate_spec.metric_config.sha256,
     segmentation_config_sha256=spec.segmentation_config_sha256,
     preparation_schema_version=BEHAVIOR_ROUTE_PREPARATION_SCHEMA_VERSION,
@@ -764,6 +771,7 @@ def _validate_opponent_population(
     (
       evaluation.identity.physical_profile_sha256,
       evaluation.identity.provisional_dynamics_sha256,
+      evaluation.identity.plant_member_id,
       evaluation.identity.metric_config_sha256,
       evaluation.identity.segmentation_config_sha256,
       evaluation.identity.preparation_schema_version,
@@ -775,6 +783,7 @@ def _validate_opponent_population(
     (
       spec.physical_profile_sha256,
       spec.provisional_dynamics_sha256,
+      stock.identity.plant_member_id,
       spec.gate_spec.metric_config.sha256,
       spec.segmentation_config_sha256,
       spec.preparation_schema_version,

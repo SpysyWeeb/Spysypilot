@@ -9,7 +9,7 @@ controller request producers, but deliberately only one episode simulator:
   :func:`fresh_stock_torque_controller` and preserves controlsd's
   ``clip_curvature``/VehicleModel/live-torque state; and
 * both requests pass through the exact count-space opendbc envelope and the
-  same :func:`step_plant` implementation.
+  same independently identified counterfactual plant member.
 
 The strict behavior decoder retains the original homogeneous-controller
 qualification contract.  A separate scenario-only decoder admits an older or
@@ -45,10 +45,8 @@ import math
 from types import SimpleNamespace
 from typing import Any
 
-from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
 
-from openpilot.cereal import messaging
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   RuntimeTorqueLimits,
@@ -81,6 +79,11 @@ from openpilot.selfdrive.controls.lib.blatv2.core import (
   CoreStatus,
   ModularControllerCore,
 )
+from openpilot.selfdrive.controls.lib.blatv2.counterfactual_plant import (
+  AppliedTorqueDelayLine,
+  CounterfactualPlantMember,
+  step_counterfactual_plant,
+)
 from openpilot.selfdrive.controls.lib.blatv2.intent import (
   INTENT_CAPACITY,
   adapt_model_intent_into,
@@ -91,8 +94,11 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
 from openpilot.selfdrive.controls.lib.blatv2.plant import (
   RackState,
   TrackingPolicy,
-  step_plant,
 )
+from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import (
+  MeasuredLearningFrame,
+)
+from openpilot.selfdrive.controls.lib.blatv2.preparation_contract import decode_car_params
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
   curvature_from_measured_angle,
@@ -131,16 +137,6 @@ MODULAR_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-modular-core-v1"
 # in the off-device harness; the exact-stock tests pin it against modeld.py,
 # and the replay identity pins the source commit.
 SOURCE_LAT_SMOOTH_SECONDS = 0.0
-# These reasons describe an unverified recorded controller, not missing
-# counterfactual inputs. They may enter scenario-only replay while remaining
-# explicitly ineligible as recorded-controller behavioral evidence.
-SCENARIO_COMPATIBLE_RECORDED_SOURCE_REASONS = frozenset({
-  "eligible",
-  "mixed_controller_sources",
-  "unverified_controller_source",
-  "unverified_modular_artifact",
-  "unverified_stock_composition",
-})
 _CORE_INPUT_KEYS = frozenset({
   "appliedCountValid",
   "carParamsBase64",
@@ -362,8 +358,14 @@ class ReplayFrameInput:
       and self.live_torque_lat_accel_factor <= 0.0
     ):
       raise ValueError("live torque factor must be positive")
-    if self.live_torque_friction < 0.0 or self.lateral_delay_seconds < 0.0:
-      raise ValueError("friction and lateral delay must be non-negative")
+    if (
+      self.live_torque_inputs_valid
+      and self.live_torque_use_params
+      and self.live_torque_friction < 0.0
+    ):
+      raise ValueError("consumed live torque friction must be non-negative")
+    if self.lateral_delay_seconds < 0.0:
+      raise ValueError("lateral delay must be non-negative")
     if any(index < -1 for index in (
       self.live_torque_parameters_publication_index,
       self.lateral_delay_publication_index,
@@ -585,6 +587,135 @@ def _linked_publication(
   return values[index]
 
 
+def validate_behavior_scenario_active_frame(
+  *,
+  physical_record_index: int,
+  rack_acceleration_valid: bool,
+  witness: ControlsWitness,
+  physical: Any,
+  model: ModelPublication | None,
+  live_torque: LiveTorqueParametersPublication | None,
+  live_delay: LiveDelayPublication | None,
+  maneuver: LateralManeuverPlanPublication | None,
+) -> None:
+  """Validate every input consumed by one lateral-active scenario frame.
+
+  This is the full-route counterpart of certification-vector v5's bounded
+  scenario plane.  It runs before reference derivation or either controller is
+  advanced. Exact-stock calibration may legitimately retain its initialized
+  or last accepted value when the witnessed live-torque checks did not pass;
+  missing context and synthetic delay fallback remain forbidden. Live
+  rack-mapping validity remains the separate pinned measured-frame contract.
+  """
+  if not isinstance(witness, ControlsWitness):
+    raise TypeError("behavior scenario validation requires a controls witness")
+  if not witness.lateral_active:
+    return
+  if witness.race_unresolved:
+    raise BehaviorReplayError("active lateral scenario contains unresolved evidence")
+  if witness.gap_from_previous:
+    raise BehaviorReplayError("active lateral scenario lacks valid control cadence")
+  if not witness.car_control_paired:
+    raise BehaviorReplayError("active lateral scenario lacks carControl context")
+  if not isinstance(physical, MeasuredLearningFrame):
+    raise TypeError("active lateral scenario physical frame is malformed")
+  if witness.inputs_valid != physical.inputs_valid:
+    raise BehaviorReplayError(
+      "active lateral scenario invalid evidence: physical validity disagrees",
+    )
+  if not witness.message_valid or not physical.inputs_valid:
+    raise BehaviorReplayError("active lateral scenario contains invalid evidence")
+  if physical_record_index != 0 and not rack_acceleration_valid:
+    raise BehaviorReplayError("active lateral scenario lacks valid control cadence")
+  if (
+    not witness.model_link_valid
+    or witness.model_publication_index < 0
+    or not isinstance(model, ModelPublication)
+  ):
+    raise BehaviorReplayError("active lateral scenario lacks exact model intent")
+  if model.mono_time_ns > witness.mono_time_ns:
+    raise BehaviorReplayError("active lateral scenario model link points to the future")
+  if not model.message_valid or not witness.model_message_alive:
+    raise BehaviorReplayError("active lateral scenario model intent is not valid and alive")
+  model_payload_valid = (
+    model.frame_id >= 0
+    and 0 <= model.timestamp_eof_ns <= model.mono_time_ns
+    and math.isfinite(model.desired_curvature_time_s)
+    and model.desired_curvature_time_s >= 0.0
+    and model.native_grid_valid
+    and bool(model.plan_times)
+    and math.isfinite(model.plan_times[0])
+    and model.plan_times[0] >= 0.0
+  )
+  if not model_payload_valid:
+    raise BehaviorReplayError("active lateral scenario model intent payload is invalid")
+  if (
+    not witness.torque_output_can_valid
+    or type(witness.torque_output_can_count) is not int
+    or not math.isfinite(physical.applied_torque)
+  ):
+    raise BehaviorReplayError("active lateral scenario lacks exact applied torque")
+
+  if (
+    not witness.live_torque_parameters_available
+    or witness.live_torque_parameters_index < 0
+    or not isinstance(live_torque, LiveTorqueParametersPublication)
+  ):
+    raise BehaviorReplayError("active lateral scenario lacks live torque context")
+  if live_torque.mono_time_ns > witness.mono_time_ns:
+    raise BehaviorReplayError("active lateral scenario live torque link points to the future")
+  if not live_torque.message_valid:
+    raise BehaviorReplayError("active lateral scenario live torque publication is invalid")
+  if not witness.live_torque_parameters_health_exact:
+    raise BehaviorReplayError(
+      "active lateral scenario lacks exact stock calibration health",
+    )
+  # These payload scalars are consumed only when the exact witness-time health
+  # check passed and the publication selected parameter use.  Failed checks or
+  # useParams=false deliberately leave even negative sentinel values inert.
+  if witness.live_torque_parameters_checks_passed and live_torque.use_params:
+    if (
+      not math.isfinite(live_torque.lat_accel_factor)
+      or live_torque.lat_accel_factor <= 0.0
+      or not math.isfinite(live_torque.lat_accel_offset)
+      or not math.isfinite(live_torque.friction)
+      or live_torque.friction < 0.0
+    ):
+      raise BehaviorReplayError("active lateral scenario live torque payload is invalid")
+
+  if (
+    not witness.live_delay_available
+    or witness.live_delay_index < 0
+    or not isinstance(live_delay, LiveDelayPublication)
+  ):
+    raise BehaviorReplayError("active lateral scenario lacks live delay context")
+  if live_delay.mono_time_ns > witness.mono_time_ns:
+    raise BehaviorReplayError("active lateral scenario live delay link points to the future")
+  if (
+    not live_delay.message_valid
+    or not math.isfinite(live_delay.lateral_delay_s)
+    or live_delay.lateral_delay_s < 0.0
+  ):
+    raise BehaviorReplayError("active lateral scenario live delay payload is invalid")
+
+  maneuver_link_present = (
+    witness.maneuver_plan_available
+    or witness.lateral_maneuver_plan_index >= 0
+  )
+  if maneuver_link_present and not isinstance(
+    maneuver,
+    LateralManeuverPlanPublication,
+  ):
+    raise BehaviorReplayError("active lateral scenario maneuver context is invalid")
+  if maneuver is not None:
+    if maneuver.mono_time_ns > witness.mono_time_ns:
+      raise BehaviorReplayError("active lateral scenario maneuver link points to the future")
+    if maneuver.message_valid:
+      raise BehaviorReplayError(
+        "active lateral scenario uses a lateral maneuver plan override",
+      )
+
+
 def behavior_rack_mapping_from_physical_frame(
   vehicle_model: VehicleModel,
   physical: Any,
@@ -666,6 +797,16 @@ def build_canonical_behavior_frame(
   ):
     if publication is not None and publication.mono_time_ns > witness.mono_time_ns:
       raise BehaviorReplayError(f"{name} link points to a future publication")
+  validate_behavior_scenario_active_frame(
+    physical_record_index=index,
+    rack_acceleration_valid=rack_acceleration_valid,
+    witness=witness,
+    physical=physical,
+    model=model,
+    live_torque=live_torque,
+    live_delay=live_delay,
+    maneuver=maneuver,
+  )
   live_mapping = behavior_rack_mapping_from_physical_frame(mapping_model, physical)
   live_parameters_inputs_valid = (
     live_mapping is not None
@@ -839,10 +980,6 @@ def behavior_scenario_provenance_from_route_source(
   route_evidence_sha256: str,
 ) -> BehaviorScenarioProvenance:
   """Validate and preserve an authenticated recorded source as a scenario."""
-  if source.behavior_ineligible_reason not in SCENARIO_COMPATIBLE_RECORDED_SOURCE_REASONS:
-    raise BehaviorReplayError(
-      f"route evidence is scenario-incompatible: {source.behavior_ineligible_reason}",
-    )
   return BehaviorScenarioProvenance(
     schema_version=BEHAVIOR_SCENARIO_PROVENANCE_SCHEMA_VERSION,
     route_id=source.route_id,
@@ -854,24 +991,6 @@ def behavior_scenario_provenance_from_route_source(
     runtime_identity=source.runtime_identity,
     preparation_cache_key=source.preparation_cache_key,
   )
-
-
-def validate_behavior_scenario_active_witness(witness: ControlsWitness) -> None:
-  """Fail closed on an active witness lacking complete replay inputs."""
-  if not isinstance(witness, ControlsWitness):
-    raise TypeError("behavior scenario validation requires a controls witness")
-  if not witness.message_valid or not witness.inputs_valid:
-    raise BehaviorReplayError("active lateral scenario contains invalid evidence")
-  if witness.race_unresolved:
-    raise BehaviorReplayError("active lateral scenario contains unresolved evidence")
-  if not witness.model_link_valid or witness.model_publication_index < 0:
-    raise BehaviorReplayError("active lateral scenario lacks exact model intent")
-  if not witness.torque_output_can_valid:
-    raise BehaviorReplayError("active lateral scenario lacks exact applied torque")
-  if not witness.live_torque_parameters_health_exact:
-    raise BehaviorReplayError(
-      "active lateral scenario lacks exact stock calibration health",
-    )
 
 
 def behavior_scenario_set_identity(
@@ -1030,14 +1149,6 @@ def _make_behavior_route_evidence_decoder(
         witness.maneuver_plan_available,
         name="lateral maneuver",
       )
-      if (
-        witness.lateral_active
-        and maneuver is not None
-        and maneuver.message_valid
-      ):
-        raise BehaviorReplayError(
-          "active lateral scenario uses a lateral maneuver plan override",
-        )
       control, _, _ = build_canonical_behavior_frame(
         index=index,
         source=source,
@@ -1057,13 +1168,8 @@ def _make_behavior_route_evidence_decoder(
       )
       controls.append(control)
     if scenario_only:
-      active_witnesses = tuple(
-        witness for witness in artifact.control_witnesses if witness.lateral_active
-      )
-      if not active_witnesses:
+      if not any(witness.lateral_active for witness in artifact.control_witnesses):
         raise BehaviorReplayError("route evidence has no active lateral scenario")
-      for witness in active_witnesses:
-        validate_behavior_scenario_active_witness(witness)
     events = tuple(sorted(
       (
         EventLocator(
@@ -1101,7 +1207,7 @@ def decode_behavior_car_params(encoded: bytes) -> Any:
   if not encoded:
     raise BehaviorReplayError("route replay lacks canonical CarParams bytes")
   try:
-    params = messaging.log_from_bytes(encoded, car.CarParams)
+    params = decode_car_params(encoded)
     # Force the fields used during construction while the capnp reader is in
     # scope; malformed/non-CarParams payloads fail here rather than later.
     str(params.carFingerprint)
@@ -1260,6 +1366,7 @@ class _ModularRequestProducer(_RequestProducer):
     )
     self.params = runtime.car_params
     self.profile = runtime.controller_profile
+    self.steer_max = runtime.runtime_bundle.torque_limits.steer_max
     self.plan_times = [0.0] * INTENT_CAPACITY
     self.orientation_rates = [0.0] * INTENT_CAPACITY
     self.velocities = [0.0] * INTENT_CAPACITY
@@ -1323,7 +1430,10 @@ class _ModularRequestProducer(_RequestProducer):
       measured_rack_angle_deg=state.angle_deg,
       measured_rack_rate_deg_s=state.rate_deg_s,
       measured_rack_acceleration_deg_s2=acceleration_deg_s2,
-      recorded_applied_torque=state.applied_torque,
+      # The controller receives the previous torque actually placed on CAN.
+      # Rack-effective torque is delay-line/plant state and must never be fed
+      # back as if the actuator had emitted it this frame.
+      recorded_applied_torque=previous_applied_counts / self.steer_max,
       lateral_accel_offset=float(self.params.lateralTuning.torque.latAccelOffset),
       live_mapping=control.live_rack_mapping,
       lateral_active=True,
@@ -1497,6 +1607,7 @@ class BehaviorReplayStepper:
     first_frame_input: ReplayFrameInput,
     nominal_rack_mapping: RackMappingSnapshot,
     provisional_dynamics: ProvisionalRackDynamics,
+    plant_member: CounterfactualPlantMember | None = None,
     interface_registry: Mapping[str, type] | None = None,
   ) -> None:
     if not vehicle_identity.strip():
@@ -1522,6 +1633,30 @@ class BehaviorReplayStepper:
     )
     self.policy = policy
     self.limits = self.runtime.runtime_bundle.torque_limits
+    if plant_member is None:
+      # Compatibility-only diagnostic member for legacy callers. Selection
+      # authorities pass an independently identified member explicitly.
+      plant_member = CounterfactualPlantMember.create(
+        rack_gain_deg_s2_per_torque=(
+          provisional_dynamics.rack_gain_deg_s2_per_torque
+        ),
+        rack_damping_per_s=provisional_dynamics.rack_damping_per_s,
+        delay_offset_s=0.0,
+        unresolved_load_torque=0.0,
+      )
+    if not isinstance(plant_member, CounterfactualPlantMember):
+      raise TypeError("behavior stepper requires a counterfactual plant member")
+    self.plant_member = plant_member
+    maximum_delay = max(
+      self.plant_member.effective_delay_s(
+        node.parameters.transport_delay_s,
+      )
+      for node in self.runtime.controller_profile.nodes
+    )
+    self.delay_line = AppliedTorqueDelayLine(
+      fixed_dt_s=DT_CTRL,
+      maximum_delay_s=maximum_delay,
+    )
     self._car_params_bytes = first_frame_input.car_params_bytes
     self.reset()
 
@@ -1566,6 +1701,7 @@ class BehaviorReplayStepper:
     # The route's recorded request belongs to the controller which happened
     # to drive it. It cannot perturb stock or candidate counterfactual state.
     self.previous_requested_counts = frame_input.recorded_applied_counts
+    self.delay_line.reset(applied)
     self.censored = False
     self.episode_faulted = False
     self.producer = self._fresh_producer()
@@ -1578,6 +1714,8 @@ class BehaviorReplayStepper:
     self,
     control: CanonicalBehaviorControlInput,
     frame_input: ReplayFrameInput,
+    *,
+    controller_fault: bool = False,
   ) -> ControllerFrameOutput:
     counts = (
       frame_input.recorded_applied_counts
@@ -1609,7 +1747,34 @@ class BehaviorReplayStepper:
       requested_counts=counts,
       limits=self.limits,
       response_eligible=False,
-      controller_fault=False,
+      controller_fault=controller_fault,
+    )
+
+  def _faulted_output(
+    self,
+    control: CanonicalBehaviorControlInput,
+  ) -> ControllerFrameOutput:
+    assert self.state is not None
+    try:
+      curvature = _measured_curvature(
+        self.state,
+        control.speed_mps,
+        control.live_rack_mapping,
+        control.nominal_rack_mapping,
+      )
+    except (TypeError, ValueError, OverflowError):
+      curvature = 0.0
+    return _output(
+      mono_time_ns=control.mono_time_ns,
+      state=self.state,
+      acceleration_deg_s2=self.acceleration_deg_s2,
+      measured_curvature=curvature,
+      raw_requested_torque=self.previous_applied_counts / self.limits.steer_max,
+      applied_counts=self.previous_applied_counts,
+      requested_counts=self.previous_applied_counts,
+      limits=self.limits,
+      response_eligible=False,
+      controller_fault=True,
     )
 
   def _validate_frame(
@@ -1680,12 +1845,14 @@ class BehaviorReplayStepper:
 
     if engagement_boundary and not self._bootstrap(frame_input):
       self.previous_active = True
-      return self._inactive_output(control, frame_input)
+      return self._inactive_output(control, frame_input, controller_fault=True)
     self.previous_active = True
     if control.driver_intervention_onset or frame_input.intervention_onset_uncertain:
       self.censored = True
     if self.state is None or self.producer is None:
-      return self._inactive_output(control, frame_input)
+      self.episode_faulted = True
+      self.censored = True
+      return self._inactive_output(control, frame_input, controller_fault=True)
 
     runtime_valid = (
       control.inputs_valid
@@ -1695,11 +1862,16 @@ class BehaviorReplayStepper:
     )
     if not runtime_valid:
       self.episode_faulted = True
+    if control.platform_fault:
+      self.episode_faulted = True
+      self.censored = True
     previous_output_constrained = (
       abs(
         self.previous_requested_counts - self.previous_applied_counts,
       ) / self.limits.steer_max > 1e-2
     )
+    if self.episode_faulted:
+      return self._faulted_output(control)
     raw = 0.0
     controller_fault = self.episode_faulted
     if not self.episode_faulted:
@@ -1717,6 +1889,10 @@ class BehaviorReplayStepper:
     if not math.isfinite(raw):
       raw = 0.0
       controller_fault = True
+    if controller_fault:
+      self.episode_faulted = True
+      self.censored = True
+      return self._faulted_output(control)
     requested_counts = int(round(raw * self.limits.steer_max))
     try:
       applied_counts = apply_torque_envelope_counts(
@@ -1732,17 +1908,13 @@ class BehaviorReplayStepper:
         control.nominal_rack_mapping,
       )
     except (TypeError, ValueError, OverflowError):
-      applied_counts = self.previous_applied_counts
-      requested_counts = self.previous_applied_counts
-      curvature = 0.0
-      raw = applied_counts / self.limits.steer_max
-      controller_fault = True
       self.episode_faulted = True
+      self.censored = True
+      return self._faulted_output(control)
     response_eligible = (
       runtime_valid
       and not self.censored
       and not controller_fault
-      and not control.platform_fault
     )
     output = _output(
       mono_time_ns=control.mono_time_ns,
@@ -1766,24 +1938,38 @@ class BehaviorReplayStepper:
       control.speed_mps,
     ).parameters
     try:
-      plant_step = step_plant(
-        self.state,
-        applied_counts / self.limits.steer_max,
-        control.speed_mps,
-        selected_mapping,
-        control.nominal_rack_mapping,
-        float(self.runtime.car_params.lateralTuning.torque.latAccelOffset)
-        + parameters.lateral_accel_offset_correction_mps2,
-        parameters,
-        # Counterfactual observer learning is disabled; the plant and core
-        # therefore share the same explicit zero disturbance.
-        0.0,
-        DT_CTRL,
+      can_applied_torque = applied_counts / self.limits.steer_max
+      rack_effective_torque = self.delay_line.commit_and_sample(
+        can_applied_torque,
+        self.plant_member.effective_delay_s(parameters.transport_delay_s),
       )
-      self.state = plant_step.state
+      plant_step = step_counterfactual_plant(
+        state=self.state,
+        rack_effective_torque=rack_effective_torque,
+        speed_mps=control.speed_mps,
+        mapping=selected_mapping,
+        nominal_mapping=control.nominal_rack_mapping,
+        lateral_accel_offset=(
+          float(self.runtime.car_params.lateralTuning.torque.latAccelOffset)
+          + parameters.lateral_accel_offset_correction_mps2
+        ),
+        base_parameters=parameters,
+        member=self.plant_member,
+        dt=DT_CTRL,
+      )
+      # RackState remains the controller-facing state: its applied torque is
+      # the latest command placed on CAN. The delayed rack-effective value is
+      # owned exclusively by the delay line.
+      self.state = RackState(
+        plant_step.state.angle_deg,
+        plant_step.state.rate_deg_s,
+        can_applied_torque,
+      )
       self.acceleration_deg_s2 = plant_step.acceleration_deg_s2
     except (TypeError, ValueError, OverflowError):
       self.episode_faulted = True
+      self.censored = True
+      return self._faulted_output(control)
     self.previous_requested_counts = requested_counts
     self.previous_applied_counts = applied_counts
     return output

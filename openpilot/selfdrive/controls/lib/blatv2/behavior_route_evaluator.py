@@ -18,7 +18,7 @@ per-window metric results.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -65,7 +65,6 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
   build_canonical_behavior_frame,
   decode_behavior_car_params,
   validate_reviewed_replay_core_identity,
-  validate_behavior_scenario_active_witness,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_segmentation import (
   BehaviorPhaseSpan,
@@ -79,6 +78,9 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
+)
+from openpilot.selfdrive.controls.lib.blatv2.counterfactual_plant import (
+  CounterfactualPlantMember,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   build_detected_runtime_bundle,
@@ -97,8 +99,9 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 
 
 BEHAVIOR_ROUTE_PREPARATION_SCHEMA_VERSION = 2
-BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION = 3
+BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION = 4
 _RACK_ACCELERATION_MAXIMUM_GAP_NS = 15_000_000
+_MAXIMUM_ROUTE_POLICIES = 64
 
 
 class BehaviorRouteEvaluationError(RuntimeError):
@@ -225,6 +228,7 @@ class BehaviorRouteEvaluation:
   artifact_identity: ReplayArtifactIdentity
   physical_profile_sha256: str
   provisional_dynamics_sha256: str
+  plant_member_id: str
   segmentation_config_sha256: str
   metric_config_sha256: str
   windows: tuple[WindowMetricSet, ...]
@@ -254,6 +258,7 @@ class BehaviorRouteEvaluation:
       self.single_route_scenario_set_sha256,
       self.physical_profile_sha256,
       self.provisional_dynamics_sha256,
+      self.plant_member_id,
       self.segmentation_config_sha256,
       self.metric_config_sha256,
       self.artifact_identity.composed_controller_artifact_sha256,
@@ -276,6 +281,7 @@ class BehaviorRouteEvaluation:
       "preparationSha256": self.preparation_sha256,
       "preparationSchemaVersion": self.preparation_schema_version,
       "provisionalDynamicsSha256": self.provisional_dynamics_sha256,
+      "plantMemberId": self.plant_member_id,
       "scenario": self.scenario.to_dict(),
       "schemaVersion": self.schema_version,
       "segmentationConfigSha256": self.segmentation_config_sha256,
@@ -527,14 +533,6 @@ def _stream_frames(
         witness.lateral_maneuver_plan_index,
         witness.maneuver_plan_available,
       )
-      if (
-        witness.lateral_active
-        and maneuver is not None
-        and maneuver.message_valid
-      ):
-        raise BehaviorRouteEvaluationError(
-          "active lateral scenario uses a lateral maneuver plan override",
-        )
       try:
         control, frame_input, model_intent = build_canonical_behavior_frame(
           index=index,
@@ -553,16 +551,14 @@ def _stream_frames(
           maneuver=maneuver,
           scenario_only=True,
         )
-      except (BehaviorReplayError, TypeError, ValueError) as error:
+      except BehaviorReplayError as error:
+        raise BehaviorRouteEvaluationError(str(error)) from error
+      except (TypeError, ValueError) as error:
         raise BehaviorRouteEvaluationError(
           "canonical behavior frame reconstruction failed",
         ) from error
       if witness.lateral_active:
         active_count += 1
-        try:
-          validate_behavior_scenario_active_witness(witness)
-        except BehaviorReplayError as error:
-          raise BehaviorRouteEvaluationError(str(error)) from error
         if model_intent is None:
           raise BehaviorRouteEvaluationError(
             "active lateral scenario lacks exact model intent",
@@ -757,123 +753,254 @@ def _evaluate_prepared_behavior_route_with_registry_for_test(
   *,
   opponent_role: ReplayRole,
   core_identity: ReplayCoreIdentity,
+  plant_member: CounterfactualPlantMember | None = None,
   interface_registry: Mapping[str, type] | None = None,
 ) -> BehaviorRouteEvaluation:
   """Replay one opponent with an explicitly injected test interface registry."""
-  if not isinstance(preparation, BehaviorRoutePreparation):
+  _, evaluations = _evaluate_behavior_route_policies_with_registry_for_test(
+    evidence,
+    preparation,
+    physical_profile,
+    provisional_dynamics,
+    (policy,),
+    metric_config,
+    opponent_roles=(opponent_role,),
+    core_identities=(core_identity,),
+    plant_member=plant_member,
+    interface_registry=interface_registry,
+  )
+  return evaluations[0]
+
+
+def _validate_policy_population(
+  policies: tuple[BehaviorPolicy | None, ...],
+  roles: tuple[ReplayRole, ...],
+  cores: tuple[ReplayCoreIdentity, ...],
+) -> None:
+  if not 0 < len(policies) <= _MAXIMUM_ROUTE_POLICIES:
+    raise ValueError("behavior route policy population is outside its bound")
+  if len(roles) != len(policies) or len(cores) != len(policies):
+    raise ValueError("behavior route opponent populations disagree")
+  for policy, role, core in zip(policies, roles, cores, strict=True):
+    if policy is not None and not isinstance(policy, BehaviorPolicy):
+      raise TypeError("behavior route policy has the wrong type")
+    if not isinstance(role, ReplayRole):
+      raise TypeError("behavior route requires an explicit opponent role")
+    if not isinstance(core, ReplayCoreIdentity):
+      raise TypeError("behavior route requires replay core identities")
+    if (policy is None) != (role is ReplayRole.EXACT_STOCK):
+      raise ValueError("only exact stock may replay without a behavior policy")
+    if role is ReplayRole.EXACT_STOCK:
+      validate_reviewed_replay_core_identity(core, exact_stock=True)
+
+
+def _preparation_from_reference(
+  runtime: _StreamRuntime,
+  physical_profile: VehicleCalibrationProfile,
+  provisional_dynamics: ProvisionalRackDynamics,
+  segmentation_config: SegmentationConfig,
+  reference_digest: Any,
+  reference_scratch: BehaviorSampleScratch,
+  sample_count: int,
+  events: tuple[EventLocator, ...],
+) -> BehaviorRoutePreparation:
+  samples = reference_scratch.finish()
+  segmentation = segment_file_backed_behavior_route(
+    runtime.source.route_id,
+    runtime.recorded_source,
+    samples,
+    events,
+    segmentation_config,
+  )
+  spans = tuple(window.descriptor for window in segmentation.windows)
+  ranges = _unassigned_ranges(sample_count, spans)
+  if sum(end - start for start, end in ranges) != len(segmentation.unassigned_sample_indices):
+    raise BehaviorRouteEvaluationError("compact and canonical unassigned segmentation differ")
+  return BehaviorRoutePreparation(
+    schema_version=BEHAVIOR_ROUTE_PREPARATION_SCHEMA_VERSION,
+    scenario=runtime.scenario,
+    physical_profile_sha256=runtime.physical_profile_sha256,
+    provisional_dynamics_sha256=provisional_dynamics.identity_sha256,
+    segmentation_config_sha256=segmentation.config_sha256,
+    reference_samples_sha256=reference_digest.hexdigest(),
+    file_backed_segmentation_sha256=segmentation.sha256,
+    sample_count=sample_count,
+    spans=spans,
+    event_coverage=segmentation.event_coverage,
+    unassigned_sample_ranges=ranges,
+  )
+
+
+def _evaluate_behavior_route_policies_with_registry_for_test(
+  evidence: RouteEvidenceStreamReader | str | Path,
+  preparation: BehaviorRoutePreparation | None,
+  physical_profile: VehicleCalibrationProfile,
+  provisional_dynamics: ProvisionalRackDynamics,
+  policies: tuple[BehaviorPolicy | None, ...],
+  metric_config: BehaviorMetricConfig,
+  *,
+  opponent_roles: tuple[ReplayRole, ...],
+  core_identities: tuple[ReplayCoreIdentity, ...],
+  segmentation_config: SegmentationConfig | None = None,
+  plant_member: CounterfactualPlantMember | None = None,
+  interface_registry: Mapping[str, type] | None = None,
+) -> tuple[BehaviorRoutePreparation, tuple[BehaviorRouteEvaluation, ...]]:
+  """Stream one route once while evaluating a bounded opponent population."""
+  _validate_policy_population(policies, opponent_roles, core_identities)
+  if preparation is None and not isinstance(segmentation_config, SegmentationConfig):
+    raise TypeError("new route preparation requires segmentation config")
+  if preparation is not None and not isinstance(preparation, BehaviorRoutePreparation):
     raise TypeError("behavior route evaluation requires a preparation")
-  if policy is not None and not isinstance(policy, BehaviorPolicy):
-    raise TypeError("behavior route policy has the wrong type")
   if not isinstance(metric_config, BehaviorMetricConfig):
     raise TypeError("behavior route evaluation requires metric config")
-  if not isinstance(opponent_role, ReplayRole):
-    raise TypeError("behavior route evaluation requires an explicit opponent role")
-  if not isinstance(core_identity, ReplayCoreIdentity):
-    raise TypeError("behavior route evaluation requires replay core identity")
-  if (policy is None) != (opponent_role is ReplayRole.EXACT_STOCK):
-    raise ValueError("only exact stock may replay without a behavior policy")
-  if opponent_role is ReplayRole.EXACT_STOCK:
-    # ``policy=None`` selects the fixed LatControlTorque producer below.  The
-    # role label is admitted only when its digest also names that reviewed
-    # adapter; caller-constructed identities cannot relabel another result as
-    # the permanent stock floor.
-    validate_reviewed_replay_core_identity(core_identity, exact_stock=True)
   try:
     with _reader_scope(evidence) as reader:
-      runtime = _runtime(
-        reader,
-        physical_profile,
-        provisional_dynamics,
-        interface_registry,
-      )
-      if (
+      runtime = _runtime(reader, physical_profile, provisional_dynamics, interface_registry)
+      if preparation is not None and (
         preparation.scenario != runtime.scenario
         or preparation.physical_profile_sha256 != runtime.physical_profile_sha256
-        or preparation.provisional_dynamics_sha256
-        != provisional_dynamics.identity_sha256
+        or preparation.provisional_dynamics_sha256 != provisional_dynamics.identity_sha256
       ):
-        raise BehaviorRouteEvaluationError(
-          "route evidence/profile differs from frozen preparation",
-        )
-      # Evaluation does not consume event payloads, but it must authenticate
-      # and exhaust every plane exactly as the preparation pass did.
-      for _ in reader.iter_event_locators():
-        pass
+        raise BehaviorRouteEvaluationError("route evidence/profile differs from frozen preparation")
+      if preparation is None and segmentation_config is not None:
+        events = _event_locators(reader, segmentation_config.maximum_event_locators)
+      else:
+        for _ in reader.iter_event_locators():
+          pass
+        events = ()
       reference_digest = hashlib.sha256()
-      stepper: BehaviorReplayStepper | None = None
-      with BehaviorSampleScratch() as scratch:
+      steppers: tuple[BehaviorReplayStepper, ...] | None = None
+      with ExitStack() as stack:
+        reference_scratch = (
+          stack.enter_context(BehaviorSampleScratch()) if preparation is None else None
+        )
+        response_scratches = tuple(
+          stack.enter_context(BehaviorSampleScratch()) for _ in policies
+        )
         sample_count = 0
         for frame in _stream_frames(runtime, physical_profile):
           target = _target_sample(frame, physical_profile)
           _update_reference_digest(reference_digest, target)
-          if stepper is None:
-            stepper = BehaviorReplayStepper(
-              vehicle_identity=runtime.source.vehicle_identity,
-              physical_profile=physical_profile,
-              policy=policy,
-              first_frame_input=frame.frame_input,
-              nominal_rack_mapping=runtime.nominal_rack_mapping,
-              provisional_dynamics=provisional_dynamics,
-              interface_registry=interface_registry,
+          if reference_scratch is not None:
+            reference_scratch.append(target)
+          if steppers is None:
+            steppers = tuple(
+              BehaviorReplayStepper(
+                vehicle_identity=runtime.source.vehicle_identity,
+                physical_profile=physical_profile,
+                policy=policy,
+                first_frame_input=frame.frame_input,
+                nominal_rack_mapping=runtime.nominal_rack_mapping,
+                provisional_dynamics=provisional_dynamics,
+                plant_member=plant_member,
+                interface_registry=interface_registry,
+              )
+              for policy in policies
             )
-          output = stepper.step(
-            control=frame.control,
-            frame_input=frame.frame_input,
-            model_intent=frame.model_intent,
-            reference=frame.reference,
-          )
-          scratch.append(_response_sample(frame, output, physical_profile))
+          for stepper, scratch in zip(steppers, response_scratches, strict=True):
+            output = stepper.step(
+              control=frame.control,
+              frame_input=frame.frame_input,
+              model_intent=frame.model_intent,
+              reference=frame.reference,
+            )
+            if output.controller_fault:
+              raise BehaviorRouteEvaluationError(
+                "controller fault invalidates the complete route opponent",
+              )
+            scratch.append(_response_sample(frame, output, physical_profile))
           sample_count += 1
-        if stepper is None:
+        if steppers is None:
           raise BehaviorRouteEvaluationError("route evidence contains no replay frames")
-        if (
+        if preparation is None:
+          assert reference_scratch is not None and segmentation_config is not None
+          preparation = _preparation_from_reference(
+            runtime,
+            physical_profile,
+            provisional_dynamics,
+            segmentation_config,
+            reference_digest,
+            reference_scratch,
+            sample_count,
+            events,
+          )
+        elif (
           sample_count != preparation.sample_count
           or reference_digest.hexdigest() != preparation.reference_samples_sha256
         ):
-          raise BehaviorRouteEvaluationError(
-            "route reference differs from frozen preparation",
+          raise BehaviorRouteEvaluationError("route reference differs from frozen preparation")
+        evaluations: list[BehaviorRouteEvaluation] = []
+        for policy, role, core, scratch in zip(
+          policies, opponent_roles, core_identities, response_scratches, strict=True,
+        ):
+          samples = scratch.finish()
+          windows = tuple(
+            FileBackedBehaviorWindow(
+              route_id=runtime.source.route_id,
+              source=runtime.recorded_source,
+              descriptor=span,
+              samples=BehaviorSampleSpan(
+                samples,
+                span.start_sample_index,
+                span.end_sample_index_exclusive,
+              ),
+            )
+            for span in preparation.spans
           )
-        samples = scratch.finish()
-        windows = tuple(
-          FileBackedBehaviorWindow(
-            route_id=runtime.source.route_id,
-            source=runtime.recorded_source,
-            descriptor=span,
-            samples=BehaviorSampleSpan(
-              samples,
-              span.start_sample_index,
-              span.end_sample_index_exclusive,
-            ),
+          metrics = retain_route_metric_windows(
+            (score_file_backed_window(window, metric_config) for window in windows),
+            metric_config,
           )
-          for span in preparation.spans
-        )
-        metrics = retain_route_metric_windows(
-          (score_file_backed_window(window, metric_config) for window in windows),
-          metric_config,
-        )
-      return BehaviorRouteEvaluation(
-        schema_version=BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION,
-        preparation_sha256=preparation.sha256,
-        preparation_schema_version=preparation.schema_version,
-        scenario=runtime.scenario,
-        single_route_scenario_set_sha256=BehaviorScenarioSetIdentity(
-          (runtime.scenario,),
-        ).sha256,
-        artifact_identity=ReplayArtifactIdentity.compose(
-          opponent_role,
-          core_identity,
-          policy,
-        ),
-        physical_profile_sha256=runtime.physical_profile_sha256,
-        provisional_dynamics_sha256=provisional_dynamics.identity_sha256,
-        segmentation_config_sha256=preparation.segmentation_config_sha256,
-        metric_config_sha256=metric_config.sha256,
-        windows=metrics,
-      )
+          evaluations.append(BehaviorRouteEvaluation(
+            schema_version=BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION,
+            preparation_sha256=preparation.sha256,
+            preparation_schema_version=preparation.schema_version,
+            scenario=runtime.scenario,
+            single_route_scenario_set_sha256=BehaviorScenarioSetIdentity(
+              (runtime.scenario,),
+            ).sha256,
+            artifact_identity=ReplayArtifactIdentity.compose(role, core, policy),
+            physical_profile_sha256=runtime.physical_profile_sha256,
+            provisional_dynamics_sha256=provisional_dynamics.identity_sha256,
+            plant_member_id=steppers[0].plant_member.member_id,
+            segmentation_config_sha256=preparation.segmentation_config_sha256,
+            metric_config_sha256=metric_config.sha256,
+            windows=metrics,
+          ))
+        return preparation, tuple(evaluations)
   except (RouteEvidenceError, BehaviorReplayError, ValueError) as error:
     if isinstance(error, BehaviorRouteEvaluationError):
       raise
     raise BehaviorRouteEvaluationError("behavior route evaluation failed") from error
+
+
+def evaluate_behavior_route_policies(
+  evidence: RouteEvidenceStreamReader | str | Path,
+  preparation: BehaviorRoutePreparation | None,
+  physical_profile: VehicleCalibrationProfile,
+  provisional_dynamics: ProvisionalRackDynamics,
+  policies: tuple[BehaviorPolicy | None, ...],
+  metric_config: BehaviorMetricConfig,
+  *,
+  opponent_roles: tuple[ReplayRole, ...],
+  core_identities: tuple[ReplayCoreIdentity, ...],
+  plant_member: CounterfactualPlantMember,
+  segmentation_config: SegmentationConfig | None = None,
+) -> tuple[BehaviorRoutePreparation, tuple[BehaviorRouteEvaluation, ...]]:
+  """Production one-scan route-major replay for a bounded policy population."""
+  return _evaluate_behavior_route_policies_with_registry_for_test(
+    evidence,
+    preparation,
+    physical_profile,
+    provisional_dynamics,
+    policies,
+    metric_config,
+    opponent_roles=opponent_roles,
+    core_identities=core_identities,
+    plant_member=plant_member,
+    segmentation_config=segmentation_config,
+    interface_registry=None,
+  )
 
 
 def evaluate_prepared_behavior_route(
@@ -886,6 +1013,7 @@ def evaluate_prepared_behavior_route(
   *,
   opponent_role: ReplayRole,
   core_identity: ReplayCoreIdentity,
+  plant_member: CounterfactualPlantMember,
 ) -> BehaviorRouteEvaluation:
   """Replay one exact opponent through the detected production interface.
 
@@ -903,6 +1031,7 @@ def evaluate_prepared_behavior_route(
     metric_config,
     opponent_role=opponent_role,
     core_identity=core_identity,
+    plant_member=plant_member,
     interface_registry=None,
   )
 
@@ -917,6 +1046,7 @@ def evaluate_behavior_route(
   *,
   opponent_role: ReplayRole,
   core_identity: ReplayCoreIdentity,
+  plant_member: CounterfactualPlantMember,
 ) -> BehaviorRouteEvaluation:
   """Prepare and evaluate one route while keeping both passes bounded."""
   with _reader_scope(evidence) as reader:
@@ -935,4 +1065,5 @@ def evaluate_behavior_route(
       metric_config,
       opponent_role=opponent_role,
       core_identity=core_identity,
+      plant_member=plant_member,
     )

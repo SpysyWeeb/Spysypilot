@@ -235,6 +235,7 @@ class AggregateFixture:
     values: tuple[float, float, float],
     *,
     undefined: bool = False,
+    plant_member_id: str | None = None,
   ) -> BehaviorRouteEvaluation:
     core = self.stock_core if role is ReplayRole.EXACT_STOCK else self.modular_core
     window = WindowMetricSet(
@@ -258,6 +259,9 @@ class AggregateFixture:
       artifact_identity=ReplayArtifactIdentity.compose(role, core, policy),
       physical_profile_sha256=self.profile_sha,
       provisional_dynamics_sha256=self.dynamics_sha,
+      plant_member_id=(
+        _hash("plant-member") if plant_member_id is None else plant_member_id
+      ),
       segmentation_config_sha256=self.segmentation_sha,
       metric_config_sha256=self.metric_config.sha256,
       windows=(window,),
@@ -271,13 +275,21 @@ class AggregateFixture:
     values: tuple[float, float, float],
     *,
     undefined: bool = False,
+    plant_member_id: str | None = None,
   ):
     scenarios = {
       scenario.route_id: scenario
       for scenario in self.scenarios.sources
     }
     results = tuple(
-      self.route_result(scenarios[route_id], role, policy, values, undefined=undefined)
+      self.route_result(
+        scenarios[route_id],
+        role,
+        policy,
+        values,
+        undefined=undefined,
+        plant_member_id=plant_member_id,
+      )
       for route_id in self.spec.partition.route_ids_for(split)
     )
     return aggregate_behavior_route_results(self.spec, split, results, policy)
@@ -370,6 +382,21 @@ class TestBehaviorAggregate(unittest.TestCase):
       for scenario in self.fixture.scenarios.sources
     }
     self.assertEqual(recorded_names, {"recorded-stock", "recorded-blat"})
+
+  def test_opponents_from_different_plant_members_cannot_compare(self):
+    comparison = self.fixture.comparison()
+    foreign = self.fixture.aggregate(
+      BehaviorRouteSplit.TRAINING,
+      ReplayRole.CANDIDATE,
+      self.fixture.grid[1].policy,
+      (7.0, 0.2, 1.0),
+      plant_member_id=_hash("foreign-plant-member"),
+    )
+    with self.assertRaisesRegex(BehaviorAggregateError, "physical or metric contracts"):
+      replace(
+        comparison,
+        candidates=(comparison.candidates[0], foreign),
+      )
 
   def test_route_order_duplicate_and_mixed_vehicle_fail_closed(self):
     route_ids = self.fixture.spec.partition.route_ids_for(BehaviorRouteSplit.TRAINING)

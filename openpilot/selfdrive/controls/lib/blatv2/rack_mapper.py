@@ -416,3 +416,25 @@ def curvature_from_measured_angle(
     valid=inputs_valid,
     degraded=not inputs_valid,
   )
+
+
+def curvature_slope_per_steering_degree(
+  speed: float,
+  live_snapshot: RackMappingSnapshot | None,
+  nominal_snapshot: RackMappingSnapshot,
+) -> float:
+  """Return the analytic local curvature slope of the scalar VehicleModel."""
+  if not math.isfinite(speed) or speed < 0.0:
+    raise ValueError("rack curvature-slope speed must be finite and non-negative")
+  snapshot, _ = _select_snapshot(live_snapshot, nominal_snapshot)
+  slip_factor = _slip_factor(snapshot)
+  speed_squared = speed * speed
+  curvature_denominator = 1.0 - slip_factor * speed_squared
+  if curvature_denominator == 0.0:
+    raise ValueError("VehicleModel curvature denominator is zero")
+  curvature_factor = (
+    (1.0 - snapshot.steer_ratio_rear)
+    / curvature_denominator
+    / snapshot.wheelbase_m
+  )
+  return -curvature_factor / snapshot.steer_ratio * math.pi / 180.0
