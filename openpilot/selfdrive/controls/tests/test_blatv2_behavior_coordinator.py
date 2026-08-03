@@ -389,7 +389,7 @@ class TestBehaviorCoordinator(unittest.TestCase):
     result = finalize(ReplayFixture("validation_regression"))
 
     self.assertFalse(result.passed)
-    self.assertEqual(result.reasons, (FinalizationReason.SMOOTH_VALIDATION_REGRESSION,))
+    self.assertEqual(result.reasons, (FinalizationReason.SMOOTH_CROSS_FIT_REGRESSION,))
     self.assertFalse(result.smooth_passed)
     self.assertTrue(result.swift_passed)
     self.assertTrue(result.strong_passed)

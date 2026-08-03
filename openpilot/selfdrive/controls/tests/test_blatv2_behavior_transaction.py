@@ -90,9 +90,9 @@ def physical_profile(*, qualified: bool = True) -> VehicleCalibrationProfile:
       moving_sample_count=3_000,
       breakaway_support_s=30.0,
       breakaway_sample_count=300,
-      validation_count=1_000,
-      inverse_calibration_validation_rms=0.01,
-      breakaway_validation_rms=0.01,
+      cross_fit_route_count=1_000,
+      full_fit_candidate_rms=0.01,
+      breakaway_full_fit_candidate_rms=0.01,
     )
     for speed in (0.0, 30.0)
   )
@@ -931,9 +931,10 @@ class TestBehaviorTransaction(unittest.TestCase):
     self.assertEqual(
       result.sha256,
       # Segmentation schema 2 adds fail-closed span/event work limits to the
-      # transaction identity, so the reviewed prebatch fixture intentionally
+      # transaction identity; profile schema 3 also gives full-fit/cross-fit
+        # evidence honest names, so the reviewed prebatch fixture intentionally
       # changed even though this route remains below every limit.
-      "06ec5c302a7972d6e09749a48418cee048907669b2d89576d938ada8e641150b",
+      "f7e997fbd745104d3e6110fca07a0c1294ed8f494e97f4e097c8ac8529d54803",
     )
 
   def test_validation_replays_only_the_frozen_training_winner(self):

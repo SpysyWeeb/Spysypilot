@@ -186,9 +186,9 @@ def physical_profile() -> VehicleCalibrationProfile:
         moving_sample_count=30000,
         breakaway_support_s=30.0,
         breakaway_sample_count=3000,
-        validation_count=30000,
-        inverse_calibration_validation_rms=0.01,
-        breakaway_validation_rms=0.01,
+        cross_fit_route_count=30000,
+        full_fit_candidate_rms=0.01,
+        breakaway_full_fit_candidate_rms=0.01,
       )
       for speed in DEFAULT_SPEED_NODES_MPS
     ),

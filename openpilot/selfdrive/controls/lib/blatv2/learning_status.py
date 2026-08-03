@@ -4,7 +4,7 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 4 deliberately rejects the retired physical rack-fit vocabulary and
+Schema 5 deliberately rejects the retired physical rack-fit vocabulary and
 adds canonical first-cause sample accounting. The
 only candidate values it exposes are the four observable inverse-torque
 calibration values, while independent base, moving, breakaway, and authority
@@ -26,8 +26,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationNodeSupportDiagnostic,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
-  MIN_VALIDATION_SUPPORT_FRACTION,
   CalibrationFitStatus,
+  CalibrationCrossFitStatus,
   CalibrationModelId,
   CalibrationNodeQualificationReport,
   CalibrationQualificationReason,
@@ -39,7 +39,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 4
+LEARNING_STATUS_SCHEMA_VERSION = 5
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
   "all_intervals_qualified",
@@ -63,24 +63,24 @@ _TOP_LEVEL_KEYS = {
 _NODE_KEYS = {
   "applied_torque_directions",
   "applied_torque_span",
-  "authority_candidate_validation_rms",
+  "authority_full_fit_candidate_rms",
   "authority_fit_sample_count",
   "authority_fit_support_s",
   "authority_sample_count",
-  "authority_seed_validation_rms",
+  "authority_full_fit_seed_rms",
   "authority_support_s",
-  "authority_training_count",
-  "authority_validation_count",
+  "authority_full_fit_count",
+  "authority_cross_fit_route_count",
   "base_sample_count",
   "base_support_s",
-  "breakaway_candidate_validation_rms",
+  "breakaway_full_fit_candidate_rms",
   "breakaway_sample_count",
-  "breakaway_seed_validation_rms",
+  "breakaway_full_fit_seed_rms",
   "breakaway_support_s",
-  "breakaway_training_count",
-  "breakaway_validation_count",
+  "breakaway_full_fit_count",
+  "breakaway_cross_fit_route_count",
   "candidate_parameters",
-  "candidate_validation_rms",
+  "full_fit_candidate_rms",
   "clean_support_s",
   "confidence",
   "evaluation_status",
@@ -101,27 +101,25 @@ _NODE_KEYS = {
   "lateral_accel_rms_mps2",
   "lateral_accel_span_mps2",
   "minimum_support_s",
-  "minimum_validation_support_s",
-  "moving_candidate_validation_rms",
+  "moving_full_fit_candidate_rms",
   "moving_sample_count",
-  "moving_seed_validation_rms",
+  "moving_full_fit_seed_rms",
   "moving_support_s",
-  "moving_training_count",
-  "moving_validation_count",
+  "moving_full_fit_count",
+  "moving_cross_fit_route_count",
   "node_index",
   "qualified",
   "rack_reversals",
   "rack_travel_deg",
   "reasons",
-  "seed_validation_rms",
+  "full_fit_seed_rms",
   "speed_mps",
   "supported_sample_count",
-  "training_count",
-  "training_outcome",
-  "training_paired_loss",
-  "validation_count",
-  "validation_paired_loss",
-  "validation_support_s",
+  "full_fit_count",
+  "selection_outcome",
+  "full_fit_paired_loss",
+  "cross_fit_route_count",
+  "cross_fit_paired_loss",
 }
 _FIT_DIAGNOSTIC_KEYS = {
   "breakaway_parameter_count",
@@ -141,13 +139,17 @@ _PAIRED_LOSS_KEYS = {
   "upper_bound_mse",
 }
 _INTERPOLATION_KEYS = {
+  "contributing_route_count",
+  "cross_fit_status",
+  "failed_fold_count",
   "interval_index",
   "lower_speed_mps",
   "qualified",
   "reasons",
-  "training_paired_loss",
+  "successful_fold_count",
+  "full_fit_paired_loss",
   "upper_speed_mps",
-  "validation_paired_loss",
+  "cross_fit_paired_loss",
 }
 _CANDIDATE_PARAMETER_KEYS = {
   "kinetic_friction_torque",
@@ -165,8 +167,8 @@ _EVALUATION_STATUSES = {
   "numerical_failure",
   "rank_deficient",
   "seed_retained",
-  "validation_inconclusive",
-  "validation_regressed",
+  "cross_fit_inconclusive",
+  "cross_fit_regressed",
 }
 
 
@@ -493,10 +495,10 @@ def _node_evaluation_status(report: CalibrationNodeQualificationReport) -> str:
     return "rank_deficient"
   if CalibrationQualificationReason.ILL_CONDITIONED_FIT in reasons:
     return "ill_conditioned"
-  if CalibrationQualificationReason.VALIDATION_INCONCLUSIVE in reasons:
-    return "validation_inconclusive"
-  if any("validation_regression" in reason.value for reason in reasons):
-    return "validation_regressed"
+  if CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE in reasons:
+    return "cross_fit_inconclusive"
+  if any("cross_fit_regression" in reason.value for reason in reasons):
+    return "cross_fit_regressed"
   if CalibrationQualificationReason.INVALID_PARAMETERS in reasons:
     return "invalid_parameters"
   return "numerical_failure"
@@ -600,9 +602,9 @@ def _node_payload(
       report.applied_torque_span,
       f"{context}.applied_torque_span",
     ),
-    "authority_candidate_validation_rms": _optional_rms(
-      report.authority_candidate_validation_rms,
-      f"{context}.authority_candidate_validation_rms",
+    "authority_full_fit_candidate_rms": _optional_rms(
+      report.authority_full_fit_candidate_rms,
+      f"{context}.authority_full_fit_candidate_rms",
     ),
     "authority_fit_sample_count": _nonnegative_int(
       report.authority_fit_sample_count,
@@ -616,21 +618,21 @@ def _node_payload(
       report.authority_sample_count,
       f"{context}.authority_sample_count",
     ),
-    "authority_seed_validation_rms": _optional_rms(
-      report.authority_seed_validation_rms,
-      f"{context}.authority_seed_validation_rms",
+    "authority_full_fit_seed_rms": _optional_rms(
+      report.authority_full_fit_seed_rms,
+      f"{context}.authority_full_fit_seed_rms",
     ),
     "authority_support_s": _nonnegative_float(
       report.authority_support_s,
       f"{context}.authority_support_s",
     ),
-    "authority_training_count": _nonnegative_int(
-      report.authority_training_count,
-      f"{context}.authority_training_count",
+    "authority_full_fit_count": _nonnegative_int(
+      report.authority_full_fit_count,
+      f"{context}.authority_full_fit_count",
     ),
-    "authority_validation_count": _nonnegative_int(
-      report.authority_validation_count,
-      f"{context}.authority_validation_count",
+    "authority_cross_fit_route_count": _nonnegative_int(
+      report.authority_cross_fit_route_count,
+      f"{context}.authority_cross_fit_route_count",
     ),
     "base_sample_count": _nonnegative_int(
       report.base_sample_count,
@@ -640,34 +642,34 @@ def _node_payload(
       report.base_support_s,
       f"{context}.base_support_s",
     ),
-    "breakaway_candidate_validation_rms": _optional_rms(
-      report.breakaway_candidate_validation_rms,
-      f"{context}.breakaway_candidate_validation_rms",
+    "breakaway_full_fit_candidate_rms": _optional_rms(
+      report.breakaway_full_fit_candidate_rms,
+      f"{context}.breakaway_full_fit_candidate_rms",
     ),
     "breakaway_sample_count": _nonnegative_int(
       report.breakaway_sample_count,
       f"{context}.breakaway_sample_count",
     ),
-    "breakaway_seed_validation_rms": _optional_rms(
-      report.breakaway_seed_validation_rms,
-      f"{context}.breakaway_seed_validation_rms",
+    "breakaway_full_fit_seed_rms": _optional_rms(
+      report.breakaway_full_fit_seed_rms,
+      f"{context}.breakaway_full_fit_seed_rms",
     ),
     "breakaway_support_s": _nonnegative_float(
       report.breakaway_support_s,
       f"{context}.breakaway_support_s",
     ),
-    "breakaway_training_count": _nonnegative_int(
-      report.breakaway_training_count,
-      f"{context}.breakaway_training_count",
+    "breakaway_full_fit_count": _nonnegative_int(
+      report.breakaway_full_fit_count,
+      f"{context}.breakaway_full_fit_count",
     ),
-    "breakaway_validation_count": _nonnegative_int(
-      report.breakaway_validation_count,
-      f"{context}.breakaway_validation_count",
+    "breakaway_cross_fit_route_count": _nonnegative_int(
+      report.breakaway_cross_fit_route_count,
+      f"{context}.breakaway_cross_fit_route_count",
     ),
     "candidate_parameters": _candidate_parameters(report),
-    "candidate_validation_rms": _optional_rms(
-      report.candidate_validation_rms,
-      f"{context}.candidate_validation_rms",
+    "full_fit_candidate_rms": _optional_rms(
+      report.full_fit_candidate_rms,
+      f"{context}.full_fit_candidate_rms",
     ),
     "clean_support_s": _nonnegative_float(
       report.clean_support_s,
@@ -693,32 +695,29 @@ def _node_payload(
       f"{context}.lateral_accel_span_mps2",
     ),
     "minimum_support_s": minimum_support,
-    "minimum_validation_support_s": (
-      minimum_support * MIN_VALIDATION_SUPPORT_FRACTION
-    ),
-    "moving_candidate_validation_rms": _optional_rms(
-      report.moving_candidate_validation_rms,
-      f"{context}.moving_candidate_validation_rms",
+    "moving_full_fit_candidate_rms": _optional_rms(
+      report.moving_full_fit_candidate_rms,
+      f"{context}.moving_full_fit_candidate_rms",
     ),
     "moving_sample_count": _nonnegative_int(
       report.moving_sample_count,
       f"{context}.moving_sample_count",
     ),
-    "moving_seed_validation_rms": _optional_rms(
-      report.moving_seed_validation_rms,
-      f"{context}.moving_seed_validation_rms",
+    "moving_full_fit_seed_rms": _optional_rms(
+      report.moving_full_fit_seed_rms,
+      f"{context}.moving_full_fit_seed_rms",
     ),
     "moving_support_s": _nonnegative_float(
       report.moving_support_s,
       f"{context}.moving_support_s",
     ),
-    "moving_training_count": _nonnegative_int(
-      report.moving_training_count,
-      f"{context}.moving_training_count",
+    "moving_full_fit_count": _nonnegative_int(
+      report.moving_full_fit_count,
+      f"{context}.moving_full_fit_count",
     ),
-    "moving_validation_count": _nonnegative_int(
-      report.moving_validation_count,
-      f"{context}.moving_validation_count",
+    "moving_cross_fit_route_count": _nonnegative_int(
+      report.moving_cross_fit_route_count,
+      f"{context}.moving_cross_fit_route_count",
     ),
     "node_index": _nonnegative_int(report.node_index, f"{context}.node_index"),
     "qualified": report.qualified,
@@ -731,37 +730,33 @@ def _node_payload(
       f"{context}.rack_travel_deg",
     ),
     "reasons": [reason.value for reason in report.reasons],
-    "seed_validation_rms": _optional_rms(
-      report.seed_validation_rms,
-      f"{context}.seed_validation_rms",
+    "full_fit_seed_rms": _optional_rms(
+      report.full_fit_seed_rms,
+      f"{context}.full_fit_seed_rms",
     ),
     "speed_mps": _nonnegative_float(report.speed_mps, f"{context}.speed_mps"),
     "supported_sample_count": _nonnegative_int(
       report.supported_sample_count,
       f"{context}.supported_sample_count",
     ),
-    "training_count": _nonnegative_int(
-      report.training_count,
-      f"{context}.training_count",
+    "full_fit_count": _nonnegative_int(
+      report.full_fit_count,
+      f"{context}.full_fit_count",
     ),
-    "training_outcome": (
-      None if report.training_outcome is None else report.training_outcome.value
+    "selection_outcome": (
+      None if report.selection_outcome is None else report.selection_outcome.value
     ),
-    "training_paired_loss": _paired_loss_payload(
-      report.training_paired_loss,
-      f"{context}.training_paired_loss",
+    "full_fit_paired_loss": _paired_loss_payload(
+      report.full_fit_paired_loss,
+      f"{context}.full_fit_paired_loss",
     ),
-    "validation_count": _nonnegative_int(
-      report.validation_count,
-      f"{context}.validation_count",
+    "cross_fit_route_count": _nonnegative_int(
+      report.cross_fit_route_count,
+      f"{context}.cross_fit_route_count",
     ),
-    "validation_paired_loss": _paired_loss_payload(
-      report.validation_paired_loss,
-      f"{context}.validation_paired_loss",
-    ),
-    "validation_support_s": _nonnegative_float(
-      report.validation_support_s,
-      f"{context}.validation_support_s",
+    "cross_fit_paired_loss": _paired_loss_payload(
+      report.cross_fit_paired_loss,
+      f"{context}.cross_fit_paired_loss",
     ),
   }
 
@@ -769,6 +764,15 @@ def _node_payload(
 def _interpolation_payload(report: object) -> dict[str, object]:
   context = f"interpolation_reports[{report.interval_index}]"
   return {
+    "contributing_route_count": _nonnegative_int(
+      report.contributing_route_count,
+      f"{context}.contributing_route_count",
+    ),
+    "cross_fit_status": report.cross_fit_status.value,
+    "failed_fold_count": _nonnegative_int(
+      report.failed_fold_count,
+      f"{context}.failed_fold_count",
+    ),
     "interval_index": _nonnegative_int(
       report.interval_index,
       f"{context}.interval_index",
@@ -779,17 +783,21 @@ def _interpolation_payload(report: object) -> dict[str, object]:
     ),
     "qualified": report.qualified,
     "reasons": [reason.value for reason in report.reasons],
-    "training_paired_loss": _paired_loss_payload(
-      report.training_paired_loss,
-      f"{context}.training_paired_loss",
+    "successful_fold_count": _nonnegative_int(
+      report.successful_fold_count,
+      f"{context}.successful_fold_count",
+    ),
+    "full_fit_paired_loss": _paired_loss_payload(
+      report.full_fit_paired_loss,
+      f"{context}.full_fit_paired_loss",
     ),
     "upper_speed_mps": _nonnegative_float(
       report.upper_speed_mps,
       f"{context}.upper_speed_mps",
     ),
-    "validation_paired_loss": _paired_loss_payload(
-      report.validation_paired_loss,
-      f"{context}.validation_paired_loss",
+    "cross_fit_paired_loss": _paired_loss_payload(
+      report.cross_fit_paired_loss,
+      f"{context}.cross_fit_paired_loss",
     ),
   }
 
@@ -1049,8 +1057,8 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError("learning node speeds must strictly increase")
     previous_speed = speed
     for field in (
-      "minimum_support_s", "clean_support_s", "validation_support_s",
-      "minimum_validation_support_s", "base_support_s", "moving_support_s",
+      "minimum_support_s", "clean_support_s",
+      "base_support_s", "moving_support_s",
       "breakaway_support_s", "authority_support_s", "authority_fit_support_s",
       "lateral_accel_span_mps2", "lateral_accel_rms_mps2",
       "rack_travel_deg", "applied_torque_span", "confidence",
@@ -1059,12 +1067,12 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     if _finite_float(node["confidence"], f"{context}.confidence") > 1.0:
       raise ValueError(f"{context}.confidence must not exceed one")
     for field in (
-      "supported_sample_count", "training_count", "validation_count",
-      "base_sample_count", "moving_sample_count", "moving_training_count",
-      "moving_validation_count", "breakaway_sample_count",
-      "breakaway_training_count", "breakaway_validation_count",
+      "supported_sample_count", "full_fit_count", "cross_fit_route_count",
+      "base_sample_count", "moving_sample_count", "moving_full_fit_count",
+      "moving_cross_fit_route_count", "breakaway_sample_count",
+      "breakaway_full_fit_count", "breakaway_cross_fit_route_count",
       "authority_sample_count", "authority_fit_sample_count",
-      "authority_training_count", "authority_validation_count",
+      "authority_full_fit_count", "authority_cross_fit_route_count",
       "rack_reversals", "lateral_accel_directions",
       "applied_torque_directions",
     ):
@@ -1089,10 +1097,10 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     ):
       raise ValueError(f"{context} authority fit exceeds authority evidence")
     for field in (
-      "seed_validation_rms", "candidate_validation_rms",
-      "moving_seed_validation_rms", "moving_candidate_validation_rms",
-      "breakaway_seed_validation_rms", "breakaway_candidate_validation_rms",
-      "authority_seed_validation_rms", "authority_candidate_validation_rms",
+      "full_fit_seed_rms", "full_fit_candidate_rms",
+      "moving_full_fit_seed_rms", "moving_full_fit_candidate_rms",
+      "breakaway_full_fit_seed_rms", "breakaway_full_fit_candidate_rms",
+      "authority_full_fit_seed_rms", "authority_full_fit_candidate_rms",
     ):
       _optional_nonnegative_float(node[field], f"{context}.{field}")
 
@@ -1138,21 +1146,21 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context}.rank-deficient status lacks fit evidence")
     if evaluation_status == "ill_conditioned" and CalibrationFitStatus.ILL_CONDITIONED.value not in fit_statuses:
       raise ValueError(f"{context}.ill-conditioned status lacks fit evidence")
-    training_outcome = node["training_outcome"]
-    if training_outcome not in (
+    selection_outcome = node["selection_outcome"]
+    if selection_outcome not in (
       None,
       CalibrationQualificationReason.LEARNED.value,
       CalibrationQualificationReason.SEED_RETAINED.value,
     ):
-      raise ValueError(f"{context}.training_outcome is invalid")
+      raise ValueError(f"{context}.selection_outcome is invalid")
     _validate_paired_loss(
-      node["training_paired_loss"],
-      f"{context}.training_paired_loss",
+      node["full_fit_paired_loss"],
+      f"{context}.full_fit_paired_loss",
       optional=True,
     )
     _validate_paired_loss(
-      node["validation_paired_loss"],
-      f"{context}.validation_paired_loss",
+      node["cross_fit_paired_loss"],
+      f"{context}.cross_fit_paired_loss",
       optional=True,
     )
     reasons = node["reasons"]
@@ -1167,7 +1175,7 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     if any(reason not in reason_values for reason in reasons):
       raise ValueError(f"{context}.qualification reason is unknown")
     if node["qualified"] and (
-      evaluation_status != reasons[0] or training_outcome != reasons[0]
+      evaluation_status != reasons[0] or selection_outcome != reasons[0]
     ):
       raise ValueError(f"{context}.qualified outcome projection disagrees")
     if not node["qualified"] and evaluation_status in ("learned", "seed_retained"):
@@ -1228,6 +1236,28 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context} speed bounds disagree with node grid")
     if type(report["qualified"]) is not bool:
       raise ValueError(f"{context}.qualified must be boolean")
+    contributing = _nonnegative_int(
+      report["contributing_route_count"],
+      f"{context}.contributing_route_count",
+    )
+    successful = _nonnegative_int(
+      report["successful_fold_count"],
+      f"{context}.successful_fold_count",
+    )
+    failed = _nonnegative_int(
+      report["failed_fold_count"],
+      f"{context}.failed_fold_count",
+    )
+    if successful + failed != contributing:
+      raise ValueError(f"{context} fold counts disagree")
+    try:
+      cross_fit_status = CalibrationCrossFitStatus(report["cross_fit_status"])
+    except (TypeError, ValueError) as exc:
+      raise ValueError(f"{context}.cross_fit_status is invalid") from exc
+    if report["qualified"] and (
+      failed != 0 or cross_fit_status is not CalibrationCrossFitStatus.SCORED
+    ):
+      raise ValueError(f"{context} qualified with incomplete cross-fit")
     interval_qualified.append(report["qualified"])
     reasons = report["reasons"]
     if type(reasons) is not list or not reasons or any(
@@ -1240,13 +1270,13 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     ):
       raise ValueError(f"{context}.qualification reasons disagree")
     _validate_paired_loss(
-      report["training_paired_loss"],
-      f"{context}.training_paired_loss",
+      report["full_fit_paired_loss"],
+      f"{context}.full_fit_paired_loss",
       optional=False,
     )
     _validate_paired_loss(
-      report["validation_paired_loss"],
-      f"{context}.validation_paired_loss",
+      report["cross_fit_paired_loss"],
+      f"{context}.cross_fit_paired_loss",
       optional=False,
     )
   all_nodes_evaluated = all(
@@ -1283,7 +1313,7 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
   if candidate_present and not all_qualified:
     raise ValueError("candidate exists before full qualification")
   if all_qualified and not candidate_present and any(
-    node["training_outcome"] == CalibrationQualificationReason.LEARNED.value
+    node["selection_outcome"] == CalibrationQualificationReason.LEARNED.value
     for node in nodes
   ):
     raise ValueError("qualified learned node lacks candidate artifact")

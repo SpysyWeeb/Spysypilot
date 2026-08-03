@@ -28,8 +28,13 @@ the earliest possible motion, then a same-direction rate quantum must confirm
 it within the existing transport delay. The midpoint of the last stuck and
 first moving responses identifies static friction once per episode.
 
-The numerical fit is deterministic constrained least squares. Only the
-trainer's immutable global-TRAIN routes enter this learner. It evaluates the
+The numerical fit is deterministic constrained least squares. The math core
+consumes exactly the route population supplied by its caller; it has no token,
+partition service, or authority to claim that population is global TRAIN. The
+PC trainer owns the immutable TRAIN manifest, authenticates route membership,
+and passes only that sealed population to the core. Generic historical
+backfill remains display-only evidence preparation and cannot promote a
+profile. The learner evaluates the
 nested `static only -> friction -> offset + friction -> full map` family with
 route-grouped leave-one-route-out cross-fitting: each fold fits all other
 TRAIN routes and scores only the omitted whole route. The route counter remains
@@ -40,10 +45,12 @@ that family is refit once on every TRAIN route for the published parameters.
 The seed remains a first-class safe result when no family robustly improves.
 
 Every coefficient-bearing stratum needs two independent contributing routes;
-four rows are only the numerical/rank floor. A route with thousands of rows
-still counts once. Evidence schema 10 reports independent route counts,
+any nonempty stratum makes its route a cross-fit contributor, while four rows
+are enforced only on each combined fold-fit population after the held route is
+removed. A route with thousands of rows still counts once. Evidence schema 11
+reports independent route counts,
 cross-fit fold failures, paired out-of-fold losses, and the final all-route fit
-separately. Schema 9 parity evidence is rejected rather than reinterpreted.
+separately. Earlier evidence schemas are rejected rather than reinterpreted.
 
 The `0/5/10/15/20/30 m/s` support floors are respectively
 `150/150/240/240/420/420` accepted weighted seconds, not wall-clock drive
@@ -166,9 +173,9 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 4 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 5 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
-selection, validation regression, and interpolation state. It also carries
+selection, cross-fit regression, fold completion, and interpolation state. It also carries
 strict first-cause accounting for every prepared frame, so accepted evidence
 plus the finite rejection-reason set always equals the ingested-frame count.
 Frames absent before the first canonical poll and explicit source gaps remain

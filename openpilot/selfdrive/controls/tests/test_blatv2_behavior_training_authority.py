@@ -1191,11 +1191,14 @@ class TestBehaviorTrainingAuthority(unittest.TestCase):
     ), key=lambda member: member.member_id))
     physical_receipt = SimpleNamespace(
       generation_sha256="8" * 64,
+      evidence_compatibility_sha256="9" * 64,
       partition_receipt_sha256="c" * 64,
       partition_sha256=partition.sha256,
       profile_path=Path("/tmp/profile"),
       profile_sha256="7" * 64,
       module_closure_sha256="d" * 64,
+      training_algorithm_identity_sha256="a" * 64,
+      training_algorithm_schema_version=11,
     )
     partition_receipt = SimpleNamespace(
       receipt_sha256="c" * 64,

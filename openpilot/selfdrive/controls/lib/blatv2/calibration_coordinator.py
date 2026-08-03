@@ -7,7 +7,7 @@ written last so it acts as the commit record for the independently atomic
 evidence and optional candidate files.
 
 The coordinator can create an *unapproved* candidate only after every speed
-node and interpolation interval qualifies through schema-10 route-grouped
+node and interpolation interval qualifies through schema-11 route-grouped
 leave-one-route-out evidence drawn exclusively from the caller's global TRAIN
 partition. An evaluated all-seed outcome is
 successful and emits an immutable selected-profile proof for downstream
@@ -42,7 +42,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 10
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 11
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
@@ -64,22 +64,22 @@ class CalibrationNodeSupportDiagnostic:
   supported_sample_count: int
   base_support_s: float
   base_sample_count: int
-  training_support_s: float
-  training_count: int
-  validation_support_s: float
-  validation_count: int
+  full_fit_support_s: float
+  full_fit_count: int
+  cross_fit_support_s: float
+  cross_fit_route_count: int
   moving_support_s: float
   moving_sample_count: int
-  moving_training_support_s: float
-  moving_training_count: int
-  moving_validation_support_s: float
-  moving_validation_count: int
+  moving_full_fit_support_s: float
+  moving_full_fit_count: int
+  moving_cross_fit_support_s: float
+  moving_cross_fit_route_count: int
   breakaway_support_s: float
   breakaway_sample_count: int
-  breakaway_training_support_s: float
-  breakaway_training_count: int
-  breakaway_validation_support_s: float
-  breakaway_validation_count: int
+  breakaway_full_fit_support_s: float
+  breakaway_full_fit_count: int
+  breakaway_cross_fit_support_s: float
+  breakaway_cross_fit_route_count: int
   authority_support_s: float
   authority_sample_count: int
   authority_magnitude_sample_count: int
@@ -88,10 +88,10 @@ class CalibrationNodeSupportDiagnostic:
   authority_unresolved_sample_count: int
   authority_fit_support_s: float
   authority_fit_sample_count: int
-  authority_training_support_s: float
-  authority_training_count: int
-  authority_validation_support_s: float
-  authority_validation_count: int
+  authority_full_fit_support_s: float
+  authority_full_fit_count: int
+  authority_cross_fit_support_s: float
+  authority_cross_fit_route_count: int
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -182,13 +182,13 @@ def _qualification_manifest(report: object) -> dict[str, object]:
     "moving_support_s",
     "moving_sample_count",
     "moving_reasons",
-    "moving_seed_validation_rms",
-    "moving_candidate_validation_rms",
+    "moving_full_fit_seed_rms",
+    "moving_full_fit_candidate_rms",
     "breakaway_support_s",
     "breakaway_sample_count",
     "breakaway_reasons",
-    "breakaway_seed_validation_rms",
-    "breakaway_candidate_validation_rms",
+    "breakaway_full_fit_seed_rms",
+    "breakaway_full_fit_candidate_rms",
   }
   missing = required - encoded.keys()
   if missing:
@@ -317,22 +317,22 @@ class CalibrationLearningCoordinator:
           supported_sample_count=evidence.supported_sample_count,
           base_support_s=evidence.base_support_s,
           base_sample_count=evidence.base_sample_count,
-          training_support_s=evidence.training_support_s,
-          training_count=evidence.training_count,
-          validation_support_s=evidence.validation_support_s,
-          validation_count=evidence.validation_count,
+          full_fit_support_s=evidence.full_fit_support_s,
+          full_fit_count=evidence.full_fit_count,
+          cross_fit_support_s=evidence.cross_fit_support_s,
+          cross_fit_route_count=evidence.cross_fit_route_count,
           moving_support_s=evidence.moving_support_s,
           moving_sample_count=evidence.moving_sample_count,
-          moving_training_support_s=evidence.moving_training_support_s,
-          moving_training_count=evidence.moving_training_count,
-          moving_validation_support_s=evidence.moving_validation_support_s,
-          moving_validation_count=evidence.moving_validation_count,
+          moving_full_fit_support_s=evidence.moving_full_fit_support_s,
+          moving_full_fit_count=evidence.moving_full_fit_count,
+          moving_cross_fit_support_s=evidence.moving_cross_fit_support_s,
+          moving_cross_fit_route_count=evidence.moving_cross_fit_route_count,
           breakaway_support_s=evidence.breakaway_support_s,
           breakaway_sample_count=evidence.breakaway_sample_count,
-          breakaway_training_support_s=evidence.breakaway_training_support_s,
-          breakaway_training_count=evidence.breakaway_training_count,
-          breakaway_validation_support_s=evidence.breakaway_validation_support_s,
-          breakaway_validation_count=evidence.breakaway_validation_count,
+          breakaway_full_fit_support_s=evidence.breakaway_full_fit_support_s,
+          breakaway_full_fit_count=evidence.breakaway_full_fit_count,
+          breakaway_cross_fit_support_s=evidence.breakaway_cross_fit_support_s,
+          breakaway_cross_fit_route_count=evidence.breakaway_cross_fit_route_count,
           authority_support_s=evidence.authority_support_s,
           authority_sample_count=evidence.authority_sample_count,
           authority_magnitude_sample_count=evidence.authority_magnitude_sample_count,
@@ -341,10 +341,10 @@ class CalibrationLearningCoordinator:
           authority_unresolved_sample_count=evidence.authority_unresolved_sample_count,
           authority_fit_support_s=evidence.authority_fit_support_s,
           authority_fit_sample_count=evidence.authority_fit_sample_count,
-          authority_training_support_s=evidence.authority_training_support_s,
-          authority_training_count=evidence.authority_training_count,
-          authority_validation_support_s=evidence.authority_validation_support_s,
-          authority_validation_count=evidence.authority_validation_count,
+          authority_full_fit_support_s=evidence.authority_full_fit_support_s,
+          authority_full_fit_count=evidence.authority_full_fit_count,
+          authority_cross_fit_support_s=evidence.authority_cross_fit_support_s,
+          authority_cross_fit_route_count=evidence.authority_cross_fit_route_count,
           lateral_accel_span_mps2=evidence.lateral_accel_span_mps2,
           applied_torque_span=evidence.applied_torque_span,
           lateral_accel_directions=evidence.lateral_accel_directions,

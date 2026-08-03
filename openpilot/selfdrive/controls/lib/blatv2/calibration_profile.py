@@ -26,7 +26,7 @@ import math
 from typing import Any
 
 
-CALIBRATION_PROFILE_SCHEMA_VERSION = 2
+CALIBRATION_PROFILE_SCHEMA_VERSION = 3
 CALIBRATION_PROFILE_PARAM_KEY = "BLaTv2ObservableCalibrationProfile"
 DEFAULT_SPEED_NODES_MPS = (0.0, 5.0, 10.0, 15.0, 20.0, 30.0)
 
@@ -112,9 +112,9 @@ class CalibrationProfileNode:
   moving_sample_count: int
   breakaway_support_s: float
   breakaway_sample_count: int
-  validation_count: int
-  inverse_calibration_validation_rms: float
-  breakaway_validation_rms: float | None
+  cross_fit_route_count: int
+  full_fit_candidate_rms: float
+  breakaway_full_fit_candidate_rms: float | None
 
   def __post_init__(self) -> None:
     if not isinstance(self.parameters, CalibrationParameters):
@@ -124,10 +124,10 @@ class CalibrationProfileNode:
       self.base_support_s,
       self.moving_support_s,
       self.breakaway_support_s,
-      self.inverse_calibration_validation_rms,
+      self.full_fit_candidate_rms,
     )
-    if self.breakaway_validation_rms is not None:
-      values += (self.breakaway_validation_rms,)
+    if self.breakaway_full_fit_candidate_rms is not None:
+      values += (self.breakaway_full_fit_candidate_rms,)
     if not all(math.isfinite(value) for value in values):
       raise ValueError("profile-node evidence must be finite")
     if (
@@ -135,15 +135,15 @@ class CalibrationProfileNode:
       or self.base_support_s < 0.0
       or self.moving_support_s < 0.0
       or self.breakaway_support_s < 0.0
-      or self.inverse_calibration_validation_rms < 0.0
-      or (self.breakaway_validation_rms is not None and self.breakaway_validation_rms < 0.0)
+      or self.full_fit_candidate_rms < 0.0
+      or (self.breakaway_full_fit_candidate_rms is not None and self.breakaway_full_fit_candidate_rms < 0.0)
     ):
       raise ValueError("profile-node evidence is outside its valid domain")
     for count_name in (
       "base_sample_count",
       "moving_sample_count",
       "breakaway_sample_count",
-      "validation_count",
+      "cross_fit_route_count",
     ):
       count = getattr(self, count_name)
       if isinstance(count, bool) or not isinstance(count, int) or count < 0:
@@ -275,9 +275,9 @@ class VehicleCalibrationProfile:
           "moving_sample_count": node.moving_sample_count,
           "breakaway_support_s": node.breakaway_support_s,
           "breakaway_sample_count": node.breakaway_sample_count,
-          "validation_count": node.validation_count,
-          "inverse_calibration_validation_rms": node.inverse_calibration_validation_rms,
-          "breakaway_validation_rms": node.breakaway_validation_rms,
+          "cross_fit_route_count": node.cross_fit_route_count,
+          "full_fit_candidate_rms": node.full_fit_candidate_rms,
+          "breakaway_full_fit_candidate_rms": node.breakaway_full_fit_candidate_rms,
         }
         for node in self.nodes
       ],
@@ -315,8 +315,8 @@ class VehicleCalibrationProfile:
     node_keys = frozenset({
       "speed_mps", "parameters", "base_support_s", "base_sample_count",
       "moving_support_s", "moving_sample_count", "breakaway_support_s",
-      "breakaway_sample_count", "validation_count", "inverse_calibration_validation_rms",
-      "breakaway_validation_rms",
+      "breakaway_sample_count", "cross_fit_route_count", "full_fit_candidate_rms",
+      "breakaway_full_fit_candidate_rms",
     })
     parameter_keys = frozenset({
       "torque_per_lateral_accel", "lateral_accel_offset_correction_mps2", "kinetic_friction_torque",
@@ -326,7 +326,7 @@ class VehicleCalibrationProfile:
     for index, raw_node_value in enumerate(raw_nodes):
       raw_node = _require_exact_keys(raw_node_value, node_keys, f"calibration node {index}")
       raw_params = _require_exact_keys(raw_node["parameters"], parameter_keys, f"calibration node {index} parameters")
-      breakaway_rms_value = raw_node["breakaway_validation_rms"]
+      breakaway_rms_value = raw_node["breakaway_full_fit_candidate_rms"]
       nodes.append(CalibrationProfileNode(
         speed_mps=float(raw_node["speed_mps"]),
         parameters=CalibrationParameters(
@@ -345,9 +345,9 @@ class VehicleCalibrationProfile:
         moving_sample_count=_require_int(raw_node["moving_sample_count"], f"calibration node {index} moving_sample_count"),
         breakaway_support_s=float(raw_node["breakaway_support_s"]),
         breakaway_sample_count=_require_int(raw_node["breakaway_sample_count"], f"calibration node {index} breakaway_sample_count"),
-        validation_count=_require_int(raw_node["validation_count"], f"calibration node {index} validation_count"),
-        inverse_calibration_validation_rms=float(raw_node["inverse_calibration_validation_rms"]),
-        breakaway_validation_rms=(None if breakaway_rms_value is None else float(breakaway_rms_value)),
+        cross_fit_route_count=_require_int(raw_node["cross_fit_route_count"], f"calibration node {index} cross_fit_route_count"),
+        full_fit_candidate_rms=float(raw_node["full_fit_candidate_rms"]),
+        breakaway_full_fit_candidate_rms=(None if breakaway_rms_value is None else float(breakaway_rms_value)),
       ))
     return cls(
       vehicle_identity=identity,
@@ -401,9 +401,9 @@ def make_calibration_seed_profile(
       moving_sample_count=0,
       breakaway_support_s=0.0,
       breakaway_sample_count=0,
-      validation_count=0,
-      inverse_calibration_validation_rms=0.0,
-      breakaway_validation_rms=None,
+      cross_fit_route_count=0,
+      full_fit_candidate_rms=0.0,
+      breakaway_full_fit_candidate_rms=None,
     )
     for speed in speed_nodes_mps
   )

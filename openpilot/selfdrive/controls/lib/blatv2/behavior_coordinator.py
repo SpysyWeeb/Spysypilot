@@ -673,9 +673,9 @@ class FinalizationReason(StrEnum):
   UNDEFINED_TRAINING_METRIC = "undefined_training_metric"
   NO_TRAINING_WINNER = "no_training_winner"
   UNDEFINED_VALIDATION_METRIC = "undefined_validation_metric"
-  SMOOTH_VALIDATION_REGRESSION = "smooth_validation_regression"
-  SWIFT_VALIDATION_REGRESSION = "swift_validation_regression"
-  STRONG_VALIDATION_REGRESSION = "strong_validation_regression"
+  SMOOTH_CROSS_FIT_REGRESSION = "smooth_cross_fit_regression"
+  SWIFT_CROSS_FIT_REGRESSION = "swift_cross_fit_regression"
+  STRONG_CROSS_FIT_REGRESSION = "strong_cross_fit_regression"
   TARGET_VALIDATION_NOT_MATERIAL = "target_validation_not_material"
 
 
@@ -1144,11 +1144,11 @@ def finalize_behavior_learning(
   target_passed = validation.frozen_winner_verdict.target_materially_improved
   if not validation.accepted:
     if not smooth_passed:
-      reason = FinalizationReason.SMOOTH_VALIDATION_REGRESSION
+      reason = FinalizationReason.SMOOTH_CROSS_FIT_REGRESSION
     elif not swift_passed:
-      reason = FinalizationReason.SWIFT_VALIDATION_REGRESSION
+      reason = FinalizationReason.SWIFT_CROSS_FIT_REGRESSION
     elif not strong_passed:
-      reason = FinalizationReason.STRONG_VALIDATION_REGRESSION
+      reason = FinalizationReason.STRONG_CROSS_FIT_REGRESSION
     else:
       reason = FinalizationReason.TARGET_VALIDATION_NOT_MATERIAL
     return _failed_finalization(

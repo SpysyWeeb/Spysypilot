@@ -117,9 +117,9 @@ def _qualification_manifest(
       report.applied_torque_span,
       f"{context}.applied_torque_span",
     ),
-    "authority_candidate_validation_rms": _optional_float_hex(
-      report.authority_candidate_validation_rms,
-      f"{context}.authority_candidate_validation_rms",
+    "authority_candidate_full_fit_candidate_rms": _optional_float_hex(
+      report.authority_candidate_full_fit_candidate_rms,
+      f"{context}.authority_candidate_full_fit_candidate_rms",
     ),
     "authority_fit_active": report.authority_fit_active,
     "authority_fit_sample_count": report.authority_fit_sample_count,
@@ -128,9 +128,9 @@ def _qualification_manifest(
       f"{context}.authority_fit_support_s",
     ),
     "authority_sample_count": report.authority_sample_count,
-    "authority_seed_validation_rms": _optional_float_hex(
-      report.authority_seed_validation_rms,
-      f"{context}.authority_seed_validation_rms",
+    "authority_seed_full_fit_candidate_rms": _optional_float_hex(
+      report.authority_seed_full_fit_candidate_rms,
+      f"{context}.authority_seed_full_fit_candidate_rms",
     ),
     "authority_support_s": _finite_float_hex(
       report.authority_support_s,
@@ -138,9 +138,9 @@ def _qualification_manifest(
     ),
     "authority_training_count": report.authority_training_count,
     "authority_validation_count": report.authority_validation_count,
-    "candidate_validation_rms": _optional_float_hex(
-      report.candidate_validation_rms,
-      f"{context}.candidate_validation_rms",
+    "candidate_full_fit_candidate_rms": _optional_float_hex(
+      report.candidate_full_fit_candidate_rms,
+      f"{context}.candidate_full_fit_candidate_rms",
     ),
     "clean_support_s": _finite_float_hex(
       report.clean_support_s,
@@ -170,9 +170,9 @@ def _qualification_manifest(
       f"{context}.rack_travel_deg",
     ),
     "reasons": [reason.value for reason in report.reasons],
-    "seed_validation_rms": _optional_float_hex(
-      report.seed_validation_rms,
-      f"{context}.seed_validation_rms",
+    "seed_full_fit_candidate_rms": _optional_float_hex(
+      report.seed_full_fit_candidate_rms,
+      f"{context}.seed_full_fit_candidate_rms",
     ),
     "speed_mps": _finite_float_hex(
       report.speed_mps,

@@ -71,6 +71,7 @@ def payload() -> dict[str, object]:
   member_ids = [value.member_id for value in members]
   return {
     "activationEligible": False,
+    "evidenceCompatibilitySha256": "0" * 64,
     "importManifestSha256": "7" * 64,
     "memberSetSha256": hashlib.sha256(
       b"blatv2-robust-member-set-v1\0" + canonical_json(member_wire).encode(),
@@ -86,10 +87,12 @@ def payload() -> dict[str, object]:
     "physicalModuleClosureSha256": "b" * 64,
     "physicalProfileSha256": "c" * 64,
     "reviewedReplaySource": source().to_dict(),
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "status": "qualified",
     "testFalsificationPassed": True,
     "testMemberIds": member_ids,
+    "trainingAlgorithmIdentitySha256": "1" * 64,
+    "trainingAlgorithmSchemaVersion": 11,
     "trainingMemberIds": member_ids,
     "transientModuleClosureSha256": "d" * 64,
     "transientReportSha256": "e" * 64,
@@ -113,12 +116,15 @@ def persist(root: Path, value: dict[str, object]) -> Path:
 def load(path: Path):
   return load_robust_plant_set(
     path,
+    evidence_compatibility_sha256="0" * 64,
     import_manifest_sha256="7" * 64,
     partition_receipt_sha256="8" * 64,
     partition=partition(),
     physical_generation_sha256="a" * 64,
     physical_module_closure_sha256="b" * 64,
     physical_profile_sha256="c" * 64,
+    training_algorithm_identity_sha256="1" * 64,
+    training_algorithm_schema_version=11,
     replay_source=source(),
   )
 
@@ -157,11 +163,56 @@ class TestRobustPlantSet(unittest.TestCase):
       with self.assertRaisesRegex(RobustPlantSetError, "another experiment"):
         load_robust_plant_set(
           path,
+          evidence_compatibility_sha256="0" * 64,
           import_manifest_sha256="0" * 64,
           partition_receipt_sha256="8" * 64,
           partition=partition(),
           physical_generation_sha256="a" * 64,
           physical_module_closure_sha256="b" * 64,
           physical_profile_sha256="c" * 64,
+          training_algorithm_identity_sha256="1" * 64,
+          training_algorithm_schema_version=11,
           replay_source=source(),
         )
+
+  def test_evidence_and_training_algorithm_mismatch_fail(self) -> None:
+    mismatches = (
+      ("evidenceCompatibilitySha256", "0" * 64, "2" * 64),
+      ("trainingAlgorithmIdentitySha256", "1" * 64, "2" * 64),
+      ("trainingAlgorithmSchemaVersion", 11, 12),
+    )
+    for name, persisted, expected in mismatches:
+      with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+        value = payload()
+        self.assertEqual(value[name], persisted)
+        path = persist(Path(directory), value)
+        arguments = {
+          "evidence_compatibility_sha256": "0" * 64,
+          "training_algorithm_identity_sha256": "1" * 64,
+          "training_algorithm_schema_version": 11,
+        }
+        arguments[{  # type: ignore[index]
+          "evidenceCompatibilitySha256": "evidence_compatibility_sha256",
+          "trainingAlgorithmIdentitySha256": "training_algorithm_identity_sha256",
+          "trainingAlgorithmSchemaVersion": "training_algorithm_schema_version",
+        }[name]] = expected
+        with self.assertRaisesRegex(RobustPlantSetError, "another experiment"):
+          load_robust_plant_set(
+            path,
+            import_manifest_sha256="7" * 64,
+            partition_receipt_sha256="8" * 64,
+            partition=partition(),
+            physical_generation_sha256="a" * 64,
+            physical_module_closure_sha256="b" * 64,
+            physical_profile_sha256="c" * 64,
+            replay_source=source(),
+            **arguments,
+          )
+
+  def test_legacy_schema_is_rejected(self) -> None:
+    value = payload()
+    value["schemaVersion"] = 1
+    with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
+      RobustPlantSetError, "not passed unchanged",
+    ):
+      load(persist(Path(directory), value))

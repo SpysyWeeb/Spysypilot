@@ -27,8 +27,8 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_replay_authority import Re
 from openpilot.selfdrive.controls.lib.blatv2.counterfactual_plant import CounterfactualPlantMember
 
 
-ROBUST_PLANT_SET_SCHEMA_VERSION = 1
-ROBUST_PLANT_SET_DOMAIN = b"blatv2-robust-plant-set-v1\0"
+ROBUST_PLANT_SET_SCHEMA_VERSION = 2
+ROBUST_PLANT_SET_DOMAIN = b"blatv2-robust-plant-set-v2\0"
 ROBUST_PLANT_SET_MINIMUM_MEMBERS = 2
 ROBUST_PLANT_SET_MAXIMUM_MEMBERS = 64
 _MAXIMUM_RECEIPT_BYTES = 8 * 1024 * 1024
@@ -113,12 +113,15 @@ def _read_immutable_canonical(path: Path) -> tuple[dict[str, object], bytes]:
 @dataclass(frozen=True, slots=True)
 class RobustPlantSet:
   receipt_sha256: str
+  evidence_compatibility_sha256: str
   import_manifest_sha256: str
   partition_receipt_sha256: str
   partition_sha256: str
   physical_generation_sha256: str
   physical_profile_sha256: str
   physical_module_closure_sha256: str
+  training_algorithm_identity_sha256: str
+  training_algorithm_schema_version: int
   transient_report_sha256: str
   transient_rules_sha256: str
   transient_module_closure_sha256: str
@@ -126,13 +129,15 @@ class RobustPlantSet:
 
   def __post_init__(self) -> None:
     for name in (
-      "receipt_sha256", "import_manifest_sha256", "partition_receipt_sha256",
+      "receipt_sha256", "evidence_compatibility_sha256", "import_manifest_sha256", "partition_receipt_sha256",
       "partition_sha256", "physical_generation_sha256", "physical_profile_sha256",
-      "physical_module_closure_sha256",
+      "physical_module_closure_sha256", "training_algorithm_identity_sha256",
       "transient_report_sha256", "transient_rules_sha256",
       "transient_module_closure_sha256",
     ):
       _sha256(getattr(self, name), f"robust plant set {name}")
+    if type(self.training_algorithm_schema_version) is not int or self.training_algorithm_schema_version <= 0:
+      raise ValueError("robust plant set training algorithm schema is malformed")
     member_ids = tuple(member.member_id for member in self.members)
     if (
       not ROBUST_PLANT_SET_MINIMUM_MEMBERS
@@ -150,18 +155,22 @@ class RobustPlantSet:
 def load_robust_plant_set(
   path: Path,
   *,
+  evidence_compatibility_sha256: str,
   import_manifest_sha256: str,
   partition_receipt_sha256: str,
   partition: FrozenBehaviorPartition,
   physical_generation_sha256: str,
   physical_profile_sha256: str,
   physical_module_closure_sha256: str,
+  training_algorithm_identity_sha256: str,
+  training_algorithm_schema_version: int,
   replay_source: ReviewedReplaySource,
 ) -> RobustPlantSet:
   """Authenticate one frozen member population and all held-out verdicts."""
   payload, encoded = _read_immutable_canonical(path)
   keys = {
     "activationEligible",
+    "evidenceCompatibilitySha256",
     "importManifestSha256",
     "memberSetSha256",
     "members",
@@ -179,6 +188,8 @@ def load_robust_plant_set(
     "status",
     "testFalsificationPassed",
     "testMemberIds",
+    "trainingAlgorithmIdentitySha256",
+    "trainingAlgorithmSchemaVersion",
     "trainingMemberIds",
     "transientModuleClosureSha256",
     "transientReportSha256",
@@ -201,12 +212,17 @@ def load_robust_plant_set(
   if path.parent.name != receipt_sha256:
     raise RobustPlantSetError("robust plant-set content address differs")
   for name in (
-    "importManifestSha256", "memberSetSha256", "moduleClosureSha256",
+    "evidenceCompatibilitySha256", "importManifestSha256", "memberSetSha256", "moduleClosureSha256",
     "partitionReceiptSha256", "partitionSha256", "physicalGenerationSha256",
-    "physicalModuleClosureSha256", "physicalProfileSha256", "transientModuleClosureSha256",
+    "physicalModuleClosureSha256", "physicalProfileSha256", "trainingAlgorithmIdentitySha256", "transientModuleClosureSha256",
     "transientReportSha256", "transientRulesSha256",
   ):
     _sha256(payload[name], f"robust plant-set {name}")
+  if (
+    type(payload["trainingAlgorithmSchemaVersion"]) is not int
+    or payload["trainingAlgorithmSchemaVersion"] <= 0
+  ):
+    raise RobustPlantSetError("robust plant-set training algorithm schema is malformed")
   if payload["reviewedReplaySource"] != replay_source.to_dict():
     raise RobustPlantSetError("robust plant set was produced by another replay source")
   if payload["moduleClosureSha256"] != replay_source.module_closure_sha256:
@@ -221,12 +237,15 @@ def load_robust_plant_set(
   ):
     raise RobustPlantSetError("robust plant set carries another route partition")
   expected = (
+    (payload["evidenceCompatibilitySha256"], evidence_compatibility_sha256),
     (payload["importManifestSha256"], import_manifest_sha256),
     (payload["partitionReceiptSha256"], partition_receipt_sha256),
     (payload["partitionSha256"], partition.sha256),
     (payload["physicalGenerationSha256"], physical_generation_sha256),
     (payload["physicalProfileSha256"], physical_profile_sha256),
     (payload["physicalModuleClosureSha256"], physical_module_closure_sha256),
+    (payload["trainingAlgorithmIdentitySha256"], training_algorithm_identity_sha256),
+    (payload["trainingAlgorithmSchemaVersion"], training_algorithm_schema_version),
   )
   if any(left != right for left, right in expected):
     raise RobustPlantSetError("robust plant set belongs to another experiment")
@@ -275,12 +294,15 @@ def load_robust_plant_set(
       raise RobustPlantSetError("robust plant set changed across held-out stages")
   return RobustPlantSet(
     receipt_sha256=receipt_sha256,
+    evidence_compatibility_sha256=payload["evidenceCompatibilitySha256"],
     import_manifest_sha256=payload["importManifestSha256"],
     partition_receipt_sha256=payload["partitionReceiptSha256"],
     partition_sha256=payload["partitionSha256"],
     physical_generation_sha256=payload["physicalGenerationSha256"],
     physical_profile_sha256=payload["physicalProfileSha256"],
     physical_module_closure_sha256=payload["physicalModuleClosureSha256"],
+    training_algorithm_identity_sha256=payload["trainingAlgorithmIdentitySha256"],
+    training_algorithm_schema_version=payload["trainingAlgorithmSchemaVersion"],
     transient_report_sha256=payload["transientReportSha256"],
     transient_rules_sha256=payload["transientRulesSha256"],
     transient_module_closure_sha256=payload["transientModuleClosureSha256"],

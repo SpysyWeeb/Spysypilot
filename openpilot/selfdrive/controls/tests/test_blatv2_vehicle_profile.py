@@ -37,8 +37,8 @@ def node(speed: float, value: float, qualified: bool = True) -> ProfileNode:
     parameters=params(value, qualified),
     clean_support_s=180.0,
     sample_count=1000,
-    validation_count=200,
-    validation_rms=0.1,
+    cross_fit_route_count=200,
+    full_fit_candidate_rms=0.1,
   )
 
 
@@ -108,9 +108,9 @@ class TestBlatV2VehicleProfile(unittest.TestCase):
         moving_sample_count=100,
         breakaway_support_s=2.0,
         breakaway_sample_count=20,
-        validation_count=50,
-        inverse_calibration_validation_rms=0.03,
-        breakaway_validation_rms=0.02,
+        cross_fit_route_count=50,
+        full_fit_candidate_rms=0.03,
+        breakaway_full_fit_candidate_rms=0.02,
       )
       for index, source in enumerate(seed.nodes)
     )

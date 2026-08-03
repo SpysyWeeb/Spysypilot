@@ -159,7 +159,7 @@ def behavior_finalization(
     final_behavior_policy_sha256=behavior.sha256 if passed else None,
     behavior_selection_sha256=selection if passed else None,
     reasons=(FinalizationReason.PASSED,) if passed else (
-      FinalizationReason.SMOOTH_VALIDATION_REGRESSION,
+      FinalizationReason.SMOOTH_CROSS_FIT_REGRESSION,
     ),
   )
 

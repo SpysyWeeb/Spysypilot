@@ -121,7 +121,7 @@ PROVISIONAL_CONTROLLER_POLICY_PATH = BLATV2_LIBRARY_ROOT / "provisional_controll
 _WORKER_COUNT = 4
 _TRAINING_PHYSICAL_RECEIPT_MAXIMUM_BYTES = 16 * 1024 * 1024
 _TRAINING_PHYSICAL_PROFILE_MAXIMUM_BYTES = 4 * 1024 * 1024
-_TRAINING_PHYSICAL_GENERATION_DOMAIN = b"blatv2-training-scoped-physical-generation-v1\0"
+_TRAINING_PHYSICAL_GENERATION_DOMAIN = b"blatv2-training-scoped-physical-generation-v2\0"
 _TRAINING_PARTITION_RECEIPT_DOMAIN = b"blatv2-trainer-partition-receipt-v2\0"
 _TRAINING_PARTITION_RECEIPT_MAXIMUM_BYTES = 16 * 1024 * 1024
 _RECEIPT_DOMAIN = b"blatv2-authenticated-training-receipt-v2\0"
@@ -480,11 +480,14 @@ def _sha256_json(value: object) -> str:
 @dataclass(frozen=True, slots=True)
 class _TrainingPhysicalReceipt:
   generation_sha256: str
+  evidence_compatibility_sha256: str
   partition_receipt_sha256: str
   partition_sha256: str
   profile_path: Path
   profile_sha256: str
   module_closure_sha256: str
+  training_algorithm_identity_sha256: str
+  training_algorithm_schema_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,18 +637,20 @@ def _load_training_physical_receipt(
     raise BehaviorTrainingAuthorityError("training physical receipt is malformed") from error
   keys = {
     "aaBitExact", "acceptedSampleCount", "activationEligible", "allNodesQualified",
-    "candidateProfileSha256", "evidenceSha256", "heldOutArtifactsOpened",
+    "candidateProfileSha256", "evidenceCompatibilitySha256", "evidenceRuntimeIdentitySha256",
+    "evidenceSha256", "evidenceSourceCompositionSha256", "evidenceSourceIdentitySha256", "heldOutArtifactsOpened",
     "importManifestSha256", "interpolationQualified", "manifestSha256",
     "moduleClosure", "moduleClosureSha256", "partition", "partitionReceiptSha256",
     "partitionSha256", "productionMode", "rejectedSampleCount",
-    "runtimeCarParamsRouteId", "runtimeIdentitySha256", "schemaVersion",
-    "selectedProfile", "selectedProfileSha256", "sourceCompositionSha256",
-    "sourceIdentitySha256", "trainingRoutes",
+    "runtimeCarParamsRouteId", "schemaVersion",
+    "selectedProfile", "selectedProfileSha256", "trainingAlgorithmIdentitySha256", "trainingAlgorithmSchemaVersion",
+    "trainingRoutes", "trainingRuntimeIdentitySha256", "trainingSourceCompositionSha256",
+    "trainingSourceIdentitySha256",
   }
   if type(payload) is not dict or set(payload) != keys or encoded != canonical_json(payload).encode():
     raise BehaviorTrainingAuthorityError("training physical receipt is not canonical")
   if (
-    payload["schemaVersion"] != 1
+    payload["schemaVersion"] != 2
     or payload["activationEligible"] is not False
     or payload["heldOutArtifactsOpened"] is not False
     or payload["productionMode"] is not True
@@ -660,14 +665,19 @@ def _load_training_physical_receipt(
   if path.parent.name != generation_sha256:
     raise BehaviorTrainingAuthorityError("training physical receipt address differs")
   for name in (
-    "evidenceSha256", "importManifestSha256", "manifestSha256", "moduleClosureSha256",
-    "partitionReceiptSha256", "partitionSha256", "runtimeIdentitySha256",
-    "selectedProfileSha256", "sourceCompositionSha256", "sourceIdentitySha256",
+    "evidenceCompatibilitySha256", "evidenceRuntimeIdentitySha256", "evidenceSha256",
+    "evidenceSourceCompositionSha256", "evidenceSourceIdentitySha256", "importManifestSha256",
+    "manifestSha256", "moduleClosureSha256", "partitionReceiptSha256", "partitionSha256",
+    "selectedProfileSha256",
+    "trainingAlgorithmIdentitySha256", "trainingRuntimeIdentitySha256",
+    "trainingSourceCompositionSha256", "trainingSourceIdentitySha256",
   ):
     _sha256(payload[name], f"training physical {name}")
   candidate = payload["candidateProfileSha256"]
   if candidate is not None:
     _sha256(candidate, "training physical candidate profile")
+  if type(payload["trainingAlgorithmSchemaVersion"]) is not int or payload["trainingAlgorithmSchemaVersion"] <= 0:
+    raise BehaviorTrainingAuthorityError("training physical algorithm schema is malformed")
   for name in ("acceptedSampleCount", "rejectedSampleCount"):
     if type(payload[name]) is not int or payload[name] < 0:
       raise BehaviorTrainingAuthorityError("training physical sample accounting is malformed")
@@ -680,8 +690,8 @@ def _load_training_physical_receipt(
     or persisted_partition != partition
     or payload["partitionSha256"] != partition.sha256
     or payload["partitionReceiptSha256"] != partition_receipt.receipt_sha256
-    or payload["sourceCompositionSha256"] != partition_receipt.source_composition_sha256
-    or payload["runtimeIdentitySha256"] != partition_receipt.runtime_identity_sha256
+    or payload["evidenceSourceCompositionSha256"] != partition_receipt.source_composition_sha256
+    or payload["evidenceRuntimeIdentitySha256"] != partition_receipt.runtime_identity_sha256
   ):
     raise BehaviorTrainingAuthorityError("training physical receipt belongs to another experiment")
   expected_training = [
@@ -731,11 +741,14 @@ def _load_training_physical_receipt(
     raise BehaviorTrainingAuthorityError("training selected profile identity differs")
   return _TrainingPhysicalReceipt(
     generation_sha256=generation_sha256,
+    evidence_compatibility_sha256=payload["evidenceCompatibilitySha256"],
     partition_receipt_sha256=payload["partitionReceiptSha256"],
     partition_sha256=payload["partitionSha256"],
     profile_path=profile_path,
     profile_sha256=payload["selectedProfileSha256"],
     module_closure_sha256=payload["moduleClosureSha256"],
+    training_algorithm_identity_sha256=payload["trainingAlgorithmIdentitySha256"],
+    training_algorithm_schema_version=payload["trainingAlgorithmSchemaVersion"],
   )
 
 
@@ -1724,12 +1737,15 @@ def _execute_epoch_once_common(
   try:
     plant_set = load_robust_plant_set(
       robust_plant_set_path,
+      evidence_compatibility_sha256=physical_receipt.evidence_compatibility_sha256,
       import_manifest_sha256=authenticated.manifest_sha256,
       partition_receipt_sha256=physical_receipt.partition_receipt_sha256,
       partition=partition,
       physical_generation_sha256=physical_receipt.generation_sha256,
       physical_profile_sha256=profile_sha256,
       physical_module_closure_sha256=physical_receipt.module_closure_sha256,
+      training_algorithm_identity_sha256=physical_receipt.training_algorithm_identity_sha256,
+      training_algorithm_schema_version=physical_receipt.training_algorithm_schema_version,
       replay_source=replay_source,
     )
   except RobustPlantSetError as error:

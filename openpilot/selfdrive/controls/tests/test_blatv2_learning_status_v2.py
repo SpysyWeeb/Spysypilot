@@ -12,6 +12,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationFitStatus,
   CalibrationInterpolationQualificationReport,
+  CalibrationCrossFitStatus,
   CalibrationLearningResult,
   CalibrationModelFitDiagnostic,
   CalibrationModelId,
@@ -95,9 +96,9 @@ def _candidate(seed: VehicleCalibrationProfile) -> VehicleCalibrationProfile:
       moving_sample_count=120,
       breakaway_support_s=8.0,
       breakaway_sample_count=80,
-      validation_count=80,
-      inverse_calibration_validation_rms=0.05,
-      breakaway_validation_rms=0.04,
+      cross_fit_route_count=80,
+      full_fit_candidate_rms=0.05,
+      breakaway_full_fit_candidate_rms=0.04,
     )
     for index, node in enumerate(seed.nodes)
   )
@@ -127,19 +128,18 @@ def _report(
     minimum_support_s=30.0,
     clean_support_s=40.0,
     supported_sample_count=400,
-    training_count=320,
-    validation_count=80,
-    validation_support_s=8.0,
+    full_fit_count=320,
+    cross_fit_route_count=80,
     base_support_s=20.0,
     base_sample_count=200,
     moving_support_s=12.0,
     moving_sample_count=120,
-    moving_training_count=96,
-    moving_validation_count=24,
+    moving_full_fit_count=96,
+    moving_cross_fit_route_count=24,
     breakaway_support_s=8.0,
     breakaway_sample_count=80,
-    breakaway_training_count=64,
-    breakaway_validation_count=16,
+    breakaway_full_fit_count=64,
+    breakaway_cross_fit_route_count=16,
     lateral_accel_span_mps2=1.2,
     lateral_accel_rms_mps2=0.35,
     rack_travel_deg=240.0,
@@ -147,12 +147,12 @@ def _report(
     rack_reversals=12,
     lateral_accel_directions=2,
     applied_torque_directions=2,
-    seed_validation_rms=0.11,
-    candidate_validation_rms=0.06,
-    moving_seed_validation_rms=0.12,
-    moving_candidate_validation_rms=0.07,
-    breakaway_seed_validation_rms=0.13,
-    breakaway_candidate_validation_rms=0.08,
+    full_fit_seed_rms=0.11,
+    full_fit_candidate_rms=0.06,
+    moving_full_fit_seed_rms=0.12,
+    moving_full_fit_candidate_rms=0.07,
+    breakaway_full_fit_seed_rms=0.13,
+    breakaway_full_fit_candidate_rms=0.08,
     confidence=0.8,
     reasons=reasons,
     candidate_parameters=parameters,
@@ -160,10 +160,10 @@ def _report(
     authority_sample_count=50,
     authority_fit_support_s=3.0,
     authority_fit_sample_count=30,
-    authority_training_count=24,
-    authority_validation_count=6,
-    authority_seed_validation_rms=0.14,
-    authority_candidate_validation_rms=0.09,
+    authority_full_fit_count=24,
+    authority_cross_fit_route_count=6,
+    authority_full_fit_seed_rms=0.14,
+    authority_full_fit_candidate_rms=0.09,
     fit_diagnostics=tuple(
       CalibrationModelFitDiagnostic(
         model=model,
@@ -181,17 +181,17 @@ def _report(
         (CalibrationModelId.FULL_MAP, 3),
       )
     ),
-    training_paired_loss=(
+    full_fit_paired_loss=(
       CalibrationPairedLossDiagnostic(2, -0.02, 0.005, -0.025, -0.015, 1e-14)
       if qualified
       else None
     ),
-    validation_paired_loss=(
+    cross_fit_paired_loss=(
       CalibrationPairedLossDiagnostic(2, -0.01, 0.002, -0.012, -0.008, 1e-14)
       if qualified
       else None
     ),
-    training_outcome=(
+    selection_outcome=(
       CalibrationQualificationReason.LEARNED if qualified else None
     ),
   )
@@ -216,13 +216,17 @@ def _fixtures(*, qualified: bool = True):
         interval_index=0,
         lower_speed_mps=seed.nodes[0].speed_mps,
         upper_speed_mps=seed.nodes[1].speed_mps,
-        training_paired_loss=CalibrationPairedLossDiagnostic(
+        full_fit_paired_loss=CalibrationPairedLossDiagnostic(
           2, -0.02, 0.005, -0.025, -0.015, 1e-14
         ),
-        validation_paired_loss=CalibrationPairedLossDiagnostic(
+        cross_fit_paired_loss=CalibrationPairedLossDiagnostic(
           2, -0.01, 0.002, -0.012, -0.008, 1e-14
         ),
         reasons=(CalibrationQualificationReason.QUALIFIED,),
+        contributing_route_count=2,
+        successful_fold_count=2,
+        failed_fold_count=0,
+        cross_fit_status=CalibrationCrossFitStatus.SCORED,
       ),
     )
     if qualified
@@ -282,7 +286,7 @@ def _baseline() -> DriveEvidenceBaseline:
   return DriveEvidenceBaseline.from_support_diagnostics(diagnostics)
 
 
-def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None:
+def test_schema_v5_roundtrip_identity_observable_parameters_and_deltas() -> None:
   runtime, finalization = _fixtures()
   baseline = _baseline()
   payload = build_learning_status_payload(
@@ -296,7 +300,7 @@ def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 4
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 5
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -320,10 +324,10 @@ def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None
 
   node = payload["nodes"][0]
   assert node["evaluation_status"] == "learned"
-  assert node["training_outcome"] == "learned"
+  assert node["selection_outcome"] == "learned"
   assert len(node["fit_diagnostics"]) == 4
   assert node["fit_diagnostics"][-1]["moving_rank"] == 3
-  assert node["training_paired_loss"]["route_count"] == 2
+  assert node["full_fit_paired_loss"]["route_count"] == 2
   assert node["candidate_parameters"] == {
     "kinetic_friction_torque": 0.03,
     "lateral_accel_offset_correction_mps2": -0.04,
@@ -344,13 +348,13 @@ def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert node["last_drive_authority_fit_sample_count"] == 10
 
 
-def test_fully_evaluated_validation_regression_is_not_reported_as_pending() -> None:
+def test_fully_evaluated_cross_fit_regression_is_not_reported_as_pending() -> None:
   runtime, finalization = _fixtures(qualified=False)
   rejected_reports = tuple(
     replace(
       report,
-      reasons=(CalibrationQualificationReason.VALIDATION_REGRESSION,),
-      training_outcome=CalibrationQualificationReason.LEARNED,
+      reasons=(CalibrationQualificationReason.CROSS_FIT_REGRESSION,),
+      selection_outcome=CalibrationQualificationReason.LEARNED,
     )
     for report in finalization.learning_result.node_reports
   )
@@ -370,7 +374,7 @@ def test_fully_evaluated_validation_regression_is_not_reported_as_pending() -> N
   assert payload["all_intervals_qualified"] is False
   assert payload["candidate_profile_available"] is False
   assert all(
-    node["evaluation_status"] == "validation_regressed"
+    node["evaluation_status"] == "cross_fit_regressed"
     for node in payload["nodes"]
   )
 
@@ -529,17 +533,17 @@ def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
       report,
       reasons=(CalibrationQualificationReason.SEED_RETAINED,),
       candidate_parameters=runtime.calibration_seed_profile.nodes[index].parameters,
-      training_outcome=CalibrationQualificationReason.SEED_RETAINED,
-      training_paired_loss=zero_loss,
-      validation_paired_loss=zero_loss,
+      selection_outcome=CalibrationQualificationReason.SEED_RETAINED,
+      full_fit_paired_loss=zero_loss,
+      cross_fit_paired_loss=zero_loss,
     )
     for index, report in enumerate(finalization.learning_result.node_reports)
   )
   intervals = tuple(
     replace(
       report,
-      training_paired_loss=zero_loss,
-      validation_paired_loss=zero_loss,
+      full_fit_paired_loss=zero_loss,
+      cross_fit_paired_loss=zero_loss,
     )
     for report in finalization.learning_result.interpolation_reports
   )
@@ -584,19 +588,19 @@ def test_failure_classifications_remain_distinct() -> None:
       None,
     ),
     (
-      CalibrationQualificationReason.VALIDATION_INCONCLUSIVE,
-      "validation_inconclusive",
+      CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE,
+      "cross_fit_inconclusive",
       None,
       CalibrationQualificationReason.LEARNED,
     ),
     (
-      CalibrationQualificationReason.VALIDATION_REGRESSION,
-      "validation_regressed",
+      CalibrationQualificationReason.CROSS_FIT_REGRESSION,
+      "cross_fit_regressed",
       None,
       CalibrationQualificationReason.LEARNED,
     ),
   )
-  for reason, expected, fit_status, training_outcome in cases:
+  for reason, expected, fit_status, selection_outcome in cases:
     reports = list(finalization.learning_result.node_reports)
     diagnostics = reports[0].fit_diagnostics
     if fit_status is not None:
@@ -616,7 +620,7 @@ def test_failure_classifications_remain_distinct() -> None:
       reports[0],
       reasons=(reason,),
       fit_diagnostics=diagnostics,
-      training_outcome=training_outcome,
+      selection_outcome=selection_outcome,
     )
     classified = replace(
       finalization,

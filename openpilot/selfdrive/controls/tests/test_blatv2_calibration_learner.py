@@ -17,6 +17,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CALIBRATION_EVIDENCE_SCHEMA_VERSION,
   CalibrationCrossFitStatus,
   CalibrationFitStatus,
+  CalibrationModelFitDiagnostic,
   CalibrationModelId,
   CalibrationProfileLearner,
   CalibrationQualificationReason,
@@ -26,7 +27,9 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   _fit_bounded_subset,
   _fit_model_family,
   _cross_fit_family,
+  _cross_fit_interval_loss,
   _canonical_routes,
+  _aggregate_nodes,
   _seed_coefficients,
   _solve,
   calibration_evidence_sha256,
@@ -518,12 +521,9 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertEqual(snapshot.authority_unresolved_sample_count, 1)
     self.assertAlmostEqual(snapshot.authority_support_s, 2.0 * DT)
     self.assertAlmostEqual(snapshot.authority_fit_support_s, DT)
-    self.assertEqual(
-      snapshot.training_count + snapshot.validation_count,
-      snapshot.supported_sample_count,
-    )
+    self.assertEqual(snapshot.full_fit_count, snapshot.supported_sample_count)
     self.assertAlmostEqual(
-      snapshot.training_support_s + snapshot.validation_support_s,
+      snapshot.full_fit_support_s,
       snapshot.clean_support_s,
     )
     self.assertEqual(snapshot.lateral_accel_directions, 2)
@@ -545,19 +545,12 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
 
       snapshot = learner.evidence_for_node(2)
       full_fit_counts = (
-        snapshot.training_count,
-        snapshot.moving_training_count,
-        snapshot.breakaway_training_count,
-        snapshot.breakaway_episode_training_count,
-      )
-      retired_parity_counts = (
-        snapshot.validation_count,
-        snapshot.moving_validation_count,
-        snapshot.breakaway_validation_count,
-        snapshot.breakaway_episode_validation_count,
+        snapshot.full_fit_count,
+        snapshot.moving_full_fit_count,
+        snapshot.breakaway_full_fit_count,
+        snapshot.breakaway_episode_full_fit_count,
       )
       self.assertTrue(all(count > 0 for count in full_fit_counts))
-      self.assertEqual(retired_parity_counts, (0, 0, 0, 0))
       learner.end_route()
 
   def test_route_identity_prevents_duplicate_uncertainty_and_partition_leakage(self) -> None:
@@ -612,6 +605,145 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       for diagnostic in report.cross_fit_diagnostics
     ))
 
+  def test_authority_only_route_is_held_out_and_scored(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    predictors = (-0.8, 1.0, 1.0, 0.0)
+    for route_counter in (200, 201):
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
+      add_identifiable_stream(learner, 10.0, 120)
+      if route_counter == 200:
+        for _ in range(4):
+          learner._add_regression(2, "authority_training", predictors, 0.35, 0.1)
+      learner.end_route()
+    learner.begin_route(route_sha(202), route_counter=202)
+    for _ in range(4):
+      learner._add_regression(2, "authority_training", predictors, 0.35, 0.1)
+    learner.end_route()
+
+    family = _cross_fit_family(
+      tuple(learner._routes),
+      2,
+      CalibrationModelId.FULL_MAP,
+      _seed_coefficients(learner.seed_profile.nodes[2].parameters),
+      (),
+    )
+    self.assertEqual(family.diagnostic.contributing_route_count, 3)
+    self.assertEqual(family.diagnostic.successful_fold_count, 3)
+    self.assertEqual(family.diagnostic.failed_fold_count, 0)
+    self.assertIn(route_sha(202), dict(family.coefficients_by_route))
+
+  def test_authority_heldout_regression_blocks_family(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    predictors = (-0.8, 1.0, 1.0, 0.0)
+    for route_counter in (203, 204, 205):
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
+      add_identifiable_stream(learner, 10.0, 120)
+      authority_target = -5.0 if route_counter == 205 else 0.35
+      for _ in range(4):
+        learner._add_regression(2, "authority_training", predictors, authority_target, 0.1)
+      learner.end_route()
+
+    family = _cross_fit_family(
+      tuple(learner._routes),
+      2,
+      CalibrationModelId.FULL_MAP,
+      _seed_coefficients(learner.seed_profile.nodes[2].parameters),
+      (),
+    )
+    self.assertEqual(family.diagnostic.contributing_route_count, 3)
+    self.assertEqual(family.diagnostic.status, CalibrationCrossFitStatus.HELD_OUT_REGRESSION)
+
+  def test_three_row_authority_routes_fail_each_combined_holdout_fit(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    predictors = (-0.8, 1.0, 1.0, 0.0)
+    for route_counter in (210, 211):
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
+      add_identifiable_stream(learner, 10.0, 120)
+      for _ in range(3):
+        learner._add_regression(2, "authority_training", predictors, 0.35, 0.1)
+      learner.end_route()
+    family = _cross_fit_family(
+      tuple(learner._routes),
+      2,
+      CalibrationModelId.FULL_MAP,
+      _seed_coefficients(learner.seed_profile.nodes[2].parameters),
+      (),
+    )
+    self.assertEqual(family.diagnostic.contributing_route_count, 2)
+    self.assertEqual(family.diagnostic.successful_fold_count, 0)
+    self.assertEqual(family.diagnostic.failed_fold_count, 2)
+    self.assertEqual(family.diagnostic.status, CalibrationCrossFitStatus.FOLD_FIT_FAILURE)
+
+  def test_all_family_fold_failures_cannot_retain_seed(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    for route_counter in (220, 221):
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
+      for direction in (-1.0, 1.0, 1.0):
+        moving = (-direction, 1.0, direction, 0.0)
+        episode = (-direction, 1.0, 0.0, direction)
+        learner._add_regression(2, "moving_training", moving, direction * 0.2, 1.0)
+        learner._add_regression(2, "breakaway_episode_training", episode, direction * 0.3, 1.0)
+        learner._add_regression(2, "breakaway_training", episode, direction * 0.3, 1.0)
+        learner._add_regression(2, "training", moving, direction * 0.2, 1.0)
+        learner._add_regression(2, "training", episode, direction * 0.3, 1.0)
+      learner.end_route()
+    report = learner._node_report(2)
+    self.assertIn(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE, report.reasons)
+    self.assertNotEqual(report.selection_outcome, CalibrationQualificationReason.SEED_RETAINED)
+    self.assertTrue(all(
+      diagnostic.status is CalibrationCrossFitStatus.FOLD_FIT_FAILURE
+      for diagnostic in report.cross_fit_diagnostics
+    ))
+
+  def test_interpolation_middle_fold_failure_blocks_profile(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    add_complete_evidence(learner)
+    routes = _canonical_routes(tuple(learner._routes))
+    contributing = tuple(route for route in routes if route.intervals[0].count > 0)
+    self.assertGreaterEqual(len(contributing), 3)
+    middle_identity = contributing[len(contributing) // 2].route_identity_sha256
+    all_identities = {route.route_identity_sha256 for route in routes}
+
+    def selective_fit(fit_routes, node_index, model, seed, **unused):
+      held_identity = next(iter(all_identities - {route.route_identity_sha256 for route in fit_routes}))
+      status = CalibrationFitStatus.RANK_DEFICIENT if held_identity == middle_identity else CalibrationFitStatus.IDENTIFIABLE
+      diagnostic = CalibrationModelFitDiagnostic(model, status, 4, 4, 1.0, 1, 1)
+      return (None, diagnostic) if status is CalibrationFitStatus.RANK_DEFICIENT else (seed, diagnostic)
+
+    with patch(
+      "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._fit_model_family",
+      side_effect=selective_fit,
+    ):
+      _, route_count, successful, failed, status = _cross_fit_interval_loss(
+        routes,
+        0,
+        CalibrationModelId.FULL_MAP,
+        CalibrationModelId.FULL_MAP,
+        learner.seed_profile.nodes[0].parameters,
+        learner.seed_profile.nodes[1].parameters,
+      )
+    self.assertEqual(route_count, len(contributing))
+    self.assertEqual(successful, len(contributing) - 1)
+    self.assertEqual(failed, 1)
+    self.assertEqual(status, CalibrationCrossFitStatus.FOLD_FIT_FAILURE)
+
+  def test_nonassociative_route_order_is_byte_exact(self) -> None:
+    def build(order: tuple[int, ...]) -> tuple[bytes, bytes]:
+      learner = CalibrationProfileLearner(seed_profile())
+      weights = (0.2, 0.4, 0.3, 0.1)
+      for route_counter in order:
+        learner.begin_route(route_sha(route_counter), route_counter=route_counter)
+        predictor = (1.0, 1.0, 1.0, 0.0)
+        learner._add_regression(2, "moving_training", predictor, 0.1, weights[route_counter])
+        learner._add_regression(2, "training", predictor, 0.1, weights[route_counter])
+        learner.end_route()
+      report = learner._node_report(2)
+      return learner.export_evidence(), canonical(asdict(report))
+
+    expected = build((0, 1, 2, 3))
+    self.assertEqual(build((3, 1, 0, 2)), expected)
+    self.assertEqual(build((2, 0, 3, 1)), expected)
+
   def test_one_authority_route_with_many_rows_does_not_fake_independence(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())
     add_complete_evidence(learner)
@@ -651,9 +783,9 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     observed_fit_sets: list[frozenset[str]] = []
     original = _fit_model_family
 
-    def recording_fit(fit_routes, node_index, model, coefficients):
+    def recording_fit(fit_routes, node_index, model, coefficients, **kwargs):
       observed_fit_sets.append(frozenset(route.route_identity_sha256 for route in fit_routes))
-      return original(fit_routes, node_index, model, coefficients)
+      return original(fit_routes, node_index, model, coefficients, **kwargs)
 
     with patch(
       "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._fit_model_family",
@@ -690,7 +822,6 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
 
   def test_dense_ordinary_fit_cannot_outvote_breakaway_and_nested_safe_model_wins(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())
-    node = learner._nodes[2]
     seed = _seed_coefficients(learner.seed_profile.nodes[2].parameters)
     xs = (-1.0, -0.5, 0.5, 1.0)
 
@@ -718,6 +849,8 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
         learner._add_regression(2, "breakaway_episode_training", breakaway_predictors, breakaway_target, 1.0)
         learner._add_regression(2, "training", breakaway_predictors, breakaway_target, 1.0)
       learner.end_route()
+
+    node = _aggregate_nodes(tuple(route.nodes[2] for route in learner._routes))
 
     richer = _fit_bounded_subset(
       node.moving_training,
@@ -769,7 +902,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       0,
     )
 
-  def test_strict_v10_evidence_is_deterministic_and_restorable(self) -> None:
+  def test_strict_v11_evidence_is_deterministic_and_restorable(self) -> None:
     seed = seed_profile()
     learner = CalibrationProfileLearner(seed)
     for route_counter, direction in ((0, 1), (2, -1), (1, -1), (3, 1)):
@@ -791,21 +924,21 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     restored = CalibrationProfileLearner.from_evidence(seed, encoded)
     self.assertEqual(restored.export_evidence(), encoded)
     self.assertEqual(restored.evidence_for_node(2), learner.evidence_for_node(2))
-    original_report = learner.qualify("v10 diagnostics").node_reports[2]
-    restored_report = restored.qualify("v10 diagnostics").node_reports[2]
-    self.assertGreater(original_report.breakaway_episode_training_count, 0)
-    self.assertGreater(original_report.breakaway_episode_validation_count, 0)
+    original_report = learner.qualify("v11 diagnostics").node_reports[2]
+    restored_report = restored.qualify("v11 diagnostics").node_reports[2]
+    self.assertGreater(original_report.breakaway_episode_full_fit_count, 0)
+    self.assertGreater(original_report.breakaway_episode_cross_fit_route_count, 0)
     self.assertGreater(original_report.breakaway_episode_dwell_s, 0.0)
     self.assertGreater(original_report.breakaway_angle_assisted_count, 0)
     self.assertIsNotNone(original_report.selected_model)
     self.assertEqual(restored_report.selected_model, original_report.selected_model)
     self.assertEqual(
-      restored_report.breakaway_episode_training_count,
-      original_report.breakaway_episode_training_count,
+      restored_report.breakaway_episode_full_fit_count,
+      original_report.breakaway_episode_full_fit_count,
     )
     self.assertEqual(
-      restored_report.breakaway_episode_validation_count,
-      original_report.breakaway_episode_validation_count,
+      restored_report.breakaway_episode_cross_fit_route_count,
+      original_report.breakaway_episode_cross_fit_route_count,
     )
     self.assertEqual(
       restored_report.breakaway_angle_assisted_count,
@@ -940,8 +1073,8 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       self.assertGreater(report.base_sample_count, 0)
       self.assertGreater(report.moving_sample_count, 0)
       self.assertGreater(report.breakaway_sample_count, 0)
-      self.assertIsNotNone(report.moving_candidate_validation_rms)
-      self.assertIsNotNone(report.breakaway_candidate_validation_rms)
+      self.assertIsNotNone(report.moving_full_fit_candidate_rms)
+      self.assertIsNotNone(report.breakaway_full_fit_candidate_rms)
       self.assertAlmostEqual(node.parameters.torque_per_lateral_accel, TRUE_GAIN, places=9)
       self.assertAlmostEqual(node.parameters.lateral_accel_offset_correction_mps2, TRUE_OFFSET_MPS2, places=9)
       self.assertAlmostEqual(node.parameters.kinetic_friction_torque, TRUE_KINETIC, places=9)
@@ -1036,7 +1169,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     report = learner._node_report(2)
     self.assertIsNone(report.selected_model)
     self.assertEqual(
-      report.training_outcome,
+      report.selection_outcome,
       CalibrationQualificationReason.SEED_RETAINED,
     )
     self.assertTrue(all(
@@ -1067,7 +1200,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     rejected = learner.qualify("interpolation regression")
     self.assertIsNone(rejected.candidate_profile)
     self.assertIn(
-      CalibrationQualificationReason.INTERPOLATION_VALIDATION_REGRESSION,
+      CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION,
       rejected.interpolation_reports[interval_index].reasons,
     )
 

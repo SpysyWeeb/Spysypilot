@@ -101,22 +101,22 @@ class _Snapshot:
   supported_sample_count: int
   base_support_s: float
   base_sample_count: int
-  training_support_s: float
-  training_count: int
-  validation_support_s: float
-  validation_count: int
+  full_fit_support_s: float
+  full_fit_count: int
+  cross_fit_support_s: float
+  cross_fit_route_count: int
   moving_support_s: float
   moving_sample_count: int
-  moving_training_support_s: float
-  moving_training_count: int
-  moving_validation_support_s: float
-  moving_validation_count: int
+  moving_full_fit_support_s: float
+  moving_full_fit_count: int
+  moving_cross_fit_support_s: float
+  moving_cross_fit_route_count: int
   breakaway_support_s: float
   breakaway_sample_count: int
-  breakaway_training_support_s: float
-  breakaway_training_count: int
-  breakaway_validation_support_s: float
-  breakaway_validation_count: int
+  breakaway_full_fit_support_s: float
+  breakaway_full_fit_count: int
+  breakaway_cross_fit_support_s: float
+  breakaway_cross_fit_route_count: int
   authority_support_s: float
   authority_sample_count: int
   authority_magnitude_sample_count: int
@@ -125,10 +125,10 @@ class _Snapshot:
   authority_unresolved_sample_count: int
   authority_fit_support_s: float
   authority_fit_sample_count: int
-  authority_training_support_s: float
-  authority_training_count: int
-  authority_validation_support_s: float
-  authority_validation_count: int
+  authority_full_fit_support_s: float
+  authority_full_fit_count: int
+  authority_cross_fit_support_s: float
+  authority_cross_fit_route_count: int
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -147,14 +147,14 @@ class _Report:
   moving_support_s: float
   moving_sample_count: int
   moving_reasons: tuple[_Reason, ...]
-  moving_seed_validation_rms: float | None
-  moving_candidate_validation_rms: float | None
+  moving_full_fit_seed_rms: float | None
+  moving_full_fit_candidate_rms: float | None
   breakaway_support_s: float
   breakaway_sample_count: int
   breakaway_reasons: tuple[_Reason, ...]
-  breakaway_seed_validation_rms: float | None
-  breakaway_candidate_validation_rms: float | None
-  inverse_calibration_validation_rms: float | None
+  breakaway_full_fit_seed_rms: float | None
+  breakaway_full_fit_candidate_rms: float | None
+  full_fit_candidate_rms: float | None
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -225,22 +225,22 @@ class _FakeCalibrationLearner:
       supported_sample_count=count,
       base_support_s=count * DT,
       base_sample_count=count,
-      training_support_s=count * DT,
-      training_count=count,
-      validation_support_s=0.0,
-      validation_count=0,
+      full_fit_support_s=count * DT,
+      full_fit_count=count,
+      cross_fit_support_s=0.0,
+      cross_fit_route_count=0,
       moving_support_s=count * DT,
       moving_sample_count=count,
-      moving_training_support_s=count * DT,
-      moving_training_count=count,
-      moving_validation_support_s=0.0,
-      moving_validation_count=0,
+      moving_full_fit_support_s=count * DT,
+      moving_full_fit_count=count,
+      moving_cross_fit_support_s=0.0,
+      moving_cross_fit_route_count=0,
       breakaway_support_s=count * DT,
       breakaway_sample_count=count,
-      breakaway_training_support_s=count * DT,
-      breakaway_training_count=count,
-      breakaway_validation_support_s=0.0,
-      breakaway_validation_count=0,
+      breakaway_full_fit_support_s=count * DT,
+      breakaway_full_fit_count=count,
+      breakaway_cross_fit_support_s=0.0,
+      breakaway_cross_fit_route_count=0,
       authority_support_s=0.0,
       authority_sample_count=0,
       authority_magnitude_sample_count=0,
@@ -249,10 +249,10 @@ class _FakeCalibrationLearner:
       authority_unresolved_sample_count=0,
       authority_fit_support_s=0.0,
       authority_fit_sample_count=0,
-      authority_training_support_s=0.0,
-      authority_training_count=0,
-      authority_validation_support_s=0.0,
-      authority_validation_count=0,
+      authority_full_fit_support_s=0.0,
+      authority_full_fit_count=0,
+      authority_cross_fit_support_s=0.0,
+      authority_cross_fit_route_count=0,
       lateral_accel_span_mps2=0.8 if count else 0.0,
       applied_torque_span=0.4 if count else 0.0,
       lateral_accel_directions=2 if count else 0,
@@ -287,14 +287,14 @@ class _FakeCalibrationLearner:
           moving_support_s=count * DT,
           moving_sample_count=count,
           moving_reasons=(() if qualified else (_Reason.INSUFFICIENT_MOVING_EVIDENCE,)),
-          moving_seed_validation_rms=(0.02 if qualified else None),
-          moving_candidate_validation_rms=(0.01 if qualified else None),
+          moving_full_fit_seed_rms=(0.02 if qualified else None),
+          moving_full_fit_candidate_rms=(0.01 if qualified else None),
           breakaway_support_s=count * DT,
           breakaway_sample_count=count,
           breakaway_reasons=(() if qualified else (_Reason.INSUFFICIENT_BREAKAWAY_EVIDENCE,)),
-          breakaway_seed_validation_rms=(0.03 if qualified else None),
-          breakaway_candidate_validation_rms=(0.02 if qualified else None),
-          inverse_calibration_validation_rms=(0.03 if qualified else None),
+          breakaway_full_fit_seed_rms=(0.03 if qualified else None),
+          breakaway_full_fit_candidate_rms=(0.02 if qualified else None),
+          full_fit_candidate_rms=(0.03 if qualified else None),
           lateral_accel_span_mps2=(0.8 if count else 0.0),
           applied_torque_span=(0.4 if count else 0.0),
           lateral_accel_directions=(2 if count else 0),
@@ -317,9 +317,9 @@ class _FakeCalibrationLearner:
             moving_sample_count=report.moving_sample_count,
             breakaway_support_s=report.breakaway_support_s,
             breakaway_sample_count=report.breakaway_sample_count,
-            validation_count=report.base_sample_count,
-            inverse_calibration_validation_rms=0.03,
-            breakaway_validation_rms=0.02,
+            cross_fit_route_count=report.base_sample_count,
+            full_fit_candidate_rms=0.03,
+            breakaway_full_fit_candidate_rms=0.02,
           )
         )
       candidate = VehicleCalibrationProfile(
@@ -391,8 +391,8 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
     self.assertEqual(diagnostic.base_sample_count, 1)
     self.assertEqual(diagnostic.moving_sample_count, 1)
     self.assertEqual(diagnostic.breakaway_sample_count, 1)
-    self.assertEqual(diagnostic.training_count, 1)
-    self.assertEqual(diagnostic.validation_count, 0)
+    self.assertEqual(diagnostic.full_fit_count, 1)
+    self.assertEqual(diagnostic.cross_fit_route_count, 0)
     self.assertEqual(diagnostic.authority_sample_count, 0)
     self.assertEqual(diagnostic.authority_fit_sample_count, 0)
     self.assertEqual(diagnostic.lateral_accel_directions, 2)
@@ -487,21 +487,21 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
     manifest = json.loads(finalization.manifest_bytes)
     self.assertEqual(manifest["artifact_schema_version"], CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION)
-    self.assertEqual(manifest["artifact_schema_version"], 10)
-    self.assertEqual(manifest["evidence_schema_version"], 10)
+    self.assertEqual(manifest["artifact_schema_version"], 11)
+    self.assertEqual(manifest["evidence_schema_version"], 11)
     self.assertEqual(manifest["seed_profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
-    self.assertEqual(manifest["seed_profile_schema_version"], 2)
+    self.assertEqual(manifest["seed_profile_schema_version"], 3)
     self.assertEqual(manifest["seed_profile_sha256"], hashlib.sha256(seed.to_json().encode()).hexdigest())
     self.assertEqual(manifest["evidence_sha256"], finalization.evidence_sha256)
     self.assertEqual(manifest["candidate_profile"]["profile_sha256"], finalization.candidate_profile_sha256)
     for report in manifest["node_reports"]:
       self.assertIn("base_support_s", report)
       self.assertIn("moving_reasons", report)
-      self.assertIn("moving_seed_validation_rms", report)
-      self.assertIn("moving_candidate_validation_rms", report)
+      self.assertIn("moving_full_fit_seed_rms", report)
+      self.assertIn("moving_full_fit_candidate_rms", report)
       self.assertIn("breakaway_reasons", report)
-      self.assertIn("breakaway_seed_validation_rms", report)
-      self.assertIn("breakaway_candidate_validation_rms", report)
+      self.assertIn("breakaway_full_fit_seed_rms", report)
+      self.assertIn("breakaway_full_fit_candidate_rms", report)
       self.assertNotIn("rack_gain", json.dumps(report))
       self.assertNotIn("rack_damping", json.dumps(report))
 
@@ -581,21 +581,21 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
 
 class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
-  def test_real_v10_report_is_manifest_compatible_and_restorable(self) -> None:
+  def test_real_v11_report_is_manifest_compatible_and_restorable(self) -> None:
     seed = seed_profile()
     first = CalibrationLearningCoordinator(seed).finalize()
     restored = CalibrationLearningCoordinator(seed, first.evidence_bytes).finalize()
     self.assertEqual(restored.evidence_bytes, first.evidence_bytes)
     self.assertEqual(restored.manifest_bytes, first.manifest_bytes)
     manifest = json.loads(first.manifest_bytes)
-    self.assertEqual(manifest["artifact_schema_version"], 10)
-    self.assertEqual(manifest["evidence_schema_version"], 10)
-    self.assertEqual(manifest["seed_profile_schema_version"], 2)
+    self.assertEqual(manifest["artifact_schema_version"], 11)
+    self.assertEqual(manifest["evidence_schema_version"], 11)
+    self.assertEqual(manifest["seed_profile_schema_version"], 3)
     for report in manifest["node_reports"]:
       self.assertIn("moving_reasons", report)
-      self.assertIn("moving_candidate_validation_rms", report)
+      self.assertIn("moving_full_fit_candidate_rms", report)
       self.assertIn("breakaway_reasons", report)
-      self.assertIn("breakaway_candidate_validation_rms", report)
+      self.assertIn("breakaway_full_fit_candidate_rms", report)
       self.assertIn("independent_route_counts", report)
       self.assertIn("cross_fit_diagnostics", report)
       self.assertIn("full_fit_diagnostic", report)
