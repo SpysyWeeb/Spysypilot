@@ -268,7 +268,7 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
         CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
         LEARNING_STATUS_SCHEMA_VERSION,
       ),
-      (15, 15, 9),
+      (15, 16, 10),
     )
     # Evidence-preparation identities describe the unchanged source contract;
     # algorithm/output schema migrations must never invalidate route inputs.

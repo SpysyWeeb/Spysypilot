@@ -38,6 +38,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   build_learning_status_bytes,
   build_learning_status_payload,
   decode_learning_status,
+  _validate_cross_fit_status,
   validate_learning_status_payload,
 )
 
@@ -220,6 +221,7 @@ def _report(
         contributing_route_count=2,
         successful_fold_count=2,
         failed_fold_count=0,
+        regressed_fold_count=0,
         paired_loss=(
           paired_loss
           if qualified and diagnostic.model is CalibrationModelId.FULL_MAP
@@ -264,12 +266,14 @@ def _fixtures(*, qualified: bool = True):
           contributing_route_count=2,
           successful_fold_count=2,
           failed_fold_count=0,
+          regressed_fold_count=0,
           cross_fit_status=CalibrationCrossFitStatus.SCORED,
         ),),
         reasons=(CalibrationQualificationReason.QUALIFIED,),
         contributing_route_count=2,
         successful_fold_count=2,
         failed_fold_count=0,
+        regressed_fold_count=0,
         cross_fit_status=CalibrationCrossFitStatus.SCORED,
       ),
     )
@@ -344,7 +348,7 @@ def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 9
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 10
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -681,6 +685,41 @@ def test_schema_v7_rejects_cross_fit_semantic_tampering() -> None:
   ]
   with test_case.assertRaisesRegex(ValueError, "reasons contradict carried diagnostics"):
     validate_learning_status_payload(node_reason)
+
+
+def test_real_diluted_fold_regression_has_an_explicit_witness() -> None:
+  diagnostic = {
+    "contributing_route_count": 26,
+    "failed_fold_count": 0,
+    "model": "friction_map",
+    "paired_loss": {
+      "lower_bound_mse": -0.007728859866319967,
+      "mean_candidate_minus_seed_mse": -0.004015583293787311,
+      "numerical_tolerance_mse": 1.4210854715202004e-14,
+      "route_count": 26,
+      "uncertainty_mse": 0.0037132765725326564,
+      "upper_bound_mse": -0.00030230672125465454,
+    },
+    "regressed_fold_count": 12,
+    "status": CalibrationCrossFitStatus.HELD_OUT_REGRESSION.value,
+    "successful_fold_count": 26,
+  }
+  assert _validate_cross_fit_status(
+    diagnostic,
+    "real_node_2_friction_map",
+    coverage_sufficient=True,
+    interval=False,
+  ) == "improved"
+
+  hidden = json.loads(json.dumps(diagnostic))
+  hidden["regressed_fold_count"] = 0
+  with unittest.TestCase().assertRaisesRegex(ValueError, "status contradicts"):
+    _validate_cross_fit_status(
+      hidden,
+      "real_node_2_friction_map",
+      coverage_sufficient=True,
+      interval=False,
+    )
 
 
 def test_baseline_rejects_any_population_moving_backwards() -> None:

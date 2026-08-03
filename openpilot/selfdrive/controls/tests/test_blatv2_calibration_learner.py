@@ -25,6 +25,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationQualificationReason,
   CalibrationSampleDisposition,
   _JointRegression,
+  _PairedLossVerdict,
   _Regression,
   _fit_bounded_subset,
   _fit_model_family,
@@ -40,6 +41,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   _validate_joint_predictor_moments,
   _validate_scaled_psd,
   _solve,
+  calibration_cross_fit_status,
   calibration_evidence_sha256,
   calibration_learning_sample_field_names,
   minimum_calibration_support_s,
@@ -703,7 +705,9 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       (),
     )
     self.assertEqual(family.diagnostic.contributing_route_count, 3)
+    self.assertEqual(family.diagnostic.paired_loss.route_count, 3)
     self.assertEqual(family.diagnostic.successful_fold_count, 3)
+    self.assertEqual(family.diagnostic.regressed_fold_count, 1)
     self.assertEqual(family.diagnostic.failed_fold_count, 0)
     self.assertIn(route_sha(202), dict(family.coefficients_by_route))
 
@@ -792,7 +796,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._fit_model_family",
       side_effect=selective_fit,
     ):
-      _, route_count, successful, failed, status = _cross_fit_interval_loss(
+      _, route_count, successful, failed, regressed, status = _cross_fit_interval_loss(
         routes,
         0,
         CalibrationIntervalStratum.BASE,
@@ -804,6 +808,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertEqual(route_count, len(contributing))
     self.assertEqual(successful, len(contributing) - 1)
     self.assertEqual(failed, 1)
+    self.assertEqual(regressed, 0)
     self.assertEqual(status, CalibrationCrossFitStatus.FOLD_FIT_FAILURE)
 
   def test_nonassociative_route_order_is_byte_exact(self) -> None:
@@ -1345,9 +1350,10 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       )
     report = learner._node_report(2)
     self.assertIsNone(report.selected_model)
+    self.assertFalse(report.qualified)
     self.assertEqual(
-      report.selection_outcome,
-      CalibrationQualificationReason.SEED_RETAINED,
+      report.reasons,
+      (CalibrationQualificationReason.CROSS_FIT_REGRESSION,),
     )
     self.assertTrue(all(
       diagnostic.status is not CalibrationCrossFitStatus.SCORED
@@ -1769,6 +1775,74 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
 
     with self.assertRaisesRegex(ValueError, "overflow"):
       _finite_fsum((1e308, 1e308), "finite_sum")
+
+  def test_cross_fit_status_truth_table_is_authoritative(self) -> None:
+    for interval in (False, True):
+      for coverage_sufficient in (False, True):
+        for contributing in range(4):
+          for successful in range(4):
+            for regressed in range(4):
+              for failed in range(4):
+                for verdict in _PairedLossVerdict:
+                  with self.subTest(
+                    interval=interval,
+                    contributing=contributing,
+                    successful=successful,
+                    regressed=regressed,
+                    failed=failed,
+                    verdict=verdict,
+                  ):
+                    if not coverage_sufficient:
+                      expected = (
+                        CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES
+                        if successful == failed == regressed == 0
+                        and verdict is _PairedLossVerdict.NO_DATA
+                        else None
+                      )
+                    elif successful == failed == 0:
+                      expected = None
+                    elif successful + failed != contributing or regressed > successful:
+                      expected = None
+                    elif failed:
+                      expected = CalibrationCrossFitStatus.FOLD_FIT_FAILURE
+                    elif verdict is _PairedLossVerdict.NO_DATA:
+                      expected = None
+                    elif regressed:
+                      expected = CalibrationCrossFitStatus.HELD_OUT_REGRESSION
+                    elif verdict is _PairedLossVerdict.REGRESSION:
+                      expected = None
+                    elif verdict is _PairedLossVerdict.IMPROVED or (
+                      interval and verdict is _PairedLossVerdict.NO_REGRESSION
+                    ):
+                      expected = CalibrationCrossFitStatus.SCORED
+                    else:
+                      expected = CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+                    arguments = {
+                      "contributing_route_count": contributing,
+                      "successful_fold_count": successful,
+                      "failed_fold_count": failed,
+                      "regressed_fold_count": regressed,
+                      "paired_loss_verdict": verdict,
+                      "coverage_sufficient": coverage_sufficient,
+                      "interval": interval,
+                    }
+                    if expected is None:
+                      with self.assertRaises(ValueError):
+                        calibration_cross_fit_status(**arguments)
+                    else:
+                      self.assertIs(calibration_cross_fit_status(**arguments), expected)
+
+    for poison in (True, 1.0, -1):
+      with self.subTest(poison=poison), self.assertRaises(ValueError):
+        calibration_cross_fit_status(
+          contributing_route_count=poison,
+          successful_fold_count=0,
+          failed_fold_count=0,
+          regressed_fold_count=0,
+          paired_loss_verdict=_PairedLossVerdict.NO_DATA,
+          coverage_sufficient=False,
+          interval=False,
+        )
 
   def test_live_rows_are_structural_only_and_cannot_publish(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())

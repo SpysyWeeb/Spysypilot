@@ -414,6 +414,7 @@ class CalibrationCrossFitModelDiagnostic:
   contributing_route_count: int
   successful_fold_count: int
   failed_fold_count: int
+  regressed_fold_count: int
   paired_loss: CalibrationPairedLossDiagnostic
 
 
@@ -1593,6 +1594,7 @@ class CalibrationIntervalStratumDiagnostic:
   contributing_route_count: int
   successful_fold_count: int
   failed_fold_count: int
+  regressed_fold_count: int
   cross_fit_status: CalibrationCrossFitStatus
 
 
@@ -1607,6 +1609,7 @@ class CalibrationInterpolationQualificationReport:
   contributing_route_count: int = 0
   successful_fold_count: int = 0
   failed_fold_count: int = 0
+  regressed_fold_count: int = 0
   cross_fit_status: CalibrationCrossFitStatus = CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES
 
   @property
@@ -2036,6 +2039,61 @@ class _PairedLossVerdict(StrEnum):
   NO_DATA = "no_data"
 
 
+def calibration_cross_fit_status(
+  *,
+  contributing_route_count: int,
+  successful_fold_count: int,
+  failed_fold_count: int,
+  regressed_fold_count: int,
+  paired_loss_verdict: _PairedLossVerdict,
+  coverage_sufficient: bool,
+  interval: bool,
+) -> CalibrationCrossFitStatus:
+  """Derive the one authoritative status from observable fold accounting."""
+  counts = (
+    contributing_route_count,
+    successful_fold_count,
+    failed_fold_count,
+    regressed_fold_count,
+  )
+  if any(type(count) is not int or count < 0 for count in counts):
+    raise ValueError("cross-fit fold counts must be nonnegative integers")
+  if (
+    type(coverage_sufficient) is not bool
+    or type(interval) is not bool
+    or type(paired_loss_verdict) is not _PairedLossVerdict
+  ):
+    raise ValueError("cross-fit status inputs are invalid")
+
+  # No fold was attempted when the required independent population is absent.
+  # Contributing evidence is coverage, not a fabricated fit failure.
+  if not coverage_sufficient:
+    if successful_fold_count != 0 or failed_fold_count != 0 or regressed_fold_count != 0:
+      raise ValueError("insufficient cross-fit coverage has attempted folds")
+    if paired_loss_verdict is not _PairedLossVerdict.NO_DATA:
+      raise ValueError("unattempted cross-fit carries paired-loss evidence")
+    return CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES
+  if successful_fold_count == failed_fold_count == 0:
+    raise ValueError("sufficient cross-fit coverage has no attempted folds")
+  if successful_fold_count + failed_fold_count != contributing_route_count:
+    raise ValueError("cross-fit attempted-fold counts disagree with contributors")
+  if regressed_fold_count > successful_fold_count:
+    raise ValueError("cross-fit regressed-fold count exceeds successful folds")
+  if failed_fold_count:
+    return CalibrationCrossFitStatus.FOLD_FIT_FAILURE
+  if paired_loss_verdict is _PairedLossVerdict.NO_DATA:
+    raise ValueError("attempted cross-fit lacks paired-loss evidence")
+  if regressed_fold_count:
+    return CalibrationCrossFitStatus.HELD_OUT_REGRESSION
+  if paired_loss_verdict is _PairedLossVerdict.REGRESSION:
+    raise ValueError("aggregate regression lacks a regressed-fold witness")
+  if paired_loss_verdict is _PairedLossVerdict.IMPROVED or (
+    interval and paired_loss_verdict is _PairedLossVerdict.NO_REGRESSION
+  ):
+    return CalibrationCrossFitStatus.SCORED
+  return CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+
+
 def _loss_tolerance(candidate_mse: float, comparator_mse: float) -> float:
   return (
     NUMERICAL_LOSS_EPSILON_MULTIPLIER
@@ -2353,12 +2411,28 @@ def _validate_interval_conservation(route: _RouteEvidence) -> None:
 
 
 def _family_fit_fields(model: CalibrationModelId, include_authority: bool) -> tuple[str, ...]:
-  fields = ("breakaway_episode_training",)
+  return tuple(
+    f"{population}_training"
+    for population in calibration_cross_fit_required_populations(
+      model,
+      include_authority=include_authority,
+    )
+  )
+
+
+def calibration_cross_fit_required_populations(
+  model: CalibrationModelId,
+  *,
+  include_authority: bool,
+) -> tuple[str, ...]:
+  if type(model) is not CalibrationModelId or type(include_authority) is not bool:
+    raise ValueError("cross-fit population selector is invalid")
+  populations = ("breakaway_episode",)
   if model is not CalibrationModelId.STATIC_ONLY:
-    fields = ("moving_training", *fields)
+    populations = ("moving", *populations)
     if include_authority:
-      fields = (*fields, "authority_training")
-  return fields
+      populations = (*populations, "authority")
+  return populations
 
 
 def _family_population_fields(include_authority: bool) -> tuple[str, ...]:
@@ -2441,23 +2515,33 @@ def _cross_fit_family(
     or any(len(_contributing_routes(canonical, node_index, field)) < MIN_INDEPENDENT_ROUTES for field in required_fields)
   )
   if lacks_independence:
+    paired = _diagnostic_from_deltas(())
     return _CrossFitFamily(
       model,
       (),
       CalibrationCrossFitModelDiagnostic(
         model,
-        CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES,
+        calibration_cross_fit_status(
+          contributing_route_count=len(contributing),
+          successful_fold_count=0,
+          failed_fold_count=0,
+          regressed_fold_count=0,
+          paired_loss_verdict=_paired_loss_verdict(paired),
+          coverage_sufficient=False,
+          interval=False,
+        ),
         len(contributing),
         0,
-        len(contributing),
-        _diagnostic_from_deltas(()),
+        0,
+        0,
+        paired,
       ),
     )
 
   fold_coefficients: list[tuple[str, tuple[float, float, float, float]]] = []
   deltas: list[tuple[float, float]] = []
   failures = 0
-  heldout_regression = False
+  regressed_folds = 0
   for held_out in contributing:
     fit_routes = tuple(route for route in canonical if route is not held_out)
     coefficients, fit_diagnostic = _fit_model_family(
@@ -2474,6 +2558,7 @@ def _cross_fit_family(
     seed_errors: list[float] = []
     weights: list[float] = []
     fold_safe = True
+    fold_regression = False
     fold_tolerance = 0.0
     for field in population_fields:
       evidence = _route_node_regression(held_out, node_index, field)
@@ -2487,7 +2572,7 @@ def _cross_fit_family(
       tolerance = _loss_tolerance(candidate_mse, seed_mse)
       fold_tolerance = max(fold_tolerance, tolerance)
       if candidate_mse - seed_mse > tolerance:
-        heldout_regression = True
+        fold_regression = True
       candidate_errors.append(candidate_mse * evidence.weight_s)
       seed_errors.append(seed_mse * evidence.weight_s)
       weights.append(evidence.weight_s)
@@ -2498,17 +2583,19 @@ def _cross_fit_family(
     delta = (math.fsum(candidate_errors) - math.fsum(seed_errors)) / total_weight
     deltas.append((0.0 if abs(delta) <= fold_tolerance else delta, fold_tolerance))
     fold_coefficients.append((held_out.route_identity_sha256, coefficients))
+    if fold_regression:
+      regressed_folds += 1
 
   paired = _diagnostic_from_deltas(tuple(deltas))
   verdict = _paired_loss_verdict(paired)
-  status = (
-    CalibrationCrossFitStatus.HELD_OUT_REGRESSION
-    if heldout_regression
-    else CalibrationCrossFitStatus.FOLD_FIT_FAILURE
-    if failures
-    else CalibrationCrossFitStatus.SCORED
-    if verdict is _PairedLossVerdict.IMPROVED
-    else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+  status = calibration_cross_fit_status(
+    contributing_route_count=len(contributing),
+    successful_fold_count=len(deltas),
+    failed_fold_count=failures,
+    regressed_fold_count=regressed_folds,
+    paired_loss_verdict=verdict,
+    coverage_sufficient=True,
+    interval=False,
   )
   return _CrossFitFamily(
     model,
@@ -2517,8 +2604,9 @@ def _cross_fit_family(
       model,
       status,
       len(contributing),
-      len(fold_coefficients),
+      len(deltas),
       failures,
+      regressed_folds,
       paired,
     ),
   )
@@ -2577,19 +2665,29 @@ def _cross_fit_interval_loss(
   upper_model: CalibrationModelId | None,
   seed_lower: CalibrationParameters,
   seed_upper: CalibrationParameters,
-) -> tuple[CalibrationPairedLossDiagnostic, int, int, int, CalibrationCrossFitStatus]:
+) -> tuple[CalibrationPairedLossDiagnostic, int, int, int, int, CalibrationCrossFitStatus]:
   canonical = _canonical_routes(routes)
   contributing = tuple(
     route for route in canonical
     if route.intervals[interval_index].regression(stratum).count > 0
   )
   if len(contributing) < MIN_INDEPENDENT_ROUTES:
+    diagnostic = _diagnostic_from_deltas(())
     return (
-      _diagnostic_from_deltas(()), len(contributing), 0, len(contributing),
-      CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES,
+      diagnostic, len(contributing), 0, 0, 0,
+      calibration_cross_fit_status(
+        contributing_route_count=len(contributing),
+        successful_fold_count=0,
+        failed_fold_count=0,
+        regressed_fold_count=0,
+        paired_loss_verdict=_paired_loss_verdict(diagnostic),
+        coverage_sufficient=False,
+        interval=True,
+      ),
     )
   deltas: list[tuple[float, float]] = []
   failures = 0
+  regressed_folds = 0
   for held_out in contributing:
     fit_routes = tuple(route for route in canonical if route is not held_out)
     lower_coefficients = _seed_coefficients(seed_lower)
@@ -2645,18 +2743,20 @@ def _cross_fit_interval_loss(
     tolerance = _loss_tolerance(candidate_mse, seed_mse)
     delta = candidate_mse - seed_mse
     deltas.append((0.0 if abs(delta) <= tolerance else delta, tolerance))
+    if delta > tolerance:
+      regressed_folds += 1
   diagnostic = _diagnostic_from_deltas(tuple(deltas))
   verdict = _paired_loss_verdict(diagnostic)
-  status = (
-    CalibrationCrossFitStatus.FOLD_FIT_FAILURE
-    if failures
-    else CalibrationCrossFitStatus.SCORED
-    if verdict in (_PairedLossVerdict.IMPROVED, _PairedLossVerdict.NO_REGRESSION)
-    else CalibrationCrossFitStatus.HELD_OUT_REGRESSION
-    if verdict is _PairedLossVerdict.REGRESSION
-    else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+  status = calibration_cross_fit_status(
+    contributing_route_count=len(contributing),
+    successful_fold_count=len(deltas),
+    failed_fold_count=failures,
+    regressed_fold_count=regressed_folds,
+    paired_loss_verdict=verdict,
+    coverage_sufficient=True,
+    interval=True,
   )
-  return diagnostic, len(contributing), len(deltas), failures, status
+  return diagnostic, len(contributing), len(deltas), failures, regressed_folds, status
 
 
 def minimum_calibration_support_s(speed_mps: float) -> float:
@@ -3510,19 +3610,26 @@ class CalibrationProfileLearner:
         routes, index, family, selected_cross_fit
       ):
         selected_cross_fit = family
-    complete_cross_fit = tuple(
+    safe_seed_cross_fit = tuple(
       family for family in cross_fit_families
-      if (
-        family.diagnostic.contributing_route_count >= MIN_INDEPENDENT_ROUTES
-        and family.diagnostic.failed_fold_count == 0
-        and family.diagnostic.successful_fold_count
-        == family.diagnostic.contributing_route_count
-      )
+      if family.diagnostic.status is CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
     )
-    if selected_cross_fit is None and not complete_cross_fit:
+    cross_fit_fold_failure = (
+      selected_cross_fit is None
+      and not safe_seed_cross_fit
+      and any(family.diagnostic.failed_fold_count > 0 for family in cross_fit_families)
+    )
+    if cross_fit_fold_failure:
       reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
       unresolved.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
-    cross_fit_fold_failure = selected_cross_fit is None and not complete_cross_fit
+    heldout_regression = (
+      selected_cross_fit is None
+      and not safe_seed_cross_fit
+      and any(
+        family.diagnostic.regressed_fold_count > 0
+        for family in cross_fit_families
+      )
+    )
 
     include_authority = route_counts.authority > 0
     full_fit_results = tuple(
@@ -3554,8 +3661,8 @@ class CalibrationProfileLearner:
     selection_cross_fit = (
       selected_cross_fit
       if selected_cross_fit is not None
-      else complete_cross_fit[0]
-      if complete_cross_fit
+      else safe_seed_cross_fit[0]
+      if safe_seed_cross_fit
       else None
     )
     selected_full_fit = next(
@@ -3565,10 +3672,13 @@ class CalibrationProfileLearner:
       ),
       None,
     )
-    seed_retained = selected_cross_fit is None and bool(complete_cross_fit)
+    seed_retained = (
+      selected_cross_fit is None
+      and bool(safe_seed_cross_fit)
+    )
     coefficients = seed_coefficients
     full_fit_diagnostic: CalibrationModelFitDiagnostic | None = None
-    full_fit_safe = True
+    full_fit_safe = not heldout_regression
     full_fit_stratum_losses: tuple[CalibrationPairedLossDiagnostic, ...] = ()
     if selected_full_fit is not None:
       _, fitted, full_fit_diagnostic = selected_full_fit
@@ -3794,6 +3904,7 @@ class CalibrationProfileLearner:
           contributing_route_count,
           successful_fold_count,
           failed_fold_count,
+          regressed_fold_count,
           cross_fit_status,
         ) = _cross_fit_interval_loss(
           routes,
@@ -3811,6 +3922,7 @@ class CalibrationProfileLearner:
           contributing_route_count=contributing_route_count,
           successful_fold_count=successful_fold_count,
           failed_fold_count=failed_fold_count,
+          regressed_fold_count=regressed_fold_count,
           cross_fit_status=cross_fit_status,
         ))
         if contributing_route_count < MIN_INDEPENDENT_ROUTES:
@@ -3819,8 +3931,8 @@ class CalibrationProfileLearner:
           )
         if failed_fold_count:
           interval_reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
-        full_fit_verdict = _paired_loss_verdict(full_fit, identical=profile_identical)
-        cross_fit_verdict = _paired_loss_verdict(cross_fit, identical=profile_identical)
+        full_fit_verdict = _paired_loss_verdict(full_fit)
+        cross_fit_verdict = _paired_loss_verdict(cross_fit)
         if full_fit_verdict is _PairedLossVerdict.REGRESSION:
           interval_reasons.append(
             CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION
@@ -3829,7 +3941,7 @@ class CalibrationProfileLearner:
           interval_reasons.append(
             CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE
           )
-        if cross_fit_verdict is _PairedLossVerdict.REGRESSION:
+        if regressed_fold_count or cross_fit_verdict is _PairedLossVerdict.REGRESSION:
           interval_reasons.append(
             CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION
           )
@@ -3873,6 +3985,9 @@ class CalibrationProfileLearner:
           ),
           failed_fold_count=sum(
             diagnostic.failed_fold_count for diagnostic in stratum_diagnostics
+          ),
+          regressed_fold_count=sum(
+            diagnostic.regressed_fold_count for diagnostic in stratum_diagnostics
           ),
           cross_fit_status=cross_fit_status,
         )
