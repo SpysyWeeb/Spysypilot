@@ -195,13 +195,13 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 9 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 10 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
 selection, cross-fit regression, fold completion, and per-stratum interpolation
 state. The selected or seed-retained result carries its authoritative model
-family, independent contributor counts, paired held-out loss, final full-fit
-diagnostic, and unresolved diagnostics rather than a summary with missing
-proof. It also carries
+family, independent contributor counts, paired held-out loss, explicit
+regressed-fold counts, final full-fit diagnostic, and unresolved diagnostics
+rather than a summary with missing proof. It also carries
 strict first-cause accounting for every prepared frame, so accepted evidence
 plus the finite rejection-reason set always equals the ingested-frame count.
 Frames absent before the first canonical poll and explicit source gaps remain
