@@ -129,6 +129,9 @@ def _report(
   paired_loss = CalibrationPairedLossDiagnostic(
     2, -0.01, 0.002, -0.012, -0.008, 1e-14
   )
+  neutral_loss = CalibrationPairedLossDiagnostic(
+    2, 0.0, 0.0, 0.0, 0.0, 1e-14
+  )
   fit_diagnostics = tuple(
     CalibrationModelFitDiagnostic(
       model=model,
@@ -159,11 +162,11 @@ def _report(
     moving_support_s=12.0,
     moving_sample_count=120,
     moving_full_fit_count=96,
-    moving_cross_fit_route_count=24,
+    moving_cross_fit_route_count=2,
     breakaway_support_s=8.0,
     breakaway_sample_count=80,
     breakaway_full_fit_count=64,
-    breakaway_cross_fit_route_count=16,
+    breakaway_cross_fit_route_count=2,
     lateral_accel_span_mps2=1.2,
     lateral_accel_rms_mps2=0.35,
     rack_travel_deg=240.0,
@@ -185,7 +188,7 @@ def _report(
     authority_fit_support_s=3.0,
     authority_fit_sample_count=30,
     authority_full_fit_count=24,
-    authority_cross_fit_route_count=6,
+    authority_cross_fit_route_count=2,
     authority_full_fit_seed_rms=0.14,
     authority_full_fit_candidate_rms=0.09,
     fit_diagnostics=fit_diagnostics,
@@ -214,7 +217,11 @@ def _report(
         contributing_route_count=2,
         successful_fold_count=2,
         failed_fold_count=0,
-        paired_loss=paired_loss,
+        paired_loss=(
+          paired_loss
+          if qualified and diagnostic.model is CalibrationModelId.FULL_MAP
+          else neutral_loss
+        ),
       )
       for diagnostic in fit_diagnostics
     ),
@@ -526,6 +533,92 @@ def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None
     validate_learning_status_payload(missing_proof)
 
 
+def test_schema_v6_rejects_cross_fit_semantic_tampering() -> None:
+  test_case = unittest.TestCase()
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+
+  moving_legacy = json.loads(json.dumps(payload))
+  moving_legacy["nodes"][0]["moving_cross_fit_route_count"] += 1
+  with test_case.assertRaisesRegex(ValueError, "moving_cross_fit_route_count disagrees"):
+    validate_learning_status_payload(moving_legacy)
+
+  moving_population = json.loads(json.dumps(payload))
+  moving_population["nodes"][0]["independent_route_counts"]["moving"] = 1
+  with test_case.assertRaisesRegex(ValueError, "moving_cross_fit_route_count disagrees"):
+    validate_learning_status_payload(moving_population)
+
+  loss_routes = json.loads(json.dumps(payload))
+  selected = loss_routes["nodes"][0]["cross_fit_diagnostics"][-1]
+  selected["paired_loss"]["route_count"] = 1
+  selected["paired_loss"]["uncertainty_mse"] = None
+  selected["paired_loss"]["lower_bound_mse"] = None
+  selected["paired_loss"]["upper_bound_mse"] = None
+  with test_case.assertRaisesRegex(ValueError, "paired-loss route count disagrees"):
+    validate_learning_status_payload(loss_routes)
+
+  selected_status = json.loads(json.dumps(payload))
+  selected_node = selected_status["nodes"][0]
+  selected_diagnostic = selected_node["cross_fit_diagnostics"][-1]
+  selected_diagnostic["status"] = CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+  selected_diagnostic["paired_loss"].update({
+    "mean_candidate_minus_seed_mse": 0.0,
+    "uncertainty_mse": 0.0,
+    "lower_bound_mse": 0.0,
+    "upper_bound_mse": 0.0,
+  })
+  selected_node["cross_fit_paired_loss"] = json.loads(json.dumps(
+    selected_diagnostic["paired_loss"]
+  ))
+  with test_case.assertRaisesRegex(ValueError, "selected family status contradicts outcome"):
+    validate_learning_status_payload(selected_status)
+
+  interval_status = json.loads(json.dumps(payload))
+  interval_status["interpolation_reports"][0]["qualified"] = False
+  interval_status["interpolation_reports"][0]["reasons"] = [
+    CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE.value
+  ]
+  stratum = interval_status["interpolation_reports"][0]["stratum_diagnostics"][0]
+  stratum["cross_fit_status"] = (
+    CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+  )
+  stratum["cross_fit_paired_loss"].update({
+    "mean_candidate_minus_seed_mse": 0.0,
+    "uncertainty_mse": 0.1,
+    "lower_bound_mse": -0.1,
+    "upper_bound_mse": 0.1,
+  })
+  interval_status["all_intervals_qualified"] = False
+  with test_case.assertRaisesRegex(ValueError, "aggregate status contradicts strata"):
+    validate_learning_status_payload(interval_status)
+
+  interval_reason = json.loads(json.dumps(interval_status))
+  interval_reason["interpolation_reports"][0]["cross_fit_status"] = (
+    CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+  )
+  interval_reason["interpolation_reports"][0]["reasons"] = [
+    CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION.value
+  ]
+  with test_case.assertRaisesRegex(ValueError, "reasons contradict stratum diagnostics"):
+    validate_learning_status_payload(interval_reason)
+
+  unqualified_runtime, unqualified_finalization = _fixtures(qualified=False)
+  node_reason = build_learning_status_payload(
+    finalization=unqualified_finalization,
+    runtime_bundle=unqualified_runtime,
+    drive_baseline=None,
+  )
+  node_reason["nodes"][0]["reasons"] = [
+    CalibrationQualificationReason.SINGULAR_FIT.value
+  ]
+  with test_case.assertRaisesRegex(ValueError, "evaluation status contradicts reasons"):
+    validate_learning_status_payload(node_reason)
+
+
 def test_baseline_rejects_any_population_moving_backwards() -> None:
   test_case = unittest.TestCase()
   runtime, finalization = _fixtures()
@@ -579,7 +672,11 @@ def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
       full_fit_paired_loss=zero_loss,
       cross_fit_paired_loss=zero_loss,
       cross_fit_diagnostics=tuple(
-        replace(diagnostic, paired_loss=zero_loss)
+        replace(
+          diagnostic,
+          status=CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT,
+          paired_loss=zero_loss,
+        )
         for diagnostic in report.cross_fit_diagnostics
       ),
     )

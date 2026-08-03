@@ -538,25 +538,30 @@ def _cross_fit_diagnostic_payload(diagnostic: object, context: str) -> dict[str,
   }
 
 
-def _node_evaluation_status(report: CalibrationNodeQualificationReport) -> str:
-  if report.seed_retained:
+def _evaluation_status_from_reasons(reasons: tuple[str, ...]) -> str:
+  if reasons == (CalibrationQualificationReason.SEED_RETAINED.value,):
     return "seed_retained"
-  if report.learned:
+  if reasons == (CalibrationQualificationReason.LEARNED.value,):
     return "learned"
-  reasons = set(report.reasons)
-  if any(reason.value.startswith("insufficient_") for reason in reasons):
+  if any(reason.startswith("insufficient_") for reason in reasons):
     return "evidence_insufficient"
-  if CalibrationQualificationReason.RANK_DEFICIENT_FIT in reasons:
+  if CalibrationQualificationReason.RANK_DEFICIENT_FIT.value in reasons:
     return "rank_deficient"
-  if CalibrationQualificationReason.ILL_CONDITIONED_FIT in reasons:
+  if CalibrationQualificationReason.ILL_CONDITIONED_FIT.value in reasons:
     return "ill_conditioned"
-  if CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE in reasons:
+  if CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE.value in reasons:
     return "cross_fit_inconclusive"
-  if any("cross_fit_regression" in reason.value for reason in reasons):
+  if any("cross_fit_regression" in reason for reason in reasons):
     return "cross_fit_regressed"
-  if CalibrationQualificationReason.INVALID_PARAMETERS in reasons:
+  if CalibrationQualificationReason.INVALID_PARAMETERS.value in reasons:
     return "invalid_parameters"
   return "numerical_failure"
+
+
+def _node_evaluation_status(report: CalibrationNodeQualificationReport) -> str:
+  return _evaluation_status_from_reasons(
+    tuple(reason.value for reason in report.reasons)
+  )
 
 
 def _node_payload(
@@ -1020,10 +1025,10 @@ def _optional_nonnegative_float(value: object, name: str) -> None:
     _nonnegative_float(value, name)
 
 
-def _validate_paired_loss(value: object, context: str, *, optional: bool) -> None:
+def _validate_paired_loss(value: object, context: str, *, optional: bool) -> str:
   if value is None:
     if optional:
-      return
+      return "absent"
     raise ValueError(f"{context} must be present")
   if type(value) is not dict or set(value) != _PAIRED_LOSS_KEYS:
     raise ValueError(f"{context} schema does not match")
@@ -1036,13 +1041,15 @@ def _validate_paired_loss(value: object, context: str, *, optional: bool) -> Non
   if route_count == 0:
     if any(item is not None for item in (mean, tolerance, uncertainty, lower, upper)):
       raise ValueError(f"{context} empty route loss carries values")
-    return
+    return "no_data"
   mean_value = _finite_float(mean, f"{context}.mean_candidate_minus_seed_mse")
-  _nonnegative_float(tolerance, f"{context}.numerical_tolerance_mse")
+  tolerance_value = _nonnegative_float(
+    tolerance, f"{context}.numerical_tolerance_mse"
+  )
   if route_count == 1:
     if any(item is not None for item in (uncertainty, lower, upper)):
       raise ValueError(f"{context} one-route loss invents uncertainty")
-    return
+    return "inconclusive"
   uncertainty_value = _nonnegative_float(
     uncertainty,
     f"{context}.uncertainty_mse",
@@ -1063,6 +1070,13 @@ def _validate_paired_loss(value: object, context: str, *, optional: bool) -> Non
     abs_tol=1e-12,
   ):
     raise ValueError(f"{context} uncertainty bounds disagree")
+  if lower_value > tolerance_value:
+    return "regression"
+  if upper_value < -tolerance_value:
+    return "improved"
+  if upper_value <= tolerance_value:
+    return "no_regression"
+  return "inconclusive"
 
 
 def _validate_fit_diagnostics(
@@ -1124,10 +1138,69 @@ def _validate_fit_diagnostic(value: object, context: str) -> None:
   _validate_fit_diagnostics([value], context, require_complete=False)
 
 
-def _validate_cross_fit_diagnostics(value: object, context: str) -> None:
+def _validate_cross_fit_status(
+  diagnostic: dict[str, object],
+  context: str,
+  *,
+  interval: bool,
+) -> str:
+  status = CalibrationCrossFitStatus(diagnostic["status"])
+  contributing = _nonnegative_int(
+    diagnostic["contributing_route_count"],
+    f"{context}.contributing_route_count",
+  )
+  successful = _nonnegative_int(
+    diagnostic["successful_fold_count"],
+    f"{context}.successful_fold_count",
+  )
+  failed = _nonnegative_int(
+    diagnostic["failed_fold_count"],
+    f"{context}.failed_fold_count",
+  )
+  if successful + failed != contributing:
+    raise ValueError(f"{context} fold counts disagree")
+  loss_field = (
+    "paired_loss" if "paired_loss" in diagnostic else "cross_fit_paired_loss"
+  )
+  loss_outcome = _validate_paired_loss(
+    diagnostic[loss_field],
+    f"{context}.{loss_field}",
+    optional=False,
+  )
+  loss = diagnostic[loss_field]
+  if loss["route_count"] != successful:
+    raise ValueError(f"{context} paired-loss route count disagrees with folds")
+
+  complete = failed == 0 and successful == contributing
+  if status is CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES:
+    valid = successful == 0 and failed == contributing and loss_outcome == "no_data"
+  elif status is CalibrationCrossFitStatus.FOLD_FIT_FAILURE:
+    valid = failed > 0
+  elif status is CalibrationCrossFitStatus.HELD_OUT_REGRESSION:
+    supported_outcomes = (
+      ("regression",) if interval else ("regression", "inconclusive")
+    )
+    valid = successful > 0 and loss_outcome in supported_outcomes
+  elif status is CalibrationCrossFitStatus.SCORED:
+    valid = complete and loss_outcome in (
+      ("improved", "no_regression") if interval else ("improved",)
+    )
+  else:
+    valid = complete and loss_outcome in (
+      ("inconclusive",) if interval else ("no_regression", "inconclusive")
+    )
+  if not valid:
+    raise ValueError(f"{context} status contradicts folds or paired loss")
+  return loss_outcome
+
+
+def _validate_cross_fit_diagnostics(
+  value: object,
+  context: str,
+) -> dict[str, dict[str, object]]:
   if type(value) is not list or not value:
     raise ValueError(f"{context} must be a nonempty list")
-  models: set[str] = set()
+  models: dict[str, dict[str, object]] = {}
   for index, diagnostic in enumerate(value):
     item_context = f"{context}[{index}]"
     if type(diagnostic) is not dict or set(diagnostic) != _CROSS_FIT_DIAGNOSTIC_KEYS:
@@ -1139,30 +1212,12 @@ def _validate_cross_fit_diagnostics(value: object, context: str) -> None:
       raise ValueError(f"{item_context} identity is invalid") from exc
     if model.value in models:
       raise ValueError(f"{item_context}.model is duplicated")
-    models.add(model.value)
-    contributing = _nonnegative_int(
-      diagnostic["contributing_route_count"],
-      f"{item_context}.contributing_route_count",
-    )
-    successful = _nonnegative_int(
-      diagnostic["successful_fold_count"],
-      f"{item_context}.successful_fold_count",
-    )
-    failed = _nonnegative_int(
-      diagnostic["failed_fold_count"],
-      f"{item_context}.failed_fold_count",
-    )
-    if successful + failed != contributing:
-      raise ValueError(f"{item_context} fold counts disagree")
-    if status is CalibrationCrossFitStatus.SCORED and failed:
-      raise ValueError(f"{item_context} scored with failed folds")
-    _validate_paired_loss(
-      diagnostic["paired_loss"],
-      f"{item_context}.paired_loss",
-      optional=False,
-    )
-  if models != {model.value for model in CalibrationModelId}:
+    del status
+    _validate_cross_fit_status(diagnostic, item_context, interval=False)
+    models[model.value] = diagnostic
+  if set(models) != {model.value for model in CalibrationModelId}:
     raise ValueError(f"{context} model family is incomplete")
+  return models
 
 
 def validate_learning_status_payload(payload: object) -> dict[str, object]:
@@ -1306,7 +1361,7 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       CalibrationQualificationReason.SEED_RETAINED.value,
     ):
       raise ValueError(f"{context}.selection_outcome is invalid")
-    _validate_paired_loss(
+    full_fit_loss_outcome = _validate_paired_loss(
       node["full_fit_paired_loss"],
       f"{context}.full_fit_paired_loss",
       optional=True,
@@ -1316,7 +1371,7 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       f"{context}.cross_fit_paired_loss",
       optional=True,
     )
-    _validate_cross_fit_diagnostics(
+    cross_fit_diagnostics = _validate_cross_fit_diagnostics(
       node["cross_fit_diagnostics"],
       f"{context}.cross_fit_diagnostics",
     )
@@ -1338,6 +1393,13 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       for field in _INDEPENDENT_ROUTE_COUNT_KEYS - {"all"}
     ):
       raise ValueError(f"{context}.independent_route_counts exceed contributor union")
+    for legacy_field, population in (
+      ("moving_cross_fit_route_count", "moving"),
+      ("breakaway_cross_fit_route_count", "breakaway"),
+      ("authority_cross_fit_route_count", "authority"),
+    ):
+      if node[legacy_field] != parsed_route_counts[population]:
+        raise ValueError(f"{context}.{legacy_field} disagrees with route population")
     unresolved = node["unresolved_diagnostics"]
     if type(unresolved) is not list or any(
       type(reason) is not str or reason not in reason_values
@@ -1355,22 +1417,22 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context}.qualification reasons disagree")
     if any(reason not in reason_values for reason in reasons):
       raise ValueError(f"{context}.qualification reason is unknown")
+    if evaluation_status != _evaluation_status_from_reasons(tuple(reasons)):
+      raise ValueError(f"{context}.evaluation status contradicts reasons")
     if node["qualified"] and (
       evaluation_status != reasons[0] or selection_outcome != reasons[0]
     ):
       raise ValueError(f"{context}.qualified outcome projection disagrees")
     if node["qualified"] and (
       full_fit_diagnostic is None
+      or node["full_fit_paired_loss"] is None
       or node["cross_fit_paired_loss"] is None
       or node["cross_fit_paired_loss"]["route_count"] == 0
       or node["cross_fit_route_count"] == 0
     ):
       raise ValueError(f"{context}.qualified node lacks authoritative selection proof")
     if node["qualified"]:
-      authoritative = next(
-        diagnostic for diagnostic in node["cross_fit_diagnostics"]
-        if diagnostic["model"] == full_fit_diagnostic["model"]
-      )
+      authoritative = cross_fit_diagnostics[full_fit_diagnostic["model"]]
       matching_full_fit = next(
         diagnostic for diagnostic in node["fit_diagnostics"]
         if diagnostic["model"] == full_fit_diagnostic["model"]
@@ -1382,6 +1444,24 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
         or full_fit_diagnostic != matching_full_fit
       ):
         raise ValueError(f"{context}.authoritative selection proof disagrees")
+      if (
+        full_fit_diagnostic["status"] != CalibrationFitStatus.IDENTIFIABLE.value
+        or node["full_fit_paired_loss"]["route_count"] != parsed_route_counts["all"]
+        or full_fit_loss_outcome not in ("improved", "no_regression")
+      ):
+        raise ValueError(f"{context}.authoritative full-fit proof disagrees")
+      expected_status = (
+        CalibrationCrossFitStatus.SCORED.value
+        if selection_outcome == CalibrationQualificationReason.LEARNED.value
+        else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+      )
+      if authoritative["status"] != expected_status:
+        raise ValueError(f"{context}.selected family status contradicts outcome")
+      if (
+        selection_outcome == CalibrationQualificationReason.SEED_RETAINED.value
+        and full_fit_loss_outcome != "no_regression"
+      ):
+        raise ValueError(f"{context}.seed-retained loss outcome disagrees")
     if not node["qualified"] and evaluation_status in ("learned", "seed_retained"):
       raise ValueError(f"{context}.failed node has a qualified status")
 
@@ -1475,6 +1555,8 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     if type(stratum_diagnostics) is not list or not stratum_diagnostics:
       raise ValueError(f"{context}.stratum_diagnostics must be nonempty")
     strata: set[str] = set()
+    stratum_statuses: list[CalibrationCrossFitStatus] = []
+    expected_interval_reasons: list[str] = []
     stratum_successful = 0
     stratum_failed = 0
     maximum_contributors = 0
@@ -1502,22 +1584,54 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
         diagnostic["failed_fold_count"],
         f"{stratum_context}.failed_fold_count",
       )
-      if stratum_ok + stratum_bad != stratum_contributing:
-        raise ValueError(f"{stratum_context} fold counts disagree")
+      diagnostic_for_status = {
+        "status": diagnostic["cross_fit_status"],
+        "contributing_route_count": stratum_contributing,
+        "successful_fold_count": stratum_ok,
+        "failed_fold_count": stratum_bad,
+        "cross_fit_paired_loss": diagnostic["cross_fit_paired_loss"],
+      }
+      cross_loss_outcome = _validate_cross_fit_status(
+        diagnostic_for_status,
+        stratum_context,
+        interval=True,
+      )
       if report["qualified"] and (
         stratum_bad != 0 or stratum_status is not CalibrationCrossFitStatus.SCORED
       ):
         raise ValueError(f"{stratum_context} qualified with incomplete cross-fit")
-      _validate_paired_loss(
+      full_loss_outcome = _validate_paired_loss(
         diagnostic["full_fit_paired_loss"],
         f"{stratum_context}.full_fit_paired_loss",
         optional=False,
       )
-      _validate_paired_loss(
-        diagnostic["cross_fit_paired_loss"],
-        f"{stratum_context}.cross_fit_paired_loss",
-        optional=False,
-      )
+      if diagnostic["full_fit_paired_loss"]["route_count"] != stratum_contributing:
+        raise ValueError(f"{stratum_context} full-fit route count disagrees")
+      if stratum_contributing < 2:
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+        )
+      if stratum_bad:
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE.value
+        )
+      if full_loss_outcome == "regression":
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION.value
+        )
+      elif full_loss_outcome in ("no_data", "inconclusive"):
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE.value
+        )
+      if cross_loss_outcome == "regression":
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION.value
+        )
+      elif cross_loss_outcome in ("no_data", "inconclusive"):
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_INCONCLUSIVE.value
+        )
+      stratum_statuses.append(stratum_status)
       stratum_successful += stratum_ok
       stratum_failed += stratum_bad
       maximum_contributors = max(maximum_contributors, stratum_contributing)
@@ -1525,6 +1639,26 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context} aggregate fold counts disagree")
     if not maximum_contributors <= contributing <= successful + failed:
       raise ValueError(f"{context} contributor union is invalid")
+    aggregate_status = next(
+      status
+      for status in (
+        CalibrationCrossFitStatus.FOLD_FIT_FAILURE,
+        CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+        CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT,
+        CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES,
+        CalibrationCrossFitStatus.SCORED,
+      )
+      if status in stratum_statuses
+    )
+    if cross_fit_status is not aggregate_status:
+      raise ValueError(f"{context} aggregate status contradicts strata")
+    expected_reasons = (
+      [CalibrationQualificationReason.QUALIFIED.value]
+      if not expected_interval_reasons
+      else list(dict.fromkeys(expected_interval_reasons))
+    )
+    if reasons != expected_reasons:
+      raise ValueError(f"{context}.reasons contradict stratum diagnostics")
   all_nodes_evaluated = all(
     type(node["evaluation_status"]) is str
     and bool(node["evaluation_status"])

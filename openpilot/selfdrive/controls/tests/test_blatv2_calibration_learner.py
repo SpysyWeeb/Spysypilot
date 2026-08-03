@@ -554,6 +554,49 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertGreater(snapshot.applied_torque_span, 0.0)
     learner.end_route()
 
+  def test_authority_uses_current_speed_rate_resolution_for_all_supports(self) -> None:
+    seed = seed_profile()
+    nodes = list(seed.nodes)
+    nodes[1] = replace(
+      nodes[1],
+      parameters=replace(nodes[1].parameters, rack_rate_resolution_deg_s=2.0),
+    )
+    nodes[2] = replace(
+      nodes[2],
+      parameters=replace(nodes[2].parameters, rack_rate_resolution_deg_s=8.0),
+    )
+    varied_seed = replace(seed, nodes=tuple(nodes))
+    learner = CalibrationProfileLearner(varied_seed)
+    learner.begin_route(route_sha(0), route_counter=0)
+    authority = _attest_authority_sample(
+      LearningSample(
+        speed_mps=7.5,
+        dt_s=DT,
+        applied_torque=1.0,
+        measured_lateral_accel_mps2=-1.5,
+        rack_rate_deg_s=6.0,
+        rack_acceleration_deg_s2=0.0,
+        engaged=True,
+        valid=True,
+        steering_pressed=False,
+        actuator_constrained=True,
+        standstill=False,
+      ),
+      boundary=ActuatorBoundary.MAGNITUDE,
+      magnitude_boundary_dwell_s=DT,
+    )
+    self.assertTrue(learner.add_sample(authority))
+    learner.end_route()
+
+    self.assertEqual(learner.evidence_for_node(1).authority_full_fit_count, 1)
+    self.assertEqual(learner.evidence_for_node(2).authority_full_fit_count, 1)
+    self.assertEqual(learner._routes[0].intervals[1].authority.count, 1)
+    encoded = learner.export_evidence()
+    self.assertEqual(
+      CalibrationProfileLearner.from_evidence(varied_seed, encoded).export_evidence(),
+      encoded,
+    )
+
   def test_route_is_atomic_and_counter_parity_does_not_assign_a_role(self) -> None:
     for route_counter in (0, 1):
       learner = CalibrationProfileLearner(seed_profile())
@@ -928,7 +971,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       0,
     )
 
-  def test_strict_v12_evidence_is_deterministic_and_restorable(self) -> None:
+  def test_strict_v13_evidence_is_deterministic_and_restorable(self) -> None:
     seed = seed_profile()
     learner = CalibrationProfileLearner(seed)
     for route_counter, direction in ((0, 1), (2, -1), (1, -1), (3, 1)):
@@ -950,8 +993,8 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     restored = CalibrationProfileLearner.from_evidence(seed, encoded)
     self.assertEqual(restored.export_evidence(), encoded)
     self.assertEqual(restored.evidence_for_node(2), learner.evidence_for_node(2))
-    original_report = learner.qualify("v12 diagnostics").node_reports[2]
-    restored_report = restored.qualify("v12 diagnostics").node_reports[2]
+    original_report = learner.qualify("v13 diagnostics").node_reports[2]
+    restored_report = restored.qualify("v13 diagnostics").node_reports[2]
     self.assertGreater(original_report.breakaway_episode_full_fit_count, 0)
     self.assertGreater(original_report.breakaway_episode_cross_fit_route_count, 0)
     self.assertGreater(original_report.breakaway_episode_dwell_s, 0.0)
@@ -992,6 +1035,101 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     inconsistent["payload_sha256"] = hashlib.sha256(canonical(inconsistent["payload"])).hexdigest()
     with self.assertRaisesRegex(ValueError, "stratum counts"):
       CalibrationProfileLearner.from_evidence(seed, canonical(inconsistent))
+
+    reordered = json.loads(encoded)
+    reordered["payload"]["routes"].reverse()
+    for route_index, route in enumerate(reordered["payload"]["routes"]):
+      route["route_index"] = route_index
+    reordered["payload_sha256"] = hashlib.sha256(
+      canonical(reordered["payload"])
+    ).hexdigest()
+    with self.assertRaisesRegex(ValueError, "canonical identity order"):
+      CalibrationProfileLearner.from_evidence(seed, canonical(reordered))
+
+    reindexed = json.loads(encoded)
+    reindexed["payload"]["routes"][0]["route_index"] = 1
+    reindexed["payload"]["routes"][1]["route_index"] = 0
+    reindexed["payload_sha256"] = hashlib.sha256(
+      canonical(reindexed["payload"])
+    ).hexdigest()
+    with self.assertRaisesRegex(ValueError, "route ordering"):
+      CalibrationProfileLearner.from_evidence(seed, canonical(reindexed))
+
+    for fabricated_stratum in ("moving", "breakaway_episode", "authority"):
+      with self.subTest(fabricated_stratum=fabricated_stratum):
+        fabricated = json.loads(encoded)
+        interval = fabricated["payload"]["routes"][0]["intervals"][1]
+        interval[fabricated_stratum] = json.loads(json.dumps(interval["base"]))
+        fabricated["payload_sha256"] = hashlib.sha256(
+          canonical(fabricated["payload"])
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "conservation failed"):
+          CalibrationProfileLearner.from_evidence(seed, canonical(fabricated))
+
+    coordinated = json.loads(encoded)
+    route = coordinated["payload"]["routes"][0]
+    node = route["nodes"][2]
+    base_regression = {
+      "count": (
+        node["training"]["count"]
+        - node["moving_training"]["count"]
+        - node["breakaway_training"]["count"]
+      ),
+      "normal": [
+        (float.fromhex(whole) - float.fromhex(moving) - float.fromhex(breakaway)).hex()
+        for whole, moving, breakaway in zip(
+          node["training"]["normal"],
+          node["moving_training"]["normal"],
+          node["breakaway_training"]["normal"],
+          strict=True,
+        )
+      ],
+      "rhs": [
+        (float.fromhex(whole) - float.fromhex(moving) - float.fromhex(breakaway)).hex()
+        for whole, moving, breakaway in zip(
+          node["training"]["rhs"],
+          node["moving_training"]["rhs"],
+          node["breakaway_training"]["rhs"],
+          strict=True,
+        )
+      ],
+      "target_squared": (
+        float.fromhex(node["training"]["target_squared"])
+        - float.fromhex(node["moving_training"]["target_squared"])
+        - float.fromhex(node["breakaway_training"]["target_squared"])
+      ).hex(),
+      "weight_s": (
+        float.fromhex(node["training"]["weight_s"])
+        - float.fromhex(node["moving_training"]["weight_s"])
+        - float.fromhex(node["breakaway_training"]["weight_s"])
+      ).hex(),
+    }
+    self.assertGreater(base_regression["count"], 0)
+    node["authority_training"] = base_regression
+    node["authority_fit_count"] = base_regression["count"]
+    node["authority_fit_sample_count"] = base_regression["count"]
+    node["authority_sample_count"] = base_regression["count"]
+    node["authority_magnitude_sample_count"] = base_regression["count"]
+    node["authority_fit_support_s"] = base_regression["weight_s"]
+    node["authority_support_s"] = base_regression["weight_s"]
+    route["intervals"][1]["authority"] = json.loads(json.dumps(
+      route["intervals"][1]["base"]
+    ))
+    coordinated["payload_sha256"] = hashlib.sha256(
+      canonical(coordinated["payload"])
+    ).hexdigest()
+    with self.assertRaisesRegex(ValueError, "row conservation failed"):
+      CalibrationProfileLearner.from_evidence(seed, canonical(coordinated))
+
+    source_total = json.loads(encoded)
+    source = source_total["payload"]["routes"][0]["source_accounting"]
+    source["pending"] += 1
+    source["accepted"] += 1
+    source_total["payload_sha256"] = hashlib.sha256(
+      canonical(source_total["payload"])
+    ).hexdigest()
+    with self.assertRaisesRegex(ValueError, "source accounting disagrees"):
+      CalibrationProfileLearner.from_evidence(seed, canonical(source_total))
     with self.assertRaisesRegex(ValueError, "different seed"):
       CalibrationProfileLearner.from_evidence(seed_profile("other-vehicle"), encoded)
 

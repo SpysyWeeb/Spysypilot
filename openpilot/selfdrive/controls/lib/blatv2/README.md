@@ -47,12 +47,15 @@ The seed remains a first-class safe result when no family robustly improves.
 Every coefficient-bearing stratum needs two independent contributing routes;
 any nonempty stratum makes its route a cross-fit contributor, while four rows
 are enforced only on each combined fold-fit population after the held route is
-removed. A route with thousands of rows still counts once. Evidence schema 12
+removed. A route with thousands of rows still counts once. Evidence schema 13
 reports independent route counts,
 cross-fit fold failures, paired out-of-fold losses, and the final all-route fit
-separately. Runtime interpolation evidence is also partitioned into disjoint
-base, moving, complete-breakaway, and settled-authority strata. Every populated
-stratum must independently avoid regression in every leave-one-route-out fold;
+separately. Every route also carries a source-assignment ledger whose accepted
+base, moving, complete-breakaway, pending, fitted-authority, and unresolved-
+authority counts must conserve both the interval strata and the durable global
+accepted-frame count. Runtime interpolation evidence is also partitioned into
+disjoint base, moving, complete-breakaway, and settled-authority strata. Every
+populated stratum must independently avoid regression in every leave-one-route-out fold;
 abundant ordinary rows cannot dilute a sparse physical failure. Earlier
 evidence schemas are rejected rather than reinterpreted.
 
@@ -280,8 +283,8 @@ cannot fabricate a breakaway. Lifecycle and mapping discontinuities clear
 cross-frame direction.
 
 The committed identities are calibration profile/evidence/coordinator
-`2/9/9`, physical learning/operation/progress status `4/1/1`, native
-extractor/canonical join `3/3`, route evidence `BLATRE02` version `2`,
+`3/13/13`, physical learning/operation/progress status `6/1/1`, native
+extractor/canonical join `4/3`, route evidence `BLATRE02` version `2`,
 backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v7`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/

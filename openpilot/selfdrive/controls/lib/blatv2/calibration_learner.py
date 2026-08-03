@@ -14,7 +14,7 @@ by a same-direction rate quantum. Later moving rows identify kinetic motion.
 
 Inputs are the measured-only :class:`learner.LearningSample`. Slew build and
 release frames are authority evidence but never equality-fit. Evidence schema
-12 is deliberately incompatible with older evidence. Route uncertainty is
+13 is deliberately incompatible with older evidence. Route uncertainty is
 bound to immutable route/content identities and per-route sufficient
 statistics. The canonical route counter remains provenance only; it never
 assigns a statistical role. Every route supplied here already belongs to the
@@ -61,7 +61,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 12
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 13
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_INDEPENDENT_ROUTES = 2
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
@@ -540,11 +540,75 @@ class _IntervalEvidence:
 
 
 @dataclass(slots=True)
+class _RouteSourceAccounting:
+  """Physical source assignment committed before sufficient-statistic fitting."""
+
+  base: int = 0
+  moving: int = 0
+  breakaway_episode: int = 0
+  pending: int = 0
+  authority_fit: int = 0
+  authority_unresolved: int = 0
+
+  @property
+  def accepted(self) -> int:
+    return (
+      self.base
+      + self.moving
+      + self.breakaway_episode
+      + self.pending
+      + self.authority_fit
+      + self.authority_unresolved
+    )
+
+  def encoded(self) -> dict[str, int]:
+    return {
+      "accepted": self.accepted,
+      "authority_fit": self.authority_fit,
+      "authority_unresolved": self.authority_unresolved,
+      "base": self.base,
+      "breakaway_episode": self.breakaway_episode,
+      "moving": self.moving,
+      "pending": self.pending,
+    }
+
+  @classmethod
+  def decoded(cls, raw: object, context: str) -> _RouteSourceAccounting:
+    payload = _exact(raw, {
+      "accepted",
+      "authority_fit",
+      "authority_unresolved",
+      "base",
+      "breakaway_episode",
+      "moving",
+      "pending",
+    }, context)
+    values = {
+      field: payload[field]
+      for field in (
+        "authority_fit",
+        "authority_unresolved",
+        "base",
+        "breakaway_episode",
+        "moving",
+        "pending",
+      )
+    }
+    if any(type(value) is not int or value < 0 for value in values.values()):
+      raise ValueError(f"{context} counts are invalid")
+    result = cls(**values)
+    if type(payload["accepted"]) is not int or payload["accepted"] != result.accepted:
+      raise ValueError(f"{context} accepted partition disagrees")
+    return result
+
+
+@dataclass(slots=True)
 class _RouteEvidence:
   route_index: int
   route_counter: int
   route_identity_sha256: str
   route_content_sha256: str
+  source_accounting: _RouteSourceAccounting
   nodes: tuple[_Node, ...]
   intervals: tuple[_IntervalEvidence, ...]
 
@@ -1613,6 +1677,71 @@ def _independent_route_counts(
   )
 
 
+_INTERVAL_NODE_FIELDS = {
+  CalibrationIntervalStratum.BASE: "base_training",
+  CalibrationIntervalStratum.MOVING: "moving_training",
+  CalibrationIntervalStratum.BREAKAWAY_EPISODE: "breakaway_episode_training",
+  CalibrationIntervalStratum.AUTHORITY: "authority_training",
+}
+
+
+def _accumulator_close(left: float, right: float, row_count: int) -> bool:
+  tolerance = (
+    NUMERICAL_LOSS_EPSILON_MULTIPLIER
+    * sys.float_info.epsilon
+    * max(abs(left), abs(right), 1.0)
+    * max(row_count, 1)
+  )
+  return abs(left - right) <= tolerance
+
+
+def _validate_interval_conservation(route: _RouteEvidence) -> None:
+  """Prove interval strata are the same disjoint rows as node evidence."""
+  for stratum, node_field in _INTERVAL_NODE_FIELDS.items():
+    node_regressions = tuple(
+      _route_node_regression(route, node_index, node_field)
+      for node_index in range(len(route.nodes))
+    )
+    interval_regressions = tuple(
+      interval.regression(stratum) for interval in route.intervals
+    )
+    node_count = sum(regression.count for regression in node_regressions)
+    interval_count = sum(regression.count for regression in interval_regressions)
+    source_field = (
+      "breakaway_episode"
+      if stratum is CalibrationIntervalStratum.BREAKAWAY_EPISODE
+      else "authority_fit"
+      if stratum is CalibrationIntervalStratum.AUTHORITY
+      else stratum.value
+    )
+    source_count = getattr(route.source_accounting, source_field)
+    if (
+      interval_count != source_count
+      or (interval_count == 0) != (node_count == 0)
+      or node_count < interval_count
+      or node_count > 2 * interval_count
+    ):
+      raise ValueError(f"route interval {stratum.value} row conservation failed")
+    node_weight = math.fsum(regression.weight_s for regression in node_regressions)
+    interval_weight = math.fsum(
+      regression.weight_s for regression in interval_regressions
+    )
+    node_target_squared = math.fsum(
+      regression.target_squared for regression in node_regressions
+    )
+    interval_target_squared = math.fsum(
+      regression.target_squared for regression in interval_regressions
+    )
+    if not _accumulator_close(node_weight, interval_weight, node_count) or not (
+      _accumulator_close(
+        node_target_squared,
+        interval_target_squared,
+        node_count,
+      )
+    ):
+      raise ValueError(f"route interval {stratum.value} support conservation failed")
+
+
 def _family_fit_fields(model: CalibrationModelId, include_authority: bool) -> tuple[str, ...]:
   fields = ("breakaway_episode_training",)
   if model is not CalibrationModelId.STATIC_ONLY:
@@ -1968,6 +2097,7 @@ class CalibrationProfileLearner:
     # Single-owner mutable counters keep the 100 Hz path allocation-free.
     # Immutable snapshots are materialized only for export/status consumers.
     self._sample_disposition_counts = [0] * len(_SAMPLE_DISPOSITIONS)
+    self._active_route_source_accounting: _RouteSourceAccounting | None = None
     self._active_route_nodes: tuple[_Node, ...] | None = None
     self._active_route_intervals: tuple[_IntervalEvidence, ...] | None = None
 
@@ -2075,6 +2205,7 @@ class CalibrationProfileLearner:
     self._active_route_counter = counter
     self._active_route_identity_sha256 = route_identity
     self._active_route_content_sha256 = route_content
+    self._active_route_source_accounting = _RouteSourceAccounting()
     self._active_route_nodes = tuple(_Node() for _ in self.seed_profile.nodes)
     self._active_route_intervals = tuple(
       _IntervalEvidence() for _ in range(len(self._nodes) - 1)
@@ -2086,7 +2217,8 @@ class CalibrationProfileLearner:
       raise RuntimeError("calibration learner route is not active")
     route_nodes = self._active_route_nodes
     route_intervals = self._active_route_intervals
-    if route_nodes is None or route_intervals is None:
+    route_source_accounting = self._active_route_source_accounting
+    if route_nodes is None or route_intervals is None or route_source_accounting is None:
       raise AssertionError("active calibration route lacks route statistics")
     if self._active_route_identity_sha256 is None or self._active_route_content_sha256 is None:
       raise AssertionError("active calibration route lacks immutable identity")
@@ -2098,12 +2230,14 @@ class CalibrationProfileLearner:
         route_counter=self._active_route_counter,
         route_identity_sha256=self._active_route_identity_sha256,
         route_content_sha256=self._active_route_content_sha256,
+        source_accounting=route_source_accounting,
         nodes=route_nodes,
         intervals=route_intervals,
       )
     )
     self.reset_route_transients()
     self._active_route_nodes = None
+    self._active_route_source_accounting = None
     self._active_route_intervals = None
     self._active_route_counter = None
     self._active_route_identity_sha256 = None
@@ -2122,7 +2256,7 @@ class CalibrationProfileLearner:
     if route_nodes is None:
       raise AssertionError("calibration route regression lacks active route")
     if "validation" in aggregate_field:
-      raise AssertionError("schema-12 learner cannot accumulate validation rows")
+      raise AssertionError("schema-13 learner cannot accumulate validation rows")
     getattr(route_nodes[node_index], aggregate_field).add(
       predictors, target, weight
     )
@@ -2249,7 +2383,8 @@ class CalibrationProfileLearner:
         route_nodes[node_index].rack_reversals += 1
 
     route_nodes = self._active_route_nodes
-    if route_nodes is None:
+    route_source_accounting = self._active_route_source_accounting
+    if route_nodes is None or route_source_accounting is None:
       raise AssertionError("active route lacks node summaries")
     if sample.authority_evidence:
       # A limiter boundary interrupts free breakaway causality. Settled,
@@ -2257,11 +2392,12 @@ class CalibrationProfileLearner:
       self._breakaway_detector.reset()
       seed_at_speed = self.seed_profile.parameters_at(sample.speed_mps).parameters
       joint_direction = self._rate_direction(sample, seed_at_speed)
-      if (
+      equality_fit = (
         sample.actuator_boundary == ActuatorBoundary.MAGNITUDE
         and sample.magnitude_boundary_dwell_s + 1e-12 >= sample.dt_s
         and joint_direction != 0
-      ):
+      )
+      if equality_fit:
         self._add_joint_regression(
           sample.speed_mps,
           CalibrationIntervalStratum.AUTHORITY,
@@ -2269,10 +2405,12 @@ class CalibrationProfileLearner:
           sample.applied_torque,
           sample.dt_s,
         )
+        route_source_accounting.authority_fit += 1
+      else:
+        route_source_accounting.authority_unresolved += 1
       accepted = False
       for node_index, node_weight in self._supports(sample.speed_mps):
         node = route_nodes[node_index]
-        seed = self.seed_profile.nodes[node_index].parameters
         weight = sample.dt_s * node_weight
         node.authority_support_s += weight
         node.authority_sample_count += 1
@@ -2285,12 +2423,6 @@ class CalibrationProfileLearner:
         node.authority_slew_release_sample_count += bool(
           sample.actuator_boundary & ActuatorBoundary.SLEW_RELEASE
         )
-        direction = self._rate_direction(sample, seed)
-        equality_fit = (
-          sample.actuator_boundary == ActuatorBoundary.MAGNITUDE
-          and sample.magnitude_boundary_dwell_s + 1e-12 >= sample.dt_s
-          and direction != 0
-        )
         if not equality_fit:
           node.authority_unresolved_sample_count += bool(
             sample.actuator_boundary & ActuatorBoundary.MAGNITUDE
@@ -2298,7 +2430,7 @@ class CalibrationProfileLearner:
           self._reset_node(node)
           accepted = True
           continue
-        predictors = self._row(sample, "moving", direction)
+        predictors = self._row(sample, "moving", joint_direction)
         self._add_regression(
           node_index,
           "authority_training",
@@ -2332,6 +2464,14 @@ class CalibrationProfileLearner:
       for node in route_nodes:
         self._reset_node(node)
       return CalibrationSampleDisposition.BREAKAWAY_EPISODE_DISCARDED
+    if category == "pending":
+      route_source_accounting.pending += 1
+    elif category == "breakaway":
+      route_source_accounting.breakaway_episode += 1
+    elif category == "moving":
+      route_source_accounting.moving += 1
+    else:
+      route_source_accounting.base += 1
     direction = decision.direction
     support_speed = (
       episode.onset_speed_mps if episode is not None else sample.speed_mps
@@ -2991,6 +3131,7 @@ class CalibrationProfileLearner:
         "route_counter": route.route_counter,
         "route_identity_sha256": route.route_identity_sha256,
         "route_content_sha256": route.route_content_sha256,
+        "source_accounting": route.source_accounting.encoded(),
         "nodes": [
           _encode_node_summary(route_node, node_index)
           for node_index, route_node in enumerate(route.nodes)
@@ -3080,6 +3221,7 @@ class CalibrationProfileLearner:
           "route_counter",
           "route_identity_sha256",
           "route_content_sha256",
+          "source_accounting",
           "nodes",
           "intervals",
         },
@@ -3095,6 +3237,10 @@ class CalibrationProfileLearner:
       route_content = _route_sha256(
         route_payload["route_content_sha256"],
         "route content identity",
+      )
+      source_accounting = _RouteSourceAccounting.decoded(
+        route_payload["source_accounting"],
+        f"routes[{route_index}].source_accounting",
       )
       if any(
         route.route_counter == route_counter
@@ -3128,16 +3274,40 @@ class CalibrationProfileLearner:
         )
         for interval_index, raw_interval in enumerate(raw_intervals)
       )
-      learner._routes.append(
-        _RouteEvidence(
-          route_index=route_index,
-          route_counter=route_counter,
-          route_identity_sha256=route_identity,
-          route_content_sha256=route_content,
-          nodes=route_nodes,
-          intervals=route_intervals,
-        )
+      route = _RouteEvidence(
+        route_index=route_index,
+        route_counter=route_counter,
+        route_identity_sha256=route_identity,
+        route_content_sha256=route_content,
+        source_accounting=source_accounting,
+        nodes=route_nodes,
+        intervals=route_intervals,
       )
+      _validate_interval_conservation(route)
+      learner._routes.append(route)
+
+    canonical_keys = tuple(
+      (
+        route.route_identity_sha256,
+        route.route_content_sha256,
+        route.route_counter,
+      )
+      for route in _canonical_routes(tuple(learner._routes))
+    )
+    serialized_keys = tuple(
+      (
+        route.route_identity_sha256,
+        route.route_content_sha256,
+        route.route_counter,
+      )
+      for route in learner._routes
+    )
+    if serialized_keys != canonical_keys:
+      raise ValueError("calibration routes are not in canonical identity order")
+    if sum(route.source_accounting.accepted for route in learner._routes) != (
+      sample_accounting.accepted_sample_count
+    ):
+      raise ValueError("calibration route source accounting disagrees with accepted samples")
 
     reconstructed_nodes = tuple(
       _aggregate_nodes(tuple(route.nodes[index] for route in learner._routes))
