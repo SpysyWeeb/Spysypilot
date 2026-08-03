@@ -14,7 +14,7 @@ by a same-direction rate quantum. Later moving rows identify kinetic motion.
 
 Inputs are the measured-only :class:`learner.LearningSample`. Slew build and
 release frames are authority evidence but never equality-fit. Evidence schema
-10 is deliberately incompatible with older evidence. Route uncertainty is
+12 is deliberately incompatible with older evidence. Route uncertainty is
 bound to immutable route/content identities and per-route sufficient
 statistics. The canonical route counter remains provenance only; it never
 assigns a statistical role. Every route supplied here already belongs to the
@@ -61,7 +61,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
 )
 
 
-CALIBRATION_EVIDENCE_SCHEMA_VERSION = 11
+CALIBRATION_EVIDENCE_SCHEMA_VERSION = 12
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_INDEPENDENT_ROUTES = 2
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
@@ -92,6 +92,13 @@ class CalibrationSampleDisposition(StrEnum):
   MEASUREMENT_WARMUP_OR_DISCONTINUITY = "measurement_warmup_or_discontinuity"
   LEARNER_INELIGIBLE = "learner_ineligible"
   BREAKAWAY_EPISODE_DISCARDED = "breakaway_episode_discarded"
+
+
+class CalibrationIntervalStratum(StrEnum):
+  BASE = "base"
+  MOVING = "moving"
+  BREAKAWAY_EPISODE = "breakaway_episode"
+  AUTHORITY = "authority"
 
 
 _REJECTED_SAMPLE_DISPOSITIONS = tuple(
@@ -498,6 +505,40 @@ class _JointRegression:
     return result
 
 
+_INTERVAL_STRATA = tuple(CalibrationIntervalStratum)
+
+
+class _IntervalEvidence:
+  """Disjoint runtime-interpolation evidence; strata never dilute each other."""
+
+  __slots__ = tuple(stratum.value for stratum in _INTERVAL_STRATA)
+
+  def __init__(self) -> None:
+    for stratum in _INTERVAL_STRATA:
+      setattr(self, stratum.value, _JointRegression())
+
+  def regression(self, stratum: CalibrationIntervalStratum) -> _JointRegression:
+    return getattr(self, stratum.value)
+
+  def encoded(self) -> dict[str, Any]:
+    return {
+      stratum.value: self.regression(stratum).encoded()
+      for stratum in _INTERVAL_STRATA
+    }
+
+  @classmethod
+  def decoded(cls, raw: object, context: str) -> _IntervalEvidence:
+    payload = _exact(raw, {stratum.value for stratum in _INTERVAL_STRATA}, context)
+    result = cls()
+    for stratum in _INTERVAL_STRATA:
+      setattr(
+        result,
+        stratum.value,
+        _JointRegression.decoded(payload[stratum.value], f"{context}.{stratum.value}"),
+      )
+    return result
+
+
 @dataclass(slots=True)
 class _RouteEvidence:
   route_index: int
@@ -505,7 +546,7 @@ class _RouteEvidence:
   route_identity_sha256: str
   route_content_sha256: str
   nodes: tuple[_Node, ...]
-  intervals: tuple[_JointRegression, ...]
+  intervals: tuple[_IntervalEvidence, ...]
 
 
 def _combine(*parts: _Regression) -> _Regression:
@@ -663,7 +704,7 @@ def _aggregate_nodes(parts: tuple[_Node, ...]) -> _Node:
   result.torque_max = max(finite_torque_max, default=-math.inf)
   for name in _NODE_REGRESSION_FIELDS:
     setattr(result, name, _combine(*(getattr(part, name) for part in parts)))
-  # Schema 11 has no parity/global-validation population or persisted route
+  # Schema 12 has no parity/global-validation population or persisted route
   # transient. These fields remain empty only for compatibility with internal
   # helpers shared by the live accumulator.
   return result
@@ -792,6 +833,11 @@ class CalibrationNodeEvidenceSnapshot:
   breakaway_angle_assisted_count: int
   authority_full_fit_support_s: float
   authority_full_fit_count: int
+  completed_route_count: int
+  base_completed_route_count: int
+  moving_completed_route_count: int
+  breakaway_episode_completed_route_count: int
+  authority_completed_route_count: int
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -801,7 +847,7 @@ class CalibrationNodeEvidenceSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class CalibrationNodeQualificationReport:
-  """Schema-11 full-fit result plus route-grouped cross-fit diagnostics."""
+  """Schema-12 full-fit result plus route-grouped cross-fit diagnostics."""
   node_index: int
   speed_mps: float
   minimum_support_s: float
@@ -884,13 +930,23 @@ class CalibrationNodeQualificationReport:
 
 
 @dataclass(frozen=True, slots=True)
+class CalibrationIntervalStratumDiagnostic:
+  stratum: CalibrationIntervalStratum
+  full_fit_paired_loss: CalibrationPairedLossDiagnostic
+  cross_fit_paired_loss: CalibrationPairedLossDiagnostic
+  contributing_route_count: int
+  successful_fold_count: int
+  failed_fold_count: int
+  cross_fit_status: CalibrationCrossFitStatus
+
+
+@dataclass(frozen=True, slots=True)
 class CalibrationInterpolationQualificationReport:
   """Interval full-fit and route-grouped out-of-fold diagnostics."""
   interval_index: int
   lower_speed_mps: float
   upper_speed_mps: float
-  full_fit_paired_loss: CalibrationPairedLossDiagnostic
-  cross_fit_paired_loss: CalibrationPairedLossDiagnostic
+  stratum_diagnostics: tuple[CalibrationIntervalStratumDiagnostic, ...]
   reasons: tuple[CalibrationQualificationReason, ...]
   contributing_route_count: int = 0
   successful_fold_count: int = 0
@@ -1448,6 +1504,7 @@ def _safe_on_route_strata(
 def _paired_joint_route_losses(
   routes: tuple[_RouteEvidence, ...],
   interval_index: int,
+  stratum: CalibrationIntervalStratum,
   candidate_lower: CalibrationParameters,
   candidate_upper: CalibrationParameters,
   seed_lower: CalibrationParameters,
@@ -1456,7 +1513,7 @@ def _paired_joint_route_losses(
   deltas: list[float] = []
   tolerance = 0.0
   for route in _canonical_routes(routes):
-    evidence = route.intervals[interval_index]
+    evidence = route.intervals[interval_index].regression(stratum)
     if evidence.count == 0:
       continue
     candidate_mse = evidence.mse(candidate_lower, candidate_upper)
@@ -1531,6 +1588,29 @@ _DISJOINT_CROSS_FIT_FIELDS = (
   "breakaway_episode_training",
   "authority_training",
 )
+
+
+def _independent_route_counts(
+  routes: tuple[_RouteEvidence, ...],
+  node_index: int,
+) -> CalibrationIndependentRouteCounts:
+  canonical = _canonical_routes(routes)
+  contributors = {
+    route.route_identity_sha256
+    for route in canonical
+    if any(
+      _route_node_regression(route, node_index, field).count > 0
+      for field in _DISJOINT_CROSS_FIT_FIELDS
+    )
+  }
+  return CalibrationIndependentRouteCounts(
+    all=len(contributors),
+    base=len(_contributing_routes(canonical, node_index, "base_training")),
+    moving=len(_contributing_routes(canonical, node_index, "moving_training")),
+    breakaway=len(_contributing_routes(canonical, node_index, "breakaway_training")),
+    breakaway_episode=len(_contributing_routes(canonical, node_index, "breakaway_episode_training")),
+    authority=len(_contributing_routes(canonical, node_index, "authority_training")),
+  )
 
 
 def _family_fit_fields(model: CalibrationModelId, include_authority: bool) -> tuple[str, ...]:
@@ -1753,6 +1833,7 @@ def _cross_fit_dominates(
 def _cross_fit_interval_loss(
   routes: tuple[_RouteEvidence, ...],
   interval_index: int,
+  stratum: CalibrationIntervalStratum,
   lower_model: CalibrationModelId | None,
   upper_model: CalibrationModelId | None,
   seed_lower: CalibrationParameters,
@@ -1761,7 +1842,7 @@ def _cross_fit_interval_loss(
   canonical = _canonical_routes(routes)
   contributing = tuple(
     route for route in canonical
-    if route.intervals[interval_index].count > 0
+    if route.intervals[interval_index].regression(stratum).count > 0
   )
   if len(contributing) < MIN_INDEPENDENT_ROUTES:
     return (
@@ -1813,11 +1894,12 @@ def _cross_fit_interval_loss(
         False,
       )
 
-    candidate_mse = held_out.intervals[interval_index].mse(
+    held_out_evidence = held_out.intervals[interval_index].regression(stratum)
+    candidate_mse = held_out_evidence.mse(
       parameters(seed_lower, lower_coefficients),
       parameters(seed_upper, upper_coefficients),
     )
-    seed_mse = held_out.intervals[interval_index].mse(seed_lower, seed_upper)
+    seed_mse = held_out_evidence.mse(seed_lower, seed_upper)
     if candidate_mse is None or seed_mse is None:
       failures += 1
       continue
@@ -1887,7 +1969,7 @@ class CalibrationProfileLearner:
     # Immutable snapshots are materialized only for export/status consumers.
     self._sample_disposition_counts = [0] * len(_SAMPLE_DISPOSITIONS)
     self._active_route_nodes: tuple[_Node, ...] | None = None
-    self._active_route_intervals: tuple[_JointRegression, ...] | None = None
+    self._active_route_intervals: tuple[_IntervalEvidence, ...] | None = None
 
   @property
   def speed_nodes_mps(self) -> tuple[float, ...]:
@@ -1906,12 +1988,12 @@ class CalibrationProfileLearner:
     )
 
   def evidence_for_node(self, index: int) -> CalibrationNodeEvidenceSnapshot:
-    route_parts = tuple(
-      route.nodes[index] for route in _canonical_routes(tuple(self._routes))
-    )
+    completed_routes = _canonical_routes(tuple(self._routes))
+    route_parts = tuple(route.nodes[index] for route in completed_routes)
     if self._active_route_nodes is not None:
       route_parts += (self._active_route_nodes[index],)
     node = _aggregate_nodes(route_parts)
+    route_counts = _independent_route_counts(completed_routes, index)
     lateral_accel_span = 0.0 if not math.isfinite(node.lat_min) else node.lat_max - node.lat_min
     applied_torque_span = 0.0 if not math.isfinite(node.torque_min) else node.torque_max - node.torque_min
     return CalibrationNodeEvidenceSnapshot(
@@ -1948,6 +2030,11 @@ class CalibrationProfileLearner:
       breakaway_angle_assisted_count=node.breakaway_angle_assisted_count,
       authority_full_fit_support_s=node.authority_training.weight_s,
       authority_full_fit_count=node.authority_training.count,
+      completed_route_count=route_counts.all,
+      base_completed_route_count=route_counts.base,
+      moving_completed_route_count=route_counts.moving,
+      breakaway_episode_completed_route_count=route_counts.breakaway_episode,
+      authority_completed_route_count=route_counts.authority,
       lateral_accel_span_mps2=lateral_accel_span,
       applied_torque_span=applied_torque_span,
       lateral_accel_directions=node.lateral_accel_direction_mask.bit_count(),
@@ -1990,7 +2077,7 @@ class CalibrationProfileLearner:
     self._active_route_content_sha256 = route_content
     self._active_route_nodes = tuple(_Node() for _ in self.seed_profile.nodes)
     self._active_route_intervals = tuple(
-      _JointRegression() for _ in range(len(self._nodes) - 1)
+      _IntervalEvidence() for _ in range(len(self._nodes) - 1)
     )
     self._route_active = True
 
@@ -2035,7 +2122,7 @@ class CalibrationProfileLearner:
     if route_nodes is None:
       raise AssertionError("calibration route regression lacks active route")
     if "validation" in aggregate_field:
-      raise AssertionError("schema-11 learner cannot accumulate validation rows")
+      raise AssertionError("schema-12 learner cannot accumulate validation rows")
     getattr(route_nodes[node_index], aggregate_field).add(
       predictors, target, weight
     )
@@ -2055,6 +2142,7 @@ class CalibrationProfileLearner:
   def _add_joint_regression(
     self,
     speed: float,
+    stratum: CalibrationIntervalStratum,
     predictors: tuple[float, float, float, float],
     target: float,
     weight: float,
@@ -2063,7 +2151,7 @@ class CalibrationProfileLearner:
     if intervals is None:
       raise AssertionError("joint calibration regression lacks active route")
     interval, upper_weight = self._interval_support(speed)
-    intervals[interval].add(
+    intervals[interval].regression(stratum).add(
       predictors, target, weight, upper_weight
     )
 
@@ -2176,6 +2264,7 @@ class CalibrationProfileLearner:
       ):
         self._add_joint_regression(
           sample.speed_mps,
+          CalibrationIntervalStratum.AUTHORITY,
           self._row(sample, "moving", joint_direction),
           sample.applied_torque,
           sample.dt_s,
@@ -2253,18 +2342,21 @@ class CalibrationProfileLearner:
       if category == "breakaway":
         if episode is None:
           raise AssertionError("breakaway category lacks a complete episode")
-        joint_predictors = (
-          -episode.first_motion.measured_lateral_accel_mps2,
-          1.0,
-          0.0,
-          float(direction),
-        )
-        joint_torque = episode.first_motion.applied_torque
-        joint_weight = episode.first_motion.dt_s
+        joint_predictors, joint_torque = self._episode_row(episode)
+        # Match the node-family objective exactly: one physical episode gets
+        # unit total weight. Duration and dwell cannot manufacture authority.
+        joint_weight = 1.0
       else:
         joint_predictors = self._row(sample, category, direction)
       self._add_joint_regression(
         support_speed,
+        (
+          CalibrationIntervalStratum.BREAKAWAY_EPISODE
+          if category == "breakaway"
+          else CalibrationIntervalStratum.MOVING
+          if category == "moving"
+          else CalibrationIntervalStratum.BASE
+        ),
         joint_predictors,
         joint_torque,
         joint_weight,
@@ -2436,14 +2528,7 @@ class CalibrationProfileLearner:
     torque_span = 0.0 if not math.isfinite(node.torque_min) else node.torque_max - node.torque_min
     lat_rms = math.sqrt(node.lat_energy / node.clean_support_s) if node.clean_support_s > 0.0 else 0.0
 
-    route_counts = CalibrationIndependentRouteCounts(
-      all=len(_contributing_routes(routes, index, "training")),
-      base=len(_contributing_routes(routes, index, "base_training")),
-      moving=len(_contributing_routes(routes, index, "moving_training")),
-      breakaway=len(_contributing_routes(routes, index, "breakaway_training")),
-      breakaway_episode=len(_contributing_routes(routes, index, "breakaway_episode_training")),
-      authority=len(_contributing_routes(routes, index, "authority_training")),
-    )
+    route_counts = _independent_route_counts(routes, index)
     reasons: list[CalibrationQualificationReason] = []
     unresolved: list[CalibrationQualificationReason] = []
     if node.clean_support_s < minimum:
@@ -2531,8 +2616,18 @@ class CalibrationProfileLearner:
       else:
         reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
     selected_model = None if selected_cross_fit is None else selected_cross_fit.model
+    selection_cross_fit = (
+      selected_cross_fit
+      if selected_cross_fit is not None
+      else complete_cross_fit[0]
+      if complete_cross_fit
+      else None
+    )
     selected_full_fit = next(
-      (result for result in full_fit_results if result[0] is selected_model),
+      (
+        result for result in full_fit_results
+        if selection_cross_fit is not None and result[0] is selection_cross_fit.model
+      ),
       None,
     )
     seed_retained = selected_cross_fit is None and bool(complete_cross_fit)
@@ -2542,7 +2637,7 @@ class CalibrationProfileLearner:
       _, fitted, full_fit_diagnostic = selected_full_fit
       if fitted is None or full_fit_diagnostic.status is not CalibrationFitStatus.IDENTIFIABLE:
         reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
-      else:
+      elif not seed_retained:
         coefficients = fitted
         full_fit_safe, _ = _safe_on_route_strata(
           routes,
@@ -2618,8 +2713,8 @@ class CalibrationProfileLearner:
       seed_coefficients,
     )
     cross_fit_loss = (
-      selected_cross_fit.diagnostic.paired_loss
-      if selected_cross_fit is not None
+      selection_cross_fit.diagnostic.paired_loss
+      if selection_cross_fit is not None
       else _diagnostic_from_deltas(())
     )
     return CalibrationNodeQualificationReport(
@@ -2629,7 +2724,11 @@ class CalibrationProfileLearner:
       clean_support_s=node.clean_support_s,
       supported_sample_count=node.supported_sample_count,
       full_fit_count=node.training.count,
-      cross_fit_route_count=route_counts.all,
+      cross_fit_route_count=(
+        selection_cross_fit.diagnostic.contributing_route_count
+        if selection_cross_fit is not None
+        else 0
+      ),
       base_support_s=node.base_support_s,
       base_sample_count=node.base_sample_count,
       moving_support_s=node.moving_support_s,
@@ -2720,68 +2819,111 @@ class CalibrationProfileLearner:
     routes = _canonical_routes(tuple(self._routes))
     interpolation_reports: list[CalibrationInterpolationQualificationReport] = []
     for interval_index in range(len(self._nodes) - 1):
-      full_fit = _paired_joint_route_losses(
-        routes,
-        interval_index,
-        candidate_parameters[interval_index],
-        candidate_parameters[interval_index + 1],
-        seed_parameters[interval_index],
-        seed_parameters[interval_index + 1],
-      )
-      (
-        cross_fit,
-        contributing_route_count,
-        successful_fold_count,
-        failed_fold_count,
-        cross_fit_status,
-      ) = _cross_fit_interval_loss(
-        routes,
-        interval_index,
-        reports[interval_index].selected_model,
-        reports[interval_index + 1].selected_model,
-        seed_parameters[interval_index],
-        seed_parameters[interval_index + 1],
-      )
       interval_reasons: list[CalibrationQualificationReason] = []
-      if contributing_route_count < MIN_INDEPENDENT_ROUTES:
-        interval_reasons.append(
-          CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES
+      stratum_diagnostics: list[CalibrationIntervalStratumDiagnostic] = []
+      contributors: set[str] = set()
+      for stratum in _INTERVAL_STRATA:
+        stratum_routes = tuple(
+          route for route in routes
+          if route.intervals[interval_index].regression(stratum).count > 0
         )
-      full_fit_verdict = _paired_loss_verdict(full_fit, identical=profile_identical)
-      cross_fit_verdict = _paired_loss_verdict(cross_fit, identical=profile_identical)
-      if failed_fold_count:
-        interval_reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
-      if full_fit_verdict is _PairedLossVerdict.REGRESSION:
-        interval_reasons.append(
-          CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION
+        if not stratum_routes:
+          continue
+        contributors.update(route.route_identity_sha256 for route in stratum_routes)
+        full_fit = _paired_joint_route_losses(
+          routes,
+          interval_index,
+          stratum,
+          candidate_parameters[interval_index],
+          candidate_parameters[interval_index + 1],
+          seed_parameters[interval_index],
+          seed_parameters[interval_index + 1],
         )
-      elif full_fit_verdict in (_PairedLossVerdict.INCONCLUSIVE, _PairedLossVerdict.NO_DATA):
+        (
+          cross_fit,
+          contributing_route_count,
+          successful_fold_count,
+          failed_fold_count,
+          cross_fit_status,
+        ) = _cross_fit_interval_loss(
+          routes,
+          interval_index,
+          stratum,
+          reports[interval_index].selected_model,
+          reports[interval_index + 1].selected_model,
+          seed_parameters[interval_index],
+          seed_parameters[interval_index + 1],
+        )
+        stratum_diagnostics.append(CalibrationIntervalStratumDiagnostic(
+          stratum=stratum,
+          full_fit_paired_loss=full_fit,
+          cross_fit_paired_loss=cross_fit,
+          contributing_route_count=contributing_route_count,
+          successful_fold_count=successful_fold_count,
+          failed_fold_count=failed_fold_count,
+          cross_fit_status=cross_fit_status,
+        ))
+        if contributing_route_count < MIN_INDEPENDENT_ROUTES:
+          interval_reasons.append(
+            CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES
+          )
+        if failed_fold_count:
+          interval_reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
+        full_fit_verdict = _paired_loss_verdict(full_fit, identical=profile_identical)
+        cross_fit_verdict = _paired_loss_verdict(cross_fit, identical=profile_identical)
+        if full_fit_verdict is _PairedLossVerdict.REGRESSION:
+          interval_reasons.append(
+            CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION
+          )
+        elif full_fit_verdict in (_PairedLossVerdict.INCONCLUSIVE, _PairedLossVerdict.NO_DATA):
+          interval_reasons.append(
+            CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE
+          )
+        if cross_fit_verdict is _PairedLossVerdict.REGRESSION:
+          interval_reasons.append(
+            CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION
+          )
+        elif cross_fit_verdict in (_PairedLossVerdict.INCONCLUSIVE, _PairedLossVerdict.NO_DATA):
+          interval_reasons.append(
+            CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_INCONCLUSIVE
+          )
+      if not stratum_diagnostics:
         interval_reasons.append(
           CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE
         )
-      if cross_fit_verdict is _PairedLossVerdict.REGRESSION:
-        interval_reasons.append(
-          CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION
-        )
-      elif cross_fit_verdict in (_PairedLossVerdict.INCONCLUSIVE, _PairedLossVerdict.NO_DATA):
-        interval_reasons.append(
-          CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_INCONCLUSIVE
-        )
+      interval_statuses = tuple(
+        diagnostic.cross_fit_status for diagnostic in stratum_diagnostics
+      )
+      cross_fit_status = next(
+        (
+          status for status in (
+            CalibrationCrossFitStatus.FOLD_FIT_FAILURE,
+            CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+            CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT,
+            CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES,
+          )
+          if status in interval_statuses
+        ),
+        CalibrationCrossFitStatus.SCORED,
+      )
       interpolation_reports.append(
         CalibrationInterpolationQualificationReport(
           interval_index=interval_index,
           lower_speed_mps=self.speed_nodes_mps[interval_index],
           upper_speed_mps=self.speed_nodes_mps[interval_index + 1],
-          full_fit_paired_loss=full_fit,
-          cross_fit_paired_loss=cross_fit,
+          stratum_diagnostics=tuple(stratum_diagnostics),
           reasons=(
             (CalibrationQualificationReason.QUALIFIED,)
             if not interval_reasons
             else tuple(dict.fromkeys(interval_reasons))
           ),
-          contributing_route_count=contributing_route_count,
-          successful_fold_count=successful_fold_count,
-          failed_fold_count=failed_fold_count,
+          contributing_route_count=len(contributors),
+          successful_fold_count=sum(
+            diagnostic.successful_fold_count for diagnostic in stratum_diagnostics
+          ),
+          failed_fold_count=sum(
+            diagnostic.failed_fold_count for diagnostic in stratum_diagnostics
+          ),
           cross_fit_status=cross_fit_status,
         )
       )
@@ -2814,7 +2956,7 @@ class CalibrationProfileLearner:
       if report.selected_model is not None
     )
     candidate_provenance = (
-      f"{source}; observable-inverse-torque-crossfit-v3; " +
+      f"{source}; observable-inverse-torque-crossfit-v4; " +
       f"models={model_ids}; evidence_revision={revision}"
     )
     profile = VehicleCalibrationProfile(
@@ -2980,7 +3122,7 @@ class CalibrationProfileLearner:
       ) - 1:
         raise ValueError("calibration route interval count is incompatible")
       route_intervals = tuple(
-        _JointRegression.decoded(
+        _IntervalEvidence.decoded(
           raw_interval,
           f"routes[{route_index}].intervals[{interval_index}]",
         )

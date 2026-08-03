@@ -17,6 +17,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CALIBRATION_EVIDENCE_SCHEMA_VERSION,
   CalibrationCrossFitStatus,
   CalibrationFitStatus,
+  CalibrationIntervalStratum,
   CalibrationModelFitDiagnostic,
   CalibrationModelId,
   CalibrationProfileLearner,
@@ -463,6 +464,27 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertEqual(snapshot.rack_reversals, 1)
     learner.end_route()
 
+  def test_interval_breakaway_matches_unit_weight_episode_objective(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    learner.begin_route(route_sha(44), route_counter=44)
+    for lateral_accel in (0.3, 0.4, 0.5):
+      self.assertTrue(learner.add_sample(sample(10.0, lateral_accel, 0.0)))
+    confirmation = replace(
+      sample(10.0, 0.7, RATE_QUANTUM_DEG_S, breakaway_sign=1),
+      dt_s=0.01,
+    )
+    self.assertTrue(learner.add_sample(confirmation))
+    learner.end_route()
+
+    route = learner._routes[0]
+    node_episode = route.nodes[2].breakaway_episode_training
+    interval_episode = route.intervals[1].breakaway_episode
+    self.assertEqual(node_episode.count, 1)
+    self.assertEqual(interval_episode.count, 1)
+    self.assertEqual(node_episode.weight_s, 1.0)
+    self.assertEqual(interval_episode.weight_s, 1.0)
+    self.assertEqual(interval_episode.target_squared, node_episode.target_squared)
+
   def test_independent_support_and_authority_counts(self) -> None:
     learner = CalibrationProfileLearner(seed_profile())
     learner.begin_route(route_sha(0), route_counter=0)
@@ -699,7 +721,10 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     learner = CalibrationProfileLearner(seed_profile())
     add_complete_evidence(learner)
     routes = _canonical_routes(tuple(learner._routes))
-    contributing = tuple(route for route in routes if route.intervals[0].count > 0)
+    contributing = tuple(
+      route for route in routes
+      if route.intervals[0].base.count > 0
+    )
     self.assertGreaterEqual(len(contributing), 3)
     middle_identity = contributing[len(contributing) // 2].route_identity_sha256
     all_identities = {route.route_identity_sha256 for route in routes}
@@ -717,6 +742,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       _, route_count, successful, failed, status = _cross_fit_interval_loss(
         routes,
         0,
+        CalibrationIntervalStratum.BASE,
         CalibrationModelId.FULL_MAP,
         CalibrationModelId.FULL_MAP,
         learner.seed_profile.nodes[0].parameters,
@@ -902,7 +928,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       0,
     )
 
-  def test_strict_v11_evidence_is_deterministic_and_restorable(self) -> None:
+  def test_strict_v12_evidence_is_deterministic_and_restorable(self) -> None:
     seed = seed_profile()
     learner = CalibrationProfileLearner(seed)
     for route_counter, direction in ((0, 1), (2, -1), (1, -1), (3, 1)):
@@ -924,8 +950,8 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     restored = CalibrationProfileLearner.from_evidence(seed, encoded)
     self.assertEqual(restored.export_evidence(), encoded)
     self.assertEqual(restored.evidence_for_node(2), learner.evidence_for_node(2))
-    original_report = learner.qualify("v11 diagnostics").node_reports[2]
-    restored_report = restored.qualify("v11 diagnostics").node_reports[2]
+    original_report = learner.qualify("v12 diagnostics").node_reports[2]
+    restored_report = restored.qualify("v12 diagnostics").node_reports[2]
     self.assertGreater(original_report.breakaway_episode_full_fit_count, 0)
     self.assertGreater(original_report.breakaway_episode_cross_fit_route_count, 0)
     self.assertGreater(original_report.breakaway_episode_dwell_s, 0.0)
@@ -1190,7 +1216,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     seed_target = 0.5 * (seed_lower[0] + seed_upper[0])
     for route in learner._routes:
       for _ in range(100):
-        route.intervals[interval_index].add(
+        route.intervals[interval_index].base.add(
           predictors,
           seed_target,
           1.0,
@@ -1202,6 +1228,115 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertIn(
       CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION,
       rejected.interpolation_reports[interval_index].reasons,
+    )
+
+  def test_sparse_authority_interval_regression_cannot_be_diluted_by_base(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    add_complete_evidence(learner)
+    interval_index = 0
+    seed_lower = learner.seed_profile.nodes[0].parameters
+    seed_upper = learner.seed_profile.nodes[1].parameters
+    predictors = (1.0, 0.0, 0.0, 0.0)
+    seed_target = 0.5 * (
+      seed_lower.torque_per_lateral_accel
+      + seed_upper.torque_per_lateral_accel
+    )
+    for route in learner._routes:
+      route.intervals[interval_index].authority.add(
+        predictors, seed_target, 0.01, 0.5
+      )
+
+    result = learner.qualify("authority stratum regression")
+    report = result.interpolation_reports[interval_index]
+    authority = next(
+      diagnostic for diagnostic in report.stratum_diagnostics
+      if diagnostic.stratum is CalibrationIntervalStratum.AUTHORITY
+    )
+    self.assertIsNone(result.candidate_profile)
+    self.assertEqual(
+      authority.cross_fit_status,
+      CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+    )
+    self.assertIn(
+      CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION,
+      report.reasons,
+    )
+
+  def test_sparse_breakaway_interval_regression_cannot_be_diluted_by_base(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    add_complete_evidence(learner)
+    interval_index = 0
+    seed_lower = learner.seed_profile.nodes[0].parameters
+    seed_upper = learner.seed_profile.nodes[1].parameters
+    predictors = (0.0, 0.0, 0.0, 1.0)
+    seed_target = 0.5 * (
+      seed_lower.static_breakaway_torque
+      + seed_upper.static_breakaway_torque
+    )
+    for route in learner._routes:
+      route.intervals[interval_index].breakaway_episode = _JointRegression()
+      route.intervals[interval_index].breakaway_episode.add(
+        predictors, seed_target, 1.0, 0.5
+      )
+
+    result = learner.qualify("breakaway stratum regression")
+    report = result.interpolation_reports[interval_index]
+    breakaway = next(
+      diagnostic for diagnostic in report.stratum_diagnostics
+      if diagnostic.stratum is CalibrationIntervalStratum.BREAKAWAY_EPISODE
+    )
+    self.assertIsNone(result.candidate_profile)
+    self.assertEqual(
+      breakaway.cross_fit_status,
+      CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+    )
+
+  def test_authority_only_route_contributes_to_completed_route_union(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    learner.begin_route(route_sha(900), route_counter=900)
+    learner._add_regression(
+      2,
+      "authority_training",
+      (-0.8, 1.0, 1.0, 0.0),
+      0.4,
+      0.1,
+    )
+    learner.end_route()
+    evidence = learner.evidence_for_node(2)
+    self.assertEqual(evidence.completed_route_count, 1)
+    self.assertEqual(evidence.base_completed_route_count, 0)
+    self.assertEqual(evidence.authority_completed_route_count, 1)
+
+  def test_selected_family_count_includes_an_authority_only_route(self) -> None:
+    learner = CalibrationProfileLearner(seed_profile())
+    add_complete_evidence(learner)
+    before = learner.evidence_for_node(2)
+    learner.begin_route(route_sha(901), route_counter=901)
+    for index in range(20):
+      direction = -1 if index % 2 else 1
+      lateral_accel = direction * (0.3 + 0.04 * index)
+      predictors = (-lateral_accel, 1.0, float(direction), 0.0)
+      learner._add_regression(
+        2,
+        "authority_training",
+        predictors,
+        inverse_torque(lateral_accel, moving_sign=direction),
+        0.1,
+      )
+    learner.end_route()
+
+    report = learner._node_report(2)
+    self.assertEqual(
+      report.independent_route_counts.all,
+      before.completed_route_count + 1,
+    )
+    self.assertEqual(
+      report.cross_fit_route_count,
+      report.independent_route_counts.all,
+    )
+    self.assertEqual(
+      report.authority_cross_fit_route_count,
+      before.authority_completed_route_count + 1,
     )
 
 

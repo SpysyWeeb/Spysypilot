@@ -47,10 +47,14 @@ The seed remains a first-class safe result when no family robustly improves.
 Every coefficient-bearing stratum needs two independent contributing routes;
 any nonempty stratum makes its route a cross-fit contributor, while four rows
 are enforced only on each combined fold-fit population after the held route is
-removed. A route with thousands of rows still counts once. Evidence schema 11
+removed. A route with thousands of rows still counts once. Evidence schema 12
 reports independent route counts,
 cross-fit fold failures, paired out-of-fold losses, and the final all-route fit
-separately. Earlier evidence schemas are rejected rather than reinterpreted.
+separately. Runtime interpolation evidence is also partitioned into disjoint
+base, moving, complete-breakaway, and settled-authority strata. Every populated
+stratum must independently avoid regression in every leave-one-route-out fold;
+abundant ordinary rows cannot dilute a sparse physical failure. Earlier
+evidence schemas are rejected rather than reinterpreted.
 
 The `0/5/10/15/20/30 m/s` support floors are respectively
 `150/150/240/240/420/420` accepted weighted seconds, not wall-clock drive
@@ -173,9 +177,13 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 5 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 6 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
-selection, cross-fit regression, fold completion, and interpolation state. It also carries
+selection, cross-fit regression, fold completion, and per-stratum interpolation
+state. The selected or seed-retained result carries its authoritative model
+family, independent contributor counts, paired held-out loss, final full-fit
+diagnostic, and unresolved diagnostics rather than a summary with missing
+proof. It also carries
 strict first-cause accounting for every prepared frame, so accepted evidence
 plus the finite rejection-reason set always equals the ingested-frame count.
 Frames absent before the first canonical poll and explicit source gaps remain
@@ -189,8 +197,11 @@ mean active. Both status documents are display-only.
 
 ## Determinism and storage
 
-Only complete PC full-rlog replay owns durable evidence. Routes are ordered by
-their canonical route counter. Within a route, selected events are ordered by
+Only complete PC full-rlog replay owns durable evidence. Statistical
+aggregation orders routes by `(route identity SHA-256, route content SHA-256,
+canonical route counter)`. Identity and content hashes define immutable
+membership; the counter is provenance and a final deterministic tie-breaker,
+not a fold assignment. Within a route, selected events are ordered by
 `(logMonoTime, segment, recorded ordinal)`, and a controls witness may use only
 a source at or before its timestamp. Recorded ordinal deliberately resolves
 equal-timestamp ties.

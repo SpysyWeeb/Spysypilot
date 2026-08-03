@@ -103,20 +103,18 @@ class _Snapshot:
   base_sample_count: int
   full_fit_support_s: float
   full_fit_count: int
-  cross_fit_support_s: float
-  cross_fit_route_count: int
+  completed_route_count: int
+  base_completed_route_count: int
   moving_support_s: float
   moving_sample_count: int
   moving_full_fit_support_s: float
   moving_full_fit_count: int
-  moving_cross_fit_support_s: float
-  moving_cross_fit_route_count: int
+  moving_completed_route_count: int
   breakaway_support_s: float
   breakaway_sample_count: int
   breakaway_full_fit_support_s: float
   breakaway_full_fit_count: int
-  breakaway_cross_fit_support_s: float
-  breakaway_cross_fit_route_count: int
+  breakaway_episode_completed_route_count: int
   authority_support_s: float
   authority_sample_count: int
   authority_magnitude_sample_count: int
@@ -127,8 +125,7 @@ class _Snapshot:
   authority_fit_sample_count: int
   authority_full_fit_support_s: float
   authority_full_fit_count: int
-  authority_cross_fit_support_s: float
-  authority_cross_fit_route_count: int
+  authority_completed_route_count: int
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -227,20 +224,18 @@ class _FakeCalibrationLearner:
       base_sample_count=count,
       full_fit_support_s=count * DT,
       full_fit_count=count,
-      cross_fit_support_s=0.0,
-      cross_fit_route_count=0,
+      completed_route_count=int(bool(count)),
+      base_completed_route_count=int(bool(count)),
       moving_support_s=count * DT,
       moving_sample_count=count,
       moving_full_fit_support_s=count * DT,
       moving_full_fit_count=count,
-      moving_cross_fit_support_s=0.0,
-      moving_cross_fit_route_count=0,
+      moving_completed_route_count=int(bool(count)),
       breakaway_support_s=count * DT,
       breakaway_sample_count=count,
       breakaway_full_fit_support_s=count * DT,
       breakaway_full_fit_count=count,
-      breakaway_cross_fit_support_s=0.0,
-      breakaway_cross_fit_route_count=0,
+      breakaway_episode_completed_route_count=int(bool(count)),
       authority_support_s=0.0,
       authority_sample_count=0,
       authority_magnitude_sample_count=0,
@@ -251,8 +246,7 @@ class _FakeCalibrationLearner:
       authority_fit_sample_count=0,
       authority_full_fit_support_s=0.0,
       authority_full_fit_count=0,
-      authority_cross_fit_support_s=0.0,
-      authority_cross_fit_route_count=0,
+      authority_completed_route_count=0,
       lateral_accel_span_mps2=0.8 if count else 0.0,
       applied_torque_span=0.4 if count else 0.0,
       lateral_accel_directions=2 if count else 0,
@@ -392,7 +386,10 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
     self.assertEqual(diagnostic.moving_sample_count, 1)
     self.assertEqual(diagnostic.breakaway_sample_count, 1)
     self.assertEqual(diagnostic.full_fit_count, 1)
-    self.assertEqual(diagnostic.cross_fit_route_count, 0)
+    self.assertEqual(diagnostic.completed_route_count, 1)
+    self.assertEqual(diagnostic.base_completed_route_count, 1)
+    self.assertEqual(diagnostic.moving_completed_route_count, 1)
+    self.assertEqual(diagnostic.breakaway_episode_completed_route_count, 1)
     self.assertEqual(diagnostic.authority_sample_count, 0)
     self.assertEqual(diagnostic.authority_fit_sample_count, 0)
     self.assertEqual(diagnostic.lateral_accel_directions, 2)
@@ -487,8 +484,8 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
     manifest = json.loads(finalization.manifest_bytes)
     self.assertEqual(manifest["artifact_schema_version"], CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION)
-    self.assertEqual(manifest["artifact_schema_version"], 11)
-    self.assertEqual(manifest["evidence_schema_version"], 11)
+    self.assertEqual(manifest["artifact_schema_version"], 12)
+    self.assertEqual(manifest["evidence_schema_version"], 12)
     self.assertEqual(manifest["seed_profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
     self.assertEqual(manifest["seed_profile_schema_version"], 3)
     self.assertEqual(manifest["seed_profile_sha256"], hashlib.sha256(seed.to_json().encode()).hexdigest())
@@ -581,15 +578,15 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
 
 class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
-  def test_real_v11_report_is_manifest_compatible_and_restorable(self) -> None:
+  def test_real_v12_report_is_manifest_compatible_and_restorable(self) -> None:
     seed = seed_profile()
     first = CalibrationLearningCoordinator(seed).finalize()
     restored = CalibrationLearningCoordinator(seed, first.evidence_bytes).finalize()
     self.assertEqual(restored.evidence_bytes, first.evidence_bytes)
     self.assertEqual(restored.manifest_bytes, first.manifest_bytes)
     manifest = json.loads(first.manifest_bytes)
-    self.assertEqual(manifest["artifact_schema_version"], 11)
-    self.assertEqual(manifest["evidence_schema_version"], 11)
+    self.assertEqual(manifest["artifact_schema_version"], 12)
+    self.assertEqual(manifest["evidence_schema_version"], 12)
     self.assertEqual(manifest["seed_profile_schema_version"], 3)
     for report in manifest["node_reports"]:
       self.assertIn("moving_reasons", report)
@@ -601,6 +598,23 @@ class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
       self.assertIn("full_fit_diagnostic", report)
       self.assertIn("unresolved_diagnostics", report)
     self.assertEqual(manifest["interpolation_reports"], [])
+
+  def test_real_learner_support_diagnostics_use_completed_route_counts(self) -> None:
+    coordinator = CalibrationLearningCoordinator(seed_profile())
+    self.assertEqual(coordinator.support_diagnostics[2].completed_route_count, 0)
+    coordinator.transition_onroad(route_sha(0x62), route_counter=0x62)
+    self.assertTrue(coordinator.ingest(measured_sample(10.0, 1)))
+    self.assertEqual(coordinator.support_diagnostics[2].completed_route_count, 0)
+    coordinator.transition_offroad()
+    diagnostic = coordinator.support_diagnostics[2]
+    self.assertEqual(diagnostic.completed_route_count, 1)
+    self.assertEqual(
+      diagnostic.base_completed_route_count
+      + diagnostic.moving_completed_route_count
+      + diagnostic.breakaway_episode_completed_route_count
+      + diagnostic.authority_completed_route_count,
+      1,
+    )
 
 
 if __name__ == "__main__":
