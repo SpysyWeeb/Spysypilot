@@ -122,7 +122,13 @@ class Controls:
       self.sm.all_checks(['radarState']),
     )
     actuators.accel = float(self.LoC.update(
-      CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits, lead,
+      CC.longActive,
+      CS,
+      long_plan.aTarget,
+      long_plan.shouldStop,
+      pid_accel_limits,
+      lead,
+      emergency_stop=bool(long_plan.fcw or self.sm['controlsState'].forceDecel),
     ))
 
     # Steering PID loop and lateral MPC
