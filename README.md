@@ -8,8 +8,8 @@ created from the current untouched `stock` tip.
 **In progress — not field validated.**
 
 BLoTv2 is a ground-up longitudinal control iteration that combines an
-improved Smooth Stops final-approach controller with an improved
-longitudinal planner/MPC policy. Its joint product target is:
+improved Smooth Stops ordinary-stop controller with an improved longitudinal
+planner/MPC policy. Its joint product target is:
 
 - **Smooth:** continuous acceleration and jerk through following, braking,
   final approach, hold, and release.
@@ -58,9 +58,10 @@ The implementation and signal mapping are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 
 Each physical decision has one owner. The planner/MPC owns trajectory
-necessity, Smooth Stops owns only the final low-speed approach and hold
-handoff, and the stock long controller and platform safety layers retain
-their existing command-envelope responsibilities.
+necessity, Smooth Stops shapes ordinary stop braking from intent through the
+standstill handoff, and the stock long controller and platform safety layers
+retain their existing command-envelope responsibilities. Explicit FCW,
+force-decel, and lead-collision floors remain safety overrides.
 
 The design, exact mechanisms, known risks, and field plan are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md). Promotion gates are tracked in
