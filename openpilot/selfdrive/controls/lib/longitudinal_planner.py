@@ -49,6 +49,13 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
+# Stop intent is published before standstill so LongControl can shape the full
+# ordinary stop. The final three MPC samples must agree; action.shouldStop is
+# already a model-authored stop signal and follows the same latch.
+STOP_INTENT_SPEED = 0.5
+STOP_INTENT_CONFIRM = 0.15
+STOP_INTENT_RELEASE = 0.35
+
 # Lookup table for turns
 # Do not let the turn budget clip the requested straight-line launch authority.
 # Lateral acceleration still consumes this shared budget in a turn.
@@ -64,6 +71,41 @@ LAUNCH_OPEN_LENGTH = 20.0   # m, model path length that reads as "the way ahead 
 LAUNCH_OPEN_CONFIRM = 0.7   # filtered (RC 0.3s) open level to trust -- ~0.5s of sustained open path
 LAUNCH_CLOSE_LENGTH = 10.0  # m, path re-collapse below this cancels anticipation (model changed its mind)
 
+def projected_stop_intent(speeds):
+  values = np.asarray(speeds, dtype=float)
+  if values.size < 3 or not np.all(np.isfinite(values)):
+    return False
+  tail = values[-3:]
+  return bool(np.all(tail <= STOP_INTENT_SPEED) and np.all(np.diff(tail) <= 0.05))
+
+
+class StopIntentLatch:
+  """Debounce ordinary stop intent while preserving it through the approach."""
+
+  def __init__(self, dt=DT_MDL):
+    self.dt = dt
+    self._on_s = 0.0
+    self._off_s = 0.0
+    self.active = False
+
+  def reset(self):
+    self._on_s = 0.0
+    self._off_s = 0.0
+    self.active = False
+
+  def update(self, raw_intent):
+    if raw_intent:
+      self._on_s += self.dt
+      self._off_s = 0.0
+      if self._on_s + 1e-9 >= STOP_INTENT_CONFIRM:
+        self.active = True
+    elif self.active:
+      self._off_s += self.dt
+      if self._off_s + 1e-9 >= STOP_INTENT_RELEASE:
+        self.reset()
+    else:
+      self._on_s = 0.0
+    return self.active
 
 def get_requested_max_accel(v_ego):
   speed_fraction = float(np.clip(v_ego / A_CRUISE_MAX_CURVE_SPEED, 0.0, 1.0))
@@ -137,6 +179,7 @@ class LongitudinalPlanner:
     self.blotv2 = BLoTv2Supervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt)
     self.curve_speed_limiter = ModelCurveSpeedLimiter()
+    self.stop_intent = StopIntentLatch(dt)
 
     self.a_desired = init_a
     self.last_mpc_a_target = init_a
@@ -210,6 +253,7 @@ class LongitudinalPlanner:
       self.last_mpc_a_target = float(self.a_desired)
       self.blotv2.reset()
       self.lead_departure.reset()
+      self.stop_intent.reset()
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -249,7 +293,7 @@ class LongitudinalPlanner:
     self.j_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC[:-1], self.mpc.j_solution)
 
     # TODO counter is only needed because radar is glitchy, remove once radar is gone
-    self.fcw = self.mpc.crash_cnt > 2 and not sm['carState'].standstill
+    self.fcw = (self.mpc.crash_cnt > 2 and not sm['carState'].standstill) or policy.emergency
     if self.fcw:
       cloudlog.info("FCW triggered")
 
@@ -261,12 +305,13 @@ class LongitudinalPlanner:
                                               action_t=action_t)
     self.last_mpc_a_target = float(output_a_target_mpc)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
-    if self.lead_departure.update(
+    lead_departure_released = self.lead_departure.update(
       active=self.CP.openpilotLongitudinalControl and not long_control_off,
       standstill=sm['carState'].standstill,
       lead=lead,
       predicted_speed=model_predicted_speed(model_lead_0, lead),
-    ):
+    )
+    if lead_departure_released:
       # Begin only the MPC hold-release leg; preserve its acceleration target
       # and never override an e2e stop candidate below.
       output_should_stop_mpc = False
@@ -325,7 +370,13 @@ class LongitudinalPlanner:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+    raw_stop_intent = (
+      force_decel
+      or output_should_stop_e2e
+      or (projected_stop_intent(self.v_desired_trajectory) and not lead_departure_released)
+      or any(should_stop for _, _, should_stop in candidates)
+    )
+    self.output_should_stop = self.stop_intent.update(raw_stop_intent)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, BLOTV2_ACCEL_MAX)
 
     self.a_desired = float(self.output_a_target)
