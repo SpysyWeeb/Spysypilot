@@ -52,6 +52,17 @@ def get_steer_limited_by_safety(CP, CC, CO) -> bool:
   return abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
 
 
+def force_decel_requested(selfdrive_state, driver_monitoring_state) -> bool:
+  """Return the driver-monitoring/soft-disable emergency braking request.
+
+  ``controlsState`` is published by this process, so it is not available in
+  the controlsd SubMaster. Keep this decision on the inputs controlsd already
+  owns instead of creating a self-subscription cycle.
+  """
+  return bool(driver_monitoring_state.noResponseForceDecel or
+              selfdrive_state.state == State.softDisabling)
+
+
 class Controls:
   def __init__(self) -> None:
     self.params = Params()
@@ -251,6 +262,7 @@ class Controls:
       self.sm['radarState'].leadOne,
       self.sm.all_checks(['radarState']),
     )
+    force_decel = force_decel_requested(self.sm['selfdriveState'], self.sm['driverMonitoringState'])
     actuators.accel = float(self.LoC.update(
       CC.longActive,
       CS,
@@ -258,7 +270,7 @@ class Controls:
       long_plan.shouldStop,
       pid_accel_limits,
       lead,
-      emergency_stop=bool(long_plan.fcw or self.sm['controlsState'].forceDecel),
+      emergency_stop=bool(long_plan.fcw or force_decel),
     ))
 
     # Steering controller. The STOCK arm below is the existing stock block:
@@ -391,8 +403,7 @@ class Controls:
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)
     cs.ufAccelCmd = float(self.LoC.pid.f)
-    cs.forceDecel = bool(self.sm['driverMonitoringState'].noResponseForceDecel or
-                         (self.sm['selfdriveState'].state == State.softDisabling))
+    cs.forceDecel = force_decel_requested(self.sm['selfdriveState'], self.sm['driverMonitoringState'])
 
     # trigger the car's stock driver monitoring escalation
     CC.driverMonitoringEscalation = cs.forceDecel
