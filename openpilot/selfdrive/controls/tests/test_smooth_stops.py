@@ -38,7 +38,7 @@ class TestSmoothStopSettle(unittest.TestCase):
   def test_entry_is_continuous(self):
     controller = SmoothStopController()
     output = controller.settle(-0.05, 1.0, -0.4)
-    self.assertAlmostEqual(output, -0.4)
+    self.assertLessEqual(abs(output + 0.4), SETTLE_JERK * DT_CTRL + 1e-9)
 
   def test_settle_pressure_respects_jerk_limit(self):
     controller = SmoothStopController()
@@ -46,9 +46,32 @@ class TestSmoothStopSettle(unittest.TestCase):
     output = controller.settle(-0.05, 0.5, previous)
     self.assertLessEqual(abs(output - previous), SETTLE_JERK * DT_CTRL + 1e-9)
 
-  def test_stronger_plan_braking_passes_through(self):
+  def test_ordinary_plan_braking_is_profiled(self):
     controller = SmoothStopController()
-    self.assertEqual(controller.settle(-3.0, 1.0, -0.1), -3.0)
+    output = controller.settle(-3.0, 15.0, 0.0)
+    self.assertAlmostEqual(output, -SETTLE_JERK * DT_CTRL)
+
+  def test_emergency_plan_braking_passes_through(self):
+    controller = SmoothStopController()
+    self.assertEqual(controller.settle(-3.0, 15.0, -0.1, emergency=True), -3.0)
+
+  def test_limo_profile_reaches_plateau_then_releases(self):
+    controller = SmoothStopController()
+    lead = LeadObservation(True, distance=100.0, speed=15.0)
+    output = 0.0
+    high_speed_outputs = []
+    for _ in range(80):
+      output = controller.settle(-1.0, 15.0, output, lead)
+      high_speed_outputs.append(output)
+    self.assertAlmostEqual(high_speed_outputs[-1], -1.0, places=6)
+
+    release_outputs = []
+    for speed in (4.0, 3.0, 2.0, 1.0, 0.3, 0.15):
+      for _ in range(20):
+        output = controller.settle(-1.0, speed, output, lead)
+      release_outputs.append(output)
+    self.assertTrue(all(a <= b for a, b in zip(release_outputs, release_outputs[1:], strict=False)))
+    self.assertAlmostEqual(release_outputs[-1], -0.12, places=6)
 
   def test_stationary_vehicle_creep_ratchets_firmer(self):
     output = run_settle(SmoothStopController(), 2.0, v_ego=0.6)

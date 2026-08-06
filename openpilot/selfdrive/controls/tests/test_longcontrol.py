@@ -93,7 +93,20 @@ class TestSmoothStopLongControlIntegration(OpenpilotTestCase):
       LeadObservation(),
     )
     assert control.long_control_state == LongCtrlState.pid
-    assert output <= -0.4
+    assert -0.4 < output < 0.0
+
+  def test_emergency_stop_can_bypass_limo_profile(self):
+    control = long_control()
+    output = control.update(
+      True,
+      car_state(15.0),
+      -3.0,
+      True,
+      (-3.5, 2.0),
+      LeadObservation(),
+      emergency_stop=True,
+    )
+    assert output == -3.0
 
   def test_true_standstill_hands_off_to_stock_hold(self):
     control = long_control()
