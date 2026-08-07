@@ -24,9 +24,7 @@ Every test report must identify:
 - [x] Shared live/finite lead contract.
 - [x] Relative lead-physics unit coverage.
 - [x] Smooth Stops rolling-queue/dropout transition coverage.
-- [x] Limousine stop ramp/plateau/release and ordinary stronger-target
-  shaping coverage.
-- [x] Explicit emergency planner-braking pass-through coverage.
+- [x] Stronger planner braking pass-through coverage.
 - [x] MPC supervisor trigger, emergency, and slew coverage.
 - [x] Model lead trajectory shape/finite/fallback coverage.
 - [x] Low-speed radar override qualification coverage.
@@ -56,9 +54,6 @@ Replay must use the real production classes, not copied equations.
 
 - [ ] Baseline and BLoTv2 replay the same route timelines.
 - [ ] Smooth-stop routes cover no lead, stopped lead, and creeping queue.
-- [ ] Ordinary planned stops show the limousine pressure hill from intent
-  entry through standstill; only FCW/force-decel/collision-floor events may
-  bypass it.
 - [ ] Rolling-lead noise and radar-dropout motivating windows are reviewed.
 - [ ] Mild lead-braking onset improves without early phantom braking.
 - [ ] Hard lead braking has no collision-distance or peak-decel regression.

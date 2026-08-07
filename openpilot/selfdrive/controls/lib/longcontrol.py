@@ -51,16 +51,16 @@ class LongControl:
   def reset(self):
     self.pid.reset()
 
-  def update(self, active, CS, a_target, should_stop, accel_limits,
-             lead: LeadObservation | None = None, emergency_stop: bool = False):
+  def update(self, active, CS, a_target, should_stop, accel_limits, lead: LeadObservation | None = None):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     pos_limit = min(accel_limits[1], BLOTV2_ACCEL_MAX)
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = pos_limit
 
-    # `should_stop` is the planner's debounced stop intent. Smooth Stops owns
-    # the ordinary stop profile while the car is rolling; only the hold state
-    # is entered once the vehicle is truly stationary.
+    # Smooth Stops owns only a rolling final approach. This is safe from both
+    # pid and off: current openpilot has no separate starting command that can
+    # blip on the off -> pid edge. Once truly stopped, the stock stopping clamp
+    # takes over. Hold release remains debounced against one-frame plan flicker.
     if active and should_stop and self.long_control_state in (LongCtrlState.off, LongCtrlState.pid):
       stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo, CS.standstill)
     elif active and self.long_control_state == LongCtrlState.stopping:
@@ -90,13 +90,7 @@ class LongControl:
 
     else:  # LongCtrlState.pid
       if active and should_stop:
-        output_accel = self.smooth_stop.settle(
-          a_target,
-          CS.vEgo,
-          self.last_output_accel,
-          lead,
-          emergency=emergency_stop,
-        )
+        output_accel = self.smooth_stop.settle(a_target, CS.vEgo, self.last_output_accel, lead)
         self.reset()
       else:
         error = a_target - CS.aEgo

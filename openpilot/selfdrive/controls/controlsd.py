@@ -262,7 +262,6 @@ class Controls:
       self.sm['radarState'].leadOne,
       self.sm.all_checks(['radarState']),
     )
-    force_decel = force_decel_requested(self.sm['selfdriveState'], self.sm['driverMonitoringState'])
     actuators.accel = float(self.LoC.update(
       CC.longActive,
       CS,
@@ -270,7 +269,6 @@ class Controls:
       long_plan.shouldStop,
       pid_accel_limits,
       lead,
-      emergency_stop=bool(long_plan.fcw or force_decel),
     ))
 
     # Steering controller. The STOCK arm below is the existing stock block:
