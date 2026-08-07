@@ -47,18 +47,6 @@ no UI or user-facing Params and does not own target speed or braking. The
 implementation, signal mapping, and ownership boundaries are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 
-## BLoTv2 Smooth Stops
-
-**Status: in progress; awaiting field validation.** Ordinary planned stops now
-use a debounced stop intent and a single limousine profile from braking onset
-through standstill: jerk-limited ramp-in, requested-deceleration plateau, and
-progressive release from `4.0` to `0.15 m/s` toward a `0.12 m/s²` stop kiss.
-FCW, force-decel, and lead-collision safety floors remain explicit overrides;
-normal stronger planner targets no longer bypass the comfort profile. The
-implementation and remaining field gates are documented in
-[`docs/BLoTv2.md`](docs/BLoTv2.md#limousine-braking-profile) and
-[`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
-
 ## BLoTv2 ordinary cruise comfort
 
 **Status: in progress; awaiting field validation.** Route

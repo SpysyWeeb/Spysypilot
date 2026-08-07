@@ -13,15 +13,11 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   LongitudinalMpc,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (
-  STOP_INTENT_CONFIRM,
-  STOP_INTENT_RELEASE,
-  StopIntentLatch,
   get_cruise_accel,
   get_cruise_comfort_accel,
   get_max_accel,
   get_requested_max_accel,
   ordinary_cruise_comfort_enabled,
-  projected_stop_intent,
 )
 
 
@@ -166,31 +162,6 @@ class TestStrongCruiseEnvelope(unittest.TestCase):
       longitudinal_planner.J_CRUISE_VALS,
       [2.0, 1.6, 1.0, 0.6],
     )
-
-
-class TestStopIntent(unittest.TestCase):
-  def test_projected_mpc_stop_requires_a_consistent_tail(self):
-    self.assertTrue(projected_stop_intent([4.0, 2.0, 0.4, 0.3, 0.2]))
-    self.assertFalse(projected_stop_intent([4.0, 2.0, 0.4, 0.7, 0.2]))
-    self.assertFalse(projected_stop_intent([4.0, 2.0, float("nan"), 0.2, 0.1]))
-
-  def test_stop_intent_latch_debounces_and_holds_release(self):
-    latch = StopIntentLatch(dt=0.05)
-    for _ in range(round(STOP_INTENT_CONFIRM / 0.05) - 1):
-      self.assertFalse(latch.update(True))
-    self.assertTrue(latch.update(True))
-
-    for _ in range(round(STOP_INTENT_RELEASE / 0.05) - 1):
-      self.assertTrue(latch.update(False))
-    self.assertFalse(latch.update(False))
-
-  def test_stop_intent_reset_clears_state(self):
-    latch = StopIntentLatch(dt=0.05)
-    latch.update(True)
-    latch.update(True)
-    latch.reset()
-    self.assertFalse(latch.active)
-    self.assertFalse(latch.update(False))
 
 
 class TestOrdinaryCruiseComfort(unittest.TestCase):

@@ -27,7 +27,7 @@ The product target is **Smooth. Swift. Strong.**
 | Lead trajectory and obstacle optimization | stock Acados longitudinal MPC |
 | MPC response cost and dynamic headway | `BLoTv2Supervisor` |
 | Cruise acceleration target | longitudinal planner |
-| Ordinary stop profile and standstill handoff | `SmoothStopController` |
+| Final rolling landing | `SmoothStopController` |
 | Standstill hold | stock `LongCtrlState.stopping` |
 | Acceleration tracking | stock longitudinal PID |
 | Effective Chill/Experimental mode | `selfdrived` |
@@ -38,8 +38,7 @@ No downstream layer compensates by silently taking ownership of another
 layer's decision. In particular:
 
 - the supervisor never commands acceleration;
-- Smooth Stops shapes ordinary planner braking; explicit FCW, force-decel, and
-  lead-collision floors can override it;
+- Smooth Stops never weakens a stronger planner brake request;
 - Conditional Experimental Mode never commands a speed, acceleration, brake,
   or stop point;
 - BLoTv2 does not raise opendbc or panda limits;
@@ -62,7 +61,7 @@ radarState -- live/finite lead observation --> necessity supervisor
                         |
                  longitudinalPlan
                         |
-          Smooth Stops ordinary-stop profile
+          Smooth Stops final-approach policy
                         |
                 stock longitudinal PID/hold
                         |
@@ -96,30 +95,27 @@ owner.
 
 ## Smooth
 
-### Limousine braking profile
+### Entry-anchored landing
 
-The planner publishes a debounced stop intent before terminal standstill.
-While that intent is active, longcontrol remains in the PID state and
-`SmoothStopController` owns the ordinary longitudinal command from the first
-braking frame through the hold handoff. It applies the requested deceleration
-with a `1.5 m/s³` jerk limit, holds the requested braking level through the
-main approach, and releases it linearly from `4.0 m/s` to `0.15 m/s`, reaching
-the `0.12 m/s²` stop kiss before standstill. This is the pressure hill of a
-limousine stop: ramp in, plateau, then progressively release.
+When the plan wants a stop but ego is still rolling, longcontrol stays in the
+PID state and enters a settle policy. It latches the current command and entry
+speed, then releases pressure continuously toward a `0.12 m/s²` stop kiss as
+speed reaches zero.
 
-The stock hold clamp is entered only below `0.05 m/s`, or below `0.15 m/s`
-when the car itself reports standstill. Ordinary planner commands no longer
-bypass this profile merely because they are stronger than the current output.
-The stop intent latch confirms raw model/MPC stop evidence for `0.15 s` and
-holds it for `0.35 s` after a transient clear.
+The stock hold clamp is entered only below `0.05 m/s`, or below `0.15 m/s` when
+the car itself reports standstill. This avoids applying the full hold ramp to a
+moving vehicle. It also works on an off-to-engaged rolling stop because current
+stock openpilot no longer has a separate fixed starting command on that edge.
 
-### Safety authority is preserved
+### Planner authority is preserved
 
-The ordinary profile still honors relative lead-closing deceleration and
-anti-creep safety floors. FCW, forced deceleration, and the BLoTv2 lead-
-collision emergency signal pass the stronger planner command through without
-waiting for the comfort jerk ramp. A normal stronger planner target is shaped
-by the limousine profile instead of being treated as an emergency by default.
+Settle pressure is jerk-limited for comfort, but the returned command is:
+
+```text
+min(settle_command, planner_a_target)
+```
+
+A stronger MPC or e2e brake request therefore passes through immediately.
 
 ### Rolling-queue behavior
 
@@ -234,7 +230,6 @@ what caused it.
 | Stop evidence | BLoTv2 signal and use |
 |---|---|
 | Direct final-approach intent | `modelV2.action.shouldStop` |
-| Projected MPC intent | final three MPC speed samples at or below `0.5 m/s` with a non-increasing tail |
 | Strict prediction | `position.x[-1]` is inside a `5.0 s` ego-speed horizon and `velocity.x[-1] <= 1.0 m/s` |
 | High-speed early prediction | above `13.0 m/s`, the path is inside a `1.3 m/s²` comfort-stop envelope plus `0.5 s` response distance, terminal speed is at most `6.5 m/s` and `35%` of ego speed, and `action.desiredAcceleration <= -0.5 m/s²` |
 | High-speed filter hint | inside an `8.0 s` horizon, terminal speed at most `55%` of ego speed, and desired acceleration at most `-0.25 m/s²`; its `0.45` confidence is below entry qualification and can neither switch modes alone nor sustain an active latch |
@@ -429,8 +424,7 @@ not a fixed fraction of the positive acceleration ceiling, so no speculative
 cost retune is needed merely to expose more positive authority. The resulting
 launch feel, delivered acceleration, saturation duty, and speed overshoot still
 require route review and owner field validation. Strong braking remains
-available because explicit FCW, force-decel, and lead-collision safety floors
-bypass the ordinary comfort ramp.
+available because Smooth Stops passes stronger plan braking through.
 
 Aggressive personality retains BLoT's `1.0 s` base follow setting; standard and
 relaxed remain `1.45 s` and `1.75 s`. Dynamic onset can only add headway.
@@ -451,11 +445,7 @@ mandatory field gate.
 Automated coverage includes:
 
 - finite/live lead construction and relative-motion physics;
-- stop-intent confirmation/release debounce and projected-MPC stop-tail
-  qualification;
-- limousine ramp, plateau, release, jerk bounds, and ordinary stronger-target
-  shaping;
-- explicit emergency pass-through and relative lead-collision floors;
+- settle entry continuity, jerk bounds, and stronger-plan pass-through;
 - anti-creep progress, noisy rolling-lead thresholds, radar dropout, and
   stopped-to-moving queue transitions;
 - true-stop handoff and hold-release debounce;

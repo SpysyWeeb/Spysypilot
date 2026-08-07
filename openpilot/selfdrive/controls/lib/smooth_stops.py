@@ -1,9 +1,8 @@
-"""BLoTv2 limousine-stop profile and standstill handoff.
+"""BLoTv2 final-approach and standstill-handoff controller.
 
-An ordinary planned stop is shaped from stop-intent entry through standstill:
-braking ramps in, holds the planner's requested deceleration, and releases
-progressively near zero speed. Collision/driver safety overrides remain able
-to pass through stronger braking.
+Smooth Stops owns only the last low-speed landing. The planner remains the
+collision-avoidance authority: any stronger planner braking passes through
+immediately.
 """
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_CTRL
@@ -17,15 +16,10 @@ STANDSTILL_SPEED = 0.05
 STANDSTILL_HOLD_SPEED = 0.15
 HOLD_RELEASE_FRAMES = 10
 
-# Limousine profile.
+# Entry-anchored landing taper.
 STOP_KISS_DECEL = 0.12
-LIMO_BRAKE_JERK = 1.5
-LIMO_RELEASE_START_SPEED = 4.0
-LIMO_RELEASE_END_SPEED = 0.15
-
-# Keep the old name available to downstream tests/tools while making the
-# profile's lower jerk explicit.
-SETTLE_JERK = LIMO_BRAKE_JERK
+MIN_ENTRY_SPEED = 0.1
+SETTLE_JERK = 2.5
 
 # Relative-frame lead margin and anti-creep.
 STOP_GAP_MARGIN = 2.5
@@ -44,7 +38,7 @@ CREEP_DECAY_RATE = 1.0
 
 
 class SmoothStopController:
-  """Shape ordinary stop braking and hand off cleanly to the stock hold state."""
+  """Feather a rolling stop to zero speed before entering the stock hold state."""
 
   def __init__(self):
     self._no_stop_frames = 0
@@ -54,6 +48,8 @@ class SmoothStopController:
     self._v_min = float("inf")
     self._stall_s = 0.0
     self._creep_decel = 0.0
+    self._entry_v = 0.0
+    self._entry_decel = 0.0
     self._lead_moving = False
     self._lead_dropout_s = 0.0
 
@@ -87,34 +83,26 @@ class SmoothStopController:
     return self._lead_moving
 
   def settle(self, a_target: float, v_ego: float, last_output: float,
-             lead: LeadObservation | None = None, emergency: bool = False) -> float:
+             lead: LeadObservation | None = None) -> float:
     lead = lead if lead is not None else LeadObservation()
 
-    # Ordinary braking follows the desired deceleration, then releases it
-    # progressively over the final ~9 mph. The jerk limit applies both to
-    # brake application and release, producing a smooth pressure hill rather
-    # than a late step into the stock stopping clamp.
-    requested_decel = max(-float(a_target), STOP_KISS_DECEL)
-    if v_ego <= LIMO_RELEASE_END_SPEED:
-      release_fraction = 0.0
-    else:
-      release_fraction = min(
-        max((v_ego - LIMO_RELEASE_END_SPEED) /
-            (LIMO_RELEASE_START_SPEED - LIMO_RELEASE_END_SPEED), 0.0),
-        1.0,
-      )
-    a_profile = -(
-      STOP_KISS_DECEL + (requested_decel - STOP_KISS_DECEL) * release_fraction
+    # Latch the pressure present at settle entry and release it continuously as
+    # speed falls. This gives a no-step entry and the low residual "kiss."
+    if self._entry_v <= 0.0:
+      self._entry_v = max(v_ego, MIN_ENTRY_SPEED)
+      self._entry_decel = max(-last_output, STOP_KISS_DECEL)
+    landing = STOP_KISS_DECEL + (self._entry_decel - STOP_KISS_DECEL) * min(
+      max(v_ego, 0.0) / self._entry_v, 1.0,
     )
+    a_settle = -landing
 
-    # Lead collision geometry is a safety floor, not a comfort request. It is
-    # allowed to override the limo profile when relative closing requires it.
+    # Add only the braking required by relative closing motion. The old
+    # absolute-ego-speed floor over-braked equal-speed creeping queues.
     creep_rate = ANTI_CREEP_RATE
     if lead.present:
-      a_safety = -closing_decel_requirement(
+      a_settle = min(a_settle, -closing_decel_requirement(
         v_ego, lead, STOP_GAP_MARGIN, MIN_GAP_BUDGET,
-      )
-      a_profile = min(a_profile, a_safety)
+      ))
       gap = max(lead.distance - STOP_GAP_MARGIN, MIN_GAP_BUDGET)
       urgency = min(max(1.0 - gap / URGENT_GAP, 0.0), 1.0)
       creep_rate *= 1.0 + urgency * (URGENT_RATE_MULT - 1.0)
@@ -134,12 +122,10 @@ class SmoothStopController:
         self._stall_s += DT_CTRL
       self._creep_decel = max(self._creep_decel, creep_rate * self._stall_s)
 
-    a_profile = max(a_profile - self._creep_decel, ACCEL_MIN)
+    a_settle = max(a_settle - self._creep_decel, ACCEL_MIN)
 
-    if emergency:
-      # FCW, force-decel, or an equivalent collision/emergency signal owns the
-      # command. The ordinary profile must never delay a safety intervention.
-      return min(float(a_target), a_profile)
-
-    step = LIMO_BRAKE_JERK * DT_CTRL
-    return min(max(a_profile, last_output - step), last_output + step)
+    # Jerk-limit only comfort pressure. Stronger planner braking is an immediate
+    # pass-through so Smooth Stops cannot weaken collision avoidance.
+    step = SETTLE_JERK * DT_CTRL
+    a_settle = min(max(a_settle, last_output - step), last_output + step)
+    return min(a_settle, a_target)
