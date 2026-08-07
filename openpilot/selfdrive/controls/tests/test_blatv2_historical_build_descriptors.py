@@ -19,7 +19,7 @@ REGISTRY_PATH = (
   / "historical_build_descriptors.json"
 )
 REVIEWED_REGISTRY_SHA256 = (
-  "0657f4fae4b51b402090ec61aa2ba5fe7443ebfdb3c6db42b152bbac7b4db225"
+  "23e8646bf149b64814d956900183e7983582f9554170a428afc2db1e6e7c350c"
 )
 FIRST_DESCRIPTOR_SHA256 = (
   "8ce8026f4ff30b1036206046dcd96aa3b27a47f61f21673a2629154379769684"
@@ -31,6 +31,7 @@ INTENDED_ROOT_COMMITS = {
   "0cf7aeda81d66ca340f5f80ec581745066818473",
   "22b915a7ab7a1d2963c12db9cc6a48bda3be708f",
   "2447667ea36160b7706b8ab919bc2d4e71b54f56",
+  "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
   "34357419f38b84e2de90bc9cbfdfb5704a282627",
   "36bcc1be838138d39e90a70e8ba5277dc87e04a3",
   "3849a2f72e8fe1902dc4b91c4a3b98384295103a",
@@ -137,6 +138,29 @@ def test_combo_8cc_route_build_has_exact_reviewed_descriptor() -> None:
     "steer_max": 409,
     "steer_step": 1,
     "superproject_commit": "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
+    "supported_vehicle_identity": "HYUNDAI_PALISADE",
+  }
+
+
+def test_combo_293_route_build_has_exact_reviewed_descriptor() -> None:
+  descriptor = load_reviewed_registry(REGISTRY_PATH).resolve(
+    "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
+  )
+  assert descriptor is not None
+  assert descriptor.to_dict() == {
+    "driver_allowance": 50,
+    "driver_factor": 1,
+    "driver_multiplier": 2,
+    "log_schema_blob": "d40096ff46dc7d1b0dec3698e3e9c77a63b3fb72",
+    "opendbc_commit": "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    "panda_commit": "7f245a890f7bc00712ca4ebf903190a084c7f86b",
+    "production_envelope_verified": True,
+    "rack_rate_resolution_deg_s": 4.0,
+    "steer_delta_down": 7,
+    "steer_delta_up": 4,
+    "steer_max": 409,
+    "steer_step": 1,
+    "superproject_commit": "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
     "supported_vehicle_identity": "HYUNDAI_PALISADE",
   }
 

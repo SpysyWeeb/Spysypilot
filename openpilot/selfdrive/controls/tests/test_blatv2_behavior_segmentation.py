@@ -43,6 +43,10 @@ def config() -> SegmentationConfig:
     maximum_sample_gap_s=0.15,
     turn_in_crossing_fraction=0.5,
     release_onset_fraction=0.9,
+    maximum_raw_phase_spans=65_536,
+    maximum_phase_windows=4_096,
+    maximum_event_locators=4_096,
+    maximum_event_phase_attachments=65_536,
   )
 
 

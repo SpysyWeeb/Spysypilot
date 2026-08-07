@@ -39,6 +39,11 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
   MetricPreference,
   build_candidate_grid,
 )
+from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
+  make_exact_stock_behavior_replay_core,
+  make_modular_behavior_replay_core,
+  reviewed_replay_core_identity,
+)
 from openpilot.selfdrive.controls.lib.blatv2.behavior_segmentation import SegmentationConfig
 from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
   BehaviorLearningTransactionResult,
@@ -52,7 +57,8 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_transaction import (
   ControllerReplayRequest,
   DecodedBehaviorRoute,
   QualificationDisposition,
-  run_behavior_learning_transaction,
+  _run_behavior_learning_transaction_unchecked_for_test as run_behavior_learning_transaction,
+  run_behavior_learning_transaction as run_reviewed_behavior_learning_transaction,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationParameters,
@@ -60,6 +66,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
 )
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import RackMappingSnapshot
+from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import ProvisionalRackDynamics
 
 
 def physical_profile(*, qualified: bool = True) -> VehicleCalibrationProfile:
@@ -83,9 +90,9 @@ def physical_profile(*, qualified: bool = True) -> VehicleCalibrationProfile:
       moving_sample_count=3_000,
       breakaway_support_s=30.0,
       breakaway_sample_count=300,
-      validation_count=1_000,
-      inverse_calibration_validation_rms=0.01,
-      breakaway_validation_rms=0.01,
+      cross_fit_route_count=1_000,
+      full_fit_candidate_rms=0.01,
+      breakaway_full_fit_candidate_rms=0.01,
     )
     for speed in (0.0, 30.0)
   )
@@ -223,6 +230,10 @@ def segmentation_config() -> SegmentationConfig:
     maximum_sample_gap_s=0.15,
     turn_in_crossing_fraction=0.5,
     release_onset_fraction=0.9,
+    maximum_raw_phase_spans=65_536,
+    maximum_phase_windows=4_096,
+    maximum_event_locators=4_096,
+    maximum_event_phase_attachments=65_536,
   )
 
 
@@ -434,6 +445,68 @@ def wait_for_processes_gone(pids: tuple[int, ...], timeout_s: float = 3.0) -> bo
 
 
 class TestBehaviorTransaction(unittest.TestCase):
+  def test_public_transaction_rejects_opponents_with_different_dynamics(self):
+    common = {
+      "source_openpilot_commit": "1" * 40,
+      "opendbc_commit": "2" * 40,
+      "panda_commit": "3" * 40,
+    }
+    stock_dynamics = ProvisionalRackDynamics(4000.0, 10.0, 4.0, "stock")
+    candidate_dynamics = replace(stock_dynamics, rack_gain_deg_s2_per_torque=3999.0)
+    stock = make_exact_stock_behavior_replay_core(
+      reviewed_replay_core_identity(exact_stock=True, **common),
+      provisional_dynamics=stock_dynamics,
+    )
+    candidate = make_modular_behavior_replay_core(
+      reviewed_replay_core_identity(exact_stock=False, **common),
+      provisional_dynamics=candidate_dynamics,
+    )
+
+    with self.assertRaisesRegex(
+      BehaviorTransactionError,
+      "identical provisional rack dynamics",
+    ):
+      run_reviewed_behavior_learning_transaction(
+        route_evidence_artifacts=(),
+        decode_route_evidence=lambda artifact, _: artifact,
+        physical_profile=physical_profile(),
+        accepted_policy=None,
+        search_center_policy=BehaviorPolicy(10.0, 1.0),
+        exact_stock=stock,
+        currently_accepted=None,
+        candidate=candidate,
+        segmentation_config=segmentation_config(),
+        gate_spec=gate_spec(),
+      )
+
+  def test_public_transaction_rejects_callback_spoofing_reviewed_stock_hash(self):
+    callback = core_callback()
+    stock_identity = reviewed_replay_core_identity(
+      exact_stock=True,
+      source_openpilot_commit="1" * 40,
+      opendbc_commit="2" * 40,
+      panda_commit="3" * 40,
+    )
+    stock = BehaviorReplayCore(stock_identity, callback)
+    _ignored_stock, accepted, candidate = cores()
+
+    with self.assertRaisesRegex(
+      BehaviorTransactionError,
+      "requires reviewed replay-core adapters",
+    ):
+      run_reviewed_behavior_learning_transaction(
+        route_evidence_artifacts=tuple(decoded_route(index) for index in range(4)),
+        decode_route_evidence=lambda artifact, _: artifact,
+        physical_profile=physical_profile(),
+        accepted_policy=BehaviorPolicy(10.0, 1.0),
+        search_center_policy=BehaviorPolicy(10.0, 1.0),
+        exact_stock=stock,
+        currently_accepted=accepted,
+        candidate=candidate,
+        segmentation_config=segmentation_config(),
+        gate_spec=gate_spec(),
+      )
+
   def test_every_worker_count_promptly_reaps_blocked_workers_on_abort(self):
     context = multiprocessing.get_context("fork")
     for worker_count in (1, 4):
@@ -857,7 +930,11 @@ class TestBehaviorTransaction(unittest.TestCase):
     result = run(tuple(decoded_route(index) for index in range(4)))
     self.assertEqual(
       result.sha256,
-      "c5bf75f2676ef305b6bea0ecd3255910c57a467e5955c677157cd6f0b99d7dfc",
+      # Segmentation schema 2 adds fail-closed span/event work limits to the
+      # transaction identity; profile schema 3 also gives full-fit/cross-fit
+        # evidence honest names, so the reviewed prebatch fixture intentionally
+      # changed even though this route remains below every limit.
+      "f7e997fbd745104d3e6110fca07a0c1294ed8f494e97f4e097c8ac8529d54803",
     )
 
   def test_validation_replays_only_the_frozen_training_winner(self):

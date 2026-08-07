@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import math
 from pathlib import Path
@@ -21,6 +22,7 @@ from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION,
   ProvisionalRackDynamics,
+  RackDynamicsNode,
   RuntimeVehicleCompatibility,
   RuntimeVehicleCompatibilityError,
   build_runtime_vehicle_bundle,
@@ -546,14 +548,70 @@ def _test_committed_provisional_seed_is_explicit_and_unqualified(
   )
   bundle = build_palisade(palisade_cp, dynamics)
 
-  assert PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION == 1
+  assert PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION == 2
   assert dynamics.provenance
   assert not bundle.seed_profile.qualified
   assert all(
     not node.parameters.qualified
     for node in bundle.seed_profile.nodes
   )
-  assert "Never eligible for actuation" in dynamics.provenance
+  assert "not an approved artifact" in dynamics.provenance
+  assert "owner field testing" in dynamics.provenance
+
+  expected = (
+    (0.0, 4000.0, 10.0),
+    (5.0, 4000.0, 10.0),
+    (10.0, 3200.0, 14.0),
+    (15.0, 3200.0, 14.0),
+    (20.0, 3200.0, 14.0),
+    (30.0, 3200.0, 14.0),
+  )
+  assert tuple(
+    (
+      node.speed_mps,
+      node.rack_gain_deg_s2_per_torque,
+      node.rack_damping_per_s,
+    )
+    for node in dynamics.nodes
+  ) == expected
+  assert dynamics.parameters_at_speed(7.5) == (3600.0, 12.0)
+  assert tuple(
+    (
+      node.speed_mps,
+      node.parameters.rack_gain_deg_s2_per_torque,
+      node.parameters.rack_damping_per_s,
+    )
+    for node in bundle.seed_profile.nodes
+  ) == expected
+
+
+def _test_provisional_speed_schedule_fails_closed() -> None:
+  valid_nodes = tuple(
+    RackDynamicsNode(speed, 4000.0, 10.0)
+    for speed in (0.0, 5.0, 10.0, 15.0, 20.0, 30.0)
+  )
+  with _assert_raises(RuntimeVehicleCompatibilityError):
+    ProvisionalRackDynamics(
+      4000.0,
+      10.0,
+      4.0,
+      "explicit",
+      valid_nodes[:-1],
+    )
+  replaced = replace(
+    ProvisionalRackDynamics(
+      4000.0,
+      10.0,
+      4.0,
+      "explicit",
+      valid_nodes,
+    ),
+    rack_gain_deg_s2_per_torque=3200.0,
+  )
+  assert all(
+    node.rack_gain_deg_s2_per_torque == 3200.0
+    for node in replaced.nodes
+  )
 
 
 def _test_provisional_seed_schema_fails_closed(
@@ -776,6 +834,9 @@ class TestBlatV2RuntimeVehicle(unittest.TestCase):
           self.tmp_path,
           payload,
         )
+
+  def test_provisional_speed_schedule_fails_closed(self):
+    _test_provisional_speed_schedule_fails_closed()
 
   def test_production_adapter_has_no_platform_or_actuator_literals(self):
     _test_production_adapter_has_no_platform_or_actuator_literals()

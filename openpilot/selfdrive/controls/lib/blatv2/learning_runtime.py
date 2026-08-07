@@ -30,12 +30,17 @@ from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   apply_torque_envelope,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
+  CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
   CalibrationLearningCoordinator,
   CalibrationLearningFinalization,
   CalibrationLearningLifecycleState,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CALIBRATION_EVIDENCE_SCHEMA_VERSION,
   CalibrationSampleDisposition,
+)
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
   ActuatorBoundary,
@@ -574,33 +579,55 @@ class PersistentLearningRuntime:
         evidence_bytes,
         candidate_provenance=CASUAL_DRIVING_CANDIDATE_PROVENANCE,
       )
-      finalization = coordinator.finalize()
-      if finalization.manifest_bytes != manifest_bytes:
+      manifest = json.loads(manifest_bytes)
+      if (
+        type(manifest) is not dict
+        or manifest_bytes != json.dumps(
+          manifest,
+          sort_keys=True,
+          separators=(",", ":"),
+        ).encode("utf-8")
+        or manifest.get("artifact_schema_version")
+        != CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION
+        or manifest.get("evidence_schema_version")
+        != CALIBRATION_EVIDENCE_SCHEMA_VERSION
+        or manifest.get("evidence_sha256")
+        != hashlib.sha256(evidence_bytes).hexdigest()
+        or manifest.get("seed_profile_sha256")
+        != coordinator.seed_profile_sha256
+        or manifest.get("vehicle_identity") != coordinator.vehicle_identity
+      ):
         raise LearningRestoreError(
           "stored learner manifest does not identify the exact evidence",
         )
-      selected_json = finalization.selected_profile_json
-      selected_identity = finalization.selected_profile_sha256
-      if selected_json is not None:
-        if selected_identity is None:
-          raise AssertionError("selected profile JSON lacks its canonical identity")
+      selected_manifest = manifest.get("selected_profile")
+      if selected_manifest is not None:
+        if type(selected_manifest) is not dict:
+          raise LearningRestoreError("stored selected profile manifest is invalid")
+        selected_identity = selected_manifest.get("profile_sha256")
+        if type(selected_identity) is not str:
+          raise LearningRestoreError("stored selected profile identity is invalid")
         selected_path = artifact_paths.selected_profile(selected_identity)
         if (
           not selected_path.is_file()
-          or selected_path.read_bytes() != selected_json
+          or hashlib.sha256(selected_path.read_bytes()).hexdigest()
+          != selected_identity
         ):
           raise LearningRestoreError(
             "stored selected profile is missing or does not match manifest",
           )
-      candidate_json = finalization.candidate_profile_json
-      candidate_identity = finalization.candidate_profile_sha256
-      if candidate_json is not None:
-        if candidate_identity is None:
-          raise AssertionError("candidate JSON lacks its canonical identity")
+      candidate_manifest = manifest.get("candidate_profile")
+      if candidate_manifest is not None:
+        if type(candidate_manifest) is not dict:
+          raise LearningRestoreError("stored candidate profile manifest is invalid")
+        candidate_identity = candidate_manifest.get("profile_sha256")
+        if type(candidate_identity) is not str:
+          raise LearningRestoreError("stored candidate profile identity is invalid")
         candidate_path = artifact_paths.candidate(candidate_identity)
         if (
           not candidate_path.is_file()
-          or candidate_path.read_bytes() != candidate_json
+          or hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+          != candidate_identity
         ):
           raise LearningRestoreError(
             "stored learner candidate is missing or does not match manifest",
@@ -846,7 +873,12 @@ class PersistentLearningRuntime:
     self.last_live_mapping_valid = True
     return mapping
 
-  def ingest(self, frame: MeasuredLearningFrame) -> bool:
+  def ingest(
+    self,
+    frame: MeasuredLearningFrame,
+    *,
+    source_coordinate: CalibrationIngestionCoordinate | None = None,
+  ) -> bool:
     if (
       self.coordinator.state
       is not CalibrationLearningLifecycleState.ONROAD
@@ -1062,6 +1094,7 @@ class PersistentLearningRuntime:
       upstream_rejection = CalibrationSampleDisposition.MEASUREMENT_WARMUP_OR_DISCONTINUITY
     accepted = self.coordinator.ingest(
       sample,
+      source_coordinate=source_coordinate,
       upstream_rejection=upstream_rejection,
     )
     self.last_sample_accepted = accepted

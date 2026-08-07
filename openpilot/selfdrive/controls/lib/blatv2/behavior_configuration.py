@@ -29,6 +29,10 @@ _SEGMENTATION_KEYS = frozenset((
   "directHandoffMaxNeutralDurationS",
   "directHandoffMinPeakCurvature1pm",
   "maximumPhaseExtensionS",
+  "maximumRawPhaseSpans",
+  "maximumPhaseWindows",
+  "maximumEventLocators",
+  "maximumEventPhaseAttachments",
   "maximumSampleGapS",
   "minimumPhaseDurationS",
   "minimumPhaseSamples",
@@ -81,8 +85,15 @@ def load_behavior_segmentation_config(
     raise ValueError("behavior segmentation keys do not match the schema")
   if type(payload["schemaVersion"]) is not int:
     raise ValueError("segmentation schema version must be integer")
-  if type(payload["minimumPhaseSamples"]) is not int:
-    raise ValueError("minimum phase samples must be integer")
+  integer_fields = (
+    "minimumPhaseSamples",
+    "maximumRawPhaseSpans",
+    "maximumPhaseWindows",
+    "maximumEventLocators",
+    "maximumEventPhaseAttachments",
+  )
+  if any(type(payload[name]) is not int for name in integer_fields):
+    raise ValueError("segmentation sample and work limits must be integers")
   return SegmentationConfig(
     schema_version=payload["schemaVersion"],
     reference_zero_threshold_1pm=_number(
@@ -115,4 +126,8 @@ def load_behavior_segmentation_config(
     maximum_sample_gap_s=_number(payload, "maximumSampleGapS"),
     turn_in_crossing_fraction=_number(payload, "turnInCrossingFraction"),
     release_onset_fraction=_number(payload, "releaseOnsetFraction"),
+    maximum_raw_phase_spans=payload["maximumRawPhaseSpans"],
+    maximum_phase_windows=payload["maximumPhaseWindows"],
+    maximum_event_locators=payload["maximumEventLocators"],
+    maximum_event_phase_attachments=payload["maximumEventPhaseAttachments"],
   )

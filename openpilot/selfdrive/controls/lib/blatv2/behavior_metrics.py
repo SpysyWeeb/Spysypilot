@@ -8,7 +8,8 @@ hidden tuning constants.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
@@ -407,14 +408,58 @@ def _undefined_disposition(reasons: tuple[str, ...]) -> MetricDisposition:
   return MetricDisposition.COVERAGE_EXCLUDED
 
 
-def _rates(samples: tuple[BehaviorSample, ...], field: str) -> tuple[tuple[float, float], ...]:
-  result: list[tuple[float, float]] = []
-  for left, right in zip(samples, samples[1:], strict=False):
-    dt_s = (right.mono_time_ns - left.mono_time_ns) * 1e-9
-    if dt_s <= 0.0:
+@dataclass(frozen=True, slots=True)
+class _SampleSeries:
+  iterator_factory: Callable[[], Iterator[BehaviorSample]]
+  count: int
+  first: BehaviorSample | None
+  last: BehaviorSample | None
+
+  def __iter__(self) -> Iterator[BehaviorSample]:
+    return self.iterator_factory()
+
+
+def _inspect_series(
+  iterator_factory: Callable[[], Iterator[BehaviorSample]],
+) -> _SampleSeries:
+  count = 0
+  first: BehaviorSample | None = None
+  last: BehaviorSample | None = None
+  for sample in iterator_factory():
+    if first is None:
+      first = sample
+    last = sample
+    count += 1
+  return _SampleSeries(iterator_factory, count, first, last)
+
+
+def _clean_sample_factory(
+  samples: Sequence[BehaviorSample],
+) -> tuple[Callable[[], Iterator[BehaviorSample]], int | None]:
+  def clean() -> Iterator[BehaviorSample]:
+    for sample in samples:
+      if sample.driver_intervention_onset:
+        break
+      if sample.delivered_frame_eligible:
+        yield sample
+
+  intervention = next(
+    (sample.mono_time_ns for sample in samples if sample.driver_intervention_onset),
+    None,
+  )
+  return clean, intervention
+
+
+def _rates(samples: _SampleSeries, field: str) -> Iterator[tuple[float, float]]:
+  left: BehaviorSample | None = None
+  for right in samples:
+    if left is None:
+      left = right
       continue
-    result.append((right.route_time_s, (getattr(right, field) - getattr(left, field)) / dt_s))
-  return tuple(result)
+    dt_s = (right.mono_time_ns - left.mono_time_ns) * 1e-9
+    if dt_s > 0.0:
+      yield right.route_time_s, (getattr(right, field) - getattr(left, field)) / dt_s
+    left = right
 
 
 def _rms(values: Iterable[float]) -> float | None:
@@ -426,13 +471,19 @@ def _rms(values: Iterable[float]) -> float | None:
 
 def _rate_rms(
   name: BehaviorMetricName,
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   field: str,
 ) -> MetricValue:
-  rates = _rates(samples, field)
-  value = _rms(rate for _, rate in rates)
+  count = 0
+  def squares() -> Iterator[float]:
+    nonlocal count
+    for _, rate in _rates(samples, field):
+      count += 1
+      yield rate * rate
+  total = math.fsum(squares())
+  value = math.sqrt(total / count) if count else None
   return (
-    _metric(name, value, len(rates))
+    _metric(name, value, count)
     if value is not None
     else _metric(name, None, 0, "insufficient_adjacent_samples")
   )
@@ -440,25 +491,27 @@ def _rate_rms(
 
 def _worst_burst(
   name: BehaviorMetricName,
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   field: str,
   burst_window_s: float,
 ) -> MetricValue:
-  rates = _rates(samples, field)
-  if not rates or samples[-1].route_time_s - samples[0].route_time_s < burst_window_s:
+  if samples.first is None or samples.last is None or samples.count < 2:
+    return _metric(name, None, 0, "window_shorter_than_burst_interval")
+  if samples.last.route_time_s - samples.first.route_time_s < burst_window_s:
     return _metric(name, None, 0, "window_shorter_than_burst_interval")
   worst: float | None = None
   valid_windows = 0
-  left = 0
   squared_sum = 0.0
-  earliest_sample_time_s = samples[0].route_time_s
-  for end, (end_time_s, value) in enumerate(rates):
+  active: deque[tuple[float, float]] = deque()
+  earliest_sample_time_s = samples.first.route_time_s
+  for end_time_s, value in _rates(samples, field):
     squared_sum += value * value
+    active.append((end_time_s, value))
     start_time_s = end_time_s - burst_window_s
-    while left <= end and rates[left][0] <= start_time_s:
-      squared_sum -= rates[left][1] * rates[left][1]
-      left += 1
-    count = end - left + 1
+    while active and active[0][0] <= start_time_s:
+      _, removed = active.popleft()
+      squared_sum -= removed * removed
+    count = len(active)
     if count <= 0 or end_time_s - earliest_sample_time_s < burst_window_s:
       continue
     rms = math.sqrt(max(0.0, squared_sum) / count)
@@ -473,41 +526,53 @@ def _worst_burst(
 
 def _chatter(
   name: BehaviorMetricName,
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   field: str,
   threshold: float,
 ) -> MetricValue:
-  rates = _rates(samples, field)
-  significant_signs = [
-    1 if rate > 0.0 else -1
-    for _, rate in rates
-    if abs(rate) >= threshold
-  ]
-  duration_s = samples[-1].route_time_s - samples[0].route_time_s if len(samples) >= 2 else 0.0
+  previous_sign: int | None = None
+  significant_count = 0
+  reversals = 0
+  for _, rate in _rates(samples, field):
+    if abs(rate) < threshold:
+      continue
+    sign = 1 if rate > 0.0 else -1
+    if previous_sign is not None and sign != previous_sign:
+      reversals += 1
+    previous_sign = sign
+    significant_count += 1
+  duration_s = (
+    samples.last.route_time_s - samples.first.route_time_s
+    if samples.first is not None and samples.last is not None and samples.count >= 2
+    else 0.0
+  )
   if duration_s <= 0.0:
     return _metric(name, None, 0, "insufficient_duration")
-  reversals = sum(
-    right != left
-    for left, right in zip(significant_signs, significant_signs[1:], strict=False)
-  )
   return _metric(
     name,
     reversals / duration_s,
-    len(significant_signs),
+    significant_count,
   )
 
 
-def _direction_and_peak(samples: tuple[BehaviorSample, ...]) -> tuple[float, float, int] | None:
-  if not samples:
+def _direction_and_peak(samples: _SampleSeries) -> tuple[float, float, int] | None:
+  if not samples.count:
     return None
-  peak_index = max(range(len(samples)), key=lambda index: abs(samples[index].anchored_curvature_1pm))
-  peak = samples[peak_index].anchored_curvature_1pm
+  peak_index = 0
+  peak = 0.0
+  peak_magnitude = -1.0
+  for index, sample in enumerate(samples):
+    magnitude = abs(sample.anchored_curvature_1pm)
+    if magnitude > peak_magnitude:
+      peak_index = index
+      peak = sample.anchored_curvature_1pm
+      peak_magnitude = magnitude
   if peak == 0.0:
     return None
   return (1.0 if peak > 0.0 else -1.0), abs(peak), peak_index
 
 
-def _release_overshoot(samples: tuple[BehaviorSample, ...], phase: ManeuverPhase) -> MetricValue:
+def _release_overshoot(samples: _SampleSeries, phase: ManeuverPhase) -> MetricValue:
   if phase is not ManeuverPhase.RELEASE_UNWIND:
     return _metric(BehaviorMetricName.RELEASE_OVERSHOOT_1PM, None, 0, "not_release_phase")
   peak = _direction_and_peak(samples)
@@ -518,11 +583,11 @@ def _release_overshoot(samples: tuple[BehaviorSample, ...], phase: ManeuverPhase
     0.0,
     max(direction * (sample.measured_curvature_1pm - sample.anchored_curvature_1pm) for sample in samples),
   )
-  return _metric(BehaviorMetricName.RELEASE_OVERSHOOT_1PM, overshoot, len(samples))
+  return _metric(BehaviorMetricName.RELEASE_OVERSHOOT_1PM, overshoot, samples.count)
 
 
 def _first_crossing_time(
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   field: str,
   direction: float,
   threshold: float,
@@ -534,7 +599,7 @@ def _first_crossing_time(
 
 
 def _turn_in_lag(
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   phase: ManeuverPhase,
   fraction: float,
 ) -> MetricValue:
@@ -548,31 +613,33 @@ def _turn_in_lag(
   desired_time = _first_crossing_time(samples, "anchored_curvature_1pm", direction, threshold)
   delivered_time = _first_crossing_time(samples, "measured_curvature_1pm", direction, threshold)
   if desired_time is None:
-    return _metric(BehaviorMetricName.SIGNED_TURN_IN_LAG_S, None, len(samples), "reference_crossing_unobservable")
+    return _metric(BehaviorMetricName.SIGNED_TURN_IN_LAG_S, None, samples.count, "reference_crossing_unobservable")
   if delivered_time is None:
-    return _metric(BehaviorMetricName.SIGNED_TURN_IN_LAG_S, None, len(samples), "delivered_crossing_unobservable")
+    return _metric(BehaviorMetricName.SIGNED_TURN_IN_LAG_S, None, samples.count, "delivered_crossing_unobservable")
   return _metric(
     BehaviorMetricName.SIGNED_TURN_IN_LAG_S,
     delivered_time - desired_time,
-    len(samples),
+    samples.count,
   )
 
 
 def _release_crossing_time(
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   field: str,
   direction: float,
   threshold: float,
   start_index: int,
 ) -> float | None:
-  for sample in samples[start_index:]:
+  for index, sample in enumerate(samples):
+    if index < start_index:
+      continue
     if direction * getattr(sample, field) <= threshold:
       return sample.route_time_s
   return None
 
 
 def _release_lag(
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   phase: ManeuverPhase,
   fraction: float,
 ) -> MetricValue:
@@ -590,15 +657,18 @@ def _release_lag(
     threshold,
     peak_index,
   )
-  delivered_peak_index = max(
-    range(len(samples)),
-    key=lambda index: direction * samples[index].measured_curvature_1pm,
-  )
-  if direction * samples[delivered_peak_index].measured_curvature_1pm < threshold:
+  delivered_peak_index = 0
+  delivered_peak = -math.inf
+  for index, sample in enumerate(samples):
+    value = direction * sample.measured_curvature_1pm
+    if value > delivered_peak:
+      delivered_peak_index = index
+      delivered_peak = value
+  if delivered_peak < threshold:
     return _metric(
       BehaviorMetricName.SIGNED_RELEASE_LAG_S,
       None,
-      len(samples),
+      samples.count,
       "delivered_peak_below_release_threshold",
     )
   delivered_time = _release_crossing_time(
@@ -609,24 +679,24 @@ def _release_lag(
     delivered_peak_index,
   )
   if desired_time is None:
-    return _metric(BehaviorMetricName.SIGNED_RELEASE_LAG_S, None, len(samples), "reference_release_incomplete")
+    return _metric(BehaviorMetricName.SIGNED_RELEASE_LAG_S, None, samples.count, "reference_release_incomplete")
   if delivered_time is None:
-    return _metric(BehaviorMetricName.SIGNED_RELEASE_LAG_S, None, len(samples), "delivered_release_incomplete")
+    return _metric(BehaviorMetricName.SIGNED_RELEASE_LAG_S, None, samples.count, "delivered_release_incomplete")
   return _metric(
     BehaviorMetricName.SIGNED_RELEASE_LAG_S,
     delivered_time - desired_time,
-    len(samples),
+    samples.count,
   )
 
 
 def _correction_latency(
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   threshold: float,
 ) -> MetricValue:
-  if not samples:
+  if samples.first is None:
     return _metric(BehaviorMetricName.CORRECTION_LATENCY_S, None, 0, "no_clean_samples")
-  desired_start = samples[0].anchored_curvature_1pm
-  measured_start = samples[0].measured_curvature_1pm
+  desired_start = samples.first.anchored_curvature_1pm
+  measured_start = samples.first.measured_curvature_1pm
   desired_time: float | None = None
   direction = 0.0
   for sample in samples:
@@ -636,7 +706,7 @@ def _correction_latency(
       direction = 1.0 if delta > 0.0 else -1.0
       break
   if desired_time is None:
-    return _metric(BehaviorMetricName.CORRECTION_LATENCY_S, None, len(samples), "no_reference_correction")
+    return _metric(BehaviorMetricName.CORRECTION_LATENCY_S, None, samples.count, "no_reference_correction")
   for sample in samples:
     if sample.route_time_s < desired_time:
       continue
@@ -644,36 +714,43 @@ def _correction_latency(
       return _metric(
         BehaviorMetricName.CORRECTION_LATENCY_S,
         sample.route_time_s - desired_time,
-        len(samples),
+        samples.count,
       )
-  return _metric(BehaviorMetricName.CORRECTION_LATENCY_S, None, len(samples), "delivered_correction_unobservable")
+  return _metric(BehaviorMetricName.CORRECTION_LATENCY_S, None, samples.count, "delivered_correction_unobservable")
 
 
-def _rate_error(samples: tuple[BehaviorSample, ...]) -> MetricValue:
-  value = _rms(
-    sample.measured_rack_rate_deg_s - sample.desired_rack_rate_deg_s
-    for sample in samples
-  )
+def _rate_error(samples: _SampleSeries) -> MetricValue:
+  def squared_errors() -> Iterator[float]:
+    for sample in samples:
+      error = sample.measured_rack_rate_deg_s - sample.desired_rack_rate_deg_s
+      yield error * error
+  value = math.sqrt(math.fsum(squared_errors()) / samples.count) if samples.count else None
   return (
-    _metric(BehaviorMetricName.RACK_RATE_ERROR_RMS_DEG_S, value, len(samples))
+    _metric(BehaviorMetricName.RACK_RATE_ERROR_RMS_DEG_S, value, samples.count)
     if value is not None
     else _metric(BehaviorMetricName.RACK_RATE_ERROR_RMS_DEG_S, None, 0, "no_clean_samples")
   )
 
 
-def _integrated_error(samples: tuple[BehaviorSample, ...]) -> MetricValue:
-  if len(samples) < 2:
+def _integrated_error(samples: _SampleSeries) -> MetricValue:
+  if samples.count < 2:
     return _metric(BehaviorMetricName.INTEGRATED_CURVATURE_ERROR, None, 0, "insufficient_adjacent_samples")
   integral = 0.0
   transitions = 0
-  for left, right in zip(samples, samples[1:], strict=False):
+  left: BehaviorSample | None = None
+  for right in samples:
+    if left is None:
+      left = right
+      continue
     dt_s = (right.mono_time_ns - left.mono_time_ns) * 1e-9
     if dt_s <= 0.0:
+      left = right
       continue
     left_error = abs(left.measured_curvature_1pm - left.anchored_curvature_1pm)
     right_error = abs(right.measured_curvature_1pm - right.anchored_curvature_1pm)
     integral += 0.5 * (left_error + right_error) * dt_s
     transitions += 1
+    left = right
   return (
     _metric(BehaviorMetricName.INTEGRATED_CURVATURE_ERROR, integral, transitions)
     if transitions
@@ -681,35 +758,37 @@ def _integrated_error(samples: tuple[BehaviorSample, ...]) -> MetricValue:
   )
 
 
-def _peak_error(samples: tuple[BehaviorSample, ...]) -> MetricValue:
-  if not samples:
+def _peak_error(samples: _SampleSeries) -> MetricValue:
+  if not samples.count:
     return _metric(BehaviorMetricName.PEAK_CURVATURE_ERROR, None, 0, "no_clean_samples")
   return _metric(
     BehaviorMetricName.PEAK_CURVATURE_ERROR,
     max(abs(sample.measured_curvature_1pm - sample.anchored_curvature_1pm) for sample in samples),
-    len(samples),
+    samples.count,
   )
 
 
-def _hold_bias(samples: tuple[BehaviorSample, ...], phase: ManeuverPhase) -> MetricValue:
+def _hold_bias(samples: _SampleSeries, phase: ManeuverPhase) -> MetricValue:
   if phase is not ManeuverPhase.HOLD:
     return _metric(BehaviorMetricName.HOLD_BIAS_1PM, None, 0, "not_hold_phase")
-  directions = [
-    1.0 if sample.anchored_curvature_1pm > 0.0 else -1.0
-    for sample in samples
-    if sample.anchored_curvature_1pm != 0.0
-  ]
-  if len(directions) != len(samples) or not directions:
-    return _metric(BehaviorMetricName.HOLD_BIAS_1PM, None, len(samples), "zero_or_signless_hold_reference")
-  bias = math.fsum(
-    direction * (sample.measured_curvature_1pm - sample.anchored_curvature_1pm)
-    for direction, sample in zip(directions, samples, strict=True)
-  ) / len(samples)
-  return _metric(BehaviorMetricName.HOLD_BIAS_1PM, bias, len(samples))
+  zero_reference = False
+  def signed_biases() -> Iterator[float]:
+    nonlocal zero_reference
+    for sample in samples:
+      if sample.anchored_curvature_1pm == 0.0:
+        zero_reference = True
+        yield 0.0
+        continue
+      direction = 1.0 if sample.anchored_curvature_1pm > 0.0 else -1.0
+      yield direction * (sample.measured_curvature_1pm - sample.anchored_curvature_1pm)
+  total = math.fsum(signed_biases())
+  if zero_reference or not samples.count:
+    return _metric(BehaviorMetricName.HOLD_BIAS_1PM, None, samples.count, "zero_or_signless_hold_reference")
+  return _metric(BehaviorMetricName.HOLD_BIAS_1PM, total / samples.count, samples.count)
 
 
 def _delivered_and_completion(
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   completion_threshold: float,
 ) -> tuple[MetricValue, MetricValue]:
   peak = _direction_and_peak(samples)
@@ -723,30 +802,36 @@ def _delivered_and_completion(
   delivered = max(direction * sample.measured_curvature_1pm for sample in samples)
   fraction = delivered / magnitude
   return (
-    _metric(BehaviorMetricName.DELIVERED_FRACTION, fraction, len(samples)),
+    _metric(BehaviorMetricName.DELIVERED_FRACTION, fraction, samples.count),
     _metric(
       BehaviorMetricName.COMPLETION,
       1.0 if fraction >= completion_threshold else 0.0,
-      len(samples),
+      samples.count,
     ),
   )
 
 
 def _unused_headroom(
-  samples: tuple[BehaviorSample, ...],
+  samples: _SampleSeries,
   headroom_threshold: float,
   error_epsilon: float,
 ) -> MetricValue:
   eligible = 0
   growing = 0
-  for left, right in zip(samples, samples[1:], strict=False):
+  left: BehaviorSample | None = None
+  for right in samples:
+    if left is None:
+      left = right
+      continue
     if right.actuator_constrained or right.torque_headroom < headroom_threshold:
+      left = right
       continue
     eligible += 1
     left_error = abs(left.anchored_curvature_1pm - left.measured_curvature_1pm)
     right_error = abs(right.anchored_curvature_1pm - right.measured_curvature_1pm)
     if right_error > left_error + error_epsilon:
       growing += 1
+    left = right
   if not eligible:
     return _metric(
       BehaviorMetricName.GROWING_ERROR_UNUSED_HEADROOM,
@@ -761,11 +846,26 @@ def _unused_headroom(
   )
 
 
-def score_window(window: BehaviorWindow, config: BehaviorMetricConfig) -> WindowMetricSet:
-  samples = window.clean_pre_intervention_samples
+def score_sample_view(
+  *,
+  route_id: str,
+  window_id: str,
+  source_identity_sha256: str,
+  maneuver_class: ManeuverClass,
+  phase: ManeuverPhase,
+  samples: Sequence[BehaviorSample],
+  config: BehaviorMetricConfig,
+) -> WindowMetricSet:
+  """Score one re-iterable sample view without retaining its sample payload."""
+  clean_factory, intervention_mono_time_ns = _clean_sample_factory(samples)
+  clean = _inspect_series(clean_factory)
+  # Speed assigns the frozen physical window to strata; it is not controller
+  # output.  Deriving it from clean response frames would let a faulting
+  # candidate remove the window from its own comparison population.
+  physical_count = len(samples)
   mean_speed = (
-    math.fsum(sample.speed_mps for sample in samples) / len(samples)
-    if samples
+    math.fsum(sample.speed_mps for sample in samples) / physical_count
+    if physical_count
     else None
   )
   support_by_node = dict.fromkeys(config.speed_nodes_mps, 0.0)
@@ -773,64 +873,76 @@ def score_window(window: BehaviorWindow, config: BehaviorMetricConfig) -> Window
     for node, weight in speed_node_weights(sample.speed_mps, config.speed_nodes_mps):
       support_by_node[node] += weight
   speed_node_support = tuple(
-    (node, weight / len(samples))
+    (node, weight / physical_count)
     for node, weight in support_by_node.items()
-    if samples and weight > 0.0
+    if physical_count and weight > 0.0
   )
-  if len(samples) < config.minimum_samples:
+  if clean.count < config.minimum_samples:
     metrics = tuple(
-      _metric(name, None, len(samples), "insufficient_clean_pre_intervention_samples")
+      _metric(name, None, clean.count, "insufficient_clean_pre_intervention_samples")
       for name in BehaviorMetricName
     )
   else:
     delivered, completion = _delivered_and_completion(
-      samples,
+      clean,
       config.completion_delivered_fraction,
     )
     metrics = (
-      _rate_rms(BehaviorMetricName.RAW_TORQUE_RATE_RMS, samples, "raw_requested_torque"),
-      _rate_rms(BehaviorMetricName.APPLIED_TORQUE_RATE_RMS, samples, "envelope_applied_torque"),
-      _worst_burst(BehaviorMetricName.RAW_WORST_BURST_RMS, samples, "raw_requested_torque", config.burst_window_s),
-      _worst_burst(BehaviorMetricName.APPLIED_WORST_BURST_RMS, samples, "envelope_applied_torque", config.burst_window_s),
+      _rate_rms(BehaviorMetricName.RAW_TORQUE_RATE_RMS, clean, "raw_requested_torque"),
+      _rate_rms(BehaviorMetricName.APPLIED_TORQUE_RATE_RMS, clean, "envelope_applied_torque"),
+      _worst_burst(BehaviorMetricName.RAW_WORST_BURST_RMS, clean, "raw_requested_torque", config.burst_window_s),
+      _worst_burst(BehaviorMetricName.APPLIED_WORST_BURST_RMS, clean, "envelope_applied_torque", config.burst_window_s),
       _chatter(
         BehaviorMetricName.RAW_CHATTER_REVERSALS_PER_S,
-        samples,
+        clean,
         "raw_requested_torque",
         config.chatter_torque_rate_threshold_per_s,
       ),
       _chatter(
         BehaviorMetricName.APPLIED_CHATTER_REVERSALS_PER_S,
-        samples,
+        clean,
         "envelope_applied_torque",
         config.chatter_torque_rate_threshold_per_s,
       ),
-      _release_overshoot(samples, window.phase),
-      _turn_in_lag(samples, window.phase, config.turn_in_crossing_fraction),
-      _release_lag(samples, window.phase, config.release_crossing_fraction),
-      _correction_latency(samples, config.correction_curvature_threshold_1pm),
-      _rate_error(samples),
-      _integrated_error(samples),
-      _peak_error(samples),
-      _hold_bias(samples, window.phase),
+      _release_overshoot(clean, phase),
+      _turn_in_lag(clean, phase, config.turn_in_crossing_fraction),
+      _release_lag(clean, phase, config.release_crossing_fraction),
+      _correction_latency(clean, config.correction_curvature_threshold_1pm),
+      _rate_error(clean),
+      _integrated_error(clean),
+      _peak_error(clean),
+      _hold_bias(clean, phase),
       delivered,
       completion,
       _unused_headroom(
-        samples,
+        clean,
         config.unused_headroom_threshold,
         config.growing_error_epsilon_1pm,
       ),
     )
   return WindowMetricSet(
+    route_id=route_id,
+    window_id=window_id,
+    source_identity_sha256=source_identity_sha256,
+    maneuver_class=maneuver_class,
+    phase=phase,
+    mean_speed_mps=mean_speed,
+    speed_node_support=speed_node_support,
+    clean_sample_count=clean.count,
+    intervention_mono_time_ns=intervention_mono_time_ns,
+    metrics=metrics,
+  )
+
+
+def score_window(window: BehaviorWindow, config: BehaviorMetricConfig) -> WindowMetricSet:
+  return score_sample_view(
     route_id=window.route_id,
     window_id=window.window_id,
     source_identity_sha256=window.source.sha256,
     maneuver_class=window.maneuver_class,
     phase=window.phase,
-    mean_speed_mps=mean_speed,
-    speed_node_support=speed_node_support,
-    clean_sample_count=len(samples),
-    intervention_mono_time_ns=window.intervention_mono_time_ns,
-    metrics=metrics,
+    samples=window.samples,
+    config=config,
   )
 
 
@@ -854,6 +966,46 @@ def speed_node_weights(
         return ((right, 1.0),)
       return ((left, 1.0 - right_weight), (right, right_weight))
   raise AssertionError("increasing speed nodes must bracket finite speed")
+
+
+def retain_route_metric_windows(
+  windows: Iterable[WindowMetricSet],
+  config: BehaviorMetricConfig,
+) -> tuple[WindowMetricSet, ...]:
+  """Retain exactly the windows which can contribute to route strata.
+
+  Route aggregation selects the lowest identity hashes before inspecting a
+  metric value. Keeping those same per-route/per-stratum prefixes while the
+  scorer streams avoids an unbounded intermediate window graph without giving
+  a candidate any influence over which values survive.
+  """
+  buckets: dict[
+    tuple[str, StratumKey],
+    list[tuple[tuple[bytes, str], WindowMetricSet]],
+  ] = {}
+  for window in windows:
+    selection_key = (
+      hashlib.sha256(f"{window.route_id}\0{window.window_id}".encode()).digest(),
+      window.window_id,
+    )
+    for speed_node_mps, weight in window.speed_node_support:
+      if weight <= 0.0:
+        continue
+      key = (
+        window.route_id,
+        StratumKey(speed_node_mps, window.maneuver_class),
+      )
+      bucket = buckets.setdefault(key, [])
+      bucket.append((selection_key, window))
+      bucket.sort(key=lambda item: item[0])
+      if len(bucket) > config.maximum_route_windows_per_stratum:
+        bucket.pop()
+  retained = {
+    (window.route_id, window.window_id): window
+    for bucket in buckets.values()
+    for _, window in bucket
+  }
+  return tuple(sorted(retained.values(), key=lambda value: (value.route_id, value.window_id)))
 
 
 def _aggregate_stratum(
@@ -1026,12 +1178,18 @@ def score_behavior(
   config: BehaviorMetricConfig,
 ) -> BehaviorScorecard:
   """Score windows with equal route and equal speed/class-stratum weight."""
-  scored = tuple(
-    sorted(
-      (score_window(window, config) for window in windows),
-      key=lambda value: (value.route_id, value.window_id),
-    )
+  return aggregate_behavior_metrics(
+    (score_window(window, config) for window in windows),
+    config,
   )
+
+
+def aggregate_behavior_metrics(
+  windows: Iterable[WindowMetricSet],
+  config: BehaviorMetricConfig,
+) -> BehaviorScorecard:
+  """Reduce bounded per-window results without retaining behavior samples."""
+  scored = retain_route_metric_windows(windows, config)
   grouped: dict[StratumKey, list[tuple[WindowMetricSet, float]]] = {}
   for window in scored:
     for speed_node_mps, weight in window.speed_node_support:

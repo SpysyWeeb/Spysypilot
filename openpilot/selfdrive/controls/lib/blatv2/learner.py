@@ -97,8 +97,8 @@ class QualificationReason(StrEnum):
   INSUFFICIENT_EXCITATION = "insufficient_excitation"
   SINGULAR_FIT = "singular_fit"
   INVALID_PARAMETERS = "invalid_parameters"
-  VALIDATION_REGRESSION = "validation_regression"
-  AUTHORITY_VALIDATION_REGRESSION = "authority_validation_regression"
+  CROSS_FIT_REGRESSION = "cross_fit_regression"
+  AUTHORITY_CROSS_FIT_REGRESSION = "authority_cross_fit_regression"
 
 
 class ActuatorBoundary(IntFlag):
@@ -327,8 +327,8 @@ class NodeQualificationReport:
   rack_travel_deg: float
   applied_torque_span: float
   rack_reversals: int
-  seed_validation_rms: float | None
-  candidate_validation_rms: float | None
+  seed_full_fit_candidate_rms: float | None
+  candidate_full_fit_candidate_rms: float | None
   confidence: float
   reasons: tuple[QualificationReason, ...]
   candidate_parameters: PhysicalParameters | None
@@ -339,8 +339,8 @@ class NodeQualificationReport:
   authority_training_count: int = 0
   authority_validation_count: int = 0
   authority_fit_active: bool = False
-  authority_seed_validation_rms: float | None = None
-  authority_candidate_validation_rms: float | None = None
+  authority_seed_full_fit_candidate_rms: float | None = None
+  authority_candidate_full_fit_candidate_rms: float | None = None
 
   @property
   def qualified(self) -> bool:
@@ -1572,7 +1572,7 @@ class ProfileLearner:
             candidate_rms
             > seed_rms + VALIDATION_RMS_ABSOLUTE_TOLERANCE
           ):
-            reasons.append(QualificationReason.VALIDATION_REGRESSION)
+            reasons.append(QualificationReason.CROSS_FIT_REGRESSION)
           free_seed_rms = node.validation.rms(seed_coefficients)
           free_candidate_rms = node.validation.rms(coefficients)
           if (
@@ -1581,7 +1581,7 @@ class ProfileLearner:
             and free_candidate_rms
             > free_seed_rms + VALIDATION_RMS_ABSOLUTE_TOLERANCE
           ):
-            reasons.append(QualificationReason.VALIDATION_REGRESSION)
+            reasons.append(QualificationReason.CROSS_FIT_REGRESSION)
           authority_seed_rms = node.authority_validation.rms(
             seed_coefficients,
           )
@@ -1597,7 +1597,7 @@ class ProfileLearner:
             > authority_seed_rms + VALIDATION_RMS_ABSOLUTE_TOLERANCE
           ):
             reasons.append(
-              QualificationReason.AUTHORITY_VALIDATION_REGRESSION,
+              QualificationReason.AUTHORITY_CROSS_FIT_REGRESSION,
             )
 
           ratios = (
@@ -1654,8 +1654,8 @@ class ProfileLearner:
       rack_travel_deg=node.rack_travel_deg,
       applied_torque_span=torque_span,
       rack_reversals=node.rack_reversals,
-      seed_validation_rms=seed_rms,
-      candidate_validation_rms=candidate_rms,
+      seed_full_fit_candidate_rms=seed_rms,
+      candidate_full_fit_candidate_rms=candidate_rms,
       confidence=(
         candidate_parameters.confidence
         if candidate_parameters is not None
@@ -1674,10 +1674,10 @@ class ProfileLearner:
       authority_training_count=node.authority_training.count,
       authority_validation_count=node.authority_validation.count,
       authority_fit_active=authority_fit_active,
-      authority_seed_validation_rms=(
+      authority_seed_full_fit_candidate_rms=(
         node.authority_validation.rms(seed_coefficients)
       ),
-      authority_candidate_validation_rms=(
+      authority_candidate_full_fit_candidate_rms=(
         None
         if coefficients is None
         else node.authority_validation.rms(coefficients)
@@ -1699,7 +1699,7 @@ class ProfileLearner:
     for report in reports:
       if (
         report.candidate_parameters is None
-        or report.candidate_validation_rms is None
+        or report.candidate_full_fit_candidate_rms is None
       ):
         raise AssertionError("qualified node lacks validated parameters")
       profile_nodes.append(ProfileNode(
@@ -1707,8 +1707,8 @@ class ProfileLearner:
         parameters=report.candidate_parameters,
         clean_support_s=report.clean_support_s,
         sample_count=report.supported_sample_count,
-        validation_count=report.validation_count,
-        validation_rms=report.candidate_validation_rms,
+        cross_fit_route_count=report.validation_count,
+        full_fit_candidate_rms=report.candidate_full_fit_candidate_rms,
       ))
     # Revisions are opaque monotone evidence generations, not a count of
     # approvals. The sufficient statistics are cumulative and restored

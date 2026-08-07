@@ -36,9 +36,9 @@ def node(speed: float, value: float, *, qualified: bool = True) -> CalibrationPr
     moving_sample_count=500 + int(speed),
     breakaway_support_s=10.0 + speed,
     breakaway_sample_count=20 + int(speed),
-    validation_count=100 + int(speed),
-    inverse_calibration_validation_rms=0.02 + speed / 1000.0,
-    breakaway_validation_rms=0.03 + speed / 1000.0,
+    cross_fit_route_count=100 + int(speed),
+    full_fit_candidate_rms=0.02 + speed / 1000.0,
+    breakaway_full_fit_candidate_rms=0.03 + speed / 1000.0,
   )
 
 

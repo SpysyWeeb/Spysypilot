@@ -9,10 +9,12 @@ from openpilot.selfdrive.controls.lib.blatv2.plant import (
   predict_applied_history,
   presliding_friction_magnitude,
   steady_road_load_torque,
+  step_rack_dynamics,
   step_plant,
 )
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
+  curvature_from_measured_angle,
 )
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   PhysicalParameters,
@@ -168,6 +170,26 @@ class TestBlatV2Plant(unittest.TestCase):
     second = predict_applied_history(state, commands, 5.0, rack_mapping, rack_mapping, 0.0, physical_parameters, 0.0, 0.01)
     self.assertEqual(first, second)
     self.assertGreater(first.rate_deg_s, 0.0)
+
+  def test_step_plant_delegates_without_changing_transient_semantics(self):
+    rack_mapping = mapping()
+    physical_parameters = parameters()
+    state = RackState(-12.0, 3.0, 0.1)
+    curvature = curvature_from_measured_angle(
+      state.angle_deg, 9.0, rack_mapping, rack_mapping,
+    ).curvature
+    aligning = steady_road_load_torque(
+      curvature, 9.0, rack_mapping.roll_rad, 0.0,
+      physical_parameters.torque_per_lateral_accel,
+    )
+    wrapped = step_plant(
+      state, -0.4, 9.0, rack_mapping, rack_mapping, 0.0,
+      physical_parameters, 0.02, 0.01,
+    )
+    direct = step_rack_dynamics(
+      state, -0.4, aligning, physical_parameters, 0.02, 0.01,
+    )
+    self.assertEqual(wrapped, direct)
 
   def test_nonfinite_inverse_input_rejected(self):
     physical_parameters = parameters()

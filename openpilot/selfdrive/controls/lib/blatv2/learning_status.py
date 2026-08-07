@@ -4,8 +4,12 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 4 deliberately rejects the retired physical rack-fit vocabulary and
-adds canonical first-cause sample accounting. The
+Schema 10 binds each per-stratum full-fit proof to an explicit population used
+to derive the complete
+ordered qualification reason set. It also rejects the retired rack-fit vocabulary and
+adds canonical first-cause sample accounting. Cross-fit diagnostics preserve
+successful fit folds separately from held-out-regressed folds, so a family-level
+loss cannot dilute a named-population regression. The
 only candidate values it exposes are the four observable inverse-torque
 calibration values, while independent base, moving, breakaway, and authority
 populations remain visible for audit and UI progress reporting. It also keeps
@@ -26,12 +30,23 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationNodeSupportDiagnostic,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
-  MIN_VALIDATION_SUPPORT_FRACTION,
   CalibrationFitStatus,
+  CalibrationCrossFitStatus,
+  CalibrationIntervalStratum,
   CalibrationModelId,
   CalibrationNodeQualificationReport,
   CalibrationQualificationReason,
   CalibrationSampleAccounting,
+  _PairedLossVerdict,
+  MAX_CALIBRATION_EVIDENCE_ROWS,
+  calibration_cross_fit_status,
+  calibration_cross_fit_required_populations,
+  calibration_node_failure_reasons,
+  MIN_INDEPENDENT_ROUTES,
+  MIN_STRATUM_TRAINING_ROWS,
+  MIN_APPLIED_TORQUE_SPAN,
+  MIN_LATERAL_ACCEL_RMS_MPS2,
+  MIN_LATERAL_ACCEL_SPAN_MPS2,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   RuntimeVehicleBundle,
@@ -39,7 +54,8 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 4
+LEARNING_STATUS_SCHEMA_VERSION = 10
+MAX_LEARNING_STATUS_FLOAT_ABS = float(MAX_CALIBRATION_EVIDENCE_ROWS)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
   "all_intervals_qualified",
@@ -63,24 +79,32 @@ _TOP_LEVEL_KEYS = {
 _NODE_KEYS = {
   "applied_torque_directions",
   "applied_torque_span",
-  "authority_candidate_validation_rms",
+  "authority_full_fit_candidate_rms",
   "authority_fit_sample_count",
   "authority_fit_support_s",
   "authority_sample_count",
-  "authority_seed_validation_rms",
+  "authority_full_fit_seed_rms",
   "authority_support_s",
-  "authority_training_count",
-  "authority_validation_count",
+  "authority_full_fit_count",
+  "authority_cross_fit_route_count",
+  "authority_magnitude_sample_count",
+  "authority_slew_build_sample_count",
+  "authority_slew_release_sample_count",
+  "authority_unresolved_sample_count",
   "base_sample_count",
   "base_support_s",
-  "breakaway_candidate_validation_rms",
+  "breakaway_full_fit_candidate_rms",
   "breakaway_sample_count",
-  "breakaway_seed_validation_rms",
+  "breakaway_full_fit_seed_rms",
   "breakaway_support_s",
-  "breakaway_training_count",
-  "breakaway_validation_count",
+  "breakaway_full_fit_count",
+  "breakaway_cross_fit_route_count",
+  "breakaway_episode_full_fit_count",
+  "breakaway_episode_cross_fit_route_count",
+  "breakaway_episode_dwell_s",
+  "breakaway_angle_assisted_count",
   "candidate_parameters",
-  "candidate_validation_rms",
+  "full_fit_candidate_rms",
   "clean_support_s",
   "confidence",
   "evaluation_status",
@@ -101,27 +125,30 @@ _NODE_KEYS = {
   "lateral_accel_rms_mps2",
   "lateral_accel_span_mps2",
   "minimum_support_s",
-  "minimum_validation_support_s",
-  "moving_candidate_validation_rms",
+  "moving_full_fit_candidate_rms",
   "moving_sample_count",
-  "moving_seed_validation_rms",
+  "moving_full_fit_seed_rms",
   "moving_support_s",
-  "moving_training_count",
-  "moving_validation_count",
+  "moving_full_fit_count",
+  "moving_cross_fit_route_count",
   "node_index",
   "qualified",
   "rack_reversals",
   "rack_travel_deg",
   "reasons",
-  "seed_validation_rms",
+  "full_fit_seed_rms",
   "speed_mps",
   "supported_sample_count",
-  "training_count",
-  "training_outcome",
-  "training_paired_loss",
-  "validation_count",
-  "validation_paired_loss",
-  "validation_support_s",
+  "full_fit_count",
+  "selection_outcome",
+  "full_fit_paired_loss",
+  "full_fit_stratum_paired_losses",
+  "cross_fit_route_count",
+  "cross_fit_paired_loss",
+  "cross_fit_diagnostics",
+  "full_fit_diagnostic",
+  "independent_route_counts",
+  "unresolved_diagnostics",
 }
 _FIT_DIAGNOSTIC_KEYS = {
   "breakaway_parameter_count",
@@ -140,14 +167,46 @@ _PAIRED_LOSS_KEYS = {
   "uncertainty_mse",
   "upper_bound_mse",
 }
+_STRATUM_PAIRED_LOSS_KEYS = {"paired_loss", "stratum"}
+_CROSS_FIT_DIAGNOSTIC_KEYS = {
+  "contributing_route_count",
+  "failed_fold_count",
+  "model",
+  "paired_loss",
+  "regressed_fold_count",
+  "status",
+  "successful_fold_count",
+}
+_INDEPENDENT_ROUTE_COUNT_KEYS = {
+  "all",
+  "authority",
+  "base",
+  "breakaway",
+  "breakaway_episode",
+  "moving",
+}
 _INTERPOLATION_KEYS = {
+  "contributing_route_count",
+  "cross_fit_status",
+  "failed_fold_count",
   "interval_index",
   "lower_speed_mps",
   "qualified",
+  "regressed_fold_count",
   "reasons",
-  "training_paired_loss",
+  "successful_fold_count",
+  "stratum_diagnostics",
   "upper_speed_mps",
-  "validation_paired_loss",
+}
+_INTERPOLATION_STRATUM_KEYS = {
+  "contributing_route_count",
+  "cross_fit_paired_loss",
+  "cross_fit_status",
+  "failed_fold_count",
+  "full_fit_paired_loss",
+  "regressed_fold_count",
+  "stratum",
+  "successful_fold_count",
 }
 _CANDIDATE_PARAMETER_KEYS = {
   "kinetic_friction_torque",
@@ -165,8 +224,8 @@ _EVALUATION_STATUSES = {
   "numerical_failure",
   "rank_deficient",
   "seed_retained",
-  "validation_inconclusive",
-  "validation_regressed",
+  "cross_fit_inconclusive",
+  "cross_fit_regressed",
 }
 
 
@@ -188,9 +247,12 @@ def _support_populations_match(
 def _finite_float(value: object, name: str) -> float:
   if type(value) not in (int, float):
     raise TypeError(f"{name} must be a JSON number")
-  numeric = float(value)
-  if not math.isfinite(numeric):
-    raise ValueError(f"{name} must be finite")
+  try:
+    numeric = float(value)
+  except OverflowError as exc:
+    raise ValueError(f"{name} exceeds the learning-status numeric bound") from exc
+  if not math.isfinite(numeric) or abs(numeric) > MAX_LEARNING_STATUS_FLOAT_ABS:
+    raise ValueError(f"{name} must be finite and bounded")
   return 0.0 if numeric == 0.0 else numeric
 
 
@@ -209,8 +271,11 @@ def _nonnegative_float(value: object, name: str) -> float:
 
 
 def _nonnegative_int(value: object, name: str) -> int:
-  if type(value) is not int or value < 0:
-    raise ValueError(f"{name} must be a nonnegative integer")
+  if (
+    type(value) is not int
+    or not 0 <= value <= MAX_CALIBRATION_EVIDENCE_ROWS
+  ):
+    raise ValueError(f"{name} must be a bounded nonnegative integer")
   return value
 
 
@@ -447,10 +512,17 @@ def _paired_loss_payload(diagnostic: object | None, context: str) -> dict[str, o
 
 
 def _fit_diagnostics_payload(report: CalibrationNodeQualificationReport) -> list[dict[str, object]]:
-  result: list[dict[str, object]] = []
-  for index, diagnostic in enumerate(report.fit_diagnostics):
-    context = f"nodes[{report.node_index}].fit_diagnostics[{index}]"
-    result.append({
+  return [
+    _fit_diagnostic_payload(
+      diagnostic,
+      f"nodes[{report.node_index}].fit_diagnostics[{index}]",
+    )
+    for index, diagnostic in enumerate(report.fit_diagnostics)
+  ]
+
+
+def _fit_diagnostic_payload(diagnostic: object, context: str) -> dict[str, object]:
+  return {
       "breakaway_parameter_count": _nonnegative_int(
         diagnostic.breakaway_parameter_count,
         f"{context}.breakaway_parameter_count",
@@ -477,29 +549,57 @@ def _fit_diagnostics_payload(report: CalibrationNodeQualificationReport) -> list
         f"{context}.moving_rank",
       ),
       "status": diagnostic.status.value,
-    })
-  return result
+    }
+
+
+def _cross_fit_diagnostic_payload(diagnostic: object, context: str) -> dict[str, object]:
+  return {
+    "contributing_route_count": _nonnegative_int(
+      diagnostic.contributing_route_count,
+      f"{context}.contributing_route_count",
+    ),
+    "failed_fold_count": _nonnegative_int(
+      diagnostic.failed_fold_count,
+      f"{context}.failed_fold_count",
+    ),
+    "model": diagnostic.model.value,
+    "paired_loss": _paired_loss_payload(diagnostic.paired_loss, f"{context}.paired_loss"),
+    "regressed_fold_count": _nonnegative_int(
+      diagnostic.regressed_fold_count,
+      f"{context}.regressed_fold_count",
+    ),
+    "status": diagnostic.status.value,
+    "successful_fold_count": _nonnegative_int(
+      diagnostic.successful_fold_count,
+      f"{context}.successful_fold_count",
+    ),
+  }
+
+
+def _evaluation_status_from_reasons(reasons: tuple[str, ...]) -> str:
+  if reasons == (CalibrationQualificationReason.SEED_RETAINED.value,):
+    return "seed_retained"
+  if reasons == (CalibrationQualificationReason.LEARNED.value,):
+    return "learned"
+  if any(reason.startswith("insufficient_") for reason in reasons):
+    return "evidence_insufficient"
+  if CalibrationQualificationReason.RANK_DEFICIENT_FIT.value in reasons:
+    return "rank_deficient"
+  if CalibrationQualificationReason.ILL_CONDITIONED_FIT.value in reasons:
+    return "ill_conditioned"
+  if CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE.value in reasons:
+    return "cross_fit_inconclusive"
+  if any("cross_fit_regression" in reason for reason in reasons):
+    return "cross_fit_regressed"
+  if CalibrationQualificationReason.INVALID_PARAMETERS.value in reasons:
+    return "invalid_parameters"
+  return "numerical_failure"
 
 
 def _node_evaluation_status(report: CalibrationNodeQualificationReport) -> str:
-  if report.seed_retained:
-    return "seed_retained"
-  if report.learned:
-    return "learned"
-  reasons = set(report.reasons)
-  if any(reason.value.startswith("insufficient_") for reason in reasons):
-    return "evidence_insufficient"
-  if CalibrationQualificationReason.RANK_DEFICIENT_FIT in reasons:
-    return "rank_deficient"
-  if CalibrationQualificationReason.ILL_CONDITIONED_FIT in reasons:
-    return "ill_conditioned"
-  if CalibrationQualificationReason.VALIDATION_INCONCLUSIVE in reasons:
-    return "validation_inconclusive"
-  if any("validation_regression" in reason.value for reason in reasons):
-    return "validation_regressed"
-  if CalibrationQualificationReason.INVALID_PARAMETERS in reasons:
-    return "invalid_parameters"
-  return "numerical_failure"
+  return _evaluation_status_from_reasons(
+    tuple(reason.value for reason in report.reasons)
+  )
 
 
 def _node_payload(
@@ -600,9 +700,9 @@ def _node_payload(
       report.applied_torque_span,
       f"{context}.applied_torque_span",
     ),
-    "authority_candidate_validation_rms": _optional_rms(
-      report.authority_candidate_validation_rms,
-      f"{context}.authority_candidate_validation_rms",
+    "authority_full_fit_candidate_rms": _optional_rms(
+      report.authority_full_fit_candidate_rms,
+      f"{context}.authority_full_fit_candidate_rms",
     ),
     "authority_fit_sample_count": _nonnegative_int(
       report.authority_fit_sample_count,
@@ -616,21 +716,37 @@ def _node_payload(
       report.authority_sample_count,
       f"{context}.authority_sample_count",
     ),
-    "authority_seed_validation_rms": _optional_rms(
-      report.authority_seed_validation_rms,
-      f"{context}.authority_seed_validation_rms",
+    "authority_full_fit_seed_rms": _optional_rms(
+      report.authority_full_fit_seed_rms,
+      f"{context}.authority_full_fit_seed_rms",
     ),
     "authority_support_s": _nonnegative_float(
       report.authority_support_s,
       f"{context}.authority_support_s",
     ),
-    "authority_training_count": _nonnegative_int(
-      report.authority_training_count,
-      f"{context}.authority_training_count",
+    "authority_full_fit_count": _nonnegative_int(
+      report.authority_full_fit_count,
+      f"{context}.authority_full_fit_count",
     ),
-    "authority_validation_count": _nonnegative_int(
-      report.authority_validation_count,
-      f"{context}.authority_validation_count",
+    "authority_cross_fit_route_count": _nonnegative_int(
+      report.authority_cross_fit_route_count,
+      f"{context}.authority_cross_fit_route_count",
+    ),
+    "authority_magnitude_sample_count": _nonnegative_int(
+      report.authority_magnitude_sample_count,
+      f"{context}.authority_magnitude_sample_count",
+    ),
+    "authority_slew_build_sample_count": _nonnegative_int(
+      report.authority_slew_build_sample_count,
+      f"{context}.authority_slew_build_sample_count",
+    ),
+    "authority_slew_release_sample_count": _nonnegative_int(
+      report.authority_slew_release_sample_count,
+      f"{context}.authority_slew_release_sample_count",
+    ),
+    "authority_unresolved_sample_count": _nonnegative_int(
+      report.authority_unresolved_sample_count,
+      f"{context}.authority_unresolved_sample_count",
     ),
     "base_sample_count": _nonnegative_int(
       report.base_sample_count,
@@ -640,34 +756,50 @@ def _node_payload(
       report.base_support_s,
       f"{context}.base_support_s",
     ),
-    "breakaway_candidate_validation_rms": _optional_rms(
-      report.breakaway_candidate_validation_rms,
-      f"{context}.breakaway_candidate_validation_rms",
+    "breakaway_full_fit_candidate_rms": _optional_rms(
+      report.breakaway_full_fit_candidate_rms,
+      f"{context}.breakaway_full_fit_candidate_rms",
     ),
     "breakaway_sample_count": _nonnegative_int(
       report.breakaway_sample_count,
       f"{context}.breakaway_sample_count",
     ),
-    "breakaway_seed_validation_rms": _optional_rms(
-      report.breakaway_seed_validation_rms,
-      f"{context}.breakaway_seed_validation_rms",
+    "breakaway_full_fit_seed_rms": _optional_rms(
+      report.breakaway_full_fit_seed_rms,
+      f"{context}.breakaway_full_fit_seed_rms",
     ),
     "breakaway_support_s": _nonnegative_float(
       report.breakaway_support_s,
       f"{context}.breakaway_support_s",
     ),
-    "breakaway_training_count": _nonnegative_int(
-      report.breakaway_training_count,
-      f"{context}.breakaway_training_count",
+    "breakaway_full_fit_count": _nonnegative_int(
+      report.breakaway_full_fit_count,
+      f"{context}.breakaway_full_fit_count",
     ),
-    "breakaway_validation_count": _nonnegative_int(
-      report.breakaway_validation_count,
-      f"{context}.breakaway_validation_count",
+    "breakaway_cross_fit_route_count": _nonnegative_int(
+      report.breakaway_cross_fit_route_count,
+      f"{context}.breakaway_cross_fit_route_count",
+    ),
+    "breakaway_episode_full_fit_count": _nonnegative_int(
+      report.breakaway_episode_full_fit_count,
+      f"{context}.breakaway_episode_full_fit_count",
+    ),
+    "breakaway_episode_cross_fit_route_count": _nonnegative_int(
+      report.breakaway_episode_cross_fit_route_count,
+      f"{context}.breakaway_episode_cross_fit_route_count",
+    ),
+    "breakaway_episode_dwell_s": _nonnegative_float(
+      report.breakaway_episode_dwell_s,
+      f"{context}.breakaway_episode_dwell_s",
+    ),
+    "breakaway_angle_assisted_count": _nonnegative_int(
+      report.breakaway_angle_assisted_count,
+      f"{context}.breakaway_angle_assisted_count",
     ),
     "candidate_parameters": _candidate_parameters(report),
-    "candidate_validation_rms": _optional_rms(
-      report.candidate_validation_rms,
-      f"{context}.candidate_validation_rms",
+    "full_fit_candidate_rms": _optional_rms(
+      report.full_fit_candidate_rms,
+      f"{context}.full_fit_candidate_rms",
     ),
     "clean_support_s": _nonnegative_float(
       report.clean_support_s,
@@ -693,32 +825,29 @@ def _node_payload(
       f"{context}.lateral_accel_span_mps2",
     ),
     "minimum_support_s": minimum_support,
-    "minimum_validation_support_s": (
-      minimum_support * MIN_VALIDATION_SUPPORT_FRACTION
-    ),
-    "moving_candidate_validation_rms": _optional_rms(
-      report.moving_candidate_validation_rms,
-      f"{context}.moving_candidate_validation_rms",
+    "moving_full_fit_candidate_rms": _optional_rms(
+      report.moving_full_fit_candidate_rms,
+      f"{context}.moving_full_fit_candidate_rms",
     ),
     "moving_sample_count": _nonnegative_int(
       report.moving_sample_count,
       f"{context}.moving_sample_count",
     ),
-    "moving_seed_validation_rms": _optional_rms(
-      report.moving_seed_validation_rms,
-      f"{context}.moving_seed_validation_rms",
+    "moving_full_fit_seed_rms": _optional_rms(
+      report.moving_full_fit_seed_rms,
+      f"{context}.moving_full_fit_seed_rms",
     ),
     "moving_support_s": _nonnegative_float(
       report.moving_support_s,
       f"{context}.moving_support_s",
     ),
-    "moving_training_count": _nonnegative_int(
-      report.moving_training_count,
-      f"{context}.moving_training_count",
+    "moving_full_fit_count": _nonnegative_int(
+      report.moving_full_fit_count,
+      f"{context}.moving_full_fit_count",
     ),
-    "moving_validation_count": _nonnegative_int(
-      report.moving_validation_count,
-      f"{context}.moving_validation_count",
+    "moving_cross_fit_route_count": _nonnegative_int(
+      report.moving_cross_fit_route_count,
+      f"{context}.moving_cross_fit_route_count",
     ),
     "node_index": _nonnegative_int(report.node_index, f"{context}.node_index"),
     "qualified": report.qualified,
@@ -731,44 +860,106 @@ def _node_payload(
       f"{context}.rack_travel_deg",
     ),
     "reasons": [reason.value for reason in report.reasons],
-    "seed_validation_rms": _optional_rms(
-      report.seed_validation_rms,
-      f"{context}.seed_validation_rms",
+    "full_fit_seed_rms": _optional_rms(
+      report.full_fit_seed_rms,
+      f"{context}.full_fit_seed_rms",
     ),
     "speed_mps": _nonnegative_float(report.speed_mps, f"{context}.speed_mps"),
     "supported_sample_count": _nonnegative_int(
       report.supported_sample_count,
       f"{context}.supported_sample_count",
     ),
-    "training_count": _nonnegative_int(
-      report.training_count,
-      f"{context}.training_count",
+    "full_fit_count": _nonnegative_int(
+      report.full_fit_count,
+      f"{context}.full_fit_count",
     ),
-    "training_outcome": (
-      None if report.training_outcome is None else report.training_outcome.value
+    "selection_outcome": (
+      None if report.selection_outcome is None else report.selection_outcome.value
     ),
-    "training_paired_loss": _paired_loss_payload(
-      report.training_paired_loss,
-      f"{context}.training_paired_loss",
+    "full_fit_paired_loss": _paired_loss_payload(
+      report.full_fit_paired_loss,
+      f"{context}.full_fit_paired_loss",
     ),
-    "validation_count": _nonnegative_int(
-      report.validation_count,
-      f"{context}.validation_count",
+    "full_fit_stratum_paired_losses": [
+      {
+        "paired_loss": _paired_loss_payload(
+          diagnostic,
+          f"{context}.full_fit_stratum_paired_losses[{index}].paired_loss",
+        ),
+        "stratum": stratum.value,
+      }
+      for index, (stratum, diagnostic) in enumerate(zip(
+        (
+          CalibrationIntervalStratum.BASE,
+          CalibrationIntervalStratum.MOVING,
+          CalibrationIntervalStratum.BREAKAWAY_EPISODE,
+          *(
+            (CalibrationIntervalStratum.AUTHORITY,)
+            if report.independent_route_counts is not None
+            and report.independent_route_counts.authority > 0
+            else ()
+          ),
+        )[:len(report.full_fit_stratum_paired_losses)],
+        report.full_fit_stratum_paired_losses,
+        strict=True,
+      ))
+    ],
+    "cross_fit_route_count": _nonnegative_int(
+      report.cross_fit_route_count,
+      f"{context}.cross_fit_route_count",
     ),
-    "validation_paired_loss": _paired_loss_payload(
-      report.validation_paired_loss,
-      f"{context}.validation_paired_loss",
+    "cross_fit_paired_loss": _paired_loss_payload(
+      report.cross_fit_paired_loss,
+      f"{context}.cross_fit_paired_loss",
     ),
-    "validation_support_s": _nonnegative_float(
-      report.validation_support_s,
-      f"{context}.validation_support_s",
+    "cross_fit_diagnostics": [
+      _cross_fit_diagnostic_payload(
+        diagnostic,
+        f"{context}.cross_fit_diagnostics[{index}]",
+      )
+      for index, diagnostic in enumerate(report.cross_fit_diagnostics)
+    ],
+    "full_fit_diagnostic": (
+      None
+      if report.full_fit_diagnostic is None
+      else _fit_diagnostic_payload(
+        report.full_fit_diagnostic,
+        f"{context}.full_fit_diagnostic",
+      )
     ),
+    "independent_route_counts": (
+      None
+      if report.independent_route_counts is None
+      else {
+        field: _nonnegative_int(
+          getattr(report.independent_route_counts, field),
+          f"{context}.independent_route_counts.{field}",
+        )
+        for field in sorted(_INDEPENDENT_ROUTE_COUNT_KEYS)
+      }
+    ),
+    "unresolved_diagnostics": [
+      diagnostic.value for diagnostic in report.unresolved_diagnostics
+    ],
   }
 
 
 def _interpolation_payload(report: object) -> dict[str, object]:
   context = f"interpolation_reports[{report.interval_index}]"
   return {
+    "contributing_route_count": _nonnegative_int(
+      report.contributing_route_count,
+      f"{context}.contributing_route_count",
+    ),
+    "cross_fit_status": report.cross_fit_status.value,
+    "failed_fold_count": _nonnegative_int(
+      report.failed_fold_count,
+      f"{context}.failed_fold_count",
+    ),
+    "regressed_fold_count": _nonnegative_int(
+      report.regressed_fold_count,
+      f"{context}.regressed_fold_count",
+    ),
     "interval_index": _nonnegative_int(
       report.interval_index,
       f"{context}.interval_index",
@@ -779,18 +970,45 @@ def _interpolation_payload(report: object) -> dict[str, object]:
     ),
     "qualified": report.qualified,
     "reasons": [reason.value for reason in report.reasons],
-    "training_paired_loss": _paired_loss_payload(
-      report.training_paired_loss,
-      f"{context}.training_paired_loss",
+    "successful_fold_count": _nonnegative_int(
+      report.successful_fold_count,
+      f"{context}.successful_fold_count",
     ),
     "upper_speed_mps": _nonnegative_float(
       report.upper_speed_mps,
       f"{context}.upper_speed_mps",
     ),
-    "validation_paired_loss": _paired_loss_payload(
-      report.validation_paired_loss,
-      f"{context}.validation_paired_loss",
-    ),
+    "stratum_diagnostics": [
+      {
+        "contributing_route_count": _nonnegative_int(
+          diagnostic.contributing_route_count,
+          f"{context}.stratum_diagnostics[{index}].contributing_route_count",
+        ),
+        "cross_fit_paired_loss": _paired_loss_payload(
+          diagnostic.cross_fit_paired_loss,
+          f"{context}.stratum_diagnostics[{index}].cross_fit_paired_loss",
+        ),
+        "cross_fit_status": diagnostic.cross_fit_status.value,
+        "failed_fold_count": _nonnegative_int(
+          diagnostic.failed_fold_count,
+          f"{context}.stratum_diagnostics[{index}].failed_fold_count",
+        ),
+        "regressed_fold_count": _nonnegative_int(
+          diagnostic.regressed_fold_count,
+          f"{context}.stratum_diagnostics[{index}].regressed_fold_count",
+        ),
+        "full_fit_paired_loss": _paired_loss_payload(
+          diagnostic.full_fit_paired_loss,
+          f"{context}.stratum_diagnostics[{index}].full_fit_paired_loss",
+        ),
+        "stratum": diagnostic.stratum.value,
+        "successful_fold_count": _nonnegative_int(
+          diagnostic.successful_fold_count,
+          f"{context}.stratum_diagnostics[{index}].successful_fold_count",
+        ),
+      }
+      for index, diagnostic in enumerate(report.stratum_diagnostics)
+    ],
   }
 
 
@@ -909,10 +1127,10 @@ def _optional_nonnegative_float(value: object, name: str) -> None:
     _nonnegative_float(value, name)
 
 
-def _validate_paired_loss(value: object, context: str, *, optional: bool) -> None:
+def _validate_paired_loss(value: object, context: str, *, optional: bool) -> str:
   if value is None:
     if optional:
-      return
+      return "absent"
     raise ValueError(f"{context} must be present")
   if type(value) is not dict or set(value) != _PAIRED_LOSS_KEYS:
     raise ValueError(f"{context} schema does not match")
@@ -925,13 +1143,15 @@ def _validate_paired_loss(value: object, context: str, *, optional: bool) -> Non
   if route_count == 0:
     if any(item is not None for item in (mean, tolerance, uncertainty, lower, upper)):
       raise ValueError(f"{context} empty route loss carries values")
-    return
+    return "no_data"
   mean_value = _finite_float(mean, f"{context}.mean_candidate_minus_seed_mse")
-  _nonnegative_float(tolerance, f"{context}.numerical_tolerance_mse")
+  tolerance_value = _nonnegative_float(
+    tolerance, f"{context}.numerical_tolerance_mse"
+  )
   if route_count == 1:
     if any(item is not None for item in (uncertainty, lower, upper)):
       raise ValueError(f"{context} one-route loss invents uncertainty")
-    return
+    return "inconclusive"
   uncertainty_value = _nonnegative_float(
     uncertainty,
     f"{context}.uncertainty_mse",
@@ -952,9 +1172,21 @@ def _validate_paired_loss(value: object, context: str, *, optional: bool) -> Non
     abs_tol=1e-12,
   ):
     raise ValueError(f"{context} uncertainty bounds disagree")
+  if lower_value > tolerance_value:
+    return "regression"
+  if upper_value < -tolerance_value:
+    return "improved"
+  if upper_value <= tolerance_value:
+    return "no_regression"
+  return "inconclusive"
 
 
-def _validate_fit_diagnostics(value: object, context: str) -> set[str]:
+def _validate_fit_diagnostics(
+  value: object,
+  context: str,
+  *,
+  require_complete: bool = True,
+) -> set[str]:
   if type(value) is not list or not value:
     raise ValueError(f"{context} must be a nonempty list")
   expected_models = {model.value for model in CalibrationModelId}
@@ -999,9 +1231,107 @@ def _validate_fit_diagnostics(value: object, context: str) -> set[str]:
       raise ValueError(f"{item_context} identifiable fit lacks full rank")
     if status == CalibrationFitStatus.RANK_DEFICIENT.value and full_rank:
       raise ValueError(f"{item_context} rank-deficient fit has full rank")
-  if observed_models != expected_models:
+  if require_complete and observed_models != expected_models:
     raise ValueError(f"{context} model family is incomplete")
   return observed_statuses
+
+
+def _validate_fit_diagnostic(value: object, context: str) -> None:
+  _validate_fit_diagnostics([value], context, require_complete=False)
+
+
+def _validate_cross_fit_status(
+  diagnostic: dict[str, object],
+  context: str,
+  *,
+  coverage_sufficient: bool,
+  interval: bool,
+) -> str:
+  status = CalibrationCrossFitStatus(diagnostic["status"])
+  contributing = _nonnegative_int(
+    diagnostic["contributing_route_count"],
+    f"{context}.contributing_route_count",
+  )
+  successful = _nonnegative_int(
+    diagnostic["successful_fold_count"],
+    f"{context}.successful_fold_count",
+  )
+  failed = _nonnegative_int(
+    diagnostic["failed_fold_count"],
+    f"{context}.failed_fold_count",
+  )
+  regressed = _nonnegative_int(
+    diagnostic["regressed_fold_count"],
+    f"{context}.regressed_fold_count",
+  )
+  loss_field = (
+    "paired_loss" if "paired_loss" in diagnostic else "cross_fit_paired_loss"
+  )
+  loss_outcome = _validate_paired_loss(
+    diagnostic[loss_field],
+    f"{context}.{loss_field}",
+    optional=False,
+  )
+  loss = diagnostic[loss_field]
+  if loss["route_count"] != successful:
+    raise ValueError(f"{context} paired-loss route count disagrees with folds")
+  try:
+    expected = calibration_cross_fit_status(
+      contributing_route_count=contributing,
+      successful_fold_count=successful,
+      failed_fold_count=failed,
+      regressed_fold_count=regressed,
+      paired_loss_verdict=_PairedLossVerdict(loss_outcome),
+      coverage_sufficient=coverage_sufficient,
+      interval=interval,
+    )
+  except (TypeError, ValueError) as exc:
+    raise ValueError(f"{context} fold accounting is invalid") from exc
+  if status is not expected:
+    raise ValueError(f"{context} status contradicts folds or paired loss")
+  return loss_outcome
+
+
+def _validate_cross_fit_diagnostics(
+  value: object,
+  context: str,
+  route_counts: dict[str, int],
+) -> dict[str, dict[str, object]]:
+  if type(value) is not list or not value:
+    raise ValueError(f"{context} must be a nonempty list")
+  models: dict[str, dict[str, object]] = {}
+  for index, diagnostic in enumerate(value):
+    item_context = f"{context}[{index}]"
+    if type(diagnostic) is not dict or set(diagnostic) != _CROSS_FIT_DIAGNOSTIC_KEYS:
+      raise ValueError(f"{item_context} schema does not match")
+    try:
+      model = CalibrationModelId(diagnostic["model"])
+      status = CalibrationCrossFitStatus(diagnostic["status"])
+    except (TypeError, ValueError) as exc:
+      raise ValueError(f"{item_context} identity is invalid") from exc
+    if model.value in models:
+      raise ValueError(f"{item_context}.model is duplicated")
+    if diagnostic["contributing_route_count"] != route_counts["all"]:
+      raise ValueError(f"{item_context}.contributing_route_count disagrees with route population")
+    del status
+    required_populations = calibration_cross_fit_required_populations(
+      model,
+      include_authority=route_counts["authority"] > 0,
+    )
+    coverage_sufficient = (
+      diagnostic["contributing_route_count"] >= MIN_INDEPENDENT_ROUTES
+      and all(route_counts[field] >= MIN_INDEPENDENT_ROUTES for field in required_populations)
+    )
+    _validate_cross_fit_status(
+      diagnostic,
+      item_context,
+      coverage_sufficient=coverage_sufficient,
+      interval=False,
+    )
+    models[model.value] = diagnostic
+  if set(models) != {model.value for model in CalibrationModelId}:
+    raise ValueError(f"{context} model family is incomplete")
+  return models
 
 
 def validate_learning_status_payload(payload: object) -> dict[str, object]:
@@ -1049,8 +1379,8 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError("learning node speeds must strictly increase")
     previous_speed = speed
     for field in (
-      "minimum_support_s", "clean_support_s", "validation_support_s",
-      "minimum_validation_support_s", "base_support_s", "moving_support_s",
+      "minimum_support_s", "clean_support_s",
+      "base_support_s", "moving_support_s",
       "breakaway_support_s", "authority_support_s", "authority_fit_support_s",
       "lateral_accel_span_mps2", "lateral_accel_rms_mps2",
       "rack_travel_deg", "applied_torque_span", "confidence",
@@ -1059,12 +1389,12 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     if _finite_float(node["confidence"], f"{context}.confidence") > 1.0:
       raise ValueError(f"{context}.confidence must not exceed one")
     for field in (
-      "supported_sample_count", "training_count", "validation_count",
-      "base_sample_count", "moving_sample_count", "moving_training_count",
-      "moving_validation_count", "breakaway_sample_count",
-      "breakaway_training_count", "breakaway_validation_count",
+      "supported_sample_count", "full_fit_count", "cross_fit_route_count",
+      "base_sample_count", "moving_sample_count", "moving_full_fit_count",
+      "moving_cross_fit_route_count", "breakaway_sample_count",
+      "breakaway_full_fit_count", "breakaway_cross_fit_route_count",
       "authority_sample_count", "authority_fit_sample_count",
-      "authority_training_count", "authority_validation_count",
+      "authority_full_fit_count", "authority_cross_fit_route_count",
       "rack_reversals", "lateral_accel_directions",
       "applied_torque_directions",
     ):
@@ -1089,10 +1419,10 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     ):
       raise ValueError(f"{context} authority fit exceeds authority evidence")
     for field in (
-      "seed_validation_rms", "candidate_validation_rms",
-      "moving_seed_validation_rms", "moving_candidate_validation_rms",
-      "breakaway_seed_validation_rms", "breakaway_candidate_validation_rms",
-      "authority_seed_validation_rms", "authority_candidate_validation_rms",
+      "full_fit_seed_rms", "full_fit_candidate_rms",
+      "moving_full_fit_seed_rms", "moving_full_fit_candidate_rms",
+      "breakaway_full_fit_seed_rms", "breakaway_full_fit_candidate_rms",
+      "authority_full_fit_seed_rms", "authority_full_fit_candidate_rms",
     ):
       _optional_nonnegative_float(node[field], f"{context}.{field}")
 
@@ -1138,23 +1468,59 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context}.rank-deficient status lacks fit evidence")
     if evaluation_status == "ill_conditioned" and CalibrationFitStatus.ILL_CONDITIONED.value not in fit_statuses:
       raise ValueError(f"{context}.ill-conditioned status lacks fit evidence")
-    training_outcome = node["training_outcome"]
-    if training_outcome not in (
+    selection_outcome = node["selection_outcome"]
+    if selection_outcome not in (
       None,
       CalibrationQualificationReason.LEARNED.value,
       CalibrationQualificationReason.SEED_RETAINED.value,
     ):
-      raise ValueError(f"{context}.training_outcome is invalid")
-    _validate_paired_loss(
-      node["training_paired_loss"],
-      f"{context}.training_paired_loss",
+      raise ValueError(f"{context}.selection_outcome is invalid")
+    full_fit_loss_outcome = _validate_paired_loss(
+      node["full_fit_paired_loss"],
+      f"{context}.full_fit_paired_loss",
       optional=True,
     )
     _validate_paired_loss(
-      node["validation_paired_loss"],
-      f"{context}.validation_paired_loss",
+      node["cross_fit_paired_loss"],
+      f"{context}.cross_fit_paired_loss",
       optional=True,
     )
+    full_fit_diagnostic = node["full_fit_diagnostic"]
+    if full_fit_diagnostic is not None:
+      _validate_fit_diagnostic(
+        full_fit_diagnostic,
+        f"{context}.full_fit_diagnostic",
+      )
+    route_counts = node["independent_route_counts"]
+    if type(route_counts) is not dict or set(route_counts) != _INDEPENDENT_ROUTE_COUNT_KEYS:
+      raise ValueError(f"{context}.independent_route_counts schema does not match")
+    parsed_route_counts = {
+      field: _nonnegative_int(value, f"{context}.independent_route_counts.{field}")
+      for field, value in route_counts.items()
+    }
+    if any(
+      parsed_route_counts[field] > parsed_route_counts["all"]
+      for field in _INDEPENDENT_ROUTE_COUNT_KEYS - {"all"}
+    ):
+      raise ValueError(f"{context}.independent_route_counts exceed contributor union")
+    for legacy_field, population in (
+      ("moving_cross_fit_route_count", "moving"),
+      ("breakaway_cross_fit_route_count", "breakaway"),
+      ("authority_cross_fit_route_count", "authority"),
+    ):
+      if node[legacy_field] != parsed_route_counts[population]:
+        raise ValueError(f"{context}.{legacy_field} disagrees with route population")
+    cross_fit_diagnostics = _validate_cross_fit_diagnostics(
+      node["cross_fit_diagnostics"],
+      f"{context}.cross_fit_diagnostics",
+      parsed_route_counts,
+    )
+    unresolved = node["unresolved_diagnostics"]
+    if type(unresolved) is not list or any(
+      type(reason) is not str or reason not in reason_values
+      for reason in unresolved
+    ):
+      raise ValueError(f"{context}.unresolved_diagnostics are invalid")
     reasons = node["reasons"]
     if type(reasons) is not list or not reasons or any(type(reason) is not str or not reason for reason in reasons):
       raise ValueError(f"{context}.reasons must be nonempty text values")
@@ -1166,10 +1532,254 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context}.qualification reasons disagree")
     if any(reason not in reason_values for reason in reasons):
       raise ValueError(f"{context}.qualification reason is unknown")
+    expected_prerequisites: list[str] = []
+    if node["clean_support_s"] < node["minimum_support_s"]:
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value
+      )
+    if (
+      node["lateral_accel_span_mps2"] < MIN_LATERAL_ACCEL_SPAN_MPS2
+      or node["lateral_accel_rms_mps2"] < MIN_LATERAL_ACCEL_RMS_MPS2
+      or node["applied_torque_span"] < MIN_APPLIED_TORQUE_SPAN
+      or node["lateral_accel_directions"] != 2
+      or node["applied_torque_directions"] != 2
+    ):
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_EXCITATION.value
+      )
+    if node["moving_full_fit_count"] < MIN_STRATUM_TRAINING_ROWS:
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE.value
+      )
+    if (
+      node["breakaway_full_fit_count"] < MIN_STRATUM_TRAINING_ROWS
+      or node["breakaway_episode_full_fit_count"]
+      < MIN_STRATUM_TRAINING_ROWS
+    ):
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE.value
+      )
+    required_route_counts = (
+      parsed_route_counts["all"],
+      parsed_route_counts["base"],
+      parsed_route_counts["moving"],
+      parsed_route_counts["breakaway"],
+      parsed_route_counts["breakaway_episode"],
+    )
+    if (
+      any(count < MIN_INDEPENDENT_ROUTES for count in required_route_counts)
+      or 0 < parsed_route_counts["authority"] < MIN_INDEPENDENT_ROUTES
+    ):
+      expected_prerequisites.append(
+        CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+      )
+    cross_fit_values = tuple(cross_fit_diagnostics.values())
+    has_scored_family = any(
+      diagnostic["status"] == CalibrationCrossFitStatus.SCORED.value
+      for diagnostic in cross_fit_values
+    )
+    has_safe_seed_family = any(
+      diagnostic["status"]
+      == CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+      for diagnostic in cross_fit_values
+    )
+    cross_fit_fold_failure = (
+      not has_scored_family
+      and not has_safe_seed_family
+      and any(diagnostic["failed_fold_count"] > 0 for diagnostic in cross_fit_values)
+    )
+    has_regressed_family = any(
+      diagnostic["regressed_fold_count"] > 0 for diagnostic in cross_fit_values
+    )
+    if (
+      full_fit_diagnostic is not None
+      and full_fit_diagnostic["status"]
+      != CalibrationFitStatus.IDENTIFIABLE.value
+    ):
+      cross_fit_fold_failure = True
+    stratum_losses = node["full_fit_stratum_paired_losses"]
+    if type(stratum_losses) is not list:
+      raise ValueError(f"{context}.full_fit_stratum_paired_losses must be a list")
+    expected_strata = (
+      CalibrationIntervalStratum.BASE,
+      CalibrationIntervalStratum.MOVING,
+      CalibrationIntervalStratum.BREAKAWAY_EPISODE,
+      *(
+        (CalibrationIntervalStratum.AUTHORITY,)
+        if parsed_route_counts["authority"] > 0
+        else ()
+      ),
+    )
+    stratum_outcomes: list[str] = []
+    for loss_index, diagnostic in enumerate(stratum_losses):
+      loss_context = f"{context}.full_fit_stratum_paired_losses[{loss_index}]"
+      if type(diagnostic) is not dict or set(diagnostic) != _STRATUM_PAIRED_LOSS_KEYS:
+        raise ValueError(f"{loss_context} schema does not match")
+      if (
+        loss_index >= len(expected_strata)
+        or diagnostic["stratum"] != expected_strata[loss_index].value
+      ):
+        raise ValueError(f"{loss_context}.stratum ordering is invalid")
+      paired_loss = diagnostic["paired_loss"]
+      outcome = _validate_paired_loss(
+        paired_loss,
+        f"{loss_context}.paired_loss",
+        optional=False,
+      )
+      population = (
+        "breakaway_episode"
+        if expected_strata[loss_index]
+        is CalibrationIntervalStratum.BREAKAWAY_EPISODE
+        else expected_strata[loss_index].value
+      )
+      if paired_loss["route_count"] != parsed_route_counts[population]:
+        raise ValueError(f"{loss_context} route population disagrees")
+      stratum_outcomes.append(outcome)
+    expects_stratum_losses = (
+      selection_outcome == CalibrationQualificationReason.LEARNED.value
+      and full_fit_diagnostic is not None
+      and full_fit_diagnostic["status"]
+      == CalibrationFitStatus.IDENTIFIABLE.value
+    )
+    expected_stratum_count = len(expected_strata)
+    if (
+      expects_stratum_losses
+      and len(stratum_outcomes) != expected_stratum_count
+    ) or (not expects_stratum_losses and stratum_outcomes):
+      raise ValueError(f"{context}.full-fit stratum proof is incomplete")
+    full_fit_safe = not (
+      not has_scored_family
+      and not has_safe_seed_family
+      and has_regressed_family
+    ) and all(
+      outcome in ("improved", "no_regression")
+      for outcome in stratum_outcomes
+    )
+    raw_parameters = node["candidate_parameters"]
+    if raw_parameters is not None and (
+      type(raw_parameters) is not dict
+      or set(raw_parameters) != _CANDIDATE_PARAMETER_KEYS
+    ):
+      raise ValueError(f"{context}.candidate_parameters schema differs")
+    parameters_valid = False
+    if type(raw_parameters) is dict and set(raw_parameters) == _CANDIDATE_PARAMETER_KEYS:
+      raw_values = tuple(raw_parameters.values())
+      if all(type(value) in (int, float) for value in raw_values):
+        gain = float(raw_parameters["torque_per_lateral_accel"])
+        offset = float(raw_parameters["lateral_accel_offset_correction_mps2"])
+        kinetic = float(raw_parameters["kinetic_friction_torque"])
+        static = float(raw_parameters["static_breakaway_torque"])
+        parameters_valid = (
+          all(math.isfinite(value) for value in (gain, offset, kinetic, static))
+          and gain > 0.0
+          and static >= kinetic >= 0.0
+          and abs(offset) <= max(1.0, float(node["lateral_accel_span_mps2"]))
+        )
+    expected_reasons = [reason.value for reason in calibration_node_failure_reasons(
+      insufficient_support=(
+        CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value
+        in expected_prerequisites
+      ),
+      insufficient_excitation=(
+        CalibrationQualificationReason.INSUFFICIENT_EXCITATION.value
+        in expected_prerequisites
+      ),
+      insufficient_moving_evidence=(
+        CalibrationQualificationReason.INSUFFICIENT_MOVING_EVIDENCE.value
+        in expected_prerequisites
+      ),
+      insufficient_breakaway_evidence=(
+        CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE.value
+        in expected_prerequisites
+      ),
+      insufficient_independent_routes=(
+        CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+        in expected_prerequisites
+      ),
+      cross_fit_fold_failure=cross_fit_fold_failure,
+      fit_statuses=tuple(CalibrationFitStatus(status) for status in fit_statuses),
+      full_fit_safe=full_fit_safe,
+      parameters_valid=parameters_valid,
+    )]
+    if node["qualified"]:
+      if expected_reasons:
+        raise ValueError(f"{context}.qualified node carries failed proof")
+      expected_reasons = [selection_outcome]
+    if reasons != expected_reasons:
+      raise ValueError(f"{context}.reasons contradict carried diagnostics")
+    expected_unresolved = []
+    if (
+      CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+      in expected_prerequisites
+    ):
+      expected_unresolved.append(
+        CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+      )
+    if cross_fit_fold_failure:
+      expected_unresolved.append(
+        CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE.value
+      )
+    if unresolved != expected_unresolved:
+      raise ValueError(f"{context}.unresolved diagnostics contradict proof")
+    if (
+      node["breakaway_angle_assisted_count"]
+      > node["breakaway_episode_full_fit_count"]
+      or node["authority_fit_sample_count"] > node["authority_sample_count"]
+      or node["authority_unresolved_sample_count"]
+      > node["authority_magnitude_sample_count"]
+      or node["authority_magnitude_sample_count"]
+      > node["authority_sample_count"]
+      or node["authority_slew_build_sample_count"]
+      > node["authority_sample_count"]
+      or node["authority_slew_release_sample_count"]
+      > node["authority_sample_count"]
+    ):
+      raise ValueError(f"{context}.carried evidence populations are inconsistent")
+    if evaluation_status != _evaluation_status_from_reasons(tuple(reasons)):
+      raise ValueError(f"{context}.evaluation status contradicts reasons")
     if node["qualified"] and (
-      evaluation_status != reasons[0] or training_outcome != reasons[0]
+      evaluation_status != reasons[0] or selection_outcome != reasons[0]
     ):
       raise ValueError(f"{context}.qualified outcome projection disagrees")
+    if node["qualified"] and (
+      full_fit_diagnostic is None
+      or node["full_fit_paired_loss"] is None
+      or node["cross_fit_paired_loss"] is None
+      or node["cross_fit_paired_loss"]["route_count"] == 0
+      or node["cross_fit_route_count"] == 0
+    ):
+      raise ValueError(f"{context}.qualified node lacks authoritative selection proof")
+    if node["qualified"]:
+      authoritative = cross_fit_diagnostics[full_fit_diagnostic["model"]]
+      matching_full_fit = next(
+        diagnostic for diagnostic in node["fit_diagnostics"]
+        if diagnostic["model"] == full_fit_diagnostic["model"]
+      )
+      if (
+        node["cross_fit_route_count"] != authoritative["contributing_route_count"]
+        or node["cross_fit_route_count"] != parsed_route_counts["all"]
+        or node["cross_fit_paired_loss"] != authoritative["paired_loss"]
+        or full_fit_diagnostic != matching_full_fit
+      ):
+        raise ValueError(f"{context}.authoritative selection proof disagrees")
+      if (
+        full_fit_diagnostic["status"] != CalibrationFitStatus.IDENTIFIABLE.value
+        or node["full_fit_paired_loss"]["route_count"] != parsed_route_counts["all"]
+        or full_fit_loss_outcome not in ("improved", "no_regression")
+      ):
+        raise ValueError(f"{context}.authoritative full-fit proof disagrees")
+      expected_status = (
+        CalibrationCrossFitStatus.SCORED.value
+        if selection_outcome == CalibrationQualificationReason.LEARNED.value
+        else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+      )
+      if authoritative["status"] != expected_status:
+        raise ValueError(f"{context}.selected family status contradicts outcome")
+      if (
+        selection_outcome == CalibrationQualificationReason.SEED_RETAINED.value
+        and full_fit_loss_outcome != "no_regression"
+      ):
+        raise ValueError(f"{context}.seed-retained loss outcome disagrees")
     if not node["qualified"] and evaluation_status in ("learned", "seed_retained"):
       raise ValueError(f"{context}.failed node has a qualified status")
 
@@ -1228,6 +1838,30 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       raise ValueError(f"{context} speed bounds disagree with node grid")
     if type(report["qualified"]) is not bool:
       raise ValueError(f"{context}.qualified must be boolean")
+    contributing = _nonnegative_int(
+      report["contributing_route_count"],
+      f"{context}.contributing_route_count",
+    )
+    successful = _nonnegative_int(
+      report["successful_fold_count"],
+      f"{context}.successful_fold_count",
+    )
+    failed = _nonnegative_int(
+      report["failed_fold_count"],
+      f"{context}.failed_fold_count",
+    )
+    regressed = _nonnegative_int(
+      report["regressed_fold_count"],
+      f"{context}.regressed_fold_count",
+    )
+    try:
+      cross_fit_status = CalibrationCrossFitStatus(report["cross_fit_status"])
+    except (TypeError, ValueError) as exc:
+      raise ValueError(f"{context}.cross_fit_status is invalid") from exc
+    if report["qualified"] and (
+      failed != 0 or cross_fit_status is not CalibrationCrossFitStatus.SCORED
+    ):
+      raise ValueError(f"{context} qualified with incomplete cross-fit")
     interval_qualified.append(report["qualified"])
     reasons = report["reasons"]
     if type(reasons) is not list or not reasons or any(
@@ -1239,16 +1873,128 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       reasons == [CalibrationQualificationReason.QUALIFIED.value]
     ):
       raise ValueError(f"{context}.qualification reasons disagree")
-    _validate_paired_loss(
-      report["training_paired_loss"],
-      f"{context}.training_paired_loss",
-      optional=False,
+    stratum_diagnostics = report["stratum_diagnostics"]
+    if type(stratum_diagnostics) is not list or not stratum_diagnostics:
+      raise ValueError(f"{context}.stratum_diagnostics must be nonempty")
+    strata: set[str] = set()
+    stratum_statuses: list[CalibrationCrossFitStatus] = []
+    expected_interval_reasons: list[str] = []
+    stratum_successful = 0
+    stratum_failed = 0
+    stratum_regressed = 0
+    maximum_contributors = 0
+    total_stratum_contributors = 0
+    for stratum_index, diagnostic in enumerate(stratum_diagnostics):
+      stratum_context = f"{context}.stratum_diagnostics[{stratum_index}]"
+      if type(diagnostic) is not dict or set(diagnostic) != _INTERPOLATION_STRATUM_KEYS:
+        raise ValueError(f"{stratum_context} schema does not match")
+      try:
+        stratum = CalibrationIntervalStratum(diagnostic["stratum"])
+        stratum_status = CalibrationCrossFitStatus(diagnostic["cross_fit_status"])
+      except (TypeError, ValueError) as exc:
+        raise ValueError(f"{stratum_context} identity is invalid") from exc
+      if stratum.value in strata:
+        raise ValueError(f"{stratum_context}.stratum is duplicated")
+      strata.add(stratum.value)
+      stratum_contributing = _nonnegative_int(
+        diagnostic["contributing_route_count"],
+        f"{stratum_context}.contributing_route_count",
+      )
+      stratum_ok = _nonnegative_int(
+        diagnostic["successful_fold_count"],
+        f"{stratum_context}.successful_fold_count",
+      )
+      stratum_bad = _nonnegative_int(
+        diagnostic["failed_fold_count"],
+        f"{stratum_context}.failed_fold_count",
+      )
+      stratum_regressed_count = _nonnegative_int(
+        diagnostic["regressed_fold_count"],
+        f"{stratum_context}.regressed_fold_count",
+      )
+      diagnostic_for_status = {
+        "status": diagnostic["cross_fit_status"],
+        "contributing_route_count": stratum_contributing,
+        "successful_fold_count": stratum_ok,
+        "failed_fold_count": stratum_bad,
+        "regressed_fold_count": stratum_regressed_count,
+        "cross_fit_paired_loss": diagnostic["cross_fit_paired_loss"],
+      }
+      cross_loss_outcome = _validate_cross_fit_status(
+        diagnostic_for_status,
+        stratum_context,
+        coverage_sufficient=stratum_contributing >= MIN_INDEPENDENT_ROUTES,
+        interval=True,
+      )
+      if report["qualified"] and (
+        stratum_bad != 0 or stratum_status is not CalibrationCrossFitStatus.SCORED
+      ):
+        raise ValueError(f"{stratum_context} qualified with incomplete cross-fit")
+      full_loss_outcome = _validate_paired_loss(
+        diagnostic["full_fit_paired_loss"],
+        f"{stratum_context}.full_fit_paired_loss",
+        optional=False,
+      )
+      if diagnostic["full_fit_paired_loss"]["route_count"] != stratum_contributing:
+        raise ValueError(f"{stratum_context} full-fit route count disagrees")
+      if stratum_contributing < 2:
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
+        )
+      if stratum_bad:
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE.value
+        )
+      if full_loss_outcome == "regression":
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION.value
+        )
+      elif full_loss_outcome in ("no_data", "inconclusive"):
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_TRAINING_INCONCLUSIVE.value
+        )
+      if stratum_regressed_count or cross_loss_outcome == "regression":
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION.value
+        )
+      elif cross_loss_outcome in ("no_data", "inconclusive"):
+        expected_interval_reasons.append(
+          CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_INCONCLUSIVE.value
+        )
+      stratum_statuses.append(stratum_status)
+      stratum_successful += stratum_ok
+      stratum_failed += stratum_bad
+      stratum_regressed += stratum_regressed_count
+      maximum_contributors = max(maximum_contributors, stratum_contributing)
+      total_stratum_contributors += stratum_contributing
+    if (
+      successful != stratum_successful
+      or failed != stratum_failed
+      or regressed != stratum_regressed
+    ):
+      raise ValueError(f"{context} aggregate fold counts disagree")
+    if not maximum_contributors <= contributing <= total_stratum_contributors:
+      raise ValueError(f"{context} contributor union is invalid")
+    aggregate_status = next(
+      status
+      for status in (
+        CalibrationCrossFitStatus.FOLD_FIT_FAILURE,
+        CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+        CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT,
+        CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES,
+        CalibrationCrossFitStatus.SCORED,
+      )
+      if status in stratum_statuses
     )
-    _validate_paired_loss(
-      report["validation_paired_loss"],
-      f"{context}.validation_paired_loss",
-      optional=False,
+    if cross_fit_status is not aggregate_status:
+      raise ValueError(f"{context} aggregate status contradicts strata")
+    expected_reasons = (
+      [CalibrationQualificationReason.QUALIFIED.value]
+      if not expected_interval_reasons
+      else list(dict.fromkeys(expected_interval_reasons))
     )
+    if reasons != expected_reasons:
+      raise ValueError(f"{context}.reasons contradict stratum diagnostics")
   all_nodes_evaluated = all(
     type(node["evaluation_status"]) is str
     and bool(node["evaluation_status"])
@@ -1283,7 +2029,7 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
   if candidate_present and not all_qualified:
     raise ValueError("candidate exists before full qualification")
   if all_qualified and not candidate_present and any(
-    node["training_outcome"] == CalibrationQualificationReason.LEARNED.value
+    node["selection_outcome"] == CalibrationQualificationReason.LEARNED.value
     for node in nodes
   ):
     raise ValueError("qualified learned node lacks candidate artifact")

@@ -31,6 +31,7 @@ from openpilot.selfdrive.controls.lib.blatv2.reference import sample_reference
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+BEHAVIOR_SCENARIO_PROVENANCE_SCHEMA_VERSION = 1
 
 
 class ManeuverPhase(StrEnum):
@@ -103,6 +104,102 @@ class BehaviorSourceIdentity:
       "opendbcCommit": self.opendbc_commit,
       "pandaCommit": self.panda_commit,
       "sourceOpenpilotCommit": self.source_openpilot_commit,
+    }
+
+  def to_json(self) -> str:
+    return canonical_json(self.to_dict())
+
+  @property
+  def sha256(self) -> str:
+    return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorScenarioProvenance:
+  """Recorded source and immutable input identity for one replay scenario.
+
+  A scenario supplies authenticated model, vehicle-state, calibration, and
+  applied-torque context to counterfactual controllers.  Its recorded
+  controller is provenance only: it is neither a quality label nor silently
+  relabeled as the exact-stock opponent.  Compatibility is established by
+  the strict scenario decoder before this object is emitted.
+  """
+
+  schema_version: int
+  route_id: str
+  route_evidence_sha256: str
+  recorded_source: BehaviorSourceIdentity
+  recorded_behavior_eligible: bool
+  recorded_behavior_ineligible_reason: str
+  vehicle_identity: str
+  runtime_identity: str
+  preparation_cache_key: str
+
+  def __post_init__(self) -> None:
+    if self.schema_version != BEHAVIOR_SCENARIO_PROVENANCE_SCHEMA_VERSION:
+      raise ValueError("behavior scenario provenance schema is incompatible")
+    if not self.route_id.strip():
+      raise ValueError("scenario route_id must not be empty")
+    for name, value in (
+      ("route_evidence_sha256", self.route_evidence_sha256),
+      ("runtime_identity", self.runtime_identity),
+      ("preparation_cache_key", self.preparation_cache_key),
+    ):
+      if _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{name} must be lowercase SHA-256")
+    if not isinstance(self.recorded_source, BehaviorSourceIdentity):
+      raise TypeError("recorded_source must be a BehaviorSourceIdentity")
+    if type(self.recorded_behavior_eligible) is not bool:
+      raise TypeError("recorded_behavior_eligible must be boolean")
+    if not self.recorded_behavior_ineligible_reason.strip():
+      raise ValueError("recorded behavior reason must not be empty")
+    if self.recorded_behavior_eligible != (
+      self.recorded_behavior_ineligible_reason == "eligible"
+    ):
+      raise ValueError("recorded behavior eligibility and reason disagree")
+    if not self.vehicle_identity.strip():
+      raise ValueError("scenario vehicle identity must not be empty")
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "preparationCacheKey": self.preparation_cache_key,
+      "recordedBehaviorEligible": self.recorded_behavior_eligible,
+      "recordedBehaviorIneligibleReason": self.recorded_behavior_ineligible_reason,
+      "recordedSource": self.recorded_source.to_dict(),
+      "routeEvidenceSha256": self.route_evidence_sha256,
+      "routeId": self.route_id,
+      "runtimeIdentity": self.runtime_identity,
+      "schemaVersion": self.schema_version,
+      "vehicleIdentity": self.vehicle_identity,
+    }
+
+  def to_json(self) -> str:
+    return canonical_json(self.to_dict())
+
+  @property
+  def sha256(self) -> str:
+    return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorScenarioSetIdentity:
+  """Order-sensitive experiment identity over scenario provenance."""
+
+  sources: tuple[BehaviorScenarioProvenance, ...]
+
+  def __post_init__(self) -> None:
+    if type(self.sources) is not tuple or not self.sources:
+      raise ValueError("behavior scenario set must not be empty")
+    if any(not isinstance(source, BehaviorScenarioProvenance) for source in self.sources):
+      raise TypeError("behavior scenario sources have the wrong type")
+    route_ids = tuple(source.route_id for source in self.sources)
+    if len(set(route_ids)) != len(route_ids):
+      raise ValueError("behavior scenario route IDs must be unique")
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "scenarioSources": [source.to_dict() for source in self.sources],
+      "schemaVersion": BEHAVIOR_SCENARIO_PROVENANCE_SCHEMA_VERSION,
     }
 
   def to_json(self) -> str:

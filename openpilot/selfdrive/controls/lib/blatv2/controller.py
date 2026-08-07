@@ -13,8 +13,8 @@ separately.
 
 Scalar-only reference and nominal-rack-mapping degradation are accepted for
 live use because the existing core marks both results valid and deterministic.
-An unqualified profile is never accepted for live use, even though its core
-result remains useful shadow evidence.
+An unqualified profile remains shadow-only unless the caller supplies the
+explicit development authorization and a provisional engagement decision.
 """
 
 from __future__ import annotations
@@ -165,6 +165,7 @@ class ModularControllerCandidate:
     *,
     core: ModularControllerCore,
     runtime_limits: RuntimeTorqueLimits,
+    development_unqualified_profile_authorized: bool = False,
   ) -> None:
     if not isinstance(core, ModularControllerCore):
       raise TypeError("candidate requires a ModularControllerCore")
@@ -172,6 +173,9 @@ class ModularControllerCandidate:
       raise TypeError("candidate requires explicit runtime torque limits")
     self.core = core
     self.runtime_limits = runtime_limits
+    self.development_unqualified_profile_authorized = bool(
+      development_unqualified_profile_authorized,
+    )
     self.guard = InvalidOutputGuard(core.fixed_dt_s)
     self.result = CandidateResult()
     self._core_profile = core.profile
@@ -257,7 +261,14 @@ class ModularControllerCandidate:
       )
     if decision.profile is None:
       raise ValueError("modular decision is missing its profile")
-    if not decision.profile.qualified or not self._core_profile.qualified:
+    unqualified_authorized = (
+      self.development_unqualified_profile_authorized
+      and decision.provisional
+    )
+    if (
+      (not decision.profile.qualified or not self._core_profile.qualified)
+      and not unqualified_authorized
+    ):
       raise ValueError("unqualified profile cannot own live actuation")
     if (
       decision.profile.vehicle_identity
@@ -320,10 +331,17 @@ class ModularControllerCandidate:
       return False
     if decision.selection == ControllerSelection.STOCK:
       return decision.profile is None and decision.profile_sha256 == ""
+    profile_authorized = (
+      self._core_profile.qualified
+      or (
+        self.development_unqualified_profile_authorized
+        and decision.provisional
+      )
+    )
     return (
       decision.profile is self._core_profile
       and decision.profile_sha256 == self._core_profile_hash
-      and self._core_profile.qualified
+      and profile_authorized
     )
 
   def _clear_result_for_bound_decision(self) -> None:
@@ -504,10 +522,25 @@ class ModularControllerCandidate:
       self.result.car_control_valid = safe_command.car_control_valid
       return self.result
 
+    profile_authorized = (
+      core_result.profile_qualified
+      or (
+        self.development_unqualified_profile_authorized
+        and self._decision.provisional
+        and core_result.status == CoreStatus.SHADOW_UNQUALIFIED_PROFILE
+      )
+    )
+    core_status_live = (
+      core_result.status in _LIVE_CORE_STATUSES
+      or (
+        self.development_unqualified_profile_authorized
+        and core_result.status == CoreStatus.SHADOW_UNQUALIFIED_PROFILE
+      )
+    )
     core_live_valid = (
       core_result.valid
-      and core_result.profile_qualified
-      and core_result.status in _LIVE_CORE_STATUSES
+      and profile_authorized
+      and core_status_live
       and lateral_valid
     )
     safe_command = self.guard.update(

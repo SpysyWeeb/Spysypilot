@@ -13,11 +13,17 @@ so extending a logger window cannot duplicate samples in metric input.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
+from array import array
+from collections.abc import Iterable, Iterator, Sequence
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, replace
 from enum import StrEnum
 import hashlib
 import math
+import mmap
+import os
+import struct
+import tempfile
 from typing import Any
 
 from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
@@ -50,9 +56,18 @@ class EventCoverageStop(StrEnum):
   NO_MANEUVER = "no_maneuver"
 
 
+class SegmentationResourceError(ValueError):
+  """A route exceeds its versioned offline segmentation work authority."""
+
+
 @dataclass(frozen=True, slots=True)
 class SegmentationConfig:
-  """Every deterministic phase/coverage constant used by this module."""
+  """Every deterministic phase, coverage, and work limit used here.
+
+  Work limits reject an adversarial route; they never truncate, sample, or
+  reinterpret it. They are part of the hashed segmentation authority so a
+  limit change cannot silently alter the population admitted to training.
+  """
 
   schema_version: int
   reference_zero_threshold_1pm: float
@@ -67,6 +82,10 @@ class SegmentationConfig:
   maximum_sample_gap_s: float
   turn_in_crossing_fraction: float
   release_onset_fraction: float
+  maximum_raw_phase_spans: int
+  maximum_phase_windows: int
+  maximum_event_locators: int
+  maximum_event_phase_attachments: int
 
   def __post_init__(self) -> None:
     if self.schema_version <= 0:
@@ -86,6 +105,16 @@ class SegmentationConfig:
       raise ValueError("segmentation thresholds and durations must be finite and positive")
     if self.minimum_phase_samples <= 0:
       raise ValueError("minimum_phase_samples must be positive")
+    work_limits = (
+      self.maximum_raw_phase_spans,
+      self.maximum_phase_windows,
+      self.maximum_event_locators,
+      self.maximum_event_phase_attachments,
+    )
+    if any(type(value) is not int or value <= 0 for value in work_limits):
+      raise ValueError("segmentation work limits must be positive integers")
+    if self.maximum_phase_windows > self.maximum_raw_phase_spans:
+      raise ValueError("phase-window limit cannot exceed raw-span limit")
     if not 0.0 < self.turn_in_crossing_fraction < 1.0:
       raise ValueError("turn_in_crossing_fraction must be in (0, 1)")
     if not 0.0 < self.release_onset_fraction < 1.0:
@@ -93,14 +122,14 @@ class SegmentationConfig:
 
   @classmethod
   def provisional_offline_gate(cls) -> SegmentationConfig:
-    """Version-1 reproducibility constants, not controller feel dials.
+    """Version-2 reproducibility constants, not controller feel dials.
 
     The 50% turn-in and 90% release fractions are the committed metric
     conventions.  Remaining values are conservative evidence-discrimination
     constants and must be revised by a version bump, never silently.
     """
     return cls(
-      schema_version=1,
+      schema_version=2,
       reference_zero_threshold_1pm=0.0005,
       quasi_steady_rate_threshold_1pm_s=0.001,
       monotonic_progress_epsilon_1pm_s=0.00001,
@@ -113,13 +142,21 @@ class SegmentationConfig:
       maximum_sample_gap_s=0.015,
       turn_in_crossing_fraction=0.5,
       release_onset_fraction=0.9,
+      maximum_raw_phase_spans=65_536,
+      maximum_phase_windows=4_096,
+      maximum_event_locators=4_096,
+      maximum_event_phase_attachments=65_536,
     )
 
   def to_dict(self) -> dict[str, Any]:
     return {
       "directHandoffMaxNeutralDurationS": self.direct_handoff_max_neutral_duration_s,
       "directHandoffMinPeakCurvature1pm": self.direct_handoff_min_peak_curvature_1pm,
+      "maximumEventLocators": self.maximum_event_locators,
+      "maximumEventPhaseAttachments": self.maximum_event_phase_attachments,
       "maximumPhaseExtensionS": self.maximum_phase_extension_s,
+      "maximumPhaseWindows": self.maximum_phase_windows,
+      "maximumRawPhaseSpans": self.maximum_raw_phase_spans,
       "maximumSampleGapS": self.maximum_sample_gap_s,
       "minimumPhaseDurationS": self.minimum_phase_duration_s,
       "minimumPhaseSamples": self.minimum_phase_samples,
@@ -236,6 +273,83 @@ class SegmentationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BehaviorPhaseSpan:
+  """Bounded phase descriptor shared by eager and file-backed consumers."""
+
+  window_id: str
+  maneuver_class: ManeuverClass
+  phase: ManeuverPhase
+  start_sample_index: int
+  end_sample_index_exclusive: int
+  event_locators: tuple[EventLocator, ...]
+  observability: WindowObservability
+
+  def __post_init__(self) -> None:
+    if not self.window_id.strip():
+      raise ValueError("window_id must not be empty")
+    if self.start_sample_index < 0 or self.end_sample_index_exclusive <= self.start_sample_index:
+      raise ValueError("phase span bounds must be a non-empty half-open interval")
+
+
+@dataclass(frozen=True, slots=True)
+class BehaviorSegmentationSpans:
+  """Segmentation metadata without copied behavior sample tuples."""
+
+  route_id: str
+  source_identity_sha256: str
+  config_sha256: str
+  spans: tuple[BehaviorPhaseSpan, ...]
+  event_coverage: tuple[EventCoverage, ...]
+  unassigned_sample_indices: Sequence[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _UnassignedSampleIndices(Sequence[int]):
+  """Compact complement of the non-overlapping assigned phase ranges."""
+
+  ranges: tuple[tuple[int, int], ...]
+  count: int
+
+  @classmethod
+  def from_assigned_ranges(
+    cls,
+    sample_count: int,
+    assigned_ranges: tuple[tuple[int, int], ...],
+  ) -> _UnassignedSampleIndices:
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in assigned_ranges:
+      if start < cursor or end < start or end > sample_count:
+        raise ValueError("assigned segmentation ranges are invalid")
+      if cursor < start:
+        ranges.append((cursor, start))
+      cursor = end
+    if cursor < sample_count:
+      ranges.append((cursor, sample_count))
+    return cls(tuple(ranges), sum(end - start for start, end in ranges))
+
+  def __len__(self) -> int:
+    return self.count
+
+  def __iter__(self) -> Iterator[int]:
+    for start, end in self.ranges:
+      yield from range(start, end)
+
+  def __getitem__(self, index: int | slice) -> int | tuple[int, ...]:
+    if isinstance(index, slice):
+      return tuple(self)[index]
+    selected = index + self.count if index < 0 else index
+    if not 0 <= selected < self.count:
+      raise IndexError(index)
+    for start, end in self.ranges:
+      length = end - start
+      if selected < length:
+        return start + selected
+      selected -= length
+    raise AssertionError("unassigned sample index count is inconsistent")
+
+
+@dataclass(frozen=True, slots=True)
 class _Run:
   start: int
   end: int
@@ -252,27 +366,241 @@ class _Span:
   driver_censor_ns: int | None = None
 
 
+_BOUNDARY_REASONS = tuple(BoundaryReason)
+_BOUNDARY_REASON_TO_CODE = {reason: index for index, reason in enumerate(_BOUNDARY_REASONS)}
+_NO_BOUNDARY_REASON = 0xff
+_PHASE_CODES = tuple(ManeuverPhase)
+_PHASE_TO_CODE = {phase: index for index, phase in enumerate(_PHASE_CODES)}
+_SPAN_RECORD = struct.Struct("<QQBQQBBBQ")
+_EPISODE_RECORD = struct.Struct("<QQ")
+_SPAN_BLOCK_BYTES = 16 * 1024
+_SPAN_RECORDS_PER_BLOCK = max(1, _SPAN_BLOCK_BYTES // _SPAN_RECORD.size)
+_EPISODE_RECORDS_PER_BLOCK = max(1, _SPAN_BLOCK_BYTES // _EPISODE_RECORD.size)
+
+
+class _SpanScratch:
+  """Owned fixed-record store for canonical raw phase spans.
+
+  Raw phases can alternate every sample while nearly all fail the committed
+  minimum-duration rule. Keeping those transient descriptors as Python
+  objects makes heap use route-length-dependent. This store retains the exact
+  pre-filter population on disk because event coverage and completion depend
+  on it, while exposing the same ordered random-access view to both eager and
+  file-backed segmentation.
+  """
+
+  __slots__ = (
+    "_cache",
+    "_cache_start",
+    "_count",
+    "_episode_cache",
+    "_episode_cache_start",
+    "_episode_count",
+    "_episode_file",
+    "_file",
+    "_finished",
+    "_open_episode_run",
+    "_open_episode_start",
+  )
+
+  def __init__(self) -> None:
+    self._file = tempfile.TemporaryFile(prefix="blatv2-segmentation-spans-", buffering=0)
+    self._episode_file = tempfile.TemporaryFile(prefix="blatv2-segmentation-episodes-", buffering=0)
+    self._count = 0
+    self._episode_count = 0
+    self._cache_start = -1
+    self._cache: tuple[_Span, ...] = ()
+    self._episode_cache_start = -1
+    self._episode_cache: tuple[tuple[int, int], ...] = ()
+    self._open_episode_start: int | None = None
+    self._open_episode_run: _Run | None = None
+    self._finished = False
+
+  def __enter__(self) -> _SpanScratch:
+    return self
+
+  def __exit__(self, *_: object) -> None:
+    self._file.close()
+    self._episode_file.close()
+
+  def __len__(self) -> int:
+    return self._count
+
+  def __iter__(self) -> Iterator[_Span]:
+    for index in range(self._count):
+      yield self[index]
+
+  def __getitem__(self, index: int) -> _Span:
+    if type(index) is not int:
+      raise TypeError("span scratch indices must be integers")
+    if not self._finished:
+      raise RuntimeError("temporary segmentation spans are not finalized")
+    resolved = index + self._count if index < 0 else index
+    if not 0 <= resolved < self._count:
+      raise IndexError(index)
+    block_start = (resolved // _SPAN_RECORDS_PER_BLOCK) * _SPAN_RECORDS_PER_BLOCK
+    if block_start != self._cache_start:
+      count = min(_SPAN_RECORDS_PER_BLOCK, self._count - block_start)
+      encoded = os.pread(
+        self._file.fileno(),
+        count * _SPAN_RECORD.size,
+        block_start * _SPAN_RECORD.size,
+      )
+      if len(encoded) != count * _SPAN_RECORD.size:
+        raise RuntimeError("temporary segmentation span is truncated")
+      self._cache = tuple(
+        self._decode_span(encoded[offset:offset + _SPAN_RECORD.size])
+        for offset in range(0, len(encoded), _SPAN_RECORD.size)
+      )
+      self._cache_start = block_start
+    return self._cache[resolved - block_start]
+
+  @staticmethod
+  def _decode_span(encoded: bytes) -> _Span:
+    (
+      start,
+      end,
+      phase_code,
+      run_start,
+      run_end,
+      start_reason_code,
+      end_reason_code,
+      driver_censor_present,
+      driver_censor_ns,
+    ) = _SPAN_RECORD.unpack(encoded)
+    try:
+      phase = _PHASE_CODES[phase_code]
+      start_reason = (
+        None
+        if start_reason_code == _NO_BOUNDARY_REASON
+        else _BOUNDARY_REASONS[start_reason_code]
+      )
+      end_reason = (
+        None
+        if end_reason_code == _NO_BOUNDARY_REASON
+        else _BOUNDARY_REASONS[end_reason_code]
+      )
+    except IndexError as exc:
+      raise RuntimeError("temporary segmentation span is invalid") from exc
+    if driver_censor_present not in (0, 1):
+      raise RuntimeError("temporary segmentation span is invalid")
+    return _Span(
+      start,
+      end,
+      phase,
+      _Run(run_start, run_end, start_reason, end_reason),
+      driver_censor_ns if driver_censor_present else None,
+    )
+
+  def append(self, span: _Span) -> None:
+    if self._finished:
+      raise RuntimeError("temporary segmentation spans are already finalized")
+    if self._open_episode_start is not None and (
+      span.phase is ManeuverPhase.STRAIGHT_QUASI_STEADY
+      or span.run != self._open_episode_run
+    ):
+      self._append_episode(self._open_episode_start, self._count)
+      self._open_episode_start = None
+      self._open_episode_run = None
+    if (
+      span.phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY
+      and self._open_episode_start is None
+    ):
+      self._open_episode_start = self._count
+      self._open_episode_run = span.run
+    encoded = _SPAN_RECORD.pack(
+      span.start,
+      span.end,
+      _PHASE_TO_CODE[span.phase],
+      span.run.start,
+      span.run.end,
+      (
+        _NO_BOUNDARY_REASON
+        if span.run.start_reason is None
+        else _BOUNDARY_REASON_TO_CODE[span.run.start_reason]
+      ),
+      (
+        _NO_BOUNDARY_REASON
+        if span.run.end_reason is None
+        else _BOUNDARY_REASON_TO_CODE[span.run.end_reason]
+      ),
+      int(span.driver_censor_ns is not None),
+      0 if span.driver_censor_ns is None else span.driver_censor_ns,
+    )
+    written = self._file.write(encoded)
+    if written != len(encoded):
+      raise RuntimeError("temporary segmentation span write made no progress")
+    self._count += 1
+
+  def _append_episode(self, start: int, end: int) -> None:
+    encoded = _EPISODE_RECORD.pack(start, end)
+    if self._episode_file.write(encoded) != len(encoded):
+      raise RuntimeError("temporary segmentation episode write made no progress")
+    self._episode_count += 1
+
+  def finish(self) -> None:
+    if self._finished:
+      return
+    if self._open_episode_start is not None:
+      self._append_episode(self._open_episode_start, self._count)
+      self._open_episode_start = None
+      self._open_episode_run = None
+    self._finished = True
+
+  def _episode(self, index: int) -> tuple[int, int]:
+    block_start = (index // _EPISODE_RECORDS_PER_BLOCK) * _EPISODE_RECORDS_PER_BLOCK
+    if block_start != self._episode_cache_start:
+      count = min(_EPISODE_RECORDS_PER_BLOCK, self._episode_count - block_start)
+      encoded = os.pread(
+        self._episode_file.fileno(),
+        count * _EPISODE_RECORD.size,
+        block_start * _EPISODE_RECORD.size,
+      )
+      if len(encoded) != count * _EPISODE_RECORD.size:
+        raise RuntimeError("temporary segmentation episode is truncated")
+      self._episode_cache = tuple(
+        _EPISODE_RECORD.unpack(encoded[offset:offset + _EPISODE_RECORD.size])
+        for offset in range(0, len(encoded), _EPISODE_RECORD.size)
+      )
+      self._episode_cache_start = block_start
+    return self._episode_cache[index - block_start]
+
+  def episode_bounds(self, anchor_index: int) -> tuple[int, int]:
+    """Find the non-straight episode containing one known non-straight span."""
+    low = 0
+    high = self._episode_count
+    while low < high:
+      middle = (low + high) // 2
+      start, end = self._episode(middle)
+      if anchor_index < start:
+        high = middle
+      elif anchor_index >= end:
+        low = middle + 1
+      else:
+        return start, end
+    raise RuntimeError("temporary segmentation episode index is inconsistent")
+
+
 def _validate_inputs(
   route_id: str,
-  samples: tuple[BehaviorSample, ...],
+  samples: Sequence[BehaviorSample],
   events: tuple[EventLocator, ...],
 ) -> None:
   if not route_id.strip():
     raise ValueError("route_id must not be empty")
   if not samples:
     raise ValueError("segmentation requires at least one sample")
-  if any(
-    right.mono_time_ns <= left.mono_time_ns or right.route_time_s <= left.route_time_s
-    for left, right in zip(samples, samples[1:], strict=False)
-  ):
-    raise ValueError("samples must be strictly ordered by mono and route time")
+  for index in range(1, len(samples)):
+    left = samples[index - 1]
+    right = samples[index]
+    if right.mono_time_ns <= left.mono_time_ns or right.route_time_s <= left.route_time_s:
+      raise ValueError("samples must be strictly ordered by mono and route time")
   keys = tuple((event.occurred_mono_time_ns, event.event_type, event.severity) for event in events)
   if keys != tuple(sorted(keys)):
     raise ValueError("event locators must be in canonical timestamp order")
 
 
-def _valid_runs(samples: tuple[BehaviorSample, ...], config: SegmentationConfig) -> tuple[_Run, ...]:
-  runs: list[_Run] = []
+def _valid_runs(samples: Sequence[BehaviorSample], config: SegmentationConfig) -> Iterator[_Run]:
   start: int | None = None
   start_reason: BoundaryReason | None = None
   end_reason: BoundaryReason | None = None
@@ -285,7 +613,7 @@ def _valid_runs(samples: tuple[BehaviorSample, ...], config: SegmentationConfig)
         if gap
         else BoundaryReason.PHASE_INCOMPLETE_AT_INVALID_INPUT
       )
-      runs.append(_Run(start, index, start_reason, end_reason))
+      yield _Run(start, index, start_reason, end_reason)
       start = None
     if valid and start is None:
       if gap:
@@ -296,11 +624,10 @@ def _valid_runs(samples: tuple[BehaviorSample, ...], config: SegmentationConfig)
         start_reason = None
       start = index
   if start is not None:
-    runs.append(_Run(start, len(samples), start_reason, BoundaryReason.PHASE_INCOMPLETE_AT_ROUTE_END))
-  return tuple(runs)
+    yield _Run(start, len(samples), start_reason, BoundaryReason.PHASE_INCOMPLETE_AT_ROUTE_END)
 
 
-def _reference_rate(samples: tuple[BehaviorSample, ...], run: _Run, index: int) -> float:
+def _reference_rate(samples: Sequence[BehaviorSample], run: _Run, index: int) -> float:
   if index > run.start:
     left = samples[index - 1]
     right = samples[index]
@@ -327,57 +654,90 @@ def _primitive_phase(sample: BehaviorSample, rate: float, config: SegmentationCo
   return ManeuverPhase.HOLD
 
 
+_LABEL_WRITE_CHUNK = 64 * 1024
+
+
+def _read_label(labels: mmap.mmap, index: int) -> ManeuverPhase:
+  encoded = labels[index]
+  if encoded >= len(_PHASE_CODES):
+    raise RuntimeError("temporary segmentation label is invalid")
+  return _PHASE_CODES[encoded]
+
+
+def _write_label_range(
+  labels: mmap.mmap,
+  start: int,
+  end: int,
+  phase: ManeuverPhase,
+) -> None:
+  encoded = bytes((_PHASE_TO_CODE[phase],))
+  cursor = start
+  while cursor < end:
+    chunk_end = min(cursor + _LABEL_WRITE_CHUNK, end)
+    labels[cursor:chunk_end] = encoded * (chunk_end - cursor)
+    cursor = chunk_end
+
+
 def _apply_direct_handoffs(
-  samples: tuple[BehaviorSample, ...],
+  samples: Sequence[BehaviorSample],
   run: _Run,
-  labels: list[ManeuverPhase],
+  labels: mmap.mmap,
   config: SegmentationConfig,
 ) -> None:
-  meaningful = [
-    index
-    for index in range(run.start, run.end)
-    if abs(samples[index].anchored_curvature_1pm) >= config.direct_handoff_min_peak_curvature_1pm
-  ]
-  for left, right in zip(meaningful, meaningful[1:], strict=False):
-    left_curvature = samples[left].anchored_curvature_1pm
+  previous_meaningful: int | None = None
+  for right in range(run.start, run.end):
     right_curvature = samples[right].anchored_curvature_1pm
+    if abs(right_curvature) < config.direct_handoff_min_peak_curvature_1pm:
+      continue
+    left = previous_meaningful
+    previous_meaningful = right
+    if left is None:
+      continue
+    left_curvature = samples[left].anchored_curvature_1pm
     if left_curvature * right_curvature >= 0.0:
       continue
     if samples[right].route_time_s - samples[left].route_time_s > config.direct_handoff_max_neutral_duration_s:
       continue
     start = left
-    while start > run.start and labels[start - 1] is ManeuverPhase.RELEASE_UNWIND:
+    while start > run.start and _read_label(labels, start - 1) is ManeuverPhase.RELEASE_UNWIND:
       start -= 1
     end = right + 1
-    while end < run.end and labels[end] is ManeuverPhase.TURN_IN:
+    while end < run.end and _read_label(labels, end) is ManeuverPhase.TURN_IN:
       end += 1
-    for index in range(start, end):
-      labels[index] = ManeuverPhase.DIRECT_HANDOFF
+    _write_label_range(labels, start, end, ManeuverPhase.DIRECT_HANDOFF)
 
 
 def _raw_spans(
-  samples: tuple[BehaviorSample, ...],
-  runs: tuple[_Run, ...],
+  samples: Sequence[BehaviorSample],
+  runs: Iterable[_Run],
   config: SegmentationConfig,
-) -> tuple[_Span, ...]:
-  spans: list[_Span] = []
-  for run in runs:
-    labels = [ManeuverPhase.STRAIGHT_QUASI_STEADY] * len(samples)
-    for index in range(run.start, run.end):
-      labels[index] = _primitive_phase(samples[index], _reference_rate(samples, run, index), config)
-    _apply_direct_handoffs(samples, run, labels, config)
-    start = run.start
-    for index in range(run.start + 1, run.end + 1):
-      if index == run.end or labels[index] is not labels[start]:
-        spans.append(_Span(start, index, labels[start], run))
-        start = index
-  return tuple(spans)
+) -> Iterator[_Span]:
+  with tempfile.TemporaryFile(prefix="blatv2-segmentation-") as labels:
+    labels.truncate(len(samples))
+    with mmap.mmap(labels.fileno(), len(samples), access=mmap.ACCESS_WRITE) as mapped:
+      for run in runs:
+        for index in range(run.start, run.end):
+          _write_label_range(
+            mapped,
+            index,
+            index + 1,
+            _primitive_phase(samples[index], _reference_rate(samples, run, index), config),
+          )
+        _apply_direct_handoffs(samples, run, mapped, config)
+        start = run.start
+        start_phase = _read_label(mapped, start)
+        for index in range(run.start + 1, run.end + 1):
+          if index == run.end or _read_label(mapped, index) is not start_phase:
+            yield _Span(start, index, start_phase, run)
+            start = index
+            if index < run.end:
+              start_phase = _read_label(mapped, index)
 
 
 def _phase_completed(left: _Span, next_span: _Span | None) -> bool:
   if left.phase is ManeuverPhase.STRAIGHT_QUASI_STEADY:
     return True
-  if next_span is None or next_span.run is not left.run:
+  if next_span is None or next_span.run != left.run:
     return False
   allowed = {
     ManeuverPhase.TURN_IN: (ManeuverPhase.HOLD, ManeuverPhase.RELEASE_UNWIND, ManeuverPhase.DIRECT_HANDOFF),
@@ -389,9 +749,9 @@ def _phase_completed(left: _Span, next_span: _Span | None) -> bool:
 
 
 def _censor_spans(
-  samples: tuple[BehaviorSample, ...],
-  spans: tuple[_Span, ...],
-) -> tuple[_Span, ...]:
+  samples: Sequence[BehaviorSample],
+  spans: Iterable[_Span],
+) -> Iterator[_Span]:
   """Censor from intervention onset through the whole active episode.
 
   Straight curvature is not a lifecycle boundary.  Neither an invalid input
@@ -399,42 +759,42 @@ def _censor_spans(
   lateral-inactive sample clears the censor; evidence may then resume on the
   next inactive-to-active transition.
   """
-  censor_by_sample: list[int | None] = []
   censor_ns: int | None = None
-  for sample in samples:
-    if not sample.lateral_active:
-      censor_ns = None
-    elif sample.driver_intervention_onset and censor_ns is None:
-      censor_ns = sample.mono_time_ns
-    censor_by_sample.append(censor_ns)
-
-  result: list[_Span] = []
+  cursor = 0
   for span in spans:
-    active_censor_ns = next(
-      (
-        value
-        for value in censor_by_sample[span.start:span.end]
-        if value is not None
-      ),
-      None,
-    )
-    result.append(_Span(
+    while cursor < span.start:
+      sample = samples[cursor]
+      if not sample.lateral_active:
+        censor_ns = None
+      elif sample.driver_intervention_onset and censor_ns is None:
+        censor_ns = sample.mono_time_ns
+      cursor += 1
+    active_censor_ns: int | None = None
+    while cursor < span.end:
+      sample = samples[cursor]
+      if not sample.lateral_active:
+        censor_ns = None
+      elif sample.driver_intervention_onset and censor_ns is None:
+        censor_ns = sample.mono_time_ns
+      if active_censor_ns is None and censor_ns is not None:
+        active_censor_ns = censor_ns
+      cursor += 1
+    yield _Span(
       span.start,
       span.end,
       span.phase,
       span.run,
       active_censor_ns,
-    ))
-  return tuple(result)
+    )
 
 
-def _qualifies(span: _Span, samples: tuple[BehaviorSample, ...], config: SegmentationConfig) -> bool:
+def _qualifies(span: _Span, samples: Sequence[BehaviorSample], config: SegmentationConfig) -> bool:
   count = span.end - span.start
   duration = samples[span.end - 1].route_time_s - samples[span.start].route_time_s
   return count >= config.minimum_phase_samples and duration >= config.minimum_phase_duration_s
 
 
-def _maneuver_class(span: _Span, samples: tuple[BehaviorSample, ...], config: SegmentationConfig) -> ManeuverClass:
+def _maneuver_class(span: _Span, samples: Sequence[BehaviorSample], config: SegmentationConfig) -> ManeuverClass:
   if span.phase is ManeuverPhase.STRAIGHT_QUASI_STEADY:
     return ManeuverClass.STRAIGHT
   if span.phase is ManeuverPhase.DIRECT_HANDOFF:
@@ -445,34 +805,31 @@ def _maneuver_class(span: _Span, samples: tuple[BehaviorSample, ...], config: Se
 
 def _metric_crossing_observed(
   span: _Span,
-  samples: tuple[BehaviorSample, ...],
+  samples: Sequence[BehaviorSample],
   config: SegmentationConfig,
 ) -> bool | None:
   """Report whether the committed timing crossing exists inside the phase."""
-  magnitudes = tuple(abs(sample.anchored_curvature_1pm) for sample in samples[span.start:span.end])
-  peak = max(magnitudes)
+  peak = max(abs(samples[index].anchored_curvature_1pm) for index in range(span.start, span.end))
+  def crosses(threshold: float, rising: bool) -> bool:
+    previous = abs(samples[span.start].anchored_curvature_1pm)
+    for index in range(span.start + 1, span.end):
+      current = abs(samples[index].anchored_curvature_1pm)
+      if (previous < threshold <= current) if rising else (previous >= threshold > current):
+        return True
+      previous = current
+    return False
   if span.phase is ManeuverPhase.TURN_IN:
     threshold = peak * config.turn_in_crossing_fraction
-    return any(left < threshold <= right for left, right in zip(magnitudes, magnitudes[1:], strict=False))
+    return crosses(threshold, True)
   if span.phase is ManeuverPhase.RELEASE_UNWIND:
     threshold = peak * config.release_onset_fraction
-    return any(left >= threshold > right for left, right in zip(magnitudes, magnitudes[1:], strict=False))
+    return crosses(threshold, False)
   return None
 
 
-def _episode_bounds(spans: tuple[_Span, ...], anchor_index: int) -> tuple[int, int]:
-  start = anchor_index
-  while start > 0 and spans[start - 1].run is spans[anchor_index].run and spans[start - 1].phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY:
-    start -= 1
-  end = anchor_index + 1
-  while end < len(spans) and spans[end].run is spans[anchor_index].run and spans[end].phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY:
-    end += 1
-  return start, end
-
-
 def _event_coverage(
-  samples: tuple[BehaviorSample, ...],
-  spans: tuple[_Span, ...],
+  samples: Sequence[BehaviorSample],
+  spans: _SpanScratch,
   events: tuple[EventLocator, ...],
   config: SegmentationConfig,
 ) -> tuple[EventCoverage, ...]:
@@ -480,19 +837,42 @@ def _event_coverage(
   route_start = samples[0].mono_time_ns
   route_end = samples[-1].mono_time_ns
   extension_ns = round(config.maximum_phase_extension_s * 1e9)
+  nonstraight_indices = array("Q")
+  nonstraight_starts = array("Q")
+  nonstraight_ends = array("Q")
+  for span_index, span in enumerate(spans):
+    if span.phase is ManeuverPhase.STRAIGHT_QUASI_STEADY:
+      continue
+    nonstraight_indices.append(span_index)
+    nonstraight_starts.append(samples[span.start].mono_time_ns)
+    nonstraight_ends.append(samples[span.end - 1].mono_time_ns)
   for event_index, event in enumerate(events):
     before_ns = round(event.analysis_window_before_s * 1e9)
     after_ns = round(event.analysis_window_after_s * 1e9)
     nominal_start = max(route_start, event.occurred_mono_time_ns - before_ns)
     nominal_end = min(route_end, event.occurred_mono_time_ns + after_ns)
-    candidates = [
-      (index, span)
-      for index, span in enumerate(spans)
-      if span.phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY
-      and samples[span.end - 1].mono_time_ns >= nominal_start
-      and samples[span.start].mono_time_ns <= nominal_end
-    ]
-    if not candidates:
+    anchor_index: int | None = None
+    anchor_key: tuple[int, int, int] | None = None
+    insertion = bisect_right(nonstraight_starts, event.occurred_mono_time_ns)
+    for candidate in (insertion - 1, insertion):
+      if not 0 <= candidate < len(nonstraight_indices):
+        continue
+      index = nonstraight_indices[candidate]
+      span_start_ns = nonstraight_starts[candidate]
+      span_end_ns = nonstraight_ends[candidate]
+      if span_end_ns < nominal_start or span_start_ns > nominal_end:
+        continue
+      key = (
+        0
+        if span_start_ns <= event.occurred_mono_time_ns <= span_end_ns
+        else 1,
+        abs(span_start_ns - event.occurred_mono_time_ns),
+        index,
+      )
+      if anchor_key is None or key < anchor_key:
+        anchor_index = index
+        anchor_key = key
+    if anchor_index is None:
       coverages.append(EventCoverage(
         locator=event,
         physical_start_mono_time_ns=None,
@@ -505,15 +885,7 @@ def _event_coverage(
         stop_reason=EventCoverageStop.NO_MANEUVER,
       ))
       continue
-    anchor_index, _ = min(
-      candidates,
-      key=lambda item: (
-        0 if samples[item[1].start].mono_time_ns <= event.occurred_mono_time_ns <= samples[item[1].end - 1].mono_time_ns else 1,
-        abs(samples[item[1].start].mono_time_ns - event.occurred_mono_time_ns),
-        item[0],
-      ),
-    )
-    episode_start, episode_end = _episode_bounds(spans, anchor_index)
+    episode_start, episode_end = spans.episode_bounds(anchor_index)
     physical_start = samples[spans[episode_start].start].mono_time_ns
     desired_end = samples[spans[episode_end - 1].end - 1].mono_time_ns
     maximum_end = nominal_end + extension_ns
@@ -569,6 +941,145 @@ def _event_coverage(
   return tuple(coverages)
 
 
+def _attach_events_to_descriptors(
+  samples: Sequence[BehaviorSample],
+  descriptors: list[BehaviorPhaseSpan],
+  coverage: tuple[EventCoverage, ...],
+  config: SegmentationConfig,
+) -> tuple[BehaviorPhaseSpan, ...]:
+  """Attach only interval overlaps, with work proportional to real output."""
+  if not descriptors or not coverage:
+    return tuple(descriptors)
+  starts = array(
+    "Q",
+    (samples[item.start_sample_index].mono_time_ns for item in descriptors),
+  )
+  ends = array(
+    "Q",
+    (samples[item.end_sample_index_exclusive - 1].mono_time_ns for item in descriptors),
+  )
+  attachments: list[list[EventLocator]] = [[] for _ in descriptors]
+  attachment_count = 0
+  for item in coverage:
+    if item.physical_start_mono_time_ns is None or item.physical_end_mono_time_ns is None:
+      continue
+    index = bisect_left(ends, item.physical_start_mono_time_ns)
+    while index < len(descriptors) and starts[index] <= item.physical_end_mono_time_ns:
+      attachments[index].append(item.locator)
+      attachment_count += 1
+      if attachment_count > config.maximum_event_phase_attachments:
+        raise SegmentationResourceError(
+          "route exceeds maximum event-to-phase attachment work",
+        )
+      index += 1
+  return tuple(
+    replace(descriptor, event_locators=tuple(events))
+    for descriptor, events in zip(descriptors, attachments, strict=True)
+  )
+
+
+def _bounded_event_locators(
+  event_locators: Iterable[EventLocator],
+  maximum: int,
+) -> tuple[EventLocator, ...]:
+  values: list[EventLocator] = []
+  for value in event_locators:
+    if len(values) >= maximum:
+      raise SegmentationResourceError("route exceeds maximum event-locator work")
+    values.append(value)
+  return tuple(values)
+
+
+def segment_behavior_spans(
+  route_id: str,
+  source: BehaviorSourceIdentity,
+  samples: Sequence[BehaviorSample],
+  event_locators: Iterable[EventLocator],
+  config: SegmentationConfig,
+) -> BehaviorSegmentationSpans:
+  """Segment a re-iterable sample view without copying its sample payload."""
+  event_values = _bounded_event_locators(
+    event_locators,
+    config.maximum_event_locators,
+  )
+  _validate_inputs(route_id, samples, event_values)
+  runs = _valid_runs(samples, config)
+  raw_spans = _raw_spans(samples, runs, config)
+  descriptors: list[BehaviorPhaseSpan] = []
+  assigned_ranges: list[tuple[int, int]] = []
+  with _SpanScratch() as censored_spans:
+    for span in _censor_spans(samples, raw_spans):
+      if len(censored_spans) >= config.maximum_raw_phase_spans:
+        raise SegmentationResourceError("route exceeds maximum raw phase-span work")
+      censored_spans.append(span)
+    censored_spans.finish()
+    coverage = _event_coverage(samples, censored_spans, event_values, config)
+    for span_index, span in enumerate(censored_spans):
+      if not _qualifies(span, samples, config):
+        continue
+      # The onset-containing phase retains post-contact samples as diagnostic
+      # context; BehaviorWindow censors them.  Later phases in the same maneuver
+      # are omitted through the remainder of the same lateral-active episode.
+      # Only a real inactive-to-active boundary can begin independent evidence.
+      if span.driver_censor_ns is not None and not any(
+        samples[index].driver_intervention_onset for index in range(span.start, span.end)
+      ):
+        continue
+      next_span = censored_spans[span_index + 1] if span_index + 1 < len(censored_spans) else None
+      onset_observed = not (
+        span.start == span.run.start
+        and span.phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY
+        and (span.run.start == 0 or span.run.start_reason is not None)
+      )
+      completion_observed = _phase_completed(span, next_span)
+      reasons: list[BoundaryReason] = []
+      if not onset_observed:
+        reasons.append(BoundaryReason.PHASE_ONSET_PRECEDES_AVAILABLE_EVIDENCE)
+      if not completion_observed and span.phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY:
+        if span.run.end_reason is not None:
+          reasons.append(span.run.end_reason)
+      if span.driver_censor_ns is not None:
+        reasons.append(BoundaryReason.DRIVER_INTERVENTION_CENSOR)
+      if len(descriptors) >= config.maximum_phase_windows:
+        raise SegmentationResourceError("route exceeds maximum retained phase-window work")
+      window_id = f"{route_id}:{len(descriptors):06d}:{span.phase.value}:{samples[span.start].mono_time_ns}-{samples[span.end - 1].mono_time_ns}"
+      observability = WindowObservability(
+        onset_observed=onset_observed,
+        completion_observed=completion_observed,
+        metric_crossing_observed=_metric_crossing_observed(span, samples, config),
+        reasons=tuple(dict.fromkeys(reasons)),
+        driver_censor_mono_time_ns=span.driver_censor_ns,
+      )
+      descriptors.append(BehaviorPhaseSpan(
+        window_id=window_id,
+        maneuver_class=_maneuver_class(span, samples, config),
+        phase=span.phase,
+        start_sample_index=span.start,
+        end_sample_index_exclusive=span.end,
+        event_locators=(),
+        observability=observability,
+      ))
+      assigned_ranges.append((span.start, span.end))
+    retained_descriptors = _attach_events_to_descriptors(
+      samples,
+      descriptors,
+      coverage,
+      config,
+    )
+    unassigned = _UnassignedSampleIndices.from_assigned_ranges(
+      len(samples),
+      tuple(assigned_ranges),
+    )
+  return BehaviorSegmentationSpans(
+    route_id=route_id,
+    source_identity_sha256=source.sha256,
+    config_sha256=config.sha256,
+    spans=retained_descriptors,
+    event_coverage=coverage,
+    unassigned_sample_indices=unassigned,
+  )
+
+
 def segment_behavior_route(
   route_id: str,
   source: BehaviorSourceIdentity,
@@ -578,76 +1089,29 @@ def segment_behavior_route(
 ) -> SegmentationResult:
   """Segment one route into canonical, non-overlapping physical phases."""
   sample_values = tuple(samples)
-  event_values = tuple(event_locators)
-  _validate_inputs(route_id, sample_values, event_values)
-  runs = _valid_runs(sample_values, config)
-  raw_spans = _raw_spans(sample_values, runs, config)
-  censored_spans = _censor_spans(sample_values, raw_spans)
-  coverage = _event_coverage(sample_values, censored_spans, event_values, config)
-  windows: list[SegmentedBehaviorWindow] = []
-  assigned: set[int] = set()
-  for span_index, span in enumerate(censored_spans):
-    if not _qualifies(span, sample_values, config):
-      continue
-    # The onset-containing phase retains post-contact samples as diagnostic
-    # context; BehaviorWindow censors them.  Later phases in the same maneuver
-    # are omitted through the remainder of the same lateral-active episode.
-    # Only a real inactive-to-active boundary can begin independent evidence.
-    if span.driver_censor_ns is not None and not any(
-      sample.driver_intervention_onset for sample in sample_values[span.start:span.end]
-    ):
-      continue
-    next_span = censored_spans[span_index + 1] if span_index + 1 < len(censored_spans) else None
-    onset_observed = not (
-      span.start == span.run.start
-      and span.phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY
-      and (span.run.start == 0 or span.run.start_reason is not None)
-    )
-    completion_observed = _phase_completed(span, next_span)
-    reasons: list[BoundaryReason] = []
-    if not onset_observed:
-      reasons.append(BoundaryReason.PHASE_ONSET_PRECEDES_AVAILABLE_EVIDENCE)
-    if not completion_observed and span.phase is not ManeuverPhase.STRAIGHT_QUASI_STEADY:
-      if span.run.end_reason is not None:
-        reasons.append(span.run.end_reason)
-    if span.driver_censor_ns is not None:
-      reasons.append(BoundaryReason.DRIVER_INTERVENTION_CENSOR)
-    attached_events = tuple(
-      coverage_item.locator
-      for coverage_item in coverage
-      if coverage_item.physical_start_mono_time_ns is not None
-      and coverage_item.physical_end_mono_time_ns is not None
-      and sample_values[span.end - 1].mono_time_ns >= coverage_item.physical_start_mono_time_ns
-      and sample_values[span.start].mono_time_ns <= coverage_item.physical_end_mono_time_ns
-    )
-    window_id = f"{route_id}:{len(windows):06d}:{span.phase.value}:{sample_values[span.start].mono_time_ns}-{sample_values[span.end - 1].mono_time_ns}"
-    window = BehaviorWindow(
-      route_id=route_id,
-      window_id=window_id,
-      source=source,
-      maneuver_class=_maneuver_class(span, sample_values, config),
-      phase=span.phase,
-      samples=sample_values[span.start:span.end],
-      event_locators=attached_events,
-    )
-    windows.append(SegmentedBehaviorWindow(
-      window=window,
-      start_sample_index=span.start,
-      end_sample_index_exclusive=span.end,
-      observability=WindowObservability(
-        onset_observed=onset_observed,
-        completion_observed=completion_observed,
-        metric_crossing_observed=_metric_crossing_observed(span, sample_values, config),
-        reasons=tuple(dict.fromkeys(reasons)),
-        driver_censor_mono_time_ns=span.driver_censor_ns,
+  segmented = segment_behavior_spans(route_id, source, sample_values, event_locators, config)
+  windows = tuple(
+    SegmentedBehaviorWindow(
+      window=BehaviorWindow(
+        route_id=route_id,
+        window_id=span.window_id,
+        source=source,
+        maneuver_class=span.maneuver_class,
+        phase=span.phase,
+        samples=sample_values[span.start_sample_index:span.end_sample_index_exclusive],
+        event_locators=span.event_locators,
       ),
-    ))
-    assigned.update(range(span.start, span.end))
+      start_sample_index=span.start_sample_index,
+      end_sample_index_exclusive=span.end_sample_index_exclusive,
+      observability=span.observability,
+    )
+    for span in segmented.spans
+  )
   return SegmentationResult(
-    route_id=route_id,
-    source_identity_sha256=source.sha256,
-    config_sha256=config.sha256,
-    windows=tuple(windows),
-    event_coverage=coverage,
-    unassigned_sample_indices=tuple(index for index in range(len(sample_values)) if index not in assigned),
+    route_id=segmented.route_id,
+    source_identity_sha256=segmented.source_identity_sha256,
+    config_sha256=segmented.config_sha256,
+    windows=windows,
+    event_coverage=segmented.event_coverage,
+    unassigned_sample_indices=tuple(segmented.unassigned_sample_indices),
   )

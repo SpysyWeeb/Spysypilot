@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
+import gc
 import hashlib
+import json
+import math
 import os
 from pathlib import Path
 import struct
 import tempfile
+import tracemalloc
 
 import pytest  # noqa: TID251
 
+from openpilot.selfdrive.controls.lib.blatv2 import route_evidence as route_evidence_module
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import _encode_frame
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import MeasuredLearningFrame
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
@@ -20,7 +26,9 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ModelPublication,
   RouteEvidenceArtifact,
   RouteEvidenceError,
+  RouteEvidenceFileSummary,
   RouteEvidenceSourceIdentity,
+  RouteEvidenceStreamReader,
   RouteEvidenceStore,
   inspect_route_evidence_file,
 )
@@ -102,12 +110,75 @@ TORQUE = (LiveTorqueParametersPublication(0, 0, 940, 2.5, 0.0, 0.1, 1, True, Tru
 DELAY = (LiveDelayPublication(0, 0, 941, 0.12, 1, True, "valid"),)
 MANEUVER = (LateralManeuverPlanPublication(0, 0, 942, -0.012, True),)
 EVENTS = (DrivingEventLocator(0, 0, 1_020, 1_000, 6.0, 2.0, "event-1", "lat.turnStopTurn", "warning", True),)
+_ROUTE_HEADER = struct.Struct("<8sHH9Q")
+_SECTION_NAMES = (
+  "manifest", "car_params", "physical", "models", "controls",
+  "live_torque", "live_delay", "maneuvers", "events",
+)
 
 
 def artifact(raw: float = -0.0) -> RouteEvidenceArtifact:
   return RouteEvidenceArtifact(
     source(), CP, PHYSICAL, (model(0), model(1)),
     (witness(0, raw), witness(1, 0.25)), TORQUE, DELAY, MANEUVER, EVENTS,
+  )
+
+
+def _manifest(encoded: bytes) -> dict[str, object]:
+  sizes = _ROUTE_HEADER.unpack_from(encoded)[3:]
+  payload = json.loads(encoded[_ROUTE_HEADER.size:_ROUTE_HEADER.size + sizes[0]])
+  assert isinstance(payload, dict)
+  return payload
+
+
+def _mutate_section(
+  encoded: bytes,
+  name: str,
+  mutate: Callable[[bytearray], None],
+) -> bytes:
+  sizes = _ROUTE_HEADER.unpack_from(encoded)[3:]
+  section_index = _SECTION_NAMES.index(name)
+  start = _ROUTE_HEADER.size + sum(sizes[:section_index])
+  end = start + sizes[section_index]
+  section = bytearray(encoded[start:end])
+  mutate(section)
+  assert len(section) == sizes[section_index]
+  manifest = _manifest(encoded)
+  section_hashes = manifest["section_sha256"]
+  assert isinstance(section_hashes, dict)
+  section_hashes[name] = hashlib.sha256(section).hexdigest()
+  if name == "physical":
+    manifest["physical_plane_sha256"] = hashlib.sha256(section).hexdigest()
+  rebuilt_manifest = json.dumps(
+    manifest, allow_nan=False, separators=(",", ":"), sort_keys=True,
+  ).encode()
+  assert len(rebuilt_manifest) == sizes[0]
+  manifest_end = _ROUTE_HEADER.size + sizes[0]
+  return b"".join((
+    encoded[:_ROUTE_HEADER.size],
+    rebuilt_manifest,
+    encoded[manifest_end:start],
+    section,
+    encoded[end:],
+  ))
+
+
+def _unchecked_summary(
+  path: Path,
+  trusted: RouteEvidenceFileSummary,
+  encoded: bytes,
+) -> RouteEvidenceFileSummary:
+  info = path.stat()
+  return replace(
+    trusted,
+    path=path,
+    sha256=hashlib.sha256(encoded).hexdigest(),
+    manifest=_manifest(encoded),
+    st_dev=info.st_dev,
+    st_ino=info.st_ino,
+    st_size=info.st_size,
+    st_mtime_ns=info.st_mtime_ns,
+    st_ctime_ns=info.st_ctime_ns,
   )
 
 
@@ -156,6 +227,96 @@ def test_rejects_old_spool_and_corrupt_sections() -> None:
     RouteEvidenceArtifact.from_bytes(encoded)
   with pytest.raises(RouteEvidenceError):
     RouteEvidenceArtifact.from_bytes(artifact().canonical_bytes + b"x")
+
+
+@pytest.mark.parametrize("mutation", ("noncanonical_bool", "nonfinite_numeric"))
+def test_physical_records_are_canonical_in_eager_inspector_and_stream_paths(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  mutation: str,
+) -> None:
+  expected = artifact()
+  path = tmp_path / f"physical-{mutation}.route-evidence"
+  path.write_bytes(expected.canonical_bytes)
+  trusted = inspect_route_evidence_file(path)
+
+  def mutate_physical(section: bytearray) -> None:
+    if mutation == "noncanonical_bool":
+      # Four int64 clocks and nine float64 values precede the twelve bools;
+      # lateral_active is the seventh bool.
+      section[struct.calcsize("<4q9d") + 6] = 2
+    else:
+      struct.pack_into("<d", section, struct.calcsize("<4q"), math.nan)
+
+  forged = _mutate_section(expected.canonical_bytes, "physical", mutate_physical)
+  with pytest.raises(RouteEvidenceError, match="physical"):
+    RouteEvidenceArtifact.from_bytes(forged)
+
+  path.write_bytes(forged)
+  with pytest.raises(RouteEvidenceError, match="physical"):
+    inspect_route_evidence_file(path)
+
+  summary = _unchecked_summary(path, trusted, forged)
+  monkeypatch.setattr(
+    route_evidence_module,
+    "inspect_route_evidence_file",
+    lambda _: summary,
+  )
+  with RouteEvidenceStreamReader(path) as stream:
+    with pytest.raises(RouteEvidenceError, match="physical"):
+      tuple(stream.iter_physical_frames())
+
+
+def test_event_ids_are_unique_in_direct_eager_inspector_and_stream_paths(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  second = replace(
+    EVENTS[0],
+    ordinal=1,
+    publication_mono_time_ns=1_021,
+    occurred_mono_time_ns=1_001,
+    event_id="event-2",
+  )
+  duplicate = replace(second, event_id=EVENTS[0].event_id)
+  with pytest.raises(RouteEvidenceError, match="not unique"):
+    RouteEvidenceArtifact(
+      source(), CP, PHYSICAL, (model(0), model(1)),
+      (witness(0), witness(1)), TORQUE, DELAY, MANEUVER,
+      (EVENTS[0], duplicate),
+    )
+
+  expected = RouteEvidenceArtifact(
+    source(), CP, PHYSICAL, (model(0), model(1)),
+    (witness(0), witness(1)), TORQUE, DELAY, MANEUVER,
+    (EVENTS[0], second),
+  )
+  path = tmp_path / "duplicate-event-id.route-evidence"
+  path.write_bytes(expected.canonical_bytes)
+  trusted = inspect_route_evidence_file(path)
+
+  def duplicate_event_id(section: bytearray) -> None:
+    assert section.count(b"event-1") == 1
+    assert section.count(b"event-2") == 1
+    section[:] = section.replace(b"event-2", b"event-1")
+
+  forged = _mutate_section(expected.canonical_bytes, "events", duplicate_event_id)
+  with pytest.raises(RouteEvidenceError, match="not unique"):
+    RouteEvidenceArtifact.from_bytes(forged)
+
+  path.write_bytes(forged)
+  with pytest.raises(RouteEvidenceError, match="not unique"):
+    inspect_route_evidence_file(path)
+
+  summary = _unchecked_summary(path, trusted, forged)
+  monkeypatch.setattr(
+    route_evidence_module,
+    "inspect_route_evidence_file",
+    lambda _: summary,
+  )
+  with RouteEvidenceStreamReader(path) as stream:
+    with pytest.raises(RouteEvidenceError, match="not unique"):
+      tuple(stream.iter_event_locators())
 
 
 def test_indices_counts_and_exact_can_count_are_closed() -> None:
@@ -218,6 +379,95 @@ def test_streamed_inspection_authenticates_shape_and_store_object(tmp_path: Path
     source_key=expected.source_key,
   )
   assert store.inspect(expected.sha256).sha256 == expected.sha256
+  with store.open_stream(expected.sha256) as stream:
+    assert tuple(stream.iter_control_witnesses()) == expected.control_witnesses
+
+
+def test_stream_reader_matches_every_eager_plane_frame_for_frame(tmp_path: Path) -> None:
+  expected = artifact()
+  path = tmp_path / "stream.route-evidence"
+  path.write_bytes(expected.canonical_bytes)
+
+  with RouteEvidenceStreamReader(path) as stream:
+    assert stream.summary.sha256 == expected.sha256
+    assert stream.read_car_params_bytes() == bytes(expected.car_params_bytes)
+    assert tuple(stream.iter_physical_frames()) == tuple(expected.iter_physical_frames())
+    assert tuple(stream.iter_model_publications()) == expected.model_publications
+    assert tuple(stream.iter_control_witnesses()) == expected.control_witnesses
+    assert tuple(stream.iter_live_torque_parameters()) == expected.live_torque_parameters
+    assert tuple(stream.iter_live_delays()) == expected.live_delays
+    assert tuple(stream.iter_lateral_maneuver_plans()) == expected.lateral_maneuver_plans
+    assert tuple(stream.iter_event_locators()) == expected.event_locators
+
+  with pytest.raises(RouteEvidenceError, match="closed"):
+    stream.read_car_params_bytes()
+
+
+@pytest.mark.parametrize("mutation", ("tamper", "truncate"))
+def test_stream_reader_rejects_changes_to_held_artifact(
+  tmp_path: Path,
+  mutation: str,
+) -> None:
+  expected = artifact()
+  path = tmp_path / f"{mutation}.route-evidence"
+  path.write_bytes(expected.canonical_bytes)
+
+  with RouteEvidenceStreamReader(path) as stream:
+    with path.open("r+b") as output:
+      if mutation == "tamper":
+        output.seek(stream.summary.physical_offset)
+        output.write(b"\xff")
+      else:
+        output.truncate(stream.summary.physical_offset + 1)
+      output.flush()
+      os.fsync(output.fileno())
+    with pytest.raises(RouteEvidenceError, match="changed during streaming|truncated"):
+      tuple(stream.iter_physical_frames())
+
+
+def test_stream_reader_peak_memory_does_not_scale_with_record_count(tmp_path: Path) -> None:
+  def evidence_path(name: str, count: int) -> Path:
+    frames = tuple(frame(1_000 + index * 10) for index in range(count))
+    physical = b"".join(_encode_frame(value) for value in frames)
+    controls = tuple(
+      replace(
+        witness(0),
+        ordinal=index,
+        mono_time_ns=1_000 + index * 10,
+        physical_record_index=index,
+      )
+      for index in range(count)
+    )
+    identity = replace(
+      source(),
+      physical_record_count=count,
+      controls_witness_count=count,
+    )
+    value = RouteEvidenceArtifact(
+      identity, CP, physical, (model(0),), controls,
+      TORQUE, DELAY, MANEUVER, EVENTS,
+    )
+    path = tmp_path / f"{name}.route-evidence"
+    path.write_bytes(value.canonical_bytes)
+    return path
+
+  small = evidence_path("small", 20)
+  large = evidence_path("large", 5_000)
+  gc.collect()
+
+  def peak(path: Path) -> int:
+    tracemalloc.start()
+    try:
+      with RouteEvidenceStreamReader(path) as stream:
+        assert sum(1 for _ in stream.iter_physical_frames()) > 0
+        assert sum(1 for _ in stream.iter_control_witnesses()) > 0
+      return tracemalloc.get_traced_memory()[1]
+    finally:
+      tracemalloc.stop()
+
+  small_peak = peak(small)
+  large_peak = peak(large)
+  assert large_peak <= small_peak + 256 * 1024
 
 
 @pytest.mark.parametrize("pre_poll_count", (1, 3))

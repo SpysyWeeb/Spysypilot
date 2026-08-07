@@ -27,6 +27,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
   CalibrationLearningLifecycleState,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
+  CalibrationProfileLearner,
+  CalibrationSampleAccounting,
   CalibrationSampleDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
@@ -36,6 +38,9 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   make_calibration_seed_profile,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 
 
 DT = 0.01
@@ -101,22 +106,20 @@ class _Snapshot:
   supported_sample_count: int
   base_support_s: float
   base_sample_count: int
-  training_support_s: float
-  training_count: int
-  validation_support_s: float
-  validation_count: int
+  full_fit_support_s: float
+  full_fit_count: int
+  completed_route_count: int
+  base_completed_route_count: int
   moving_support_s: float
   moving_sample_count: int
-  moving_training_support_s: float
-  moving_training_count: int
-  moving_validation_support_s: float
-  moving_validation_count: int
+  moving_full_fit_support_s: float
+  moving_full_fit_count: int
+  moving_completed_route_count: int
   breakaway_support_s: float
   breakaway_sample_count: int
-  breakaway_training_support_s: float
-  breakaway_training_count: int
-  breakaway_validation_support_s: float
-  breakaway_validation_count: int
+  breakaway_full_fit_support_s: float
+  breakaway_full_fit_count: int
+  breakaway_episode_completed_route_count: int
   authority_support_s: float
   authority_sample_count: int
   authority_magnitude_sample_count: int
@@ -125,10 +128,9 @@ class _Snapshot:
   authority_unresolved_sample_count: int
   authority_fit_support_s: float
   authority_fit_sample_count: int
-  authority_training_support_s: float
-  authority_training_count: int
-  authority_validation_support_s: float
-  authority_validation_count: int
+  authority_full_fit_support_s: float
+  authority_full_fit_count: int
+  authority_completed_route_count: int
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -147,14 +149,14 @@ class _Report:
   moving_support_s: float
   moving_sample_count: int
   moving_reasons: tuple[_Reason, ...]
-  moving_seed_validation_rms: float | None
-  moving_candidate_validation_rms: float | None
+  moving_full_fit_seed_rms: float | None
+  moving_full_fit_candidate_rms: float | None
   breakaway_support_s: float
   breakaway_sample_count: int
   breakaway_reasons: tuple[_Reason, ...]
-  breakaway_seed_validation_rms: float | None
-  breakaway_candidate_validation_rms: float | None
-  inverse_calibration_validation_rms: float | None
+  breakaway_full_fit_seed_rms: float | None
+  breakaway_full_fit_candidate_rms: float | None
+  full_fit_candidate_rms: float | None
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -172,11 +174,12 @@ class _FakeCalibrationLearner:
     self.active_route_counter: int | None = None
     self.begun_route_counters: list[int] = []
     self.ended_route_counters: list[int] = []
+    self._accounting = CalibrationSampleAccounting.empty()
 
   @classmethod
   def from_evidence(cls, seed: VehicleCalibrationProfile, encoded: bytes) -> _FakeCalibrationLearner:
     payload = json.loads(encoded)
-    if payload["evidence_schema_version"] != 9:
+    if payload["evidence_schema_version"] != 10:
       raise ValueError("evidence schema is incompatible")
     if payload["vehicle_identity"] != seed.vehicle_identity:
       raise ValueError("evidence belongs to a different vehicle")
@@ -218,6 +221,28 @@ class _FakeCalibrationLearner:
     self.counts[self._node(sample.speed_mps)] += 1
     return True
 
+  def add_sample_with_disposition(
+    self,
+    sample: LearningSample,
+    *,
+    upstream_rejection: CalibrationSampleDisposition | None,
+    source_coordinate: CalibrationIngestionCoordinate | None,
+  ) -> CalibrationSampleDisposition:
+    del source_coordinate
+    disposition = (
+      upstream_rejection
+      if upstream_rejection is not None
+      else CalibrationSampleDisposition.ACCEPTED
+      if self.add_sample(sample)
+      else CalibrationSampleDisposition.LEARNER_INELIGIBLE
+    )
+    self._accounting = self._accounting.with_disposition(disposition)
+    return disposition
+
+  @property
+  def sample_accounting(self) -> CalibrationSampleAccounting:
+    return self._accounting
+
   def evidence_for_node(self, node_index: int) -> _Snapshot:
     count = self.counts[node_index]
     return _Snapshot(
@@ -225,22 +250,20 @@ class _FakeCalibrationLearner:
       supported_sample_count=count,
       base_support_s=count * DT,
       base_sample_count=count,
-      training_support_s=count * DT,
-      training_count=count,
-      validation_support_s=0.0,
-      validation_count=0,
+      full_fit_support_s=count * DT,
+      full_fit_count=count,
+      completed_route_count=int(bool(count)),
+      base_completed_route_count=int(bool(count)),
       moving_support_s=count * DT,
       moving_sample_count=count,
-      moving_training_support_s=count * DT,
-      moving_training_count=count,
-      moving_validation_support_s=0.0,
-      moving_validation_count=0,
+      moving_full_fit_support_s=count * DT,
+      moving_full_fit_count=count,
+      moving_completed_route_count=int(bool(count)),
       breakaway_support_s=count * DT,
       breakaway_sample_count=count,
-      breakaway_training_support_s=count * DT,
-      breakaway_training_count=count,
-      breakaway_validation_support_s=0.0,
-      breakaway_validation_count=0,
+      breakaway_full_fit_support_s=count * DT,
+      breakaway_full_fit_count=count,
+      breakaway_episode_completed_route_count=int(bool(count)),
       authority_support_s=0.0,
       authority_sample_count=0,
       authority_magnitude_sample_count=0,
@@ -249,10 +272,9 @@ class _FakeCalibrationLearner:
       authority_unresolved_sample_count=0,
       authority_fit_support_s=0.0,
       authority_fit_sample_count=0,
-      authority_training_support_s=0.0,
-      authority_training_count=0,
-      authority_validation_support_s=0.0,
-      authority_validation_count=0,
+      authority_full_fit_support_s=0.0,
+      authority_full_fit_count=0,
+      authority_completed_route_count=0,
       lateral_accel_span_mps2=0.8 if count else 0.0,
       applied_torque_span=0.4 if count else 0.0,
       lateral_accel_directions=2 if count else 0,
@@ -264,12 +286,19 @@ class _FakeCalibrationLearner:
     return json.dumps(
       {
         "counts": self.counts,
-        "evidence_schema_version": 9,
+        "evidence_schema_version": 10,
         "vehicle_identity": self.seed.vehicle_identity,
       },
       sort_keys=True,
       separators=(",", ":"),
     ).encode()
+
+  def export_authoritative_evidence(self) -> bytes:
+    return self.export_evidence()
+
+  @property
+  def route_commitments(self) -> tuple[object, ...]:
+    return ()
 
   def qualify(self, provenance: str) -> SimpleNamespace:
     reports = []
@@ -287,14 +316,14 @@ class _FakeCalibrationLearner:
           moving_support_s=count * DT,
           moving_sample_count=count,
           moving_reasons=(() if qualified else (_Reason.INSUFFICIENT_MOVING_EVIDENCE,)),
-          moving_seed_validation_rms=(0.02 if qualified else None),
-          moving_candidate_validation_rms=(0.01 if qualified else None),
+          moving_full_fit_seed_rms=(0.02 if qualified else None),
+          moving_full_fit_candidate_rms=(0.01 if qualified else None),
           breakaway_support_s=count * DT,
           breakaway_sample_count=count,
           breakaway_reasons=(() if qualified else (_Reason.INSUFFICIENT_BREAKAWAY_EVIDENCE,)),
-          breakaway_seed_validation_rms=(0.03 if qualified else None),
-          breakaway_candidate_validation_rms=(0.02 if qualified else None),
-          inverse_calibration_validation_rms=(0.03 if qualified else None),
+          breakaway_full_fit_seed_rms=(0.03 if qualified else None),
+          breakaway_full_fit_candidate_rms=(0.02 if qualified else None),
+          full_fit_candidate_rms=(0.03 if qualified else None),
           lateral_accel_span_mps2=(0.8 if count else 0.0),
           applied_torque_span=(0.4 if count else 0.0),
           lateral_accel_directions=(2 if count else 0),
@@ -317,9 +346,9 @@ class _FakeCalibrationLearner:
             moving_sample_count=report.moving_sample_count,
             breakaway_support_s=report.breakaway_support_s,
             breakaway_sample_count=report.breakaway_sample_count,
-            validation_count=report.base_sample_count,
-            inverse_calibration_validation_rms=0.03,
-            breakaway_validation_rms=0.02,
+            cross_fit_route_count=report.base_sample_count,
+            full_fit_candidate_rms=0.03,
+            breakaway_full_fit_candidate_rms=0.02,
           )
         )
       candidate = VehicleCalibrationProfile(
@@ -331,6 +360,7 @@ class _FakeCalibrationLearner:
     return SimpleNamespace(
       all_nodes_qualified=all_qualified,
       candidate_profile=candidate,
+      selected_profile=candidate,
       node_reports=tuple(reports),
       interpolation_reports=(),
       contains_learned_change=all_qualified,
@@ -391,8 +421,11 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
     self.assertEqual(diagnostic.base_sample_count, 1)
     self.assertEqual(diagnostic.moving_sample_count, 1)
     self.assertEqual(diagnostic.breakaway_sample_count, 1)
-    self.assertEqual(diagnostic.training_count, 1)
-    self.assertEqual(diagnostic.validation_count, 0)
+    self.assertEqual(diagnostic.full_fit_count, 1)
+    self.assertEqual(diagnostic.completed_route_count, 1)
+    self.assertEqual(diagnostic.base_completed_route_count, 1)
+    self.assertEqual(diagnostic.moving_completed_route_count, 1)
+    self.assertEqual(diagnostic.breakaway_episode_completed_route_count, 1)
     self.assertEqual(diagnostic.authority_sample_count, 0)
     self.assertEqual(diagnostic.authority_fit_sample_count, 0)
     self.assertEqual(diagnostic.lateral_accel_directions, 2)
@@ -487,21 +520,21 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
     manifest = json.loads(finalization.manifest_bytes)
     self.assertEqual(manifest["artifact_schema_version"], CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION)
-    self.assertEqual(manifest["artifact_schema_version"], 9)
-    self.assertEqual(manifest["evidence_schema_version"], 9)
+    self.assertEqual(manifest["artifact_schema_version"], 16)
+    self.assertEqual(manifest["evidence_schema_version"], 15)
     self.assertEqual(manifest["seed_profile_schema_version"], CALIBRATION_PROFILE_SCHEMA_VERSION)
-    self.assertEqual(manifest["seed_profile_schema_version"], 2)
+    self.assertEqual(manifest["seed_profile_schema_version"], 3)
     self.assertEqual(manifest["seed_profile_sha256"], hashlib.sha256(seed.to_json().encode()).hexdigest())
     self.assertEqual(manifest["evidence_sha256"], finalization.evidence_sha256)
     self.assertEqual(manifest["candidate_profile"]["profile_sha256"], finalization.candidate_profile_sha256)
     for report in manifest["node_reports"]:
       self.assertIn("base_support_s", report)
       self.assertIn("moving_reasons", report)
-      self.assertIn("moving_seed_validation_rms", report)
-      self.assertIn("moving_candidate_validation_rms", report)
+      self.assertIn("moving_full_fit_seed_rms", report)
+      self.assertIn("moving_full_fit_candidate_rms", report)
       self.assertIn("breakaway_reasons", report)
-      self.assertIn("breakaway_seed_validation_rms", report)
-      self.assertIn("breakaway_candidate_validation_rms", report)
+      self.assertIn("breakaway_full_fit_seed_rms", report)
+      self.assertIn("breakaway_full_fit_candidate_rms", report)
       self.assertNotIn("rack_gain", json.dumps(report))
       self.assertNotIn("rack_damping", json.dumps(report))
 
@@ -581,22 +614,75 @@ class TestBLaTv2CalibrationCoordinator(unittest.TestCase):
 
 
 class TestBLaTv2CalibrationCoordinatorRealLearner(unittest.TestCase):
-  def test_real_v9_report_is_manifest_compatible_and_restorable(self) -> None:
+  def test_structural_restore_cannot_self_authenticate_embedded_commitments(self) -> None:
+    seed = seed_profile()
+    learner = CalibrationProfileLearner(seed)
+    identity = route_sha(0x61)
+    learner.begin_route(identity, identity, route_counter=0x61)
+    learner.add_sample_with_disposition(
+      measured_sample(10.0, 0),
+      source_coordinate=CalibrationIngestionCoordinate(
+        identity,
+        0,
+        1_000_000_000,
+        0,
+      ),
+    )
+    learner.end_route()
+    encoded = learner.export_authoritative_evidence()
+
+    restored = CalibrationLearningCoordinator(seed, encoded)
+    self.assertFalse(restored._learner.evidence_authoritative)
+    with self.assertRaisesRegex(RuntimeError, "non-authoritative"):
+      restored.finalize()
+
+  def test_finalize_requires_authority_api_and_route_commitments(self) -> None:
+    coordinator = CalibrationLearningCoordinator(seed_profile())
+    coordinator._learner = SimpleNamespace()
+    with self.assertRaises(AttributeError):
+      coordinator.finalize()
+
+  def test_real_v12_report_is_manifest_compatible_and_restorable(self) -> None:
     seed = seed_profile()
     first = CalibrationLearningCoordinator(seed).finalize()
-    restored = CalibrationLearningCoordinator(seed, first.evidence_bytes).finalize()
+    restored = CalibrationLearningCoordinator(
+      seed,
+      first.evidence_bytes,
+      expected_route_commitments=(),
+    ).finalize()
     self.assertEqual(restored.evidence_bytes, first.evidence_bytes)
     self.assertEqual(restored.manifest_bytes, first.manifest_bytes)
     manifest = json.loads(first.manifest_bytes)
-    self.assertEqual(manifest["artifact_schema_version"], 9)
-    self.assertEqual(manifest["evidence_schema_version"], 9)
-    self.assertEqual(manifest["seed_profile_schema_version"], 2)
+    self.assertEqual(manifest["artifact_schema_version"], 16)
+    self.assertEqual(manifest["evidence_schema_version"], 15)
+    self.assertEqual(manifest["seed_profile_schema_version"], 3)
     for report in manifest["node_reports"]:
       self.assertIn("moving_reasons", report)
-      self.assertIn("moving_candidate_validation_rms", report)
+      self.assertIn("moving_full_fit_candidate_rms", report)
       self.assertIn("breakaway_reasons", report)
-      self.assertIn("breakaway_candidate_validation_rms", report)
+      self.assertIn("breakaway_full_fit_candidate_rms", report)
+      self.assertIn("independent_route_counts", report)
+      self.assertIn("cross_fit_diagnostics", report)
+      self.assertIn("full_fit_diagnostic", report)
+      self.assertIn("unresolved_diagnostics", report)
     self.assertEqual(manifest["interpolation_reports"], [])
+
+  def test_real_learner_support_diagnostics_use_completed_route_counts(self) -> None:
+    coordinator = CalibrationLearningCoordinator(seed_profile())
+    self.assertEqual(coordinator.support_diagnostics[2].completed_route_count, 0)
+    coordinator.transition_onroad(route_sha(0x62), route_counter=0x62)
+    self.assertTrue(coordinator.ingest(measured_sample(10.0, 1)))
+    self.assertEqual(coordinator.support_diagnostics[2].completed_route_count, 0)
+    coordinator.transition_offroad()
+    diagnostic = coordinator.support_diagnostics[2]
+    self.assertEqual(diagnostic.completed_route_count, 1)
+    self.assertEqual(
+      diagnostic.base_completed_route_count
+      + diagnostic.moving_completed_route_count
+      + diagnostic.breakaway_episode_completed_route_count
+      + diagnostic.authority_completed_route_count,
+      1,
+    )
 
 
 if __name__ == "__main__":

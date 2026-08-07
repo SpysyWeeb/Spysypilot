@@ -1,9 +1,10 @@
 """Engagement-bound live composition for the modular BLaTv2 controller.
 
 The existing stock ``LatControlTorque`` remains outside this module and is the
-sole actuator unless an exact, already-active approved artifact is eligible
-at the lateral-session boundary.  This module performs no profile staging,
-feedback processing, file/Params writes, or hot fallback.
+sole actuator unless an exact, already-active approved artifact or an explicit
+development trial is eligible at the lateral-session boundary. This module
+performs no profile staging, feedback processing, file/Params writes, or hot
+fallback.
 
 A lateral session (``enabled OR lateral_active``) owns one immutable selection.
 A bound modular
@@ -32,6 +33,7 @@ from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
 from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
   ControllerSelection,
   EngagementDecision,
+  profile_sha256,
 )
 from openpilot.selfdrive.controls.lib.blatv2.controller import (
   CandidateResult,
@@ -47,6 +49,7 @@ from openpilot.selfdrive.controls.lib.blatv2.live_adapter import (
   PreparedLiveInput,
   exact_applied_torque_counts,
 )
+from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
   RuntimeVehicleBundle,
@@ -59,8 +62,12 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 
 MODULAR_LIVE_ARCHITECTURE = "blatv2.modular.inverse-rack"
 MODULAR_LIVE_VERSION = 1
+EXPERIMENTAL_CONTROLLER_PARAM = "BLaTv2ExperimentalController"
 PROVISIONAL_RACK_DYNAMICS_PATH = (
   Path(__file__).resolve().parent / "provisional_rack_dynamics.json"
+)
+PROVISIONAL_CONTROLLER_POLICY_PATH = (
+  Path(__file__).resolve().parent / "provisional_controller_policy.json"
 )
 
 
@@ -81,6 +88,8 @@ class LiveEligibility(IntEnum):
   NO_EXACT_APPLIED_COUNT = 13
   LATERAL_MANEUVER_MODE = 14
   CALIBRATION_COMPOSITION_MISMATCH = 15
+  EXPERIMENTAL_PLATFORM_UNSUPPORTED = 16
+  EXPERIMENTAL_CONFIGURATION_INVALID = 17
 
 
 def control_witness_mono_ns() -> int:
@@ -90,7 +99,7 @@ def control_witness_mono_ns() -> int:
 
 
 class ModularLiveController:
-  """One preconstructed approved candidate and immutable engagement binding."""
+  """One preconstructed candidate and immutable engagement binding."""
 
   __slots__ = (
     "car_params",
@@ -99,6 +108,11 @@ class ModularLiveController:
     "activation",
     "activation_provisional",
     "artifact_diagnostic",
+    "experimental_requested",
+    "experimental_platform_compatible",
+    "experimental_active",
+    "controller_profile",
+    "controller_policy",
     "source_openpilot_commit",
     "opendbc_commit",
     "panda_commit",
@@ -138,6 +152,9 @@ class ModularLiveController:
     opendbc_commit: str,
     panda_commit: str,
     activation: PersistentProfileActivation | None = None,
+    experimental_requested: bool = False,
+    experimental_platform_compatible: bool = False,
+    experimental_policy: ControllerPolicy | None = None,
   ) -> None:
     self.car_params = car_params
     self.runtime_bundle = runtime_bundle
@@ -145,36 +162,74 @@ class ModularLiveController:
     self.activation = activation
     self.activation_provisional = bool(activation_provisional)
     self.artifact_diagnostic = artifact_diagnostic
+    self.experimental_requested = bool(experimental_requested)
+    self.experimental_platform_compatible = bool(
+      experimental_platform_compatible,
+    )
+    self.experimental_active = False
+    self.controller_profile = (
+      None if artifact is None else artifact.vehicle_profile
+    )
+    self.controller_policy = (
+      experimental_policy
+      if artifact is None
+      else artifact.controller_policy
+    )
+    if (
+      artifact is None
+      and self.experimental_requested
+      and runtime_bundle is not None
+    ):
+      try:
+        self.controller_profile = compose_controller_profile(
+          runtime_bundle.calibration_seed_profile,
+          runtime_bundle.seed_profile,
+        )
+      except (TypeError, ValueError, OverflowError):
+        self.controller_profile = None
     self.source_openpilot_commit = str(source_openpilot_commit)
     self.opendbc_commit = str(opendbc_commit)
     self.panda_commit = str(panda_commit)
     self.eligibility = self._validate_eligibility()
+    self.experimental_active = bool(
+      self.eligibility == LiveEligibility.ELIGIBLE
+      and artifact is None
+      and self.experimental_requested
+    )
     self.binding_reason = self.eligibility
     self.candidate: ModularControllerCandidate | None = None
     self.adapter: LiveInputAdapter | None = None
 
     if self.eligibility == LiveEligibility.ELIGIBLE:
-      if runtime_bundle is None or artifact is None:
-        raise AssertionError("eligible live controller lacks artifacts")
+      if (
+        runtime_bundle is None
+        or self.controller_profile is None
+        or self.controller_policy is None
+      ):
+        raise AssertionError("eligible live controller lacks a candidate")
       try:
         core = ModularControllerCore(
           fixed_dt_s=DT_CTRL,
-          profile=artifact.vehicle_profile,
-          tracking_policy=artifact.controller_policy.tracking_policy,
-          observer_policy=artifact.controller_policy.observer_policy,
+          profile=self.controller_profile,
+          tracking_policy=self.controller_policy.tracking_policy,
+          observer_policy=self.controller_policy.observer_policy,
           nominal_mapping=runtime_bundle.nominal_rack_mapping,
           plan_capacity=INTENT_CAPACITY,
         )
         self.candidate = ModularControllerCandidate(
           core=core,
           runtime_limits=runtime_bundle.torque_limits,
+          development_unqualified_profile_authorized=(
+            self.experimental_active
+          ),
         )
         self.adapter = LiveInputAdapter(
           car_params=car_params,
-          profile=artifact.vehicle_profile,
+          profile=self.controller_profile,
         )
       except Exception:
         self.eligibility = LiveEligibility.CONSTRUCTION_FAILED
+        self.experimental_active = False
         self.candidate = None
         self.adapter = None
 
@@ -214,6 +269,9 @@ class ModularLiveController:
     activation: PersistentProfileActivation | None = None
     activation_provisional = False
     diagnostic = ArtifactDiagnostic.ABSENT
+    experimental_requested = False
+    experimental_platform_compatible = False
+    experimental_policy: ControllerPolicy | None = None
     try:
       controller = car_interface.CC
       controller_params = controller.params
@@ -227,31 +285,60 @@ class ModularLiveController:
         vehicle_identity=str(car_params.carFingerprint),
         provisional_rack_dynamics=dynamics,
       )
-      # PersistentProfileActivation validates the complete state and every
-      # embedded artifact during construction. Its begin/end calls are now a
-      # read-only binding over state already prepared by profiled offroad.
-      activation = PersistentProfileActivation(
-        params,
-        expected_vehicle_identity=runtime_bundle.vehicle_identity,
-        expected_runtime_vehicle_identity_sha256=(
-          runtime_bundle.identity_sha256
-        ),
-        expected_source_openpilot_commit=source_openpilot_commit,
-        expected_opendbc_commit=opendbc_commit,
-        expected_panda_commit=panda_commit,
-        production_envelope_verified=(
-          runtime_bundle.torque_limits.production_envelope_verified
-        ),
-      )
-      diagnostic = activation.diagnostic
-      if diagnostic == ArtifactDiagnostic.OK:
-        artifact = activation.active_artifact
-        activation_provisional = activation.provisional
     except Exception:
       diagnostic = ArtifactDiagnostic.STATE_INVALID
       runtime_bundle = None
-      artifact = None
-      activation_provisional = False
+
+    if runtime_bundle is not None:
+      try:
+        experimental_requested = params.get_bool(
+          EXPERIMENTAL_CONTROLLER_PARAM,
+        )
+      except Exception:
+        experimental_requested = False
+      if experimental_requested:
+        experimental_platform_compatible = (
+          getattr(
+            controller_params,
+            "BLATV2_CONTEXTUAL_DYNAMICS_COMPATIBLE",
+            False,
+          )
+          is True
+        )
+        try:
+          experimental_policy = ControllerPolicy.from_json_file(
+            PROVISIONAL_CONTROLLER_POLICY_PATH,
+          )
+        except (OSError, TypeError, ValueError, OverflowError):
+          experimental_policy = None
+
+    if runtime_bundle is not None:
+      try:
+        # PersistentProfileActivation validates the complete state and every
+        # embedded artifact during construction. Its begin/end calls are now a
+        # read-only binding over state already prepared by profiled offroad.
+        activation = PersistentProfileActivation(
+          params,
+          expected_vehicle_identity=runtime_bundle.vehicle_identity,
+          expected_runtime_vehicle_identity_sha256=(
+            runtime_bundle.identity_sha256
+          ),
+          expected_source_openpilot_commit=source_openpilot_commit,
+          expected_opendbc_commit=opendbc_commit,
+          expected_panda_commit=panda_commit,
+          production_envelope_verified=(
+            runtime_bundle.torque_limits.production_envelope_verified
+          ),
+        )
+        diagnostic = activation.diagnostic
+        if diagnostic == ArtifactDiagnostic.OK:
+          artifact = activation.active_artifact
+          activation_provisional = activation.provisional
+      except Exception:
+        diagnostic = ArtifactDiagnostic.STATE_INVALID
+        activation = None
+        artifact = None
+        activation_provisional = False
     return cls(
       car_params=car_params,
       runtime_bundle=runtime_bundle,
@@ -262,6 +349,9 @@ class ModularLiveController:
       source_openpilot_commit=source_openpilot_commit,
       opendbc_commit=opendbc_commit,
       panda_commit=panda_commit,
+      experimental_requested=experimental_requested,
+      experimental_platform_compatible=experimental_platform_compatible,
+      experimental_policy=experimental_policy,
     )
 
   def _validate_eligibility(self) -> LiveEligibility:
@@ -270,6 +360,19 @@ class ModularLiveController:
     if bundle is None:
       return LiveEligibility.NO_RUNTIME_BUNDLE
     if artifact is None:
+      if self.experimental_requested:
+        if not self.experimental_platform_compatible:
+          return LiveEligibility.EXPERIMENTAL_PLATFORM_UNSUPPORTED
+        if not bundle.torque_limits.production_envelope_verified:
+          return LiveEligibility.UNVERIFIED_PRODUCTION_ENVELOPE
+        if (
+          self.controller_profile is None
+          or self.controller_policy is None
+          or not self.controller_policy.provisional
+          or self.controller_profile.qualified
+        ):
+          return LiveEligibility.EXPERIMENTAL_CONFIGURATION_INVALID
+        return LiveEligibility.ELIGIBLE
       if self.artifact_diagnostic not in (
         ArtifactDiagnostic.OK,
         ArtifactDiagnostic.ABSENT,
@@ -319,16 +422,16 @@ class ModularLiveController:
   def profile_sha256(self) -> str:
     return (
       ""
-      if self.artifact is None
-      else self.artifact.vehicle_profile_sha256
+      if self.controller_profile is None
+      else profile_sha256(self.controller_profile)
     )
 
   @property
   def policy_sha256(self) -> str:
     return (
       ""
-      if self.artifact is None
-      else self.artifact.controller_policy_sha256
+      if self.controller_policy is None
+      else self.controller_policy.sha256
     )
 
   @property
@@ -379,13 +482,15 @@ class ModularLiveController:
     )
 
   def _modular_decision(self) -> EngagementDecision:
-    if self.artifact is None:
-      raise AssertionError("modular decision has no approved artifact")
+    if self.controller_profile is None:
+      raise AssertionError("modular decision has no controller profile")
     return EngagementDecision(
       selection=ControllerSelection.MODULAR,
-      profile=self.artifact.vehicle_profile,
-      profile_sha256=self.artifact.vehicle_profile_sha256,
-      provisional=self.activation_provisional,
+      profile=self.controller_profile,
+      profile_sha256=self.profile_sha256,
+      provisional=(
+        self.experimental_active or self.activation_provisional
+      ),
     )
 
   def update_engagement(
@@ -399,9 +504,9 @@ class ModularLiveController:
 
     AOL/MADS can make lateral active while ``enabled`` is false, so ``enabled
     OR lateral_active`` is both the authorization boundary and the lifetime.
-    An eligible approved artifact may therefore bind MODULAR at a lateral-only
-    boundary, and later ``enabled`` toggles cannot switch controllers while
-    lateral steering remains active.
+    An eligible approved artifact or authorized trial may therefore bind
+    MODULAR at a lateral-only boundary, and later ``enabled`` toggles cannot
+    switch controllers while lateral steering remains active.
     """
     enabled_now = bool(enabled)
     lateral_active_now = bool(lateral_active)
@@ -446,8 +551,10 @@ class ModularLiveController:
     self.enabled_bound = True
     self.maneuver_forced_stock = bool(lateral_maneuver_active)
     self.binding_reason = self.eligibility
-    activation_allows_modular = self.artifact is not None
-    if self.activation is not None:
+    activation_allows_modular = self.experimental_active
+    if not self.experimental_active:
+      activation_allows_modular = self.artifact is not None
+    if not self.experimental_active and self.activation is not None:
       try:
         approved_decision = self.activation.begin_engagement()
         activation_allows_modular = (

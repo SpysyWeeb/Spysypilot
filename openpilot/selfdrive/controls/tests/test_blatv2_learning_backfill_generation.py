@@ -134,6 +134,12 @@ def replay_result(
   *,
   accepted: int = 1,
 ) -> ReplayResult:
+  assignment_chain_sha256 = hashlib.sha256(
+    f"assignments:{route.route_name}:{accepted}".encode("ascii"),
+  ).hexdigest()
+  route_commitment_sha256 = hashlib.sha256(
+    f"commitment:{route.route_name}:{accepted}".encode("ascii"),
+  ).hexdigest()
   return ReplayResult(
     route=route,
     disposition="ingested",
@@ -159,6 +165,9 @@ def replay_result(
     rejected_sample_count=2,
     controls_witness_count=accepted + 2,
     unresolved_witness_count=0,
+    assignment_record_count=accepted + 2,
+    assignment_chain_sha256=assignment_chain_sha256,
+    route_commitment_sha256=route_commitment_sha256,
   )
 
 
@@ -258,10 +267,15 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
         CALIBRATION_EVIDENCE_SCHEMA_VERSION,
         CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
         LEARNING_STATUS_SCHEMA_VERSION,
-        CANONICAL_JOIN_SCHEMA_VERSION,
-        FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
       ),
-        (9, 9, 4, 3, "complete_full_rlog_authority_v7"),
+      (15, 16, 10),
+    )
+    # Evidence-preparation identities describe the unchanged source contract;
+    # algorithm/output schema migrations must never invalidate route inputs.
+    self.assertEqual(CANONICAL_JOIN_SCHEMA_VERSION, 3)
+    self.assertEqual(
+      FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
+      "complete_full_rlog_authority_v7",
     )
 
   def test_inclusion_policy_namespace_ignores_legacy_runtime_root(

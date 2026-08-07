@@ -1,8 +1,38 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "provisional": true,
-  "rack_gain_deg_s2_per_torque": 4000.0,
-  "rack_damping_per_s": 10.0,
+  "nodes": [
+    {
+      "speed_mps": 0.0,
+      "rack_gain_deg_s2_per_torque": 4000.0,
+      "rack_damping_per_s": 10.0
+    },
+    {
+      "speed_mps": 5.0,
+      "rack_gain_deg_s2_per_torque": 4000.0,
+      "rack_damping_per_s": 10.0
+    },
+    {
+      "speed_mps": 10.0,
+      "rack_gain_deg_s2_per_torque": 3200.0,
+      "rack_damping_per_s": 14.0
+    },
+    {
+      "speed_mps": 15.0,
+      "rack_gain_deg_s2_per_torque": 3200.0,
+      "rack_damping_per_s": 14.0
+    },
+    {
+      "speed_mps": 20.0,
+      "rack_gain_deg_s2_per_torque": 3200.0,
+      "rack_damping_per_s": 14.0
+    },
+    {
+      "speed_mps": 30.0,
+      "rack_gain_deg_s2_per_torque": 3200.0,
+      "rack_damping_per_s": 14.0
+    }
+  ],
   "rack_rate_resolution_deg_s": 4.0,
-  "provenance": "Unqualified order-of-magnitude rack seed for shadow collection only; 4 deg/s rate resolution observed on the Palisade. Never eligible for actuation until every speed node is independently fit, validated, and replay-approved."
+  "provenance": "Unqualified Palisade contextual seed: retain 4000/10 through 5 m/s, interpolate to the interior global training-selected 3200/14 result at 10 m/s, and hold it above 10 m/s. The 51-route diagnostic used the authenticated 28/13/10 whole-route partition and 4 deg/s observed rate resolution. Validation and test strata were inspected while constraining this field candidate, so new routes and owner field testing are required rather than treating those splits as untouched acceptance evidence. This seed is not an approved artifact."
 }

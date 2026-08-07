@@ -11,7 +11,12 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_coordinator import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationFitStatus,
+  CalibrationCrossFitModelDiagnostic,
   CalibrationInterpolationQualificationReport,
+  CalibrationIntervalStratum,
+  CalibrationIntervalStratumDiagnostic,
+  CalibrationIndependentRouteCounts,
+  CalibrationCrossFitStatus,
   CalibrationLearningResult,
   CalibrationModelFitDiagnostic,
   CalibrationModelId,
@@ -20,6 +25,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationQualificationReason,
   CalibrationSampleAccounting,
   CalibrationSampleDisposition,
+  MIN_STRATUM_TRAINING_ROWS,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
@@ -32,6 +38,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   build_learning_status_bytes,
   build_learning_status_payload,
   decode_learning_status,
+  _validate_cross_fit_status,
   validate_learning_status_payload,
 )
 
@@ -95,9 +102,9 @@ def _candidate(seed: VehicleCalibrationProfile) -> VehicleCalibrationProfile:
       moving_sample_count=120,
       breakaway_support_s=8.0,
       breakaway_sample_count=80,
-      validation_count=80,
-      inverse_calibration_validation_rms=0.05,
-      breakaway_validation_rms=0.04,
+      cross_fit_route_count=80,
+      full_fit_candidate_rms=0.05,
+      breakaway_full_fit_candidate_rms=0.04,
     )
     for index, node in enumerate(seed.nodes)
   )
@@ -121,25 +128,49 @@ def _report(
     if qualified
     else (CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE,)
   )
+  paired_loss = CalibrationPairedLossDiagnostic(
+    2, -0.01, 0.002, -0.012, -0.008, 1e-14
+  )
+  neutral_loss = CalibrationPairedLossDiagnostic(
+    2, 0.0, 0.0, 0.0, 0.0, 1e-14
+  )
+  fit_diagnostics = tuple(
+    CalibrationModelFitDiagnostic(
+      model=model,
+      status=CalibrationFitStatus.IDENTIFIABLE,
+      moving_rank=rank,
+      moving_parameter_count=rank,
+      condition_estimate=1.0,
+      breakaway_rank=1,
+      breakaway_parameter_count=1,
+    )
+    for model, rank in (
+      (CalibrationModelId.STATIC_ONLY, 0),
+      (CalibrationModelId.FRICTION_MAP, 1),
+      (CalibrationModelId.OFFSET_AND_FRICTION, 2),
+      (CalibrationModelId.FULL_MAP, 3),
+    )
+  )
   return CalibrationNodeQualificationReport(
     node_index=node_index,
     speed_mps=speed_mps,
     minimum_support_s=30.0,
     clean_support_s=40.0,
     supported_sample_count=400,
-    training_count=320,
-    validation_count=80,
-    validation_support_s=8.0,
+    full_fit_count=320,
+    cross_fit_route_count=2 if qualified else 0,
     base_support_s=20.0,
     base_sample_count=200,
     moving_support_s=12.0,
     moving_sample_count=120,
-    moving_training_count=96,
-    moving_validation_count=24,
+    moving_full_fit_count=96,
+    moving_cross_fit_route_count=2,
     breakaway_support_s=8.0,
     breakaway_sample_count=80,
-    breakaway_training_count=64,
-    breakaway_validation_count=16,
+    breakaway_full_fit_count=64,
+    breakaway_cross_fit_route_count=2,
+    breakaway_episode_full_fit_count=64 if qualified else 0,
+    breakaway_episode_cross_fit_route_count=2 if qualified else 0,
     lateral_accel_span_mps2=1.2,
     lateral_accel_rms_mps2=0.35,
     rack_travel_deg=240.0,
@@ -147,12 +178,12 @@ def _report(
     rack_reversals=12,
     lateral_accel_directions=2,
     applied_torque_directions=2,
-    seed_validation_rms=0.11,
-    candidate_validation_rms=0.06,
-    moving_seed_validation_rms=0.12,
-    moving_candidate_validation_rms=0.07,
-    breakaway_seed_validation_rms=0.13,
-    breakaway_candidate_validation_rms=0.08,
+    full_fit_seed_rms=0.11,
+    full_fit_candidate_rms=0.06,
+    moving_full_fit_seed_rms=0.12,
+    moving_full_fit_candidate_rms=0.07,
+    breakaway_full_fit_seed_rms=0.13,
+    breakaway_full_fit_candidate_rms=0.08,
     confidence=0.8,
     reasons=reasons,
     candidate_parameters=parameters,
@@ -160,40 +191,48 @@ def _report(
     authority_sample_count=50,
     authority_fit_support_s=3.0,
     authority_fit_sample_count=30,
-    authority_training_count=24,
-    authority_validation_count=6,
-    authority_seed_validation_rms=0.14,
-    authority_candidate_validation_rms=0.09,
-    fit_diagnostics=tuple(
-      CalibrationModelFitDiagnostic(
-        model=model,
-        status=CalibrationFitStatus.IDENTIFIABLE,
-        moving_rank=rank,
-        moving_parameter_count=rank,
-        condition_estimate=1.0,
-        breakaway_rank=1,
-        breakaway_parameter_count=1,
-      )
-      for model, rank in (
-        (CalibrationModelId.STATIC_ONLY, 0),
-        (CalibrationModelId.FRICTION_MAP, 1),
-        (CalibrationModelId.OFFSET_AND_FRICTION, 2),
-        (CalibrationModelId.FULL_MAP, 3),
-      )
-    ),
-    training_paired_loss=(
+    authority_full_fit_count=24,
+    authority_cross_fit_route_count=2,
+    authority_full_fit_seed_rms=0.14,
+    authority_full_fit_candidate_rms=0.09,
+    fit_diagnostics=fit_diagnostics,
+    full_fit_paired_loss=(
       CalibrationPairedLossDiagnostic(2, -0.02, 0.005, -0.025, -0.015, 1e-14)
       if qualified
       else None
     ),
-    validation_paired_loss=(
-      CalibrationPairedLossDiagnostic(2, -0.01, 0.002, -0.012, -0.008, 1e-14)
+    cross_fit_paired_loss=(
+      paired_loss
       if qualified
       else None
     ),
-    training_outcome=(
+    selection_outcome=(
       CalibrationQualificationReason.LEARNED if qualified else None
     ),
+    independent_route_counts=CalibrationIndependentRouteCounts(2, 2, 2, 2, 2, 2),
+    cross_fit_diagnostics=tuple(
+      CalibrationCrossFitModelDiagnostic(
+        model=diagnostic.model,
+        status=(
+          CalibrationCrossFitStatus.SCORED
+          if qualified and diagnostic.model is CalibrationModelId.FULL_MAP
+          else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+        ),
+        contributing_route_count=2,
+        successful_fold_count=2,
+        failed_fold_count=0,
+        regressed_fold_count=0,
+        paired_loss=(
+          paired_loss
+          if qualified and diagnostic.model is CalibrationModelId.FULL_MAP
+          else neutral_loss
+        ),
+      )
+      for diagnostic in fit_diagnostics
+    ),
+    full_fit_diagnostic=fit_diagnostics[-1] if qualified else None,
+    unresolved_diagnostics=(),
+    full_fit_stratum_paired_losses=(paired_loss,) * 4 if qualified else (),
   )
 
 
@@ -216,13 +255,26 @@ def _fixtures(*, qualified: bool = True):
         interval_index=0,
         lower_speed_mps=seed.nodes[0].speed_mps,
         upper_speed_mps=seed.nodes[1].speed_mps,
-        training_paired_loss=CalibrationPairedLossDiagnostic(
-          2, -0.02, 0.005, -0.025, -0.015, 1e-14
-        ),
-        validation_paired_loss=CalibrationPairedLossDiagnostic(
-          2, -0.01, 0.002, -0.012, -0.008, 1e-14
-        ),
+        stratum_diagnostics=(CalibrationIntervalStratumDiagnostic(
+          stratum=CalibrationIntervalStratum.BASE,
+          full_fit_paired_loss=CalibrationPairedLossDiagnostic(
+            2, -0.02, 0.005, -0.025, -0.015, 1e-14
+          ),
+          cross_fit_paired_loss=CalibrationPairedLossDiagnostic(
+            2, -0.01, 0.002, -0.012, -0.008, 1e-14
+          ),
+          contributing_route_count=2,
+          successful_fold_count=2,
+          failed_fold_count=0,
+          regressed_fold_count=0,
+          cross_fit_status=CalibrationCrossFitStatus.SCORED,
+        ),),
         reasons=(CalibrationQualificationReason.QUALIFIED,),
+        contributing_route_count=2,
+        successful_fold_count=2,
+        failed_fold_count=0,
+        regressed_fold_count=0,
+        cross_fit_status=CalibrationCrossFitStatus.SCORED,
       ),
     )
     if qualified
@@ -282,7 +334,7 @@ def _baseline() -> DriveEvidenceBaseline:
   return DriveEvidenceBaseline.from_support_diagnostics(diagnostics)
 
 
-def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None:
+def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None:
   runtime, finalization = _fixtures()
   baseline = _baseline()
   payload = build_learning_status_payload(
@@ -296,7 +348,7 @@ def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 4
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 10
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -308,6 +360,10 @@ def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert payload["candidate_profile_available"] is True
   assert payload["candidate_profile_sha256"] == finalization.candidate_profile_sha256
   assert payload["sample_accounting"] == finalization.sample_accounting.to_payload()
+  assert payload["nodes"][0]["independent_route_counts"]["all"] == 2
+  assert len(payload["nodes"][0]["cross_fit_diagnostics"]) == 4
+  assert payload["nodes"][0]["full_fit_diagnostic"]["model"] == "full_map"
+  assert payload["interpolation_reports"][0]["stratum_diagnostics"][0]["stratum"] == "base"
   assert decode_learning_status(encoded) == payload
   with unittest.TestCase().assertRaisesRegex(ValueError, "not canonical"):
     decode_learning_status(encoded + b" ")
@@ -320,10 +376,10 @@ def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None
 
   node = payload["nodes"][0]
   assert node["evaluation_status"] == "learned"
-  assert node["training_outcome"] == "learned"
+  assert node["selection_outcome"] == "learned"
   assert len(node["fit_diagnostics"]) == 4
   assert node["fit_diagnostics"][-1]["moving_rank"] == 3
-  assert node["training_paired_loss"]["route_count"] == 2
+  assert node["full_fit_paired_loss"]["route_count"] == 2
   assert node["candidate_parameters"] == {
     "kinetic_friction_torque": 0.03,
     "lateral_accel_offset_correction_mps2": -0.04,
@@ -344,13 +400,20 @@ def test_schema_v4_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert node["last_drive_authority_fit_sample_count"] == 10
 
 
-def test_fully_evaluated_validation_regression_is_not_reported_as_pending() -> None:
+def test_fully_evaluated_cross_fit_regression_is_not_reported_as_pending() -> None:
   runtime, finalization = _fixtures(qualified=False)
+  regressed_loss = CalibrationPairedLossDiagnostic(
+    2, 0.02, 0.005, 0.015, 0.025, 1e-14
+  )
   rejected_reports = tuple(
     replace(
       report,
-      reasons=(CalibrationQualificationReason.VALIDATION_REGRESSION,),
-      training_outcome=CalibrationQualificationReason.LEARNED,
+      reasons=(CalibrationQualificationReason.CROSS_FIT_REGRESSION,),
+      selection_outcome=CalibrationQualificationReason.LEARNED,
+      breakaway_episode_full_fit_count=MIN_STRATUM_TRAINING_ROWS,
+      full_fit_paired_loss=regressed_loss,
+      full_fit_diagnostic=report.fit_diagnostics[-1],
+      full_fit_stratum_paired_losses=(regressed_loss,) * 4,
     )
     for report in finalization.learning_result.node_reports
   )
@@ -370,9 +433,43 @@ def test_fully_evaluated_validation_regression_is_not_reported_as_pending() -> N
   assert payload["all_intervals_qualified"] is False
   assert payload["candidate_profile_available"] is False
   assert all(
-    node["evaluation_status"] == "validation_regressed"
+    node["evaluation_status"] == "cross_fit_regressed"
     for node in payload["nodes"]
   )
+
+
+def test_qualified_stratum_proof_is_identity_ordered_and_non_regressing() -> None:
+  test_case = unittest.TestCase()
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+
+  regressed = json.loads(json.dumps(payload))
+  loss = regressed["nodes"][0]["full_fit_stratum_paired_losses"][0]["paired_loss"]
+  loss.update({
+    "lower_bound_mse": 0.01,
+    "mean_candidate_minus_seed_mse": 0.02,
+    "uncertainty_mse": 0.01,
+    "upper_bound_mse": 0.03,
+  })
+  with test_case.assertRaisesRegex(ValueError, "qualified node carries failed proof"):
+    validate_learning_status_payload(regressed)
+
+  reordered = json.loads(json.dumps(payload))
+  losses = reordered["nodes"][0]["full_fit_stratum_paired_losses"]
+  losses[0], losses[1] = losses[1], losses[0]
+  with test_case.assertRaisesRegex(ValueError, "stratum ordering"):
+    validate_learning_status_payload(reordered)
+
+  wrong_population = json.loads(json.dumps(payload))
+  wrong_population["nodes"][0]["full_fit_stratum_paired_losses"][0][
+    "paired_loss"
+  ]["route_count"] += 1
+  with test_case.assertRaisesRegex(ValueError, "route population disagrees"):
+    validate_learning_status_payload(wrong_population)
 
 def test_device_accumulation_rounding_projects_without_hiding_snapshot() -> None:
   diagnostics = tuple(
@@ -439,6 +536,25 @@ def test_display_rejects_material_support_population_disagreement() -> None:
     validate_learning_status_payload(payload)
 
 
+def test_display_numeric_domain_rejects_overflow_and_non_numbers() -> None:
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  for value in (10**10000, True, float("nan"), float("inf")):
+    poisoned = json.loads(json.dumps(payload))
+    poisoned["nodes"][0]["speed_mps"] = value
+    with unittest.TestCase().assertRaises((TypeError, ValueError)):
+      validate_learning_status_payload(poisoned)
+
+  huge_count = json.loads(json.dumps(payload))
+  huge_count["nodes"][0]["supported_sample_count"] = 10**10000
+  with unittest.TestCase().assertRaisesRegex(ValueError, "bounded"):
+    validate_learning_status_payload(huge_count)
+
+
 def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None:
   test_case = unittest.TestCase()
   runtime, finalization = _fixtures()
@@ -478,6 +594,132 @@ def test_decoder_rejects_legacy_schema_rack_fields_and_unknown_reasons() -> None
   inconsistent_accounting["sample_accounting"]["ingested_sample_count"] = 1
   with test_case.assertRaisesRegex(ValueError, "totals disagree"):
     validate_learning_status_payload(inconsistent_accounting)
+
+  missing_proof = json.loads(json.dumps(payload))
+  missing_proof["nodes"][0]["cross_fit_diagnostics"] = []
+  with test_case.assertRaisesRegex(ValueError, "nonempty"):
+    validate_learning_status_payload(missing_proof)
+
+
+def test_schema_v7_rejects_cross_fit_semantic_tampering() -> None:
+  test_case = unittest.TestCase()
+  runtime, finalization = _fixtures()
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+
+  moving_legacy = json.loads(json.dumps(payload))
+  moving_legacy["nodes"][0]["moving_cross_fit_route_count"] += 1
+  with test_case.assertRaisesRegex(ValueError, "moving_cross_fit_route_count disagrees"):
+    validate_learning_status_payload(moving_legacy)
+
+  moving_population = json.loads(json.dumps(payload))
+  moving_population["nodes"][0]["independent_route_counts"]["moving"] = 1
+  with test_case.assertRaisesRegex(ValueError, "moving_cross_fit_route_count disagrees"):
+    validate_learning_status_payload(moving_population)
+
+  loss_routes = json.loads(json.dumps(payload))
+  selected = loss_routes["nodes"][0]["cross_fit_diagnostics"][-1]
+  selected["paired_loss"]["route_count"] = 1
+  selected["paired_loss"]["uncertainty_mse"] = None
+  selected["paired_loss"]["lower_bound_mse"] = None
+  selected["paired_loss"]["upper_bound_mse"] = None
+  with test_case.assertRaisesRegex(ValueError, "paired-loss route count disagrees"):
+    validate_learning_status_payload(loss_routes)
+
+  selected_status = json.loads(json.dumps(payload))
+  selected_node = selected_status["nodes"][0]
+  selected_diagnostic = selected_node["cross_fit_diagnostics"][-1]
+  selected_diagnostic["status"] = CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+  selected_diagnostic["paired_loss"].update({
+    "mean_candidate_minus_seed_mse": 0.0,
+    "uncertainty_mse": 0.0,
+    "lower_bound_mse": 0.0,
+    "upper_bound_mse": 0.0,
+  })
+  selected_node["cross_fit_paired_loss"] = json.loads(json.dumps(
+    selected_diagnostic["paired_loss"]
+  ))
+  with test_case.assertRaisesRegex(ValueError, "selected family status contradicts outcome"):
+    validate_learning_status_payload(selected_status)
+
+  interval_status = json.loads(json.dumps(payload))
+  interval_status["interpolation_reports"][0]["qualified"] = False
+  interval_status["interpolation_reports"][0]["reasons"] = [
+    CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE.value
+  ]
+  stratum = interval_status["interpolation_reports"][0]["stratum_diagnostics"][0]
+  stratum["cross_fit_status"] = (
+    CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+  )
+  stratum["cross_fit_paired_loss"].update({
+    "mean_candidate_minus_seed_mse": 0.0,
+    "uncertainty_mse": 0.1,
+    "lower_bound_mse": -0.1,
+    "upper_bound_mse": 0.1,
+  })
+  interval_status["all_intervals_qualified"] = False
+  with test_case.assertRaisesRegex(ValueError, "aggregate status contradicts strata"):
+    validate_learning_status_payload(interval_status)
+
+  interval_reason = json.loads(json.dumps(interval_status))
+  interval_reason["interpolation_reports"][0]["cross_fit_status"] = (
+    CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+  )
+  interval_reason["interpolation_reports"][0]["reasons"] = [
+    CalibrationQualificationReason.INTERPOLATION_CROSS_FIT_REGRESSION.value
+  ]
+  with test_case.assertRaisesRegex(ValueError, "reasons contradict stratum diagnostics"):
+    validate_learning_status_payload(interval_reason)
+
+  unqualified_runtime, unqualified_finalization = _fixtures(qualified=False)
+  node_reason = build_learning_status_payload(
+    finalization=unqualified_finalization,
+    runtime_bundle=unqualified_runtime,
+    drive_baseline=None,
+  )
+  node_reason["nodes"][0]["reasons"] = [
+    CalibrationQualificationReason.SINGULAR_FIT.value
+  ]
+  with test_case.assertRaisesRegex(ValueError, "reasons contradict carried diagnostics"):
+    validate_learning_status_payload(node_reason)
+
+
+def test_real_diluted_fold_regression_has_an_explicit_witness() -> None:
+  diagnostic = {
+    "contributing_route_count": 26,
+    "failed_fold_count": 0,
+    "model": "friction_map",
+    "paired_loss": {
+      "lower_bound_mse": -0.007728859866319967,
+      "mean_candidate_minus_seed_mse": -0.004015583293787311,
+      "numerical_tolerance_mse": 1.4210854715202004e-14,
+      "route_count": 26,
+      "uncertainty_mse": 0.0037132765725326564,
+      "upper_bound_mse": -0.00030230672125465454,
+    },
+    "regressed_fold_count": 12,
+    "status": CalibrationCrossFitStatus.HELD_OUT_REGRESSION.value,
+    "successful_fold_count": 26,
+  }
+  assert _validate_cross_fit_status(
+    diagnostic,
+    "real_node_2_friction_map",
+    coverage_sufficient=True,
+    interval=False,
+  ) == "improved"
+
+  hidden = json.loads(json.dumps(diagnostic))
+  hidden["regressed_fold_count"] = 0
+  with unittest.TestCase().assertRaisesRegex(ValueError, "status contradicts"):
+    _validate_cross_fit_status(
+      hidden,
+      "real_node_2_friction_map",
+      coverage_sufficient=True,
+      interval=False,
+    )
 
 
 def test_baseline_rejects_any_population_moving_backwards() -> None:
@@ -519,6 +761,129 @@ def test_candidate_identity_requires_every_node_qualified() -> None:
     )
 
 
+def test_unqualified_reason_set_is_derived_from_carried_prerequisites() -> None:
+  runtime, finalization = _fixtures(qualified=False)
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+
+  fabricated = json.loads(json.dumps(payload))
+  fabricated["nodes"][0]["reasons"].append(
+    CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value,
+  )
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried diagnostics",
+  ):
+    validate_learning_status_payload(fabricated)
+
+  missing = json.loads(json.dumps(payload))
+  missing["nodes"][0]["reasons"] = [
+    CalibrationQualificationReason.CROSS_FIT_INCONCLUSIVE.value,
+  ]
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried diagnostics",
+  ):
+    validate_learning_status_payload(missing)
+
+  for extra in (
+    CalibrationQualificationReason.CROSS_FIT_REGRESSION,
+    CalibrationQualificationReason.MOVING_CROSS_FIT_REGRESSION,
+    CalibrationQualificationReason.RANK_DEFICIENT_FIT,
+    CalibrationQualificationReason.INVALID_PARAMETERS,
+  ):
+    poisoned = json.loads(json.dumps(payload))
+    poisoned["nodes"][0]["reasons"].append(extra.value)
+    with unittest.TestCase().assertRaisesRegex(
+      ValueError,
+      "reasons contradict carried diagnostics",
+    ):
+      validate_learning_status_payload(poisoned)
+
+  ordered = json.loads(json.dumps(payload))
+  ordered_node = ordered["nodes"][0]
+  ordered_node["clean_support_s"] = ordered_node["minimum_support_s"] - 1.0
+  ordered_node["base_support_s"] = (
+    ordered_node["clean_support_s"]
+    - ordered_node["moving_support_s"]
+    - ordered_node["breakaway_support_s"]
+  )
+  ordered_node["reasons"] = [
+    CalibrationQualificationReason.INSUFFICIENT_SUPPORT.value,
+    CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE.value,
+  ]
+  validate_learning_status_payload(ordered)
+  reordered = json.loads(json.dumps(ordered))
+  reordered["nodes"][0]["reasons"].reverse()
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried diagnostics",
+  ):
+    validate_learning_status_payload(reordered)
+  missing_legitimate = json.loads(json.dumps(ordered))
+  missing_legitimate["nodes"][0]["reasons"].pop()
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried diagnostics",
+  ):
+    validate_learning_status_payload(missing_legitimate)
+
+  unresolved_poison = json.loads(json.dumps(payload))
+  unresolved_poison["nodes"][0]["unresolved_diagnostics"] = [
+    CalibrationQualificationReason.INVALID_PARAMETERS.value,
+  ]
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "unresolved diagnostics contradict proof",
+  ):
+    validate_learning_status_payload(unresolved_poison)
+
+
+def test_breakaway_population_and_reason_cannot_be_mutated_independently() -> None:
+  runtime, finalization = _fixtures(qualified=False)
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  payload["nodes"][0]["breakaway_episode_full_fit_count"] = (
+    MIN_STRATUM_TRAINING_ROWS
+  )
+
+  with unittest.TestCase().assertRaisesRegex(
+    ValueError,
+    "reasons contradict carried diagnostics",
+  ):
+    validate_learning_status_payload(payload)
+
+
+def test_invalid_parameter_reason_is_derived_from_complete_predicate() -> None:
+  runtime, finalization = _fixtures(qualified=False)
+  payload = build_learning_status_payload(
+    finalization=finalization,
+    runtime_bundle=runtime,
+    drive_baseline=None,
+  )
+  mutations = (
+    ("torque_per_lateral_accel", 0.0),
+    ("torque_per_lateral_accel", -0.1),
+    ("kinetic_friction_torque", -0.1),
+    ("kinetic_friction_torque", 0.2),
+    ("lateral_accel_offset_correction_mps2", float("inf")),
+  )
+  for field, value in mutations:
+    poisoned = json.loads(json.dumps(payload))
+    poisoned["nodes"][0]["candidate_parameters"][field] = value
+    with unittest.TestCase().assertRaisesRegex(
+      ValueError,
+      "reasons contradict carried diagnostics",
+    ):
+      validate_learning_status_payload(poisoned)
+
+
 def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
   runtime, finalization = _fixtures()
   zero_loss = CalibrationPairedLossDiagnostic(
@@ -529,17 +894,32 @@ def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
       report,
       reasons=(CalibrationQualificationReason.SEED_RETAINED,),
       candidate_parameters=runtime.calibration_seed_profile.nodes[index].parameters,
-      training_outcome=CalibrationQualificationReason.SEED_RETAINED,
-      training_paired_loss=zero_loss,
-      validation_paired_loss=zero_loss,
+      selection_outcome=CalibrationQualificationReason.SEED_RETAINED,
+      full_fit_paired_loss=zero_loss,
+      cross_fit_paired_loss=zero_loss,
+      cross_fit_diagnostics=tuple(
+        replace(
+          diagnostic,
+          status=CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT,
+          paired_loss=zero_loss,
+        )
+        for diagnostic in report.cross_fit_diagnostics
+      ),
+      full_fit_stratum_paired_losses=(),
     )
     for index, report in enumerate(finalization.learning_result.node_reports)
   )
   intervals = tuple(
     replace(
       report,
-      training_paired_loss=zero_loss,
-      validation_paired_loss=zero_loss,
+      stratum_diagnostics=tuple(
+        replace(
+          diagnostic,
+          full_fit_paired_loss=zero_loss,
+          cross_fit_paired_loss=zero_loss,
+        )
+        for diagnostic in report.stratum_diagnostics
+      ),
     )
     for report in finalization.learning_result.interpolation_reports
   )
@@ -560,6 +940,8 @@ def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
   assert payload["candidate_profile_available"] is False
   assert payload["candidate_profile_sha256"] is None
   assert all(node["evaluation_status"] == "seed_retained" for node in payload["nodes"])
+  assert all(node["cross_fit_paired_loss"]["route_count"] == 2 for node in payload["nodes"])
+  assert all(node["full_fit_diagnostic"] is not None for node in payload["nodes"])
 
 
 def test_failure_classifications_remain_distinct() -> None:
@@ -584,39 +966,71 @@ def test_failure_classifications_remain_distinct() -> None:
       None,
     ),
     (
-      CalibrationQualificationReason.VALIDATION_INCONCLUSIVE,
-      "validation_inconclusive",
-      None,
-      CalibrationQualificationReason.LEARNED,
-    ),
-    (
-      CalibrationQualificationReason.VALIDATION_REGRESSION,
-      "validation_regressed",
+      CalibrationQualificationReason.CROSS_FIT_REGRESSION,
+      "cross_fit_regressed",
       None,
       CalibrationQualificationReason.LEARNED,
     ),
   )
-  for reason, expected, fit_status, training_outcome in cases:
+  for reason, expected, fit_status, selection_outcome in cases:
     reports = list(finalization.learning_result.node_reports)
     diagnostics = reports[0].fit_diagnostics
     if fit_status is not None:
-      diagnostics = (
+      diagnostics = tuple(
         replace(
-          diagnostics[0],
-          status=fit_status,
-          breakaway_rank=(
-            0
+          diagnostic,
+          status=(
+            CalibrationFitStatus.NO_SOLUTION
             if fit_status is CalibrationFitStatus.RANK_DEFICIENT
-            else diagnostics[0].breakaway_rank
+            and diagnostic.moving_parameter_count == 0
+            else fit_status
           ),
-        ),
-        *diagnostics[1:],
+          moving_rank=(
+            diagnostic.moving_rank - 1
+            if fit_status is CalibrationFitStatus.RANK_DEFICIENT
+            and diagnostic.moving_parameter_count > 0
+            else diagnostic.moving_rank
+          ),
+          breakaway_rank=(
+            diagnostic.breakaway_rank
+          ),
+        )
+        for diagnostic in diagnostics
       )
     reports[0] = replace(
       reports[0],
       reasons=(reason,),
       fit_diagnostics=diagnostics,
-      training_outcome=training_outcome,
+      selection_outcome=selection_outcome,
+      breakaway_episode_full_fit_count=(
+        0
+        if reason is CalibrationQualificationReason.INSUFFICIENT_BREAKAWAY_EVIDENCE
+        else MIN_STRATUM_TRAINING_ROWS
+      ),
+      lateral_accel_span_mps2=(
+        0.0
+        if reason is CalibrationQualificationReason.INSUFFICIENT_EXCITATION
+        else reports[0].lateral_accel_span_mps2
+      ),
+      full_fit_paired_loss=(
+        CalibrationPairedLossDiagnostic(
+          2, 0.02, 0.005, 0.015, 0.025, 1e-14
+        )
+        if reason is CalibrationQualificationReason.CROSS_FIT_REGRESSION
+        else reports[0].full_fit_paired_loss
+      ),
+      full_fit_diagnostic=(
+        reports[0].fit_diagnostics[-1]
+        if reason is CalibrationQualificationReason.CROSS_FIT_REGRESSION
+        else reports[0].full_fit_diagnostic
+      ),
+      full_fit_stratum_paired_losses=(
+        (CalibrationPairedLossDiagnostic(
+          2, 0.02, 0.005, 0.015, 0.025, 1e-14
+        ),) * 4
+        if reason is CalibrationQualificationReason.CROSS_FIT_REGRESSION
+        else reports[0].full_fit_stratum_paired_losses
+      ),
     )
     classified = replace(
       finalization,

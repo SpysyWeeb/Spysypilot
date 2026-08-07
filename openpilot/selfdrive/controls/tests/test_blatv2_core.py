@@ -105,8 +105,8 @@ def vehicle_profile(
       parameters=params,
       clean_support_s=500.0 if qualified else 0.0,
       sample_count=50000 if qualified else 0,
-      validation_count=25000 if qualified else 0,
-      validation_rms=0.01 if qualified else 0.0,
+      cross_fit_route_count=25000 if qualified else 0,
+      full_fit_candidate_rms=0.01 if qualified else 0.0,
     ))
   return VehicleProfile(
     vehicle_identity="synthetic-vehicle",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import unittest
 
@@ -12,11 +13,13 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
   ManeuverPhase,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
+  aggregate_behavior_metrics,
   BehaviorMetricConfig,
   BehaviorMetricName,
   MetricDisposition,
   score_behavior,
   score_window,
+  retain_route_metric_windows,
   speed_node_weights,
 )
 
@@ -101,6 +104,89 @@ def make_window(
 
 
 class TestBehaviorMetrics(unittest.TestCase):
+  def test_bounded_window_metric_reduction_matches_eager_scorecard(self):
+    windows = (
+      make_window(
+        "route-b",
+        "hold",
+        ManeuverPhase.HOLD,
+        (make_sample(0), make_sample(1)),
+      ),
+      make_window(
+        "route-a",
+        "turn",
+        ManeuverPhase.TURN_IN,
+        (
+          make_sample(0, desired=0.0, measured=0.0),
+          make_sample(1, desired=0.01, measured=0.008),
+          make_sample(2, desired=0.02, measured=0.02),
+        ),
+      ),
+    )
+    eager = score_behavior(windows, config())
+    bounded = aggregate_behavior_metrics(
+      (score_window(window, config()) for window in reversed(windows)),
+      config(),
+    )
+
+    self.assertEqual(bounded, eager)
+    self.assertEqual(bounded.to_json(), eager.to_json())
+
+  def test_streaming_retention_matches_value_independent_route_prefixes(self):
+    metric_config = replace(config(), maximum_route_windows_per_stratum=3)
+    scored = tuple(
+      score_window(
+        make_window(
+          "route-a",
+          f"window-{index:04d}",
+          ManeuverPhase.HOLD,
+          (
+            make_sample(index * 2, speed=2.5 + index % 4 * 5.0),
+            make_sample(index * 2 + 1, speed=2.5 + index % 4 * 5.0),
+          ),
+          ManeuverClass.STRAIGHT if index % 2 else ManeuverClass.CURVE,
+        ),
+        metric_config,
+      )
+      for index in range(1_000)
+    )
+    retained = retain_route_metric_windows(iter(scored), metric_config)
+    expected_ids: set[tuple[str, str]] = set()
+    strata = {
+      (node, window.maneuver_class)
+      for window in scored
+      for node, weight in window.speed_node_support
+      if weight > 0.0
+    }
+    for node, maneuver_class in strata:
+      eligible = (
+        window
+        for window in scored
+        if window.maneuver_class is maneuver_class
+        and any(item_node == node and weight > 0.0 for item_node, weight in window.speed_node_support)
+      )
+      selected = sorted(
+        eligible,
+        key=lambda window: (
+          hashlib.sha256(f"{window.route_id}\0{window.window_id}".encode()).digest(),
+          window.window_id,
+        ),
+      )[:metric_config.maximum_route_windows_per_stratum]
+      expected_ids.update((window.route_id, window.window_id) for window in selected)
+
+    self.assertEqual(
+      {(window.route_id, window.window_id) for window in retained},
+      expected_ids,
+    )
+    self.assertLessEqual(
+      len(retained),
+      len(strata) * metric_config.maximum_route_windows_per_stratum,
+    )
+    self.assertEqual(
+      aggregate_behavior_metrics(iter(scored), metric_config),
+      aggregate_behavior_metrics(iter(retained), metric_config),
+    )
+
   def test_signed_early_turn_in_remains_negative(self):
     window = make_window(
       "route-a",
@@ -134,6 +220,38 @@ class TestBehaviorMetrics(unittest.TestCase):
     result = score_window(window, config())
     self.assertEqual(result.clean_sample_count, 2)
     self.assertAlmostEqual(result.metric(BehaviorMetricName.PEAK_CURVATURE_ERROR).value, 0.001)
+
+  def test_faulting_candidate_cannot_remove_its_physical_window(self):
+    physical = (
+      make_sample(0, speed=2.5),
+      make_sample(1, speed=5.0),
+      make_sample(2, speed=7.5),
+    )
+    healthy = score_window(
+      make_window("route-a", "physical-window", ManeuverPhase.HOLD, physical),
+      config(),
+    )
+    faulted = score_window(
+      make_window(
+        "route-a",
+        "physical-window",
+        ManeuverPhase.HOLD,
+        tuple(replace(sample, controller_fault=True) for sample in physical),
+      ),
+      config(),
+    )
+
+    self.assertEqual(faulted.mean_speed_mps, healthy.mean_speed_mps)
+    self.assertEqual(faulted.speed_node_support, healthy.speed_node_support)
+    self.assertEqual(faulted.clean_sample_count, 0)
+    self.assertTrue(all(
+      metric.disposition is MetricDisposition.COVERAGE_EXCLUDED
+      for metric in faulted.metrics
+    ))
+    self.assertEqual(
+      tuple(window.window_id for window in retain_route_metric_windows((healthy,), config())),
+      tuple(window.window_id for window in retain_route_metric_windows((faulted,), config())),
+    )
 
   def test_phase_specific_release_metrics_are_explicit(self):
     samples = (

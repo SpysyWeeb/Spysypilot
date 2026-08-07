@@ -23,9 +23,15 @@ NATIVE_EXTRACTOR_PATH = (
 
 def decode_car_params(encoded: bytes) -> car.CarParams:
   """Decode owned CarParams with the same bounded contract on ARM and PC."""
+  # Keep the reader over the caller-owned immutable bytes. The replay runtime
+  # retains those bytes for its full lifetime, matching cereal's production
+  # decode semantics without importing messaging (and its msgq extension).
   with car.CarParams.from_bytes(
     encoded,
     traversal_limit_in_words=MAXIMUM_CAR_PARAMS_TRAVERSAL_WORDS,
     nesting_limit=64,
   ) as reader:
-    return reader.as_builder()
+    str(reader.carFingerprint)
+    float(reader.mass)
+    float(reader.wheelbase)
+    return reader.as_builder().as_reader()

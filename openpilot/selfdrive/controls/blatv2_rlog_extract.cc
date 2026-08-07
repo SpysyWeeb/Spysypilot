@@ -19,10 +19,10 @@ namespace {
 constexpr std::array<char, 8> kMagic = {
   'B', 'L', 'A', 'T', 'V', '2', 'R', '1',
 };
-// v3 completes the single-pass shared-evidence input set.  The Python side
-// compacts these bounded messages into typed binary planes immediately; it
-// never retains route-wide Cap'n Proto builders.
-constexpr uint32_t kStreamSchemaVersion = 3;
+// v4 binds the selected input stream to recent-window live-torque health
+// reconstruction. The Python side compacts these bounded messages into typed
+// binary planes immediately; it never retains route-wide Cap'n Proto builders.
+constexpr uint32_t kStreamSchemaVersion = 4;
 constexpr uint32_t kEndRecord = std::numeric_limits<uint32_t>::max();
 constexpr size_t kInputChunkSize = 256 * 1024;
 constexpr size_t kMaximumSegmentCount = 512;

@@ -9,6 +9,7 @@ from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
   curvature_from_measured_angle,
+  curvature_slope_per_steering_degree,
   map_reference,
   map_reference_into,
 )
@@ -89,6 +90,29 @@ class TestBlatV2RackMapper(unittest.TestCase):
             angle.angle_deg, speed, alignment, alignment,
           )
           self.assertAlmostEqual(recovered.curvature, curvature, delta=1e-12)
+
+  def test_analytic_curvature_slope_reconstructs_affine_mapping(self) -> None:
+    for speed in (0.0, 3.0, 12.0, 25.0, 35.0):
+      for roll, offset in ((0.0, 0.0), (0.03, -1.2), (-0.02, 2.5)):
+        alignment = snapshot(
+          self.vehicle_model, roll=roll, offset=offset,
+        )
+        slope = curvature_slope_per_steering_degree(
+          speed, alignment, alignment,
+        )
+        origin_angle = -37.5
+        origin = curvature_from_measured_angle(
+          origin_angle, speed, alignment, alignment,
+        ).curvature
+        for angle in (-420.0, -5.0, 0.0, 75.0, 510.0):
+          with self.subTest(
+            speed=speed, roll=roll, offset=offset, angle=angle,
+          ):
+            direct = curvature_from_measured_angle(
+              angle, speed, alignment, alignment,
+            ).curvature
+            affine = origin + slope * (angle - origin_angle)
+            self.assertAlmostEqual(direct, affine, delta=1e-16)
 
   def test_analytic_derivatives_match_continuous_polynomial(self) -> None:
     alignment = snapshot(self.vehicle_model, roll=0.018, offset=0.4)

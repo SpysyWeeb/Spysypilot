@@ -5,5 +5,5 @@
   "natural_frequency_per_s": 10.0,
   "damping_ratio": 1.0,
   "observer": null,
-  "provenance": "Critically damped, speed-independent shadow seed. The 10 rad/s natural frequency is an unelected replay-sweep center, not an accepted feel value; observer disabled until a qualified physical profile and held-out residual gate exist."
+  "provenance": "Critically damped, speed-independent study and development-trial seed. The 10 rad/s natural frequency is an unelected replay-sweep center, not an accepted feel value; observer disabled until a qualified physical profile and held-out residual gate exist. This policy is not an approved artifact."
 }

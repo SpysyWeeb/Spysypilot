@@ -670,6 +670,58 @@ def test_quality_gate_covers_all_controls_and_route_tail(
   assert raised.value.reason == expected
 
 
+@pytest.mark.parametrize(("missing_count", "accepted"), ((1, True), (2, False)))
+def test_quality_gate_one_percent_boundary_is_exact(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  palisade_cp: car.CarParams,
+  missing_count: int,
+  accepted: bool,
+) -> None:
+  base_ns = 1_000_000_000
+  records, events = extracted_fixture(
+    palisade_cp,
+    base_ns=base_ns,
+    control_count=100,
+  )
+  missing_times = {
+    base_ns + index * 10_000_000
+    for index in range(40, 40 + missing_count)
+  }
+  retained = tuple(
+    record
+    for record in records
+    if not (
+      events[record.encoded].which() == "carControl"
+      and events[record.encoded].logMonoTime in missing_times
+    )
+  )
+
+  if accepted:
+    prepared = prepare_fixture(
+      tmp_path,
+      monkeypatch,
+      records=retained,
+      events=events,
+      cp=palisade_cp,
+      car_params_decoder=None,
+    )
+    assert prepared.controls_witness_count == 100
+    assert prepared.unresolved_witness_count == 1
+    assert prepared.gap_count == 0
+  else:
+    with pytest.raises(RouteRejected) as raised:
+      prepare_fixture(
+        tmp_path,
+        monkeypatch,
+        records=retained,
+        events=events,
+        cp=palisade_cp,
+        car_params_decoder=None,
+      )
+    assert raised.value.reason == "measurement_continuity_failed"
+
+
 def test_certification_mode_removes_only_segment_local_context_prefix(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
