@@ -5,8 +5,9 @@ the small, speed-independent response objective shared by every vehicle:
 closed-loop natural frequency and damping, plus an optional physical
 disturbance-observer policy. It contains no maneuver gates or speed schedule.
 
-A provisional policy may be used in shadow/replay but is not field eligible.
-Its deterministic hash is part of every candidate identity.
+A provisional policy is not an approved artifact. It may be used in
+shadow/replay or by a separately authorized development trial, and its
+deterministic hash is part of every candidate identity.
 """
 
 from __future__ import annotations

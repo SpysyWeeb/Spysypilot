@@ -14,6 +14,14 @@ only a separately reviewed and manually installed artifact. It runs no BLaTv2
 learner and has no automatic Wi-Fi upload or processing fallback. Controller
 and actuation behavior are unchanged in this milestone.
 
+**Palisade contextual controller — in progress.** Archived routes are being
+used to identify one bounded rack model for the sole live inverse controller.
+The study preserves whole-route training, validation, and test splits and
+reports turn-in, unwind, direction, and speed strata separately. A study result
+cannot create an approved artifact. The exact provisional candidate can run
+only through a Palisade-only development parameter read at controls startup,
+and this item remains in progress until the owner completes a field test.
+
 This branch replaces the previous BLaTv2 controller architecture. Git history
 and useful test infrastructure remain available for audit, but no previous
 BLaTv2 controller mechanism is part of the new active design by default.

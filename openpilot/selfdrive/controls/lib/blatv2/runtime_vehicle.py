@@ -10,7 +10,7 @@ fail closed so stock control remains the only eligible controller.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 import hashlib
 import json
@@ -32,6 +32,7 @@ from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
 )
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
+  DEFAULT_SPEED_NODES_MPS,
   VehicleProfile,
   make_seed_profile,
 )
@@ -39,7 +40,7 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 
 RUNTIME_VEHICLE_SCHEMA_VERSION = 1
 CALIBRATION_RUNTIME_IDENTITY_SCHEMA_VERSION = 1
-PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION = 1
+PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION = 2
 # This multiplier admits only accumulated binary64/API representation error.
 # It is not a steering tolerance or feel dial.
 _CALLBACK_REPRESENTATION_EPSILON_MULTIPLIER = 128.0
@@ -78,19 +79,74 @@ def _fail(
 
 
 @dataclass(frozen=True, slots=True)
+class RackDynamicsNode:
+  speed_mps: float
+  rack_gain_deg_s2_per_torque: float
+  rack_damping_per_s: float
+
+  def __post_init__(self) -> None:
+    speed = float(self.speed_mps)
+    gain = float(self.rack_gain_deg_s2_per_torque)
+    damping = float(self.rack_damping_per_s)
+    if (
+      not math.isfinite(speed)
+      or speed < 0.0
+      or not math.isfinite(gain)
+      or gain <= 0.0
+      or not math.isfinite(damping)
+      or damping < 0.0
+    ):
+      _fail(
+        RuntimeVehicleCompatibility.INVALID_PROVISIONAL_DYNAMICS,
+        "rack dynamics node must be finite and physical",
+      )
+    object.__setattr__(self, "speed_mps", speed)
+    object.__setattr__(self, "rack_gain_deg_s2_per_torque", gain)
+    object.__setattr__(self, "rack_damping_per_s", damping)
+
+  def to_dict(self) -> dict[str, float]:
+    return {
+      "rack_damping_per_s": self.rack_damping_per_s,
+      "rack_gain_deg_s2_per_torque": self.rack_gain_deg_s2_per_torque,
+      "speed_mps": self.speed_mps,
+    }
+
+
+@dataclass(frozen=True, slots=True)
 class ProvisionalRackDynamics:
-  """Explicit unqualified dynamics used only for shadowing and training."""
+  """Explicit unqualified dynamics for study and authorized field trials."""
 
   rack_gain_deg_s2_per_torque: float
   rack_damping_per_s: float
   rack_rate_resolution_deg_s: float
   provenance: str
+  nodes: tuple[RackDynamicsNode, ...] = ()
 
   def __post_init__(self) -> None:
     gain = float(self.rack_gain_deg_s2_per_torque)
     damping = float(self.rack_damping_per_s)
     resolution = float(self.rack_rate_resolution_deg_s)
     provenance = str(self.provenance).strip()
+    nodes = self.nodes
+    if (
+      not nodes
+      or (
+        type(nodes) is tuple
+        and nodes
+        and type(nodes[0]) is RackDynamicsNode
+        and (
+          nodes[0].rack_gain_deg_s2_per_torque != gain
+          or nodes[0].rack_damping_per_s != damping
+        )
+      )
+    ):
+      # Preserve the legacy scalar constructor and dataclasses.replace
+      # semantics: changing either scalar intentionally requests a uniform
+      # schedule. Schema-2 files derive both scalars from their first node.
+      nodes = tuple(
+        RackDynamicsNode(speed, gain, damping)
+        for speed in DEFAULT_SPEED_NODES_MPS
+      )
     if (
       not math.isfinite(gain)
       or gain <= 0.0
@@ -99,6 +155,9 @@ class ProvisionalRackDynamics:
       or not math.isfinite(resolution)
       or resolution < 0.0
       or not provenance
+      or type(nodes) is not tuple
+      or any(type(node) is not RackDynamicsNode for node in nodes)
+      or tuple(node.speed_mps for node in nodes) != DEFAULT_SPEED_NODES_MPS
     ):
       _fail(
         RuntimeVehicleCompatibility.INVALID_PROVISIONAL_DYNAMICS,
@@ -116,13 +175,37 @@ class ProvisionalRackDynamics:
       resolution,
     )
     object.__setattr__(self, "provenance", provenance)
+    object.__setattr__(self, "nodes", nodes)
+
+  def parameters_at_speed(self, speed_mps: float) -> tuple[float, float]:
+    speed = float(speed_mps)
+    if not math.isfinite(speed) or speed < 0.0:
+      _fail(
+        RuntimeVehicleCompatibility.INVALID_PROVISIONAL_DYNAMICS,
+        "rack dynamics interpolation speed must be finite and non-negative",
+      )
+    if speed <= self.nodes[0].speed_mps:
+      node = self.nodes[0]
+      return node.rack_gain_deg_s2_per_torque, node.rack_damping_per_s
+    for lower, upper in zip(self.nodes, self.nodes[1:], strict=True):
+      if speed <= upper.speed_mps:
+        weight = (speed - lower.speed_mps) / (upper.speed_mps - lower.speed_mps)
+        gain = lower.rack_gain_deg_s2_per_torque + weight * (
+          upper.rack_gain_deg_s2_per_torque
+          - lower.rack_gain_deg_s2_per_torque
+        )
+        damping = lower.rack_damping_per_s + weight * (
+          upper.rack_damping_per_s - lower.rack_damping_per_s
+        )
+        return gain, damping
+    node = self.nodes[-1]
+    return node.rack_gain_deg_s2_per_torque, node.rack_damping_per_s
 
   def to_dict(self) -> dict[str, Any]:
     return {
       "provenance": self.provenance,
       "provisional": True,
-      "rack_damping_per_s": self.rack_damping_per_s,
-      "rack_gain_deg_s2_per_torque": self.rack_gain_deg_s2_per_torque,
+      "nodes": [node.to_dict() for node in self.nodes],
       "rack_rate_resolution_deg_s": self.rack_rate_resolution_deg_s,
       "schema_version": PROVISIONAL_RACK_DYNAMICS_SCHEMA_VERSION,
     }
@@ -139,7 +222,7 @@ class ProvisionalRackDynamics:
     cls,
     path: str | Path,
   ) -> ProvisionalRackDynamics:
-    """Load an explicit, schema-pinned shadow/training seed."""
+    """Load an explicit, schema-pinned provisional seed."""
     try:
       payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -149,8 +232,7 @@ class ProvisionalRackDynamics:
       ) from exc
     expected_keys = {
       "schema_version",
-      "rack_gain_deg_s2_per_torque",
-      "rack_damping_per_s",
+      "nodes",
       "rack_rate_resolution_deg_s",
       "provenance",
       "provisional",
@@ -171,15 +253,34 @@ class ProvisionalRackDynamics:
         "rack dynamics must use the current explicitly provisional schema",
       )
     try:
+      raw_nodes = payload["nodes"]
+      if type(raw_nodes) is not list:
+        raise TypeError("rack dynamics nodes must be a list")
+      nodes = tuple(
+        RackDynamicsNode(
+          speed_mps=float(raw_node["speed_mps"]),
+          rack_gain_deg_s2_per_torque=float(
+            raw_node["rack_gain_deg_s2_per_torque"],
+          ),
+          rack_damping_per_s=float(raw_node["rack_damping_per_s"]),
+        )
+        for raw_node in raw_nodes
+        if type(raw_node) is dict and set(raw_node) == {
+          "speed_mps",
+          "rack_gain_deg_s2_per_torque",
+          "rack_damping_per_s",
+        }
+      )
+      if len(nodes) != len(raw_nodes) or not nodes:
+        raise ValueError("rack dynamics nodes are malformed")
       return cls(
-        rack_gain_deg_s2_per_torque=float(
-          payload["rack_gain_deg_s2_per_torque"],
-        ),
-        rack_damping_per_s=float(payload["rack_damping_per_s"]),
+        rack_gain_deg_s2_per_torque=nodes[0].rack_gain_deg_s2_per_torque,
+        rack_damping_per_s=nodes[0].rack_damping_per_s,
         rack_rate_resolution_deg_s=float(
           payload["rack_rate_resolution_deg_s"],
         ),
         provenance=payload["provenance"],
+        nodes=nodes,
       )
     except (TypeError, ValueError, OverflowError) as exc:
       if isinstance(exc, RuntimeVehicleCompatibilityError):
@@ -656,6 +757,26 @@ def build_runtime_vehicle_bundle(
     static_friction_torque=friction,
     kinetic_friction_torque=friction,
     rack_rate_resolution_deg_s=rack_rate_resolution,
+  )
+  dynamics_by_speed = {
+    node.speed_mps: provisional_rack_dynamics.parameters_at_speed(
+      node.speed_mps,
+    )
+    for node in base_seed.nodes
+  }
+  base_seed = replace(
+    base_seed,
+    nodes=tuple(
+      replace(
+        node,
+        parameters=replace(
+          node.parameters,
+          rack_gain_deg_s2_per_torque=dynamics_by_speed[node.speed_mps][0],
+          rack_damping_per_s=dynamics_by_speed[node.speed_mps][1],
+        ),
+      )
+      for node in base_seed.nodes
+    ),
   )
   calibration_seed_profile = make_calibration_seed_profile(
     vehicle_identity=identity,

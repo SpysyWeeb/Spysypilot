@@ -77,8 +77,8 @@ class Controls:
 
     # Optional modular construction is process-start-only. No approved
     # artifact exists on a fresh install, so the exact stock controller above
-    # remains the sole actuator until profiled has prepared a fully gated
-    # active artifact for this exact build/runtime identity.
+    # remains the sole actuator unless profiled has prepared an exact active
+    # artifact or the explicit development-trial parameter is enabled.
     try:
       source_openpilot_commit = (
         get_build_metadata().openpilot.git_commit
@@ -107,7 +107,9 @@ class Controls:
     self.blatv2_messages_valid = True
     self.blatv2_modular_session = False
     cloudlog.info(
-      f"BLaTv2 modular bootstrap: eligibility={int(self.blatv2_live.eligibility)} runtime_identity={self.blatv2_live.runtime_identity_sha256}"
+      f"BLaTv2 modular bootstrap: eligibility={int(self.blatv2_live.eligibility)} " +
+      f"experimental={self.blatv2_live.experimental_active} " +
+      f"runtime_identity={self.blatv2_live.runtime_identity_sha256}"
     )
 
   def update(self):
