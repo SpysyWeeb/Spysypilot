@@ -567,9 +567,9 @@ def _controller_profile_matches_calibration(
         + calibration_node.moving_sample_count
         + calibration_node.breakaway_sample_count
       )
-      or controller_node.validation_count != calibration_node.validation_count
-      or controller_node.validation_rms
-      != calibration_node.inverse_calibration_validation_rms
+      or controller_node.cross_fit_route_count != calibration_node.cross_fit_route_count
+      or controller_node.full_fit_candidate_rms
+      != calibration_node.full_fit_candidate_rms
     ):
       return False
   return True

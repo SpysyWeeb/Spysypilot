@@ -8,6 +8,8 @@ friction, observer, torque envelope, safety limits, or any live state.
 Training chooses at most one frozen winner.  Held-out validation receives only
 that winner and may accept or reject it; it has no fallback-selection API.
 Smooth, Swift, and Strong remain independent contracts throughout.
+Exact stock remains a permanent comparator: the declared target must improve
+materially against stock and the accepted incumbent on the current routes.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from dataclasses import dataclass, replace
 from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
 from enum import StrEnum
 import hashlib
+import json
 import math
 import sys
 from typing import TYPE_CHECKING, Any
@@ -438,6 +441,111 @@ class PolicyEvaluation:
 
 
 @dataclass(frozen=True, slots=True)
+class _EvaluationCoreIdentity:
+  controller_name: str
+  core_artifact_sha256: str
+  source_openpilot_commit: str
+  opendbc_commit: str
+  panda_commit: str
+
+  @property
+  def platform_identity(self) -> tuple[str, str, str]:
+    return self.source_openpilot_commit, self.opendbc_commit, self.panda_commit
+
+
+@dataclass(frozen=True, slots=True)
+class _EvaluationArtifactIdentity:
+  role: str
+  core: _EvaluationCoreIdentity
+  behavior_policy_sha256: str | None
+  composed_controller_artifact_sha256: str
+
+
+def _lower_hex(value: object, length: int, name: str) -> str:
+  if (
+    type(value) is not str
+    or len(value) != length
+    or any(character not in "0123456789abcdef" for character in value)
+  ):
+    raise ValueError(f"{name} must be {length}-character lowercase hexadecimal")
+  return value
+
+
+def _source_commit(value: object, name: str) -> str:
+  if (
+    type(value) is not str
+    or len(value) not in (40, 64)
+    or any(character not in "0123456789abcdef" for character in value)
+  ):
+    raise ValueError(f"{name} must be a full lowercase source commit")
+  return value
+
+
+def _parse_evaluation_artifact_identity(encoded: object) -> _EvaluationArtifactIdentity:
+  """Parse the coordinator wire identity without importing it cyclically."""
+  if type(encoded) is not str or not encoded:
+    raise ValueError("artifact_identity must be canonical identity JSON")
+  try:
+    payload = json.loads(encoded)
+  except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise ValueError("artifact_identity must be canonical identity JSON") from exc
+  if type(payload) is not dict or set(payload) != {
+    "behaviorPolicySha256",
+    "composedControllerArtifactSha256",
+    "core",
+    "role",
+  }:
+    raise ValueError("artifact identity keys do not match schema")
+  if canonical_json(payload) != encoded:
+    raise ValueError("artifact identity JSON is not canonical")
+  role = payload["role"]
+  if role not in {"exact_stock", "currently_accepted", "candidate"}:
+    raise ValueError("artifact identity role is invalid")
+  core_payload = payload["core"]
+  if type(core_payload) is not dict or set(core_payload) != {
+    "controllerName",
+    "coreArtifactSha256",
+    "opendbcCommit",
+    "pandaCommit",
+    "sourceOpenpilotCommit",
+  }:
+    raise ValueError("artifact core identity keys do not match schema")
+  controller_name = core_payload["controllerName"]
+  if type(controller_name) is not str or not controller_name.strip():
+    raise ValueError("artifact controller name must be non-empty text")
+  policy_sha256 = payload["behaviorPolicySha256"]
+  if policy_sha256 is not None:
+    policy_sha256 = _lower_hex(policy_sha256, 64, "artifact policy identity")
+  core = _EvaluationCoreIdentity(
+    controller_name=controller_name,
+    core_artifact_sha256=_lower_hex(
+      core_payload["coreArtifactSha256"], 64, "artifact core identity",
+    ),
+    source_openpilot_commit=_source_commit(
+      core_payload["sourceOpenpilotCommit"], "artifact source commit",
+    ),
+    opendbc_commit=_source_commit(
+      core_payload["opendbcCommit"], "artifact opendbc commit",
+    ),
+    panda_commit=_source_commit(
+      core_payload["pandaCommit"], "artifact panda commit",
+    ),
+  )
+  composed = _lower_hex(
+    payload["composedControllerArtifactSha256"],
+    64,
+    "composed controller artifact identity",
+  )
+  expected_composed = hashlib.sha256(canonical_json({
+    "behaviorPolicySha256": policy_sha256,
+    "core": core_payload,
+  }).encode("utf-8")).hexdigest()
+  if composed != expected_composed:
+    raise ValueError("composed controller artifact identity is invalid")
+  return _EvaluationArtifactIdentity(role, core, policy_sha256, composed)
+
+
+@dataclass(frozen=True, slots=True)
 class MetricGateRule:
   """Explicit physical bound, comparison uncertainty, and normalization."""
 
@@ -774,6 +882,61 @@ def _metric_margin(
   )
 
 
+def _validate_comparison_identities(
+  candidate: PolicyCandidate,
+  candidate_evaluation: PolicyEvaluation,
+  exact_stock_evaluation: PolicyEvaluation,
+  accepted_evaluation: PolicyEvaluation,
+) -> None:
+  """Fail closed before any metric can vote under a mislabeled opponent."""
+  candidate_identity = _parse_evaluation_artifact_identity(
+    candidate_evaluation.artifact_identity,
+  )
+  stock_identity = _parse_evaluation_artifact_identity(
+    exact_stock_evaluation.artifact_identity,
+  )
+  accepted_identity = _parse_evaluation_artifact_identity(
+    accepted_evaluation.artifact_identity,
+  )
+  if candidate_evaluation.policy != candidate.policy:
+    raise ValueError("candidate evaluation policy identity mismatch")
+  if (
+    candidate_identity.role != "candidate"
+    or candidate_identity.behavior_policy_sha256 != candidate.policy.sha256
+  ):
+    raise ValueError("candidate evaluation artifact role or policy mismatch")
+  if exact_stock_evaluation.policy is not None:
+    raise ValueError("exact-stock evaluation must have a null policy")
+  if (
+    stock_identity.role != "exact_stock"
+    or stock_identity.behavior_policy_sha256 is not None
+  ):
+    raise ValueError("exact-stock evaluation artifact identity mismatch")
+
+  if accepted_evaluation.policy is None:
+    if accepted_identity.behavior_policy_sha256 is not None:
+      raise ValueError("bootstrap accepted evaluation has a policy identity")
+    if accepted_identity.role not in {"exact_stock", "currently_accepted"}:
+      raise ValueError("bootstrap accepted evaluation artifact role mismatch")
+    if accepted_identity.core != stock_identity.core:
+      raise ValueError("bootstrap incumbent does not alias exact-stock core")
+    if accepted_evaluation.metrics != exact_stock_evaluation.metrics:
+      raise ValueError("bootstrap incumbent does not alias exact-stock evaluation")
+  elif (
+    accepted_identity.role != "currently_accepted"
+    or accepted_identity.behavior_policy_sha256 != accepted_evaluation.policy.sha256
+  ):
+    raise ValueError("accepted evaluation artifact role or policy mismatch")
+
+  platform_identities = {
+    candidate_identity.core.platform_identity,
+    stock_identity.core.platform_identity,
+    accepted_identity.core.platform_identity,
+  }
+  if len(platform_identities) != 1:
+    raise ValueError("controller evaluations use different platform source identities")
+
+
 def evaluate_candidate(
   candidate: PolicyCandidate,
   candidate_evaluation: PolicyEvaluation,
@@ -789,8 +952,12 @@ def evaluate_candidate(
     raise ValueError("paired route uncertainty method is unsupported")
   if minimum_paired_route_count < 2:
     raise ValueError("paired route uncertainty requires at least two routes")
-  if candidate_evaluation.policy != candidate.policy:
-    raise ValueError("candidate evaluation policy identity mismatch")
+  _validate_comparison_identities(
+    candidate,
+    candidate_evaluation,
+    exact_stock_evaluation,
+    accepted_evaluation,
+  )
   if not (
     candidate_evaluation.route_ids
     == exact_stock_evaluation.route_ids
@@ -834,14 +1001,26 @@ def evaluate_candidate(
     for verdict in metric_verdicts
     if verdict.metric_name == target_metric_name
   )
-  target_improvement: float | None = None
-  target_material = False
-  if target_verdict.paired_against_accepted is not None:
-    target_improvement = target_verdict.paired_against_accepted.mean
-    target_material = (
-      target_verdict.paired_against_accepted.lower
-      > target_rule.noise_floor
+  target_pairs = tuple(
+    pair
+    for pair in (
+      target_verdict.paired_against_stock,
+      target_verdict.paired_against_accepted,
     )
+    if pair is not None
+  )
+  target_improvement = (
+    min(pair.mean for pair in target_pairs)
+    if len(target_pairs) == 2
+    else None
+  )
+  # Stock remains the permanent minimum bar after a modular policy has been
+  # accepted. A later candidate must materially improve the declared target
+  # against both stock and that incumbent on the current route population.
+  target_material = len(target_pairs) == 2 and all(
+    pair.lower > target_rule.noise_floor
+    for pair in target_pairs
+  )
   contract_margins = tuple(
     contract.margin
     for contract in contract_verdicts
@@ -853,13 +1032,13 @@ def evaluate_candidate(
     else None
   )
   if target_improvement is not None and worst_margin is not None:
-    assert target_verdict.paired_against_accepted is not None
     worst_margin = min(
       worst_margin,
-      (
-        target_verdict.paired_against_accepted.lower
-        - target_rule.noise_floor
-      ) / target_rule.margin_normalization,
+      *(
+        (pair.lower - target_rule.noise_floor)
+        / target_rule.margin_normalization
+        for pair in target_pairs
+      ),
     )
   passed = all(contract.passed for contract in contract_verdicts) and target_material
   gate_spec_sha256 = hashlib.sha256(canonical_json({

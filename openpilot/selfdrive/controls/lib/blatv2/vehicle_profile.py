@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
 )
 
 
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 PROFILE_PARAM_KEY = "BLaTv2ModularVehicleProfile"
 DEFAULT_SPEED_NODES_MPS = (0.0, 5.0, 10.0, 15.0, 20.0, 30.0)
 
@@ -39,8 +39,8 @@ _NODE_KEYS = frozenset({
   "parameters",
   "sample_count",
   "speed_mps",
-  "validation_count",
-  "validation_rms",
+  "cross_fit_route_count",
+  "full_fit_candidate_rms",
 })
 _PARAMETER_KEYS = frozenset({
   "confidence",
@@ -148,26 +148,26 @@ class ProfileNode:
   parameters: PhysicalParameters
   clean_support_s: float
   sample_count: int
-  validation_count: int
-  validation_rms: float
+  cross_fit_route_count: int
+  full_fit_candidate_rms: float
 
   def __post_init__(self) -> None:
     if not isinstance(self.parameters, PhysicalParameters):
       raise ValueError("profile-node parameters must be PhysicalParameters")
-    if type(self.sample_count) is not int or type(self.validation_count) is not int:
+    if type(self.sample_count) is not int or type(self.cross_fit_route_count) is not int:
       raise ValueError("profile-node counts must be integers")
     if not all(math.isfinite(value) for value in (
       self.speed_mps,
       self.clean_support_s,
-      self.validation_rms,
+      self.full_fit_candidate_rms,
     )):
       raise ValueError("profile-node values must be finite")
     if (
       self.speed_mps < 0.0
       or self.clean_support_s < 0.0
       or self.sample_count < 0
-      or self.validation_count < 0
-      or self.validation_rms < 0.0
+      or self.cross_fit_route_count < 0
+      or self.full_fit_candidate_rms < 0.0
     ):
       raise ValueError("profile-node evidence is outside its valid domain")
 
@@ -313,8 +313,8 @@ class VehicleProfile:
           },
           "clean_support_s": node.clean_support_s,
           "sample_count": node.sample_count,
-          "validation_count": node.validation_count,
-          "validation_rms": node.validation_rms,
+          "cross_fit_route_count": node.cross_fit_route_count,
+          "full_fit_candidate_rms": node.full_fit_candidate_rms,
         }
         for node in self.nodes
       ],
@@ -422,13 +422,13 @@ class VehicleProfile:
           raw_node["sample_count"],
           f"vehicle profile node {index} sample_count",
         ),
-        validation_count=_require_int(
-          raw_node["validation_count"],
-          f"vehicle profile node {index} validation_count",
+        cross_fit_route_count=_require_int(
+          raw_node["cross_fit_route_count"],
+          f"vehicle profile node {index} cross_fit_route_count",
         ),
-        validation_rms=_require_float(
-          raw_node["validation_rms"],
-          f"vehicle profile node {index} validation_rms",
+        full_fit_candidate_rms=_require_float(
+          raw_node["full_fit_candidate_rms"],
+          f"vehicle profile node {index} full_fit_candidate_rms",
         ),
       ))
     return cls(
@@ -469,8 +469,8 @@ def make_seed_profile(
       parameters=parameters,
       clean_support_s=0.0,
       sample_count=0,
-      validation_count=0,
-      validation_rms=0.0,
+      cross_fit_route_count=0,
+      full_fit_candidate_rms=0.0,
     )
     for speed in speed_nodes_mps
   )
@@ -537,8 +537,8 @@ def compose_controller_profile(
         + calibration_node.moving_sample_count
         + calibration_node.breakaway_sample_count
       ),
-      validation_count=calibration_node.validation_count,
-      validation_rms=calibration_node.inverse_calibration_validation_rms,
+      cross_fit_route_count=calibration_node.cross_fit_route_count,
+      full_fit_candidate_rms=calibration_node.full_fit_candidate_rms,
     ))
 
   calibration_sha = hashlib.sha256(

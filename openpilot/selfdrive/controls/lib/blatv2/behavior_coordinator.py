@@ -528,13 +528,49 @@ class ReplayRole(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ReplayCoreIdentity:
-  """Exact shared numerical-core bytes and source commits for replay."""
+  """Declared numerical-core contract and source commits for replay.
+
+  This value is hash identity, not execution authority.  Production replay
+  validates it against a reviewed implementation contract and fixed adapter.
+  """
 
   controller_name: str
   core_artifact_sha256: str
   source_openpilot_commit: str
   opendbc_commit: str
   panda_commit: str
+
+  @classmethod
+  def compose(
+    cls,
+    *,
+    controller_name: str,
+    implementation_contract: str,
+    replay_input_schema_version: int,
+    source_openpilot_commit: str,
+    opendbc_commit: str,
+    panda_commit: str,
+  ) -> ReplayCoreIdentity:
+    """Bind reviewed implementation semantics to exact source commits."""
+    if not controller_name.strip() or not implementation_contract.strip():
+      raise ValueError("replay core implementation identity is empty")
+    if replay_input_schema_version <= 0:
+      raise ValueError("replay input schema version must be positive")
+    core_sha256 = _sha256_json({
+      "behaviorReplayInputSchemaVersion": replay_input_schema_version,
+      "controllerName": controller_name,
+      "implementationContract": implementation_contract,
+      "opendbcCommit": opendbc_commit,
+      "pandaCommit": panda_commit,
+      "sourceOpenpilotCommit": source_openpilot_commit,
+    })
+    return cls(
+      controller_name=controller_name,
+      core_artifact_sha256=core_sha256,
+      source_openpilot_commit=source_openpilot_commit,
+      opendbc_commit=opendbc_commit,
+      panda_commit=panda_commit,
+    )
 
   def __post_init__(self) -> None:
     if not self.controller_name.strip():
@@ -637,9 +673,9 @@ class FinalizationReason(StrEnum):
   UNDEFINED_TRAINING_METRIC = "undefined_training_metric"
   NO_TRAINING_WINNER = "no_training_winner"
   UNDEFINED_VALIDATION_METRIC = "undefined_validation_metric"
-  SMOOTH_VALIDATION_REGRESSION = "smooth_validation_regression"
-  SWIFT_VALIDATION_REGRESSION = "swift_validation_regression"
-  STRONG_VALIDATION_REGRESSION = "strong_validation_regression"
+  SMOOTH_CROSS_FIT_REGRESSION = "smooth_cross_fit_regression"
+  SWIFT_CROSS_FIT_REGRESSION = "swift_cross_fit_regression"
+  STRONG_CROSS_FIT_REGRESSION = "strong_cross_fit_regression"
   TARGET_VALIDATION_NOT_MATERIAL = "target_validation_not_material"
 
 
@@ -931,6 +967,13 @@ def finalize_behavior_learning(
 ) -> BehaviorLearningFinalization:
   """Select on whole training routes, freeze once, then validate once.
 
+  This is a pure selection primitive, not replay authority: its callback is
+  intentionally caller-owned.  Production reaches it only after
+  ``run_behavior_learning_transaction`` has admitted the reviewed fixed replay
+  adapters, or through the compact aggregate path whose route evaluations
+  validate those adapters directly.  Calling this selector with synthetic
+  evaluations is useful in tests but cannot establish an exact-stock row.
+
   Before the first modular artifact is approved, ``accepted_policy`` and
   ``accepted_core`` are both ``None``.  Exact stock then supplies both
   reference roles while ``search_center_policy`` remains an explicit search
@@ -1101,11 +1144,11 @@ def finalize_behavior_learning(
   target_passed = validation.frozen_winner_verdict.target_materially_improved
   if not validation.accepted:
     if not smooth_passed:
-      reason = FinalizationReason.SMOOTH_VALIDATION_REGRESSION
+      reason = FinalizationReason.SMOOTH_CROSS_FIT_REGRESSION
     elif not swift_passed:
-      reason = FinalizationReason.SWIFT_VALIDATION_REGRESSION
+      reason = FinalizationReason.SWIFT_CROSS_FIT_REGRESSION
     elif not strong_passed:
-      reason = FinalizationReason.STRONG_VALIDATION_REGRESSION
+      reason = FinalizationReason.STRONG_CROSS_FIT_REGRESSION
     else:
       reason = FinalizationReason.TARGET_VALIDATION_NOT_MATERIAL
     return _failed_finalization(

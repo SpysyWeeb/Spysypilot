@@ -42,6 +42,7 @@ MAX_EVENT_TYPE_BYTES = 128
 MAX_EVENT_SEVERITY_BYTES = 64
 MAX_STATUS_BYTES = 128
 MAX_ROUTE_EVIDENCE_MANIFEST_BYTES = 4 * 1024 * 1024
+STREAM_HASH_CHUNK_BYTES = 64 * 1024
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -135,6 +136,92 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
   except (TypeError, ValueError) as error:
     raise RouteEvidenceError("manifest is not canonical JSON") from error
+
+
+_PHYSICAL_TIME_FIELDS = (
+  "sample_mono_ns",
+  "response_mono_ns",
+  "applied_report_mono_ns",
+  "applied_effective_mono_ns",
+)
+_PHYSICAL_NUMERIC_FIELDS = (
+  "speed_mps",
+  "steering_angle_deg",
+  "steering_rate_deg_s",
+  "steering_torque",
+  "applied_torque",
+  "angle_offset_deg",
+  "steer_ratio",
+  "stiffness_factor",
+  "roll_rad",
+)
+_PHYSICAL_BOOLEAN_FIELDS = (
+  "steering_pressed",
+  "standstill",
+  "steer_fault_temporary",
+  "steer_fault_permanent",
+  "can_valid",
+  "can_timeout",
+  "lateral_active",
+  "live_parameters_valid",
+  "angle_offset_valid",
+  "steer_ratio_valid",
+  "stiffness_factor_valid",
+  "inputs_valid",
+)
+
+
+def _physical_frame_codec() -> tuple[int, Any, Any]:
+  """Load the sole physical-plane codec without creating an import cycle."""
+  from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
+    SPOOL_RECORD_SIZE,
+    _decode_frame,
+    _encode_frame,
+  )
+
+  return SPOOL_RECORD_SIZE, _decode_frame, _encode_frame
+
+
+def _decode_canonical_physical_record(
+  encoded: bytes | memoryview,
+  decode_frame: Any,
+  encode_frame: Any,
+) -> Any:
+  """Decode one bounded record and prove its semantic and wire invariants."""
+  try:
+    frame = decode_frame(encoded)
+    for field in _PHYSICAL_TIME_FIELDS:
+      _sint(getattr(frame, field), f"physical {field}", -(1 << 63), (1 << 63) - 1)
+    for field in _PHYSICAL_NUMERIC_FIELDS:
+      _finite(getattr(frame, field), f"physical {field}")
+    for field in _PHYSICAL_BOOLEAN_FIELDS:
+      _boolean(getattr(frame, field), f"physical {field}")
+    rebuilt = encode_frame(frame)
+  except (AttributeError, struct.error, TypeError, ValueError) as error:
+    raise RouteEvidenceError("physical record is invalid") from error
+  if rebuilt != encoded:
+    raise RouteEvidenceError("physical record is not canonical")
+  return frame
+
+
+def _validate_physical_plane(encoded: bytes | memoryview) -> None:
+  """Validate an in-memory physical plane one fixed-size record at a time."""
+  record_size, decode_frame, encode_frame = _physical_frame_codec()
+  if len(encoded) % record_size:
+    raise RouteEvidenceError("physical plane size/count/encoding disagree")
+  view = memoryview(encoded)
+  for offset in range(0, len(view), record_size):
+    _decode_canonical_physical_record(
+      view[offset:offset + record_size],
+      decode_frame,
+      encode_frame,
+    )
+
+
+def _add_unique_event_id(event_ids: set[str], event_id: str) -> None:
+  if event_id in event_ids:
+    raise RouteEvidenceError("event IDs are not unique")
+  event_ids.add(event_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -699,6 +786,7 @@ class RouteEvidenceArtifact:
     )
     if len(physical) != source_identity.physical_record_count * SPOOL_RECORD_SIZE:
       raise RouteEvidenceError("physical plane size/count/encoding disagree")
+    _validate_physical_plane(physical)
     _validate_sparse(live_torque_parameters, LiveTorqueParametersPublication, "live torque", MAX_SPARSE_PUBLICATIONS)
     _validate_sparse(live_delays, LiveDelayPublication, "live delay", MAX_SPARSE_PUBLICATIONS)
     _validate_sparse(lateral_maneuver_plans, LateralManeuverPlanPublication, "maneuver plan", MAX_SPARSE_PUBLICATIONS)
@@ -742,9 +830,7 @@ class RouteEvidenceArtifact:
       if _finite(value.analysis_window_before_s, "event before window") < 0.0 or _finite(value.analysis_window_after_s, "event after window") < 0.0:
         raise RouteEvidenceError("event windows must be nonnegative")
       _boolean(value.message_valid, "event message valid")
-      if value.event_id in event_ids:
-        raise RouteEvidenceError("event IDs are not unique")
-      event_ids.add(value.event_id)
+      _add_unique_event_id(event_ids, value.event_id)
       key = (value.publication_mono_time_ns, value.segment_index, value.ordinal)
       if previous_event is not None and key <= previous_event:
         raise RouteEvidenceError("event records are not ordered")
@@ -960,8 +1046,8 @@ class RouteEvidenceArtifact:
     events = _decode_events(sections[8], manifest["driving_event_locator_count"])
     # Decoders reject non-canonical reserved values and malformed records.
     # Re-encoding each compact section independently proves canonical wire
-    # form while keeping peak memory bounded to one compact plane.  The large
-    # physical plane is fixed-width and validated by size/hash above.
+    # form while keeping peak memory bounded to one compact plane. The large
+    # physical plane is validated one fixed-width record at a time below.
     for rebuilt_section, section in (
       (_encode_models(models), sections[3]),
       (_encode_controls(controls), sections[4]),
@@ -972,6 +1058,10 @@ class RouteEvidenceArtifact:
     ):
       if rebuilt_section != section:
         raise RouteEvidenceError("route evidence section is not canonical")
+    _validate_physical_plane(physical)
+    event_ids: set[str] = set()
+    for event in events:
+      _add_unique_event_id(event_ids, event.event_id)
 
     artifact = object.__new__(cls)
     artifact._canonical_bytes = encoded
@@ -1025,7 +1115,7 @@ def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
       chunks: list[bytes] = []
       remaining = size
       while remaining:
-        block = os.read(descriptor, min(1024 * 1024, remaining))
+        block = os.read(descriptor, min(STREAM_HASH_CHUNK_BYTES, remaining))
         if not block:
           break
         chunks.append(block)
@@ -1156,7 +1246,7 @@ def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
       section_digest = hashlib.sha256()
       remaining = size
       while remaining:
-        block = os.read(descriptor, min(1024 * 1024, remaining))
+        block = os.read(descriptor, min(STREAM_HASH_CHUNK_BYTES, remaining))
         if not block:
           raise RouteEvidenceError("route evidence section is truncated")
         whole_digest.update(block)
@@ -1199,6 +1289,28 @@ def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
           raise RouteEvidenceError(f"{purpose} is truncated")
         output.extend(block)
       return bytes(output)
+
+    physical_record_size, decode_frame, encode_frame = _physical_frame_codec()
+    physical_cursor = section_offsets[2]
+    physical_remaining = source.physical_record_count
+    records_per_block = max(1, STREAM_HASH_CHUNK_BYTES // physical_record_size)
+    while physical_remaining:
+      block_count = min(physical_remaining, records_per_block)
+      block = memoryview(pread_exact(
+        physical_cursor,
+        block_count * physical_record_size,
+        "physical record block",
+      ))
+      for offset in range(0, len(block), physical_record_size):
+        _decode_canonical_physical_record(
+          block[offset:offset + physical_record_size],
+          decode_frame,
+          encode_frame,
+        )
+      physical_cursor += len(block)
+      physical_remaining -= block_count
+    if physical_cursor != section_offsets[2] + sizes[2]:
+      raise RouteEvidenceError("physical section contains trailing bytes")
 
     model_cursor = section_offsets[3]
     previous_model: tuple[int, int, int] | None = None
@@ -1292,6 +1404,7 @@ def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
 
     event_cursor = section_offsets[8]
     previous_event: tuple[int, int, int] | None = None
+    event_ids: set[str] = set()
     for _ in range(event_count):
       fixed = pread_exact(event_cursor, _EVENT.size, "event record")
       row = _EVENT.unpack(fixed)
@@ -1304,6 +1417,7 @@ def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
         raise RouteEvidenceError("event record is not canonical")
       if decoded.analysis_window_before_s < 0.0 or decoded.analysis_window_after_s < 0.0:
         raise RouteEvidenceError("event windows must be nonnegative")
+      _add_unique_event_id(event_ids, decoded.event_id)
       key = (decoded.publication_mono_time_ns, decoded.segment_index, decoded.ordinal)
       if previous_event is not None and key <= previous_event:
         raise RouteEvidenceError("event records are not ordered")
@@ -1336,6 +1450,362 @@ def inspect_route_evidence_file(path: str | Path) -> RouteEvidenceFileSummary:
     )
   finally:
     os.close(descriptor)
+
+
+class RouteEvidenceStreamReader:
+  """Authenticated, bounded-memory view of one route-evidence artifact.
+
+  Construction runs the same complete inspector used at the immutable-store
+  boundary, then opens and holds the exact inspected inode.  Plane iterators
+  use ``pread`` and retain at most one bounded wire record.  A fully consumed
+  iterator independently checks its section digest; every iterator also
+  checks that the held file identity remained stable.
+
+  The eager :class:`RouteEvidenceArtifact` remains the construction and small
+  fixture API.  Streaming/eager parity tests pin every decoded public value so
+  this reader cannot quietly become a second evidence decoder.
+  """
+
+  __slots__ = (
+    "summary", "_descriptor", "_offsets", "_sizes", "_counts",
+  )
+
+  def __init__(self, path: str | Path) -> None:
+    self.summary = inspect_route_evidence_file(path)
+    self._descriptor = os.open(
+      self.summary.path,
+      os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+      self._check_stable()
+      header = self._pread_exact(0, _HEADER.size, "route evidence header")
+      unpacked = _HEADER.unpack(header)
+      sizes = tuple(unpacked[3:])
+      if (
+        unpacked[0] != ROUTE_EVIDENCE_MAGIC
+        or unpacked[1] != ROUTE_EVIDENCE_VERSION
+        or unpacked[2] != 0
+        or _HEADER.size + sum(sizes) != self.summary.st_size
+      ):
+        raise RouteEvidenceError("route evidence header changed after inspection")
+      offsets: list[int] = []
+      cursor = _HEADER.size
+      for size in sizes:
+        offsets.append(cursor)
+        cursor += size
+      self._offsets = tuple(offsets)
+      self._sizes = sizes
+      manifest = self.summary.manifest
+      self._counts = (
+        _uint(manifest["model_publication_count"], "model publication count", MAX_MODEL_PUBLICATIONS),
+        _uint(manifest["control_witness_count"], "control witness count", MAX_CONTROL_WITNESSES),
+        _uint(manifest["live_torque_parameters_count"], "live torque parameters count", MAX_SPARSE_PUBLICATIONS),
+        _uint(manifest["live_delay_count"], "live delay count", MAX_SPARSE_PUBLICATIONS),
+        _uint(manifest["lateral_maneuver_plan_count"], "lateral maneuver plan count", MAX_SPARSE_PUBLICATIONS),
+        _uint(manifest["driving_event_locator_count"], "driving event locator count", MAX_EVENT_LOCATORS),
+      )
+    except BaseException:
+      os.close(self._descriptor)
+      self._descriptor = -1
+      raise
+
+  def __enter__(self) -> RouteEvidenceStreamReader:
+    if self._descriptor < 0:
+      raise RouteEvidenceError("route evidence stream is closed")
+    return self
+
+  def __exit__(self, *_: object) -> None:
+    self.close()
+
+  def close(self) -> None:
+    if self._descriptor >= 0:
+      os.close(self._descriptor)
+      self._descriptor = -1
+
+  def _check_stable(self) -> None:
+    if self._descriptor < 0:
+      raise RouteEvidenceError("route evidence stream is closed")
+    observed = os.fstat(self._descriptor)
+    if (
+      not stat.S_ISREG(observed.st_mode)
+      or observed.st_dev != self.summary.st_dev
+      or observed.st_ino != self.summary.st_ino
+      or observed.st_size != self.summary.st_size
+      or observed.st_mtime_ns != self.summary.st_mtime_ns
+      or observed.st_ctime_ns != self.summary.st_ctime_ns
+    ):
+      raise RouteEvidenceError("route evidence changed during streaming")
+
+  def _pread_exact(self, offset: int, size: int, purpose: str) -> bytes:
+    output = bytearray()
+    while len(output) < size:
+      block = os.pread(
+        self._descriptor,
+        size - len(output),
+        offset + len(output),
+      )
+      if not block:
+        raise RouteEvidenceError(f"{purpose} is truncated")
+      output.extend(block)
+    return bytes(output)
+
+  def _section_digest(self, name: str) -> str:
+    manifest_hashes = self.summary.manifest["section_sha256"]
+    assert type(manifest_hashes) is dict
+    return str(manifest_hashes[name])
+
+  @staticmethod
+  def _finish_section(
+    digest: Any,
+    expected: str,
+    completed: bool,
+  ) -> None:
+    if completed and digest.hexdigest() != expected:
+      raise RouteEvidenceError("route evidence section hash mismatch")
+
+  def read_car_params_bytes(self) -> bytes:
+    self._check_stable()
+    encoded = self._pread_exact(
+      self._offsets[1], self._sizes[1], "canonical CarParams section",
+    )
+    if hashlib.sha256(encoded).hexdigest() != self._section_digest("car_params"):
+      raise RouteEvidenceError("route evidence section hash mismatch")
+    self._check_stable()
+    return encoded
+
+  def iter_physical_frames(self) -> Iterator[Any]:
+    record_size, decode_frame, encode_frame = _physical_frame_codec()
+
+    self._check_stable()
+    digest = hashlib.sha256()
+    completed = False
+    try:
+      cursor = self._offsets[2]
+      remaining = self.summary.source_identity.physical_record_count
+      records_per_block = max(1, STREAM_HASH_CHUNK_BYTES // record_size)
+      while remaining:
+        block_count = min(remaining, records_per_block)
+        encoded = self._pread_exact(
+          cursor,
+          block_count * record_size,
+          "physical record block",
+        )
+        digest.update(encoded)
+        block = memoryview(encoded)
+        for offset in range(0, len(block), record_size):
+          yield _decode_canonical_physical_record(
+            block[offset:offset + record_size],
+            decode_frame,
+            encode_frame,
+          )
+        cursor += len(encoded)
+        remaining -= block_count
+      if cursor != self._offsets[2] + self._sizes[2]:
+        raise RouteEvidenceError("physical section contains trailing bytes")
+      completed = True
+    finally:
+      self._finish_section(digest, self._section_digest("physical"), completed)
+      self._check_stable()
+
+  def iter_model_publications(self) -> Iterator[ModelPublication]:
+    self._check_stable()
+    digest = hashlib.sha256()
+    completed = False
+    try:
+      cursor = self._offsets[3]
+      previous: tuple[int, int, int] | None = None
+      for _ in range(self._counts[0]):
+        fixed = self._pread_exact(cursor, _MODEL.size, "model record")
+        length = _MODEL.unpack(fixed)[11]
+        if length > MAX_NATIVE_PLAN_SAMPLES:
+          raise RouteEvidenceError("model native grid length is invalid")
+        size = _MODEL.size + 3 * length * 8
+        encoded = self._pread_exact(cursor, size, "model record")
+        digest.update(encoded)
+        value = _decode_models(memoryview(encoded), 1)[0]
+        if _encode_models((value,)) != encoded:
+          raise RouteEvidenceError("model record is not canonical")
+        key = (value.mono_time_ns, value.segment_index, value.ordinal)
+        if previous is not None and key <= previous:
+          raise RouteEvidenceError("model records are not ordered")
+        previous = key
+        cursor += size
+        yield value
+      if cursor != self._offsets[3] + self._sizes[3]:
+        raise RouteEvidenceError("model section contains trailing bytes")
+      completed = True
+    finally:
+      self._finish_section(digest, self._section_digest("models"), completed)
+      self._check_stable()
+
+  def iter_control_witnesses(self) -> Iterator[ControlsWitness]:
+    self._check_stable()
+    digest = hashlib.sha256()
+    completed = False
+    try:
+      cursor = self._offsets[4]
+      previous: tuple[int, int, int] | None = None
+      index = 0
+      records_per_block = max(1, STREAM_HASH_CHUNK_BYTES // _CONTROL.size)
+      while index < self._counts[1]:
+        block_count = min(self._counts[1] - index, records_per_block)
+        encoded = self._pread_exact(
+          cursor,
+          block_count * _CONTROL.size,
+          "control record block",
+        )
+        digest.update(encoded)
+        block = memoryview(encoded)
+        for offset in range(0, len(block), _CONTROL.size):
+          record = block[offset:offset + _CONTROL.size]
+          value = _decode_controls(record, 1)[0]
+          if _encode_controls((value,)) != record:
+            raise RouteEvidenceError("control record is not canonical")
+          if value.physical_record_index != index:
+            raise RouteEvidenceError("physical record indices are not canonical")
+          if value.model_publication_index >= self._counts[0]:
+            raise RouteEvidenceError("model publication index is out of range")
+          if value.live_torque_parameters_index >= self._counts[2]:
+            raise RouteEvidenceError("live torque index is out of range")
+          if value.live_delay_index >= self._counts[3]:
+            raise RouteEvidenceError("live delay index is out of range")
+          if value.lateral_maneuver_plan_index >= self._counts[4]:
+            raise RouteEvidenceError("maneuver plan index is out of range")
+          key = (value.mono_time_ns, value.segment_index, value.ordinal)
+          if previous is not None and key <= previous:
+            raise RouteEvidenceError("control records are not ordered")
+          previous = key
+          index += 1
+          yield value
+        cursor += len(encoded)
+      if cursor != self._offsets[4] + self._sizes[4]:
+        raise RouteEvidenceError("control section contains trailing bytes")
+      completed = True
+    finally:
+      self._finish_section(digest, self._section_digest("controls"), completed)
+      self._check_stable()
+
+  def iter_live_torque_parameters(self) -> Iterator[LiveTorqueParametersPublication]:
+    self._check_stable()
+    digest = hashlib.sha256()
+    completed = False
+    try:
+      cursor = self._offsets[5]
+      previous: tuple[int, int, int] | None = None
+      for _ in range(self._counts[2]):
+        encoded = self._pread_exact(cursor, _TORQUE.size, "live torque record")
+        digest.update(encoded)
+        value = _decode_torque(memoryview(encoded), 1)[0]
+        if _encode_torque((value,)) != encoded:
+          raise RouteEvidenceError("live torque record is not canonical")
+        key = (value.mono_time_ns, value.segment_index, value.ordinal)
+        if previous is not None and key <= previous:
+          raise RouteEvidenceError("live torque records are not ordered")
+        previous = key
+        cursor += _TORQUE.size
+        yield value
+      if cursor != self._offsets[5] + self._sizes[5]:
+        raise RouteEvidenceError("live torque section contains trailing bytes")
+      completed = True
+    finally:
+      self._finish_section(digest, self._section_digest("live_torque"), completed)
+      self._check_stable()
+
+  def iter_live_delays(self) -> Iterator[LiveDelayPublication]:
+    self._check_stable()
+    digest = hashlib.sha256()
+    completed = False
+    try:
+      cursor = self._offsets[6]
+      previous: tuple[int, int, int] | None = None
+      for _ in range(self._counts[3]):
+        fixed = self._pread_exact(cursor, _DELAY.size, "live delay record")
+        length = _DELAY.unpack(fixed)[7]
+        if length > MAX_STATUS_BYTES:
+          raise RouteEvidenceError("live delay status exceeds its bound")
+        size = _DELAY.size + length
+        encoded = self._pread_exact(cursor, size, "live delay record")
+        digest.update(encoded)
+        value = _decode_delay(memoryview(encoded), 1)[0]
+        if _encode_delay((value,)) != encoded:
+          raise RouteEvidenceError("live delay record is not canonical")
+        key = (value.mono_time_ns, value.segment_index, value.ordinal)
+        if previous is not None and key <= previous:
+          raise RouteEvidenceError("live delay records are not ordered")
+        previous = key
+        cursor += size
+        yield value
+      if cursor != self._offsets[6] + self._sizes[6]:
+        raise RouteEvidenceError("live delay section contains trailing bytes")
+      completed = True
+    finally:
+      self._finish_section(digest, self._section_digest("live_delay"), completed)
+      self._check_stable()
+
+  def iter_lateral_maneuver_plans(self) -> Iterator[LateralManeuverPlanPublication]:
+    self._check_stable()
+    digest = hashlib.sha256()
+    completed = False
+    try:
+      cursor = self._offsets[7]
+      previous: tuple[int, int, int] | None = None
+      for _ in range(self._counts[4]):
+        encoded = self._pread_exact(cursor, _MANEUVER.size, "maneuver plan record")
+        digest.update(encoded)
+        value = _decode_maneuvers(memoryview(encoded), 1)[0]
+        if _encode_maneuvers((value,)) != encoded:
+          raise RouteEvidenceError("maneuver plan record is not canonical")
+        key = (value.mono_time_ns, value.segment_index, value.ordinal)
+        if previous is not None and key <= previous:
+          raise RouteEvidenceError("maneuver plan records are not ordered")
+        previous = key
+        cursor += _MANEUVER.size
+        yield value
+      if cursor != self._offsets[7] + self._sizes[7]:
+        raise RouteEvidenceError("maneuver section contains trailing bytes")
+      completed = True
+    finally:
+      self._finish_section(digest, self._section_digest("maneuvers"), completed)
+      self._check_stable()
+
+  def iter_event_locators(self) -> Iterator[DrivingEventLocator]:
+    self._check_stable()
+    digest = hashlib.sha256()
+    completed = False
+    try:
+      cursor = self._offsets[8]
+      previous: tuple[int, int, int] | None = None
+      event_ids: set[str] = set()
+      for _ in range(self._counts[5]):
+        fixed = self._pread_exact(cursor, _EVENT.size, "event record")
+        row = _EVENT.unpack(fixed)
+        if (
+          row[7] > MAX_EVENT_ID_BYTES
+          or row[8] > MAX_EVENT_TYPE_BYTES
+          or row[9] > MAX_EVENT_SEVERITY_BYTES
+        ):
+          raise RouteEvidenceError("event text exceeds its bound")
+        size = _EVENT.size + sum(row[7:10])
+        encoded = self._pread_exact(cursor, size, "event record")
+        digest.update(encoded)
+        value = _decode_events(memoryview(encoded), 1)[0]
+        if _encode_events((value,)) != encoded:
+          raise RouteEvidenceError("event record is not canonical")
+        if value.analysis_window_before_s < 0.0 or value.analysis_window_after_s < 0.0:
+          raise RouteEvidenceError("event windows must be nonnegative")
+        _add_unique_event_id(event_ids, value.event_id)
+        key = (value.publication_mono_time_ns, value.segment_index, value.ordinal)
+        if previous is not None and key <= previous:
+          raise RouteEvidenceError("event records are not ordered")
+        previous = key
+        cursor += size
+        yield value
+      if cursor != self._offsets[8] + self._sizes[8]:
+        raise RouteEvidenceError("event section contains trailing bytes")
+      completed = True
+    finally:
+      self._finish_section(digest, self._section_digest("events"), completed)
+      self._check_stable()
 
 
 def _safe_directory(path: Path, create: bool) -> None:
@@ -1701,6 +2171,17 @@ class RouteEvidenceStore:
     if summary.sha256 != sha256:
       raise RouteEvidenceError("route evidence object hash mismatch")
     return summary
+
+  def open_stream(self, sha256: str) -> RouteEvidenceStreamReader:
+    """Open an authenticated object without materializing any full plane."""
+    _hash(sha256, "route evidence sha256")
+    _safe_directory(self.root, create=False)
+    path = self.root / "objects" / f"{sha256}.route-evidence"
+    stream = RouteEvidenceStreamReader(path)
+    if stream.summary.sha256 != sha256:
+      stream.close()
+      raise RouteEvidenceError("route evidence object hash mismatch")
+    return stream
 
   def lookup(self, source_key: str) -> RouteEvidenceArtifact | None:
     _hash(source_key, "route evidence source key")

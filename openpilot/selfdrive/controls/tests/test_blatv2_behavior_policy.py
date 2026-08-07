@@ -13,6 +13,11 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   BehaviorContract,
   BehaviorMetricName,
 )
+from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import (
+  ReplayArtifactIdentity,
+  ReplayCoreIdentity,
+  ReplayRole,
+)
 from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
   PAIRED_ROUTE_UNCERTAINTY_METHOD,
   BehaviorPolicy,
@@ -84,8 +89,27 @@ def evaluation(
   signed_turn_lag: float,
   delivered_fraction: float,
 ) -> PolicyEvaluation:
+  role = (
+    ReplayRole.EXACT_STOCK
+    if identity.startswith("stock")
+    else ReplayRole.CURRENTLY_ACCEPTED
+    if identity.startswith("accepted")
+    else ReplayRole.CANDIDATE
+  )
+  core_token = hashlib.sha256(identity.encode()).hexdigest()
+  artifact = ReplayArtifactIdentity.compose(
+    role,
+    ReplayCoreIdentity(
+      controller_name=identity,
+      core_artifact_sha256=core_token,
+      source_openpilot_commit="1" * 40,
+      opendbc_commit="2" * 40,
+      panda_commit="3" * 40,
+    ),
+    policy,
+  )
   return PolicyEvaluation(
-    artifact_identity=identity,
+    artifact_identity=artifact.to_json(),
     policy=policy,
     route_ids=route_ids,
     metrics=(
@@ -388,6 +412,42 @@ class TestBehaviorPolicy(unittest.TestCase):
     self.assertEqual(dust_verdict.target_improvement, 0.0)
     self.assertFalse(dust_verdict.target_materially_improved)
 
+  def test_target_must_materially_beat_stock_after_an_incumbent_exists(self):
+    candidates = grid()
+    candidate = candidates[0]
+    route_ids = ("train-a", "train-b")
+    stock = evaluation("stock", None, route_ids, 9.0, 0.5, 0.9)
+    accepted = evaluation(
+      "accepted",
+      candidates[1].policy,
+      route_ids,
+      10.0,
+      0.5,
+      0.9,
+    )
+    proposed = evaluation(
+      "candidate",
+      candidate.policy,
+      route_ids,
+      9.0,
+      0.4,
+      0.95,
+    )
+
+    verdict = evaluate_candidate(
+      candidate,
+      proposed,
+      stock,
+      accepted,
+      rules(),
+      BehaviorMetricName.RAW_TORQUE_RATE_RMS.value,
+      *UNCERTAINTY_ARGS,
+    )
+
+    self.assertEqual(verdict.target_improvement, 0.0)
+    self.assertFalse(verdict.target_materially_improved)
+    self.assertFalse(verdict.passed)
+
   def test_held_out_validator_rejects_only_frozen_winner_and_routes_do_not_leak(self):
     candidates = grid()
     train_stock = evaluation("stock-train", None, ("train-a", "train-b"), 10.0, 0.5, 0.9)
@@ -466,6 +526,89 @@ class TestBehaviorPolicy(unittest.TestCase):
         rules(),
         BehaviorMetricName.RAW_TORQUE_RATE_RMS.value,
         *UNCERTAINTY_ARGS,
+      )
+
+  def test_selector_rejects_mislabeled_stock_and_platform_mismatch(self):
+    candidates = grid()
+    candidate = candidates[0]
+    route_ids = ("train-a", "train-b")
+    stock = evaluation("stock", None, route_ids, 10.0, 0.5, 0.9)
+    accepted = evaluation("accepted", candidates[1].policy, route_ids, 10.0, 0.5, 0.9)
+    proposed = evaluation("candidate", candidate.policy, route_ids, 8.0, 0.4, 0.95)
+
+    stock_core = ReplayCoreIdentity(
+      controller_name="mislabeled-stock",
+      core_artifact_sha256="a" * 64,
+      source_openpilot_commit="1" * 40,
+      opendbc_commit="2" * 40,
+      panda_commit="3" * 40,
+    )
+    mislabeled_stock = replace(
+      stock,
+      artifact_identity=ReplayArtifactIdentity.compose(
+        ReplayRole.EXACT_STOCK,
+        stock_core,
+        candidate.policy,
+      ).to_json(),
+      policy=candidate.policy,
+    )
+    with self.assertRaisesRegex(ValueError, "exact-stock.*null policy"):
+      evaluate_candidate(
+        candidate, proposed, mislabeled_stock, accepted, rules(),
+        BehaviorMetricName.RAW_TORQUE_RATE_RMS.value, *UNCERTAINTY_ARGS,
+      )
+
+    candidate_identity = ReplayArtifactIdentity.compose(
+      ReplayRole.CANDIDATE,
+      ReplayCoreIdentity(
+        controller_name="candidate-wrong-platform",
+        core_artifact_sha256="b" * 64,
+        source_openpilot_commit="1" * 40,
+        opendbc_commit="9" * 40,
+        panda_commit="3" * 40,
+      ),
+      candidate.policy,
+    )
+    wrong_platform = replace(proposed, artifact_identity=candidate_identity.to_json())
+    with self.assertRaisesRegex(ValueError, "different platform source"):
+      select_training_winner(
+        (candidate,), (wrong_platform,), stock, accepted, rules(),
+        BehaviorMetricName.RAW_TORQUE_RATE_RMS.value, *UNCERTAINTY_ARGS,
+      )
+
+  def test_bootstrap_accepted_evaluation_must_alias_stock_metrics(self):
+    candidate = grid()[0]
+    route_ids = ("train-a", "train-b")
+    stock = evaluation("stock", None, route_ids, 10.0, 0.5, 0.9)
+    stock_payload = json.loads(stock.artifact_identity)
+    stock_core = ReplayCoreIdentity(
+      controller_name=stock_payload["core"]["controllerName"],
+      core_artifact_sha256=stock_payload["core"]["coreArtifactSha256"],
+      source_openpilot_commit=stock_payload["core"]["sourceOpenpilotCommit"],
+      opendbc_commit=stock_payload["core"]["opendbcCommit"],
+      panda_commit=stock_payload["core"]["pandaCommit"],
+    )
+    accepted_identity = ReplayArtifactIdentity.compose(
+      ReplayRole.CURRENTLY_ACCEPTED,
+      stock_core,
+      None,
+    )
+    bad_bootstrap = PolicyEvaluation(
+      artifact_identity=accepted_identity.to_json(),
+      policy=None,
+      route_ids=route_ids,
+      metrics=tuple(
+        replace(metric, value=9.0, route_values=(("train-a", 9.0), ("train-b", 9.0)))
+        if metric.name == BehaviorMetricName.RAW_TORQUE_RATE_RMS.value
+        else metric
+        for metric in stock.metrics
+      ),
+    )
+    proposed = evaluation("candidate", candidate.policy, route_ids, 8.0, 0.4, 0.95)
+    with self.assertRaisesRegex(ValueError, "does not alias exact-stock evaluation"):
+      evaluate_candidate(
+        candidate, proposed, stock, bad_bootstrap, rules(),
+        BehaviorMetricName.RAW_TORQUE_RATE_RMS.value, *UNCERTAINTY_ARGS,
       )
 
   def test_artifacts_are_immutable_and_modules_have_no_actuation_or_storage_import(self):

@@ -67,9 +67,9 @@ def qualified_profile() -> VehicleCalibrationProfile:
         moving_sample_count=30_000,
         breakaway_support_s=30.0,
         breakaway_sample_count=3_000,
-        validation_count=10_000,
-        inverse_calibration_validation_rms=0.01,
-        breakaway_validation_rms=0.01,
+        cross_fit_route_count=10_000,
+        full_fit_candidate_rms=0.01,
+        breakaway_full_fit_candidate_rms=0.01,
       )
       for speed in (0.0, 30.0)
     ),

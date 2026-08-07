@@ -215,6 +215,44 @@ def step_plant(
     lateral_accel_offset,
     parameters.torque_per_lateral_accel,
   )
+  return step_rack_dynamics(
+    state,
+    applied,
+    aligning,
+    parameters,
+    disturbance,
+    step_seconds,
+  )
+
+
+def step_rack_dynamics(
+  state: RackState,
+  applied_torque: float,
+  aligning_torque: float,
+  parameters: PhysicalParameters,
+  disturbance_torque: float,
+  dt: float,
+) -> PlantStep:
+  """Advance from an already-computed aligning load.
+
+  This is the single transient numerical kernel shared by live/offline plant
+  rollout and identified-set fitting. Mapping and steady-load conventions stay
+  with the caller; stiction, continuous presliding friction, zero-crossing,
+  damping, and semi-implicit integration are defined only here.
+  """
+  applied = float(applied_torque)
+  aligning = float(aligning_torque)
+  disturbance = float(disturbance_torque)
+  step_seconds = float(dt)
+  if not all(math.isfinite(value) for value in (
+    applied, aligning, disturbance, step_seconds,
+  )):
+    raise ValueError("rack dynamics inputs must be finite")
+  if step_seconds <= 0.0:
+    raise ValueError("rack dynamics dt is outside its valid domain")
+  if not isinstance(parameters, PhysicalParameters):
+    raise TypeError("rack dynamics parameters have the wrong type")
+
   net_before_friction = applied - aligning - disturbance
   friction_magnitude = presliding_friction_magnitude(
     state.rate_deg_s, parameters,

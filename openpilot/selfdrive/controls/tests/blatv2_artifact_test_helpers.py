@@ -202,9 +202,9 @@ def calibration_profile_for_controller(
       moving_sample_count=0,
       breakaway_support_s=0.0,
       breakaway_sample_count=0,
-      validation_count=node.validation_count,
-      inverse_calibration_validation_rms=node.validation_rms,
-      breakaway_validation_rms=None,
+      cross_fit_route_count=node.cross_fit_route_count,
+      full_fit_candidate_rms=node.full_fit_candidate_rms,
+      breakaway_full_fit_candidate_rms=None,
     )
     for node in profile.nodes
   )

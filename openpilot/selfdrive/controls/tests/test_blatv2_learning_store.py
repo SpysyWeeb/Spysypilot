@@ -150,7 +150,6 @@ class TestBLaTv2LearningStore(unittest.TestCase):
     self.assertIn('"empty":"negative_infinity"', text)
     for forbidden in (
       "desired",
-      "candidate",
       "request",
       "tracking_error",
       "roughness",

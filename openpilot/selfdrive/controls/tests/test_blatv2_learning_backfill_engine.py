@@ -40,6 +40,9 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   MeasuredLearningFrame,
   build_persistent_learning_runtime,
 )
+from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
+  RouteEvidenceArtifact,
+)
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
 )
@@ -120,6 +123,69 @@ def dynamics() -> ProvisionalRackDynamics:
     rack_rate_resolution_deg_s=4.0,
     provenance="engine test",
   )
+
+
+def live_torque_record(mono_ns: int, *, valid: bool = True) -> SimpleNamespace:
+  return SimpleNamespace(mono_ns=mono_ns, valid=valid)
+
+
+def test_live_torque_health_recovers_after_startup_outlier() -> None:
+  records = (
+    live_torque_record(0),
+    live_torque_record(500_000_000),
+    live_torque_record(750_000_000),
+    live_torque_record(1_000_000_000),
+    live_torque_record(1_250_000_000),
+    live_torque_record(1_500_000_000),
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=1_505_000_000,
+    publication_index=5,
+    records=records,
+  ) == (True, True)
+
+
+def test_live_torque_health_stays_inexact_until_recent_window_is_known() -> None:
+  records = tuple(
+    live_torque_record(index * 250_000_000)
+    for index in range(4)
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=755_000_000,
+    publication_index=3,
+    records=records,
+  ) == (False, False)
+
+
+def test_live_torque_health_rejects_bad_recent_interval() -> None:
+  records = (
+    live_torque_record(0),
+    live_torque_record(250_000_000),
+    live_torque_record(500_000_000),
+    live_torque_record(750_000_000),
+    live_torque_record(1_250_000_000),
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=1_255_000_000,
+    publication_index=4,
+    records=records,
+  ) == (False, False)
+
+
+def test_live_torque_health_invalid_latest_is_exactly_unhealthy() -> None:
+  records = tuple(
+    live_torque_record(index * 250_000_000, valid=index != 4)
+    for index in range(5)
+  )
+
+  assert learning_backfill._reconstruct_live_torque_health(
+    poll_mono_ns=1_005_000_000,
+    publication_index=4,
+    records=records,
+  ) == (False, True)
 
 
 def route_frame(
@@ -730,6 +796,55 @@ def test_injected_route_rejection_keeps_stable_ledger_semantics(
   assert ledger["entries"][0]["rejected_sample_count"] == 0
 
 
+@pytest.mark.parametrize("changed_outcome", ("ingested", "different_rejection"))
+def test_retained_rejection_is_replayed_and_must_match_ledger_exactly(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  changed_outcome: str,
+) -> None:
+  rejected_name, _ = add_route(tmp_path / "logs", 0x10)
+  ingested_name, _ = add_route(tmp_path / "logs", 0x20)
+  source_mode = {"value": "original"}
+  source_calls: list[tuple[int, str]] = []
+
+  def injected_source(authority_index, route, abort_requested):
+    source_calls.append((authority_index, route.route_name))
+    assert not abort_requested()
+    if route.route_name == rejected_name:
+      if source_mode["value"] == "original":
+        raise RouteRejected("remote_route_rejected", "original rejection")
+      if source_mode["value"] == "different_rejection":
+        raise RouteRejected("remote_route_changed", "changed rejection")
+    return learning_backfill.prepare_route(route)
+
+  engine, _, _, _ = make_engine(
+    tmp_path,
+    monkeypatch,
+    prepared_route_source=injected_source,
+  )
+  first = engine.run_once()
+  assert first.publication is not None
+  assert source_calls == [
+    (1, rejected_name),
+    (1, ingested_name),
+    (2, rejected_name),
+    (2, ingested_name),
+  ]
+
+  source_calls.clear()
+  source_mode["value"] = changed_outcome
+  with pytest.raises(BackfillError) as changed:
+    engine.run_once()
+  assert changed.value.diagnostic == "backfill_untracked_evidence"
+  assert "fresh authority replay" in str(changed.value)
+  assert source_calls == [
+    (1, rejected_name),
+    (1, ingested_name),
+    (2, rejected_name),
+    (2, ingested_name),
+  ]
+
+
 def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
@@ -778,8 +893,11 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   second_run = engine.run_once()
   assert second_run.publication is not None
   assert prepare_calls == Counter({
-    first_name: 2,
-    second_name: 2,
+    # A durable snapshot is structural state, not replay authority. Each
+    # publishing transaction independently replays every retained ingested
+    # route through both authorities before adding the new route.
+    first_name: 4,
+    second_name: 4,
     new_name: 2,
   })
   runtime = runtime_factory()
@@ -805,15 +923,41 @@ def test_bootstrap_then_watermark_late_skip_and_hash_exactly_once(
   assert no_op.publication is None
   assert not no_op.pending_logger_close
   assert prepare_calls == Counter({
-    first_name: 2,
-    second_name: 2,
-    new_name: 2,
+    first_name: 6,
+    second_name: 6,
+    new_name: 4,
   })
 
   first_rlog.write_bytes(b"mutated-known-route")
   with pytest.raises(BackfillError) as changed:
     engine.run_once()
   assert changed.value.diagnostic == "backfill_untracked_evidence"
+
+
+def test_matching_a_a_historical_change_cannot_replace_retained_authority(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  route_name, _ = add_route(tmp_path / "logs", 0x10)
+  engine, _, prepare_calls, _ = make_engine(tmp_path, monkeypatch)
+  first = engine.run_once()
+  assert first.publication is not None
+  assert prepare_calls == Counter({route_name: 2})
+
+  original_prepare = learning_backfill.prepare_route
+
+  def changed_prepare(route, **kwargs):
+    prepared = original_prepare(route, **kwargs)
+    return replace(
+      prepared,
+      provenance={**prepared.provenance, "route_version": "changed-history"},
+    )
+
+  monkeypatch.setattr(learning_backfill, "prepare_route", changed_prepare)
+  with pytest.raises(BackfillError) as changed:
+    engine.run_once()
+  assert changed.value.diagnostic == "backfill_untracked_evidence"
+  assert "fresh authority replay" in str(changed.value)
 
 
 def test_progress_reports_both_passes_without_double_counting(
@@ -1278,6 +1422,53 @@ def test_four_worker_helper_provenance_difference_is_unpublished(
   assert not paths.evidence.exists()
   assert not paths.manifest.exists()
   assert not paths.backfill_ledger.exists()
+
+
+def test_authenticated_replay_rejects_witness_from_another_physical_row(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  add_route(tmp_path / "logs", 0x10)
+  engine, _params, _calls, _runtime_factory = make_engine(
+    tmp_path,
+    monkeypatch,
+  )
+  deterministic_prepare = learning_backfill.prepare_route
+
+  def mismatched_prepare(route, **kwargs):
+    prepared = deterministic_prepare(route, **kwargs)
+    evidence = prepared.route_evidence
+    assert evidence is not None
+    controls = (
+      replace(
+        evidence.control_witnesses[0],
+        mono_time_ns=evidence.control_witnesses[0].mono_time_ns + 1,
+      ),
+      *evidence.control_witnesses[1:],
+    )
+    mismatched = RouteEvidenceArtifact(
+      evidence.source_identity,
+      evidence.car_params_bytes,
+      evidence.physical_bytes,
+      evidence.model_publications,
+      controls,
+      evidence.live_torque_parameters,
+      evidence.live_delays,
+      evidence.lateral_maneuver_plans,
+      evidence.event_locators,
+    )
+    return replace(prepared, route_evidence=mismatched)
+
+  monkeypatch.setattr(
+    learning_backfill,
+    "prepare_route",
+    mismatched_prepare,
+  )
+
+  with pytest.raises(BackfillError) as raised:
+    engine.run_once()
+
+  assert raised.value.diagnostic == "backfill_source_coordinate_mismatch"
 
 
 def test_route_evidence_is_not_durable_until_both_authorities_match(
@@ -2266,37 +2457,38 @@ def test_route_local_rejection_does_not_block_later_good_route(
         "invalid_route_version",
         "representative malformed historical InitData version",
       )
+    frames = tuple(
+      route_frame(
+        cp,
+        1_000_000_000 + index * 10_000_000,
+        first_in_route=index == 0,
+      )
+      for index in range(CAUSAL_ROUTE_FRAME_COUNT)
+    )
+    provenance = {
+      "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
+      "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
+      "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
+      "extractor_schema_version": learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION,
+      "log_schema_blob": "4" * 40,
+      "opendbc_commit": "2" * 40,
+      "panda_commit": "3" * 40,
+      "physical_compatibility_sha256": hashlib.sha256(b"physical").hexdigest(),
+      "route_version": "test-version",
+      "selected_event_stream_sha256": hashlib.sha256(route.route_name.encode("ascii")).hexdigest(),
+      "superproject_commit": "1" * 40,
+    }
     return PreparedRoute(
-      frames=tuple(
-        route_frame(
-          cp,
-          1_000_000_000 + index * 10_000_000,
-          first_in_route=index == 0,
-        )
-        for index in range(CAUSAL_ROUTE_FRAME_COUNT)
-      ),
+      frames=frames,
       controls_witness_count=CAUSAL_ROUTE_FRAME_COUNT,
       unresolved_witness_count=0,
       gap_count=0,
-      provenance={
-        "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
-        "car_params_sha256": hashlib.sha256(b"car-params").hexdigest(),
-        "dongle_id_sha256": hashlib.sha256(b"dongle").hexdigest(),
-        "extractor_schema_version": (
-          learning_backfill.NATIVE_EXTRACTOR_SCHEMA_VERSION
-        ),
-        "log_schema_blob": "4" * 40,
-        "opendbc_commit": "2" * 40,
-        "panda_commit": "3" * 40,
-        "physical_compatibility_sha256": hashlib.sha256(
-          b"physical",
-        ).hexdigest(),
-        "route_version": "test-version",
-        "selected_event_stream_sha256": hashlib.sha256(
-          route.route_name.encode("ascii"),
-        ).hexdigest(),
-        "superproject_commit": "1" * 40,
-      },
+      provenance=provenance,
+      route_evidence=route_evidence_for_frames(
+        route.route_name,
+        frames,
+        provenance,
+      ),
     )
 
   replay = learning_backfill.replay_routes(

@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
+from opendbc.car.hyundai.interface import CarInterface
+from opendbc.car.hyundai.values import CAR
 from openpilot.selfdrive.controls.lib.blatv2.stock_bootstrap import (
   fresh_stock_torque_controller,
 )
@@ -37,6 +39,7 @@ from openpilot.selfdrive.controls.lib.blatv2.live_adapter import (
 )
 from openpilot.selfdrive.controls.lib.blatv2 import live_controller as live_module
 from openpilot.selfdrive.controls.lib.blatv2.live_controller import (
+  EXPERIMENTAL_CONTROLLER_PARAM,
   LiveEligibility,
   ModularLiveController,
 )
@@ -251,6 +254,52 @@ def live(
   )
 
 
+def experimental_live(
+  *,
+  bundle: RuntimeVehicleBundle | None = None,
+  requested: bool = True,
+  compatible: bool = True,
+  selected_policy: ControllerPolicy | None = None,
+) -> ModularLiveController:
+  actual_bundle = runtime_bundle() if bundle is None else bundle
+  provisional_policy = replace(
+    policy(),
+    provenance="synthetic development trial policy",
+    provisional=True,
+  )
+  return ModularLiveController(
+    car_params=synthetic_cp(),
+    runtime_bundle=actual_bundle,
+    artifact=None,
+    activation_provisional=False,
+    artifact_diagnostic=ArtifactDiagnostic.ABSENT,
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
+    experimental_requested=requested,
+    experimental_platform_compatible=compatible,
+    experimental_policy=(
+      provisional_policy
+      if selected_policy is None
+      else selected_policy
+    ),
+  )
+
+
+class TrialParams:
+  def __init__(self, enabled: bool):
+    self.enabled = enabled
+
+  def get_bool(self, key: str) -> bool:
+    assert key == EXPERIMENTAL_CONTROLLER_PARAM
+    return self.enabled
+
+  @staticmethod
+  def get(key: str, block: bool = False):
+    del key, block
+    return None
+
+
 def model(
   *,
   curvature: float = 0.012,
@@ -418,6 +467,145 @@ def test_absent_invalid_mismatched_and_unverified_are_exact_stock() -> None:
     assert controller.candidate_result is None
     assert controller.messages_valid
     assert controller.selection == ControllerSelection.STOCK
+
+
+def test_explicit_experimental_candidate_binds_one_unqualified_controller(
+  monkeypatch,
+) -> None:
+  selected = experimental_live()
+  state, output, live_params = vehicle_messages()
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
+
+  assert selected.eligibility == LiveEligibility.ELIGIBLE
+  assert selected.experimental_active
+  assert selected.artifact_sha256 == ""
+  assert selected.profile_sha256
+  assert selected.policy_sha256
+  assert selected.controller_profile is not None
+  assert not selected.controller_profile.qualified
+  assert selected.controller_policy is not None
+  assert selected.controller_policy.provisional
+
+  bind_modular(selected, clock, state, output)
+  assert selected.decision is not None
+  assert selected.decision.provisional
+  result = step(selected, clock, state, output, live_params)
+  assert result.status == CandidateStatus.MODULAR_OK
+  assert selected.selection == ControllerSelection.MODULAR
+
+
+def test_experimental_authorization_fails_closed() -> None:
+  unverified_bundle = runtime_bundle(verified=False)
+  cases = (
+    (
+      experimental_live(requested=False),
+      LiveEligibility.NO_ACTIVE_ARTIFACT,
+    ),
+    (
+      experimental_live(compatible=False),
+      LiveEligibility.EXPERIMENTAL_PLATFORM_UNSUPPORTED,
+    ),
+    (
+      experimental_live(bundle=unverified_bundle),
+      LiveEligibility.UNVERIFIED_PRODUCTION_ENVELOPE,
+    ),
+    (
+      experimental_live(selected_policy=policy()),
+      LiveEligibility.EXPERIMENTAL_CONFIGURATION_INVALID,
+    ),
+  )
+  _, output, _ = vehicle_messages()
+  for selected, expected in cases:
+    assert selected.eligibility == expected
+    assert not selected.experimental_active
+    assert selected.candidate is None
+    assert selected.observe_previous_applied(output)
+    assert selected.update_engagement(
+      enabled=True,
+      lateral_active=True,
+      lateral_maneuver_active=False,
+    ) == ControllerSelection.STOCK
+
+
+def test_approved_artifact_takes_precedence_over_experimental_request() -> None:
+  bundle = runtime_bundle()
+  approved = artifact(bundle)
+  selected = ModularLiveController(
+    car_params=synthetic_cp(),
+    runtime_bundle=bundle,
+    artifact=approved,
+    activation_provisional=True,
+    artifact_diagnostic=ArtifactDiagnostic.OK,
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
+    experimental_requested=True,
+    experimental_platform_compatible=True,
+    experimental_policy=replace(policy(), provisional=True),
+  )
+
+  assert selected.eligibility == LiveEligibility.ELIGIBLE
+  assert not selected.experimental_active
+  assert selected.artifact is approved
+  assert selected.controller_profile is approved.vehicle_profile
+  assert selected.controller_policy is approved.controller_policy
+
+
+def test_experimental_parameter_is_development_only_and_process_bound() -> None:
+  root = Path(__file__).resolve().parents[3]
+  keys = (root / "common" / "params_keys.h").read_text()
+  assert (
+    f'{{"{EXPERIMENTAL_CONTROLLER_PARAM}", ' +
+    '{PERSISTENT | DEVELOPMENT_ONLY, BOOL, "0"}}'
+  ) in keys
+
+  hot_sources = "\n".join((
+    inspect.getsource(ModularLiveController.update_engagement),
+    inspect.getsource(ModularLiveController.update_modular),
+  ))
+  assert EXPERIMENTAL_CONTROLLER_PARAM not in hot_sources
+
+
+def test_process_start_builds_trial_only_for_opendbc_capable_platform() -> None:
+  cp = CarInterface.get_non_essential_params(CAR.HYUNDAI_PALISADE)
+  ci = CarInterface(cp)
+  selected = ModularLiveController.from_persistent(
+    car_params=cp,
+    car_interface=ci,
+    params=TrialParams(True),
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
+  )
+
+  assert selected.eligibility == LiveEligibility.ELIGIBLE
+  assert selected.experimental_requested
+  assert selected.experimental_platform_compatible
+  assert selected.experimental_active
+  assert selected.controller_profile is not None
+  assert not selected.controller_profile.qualified
+  assert selected.runtime_bundle is not None
+  assert (
+    selected.runtime_bundle.torque_limits.steer_max,
+    selected.runtime_bundle.torque_limits.delta_up,
+    selected.runtime_bundle.torque_limits.delta_down,
+  ) == (409, 4, 7)
+
+  disabled = ModularLiveController.from_persistent(
+    car_params=cp,
+    car_interface=ci,
+    params=TrialParams(False),
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
+  )
+  assert disabled.eligibility == LiveEligibility.NO_ACTIVE_ARTIFACT
+  assert not disabled.experimental_active
 
 
 def test_altered_transient_rack_values_fail_to_exact_stock() -> None:

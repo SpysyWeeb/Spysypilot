@@ -409,8 +409,8 @@ class TestBLaTv2Learner(unittest.TestCase):
       report.authority_validation_count,
       MIN_AUTHORITY_VALIDATION_SAMPLES,
     )
-    self.assertIsNotNone(report.authority_seed_validation_rms)
-    self.assertIsNotNone(report.authority_candidate_validation_rms)
+    self.assertIsNotNone(report.authority_seed_full_fit_candidate_rms)
+    self.assertIsNotNone(report.authority_candidate_full_fit_candidate_rms)
 
   def test_authority_validation_regression_blocks_profile(self) -> None:
     learner = ProfileLearner(seed_profile())
@@ -431,7 +431,7 @@ class TestBLaTv2Learner(unittest.TestCase):
     result = learner.qualify("authority held-out regression")
     self.assertIsNone(result.candidate_profile)
     self.assertIn(
-      QualificationReason.AUTHORITY_VALIDATION_REGRESSION,
+      QualificationReason.AUTHORITY_CROSS_FIT_REGRESSION,
       result.node_reports[0].reasons,
     )
 
@@ -588,12 +588,12 @@ class TestBLaTv2Learner(unittest.TestCase):
       ))
     report = learner.qualify("regressive-holdout").node_reports[2]
     self.assertIn(
-      QualificationReason.VALIDATION_REGRESSION, report.reasons,
+      QualificationReason.CROSS_FIT_REGRESSION, report.reasons,
     )
-    self.assertIsNotNone(report.candidate_validation_rms)
-    self.assertIsNotNone(report.seed_validation_rms)
+    self.assertIsNotNone(report.candidate_full_fit_candidate_rms)
+    self.assertIsNotNone(report.seed_full_fit_candidate_rms)
     self.assertGreater(
-      report.candidate_validation_rms, report.seed_validation_rms,
+      report.candidate_full_fit_candidate_rms, report.seed_full_fit_candidate_rms,
     )
 
   def test_one_qualified_node_cannot_promote_profile(self) -> None:

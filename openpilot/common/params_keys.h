@@ -20,6 +20,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BLaTv2ApprovedArtifact", {PERSISTENT, JSON}},
     {"BLaTv2BackfillProgress", {CLEAR_ON_MANAGER_START, JSON}},
     {"BLaTv2BehaviorLearningStatus", {CLEAR_ON_MANAGER_START, JSON}},
+    {"BLaTv2ExperimentalController", {PERSISTENT | DEVELOPMENT_ONLY, BOOL, "0"}},
     {"BLaTv2FeedbackRequest", {PERSISTENT, JSON}},
     {"BLaTv2FeedbackResponse", {PERSISTENT, JSON}},
     {"BLaTv2LearningOperationStatus", {CLEAR_ON_MANAGER_START, JSON}},

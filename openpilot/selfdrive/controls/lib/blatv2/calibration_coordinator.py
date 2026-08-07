@@ -7,7 +7,9 @@ written last so it acts as the commit record for the independently atomic
 evidence and optional candidate files.
 
 The coordinator can create an *unapproved* candidate only after every speed
-node and interpolation interval qualifies. An evaluated all-seed outcome is
+node and every populated interpolation stratum qualifies through schema-14 route-grouped
+leave-one-route-out evidence drawn exclusively from the caller's global TRAIN
+partition. An evaluated all-seed outcome is
 successful and emits an immutable selected-profile proof for downstream
 behavior replay, but it intentionally emits no redundant *new calibration*
 candidate. It has no API for approval, activation, controller selection, or
@@ -31,16 +33,20 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationProfileLearner,
   CalibrationSampleAccounting,
   CalibrationSampleDisposition,
+  CalibrationRouteCommitment,
   calibration_evidence_sha256,
   minimum_calibration_support_s,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
 )
+from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
+  CalibrationIngestionCoordinate,
+)
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 9
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 16
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
@@ -62,22 +68,20 @@ class CalibrationNodeSupportDiagnostic:
   supported_sample_count: int
   base_support_s: float
   base_sample_count: int
-  training_support_s: float
-  training_count: int
-  validation_support_s: float
-  validation_count: int
+  full_fit_support_s: float
+  full_fit_count: int
+  completed_route_count: int
+  base_completed_route_count: int
   moving_support_s: float
   moving_sample_count: int
-  moving_training_support_s: float
-  moving_training_count: int
-  moving_validation_support_s: float
-  moving_validation_count: int
+  moving_full_fit_support_s: float
+  moving_full_fit_count: int
+  moving_completed_route_count: int
   breakaway_support_s: float
   breakaway_sample_count: int
-  breakaway_training_support_s: float
-  breakaway_training_count: int
-  breakaway_validation_support_s: float
-  breakaway_validation_count: int
+  breakaway_full_fit_support_s: float
+  breakaway_full_fit_count: int
+  breakaway_episode_completed_route_count: int
   authority_support_s: float
   authority_sample_count: int
   authority_magnitude_sample_count: int
@@ -86,10 +90,9 @@ class CalibrationNodeSupportDiagnostic:
   authority_unresolved_sample_count: int
   authority_fit_support_s: float
   authority_fit_sample_count: int
-  authority_training_support_s: float
-  authority_training_count: int
-  authority_validation_support_s: float
-  authority_validation_count: int
+  authority_full_fit_support_s: float
+  authority_full_fit_count: int
+  authority_completed_route_count: int
   lateral_accel_span_mps2: float
   applied_torque_span: float
   lateral_accel_directions: int
@@ -180,13 +183,13 @@ def _qualification_manifest(report: object) -> dict[str, object]:
     "moving_support_s",
     "moving_sample_count",
     "moving_reasons",
-    "moving_seed_validation_rms",
-    "moving_candidate_validation_rms",
+    "moving_full_fit_seed_rms",
+    "moving_full_fit_candidate_rms",
     "breakaway_support_s",
     "breakaway_sample_count",
     "breakaway_reasons",
-    "breakaway_seed_validation_rms",
-    "breakaway_candidate_validation_rms",
+    "breakaway_full_fit_seed_rms",
+    "breakaway_full_fit_candidate_rms",
   }
   missing = required - encoded.keys()
   if missing:
@@ -237,6 +240,7 @@ class CalibrationLearningCoordinator:
     evidence_bytes: bytes | None = None,
     *,
     candidate_provenance: str = "measured observable casual-driving evidence",
+    expected_route_commitments: tuple[tuple[str, str], ...] | None = None,
   ) -> None:
     if not isinstance(seed_profile, VehicleCalibrationProfile):
       raise TypeError("calibration coordinator requires a VehicleCalibrationProfile")
@@ -244,22 +248,23 @@ class CalibrationLearningCoordinator:
     if not provenance:
       raise ValueError("candidate provenance must not be empty")
 
-    self._learner = CalibrationProfileLearner(seed_profile) if evidence_bytes is None else CalibrationProfileLearner.from_evidence(seed_profile, evidence_bytes)
-    self._add_sample_with_disposition = getattr(
-      self._learner,
-      "add_sample_with_disposition",
-      None,
-    )
-    self._reset_route_transients = getattr(
-      self._learner,
-      "reset_route_transients",
-      None,
-    )
+    if evidence_bytes is None:
+      self._learner = CalibrationProfileLearner(seed_profile)
+    elif expected_route_commitments is None:
+      self._learner = CalibrationProfileLearner.from_evidence(
+        seed_profile,
+        evidence_bytes,
+      )
+    else:
+      self._learner = CalibrationProfileLearner.from_evidence(
+        seed_profile,
+        evidence_bytes,
+        expected_route_commitments=expected_route_commitments,
+      )
     self._seed_profile = seed_profile
     self._candidate_provenance = provenance
     self._state = CalibrationLearningLifecycleState.OFFROAD
     self._clean_sample_count = 0
-    self._fallback_sample_accounting = CalibrationSampleAccounting.empty()
     self._evidence_generation = 0
     self._finalized_generation = -1
     self._cached_finalization: CalibrationLearningFinalization | None = None
@@ -294,12 +299,10 @@ class CalibrationLearningCoordinator:
 
   @property
   def sample_accounting(self) -> CalibrationSampleAccounting:
-    accounting = getattr(self._learner, "sample_accounting", None)
-    return (
-      accounting
-      if isinstance(accounting, CalibrationSampleAccounting)
-      else self._fallback_sample_accounting
-    )
+    accounting = self._learner.sample_accounting
+    if not isinstance(accounting, CalibrationSampleAccounting):
+      raise TypeError("calibration learner emitted invalid sample accounting")
+    return accounting
 
   @property
   def support_diagnostics(self) -> tuple[CalibrationNodeSupportDiagnostic, ...]:
@@ -315,22 +318,20 @@ class CalibrationLearningCoordinator:
           supported_sample_count=evidence.supported_sample_count,
           base_support_s=evidence.base_support_s,
           base_sample_count=evidence.base_sample_count,
-          training_support_s=evidence.training_support_s,
-          training_count=evidence.training_count,
-          validation_support_s=evidence.validation_support_s,
-          validation_count=evidence.validation_count,
+          full_fit_support_s=evidence.full_fit_support_s,
+          full_fit_count=evidence.full_fit_count,
+          completed_route_count=evidence.completed_route_count,
+          base_completed_route_count=evidence.base_completed_route_count,
           moving_support_s=evidence.moving_support_s,
           moving_sample_count=evidence.moving_sample_count,
-          moving_training_support_s=evidence.moving_training_support_s,
-          moving_training_count=evidence.moving_training_count,
-          moving_validation_support_s=evidence.moving_validation_support_s,
-          moving_validation_count=evidence.moving_validation_count,
+          moving_full_fit_support_s=evidence.moving_full_fit_support_s,
+          moving_full_fit_count=evidence.moving_full_fit_count,
+          moving_completed_route_count=evidence.moving_completed_route_count,
           breakaway_support_s=evidence.breakaway_support_s,
           breakaway_sample_count=evidence.breakaway_sample_count,
-          breakaway_training_support_s=evidence.breakaway_training_support_s,
-          breakaway_training_count=evidence.breakaway_training_count,
-          breakaway_validation_support_s=evidence.breakaway_validation_support_s,
-          breakaway_validation_count=evidence.breakaway_validation_count,
+          breakaway_full_fit_support_s=evidence.breakaway_full_fit_support_s,
+          breakaway_full_fit_count=evidence.breakaway_full_fit_count,
+          breakaway_episode_completed_route_count=evidence.breakaway_episode_completed_route_count,
           authority_support_s=evidence.authority_support_s,
           authority_sample_count=evidence.authority_sample_count,
           authority_magnitude_sample_count=evidence.authority_magnitude_sample_count,
@@ -339,10 +340,9 @@ class CalibrationLearningCoordinator:
           authority_unresolved_sample_count=evidence.authority_unresolved_sample_count,
           authority_fit_support_s=evidence.authority_fit_support_s,
           authority_fit_sample_count=evidence.authority_fit_sample_count,
-          authority_training_support_s=evidence.authority_training_support_s,
-          authority_training_count=evidence.authority_training_count,
-          authority_validation_support_s=evidence.authority_validation_support_s,
-          authority_validation_count=evidence.authority_validation_count,
+          authority_full_fit_support_s=evidence.authority_full_fit_support_s,
+          authority_full_fit_count=evidence.authority_full_fit_count,
+          authority_completed_route_count=evidence.authority_completed_route_count,
           lateral_accel_span_mps2=evidence.lateral_accel_span_mps2,
           applied_torque_span=evidence.applied_torque_span,
           lateral_accel_directions=evidence.lateral_accel_directions,
@@ -383,6 +383,7 @@ class CalibrationLearningCoordinator:
     self,
     sample: LearningSample,
     *,
+    source_coordinate: CalibrationIngestionCoordinate | None = None,
     upstream_rejection: CalibrationSampleDisposition | None = None,
   ) -> bool:
     """Accumulate and durably classify one measured frame in memory."""
@@ -391,30 +392,13 @@ class CalibrationLearningCoordinator:
     if not isinstance(sample, LearningSample):
       raise TypeError("calibration coordinator requires a measured-only LearningSample")
 
-    if callable(self._add_sample_with_disposition):
-      disposition = self._add_sample_with_disposition(
-        sample,
-        upstream_rejection=upstream_rejection,
-      )
-      if not isinstance(disposition, CalibrationSampleDisposition):
-        raise TypeError("calibration learner emitted an invalid disposition")
-    else:
-      if upstream_rejection is not None:
-        # A legacy test double cannot classify first causes itself. Preserve
-        # physical continuity without ever presenting rejected evidence to its
-        # accumulator.
-        if callable(self._reset_route_transients):
-          self._reset_route_transients()
-        disposition = upstream_rejection
-      else:
-        disposition = (
-          CalibrationSampleDisposition.ACCEPTED
-          if self._learner.add_sample(sample)
-          else CalibrationSampleDisposition.LEARNER_INELIGIBLE
-        )
-      self._fallback_sample_accounting = (
-        self._fallback_sample_accounting.with_disposition(disposition)
-      )
+    disposition = self._learner.add_sample_with_disposition(
+      sample,
+      upstream_rejection=upstream_rejection,
+      source_coordinate=source_coordinate,
+    )
+    if not isinstance(disposition, CalibrationSampleDisposition):
+      raise TypeError("calibration learner emitted an invalid disposition")
     accepted = disposition is CalibrationSampleDisposition.ACCEPTED
     if accepted:
       # Inverse calibration legitimately retains signed reversal rows even
@@ -436,22 +420,18 @@ class CalibrationLearningCoordinator:
     if self._cached_finalization is not None and self._finalized_generation == self._evidence_generation:
       return self._cached_finalization
 
-    evidence_bytes = self._learner.export_evidence()
+    evidence_bytes = self._learner.export_authoritative_evidence()
     evidence_identity = calibration_evidence_sha256(evidence_bytes)
     result = self._learner.qualify(self._candidate_provenance)
     candidate = result.candidate_profile
-    # Test doubles and external audit adapters that predate selected-profile
-    # publication may expose only the learned candidate. A production learner
-    # provides ``selected_profile`` explicitly; the fallback preserves it
-    # for the learned case without inventing an all-seed selection.
-    selected = getattr(result, "selected_profile", candidate)
+    selected = result.selected_profile
     if (selected is not None) != result.all_nodes_qualified:
       raise ValueError("qualified calibration selection completeness is inconsistent")
     if candidate is not None and not result.all_nodes_qualified:
       raise ValueError("calibration learner candidate completeness is inconsistent")
     if (
       candidate is None
-      and getattr(result, "contains_learned_change", False)
+      and result.contains_learned_change
       and result.all_nodes_qualified
     ):
       raise ValueError("qualified learned calibration disappeared before publication")
@@ -489,7 +469,19 @@ class CalibrationLearningCoordinator:
       "node_reports": [_qualification_manifest(report) for report in result.node_reports],
       "interpolation_reports": [
         _manifest_value(report, "interpolation_report")
-        for report in getattr(result, "interpolation_reports", ())
+        for report in result.interpolation_reports
+      ],
+      "route_commitments": [
+        {
+          "assignment_chain_sha256": commitment.assignment_chain_sha256,
+          "assignment_record_count": commitment.assignment_record_count,
+          "route_commitment_sha256": commitment.route_commitment_sha256,
+          "route_content_sha256": commitment.route_content_sha256,
+          "route_counter": commitment.route_counter,
+          "route_identity_sha256": commitment.route_identity_sha256,
+          "route_index": commitment.route_index,
+        }
+        for commitment in self._learner.route_commitments
       ],
       "seed_profile_revision": self._seed_profile.revision,
       "seed_profile_schema_version": self._seed_profile.schema_version,
@@ -557,3 +549,7 @@ class CalibrationLearningCoordinator:
       _atomic_write_bytes(candidate_profile_path, candidate_json)
     _atomic_write_bytes(manifest_path, finalization.manifest_bytes)
     return finalization
+
+  @property
+  def route_commitments(self) -> tuple[CalibrationRouteCommitment, ...]:
+    return self._learner.route_commitments

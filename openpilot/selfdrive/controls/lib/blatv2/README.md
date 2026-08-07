@@ -16,8 +16,8 @@ actuates.
 
 The current generation learns an observable inverse-torque calibration, not
 the retired dynamic rack model. At each `0/5/10/15/20/30 m/s` node it keeps
-stationary/base, resolved-moving, confirmed stuck-to-motion breakaway, held-out
-validation, and actuator-authority populations separate. The only fitted
+stationary/base, resolved-moving, confirmed stuck-to-motion breakaway, and
+actuator-authority populations separate per immutable route. The only fitted
 values are torque per lateral acceleration, signed lateral-acceleration offset
 correction, moving friction, and static breakaway. Rack gain and damping are
 neither fitted nor part of the calibration identity.
@@ -28,25 +28,58 @@ the earliest possible motion, then a same-direction rate quantum must confirm
 it within the existing transport delay. The midpoint of the last stuck and
 first moving responses identifies static friction once per episode.
 
-The numerical fit is deterministic constrained least squares. Training
-routes evaluate a nested `static only -> friction -> offset + friction -> full
-map` family. The seed is a first-class safe result. A learned candidate must
-clear paired whole-route uncertainty without regressing any populated category;
-otherwise the node qualifies as `seed_retained`. The winner is frozen before
-validation and receives exactly one held-route check—there is no fallback
-selection after seeing validation.
-The canonical route counter assigns an entire route to training (even) or
-validation (odd) before any prepared frame is applied. The counter is carried
-through preparation, replay, evidence, and restore rather than inferred from
-replay order or a hash. Base, moving, breakaway, and authority parts of one
-maneuver can therefore never leak across the boundary.
+The numerical fit is deterministic constrained least squares. The math core
+consumes exactly the route population supplied by its caller; it has no token,
+partition service, or authority to claim that population is global TRAIN. The
+PC trainer owns the immutable TRAIN manifest, authenticates route membership,
+and passes only that sealed population to the core. Generic historical
+backfill remains display-only evidence preparation and cannot promote a
+profile. The learner evaluates the
+nested `static only -> friction -> offset + friction -> full map` family with
+route-grouped leave-one-route-out cross-fitting: each fold fits all other
+TRAIN routes and scores only the omitted whole route. The route counter remains
+immutable provenance and has no statistical meaning. Candidate choice uses
+only aggregated out-of-fold paired losses with a whole-route uncertainty
+envelope; global VALIDATION and TEST are inaccessible. After family selection,
+that family is refit once on every TRAIN route for the published parameters.
+The seed remains a first-class safe result when no family robustly improves.
+
+Every coefficient-bearing stratum needs two independent contributing routes;
+any nonempty stratum makes its route a cross-fit contributor, while four rows
+are enforced only on each combined fold-fit population after the held route is
+removed. A route with thousands of rows still counts once. Evidence schema 15
+reports independent route counts,
+cross-fit fold failures, paired out-of-fold losses, and the final all-route fit
+separately. Every route also carries a source-assignment ledger whose accepted
+base, moving, complete-breakaway, pending, fitted-authority, and unresolved-
+authority counts must conserve both the interval strata and the durable global
+accepted-frame count. Runtime interpolation evidence is also partitioned into
+disjoint base, moving, complete-breakaway, and settled-authority strata. Every
+populated stratum must independently avoid regression in every leave-one-route-out fold;
+abundant ordinary rows cannot dilute a sparse physical failure. Earlier
+evidence schemas are rejected rather than reinterpreted.
+
+Historical replay assigns every controls witness a canonical ingestion
+coordinate: route-content SHA-256, segment index, controls mono time, and
+recorded ordinal. Replay verifies the witness against the same indexed
+physical frame before the learner sees it. Every accepted and rejected
+disposition then extends an ordered assignment hash chain. Accepted records
+commit exact hexadecimal physical values and the exact node, interval,
+support, training, and episode weights they contributed; rejected records
+commit an empty contribution set. Each route commitment binds the distinct
+route identity, route-content artifact, assignment chain, source accounting,
+and sufficient statistics. The trainer supplies the complete ordered route
+commitment mapping from its own independent replay; embedded roots are
+structural integrity checks only and are never treated as population
+authority. Live rows have no authenticated historical coordinate and therefore
+cannot publish authoritative calibration evidence.
 
 The `0/5/10/15/20/30 m/s` support floors are respectively
 `150/150/240/240/420/420` accepted weighted seconds, not wall-clock drive
-time. Every node also needs at least 20% held-out support, bidirectional torque
-and lateral-acceleration excitation, and at least four training and four
-validation moving rows plus four training and four validation complete
-breakaway episodes in both directions. Low-speed sharp turns are rare but
+time. Every node also needs bidirectional torque and lateral-acceleration
+excitation, at least two independent routes for every required stratum, and at
+least four moving rows plus four complete breakaway episodes as numerical
+floors. Low-speed sharp turns are rare but
 data-dense; waiting, driver override, or unexcited straight travel does not fill
 their node. Between nodes, evidence weights and runtime parameters interpolate
 linearly, and every adjacent interval must validate independently. Highway data
@@ -162,9 +195,13 @@ The optional progress projection is `CLEAR_ON_MANAGER_START`, is tied to the
 operation id and sequence to reject torn reads, and is removed at terminal
 idle/failure. Older UI code continues to use the coarse operation status.
 
-Physical `BLaTv2LearningStatus` schema 4 distinguishes learned, seed retained,
+Physical `BLaTv2LearningStatus` schema 10 distinguishes learned, seed retained,
 missing support/variety, rank deficiency, ill conditioning, inconclusive
-selection, validation regression, and interpolation state. It also carries
+selection, cross-fit regression, fold completion, and per-stratum interpolation
+state. The selected or seed-retained result carries its authoritative model
+family, independent contributor counts, paired held-out loss, explicit
+regressed-fold counts, final full-fit diagnostic, and unresolved diagnostics
+rather than a summary with missing proof. It also carries
 strict first-cause accounting for every prepared frame, so accepted evidence
 plus the finite rejection-reason set always equals the ingested-frame count.
 Frames absent before the first canonical poll and explicit source gaps remain
@@ -178,8 +215,11 @@ mean active. Both status documents are display-only.
 
 ## Determinism and storage
 
-Only complete PC full-rlog replay owns durable evidence. Routes are ordered by
-their canonical route counter. Within a route, selected events are ordered by
+Only complete PC full-rlog replay owns durable evidence. Statistical
+aggregation orders routes by `(route identity SHA-256, route content SHA-256,
+canonical route counter)`. Identity and content hashes define immutable
+membership; the counter is provenance and a final deterministic tie-breaker,
+not a fold assignment. Within a route, selected events are ordered by
 `(logMonoTime, segment, recorded ordinal)`, and a controls witness may use only
 a source at or before its timestamp. Recorded ordinal deliberately resolves
 equal-timestamp ties.
@@ -258,9 +298,9 @@ cannot fabricate a breakaway. Lifecycle and mapping discontinuities clear
 cross-frame direction.
 
 The committed identities are calibration profile/evidence/coordinator
-`2/9/9`, physical learning/operation/progress status `4/1/1`, native
-extractor/canonical join `3/3`, route evidence `BLATRE02` version `2`,
-backfill ledger/commit/pointer `2/2/1`, controller policy `1`, and namespace
+`3/14/14`, physical learning/operation/progress status `7/1/1`, native
+extractor/canonical join `4/3`, route evidence `BLATRE02` version `2`,
+backfill ledger/commit/pointer `3/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v7`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
