@@ -435,6 +435,14 @@ def test_historical_request_association_is_provenance_and_time_bounded() -> None
     opendbc_commit="68fda8e06e648fd23e2cdac6a5d04ef3df67f29b",
   )
   assert bind(f4, 105_000_000).steering_request_active_valid
+  route_87 = replace(
+    _historical_descriptor(),
+    superproject_commit="b1006825028dc268b1334405626690d73d56fa0c",
+    opendbc_commit="1c4ead88ec81d8ac688496d596c72b9ddae5b95a",
+    panda_commit="398ab83103e78c15c7b9b9d0b59c165d1cef0c5c",
+    log_schema_blob="83a13a871d534822dbe88afa8ca9e0ad4dd8a365",
+  )
+  assert bind(route_87, 105_000_000).steering_request_active_valid
   assert not bind(
     _historical_descriptor(vehicle="HYUNDAI_SONATA"),
     105_000_000,

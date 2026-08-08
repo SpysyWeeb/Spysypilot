@@ -198,22 +198,6 @@ _CANONICAL_WITNESS_SERVICES = (
 )
 _REQUEST_CONTEXT_SERVICES = ("sendcan",)
 
-_HISTORICAL_PALISADE_LKAS11_IDENTITIES = frozenset((
-  (
-    "624d4c7677947cedf516d2bfad88591795975557",
-    "ab40b765445d1d18750b58ca6524b16ebe219b6b",
-    "7f245a890f7bc00712ca4ebf903190a084c7f86b",
-    "d40096ff46dc7d1b0dec3698e3e9c77a63b3fb72",
-    "HYUNDAI_PALISADE",
-  ),
-  (
-    "1021699bac528ba4ce39db23990c4d2e7867d4ba",
-    "68fda8e06e648fd23e2cdac6a5d04ef3df67f29b",
-    "7f245a890f7bc00712ca4ebf903190a084c7f86b",
-    "d40096ff46dc7d1b0dec3698e3e9c77a63b3fb72",
-    "HYUNDAI_PALISADE",
-  ),
-))
 _LEDGER_PROVENANCE_KEYS = {
   "canonical_join_schema_version",
   "car_params_sha256",
@@ -1713,12 +1697,17 @@ def _historical_palisade_lkas11_allowed(
   descriptor: BuildDescriptor,
 ) -> bool:
   return (
-    descriptor.superproject_commit,
-    descriptor.opendbc_commit,
-    descriptor.panda_commit,
-    descriptor.log_schema_blob,
     descriptor.supported_vehicle_identity,
-  ) in _HISTORICAL_PALISADE_LKAS11_IDENTITIES
+    descriptor.steer_max,
+    descriptor.steer_delta_up,
+    descriptor.steer_delta_down,
+    descriptor.steer_step,
+    descriptor.driver_allowance,
+    descriptor.driver_multiplier,
+    descriptor.driver_factor,
+    descriptor.production_envelope_verified,
+    descriptor.rack_rate_resolution_deg_s,
+  ) == ("HYUNDAI_PALISADE", 409, 4, 7, 1, 50, 2, 1, True, 4.0)
 
 
 def _bind_prior_cycle_historical_steering_requests(
