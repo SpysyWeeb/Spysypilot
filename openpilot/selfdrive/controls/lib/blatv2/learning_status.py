@@ -4,7 +4,7 @@ This Params value is an informational projection of already-finalized
 calibration evidence.  It is outside controller selection, approval, fitting,
 and actuation: deleting or corrupting it cannot change which controller runs.
 
-Schema 10 binds each per-stratum full-fit proof to an explicit population used
+Schema 11 binds each per-stratum full-fit proof to an explicit population used
 to derive the complete
 ordered qualification reason set. It also rejects the retired rack-fit vocabulary and
 adds canonical first-cause sample accounting. Cross-fit diagnostics preserve
@@ -43,6 +43,8 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   calibration_cross_fit_required_populations,
   calibration_node_failure_reasons,
   MIN_INDEPENDENT_ROUTES,
+  MIN_TERMINAL_SEED_AUTHORITY_ROUTES,
+  terminal_seed_authority_allowed,
   MIN_STRATUM_TRAINING_ROWS,
   MIN_APPLIED_TORQUE_SPAN,
   MIN_LATERAL_ACCEL_RMS_MPS2,
@@ -54,7 +56,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 10
+LEARNING_STATUS_SCHEMA_VERSION = 11
 MAX_LEARNING_STATUS_FLOAT_ABS = float(MAX_CALIBRATION_EVIDENCE_ROWS)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
@@ -1127,7 +1129,13 @@ def _optional_nonnegative_float(value: object, name: str) -> None:
     _nonnegative_float(value, name)
 
 
-def _validate_paired_loss(value: object, context: str, *, optional: bool) -> str:
+def _validate_paired_loss(
+  value: object,
+  context: str,
+  *,
+  optional: bool,
+  identical: bool = False,
+) -> str:
   if value is None:
     if optional:
       return "absent"
@@ -1148,10 +1156,12 @@ def _validate_paired_loss(value: object, context: str, *, optional: bool) -> str
   tolerance_value = _nonnegative_float(
     tolerance, f"{context}.numerical_tolerance_mse"
   )
+  if identical and mean_value != 0.0:
+    raise ValueError(f"{context} exact-seed loss is not identical")
   if route_count == 1:
     if any(item is not None for item in (uncertainty, lower, upper)):
       raise ValueError(f"{context} one-route loss invents uncertainty")
-    return "inconclusive"
+    return "no_regression" if identical else "inconclusive"
   uncertainty_value = _nonnegative_float(
     uncertainty,
     f"{context}.uncertainty_mse",
@@ -1246,6 +1256,7 @@ def _validate_cross_fit_status(
   *,
   coverage_sufficient: bool,
   interval: bool,
+  identical: bool = False,
 ) -> str:
   status = CalibrationCrossFitStatus(diagnostic["status"])
   contributing = _nonnegative_int(
@@ -1271,6 +1282,7 @@ def _validate_cross_fit_status(
     diagnostic[loss_field],
     f"{context}.{loss_field}",
     optional=False,
+    identical=identical,
   )
   loss = diagnostic[loss_field]
   if loss["route_count"] != successful:
@@ -1566,9 +1578,23 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       parsed_route_counts["breakaway"],
       parsed_route_counts["breakaway_episode"],
     )
+    terminal_seed_authority = terminal_seed_authority_allowed(
+      vehicle_identity=payload["vehicle_identity"],
+      speed_mps=speed,
+      terminal=index == len(nodes) - 1,
+      seed_retained=(
+        selection_outcome
+        == CalibrationQualificationReason.SEED_RETAINED.value
+      ),
+    )
+    minimum_authority_routes = (
+      MIN_TERMINAL_SEED_AUTHORITY_ROUTES
+      if terminal_seed_authority
+      else MIN_INDEPENDENT_ROUTES
+    )
     if (
       any(count < MIN_INDEPENDENT_ROUTES for count in required_route_counts)
-      or 0 < parsed_route_counts["authority"] < MIN_INDEPENDENT_ROUTES
+      or 0 < parsed_route_counts["authority"] < minimum_authority_routes
     ):
       expected_prerequisites.append(
         CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
@@ -1896,6 +1922,25 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       if stratum.value in strata:
         raise ValueError(f"{stratum_context}.stratum is duplicated")
       strata.add(stratum.value)
+      terminal_seed_authority = terminal_seed_authority_allowed(
+        vehicle_identity=payload["vehicle_identity"],
+        speed_mps=upper_speed,
+        terminal=(
+          index == len(nodes) - 2
+          and stratum is CalibrationIntervalStratum.AUTHORITY
+        ),
+        seed_retained=(
+          nodes[index]["selection_outcome"]
+          == CalibrationQualificationReason.SEED_RETAINED.value
+          and nodes[index + 1]["selection_outcome"]
+          == CalibrationQualificationReason.SEED_RETAINED.value
+        ),
+      )
+      minimum_independent_routes = (
+        MIN_TERMINAL_SEED_AUTHORITY_ROUTES
+        if terminal_seed_authority
+        else MIN_INDEPENDENT_ROUTES
+      )
       stratum_contributing = _nonnegative_int(
         diagnostic["contributing_route_count"],
         f"{stratum_context}.contributing_route_count",
@@ -1923,8 +1968,11 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       cross_loss_outcome = _validate_cross_fit_status(
         diagnostic_for_status,
         stratum_context,
-        coverage_sufficient=stratum_contributing >= MIN_INDEPENDENT_ROUTES,
+        coverage_sufficient=(
+          stratum_contributing >= minimum_independent_routes
+        ),
         interval=True,
+        identical=terminal_seed_authority,
       )
       if report["qualified"] and (
         stratum_bad != 0 or stratum_status is not CalibrationCrossFitStatus.SCORED
@@ -1934,10 +1982,11 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
         diagnostic["full_fit_paired_loss"],
         f"{stratum_context}.full_fit_paired_loss",
         optional=False,
+        identical=terminal_seed_authority,
       )
       if diagnostic["full_fit_paired_loss"]["route_count"] != stratum_contributing:
         raise ValueError(f"{stratum_context} full-fit route count disagrees")
-      if stratum_contributing < 2:
+      if stratum_contributing < minimum_independent_routes:
         expected_interval_reasons.append(
           CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES.value
         )

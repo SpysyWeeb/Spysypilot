@@ -31,6 +31,15 @@ samples may prepare reachable authority but may not move the path earlier to
 hide delay. This item remains in progress until replay, safety, timing, and
 owner field testing are complete.
 
+**30 m/s field-trial authority — owner authorized, in progress.** The terminal
+30 m/s node and its 20–30 m/s authority interpolation may retain the exact
+reviewed seed with one independent maximum-authority route. This exception
+cannot select learned high-speed coefficients and does not change the global
+two-route minimum for any lower node, other stratum, or learned endpoint.
+BLaTv2 remains the sole active steering controller during its bound session;
+no stock controller runs in parallel. Field results remain required before
+this task can be marked done.
+
 Controls startup keeps separate horizon-policy sources: the provisional policy
 is used only by the explicit development trial, while the approved source path
 is currently absent and therefore fails closed. Approval schema v7 also retires

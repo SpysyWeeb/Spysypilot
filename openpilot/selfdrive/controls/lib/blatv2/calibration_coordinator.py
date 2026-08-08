@@ -7,13 +7,16 @@ written last so it acts as the commit record for the independently atomic
 evidence and optional candidate files.
 
 The coordinator can create an *unapproved* candidate only after every speed
-node and every populated interpolation stratum qualifies through schema-14 route-grouped
+node and every populated interpolation stratum qualifies through schema-17 route-grouped
 leave-one-route-out evidence drawn exclusively from the caller's global TRAIN
 partition. An evaluated all-seed outcome is
 successful and emits an immutable selected-profile proof for downstream
 behavior replay, but it intentionally emits no redundant *new calibration*
 candidate. It has no API for approval, activation, controller selection, or
 mutation of the profile used by a live controller.
+
+Schema 17 permits one owner-authorized terminal 30 m/s authority route only
+when both the node and terminal interpolation retain the exact seed.
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 16
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 17
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION

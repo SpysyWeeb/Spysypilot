@@ -26,7 +26,12 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationProfileLearner,
   CalibrationQualificationReason,
   CalibrationSampleDisposition,
+  MIN_STRATUM_TRAINING_ROWS,
+  MIN_TERMINAL_SEED_AUTHORITY_ROUTES,
+  TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY,
+  TERMINAL_SEED_AUTHORITY_POLICY_ID,
   _JointRegression,
+  terminal_seed_authority_allowed,
   _PairedLossVerdict,
   _CrossFitFamily,
   _Regression,
@@ -928,6 +933,124 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertIn(
       CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES,
       report.unresolved_diagnostics,
+    )
+
+  def test_terminal_seed_authority_uses_owner_field_trial_minimum(self) -> None:
+    self.assertEqual(
+      terminal_seed_authority_allowed(
+        vehicle_identity=TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY,
+        speed_mps=30.0,
+        terminal=True,
+        seed_retained=True,
+      ),
+      True,
+    )
+    for vehicle_identity, speed_mps, terminal, seed_retained in (
+      ("other-vehicle", 30.0, True, True),
+      (TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY, 20.0, True, True),
+      (TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY, 30.0, False, True),
+      (TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY, 30.0, True, False),
+    ):
+      self.assertFalse(
+        terminal_seed_authority_allowed(
+          vehicle_identity=vehicle_identity,
+          speed_mps=speed_mps,
+          terminal=terminal,
+          seed_retained=seed_retained,
+        )
+      )
+    seed = seed_profile(TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY)
+    learner = CalibrationProfileLearner(seed)
+    add_complete_evidence(
+      learner,
+      {
+        speed: seed.nodes[index].parameters
+        for index, speed in enumerate(DEFAULT_SPEED_NODES_MPS)
+      },
+    )
+    predictors = (-0.8, 1.0, 1.0, 0.0)
+
+    def add_authority_route(
+      route_counter: int,
+      node_indices: tuple[int, ...],
+      *,
+      terminal_interval: bool,
+    ) -> None:
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
+      for node_index in node_indices:
+        coefficients = _seed_coefficients(seed.nodes[node_index].parameters)
+        target = math.fsum(
+          coefficient * predictor
+          for coefficient, predictor in zip(
+            coefficients,
+            predictors,
+            strict=True,
+          )
+        )
+        for _ in range(MIN_STRATUM_TRAINING_ROWS):
+          learner._add_regression(
+            node_index,
+            "authority_training",
+            predictors,
+            target,
+            DT,
+          )
+      learner.end_route()
+      if terminal_interval:
+        lower = _seed_coefficients(seed.nodes[-2].parameters)
+        upper = _seed_coefficients(seed.nodes[-1].parameters)
+        target = math.fsum(
+          0.5 * (lower_value + upper_value) * predictor
+          for lower_value, upper_value, predictor in zip(
+            lower,
+            upper,
+            predictors,
+            strict=True,
+          )
+        )
+        for _ in range(MIN_STRATUM_TRAINING_ROWS):
+          learner._routes[-1].intervals[-1].authority.add(
+            predictors,
+            target,
+            DT,
+            0.5,
+          )
+
+    add_authority_route(
+      1000,
+      (len(seed.nodes) - 2, len(seed.nodes) - 1),
+      terminal_interval=True,
+    )
+    add_authority_route(
+      1001,
+      (len(seed.nodes) - 2,),
+      terminal_interval=False,
+    )
+
+    result = learner.qualify("owner-authorized terminal authority")
+    self.assertTrue(result.all_nodes_qualified)
+    self.assertIsNone(result.candidate_profile)
+    self.assertIsNotNone(result.selected_profile)
+    terminal = result.node_reports[-1]
+    self.assertTrue(terminal.seed_retained)
+    self.assertEqual(
+      terminal.independent_route_counts.authority,
+      MIN_TERMINAL_SEED_AUTHORITY_ROUTES,
+    )
+    authority = next(
+      diagnostic
+      for diagnostic in result.interpolation_reports[-1].stratum_diagnostics
+      if diagnostic.stratum is CalibrationIntervalStratum.AUTHORITY
+    )
+    self.assertEqual(authority.contributing_route_count, 1)
+    self.assertEqual(authority.successful_fold_count, 1)
+    self.assertEqual(
+      authority.cross_fit_status,
+      CalibrationCrossFitStatus.SCORED,
+    )
+    self.assertIn(
+      f"terminal_authority_policy={TERMINAL_SEED_AUTHORITY_POLICY_ID}",
+      result.selected_profile.provenance,
     )
 
   def test_route_input_order_does_not_change_evidence_bytes(self) -> None:

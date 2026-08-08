@@ -39,6 +39,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   build_learning_status_payload,
   decode_learning_status,
   _validate_cross_fit_status,
+  _validate_paired_loss,
   validate_learning_status_payload,
 )
 
@@ -348,7 +349,7 @@ def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 10
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 11
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -398,6 +399,36 @@ def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert node["last_drive_authority_sample_count"] == 10
   assert node["last_drive_authority_fit_support_s"] == 1.0
   assert node["last_drive_authority_fit_sample_count"] == 10
+
+
+def test_terminal_exact_seed_loss_does_not_invent_one_route_uncertainty() -> None:
+  loss = {
+    "lower_bound_mse": None,
+    "mean_candidate_minus_seed_mse": 0.0,
+    "numerical_tolerance_mse": 1e-14,
+    "route_count": 1,
+    "uncertainty_mse": None,
+    "upper_bound_mse": None,
+  }
+  assert _validate_paired_loss(
+    loss,
+    "terminal authority",
+    optional=False,
+  ) == "inconclusive"
+  assert _validate_paired_loss(
+    loss,
+    "terminal authority",
+    optional=False,
+    identical=True,
+  ) == "no_regression"
+  loss["mean_candidate_minus_seed_mse"] = 5e-15
+  with unittest.TestCase().assertRaisesRegex(ValueError, "not identical"):
+    _validate_paired_loss(
+      loss,
+      "terminal authority",
+      optional=False,
+      identical=True,
+    )
 
 
 def test_fully_evaluated_cross_fit_regression_is_not_reported_as_pending() -> None:

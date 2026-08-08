@@ -268,7 +268,7 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
         CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION,
         LEARNING_STATUS_SCHEMA_VERSION,
       ),
-      (15, 16, 10),
+      (15, 17, 11),
     )
     # The join identity moves only when source interpretation changes. Version
     # 4 binds request-off censoring to the carried command timeline.

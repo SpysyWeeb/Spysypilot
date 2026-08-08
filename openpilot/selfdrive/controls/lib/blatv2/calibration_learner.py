@@ -74,6 +74,12 @@ MAX_CALIBRATION_EVIDENCE_ROWS = (
 MAX_CALIBRATION_WIRE_FLOAT_ABS = math.sqrt(sys.float_info.max) / 16.0
 MIN_STRATUM_TRAINING_ROWS = 4
 MIN_INDEPENDENT_ROUTES = 2
+MIN_TERMINAL_SEED_AUTHORITY_ROUTES = 1
+TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY = "HYUNDAI_PALISADE"
+TERMINAL_SEED_AUTHORITY_SPEED_MPS = 30.0
+TERMINAL_SEED_AUTHORITY_POLICY_ID = (
+  "palisade-terminal-30mps-authority-one-route-field-test-v1"
+)
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
 # Floating-point cancellation guard only. Physical acceptance uses the
 # route-level paired uncertainty interval implemented below.
@@ -89,6 +95,21 @@ def _bounded_count(value: object, context: str) -> int:
   ):
     raise ValueError(f"{context} is outside the evidence schema bound")
   return value
+
+
+def terminal_seed_authority_allowed(
+  *,
+  vehicle_identity: str,
+  speed_mps: float,
+  terminal: bool,
+  seed_retained: bool,
+) -> bool:
+  return (
+    vehicle_identity == TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY
+    and terminal
+    and speed_mps == TERMINAL_SEED_AUTHORITY_SPEED_MPS
+    and seed_retained
+  )
 
 
 def _stat_tolerance(scale: float, count: int, multiplier: float) -> float:
@@ -2145,10 +2166,12 @@ def _paired_loss_verdict(
   *,
   identical: bool = False,
 ) -> _PairedLossVerdict:
-  if identical:
-    return _PairedLossVerdict.NO_REGRESSION
   if diagnostic.route_count == 0:
     return _PairedLossVerdict.NO_DATA
+  if identical:
+    if diagnostic.mean_candidate_minus_seed_mse != 0.0:
+      raise ValueError("identical paired loss is nonzero")
+    return _PairedLossVerdict.NO_REGRESSION
   if diagnostic.upper_bound_mse is None or diagnostic.lower_bound_mse is None:
     return _PairedLossVerdict.INCONCLUSIVE
   tolerance = diagnostic.numerical_tolerance_mse or 0.0
@@ -2665,13 +2688,23 @@ def _cross_fit_interval_loss(
   upper_model: CalibrationModelId | None,
   seed_lower: CalibrationParameters,
   seed_upper: CalibrationParameters,
+  *,
+  allow_single_exact_seed: bool = False,
 ) -> tuple[CalibrationPairedLossDiagnostic, int, int, int, int, CalibrationCrossFitStatus]:
+  exact_seed = lower_model is None and upper_model is None
+  if allow_single_exact_seed and not exact_seed:
+    raise ValueError("single-route interval authority requires exact seed")
+  minimum_independent_routes = (
+    MIN_TERMINAL_SEED_AUTHORITY_ROUTES
+    if allow_single_exact_seed
+    else MIN_INDEPENDENT_ROUTES
+  )
   canonical = _canonical_routes(routes)
   contributing = tuple(
     route for route in canonical
     if route.intervals[interval_index].regression(stratum).count > 0
   )
-  if len(contributing) < MIN_INDEPENDENT_ROUTES:
+  if len(contributing) < minimum_independent_routes:
     diagnostic = _diagnostic_from_deltas(())
     return (
       diagnostic, len(contributing), 0, 0, 0,
@@ -2746,7 +2779,10 @@ def _cross_fit_interval_loss(
     if delta > tolerance:
       regressed_folds += 1
   diagnostic = _diagnostic_from_deltas(tuple(deltas))
-  verdict = _paired_loss_verdict(diagnostic)
+  verdict = _paired_loss_verdict(
+    diagnostic,
+    identical=exact_seed,
+  )
   status = calibration_cross_fit_status(
     contributing_route_count=len(contributing),
     successful_fold_count=len(deltas),
@@ -3587,13 +3623,10 @@ class CalibrationProfileLearner:
       route_counts.breakaway,
       route_counts.breakaway_episode,
     )
-    insufficient_independent = any(
+    insufficient_required_routes = any(
       count < MIN_INDEPENDENT_ROUTES for count in required_counts
-    ) or 0 < route_counts.authority < MIN_INDEPENDENT_ROUTES
-    if any(count < MIN_INDEPENDENT_ROUTES for count in required_counts):
-      reasons.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
-      unresolved.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
-    if 0 < route_counts.authority < MIN_INDEPENDENT_ROUTES:
+    )
+    if insufficient_required_routes:
       reasons.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
       unresolved.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
 
@@ -3675,6 +3708,26 @@ class CalibrationProfileLearner:
     seed_retained = (
       selected_cross_fit is None
       and bool(safe_seed_cross_fit)
+    )
+    terminal_seed_authority = terminal_seed_authority_allowed(
+      vehicle_identity=self.seed_profile.vehicle_identity,
+      speed_mps=speed,
+      terminal=index == len(self._nodes) - 1,
+      seed_retained=seed_retained,
+    )
+    minimum_authority_routes = (
+      MIN_TERMINAL_SEED_AUTHORITY_ROUTES
+      if terminal_seed_authority
+      else MIN_INDEPENDENT_ROUTES
+    )
+    insufficient_authority_routes = (
+      0 < route_counts.authority < minimum_authority_routes
+    )
+    if insufficient_authority_routes:
+      reasons.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
+      unresolved.append(CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES)
+    insufficient_independent = (
+      insufficient_required_routes or insufficient_authority_routes
     )
     coefficients = seed_coefficients
     full_fit_diagnostic: CalibrationModelFitDiagnostic | None = None
@@ -3883,6 +3936,23 @@ class CalibrationProfileLearner:
       stratum_diagnostics: list[CalibrationIntervalStratumDiagnostic] = []
       contributors: set[str] = set()
       for stratum in _INTERVAL_STRATA:
+        terminal_seed_authority = terminal_seed_authority_allowed(
+          vehicle_identity=self.seed_profile.vehicle_identity,
+          speed_mps=self.speed_nodes_mps[interval_index + 1],
+          terminal=(
+            interval_index == len(self._nodes) - 2
+            and stratum is CalibrationIntervalStratum.AUTHORITY
+          ),
+          seed_retained=(
+            reports[interval_index].seed_retained
+            and reports[interval_index + 1].seed_retained
+          ),
+        )
+        minimum_independent_routes = (
+          MIN_TERMINAL_SEED_AUTHORITY_ROUTES
+          if terminal_seed_authority
+          else MIN_INDEPENDENT_ROUTES
+        )
         stratum_routes = tuple(
           route for route in routes
           if route.intervals[interval_index].regression(stratum).count > 0
@@ -3914,6 +3984,7 @@ class CalibrationProfileLearner:
           reports[interval_index + 1].selected_model,
           seed_parameters[interval_index],
           seed_parameters[interval_index + 1],
+          allow_single_exact_seed=terminal_seed_authority,
         )
         stratum_diagnostics.append(CalibrationIntervalStratumDiagnostic(
           stratum=stratum,
@@ -3925,14 +3996,20 @@ class CalibrationProfileLearner:
           regressed_fold_count=regressed_fold_count,
           cross_fit_status=cross_fit_status,
         ))
-        if contributing_route_count < MIN_INDEPENDENT_ROUTES:
+        if contributing_route_count < minimum_independent_routes:
           interval_reasons.append(
             CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES
           )
         if failed_fold_count:
           interval_reasons.append(CalibrationQualificationReason.CROSS_FIT_FOLD_FAILURE)
-        full_fit_verdict = _paired_loss_verdict(full_fit)
-        cross_fit_verdict = _paired_loss_verdict(cross_fit)
+        full_fit_verdict = _paired_loss_verdict(
+          full_fit,
+          identical=terminal_seed_authority,
+        )
+        cross_fit_verdict = _paired_loss_verdict(
+          cross_fit,
+          identical=terminal_seed_authority,
+        )
         if full_fit_verdict is _PairedLossVerdict.REGRESSION:
           interval_reasons.append(
             CalibrationQualificationReason.INTERPOLATION_TRAINING_REGRESSION
@@ -4021,7 +4098,8 @@ class CalibrationProfileLearner:
       if report.selected_model is not None
     )
     candidate_provenance = (
-      f"{source}; observable-inverse-torque-crossfit-v4; " +
+      f"{source}; observable-inverse-torque-crossfit-v5; " +
+      f"terminal_authority_policy={TERMINAL_SEED_AUTHORITY_POLICY_ID}; " +
       f"models={model_ids}; evidence_revision={revision}"
     )
     profile = VehicleCalibrationProfile(
