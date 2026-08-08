@@ -153,9 +153,13 @@ class Controls:
 
     # Bind one controller architecture at the AOL/MADS lateral-session
     # boundary (enabled OR latActive). An exact
-    # torqueOutputCan count is the only actuator Markov state accepted by the
-    # modular path; failure leaves a new engagement on exact stock.
-    self.blatv2_live.observe_previous_applied(self.sm['carOutput'])
+    # torqueOutputCan count plus the emitted steering-request witness are the
+    # actuator Markov state accepted by the modular path; failure leaves a new
+    # engagement on exact stock.
+    self.blatv2_live.observe_previous_applied(
+      self.sm['carOutput'],
+      car_output_mono_ns=int(self.sm.logMonoTime['carOutput']),
+    )
     lateral_maneuver_active = bool(
       self.lateral_maneuver_mode
       or self.sm.valid['lateralManeuverPlan']
@@ -253,7 +257,10 @@ class Controls:
           self.sm.all_checks(['liveParameters'])
         ),
         lateral_active=CC.latActive,
-        actuator_constrained_previous=self.steer_limited_by_safety,
+        actuator_constrained_previous=(
+          not self.blatv2_live.final_count_match_valid
+          or self.blatv2_live.final_limiter_altered
+        ),
         lateral_maneuver_active=lateral_maneuver_active,
       )
       core_result = result.core_result
@@ -291,6 +298,14 @@ class Controls:
         cloudlog.error(f"actuators.{p} not finite {actuators.to_dict()}")
         setattr(actuators, p, 0.0)
 
+    if controller_selection == ControllerSelection.MODULAR:
+      command_recorded = self.blatv2_live.record_requested_command(
+        actuators.torque,
+      )
+      self.blatv2_messages_valid = (
+        self.blatv2_messages_valid and command_recorded
+      )
+
     return CC, lac_log
 
   def publish(self, CC, lac_log):
@@ -326,6 +341,11 @@ class Controls:
       if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
         self.steer_limited_by_safety = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \
                                               STEER_ANGLE_SATURATION_THRESHOLD
+      elif self.blatv2_live.selection == ControllerSelection.MODULAR:
+        self.steer_limited_by_safety = (
+          not self.blatv2_live.final_count_match_valid
+          or self.blatv2_live.final_limiter_altered
+        )
       else:
         self.steer_limited_by_safety = abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
 

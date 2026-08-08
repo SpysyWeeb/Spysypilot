@@ -109,9 +109,13 @@ def sample(
     measured_rack_rate_deg_s=curvature * 40.0,
     measured_rack_accel_deg_s2=curvature * -15.0,
     raw_requested_torque=curvature * 10.0 + (index % 2) * 0.01,
+    planned_requested_torque=curvature * 10.0,
+    reachable_envelope_torque=curvature * 9.0,
     envelope_applied_torque=curvature * 9.0,
     torque_headroom=0.5,
     actuator_constrained=index % 9 == 0,
+    steering_request_active=True,
+    maximum_authority_required=False,
     lateral_active=lateral_active,
     inputs_valid=lateral_active,
     steering_pressed=intervention,
@@ -197,7 +201,10 @@ def test_file_backed_segmentation_and_metrics_match_eager_exactly(tmp_path: Path
     bounded_metrics = tuple(score_file_backed_window(item, metric_config()) for item in bounded.windows)
     bounded_scorecard = aggregate_behavior_metrics(bounded_metrics, metric_config())
     eager_scorecard = score_behavior(eager.behavior_windows, metric_config())
-    assert bounded_metrics == eager_scorecard.windows
+    assert bounded_metrics == tuple(
+      window for window in eager_scorecard.windows
+      if window.summary_metric_name is None
+    )
     assert bounded_scorecard == eager_scorecard
     assert bounded_scorecard.to_json() == eager_scorecard.to_json()
 
@@ -222,8 +229,9 @@ def test_file_backed_phase_shapes_preserve_eager_hashes_and_scores(
       "route-shape", SOURCE, scratch.finish(), (), segmentation_config(),
     )
     assert bounded.sha256 == eager.sha256
+    eager_metrics = score_behavior(eager.behavior_windows, metric_config()).windows
     assert tuple(score_file_backed_window(item, metric_config()) for item in bounded.windows) == tuple(
-      score_behavior(eager.behavior_windows, metric_config()).windows
+      window for window in eager_metrics if window.summary_metric_name is None
     )
 
 
@@ -269,7 +277,9 @@ def test_adversarial_short_span_population_preserves_committed_hash(
     assert segmented.windows[0].descriptor.start_sample_index == 0
     assert segmented.windows[0].descriptor.end_sample_index_exclusive == 2
     assert len(segmented.unassigned_sample_indices) == 9_998
-    assert segmented.sha256 == "ee0ec76d087d014c5041ee6de038f1561c2680f1c00fbd424b73c78901f2bf99"
+    # The golden binds the v2 scratch/sample command and request-state fields;
+    # eager/file-backed equivalence above proves both paths hash the same bytes.
+    assert segmented.sha256 == "daad132274781884bab06f32c29d2e62e4755a5bd842239b63d575826563e6ed"
 
 
 def test_many_events_do_not_rescan_every_adversarial_span(
@@ -304,7 +314,7 @@ def test_many_events_do_not_rescan_every_adversarial_span(
     )
 
     assert len(segmented.event_coverage) == 100
-    assert segmented.sha256 == "9c39b1a605b450c1489c4152be124a98beeaf190f8a5ffbdaf1e83a436303116"
+    assert segmented.sha256 == "30a13d7799d169b533cba80b1ef19a08bc16d5fe12e0680267571230e4d0da69"
     # One canonical descriptor pass is O(spans). Every event then performs a
     # binary search plus a local overlap scan, not another full-route scan.
     assert span_reads < 25_000

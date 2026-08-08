@@ -8,6 +8,7 @@ import tracemalloc
 from unittest.mock import patch
 import warnings
 
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
   BehaviorControlResponse,
   BehaviorWindow,
@@ -15,6 +16,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   BehaviorMetricConfig,
+  aggregate_behavior_metrics,
   score_window,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import ReplayRole
@@ -127,7 +129,7 @@ def _artifact(
     )
     for index in range(count)
   )
-  times = tuple(sample * 0.05 for sample in range(20))
+  times = tuple(ModelConstants.T_IDXS)
   models = tuple(
     ModelPublication(
       segment_index=0,
@@ -166,6 +168,7 @@ def _artifact(
       desired_curvature=_curve(index, count),
       envelope_headroom=1.0,
       torque_output_can_count=0,
+      steering_request_fault_avoidance_counter=0,
       message_valid=True,
       model_message_alive=True,
       model_link_valid=True,
@@ -184,6 +187,9 @@ def _artifact(
       live_delay_available=index > 0,
       live_torque_parameters_checks_passed=False,
       live_torque_parameters_health_exact=True,
+      steering_request_active=True,
+      steering_request_active_valid=True,
+      steering_request_fault_avoidance_counter_valid=True,
     )
     for index in range(count)
   )
@@ -201,7 +207,7 @@ def _artifact(
     behavior_ineligible_reason="unverified_controller_source",
     vehicle_identity=FINGERPRINT,
     runtime_identity="5" * 64,
-    schema_versions={"extractor": 3, "route_evidence": 2},
+    schema_versions={"extractor": 3, "route_evidence": 4},
     preparation_provenance={"canonical": True},
     physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
     physical_record_count=count,
@@ -348,9 +354,13 @@ def _eager_metrics(
         measured_rack_rate_deg_s=output.measured_rack_rate_deg_s,
         measured_rack_accel_deg_s2=output.measured_rack_accel_deg_s2,
         raw_requested_torque=output.raw_requested_torque,
+        planned_requested_torque=output.planned_requested_torque,
+        reachable_envelope_torque=output.reachable_envelope_torque,
         envelope_applied_torque=output.envelope_applied_torque,
         torque_headroom=output.torque_headroom,
         actuator_constrained=output.actuator_constrained,
+        steering_request_active=output.steering_request_active,
+        maximum_authority_required=output.maximum_authority_required,
         lateral_active=control.lateral_active,
         inputs_valid=neutral.inputs_valid and output.response_eligible,
         steering_pressed=control.steering_pressed,
@@ -407,7 +417,10 @@ def test_streamed_stock_and_modular_match_eager_windows_exactly(tmp_path: Path) 
       interface_registry=INTERFACES,
     )
     assert preparation.file_backed_segmentation_sha256 == expected_segmentation_sha
-    assert result.windows == expected_metrics
+    assert result.windows == aggregate_behavior_metrics(
+      expected_metrics,
+      _metric_config(),
+    ).windows
 
 
 def test_route_major_population_scans_physical_evidence_once(tmp_path: Path) -> None:

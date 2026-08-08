@@ -8,8 +8,8 @@ friction, observer, torque envelope, safety limits, or any live state.
 Training chooses at most one frozen winner.  Held-out validation receives only
 that winner and may accept or reject it; it has no fallback-selection API.
 Smooth, Swift, and Strong remain independent contracts throughout.
-Exact stock remains a permanent comparator: the declared target must improve
-materially against stock and the accepted incumbent on the current routes.
+Every eligible stratum must match or beat exact stock and the accepted
+incumbent; balanced metrics remain reporting and ranking diagnostics.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   BehaviorContract,
   BehaviorMetricName,
   BehaviorScorecard,
+  MetricDisposition,
   behavior_metric_contract,
 )
 
@@ -201,6 +202,168 @@ def build_candidate_grid(spec: PolicyGridSpec) -> tuple[PolicyCandidate, ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyStratumMetric:
+  stratum: str
+  value: float | None
+  disposition: MetricDisposition
+  exclusions: tuple[str, ...]
+  route_count: int
+  window_count: int
+  weighted_support: float
+  coverage_identity_sha256: str
+  physical_failure_window_ids: tuple[str, ...]
+  coverage_excluded_window_ids: tuple[str, ...]
+  not_applicable_window_ids: tuple[str, ...]
+  route_values: tuple[tuple[str, float], ...]
+
+  def __post_init__(self) -> None:
+    if not self.stratum.strip():
+      raise ValueError("policy stratum metric needs a stratum")
+    if type(self.disposition) is not MetricDisposition:
+      raise ValueError("policy stratum metric disposition is not registered")
+    if self.value is not None and not math.isfinite(self.value):
+      raise ValueError("policy stratum metric value must be finite")
+    if self.route_count < 0 or self.window_count < 0:
+      raise ValueError("policy stratum coverage counts must be non-negative")
+    if not math.isfinite(self.weighted_support) or self.weighted_support < 0.0:
+      raise ValueError("policy stratum support must be finite and non-negative")
+    if len(self.coverage_identity_sha256) != 64 or any(
+      character not in "0123456789abcdef"
+      for character in self.coverage_identity_sha256
+    ):
+      raise ValueError("policy stratum coverage identity must be lowercase SHA-256")
+    for label, window_ids in (
+      ("physical failures", self.physical_failure_window_ids),
+      ("coverage exclusions", self.coverage_excluded_window_ids),
+      ("not-applicable windows", self.not_applicable_window_ids),
+    ):
+      if tuple(sorted(set(window_ids))) != window_ids:
+        raise ValueError(f"policy stratum {label} must be unique and sorted")
+    route_ids = tuple(route_id for route_id, _ in self.route_values)
+    if route_ids != tuple(sorted(set(route_ids))):
+      raise ValueError("policy stratum route values must be unique and sorted")
+    if any(not math.isfinite(value) for _, value in self.route_values):
+      raise ValueError("policy stratum route values must be finite")
+    evidence_disposition = (
+      MetricDisposition.PHYSICAL_UNSCOREABLE
+      if self.physical_failure_window_ids
+      else MetricDisposition.DEFINED
+      if self.value is not None
+      else MetricDisposition.COVERAGE_EXCLUDED
+      if self.coverage_excluded_window_ids
+      else MetricDisposition.NOT_APPLICABLE
+      if self.not_applicable_window_ids
+      else None
+    )
+    if self.disposition is not evidence_disposition:
+      raise ValueError("policy stratum disposition disagrees with window evidence")
+    if self.defined:
+      if len(route_ids) != self.route_count:
+        raise ValueError("defined policy stratum metric has inconsistent evidence")
+    elif self.route_values or not self.exclusions:
+      raise ValueError("undefined policy stratum metric has inconsistent evidence")
+
+  @property
+  def defined(self) -> bool:
+    return self.disposition is MetricDisposition.DEFINED
+
+  @property
+  def route_values_by_id(self) -> dict[str, float]:
+    return dict(self.route_values)
+
+  def to_dict(self) -> dict[str, Any]:
+    return {
+      "coverageIdentitySha256": self.coverage_identity_sha256,
+      "coverageExcludedWindowIds": list(self.coverage_excluded_window_ids),
+      "defined": self.defined,
+      "disposition": self.disposition.value,
+      "exclusions": list(self.exclusions),
+      "notApplicableWindowIds": list(self.not_applicable_window_ids),
+      "physicalFailureWindowIds": list(self.physical_failure_window_ids),
+      "routeCount": self.route_count,
+      "routeValues": [
+        {"routeId": route_id, "value": value}
+        for route_id, value in self.route_values
+      ],
+      "stratum": self.stratum,
+      "value": self.value,
+      "weightedSupport": self.weighted_support,
+      "windowCount": self.window_count,
+    }
+
+  @classmethod
+  def from_dict(cls, payload: object) -> PolicyStratumMetric:
+    keys = frozenset((
+      "coverageIdentitySha256",
+      "coverageExcludedWindowIds",
+      "defined",
+      "disposition",
+      "exclusions",
+      "notApplicableWindowIds",
+      "physicalFailureWindowIds",
+      "routeCount",
+      "routeValues",
+      "stratum",
+      "value",
+      "weightedSupport",
+      "windowCount",
+    ))
+    if type(payload) is not dict or frozenset(payload) != keys:
+      raise ValueError("policy stratum metric keys do not match schema")
+    if (
+      type(payload["stratum"]) is not str
+      or type(payload["defined"]) is not bool
+      or type(payload["disposition"]) is not str
+    ):
+      raise ValueError("policy stratum identity and defined flag have invalid types")
+    try:
+      disposition = MetricDisposition(payload["disposition"])
+    except ValueError as exc:
+      raise ValueError("policy stratum metric disposition is not registered") from exc
+    for key in (
+      "coverageExcludedWindowIds",
+      "exclusions",
+      "notApplicableWindowIds",
+      "physicalFailureWindowIds",
+    ):
+      if type(payload[key]) is not list or any(type(value) is not str for value in payload[key]):
+        raise ValueError(f"policy stratum {key} must be a text array")
+    if type(payload["routeCount"]) is not int or type(payload["windowCount"]) is not int:
+      raise ValueError("policy stratum coverage counts must be integer")
+    if type(payload["weightedSupport"]) not in (int, float):
+      raise ValueError("policy stratum weighted support must be numeric")
+    if payload["value"] is not None and type(payload["value"]) not in (int, float):
+      raise ValueError("policy stratum value must be numeric or null")
+    raw_route_values = payload["routeValues"]
+    if type(raw_route_values) is not list:
+      raise ValueError("policy stratum route values must be an array")
+    route_values: list[tuple[str, float]] = []
+    for raw in raw_route_values:
+      if type(raw) is not dict or frozenset(raw) != {"routeId", "value"}:
+        raise ValueError("policy stratum route value keys do not match schema")
+      if type(raw["routeId"]) is not str or type(raw["value"]) not in (int, float):
+        raise ValueError("policy stratum route value has invalid types")
+      route_values.append((raw["routeId"], float(raw["value"])))
+    metric = cls(
+      stratum=payload["stratum"],
+      value=None if payload["value"] is None else float(payload["value"]),
+      disposition=disposition,
+      exclusions=tuple(payload["exclusions"]),
+      route_count=payload["routeCount"],
+      window_count=payload["windowCount"],
+      weighted_support=float(payload["weightedSupport"]),
+      coverage_identity_sha256=payload["coverageIdentitySha256"],
+      physical_failure_window_ids=tuple(payload["physicalFailureWindowIds"]),
+      coverage_excluded_window_ids=tuple(payload["coverageExcludedWindowIds"]),
+      not_applicable_window_ids=tuple(payload["notApplicableWindowIds"]),
+      route_values=tuple(route_values),
+    )
+    if payload["defined"] != metric.defined:
+      raise ValueError("policy stratum defined flag disagrees with value")
+    return metric
+
+
+@dataclass(frozen=True, slots=True)
 class PolicyMetric:
   name: str
   value: float | None
@@ -211,6 +374,7 @@ class PolicyMetric:
   weighted_support: float
   coverage_identity_sha256: str
   strata: tuple[str, ...]
+  stratum_metrics: tuple[PolicyStratumMetric, ...]
   physical_failure_window_ids: tuple[str, ...]
   route_values: tuple[tuple[str, float], ...]
 
@@ -234,6 +398,9 @@ class PolicyMetric:
       raise ValueError("policy metric coverage identity must be lowercase SHA-256")
     if tuple(sorted(set(self.strata))) != self.strata:
       raise ValueError("policy metric strata must be unique and sorted")
+    stratum_names = tuple(metric.stratum for metric in self.stratum_metrics)
+    if stratum_names != tuple(sorted(set(stratum_names))) or stratum_names != self.strata:
+      raise ValueError("policy metric stratum evidence must exactly cover strata")
     if tuple(sorted(set(self.physical_failure_window_ids))) != self.physical_failure_window_ids:
       raise ValueError("physical failure window IDs must be unique and sorted")
     route_value_ids = tuple(route_id for route_id, _ in self.route_values)
@@ -272,6 +439,7 @@ class PolicyMetric:
       "weightedSupport": self.weighted_support,
       "coverageIdentitySha256": self.coverage_identity_sha256,
       "strata": list(self.strata),
+      "stratumMetrics": [metric.to_dict() for metric in self.stratum_metrics],
       "physicalFailureWindowIds": list(self.physical_failure_window_ids),
       "routeValues": [
         {"routeId": route_id, "value": value}
@@ -292,6 +460,7 @@ class PolicyMetric:
       "routeCount",
       "routeValues",
       "strata",
+      "stratumMetrics",
       "value",
       "weightedSupport",
       "windowCount",
@@ -313,6 +482,8 @@ class PolicyMetric:
       if type(value["routeId"]) is not str or type(value["value"]) not in (int, float):
         raise ValueError("policy metric route value has invalid types")
       route_values.append((value["routeId"], float(value["value"])))
+    if type(payload["stratumMetrics"]) is not list:
+      raise ValueError("policy metric stratumMetrics must be an array")
     for key in ("denominator", "routeCount", "windowCount"):
       if type(payload[key]) is not int:
         raise ValueError(f"policy metric {key} must be integer")
@@ -332,6 +503,10 @@ class PolicyMetric:
       weighted_support=float(payload["weightedSupport"]),
       coverage_identity_sha256=payload["coverageIdentitySha256"],
       strata=tuple(payload["strata"]),
+      stratum_metrics=tuple(
+        PolicyStratumMetric.from_dict(value)
+        for value in payload["stratumMetrics"]
+      ),
       physical_failure_window_ids=tuple(payload["physicalFailureWindowIds"]),
       route_values=tuple(route_values),
     )
@@ -346,11 +521,28 @@ class PolicyMetric:
     name: BehaviorMetricName,
   ) -> PolicyMetric:
     aggregate = next(metric for metric in scorecard.balanced_metrics if metric.name is name)
-    strata = tuple(sorted(
-      f"{stratum.key.speed_node_mps:g}:{stratum.key.maneuver_class.value}"
-      for stratum in scorecard.strata
-      if next(metric for metric in stratum.metrics if metric.name is name).defined
+    stratum_metrics = tuple(sorted(
+      (
+        PolicyStratumMetric(
+          stratum=f"{stratum.key.speed_node_mps:g}:{stratum.key.maneuver_class.value}",
+          value=value.value,
+          disposition=value.disposition,
+          exclusions=value.exclusions,
+          route_count=value.route_count,
+          window_count=value.window_count,
+          weighted_support=value.weighted_support,
+          coverage_identity_sha256=value.coverage_identity_sha256,
+          physical_failure_window_ids=value.physical_failure_window_ids,
+          coverage_excluded_window_ids=value.coverage_excluded_window_ids,
+          not_applicable_window_ids=value.not_applicable_window_ids,
+          route_values=value.route_values,
+        )
+        for stratum in scorecard.strata
+        for value in (next(metric for metric in stratum.metrics if metric.name is name),)
+      ),
+      key=lambda metric: metric.stratum,
     ))
+    strata = tuple(metric.stratum for metric in stratum_metrics)
     return cls(
       name=name.value,
       value=aggregate.value,
@@ -361,6 +553,7 @@ class PolicyMetric:
       weighted_support=aggregate.weighted_support,
       coverage_identity_sha256=aggregate.coverage_identity_sha256,
       strata=strata,
+      stratum_metrics=stratum_metrics,
       physical_failure_window_ids=aggregate.physical_failure_window_ids,
       route_values=aggregate.route_values,
     )
@@ -715,8 +908,8 @@ class CandidateGateVerdict:
 
 
 def _paired_route_uncertainty(
-  candidate: PolicyMetric,
-  reference: PolicyMetric,
+  candidate: PolicyMetric | PolicyStratumMetric,
+  reference: PolicyMetric | PolicyStratumMetric,
   preference: MetricPreference,
   method: str,
   minimum_paired_route_count: int,
@@ -770,107 +963,115 @@ def _metric_margin(
   minimum_paired_route_count: int,
 ) -> MetricGateVerdict:
   reasons: list[str] = []
-  if candidate.physical_failure_window_ids:
-    reasons.extend(
-      f"candidate_physical_unscoreable:{window_id}"
-      for window_id in candidate.physical_failure_window_ids
-    )
-  identities = {
-    candidate.coverage_identity_sha256,
-    stock.coverage_identity_sha256,
-    accepted.coverage_identity_sha256,
-  }
-  if len(identities) != 1:
-    reasons.append("candidate_reference_coverage_mismatch")
-  for label, metric in (
-    ("candidate", candidate),
-    ("stock", stock),
-    ("accepted", accepted),
-  ):
-    if metric.route_count < rule.minimum_route_count:
-      reasons.append(f"{label}_route_coverage_below_minimum")
-    if metric.window_count < rule.minimum_window_count:
-      reasons.append(f"{label}_window_coverage_below_minimum")
-    if metric.weighted_support < rule.minimum_weighted_support:
-      reasons.append(f"{label}_weighted_support_below_minimum")
-    missing_strata = tuple(sorted(set(rule.required_strata) - set(metric.strata)))
-    reasons.extend(f"{label}_missing_required_stratum:{value}" for value in missing_strata)
-  if reasons:
-    return MetricGateVerdict(
-      metric_name=rule.metric_name,
-      contract=rule.contract,
-      passed=False,
-      margin=None,
-      reasons=tuple(reasons),
-    )
-  if not candidate.defined:
-    return MetricGateVerdict(
-      metric_name=rule.metric_name,
-      contract=rule.contract,
-      passed=False,
-      margin=None,
-      reasons=("candidate_metric_undefined", *candidate.exclusions),
-    )
-  if not stock.defined or not accepted.defined:
-    missing = (
-      *(("stock_metric_undefined",) if not stock.defined else ()),
-      *(("accepted_metric_undefined",) if not accepted.defined else ()),
-    )
-    return MetricGateVerdict(
-      metric_name=rule.metric_name,
-      contract=rule.contract,
-      passed=False,
-      margin=None,
-      reasons=missing,
-    )
-  assert candidate.value is not None
-  assert stock.value is not None
-  assert accepted.value is not None
-  stock_pair, stock_pair_error = _paired_route_uncertainty(
-    candidate,
-    stock,
-    rule.preference,
-    paired_uncertainty_method,
-    minimum_paired_route_count,
-  )
-  accepted_pair, accepted_pair_error = _paired_route_uncertainty(
-    candidate,
-    accepted,
-    rule.preference,
-    paired_uncertainty_method,
-    minimum_paired_route_count,
-  )
-  if stock_pair_error is not None:
-    reasons.append(f"stock_{stock_pair_error}")
-  if accepted_pair_error is not None:
-    reasons.append(f"accepted_{accepted_pair_error}")
-  if reasons:
-    return MetricGateVerdict(
-      metric_name=rule.metric_name,
-      contract=rule.contract,
-      passed=False,
-      margin=None,
-      reasons=tuple(reasons),
-      paired_against_stock=stock_pair,
-      paired_against_accepted=accepted_pair,
-    )
-  assert stock_pair is not None
-  assert accepted_pair is not None
   margins: list[float] = []
-  if rule.minimum_allowed is not None:
-    margins.append((candidate.value - rule.minimum_allowed) / rule.margin_normalization)
-    if candidate.value < rule.minimum_allowed:
-      reasons.append("below_absolute_minimum")
-  if rule.maximum_allowed is not None:
-    margins.append((rule.maximum_allowed - candidate.value) / rule.margin_normalization)
-    if candidate.value > rule.maximum_allowed:
-      reasons.append("above_absolute_maximum")
-  for label, paired in (("stock", stock_pair), ("accepted", accepted_pair)):
-    comparison = paired.lower + rule.noise_floor
-    margins.append(comparison / rule.margin_normalization)
-    if paired.lower < -rule.noise_floor:
-      reasons.append(f"regressed_vs_{label}")
-  margin = min(margins) if margins else 0.0
+  candidate_strata = {metric.stratum: metric for metric in candidate.stratum_metrics}
+  stock_strata = {metric.stratum: metric for metric in stock.stratum_metrics}
+  accepted_strata = {metric.stratum: metric for metric in accepted.stratum_metrics}
+
+  all_strata = tuple(sorted(
+    set(candidate_strata) | set(stock_strata) | set(accepted_strata) | set(rule.required_strata),
+  ))
+  for stratum in all_strata:
+    values = (
+      ("candidate", candidate_strata.get(stratum)),
+      ("stock", stock_strata.get(stratum)),
+      ("accepted", accepted_strata.get(stratum)),
+    )
+    required = stratum in rule.required_strata
+    if not required and all(
+      metric is not None and metric.disposition is MetricDisposition.NOT_APPLICABLE
+      for _, metric in values
+    ):
+      continue
+    stratum_failed = False
+    for label, metric in values:
+      if metric is None:
+        reason = "missing_required_stratum" if required else "missing_stratum"
+        reasons.append(f"{stratum}:{label}_{reason}")
+        stratum_failed = True
+        continue
+      if metric.route_count < rule.minimum_route_count:
+        reasons.append(f"{stratum}:{label}_route_coverage_below_minimum")
+        stratum_failed = True
+      if metric.window_count < rule.minimum_window_count:
+        reasons.append(f"{stratum}:{label}_window_coverage_below_minimum")
+        stratum_failed = True
+      if metric.weighted_support < rule.minimum_weighted_support:
+        reasons.append(f"{stratum}:{label}_weighted_support_below_minimum")
+        stratum_failed = True
+      if metric.physical_failure_window_ids:
+        reasons.extend(
+          f"{stratum}:{label}_physical_unscoreable:{window_id}"
+          for window_id in metric.physical_failure_window_ids
+        )
+        stratum_failed = True
+      if not metric.defined:
+        reasons.extend(
+          f"{stratum}:{label}_metric_undefined:{reason}"
+          for reason in metric.exclusions
+        )
+        stratum_failed = True
+    if stratum_failed:
+      continue
+    candidate_value = values[0][1]
+    stock_value = values[1][1]
+    accepted_value = values[2][1]
+    assert candidate_value is not None and candidate_value.value is not None
+    assert stock_value is not None and accepted_value is not None
+    if len({
+      candidate_value.coverage_identity_sha256,
+      stock_value.coverage_identity_sha256,
+      accepted_value.coverage_identity_sha256,
+    }) != 1:
+      reasons.append(f"{stratum}:candidate_reference_coverage_mismatch")
+      continue
+    if rule.minimum_allowed is not None:
+      margins.append(
+        (candidate_value.value - rule.minimum_allowed) / rule.margin_normalization,
+      )
+      if candidate_value.value < rule.minimum_allowed:
+        reasons.append(f"{stratum}:below_absolute_minimum")
+    if rule.maximum_allowed is not None:
+      margins.append(
+        (rule.maximum_allowed - candidate_value.value) / rule.margin_normalization,
+      )
+      if candidate_value.value > rule.maximum_allowed:
+        reasons.append(f"{stratum}:above_absolute_maximum")
+    for label, reference in (("stock", stock_value), ("accepted", accepted_value)):
+      paired, error = _paired_route_uncertainty(
+        candidate_value,
+        reference,
+        rule.preference,
+        paired_uncertainty_method,
+        minimum_paired_route_count,
+      )
+      if error is not None:
+        reasons.append(f"{stratum}:{label}_{error}")
+        continue
+      assert paired is not None
+      comparison = paired.lower + rule.noise_floor
+      margins.append(comparison / rule.margin_normalization)
+      if paired.lower < -rule.noise_floor:
+        reasons.append(f"{stratum}:regressed_vs_{label}")
+
+  stock_pair = None
+  accepted_pair = None
+  if candidate.defined and stock.defined and accepted.defined:
+    stock_pair, _ = _paired_route_uncertainty(
+      candidate,
+      stock,
+      rule.preference,
+      paired_uncertainty_method,
+      minimum_paired_route_count,
+    )
+    accepted_pair, _ = _paired_route_uncertainty(
+      candidate,
+      accepted,
+      rule.preference,
+      paired_uncertainty_method,
+      minimum_paired_route_count,
+    )
+  margin = min(margins) if margins else None
   return MetricGateVerdict(
     metric_name=rule.metric_name,
     contract=rule.contract,
@@ -1014,9 +1215,8 @@ def evaluate_candidate(
     if len(target_pairs) == 2
     else None
   )
-  # Stock remains the permanent minimum bar after a modular policy has been
-  # accepted. A later candidate must materially improve the declared target
-  # against both stock and that incumbent on the current route population.
+  # The balanced target remains a ranking diagnostic. Acceptance is decided
+  # only by the independently validated speed-by-maneuver contract strata.
   target_material = len(target_pairs) == 2 and all(
     pair.lower > target_rule.noise_floor
     for pair in target_pairs
@@ -1040,7 +1240,7 @@ def evaluate_candidate(
         for pair in target_pairs
       ),
     )
-  passed = all(contract.passed for contract in contract_verdicts) and target_material
+  passed = all(contract.passed for contract in contract_verdicts)
   gate_spec_sha256 = hashlib.sha256(canonical_json({
     "rules": [rule.to_dict() for rule in ordered_rules],
     "minimumPairedRouteCount": minimum_paired_route_count,

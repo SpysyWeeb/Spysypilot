@@ -226,14 +226,14 @@ equal-timestamp ties.
 
 Every eligible batch is replayed in two fresh runtimes and must produce
 byte-identical evidence, manifest, selected profile, optional learned
-candidate, counters, ledger entries, and complete `BLATRE02` route artifacts.
+candidate, counters, ledger entries, and complete `BLATRE04` route artifacts.
 Publication stages immutable, content-addressed artifacts and changes readers
 with one atomic `CURRENT` pointer replacement. The SHA-bound ledger provides
 exactly-once route ownership and rejects changed content for an already known
 route.
 
-Each A/A authority decodes each full rlog once into its own `BLATRE02`
-version-2 artifact. The artifact contains the physical frame plane once plus
+Each A/A authority decodes each full rlog once into its own `BLATRE04`
+version-4 artifact. The artifact contains the physical frame plane once plus
 model, controls, torque, delay, maneuver, and event planes, so behavior replay
 does not decode the raw route again. Four production lanes are the two
 independent causal authority owners plus one private preparation helper per
@@ -264,16 +264,21 @@ is rebuilt twice from fresh artifacts/cores and must be byte-identical. A safe
 failure publishes `stock_retained` with no policy file.
 
 `accepted_sample_count` means a valid hands-off measured-response frame
-incorporated into base, moving, breakaway, or authority evidence. Reachable driver-free full
-magnitude and maximum-slew boundaries are retained because `carOutput`
-records the actual CarController input to the rack. Slew rows are authority
+incorporated into base, moving, breakaway, or authority evidence. Reachable
+driver-free full magnitude and maximum-slew boundaries are retained when both
+the carried `carOutput` command and active EPS steering request are exact.
+Request-off rows preserve the command for behavior replay but cannot enter a
+physical fit. Slew rows are authority
 observations only; stationary full-torque rows likewise remain unresolved
 authority observations rather than equality-fit data.
 
 The replay retains distinct controls-witness, car-state response,
 `carOutput` report, and applied-command effective timestamps. Since `card.py`
 publishes `last_actuators_output` before applying its next output, a
-`carOutput` payload is effective at the preceding `carOutput` publication.
+`carOutput` payload is effective at the preceding `carOutput` publication. On
+reviewed historical Palisade builds, its request bit is the unique matching
+LKAS11 send between that preceding publication and the current report; the
+later send emitted after the current report belongs to the next payload.
 For rack response at time `t`, the input is the newest exact zero-order-held
 command effective at or before `t - transport_delay(speed)`. No future,
 interpolated, or same-frame command can enter the fit. Speed, mapping,
@@ -284,7 +289,7 @@ of settled command-side dwell and only when the rack is measurably moving.
 Every populated authority stratum can veto a regressing model. Authority rows
 alter the fit only after four training observations; that fitted use then
 requires four independent held-out observations before qualification.
-Driver-limited, lateral-inactive,
+Driver-limited, request-off, lateral-inactive,
 standstill, invalid/gapped, and physically unreachable transitions are
 excluded.
 
@@ -299,14 +304,14 @@ cross-frame direction.
 
 The committed identities are calibration profile/evidence/coordinator
 `3/14/14`, physical learning/operation/progress status `7/1/1`, native
-extractor/canonical join `4/3`, route evidence `BLATRE02` version `2`,
+extractor/canonical join `5/4`, route evidence `BLATRE04` version `4`,
 backfill ledger/commit/pointer `3/2/1`, controller policy `1`, and namespace
 `complete_full_rlog_authority_v7`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
 cross-architecture certification are `2/5`, and off-device display progress
 is `2`; these retired wire identities stay reserved. Future feedback/lifecycle and
-approved-artifact/selection/activation contracts are `2/2` and `5/2/1`.
+approved-artifact/selection/activation contracts are `2/2` and `7/2/1`.
 Older evidence is never
 reinterpreted or mixed silently.
 

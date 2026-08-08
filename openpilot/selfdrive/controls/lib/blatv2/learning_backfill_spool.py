@@ -1,4 +1,4 @@
-"""Scratch facade over the complete shared route-evidence v2 artifact.
+"""Scratch facade over the complete shared route-evidence v4 artifact.
 
 The former BLATSP01 physical-only spool is intentionally unsupported.  A
 worker now transports the exact RouteEvidenceArtifact bytes; calibration sees

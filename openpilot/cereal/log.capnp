@@ -1070,6 +1070,42 @@ struct ControlsState @0x97ff69c53601abf1 {
     modularManeuverForcedStock @184 :Bool;
     modularProductionEnvelopeVerified @185 :Bool;
     modularSelectionBound @186 :Bool;
+    modularHorizonPolicyHash @187 :Text;
+    modularPlannedTorque @188 :Float64;
+    modularPlannedCounts @189 :Int32;
+    modularReactiveTorque @190 :Float64;
+    modularReactiveCounts @191 :Int32;
+    modularRawRequestedCounts @192 :Int32;
+    modularRawToPlannedResidualCounts @193 :Int32;
+    modularRawToPlannedUnmetTorque @194 :Float64;
+    modularPreparationActive @195 :Bool;
+    modularPreparationScheduled @196 :Bool;
+    modularHorizonStatus @197 :UInt8;
+    modularHorizonValid @198 :Bool;
+    modularDriverSuppressed @199 :Bool;
+    modularFutureBandReachable @200 :Bool;
+    modularFirstUnreachableIndex @201 :Int16;
+    modularFirstUnreachableTimeSeconds @202 :Float64;
+    modularMaximumBandResidualCounts @203 :UInt16;
+    modularMaximumPathLeadDeg @204 :Float64;
+    modularMaximumPathRateLeadDegS @205 :Float64;
+    modularPathLeadConstrainedSamples @206 :UInt16;
+    modularMaximumAuthorityRequired @207 :Bool;
+    modularMaximumAuthorityActive @208 :Bool;
+    modularMaximumUrgency @209 :Float64;
+    modularPreviousCommandCounts @210 :Int32;
+    modularRecordedAppliedTorque @211 :Float64;
+    modularSteeringRequestActive @212 :Bool;
+    modularSteeringRequestValid @213 :Bool;
+    modularSteeringRequestFaultAvoidanceCounter @214 :UInt8;
+    modularControlCadenceValid @215 :Bool;
+    modularTransportReprimed @216 :Bool;
+    modularAdapterException @217 :Bool;
+    modularRawToPlannedConstrained @218 :Bool;
+    modularFinalExpectedCounts @219 :Int32;
+    modularFinalCountResidual @220 :Int32;
+    modularFinalCountMatchValid @221 :Bool;
+    modularFinalLimiterAltered @222 :Bool;
    }
 
   struct LateralAngleState {
@@ -3309,6 +3345,7 @@ struct BlatV2Shadow {
   modularControlWitnessMonoTime @155 :UInt64;
   modularStateAgeSeconds @156 :Float64;
   modularTotalPredictionHorizonSeconds @157 :Float64;
+  modularHorizonPolicyHash @158 :Text;
 }
 
 struct Touch {

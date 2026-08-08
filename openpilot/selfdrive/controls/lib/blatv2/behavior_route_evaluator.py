@@ -98,8 +98,8 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 )
 
 
-BEHAVIOR_ROUTE_PREPARATION_SCHEMA_VERSION = 2
-BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION = 4
+BEHAVIOR_ROUTE_PREPARATION_SCHEMA_VERSION = 3
+BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION = 5
 _RACK_ACCELERATION_MAXIMUM_GAP_NS = 15_000_000
 _MAXIMUM_ROUTE_POLICIES = 64
 
@@ -135,6 +135,9 @@ def _metric_set_dict(value: WindowMetricSet) -> dict[str, object]:
     "routeId": value.route_id,
     "sourceIdentitySha256": value.source_identity_sha256,
     "speedNodeSupport": [list(item) for item in value.speed_node_support],
+    "summaryMetricName": (
+      None if value.summary_metric_name is None else value.summary_metric_name.value
+    ),
     "windowId": value.window_id,
   }
 
@@ -628,9 +631,13 @@ def _target_sample(
       measured_rack_rate_deg_s=reference.desired_rack_rate_deg_s,
       measured_rack_accel_deg_s2=reference.desired_rack_accel_deg_s2,
       raw_requested_torque=0.0,
+      planned_requested_torque=0.0,
+      reachable_envelope_torque=0.0,
       envelope_applied_torque=0.0,
       torque_headroom=1.0,
       actuator_constrained=False,
+      steering_request_active=False,
+      maximum_authority_required=False,
       lateral_active=neutral.lateral_active,
       inputs_valid=neutral.inputs_valid,
       steering_pressed=neutral.steering_pressed,
@@ -731,9 +738,13 @@ def _response_sample(
       measured_rack_rate_deg_s=output.measured_rack_rate_deg_s,
       measured_rack_accel_deg_s2=output.measured_rack_accel_deg_s2,
       raw_requested_torque=output.raw_requested_torque,
+      planned_requested_torque=output.planned_requested_torque,
+      reachable_envelope_torque=output.reachable_envelope_torque,
       envelope_applied_torque=output.envelope_applied_torque,
       torque_headroom=output.torque_headroom,
       actuator_constrained=output.actuator_constrained,
+      steering_request_active=output.steering_request_active,
+      maximum_authority_required=output.maximum_authority_required,
       lateral_active=frame.control.lateral_active,
       inputs_valid=neutral.inputs_valid and output.response_eligible,
       steering_pressed=frame.control.steering_pressed,

@@ -1,6 +1,9 @@
 import math
 
-from openpilot.selfdrive.controls.lib.blatv2.actuator import RuntimeTorqueLimits
+from openpilot.selfdrive.controls.lib.blatv2.actuator import (
+  RuntimeTorqueLimits,
+  apply_torque_envelope,
+)
 from openpilot.selfdrive.controls.lib.blatv2.live_safety import (
   LiveSafetyState,
   InvalidOutputGuard,
@@ -18,13 +21,14 @@ def update(
   raw: float,
   applied: float,
   active: bool = True,
+  driver_torque: float = 0.0,
 ):
   return guard.update(
     active=active,
     core_ok=core_ok,
     raw_torque=raw,
     applied_torque=applied,
-    driver_torque=0.0,
+    driver_torque=driver_torque,
     limits=LIMITS,
   )
 
@@ -78,6 +82,27 @@ def test_invalid_holds_decays_and_latches_without_bypassing_down_rate():
     0 <= counts[index] - counts[index + 1] <= LIMITS.delta_down
     for index in range(len(counts) - 1)
   )
+
+
+def test_first_invalid_hold_uses_current_driver_envelope():
+  guard = InvalidOutputGuard(0.01)
+  held = 200 / LIMITS.steer_max
+  driver_torque = -200.0
+  expected = apply_torque_envelope(
+    LIMITS, held, held, driver_torque,
+  ).applied_torque
+
+  first = update(
+    guard,
+    core_ok=False,
+    raw=math.nan,
+    applied=held,
+    driver_torque=driver_torque,
+  )
+
+  assert first.state == LiveSafetyState.HOLDING_FIRST_INVALID
+  assert first.torque == expected
+  assert first.torque != held
 
 
 def test_ten_consecutive_ok_frames_clear_same_latch_and_resume_through_slew():

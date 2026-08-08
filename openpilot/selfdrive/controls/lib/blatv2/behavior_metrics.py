@@ -49,6 +49,15 @@ class BehaviorMetricName(StrEnum):
   DELIVERED_FRACTION = "delivered_curvature_fraction"
   COMPLETION = "maneuver_completion_fraction"
   GROWING_ERROR_UNUSED_HEADROOM = "growing_error_unused_headroom_fraction"
+  MIN_SIGNED_TURN_IN_LAG_S = "minimum_signed_delivered_turn_in_lag_s"
+  MAX_SIGNED_TURN_IN_LAG_S = "maximum_signed_delivered_turn_in_lag_s"
+  MIN_SIGNED_RELEASE_LAG_S = "minimum_signed_delivered_release_lag_s"
+  MAX_SIGNED_RELEASE_LAG_S = "maximum_signed_delivered_release_lag_s"
+  MIN_DELIVERED_FRACTION = "minimum_delivered_curvature_fraction"
+  MAX_DELIVERED_FRACTION = "maximum_delivered_curvature_fraction"
+  DELIVERED_ERROR_CROSSINGS_PER_S = "delivered_path_error_crossings_per_s"
+  HOLD_ERROR_CROSSINGS_PER_S = "hold_path_error_crossings_per_s"
+  MAXIMUM_AUTHORITY_SHORTFALL = "maximum_authority_shortfall"
 
 
 class MetricDisposition(StrEnum):
@@ -62,6 +71,7 @@ class MetricDisposition(StrEnum):
 
 class MetricReducer(StrEnum):
   POOLED_RMS = "pooled_rms"
+  MINIMUM = "minimum"
   MAXIMUM = "maximum"
   MEDIAN = "median"
   WEIGHTED_MEAN = "weighted_mean"
@@ -85,6 +95,15 @@ _CONTRACT_BY_METRIC = {
   BehaviorMetricName.DELIVERED_FRACTION: BehaviorContract.STRONG,
   BehaviorMetricName.COMPLETION: BehaviorContract.STRONG,
   BehaviorMetricName.GROWING_ERROR_UNUSED_HEADROOM: BehaviorContract.STRONG,
+  BehaviorMetricName.MIN_SIGNED_TURN_IN_LAG_S: BehaviorContract.SWIFT,
+  BehaviorMetricName.MAX_SIGNED_TURN_IN_LAG_S: BehaviorContract.SWIFT,
+  BehaviorMetricName.MIN_SIGNED_RELEASE_LAG_S: BehaviorContract.SWIFT,
+  BehaviorMetricName.MAX_SIGNED_RELEASE_LAG_S: BehaviorContract.SWIFT,
+  BehaviorMetricName.MIN_DELIVERED_FRACTION: BehaviorContract.STRONG,
+  BehaviorMetricName.MAX_DELIVERED_FRACTION: BehaviorContract.STRONG,
+  BehaviorMetricName.DELIVERED_ERROR_CROSSINGS_PER_S: BehaviorContract.SMOOTH,
+  BehaviorMetricName.HOLD_ERROR_CROSSINGS_PER_S: BehaviorContract.SMOOTH,
+  BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL: BehaviorContract.STRONG,
 }
 
 _REDUCER_BY_METRIC = {
@@ -105,7 +124,28 @@ _REDUCER_BY_METRIC = {
   BehaviorMetricName.DELIVERED_FRACTION: MetricReducer.WEIGHTED_MEAN,
   BehaviorMetricName.COMPLETION: MetricReducer.WEIGHTED_MEAN,
   BehaviorMetricName.GROWING_ERROR_UNUSED_HEADROOM: MetricReducer.WEIGHTED_MEAN,
+  BehaviorMetricName.MIN_SIGNED_TURN_IN_LAG_S: MetricReducer.MINIMUM,
+  BehaviorMetricName.MAX_SIGNED_TURN_IN_LAG_S: MetricReducer.MAXIMUM,
+  BehaviorMetricName.MIN_SIGNED_RELEASE_LAG_S: MetricReducer.MINIMUM,
+  BehaviorMetricName.MAX_SIGNED_RELEASE_LAG_S: MetricReducer.MAXIMUM,
+  BehaviorMetricName.MIN_DELIVERED_FRACTION: MetricReducer.MINIMUM,
+  BehaviorMetricName.MAX_DELIVERED_FRACTION: MetricReducer.MAXIMUM,
+  BehaviorMetricName.DELIVERED_ERROR_CROSSINGS_PER_S: MetricReducer.MAXIMUM,
+  BehaviorMetricName.HOLD_ERROR_CROSSINGS_PER_S: MetricReducer.MAXIMUM,
+  BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL: MetricReducer.MAXIMUM,
 }
+
+_ALL_WINDOW_METRICS = frozenset((
+  BehaviorMetricName.MIN_SIGNED_TURN_IN_LAG_S,
+  BehaviorMetricName.MAX_SIGNED_TURN_IN_LAG_S,
+  BehaviorMetricName.MIN_SIGNED_RELEASE_LAG_S,
+  BehaviorMetricName.MAX_SIGNED_RELEASE_LAG_S,
+  BehaviorMetricName.MIN_DELIVERED_FRACTION,
+  BehaviorMetricName.MAX_DELIVERED_FRACTION,
+  BehaviorMetricName.DELIVERED_ERROR_CROSSINGS_PER_S,
+  BehaviorMetricName.HOLD_ERROR_CROSSINGS_PER_S,
+  BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL,
+))
 
 
 def behavior_metric_contract(name: str | BehaviorMetricName) -> BehaviorContract:
@@ -240,7 +280,14 @@ class WindowMetricSet:
   speed_node_support: tuple[tuple[float, float], ...]
   clean_sample_count: int
   intervention_mono_time_ns: int | None
+  summary_metric_name: BehaviorMetricName | None
   metrics: tuple[MetricValue, ...]
+
+  def __post_init__(self) -> None:
+    if tuple(metric.name for metric in self.metrics) != tuple(BehaviorMetricName):
+      raise ValueError("window metric registry is incomplete or non-canonical")
+    if self.summary_metric_name is not None and self.summary_metric_name not in _ALL_WINDOW_METRICS:
+      raise ValueError("window summary metric is not an all-window metric")
 
   def metric(self, name: BehaviorMetricName) -> MetricValue:
     return next(metric for metric in self.metrics if metric.name is name)
@@ -333,6 +380,9 @@ class BehaviorScorecard:
           "phase": window.phase.value,
           "routeId": window.route_id,
           "sourceIdentitySha256": window.source_identity_sha256,
+          "summaryMetricName": (
+            None if window.summary_metric_name is None else window.summary_metric_name.value
+          ),
           "windowId": window.window_id,
         }
         for window in self.windows
@@ -811,6 +861,86 @@ def _delivered_and_completion(
   )
 
 
+def _as_metric(name: BehaviorMetricName, metric: MetricValue) -> MetricValue:
+  return _metric(
+    name,
+    metric.value,
+    metric.denominator,
+    *metric.exclusions,
+    disposition=metric.disposition,
+  )
+
+
+def _error_crossings(
+  name: BehaviorMetricName,
+  samples: _SampleSeries,
+  hysteresis_1pm: float,
+  phase: ManeuverPhase,
+) -> MetricValue:
+  if name is BehaviorMetricName.HOLD_ERROR_CROSSINGS_PER_S and phase is not ManeuverPhase.HOLD:
+    return _metric(name, None, 0, "not_hold_phase")
+  if samples.first is None or samples.last is None or samples.count < 2:
+    return _metric(name, None, 0, "insufficient_duration")
+  state = 0
+  crossings = 0
+  observations = 0
+  for sample in samples:
+    error = sample.measured_curvature_1pm - sample.anchored_curvature_1pm
+    next_state = 1 if error >= hysteresis_1pm else -1 if error <= -hysteresis_1pm else state
+    if state and next_state != state:
+      crossings += 1
+    if next_state:
+      observations += 1
+    state = next_state
+  duration_s = samples.last.route_time_s - samples.first.route_time_s
+  if duration_s <= 0.0:
+    return _metric(name, None, 0, "insufficient_duration")
+  return _metric(name, crossings / duration_s, observations)
+
+
+def _maximum_authority_shortfall(samples: _SampleSeries) -> MetricValue:
+  worst = 0.0
+  eligible = 0
+  suppressed = 0
+  for sample in samples:
+    if not sample.maximum_authority_required:
+      continue
+    direction = (sample.raw_requested_torque > 0.0) - (sample.raw_requested_torque < 0.0)
+    if direction == 0 or not sample.steering_request_active:
+      suppressed += 1
+      continue
+    worst = max(
+      worst,
+      direction * (
+        sample.reachable_envelope_torque - sample.planned_requested_torque
+      ),
+      direction * (
+        sample.reachable_envelope_torque - sample.envelope_applied_torque
+      ),
+    )
+    eligible += 1
+  if suppressed:
+    return _metric(
+      BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL,
+      None,
+      suppressed,
+      "request_suppressed_maximum_authority",
+      disposition=MetricDisposition.PHYSICAL_UNSCOREABLE,
+    )
+  if not eligible:
+    return _metric(
+      BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL,
+      None,
+      0,
+      "not_maximum_authority_demand",
+    )
+  return _metric(
+    BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL,
+    max(0.0, worst),
+    eligible,
+  )
+
+
 def _unused_headroom(
   samples: _SampleSeries,
   headroom_threshold: float,
@@ -887,6 +1017,8 @@ def score_sample_view(
       clean,
       config.completion_delivered_fraction,
     )
+    turn_in_lag = _turn_in_lag(clean, phase, config.turn_in_crossing_fraction)
+    release_lag = _release_lag(clean, phase, config.release_crossing_fraction)
     metrics = (
       _rate_rms(BehaviorMetricName.RAW_TORQUE_RATE_RMS, clean, "raw_requested_torque"),
       _rate_rms(BehaviorMetricName.APPLIED_TORQUE_RATE_RMS, clean, "envelope_applied_torque"),
@@ -905,8 +1037,8 @@ def score_sample_view(
         config.chatter_torque_rate_threshold_per_s,
       ),
       _release_overshoot(clean, phase),
-      _turn_in_lag(clean, phase, config.turn_in_crossing_fraction),
-      _release_lag(clean, phase, config.release_crossing_fraction),
+      turn_in_lag,
+      release_lag,
       _correction_latency(clean, config.correction_curvature_threshold_1pm),
       _rate_error(clean),
       _integrated_error(clean),
@@ -919,6 +1051,25 @@ def score_sample_view(
         config.unused_headroom_threshold,
         config.growing_error_epsilon_1pm,
       ),
+      _as_metric(BehaviorMetricName.MIN_SIGNED_TURN_IN_LAG_S, turn_in_lag),
+      _as_metric(BehaviorMetricName.MAX_SIGNED_TURN_IN_LAG_S, turn_in_lag),
+      _as_metric(BehaviorMetricName.MIN_SIGNED_RELEASE_LAG_S, release_lag),
+      _as_metric(BehaviorMetricName.MAX_SIGNED_RELEASE_LAG_S, release_lag),
+      _as_metric(BehaviorMetricName.MIN_DELIVERED_FRACTION, delivered),
+      _as_metric(BehaviorMetricName.MAX_DELIVERED_FRACTION, delivered),
+      _error_crossings(
+        BehaviorMetricName.DELIVERED_ERROR_CROSSINGS_PER_S,
+        clean,
+        config.correction_curvature_threshold_1pm,
+        phase,
+      ),
+      _error_crossings(
+        BehaviorMetricName.HOLD_ERROR_CROSSINGS_PER_S,
+        clean,
+        config.correction_curvature_threshold_1pm,
+        phase,
+      ),
+      _maximum_authority_shortfall(clean),
     )
   return WindowMetricSet(
     route_id=route_id,
@@ -930,6 +1081,7 @@ def score_sample_view(
     speed_node_support=speed_node_support,
     clean_sample_count=clean.count,
     intervention_mono_time_ns=intervention_mono_time_ns,
+    summary_metric_name=None,
     metrics=metrics,
   )
 
@@ -968,6 +1120,84 @@ def speed_node_weights(
   raise AssertionError("increasing speed nodes must bracket finite speed")
 
 
+@dataclass(slots=True)
+class _AllWindowExtremum:
+  route_id: str
+  source_identity_sha256: str
+  key: StratumKey
+  name: BehaviorMetricName
+  value: float | None = None
+  defined_count: int = 0
+  defined_support: float = 0.0
+  population_support: float = 0.0
+  physical_count: int = 0
+  coverage_count: int = 0
+  physical_reasons: tuple[str, ...] = ()
+  coverage_reasons: tuple[str, ...] = ()
+
+  def update(self, metric: MetricValue, weight: float) -> None:
+    self.population_support += weight
+    if metric.disposition is MetricDisposition.PHYSICAL_UNSCOREABLE:
+      self.physical_count += 1
+      self.physical_reasons = tuple(sorted(set(self.physical_reasons) | set(metric.exclusions)))
+    elif metric.disposition is MetricDisposition.COVERAGE_EXCLUDED:
+      self.coverage_count += 1
+      self.coverage_reasons = tuple(sorted(set(self.coverage_reasons) | set(metric.exclusions)))
+    elif metric.disposition is MetricDisposition.DEFINED:
+      assert metric.value is not None
+      reducer = _REDUCER_BY_METRIC[self.name]
+      if self.value is None:
+        self.value = metric.value
+      elif reducer is MetricReducer.MINIMUM:
+        self.value = min(self.value, metric.value)
+      else:
+        self.value = max(self.value, metric.value)
+      self.defined_count += 1
+      self.defined_support += weight
+
+  def window(self) -> WindowMetricSet:
+    applicable_count = self.defined_count + self.coverage_count + self.physical_count
+    if self.physical_count:
+      summary = _metric(
+        self.name,
+        None,
+        applicable_count,
+        *tuple(sorted(set(self.physical_reasons) | set(self.coverage_reasons))),
+        disposition=MetricDisposition.PHYSICAL_UNSCOREABLE,
+      )
+    elif self.coverage_count:
+      summary = _metric(
+        self.name,
+        None,
+        applicable_count,
+        *self.coverage_reasons,
+        disposition=MetricDisposition.COVERAGE_EXCLUDED,
+      )
+    elif self.value is not None:
+      summary = _metric(self.name, self.value, self.defined_count)
+    else:
+      summary = _metric(self.name, None, 0, "not_applicable_in_route_stratum")
+    support = self.defined_support if summary.defined else self.population_support
+    return WindowMetricSet(
+      route_id=self.route_id,
+      window_id=f"all-window:{self.key.speed_node_mps:g}:{self.key.maneuver_class.value}:{self.name.value}",
+      source_identity_sha256=self.source_identity_sha256,
+      maneuver_class=self.key.maneuver_class,
+      phase=ManeuverPhase.HOLD,
+      mean_speed_mps=self.key.speed_node_mps,
+      speed_node_support=((self.key.speed_node_mps, support),),
+      clean_sample_count=summary.denominator,
+      intervention_mono_time_ns=None,
+      summary_metric_name=self.name,
+      metrics=tuple(
+        summary
+        if name is self.name
+        else _metric(name, None, 0, "not_summary_metric")
+        for name in BehaviorMetricName
+      ),
+    )
+
+
 def retain_route_metric_windows(
   windows: Iterable[WindowMetricSet],
   config: BehaviorMetricConfig,
@@ -983,7 +1213,24 @@ def retain_route_metric_windows(
     tuple[str, StratumKey],
     list[tuple[tuple[bytes, str], WindowMetricSet]],
   ] = {}
+  extrema: dict[tuple[str, StratumKey, BehaviorMetricName], _AllWindowExtremum] = {}
+  summaries: dict[tuple[str, StratumKey, BehaviorMetricName], WindowMetricSet] = {}
   for window in windows:
+    if window.summary_metric_name is not None:
+      if len(window.speed_node_support) != 1:
+        raise ValueError("all-window summary must identify exactly one speed node")
+      speed_node_mps, weight = window.speed_node_support[0]
+      if weight <= 0.0:
+        raise ValueError("all-window summary support must be positive")
+      key = (
+        window.route_id,
+        StratumKey(speed_node_mps, window.maneuver_class),
+        window.summary_metric_name,
+      )
+      if key in summaries:
+        raise ValueError("duplicate all-window summary")
+      summaries[key] = window
+      continue
     selection_key = (
       hashlib.sha256(f"{window.route_id}\0{window.window_id}".encode()).digest(),
       window.window_id,
@@ -1000,11 +1247,31 @@ def retain_route_metric_windows(
       bucket.sort(key=lambda item: item[0])
       if len(bucket) > config.maximum_route_windows_per_stratum:
         bucket.pop()
+      for name in _ALL_WINDOW_METRICS:
+        summary_key = (window.route_id, key[1], name)
+        accumulator = extrema.get(summary_key)
+        if accumulator is None:
+          accumulator = _AllWindowExtremum(
+            route_id=window.route_id,
+            source_identity_sha256=window.source_identity_sha256,
+            key=key[1],
+            name=name,
+          )
+          extrema[summary_key] = accumulator
+        elif accumulator.source_identity_sha256 != window.source_identity_sha256:
+          raise ValueError("route stratum mixes source identities")
+        accumulator.update(window.metric(name), weight)
   retained = {
     (window.route_id, window.window_id): window
     for bucket in buckets.values()
     for _, window in bucket
   }
+  for key, accumulator in extrema.items():
+    summaries.setdefault(key, accumulator.window())
+  retained.update(
+    ((window.route_id, window.window_id), window)
+    for window in summaries.values()
+  )
   return tuple(sorted(retained.values(), key=lambda value: (value.route_id, value.window_id)))
 
 
@@ -1032,6 +1299,11 @@ def _aggregate_stratum(
           (window, weight)
           for window, weight in weighted_windows
           if window.route_id == route_id
+          and (
+            window.summary_metric_name is name
+            if name in _ALL_WINDOW_METRICS
+            else window.summary_metric_name is None
+          )
         ),
         key=lambda item: (
           hashlib.sha256(
@@ -1040,7 +1312,11 @@ def _aggregate_stratum(
           item[0].window_id,
         ),
       )
-      selected = tuple(route_windows[:cap])
+      selected = tuple(
+        route_windows
+        if name in _ALL_WINDOW_METRICS
+        else route_windows[:cap]
+      )
       defined: list[tuple[float, float, int]] = []
       route_physical = False
       for window, weight in selected:
@@ -1054,10 +1330,14 @@ def _aggregate_stratum(
         elif metric.disposition is MetricDisposition.PHYSICAL_UNSCOREABLE:
           physical_ids.append(identity)
           reasons.extend(f"{identity}:{reason}" for reason in metric.exclusions)
+          if name in _ALL_WINDOW_METRICS:
+            used_windows += metric.denominator
           route_physical = True
         elif metric.disposition is MetricDisposition.COVERAGE_EXCLUDED:
           coverage_ids.append(identity)
           reasons.extend(f"{identity}:{reason}" for reason in metric.exclusions)
+          if name in _ALL_WINDOW_METRICS:
+            used_windows += metric.denominator
         else:
           not_applicable_ids.append(identity)
       if route_physical:
@@ -1065,7 +1345,11 @@ def _aggregate_stratum(
       if defined:
         route_values.append(_reduce_values(name, tuple(defined)))
         used_route_ids.append(route_id)
-        used_windows += len(defined)
+        used_windows += (
+          sum(denominator for _, _, denominator in defined)
+          if name in _ALL_WINDOW_METRICS
+          else len(defined)
+        )
         weighted_support += math.fsum(weight for _, weight, _ in defined)
     disposition = _aggregate_disposition(
       route_values,
@@ -1123,6 +1407,8 @@ def _reduce_values(
   values: tuple[tuple[float, float, int], ...],
 ) -> float:
   reducer = _REDUCER_BY_METRIC[name]
+  if reducer is MetricReducer.MINIMUM:
+    return min(value for value, _, _ in values)
   if reducer is MetricReducer.MAXIMUM:
     return max(value for value, _, _ in values)
   if reducer is MetricReducer.MEDIAN:
@@ -1144,6 +1430,8 @@ def _reduce_route_values(
   values: tuple[float, ...],
 ) -> float:
   reducer = _REDUCER_BY_METRIC[name]
+  if reducer is MetricReducer.MINIMUM:
+    return min(values)
   if reducer is MetricReducer.MAXIMUM:
     return max(values)
   if reducer is MetricReducer.MEDIAN:
@@ -1166,10 +1454,10 @@ def _aggregate_disposition(
 ) -> MetricDisposition:
   if physical_ids:
     return MetricDisposition.PHYSICAL_UNSCOREABLE
-  if defined_values:
-    return MetricDisposition.DEFINED
   if coverage_ids:
     return MetricDisposition.COVERAGE_EXCLUDED
+  if defined_values:
+    return MetricDisposition.DEFINED
   return MetricDisposition.NOT_APPLICABLE
 
 
@@ -1237,10 +1525,10 @@ def aggregate_behavior_metrics(
     }))
     if physical_ids:
       disposition = MetricDisposition.PHYSICAL_UNSCOREABLE
-    elif defined:
-      disposition = MetricDisposition.DEFINED
     elif coverage_ids:
       disposition = MetricDisposition.COVERAGE_EXCLUDED
+    elif defined:
+      disposition = MetricDisposition.DEFINED
     else:
       disposition = MetricDisposition.NOT_APPLICABLE
     route_ids = tuple(sorted({

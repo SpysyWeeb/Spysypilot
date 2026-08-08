@@ -1,7 +1,7 @@
 # BLaTv2 — modular adaptive lateral control
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot),
-created from the current untouched `stock` tip.
+created from an untouched `stock` tip.
 
 ## Status
 
@@ -21,6 +21,27 @@ reports turn-in, unwind, direction, and speed strata separately. A study result
 cannot create an approved artifact. The exact provisional candidate can run
 only through a Palisade-only development parameter read at controls startup,
 and this item remains in progress until the owner completes a field test.
+
+**Two-second predictive controller — in progress.** The current one-time
+inverse request is being replaced with one bounded receding-horizon controller
+that consumes the model's native two-second curvature plan, predicts the
+Palisade rack response, and selects its next command inside the exact production
+torque envelope. Near-horizon path tracking remains the objective; farther
+samples may prepare reachable authority but may not move the path earlier to
+hide delay. This item remains in progress until replay, safety, timing, and
+owner field testing are complete.
+
+Controls startup keeps separate horizon-policy sources: the provisional policy
+is used only by the explicit development trial, while the approved source path
+is currently absent and therefore fails closed. Approval schema v7 also retires
+the caller-supplied external-safety Boolean: no authenticated safety/owner
+authority exists yet, so persisted production activation fails closed. The
+explicit Palisade development parameter remains the only field-test path.
+
+The exact f3 stock-reference and f4 prior-BLaTv2 raw routes are retained in
+`openpilot/selfdrive/controls/lib/blatv2/development_baselines.json`. Their
+pull-manifest hashes transitively pin every segment; the ledger grants neither
+recorded-controller nor scenario authority.
 
 This branch replaces the previous BLaTv2 controller architecture. Git history
 and useful test infrastructure remain available for audit, but no previous

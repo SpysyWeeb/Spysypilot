@@ -44,11 +44,16 @@ from openpilot.selfdrive.controls.lib.blatv2.core import (
   CoreResult,
   ModularControllerCore,
 )
+from openpilot.selfdrive.controls.lib.blatv2.horizon import HorizonPolicy
 from openpilot.selfdrive.controls.lib.blatv2.intent import (
   INTENT_CAPACITY,
   IntentAdaptation,
   IntentBuildStatus,
   adapt_model_intent_into,
+)
+from openpilot.selfdrive.controls.lib.blatv2.live_adapter import (
+  exact_applied_torque_counts,
+  exact_steering_request_state,
 )
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
@@ -61,7 +66,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 )
 
 
-MODULAR_SHADOW_SCHEMA_VERSION = 2
+MODULAR_SHADOW_SCHEMA_VERSION = 3
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -74,6 +79,7 @@ SUBSCRIBED_SERVICES = (
 )
 PROVISIONAL_RACK_DYNAMICS_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_rack_dynamics.json"
 PROVISIONAL_POLICY_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_controller_policy.json"
+PROVISIONAL_HORIZON_POLICY_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_horizon_policy.json"
 MAX_RACK_DERIVATIVE_GAP_S = 0.015
 RECORDED_ACTUATOR_CONSTRAINT_TOLERANCE = 1e-2
 _CONTROLLER_LIMIT_FIELDS = (
@@ -289,12 +295,14 @@ class ModularShadowRunner:
     controller_params: object,
     runtime_bundle: RuntimeVehicleBundle,
     policy: ControllerPolicy,
+    horizon_policy: HorizonPolicy,
   ) -> None:
     self.car_params = car_params
     self.car_interface = car_interface
     self.controller_params = controller_params
     self.runtime_bundle = runtime_bundle
     self.policy = policy
+    self.horizon_policy = horizon_policy
     self.profile = runtime_bundle.seed_profile
     self.vehicle_model = VehicleModel(car_params)
     self.core = ModularControllerCore(
@@ -303,6 +311,8 @@ class ModularShadowRunner:
       tracking_policy=policy.tracking_policy,
       observer_policy=policy.observer_policy,
       nominal_mapping=runtime_bundle.nominal_rack_mapping,
+      runtime_limits=runtime_bundle.torque_limits,
+      horizon_policy=horizon_policy,
       plan_capacity=INTENT_CAPACITY,
     )
 
@@ -314,6 +324,7 @@ class ModularShadowRunner:
 
     self.runtime_vehicle_identity_hash = runtime_bundle.identity_sha256
     self.policy_hash = policy.sha256
+    self.horizon_policy_hash = horizon_policy.sha256
     self.profile_hash = profile_sha256(self.profile)
     self.intent_adaptation: IntentAdaptation | None = None
     self.core_result: CoreResult = self.core.result
@@ -354,6 +365,9 @@ class ModularShadowRunner:
       PROVISIONAL_RACK_DYNAMICS_PATH,
     )
     policy = ControllerPolicy.from_json_file(PROVISIONAL_POLICY_PATH)
+    horizon_policy = HorizonPolicy.from_json_file(
+      PROVISIONAL_HORIZON_POLICY_PATH,
+    )
     runtime_bundle = build_runtime_vehicle_bundle(
       car_params=car_params,
       car_interface_or_callback=car_interface,
@@ -367,6 +381,7 @@ class ModularShadowRunner:
       controller_params=controller_params,
       runtime_bundle=runtime_bundle,
       policy=policy,
+      horizon_policy=horizon_policy,
     )
 
   def _live_mapping(
@@ -519,7 +534,20 @@ class ModularShadowRunner:
       current_speed = float(car_state.vEgo)
       measured_angle = float(car_state.steeringAngleDeg)
       measured_rate = float(car_state.steeringRateDeg)
-      applied_torque = float(car_output.actuatorsOutput.torque)
+      command_counts = exact_applied_torque_counts(
+        car_output,
+        self.runtime_bundle.torque_limits,
+      )
+      request_state = exact_steering_request_state(car_output)
+      if command_counts is None or request_state is None:
+        raise ValueError("exact command/request state is unavailable")
+      request_active, request_counter = request_state
+      request_state_valid = True
+      applied_torque = (
+        command_counts / self.runtime_bundle.torque_limits.steer_max
+        if request_active
+        else 0.0
+      )
       requested_torque = float(car_control.actuators.torque)
       driver_torque = float(car_state.steeringTorque)
       steering_pressed = bool(car_state.steeringPressed)
@@ -531,6 +559,10 @@ class ModularShadowRunner:
       measured_angle = math.nan
       measured_rate = math.nan
       applied_torque = math.nan
+      command_counts = 0
+      request_active = False
+      request_counter = 0
+      request_state_valid = False
       requested_torque = math.nan
       driver_torque = math.nan
       steering_pressed = False
@@ -561,6 +593,8 @@ class ModularShadowRunner:
     self.lateral_valid = self.vehicle_state_valid and acceleration_valid
     engagement_boundary = self.lateral_active != self._previous_lateral_active
     self._previous_lateral_active = self.lateral_active
+    if engagement_boundary and self.lateral_active:
+      self.core.prime_applied_history(applied_torque)
 
     live_mapping = self._live_mapping(
       live_parameters,
@@ -583,7 +617,14 @@ class ModularShadowRunner:
     self.intent_adaptation = adaptation
     self.model_input_valid = bool(adaptation.frame is not None and adaptation.frame.validity.model_valid)
 
-    self.recorded_actuator_constrained = self.vehicle_state_valid and abs(requested_torque - applied_torque) > RECORDED_ACTUATOR_CONSTRAINT_TOLERANCE
+    command_torque = (
+      command_counts / self.runtime_bundle.torque_limits.steer_max
+    )
+    self.recorded_actuator_constrained = self.vehicle_state_valid and (
+      not request_active
+      or abs(requested_torque - command_torque)
+      > RECORDED_ACTUATOR_CONSTRAINT_TOLERANCE
+    )
     lateral_accel_offset = float(
       self.car_params.lateralTuning.torque.latAccelOffset,
     )
@@ -598,7 +639,11 @@ class ModularShadowRunner:
       measured_rack_angle_deg=measured_angle,
       measured_rack_rate_deg_s=measured_rate,
       measured_rack_acceleration_deg_s2=measured_acceleration,
+      previous_command_counts=command_counts,
       recorded_applied_torque=applied_torque,
+      driver_torque=driver_torque,
+      steering_request_fault_avoidance_counter=request_counter,
+      steering_request_state_valid=request_state_valid,
       lateral_accel_offset=lateral_accel_offset,
       live_mapping=live_mapping,
       lateral_active=self.lateral_active,
@@ -618,17 +663,17 @@ class ModularShadowRunner:
     self.feasible_torque = 0.0
     self.unmet_torque = 0.0
     self.feasibility_constrained = False
-    feasibility_valid = result.valid and math.isfinite(result.raw_torque) and math.isfinite(applied_torque) and math.isfinite(driver_torque)
+    feasibility_valid = result.valid and math.isfinite(result.planned_torque) and math.isfinite(command_torque) and math.isfinite(driver_torque)
     if feasibility_valid:
       try:
         envelope = apply_torque_envelope(
           self.runtime_bundle.torque_limits,
-          result.raw_torque,
-          applied_torque,
+          result.planned_torque,
+          command_torque,
           driver_torque,
         )
         self.feasible_torque = envelope.applied_torque
-        self.unmet_torque = result.raw_torque - envelope.applied_torque
+        self.unmet_torque = result.planned_torque - envelope.applied_torque
         self.feasibility_constrained = envelope.constrained
       except (TypeError, ValueError, OverflowError):
         feasibility_valid = False
@@ -688,6 +733,7 @@ def populate_shadow_message(
     runner.runtime_vehicle_identity_hash,
   )
   shadow.modularPolicyHash = str(runner.policy_hash)
+  shadow.modularHorizonPolicyHash = str(runner.horizon_policy_hash)
   shadow.modularProfileHash = str(runner.profile_hash)
   shadow.modularModelFrameId = int(result.model_frame_id)
   shadow.modularIntentStatus = int(result.intent_code)

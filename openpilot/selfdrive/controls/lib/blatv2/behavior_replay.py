@@ -42,9 +42,13 @@ from dataclasses import dataclass
 import base64
 import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from opendbc.car.hyundai.steering_request import (
+  apply_steering_request_fault_avoidance,
+)
 from opendbc.car.vehicle_model import VehicleModel
 
 from openpilot.common.realtime import DT_CTRL
@@ -88,6 +92,7 @@ from openpilot.selfdrive.controls.lib.blatv2.intent import (
   INTENT_CAPACITY,
   adapt_model_intent_into,
 )
+from openpilot.selfdrive.controls.lib.blatv2.horizon import HorizonPolicy
 from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
   build_detected_runtime_bundle,
 )
@@ -131,7 +136,8 @@ BEHAVIOR_REPLAY_INPUT_SCHEMA_VERSION = 1
 EXACT_STOCK_REPLAY_CONTROLLER_NAME = "openpilot.LatControlTorque.exact-stock"
 EXACT_STOCK_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-full-stock-v1"
 MODULAR_REPLAY_CONTROLLER_NAME = "blatv2.ModularControllerCore"
-MODULAR_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-modular-core-v1"
+MODULAR_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-modular-core-v2"
+PROVISIONAL_HORIZON_POLICY_PATH = Path(__file__).resolve().parent / "provisional_horizon_policy.json"
 # Importing modeld just to obtain this scalar also imports the device-only
 # vision IPC extension.  Keep the source value local so replay remains usable
 # in the off-device harness; the exact-stock tests pin it against modeld.py,
@@ -1293,15 +1299,21 @@ def _output(
   acceleration_deg_s2: float,
   measured_curvature: float,
   raw_requested_torque: float,
+  planned_requested_torque: float,
+  reachable_counts: int,
   applied_counts: int,
   requested_counts: int,
   limits: RuntimeTorqueLimits,
+  steering_request_active: bool,
+  maximum_authority_required: bool,
   response_eligible: bool,
   controller_fault: bool,
 ) -> ControllerFrameOutput:
   raw = float(raw_requested_torque)
-  if not math.isfinite(raw):
+  planned = float(planned_requested_torque)
+  if not math.isfinite(raw) or not math.isfinite(planned):
     raw = 0.0
+    planned = 0.0
     controller_fault = True
     response_eligible = False
   return ControllerFrameOutput(
@@ -1311,9 +1323,13 @@ def _output(
     measured_rack_rate_deg_s=float(state.rate_deg_s),
     measured_rack_accel_deg_s2=float(acceleration_deg_s2),
     raw_requested_torque=raw,
+    planned_requested_torque=planned,
+    reachable_envelope_torque=reachable_counts / limits.steer_max,
     envelope_applied_torque=applied_counts / limits.steer_max,
     torque_headroom=_headroom(limits, requested_counts),
     actuator_constrained=applied_counts != requested_counts,
+    steering_request_active=bool(steering_request_active),
+    maximum_authority_required=bool(maximum_authority_required),
     controller_fault=bool(controller_fault),
     response_eligible=bool(response_eligible),
   )
@@ -1339,9 +1355,12 @@ class _RequestProducer:
     state: RackState,
     acceleration_deg_s2: float,
     previous_applied_counts: int,
+    previous_steering_request_active: bool,
+    steering_request_fault_avoidance_counter: int,
+    steering_request_state_valid: bool,
     previous_output_constrained: bool,
     engagement_boundary: bool,
-  ) -> tuple[float, bool]:
+  ) -> tuple[float, float, bool]:
     raise NotImplementedError
 
 
@@ -1351,6 +1370,9 @@ class _ModularRequestProducer(_RequestProducer):
     policy: BehaviorPolicy,
     runtime: _RouteRuntime,
   ) -> None:
+    horizon_policy = HorizonPolicy.from_json_file(
+      PROVISIONAL_HORIZON_POLICY_PATH,
+    )
     self.core = ModularControllerCore(
       fixed_dt_s=DT_CTRL,
       profile=runtime.controller_profile,
@@ -1362,6 +1384,8 @@ class _ModularRequestProducer(_RequestProducer):
       # itself. Counterfactual observer learning is therefore explicitly off.
       observer_policy=None,
       nominal_mapping=runtime.runtime_bundle.nominal_rack_mapping,
+      runtime_limits=runtime.runtime_bundle.torque_limits,
+      horizon_policy=horizon_policy,
       plan_capacity=INTENT_CAPACITY,
     )
     self.params = runtime.car_params
@@ -1391,11 +1415,14 @@ class _ModularRequestProducer(_RequestProducer):
     state: RackState,
     acceleration_deg_s2: float,
     previous_applied_counts: int,
+    previous_steering_request_active: bool,
+    steering_request_fault_avoidance_counter: int,
+    steering_request_state_valid: bool,
     previous_output_constrained: bool,
     engagement_boundary: bool,
-  ) -> tuple[float, bool]:
+  ) -> tuple[float, float, bool]:
     if model_intent is None or reference is None:
-      return 0.0, True
+      return 0.0, 0.0, True
     if model_intent.model_frame_id != frame_input.model_frame_id:
       raise BehaviorReplayError("model frame identity differs from the exact link")
     parameters = self.profile.parameters_at(control.speed_mps).parameters
@@ -1433,7 +1460,13 @@ class _ModularRequestProducer(_RequestProducer):
       # The controller receives the previous torque actually placed on CAN.
       # Rack-effective torque is delay-line/plant state and must never be fed
       # back as if the actuator had emitted it this frame.
-      recorded_applied_torque=previous_applied_counts / self.steer_max,
+      previous_command_counts=previous_applied_counts,
+      recorded_applied_torque=(
+        previous_applied_counts / self.steer_max
+        if previous_steering_request_active
+        else 0.0
+      ),
+      driver_torque=frame_input.driver_torque,
       lateral_accel_offset=float(self.params.lateralTuning.torque.latAccelOffset),
       live_mapping=control.live_rack_mapping,
       lateral_active=True,
@@ -1446,6 +1479,10 @@ class _ModularRequestProducer(_RequestProducer):
       engagement_boundary=engagement_boundary,
       live_parameters_valid=frame_input.live_parameters_inputs_valid,
       steering_pressed=control.steering_pressed,
+      steering_request_fault_avoidance_counter=(
+        steering_request_fault_avoidance_counter
+      ),
+      steering_request_state_valid=steering_request_state_valid,
       actuator_constrained=previous_output_constrained,
       output_constrained=previous_output_constrained,
       standstill=frame_input.standstill,
@@ -1463,8 +1500,8 @@ class _ModularRequestProducer(_RequestProducer):
         raise BehaviorReplayError(
           "modular core reference differs from transaction reference",
         )
-      return float(result.raw_torque), False
-    return 0.0, True
+      return float(result.raw_torque), float(result.planned_torque), False
+    return 0.0, 0.0, True
 
 
 class _StockRequestProducer(_RequestProducer):
@@ -1498,19 +1535,30 @@ class _StockRequestProducer(_RequestProducer):
     state: RackState,
     acceleration_deg_s2: float,
     previous_applied_counts: int,
+    previous_steering_request_active: bool,
+    steering_request_fault_avoidance_counter: int,
+    steering_request_state_valid: bool,
     previous_output_constrained: bool,
     engagement_boundary: bool,
-  ) -> tuple[float, bool]:
-    del acceleration_deg_s2, previous_applied_counts, engagement_boundary, reference
+  ) -> tuple[float, float, bool]:
+    del (
+      acceleration_deg_s2,
+      previous_applied_counts,
+      previous_steering_request_active,
+      steering_request_fault_avoidance_counter,
+      steering_request_state_valid,
+      engagement_boundary,
+      reference,
+    )
     if model_intent is None:
-      return 0.0, True
+      return 0.0, 0.0, True
     if model_intent.model_frame_id != frame_input.model_frame_id:
       raise BehaviorReplayError("model frame identity differs from the exact link")
     if not frame_input.live_torque_health_exact:
       # Stock conditionally updates its stateful calibration from
       # sm.all_checks(['liveTorqueParameters']).  If that witness-time result
       # cannot be proved, there is no exact stock replay for this frame.
-      return 0.0, True
+      return 0.0, 0.0, True
     try:
       self.vehicle_model.update_params(
         max(frame_input.stiffness_factor, 0.1),
@@ -1573,8 +1621,8 @@ class _StockRequestProducer(_RequestProducer):
       )
       raw_float = float(raw)
       if not math.isfinite(raw_float):
-        return 0.0, True
-      return raw_float, False
+        return 0.0, 0.0, True
+      return raw_float, raw_float, False
     except (
       AttributeError,
       TypeError,
@@ -1582,7 +1630,7 @@ class _StockRequestProducer(_RequestProducer):
       OverflowError,
       ZeroDivisionError,
     ):
-      return 0.0, True
+      return 0.0, 0.0, True
 
 
 class BehaviorReplayStepper:
@@ -1666,6 +1714,8 @@ class BehaviorReplayStepper:
     self.acceleration_deg_s2 = 0.0
     self.previous_applied_counts = 0
     self.previous_requested_counts = 0
+    self.previous_steering_request_active = False
+    self.steering_request_fault_avoidance_counter = 0
     self.previous_active = False
     self.censored = False
     self.episode_faulted = False
@@ -1701,6 +1751,8 @@ class BehaviorReplayStepper:
     # The route's recorded request belongs to the controller which happened
     # to drive it. It cannot perturb stock or candidate counterfactual state.
     self.previous_requested_counts = frame_input.recorded_applied_counts
+    self.previous_steering_request_active = True
+    self.steering_request_fault_avoidance_counter = 0
     self.delay_line.reset(applied)
     self.censored = False
     self.episode_faulted = False
@@ -1743,9 +1795,13 @@ class BehaviorReplayStepper:
       acceleration_deg_s2=frame_input.recorded_rack_acceleration_deg_s2,
       measured_curvature=curvature,
       raw_requested_torque=0.0,
+      planned_requested_torque=0.0,
+      reachable_counts=counts,
       applied_counts=counts,
       requested_counts=counts,
       limits=self.limits,
+      steering_request_active=False,
+      maximum_authority_required=False,
       response_eligible=False,
       controller_fault=controller_fault,
     )
@@ -1770,9 +1826,13 @@ class BehaviorReplayStepper:
       acceleration_deg_s2=self.acceleration_deg_s2,
       measured_curvature=curvature,
       raw_requested_torque=self.previous_applied_counts / self.limits.steer_max,
+      planned_requested_torque=self.previous_applied_counts / self.limits.steer_max,
+      reachable_counts=self.previous_applied_counts,
       applied_counts=self.previous_applied_counts,
       requested_counts=self.previous_applied_counts,
       limits=self.limits,
+      steering_request_active=False,
+      maximum_authority_required=False,
       response_eligible=False,
       controller_fault=True,
     )
@@ -1873,9 +1933,10 @@ class BehaviorReplayStepper:
     if self.episode_faulted:
       return self._faulted_output(control)
     raw = 0.0
+    planned = 0.0
     controller_fault = self.episode_faulted
     if not self.episode_faulted:
-      raw, controller_fault = self.producer.request_torque(
+      raw, planned, controller_fault = self.producer.request_torque(
         control=control,
         frame_input=frame_input,
         model_intent=model_intent,
@@ -1883,17 +1944,26 @@ class BehaviorReplayStepper:
         state=self.state,
         acceleration_deg_s2=self.acceleration_deg_s2,
         previous_applied_counts=self.previous_applied_counts,
+        previous_steering_request_active=(
+          self.previous_steering_request_active
+        ),
+        steering_request_fault_avoidance_counter=(
+          self.steering_request_fault_avoidance_counter
+        ),
+        steering_request_state_valid=True,
         previous_output_constrained=previous_output_constrained,
         engagement_boundary=engagement_boundary,
       )
-    if not math.isfinite(raw):
+    if not math.isfinite(raw) or not math.isfinite(planned):
       raw = 0.0
+      planned = 0.0
       controller_fault = True
     if controller_fault:
       self.episode_faulted = True
       self.censored = True
       return self._faulted_output(control)
-    requested_counts = int(round(raw * self.limits.steer_max))
+    raw_counts = int(round(raw * self.limits.steer_max))
+    requested_counts = int(round(planned * self.limits.steer_max))
     try:
       applied_counts = apply_torque_envelope_counts(
         self.limits,
@@ -1901,11 +1971,30 @@ class BehaviorReplayStepper:
         self.previous_applied_counts,
         frame_input.driver_torque,
       )
+      raw_direction = (raw_counts > 0) - (raw_counts < 0)
+      reachable_counts = apply_torque_envelope_counts(
+        self.limits,
+        raw_direction * self.limits.steer_max,
+        self.previous_applied_counts,
+        frame_input.driver_torque,
+      )
+      maximum_authority_required = (
+        raw_direction != 0
+        and raw_direction * raw_counts >= raw_direction * reachable_counts
+      )
       curvature = _measured_curvature(
         self.state,
         control.speed_mps,
         control.live_rack_mapping,
         control.nominal_rack_mapping,
+      )
+      (
+        next_steering_request_counter,
+        steering_request_active,
+      ) = apply_steering_request_fault_avoidance(
+        self.state.angle_deg,
+        True,
+        self.steering_request_fault_avoidance_counter,
       )
     except (TypeError, ValueError, OverflowError):
       self.episode_faulted = True
@@ -1922,9 +2011,13 @@ class BehaviorReplayStepper:
       acceleration_deg_s2=self.acceleration_deg_s2,
       measured_curvature=curvature,
       raw_requested_torque=raw,
+      planned_requested_torque=planned,
+      reachable_counts=reachable_counts,
       applied_counts=applied_counts,
       requested_counts=requested_counts,
       limits=self.limits,
+      steering_request_active=steering_request_active,
+      maximum_authority_required=maximum_authority_required,
       response_eligible=response_eligible,
       controller_fault=controller_fault,
     )
@@ -1940,7 +2033,7 @@ class BehaviorReplayStepper:
     try:
       can_applied_torque = applied_counts / self.limits.steer_max
       rack_effective_torque = self.delay_line.commit_and_sample(
-        can_applied_torque,
+        can_applied_torque if steering_request_active else 0.0,
         self.plant_member.effective_delay_s(parameters.transport_delay_s),
       )
       plant_step = step_counterfactual_plant(
@@ -1972,6 +2065,10 @@ class BehaviorReplayStepper:
       return self._faulted_output(control)
     self.previous_requested_counts = requested_counts
     self.previous_applied_counts = applied_counts
+    self.previous_steering_request_active = steering_request_active
+    self.steering_request_fault_avoidance_counter = (
+      next_steering_request_counter
+    )
     return output
 
 

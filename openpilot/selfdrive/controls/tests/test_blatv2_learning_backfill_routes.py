@@ -142,7 +142,13 @@ def source_message(service: str, cp: car.CarParams) -> object:
     )
   if service == "carOutput":
     return SimpleNamespace(
-      actuatorsOutput=SimpleNamespace(torque=0.0, torqueOutputCan=0.0),
+      actuatorsOutput=SimpleNamespace(
+        torque=0.0,
+        torqueOutputCan=0.0,
+        steeringRequestActive=True,
+        steeringRequestActiveValid=True,
+        steeringRequestFaultAvoidanceCounter=0,
+      ),
     )
   if service == "liveParameters":
     return SimpleNamespace(

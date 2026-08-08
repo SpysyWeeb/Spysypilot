@@ -270,9 +270,9 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       ),
       (15, 16, 10),
     )
-    # Evidence-preparation identities describe the unchanged source contract;
-    # algorithm/output schema migrations must never invalidate route inputs.
-    self.assertEqual(CANONICAL_JOIN_SCHEMA_VERSION, 3)
+    # The join identity moves only when source interpretation changes. Version
+    # 4 binds request-off censoring to the carried command timeline.
+    self.assertEqual(CANONICAL_JOIN_SCHEMA_VERSION, 4)
     self.assertEqual(
       FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
       "complete_full_rlog_authority_v7",

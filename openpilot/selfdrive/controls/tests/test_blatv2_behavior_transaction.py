@@ -357,9 +357,13 @@ def core_callback(*, noisy_after_contact: bool = False):
         measured_rack_rate_deg_s=reference.desired_rack_rate_deg_s * factor,
         measured_rack_accel_deg_s2=reference.desired_rack_accel_deg_s2 * factor,
         raw_requested_torque=raw,
+        planned_requested_torque=raw,
+        reachable_envelope_torque=raw,
         envelope_applied_torque=raw,
         torque_headroom=max(0.0, 1.0 - abs(raw)),
         actuator_constrained=False,
+        steering_request_active=True,
+        maximum_authority_required=False,
         controller_fault=False,
         response_eligible=True,
       ))
@@ -730,13 +734,17 @@ class TestBehaviorTransaction(unittest.TestCase):
     self.assertTrue(result.finalization.swift_passed)
     self.assertTrue(result.finalization.strong_passed)
 
-  def test_any_gate_failure_keeps_exact_stock_active(self):
+  def test_balanced_target_loss_cannot_veto_passing_strata(self):
     routes = tuple(decoded_route(index, hard=index == 2) for index in range(4))
     result = run(routes)
 
-    self.assertFalse(result.finalization.passed)
-    self.assertTrue(result.stock_retained)
-    self.assertIsNone(result.selected_policy)
+    self.assertTrue(result.finalization.passed)
+    self.assertFalse(result.finalization.target_materially_improved)
+    self.assertTrue(result.finalization.smooth_passed)
+    self.assertTrue(result.finalization.swift_passed)
+    self.assertTrue(result.finalization.strong_passed)
+    self.assertFalse(result.stock_retained)
+    self.assertIsNotNone(result.selected_policy)
 
   def test_hard_turn_that_never_crosses_is_fatal_despite_easy_windows(self):
     routes = tuple(decoded_route(index, hard=index == 1) for index in range(4))
@@ -930,11 +938,9 @@ class TestBehaviorTransaction(unittest.TestCase):
     result = run(tuple(decoded_route(index) for index in range(4)))
     self.assertEqual(
       result.sha256,
-      # Segmentation schema 2 adds fail-closed span/event work limits to the
-      # transaction identity; profile schema 3 also gives full-fit/cross-fit
-        # evidence honest names, so the reviewed prebatch fixture intentionally
-      # changed even though this route remains below every limit.
-      "f7e997fbd745104d3e6110fca07a0c1294ed8f494e97f4e097c8ac8529d54803",
+      # Transaction schema 3 binds raw/planned/reachable/applied commands,
+      # request state, exact stratum dispositions, and bounded all-window summaries.
+        "1c8b6191c63c9cf408691c8232d5d7cd42b83f02001fd068ddffc18cfe5519f3",
     )
 
   def test_validation_replays_only_the_frozen_training_winner(self):

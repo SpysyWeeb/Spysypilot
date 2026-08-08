@@ -8,9 +8,10 @@ the numerical BLaTv2 artifacts.  It retains no steering policy:
 * live rack mapping is built from one ``liveParameters`` snapshot;
 * rack acceleration is differentiated only across consecutive, positive
   carState sample gaps no larger than 15 ms; and
-* the previous applied CAN torque is accepted only when ``torqueOutputCan`` is
-  an exact integer count.  A normalized Float32 is never rounded back into a
-  controller state.
+* the previous command is accepted only when ``torqueOutputCan`` is an exact
+  integer count; and
+* physical-history eligibility separately requires the platform steering
+  request bit and its validity witness.
 
 All trajectory storage and the output object are allocated once.  Callers
 must snapshot values they need after the next :meth:`prepare` call.
@@ -186,6 +187,29 @@ def exact_applied_torque_counts(
   if abs(counts) > limits.steer_max:
     return None
   return counts
+
+
+def exact_steering_request_state(
+  car_output: Any,
+) -> tuple[bool, int] | None:
+  """Return the emitted request bit and platform fault-avoidance counter.
+
+  This authenticates command-layer telemetry only. An asserted request is not
+  proof of measured EPS torque, while a deasserted request means the carried
+  ``torqueOutputCan`` count must not be entered as physical applied history.
+  """
+  try:
+    actuators = car_output.actuatorsOutput
+    active = actuators.steeringRequestActive
+    valid = actuators.steeringRequestActiveValid
+    counter = actuators.steeringRequestFaultAvoidanceCounter
+  except (AttributeError, TypeError, ValueError, OverflowError):
+    return None
+  if type(active) is not bool or valid is not True or type(counter) is not int:
+    return None
+  if not 0 <= counter <= 255:
+    return None
+  return active, counter
 
 
 class LiveInputAdapter:

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 from openpilot.selfdrive.controls.blatv2_profiled import (
   PUBLISHED_SERVICES,
-  STEP_TIMEOUT_MS,
   SUBSCRIBED_SERVICES,
   BlatV2ProfileDaemon,
   ProfileLifecycleContext,
@@ -21,17 +21,9 @@ from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
   ApprovedProfileArtifact,
   ArtifactDiagnostic,
   PersistentProfileActivation,
-  ProfileIdentity,
 )
 from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
   ControllerSelection,
-)
-from openpilot.selfdrive.controls.lib.blatv2.feedback import (
-  FEEDBACK_REQUEST_PARAM,
-  FEEDBACK_RESPONSE_PARAM,
-  FeedbackChoice,
-  FeedbackRequest,
-  FeedbackResponse,
 )
 from openpilot.selfdrive.controls.lib.blatv2.lifecycle_status import (
   LIFECYCLE_STATUS_PARAM,
@@ -47,8 +39,11 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
   calibration_profile_for_controller,
   calibration_selection_manifest,
+  passing_device_acceptance_receipt,
   passed_behavior_finalization,
 )
+
+
 VEHICLE = "GENERIC PORTABLE TORQUE VEHICLE"
 RUNTIME_HASH = "1" * 64
 SOURCE_COMMIT = "2" * 40
@@ -57,6 +52,7 @@ PANDA_COMMIT = "4" * 40
 EVIDENCE_HASH = "4" * 64
 CALIBRATION_MANIFEST_HASH = "5" * 64
 HARNESS_COMMIT = "5" * 40
+HORIZON_POLICY_HASH = "6" * 64
 
 
 class MemoryParams:
@@ -201,10 +197,14 @@ def artifact(revision=1, *, runtime_hash=RUNTIME_HASH):
     observer_time_constant_s=None,
     observer_max_abs_disturbance_torque=None,
   )
+  profile_hash = hashlib.sha256(
+    selected_profile.to_json().encode(),
+  ).hexdigest()
   return ApprovedProfileArtifact(
     vehicle_profile=selected_profile,
     calibration_profile=calibration_profile,
     controller_policy=selected_policy,
+    horizon_policy_sha256=HORIZON_POLICY_HASH,
     runtime_vehicle_identity_sha256=runtime_hash,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
@@ -219,9 +219,17 @@ def artifact(revision=1, *, runtime_hash=RUNTIME_HASH):
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
-    safety_passed=True,
     deterministic_aa_passed=True,
-    device_timing_passed=True,
+    device_acceptance_receipt=passing_device_acceptance_receipt(
+      vehicle_identity=selected_profile.vehicle_identity,
+      runtime_identity_sha256=runtime_hash,
+      profile_sha256=profile_hash,
+      controller_policy_sha256=selected_policy.sha256,
+      horizon_policy_sha256=HORIZON_POLICY_HASH,
+      source_openpilot_commit=SOURCE_COMMIT,
+      opendbc_commit=OPENDBC_COMMIT,
+      panda_commit=PANDA_COMMIT,
+    ),
     smooth_passed=True,
     swift_passed=True,
     strong_passed=True,
@@ -299,17 +307,6 @@ def step(
   daemon.step()
 
 
-def prepare_provisional_daemon():
-  params = MemoryParams()
-  params.values[APPROVED_ARTIFACT_PARAM] = artifact().to_param()
-  sm = FakeSubMaster()
-  daemon = daemon_for(params, sm)
-  step(daemon, params, sm, started=False)
-  assert daemon.context is not None
-  assert daemon.context.activation.provisional
-  return params, sm, daemon
-
-
 def lifecycle_payload(activation):
   return build_lifecycle_status_payload(
     activation=activation,
@@ -321,7 +318,7 @@ def lifecycle_payload(activation):
   )
 
 
-def test_lifecycle_display_projection_maps_every_effective_state():
+def test_lifecycle_display_projection_maps_current_stock_state():
   params = MemoryParams()
   manager = context_for(params).activation
   stock = lifecycle_payload(manager)
@@ -346,73 +343,8 @@ def test_lifecycle_display_projection_maps_every_effective_state():
     panda_commit=PANDA_COMMIT,
   )
 
-  manager.stage(artifact(), offroad=True)
-  staged = lifecycle_payload(manager)
-  assert staged["controller_state"] == "staged"
-  assert staged["effective_controller"] == "stock"
-  assert staged["active_profile"] is None
-  assert staged["staged_profile"]["profile_revision"] == 1
 
-  manager.prepare_offroad(offroad=True)
-  provisional = lifecycle_payload(manager)
-  assert provisional["controller_state"] == "provisional"
-  assert provisional["effective_controller"] == "modular"
-  assert provisional["active_profile"]["profile_revision"] == 1
-  assert provisional["staged_profile"] is None
-
-  active = manager.active_artifact
-  identity = ProfileIdentity.from_artifact(active)
-  request = FeedbackRequest(
-    artifact_sha256=identity.artifact_sha256,
-    profile_sha256=identity.profile_sha256,
-    profile_revision=identity.profile_revision,
-  )
-  params.values[FEEDBACK_REQUEST_PARAM] = request.to_param()
-  params.values[FEEDBACK_RESPONSE_PARAM] = (
-    FeedbackResponse.for_request(
-      request,
-      FeedbackChoice.WORSE,
-    ).to_param()
-  )
-  assert manager.consume_feedback(offroad=True) is FeedbackChoice.WORSE
-  rollback = lifecycle_payload(manager)
-  assert rollback["controller_state"] == "rollback_pending"
-  assert rollback["effective_controller"] == "stock"
-  assert rollback["rejected_profile_count"] == 1
-
-  manager.prepare_offroad(offroad=True)
-  rolled_back = lifecycle_payload(manager)
-  assert rolled_back["controller_state"] == "stock"
-  assert rolled_back["effective_controller"] == "stock"
-
-  approved_params = MemoryParams()
-  approved_manager = context_for(approved_params).activation
-  approved_manager.stage(artifact(), offroad=True)
-  approved_manager.prepare_offroad(offroad=True)
-  approved_active = approved_manager.active_artifact
-  approved_identity = ProfileIdentity.from_artifact(approved_active)
-  approved_request = FeedbackRequest(
-    artifact_sha256=approved_identity.artifact_sha256,
-    profile_sha256=approved_identity.profile_sha256,
-    profile_revision=approved_identity.profile_revision,
-  )
-  approved_params.values[FEEDBACK_REQUEST_PARAM] = approved_request.to_param()
-  approved_params.values[FEEDBACK_RESPONSE_PARAM] = (
-    FeedbackResponse.for_request(
-      approved_request,
-      FeedbackChoice.BETTER,
-    ).to_param()
-  )
-  assert (
-    approved_manager.consume_feedback(offroad=True)
-    is FeedbackChoice.BETTER
-  )
-  approved = lifecycle_payload(approved_manager)
-  assert approved["controller_state"] == "approved"
-  assert approved["effective_controller"] == "modular"
-
-
-def test_lifecycle_display_invalid_stale_and_unverified_fail_closed():
+def test_lifecycle_display_invalid_and_unapproved_fail_closed():
   malformed_params = MemoryParams()
   malformed_params.values[ACTIVATION_STATE_PARAM] = {"not": "canonical"}
   malformed = context_for(malformed_params).activation
@@ -423,61 +355,24 @@ def test_lifecycle_display_invalid_stale_and_unverified_fail_closed():
   assert invalid["active_profile"] is None
   assert invalid["activation_state_sha256"] is None
 
-  stale_params = MemoryParams()
-  old_source = "6" * 40
-  old_artifact = ApprovedProfileArtifact(
-    vehicle_profile=artifact().vehicle_profile,
-    calibration_profile=artifact().calibration_profile,
-    controller_policy=artifact().controller_policy,
-    runtime_vehicle_identity_sha256=RUNTIME_HASH,
-    source_openpilot_commit=old_source,
-    opendbc_commit=OPENDBC_COMMIT,
-    panda_commit=PANDA_COMMIT,
-    calibration_selection_manifest=artifact().calibration_selection_manifest,
-    behavior_finalization=artifact().behavior_finalization,
-    replay_harness_commit=HARNESS_COMMIT,
-    replay_passed=True,
-    delivered_replay_passed=True,
-    safety_passed=True,
-    deterministic_aa_passed=True,
-    device_timing_passed=True,
-    smooth_passed=True,
-    swift_passed=True,
-    strong_passed=True,
-  )
-  old_manager = PersistentProfileActivation(
-    stale_params,
-    expected_vehicle_identity=VEHICLE,
-    expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
-    expected_source_openpilot_commit=old_source,
-    expected_opendbc_commit=OPENDBC_COMMIT,
-    expected_panda_commit=PANDA_COMMIT,
-    production_envelope_verified=True,
-  )
-  old_manager.stage(old_artifact, offroad=True)
-  old_manager.prepare_offroad(offroad=True)
-  stale = context_for(stale_params).activation
-  stale_status = lifecycle_payload(stale)
-  assert stale_status["controller_state"] == "unavailable"
-  assert stale_status["diagnostic"] == ArtifactDiagnostic.STATE_STALE_BUILD.value
-  assert stale_status["effective_controller"] == "stock"
-
-  unverified_params = MemoryParams()
-  prepared = context_for(unverified_params).activation
-  prepared.stage(artifact(), offroad=True)
-  prepared.prepare_offroad(offroad=True)
-  unverified = context_for(
-    unverified_params,
-    envelope_verified=False,
-  ).activation
-  unverified_status = lifecycle_payload(unverified)
-  assert unverified_status["controller_state"] == "unavailable"
-  assert unverified_status["effective_controller"] == "stock"
+  blocked_params = MemoryParams()
+  blocked_params.values[APPROVED_ARTIFACT_PARAM] = artifact().to_param()
+  sm = FakeSubMaster()
+  blocked = daemon_for(blocked_params, sm)
+  step(blocked, blocked_params, sm, started=False)
+  assert blocked.context.activation.active_artifact is None
   assert (
-    unverified_status["diagnostic"]
-    == ArtifactDiagnostic.UNVERIFIED_ACTUATION_ENVELOPE.value
+    blocked.last_artifact_diagnostic
+    is ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE
   )
-  assert unverified_status["active_profile"] is None
+  status = blocked_params.values[LIFECYCLE_STATUS_PARAM]
+  assert status["controller_state"] == "unavailable"
+  assert status["effective_controller"] == "stock"
+  assert (
+    status["diagnostic"]
+    == ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE.value
+  )
+  assert ACTIVATION_STATE_PARAM not in blocked_params.values
 
 
 def test_lifecycle_cache_skips_unchanged_offroad_writes_but_tracks_transition():
@@ -503,7 +398,16 @@ def test_lifecycle_cache_skips_unchanged_offroad_writes_but_tracks_transition():
     put for put in params.puts if put[0] == LIFECYCLE_STATUS_PARAM
   ]
   assert len(lifecycle_puts) == 2
-  assert lifecycle_puts[-1][1]["controller_state"] == "provisional"
+  assert lifecycle_puts[-1][1]["controller_state"] == "unavailable"
+  assert (
+    lifecycle_puts[-1][1]["diagnostic"]
+    == ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE.value
+  )
+  assert (
+    daemon.last_artifact_diagnostic
+    is ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE
+  )
+  assert ACTIVATION_STATE_PARAM not in params.values
 
 
 def _fingerprint_daemon(params, sm, *, fail_fingerprint):
@@ -636,124 +540,6 @@ def test_known_identity_failure_onroad_defers_cache_clear_until_offroad():
   assert not daemon._lifecycle_status_clear_pending
 
 
-def test_exact_lifecycle_is_prepared_offroad_and_live_path_is_read_only():
-  params, sm, daemon = prepare_provisional_daemon()
-  activation = daemon.context.activation
-  display = params.values[LIFECYCLE_STATUS_PARAM]
-  assert type(display) is dict
-  assert display["controller_state"] == "provisional"
-  assert display["effective_controller"] == "modular"
-  assert params.puts[-1][0] == LIFECYCLE_STATUS_PARAM
-  assert params.puts[-1][2] is True
-  selected = activation.active_artifact
-  assert selected is not None
-  assert activation.staged_artifact is None
-
-  puts_before_drive = len(params.puts)
-  step(daemon, params, sm, started=True, enabled=False)
-  step(daemon, params, sm, enabled=True)
-  step(daemon, params, sm, enabled=True)
-  assert len(params.puts) == puts_before_drive
-  assert params.onroad_writes == []
-
-  step(daemon, params, sm, started=False)
-  request = FeedbackRequest.from_param(
-    params.values[FEEDBACK_REQUEST_PARAM],
-  )
-  assert request.profile_sha256 == selected.vehicle_profile_sha256
-  assert request.profile_revision == selected.vehicle_profile.revision
-  assert all(timeout == STEP_TIMEOUT_MS for timeout in sm.timeouts)
-
-  # The same state object subsequently binds without touching Params.
-  put_count = len(params.puts)
-  decision = activation.begin_engagement()
-  assert decision.selection is ControllerSelection.MODULAR
-  assert decision.artifact == selected
-  activation.end_engagement()
-  assert len(params.puts) == put_count
-
-
-def test_onroad_period_without_enabled_lateral_does_not_prompt():
-  params, sm, daemon = prepare_provisional_daemon()
-  step(daemon, params, sm, started=True, enabled=False)
-  step(daemon, params, sm, enabled=False)
-  step(daemon, params, sm, started=False)
-  assert FEEDBACK_REQUEST_PARAM not in params.values
-
-
-def test_enabled_but_forced_stock_drive_does_not_prompt():
-  params, sm, daemon = prepare_provisional_daemon()
-  step(
-    daemon,
-    params,
-    sm,
-    started=True,
-    enabled=True,
-    modular=False,
-  )
-  step(daemon, params, sm, enabled=True, modular=False)
-  step(daemon, params, sm, started=False)
-  assert FEEDBACK_REQUEST_PARAM not in params.values
-
-
-def test_modular_telemetry_for_another_artifact_does_not_prompt():
-  params, sm, daemon = prepare_provisional_daemon()
-  step(
-    daemon,
-    params,
-    sm,
-    started=True,
-    enabled=True,
-    modular=True,
-    artifact_hash="f" * 64,
-  )
-  step(daemon, params, sm, started=False)
-  assert FEEDBACK_REQUEST_PARAM not in params.values
-
-
-def _feedback_outcome_is_exact_and_offroad(choice):
-  params, sm, daemon = prepare_provisional_daemon()
-  step(daemon, params, sm, started=True, enabled=True)
-  step(daemon, params, sm, started=False)
-  request = FeedbackRequest.from_param(
-    params.values[FEEDBACK_REQUEST_PARAM],
-  )
-  params.values[FEEDBACK_RESPONSE_PARAM] = (
-    FeedbackResponse.for_request(request, choice).to_param()
-  )
-  step(daemon, params, sm, started=False)
-
-  activation = daemon.context.activation
-  assert FEEDBACK_REQUEST_PARAM not in params.values
-  assert FEEDBACK_RESPONSE_PARAM not in params.values
-  if choice is FeedbackChoice.WORSE:
-    assert activation.active_artifact is None
-    assert not activation.rollback_pending
-    assert len(activation.rejected_profile_identities) == 1
-    assert (
-      activation.begin_engagement().selection
-      is ControllerSelection.STOCK
-    )
-    activation.end_engagement()
-  elif choice in (FeedbackChoice.BETTER, FeedbackChoice.ABOUT_SAME):
-    assert activation.active_artifact is not None
-    assert not activation.provisional
-  else:
-    assert activation.active_artifact is not None
-    assert activation.provisional
-    # NOT_SURE permits a fresh prompt only after another enabled drive.
-    step(daemon, params, sm, started=True, enabled=True)
-    step(daemon, params, sm, started=False)
-    assert FeedbackRequest.from_param(
-      params.values[FEEDBACK_REQUEST_PARAM],
-    ) == request
-
-
-def test_all_feedback_outcomes_are_exact_and_offroad():
-  for choice in FeedbackChoice:
-    _feedback_outcome_is_exact_and_offroad(choice)
-
-
 def test_stale_mismatched_malformed_and_unverified_artifacts_remain_stock():
   malformed_params = MemoryParams()
   malformed_params.values[APPROVED_ARTIFACT_PARAM] = {
@@ -790,147 +576,8 @@ def test_stale_mismatched_malformed_and_unverified_artifacts_remain_stock():
   assert unverified.context.activation.active_artifact is None
   assert (
     unverified.last_artifact_diagnostic
-    is ArtifactDiagnostic.UNVERIFIED_ACTUATION_ENVELOPE
+    is ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE
   )
-
-
-def test_daemon_retires_canonical_old_build_then_prepares_current_artifact():
-  params = MemoryParams()
-  old_source = "6" * 40
-  old_artifact = copy.copy(artifact())
-  old_artifact = ApprovedProfileArtifact(
-    vehicle_profile=old_artifact.vehicle_profile,
-    calibration_profile=old_artifact.calibration_profile,
-    controller_policy=old_artifact.controller_policy,
-    runtime_vehicle_identity_sha256=RUNTIME_HASH,
-    source_openpilot_commit=old_source,
-    opendbc_commit=OPENDBC_COMMIT,
-    panda_commit=PANDA_COMMIT,
-    calibration_selection_manifest=old_artifact.calibration_selection_manifest,
-    behavior_finalization=old_artifact.behavior_finalization,
-    replay_harness_commit=HARNESS_COMMIT,
-    replay_passed=True,
-    delivered_replay_passed=True,
-    safety_passed=True,
-    deterministic_aa_passed=True,
-    device_timing_passed=True,
-    smooth_passed=True,
-    swift_passed=True,
-    strong_passed=True,
-  )
-  old_manager = PersistentProfileActivation(
-    params,
-    expected_vehicle_identity=VEHICLE,
-    expected_runtime_vehicle_identity_sha256=RUNTIME_HASH,
-    expected_source_openpilot_commit=old_source,
-    expected_opendbc_commit=OPENDBC_COMMIT,
-    expected_panda_commit=PANDA_COMMIT,
-    production_envelope_verified=True,
-  )
-  old_manager.stage(old_artifact, offroad=True)
-  old_manager.prepare_offroad(offroad=True)
-  params.values[APPROVED_ARTIFACT_PARAM] = artifact().to_param()
-
-  sm = FakeSubMaster()
-  daemon = daemon_for(params, sm)
-  step(daemon, params, sm, started=False)
-  activation = daemon.context.activation
-  assert not activation.stale_build_state
-  assert activation.active_artifact == artifact()
-  assert activation.provisional
-
-
-def test_rejected_exact_identity_never_reactivates_from_approved_param():
-  params, sm, daemon = prepare_provisional_daemon()
-  selected = daemon.context.activation.active_artifact
-  step(daemon, params, sm, started=True, enabled=True)
-  step(daemon, params, sm, started=False)
-  request = FeedbackRequest.from_param(
-    params.values[FEEDBACK_REQUEST_PARAM],
-  )
-  params.values[FEEDBACK_RESPONSE_PARAM] = (
-    FeedbackResponse.for_request(
-      request,
-      FeedbackChoice.WORSE,
-    ).to_param()
-  )
-  step(daemon, params, sm, started=False)
-  identity = ProfileIdentity.from_artifact(selected)
-  assert identity in daemon.context.activation.rejected_profile_identities
-  for _ in range(3):
-    step(daemon, params, sm, started=False)
-  assert daemon.context.activation.active_artifact is None
-
-
-def test_worse_restores_the_exact_previous_artifact_before_next_drive():
-  params = MemoryParams()
-  manager = context_for(params).activation
-  first = artifact(1)
-  second = artifact(2)
-  manager.stage(first, offroad=True)
-  manager.prepare_offroad(offroad=True)
-  first_request = FeedbackRequest(
-    first.artifact_sha256,
-    first.vehicle_profile_sha256,
-    first.vehicle_profile.revision,
-  )
-  params.values[FEEDBACK_REQUEST_PARAM] = first_request.to_param()
-  params.values[FEEDBACK_RESPONSE_PARAM] = (
-    FeedbackResponse.for_request(
-      first_request,
-      FeedbackChoice.BETTER,
-    ).to_param()
-  )
-  assert manager.consume_feedback(offroad=True) is FeedbackChoice.BETTER
-  manager.stage(second, offroad=True)
-  manager.prepare_offroad(offroad=True)
-  assert manager.active_artifact == second
-
-  params.values[APPROVED_ARTIFACT_PARAM] = second.to_param()
-  sm = FakeSubMaster()
-  daemon = daemon_for(params, sm)
-  step(
-    daemon,
-    params,
-    sm,
-    started=True,
-    enabled=True,
-    artifact_hash=second.artifact_sha256,
-  )
-  step(daemon, params, sm, started=False)
-  request = FeedbackRequest.from_param(
-    params.values[FEEDBACK_REQUEST_PARAM],
-  )
-  params.values[FEEDBACK_RESPONSE_PARAM] = (
-    FeedbackResponse.for_request(
-      request,
-      FeedbackChoice.WORSE,
-    ).to_param()
-  )
-  step(daemon, params, sm, started=False)
-  assert daemon.context.activation.active_artifact == first
-  decision = daemon.context.activation.begin_engagement()
-  assert decision.artifact == first
-  assert decision.selection is ControllerSelection.MODULAR
-  daemon.context.activation.end_engagement()
-
-
-def test_daemon_restart_mid_enabled_drive_publishes_request_on_stop():
-  params = MemoryParams()
-  manager = context_for(params).activation
-  manager.stage(artifact(), offroad=True)
-  manager.prepare_offroad(offroad=True)
-  assert manager.provisional
-
-  sm = FakeSubMaster()
-  restarted = daemon_for(params, sm)
-  step(restarted, params, sm, started=True, enabled=True)
-  assert restarted.context.activation.provisional
-  assert params.onroad_writes == []
-  step(restarted, params, sm, started=False)
-  assert FeedbackRequest.from_param(
-    params.values[FEEDBACK_REQUEST_PARAM],
-  ).profile_sha256 == artifact().vehicle_profile_sha256
 
 
 def test_runtime_commit_resolution_requires_full_exact_agreement(tmp_path):
@@ -1004,13 +651,3 @@ def test_process_is_passive_portable_and_not_manager_registered():
     / "process_config.py"
   ).read_text()
   assert 'PythonProcess("blatv2_profiled",' not in process_config
-
-
-def test_activation_state_writes_are_offroad_and_atomic_json():
-  params, sm, daemon = prepare_provisional_daemon()
-  activation_puts = [
-    put for put in params.puts if put[0] == ACTIVATION_STATE_PARAM
-  ]
-  assert activation_puts
-  assert all(block is True for _, _, block in activation_puts)
-  assert all(type(payload) is dict for _, payload, _ in activation_puts)

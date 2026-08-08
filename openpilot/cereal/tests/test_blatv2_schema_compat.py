@@ -199,6 +199,42 @@ LATERAL_TORQUE_MANIFEST_TEXT = """
 184 modularManeuverForcedStock Bool
 185 modularProductionEnvelopeVerified Bool
 186 modularSelectionBound Bool
+187 modularHorizonPolicyHash Text
+188 modularPlannedTorque Float64
+189 modularPlannedCounts Int32
+190 modularReactiveTorque Float64
+191 modularReactiveCounts Int32
+192 modularRawRequestedCounts Int32
+193 modularRawToPlannedResidualCounts Int32
+194 modularRawToPlannedUnmetTorque Float64
+195 modularPreparationActive Bool
+196 modularPreparationScheduled Bool
+197 modularHorizonStatus UInt8
+198 modularHorizonValid Bool
+199 modularDriverSuppressed Bool
+200 modularFutureBandReachable Bool
+201 modularFirstUnreachableIndex Int16
+202 modularFirstUnreachableTimeSeconds Float64
+203 modularMaximumBandResidualCounts UInt16
+204 modularMaximumPathLeadDeg Float64
+205 modularMaximumPathRateLeadDegS Float64
+206 modularPathLeadConstrainedSamples UInt16
+207 modularMaximumAuthorityRequired Bool
+208 modularMaximumAuthorityActive Bool
+209 modularMaximumUrgency Float64
+210 modularPreviousCommandCounts Int32
+211 modularRecordedAppliedTorque Float64
+212 modularSteeringRequestActive Bool
+213 modularSteeringRequestValid Bool
+214 modularSteeringRequestFaultAvoidanceCounter UInt8
+215 modularControlCadenceValid Bool
+216 modularTransportReprimed Bool
+217 modularAdapterException Bool
+218 modularRawToPlannedConstrained Bool
+219 modularFinalExpectedCounts Int32
+220 modularFinalCountResidual Int32
+221 modularFinalCountMatchValid Bool
+222 modularFinalLimiterAltered Bool
 """
 
 BLAT_V2_SHADOW_MANIFEST_TEXT = """
@@ -363,6 +399,7 @@ MODULAR_SHADOW_MANIFEST_TEXT = """
 155 modularControlWitnessMonoTime UInt64
 156 modularStateAgeSeconds Float64
 157 modularTotalPredictionHorizonSeconds Float64
+158 modularHorizonPolicyHash Text
 """
 
 
@@ -418,11 +455,11 @@ class TestBLaTv2SchemaCompatibility(unittest.TestCase):
   def test_lateral_torque_manifest_is_exact(self) -> None:
     actual = _struct_manifest(log.ControlsState.LateralTorqueState)
     self.assertEqual(actual, LATERAL_TORQUE_MANIFEST)
-    self.assertEqual(len(actual), 187)
-    self.assertEqual(actual[-1][0], 186)
+    self.assertEqual(len(actual), 223)
+    self.assertEqual(actual[-1][0], 222)
     self.assertEqual(
       tuple(ordinal for ordinal, _, _ in actual),
-      tuple(range(187)),
+      tuple(range(223)),
     )
 
   def test_blat_v2_shadow_manifest_is_exact(self) -> None:
@@ -431,11 +468,11 @@ class TestBLaTv2SchemaCompatibility(unittest.TestCase):
     modular = tuple(field for field in actual if field[0] >= 86)
     self.assertEqual(historical, BLAT_V2_SHADOW_MANIFEST)
     self.assertEqual(modular, MODULAR_SHADOW_MANIFEST)
-    self.assertEqual(len(actual), 158)
-    self.assertEqual(actual[-1][0], 157)
+    self.assertEqual(len(actual), 159)
+    self.assertEqual(actual[-1][0], 158)
     self.assertEqual(
       tuple(ordinal for ordinal, _, _ in actual),
-      tuple(range(158)),
+      tuple(range(159)),
     )
 
   def test_original_candidate_slots_remain_non_void(self) -> None:

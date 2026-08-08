@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 import secrets
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 
 from openpilot.selfdrive.controls.lib.blatv2.behavior_configuration import (
@@ -1105,24 +1105,23 @@ def _ordered_map_for_test(
   calls: tuple[tuple[object, ...], ...],
   worker_count: int,
   interface_registry: Mapping[str, type] | None,
+  worker: Callable[..., _RouteBatchResult] | None = None,
 ) -> tuple[_RouteBatchResult, ...]:
   if not calls or len(calls) > _MAXIMUM_STAGE_CALLS:
     raise BehaviorTrainingAuthorityError("training stage route population is outside its bound")
   if type(worker_count) is not int or not 1 <= worker_count <= _WORKER_COUNT:
     raise BehaviorTrainingAuthorityError("training stage worker count is outside its bound")
+  worker = _evaluate_policies_for_route_for_test if worker is None else worker
   try:
     if interface_registry is not None or worker_count == 1:
       values = tuple(
-        _evaluate_policies_for_route_for_test(*call, interface_registry)
+        worker(*call, interface_registry)
         for call in calls
       )
     else:
       executor = ProcessPoolExecutor(max_workers=worker_count)
       futures = tuple(
-        executor.submit(
-          _evaluate_policies_for_route_for_test_star,
-          (*call, interface_registry),
-        )
+        executor.submit(worker, *call, interface_registry)
         for call in calls
       )
       collected: list[_RouteBatchResult] = []
@@ -1148,12 +1147,6 @@ def _ordered_map_for_test(
 
 def _evaluate_policies_for_route_star(arguments: tuple[object, ...]) -> _RouteBatchResult:
   return _evaluate_policies_for_route(*arguments)
-
-
-def _evaluate_policies_for_route_for_test_star(
-  arguments: tuple[object, ...],
-) -> _RouteBatchResult:
-  return _evaluate_policies_for_route_for_test(*arguments)
 
 
 def _calls(
