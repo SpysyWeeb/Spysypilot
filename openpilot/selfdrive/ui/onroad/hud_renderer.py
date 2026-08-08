@@ -1,6 +1,7 @@
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
+from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -71,6 +72,9 @@ class HudRenderer(Widget):
     self._font_medium: rl.Font = gui_app.font(FontWeight.MEDIUM)
 
     self._exp_button: ExpButton = ExpButton(UI_CONFIG.button_size, UI_CONFIG.wheel_icon_size)
+    self._txt_wheel = gui_app.texture('icons_mici/wheel.png', UI_CONFIG.wheel_icon_size, UI_CONFIG.wheel_icon_size)
+    self._wheel_alpha_filter = FirstOrderFilter(0, 0.05, 1 / gui_app.target_fps)
+    self._wheel_y_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
@@ -120,9 +124,24 @@ class HudRenderer(Widget):
     button_x = rect.x + rect.width - UI_CONFIG.border_size - UI_CONFIG.button_size
     button_y = rect.y + UI_CONFIG.border_size
     self._exp_button.render(rl.Rectangle(button_x, button_y, UI_CONFIG.button_size, UI_CONFIG.button_size))
+    self._draw_steering_wheel(rect)
 
   def user_interacting(self) -> bool:
     return self._exp_button.is_pressed
+
+  def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
+    disengaged = ui_state.status == UIStatus.DISENGAGED
+    alpha = self._wheel_alpha_filter.update(0 if disengaged else 255 * 0.9)
+    y_offset = self._wheel_y_filter.update(self._txt_wheel.height / 2 if disengaged else 0)
+
+    pos_x = int(rect.x + 63 + self._txt_wheel.width / 2)
+    pos_y = int(rect.y + rect.height - 42 - self._txt_wheel.height / 2 + y_offset)
+    src_rect = rl.Rectangle(0, 0, self._txt_wheel.width, self._txt_wheel.height)
+    dest_rect = rl.Rectangle(pos_x, pos_y, self._txt_wheel.width, self._txt_wheel.height)
+    origin = (self._txt_wheel.width / 2, self._txt_wheel.height / 2)
+    color = rl.Color(255, 255, 255, int(alpha))
+
+    rl.draw_texture_pro(self._txt_wheel, src_rect, dest_rect, origin, -ui_state.sm['carState'].steeringAngleDeg, color)
 
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
