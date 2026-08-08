@@ -28,6 +28,7 @@ from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   PreparedRoute,
   RouteCandidate,
+  RouteRejected,
   RouteSegment,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
@@ -590,11 +591,12 @@ def test_empty_physical_plane_and_empty_eligible_behavior_fail_closed() -> None:
     prepared=_prepared(physically_empty, invalid_frames),
   )
   assert empty_result["physical_plane"]["frames_retained"] == 0
-  with pytest.raises(CertificationVectorError, match="no valid physical"):
+  with pytest.raises(RouteRejected, match="no valid physical") as rejected:
     build_certification_vector_from_prepared_route(
       RouteCandidate(ROUTE, 1, (SEGMENT,)),
       _prepared(physically_empty, invalid_frames),
     )
+  assert rejected.value.reason == "physical_witness_unavailable"
 
   with pytest.raises(CertificationVectorError, match="behavior-eligible"):
     _signed_vector(_segment_vector(

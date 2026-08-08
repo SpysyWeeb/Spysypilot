@@ -41,6 +41,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BuildDescriptorRegistry,
   PreparedRoute,
   RouteCandidate,
+  RouteRejected,
   RouteSegment,
   prepare_route,
 )
@@ -785,11 +786,13 @@ def build_certification_vector_from_prepared_route(
     segment_vectors.append(result)
 
   if retained_physical == 0:
-    raise CertificationVectorError(
+    raise RouteRejected(
+      "physical_witness_unavailable",
       "certification vector has no valid physical-learning witnesses",
     )
   if source.behavior_eligible and retained_behavior == 0:
-    raise CertificationVectorError(
+    raise RouteRejected(
+      "behavior_witness_unavailable",
       "behavior-eligible vector has no certification witnesses",
     )
 
