@@ -37,6 +37,8 @@ Routes and learning artifacts are handled outside the device UI.
 
 - `openpilot/selfdrive/ui/layouts/home.py` — two-page carousel containing the
   existing terminal and system pages.
+- `openpilot/selfdrive/ui/layouts/main.py` — forwards the initial show event to
+  the active home page so the live terminal starts on boot without a page cycle.
 - Removed the retired BLaTv2 learner/readiness widgets and their Params reader.
 - Preserved the BLaTv2 post-drive feedback prompt for PC-generated profiles.
 - Removed the five route-analyzer widgets, `drive_statsd`, its process
