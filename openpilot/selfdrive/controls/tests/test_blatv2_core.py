@@ -5,7 +5,10 @@ import math
 from pathlib import Path
 import unittest
 
-from openpilot.selfdrive.controls.lib.blatv2.actuator import RuntimeTorqueLimits
+from openpilot.selfdrive.controls.lib.blatv2.actuator import (
+  RuntimeTorqueLimits,
+  apply_torque_envelope_counts,
+)
 from openpilot.selfdrive.controls.lib.blatv2.core import (
   CoreResult,
   CoreStatus,
@@ -224,6 +227,7 @@ def make_core(
   tracking_policy: TrackingPolicy | None = None,
   development_reactive_only: bool = False,
   development_natural_frequency_nodes_per_s: tuple[float, ...] | None = None,
+  development_phase_boost: bool = False,
 ) -> ModularControllerCore:
   return ModularControllerCore(
     fixed_dt_s=DT,
@@ -240,6 +244,7 @@ def make_core(
     development_natural_frequency_nodes_per_s=(
       development_natural_frequency_nodes_per_s
     ),
+    development_phase_boost=development_phase_boost,
   )
 
 
@@ -298,6 +303,206 @@ def update_core(
 
 
 class TestBLaTv2Core(unittest.TestCase):
+  @staticmethod
+  def phase_core() -> ModularControllerCore:
+    core = make_core(
+      vehicle_profile(qualified=False),
+      tracking_policy=TrackingPolicy(10.5, 1.0),
+      development_reactive_only=True,
+      development_natural_frequency_nodes_per_s=(
+        11.0, 11.0, 10.5, 10.25, 10.0, 10.0,
+      ),
+      development_phase_boost=True,
+    )
+    core.prime_applied_history(0.0)
+    return core
+
+  def test_development_phase_assist_turn_unwind_and_speed_envelope(self) -> None:
+    def settle(curvature: float, curvature_rate: float) -> tuple[ModularControllerCore, float]:
+      core = self.phase_core()
+      assist = 0.0
+      for _ in range(100):
+        assist = core._development_phase_assist(
+          desired_curvature=curvature,
+          desired_curvature_rate=curvature_rate,
+          effect_speed_mps=2.0,
+          permitted=True,
+        )
+      return core, assist
+
+    left_turn, left_turn_assist = settle(0.15, 0.20)
+    left_unwind, left_unwind_assist = settle(0.15, -0.20)
+    right_turn, right_turn_assist = settle(-0.15, -0.20)
+    right_unwind, right_unwind_assist = settle(-0.15, 0.20)
+
+    self.assertLess(left_turn_assist, 0.0)
+    self.assertGreater(left_turn.result.phase_weight, 0.0)
+    self.assertGreater(left_unwind_assist, 0.0)
+    self.assertLess(left_unwind.result.phase_weight, 0.0)
+    self.assertGreater(right_turn_assist, 0.0)
+    self.assertGreater(right_turn.result.phase_weight, 0.0)
+    self.assertLess(right_unwind_assist, 0.0)
+    self.assertLess(right_unwind.result.phase_weight, 0.0)
+    self.assertAlmostEqual(left_turn_assist, -right_turn_assist)
+    self.assertAlmostEqual(left_unwind_assist, -right_unwind_assist)
+    self.assertLessEqual(abs(left_turn_assist), 0.02)
+    self.assertLessEqual(abs(left_unwind_assist), 0.03)
+    self.assertGreater(abs(left_unwind_assist), abs(left_turn_assist))
+
+    center = self.phase_core()
+    center_assist = center._development_phase_assist(
+      desired_curvature=0.02,
+      desired_curvature_rate=0.20,
+      effect_speed_mps=2.0,
+      permitted=True,
+    )
+    self.assertEqual(center_assist, 0.0)
+    self.assertEqual(center.result.phase_weight, 0.0)
+
+    highway = self.phase_core()
+    highway_assist = highway._development_phase_assist(
+      desired_curvature=0.15,
+      desired_curvature_rate=0.20,
+      effect_speed_mps=15.0,
+      permitted=True,
+    )
+    self.assertEqual(highway_assist, 0.0)
+    self.assertEqual(highway.result.desired_lateral_jerk_mps3, 0.0)
+
+    self.assertEqual(left_turn._development_phase_assist(
+      desired_curvature=0.15,
+      desired_curvature_rate=0.20,
+      effect_speed_mps=2.0,
+      permitted=False,
+    ), 0.0)
+    self.assertEqual(left_turn.result.desired_lateral_jerk_mps3, 0.0)
+    self.assertEqual(left_turn.result.phase_assist_torque, 0.0)
+
+  def test_development_phase_assist_waits_for_filter_sign_reversal(self) -> None:
+    core = self.phase_core()
+    for _ in range(100):
+      assist = core._development_phase_assist(
+        desired_curvature=0.15,
+        desired_curvature_rate=0.20,
+        effect_speed_mps=2.0,
+        permitted=True,
+      )
+    self.assertLess(assist, 0.0)
+
+    assist = core._development_phase_assist(
+      desired_curvature=0.15,
+      desired_curvature_rate=-0.20,
+      effect_speed_mps=2.0,
+      permitted=True,
+    )
+    self.assertGreater(core.result.desired_lateral_jerk_mps3, 0.0)
+    self.assertEqual(core.result.phase_weight, 0.0)
+    self.assertEqual(assist, 0.0)
+
+    for _ in range(100):
+      assist = core._development_phase_assist(
+        desired_curvature=0.15,
+        desired_curvature_rate=-0.20,
+        effect_speed_mps=2.0,
+        permitted=True,
+      )
+      if core.result.desired_lateral_jerk_mps3 < 0.0:
+        break
+      self.assertEqual(core.result.phase_weight, 0.0)
+      self.assertEqual(assist, 0.0)
+    else:
+      self.fail("phase jerk filter did not cross zero")
+    self.assertGreater(assist, 0.0)
+
+  def test_development_phase_assist_precedes_the_unchanged_envelope(self) -> None:
+    profile = vehicle_profile(qualified=False)
+    frequencies = (11.0, 11.0, 10.5, 10.25, 10.0, 10.0)
+    adaptation, outputs, _ = adapted_intent(
+      profile,
+      current_speed=5.0,
+      scalar_curvature=0.05,
+      constant_speed=True,
+    )
+    phase_core = make_core(
+      profile,
+      tracking_policy=TrackingPolicy(10.5, 1.0),
+      development_reactive_only=True,
+      development_natural_frequency_nodes_per_s=frequencies,
+      development_phase_boost=True,
+    )
+    base_core = make_core(
+      profile,
+      tracking_policy=TrackingPolicy(10.5, 1.0),
+      development_reactive_only=True,
+      development_natural_frequency_nodes_per_s=frequencies,
+    )
+    phase_core.prime_applied_history(0.0)
+    base_core.prime_applied_history(0.0)
+    phase_result = None
+    base_result = None
+    for _ in range(100):
+      phase_result = update_core(
+        phase_core,
+        adaptation,
+        outputs,
+        scalar_curvature=0.05,
+        current_speed=5.0,
+      )
+      base_result = update_core(
+        base_core,
+        adaptation,
+        outputs,
+        scalar_curvature=0.05,
+        current_speed=5.0,
+      )
+    assert phase_result is not None and base_result is not None
+    self.assertNotEqual(phase_result.phase_assist_torque, 0.0)
+    self.assertAlmostEqual(
+      phase_result.raw_torque,
+      base_result.raw_torque + phase_result.phase_assist_torque,
+    )
+    expected_raw_counts = round(phase_result.raw_torque * LIMITS.steer_max)
+    self.assertEqual(phase_result.raw_requested_counts, expected_raw_counts)
+    self.assertEqual(
+      phase_result.planned_counts,
+      apply_torque_envelope_counts(LIMITS, expected_raw_counts, 0, 0.0),
+    )
+
+    suppressed_result = update_core(
+      phase_core,
+      adaptation,
+      outputs,
+      scalar_curvature=0.05,
+      current_speed=5.0,
+      driver_torque=LIMITS.driver_allowance + 1,
+    )
+    self.assertTrue(suppressed_result.driver_suppressed)
+    self.assertEqual(suppressed_result.desired_lateral_jerk_mps3, 0.0)
+    self.assertEqual(suppressed_result.phase_weight, 0.0)
+    self.assertEqual(suppressed_result.phase_assist_torque, 0.0)
+
+    approved = vehicle_profile()
+    approved_adaptation, approved_outputs, _ = adapted_intent(approved)
+    default_core = make_core(approved)
+    explicit_off_core = make_core(
+      approved,
+      development_phase_boost=False,
+    )
+    default_core.prime_applied_history(0.0)
+    explicit_off_core.prime_applied_history(0.0)
+    self.assertEqual(
+      update_core(
+        default_core,
+        approved_adaptation,
+        approved_outputs,
+      ).snapshot(),
+      update_core(
+        explicit_off_core,
+        approved_adaptation,
+        approved_outputs,
+      ).snapshot(),
+    )
+
   def test_development_response_schedule_interpolates_at_effect_speed(self) -> None:
     profile = vehicle_profile(qualified=False)
     frequencies = (11.0, 11.0, 10.5, 10.25, 10.0, 10.0)
@@ -350,6 +555,12 @@ class TestBLaTv2Core(unittest.TestCase):
       make_core(
         vehicle_profile(qualified=False),
         development_natural_frequency_nodes_per_s=frequencies,
+      )
+    with self.assertRaisesRegex(ValueError, "phase boost"):
+      make_core(
+        vehicle_profile(qualified=False),
+        development_reactive_only=True,
+        development_phase_boost=True,
       )
     with self.assertRaisesRegex(ValueError, "qualified profiles"):
       make_core(

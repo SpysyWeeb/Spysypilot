@@ -302,6 +302,7 @@ class ModularControllerCandidate:
     if self._engaged:
       raise RuntimeError("candidate engagement already active")
     self._validate_begin_decision(decision)
+    self.core.reset_development_phase_assist()
     self.guard.reset()
     self._decision = decision
     self._binding_faulted = False
@@ -313,6 +314,7 @@ class ModularControllerCandidate:
     if not self._engaged or self._decision is None:
       raise RuntimeError("candidate has no active engagement")
     matches = decision is self._decision
+    self.core.reset_development_phase_assist()
     self.guard.reset()
     self._engaged = False
     self._decision = None
@@ -452,6 +454,7 @@ class ModularControllerCandidate:
 
     self._clear_result_for_bound_decision()
     if not self._engaged or self._decision is None:
+      self.core.reset_development_phase_assist()
       self.guard.reset()
       return self.result
 
@@ -461,6 +464,7 @@ class ModularControllerCandidate:
     command_torque = command_counts / self.runtime_limits.steer_max
     decision_matches = self._decision_matches(engagement_decision)
     if self._binding_faulted or not decision_matches:
+      self.core.reset_development_phase_assist()
       newly_faulted = not self._binding_faulted
       self._binding_faulted = True
       safe_command = self.guard.update(
@@ -510,6 +514,8 @@ class ModularControllerCandidate:
       output_constrained=output_constrained,
       standstill=standstill,
     )
+    if not core_result.valid:
+      self.core.reset_development_phase_assist()
     self._copy_core_and_feasibility(
       core_result,
       command_counts,
@@ -632,6 +638,7 @@ class ModularControllerCandidate:
       Integral,
     ):
       raise TypeError("previous command must be an integer count")
+    self.core.reset_development_phase_assist()
     driver = float(driver_torque)
     if not math.isfinite(driver):
       driver = 0.0

@@ -577,6 +577,7 @@ def test_explicit_experimental_candidate_binds_one_unqualified_controller(
   assert selected.candidate.core.reference_count == 1
   assert selected.candidate.core.horizon is None
   assert selected.candidate.core.development_natural_frequency_nodes_per_s is None
+  assert not selected.candidate.core.development_phase_boost
 
   bind_modular(selected, clock, state, output)
   assert selected.decision is not None
@@ -669,6 +670,7 @@ def test_approved_artifact_takes_precedence_over_experimental_request() -> None:
   assert selected.candidate.core.reference_count == HORIZON_SAMPLE_COUNT
   assert selected.candidate.core.horizon is not None
   assert selected.candidate.core.development_natural_frequency_nodes_per_s is None
+  assert not selected.candidate.core.development_phase_boost
 
 
 def test_experimental_parameter_is_development_only_and_process_bound() -> None:
@@ -713,6 +715,7 @@ def test_process_start_builds_trial_only_for_opendbc_capable_platform() -> None:
     selected.candidate.core.development_natural_frequency_nodes_per_s
     == live_module.DEVELOPMENT_NATURAL_FREQUENCY_NODES_PER_S
   )
+  assert selected.candidate.core.development_phase_boost
   assert tuple(
     zip(
       selected.controller_profile.speed_nodes_mps,
@@ -755,6 +758,7 @@ def test_process_start_builds_trial_only_for_opendbc_capable_platform() -> None:
   assert other.eligibility == LiveEligibility.ELIGIBLE
   assert other.candidate is not None
   assert other.candidate.core.development_natural_frequency_nodes_per_s is None
+  assert not other.candidate.core.development_phase_boost
 
   disabled = ModularLiveController.from_persistent(
     car_params=cp,
@@ -2064,6 +2068,19 @@ def test_envelope_output_raw_scalar_timing_and_schema_round_trip(
     )
     assert math.isclose(decoded.modularRawScalarCurvature, 0.012, rel_tol=1e-6, abs_tol=1e-12)
     assert decoded.modularCommandTorque == result.command_torque
+    assert decoded.desiredLateralJerk == core.desired_lateral_jerk_mps3
+    physical_feedforward = (
+      core.aligning_torque
+      + core.friction_torque
+      + core.motion_feedforward_torque
+      + core.disturbance_torque
+    )
+    assert core.phase_assist_torque == 0.0
+    assert math.isclose(decoded.f,
+      physical_feedforward,
+      rel_tol=1e-6,
+      abs_tol=1e-7,
+    )
     assert decoded.modularPlannedTorque == core.planned_torque
     assert decoded.modularPlannedCounts == core.planned_counts
     assert decoded.modularPreviousCommandCounts == 37
