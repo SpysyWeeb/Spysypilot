@@ -7,10 +7,12 @@ authority is the driving model. It uses the model's scalar action and future
 trajectory, live vehicle state, learned vehicle response, and runtime actuator
 limits to produce one torque request.
 
-The design deliberately avoids named maneuver patches. There is no turn-in
-boost, unwind controller, handoff state machine, authority restoration,
-low-speed controller, or smoothness filter. If a physical module is wrong, it
-is fixed or replaced at its contract boundary.
+The approved design deliberately avoids named maneuver patches. It has no
+turn-in boost, unwind controller, handoff state machine, authority restoration,
+low-speed controller, or smoothness filter. The provisional Palisade owner
+trial has the single source-bound phase-assist exception documented below; it
+cannot enter an approved artifact. If a physical module is wrong, it is fixed
+or replaced at its contract boundary.
 
 All numerical modules are shared libraries called synchronously from the
 100 Hz control loop and from replay. They are not separate onroad processes.
@@ -429,6 +431,18 @@ natural frequency is `11.0, 11.0, 10.5, 10.25, 10.0, 10.0 1/s` at
 Damping remains `1.0`. This unqualified reactive schedule is tied to the exact
 source commit and cannot enter the global behavior search or approved preview
 artifact path.
+
+That same exact Palisade trial applies one transient phase assist before the
+unchanged production torque envelope. Model curvature jerk is clipped to
+`-2.5` through `+2.5 m/s^3`, filtered at `1.2 Hz`, and combined with desired lateral
+acceleration to distinguish turn-in from unwind. The correction is bounded to
+`0.02` normalized torque during turn-in and `0.03` during unwind, is suppressed
+near lane center, fades continuously from `5` to `15 m/s`, and is exactly zero
+at and above `15 m/s`. Inactive, invalid, driver-override, and engagement-boundary
+frames reset the filter. After a jerk-sign reversal, assist stays zero until
+the filtered jerk agrees with the current raw jerk; the filter continues
+updating and remains logged. Approved artifacts and other experimental
+runtimes do not enable this source-bound assist.
 
 It cannot reinterpret the model path, vehicle calibration, observer, or
 actuator envelope. The target is always the model's scalar-anchored reference;

@@ -77,7 +77,7 @@ def build_modular_lateral_state(
   state.d = _finite_or_zero(
     0.0 if core is None else core.rate_feedback_torque,
   )
-  state.f = _finite_or_zero(
+  physical_feedforward = (
     0.0
     if core is None
     else (
@@ -85,8 +85,11 @@ def build_modular_lateral_state(
       + core.friction_torque
       + core.motion_feedforward_torque
       + core.disturbance_torque
-    ),
+    )
   )
+  if core is not None and core.phase_assist_torque != 0.0:
+    physical_feedforward += core.phase_assist_torque
+  state.f = _finite_or_zero(physical_feedforward)
   state.output = _finite_or_zero(command)
   state.saturated = bool(
     candidate is not None and candidate.constraint_active,
@@ -100,7 +103,9 @@ def build_modular_lateral_state(
   state.desiredLateralAccel = _finite_or_zero(
     desired_curvature * effect_speed * effect_speed,
   )
-  state.desiredLateralJerk = 0.0
+  state.desiredLateralJerk = _finite_or_zero(
+    0.0 if core is None else core.desired_lateral_jerk_mps3,
+  )
   state.version = int(MODULAR_LIVE_VERSION)
 
   state.modularArchitecture = (

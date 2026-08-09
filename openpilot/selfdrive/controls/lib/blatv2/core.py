@@ -31,6 +31,7 @@ from opendbc.car.hyundai.steering_request import (
   steering_request_fault_avoidance_counter_valid,
 )
 
+from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   RuntimeTorqueLimits,
   apply_torque_envelope_counts,
@@ -72,6 +73,19 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   PhysicalParameters,
   VehicleProfile,
 )
+
+
+DEVELOPMENT_PHASE_FILTER_HZ = 1.2
+DEVELOPMENT_PHASE_JERK_LIMIT_MPS3 = 2.5
+DEVELOPMENT_PHASE_SCALE = 0.11
+DEVELOPMENT_PHASE_ACCEL_ONSET_MPS2 = 0.08
+DEVELOPMENT_PHASE_ACCEL_RISE_MPS2 = 0.20
+DEVELOPMENT_PHASE_JERK_RISE_MPS3 = 0.24
+DEVELOPMENT_PHASE_TRANSITION_SPEED_MPS = 9.0
+DEVELOPMENT_PHASE_FULL_SPEED_MPS = 5.0
+DEVELOPMENT_PHASE_ZERO_SPEED_MPS = 15.0
+DEVELOPMENT_TURN_IN_ASSIST_TORQUE = 0.02
+DEVELOPMENT_UNWIND_ASSIST_TORQUE = 0.03
 
 
 class CoreStatus(IntEnum):
@@ -129,6 +143,9 @@ class CoreResult:
     "desired_angle_deg",
     "desired_rate_deg_s",
     "desired_acceleration_deg_s2",
+    "desired_lateral_jerk_mps3",
+    "phase_weight",
+    "phase_assist_torque",
     "measured_angle_deg",
     "measured_rate_deg_s",
     "predicted_angle_deg",
@@ -227,6 +244,9 @@ class CoreResult:
     self.desired_angle_deg = 0.0
     self.desired_rate_deg_s = 0.0
     self.desired_acceleration_deg_s2 = 0.0
+    self.desired_lateral_jerk_mps3 = 0.0
+    self.phase_weight = 0.0
+    self.phase_assist_torque = 0.0
     self.measured_angle_deg = 0.0
     self.measured_rate_deg_s = 0.0
     self.predicted_angle_deg = 0.0
@@ -327,6 +347,7 @@ class ModularControllerCore:
     plan_capacity: int,
     development_reactive_only: bool = False,
     development_natural_frequency_nodes_per_s: tuple[float, ...] | None = None,
+    development_phase_boost: bool = False,
   ) -> None:
     dt = float(fixed_dt_s)
     if not math.isfinite(dt) or dt <= 0.0:
@@ -351,6 +372,8 @@ class ModularControllerCore:
       raise TypeError("core requires an explicit HorizonPolicy")
     if type(development_reactive_only) is not bool:
       raise TypeError("development reactive mode must be explicit")
+    if type(development_phase_boost) is not bool:
+      raise TypeError("development phase boost must be explicit")
     if development_reactive_only and profile.qualified:
       raise ValueError("qualified profiles require the predictive horizon")
     if development_reactive_only and (
@@ -374,6 +397,11 @@ class ModularControllerCore:
         )
       ):
         raise ValueError("development response schedule is incompatible")
+    if development_phase_boost and (
+      not development_reactive_only
+      or development_natural_frequency_nodes_per_s is None
+    ):
+      raise ValueError("development phase boost requires the response trial")
 
     self.fixed_dt_s = dt
     self.profile = profile
@@ -385,6 +413,16 @@ class ModularControllerCore:
     self.development_reactive_only = development_reactive_only
     self.development_natural_frequency_nodes_per_s = (
       development_natural_frequency_nodes_per_s
+    )
+    self.development_phase_boost = development_phase_boost
+    self._development_phase_jerk_filter = (
+      FirstOrderFilter(
+        0.0,
+        1.0 / (2.0 * math.pi * DEVELOPMENT_PHASE_FILTER_HZ),
+        dt,
+      )
+      if development_phase_boost
+      else None
     )
     self.reference_count = (
       1 if development_reactive_only else HORIZON_SAMPLE_COUNT
@@ -477,6 +515,98 @@ class ModularControllerCore:
     self._selected_history_count = 0
     self._selected_full_steps = 0
     self._selected_fractional_dt_s = 0.0
+    self.reset_development_phase_assist()
+
+  def reset_development_phase_assist(self) -> None:
+    phase_filter = self._development_phase_jerk_filter
+    if phase_filter is not None:
+      phase_filter.x = 0.0
+      phase_filter.initialized = True
+    self.result.desired_lateral_jerk_mps3 = 0.0
+    self.result.phase_weight = 0.0
+    self.result.phase_assist_torque = 0.0
+
+  def _development_phase_assist(
+    self,
+    *,
+    desired_curvature: float,
+    desired_curvature_rate: float,
+    effect_speed_mps: float,
+    permitted: bool,
+  ) -> float:
+    """Return the source-bound Palisade transient torque correction."""
+    phase_filter = self._development_phase_jerk_filter
+    if (
+      phase_filter is None
+      or not permitted
+      or effect_speed_mps >= DEVELOPMENT_PHASE_ZERO_SPEED_MPS
+    ):
+      self.reset_development_phase_assist()
+      return 0.0
+
+    raw_jerk = desired_curvature_rate * effect_speed_mps * effect_speed_mps
+    raw_jerk = min(max(
+      raw_jerk,
+      -DEVELOPMENT_PHASE_JERK_LIMIT_MPS3,
+    ), DEVELOPMENT_PHASE_JERK_LIMIT_MPS3)
+    filtered_jerk = float(phase_filter.update(raw_jerk))
+    self.result.desired_lateral_jerk_mps3 = filtered_jerk
+    if raw_jerk * filtered_jerk <= 0.0:
+      self.result.phase_weight = 0.0
+      self.result.phase_assist_torque = 0.0
+      return 0.0
+
+    desired_lateral_accel = (
+      desired_curvature * effect_speed_mps * effect_speed_mps
+    )
+    phase = math.tanh(
+      desired_lateral_accel * filtered_jerk / DEVELOPMENT_PHASE_SCALE,
+    )
+    accel_activation = 1.0 - math.exp(
+      -max(
+        abs(desired_lateral_accel)
+        - DEVELOPMENT_PHASE_ACCEL_ONSET_MPS2,
+        0.0,
+      ) / DEVELOPMENT_PHASE_ACCEL_RISE_MPS2,
+    )
+    jerk_activation = 1.0 - math.exp(
+      -abs(filtered_jerk) / DEVELOPMENT_PHASE_JERK_RISE_MPS3,
+    )
+    low_speed_weight = 1.0 / (
+      1.0
+      + (
+        effect_speed_mps / DEVELOPMENT_PHASE_TRANSITION_SPEED_MPS
+      ) ** 2
+    )
+    high_speed_fade = min(max(
+      (
+        DEVELOPMENT_PHASE_ZERO_SPEED_MPS - effect_speed_mps
+      ) / (
+        DEVELOPMENT_PHASE_ZERO_SPEED_MPS
+        - DEVELOPMENT_PHASE_FULL_SPEED_MPS
+      ),
+      0.0,
+    ), 1.0)
+    phase_weight = (
+      phase
+      * accel_activation
+      * jerk_activation
+      * low_speed_weight
+      * high_speed_fade
+    )
+    amplitude = (
+      DEVELOPMENT_TURN_IN_ASSIST_TORQUE
+      if phase >= 0.0
+      else DEVELOPMENT_UNWIND_ASSIST_TORQUE
+    )
+    phase_assist = (
+      0.0
+      if filtered_jerk == 0.0
+      else -math.copysign(amplitude * abs(phase_weight), filtered_jerk)
+    )
+    self.result.phase_weight = phase_weight
+    self.result.phase_assist_torque = phase_assist
+    return phase_assist
 
   def _select_applied_history(
     self,
@@ -714,6 +844,7 @@ class ModularControllerCore:
       )
     )
     if not measurement_finite:
+      self.reset_development_phase_assist()
       fallback_parameters = self.profile.nodes[0].parameters
       self._update_observer(
         applied_torque=(
@@ -814,6 +945,7 @@ class ModularControllerCore:
     )
 
     if frame is None or not intent_status.usable:
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.INVALID_INTENT
       return self.result
 
@@ -839,6 +971,7 @@ class ModularControllerCore:
         != total_prediction_horizon_s
       )
     ):
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.TRANSPORT_TIME_MISMATCH
       return self.result
 
@@ -878,6 +1011,7 @@ class ModularControllerCore:
         self._scratch_speed_tangents,
       )
     except (TypeError, ValueError, OverflowError):
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.REFERENCE_FAILURE
       return self.result
 
@@ -888,6 +1022,7 @@ class ModularControllerCore:
       or not reference_status.valid
       or reference_status.scalar_only
     ):
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.REFERENCE_FAILURE
       return self.result
     self.result.desired_curvature = self._reference_curvatures[0]
@@ -951,11 +1086,13 @@ class ModularControllerCore:
         self._rack_accelerations,
       )
     except (TypeError, ValueError, OverflowError):
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.RACK_MAPPING_FAILURE
       return self.result
 
     self.result.rack_mapping_valid = rack_status.valid
     if rack_status.count != self.reference_count:
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.RACK_MAPPING_FAILURE
       return self.result
     self.result.desired_angle_deg = self._rack_angles[0]
@@ -965,6 +1102,7 @@ class ModularControllerCore:
     )
 
     if not self._select_applied_history(total_prediction_horizon_s):
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.INSUFFICIENT_APPLIED_HISTORY
       return self.result
     history_count = self._selected_history_count
@@ -1056,12 +1194,29 @@ class ModularControllerCore:
         self.observer.estimate_torque,
       )
     except (TypeError, ValueError, OverflowError):
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.PLANT_FAILURE
       return self.result
 
     self.result.predicted_angle_deg = predicted_state.angle_deg
     self.result.predicted_rate_deg_s = predicted_state.rate_deg_s
-    self.result.raw_torque = inverse.raw_torque
+    phase_assist = self._development_phase_assist(
+      desired_curvature=self._reference_curvatures[0],
+      desired_curvature_rate=self._reference_curvature_rates[0],
+      effect_speed_mps=self._reference_speeds[0],
+      permitted=(
+        lateral_active
+        and not engagement_boundary
+        and not steering_pressed
+        and abs(driver_torque * self.runtime_limits.driver_factor)
+        <= self.runtime_limits.driver_allowance
+        and lateral_valid
+        and model_valid
+        and vehicle_state_valid
+      ),
+    )
+    requested_raw_torque = inverse.raw_torque + phase_assist
+    self.result.raw_torque = requested_raw_torque
     self.result.aligning_torque = inverse.aligning_torque
     self.result.friction_torque = inverse.friction_torque
     self.result.motion_feedforward_torque = (
@@ -1077,14 +1232,16 @@ class ModularControllerCore:
     self.result.required_acceleration_deg_s2 = (
       inverse.required_acceleration_deg_s2
     )
-    if not math.isfinite(self.result.raw_torque):
+    if not math.isfinite(requested_raw_torque):
+      self.reset_development_phase_assist()
       self.result.status = CoreStatus.PLANT_FAILURE
       self.result.raw_torque = 0.0
       return self.result
 
     if self.development_reactive_only:
-      scaled_request = inverse.raw_torque * self.runtime_limits.steer_max
+      scaled_request = requested_raw_torque * self.runtime_limits.steer_max
       if not math.isfinite(scaled_request):
+        self.reset_development_phase_assist()
         self.result.status = CoreStatus.PLANT_FAILURE
         return self.result
       requested_counts = int(round(scaled_request))
@@ -1113,7 +1270,7 @@ class ModularControllerCore:
         requested_counts != planned_counts
       )
       self.result.raw_to_planned_unmet_torque = (
-        inverse.raw_torque - self.result.planned_torque
+        requested_raw_torque - self.result.planned_torque
       )
       self.result.raw_to_planned_residual_counts = (
         requested_counts - planned_counts
@@ -1127,7 +1284,7 @@ class ModularControllerCore:
         -1 if steering_request_active else 0
       )
       self.result.maximum_authority_required = (
-        abs(inverse.raw_torque) >= 1.0
+        abs(requested_raw_torque) >= 1.0
       )
       self.result.maximum_authority_active = (
         steering_request_active
@@ -1137,7 +1294,7 @@ class ModularControllerCore:
           self.runtime_limits,
           int(math.copysign(
             self.runtime_limits.steer_max,
-            inverse.raw_torque,
+            requested_raw_torque,
           )),
           int(previous_command_counts),
           driver_torque,

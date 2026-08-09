@@ -254,6 +254,13 @@ class ModularLiveController:
       ):
         raise AssertionError("eligible live controller lacks a candidate")
       try:
+        development_response_active = (
+          self.experimental_active
+          and self.controller_profile.speed_nodes_mps
+          == DEFAULT_SPEED_NODES_MPS
+          and runtime_bundle.identity_sha256
+          == DEVELOPMENT_RESPONSE_RUNTIME_VEHICLE_IDENTITY_SHA256
+        )
         core = ModularControllerCore(
           fixed_dt_s=DT_CTRL,
           profile=self.controller_profile,
@@ -266,15 +273,10 @@ class ModularLiveController:
           development_reactive_only=self.experimental_active,
           development_natural_frequency_nodes_per_s=(
             DEVELOPMENT_NATURAL_FREQUENCY_NODES_PER_S
-            if (
-              self.experimental_active
-              and self.controller_profile.speed_nodes_mps
-              == DEFAULT_SPEED_NODES_MPS
-              and runtime_bundle.identity_sha256
-              == DEVELOPMENT_RESPONSE_RUNTIME_VEHICLE_IDENTITY_SHA256
-            )
+            if development_response_active
             else None
           ),
+          development_phase_boost=development_response_active,
         )
         self.candidate = ModularControllerCandidate(
           core=core,
