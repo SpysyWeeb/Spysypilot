@@ -364,6 +364,7 @@ class Controls:
     if controller_selection == ControllerSelection.MODULAR:
       self.blatv2_live.record_requested_command(
         actuators.torque,
+        lateral_active=CC.latActive,
       )
 
     return CC, lac_log

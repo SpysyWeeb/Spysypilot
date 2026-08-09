@@ -50,6 +50,7 @@ class IntentStatusCode(IntEnum):
   INVALID_SCALAR = 7
   INVALID_VEHICLE_STATE = 8
   INVALID_MODEL_FRAME_ID = 9
+  MALFORMED_SUFFIX_TRUNCATED = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,7 @@ class IntentBuildStatus:
       IntentStatusCode.OK,
       IntentStatusCode.SCALAR_ONLY_MALFORMED_FUTURE,
       IntentStatusCode.SCALAR_ONLY_UNSUPPORTED_QUERY,
+      IntentStatusCode.MALFORMED_SUFFIX_TRUNCATED,
     )
 
   @property
@@ -205,18 +207,18 @@ def _write_scalar_only(
   output_plan_curvatures[0] = scalar_curvature
 
 
-def _future_arrays_valid(
+def _valid_future_prefix_count(
   native_plan_times_s: Sequence[float],
   native_orientation_rates_z: Sequence[float],
   native_velocities_x: Sequence[float],
-) -> bool:
+) -> int:
   count = len(native_plan_times_s)
   if (
     count < 2
     or len(native_orientation_rates_z) != count
     or len(native_velocities_x) != count
   ):
-    return False
+    return 0
   previous_time = -math.inf
   for index in range(count):
     try:
@@ -224,7 +226,7 @@ def _future_arrays_valid(
       orientation_rate = float(native_orientation_rates_z[index])
       planned_speed = float(native_velocities_x[index])
     except (TypeError, ValueError, OverflowError):
-      return False
+      return index
     if (
       not math.isfinite(plan_time)
       or plan_time < 0.0
@@ -233,9 +235,9 @@ def _future_arrays_valid(
       or not math.isfinite(planned_speed)
       or planned_speed <= 0.0
     ):
-      return False
+      return index
     previous_time = plan_time
-  return True
+  return count
 
 
 def adapt_model_intent_into(
@@ -258,6 +260,7 @@ def adapt_model_intent_into(
   output_orientation_rates_z: MutableSequence[float],
   output_velocities_x: MutableSequence[float],
   output_plan_curvatures: MutableSequence[float],
+  allow_truncated_future_prefix: bool = False,
 ) -> IntentAdaptation:
   """Adapt a model message into canonical caller-owned intent buffers.
 
@@ -400,23 +403,31 @@ def adapt_model_intent_into(
       ),
     )
 
-  future_arrays_valid = _future_arrays_valid(
+  valid_prefix_count = _valid_future_prefix_count(
     native_plan_times_s,
     native_orientation_rates_z,
     native_velocities_x,
   )
+  future_arrays_valid = (
+    native_count >= 2 and valid_prefix_count == native_count
+  )
+  truncated_suffix = bool(
+    allow_truncated_future_prefix
+    and 2 <= valid_prefix_count < native_count
+  )
+  usable_count = valid_prefix_count if truncated_suffix else native_count
   action_supported = False
   current_supported = False
   effect_supported = False
-  if future_arrays_valid:
+  if future_arrays_valid or truncated_suffix:
     first_time = float(native_plan_times_s[0])
-    last_time = float(native_plan_times_s[native_count - 1])
+    last_time = float(native_plan_times_s[usable_count - 1])
     action_supported = first_time <= action_time <= last_time
     current_supported = first_time <= plan_time_now_s <= last_time
     effect_supported = first_time <= physical_effect_plan_s <= last_time
 
   future_valid = (
-    future_arrays_valid
+    (future_arrays_valid or truncated_suffix)
     and action_supported
     and current_supported
     and effect_supported
@@ -456,7 +467,7 @@ def adapt_model_intent_into(
       ),
     )
 
-  for index in range(native_count):
+  for index in range(usable_count):
     plan_time = float(native_plan_times_s[index])
     orientation_rate = float(native_orientation_rates_z[index])
     planned_speed = float(native_velocities_x[index])
@@ -468,8 +479,12 @@ def adapt_model_intent_into(
   return IntentAdaptation(
     frame=frame,
     status=_status(
-      IntentStatusCode.OK,
-      count=native_count,
+      (
+        IntentStatusCode.MALFORMED_SUFFIX_TRUNCATED
+        if truncated_suffix
+        else IntentStatusCode.OK
+      ),
+      count=usable_count,
       future_valid=True,
       scalar_only=False,
       action_query_supported=True,

@@ -369,7 +369,11 @@ def build_modular_lateral_state(
     0.0 if core is None else core.maximum_urgency,
   )
   state.modularPreviousCommandCounts = _sint_or_zero(
-    previous_counts,
+    (
+      previous_counts
+      if live.last_projected_command_counts is None
+      else live.last_projected_command_counts
+    ),
     32,
   )
   state.modularRecordedAppliedTorque = _finite_or_zero(

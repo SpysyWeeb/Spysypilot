@@ -30,6 +30,9 @@ from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
   ApprovedProfileArtifact,
   PersistentProfileActivation,
 )
+from openpilot.selfdrive.controls.lib.blatv2.actuator import (
+  apply_torque_envelope_counts,
+)
 from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
   ControllerSelection,
   EngagementDecision,
@@ -160,7 +163,10 @@ class ModularLiveController:
     "car_output_cadence_valid",
     "transport_reprime_required",
     "pending_command_counts",
+    "pending_lateral_active",
+    "awaited_command_counts",
     "last_expected_command_counts",
+    "last_projected_command_counts",
     "final_count_residual",
     "final_count_match_valid",
     "previous_output_constrained",
@@ -279,6 +285,7 @@ class ModularLiveController:
         self.adapter = LiveInputAdapter(
           car_params=car_params,
           profile=self.controller_profile,
+          allow_truncated_future_prefix=self.experimental_active,
         )
       except Exception:
         self.eligibility = LiveEligibility.CONSTRUCTION_FAILED
@@ -300,7 +307,10 @@ class ModularLiveController:
     self.car_output_cadence_valid = False
     self.transport_reprime_required = False
     self.pending_command_counts: int | None = None
+    self.pending_lateral_active: bool | None = None
+    self.awaited_command_counts: int | None = None
     self.last_expected_command_counts: int | None = None
+    self.last_projected_command_counts: int | None = None
     self.final_count_residual = 0
     self.final_count_match_valid = False
     self.previous_output_constrained = False
@@ -566,32 +576,45 @@ class ModularLiveController:
   def final_limiter_altered(self) -> bool:
     return self.final_count_match_valid and self.final_count_residual != 0
 
-  def record_requested_command(self, torque: float) -> bool:
-    """Bind this control request to the next new CarOutput witness."""
+  def record_requested_command(
+    self,
+    torque: float,
+    *,
+    lateral_active: bool,
+  ) -> bool:
+    """Retain one request until the next frame projects card state."""
     if self.runtime_bundle is None or self.selection != ControllerSelection.MODULAR:
       self.pending_command_counts = None
+      self.pending_lateral_active = None
+      return False
+    if type(lateral_active) is not bool:
+      self.pending_command_counts = None
+      self.pending_lateral_active = None
       return False
     try:
       normalized = float(torque)
     except (TypeError, ValueError, OverflowError):
       self.pending_command_counts = None
+      self.pending_lateral_active = None
       return False
     steer_max = self.runtime_bundle.torque_limits.steer_max
     if not math.isfinite(normalized):
       self.pending_command_counts = None
+      self.pending_lateral_active = None
       return False
     counts = int(round(normalized * steer_max))
     if abs(counts) > steer_max:
       self.pending_command_counts = None
+      self.pending_lateral_active = None
       return False
     if self.transport_reprime_required:
       return False
     if self.pending_command_counts is not None:
-      # A duplicate output leaves command/output correspondence unknown. Keep
-      # the original unmatched command until one new output discards it during
-      # transport resynchronization; never relabel it as this newer request.
+      # A second request before the first was projected has unknown ordering.
+      # Keep the original request; transport resynchronization will clear it.
       return False
     self.pending_command_counts = counts
+    self.pending_lateral_active = lateral_active
     return True
 
   def observe_previous_applied(
@@ -604,6 +627,7 @@ class ModularLiveController:
     self.last_applied_count_valid = False
     self.last_steering_request_valid = False
     self.final_count_match_valid = False
+    self.final_count_residual = 0
     self.car_output_fresh = False
     self.car_output_cadence_valid = False
     if self.runtime_bundle is None:
@@ -618,6 +642,10 @@ class ModularLiveController:
       )
     ):
       self.transport_reprime_required = True
+      self.pending_command_counts = None
+      self.pending_lateral_active = None
+      self.awaited_command_counts = None
+      self.last_expected_command_counts = None
       return False
 
     prior_output_mono_ns = self.last_car_output_mono_ns
@@ -635,18 +663,22 @@ class ModularLiveController:
       and not self.transport_reprime_required
     )
     expected_counts = (
-      self.pending_command_counts if correspondence_valid else None
+      self.awaited_command_counts if correspondence_valid else None
     )
-    self.pending_command_counts = None
+    self.awaited_command_counts = None
     self.last_expected_command_counts = expected_counts
     if not self.car_output_cadence_valid:
       self.transport_reprime_required = True
+      self.pending_command_counts = None
+      self.pending_lateral_active = None
     counts = exact_applied_torque_counts(
       car_output,
       self.runtime_bundle.torque_limits,
     )
     if counts is None:
       self.transport_reprime_required = True
+      self.pending_command_counts = None
+      self.pending_lateral_active = None
       return False
     self.last_exact_applied_counts = counts
     self.last_applied_count_valid = True
@@ -656,6 +688,8 @@ class ModularLiveController:
     request_state = exact_steering_request_state(car_output)
     if request_state is None:
       self.transport_reprime_required = True
+      self.pending_command_counts = None
+      self.pending_lateral_active = None
       return False
     self.last_steering_request_active = request_state[0]
     self.last_steering_request_counter = request_state[1]
@@ -753,6 +787,10 @@ class ModularLiveController:
       self.transport_reprimed = False
       self.transport_reprime_required = False
       self.pending_command_counts = None
+      self.pending_lateral_active = None
+      self.awaited_command_counts = None
+      self.last_expected_command_counts = None
+      self.last_projected_command_counts = None
       return self.selection
 
     if self.enabled_bound:
@@ -903,29 +941,16 @@ class ModularLiveController:
     start = time.perf_counter()
     self.adapter_exception = False
     self.transport_reprimed = False
+    self.last_projected_command_counts = self.last_exact_applied_counts
     try:
       self.control_cadence_valid = self._observe_control_cadence(
         self.control_witness_ns,
       )
       if not self.control_cadence_valid:
         self.transport_reprime_required = True
-      prepared = self.adapter.prepare(
-        state_sample_mono_ns=state_sample_mono_ns,
-        control_witness_mono_ns=self.control_witness_ns,
-        model_publication_mono_ns=model_publication_mono_ns,
-        model_message=model_message,
-        car_state=car_state,
-        live_parameters=live_parameters,
-        model_message_valid=model_message_valid,
-        model_message_alive=model_message_alive,
-        vehicle_inputs_valid=vehicle_inputs_valid,
-        live_parameters_inputs_valid=live_parameters_inputs_valid,
-      )
-      self.prepared_input = prepared
-      adaptation = prepared.adaptation
-      if adaptation is None:
-        raise ValueError("live adapter returned no intent status")
-
+        self.pending_command_counts = None
+        self.pending_lateral_active = None
+        self.awaited_command_counts = None
       exact_physical_state_valid = (
         self.last_applied_count_valid
         and self.last_steering_request_valid
@@ -948,6 +973,50 @@ class ModularLiveController:
         self.transport_reprimed = True
         self.transport_reprime_required = False
 
+      previous_command_counts = self.last_exact_applied_counts
+      projection_valid = (
+        exact_physical_state_valid
+        and self.car_output_cadence_valid
+        and self.control_cadence_valid
+        and not reprime_this_frame
+      )
+      if (
+        projection_valid
+        and self.pending_command_counts is not None
+        and self.pending_lateral_active is not None
+      ):
+        previous_command_counts = (
+          apply_torque_envelope_counts(
+            self.runtime_bundle.torque_limits,
+            self.pending_command_counts,
+            self.last_exact_applied_counts,
+            driver_torque,
+          )
+          if self.pending_lateral_active
+          else 0
+        )
+        self.awaited_command_counts = previous_command_counts
+        self.pending_command_counts = None
+        self.pending_lateral_active = None
+      self.last_projected_command_counts = previous_command_counts
+
+      prepared = self.adapter.prepare(
+        state_sample_mono_ns=state_sample_mono_ns,
+        control_witness_mono_ns=self.control_witness_ns,
+        model_publication_mono_ns=model_publication_mono_ns,
+        model_message=model_message,
+        car_state=car_state,
+        live_parameters=live_parameters,
+        model_message_valid=model_message_valid,
+        model_message_alive=model_message_alive,
+        vehicle_inputs_valid=vehicle_inputs_valid,
+        live_parameters_inputs_valid=live_parameters_inputs_valid,
+      )
+      self.prepared_input = prepared
+      adaptation = prepared.adaptation
+      if adaptation is None:
+        raise ValueError("live adapter returned no intent status")
+
       # A lateral maneuver process appearing after the enabled boundary is
       # treated as invalid input.  Hot-switching to stock would violate the
       # immutable engagement contract; the normal guard safely decays instead.
@@ -961,14 +1030,14 @@ class ModularLiveController:
       if not runtime_inputs_valid:
         result = self.candidate.update_invalid_frame(
           engagement_decision=self.decision,
-          previous_command_counts=self.last_exact_applied_counts,
+          previous_command_counts=previous_command_counts,
           driver_torque=driver_torque,
           lateral_active=lateral_active,
         )
       else:
         result = self.candidate.update(
           engagement_decision=self.decision,
-          previous_command_counts=self.last_exact_applied_counts,
+          previous_command_counts=previous_command_counts,
           recorded_applied_torque=recorded_applied,
           driver_torque=prepared.driver_torque,
           frame=adaptation.frame,
@@ -1012,7 +1081,11 @@ class ModularLiveController:
       self.adapter_exception = True
       result = self.candidate.update_invalid_frame(
         engagement_decision=self.decision,
-        previous_command_counts=self.last_exact_applied_counts,
+        previous_command_counts=(
+          self.last_exact_applied_counts
+          if self.last_projected_command_counts is None
+          else self.last_projected_command_counts
+        ),
         driver_torque=driver_torque,
         lateral_active=lateral_active,
       )
