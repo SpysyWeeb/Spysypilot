@@ -262,6 +262,54 @@ class TestBLaTv2Intent(unittest.TestCase):
         )
         self.assertTrue(result.status.scalar_only)
 
+  def test_development_mode_uses_only_a_query_complete_positive_prefix(
+    self,
+  ) -> None:
+    speeds = list(self.speeds)
+    speeds[-1] = -0.01
+    strict, _ = self.adapt(
+      native_velocities_x=speeds,
+      physical_transport_delay_s=0.09,
+    )
+    self.assertEqual(
+      strict.status.code,
+      IntentStatusCode.SCALAR_ONLY_MALFORMED_FUTURE,
+    )
+
+    truncated, outputs = self.adapt(
+      native_velocities_x=speeds,
+      physical_transport_delay_s=0.09,
+      allow_truncated_future_prefix=True,
+    )
+    self.assertEqual(
+      truncated.status.code,
+      IntentStatusCode.MALFORMED_SUFFIX_TRUNCATED,
+    )
+    self.assertTrue(truncated.status.usable)
+    self.assertTrue(truncated.status.future_valid)
+    self.assertFalse(truncated.status.scalar_only)
+    self.assertEqual(truncated.status.count, 4)
+    self.assertTrue(truncated.frame.validity.plan_valid)
+    self.assertEqual(outputs[0][:4], self.times[:4])
+    self.assertEqual(outputs[1][:4], self.rates[:4])
+    self.assertEqual(outputs[2][:4], self.speeds[:4])
+    self.assertTrue(
+      all(value == 0.0 for output in outputs for value in output[4:])
+    )
+
+    speeds[3] = 0.0
+    unsupported, _ = self.adapt(
+      native_velocities_x=speeds,
+      physical_transport_delay_s=0.09,
+      allow_truncated_future_prefix=True,
+    )
+    self.assertEqual(
+      unsupported.status.code,
+      IntentStatusCode.SCALAR_ONLY_MALFORMED_FUTURE,
+    )
+    self.assertTrue(unsupported.status.scalar_only)
+    self.assertFalse(unsupported.status.action_query_supported)
+
   def test_action_current_and_effect_query_support_are_explicit(self) -> None:
     unsupported_action, _ = self.adapt(
       published_desired_curvature_time_s=0.45,

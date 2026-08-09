@@ -997,13 +997,32 @@ def test_exact_count_source_rejects_fractional_normalized_reconstruction() -> No
   assert selected.last_exact_applied_counts is None
 
 
-def test_final_limiter_residual_uses_the_next_new_car_output_count() -> None:
+def test_final_limiter_residual_pairs_awaited_projection_not_inflight_command(
+  monkeypatch,
+) -> None:
   selected = experimental_live()
-  state, output, _ = vehicle_messages()
+  state, output, live_params = vehicle_messages()
   clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
   bind_modular(selected, clock, state, output)
 
-  assert selected.record_requested_command(41 / 409)
+  assert selected.record_requested_command(41 / 409, lateral_active=True)
+  output.actuatorsOutput.torqueOutputCan = 40.0
+  projected = step(selected, clock, state, output, live_params)
+  assert selected.last_projected_command_counts == 41
+  assert selected.awaited_command_counts == 41
+  assert selected.last_expected_command_counts is None
+  assert selected.record_requested_command(
+    projected.command_torque,
+    lateral_active=True,
+  )
+
+  # The next published output corresponds to the older projected request;
+  # the newer command remains in flight for command-time projection.
   output.actuatorsOutput.torqueOutputCan = 40.0
   assert selected.observe_previous_applied(
     output,
@@ -1013,6 +1032,9 @@ def test_final_limiter_residual_uses_the_next_new_car_output_count() -> None:
   assert selected.final_count_residual == -1
   assert selected.final_count_match_valid
   assert selected.final_limiter_altered
+  assert selected.pending_command_counts == round(
+    projected.command_torque * 409,
+  )
 
   telemetry = build_modular_lateral_state(
     selected,
@@ -1028,13 +1050,14 @@ def test_final_limiter_residual_uses_the_next_new_car_output_count() -> None:
     assert decoded.modularFinalCountMatchValid
     assert decoded.modularFinalLimiterAltered
 
-  assert selected.record_requested_command(44 / 409)
   output.actuatorsOutput.torqueOutputCan = 44.0
   assert not selected.observe_previous_applied(
     output,
     car_output_mono_ns=clock.now_ns,
   )
-  assert selected.pending_command_counts == 44
+  assert selected.pending_command_counts is None
+  assert selected.pending_lateral_active is None
+  assert selected.awaited_command_counts is None
   assert selected.transport_reprime_required
   assert not selected.final_count_match_valid
   clock.advance()
@@ -1046,6 +1069,239 @@ def test_final_limiter_residual_uses_the_next_new_car_output_count() -> None:
   assert selected.last_expected_command_counts is None
   assert not selected.final_count_match_valid
   assert not selected.final_limiter_altered
+
+
+def test_inflight_projection_preserves_each_production_rate_step(
+  monkeypatch,
+) -> None:
+  selected = experimental_live()
+  state, output, live_params = vehicle_messages()
+  output.actuatorsOutput.torqueOutputCan = 0.0
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
+  bind_modular(selected, clock, state, output)
+  limits = selected.runtime_bundle.torque_limits
+  model_input = model(curvature=0.2)
+  stored_output = 0
+  card_internal = 0
+  inflight_command = None
+  published_trace = []
+  command_trace = []
+
+  for _ in range(5):
+    # Card publishes its stored result, advances its internal limiter with the
+    # older in-flight CarControl, then controlsd computes the next request.
+    output.actuatorsOutput.torqueOutputCan = float(stored_output)
+    published_trace.append(stored_output)
+    if inflight_command is not None:
+      card_internal = apply_torque_envelope_counts(
+        limits,
+        inflight_command,
+        card_internal,
+        state.steeringTorque,
+      )
+    stored_output = card_internal
+
+    assert selected.observe_previous_applied(
+      output,
+      car_output_mono_ns=clock.now_ns,
+    )
+    result = selected.update_modular(
+      state_sample_mono_ns=clock.now_ns - 5_000_000,
+      model_publication_mono_ns=clock.now_ns - 10_000_000,
+      model_message=model_input,
+      car_state=state,
+      live_parameters=live_params,
+      model_message_valid=True,
+      model_message_alive=True,
+      vehicle_inputs_valid=True,
+      live_parameters_inputs_valid=True,
+      lateral_active=True,
+      actuator_constrained_previous=False,
+      lateral_maneuver_active=False,
+    )
+    inflight_command = round(result.command_torque * limits.steer_max)
+    command_trace.append(inflight_command)
+    assert selected.record_requested_command(
+      result.command_torque,
+      lateral_active=True,
+    )
+    clock.advance()
+
+  assert published_trace[1:] == [0, -4, -8, -12]
+  assert command_trace == [-4, -8, -12, -16, -20]
+  assert selected.last_exact_applied_counts == -12
+  assert selected.last_projected_command_counts == -16
+  assert selected.last_expected_command_counts == -12
+  assert selected.final_count_match_valid
+  assert not selected.final_limiter_altered
+
+  telemetry = build_modular_lateral_state(
+    selected,
+    lateral_active=True,
+    measured_curvature=0.0,
+    v_ego_m_s=state.vEgo,
+  )
+  assert telemetry.modularPreviousAppliedCounts == -12
+  assert telemetry.modularPreviousCommandCounts == -16
+  assert telemetry.modularFinalExpectedCounts == -12
+
+
+def test_inflight_projection_uses_card_state_for_unwind(monkeypatch) -> None:
+  selected = experimental_live()
+  state, output, live_params = vehicle_messages()
+  output.actuatorsOutput.torqueOutputCan = -71.0
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
+  bind_modular(selected, clock, state, output)
+  assert selected.record_requested_command(
+    -73 / 409,
+    lateral_active=True,
+  )
+  assert selected.observe_previous_applied(
+    output,
+    car_output_mono_ns=clock.now_ns,
+  )
+  result = selected.update_modular(
+    state_sample_mono_ns=clock.now_ns - 5_000_000,
+    model_publication_mono_ns=clock.now_ns - 10_000_000,
+    model_message=model(curvature=0.00128),
+    car_state=state,
+    live_parameters=live_params,
+    model_message_valid=True,
+    model_message_alive=True,
+    vehicle_inputs_valid=True,
+    live_parameters_inputs_valid=True,
+    lateral_active=True,
+    actuator_constrained_previous=False,
+    lateral_maneuver_active=False,
+  )
+
+  assert selected.last_exact_applied_counts == -71
+  assert selected.last_projected_command_counts == -73
+  assert result.core_result is not None
+  assert result.core_result.raw_requested_counts == -58
+  assert result.feasible_counts == -66
+  assert round(result.command_torque * 409) == -66
+
+
+def test_inflight_projection_uses_driver_torque_and_lateral_active(
+  monkeypatch,
+) -> None:
+  def project(*, pending_lateral_active: bool) -> ModularLiveController:
+    selected = experimental_live()
+    state, output, live_params = vehicle_messages()
+    state.steeringTorque = -200.0
+    state.steeringPressed = True
+    output.actuatorsOutput.torqueOutputCan = 300.0
+    clock = FakeClock()
+    monkeypatch.setattr(
+      live_module,
+      "control_witness_mono_ns",
+      lambda: clock.now_ns,
+    )
+    bind_modular(selected, clock, state, output)
+    assert selected.record_requested_command(
+      1.0,
+      lateral_active=pending_lateral_active,
+    )
+    assert selected.observe_previous_applied(
+      output,
+      car_output_mono_ns=clock.now_ns,
+    )
+    selected.update_modular(
+      state_sample_mono_ns=clock.now_ns - 5_000_000,
+      model_publication_mono_ns=clock.now_ns - 10_000_000,
+      model_message=model(),
+      car_state=state,
+      live_parameters=live_params,
+      model_message_valid=True,
+      model_message_alive=True,
+      vehicle_inputs_valid=True,
+      live_parameters_inputs_valid=True,
+      lateral_active=True,
+      actuator_constrained_previous=False,
+      lateral_maneuver_active=False,
+    )
+    return selected
+
+  active = project(pending_lateral_active=True)
+  assert active.last_projected_command_counts == 293
+  assert active.awaited_command_counts == 293
+
+  inactive = project(pending_lateral_active=False)
+  assert inactive.last_projected_command_counts == 0
+  assert inactive.awaited_command_counts == 0
+
+
+def test_experimental_intent_uses_supported_positive_prefix_only(
+  monkeypatch,
+) -> None:
+  state, output, live_params = vehicle_messages()
+  model_input = model()
+  speeds = list(model_input.velocity.x)
+  speeds[13] = -0.01
+  model_input.velocity.x = speeds
+
+  experimental = experimental_live()
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
+  bind_modular(experimental, clock, state, output)
+  result = step(
+    experimental,
+    clock,
+    state,
+    output,
+    live_params,
+    model_input=model_input,
+  )
+  assert experimental.prepared_input is not None
+  assert experimental.prepared_input.adaptation is not None
+  assert (
+    experimental.prepared_input.adaptation.status.code
+    == IntentStatusCode.MALFORMED_SUFFIX_TRUNCATED
+  )
+  assert experimental.prepared_input.adaptation.status.count == 13
+  assert result.status == CandidateStatus.MODULAR_OK
+
+  approved = live()
+  approved_clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: approved_clock.now_ns,
+  )
+  _, approved_output, _ = vehicle_messages()
+  bind_modular(approved, approved_clock, state, approved_output)
+  strict = step(
+    approved,
+    approved_clock,
+    state,
+    approved_output,
+    live_params,
+    model_input=model_input,
+  )
+  assert approved.prepared_input is not None
+  assert approved.prepared_input.adaptation is not None
+  assert (
+    approved.prepared_input.adaptation.status.code
+    == IntentStatusCode.SCALAR_ONLY_MALFORMED_FUTURE
+  )
+  assert strict.status == CandidateStatus.MODULAR_CORE_INVALID
+  assert strict.core_result is not None
+  assert strict.core_result.status == CoreStatus.REFERENCE_FAILURE
 
 
 def test_missing_request_state_guards_and_requires_transport_reprime(
@@ -1061,7 +1317,10 @@ def test_missing_request_state_guards_and_requires_transport_reprime(
 
   valid = step(selected, clock, state, output, live_params)
   assert valid.status == CandidateStatus.MODULAR_OK
-  assert selected.record_requested_command(valid.command_torque)
+  assert selected.record_requested_command(
+    valid.command_torque,
+    lateral_active=True,
+  )
 
   output.actuatorsOutput.steeringRequestActiveValid = False
   missing = step(selected, clock, state, output, live_params)
@@ -1069,7 +1328,10 @@ def test_missing_request_state_guards_and_requires_transport_reprime(
   assert missing.safety_state == LiveSafetyState.HOLDING_FIRST_INVALID
   assert selected.transport_reprime_required
   assert not selected.adapter_exception
-  assert not selected.record_requested_command(missing.command_torque)
+  assert not selected.record_requested_command(
+    missing.command_torque,
+    lateral_active=True,
+  )
 
   output.actuatorsOutput.steeringRequestActiveValid = True
   resync = step(selected, clock, state, output, live_params)
@@ -1077,7 +1339,10 @@ def test_missing_request_state_guards_and_requires_transport_reprime(
   assert selected.transport_reprimed
   assert not selected.transport_reprime_required
   assert not selected.adapter_exception
-  assert selected.record_requested_command(resync.command_torque)
+  assert selected.record_requested_command(
+    resync.command_torque,
+    lateral_active=True,
+  )
 
 
 def test_gapped_car_output_invalidates_and_reprimes_transport(monkeypatch) -> None:
@@ -1090,7 +1355,10 @@ def test_gapped_car_output_invalidates_and_reprimes_transport(monkeypatch) -> No
   bind_modular(selected, clock, state, output)
 
   valid = step(selected, clock, state, output, live_params)
-  assert selected.record_requested_command(valid.command_torque)
+  assert selected.record_requested_command(
+    valid.command_torque,
+    lateral_active=True,
+  )
   gapped = step(
     selected,
     clock,

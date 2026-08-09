@@ -182,6 +182,7 @@ class LiveInputAdapter:
     "orientation_rates_z",
     "velocities_x",
     "plan_curvatures",
+    "allow_truncated_future_prefix",
     "result",
     "_rack_motion",
   )
@@ -191,6 +192,7 @@ class LiveInputAdapter:
     *,
     car_params: car.CarParams,
     profile: VehicleProfile,
+    allow_truncated_future_prefix: bool = False,
   ) -> None:
     if not isinstance(profile, VehicleProfile):
       raise TypeError("live adapter requires an exact VehicleProfile")
@@ -201,6 +203,9 @@ class LiveInputAdapter:
     self.orientation_rates_z = [0.0] * INTENT_CAPACITY
     self.velocities_x = [0.0] * INTENT_CAPACITY
     self.plan_curvatures = [0.0] * INTENT_CAPACITY
+    self.allow_truncated_future_prefix = bool(
+      allow_truncated_future_prefix,
+    )
     self.result = PreparedLiveInput()
     self._rack_motion = SignedRackMotionNormalizer()
 
@@ -498,6 +503,9 @@ class LiveInputAdapter:
         output_orientation_rates_z=self.orientation_rates_z,
         output_velocities_x=self.velocities_x,
         output_plan_curvatures=self.plan_curvatures,
+        allow_truncated_future_prefix=(
+          self.allow_truncated_future_prefix
+        ),
       )
     except (AttributeError, TypeError, ValueError, OverflowError):
       output.status = LiveAdapterStatus.INVALID_MODEL_FIELDS
