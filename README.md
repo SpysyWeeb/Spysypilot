@@ -2,10 +2,9 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see
 the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for
-the full fork overview. This fork is entirely vibe-coded with
-[Claude Code](https://claude.com/claude-code), is a personal project, and is
-**not meant for others to use**; anyone who tries it does so at their own
-risk.
+the full fork overview. This fork is entirely vibe-coded, is a personal
+project, and is **not meant for others to use**; anyone who tries it does so
+at their own risk.
 
 Detailed implementation notes:
 [`docs/DrivingEventPlatform.md`](docs/DrivingEventPlatform.md).
