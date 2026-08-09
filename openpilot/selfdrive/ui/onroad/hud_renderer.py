@@ -108,8 +108,6 @@ class HudRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     """Render HUD elements to the screen."""
-    self._torque_bar.render(rect)
-
     # Draw the header background
     rl.draw_rectangle_gradient_v(
       int(rect.x),
@@ -129,6 +127,7 @@ class HudRenderer(Widget):
     button_y = rect.y + UI_CONFIG.border_size
     self._exp_button.render(rl.Rectangle(button_x, button_y, UI_CONFIG.button_size, UI_CONFIG.button_size))
     self._draw_steering_wheel(rect)
+    self._torque_bar.render(rect)
 
   def user_interacting(self) -> bool:
     return self._exp_button.is_pressed
