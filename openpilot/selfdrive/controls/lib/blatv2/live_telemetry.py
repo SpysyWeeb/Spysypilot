@@ -12,6 +12,7 @@ from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
 from openpilot.selfdrive.controls.lib.blatv2.live_controller import (
   MODULAR_LIVE_ARCHITECTURE,
   MODULAR_LIVE_VERSION,
+  MODULAR_REACTIVE_ARCHITECTURE,
   ModularLiveController,
 )
 
@@ -102,7 +103,11 @@ def build_modular_lateral_state(
   state.desiredLateralJerk = 0.0
   state.version = int(MODULAR_LIVE_VERSION)
 
-  state.modularArchitecture = MODULAR_LIVE_ARCHITECTURE
+  state.modularArchitecture = (
+    MODULAR_REACTIVE_ARCHITECTURE
+    if live.experimental_active
+    else MODULAR_LIVE_ARCHITECTURE
+  )
   state.modularControllerVersion = int(MODULAR_LIVE_VERSION)
   state.modularSelection = int(live.selection)
   state.modularBindingReason = int(live.binding_reason)

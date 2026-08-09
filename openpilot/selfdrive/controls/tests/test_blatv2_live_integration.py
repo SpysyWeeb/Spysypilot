@@ -16,6 +16,7 @@ from openpilot.selfdrive.controls.lib.blatv2.stock_bootstrap import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   RuntimeTorqueLimits,
+  apply_torque_envelope_counts,
 )
 from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
   ApprovedProfileArtifact,
@@ -31,7 +32,11 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import (
   CandidateStatus,
 )
 from openpilot.selfdrive.controls.lib.blatv2.core import CoreStatus
-from openpilot.selfdrive.controls.lib.blatv2.horizon import HorizonPolicy
+from openpilot.selfdrive.controls.lib.blatv2.horizon import (
+  HORIZON_SAMPLE_COUNT,
+  HorizonPolicy,
+  HorizonStatus,
+)
 from openpilot.selfdrive.controls.lib.blatv2.intent import (
   IntentStatusCode,
   MAX_MODEL_PUBLICATION_AGE_NS,
@@ -567,12 +572,38 @@ def test_explicit_experimental_candidate_binds_one_unqualified_controller(
   assert not selected.controller_profile.qualified
   assert selected.controller_policy is not None
   assert selected.controller_policy.provisional
+  assert selected.candidate is not None
+  assert selected.candidate.core.development_reactive_only
+  assert selected.candidate.core.reference_count == 1
+  assert selected.candidate.core.horizon is None
 
   bind_modular(selected, clock, state, output)
   assert selected.decision is not None
   assert selected.decision.provisional
   result = step(selected, clock, state, output, live_params)
   assert result.status == CandidateStatus.MODULAR_OK
+  assert result.core_result is not None
+  assert result.core_result.horizon_status == HorizonStatus.REACTIVE_ONLY
+  assert not result.core_result.horizon_valid
+  assert result.core_result.planned_counts == result.core_result.reactive_counts
+  assert result.core_result.planned_counts == apply_torque_envelope_counts(
+    selected.runtime_bundle.torque_limits,
+    result.core_result.raw_requested_counts,
+    37,
+    state.steeringTorque,
+  )
+  assert result.core_result.planned_torque == (
+    result.core_result.planned_counts / 409
+  )
+  telemetry = build_modular_lateral_state(
+    selected,
+    lateral_active=True,
+    measured_curvature=0.0,
+    v_ego_m_s=10.0,
+  )
+  assert telemetry.modularArchitecture == "blatv2.modular.inverse-rack"
+  assert telemetry.modularHorizonStatus == HorizonStatus.REACTIVE_ONLY
+  assert not telemetry.modularHorizonValid
   assert selected.selection == ControllerSelection.MODULAR
 
 
@@ -632,6 +663,10 @@ def test_approved_artifact_takes_precedence_over_experimental_request() -> None:
   assert selected.artifact is approved
   assert selected.controller_profile is approved.vehicle_profile
   assert selected.controller_policy is approved.controller_policy
+  assert selected.candidate is not None
+  assert not selected.candidate.core.development_reactive_only
+  assert selected.candidate.core.reference_count == HORIZON_SAMPLE_COUNT
+  assert selected.candidate.core.horizon is not None
 
 
 def test_experimental_parameter_is_development_only_and_process_bound() -> None:
