@@ -7,11 +7,6 @@ import math
 from typing import Any
 
 from openpilot.cereal.services import SERVICE_LIST
-from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
-  MeasuredLearningFrame,
-)
-
-
 # Each source may be at most one-and-a-half declared publication periods older
 # than a controls witness. This is an alignment bound, not controller tuning.
 MAX_SOURCE_AGE_PERIODS = 1.5
@@ -133,69 +128,3 @@ def maximum_source_age_ns(service: str) -> int:
   if not math.isfinite(frequency) or frequency <= 0.0:
     raise ValueError("learning source must have a positive declared frequency")
   return int(round(MAX_SOURCE_AGE_PERIODS * 1e9 / frequency))
-
-
-def measured_learning_frame(
-  *,
-  witness_mono_ns: int,
-  car_state_mono_ns: int,
-  car_output_mono_ns: int,
-  previous_car_output_mono_ns: int | None,
-  car_state: Any,
-  car_control: Any,
-  car_output: Any,
-  live_parameters: Any,
-) -> MeasuredLearningFrame:
-  """Copy measured response plus its source clocks into learner input.
-
-  ``carOutput`` publishes the actuator result from the preceding card cycle.
-  Its effective command time is therefore the preceding carOutput publication
-  timestamp, while ``car_output_mono_ns`` remains the report identity used for
-  duplicate detection. No source clock is replaced by controlsState time.
-  """
-  witness = int(witness_mono_ns)
-  response = int(car_state_mono_ns)
-  applied_report = int(car_output_mono_ns)
-  applied_effective = (
-    0
-    if previous_car_output_mono_ns is None
-    else int(previous_car_output_mono_ns)
-  )
-  return MeasuredLearningFrame(
-    sample_mono_ns=witness,
-    response_mono_ns=response,
-    applied_report_mono_ns=applied_report,
-    applied_effective_mono_ns=applied_effective,
-    speed_mps=float(car_state.vEgo),
-    steering_angle_deg=float(car_state.steeringAngleDeg),
-    steering_rate_deg_s=float(car_state.steeringRateDeg),
-    steering_torque=float(car_state.steeringTorque),
-    steering_pressed=bool(car_state.steeringPressed),
-    standstill=bool(car_state.standstill),
-    steer_fault_temporary=bool(car_state.steerFaultTemporary),
-    steer_fault_permanent=bool(car_state.steerFaultPermanent),
-    can_valid=bool(car_state.canValid),
-    can_timeout=bool(car_state.canTimeout),
-    applied_torque=float(car_output.actuatorsOutput.torque),
-    # carControl contributes only the proof that lateral output was enabled.
-    lateral_active=bool(car_control.latActive),
-    live_parameters_valid=bool(live_parameters.valid),
-    angle_offset_valid=bool(live_parameters.angleOffsetValid),
-    steer_ratio_valid=bool(live_parameters.steerRatioValid),
-    stiffness_factor_valid=bool(
-      live_parameters.stiffnessFactorValid,
-    ),
-    angle_offset_deg=float(live_parameters.angleOffsetDeg),
-    steer_ratio=float(live_parameters.steerRatio),
-    stiffness_factor=float(live_parameters.stiffnessFactor),
-    roll_rad=float(live_parameters.roll),
-    inputs_valid=(
-      witness > 0
-      and 0 < response <= witness
-      and 0 < applied_report <= witness
-      and (
-        applied_effective == 0
-        or 0 < applied_effective < applied_report
-      )
-    ),
-  )

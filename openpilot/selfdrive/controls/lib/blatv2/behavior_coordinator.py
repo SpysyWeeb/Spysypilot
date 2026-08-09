@@ -42,7 +42,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
 )
 
 
-BEHAVIOR_GATE_SPEC_SCHEMA_VERSION = 3
+BEHAVIOR_GATE_SPEC_SCHEMA_VERSION = 4
 BEHAVIOR_FINALIZATION_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -703,7 +703,6 @@ class BehaviorLearningFinalization:
       self.smooth_passed
       and self.swift_passed
       and self.strong_passed
-      and self.target_materially_improved
     )
     emitted = (
       self.final_behavior_policy is not None
@@ -1150,7 +1149,7 @@ def finalize_behavior_learning(
     elif not strong_passed:
       reason = FinalizationReason.STRONG_CROSS_FIT_REGRESSION
     else:
-      reason = FinalizationReason.TARGET_VALIDATION_NOT_MATERIAL
+      reason = FinalizationReason.EVALUATION_METRICS_INVALID
     return _failed_finalization(
       gate_spec,
       reason,

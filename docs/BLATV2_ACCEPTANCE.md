@@ -5,6 +5,11 @@ offline artifact to shadow collection and, eventually, actuation. A later
 stage may not waive an earlier one. Until every activation gate passes, the
 stock openpilot torque controller remains the sole actuator.
 
+The Palisade-only development parameter is a separate, explicit owner-trial
+path for the bundled provisional tune. It does not pass or weaken any gate in
+this document, create an approved artifact, or run beside stock. Stock remains
+the default, and one controller is bound for the complete lateral session.
+
 All current learning and qualification work is PC-only. The device records
 ordinary full rlogs and runs no BLaTv2 learner, replay worker, route uploader,
 or Wi-Fi bridge. An operator copies closed routes into durable PC storage over
@@ -198,10 +203,11 @@ The current contract identities are:
 | calibration profile / evidence / coordinator | 2 / 9 / 9 |
 | runtime vehicle / calibration identity / provisional dynamics | 1 / 1 / 1 |
 | physical learning / operation / progress status | 4 / 1 / 1 |
-| native extractor / canonical join | 3 / 3 |
-| route evidence | `BLATRE02`, version 2 |
-| backfill ledger / commit / pointer | 2 / 2 / 1 |
-| inclusion namespace | `complete_full_rlog_authority_v7` |
+| native extractor / canonical join | 5 / 5 |
+| physical-frame encoding | 2 |
+| route evidence | `BLATRE04`, version 4 |
+| backfill ledger / commit / pointer | 3 / 2 / 1 |
+| inclusion namespace | `complete_full_rlog_authority_v8` |
 | controller policy | 1 |
 | behavior gate / segmentation / replay input | 3 / 1 / 1 |
 | behavior transaction / finalization | 2 / 1 |
@@ -212,7 +218,7 @@ The current contract identities are:
 | off-device protocol / certification | 2 / 5 |
 | off-device display progress | 2 |
 
-The v7 physical namespace starts from empty evidence. Retired v1 through v6
+The v8 physical namespace starts from empty evidence. Retired v1 through v7
 artifact bytes are immutable and cannot be migrated into it.
 
 Each speed node independently requires its documented clean support,
@@ -336,12 +342,11 @@ it.
 
 The field manager must contain zero BLaTv2 background processes on a real car.
 Shadow, learning, replay, profile-lifecycle, transfer, and bridge entrypoints
-remain absent while stock is the sole active controller. Retained libraries and
-wire/schema identities are offline compatibility surfaces, not managed
-services. A future activation build
-must first add a reviewed offroad witness for exact provisional-profile
-exercise and feedback; it may not restore an always-on lifecycle observer by
-assumption.
+remain absent whether stock or the explicit provisional trial owns the lateral
+session. Retained libraries and wire/schema identities are offline
+compatibility surfaces, not managed services. Any approved activation build
+must add a reviewed offroad witness for exact candidate exercise and feedback;
+it may not restore an always-on lifecycle observer by assumption.
 
 This isolation is a measured field-load decision. On route `d1` from combo
 build `ff842`, `blatv2_shadowd` exited with status `-6` 302 times at roughly a

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "revision": 0,
+  "provisional": true,
+  "immediate_confidence": 1.0,
+  "preparation_confidence": 0.5,
+  "reserve_confidence": 0.25,
+  "smooth_position_tolerance_s": 0.05,
+  "smooth_rate_tolerance_quanta": 1.0,
+  "no_lead_position_tolerance_s": 0.01,
+  "no_lead_rate_tolerance_quanta": 1.0,
+  "maximum_torque_slack": 0.25,
+  "provenance": "Unqualified two-second Palisade development policy. Confidence changes admissible torque slack, never the model path; no-lead tolerances are expressed through the detected rack-rate quantum. Values require replay, device timing, fresh held-out routes, and owner field testing before approval."
+}

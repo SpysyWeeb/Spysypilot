@@ -26,6 +26,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationSampleAccounting,
   CalibrationSampleDisposition,
   MIN_STRATUM_TRAINING_ROWS,
+  TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
@@ -39,6 +40,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_status import (
   build_learning_status_payload,
   decode_learning_status,
   _validate_cross_fit_status,
+  _validate_paired_loss,
   validate_learning_status_payload,
 )
 
@@ -348,7 +350,7 @@ def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 10
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 12
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -398,6 +400,36 @@ def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None
   assert node["last_drive_authority_sample_count"] == 10
   assert node["last_drive_authority_fit_support_s"] == 1.0
   assert node["last_drive_authority_fit_sample_count"] == 10
+
+
+def test_terminal_exact_seed_loss_does_not_invent_one_route_uncertainty() -> None:
+  loss = {
+    "lower_bound_mse": None,
+    "mean_candidate_minus_seed_mse": 0.0,
+    "numerical_tolerance_mse": 1e-14,
+    "route_count": 1,
+    "uncertainty_mse": None,
+    "upper_bound_mse": None,
+  }
+  assert _validate_paired_loss(
+    loss,
+    "terminal authority",
+    optional=False,
+  ) == "inconclusive"
+  assert _validate_paired_loss(
+    loss,
+    "terminal authority",
+    optional=False,
+    identical=True,
+  ) == "no_regression"
+  loss["mean_candidate_minus_seed_mse"] = 5e-15
+  with unittest.TestCase().assertRaisesRegex(ValueError, "not identical"):
+    _validate_paired_loss(
+      loss,
+      "terminal authority",
+      optional=False,
+      identical=True,
+    )
 
 
 def test_fully_evaluated_cross_fit_regression_is_not_reported_as_pending() -> None:
@@ -942,6 +974,43 @@ def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
   assert all(node["evaluation_status"] == "seed_retained" for node in payload["nodes"])
   assert all(node["cross_fit_paired_loss"]["route_count"] == 2 for node in payload["nodes"])
   assert all(node["full_fit_diagnostic"] is not None for node in payload["nodes"])
+
+  terminal = json.loads(json.dumps(payload))
+  terminal["vehicle_identity"] = TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY
+  terminal["nodes"][-1]["speed_mps"] = 30.0
+  terminal["interpolation_reports"][-1]["upper_speed_mps"] = 30.0
+  node = terminal["nodes"][-1]
+  node["authority_cross_fit_route_count"] = 1
+  node["independent_route_counts"]["authority"] = 1
+  node["full_fit_diagnostic"] = node["fit_diagnostics"][0]
+  for index, diagnostic in enumerate(node["cross_fit_diagnostics"]):
+    if index == 0:
+      diagnostic["status"] = CalibrationCrossFitStatus.HELD_OUT_REGRESSION.value
+      diagnostic["regressed_fold_count"] = 1
+      node["cross_fit_paired_loss"] = json.loads(json.dumps(diagnostic["paired_loss"]))
+    else:
+      diagnostic.update({
+        "failed_fold_count": 0,
+        "regressed_fold_count": 0,
+        "status": CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES.value,
+        "successful_fold_count": 0,
+      })
+      diagnostic["paired_loss"] = {
+        "lower_bound_mse": None,
+        "mean_candidate_minus_seed_mse": None,
+        "numerical_tolerance_mse": None,
+        "route_count": 0,
+        "uncertainty_mse": None,
+        "upper_bound_mse": None,
+      }
+  validate_learning_status_payload(terminal)
+
+  changed_seed = json.loads(json.dumps(terminal))
+  changed_seed["nodes"][-1]["full_fit_paired_loss"][
+    "mean_candidate_minus_seed_mse"
+  ] = 1e-15
+  with unittest.TestCase().assertRaisesRegex(ValueError, "not identical"):
+    validate_learning_status_payload(changed_seed)
 
 
 def test_failure_classifications_remain_distinct() -> None:

@@ -103,6 +103,7 @@ class FakeEvent:
       which in learning_backfill._SOURCE_SERVICES
       or which in learning_backfill._BEHAVIOR_CONTEXT_SERVICES
       or which in learning_backfill._CANONICAL_WITNESS_SERVICES
+      or which in learning_backfill._REQUEST_CONTEXT_SERVICES
     ):
       setattr(self, which, payload)
 
@@ -142,7 +143,13 @@ def source_message(service: str, cp: car.CarParams) -> object:
     )
   if service == "carOutput":
     return SimpleNamespace(
-      actuatorsOutput=SimpleNamespace(torque=0.0, torqueOutputCan=0.0),
+      actuatorsOutput=SimpleNamespace(
+        torque=0.0,
+        torqueOutputCan=0.0,
+        steeringRequestActive=True,
+        steeringRequestActiveValid=True,
+        steeringRequestFaultAvoidanceCounter=0,
+      ),
     )
   if service == "liveParameters":
     return SimpleNamespace(
@@ -197,6 +204,15 @@ def model_message(frame_id: int) -> object:
     orientationRate=SimpleNamespace(t=(0.0, 0.05), z=(0.0, 0.0)),
     velocity=SimpleNamespace(t=(0.0, 0.05), x=(10.0, 10.0)),
   )
+
+
+def sendcan_message(torque_count: int = 0) -> tuple[object, ...]:
+  steering_word = (torque_count + 1024) | (1 << 11)
+  return (SimpleNamespace(
+    address=learning_backfill.HYUNDAI_LKAS11_ADDRESS,
+    dat=b"\0\0" + steering_word.to_bytes(2, "little") + b"\0" * 4,
+    src=learning_backfill.HYUNDAI_LKAS11_BUS,
+  ),)
 
 
 def extracted_fixture(
@@ -274,6 +290,13 @@ def extracted_fixture(
     base - 10_000_000,
     payload=b"canonical-route-car-params",
   )
+  # Boundary for the first report. Each following sendcan is the exact command
+  # represented by the next CarOutput publication.
+  add(
+    "carOutput",
+    base - 9_000_000,
+    payload=source_message("carOutput", cp),
+  )
   if duplicate_car_params:
     add(
       "carParams",
@@ -300,7 +323,6 @@ def extracted_fixture(
     base - 2_000_000,
     payload=SimpleNamespace(desiredCurvature=0.0),
   )
-
   for index in range(control_count):
     timestamp = base + index * 10_000_000
     if source_mode == "gap" and index >= control_count // 2:
@@ -311,6 +333,12 @@ def extracted_fixture(
       or source_mode == "late" and index >= control_count // 2
       or source_mode == "control_before_equal" and index > 0
     )
+    publishes_output = (
+      publish_sources
+      or source_mode == "control_before_equal" and index == 0
+    )
+    if publishes_output:
+      add("sendcan", timestamp - 5_000_000, payload=sendcan_message())
     model_mono_ns = timestamp - 1_000_000
     add("modelV2", model_mono_ns, payload=model_message(index))
     add("selfdriveState", timestamp, payload=SimpleNamespace())

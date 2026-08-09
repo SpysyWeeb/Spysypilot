@@ -19,24 +19,28 @@ REGISTRY_PATH = (
   / "historical_build_descriptors.json"
 )
 REVIEWED_REGISTRY_SHA256 = (
-  "23e8646bf149b64814d956900183e7983582f9554170a428afc2db1e6e7c350c"
+  "8e5139f50a93f5b8c1f6f0b0655ad7eef20a7713af5b93d8252697e481c35eeb"
 )
 FIRST_DESCRIPTOR_SHA256 = (
-  "8ce8026f4ff30b1036206046dcd96aa3b27a47f61f21673a2629154379769684"
+  "55b6ceed6856a1f60ea5d6a2e7a0fd0a7af08e4fdae060586c242d97fa019f93"
 )
 INTENDED_ROOT_COMMITS = {
+  "013adde4ba5c7e6f66b40809a641c620894ddbca",
   "02bf07c412b4ae92889c7a977fec61328a300c66",
   "04a9f12d75c27ee349cd883bbd4ec68c0cc99413",
   "080f2a55a07484a6f71cfe9706c1fdaea5dca5d8",
   "0cf7aeda81d66ca340f5f80ec581745066818473",
+  "1021699bac528ba4ce39db23990c4d2e7867d4ba",
   "22b915a7ab7a1d2963c12db9cc6a48bda3be708f",
   "2447667ea36160b7706b8ab919bc2d4e71b54f56",
   "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
+  "320ab0def1d484675a9f1653fd5f80f73f96d4c0",
   "34357419f38b84e2de90bc9cbfdfb5704a282627",
   "36bcc1be838138d39e90a70e8ba5277dc87e04a3",
   "3849a2f72e8fe1902dc4b91c4a3b98384295103a",
   "3b41587559d7822986565dcd13904cfb0c3aae2e",
   "49d7f41ae428464ee9cb95a3e381f45f0865ba9d",
+  "624d4c7677947cedf516d2bfad88591795975557",
   "73e1d56cb4fec4a819b1d1a925e70a124114684b",
   "75caa41962e0f41351e30faef2652935a0af6a92",
   "7a1ddfc50c3dbb1a8837f95929474156d8c2ee46",
@@ -54,6 +58,7 @@ INTENDED_ROOT_COMMITS = {
   "b8bea34ddac98ab40dcf5d2eb1aa4dda3b120a8c",
   "d0002f5286be81e022f5b12b831d9f45c829bb4e",
   "e14723136c5202316770ed3e5b09f5bb2ee39c28",
+  "e1e719bbf009ed46fbb5a4b891f12d6c4644711f",
   "e410f73c6c30e43fe89ae45fb2d27410c6ea7a8a",
   "e45707824f09626e78b54b733e0f8e30ee2ca3bd",
   "ed0f289d46a5794657ceffec6b761b6ab03a9aa7",
@@ -119,17 +124,47 @@ def test_checked_in_registry_is_canonical_complete_and_limits_only() -> None:
   )
 
 
-def test_combo_8cc_route_build_has_exact_reviewed_descriptor() -> None:
-  descriptor = load_reviewed_registry(REGISTRY_PATH).resolve(
-    "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
-  )
+@pytest.mark.parametrize(
+  ("root_commit", "opendbc_commit"),
+  (
+    (
+      "013adde4ba5c7e6f66b40809a641c620894ddbca",
+      "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    ),
+    (
+      "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
+      "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    ),
+    (
+      "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
+      "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    ),
+    (
+      "320ab0def1d484675a9f1653fd5f80f73f96d4c0",
+      "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    ),
+    (
+      "624d4c7677947cedf516d2bfad88591795975557",
+      "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    ),
+    (
+      "1021699bac528ba4ce39db23990c4d2e7867d4ba",
+      "68fda8e06e648fd23e2cdac6a5d04ef3df67f29b",
+    ),
+  ),
+)
+def test_route_builds_have_exact_reviewed_descriptors(
+  root_commit: str,
+  opendbc_commit: str,
+) -> None:
+  descriptor = load_reviewed_registry(REGISTRY_PATH).resolve(root_commit)
   assert descriptor is not None
   assert descriptor.to_dict() == {
     "driver_allowance": 50,
     "driver_factor": 1,
     "driver_multiplier": 2,
     "log_schema_blob": "d40096ff46dc7d1b0dec3698e3e9c77a63b3fb72",
-    "opendbc_commit": "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    "opendbc_commit": opendbc_commit,
     "panda_commit": "7f245a890f7bc00712ca4ebf903190a084c7f86b",
     "production_envelope_verified": True,
     "rack_rate_resolution_deg_s": 4.0,
@@ -137,32 +172,25 @@ def test_combo_8cc_route_build_has_exact_reviewed_descriptor() -> None:
     "steer_delta_up": 4,
     "steer_max": 409,
     "steer_step": 1,
-    "superproject_commit": "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
+    "superproject_commit": root_commit,
     "supported_vehicle_identity": "HYUNDAI_PALISADE",
   }
 
 
-def test_combo_293_route_build_has_exact_reviewed_descriptor() -> None:
+def test_e1e719_build_has_exact_reviewed_source_tuple() -> None:
   descriptor = load_reviewed_registry(REGISTRY_PATH).resolve(
-    "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
+    "e1e719bbf009ed46fbb5a4b891f12d6c4644711f"
   )
   assert descriptor is not None
-  assert descriptor.to_dict() == {
-    "driver_allowance": 50,
-    "driver_factor": 1,
-    "driver_multiplier": 2,
-    "log_schema_blob": "d40096ff46dc7d1b0dec3698e3e9c77a63b3fb72",
-    "opendbc_commit": "ab40b765445d1d18750b58ca6524b16ebe219b6b",
-    "panda_commit": "7f245a890f7bc00712ca4ebf903190a084c7f86b",
-    "production_envelope_verified": True,
-    "rack_rate_resolution_deg_s": 4.0,
-    "steer_delta_down": 7,
-    "steer_delta_up": 4,
-    "steer_max": 409,
-    "steer_step": 1,
-    "superproject_commit": "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
-    "supported_vehicle_identity": "HYUNDAI_PALISADE",
-  }
+  assert (
+    descriptor.opendbc_commit,
+    descriptor.panda_commit,
+    descriptor.log_schema_blob,
+  ) == (
+    "9bc1643ba11a4d74cd22bd23baa1f3f59db42ad3",
+    "b4c7d0fd09bd179cfbfa91c6525081560b71657e",
+    "4e433da8bddf55605746bd2a6faf4db651b6f93b",
+  )
 
 
 def test_duplicate_root_is_rejected(tmp_path: Path) -> None:

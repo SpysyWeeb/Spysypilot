@@ -248,6 +248,7 @@ class AggregateFixture:
       speed_node_support=((5.0, 1.0),),
       clean_sample_count=10,
       intervention_mono_time_ns=None,
+      summary_metric_name=None,
       metrics=self._metrics(*values, undefined=undefined),
     )
     return BehaviorRouteEvaluation(
@@ -570,7 +571,10 @@ class TestBehaviorAggregate(unittest.TestCase):
       None,
       (10.0, 0.5, 0.8),
     )
-    original_window = evaluation.scorecard.windows[0]
+    original_window = next(
+      window for window in evaluation.scorecard.windows
+      if window.summary_metric_name is None
+    )
     original_metric = original_window.metrics[0]
     altered_window = replace(
       original_window,
@@ -647,7 +651,7 @@ class TestBehaviorAggregate(unittest.TestCase):
     with self.assertRaises(BehaviorAggregateError):
       replace(result, held_out_validation=replace(result.held_out_validation, accepted=False))
 
-  def test_exact_tie_and_undefined_coverage_do_not_touch_validation(self):
+  def test_exact_stratum_tie_validates_and_undefined_candidate_cannot_win(self):
     stock = self.fixture.aggregate(
       BehaviorRouteSplit.TRAINING,
       ReplayRole.EXACT_STOCK,
@@ -677,15 +681,25 @@ class TestBehaviorAggregate(unittest.TestCase):
       (10.0, 0.5, 0.8),
     )
     calls = []
+
+    def evaluate_tie(_artifact, policy):
+      calls.append(True)
+      return self.fixture.aggregate(
+        BehaviorRouteSplit.VALIDATION,
+        ReplayRole.CANDIDATE,
+        policy,
+        (10.0, 0.5, 0.8),
+      )
+
     result = select_behavior_candidate(
       comparison,
       self.fixture.center,
       stock_validation,
       None,
-      lambda *_: calls.append(True),
+      evaluate_tie,
     )
-    self.assertEqual(calls, [])
-    self.assertEqual(result.disposition, BehaviorAggregateSelectionDisposition.STOCK_RETAINED)
+    self.assertEqual(calls, [True])
+    self.assertEqual(result.disposition, BehaviorAggregateSelectionDisposition.CANDIDATE_PROMOTED)
 
     undefined = self.fixture.comparison(undefined=True)
     stock_contract = tuple(
@@ -699,14 +713,27 @@ class TestBehaviorAggregate(unittest.TestCase):
       ) == stock_contract
       for candidate in undefined.candidates
     ))
+    selected_policies = []
+
+    def evaluate_defined(_artifact, policy):
+      calls.append(True)
+      selected_policies.append(policy)
+      return self.fixture.aggregate(
+        BehaviorRouteSplit.VALIDATION,
+        ReplayRole.CANDIDATE,
+        policy,
+        (9.0, 0.4, 0.85),
+      )
+
     result = select_behavior_candidate(
       undefined,
       self.fixture.center,
       *self.fixture.validation_references(),
-      lambda *_: calls.append(True),
+      evaluate_defined,
     )
-    self.assertEqual(calls, [])
-    self.assertEqual(result.disposition, BehaviorAggregateSelectionDisposition.INCUMBENT_RETAINED)
+    self.assertEqual(calls, [True, True])
+    self.assertEqual(selected_policies, [self.fixture.grid[0].policy])
+    self.assertEqual(result.disposition, BehaviorAggregateSelectionDisposition.CANDIDATE_PROMOTED)
 
 
 if __name__ == "__main__":

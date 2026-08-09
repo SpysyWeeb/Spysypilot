@@ -20,6 +20,12 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
   VehicleCalibrationProfile,
 )
+from openpilot.selfdrive.controls.lib.blatv2.device_acceptance import (
+  FAILURE_REASONS,
+  MODULAR_ARCHITECTURE,
+  PERCENTILE_METHOD,
+  DeviceAcceptanceReceipt,
+)
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   VehicleProfile,
@@ -45,7 +51,7 @@ def route_evidence_for_frames(
   car_params_bytes: bytes = b"test-canonical-car-params",
   runtime_identity: str | None = None,
 ) -> RouteEvidenceArtifact:
-  """Build complete but behavior-ineligible v2 evidence for unit fixtures."""
+  """Build complete but behavior-ineligible v4 evidence for unit fixtures."""
   route_hash = hashlib.sha256(route_name.encode()).hexdigest()
   source = RouteEvidenceSourceIdentity(
     route_id=route_name,
@@ -65,9 +71,9 @@ def route_evidence_for_frames(
       if runtime_identity is None
       else runtime_identity
     ),
-    schema_versions={"route_evidence": 2},
+    schema_versions={"route_evidence": 4},
     preparation_provenance=dict(provenance),
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=len(frames),
     preparation_cache_key=hashlib.sha256(
       f"test:{route_name}".encode(),
@@ -92,6 +98,7 @@ def route_evidence_for_frames(
       measured_curvature=0.0, desired_curvature=0.0,
       envelope_headroom=max(0.0, 1.0 - abs(frame.applied_torque)),
       torque_output_can_count=round(frame.applied_torque * 409.0),
+      steering_request_fault_avoidance_counter=0,
       message_valid=True, model_message_alive=False,
       model_link_valid=False, inputs_valid=frame.inputs_valid,
       lateral_active=frame.lateral_active,
@@ -104,12 +111,50 @@ def route_evidence_for_frames(
       live_torque_parameters_available=False, live_delay_available=False,
       live_torque_parameters_checks_passed=False,
       live_torque_parameters_health_exact=True,
+      steering_request_active=True,
+      steering_request_active_valid=True,
+      steering_request_fault_avoidance_counter_valid=True,
     )
     for index, frame in enumerate(frames)
   )
   return RouteEvidenceArtifact(
     source, car_params_bytes,
     b"".join(_encode_frame(frame) for frame in frames), (), controls,
+  )
+
+
+def passing_device_acceptance_receipt(
+  *,
+  vehicle_identity: str,
+  runtime_identity_sha256: str,
+  profile_sha256: str,
+  controller_policy_sha256: str,
+  horizon_policy_sha256: str,
+  source_openpilot_commit: str,
+  opendbc_commit: str,
+  panda_commit: str,
+) -> DeviceAcceptanceReceipt:
+  return DeviceAcceptanceReceipt(
+    route_evidence_sha256s=("f" * 64,),
+    device_type="tici",
+    vehicle_identity=vehicle_identity,
+    controller_architecture=MODULAR_ARCHITECTURE,
+    source_openpilot_commit=source_openpilot_commit,
+    opendbc_commit=opendbc_commit,
+    panda_commit=panda_commit,
+    live_artifact_sha256="",
+    runtime_identity_sha256=runtime_identity_sha256,
+    profile_sha256=profile_sha256,
+    controller_policy_sha256=controller_policy_sha256,
+    horizon_policy_sha256=horizon_policy_sha256,
+    sample_count=1,
+    percentile_method=PERCENTILE_METHOD,
+    compute_p50_seconds=0.001,
+    compute_p90_seconds=0.001,
+    compute_p99_seconds=0.001,
+    compute_max_seconds=0.001,
+    drop_count=0,
+    failure_counts=tuple((reason, 0) for reason in FAILURE_REASONS),
   )
 
 

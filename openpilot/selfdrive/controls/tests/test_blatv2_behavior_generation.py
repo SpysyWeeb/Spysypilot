@@ -95,19 +95,20 @@ class TestBehaviorGeneration(unittest.TestCase):
     self.assertNotIn("approved.json", generation_files)
     self.assertNotIn("activation.json", generation_files)
 
-  def test_stock_retained_is_audited_without_policy(self) -> None:
-    retained = run(tuple(
+  def test_balanced_target_diagnostic_is_audited_with_policy(self) -> None:
+    qualified = run(tuple(
       decoded_route(index, hard=index == 2)
       for index in range(4)
     ))
-    self.assertTrue(retained.stock_retained)
+    self.assertFalse(qualified.stock_retained)
+    self.assertFalse(qualified.finalization.target_materially_improved)
 
-    generation = self._publish(retained)
+    generation = self._publish(qualified)
     loaded = load_current_behavior_generation(self.root)
     self.assertEqual(loaded.generation_sha256, generation)
-    self.assertTrue(loaded.stock_retained)
-    self.assertIsNone(loaded.selected_policy)
-    self.assertFalse((self.root / "generations" / generation / "policy.json").exists())
+    self.assertFalse(loaded.stock_retained)
+    self.assertEqual(loaded.selected_policy, qualified.selected_policy)
+    self.assertTrue((self.root / "generations" / generation / "policy.json").exists())
 
   def test_aa_mismatch_creates_nothing(self) -> None:
     changed = replace(self.qualified, physical_profile_sha256="8" * 64)

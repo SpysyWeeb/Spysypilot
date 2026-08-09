@@ -373,9 +373,13 @@ class BehaviorSample:
   measured_rack_rate_deg_s: float
   measured_rack_accel_deg_s2: float
   raw_requested_torque: float
+  planned_requested_torque: float
+  reachable_envelope_torque: float
   envelope_applied_torque: float
   torque_headroom: float
   actuator_constrained: bool
+  steering_request_active: bool
+  maximum_authority_required: bool
   lateral_active: bool
   inputs_valid: bool
   steering_pressed: bool
@@ -399,6 +403,8 @@ class BehaviorSample:
       "measured_rack_rate_deg_s",
       "measured_rack_accel_deg_s2",
       "raw_requested_torque",
+      "planned_requested_torque",
+      "reachable_envelope_torque",
       "envelope_applied_torque",
       "torque_headroom",
     )
@@ -435,10 +441,14 @@ class BehaviorSample:
       "measuredRackAngleDeg": _canonical_number(self.measured_rack_angle_deg),
       "measuredRackRateDegS": _canonical_number(self.measured_rack_rate_deg_s),
       "monoTimeNs": self.mono_time_ns,
+      "maximumAuthorityRequired": self.maximum_authority_required,
+      "plannedRequestedTorque": _canonical_number(self.planned_requested_torque),
       "rawRequestedTorque": _canonical_number(self.raw_requested_torque),
+      "reachableEnvelopeTorque": _canonical_number(self.reachable_envelope_torque),
       "routeTimeS": _canonical_number(self.route_time_s),
       "scalarCurvature1pm": _canonical_number(self.scalar_curvature_1pm),
       "speedMps": _canonical_number(self.speed_mps),
+      "steeringRequestActive": self.steering_request_active,
       "steeringPressed": self.steering_pressed,
       "torqueHeadroom": _canonical_number(self.torque_headroom),
     }
@@ -459,9 +469,13 @@ class BehaviorControlResponse:
   measured_rack_rate_deg_s: float
   measured_rack_accel_deg_s2: float
   raw_requested_torque: float
+  planned_requested_torque: float
+  reachable_envelope_torque: float
   envelope_applied_torque: float
   torque_headroom: float
   actuator_constrained: bool
+  steering_request_active: bool
+  maximum_authority_required: bool
   lateral_active: bool
   inputs_valid: bool
   steering_pressed: bool
@@ -480,6 +494,8 @@ class BehaviorControlResponse:
       "measured_rack_rate_deg_s",
       "measured_rack_accel_deg_s2",
       "raw_requested_torque",
+      "planned_requested_torque",
+      "reachable_envelope_torque",
       "envelope_applied_torque",
       "torque_headroom",
     ):
@@ -584,9 +600,13 @@ def assemble_behavior_sample(
     measured_rack_rate_deg_s=response.measured_rack_rate_deg_s,
     measured_rack_accel_deg_s2=response.measured_rack_accel_deg_s2,
     raw_requested_torque=response.raw_requested_torque,
+    planned_requested_torque=response.planned_requested_torque,
+    reachable_envelope_torque=response.reachable_envelope_torque,
     envelope_applied_torque=response.envelope_applied_torque,
     torque_headroom=response.torque_headroom,
     actuator_constrained=response.actuator_constrained,
+    steering_request_active=response.steering_request_active,
+    maximum_authority_required=response.maximum_authority_required,
     lateral_active=response.lateral_active,
     inputs_valid=response.inputs_valid and reference.valid,
     steering_pressed=response.steering_pressed,

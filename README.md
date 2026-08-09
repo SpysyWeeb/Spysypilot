@@ -72,13 +72,25 @@ and [`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
 
 ## BLaTv2 modular replacement
 
-**Status: in progress; PC-only learning while stock torque control remains
-active.** The previous LQI controller is retired. LQI means “Linear Quadratic
+**BLaTv2/Combo OWNER FIELD TUNE — EXPERIMENTAL, PROVISIONAL, AND UNQUALIFIED — PALISADE ONLY — STOCK BY DEFAULT**
+
+For an owner-supervised trial, set the development-only
+`BLaTv2ExperimentalController` Bool offroad before `controlsd` starts, and
+clear it offroad before restarting controls to return to stock. It remains
+disabled by default. Begin on a closed, low-speed course and expand the test
+only while steering remains predictable. Accept a trial window only when its
+`controlsState.lateralControlState.torqueState` reports `modularSelection == 1`,
+`modularSelectionBound == true`, and `modularBindingReason == 0`; otherwise stop
+that pass and do not treat its stock-controller frames as BLaTv2 evidence.
+
+**Status: in progress; owner-supervised Palisade field tuning.** The previous
+LQI controller is retired. LQI means “Linear Quadratic
 Integral”: state feedback with an integral-error state. The replacement is a
 modular learning system aimed at **Smooth. Swift. Strong.**, but this milestone
-does not authorize learned steering. There is no approved profile or automatic
-activation path. `LatControlTorque` remains byte-identical to the stock
-bootstrap. The validated Palisade/Telluride uses the runtime-selected 409/4/7
+does not create an approved profile or automatic activation path. The explicit
+development parameter selects the provisional Palisade tune as the sole
+steering controller for that lateral session; otherwise stock remains the sole
+controller. The validated Palisade/Telluride uses the runtime-selected 409/4/7
 opendbc/panda envelope; every other vehicle keeps the limits supplied by its
 own `CarControllerParams`.
 

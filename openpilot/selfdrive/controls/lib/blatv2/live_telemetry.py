@@ -33,6 +33,16 @@ def _uint_or_zero(value: object, bits: int) -> int:
   return numeric if 0 <= numeric <= maximum else 0
 
 
+def _sint_or_zero(value: object, bits: int) -> int:
+  try:
+    numeric = int(value)
+  except (TypeError, ValueError, OverflowError):
+    return 0
+  minimum = -(1 << (bits - 1))
+  maximum = (1 << (bits - 1)) - 1
+  return numeric if minimum <= numeric <= maximum else 0
+
+
 def build_modular_lateral_state(
   live: ModularLiveController,
   *,
@@ -275,5 +285,119 @@ def build_modular_lateral_state(
   state.modularSelectionBound = bool(
     live.enabled_bound
     and live.selection == ControllerSelection.MODULAR
+  )
+  state.modularHorizonPolicyHash = str(
+    live.horizon_policy_sha256,
+  )
+  state.modularPlannedTorque = _finite_or_zero(
+    0.0 if core is None else core.planned_torque,
+  )
+  state.modularPlannedCounts = _sint_or_zero(
+    0 if core is None else core.planned_counts,
+    32,
+  )
+  state.modularReactiveTorque = _finite_or_zero(
+    0.0 if core is None else core.reactive_torque,
+  )
+  state.modularReactiveCounts = _sint_or_zero(
+    0 if core is None else core.reactive_counts,
+    32,
+  )
+  state.modularRawRequestedCounts = _sint_or_zero(
+    0 if core is None else core.raw_requested_counts,
+    32,
+  )
+  state.modularRawToPlannedResidualCounts = _sint_or_zero(
+    0 if core is None else core.raw_to_planned_residual_counts,
+    32,
+  )
+  state.modularRawToPlannedUnmetTorque = _finite_or_zero(
+    0.0 if core is None else core.raw_to_planned_unmet_torque,
+  )
+  state.modularPreparationActive = bool(
+    core is not None and core.preparation_active,
+  )
+  state.modularPreparationScheduled = bool(
+    core is not None and core.preparation_scheduled,
+  )
+  state.modularHorizonStatus = _uint_or_zero(
+    0 if core is None else core.horizon_status,
+    8,
+  )
+  state.modularHorizonValid = bool(
+    core is not None and core.horizon_valid,
+  )
+  state.modularDriverSuppressed = bool(
+    core is not None and core.driver_suppressed,
+  )
+  state.modularFutureBandReachable = bool(
+    core is not None and core.future_band_reachable,
+  )
+  state.modularFirstUnreachableIndex = _sint_or_zero(
+    -1 if core is None else core.first_unreachable_index,
+    16,
+  )
+  state.modularFirstUnreachableTimeSeconds = _finite_or_zero(
+    -1.0 if core is None else core.first_unreachable_time_s,
+  )
+  state.modularMaximumBandResidualCounts = _uint_or_zero(
+    0 if core is None else core.maximum_band_residual_counts,
+    16,
+  )
+  state.modularMaximumPathLeadDeg = _finite_or_zero(
+    0.0 if core is None else core.maximum_path_lead_deg,
+  )
+  state.modularMaximumPathRateLeadDegS = _finite_or_zero(
+    0.0 if core is None else core.maximum_path_rate_lead_deg_s,
+  )
+  state.modularPathLeadConstrainedSamples = _uint_or_zero(
+    0 if core is None else core.path_lead_constrained_samples,
+    16,
+  )
+  state.modularMaximumAuthorityRequired = bool(
+    core is not None and core.maximum_authority_required,
+  )
+  state.modularMaximumAuthorityActive = bool(
+    core is not None and core.maximum_authority_active,
+  )
+  state.modularMaximumUrgency = _finite_or_zero(
+    0.0 if core is None else core.maximum_urgency,
+  )
+  state.modularPreviousCommandCounts = _sint_or_zero(
+    previous_counts,
+    32,
+  )
+  state.modularRecordedAppliedTorque = _finite_or_zero(
+    live.last_recorded_applied_torque,
+  )
+  state.modularSteeringRequestActive = bool(
+    live.last_steering_request_active,
+  )
+  state.modularSteeringRequestValid = bool(
+    live.last_steering_request_valid,
+  )
+  state.modularSteeringRequestFaultAvoidanceCounter = _uint_or_zero(
+    live.last_steering_request_counter,
+    8,
+  )
+  state.modularControlCadenceValid = bool(live.control_cadence_valid)
+  state.modularTransportReprimed = bool(live.transport_reprimed)
+  state.modularAdapterException = bool(live.adapter_exception)
+  state.modularRawToPlannedConstrained = bool(
+    core is not None and core.raw_to_planned_constrained,
+  )
+  state.modularFinalExpectedCounts = _sint_or_zero(
+    live.last_expected_command_counts,
+    32,
+  )
+  state.modularFinalCountResidual = _sint_or_zero(
+    live.final_count_residual,
+    32,
+  )
+  state.modularFinalCountMatchValid = bool(
+    live.final_count_match_valid,
+  )
+  state.modularFinalLimiterAltered = bool(
+    live.final_limiter_altered,
   )
   return state

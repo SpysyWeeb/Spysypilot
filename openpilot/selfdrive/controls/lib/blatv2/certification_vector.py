@@ -41,6 +41,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   BuildDescriptorRegistry,
   PreparedRoute,
   RouteCandidate,
+  RouteRejected,
   RouteSegment,
   prepare_route,
 )
@@ -535,16 +536,7 @@ def _segment_vector(
       scenario_last_mono_ns = witness.mono_time_ns
     else:
       scenario_excluded[scenario_reason] += 1
-  if retained_physical == 0:
-    raise CertificationVectorError(
-      "certification segment has no valid physical-learning witnesses",
-    )
-
   source = artifact.source_identity
-  if source.behavior_eligible and retained_behavior == 0:
-    raise CertificationVectorError(
-      "behavior-eligible segment has no certification witnesses",
-    )
   pre_poll_count = (
     prepared.pre_poll_dropped_count
     if include_pre_poll_exclusions
@@ -768,6 +760,8 @@ def build_certification_vector_from_prepared_route(
 
   segment_vectors: list[dict[str, object]] = []
   decoded_controls = 0
+  retained_behavior = 0
+  retained_physical = 0
   first_index = route.segments[0].index
   for segment in selected:
     result = _segment_vector(
@@ -787,7 +781,20 @@ def build_certification_vector_from_prepared_route(
       raise CertificationVectorError(
         "certification controls witness population exceeds its bound",
       )
+    retained_physical += int(result["physical_plane"]["frames_retained"])
+    retained_behavior += int(result["behavior_plane"]["controls_retained"])
     segment_vectors.append(result)
+
+  if retained_physical == 0:
+    raise RouteRejected(
+      "physical_witness_unavailable",
+      "certification vector has no valid physical-learning witnesses",
+    )
+  if source.behavior_eligible and retained_behavior == 0:
+    raise RouteRejected(
+      "behavior_witness_unavailable",
+      "behavior-eligible vector has no certification witnesses",
+    )
 
   domains = [item["preparation_domain"] for item in segment_vectors]
   if not domains or any(domain != domains[0] for domain in domains[1:]):
@@ -1057,6 +1064,8 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
   selected_manifest: list[dict[str, object]] = []
   controls_total = 0
   compressed_total = 0
+  retained_behavior_total = 0
+  retained_physical_total = 0
   previous = -1
   route_context: dict[str, object] | None = None
   expected_result_keys = {
@@ -1129,12 +1138,9 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
         "segment_local_gap",
       }),
     )
-    if (
-      physical_count == 0
-      or physical_count + physical_exclusion_total
-      != coverage["controls_total"]
-    ):
+    if physical_count + physical_exclusion_total != coverage["controls_total"]:
       raise CertificationVectorError("physical proof coverage is not meaningful")
+    retained_physical_total += physical_count
     _validate_retained_timestamps(
       physical["first_retained_mono_ns"],
       physical["last_retained_mono_ns"],
@@ -1150,7 +1156,10 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
       "physical frames plane",
     )
     empty_hash = hashlib.sha256().hexdigest()
-    if physical_controls_hash == empty_hash or physical_frames_hash == empty_hash:
+    if physical_count == 0:
+      if physical_controls_hash != empty_hash or physical_frames_hash != empty_hash:
+        raise CertificationVectorError("empty physical plane digest is not canonical")
+    elif physical_controls_hash == empty_hash or physical_frames_hash == empty_hash:
       raise CertificationVectorError("nonempty physical plane has an empty digest")
 
     behavior = result["behavior_plane"]
@@ -1166,6 +1175,7 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
       "behavior retained controls",
       1_000_000,
     )
+    retained_behavior_total += behavior_count
     behavior_exclusion_total = _exclusion_total(
       behavior["exclusions"],
       "behavior plane",
@@ -1210,7 +1220,6 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
       or not source_reason
       or source_eligible != (source_reason == "eligible")
       or proof_eligible != (source_eligible and behavior_count > 0)
-      or (source_eligible and behavior_count == 0)
     ):
       raise CertificationVectorError("behavior source eligibility is invalid")
     if behavior_count:
@@ -1351,6 +1360,18 @@ def _validate_vector_semantics(manifest: dict[str, object]) -> None:
       raise CertificationVectorError(
         "selected proofs do not share one full-route preparation context",
       )
+  if retained_physical_total == 0:
+    raise CertificationVectorError(
+      "certification vector has no valid physical-learning witnesses",
+    )
+  if (
+    retained_behavior_total == 0
+    and route_context is not None
+    and route_context["behavior_source_eligible"]
+  ):
+    raise CertificationVectorError(
+      "behavior-eligible vector has no certification witnesses",
+    )
   scenario_proof = manifest["scenario_proof"]
   expected_scenario_proof_keys = {
     "active_controls_retained", "controls_retained", "proof_eligible",

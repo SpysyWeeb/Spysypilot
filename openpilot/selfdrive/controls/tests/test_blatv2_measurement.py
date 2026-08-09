@@ -4,8 +4,12 @@ import math
 from unittest.mock import patch
 
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
+from openpilot.selfdrive.controls.lib.blatv2.actuator import RuntimeTorqueLimits
+from openpilot.selfdrive.controls.lib.blatv2.learning_runtime import (
+  _MeasuredEnvelopeConstraint,
+)
 from openpilot.selfdrive.controls.lib.blatv2.measurement import (
-  MAX_CONTINUOUS_MEASUREMENT_GAP_S,
+  MAX_CONTINUOUS_MEASUREMENT_GAP_NS,
   LearningMeasurementBuilder,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learner import (
@@ -34,6 +38,30 @@ def mapping(*, roll: float = 0.02, offset: float = 1.5, valid: bool = True):
   )
 
 
+def test_envelope_gap_boundary_is_exact_at_long_uptime():
+  limits = RuntimeTorqueLimits(409, 4, 7, 1, 50, 2, 1)
+  base_ns = 10_000_000_000_000_000
+
+  def record(constraint, timestamp_ns):
+    return constraint.update(
+      sample_mono_ns=timestamp_ns,
+      applied_torque=0.0,
+      driver_torque=0.0,
+      inputs_valid=True,
+    )
+
+  boundary = _MeasuredEnvelopeConstraint(limits)
+  assert not record(boundary, base_ns).valid
+  assert record(boundary, base_ns + MAX_CONTINUOUS_MEASUREMENT_GAP_NS).valid
+
+  over = _MeasuredEnvelopeConstraint(limits)
+  assert not record(over, base_ns).valid
+  assert not record(
+    over,
+    base_ns + MAX_CONTINUOUS_MEASUREMENT_GAP_NS + 1,
+  ).valid
+
+
 def update(
   builder: LearningMeasurementBuilder,
   *,
@@ -53,7 +81,9 @@ def update(
 ):
   live_mapping = mapping() if live is None else live
   return builder.update(
-    sample_time_s=timestamp,
+    sample_mono_ns=(
+      round(timestamp * 1e9) if math.isfinite(timestamp) else timestamp
+    ),
     speed_mps=speed,
     measured_rack_angle_deg=angle,
     measured_rack_rate_deg_s=rate,
@@ -208,7 +238,7 @@ def test_gap_resets_derivative_evidence():
   builder = LearningMeasurementBuilder()
   update(builder, timestamp=1.0, angle=8.0, rate=0.0)
   update(builder, timestamp=1.01, angle=8.1, rate=1.0)
-  gap_time = 1.01 + MAX_CONTINUOUS_MEASUREMENT_GAP_S + 1e-6
+  gap_time = 1.01 + MAX_CONTINUOUS_MEASUREMENT_GAP_NS * 1e-9 + 1e-6
   gap = update(
     builder,
     timestamp=gap_time,

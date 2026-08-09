@@ -6,11 +6,13 @@ the numerical BLaTv2 artifacts.  It retains no steering policy:
 * the raw model scalar and its published action timestamp are consumed as-is;
 * model and velocity trajectories must share the exact native time grid;
 * live rack mapping is built from one ``liveParameters`` snapshot;
-* rack acceleration is differentiated only across consecutive, positive
+* unsigned rack-rate magnitude is signed from measured angle motion;
+* rack acceleration is differentiated only across consecutive, signed
   carState sample gaps no larger than 15 ms; and
-* the previous applied CAN torque is accepted only when ``torqueOutputCan`` is
-  an exact integer count.  A normalized Float32 is never rounded back into a
-  controller state.
+* the previous command is accepted only when ``torqueOutputCan`` is an exact
+  integer count; and
+* physical-history eligibility separately requires the platform steering
+  request bit and its validity witness.
 
 All trajectory storage and the output object are allocated once.  Callers
 must snapshot values they need after the next :meth:`prepare` call.
@@ -36,6 +38,9 @@ from openpilot.selfdrive.controls.lib.blatv2.intent import (
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
 )
+from openpilot.selfdrive.controls.lib.blatv2.rack_motion import (
+  SignedRackMotionNormalizer,
+)
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   VehicleProfile,
 )
@@ -45,6 +50,15 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 # live controller's control-witness cadence check.  Neither path may bridge a
 # missing 100 Hz controller frame.
 MAX_RECORDED_FRAME_GAP_NS = 15_000_000
+
+
+def exact_nonnegative_int(value: Any, description: str) -> int:
+  if isinstance(value, bool):
+    raise ValueError(f"{description} must be an exact nonnegative integer")
+  result = int(value)
+  if result != value or result < 0:
+    raise ValueError(f"{description} must be an exact nonnegative integer")
+  return result
 
 
 class LiveAdapterStatus(IntEnum):
@@ -107,60 +121,6 @@ class PreparedLiveInput:
     self.desired_curvature_time_s = 0.0
 
 
-class _RackDerivative:
-  """One timestamped derivative with no interpolation across missing frames."""
-
-  __slots__ = ("_previous_sample_mono_ns", "_previous_rate_deg_s")
-
-  def __init__(self) -> None:
-    self._previous_sample_mono_ns: int | None = None
-    self._previous_rate_deg_s = 0.0
-
-  def reset(self) -> None:
-    self._previous_sample_mono_ns = None
-    self._previous_rate_deg_s = 0.0
-
-  def update(
-    self,
-    *,
-    state_sample_mono_ns: int,
-    rack_rate_deg_s: float,
-    inputs_valid: bool,
-  ) -> tuple[float, bool]:
-    try:
-      sample_ns = int(state_sample_mono_ns)
-      rate = float(rack_rate_deg_s)
-    except (TypeError, ValueError, OverflowError):
-      self.reset()
-      return math.nan, False
-    if (
-      not inputs_valid
-      or isinstance(state_sample_mono_ns, bool)
-      or sample_ns != state_sample_mono_ns
-      or sample_ns < 0
-      or not math.isfinite(rate)
-    ):
-      self.reset()
-      return math.nan, False
-
-    acceleration = math.nan
-    valid = False
-    if self._previous_sample_mono_ns is not None:
-      gap_ns = sample_ns - self._previous_sample_mono_ns
-      valid = 0 < gap_ns <= MAX_RECORDED_FRAME_GAP_NS
-      if valid:
-        acceleration = (
-          rate - self._previous_rate_deg_s
-        ) / (gap_ns * 1e-9)
-
-    # A bad/repeated/gapped pair cannot be used, but the current valid sample
-    # becomes the sole baseline for the next pair.  This prevents a future
-    # derivative from spanning the rejected gap.
-    self._previous_sample_mono_ns = sample_ns
-    self._previous_rate_deg_s = rate
-    return acceleration, valid
-
-
 def exact_applied_torque_counts(
   car_output: Any,
   limits: RuntimeTorqueLimits,
@@ -188,6 +148,29 @@ def exact_applied_torque_counts(
   return counts
 
 
+def exact_steering_request_state(
+  car_output: Any,
+) -> tuple[bool, int] | None:
+  """Return the emitted request bit and platform fault-avoidance counter.
+
+  This authenticates command-layer telemetry only. An asserted request is not
+  proof of measured EPS torque, while a deasserted request means the carried
+  ``torqueOutputCan`` count must not be entered as physical applied history.
+  """
+  try:
+    actuators = car_output.actuatorsOutput
+    active = actuators.steeringRequestActive
+    valid = actuators.steeringRequestActiveValid
+    counter = actuators.steeringRequestFaultAvoidanceCounter
+  except (AttributeError, TypeError, ValueError, OverflowError):
+    return None
+  if type(active) is not bool or valid is not True or type(counter) is not int:
+    return None
+  if not 0 <= counter <= 255:
+    return None
+  return active, counter
+
+
 class LiveInputAdapter:
   """Preallocated conversion of one frozen live/replay frame snapshot."""
 
@@ -200,7 +183,7 @@ class LiveInputAdapter:
     "velocities_x",
     "plan_curvatures",
     "result",
-    "_rack_derivative",
+    "_rack_motion",
   )
 
   def __init__(
@@ -219,28 +202,61 @@ class LiveInputAdapter:
     self.velocities_x = [0.0] * INTENT_CAPACITY
     self.plan_curvatures = [0.0] * INTENT_CAPACITY
     self.result = PreparedLiveInput()
-    self._rack_derivative = _RackDerivative()
+    self._rack_motion = SignedRackMotionNormalizer()
 
   def reset_derivative(self) -> None:
-    self._rack_derivative.reset()
+    self._rack_motion.reset()
 
   def observe_inactive_state(
     self,
     *,
     state_sample_mono_ns: int,
     car_state: Any,
+    live_parameters: Any,
     inputs_valid: bool,
+    live_parameters_inputs_valid: bool,
   ) -> None:
-    """Keep only the latest disengaged rack-rate sample as derivative seed."""
+    """Warm signed rack motion while no engagement is bound."""
     try:
+      sample_ns = int(state_sample_mono_ns)
+      speed = float(car_state.vEgo)
+      angle = float(car_state.steeringAngleDeg)
       rate = float(car_state.steeringRateDeg)
+      steering_pressed = bool(car_state.steeringPressed)
+      standstill = bool(car_state.standstill)
+      resolution = self.profile.parameters_at(
+        speed,
+      ).parameters.rack_rate_resolution_deg_s
+      timestamp_valid = (
+        not isinstance(state_sample_mono_ns, bool)
+        and sample_ns == state_sample_mono_ns
+        and sample_ns >= 0
+      )
+      mapping = self._live_mapping(
+        live_parameters,
+        inputs_valid=live_parameters_inputs_valid,
+      )
     except (AttributeError, TypeError, ValueError, OverflowError):
-      self._rack_derivative.reset()
+      self._rack_motion.reset()
       return
-    self._rack_derivative.update(
-      state_sample_mono_ns=state_sample_mono_ns,
-      rack_rate_deg_s=rate,
-      inputs_valid=bool(inputs_valid),
+    self._rack_motion.update(
+      sample_mono_ns=sample_ns,
+      steering_angle_deg=(
+        angle - mapping.angle_offset_deg
+        if mapping is not None
+        else angle
+      ),
+      raw_rate_deg_s=rate,
+      rate_resolution_deg_s=resolution,
+      lifecycle_valid=(
+        bool(inputs_valid)
+        and timestamp_valid
+        and speed >= 0.0
+        and not steering_pressed
+        and not standstill
+        and mapping is not None
+      ),
+      maximum_gap_ns=MAX_RECORDED_FRAME_GAP_NS,
     )
 
   def _live_mapping(
@@ -351,23 +367,28 @@ class LiveInputAdapter:
     output = self.result
     output.clear()
     try:
-      output.state_sample_mono_ns = int(state_sample_mono_ns)
-      output.control_witness_mono_ns = int(control_witness_mono_ns)
-      output.model_publication_mono_ns = int(
+      output.state_sample_mono_ns = exact_nonnegative_int(
+        state_sample_mono_ns,
+        "state sample timestamp",
+      )
+      output.control_witness_mono_ns = exact_nonnegative_int(
+        control_witness_mono_ns,
+        "control witness timestamp",
+      )
+      output.model_publication_mono_ns = exact_nonnegative_int(
         model_publication_mono_ns,
+        "model publication timestamp",
       )
       output.current_v_ego_m_s = float(car_state.vEgo)
       output.measured_rack_angle_deg = float(
         car_state.steeringAngleDeg,
       )
-      output.measured_rack_rate_deg_s = float(
-        car_state.steeringRateDeg,
-      )
+      raw_rack_rate_deg_s = float(car_state.steeringRateDeg)
       output.driver_torque = float(car_state.steeringTorque)
       output.steering_pressed = bool(car_state.steeringPressed)
       output.standstill = bool(car_state.standstill)
     except (AttributeError, TypeError, ValueError, OverflowError):
-      self._rack_derivative.reset()
+      self._rack_motion.reset()
       output.adaptation = self._invalid_adaptation(
         state_sample_mono_ns=max(output.state_sample_mono_ns, 0),
         control_witness_mono_ns=max(output.control_witness_mono_ns, 0),
@@ -377,48 +398,75 @@ class LiveInputAdapter:
 
     output.vehicle_state_valid = (
       bool(vehicle_inputs_valid)
-      and output.state_sample_mono_ns >= 0
       and output.control_witness_mono_ns >= output.state_sample_mono_ns
       and all(math.isfinite(value) for value in (
         output.current_v_ego_m_s,
         output.measured_rack_angle_deg,
-        output.measured_rack_rate_deg_s,
+        raw_rack_rate_deg_s,
         output.driver_torque,
       ))
       and output.current_v_ego_m_s >= 0.0
     )
-    acceleration, acceleration_valid = self._rack_derivative.update(
-      state_sample_mono_ns=output.state_sample_mono_ns,
-      rack_rate_deg_s=output.measured_rack_rate_deg_s,
-      inputs_valid=output.vehicle_state_valid,
-    )
-    output.measured_rack_acceleration_deg_s2 = acceleration
-    output.rack_derivative_valid = acceleration_valid
-
     output.live_mapping = self._live_mapping(
       live_parameters,
       inputs_valid=live_parameters_inputs_valid,
     )
     output.live_parameters_valid = output.live_mapping is not None
-    # Nominal mapping remains useful for passive core diagnostics, but live
-    # actuation cannot manufacture rack-position error from missing/stale
-    # angle offset, roll, stiffness, or steer ratio.
-    output.lateral_valid = (
-      output.vehicle_state_valid
-      and acceleration_valid
-      and output.live_parameters_valid
-    )
     profile_speed = (
       output.current_v_ego_m_s
       if output.vehicle_state_valid
       else self.profile.nodes[0].speed_mps
     )
-    transport_delay = self.profile.parameters_at(
+    profile_parameters = self.profile.parameters_at(
       profile_speed,
-    ).parameters.transport_delay_s
+    ).parameters
+    motion = self._rack_motion.update(
+      sample_mono_ns=output.state_sample_mono_ns,
+      steering_angle_deg=(
+        output.measured_rack_angle_deg - output.live_mapping.angle_offset_deg
+        if output.live_mapping is not None
+        else output.measured_rack_angle_deg
+      ),
+      raw_rate_deg_s=raw_rack_rate_deg_s,
+      rate_resolution_deg_s=profile_parameters.rack_rate_resolution_deg_s,
+      lifecycle_valid=(
+        output.vehicle_state_valid
+        and output.live_mapping is not None
+        and not output.steering_pressed
+        and not output.standstill
+      ),
+      maximum_gap_ns=MAX_RECORDED_FRAME_GAP_NS,
+    )
+    output.measured_rack_rate_deg_s = (
+      motion.signed_rate_deg_s if motion.sign_valid else math.nan
+    )
+    output.measured_rack_acceleration_deg_s2 = (
+      motion.rack_acceleration_deg_s2
+      if motion.derivative_continuous or motion.direction_reversal
+      else math.nan
+    )
+    output.rack_derivative_valid = (
+      motion.derivative_continuous or motion.direction_reversal
+    )
+    # Nominal mapping remains useful for passive core diagnostics, but live
+    # actuation cannot manufacture rack-position error from missing/stale
+    # angle offset, roll, stiffness, or steer ratio.
+    output.lateral_valid = (
+      output.vehicle_state_valid
+      and output.rack_derivative_valid
+      and output.live_parameters_valid
+    )
+    transport_delay = profile_parameters.transport_delay_s
 
     try:
-      output.model_timestamp_eof_ns = int(model_message.timestampEof)
+      output.model_timestamp_eof_ns = exact_nonnegative_int(
+        model_message.timestampEof,
+        "model plan-origin timestamp",
+      )
+      model_frame_id = exact_nonnegative_int(
+        model_message.frameId,
+        "model frame id",
+      )
       output.desired_curvature_time_s = float(
         model_message.action.desiredCurvatureTime,
       )
@@ -437,7 +485,7 @@ class LiveInputAdapter:
         control_witness_mono_ns=output.control_witness_mono_ns,
         model_publication_mono_ns=output.model_publication_mono_ns,
         plan_origin_mono_ns=output.model_timestamp_eof_ns,
-        model_frame_id=int(model_message.frameId),
+        model_frame_id=model_frame_id,
         message_valid=model_message_valid,
         message_alive=model_message_alive,
         scalar_desired_curvature=output.scalar_curvature,
@@ -465,10 +513,10 @@ class LiveInputAdapter:
 
     if not output.vehicle_state_valid:
       output.status = LiveAdapterStatus.INVALID_VEHICLE_STATE
-    elif not output.rack_derivative_valid:
-      output.status = LiveAdapterStatus.INVALID_RACK_DERIVATIVE
     elif not output.live_parameters_valid:
       output.status = LiveAdapterStatus.INVALID_LIVE_PARAMETERS
+    elif not output.rack_derivative_valid:
+      output.status = LiveAdapterStatus.INVALID_RACK_DERIVATIVE
     else:
       output.status = LiveAdapterStatus.OK
     return output

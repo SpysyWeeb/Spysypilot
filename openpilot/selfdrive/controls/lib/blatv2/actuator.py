@@ -84,6 +84,16 @@ class RuntimeTorqueLimits:
   def STEER_DRIVER_FACTOR(self) -> int:
     return self.driver_factor
 
+  def driver_exceeds_allowance(self, driver_torque: float) -> bool:
+    """Whether measured human torque makes rack input ambiguous."""
+    torque = float(driver_torque)
+    if not math.isfinite(torque):
+      return True
+    return max(
+      abs(torque),
+      abs(torque * self.driver_factor),
+    ) > self.driver_allowance
+
 
 @dataclass(frozen=True, slots=True)
 class EnvelopeResult:

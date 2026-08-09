@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   aggregate_behavior_metrics,
+  BehaviorContract,
   BehaviorMetricConfig,
   BehaviorMetricName,
   MetricDisposition,
@@ -21,6 +22,13 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   score_window,
   retain_route_metric_windows,
   speed_node_weights,
+)
+from openpilot.selfdrive.controls.lib.blatv2 import behavior_policy
+from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
+  PAIRED_ROUTE_UNCERTAINTY_METHOD,
+  MetricGateRule,
+  MetricPreference,
+  PolicyMetric,
 )
 
 
@@ -75,9 +83,13 @@ def make_sample(
     measured_rack_rate_deg_s=measured * 100.0,
     measured_rack_accel_deg_s2=0.0,
     raw_requested_torque=raw_torque,
+    planned_requested_torque=raw_torque,
+    reachable_envelope_torque=applied_torque,
     envelope_applied_torque=applied_torque,
     torque_headroom=0.5,
     actuator_constrained=False,
+    steering_request_active=True,
+    maximum_authority_required=False,
     lateral_active=True,
     inputs_valid=True,
     steering_pressed=False,
@@ -175,12 +187,41 @@ class TestBehaviorMetrics(unittest.TestCase):
       expected_ids.update((window.route_id, window.window_id) for window in selected)
 
     self.assertEqual(
-      {(window.route_id, window.window_id) for window in retained},
+      {
+        (window.route_id, window.window_id)
+        for window in retained
+        if window.summary_metric_name is None
+      },
       expected_ids,
+    )
+    summary_names = {
+      BehaviorMetricName.MIN_SIGNED_TURN_IN_LAG_S,
+      BehaviorMetricName.MAX_SIGNED_TURN_IN_LAG_S,
+      BehaviorMetricName.MIN_SIGNED_RELEASE_LAG_S,
+      BehaviorMetricName.MAX_SIGNED_RELEASE_LAG_S,
+      BehaviorMetricName.MIN_DELIVERED_FRACTION,
+      BehaviorMetricName.MAX_DELIVERED_FRACTION,
+      BehaviorMetricName.DELIVERED_ERROR_CROSSINGS_PER_S,
+      BehaviorMetricName.HOLD_ERROR_CROSSINGS_PER_S,
+      BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL,
+    }
+    self.assertEqual(
+      {
+        (window.speed_node_support[0][0], window.maneuver_class, window.summary_metric_name)
+        for window in retained
+        if window.summary_metric_name is not None
+      },
+      {
+        (node, maneuver_class, name)
+        for node, maneuver_class in strata
+        for name in summary_names
+      },
     )
     self.assertLessEqual(
       len(retained),
-      len(strata) * metric_config.maximum_route_windows_per_stratum,
+      len(strata) * (
+        metric_config.maximum_route_windows_per_stratum + len(summary_names)
+      ),
     )
     self.assertEqual(
       aggregate_behavior_metrics(iter(scored), metric_config),
@@ -298,6 +339,424 @@ class TestBehaviorMetrics(unittest.TestCase):
     )
     self.assertTrue(result.metric(BehaviorMetricName.RAW_WORST_BURST_RMS).defined)
     self.assertTrue(result.metric(BehaviorMetricName.APPLIED_WORST_BURST_RMS).defined)
+
+  def test_delivered_error_crossings_use_hysteresis_not_torque_chatter(self):
+    quiet_errors = (-0.001, 0.001, -0.001, 0.001, -0.001, 0.001)
+    quiet = score_window(
+      make_window(
+        "route-a",
+        "torque-chatter",
+        ManeuverPhase.HOLD,
+        tuple(
+          make_sample(
+            index,
+            measured=0.01 + error,
+            raw_torque=0.1 if index % 2 else -0.1,
+          )
+          for index, error in enumerate(quiet_errors)
+        ),
+      ),
+      config(),
+    )
+    self.assertGreater(
+      quiet.metric(BehaviorMetricName.RAW_CHATTER_REVERSALS_PER_S).value,
+      0.0,
+    )
+    self.assertEqual(
+      quiet.metric(BehaviorMetricName.DELIVERED_ERROR_CROSSINGS_PER_S).value,
+      0.0,
+    )
+
+    ringing_errors = (0.003, 0.001, -0.001, -0.003, -0.001, 0.003)
+    ringing = score_window(
+      make_window(
+        "route-a",
+        "path-ringing",
+        ManeuverPhase.HOLD,
+        tuple(
+          make_sample(index, measured=0.01 + error, raw_torque=0.1)
+          for index, error in enumerate(ringing_errors)
+        ),
+      ),
+      config(),
+    )
+    self.assertEqual(
+      ringing.metric(BehaviorMetricName.RAW_CHATTER_REVERSALS_PER_S).value,
+      0.0,
+    )
+    self.assertAlmostEqual(
+      ringing.metric(BehaviorMetricName.DELIVERED_ERROR_CROSSINGS_PER_S).value,
+      4.0,
+    )
+    self.assertAlmostEqual(
+      ringing.metric(BehaviorMetricName.HOLD_ERROR_CROSSINGS_PER_S).value,
+      4.0,
+    )
+
+  def test_all_window_tails_survive_cap_and_veto_cancellation(self):
+    metric_config = replace(config(), maximum_route_windows_per_stratum=2)
+    window_ids = tuple(f"window-{index:02d}" for index in range(10))
+    retained_ids = frozenset(sorted(
+      window_ids,
+      key=lambda window_id: hashlib.sha256(
+        f"route-a\0{window_id}".encode(),
+      ).digest(),
+    )[:metric_config.maximum_route_windows_per_stratum])
+    exceptional_ids = tuple(
+      window_id for window_id in window_ids if window_id not in retained_ids
+    )[:4]
+    early_id, late_id, under_id, over_id = exceptional_ids
+
+    patterns = {
+      early_id: ((0.0, 0.004, 0.01), (0.0, 0.006, 0.01)),
+      late_id: ((0.0, 0.006, 0.01, 0.01), (0.0, 0.0, 0.004, 0.01)),
+      under_id: ((0.0, 0.006, 0.01), (0.0, 0.0048, 0.008)),
+      over_id: ((0.0, 0.006, 0.01), (0.0, 0.0072, 0.012)),
+    }
+    scored = []
+    for window_id in window_ids:
+      desired, measured = patterns.get(
+        window_id,
+        ((0.0, 0.006, 0.01), (0.0, 0.006, 0.01)),
+      )
+      scored.append(score_window(
+        make_window(
+          "route-a",
+          window_id,
+          ManeuverPhase.TURN_IN,
+          tuple(
+            make_sample(index, desired=target, measured=delivered)
+            for index, (target, delivered) in enumerate(
+              zip(desired, measured, strict=True),
+            )
+          ),
+        ),
+        metric_config,
+      ))
+    scorecard = aggregate_behavior_metrics(scored, metric_config)
+    self.assertTrue(set(exceptional_ids).isdisjoint({
+      window.window_id
+      for window in scorecard.windows
+      if window.summary_metric_name is None
+    }))
+
+    def policy_metric(name: BehaviorMetricName) -> PolicyMetric:
+      return PolicyMetric.from_scorecard(scorecard, name)
+
+    minimum_lag = policy_metric(BehaviorMetricName.MIN_SIGNED_TURN_IN_LAG_S)
+    maximum_lag = policy_metric(BehaviorMetricName.MAX_SIGNED_TURN_IN_LAG_S)
+    minimum_delivery = policy_metric(BehaviorMetricName.MIN_DELIVERED_FRACTION)
+    maximum_delivery = policy_metric(BehaviorMetricName.MAX_DELIVERED_FRACTION)
+    average_delivery = policy_metric(BehaviorMetricName.DELIVERED_FRACTION)
+    self.assertAlmostEqual(minimum_lag.value, -0.1)
+    self.assertAlmostEqual(maximum_lag.value, 0.2)
+    self.assertAlmostEqual(minimum_delivery.value, 0.8)
+    self.assertAlmostEqual(maximum_delivery.value, 1.2)
+    self.assertEqual(average_delivery.value, 1.0)
+    self.assertEqual(minimum_lag.window_count, len(window_ids))
+    self.assertEqual(maximum_lag.window_count, len(window_ids))
+
+    def verdict(
+      candidate: PolicyMetric,
+      *,
+      safe_value: float,
+      contract: BehaviorContract,
+      preference: MetricPreference,
+      minimum: float,
+      maximum: float,
+    ):
+      reference = replace(
+        candidate,
+        value=safe_value,
+        route_values=(("route-a", safe_value),),
+        stratum_metrics=(replace(
+          candidate.stratum_metrics[0],
+          value=safe_value,
+          route_values=(("route-a", safe_value),),
+        ),),
+      )
+      return behavior_policy._metric_margin(
+        candidate,
+        reference,
+        reference,
+        MetricGateRule(
+          metric_name=candidate.name,
+          contract=contract,
+          preference=preference,
+          noise_floor=0.0,
+          margin_normalization=1.0,
+          minimum_allowed=minimum,
+          maximum_allowed=maximum,
+          minimum_route_count=1,
+          minimum_window_count=1,
+          minimum_weighted_support=1.0,
+          required_strata=("5:turn",),
+        ),
+        PAIRED_ROUTE_UNCERTAINTY_METHOD,
+        1,
+      )
+
+    self.assertFalse(verdict(
+      minimum_lag,
+      safe_value=0.05,
+      contract=BehaviorContract.SWIFT,
+      preference=MetricPreference.HIGHER_IS_BETTER,
+      minimum=0.0,
+      maximum=0.12,
+    ).passed)
+    self.assertFalse(verdict(
+      maximum_lag,
+      safe_value=0.05,
+      contract=BehaviorContract.SWIFT,
+      preference=MetricPreference.LOWER_IS_BETTER,
+      minimum=0.0,
+      maximum=0.12,
+    ).passed)
+    self.assertFalse(verdict(
+      minimum_delivery,
+      safe_value=1.0,
+      contract=BehaviorContract.STRONG,
+      preference=MetricPreference.HIGHER_IS_BETTER,
+      minimum=0.95,
+      maximum=1.1,
+    ).passed)
+    self.assertFalse(verdict(
+      maximum_delivery,
+      safe_value=1.0,
+      contract=BehaviorContract.STRONG,
+      preference=MetricPreference.LOWER_IS_BETTER,
+      minimum=0.0,
+      maximum=1.1,
+    ).passed)
+
+  def test_maximum_authority_shortfall_censors_request_suppression(self):
+    def authority_metric(
+      *,
+      planned: float,
+      reachable: float,
+      applied: float,
+      request_active: bool,
+    ):
+      samples = tuple(
+        replace(
+          make_sample(index, raw_torque=1.5),
+          planned_requested_torque=planned,
+          reachable_envelope_torque=reachable,
+          envelope_applied_torque=applied,
+          steering_request_active=request_active,
+          maximum_authority_required=True,
+        )
+        for index in range(2)
+      )
+      return score_window(
+        make_window("route-a", "maximum-authority", ManeuverPhase.TURN_IN, samples),
+        config(),
+      ).metric(BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL)
+
+    reachable = authority_metric(
+      planned=0.4,
+      reachable=0.4,
+      applied=0.4,
+      request_active=True,
+    )
+    short = authority_metric(
+      planned=0.3,
+      reachable=0.4,
+      applied=0.3,
+      request_active=True,
+    )
+    suppressed = authority_metric(
+      planned=0.4,
+      reachable=0.4,
+      applied=0.4,
+      request_active=False,
+    )
+    self.assertEqual(reachable.value, 0.0)
+    self.assertAlmostEqual(short.value, 0.1)
+    self.assertEqual(suppressed.disposition, MetricDisposition.PHYSICAL_UNSCOREABLE)
+    self.assertIn("request_suppressed_maximum_authority", suppressed.exclusions)
+
+  def test_all_window_unscoreable_summaries_count_affected_windows(self):
+    suppressed = tuple(
+      score_window(
+        make_window(
+          "route-a",
+          f"request-off-{window_index}",
+          ManeuverPhase.TURN_IN,
+          tuple(
+            replace(
+              make_sample(sample_index),
+              steering_request_active=False,
+              maximum_authority_required=True,
+            )
+            for sample_index in range(2)
+          ),
+        ),
+        config(),
+      )
+      for window_index in range(2)
+    )
+    excluded = tuple(
+      score_window(
+        make_window(
+          "route-a",
+          f"coverage-off-{window_index}",
+          ManeuverPhase.TURN_IN,
+          tuple(
+            replace(make_sample(sample_index), controller_fault=True)
+            for sample_index in range(2)
+          ),
+        ),
+        config(),
+      )
+      for window_index in range(2)
+    )
+
+    for scored, name, disposition in (
+      (
+        suppressed,
+        BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL,
+        MetricDisposition.PHYSICAL_UNSCOREABLE,
+      ),
+      (
+        excluded,
+        BehaviorMetricName.MIN_DELIVERED_FRACTION,
+        MetricDisposition.COVERAGE_EXCLUDED,
+      ),
+    ):
+      retained = retain_route_metric_windows(scored, config())
+      summary = next(window for window in retained if window.summary_metric_name is name)
+      self.assertEqual(summary.metric(name).disposition, disposition)
+      self.assertEqual(summary.metric(name).denominator, len(scored))
+      self.assertEqual(summary.clean_sample_count, len(scored))
+
+      policy = PolicyMetric.from_scorecard(
+        aggregate_behavior_metrics(scored, config()),
+        name,
+      )
+      self.assertEqual(policy.stratum_metrics[0].disposition, disposition)
+      self.assertEqual(policy.stratum_metrics[0].window_count, len(scored))
+
+  def test_mixed_all_window_failures_precede_defined_values(self):
+    metric_config = config()
+    delivered_windows = tuple(
+      score_window(
+        make_window(
+          "route-b" if window_index == 2 else "route-a",
+          f"delivered-{window_index}",
+          ManeuverPhase.TURN_IN,
+          (make_sample(0), make_sample(1)),
+        ),
+        metric_config,
+      )
+      for window_index in range(3)
+    )
+    coverage_window = score_window(
+      make_window(
+        "route-a",
+        "delivered-coverage",
+        ManeuverPhase.TURN_IN,
+        tuple(
+          replace(make_sample(index), controller_fault=True)
+          for index in range(2)
+        ),
+      ),
+      metric_config,
+    )
+    delivered_name = BehaviorMetricName.MIN_DELIVERED_FRACTION
+    retained = retain_route_metric_windows(
+      (*delivered_windows, coverage_window),
+      metric_config,
+    )
+    route_summary = next(
+      window
+      for window in retained
+      if window.route_id == "route-a" and window.summary_metric_name is delivered_name
+    )
+    self.assertEqual(
+      route_summary.metric(delivered_name).disposition,
+      MetricDisposition.COVERAGE_EXCLUDED,
+    )
+    self.assertEqual(route_summary.metric(delivered_name).denominator, 3)
+    self.assertEqual(route_summary.clean_sample_count, 3)
+
+    delivered = PolicyMetric.from_scorecard(
+      aggregate_behavior_metrics((*delivered_windows, coverage_window), metric_config),
+      delivered_name,
+    )
+    self.assertIsNone(delivered.value)
+    self.assertEqual(
+      delivered.stratum_metrics[0].disposition,
+      MetricDisposition.COVERAGE_EXCLUDED,
+    )
+    self.assertEqual(delivered.stratum_metrics[0].window_count, 4)
+    reference = PolicyMetric.from_scorecard(
+      aggregate_behavior_metrics(delivered_windows, metric_config),
+      delivered_name,
+    )
+    verdict = behavior_policy._metric_margin(
+      delivered,
+      reference,
+      reference,
+      MetricGateRule(
+        metric_name=delivered_name.value,
+        contract=BehaviorContract.STRONG,
+        preference=MetricPreference.HIGHER_IS_BETTER,
+        noise_floor=0.0,
+        margin_normalization=1.0,
+        minimum_allowed=0.95,
+        maximum_allowed=1.1,
+        minimum_route_count=1,
+        minimum_window_count=1,
+        minimum_weighted_support=1.0,
+        required_strata=("5:turn",),
+      ),
+      PAIRED_ROUTE_UNCERTAINTY_METHOD,
+      1,
+    )
+    self.assertFalse(verdict.passed)
+
+    authority_windows = tuple(
+      score_window(
+        make_window(
+          "route-b" if window_index == 2 else "route-a",
+          f"authority-{window_index}",
+          ManeuverPhase.TURN_IN,
+          tuple(
+            replace(make_sample(index), maximum_authority_required=True)
+            for index in range(2)
+          ),
+        ),
+        metric_config,
+      )
+      for window_index in range(3)
+    )
+    suppressed = score_window(
+      make_window(
+        "route-a",
+        "authority-suppressed",
+        ManeuverPhase.TURN_IN,
+        tuple(
+          replace(
+            make_sample(index),
+            steering_request_active=False,
+            maximum_authority_required=True,
+          )
+          for index in range(2)
+        ),
+      ),
+      metric_config,
+    )
+    authority_name = BehaviorMetricName.MAXIMUM_AUTHORITY_SHORTFALL
+    authority = PolicyMetric.from_scorecard(
+      aggregate_behavior_metrics((*authority_windows, suppressed), metric_config),
+      authority_name,
+    )
+    self.assertEqual(
+      authority.stratum_metrics[0].disposition,
+      MetricDisposition.PHYSICAL_UNSCOREABLE,
+    )
+    self.assertEqual(authority.stratum_metrics[0].window_count, 4)
 
   def test_speed_transition_uses_adjacent_linear_weights_without_boundary(self):
     self.assertEqual(speed_node_weights(0.0, (0.0, 5.0, 10.0)), ((0.0, 1.0),))

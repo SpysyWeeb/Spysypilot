@@ -13,6 +13,7 @@ from openpilot.selfdrive.controls.lib.blatv2.approved_artifact import (
   ApprovedArtifactReader,
   ApprovedProfileArtifact,
   ArtifactDiagnostic,
+  ArtifactValidationError,
   CalibrationSelectionManifest,
   PersistentProfileActivation,
   ProfileIdentity,
@@ -26,16 +27,10 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import BehaviorPoli
 from openpilot.selfdrive.controls.lib.blatv2.bootstrap import (
   ControllerSelection,
 )
-from openpilot.selfdrive.controls.lib.blatv2.feedback import (
-  FEEDBACK_REQUEST_PARAM,
-  FEEDBACK_RESPONSE_PARAM,
-  FeedbackChoice,
-  FeedbackRequest,
-  FeedbackResponse,
-)
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
   calibration_profile_for_controller,
+  passing_device_acceptance_receipt,
 )
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   PhysicalParameters,
@@ -52,6 +47,7 @@ PANDA_COMMIT = "4" * 40
 EVIDENCE_HASH = "4" * 64
 HARNESS_COMMIT = "5" * 40
 CALIBRATION_MANIFEST_HASH = "5" * 64
+HORIZON_POLICY_HASH = "6" * 64
 
 
 class MemoryParams:
@@ -181,10 +177,14 @@ def artifact(revision: int = 1) -> ApprovedProfileArtifact:
   selected_profile = profile(revision)
   calibration = calibration_profile_for_controller(selected_profile)
   selected_policy = policy()
+  profile_hash = hashlib.sha256(
+    selected_profile.to_json().encode(),
+  ).hexdigest()
   return ApprovedProfileArtifact(
     vehicle_profile=selected_profile,
     calibration_profile=calibration,
     controller_policy=selected_policy,
+    horizon_policy_sha256=HORIZON_POLICY_HASH,
     runtime_vehicle_identity_sha256=RUNTIME_HASH,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
@@ -194,9 +194,17 @@ def artifact(revision: int = 1) -> ApprovedProfileArtifact:
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
-    safety_passed=True,
     deterministic_aa_passed=True,
-    device_timing_passed=True,
+    device_acceptance_receipt=passing_device_acceptance_receipt(
+      vehicle_identity=selected_profile.vehicle_identity,
+      runtime_identity_sha256=RUNTIME_HASH,
+      profile_sha256=profile_hash,
+      controller_policy_sha256=selected_policy.sha256,
+      horizon_policy_sha256=HORIZON_POLICY_HASH,
+      source_openpilot_commit=SOURCE_COMMIT,
+      opendbc_commit=OPENDBC_COMMIT,
+      panda_commit=PANDA_COMMIT,
+    ),
     smooth_passed=True,
     swift_passed=True,
     strong_passed=True,
@@ -234,28 +242,6 @@ def activation(
   )
 
 
-def set_feedback(
-  params: MemoryParams,
-  selected: ApprovedProfileArtifact,
-  choice: FeedbackChoice,
-  *,
-  profile_sha256: str | None = None,
-) -> None:
-  request = FeedbackRequest(
-    artifact_sha256=selected.artifact_sha256,
-    profile_sha256=(
-      selected.vehicle_profile_sha256
-      if profile_sha256 is None
-      else profile_sha256
-    ),
-    profile_revision=selected.vehicle_profile.revision,
-  )
-  params.values[FEEDBACK_REQUEST_PARAM] = request.to_param()
-  params.values[FEEDBACK_RESPONSE_PARAM] = (
-    FeedbackResponse.for_request(request, choice).to_param()
-  )
-
-
 class TestApprovedProfileArtifact(unittest.TestCase):
   def setUp(self):
     self.params = MemoryParams()
@@ -264,16 +250,18 @@ class TestApprovedProfileArtifact(unittest.TestCase):
       self.approved.to_param()
     )
 
-  def test_valid_artifact_round_trip_binds_every_identity(self):
-    result = reader_result(self.params)
-    self.assertIs(result.diagnostic, ArtifactDiagnostic.OK)
-    self.assertEqual(result.artifact, self.approved)
+  def test_candidate_round_trip_binds_identity_but_cannot_approve(self):
+    parsed = ApprovedProfileArtifact.from_param(
+      self.approved.to_param(),
+      expected_vehicle_identity=VEHICLE,
+    )
+    self.assertEqual(parsed, self.approved)
     self.assertEqual(
-      result.artifact.behavior_selection_sha256,
+      parsed.behavior_selection_sha256,
       self.approved.behavior_finalization.behavior_selection_sha256,
     )
     self.assertEqual(
-      result.artifact.artifact_sha256,
+      parsed.artifact_sha256,
       hashlib.sha256(
         json.dumps(
           self.approved.to_param(),
@@ -281,6 +269,13 @@ class TestApprovedProfileArtifact(unittest.TestCase):
           separators=(",", ":"),
         ).encode(),
       ).hexdigest(),
+    )
+
+    result = reader_result(self.params)
+    self.assertIsNone(result.artifact)
+    self.assertIs(
+      result.diagnostic,
+      ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE,
     )
 
   def test_absent_and_read_error_fail_to_stock_without_exception(self):
@@ -304,9 +299,9 @@ class TestApprovedProfileArtifact(unittest.TestCase):
     extra = self.approved.to_param()
     extra["automaticApproval"] = True
     mutations.append(extra)
-    wrong_bool = self.approved.to_param()
-    wrong_bool["safetyPassed"] = 1
-    mutations.append(wrong_bool)
+    retired_safety_bool = self.approved.to_param()
+    retired_safety_bool["externalSafetyEvidencePassed"] = True
+    mutations.append(retired_safety_bool)
     upper_hash = self.approved.to_param()
     upper_hash["learnerEvidenceSha256"] = "A" * 64
     mutations.append(upper_hash)
@@ -494,9 +489,7 @@ class TestApprovedProfileArtifact(unittest.TestCase):
     for key in (
       "replayPassed",
       "deliveredReplayPassed",
-      "safetyPassed",
       "deterministicAaPassed",
-      "deviceTimingPassed",
       "smoothPassed",
       "swiftPassed",
       "strongPassed",
@@ -533,6 +526,42 @@ class TestApprovedProfileArtifact(unittest.TestCase):
           result.diagnostic,
           ArtifactDiagnostic.MALFORMED,
         )
+
+  def test_device_receipt_is_hash_and_identity_bound_without_boolean_escape(self):
+    forged = self.approved.to_param()
+    forged["deviceTimingPassed"] = True
+    self.params.values[APPROVED_ARTIFACT_PARAM] = forged
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.MALFORMED,
+    )
+
+    tampered = self.approved.to_param()
+    decoded = json.loads(tampered["deviceAcceptanceReceiptJson"])
+    decoded["sampleCount"] = 2
+    tampered["deviceAcceptanceReceiptJson"] = json.dumps(
+      decoded,
+      sort_keys=True,
+      separators=(",", ":"),
+    )
+    self.params.values[APPROVED_ARTIFACT_PARAM] = tampered
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.DEVICE_ACCEPTANCE_PROOF_MISMATCH,
+    )
+
+    mismatched = self.approved.to_param()
+    receipt = replace(
+      self.approved.device_acceptance_receipt,
+      horizon_policy_sha256="7" * 64,
+    )
+    mismatched["deviceAcceptanceReceiptJson"] = receipt.to_json()
+    mismatched["deviceAcceptanceReceiptSha256"] = receipt.sha256
+    self.params.values[APPROVED_ARTIFACT_PARAM] = mismatched
+    self.assertIs(
+      reader_result(self.params).diagnostic,
+      ArtifactDiagnostic.DEVICE_ACCEPTANCE_PROOF_MISMATCH,
+    )
 
   def test_old_schema_artifact_fails_closed_in_reader_and_activation(self):
     old_payload = self.approved.to_param()
@@ -586,9 +615,17 @@ class TestApprovedProfileArtifact(unittest.TestCase):
     )
 
     state_params = MemoryParams()
-    manager = activation(state_params)
-    manager.stage(self.approved, offroad=True)
-    persisted = state_params.values[ACTIVATION_STATE_PARAM]
+    persisted = {
+      "schemaVersion": 1,
+      "activeArtifact": None,
+      "activeProfileIdentity": None,
+      "previousArtifact": None,
+      "stagedArtifact": self.approved.to_param(),
+      "provisional": False,
+      "rollbackPending": False,
+      "rejectedProfileIdentities": [],
+    }
+    state_params.values[ACTIVATION_STATE_PARAM] = persisted
     persisted["stagedArtifact"]["schemaVersion"] = 3
     for key in (
       "pandaCommit",
@@ -698,220 +735,52 @@ class TestApprovedProfileArtifact(unittest.TestCase):
     )
 
 
-class TestPersistentProfileActivation(unittest.TestCase):
-  def setUp(self):
-    self.params = MemoryParams()
-
-  def _activate_provisional(
-    self,
-    candidate: ApprovedProfileArtifact | None = None,
-  ) -> tuple[
-    PersistentProfileActivation,
-    ApprovedProfileArtifact,
-  ]:
-    selected = artifact() if candidate is None else candidate
-    manager = activation(self.params)
-    manager.stage(selected, offroad=True)
-    self.assertTrue(manager.prepare_offroad(offroad=True))
-    decision = manager.begin_engagement()
-    self.assertIs(decision.selection, ControllerSelection.MODULAR)
-    self.assertEqual(decision.artifact, selected)
-    self.assertTrue(decision.provisional)
-    manager.end_engagement()
-    return manager, selected
-
-  def test_empty_state_is_stock_and_stage_survives_restart(self):
-    manager = activation(self.params)
-    self.assertIs(
-      manager.begin_engagement().selection,
-      ControllerSelection.STOCK,
-    )
-    manager.end_engagement()
+class TestPersistentProfileActivationAuthorityWall(unittest.TestCase):
+  def test_stage_and_preseeded_state_cannot_bypass_missing_authority(self):
+    params = MemoryParams()
     selected = artifact()
-    manager.stage(selected, offroad=True)
-    restored = activation(self.params)
-    self.assertEqual(restored.staged_artifact, selected)
+    manager = activation(params)
+    with self.assertRaises(ArtifactValidationError) as raised:
+      manager.stage(selected, offroad=True)
     self.assertIs(
-      restored.begin_engagement().selection,
-      ControllerSelection.STOCK,
+      raised.exception.reason,
+      ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE,
     )
-    restored.end_engagement()
-    self.assertTrue(restored.prepare_offroad(offroad=True))
-    decision = restored.begin_engagement()
-    self.assertEqual(decision.artifact, selected)
-
-  def test_stage_and_feedback_cannot_switch_mid_engagement(self):
-    manager = activation(self.params)
-    first = artifact()
-    manager.stage(first, offroad=True)
-    manager.prepare_offroad(offroad=True)
+    self.assertEqual(params.puts, [])
+    self.assertFalse(manager.prepare_offroad(offroad=True))
     decision = manager.begin_engagement()
-    self.assertEqual(decision.artifact, first)
-    with self.assertRaisesRegex(RuntimeError, "offroad"):
-      manager.stage(artifact(2), offroad=True)
-    response = FeedbackResponse(
-      first.artifact_sha256,
-      first.vehicle_profile_sha256,
-      first.vehicle_profile.revision,
-      FeedbackChoice.WORSE,
-    )
-    self.params.values[FEEDBACK_RESPONSE_PARAM] = response.to_param()
-    self.assertIsNone(manager.consume_feedback(offroad=True))
-    self.assertFalse(manager.rollback_pending)
+    self.assertIs(decision.selection, ControllerSelection.STOCK)
+    self.assertIsNone(decision.artifact)
+    manager.end_engagement()
 
-  def test_worse_rejects_exact_identity_then_rolls_back_at_boundary(self):
-    manager, selected = self._activate_provisional()
-    set_feedback(self.params, selected, FeedbackChoice.WORSE)
-    self.assertIs(
-      manager.consume_feedback(offroad=True),
-      FeedbackChoice.WORSE,
-    )
     identity = ProfileIdentity.from_artifact(selected)
-    self.assertIn(identity, manager.rejected_profile_identities)
-    self.assertTrue(manager.rollback_pending)
-    self.assertEqual(manager.active_artifact, selected)
-
-    restored = activation(self.params)
-    self.assertTrue(restored.rollback_pending)
-    put_count = len(self.params.puts)
+    params.values[ACTIVATION_STATE_PARAM] = {
+      "schemaVersion": 1,
+      "activeArtifact": selected.to_param(),
+      "activeProfileIdentity": identity.to_param(),
+      "previousArtifact": None,
+      "stagedArtifact": None,
+      "provisional": False,
+      "rollbackPending": False,
+      "rejectedProfileIdentities": [],
+    }
+    restored = activation(params)
+    self.assertIs(
+      restored.diagnostic,
+      ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE,
+    )
+    self.assertIsNone(restored.active_artifact)
+    self.assertFalse(restored.prepare_offroad(offroad=True))
     decision = restored.begin_engagement()
     self.assertIs(decision.selection, ControllerSelection.STOCK)
     self.assertIsNone(decision.artifact)
-    self.assertEqual(len(self.params.puts), put_count)
-    restored.end_engagement()
-    self.assertTrue(restored.prepare_offroad(offroad=True))
-    decision = restored.begin_engagement()
-    self.assertIs(decision.selection, ControllerSelection.STOCK)
-    restored.end_engagement()
-    with self.assertRaisesRegex(ValueError, "rejected"):
-      restored.stage(selected, offroad=True)
 
-  def test_better_and_about_same_accept_exact_provisional_profile(self):
-    for choice in (
-      FeedbackChoice.BETTER,
-      FeedbackChoice.ABOUT_SAME,
-    ):
-      with self.subTest(choice=choice):
-        params = MemoryParams()
-        manager = activation(params)
-        selected = artifact()
-        manager.stage(selected, offroad=True)
-        manager.prepare_offroad(offroad=True)
-        manager.begin_engagement()
-        manager.end_engagement()
-        set_feedback(params, selected, choice)
-        self.assertIs(manager.consume_feedback(offroad=True), choice)
-        self.assertFalse(manager.provisional)
-        restored = activation(params)
-        decision = restored.begin_engagement()
-        self.assertEqual(decision.artifact, selected)
-        self.assertFalse(decision.provisional)
 
-  def test_not_sure_preserves_provisional_state(self):
-    manager, selected = self._activate_provisional()
-    set_feedback(self.params, selected, FeedbackChoice.NOT_SURE)
-    put_count = len(self.params.puts)
-    self.assertIs(
-      manager.consume_feedback(offroad=True),
-      FeedbackChoice.NOT_SURE,
-    )
-    self.assertTrue(manager.provisional)
-    self.assertEqual(len(self.params.puts), put_count)
-    self.assertNotIn(FEEDBACK_RESPONSE_PARAM, self.params.values)
-
-  def test_feedback_must_match_hash_revision_and_be_offroad(self):
-    manager, selected = self._activate_provisional()
-    set_feedback(
-      self.params,
-      selected,
-      FeedbackChoice.WORSE,
-      profile_sha256="b" * 64,
-    )
-    self.assertIsNone(manager.consume_feedback(offroad=True))
-    self.assertIsNone(manager.consume_feedback(offroad=False))
-    self.assertFalse(manager.rollback_pending)
-
-  def test_feedback_requires_the_exact_request_as_well_as_response(self):
-    manager, selected = self._activate_provisional()
-    self.params.values[FEEDBACK_RESPONSE_PARAM] = FeedbackResponse(
-      selected.artifact_sha256,
-      selected.vehicle_profile_sha256,
-      selected.vehicle_profile.revision,
-      FeedbackChoice.WORSE,
-    ).to_param()
-    self.assertIsNone(manager.consume_feedback(offroad=True))
-    self.assertFalse(manager.rollback_pending)
-
-  def test_same_profile_in_a_different_artifact_cannot_resolve_feedback(self):
-    manager, selected = self._activate_provisional()
-    different_wrapper = replace(
-      selected,
-      controller_policy=policy(revision=2),
-    )
-    self.assertEqual(
-      different_wrapper.vehicle_profile_sha256,
-      selected.vehicle_profile_sha256,
-    )
-    self.assertNotEqual(
-      different_wrapper.artifact_sha256,
-      selected.artifact_sha256,
-    )
-    set_feedback(
-      self.params,
-      different_wrapper,
-      FeedbackChoice.BETTER,
-    )
-    self.assertIsNone(manager.consume_feedback(offroad=True))
-    self.assertTrue(manager.provisional)
-
-  def test_newer_artifact_switches_only_at_next_engagement(self):
-    manager, first = self._activate_provisional()
-    set_feedback(self.params, first, FeedbackChoice.BETTER)
-    manager.consume_feedback(offroad=True)
-    second = artifact(2)
-    manager.stage(second, offroad=True)
-    self.assertEqual(manager.active_artifact, first)
-    decision = manager.begin_engagement()
-    self.assertEqual(decision.artifact, first)
-    manager.end_engagement()
-    self.assertTrue(manager.prepare_offroad(offroad=True))
-    decision = manager.begin_engagement()
-    self.assertEqual(decision.artifact, second)
-    self.assertTrue(decision.provisional)
-
-  def test_begin_engagement_is_strictly_read_only(self):
-    selected = artifact()
-    manager = activation(self.params)
-    manager.stage(selected, offroad=True)
-
-    def forbid_put(*_args, **_kwargs):
-      raise AssertionError("live engagement attempted a Params write")
-
-    original_put = self.params.put
-    self.params.put = forbid_put
-    try:
-      decision = manager.begin_engagement()
-      self.assertIs(decision.selection, ControllerSelection.STOCK)
-      manager.end_engagement()
-    finally:
-      self.params.put = original_put
-
-    self.assertTrue(manager.prepare_offroad(offroad=True))
-    self.params.put = forbid_put
-    try:
-      decision = manager.begin_engagement()
-      self.assertIs(decision.selection, ControllerSelection.MODULAR)
-      self.assertEqual(decision.artifact, selected)
-      manager.end_engagement()
-    finally:
-      self.params.put = original_put
+class TestPersistentProfileActivationGuards(unittest.TestCase):
+  def setUp(self):
+    self.params = MemoryParams()
 
   def test_unverified_production_envelope_can_construct_but_only_selects_stock(self):
-    selected = artifact()
-    prepared = activation(self.params)
-    prepared.stage(selected, offroad=True)
-    prepared.prepare_offroad(offroad=True)
-
     unverified = activation(
       self.params,
       production_envelope_verified=False,
@@ -924,68 +793,6 @@ class TestPersistentProfileActivation(unittest.TestCase):
     self.assertEqual(len(self.params.puts), put_count)
     with self.assertRaisesRegex(RuntimeError, "verified production"):
       unverified.stage(artifact(2), offroad=True)
-
-  def test_canonical_old_source_opendbc_or_panda_state_retires_offroad(self):
-    cases = (
-      (
-        replace(
-          artifact(),
-          source_openpilot_commit="6" * 40,
-        ),
-        {
-          "expected_source_openpilot_commit": "6" * 40,
-          "expected_opendbc_commit": OPENDBC_COMMIT,
-        },
-      ),
-      (
-        replace(
-          artifact(),
-          opendbc_commit="7" * 40,
-        ),
-        {
-          "expected_source_openpilot_commit": SOURCE_COMMIT,
-          "expected_opendbc_commit": "7" * 40,
-        },
-      ),
-      (
-        replace(
-          artifact(),
-          panda_commit="8" * 40,
-        ),
-        {
-          "expected_source_openpilot_commit": SOURCE_COMMIT,
-          "expected_opendbc_commit": OPENDBC_COMMIT,
-          "expected_panda_commit": "8" * 40,
-        },
-      ),
-    )
-    for old_artifact, old_expected in cases:
-      with self.subTest(old_expected=old_expected):
-        params = MemoryParams()
-        old_manager = activation(params, **old_expected)
-        old_manager.stage(old_artifact, offroad=True)
-        old_manager.prepare_offroad(offroad=True)
-
-        current = activation(params)
-        self.assertTrue(current.stale_build_state)
-        self.assertIs(
-          current.diagnostic,
-          ArtifactDiagnostic.STATE_STALE_BUILD,
-        )
-        put_count = len(params.puts)
-        decision = current.begin_engagement()
-        self.assertIs(decision.selection, ControllerSelection.STOCK)
-        current.end_engagement()
-        self.assertEqual(len(params.puts), put_count)
-        with self.assertRaisesRegex(RuntimeError, "offroad"):
-          current.retire_stale_build_offroad(offroad=False)
-        self.assertTrue(
-          current.retire_stale_build_offroad(offroad=True),
-        )
-        self.assertFalse(current.stale_build_state)
-        current.stage(artifact(), offroad=True)
-        current.prepare_offroad(offroad=True)
-        self.assertEqual(current.active_artifact, artifact())
 
   def test_malformed_persisted_state_stays_stock_and_is_not_overwritten(self):
     corrupt = {"schemaVersion": 1}
@@ -1006,6 +813,45 @@ class TestPersistentProfileActivation(unittest.TestCase):
       self.params.values[ACTIVATION_STATE_PARAM],
       corrupt,
     )
+
+  def test_persisted_state_invariants_fail_closed(self):
+    selected = artifact()
+    base = {
+      "schemaVersion": 1,
+      "activeArtifact": selected.to_param(),
+      "activeProfileIdentity": ProfileIdentity.from_artifact(
+        selected,
+      ).to_param(),
+      "previousArtifact": None,
+      "stagedArtifact": None,
+      "provisional": False,
+      "rollbackPending": False,
+      "rejectedProfileIdentities": [],
+    }
+    cases = {
+      "identity": {
+        "activeProfileIdentity": ProfileIdentity.from_artifact(
+          artifact(2),
+        ).to_param(),
+      },
+      "rollback": {"rollbackPending": True},
+      "duplicate role": {"stagedArtifact": selected.to_param()},
+    }
+    for name, mutation in cases.items():
+      with self.subTest(name=name):
+        persisted = copy.deepcopy(base)
+        persisted.update(mutation)
+        params = MemoryParams()
+        params.values[ACTIVATION_STATE_PARAM] = persisted
+        manager = activation(params)
+        self.assertIs(manager.diagnostic, ArtifactDiagnostic.STATE_INVALID)
+        self.assertIsNone(manager.active_artifact)
+        self.assertFalse(manager.prepare_offroad(offroad=True))
+        self.assertIs(
+          manager.begin_engagement().selection,
+          ControllerSelection.STOCK,
+        )
+        self.assertEqual(params.values[ACTIVATION_STATE_PARAM], persisted)
 
   def test_activation_params_are_persistent_json_without_clear_flags(self):
     root = Path(__file__).resolve().parents[3]

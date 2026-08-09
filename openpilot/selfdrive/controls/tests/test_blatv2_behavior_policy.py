@@ -12,6 +12,7 @@ from openpilot.selfdrive.controls.lib.blatv2 import behavior_evidence, behavior_
 from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   BehaviorContract,
   BehaviorMetricName,
+  MetricDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import (
   ReplayArtifactIdentity,
@@ -26,6 +27,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
   PolicyEvaluation,
   PolicyGridSpec,
   PolicyMetric,
+  PolicyStratumMetric,
   build_candidate_grid,
   evaluate_candidate,
   select_training_winner,
@@ -128,6 +130,34 @@ def policy_metric(
   coverage: str = "f" * 64,
   physical_failures: tuple[str, ...] = (),
 ) -> PolicyMetric:
+  stratum_metric = PolicyStratumMetric(
+    stratum="5:turn",
+    value=value,
+    disposition=(
+      MetricDisposition.DEFINED
+      if value is not None
+      else MetricDisposition.PHYSICAL_UNSCOREABLE
+      if physical_failures
+      else MetricDisposition.COVERAGE_EXCLUDED
+    ),
+    exclusions=() if value is not None else ("unscoreable",),
+    route_count=len(route_ids),
+    window_count=10,
+    weighted_support=10.0,
+    coverage_identity_sha256=coverage,
+    physical_failure_window_ids=physical_failures,
+    coverage_excluded_window_ids=(
+      ("fixture/coverage-excluded",)
+      if value is None and not physical_failures
+      else ()
+    ),
+    not_applicable_window_ids=(),
+    route_values=(
+      tuple((route_id, value) for route_id in route_ids)
+      if value is not None
+      else ()
+    ),
+  )
   return PolicyMetric(
     name.value,
     value,
@@ -138,11 +168,71 @@ def policy_metric(
     weighted_support=10.0,
     coverage_identity_sha256=coverage,
     strata=("5:turn",),
+    stratum_metrics=(stratum_metric,),
     physical_failure_window_ids=physical_failures,
     route_values=(
       tuple((route_id, value) for route_id in route_ids)
       if value is not None
       else ()
+    ),
+  )
+
+
+def with_metric_strata(
+  source: PolicyEvaluation,
+  name: BehaviorMetricName,
+  aggregate_value: float,
+  values: tuple[tuple[str, float], ...],
+) -> PolicyEvaluation:
+  metrics = []
+  for metric in source.metrics:
+    if metric.name != name.value:
+      metrics.append(metric)
+      continue
+    base = metric.stratum_metrics[0]
+    strata = tuple(
+      replace(
+        base,
+        stratum=stratum,
+        value=value,
+        exclusions=(),
+        route_values=tuple(
+          (route_id, value) for route_id in source.route_ids
+        ),
+      )
+      for stratum, value in values
+    )
+    metrics.append(replace(
+      metric,
+      value=aggregate_value,
+      route_values=tuple(
+        (route_id, aggregate_value) for route_id in source.route_ids
+      ),
+      strata=tuple(stratum.stratum for stratum in strata),
+      stratum_metrics=strata,
+    ))
+  return replace(source, metrics=tuple(metrics))
+
+
+def with_extra_metric_stratum(
+  source: PolicyEvaluation,
+  name: BehaviorMetricName,
+  extra: PolicyStratumMetric,
+) -> PolicyEvaluation:
+  return replace(
+    source,
+    metrics=tuple(
+      replace(
+        metric,
+        strata=tuple(sorted((*metric.strata, extra.stratum))),
+        stratum_metrics=tuple(sorted(
+          (*metric.stratum_metrics, extra),
+          key=lambda value: value.stratum,
+        )),
+      )
+      if metric.name == name.value
+      else metric
+      for metric in source.metrics
     ),
   )
 
@@ -227,7 +317,7 @@ class TestBehaviorPolicy(unittest.TestCase):
     self.assertFalse(verdict.passed)
     swift = next(contract for contract in verdict.contracts if contract.contract is BehaviorContract.SWIFT)
     self.assertFalse(swift.passed)
-    self.assertIn("below_absolute_minimum", swift.metrics[0].reasons)
+    self.assertIn("5:turn:below_absolute_minimum", swift.metrics[0].reasons)
 
   def test_physical_failure_and_coverage_mismatch_fail_before_averaging(self):
     candidates = grid()
@@ -244,6 +334,14 @@ class TestBehaviorPolicy(unittest.TestCase):
         exclusions=("delivered_crossing_unobservable",),
         physical_failure_window_ids=("route-a/hard-turn",),
         route_values=(),
+        stratum_metrics=(replace(
+          metric.stratum_metrics[0],
+          value=None,
+          disposition=MetricDisposition.PHYSICAL_UNSCOREABLE,
+          exclusions=("delivered_crossing_unobservable",),
+          physical_failure_window_ids=("route-a/hard-turn",),
+          route_values=(),
+        ),),
       )
       if metric.name == turn_name else metric
       for metric in proposed.metrics
@@ -263,7 +361,14 @@ class TestBehaviorPolicy(unittest.TestCase):
     self.assertTrue(any("physical_unscoreable" in reason for reason in swift.metrics[0].reasons))
 
     mismatched_metrics = tuple(
-      replace(metric, coverage_identity_sha256="e" * 64)
+      replace(
+        metric,
+        coverage_identity_sha256="e" * 64,
+        stratum_metrics=(replace(
+          metric.stratum_metrics[0],
+          coverage_identity_sha256="e" * 64,
+        ),),
+      )
       if metric.name == BehaviorMetricName.RAW_TORQUE_RATE_RMS.value else metric
       for metric in proposed.metrics
     )
@@ -278,7 +383,7 @@ class TestBehaviorPolicy(unittest.TestCase):
       *UNCERTAINTY_ARGS,
     )
     smooth = next(value for value in mismatch_verdict.contracts if value.contract is BehaviorContract.SMOOTH)
-    self.assertIn("candidate_reference_coverage_mismatch", smooth.metrics[0].reasons)
+    self.assertIn("5:turn:candidate_reference_coverage_mismatch", smooth.metrics[0].reasons)
 
   def test_sparse_easy_speed_evidence_fails_coverage_gate(self):
     candidates = grid()
@@ -304,6 +409,279 @@ class TestBehaviorPolicy(unittest.TestCase):
     self.assertFalse(smooth.passed)
     self.assertTrue(any("route_coverage" in reason for reason in smooth.metrics[0].reasons))
     self.assertTrue(any("missing_required_stratum" in reason for reason in smooth.metrics[0].reasons))
+
+  def test_bad_populated_stratum_vetoes_good_balanced_aggregate(self):
+    candidates = grid()
+    candidate = candidates[0]
+    route_ids = ("train-a", "train-b")
+    stock = with_metric_strata(
+      evaluation("stock", None, route_ids, 15.0, 0.5, 0.9),
+      BehaviorMetricName.RAW_TORQUE_RATE_RMS,
+      15.0,
+      (("10:turn", 15.0), ("5:turn", 15.0)),
+    )
+    accepted = with_metric_strata(
+      evaluation("accepted", candidates[1].policy, route_ids, 15.0, 0.5, 0.9),
+      BehaviorMetricName.RAW_TORQUE_RATE_RMS,
+      15.0,
+      (("10:turn", 15.0), ("5:turn", 15.0)),
+    )
+    proposed = with_metric_strata(
+      evaluation("candidate", candidate.policy, route_ids, 13.0, 0.4, 1.0),
+      BehaviorMetricName.RAW_TORQUE_RATE_RMS,
+      13.0,
+      (("10:turn", 25.0), ("5:turn", 1.0)),
+    )
+    verdict = evaluate_candidate(
+      candidate,
+      proposed,
+      stock,
+      accepted,
+      rules(),
+      BehaviorMetricName.RAW_TORQUE_RATE_RMS.value,
+      *UNCERTAINTY_ARGS,
+    )
+    smooth = next(
+      contract for contract in verdict.contracts
+      if contract.contract is BehaviorContract.SMOOTH
+    )
+    self.assertFalse(verdict.passed)
+    self.assertTrue(verdict.target_materially_improved)
+    self.assertIn("10:turn:above_absolute_maximum", smooth.metrics[0].reasons)
+    self.assertIn("10:turn:regressed_vs_stock", smooth.metrics[0].reasons)
+
+  def test_unsupported_required_stratum_fails_current_support_rule(self):
+    candidates = grid()
+    candidate = candidates[0]
+    route_ids = ("train-a", "train-b")
+    stock = evaluation("stock", None, route_ids, 10.0, 0.5, 0.9)
+    accepted = evaluation("accepted", candidates[1].policy, route_ids, 10.0, 0.5, 0.9)
+    proposed = evaluation("candidate", candidate.policy, route_ids, 1.0, 0.4, 1.0)
+    proposed = replace(
+      proposed,
+      metrics=tuple(
+        replace(
+          metric,
+          stratum_metrics=(replace(
+            metric.stratum_metrics[0],
+            weighted_support=0.5,
+          ),),
+        )
+        if metric.name == BehaviorMetricName.RAW_TORQUE_RATE_RMS.value
+        else metric
+        for metric in proposed.metrics
+      ),
+    )
+    verdict = evaluate_candidate(
+      candidate,
+      proposed,
+      stock,
+      accepted,
+      rules(),
+      BehaviorMetricName.RAW_TORQUE_RATE_RMS.value,
+      *UNCERTAINTY_ARGS,
+    )
+    smooth = next(
+      contract for contract in verdict.contracts
+      if contract.contract is BehaviorContract.SMOOTH
+    )
+    self.assertFalse(smooth.passed)
+    self.assertIn(
+      "5:turn:candidate_weighted_support_below_minimum",
+      smooth.metrics[0].reasons,
+    )
+
+  def test_nonrequired_request_off_physical_stratum_is_not_skipped(self):
+    candidates = grid()
+    route_ids = ("train-a", "train-b")
+    stock = evaluation("stock", None, route_ids, 10.0, 0.5, 0.9)
+    accepted = evaluation("accepted", candidates[1].policy, route_ids, 10.0, 0.5, 0.9)
+    proposed = evaluation("candidate", candidates[0].policy, route_ids, 8.0, 0.4, 1.0)
+    name = BehaviorMetricName.RAW_TORQUE_RATE_RMS
+
+    def unavailable(source: PolicyEvaluation, disposition: MetricDisposition) -> PolicyStratumMetric:
+      base = source.metric(name.value).stratum_metrics[0]
+      physical = disposition is MetricDisposition.PHYSICAL_UNSCOREABLE
+      return replace(
+        base,
+        stratum="10:turn",
+        value=None,
+        disposition=disposition,
+        exclusions=(
+          "request_suppressed_maximum_authority"
+          if physical
+          else "not_applicable_in_route_stratum",
+        ),
+        route_count=0,
+        window_count=2 if physical else 0,
+        weighted_support=0.0,
+        physical_failure_window_ids=("train-a/request-off",) if physical else (),
+        coverage_excluded_window_ids=(),
+        not_applicable_window_ids=("train-a/not-applicable",) if not physical else (),
+        route_values=(),
+      )
+
+    proposed = with_extra_metric_stratum(
+      proposed,
+      name,
+      unavailable(proposed, MetricDisposition.PHYSICAL_UNSCOREABLE),
+    )
+    stock = with_extra_metric_stratum(
+      stock,
+      name,
+      unavailable(stock, MetricDisposition.NOT_APPLICABLE),
+    )
+    accepted = with_extra_metric_stratum(
+      accepted,
+      name,
+      unavailable(accepted, MetricDisposition.NOT_APPLICABLE),
+    )
+
+    verdict = evaluate_candidate(
+      candidates[0], proposed, stock, accepted, rules(), name.value, *UNCERTAINTY_ARGS,
+    )
+    smooth = next(value for value in verdict.contracts if value.contract is BehaviorContract.SMOOTH)
+    self.assertFalse(verdict.passed)
+    self.assertIn(
+      "10:turn:candidate_physical_unscoreable:train-a/request-off",
+      smooth.metrics[0].reasons,
+    )
+
+  def test_nonrequired_low_reference_coverage_is_not_skipped(self):
+    candidates = grid()
+    route_ids = ("train-a", "train-b")
+    name = BehaviorMetricName.RAW_TORQUE_RATE_RMS
+    stock = with_metric_strata(
+      evaluation("stock", None, route_ids, 10.0, 0.5, 0.9),
+      name,
+      10.0,
+      (("10:turn", 10.0), ("5:turn", 10.0)),
+    )
+    accepted = with_metric_strata(
+      evaluation("accepted", candidates[1].policy, route_ids, 10.0, 0.5, 0.9),
+      name,
+      10.0,
+      (("10:turn", 10.0), ("5:turn", 10.0)),
+    )
+    proposed = with_metric_strata(
+      evaluation("candidate", candidates[0].policy, route_ids, 8.0, 0.4, 1.0),
+      name,
+      8.0,
+      (("10:turn", 8.0), ("5:turn", 8.0)),
+    )
+    low_reference = replace(
+      stock.metric(name.value).stratum_metrics[0],
+      value=None,
+      disposition=MetricDisposition.COVERAGE_EXCLUDED,
+      exclusions=("low_reference_coverage",),
+      route_count=0,
+      window_count=0,
+      weighted_support=0.0,
+      coverage_excluded_window_ids=("train-a/low-reference",),
+      not_applicable_window_ids=(),
+      route_values=(),
+    )
+    stock = replace(
+      stock,
+      metrics=tuple(
+        replace(
+          metric,
+          stratum_metrics=(low_reference, metric.stratum_metrics[1]),
+        )
+        if metric.name == name.value
+        else metric
+        for metric in stock.metrics
+      ),
+    )
+
+    verdict = evaluate_candidate(
+      candidates[0], proposed, stock, accepted, rules(), name.value, *UNCERTAINTY_ARGS,
+    )
+    smooth = next(value for value in verdict.contracts if value.contract is BehaviorContract.SMOOTH)
+    self.assertFalse(verdict.passed)
+    self.assertIn("10:turn:stock_route_coverage_below_minimum", smooth.metrics[0].reasons)
+    self.assertIn(
+      "10:turn:stock_metric_undefined:low_reference_coverage",
+      smooth.metrics[0].reasons,
+    )
+
+  def test_stratum_serialization_is_deterministic_and_tamper_closed(self):
+    candidate = grid()[0]
+    source = evaluation(
+      "candidate",
+      candidate.policy,
+      ("train-a", "train-b"),
+      8.0,
+      0.4,
+      0.95,
+    )
+    encoded = source.to_json()
+    decoded = PolicyEvaluation.from_dict(json.loads(encoded))
+    self.assertEqual(decoded.to_json(), encoded)
+    self.assertEqual(decoded.sha256, source.sha256)
+    base = source.metrics[0].stratum_metrics[0]
+    undefined = tuple(
+      replace(
+        base,
+        value=None,
+        disposition=disposition,
+        exclusions=(reason,),
+        route_count=0,
+        window_count=2 if disposition is not MetricDisposition.NOT_APPLICABLE else 0,
+        weighted_support=0.0,
+        physical_failure_window_ids=("train-a/request-off",)
+        if disposition is MetricDisposition.PHYSICAL_UNSCOREABLE
+        else (),
+        coverage_excluded_window_ids=("train-a/coverage-excluded",)
+        if disposition is MetricDisposition.COVERAGE_EXCLUDED
+        else (),
+        not_applicable_window_ids=("train-a/not-applicable",)
+        if disposition is MetricDisposition.NOT_APPLICABLE
+        else (),
+        route_values=(),
+      )
+      for disposition, reason in (
+        (MetricDisposition.NOT_APPLICABLE, "not_applicable_in_route_stratum"),
+        (MetricDisposition.COVERAGE_EXCLUDED, "low_reference_coverage"),
+        (MetricDisposition.PHYSICAL_UNSCOREABLE, "request_suppressed_maximum_authority"),
+      )
+    )
+    for metric in (base, *undefined):
+      self.assertEqual(PolicyStratumMetric.from_dict(metric.to_dict()), metric)
+    self.assertEqual(
+      {metric.to_dict()["disposition"] for metric in (base, *undefined)},
+      {disposition.value for disposition in MetricDisposition},
+    )
+
+    tampered = json.loads(encoded)
+    tampered["metrics"][0]["stratumMetrics"][0]["routeCount"] += 1
+    with self.assertRaisesRegex(ValueError, "inconsistent evidence"):
+      PolicyEvaluation.from_dict(tampered)
+
+    wrong_disposition = json.loads(encoded)
+    wrong_disposition["metrics"][0]["stratumMetrics"][0]["disposition"] = (
+      MetricDisposition.COVERAGE_EXCLUDED.value
+    )
+    with self.assertRaisesRegex(ValueError, "disposition disagrees with window evidence"):
+      PolicyEvaluation.from_dict(wrong_disposition)
+
+    for source_disposition, target_disposition in (
+      (MetricDisposition.NOT_APPLICABLE, MetricDisposition.COVERAGE_EXCLUDED),
+      (MetricDisposition.COVERAGE_EXCLUDED, MetricDisposition.NOT_APPLICABLE),
+    ):
+      forged = next(
+        metric.to_dict()
+        for metric in undefined
+        if metric.disposition is source_disposition
+      )
+      forged["disposition"] = target_disposition.value
+      with self.assertRaisesRegex(ValueError, "disposition disagrees with window evidence"):
+        PolicyStratumMetric.from_dict(forged)
+
+    missing = json.loads(encoded)
+    del missing["metrics"][0]["stratumMetrics"][0]["disposition"]
+    with self.assertRaisesRegex(ValueError, "keys do not match schema"):
+      PolicyEvaluation.from_dict(missing)
 
   def test_training_search_is_deterministic_and_uses_canonical_tie_break(self):
     candidates = grid()
@@ -384,7 +762,7 @@ class TestBehaviorPolicy(unittest.TestCase):
     self.assertEqual(diagnostic.uncertainty, 1.0)
     self.assertEqual(diagnostic.lower, 0.0)
     self.assertFalse(verdict.target_materially_improved)
-    self.assertFalse(verdict.passed)
+    self.assertTrue(verdict.passed)
 
     dust = math.nextafter(10.0, math.inf)
     dust_candidate = replace(
@@ -412,7 +790,7 @@ class TestBehaviorPolicy(unittest.TestCase):
     self.assertEqual(dust_verdict.target_improvement, 0.0)
     self.assertFalse(dust_verdict.target_materially_improved)
 
-  def test_target_must_materially_beat_stock_after_an_incumbent_exists(self):
+  def test_balanced_target_loss_is_diagnostic_when_strata_pass(self):
     candidates = grid()
     candidate = candidates[0]
     route_ids = ("train-a", "train-b")
@@ -446,7 +824,7 @@ class TestBehaviorPolicy(unittest.TestCase):
 
     self.assertEqual(verdict.target_improvement, 0.0)
     self.assertFalse(verdict.target_materially_improved)
-    self.assertFalse(verdict.passed)
+    self.assertTrue(verdict.passed)
 
   def test_held_out_validator_rejects_only_frozen_winner_and_routes_do_not_leak(self):
     candidates = grid()

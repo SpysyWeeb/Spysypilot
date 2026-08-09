@@ -23,10 +23,12 @@ from openpilot.selfdrive.controls.blatv2_shadowd import (
   populate_shadow_message,
 )
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
+from openpilot.selfdrive.controls.lib.blatv2.horizon import HorizonPolicy
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
   build_runtime_vehicle_bundle,
 )
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
 def build_runner() -> tuple[ModularShadowRunner, car.CarParams]:
@@ -38,6 +40,9 @@ def build_runner() -> tuple[ModularShadowRunner, car.CarParams]:
   )
   policy = ControllerPolicy.from_json_file(
     blatv2_shadowd.PROVISIONAL_POLICY_PATH,
+  )
+  horizon_policy = HorizonPolicy.from_json_file(
+    blatv2_shadowd.PROVISIONAL_HORIZON_POLICY_PATH,
   )
   bundle = build_runtime_vehicle_bundle(
     car_params=cp,
@@ -53,6 +58,7 @@ def build_runner() -> tuple[ModularShadowRunner, car.CarParams]:
       controller_params=controller_params,
       runtime_bundle=bundle,
       policy=policy,
+      horizon_policy=horizon_policy,
     ),
     cp,
   )
@@ -65,7 +71,7 @@ def build_model(
   desired_curvature_time_s: float = 0.347,
 ) -> object:
   model = log.ModelDataV2.new_message()
-  native_times = [index * 0.05 for index in range(33)]
+  native_times = list(ModelConstants.T_IDXS)
   planned_speed = 10.0
   scalar_curvature = 0.012
   model.frameId = frame_id
@@ -94,6 +100,10 @@ def build_vehicle_messages(cp: car.CarParams) -> tuple[object, ...]:
 
   car_output = car.CarOutput.new_message()
   car_output.actuatorsOutput.torque = 0.0
+  car_output.actuatorsOutput.torqueOutputCan = 0.0
+  car_output.actuatorsOutput.steeringRequestActive = True
+  car_output.actuatorsOutput.steeringRequestActiveValid = True
+  car_output.actuatorsOutput.steeringRequestFaultAvoidanceCounter = 0
 
   selfdrive_state = log.SelfdriveState.new_message()
   selfdrive_state.active = True
@@ -249,6 +259,7 @@ def test_real_core_frame_populates_and_serializes_every_modular_field() -> None:
     assert output.modularModelFrameId == result.model_frame_id
     assert output.modularRuntimeVehicleIdentityHash == (runner.runtime_vehicle_identity_hash)
     assert output.modularPolicyHash == runner.policy_hash
+    assert output.modularHorizonPolicyHash == runner.horizon_policy_hash
     assert output.modularProfileHash == runner.profile_hash
     assert output.modularDesiredCurvature == result.desired_curvature
     assert output.modularRawTorque == result.raw_torque
@@ -279,17 +290,17 @@ def test_real_core_frame_populates_and_serializes_every_modular_field() -> None:
         assert math.isfinite(getattr(output, name)), name
 
 
-def test_feasibility_is_one_step_from_measured_applied_torque_only() -> None:
+def test_feasibility_is_one_step_from_previous_command_only() -> None:
   runner, cp = build_runner()
   _, result = run_valid_core_frame(runner, cp)
   expected = blatv2_shadowd.apply_torque_envelope(
     runner.runtime_bundle.torque_limits,
-    result.raw_torque,
+    result.planned_torque,
     runner.measured_previous_applied_torque,
     runner.measured_driver_torque,
   )
   assert runner.feasible_torque == expected.applied_torque
-  assert runner.unmet_torque == (result.raw_torque - expected.applied_torque)
+  assert runner.unmet_torque == (result.planned_torque - expected.applied_torque)
   assert runner.core_result.raw_torque == result.raw_torque
 
 
@@ -314,6 +325,54 @@ def test_repeated_shadow_trace_is_byte_exact_when_timing_is_excluded() -> None:
     )
     messages.append(event.to_bytes())
   assert messages[0] == messages[1]
+
+
+def test_shadow_signs_unsigned_rack_rate_from_angle_motion() -> None:
+  runner, cp = build_runner()
+  messages = build_vehicle_messages(cp)
+  messages[0].steeringRateDeg = 8.0
+  origin_ns = 10_000_000_000
+  result = None
+  for frame, angle in enumerate((0.0, -0.1, -0.2)):
+    messages[0].steeringAngleDeg = angle
+    control_ns = origin_ns + 200_000_000 + frame * 10_000_000
+    result = runner.update(
+      state_sample_mono_ns=control_ns - 5_000_000,
+      control_witness_mono_ns=control_ns,
+      model_publication_mono_ns=control_ns - 10_000_000,
+      model_message=build_model(frame_id=100 + frame, origin_ns=origin_ns),
+      car_state=messages[0],
+      car_control=messages[1],
+      car_output=messages[2],
+      selfdrive_state=messages[3],
+      live_parameters=messages[4],
+      model_message_valid=True,
+      model_message_alive=True,
+      vehicle_inputs_valid=True,
+      live_parameters_inputs_valid=True,
+    )
+
+  assert result is not None and result.valid
+  assert result.measured_rate_deg_s == -8.0
+  assert runner.measured_acceleration_deg_s2 == 0.0
+
+  messages[4].steerRatio = -1.0
+  runner.update(
+    state_sample_mono_ns=origin_ns + 225_000_000,
+    control_witness_mono_ns=origin_ns + 230_000_000,
+    model_publication_mono_ns=origin_ns + 220_000_000,
+    model_message=build_model(frame_id=103, origin_ns=origin_ns),
+    car_state=messages[0],
+    car_control=messages[1],
+    car_output=messages[2],
+    selfdrive_state=messages[3],
+    live_parameters=messages[4],
+    model_message_valid=True,
+    model_message_alive=True,
+    vehicle_inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  assert not runner.lateral_valid
 
 
 def test_invalid_model_clears_plan_and_publishes_invalid_without_crashing() -> None:

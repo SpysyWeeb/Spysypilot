@@ -26,7 +26,12 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationProfileLearner,
   CalibrationQualificationReason,
   CalibrationSampleDisposition,
+  MIN_STRATUM_TRAINING_ROWS,
+  MIN_TERMINAL_SEED_AUTHORITY_ROUTES,
+  TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY,
+  TERMINAL_SEED_AUTHORITY_POLICY_ID,
   _JointRegression,
+  terminal_seed_authority_allowed,
   _PairedLossVerdict,
   _CrossFitFamily,
   _Regression,
@@ -928,6 +933,204 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertIn(
       CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES,
       report.unresolved_diagnostics,
+    )
+
+  def test_terminal_regressed_fit_retains_exact_seed_with_owner_minimum(self) -> None:
+    self.assertEqual(
+      terminal_seed_authority_allowed(
+        vehicle_identity=TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY,
+        speed_mps=30.0,
+        terminal=True,
+        seed_retained=True,
+      ),
+      True,
+    )
+    for vehicle_identity, speed_mps, terminal, seed_retained in (
+      ("other-vehicle", 30.0, True, True),
+      (TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY, 20.0, True, True),
+      (TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY, 30.0, False, True),
+      (TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY, 30.0, True, False),
+    ):
+      self.assertFalse(
+        terminal_seed_authority_allowed(
+          vehicle_identity=vehicle_identity,
+          speed_mps=speed_mps,
+          terminal=terminal,
+          seed_retained=seed_retained,
+        )
+      )
+    seed = seed_profile(TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY)
+    learner = CalibrationProfileLearner(seed)
+    add_complete_evidence(
+      learner,
+      {
+        speed: seed.nodes[index].parameters
+        for index, speed in enumerate(DEFAULT_SPEED_NODES_MPS)
+      },
+    )
+    predictors = (-0.8, 1.0, 1.0, 0.0)
+
+    def add_authority_route(
+      route_counter: int,
+      node_indices: tuple[int, ...],
+      *,
+      terminal_interval: bool,
+    ) -> None:
+      learner.begin_route(route_sha(route_counter), route_counter=route_counter)
+      for node_index in node_indices:
+        coefficients = _seed_coefficients(seed.nodes[node_index].parameters)
+        target = math.fsum(
+          coefficient * predictor
+          for coefficient, predictor in zip(
+            coefficients,
+            predictors,
+            strict=True,
+          )
+        )
+        for _ in range(MIN_STRATUM_TRAINING_ROWS):
+          learner._add_regression(
+            node_index,
+            "authority_training",
+            predictors,
+            target,
+            DT,
+          )
+      learner.end_route()
+      if terminal_interval:
+        lower = _seed_coefficients(seed.nodes[-2].parameters)
+        upper = _seed_coefficients(seed.nodes[-1].parameters)
+        target = math.fsum(
+          0.5 * (lower_value + upper_value) * predictor
+          for lower_value, upper_value, predictor in zip(
+            lower,
+            upper,
+            predictors,
+            strict=True,
+          )
+        )
+        for _ in range(MIN_STRATUM_TRAINING_ROWS):
+          learner._routes[-1].intervals[-1].authority.add(
+            predictors,
+            target,
+            DT,
+            0.5,
+          )
+
+    add_authority_route(
+      1000,
+      (len(seed.nodes) - 2, len(seed.nodes) - 1),
+      terminal_interval=True,
+    )
+    add_authority_route(
+      1001,
+      (len(seed.nodes) - 2,),
+      terminal_interval=False,
+    )
+
+    def reject_terminal_alternate_fit(routes, node_index, model, coefficients, fields):
+      family = _cross_fit_family(routes, node_index, model, coefficients, fields)
+      if (
+        node_index == len(seed.nodes) - 1
+        and family.diagnostic.status
+        is CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+      ):
+        return replace(
+          family,
+          diagnostic=replace(
+            family.diagnostic,
+            status=CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+            regressed_fold_count=1,
+          ),
+        )
+      return family
+
+    route_count = len(learner._routes)
+    change_terminal_fit = False
+
+    def terminal_full_fit(routes, node_index, model, coefficients, **kwargs):
+      fitted, diagnostic = _fit_model_family(
+        routes,
+        node_index,
+        model,
+        coefficients,
+        **kwargs,
+      )
+      if (
+        len(routes) == route_count
+        and node_index == len(seed.nodes) - 1
+        and model is CalibrationModelId.STATIC_ONLY
+        and fitted is not None
+      ):
+        fitted = _seed_coefficients(seed.nodes[-1].parameters)
+        if change_terminal_fit:
+          fitted = (math.nextafter(fitted[0], math.inf), *fitted[1:])
+      return fitted, diagnostic
+
+    with (
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._cross_fit_family",
+        side_effect=reject_terminal_alternate_fit,
+      ),
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._fit_model_family",
+        side_effect=terminal_full_fit,
+      ),
+    ):
+      result = learner.qualify("owner-authorized terminal authority")
+    self.assertTrue(
+      result.all_nodes_qualified,
+      tuple(report.reasons for report in result.node_reports),
+    )
+    self.assertIsNone(result.candidate_profile)
+    self.assertIsNotNone(result.selected_profile)
+    terminal = result.node_reports[-1]
+    self.assertTrue(terminal.seed_retained)
+    self.assertIsNone(terminal.selected_model)
+    selected_proof = next(
+      diagnostic for diagnostic in terminal.cross_fit_diagnostics
+      if diagnostic.model is terminal.full_fit_diagnostic.model
+    )
+    self.assertEqual(
+      selected_proof.status,
+      CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+    )
+    self.assertEqual(selected_proof.regressed_fold_count, 1)
+    self.assertEqual(
+      terminal.independent_route_counts.authority,
+      MIN_TERMINAL_SEED_AUTHORITY_ROUTES,
+    )
+    authority = next(
+      diagnostic
+      for diagnostic in result.interpolation_reports[-1].stratum_diagnostics
+      if diagnostic.stratum is CalibrationIntervalStratum.AUTHORITY
+    )
+    self.assertEqual(authority.contributing_route_count, 1)
+    self.assertEqual(authority.successful_fold_count, 1)
+    self.assertEqual(
+      authority.cross_fit_status,
+      CalibrationCrossFitStatus.SCORED,
+    )
+    self.assertIn(
+      f"terminal_authority_policy={TERMINAL_SEED_AUTHORITY_POLICY_ID}",
+      result.selected_profile.provenance,
+    )
+
+    change_terminal_fit = True
+    with (
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._cross_fit_family",
+        side_effect=reject_terminal_alternate_fit,
+      ),
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._fit_model_family",
+        side_effect=terminal_full_fit,
+      ),
+    ):
+      rejected = learner.qualify("non-seed terminal fit")
+    self.assertFalse(rejected.node_reports[-1].qualified)
+    self.assertIn(
+      CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES,
+      rejected.node_reports[-1].reasons,
     )
 
   def test_route_input_order_does_not_change_evidence_bytes(self) -> None:

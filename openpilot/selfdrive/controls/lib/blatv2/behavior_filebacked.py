@@ -41,16 +41,18 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
 )
 
 
-_MAGIC = b"BLATBS01"
-_VERSION = 1
+_MAGIC = b"BLATBS02"
+_VERSION = 2
 _HEADER = struct.Struct("<8sIIQ")
-_RECORD = struct.Struct("<Q15dB7x")
+_RECORD = struct.Struct("<Q17dB7x")
 _FLAG_ACTUATOR_CONSTRAINED = 1 << 0
 _FLAG_LATERAL_ACTIVE = 1 << 1
 _FLAG_INPUTS_VALID = 1 << 2
 _FLAG_STEERING_PRESSED = 1 << 3
 _FLAG_CONTROLLER_FAULT = 1 << 4
 _FLAG_DRIVER_INTERVENTION_ONSET = 1 << 5
+_FLAG_STEERING_REQUEST_ACTIVE = 1 << 6
+_FLAG_MAXIMUM_AUTHORITY_REQUIRED = 1 << 7
 _KNOWN_FLAGS = (
   _FLAG_ACTUATOR_CONSTRAINED
   | _FLAG_LATERAL_ACTIVE
@@ -58,6 +60,8 @@ _KNOWN_FLAGS = (
   | _FLAG_STEERING_PRESSED
   | _FLAG_CONTROLLER_FAULT
   | _FLAG_DRIVER_INTERVENTION_ONSET
+  | _FLAG_STEERING_REQUEST_ACTIVE
+  | _FLAG_MAXIMUM_AUTHORITY_REQUIRED
 )
 _READ_CHUNK_RECORDS = 512
 
@@ -74,6 +78,8 @@ def _encode_sample(sample: BehaviorSample) -> bytes:
     | (_FLAG_STEERING_PRESSED if sample.steering_pressed else 0)
     | (_FLAG_CONTROLLER_FAULT if sample.controller_fault else 0)
     | (_FLAG_DRIVER_INTERVENTION_ONSET if sample.driver_intervention_onset else 0)
+    | (_FLAG_STEERING_REQUEST_ACTIVE if sample.steering_request_active else 0)
+    | (_FLAG_MAXIMUM_AUTHORITY_REQUIRED if sample.maximum_authority_required else 0)
   )
   return _RECORD.pack(
     sample.mono_time_ns,
@@ -90,6 +96,8 @@ def _encode_sample(sample: BehaviorSample) -> bytes:
     sample.measured_rack_rate_deg_s,
     sample.measured_rack_accel_deg_s2,
     sample.raw_requested_torque,
+    sample.planned_requested_torque,
+    sample.reachable_envelope_torque,
     sample.envelope_applied_torque,
     sample.torque_headroom,
     flags,
@@ -116,9 +124,13 @@ def _decode_sample(encoded: bytes | memoryview) -> BehaviorSample:
     measured_rack_rate_deg_s=values[11],
     measured_rack_accel_deg_s2=values[12],
     raw_requested_torque=values[13],
-    envelope_applied_torque=values[14],
-    torque_headroom=values[15],
+    planned_requested_torque=values[14],
+    reachable_envelope_torque=values[15],
+    envelope_applied_torque=values[16],
+    torque_headroom=values[17],
     actuator_constrained=bool(flags & _FLAG_ACTUATOR_CONSTRAINED),
+    steering_request_active=bool(flags & _FLAG_STEERING_REQUEST_ACTIVE),
+    maximum_authority_required=bool(flags & _FLAG_MAXIMUM_AUTHORITY_REQUIRED),
     lateral_active=bool(flags & _FLAG_LATERAL_ACTIVE),
     inputs_valid=bool(flags & _FLAG_INPUTS_VALID),
     steering_pressed=bool(flags & _FLAG_STEERING_PRESSED),

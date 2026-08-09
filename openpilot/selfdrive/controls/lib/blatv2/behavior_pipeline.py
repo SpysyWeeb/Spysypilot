@@ -519,7 +519,7 @@ class OffroadBehaviorLearningPipeline:
           runtime.runtime_bundle.calibration_identity_sha256
         ),
       )
-      store = RouteEvidenceStore(paths.root / "route_evidence_v2")
+      store = RouteEvidenceStore(paths.root / "route_evidence_v4")
       cohort = select_homogeneous_behavior_cohort(ledger=ledger, store=store)
     except Exception as exc:
       raise BehaviorPipelineError("behavior route ledger could not be authenticated") from exc

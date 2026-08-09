@@ -8,6 +8,7 @@ import tracemalloc
 from unittest.mock import patch
 import warnings
 
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
   BehaviorControlResponse,
   BehaviorWindow,
@@ -15,18 +16,22 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   BehaviorMetricConfig,
+  aggregate_behavior_metrics,
   score_window,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import ReplayRole
 from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
   BehaviorReplayError,
   BehaviorReplayStepper,
+  ReplayFrameInput,
   make_behavior_scenario_route_evidence_decoder,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_route_evaluator import (
   BehaviorRouteEvaluationError,
   _evaluate_behavior_route_policies_with_registry_for_test,
   _evaluate_prepared_behavior_route_with_registry_for_test as evaluate_prepared_behavior_route,
+  _runtime,
+  _stream_frames,
   evaluate_behavior_route_policies as evaluate_behavior_route_policies_production,
   prepare_behavior_route_scenario,
 )
@@ -127,7 +132,7 @@ def _artifact(
     )
     for index in range(count)
   )
-  times = tuple(sample * 0.05 for sample in range(20))
+  times = tuple(ModelConstants.T_IDXS)
   models = tuple(
     ModelPublication(
       segment_index=0,
@@ -166,6 +171,7 @@ def _artifact(
       desired_curvature=_curve(index, count),
       envelope_headroom=1.0,
       torque_output_can_count=0,
+      steering_request_fault_avoidance_counter=0,
       message_valid=True,
       model_message_alive=True,
       model_link_valid=True,
@@ -184,6 +190,9 @@ def _artifact(
       live_delay_available=index > 0,
       live_torque_parameters_checks_passed=False,
       live_torque_parameters_health_exact=True,
+      steering_request_active=True,
+      steering_request_active_valid=True,
+      steering_request_fault_avoidance_counter_valid=True,
     )
     for index in range(count)
   )
@@ -201,9 +210,9 @@ def _artifact(
     behavior_ineligible_reason="unverified_controller_source",
     vehicle_identity=FINGERPRINT,
     runtime_identity="5" * 64,
-    schema_versions={"extractor": 3, "route_evidence": 2},
+    schema_versions={"extractor": 3, "route_evidence": 4},
     preparation_provenance={"canonical": True},
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=count,
     preparation_cache_key="6" * 64,
     controls_witness_count=count,
@@ -261,11 +270,16 @@ def _replace_artifact(
   models: tuple[ModelPublication, ...] | None = None,
   live_torque: tuple[LiveTorqueParametersPublication, ...] | None = None,
   live_delay: tuple[LiveDelayPublication, ...] | None = None,
+  physical_frames: tuple[MeasuredLearningFrame, ...] | None = None,
 ) -> RouteEvidenceArtifact:
   return RouteEvidenceArtifact(
     artifact.source_identity if source is None else source,
     bytes(artifact.car_params_bytes),
-    bytes(artifact.physical_bytes),
+    (
+      bytes(artifact.physical_bytes)
+      if physical_frames is None
+      else b"".join(_encode_frame(frame) for frame in physical_frames)
+    ),
     artifact.model_publications if models is None else models,
     artifact.control_witnesses if witnesses is None else witnesses,
     artifact.live_torque_parameters if live_torque is None else live_torque,
@@ -348,9 +362,13 @@ def _eager_metrics(
         measured_rack_rate_deg_s=output.measured_rack_rate_deg_s,
         measured_rack_accel_deg_s2=output.measured_rack_accel_deg_s2,
         raw_requested_torque=output.raw_requested_torque,
+        planned_requested_torque=output.planned_requested_torque,
+        reachable_envelope_torque=output.reachable_envelope_torque,
         envelope_applied_torque=output.envelope_applied_torque,
         torque_headroom=output.torque_headroom,
         actuator_constrained=output.actuator_constrained,
+        steering_request_active=output.steering_request_active,
+        maximum_authority_required=output.maximum_authority_required,
         lateral_active=control.lateral_active,
         inputs_valid=neutral.inputs_valid and output.response_eligible,
         steering_pressed=control.steering_pressed,
@@ -407,7 +425,105 @@ def test_streamed_stock_and_modular_match_eager_windows_exactly(tmp_path: Path) 
       interface_registry=INTERFACES,
     )
     assert preparation.file_backed_segmentation_sha256 == expected_segmentation_sha
-    assert result.windows == expected_metrics
+    assert result.windows == aggregate_behavior_metrics(
+      expected_metrics,
+      _metric_config(),
+    ).windows
+
+
+def test_streamed_and_eager_inputs_share_signed_rack_motion(tmp_path: Path) -> None:
+  base = _artifact(count=8)
+  frames = tuple(
+    replace(
+      frame,
+      steering_angle_deg=-0.1 * index,
+      steering_rate_deg_s=8.0,
+    )
+    for index, frame in enumerate(base.iter_physical_frames())
+  )
+  artifact = _replace_artifact(base, physical_frames=frames)
+  path = _write(tmp_path, artifact)
+  eager = make_behavior_scenario_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )(artifact, physical_profile())
+
+  with RouteEvidenceStreamReader(path) as reader:
+    runtime = _runtime(
+      reader,
+      physical_profile(),
+      provisional(),
+      INTERFACES,
+    )
+    streamed = tuple(_stream_frames(runtime, physical_profile()))
+
+  assert tuple(frame.control.core_input for frame in streamed) == tuple(
+    control.core_input for control in eager.control_inputs
+  )
+  signed = ReplayFrameInput.from_bytes(streamed[1].control.core_input)
+  assert signed.recorded_rack_rate_deg_s == -8.0
+  assert signed.control_cadence_valid
+
+
+def test_eager_and_streamed_motion_do_not_bridge_inactive_resets(
+  tmp_path: Path,
+) -> None:
+  for reset_kind in ("steering_pressed", "driver_torque", "gap"):
+    base = _artifact(count=8)
+    frames = tuple(
+      replace(
+        frame,
+        steering_angle_deg=-0.1 * index,
+        steering_rate_deg_s=8.0,
+        lateral_active=index > 1,
+        steering_pressed=reset_kind == "steering_pressed" and index == 1,
+        steering_torque=51.0 if reset_kind == "driver_torque" and index == 1 else 0.0,
+      )
+      for index, frame in enumerate(base.iter_physical_frames())
+    )
+    witnesses = tuple(
+      replace(
+        witness,
+        lateral_active=index > 1,
+        gap_from_previous=reset_kind == "gap" and index == 1,
+      )
+      for index, witness in enumerate(base.control_witnesses)
+    )
+    source = replace(
+      base.source_identity,
+      gap_count=1 if reset_kind == "gap" else 0,
+    )
+    artifact = _replace_artifact(
+      base,
+      source=source,
+      witnesses=witnesses,
+      physical_frames=frames,
+    )
+    decoder = make_behavior_scenario_route_evidence_decoder(
+      provisional_dynamics=provisional(),
+      interface_registry=INTERFACES,
+    )
+    try:
+      decoder(artifact, physical_profile())
+    except BehaviorReplayError as error:
+      assert "signed rack motion" in str(error)
+    else:
+      raise AssertionError(f"eager decoder bridged inactive {reset_kind}")
+
+    path = _write(tmp_path, artifact, f"{reset_kind}.route-evidence")
+    with RouteEvidenceStreamReader(path) as reader:
+      runtime = _runtime(
+        reader,
+        physical_profile(),
+        provisional(),
+        INTERFACES,
+      )
+      try:
+        tuple(_stream_frames(runtime, physical_profile()))
+      except BehaviorRouteEvaluationError as error:
+        assert "signed rack motion" in str(error)
+      else:
+        raise AssertionError(f"stream decoder bridged inactive {reset_kind}")
 
 
 def test_route_major_population_scans_physical_evidence_once(tmp_path: Path) -> None:

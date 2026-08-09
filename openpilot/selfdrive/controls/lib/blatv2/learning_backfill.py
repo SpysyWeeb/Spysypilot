@@ -9,10 +9,10 @@ atomic CURRENT-pointer replacement.
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import fcntl
 import hashlib
@@ -79,6 +79,7 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   LiveDelayPublication,
   LiveTorqueParametersPublication,
   ModelPublication,
+  ROUTE_EVIDENCE_VERSION,
   RouteEvidenceArtifact,
   RouteEvidenceError,
   RouteEvidenceFileSummary,
@@ -96,8 +97,8 @@ BACKFILL_LEDGER_SCHEMA_VERSION = 3
 BACKFILL_PROVENANCE_SCHEMA_VERSION = 1
 BACKFILL_COMMIT_SCHEMA_VERSION = 2
 BACKFILL_POINTER_SCHEMA_VERSION = 1
-NATIVE_EXTRACTOR_SCHEMA_VERSION = 4
-CANONICAL_JOIN_SCHEMA_VERSION = 3
+NATIVE_EXTRACTOR_SCHEMA_VERSION = 5
+CANONICAL_JOIN_SCHEMA_VERSION = 5
 MAXIMUM_EVENT_BYTES = 64 * 1024 * 1024
 MAXIMUM_EVENT_TRAVERSAL_WORDS = MAXIMUM_EVENT_BYTES // 8
 MAXIMUM_SELECTED_RECORDS_PER_SEGMENT = 100_000
@@ -108,6 +109,8 @@ MAXIMUM_UNRESOLVED_FRACTION = 0.01
 EXTRACTOR_IO_TIMEOUT_S = 60.0
 EXTRACTOR_EXIT_TIMEOUT_S = 5.0
 MAXIMUM_CONTROL_GAP_NS = 15_000_000
+HYUNDAI_LKAS11_ADDRESS = 0x340
+HYUNDAI_LKAS11_BUS = 0
 # Two workers are the independent A/A replay authorities. Four adds one
 # private, one-route-ahead preparation lane to each authority; application
 # remains serial within each pass and prepared data is never shared across it.
@@ -131,8 +134,8 @@ _PREPARED_ROUTE_PARTIAL_FILE_RE = re.compile(
     r"[A-Za-z0-9_-]+\.partial\Z",
   )),
 )
-ROUTE_EVIDENCE_STAGING_DIRECTORY = ".route-evidence-staging-v2"
-ROUTE_EVIDENCE_STAGING_QUARANTINE = ".route-evidence-staging-quarantine-v2"
+ROUTE_EVIDENCE_STAGING_DIRECTORY = ".route-evidence-staging-v4"
+ROUTE_EVIDENCE_STAGING_QUARANTINE = ".route-evidence-staging-quarantine-v4"
 ROUTE_EVIDENCE_STAGING_MAX_FILES = 4096
 ROUTE_EVIDENCE_STAGING_MAX_BYTES = 4 * 1024 * 1024 * 1024
 _ROUTE_EVIDENCE_STAGED_FILE_RE = re.compile(
@@ -158,6 +161,7 @@ _RECORD_HEADER = struct.Struct("<IIQ")
 _END_RECORD = 0xffffffff
 _EVENT_WHICH = {
   "initData": 0,
+  "sendcan": 16,
   "controlsState": 6,
   "carState": 21,
   "carControl": 22,
@@ -192,6 +196,8 @@ _CANONICAL_WITNESS_SERVICES = (
   "controlsState",
   "selfdriveState",
 )
+_REQUEST_CONTEXT_SERVICES = ("sendcan",)
+
 _LEDGER_PROVENANCE_KEYS = {
   "canonical_join_schema_version",
   "car_params_sha256",
@@ -552,6 +558,29 @@ class _RecordedCarOutput:
   applied_torque: float
   torque_output_can_count: int
   torque_output_can_valid: bool
+  steering_request_active: bool
+  steering_request_active_valid: bool
+  steering_request_fault_avoidance_counter: int
+  steering_request_fault_avoidance_counter_valid: bool
+  applied_effective_mono_ns: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedOutgoingCanFrame:
+  address: int
+  dat: bytes
+  src: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedSendcan:
+  frames: tuple[_RecordedOutgoingCanFrame, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DecodedHyundaiLkas11:
+  torque_count: int
+  steering_request_active: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,6 +606,30 @@ class _RecordedControlsState:
   modular_source_openpilot_commit: str
   modular_opendbc_commit: str
   modular_selection_bound: bool
+  modular_active: bool = False
+  modular_profile_sha256: str = ""
+  modular_policy_sha256: str = ""
+  modular_runtime_identity_sha256: str = ""
+  modular_horizon_policy_sha256: str = ""
+  modular_compute_time_seconds: float = 0.0
+  modular_control_witness_mono_ns: int = 0
+  modular_intent_status: int = 0
+  modular_safety_state: int = 0
+  modular_invalid_frames: int = 0
+  modular_recovery_ok_frames: int = 0
+  modular_controls_valid: bool = False
+  modular_car_control_valid: bool = False
+  modular_vehicle_state_valid: bool = False
+  modular_live_parameters_valid: bool = False
+  modular_horizon_valid: bool = False
+  modular_control_cadence_valid: bool = False
+  modular_adapter_exception: bool = False
+  modular_production_envelope_verified: bool = False
+  modular_final_expected_counts: int = 0
+  modular_final_count_residual: int = 0
+  modular_final_count_match_valid: bool = False
+  modular_final_limiter_altered: bool = False
+  modular_telemetry_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -666,7 +719,6 @@ class _CanonicalControlJoin:
   car_state: _TimedRouteRecord
   live_parameters: _TimedRouteRecord
   car_output: _TimedRouteRecord
-  previous_car_output_mono_ns: int | None
   car_control: _TimedRouteRecord | None
   curvature_unresolved: bool
   gap_from_previous: bool
@@ -1567,11 +1619,205 @@ def _copy_car_output(message: Any) -> _RecordedCarOutput:
     and raw_can_count.is_integer()
     and -(1 << 31) <= raw_can_count <= (1 << 31) - 1
   )
+  request_active = False
+  request_active_valid = False
+  fault_avoidance_counter = 0
+  fault_avoidance_counter_valid = False
+  try:
+    raw_request_active = message.actuatorsOutput.steeringRequestActive
+    raw_request_valid = (
+      message.actuatorsOutput.steeringRequestActiveValid
+    )
+    if (
+      type(raw_request_valid) is bool
+      and raw_request_valid
+      and type(raw_request_active) is bool
+    ):
+      request_active = raw_request_active
+      request_active_valid = True
+  except (AttributeError, TypeError, ValueError):
+    pass
+  if request_active_valid:
+    try:
+      raw_fault_counter = (
+        message.actuatorsOutput.steeringRequestFaultAvoidanceCounter
+      )
+      if (
+        type(raw_fault_counter) is int
+        and not isinstance(raw_fault_counter, bool)
+        and 0 <= raw_fault_counter <= 255
+      ):
+        fault_avoidance_counter = raw_fault_counter
+        fault_avoidance_counter_valid = True
+    except (AttributeError, TypeError, ValueError):
+      pass
   return _RecordedCarOutput(
-    applied_torque=float(message.actuatorsOutput.torque),
+    # The physical command is populated only after exact sendcan binding.
+    applied_torque=0.0,
     torque_output_can_count=(int(raw_can_count) if can_count_valid else 0),
     torque_output_can_valid=can_count_valid,
+    steering_request_active=request_active,
+    steering_request_active_valid=request_active_valid,
+    steering_request_fault_avoidance_counter=(
+      fault_avoidance_counter
+    ),
+    steering_request_fault_avoidance_counter_valid=(
+      fault_avoidance_counter_valid
+    ),
   )
+
+
+def _copy_sendcan(message: Any) -> _RecordedSendcan:
+  frames = []
+  for frame in message:
+    try:
+      address = int(frame.address)
+      src = int(frame.src)
+      dat = bytes(frame.dat)
+    except (AttributeError, TypeError, ValueError):
+      continue
+    frames.append(_RecordedOutgoingCanFrame(
+      address=address,
+      dat=dat,
+      src=src,
+    ))
+  return _RecordedSendcan(frames=tuple(frames))
+
+
+def _decode_hyundai_lkas11(
+  frame: _RecordedOutgoingCanFrame,
+) -> _DecodedHyundaiLkas11 | None:
+  if (
+    frame.address != HYUNDAI_LKAS11_ADDRESS
+    or frame.src != HYUNDAI_LKAS11_BUS
+    or len(frame.dat) != 8
+  ):
+    return None
+  steering_word = int.from_bytes(frame.dat[2:4], "little")
+  return _DecodedHyundaiLkas11(
+    torque_count=(steering_word & 0x7ff) - 1024,
+    steering_request_active=bool(steering_word & (1 << 11)),
+  )
+
+
+def _palisade_lkas11_allowed(
+  descriptor: BuildDescriptor,
+) -> bool:
+  return (
+    descriptor.supported_vehicle_identity,
+    descriptor.steer_max,
+    descriptor.steer_delta_up,
+    descriptor.steer_delta_down,
+    descriptor.steer_step,
+    descriptor.driver_allowance,
+    descriptor.driver_multiplier,
+    descriptor.driver_factor,
+    descriptor.production_envelope_verified,
+    descriptor.rack_rate_resolution_deg_s,
+  ) == ("HYUNDAI_PALISADE", 409, 4, 7, 1, 50, 2, 1, True, 4.0)
+
+
+def _bind_prior_cycle_palisade_lkas11(
+  *,
+  descriptor: BuildDescriptor,
+  car_outputs: list[_TimedRouteRecord],
+  sendcan_records: list[_TimedRouteRecord],
+) -> None:
+  """Bind each CarOutput to its exact preceding-cycle LKAS11 send.
+
+  ``card.py`` publishes CarOutput_i before emitting sendcan_i. Therefore the
+  payload in CarOutput_i came from the unique LKAS11 send after
+  CarOutput_(i-1), not from the later sendcan_i.
+  """
+  if not _palisade_lkas11_allowed(descriptor):
+    return
+  sendcan_keys = tuple(
+    (record.mono_ns, record.source_order)
+    for record in sendcan_records
+  )
+  for index, current in enumerate(car_outputs):
+    output = current.payload
+    if not isinstance(output, _RecordedCarOutput):
+      continue
+    # Raw CarOutput values are not physical authority until sendcan proves
+    # exact count, request, source, and timing parity.
+    car_outputs[index] = replace(
+      current,
+      payload=replace(
+        output,
+        applied_torque=0.0,
+        applied_effective_mono_ns=0,
+      ),
+    )
+    if index == 0 or not current.valid:
+      continue
+    previous = car_outputs[index - 1]
+    if previous.segment_index != current.segment_index:
+      continue
+    previous_key = (previous.mono_ns, previous.source_order)
+    current_key = (current.mono_ns, current.source_order)
+    candidates: list[tuple[_TimedRouteRecord, _DecodedHyundaiLkas11]] = []
+    sendcan_left = bisect_right(sendcan_keys, previous_key)
+    sendcan_right = bisect_left(sendcan_keys, current_key)
+    for sendcan_index in range(sendcan_left, sendcan_right):
+      sendcan = sendcan_records[sendcan_index]
+      if (
+        sendcan.segment_index != current.segment_index
+        or not sendcan.valid
+        or not previous.mono_ns < sendcan.mono_ns < current.mono_ns
+        or not isinstance(sendcan.payload, _RecordedSendcan)
+      ):
+        continue
+      candidates.extend(
+        (sendcan, decoded)
+        for frame in sendcan.payload.frames
+        if (decoded := _decode_hyundai_lkas11(frame)) is not None
+      )
+    if (
+      len(candidates) != 1
+      or not output.torque_output_can_valid
+      or not -descriptor.steer_max <= output.torque_output_can_count <= descriptor.steer_max
+    ):
+      continue
+    sendcan, decoded = candidates[0]
+    if (
+      sendcan.mono_ns - previous.mono_ns > MAXIMUM_CONTROL_GAP_NS
+      or current.mono_ns - sendcan.mono_ns > MAXIMUM_CONTROL_GAP_NS
+      or decoded.torque_count != output.torque_output_can_count
+      or (
+        output.steering_request_active_valid
+        and output.steering_request_active
+        != decoded.steering_request_active
+      )
+    ):
+      continue
+    replacement = replace(
+      current,
+      payload=replace(
+        output,
+        applied_torque=decoded.torque_count / descriptor.steer_max,
+        torque_output_can_count=decoded.torque_count,
+        torque_output_can_valid=True,
+        steering_request_active=(
+          output.steering_request_active
+          if output.steering_request_active_valid
+          else decoded.steering_request_active
+        ),
+        steering_request_active_valid=True,
+        steering_request_fault_avoidance_counter=(
+          output.steering_request_fault_avoidance_counter
+          if output.steering_request_active_valid
+          else 0
+        ),
+        steering_request_fault_avoidance_counter_valid=(
+          output.steering_request_fault_avoidance_counter_valid
+          if output.steering_request_active_valid
+          else False
+        ),
+        applied_effective_mono_ns=sendcan.mono_ns,
+      ),
+    )
+    car_outputs[index] = replacement
 
 
 def _copy_live_parameters(message: Any) -> _RecordedLiveParameters:
@@ -1594,16 +1840,101 @@ def _copy_controls_state(message: Any) -> _RecordedControlsState:
   source_commit = ""
   opendbc_commit = ""
   selection_bound = False
+  modular_active = False
+  profile_sha256 = ""
+  policy_sha256 = ""
+  runtime_identity_sha256 = ""
+  horizon_policy_sha256 = ""
+  compute_time_seconds = 0.0
+  control_witness_mono_ns = 0
+  intent_status = 0
+  safety_state = 0
+  invalid_frames = 0
+  recovery_ok_frames = 0
+  controls_valid = False
+  car_control_valid = False
+  vehicle_state_valid = False
+  live_parameters_valid = False
+  horizon_valid = False
+  control_cadence_valid = False
+  adapter_exception = False
+  production_envelope_verified = False
+  final_expected_counts = 0
+  final_count_residual = 0
+  final_count_match_valid = False
+  final_limiter_altered = False
+  telemetry_available = False
   try:
     lateral = message.lateralControlState
     if lateral.which() == "torqueState":
       torque_state = lateral.torqueState
+      modular_active = bool(torque_state.active)
       architecture = str(torque_state.modularArchitecture)
       selection = int(torque_state.modularSelection)
       artifact = str(torque_state.modularArtifactHash)
       source_commit = str(torque_state.modularSourceOpenpilotCommit)
       opendbc_commit = str(torque_state.modularOpendbcCommit)
       selection_bound = bool(torque_state.modularSelectionBound)
+      profile = str(torque_state.modularProfileHash)
+      policy = str(torque_state.modularPolicyHash)
+      runtime = str(torque_state.modularRuntimeIdentityHash)
+      horizon = str(torque_state.modularHorizonPolicyHash)
+      controller_version = int(torque_state.modularControllerVersion)
+      timing_values = (
+        float(torque_state.modularComputeTimeSeconds),
+        int(torque_state.modularControlWitnessMonoTime),
+        int(torque_state.modularIntentStatus),
+        int(torque_state.modularSafetyState),
+        int(torque_state.modularInvalidFrames),
+        int(torque_state.modularRecoveryOkFrames),
+        bool(torque_state.modularControlsValid),
+        bool(torque_state.modularCarControlValid),
+        bool(torque_state.modularVehicleStateValid),
+        bool(torque_state.modularLiveParametersValid),
+        bool(torque_state.modularHorizonValid),
+        bool(torque_state.modularControlCadenceValid),
+        bool(torque_state.modularAdapterException),
+        bool(torque_state.modularProductionEnvelopeVerified),
+        int(torque_state.modularFinalExpectedCounts),
+        int(torque_state.modularFinalCountResidual),
+        bool(torque_state.modularFinalCountMatchValid),
+        bool(torque_state.modularFinalLimiterAltered),
+      )
+      if (
+        controller_version > 0
+        and selection in (0, 1)
+        and architecture
+        and _FULL_COMMIT_RE.fullmatch(source_commit) is not None
+        and _FULL_COMMIT_RE.fullmatch(opendbc_commit) is not None
+        and all(_SHA256_RE.fullmatch(value) is not None for value in (
+          profile, policy, runtime, horizon,
+        ))
+      ):
+        profile_sha256 = profile
+        policy_sha256 = policy
+        runtime_identity_sha256 = runtime
+        horizon_policy_sha256 = horizon
+        (
+          compute_time_seconds,
+          control_witness_mono_ns,
+          intent_status,
+          safety_state,
+          invalid_frames,
+          recovery_ok_frames,
+          controls_valid,
+          car_control_valid,
+          vehicle_state_valid,
+          live_parameters_valid,
+          horizon_valid,
+          control_cadence_valid,
+          adapter_exception,
+          production_envelope_verified,
+          final_expected_counts,
+          final_count_residual,
+          final_count_match_valid,
+          final_limiter_altered,
+        ) = timing_values
+        telemetry_available = True
   except Exception:
     # Historical schemas have no modular telemetry.  They remain valid for
     # physical calibration but cannot claim a verified behavior source.
@@ -1618,6 +1949,32 @@ def _copy_controls_state(message: Any) -> _RecordedControlsState:
     modular_source_openpilot_commit=source_commit,
     modular_opendbc_commit=opendbc_commit,
     modular_selection_bound=selection_bound,
+    modular_active=modular_active,
+    modular_profile_sha256=profile_sha256,
+    modular_policy_sha256=policy_sha256,
+    modular_runtime_identity_sha256=runtime_identity_sha256,
+    modular_horizon_policy_sha256=horizon_policy_sha256,
+    modular_compute_time_seconds=compute_time_seconds,
+    modular_control_witness_mono_ns=control_witness_mono_ns,
+    modular_intent_status=intent_status,
+    modular_safety_state=safety_state,
+    modular_invalid_frames=invalid_frames,
+    modular_recovery_ok_frames=recovery_ok_frames,
+    modular_controls_valid=controls_valid,
+    modular_car_control_valid=car_control_valid,
+    modular_vehicle_state_valid=vehicle_state_valid,
+    modular_live_parameters_valid=live_parameters_valid,
+    modular_horizon_valid=horizon_valid,
+    modular_control_cadence_valid=control_cadence_valid,
+    modular_adapter_exception=adapter_exception,
+    modular_production_envelope_verified=(
+      production_envelope_verified
+    ),
+    modular_final_expected_counts=final_expected_counts,
+    modular_final_count_residual=final_count_residual,
+    modular_final_count_match_valid=final_count_match_valid,
+    modular_final_limiter_altered=final_limiter_altered,
+    modular_telemetry_available=telemetry_available,
   )
 
 
@@ -1715,6 +2072,7 @@ def _copy_driving_event(message: Any) -> _RecordedDrivingEvent:
 
 def _copy_selected_payload(which: str, message: Any) -> Any:
   copiers: dict[str, Callable[[Any], Any]] = {
+    "sendcan": _copy_sendcan,
     "carState": _copy_car_state,
     "carControl": _copy_car_control,
     "carOutput": _copy_car_output,
@@ -1759,6 +2117,7 @@ def _decode_extracted_event(
           bool(init.dirty),
           str(init.dongleId),
           str(init.version),
+          str(getattr(init, "deviceType", "unknown")),
         )
       elif which == "carParams":
         payload = bytes(event.carParams.as_builder().to_bytes())
@@ -1766,6 +2125,7 @@ def _decode_extracted_event(
         which in _SOURCE_SERVICES
         or which in _BEHAVIOR_CONTEXT_SERVICES
         or which in _CANONICAL_WITNESS_SERVICES
+        or which in _REQUEST_CONTEXT_SERVICES
       ):
         payload = _copy_selected_payload(
           which,
@@ -2029,12 +2389,6 @@ def _build_canonical_control_joins(
         "measurement_race_unreconstructable",
         f"{route_name}: selfdriveState poll precedes the first carOutput",
       )
-    output_index = bisect_right(output_times, car_output.mono_ns) - 1
-    previous_output_ns = (
-      None
-      if output_index <= 0
-      else ordered_outputs[output_index - 1].mono_ns
-    )
 
     state_left = bisect_right(state_times, poll_ns)
     state_right = bisect_right(state_times, witness.mono_ns)
@@ -2108,7 +2462,6 @@ def _build_canonical_control_joins(
       car_state=selected_state,
       live_parameters=selected_parameters,
       car_output=car_output,
-      previous_car_output_mono_ns=previous_output_ns,
       car_control=paired_commands.get(witness.source_order),
       curvature_unresolved=unresolved,
       gap_from_previous=(
@@ -2143,16 +2496,17 @@ def _measured_frame_from_join(
       "measured_frame_invalid",
       "canonical join contains an invalid compact payload",
     )
-  applied_effective_ns = (
-    0
-    if join.previous_car_output_mono_ns is None
-    else join.previous_car_output_mono_ns
-  )
+  applied_effective_ns = car_output.applied_effective_mono_ns
   source_valid = (
     join.witness.valid
     and join.car_state.valid
     and join.live_parameters.valid
     and join.car_output.valid
+    and car_output.torque_output_can_valid
+    and -409 <= car_output.torque_output_can_count <= 409
+    and applied_effective_ns > 0
+    and car_output.steering_request_active_valid
+    and car_output.steering_request_active
     and join.car_control is not None
     and join.car_control.valid
   )
@@ -2188,10 +2542,7 @@ def _measured_frame_from_join(
       and not join.curvature_unresolved
       and 0 < join.car_state.mono_ns <= join.witness.mono_ns
       and 0 < join.car_output.mono_ns <= join.poll_mono_ns
-      and (
-        applied_effective_ns == 0
-        or 0 < applied_effective_ns < join.car_output.mono_ns
-      )
+      and 0 < applied_effective_ns < join.car_output.mono_ns
     ),
   )
 
@@ -2281,6 +2632,59 @@ def _behavior_controller_source(
     else "stock_canonical"
   )
   return True, "eligible", _sha256(payload), source_kind
+
+
+def _device_controller_identity(
+  joins: tuple[_CanonicalControlJoin, ...],
+) -> tuple[str, str, str, str, str, str, str, str]:
+  """Return one exact active modular identity or explicit unavailability."""
+  states = []
+  for join in joins:
+    command = None if join.car_control is None else join.car_control.payload
+    controls = join.witness.payload
+    if (
+      isinstance(command, _RecordedCarControl)
+      and command.lateral_active
+      and isinstance(controls, _RecordedControlsState)
+      and controls.modular_selection == 1
+    ):
+      states.append(controls)
+  if not states:
+    return ("", "", "", "", "", "", "", "")
+
+  def unique(field: str) -> str:
+    values = {str(getattr(state, field)) for state in states}
+    return values.pop() if len(values) == 1 else ""
+
+  architecture = unique("modular_architecture")
+  source_openpilot_commit = unique("modular_source_openpilot_commit")
+  opendbc_commit = unique("modular_opendbc_commit")
+  runtime = unique("modular_runtime_identity_sha256")
+  profile = unique("modular_profile_sha256")
+  policy = unique("modular_policy_sha256")
+  horizon = unique("modular_horizon_policy_sha256")
+  required = (
+    architecture, source_openpilot_commit, opendbc_commit,
+    runtime, profile, policy, horizon,
+  )
+  if (
+    not all(required)
+    or _FULL_COMMIT_RE.fullmatch(source_openpilot_commit) is None
+    or _FULL_COMMIT_RE.fullmatch(opendbc_commit) is None
+    or any(
+      _SHA256_RE.fullmatch(value) is None
+      for value in (runtime, profile, policy, horizon)
+    )
+  ):
+    architecture = source_openpilot_commit = opendbc_commit = ""
+    runtime = profile = policy = horizon = ""
+  live_artifact = unique("modular_artifact_sha256")
+  if live_artifact and _SHA256_RE.fullmatch(live_artifact) is None:
+    live_artifact = ""
+  return (
+    architecture, source_openpilot_commit, opendbc_commit, live_artifact,
+    runtime, profile, policy, horizon,
+  )
 
 
 def _latest_sparse_indices(
@@ -2375,6 +2779,7 @@ def _route_evidence_artifact(
   route_car_params_bytes: bytes,
   route_bundle: RuntimeVehicleBundle,
   route_descriptor: BuildDescriptor,
+  device_type: str,
   route_records: Mapping[str, list[_TimedRouteRecord]],
   joins: tuple[_CanonicalControlJoin, ...],
   frames: tuple[MeasuredLearningFrame, ...],
@@ -2494,6 +2899,16 @@ def _route_evidence_artifact(
       source_panda_commit=route_descriptor.panda_commit,
     )
   )
+  (
+    controller_architecture,
+    recorded_source_openpilot_commit,
+    recorded_opendbc_commit,
+    live_artifact_sha256,
+    recorded_runtime_identity_sha256,
+    recorded_profile_sha256,
+    recorded_controller_policy_sha256,
+    recorded_horizon_policy_sha256,
+  ) = _device_controller_identity(joins)
   model_failure_count = sum(index is None for index in model_indices)
   active_exact_count_failure = any(
     isinstance(join.car_control.payload, _RecordedCarControl)
@@ -2501,6 +2916,8 @@ def _route_evidence_artifact(
     and (
       not isinstance(join.car_output.payload, _RecordedCarOutput)
       or not join.car_output.payload.torque_output_can_valid
+      or not -409 <= join.car_output.payload.torque_output_can_count <= 409
+      or join.car_output.payload.applied_effective_mono_ns <= 0
     )
     for join in joins
     if join.car_control is not None
@@ -2605,13 +3022,23 @@ def _route_evidence_artifact(
       state_sample_mono_ns=join.car_state.mono_ns,
       live_parameters_mono_ns=join.live_parameters.mono_ns,
       car_output_report_mono_ns=join.car_output.mono_ns,
-      car_output_effective_mono_ns=(0 if join.previous_car_output_mono_ns is None else join.previous_car_output_mono_ns),
+      car_output_effective_mono_ns=output.applied_effective_mono_ns,
       car_control_mono_ns=(-1 if join.car_control is None else join.car_control.mono_ns),
       raw_request_torque=raw_request,
       measured_curvature=controls_state.measured_curvature,
       desired_curvature=controls_state.desired_curvature,
       envelope_headroom=max(0.0, min(1.0, 1.0 - abs(raw_request))),
       torque_output_can_count=output.torque_output_can_count,
+      steering_request_active=output.steering_request_active,
+      steering_request_active_valid=(
+        output.steering_request_active_valid
+      ),
+      steering_request_fault_avoidance_counter=(
+        output.steering_request_fault_avoidance_counter
+      ),
+      steering_request_fault_avoidance_counter_valid=(
+        output.steering_request_fault_avoidance_counter_valid
+      ),
       message_valid=join.witness.valid,
       model_message_alive=model_alive,
       model_link_valid=model_index is not None,
@@ -2630,6 +3057,54 @@ def _route_evidence_artifact(
       live_delay_available=delay_indices[index] is not None,
       live_torque_parameters_checks_passed=torque_health[index][0],
       live_torque_parameters_health_exact=torque_health[index][1],
+      modular_compute_time_seconds=(
+        controls_state.modular_compute_time_seconds
+      ),
+      modular_control_witness_mono_ns=(
+        controls_state.modular_control_witness_mono_ns
+      ),
+      modular_selection=controls_state.modular_selection,
+      modular_invalid_frames=controls_state.modular_invalid_frames,
+      modular_recovery_ok_frames=(
+        controls_state.modular_recovery_ok_frames
+      ),
+      modular_intent_status=controls_state.modular_intent_status,
+      modular_safety_state=controls_state.modular_safety_state,
+      modular_telemetry_available=(
+        controls_state.modular_telemetry_available
+      ),
+      modular_active=controls_state.modular_active,
+      modular_selection_bound=controls_state.modular_selection_bound,
+      modular_controls_valid=controls_state.modular_controls_valid,
+      modular_car_control_valid=controls_state.modular_car_control_valid,
+      modular_vehicle_state_valid=(
+        controls_state.modular_vehicle_state_valid
+      ),
+      modular_live_parameters_valid=(
+        controls_state.modular_live_parameters_valid
+      ),
+      modular_horizon_valid=controls_state.modular_horizon_valid,
+      modular_control_cadence_valid=(
+        controls_state.modular_control_cadence_valid
+      ),
+      modular_adapter_exception=(
+        controls_state.modular_adapter_exception
+      ),
+      modular_production_envelope_verified=(
+        controls_state.modular_production_envelope_verified
+      ),
+      modular_final_expected_counts=(
+        controls_state.modular_final_expected_counts
+      ),
+      modular_final_count_residual=(
+        controls_state.modular_final_count_residual
+      ),
+      modular_final_count_match_valid=(
+        controls_state.modular_final_count_match_valid
+      ),
+      modular_final_limiter_altered=(
+        controls_state.modular_final_limiter_altered
+      ),
     ))
     previous_active = active
     previous_intervening = intervening
@@ -2644,6 +3119,7 @@ def _route_evidence_artifact(
       for segment in route.segments
     ],
     "runtime_bundle_sha256": _sha256(route_bundle.to_json().encode()),
+    "route_evidence_schema_version": ROUTE_EVIDENCE_VERSION,
     "superproject_commit": route_descriptor.superproject_commit,
   }
   source = RouteEvidenceSourceIdentity(
@@ -2663,11 +3139,11 @@ def _route_evidence_artifact(
     schema_versions={
       "canonical_join": CANONICAL_JOIN_SCHEMA_VERSION,
       "extractor": NATIVE_EXTRACTOR_SCHEMA_VERSION,
-      "route_evidence": 2,
+      "route_evidence": ROUTE_EVIDENCE_VERSION,
       "live_torque_health_reconstruction": 2,
     },
     preparation_provenance=dict(provenance),
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=len(frames),
     preparation_cache_key=_sha256(_canonical_json_bytes(cache_payload)),
     controls_witness_count=(
@@ -2683,6 +3159,17 @@ def _route_evidence_artifact(
     gap_count=gap_count,
     model_link_failure_count=model_failure_count,
     pre_poll_dropped_timestamps_ns=pre_poll_dropped,
+    device_type=device_type,
+    controller_architecture=controller_architecture,
+    recorded_source_openpilot_commit=recorded_source_openpilot_commit,
+    recorded_opendbc_commit=recorded_opendbc_commit,
+    live_artifact_sha256=live_artifact_sha256,
+    recorded_runtime_identity_sha256=recorded_runtime_identity_sha256,
+    recorded_profile_sha256=recorded_profile_sha256,
+    recorded_controller_policy_sha256=(
+      recorded_controller_policy_sha256
+    ),
+    recorded_horizon_policy_sha256=recorded_horizon_policy_sha256,
   )
   physical = b"".join(_encode_frame(frame) for frame in frames)
   return RouteEvidenceArtifact(
@@ -2760,6 +3247,7 @@ def _prepare_route_with_extractor(
       *_SOURCE_SERVICES,
       *_BEHAVIOR_CONTEXT_SERVICES,
       *_CANONICAL_WITNESS_SERVICES,
+      *_REQUEST_CONTEXT_SERVICES,
     )
   }
   first_source_time: dict[str, int] = {}
@@ -2863,6 +3351,7 @@ def _prepare_route_with_extractor(
           dirty,
           dongle_id,
           route_version,
+          device_type,
         ) = decoded.payload
         if (
           type(route_version) is not str
@@ -2874,6 +3363,17 @@ def _prepare_route_with_extractor(
           raise RouteRejected(
             "invalid_route_version",
             "route version is empty or malformed",
+          )
+        if (
+          type(device_type) is not str
+          or not device_type
+          or len(device_type) > 64
+          or device_type.strip() != device_type
+          or not device_type.isprintable()
+        ):
+          raise RouteRejected(
+            "invalid_device_type",
+            "route device type is empty or malformed",
           )
         descriptor = descriptor_registry.resolve(superproject_commit)
         if descriptor is None:
@@ -2898,6 +3398,7 @@ def _prepare_route_with_extractor(
           descriptor.log_schema_blob,
           route_version,
           dongle_id,
+          device_type,
         )
         if route_init_identity is None:
           route_init_identity = identity
@@ -3052,6 +3553,12 @@ def _prepare_route_with_extractor(
       "route runtime compatibility could not be reconstructed",
     ) from exc
 
+  _bind_prior_cycle_palisade_lkas11(
+    descriptor=route_descriptor,
+    car_outputs=route_records["carOutput"],
+    sendcan_records=route_records["sendcan"],
+  )
+
   try:
     from opendbc.car.vehicle_model import VehicleModel
 
@@ -3126,6 +3633,7 @@ def _prepare_route_with_extractor(
     log_schema_blob,
     version,
     dongle_id,
+    device_type,
   ) = route_init_identity
   provenance = {
     "canonical_join_schema_version": CANONICAL_JOIN_SCHEMA_VERSION,
@@ -3146,6 +3654,7 @@ def _prepare_route_with_extractor(
     route_car_params_bytes=route_car_params_bytes,
     route_bundle=route_bundle,
     route_descriptor=route_descriptor,
+    device_type=device_type,
     route_records=route_records,
     joins=canonical_joins,
     frames=all_frames,
@@ -4824,7 +5333,7 @@ def _route_evidence_staging_path(
       "backfill_route_incompatible",
       "route-evidence staging identity is invalid",
     )
-  return root / ".route-evidence-staging-v2" / f"authority-{authority_index}" / f"{sha256}.route-evidence"
+  return root / ROUTE_EVIDENCE_STAGING_DIRECTORY / f"authority-{authority_index}" / f"{sha256}.route-evidence"
 
 
 def _stage_route_evidence(
@@ -4984,7 +5493,7 @@ def _publish_route_evidence_after_aa(
   second: ReplayPass,
 ) -> None:
   """Publish complete route artifacts only after replay-level A/A passes."""
-  store = RouteEvidenceStore(root / "route_evidence_v2")
+  store = RouteEvidenceStore(root / "route_evidence_v4")
   second_by_route = {
     result.route.route_name: result
     for result in second.results
@@ -5027,7 +5536,7 @@ def _publish_route_evidence_after_aa(
         "backfill_nondeterministic",
         "route-evidence A/A bytes are missing or disagree",
       ) from error
-  staging_root = root / ".route-evidence-staging-v2"
+  staging_root = root / ROUTE_EVIDENCE_STAGING_DIRECTORY
   try:
     for authority_index in (1, 2):
       (staging_root / f"authority-{authority_index}").rmdir()
