@@ -40,6 +40,7 @@ from openpilot.selfdrive.controls.lib.blatv2.live_adapter import (
   INTENT_CAPACITY,
   LiveAdapterStatus,
   LiveInputAdapter,
+  exact_nonnegative_int,
   exact_applied_torque_counts,
   exact_steering_request_state,
 )
@@ -413,6 +414,7 @@ def bind_modular(
   state: object,
   output: object,
 ) -> None:
+  _, _, live_params = vehicle_messages()
   selected.update_engagement(
     enabled=False,
     lateral_active=False,
@@ -421,7 +423,9 @@ def bind_modular(
   selected.observe_inactive_state(
     state_sample_mono_ns=clock.now_ns - 15_000_000,
     car_state=state,
+    live_parameters=live_params,
     inputs_valid=True,
+    live_parameters_inputs_valid=True,
   )
   assert selected.observe_previous_applied(output)
   assert selected.update_engagement(
@@ -1067,7 +1071,9 @@ def test_native_grid_and_derivative_gap_contracts() -> None:
   adapter.observe_inactive_state(
     state_sample_mono_ns=BASE_NS + 200_000_000,
     car_state=state,
+    live_parameters=live_params,
     inputs_valid=True,
+    live_parameters_inputs_valid=True,
   )
   prepared = adapter.prepare(
     state_sample_mono_ns=BASE_NS + 210_000_000,
@@ -1100,6 +1106,74 @@ def test_native_grid_and_derivative_gap_contracts() -> None:
   assert gapped.status == LiveAdapterStatus.INVALID_RACK_DERIVATIVE
   assert not gapped.rack_derivative_valid
   assert math.isnan(gapped.measured_rack_acceleration_deg_s2)
+
+
+def test_timing_identifiers_require_exact_nonnegative_integers() -> None:
+  assert exact_nonnegative_int(42, "test") == 42
+  for invalid in (True, -1, 1.5, math.nan):
+    try:
+      exact_nonnegative_int(invalid, "test")
+    except (TypeError, ValueError, OverflowError):
+      pass
+    else:
+      raise AssertionError(f"inexact timing identifier accepted: {invalid!r}")
+
+
+def test_unsigned_rack_rate_uses_angle_direction_through_reversal() -> None:
+  adapter = LiveInputAdapter(
+    car_params=synthetic_cp(),
+    profile=qualified_profile(),
+  )
+  state, _, live_params = vehicle_messages()
+  state.steeringRateDeg = 8.0
+  adapter.observe_inactive_state(
+    state_sample_mono_ns=BASE_NS + 190_000_000,
+    car_state=state,
+    live_parameters=live_params,
+    inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  state.steeringAngleDeg = -0.1
+  adapter.observe_inactive_state(
+    state_sample_mono_ns=BASE_NS + 200_000_000,
+    car_state=state,
+    live_parameters=live_params,
+    inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+
+  negative = adapter.prepare(
+    state_sample_mono_ns=BASE_NS + 210_000_000,
+    control_witness_mono_ns=BASE_NS + 215_000_000,
+    model_publication_mono_ns=BASE_NS + 205_000_000,
+    model_message=model(),
+    car_state=state,
+    live_parameters=live_params,
+    model_message_valid=True,
+    model_message_alive=True,
+    vehicle_inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  assert negative.status == LiveAdapterStatus.OK
+  assert negative.measured_rack_rate_deg_s == -8.0
+  assert negative.measured_rack_acceleration_deg_s2 == 0.0
+
+  state.steeringAngleDeg = 0.0
+  reversal = adapter.prepare(
+    state_sample_mono_ns=BASE_NS + 220_000_000,
+    control_witness_mono_ns=BASE_NS + 225_000_000,
+    model_publication_mono_ns=BASE_NS + 215_000_000,
+    model_message=model(),
+    car_state=state,
+    live_parameters=live_params,
+    model_message_valid=True,
+    model_message_alive=True,
+    vehicle_inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  assert reversal.status == LiveAdapterStatus.OK
+  assert reversal.measured_rack_rate_deg_s == 8.0
+  assert reversal.measured_rack_acceleration_deg_s2 == 0.0
 
 
 def test_nonzero_delay_zoh_prime_makes_first_active_frame_valid(
@@ -1361,7 +1435,7 @@ def test_stale_plan_then_fresh_changed_plan_recovers_without_switching() -> None
     assert recovered.core_result.desired_curvature < 0.0
 
 
-def test_invalid_live_parameters_are_diagnostic_only_and_guard_actuation(
+def test_invalid_live_parameters_reset_rack_motion_and_guard_actuation(
 ) -> None:
   for failure in ("message", "subscription"):
     selected = live()
@@ -1393,11 +1467,12 @@ def test_invalid_live_parameters_are_diagnostic_only_and_guard_actuation(
         == LiveAdapterStatus.INVALID_LIVE_PARAMETERS
       )
       assert not selected.prepared_input.live_parameters_valid
+      assert not selected.prepared_input.rack_derivative_valid
       assert not selected.prepared_input.lateral_valid
       assert invalid.core_result is not None
       assert (
         invalid.core_result.status
-        == CoreStatus.DEGRADED_NOMINAL_MAPPING
+        == CoreStatus.INVALID_MEASUREMENT
       )
       assert invalid.status == CandidateStatus.MODULAR_CORE_INVALID
       assert invalid.safety_state == LiveSafetyState.HOLDING_FIRST_INVALID
@@ -1533,7 +1608,9 @@ def test_binding_mismatch_poison_lasts_until_both_false_session_boundary(
   selected.observe_inactive_state(
     state_sample_mono_ns=clock.now_ns - 15_000_000,
     car_state=state,
+    live_parameters=live_params,
     inputs_valid=True,
+    live_parameters_inputs_valid=True,
   )
   assert selected.observe_previous_applied(output)
   assert selected.update_engagement(

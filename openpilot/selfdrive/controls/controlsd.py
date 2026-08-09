@@ -173,10 +173,15 @@ class Controls:
       self.blatv2_live.observe_inactive_state(
         state_sample_mono_ns=int(self.sm.logMonoTime['carState']),
         car_state=CS,
+        live_parameters=self.sm['liveParameters'],
         inputs_valid=bool(
           self.sm.seen['carState']
           and self.sm.valid['carState']
           and CS.canValid
+        ),
+        live_parameters_inputs_valid=bool(
+          self.sm.seen['liveParameters']
+          and self.sm.valid['liveParameters']
         ),
       )
     if (

@@ -47,7 +47,7 @@ from openpilot.selfdrive.controls.lib.blatv2.learner import (
   _attest_authority_sample,
 )
 from openpilot.selfdrive.controls.lib.blatv2.measurement import (
-  MAX_CONTINUOUS_MEASUREMENT_GAP_S,
+  MAX_CONTINUOUS_MEASUREMENT_GAP_NS,
   LearningMeasurementBuilder,
 )
 from openpilot.selfdrive.controls.lib.blatv2.preparation_frame import (
@@ -294,7 +294,7 @@ class _MeasuredEnvelopeConstraint:
     "_limits",
     "_previous_applied",
     "_previous_driver_torque",
-    "_previous_time_s",
+    "_previous_mono_ns",
     "_magnitude_boundary_value",
     "_magnitude_boundary_dwell_s",
     "_torque_count_tolerance",
@@ -305,7 +305,7 @@ class _MeasuredEnvelopeConstraint:
     self._limits = limits
     self._previous_applied = 0.0
     self._previous_driver_torque = 0.0
-    self._previous_time_s: float | None = None
+    self._previous_mono_ns: int | None = None
     self._magnitude_boundary_value: float | None = None
     self._magnitude_boundary_dwell_s = 0.0
     # CarController output is normalized after an integer-count limiter. Half
@@ -319,36 +319,37 @@ class _MeasuredEnvelopeConstraint:
   def reset(self) -> None:
     self._previous_applied = 0.0
     self._previous_driver_torque = 0.0
-    self._previous_time_s = None
+    self._previous_mono_ns = None
     self._magnitude_boundary_value = None
     self._magnitude_boundary_dwell_s = 0.0
-
-  def driver_exceeds_allowance(self, value: float) -> bool:
-    """Whether raw measured driver torque makes rack input ambiguous."""
-    numeric = float(value)
-    if not math.isfinite(numeric):
-      return True
-    # The limiter scales the sensor through DRIVER_FACTOR. Raw torque is also
-    # retained in the veto so factor=0/multiplier=0 platforms cannot classify
-    # obvious human rack input as vehicle-owned evidence.
-    return max(
-      abs(numeric),
-      abs(numeric * self._limits.driver_factor),
-    ) > self._limits.driver_allowance
 
   def update(
     self,
     *,
-    sample_time_s: float,
+    sample_mono_ns: int,
     applied_torque: float,
     driver_torque: float,
     inputs_valid: bool,
   ) -> _MeasuredEnvelopeObservation:
-    values = (sample_time_s, applied_torque, driver_torque)
+    try:
+      timestamp_ns = int(sample_mono_ns)
+      applied = float(applied_torque)
+      driver = float(driver_torque)
+    except (TypeError, ValueError, OverflowError):
+      self.reset()
+      return _MeasuredEnvelopeObservation(
+        valid=False,
+        constrained=True,
+        boundary=ActuatorBoundary.NONE,
+        magnitude_boundary_dwell_s=0.0,
+      )
     if (
       not inputs_valid
-      or not all(math.isfinite(value) for value in values)
-      or abs(applied_torque) > 1.0
+      or isinstance(sample_mono_ns, bool)
+      or timestamp_ns != sample_mono_ns
+      or timestamp_ns <= 0
+      or not all(math.isfinite(value) for value in (applied, driver))
+      or abs(applied) > 1.0
     ):
       self.reset()
       return _MeasuredEnvelopeObservation(
@@ -358,7 +359,7 @@ class _MeasuredEnvelopeConstraint:
         magnitude_boundary_dwell_s=0.0,
       )
 
-    applied_counts = applied_torque * self._limits.steer_max
+    applied_counts = applied * self._limits.steer_max
     if (
       abs(applied_counts - round(applied_counts))
       > self._torque_grid_tolerance_counts
@@ -371,10 +372,10 @@ class _MeasuredEnvelopeConstraint:
         magnitude_boundary_dwell_s=0.0,
       )
 
-    if self._previous_time_s is None:
-      self._previous_time_s = sample_time_s
-      self._previous_applied = applied_torque
-      self._previous_driver_torque = driver_torque
+    if self._previous_mono_ns is None:
+      self._previous_mono_ns = timestamp_ns
+      self._previous_applied = applied
+      self._previous_driver_torque = driver
       return _MeasuredEnvelopeObservation(
         valid=False,
         constrained=True,
@@ -382,8 +383,8 @@ class _MeasuredEnvelopeConstraint:
         magnitude_boundary_dwell_s=0.0,
       )
 
-    dt_s = sample_time_s - self._previous_time_s
-    if not 0.0 < dt_s <= MAX_CONTINUOUS_MEASUREMENT_GAP_S:
+    dt_ns = timestamp_ns - self._previous_mono_ns
+    if not 0 < dt_ns <= MAX_CONTINUOUS_MEASUREMENT_GAP_NS:
       self.reset()
       return _MeasuredEnvelopeObservation(
         valid=False,
@@ -391,6 +392,7 @@ class _MeasuredEnvelopeConstraint:
         boundary=ActuatorBoundary.NONE,
         magnitude_boundary_dwell_s=0.0,
       )
+    dt_s = dt_ns * 1e-9
 
     # carOutput contains the previous CarController result while carState is
     # the current card cycle. If either adjacent driver-torque sample exceeds
@@ -398,13 +400,13 @@ class _MeasuredEnvelopeConstraint:
     # are both ambiguous. Reject conservatively and require a fresh
     # full-magnitude dwell instead of pretending the joined sample is exact.
     driver_interaction = (
-      self.driver_exceeds_allowance(driver_torque)
-      or self.driver_exceeds_allowance(self._previous_driver_torque)
+      self._limits.driver_exceeds_allowance(driver)
+      or self._limits.driver_exceeds_allowance(self._previous_driver_torque)
     )
     if driver_interaction:
-      self._previous_time_s = sample_time_s
-      self._previous_applied = applied_torque
-      self._previous_driver_torque = driver_torque
+      self._previous_mono_ns = timestamp_ns
+      self._previous_applied = applied
+      self._previous_driver_torque = driver
       self._magnitude_boundary_value = None
       self._magnitude_boundary_dwell_s = 0.0
       return _MeasuredEnvelopeObservation(
@@ -429,7 +431,7 @@ class _MeasuredEnvelopeConstraint:
     lower = min(positive, negative)
     upper = max(positive, negative)
     tolerance = self._torque_count_tolerance
-    inside = lower - tolerance <= applied_torque <= upper + tolerance
+    inside = lower - tolerance <= applied <= upper + tolerance
     if not inside:
       self.reset()
       return _MeasuredEnvelopeObservation(
@@ -439,19 +441,19 @@ class _MeasuredEnvelopeConstraint:
         magnitude_boundary_dwell_s=0.0,
       )
 
-    lower_distance = abs(applied_torque - lower)
-    upper_distance = abs(applied_torque - upper)
+    lower_distance = abs(applied - lower)
+    upper_distance = abs(applied - upper)
     on_boundary = lower_distance <= tolerance or upper_distance <= tolerance
     boundary = ActuatorBoundary.NONE
     if on_boundary:
-      if abs(abs(applied_torque) - 1.0) <= tolerance:
+      if abs(abs(applied) - 1.0) <= tolerance:
         boundary |= ActuatorBoundary.MAGNITUDE
 
       magnitude_delta = (
-        abs(applied_torque) - abs(self._previous_applied)
+        abs(applied) - abs(self._previous_applied)
       )
       crossed_zero = (
-        applied_torque * self._previous_applied < 0.0
+        applied * self._previous_applied < 0.0
       )
       if crossed_zero:
         # The production sign-crossing limiter spends the frame's budget
@@ -468,20 +470,20 @@ class _MeasuredEnvelopeConstraint:
       if (
         self._magnitude_boundary_value is not None
         and abs(
-          applied_torque - self._magnitude_boundary_value
+          applied - self._magnitude_boundary_value
         ) <= tolerance
       ):
         self._magnitude_boundary_dwell_s += dt_s
       else:
         self._magnitude_boundary_dwell_s = 0.0
-      self._magnitude_boundary_value = applied_torque
+      self._magnitude_boundary_value = applied
     else:
       self._magnitude_boundary_value = None
       self._magnitude_boundary_dwell_s = 0.0
 
-    self._previous_time_s = sample_time_s
-    self._previous_applied = applied_torque
-    self._previous_driver_torque = driver_torque
+    self._previous_mono_ns = timestamp_ns
+    self._previous_applied = applied
+    self._previous_driver_torque = driver
     return _MeasuredEnvelopeObservation(
       valid=True,
       constrained=on_boundary,
@@ -520,7 +522,7 @@ class PersistentLearningRuntime:
         node.parameters.transport_delay_s
         for node in runtime_bundle.calibration_seed_profile.nodes
       ),
-      maximum_gap_s=MAX_CONTINUOUS_MEASUREMENT_GAP_S,
+      maximum_gap_ns=MAX_CONTINUOUS_MEASUREMENT_GAP_NS,
     )
     self._last_applied_report_mono_ns = 0
     self._last_reported_applied_torque = 0.0
@@ -887,17 +889,20 @@ class PersistentLearningRuntime:
     if not isinstance(frame, MeasuredLearningFrame):
       raise TypeError("persistent learner requires MeasuredLearningFrame")
 
-    witness_mono_ns = int(frame.sample_mono_ns)
-    response_mono_ns = int(frame.response_mono_ns)
-    applied_report_mono_ns = int(frame.applied_report_mono_ns)
-    applied_effective_mono_ns = int(frame.applied_effective_mono_ns)
-    sample_time_s = response_mono_ns * 1e-9
-    applied_report_time_s = applied_report_mono_ns * 1e-9
-    applied_effective_time_s = applied_effective_mono_ns * 1e-9
-    numeric_valid = frame.inputs_valid and all(math.isfinite(value) for value in (
-      sample_time_s,
-      applied_report_time_s,
-      applied_effective_time_s,
+    clocks = (
+      frame.sample_mono_ns,
+      frame.response_mono_ns,
+      frame.applied_report_mono_ns,
+      frame.applied_effective_mono_ns,
+    )
+    clocks_valid = all(type(value) is int for value in clocks)
+    (
+      witness_mono_ns,
+      response_mono_ns,
+      applied_report_mono_ns,
+      applied_effective_mono_ns,
+    ) = clocks if clocks_valid else (0, 0, 0, 0)
+    numeric_valid = clocks_valid and frame.inputs_valid and all(math.isfinite(value) for value in (
       frame.speed_mps,
       frame.steering_angle_deg,
       frame.steering_rate_deg_s,
@@ -951,7 +956,7 @@ class PersistentLearningRuntime:
       numeric_valid
       and lateral_active
       and self.last_live_mapping_valid
-      and self.envelope_constraint.driver_exceeds_allowance(
+      and self.runtime_bundle.torque_limits.driver_exceeds_allowance(
         frame.steering_torque,
       )
     )
@@ -981,7 +986,7 @@ class PersistentLearningRuntime:
         self.envelope_constraint.reset()
         self.torque_response_aligner.reset()
       envelope_observation = self.envelope_constraint.update(
-        sample_time_s=applied_effective_time_s,
+        sample_mono_ns=applied_effective_mono_ns,
         applied_torque=frame.applied_torque,
         driver_torque=frame.steering_torque,
         inputs_valid=(
@@ -990,8 +995,8 @@ class PersistentLearningRuntime:
         ),
       )
       command_observation_valid = self.torque_response_aligner.record(
-        report_time_s=applied_report_time_s,
-        effective_time_s=applied_effective_time_s,
+        report_mono_ns=applied_report_mono_ns,
+        effective_mono_ns=applied_effective_mono_ns,
         applied_torque=frame.applied_torque,
         actuator_constrained=envelope_observation.constrained,
         boundary=envelope_observation.boundary,
@@ -1020,7 +1025,7 @@ class PersistentLearningRuntime:
     )
     aligned_torque = (
       self.torque_response_aligner.aligned(
-        response_time_s=sample_time_s,
+        response_mono_ns=response_mono_ns,
         transport_delay_s=seed_parameters.transport_delay_s,
       )
       if command_observation_valid
@@ -1036,7 +1041,7 @@ class PersistentLearningRuntime:
     )
     self.last_actuator_constrained = actuator_constrained
     sample = self.measurement_builder.update(
-      sample_time_s=sample_time_s,
+      sample_mono_ns=response_mono_ns,
       speed_mps=frame.speed_mps,
       measured_rack_angle_deg=frame.steering_angle_deg,
       measured_rack_rate_deg_s=frame.steering_rate_deg_s,

@@ -108,6 +108,10 @@ from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
   curvature_from_measured_angle,
 )
+from openpilot.selfdrive.controls.lib.blatv2.rack_motion import (
+  RackMotionObservation,
+  SignedRackMotionNormalizer,
+)
 from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
   ROUTE_EVIDENCE_VERSION,
   ControlsWitness,
@@ -132,11 +136,11 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 
 
-BEHAVIOR_REPLAY_INPUT_SCHEMA_VERSION = 1
+BEHAVIOR_REPLAY_INPUT_SCHEMA_VERSION = 2
 EXACT_STOCK_REPLAY_CONTROLLER_NAME = "openpilot.LatControlTorque.exact-stock"
-EXACT_STOCK_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-full-stock-v1"
+EXACT_STOCK_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-full-stock-v2"
 MODULAR_REPLAY_CONTROLLER_NAME = "blatv2.ModularControllerCore"
-MODULAR_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-modular-core-v2"
+MODULAR_REPLAY_IMPLEMENTATION_CONTRACT = "behavior-replay-modular-core-v3"
 PROVISIONAL_HORIZON_POLICY_PATH = Path(__file__).resolve().parent / "provisional_horizon_policy.json"
 # Importing modeld just to obtain this scalar also imports the device-only
 # vision IPC extension.  Keep the source value local so replay remains usable
@@ -597,6 +601,7 @@ def validate_behavior_scenario_active_frame(
   *,
   physical_record_index: int,
   rack_acceleration_valid: bool,
+  engagement_boundary: bool = False,
   witness: ControlsWitness,
   physical: Any,
   model: ModelPublication | None,
@@ -631,7 +636,11 @@ def validate_behavior_scenario_active_frame(
     )
   if not witness.message_valid or not physical.inputs_valid:
     raise BehaviorReplayError("active lateral scenario contains invalid evidence")
-  if physical_record_index != 0 and not rack_acceleration_valid:
+  if (
+    physical_record_index != 0
+    and not engagement_boundary
+    and not rack_acceleration_valid
+  ):
     raise BehaviorReplayError("active lateral scenario lacks valid control cadence")
   if (
     not witness.model_link_valid
@@ -742,8 +751,8 @@ def behavior_rack_mapping_from_physical_frame(
     return None
   try:
     vehicle_model.update_params(
-      max(physical.stiffness_factor, 0.1),
-      max(physical.steer_ratio, 0.1),
+      physical.stiffness_factor,
+      physical.steer_ratio,
     )
     return RackMappingSnapshot.from_vehicle_model(
       vehicle_model,
@@ -781,11 +790,11 @@ def build_canonical_behavior_frame(
   car_params: Any,
   car_params_bytes: bytes,
   nominal_rack_mapping: RackMappingSnapshot,
-  mapping_model: VehicleModel,
   witness: ControlsWitness,
   physical: Any,
-  rack_acceleration_deg_s2: float,
-  rack_acceleration_valid: bool,
+  live_mapping: RackMappingSnapshot | None,
+  rack_motion: RackMotionObservation,
+  engagement_boundary: bool,
   model: ModelPublication | None,
   live_torque: LiveTorqueParametersPublication | None,
   live_delay: LiveDelayPublication | None,
@@ -803,9 +812,15 @@ def build_canonical_behavior_frame(
   ):
     if publication is not None and publication.mono_time_ns > witness.mono_time_ns:
       raise BehaviorReplayError(f"{name} link points to a future publication")
+  rack_acceleration_valid = (
+    rack_motion.derivative_continuous or rack_motion.direction_reversal
+  )
+  if witness.lateral_active and not rack_motion.sign_valid:
+    raise BehaviorReplayError("active lateral scenario lacks signed rack motion")
   validate_behavior_scenario_active_frame(
     physical_record_index=index,
     rack_acceleration_valid=rack_acceleration_valid,
+    engagement_boundary=engagement_boundary,
     witness=witness,
     physical=physical,
     model=model,
@@ -813,7 +828,6 @@ def build_canonical_behavior_frame(
     live_delay=live_delay,
     maneuver=maneuver,
   )
-  live_mapping = behavior_rack_mapping_from_physical_frame(mapping_model, physical)
   live_parameters_inputs_valid = (
     live_mapping is not None
     and witness.live_parameters_mono_ns >= 0
@@ -838,8 +852,12 @@ def build_canonical_behavior_frame(
     state_sample_mono_time_ns=witness.state_sample_mono_ns,
     model_frame_id=0 if model is None else model.frame_id,
     recorded_rack_angle_deg=physical.steering_angle_deg,
-    recorded_rack_rate_deg_s=physical.steering_rate_deg_s,
-    recorded_rack_acceleration_deg_s2=rack_acceleration_deg_s2,
+    recorded_rack_rate_deg_s=rack_motion.signed_rate_deg_s,
+    recorded_rack_acceleration_deg_s2=(
+      rack_motion.rack_acceleration_deg_s2
+      if rack_acceleration_valid
+      else 0.0
+    ),
     recorded_applied_torque=physical.applied_torque,
     recorded_applied_counts=witness.torque_output_can_count,
     # Recorded request is retained only as authenticated provenance.  The
@@ -861,7 +879,8 @@ def build_canonical_behavior_frame(
     applied_count_valid=witness.torque_output_can_valid,
     witness_resolved=not witness.race_unresolved,
     control_cadence_valid=(
-      not witness.gap_from_previous and (index == 0 or rack_acceleration_valid)
+      not witness.gap_from_previous
+      and (index == 0 or engagement_boundary or rack_acceleration_valid)
     ),
     model_message_valid=(False if model is None else model.message_valid),
     model_message_alive=(model is not None and witness.model_message_alive),
@@ -917,26 +936,53 @@ def build_canonical_behavior_frame(
   return control, frame_input, None if model is None else sparse_model_behavior_intent(model)
 
 
-def _rack_accelerations(
-  frames: tuple[Any, ...],
-) -> tuple[tuple[float, bool], ...]:
-  output: list[tuple[float, bool]] = []
-  previous_time: int | None = None
-  previous_rate = 0.0
-  for frame in frames:
-    acceleration = 0.0
-    valid = False
-    if previous_time is not None:
-      gap_ns = frame.response_mono_ns - previous_time
-      valid = 0 < gap_ns <= 15_000_000
-      if valid:
-        acceleration = (
-          frame.steering_rate_deg_s - previous_rate
-        ) / (gap_ns * 1e-9)
-    output.append((acceleration, valid))
-    previous_time = frame.response_mono_ns
-    previous_rate = frame.steering_rate_deg_s
-  return tuple(output)
+def observe_behavior_rack_motion(
+  *,
+  normalizer: SignedRackMotionNormalizer,
+  profile: VehicleProfile,
+  mapping_model: VehicleModel,
+  runtime_limits: RuntimeTorqueLimits,
+  witness: ControlsWitness,
+  physical: Any,
+) -> tuple[RackMappingSnapshot | None, RackMotionObservation]:
+  """Reconstruct one signed rack observation for either replay decoder."""
+  live_mapping = behavior_rack_mapping_from_physical_frame(
+    mapping_model,
+    physical,
+  )
+  speed = abs(physical.speed_mps)
+  resolution = profile.parameters_at(
+    speed,
+  ).parameters.rack_rate_resolution_deg_s
+  lifecycle_valid = (
+    bool(physical.inputs_valid)
+    and live_mapping is not None
+    and not witness.gap_from_previous
+    and not bool(physical.steering_pressed)
+    and not runtime_limits.driver_exceeds_allowance(
+      physical.steering_torque,
+    )
+    and not bool(physical.standstill)
+    and not bool(physical.steer_fault_temporary)
+    and not bool(physical.steer_fault_permanent)
+    and bool(physical.can_valid)
+    and not bool(physical.can_timeout)
+  )
+  observation = normalizer.update(
+    sample_mono_ns=physical.response_mono_ns,
+    steering_angle_deg=(
+      physical.steering_angle_deg - (
+        live_mapping.angle_offset_deg
+        if live_mapping is not None
+        else 0.0
+      )
+    ),
+    raw_rate_deg_s=physical.steering_rate_deg_s,
+    rate_resolution_deg_s=resolution,
+    lifecycle_valid=lifecycle_valid,
+    maximum_gap_ns=15_000_000,
+  )
+  return live_mapping, observation
 
 
 def behavior_source_identity_from_route_source(
@@ -1120,13 +1166,13 @@ def _make_behavior_route_evidence_decoder(
     )
     nominal_mapping = bundle.nominal_rack_mapping
     mapping_model = VehicleModel(params)
-    accelerations = _rack_accelerations(physical_frames)
+    rack_motion = SignedRackMotionNormalizer()
+    previous_lateral_active = False
     controls: list[CanonicalBehaviorControlInput] = []
     cp_bytes = bytes(artifact.car_params_bytes)
-    for index, (witness, physical, acceleration_fact) in enumerate(zip(
+    for index, (witness, physical) in enumerate(zip(
       artifact.control_witnesses,
       physical_frames,
-      accelerations,
       strict=True,
     )):
       if witness.physical_record_index != index:
@@ -1155,17 +1201,26 @@ def _make_behavior_route_evidence_decoder(
         witness.maneuver_plan_available,
         name="lateral maneuver",
       )
+      live_mapping, motion = observe_behavior_rack_motion(
+        normalizer=rack_motion,
+        profile=controller_profile,
+        mapping_model=mapping_model,
+        runtime_limits=bundle.torque_limits,
+        witness=witness,
+        physical=physical,
+      )
+      engagement_boundary = witness.lateral_active and not previous_lateral_active
       control, _, _ = build_canonical_behavior_frame(
         index=index,
         source=source,
         car_params=params,
         car_params_bytes=cp_bytes,
         nominal_rack_mapping=nominal_mapping,
-        mapping_model=mapping_model,
         witness=witness,
         physical=physical,
-        rack_acceleration_deg_s2=acceleration_fact[0],
-        rack_acceleration_valid=acceleration_fact[1],
+        live_mapping=live_mapping,
+        rack_motion=motion,
+        engagement_boundary=engagement_boundary,
         model=model,
         live_torque=torque,
         live_delay=delay,
@@ -1173,6 +1228,7 @@ def _make_behavior_route_evidence_decoder(
         scenario_only=scenario_only,
       )
       controls.append(control)
+      previous_lateral_active = witness.lateral_active
     if scenario_only:
       if not any(witness.lateral_active for witness in artifact.control_witnesses):
         raise BehaviorReplayError("route evidence has no active lateral scenario")

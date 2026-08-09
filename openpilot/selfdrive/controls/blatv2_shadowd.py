@@ -52,12 +52,16 @@ from openpilot.selfdrive.controls.lib.blatv2.intent import (
   adapt_model_intent_into,
 )
 from openpilot.selfdrive.controls.lib.blatv2.live_adapter import (
+  exact_nonnegative_int,
   exact_applied_torque_counts,
   exact_steering_request_state,
 )
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import (
   RackMappingSnapshot,
+)
+from openpilot.selfdrive.controls.lib.blatv2.rack_motion import (
+  SignedRackMotionNormalizer,
 )
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
@@ -66,7 +70,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 )
 
 
-MODULAR_SHADOW_SCHEMA_VERSION = 3
+MODULAR_SHADOW_SCHEMA_VERSION = 4
 PUBLISHED_SERVICES = ("blatV2Shadow",)
 SUBSCRIBED_SERVICES = (
   "modelV2",
@@ -80,7 +84,7 @@ SUBSCRIBED_SERVICES = (
 PROVISIONAL_RACK_DYNAMICS_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_rack_dynamics.json"
 PROVISIONAL_POLICY_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_controller_policy.json"
 PROVISIONAL_HORIZON_POLICY_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_horizon_policy.json"
-MAX_RACK_DERIVATIVE_GAP_S = 0.015
+MAX_RACK_DERIVATIVE_GAP_NS = 15_000_000
 RECORDED_ACTUATOR_CONSTRAINT_TOLERANCE = 1e-2
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
@@ -168,48 +172,6 @@ def controller_params_from_interface(
       "detected CarControllerParams lacks the torque-envelope contract",
     )
   return controller_params
-
-
-class _RackAcceleration:
-  """Timestamped measured-rate derivative with explicit gap invalidation."""
-
-  __slots__ = ("_previous_time_s", "_previous_rate_deg_s")
-
-  def __init__(self) -> None:
-    self._previous_time_s: float | None = None
-    self._previous_rate_deg_s = 0.0
-
-  def reset(self) -> None:
-    self._previous_time_s = None
-    self._previous_rate_deg_s = 0.0
-
-  def update(
-    self,
-    *,
-    sample_mono_ns: int,
-    rack_rate_deg_s: float,
-    inputs_valid: bool,
-  ) -> tuple[float, bool]:
-    try:
-      sample_time_s = int(sample_mono_ns) * 1e-9
-      rate_deg_s = float(rack_rate_deg_s)
-    except (TypeError, ValueError, OverflowError):
-      self.reset()
-      return 0.0, False
-    if not inputs_valid or sample_mono_ns < 0 or not math.isfinite(sample_time_s) or not math.isfinite(rate_deg_s):
-      self.reset()
-      return 0.0, False
-
-    acceleration = 0.0
-    valid = False
-    if self._previous_time_s is not None:
-      dt_s = sample_time_s - self._previous_time_s
-      valid = 0.0 < dt_s <= MAX_RACK_DERIVATIVE_GAP_S
-      if valid:
-        acceleration = (rate_deg_s - self._previous_rate_deg_s) / dt_s
-    self._previous_time_s = sample_time_s
-    self._previous_rate_deg_s = rate_deg_s
-    return acceleration, valid
 
 
 class _CanonicalModelSelector:
@@ -320,7 +282,7 @@ class ModularShadowRunner:
     self.orientation_rates_z = [0.0] * INTENT_CAPACITY
     self.velocities_x = [0.0] * INTENT_CAPACITY
     self.plan_curvatures = [0.0] * INTENT_CAPACITY
-    self.rack_acceleration = _RackAcceleration()
+    self.rack_motion = SignedRackMotionNormalizer()
 
     self.runtime_vehicle_identity_hash = runtime_bundle.identity_sha256
     self.policy_hash = policy.sha256
@@ -414,12 +376,9 @@ class ModularShadowRunner:
           roll,
           angle_offset,
         )
-      ):
+      ) or stiffness_factor <= 0.0 or steer_ratio <= 0.0:
         return None
-      self.vehicle_model.update_params(
-        max(stiffness_factor, 0.1),
-        max(steer_ratio, 0.1),
-      )
+      self.vehicle_model.update_params(stiffness_factor, steer_ratio)
       mapping = RackMappingSnapshot.from_vehicle_model(
         self.vehicle_model,
         roll_rad=roll,
@@ -462,11 +421,26 @@ class ModularShadowRunner:
       if not same_native_grid:
         native_velocities = ()
       adaptation = adapt_model_intent_into(
-        state_sample_mono_ns=state_sample_mono_ns,
-        control_witness_mono_ns=control_witness_mono_ns,
-        model_publication_mono_ns=model_publication_mono_ns,
-        plan_origin_mono_ns=int(model_message.timestampEof),
-        model_frame_id=int(model_message.frameId),
+        state_sample_mono_ns=exact_nonnegative_int(
+          state_sample_mono_ns,
+          "state sample timestamp",
+        ),
+        control_witness_mono_ns=exact_nonnegative_int(
+          control_witness_mono_ns,
+          "control witness timestamp",
+        ),
+        model_publication_mono_ns=exact_nonnegative_int(
+          model_publication_mono_ns,
+          "model publication timestamp",
+        ),
+        plan_origin_mono_ns=exact_nonnegative_int(
+          model_message.timestampEof,
+          "model plan-origin timestamp",
+        ),
+        model_frame_id=exact_nonnegative_int(
+          model_message.frameId,
+          "model frame id",
+        ),
         message_valid=model_message_valid,
         message_alive=model_message_alive,
         scalar_desired_curvature=scalar_curvature,
@@ -528,12 +502,27 @@ class ModularShadowRunner:
     live_parameters_inputs_valid: bool,
   ) -> CoreResult:
     """Compute one passive frame from recorded response and model intent."""
-    self.state_sample_mono_ns = int(state_sample_mono_ns)
-    self.control_witness_mono_ns = int(control_witness_mono_ns)
+    timestamps_valid = True
+    try:
+      self.state_sample_mono_ns = exact_nonnegative_int(
+        state_sample_mono_ns,
+        "state sample timestamp",
+      )
+      self.control_witness_mono_ns = exact_nonnegative_int(
+        control_witness_mono_ns,
+        "control witness timestamp",
+      )
+      timestamps_valid = (
+        self.state_sample_mono_ns <= self.control_witness_mono_ns
+      )
+    except (TypeError, ValueError, OverflowError):
+      self.state_sample_mono_ns = 0
+      self.control_witness_mono_ns = 0
+      timestamps_valid = False
     try:
       current_speed = float(car_state.vEgo)
       measured_angle = float(car_state.steeringAngleDeg)
-      measured_rate = float(car_state.steeringRateDeg)
+      raw_measured_rate = float(car_state.steeringRateDeg)
       command_counts = exact_applied_torque_counts(
         car_output,
         self.runtime_bundle.torque_limits,
@@ -557,7 +546,7 @@ class ModularShadowRunner:
     except (AttributeError, TypeError, ValueError, OverflowError):
       current_speed = math.nan
       measured_angle = math.nan
-      measured_rate = math.nan
+      raw_measured_rate = math.nan
       applied_torque = math.nan
       command_counts = 0
       request_active = False
@@ -571,42 +560,69 @@ class ModularShadowRunner:
       selfdrive_active = False
       vehicle_inputs_valid = False
 
-    numeric_vehicle_inputs_valid = bool(vehicle_inputs_valid) and all(
-      math.isfinite(value)
-      for value in (
-        current_speed,
-        measured_angle,
-        measured_rate,
-        applied_torque,
-        requested_torque,
-        driver_torque,
+    numeric_vehicle_inputs_valid = (
+      timestamps_valid
+      and bool(vehicle_inputs_valid)
+      and all(
+        math.isfinite(value)
+        for value in (
+          current_speed,
+          measured_angle,
+          raw_measured_rate,
+          applied_torque,
+          requested_torque,
+          driver_torque,
+        )
       )
     )
     self.vehicle_state_valid = numeric_vehicle_inputs_valid and current_speed >= 0.0
     self.lateral_active = self.vehicle_state_valid and lateral_active and selfdrive_active
-    measured_acceleration, acceleration_valid = self.rack_acceleration.update(
-      sample_mono_ns=state_sample_mono_ns,
-      rack_rate_deg_s=measured_rate,
-      inputs_valid=self.vehicle_state_valid,
-    )
-    self.measured_acceleration_deg_s2 = measured_acceleration
-    self.lateral_valid = self.vehicle_state_valid and acceleration_valid
-    engagement_boundary = self.lateral_active != self._previous_lateral_active
-    self._previous_lateral_active = self.lateral_active
-    if engagement_boundary and self.lateral_active:
-      self.core.prime_applied_history(applied_torque)
-
     live_mapping = self._live_mapping(
       live_parameters,
       inputs_valid=live_parameters_inputs_valid,
     )
     profile_speed = current_speed if self.vehicle_state_valid else self.profile.nodes[0].speed_mps
-    transport_delay = self.profile.parameters_at(
+    profile_parameters = self.profile.parameters_at(
       profile_speed,
-    ).parameters.transport_delay_s
+    ).parameters
+    motion = self.rack_motion.update(
+      sample_mono_ns=self.state_sample_mono_ns,
+      steering_angle_deg=(
+        measured_angle - live_mapping.angle_offset_deg
+        if live_mapping is not None
+        else measured_angle
+      ),
+      raw_rate_deg_s=raw_measured_rate,
+      rate_resolution_deg_s=profile_parameters.rack_rate_resolution_deg_s,
+      lifecycle_valid=(
+        self.vehicle_state_valid
+        and live_mapping is not None
+        and not steering_pressed
+        and not standstill
+      ),
+      maximum_gap_ns=MAX_RACK_DERIVATIVE_GAP_NS,
+    )
+    measured_rate = motion.signed_rate_deg_s if motion.sign_valid else math.nan
+    measured_acceleration = (
+      motion.rack_acceleration_deg_s2
+      if motion.derivative_continuous or motion.direction_reversal
+      else math.nan
+    )
+    self.measured_acceleration_deg_s2 = measured_acceleration
+    self.lateral_valid = (
+      self.vehicle_state_valid
+      and (motion.derivative_continuous or motion.direction_reversal)
+      and self.live_parameters_valid
+    )
+    engagement_boundary = self.lateral_active != self._previous_lateral_active
+    self._previous_lateral_active = self.lateral_active
+    if engagement_boundary and self.lateral_active:
+      self.core.prime_applied_history(applied_torque)
+
+    transport_delay = profile_parameters.transport_delay_s
     adaptation, scalar_curvature = self._adapt_intent(
-      state_sample_mono_ns=state_sample_mono_ns,
-      control_witness_mono_ns=control_witness_mono_ns,
+      state_sample_mono_ns=self.state_sample_mono_ns,
+      control_witness_mono_ns=self.control_witness_mono_ns,
       model_publication_mono_ns=model_publication_mono_ns,
       model_message=model_message,
       model_message_valid=model_message_valid,

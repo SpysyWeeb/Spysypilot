@@ -36,7 +36,7 @@ from openpilot.selfdrive.controls.lib.blatv2.rack_motion import (
 
 # A 100 Hz measurement may jitter by half a nominal frame. A larger gap means
 # an unknown intermediate torque/rack transition and is not fit evidence.
-MAX_CONTINUOUS_MEASUREMENT_GAP_S = 0.015
+MAX_CONTINUOUS_MEASUREMENT_GAP_NS = 15_000_000
 
 
 class LearningMeasurementBuilder:
@@ -53,7 +53,7 @@ class LearningMeasurementBuilder:
   def update(
     self,
     *,
-    sample_time_s: float,
+    sample_mono_ns: int,
     speed_mps: float,
     measured_rack_angle_deg: float,
     measured_rack_rate_deg_s: float,
@@ -69,7 +69,15 @@ class LearningMeasurementBuilder:
     standstill: bool,
   ) -> LearningSample:
     """Build one measured-only sample and update derivative history."""
-    timestamp = float(sample_time_s)
+    try:
+      timestamp_ns = int(sample_mono_ns)
+    except (TypeError, ValueError, OverflowError):
+      timestamp_ns = -1
+    timestamp_valid = (
+      not isinstance(sample_mono_ns, bool)
+      and timestamp_ns == sample_mono_ns
+      and timestamp_ns >= 0
+    )
     speed = float(speed_mps)
     angle = float(measured_rack_angle_deg)
     rate = float(measured_rack_rate_deg_s)
@@ -77,7 +85,6 @@ class LearningMeasurementBuilder:
     applied = float(applied_torque)
     offset = float(lateral_accel_offset)
     numeric_finite = all(math.isfinite(value) for value in (
-      timestamp,
       speed,
       angle,
       rate,
@@ -97,6 +104,7 @@ class LearningMeasurementBuilder:
     )
     lifecycle_continuous = (
       bool(engaged)
+      and timestamp_valid
       and not bool(standstill)
       and bool(inputs_valid)
       and numeric_finite
@@ -107,7 +115,7 @@ class LearningMeasurementBuilder:
     )
 
     motion = self._rack_motion.update(
-      sample_time_s=timestamp,
+      sample_mono_ns=timestamp_ns,
       # Direction is physical rack motion, not a slowly changing learned
       # alignment offset. Curvature reconstruction below still receives the
       # raw steering angle and applies the same offset exactly once.
@@ -115,7 +123,7 @@ class LearningMeasurementBuilder:
       raw_rate_deg_s=rate,
       rate_resolution_deg_s=rate_resolution,
       lifecycle_valid=lifecycle_continuous,
-      maximum_gap_s=MAX_CONTINUOUS_MEASUREMENT_GAP_S,
+      maximum_gap_ns=MAX_CONTINUOUS_MEASUREMENT_GAP_NS,
     )
     dt_s = motion.dt_s
     derivative_valid = motion.derivative_continuous

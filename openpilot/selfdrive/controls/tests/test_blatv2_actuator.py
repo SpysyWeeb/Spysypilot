@@ -70,6 +70,12 @@ class TestBlatV2Actuator(unittest.TestCase):
     runtime_limits = RuntimeTorqueLimits.from_controller_params(source)
     self.assertFalse(runtime_limits.production_envelope_verified)
 
+  def test_driver_allowance_rejects_hidden_human_rack_input(self):
+    runtime_limits = limits()
+    self.assertFalse(runtime_limits.driver_exceeds_allowance(50.0))
+    self.assertTrue(runtime_limits.driver_exceeds_allowance(51.0))
+    self.assertTrue(runtime_limits.driver_exceeds_allowance(float("nan")))
+
   def test_build_release_sign_crossing_and_saturation(self):
     cases = (
       (0, 100, 4),

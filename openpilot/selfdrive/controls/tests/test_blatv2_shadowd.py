@@ -327,6 +327,54 @@ def test_repeated_shadow_trace_is_byte_exact_when_timing_is_excluded() -> None:
   assert messages[0] == messages[1]
 
 
+def test_shadow_signs_unsigned_rack_rate_from_angle_motion() -> None:
+  runner, cp = build_runner()
+  messages = build_vehicle_messages(cp)
+  messages[0].steeringRateDeg = 8.0
+  origin_ns = 10_000_000_000
+  result = None
+  for frame, angle in enumerate((0.0, -0.1, -0.2)):
+    messages[0].steeringAngleDeg = angle
+    control_ns = origin_ns + 200_000_000 + frame * 10_000_000
+    result = runner.update(
+      state_sample_mono_ns=control_ns - 5_000_000,
+      control_witness_mono_ns=control_ns,
+      model_publication_mono_ns=control_ns - 10_000_000,
+      model_message=build_model(frame_id=100 + frame, origin_ns=origin_ns),
+      car_state=messages[0],
+      car_control=messages[1],
+      car_output=messages[2],
+      selfdrive_state=messages[3],
+      live_parameters=messages[4],
+      model_message_valid=True,
+      model_message_alive=True,
+      vehicle_inputs_valid=True,
+      live_parameters_inputs_valid=True,
+    )
+
+  assert result is not None and result.valid
+  assert result.measured_rate_deg_s == -8.0
+  assert runner.measured_acceleration_deg_s2 == 0.0
+
+  messages[4].steerRatio = -1.0
+  runner.update(
+    state_sample_mono_ns=origin_ns + 225_000_000,
+    control_witness_mono_ns=origin_ns + 230_000_000,
+    model_publication_mono_ns=origin_ns + 220_000_000,
+    model_message=build_model(frame_id=103, origin_ns=origin_ns),
+    car_state=messages[0],
+    car_control=messages[1],
+    car_output=messages[2],
+    selfdrive_state=messages[3],
+    live_parameters=messages[4],
+    model_message_valid=True,
+    model_message_alive=True,
+    vehicle_inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  assert not runner.lateral_valid
+
+
 def test_invalid_model_clears_plan_and_publishes_invalid_without_crashing() -> None:
   runner, cp = build_runner()
   control_ns, _ = run_valid_core_frame(runner, cp)

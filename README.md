@@ -31,6 +31,14 @@ samples may prepare reachable authority but may not move the path earlier to
 hide delay. This item remains in progress until replay, safety, timing, and
 owner field testing are complete.
 
+**Signed rack-input correction — in progress.** Palisade `SAS_Speed` is an
+unsigned 4 deg/s magnitude. Live control, shadow, behavior replay, and TRAIN
+transient decoding now reuse one angle-motion normalizer instead of treating
+that magnitude as signed rack motion. Driver contact, standstill, mapping loss,
+faults, CAN gaps, and cadence gaps clear its history. Existing TRAIN gates stay
+unchanged; the corrected TRAIN-only transient freeze must still pass before any
+held-out evaluation or field claim.
+
 **30 m/s field-trial authority — owner authorized, in progress.** The terminal
 30 m/s node and its 20–30 m/s authority interpolation may retain the exact
 reviewed seed with one independent maximum-authority route. This exception

@@ -640,7 +640,9 @@ class ModularLiveController:
     *,
     state_sample_mono_ns: int,
     car_state: Any,
+    live_parameters: Any,
     inputs_valid: bool,
+    live_parameters_inputs_valid: bool,
   ) -> None:
     """Warm only the measured-rate derivative while no engagement is bound."""
     if self.enabled_bound or self.adapter is None:
@@ -648,7 +650,9 @@ class ModularLiveController:
     self.adapter.observe_inactive_state(
       state_sample_mono_ns=state_sample_mono_ns,
       car_state=car_state,
+      live_parameters=live_parameters,
       inputs_valid=inputs_valid,
+      live_parameters_inputs_valid=live_parameters_inputs_valid,
     )
 
   def _stock_decision(self) -> EngagementDecision:

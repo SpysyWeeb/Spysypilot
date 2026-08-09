@@ -524,11 +524,16 @@ def replace_route_evidence(
   *,
   source: RouteEvidenceSourceIdentity | None = None,
   witnesses: tuple[ControlsWitness, ...] | None = None,
+  physical_frames: tuple[MeasuredLearningFrame, ...] | None = None,
 ) -> RouteEvidenceArtifact:
   return RouteEvidenceArtifact(
     artifact.source_identity if source is None else source,
     bytes(artifact.car_params_bytes),
-    bytes(artifact.physical_bytes),
+    (
+      bytes(artifact.physical_bytes)
+      if physical_frames is None
+      else b"".join(_encode_frame(frame) for frame in physical_frames)
+    ),
     artifact.model_publications,
     artifact.control_witnesses if witnesses is None else witnesses,
     artifact.live_torque_parameters,
@@ -728,6 +733,13 @@ def test_replay_frame_input_roundtrip_is_exact_and_strict() -> None:
   assert restored == original
   assert math.copysign(1.0, restored.recorded_rack_angle_deg) == -1.0
   assert restored.to_bytes() == encoded
+  old_schema = encoded.replace(b'"schemaVersion":2', b'"schemaVersion":1')
+  try:
+    ReplayFrameInput.from_bytes(old_schema)
+  except BehaviorReplayError as error:
+    assert "schema is incompatible" in str(error)
+  else:
+    raise AssertionError("prior replay-input semantics were accepted")
   with patch("json.loads", return_value={"schemaVersion": 1}):
     try:
       ReplayFrameInput.from_bytes(encoded)
@@ -800,6 +812,64 @@ def test_decoder_preserves_inactive_premodel_prefix_and_exact_links() -> None:
   assert active.live_torque_inputs_valid
   assert decoded.event_locators[0].event_type == "lat.turnStopTurn"
   assert decoded.route_evidence_sha256 == artifact.sha256
+
+
+def test_decoder_signs_unsigned_rate_and_keeps_reversal_cadence() -> None:
+  base = route_evidence_with_inactive_premodel_prefix()
+  original = tuple(base.iter_physical_frames())
+  frames = tuple(
+    replace(
+      frame,
+      steering_angle_deg=angle,
+      steering_rate_deg_s=8.0,
+    )
+    for frame, angle in zip(
+      original,
+      (0.0, -0.1, 0.0, 0.1),
+      strict=True,
+    )
+  )
+  artifact = replace_route_evidence(base, physical_frames=frames)
+  decoded = make_behavior_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )(artifact, physical_profile())
+  inputs = tuple(
+    ReplayFrameInput.from_bytes(control.core_input)
+    for control in decoded.control_inputs
+  )
+
+  assert inputs[1].recorded_rack_rate_deg_s == -8.0
+  assert inputs[1].recorded_rack_acceleration_deg_s2 == 0.0
+  assert inputs[1].control_cadence_valid
+  assert inputs[2].recorded_rack_rate_deg_s == 8.0
+  assert inputs[2].recorded_rack_acceleration_deg_s2 == 0.0
+  assert inputs[2].control_cadence_valid
+
+
+def test_decoder_does_not_bridge_live_mapping_dropout() -> None:
+  base = route_evidence_with_inactive_premodel_prefix()
+  frames = tuple(base.iter_physical_frames())
+  artifact = replace_route_evidence(
+    base,
+    physical_frames=(
+      frames[0],
+      frames[1],
+      replace(frames[2], live_parameters_valid=False),
+      frames[3],
+    ),
+  )
+  decoder = make_behavior_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )
+
+  try:
+    decoder(artifact, physical_profile())
+  except BehaviorReplayError as error:
+    assert "signed rack motion" in str(error)
+  else:
+    raise AssertionError("mapping dropout bridged signed rack history")
 
 
 def test_scenario_decoder_preserves_unverified_recorded_source_without_relabeling() -> None:
