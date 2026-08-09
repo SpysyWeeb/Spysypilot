@@ -5,10 +5,16 @@ import math
 from pathlib import Path
 import unittest
 
+from openpilot.selfdrive.controls.lib.blatv2.actuator import RuntimeTorqueLimits
 from openpilot.selfdrive.controls.lib.blatv2.core import (
   CoreResult,
   CoreStatus,
   ModularControllerCore,
+)
+from openpilot.selfdrive.controls.lib.blatv2.horizon import (
+  HORIZON_SAMPLE_COUNT,
+  HorizonPolicy,
+  HorizonStatus,
 )
 from openpilot.selfdrive.controls.lib.blatv2.intent import (
   INTENT_CAPACITY,
@@ -40,6 +46,17 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 
 
 DT = 0.01
+POLICY_PATH = Path(__file__).parents[1] / "lib" / "blatv2" / "provisional_horizon_policy.json"
+LIMITS = RuntimeTorqueLimits(
+  steer_max=409,
+  delta_up=4,
+  delta_down=7,
+  steer_step=1,
+  driver_allowance=50,
+  driver_multiplier=2,
+  driver_factor=1,
+  production_envelope_verified=True,
+)
 
 
 def mapping(*, valid: bool = True) -> RackMappingSnapshot:
@@ -122,7 +139,7 @@ def plan_values(
   constant_curvature: float | None = None,
   constant_speed: bool = False,
 ) -> tuple[list[float], list[float], list[float], list[float]]:
-  times = [index * 0.05 for index in range(21)]
+  times = [index * 0.1 for index in range(INTENT_CAPACITY)]
   speeds = (
     [planned_speed] * len(times)
     if constant_speed
@@ -211,6 +228,8 @@ def make_core(
     tracking_policy=TrackingPolicy(6.0),
     observer_policy=observer_policy,
     nominal_mapping=mapping(),
+    runtime_limits=LIMITS,
+    horizon_policy=HorizonPolicy.from_json_file(POLICY_PATH),
     plan_capacity=INTENT_CAPACITY,
   )
 
@@ -225,13 +244,17 @@ def update_core(
   measured_angle: float = 0.0,
   measured_rate: float = 0.0,
   measured_acceleration: float = 0.0,
+  previous_command_counts: int = 0,
   applied_torque: float = 0.0,
+  driver_torque: float = 0.0,
   live: RackMappingSnapshot | None = None,
   lateral_active: bool = True,
   lateral_valid: bool = True,
   engagement_boundary: bool = False,
   live_parameters_valid: bool = True,
   steering_pressed: bool = False,
+  steering_request_counter: int = 0,
+  steering_request_state_valid: bool = True,
   actuator_constrained: bool = False,
   output_constrained: bool = False,
   standstill: bool = False,
@@ -247,7 +270,9 @@ def update_core(
     measured_rack_angle_deg=measured_angle,
     measured_rack_rate_deg_s=measured_rate,
     measured_rack_acceleration_deg_s2=measured_acceleration,
+    previous_command_counts=previous_command_counts,
     recorded_applied_torque=applied_torque,
+    driver_torque=driver_torque,
     lateral_accel_offset=0.0,
     live_mapping=mapping() if live is None else live,
     lateral_active=lateral_active,
@@ -255,6 +280,8 @@ def update_core(
     engagement_boundary=engagement_boundary,
     live_parameters_valid=live_parameters_valid,
     steering_pressed=steering_pressed,
+    steering_request_fault_avoidance_counter=steering_request_counter,
+    steering_request_state_valid=steering_request_state_valid,
     actuator_constrained=actuator_constrained,
     output_constrained=output_constrained,
     standstill=standstill,
@@ -262,6 +289,156 @@ def update_core(
 
 
 class TestBLaTv2Core(unittest.TestCase):
+  def test_horizon_identity_and_effect_time_grid_are_exact(self) -> None:
+    profile = vehicle_profile(delays=(0.1,) * 6)
+    adaptation, outputs, _ = adapted_intent(profile)
+    core = make_core(profile)
+    core.prime_applied_history(0.0)
+    result = update_core(core, adaptation, outputs)
+
+    self.assertTrue(result.valid)
+    self.assertIs(core.horizon.profile, core.profile)
+    self.assertIs(core.horizon.tracking_policy, core.tracking_policy)
+    self.assertIs(core.horizon.nominal_mapping, core.nominal_mapping)
+    self.assertIs(core.horizon.limits, core.runtime_limits)
+    self.assertIs(core.horizon.horizon_policy, core.horizon_policy)
+    self.assertEqual(len(core._query_times), HORIZON_SAMPLE_COUNT)
+    for index in range(HORIZON_SAMPLE_COUNT):
+      expected = result.physical_effect_plan_s + index * DT
+      self.assertEqual(core._query_times[index], expected)
+      self.assertEqual(core._reference_times[index], expected)
+    self.assertEqual(
+      core._query_times[-1],
+      result.physical_effect_plan_s + 2.0,
+    )
+
+  def test_raw_inverse_and_exact_planned_count_remain_separate(self) -> None:
+    profile = vehicle_profile()
+    adaptation, outputs, _ = adapted_intent(
+      profile,
+      scalar_curvature=0.08,
+      constant_curvature=0.08,
+      constant_speed=True,
+    )
+    core = make_core(profile)
+    calls = 0
+    horizon_update = core.horizon.update
+
+    def counted_horizon(**kwargs):
+      nonlocal calls
+      calls += 1
+      return horizon_update(**kwargs)
+
+    core.horizon.update = counted_horizon  # type: ignore[method-assign]
+    result = update_core(
+      core,
+      adaptation,
+      outputs,
+      scalar_curvature=0.08,
+    )
+
+    self.assertEqual(calls, 1)
+    self.assertTrue(result.valid)
+    self.assertTrue(result.horizon_valid)
+    self.assertIn(
+      result.horizon_status,
+      (
+        int(HorizonStatus.OK),
+        int(HorizonStatus.FUTURE_CONSTRAINED),
+      ),
+    )
+    self.assertNotEqual(result.raw_torque, result.planned_torque)
+    self.assertEqual(abs(result.planned_counts), LIMITS.delta_up)
+    self.assertEqual(
+      result.planned_torque,
+      result.planned_counts / LIMITS.steer_max,
+    )
+    self.assertEqual(
+      result.raw_requested_counts - result.planned_counts,
+      result.raw_to_planned_residual_counts,
+    )
+    self.assertEqual(
+      result.raw_torque - result.planned_torque,
+      result.raw_to_planned_unmet_torque,
+    )
+    self.assertTrue(result.raw_to_planned_constrained)
+
+  def test_command_markov_state_and_physical_history_are_independent(self) -> None:
+    profile = vehicle_profile(delays=(0.02,) * 6)
+    adaptation, outputs, _ = adapted_intent(
+      profile,
+      scalar_curvature=0.0,
+      constant_curvature=0.0,
+      constant_speed=True,
+    )
+
+    request_off = make_core(profile)
+    neutral = make_core(profile)
+    physically_applied = make_core(profile)
+    request_off.prime_applied_history(0.0)
+    neutral.prime_applied_history(0.0)
+    physically_applied.prime_applied_history(100 / LIMITS.steer_max)
+    off_result = update_core(
+      request_off,
+      adaptation,
+      outputs,
+      scalar_curvature=0.0,
+      previous_command_counts=100,
+      applied_torque=0.0,
+    )
+    neutral_result = update_core(
+      neutral,
+      adaptation,
+      outputs,
+      scalar_curvature=0.0,
+      previous_command_counts=0,
+      applied_torque=0.0,
+    )
+    applied_result = update_core(
+      physically_applied,
+      adaptation,
+      outputs,
+      scalar_curvature=0.0,
+      previous_command_counts=100,
+      applied_torque=100 / LIMITS.steer_max,
+    )
+
+    self.assertTrue(off_result.valid)
+    self.assertTrue(neutral_result.valid)
+    self.assertTrue(applied_result.valid)
+    self.assertEqual(off_result.predicted_angle_deg, neutral_result.predicted_angle_deg)
+    self.assertEqual(off_result.predicted_rate_deg_s, neutral_result.predicted_rate_deg_s)
+    self.assertNotEqual(off_result.planned_counts, neutral_result.planned_counts)
+    self.assertNotEqual(off_result.predicted_angle_deg, applied_result.predicted_angle_deg)
+
+  def test_horizon_failure_invalidates_instead_of_using_raw_request(self) -> None:
+    profile = vehicle_profile()
+    adaptation, outputs, _ = adapted_intent(profile)
+    core = make_core(profile)
+
+    def failed_horizon(**_kwargs):
+      core.horizon.result.clear(HorizonStatus.PLANT_FAILURE)
+      return core.horizon.result
+
+    core.horizon.update = failed_horizon  # type: ignore[method-assign]
+    result = update_core(core, adaptation, outputs)
+    self.assertFalse(result.valid)
+    self.assertEqual(result.status, CoreStatus.HORIZON_FAILURE)
+    self.assertNotEqual(result.raw_torque, 0.0)
+    self.assertEqual(result.planned_torque, 0.0)
+
+    raising_core = make_core(profile)
+
+    def raising_horizon(**_kwargs):
+      raise ValueError("synthetic horizon failure")
+
+    raising_core.horizon.update = raising_horizon  # type: ignore[method-assign]
+    raised = update_core(raising_core, adaptation, outputs)
+    self.assertFalse(raised.valid)
+    self.assertEqual(raised.status, CoreStatus.HORIZON_FAILURE)
+    self.assertNotEqual(raised.raw_torque, 0.0)
+    self.assertEqual(raised.planned_torque, 0.0)
+
   def test_reference_query_before_at_and_after_scalar_action_is_anchored(self) -> None:
     profile = vehicle_profile()
     scalar = 0.012
@@ -411,7 +588,7 @@ class TestBLaTv2Core(unittest.TestCase):
     self.assertEqual(aged.prediction_history_count, 3)
     self.assertAlmostEqual(aged.prediction_fractional_dt_s, 0.005)
 
-  def test_scalar_only_fallback_is_finite_and_not_stale(self) -> None:
+  def test_malformed_future_is_explicit_and_fails_closed(self) -> None:
     profile = vehicle_profile()
     adaptation, outputs, _ = adapted_intent(
       profile, malformed_future=True,
@@ -419,13 +596,12 @@ class TestBLaTv2Core(unittest.TestCase):
     self.assertTrue(adaptation.status.scalar_only)
     core = make_core(profile)
     result = update_core(core, adaptation, outputs)
-    self.assertTrue(result.valid)
-    self.assertEqual(result.status, CoreStatus.DEGRADED_SCALAR_ONLY)
+    self.assertFalse(result.valid)
+    self.assertEqual(result.status, CoreStatus.REFERENCE_FAILURE)
     self.assertTrue(result.reference_scalar_only)
-    self.assertEqual(result.desired_curvature, 0.012)
-    self.assertEqual(result.desired_curvature_rate, 0.0)
-    self.assertEqual(result.desired_curvature_acceleration, 0.0)
-    self.assertTrue(math.isfinite(result.raw_torque))
+    self.assertFalse(result.horizon_valid)
+    self.assertEqual(result.raw_torque, 0.0)
+    self.assertEqual(result.planned_torque, 0.0)
 
   def test_existing_reference_mapper_and_inverse_reach_core_unchanged(self) -> None:
     profile = vehicle_profile()
@@ -852,6 +1028,7 @@ class TestBLaTv2Core(unittest.TestCase):
       "DT_MDL",
       "LAT_SMOOTH_SECONDS",
       "liveDelay",
+      "LatControlTorque",
       "BLaTv1",
       "v14",
     ):
@@ -859,6 +1036,8 @@ class TestBLaTv2Core(unittest.TestCase):
     signature = inspect.signature(ModularControllerCore)
     self.assertIs(signature.parameters["tracking_policy"].default, inspect.Parameter.empty)
     self.assertIs(signature.parameters["observer_policy"].default, inspect.Parameter.empty)
+    self.assertIs(signature.parameters["runtime_limits"].default, inspect.Parameter.empty)
+    self.assertIs(signature.parameters["horizon_policy"].default, inspect.Parameter.empty)
 
 
 if __name__ == "__main__":

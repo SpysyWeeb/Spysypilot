@@ -1512,7 +1512,7 @@ def test_route_evidence_is_not_durable_until_both_authorities_match(
     authority_index=1,
     artifact=evidence,
   )
-  assert not (tmp_path / "route_evidence_v2").exists()
+  assert not (tmp_path / "route_evidence_v4").exists()
 
   learning_backfill._stage_route_evidence(
     root=tmp_path,
@@ -1527,10 +1527,10 @@ def test_route_evidence_is_not_durable_until_both_authorities_match(
   )
 
   stored = learning_backfill.RouteEvidenceStore(
-    tmp_path / "route_evidence_v2",
+    tmp_path / "route_evidence_v4",
   ).load(evidence.sha256)
   assert stored.canonical_bytes == evidence.canonical_bytes
-  assert not (tmp_path / ".route-evidence-staging-v2").exists()
+  assert not (tmp_path / ".route-evidence-staging-v4").exists()
 
 
 def test_stale_route_evidence_staging_is_bounded_and_quarantined(

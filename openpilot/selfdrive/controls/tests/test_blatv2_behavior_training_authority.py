@@ -909,10 +909,8 @@ class TestBehaviorTrainingAuthority(unittest.TestCase):
     calls = tuple((
       _WorkerRoute(f"{index:08x}--{index:010x}"),
     ) for index in range(12, 0, -1))
-    target = "openpilot.selfdrive.controls.lib.blatv2.behavior_training_authority._evaluate_policies_for_route_for_test"
-    with patch(target, new=_fake_worker):
-      one = _ordered_map_for_test(calls, 1, None)
-      four = _ordered_map_for_test(calls, 4, None)
+    one = _ordered_map_for_test(calls, 1, None, worker=_fake_worker)
+    four = _ordered_map_for_test(calls, 4, None, worker=_fake_worker)
     self.assertEqual(one, four)
     self.assertEqual(tuple(row.route_id for row in four), tuple(sorted(row.route_id for row in four)))
 

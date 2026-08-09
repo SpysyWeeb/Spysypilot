@@ -37,6 +37,10 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   VehicleCalibrationProfile,
 )
+from openpilot.selfdrive.controls.lib.blatv2.device_acceptance import (
+  DeviceAcceptanceError,
+  DeviceAcceptanceReceipt,
+)
 from openpilot.selfdrive.controls.lib.blatv2.feedback import (
   FEEDBACK_REQUEST_PARAM,
   FEEDBACK_RESPONSE_PARAM,
@@ -50,7 +54,7 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 )
 
 
-APPROVED_ARTIFACT_SCHEMA_VERSION = 5
+APPROVED_ARTIFACT_SCHEMA_VERSION = 7
 CALIBRATION_SELECTION_SCHEMA_VERSION = 2
 ACTIVATION_STATE_SCHEMA_VERSION = 1
 APPROVED_ARTIFACT_PARAM = "BLaTv2ApprovedArtifact"
@@ -66,6 +70,7 @@ _ARTIFACT_KEYS = frozenset((
   "calibrationProfileSha256",
   "controllerPolicyJson",
   "controllerPolicySha256",
+  "horizonPolicySha256",
   "runtimeVehicleIdentitySha256",
   "sourceOpenpilotCommit",
   "opendbcCommit",
@@ -79,9 +84,9 @@ _ARTIFACT_KEYS = frozenset((
   "replayHarnessCommit",
   "replayPassed",
   "deliveredReplayPassed",
-  "safetyPassed",
   "deterministicAaPassed",
-  "deviceTimingPassed",
+  "deviceAcceptanceReceiptJson",
+  "deviceAcceptanceReceiptSha256",
   "smoothPassed",
   "swiftPassed",
   "strongPassed",
@@ -141,6 +146,10 @@ class ArtifactDiagnostic(StrEnum):
   POLICY_HASH_MISMATCH = "policy_hash_mismatch"
   CALIBRATION_PROOF_MISMATCH = "calibration_proof_mismatch"
   BEHAVIOR_PROOF_MISMATCH = "behavior_proof_mismatch"
+  DEVICE_ACCEPTANCE_PROOF_MISMATCH = "device_acceptance_proof_mismatch"
+  EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE = (
+    "external_safety_authority_unavailable"
+  )
   UNQUALIFIED_PROFILE = "unqualified_profile"
   PROVISIONAL_POLICY = "provisional_policy"
   VEHICLE_MISMATCH = "vehicle_mismatch"
@@ -513,6 +522,24 @@ def _behavior_finalization_from_canonical_json(
   return finalization
 
 
+def _device_acceptance_from_canonical_json(
+  encoded: object,
+) -> DeviceAcceptanceReceipt:
+  if type(encoded) is not str:
+    _fail(
+      ArtifactDiagnostic.MALFORMED,
+      "deviceAcceptanceReceiptJson must be text",
+    )
+  try:
+    receipt = DeviceAcceptanceReceipt.from_json(encoded)
+  except DeviceAcceptanceError as error:
+    raise ArtifactValidationError(
+      ArtifactDiagnostic.MALFORMED,
+      "deviceAcceptanceReceiptJson is invalid",
+    ) from error
+  return receipt
+
+
 def _controller_profile_matches_calibration(
   controller: VehicleProfile,
   calibration: VehicleCalibrationProfile,
@@ -583,8 +610,11 @@ class ApprovedProfileArtifact:
   five-metric gates passed. ``delivered_replay_passed`` is deliberately
   separate: it proves the vehicle/twin delivered-curvature gates rather than
   allowing a command-space pass to imply physical path authority.
-  ``device_timing_passed`` is also independent because only timing measured on
-  comma hardware can approve the runtime budget. ``smooth_passed``,
+  Device timing/comms is carried by a content-addressed route-evidence
+  receipt; no caller boolean can approve the runtime budget. External safety
+  authority remains unresolved, so persisted production activation fails
+  closed while candidate bundles remain parseable for offline inspection.
+  ``smooth_passed``,
   ``swift_passed``, and ``strong_passed`` are independent behavioral contracts:
   no aggregate score may trade one product value for another. The exact
   behavioral selection evidence is bound by the canonical behavioral
@@ -597,6 +627,7 @@ class ApprovedProfileArtifact:
   vehicle_profile: VehicleProfile
   calibration_profile: VehicleCalibrationProfile
   controller_policy: ControllerPolicy
+  horizon_policy_sha256: str
   runtime_vehicle_identity_sha256: str
   source_openpilot_commit: str
   opendbc_commit: str
@@ -606,9 +637,8 @@ class ApprovedProfileArtifact:
   replay_harness_commit: str
   replay_passed: bool
   delivered_replay_passed: bool
-  safety_passed: bool
   deterministic_aa_passed: bool
-  device_timing_passed: bool
+  device_acceptance_receipt: DeviceAcceptanceReceipt
   smooth_passed: bool
   swift_passed: bool
   strong_passed: bool
@@ -631,6 +661,7 @@ class ApprovedProfileArtifact:
     _strict_commit(self.opendbc_commit, "opendbcCommit")
     _strict_commit(self.panda_commit, "pandaCommit")
     _strict_commit(self.replay_harness_commit, "replayHarnessCommit")
+    _strict_sha256(self.horizon_policy_sha256, "horizonPolicySha256")
     if not isinstance(self.vehicle_profile, VehicleProfile):
       _fail(
         ArtifactDiagnostic.MALFORMED,
@@ -671,9 +702,7 @@ class ApprovedProfileArtifact:
     gates = (
       self.replay_passed,
       self.delivered_replay_passed,
-      self.safety_passed,
       self.deterministic_aa_passed,
-      self.device_timing_passed,
       self.smooth_passed,
       self.swift_passed,
       self.strong_passed,
@@ -687,6 +716,20 @@ class ApprovedProfileArtifact:
       _fail(
         ArtifactDiagnostic.GATE_FAILED,
         "every artifact acceptance gate must pass",
+      )
+    if not isinstance(
+      self.device_acceptance_receipt,
+      DeviceAcceptanceReceipt,
+    ):
+      _fail(
+        ArtifactDiagnostic.MALFORMED,
+        "device acceptance receipt has the wrong type",
+      )
+    receipt = self.device_acceptance_receipt
+    if not receipt.passed:
+      _fail(
+        ArtifactDiagnostic.GATE_FAILED,
+        "device timing/comms acceptance did not pass",
       )
     if not isinstance(
       self.calibration_selection_manifest,
@@ -747,6 +790,35 @@ class ApprovedProfileArtifact:
         ArtifactDiagnostic.BEHAVIOR_PROOF_MISMATCH,
         "artifact behavioral gates disagree with the finalization proof",
       )
+    if (
+      receipt.vehicle_identity != self.vehicle_profile.vehicle_identity
+      or not hmac.compare_digest(
+        receipt.source_openpilot_commit,
+        self.source_openpilot_commit,
+      )
+      or not hmac.compare_digest(receipt.opendbc_commit, self.opendbc_commit)
+      or not hmac.compare_digest(receipt.panda_commit, self.panda_commit)
+      or not hmac.compare_digest(
+        receipt.runtime_identity_sha256,
+        self.runtime_vehicle_identity_sha256,
+      )
+      or not hmac.compare_digest(
+        receipt.profile_sha256,
+        self.vehicle_profile_sha256,
+      )
+      or not hmac.compare_digest(
+        receipt.controller_policy_sha256,
+        self.controller_policy_sha256,
+      )
+      or not hmac.compare_digest(
+        receipt.horizon_policy_sha256,
+        self.horizon_policy_sha256,
+      )
+    ):
+      _fail(
+        ArtifactDiagnostic.DEVICE_ACCEPTANCE_PROOF_MISMATCH,
+        "device acceptance receipt names another controller identity",
+      )
 
   @property
   def vehicle_profile_sha256(self) -> str:
@@ -780,6 +852,7 @@ class ApprovedProfileArtifact:
       "calibrationProfileSha256": self.calibration_profile_sha256,
       "controllerPolicyJson": self.controller_policy.to_json(),
       "controllerPolicySha256": self.controller_policy_sha256,
+      "horizonPolicySha256": self.horizon_policy_sha256,
       "runtimeVehicleIdentitySha256": (
         self.runtime_vehicle_identity_sha256
       ),
@@ -799,9 +872,13 @@ class ApprovedProfileArtifact:
       "replayHarnessCommit": self.replay_harness_commit,
       "replayPassed": self.replay_passed,
       "deliveredReplayPassed": self.delivered_replay_passed,
-      "safetyPassed": self.safety_passed,
       "deterministicAaPassed": self.deterministic_aa_passed,
-      "deviceTimingPassed": self.device_timing_passed,
+      "deviceAcceptanceReceiptJson": (
+        self.device_acceptance_receipt.to_json()
+      ),
+      "deviceAcceptanceReceiptSha256": (
+        self.device_acceptance_receipt.sha256
+      ),
       "smoothPassed": self.smooth_passed,
       "swiftPassed": self.swift_passed,
       "strongPassed": self.strong_passed,
@@ -840,6 +917,10 @@ class ApprovedProfileArtifact:
       payload["controllerPolicySha256"],
       "controllerPolicySha256",
     )
+    horizon_policy_hash = _strict_sha256(
+      payload["horizonPolicySha256"],
+      "horizonPolicySha256",
+    )
     profile = _profile_from_canonical_json(
       payload["vehicleProfileJson"],
       expected_vehicle_identity,
@@ -865,6 +946,13 @@ class ApprovedProfileArtifact:
     behavior_finalization = _behavior_finalization_from_canonical_json(
       payload["behaviorFinalizationJson"],
     )
+    device_acceptance_hash = _strict_sha256(
+      payload["deviceAcceptanceReceiptSha256"],
+      "deviceAcceptanceReceiptSha256",
+    )
+    device_acceptance = _device_acceptance_from_canonical_json(
+      payload["deviceAcceptanceReceiptJson"],
+    )
     if not hmac.compare_digest(
       profile_hash,
       _sha256_text(profile.to_json()),
@@ -885,6 +973,19 @@ class ApprovedProfileArtifact:
       _fail(
         ArtifactDiagnostic.POLICY_HASH_MISMATCH,
         "controller policy hash does not match its JSON",
+      )
+    if not hmac.compare_digest(
+      device_acceptance_hash,
+      device_acceptance.sha256,
+    ):
+      _fail(
+        ArtifactDiagnostic.DEVICE_ACCEPTANCE_PROOF_MISMATCH,
+        "device acceptance receipt hash does not match its JSON",
+      )
+    if not device_acceptance.passed:
+      _fail(
+        ArtifactDiagnostic.GATE_FAILED,
+        "device timing/comms acceptance did not pass",
       )
     if not hmac.compare_digest(
       calibration_manifest_hash,
@@ -934,6 +1035,7 @@ class ApprovedProfileArtifact:
       vehicle_profile=profile,
       calibration_profile=calibration_profile,
       controller_policy=policy,
+      horizon_policy_sha256=horizon_policy_hash,
       runtime_vehicle_identity_sha256=_strict_sha256(
         payload["runtimeVehicleIdentitySha256"],
         "runtimeVehicleIdentitySha256",
@@ -964,18 +1066,11 @@ class ApprovedProfileArtifact:
         payload["deliveredReplayPassed"],
         "deliveredReplayPassed",
       ),
-      safety_passed=_strict_bool(
-        payload["safetyPassed"],
-        "safetyPassed",
-      ),
       deterministic_aa_passed=_strict_bool(
         payload["deterministicAaPassed"],
         "deterministicAaPassed",
       ),
-      device_timing_passed=_strict_bool(
-        payload["deviceTimingPassed"],
-        "deviceTimingPassed",
-      ),
+      device_acceptance_receipt=device_acceptance,
       smooth_passed=_strict_bool(
         payload["smoothPassed"],
         "smoothPassed",
@@ -1072,8 +1167,10 @@ class ApprovedArtifactReader:
     except ArtifactValidationError as exc:
       return ArtifactReadResult(artifact=None, diagnostic=exc.reason)
     return ArtifactReadResult(
-      artifact=artifact,
-      diagnostic=ArtifactDiagnostic.OK,
+      artifact=None,
+      diagnostic=(
+        ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE
+      ),
     )
 
 
@@ -1333,6 +1430,10 @@ class PersistentProfileActivation:
         ArtifactDiagnostic.PANDA_COMMIT_MISMATCH,
         "activation artifact panda commit does not match",
       )
+    _fail(
+      ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE,
+      "external safety approval authority is unavailable",
+    )
 
   def _state_from_param(self, value: object) -> _ActivationState:
     payload = _strict_object(value, _STATE_KEYS, "activation state")
@@ -1469,6 +1570,14 @@ class PersistentProfileActivation:
         self._state = _ActivationState()
         self.diagnostic = ArtifactDiagnostic.STATE_STALE_BUILD
         return
+      if (
+        exc.reason
+        is ArtifactDiagnostic.EXTERNAL_SAFETY_AUTHORITY_UNAVAILABLE
+      ):
+        self._state_valid = False
+        self._state = _ActivationState()
+        self.diagnostic = exc.reason
+        return
       self._state_valid = False
       self._state = _ActivationState()
       self.diagnostic = ArtifactDiagnostic.STATE_INVALID
@@ -1532,6 +1641,10 @@ class PersistentProfileActivation:
     if not self._production_envelope_verified:
       raise RuntimeError(
         "approved artifact requires a verified production actuator envelope",
+      )
+    if not self._state_valid:
+      raise RuntimeError(
+        "invalid persisted activation state must be repaired explicitly",
       )
     reparsed = self._parse_artifact(artifact.to_param())
     if reparsed is None:

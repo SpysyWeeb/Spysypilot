@@ -22,6 +22,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_metrics import (
   BehaviorContract,
   BehaviorMetricConfig,
   BehaviorMetricName,
+  MetricDisposition,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
   PAIRED_ROUTE_UNCERTAINTY_METHOD,
@@ -30,6 +31,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_policy import (
   MetricPreference,
   PolicyEvaluation,
   PolicyMetric,
+  PolicyStratumMetric,
 )
 from openpilot.selfdrive.controls.lib.blatv2.policy import ControllerPolicy
 
@@ -158,6 +160,35 @@ def policy_metric(
   route_ids: tuple[str, ...],
   exclusions: tuple[str, ...] = (),
 ) -> PolicyMetric:
+  disposition = (
+    MetricDisposition.DEFINED
+    if value is not None
+    else MetricDisposition.NOT_APPLICABLE
+    if exclusions == ("no_hold_phase",)
+    else MetricDisposition.COVERAGE_EXCLUDED
+  )
+  stratum_metric = PolicyStratumMetric(
+    stratum="5:turn",
+    value=value,
+    disposition=disposition,
+    exclusions=exclusions,
+    route_count=len(route_ids),
+    window_count=20,
+    weighted_support=20.0,
+    coverage_identity_sha256="f" * 64,
+    physical_failure_window_ids=(),
+    coverage_excluded_window_ids=("fixture/coverage-excluded",)
+    if disposition is MetricDisposition.COVERAGE_EXCLUDED
+    else (),
+    not_applicable_window_ids=("fixture/not-applicable",)
+    if disposition is MetricDisposition.NOT_APPLICABLE
+    else (),
+    route_values=(
+      tuple((route_id, value) for route_id in route_ids)
+      if value is not None
+      else ()
+    ),
+  )
   return PolicyMetric(
     name=name.value,
     value=value,
@@ -168,6 +199,7 @@ def policy_metric(
     weighted_support=20.0,
     coverage_identity_sha256="f" * 64,
     strata=("5:turn",),
+    stratum_metrics=(stratum_metric,),
     physical_failure_window_ids=(),
     route_values=(
       tuple((route_id, value) for route_id in route_ids)

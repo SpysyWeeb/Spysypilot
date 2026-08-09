@@ -58,16 +58,25 @@ def source() -> RouteEvidenceSourceIdentity:
     route_id="000000b7--a6b3b1f175", route_time_origin_mono_ns=900,
     route_segment_sha256=("a" * 64,), route_segment_size_bytes=(1234,),
     source_superproject_commit="1" * 40, source_opendbc_commit="2" * 40,
-    source_panda_commit="3" * 40, controller_source_kind="stock_canonical",
+    source_panda_commit="3" * 40, controller_source_kind="modular_artifact",
     controller_artifact_sha256="4" * 64, behavior_eligible=True,
     behavior_ineligible_reason="eligible", vehicle_identity="HYUNDAI_PALISADE",
     runtime_identity="5" * 64,
-    schema_versions={"extractor": 3, "route_evidence": 2},
+    schema_versions={"extractor": 3, "route_evidence": 4},
     preparation_provenance={"extractor_schema_version": 3},
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=2, preparation_cache_key="6" * 64,
     controls_witness_count=2, unresolved_witness_count=0, gap_count=0,
     model_link_failure_count=0,
+    device_type="tici",
+    controller_architecture="blatv2.modular.preview-rack",
+    recorded_source_openpilot_commit="1" * 40,
+    recorded_opendbc_commit="2" * 40,
+    live_artifact_sha256="7" * 64,
+    recorded_runtime_identity_sha256="5" * 64,
+    recorded_profile_sha256="8" * 64,
+    recorded_controller_policy_sha256="9" * 64,
+    recorded_horizon_policy_sha256="a" * 64,
   )
 
 
@@ -94,6 +103,7 @@ def witness(index: int, raw: float = -0.0) -> ControlsWitness:
     car_control_mono_ns=1_001 + index * 10, raw_request_torque=raw,
     measured_curvature=-0.01, desired_curvature=-0.012,
     envelope_headroom=1.0 - abs(raw), torque_output_can_count=20 + index,
+    steering_request_fault_avoidance_counter=0,
     message_valid=True, model_message_alive=True, model_link_valid=True,
     inputs_valid=True, lateral_active=True, driver_intervening=False,
     steer_fault=False, intervention_onset=False,
@@ -103,6 +113,31 @@ def witness(index: int, raw: float = -0.0) -> ControlsWitness:
     live_torque_parameters_available=True, live_delay_available=True,
     live_torque_parameters_checks_passed=True,
     live_torque_parameters_health_exact=True,
+    steering_request_active=True,
+    steering_request_active_valid=True,
+    steering_request_fault_avoidance_counter_valid=True,
+    modular_compute_time_seconds=0.001 + index * 0.001,
+    modular_control_witness_mono_ns=1_000_000_000 + index * 10_000_000,
+    modular_selection=1,
+    modular_invalid_frames=0,
+    modular_recovery_ok_frames=0,
+    modular_intent_status=0,
+    modular_safety_state=1,
+    modular_telemetry_available=True,
+    modular_active=True,
+    modular_selection_bound=True,
+    modular_controls_valid=True,
+    modular_car_control_valid=True,
+    modular_vehicle_state_valid=True,
+    modular_live_parameters_valid=True,
+    modular_horizon_valid=True,
+    modular_control_cadence_valid=True,
+    modular_adapter_exception=False,
+    modular_production_envelope_verified=True,
+    modular_final_expected_counts=20 + index,
+    modular_final_count_residual=0,
+    modular_final_count_match_valid=True,
+    modular_final_limiter_altered=False,
   )
 
 
@@ -192,12 +227,64 @@ def test_deterministic_roundtrip_and_exact_planes() -> None:
   assert tuple(restored.iter_physical_frames()) == FRAMES
   assert restored.model_publications == first.model_publications
   assert restored.control_witnesses == first.control_witnesses
+  assert restored.control_witnesses[1].modular_final_expected_counts == 21
+  assert restored.control_witnesses[1].modular_final_count_match_valid
   assert restored.live_torque_parameters == TORQUE
   assert restored.live_delays == DELAY
   assert restored.lateral_maneuver_plans == MANEUVER
   assert restored.event_locators == EVENTS
   assert struct.pack("<d", restored.model_publications[0].scalar_curvature) == struct.pack("<Q", 1 << 63)
   assert struct.pack("<d", restored.control_witnesses[0].raw_request_torque) == struct.pack("<Q", 1 << 63)
+
+
+def test_request_cut_roundtrip_preserves_command_and_fit_censor() -> None:
+  cut = replace(
+    witness(0),
+    torque_output_can_count=193,
+    inputs_valid=False,
+    steering_request_active=False,
+    steering_request_active_valid=True,
+    steering_request_fault_avoidance_counter=90,
+    steering_request_fault_avoidance_counter_valid=True,
+  )
+  encoded = route_evidence_module._encode_controls((cut,))
+  restored = route_evidence_module._decode_controls(
+    memoryview(encoded),
+    1,
+  )[0]
+  assert restored.torque_output_can_count == 193
+  assert restored.steering_request_active_valid
+  assert not restored.steering_request_active
+  assert restored.steering_request_fault_avoidance_counter == 90
+  assert restored.steering_request_fault_avoidance_counter_valid
+  assert not restored.inputs_valid
+
+
+def test_v4_control_wire_retains_exact_final_correspondence() -> None:
+  expected = replace(
+    witness(0),
+    modular_final_expected_counts=19,
+    modular_final_count_residual=1,
+    modular_final_count_match_valid=True,
+    modular_final_limiter_altered=True,
+  )
+  encoded = route_evidence_module._encode_controls((expected,))
+  assert len(encoded) == route_evidence_module._CONTROL.size == 185
+  assert route_evidence_module._decode_controls(
+    memoryview(encoded),
+    1,
+  ) == (expected,)
+
+
+def test_physically_valid_control_requires_explicit_active_request() -> None:
+  with pytest.raises(RouteEvidenceError, match="active steering request"):
+    replace(
+      witness(0),
+      steering_request_active=False,
+      steering_request_active_valid=False,
+      steering_request_fault_avoidance_counter=0,
+      steering_request_fault_avoidance_counter_valid=False,
+    )
 
 
 def test_invalid_native_model_grid_is_preserved_empty() -> None:
@@ -227,6 +314,11 @@ def test_rejects_old_spool_and_corrupt_sections() -> None:
     RouteEvidenceArtifact.from_bytes(encoded)
   with pytest.raises(RouteEvidenceError):
     RouteEvidenceArtifact.from_bytes(artifact().canonical_bytes + b"x")
+
+  version_three = bytearray(artifact().canonical_bytes)
+  struct.pack_into("<8sH", version_three, 0, b"BLATRE03", 3)
+  with pytest.raises(RouteEvidenceError, match="unsupported"):
+    RouteEvidenceArtifact.from_bytes(version_three)
 
 
 @pytest.mark.parametrize("mutation", ("noncanonical_bool", "nonfinite_numeric"))

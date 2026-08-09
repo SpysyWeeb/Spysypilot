@@ -54,31 +54,31 @@ class SignedRackMotionNormalizer:
   __slots__ = (
     "_direction",
     "_motion_anchor_angle_deg",
-    "_motion_anchor_time_s",
+    "_motion_anchor_mono_ns",
     "_previous_angle_deg",
+    "_previous_mono_ns",
     "_previous_rate_deg_s",
     "_previous_rate_valid",
-    "_previous_time_s",
     "_raw_signed_episode",
   )
 
   def __init__(self) -> None:
-    self._previous_time_s: float | None = None
+    self._previous_mono_ns: int | None = None
     self._previous_angle_deg = 0.0
     self._previous_rate_deg_s = 0.0
     self._previous_rate_valid = False
     self._direction = 0
-    self._motion_anchor_time_s = 0.0
+    self._motion_anchor_mono_ns = 0
     self._motion_anchor_angle_deg = 0.0
     self._raw_signed_episode = False
 
   def reset(self) -> None:
-    self._previous_time_s = None
+    self._previous_mono_ns = None
     self._previous_angle_deg = 0.0
     self._previous_rate_deg_s = 0.0
     self._previous_rate_valid = False
     self._direction = 0
-    self._motion_anchor_time_s = 0.0
+    self._motion_anchor_mono_ns = 0
     self._motion_anchor_angle_deg = 0.0
     self._raw_signed_episode = False
 
@@ -97,14 +97,14 @@ class SignedRackMotionNormalizer:
   def _seed(
     self,
     *,
-    timestamp: float,
+    sample_mono_ns: int,
     angle: float,
     raw_rate: float,
   ) -> RackMotionObservation:
     magnitude = abs(raw_rate)
-    self._previous_time_s = timestamp
+    self._previous_mono_ns = sample_mono_ns
     self._previous_angle_deg = angle
-    self._motion_anchor_time_s = timestamp
+    self._motion_anchor_mono_ns = sample_mono_ns
     self._motion_anchor_angle_deg = angle
     self._previous_rate_valid = raw_rate <= 0.0
     self._raw_signed_episode = raw_rate < 0.0
@@ -132,55 +132,63 @@ class SignedRackMotionNormalizer:
   def update(
     self,
     *,
-    sample_time_s: float,
+    sample_mono_ns: int,
     steering_angle_deg: float,
     raw_rate_deg_s: float,
     rate_resolution_deg_s: float,
     lifecycle_valid: bool,
-    maximum_gap_s: float,
+    maximum_gap_ns: int,
   ) -> RackMotionObservation:
-    timestamp = float(sample_time_s)
-    angle = float(steering_angle_deg)
-    raw_rate = float(raw_rate_deg_s)
-    resolution = float(rate_resolution_deg_s)
-    maximum_gap = float(maximum_gap_s)
+    try:
+      timestamp_ns = int(sample_mono_ns)
+      maximum_gap = int(maximum_gap_ns)
+      angle = float(steering_angle_deg)
+      raw_rate = float(raw_rate_deg_s)
+      resolution = float(rate_resolution_deg_s)
+    except (TypeError, ValueError, OverflowError):
+      self.reset()
+      return self._invalid(RackMotionSource.RESET)
     if (
       not lifecycle_valid
+      or isinstance(sample_mono_ns, bool)
+      or isinstance(maximum_gap_ns, bool)
+      or timestamp_ns != sample_mono_ns
+      or maximum_gap != maximum_gap_ns
+      or timestamp_ns < 0
       or not all(math.isfinite(value) for value in (
-        timestamp,
         angle,
         raw_rate,
         resolution,
-        maximum_gap,
       ))
       or resolution < 0.0
-      or maximum_gap <= 0.0
+      or maximum_gap <= 0
     ):
       self.reset()
       return self._invalid(RackMotionSource.RESET)
 
-    if self._previous_time_s is None:
+    if self._previous_mono_ns is None:
       return self._seed(
-        timestamp=timestamp,
+        sample_mono_ns=timestamp_ns,
         angle=angle,
         raw_rate=raw_rate,
       )
 
-    dt_s = timestamp - self._previous_time_s
-    if dt_s == 0.0:
+    dt_ns = timestamp_ns - self._previous_mono_ns
+    if dt_ns == 0:
       # A repeated canonical carState snapshot is not a new physical
       # measurement. Do not advance or destroy the unique-sample history.
       if angle == self._previous_angle_deg:
         return self._invalid(RackMotionSource.UNRESOLVED)
       self.reset()
       return self._invalid(RackMotionSource.DISAGREEMENT)
-    if dt_s < 0.0 or dt_s > maximum_gap:
+    if dt_ns < 0 or dt_ns > maximum_gap:
       self.reset()
       return self._seed(
-        timestamp=timestamp,
+        sample_mono_ns=timestamp_ns,
         angle=angle,
         raw_rate=raw_rate,
       )
+    dt_s = dt_ns * 1e-9
 
     magnitude = abs(raw_rate)
     previous_direction = self._direction
@@ -193,7 +201,7 @@ class SignedRackMotionNormalizer:
       sign_valid = True
       source = RackMotionSource.ZERO
       self._raw_signed_episode = False
-      self._motion_anchor_time_s = timestamp
+      self._motion_anchor_mono_ns = timestamp_ns
       self._motion_anchor_angle_deg = angle
     elif raw_rate < 0.0:
       direction = -1
@@ -222,7 +230,7 @@ class SignedRackMotionNormalizer:
         source = RackMotionSource.CONTINUOUS_HOLD
       sign_valid = True
     else:
-      elapsed_s = timestamp - self._motion_anchor_time_s
+      elapsed_s = (timestamp_ns - self._motion_anchor_mono_ns) * 1e-9
       angle_delta = angle - self._motion_anchor_angle_deg
       minimum_angle_motion = 0.5 * resolution * elapsed_s
       if (
@@ -251,7 +259,7 @@ class SignedRackMotionNormalizer:
       else 0.0
     )
 
-    self._previous_time_s = timestamp
+    self._previous_mono_ns = timestamp_ns
     self._previous_angle_deg = angle
     self._previous_rate_deg_s = signed_rate
     self._previous_rate_valid = sign_valid

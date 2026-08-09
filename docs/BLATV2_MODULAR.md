@@ -21,13 +21,16 @@ and runs no BLaTv2 learner, historical replay, route uploader, Wi-Fi bridge, or
 local-processing fallback. An operator copies closed routes over read-only SSH
 into durable PC storage. The PC owns deterministic A/A replay, physical and
 behavioral qualification, and informational candidate generation. A candidate
-has no activation path until separate manual review, installation, and the
-remaining controller gates authorize that exact artifact.
+has no approved activation path until separate manual review, installation,
+and the remaining controller gates authorize that exact artifact. The
+Palisade-only development parameter is a distinct owner-trial path for the
+bundled provisional tune; it leaves every approval gate intact.
 
-The present field build does not actuate this modular core. With no separately
-approved artifact, controlsd constructs and runs the exact stock openpilot
-torque controller, not a stock-shaped approximation or a modular controller
-with stock values. The retired LQI design is also absent. **LQI** means
+The present field build actuates this modular core only when that development
+parameter was enabled offroad and the Palisade/runtime checks pass. Otherwise
+controlsd constructs and runs the exact stock openpilot torque controller, not
+a stock-shaped approximation or a modular controller with stock values. The
+retired LQI design is also absent. **LQI** means
 **Linear Quadratic Integral**: state feedback chosen from a mathematical
 tracking/effort cost with an accumulated integral-error state. It is documented
 only to make clear that neither its state nor its gain schedules are inherited.
@@ -350,10 +353,11 @@ The committed storage/wire identities are:
 | calibration profile / evidence / coordinator | 2 / 9 / 9 |
 | runtime vehicle / calibration identity / provisional dynamics | 1 / 1 / 1 |
 | physical learning / operation / progress status | 4 / 1 / 1 |
-| native extractor / canonical join | 3 / 3 |
-| route evidence | `BLATRE02`, version 2 |
-| backfill ledger / commit / pointer | 2 / 2 / 1 |
-| physical inclusion namespace | `complete_full_rlog_authority_v7` |
+| native extractor / canonical join | 5 / 5 |
+| physical-frame encoding | 2 |
+| route evidence | `BLATRE04`, version 4 |
+| backfill ledger / commit / pointer | 3 / 2 / 1 |
+| physical inclusion namespace | `complete_full_rlog_authority_v8` |
 | controller policy | 1 |
 | behavior gate spec / segmentation / replay input | 3 / 1 / 1 |
 | behavior transaction / finalization | 2 / 1 |
@@ -365,8 +369,8 @@ The committed storage/wire identities are:
 | off-device display progress | 2 |
 
 These values are code contracts, not display labels. The retired physical v1
-through v6 namespaces remain byte-untouched and are never migrated or restored
-as v7; retained compatible full rlogs are replayed into an initially empty v7
+through v7 namespaces remain byte-untouched and are never migrated or restored
+as v8; retained compatible full rlogs are replayed into an initially empty v8
 ledger. The separate calibration runtime identity excludes provisional rack
 gain/damping but remains bound to the actual vehicle, measured mapping,
 opendbc torque calibration and limits, delay, and rack-rate resolution.
@@ -686,18 +690,19 @@ registered. Retained numerical libraries and wire/schema identities are
 offline compatibility surfaces. Consequently, BLaTv2 contributes no managed
 process load onroad or offroad.
 
-Any future modular actuation must remain synchronous inside controlsd so
-device and replay import the same artifact and share one control-frame clock.
-The current controlsd selection remains stock.
+Modular actuation remains synchronous inside controlsd so device and replay
+share one control-frame clock. It occurs only through the explicit provisional
+trial or a future approved artifact; otherwise controlsd selects stock.
 
-## Future bootstrap and rollback contract
+## Approved bootstrap and rollback contract
 
-The exact stock torque controller actuates throughout this learning milestone.
-A complete all-node physical selection and any qualified behavior policy are
+The exact stock torque controller remains the default throughout this learning
+milestone; the explicit owner trial is an unapproved provisional exception. A
+complete all-node physical selection and any qualified behavior policy are
 emitted only as authenticated offline artifacts. An all-seed physical result
 or failed behavior gate explicitly retains stock and emits no redundant policy.
-Before a future controller consumer could use a selected physical profile and
-qualified behavior policy, that exact composed candidate would have to pass:
+Before an approved consumer could use a selected physical profile and qualified
+behavior policy, that exact composed candidate would have to pass:
 
 1. deterministic unit and contract tests;
 2. device/harness A/A parity;

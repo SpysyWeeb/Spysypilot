@@ -95,7 +95,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
 from openpilot.selfdrive.controls.lib.blatv2.rack_mapper import RackMappingSnapshot
 
 
-BEHAVIOR_TRANSACTION_SCHEMA_VERSION = 2
+BEHAVIOR_TRANSACTION_SCHEMA_VERSION = 3
 MAX_BEHAVIOR_REPLAY_WORKERS = 4
 BEHAVIOR_WORKER_STARTUP_TIMEOUT_S = 2.0
 BEHAVIOR_WORKER_POLL_INTERVAL_S = 0.05
@@ -280,9 +280,13 @@ class ControllerFrameOutput:
   measured_rack_rate_deg_s: float
   measured_rack_accel_deg_s2: float
   raw_requested_torque: float
+  planned_requested_torque: float
+  reachable_envelope_torque: float
   envelope_applied_torque: float
   torque_headroom: float
   actuator_constrained: bool
+  steering_request_active: bool
+  maximum_authority_required: bool
   controller_fault: bool
   response_eligible: bool
 
@@ -295,6 +299,8 @@ class ControllerFrameOutput:
       self.measured_rack_rate_deg_s,
       self.measured_rack_accel_deg_s2,
       self.raw_requested_torque,
+      self.planned_requested_torque,
+      self.reachable_envelope_torque,
       self.envelope_applied_torque,
       self.torque_headroom,
     )
@@ -530,9 +536,13 @@ def neutral_behavior_response(
     measured_rack_rate_deg_s=0.0,
     measured_rack_accel_deg_s2=0.0,
     raw_requested_torque=0.0,
+    planned_requested_torque=0.0,
+    reachable_envelope_torque=0.0,
     envelope_applied_torque=0.0,
     torque_headroom=1.0,
     actuator_constrained=False,
+    steering_request_active=False,
+    maximum_authority_required=False,
     lateral_active=control.lateral_active,
     inputs_valid=control.inputs_valid and parameters.qualified,
     steering_pressed=control.steering_pressed,
@@ -595,9 +605,13 @@ def _prepare_route(
         measured_rack_rate_deg_s=reference.desired_rack_rate_deg_s,
         measured_rack_accel_deg_s2=reference.desired_rack_accel_deg_s2,
         raw_requested_torque=0.0,
+        planned_requested_torque=0.0,
+        reachable_envelope_torque=0.0,
         envelope_applied_torque=0.0,
         torque_headroom=1.0,
         actuator_constrained=False,
+        steering_request_active=False,
+        maximum_authority_required=False,
         lateral_active=neutral.lateral_active,
         inputs_valid=neutral.inputs_valid,
         steering_pressed=neutral.steering_pressed,
@@ -694,9 +708,13 @@ def _run_replay_job(
         measured_rack_rate_deg_s=output.measured_rack_rate_deg_s,
         measured_rack_accel_deg_s2=output.measured_rack_accel_deg_s2,
         raw_requested_torque=output.raw_requested_torque,
+        planned_requested_torque=output.planned_requested_torque,
+        reachable_envelope_torque=output.reachable_envelope_torque,
         envelope_applied_torque=output.envelope_applied_torque,
         torque_headroom=output.torque_headroom,
         actuator_constrained=output.actuator_constrained,
+        steering_request_active=output.steering_request_active,
+        maximum_authority_required=output.maximum_authority_required,
         lateral_active=control.lateral_active,
         inputs_valid=neutral.inputs_valid and output.response_eligible,
         steering_pressed=control.steering_pressed,

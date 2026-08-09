@@ -39,6 +39,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_evidence import (
   canonical_json,
   derive_behavior_reference,
 )
+from openpilot.selfdrive.controls.lib.blatv2.actuator import RuntimeTorqueLimits
 from openpilot.selfdrive.controls.lib.blatv2.behavior_coordinator import (
   ReplayArtifactIdentity,
   ReplayCoreIdentity,
@@ -64,6 +65,7 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_replay import (
   behavior_scenario_provenance_from_route_source,
   build_canonical_behavior_frame,
   decode_behavior_car_params,
+  observe_behavior_rack_motion,
   validate_reviewed_replay_core_identity,
 )
 from openpilot.selfdrive.controls.lib.blatv2.behavior_segmentation import (
@@ -93,14 +95,17 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
 from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   ProvisionalRackDynamics,
 )
+from openpilot.selfdrive.controls.lib.blatv2.rack_motion import (
+  SignedRackMotionNormalizer,
+)
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
+  VehicleProfile,
   compose_controller_profile,
 )
 
 
-BEHAVIOR_ROUTE_PREPARATION_SCHEMA_VERSION = 2
-BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION = 4
-_RACK_ACCELERATION_MAXIMUM_GAP_NS = 15_000_000
+BEHAVIOR_ROUTE_PREPARATION_SCHEMA_VERSION = 3
+BEHAVIOR_ROUTE_EVALUATION_SCHEMA_VERSION = 5
 _MAXIMUM_ROUTE_POLICIES = 64
 
 
@@ -135,6 +140,9 @@ def _metric_set_dict(value: WindowMetricSet) -> dict[str, object]:
     "routeId": value.route_id,
     "sourceIdentitySha256": value.source_identity_sha256,
     "speedNodeSupport": [list(item) for item in value.speed_node_support],
+    "summaryMetricName": (
+      None if value.summary_metric_name is None else value.summary_metric_name.value
+    ),
     "windowId": value.window_id,
   }
 
@@ -376,6 +384,8 @@ class _StreamRuntime:
   car_params: Any
   nominal_rack_mapping: Any
   mapping_model: VehicleModel
+  controller_profile: VehicleProfile
+  runtime_limits: RuntimeTorqueLimits
   physical_profile_sha256: str
 
 
@@ -444,6 +454,8 @@ def _runtime(
     car_params=car_params,
     nominal_rack_mapping=bundle.nominal_rack_mapping,
     mapping_model=VehicleModel(car_params),
+    controller_profile=controller_profile,
+    runtime_limits=bundle.torque_limits,
     physical_profile_sha256=_sha256_text(physical_profile.to_json()),
   )
 
@@ -478,8 +490,8 @@ def _stream_frames(
     reader.iter_lateral_maneuver_plans(),
     "lateral maneuver",
   )
-  previous_response_mono_ns: int | None = None
-  previous_rate_deg_s = 0.0
+  rack_motion = SignedRackMotionNormalizer()
+  previous_lateral_active = False
   active_count = 0
   sentinel = object()
   index = 0
@@ -501,22 +513,6 @@ def _stream_frames(
           )
         break
       assert isinstance(witness, ControlsWitness)
-      gap_ns = (
-        0
-        if previous_response_mono_ns is None
-        else physical.response_mono_ns - previous_response_mono_ns
-      )
-      acceleration_valid = (
-        previous_response_mono_ns is not None
-        and 0 < gap_ns <= _RACK_ACCELERATION_MAXIMUM_GAP_NS
-      )
-      acceleration = (
-        (physical.steering_rate_deg_s - previous_rate_deg_s) / (gap_ns * 1e-9)
-        if acceleration_valid
-        else 0.0
-      )
-      previous_response_mono_ns = physical.response_mono_ns
-      previous_rate_deg_s = physical.steering_rate_deg_s
       model = model_values.select(
         witness.model_publication_index,
         witness.model_link_valid,
@@ -533,6 +529,15 @@ def _stream_frames(
         witness.lateral_maneuver_plan_index,
         witness.maneuver_plan_available,
       )
+      live_mapping, motion = observe_behavior_rack_motion(
+        normalizer=rack_motion,
+        profile=runtime.controller_profile,
+        mapping_model=runtime.mapping_model,
+        runtime_limits=runtime.runtime_limits,
+        witness=witness,
+        physical=physical,
+      )
+      engagement_boundary = witness.lateral_active and not previous_lateral_active
       try:
         control, frame_input, model_intent = build_canonical_behavior_frame(
           index=index,
@@ -540,11 +545,11 @@ def _stream_frames(
           car_params=runtime.car_params,
           car_params_bytes=runtime.car_params_bytes,
           nominal_rack_mapping=runtime.nominal_rack_mapping,
-          mapping_model=runtime.mapping_model,
           witness=witness,
           physical=physical,
-          rack_acceleration_deg_s2=acceleration,
-          rack_acceleration_valid=acceleration_valid,
+          live_mapping=live_mapping,
+          rack_motion=motion,
+          engagement_boundary=engagement_boundary,
           model=model,
           live_torque=live_torque,
           live_delay=live_delay,
@@ -570,6 +575,7 @@ def _stream_frames(
         else derive_behavior_reference(model_intent, neutral)
       )
       yield _StreamFrame(control, frame_input, model_intent, reference)
+      previous_lateral_active = witness.lateral_active
       index += 1
     model_values.finish()
     torque_values.finish()
@@ -628,9 +634,13 @@ def _target_sample(
       measured_rack_rate_deg_s=reference.desired_rack_rate_deg_s,
       measured_rack_accel_deg_s2=reference.desired_rack_accel_deg_s2,
       raw_requested_torque=0.0,
+      planned_requested_torque=0.0,
+      reachable_envelope_torque=0.0,
       envelope_applied_torque=0.0,
       torque_headroom=1.0,
       actuator_constrained=False,
+      steering_request_active=False,
+      maximum_authority_required=False,
       lateral_active=neutral.lateral_active,
       inputs_valid=neutral.inputs_valid,
       steering_pressed=neutral.steering_pressed,
@@ -731,9 +741,13 @@ def _response_sample(
       measured_rack_rate_deg_s=output.measured_rack_rate_deg_s,
       measured_rack_accel_deg_s2=output.measured_rack_accel_deg_s2,
       raw_requested_torque=output.raw_requested_torque,
+      planned_requested_torque=output.planned_requested_torque,
+      reachable_envelope_torque=output.reachable_envelope_torque,
       envelope_applied_torque=output.envelope_applied_torque,
       torque_headroom=output.torque_headroom,
       actuator_constrained=output.actuator_constrained,
+      steering_request_active=output.steering_request_active,
+      maximum_authority_required=output.maximum_authority_required,
       lateral_active=frame.control.lateral_active,
       inputs_valid=neutral.inputs_valid and output.response_eligible,
       steering_pressed=frame.control.steering_pressed,

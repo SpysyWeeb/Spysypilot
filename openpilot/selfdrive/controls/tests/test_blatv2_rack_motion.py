@@ -9,6 +9,7 @@ from openpilot.selfdrive.controls.lib.blatv2.rack_motion import (
 
 
 GAP = 0.015
+GAP_NS = 15_000_000
 RESOLUTION = 4.0
 
 
@@ -21,12 +22,14 @@ def observe(
   valid: bool = True,
 ):
   return normalizer.update(
-    sample_time_s=time_s,
+    sample_mono_ns=(
+      round(time_s * 1e9) if math.isfinite(time_s) else time_s
+    ),
     steering_angle_deg=angle_deg,
     raw_rate_deg_s=rate_deg_s,
     rate_resolution_deg_s=RESOLUTION,
     lifecycle_valid=valid,
-    maximum_gap_s=GAP,
+    maximum_gap_ns=GAP_NS,
   )
 
 
@@ -133,6 +136,35 @@ def test_gap_invalid_and_route_reset_cannot_leak_direction():
   assert not route_seed.sign_valid
 
 
+def test_exact_nanosecond_gap_is_uptime_independent():
+  base_ns = 10_000_000_000_000_000
+
+  def at(
+    normalizer: SignedRackMotionNormalizer,
+    timestamp_ns: int,
+    angle_deg: float,
+  ):
+    return normalizer.update(
+      sample_mono_ns=timestamp_ns,
+      steering_angle_deg=angle_deg,
+      raw_rate_deg_s=0.0 if angle_deg == 0.0 else 8.0,
+      rate_resolution_deg_s=RESOLUTION,
+      lifecycle_valid=True,
+      maximum_gap_ns=GAP_NS,
+    )
+
+  normalizer = SignedRackMotionNormalizer()
+  at(normalizer, base_ns, 0.0)
+  boundary = at(normalizer, base_ns + GAP_NS, 0.1)
+
+  over = SignedRackMotionNormalizer()
+  at(over, base_ns, 0.0)
+  after_boundary = at(over, base_ns + GAP_NS + 1, 0.1)
+
+  assert boundary.derivative_continuous
+  assert not after_boundary.derivative_continuous
+
+
 def test_nonfinite_and_invalid_lifecycle_fail_closed():
   for kwargs in (
     {"time_s": math.nan, "angle_deg": 0.0, "rate_deg_s": 0.0},
@@ -149,3 +181,34 @@ def test_nonfinite_and_invalid_lifecycle_fail_closed():
     assert not result.sign_valid
     assert not result.derivative_continuous
     assert result.signed_rate_deg_s == 0.0
+
+
+def test_malformed_input_resets_resolved_direction():
+  base = {
+    "sample_mono_ns": 1_020_000_000,
+    "steering_angle_deg": 0.2,
+    "raw_rate_deg_s": 8.0,
+    "rate_resolution_deg_s": RESOLUTION,
+    "lifecycle_valid": True,
+    "maximum_gap_ns": GAP_NS,
+  }
+  for field in (
+    "sample_mono_ns",
+    "steering_angle_deg",
+    "raw_rate_deg_s",
+    "rate_resolution_deg_s",
+    "maximum_gap_ns",
+  ):
+    normalizer = SignedRackMotionNormalizer()
+    observe(normalizer, time_s=1.00, angle_deg=0.0, rate_deg_s=0.0)
+    observe(normalizer, time_s=1.01, angle_deg=0.1, rate_deg_s=8.0)
+    invalid = normalizer.update(**(base | {field: object()}))
+    plateau = observe(
+      normalizer,
+      time_s=1.03,
+      angle_deg=0.2,
+      rate_deg_s=8.0,
+    )
+
+    assert invalid.source is RackMotionSource.RESET
+    assert not plateau.sign_valid

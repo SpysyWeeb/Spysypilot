@@ -31,11 +31,18 @@ from openpilot.selfdrive.controls.lib.blatv2.controller import (
   CandidateStatus,
 )
 from openpilot.selfdrive.controls.lib.blatv2.core import CoreStatus
+from openpilot.selfdrive.controls.lib.blatv2.horizon import HorizonPolicy
+from openpilot.selfdrive.controls.lib.blatv2.intent import (
+  IntentStatusCode,
+  MAX_MODEL_PUBLICATION_AGE_NS,
+)
 from openpilot.selfdrive.controls.lib.blatv2.live_adapter import (
   INTENT_CAPACITY,
   LiveAdapterStatus,
   LiveInputAdapter,
+  exact_nonnegative_int,
   exact_applied_torque_counts,
+  exact_steering_request_state,
 )
 from openpilot.selfdrive.controls.lib.blatv2 import live_controller as live_module
 from openpilot.selfdrive.controls.lib.blatv2.live_controller import (
@@ -64,9 +71,11 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
   compose_controller_profile,
   make_seed_profile,
 )
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.tests.blatv2_artifact_test_helpers import (
   calibration_profile_for_controller,
   calibration_selection_manifest,
+  passing_device_acceptance_receipt,
   passed_behavior_finalization,
 )
 
@@ -156,6 +165,22 @@ def policy() -> ControllerPolicy:
   )
 
 
+def horizon_policy(*, provisional: bool = False) -> HorizonPolicy:
+  return HorizonPolicy(
+    revision=1,
+    provenance="synthetic fixed horizon policy",
+    provisional=provisional,
+    immediate_confidence=1.0,
+    preparation_confidence=0.5,
+    reserve_confidence=0.25,
+    smooth_position_tolerance_s=0.05,
+    smooth_rate_tolerance_quanta=1.0,
+    no_lead_position_tolerance_s=0.01,
+    no_lead_rate_tolerance_quanta=1.0,
+    maximum_torque_slack=0.25,
+  )
+
+
 def runtime_bundle(
   *,
   verified: bool = True,
@@ -202,10 +227,15 @@ def artifact(bundle: RuntimeVehicleBundle) -> ApprovedProfileArtifact:
     bundle.seed_profile,
   )
   selected_policy = policy()
+  selected_horizon_policy = horizon_policy()
+  profile_hash = hashlib.sha256(
+    selected_profile.to_json().encode(),
+  ).hexdigest()
   return ApprovedProfileArtifact(
     vehicle_profile=selected_profile,
     calibration_profile=calibration_profile,
     controller_policy=selected_policy,
+    horizon_policy_sha256=selected_horizon_policy.sha256,
     runtime_vehicle_identity_sha256=bundle.identity_sha256,
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
@@ -220,9 +250,17 @@ def artifact(bundle: RuntimeVehicleBundle) -> ApprovedProfileArtifact:
     replay_harness_commit=HARNESS_COMMIT,
     replay_passed=True,
     delivered_replay_passed=True,
-    safety_passed=True,
     deterministic_aa_passed=True,
-    device_timing_passed=True,
+    device_acceptance_receipt=passing_device_acceptance_receipt(
+      vehicle_identity=selected_profile.vehicle_identity,
+      runtime_identity_sha256=bundle.identity_sha256,
+      profile_sha256=profile_hash,
+      controller_policy_sha256=selected_policy.sha256,
+      horizon_policy_sha256=selected_horizon_policy.sha256,
+      source_openpilot_commit=SOURCE_COMMIT,
+      opendbc_commit=OPENDBC_COMMIT,
+      panda_commit=PANDA_COMMIT,
+    ),
     smooth_passed=True,
     swift_passed=True,
     strong_passed=True,
@@ -251,6 +289,7 @@ def live(
     source_openpilot_commit=SOURCE_COMMIT,
     opendbc_commit=OPENDBC_COMMIT,
     panda_commit=PANDA_COMMIT,
+    horizon_policy=horizon_policy(),
   )
 
 
@@ -260,6 +299,7 @@ def experimental_live(
   requested: bool = True,
   compatible: bool = True,
   selected_policy: ControllerPolicy | None = None,
+  selected_horizon_policy: HorizonPolicy | None = None,
 ) -> ModularLiveController:
   actual_bundle = runtime_bundle() if bundle is None else bundle
   provisional_policy = replace(
@@ -282,6 +322,11 @@ def experimental_live(
       provisional_policy
       if selected_policy is None
       else selected_policy
+    ),
+    horizon_policy=(
+      horizon_policy(provisional=True)
+      if selected_horizon_policy is None
+      else selected_horizon_policy
     ),
   )
 
@@ -306,7 +351,8 @@ def model(
   same_grid: bool = True,
 ) -> object:
   message = log.ModelDataV2.new_message()
-  times = [index * 0.05 for index in range(INTENT_CAPACITY)]
+  times = list(ModelConstants.T_IDXS)
+  assert len(times) == INTENT_CAPACITY
   speeds = [10.0] * len(times)
   curvatures = [curvature + 0.001 * time for time in times]
   message.frameId = 42
@@ -338,6 +384,9 @@ def vehicle_messages() -> tuple[object, object, object]:
 
   output = car.CarOutput.new_message()
   output.actuatorsOutput.torqueOutputCan = 37.0
+  output.actuatorsOutput.steeringRequestActive = True
+  output.actuatorsOutput.steeringRequestActiveValid = True
+  output.actuatorsOutput.steeringRequestFaultAvoidanceCounter = 0
 
   live_params = log.LiveParametersData.new_message()
   live_params.valid = True
@@ -365,6 +414,7 @@ def bind_modular(
   state: object,
   output: object,
 ) -> None:
+  _, _, live_params = vehicle_messages()
   selected.update_engagement(
     enabled=False,
     lateral_active=False,
@@ -373,7 +423,9 @@ def bind_modular(
   selected.observe_inactive_state(
     state_sample_mono_ns=clock.now_ns - 15_000_000,
     car_state=state,
+    live_parameters=live_params,
     inputs_valid=True,
+    live_parameters_inputs_valid=True,
   )
   assert selected.observe_previous_applied(output)
   assert selected.update_engagement(
@@ -393,12 +445,26 @@ def step(
   message_valid: bool = True,
   live_parameters_valid: bool = True,
   maneuver_active: bool = False,
+  model_input: object | None = None,
+  model_publication_mono_ns: int | None = None,
+  car_output_mono_ns: int | None = None,
 ):
-  selected.observe_previous_applied(output)
+  selected.observe_previous_applied(
+    output,
+    car_output_mono_ns=(
+      clock.now_ns
+      if car_output_mono_ns is None
+      else car_output_mono_ns
+    ),
+  )
   result = selected.update_modular(
     state_sample_mono_ns=clock.now_ns - 5_000_000,
-    model_publication_mono_ns=clock.now_ns - 10_000_000,
-    model_message=model(),
+    model_publication_mono_ns=(
+      clock.now_ns - 10_000_000
+      if model_publication_mono_ns is None
+      else model_publication_mono_ns
+    ),
+    model_message=model() if model_input is None else model_input,
     car_state=state,
     live_parameters=live_params,
     model_message_valid=message_valid,
@@ -418,6 +484,7 @@ def step(
 
 def test_absent_invalid_mismatched_and_unverified_are_exact_stock() -> None:
   bundle = runtime_bundle()
+  approved = artifact(bundle)
   absent = live(
     bundle=bundle,
     selected_artifact=None,
@@ -426,15 +493,23 @@ def test_absent_invalid_mismatched_and_unverified_are_exact_stock() -> None:
   mismatched = live(
     bundle=bundle,
     selected_artifact=replace(
-      artifact(bundle),
+      approved,
       runtime_vehicle_identity_sha256="f" * 64,
+      device_acceptance_receipt=replace(
+        approved.device_acceptance_receipt,
+        runtime_identity_sha256="f" * 64,
+      ),
     ),
   )
   panda_mismatched = live(
     bundle=bundle,
     selected_artifact=replace(
-      artifact(bundle),
+      approved,
       panda_commit="f" * 40,
+      device_acceptance_receipt=replace(
+        approved.device_acceptance_receipt,
+        panda_commit="f" * 40,
+      ),
     ),
   )
   unverified_bundle = runtime_bundle(verified=False)
@@ -547,6 +622,7 @@ def test_approved_artifact_takes_precedence_over_experimental_request() -> None:
     experimental_requested=True,
     experimental_platform_compatible=True,
     experimental_policy=replace(policy(), provisional=True),
+    horizon_policy=horizon_policy(),
   )
 
   assert selected.eligibility == LiveEligibility.ELIGIBLE
@@ -587,8 +663,21 @@ def test_process_start_builds_trial_only_for_opendbc_capable_platform() -> None:
   assert selected.experimental_requested
   assert selected.experimental_platform_compatible
   assert selected.experimental_active
+  assert selected.artifact is None
+  assert selected.activation is not None
+  assert selected.activation.active_artifact is None
+  assert selected.artifact_diagnostic is ArtifactDiagnostic.ABSENT
   assert selected.controller_profile is not None
   assert not selected.controller_profile.qualified
+  telemetry = build_modular_lateral_state(
+    selected,
+    lateral_active=False,
+    measured_curvature=0.0,
+    v_ego_m_s=0.0,
+  )
+  assert telemetry.modularBindingReason == LiveEligibility.ELIGIBLE
+  assert telemetry.modularArtifactHash == ""
+  assert telemetry.modularProfileHash == selected.profile_sha256
   assert selected.runtime_bundle is not None
   assert (
     selected.runtime_bundle.torque_limits.steer_max,
@@ -608,6 +697,60 @@ def test_process_start_builds_trial_only_for_opendbc_capable_platform() -> None:
   assert not disabled.experimental_active
 
 
+def test_source_horizon_load_is_independent_and_exact_hash_bound(
+  tmp_path,
+  monkeypatch,
+) -> None:
+  future_policy = horizon_policy()
+  policy_path = tmp_path / "horizon-policy.json"
+  policy_path.write_text(future_policy.to_json())
+  monkeypatch.setattr(
+    live_module,
+    "APPROVED_HORIZON_POLICY_PATH",
+    policy_path,
+  )
+  cp = CarInterface.get_non_essential_params(CAR.HYUNDAI_PALISADE)
+  selected = ModularLiveController.from_persistent(
+    car_params=cp,
+    car_interface=CarInterface(cp),
+    params=TrialParams(False),
+    source_openpilot_commit=SOURCE_COMMIT,
+    opendbc_commit=OPENDBC_COMMIT,
+    panda_commit=PANDA_COMMIT,
+  )
+  assert not selected.experimental_requested
+  assert selected.horizon_policy == future_policy
+  assert selected.eligibility == LiveEligibility.NO_ACTIVE_ARTIFACT
+
+  bundle = runtime_bundle()
+  approved = artifact(bundle)
+
+  def with_horizon(selected_policy: HorizonPolicy) -> ModularLiveController:
+    return ModularLiveController(
+      car_params=synthetic_cp(),
+      runtime_bundle=bundle,
+      artifact=approved,
+      activation_provisional=False,
+      artifact_diagnostic=ArtifactDiagnostic.OK,
+      source_openpilot_commit=SOURCE_COMMIT,
+      opendbc_commit=OPENDBC_COMMIT,
+      panda_commit=PANDA_COMMIT,
+      horizon_policy=selected_policy,
+    )
+
+  exact = with_horizon(future_policy)
+  assert not exact.experimental_requested
+  assert exact.eligibility == LiveEligibility.ELIGIBLE
+  assert (
+    with_horizon(replace(future_policy, revision=2)).eligibility
+    == LiveEligibility.HORIZON_CONFIGURATION_INVALID
+  )
+  assert (
+    with_horizon(replace(future_policy, provisional=True)).eligibility
+    == LiveEligibility.HORIZON_CONFIGURATION_INVALID
+  )
+
+
 def test_altered_transient_rack_values_fail_to_exact_stock() -> None:
   bundle = runtime_bundle()
   approved = artifact(bundle)
@@ -625,14 +768,18 @@ def test_altered_transient_rack_values_fail_to_exact_stock() -> None:
     changed_profile = replace(approved.vehicle_profile, nodes=nodes)
     changed_manifest = replace(
       approved.calibration_selection_manifest,
-      selected_controller_profile_sha256=hashlib.sha256(
-        changed_profile.to_json().encode(),
-      ).hexdigest(),
+      selected_controller_profile_sha256=(
+        hashlib.sha256(changed_profile.to_json().encode()).hexdigest()
+      ),
     )
     internally_bound = replace(
       approved,
       vehicle_profile=changed_profile,
       calibration_selection_manifest=changed_manifest,
+      device_acceptance_receipt=replace(
+        approved.device_acceptance_receipt,
+        profile_sha256=changed_manifest.selected_controller_profile_sha256,
+      ),
     )
     selected = live(
       bundle=bundle,
@@ -670,6 +817,10 @@ def test_runtime_seed_grid_mismatch_fails_to_exact_stock() -> None:
   runtime_bound = replace(
     approved,
     runtime_vehicle_identity_sha256=mismatched_bundle.identity_sha256,
+    device_acceptance_receipt=replace(
+      approved.device_acceptance_receipt,
+      runtime_identity_sha256=mismatched_bundle.identity_sha256,
+    ),
   )
   selected = live(
     bundle=mismatched_bundle,
@@ -775,6 +926,140 @@ def test_exact_count_source_rejects_fractional_normalized_reconstruction() -> No
   assert selected.last_exact_applied_counts is None
 
 
+def test_final_limiter_residual_uses_the_next_new_car_output_count() -> None:
+  selected = experimental_live()
+  state, output, _ = vehicle_messages()
+  clock = FakeClock()
+  bind_modular(selected, clock, state, output)
+
+  assert selected.record_requested_command(41 / 409)
+  output.actuatorsOutput.torqueOutputCan = 40.0
+  assert selected.observe_previous_applied(
+    output,
+    car_output_mono_ns=clock.now_ns,
+  )
+  assert selected.last_expected_command_counts == 41
+  assert selected.final_count_residual == -1
+  assert selected.final_count_match_valid
+  assert selected.final_limiter_altered
+
+  telemetry = build_modular_lateral_state(
+    selected,
+    lateral_active=True,
+    measured_curvature=0.0,
+    v_ego_m_s=10.0,
+  )
+  with log.ControlsState.LateralTorqueState.from_bytes(
+    telemetry.to_bytes(),
+  ) as decoded:
+    assert decoded.modularFinalExpectedCounts == 41
+    assert decoded.modularFinalCountResidual == -1
+    assert decoded.modularFinalCountMatchValid
+    assert decoded.modularFinalLimiterAltered
+
+  assert selected.record_requested_command(44 / 409)
+  output.actuatorsOutput.torqueOutputCan = 44.0
+  assert not selected.observe_previous_applied(
+    output,
+    car_output_mono_ns=clock.now_ns,
+  )
+  assert selected.pending_command_counts == 44
+  assert selected.transport_reprime_required
+  assert not selected.final_count_match_valid
+  clock.advance()
+  assert not selected.observe_previous_applied(
+    output,
+    car_output_mono_ns=clock.now_ns,
+  )
+  assert selected.transport_reprime_required
+  assert selected.last_expected_command_counts is None
+  assert not selected.final_count_match_valid
+  assert not selected.final_limiter_altered
+
+
+def test_missing_request_state_guards_and_requires_transport_reprime(
+  monkeypatch,
+) -> None:
+  selected = experimental_live()
+  state, output, live_params = vehicle_messages()
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module, "control_witness_mono_ns", lambda: clock.now_ns,
+  )
+  bind_modular(selected, clock, state, output)
+
+  valid = step(selected, clock, state, output, live_params)
+  assert valid.status == CandidateStatus.MODULAR_OK
+  assert selected.record_requested_command(valid.command_torque)
+
+  output.actuatorsOutput.steeringRequestActiveValid = False
+  missing = step(selected, clock, state, output, live_params)
+  assert missing.status == CandidateStatus.MODULAR_CORE_INVALID
+  assert missing.safety_state == LiveSafetyState.HOLDING_FIRST_INVALID
+  assert selected.transport_reprime_required
+  assert not selected.adapter_exception
+  assert not selected.record_requested_command(missing.command_torque)
+
+  output.actuatorsOutput.steeringRequestActiveValid = True
+  resync = step(selected, clock, state, output, live_params)
+  assert resync.status == CandidateStatus.MODULAR_CORE_INVALID
+  assert selected.transport_reprimed
+  assert not selected.transport_reprime_required
+  assert not selected.adapter_exception
+  assert selected.record_requested_command(resync.command_torque)
+
+
+def test_gapped_car_output_invalidates_and_reprimes_transport(monkeypatch) -> None:
+  selected = experimental_live()
+  state, output, live_params = vehicle_messages()
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module, "control_witness_mono_ns", lambda: clock.now_ns,
+  )
+  bind_modular(selected, clock, state, output)
+
+  valid = step(selected, clock, state, output, live_params)
+  assert selected.record_requested_command(valid.command_torque)
+  gapped = step(
+    selected,
+    clock,
+    state,
+    output,
+    live_params,
+    car_output_mono_ns=clock.now_ns + 20_000_000,
+  )
+
+  assert gapped.status == CandidateStatus.MODULAR_CORE_INVALID
+  assert selected.transport_reprimed
+  assert not selected.car_output_cadence_valid
+  assert selected.control_cadence_valid
+  assert selected.last_expected_command_counts is None
+  assert not selected.final_count_match_valid
+
+
+def test_exact_request_state_distinguishes_cut_from_unavailable() -> None:
+  selected = live()
+  _, output, _ = vehicle_messages()
+  assert exact_steering_request_state(output) == (True, 0)
+  assert selected.observe_previous_applied(output)
+  assert selected.last_recorded_applied_torque == 37 / 409
+
+  output.actuatorsOutput.steeringRequestActive = False
+  output.actuatorsOutput.steeringRequestFaultAvoidanceCounter = 90
+  assert exact_steering_request_state(output) == (False, 90)
+  assert selected.observe_previous_applied(output)
+  assert selected.last_exact_applied_counts == 37
+  assert selected.last_recorded_applied_torque == 0.0
+  assert not selected.last_steering_request_active
+  assert selected.last_steering_request_counter == 90
+
+  output.actuatorsOutput.steeringRequestActiveValid = False
+  assert exact_steering_request_state(output) is None
+  assert not selected.observe_previous_applied(output)
+  assert selected.last_applied_count_valid
+  assert not selected.last_steering_request_valid
+
+
 def test_native_grid_and_derivative_gap_contracts() -> None:
   cp = synthetic_cp()
   selected_profile = qualified_profile()
@@ -786,7 +1071,9 @@ def test_native_grid_and_derivative_gap_contracts() -> None:
   adapter.observe_inactive_state(
     state_sample_mono_ns=BASE_NS + 200_000_000,
     car_state=state,
+    live_parameters=live_params,
     inputs_valid=True,
+    live_parameters_inputs_valid=True,
   )
   prepared = adapter.prepare(
     state_sample_mono_ns=BASE_NS + 210_000_000,
@@ -819,6 +1106,74 @@ def test_native_grid_and_derivative_gap_contracts() -> None:
   assert gapped.status == LiveAdapterStatus.INVALID_RACK_DERIVATIVE
   assert not gapped.rack_derivative_valid
   assert math.isnan(gapped.measured_rack_acceleration_deg_s2)
+
+
+def test_timing_identifiers_require_exact_nonnegative_integers() -> None:
+  assert exact_nonnegative_int(42, "test") == 42
+  for invalid in (True, -1, 1.5, math.nan):
+    try:
+      exact_nonnegative_int(invalid, "test")
+    except (TypeError, ValueError, OverflowError):
+      pass
+    else:
+      raise AssertionError(f"inexact timing identifier accepted: {invalid!r}")
+
+
+def test_unsigned_rack_rate_uses_angle_direction_through_reversal() -> None:
+  adapter = LiveInputAdapter(
+    car_params=synthetic_cp(),
+    profile=qualified_profile(),
+  )
+  state, _, live_params = vehicle_messages()
+  state.steeringRateDeg = 8.0
+  adapter.observe_inactive_state(
+    state_sample_mono_ns=BASE_NS + 190_000_000,
+    car_state=state,
+    live_parameters=live_params,
+    inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  state.steeringAngleDeg = -0.1
+  adapter.observe_inactive_state(
+    state_sample_mono_ns=BASE_NS + 200_000_000,
+    car_state=state,
+    live_parameters=live_params,
+    inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+
+  negative = adapter.prepare(
+    state_sample_mono_ns=BASE_NS + 210_000_000,
+    control_witness_mono_ns=BASE_NS + 215_000_000,
+    model_publication_mono_ns=BASE_NS + 205_000_000,
+    model_message=model(),
+    car_state=state,
+    live_parameters=live_params,
+    model_message_valid=True,
+    model_message_alive=True,
+    vehicle_inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  assert negative.status == LiveAdapterStatus.OK
+  assert negative.measured_rack_rate_deg_s == -8.0
+  assert negative.measured_rack_acceleration_deg_s2 == 0.0
+
+  state.steeringAngleDeg = 0.0
+  reversal = adapter.prepare(
+    state_sample_mono_ns=BASE_NS + 220_000_000,
+    control_witness_mono_ns=BASE_NS + 225_000_000,
+    model_publication_mono_ns=BASE_NS + 215_000_000,
+    model_message=model(),
+    car_state=state,
+    live_parameters=live_params,
+    model_message_valid=True,
+    model_message_alive=True,
+    vehicle_inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  assert reversal.status == LiveAdapterStatus.OK
+  assert reversal.measured_rack_rate_deg_s == 8.0
+  assert reversal.measured_rack_acceleration_deg_s2 == 0.0
 
 
 def test_nonzero_delay_zoh_prime_makes_first_active_frame_valid(
@@ -859,6 +1214,81 @@ def test_nonzero_delay_zoh_prime_makes_first_active_frame_valid(
   assert prime_values == [37 / 409]
 
 
+def test_request_cut_preserves_command_and_primes_zero_actuator_input(
+  monkeypatch,
+) -> None:
+  selected = live()
+  state, output, live_params = vehicle_messages()
+  output.actuatorsOutput.steeringRequestActive = False
+  output.actuatorsOutput.steeringRequestFaultAvoidanceCounter = 90
+  clock = FakeClock()
+  assert selected.candidate is not None
+  prime_values: list[float] = []
+  request_states: list[tuple[int, bool]] = []
+  original_prime = selected.candidate.core.prime_applied_history
+  original_horizon_update = selected.candidate.core.horizon.update
+
+  def counted_prime(value: float) -> None:
+    prime_values.append(float(value))
+    original_prime(value)
+
+  def capture_request_state(**kwargs):
+    request_states.append((
+      kwargs["steering_request_fault_avoidance_counter"],
+      kwargs["steering_request_state_valid"],
+    ))
+    return original_horizon_update(**kwargs)
+
+  selected.candidate.core.prime_applied_history = counted_prime
+  selected.candidate.core.horizon.update = capture_request_state
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
+  bind_modular(selected, clock, state, output)
+  assert prime_values == [0.0]
+  result = step(selected, clock, state, output, live_params)
+  assert result.status == CandidateStatus.MODULAR_OK
+  assert result.core_result is not None
+  assert request_states == [(90, True)]
+  assert selected.last_actuator_constrained_input
+  telemetry = build_modular_lateral_state(
+    selected,
+    lateral_active=True,
+    measured_curvature=0.0,
+    v_ego_m_s=10.0,
+  )
+  assert telemetry.modularPreviousAppliedCounts == 37
+  assert telemetry.modularPreviousCommandCounts == 37
+  assert telemetry.modularRecordedAppliedTorque == 0.0
+  assert not telemetry.modularSteeringRequestActive
+  assert telemetry.modularSteeringRequestValid
+  assert telemetry.modularSteeringRequestFaultAvoidanceCounter == 90
+
+
+def test_unreachable_request_counter_fails_closed_in_bound_controller(
+  monkeypatch,
+) -> None:
+  selected = live()
+  state, output, live_params = vehicle_messages()
+  output.actuatorsOutput.steeringRequestFaultAvoidanceCounter = 91
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
+
+  bind_modular(selected, clock, state, output)
+  result = step(selected, clock, state, output, live_params)
+
+  assert result.status == CandidateStatus.MODULAR_CORE_INVALID
+  assert result.core_result is not None
+  assert result.core_result.status == CoreStatus.INVALID_MEASUREMENT
+  assert result.safety_state == LiveSafetyState.HOLDING_FIRST_INVALID
+
+
 def test_control_witness_discontinuity_reprimes_and_uses_guard_recovery(
 ) -> None:
   for cadence_failure in ("repeated", "gap"):
@@ -892,10 +1322,21 @@ def test_control_witness_discontinuity_reprimes_and_uses_guard_recovery(
         clock.now_ns -= 10_000_000
       else:
         clock.now_ns += 10_000_000
+      assert selected.last_car_output_mono_ns is not None
+      next_car_output_mono_ns = (
+        selected.last_car_output_mono_ns + 10_000_000
+      )
       exact_counts_before_failure = round(
         output.actuatorsOutput.torqueOutputCan,
       )
-      invalid = step(selected, clock, state, output, live_params)
+      invalid = step(
+        selected,
+        clock,
+        state,
+        output,
+        live_params,
+        car_output_mono_ns=next_car_output_mono_ns,
+      )
       assert not selected.control_cadence_valid
       assert selected.transport_reprimed
       assert len(prime_values) == 2
@@ -906,19 +1347,95 @@ def test_control_witness_discontinuity_reprimes_and_uses_guard_recovery(
       assert invalid.safety_state == LiveSafetyState.HOLDING_FIRST_INVALID
 
       for frame in range(RECOVERY_OK_FRAMES - 1):
-        recovering = step(selected, clock, state, output, live_params)
+        assert selected.last_car_output_mono_ns is not None
+        recovering = step(
+          selected,
+          clock,
+          state,
+          output,
+          live_params,
+          car_output_mono_ns=(
+            selected.last_car_output_mono_ns + 10_000_000
+          ),
+        )
         assert selected.control_cadence_valid
         assert not selected.transport_reprimed
         assert recovering.safety_state == LiveSafetyState.RECOVERING
         assert recovering.recovery_ok_frames == frame + 1
-      recovered = step(selected, clock, state, output, live_params)
+      assert selected.last_car_output_mono_ns is not None
+      recovered = step(
+        selected,
+        clock,
+        state,
+        output,
+        live_params,
+        car_output_mono_ns=(
+          selected.last_car_output_mono_ns + 10_000_000
+        ),
+      )
       assert recovered.status == CandidateStatus.MODULAR_OK
       assert recovered.safety_state == LiveSafetyState.OK
       assert selected.messages_valid
       assert len(prime_values) == 2
 
 
-def test_invalid_live_parameters_are_diagnostic_only_and_guard_actuation(
+def test_stale_plan_then_fresh_changed_plan_recovers_without_switching() -> None:
+  selected = live()
+  state, output, live_params = vehicle_messages()
+  clock = FakeClock()
+  with patch.object(
+    live_module,
+    "control_witness_mono_ns",
+    side_effect=lambda: clock.now_ns,
+  ):
+    bind_modular(selected, clock, state, output)
+    valid = step(selected, clock, state, output, live_params)
+    assert valid.status == CandidateStatus.MODULAR_OK
+
+    stale_publication_ns = (
+      clock.now_ns - MAX_MODEL_PUBLICATION_AGE_NS - 1
+    )
+    stale_model = model(curvature=0.02)
+    stale_model.timestampEof = stale_publication_ns - 10_000_000
+    stale = step(
+      selected,
+      clock,
+      state,
+      output,
+      live_params,
+      model_input=stale_model,
+      model_publication_mono_ns=stale_publication_ns,
+    )
+    assert selected.prepared_input is not None
+    assert selected.prepared_input.adaptation is not None
+    assert (
+      selected.prepared_input.adaptation.status.code
+      == IntentStatusCode.MESSAGE_STALE
+    )
+    assert stale.status == CandidateStatus.MODULAR_CORE_INVALID
+    assert stale.safety_state == LiveSafetyState.HOLDING_FIRST_INVALID
+
+    recovered = stale
+    for _ in range(RECOVERY_OK_FRAMES):
+      changed = model(curvature=-0.02)
+      changed.frameId = 43
+      changed.timestampEof = clock.now_ns - 20_000_000
+      recovered = step(
+        selected,
+        clock,
+        state,
+        output,
+        live_params,
+        model_input=changed,
+      )
+    assert selected.selection == ControllerSelection.MODULAR
+    assert recovered.status == CandidateStatus.MODULAR_OK
+    assert recovered.safety_state == LiveSafetyState.OK
+    assert recovered.core_result is not None
+    assert recovered.core_result.desired_curvature < 0.0
+
+
+def test_invalid_live_parameters_reset_rack_motion_and_guard_actuation(
 ) -> None:
   for failure in ("message", "subscription"):
     selected = live()
@@ -950,11 +1467,12 @@ def test_invalid_live_parameters_are_diagnostic_only_and_guard_actuation(
         == LiveAdapterStatus.INVALID_LIVE_PARAMETERS
       )
       assert not selected.prepared_input.live_parameters_valid
+      assert not selected.prepared_input.rack_derivative_valid
       assert not selected.prepared_input.lateral_valid
       assert invalid.core_result is not None
       assert (
         invalid.core_result.status
-        == CoreStatus.DEGRADED_NOMINAL_MAPPING
+        == CoreStatus.INVALID_MEASUREMENT
       )
       assert invalid.status == CandidateStatus.MODULAR_CORE_INVALID
       assert invalid.safety_state == LiveSafetyState.HOLDING_FIRST_INVALID
@@ -1090,7 +1608,9 @@ def test_binding_mismatch_poison_lasts_until_both_false_session_boundary(
   selected.observe_inactive_state(
     state_sample_mono_ns=clock.now_ns - 15_000_000,
     car_state=state,
+    live_parameters=live_params,
     inputs_valid=True,
+    live_parameters_inputs_valid=True,
   )
   assert selected.observe_previous_applied(output)
   assert selected.update_engagement(
@@ -1128,6 +1648,8 @@ def test_envelope_output_raw_scalar_timing_and_schema_round_trip(
   )
   assert prepared.state_sample_mono_ns == BASE_NS + 245_000_000
   assert prepared.control_witness_mono_ns == BASE_NS + 250_000_000
+  assert result.core_result is not None
+  core = result.core_result
   assert result.feasible_counts is not None
   assert result.command_torque == result.feasible_torque
   assert (
@@ -1147,6 +1669,9 @@ def test_envelope_output_raw_scalar_timing_and_schema_round_trip(
     assert decoded.modularSelection == ControllerSelection.MODULAR
     assert decoded.modularArtifactHash == selected.artifact_sha256
     assert decoded.modularPolicyHash == selected.policy_sha256
+    assert decoded.modularHorizonPolicyHash == (
+      selected.horizon_policy_sha256
+    )
     assert decoded.modularRuntimeIdentityHash == (
       selected.runtime_identity_sha256
     )
@@ -1158,6 +1683,13 @@ def test_envelope_output_raw_scalar_timing_and_schema_round_trip(
     )
     assert math.isclose(decoded.modularRawScalarCurvature, 0.012, rel_tol=1e-6, abs_tol=1e-12)
     assert decoded.modularCommandTorque == result.command_torque
+    assert decoded.modularPlannedTorque == core.planned_torque
+    assert decoded.modularPlannedCounts == core.planned_counts
+    assert decoded.modularPreviousCommandCounts == 37
+    assert decoded.modularRecordedAppliedTorque == 37 / 409
+    assert decoded.modularSteeringRequestActive
+    assert decoded.modularSteeringRequestValid
+    assert decoded.modularHorizonValid
     assert decoded.modularCommandEnvelopeApplied
     assert decoded.modularControlsValid
 
@@ -1235,6 +1767,17 @@ def test_stock_arm_remains_the_unmodified_stock_update_shape() -> None:
     assert required in stock_arm
   assert "update_modular" not in stock_arm
   assert "blatv2_messages_valid = True" in stock_arm
+
+  modular_arm = source[modular_start:]
+  assert (
+    "not self.blatv2_live.final_count_match_valid"
+    in modular_arm
+  )
+  assert "self.blatv2_live.final_limiter_altered" in modular_arm
+  assert (
+    "actuator_constrained_previous=self.steer_limited_by_safety"
+    not in modular_arm
+  )
 
 
 def test_production_sources_have_no_platform_literals_or_legacy_mechanisms() -> None:

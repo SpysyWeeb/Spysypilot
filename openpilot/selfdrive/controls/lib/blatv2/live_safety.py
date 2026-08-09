@@ -98,7 +98,10 @@ class InvalidOutputGuard:
       if self.invalid_frames >= self.invalid_latch_frames:
         self.comm_issue_latched = True
       if self.invalid_frames == 1:
-        torque = applied if math.isfinite(applied) else 0.0
+        held = applied if math.isfinite(applied) else 0.0
+        torque = apply_torque_envelope(
+          limits, held, held, driver_torque,
+        ).applied_torque
         constrained = True
         state = LiveSafetyState.HOLDING_FIRST_INVALID
       else:

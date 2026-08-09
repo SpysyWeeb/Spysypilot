@@ -19,10 +19,11 @@ namespace {
 constexpr std::array<char, 8> kMagic = {
   'B', 'L', 'A', 'T', 'V', '2', 'R', '1',
 };
-// v4 binds the selected input stream to recent-window live-torque health
-// reconstruction. The Python side compacts these bounded messages into typed
-// binary planes immediately; it never retains route-wide Cap'n Proto builders.
-constexpr uint32_t kStreamSchemaVersion = 4;
+// v5 adds a bounded projection of outgoing Hyundai LKAS11 candidates. The
+// Python side authenticates platform/build provenance before decoding them.
+constexpr uint32_t kStreamSchemaVersion = 5;
+constexpr uint32_t kHyundaiLkas11Address = 0x340;
+constexpr uint8_t kHyundaiLkas11Bus = 0;
 constexpr uint32_t kEndRecord = std::numeric_limits<uint32_t>::max();
 constexpr size_t kInputChunkSize = 256 * 1024;
 constexpr size_t kMaximumSegmentCount = 512;
@@ -80,6 +81,7 @@ bool selected(cereal::Event::Which which) {
     case cereal::Event::LIVE_TORQUE_PARAMETERS:
     case cereal::Event::LIVE_DELAY:
     case cereal::Event::LATERAL_MANEUVER_PLAN:
+    case cereal::Event::SENDCAN:
       return true;
     default:
       return false;
@@ -122,6 +124,73 @@ public:
   }
 
 private:
+  bool writeRecord(
+    cereal::Event::Which which,
+    uint64_t mono_time,
+    const uint8_t *message,
+    size_t message_size
+  ) {
+    if (
+      !writeU32(static_cast<uint32_t>(message_size))
+      || !writeU32(static_cast<uint32_t>(which))
+      || !writeU64(mono_time)
+    ) {
+      return false;
+    }
+    std::cout.write(
+      reinterpret_cast<const char *>(message),
+      static_cast<std::streamsize>(message_size)
+    );
+    return std::cout.good();
+  }
+
+  bool writeSendcanProjection(const cereal::Event::Reader &event) {
+    const auto frames = event.getSendcan();
+    size_t selected_count = 0;
+    for (const auto frame : frames) {
+      selected_count += (
+        frame.getAddress() == kHyundaiLkas11Address
+        && frame.getSrc() == kHyundaiLkas11Bus
+        && frame.getDat().size() == 8
+      );
+    }
+    if (selected_count == 0) {
+      return true;
+    }
+
+    capnp::MallocMessageBuilder builder;
+    auto projected = builder.initRoot<cereal::Event>();
+    projected.setValid(event.getValid());
+    projected.setLogMonoTime(event.getLogMonoTime());
+    auto output = projected.initSendcan(selected_count);
+    size_t output_index = 0;
+    for (const auto frame : frames) {
+      if (
+        frame.getAddress() != kHyundaiLkas11Address
+        || frame.getSrc() != kHyundaiLkas11Bus
+        || frame.getDat().size() != 8
+      ) {
+        continue;
+      }
+      auto selected_frame = output[output_index++];
+      selected_frame.setAddress(frame.getAddress());
+      selected_frame.setDat(frame.getDat());
+      selected_frame.setSrc(frame.getSrc());
+    }
+    const auto words = capnp::messageToFlatArray(builder);
+    const auto bytes = words.asBytes();
+    if (!writeRecord(
+      cereal::Event::SENDCAN,
+      event.getLogMonoTime(),
+      bytes.begin(),
+      bytes.size()
+    )) {
+      return false;
+    }
+    ++emitted_count_;
+    return true;
+  }
+
   bool nextMessageSize(size_t *message_size) const {
     const size_t available = pending_.size() - offset_;
     if (available < 8) {
@@ -200,23 +269,23 @@ private:
           );
         }
         if (selected(which)) {
-          if (
-            !writeU32(static_cast<uint32_t>(message_size))
-            || !writeU32(static_cast<uint32_t>(which))
-            || !writeU64(event.getLogMonoTime())
-          ) {
-            std::cerr << "could not write extraction stream\n";
-            return false;
+          if (which == cereal::Event::SENDCAN) {
+            if (!writeSendcanProjection(event)) {
+              std::cerr << "could not write extraction stream\n";
+              return false;
+            }
+          } else {
+            if (!writeRecord(
+              which,
+              event.getLogMonoTime(),
+              message,
+              message_size
+            )) {
+              std::cerr << "could not write extraction payload\n";
+              return false;
+            }
+            ++emitted_count_;
           }
-          std::cout.write(
-            reinterpret_cast<const char *>(message),
-            static_cast<std::streamsize>(message_size)
-          );
-          if (!std::cout.good()) {
-            std::cerr << "could not write extraction payload\n";
-            return false;
-          }
-          ++emitted_count_;
         }
         offset_ += message_size;
       }

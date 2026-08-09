@@ -5,9 +5,9 @@ per independent authority into one immutable container: the existing physical
 ``MeasuredLearningFrame`` wire plane is stored exactly once, while the compact
 behavior planes preserve the clocks and source values needed for exact replay.
 
-Version 2 intentionally has no compatibility path for the old physical-only
-``BLATSP01`` spool.  Treating an old spool as complete behavior evidence would
-silently train on missing model/controller context, so it fails closed.
+Version 4 adds device and active-controller timing/comms witnesses. Version-3
+artifacts fail closed because missing hardware provenance and guard state
+cannot qualify the 10 ms device budget.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ import tempfile
 from typing import Any
 
 
-ROUTE_EVIDENCE_MAGIC = b"BLATRE02"
-ROUTE_EVIDENCE_VERSION = 2
+ROUTE_EVIDENCE_MAGIC = b"BLATRE04"
+ROUTE_EVIDENCE_VERSION = 4
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
 MAX_CAR_PARAMS_BYTES = 1024 * 1024
 MAX_PHYSICAL_RECORDS = 1_000_000
@@ -49,7 +49,7 @@ _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 # manifest, CarParams, physical, model, controls, torque, delay, maneuver, event
 _HEADER = struct.Struct("<8sHH9Q")
 _MODEL = struct.Struct("<IIQqqddBBBBH")
-_CONTROL = struct.Struct("<IIQIiiiiQqqQqqddddi18B")
+_CONTROL = struct.Struct("<IIQIiiiiQqqQqqddddiB21BdQbHBBB11Bii2B")
 _TORQUE = struct.Struct("<IIQdddqBBB")
 _DELAY = struct.Struct("<IIQdqBBH")
 _MANEUVER = struct.Struct("<IIQdBB")
@@ -249,6 +249,15 @@ class RouteEvidenceSourceIdentity:
   gap_count: int
   model_link_failure_count: int
   pre_poll_dropped_timestamps_ns: tuple[int, ...] = ()
+  device_type: str = "unknown"
+  controller_architecture: str = ""
+  recorded_source_openpilot_commit: str = ""
+  recorded_opendbc_commit: str = ""
+  live_artifact_sha256: str = ""
+  recorded_runtime_identity_sha256: str = ""
+  recorded_profile_sha256: str = ""
+  recorded_controller_policy_sha256: str = ""
+  recorded_horizon_policy_sha256: str = ""
 
   def __post_init__(self) -> None:
     _text(self.route_id, "route id", 1024)
@@ -304,6 +313,34 @@ class RouteEvidenceSourceIdentity:
       if value <= previous:
         raise RouteEvidenceError("pre-poll timestamps are not ordered")
       previous = value
+    _text(self.device_type, "device type", 64)
+    recorded_identity = (
+      self.controller_architecture,
+      self.recorded_source_openpilot_commit,
+      self.recorded_opendbc_commit,
+      self.recorded_runtime_identity_sha256,
+      self.recorded_profile_sha256,
+      self.recorded_controller_policy_sha256,
+      self.recorded_horizon_policy_sha256,
+    )
+    if any(recorded_identity) != all(recorded_identity):
+      raise RouteEvidenceError("recorded controller identity is incomplete")
+    if self.controller_architecture:
+      _text(self.controller_architecture, "controller architecture", 128)
+      _commit(
+        self.recorded_source_openpilot_commit,
+        "recorded source openpilot commit",
+      )
+      _commit(self.recorded_opendbc_commit, "recorded opendbc commit")
+      for field, value in (
+        ("recorded runtime identity", self.recorded_runtime_identity_sha256),
+        ("recorded profile", self.recorded_profile_sha256),
+        ("recorded controller policy", self.recorded_controller_policy_sha256),
+        ("recorded horizon policy", self.recorded_horizon_policy_sha256),
+      ):
+        _hash(value, field)
+    if self.live_artifact_sha256:
+      _hash(self.live_artifact_sha256, "live artifact hash")
 
   def manifest_dict(self) -> dict[str, object]:
     payload = asdict(self)
@@ -376,6 +413,7 @@ class ControlsWitness:
   desired_curvature: float
   envelope_headroom: float
   torque_output_can_count: int
+  steering_request_fault_avoidance_counter: int
   message_valid: bool
   model_message_alive: bool
   model_link_valid: bool
@@ -394,6 +432,31 @@ class ControlsWitness:
   live_delay_available: bool
   live_torque_parameters_checks_passed: bool
   live_torque_parameters_health_exact: bool
+  steering_request_active: bool
+  steering_request_active_valid: bool
+  steering_request_fault_avoidance_counter_valid: bool
+  modular_compute_time_seconds: float = 0.0
+  modular_control_witness_mono_ns: int = 0
+  modular_selection: int = -1
+  modular_invalid_frames: int = 0
+  modular_recovery_ok_frames: int = 0
+  modular_intent_status: int = 0
+  modular_safety_state: int = 0
+  modular_telemetry_available: bool = False
+  modular_active: bool = False
+  modular_selection_bound: bool = False
+  modular_controls_valid: bool = False
+  modular_car_control_valid: bool = False
+  modular_vehicle_state_valid: bool = False
+  modular_live_parameters_valid: bool = False
+  modular_horizon_valid: bool = False
+  modular_control_cadence_valid: bool = False
+  modular_adapter_exception: bool = False
+  modular_production_envelope_verified: bool = False
+  modular_final_expected_counts: int = 0
+  modular_final_count_residual: int = 0
+  modular_final_count_match_valid: bool = False
+  modular_final_limiter_altered: bool = False
 
   def __post_init__(self) -> None:
     _uint(self.segment_index, "control segment", (1 << 32) - 1)
@@ -423,6 +486,11 @@ class ControlsWitness:
     if headroom < 0.0 or headroom > 1.0:
       raise RouteEvidenceError("envelope headroom is outside [0,1]")
     _sint(self.torque_output_can_count, "torque output CAN count", -(1 << 31), (1 << 31) - 1)
+    _uint(
+      self.steering_request_fault_avoidance_counter,
+      "steering request fault avoidance counter",
+      255,
+    )
     for field in (
       "message_valid", "model_message_alive", "model_link_valid",
       "inputs_valid", "lateral_active", "driver_intervening",
@@ -432,14 +500,82 @@ class ControlsWitness:
       "live_torque_parameters_available", "live_delay_available",
       "live_torque_parameters_checks_passed",
       "live_torque_parameters_health_exact",
+      "steering_request_active", "steering_request_active_valid",
+      "steering_request_fault_avoidance_counter_valid",
+      "modular_telemetry_available", "modular_active",
+      "modular_selection_bound", "modular_controls_valid",
+      "modular_car_control_valid", "modular_vehicle_state_valid",
+      "modular_live_parameters_valid", "modular_horizon_valid",
+      "modular_control_cadence_valid", "modular_adapter_exception",
+      "modular_production_envelope_verified",
+      "modular_final_count_match_valid", "modular_final_limiter_altered",
     ):
       _boolean(getattr(self, field), field)
+    _finite(self.modular_compute_time_seconds, "modular compute time")
+    _uint(self.modular_control_witness_mono_ns, "modular control witness")
+    _sint(self.modular_selection, "modular selection", -1, 1)
+    _uint(self.modular_invalid_frames, "modular invalid frames", (1 << 16) - 1)
+    _uint(self.modular_recovery_ok_frames, "modular recovery frames", (1 << 8) - 1)
+    _uint(self.modular_intent_status, "modular intent status", (1 << 8) - 1)
+    _uint(self.modular_safety_state, "modular safety state", (1 << 8) - 1)
+    _sint(
+      self.modular_final_expected_counts,
+      "modular final expected counts",
+      -(1 << 31),
+      (1 << 31) - 1,
+    )
+    _sint(
+      self.modular_final_count_residual,
+      "modular final count residual",
+      -(1 << 31),
+      (1 << 31) - 1,
+    )
+    if self.modular_selection_bound and self.modular_selection != 1:
+      raise RouteEvidenceError("bound modular selection is not modular")
+    if not self.modular_telemetry_available and any((
+      self.modular_compute_time_seconds != 0.0,
+      self.modular_control_witness_mono_ns != 0,
+      self.modular_invalid_frames != 0,
+      self.modular_recovery_ok_frames != 0,
+      self.modular_intent_status != 0,
+      self.modular_safety_state != 0,
+      self.modular_controls_valid,
+      self.modular_car_control_valid,
+      self.modular_vehicle_state_valid,
+      self.modular_live_parameters_valid,
+      self.modular_horizon_valid,
+      self.modular_control_cadence_valid,
+      self.modular_adapter_exception,
+      self.modular_production_envelope_verified,
+      self.modular_final_expected_counts != 0,
+      self.modular_final_count_residual != 0,
+      self.modular_final_count_match_valid,
+      self.modular_final_limiter_altered,
+    )):
+      raise RouteEvidenceError("unavailable modular telemetry is not canonical")
     if self.model_link_valid != (self.model_publication_index >= 0):
       raise RouteEvidenceError("model link flag and index disagree")
     if self.car_control_paired != (self.car_control_mono_ns >= 0):
       raise RouteEvidenceError("carControl pairing flag and clock disagree")
     if self.torque_output_can_valid is False and self.torque_output_can_count != 0:
       raise RouteEvidenceError("invalid CAN count must be canonical zero")
+    if not self.steering_request_active_valid and self.steering_request_active:
+      raise RouteEvidenceError("invalid steering request must be canonical false")
+    if (
+      not self.steering_request_fault_avoidance_counter_valid
+      and self.steering_request_fault_avoidance_counter != 0
+    ):
+      raise RouteEvidenceError("invalid fault avoidance counter must be canonical zero")
+    if (
+      self.steering_request_fault_avoidance_counter_valid
+      and not self.steering_request_active_valid
+    ):
+      raise RouteEvidenceError("fault avoidance counter requires request validity")
+    if self.inputs_valid and (
+      not self.steering_request_active_valid
+      or not self.steering_request_active
+    ):
+      raise RouteEvidenceError("physical input requires an active steering request")
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,6 +701,7 @@ def _encode_controls(records: tuple[ControlsWitness, ...]) -> bytes:
       value.car_control_mono_ns, value.raw_request_torque,
       value.measured_curvature, value.desired_curvature,
       value.envelope_headroom, value.torque_output_can_count,
+      value.steering_request_fault_avoidance_counter,
       value.message_valid, value.model_message_alive, value.model_link_valid,
       value.inputs_valid, value.lateral_active, value.driver_intervening,
       value.steer_fault, value.intervention_onset,
@@ -574,6 +711,31 @@ def _encode_controls(records: tuple[ControlsWitness, ...]) -> bytes:
       value.live_torque_parameters_available, value.live_delay_available,
       value.live_torque_parameters_checks_passed,
       value.live_torque_parameters_health_exact,
+      value.steering_request_active,
+      value.steering_request_active_valid,
+      value.steering_request_fault_avoidance_counter_valid,
+      value.modular_compute_time_seconds,
+      value.modular_control_witness_mono_ns,
+      value.modular_selection,
+      value.modular_invalid_frames,
+      value.modular_recovery_ok_frames,
+      value.modular_intent_status,
+      value.modular_safety_state,
+      value.modular_telemetry_available,
+      value.modular_active,
+      value.modular_selection_bound,
+      value.modular_controls_valid,
+      value.modular_car_control_valid,
+      value.modular_vehicle_state_valid,
+      value.modular_live_parameters_valid,
+      value.modular_horizon_valid,
+      value.modular_control_cadence_valid,
+      value.modular_adapter_exception,
+      value.modular_production_envelope_verified,
+      value.modular_final_expected_counts,
+      value.modular_final_count_residual,
+      value.modular_final_count_match_valid,
+      value.modular_final_limiter_altered,
     )
     offset += _CONTROL.size
   return bytes(output)
@@ -585,7 +747,7 @@ def _decode_controls(encoded: memoryview, count: int) -> tuple[ControlsWitness, 
   values: list[ControlsWitness] = []
   for offset in range(0, len(encoded), _CONTROL.size):
     row = _CONTROL.unpack_from(encoded, offset)
-    flags = row[19:]
+    flags = (*row[20:41], *row[48:59], *row[61:63])
     if any(flag not in (0, 1) for flag in flags):
       raise RouteEvidenceError("control boolean is non-canonical")
     values.append(ControlsWitness(
@@ -598,17 +760,43 @@ def _decode_controls(encoded: memoryview, count: int) -> tuple[ControlsWitness, 
       car_control_mono_ns=row[13], raw_request_torque=row[14],
       measured_curvature=row[15], desired_curvature=row[16],
       envelope_headroom=row[17], torque_output_can_count=row[18],
-      message_valid=bool(row[19]), model_message_alive=bool(row[20]),
-      model_link_valid=bool(row[21]), inputs_valid=bool(row[22]),
-      lateral_active=bool(row[23]), driver_intervening=bool(row[24]),
-      steer_fault=bool(row[25]), intervention_onset=bool(row[26]),
-      intervention_onset_uncertain=bool(row[27]), race_unresolved=bool(row[28]),
-      gap_from_previous=bool(row[29]), car_control_paired=bool(row[30]),
-      torque_output_can_valid=bool(row[31]), maneuver_plan_available=bool(row[32]),
-      live_torque_parameters_available=bool(row[33]),
-      live_delay_available=bool(row[34]),
-      live_torque_parameters_checks_passed=bool(row[35]),
-      live_torque_parameters_health_exact=bool(row[36]),
+      steering_request_fault_avoidance_counter=row[19],
+      message_valid=bool(row[20]), model_message_alive=bool(row[21]),
+      model_link_valid=bool(row[22]), inputs_valid=bool(row[23]),
+      lateral_active=bool(row[24]), driver_intervening=bool(row[25]),
+      steer_fault=bool(row[26]), intervention_onset=bool(row[27]),
+      intervention_onset_uncertain=bool(row[28]), race_unresolved=bool(row[29]),
+      gap_from_previous=bool(row[30]), car_control_paired=bool(row[31]),
+      torque_output_can_valid=bool(row[32]), maneuver_plan_available=bool(row[33]),
+      live_torque_parameters_available=bool(row[34]),
+      live_delay_available=bool(row[35]),
+      live_torque_parameters_checks_passed=bool(row[36]),
+      live_torque_parameters_health_exact=bool(row[37]),
+      steering_request_active=bool(row[38]),
+      steering_request_active_valid=bool(row[39]),
+      steering_request_fault_avoidance_counter_valid=bool(row[40]),
+      modular_compute_time_seconds=row[41],
+      modular_control_witness_mono_ns=row[42],
+      modular_selection=row[43],
+      modular_invalid_frames=row[44],
+      modular_recovery_ok_frames=row[45],
+      modular_intent_status=row[46],
+      modular_safety_state=row[47],
+      modular_telemetry_available=bool(row[48]),
+      modular_active=bool(row[49]),
+      modular_selection_bound=bool(row[50]),
+      modular_controls_valid=bool(row[51]),
+      modular_car_control_valid=bool(row[52]),
+      modular_vehicle_state_valid=bool(row[53]),
+      modular_live_parameters_valid=bool(row[54]),
+      modular_horizon_valid=bool(row[55]),
+      modular_control_cadence_valid=bool(row[56]),
+      modular_adapter_exception=bool(row[57]),
+      modular_production_envelope_verified=bool(row[58]),
+      modular_final_expected_counts=row[59],
+      modular_final_count_residual=row[60],
+      modular_final_count_match_valid=bool(row[61]),
+      modular_final_limiter_altered=bool(row[62]),
     ))
   return tuple(values)
 

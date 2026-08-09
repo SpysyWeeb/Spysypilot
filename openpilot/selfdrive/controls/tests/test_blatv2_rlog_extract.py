@@ -188,6 +188,59 @@ def current_event(which: str, mono_ns: int) -> bytes:
   return event.to_bytes()
 
 
+def sendcan_event(
+  mono_ns: int,
+  frames: tuple[tuple[int, bytes, int], ...],
+) -> bytes:
+  event = log.Event.new_message(valid=True, logMonoTime=mono_ns)
+  output = event.init("sendcan", len(frames))
+  for index, (address, dat, src) in enumerate(frames):
+    output[index].address = address
+    output[index].dat = dat
+    output[index].src = src
+  return event.to_bytes()
+
+
+def test_native_projects_only_exact_lkas11_candidates(
+  native_extractor: Path,
+  tmp_path: Path,
+) -> None:
+  raw = sendcan_event(100, (
+    (0x123, b"unrelated", 0),
+    (0x340, bytes.fromhex("0000c11430006812"), 0),
+    (0x340, b"wrongbus", 1),
+    (0x340, b"short", 0),
+  ))
+  segment = tmp_path / "sendcan-rlog"
+  segment.write_bytes(raw)
+
+  extracted = extract_segment_events(native_extractor, segment)
+  assert len(extracted) == 1
+  assert extracted[0].which == learning_backfill._EVENT_WHICH["sendcan"]
+  assert extracted[0].mono_ns == 100
+  assert extracted[0].encoded != raw
+  with learning_backfill.bounded_event_reader(extracted[0].encoded) as event:
+    assert event.which() == "sendcan"
+    assert [(frame.address, bytes(frame.dat), frame.src) for frame in event.sendcan] == [
+      (0x340, bytes.fromhex("0000c11430006812"), 0),
+    ]
+  decoded = learning_backfill._decode_extracted_event(
+    extracted[0],
+    learning_backfill.bounded_event_reader,
+  )
+  assert isinstance(decoded.payload, learning_backfill._RecordedSendcan)
+  assert decoded.payload.frames == (
+    learning_backfill._RecordedOutgoingCanFrame(
+      0x340,
+      bytes.fromhex("0000c11430006812"),
+      0,
+    ),
+  )
+
+  segment.write_bytes(sendcan_event(101, ((0x123, b"unrelated", 0),)))
+  assert extract_segment_events(native_extractor, segment) == ()
+
+
 def test_native_retains_complete_shared_evidence_input_set(
   native_extractor: Path,
   tmp_path: Path,
@@ -638,6 +691,30 @@ def test_python_protocol_requires_finite_verified_trailer_and_exit(
     extract_segment_events(extractor, segment)
 
   assert raised.value.reason == reason
+
+
+def test_python_protocol_rejects_previous_v4_extractor_stream(
+  tmp_path: Path,
+) -> None:
+  output = b"".join((
+    learning_backfill._STREAM_HEADER.pack(
+      learning_backfill._STREAM_MAGIC,
+      4,
+      0,
+    ),
+    learning_backfill._RECORD_HEADER.pack(
+      0,
+      learning_backfill._END_RECORD,
+      0,
+    ),
+  ))
+  extractor = fake_extractor(tmp_path, output)
+  segment = tmp_path / "segment"
+  segment.write_bytes(b"unused")
+
+  with pytest.raises(RouteRejected) as raised:
+    extract_segment_events(extractor, segment)
+  assert raised.value.reason == "extractor_schema_mismatch"
 
 
 def test_python_protocol_enforces_selected_record_bound(

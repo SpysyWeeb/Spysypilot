@@ -528,6 +528,18 @@ class BlatV2ProfileDaemon:
       opendbc_commit=context.commits.opendbc_commit,
       panda_commit=context.commits.panda_commit,
     )
+    if (
+      context.activation.diagnostic in (
+        ArtifactDiagnostic.OK,
+        ArtifactDiagnostic.ABSENT,
+      )
+      and self.last_artifact_diagnostic not in (
+        ArtifactDiagnostic.OK,
+        ArtifactDiagnostic.ABSENT,
+      )
+    ):
+      payload["controller_state"] = "unavailable"
+      payload["diagnostic"] = self.last_artifact_diagnostic.value
     encoded = canonical_lifecycle_status_bytes(payload)
     if encoded == self._last_lifecycle_status_bytes:
       return

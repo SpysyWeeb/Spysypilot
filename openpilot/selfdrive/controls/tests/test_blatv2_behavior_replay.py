@@ -10,8 +10,10 @@ import struct
 from unittest.mock import patch
 
 from opendbc.car.structs import car
+from opendbc.car.hyundai.steering_request import MAX_ANGLE, MAX_ANGLE_FRAMES
 from opendbc.car.vehicle_model import VehicleModel
 
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.blatv2.actuator import (
   RuntimeTorqueLimits,
   apply_torque_envelope_counts,
@@ -317,7 +319,7 @@ def decoded_route(
   for index in range(count):
     mono_ns = BASE_NS + index * 10_000_000
     curvature = 0.0 if index == 0 else 0.012
-    times = tuple(sample * 0.05 for sample in range(20))
+    times = tuple(ModelConstants.T_IDXS)
     models.append(SparseModelBehaviorIntent(
       plan_origin_mono_time_ns=mono_ns,
       publication_mono_time_ns=mono_ns,
@@ -416,9 +418,11 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
       timestamp_eof_ns=BASE_NS + (index + 1) * 10_000_000 - 6_000_000,
       scalar_curvature=0.01 + index * 0.001,
       desired_curvature_time_s=0.25,
-      plan_times=(0.0, 0.05, 0.1),
-      orientation_rate_z=(0.08, 0.088, 0.096),
-      velocity_x=(8.0, 8.0, 8.0),
+      plan_times=tuple(ModelConstants.T_IDXS),
+      orientation_rate_z=tuple(
+        (0.01 + index * 0.001) * 8.0 for _ in ModelConstants.T_IDXS
+      ),
+      velocity_x=tuple(8.0 for _ in ModelConstants.T_IDXS),
       message_valid=True,
       native_grid_valid=True,
     )
@@ -445,6 +449,7 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
       desired_curvature=0.01,
       envelope_headroom=1.0 - index / 409.0,
       torque_output_can_count=index,
+      steering_request_fault_avoidance_counter=0,
       message_valid=True,
       model_message_alive=index > 0,
       model_link_valid=index > 0,
@@ -463,6 +468,9 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
       live_delay_available=True,
       live_torque_parameters_checks_passed=True,
       live_torque_parameters_health_exact=True,
+      steering_request_active=True,
+      steering_request_active_valid=True,
+      steering_request_fault_avoidance_counter_valid=True,
     )
     for index in range(4)
   )
@@ -480,9 +488,9 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
     behavior_ineligible_reason="eligible",
     vehicle_identity=FINGERPRINT,
     runtime_identity="5" * 64,
-    schema_versions={"extractor": 3, "route_evidence": 2},
+    schema_versions={"extractor": 3, "route_evidence": 4},
     preparation_provenance={"canonical": True},
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=4,
     preparation_cache_key="6" * 64,
     controls_witness_count=4,
@@ -516,11 +524,16 @@ def replace_route_evidence(
   *,
   source: RouteEvidenceSourceIdentity | None = None,
   witnesses: tuple[ControlsWitness, ...] | None = None,
+  physical_frames: tuple[MeasuredLearningFrame, ...] | None = None,
 ) -> RouteEvidenceArtifact:
   return RouteEvidenceArtifact(
     artifact.source_identity if source is None else source,
     bytes(artifact.car_params_bytes),
-    bytes(artifact.physical_bytes),
+    (
+      bytes(artifact.physical_bytes)
+      if physical_frames is None
+      else b"".join(_encode_frame(frame) for frame in physical_frames)
+    ),
     artifact.model_publications,
     artifact.control_witnesses if witnesses is None else witnesses,
     artifact.live_torque_parameters,
@@ -533,16 +546,20 @@ def replace_route_evidence(
 def output_bytes(outputs) -> bytes:
   return b"".join(
     struct.pack(
-      "<Q7d3?",
+      "<Q9d5?",
       output.mono_time_ns,
       output.measured_curvature_1pm,
       output.measured_rack_angle_deg,
       output.measured_rack_rate_deg_s,
       output.measured_rack_accel_deg_s2,
       output.raw_requested_torque,
+      output.planned_requested_torque,
+      output.reachable_envelope_torque,
       output.envelope_applied_torque,
       output.torque_headroom,
       output.actuator_constrained,
+      output.steering_request_active,
+      output.maximum_authority_required,
       output.controller_fault,
       output.response_eligible,
     )
@@ -588,9 +605,13 @@ def request(
         measured_rack_rate_deg_s=0.0,
         measured_rack_accel_deg_s2=0.0,
         raw_requested_torque=0.0,
+        planned_requested_torque=0.0,
+        reachable_envelope_torque=0.0,
         envelope_applied_torque=0.0,
         torque_headroom=1.0,
         actuator_constrained=False,
+        steering_request_active=True,
+        maximum_authority_required=False,
         lateral_active=control.lateral_active,
         inputs_valid=control.inputs_valid,
         steering_pressed=control.steering_pressed,
@@ -712,6 +733,13 @@ def test_replay_frame_input_roundtrip_is_exact_and_strict() -> None:
   assert restored == original
   assert math.copysign(1.0, restored.recorded_rack_angle_deg) == -1.0
   assert restored.to_bytes() == encoded
+  old_schema = encoded.replace(b'"schemaVersion":2', b'"schemaVersion":1')
+  try:
+    ReplayFrameInput.from_bytes(old_schema)
+  except BehaviorReplayError as error:
+    assert "schema is incompatible" in str(error)
+  else:
+    raise AssertionError("prior replay-input semantics were accepted")
   with patch("json.loads", return_value={"schemaVersion": 1}):
     try:
       ReplayFrameInput.from_bytes(encoded)
@@ -784,6 +812,64 @@ def test_decoder_preserves_inactive_premodel_prefix_and_exact_links() -> None:
   assert active.live_torque_inputs_valid
   assert decoded.event_locators[0].event_type == "lat.turnStopTurn"
   assert decoded.route_evidence_sha256 == artifact.sha256
+
+
+def test_decoder_signs_unsigned_rate_and_keeps_reversal_cadence() -> None:
+  base = route_evidence_with_inactive_premodel_prefix()
+  original = tuple(base.iter_physical_frames())
+  frames = tuple(
+    replace(
+      frame,
+      steering_angle_deg=angle,
+      steering_rate_deg_s=8.0,
+    )
+    for frame, angle in zip(
+      original,
+      (0.0, -0.1, 0.0, 0.1),
+      strict=True,
+    )
+  )
+  artifact = replace_route_evidence(base, physical_frames=frames)
+  decoded = make_behavior_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )(artifact, physical_profile())
+  inputs = tuple(
+    ReplayFrameInput.from_bytes(control.core_input)
+    for control in decoded.control_inputs
+  )
+
+  assert inputs[1].recorded_rack_rate_deg_s == -8.0
+  assert inputs[1].recorded_rack_acceleration_deg_s2 == 0.0
+  assert inputs[1].control_cadence_valid
+  assert inputs[2].recorded_rack_rate_deg_s == 8.0
+  assert inputs[2].recorded_rack_acceleration_deg_s2 == 0.0
+  assert inputs[2].control_cadence_valid
+
+
+def test_decoder_does_not_bridge_live_mapping_dropout() -> None:
+  base = route_evidence_with_inactive_premodel_prefix()
+  frames = tuple(base.iter_physical_frames())
+  artifact = replace_route_evidence(
+    base,
+    physical_frames=(
+      frames[0],
+      frames[1],
+      replace(frames[2], live_parameters_valid=False),
+      frames[3],
+    ),
+  )
+  decoder = make_behavior_route_evidence_decoder(
+    provisional_dynamics=provisional(),
+    interface_registry=INTERFACES,
+  )
+
+  try:
+    decoder(artifact, physical_profile())
+  except BehaviorReplayError as error:
+    assert "signed rack motion" in str(error)
+  else:
+    raise AssertionError("mapping dropout bridged signed rack history")
 
 
 def test_scenario_decoder_preserves_unverified_recorded_source_without_relabeling() -> None:
@@ -1019,10 +1105,13 @@ def test_modular_replay_calls_existing_core_and_is_exact_aa() -> None:
   replay_request = request(route, modular=True)
   original_update = ModularControllerCore.update
   calls = []
+  requests = []
 
   def traced_update(self, *args, **kwargs):
     calls.append(kwargs["scalar_curvature"])
-    return original_update(self, *args, **kwargs)
+    result = original_update(self, *args, **kwargs)
+    requests.append((result.raw_torque, result.planned_torque))
+    return result
 
   with patch.object(ModularControllerCore, "update", traced_update):
     first = tuple(modular_core().replay_route(replay_request))
@@ -1030,21 +1119,73 @@ def test_modular_replay_calls_existing_core_and_is_exact_aa() -> None:
 
   assert len(calls) == len(route.control_inputs) - 1
   assert first == second
+  assert any(raw != planned for raw, planned in requests)
+  assert tuple(output.raw_requested_torque for output in first[1:]) == tuple(
+    raw for raw, _ in requests
+  )
+  assert tuple(output.planned_requested_torque for output in first[1:]) == tuple(
+    planned for _, planned in requests
+  )
+  assert any(
+    output.raw_requested_torque != output.planned_requested_torque
+    for output in first[1:]
+  )
+  limits = RuntimeTorqueLimits(409, 4, 7, 1, 50, 2, 1, True)
+  previous_applied_counts = round(first[0].envelope_applied_torque * limits.steer_max)
+  for control, output in zip(route.control_inputs[1:], first[1:], strict=True):
+    frame = ReplayFrameInput.from_bytes(control.core_input)
+    expected_applied_counts = apply_torque_envelope_counts(
+      limits,
+      round(output.planned_requested_torque * limits.steer_max),
+      previous_applied_counts,
+      frame.driver_torque,
+    )
+    assert output.envelope_applied_torque == expected_applied_counts / limits.steer_max
+    previous_applied_counts = expected_applied_counts
   assert all(math.isfinite(output.raw_requested_torque) for output in first)
   assert any(output.response_eligible for output in first)
 
 
+def test_replay_preserves_raw_planned_and_applied_as_distinct_values() -> None:
+  original_update = ModularControllerCore.update
+
+  def forced_requests(self, *args, **kwargs):
+    result = original_update(self, *args, **kwargs)
+    if result.valid:
+      result.raw_torque = -1.0
+      result.planned_torque = -0.001
+    return result
+
+  replay_request = request(decoded_route(), modular=True)
+  with patch.object(ModularControllerCore, "update", forced_requests):
+    outputs = tuple(modular_core().replay_route(replay_request))
+
+  output = outputs[1]
+  assert output.raw_requested_torque == -1.0
+  assert output.planned_requested_torque == -0.001
+  assert output.envelope_applied_torque == 0.0
+  assert len({
+    output.raw_requested_torque,
+    output.planned_requested_torque,
+    output.envelope_applied_torque,
+  }) == 3
+  assert output.reachable_envelope_torque == -4 / 409
+  assert output.maximum_authority_required
+
+
 def test_whole_route_adapters_match_streaming_core_and_legacy_bytes() -> None:
-  legacy_sha256 = {
-    False: "675e78bcc9025b080f1d9b0d6ede0f8ac00570bf047d54591a20180dd0709532",
-    True: "29d6b57e8b1b9e4029aef0466016b830ea32f733e6325c572e24cefa165477be",
+  # These bytes bind raw, planned, reachable, applied, and request-state
+  # semantics; a field loss or reinterpretation must change the golden.
+  contract_sha256 = {
+    False: "b492d5bde172ed7e26ddedd53ba38af4ce9f685f0f058e4d073335b1f123d3a8",
+    True: "f565652bd4c9ce34a097b5efcd2d4f2cd1ff106747137f574c3150c1a3535dc0",
   }
   for replay_core, modular in ((stock_core(), False), (modular_core(), True)):
     replay_request = request(decoded_route(), modular=modular)
     whole_route = tuple(replay_core.replay_route(replay_request))
     streamed = stream_request(replay_request)
     assert output_bytes(streamed) == output_bytes(whole_route)
-    assert hashlib.sha256(output_bytes(streamed)).hexdigest() == legacy_sha256[modular]
+    assert hashlib.sha256(output_bytes(streamed)).hexdigest() == contract_sha256[modular]
 
 
 def test_stock_replay_constructs_actual_source_controller() -> None:
@@ -1138,6 +1279,37 @@ def test_controller_sees_can_torque_while_rack_response_obeys_positive_delay() -
     effective is not None and effective != output.envelope_applied_torque
     for effective, output in zip(rack_effective[1:], outputs[1:], strict=True)
   )
+
+
+def test_replay_request_cut_carries_can_count_but_commits_zero_torque() -> None:
+  replay_request = request(
+    decoded_route(physical_overrides={1: (MAX_ANGLE + 1.0, 0.0, 200)}),
+    modular=True,
+  )
+  stepper, inputs = streaming_stepper(replay_request)
+
+  for index in (0, 1):
+    control = replay_request.route.control_inputs[index]
+    stepper.step(
+      control=control,
+      frame_input=inputs[index],
+      model_intent=replay_request.route.model_publications[index],
+      reference=replay_request.references[index],
+    )
+  stepper.steering_request_fault_avoidance_counter = MAX_ANGLE_FRAMES
+
+  control = replay_request.route.control_inputs[2]
+  output = stepper.step(
+    control=control,
+    frame_input=inputs[2],
+    model_intent=replay_request.route.model_publications[2],
+    reference=replay_request.references[2],
+  )
+
+  assert output.envelope_applied_torque != 0.0
+  assert stepper.previous_applied_counts != 0
+  assert not stepper.previous_steering_request_active
+  assert stepper.delay_line.latest_rack_effective_torque == 0.0
 
 
 def test_independent_plant_member_changes_response_without_changing_controller_bytes() -> None:
@@ -1278,7 +1450,7 @@ def test_nonfinite_core_output_is_finite_fault_and_not_eligible() -> None:
     result = original_update(self, *args, **kwargs)
     call_count += 1
     if call_count == 5:
-      result.raw_torque = math.nan
+      result.planned_torque = math.nan
     return result
 
   with patch.object(ModularControllerCore, "update", one_nonfinite):

@@ -28,6 +28,7 @@ from openpilot.selfdrive.controls.lib.blatv2.certification_vector import (
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill import (
   PreparedRoute,
   RouteCandidate,
+  RouteRejected,
   RouteSegment,
 )
 from openpilot.selfdrive.controls.lib.blatv2.learning_backfill_spool import (
@@ -572,7 +573,10 @@ def test_empty_physical_plane_and_empty_eligible_behavior_fail_closed() -> None:
     for control in evidence.control_witnesses
   )
   physically_empty = RouteEvidenceArtifact(
-    evidence.source_identity,
+    replace(
+      evidence.source_identity,
+      preparation_provenance=dict(PROVENANCE),
+    ),
     CP,
     b"".join(_encode_frame(frame) for frame in invalid_frames),
     evidence.model_publications,
@@ -582,17 +586,23 @@ def test_empty_physical_plane_and_empty_eligible_behavior_fail_closed() -> None:
     (),
     EVENTS,
   )
-  with pytest.raises(CertificationVectorError, match="no valid physical"):
-    _segment_vector(
-      segment=SEGMENT,
-      prepared=_prepared(physically_empty, invalid_frames),
+  empty_result = _segment_vector(
+    segment=SEGMENT,
+    prepared=_prepared(physically_empty, invalid_frames),
+  )
+  assert empty_result["physical_plane"]["frames_retained"] == 0
+  with pytest.raises(RouteRejected, match="no valid physical") as rejected:
+    build_certification_vector_from_prepared_route(
+      RouteCandidate(ROUTE, 1, (SEGMENT,)),
+      _prepared(physically_empty, invalid_frames),
     )
+  assert rejected.value.reason == "physical_witness_unavailable"
 
   with pytest.raises(CertificationVectorError, match="behavior-eligible"):
-    _segment_vector(
+    _signed_vector(_segment_vector(
       segment=SEGMENT,
       prepared=_prepared(_without_maneuver_plan(source_eligible=True)),
-    )
+    ))
 
 
 def test_scenario_plane_applies_physical_exclusion_first() -> None:
@@ -761,6 +771,38 @@ def test_full_route_projection_preserves_cross_segment_control_state() -> None:
   ] = "f" * 64
   with pytest.raises(CertificationVectorError, match="full-route preparation context"):
     CertificationVector.from_manifest(split_context)
+
+  inactive_frames = (
+    *frames[:2],
+    *(replace(value, inputs_valid=False) for value in frames[2:]),
+  )
+  inactive_controls = (
+    *controls[:2],
+    *(replace(value, inputs_valid=False) for value in controls[2:]),
+  )
+  inactive_evidence = RouteEvidenceArtifact(
+    identity,
+    CP,
+    b"".join(_encode_frame(value) for value in inactive_frames),
+    models,
+    inactive_controls,
+    torque,
+    delay,
+    maneuvers,
+    EVENTS,
+  )
+  inactive_vector = build_certification_vector_from_prepared_route(
+    route,
+    _prepared(inactive_evidence, inactive_frames),
+  )
+  assert inactive_vector.manifest["segment_results"][1]["physical_plane"] == {
+    "encoded_controls_sha256": hashlib.sha256().hexdigest(),
+    "encoded_frames_sha256": hashlib.sha256().hexdigest(),
+    "exclusions": {"physical_inputs_invalid": 2},
+    "first_retained_mono_ns": None,
+    "frames_retained": 0,
+    "last_retained_mono_ns": None,
+  }
 
 
 @pytest.mark.parametrize(

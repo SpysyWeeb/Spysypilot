@@ -11,10 +11,11 @@ still computes the modular core in shadow, but it never exposes a modular
 command. The caller continues to invoke the existing stock controller
 separately.
 
-Scalar-only reference and nominal-rack-mapping degradation are accepted for
-live use because the existing core marks both results valid and deterministic.
-An unqualified profile remains shadow-only unless the caller supplies the
-explicit development authorization and a provisional engagement decision.
+Malformed or scalar-only future reference is rejected by the horizon core and
+therefore enters the existing invalid-output lifecycle. Nominal rack mapping
+remains an explicit deterministic degradation. An unqualified profile remains
+shadow-only unless the caller supplies the explicit development authorization
+and a provisional engagement decision.
 """
 
 from __future__ import annotations
@@ -152,7 +153,6 @@ class CandidateResult:
 
 _LIVE_CORE_STATUSES = (
   CoreStatus.OK,
-  CoreStatus.DEGRADED_SCALAR_ONLY,
   CoreStatus.DEGRADED_NOMINAL_MAPPING,
 )
 
@@ -164,15 +164,11 @@ class ModularControllerCandidate:
     self,
     *,
     core: ModularControllerCore,
-    runtime_limits: RuntimeTorqueLimits,
     development_unqualified_profile_authorized: bool = False,
   ) -> None:
     if not isinstance(core, ModularControllerCore):
       raise TypeError("candidate requires a ModularControllerCore")
-    if not isinstance(runtime_limits, RuntimeTorqueLimits):
-      raise TypeError("candidate requires explicit runtime torque limits")
     self.core = core
-    self.runtime_limits = runtime_limits
     self.development_unqualified_profile_authorized = bool(
       development_unqualified_profile_authorized,
     )
@@ -185,6 +181,10 @@ class ModularControllerCandidate:
     self._binding_faulted = False
 
   @property
+  def runtime_limits(self) -> RuntimeTorqueLimits:
+    return self.core.runtime_limits
+
+  @property
   def engaged(self) -> bool:
     return self._engaged
 
@@ -194,46 +194,56 @@ class ModularControllerCandidate:
 
   def prime_transport_state(
     self,
-    previous_applied_counts: int,
+    previous_command_counts: int,
+    recorded_applied_torque: float,
   ) -> None:
-    """Prime only the rack-transport history from an exact measured count."""
+    """Prime transport from request-aware physical torque, not CAN counts."""
     if self._engaged:
       raise RuntimeError("transport state may be primed only while disengaged")
-    self._prime_transport_counts(previous_applied_counts)
+    self._prime_transport_state(
+      previous_command_counts,
+      recorded_applied_torque,
+    )
 
   def reprime_transport_state(
     self,
-    previous_applied_counts: int,
+    previous_command_counts: int,
+    recorded_applied_torque: float,
   ) -> None:
     """Resynchronize transport history after a detected controller-frame gap.
 
     The frame carrying the discontinuity is invalid and never runs the core.
-    Repeating the exact current command-layer count across the delay ring
-    prevents the next valid frame from treating missing 100 Hz commands as a
-    continuous history.  This changes transport state only; engagement
-    identity and the invalid-output guard remain intact.
+    Repeating the request-aware physical torque across the delay ring prevents
+    the next valid frame from treating missing 100 Hz response as continuous
+    history. The separately validated command count is never substituted for
+    that physical value. Engagement identity and the guard remain intact.
     """
     if not self._engaged or self._decision is None:
       raise RuntimeError("transport resynchronization requires engagement")
     if self._decision.selection != ControllerSelection.MODULAR:
       raise RuntimeError("stock selection has no live transport history")
-    self._prime_transport_counts(previous_applied_counts)
+    self._prime_transport_state(
+      previous_command_counts,
+      recorded_applied_torque,
+    )
 
-  def _prime_transport_counts(
+  def _prime_transport_state(
     self,
-    previous_applied_counts: int,
+    previous_command_counts: int,
+    recorded_applied_torque: float,
   ) -> None:
-    if isinstance(previous_applied_counts, bool) or not isinstance(
-      previous_applied_counts,
+    if isinstance(previous_command_counts, bool) or not isinstance(
+      previous_command_counts,
       Integral,
     ):
-      raise TypeError("transport prime requires an exact integer count")
-    counts = int(previous_applied_counts)
+      raise TypeError("transport prime requires an exact command count")
+    counts = int(previous_command_counts)
     if abs(counts) > self.runtime_limits.steer_max:
       raise ValueError("transport prime exceeds the runtime torque envelope")
-    self.core.prime_applied_history(
-      counts / self.runtime_limits.steer_max,
-    )
+    applied = float(recorded_applied_torque)
+    if not math.isfinite(applied) or abs(applied) > 1.0:
+      raise ValueError("transport prime physical torque is invalid")
+    self.core.prime_applied_history(applied)
 
   def _validate_begin_decision(
     self,
@@ -365,7 +375,7 @@ class ModularControllerCandidate:
   def _copy_core_and_feasibility(
     self,
     core_result: CoreResult,
-    previous_applied_counts: int,
+    previous_command_counts: int,
     driver_torque: float,
   ) -> None:
     self.result.core_result = core_result
@@ -374,8 +384,8 @@ class ModularControllerCandidate:
     self.result.raw_torque = core_result.raw_torque
     feasibility = inspect_current_torque_feasibility(
       self.runtime_limits,
-      previous_applied_counts,
-      core_result.raw_torque,
+      previous_command_counts,
+      core_result.planned_torque,
       driver_torque,
     )
     self.result.feasibility_status = feasibility.status
@@ -401,7 +411,8 @@ class ModularControllerCandidate:
     self,
     *,
     engagement_decision: EngagementDecision,
-    previous_applied_counts: int,
+    previous_command_counts: int,
+    recorded_applied_torque: float,
     driver_torque: float,
     frame: CanonicalFrame | None,
     intent_status: IntentBuildStatus,
@@ -420,27 +431,34 @@ class ModularControllerCandidate:
     engagement_boundary: bool,
     live_parameters_valid: bool,
     steering_pressed: bool,
+    steering_request_fault_avoidance_counter: int,
+    steering_request_state_valid: bool,
     actuator_constrained: bool,
     output_constrained: bool,
     standstill: bool,
   ) -> CandidateResult:
-    """Compute one shadow frame and, only when authorized, one safe command."""
-    if isinstance(previous_applied_counts, bool) or not isinstance(
-      previous_applied_counts,
+    """Compute one frame from separate command and physical-history states."""
+    if isinstance(previous_command_counts, bool) or not isinstance(
+      previous_command_counts,
       Integral,
     ):
-      raise TypeError("previous applied torque must be an integer count")
+      raise TypeError("previous command must be an integer count")
     driver = float(driver_torque)
     if not math.isfinite(driver):
       raise ValueError("driver torque must be finite")
+    recorded_applied = float(recorded_applied_torque)
+    if not math.isfinite(recorded_applied) or abs(recorded_applied) > 1.0:
+      raise ValueError("recorded physical torque must be finite and normalized")
 
     self._clear_result_for_bound_decision()
     if not self._engaged or self._decision is None:
       self.guard.reset()
       return self.result
 
-    applied_counts = int(previous_applied_counts)
-    applied_torque = applied_counts / self.runtime_limits.steer_max
+    command_counts = int(previous_command_counts)
+    if abs(command_counts) > self.runtime_limits.steer_max:
+      raise ValueError("previous command exceeds the runtime torque envelope")
+    command_torque = command_counts / self.runtime_limits.steer_max
     decision_matches = self._decision_matches(engagement_decision)
     if self._binding_faulted or not decision_matches:
       newly_faulted = not self._binding_faulted
@@ -449,7 +467,7 @@ class ModularControllerCandidate:
         active=bool(lateral_active),
         core_ok=False,
         raw_torque=math.nan,
-        applied_torque=applied_torque,
+        applied_torque=command_torque,
         driver_torque=driver,
         limits=self.runtime_limits,
       )
@@ -474,7 +492,9 @@ class ModularControllerCandidate:
       measured_rack_acceleration_deg_s2=(
         measured_rack_acceleration_deg_s2
       ),
-      recorded_applied_torque=applied_torque,
+      previous_command_counts=command_counts,
+      recorded_applied_torque=recorded_applied,
+      driver_torque=driver,
       lateral_accel_offset=lateral_accel_offset,
       live_mapping=live_mapping,
       lateral_active=lateral_active,
@@ -482,13 +502,17 @@ class ModularControllerCandidate:
       engagement_boundary=engagement_boundary,
       live_parameters_valid=live_parameters_valid,
       steering_pressed=steering_pressed,
+      steering_request_fault_avoidance_counter=(
+        steering_request_fault_avoidance_counter
+      ),
+      steering_request_state_valid=steering_request_state_valid,
       actuator_constrained=actuator_constrained,
       output_constrained=output_constrained,
       standstill=standstill,
     )
     self._copy_core_and_feasibility(
       core_result,
-      applied_counts,
+      command_counts,
       driver,
     )
 
@@ -511,8 +535,8 @@ class ModularControllerCandidate:
       safe_command = self.guard.update(
         active=False,
         core_ok=False,
-        raw_torque=core_result.raw_torque,
-        applied_torque=applied_torque,
+        raw_torque=core_result.planned_torque,
+        applied_torque=command_torque,
         driver_torque=driver,
         limits=self.runtime_limits,
       )
@@ -546,8 +570,8 @@ class ModularControllerCandidate:
     safe_command = self.guard.update(
       active=True,
       core_ok=core_live_valid,
-      raw_torque=core_result.raw_torque,
-      applied_torque=applied_torque,
+      raw_torque=core_result.planned_torque,
+      applied_torque=command_torque,
       driver_torque=driver,
       limits=self.runtime_limits,
     )
@@ -590,7 +614,7 @@ class ModularControllerCandidate:
     self,
     *,
     engagement_decision: EngagementDecision,
-    previous_applied_counts: int,
+    previous_command_counts: int,
     driver_torque: float,
     lateral_active: bool,
   ) -> CandidateResult:
@@ -603,22 +627,23 @@ class ModularControllerCandidate:
     decay through the one production envelope, and the existing commIssue
     validity path latches after the pinned interval.
     """
-    if isinstance(previous_applied_counts, bool) or not isinstance(
-      previous_applied_counts,
+    if isinstance(previous_command_counts, bool) or not isinstance(
+      previous_command_counts,
       Integral,
     ):
-      raise TypeError("previous applied torque must be an integer count")
+      raise TypeError("previous command must be an integer count")
     driver = float(driver_torque)
     if not math.isfinite(driver):
       driver = 0.0
+    command_counts = int(previous_command_counts)
+    if abs(command_counts) > self.runtime_limits.steer_max:
+      raise ValueError("previous command exceeds the runtime torque envelope")
 
     self._clear_result_for_bound_decision()
     if not self._engaged or self._decision is None:
       self.guard.reset()
       return self.result
-    applied_torque = (
-      int(previous_applied_counts) / self.runtime_limits.steer_max
-    )
+    applied_torque = command_counts / self.runtime_limits.steer_max
     decision_matches = self._decision_matches(engagement_decision)
     if self._binding_faulted or not decision_matches:
       newly_faulted = not self._binding_faulted

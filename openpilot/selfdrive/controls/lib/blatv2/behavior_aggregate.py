@@ -65,12 +65,12 @@ from openpilot.selfdrive.controls.lib.blatv2.behavior_route_evaluator import (
 )
 
 
-BEHAVIOR_AGGREGATE_SPEC_SCHEMA_VERSION = 1
-BEHAVIOR_AGGREGATE_ARTIFACT_SCHEMA_VERSION = 2
-BEHAVIOR_AGGREGATE_EVALUATION_SCHEMA_VERSION = 1
+BEHAVIOR_AGGREGATE_SPEC_SCHEMA_VERSION = 2
+BEHAVIOR_AGGREGATE_ARTIFACT_SCHEMA_VERSION = 3
+BEHAVIOR_AGGREGATE_EVALUATION_SCHEMA_VERSION = 2
 BEHAVIOR_TRAINING_COMPARISON_SCHEMA_VERSION = 1
 BEHAVIOR_AGGREGATE_SELECTION_SCHEMA_VERSION = 1
-BEHAVIOR_METRIC_AGGREGATION_CONTRACT = "aggregate_behavior_metrics_v1"
+BEHAVIOR_METRIC_AGGREGATION_CONTRACT = "aggregate_behavior_metrics_v2"
 
 
 class BehaviorAggregateError(ValueError):
@@ -563,6 +563,7 @@ def _window_contract_sha256(windows: tuple[WindowMetricSet, ...]) -> str:
       "windowId": window.window_id,
     }
     for window in windows
+    if window.summary_metric_name is None
   ])
 
 
