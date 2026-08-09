@@ -307,6 +307,19 @@ controller, command envelope, panda safety, or submodule change is admitted by
 this review. The route is therefore eligible for preparation without a
 provenance bypass.
 
+Historical build `013adde4ba` is reviewed against the exact `d40096f` schema,
+`ab40b76` opendbc, `7f245a8` panda, and Palisade 409/4/7 envelope. Relative to
+the reviewed `29385dd8` parent, its changes are confined to longitudinal code,
+documentation, and tests. It also predates the `controlsd` self-subscription
+crash fix, so admission permits fail-closed preparation but does not claim its
+routes contain usable learning witnesses.
+
+Historical build `e1e719bbf0` is reviewed against its exact `4e433da` schema,
+`9bc1643` opendbc, `b4c7d0f` panda, and Palisade 409/4/7 envelope. Its
+steering-critical controller and safety sources match its already reviewed
+first parent. Admission does not infer which route recorded that build or
+whether it contains useful speed coverage; preparation must authenticate both.
+
 ### PC learner qualification
 
 A selected physical profile becomes complete only when every speed node and

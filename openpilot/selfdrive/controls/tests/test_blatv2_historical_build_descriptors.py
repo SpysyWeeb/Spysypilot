@@ -19,12 +19,13 @@ REGISTRY_PATH = (
   / "historical_build_descriptors.json"
 )
 REVIEWED_REGISTRY_SHA256 = (
-  "d9e513c603967a33a01be8cb91e918ea736f1beb0f5d8f46adee0fcd7d00173c"
+  "8e5139f50a93f5b8c1f6f0b0655ad7eef20a7713af5b93d8252697e481c35eeb"
 )
 FIRST_DESCRIPTOR_SHA256 = (
-  "8ce8026f4ff30b1036206046dcd96aa3b27a47f61f21673a2629154379769684"
+  "55b6ceed6856a1f60ea5d6a2e7a0fd0a7af08e4fdae060586c242d97fa019f93"
 )
 INTENDED_ROOT_COMMITS = {
+  "013adde4ba5c7e6f66b40809a641c620894ddbca",
   "02bf07c412b4ae92889c7a977fec61328a300c66",
   "04a9f12d75c27ee349cd883bbd4ec68c0cc99413",
   "080f2a55a07484a6f71cfe9706c1fdaea5dca5d8",
@@ -57,6 +58,7 @@ INTENDED_ROOT_COMMITS = {
   "b8bea34ddac98ab40dcf5d2eb1aa4dda3b120a8c",
   "d0002f5286be81e022f5b12b831d9f45c829bb4e",
   "e14723136c5202316770ed3e5b09f5bb2ee39c28",
+  "e1e719bbf009ed46fbb5a4b891f12d6c4644711f",
   "e410f73c6c30e43fe89ae45fb2d27410c6ea7a8a",
   "e45707824f09626e78b54b733e0f8e30ee2ca3bd",
   "ed0f289d46a5794657ceffec6b761b6ab03a9aa7",
@@ -126,6 +128,10 @@ def test_checked_in_registry_is_canonical_complete_and_limits_only() -> None:
   ("root_commit", "opendbc_commit"),
   (
     (
+      "013adde4ba5c7e6f66b40809a641c620894ddbca",
+      "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    ),
+    (
       "8cc8a31d22fc54ca219f06d77e3dcba7b080c228",
       "ab40b765445d1d18750b58ca6524b16ebe219b6b",
     ),
@@ -169,6 +175,22 @@ def test_route_builds_have_exact_reviewed_descriptors(
     "superproject_commit": root_commit,
     "supported_vehicle_identity": "HYUNDAI_PALISADE",
   }
+
+
+def test_e1e719_build_has_exact_reviewed_source_tuple() -> None:
+  descriptor = load_reviewed_registry(REGISTRY_PATH).resolve(
+    "e1e719bbf009ed46fbb5a4b891f12d6c4644711f"
+  )
+  assert descriptor is not None
+  assert (
+    descriptor.opendbc_commit,
+    descriptor.panda_commit,
+    descriptor.log_schema_blob,
+  ) == (
+    "9bc1643ba11a4d74cd22bd23baa1f3f59db42ad3",
+    "b4c7d0fd09bd179cfbfa91c6525081560b71657e",
+    "4e433da8bddf55605746bd2a6faf4db651b6f93b",
+  )
 
 
 def test_duplicate_root_is_rejected(tmp_path: Path) -> None:
