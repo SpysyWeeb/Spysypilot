@@ -414,9 +414,6 @@ class Controls:
         self.sm['carOutput'],
       )
 
-    # TODO: both controlsState and carControl valids should be set by
-    #       sm.all_checks(), but this creates a circular dependency
-
     # controlsState
     dat = messaging.new_message('controlsState')
     dat.valid = CS.canValid and self.blatv2_messages_valid

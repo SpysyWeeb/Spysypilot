@@ -413,6 +413,8 @@ def bind_modular(
   clock: FakeClock,
   state: object,
   output: object,
+  *,
+  enabled: bool = True,
 ) -> None:
   _, _, live_params = vehicle_messages()
   selected.update_engagement(
@@ -429,7 +431,7 @@ def bind_modular(
   )
   assert selected.observe_previous_applied(output)
   assert selected.update_engagement(
-    enabled=True,
+    enabled=enabled,
     lateral_active=True,
     lateral_maneuver_active=False,
   ) == ControllerSelection.MODULAR
@@ -1563,6 +1565,48 @@ def test_invalid_guard_propagates_hold_decay_latch_and_ten_ok_recovery(
   assert selected.messages_valid
 
 
+def test_aol_driver_override_keeps_live_measurement_valid(monkeypatch) -> None:
+  selected = experimental_live()
+  state, output, live_params = vehicle_messages()
+  state.steeringRateDeg = 8.0
+  state.steeringTorque = 200.0
+  state.steeringPressed = True
+  clock = FakeClock()
+  monkeypatch.setattr(
+    live_module,
+    "control_witness_mono_ns",
+    lambda: clock.now_ns,
+  )
+  selected.observe_inactive_state(
+    state_sample_mono_ns=clock.now_ns - 25_000_000,
+    car_state=state,
+    live_parameters=live_params,
+    inputs_valid=True,
+    live_parameters_inputs_valid=True,
+  )
+  state.steeringAngleDeg += 0.1
+  bind_modular(selected, clock, state, output, enabled=False)
+
+  assert selected.candidate is not None
+  for _ in range(
+    selected.candidate.guard.invalid_latch_frames
+    + RECOVERY_OK_FRAMES
+  ):
+    state.steeringAngleDeg += 0.1
+    current = step(selected, clock, state, output, live_params)
+    assert selected.prepared_input is not None
+    assert selected.prepared_input.status == LiveAdapterStatus.OK
+    assert selected.prepared_input.rack_derivative_valid
+    assert selected.prepared_input.lateral_valid
+    assert current.status == CandidateStatus.MODULAR_OK
+    assert current.core_result is not None
+    assert current.core_result.driver_suppressed
+    assert current.safety_state == LiveSafetyState.OK
+    assert current.controls_valid and current.car_control_valid
+    assert selected.messages_valid
+  assert selected.candidate.guard.invalid_frames == 0
+
+
 def test_binding_mismatch_poison_lasts_until_both_false_session_boundary(
   monkeypatch,
 ) -> None:
@@ -1778,6 +1822,16 @@ def test_stock_arm_remains_the_unmodified_stock_update_shape() -> None:
     "actuator_constrained_previous=self.steer_limited_by_safety"
     not in modular_arm
   )
+  assert "self.sm.all_checks(['carState', 'carOutput'])" in modular_arm
+  assert "cc_send.valid = CS.canValid and self.blatv2_messages_valid" in source
+
+  card_source = (
+    Path(__file__).parents[2] / "car" / "card.py"
+  ).read_text()
+  assert "co_send.valid = self.sm.all_checks(['carControl'])" not in card_source
+  assert "co_send.valid = (\n      CS.canValid" in card_source
+  assert "and self.sm.all_alive(['carControl'])" in card_source
+  assert "and self.sm.all_freq_ok(['carControl'])" in card_source
 
 
 def test_production_sources_have_no_platform_literals_or_legacy_mechanisms() -> None:

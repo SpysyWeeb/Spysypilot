@@ -222,7 +222,6 @@ class LiveInputAdapter:
       speed = float(car_state.vEgo)
       angle = float(car_state.steeringAngleDeg)
       rate = float(car_state.steeringRateDeg)
-      steering_pressed = bool(car_state.steeringPressed)
       standstill = bool(car_state.standstill)
       resolution = self.profile.parameters_at(
         speed,
@@ -252,7 +251,6 @@ class LiveInputAdapter:
         bool(inputs_valid)
         and timestamp_valid
         and speed >= 0.0
-        and not steering_pressed
         and not standstill
         and mapping is not None
       ),
@@ -432,7 +430,6 @@ class LiveInputAdapter:
       lifecycle_valid=(
         output.vehicle_state_valid
         and output.live_mapping is not None
-        and not output.steering_pressed
         and not output.standstill
       ),
       maximum_gap_ns=MAX_RECORDED_FRAME_GAP_NS,
