@@ -423,6 +423,13 @@ it is explicitly unelected. The committed candidate bounds are
 `5.0–15.0 1/s` and damping ratio `0.6–1.5`. These are behavior-search bounds,
 not speed gates or vehicle torque values.
 
+The explicit Palisade inverse-rack owner trial has one source-bound exception:
+natural frequency is `11.0, 11.0, 10.5, 10.25, 10.0, 10.0 1/s` at
+`0, 5, 10, 15, 20, 30 m/s`, with linear interpolation and flat endpoints.
+Damping remains `1.0`. This unqualified reactive schedule is tied to the exact
+source commit and cannot enter the global behavior search or approved preview
+artifact path.
+
 It cannot reinterpret the model path, vehicle calibration, observer, or
 actuator envelope. The target is always the model's scalar-anchored reference;
 lane-line estimates never enter it. Auto-logger events may locate maneuvers but

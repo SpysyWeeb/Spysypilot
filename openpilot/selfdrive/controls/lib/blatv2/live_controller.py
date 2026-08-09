@@ -58,6 +58,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
   build_runtime_vehicle_bundle,
 )
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
+  DEFAULT_SPEED_NODES_MPS,
   compose_controller_profile,
 )
 
@@ -77,6 +78,19 @@ PROVISIONAL_HORIZON_POLICY_PATH = (
 )
 APPROVED_HORIZON_POLICY_PATH = (
   Path(__file__).resolve().parent / "approved_horizon_policy.json"
+)
+# Source-bound owner-trial values aligned with DEFAULT_SPEED_NODES_MPS.
+DEVELOPMENT_NATURAL_FREQUENCY_NODES_PER_S = (
+  11.0,
+  11.0,
+  10.5,
+  10.25,
+  10.0,
+  10.0,
+)
+# A different runtime bundle remains on the scalar policy.
+DEVELOPMENT_RESPONSE_RUNTIME_VEHICLE_IDENTITY_SHA256 = (
+  "e083e7e04e7ebde304773896ef574da06e31ee0a09815458ccd86375882786fa"
 )
 
 
@@ -244,6 +258,17 @@ class ModularLiveController:
           horizon_policy=self.horizon_policy,
           plan_capacity=INTENT_CAPACITY,
           development_reactive_only=self.experimental_active,
+          development_natural_frequency_nodes_per_s=(
+            DEVELOPMENT_NATURAL_FREQUENCY_NODES_PER_S
+            if (
+              self.experimental_active
+              and self.controller_profile.speed_nodes_mps
+              == DEFAULT_SPEED_NODES_MPS
+              and runtime_bundle.identity_sha256
+              == DEVELOPMENT_RESPONSE_RUNTIME_VEHICLE_IDENTITY_SHA256
+            )
+            else None
+          ),
         )
         self.candidate = ModularControllerCandidate(
           core=core,

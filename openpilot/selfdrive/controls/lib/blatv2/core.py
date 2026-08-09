@@ -68,6 +68,7 @@ from openpilot.selfdrive.controls.lib.blatv2.reference import (
   sample_reference_into,
 )
 from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
+  DEFAULT_SPEED_NODES_MPS,
   PhysicalParameters,
   VehicleProfile,
 )
@@ -325,6 +326,7 @@ class ModularControllerCore:
     horizon_policy: HorizonPolicy,
     plan_capacity: int,
     development_reactive_only: bool = False,
+    development_natural_frequency_nodes_per_s: tuple[float, ...] | None = None,
   ) -> None:
     dt = float(fixed_dt_s)
     if not math.isfinite(dt) or dt <= 0.0:
@@ -357,6 +359,21 @@ class ModularControllerCore:
       or runtime_limits.steer_step != 1
     ):
       raise ValueError("development reactive mode requires the verified 100 Hz envelope")
+    if development_natural_frequency_nodes_per_s is not None:
+      if (
+        not development_reactive_only
+        or profile.speed_nodes_mps != DEFAULT_SPEED_NODES_MPS
+        or type(development_natural_frequency_nodes_per_s) is not tuple
+        or len(development_natural_frequency_nodes_per_s) != len(profile.nodes)
+        or tracking_policy.damping_ratio != 1.0
+        or any(
+          type(value) not in (int, float)
+          or not math.isfinite(value)
+          or value <= 0.0
+          for value in development_natural_frequency_nodes_per_s
+        )
+      ):
+        raise ValueError("development response schedule is incompatible")
 
     self.fixed_dt_s = dt
     self.profile = profile
@@ -366,6 +383,9 @@ class ModularControllerCore:
     self.horizon_policy = horizon_policy
     self.plan_capacity = int(plan_capacity)
     self.development_reactive_only = development_reactive_only
+    self.development_natural_frequency_nodes_per_s = (
+      development_natural_frequency_nodes_per_s
+    )
     self.reference_count = (
       1 if development_reactive_only else HORIZON_SAMPLE_COUNT
     )
@@ -965,6 +985,21 @@ class ModularControllerCore:
       measured_rack_rate_deg_s,
       recorded_applied_torque,
     )
+    effect_tracking_policy = self.tracking_policy
+    if self.development_natural_frequency_nodes_per_s is not None:
+      lower_frequency = self.development_natural_frequency_nodes_per_s[
+        effect_profile.lower_node
+      ]
+      upper_frequency = self.development_natural_frequency_nodes_per_s[
+        effect_profile.upper_node
+      ]
+      effect_tracking_policy = TrackingPolicy(
+        natural_frequency_per_s=(
+          lower_frequency
+          + effect_profile.upper_weight * (upper_frequency - lower_frequency)
+        ),
+        damping_ratio=self.tracking_policy.damping_ratio,
+      )
     try:
       if not self.development_reactive_only and not self._fill_committed_command_time_angles(
         initial_state=predicted_state,
@@ -1017,7 +1052,7 @@ class ModularControllerCore:
         selected_mapping.roll_rad,
         effect_lateral_accel_offset,
         effect_parameters,
-        self.tracking_policy,
+        effect_tracking_policy,
         self.observer.estimate_torque,
       )
     except (TypeError, ValueError, OverflowError):

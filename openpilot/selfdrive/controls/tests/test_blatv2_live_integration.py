@@ -576,6 +576,7 @@ def test_explicit_experimental_candidate_binds_one_unqualified_controller(
   assert selected.candidate.core.development_reactive_only
   assert selected.candidate.core.reference_count == 1
   assert selected.candidate.core.horizon is None
+  assert selected.candidate.core.development_natural_frequency_nodes_per_s is None
 
   bind_modular(selected, clock, state, output)
   assert selected.decision is not None
@@ -667,6 +668,7 @@ def test_approved_artifact_takes_precedence_over_experimental_request() -> None:
   assert not selected.candidate.core.development_reactive_only
   assert selected.candidate.core.reference_count == HORIZON_SAMPLE_COUNT
   assert selected.candidate.core.horizon is not None
+  assert selected.candidate.core.development_natural_frequency_nodes_per_s is None
 
 
 def test_experimental_parameter_is_development_only_and_process_bound() -> None:
@@ -706,6 +708,25 @@ def test_process_start_builds_trial_only_for_opendbc_capable_platform() -> None:
   assert selected.artifact_diagnostic is ArtifactDiagnostic.ABSENT
   assert selected.controller_profile is not None
   assert not selected.controller_profile.qualified
+  assert selected.candidate is not None
+  assert (
+    selected.candidate.core.development_natural_frequency_nodes_per_s
+    == live_module.DEVELOPMENT_NATURAL_FREQUENCY_NODES_PER_S
+  )
+  assert tuple(
+    zip(
+      selected.controller_profile.speed_nodes_mps,
+      selected.candidate.core.development_natural_frequency_nodes_per_s,
+      strict=True,
+    )
+  ) == (
+    (0.0, 11.0),
+    (5.0, 11.0),
+    (10.0, 10.5),
+    (15.0, 10.25),
+    (20.0, 10.0),
+    (30.0, 10.0),
+  )
   telemetry = build_modular_lateral_state(
     selected,
     lateral_active=False,
@@ -717,10 +738,23 @@ def test_process_start_builds_trial_only_for_opendbc_capable_platform() -> None:
   assert telemetry.modularProfileHash == selected.profile_sha256
   assert selected.runtime_bundle is not None
   assert (
+    selected.runtime_bundle.identity_sha256
+    == live_module.DEVELOPMENT_RESPONSE_RUNTIME_VEHICLE_IDENTITY_SHA256
+  )
+  assert (
     selected.runtime_bundle.torque_limits.steer_max,
     selected.runtime_bundle.torque_limits.delta_up,
     selected.runtime_bundle.torque_limits.delta_down,
   ) == (409, 4, 7)
+
+  other_bundle = replace(
+    selected.runtime_bundle,
+    vehicle_identity="synthetic-other-platform",
+  )
+  other = experimental_live(bundle=other_bundle)
+  assert other.eligibility == LiveEligibility.ELIGIBLE
+  assert other.candidate is not None
+  assert other.candidate.core.development_natural_frequency_nodes_per_s is None
 
   disabled = ModularLiveController.from_persistent(
     car_params=cp,
