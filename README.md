@@ -1,6 +1,6 @@
 # Spysypilot
 
-This fork is **entirely vibe-coded using [Claude Code](https://claude.com/claude-code)** — including this README.
+This fork is **entirely vibe-coded** — including this README.
 
 It's a personal side project for SpysyWeeb. It is **not meant for others to use**, but it's available for anyone who wants to try it **at their own risk**.
 
