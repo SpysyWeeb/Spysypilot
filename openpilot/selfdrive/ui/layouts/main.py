@@ -64,6 +64,10 @@ class MainLayout(Widget):
     if not self._onboarding_window.completed:
       gui_app.push_widget(self._onboarding_window)
 
+  def show_event(self):
+    super().show_event()
+    self._layouts[self._current_mode].show_event()
+
   def _render(self, _):
     self._handle_onroad_transition()
     self._render_main_content()
