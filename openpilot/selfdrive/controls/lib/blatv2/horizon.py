@@ -75,6 +75,7 @@ class HorizonStatus(IntEnum):
   FUTURE_CONSTRAINED = 1
   DRIVER_OVERRIDE = 2
   INVALID_INPUT = 3
+  REACTIVE_ONLY = 4
   PLANT_FAILURE = 5
 
 

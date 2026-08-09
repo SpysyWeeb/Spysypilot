@@ -27,12 +27,17 @@ import math
 from numbers import Integral
 
 from opendbc.car.hyundai.steering_request import (
+  apply_steering_request_fault_avoidance,
   steering_request_fault_avoidance_counter_valid,
 )
 
-from openpilot.selfdrive.controls.lib.blatv2.actuator import RuntimeTorqueLimits
+from openpilot.selfdrive.controls.lib.blatv2.actuator import (
+  RuntimeTorqueLimits,
+  apply_torque_envelope_counts,
+)
 from openpilot.selfdrive.controls.lib.blatv2.contracts import CanonicalFrame
 from openpilot.selfdrive.controls.lib.blatv2.horizon import (
+  CONTROL_DT_SECONDS,
   HORIZON_SAMPLE_COUNT,
   HorizonController,
   HorizonPolicy,
@@ -319,6 +324,7 @@ class ModularControllerCore:
     runtime_limits: RuntimeTorqueLimits,
     horizon_policy: HorizonPolicy,
     plan_capacity: int,
+    development_reactive_only: bool = False,
   ) -> None:
     dt = float(fixed_dt_s)
     if not math.isfinite(dt) or dt <= 0.0:
@@ -341,6 +347,16 @@ class ModularControllerCore:
       raise TypeError("core requires explicit RuntimeTorqueLimits")
     if not isinstance(horizon_policy, HorizonPolicy):
       raise TypeError("core requires an explicit HorizonPolicy")
+    if type(development_reactive_only) is not bool:
+      raise TypeError("development reactive mode must be explicit")
+    if development_reactive_only and profile.qualified:
+      raise ValueError("qualified profiles require the predictive horizon")
+    if development_reactive_only and (
+      abs(dt - CONTROL_DT_SECONDS) > 8.0 * math.ulp(CONTROL_DT_SECONDS)
+      or not runtime_limits.production_envelope_verified
+      or runtime_limits.steer_step != 1
+    ):
+      raise ValueError("development reactive mode requires the verified 100 Hz envelope")
 
     self.fixed_dt_s = dt
     self.profile = profile
@@ -349,14 +365,22 @@ class ModularControllerCore:
     self.runtime_limits = runtime_limits
     self.horizon_policy = horizon_policy
     self.plan_capacity = int(plan_capacity)
+    self.development_reactive_only = development_reactive_only
+    self.reference_count = (
+      1 if development_reactive_only else HORIZON_SAMPLE_COUNT
+    )
     self.observer = DisturbanceObserver(observer_policy, dt)
-    self.horizon = HorizonController(
-      fixed_dt_s=dt,
-      limits=runtime_limits,
-      profile=profile,
-      tracking_policy=tracking_policy,
-      horizon_policy=horizon_policy,
-      nominal_mapping=nominal_mapping,
+    self.horizon = (
+      None
+      if development_reactive_only
+      else HorizonController(
+        fixed_dt_s=dt,
+        limits=runtime_limits,
+        profile=profile,
+        tracking_policy=tracking_policy,
+        horizon_policy=horizon_policy,
+        nominal_mapping=nominal_mapping,
+      )
     )
     self.result = CoreResult()
 
@@ -807,7 +831,7 @@ class ModularControllerCore:
     self._plan_speeds.configure(
       intent_velocities_x, intent_status.count,
     )
-    for index in range(HORIZON_SAMPLE_COUNT):
+    for index in range(self.reference_count):
       self._query_times[index] = (
         physical_effect_plan_s + index * self.fixed_dt_s
       )
@@ -821,7 +845,7 @@ class ModularControllerCore:
         intent_status.plan_time_now_s,
         current_v_ego_m_s,
         self._query_times,
-        HORIZON_SAMPLE_COUNT,
+        self.reference_count,
         self._reference_times,
         self._reference_curvatures,
         self._reference_curvature_rates,
@@ -840,7 +864,7 @@ class ModularControllerCore:
     self.result.reference_valid = reference_status.valid
     self.result.reference_scalar_only = reference_status.scalar_only
     if (
-      reference_status.count != HORIZON_SAMPLE_COUNT
+      reference_status.count != self.reference_count
       or not reference_status.valid
       or reference_status.scalar_only
     ):
@@ -899,7 +923,7 @@ class ModularControllerCore:
         self._reference_speeds,
         self._reference_speed_rates,
         self._reference_speed_accelerations,
-        HORIZON_SAMPLE_COUNT,
+        self.reference_count,
         live_mapping,
         self.nominal_mapping,
         self._rack_angles,
@@ -911,7 +935,7 @@ class ModularControllerCore:
       return self.result
 
     self.result.rack_mapping_valid = rack_status.valid
-    if rack_status.count != HORIZON_SAMPLE_COUNT:
+    if rack_status.count != self.reference_count:
       self.result.status = CoreStatus.RACK_MAPPING_FAILURE
       return self.result
     self.result.desired_angle_deg = self._rack_angles[0]
@@ -942,7 +966,7 @@ class ModularControllerCore:
       recorded_applied_torque,
     )
     try:
-      if not self._fill_committed_command_time_angles(
+      if not self.development_reactive_only and not self._fill_committed_command_time_angles(
         initial_state=predicted_state,
         state_age_s=frame.timing.state_age_s,
         transport_delay_s=transport_delay,
@@ -1023,6 +1047,73 @@ class ModularControllerCore:
       self.result.raw_torque = 0.0
       return self.result
 
+    if self.development_reactive_only:
+      scaled_request = inverse.raw_torque * self.runtime_limits.steer_max
+      if not math.isfinite(scaled_request):
+        self.result.status = CoreStatus.PLANT_FAILURE
+        return self.result
+      requested_counts = int(round(scaled_request))
+      planned_counts = apply_torque_envelope_counts(
+        self.runtime_limits,
+        requested_counts,
+        int(previous_command_counts),
+        driver_torque,
+      )
+      _, steering_request_active = (
+        apply_steering_request_fault_avoidance(
+          measured_rack_angle_deg,
+          lateral_active,
+          steering_request_fault_avoidance_counter,
+        )
+      )
+      self.result.horizon_status = int(HorizonStatus.REACTIVE_ONLY)
+      self.result.raw_requested_counts = requested_counts
+      self.result.planned_counts = planned_counts
+      self.result.planned_torque = (
+        planned_counts / self.runtime_limits.steer_max
+      )
+      self.result.reactive_counts = planned_counts
+      self.result.reactive_torque = self.result.planned_torque
+      self.result.raw_to_planned_constrained = (
+        requested_counts != planned_counts
+      )
+      self.result.raw_to_planned_unmet_torque = (
+        inverse.raw_torque - self.result.planned_torque
+      )
+      self.result.raw_to_planned_residual_counts = (
+        requested_counts - planned_counts
+      )
+      self.result.driver_suppressed = (
+        steering_pressed
+        or abs(driver_torque * self.runtime_limits.driver_factor)
+        > self.runtime_limits.driver_allowance
+      )
+      self.result.first_request_suppression_index = (
+        -1 if steering_request_active else 0
+      )
+      self.result.maximum_authority_required = (
+        abs(inverse.raw_torque) >= 1.0
+      )
+      self.result.maximum_authority_active = (
+        steering_request_active
+        and self.result.maximum_authority_required
+        and planned_counts
+        == apply_torque_envelope_counts(
+          self.runtime_limits,
+          int(math.copysign(
+            self.runtime_limits.steer_max,
+            inverse.raw_torque,
+          )),
+          int(previous_command_counts),
+          driver_torque,
+        )
+      )
+      self.result.valid = True
+      self.result.status = CoreStatus.SHADOW_UNQUALIFIED_PROFILE
+      return self.result
+
+    if self.horizon is None:
+      raise AssertionError("predictive core lacks its horizon")
     try:
       horizon_result = self.horizon.update(
         desired_curvatures=self._reference_curvatures,

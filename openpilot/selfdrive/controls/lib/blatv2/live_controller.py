@@ -63,6 +63,7 @@ from openpilot.selfdrive.controls.lib.blatv2.vehicle_profile import (
 
 
 MODULAR_LIVE_ARCHITECTURE = "blatv2.modular.preview-rack"
+MODULAR_REACTIVE_ARCHITECTURE = "blatv2.modular.inverse-rack"
 MODULAR_LIVE_VERSION = 2
 EXPERIMENTAL_CONTROLLER_PARAM = "BLaTv2ExperimentalController"
 PROVISIONAL_RACK_DYNAMICS_PATH = (
@@ -242,6 +243,7 @@ class ModularLiveController:
           runtime_limits=runtime_bundle.torque_limits,
           horizon_policy=self.horizon_policy,
           plan_capacity=INTENT_CAPACITY,
+          development_reactive_only=self.experimental_active,
         )
         self.candidate = ModularControllerCandidate(
           core=core,
