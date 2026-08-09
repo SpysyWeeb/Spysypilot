@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "revision": 1,
+  "revision": 2,
   "provisional": true,
   "natural_frequency_per_s": 10.5,
   "damping_ratio": 1.0,
   "observer": null,
-  "provenance": "Owner field-tune revision from Palisade route 00000103--b394707941: raise the unelected speed-independent response from 10.0 to 10.5 1/s after owner-reported lazy steering and measured 5-10 m/s shallow-turn lag. Envelope-limited sharp low-speed turns and unwind remain unresolved. Critical damping, the observer-off state, physical profile, and production actuator envelope remain unchanged. This policy is not an approved artifact."
+  "provenance": "Owner field-tune revision from Palisade route 00000103--b394707941. The unelected global behavior center remains 10.5 1/s. The explicit Palisade inverse-rack development path uses a source-bound natural-frequency schedule of 11.0, 11.0, 10.5, 10.25, 10.0, and 10.0 1/s at 0, 5, 10, 15, 20, and 30 m/s, with linear interpolation and flat endpoints. This targets owner-reported 5-10 m/s shallow-turn lag while preserving high-speed smoothness. Envelope-limited sharp low-speed turns and unwind remain unresolved. Critical damping, the observer-off state, physical profile, and production actuator envelope remain unchanged. This policy is not an approved artifact."
 }

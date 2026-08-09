@@ -221,16 +221,25 @@ def make_core(
   profile: VehicleProfile,
   *,
   observer_policy: ObserverPolicy | None = None,
+  tracking_policy: TrackingPolicy | None = None,
+  development_reactive_only: bool = False,
+  development_natural_frequency_nodes_per_s: tuple[float, ...] | None = None,
 ) -> ModularControllerCore:
   return ModularControllerCore(
     fixed_dt_s=DT,
     profile=profile,
-    tracking_policy=TrackingPolicy(6.0),
+    tracking_policy=(
+      TrackingPolicy(6.0) if tracking_policy is None else tracking_policy
+    ),
     observer_policy=observer_policy,
     nominal_mapping=mapping(),
     runtime_limits=LIMITS,
     horizon_policy=HorizonPolicy.from_json_file(POLICY_PATH),
     plan_capacity=INTENT_CAPACITY,
+    development_reactive_only=development_reactive_only,
+    development_natural_frequency_nodes_per_s=(
+      development_natural_frequency_nodes_per_s
+    ),
   )
 
 
@@ -289,6 +298,77 @@ def update_core(
 
 
 class TestBLaTv2Core(unittest.TestCase):
+  def test_development_response_schedule_interpolates_at_effect_speed(self) -> None:
+    profile = vehicle_profile(qualified=False)
+    frequencies = (11.0, 11.0, 10.5, 10.25, 10.0, 10.0)
+    expected_by_speed = (
+      (2.5, 11.0),
+      (5.0, 11.0),
+      (7.5, 10.75),
+      (12.5, 10.375),
+      (17.5, 10.125),
+      (25.0, 10.0),
+      (35.0, 10.0),
+    )
+    for speed, expected_frequency in expected_by_speed:
+      with self.subTest(speed=speed):
+        adaptation, outputs, _ = adapted_intent(
+          profile,
+          current_speed=speed,
+          constant_curvature=0.01,
+          constant_speed=True,
+        )
+        core = make_core(
+          profile,
+          tracking_policy=TrackingPolicy(10.5, 1.0),
+          development_reactive_only=True,
+          development_natural_frequency_nodes_per_s=frequencies,
+        )
+        core.prime_applied_history(0.0)
+        result = update_core(
+          core,
+          adaptation,
+          outputs,
+          scalar_curvature=0.01,
+          current_speed=speed,
+          measured_angle=-5.0,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.effect_speed_mps, speed)
+        self.assertNotEqual(result.position_error_deg, 0.0)
+        actual_frequency = math.sqrt(
+          result.position_feedback_torque
+          * result.rack_gain_deg_s2_per_torque
+          / result.position_error_deg
+        )
+        self.assertAlmostEqual(actual_frequency, expected_frequency)
+
+  def test_development_response_schedule_fails_closed_outside_trial(self) -> None:
+    frequencies = (11.0, 11.0, 10.5, 10.25, 10.0, 10.0)
+    with self.assertRaisesRegex(ValueError, "schedule"):
+      make_core(
+        vehicle_profile(qualified=False),
+        development_natural_frequency_nodes_per_s=frequencies,
+      )
+    with self.assertRaisesRegex(ValueError, "qualified profiles"):
+      make_core(
+        vehicle_profile(),
+        development_reactive_only=True,
+        development_natural_frequency_nodes_per_s=frequencies,
+      )
+    for bad_frequencies in (
+      frequencies[:-1],
+      (math.nan,) + frequencies[1:],
+    ):
+      with self.subTest(frequencies=bad_frequencies):
+        with self.assertRaisesRegex(ValueError, "schedule"):
+          make_core(
+            vehicle_profile(qualified=False),
+            development_reactive_only=True,
+            development_natural_frequency_nodes_per_s=bad_frequencies,
+          )
+
   def test_horizon_identity_and_effect_time_grid_are_exact(self) -> None:
     profile = vehicle_profile(delays=(0.1,) * 6)
     adaptation, outputs, _ = adapted_intent(profile)
