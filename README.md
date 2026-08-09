@@ -14,16 +14,12 @@ Any and all code and features generated in this project are free for others to u
 
 ### Combo variants
 
-Copies of `combo` that differ only in the driving model they run:
+Only two combined testing branches are maintained:
 
 | branch | driving model |
 |---|---|
 | [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) | stock comma release model |
-| [`deep-rl3-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/deep-rl3-combo) | comma's [`deep_rl3`](https://github.com/commaai/openpilot/tree/deep_rl3) experimental RL model |
-| [`divided-rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/divided-rl-combo) | comma's [`divided-rl`](https://github.com/commaai/openpilot/tree/divided-rl) experimental RL model |
-| [`michael-rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/michael-rl-combo) | comma's [`michael-rl`](https://github.com/commaai/openpilot/tree/michael-rl) experimental RL model |
-
-[`rl-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rl-combo) is a special case: it runs comma's Rebel Legion release model but is **not** a pure copy of `combo` — it also merges upstream `commaai/openpilot` master ahead of `stock`, plus small tuning deltas (e.g. `LONG_SMOOTH` 0.0), so expect it to differ beyond the model swap.
+| [`rdf-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rdf-combo) | comma's [`rdf-driving`](https://github.com/commaai/openpilot/tree/rdf-driving) experimental RDF model |
 
 ## BLoTv2 Conditional Experimental Mode
 
