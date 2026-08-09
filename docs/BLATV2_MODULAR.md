@@ -418,8 +418,8 @@ speed-independent policy values:
   error; and
 - **damping ratio**: how the response settles without ringing or overshoot.
 
-The committed provisional search center is `10.0 1/s` and damping ratio
-`1.0`; it is explicitly unelected. The committed candidate bounds are
+The provisional owner-trial center is `10.5 1/s` and damping ratio `1.0`;
+it is explicitly unelected. The committed candidate bounds are
 `5.0–15.0 1/s` and damping ratio `0.6–1.5`. These are behavior-search bounds,
 not speed gates or vehicle torque values.
 

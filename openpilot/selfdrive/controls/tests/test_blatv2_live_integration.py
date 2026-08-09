@@ -1858,6 +1858,13 @@ def test_stock_arm_remains_the_unmodified_stock_update_shape() -> None:
     not in modular_arm
   )
   assert "self.sm.all_checks(['carState', 'carOutput'])" in modular_arm
+  record_start = modular_arm.index(
+    "if controller_selection == ControllerSelection.MODULAR:",
+  )
+  record_end = modular_arm.index("\n\n    return CC, lac_log", record_start)
+  record_block = modular_arm[record_start:record_end]
+  assert "self.blatv2_live.record_requested_command(" in record_block
+  assert "blatv2_messages_valid" not in record_block
   assert "cc_send.valid = CS.canValid and self.blatv2_messages_valid" in source
 
   card_source = (

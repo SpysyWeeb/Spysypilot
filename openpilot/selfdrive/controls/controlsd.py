@@ -362,11 +362,8 @@ class Controls:
         setattr(actuators, p, 0.0)
 
     if controller_selection == ControllerSelection.MODULAR:
-      command_recorded = self.blatv2_live.record_requested_command(
+      self.blatv2_live.record_requested_command(
         actuators.torque,
-      )
-      self.blatv2_messages_valid = (
-        self.blatv2_messages_valid and command_recorded
       )
 
     return CC, lac_log
