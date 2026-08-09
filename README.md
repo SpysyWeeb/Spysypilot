@@ -17,4 +17,4 @@ There is no setting or persistent parameter. The arc is part of the standard onr
 ## What changed
 
 - `openpilot/selfdrive/ui/mici/onroad/torque_bar.py` — accepts a display scale while preserving comma four's default rendering.
-- `openpilot/selfdrive/ui/onroad/hud_renderer.py` — renders the scaled torque bar in the comma 3X HUD.
+- `openpilot/selfdrive/ui/onroad/hud_renderer.py` — renders the scaled torque bar above the comma 3X HUD.
