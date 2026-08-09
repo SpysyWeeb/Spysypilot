@@ -490,7 +490,7 @@ def route_evidence_with_inactive_premodel_prefix() -> RouteEvidenceArtifact:
     runtime_identity="5" * 64,
     schema_versions={"extractor": 3, "route_evidence": 4},
     preparation_provenance={"canonical": True},
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=4,
     preparation_cache_key="6" * 64,
     controls_witness_count=4,

@@ -321,8 +321,8 @@ ill-conditioned, inconclusive, or regressing data requires better variety or a
 safer retained seed rather than simply forcing the node through.
 
 The learner's current evidence namespace is
-`complete_full_rlog_authority_v7`. It starts empty by design. The retired v1
-through v6 namespaces and their artifact bytes are never migrated, edited, or
+`complete_full_rlog_authority_v8`. It starts empty by design. The retired v1
+through v7 namespaces and their artifact bytes are never migrated, edited, or
 interpreted as schema-9 evidence; compatible retained full rlogs are replayed
 from source. Runtime identity for this namespace excludes the retired
 provisional rack-gain/damping seed while remaining bound to the detected
@@ -579,7 +579,7 @@ fit. Every response frame is paired
 causally with the newest recorded torque effective no later than
 `response time - seed transport delay`; it is never paired with the convenient
 same-frame `carOutput`. `carOutput` itself reports the prior card cycle, so the
-effective input clock is the preceding `carOutput` publication. Once aligned,
+effective input clock is its exact count/request-matched LKAS11 send. Once aligned,
 settled full-torque motion needs one response interval of command-side dwell,
 not a second copy of the transport delay. Driver-limited and physically
 impossible transitions remain excluded. This keeps sharp-turn/breakaway

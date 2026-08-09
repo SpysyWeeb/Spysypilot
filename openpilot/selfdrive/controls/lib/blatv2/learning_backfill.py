@@ -98,7 +98,7 @@ BACKFILL_PROVENANCE_SCHEMA_VERSION = 1
 BACKFILL_COMMIT_SCHEMA_VERSION = 2
 BACKFILL_POINTER_SCHEMA_VERSION = 1
 NATIVE_EXTRACTOR_SCHEMA_VERSION = 5
-CANONICAL_JOIN_SCHEMA_VERSION = 4
+CANONICAL_JOIN_SCHEMA_VERSION = 5
 MAXIMUM_EVENT_BYTES = 64 * 1024 * 1024
 MAXIMUM_EVENT_TRAVERSAL_WORDS = MAXIMUM_EVENT_BYTES // 8
 MAXIMUM_SELECTED_RECORDS_PER_SEGMENT = 100_000
@@ -562,6 +562,7 @@ class _RecordedCarOutput:
   steering_request_active_valid: bool
   steering_request_fault_avoidance_counter: int
   steering_request_fault_avoidance_counter_valid: bool
+  applied_effective_mono_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -718,7 +719,6 @@ class _CanonicalControlJoin:
   car_state: _TimedRouteRecord
   live_parameters: _TimedRouteRecord
   car_output: _TimedRouteRecord
-  previous_car_output_mono_ns: int | None
   car_control: _TimedRouteRecord | None
   curvature_unresolved: bool
   gap_from_previous: bool
@@ -1628,25 +1628,32 @@ def _copy_car_output(message: Any) -> _RecordedCarOutput:
     raw_request_valid = (
       message.actuatorsOutput.steeringRequestActiveValid
     )
-    raw_fault_counter = (
-      message.actuatorsOutput.steeringRequestFaultAvoidanceCounter
-    )
     if (
       type(raw_request_valid) is bool
       and raw_request_valid
       and type(raw_request_active) is bool
-      and type(raw_fault_counter) is int
-      and not isinstance(raw_fault_counter, bool)
-      and 0 <= raw_fault_counter <= 255
     ):
       request_active = raw_request_active
       request_active_valid = True
-      fault_avoidance_counter = raw_fault_counter
-      fault_avoidance_counter_valid = True
   except (AttributeError, TypeError, ValueError):
     pass
+  if request_active_valid:
+    try:
+      raw_fault_counter = (
+        message.actuatorsOutput.steeringRequestFaultAvoidanceCounter
+      )
+      if (
+        type(raw_fault_counter) is int
+        and not isinstance(raw_fault_counter, bool)
+        and 0 <= raw_fault_counter <= 255
+      ):
+        fault_avoidance_counter = raw_fault_counter
+        fault_avoidance_counter_valid = True
+    except (AttributeError, TypeError, ValueError):
+      pass
   return _RecordedCarOutput(
-    applied_torque=float(message.actuatorsOutput.torque),
+    # The physical command is populated only after exact sendcan binding.
+    applied_torque=0.0,
     torque_output_can_count=(int(raw_can_count) if can_count_valid else 0),
     torque_output_can_valid=can_count_valid,
     steering_request_active=request_active,
@@ -1693,7 +1700,7 @@ def _decode_hyundai_lkas11(
   )
 
 
-def _historical_palisade_lkas11_allowed(
+def _palisade_lkas11_allowed(
   descriptor: BuildDescriptor,
 ) -> bool:
   return (
@@ -1710,19 +1717,19 @@ def _historical_palisade_lkas11_allowed(
   ) == ("HYUNDAI_PALISADE", 409, 4, 7, 1, 50, 2, 1, True, 4.0)
 
 
-def _bind_prior_cycle_historical_steering_requests(
+def _bind_prior_cycle_palisade_lkas11(
   *,
   descriptor: BuildDescriptor,
   car_outputs: list[_TimedRouteRecord],
   sendcan_records: list[_TimedRouteRecord],
 ) -> None:
-  """Recover only the send represented by each following CarOutput.
+  """Bind each CarOutput to its exact preceding-cycle LKAS11 send.
 
   ``card.py`` publishes CarOutput_i before emitting sendcan_i. Therefore the
   payload in CarOutput_i came from the unique LKAS11 send after
   CarOutput_(i-1), not from the later sendcan_i.
   """
-  if not _historical_palisade_lkas11_allowed(descriptor):
+  if not _palisade_lkas11_allowed(descriptor):
     return
   sendcan_keys = tuple(
     (record.mono_ns, record.source_order)
@@ -1730,18 +1737,26 @@ def _bind_prior_cycle_historical_steering_requests(
   )
   for index, current in enumerate(car_outputs):
     output = current.payload
-    if (
-      not isinstance(output, _RecordedCarOutput)
-      or output.steering_request_active_valid
-      or index == 0
-    ):
+    if not isinstance(output, _RecordedCarOutput):
+      continue
+    # Raw CarOutput values are not physical authority until sendcan proves
+    # exact count, request, source, and timing parity.
+    car_outputs[index] = replace(
+      current,
+      payload=replace(
+        output,
+        applied_torque=0.0,
+        applied_effective_mono_ns=0,
+      ),
+    )
+    if index == 0 or not current.valid:
       continue
     previous = car_outputs[index - 1]
     if previous.segment_index != current.segment_index:
       continue
     previous_key = (previous.mono_ns, previous.source_order)
     current_key = (current.mono_ns, current.source_order)
-    decoded_candidates: list[_DecodedHyundaiLkas11] = []
+    candidates: list[tuple[_TimedRouteRecord, _DecodedHyundaiLkas11]] = []
     sendcan_left = bisect_right(sendcan_keys, previous_key)
     sendcan_right = bisect_left(sendcan_keys, current_key)
     for sendcan_index in range(sendcan_left, sendcan_right):
@@ -1749,32 +1764,57 @@ def _bind_prior_cycle_historical_steering_requests(
       if (
         sendcan.segment_index != current.segment_index
         or not sendcan.valid
-        or sendcan.mono_ns - previous.mono_ns > MAXIMUM_CONTROL_GAP_NS
-        or current.mono_ns - sendcan.mono_ns > MAXIMUM_CONTROL_GAP_NS
+        or not previous.mono_ns < sendcan.mono_ns < current.mono_ns
         or not isinstance(sendcan.payload, _RecordedSendcan)
       ):
         continue
-      decoded_candidates.extend(
-        decoded
+      candidates.extend(
+        (sendcan, decoded)
         for frame in sendcan.payload.frames
         if (decoded := _decode_hyundai_lkas11(frame)) is not None
       )
     if (
-      len(decoded_candidates) != 1
+      len(candidates) != 1
       or not output.torque_output_can_valid
-      or decoded_candidates[0].torque_count
-      != output.torque_output_can_count
+      or not -descriptor.steer_max <= output.torque_output_can_count <= descriptor.steer_max
     ):
       continue
-    decoded = decoded_candidates[0]
+    sendcan, decoded = candidates[0]
+    if (
+      sendcan.mono_ns - previous.mono_ns > MAXIMUM_CONTROL_GAP_NS
+      or current.mono_ns - sendcan.mono_ns > MAXIMUM_CONTROL_GAP_NS
+      or decoded.torque_count != output.torque_output_can_count
+      or (
+        output.steering_request_active_valid
+        and output.steering_request_active
+        != decoded.steering_request_active
+      )
+    ):
+      continue
     replacement = replace(
       current,
       payload=replace(
         output,
-        steering_request_active=decoded.steering_request_active,
+        applied_torque=decoded.torque_count / descriptor.steer_max,
+        torque_output_can_count=decoded.torque_count,
+        torque_output_can_valid=True,
+        steering_request_active=(
+          output.steering_request_active
+          if output.steering_request_active_valid
+          else decoded.steering_request_active
+        ),
         steering_request_active_valid=True,
-        steering_request_fault_avoidance_counter=0,
-        steering_request_fault_avoidance_counter_valid=False,
+        steering_request_fault_avoidance_counter=(
+          output.steering_request_fault_avoidance_counter
+          if output.steering_request_active_valid
+          else 0
+        ),
+        steering_request_fault_avoidance_counter_valid=(
+          output.steering_request_fault_avoidance_counter_valid
+          if output.steering_request_active_valid
+          else False
+        ),
+        applied_effective_mono_ns=sendcan.mono_ns,
       ),
     )
     car_outputs[index] = replacement
@@ -2349,12 +2389,6 @@ def _build_canonical_control_joins(
         "measurement_race_unreconstructable",
         f"{route_name}: selfdriveState poll precedes the first carOutput",
       )
-    output_index = bisect_right(output_times, car_output.mono_ns) - 1
-    previous_output_ns = (
-      None
-      if output_index <= 0
-      else ordered_outputs[output_index - 1].mono_ns
-    )
 
     state_left = bisect_right(state_times, poll_ns)
     state_right = bisect_right(state_times, witness.mono_ns)
@@ -2428,7 +2462,6 @@ def _build_canonical_control_joins(
       car_state=selected_state,
       live_parameters=selected_parameters,
       car_output=car_output,
-      previous_car_output_mono_ns=previous_output_ns,
       car_control=paired_commands.get(witness.source_order),
       curvature_unresolved=unresolved,
       gap_from_previous=(
@@ -2463,16 +2496,15 @@ def _measured_frame_from_join(
       "measured_frame_invalid",
       "canonical join contains an invalid compact payload",
     )
-  applied_effective_ns = (
-    0
-    if join.previous_car_output_mono_ns is None
-    else join.previous_car_output_mono_ns
-  )
+  applied_effective_ns = car_output.applied_effective_mono_ns
   source_valid = (
     join.witness.valid
     and join.car_state.valid
     and join.live_parameters.valid
     and join.car_output.valid
+    and car_output.torque_output_can_valid
+    and -409 <= car_output.torque_output_can_count <= 409
+    and applied_effective_ns > 0
     and car_output.steering_request_active_valid
     and car_output.steering_request_active
     and join.car_control is not None
@@ -2510,10 +2542,7 @@ def _measured_frame_from_join(
       and not join.curvature_unresolved
       and 0 < join.car_state.mono_ns <= join.witness.mono_ns
       and 0 < join.car_output.mono_ns <= join.poll_mono_ns
-      and (
-        applied_effective_ns == 0
-        or 0 < applied_effective_ns < join.car_output.mono_ns
-      )
+      and 0 < applied_effective_ns < join.car_output.mono_ns
     ),
   )
 
@@ -2887,6 +2916,8 @@ def _route_evidence_artifact(
     and (
       not isinstance(join.car_output.payload, _RecordedCarOutput)
       or not join.car_output.payload.torque_output_can_valid
+      or not -409 <= join.car_output.payload.torque_output_can_count <= 409
+      or join.car_output.payload.applied_effective_mono_ns <= 0
     )
     for join in joins
     if join.car_control is not None
@@ -2991,7 +3022,7 @@ def _route_evidence_artifact(
       state_sample_mono_ns=join.car_state.mono_ns,
       live_parameters_mono_ns=join.live_parameters.mono_ns,
       car_output_report_mono_ns=join.car_output.mono_ns,
-      car_output_effective_mono_ns=(0 if join.previous_car_output_mono_ns is None else join.previous_car_output_mono_ns),
+      car_output_effective_mono_ns=output.applied_effective_mono_ns,
       car_control_mono_ns=(-1 if join.car_control is None else join.car_control.mono_ns),
       raw_request_torque=raw_request,
       measured_curvature=controls_state.measured_curvature,
@@ -3112,7 +3143,7 @@ def _route_evidence_artifact(
       "live_torque_health_reconstruction": 2,
     },
     preparation_provenance=dict(provenance),
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=len(frames),
     preparation_cache_key=_sha256(_canonical_json_bytes(cache_payload)),
     controls_witness_count=(
@@ -3522,7 +3553,7 @@ def _prepare_route_with_extractor(
       "route runtime compatibility could not be reconstructed",
     ) from exc
 
-  _bind_prior_cycle_historical_steering_requests(
+  _bind_prior_cycle_palisade_lkas11(
     descriptor=route_descriptor,
     car_outputs=route_records["carOutput"],
     sendcan_records=route_records["sendcan"],

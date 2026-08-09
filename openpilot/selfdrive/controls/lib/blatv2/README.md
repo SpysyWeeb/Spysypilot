@@ -275,10 +275,14 @@ authority observations rather than equality-fit data.
 The replay retains distinct controls-witness, car-state response,
 `carOutput` report, and applied-command effective timestamps. Since `card.py`
 publishes `last_actuators_output` before applying its next output, a
-`carOutput` payload is effective at the preceding `carOutput` publication. On
-reviewed historical Palisade builds, its request bit is the unique matching
-LKAS11 send between that preceding publication and the current report; the
-later send emitted after the current report belongs to the next payload.
+`carOutput` payload is bound to the unique valid bus-0, eight-byte LKAS11 send
+strictly between the preceding and current `carOutput` publications. Both
+sides must be within 15 ms, decoded torque must exactly match integer
+`torqueOutputCan`, and any recorded request bit must match. The exact send time
+is the applied-command clock and decoded count divided by 409 is physical
+torque; missing, duplicate, invalid, out-of-range, or mismatched bindings fail
+closed. Historical payloads may recover their missing request bit. The later
+send emitted after the current report belongs to the next payload.
 For rack response at time `t`, the input is the newest exact zero-order-held
 command effective at or before `t - transport_delay(speed)`. No future,
 interpolated, or same-frame command can enter the fit. Speed, mapping,
@@ -304,9 +308,10 @@ cross-frame direction.
 
 The committed identities are calibration profile/evidence/coordinator
 `3/14/14`, physical learning/operation/progress status `7/1/1`, native
-extractor/canonical join `5/4`, route evidence `BLATRE04` version `4`,
+extractor/canonical join `5/5`, physical-frame encoding `2`, route evidence
+`BLATRE04` version `4`,
 backfill ledger/commit/pointer `3/2/1`, controller policy `1`, and namespace
-`complete_full_rlog_authority_v7`. Behavior uses gate/
+`complete_full_rlog_authority_v8`. Behavior uses gate/
 segmentation/replay-input `3/1/1`, transaction/finalization `2/1`, generation/
 pointer/route-set `1/1/1`, and learning status `1`. Off-device protocol and
 cross-architecture certification are `2/5`, and off-device display progress
@@ -354,8 +359,8 @@ approved activation lifecycle it may request rollback or leave an artifact
 provisional; it cannot create approval.
 
 Durable storage is also versioned by evidence-inclusion policy:
-`<storage root>/<calibration runtime identity>/complete_full_rlog_authority_v7`.
-The predecessor v1/v2/v3/v4/v5/v6 namespaces and any earlier unnamespaced runtime
+`<storage root>/<calibration runtime identity>/complete_full_rlog_authority_v8`.
+The predecessor v1/v2/v3/v4/v5/v6/v7 namespaces and any earlier unnamespaced runtime
 directory remain byte-untouched and are never restored or mixed into this
-policy. Version 7 always starts with an empty ledger and independently replays
+policy. Version 8 always starts with an empty ledger and independently replays
 every eligible full rlog in the operator-selected PC archive.

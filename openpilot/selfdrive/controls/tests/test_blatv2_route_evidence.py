@@ -64,7 +64,7 @@ def source() -> RouteEvidenceSourceIdentity:
     runtime_identity="5" * 64,
     schema_versions={"extractor": 3, "route_evidence": 4},
     preparation_provenance={"extractor_schema_version": 3},
-    physical_plane_encoding_id="blatv2-measured-learning-frame-v1",
+    physical_plane_encoding_id="blatv2-measured-learning-frame-v2",
     physical_record_count=2, preparation_cache_key="6" * 64,
     controls_witness_count=2, unresolved_witness_count=0, gap_count=0,
     model_link_failure_count=0,

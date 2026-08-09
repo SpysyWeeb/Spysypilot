@@ -85,6 +85,7 @@ def _output(
     steering_request_active_valid=True,
     steering_request_fault_avoidance_counter=0,
     steering_request_fault_avoidance_counter_valid=True,
+    applied_effective_mono_ns=1,
   )
 
 
@@ -190,6 +191,18 @@ def test_car_output_request_state_is_explicit_and_missing_fields_fail_closed() -
   assert not legacy.steering_request_active_valid
   assert legacy.steering_request_fault_avoidance_counter == 0
   assert not legacy.steering_request_fault_avoidance_counter_valid
+
+  request_only = backfill._copy_car_output(SimpleNamespace(
+    actuatorsOutput=SimpleNamespace(
+      torque=0.5,
+      torqueOutputCan=193.0,
+      steeringRequestActive=True,
+      steeringRequestActiveValid=True,
+    ),
+  ))
+  assert request_only.steering_request_active
+  assert request_only.steering_request_active_valid
+  assert not request_only.steering_request_fault_avoidance_counter_valid
 
   for request_active, counter in ((False, 90), (True, 0)):
     current = backfill._copy_car_output(SimpleNamespace(
@@ -376,7 +389,7 @@ def test_prior_cycle_request_cut_preserves_command_and_censors_physical_fit() ->
       backfill._RecordedSendcan((_production_lkas11(12, True),)),
     ),
   ]
-  backfill._bind_prior_cycle_historical_steering_requests(
+  backfill._bind_prior_cycle_palisade_lkas11(
     descriptor=_historical_descriptor(),
     car_outputs=outputs,
     sendcan_records=sends,
@@ -386,11 +399,13 @@ def test_prior_cycle_request_cut_preserves_command_and_censors_physical_fit() ->
   assert isinstance(cut, backfill._RecordedCarOutput)
   assert cut.torque_output_can_count == 193
   assert cut.applied_torque == pytest.approx(193 / 409.0)
+  assert cut.applied_effective_mono_ns == 105_000_000
   assert cut.steering_request_active_valid
   assert not cut.steering_request_active
   assert not cut.steering_request_fault_avoidance_counter_valid
   stale = outputs[2].payload
   assert isinstance(stale, backfill._RecordedCarOutput)
+  assert stale.applied_effective_mono_ns == 0
   assert not stale.steering_request_active_valid
 
   active_join = _join_with_activity(lateral_active=True)
@@ -401,28 +416,66 @@ def test_prior_cycle_request_cut_preserves_command_and_censors_physical_fit() ->
   )
   cut_frame = backfill._measured_frame_from_join(cut_join)
   assert cut_frame.applied_torque == pytest.approx(193 / 409.0)
+  assert cut_frame.applied_effective_mono_ns == 105_000_000
   assert not cut_frame.inputs_valid
 
 
-def test_historical_request_association_is_provenance_and_time_bounded() -> None:
+def test_palisade_lkas11_binding_is_exact_and_fail_closed() -> None:
   def bind(
     descriptor: backfill.BuildDescriptor,
     send_time_ns: int,
     *,
     send_count: int = 102,
+    output_count: int = 102,
+    modern_request: bool | None = None,
+    send_request: bool = True,
+    duplicate: bool = False,
+    invalid_extra: bool = False,
+    missing: bool = False,
+    send_segment: int = 0,
+    send_valid: bool = True,
   ) -> backfill._RecordedCarOutput:
+    output = _legacy_output(0.25, output_count)
+    if modern_request is not None:
+      output = replace(
+        output,
+        steering_request_active=modern_request,
+        steering_request_active_valid=True,
+        steering_request_fault_avoidance_counter=7,
+        steering_request_fault_avoidance_counter_valid=True,
+      )
+    frames = (
+      ()
+      if missing
+      else (_production_lkas11(send_count, send_request),)
+    )
+    if duplicate:
+      frames += (_production_lkas11(send_count, send_request),)
     outputs = [
       _record(100_000_000, 0, _legacy_output(0.0, 0)),
-      _record(120_000_000, 2, _legacy_output(0.25, 102)),
+      _record(120_000_000, 2, output),
     ]
-    backfill._bind_prior_cycle_historical_steering_requests(
-      descriptor=descriptor,
-      car_outputs=outputs,
-      sendcan_records=[_record(
+    send_record = replace(
+      _record(
         send_time_ns,
         1,
-        backfill._RecordedSendcan((_production_lkas11(send_count, True),)),
-      )],
+        backfill._RecordedSendcan(frames),
+        valid=send_valid,
+      ),
+      segment_index=send_segment,
+    )
+    sendcan_records = [send_record]
+    if invalid_extra:
+      sendcan_records.insert(0, _record(
+        104_000_000,
+        0,
+        backfill._RecordedSendcan((_production_lkas11(send_count, send_request),)),
+        valid=False,
+      ))
+    backfill._bind_prior_cycle_palisade_lkas11(
+      descriptor=descriptor,
+      car_outputs=outputs,
+      sendcan_records=sendcan_records,
     )
     result = outputs[1].payload
     assert isinstance(result, backfill._RecordedCarOutput)
@@ -443,6 +496,52 @@ def test_historical_request_association_is_provenance_and_time_bounded() -> None
     log_schema_blob="83a13a871d534822dbe88afa8ca9e0ad4dd8a365",
   )
   assert bind(route_87, 105_000_000).steering_request_active_valid
+  modern = bind(
+    _historical_descriptor(),
+    105_000_000,
+    modern_request=True,
+  )
+  assert modern.applied_effective_mono_ns == 105_000_000
+  assert modern.applied_torque == pytest.approx(102 / 409.0)
+  assert modern.steering_request_fault_avoidance_counter == 7
+  mismatch = bind(
+    _historical_descriptor(),
+    105_000_000,
+    modern_request=False,
+  )
+  assert mismatch.applied_effective_mono_ns == 0
+  assert mismatch.applied_torque == 0.0
+  assert bind(
+    _historical_descriptor(),
+    105_000_000,
+    duplicate=True,
+  ).applied_effective_mono_ns == 0
+  assert bind(
+    _historical_descriptor(),
+    105_000_000,
+    missing=True,
+  ).applied_effective_mono_ns == 0
+  assert bind(
+    _historical_descriptor(),
+    105_000_000,
+    send_valid=False,
+  ).applied_effective_mono_ns == 0
+  assert bind(
+    _historical_descriptor(),
+    105_000_000,
+    invalid_extra=True,
+  ).applied_effective_mono_ns == 105_000_000
+  assert bind(
+    _historical_descriptor(),
+    105_000_000,
+    send_segment=1,
+  ).applied_effective_mono_ns == 0
+  assert bind(
+    _historical_descriptor(),
+    105_000_000,
+    send_count=410,
+    output_count=410,
+  ).applied_effective_mono_ns == 0
   assert not bind(
     _historical_descriptor(vehicle="HYUNDAI_SONATA"),
     105_000_000,
@@ -451,6 +550,14 @@ def test_historical_request_association_is_provenance_and_time_bounded() -> None
     _historical_descriptor(),
     101_000_000,
   ).steering_request_active_valid
+  assert bind(
+    _historical_descriptor(),
+    100_000_000,
+  ).applied_effective_mono_ns == 0
+  assert bind(
+    _historical_descriptor(),
+    120_000_000,
+  ).applied_effective_mono_ns == 0
   assert not bind(
     _historical_descriptor(),
     105_000_000,

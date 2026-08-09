@@ -270,12 +270,11 @@ class TestBLaTv2BackfillGeneration(unittest.TestCase):
       ),
       (15, 17, 11),
     )
-    # The join identity moves only when source interpretation changes. Version
-    # 4 binds request-off censoring to the carried command timeline.
-    self.assertEqual(CANONICAL_JOIN_SCHEMA_VERSION, 4)
+    # Version 5 binds physical command/count/request authority to exact LKAS11.
+    self.assertEqual(CANONICAL_JOIN_SCHEMA_VERSION, 5)
     self.assertEqual(
       FULL_RLOG_INCLUSION_POLICY_NAMESPACE,
-      "complete_full_rlog_authority_v7",
+      "complete_full_rlog_authority_v8",
     )
 
   def test_inclusion_policy_namespace_ignores_legacy_runtime_root(

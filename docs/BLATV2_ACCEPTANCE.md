@@ -198,10 +198,11 @@ The current contract identities are:
 | calibration profile / evidence / coordinator | 2 / 9 / 9 |
 | runtime vehicle / calibration identity / provisional dynamics | 1 / 1 / 1 |
 | physical learning / operation / progress status | 4 / 1 / 1 |
-| native extractor / canonical join | 3 / 3 |
-| route evidence | `BLATRE02`, version 2 |
-| backfill ledger / commit / pointer | 2 / 2 / 1 |
-| inclusion namespace | `complete_full_rlog_authority_v7` |
+| native extractor / canonical join | 5 / 5 |
+| physical-frame encoding | 2 |
+| route evidence | `BLATRE04`, version 4 |
+| backfill ledger / commit / pointer | 3 / 2 / 1 |
+| inclusion namespace | `complete_full_rlog_authority_v8` |
 | controller policy | 1 |
 | behavior gate / segmentation / replay input | 3 / 1 / 1 |
 | behavior transaction / finalization | 2 / 1 |
@@ -212,7 +213,7 @@ The current contract identities are:
 | off-device protocol / certification | 2 / 5 |
 | off-device display progress | 2 |
 
-The v7 physical namespace starts from empty evidence. Retired v1 through v6
+The v8 physical namespace starts from empty evidence. Retired v1 through v7
 artifact bytes are immutable and cannot be migrated into it.
 
 Each speed node independently requires its documented clean support,

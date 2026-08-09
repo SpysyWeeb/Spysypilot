@@ -71,7 +71,7 @@ CASUAL_DRIVING_CANDIDATE_PROVENANCE = "measured casual-driving evidence"
 # physical runtime. A policy change must start from an empty ledger and replay
 # retained full rlogs; it must never reinterpret or mix a predecessor's
 # CURRENT generation in place.
-FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v7"
+FULL_RLOG_INCLUSION_POLICY_NAMESPACE = "complete_full_rlog_authority_v8"
 _CONTROLLER_LIMIT_FIELDS = (
   "STEER_MAX",
   "STEER_DELTA_UP",
