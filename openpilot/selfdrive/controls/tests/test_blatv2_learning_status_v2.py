@@ -26,6 +26,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_learner import (
   CalibrationSampleAccounting,
   CalibrationSampleDisposition,
   MIN_STRATUM_TRAINING_ROWS,
+  TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY,
 )
 from openpilot.selfdrive.controls.lib.blatv2.calibration_profile import (
   CalibrationProfileNode,
@@ -349,7 +350,7 @@ def test_schema_v7_roundtrip_identity_observable_parameters_and_deltas() -> None
     drive_baseline=baseline,
   )
 
-  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 11
+  assert payload["schema_version"] == LEARNING_STATUS_SCHEMA_VERSION == 12
   assert payload["runtime_identity_sha256"] == runtime.calibration_identity_sha256
   assert payload["runtime_identity_sha256"] != runtime.identity_sha256
   assert payload["seed_profile_sha256"] == hashlib.sha256(
@@ -973,6 +974,43 @@ def test_all_seed_qualified_result_has_no_candidate_artifact() -> None:
   assert all(node["evaluation_status"] == "seed_retained" for node in payload["nodes"])
   assert all(node["cross_fit_paired_loss"]["route_count"] == 2 for node in payload["nodes"])
   assert all(node["full_fit_diagnostic"] is not None for node in payload["nodes"])
+
+  terminal = json.loads(json.dumps(payload))
+  terminal["vehicle_identity"] = TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY
+  terminal["nodes"][-1]["speed_mps"] = 30.0
+  terminal["interpolation_reports"][-1]["upper_speed_mps"] = 30.0
+  node = terminal["nodes"][-1]
+  node["authority_cross_fit_route_count"] = 1
+  node["independent_route_counts"]["authority"] = 1
+  node["full_fit_diagnostic"] = node["fit_diagnostics"][0]
+  for index, diagnostic in enumerate(node["cross_fit_diagnostics"]):
+    if index == 0:
+      diagnostic["status"] = CalibrationCrossFitStatus.HELD_OUT_REGRESSION.value
+      diagnostic["regressed_fold_count"] = 1
+      node["cross_fit_paired_loss"] = json.loads(json.dumps(diagnostic["paired_loss"]))
+    else:
+      diagnostic.update({
+        "failed_fold_count": 0,
+        "regressed_fold_count": 0,
+        "status": CalibrationCrossFitStatus.INSUFFICIENT_INDEPENDENT_ROUTES.value,
+        "successful_fold_count": 0,
+      })
+      diagnostic["paired_loss"] = {
+        "lower_bound_mse": None,
+        "mean_candidate_minus_seed_mse": None,
+        "numerical_tolerance_mse": None,
+        "route_count": 0,
+        "uncertainty_mse": None,
+        "upper_bound_mse": None,
+      }
+  validate_learning_status_payload(terminal)
+
+  changed_seed = json.loads(json.dumps(terminal))
+  changed_seed["nodes"][-1]["full_fit_paired_loss"][
+    "mean_candidate_minus_seed_mse"
+  ] = 1e-15
+  with unittest.TestCase().assertRaisesRegex(ValueError, "not identical"):
+    validate_learning_status_payload(changed_seed)
 
 
 def test_failure_classifications_remain_distinct() -> None:

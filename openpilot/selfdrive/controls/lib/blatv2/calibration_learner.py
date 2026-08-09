@@ -78,7 +78,7 @@ MIN_TERMINAL_SEED_AUTHORITY_ROUTES = 1
 TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY = "HYUNDAI_PALISADE"
 TERMINAL_SEED_AUTHORITY_SPEED_MPS = 30.0
 TERMINAL_SEED_AUTHORITY_POLICY_ID = (
-  "palisade-terminal-30mps-authority-one-route-field-test-v1"
+  "palisade-terminal-30mps-authority-one-route-field-test-v2"
 )
 NORMAL_MATRIX_RELATIVE_PIVOT_MIN = 1e-10
 # Floating-point cancellation guard only. Physical acceptance uses the
@@ -3691,12 +3691,39 @@ class CalibrationProfileLearner:
       else:
         reasons.append(CalibrationQualificationReason.SINGULAR_FIT)
     selected_model = None if selected_cross_fit is None else selected_cross_fit.model
+    terminal_seed_fallback = next(
+      (
+        family for family in cross_fit_families
+        if (
+          selected_cross_fit is None
+          and not safe_seed_cross_fit
+          and route_counts.authority == MIN_TERMINAL_SEED_AUTHORITY_ROUTES
+          and terminal_seed_authority_allowed(
+            vehicle_identity=self.seed_profile.vehicle_identity,
+            speed_mps=speed,
+            terminal=index == len(self._nodes) - 1,
+            seed_retained=True,
+          )
+          and family.diagnostic.status
+          is CalibrationCrossFitStatus.HELD_OUT_REGRESSION
+          and family.diagnostic.successful_fold_count > 0
+          and family.diagnostic.failed_fold_count == 0
+          and any(
+            model is family.model
+            and fitted == seed_coefficients
+            and diagnostic.status is CalibrationFitStatus.IDENTIFIABLE
+            for model, fitted, diagnostic in full_fit_results
+          )
+        )
+      ),
+      None,
+    )
     selection_cross_fit = (
       selected_cross_fit
       if selected_cross_fit is not None
       else safe_seed_cross_fit[0]
       if safe_seed_cross_fit
-      else None
+      else terminal_seed_fallback
     )
     selected_full_fit = next(
       (
@@ -3705,10 +3732,7 @@ class CalibrationProfileLearner:
       ),
       None,
     )
-    seed_retained = (
-      selected_cross_fit is None
-      and bool(safe_seed_cross_fit)
-    )
+    seed_retained = selected_cross_fit is None and selection_cross_fit is not None
     terminal_seed_authority = terminal_seed_authority_allowed(
       vehicle_identity=self.seed_profile.vehicle_identity,
       speed_mps=speed,
@@ -3731,7 +3755,7 @@ class CalibrationProfileLearner:
     )
     coefficients = seed_coefficients
     full_fit_diagnostic: CalibrationModelFitDiagnostic | None = None
-    full_fit_safe = not heldout_regression
+    full_fit_safe = seed_retained or not heldout_regression
     full_fit_stratum_losses: tuple[CalibrationPairedLossDiagnostic, ...] = ()
     if selected_full_fit is not None:
       _, fitted, full_fit_diagnostic = selected_full_fit
@@ -4098,7 +4122,7 @@ class CalibrationProfileLearner:
       if report.selected_model is not None
     )
     candidate_provenance = (
-      f"{source}; observable-inverse-torque-crossfit-v5; " +
+      f"{source}; observable-inverse-torque-crossfit-v6; " +
       f"terminal_authority_policy={TERMINAL_SEED_AUTHORITY_POLICY_ID}; " +
       f"models={model_ids}; evidence_revision={revision}"
     )

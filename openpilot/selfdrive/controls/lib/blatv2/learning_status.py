@@ -56,7 +56,7 @@ from openpilot.selfdrive.controls.lib.blatv2.runtime_vehicle import (
 
 
 LEARNING_STATUS_PARAM = "BLaTv2LearningStatus"
-LEARNING_STATUS_SCHEMA_VERSION = 11
+LEARNING_STATUS_SCHEMA_VERSION = 12
 MAX_LEARNING_STATUS_FLOAT_ABS = float(MAX_CALIBRATION_EVIDENCE_ROWS)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOP_LEVEL_KEYS = {
@@ -1617,6 +1617,25 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
     has_regressed_family = any(
       diagnostic["regressed_fold_count"] > 0 for diagnostic in cross_fit_values
     )
+    terminal_seed_fallback = (
+      terminal_seed_authority
+      and parsed_route_counts["authority"]
+      == MIN_TERMINAL_SEED_AUTHORITY_ROUTES
+      and not has_scored_family
+      and not has_safe_seed_family
+      and any(
+        diagnostic["status"]
+        == CalibrationCrossFitStatus.HELD_OUT_REGRESSION.value
+        for diagnostic in cross_fit_values
+      )
+    )
+    if terminal_seed_fallback:
+      full_fit_loss_outcome = _validate_paired_loss(
+        node["full_fit_paired_loss"],
+        f"{context}.full_fit_paired_loss",
+        optional=False,
+        identical=True,
+      )
     if (
       full_fit_diagnostic is not None
       and full_fit_diagnostic["status"]
@@ -1673,10 +1692,13 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       and len(stratum_outcomes) != expected_stratum_count
     ) or (not expects_stratum_losses and stratum_outcomes):
       raise ValueError(f"{context}.full-fit stratum proof is incomplete")
-    full_fit_safe = not (
-      not has_scored_family
-      and not has_safe_seed_family
-      and has_regressed_family
+    full_fit_safe = (
+      terminal_seed_fallback
+      or not (
+        not has_scored_family
+        and not has_safe_seed_family
+        and has_regressed_family
+      )
     ) and all(
       outcome in ("improved", "no_regression")
       for outcome in stratum_outcomes
@@ -1797,7 +1819,11 @@ def validate_learning_status_payload(payload: object) -> dict[str, object]:
       expected_status = (
         CalibrationCrossFitStatus.SCORED.value
         if selection_outcome == CalibrationQualificationReason.LEARNED.value
-        else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+        else (
+          CalibrationCrossFitStatus.HELD_OUT_REGRESSION.value
+          if terminal_seed_fallback
+          else CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT.value
+        )
       )
       if authoritative["status"] != expected_status:
         raise ValueError(f"{context}.selected family status contradicts outcome")

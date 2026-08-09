@@ -935,7 +935,7 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       report.unresolved_diagnostics,
     )
 
-  def test_terminal_seed_authority_uses_owner_field_trial_minimum(self) -> None:
+  def test_terminal_regressed_fit_retains_exact_seed_with_owner_minimum(self) -> None:
     self.assertEqual(
       terminal_seed_authority_allowed(
         vehicle_identity=TERMINAL_SEED_AUTHORITY_VEHICLE_IDENTITY,
@@ -1027,12 +1027,74 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
       terminal_interval=False,
     )
 
-    result = learner.qualify("owner-authorized terminal authority")
-    self.assertTrue(result.all_nodes_qualified)
+    def reject_terminal_alternate_fit(routes, node_index, model, coefficients, fields):
+      family = _cross_fit_family(routes, node_index, model, coefficients, fields)
+      if (
+        node_index == len(seed.nodes) - 1
+        and family.diagnostic.status
+        is CalibrationCrossFitStatus.NO_ROBUST_IMPROVEMENT
+      ):
+        return replace(
+          family,
+          diagnostic=replace(
+            family.diagnostic,
+            status=CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+            regressed_fold_count=1,
+          ),
+        )
+      return family
+
+    route_count = len(learner._routes)
+    change_terminal_fit = False
+
+    def terminal_full_fit(routes, node_index, model, coefficients, **kwargs):
+      fitted, diagnostic = _fit_model_family(
+        routes,
+        node_index,
+        model,
+        coefficients,
+        **kwargs,
+      )
+      if (
+        len(routes) == route_count
+        and node_index == len(seed.nodes) - 1
+        and model is CalibrationModelId.STATIC_ONLY
+        and fitted is not None
+      ):
+        fitted = _seed_coefficients(seed.nodes[-1].parameters)
+        if change_terminal_fit:
+          fitted = (math.nextafter(fitted[0], math.inf), *fitted[1:])
+      return fitted, diagnostic
+
+    with (
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._cross_fit_family",
+        side_effect=reject_terminal_alternate_fit,
+      ),
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._fit_model_family",
+        side_effect=terminal_full_fit,
+      ),
+    ):
+      result = learner.qualify("owner-authorized terminal authority")
+    self.assertTrue(
+      result.all_nodes_qualified,
+      tuple(report.reasons for report in result.node_reports),
+    )
     self.assertIsNone(result.candidate_profile)
     self.assertIsNotNone(result.selected_profile)
     terminal = result.node_reports[-1]
     self.assertTrue(terminal.seed_retained)
+    self.assertIsNone(terminal.selected_model)
+    selected_proof = next(
+      diagnostic for diagnostic in terminal.cross_fit_diagnostics
+      if diagnostic.model is terminal.full_fit_diagnostic.model
+    )
+    self.assertEqual(
+      selected_proof.status,
+      CalibrationCrossFitStatus.HELD_OUT_REGRESSION,
+    )
+    self.assertEqual(selected_proof.regressed_fold_count, 1)
     self.assertEqual(
       terminal.independent_route_counts.authority,
       MIN_TERMINAL_SEED_AUTHORITY_ROUTES,
@@ -1051,6 +1113,24 @@ class TestBLaTv2CalibrationLearner(unittest.TestCase):
     self.assertIn(
       f"terminal_authority_policy={TERMINAL_SEED_AUTHORITY_POLICY_ID}",
       result.selected_profile.provenance,
+    )
+
+    change_terminal_fit = True
+    with (
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._cross_fit_family",
+        side_effect=reject_terminal_alternate_fit,
+      ),
+      patch(
+        "openpilot.selfdrive.controls.lib.blatv2.calibration_learner._fit_model_family",
+        side_effect=terminal_full_fit,
+      ),
+    ):
+      rejected = learner.qualify("non-seed terminal fit")
+    self.assertFalse(rejected.node_reports[-1].qualified)
+    self.assertIn(
+      CalibrationQualificationReason.INSUFFICIENT_INDEPENDENT_ROUTES,
+      rejected.node_reports[-1].reasons,
     )
 
   def test_route_input_order_does_not_change_evidence_bytes(self) -> None:

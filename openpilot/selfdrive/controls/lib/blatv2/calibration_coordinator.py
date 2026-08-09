@@ -49,7 +49,7 @@ from openpilot.selfdrive.controls.lib.blatv2.calibration_source import (
 from openpilot.selfdrive.controls.lib.blatv2.learner import LearningSample
 
 
-CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 17
+CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION = 18
 # Short alias retained for callers that treat this as the only calibration
 # coordinator. Both names identify the same wire artifact, never two schemas.
 CALIBRATION_COORDINATOR_ARTIFACT_SCHEMA_VERSION = CALIBRATION_LEARNING_COORDINATOR_ARTIFACT_SCHEMA_VERSION
