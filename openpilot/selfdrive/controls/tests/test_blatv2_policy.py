@@ -25,11 +25,12 @@ class TestBlatV2Policy(unittest.TestCase):
 
     self.assertEqual(CONTROLLER_POLICY_SCHEMA_VERSION, 1)
     self.assertTrue(policy.provisional)
-    self.assertEqual(policy.revision, 0)
+    self.assertEqual(policy.revision, 1)
     self.assertIsNone(policy.observer_policy)
-    self.assertEqual(policy.tracking_policy.natural_frequency_per_s, 10.0)
+    self.assertEqual(policy.tracking_policy.natural_frequency_per_s, 10.5)
     self.assertEqual(policy.tracking_policy.damping_ratio, 1.0)
     self.assertIn("unelected", policy.provenance)
+    self.assertIn("00000103--b394707941", policy.provenance)
 
   def test_policy_encoding_and_hash_are_deterministic(self):
     first = ControllerPolicy.from_json_file(POLICY_PATH)

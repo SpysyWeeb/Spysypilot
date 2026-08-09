@@ -1170,7 +1170,8 @@ class TestBehaviorTrainingAuthority(unittest.TestCase):
         for call in calls
       )
 
-    candidate = PolicyCandidate(0, BehaviorPolicy(8.0, 0.9), 0.0)
+    # The mocked winner must exist in the committed 10.5-centered grid.
+    candidate = PolicyCandidate(0, BehaviorPolicy(8.4, 0.9), 0.0)
     selection = SimpleNamespace(winner=candidate, to_dict=lambda: {"winner": candidate.policy.to_dict()})
     validation = SimpleNamespace(
       accepted=validation_accepted,

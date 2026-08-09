@@ -34,7 +34,7 @@ from openpilot.selfdrive.controls.lib.blatv2.route_evidence import (
 )
 from openpilot.selfdrive.controls.tests.test_blatv2_behavior_replay import (
   INTERFACES,
-  behavior_policy,
+  behavior_policy as _replay_behavior_policy,
   physical_profile,
 )
 from openpilot.selfdrive.controls.tests.test_blatv2_behavior_route_evaluator import (
@@ -47,6 +47,14 @@ ROUTE_IDS = (
   "00000002--0000000002",
   "00000003--0000000003",
 )
+
+
+def behavior_policy():
+  # Keep this authority fixture on the committed 10.5-centered policy grid.
+  return replace(
+    _replay_behavior_policy(),
+    natural_frequency_per_s=8.4,
+  )
 
 
 def _source_row(artifact: RouteEvidenceArtifact) -> dict[str, object]:
