@@ -6,14 +6,14 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see 
 
 ## What it does
 
-Adds the comma four's animated steering-wheel indicator to the bottom-left of the comma 3X onroad display. It rotates with the car's measured steering angle, fades and slides into view while openpilot is engaged, and hides when disengaged.
+Rotates the comma 3X onroad display's existing top-right steering-wheel icon with the car's measured steering angle.
 
-The existing top-right Chill/Experimental mode button is unchanged. There is no setting or persistent parameter.
+The Chill/Experimental mode button otherwise behaves as before. There is no setting or persistent parameter.
 
 ## How it works
 
-The comma 3X HUD loads the existing comma four wheel asset at its native comma 3X UI scale. Its rotation comes directly from `carState.steeringAngleDeg`, using the same direction and engagement animation as the comma four renderer.
+The mode button draws its current icon around a centered origin and rotates it directly from `carState.steeringAngleDeg`, matching the physical wheel direction.
 
 ## What changed
 
-- `openpilot/selfdrive/ui/onroad/hud_renderer.py` — renders and animates the rotating steering-wheel indicator.
+- `openpilot/selfdrive/ui/onroad/exp_button.py` — rotates the existing mode-button icon around its center.
