@@ -298,6 +298,15 @@ are unchanged. Its exact descriptor is therefore reviewed and admitted without
 bypassing the `unreviewed_build` gate. BLaTv2 remains in progress pending field
 validation.
 
+Route `000000ed--6f791e485c` records combo commit `320ab0def1`. Its descriptor
+is now reviewed against the exact `d40096f` schema, `ab40b76` opendbc,
+`7f245a8` panda, Palisade CarParams, and 409/4/7 command envelope. Relative
+to the reviewed combo baseline, the production changes are confined to the
+longitudinal emergency-stop/lead handling path and its tests; no lateral
+controller, command envelope, panda safety, or submodule change is admitted by
+this review. The route is therefore eligible for preparation without a
+provenance bypass.
+
 ### PC learner qualification
 
 A selected physical profile becomes complete only when every speed node and

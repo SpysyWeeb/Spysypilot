@@ -19,7 +19,7 @@ REGISTRY_PATH = (
   / "historical_build_descriptors.json"
 )
 REVIEWED_REGISTRY_SHA256 = (
-  "297a8d72fa7e6c3a61e981fd875c919be043601f505f8c46a749403c24ca7214"
+  "d9e513c603967a33a01be8cb91e918ea736f1beb0f5d8f46adee0fcd7d00173c"
 )
 FIRST_DESCRIPTOR_SHA256 = (
   "8ce8026f4ff30b1036206046dcd96aa3b27a47f61f21673a2629154379769684"
@@ -33,6 +33,7 @@ INTENDED_ROOT_COMMITS = {
   "22b915a7ab7a1d2963c12db9cc6a48bda3be708f",
   "2447667ea36160b7706b8ab919bc2d4e71b54f56",
   "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
+  "320ab0def1d484675a9f1653fd5f80f73f96d4c0",
   "34357419f38b84e2de90bc9cbfdfb5704a282627",
   "36bcc1be838138d39e90a70e8ba5277dc87e04a3",
   "3849a2f72e8fe1902dc4b91c4a3b98384295103a",
@@ -130,6 +131,10 @@ def test_checked_in_registry_is_canonical_complete_and_limits_only() -> None:
     ),
     (
       "29385dd8d001ebb8452ba1fc9bbb66858fdbd778",
+      "ab40b765445d1d18750b58ca6524b16ebe219b6b",
+    ),
+    (
+      "320ab0def1d484675a9f1653fd5f80f73f96d4c0",
       "ab40b765445d1d18750b58ca6524b16ebe219b6b",
     ),
     (
