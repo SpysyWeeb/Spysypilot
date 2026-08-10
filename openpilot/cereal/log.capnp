@@ -116,6 +116,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     canBusMissing @80;
     selfdrivedLagging @81;
     resumeBlocked @82;
+    carNotReady @103;
     steerTimeLimit @83;
     vehicleSensorsInvalid @84;
     locationdTemporaryError @85;
@@ -129,13 +130,14 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     userBookmark @95;
     excessiveActuation @96;
     bigModelLoading @100;
-    bigModelReady @101;
+    bigModelFailed @102;
 
     lowBatteryDEPRECATED @40;
     soundsUnavailableDEPRECATED @47;
     deviceFallingDEPRECATED @71;
     usbErrorDEPRECATED @78;
     audioFeedbackDEPRECATED @97;
+    bigModelReadyDEPRECATED @101;
   }
 }
 
@@ -178,13 +180,13 @@ struct InitData {
 
   enum DeviceType {
     unknown @0;
-    neo @1;
+    neo @1;   # NEO, EON, & comma two
     chffrAndroid @2;
     chffrIos @3;
-    tici @4;
+    tici @4;  # comma three
     pc @5;
-    tizi @6;
-    mici @7;
+    tizi @6;  # comma 3X
+    mici @7;  # comma four
   }
 
   struct PandaInfo {
@@ -705,6 +707,19 @@ struct UsbState {
   }
 }
 
+struct ChestnutState {
+  tempC @0 :Float32;
+  memoryTempC @1 :Float32;
+  powerDrawW @2 :Float32;
+  powerLimitW @3 :Float32;
+  gpuUsagePercent @4 :UInt8;
+  gpuClockMhz @5 :UInt16;
+  fanSpeedRpm @6 :UInt16;
+  pcieLtssm @7 :UInt8;
+  supplyVoltage @8 :UInt16;  # mV
+  supplyCurrent @9 :Int16;  # mA
+}
+
 struct RadarState @0x9a185389d6fdd05f {
   mdMonoTime @6 :UInt64;  # for debugging
   radarErrors @13 :Car.RadarData.Error;
@@ -748,7 +763,7 @@ struct RadarState @0x9a185389d6fdd05f {
   }
 }
 
-struct LiveCalibrationData {
+struct ExtrinsicsCalibration @0x96df70754d8390bc {
   calStatus @11 :Status;
   calCycle @2 :Int32;
   calPerc @3 :Int8;
@@ -893,183 +908,6 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
-    measurementRate @13 :Float32;
-    rateBrake @14 :Float32;
-    rateBrakeScale @15 :Float32;
-    delayedDesiredCurvature @16 :Float32;
-    legacyDesiredLateralAccel @17 :Float32;
-    speedAlignmentCorrection @18 :Float32;
-    actuationSpeed @19 :Float32;
-    currentSpeedDesiredLateralAccel @20 :Float32;
-    speedProjectionCorrection @21 :Float32;
-    longitudinalLateralAccelRate @22 :Float32;
-    rateBrakeSpeedScale @23 :Float32;
-    referenceVersion @24 :Int32;
-    referenceBaseCurvature @25 :Float32;
-    referenceOutputCurvature @26 :Float32;
-    referencePreviewTime @27 :Float32;
-    referencePreviewExtraTime @28 :Float32;
-    referenceTargetTorque @29 :Float32;
-    referenceAppliedTorque @30 :Float32;
-    referenceUnwindScale @31 :Float32;
-    referenceAuthorityRestored @32 :Float32;
-    referencePreviewCorrection @33 :Float32;
-    referenceRate @34 :Float32;
-    trackingMeasurementRate @35 :Float32;
-    rateTrackingError @36 :Float32;
-    rateTrackingCorrection @37 :Float32;
-    rateTrackingSpeedScale @38 :Float32;
-    referenceCurvatureRate @39 :Float32;
-    measurementCurvatureRate @40 :Float32;
-    cascadePositionError @41 :Float32;
-    cascadeCatchupRate @42 :Float32;
-    cascadeDesiredRate @43 :Float32;
-    cascadeRateError @44 :Float32;
-    actuatorAppliedLateralAccel @45 :Float32;
-    actuatorStateCorrection @46 :Float32;
-    cascadePScale @47 :Float32;
-    unwindBrakeActivation @48 :Float32;
-    unwindTorqueZeroTime @49 :Float32;
-    unwindProjectedPositionError @50 :Float32;
-    unwindTorqueCorrection @51 :Float32;
-    cascadeBasePScale @52 :Float32;
-    dampingTurnInBlocked @53 :Bool;
-    referenceGeometricTargetTorque @54 :Float32;
-    referenceNeutralTorque @55 :Float32;
-    referenceReachableTargetTorque @56 :Float32;
-    unwindEffectivePhase @57 :Float32;
-    unwindPhaseDirection @58 :Float32;
-    unwindDeliveryGap @59 :Float32;
-    unwindPhaseOverspeed @60 :Float32;
-    unwindNeutralTorque @61 :Float32;
-    unwindTorqueNeutralTime @62 :Float32;
-    unwindSameEpisode @63 :Bool;
-    unwindOppositeTime @64 :Float32;
-    unwindEpisodeArmed @65 :Bool;
-    finiteDifferenceReferenceCurvatureRate @66 :Float32;
-    trajectoryReferenceCurvatureRate @67 :Float32;
-    trajectoryReferenceRateValid @68 :Bool;
-    trajectoryReferenceInnovation @69 :Float32;
-    filteredTrajectoryReferenceInnovation @70 :Float32;
-    referenceSustainedUnwindScale @71 :Float32;
-    referenceEpisodeTargetTorque @72 :Float32;
-    referenceEpisodeLateralAccel @73 :Float32;
-    blatV2Status @74 :UInt8;
-    blatV2ComputeTimeSeconds @75 :Float64;
-    blatV2OutputValid @76 :Bool;
-    blatV2InvalidFrames @77 :UInt16;
-    blatV2RecoveryOkFrames @78 :UInt8;
-    blatV2CommandTorque @79 :Float64;
-    blatV2RawCommandTorque @80 :Float64;
-    blatV2FeedforwardTorque @81 :Float64;
-    blatV2FeedbackTorque @82 :Float64;
-    blatV2DesiredAngleDeg @83 :Float64;
-    blatV2DesiredRateDegS @84 :Float64;
-    blatV2DesiredAccelerationDegS2 @85 :Float64;
-    blatV2PredictedAngleDeg @86 :Float64;
-    blatV2PredictedRateDegS @87 :Float64;
-    blatV2RequiredAccelerationDegS2 @88 :Float64;
-    blatV2ActionSpeedMps @89 :Float64;
-    blatV2AligningTorque @90 :Float64;
-    blatV2FrictionTorque @91 :Float64;
-    blatV2DynamicTorque @92 :Float64;
-    blatV2ActionTimeSeconds @93 :Float64;
-    blatV2SlewConstrained @94 :Bool;
-    blatV2BreakawayActive @95 :Bool;
-    blatV2BreakawayPersistenceFrames @96 :UInt16;
-    blatV2HorizonAssistActive @97 :Bool;
-    blatV2HorizonTorqueDemand @98 :Float64;
-    blatV2HorizonDemandTimeSeconds @99 :Float64;
-    blatV2NoLeadLimited @100 :Bool;
-    blatV2PredictionDelaySeconds @101 :Float64;
-    blatV2SignedRackRateDegS @102 :Float64;
-    blatV2HeldStaticLoad @103 :Float64;
-    blatV2RackStationary @104 :Bool;
-    blatV2AdaptiveModelVersion @105 :UInt16;
-    blatV2AdaptiveGain @106 :Float64;
-    blatV2AdaptiveDamping @107 :Float64;
-    blatV2AdaptiveAlignGain @108 :Float64;
-    blatV2AdaptiveMovingFriction @109 :Float64;
-    blatV2AdaptiveRoadLoad @110 :Float64;
-    blatV2AdaptiveConfidence @111 :Float64;
-    blatV2AdaptiveSampleCount @112 :UInt64;
-    blatV2AdaptiveLearningActive @113 :Bool;
-    blatV2AdaptiveRateDegS @114 :Float64;
-    blatV2AdaptiveAccelerationDegS2 @115 :Float64;
-    blatV2AdaptiveRateResolutionDegS @116 :Float64;
-    blatV2AdaptiveResponseLagSeconds @117 :Float64;
-    blatV2AdaptiveOutcomeConfidence @118 :Float64;
-    blatV2AdaptiveOutcomePhase @119 :UInt8;
-    blatV2AdaptiveOutcomeSignedLagSeconds @120 :Float64;
-    blatV2AdaptiveOutcomeTrackingErrorFraction @121 :Float64;
-    blatV2AdaptiveOutcomeReleaseOvershootMps2 @122 :Float64;
-    blatV2AdaptiveOutcomeRoughnessPerS @123 :Float64;
-    blatV2AdaptiveOutcomeBurstPerS @124 :Float64;
-    blatV2AdaptiveOutcomeCount @125 :UInt64;
-    blatV2AdaptiveOutcomeLearningActive @126 :Bool;
-
-    # Ground-up modular BLaTv2 live controller telemetry. Historical fields
-    # @0..126 remain reserved with their original wire meanings.
-    modularArchitecture @127 :Text;
-    modularControllerVersion @128 :UInt16;
-    modularSelection @129 :UInt8;
-    modularBindingReason @130 :UInt8;
-    modularCandidateStatus @131 :UInt8;
-    modularCoreStatus @132 :UInt8;
-    modularArtifactHash @133 :Text;
-    modularProfileHash @134 :Text;
-    modularPolicyHash @135 :Text;
-    modularRuntimeIdentityHash @136 :Text;
-    modularSourceOpenpilotCommit @137 :Text;
-    modularOpendbcCommit @138 :Text;
-    modularControlWitnessMonoTime @139 :UInt64;
-    modularStateSampleMonoTime @140 :UInt64;
-    modularModelPublicationMonoTime @141 :UInt64;
-    modularModelTimestampEof @142 :UInt64;
-    modularDesiredCurvatureTimeSeconds @143 :Float64;
-    modularRawScalarCurvature @144 :Float64;
-    modularReferenceCurvature @145 :Float64;
-    modularRawTorque @146 :Float64;
-    modularCommandTorque @147 :Float64;
-    modularFeasibleTorque @148 :Float64;
-    modularAligningTorque @149 :Float64;
-    modularFrictionTorque @150 :Float64;
-    modularMotionFeedforwardTorque @151 :Float64;
-    modularPositionFeedbackTorque @152 :Float64;
-    modularRateFeedbackTorque @153 :Float64;
-    modularDisturbanceTorque @154 :Float64;
-    modularDesiredAngleDeg @155 :Float64;
-    modularDesiredRateDegS @156 :Float64;
-    modularDesiredAccelerationDegS2 @157 :Float64;
-    modularMeasuredAngleDeg @158 :Float64;
-    modularMeasuredRateDegS @159 :Float64;
-    modularMeasuredAccelerationDegS2 @160 :Float64;
-    modularPredictedAngleDeg @161 :Float64;
-    modularPredictedRateDegS @162 :Float64;
-    modularPreviousAppliedCounts @163 :Int32;
-    modularPreviousAppliedTorque @164 :Float64;
-    modularDriverTorque @165 :Float64;
-    modularConstraintActive @166 :Bool;
-    modularConstraintReason @167 :UInt8;
-    modularFeasibilityStatus @168 :UInt8;
-    modularSafetyState @169 :UInt8;
-    modularControlsValid @170 :Bool;
-    modularCarControlValid @171 :Bool;
-    modularInvalidFrames @172 :UInt16;
-    modularRecoveryOkFrames @173 :UInt8;
-    modularPreviousOutputConstrained @174 :Bool;
-    modularPreviousActuatorConstrained @175 :Bool;
-    modularVehicleStateValid @176 :Bool;
-    modularLiveParametersValid @177 :Bool;
-    modularIntentStatus @178 :UInt8;
-    modularComputeTimeSeconds @179 :Float64;
-    modularStateAgeSeconds @180 :Float64;
-    modularTotalPredictionHorizonSeconds @181 :Float64;
-    modularTransportDelaySeconds @182 :Float64;
-    modularCommandEnvelopeApplied @183 :Bool;
-    modularManeuverForcedStock @184 :Bool;
-    modularProductionEnvelopeVerified @185 :Bool;
-    modularSelectionBound @186 :Bool;
    }
 
   struct LateralAngleState {
@@ -1205,6 +1043,7 @@ struct ModelDataV2 {
   timestampEof @3 :UInt64;
   modelExecutionTime @15 :Float32;
   rawPredictions @16 :Data;
+  big @27 :Bool;
 
   # predicted future position, orientation, etc..
   position @4 :XYZTData;
@@ -1308,7 +1147,6 @@ struct ModelDataV2 {
     desiredCurvature @0 :Float32;
     desiredAcceleration @1 :Float32;
     shouldStop @2 :Bool;
-    desiredCurvatureTime @3 :Float32; # seconds from the model plan/timestampEof origin
   }
 
   deprecated :group {
@@ -1546,7 +1384,7 @@ struct LiveLocationKalman {
 }
 
 
-struct LivePose {
+struct DeviceMotion @0xc24ca2b57206b44d {
   # More info on reference frames:
   # https://github.com/commaai/openpilot/tree/master/openpilot/common/transformations
   orientationNED @0 :XYZMeasurement;
@@ -2428,7 +2266,7 @@ struct Boot {
   }
 }
 
-struct LiveParametersData {
+struct VehicleParameters @0xd9058dcb967c2753 {
   valid @0 :Bool;
   gyroBias @1 :Float32;
   angleOffsetDeg @2 :Float32;
@@ -2462,8 +2300,8 @@ struct LiveParametersData {
   }
 }
 
-struct LiveTorqueParametersData {
-  liveValid @0 :Bool;
+struct LateralTorqueParameters @0xe61690eb0b091692 {
+  valid @0 :Bool;
   latAccelFactorRaw @1 :Float32;
   latAccelOffsetRaw @2 :Float32;
   frictionCoefficientRaw @3 :Float32;
@@ -2479,7 +2317,7 @@ struct LiveTorqueParametersData {
   calPerc @13 :Int8;
 }
 
-struct LiveDelayData {
+struct LateralDelay @0x98dfdb22c44df8d4 {
   lateralDelay @0 :Float32;
   validBlocks @1 :Int32;
   status @2 :Status;
@@ -2648,489 +2486,6 @@ struct DebugAlert {
 struct UserBookmark @0xfe346a9de48d9b50 {
 }
 
-struct LateralEvent @0xd4281d502164abd1 {
-  version @0 :UInt16;
-  type @1 :Type;
-  source @2 :Source;
-  severity @3 :Severity;
-  confidence @4 :Float32;
-  controllerVersion @5 :Int32;
-  referenceVersion @6 :Int32;
-  vEgo @7 :Float32;
-  steeringAngleDeg @8 :Float32;
-  steeringRateDeg @9 :Float32;
-  desiredLateralAccel @10 :Float32;
-  actualLateralAccel @11 :Float32;
-  requestTorque @12 :Float32;
-  appliedTorque @13 :Float32;
-  referenceTargetTorque @14 :Float32;
-  referenceUnwindScale @15 :Float32;
-  appliedTargetGap @16 :Float32;
-  roadConfounded @17 :Bool;
-  driverConfounded @18 :Bool;
-  reason @19 :Text;
-
-  enum Type {
-    manual @0;
-    stallRelease @1;
-    lateUnwind @2;
-    handoffMismatch @3;
-    centerOvershoot @4;
-    torqueAuthority @5;
-  }
-
-  enum Source {
-    automatic @0;
-    user @1;
-  }
-
-  enum Severity {
-    info @0;
-    warning @1;
-    critical @2;
-  }
-}
-
-struct DrivingEvent @0xd9f3c9b84f67a2e1 {
-  version @0 :UInt16;
-  eventId @1 :Text;
-  groupId @2 :Text;
-  occurredMonoTime @3 :UInt64;
-  domain @4 :Domain;
-  source @5 :Source;
-  eventType @6 :Text;
-  detector @7 :Text;
-  detectorVersion @8 :UInt16;
-  severity @9 :Severity;
-  confidence @10 :Float32;
-  reason @11 :Text;
-  attribution @12 :Attribution;
-  driverConfounded @13 :Bool;
-  roadConfounded @14 :Bool;
-  requestedContextBefore @15 :UInt8;
-  requestedContextAfter @16 :UInt8;
-  gitCommit @17 :Text;
-  gitBranch @18 :Text;
-
-  payload :union {
-    none @19 :Void;
-    lateral @20 :LateralPayload;
-    leadLaunch @21 :LeadLaunchPayload;
-    stopJolt @27 :StopJoltPayload;
-    rollingLeadResponse @28 :RollingLeadResponsePayload;
-  }
-
-  detectedMonoTime @22 :UInt64;
-  episodeStartMonoTime @23 :UInt64;
-  analysisWindowBeforeS @24 :Float32;
-  analysisWindowAfterS @25 :Float32;
-  episodeKey @26 :Text;
-
-  enum Domain {
-    manual @0;
-    lateral @1;
-    longitudinal @2;
-    road @3;
-    driver @4;
-    system @5;
-  }
-
-  enum Source {
-    automatic @0;
-    user @1;
-  }
-
-  enum Severity {
-    info @0;
-    warning @1;
-    critical @2;
-  }
-
-  enum Attribution {
-    unknown @0;
-    model @1;
-    planner @2;
-    controller @3;
-    actuator @4;
-    vehicle @5;
-    driver @6;
-    road @7;
-    mixed @8;
-  }
-
-  struct LateralPayload {
-    controllerVersion @0 :Int32;
-    referenceVersion @1 :Int32;
-    vEgo @2 :Float32;
-    steeringAngleDeg @3 :Float32;
-    steeringRateDeg @4 :Float32;
-    desiredLateralAccel @5 :Float32;
-    actualLateralAccel @6 :Float32;
-    requestTorque @7 :Float32;
-    appliedTorque @8 :Float32;
-    referenceTargetTorque @9 :Float32;
-    referenceRate @10 :Float32;
-    referenceUnwindScale @11 :Float32;
-    referenceSustainedUnwindScale @12 :Float32;
-    unwindEffectivePhase @13 :Float32;
-    unwindOverspeed @14 :Float32;
-    unwindSameEpisode @15 :Bool;
-    appliedTargetGap @16 :Float32;
-    pTerm @17 :Float32;
-    driverTorque @18 :Float32;
-    steeringPressed @19 :Bool;
-    steeringTorqueEps @20 :Float32;
-    dampingApplied @21 :Float32;
-    dampingState @22 :Text;
-    triggerDriverConfounded @23 :Bool;
-    triggerRoadConfounded @24 :Bool;
-    driverConfoundedFraction @25 :Float32;
-    maxAbsDriverTorque @26 :Float32;
-    steeringPressedAny @27 :Bool;
-    roadConfoundedFraction @28 :Float32;
-    driverConfoundReason @29 :UInt16;
-    evidenceStartMonoTime @30 :UInt64;
-    evidenceEndMonoTime @31 :UInt64;
-    stallReleaseCount @32 :UInt8;
-    releaseOffsetsS @33 :List(Float32);
-    stallDurationsS @34 :List(Float32);
-    releasePeakRatesDeg @35 :List(Float32);
-    stallEpisodePhase @36 :Text;
-    lateUnwindDurationS @37 :Float32;
-    previousUnwindEffectivePhase @38 :Float32;
-    previousUnwindSameEpisode @39 :Bool;
-    trackingInactiveTimeS @40 :Float32;
-    rawTorqueAboveThresholdFraction @41 :Float32;
-    rawTorqueAboveThresholdLongestS @42 :Float32;
-    steeringPressedFraction @43 :Float32;
-    driverTorquePresentAtTrigger @44 :Bool;
-    driverInteraction @45 :DriverInteraction;
-    roadConfoundedAtEventTime @46 :Bool;
-    maxVerticalAccelDeviation @47 :Float32;
-    longestRoadBumpIntervalS @48 :Float32;
-    roadConfoundExtent @49 :RoadConfoundExtent;
-    centerCrossingMonoTime @50 :UInt64;
-    classificationConfirmedMonoTime @51 :UInt64;
-    establishedOutsideCenter @52 :Bool;
-    centerCrossingWheelRateDeg @53 :Float32;
-    desiredLateralAccelBeforeCrossing @54 :Float32;
-    desiredLateralAccelAfterCrossing @55 :Float32;
-    desiredReversalCommitted @56 :Bool;
-    desiredReversalCommitMonoTime @57 :UInt64;
-    trackingErrorAtCrossing @58 :Float32;
-    appliedTargetGapAtCrossing @59 :Float32;
-    handoffObserved @60 :Bool;
-    handoffMonoTime @61 :UInt64;
-    handoffCenterDeltaS @62 :Float32;
-    handoffConsolidated @63 :Bool;
-    stallReleases @64 :List(StallReleaseEvidence);
-    signedCenterCrossingWheelRateDeg @65 :Float32;
-    peakAbsCenterWheelRateDeg @66 :Float32;
-    peakTrackingError @67 :Float32;
-    peakAppliedTargetGap @68 :Float32;
-    steeringPressedAtTrigger @69 :Bool;
-    requestedTorqueAtCrossing @70 :Float32;
-    appliedTorqueAtCrossing @71 :Float32;
-    referenceTargetTorqueAtCrossing @72 :Float32;
-    unwindEpisodeStartMonoTime @73 :UInt64;
-    unwindDeficitStartMonoTime @74 :UInt64;
-    unwindDeficitDurationS @75 :Float32;
-    initialSteeringAngleDeg @76 :Float32;
-    peakSteeringAngleDeg @77 :Float32;
-    triggerSteeringAngleDeg @78 :Float32;
-    expectedUnwindDirection @79 :Text;
-    expectedAngleProgressDeg @80 :Float32;
-    actualAngleProgressDeg @81 :Float32;
-    unwindProgressRatio @82 :Float32;
-    referenceRateAtTrigger @83 :Float32;
-    measurementRateAtTrigger @84 :Float32;
-    peakReferenceMeasurementRateGap @85 :Float32;
-    requestedTorqueNeutralCrossMonoTime @86 :UInt64;
-    requestedTorqueNeutralCrossPresent @87 :Bool;
-    appliedTorqueNeutralCrossMonoTime @88 :UInt64;
-    appliedTorqueNeutralCrossPresent @89 :Bool;
-    unwindCommandDelayS @90 :Float32;
-    driverAssistedUnwind @91 :Bool;
-    driverAssistMonoTime @92 :UInt64;
-    driverAssistAngleDeg @93 :Float32;
-    driverAssistWheelRateDeg @94 :Float32;
-    driverAssistTorque @95 :Float32;
-    wheelRateIncreaseAfterAssistDegS @96 :Float32;
-    movementStartMonoTime @97 :UInt64;
-    dwellStartMonoTime @98 :UInt64;
-    releaseMonoTime @99 :UInt64;
-    dwellDurationS @100 :Float32;
-    dwellSteeringAngleDeg @101 :Float32;
-    preDwellPeakRateDegS @102 :Float32;
-    minimumDwellRateDegS @103 :Float32;
-    releasePeakRateDegS @104 :Float32;
-    rateReductionRatio @105 :Float32;
-    restartClassification @106 :Text;
-    requestTorqueDuringDwell @107 :Float32;
-    appliedTorqueDuringDwell @108 :Float32;
-    referenceTargetDuringDwell @109 :Float32;
-    trackingActiveDuringDwell @110 :Bool;
-    measurementRate @111 :Float32;
-    driverInvolvedBeforeDwell @112 :Bool;
-    driverInvolvedDuringDwell @113 :Bool;
-    driverInvolvedAfterDwell @114 :Bool;
-    turnStopActualDampingAmount @115 :Float32;
-    turnStopActualDampingState @116 :Text;
-    turnStopTurnInBlocked @117 :Bool;
-    turnStopBreakawayLatch @118 :Float32;
-    turnStopSustainFloorContribution @119 :Float32;
-    turnStopDampingVersion @120 :UInt8;
-    turnStopDampingValid @121 :Bool;
-    unwindRequestedTorqueAtTrigger @122 :Float32;
-    unwindAppliedTorqueAtTrigger @123 :Float32;
-    unwindReferenceTargetTorqueAtTrigger @124 :Float32;
-    unwindAppliedTargetGapAtTrigger @125 :Float32;
-    unwindPeakAppliedTargetGap @126 :Float32;
-    unwindNeutralTorque @127 :Float32;
-    unwindPhaseDirection @128 :Float32;
-    highAngleEvidenceValid @129 :Bool;  # The four high-angle fields below were schema-present at trigger.
-    highAngleUnwindScale @130 :Float32;
-    torqueCommandBeforeHighAngleExit @131 :Float32;
-    highAngleUnwindOldTorqueCorrection @132 :Float32;
-    highAngleUnwindOldDirectionTorque @133 :Float32;
-    oldTurnSign @134 :Float32;
-    futureUnwindCommitMonoTime @135 :UInt64;
-    futureUnwindCommitPresent @136 :Bool;
-    highAngleExitFirstNonzeroMonoTime @137 :UInt64;
-    highAngleExitFirstNonzeroPresent @138 :Bool;
-    requestedCrownNeutralMonoTime @139 :UInt64;
-    requestedCrownNeutralPresent @140 :Bool;
-    appliedCrownNeutralMonoTime @141 :UInt64;
-    appliedCrownNeutralPresent @142 :Bool;
-    unwindCrownCommandDelayS @143 :Float32;
-    wheelProgress5MonoTime @144 :UInt64;
-    wheelProgress5Present @145 :Bool;
-    wheelProgress20MonoTime @146 :UInt64;
-    wheelProgress20Present @147 :Bool;
-    wheelProgress50MonoTime @148 :UInt64;
-    wheelProgress50Present @149 :Bool;
-    unwindReboundMaxMagnitude @150 :Float32;
-    unwindReboundStartMonoTime @151 :UInt64;
-    unwindReboundStartPresent @152 :Bool;
-    unwindReboundDurationS @153 :Float32;
-    unwindReboundSameEpisode @154 :Bool;
-    driverActiveBeforeDeficit @155 :Bool;
-    driverActiveAtDeficitStart @156 :Bool;
-    driverActiveDuringEvaluation @157 :Bool;
-    driverIntervenedAfterDeficit @158 :Bool;
-    driverInterventionAcceleratedProgress @159 :Bool;
-    driverCausation @160 :Text;  # driverCreated | interventionBacked | autonomousOnly | mixed | "".
-    turnStopPreDwellProgressDeg @161 :Float32;
-    turnStopPostDwellProgressDeg @162 :Float32;
-    roadEvidenceWindowStartMonoTime @163 :UInt64;  # Clamped start actually covered by the road metrics.
-    roadEvidenceWindowStartPresent @164 :Bool;
-    driverAssistRawTorqueOnly @165 :Bool;
-    demandedCurvature @166 :Float32;
-    deliveredCurvatureFraction @167 :Float32;
-    torqueHeadroom @168 :Float32;
-    signedTrackingDeficit @169 :Float32;
-    authorityUnderDeliveryDurationS @170 :Float32;
-    takeoverConfirmationDurationS @171 :Float32;
-
-    enum DriverInteraction {
-      none @0;
-      possibleRawTorque @1;
-      confirmedSteeringPressed @2;
-    }
-
-    enum RoadConfoundExtent {
-      none @0;
-      transient @1;
-      substantial @2;
-    }
-
-    struct StallReleaseEvidence {
-      releaseMonoTime @0 :UInt64;
-      offsetFromTriggerS @1 :Float32;
-      stallDurationS @2 :Float32;
-      peakSignedSteeringRateDeg @3 :Float32;
-      peakAbsSteeringRateDeg @4 :Float32;
-      steeringAngleDeg @5 :Float32;
-      vEgo @6 :Float32;
-      desiredLateralAccel @7 :Float32;
-      actualLateralAccel @8 :Float32;
-      requestedTorque @9 :Float32;
-      appliedTorque @10 :Float32;
-      referenceTargetTorque @11 :Float32;
-      dampingApplied @12 :Float32;
-      dampingState @13 :Text;
-      turnInBlocked @14 :Bool;
-      breakawayLatch @15 :Float32;
-      sustainFloor @16 :Float32;
-      dampingVersion @17 :UInt8;
-      dampingValid @18 :Bool;
-      driverEvidenceActive @19 :Bool;
-      roadEvidenceActive @20 :Bool;
-      phase @21 :Text;
-    }
-  }
-
-  struct LeadLaunchPayload {
-    forecastToLeadS @0 :Float32;
-    planToLeadS @1 :Float32;
-    commandToLeadS @2 :Float32;
-    leadToEgoS @3 :Float32;
-    commandToEgoS @4 :Float32;
-    radarDiscontinuity @5 :Bool;
-    radarConfidence @6 :Float32;
-    onsets @7 :List(OnsetSnapshot);
-    attributionDetail @8 :Text;
-
-    struct OnsetSnapshot {
-      kind @0 :Kind;
-      monoTime @1 :UInt64;
-      dRel @2 :Float32;
-      vLead @3 :Float32;
-      vEgo @4 :Float32;
-      aEgo @5 :Float32;
-      outputAccel @6 :Float32;
-      brakePressed @7 :Bool;
-      brakeHoldActive @8 :Bool;
-
-      enum Kind {
-        candidate @0;
-        forecast @1;
-        plan @2;
-        command @3;
-        lead @4;
-        ego @5;
-        egoAcceleration @6;
-      }
-    }
-  }
-
-  struct StopJoltPayload {
-    episodeStartMonoTime @0 :UInt64;
-    standstillMonoTime @1 :UInt64;
-    peakJoltMonoTime @2 :UInt64;
-    detectionMonoTime @3 :UInt64;
-    imuJerk @4 :Float32;
-    absImuJerk @5 :Float32;
-    aEgoJerk @6 :Float32;
-    absAEgoJerk @7 :Float32;
-    imuAccelBefore @8 :Float32;
-    imuAccelAfter @9 :Float32;
-    aEgoAccelBefore @10 :Float32;
-    aEgoAccelAfter @11 :Float32;
-    accelChange @12 :Float32;
-    accelAt02Mps @13 :Float32;
-    vEgoAtPeak @14 :Float32;
-    planATarget @15 :Float32;
-    requestedAccel @16 :Float32;
-    appliedAccel @17 :Float32;
-    planAccelChange @18 :Float32;
-    requestedAccelChange @19 :Float32;
-    appliedAccelChange @20 :Float32;
-    shouldStopBefore @21 :Bool;
-    shouldStopAtPeak @22 :Bool;
-    shouldStopAfter @23 :Bool;
-    longControlStateBefore @24 :Text;
-    longControlStateAtPeak @25 :Text;
-    longControlStateAfter @26 :Text;
-    leadPresent @27 :Bool;
-    dRel @28 :Float32;
-    vLeadK @29 :Float32;
-    brakePressed @30 :Bool;
-    gasPressed @31 :Bool;
-    brakeHoldActive @32 :Bool;
-    radarValid @33 :Bool;
-    imuValid @34 :Bool;
-    roadConfounded @35 :Bool;
-    classification @36 :Classification;
-
-    enum Classification {
-      brakeGrab @0;
-      releaseSnap @1;
-      grabAndRebound @2;
-    }
-  }
-
-  struct RollingLeadResponsePayload {
-    attributionDetail @0 :Text;
-    leadCommitMonoTime @1 :UInt64;
-    plannerResponseMonoTime @2 :UInt64;
-    controllerResponseMonoTime @3 :UInt64;
-    egoResponseMonoTime @4 :UInt64;
-    detectedMonoTime @5 :UInt64;
-    leadToPlanS @6 :Float32;
-    leadToCommandS @7 :Float32;
-    leadToEgoS @8 :Float32;
-    baselineLeadSpeed @9 :Float32;
-    peakLeadSpeed @10 :Float32;
-    baselineEgoSpeed @11 :Float32;
-    peakEgoSpeed @12 :Float32;
-    peakRelativeSpeed @13 :Float32;
-    baselineGap @14 :Float32;
-    finalGap @15 :Float32;
-    maxGapGrowth @16 :Float32;
-    baselineLeadAccel @17 :Float32;
-    peakLeadAccel @18 :Float32;
-    baselinePlannerAccel @19 :Float32;
-    peakPlannerAccel @20 :Float32;
-    baselineOutputAccel @21 :Float32;
-    peakOutputAccel @22 :Float32;
-    baselineEgoAccel @23 :Float32;
-    peakEgoAccel @24 :Float32;
-    radarTrackId @25 :Int64;
-    radarDiscontinuity @26 :Bool;
-    driverConfounded @27 :Bool;
-    onsets @28 :List(OnsetSnapshot);
-    plannerResponsePresent @29 :Bool;
-    controllerResponsePresent @30 :Bool;
-    egoResponsePresent @31 :Bool;
-
-    struct OnsetSnapshot {
-      kind @0 :Kind;
-      monoTime @1 :UInt64;
-      dRel @2 :Float32;
-      vLead @3 :Float32;
-      vLeadK @4 :Float32;
-      aLeadK @5 :Float32;
-      vEgo @6 :Float32;
-      aEgo @7 :Float32;
-      plannerAccel @8 :Float32;
-      outputAccel @9 :Float32;
-      shouldStop @10 :Bool;
-      longActive @11 :Bool;
-      radarValid @12 :Bool;
-      gasPressed @13 :Bool;
-      brakePressed @14 :Bool;
-
-      enum Kind {
-        baseline @0;
-        leadCommit @1;
-        plannerResponse @2;
-        controllerResponse @3;
-        egoResponse @4;
-        detection @5;
-      }
-    }
-  }
-}
-
-struct DrivingEventRecorded @0xcac5f5a6b137d821 {
-  eventId @0 :Text;
-  groupId @1 :Text;
-  domain @2 :DrivingEvent.Domain;
-  source @3 :DrivingEvent.Source;
-  eventType @4 :Text;
-  occurredMonoTime @5 :UInt64;
-  route @6 :Text;
-  segment @7 :Int32;
-  markerWritten @8 :Bool;  # Legacy name: accepted by loggerd, not an fsync claim.
-  currentSegmentPreserved @9 :Bool;
-  followingSegmentScheduled @10 :Bool;
-  error @11 :Text;
-  segmentStartMonoTime @12 :UInt64;
-  ackMonoTime @13 :UInt64;
-  markerAccepted @14 :Bool;  # Accepted by the active logger; completed-rlog indexing verifies durability.
-}
-
 struct SoundPressure @0xdc24138990726023 {
   soundPressure @0 :Float32;
 
@@ -3146,169 +2501,6 @@ struct SoundPressure @0xdc24138990726023 {
 struct AudioData {
   data @0 :Data;
   sampleRate @1 :UInt32;
-}
-
-struct BlatV2Shadow {
-  shadowVersion @0 :UInt16;
-  valid @1 :Bool;
-  referenceCurvature @2 :Float64;
-  torqueDemand @3 :Float64;
-  feasibleTorque @4 :Float64;
-  plantResidual @5 :Float64;
-  scalarPlanDisagreement @6 :Float64;
-  horizon @7 :Float64;
-  computeTimeSeconds @8 :Float64;
-  vEgo @9 :Float64;
-  aligningTorque @10 :Float64;
-  alignInputsValid @11 :Bool;
-  disturbanceEstimate @12 :Float64;
-  observerStatus @13 :UInt8;
-  observerUnconstrainedUpdate @14 :Float64;
-  mpcCommandTorque @15 :Float64;
-  mpcStatus @16 :UInt8;
-  mpcCandidateCount @17 :UInt16;
-  mpcOptimalityResidual @18 :Float64;
-  mpcComputeTimeSeconds @19 :Float64;
-  fallbackCommandTorque @20 :Float64;
-  fallbackStatus @21 :UInt8;
-  fallbackCandidateCount @22 :UInt16;
-  fallbackOptimalityResidual @23 :Float64;
-  fallbackComputeTimeSeconds @24 :Float64;
-  sharedComputeTimeSeconds @25 :Float64;
-  mpcAvailableScheduleCount @26 :UInt16;
-  liveLqiCommandTorque @27 :Float64;
-  liveLqiStatus @28 :UInt8;
-  liveLqiComputeTimeSeconds @29 :Float64;
-  liveLqiOutputValid @30 :Bool;
-  liveLqiInvalidFrames @31 :UInt16;
-  liveLqiRecoveryOkFrames @32 :UInt8;
-  v14CommandTorque @33 :Float64;
-  v14DesiredCurvature @34 :Float64;
-  v14ControllerVersion @35 :Int32;
-  v14Valid @36 :Bool;
-  v14ComputeTimeSeconds @37 :Float64;
-  liveLqiControllerVersion @38 :Int32;
-  liveActionRawCommandTorque @39 :Float64;
-  liveActionFeedforwardTorque @40 :Float64;
-  liveActionFeedbackTorque @41 :Float64;
-  liveActionDesiredAngleDeg @42 :Float64;
-  liveActionDesiredRateDegS @43 :Float64;
-  liveActionDesiredAccelerationDegS2 @44 :Float64;
-  liveActionPredictedAngleDeg @45 :Float64;
-  liveActionPredictedRateDegS @46 :Float64;
-  liveActionRequiredAccelerationDegS2 @47 :Float64;
-  liveActionSpeedMps @48 :Float64;
-  liveActionAligningTorque @49 :Float64;
-  liveActionFrictionTorque @50 :Float64;
-  liveActionDynamicTorque @51 :Float64;
-  liveActionTimeSeconds @52 :Float64;
-  liveActionSlewConstrained @53 :Bool;
-  liveActionBreakawayActive @54 :Bool;
-  liveActionBreakawayPersistenceFrames @55 :UInt16;
-  liveActionHorizonAssistActive @56 :Bool;
-  liveActionHorizonTorqueDemand @57 :Float64;
-  liveActionHorizonDemandTimeSeconds @58 :Float64;
-  liveActionNoLeadLimited @59 :Bool;
-  liveActionPredictionDelaySeconds @60 :Float64;
-  signedRackRateDegS @61 :Float64;
-  liveActionHeldStaticLoad @62 :Float64;
-  rackStationary @63 :Bool;
-  liveAdaptiveModelVersion @64 :UInt16;
-  liveAdaptiveGain @65 :Float64;
-  liveAdaptiveDamping @66 :Float64;
-  liveAdaptiveAlignGain @67 :Float64;
-  liveAdaptiveMovingFriction @68 :Float64;
-  liveAdaptiveRoadLoad @69 :Float64;
-  liveAdaptiveConfidence @70 :Float64;
-  liveAdaptiveSampleCount @71 :UInt64;
-  liveAdaptiveLearningActive @72 :Bool;
-  liveAdaptiveRateDegS @73 :Float64;
-  liveAdaptiveAccelerationDegS2 @74 :Float64;
-  liveAdaptiveRateResolutionDegS @75 :Float64;
-  liveAdaptiveResponseLagSeconds @76 :Float64;
-  liveAdaptiveOutcomeConfidence @77 :Float64;
-  liveAdaptiveOutcomePhase @78 :UInt8;
-  liveAdaptiveOutcomeSignedLagSeconds @79 :Float64;
-  liveAdaptiveOutcomeTrackingErrorFraction @80 :Float64;
-  liveAdaptiveOutcomeReleaseOvershootMps2 @81 :Float64;
-  liveAdaptiveOutcomeRoughnessPerS @82 :Float64;
-  liveAdaptiveOutcomeBurstPerS @83 :Float64;
-  liveAdaptiveOutcomeCount @84 :UInt64;
-  liveAdaptiveOutcomeLearningActive @85 :Bool;
-
-  # Modular BLaTv2 shadow telemetry. Historical fields @0..85 are immutable.
-  modularSchemaVersion @86 :UInt16;
-  modularRuntimeVehicleIdentityHash @87 :Text;
-  modularPolicyHash @88 :Text;
-  modularProfileHash @89 :Text;
-  modularModelFrameId @90 :UInt32;
-  modularIntentStatus @91 :UInt8;
-  modularCoreStatus @92 :UInt8;
-  modularValid @93 :Bool;
-  modularIntentUsable @94 :Bool;
-  modularProfileQualified @95 :Bool;
-  modularReferenceValid @96 :Bool;
-  modularScalarOnly @97 :Bool;
-  modularNominalMappingUsed @98 :Bool;
-  modularLiveParametersValid @99 :Bool;
-  modularRecordedActuatorConstrained @100 :Bool;
-  modularFeasibilityConstrained @101 :Bool;
-  modularObserverSaturated @102 :Bool;
-  modularRawTorque @103 :Float64;
-  modularFeasibleTorque @104 :Float64;
-  modularUnmetTorque @105 :Float64;
-  modularAligningTorque @106 :Float64;
-  modularFrictionTorque @107 :Float64;
-  modularMotionFeedforwardTorque @108 :Float64;
-  modularPositionFeedbackTorque @109 :Float64;
-  modularRateFeedbackTorque @110 :Float64;
-  modularDisturbanceTorque @111 :Float64;
-  modularDesiredCurvature @112 :Float64;
-  modularDesiredCurvatureRate @113 :Float64;
-  modularDesiredCurvatureAcceleration @114 :Float64;
-  modularDesiredAngleDeg @115 :Float64;
-  modularDesiredRateDegS @116 :Float64;
-  modularDesiredAccelerationDegS2 @117 :Float64;
-  modularMeasuredAngleDeg @118 :Float64;
-  modularMeasuredRateDegS @119 :Float64;
-  modularMeasuredAccelerationDegS2 @120 :Float64;
-  modularPredictedAngleDeg @121 :Float64;
-  modularPredictedRateDegS @122 :Float64;
-  modularPositionErrorDeg @123 :Float64;
-  modularRateErrorDegS @124 :Float64;
-  modularRequiredAccelerationDegS2 @125 :Float64;
-  modularObserverEstimateTorque @126 :Float64;
-  modularObserverInstantaneousTorque @127 :Float64;
-  modularObserverStatus @128 :UInt8;
-  modularProfileLowerNodeSpeedMps @129 :Float64;
-  modularProfileUpperNodeSpeedMps @130 :Float64;
-  modularProfileUpperWeight @131 :Float64;
-  modularTorquePerLateralAccel @132 :Float64;
-  modularRackGainDegS2PerTorque @133 :Float64;
-  modularRackDampingPerS @134 :Float64;
-  modularTransportDelaySeconds @135 :Float64;
-  modularStaticFrictionTorque @136 :Float64;
-  modularKineticFrictionTorque @137 :Float64;
-  modularRackRateResolutionDegS @138 :Float64;
-  modularProfileConfidence @139 :Float64;
-  modularPlanAgeSeconds @140 :Float64;
-  modularDesiredCurvatureTimeSeconds @141 :Float64;
-  modularPlanTimeNowSeconds @142 :Float64;
-  modularPhysicalEffectPlanSeconds @143 :Float64;
-  modularCurrentSpeedMps @144 :Float64;
-  modularEffectSpeedMps @145 :Float64;
-  modularMeasuredPreviousAppliedTorque @146 :Float64;
-  modularMeasuredDriverTorque @147 :Float64;
-  modularComputeTimeSeconds @148 :Float64;
-  modularModelInputValid @149 :Bool;
-  modularVehicleStateValid @150 :Bool;
-  modularLateralActive @151 :Bool;
-  modularLateralValid @152 :Bool;
-  modularActuationEnvelopeVerified @153 :Bool;
-  modularStateSampleMonoTime @154 :UInt64;
-  modularControlWitnessMonoTime @155 :UInt64;
-  modularStateAgeSeconds @156 :Float64;
-  modularTotalPredictionHorizonSeconds @157 :Float64;
 }
 
 struct Touch {
@@ -3343,9 +2535,9 @@ struct Event {
     pandaStates @81 :List(PandaState);
     peripheralState @80 :PeripheralState;
     radarState @13 :RadarState;
-    liveTracks @131 :Car.RadarData;
+    radarTracks @131 :Car.RadarData;
     sendcan @17 :List(CanData);
-    liveCalibration @19 :LiveCalibrationData;
+    extrinsicsCalibration @19 :ExtrinsicsCalibration;
     carState @22 :Car.CarState;
     carControl @23 :Car.CarControl;
     carOutput @127 :Car.CarOutput;
@@ -3356,35 +2548,31 @@ struct Event {
     qcomGnss @31 :QcomGnss;
     gpsLocationExternal @48 :GpsLocationData;
     gpsLocation @21 :GpsLocationData;
-    liveParameters @61 :LiveParametersData;
-    liveTorqueParameters @94 :LiveTorqueParametersData;
-    liveDelay @146 : LiveDelayData;
-    lateralEvent @152 :LateralEvent;
-    drivingEvent @153 :DrivingEvent;
-    drivingEventRecorded @154 :DrivingEventRecorded;
-    blatV2Shadow @155 :BlatV2Shadow;
+    vehicleParameters @61 :VehicleParameters;
+    lateralTorqueParameters @94 :LateralTorqueParameters;
+    lateralDelay @146 : LateralDelay;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
     onroadEvents @134: List(OnroadEvent);
     carParams @69: Car.CarParams;
     driverMonitoringState @151 :DriverMonitoringState;
-    livePose @129 :LivePose;
+    deviceMotion @129 :DeviceMotion;
     modelV2 @75 :ModelDataV2;
     drivingModelData @128 :DrivingModelData;
     driverStateV2 @92 :DriverStateV2;
 
     # camera stuff, each camera state has a matching encode idx
-    roadCameraState @2 :FrameData;
-    driverCameraState @70: FrameData;
+    narrowRoadCameraState @2 :FrameData;
+    cabinCameraState @70: FrameData;
     wideRoadCameraState @74: FrameData;
-    roadEncodeIdx @15 :EncodeIndex;
-    driverEncodeIdx @76 :EncodeIndex;
+    narrowRoadEncodeIdx @15 :EncodeIndex;
+    cabinEncodeIdx @76 :EncodeIndex;
     wideRoadEncodeIdx @77 :EncodeIndex;
-    qRoadEncodeIdx @90 :EncodeIndex;
+    qNarrowRoadEncodeIdx @90 :EncodeIndex;
 
-    livestreamRoadEncodeIdx @117 :EncodeIndex;
+    livestreamNarrowRoadEncodeIdx @117 :EncodeIndex;
     livestreamWideRoadEncodeIdx @118 :EncodeIndex;
-    livestreamDriverEncodeIdx @119 :EncodeIndex;
+    livestreamCabinEncodeIdx @119 :EncodeIndex;
 
     # microphone data
     soundPressure @103 :SoundPressure;
@@ -3396,6 +2584,7 @@ struct Event {
     procLog @33 :ProcLog;
     clocks @35 :Clocks;
     deviceState @6 :DeviceState;
+    chestnutState @152 :ChestnutState;
     logMessage @18 :Text;
     errorLogMessage @85 :Text;
 
@@ -3413,15 +2602,15 @@ struct Event {
 
     # *********** debug ***********
     testJoystick @52 :Joystick;
-    roadEncodeData @86 :EncodeData;
-    driverEncodeData @87 :EncodeData;
+    narrowRoadEncodeData @86 :EncodeData;
+    cabinEncodeData @87 :EncodeData;
     wideRoadEncodeData @88 :EncodeData;
-    qRoadEncodeData @89 :EncodeData;
+    qNarrowRoadEncodeData @89 :EncodeData;
     alertDebug @133 :DebugAlert;
 
-    livestreamRoadEncodeData @120 :EncodeData;
+    livestreamNarrowRoadEncodeData @120 :EncodeData;
     livestreamWideRoadEncodeData @121 :EncodeData;
-    livestreamDriverEncodeData @122 :EncodeData;
+    livestreamCabinEncodeData @122 :EncodeData;
 
     # *********** Custom: reserved for forks ***********
 

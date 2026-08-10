@@ -1,9 +1,0 @@
-Import('env', 'cereal')
-
-# Device-safe local-rlog extraction for the offroad BLaTv2 importer.  This is
-# intentionally independent of tools/replay (desktop-only) and replay sockets.
-env.Program(
-  "blatv2_rlog_extract",
-  ["blatv2_rlog_extract.cc"],
-  LIBS=[cereal, "capnp", "kj", "zstd"],
-)

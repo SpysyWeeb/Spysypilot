@@ -1,8 +1,0 @@
-{
-  "schema_version": 1,
-  "provisional": true,
-  "rack_gain_deg_s2_per_torque": 4000.0,
-  "rack_damping_per_s": 10.0,
-  "rack_rate_resolution_deg_s": 4.0,
-  "provenance": "Unqualified order-of-magnitude rack seed for shadow collection only; 4 deg/s rate resolution observed on the Palisade. Never eligible for actuation until every speed node is independently fit, validated, and replay-approved."
-}

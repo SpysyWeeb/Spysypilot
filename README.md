@@ -16,10 +16,6 @@ cycling windows. Tap the left half to go back or the right half to advance:
 1. **Live terminal** — a scrolling, colorized console of openpilot output.
 2. **System usage** — CPU/RAM/power/fan history plus storage used/total.
 
-The BLaTv2 post-drive feedback prompt remains in place. It evaluates a
-manually installed, PC-generated profile and does not perform learning or route
-processing on the device.
-
 *(personal idea)*
 
 ## How it works
@@ -29,10 +25,6 @@ direction with modular indexing. Removing the learner pages therefore removes
 their Params polling and parsing from the UI process rather than merely hiding
 the rendered panels.
 
-The retained feedback prompt reads only the feedback request produced by the
-profile lifecycle. It cannot train, fit, approve, activate, or reset a profile.
-Routes and learning artifacts are handled outside the device UI.
-
 ## What changed
 
 - `openpilot/selfdrive/ui/layouts/home.py` — two-page carousel containing the
@@ -40,7 +32,6 @@ Routes and learning artifacts are handled outside the device UI.
 - `openpilot/selfdrive/ui/layouts/main.py` — forwards the initial show event to
   the active home page so the live terminal starts on boot without a page cycle.
 - Removed the retired BLaTv2 learner/readiness widgets and their Params reader.
-- Preserved the BLaTv2 post-drive feedback prompt for PC-generated profiles.
 - Removed the five route-analyzer widgets, `drive_statsd`, its process
   registration, and its now-unused `Spysy*Stats` Params.
 - `terminal_widget.py`, `system_stats.py`, and their behavior are unchanged.
