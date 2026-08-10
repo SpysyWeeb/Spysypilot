@@ -673,13 +673,10 @@ def test_approved_artifact_takes_precedence_over_experimental_request() -> None:
   assert not selected.candidate.core.development_phase_boost
 
 
-def test_experimental_parameter_is_development_only_and_process_bound() -> None:
+def test_archived_experimental_parameter_is_not_registered_or_hot_read() -> None:
   root = Path(__file__).resolve().parents[3]
   keys = (root / "common" / "params_keys.h").read_text()
-  assert (
-    f'{{"{EXPERIMENTAL_CONTROLLER_PARAM}", ' +
-    '{PERSISTENT | DEVELOPMENT_ONLY, BOOL, "0"}}'
-  ) in keys
+  assert EXPERIMENTAL_CONTROLLER_PARAM not in keys
 
   hot_sources = "\n".join((
     inspect.getsource(ModularLiveController.update_engagement),
@@ -2142,57 +2139,49 @@ def test_modular_boundary_reconstructs_every_hidden_stock_state() -> None:
   assert set(fresh.lat_accel_request_buffer) == {0.0}
 
 
-def test_stock_arm_remains_the_unmodified_stock_update_shape() -> None:
+def test_combo_uses_only_the_stock_lateral_controller() -> None:
   source = (
     Path(__file__).parents[1] / "controlsd.py"
   ).read_text()
-  stock_start = source.index(
-    "if controller_selection == ControllerSelection.STOCK:",
-  )
-  modular_start = source.index(
-    "    else:\n      result = self.blatv2_live.update_modular(",
-    stock_start,
-  )
-  stock_arm = source[stock_start:modular_start]
+
   for required in (
+    "from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque",
+    "self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)",
     "lateralManeuverPlan",
     "model_v2.action.desiredCurvature",
     "clip_curvature(",
     'self.sm[\"liveDelay\"].lateralDelay + LAT_SMOOTH_SECONDS',
     "self.LaC.update(",
     "actuators.torque = float(steer)",
+    "cc_send.valid = CS.canValid",
   ):
-    assert required in stock_arm
-  assert "update_modular" not in stock_arm
-  assert "blatv2_messages_valid = True" in stock_arm
+    assert required in source
 
-  modular_arm = source[modular_start:]
-  assert (
-    "not self.blatv2_live.final_count_match_valid"
-    in modular_arm
-  )
-  assert "self.blatv2_live.final_limiter_altered" in modular_arm
-  assert (
-    "actuator_constrained_previous=self.steer_limited_by_safety"
-    not in modular_arm
-  )
-  assert "self.sm.all_checks(['carState', 'carOutput'])" in modular_arm
-  record_start = modular_arm.index(
-    "if controller_selection == ControllerSelection.MODULAR:",
-  )
-  record_end = modular_arm.index("\n\n    return CC, lac_log", record_start)
-  record_block = modular_arm[record_start:record_end]
-  assert "self.blatv2_live.record_requested_command(" in record_block
-  assert "blatv2_messages_valid" not in record_block
-  assert "cc_send.valid = CS.canValid and self.blatv2_messages_valid" in source
+  for forbidden in (
+    "openpilot.selfdrive.controls.lib.blatv2",
+    "ControllerSelection",
+    "construct_modular_live_controller",
+    "fresh_stock_torque_controller",
+    "self.blatv2_live",
+    "update_modular",
+    "BLaTv2ExperimentalController",
+    "blatv2_messages_valid",
+  ):
+    assert forbidden not in source
 
   card_source = (
     Path(__file__).parents[2] / "car" / "card.py"
   ).read_text()
-  assert "co_send.valid = self.sm.all_checks(['carControl'])" not in card_source
-  assert "co_send.valid = (\n      CS.canValid" in card_source
-  assert "and self.sm.all_alive(['carControl'])" in card_source
-  assert "and self.sm.all_freq_ok(['carControl'])" in card_source
+  assert "co_send.valid = self.sm.all_checks(['carControl'])" in card_source
+
+  root = Path(__file__).parents[3]
+  params_keys = (root / "common" / "params_keys.h").read_text()
+  assert "BLaTv2ExperimentalController" not in params_keys
+  for relative_path in (
+    "selfdrive/ui/layouts/main.py",
+    "selfdrive/ui/mici/layouts/main.py",
+  ):
+    assert "BlatV2FeedbackPrompt" not in (root / relative_path).read_text()
 
 
 def test_production_sources_have_no_platform_literals_or_legacy_mechanisms() -> None:
