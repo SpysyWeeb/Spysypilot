@@ -3,13 +3,14 @@
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
-from msgq.visionipc import VisionIpcClient, VisionStreamType
+from openpilot.cereal.visionipc import VisionStreamType
+from msgq.visionipc import VisionIpcClient
 from openpilot.common.realtime import DT_MDL
 
 
 VISION_STREAMS = {
-  "narrowRoadCameraState": VisionStreamType.VISION_STREAM_ROAD,
-  "cabinCameraState": VisionStreamType.VISION_STREAM_DRIVER,
+  "narrowRoadCameraState": VisionStreamType.VISION_STREAM_NARROW_ROAD,
+  "cabinCameraState": VisionStreamType.VISION_STREAM_CABIN,
   "wideRoadCameraState": VisionStreamType.VISION_STREAM_WIDE_ROAD,
 }
 
