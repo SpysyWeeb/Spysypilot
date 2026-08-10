@@ -73,7 +73,7 @@ def _camera_session():
   return ts, exposure
 
 class TestCamerad(OpenpilotTestCase):
-  TICI_TEST = True
+  COMMA_HARDWARE_TEST = True
 
   @classmethod
   def setUpClass(cls):
@@ -118,10 +118,10 @@ class TestCamerad(OpenpilotTestCase):
     laggy_frames = {k: v for k, v in diffs.items() if v > 1.1}
     assert len(laggy_frames) == 0, f"Frames not synced properly: {laggy_frames=}"
 
-    # driver camera should be staggered ~25ms from road camera
+    # cabin camera should be staggered ~25ms from road camera
     for i in n:
       offset_ms = abs(self.logs['cabinCameraState']['timestampSof'][i] - self.logs['narrowRoadCameraState']['timestampSof'][i]) / 1e6
-      assert 20 < offset_ms < 30, f"driver camera stagger out of range at frame {i}: {offset_ms:.1f}ms (expected ~25ms)"
+      assert 20 < offset_ms < 30, f"cabin camera stagger out of range at frame {i}: {offset_ms:.1f}ms (expected ~25ms)"
 
   def test_sanity_checks(self):
     self._sanity_checks(self.logs)
