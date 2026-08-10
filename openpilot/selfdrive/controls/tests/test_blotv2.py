@@ -89,7 +89,7 @@ class TestSupervisorScope(unittest.TestCase):
     self.assertEqual(policy.jerk_scale, 1.0)
     self.assertEqual(policy.t_follow, T_FOLLOW_BASE)
 
-  def test_crawl_is_owned_by_smooth_stops(self):
+  def test_crawl_keeps_stock_mpc_policy(self):
     policy = run(BLoTv2Supervisor(), lead(v=0.0, d=8.0), 0.5, -3.0, 2.0)
     self.assertEqual(policy.jerk_scale, 1.0)
     self.assertEqual(policy.t_follow, T_FOLLOW_BASE)
