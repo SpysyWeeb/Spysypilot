@@ -73,13 +73,13 @@ bool selected(cereal::Event::Which which) {
     case cereal::Event::CAR_STATE:
     case cereal::Event::CAR_CONTROL:
     case cereal::Event::CAR_OUTPUT:
-    case cereal::Event::LIVE_PARAMETERS:
+    case cereal::Event::VEHICLE_PARAMETERS:
     case cereal::Event::CAR_PARAMS:
     case cereal::Event::MODEL_V2:
     case cereal::Event::DRIVING_EVENT:
     case cereal::Event::SELFDRIVE_STATE:
-    case cereal::Event::LIVE_TORQUE_PARAMETERS:
-    case cereal::Event::LIVE_DELAY:
+    case cereal::Event::LATERAL_TORQUE_PARAMETERS:
+    case cereal::Event::LATERAL_DELAY:
     case cereal::Event::LATERAL_MANEUVER_PLAN:
     case cereal::Event::SENDCAN:
       return true;
