@@ -6,6 +6,7 @@ import pyray as rl
 from openpilot.common.hardware.hw import Paths
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 
 SAMPLE_INTERVAL = 1.0
@@ -140,7 +141,7 @@ class SystemStatsWidget(Widget):
     rl.draw_text_ex(fn, metric.label, rl.Vector2(int(rect.x + label_pad), int(rect.y + 14)), 28, 0, _DIM)
 
     value_text = f"{metric.current:.0f}{metric.unit}"
-    vw = rl.measure_text_ex(fb, value_text, 34, 0).x
+    vw = measure_text_cached(fb, value_text, 34).x
     rl.draw_text_ex(
       fb, value_text,
       rl.Vector2(int(rect.x + rect.width - label_pad - vw), int(rect.y + 10)),
@@ -187,7 +188,7 @@ class SystemStatsWidget(Widget):
     color = _DANGER if pct >= 90 else _WARNING if pct >= 75 else _GOOD
 
     value_text = f"{self._used_gb:.0f} GB / {self._total_gb:.0f} GB"
-    vw = rl.measure_text_ex(fb, value_text, 32, 0).x
+    vw = measure_text_cached(fb, value_text, 32).x
     rl.draw_text_ex(
       fb, value_text,
       rl.Vector2(int(rect.x + rect.width - pad - vw), int(rect.y + 8)),

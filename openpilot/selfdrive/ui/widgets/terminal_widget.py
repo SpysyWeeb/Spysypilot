@@ -25,9 +25,9 @@ _JOURNAL_NOISE = r'pam_unix.*session\|session opened for\|session closed for\|CO
 
 
 def _level_color(line: str) -> rl.Color:
-    if line.startswith('[W]') or line.startswith('[WARNING]'):
+    if line.startswith(('[W]', '[WARNING]')):
         return _YELLOW
-    if line.startswith('[E]') or line.startswith('[ERROR]') or line.startswith('[C]') or line.startswith('[CRITICAL]'):
+    if line.startswith(('[E]', '[ERROR]', '[C]', '[CRITICAL]')):
         return _RED
     return _GREEN
 
