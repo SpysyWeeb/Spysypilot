@@ -159,13 +159,13 @@ _CORE_INPUT_KEYS = frozenset({
   "lateralManeuverPlanPublicationIndex",
   "lateralManeuverPlanValid",
   "interventionOnsetUncertain",
-  "liveParametersInputsValid",
+  "vehicleParametersInputsValid",
   "liveTorqueHealthExact",
   "liveTorqueFriction",
   "liveTorqueInputsValid",
   "liveTorqueLatAccelFactor",
   "liveTorqueLatAccelOffset",
-  "liveTorqueParametersPublicationIndex",
+  "lateralTorqueParametersPublicationIndex",
   "liveTorqueUseParams",
   "modelFrameId",
   "modelMessageAlive",
@@ -402,13 +402,13 @@ class ReplayFrameInput:
       "lateralManeuverPlanPublicationIndex": self.lateral_maneuver_plan_publication_index,
       "lateralManeuverPlanValid": self.lateral_maneuver_plan_valid,
       "interventionOnsetUncertain": self.intervention_onset_uncertain,
-      "liveParametersInputsValid": self.live_parameters_inputs_valid,
+      "vehicleParametersInputsValid": self.live_parameters_inputs_valid,
       "liveTorqueHealthExact": self.live_torque_health_exact,
       "liveTorqueFriction": self.live_torque_friction,
       "liveTorqueInputsValid": self.live_torque_inputs_valid,
       "liveTorqueLatAccelFactor": self.live_torque_lat_accel_factor,
       "liveTorqueLatAccelOffset": self.live_torque_lat_accel_offset,
-      "liveTorqueParametersPublicationIndex": self.live_torque_parameters_publication_index,
+      "lateralTorqueParametersPublicationIndex": self.live_torque_parameters_publication_index,
       "liveTorqueUseParams": self.live_torque_use_params,
       "modelFrameId": self.model_frame_id,
       "modelMessageAlive": self.model_message_alive,
@@ -499,8 +499,8 @@ class ReplayFrameInput:
         stiffness_factor=_require_finite("stiffnessFactor", payload["stiffnessFactor"]),
         steer_ratio=_require_finite("steerRatio", payload["steerRatio"]),
         live_torque_parameters_publication_index=_require_index(
-          "liveTorqueParametersPublicationIndex",
-          payload["liveTorqueParametersPublicationIndex"],
+          "lateralTorqueParametersPublicationIndex",
+          payload["lateralTorqueParametersPublicationIndex"],
         ),
         live_torque_lat_accel_factor=_require_finite(
           "liveTorqueLatAccelFactor", payload["liveTorqueLatAccelFactor"],
@@ -541,7 +541,7 @@ class ReplayFrameInput:
           "modelMessageAlive", payload["modelMessageAlive"],
         ),
         live_parameters_inputs_valid=_require_exact_bool(
-          "liveParametersInputsValid", payload["liveParametersInputsValid"],
+          "vehicleParametersInputsValid", payload["vehicleParametersInputsValid"],
         ),
         live_torque_health_exact=_require_exact_bool(
           "liveTorqueHealthExact", payload["liveTorqueHealthExact"],
@@ -1612,7 +1612,7 @@ class _StockRequestProducer(_RequestProducer):
       raise BehaviorReplayError("model frame identity differs from the exact link")
     if not frame_input.live_torque_health_exact:
       # Stock conditionally updates its stateful calibration from
-      # sm.all_checks(['liveTorqueParameters']).  If that witness-time result
+      # sm.all_checks(['lateralTorqueParameters']).  If that witness-time result
       # cannot be proved, there is no exact stock replay for this frame.
       return 0.0, 0.0, True
     try:
@@ -1638,7 +1638,7 @@ class _StockRequestProducer(_RequestProducer):
         live_params.roll,
       )
       if frame_input.live_torque_inputs_valid and frame_input.live_torque_use_params:
-        self.controller.update_live_torque_params(
+        self.controller.update_torque_parameters(
           frame_input.live_torque_lat_accel_factor,
           frame_input.live_torque_lat_accel_offset,
           frame_input.live_torque_friction,

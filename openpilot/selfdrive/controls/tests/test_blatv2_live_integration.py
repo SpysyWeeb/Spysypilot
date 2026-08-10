@@ -393,7 +393,7 @@ def vehicle_messages() -> tuple[object, object, object]:
   output.actuatorsOutput.steeringRequestActiveValid = True
   output.actuatorsOutput.steeringRequestFaultAvoidanceCounter = 0
 
-  live_params = log.LiveParametersData.new_message()
+  live_params = log.VehicleParameters.new_message()
   live_params.valid = True
   live_params.angleOffsetValid = True
   live_params.steerRatioValid = True
@@ -2150,7 +2150,7 @@ def test_combo_uses_only_the_stock_lateral_controller() -> None:
     "lateralManeuverPlan",
     "model_v2.action.desiredCurvature",
     "clip_curvature(",
-    'self.sm[\"liveDelay\"].lateralDelay + LAT_SMOOTH_SECONDS',
+    'self.sm[\"lateralDelay\"].lateralDelay + LAT_SMOOTH_SECONDS',
     "self.LaC.update(",
     "actuators.torque = float(steer)",
     "cc_send.valid = CS.canValid",

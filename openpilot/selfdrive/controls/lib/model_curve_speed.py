@@ -8,7 +8,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
 # Model-path curvature observed at the three owner-driven calibration points.
-# These differ slightly from vehicle curvature measured by livePose, since the
+# These differ slightly from vehicle curvature measured by deviceMotion, since the
 # online limiter must be calibrated in the same model space it consumes.
 CURVATURE_BP = np.array([0.00501, 0.04666, 0.08188])
 CURVE_SPEED_V = np.array([50.0, 22.0, 13.0]) * CV.MPH_TO_MS

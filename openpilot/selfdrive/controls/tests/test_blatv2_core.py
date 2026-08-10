@@ -1318,7 +1318,7 @@ class TestBLaTv2Core(unittest.TestCase):
     for forbidden in (
       "DT_MDL",
       "LAT_SMOOTH_SECONDS",
-      "liveDelay",
+      "lateralDelay",
       "LatControlTorque",
       "BLaTv1",
       "v14",

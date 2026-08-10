@@ -1885,8 +1885,8 @@ RouteData load_route_data(const std::string &route_name,
                                           metadata.car_fingerprint,
                                           resolved_dbc);
   route_data.route_id = make_route_identifier(route, segments);
-  build_camera_index(segments, route_data, &SegmentLogs::fcamera, "roadEncodeIdx", &route_data.road_camera);
-  build_camera_index(segments, route_data, &SegmentLogs::dcamera, "driverEncodeIdx", &route_data.driver_camera);
+  build_camera_index(segments, route_data, &SegmentLogs::fcamera, "narrowRoadEncodeIdx", &route_data.road_camera);
+  build_camera_index(segments, route_data, &SegmentLogs::dcamera, "cabinEncodeIdx", &route_data.driver_camera);
   build_camera_index(segments, route_data, &SegmentLogs::ecamera, "wideRoadEncodeIdx", &route_data.wide_road_camera);
   build_camera_index(segments, route_data, &SegmentLogs::qcamera, "qRoadEncodeIdx", &route_data.qroad_camera);
   stats.load_end = LoadStats::Clock::now();

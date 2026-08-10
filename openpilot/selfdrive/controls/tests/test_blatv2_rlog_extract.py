@@ -249,8 +249,8 @@ def test_native_retains_complete_shared_evidence_input_set(
   raw = b"".join((
     current_event("modelV2", 100),
     current_event("selfdriveState", 110),
-    current_event("liveTorqueParameters", 120),
-    current_event("liveDelay", 130),
+    current_event("lateralTorqueParameters", 120),
+    current_event("lateralDelay", 130),
     current_event("lateralManeuverPlan", 140),
     current_event("drivingEvent", 150),
   ))
@@ -266,8 +266,8 @@ def test_native_retains_complete_shared_evidence_input_set(
   assert [record.which for record in extracted] == [
     learning_backfill._EVENT_WHICH["modelV2"],
     learning_backfill._EVENT_WHICH["selfdriveState"],
-    learning_backfill._EVENT_WHICH["liveTorqueParameters"],
-    learning_backfill._EVENT_WHICH["liveDelay"],
+    learning_backfill._EVENT_WHICH["lateralTorqueParameters"],
+    learning_backfill._EVENT_WHICH["lateralDelay"],
     learning_backfill._EVENT_WHICH["lateralManeuverPlan"],
     learning_backfill._EVENT_WHICH["drivingEvent"],
   ]

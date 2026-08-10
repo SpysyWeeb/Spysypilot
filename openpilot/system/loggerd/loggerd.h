@@ -79,7 +79,7 @@ public:
 };
 
 const EncoderInfo main_road_encoder_info = {
-  .publish_name = "roadEncodeData",
+  .publish_name = "narrowRoadEncodeData",
   .thumbnail_name = "thumbnail",
   .filename = "fcamera.hevc",
   .get_settings = [](int in_width){return EncoderSettings::MainEncoderSettings(in_width);},
@@ -94,7 +94,7 @@ const EncoderInfo main_wide_road_encoder_info = {
 };
 
 const EncoderInfo main_driver_encoder_info = {
-  .publish_name = "driverEncodeData",
+  .publish_name = "cabinEncodeData",
   .filename = "dcamera.hevc",
   .record = Params().getBool("RecordFront"),
   .get_settings = [](int in_width){return EncoderSettings::MainEncoderSettings(in_width);},

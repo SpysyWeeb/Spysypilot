@@ -279,7 +279,7 @@ void process_panda_state(Panda *panda, PubMaster *pm, bool engaged, bool engaged
 
 void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control, bool is_onroad) {
   static Params params;
-  static SubMaster sm({"deviceState", "driverCameraState"});
+  static SubMaster sm({"deviceState", "cabinCameraState"});
 
   static uint64_t last_driver_camera_t = 0;
   static uint16_t prev_fan_speed = 999;
@@ -305,8 +305,8 @@ void process_peripheral_state(Panda *panda, PubMaster *pm, bool no_fan_control, 
       }
     }
 
-    if (sm.updated("driverCameraState")) {
-      auto event = sm["driverCameraState"];
+    if (sm.updated("cabinCameraState")) {
+      auto event = sm["cabinCameraState"];
       int cur_integ_lines = event.getDriverCameraState().getIntegLines();
 
       // reset the filter when camerad restarts
