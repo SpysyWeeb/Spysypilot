@@ -1,5 +1,4 @@
 from openpilot.cereal import custom
-from openpilot.selfdrive.selfdrived.events import ET
 
 State = custom.AolState.AolStateEnum
 
