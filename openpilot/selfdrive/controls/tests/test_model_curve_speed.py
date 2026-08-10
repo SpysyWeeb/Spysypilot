@@ -5,7 +5,6 @@ import numpy as np
 
 from openpilot.common.constants import CV
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
-from openpilot.selfdrive.controls.lib.longitudinal_planner import get_cruise_accel
 from openpilot.selfdrive.controls.lib.model_curve_speed import (
   CURVATURE_BP,
   CURVE_SPEED_V,
@@ -53,6 +52,9 @@ class TestModelCurveSpeed(unittest.TestCase):
 
         self.assertEqual(limiter.update(make_model(curvature=curvature), v_cruise), v_cruise)
         self.assertFalse(limiter.active)
+
+  def test_default_approach_deceleration_is_half_mps2(self):
+    self.assertAlmostEqual(ModelCurveSpeedLimiter().approach_decel, 0.5)
 
   def test_sustained_curve_caps_cruise_using_approach_distance(self):
     curvature = np.zeros(ModelConstants.IDX_N)
@@ -107,6 +109,8 @@ class TestModelCurveSpeed(unittest.TestCase):
         self.assertFalse(limiter.active)
 
   def test_existing_cruise_controller_accelerates_only_below_curve_cap(self):
+    from openpilot.selfdrive.controls.lib.longitudinal_planner import get_cruise_accel
+
     cap = 15.0
     common = {"e2e": False, "a_cruise_prev": 0.0, "dt": 0.05, "accel_coast": 0.0, "allow_throttle": True}
 
@@ -115,5 +119,5 @@ class TestModelCurveSpeed(unittest.TestCase):
     self.assertLess(get_cruise_accel(v_cruise=cap, v_ego=cap + 1.0, **common), 0.0)
 
   def test_curve_speed_units_match_field_mph_values(self):
-    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [44.0, 22.0, 13.0])
+    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [50.0, 22.0, 13.0])
     self.assertEqual(MAX_CURVE_SPEED, V_CRUISE_MAX * CV.KPH_TO_MS)
