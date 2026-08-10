@@ -53,6 +53,9 @@ class TestModelCurveSpeed(unittest.TestCase):
         self.assertEqual(limiter.update(make_model(curvature=curvature), v_cruise), v_cruise)
         self.assertFalse(limiter.active)
 
+  def test_default_approach_deceleration_is_half_mps2(self):
+    self.assertAlmostEqual(ModelCurveSpeedLimiter().approach_decel, 0.5)
+
   def test_sustained_curve_caps_cruise_using_approach_distance(self):
     curvature = np.zeros(ModelConstants.IDX_N)
     curvature[12:17] = CURVATURE_BP[1]
@@ -106,5 +109,5 @@ class TestModelCurveSpeed(unittest.TestCase):
         self.assertFalse(limiter.active)
 
   def test_curve_speed_units_match_field_mph_values(self):
-    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [44.0, 22.0, 13.0])
+    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [50.0, 22.0, 13.0])
     self.assertEqual(MAX_CURVE_SPEED, V_CRUISE_MAX * CV.KPH_TO_MS)
