@@ -1,6 +1,6 @@
 import pyray as rl
 from openpilot.cereal import log, messaging
-from msgq.visionipc import VisionStreamType
+from openpilot.cereal.visionipc import VisionStreamType
 from openpilot.selfdrive.ui.mici.onroad.cameraview import CameraView
 from openpilot.selfdrive.ui.mici.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.ui_state import ui_state, device
@@ -24,7 +24,7 @@ class BaseDriverCameraDialog(Widget):
   # Not a NavWidget so training guide can use this without back navigation
   def __init__(self):
     super().__init__()
-    self._camera_view = DriverCameraView("camerad", VisionStreamType.VISION_STREAM_DRIVER)
+    self._camera_view = DriverCameraView("camerad", VisionStreamType.VISION_STREAM_CABIN)
     self.driver_state_renderer = DriverStateRenderer(lines=True)
     self.driver_state_renderer.set_rect(rl.Rectangle(0, 0, 200, 200))
     self.driver_state_renderer.load_icons()

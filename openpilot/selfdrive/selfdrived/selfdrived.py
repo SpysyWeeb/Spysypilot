@@ -7,7 +7,8 @@ import openpilot.cereal.messaging as messaging
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
-from msgq.visionipc import VisionIpcClient, VisionStreamType
+from msgq.visionipc import VisionIpcClient
+from openpilot.cereal.visionipc import VisionStreamType
 
 
 from openpilot.common.params import Params
@@ -485,7 +486,7 @@ class SelfdriveD:
       timed_out = self.sm.frame * DT_CTRL > 6.
       if all_valid or timed_out or (SIMULATION and not REPLAY):
         available_streams = VisionIpcClient.available_streams("camerad", block=False)
-        if VisionStreamType.VISION_STREAM_ROAD not in available_streams:
+        if VisionStreamType.VISION_STREAM_NARROW_ROAD not in available_streams:
           self.sm.ignore_alive.append('narrowRoadCameraState')
           self.sm.ignore_valid.append('narrowRoadCameraState')
         if VisionStreamType.VISION_STREAM_WIDE_ROAD not in available_streams:

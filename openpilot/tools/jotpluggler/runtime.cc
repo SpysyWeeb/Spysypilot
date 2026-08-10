@@ -39,11 +39,11 @@ const bool kLogCameraTimings = env_flag_enabled("JOTP_CAMERA_TIMINGS");
 
 CameraType decoder_camera_type(CameraViewKind view) {
   switch (view) {
-    case CameraViewKind::Driver: return DriverCam;
+    case CameraViewKind::Cabin: return CabinCam;
     case CameraViewKind::WideRoad: return WideRoadCam;
-    case CameraViewKind::QRoad: return RoadCam;
+    case CameraViewKind::QRoad: return NarrowRoadCam;
     case CameraViewKind::Road:
-    default: return RoadCam;
+    default: return NarrowRoadCam;
   }
 }
 
