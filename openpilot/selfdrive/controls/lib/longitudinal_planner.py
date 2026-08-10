@@ -48,55 +48,12 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
-# Stop intent is published before standstill so LongControl can shape the full
-# ordinary stop. The final three MPC samples must agree; action.shouldStop is
-# already a model-authored stop signal and follows the same latch.
-STOP_INTENT_SPEED = 0.5
-STOP_INTENT_CONFIRM = 0.15
-STOP_INTENT_RELEASE = 0.35
-
 # Lookup table for turns
 # Do not let the turn budget clip the requested straight-line launch authority.
 # Lateral acceleration still consumes this shared budget in a turn.
 _A_TOTAL_MAX_V = [BLOTV2_ACCEL_REQUEST_MAX, BLOTV2_ACCEL_REQUEST_MAX]
 _A_TOTAL_MAX_BP = [20., 40.]
 
-
-def projected_stop_intent(speeds):
-  values = np.asarray(speeds, dtype=float)
-  if values.size < 3 or not np.all(np.isfinite(values)):
-    return False
-  tail = values[-3:]
-  return bool(np.all(tail <= STOP_INTENT_SPEED) and np.all(np.diff(tail) <= 0.05))
-
-
-class StopIntentLatch:
-  """Debounce ordinary stop intent while preserving it through the approach."""
-
-  def __init__(self, dt=DT_MDL):
-    self.dt = dt
-    self._on_s = 0.0
-    self._off_s = 0.0
-    self.active = False
-
-  def reset(self):
-    self._on_s = 0.0
-    self._off_s = 0.0
-    self.active = False
-
-  def update(self, raw_intent):
-    if raw_intent:
-      self._on_s += self.dt
-      self._off_s = 0.0
-      if self._on_s + 1e-9 >= STOP_INTENT_CONFIRM:
-        self.active = True
-    elif self.active:
-      self._off_s += self.dt
-      if self._off_s + 1e-9 >= STOP_INTENT_RELEASE:
-        self.reset()
-    else:
-      self._on_s = 0.0
-    return self.active
 
 def get_requested_max_accel(v_ego):
   speed_fraction = float(np.clip(v_ego / A_CRUISE_MAX_CURVE_SPEED, 0.0, 1.0))
@@ -170,7 +127,6 @@ class LongitudinalPlanner:
     self.allow_throttle = True
     self.blotv2 = BLoTv2Supervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt)
-    self.stop_intent = StopIntentLatch(dt)
 
     self.a_desired = init_a
     self.last_mpc_a_target = init_a
@@ -216,7 +172,6 @@ class LongitudinalPlanner:
       self.last_mpc_a_target = float(self.a_desired)
       self.blotv2.reset()
       self.lead_departure.reset()
-      self.stop_intent.reset()
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -299,13 +254,7 @@ class LongitudinalPlanner:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    raw_stop_intent = (
-      force_decel
-      or output_should_stop_e2e
-      or (projected_stop_intent(self.v_desired_trajectory) and not lead_departure_released)
-      or any(should_stop for _, _, should_stop in candidates)
-    )
-    self.output_should_stop = self.stop_intent.update(raw_stop_intent)
+    self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, BLOTV2_ACCEL_MAX)
 
     self.a_desired = float(self.output_a_target)

@@ -19,7 +19,6 @@ from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, S
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
-from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
@@ -28,17 +27,6 @@ LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
-
-
-def force_decel_requested(selfdrive_state, driver_monitoring_state) -> bool:
-  """Return the driver-monitoring/soft-disable emergency braking request.
-
-  ``controlsState`` is published by this process, so it is not available in
-  the controlsd SubMaster. Keep this decision on the inputs controlsd already
-  owns instead of creating a self-subscription cycle.
-  """
-  return bool(driver_monitoring_state.noResponseForceDecel or
-              selfdrive_state.state == State.softDisabling)
 
 
 class Controls:
@@ -52,7 +40,7 @@ class Controls:
 
     self.sm = messaging.SubMaster(['liveDelay', 'liveParameters', 'liveTorqueParameters', 'modelV2', 'selfdriveState',
                                    'liveCalibration', 'livePose', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'radarState'], poll='selfdriveState')
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance'], poll='selfdriveState')
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited_by_safety = False
@@ -128,20 +116,7 @@ class Controls:
 
     # accel PID loop
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
-    lead = LeadObservation.from_radar(
-      self.sm['radarState'].leadOne,
-      self.sm.all_checks(['radarState']),
-    )
-    force_decel = force_decel_requested(self.sm['selfdriveState'], self.sm['driverMonitoringState'])
-    actuators.accel = float(self.LoC.update(
-      CC.longActive,
-      CS,
-      long_plan.aTarget,
-      long_plan.shouldStop,
-      pid_accel_limits,
-      lead,
-      emergency_stop=bool(long_plan.fcw or force_decel),
-    ))
+    actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits))
 
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
@@ -225,7 +200,8 @@ class Controls:
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)
     cs.ufAccelCmd = float(self.LoC.pid.f)
-    cs.forceDecel = force_decel_requested(self.sm['selfdriveState'], self.sm['driverMonitoringState'])
+    cs.forceDecel = bool(self.sm['driverMonitoringState'].noResponseForceDecel or
+                         (self.sm['selfdriveState'].state == State.softDisabling))
 
     # trigger the car's stock driver monitoring escalation
     CC.driverMonitoringEscalation = cs.forceDecel

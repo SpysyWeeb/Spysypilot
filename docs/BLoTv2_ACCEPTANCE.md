@@ -23,10 +23,6 @@ Every test report must identify:
 - [x] Feature changes are authored on `BLoTv2` before `combo` integration.
 - [x] Shared live/finite lead contract.
 - [x] Relative lead-physics unit coverage.
-- [x] Smooth Stops rolling-queue/dropout transition coverage.
-- [x] Limousine stop ramp/plateau/release and ordinary stronger-target
-  shaping coverage.
-- [x] Explicit emergency planner-braking pass-through coverage.
 - [x] MPC supervisor trigger, emergency, and slew coverage.
 - [x] Model lead trajectory shape/finite/fallback coverage.
 - [x] Low-speed radar override qualification coverage.
@@ -55,11 +51,6 @@ Every test report must identify:
 Replay must use the real production classes, not copied equations.
 
 - [ ] Baseline and BLoTv2 replay the same route timelines.
-- [ ] Smooth-stop routes cover no lead, stopped lead, and creeping queue.
-- [ ] Ordinary planned stops show the limousine pressure hill from intent
-  entry through standstill; only FCW/force-decel/collision-floor events may
-  bypass it.
-- [ ] Rolling-lead noise and radar-dropout motivating windows are reviewed.
 - [ ] Mild lead-braking onset improves without early phantom braking.
 - [ ] Hard lead braking has no collision-distance or peak-decel regression.
 - [ ] `4.0 m/s²` launch response improves without lunge-and-catch behavior.
@@ -67,7 +58,7 @@ Replay must use the real production classes, not copied equations.
 - [ ] Low-speed radar ghost route is rejected without missing a real obstacle.
 - [ ] ACC and experimental-mode candidate arbitration is reviewed.
 - [x] Route `000000d2--a62f0c1831` identifies cruise authority—not PID or
-  Smooth Stops—as the source of excessive 40-to-45 mph acceleration.
+  stop-landing control—as the source of excessive 40-to-45 mph acceleration.
 - [x] Route `000000d9--6040563d1d` identifies unity-gain cruise speed error as
   the source of both excessive 75-to-80 mph acceleration and full-limit
   80-to-75 mph braking.

@@ -5,14 +5,13 @@
 **In progress. Not field validated. Do not mark complete before owner field
 testing and explicit approval.**
 
-BLoTv2 starts from the untouched `stock` branch and deliberately reimplements
-the useful mechanisms from `BLoT` and `smooth-stops`. It is not based on
-`combo`, and it does not inherit either feature branch wholesale.
+BLoTv2 starts from the untouched `stock` branch and reimplements useful BLoT
+planner/MPC mechanisms. It is not based on `combo` and does not implement stop
+landing; that remains owned by the separate `smooth-stops` branch.
 
 The product target is **Smooth. Swift. Strong.**
 
-- **Smooth:** continuous acceleration and jerk through lead following, braking,
-  final approach, hold, and release.
+- **Smooth:** continuous acceleration and jerk through cruise and lead following.
 - **Swift:** react promptly to real lead/model changes without stale trigger
   state, unnecessary solution stiffness, or hidden brake-release delay.
 - **Strong:** use the existing safe longitudinal envelope in proportion to
@@ -27,8 +26,7 @@ The product target is **Smooth. Swift. Strong.**
 | Lead trajectory and obstacle optimization | stock Acados longitudinal MPC |
 | MPC response cost and dynamic headway | `BLoTv2Supervisor` |
 | Cruise acceleration target | longitudinal planner |
-| Ordinary stop profile and standstill handoff | `SmoothStopController` |
-| Standstill hold | stock `LongCtrlState.stopping` |
+| Stop profile and standstill handoff | stock longcontrol; `smooth-stops` in `combo` |
 | Acceleration tracking | stock longitudinal PID |
 | Effective Chill/Experimental mode | `selfdrived` |
 | Vehicle command limits | opendbc |
@@ -38,8 +36,6 @@ No downstream layer compensates by silently taking ownership of another
 layer's decision. In particular:
 
 - the supervisor never commands acceleration;
-- Smooth Stops shapes ordinary planner braking; explicit FCW, force-decel, and
-  lead-collision floors can override it;
 - Conditional Experimental Mode never commands a speed, acceleration, brake,
   or stop point;
 - BLoTv2 does not raise opendbc or panda limits;
@@ -62,16 +58,13 @@ radarState -- live/finite lead observation --> necessity supervisor
                         |
                  longitudinalPlan
                         |
-          Smooth Stops ordinary-stop profile
-                        |
                 stock longitudinal PID/hold
                         |
                   opendbc --> panda
 ```
 
-The planner runs at model rate. Smooth Stops runs at control rate. The two
-processes do not share mutable state; they import the same side-effect-free
-relative lead physics.
+The planner runs at model rate and stock longcontrol tracks its selected target.
+`combo` may independently add `smooth-stops` at control rate.
 
 ## Shared lead contract
 
@@ -90,60 +83,13 @@ closing = max(v_ego - v_lead, 0)
 closing_decel = closing² / (2 * max(d_rel - stop_margin, minimum_budget))
 ```
 
-The MPC supervisor adds measured lead braking to this term. Smooth Stops uses
-only closing deceleration because the planner remains the collision-avoidance
-owner.
+The MPC supervisor adds measured lead braking to this term.
 
 ## Smooth
 
-### Limousine braking profile
-
-The planner publishes a debounced stop intent before terminal standstill.
-While that intent is active, longcontrol remains in the PID state and
-`SmoothStopController` owns the ordinary longitudinal command from the first
-braking frame through the hold handoff. It applies the requested deceleration
-with a `1.5 m/s³` jerk limit, holds the requested braking level through the
-main approach, and releases it linearly from `4.0 m/s` to `0.15 m/s`, reaching
-the `0.12 m/s²` stop kiss before standstill. This is the pressure hill of a
-limousine stop: ramp in, plateau, then progressively release.
-
-The stock hold clamp is entered only below `0.05 m/s`, or below `0.15 m/s`
-when the car itself reports standstill. Ordinary planner commands no longer
-bypass this profile merely because they are stronger than the current output.
-The stop intent latch confirms raw model/MPC stop evidence for `0.15 s` and
-holds it for `0.35 s` after a transient clear.
-
-### Safety authority is preserved
-
-The ordinary profile still honors relative lead-closing deceleration and
-anti-creep safety floors. FCW, forced deceleration, and the BLoTv2 lead-
-collision emergency signal pass the stronger planner command through without
-waiting for the comfort jerk ramp. A normal stronger planner target is shaped
-by the limousine profile instead of being treated as an emergency by default.
-
-### Rolling-queue behavior
-
-The previous Smooth Stops implementation treated a constant-speed creeping
-queue as vehicle creep. A hard `0.3 m/s` threshold stopped new accumulation but
-never released already accumulated anti-creep pressure. Noise or one radar
-dropout could therefore leave permanent extra braking.
-
-BLoTv2 uses:
-
-- moving-lead entry at `0.30 m/s`;
-- moving-lead exit at `0.18 m/s`;
-- `0.50 s` radar-dropout grace;
-- controlled anti-creep pressure decay at `1.0 m/s³`;
-- a progress baseline re-anchored at the current queue speed.
-
-The lead-distance floor also uses relative closing speed, so an equal-speed lead
-at a close but stable gap no longer produces an absolute-ego-speed brake floor.
-
-### Hold release
-
-Once stopped, ten consecutive `shouldStop == false` control frames are required
-to leave hold. Any true frame resets the count. This removes one-frame brake
-blips while adding only `0.1 s` of confirmed launch delay.
+Stop landing is intentionally outside this branch. Standalone BLoTv2 uses stock
+longcontrol and publishes stock-style stop arbitration. The canonical
+`smooth-stops` branch owns final landing behavior when integrated into `combo`.
 
 ## Swift
 
@@ -287,7 +233,7 @@ field-test gates.
 
 The BLoTv2 tree has no `force_stops.py`, `ForceStops` planner member, or cruise
 speed cap. Conditional Experimental Mode replaces that strategy by selecting
-the already-existing e2e planner candidate; the planner, MPC, Smooth Stops,
+the already-existing e2e planner candidate; the planner, MPC, longcontrol,
 longitudinal PID, opendbc, and panda keep their existing responsibilities.
 When BLoTv2 is integrated into a tree that still contains the older Force Stops
 feature, its file, import, constructor hook, and `v_cruise` cap call must be
@@ -348,7 +294,7 @@ The full-resolution route was recorded on `combo` commit `c43e130059`. Three
 40-to-45 mph corrections reached approximately `1.31`, `1.64`, and
 `1.79 m/s²`. In the strongest event, cruise selected `1.79 m/s²` at `39.4 mph`
 for only a `5.4 mph` set-speed error; the planner target and final command
-matched, so this was not PID overshoot or Smooth Stops behavior.
+matched, so this was not PID overshoot or stop-landing behavior.
 
 The intermediate four-node revision limited the same 40 mph operating point
 to about `0.99 m/s²`. The current cubic envelope permits about `1.17 m/s²`
@@ -372,7 +318,7 @@ natural-coast estimate was only about `-0.36` to `-0.39 m/s²`.
 
 The source in each comparable window was cruise. The planner target and
 longitudinal command agreed, with no lead and Experimental mode off, so the
-behavior did not originate in Smooth Stops, MPC lead following, Conditional
+behavior did not originate in stop-landing control, MPC lead following, Conditional
 Experimental Mode, the curve-speed limiter, or an anomalous PID request. The
 cause was the cruise candidate's unity-gain speed error: a 5 mph error is large
 enough to saturate either the road-speed acceleration gate or the complete
@@ -451,14 +397,6 @@ mandatory field gate.
 Automated coverage includes:
 
 - finite/live lead construction and relative-motion physics;
-- stop-intent confirmation/release debounce and projected-MPC stop-tail
-  qualification;
-- limousine ramp, plateau, release, jerk bounds, and ordinary stronger-target
-  shaping;
-- explicit emergency pass-through and relative lead-collision floors;
-- anti-creep progress, noisy rolling-lead thresholds, radar dropout, and
-  stopped-to-moving queue transitions;
-- true-stop handoff and hold-release debounce;
 - Conditional Experimental entry filtering, release hysteresis, standstill
   latch, model-health failure, route-derived high-speed stop intent,
   highway-slowdown rejection, lead-dropout/curve/turn entry vetoes, pedal
@@ -479,6 +417,7 @@ See `BLoTv2_ACCEPTANCE.md` for remaining replay, device, and field gates.
 
 - replacing the Acados optimization problem;
 - overriding e2e acceleration or stop intent;
+- owning final stop landing or standstill handoff;
 - raising vehicle or panda safety limits;
 - changing the lateral controller;
 - classifying red lights or stop signs when the model publishes no such class;
