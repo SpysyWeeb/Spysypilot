@@ -59,12 +59,12 @@ bool stream_batch_has_data(const StreamExtractBatch &batch) {
 
 bool should_subscribe_stream_service(const std::string &name) {
   static const std::array<std::string_view, 13> kSkippedServices = {{
-    "roadEncodeIdx",
-    "driverEncodeIdx",
+    "narrowRoadEncodeIdx",
+    "cabinEncodeIdx",
     "wideRoadEncodeIdx",
     "qRoadEncodeIdx",
-    "roadEncodeData",
-    "driverEncodeData",
+    "narrowRoadEncodeData",
+    "cabinEncodeData",
     "wideRoadEncodeData",
     "qRoadEncodeData",
     "livestreamWideRoadEncodeIdx",

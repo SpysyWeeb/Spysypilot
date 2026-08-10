@@ -151,7 +151,7 @@ def source_message(service: str, cp: car.CarParams) -> object:
         steeringRequestFaultAvoidanceCounter=0,
       ),
     )
-  if service == "liveParameters":
+  if service == "vehicleParameters":
     return SimpleNamespace(
       valid=True,
       angleOffsetValid=True,
@@ -304,7 +304,7 @@ def extracted_fixture(
       payload=b"canonical-route-car-params",
     )
   add(
-    "liveTorqueParameters",
+    "lateralTorqueParameters",
     base - 4_000_000,
     payload=SimpleNamespace(
       liveValid=True, useParams=True, version=1,
@@ -314,7 +314,7 @@ def extracted_fixture(
     ),
   )
   add(
-    "liveDelay",
+    "lateralDelay",
     base - 3_000_000,
     payload=SimpleNamespace(lateralDelay=0.12, status="valid", version=1),
   )

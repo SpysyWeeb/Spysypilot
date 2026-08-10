@@ -5,7 +5,7 @@ the numerical BLaTv2 artifacts.  It retains no steering policy:
 
 * the raw model scalar and its published action timestamp are consumed as-is;
 * model and velocity trajectories must share the exact native time grid;
-* live rack mapping is built from one ``liveParameters`` snapshot;
+* live rack mapping is built from one ``vehicleParameters`` snapshot;
 * unsigned rack-rate magnitude is signed from measured angle motion;
 * rack acceleration is differentiated only across consecutive, signed
   carState sample gaps no larger than 15 ms; and

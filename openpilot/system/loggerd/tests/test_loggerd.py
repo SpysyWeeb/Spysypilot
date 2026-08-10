@@ -112,12 +112,12 @@ class TestLoggerd(OpenpilotTestCase):
     w, h = 320, 240
     frame_spec = (w, h, w * h * 3 // 2, w, w * h)
     streams = [
-      (VisionStreamType.VISION_STREAM_ROAD, frame_spec, "roadCameraState"),
-      (VisionStreamType.VISION_STREAM_DRIVER, frame_spec, "driverCameraState"),
+      (VisionStreamType.VISION_STREAM_ROAD, frame_spec, "narrowRoadCameraState"),
+      (VisionStreamType.VISION_STREAM_DRIVER, frame_spec, "cabinCameraState"),
       (VisionStreamType.VISION_STREAM_WIDE_ROAD, frame_spec, "wideRoadCameraState"),
     ]
 
-    sm = messaging.SubMaster(["roadEncodeData"])
+    sm = messaging.SubMaster(["narrowRoadEncodeData"])
     pm = messaging.PubMaster([s for _, _, s in streams] + ["rawAudioData"])
     vipc_server = VisionIpcServer("camerad")
     for stream_type, frame_spec, _ in streams:
@@ -128,7 +128,7 @@ class TestLoggerd(OpenpilotTestCase):
     os.environ["LOGGERD_SEGMENT_LENGTH"] = str(segment_length)
     managed_processes["loggerd"].start()
     managed_processes["encoderd"].start()
-    assert pm.wait_for_readers_to_update("roadCameraState", timeout=5)
+    assert pm.wait_for_readers_to_update("narrowRoadCameraState", timeout=5)
 
     fps = 20
     for n in range(1, int(num_segs * segment_length * fps) + 1):

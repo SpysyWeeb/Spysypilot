@@ -108,7 +108,7 @@ def build_vehicle_messages(cp: car.CarParams) -> tuple[object, ...]:
   selfdrive_state = log.SelfdriveState.new_message()
   selfdrive_state.active = True
 
-  live_parameters = log.LiveParametersData.new_message()
+  live_parameters = log.VehicleParameters.new_message()
   live_parameters.valid = True
   live_parameters.angleOffsetValid = True
   live_parameters.steerRatioValid = True
@@ -509,7 +509,7 @@ def test_step_uses_car_state_sample_and_direct_precompute_witness() -> None:
     "carControl": object(),
     "carOutput": object(),
     "selfdriveState": object(),
-    "liveParameters": object(),
+    "vehicleParameters": object(),
   }
 
   class FakeSubMaster:

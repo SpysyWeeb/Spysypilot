@@ -2,7 +2,7 @@
 
 This module owns no messaging, Params, filesystem, UI, planner, controller, or
 vehicle behavior. Car-state samples advance the episode state at 100 Hz. IMU
-samples are accepted only on real livePose updates and retain their own
+samples are accepted only on real deviceMotion updates and retain their own
 monotonic timestamps.
 """
 import math
@@ -249,7 +249,7 @@ class StopJoltDetector:
     self.standstill_time = None
 
   def update_imu(self, sample: StopJoltImuSample) -> None:
-    """Accept each livePose update once; duplicate/held timestamps are ignored."""
+    """Accept each deviceMotion update once; duplicate/held timestamps are ignored."""
     if not math.isfinite(sample.t) or sample.t <= self.last_imu_time:
       return
     self.last_imu_time = sample.t

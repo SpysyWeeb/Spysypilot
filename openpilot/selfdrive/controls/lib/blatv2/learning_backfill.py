@@ -165,7 +165,7 @@ _EVENT_WHICH = {
   "controlsState": 6,
   "carState": 21,
   "carControl": 22,
-  "liveParameters": 60,
+  "vehicleParameters": 60,
   "carParams": 67,
   "sentinel": 71,
   "carOutput": 125,
@@ -173,9 +173,9 @@ _EVENT_WHICH = {
   # ordinals; the two deprecated union slots preceding these fields are not
   # discriminants in the generated enum.
   "modelV2": 73,
-  "liveTorqueParameters": 92,
+  "lateralTorqueParameters": 92,
   "selfdriveState": 128,
-  "liveDelay": 144,
+  "lateralDelay": 144,
   "lateralManeuverPlan": 148,
   "drivingEvent": 151,
 }
@@ -183,12 +183,12 @@ _SOURCE_SERVICES = (
   "carControl",
   "carState",
   "carOutput",
-  "liveParameters",
+  "vehicleParameters",
 )
 _BEHAVIOR_CONTEXT_SERVICES = (
   "modelV2",
-  "liveTorqueParameters",
-  "liveDelay",
+  "lateralTorqueParameters",
+  "lateralDelay",
   "lateralManeuverPlan",
   "drivingEvent",
 )
@@ -2076,11 +2076,11 @@ def _copy_selected_payload(which: str, message: Any) -> Any:
     "carState": _copy_car_state,
     "carControl": _copy_car_control,
     "carOutput": _copy_car_output,
-    "liveParameters": _copy_live_parameters,
+    "vehicleParameters": _copy_live_parameters,
     "controlsState": _copy_controls_state,
     "modelV2": _copy_model,
-    "liveTorqueParameters": _copy_live_torque_parameters,
-    "liveDelay": _copy_live_delay,
+    "lateralTorqueParameters": _copy_live_torque_parameters,
+    "lateralDelay": _copy_live_delay,
     "lateralManeuverPlan": _copy_lateral_maneuver_plan,
     "drivingEvent": _copy_driving_event,
   }
@@ -2425,7 +2425,7 @@ def _build_canonical_control_joins(
         if not isinstance(parameters, _RecordedLiveParameters):
           raise RouteRejected(
             "measurement_race_unreconstructable",
-            "liveParameters compact payload has an invalid type",
+            "vehicleParameters compact payload has an invalid type",
           )
         calculated = _evaluate_recorded_curvature(
           vehicle_model,
@@ -2720,13 +2720,13 @@ def _reconstruct_live_torque_health(
   if not latest.valid:
     return False, True  # all_valid is false regardless of alive/frequency
   recent_interval_count = max(
-    int(SERVICE_LIST["liveTorqueParameters"].frequency),
+    int(SERVICE_LIST["lateralTorqueParameters"].frequency),
     1,
   )
   if publication_index < recent_interval_count:
     return False, False  # unknown history may still occupy the recent window
   nominal_poll_jitter_ns = MAXIMUM_CONTROL_GAP_NS
-  alive_limit_ns = int(10e9 / SERVICE_LIST["liveTorqueParameters"].frequency)
+  alive_limit_ns = int(10e9 / SERVICE_LIST["lateralTorqueParameters"].frequency)
   age_ns = poll_mono_ns - latest.mono_ns
   if age_ns < 0:
     return False, False
@@ -2798,11 +2798,11 @@ def _route_evidence_artifact(
     key=lambda record: (record.mono_ns, record.segment_index, record.ordinal),
   ))
   torque_raw = tuple(sorted(
-    route_records["liveTorqueParameters"],
+    route_records["lateralTorqueParameters"],
     key=lambda record: (record.mono_ns, record.segment_index, record.ordinal),
   ))
   delay_raw = tuple(sorted(
-    route_records["liveDelay"],
+    route_records["lateralDelay"],
     key=lambda record: (record.mono_ns, record.segment_index, record.ordinal),
   ))
   maneuver_raw = tuple(sorted(
@@ -3571,7 +3571,7 @@ def _prepare_route_with_extractor(
       controls=tuple(route_records["controlsState"]),
       polls=tuple(route_records["selfdriveState"]),
       car_states=tuple(route_records["carState"]),
-      live_parameters=tuple(route_records["liveParameters"]),
+      live_parameters=tuple(route_records["vehicleParameters"]),
       car_outputs=tuple(route_records["carOutput"]),
       car_controls=tuple(route_records["carControl"]),
       vehicle_model=VehicleModel(route_car_params),

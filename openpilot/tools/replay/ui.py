@@ -76,13 +76,13 @@ def ui_thread(addr):
       'longitudinalPlan',
       'carControl',
       'radarState',
-      'liveCalibration',
+      'extrinsicsCalibration',
       'controlsState',
       'selfdriveState',
-      'liveTracks',
+      'radarTracks',
       'modelV2',
-      'liveParameters',
-      'roadCameraState',
+      'vehicleParameters',
+      'narrowRoadCameraState',
     ],
     addr=addr,
   )
@@ -152,7 +152,7 @@ def ui_thread(addr):
 
     sm.update(0)
 
-    camera = DEVICE_CAMERAS[("tici", str(sm['roadCameraState'].sensor))]
+    camera = DEVICE_CAMERAS[("tici", str(sm['narrowRoadCameraState'].sensor))]
     calib_scale = camera.fcam.width / 640.0
 
     if camera_view.frame:
@@ -195,10 +195,10 @@ def ui_thread(addr):
       plot_lead(sm['radarState'], top_down)
 
     # draw all radar points
-    maybe_update_radar_points(sm['liveTracks'].points, top_down[1])
+    maybe_update_radar_points(sm['radarTracks'].points, top_down[1])
 
-    if sm.updated['liveCalibration'] and num_px:
-      rpyCalib = np.asarray(sm['liveCalibration'].rpyCalib)
+    if sm.updated['extrinsicsCalibration'] and num_px:
+      rpyCalib = np.asarray(sm['extrinsicsCalibration'].rpyCalib)
       calibration = Calibration(num_px, rpyCalib, intrinsic_matrix, calib_scale)
 
     # Update overlay texture (RGB img -> RGBA with non-black pixels visible)
@@ -232,10 +232,10 @@ def ui_thread(addr):
       ("LONG CONTROL STATE: " + str(sm['controlsState'].longControlState), YELLOW),
       ("LONG MPC SOURCE: " + str(sm['longitudinalPlan'].longitudinalPlanSource), YELLOW),
       None,
-      ("ANGLE OFFSET (AVG): " + str(round(sm['liveParameters'].angleOffsetAverageDeg, 2)) + " deg", YELLOW),
-      ("ANGLE OFFSET (INSTANT): " + str(round(sm['liveParameters'].angleOffsetDeg, 2)) + " deg", YELLOW),
-      ("STIFFNESS: " + str(round(sm['liveParameters'].stiffnessFactor * 100.0, 2)) + " %", YELLOW),
-      ("STEER RATIO: " + str(round(sm['liveParameters'].steerRatio, 2)), YELLOW),
+      ("ANGLE OFFSET (AVG): " + str(round(sm['vehicleParameters'].angleOffsetAverageDeg, 2)) + " deg", YELLOW),
+      ("ANGLE OFFSET (INSTANT): " + str(round(sm['vehicleParameters'].angleOffsetDeg, 2)) + " deg", YELLOW),
+      ("STIFFNESS: " + str(round(sm['vehicleParameters'].stiffnessFactor * 100.0, 2)) + " %", YELLOW),
+      ("STEER RATIO: " + str(round(sm['vehicleParameters'].steerRatio, 2)), YELLOW),
     ]
 
     for i, line in enumerate(lines):

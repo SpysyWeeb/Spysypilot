@@ -19,7 +19,7 @@ def fresh_stock_torque_controller(CP, CI, live_torque_params=None):
   """Construct fully reset stock hidden state, optionally with one live tune."""
   controller = LatControlTorque(CP, CI, DT_CTRL)
   if live_torque_params is not None and live_torque_params.useParams:
-    controller.update_live_torque_params(
+    controller.update_torque_parameters(
       live_torque_params.latAccelFactorFiltered,
       live_torque_params.latAccelOffsetFiltered,
       live_torque_params.frictionCoefficientFiltered,

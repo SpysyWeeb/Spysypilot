@@ -83,12 +83,12 @@ TIMINGS = {
   "controlsState": [2.5, 0.35],
   "longitudinalPlan": [2.5, 0.5],
   "driverAssistance": [2.5, 0.5],
-  "roadCameraState": [2.5, 0.35],
-  "driverCameraState": [2.5, 0.35],
+  "narrowRoadCameraState": [2.5, 0.35],
+  "cabinCameraState": [2.5, 0.35],
   "modelV2": [2.5, 0.35],
   "driverStateV2": [2.5, 0.40],
-  "livePose": [2.5, 0.35],
-  "liveParameters": [2.5, 0.35],
+  "deviceMotion": [2.5, 0.35],
+  "vehicleParameters": [2.5, 0.35],
   "wideRoadCameraState": [1.5, 0.35],
 }
 
@@ -305,7 +305,7 @@ class TestOnroad(OpenpilotTestCase):
     result += "------------------------------------------------\n"
     result += "-----------------  SOF Timing ------------------\n"
     result += "------------------------------------------------\n"
-    for name in ['roadCameraState', 'wideRoadCameraState', 'driverCameraState']:
+    for name in ['narrowRoadCameraState', 'wideRoadCameraState', 'cabinCameraState']:
       ts = self.ts[name]['timestampSof']
       d_ms = np.diff(ts) / 1e6
       d50 = np.abs(d_ms-50)
@@ -318,8 +318,8 @@ class TestOnroad(OpenpilotTestCase):
     print(result)
 
   def test_camera_sync(self, subtests):
-    cam_states = ['roadCameraState', 'wideRoadCameraState', 'driverCameraState']
-    encode_cams = ['roadEncodeIdx', 'wideRoadEncodeIdx', 'driverEncodeIdx']
+    cam_states = ['narrowRoadCameraState', 'wideRoadCameraState', 'cabinCameraState']
+    encode_cams = ['narrowRoadEncodeIdx', 'wideRoadEncodeIdx', 'cabinEncodeIdx']
     for cams in (cam_states, encode_cams):
       with subtests.test(cams=cams):
         # sanity checks within a single cam
@@ -356,9 +356,9 @@ class TestOnroad(OpenpilotTestCase):
 
   def test_camera_encoder_matches(self, subtests):
     # sanity check that the frame metadata is consistent with the encoded frames
-    pairs = [('roadCameraState', 'roadEncodeIdx'),
+    pairs = [('narrowRoadCameraState', 'narrowRoadEncodeIdx'),
              ('wideRoadCameraState', 'wideRoadEncodeIdx'),
-             ('driverCameraState', 'driverEncodeIdx')]
+             ('cabinCameraState', 'cabinEncodeIdx')]
     for cam, enc in pairs:
       with subtests.test(camera=cam, encoder=enc):
         cam_frames = {fid: (sof, eof) for fid, sof, eof in zip(

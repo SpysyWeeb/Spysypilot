@@ -421,7 +421,7 @@ class TestBLaTv2Reference(unittest.TestCase):
   def test_reference_has_no_implicit_timing_or_smoothing_dependency(self) -> None:
     source = inspect.getsource(reference_module)
     self.assertNotIn("LAT_SMOOTH_SECONDS", source)
-    self.assertNotIn("liveDelay", source)
+    self.assertNotIn("lateralDelay", source)
     self.assertNotIn("DT_MDL", source)
 
   def test_published_action_time_is_independent_of_plant_delay(self) -> None:

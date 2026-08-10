@@ -18,8 +18,8 @@ V4L2_BUF_FLAG_KEYFRAME = 8
 # then run this "./compressed_vipc.py <ip>"
 
 ENCODE_SOCKETS = {
-  VisionStreamType.VISION_STREAM_ROAD: "roadEncodeData",
-  VisionStreamType.VISION_STREAM_DRIVER: "driverEncodeData",
+  VisionStreamType.VISION_STREAM_ROAD: "narrowRoadEncodeData",
+  VisionStreamType.VISION_STREAM_DRIVER: "cabinEncodeData",
   VisionStreamType.VISION_STREAM_WIDE_ROAD: "wideRoadEncodeData",
 }
 

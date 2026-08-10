@@ -1062,16 +1062,16 @@ def rolling_lead_sample(sm: messaging.SubMaster) -> RollingLeadSample:
 
 
 def live_pose_sample(sm: messaging.SubMaster, bump_classifier: RoadBumpClassifier) -> StopJoltImuSample:
-  """Sample IMU once per actual livePose update, using livePose's timestamp."""
-  live_pose = sm["livePose"]
+  """Sample IMU once per actual deviceMotion update, using deviceMotion's timestamp."""
+  live_pose = sm["deviceMotion"]
   acceleration = live_pose.accelerationDevice
-  now = sm.logMonoTime["livePose"] * 1e-9
+  now = sm.logMonoTime["deviceMotion"] * 1e-9
   accel_x = float(acceleration.x)
   accel_z = float(acceleration.z)
   accel_x_valid = bool(acceleration.valid and math.isfinite(accel_x))
   accel_z_valid = bool(acceleration.valid and math.isfinite(accel_z))
   imu_valid = bool(
-    sm.valid["livePose"]
+    sm.valid["deviceMotion"]
     and accel_x_valid
     and live_pose.inputsOK
     and live_pose.sensorsOK
@@ -1227,7 +1227,7 @@ def main() -> None:
   ack_sock = messaging.sub_sock("drivingEventRecorded", conflate=False)
   sm = messaging.SubMaster(
     ["bookmarkButton", "carState", "carControl", "carOutput", "controlsState",
-     "radarState", "longitudinalPlan", "modelV2", "livePose"],
+     "radarState", "longitudinalPlan", "modelV2", "deviceMotion"],
   )
   platform = DrivingEventPlatform()
   submitter = EventSubmitter(pm, git_commit, git_branch)
@@ -1247,7 +1247,7 @@ def main() -> None:
 
     controls_updated = bool(sm.updated["controlsState"])
     car_state_updated = bool(sm.updated["carState"])
-    live_pose_updated = bool(sm.updated["livePose"])
+    live_pose_updated = bool(sm.updated["deviceMotion"])
     bookmark_updated = bool(sm.updated["bookmarkButton"])
     imu_sample = live_pose_sample(sm, bump_classifier) if live_pose_updated else None
     if imu_sample is not None:

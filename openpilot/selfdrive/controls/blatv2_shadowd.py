@@ -16,7 +16,7 @@ Model timing is consumed without controller-side reconstruction:
 * a direct monotonic capture immediately before core computation is the
   controller witness.
 
-No ``LAT_SMOOTH_SECONDS``, ``DT_MDL``, or ``liveDelay`` value participates in
+No ``LAT_SMOOTH_SECONDS``, ``DT_MDL``, or ``lateralDelay`` value participates in
 the timing contract.
 """
 
@@ -79,7 +79,7 @@ SUBSCRIBED_SERVICES = (
   "carOutput",
   "selfdriveState",
   "controlsState",
-  "liveParameters",
+  "vehicleParameters",
 )
 PROVISIONAL_RACK_DYNAMICS_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_rack_dynamics.json"
 PROVISIONAL_POLICY_PATH = Path(__file__).resolve().parent / "lib" / "blatv2" / "provisional_controller_policy.json"
@@ -992,7 +992,7 @@ class BlatV2Shadow:
       car_control=self.sm["carControl"],
       car_output=self.sm["carOutput"],
       selfdrive_state=self.sm["selfdriveState"],
-      live_parameters=self.sm["liveParameters"],
+      live_parameters=self.sm["vehicleParameters"],
       model_message_valid=bool(
         model_resolved and self.model_selector.selected_valid,
       ),
@@ -1002,7 +1002,7 @@ class BlatV2Shadow:
       vehicle_inputs_valid=self._checks(self.sm, vehicle_services),
       live_parameters_inputs_valid=self._checks(
         self.sm,
-        ("liveParameters",),
+        ("vehicleParameters",),
       ),
     )
     compute_time_seconds = time.perf_counter() - start

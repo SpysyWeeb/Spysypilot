@@ -840,14 +840,14 @@ def test_live_pose_sampler_uses_its_own_timestamp_and_updates_bump_once():
   class FakeSubMaster:
     def __init__(self):
       self.data = {
-        "livePose": SimpleNamespace(
+        "deviceMotion": SimpleNamespace(
           accelerationDevice=SimpleNamespace(x=-0.8, z=9.9, valid=True),
           inputsOK=True,
           sensorsOK=True,
         ),
       }
-      self.valid = {"livePose": True}
-      self.logMonoTime = {"livePose": 2_500_000_000, "carState": 9_000_000_000}
+      self.valid = {"deviceMotion": True}
+      self.logMonoTime = {"deviceMotion": 2_500_000_000, "carState": 9_000_000_000}
 
     def __getitem__(self, name):
       return self.data[name]
