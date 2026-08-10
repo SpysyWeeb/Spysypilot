@@ -62,14 +62,14 @@ bool should_subscribe_stream_service(const std::string &name) {
     "narrowRoadEncodeIdx",
     "cabinEncodeIdx",
     "wideRoadEncodeIdx",
-    "qRoadEncodeIdx",
+    "qNarrowRoadEncodeIdx",
     "narrowRoadEncodeData",
     "cabinEncodeData",
     "wideRoadEncodeData",
-    "qRoadEncodeData",
+    "qNarrowRoadEncodeData",
     "livestreamWideRoadEncodeIdx",
-    "livestreamRoadEncodeIdx",
-    "livestreamDriverEncodeIdx",
+    "livestreamNarrowRoadEncodeIdx",
+    "livestreamCabinEncodeIdx",
     "thumbnail",
   }};
   if (name == "rawAudioData") return false;

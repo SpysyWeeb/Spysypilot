@@ -74,7 +74,7 @@ _services: dict[str, tuple] = {
   "drivingModelData": (True, 20., 10),
   "modelV2": (True, 20., None, QueueSize.BIG),
   "managerState": (True, 2., 1),
-  "qRoadEncodeIdx": (False, 20.),
+  "qNarrowRoadEncodeIdx": (False, 20.),
   "userBookmark": (True, 0., 1),
   "soundPressure": (True, 10., 10),
   "rawAudioData": (False, 20.),
@@ -82,18 +82,18 @@ _services: dict[str, tuple] = {
   "narrowRoadEncodeData": (False, 20., None, QueueSize.BIG),
   "cabinEncodeData": (False, 20., None, QueueSize.BIG),
   "wideRoadEncodeData": (False, 20., None, QueueSize.BIG),
-  "qRoadEncodeData": (False, 20., None, QueueSize.BIG),
+  "qNarrowRoadEncodeData": (False, 20., None, QueueSize.BIG),
 
   # debug
   "uiDebug": (True, 0., 1),
   "testJoystick": (True, 0.),
   "alertDebug": (True, 20., 5),
   "livestreamWideRoadEncodeIdx": (False, 20.),
-  "livestreamRoadEncodeIdx": (False, 20.),
-  "livestreamDriverEncodeIdx": (False, 20.),
+  "livestreamNarrowRoadEncodeIdx": (False, 20.),
+  "livestreamCabinEncodeIdx": (False, 20.),
   "livestreamWideRoadEncodeData": (False, 20., None, QueueSize.MEDIUM),
-  "livestreamRoadEncodeData": (False, 20., None, QueueSize.MEDIUM),
-  "livestreamDriverEncodeData": (False, 20., None, QueueSize.MEDIUM),
+  "livestreamNarrowRoadEncodeData": (False, 20., None, QueueSize.MEDIUM),
+  "livestreamCabinEncodeData": (False, 20., None, QueueSize.MEDIUM),
   "customReservedRawData0": (True, 0.),
 }
 SERVICE_LIST = {name: Service(*vals) for
