@@ -1,36 +1,23 @@
 #!/usr/bin/env python3
 import math
 from numbers import Number
-import os
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
-from openpilot.common.basedir import BASEDIR
 from openpilot.common.constants import CV
-from openpilot.common.git import get_commit
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, DT_CTRL, Priority, Ratekeeper
 from openpilot.common.swaglog import cloudlog
-from openpilot.common.version import get_build_metadata
 
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
-from openpilot.selfdrive.controls.lib.blatv2.bootstrap import ControllerSelection
-from openpilot.selfdrive.controls.lib.blatv2.live_controller import (
-  construct_modular_live_controller,
-)
-from openpilot.selfdrive.controls.lib.blatv2.live_telemetry import (
-  build_modular_lateral_state,
-)
-from openpilot.selfdrive.controls.lib.blatv2.stock_bootstrap import (
-  fresh_stock_torque_controller,
-)
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
@@ -116,44 +103,7 @@ class Controls:
     elif self.lateral_tuning_type == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.is_torque_lateral:
-      self.LaC = fresh_stock_torque_controller(self.CP, self.CI)
-
-    # Optional modular construction is process-start-only. No approved
-    # artifact exists on a fresh install, so the exact stock controller above
-    # remains the sole actuator unless profiled has prepared an exact active
-    # artifact or the explicit development-trial parameter is enabled.
-    try:
-      source_openpilot_commit = (
-        get_build_metadata().openpilot.git_commit
-      )
-    except Exception:
-      source_openpilot_commit = ""
-    try:
-      opendbc_commit = get_commit(os.path.join(BASEDIR, "opendbc_repo"))
-    except Exception:
-      opendbc_commit = ""
-    try:
-      panda_commit = get_commit(os.path.join(BASEDIR, "panda"))
-    except Exception:
-      panda_commit = ""
-    self.blatv2_live = construct_modular_live_controller(
-      car_params=self.CP,
-      car_interface=self.CI,
-      params=self.params,
-      source_openpilot_commit=source_openpilot_commit,
-      opendbc_commit=opendbc_commit,
-      panda_commit=panda_commit,
-    )
-    self.lateral_maneuver_mode = self.params.get_bool(
-      "LateralManeuverMode",
-    )
-    self.blatv2_messages_valid = True
-    self.blatv2_modular_session = False
-    cloudlog.info(
-      f"BLaTv2 modular bootstrap: eligibility={int(self.blatv2_live.eligibility)} " +
-      f"experimental={self.blatv2_live.experimental_active} " +
-      f"runtime_identity={self.blatv2_live.runtime_identity_sha256}"
-    )
+      self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
 
     self.controls_ext = ControlsExt()
 
@@ -198,62 +148,6 @@ class Controls:
     )
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
-    # Bind one controller architecture at the AOL/MADS lateral-session
-    # boundary (enabled OR latActive). An exact
-    # torqueOutputCan count plus the emitted steering-request witness are the
-    # actuator Markov state accepted by the modular path; failure leaves a new
-    # engagement on exact stock.
-    self.blatv2_live.observe_previous_applied(
-      self.sm['carOutput'],
-      car_output_mono_ns=int(self.sm.logMonoTime['carOutput']),
-    )
-    lateral_maneuver_active = bool(
-      self.lateral_maneuver_mode
-      or self.sm.valid['lateralManeuverPlan']
-    )
-    controller_selection = self.blatv2_live.update_engagement(
-      enabled=CC.enabled,
-      lateral_active=CC.latActive,
-      lateral_maneuver_active=lateral_maneuver_active,
-    )
-    if not CC.enabled and not CC.latActive:
-      self.blatv2_live.observe_inactive_state(
-        state_sample_mono_ns=int(self.sm.logMonoTime['carState']),
-        car_state=CS,
-        live_parameters=self.sm['liveParameters'],
-        inputs_valid=bool(
-          self.sm.seen['carState']
-          and self.sm.valid['carState']
-          and CS.canValid
-        ),
-        live_parameters_inputs_valid=bool(
-          self.sm.seen['liveParameters']
-          and self.sm.valid['liveParameters']
-        ),
-      )
-    if (
-      controller_selection == ControllerSelection.MODULAR
-      and not self.blatv2_modular_session
-    ):
-      # A stock controller that is merely left idle retains its PID integral,
-      # jerk filter, and request deque. Reconstruct it at the modular boundary
-      # so a later rollback starts from a genuinely fresh stock state rather
-      # than hours-old hidden state. This object never actuates this session.
-      torque_params = self.sm['liveTorqueParameters']
-      self.LaC = fresh_stock_torque_controller(
-        self.CP,
-        self.CI,
-        (
-          torque_params
-          if self.sm.all_checks(['liveTorqueParameters'])
-          else None
-        ),
-      )
-      self.desired_curvature = self.curvature
-      self.blatv2_modular_session = True
-    elif not self.blatv2_live.enabled_bound:
-      self.blatv2_modular_session = False
-
     actuators = CC.actuators
     actuators.longControlState = self.LoC.long_control_state
 
@@ -282,75 +176,24 @@ class Controls:
       lead,
     ))
 
-    # Steering controller. The STOCK arm below is the existing stock block:
-    # modular state, exceptions, and telemetry never participate in it.
-    if controller_selection == ControllerSelection.STOCK:
-      # Reset desired curvature to current to avoid violating the limits on engage
-      if self.sm.valid['lateralManeuverPlan']:
-        new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
-      else:
-        new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-      self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
-      lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
-
-      actuators.curvature = self.desired_curvature
-      steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
-                                                       self.steer_limited_by_safety, self.desired_curvature,
-                                                       curvature_limited, lat_delay)
-      actuators.torque = float(steer)
-      if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
-        actuators.curvature = float(lateral_output)
-      else:
-        actuators.steeringAngleDeg = float(lateral_output)
-      self.blatv2_messages_valid = True
+    # Steering PID loop and lateral MPC
+    # Reset desired curvature to current to avoid violating the limits on engage
+    if self.sm.valid['lateralManeuverPlan']:
+      new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
-      result = self.blatv2_live.update_modular(
-        state_sample_mono_ns=int(self.sm.logMonoTime['carState']),
-        model_publication_mono_ns=int(self.sm.logMonoTime['modelV2']),
-        model_message=model_v2,
-        car_state=CS,
-        live_parameters=lp,
-        model_message_valid=bool(self.sm.valid['modelV2']),
-        model_message_alive=bool(self.sm.alive['modelV2']),
-        vehicle_inputs_valid=bool(
-          self.sm.all_checks(['carState', 'carOutput'])
-          and CS.canValid
-        ),
-        live_parameters_inputs_valid=bool(
-          self.sm.all_checks(['liveParameters'])
-        ),
-        lateral_active=CC.latActive,
-        actuator_constrained_previous=(
-          not self.blatv2_live.final_count_match_valid
-          or self.blatv2_live.final_limiter_altered
-        ),
-        lateral_maneuver_active=lateral_maneuver_active,
-      )
-      core_result = result.core_result
-      reference_curvature = (
-        float(model_v2.action.desiredCurvature)
-        if core_result is None
-        else float(core_result.desired_curvature)
-      )
-      self.desired_curvature = (
-        reference_curvature
-        if math.isfinite(reference_curvature)
-        else self.curvature
-      )
-      actuators.curvature = self.desired_curvature
-      actuators.torque = float(
-        result.command_torque if result.command_available else 0.0
-      )
-      actuators.steeringAngleDeg = float(
-        0.0 if core_result is None else core_result.desired_angle_deg
-      )
-      lac_log = build_modular_lateral_state(
-        self.blatv2_live,
-        lateral_active=CC.latActive,
-        measured_curvature=self.curvature,
-        v_ego_m_s=CS.vEgo,
-      )
-      self.blatv2_messages_valid = self.blatv2_live.messages_valid
+      new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+    self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
+    lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+
+    actuators.curvature = self.desired_curvature
+    steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                     self.steer_limited_by_safety, self.desired_curvature,
+                                                     curvature_limited, lat_delay)
+    actuators.torque = float(steer)
+    if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
+      actuators.curvature = float(lateral_output)
+    else:
+      actuators.steeringAngleDeg = float(lateral_output)
     # Ensure no NaNs/Infs
     for p in ACTUATOR_FIELDS:
       attr = getattr(actuators, p)
@@ -360,12 +203,6 @@ class Controls:
       if not math.isfinite(attr):
         cloudlog.error(f"actuators.{p} not finite {actuators.to_dict()}")
         setattr(actuators, p, 0.0)
-
-    if controller_selection == ControllerSelection.MODULAR:
-      self.blatv2_live.record_requested_command(
-        actuators.torque,
-        lateral_active=CC.latActive,
-      )
 
     return CC, lac_log
 
@@ -397,24 +234,17 @@ class Controls:
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    # AOL can steer while selfdriveState is inactive. Keep limiter feedback
-    # live whenever lateral control is active, using BLaTv2's exact-send
-    # witness when the modular architecture owns this session.
-    if CC.latActive and self.blatv2_live.selection == ControllerSelection.MODULAR:
-      self.steer_limited_by_safety = (
-        not self.blatv2_live.final_count_match_valid
-        or self.blatv2_live.final_limiter_altered
-      )
-    else:
-      self.steer_limited_by_safety = get_steer_limited_by_safety(
-        self.CP,
-        CC,
-        self.sm['carOutput'],
-      )
+    # AOL can steer while selfdriveState is inactive, so keep stock limiter
+    # feedback live whenever lateral control is active.
+    self.steer_limited_by_safety = get_steer_limited_by_safety(
+      self.CP,
+      CC,
+      self.sm['carOutput'],
+    )
 
     # controlsState
     dat = messaging.new_message('controlsState')
-    dat.valid = CS.canValid and self.blatv2_messages_valid
+    dat.valid = CS.canValid
     cs = dat.controlsState
 
     cs.curvature = self.curvature
@@ -444,7 +274,7 @@ class Controls:
 
     # carControl
     cc_send = messaging.new_message('carControl')
-    cc_send.valid = CS.canValid and self.blatv2_messages_valid
+    cc_send.valid = CS.canValid
     cc_send.carControl = CC
     self.pm.send('carControl', cc_send)
 

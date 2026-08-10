@@ -70,72 +70,19 @@ not closed-loop or field validation. Design and remaining gates are documented
 in [`docs/BLoTv2.md`](docs/BLoTv2.md#route-000000d9--6040563d1d-ordinary-cruise-comfort-refinement)
 and [`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
 
-## BLaTv2 modular replacement
+## BLaTv2 archive
 
-**BLaTv2/Combo OWNER FIELD TUNE — EXPERIMENTAL, PROVISIONAL, AND UNQUALIFIED — PALISADE ONLY — STOCK BY DEFAULT**
+**Status: reverted from `combo`; stock lateral control restored.** `controlsd`
+constructs and updates openpilot's stock `LatControlTorque` directly. The former
+`BLaTv2ExperimentalController` activation key and post-drive BLaTv2 feedback
+prompt are removed, so no BLaTv2 controller can own steering on `combo`.
 
-For an owner-supervised trial, set the development-only
-`BLaTv2ExperimentalController` Bool offroad before `controlsd` starts, and
-clear it offroad before restarting controls to return to stock. It remains
-disabled by default. Begin on a closed, low-speed course and expand the test
-only while steering remains predictable. Accept a trial window only when its
-`controlsState.lateralControlState.torqueState` reports `modularSelection == 1`,
-`modularSelectionBound == true`, and `modularBindingReason == 0`; otherwise stop
-that pass and do not treat its stock-controller frames as BLaTv2 evidence.
-
-**Status: in progress; owner-supervised Palisade field tuning.** The previous
-LQI controller is retired. LQI means “Linear Quadratic
-Integral”: state feedback with an integral-error state. The replacement is a
-modular learning system aimed at **Smooth. Swift. Strong.**, but this milestone
-does not create an approved profile or automatic activation path. The explicit
-development parameter selects the provisional Palisade tune as the sole
-steering controller for that lateral session; otherwise stock remains the sole
-controller. The validated Palisade/Telluride uses the runtime-selected 409/4/7
-opendbc/panda envelope; every other vehicle keeps the limits supplied by its
-own `CarControllerParams`.
-
-The comma now has one role in learning: ordinary loggerd records full rlogs.
-No BLaTv2 learner, route replay worker, uploader, Wi-Fi bridge, or processing
-fallback runs in the device manager graph. Closed routes are copied manually
-over read-only SSH into durable PC storage. Historical replay, deterministic
-A/A verification, physical learning, behavioral qualification, and immutable
-candidate generation all run on the PC from a clean, commit-pinned checkout.
-The retired bridge cannot publish Params, install a profile, or activate a
-controller.
-
-Physical calibration and behavioral qualification are deliberately separate.
-The physical learner estimates only observable quantities—torque per measured
-lateral acceleration, signed offset, moving friction, and static breakaway—at
-0/5/10/15/20/30 m/s. Samples update adjacent nodes only, interpolation requires
-support on both sides, and seed retention is a valid qualified result; long
-highway drives therefore cannot erase low-speed knowledge. Support, numerical
-rank/conditioning, training, held-route validation, and full-authority evidence
-are reported independently. Each canonical route counter owns its complete
-partition (even training, odd validation), and learning-status schema 4
-accounts for every prepared frame as accepted or one explicit first rejection
-cause. Eighteen retained routes reproduced byte-identically in two independent
-passes; the 0–20 m/s nodes safely retained their seeds, while 30 m/s remains one
-held-out breakaway episode short, so no candidate was emitted.
-
-The behavior learner consumes a homogeneous, immutable route cohort (at least
-four whole routes) and replays exact stock, incumbent, and candidate controllers
-against the same inputs. It may adjust only global natural frequency and
-damping, then must independently satisfy the Smooth, Swift, and Strong gates on
-held-out routes. Driver interventions censor contaminated evidence rather than
-voting a candidate up or down, and event logs locate windows but never define
-the desired path. A complete physical fit or passing behavior candidate remains
-informational: neither can populate an approved artifact or change actuation
-without a later, separately reviewed activation phase.
-
-The retired learner/readiness dashboard has been removed because the device no
-longer owns learning state. The home panel retains the live terminal and system
-usage views. The post-drive feedback prompt remains available for a future
-manually installed, PC-generated profile; it cannot train, approve, or activate
-one.
-
-No BLaTv1 controller code or `HyundaiLowSpeedTorqueDamping` is inherited. Full
-module boundaries, evidence contracts, process-safety rules, trust boundaries,
-gates, and rollback behavior are documented in
+The BLaTv2 branch, commits, source modules, tests, route evidence, and design
+documents remain available as historical research. They are intentionally kept
+out of the live command path rather than deleted or rewritten. Any future
+Palisade work restarts from stock torque control and adds only a small,
+evidence-backed intervention after route analysis identifies a falsifiable
+cause. Existing research contracts are documented in
 [`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
 [`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
 
@@ -163,7 +110,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
 - ⚠️ **[Universal driving-event logger](https://github.com/SpysyWeeb/Spysypilot/tree/driving-event-platform)** — one rlog-first platform records automatic lateral and longitudinal failures plus general manual bookmarks, confirms preservation before showing UI success, and builds a bounded/reconstructable SSH manifest; lateral detector v7 adds b7-derived unused-authority and confirmed-driver-takeover events and remains in field validation; see [docs/DrivingEventPlatform.md](docs/DrivingEventPlatform.md) &nbsp;*(personal idea)*
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
-- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — Palisade contextual controller field trial in progress; archived routes select one bounded, speed-scheduled inverse-rack candidate, which remains explicitly provisional and can run only through a Palisade-only development parameter read at controls startup; stock remains the default and no background learner or second live controller runs on the device &nbsp;*(personal idea; awaiting owner field validation)*
+- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — archived research branch; its live controller and activation path are reverted from `combo`, which now uses stock `LatControlTorque` exclusively. Route analysis continues before any small stock-plus Palisade experiment is proposed &nbsp;*(personal idea; in progress)*
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

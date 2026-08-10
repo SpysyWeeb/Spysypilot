@@ -207,13 +207,7 @@ class Car:
 
     # publish new carOutput
     co_send = messaging.new_message('carOutput')
-    # carControl.valid carries controller health; carOutput records the
-    # guarded command card actually consumes and must remain recoverable.
-    co_send.valid = (
-      CS.canValid
-      and self.sm.all_alive(['carControl'])
-      and self.sm.all_freq_ok(['carControl'])
-    )
+    co_send.valid = self.sm.all_checks(['carControl'])
     co_send.carOutput.actuatorsOutput = self.last_actuators_output
     self.pm.send('carOutput', co_send)
 
