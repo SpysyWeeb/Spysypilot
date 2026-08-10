@@ -20,11 +20,12 @@ Every test report must identify:
 ## Foundation gate
 
 - [x] Branch created from current untouched `stock`.
-- [x] Feature changes are authored on `BLoTv2` before `combo` integration.
+- [x] BLoTv2-owned changes are authored on `BLoTv2` before `combo` integration;
+  Smooth Stops changes are authored on `smooth-stops`.
 - [x] Shared live/finite lead contract.
 - [x] Relative lead-physics unit coverage.
-- [x] Smooth Stops rolling-queue/dropout transition coverage.
-- [x] Stronger planner braking pass-through coverage.
+- [x] Integrated `smooth-stops` rolling-queue/dropout transition coverage.
+- [x] Integrated `smooth-stops` stronger-planner-braking pass-through coverage.
 - [x] MPC supervisor trigger, emergency, and slew coverage.
 - [x] Model lead trajectory shape/finite/fallback coverage.
 - [x] Low-speed radar override qualification coverage.
@@ -53,8 +54,8 @@ Every test report must identify:
 Replay must use the real production classes, not copied equations.
 
 - [ ] Baseline and BLoTv2 replay the same route timelines.
-- [ ] Smooth-stop routes cover no lead, stopped lead, and creeping queue.
-- [ ] Rolling-lead noise and radar-dropout motivating windows are reviewed.
+- [ ] Integrated Smooth Stops routes cover no lead, stopped lead, and creeping queue.
+- [ ] Integrated Smooth Stops rolling-lead noise and radar-dropout windows are reviewed.
 - [ ] Mild lead-braking onset improves without early phantom braking.
 - [ ] Hard lead braking has no collision-distance or peak-decel regression.
 - [ ] `4.0 m/s²` launch response improves without lunge-and-catch behavior.

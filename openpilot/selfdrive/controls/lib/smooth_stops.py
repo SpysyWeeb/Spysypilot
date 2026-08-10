@@ -1,4 +1,4 @@
-"""BLoTv2 final-approach and standstill-handoff controller.
+"""Smooth Stops final-approach and standstill-handoff controller.
 
 Smooth Stops owns only the last low-speed landing. The planner remains the
 collision-avoidance authority: any stronger planner braking passes through

@@ -5,14 +5,13 @@
 **In progress. Not field validated. Do not mark complete before owner field
 testing and explicit approval.**
 
-BLoTv2 starts from the untouched `stock` branch and deliberately reimplements
-the useful mechanisms from `BLoT` and `smooth-stops`. It is not based on
-`combo`, and it does not inherit either feature branch wholesale.
+BLoTv2 starts from the untouched `stock` branch and reimplements useful BLoT
+planner/MPC mechanisms. It does not implement stop landing; `combo` integrates
+that separately from the canonical `smooth-stops` branch.
 
 The product target is **Smooth. Swift. Strong.**
 
-- **Smooth:** continuous acceleration and jerk through lead following, braking,
-  final approach, hold, and release.
+- **Smooth:** continuous acceleration and jerk through cruise and lead following.
 - **Swift:** react promptly to real lead/model changes without stale trigger
   state, unnecessary solution stiffness, or hidden brake-release delay.
 - **Strong:** use the existing safe longitudinal envelope in proportion to
@@ -27,7 +26,7 @@ The product target is **Smooth. Swift. Strong.**
 | Lead trajectory and obstacle optimization | stock Acados longitudinal MPC |
 | MPC response cost and dynamic headway | `BLoTv2Supervisor` |
 | Cruise acceleration target | longitudinal planner |
-| Final rolling landing | `SmoothStopController` |
+| Final rolling landing | separate `smooth-stops` feature |
 | Standstill hold | stock `LongCtrlState.stopping` |
 | Acceleration tracking | stock longitudinal PID |
 | Effective Chill/Experimental mode | `selfdrived` |
@@ -93,7 +92,7 @@ The MPC supervisor adds measured lead braking to this term. Smooth Stops uses
 only closing deceleration because the planner remains the collision-avoidance
 owner.
 
-## Smooth
+## Integrated Smooth Stops
 
 ### Entry-anchored landing
 
@@ -124,7 +123,7 @@ queue as vehicle creep. A hard `0.3 m/s` threshold stopped new accumulation but
 never released already accumulated anti-creep pressure. Noise or one radar
 dropout could therefore leave permanent extra braking.
 
-BLoTv2 uses:
+Smooth Stops uses:
 
 - moving-lead entry at `0.30 m/s`;
 - moving-lead exit at `0.18 m/s`;
@@ -445,8 +444,8 @@ mandatory field gate.
 Automated coverage includes:
 
 - finite/live lead construction and relative-motion physics;
-- settle entry continuity, jerk bounds, and stronger-plan pass-through;
-- anti-creep progress, noisy rolling-lead thresholds, radar dropout, and
+- integrated Smooth Stops entry continuity, jerk bounds, and stronger-plan pass-through;
+- integrated anti-creep progress, noisy rolling-lead thresholds, radar dropout, and
   stopped-to-moving queue transitions;
 - true-stop handoff and hold-release debounce;
 - Conditional Experimental entry filtering, release hysteresis, standstill
@@ -469,6 +468,7 @@ See `BLoTv2_ACCEPTANCE.md` for remaining replay, device, and field gates.
 
 - replacing the Acados optimization problem;
 - overriding e2e acceleration or stop intent;
+- owning final stop landing or standstill handoff;
 - raising vehicle or panda safety limits;
 - changing the lateral controller;
 - classifying red lights or stop signs when the model publishes no such class;
