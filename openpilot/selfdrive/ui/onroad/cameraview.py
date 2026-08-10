@@ -2,7 +2,8 @@ import platform
 import numpy as np
 import pyray as rl
 
-from msgq.visionipc import VisionIpcClient, VisionStreamType, VisionBuf
+from msgq.visionipc import VisionIpcClient, VisionBuf
+from openpilot.cereal.visionipc import VisionStreamType
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.hardware import TICI
 from openpilot.system.ui.lib.application import gui_app
@@ -203,7 +204,7 @@ class CameraView(Widget):
     transform = self._calc_frame_matrix(rect)
     src_rect = rl.Rectangle(0, 0, float(self.frame.width), float(self.frame.height))
     # Flip driver camera horizontally
-    if self._stream_type == VisionStreamType.VISION_STREAM_DRIVER:
+    if self._stream_type == VisionStreamType.VISION_STREAM_CABIN:
       src_rect.width = -src_rect.width
 
     # Calculate scale
@@ -361,6 +362,6 @@ class CameraView(Widget):
 
 if __name__ == "__main__":
   gui_app.init_window("camera view")
-  road = CameraView("camerad", VisionStreamType.VISION_STREAM_ROAD)
+  road = CameraView("camerad", VisionStreamType.VISION_STREAM_NARROW_ROAD)
   for _ in gui_app.render():
     road.render(rl.Rectangle(0, 0, gui_app.width, gui_app.height))

@@ -1,6 +1,6 @@
 import numpy as np
 import pyray as rl
-from msgq.visionipc import VisionStreamType
+from openpilot.cereal.visionipc import VisionStreamType
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.ui_state import ui_state, device
@@ -11,7 +11,7 @@ from openpilot.system.ui.widgets.label import gui_label
 
 class DriverCameraDialog(CameraView):
   def __init__(self):
-    super().__init__("camerad", VisionStreamType.VISION_STREAM_DRIVER)
+    super().__init__("camerad", VisionStreamType.VISION_STREAM_CABIN)
     self.driver_state_renderer = DriverStateRenderer()
     # TODO: this can grow unbounded, should be given some thought
     device.add_interactive_timeout_callback(gui_app.pop_widget)

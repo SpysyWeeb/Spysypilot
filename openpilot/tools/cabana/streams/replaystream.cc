@@ -163,8 +163,8 @@ AbstractStream *OpenReplayWidget::open() {
   } else {
     auto replay_stream = std::make_unique<ReplayStream>(qApp);
     uint32_t flags = REPLAY_FLAG_NONE;
-    if (cameras[1]->isChecked()) flags |= REPLAY_FLAG_DCAM;
-    if (cameras[2]->isChecked()) flags |= REPLAY_FLAG_ECAM;
+    if (cameras[1]->isChecked()) flags |= REPLAY_FLAG_CABIN_CAMERA;
+    if (cameras[2]->isChecked()) flags |= REPLAY_FLAG_WIDE_ROAD;
     if (flags == REPLAY_FLAG_NONE && !cameras[0]->isChecked()) flags = REPLAY_FLAG_NO_VIPC;
 
     if (replay_stream->loadRoute(route.toStdString(), data_dir.toStdString(), flags)) {
