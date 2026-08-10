@@ -5,7 +5,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.selfdrived.events import (ET, Events, Alert, Priority, AlertSize,
                                                    AlertStatus, VisualAlert, AudibleAlert)
-from openpilot.spysypilot.aol.state import AolStateMachine, ACTIVE_STATES, ENABLED_STATES, State
+from openpilot.spysypilot.aol.state import AolStateMachine, State
 from openpilot.spysypilot.aol.helpers import is_hyundai_always_allow
 
 ButtonType = car.CarState.ButtonEvent.Type
