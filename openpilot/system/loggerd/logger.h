@@ -22,7 +22,6 @@ public:
   inline int segment() const { return part; }
   inline const std::string& segmentPath() const { return segment_path; }
   inline const std::string& routeName() const { return route_name; }
-  inline uint64_t segmentStartMonoTime() const { return segment_start_mono_time; }
   inline void write(kj::ArrayPtr<kj::byte> bytes, bool in_qlog) { write(bytes.begin(), bytes.size(), in_qlog); }
   inline void setExitSignal(int signal) { exit_signal = signal; }
 
@@ -31,7 +30,6 @@ protected:
   std::string route_path, route_name, segment_path, lock_file;
   kj::Array<capnp::word> init_data;
   std::unique_ptr<ZstdFileWriter> rlog, qlog;
-  uint64_t segment_start_mono_time = 0;
 };
 
 kj::Array<capnp::word> logger_build_init_data();
