@@ -9,9 +9,10 @@ DT = 0.05
 
 class FakeSubMaster(dict):
   def __init__(self, *, model_length=20.0, should_stop=True, desired_accel=-0.6,
-               v_ego=10.0, lead_present=False, model_valid=True):
+               v_ego=10.0, lead_present=False, model_valid=True, terminal_speed=0.0):
     super().__init__(
-      carState=SimpleNamespace(vEgo=v_ego, gasPressed=False, standstill=False),
+      carState=SimpleNamespace(vEgo=v_ego, gasPressed=False, standstill=False,
+                               leftBlinker=False, rightBlinker=False),
       selfdriveState=SimpleNamespace(enabled=True, experimentalMode=True),
       radarState=SimpleNamespace(
         leadOne=SimpleNamespace(present=lead_present),
@@ -19,7 +20,9 @@ class FakeSubMaster(dict):
       ),
       modelV2=SimpleNamespace(
         position=SimpleNamespace(x=[0.0, model_length]),
-        action=SimpleNamespace(shouldStop=should_stop, desiredAcceleration=desired_accel),
+        velocity=SimpleNamespace(x=[v_ego, terminal_speed]),
+        orientation=SimpleNamespace(z=[0.0, 0.0]),
+        action=SimpleNamespace(shouldStop=should_stop, desiredAcceleration=desired_accel, desiredCurvature=0.0),
       ),
     )
     self.valid = {"modelV2": model_valid, "radarState": True}
@@ -29,6 +32,59 @@ def arm(force_stops, sm):
   for _ in range(30):
     force_stops.update(sm)
   assert force_stops.forcing
+
+
+def test_cem_qualified_stop_starts_live_shaping_before_latch():
+  for model_length, expected_cap in ((116.146, 17.477), (150.0, math.sqrt(2.0 * 1.2 * 150.0))):
+    force_stops = ForceStops(dt=DT)
+    sm = FakeSubMaster(model_length=model_length, should_stop=False, desired_accel=-0.73,
+                       v_ego=19.477, terminal_speed=4.066)
+
+    assert math.isclose(force_stops.update(sm), expected_cap)
+    assert not force_stops.forcing
+
+
+def test_incomplete_early_trajectory_cannot_shape():
+  for field, axis in (("position", "x"), ("velocity", "x"), ("orientation", "z")):
+    force_stops = ForceStops(dt=DT)
+    sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-0.73,
+                       v_ego=19.477, terminal_speed=4.066)
+    trajectory = getattr(sm["modelV2"], field)
+    setattr(trajectory, axis, [getattr(trajectory, axis)[-1]])
+
+    assert math.isinf(force_stops.update(sm))
+
+
+def test_nonfinite_early_action_cannot_shape():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-math.inf,
+                     v_ego=19.477, terminal_speed=4.066)
+
+  assert math.isinf(force_stops.update(sm))
+
+
+def test_filtered_lead_blocks_immediate_early_shaping_after_dropout():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-0.73,
+                     v_ego=19.477, terminal_speed=4.066, lead_present=True)
+  for _ in range(30):
+    assert math.isinf(force_stops.update(sm))
+  sm["radarState"].leadOne.present = False
+
+  assert math.isinf(force_stops.update(sm))
+
+
+def test_early_shaping_does_not_prime_physical_latch():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-0.73,
+                     v_ego=19.477, terminal_speed=4.066)
+  for _ in range(30):
+    assert math.isfinite(force_stops.update(sm))
+  sm["modelV2"].position.x[-1] = 58.0
+
+  force_stops.update(sm)
+
+  assert not force_stops.forcing
 
 
 def test_latched_position_survives_brief_model_clear():
