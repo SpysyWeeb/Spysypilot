@@ -39,7 +39,7 @@ Every test report must identify:
 - [x] Conditional mode filtering, debounce, hysteresis, latch, lead/turn
   guards, pedal override, invalid-model release, reset, and publication have
   deterministic unit coverage.
-- [x] High-speed early intent, filter-only hints, comfort-distance gating,
+- [x] Early urban intent, faster filter-only hints, intent-hold behavior,
   geometry validity, highway-slowdown rejection, and recent-lead hysteresis
   have deterministic unit coverage.
 - [x] BLoTv2 contains no legacy Force Stops speed-cap owner or planner hook.

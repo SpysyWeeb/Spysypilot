@@ -106,7 +106,7 @@ def test_real_stop_detector_request_reaches_effective_mode_and_releases():
   instance.sm['modelV2'].action.desiredAcceleration = 0.0
   instance.sm['modelV2'].position.x = [0.0, 90.0]
   instance.sm['modelV2'].velocity.x = [10.0, 10.0]
-  for _ in range(60):
+  for _ in range(100):
     instance.update_experimental_mode(CS)
   assert not instance.experimental_mode
 

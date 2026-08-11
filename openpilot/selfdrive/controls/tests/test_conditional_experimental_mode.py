@@ -7,12 +7,13 @@ from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (
   STOP_EARLY_COMFORT_DECEL,
   STOP_EARLY_CONFIDENCE,
   STOP_EARLY_HINT_CONFIDENCE,
+  STOP_EARLY_HINT_ENTRY_MAX_SPEED,
   STOP_EARLY_MAX_HEADING_CHANGE,
   STOP_EARLY_MAX_LATERAL_ACCEL,
   STOP_EARLY_MIN_SPEED,
   STOP_EARLY_RESPONSE_BUFFER_S,
-  STOP_ENTRY_DEBOUNCE_S,
   STOP_PREDICTION_HORIZON_S,
+  STOP_INTENT_HOLD_S,
   STOP_SAMPLE_MIN_CONFIDENCE,
   observe_model_stop_intent,
 )
@@ -82,13 +83,6 @@ def route_d7_early_stop_model():
                desired_curvature=-0.00007, terminal_heading=-0.001)
 
 
-def frames_until_active(cem, md, cs, limit=100):
-  for frame in range(1, limit + 1):
-    if cem.update(md, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True):
-      return frame
-  return None
-
-
 def activate(cem, cs=None):
   cs = cs or car_state()
   assert run_frames(cem, 30, confirmed_stop_model(cs.vEgo), cs)[-1]
@@ -125,7 +119,7 @@ def test_route_d7_high_speed_stop_enters_before_strict_terminal_threshold():
   assert run_frames(cem, 30, stop, car_state(v_ego=v_ego))[-1]
 
 
-def test_high_speed_hint_precharges_filter_but_cannot_request_experimental():
+def test_sustained_urban_early_hint_requests_experimental():
   cem = new_cem()
   v_ego = 20.0
   hint = model(path_end=159.3, terminal_speed=9.93, desired_accel=-0.32,
@@ -133,38 +127,31 @@ def test_high_speed_hint_precharges_filter_but_cannot_request_experimental():
   observation = observe_model_stop_intent(hint, car_state(v_ego=v_ego), radar_state())
 
   assert observation.reason == "earlyHint"
-  assert observation.confidence == STOP_EARLY_HINT_CONFIDENCE
-  assert observation.confidence < STOP_SAMPLE_MIN_CONFIDENCE
-  assert not any(run_frames(cem, 200, hint, car_state(v_ego=v_ego)))
-  assert cem._entry_elapsed == 0.0
+  assert observation.confidence >= STOP_SAMPLE_MIN_CONFIDENCE
+  assert run_frames(cem, 30, hint, car_state(v_ego=v_ego))[-1]
 
 
-def test_high_speed_hint_reduces_filter_latency_without_bypassing_debounce():
-  v_ego = 20.0
-  cs = car_state(v_ego=v_ego)
+def test_urban_early_hint_entry_speed_boundary_is_inclusive():
   hint = model(path_end=159.3, terminal_speed=9.93, desired_accel=-0.32,
                desired_curvature=-0.00005, terminal_heading=-0.001)
-  strong = model(path_end=145.0, terminal_speed=6.0, desired_accel=-0.55,
-                 desired_curvature=-0.00005, terminal_heading=-0.001)
 
-  cold_frames = frames_until_active(new_cem(), strong, cs)
-  primed = new_cem()
-  assert not any(run_frames(primed, 30, hint, cs))
-  primed_frames = frames_until_active(primed, strong, cs)
+  at_limit = observe_model_stop_intent(hint, car_state(v_ego=STOP_EARLY_HINT_ENTRY_MAX_SPEED), radar_state())
+  above_limit = observe_model_stop_intent(hint, car_state(v_ego=STOP_EARLY_HINT_ENTRY_MAX_SPEED + 0.0001), radar_state())
 
-  assert cold_frames is not None and primed_frames is not None
-  assert primed_frames < cold_frames
-  assert primed_frames * DT >= STOP_ENTRY_DEBOUNCE_S
+  assert at_limit.confidence >= STOP_SAMPLE_MIN_CONFIDENCE
+  assert above_limit.confidence == STOP_EARLY_HINT_CONFIDENCE
 
 
-def test_early_high_speed_tier_stays_inside_comfort_stopping_envelope():
+def test_urban_early_hint_extends_beyond_comfort_envelope_only_inside_eight_seconds():
   v_ego = 18.0
   distance_limit = v_ego ** 2 / (2.0 * STOP_EARLY_COMFORT_DECEL) + v_ego * STOP_EARLY_RESPONSE_BUFFER_S
-  outside = model(path_end=distance_limit + 0.1, terminal_speed=4.0, desired_accel=-0.6)
-  observation = observe_model_stop_intent(outside, car_state(v_ego=v_ego), radar_state())
+  hint = model(path_end=distance_limit + 0.1, terminal_speed=4.0, desired_accel=-0.6)
+  outside_hint = model(path_end=v_ego * 8.0 + 0.1, terminal_speed=4.0, desired_accel=-0.6)
+  observation = observe_model_stop_intent(hint, car_state(v_ego=v_ego), radar_state())
 
-  assert observation.reason != "earlyTrajectory"
-  assert not any(run_frames(new_cem(), 40, outside, car_state(v_ego=v_ego)))
+  assert observation.reason == "earlyHint"
+  assert run_frames(new_cem(), 40, hint, car_state(v_ego=v_ego))[-1]
+  assert not any(run_frames(new_cem(), 40, outside_hint, car_state(v_ego=v_ego)))
 
 
 def test_highway_slowdown_does_not_qualify_as_an_early_stop():
@@ -271,13 +258,40 @@ def test_release_hysteresis_ignores_brief_clear_prediction():
   assert run_frames(cem, 5, confirmed_stop_model())[-1]
 
 
+def test_confirmed_stop_holds_experimental_through_prediction_flicker():
+  control_dt = 0.01
+  cem = ConditionalExperimentalMode(control_dt=control_dt, model_dt=DT)
+  stop = confirmed_stop_model()
+  clear = clear_model()
+  cs = car_state()
+  radar = radar_state()
+  active = False
+
+  for frame in range(200):
+    active = cem.update(stop, cs, radar, controls_enabled=True, model_updated=frame % 5 == 0, model_valid=True)
+  assert active
+
+  for frame in range(200):
+    active = cem.update(clear, cs, radar, controls_enabled=True, model_updated=frame % 5 == 0, model_valid=True)
+  assert active
+
+  assert cem.update(stop, cs, radar, controls_enabled=True, model_updated=True, model_valid=True)
+  hold_frames = int((STOP_INTENT_HOLD_S - 0.5) / control_dt)
+  assert all(cem.update(clear, cs, radar, controls_enabled=True, model_updated=frame % 5 == 0, model_valid=True)
+             for frame in range(hold_frames))
+  for frame in range(int(1.0 / control_dt)):
+    active = cem.update(clear, cs, radar, controls_enabled=True, model_updated=frame % 5 == 0, model_valid=True)
+  assert not active
+
+
 def test_filter_only_hint_cannot_sustain_an_active_mode_latch():
   cem = new_cem()
-  activate(cem, car_state(v_ego=20.0))
-  hint = model(path_end=159.3, terminal_speed=9.93, desired_accel=-0.32,
-               desired_curvature=-0.00005, terminal_heading=-0.001)
+  v_ego = 24.54
+  activate(cem, car_state(v_ego=v_ego))
+  hint = model(path_end=170.13, terminal_speed=8.41, desired_accel=-1.06,
+               desired_curvature=0.00015, terminal_heading=0.004)
 
-  outputs = run_frames(cem, 80, hint, car_state(v_ego=20.0))
+  outputs = run_frames(cem, 100, hint, car_state(v_ego=v_ego))
   assert outputs[0]
   assert not outputs[-1]
 
@@ -298,7 +312,7 @@ def test_green_release_returns_to_chill_after_standstill_latch_and_hysteresis():
   stop = model(should_stop=True, path_end=2.0, terminal_speed=0.0)
   run_frames(cem, 25, stop, stopped)
 
-  outputs = run_frames(cem, 60, clear_model(), stopped)
+  outputs = run_frames(cem, 100, clear_model(), stopped)
   assert outputs[0]
   assert not outputs[-1]
 

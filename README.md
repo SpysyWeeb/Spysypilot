@@ -45,12 +45,13 @@ stop prediction, hold that handoff through the stop, and return to Chill after
 a stable release or driver override. This branch has no standalone traffic
 light or stop-sign classifier, so the detector uses the model's existing
 `action.shouldStop`, predicted position/velocity/orientation, and action
-signals. A route-derived high-speed tier now recognizes a straight, lead-free
-near-stop trajectory before the terminal prediction reaches zero; weaker
-evidence only precharges its existing temporal filter. Replay of route
-`000000d7--cc6308b4d0` moves the first handoff from `39.1 mph` to `42.2 mph`
-without admitting its highway-exit slowdown or brief radar-dropout window.
-This is counterfactual replay evidence, not field validation. The feature
+signals. The route-derived tiers now recognize a straight, lead-free near-stop
+trajectory earlier: weaker evidence can qualify at or below `22 m/s` after the
+filter/debounce, while the known `55 mph` highway slowdown remains filter-only.
+A qualifying stop also refreshes a `4 s` mode hold so brief prediction flicker
+cannot return the approach to Chill. The earlier route replay moved the first
+handoff from `39.1 mph` to `42.2 mph`; the new earlier threshold still requires
+fresh replay and field validation.
 publishes only through `selfdriveState.experimentalMode`; it adds no UI or
 user-facing Params and does not own target speed or braking.
 The implementation and signal mapping are documented in

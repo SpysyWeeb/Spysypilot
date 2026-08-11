@@ -180,10 +180,9 @@ what caused it.
 | Stop evidence | BLoTv2 signal and use |
 |---|---|
 | Direct final-approach intent | `modelV2.action.shouldStop` |
-| Projected MPC intent | final three MPC speed samples at or below `0.5 m/s` with a non-increasing tail |
 | Strict prediction | `position.x[-1]` is inside a `5.0 s` ego-speed horizon and `velocity.x[-1] <= 1.0 m/s` |
 | High-speed early prediction | above `13.0 m/s`, the path is inside a `1.3 m/s²` comfort-stop envelope plus `0.5 s` response distance, terminal speed is at most `6.5 m/s` and `35%` of ego speed, and `action.desiredAcceleration <= -0.5 m/s²` |
-| High-speed filter hint | inside an `8.0 s` horizon, terminal speed at most `55%` of ego speed, and desired acceleration at most `-0.25 m/s²`; its `0.45` confidence is below entry qualification and can neither switch modes alone nor sustain an active latch |
+| Early urban prediction | inside an `8.0 s` horizon, terminal speed at most `55%` of ego speed, and desired acceleration at most `-0.25 m/s²`; at or below `22.0 m/s` it receives qualifying `0.70` confidence, while faster approaches remain a non-triggering `0.45` filter hint |
 | Early geometry guard | no turn signal, valid `action.desiredCurvature` below `1.0 m/s²` lateral acceleration, and valid terminal `orientation.z` within `20 degrees` |
 | Missing-velocity fallback | short path plus `action.desiredAcceleration <= -0.5 m/s²` |
 | Lead ownership | relevant `radarState.leadOne` blocks a new handoff; its veto persists `3.0 s` after loss so radar flicker cannot transfer a lead slowdown to CEM |
@@ -191,12 +190,14 @@ what caused it.
 | Release/override | stable model clear, resumed motion, gas, brake, invalid model, or disengagement |
 
 The evidence filter uses a `0.30 s` time constant, separate entry/release
-thresholds, `0.20 s` entry debounce, and `0.75 s` release hysteresis. A mode
-handoff has a `1.0 s` minimum latch. Once standstill is reached, the generic
-stop latch is held for at least `1.0 s`; it remains active indefinitely while
-stop evidence stays valid, then releases after the same stable-clear test. A
-resume above `0.8 m/s` releases immediately. Gas or brake suppresses a new
-handoff for `2.0 s`, and a completed stop gets the same `2.0 s` re-entry guard.
+thresholds, `0.20 s` entry debounce, and `0.75 s` release hysteresis. Every
+qualifying stop sample refreshes a `4.0 s` intent hold so brief model flicker
+cannot move the stop approach back to Chill. A mode handoff also has a `1.0 s`
+minimum latch. Once standstill is reached, a separate `1.0 s` minimum prevents
+an immediate clear; the refreshed `4.0 s` intent hold still applies. Valid stop
+evidence keeps Experimental active indefinitely. A resume above `0.8 m/s`
+releases immediately. Gas or brake suppresses a new handoff for `2.0 s`, and a
+completed stop gets the same `2.0 s` re-entry guard.
 All values live together in `conditional_experimental_mode.py`; no tuning Param
 or UI control is added.
 
@@ -211,14 +212,15 @@ braked about `2.1 s` later because the remaining stop felt too late.
 The recorded model had already developed coherent stop intent at `42.4 mph`:
 `position.x[-1] = 138.0 m`, `velocity.x[-1] = 5.85 m/s`,
 `action.desiredAcceleration = -0.50 m/s²`, and an essentially straight
-predicted heading. The production CEM class with the new early tier switches
-at `42.2 mph`, `3.8 s` and roughly `69 m` before the deployed handoff. The
-earlier `44.7 mph` sample is only a filter hint and cannot request Experimental
-on its own.
+predicted heading. The first early tier switches at `42.2 mph`, `3.8 s` and
+roughly `69 m` before the deployed handoff. The earlier `44.7 mph` sample is
+now eligible to request Experimental after the normal filter and debounce;
+exact full-route timing still requires a new replay receipt.
 
 A scan of all 62 route segments also exposed two ambiguous windows. A
 `55 mph` highway-exit approach predicted slowing to about `8 m/s`, not a stop;
-the `6.5 m/s` absolute terminal cap rejects it. A separate intersection
+the `6.5 m/s` strict-tier terminal cap rejects it and the `22.0 m/s` urban-tier
+ceiling keeps it filter-only. A separate intersection
 window lost a relevant radar lead briefly; the `3.0 s` lead-release guard
 keeps that slowdown lead-owned. Neither guard changes the first red-light
 handoff or the later low-speed stop/green-release result.

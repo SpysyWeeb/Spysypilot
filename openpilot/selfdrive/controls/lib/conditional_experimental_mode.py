@@ -43,13 +43,13 @@ STOP_EARLY_DESIRED_ACCEL_MAX = -0.5
 STOP_EARLY_MAX_LATERAL_ACCEL = 1.0
 STOP_EARLY_MAX_HEADING_CHANGE = math.radians(20.0)
 
-# Weaker evidence may charge the temporal filter but is deliberately below
-# STOP_SAMPLE_MIN_CONFIDENCE, so it can never request Experimental by itself.
-# This avoids spending the full filter delay after a gradually developing
-# high-speed stop becomes strong enough to qualify.
+# Weaker early evidence may request Experimental on urban-speed approaches after
+# the normal filter and debounce. Above the urban ceiling it remains filter-only,
+# which preserves rejection of the known 55 mph highway slowdown.
 STOP_EARLY_HINT_HORIZON_S = 8.0
 STOP_EARLY_HINT_TERMINAL_SPEED_RATIO = 0.55
 STOP_EARLY_HINT_DESIRED_ACCEL_MAX = -0.25
+STOP_EARLY_HINT_ENTRY_MAX_SPEED = 22.0
 
 # Evidence strengths and temporal qualification.
 STOP_DIRECT_CONFIDENCE = 1.0
@@ -57,6 +57,7 @@ STOP_TRAJECTORY_CONFIDENCE = 0.85
 STOP_EARLY_CONFIDENCE = 0.80
 STOP_FALLBACK_CONFIDENCE = 0.70
 STOP_EARLY_HINT_CONFIDENCE = 0.45
+STOP_EARLY_HINT_ENTRY_CONFIDENCE = 0.70
 STOP_SAMPLE_MIN_CONFIDENCE = 0.70
 STOP_FILTER_TIME_CONSTANT_S = 0.30
 STOP_ENTRY_FILTER_THRESHOLD = 0.55
@@ -66,6 +67,7 @@ STOP_RELEASE_HYSTERESIS_S = 0.75
 
 # Latching and release behavior.
 MODE_MIN_LATCH_S = 1.0
+STOP_INTENT_HOLD_S = 4.0
 STANDSTILL_MIN_LATCH_S = 1.0
 MODEL_INVALID_RELEASE_S = 0.50
 RESUME_RELEASE_SPEED = 0.8
@@ -179,7 +181,7 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
     confidence = STOP_FALLBACK_CONFIDENCE
     reason = "path+braking"
   elif early_hint:
-    confidence = STOP_EARLY_HINT_CONFIDENCE
+    confidence = STOP_EARLY_HINT_ENTRY_CONFIDENCE if v_ego <= STOP_EARLY_HINT_ENTRY_MAX_SPEED else STOP_EARLY_HINT_CONFIDENCE
     reason = "earlyHint"
 
   lead = getattr(radar_state, "leadOne", None)
@@ -216,6 +218,7 @@ class ConditionalExperimentalMode:
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
     self._active_elapsed = 0.0
+    self._intent_hold_remaining = 0.0
     self._standstill_elapsed = 0.0
     self._standstill_seen = False
     self._invalid_elapsed = 0.0
@@ -236,6 +239,7 @@ class ConditionalExperimentalMode:
     self.last_observation = StopIntentObservation()
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
+    self._intent_hold_remaining = 0.0
 
   def _deactivate(self, suppress_for: float) -> None:
     self.experimental_mode = False
@@ -260,6 +264,8 @@ class ConditionalExperimentalMode:
     entry_veto = self._lead_veto_remaining > 0.0 or observation.committed_turn
     confidence = observation.confidence if self.experimental_mode or not entry_veto else 0.0
     raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
+    if raw_stop:
+      self._intent_hold_remaining = STOP_INTENT_HOLD_S
     # A filter-only hint can shorten later entry latency, but cannot sustain an
     # already active latch indefinitely after qualifying evidence disappears.
     filter_input = confidence if not self.experimental_mode or raw_stop else 0.0
@@ -287,6 +293,7 @@ class ConditionalExperimentalMode:
       return False
 
     self._post_stop_remaining = max(self._post_stop_remaining - self.control_dt, 0.0)
+    self._intent_hold_remaining = max(self._intent_hold_remaining - self.control_dt, 0.0)
 
     driver_override = bool(getattr(car_state, "gasPressed", False) or getattr(car_state, "brakePressed", False))
     if driver_override:
@@ -323,6 +330,7 @@ class ConditionalExperimentalMode:
       standstill_latch_satisfied = not self._standstill_seen or self._standstill_elapsed >= STANDSTILL_MIN_LATCH_S
       stable_clear = (
         self._active_elapsed >= MODE_MIN_LATCH_S and
+        self._intent_hold_remaining <= 0.0 and
         standstill_latch_satisfied and
         self._clear_elapsed >= STOP_RELEASE_HYSTERESIS_S
       )
