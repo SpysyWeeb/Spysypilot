@@ -139,7 +139,8 @@ class ForceStops:
     terminal_speed = float(sm['modelV2'].velocity.x[-1]) if len(sm['modelV2'].velocity.x) >= 2 else math.inf
     terminal_heading = float(sm['modelV2'].orientation.z[-1]) if len(sm['modelV2'].orientation.z) >= 2 else math.inf
     early_stopping = (
-      len(xs) >= 2 and not tracking_lead and v_ego >= EARLY_STOP_MIN_SPEED and action.desiredAcceleration <= EARLY_BRAKE_GATE and
+      len(xs) >= 2 and not tracking_lead and v_ego >= EARLY_STOP_MIN_SPEED and
+      math.isfinite(action.desiredAcceleration) and action.desiredAcceleration <= EARLY_BRAKE_GATE and
       model_length <= v_ego ** 2 / (2.0 * EARLY_STOP_COMFORT_DECEL) + v_ego * EARLY_STOP_RESPONSE_S and
       math.isfinite(terminal_speed) and terminal_speed <= min(EARLY_STOP_TERMINAL_MAX, v_ego * EARLY_STOP_TERMINAL_RATIO) and
       math.isfinite(action.desiredCurvature) and abs(action.desiredCurvature) * v_ego ** 2 <= EARLY_STOP_MAX_LAT_ACCEL and
