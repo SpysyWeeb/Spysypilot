@@ -1,7 +1,7 @@
 import math
 from types import SimpleNamespace
 
-from openpilot.selfdrive.controls.lib.force_stops import ForceStops, STOP_POSITION_HOLD_S
+from openpilot.selfdrive.controls.lib.force_stops import ForceStops, GAS_OVERRIDE_S, STOP_POSITION_HOLD_S
 
 
 DT = 0.05
@@ -144,6 +144,23 @@ def test_gas_bypasses_pre_latch_shaping():
     force_stops.update(sm)
 
   sm["carState"].gasPressed = True
+
+  assert math.isinf(force_stops.update(sm))
+
+
+def test_gas_override_survives_experimental_mode_release():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster()
+  sm["selfdriveState"].experimentalMode = False
+  sm["carState"].gasPressed = True
+
+  assert math.isinf(force_stops.update(sm))
+  assert force_stops.override_timer == GAS_OVERRIDE_S
+
+  sm["carState"].gasPressed = False
+  for _ in range(int(1.0 / DT)):
+    force_stops.update(sm)
+  sm["selfdriveState"].experimentalMode = True
 
   assert math.isinf(force_stops.update(sm))
 
