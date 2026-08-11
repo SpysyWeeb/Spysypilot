@@ -26,6 +26,7 @@ The product target is **Smooth. Swift. Strong.**
 | Lead trajectory and obstacle optimization | stock Acados longitudinal MPC |
 | MPC response cost and dynamic headway | `BLoTv2Supervisor` |
 | Cruise acceleration target | longitudinal planner |
+| Committed model stop point and approach cap | separate `force-stops` feature |
 | Final rolling landing | separate `smooth-stops` feature |
 | Standstill hold | stock `LongCtrlState.stopping` |
 | Acceleration tracking | stock longitudinal PID |
@@ -56,6 +57,8 @@ radarState -- live/finite lead observation --> necessity supervisor
                         v
                  stock Acados MPC
                         |
+model stop + effective Experimental --> Force Stops cruise cap
+                        |
              planner candidate arbitration
                         |
                  longitudinalPlan
@@ -67,9 +70,9 @@ radarState -- live/finite lead observation --> necessity supervisor
                   opendbc --> panda
 ```
 
-The planner runs at model rate. Smooth Stops runs at control rate. The two
-processes do not share mutable state; they import the same side-effect-free
-relative lead physics.
+The planner and optional Force Stops tracker run at model rate. Smooth Stops
+runs at control rate. CEM selects the planning mode, Force Stops may cap the
+approach, and Smooth Stops owns only the final landing.
 
 ## Shared lead contract
 
@@ -280,15 +283,14 @@ show the trajectory the newly selected e2e planner would have driven. The
 high-speed stop and false-handoff behavior therefore remain explicit owner
 field-test gates.
 
-### Force Stops replacement
+### Force Stops separation
 
-The BLoTv2 tree has no `force_stops.py`, `ForceStops` planner member, or cruise
-speed cap. Conditional Experimental Mode replaces that strategy by selecting
-the already-existing e2e planner candidate; the planner, MPC, Smooth Stops,
-longitudinal PID, opendbc, and panda keep their existing responsibilities.
-When BLoTv2 is integrated into a tree that still contains the older Force Stops
-feature, its file, import, constructor hook, and `v_cruise` cap call must be
-removed. The two mechanisms must not run together.
+The standalone BLoTv2 tree has no `force_stops.py`, `ForceStops` planner member,
+or cruise-speed cap. Conditional Experimental Mode only selects the existing
+e2e planner candidate. Combo now integrates the separately owned `force-stops`
+feature after CEM: it tracks a lead-free model stop point and caps the planner's
+cruise candidate while stronger MPC/e2e braking still wins. Smooth Stops,
+longitudinal PID, opendbc, and panda retain their existing responsibilities.
 
 ## Strong
 

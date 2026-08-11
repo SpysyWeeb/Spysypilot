@@ -21,6 +21,18 @@ Only two combined testing branches are maintained:
 | [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) | stock comma release model |
 | [`rdf-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rdf-combo) | comma's [`rdf-driving`](https://github.com/commaai/openpilot/tree/rdf-driving) experimental RDF model |
 
+## Force Stops
+
+**Status: in progress; awaiting fresh route replay and owner field validation.**
+After CEM selects Experimental mode for a lead-free model stop, Force Stops
+tracks that model endpoint as ego advances and caps the stock planner's cruise
+candidate. It resists ordinary farther-away endpoint noise, accepts bounded
+near-stop correction, and holds the same point for `4 s` through brief model
+flicker. Either raw radar lead, invalid model/radar data, driver gas,
+disengagement, or standstill releases it immediately. Stronger MPC/e2e braking
+still wins; Smooth Stops remains the sole final-landing and standstill-handoff
+owner.
+
 ## BLoTv2 Conditional Experimental Mode
 
 **Status: in progress; awaiting field validation.** Combo normally remains in
@@ -109,7 +121,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Custom main menu windows](https://github.com/SpysyWeeb/Spysypilot/tree/custom-main-menu)** — replaces the "upgrade now" panel with the existing live terminal and system graphs; the terminal feed starts with the initial home page instead of waiting for a page cycle, and the retired route analyzer, `drive_statsd`, and on-device BLaTv2 learner dashboard are removed &nbsp;*(personal idea)*
 - ✅ **[Swapped cruise speed adjustments](https://github.com/SpysyWeeb/Spysypilot/tree/swapped-cruise-speed)** — short press rounds to nearest 5 and jumps there (e.g. 42 → 45), long press steps by 1; reverses stock behavior &nbsp;*(inspired by sunnypilot)*
 - ❌ **Quiet mode** — silence the engage and disengage sounds while leaving safety alerts audible; no branch yet &nbsp;*(inspired by sunnypilot)*
-- ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — legacy stop-strategy branch retained for reference; its independent cruise-speed cap is intentionally removed from `combo` and superseded there by BLoTv2 Conditional Experimental Mode &nbsp;*(inspired by IQPilot)*
+- ⚠️ **[Force Stops](https://github.com/SpysyWeeb/Spysypilot/tree/force-stops)** — commits to a lead-free model stop endpoint across prediction flicker and applies a bounded planner cruise-speed cap; integrated separately from BLoTv2 CEM recognition and Smooth Stops final landing &nbsp;*(inspired by IQPilot; awaiting replay and field validation)*
 - ⚠️ **[Better green lights](https://github.com/SpysyWeeb/Spysypilot/tree/better-green-lights)** — experimental-mode green-light launches start ~1.5–2s sooner by reading the model's path-length explosion instead of its laggy shouldStop bit, plus a launch assist that skips the dead time at the head of the model's speed plan &nbsp;*(personal idea)*
 - ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*

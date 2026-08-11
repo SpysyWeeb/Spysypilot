@@ -46,6 +46,8 @@ Every test report must identify:
   geometry validity, highway-slowdown rejection, and recent-lead hysteresis
   have deterministic unit coverage.
 - [x] BLoTv2 contains no legacy Force Stops speed-cap owner or planner hook.
+- [x] Combo's optional Force Stops owner is integrated separately from BLoTv2
+  CEM and Smooth Stops, with focused release and position-hold coverage.
 - [x] Stock longitudinal maneuver matrix passes.
 - [x] Final static and generated-solver build audit.
 
