@@ -21,11 +21,11 @@ Safety/comfort properties baked in:
 - Before the latch, a live comfort envelope (√(2·1.2·d)) shapes lead-less red-light approaches onto the owner's fitted braking curve instead of the model's late ramp.
 - The latched stop point follows the model's endpoint forward at a bounded rate (so a mid-collapse latch doesn't park the car short) and, below 3 m/s, downward too (so a stale latch can't roll past the model's stop line into a crosswalk).
 - Qualifying evidence refreshes a 4 s position hold, keeping the same tracked point through brief model dropouts.
-- Invalid model/radar data or a raw lead releases immediately instead of letting the position hold override lead handling.
-- Driver gas cancels forcing for 10 s; at standstill the module steps aside entirely and the normal hold clamp owns the stop.
+- Invalid model/radar data or either raw radar lead releases immediately instead of letting the position hold override lead handling.
+- Driver gas bypasses all shaping and cancels forcing for 10 s; at standstill the module steps aside entirely and the normal hold clamp owns the stop.
 
 ## What changed
 
 - `openpilot/selfdrive/controls/lib/force_stops.py` — the `ForceStops` class: filtered path-length detector, position hold with forward-ratchet/down-follow, comfort envelope, validity/lead release, and gas override.
 - `openpilot/selfdrive/controls/lib/longitudinal_planner.py` — one hook: `v_cruise = min(v_cruise, force_stops.update(sm))`.
-- `openpilot/selfdrive/controls/tests/test_force_stops.py` — deterministic position-hold, raw-lead, and invalid-model coverage.
+- `openpilot/selfdrive/controls/tests/test_force_stops.py` — deterministic position-hold, driver/lead release, and invalid-model coverage.

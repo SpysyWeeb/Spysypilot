@@ -13,7 +13,10 @@ class FakeSubMaster(dict):
     super().__init__(
       carState=SimpleNamespace(vEgo=v_ego, gasPressed=False, standstill=False),
       selfdriveState=SimpleNamespace(enabled=True, experimentalMode=True),
-      radarState=SimpleNamespace(leadOne=SimpleNamespace(present=lead_present)),
+      radarState=SimpleNamespace(
+        leadOne=SimpleNamespace(present=lead_present),
+        leadTwo=SimpleNamespace(present=False),
+      ),
       modelV2=SimpleNamespace(
         position=SimpleNamespace(x=[0.0, model_length]),
         action=SimpleNamespace(shouldStop=should_stop, desiredAcceleration=desired_accel),
@@ -132,6 +135,28 @@ def test_immediate_exit_conditions_bypass_position_hold():
 
     assert math.isinf(force_stops.update(sm))
     assert not force_stops.forcing
+
+
+def test_gas_bypasses_pre_latch_shaping():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster()
+  for _ in range(9):
+    force_stops.update(sm)
+
+  sm["carState"].gasPressed = True
+
+  assert math.isinf(force_stops.update(sm))
+
+
+def test_secondary_raw_lead_bypasses_pre_latch_shaping():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster()
+  for _ in range(9):
+    force_stops.update(sm)
+
+  sm["radarState"].leadTwo.present = True
+
+  assert math.isinf(force_stops.update(sm))
 
 
 def test_invalid_model_cannot_arm_force_stop():
