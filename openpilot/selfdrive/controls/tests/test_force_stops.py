@@ -35,12 +35,13 @@ def arm(force_stops, sm):
 
 
 def test_cem_qualified_stop_starts_live_shaping_before_latch():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-0.73,
-                     v_ego=19.477, terminal_speed=4.066)
+  for model_length, expected_cap in ((116.146, 17.477), (150.0, math.sqrt(2.0 * 1.2 * 150.0))):
+    force_stops = ForceStops(dt=DT)
+    sm = FakeSubMaster(model_length=model_length, should_stop=False, desired_accel=-0.73,
+                       v_ego=19.477, terminal_speed=4.066)
 
-  assert math.isclose(force_stops.update(sm), sm["carState"].vEgo - 2.0)
-  assert not force_stops.forcing
+    assert math.isclose(force_stops.update(sm), expected_cap)
+    assert not force_stops.forcing
 
 
 def test_incomplete_early_trajectory_cannot_shape():
@@ -52,6 +53,14 @@ def test_incomplete_early_trajectory_cannot_shape():
     setattr(trajectory, axis, [getattr(trajectory, axis)[-1]])
 
     assert math.isinf(force_stops.update(sm))
+
+
+def test_nonfinite_early_action_cannot_shape():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-math.inf,
+                     v_ego=19.477, terminal_speed=4.066)
+
+  assert math.isinf(force_stops.update(sm))
 
 
 def test_filtered_lead_blocks_immediate_early_shaping_after_dropout():
