@@ -8,12 +8,14 @@ line indefinitely. The tell is the model's planned *path*: its endpoint closes i
 few meters while the stop intent flickers. This module reads that intent directly --
 when the model's path ends within a few seconds of travel and there is no lead, latch
 the model's own stop point and hold the plan to it by capping the cruise speed at
-(remaining distance / ramp time). The ACC MPC then shapes the deceleration itself, its
-shouldStop asserts as the plan speed falls below vEgoStopping, and Smooth Stops lands
-the last meter. Force Stops decides that/where, the MPC shapes, Smooth Stops lands.
+(remaining distance / ramp time). The stock planner converts that cap into its cruise
+acceleration candidate while stronger MPC/e2e braking still wins; on combo,
+Smooth Stops lands the last meter. Force Stops decides that/where, the planner
+shapes, and Smooth Stops lands.
 
-A false detection only produces a gentle, plan-shaped slowdown that unwinds when the
-filtered detector drops -- the cap drives the real MPC, never a synthetic brake command.
+A false detection only produces a gentle, plan-shaped slowdown; the latched point
+survives brief model dropouts, then unwinds after a bounded hold. The cap feeds
+the stock planner, never a synthetic brake command.
 """
 import math
 
@@ -51,6 +53,7 @@ LEAD_RC = 1.0             # s, filter on radar lead status
 LEAD_GATE = 0.45          # filtered lead level above which stopping is the lead logic's job
 RAMP_TIME = 3.0           # s, speed cap = remaining distance / this (linear-in-distance ramp to 0)
 GAS_OVERRIDE_S = 10.0     # s, a gas press during a forced stop cancels forcing for this long
+STOP_POSITION_HOLD_S = 4.0  # s, keep the latched point through brief model dropouts
 EXTEND_RATE = 3.0         # m/s, max rate the latched stop point may follow the model's endpoint
                           # forward. The latch trips mid-collapse of the model's path (by
                           # construction: the detector needs pathEnd < v*3s), so when the model
@@ -74,12 +77,14 @@ class ForceStops:
     self.forcing = False
     self.remaining = 0.0
     self.override_timer = 0.0
+    self.position_hold_remaining = 0.0
 
   def _reset(self) -> None:
     self.detect_filter.x = 0.0
     self.lead_filter.x = 0.0
     self.forcing = False
     self.remaining = 0.0
+    self.position_hold_remaining = 0.0
 
   def update(self, sm) -> float:
     """Returns a cruise speed cap in m/s; NO_CAP when inactive. min() it into v_cruise."""
@@ -90,18 +95,36 @@ class ForceStops:
       self._reset()
       return NO_CAP
 
-    self.lead_filter.update(1.0 if sm['radarState'].leadOne.present else 0.0)
+    valid = getattr(sm, 'valid', {})
+    if not (valid.get('modelV2', False) and valid.get('radarState', False)):
+      self._reset()
+      return NO_CAP
+
+    lead_present = bool(sm['radarState'].leadOne.present)
+    self.lead_filter.update(1.0 if lead_present else 0.0)
     tracking_lead = self.lead_filter.x > LEAD_GATE
+    if lead_present:
+      self.detect_filter.x = 0.0
+      self.forcing = False
+      self.position_hold_remaining = 0.0
+      return NO_CAP
 
     # the model's planned path ends here; a short endpoint means it is planning a stop,
     # however much its shouldStop bit dithers
     xs = sm['modelV2'].position.x
     model_length = float(xs[-1]) if len(xs) else 0.0
+    if not math.isfinite(model_length) or model_length <= 0.0:
+      self._reset()
+      return NO_CAP
+
     stop_time = EARLY_STOP_TIME if sm['modelV2'].action.desiredAcceleration < EARLY_BRAKE_GATE else MODEL_STOP_TIME
     model_stopping = 0.0 < model_length < max(v_ego * stop_time, MIN_STOP_LENGTH)
     latch_ready = 0.0 < model_length < max(v_ego * MODEL_STOP_TIME, MIN_STOP_LENGTH)
     detected = (model_stopping or sm['modelV2'].action.shouldStop) and not tracking_lead
     self.detect_filter.update(1.0 if detected else 0.0)
+    self.position_hold_remaining = max(self.position_hold_remaining - self.dt, 0.0)
+    if detected:
+      self.position_hold_remaining = STOP_POSITION_HOLD_S
 
     # driver gas during (or about to enter) a forced stop: the driver knows better
     if CS.gasPressed and (self.forcing or self.detect_filter.x >= LATCH_THRESHOLD):
@@ -120,7 +143,7 @@ class ForceStops:
     # tick, without latching a fresh forcing bout until the car is moving again -- a car
     # already at standstill is never "approaching" a stop, so it's outside this cap's job.
     if CS.standstill:
-      self.forcing = False
+      self._reset()
       return NO_CAP
 
     if not self.forcing:
@@ -142,13 +165,13 @@ class ForceStops:
     self.remaining = max(self.remaining - v_ego * self.dt, 0.0)
     # forward-ratchet: while the model still confidently plans this stop, follow its endpoint
     # as it extends (bounded rate, never backward -- shrinking happens only by travel above)
-    if self.detect_filter.x >= LATCH_THRESHOLD and model_length > self.remaining + EXTEND_DEADBAND:
+    if detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD and model_length > self.remaining + EXTEND_DEADBAND:
       self.remaining = min(self.remaining + EXTEND_RATE * self.dt, model_length)
     # endgame down-follow: close to the stop the model's endpoint IS the stop line -- never
     # roll past it on a stale latch
     if v_ego < DOWN_SPEED and 0.0 < model_length < self.remaining - DOWN_DEADBAND:
       self.remaining = max(self.remaining - DOWN_RATE * self.dt, model_length)
-    if self.detect_filter.x < RELEASE_THRESHOLD:
+    if self.detect_filter.x < RELEASE_THRESHOLD and self.position_hold_remaining <= 0.0:
       self.forcing = False
       return NO_CAP
     # linear commit ramp near the point, owner's comfort envelope shaping the approach into it,
