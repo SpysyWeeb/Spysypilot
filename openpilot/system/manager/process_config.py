@@ -96,7 +96,6 @@ procs = [
   PythonProcess("calibrationd", "openpilot.selfdrive.locationd.calibrationd", only_onroad),
   PythonProcess("torqued", "openpilot.selfdrive.locationd.torqued", only_onroad),
   PythonProcess("controlsd", "openpilot.selfdrive.controls.controlsd", and_(not_joystick, iscar)),
-  PythonProcess("driving_eventd", "openpilot.selfdrive.spysypilot.driving_eventd", iscar, restart_if_crash=True),
   # BLaTv2 learning is PC-only. The device records ordinary full rlogs and may
   # consume a separately reviewed artifact, but runs no learning process.
   PythonProcess("joystickd", "openpilot.tools.joystick.joystickd", or_(joystick, notcar)),
@@ -118,7 +117,6 @@ procs = [
   PythonProcess("modem", "openpilot.common.hardware.tici.modem", always_run, enabled=TICI),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
-  PythonProcess("driving_event_indexer", "openpilot.selfdrive.spysypilot.driving_event_indexer", only_offroad),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", always_run),
   # debug procs
   NativeProcess("bridge", "openpilot/cereal/messaging", ["./bridge"], notcar),
