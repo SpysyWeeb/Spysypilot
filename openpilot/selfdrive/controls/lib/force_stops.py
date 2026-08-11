@@ -100,7 +100,14 @@ class ForceStops:
       self._reset()
       return NO_CAP
 
-    lead_present = bool(sm['radarState'].leadOne.present)
+    if CS.gasPressed:
+      self.override_timer = GAS_OVERRIDE_S
+      self.detect_filter.x = 0.0
+      self.forcing = False
+      self.position_hold_remaining = 0.0
+      return NO_CAP
+
+    lead_present = bool(sm['radarState'].leadOne.present or sm['radarState'].leadTwo.present)
     self.lead_filter.update(1.0 if lead_present else 0.0)
     tracking_lead = self.lead_filter.x > LEAD_GATE
     if lead_present:
@@ -126,10 +133,6 @@ class ForceStops:
     if detected:
       self.position_hold_remaining = STOP_POSITION_HOLD_S
 
-    # driver gas during (or about to enter) a forced stop: the driver knows better
-    if CS.gasPressed and (self.forcing or self.detect_filter.x >= LATCH_THRESHOLD):
-      self.override_timer = GAS_OVERRIDE_S
-      self.forcing = False
     self.override_timer = max(self.override_timer - self.dt, 0.0)
     if self.override_timer > 0.0:
       return NO_CAP
