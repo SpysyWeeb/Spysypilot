@@ -91,6 +91,15 @@ class ForceStops:
     CS = sm['carState']
     v_ego = max(CS.vEgo, 0.0)
 
+    if CS.gasPressed:
+      self.override_timer = GAS_OVERRIDE_S
+      self.detect_filter.x = 0.0
+      self.forcing = False
+      self.position_hold_remaining = 0.0
+      return NO_CAP
+
+    self.override_timer = max(self.override_timer - self.dt, 0.0)
+
     if not (sm['selfdriveState'].enabled and sm['selfdriveState'].experimentalMode):
       self._reset()
       return NO_CAP
@@ -98,13 +107,6 @@ class ForceStops:
     valid = getattr(sm, 'valid', {})
     if not (valid.get('modelV2', False) and valid.get('radarState', False)):
       self._reset()
-      return NO_CAP
-
-    if CS.gasPressed:
-      self.override_timer = GAS_OVERRIDE_S
-      self.detect_filter.x = 0.0
-      self.forcing = False
-      self.position_hold_remaining = 0.0
       return NO_CAP
 
     lead_present = bool(sm['radarState'].leadOne.present or sm['radarState'].leadTwo.present)
@@ -133,7 +135,6 @@ class ForceStops:
     if detected:
       self.position_hold_remaining = STOP_POSITION_HOLD_S
 
-    self.override_timer = max(self.override_timer - self.dt, 0.0)
     if self.override_timer > 0.0:
       return NO_CAP
 
