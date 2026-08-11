@@ -17,6 +17,7 @@ from openpilot.selfdrive.controls.lib.blotv2 import (
   model_predicted_speed,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.controls.lib.model_curve_speed import ModelCurveSpeedLimiter
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
@@ -137,6 +138,7 @@ class LongitudinalPlanner:
     self.blotv2 = BLoTv2Supervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt)
     self.curve_speed_limiter = ModelCurveSpeedLimiter()
+    self.force_stops = ForceStops(dt)
 
     self.a_desired = init_a
     self.last_mpc_a_target = init_a
@@ -306,6 +308,10 @@ class LongitudinalPlanner:
       a_launch = get_accel_from_plan(v_shifted, a_shifted, T_IDXS_MPC, action_t=action_t)
       a_launch_max = np.interp(v_ego, [LAUNCH_MOVING_SPEED, LAUNCH_DISARM_SPEED], [LAUNCH_MAX_ACCEL, 0.])
       output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
+
+    # Optional Force Stops owns the committed approach point; CEM only selects
+    # Experimental mode and Smooth Stops remains the final-landing owner.
+    v_cruise = min(v_cruise, self.force_stops.update(sm))
 
     comfort_enabled = ordinary_cruise_comfort_enabled(
       experimental_mode,
