@@ -29,6 +29,15 @@ EARLY_STOP_TIME = 4.5     # s, widened detection window honored only while the m
                           # late to shape anything; the brake gate keeps curve-shortened paths,
                           # which the model coasts toward, from tripping the wide window)
 EARLY_BRAKE_GATE = -0.5   # m/s^2, model desiredAcceleration below this counts as "braking"
+# Match CEM's strong early-stop tier before bypassing Force Stops' own filter.
+# This also protects manually selected Experimental mode from curve/turn hints.
+EARLY_STOP_MIN_SPEED = 13.0
+EARLY_STOP_COMFORT_DECEL = 1.3
+EARLY_STOP_RESPONSE_S = 0.5
+EARLY_STOP_TERMINAL_RATIO = 0.35
+EARLY_STOP_TERMINAL_MAX = 6.5
+EARLY_STOP_MAX_LAT_ACCEL = 1.0
+EARLY_STOP_MAX_HEADING = math.radians(20.0)
 A_STOP_ENVELOPE = 1.2     # m/s^2, the owner's comfort curve applied to the model's stop point --
                           # remaining/RAMP_TIME alone is a late linear ramp; the sqrt envelope
                           # shapes the whole approach onto his fitted braking profile
@@ -126,10 +135,21 @@ class ForceStops:
       self._reset()
       return NO_CAP
 
-    stop_time = EARLY_STOP_TIME if sm['modelV2'].action.desiredAcceleration < EARLY_BRAKE_GATE else MODEL_STOP_TIME
+    action = sm['modelV2'].action
+    terminal_speed = float(sm['modelV2'].velocity.x[-1]) if len(sm['modelV2'].velocity.x) >= 2 else math.inf
+    terminal_heading = float(sm['modelV2'].orientation.z[-1]) if len(sm['modelV2'].orientation.z) >= 2 else math.inf
+    early_stopping = (
+      len(xs) >= 2 and not tracking_lead and v_ego >= EARLY_STOP_MIN_SPEED and action.desiredAcceleration <= EARLY_BRAKE_GATE and
+      model_length <= v_ego ** 2 / (2.0 * EARLY_STOP_COMFORT_DECEL) + v_ego * EARLY_STOP_RESPONSE_S and
+      math.isfinite(terminal_speed) and terminal_speed <= min(EARLY_STOP_TERMINAL_MAX, v_ego * EARLY_STOP_TERMINAL_RATIO) and
+      math.isfinite(action.desiredCurvature) and abs(action.desiredCurvature) * v_ego ** 2 <= EARLY_STOP_MAX_LAT_ACCEL and
+      math.isfinite(terminal_heading) and abs(terminal_heading) <= EARLY_STOP_MAX_HEADING and
+      not (CS.leftBlinker or CS.rightBlinker)
+    )
+    stop_time = EARLY_STOP_TIME if action.desiredAcceleration < EARLY_BRAKE_GATE else MODEL_STOP_TIME
     model_stopping = 0.0 < model_length < max(v_ego * stop_time, MIN_STOP_LENGTH)
     latch_ready = 0.0 < model_length < max(v_ego * MODEL_STOP_TIME, MIN_STOP_LENGTH)
-    detected = (model_stopping or sm['modelV2'].action.shouldStop) and not tracking_lead
+    detected = (model_stopping or action.shouldStop) and not tracking_lead
     self.detect_filter.update(1.0 if detected else 0.0)
     self.position_hold_remaining = max(self.position_hold_remaining - self.dt, 0.0)
     if detected:
@@ -156,12 +176,10 @@ class ForceStops:
         # count down by distance actually traveled, immune to later dithering
         self.forcing = True
         self.remaining = max(model_length - LATCH_SETBACK, MIN_STOP_LENGTH)
-      elif self.detect_filter.x >= PRE_LATCH_GATE and 0.0 < model_length and not sm['radarState'].leadOne.present:
+      elif early_stopping or self.detect_filter.x >= PRE_LATCH_GATE:
         # pre-latch shaping: comfort envelope on the model's LIVE endpoint, so lead-less
         # red lights brake on the owner's curve instead of the model's backloaded ramp;
         # nothing is frozen yet, so a green light or model change of heart costs nothing.
-        # Gated on RAW lead status (not the lagging filter): shaping is advisory, and the
-        # lead-acquisition transient must never let it cap around a tracked lead
         return max(math.sqrt(2.0 * A_STOP_ENVELOPE * model_length), v_ego - DV_MAX)
       else:
         return NO_CAP
