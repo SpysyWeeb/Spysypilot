@@ -1,8 +1,14 @@
 import math
 from types import SimpleNamespace
 
-from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MAX, ForceStops, GAS_OVERRIDE_S,
-                                                           LATCH_SETBACK, STOP_POSITION_HOLD_S)
+import numpy as np
+
+from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MAX, ForceStops,
+                                                           GAS_OVERRIDE_S, LATCH_SETBACK, STOP_POSITION_HOLD_S)
+from openpilot.selfdrive.controls.lib.force_stops import MPC_PROFILE_OFFSET_M
+from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 
 
 DT = 0.05
@@ -38,13 +44,99 @@ def arm(force_stops, sm):
 def test_cem_qualified_stop_starts_live_shaping_before_latch():
   v_ego = 19.477
   for model_length in (116.146, 150.0):
-    expected_cap = max(math.sqrt(2.0 * A_STOP_ENVELOPE * model_length), v_ego - DV_MAX)
+    expected_cap = max(math.sqrt(2.0 * A_STOP_ENVELOPE * (model_length - MPC_PROFILE_OFFSET_M)), v_ego - DV_MAX)
     force_stops = ForceStops(dt=DT)
     sm = FakeSubMaster(model_length=model_length, should_stop=False, desired_accel=-0.73,
                        v_ego=v_ego, terminal_speed=4.066)
 
     assert math.isclose(force_stops.update(sm), expected_cap)
     assert not force_stops.forcing
+
+
+def test_starpilot_profile_uses_six_meter_offset():
+  assert A_STOP_ENVELOPE == 0.65
+  assert MPC_PROFILE_OFFSET_M == 6.0
+  force_stops = ForceStops(dt=DT)
+  profile_distance = 20.0
+  force_stops.forcing = True
+  force_stops.remaining = MPC_PROFILE_OFFSET_M + profile_distance
+  sm = FakeSubMaster(model_length=force_stops.remaining + LATCH_SETBACK, v_ego=0.0)
+
+  expected_cap = math.sqrt(2.0 * A_STOP_ENVELOPE * profile_distance)
+  assert math.isclose(force_stops.update(sm), expected_cap)
+
+
+def test_committed_stop_is_the_mpc_obstacle_until_final_landing():
+  absent_lead = SimpleNamespace(present=False, dRel=0.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=0.0)
+  radar_state = SimpleNamespace(leadOne=absent_lead, leadTwo=absent_lead)
+  mpc = LongitudinalMpc()
+  mpc.set_cur_state(10.0, 0.0)
+  mpc.update(radar_state)
+  baseline_obstacle = mpc.params[:, 2].copy()
+
+  mpc.update(radar_state, stop_x=30.0)
+  np.testing.assert_allclose(mpc.params[:, 2], 30.0 + STOP_DISTANCE)
+  assert mpc.source == LongitudinalPlanSource.cruise
+  assert mpc.a_solution[1] < 0.0
+
+  close_lead = SimpleNamespace(present=True, dRel=15.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=1.0)
+  mpc.update(SimpleNamespace(leadOne=close_lead, leadTwo=absent_lead), stop_x=30.0)
+  assert mpc.source == LongitudinalPlanSource.lead0
+  assert np.all(mpc.params[:, 2] <= 30.0 + STOP_DISTANCE)
+
+  for active_stop_x in (0.0, STOP_DISTANCE):
+    mpc.update(radar_state, stop_x=active_stop_x)
+    np.testing.assert_allclose(mpc.params[:, 2], active_stop_x + STOP_DISTANCE)
+
+  for released_stop_x in (-1.0, float("-inf"), float("inf"), float("nan")):
+    mpc.update(radar_state, stop_x=released_stop_x)
+    np.testing.assert_allclose(mpc.params[:, 2], baseline_obstacle)
+
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster(model_length=MPC_PROFILE_OFFSET_M + LATCH_SETBACK, v_ego=0.0)
+  force_stops.forcing = True
+  force_stops.remaining = MPC_PROFILE_OFFSET_M
+  assert force_stops.update(sm) == 0.0
+
+
+def test_committed_stop_stays_with_mpc_until_force_stops_releases():
+  v_ego = 6.4
+  CP = SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
+                       steerRatio=15.0, wheelbase=2.9)
+  planner = LongitudinalPlanner(CP, init_v=v_ego)
+  sm = FakeSubMaster(model_length=100.0, should_stop=False, desired_accel=0.0, v_ego=v_ego)
+  sm["carState"].vCruise = 100.0
+  sm["carState"].aEgo = 0.0
+  sm["carState"].steeringAngleDeg = 0.0
+  sm["controlsState"] = SimpleNamespace(forceDecel=False, longControlState=LongCtrlState.pid)
+  sm["carControl"] = SimpleNamespace(orientationNED=[])
+  sm["vehicleParameters"] = SimpleNamespace(angleOffsetDeg=0.0)
+  sm["selfdriveState"].personality = 1
+  sm["modelV2"].meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[]))
+  absent_lead = SimpleNamespace(present=False, dRel=0.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=0.0)
+  sm["radarState"] = SimpleNamespace(leadOne=absent_lead, leadTwo=absent_lead)
+
+  planner.force_stops.forcing = True
+  planner.force_stops.remaining = MPC_PROFILE_OFFSET_M + 0.48
+  planner.force_stops.position_hold_remaining = 1.0
+  planner.update(sm)
+  before_remaining = planner.force_stops.remaining
+  before_accel = planner.output_a_target
+  planner.update(sm)
+
+  assert before_remaining > MPC_PROFILE_OFFSET_M >= planner.force_stops.remaining
+  np.testing.assert_allclose(planner.mpc.params[:, 2], planner.force_stops.remaining + STOP_DISTANCE)
+  assert planner.output_a_target <= before_accel + 0.25
+
+  sm["carState"].vEgo = 0.2
+  planner.update(sm)
+  np.testing.assert_allclose(planner.mpc.params[:, 2], planner.force_stops.remaining + STOP_DISTANCE)
+  assert planner.output_should_stop
+
+  sm["selfdriveState"].experimentalMode = False
+  planner.update(sm)
+  assert not planner.force_stops.forcing
+  assert np.all(planner.mpc.params[:, 2] > STOP_DISTANCE)
 
 
 def test_incomplete_early_trajectory_cannot_shape():

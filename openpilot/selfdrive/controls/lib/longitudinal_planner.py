@@ -110,9 +110,11 @@ class LongitudinalPlanner:
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
+    force_stop_cap = self.force_stops.update(sm)
+    stop_x = self.force_stops.remaining if self.force_stops.forcing else None
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
-    self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality)
+    self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality, stop_x=stop_x)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -134,7 +136,7 @@ class LongitudinalPlanner:
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     # Force Stops: hold the model to a stop it planned (red-light indecision / e2e crawl)
-    v_cruise = min(v_cruise, self.force_stops.update(sm))
+    v_cruise = min(v_cruise, force_stop_cap)
     self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle)
