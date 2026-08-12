@@ -183,7 +183,7 @@ class ForceStops:
         # pre-latch shaping: comfort envelope on the model's LIVE endpoint, so lead-less
         # red lights brake on the owner's curve instead of the model's backloaded ramp;
         # nothing is frozen yet, so a green light or model change of heart costs nothing.
-        return max(math.sqrt(2.0 * A_STOP_ENVELOPE * committed_length), v_ego - DV_MAX)
+        return max(math.sqrt(2.0 * A_STOP_ENVELOPE * model_length), v_ego - DV_MAX)
       else:
         return NO_CAP
 
