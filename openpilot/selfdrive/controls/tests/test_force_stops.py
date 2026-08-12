@@ -38,7 +38,7 @@ def arm(force_stops, sm):
 def test_cem_qualified_stop_starts_live_shaping_before_latch():
   v_ego = 19.477
   for model_length in (116.146, 150.0):
-    expected_cap = max(math.sqrt(2.0 * A_STOP_ENVELOPE * (model_length - LATCH_SETBACK)), v_ego - DV_MAX)
+    expected_cap = max(math.sqrt(2.0 * A_STOP_ENVELOPE * model_length), v_ego - DV_MAX)
     force_stops = ForceStops(dt=DT)
     sm = FakeSubMaster(model_length=model_length, should_stop=False, desired_accel=-0.73,
                        v_ego=v_ego, terminal_speed=4.066)
@@ -103,17 +103,28 @@ def test_committed_endpoint_keeps_configured_setback():
   force_stops.update(sm)
   assert math.isclose(force_stops.remaining, 3.0 - 4.0 * DT)
 
+  outward_force_stops = ForceStops(dt=1.0)
+  outward_force_stops.forcing = True
+  outward_force_stops.detect_filter.x = 1.0
+  outward_force_stops.remaining = 6.0
+  outward_sm = FakeSubMaster(model_length=10.0, v_ego=4.0)
+  outward_force_stops.update(outward_sm)
+  assert math.isclose(outward_force_stops.remaining, 10.0 - LATCH_SETBACK)
+
   force_stops.remaining = 3.5
   sm["carState"].vEgo = 0.0
   sm["modelV2"].position.x[-1] = 5.0
   force_stops.update(sm)
   assert math.isclose(force_stops.remaining, 3.5 - 2.0 * DT)
 
-  force_stops.remaining = 1.0
-  sm["carState"].vEgo = 0.0
-  sm["modelV2"].position.x[-1] = 1.0
-  force_stops.update(sm)
-  assert force_stops.remaining >= 0.0
+  near_force_stops = ForceStops(dt=DT)
+  near_sm = FakeSubMaster(model_length=1.0, v_ego=1.0)
+  cap = math.inf
+  while not near_force_stops.forcing:
+    cap = near_force_stops.update(near_sm)
+  assert near_force_stops.remaining == 0.0
+  assert cap == max(0.0, near_sm["carState"].vEgo - DV_MAX)
+  assert math.isfinite(cap)
 
 
 def test_latched_position_survives_brief_model_clear():
