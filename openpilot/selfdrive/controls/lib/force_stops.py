@@ -52,8 +52,9 @@ DV_MAX = 2.0              # m/s, the cap may never sit further below current spe
                           # MPC erases in seconds; unbounded, a collapsing path commands a slam).
                           # Inside ~2 m/s of a stop the bound is moot and the commit ramp expresses
                           # fully, so the guaranteed-stop property is untouched
-LATCH_SETBACK = 1.0       # m, latch this far short of the model's endpoint (the owner's "stop a
-                          # little further behind the line" knob)
+# Feed every cap path the same physical endpoint; otherwise a pre-latch or ratchet path silently
+# erases the owner's stop-line setback.
+LATCH_SETBACK = 5.0       # m, route-calibrated distance short of the model's endpoint
 MIN_STOP_LENGTH = 3.0     # m, floor of the detector window, keeps it alive at crawl speeds
 DETECT_RC = 1.0           # s, filter time constant on the (flickery) detector
 LATCH_THRESHOLD = 0.55    # filtered detector level that latches a forced stop
@@ -134,6 +135,7 @@ class ForceStops:
     if not math.isfinite(model_length) or model_length <= 0.0:
       self._reset()
       return NO_CAP
+    committed_length = max(model_length - LATCH_SETBACK, 0.0)
 
     action = sm['modelV2'].action
     terminal_speed = float(sm['modelV2'].velocity.x[-1]) if len(sm['modelV2'].velocity.x) >= 2 else math.inf
@@ -173,27 +175,26 @@ class ForceStops:
 
     if not self.forcing:
       if self.detect_filter.x >= LATCH_THRESHOLD and latch_ready:
-        # latch the model's stop point now, while it is confident; from here we only
+        # latch the route-calibrated stop point now, while the model is confident; from here we only
         # count down by distance actually traveled, immune to later dithering
         self.forcing = True
-        self.remaining = max(model_length - LATCH_SETBACK, MIN_STOP_LENGTH)
+        self.remaining = committed_length
       elif early_stopping or self.detect_filter.x >= PRE_LATCH_GATE:
         # pre-latch shaping: comfort envelope on the model's LIVE endpoint, so lead-less
         # red lights brake on the owner's curve instead of the model's backloaded ramp;
         # nothing is frozen yet, so a green light or model change of heart costs nothing.
-        return max(math.sqrt(2.0 * A_STOP_ENVELOPE * model_length), v_ego - DV_MAX)
+        return max(math.sqrt(2.0 * A_STOP_ENVELOPE * committed_length), v_ego - DV_MAX)
       else:
         return NO_CAP
 
     self.remaining = max(self.remaining - v_ego * self.dt, 0.0)
     # forward-ratchet: while the model still confidently plans this stop, follow its endpoint
     # as it extends (bounded rate, never backward -- shrinking happens only by travel above)
-    if detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD and model_length > self.remaining + EXTEND_DEADBAND:
-      self.remaining = min(self.remaining + EXTEND_RATE * self.dt, model_length)
-    # endgame down-follow: close to the stop the model's endpoint IS the stop line -- never
-    # roll past it on a stale latch
-    if v_ego < DOWN_SPEED and 0.0 < model_length < self.remaining - DOWN_DEADBAND:
-      self.remaining = max(self.remaining - DOWN_RATE * self.dt, model_length)
+    if detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD and committed_length > self.remaining + EXTEND_DEADBAND:
+      self.remaining = min(self.remaining + EXTEND_RATE * self.dt, committed_length)
+    # endgame down-follow: never roll past the live, setback-adjusted endpoint on a stale latch
+    if v_ego < DOWN_SPEED and committed_length < self.remaining - DOWN_DEADBAND:
+      self.remaining = max(self.remaining - DOWN_RATE * self.dt, committed_length)
     if self.detect_filter.x < RELEASE_THRESHOLD and self.position_hold_remaining <= 0.0:
       self.forcing = False
       return NO_CAP
