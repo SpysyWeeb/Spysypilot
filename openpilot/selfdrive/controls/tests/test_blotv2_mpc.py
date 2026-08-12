@@ -302,9 +302,10 @@ class TestModelLeadTrajectory(unittest.TestCase):
       self.mpc.update(radar_state, model_leads=[lead_0, lead_1, lead], model_position=model_position, allow_third_lead=True)
     self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
 
-    for gap in (0.5, 0.500001, 0.75, 1.0, 1.5):
+    for gap in (0.5, np.nextafter(0.5, np.inf), 0.500001, 0.75, 1.0, 1.5):
       self.mpc.update(radar_state, model_leads=[lead_0, lead_1, candidate_a], model_position=model_position, allow_third_lead=False)
-      for frame in range(5):
+      self.mpc.set_cur_state(10.0, 0.0)
+      for frame in range(8):
         age = frame * self.mpc.dt
         future_t = LEAD_T_IDXS_MODEL + age
         x = 20.0 + 6.0 * future_t - 10.0 * age + (gap if frame % 2 else 0.0)
@@ -312,7 +313,8 @@ class TestModelLeadTrajectory(unittest.TestCase):
                                  y=np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, same_y),
                                  v=np.full(6, 6.0))
         self.mpc.update(radar_state, model_leads=[lead_0, lead_1, alternating], model_position=model_position, allow_third_lead=True)
-      self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+        self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+        self.assertNotEqual(self.mpc.source, LongitudinalPlanSource.lead2)
 
     self.mpc.update(radar_state, model_leads=[lead_0, lead_1, candidate_a], model_position=model_position, allow_third_lead=False)
     self.mpc.set_cur_state(0.0, 0.0)
