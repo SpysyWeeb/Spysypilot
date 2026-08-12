@@ -219,6 +219,9 @@ class LongitudinalPlanner:
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
+    force_stop_cap = self.force_stops.update(sm)
+    stop_x = self.force_stops.remaining if self.force_stops.forcing else None
+
     personality = sm['selfdriveState'].personality
     radar_valid = sm.all_checks(['radarState'])
     lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
@@ -244,6 +247,7 @@ class LongitudinalPlanner:
       personality=personality,
       t_follow=policy.t_follow,
       model_leads=model_leads,
+      stop_x=stop_x,
     )
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
@@ -311,7 +315,7 @@ class LongitudinalPlanner:
 
     # Optional Force Stops owns the committed approach point; CEM only selects
     # Experimental mode and Smooth Stops remains the final-landing owner.
-    v_cruise = min(v_cruise, self.force_stops.update(sm))
+    v_cruise = min(v_cruise, force_stop_cap)
 
     comfort_enabled = ordinary_cruise_comfort_enabled(
       experimental_mode,

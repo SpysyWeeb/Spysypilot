@@ -7,15 +7,12 @@ stop sign) but never commits: action.shouldStop dithers and the car crawls towar
 line indefinitely. The tell is the model's planned *path*: its endpoint closes in to a
 few meters while the stop intent flickers. This module reads that intent directly --
 when the model's path ends within a few seconds of travel and there is no lead, latch
-the model's own stop point and hold the plan to it by capping the cruise speed at
-(remaining distance / ramp time). The stock planner converts that cap into its cruise
-acceleration candidate while stronger MPC/e2e braking still wins; on combo,
-Smooth Stops lands the last meter. Force Stops decides that/where, the planner
-shapes, and Smooth Stops lands.
+the model's own stop point. A bounded cruise-speed cap shapes the approach; after
+commit, the planner also gives the remaining point to its native MPC. Force Stops
+never commands acceleration or brakes; on combo, Smooth Stops lands the last meter.
 
-A false detection only produces a gentle, plan-shaped slowdown; the latched point
-survives brief model dropouts, then unwinds after a bounded hold. The cap feeds
-the stock planner, never a synthetic brake command.
+Before commitment, a false detection only produces a bounded, plan-shaped slowdown;
+the latched point survives brief model dropouts, then unwinds after a bounded hold.
 """
 import math
 
@@ -38,9 +35,10 @@ EARLY_STOP_TERMINAL_RATIO = 0.35
 EARLY_STOP_TERMINAL_MAX = 6.5
 EARLY_STOP_MAX_LAT_ACCEL = 1.0
 EARLY_STOP_MAX_HEADING = math.radians(20.0)
-A_STOP_ENVELOPE = 1.2     # m/s^2, the owner's comfort curve applied to the model's stop point --
-                          # remaining/RAMP_TIME alone is a late linear ramp; the sqrt envelope
-                          # shapes the whole approach onto his fitted braking profile
+A_STOP_ENVELOPE = 0.65    # m/s^2, StarPilot's model-stop kinematic approach profile --
+                          # the lower profile pulls the bounded cruise target down earlier;
+                          # planner/MPC still chooses acceleration; DV_MAX bounds only the cap step
+MPC_PROFILE_OFFSET_M = 6.0  # m, StarPilot's profile reaches zero this far before its target
 PRE_LATCH_GATE = 0.35     # filtered detector level that turns on pre-latch shaping: a LIVE envelope
                           # on the model's current endpoint, following it freely down AND up. The
                           # latch itself stays on the classic window -- freezing the wide window's
@@ -183,7 +181,8 @@ class ForceStops:
         # pre-latch shaping: comfort envelope on the model's LIVE endpoint, so lead-less
         # red lights brake on the owner's curve instead of the model's backloaded ramp;
         # nothing is frozen yet, so a green light or model change of heart costs nothing.
-        return max(math.sqrt(2.0 * A_STOP_ENVELOPE * model_length), v_ego - DV_MAX)
+        profile_distance = max(model_length - MPC_PROFILE_OFFSET_M, 0.0)
+        return max(math.sqrt(2.0 * A_STOP_ENVELOPE * profile_distance), v_ego - DV_MAX)
       else:
         return NO_CAP
 
@@ -198,8 +197,8 @@ class ForceStops:
     if self.detect_filter.x < RELEASE_THRESHOLD and self.position_hold_remaining <= 0.0:
       self.forcing = False
       return NO_CAP
-    # linear commit ramp near the point, owner's comfort envelope shaping the approach into it,
-    # bounded so a collapsing target can never demand a slam (the commit ramp lives below the
-    # bound only within ~2 m/s of the stop, where it must)
-    cap = min(self.remaining / RAMP_TIME, math.sqrt(2.0 * A_STOP_ENVELOPE * self.remaining))
+    # Speed-cap fallback near the point. DV_MAX bounds only this cap step; after
+    # commitment, native MPC may choose stronger braking for the position target.
+    profile_distance = max(self.remaining - MPC_PROFILE_OFFSET_M, 0.0)
+    cap = min(profile_distance / RAMP_TIME, math.sqrt(2.0 * A_STOP_ENVELOPE * profile_distance))
     return max(cap, v_ego - DV_MAX)
