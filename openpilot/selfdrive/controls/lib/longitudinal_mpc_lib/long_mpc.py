@@ -62,9 +62,14 @@ MIN_X_LEAD_FACTOR = 0.5
 LEAD_THREE_CONFIRM = 0.2
 LEAD_THREE_INSIDE = 0.5
 LEAD_THREE_OUTSIDE = 2.6
-LEAD_THREE_Y_STD_MAX = 1.0
+LEAD_THREE_X_STD_MAX = 10.0
+LEAD_THREE_Y_STD_MAX = 3.0
+LEAD_THREE_V_STD_MAX = 10.0
 LEAD_THREE_V_DELTA_MAX = 5.0
-LEAD_THREE_TRACK_DELTA = np.array([1.0, 0.25, 1.5, 2.0, 0.5])
+LEAD_THREE_X_DELTA_MAX = 1.0
+LEAD_THREE_X_SHAPE_DELTA_MAX = 2.0
+LEAD_THREE_Y_DELTA_MAX = 0.5
+LEAD_THREE_V_TRACK_DELTA_MAX = 3.0
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -250,6 +255,7 @@ class LongitudinalMpc:
     self.crash_cnt = 0.0
     self.lead_three_confirm = 0.0
     self.lead_three_signature = None
+    self.source = LongitudinalPlanSource.cruise
     self.solution_status = 0
     # timers
     self.solve_time = 0.0
@@ -359,9 +365,11 @@ class LongitudinalMpc:
     """Return a model-only +4 s lead only when it moves into the predicted ego path."""
     try:
       x_model = np.asarray(model_lead.x, dtype=np.float64)
+      x_std = np.asarray(model_lead.xStd, dtype=np.float64)
       y_model = np.asarray(model_lead.y, dtype=np.float64)
       y_std = np.asarray(model_lead.yStd, dtype=np.float64)
       v_model = np.asarray(model_lead.v, dtype=np.float64)
+      v_std = np.asarray(model_lead.vStd, dtype=np.float64)
       t_model = np.asarray(model_lead.t, dtype=np.float64)
       path_x = np.asarray(model_position.x, dtype=np.float64)
       path_y = np.asarray(model_position.y, dtype=np.float64)
@@ -374,12 +382,17 @@ class LongitudinalMpc:
       np.isfinite(prob)
       and prob > 0.5
       and abs(prob_time - 4.0) < 0.1
-      and all(a.shape == LEAD_T_IDXS_MODEL.shape for a in (x_model, y_model, y_std, v_model, t_model))
+      and all(a.shape == LEAD_T_IDXS_MODEL.shape for a in (x_model, x_std, y_model, y_std, v_model, v_std, t_model))
       and path_x.shape == path_y.shape
       and path_x.size > 1
-      and all(np.all(np.isfinite(a)) for a in (x_model, y_model, y_std, v_model, t_model, path_x, path_y))
+      and all(np.all(np.isfinite(a)) for a in (x_model, x_std, y_model, y_std, v_model, v_std, t_model, path_x, path_y))
+      and np.all(x_std >= 0.0)
+      and np.max(x_std) < LEAD_THREE_X_STD_MAX
       and np.all(y_std >= 0.0)
+      and np.max(y_std) < LEAD_THREE_Y_STD_MAX
       and np.all(v_model >= 0.0)
+      and np.all(v_std >= 0.0)
+      and np.max(v_std) < LEAD_THREE_V_STD_MAX
       and np.array_equal(t_model, LEAD_T_IDXS_MODEL)
       and np.all(np.diff(path_x) >= 0.0)
       and np.all(np.diff(x_model) >= 0.0)
@@ -391,10 +404,9 @@ class LongitudinalMpc:
       return None
 
     prob_idx = int(np.argmin(np.abs(LEAD_T_IDXS_MODEL - prob_time)))
-    y_path = np.interp(x_model, path_x, path_y)
-    y_offset = np.abs(y_model - y_path)
-    if not (y_offset[0] > LEAD_THREE_OUTSIDE and y_offset[prob_idx] < LEAD_THREE_INSIDE
-            and np.max(y_std[:prob_idx + 1]) < LEAD_THREE_Y_STD_MAX):
+    y_relative = y_model - np.interp(x_model, path_x, path_y)
+    y_offset = np.abs(y_relative)
+    if not (y_offset[0] > LEAD_THREE_OUTSIDE and y_offset[prob_idx] < LEAD_THREE_INSIDE):
       return None
 
     x_lead = x_model - RADAR_TO_CAMERA
@@ -403,9 +415,14 @@ class LongitudinalMpc:
       return None
     min_x_lead = MIN_X_LEAD_FACTOR * (self.x0[1] + v_lead[0]) * (self.x0[1] - v_lead[0]) / (-ACCEL_MIN * 2)
     x_lead[0] = max(x_lead[0], min_x_lead)
-    entry_time = LEAD_T_IDXS_MODEL[np.flatnonzero(y_offset < LEAD_THREE_INSIDE)[0]]
+    entry_idx = next(i for i in range(1, prob_idx + 1)
+                     if y_offset[i] < LEAD_THREE_INSIDE or y_relative[i - 1] * y_relative[i] <= 0.0)
+    y0, y1 = y_relative[entry_idx - 1:entry_idx + 1]
+    t0, t1 = LEAD_T_IDXS_MODEL[entry_idx - 1:entry_idx + 1]
+    target_y = np.copysign(LEAD_THREE_INSIDE, y0)
+    entry_time = t0 + (target_y - y0) / (y1 - y0) * (t1 - t0)
     x_lead = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead))
-    x_lead[T_IDXS < entry_time] = 1e8
+    x_lead[T_IDXS + 1e-9 < entry_time] = 1e8
     v_lead = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead)
     return np.column_stack((x_lead, v_lead))
 
@@ -419,13 +436,31 @@ class LongitudinalMpc:
     model_lead_2 = model_leads[2] if model_leads is not None and len(model_leads) > 2 else None
     lead_xv_0 = self.process_lead_model(model_lead_0, radarstate.leadOne)
     lead_xv_1 = self.process_lead_model(model_lead_1, radarstate.leadTwo)
+    # ponytail: heuristic continuity until the model publishes stable lead IDs.
     lead_xv_2 = self.process_third_model_lead(model_lead_2, model_position) if allow_third_lead else None
     if lead_xv_2 is not None:
       assert model_lead_2 is not None
-      signature = np.array([model_lead_2.x[0], model_lead_2.y[0], lead_xv_2[0, 1], model_lead_2.x[2], model_lead_2.y[2]])
-      same_candidate = self.lead_three_signature is not None and np.all(np.abs(signature - self.lead_three_signature) < LEAD_THREE_TRACK_DELTA)
-      self.lead_three_confirm = self.lead_three_confirm + self.dt if same_candidate else 0.0
-      self.lead_three_signature = signature
+      x_model = np.asarray(model_lead_2.x)
+      y_model = np.asarray(model_lead_2.y)
+      v_model = np.asarray(model_lead_2.v)
+      assert model_position is not None
+      y_relative = y_model - np.interp(x_model, model_position.x, model_position.y)
+      if self.lead_three_signature is None:
+        same_candidate = False
+      else:
+        x0, v_rel, x_shape, y_shape, v_shape = self.lead_three_signature
+        age = self.lead_three_confirm + self.dt
+        same_candidate = (
+          abs(x_model[0] - (x0 + v_rel * age)) < LEAD_THREE_X_DELTA_MAX
+          and np.max(np.abs((x_model - x_model[0]) - x_shape)) < LEAD_THREE_X_SHAPE_DELTA_MAX
+          and np.max(np.abs(y_relative - y_shape)) < LEAD_THREE_Y_DELTA_MAX
+          and np.max(np.abs(v_model - v_shape)) < LEAD_THREE_V_TRACK_DELTA_MAX
+        )
+      if same_candidate:
+        self.lead_three_confirm += self.dt
+      else:
+        self.lead_three_confirm = 0.0
+        self.lead_three_signature = (x_model[0], lead_xv_2[0, 1] - self.x0[1], x_model - x_model[0], y_relative, v_model)
     else:
       self.lead_three_confirm = 0.0
       self.lead_three_signature = None
