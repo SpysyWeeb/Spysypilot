@@ -12,13 +12,13 @@ Makes the car **actually stop at red lights and stop signs in experimental mode*
 
 ## How it works
 
-The tell is the model's planned **path length**: when it intends to stop, the path endpoint closes in to a few meters even while the stop bit flickers. A filtered detector watches for `path end < v_ego × 3s` with no lead being tracked (a wider 4.5 s window applies while the model is actively braking, to catch back-loaded lead-less red lights). When the detector latches, the model's stop point is frozen and the cruise speed is capped at what reaches zero at that point. The stock planner converts that cap into its cruise acceleration candidate while stronger MPC/e2e braking still wins. Force Stops decides *that/where*, the planner *shapes*, and (on combo) Smooth Stops *lands* the last meter.
+The tell is the model's planned **path length**: when it intends to stop, the path endpoint closes in to a few meters even while the stop bit flickers. A filtered detector watches for `path end < v_ego × 3s` with no lead being tracked (a wider 4.5 s window applies while the model is actively braking, to catch back-loaded lead-less red lights). A bounded StarPilot-style kinematic profile starts reducing the cruise target before the latch. After commitment, the same tracked stop point becomes an optional native MPC obstacle. MPC retains it through the 6 m profile boundary and the rolling landing, until Force Stops itself releases. Force Stops decides *that/where*, the planner/MPC *shapes*, and (on combo) Smooth Stops *lands* the last meter.
 
 Safety/comfort properties baked in:
 
-- The cap feeds the stock cruise candidate, never a synthetic brake command, and cannot weaken stronger MPC/e2e braking.
-- The cap may never sit more than 2 m/s below current speed, so a collapsing model path can't command a slam.
-- Before the latch, a live comfort envelope (√(2·1.2·d)) shapes lead-less red-light approaches onto the owner's fitted braking curve instead of the model's late ramp.
+- Force Stops never emits acceleration or brake commands: its speed cap and committed position are inputs to the native planner/MPC, where closer leads and stronger e2e braking still win.
+- The speed cap may never sit more than 2 m/s below current speed; after commitment, the position constraint lets MPC plan directly to the tracked point.
+- The kinematic profile is `√(2·0.65·max(d−6, 0))`, matching StarPilot's model-stop approach without changing the active MPC's lead-spacing calibration.
 - The latched stop point follows the model's endpoint forward at a bounded rate (so a mid-collapse latch doesn't park the car short) and, below 3 m/s, downward too (so a stale latch can't roll past the model's stop line into a crosswalk).
 - Qualifying evidence refreshes a 4 s position hold, keeping the same tracked point through brief model dropouts.
 - Invalid model/radar data or either raw radar lead releases immediately instead of letting the position hold override lead handling.
@@ -27,5 +27,6 @@ Safety/comfort properties baked in:
 ## What changed
 
 - `openpilot/selfdrive/controls/lib/force_stops.py` — the `ForceStops` class: filtered path-length detector, position hold with forward-ratchet/down-follow, comfort envelope, validity/lead release, and gas override.
-- `openpilot/selfdrive/controls/lib/longitudinal_planner.py` — one hook: `v_cruise = min(v_cruise, force_stops.update(sm))`.
-- `openpilot/selfdrive/controls/tests/test_force_stops.py` — deterministic position-hold, driver/lead release, and invalid-model coverage.
+- `openpilot/selfdrive/controls/lib/longitudinal_planner.py` — applies the cap and passes only the committed remaining position to MPC.
+- `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` — accepts the optional stop obstacle and preserves closer-lead priority; planner keeps it until Force Stops releases.
+- `openpilot/selfdrive/controls/tests/test_force_stops.py` — deterministic position-hold, driver/lead release, invalid-model, profile, MPC-position, lead-priority, and handoff coverage.
