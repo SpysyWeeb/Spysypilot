@@ -440,7 +440,7 @@ class LongitudinalMpc:
     return np.column_stack((x_lead, v_lead))
 
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
-             t_follow=None, model_leads=None, model_position=None, allow_third_lead=False, stop_x=None):
+             t_follow=None, model_leads=None, model_position=None, allow_third_lead=False, v_ego=None, stop_x=None):
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
 
@@ -450,6 +450,8 @@ class LongitudinalMpc:
     lead_xv_0 = self.process_lead_model(model_lead_0, radarstate.leadOne)
     lead_xv_1 = self.process_lead_model(model_lead_1, radarstate.leadTwo)
     # ponytail: heuristic continuity until the model publishes stable lead IDs.
+    measured_ego_speed = self.x0[1] if v_ego is None else float(v_ego)
+    allow_third_lead = allow_third_lead and np.isfinite(measured_ego_speed)
     require_outside = self.lead_three_signature is None
     lead_xv_2 = self.process_third_model_lead(model_lead_2, model_position, require_outside) if allow_third_lead else None
     if lead_xv_2 is not None:
@@ -465,7 +467,7 @@ class LongitudinalMpc:
         same_candidate = False
       else:
         x_shape, y_shape, v_shape, _, original_entry = self.lead_three_signature
-        self.lead_three_ego_distance += 0.5 * (self.lead_three_ego_speed + self.x0[1]) * self.dt
+        self.lead_three_ego_distance += 0.5 * (self.lead_three_ego_speed + measured_ego_speed) * self.dt
         age = self.lead_three_confirm + self.dt
         future_t = LEAD_T_IDXS_MODEL + age
         overlap = future_t <= LEAD_T_IDXS_MODEL[-1]
@@ -484,12 +486,12 @@ class LongitudinalMpc:
           )
       if same_candidate:
         self.lead_three_confirm += self.dt
-        self.lead_three_ego_speed = self.x0[1]
+        self.lead_three_ego_speed = measured_ego_speed
       else:
         self.lead_three_confirm = 0.0
         self.lead_three_ego_distance = 0.0
-        self.lead_three_ego_speed = self.x0[1]
-        self.lead_three_signature = ((x_model, y_relative, v_model, self.x0[1], entry_time)
+        self.lead_three_ego_speed = measured_ego_speed
+        self.lead_three_signature = ((x_model, y_relative, v_model, measured_ego_speed, entry_time)
                                      if abs(y_relative[0]) > LEAD_THREE_OUTSIDE else None)
     else:
       self.lead_three_confirm = 0.0

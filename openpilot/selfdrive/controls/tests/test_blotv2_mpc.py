@@ -187,6 +187,10 @@ class TestModelLeadTrajectory(unittest.TestCase):
     self.mpc.source = LongitudinalPlanSource.lead2
     self.mpc.reset()
     self.assertEqual(self.mpc.source, LongitudinalPlanSource.cruise)
+    self.assertEqual(self.mpc.lead_three_confirm, 0.0)
+    self.assertIsNone(self.mpc.lead_three_signature)
+    self.assertEqual(self.mpc.lead_three_ego_distance, 0.0)
+    self.assertEqual(self.mpc.lead_three_ego_speed, 0.0)
 
   def test_third_model_lead_rejects_uncertain_or_malformed_path(self):
     model_position = SimpleNamespace(x=np.linspace(0.0, 200.0, 33), y=np.zeros(33))
@@ -272,6 +276,7 @@ class TestModelLeadTrajectory(unittest.TestCase):
     self.mpc.update(radar_state, model_leads=[lead_0, lead_1, approaching], model_position=model_position, allow_third_lead=False)
     ego_distance = 0.0
     previous_ego_speed = 10.0
+    accelerating_ego = approaching
     for frame in range(16):
       ego_speed = 10.0 + 2.0 * frame * self.mpc.dt
       if frame:
@@ -282,9 +287,16 @@ class TestModelLeadTrajectory(unittest.TestCase):
       accelerating_ego = model_lead(probTime=4.0, x=20.0 + 6.0 * future_t - ego_distance,
                                     y=np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, y_shape),
                                     v=np.full(6, 6.0))
-      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, accelerating_ego], model_position=model_position, allow_third_lead=True)
+      self.mpc.set_cur_state(10.0, 0.0)  # production MPC state is filtered; identity must use measured v_ego below
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, accelerating_ego], model_position=model_position,
+                      allow_third_lead=True, v_ego=ego_speed)
       previous_ego_speed = ego_speed
     self.assertGreater(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, accelerating_ego], model_position=model_position,
+                    allow_third_lead=True, v_ego=np.nan)
+    self.assertEqual(self.mpc.lead_three_confirm, 0.0)
+    self.assertIsNone(self.mpc.lead_three_signature)
 
     self.mpc.update(radar_state, model_leads=[lead_0, lead_1, approaching], model_position=model_position, allow_third_lead=False)
     same_y = np.array([3.0, 2.5, 0.4, 0.2, 0.1, 0.0])
