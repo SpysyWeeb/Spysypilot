@@ -66,17 +66,20 @@ LEAD_THREE_X_STD_MAX = 10.0
 LEAD_THREE_Y_STD_MAX = 3.0
 LEAD_THREE_V_STD_MAX = 10.0
 LEAD_THREE_V_DELTA_MAX = 5.0
+LEAD_THREE_X_ANCHOR_DELTA_MAX = 0.5
 LEAD_THREE_X_SHAPE_DELTA_MAX = 2.0
 LEAD_THREE_Y_DELTA_MAX = 0.5
 LEAD_THREE_V_TRACK_DELTA_MAX = 3.0
 LEAD_THREE_ENTRY_DELTA_MAX = 0.5
 
 
-def get_lead_path_entry(x_model, y_model, path_x, path_y, prob_idx):
+def get_lead_path_entry(x_model, y_model, path_x, path_y, prob_idx, require_outside=True):
   y_relative = y_model - np.interp(x_model, path_x, path_y)
   y_offset = np.abs(y_relative)
-  if not (y_offset[0] > LEAD_THREE_OUTSIDE and y_offset[prob_idx] < LEAD_THREE_INSIDE):
+  if y_offset[prob_idx] >= LEAD_THREE_INSIDE or (require_outside and y_offset[0] <= LEAD_THREE_OUTSIDE):
     return None
+  if y_offset[0] <= LEAD_THREE_INSIDE:
+    return y_relative, 0.0
 
   entry_idx = next(i for i in range(1, prob_idx + 1)
                    if y_offset[i] < LEAD_THREE_INSIDE or y_relative[i - 1] * y_relative[i] <= 0.0)
@@ -375,7 +378,7 @@ class LongitudinalMpc:
     v_lead = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, np.clip(v_lead, 0.0, 1e8))
     return np.column_stack((x_lead, v_lead))
 
-  def process_third_model_lead(self, model_lead, model_position):
+  def process_third_model_lead(self, model_lead, model_position, require_outside=True):
     """Return a model-only +4 s lead only when it moves into the predicted ego path."""
     try:
       x_model = np.asarray(model_lead.x, dtype=np.float64)
@@ -395,7 +398,7 @@ class LongitudinalMpc:
     valid = (
       np.isfinite(prob)
       and prob > 0.5
-      and abs(prob_time - 4.0) < 0.1
+      and 3.9 < prob_time < 4.1
       and all(a.shape == LEAD_T_IDXS_MODEL.shape for a in (x_model, x_std, y_model, y_std, v_model, v_std, t_model))
       and path_x.shape == path_y.shape
       and path_x.size > 1
@@ -418,7 +421,7 @@ class LongitudinalMpc:
       return None
 
     prob_idx = int(np.argmin(np.abs(LEAD_T_IDXS_MODEL - prob_time)))
-    path_entry = get_lead_path_entry(x_model, y_model, path_x, path_y, prob_idx)
+    path_entry = get_lead_path_entry(x_model, y_model, path_x, path_y, prob_idx, require_outside)
     if path_entry is None:
       return None
     _, entry_time = path_entry
@@ -445,14 +448,15 @@ class LongitudinalMpc:
     lead_xv_0 = self.process_lead_model(model_lead_0, radarstate.leadOne)
     lead_xv_1 = self.process_lead_model(model_lead_1, radarstate.leadTwo)
     # ponytail: heuristic continuity until the model publishes stable lead IDs.
-    lead_xv_2 = self.process_third_model_lead(model_lead_2, model_position) if allow_third_lead else None
+    require_outside = self.lead_three_signature is None
+    lead_xv_2 = self.process_third_model_lead(model_lead_2, model_position, require_outside) if allow_third_lead else None
     if lead_xv_2 is not None:
       assert model_lead_2 is not None
       x_model = np.asarray(model_lead_2.x)
       y_model = np.asarray(model_lead_2.y)
       v_model = np.asarray(model_lead_2.v)
       assert model_position is not None
-      path_entry = get_lead_path_entry(x_model, y_model, np.asarray(model_position.x), np.asarray(model_position.y), 2)
+      path_entry = get_lead_path_entry(x_model, y_model, np.asarray(model_position.x), np.asarray(model_position.y), 2, require_outside)
       assert path_entry is not None
       y_relative, entry_time = path_entry
       if self.lead_three_signature is None:
@@ -461,16 +465,20 @@ class LongitudinalMpc:
         x_shape, y_shape, v_shape, ego_speed, original_entry = self.lead_three_signature
         age = self.lead_three_confirm + self.dt
         future_t = LEAD_T_IDXS_MODEL + age
-        expected_x = np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, x_shape)
-        expected_x += np.maximum(future_t - LEAD_T_IDXS_MODEL[-1], 0.0) * v_shape[-1] - ego_speed * age
-        expected_y = np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, y_shape)
-        expected_v = np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, v_shape)
-        same_candidate = (
-          np.max(np.abs(x_model - expected_x)) < LEAD_THREE_X_SHAPE_DELTA_MAX
-          and np.max(np.abs(y_relative - expected_y)) < LEAD_THREE_Y_DELTA_MAX
-          and np.max(np.abs(v_model - expected_v)) < LEAD_THREE_V_TRACK_DELTA_MAX
-          and abs(entry_time - original_entry) < LEAD_THREE_ENTRY_DELTA_MAX
-        )
+        overlap = future_t <= LEAD_T_IDXS_MODEL[-1]
+        if not np.any(overlap):
+          same_candidate = False
+        else:
+          expected_x = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, x_shape) - ego_speed * age
+          expected_y = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, y_shape)
+          expected_v = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, v_shape)
+          same_candidate = (
+            min(abs(x_model[0] - expected_x[0]), abs(x_model[0] - x_shape[0])) < LEAD_THREE_X_ANCHOR_DELTA_MAX
+            and np.max(np.abs(x_model[overlap] - expected_x)) < LEAD_THREE_X_SHAPE_DELTA_MAX
+            and np.max(np.abs(y_relative[overlap] - expected_y)) < LEAD_THREE_Y_DELTA_MAX
+            and np.max(np.abs(v_model[overlap] - expected_v)) < LEAD_THREE_V_TRACK_DELTA_MAX
+            and min(abs(entry_time - original_entry), abs(entry_time - max(original_entry - age, 0.0))) < LEAD_THREE_ENTRY_DELTA_MAX
+          )
       if same_candidate:
         self.lead_three_confirm += self.dt
       else:
