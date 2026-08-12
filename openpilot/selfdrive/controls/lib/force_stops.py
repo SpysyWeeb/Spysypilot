@@ -52,8 +52,8 @@ DV_MAX = 2.0              # m/s, the cap may never sit further below current spe
                           # MPC erases in seconds; unbounded, a collapsing path commands a slam).
                           # Inside ~2 m/s of a stop the bound is moot and the commit ramp expresses
                           # fully, so the guaranteed-stop property is untouched
-# Feed every cap path the same physical endpoint; otherwise a pre-latch or ratchet path silently
-# erases the owner's stop-line setback.
+# Apply the setback to every committed endpoint path so later ratchets cannot erase it.
+# Pre-latch shaping stays on the raw live endpoint; final-placement tuning must not alter early response.
 LATCH_SETBACK = 5.0       # m, route-calibrated distance short of the model's endpoint
 MIN_STOP_LENGTH = 3.0     # m, floor of the detector window, keeps it alive at crawl speeds
 DETECT_RC = 1.0           # s, filter time constant on the (flickery) detector
