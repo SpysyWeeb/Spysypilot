@@ -1,7 +1,8 @@
 import math
 from types import SimpleNamespace
 
-from openpilot.selfdrive.controls.lib.force_stops import ForceStops, GAS_OVERRIDE_S, STOP_POSITION_HOLD_S
+from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MAX, ForceStops, GAS_OVERRIDE_S,
+                                                           LATCH_SETBACK, STOP_POSITION_HOLD_S)
 
 
 DT = 0.05
@@ -35,10 +36,12 @@ def arm(force_stops, sm):
 
 
 def test_cem_qualified_stop_starts_live_shaping_before_latch():
-  for model_length, expected_cap in ((116.146, 17.477), (150.0, math.sqrt(2.0 * 1.2 * 150.0))):
+  v_ego = 19.477
+  for model_length in (116.146, 150.0):
+    expected_cap = max(math.sqrt(2.0 * A_STOP_ENVELOPE * (model_length - LATCH_SETBACK)), v_ego - DV_MAX)
     force_stops = ForceStops(dt=DT)
     sm = FakeSubMaster(model_length=model_length, should_stop=False, desired_accel=-0.73,
-                       v_ego=19.477, terminal_speed=4.066)
+                       v_ego=v_ego, terminal_speed=4.066)
 
     assert math.isclose(force_stops.update(sm), expected_cap)
     assert not force_stops.forcing
@@ -85,6 +88,32 @@ def test_early_shaping_does_not_prime_physical_latch():
   force_stops.update(sm)
 
   assert not force_stops.forcing
+
+
+def test_committed_endpoint_keeps_configured_setback():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster()
+  while not force_stops.forcing:
+    force_stops.update(sm)
+  assert math.isclose(force_stops.remaining, 20.0 - LATCH_SETBACK - sm["carState"].vEgo * DT)
+
+  force_stops.remaining = 3.0
+  sm["carState"].vEgo = 4.0
+  sm["modelV2"].position.x[-1] = 7.0
+  force_stops.update(sm)
+  assert math.isclose(force_stops.remaining, 3.0 - 4.0 * DT)
+
+  force_stops.remaining = 3.5
+  sm["carState"].vEgo = 0.0
+  sm["modelV2"].position.x[-1] = 5.0
+  force_stops.update(sm)
+  assert math.isclose(force_stops.remaining, 3.5 - 2.0 * DT)
+
+  force_stops.remaining = 1.0
+  sm["carState"].vEgo = 0.0
+  sm["modelV2"].position.x[-1] = 1.0
+  force_stops.update(sm)
+  assert force_stops.remaining >= 0.0
 
 
 def test_latched_position_survives_brief_model_clear():
