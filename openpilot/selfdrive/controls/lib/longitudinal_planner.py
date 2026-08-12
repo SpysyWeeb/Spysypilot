@@ -3,6 +3,7 @@ import math
 import numpy as np
 
 import openpilot.cereal.messaging as messaging
+from openpilot.cereal import log
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -247,6 +248,13 @@ class LongitudinalPlanner:
       personality=personality,
       t_follow=policy.t_follow,
       model_leads=model_leads,
+      model_position=sm['modelV2'].position,
+      allow_third_lead=(
+        not reset_state
+        and sm.all_checks(['modelV2'])
+        and sm['modelV2'].meta.laneChangeState == log.LaneChangeState.off
+        and not (sm['carState'].leftBlinker or sm['carState'].rightBlinker)
+      ),
       stop_x=stop_x,
     )
 
