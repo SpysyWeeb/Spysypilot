@@ -8,9 +8,11 @@ from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX, BLOTV2_ACC
 
 from openpilot.selfdrive.controls.lib import longitudinal_planner
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
+  LEAD_THREE_CONFIRM,
   LEAD_T_IDXS_MODEL,
   T_IDXS,
   LongitudinalMpc,
+  LongitudinalPlanSource,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (
   get_cruise_accel,
@@ -37,7 +39,11 @@ def radar_lead(**overrides):
 def model_lead(**overrides):
   values = {
     "prob": 1.0,
+    "probTime": 0.0,
+    "t": LEAD_T_IDXS_MODEL,
     "x": 8.0 * LEAD_T_IDXS_MODEL,
+    "y": np.zeros_like(LEAD_T_IDXS_MODEL),
+    "yStd": np.full_like(LEAD_T_IDXS_MODEL, 0.2),
     "v": np.full_like(LEAD_T_IDXS_MODEL, 8.0),
   }
   values.update(overrides)
@@ -84,6 +90,75 @@ class TestModelLeadTrajectory(unittest.TestCase):
     expected = self.mpc.process_lead(radar)
     actual = self.mpc.process_lead_model(model_lead(), radar)
     np.testing.assert_allclose(actual, expected)
+
+  def test_third_model_lead_only_promotes_when_future_y_enters_path(self):
+    radar_state = SimpleNamespace(
+      leadOne=radar_lead(dRel=45.0, vLead=12.0),
+      leadTwo=radar_lead(present=False),
+    )
+    lead_0 = model_lead(x=12.0 * LEAD_T_IDXS_MODEL, v=np.full_like(LEAD_T_IDXS_MODEL, 12.0))
+    lead_1 = model_lead(prob=0.0)
+    adjacent = model_lead(probTime=4.0, x=20.0 + 6.0 * LEAD_T_IDXS_MODEL, y=np.full_like(LEAD_T_IDXS_MODEL, 3.0),
+                          v=np.full_like(LEAD_T_IDXS_MODEL, 6.0))
+    entering = model_lead(probTime=4.0, x=20.0 + 6.0 * LEAD_T_IDXS_MODEL, y=np.array([3.0, 2.5, 0.4, 0.2, 0.1, 0.0]),
+                         v=np.full_like(LEAD_T_IDXS_MODEL, 6.0))
+    model_position = SimpleNamespace(x=np.linspace(0.0, 200.0, 33), y=np.zeros(33))
+
+    adjacent_xv = self.mpc.process_third_model_lead(adjacent, model_position)
+    entering_xv = self.mpc.process_third_model_lead(entering, model_position)
+    curved_position = SimpleNamespace(x=model_position.x, y=0.01 * np.asarray(model_position.x))
+    curved_y = np.interp(entering.x, curved_position.x, curved_position.y) + np.array([3.0, 2.5, 0.4, 0.2, 0.1, 0.0])
+
+    self.assertIsNone(adjacent_xv)
+    self.assertIsNotNone(entering_xv)
+    self.assertIsNotNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"y": curved_y})), curved_position))
+    assert entering_xv is not None
+    self.assertTrue(np.all(entering_xv[T_IDXS < 4.0, 0] == 1e8))
+    entry_idx = np.flatnonzero(T_IDXS >= 4.0)[0]
+    self.assertAlmostEqual(entering_xv[entry_idx, 0], 20.0 + 6.0 * T_IDXS[entry_idx] - 1.52)
+
+    expected_obstacle = entering_xv[:, 0] + entering_xv[:, 1] ** 2 / 5.0
+    existing_obstacle = 45.0 + 12.0 * T_IDXS + 12.0 ** 2 / 5.0
+    for _ in range(4):
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position)
+      np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
+    for _ in range(4):
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=True)
+      np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=True)
+    np.testing.assert_allclose(self.mpc.params[:, 2], np.minimum(existing_obstacle, expected_obstacle))
+    self.assertEqual(self.mpc.source, LongitudinalPlanSource.lead2)
+
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=False)
+    self.assertEqual(self.mpc.lead_three_confirm, 0.0)
+    np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
+
+    alternate = model_lead(**(vars(entering) | {"x": np.asarray(entering.x) + 10.0}))
+    for lead in (entering, alternate) * 3:
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, lead], model_position=model_position, allow_third_lead=True)
+      self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+      np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
+
+  def test_third_model_lead_rejects_uncertain_or_malformed_path(self):
+    model_position = SimpleNamespace(x=np.linspace(0.0, 200.0, 33), y=np.zeros(33))
+    entering = model_lead(probTime=4.0, x=20.0 + 6.0 * LEAD_T_IDXS_MODEL, y=np.array([3.0, 2.5, 0.4, 0.2, 0.1, 0.0]),
+                         v=np.full_like(LEAD_T_IDXS_MODEL, 6.0))
+
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"yStd": np.ones(6)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"yStd": -np.ones(6)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"t": np.linspace(0.0, 0.5, 6)})), model_position))
+    near_t = np.array(LEAD_T_IDXS_MODEL)
+    near_t[2] += 1e-6
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"t": near_t})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"prob": np.inf})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"v": np.full(6, 80.0)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"y": [3.0]})), model_position))
+    bad_y = np.array(entering.y)
+    bad_y[2] = np.nan
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"y": bad_y})), model_position))
+    decreasing_x = np.array(entering.x)
+    decreasing_x[2] = decreasing_x[1] - 1.0
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"x": decreasing_x})), model_position))
 
   def test_runtime_policy_range_keeps_solver_finite(self):
     radar_state = SimpleNamespace(

@@ -9,7 +9,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
-from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU, RADAR_TO_CAMERA
 
 LEAD_T_IDXS_MODEL = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
 
@@ -59,6 +59,12 @@ T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 7.0
 MIN_X_LEAD_FACTOR = 0.5
+LEAD_THREE_CONFIRM = 0.2
+LEAD_THREE_INSIDE = 0.5
+LEAD_THREE_OUTSIDE = 2.6
+LEAD_THREE_Y_STD_MAX = 1.0
+LEAD_THREE_V_DELTA_MAX = 5.0
+LEAD_THREE_TRACK_DELTA = np.array([1.0, 0.25, 1.5, 2.0, 0.5])
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -242,6 +248,8 @@ class LongitudinalMpc:
 
     self.last_cloudlog_t = 0
     self.crash_cnt = 0.0
+    self.lead_three_confirm = 0.0
+    self.lead_three_signature = None
     self.solution_status = 0
     # timers
     self.solve_time = 0.0
@@ -347,15 +355,80 @@ class LongitudinalMpc:
     v_lead = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, np.clip(v_lead, 0.0, 1e8))
     return np.column_stack((x_lead, v_lead))
 
+  def process_third_model_lead(self, model_lead, model_position):
+    """Return a model-only +4 s lead only when it moves into the predicted ego path."""
+    try:
+      x_model = np.asarray(model_lead.x, dtype=np.float64)
+      y_model = np.asarray(model_lead.y, dtype=np.float64)
+      y_std = np.asarray(model_lead.yStd, dtype=np.float64)
+      v_model = np.asarray(model_lead.v, dtype=np.float64)
+      t_model = np.asarray(model_lead.t, dtype=np.float64)
+      path_x = np.asarray(model_position.x, dtype=np.float64)
+      path_y = np.asarray(model_position.y, dtype=np.float64)
+      prob = float(model_lead.prob)
+      prob_time = float(model_lead.probTime)
+    except (AttributeError, TypeError, ValueError):
+      return None
+
+    valid = (
+      np.isfinite(prob)
+      and prob > 0.5
+      and abs(prob_time - 4.0) < 0.1
+      and all(a.shape == LEAD_T_IDXS_MODEL.shape for a in (x_model, y_model, y_std, v_model, t_model))
+      and path_x.shape == path_y.shape
+      and path_x.size > 1
+      and all(np.all(np.isfinite(a)) for a in (x_model, y_model, y_std, v_model, t_model, path_x, path_y))
+      and np.all(y_std >= 0.0)
+      and np.all(v_model >= 0.0)
+      and np.array_equal(t_model, LEAD_T_IDXS_MODEL)
+      and np.all(np.diff(path_x) >= 0.0)
+      and np.all(np.diff(x_model) >= 0.0)
+      and x_model[0] >= path_x[0]
+      and x_model[2] <= path_x[-1]
+      and x_model[0] > RADAR_TO_CAMERA
+    )
+    if not valid:
+      return None
+
+    prob_idx = int(np.argmin(np.abs(LEAD_T_IDXS_MODEL - prob_time)))
+    y_path = np.interp(x_model, path_x, path_y)
+    y_offset = np.abs(y_model - y_path)
+    if not (y_offset[0] > LEAD_THREE_OUTSIDE and y_offset[prob_idx] < LEAD_THREE_INSIDE
+            and np.max(y_std[:prob_idx + 1]) < LEAD_THREE_Y_STD_MAX):
+      return None
+
+    x_lead = x_model - RADAR_TO_CAMERA
+    v_lead = np.clip(np.gradient(x_model, LEAD_T_IDXS_MODEL, edge_order=2), 0.0, 1e8)
+    if np.max(np.abs(v_lead - v_model)) > LEAD_THREE_V_DELTA_MAX:
+      return None
+    min_x_lead = MIN_X_LEAD_FACTOR * (self.x0[1] + v_lead[0]) * (self.x0[1] - v_lead[0]) / (-ACCEL_MIN * 2)
+    x_lead[0] = max(x_lead[0], min_x_lead)
+    entry_time = LEAD_T_IDXS_MODEL[np.flatnonzero(y_offset < LEAD_THREE_INSIDE)[0]]
+    x_lead = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead))
+    x_lead[T_IDXS < entry_time] = 1e8
+    v_lead = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead)
+    return np.column_stack((x_lead, v_lead))
+
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
-             t_follow=None, model_leads=None):
+             t_follow=None, model_leads=None, model_position=None, allow_third_lead=False):
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
 
     model_lead_0 = model_leads[0] if model_leads is not None and len(model_leads) > 0 else None
     model_lead_1 = model_leads[1] if model_leads is not None and len(model_leads) > 1 else None
+    model_lead_2 = model_leads[2] if model_leads is not None and len(model_leads) > 2 else None
     lead_xv_0 = self.process_lead_model(model_lead_0, radarstate.leadOne)
     lead_xv_1 = self.process_lead_model(model_lead_1, radarstate.leadTwo)
+    lead_xv_2 = self.process_third_model_lead(model_lead_2, model_position) if allow_third_lead else None
+    if lead_xv_2 is not None:
+      assert model_lead_2 is not None
+      signature = np.array([model_lead_2.x[0], model_lead_2.y[0], lead_xv_2[0, 1], model_lead_2.x[2], model_lead_2.y[2]])
+      same_candidate = self.lead_three_signature is not None and np.all(np.abs(signature - self.lead_three_signature) < LEAD_THREE_TRACK_DELTA)
+      self.lead_three_confirm = self.lead_three_confirm + self.dt if same_candidate else 0.0
+      self.lead_three_signature = signature
+    else:
+      self.lead_three_confirm = 0.0
+      self.lead_three_signature = None
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
@@ -364,7 +437,13 @@ class LongitudinalMpc:
     lead_1_obstacle = lead_xv_1[:,0] + get_stopped_equivalence_factor(lead_xv_1[:,1])
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
-    self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]
+    if lead_xv_2 is not None and self.lead_three_confirm + 1e-9 >= LEAD_THREE_CONFIRM:
+      lead_2_obstacle = lead_xv_2[:,0] + get_stopped_equivalence_factor(lead_xv_2[:,1])
+      lead_three_active = np.any(lead_2_obstacle < np.min(x_obstacles, axis=1))
+      x_obstacles = np.column_stack([x_obstacles, lead_2_obstacle])
+    else:
+      lead_three_active = False
+    self.source = LongitudinalPlanSource.lead2 if lead_three_active else MPC_SOURCES[np.argmin(x_obstacles[0])]
 
     self.yref[:,:] = 0.0
     for i in range(N):
