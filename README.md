@@ -25,12 +25,15 @@ Only two combined testing branches are maintained:
 
 **Status: in progress; awaiting fresh route replay and owner field validation.**
 After CEM selects Experimental mode for a lead-free model stop, Force Stops
-tracks that model endpoint as ego advances and caps the stock planner's cruise
-candidate. It resists ordinary farther-away endpoint noise, accepts bounded
-near-stop correction, and holds the same point for `4 s` through brief model
-flicker. Either raw radar lead, invalid model/radar data, driver gas,
-disengagement, or standstill releases it immediately. Stronger MPC/e2e braking
-still wins; Smooth Stops remains the sole final-landing and standstill-handoff
+tracks that model endpoint as ego advances, caps the planner's cruise candidate
+with a `0.65 m/s²` kinematic profile, and passes a committed physical stop point
+to longitudinal MPC. MPC retains that point through the profile's `6 m` boundary
+and rolling landing, until Force Stops itself releases. Force Stops resists
+ordinary farther-away endpoint noise, accepts bounded near-stop correction, and
+holds the same point for `4 s` through brief model flicker. Either raw radar lead,
+invalid model/radar data, driver gas, disengagement, or standstill releases it
+immediately. Closer leads and stronger MPC/e2e braking
+still win; Smooth Stops remains the sole final-landing and standstill-handoff
 owner.
 
 ## BLoTv2 Conditional Experimental Mode
