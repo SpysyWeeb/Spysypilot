@@ -3,7 +3,7 @@ import time
 import threading
 from collections.abc import Callable
 from enum import Enum
-from openpilot.cereal import messaging, log
+from openpilot.cereal import messaging, log, custom
 from opendbc.car.structs import car
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -171,11 +171,13 @@ class UIState:
       ss = self.sm["selfdriveState"]
       state = ss.state
 
-      if state in (log.SelfdriveState.OpenpilotState.preEnabled, log.SelfdriveState.OpenpilotState.overriding):
+      aol = self.sm["spysydriveStateSP"].aol
+      if state in (log.SelfdriveState.OpenpilotState.preEnabled, log.SelfdriveState.OpenpilotState.overriding) or \
+         aol.state == custom.AolState.AolStateEnum.overriding:
         self.status = UIStatus.OVERRIDE
       elif ss.enabled:
         self.status = UIStatus.ENGAGED
-      elif self.sm["spysydriveStateSP"].aol.active:
+      elif aol.active:
         self.status = UIStatus.AOL_ACTIVE
       else:
         self.status = UIStatus.DISENGAGED
