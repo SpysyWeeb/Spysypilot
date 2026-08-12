@@ -476,7 +476,7 @@ class LongitudinalMpc:
           expected_y = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, y_shape)
           expected_v = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, v_shape)
           same_candidate = (
-            abs(x_model[0] - expected_x[0]) < LEAD_THREE_X_ANCHOR_DELTA_MAX
+            abs(x_model[0] - expected_x[0]) < LEAD_THREE_X_ANCHOR_DELTA_MAX - 1e-6
             and np.max(np.abs(x_model[overlap] - expected_x)) < LEAD_THREE_X_SHAPE_DELTA_MAX
             and np.max(np.abs(y_relative[overlap] - expected_y)) < LEAD_THREE_Y_DELTA_MAX
             and np.max(np.abs(v_model[overlap] - expected_v)) < LEAD_THREE_V_TRACK_DELTA_MAX
