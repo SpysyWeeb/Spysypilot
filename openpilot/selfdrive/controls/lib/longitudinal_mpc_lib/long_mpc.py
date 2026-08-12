@@ -66,10 +66,24 @@ LEAD_THREE_X_STD_MAX = 10.0
 LEAD_THREE_Y_STD_MAX = 3.0
 LEAD_THREE_V_STD_MAX = 10.0
 LEAD_THREE_V_DELTA_MAX = 5.0
-LEAD_THREE_X_DELTA_MAX = 1.0
 LEAD_THREE_X_SHAPE_DELTA_MAX = 2.0
 LEAD_THREE_Y_DELTA_MAX = 0.5
 LEAD_THREE_V_TRACK_DELTA_MAX = 3.0
+LEAD_THREE_ENTRY_DELTA_MAX = 0.5
+
+
+def get_lead_path_entry(x_model, y_model, path_x, path_y, prob_idx):
+  y_relative = y_model - np.interp(x_model, path_x, path_y)
+  y_offset = np.abs(y_relative)
+  if not (y_offset[0] > LEAD_THREE_OUTSIDE and y_offset[prob_idx] < LEAD_THREE_INSIDE):
+    return None
+
+  entry_idx = next(i for i in range(1, prob_idx + 1)
+                   if y_offset[i] < LEAD_THREE_INSIDE or y_relative[i - 1] * y_relative[i] <= 0.0)
+  y0, y1 = y_relative[entry_idx - 1:entry_idx + 1]
+  t0, t1 = LEAD_T_IDXS_MODEL[entry_idx - 1:entry_idx + 1]
+  target_y = np.copysign(LEAD_THREE_INSIDE, y0)
+  return y_relative, t0 + (target_y - y0) / (y1 - y0) * (t1 - t0)
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -397,17 +411,17 @@ class LongitudinalMpc:
       and np.all(np.diff(path_x) >= 0.0)
       and np.all(np.diff(x_model) >= 0.0)
       and x_model[0] >= path_x[0]
-      and x_model[2] <= path_x[-1]
+      and x_model[-1] <= path_x[-1]
       and x_model[0] > RADAR_TO_CAMERA
     )
     if not valid:
       return None
 
     prob_idx = int(np.argmin(np.abs(LEAD_T_IDXS_MODEL - prob_time)))
-    y_relative = y_model - np.interp(x_model, path_x, path_y)
-    y_offset = np.abs(y_relative)
-    if not (y_offset[0] > LEAD_THREE_OUTSIDE and y_offset[prob_idx] < LEAD_THREE_INSIDE):
+    path_entry = get_lead_path_entry(x_model, y_model, path_x, path_y, prob_idx)
+    if path_entry is None:
       return None
+    _, entry_time = path_entry
 
     x_lead = x_model - RADAR_TO_CAMERA
     v_lead = np.clip(np.gradient(x_model, LEAD_T_IDXS_MODEL, edge_order=2), 0.0, 1e8)
@@ -415,12 +429,6 @@ class LongitudinalMpc:
       return None
     min_x_lead = MIN_X_LEAD_FACTOR * (self.x0[1] + v_lead[0]) * (self.x0[1] - v_lead[0]) / (-ACCEL_MIN * 2)
     x_lead[0] = max(x_lead[0], min_x_lead)
-    entry_idx = next(i for i in range(1, prob_idx + 1)
-                     if y_offset[i] < LEAD_THREE_INSIDE or y_relative[i - 1] * y_relative[i] <= 0.0)
-    y0, y1 = y_relative[entry_idx - 1:entry_idx + 1]
-    t0, t1 = LEAD_T_IDXS_MODEL[entry_idx - 1:entry_idx + 1]
-    target_y = np.copysign(LEAD_THREE_INSIDE, y0)
-    entry_time = t0 + (target_y - y0) / (y1 - y0) * (t1 - t0)
     x_lead = np.maximum.accumulate(np.interp(T_IDXS, LEAD_T_IDXS_MODEL, x_lead))
     x_lead[T_IDXS + 1e-9 < entry_time] = 1e8
     v_lead = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, v_lead)
@@ -444,23 +452,30 @@ class LongitudinalMpc:
       y_model = np.asarray(model_lead_2.y)
       v_model = np.asarray(model_lead_2.v)
       assert model_position is not None
-      y_relative = y_model - np.interp(x_model, model_position.x, model_position.y)
+      path_entry = get_lead_path_entry(x_model, y_model, np.asarray(model_position.x), np.asarray(model_position.y), 2)
+      assert path_entry is not None
+      y_relative, entry_time = path_entry
       if self.lead_three_signature is None:
         same_candidate = False
       else:
-        x0, v_rel, x_shape, y_shape, v_shape = self.lead_three_signature
+        x_shape, y_shape, v_shape, ego_speed, original_entry = self.lead_three_signature
         age = self.lead_three_confirm + self.dt
+        future_t = LEAD_T_IDXS_MODEL + age
+        expected_x = np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, x_shape)
+        expected_x += np.maximum(future_t - LEAD_T_IDXS_MODEL[-1], 0.0) * v_shape[-1] - ego_speed * age
+        expected_y = np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, y_shape)
+        expected_v = np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, v_shape)
         same_candidate = (
-          abs(x_model[0] - (x0 + v_rel * age)) < LEAD_THREE_X_DELTA_MAX
-          and np.max(np.abs((x_model - x_model[0]) - x_shape)) < LEAD_THREE_X_SHAPE_DELTA_MAX
-          and np.max(np.abs(y_relative - y_shape)) < LEAD_THREE_Y_DELTA_MAX
-          and np.max(np.abs(v_model - v_shape)) < LEAD_THREE_V_TRACK_DELTA_MAX
+          np.max(np.abs(x_model - expected_x)) < LEAD_THREE_X_SHAPE_DELTA_MAX
+          and np.max(np.abs(y_relative - expected_y)) < LEAD_THREE_Y_DELTA_MAX
+          and np.max(np.abs(v_model - expected_v)) < LEAD_THREE_V_TRACK_DELTA_MAX
+          and abs(entry_time - original_entry) < LEAD_THREE_ENTRY_DELTA_MAX
         )
       if same_candidate:
         self.lead_three_confirm += self.dt
       else:
         self.lead_three_confirm = 0.0
-        self.lead_three_signature = (x_model[0], lead_xv_2[0, 1] - self.x0[1], x_model - x_model[0], y_relative, v_model)
+        self.lead_three_signature = (x_model, y_relative, v_model, self.x0[1], entry_time)
     else:
       self.lead_three_confirm = 0.0
       self.lead_three_signature = None

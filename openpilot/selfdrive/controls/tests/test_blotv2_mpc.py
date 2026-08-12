@@ -198,12 +198,43 @@ class TestModelLeadTrajectory(unittest.TestCase):
     self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"prob": np.inf})), model_position))
     self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"v": np.full(6, 80.0)})), model_position))
     self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"y": [3.0]})), model_position))
+    short_path = SimpleNamespace(x=np.linspace(0.0, 45.0, 33), y=np.zeros(33))
+    self.assertIsNone(self.mpc.process_third_model_lead(entering, short_path))
     bad_y = np.array(entering.y)
     bad_y[2] = np.nan
     self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"y": bad_y})), model_position))
     decreasing_x = np.array(entering.x)
     decreasing_x[2] = decreasing_x[1] - 1.0
     self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"x": decreasing_x})), model_position))
+
+  def test_third_model_lead_continuity_tracks_evolving_trajectory(self):
+    radar_state = SimpleNamespace(leadOne=radar_lead(present=False), leadTwo=radar_lead(present=False))
+    model_position = SimpleNamespace(x=np.linspace(0.0, 300.0, 33), y=np.zeros(33))
+    lead_0 = model_lead(prob=0.0)
+    lead_1 = model_lead(prob=0.0)
+    self.mpc.set_cur_state(10.0, 0.0)
+
+    accelerating = model_lead()
+    for frame in range(5):
+      age = frame * self.mpc.dt
+      absolute_t = LEAD_T_IDXS_MODEL + age
+      accelerating = model_lead(
+        probTime=4.0,
+        x=20.0 + 6.0 * absolute_t + 0.5 * absolute_t ** 2 - 10.0 * age,
+        y=np.array([3.0, 2.5, 0.4, 0.2, 0.1, 0.0]),
+        v=6.0 + absolute_t,
+      )
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, accelerating], model_position=model_position, allow_third_lead=True)
+    self.assertGreaterEqual(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, accelerating], model_position=model_position, allow_third_lead=False)
+    candidate_a = model_lead(probTime=4.0, x=20.0 + 6.0 * LEAD_T_IDXS_MODEL,
+                             y=np.array([3.0, 2.6, 0.49, 0.2, 0.1, 0.0]), v=np.full(6, 6.0))
+    candidate_b = model_lead(probTime=4.0, x=20.8 + 6.0 * LEAD_T_IDXS_MODEL,
+                             y=np.array([3.0, 0.49, 0.2, 0.1, 0.0, 0.0]), v=np.full(6, 6.0))
+    for lead in (candidate_a, candidate_b, candidate_a, candidate_b, candidate_a):
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, lead], model_position=model_position, allow_third_lead=True)
+    self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
 
   def test_runtime_policy_range_keeps_solver_finite(self):
     radar_state = SimpleNamespace(
