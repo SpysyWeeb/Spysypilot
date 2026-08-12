@@ -42,9 +42,11 @@ def model_lead(**overrides):
     "probTime": 0.0,
     "t": LEAD_T_IDXS_MODEL,
     "x": 8.0 * LEAD_T_IDXS_MODEL,
+    "xStd": np.full_like(LEAD_T_IDXS_MODEL, 0.5),
     "y": np.zeros_like(LEAD_T_IDXS_MODEL),
     "yStd": np.full_like(LEAD_T_IDXS_MODEL, 0.2),
     "v": np.full_like(LEAD_T_IDXS_MODEL, 8.0),
+    "vStd": np.full_like(LEAD_T_IDXS_MODEL, 0.5),
   }
   values.update(overrides)
   return SimpleNamespace(**values)
@@ -117,6 +119,20 @@ class TestModelLeadTrajectory(unittest.TestCase):
     entry_idx = np.flatnonzero(T_IDXS >= 4.0)[0]
     self.assertAlmostEqual(entering_xv[entry_idx, 0], 20.0 + 6.0 * T_IDXS[entry_idx] - 1.52)
 
+    crossing_between_samples = model_lead(**(vars(entering) | {"y": np.array([3.0, 1.0, 0.0, 0.0, 0.0, 0.0])}))
+    crossing_xv = self.mpc.process_third_model_lead(crossing_between_samples, model_position)
+    assert crossing_xv is not None
+    crossing_time = 3.0
+    self.assertTrue(np.all(crossing_xv[T_IDXS < crossing_time, 0] == 1e8))
+    self.assertTrue(np.all(crossing_xv[T_IDXS >= crossing_time, 0] < 1e8))
+
+    centerline_crossing = model_lead(**(vars(entering) | {"y": np.array([3.0, 1.0, -0.4, -0.2, -0.1, 0.0])}))
+    centerline_xv = self.mpc.process_third_model_lead(centerline_crossing, model_position)
+    assert centerline_xv is not None
+    centerline_entry = 2.0 + (1.0 - 0.5) / (1.0 + 0.4) * 2.0
+    self.assertTrue(np.all(centerline_xv[T_IDXS < centerline_entry, 0] == 1e8))
+    self.assertTrue(np.all(centerline_xv[T_IDXS >= centerline_entry, 0] < 1e8))
+
     expected_obstacle = entering_xv[:, 0] + entering_xv[:, 1] ** 2 / 5.0
     existing_obstacle = 45.0 + 12.0 * T_IDXS + 12.0 ** 2 / 5.0
     for _ in range(4):
@@ -139,12 +155,41 @@ class TestModelLeadTrajectory(unittest.TestCase):
       self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
       np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
 
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=False)
+    self.mpc.set_cur_state(31.0, 0.0)
+    fast_closing = entering
+    for frame in range(5):
+      moved = model_lead(**(vars(fast_closing) | {"x": np.asarray(fast_closing.x) - 1.25 * frame}))
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, moved], model_position=model_position, allow_third_lead=True)
+    self.assertGreaterEqual(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=False)
+    changed_entry = model_lead(**(vars(entering) | {"y": np.array([3.0, 0.4, 0.3, 0.2, 0.1, 0.0])}))
+    for lead in (entering, entering, changed_entry, changed_entry, changed_entry):
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, lead], model_position=model_position, allow_third_lead=True)
+    self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=False)
+    shifted_path = SimpleNamespace(x=model_position.x, y=np.full_like(model_position.x, 0.75))
+    for path in (model_position, model_position, shifted_path, shifted_path, shifted_path):
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=path, allow_third_lead=True)
+    self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+
+    self.mpc.source = LongitudinalPlanSource.lead2
+    self.mpc.reset()
+    self.assertEqual(self.mpc.source, LongitudinalPlanSource.cruise)
+
   def test_third_model_lead_rejects_uncertain_or_malformed_path(self):
     model_position = SimpleNamespace(x=np.linspace(0.0, 200.0, 33), y=np.zeros(33))
     entering = model_lead(probTime=4.0, x=20.0 + 6.0 * LEAD_T_IDXS_MODEL, y=np.array([3.0, 2.5, 0.4, 0.2, 0.1, 0.0]),
                          v=np.full_like(LEAD_T_IDXS_MODEL, 6.0))
 
-    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"yStd": np.ones(6)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"yStd": np.full(6, 3.0)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"xStd": np.full(6, 1e6)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"vStd": np.full(6, 1e6)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"xStd": np.full(6, np.nan)})), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(SimpleNamespace(**{k: v for k, v in vars(entering).items() if k != "xStd"}), model_position))
+    self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"vStd": -np.ones(6)})), model_position))
     self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"yStd": -np.ones(6)})), model_position))
     self.assertIsNone(self.mpc.process_third_model_lead(model_lead(**(vars(entering) | {"t": np.linspace(0.0, 0.5, 6)})), model_position))
     near_t = np.array(LEAD_T_IDXS_MODEL)
