@@ -133,15 +133,24 @@ class TestModelLeadTrajectory(unittest.TestCase):
     self.assertTrue(np.all(centerline_xv[T_IDXS < centerline_entry, 0] == 1e8))
     self.assertTrue(np.all(centerline_xv[T_IDXS >= centerline_entry, 0] < 1e8))
 
-    expected_obstacle = entering_xv[:, 0] + entering_xv[:, 1] ** 2 / 5.0
     existing_obstacle = 45.0 + 12.0 * T_IDXS + 12.0 ** 2 / 5.0
     for _ in range(4):
       self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position)
       np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
-    for _ in range(4):
-      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=True)
-      np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
-    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, entering], model_position=model_position, allow_third_lead=True)
+    tracked = entering
+    for frame in range(5):
+      age = frame * self.mpc.dt
+      future_t = LEAD_T_IDXS_MODEL + age
+      tracked = model_lead(**(vars(entering) | {
+        "x": 20.0 + 6.0 * future_t - 10.0 * age,
+        "y": np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, entering.y),
+      }))
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, tracked], model_position=model_position, allow_third_lead=True)
+      if frame < 4:
+        np.testing.assert_allclose(self.mpc.params[:, 2], existing_obstacle)
+    tracked_xv = self.mpc.process_third_model_lead(tracked, model_position, require_outside=False)
+    assert tracked_xv is not None
+    expected_obstacle = tracked_xv[:, 0] + tracked_xv[:, 1] ** 2 / 5.0
     np.testing.assert_allclose(self.mpc.params[:, 2], np.minimum(existing_obstacle, expected_obstacle))
     self.assertEqual(self.mpc.source, LongitudinalPlanSource.lead2)
 
@@ -238,6 +247,12 @@ class TestModelLeadTrajectory(unittest.TestCase):
     for lead in (candidate_a, candidate_b, candidate_a, candidate_b, candidate_a):
       self.mpc.update(radar_state, model_leads=[lead_0, lead_1, lead], model_position=model_position, allow_third_lead=True)
     self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+    inside_b = model_lead(probTime=4.0, x=21.25 + 6.0 * LEAD_T_IDXS_MODEL,
+                          y=np.array([0.4, 0.3, 0.2, 0.1, 0.0, 0.0]), v=np.full(6, 6.0))
+    for _ in range(5):
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, inside_b], model_position=model_position, allow_third_lead=True)
+    self.assertEqual(self.mpc.lead_three_confirm, 0.0)
+    self.assertNotEqual(self.mpc.source, LongitudinalPlanSource.lead2)
 
     self.mpc.update(radar_state, model_leads=[lead_0, lead_1, candidate_a], model_position=model_position, allow_third_lead=False)
     approaching = candidate_a
@@ -255,6 +270,23 @@ class TestModelLeadTrajectory(unittest.TestCase):
     self.assertEqual(self.mpc.source, LongitudinalPlanSource.lead2)
 
     self.mpc.update(radar_state, model_leads=[lead_0, lead_1, approaching], model_position=model_position, allow_third_lead=False)
+    ego_distance = 0.0
+    previous_ego_speed = 10.0
+    for frame in range(16):
+      ego_speed = 10.0 + 2.0 * frame * self.mpc.dt
+      if frame:
+        ego_distance += 0.5 * (previous_ego_speed + ego_speed) * self.mpc.dt
+      self.mpc.set_cur_state(ego_speed, 0.0)
+      age = frame * self.mpc.dt
+      future_t = LEAD_T_IDXS_MODEL + age
+      accelerating_ego = model_lead(probTime=4.0, x=20.0 + 6.0 * future_t - ego_distance,
+                                    y=np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, y_shape),
+                                    v=np.full(6, 6.0))
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, accelerating_ego], model_position=model_position, allow_third_lead=True)
+      previous_ego_speed = ego_speed
+    self.assertGreater(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+
+    self.mpc.update(radar_state, model_leads=[lead_0, lead_1, approaching], model_position=model_position, allow_third_lead=False)
     same_y = np.array([3.0, 2.5, 0.4, 0.2, 0.1, 0.0])
     for frame in range(5):
       age = frame * self.mpc.dt
@@ -270,6 +302,18 @@ class TestModelLeadTrajectory(unittest.TestCase):
       self.mpc.update(radar_state, model_leads=[lead_0, lead_1, lead], model_position=model_position, allow_third_lead=True)
     self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
 
+    for gap in (0.5, 0.500001, 0.75, 1.0, 1.5):
+      self.mpc.update(radar_state, model_leads=[lead_0, lead_1, candidate_a], model_position=model_position, allow_third_lead=False)
+      for frame in range(5):
+        age = frame * self.mpc.dt
+        future_t = LEAD_T_IDXS_MODEL + age
+        x = 20.0 + 6.0 * future_t - 10.0 * age + (gap if frame % 2 else 0.0)
+        alternating = model_lead(probTime=4.0, x=x,
+                                 y=np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, same_y),
+                                 v=np.full(6, 6.0))
+        self.mpc.update(radar_state, model_leads=[lead_0, lead_1, alternating], model_position=model_position, allow_third_lead=True)
+      self.assertLess(self.mpc.lead_three_confirm, LEAD_THREE_CONFIRM)
+
     self.mpc.update(radar_state, model_leads=[lead_0, lead_1, candidate_a], model_position=model_position, allow_third_lead=False)
     self.mpc.set_cur_state(0.0, 0.0)
     for frame in range(202):
@@ -279,7 +323,8 @@ class TestModelLeadTrajectory(unittest.TestCase):
                               y=np.interp(np.minimum(future_t, LEAD_T_IDXS_MODEL[-1]), LEAD_T_IDXS_MODEL, same_y),
                               v=np.full(6, 6.0))
       self.mpc.update(radar_state, model_leads=[lead_0, lead_1, long_lived], model_position=model_position, allow_third_lead=True)
-    self.assertIsNotNone(self.mpc.lead_three_signature)
+    self.assertIsNone(self.mpc.lead_three_signature)
+    self.assertNotEqual(self.mpc.source, LongitudinalPlanSource.lead2)
 
   def test_runtime_policy_range_keeps_solver_finite(self):
     radar_state = SimpleNamespace(
