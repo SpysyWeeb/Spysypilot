@@ -256,6 +256,7 @@ class LongitudinalPlanner:
         and not (sm['carState'].leftBlinker or sm['carState'].rightBlinker)
       ),
       stop_x=stop_x,
+      v_ego=v_ego,
     )
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
