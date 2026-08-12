@@ -272,6 +272,8 @@ class LongitudinalMpc:
     self.crash_cnt = 0.0
     self.lead_three_confirm = 0.0
     self.lead_three_signature = None
+    self.lead_three_ego_distance = 0.0
+    self.lead_three_ego_speed = 0.0
     self.source = LongitudinalPlanSource.cruise
     self.solution_status = 0
     # timers
@@ -462,31 +464,38 @@ class LongitudinalMpc:
       if self.lead_three_signature is None:
         same_candidate = False
       else:
-        x_shape, y_shape, v_shape, ego_speed, original_entry = self.lead_three_signature
+        x_shape, y_shape, v_shape, _, original_entry = self.lead_three_signature
+        self.lead_three_ego_distance += 0.5 * (self.lead_three_ego_speed + self.x0[1]) * self.dt
         age = self.lead_three_confirm + self.dt
         future_t = LEAD_T_IDXS_MODEL + age
         overlap = future_t <= LEAD_T_IDXS_MODEL[-1]
         if not np.any(overlap):
           same_candidate = False
         else:
-          expected_x = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, x_shape) - ego_speed * age
+          expected_x = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, x_shape) - self.lead_three_ego_distance
           expected_y = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, y_shape)
           expected_v = np.interp(future_t[overlap], LEAD_T_IDXS_MODEL, v_shape)
           same_candidate = (
-            min(abs(x_model[0] - expected_x[0]), abs(x_model[0] - x_shape[0])) < LEAD_THREE_X_ANCHOR_DELTA_MAX
+            abs(x_model[0] - expected_x[0]) < LEAD_THREE_X_ANCHOR_DELTA_MAX
             and np.max(np.abs(x_model[overlap] - expected_x)) < LEAD_THREE_X_SHAPE_DELTA_MAX
             and np.max(np.abs(y_relative[overlap] - expected_y)) < LEAD_THREE_Y_DELTA_MAX
             and np.max(np.abs(v_model[overlap] - expected_v)) < LEAD_THREE_V_TRACK_DELTA_MAX
-            and min(abs(entry_time - original_entry), abs(entry_time - max(original_entry - age, 0.0))) < LEAD_THREE_ENTRY_DELTA_MAX
+            and abs(entry_time - max(original_entry - age, 0.0)) < LEAD_THREE_ENTRY_DELTA_MAX
           )
       if same_candidate:
         self.lead_three_confirm += self.dt
+        self.lead_three_ego_speed = self.x0[1]
       else:
         self.lead_three_confirm = 0.0
-        self.lead_three_signature = (x_model, y_relative, v_model, self.x0[1], entry_time)
+        self.lead_three_ego_distance = 0.0
+        self.lead_three_ego_speed = self.x0[1]
+        self.lead_three_signature = ((x_model, y_relative, v_model, self.x0[1], entry_time)
+                                     if abs(y_relative[0]) > LEAD_THREE_OUTSIDE else None)
     else:
       self.lead_three_confirm = 0.0
       self.lead_three_signature = None
+      self.lead_three_ego_distance = 0.0
+      self.lead_three_ego_speed = 0.0
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
