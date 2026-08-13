@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState, long_control_state_trans
-from openpilot.selfdrive.controls.lib.smooth_stops import HOLD_RELEASE_FRAMES, LEAD_DROPOUT_GRACE
+from openpilot.selfdrive.controls.lib.smooth_stops import LEAD_DROPOUT_GRACE
 
 
 class TestLongControlStateTransition(OpenpilotTestCase):
@@ -92,17 +92,13 @@ class TestSmoothStopRoute17Continuity(OpenpilotTestCase):
     control.update(True, car_state(), 0.2, False, (-3.5, 2.0))
     assert control.long_control_state == LongCtrlState.pid
 
-  def test_measured_lead_departure_uses_normal_release(self):
+  def test_measured_lead_departure_releases_immediately(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.smooth.arm_hold()
     control.update(True, car_state(), 0.2, True, (-3.5, 2.0),
                    lead_distance=4.3, has_lead=True, lead_speed=0.0)
 
-    for _ in range(HOLD_RELEASE_FRAMES - 1):
-      control.update(True, car_state(), 0.2, False, (-3.5, 2.0),
-                     lead_distance=4.3, has_lead=True, lead_speed=0.4)
-      assert control.long_control_state == LongCtrlState.stopping
     control.update(True, car_state(), 0.2, False, (-3.5, 2.0),
                    lead_distance=4.3, has_lead=True, lead_speed=0.4)
     assert control.long_control_state == LongCtrlState.pid

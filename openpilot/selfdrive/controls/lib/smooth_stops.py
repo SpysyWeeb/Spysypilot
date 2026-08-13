@@ -113,9 +113,13 @@ class SmoothStopController:
     # starting and release brake pressure at standstill. Only release once should_stop has
     # been false for HOLD_RELEASE_FRAMES straight. A stopped lead receives the same
     # bounded grace already used for moving-queue radar churn; it never becomes an
-    # unbounded second hold owner. Measured departure keeps the normal release delay.
+    # unbounded second hold owner. Genuine measured departure releases immediately.
     # The counter is deliberately NOT cleared by reset() -- reset() runs every frame
     # while holding, which would defeat the debounce.
+    if not should_stop and has_lead and lead_speed >= LEAD_MOVING_ENTER:
+      self._no_stop_frames = 0
+      self._release_had_lead = False
+      return True
     if should_stop:
       self._no_stop_frames = 0
       self._release_had_lead = has_lead and lead_speed < LEAD_MOVING_ENTER
