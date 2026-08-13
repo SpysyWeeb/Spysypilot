@@ -82,6 +82,7 @@ class ForceStops:
   def __init__(self, dt: float = DT_MDL):
     self.dt = dt
     self.detect_filter = FirstOrderFilter(0.0, DETECT_RC, dt)
+    self.braking_filter = FirstOrderFilter(0.0, DETECT_RC, dt)
     self.lead_filter = FirstOrderFilter(0.0, LEAD_RC, dt)
     self.forcing = False
     self.remaining = 0.0
@@ -90,6 +91,7 @@ class ForceStops:
 
   def _reset(self) -> None:
     self.detect_filter.x = 0.0
+    self.braking_filter.x = 0.0
     self.lead_filter.x = 0.0
     self.forcing = False
     self.remaining = 0.0
@@ -103,6 +105,7 @@ class ForceStops:
     if CS.gasPressed:
       self.override_timer = GAS_OVERRIDE_S
       self.detect_filter.x = 0.0
+      self.braking_filter.x = 0.0
       self.forcing = False
       self.position_hold_remaining = 0.0
       return NO_CAP
@@ -123,6 +126,7 @@ class ForceStops:
     tracking_lead = self.lead_filter.x > LEAD_GATE
     if lead_present:
       self.detect_filter.x = 0.0
+      self.braking_filter.x = 0.0
       self.forcing = False
       self.position_hold_remaining = 0.0
       return NO_CAP
@@ -155,6 +159,7 @@ class ForceStops:
     latch_ready = 0.0 < model_length < max(v_ego * latch_time, MIN_STOP_LENGTH)
     detected = (model_stopping or action.shouldStop) and not tracking_lead
     self.detect_filter.update(1.0 if detected else 0.0)
+    self.braking_filter.update(1.0 if detected and braking else 0.0)
     self.position_hold_remaining = max(self.position_hold_remaining - self.dt, 0.0)
     if detected:
       self.position_hold_remaining = STOP_POSITION_HOLD_S
@@ -175,7 +180,8 @@ class ForceStops:
       return NO_CAP
 
     if not self.forcing:
-      if self.detect_filter.x >= LATCH_THRESHOLD and latch_ready:
+      latch_confident = self.braking_filter.x if braking and latch_time > MODEL_STOP_TIME else self.detect_filter.x
+      if latch_confident >= LATCH_THRESHOLD and latch_ready:
         # latch the route-calibrated stop point now, while the model is confident; from here we only
         # count down by distance actually traveled, immune to later dithering
         self.forcing = True
