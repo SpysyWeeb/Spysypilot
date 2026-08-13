@@ -155,6 +155,7 @@ class ForceStops:
     braking = math.isfinite(action.desiredAcceleration) and action.desiredAcceleration < EARLY_BRAKE_GATE
     stop_time = EARLY_STOP_TIME if braking else MODEL_STOP_TIME
     model_stopping = 0.0 < model_length < max(v_ego * stop_time, MIN_STOP_LENGTH)
+    classic_latch_ready = 0.0 < model_length < max(v_ego * MODEL_STOP_TIME, MIN_STOP_LENGTH)
     latch_time = LATCH_STOP_TIME if braking else MODEL_STOP_TIME
     latch_ready = 0.0 < model_length < max(v_ego * latch_time, MIN_STOP_LENGTH)
     detected = (model_stopping or action.shouldStop) and not tracking_lead
@@ -180,7 +181,7 @@ class ForceStops:
       return NO_CAP
 
     if not self.forcing:
-      latch_confident = self.braking_filter.x if braking and latch_time > MODEL_STOP_TIME else self.detect_filter.x
+      latch_confident = self.detect_filter.x if classic_latch_ready else self.braking_filter.x
       if latch_confident >= LATCH_THRESHOLD and latch_ready:
         # latch the route-calibrated stop point now, while the model is confident; from here we only
         # count down by distance actually traveled, immune to later dithering
