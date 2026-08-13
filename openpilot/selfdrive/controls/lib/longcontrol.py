@@ -66,7 +66,7 @@ class LongControl:
       stop_now = self.smooth.want_hold(should_stop, CS.vEgo, CS.standstill)
     elif active and self.long_control_state == LongCtrlState.stopping:
       # debounced hold exit: a one-frame should_stop flicker must not blip the brake at standstill
-      stop_now = not self.smooth.hold_release(should_stop)
+      stop_now = not self.smooth.hold_release(should_stop, has_lead, lead_speed)
     else:
       stop_now = should_stop
 

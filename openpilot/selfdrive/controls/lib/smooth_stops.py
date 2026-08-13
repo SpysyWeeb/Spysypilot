@@ -78,6 +78,7 @@ class SmoothStopController:
     self._entry_v = 0.0
     self._entry_decel = 0.0
     self._no_stop_frames = 0
+    self._release_had_lead = False
     self._lead_moving = False
     self._lead_dropout_s = 0.0
 
@@ -104,18 +105,28 @@ class SmoothStopController:
     # through want_hold, and a counter left >= HOLD_RELEASE_FRAMES by the previous stop
     # would let a one-frame should_stop flicker release the new hold instantly.
     self._no_stop_frames = 0
+    self._release_had_lead = False
 
-  def hold_release(self, should_stop: bool) -> bool:
+  def hold_release(self, should_stop: bool, has_lead: bool = False, lead_speed: float = 0.0) -> bool:
     # Debounce the hold exit: the plan's should_stop can flicker false for a frame while
     # stopped (seen with e2e in experimental mode), which would blip the state machine to
     # starting and release brake pressure at standstill. Only release once should_stop has
-    # been false for HOLD_RELEASE_FRAMES straight. The counter is deliberately NOT cleared
-    # by reset() -- reset() runs every frame while holding, which would defeat the debounce.
+    # been false for HOLD_RELEASE_FRAMES straight. A stopped lead receives the same
+    # bounded grace already used for moving-queue radar churn; it never becomes an
+    # unbounded second hold owner. Measured departure keeps the normal release delay.
+    # The counter is deliberately NOT cleared by reset() -- reset() runs every frame
+    # while holding, which would defeat the debounce.
     if should_stop:
       self._no_stop_frames = 0
+      self._release_had_lead = has_lead and lead_speed < LEAD_MOVING_ENTER
     else:
+      if self._release_had_lead and has_lead and lead_speed >= LEAD_MOVING_ENTER:
+        self._release_had_lead = False
+        self._no_stop_frames = 0
+      self._release_had_lead |= has_lead and lead_speed < LEAD_MOVING_ENTER
       self._no_stop_frames += 1
-    return self._no_stop_frames >= HOLD_RELEASE_FRAMES
+    release_frames = round((LEAD_DROPOUT_GRACE if self._release_had_lead else HOLD_RELEASE_FRAMES * DT_CTRL) / DT_CTRL)
+    return self._no_stop_frames >= release_frames
 
   def _update_lead_motion(self, has_lead: bool, lead_speed: float) -> bool:
     if has_lead:
