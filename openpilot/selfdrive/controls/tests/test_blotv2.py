@@ -204,8 +204,8 @@ class TestLeadDeparturePreRelease(unittest.TestCase):
     for speed in route_noise:
       self.assertFalse(release.update(True, True, lead(v=speed, d=4.3), None))
 
-    for _ in range(frames(LEAD_DEPARTURE_CONFIRM) - 1):
-      self.assertFalse(release.update(True, True, lead(v=0.4, d=4.3), None))
+  def test_strong_measured_motion_releases_immediately(self):
+    release = LeadDeparturePreRelease()
     self.assertTrue(release.update(True, True, lead(v=0.4, d=4.3), None))
 
   def test_collapsed_prediction_reapplies_hold(self):
