@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MAX, ForceStops,
-                                                           GAS_OVERRIDE_S, LATCH_SETBACK, STOP_POSITION_HOLD_S)
+                                                           GAS_OVERRIDE_S, LATCH_SETBACK, LATCH_THRESHOLD,
+                                                           STOP_POSITION_HOLD_S)
 from openpilot.selfdrive.controls.lib.force_stops import MPC_PROFILE_OFFSET_M
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, LongitudinalMpc, LongitudinalPlanSource
@@ -42,19 +43,31 @@ def arm(force_stops, sm):
 
 
 def test_force_stops_latches_on_the_bounded_early_horizon():
-  sm = FakeSubMaster(model_length=51.0, v_ego=16.0, should_stop=True, desired_accel=-0.8)
+  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=False, desired_accel=-0.8)
   force_stops = ForceStops(dt=DT)
 
-  for _ in range(20):
+  for _ in range(30):
     force_stops.update(sm)
 
   assert force_stops.forcing
   assert 3.0 * sm["carState"].vEgo < sm["modelV2"].position.x[-1] < 3.25 * sm["carState"].vEgo
 
-  nonbraking = FakeSubMaster(model_length=51.0, v_ego=16.0, should_stop=True, desired_accel=0.0)
+  nonbraking = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=0.0)
   force_stops = ForceStops(dt=DT)
   for _ in range(30):
     force_stops.update(nonbraking)
+  assert not force_stops.forcing
+
+
+def test_force_stops_does_not_spend_nonbraking_confidence_on_one_braking_frame():
+  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=0.0)
+  force_stops = ForceStops(dt=DT)
+  while force_stops.detect_filter.x < LATCH_THRESHOLD:
+    force_stops.update(sm)
+  assert not force_stops.forcing
+
+  sm["modelV2"].action.desiredAcceleration = -0.8
+  force_stops.update(sm)
   assert not force_stops.forcing
 
 
