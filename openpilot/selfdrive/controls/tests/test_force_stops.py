@@ -41,6 +41,23 @@ def arm(force_stops, sm):
   assert force_stops.forcing
 
 
+def test_force_stops_latches_on_the_bounded_early_horizon():
+  sm = FakeSubMaster(model_length=51.0, v_ego=16.0, should_stop=True, desired_accel=-0.8)
+  force_stops = ForceStops(dt=DT)
+
+  for _ in range(20):
+    force_stops.update(sm)
+
+  assert force_stops.forcing
+  assert 3.0 * sm["carState"].vEgo < sm["modelV2"].position.x[-1] < 3.25 * sm["carState"].vEgo
+
+  nonbraking = FakeSubMaster(model_length=51.0, v_ego=16.0, should_stop=True, desired_accel=0.0)
+  force_stops = ForceStops(dt=DT)
+  for _ in range(30):
+    force_stops.update(nonbraking)
+  assert not force_stops.forcing
+
+
 def test_cem_qualified_stop_starts_live_shaping_before_latch():
   v_ego = 19.477
   for model_length in (116.146, 150.0):
