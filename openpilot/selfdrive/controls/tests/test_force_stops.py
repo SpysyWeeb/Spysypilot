@@ -70,6 +70,11 @@ def test_force_stops_does_not_spend_nonbraking_confidence_on_one_braking_frame()
   force_stops.update(sm)
   assert not force_stops.forcing
 
+  sm["modelV2"].action.desiredAcceleration = 0.0
+  sm["modelV2"].position.x[-1] = 30.0
+  force_stops.update(sm)
+  assert force_stops.forcing
+
 
 def test_cem_qualified_stop_starts_live_shaping_before_latch():
   v_ego = 19.477
