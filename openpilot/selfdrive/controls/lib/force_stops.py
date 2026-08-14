@@ -18,6 +18,8 @@ import math
 
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.conditional_experimental_mode import FORCE_STOP_COMMIT_DISTANCE_M, model_trajectories_complete_and_finite
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 
 MODEL_STOP_TIME = 3.0     # s, path endpoint within v_ego * this reads as "model plans to stop"
 LATCH_STOP_TIME = 3.25    # s, commit braking evidence once its filtered stop intent is stable
@@ -76,6 +78,7 @@ DOWN_RATE = 2.0           # m/s, bounded, so the car cannot roll past the model'
                           # latch stays immune to the endpoint collapsing onto the car mid-braking
 DOWN_DEADBAND = 1.0       # m
 NO_CAP = float('inf')
+CEM_QUALIFIED_MAX_AGE_S = 2.0 * DT_MDL
 
 
 class ForceStops:
@@ -100,8 +103,6 @@ class ForceStops:
   def update(self, sm) -> float:
     """Returns a cruise speed cap in m/s; NO_CAP when inactive. min() it into v_cruise."""
     CS = sm['carState']
-    v_ego = max(CS.vEgo, 0.0)
-
     if CS.gasPressed:
       self.override_timer = GAS_OVERRIDE_S
       self.detect_filter.x = 0.0
@@ -110,14 +111,22 @@ class ForceStops:
       self.position_hold_remaining = 0.0
       return NO_CAP
 
+    if not math.isfinite(CS.vEgo):
+      self._reset()
+      return NO_CAP
+    v_ego = max(CS.vEgo, 0.0)
+
+    if CS.brakePressed:
+      self._reset()
+      return NO_CAP
+
     self.override_timer = max(self.override_timer - self.dt, 0.0)
 
     if not (sm['selfdriveState'].enabled and sm['selfdriveState'].experimentalMode):
       self._reset()
       return NO_CAP
 
-    valid = getattr(sm, 'valid', {})
-    if not (valid.get('modelV2', False) and valid.get('radarState', False)):
+    if not sm.all_checks(['carState', 'modelV2', 'radarState', 'selfdriveState']):
       self._reset()
       return NO_CAP
 
@@ -133,16 +142,35 @@ class ForceStops:
 
     # the model's planned path ends here; a short endpoint means it is planning a stop,
     # however much its shouldStop bit dithers
-    xs = sm['modelV2'].position.x
-    model_length = float(xs[-1]) if len(xs) else 0.0
-    if not math.isfinite(model_length) or model_length <= 0.0:
+    model = sm['modelV2']
+    if not model_trajectories_complete_and_finite(model):
       self._reset()
       return NO_CAP
-    committed_length = max(model_length - LATCH_SETBACK, 0.0)
 
-    action = sm['modelV2'].action
-    terminal_speed = float(sm['modelV2'].velocity.x[-1]) if len(sm['modelV2'].velocity.x) >= 2 else math.inf
-    terminal_heading = float(sm['modelV2'].orientation.z[-1]) if len(sm['modelV2'].orientation.z) >= 2 else math.inf
+    xs = model.position.x
+    model_length = float(xs[-1]) if len(xs) else 0.0
+    if len(xs) < 2 or not math.isfinite(model_length) or model_length <= 0.0:
+      self._reset()
+      return NO_CAP
+
+    action = model.action
+    desired_accel = float(action.desiredAcceleration)
+    if not math.isfinite(desired_accel):
+      self._reset()
+      return NO_CAP
+    qualified_distance = float(getattr(sm['selfdriveState'], 'conditionalStopDistance', 0.0))
+    qualified_model_time = int(getattr(sm['selfdriveState'], 'conditionalStopModelMonoTime', 0))
+    model_time = int(getattr(sm, 'logMonoTime', {}).get('modelV2', 0))
+    qualified_age = (model_time - qualified_model_time) / 1e9
+    cem_stop_qualified = (
+      bool(getattr(sm['selfdriveState'], 'conditionalStopQualified', False)) and
+      math.isfinite(qualified_distance) and 0.0 < qualified_distance < FORCE_STOP_COMMIT_DISTANCE_M and
+      0.0 <= qualified_age <= CEM_QUALIFIED_MAX_AGE_S
+    )
+    qualified_current_distance = qualified_distance - v_ego * qualified_age
+    committed_length = max((qualified_current_distance if cem_stop_qualified else model_length) - LATCH_SETBACK, 0.0)
+    terminal_speed = float(model.velocity.x[-1]) if len(model.velocity.x) >= 2 else math.inf
+    terminal_heading = float(model.orientation.z[-1]) if len(model.orientation.z) >= 2 else math.inf
     early_stopping = (
       len(xs) >= 2 and not tracking_lead and v_ego >= EARLY_STOP_MIN_SPEED and
       math.isfinite(action.desiredAcceleration) and action.desiredAcceleration <= EARLY_BRAKE_GATE and
@@ -152,13 +180,13 @@ class ForceStops:
       math.isfinite(terminal_heading) and abs(terminal_heading) <= EARLY_STOP_MAX_HEADING and
       not (CS.leftBlinker or CS.rightBlinker)
     )
-    braking = math.isfinite(action.desiredAcceleration) and action.desiredAcceleration < EARLY_BRAKE_GATE
+    braking = desired_accel < EARLY_BRAKE_GATE
     stop_time = EARLY_STOP_TIME if braking else MODEL_STOP_TIME
     model_stopping = 0.0 < model_length < max(v_ego * stop_time, MIN_STOP_LENGTH)
     classic_latch_ready = 0.0 < model_length < max(v_ego * MODEL_STOP_TIME, MIN_STOP_LENGTH)
     latch_time = LATCH_STOP_TIME if braking else MODEL_STOP_TIME
     latch_ready = 0.0 < model_length < max(v_ego * latch_time, MIN_STOP_LENGTH)
-    detected = (model_stopping or action.shouldStop) and not tracking_lead
+    detected = ((model_stopping or action.shouldStop) and not tracking_lead) or cem_stop_qualified
     self.detect_filter.update(1.0 if detected else 0.0)
     self.braking_filter.update(1.0 if detected and braking else 0.0)
     self.position_hold_remaining = max(self.position_hold_remaining - self.dt, 0.0)
@@ -180,13 +208,15 @@ class ForceStops:
       self._reset()
       return NO_CAP
 
+    just_committed = False
     if not self.forcing:
       latch_confident = self.detect_filter.x if classic_latch_ready else self.braking_filter.x
-      if latch_confident >= LATCH_THRESHOLD and latch_ready:
+      if cem_stop_qualified or (latch_confident >= LATCH_THRESHOLD and latch_ready):
         # latch the route-calibrated stop point now, while the model is confident; from here we only
         # count down by distance actually traveled, immune to later dithering
         self.forcing = True
         self.remaining = committed_length
+        just_committed = True
       elif early_stopping or self.detect_filter.x >= PRE_LATCH_GATE:
         # pre-latch shaping: comfort envelope on the model's LIVE endpoint, so lead-less
         # red lights brake on the owner's curve instead of the model's backloaded ramp;
@@ -196,13 +226,18 @@ class ForceStops:
       else:
         return NO_CAP
 
-    self.remaining = max(self.remaining - v_ego * self.dt, 0.0)
+    if not just_committed:
+      self.remaining -= v_ego * self.dt
+    if self.remaining <= -STOP_DISTANCE:
+      self._reset()
+      return NO_CAP
     # forward-ratchet: while the model still confidently plans this stop, follow its endpoint
     # as it extends (bounded rate, never backward -- shrinking happens only by travel above)
-    if detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD and committed_length > self.remaining + EXTEND_DEADBAND:
+    if (self.remaining > 0.0 and detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD and
+        committed_length > self.remaining + EXTEND_DEADBAND):
       self.remaining = min(self.remaining + EXTEND_RATE * self.dt, committed_length)
     # endgame down-follow: never roll past the live, setback-adjusted endpoint on a stale latch
-    if v_ego < DOWN_SPEED and committed_length < self.remaining - DOWN_DEADBAND:
+    if self.remaining > 0.0 and v_ego < DOWN_SPEED and committed_length < self.remaining - DOWN_DEADBAND:
       self.remaining = max(self.remaining - DOWN_RATE * self.dt, committed_length)
     if self.detect_filter.x < RELEASE_THRESHOLD and self.position_hold_remaining <= 0.0:
       self.forcing = False

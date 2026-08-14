@@ -805,6 +805,9 @@ struct SelfdriveState {
   # configurable driving settings
   experimentalMode @10 :Bool;
   personality @11 :LongitudinalPersonality;
+  conditionalStopQualified @14 :Bool;
+  conditionalStopDistance @15 :Float32;
+  conditionalStopModelMonoTime @16 :UInt64;
 
   enum AudibleAlert {
     none @0;

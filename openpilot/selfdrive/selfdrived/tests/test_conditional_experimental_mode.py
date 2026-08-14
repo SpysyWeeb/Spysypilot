@@ -12,15 +12,17 @@ class FakeSubMaster(dict):
       radarState=SimpleNamespace(),
     )
     self.updated = {'modelV2': True}
-    self.valid = {'modelV2': True}
-    self.alive = {'modelV2': True}
-    self.freq_ok = {'modelV2': True}
+    self.valid = {'modelV2': True, 'radarState': True}
+    self.alive = {'modelV2': True, 'radarState': True}
+    self.freq_ok = {'modelV2': True, 'radarState': True}
 
 
 class FakeConditionalMode:
-  def __init__(self, conditional_request, driver_override=False):
+  def __init__(self, conditional_request, driver_override=False, stop_qualified=False, stop_distance=None):
     self.conditional_request = conditional_request
     self.driver_override_active = driver_override
+    self.stop_qualified = stop_qualified
+    self.stop_distance = stop_distance
     self.calls = []
 
   def update(self, *args, **kwargs):
@@ -53,7 +55,18 @@ def test_selfdrived_is_single_effective_mode_owner():
     'controls_enabled': True,
     'model_updated': True,
     'model_valid': True,
+    'radar_valid': True,
   }
+
+
+def test_selfdrived_passes_invalid_radar_health_to_conditional_mode():
+  instance = selfdrive_for_mode_update(conditional_request=False)
+  instance.sm.alive['radarState'] = False
+
+  instance.update_experimental_mode(SimpleNamespace())
+
+  _, kwargs = instance.conditional_experimental_mode.calls[0]
+  assert kwargs['radar_valid'] is False
 
 
 def test_manual_request_and_conditional_request_resolve_in_one_place():
@@ -135,11 +148,12 @@ def test_publish_selfdrive_state_uses_effective_experimental_mode(monkeypatch):
   instance.enabled = True
   instance.active = True
   instance.experimental_mode = True
+  instance.conditional_experimental_mode = FakeConditionalMode(True, stop_qualified=True, stop_distance=42.5)
   instance.personality = 0
   instance.state_machine = SimpleNamespace(state=1)
   instance.events = SimpleNamespace(contains=lambda event_type: False, names=[])
   instance.events_prev = []
-  instance.sm = SimpleNamespace(frame=1)
+  instance.sm = SimpleNamespace(frame=1, logMonoTime={'modelV2': 123456789})
   instance.AM = SimpleNamespace(current_alert=SimpleNamespace(
     alert_text_1='',
     alert_text_2='',
@@ -153,3 +167,6 @@ def test_publish_selfdrive_state_uses_effective_experimental_mode(monkeypatch):
   instance.publish_selfdriveState(SimpleNamespace())
 
   assert sent['selfdriveState'].selfdriveState.experimentalMode is True
+  assert sent['selfdriveState'].selfdriveState.conditionalStopQualified is True
+  assert sent['selfdriveState'].selfdriveState.conditionalStopDistance == 42.5
+  assert sent['selfdriveState'].selfdriveState.conditionalStopModelMonoTime == 123456789

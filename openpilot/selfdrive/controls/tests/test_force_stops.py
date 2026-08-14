@@ -3,13 +3,14 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from openpilot.cereal import log
 from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MAX, ForceStops,
-                                                           GAS_OVERRIDE_S, LATCH_SETBACK, LATCH_THRESHOLD,
-                                                           STOP_POSITION_HOLD_S)
+                                                           GAS_OVERRIDE_S, LATCH_SETBACK, LATCH_THRESHOLD)
 from openpilot.selfdrive.controls.lib.force_stops import MPC_PROFILE_OFFSET_M
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
 DT = 0.05
@@ -17,23 +18,38 @@ DT = 0.05
 
 class FakeSubMaster(dict):
   def __init__(self, *, model_length=20.0, should_stop=True, desired_accel=-0.6,
-               v_ego=10.0, lead_present=False, model_valid=True, terminal_speed=0.0):
+               v_ego=10.0, lead_present=False, model_valid=True, terminal_speed=0.0,
+               conditional_stop_qualified=False, qualified_distance=0.0,
+               model_mono_time=2_000_000_000, qualified_model_mono_time=2_000_000_000):
     super().__init__(
-      carState=SimpleNamespace(vEgo=v_ego, gasPressed=False, standstill=False,
+      carState=SimpleNamespace(vEgo=v_ego, gasPressed=False, brakePressed=False, standstill=False,
                                leftBlinker=False, rightBlinker=False),
-      selfdriveState=SimpleNamespace(enabled=True, experimentalMode=True),
+      selfdriveState=SimpleNamespace(enabled=True, experimentalMode=True,
+                                     conditionalStopQualified=conditional_stop_qualified,
+                                     conditionalStopDistance=qualified_distance,
+                                     conditionalStopModelMonoTime=qualified_model_mono_time),
       radarState=SimpleNamespace(
         leadOne=SimpleNamespace(present=lead_present),
         leadTwo=SimpleNamespace(present=False),
       ),
       modelV2=SimpleNamespace(
-        position=SimpleNamespace(x=[0.0, model_length]),
-        velocity=SimpleNamespace(x=[v_ego, terminal_speed]),
+        position=SimpleNamespace(x=[model_length * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]),
+        velocity=SimpleNamespace(x=[v_ego + (terminal_speed - v_ego) * i / (ModelConstants.IDX_N - 1)
+                                    for i in range(ModelConstants.IDX_N)]),
+        acceleration=SimpleNamespace(x=[desired_accel] * ModelConstants.IDX_N),
         orientation=SimpleNamespace(z=[0.0, 0.0]),
         action=SimpleNamespace(shouldStop=should_stop, desiredAcceleration=desired_accel, desiredCurvature=0.0),
       ),
     )
-    self.valid = {"modelV2": model_valid, "radarState": True}
+    self.valid = {"carState": True, "modelV2": model_valid, "radarState": True, "selfdriveState": True}
+    self.alive = dict.fromkeys(self.valid, True)
+    self.freq_ok = dict.fromkeys(self.valid, True)
+    self.logMonoTime = {"modelV2": model_mono_time}
+
+  def all_checks(self, services=None):
+    services = self.keys() if services is None else services
+    return all(self.valid.get(service, False) and self.alive.get(service, False) and self.freq_ok.get(service, False)
+               for service in services)
 
 
 def arm(force_stops, sm):
@@ -76,6 +92,85 @@ def test_force_stops_does_not_spend_nonbraking_confidence_on_one_braking_frame()
   assert force_stops.forcing
 
 
+def test_cem_qualified_stop_commits_before_classic_horizon():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster(model_length=95.0, v_ego=20.0, should_stop=False,
+                     desired_accel=-0.8, terminal_speed=4.0,
+                     conditional_stop_qualified=True, qualified_distance=95.0)
+
+  force_stops.update(sm)
+
+  assert force_stops.forcing
+  assert math.isclose(force_stops.remaining, 95.0 - LATCH_SETBACK)
+
+
+def test_cem_qualified_stop_requires_current_valid_bound_authority():
+  for mutation in (
+    lambda sm: sm.valid.__setitem__("carState", False),
+    lambda sm: sm.valid.__setitem__("selfdriveState", False),
+    lambda sm: sm.alive.__setitem__("modelV2", False),
+    lambda sm: sm.freq_ok.__setitem__("selfdriveState", False),
+    lambda sm: setattr(sm["selfdriveState"], "conditionalStopModelMonoTime", sm.logMonoTime["modelV2"] - 500_000_000),
+    lambda sm: setattr(sm["selfdriveState"], "conditionalStopDistance", float("nan")),
+  ):
+    force_stops = ForceStops(dt=DT)
+    sm = FakeSubMaster(model_length=50.0, v_ego=20.0, should_stop=False, desired_accel=0.0,
+                       terminal_speed=20.0, conditional_stop_qualified=True, qualified_distance=95.0)
+    mutation(sm)
+    assert math.isinf(force_stops.update(sm))
+    assert not force_stops.forcing
+
+
+def test_brake_and_nonfinite_inputs_release_without_priming():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster(model_length=95.0, v_ego=20.0, should_stop=False,
+                     desired_accel=-0.8, terminal_speed=4.0,
+                     conditional_stop_qualified=True, qualified_distance=95.0)
+  force_stops.update(sm)
+  assert force_stops.forcing
+
+  sm["carState"].brakePressed = True
+  assert math.isinf(force_stops.update(sm))
+  assert not force_stops.forcing
+
+  sm["carState"].brakePressed = False
+  sm["selfdriveState"].conditionalStopQualified = False
+  sm["modelV2"].action.desiredAcceleration = -math.inf
+  for _ in range(30):
+    assert math.isinf(force_stops.update(sm))
+  assert force_stops.detect_filter.x == 0.0
+
+
+def test_gas_override_keeps_priority_when_both_pedals_are_pressed():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster()
+  sm["carState"].gasPressed = True
+  sm["carState"].brakePressed = True
+  sm["carState"].vEgo = float("nan")
+
+  assert math.isinf(force_stops.update(sm))
+  assert force_stops.override_timer == GAS_OVERRIDE_S
+
+
+def test_committed_target_stays_fixed_and_mpc_releases_after_crossing():
+  force_stops = ForceStops(dt=1.0)
+  sm = FakeSubMaster(model_length=100.0, v_ego=4.0, should_stop=False, desired_accel=0.0)
+  force_stops.forcing = True
+  force_stops.detect_filter.x = 1.0
+  force_stops.position_hold_remaining = 4.0
+  force_stops.remaining = 6.5
+  world_targets = []
+  travel = 0.0
+
+  for _ in range(3):
+    force_stops.update(sm)
+    travel += sm["carState"].vEgo
+    world_targets.append(travel + force_stops.remaining)
+
+  np.testing.assert_allclose(world_targets, world_targets[0])
+  assert force_stops.remaining < 0.0
+
+
 def test_cem_qualified_stop_starts_live_shaping_before_latch():
   v_ego = 19.477
   for model_length in (116.146, 150.0):
@@ -109,21 +204,27 @@ def test_committed_stop_is_the_mpc_obstacle_until_final_landing():
   mpc.update(radar_state)
   baseline_obstacle = mpc.params[:, 2].copy()
 
-  mpc.update(radar_state, stop_x=30.0)
+  for _ in range(4):
+    mpc.update(radar_state, stop_x=30.0)
   np.testing.assert_allclose(mpc.params[:, 2], 30.0 + STOP_DISTANCE)
   assert mpc.source == LongitudinalPlanSource.cruise
   assert mpc.a_solution[1] < 0.0
+  assert mpc.crash_cnt == 0
 
   close_lead = SimpleNamespace(present=True, dRel=15.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=1.0)
   mpc.update(SimpleNamespace(leadOne=close_lead, leadTwo=absent_lead), stop_x=30.0)
   assert mpc.source == LongitudinalPlanSource.lead0
   assert np.all(mpc.params[:, 2] <= 30.0 + STOP_DISTANCE)
 
-  for active_stop_x in (0.0, STOP_DISTANCE):
+  mpc.update(SimpleNamespace(leadOne=absent_lead, leadTwo=close_lead), stop_x=30.0)
+  assert mpc.source == LongitudinalPlanSource.lead1
+  assert np.all(mpc.params[:, 2] <= 30.0 + STOP_DISTANCE)
+
+  for active_stop_x in (-STOP_DISTANCE + 0.25, 0.0, STOP_DISTANCE):
     mpc.update(radar_state, stop_x=active_stop_x)
     np.testing.assert_allclose(mpc.params[:, 2], active_stop_x + STOP_DISTANCE)
 
-  for released_stop_x in (-1.0, float("-inf"), float("inf"), float("nan")):
+  for released_stop_x in (-STOP_DISTANCE, -STOP_DISTANCE - 0.25, float("-inf"), float("inf"), float("nan")):
     mpc.update(radar_state, stop_x=released_stop_x)
     np.testing.assert_allclose(mpc.params[:, 2], baseline_obstacle)
 
@@ -140,7 +241,7 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
                        steerRatio=15.0, wheelbase=2.9)
   planner = LongitudinalPlanner(CP, init_v=v_ego)
   planner.curve_speed_limiter.update = lambda model, v_cruise: v_cruise
-  planner.blotv2.update = lambda *args: SimpleNamespace(jerk_scale=1.0, t_follow=1.45)
+  planner.blotv2.update = lambda *args: SimpleNamespace(jerk_scale=1.0, t_follow=1.45, emergency=False)
   planner.lead_departure.update = lambda **kwargs: False
   sm = FakeSubMaster(model_length=100.0, should_stop=False, desired_accel=0.0, v_ego=v_ego)
   sm["carState"].vCruise = 100.0
@@ -150,7 +251,8 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
   sm["carControl"] = SimpleNamespace(orientationNED=[])
   sm["vehicleParameters"] = SimpleNamespace(angleOffsetDeg=0.0)
   sm["selfdriveState"].personality = 1
-  sm["modelV2"].meta = SimpleNamespace(laneChangeState=0, disengagePredictions=SimpleNamespace(gasPressProbs=[]))
+  sm["modelV2"].meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[]),
+                                        laneChangeState=log.LaneChangeState.off)
   sm["modelV2"].leadsV3 = []
   absent_lead = SimpleNamespace(present=False, dRel=0.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=0.0)
   sm["radarState"] = SimpleNamespace(leadOne=absent_lead, leadTwo=absent_lead)
@@ -177,6 +279,19 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
   planner.update(sm)
   assert not planner.force_stops.forcing
   assert np.all(planner.mpc.params[:, 2] > STOP_DISTANCE)
+
+
+def test_force_stops_releases_at_mpc_obstacle_boundary():
+  force_stops = ForceStops(dt=1.0)
+  sm = FakeSubMaster(model_length=20.0, v_ego=1.0, should_stop=False, desired_accel=0.0)
+  force_stops.forcing = True
+  force_stops.detect_filter.x = 1.0
+  force_stops.position_hold_remaining = 1.0
+  force_stops.remaining = -STOP_DISTANCE + sm["carState"].vEgo
+
+  assert math.isinf(force_stops.update(sm))
+  assert not force_stops.forcing
+  assert force_stops.remaining == 0.0
 
 
 def test_incomplete_early_trajectory_cannot_shape():
@@ -227,7 +342,7 @@ def test_committed_endpoint_keeps_configured_setback():
   sm = FakeSubMaster()
   while not force_stops.forcing:
     force_stops.update(sm)
-  assert math.isclose(force_stops.remaining, 20.0 - LATCH_SETBACK - sm["carState"].vEgo * DT)
+  assert math.isclose(force_stops.remaining, 20.0 - LATCH_SETBACK)
 
   force_stops.remaining = 3.0
   sm["carState"].vEgo = 4.0
@@ -268,17 +383,17 @@ def test_latched_position_survives_brief_model_clear():
   sm["modelV2"].action.shouldStop = False
   sm["modelV2"].action.desiredAcceleration = 0.0
 
-  hold_frames = int((STOP_POSITION_HOLD_S - 0.5) / DT)
+  hold_frames = int(0.5 / DT)
   assert all(math.isfinite(force_stops.update(sm)) for _ in range(hold_frames))
   cap = 0.0
-  for _ in range(int(1.0 / DT)):
+  for _ in range(int(2.0 / DT)):
     cap = force_stops.update(sm)
   assert math.isinf(cap)
 
 
 def test_new_evidence_refreshes_position_hold():
   force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
+  sm = FakeSubMaster(model_length=1.0, v_ego=0.5)
   arm(force_stops, sm)
 
   sm["modelV2"].position.x[-1] = 100.0
@@ -421,3 +536,26 @@ def test_nonfinite_model_position_releases_latched_stop():
 
   assert math.isinf(force_stops.update(sm))
   assert not force_stops.forcing
+
+
+def test_nonfinite_trajectory_samples_cannot_prime_detector_or_latch():
+  for axis in ("position", "velocity"):
+    for bad_value in (float("nan"), float("inf"), float("-inf")):
+      for sample in (10, -1):
+        force_stops = ForceStops(dt=DT)
+        sm = FakeSubMaster()
+        sm["modelV2"].position.x = [20.0 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
+        sm["modelV2"].velocity.x = [10.0 * (1.0 - i / (ModelConstants.IDX_N - 1)) for i in range(ModelConstants.IDX_N)]
+        getattr(sm["modelV2"], axis).x[sample] = bad_value
+
+        for _ in range(30):
+          assert math.isinf(force_stops.update(sm))
+        assert force_stops.detect_filter.x == 0.0
+        assert not force_stops.forcing
+        assert force_stops.position_hold_remaining == 0.0
+
+        sm["modelV2"].position.x = [20.0 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
+        sm["modelV2"].velocity.x = [10.0 * (1.0 - i / (ModelConstants.IDX_N - 1)) for i in range(ModelConstants.IDX_N)]
+        assert math.isinf(force_stops.update(sm))
+        assert not force_stops.forcing
+        arm(force_stops, sm)

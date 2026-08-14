@@ -507,7 +507,7 @@ class LongitudinalMpc:
 
     # The planner retains this obstacle for the lifetime of the committed stop.
     stop_obstacle = np.full(N + 1, np.inf)
-    if stop_x is not None and np.isfinite(stop_x) and stop_x >= 0.0:
+    if stop_x is not None and np.isfinite(stop_x) and stop_x + STOP_DISTANCE > 0.0:
       stop_obstacle.fill(float(stop_x) + STOP_DISTANCE)
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, stop_obstacle])
     if lead_xv_2 is not None and self.lead_three_confirm + 1e-9 >= LEAD_THREE_CONFIRM:

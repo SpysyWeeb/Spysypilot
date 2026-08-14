@@ -283,14 +283,22 @@ show the trajectory the newly selected e2e planner would have driven. The
 high-speed stop and false-handoff behavior therefore remain explicit owner
 field-test gates.
 
-### Force Stops separation
+### Qualified Force Stops handoff
 
-The standalone BLoTv2 tree has no `force_stops.py`, `ForceStops` planner member,
-or cruise-speed cap. Conditional Experimental Mode only selects the existing
-e2e planner candidate. Combo now integrates the separately owned `force-stops`
-feature after CEM: it tracks a lead-free model stop point and caps the planner's
-cruise candidate while stronger MPC/e2e braking still wins. Smooth Stops,
-longitudinal PID, opendbc, and panda retain their existing responsibilities.
+After one full second of current, complete, finite, lead-free stop evidence,
+CEM publishes a capability bound to the exact current `modelV2` monotonic
+timestamp and a fixed-world endpoint. Force Stops owns reversible cap shaping
+and the committed point; longitudinal MPC admits that point only while its
+native obstacle remains ahead and closer leads still win. Smooth Stops owns
+combo's final landing and standstill handoff. CEM still owns no speed,
+acceleration, brake, or stop point.
+
+This handoff is for testing only and its source candidate remains
+replay-rejected. Route-17 segment 20 stopped `1.324 m` behind its internal
+retained target; that target is not calibrated painted-line ground truth.
+Offline native LongControl did not reproduce the earlier segment-25
+no-standstill result, but neither result establishes road safety or stop-line
+placement.
 
 ## Strong
 
