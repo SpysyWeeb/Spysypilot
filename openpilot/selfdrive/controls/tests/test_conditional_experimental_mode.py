@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (
@@ -8,6 +9,9 @@ from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (
   STOP_EARLY_CONFIDENCE,
   STOP_EARLY_HINT_CONFIDENCE,
   STOP_EARLY_HINT_ENTRY_MAX_SPEED,
+  FORCE_STOP_COMMIT_DISTANCE_M,
+  FORCE_STOP_QUALIFY_S,
+  FORCE_STOP_WORLD_TOLERANCE_M,
   STOP_EARLY_MAX_HEADING_CHANGE,
   STOP_EARLY_MAX_LATERAL_ACCEL,
   STOP_EARLY_MIN_SPEED,
@@ -17,6 +21,7 @@ from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (
   STOP_SAMPLE_MIN_CONFIDENCE,
   observe_model_stop_intent,
 )
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
 DT = 0.05
@@ -24,9 +29,11 @@ DT = 0.05
 
 def model(*, should_stop=False, path_end=90.0, terminal_speed=10.0, desired_accel=0.0,
           desired_curvature=0.0, terminal_heading=0.0):
-  position_x = [] if path_end is None else [0.0, path_end]
-  velocity_x = [] if terminal_speed is None else [10.0, terminal_speed]
-  orientation_z = [] if terminal_heading is None else [0.0, terminal_heading]
+  position_x = [] if path_end is None else [path_end * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
+  velocity_x = [] if terminal_speed is None else [10.0 + (terminal_speed - 10.0) * i / (ModelConstants.IDX_N - 1)
+                                                   for i in range(ModelConstants.IDX_N)]
+  orientation_z = [] if terminal_heading is None else [terminal_heading * i / (ModelConstants.IDX_N - 1)
+                                                         for i in range(ModelConstants.IDX_N)]
   return SimpleNamespace(
     action=SimpleNamespace(
       shouldStop=should_stop,
@@ -52,8 +59,11 @@ def car_state(*, v_ego=10.0, standstill=False, gas=False, brake=False,
   )
 
 
-def radar_state(*, present=False, distance=1000.0):
-  return SimpleNamespace(leadOne=SimpleNamespace(present=present, dRel=distance))
+def radar_state(*, present=False, distance=1000.0, secondary_present=False, secondary_distance=1000.0):
+  return SimpleNamespace(
+    leadOne=SimpleNamespace(present=present, dRel=distance),
+    leadTwo=SimpleNamespace(present=secondary_present, dRel=secondary_distance),
+  )
 
 
 def new_cem():
@@ -238,6 +248,170 @@ def test_brief_stop_prediction_does_not_pass_filter_and_debounce():
   assert not any(run_frames(cem, 30, clear_model()))
 
 
+def test_force_stop_qualification_requires_sustained_full_trajectory_inside_commit_range():
+  cem = new_cem()
+  early_cs = car_state(v_ego=18.0)
+  early = model(path_end=95.0, terminal_speed=1.0, desired_accel=-0.8)
+  assert observe_model_stop_intent(early, early_cs, radar_state()).confidence == STOP_EARLY_CONFIDENCE
+  for _ in range(int(FORCE_STOP_QUALIFY_S / DT)):
+    cem.update(early, early_cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+
+  cs = car_state(v_ego=25.0)
+  stop = model(path_end=FORCE_STOP_COMMIT_DISTANCE_M - 5.0, terminal_speed=1.0, desired_accel=-0.8)
+  for _ in range(int(FORCE_STOP_QUALIFY_S / DT)):
+    cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+    stop.position.x[-1] -= cs.vEgo * DT
+  cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+  assert cem.stop_qualified
+
+  tracked_distance = cem.stop_distance
+  stop.position.x[-1] = tracked_distance - cs.vEgo * DT + FORCE_STOP_WORLD_TOLERANCE_M - 0.1
+  cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+  assert cem.stop_qualified
+  assert cem.stop_distance == stop.position.x[-1]
+
+  stop.position.x[-1] = FORCE_STOP_COMMIT_DISTANCE_M + 20.0
+  cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+  assert not cem.stop_qualified
+
+
+def test_force_stop_qualification_rejects_an_endpoint_moving_in_world_coordinates():
+  cem = new_cem()
+  cs = car_state(v_ego=25.0)
+  moving_world_endpoint = model(path_end=95.0, terminal_speed=1.0, desired_accel=-0.8)
+
+  for _ in range(2 * int(FORCE_STOP_QUALIFY_S / DT)):
+    cem.update(moving_world_endpoint, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+
+
+def test_force_stop_qualification_rejects_direct_fallback_and_nonfinite_ego_evidence():
+  missing_velocity = model(should_stop=True, path_end=95.0, terminal_speed=25.0)
+  missing_velocity.velocity.x = []
+  nonfinite_velocity = model(should_stop=True, path_end=95.0, terminal_speed=0.5)
+  nonfinite_velocity.velocity.x[10] = float("nan")
+  probes = (
+    (model(should_stop=True, path_end=95.0, terminal_speed=25.0), car_state(v_ego=25.0)),
+    (missing_velocity, car_state(v_ego=25.0)),
+    (nonfinite_velocity, car_state(v_ego=25.0)),
+    (model(path_end=95.0, terminal_speed=0.5, desired_accel=float("nan")), car_state(v_ego=25.0)),
+    (model(path_end=95.0, terminal_speed=0.5), car_state(v_ego=float("nan"))),
+  )
+  for stop, cs in probes:
+    cem = new_cem()
+    for _ in range(2 * int(FORCE_STOP_QUALIFY_S / DT) + 1):
+      cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+      assert not cem.stop_qualified
+      if math.isfinite(cs.vEgo):
+        stop.position.x[-1] -= cs.vEgo * DT
+
+
+def test_nonfinite_trajectory_resets_every_cem_lifecycle_state():
+  for lifecycle in ("cold", "partial", "qualified", "active"):
+    for axis in ("position", "velocity"):
+      for bad_value in (float("nan"), float("inf"), float("-inf")):
+        for sample in range(ModelConstants.IDX_N):
+          cem = new_cem()
+          cs = car_state()
+          if lifecycle == "partial":
+            cem.update(confirmed_stop_model(), cs, radar_state(), controls_enabled=True,
+                       model_updated=True, model_valid=True)
+            assert cem.intent_filter.x > 0.0
+          elif lifecycle == "qualified":
+            cem._post_stop_remaining = 10.0
+            stop = confirmed_stop_model()
+            for _ in range(int(FORCE_STOP_QUALIFY_S / DT) + 1):
+              cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+              stop.position.x[-1] -= cs.vEgo * DT
+            assert cem.stop_qualified and not cem.experimental_mode
+            cem._post_stop_remaining = 0.0
+          elif lifecycle == "active":
+            activate(cem, cs)
+
+          malformed = confirmed_stop_model()
+          getattr(malformed, axis).x[sample] = bad_value
+          cem.update(malformed, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+          assert cem.intent_filter.x == 0.0
+          assert cem._intent_hold_remaining == 0.0
+          assert cem._entry_elapsed == 0.0
+          assert not cem.stop_qualified
+
+          if lifecycle == "active":
+            assert not run_frames(cem, int(5.0 / DT), malformed, cs)[-1]
+
+          finite = confirmed_stop_model()
+          fresh = new_cem()
+          assert cem.update(finite, cs, radar_state(), controls_enabled=True,
+                            model_updated=True, model_valid=True) == fresh.update(
+                              finite, cs, radar_state(), controls_enabled=True,
+                              model_updated=True, model_valid=True)
+          assert cem.intent_filter.x == fresh.intent_filter.x
+          assert cem._intent_hold_remaining == fresh._intent_hold_remaining
+          assert cem._entry_elapsed == fresh._entry_elapsed
+          assert not cem.stop_qualified
+
+
+def test_secondary_lead_blocks_force_stop_qualification_through_release_hysteresis():
+  cem = new_cem()
+  cs = car_state(v_ego=25.0)
+  stop = model(path_end=95.0, terminal_speed=0.5)
+  lead = radar_state(secondary_present=True, secondary_distance=50.0)
+
+  for _ in range(2 * int(FORCE_STOP_QUALIFY_S / DT) + 1):
+    stop.position.x[-1] -= cs.vEgo * DT
+    cem.update(stop, cs, lead, controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+
+  for _ in range(int(LEAD_RELEASE_HYSTERESIS_S / DT)):
+    stop.position.x[-1] -= cs.vEgo * DT
+    cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+
+
+def test_far_secondary_lead_cannot_precharge_force_stop_qualification():
+  cem = new_cem()
+  cs = car_state(v_ego=25.0)
+  stop = model(path_end=95.0, terminal_speed=0.5)
+  far_lead = radar_state(secondary_present=True, secondary_distance=1000.0)
+
+  for _ in range(2 * int(FORCE_STOP_QUALIFY_S / DT) + 1):
+    stop.position.x[-1] -= cs.vEgo * DT
+    cem.update(stop, cs, far_lead, controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+
+  for _ in range(int(FORCE_STOP_QUALIFY_S / DT)):
+    stop.position.x[-1] -= cs.vEgo * DT
+    cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+
+
+def test_raw_lead_on_control_tick_resets_qualified_force_stop():
+  cem = new_cem()
+  cs = car_state(v_ego=25.0)
+  stop = model(path_end=95.0, terminal_speed=0.5)
+
+  for _ in range(int(FORCE_STOP_QUALIFY_S / DT)):
+    cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+    stop.position.x[-1] -= cs.vEgo * DT
+  cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+  assert cem.stop_qualified
+
+  far_lead = radar_state(secondary_present=True, secondary_distance=1000.0)
+  cem.update(stop, cs, far_lead, controls_enabled=True, model_updated=False, model_valid=True)
+  assert not cem.stop_qualified
+
+  for _ in range(int(FORCE_STOP_QUALIFY_S / DT)):
+    stop.position.x[-1] -= cs.vEgo * DT
+    cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem.stop_qualified
+  stop.position.x[-1] -= cs.vEgo * DT
+  cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+  assert cem.stop_qualified
+
+
 def test_repeated_control_ticks_do_not_count_one_model_frame_more_than_once():
   cem = new_cem()
   stop = confirmed_stop_model()
@@ -248,6 +422,29 @@ def test_repeated_control_ticks_do_not_count_one_model_frame_more_than_once():
     assert not cem.update(stop, cs, radar, controls_enabled=True, model_updated=False, model_valid=True)
 
   assert cem.intent_filter.x == 0.0
+
+
+def test_invalid_model_or_radar_tick_resets_partial_force_stop_qualification():
+  cs = car_state(v_ego=25.0)
+
+  for invalid_kwargs in (
+    {'model_valid': False, 'radar_valid': True},
+    {'model_valid': True, 'radar_valid': False},
+  ):
+    cem = new_cem()
+    stop = model(path_end=95.0, terminal_speed=0.5)
+    for _ in range(int(FORCE_STOP_QUALIFY_S / DT)):
+      cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True,
+                 model_valid=True, radar_valid=True)
+      assert not cem.stop_qualified
+      stop.position.x[-1] -= cs.vEgo * DT
+
+    cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=False, **invalid_kwargs)
+    assert not cem.stop_qualified
+
+    cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True,
+               model_valid=True, radar_valid=True)
+    assert not cem.stop_qualified
 
 
 def test_release_hysteresis_ignores_brief_clear_prediction():

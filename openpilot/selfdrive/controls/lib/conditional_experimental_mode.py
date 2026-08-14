@@ -17,6 +17,7 @@ from typing import Any
 
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_CTRL, DT_MDL
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
 # Model-stop observation tuning. All distances are meters and speeds are m/s.
@@ -64,6 +65,9 @@ STOP_ENTRY_FILTER_THRESHOLD = 0.55
 STOP_RELEASE_FILTER_THRESHOLD = 0.25
 STOP_ENTRY_DEBOUNCE_S = 0.20
 STOP_RELEASE_HYSTERESIS_S = 0.75
+FORCE_STOP_QUALIFY_S = 1.0
+FORCE_STOP_COMMIT_DISTANCE_M = 100.0
+FORCE_STOP_WORLD_TOLERANCE_M = 5.0
 
 # Latching and release behavior.
 MODE_MIN_LATCH_S = 1.0
@@ -92,6 +96,7 @@ class StopIntentObservation:
   terminal_speed: float | None = None
   relevant_lead: bool = False
   committed_turn: bool = False
+  trajectory_stop: bool = False
 
 
 def _last_finite(values: Any, minimum_length: int = 1) -> float | None:
@@ -102,6 +107,26 @@ def _last_finite(values: Any, minimum_length: int = 1) -> float | None:
   except (AttributeError, IndexError, TypeError, ValueError):
     return None
   return value if math.isfinite(value) else None
+
+
+def _finite_trajectory(values: Any) -> bool:
+  try:
+    return all(math.isfinite(float(value)) for value in values)
+  except (TypeError, ValueError):
+    return False
+
+
+def model_trajectories_finite(model: Any) -> bool:
+  return (
+    _finite_trajectory(getattr(getattr(model, "position", None), "x", ())) and
+    _finite_trajectory(getattr(getattr(model, "velocity", None), "x", ()))
+  )
+
+
+def model_trajectories_complete_and_finite(model: Any) -> bool:
+  position_x = getattr(getattr(model, "position", None), "x", ())
+  velocity_x = getattr(getattr(model, "velocity", None), "x", ())
+  return len(position_x) == ModelConstants.IDX_N and len(velocity_x) == ModelConstants.IDX_N and model_trajectories_finite(model)
 
 
 def _finite_float(value: Any, default: float = 0.0) -> float:
@@ -122,10 +147,17 @@ def _optional_finite_float(value: Any) -> float | None:
 
 def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> StopIntentObservation:
   """Translate current BLoTv2 cereal messages into one stop-intent sample."""
-  v_ego = max(_finite_float(getattr(car_state, "vEgo", 0.0)), 0.0)
+  if not model_trajectories_finite(model):
+    return StopIntentObservation()
+
+  v_ego_value = _optional_finite_float(getattr(car_state, "vEgo", None))
+  if v_ego_value is None:
+    return StopIntentObservation()
+  v_ego = max(v_ego_value, 0.0)
   action = getattr(model, "action", None)
   should_stop = bool(getattr(action, "shouldStop", False))
-  desired_accel = _finite_float(getattr(action, "desiredAcceleration", 0.0))
+  desired_accel_value = _optional_finite_float(getattr(action, "desiredAcceleration", None))
+  desired_accel = desired_accel_value if desired_accel_value is not None else 0.0
   desired_curvature = _optional_finite_float(getattr(action, "desiredCurvature", None))
 
   position = getattr(model, "position", None)
@@ -145,7 +177,9 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
 
   distance_limit = max(STOP_PATH_MIN_DISTANCE_M, v_ego * STOP_PREDICTION_HORIZON_S)
   path_in_horizon = path_end_m is not None and 0.0 < path_end_m <= distance_limit
-  trajectory_stop = path_in_horizon and terminal_speed is not None and terminal_speed <= STOP_TERMINAL_SPEED_MAX
+  strict_trajectory_stop = path_in_horizon and terminal_speed is not None and terminal_speed <= STOP_TERMINAL_SPEED_MAX
+  complete_trajectory = model_trajectories_complete_and_finite(model)
+  qualified_trajectory_stop = complete_trajectory and strict_trajectory_stop and desired_accel_value is not None
   fallback_stop = path_in_horizon and terminal_speed is None and desired_accel <= STOP_FALLBACK_ACCEL_MAX
 
   early_distance_limit = (
@@ -171,7 +205,7 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
   if should_stop:
     confidence = STOP_DIRECT_CONFIDENCE
     reason = "shouldStop"
-  elif trajectory_stop:
+  elif strict_trajectory_stop:
     confidence = STOP_TRAJECTORY_CONFIDENCE
     reason = "trajectory"
   elif early_stop:
@@ -184,13 +218,14 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
     confidence = STOP_EARLY_HINT_ENTRY_CONFIDENCE if v_ego <= STOP_EARLY_HINT_ENTRY_MAX_SPEED else STOP_EARLY_HINT_CONFIDENCE
     reason = "earlyHint"
 
-  lead = getattr(radar_state, "leadOne", None)
-  lead_present = bool(getattr(lead, "present", getattr(lead, "status", False)))
-  lead_distance = _finite_float(getattr(lead, "dRel", math.inf), math.inf)
   lead_limit = max(LEAD_RELEVANCE_MIN_DISTANCE_M, v_ego * LEAD_RELEVANCE_TIME_S)
   if path_end_m is not None:
     lead_limit = max(lead_limit, path_end_m + LEAD_PATH_MARGIN_M)
-  relevant_lead = lead_present and 0.0 <= lead_distance <= lead_limit
+  relevant_lead = any(
+    bool(getattr(lead, "present", getattr(lead, "status", False))) and
+    0.0 <= _finite_float(getattr(lead, "dRel", math.inf), math.inf) <= lead_limit
+    for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
+  )
 
   steering_angle = abs(_finite_float(getattr(car_state, "steeringAngleDeg", 0.0)))
   committed_turn = bool(
@@ -199,7 +234,7 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
      (desired_curvature is not None and abs(desired_curvature) >= COMMITTED_TURN_MIN_CURVATURE))
   )
 
-  return StopIntentObservation(confidence, reason, path_end_m, terminal_speed, relevant_lead, committed_turn)
+  return StopIntentObservation(confidence, reason, path_end_m, terminal_speed, relevant_lead, committed_turn, bool(qualified_trajectory_stop))
 
 
 class ConditionalExperimentalMode:
@@ -225,6 +260,8 @@ class ConditionalExperimentalMode:
     self._lead_veto_remaining = 0.0
     self._post_stop_remaining = 0.0
     self._override_remaining = 0.0
+    self._force_stop_qualified_elapsed = 0.0
+    self._force_stop_tracked_endpoint = None
 
   @property
   def driver_override_active(self) -> bool:
@@ -234,12 +271,24 @@ class ConditionalExperimentalMode:
   def stop_latched(self) -> bool:
     return self.experimental_mode
 
+  @property
+  def stop_qualified(self) -> bool:
+    return self._invalid_elapsed <= 0.0 and self._force_stop_qualified_elapsed + 1e-6 >= FORCE_STOP_QUALIFY_S
+
+  @property
+  def stop_distance(self) -> float | None:
+    # The hidden tracker qualifies world consistency; actuation is bound to the
+    # exact published model frame and its endpoint, never to hidden geometry.
+    return self.last_observation.path_end_m if self.stop_qualified else None
+
   def _clear_evidence(self) -> None:
     self.intent_filter.x = 0.0
     self.last_observation = StopIntentObservation()
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
     self._intent_hold_remaining = 0.0
+    self._force_stop_qualified_elapsed = 0.0
+    self._force_stop_tracked_endpoint = None
 
   def _deactivate(self, suppress_for: float) -> None:
     self.experimental_mode = False
@@ -263,6 +312,32 @@ class ConditionalExperimentalMode:
       self._lead_veto_remaining = max(self._lead_veto_remaining - self.model_dt, 0.0)
     entry_veto = self._lead_veto_remaining > 0.0 or observation.committed_turn
     confidence = observation.confidence if self.experimental_mode or not entry_veto else 0.0
+    raw_lead_present = any(
+      bool(getattr(lead, "present", getattr(lead, "status", False)))
+      for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
+    )
+    force_stop_evidence = (
+      observation.trajectory_stop and not entry_veto and not raw_lead_present and
+      observation.path_end_m is not None and 0.0 < observation.path_end_m < FORCE_STOP_COMMIT_DISTANCE_M
+    )
+    if force_stop_evidence:
+      v_ego = max(_finite_float(getattr(car_state, "vEgo", 0.0)), 0.0)
+      path_end_m = observation.path_end_m
+      assert path_end_m is not None
+      if self._force_stop_tracked_endpoint is None:
+        self._force_stop_qualified_elapsed = 0.0
+        self._force_stop_tracked_endpoint = path_end_m
+      else:
+        predicted_endpoint = self._force_stop_tracked_endpoint - v_ego * self.model_dt
+        if abs(path_end_m - predicted_endpoint) > FORCE_STOP_WORLD_TOLERANCE_M:
+          self._force_stop_qualified_elapsed = 0.0
+          self._force_stop_tracked_endpoint = path_end_m
+        else:
+          self._force_stop_qualified_elapsed += self.model_dt
+          self._force_stop_tracked_endpoint = predicted_endpoint
+    else:
+      self._force_stop_qualified_elapsed = 0.0
+      self._force_stop_tracked_endpoint = None
     raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
     if raw_stop:
       self._intent_hold_remaining = STOP_INTENT_HOLD_S
@@ -286,7 +361,7 @@ class ConditionalExperimentalMode:
         self._entry_elapsed = 0.0
 
   def update(self, model: Any, car_state: Any, radar_state: Any, *,
-             controls_enabled: bool, model_updated: bool, model_valid: bool) -> bool:
+             controls_enabled: bool, model_updated: bool, model_valid: bool, radar_valid: bool = True) -> bool:
     """Return the conditional Experimental request for the current control tick."""
     if not controls_enabled:
       self.reset()
@@ -306,13 +381,25 @@ class ConditionalExperimentalMode:
       self._clear_evidence()
       return False
 
+    trajectories_finite = model_trajectories_finite(model)
+    model_valid = model_valid and trajectories_finite
     if model_valid:
       self._invalid_elapsed = 0.0
     else:
       self._invalid_elapsed += self.control_dt
+    if not trajectories_finite:
+      self._clear_evidence()
+
+    raw_lead_present = any(
+      bool(getattr(lead, "present", getattr(lead, "status", False)))
+      for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
+    )
+    if not model_valid or not radar_valid or raw_lead_present:
+      self._force_stop_qualified_elapsed = 0.0
+      self._force_stop_tracked_endpoint = None
 
     if model_updated:
-      self._update_model_evidence(model, car_state, radar_state, model_valid)
+      self._update_model_evidence(model, car_state, radar_state, model_valid and radar_valid)
 
     if not self.experimental_mode and self._invalid_elapsed >= MODEL_INVALID_RELEASE_S:
       self._clear_evidence()

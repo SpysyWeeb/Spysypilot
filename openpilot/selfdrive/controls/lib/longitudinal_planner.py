@@ -18,6 +18,7 @@ from openpilot.selfdrive.controls.lib.blotv2 import (
   model_predicted_speed,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   LongitudinalMpc,
@@ -128,6 +129,7 @@ class LongitudinalPlanner:
     self.allow_throttle = True
     self.blotv2 = BLoTv2Supervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt)
+    self.force_stops = ForceStops(dt)
 
     self.a_desired = init_a
     self.last_mpc_a_target = init_a
@@ -180,6 +182,9 @@ class LongitudinalPlanner:
     # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
+    force_stop_cap = self.force_stops.update(sm)
+    stop_x = self.force_stops.remaining if self.force_stops.forcing else None
+
     personality = sm['selfdriveState'].personality
     radar_valid = sm.all_checks(['radarState'])
     lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
@@ -212,6 +217,7 @@ class LongitudinalPlanner:
         and sm['modelV2'].meta.laneChangeState == log.LaneChangeState.off
         and not (sm['carState'].leftBlinker or sm['carState'].rightBlinker)
       ),
+      stop_x=stop_x,
       v_ego=v_ego,
     )
 
@@ -246,6 +252,7 @@ class LongitudinalPlanner:
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     experimental_mode = sm['selfdriveState'].experimentalMode
+    v_cruise = min(v_cruise, force_stop_cap)
     comfort_enabled = ordinary_cruise_comfort_enabled(
       experimental_mode,
       force_decel,
