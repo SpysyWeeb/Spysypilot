@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+from functools import cached_property
 import os
 os.environ['GMMU'] = '0' # for usbgpu fast loading, noop for qcom
 from tinygrad.tensor import Tensor
+from tinygrad.device import Device
+import struct
 import threading
 import time
 import numpy as np
@@ -9,8 +12,9 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.messaging import PubMaster, SubMaster
-from msgq.visionipc import VisionIpcClient, VisionBuf
+from openpilot.cereal.services import SERVICE_LIST
 from openpilot.cereal.visionipc import VisionStreamType
+from msgq.visionipc import VisionIpcClient, VisionBuf
 from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
@@ -26,13 +30,12 @@ from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_IN
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import open_file_chunked
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.timing import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.modeld.helpers import usbgpu_present, usbgpu_compiled, modeld_pkl_path, get_tg_input_devices, load_oob
-from openpilot.selfdrive.modeld.usbgpu_link import wait_usbgpu_link
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
+LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 BIG_MODEL_TIMEOUT = 60
@@ -63,8 +66,62 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
 
   return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
                                 desiredAcceleration=float(desired_accel),
-                                shouldStop=bool(stop),
-                                desiredCurvatureTime=float(lat_action_t))
+                                shouldStop=bool(stop))
+
+
+class ChestnutState:
+  # only modeld can access chestnut
+  def __init__(self, pm: PubMaster, big: bool):
+    self.pm = pm
+    self.big = big
+    self.valid = True
+    self.sends = 0
+    self.metrics = {}
+
+  @cached_property
+  def power_limit(self) -> int:
+    smu = Device["AMD"].iface.dev_impl.smu
+    return smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
+
+  def send(self) -> None:
+    msg = messaging.new_message('chestnutState')
+    state = msg.chestnutState
+    self.sends += 1
+    if self.big and "AMD" in Device._opened_devices and self.sends % 100 == 1:
+      try:
+        smu = Device["AMD"].iface.dev_impl.smu
+        smu._send_msg(smu.smu_mod.PPSMC_MSG_TransferTableSmu2Dram, smu.smu_mod.TABLE_SMU_METRICS, timeout=100)
+        metrics = smu.read_table(smu.smu_mod.SmuMetricsExternal_t, smu.smu_mod.TABLE_SMU_METRICS).SmuMetrics
+        self.metrics = {'tempC': metrics.AvgTemperature[smu.smu_mod.TEMP_HOTSPOT],
+                        'memoryTempC': metrics.AvgTemperature[smu.smu_mod.TEMP_MEM],
+                        'powerDrawW': metrics.AverageSocketPower,
+                        'powerLimitW': self.power_limit,
+                        'gpuUsagePercent': metrics.AverageGfxActivity,
+                        'gpuClockMhz': metrics.AverageGfxclkFrequencyPostDs,
+                        'fanSpeedRpm': metrics.AvgFanRpm}
+        self.valid = True
+      except Exception:
+        if self.valid:
+          cloudlog.exception("chestnut state read failed")
+        self.valid = False
+        self.metrics.clear()
+    if self.big:
+      for k, v in self.metrics.items():
+        setattr(state, k, v)
+
+    asm_valid = False
+    if "AMD" in Device._opened_devices:
+      try:
+        # ASM runs on USB-C power, these still read without a gpu
+        asm = Device["AMD"].iface.pci_dev.usb
+        state.pcieLtssm = asm.read(0xB450, 1)[0]
+        state.supplyVoltage, state.supplyCurrent = struct.unpack('<Hh', bytes(asm.usb.control_read(0xC0, 5))[:4])
+        asm_valid = True
+      except Exception:
+        pass
+
+    msg.valid = asm_valid and (not self.big or self.valid)
+    self.pm.send('chestnutState', msg)
 
 
 class FrameMeta:
@@ -90,6 +147,7 @@ class ModelState:
     self.output_slices = metadata['output_slices']
 
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
+    self.usbgpu = usbgpu
 
     self.frame_skip = ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ
     self.input_queues, self.npy = make_input_queues(self.input_shapes, self.frame_skip, device=self.QUEUE_DEV)
@@ -130,6 +188,10 @@ class ModelState:
       **{k: self.input_queues[k] for k in POLICY_INPUTS if k in self.input_queues}, warped=warped
     )
     model_output = outs.numpy()[0]
+    if self.usbgpu and not np.all(np.isfinite(model_output)):
+      # TODO remove with prev_feat
+      cloudlog.error("model output not finite, dropping frame")
+      return None
     outputs_dict = self.parser.parse_outputs(self.slice_outputs(model_output, self.output_slices))
     self.npy['prev_feat'][:] = model_output[self.output_slices['hidden_state']]
 
@@ -152,9 +214,11 @@ def main(demo=False):
   cloudlog.warning("modeld init")
 
   USBGPU = usbgpu_present() and usbgpu_compiled()
+  if USBGPU:
+    os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
   params = Params()
   params.put_bool("UsbGpuLoading", USBGPU)
-  params.put_bool("UsbGpuActive", False)
+  params.remove("UsbGpuActive")
 
   config_realtime_process(7, 54)
 
@@ -189,7 +253,6 @@ def main(demo=False):
     def load_big():
       nonlocal big_model
       try:
-        wait_usbgpu_link()
         m = ModelState(vipc_client_main.width, vipc_client_main.height, True)
         m.warmup()
         big_model = m
@@ -208,11 +271,13 @@ def main(demo=False):
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
-  pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry"] + (["chestnutState"] if USBGPU else [])
+  pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
   params = Params()
+  chestnut_state = ChestnutState(pm, model.usbgpu) if USBGPU else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
@@ -282,10 +347,10 @@ def main(demo=False):
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
-      main_intrinsics = dc.ecam.intrinsics if main_wide_camera else dc.fcam.intrinsics
+      main_intrinsics = dc.wide_road.intrinsics if main_wide_camera else dc.narrow_road.intrinsics
       model_transform_main = get_warp_matrix(device_from_calib_euler, main_intrinsics, False).astype(np.float32)
       has_wide_camera = use_extra_client or main_wide_camera
-      extra_intrinsics = dc.ecam.intrinsics if has_wide_camera else dc.fcam.intrinsics
+      extra_intrinsics = dc.wide_road.intrinsics if has_wide_camera else dc.narrow_road.intrinsics
       model_transform_extra = get_warp_matrix(device_from_calib_euler, extra_intrinsics, True).astype(np.float32)
       extrinsics_calibration_seen = True
 
@@ -328,6 +393,8 @@ def main(demo=False):
       cloudlog.exception("big model failed, fall back to small")
       params.put_bool("UsbGpuActive", False)
       model = small_model
+      if chestnut_state is not None:
+        chestnut_state.big = False
       run_count = 0
       model_output = None
     mt2 = time.perf_counter()
@@ -343,6 +410,7 @@ def main(demo=False):
       fill_model_msg(modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, extrinsics_calibration_seen)
+      modelv2_send.modelV2.big = model.usbgpu
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
@@ -358,6 +426,9 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
     last_vipc_frame_id = meta_main.frame_id
+
+    if chestnut_state is not None and run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0:
+      chestnut_state.send()
 
 
 if __name__ == "__main__":
