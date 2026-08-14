@@ -144,18 +144,18 @@ class LeadDeparturePreRelease:
       self.reset()
       return False
 
-    if lead.speed > LEAD_MOVING_SPEED:
+    if lead.speed > LEAD_DEPARTURE_SPEED:
       self._released = True
       self._prediction_s = 0.0
       self._cancel_s = 0.0
       return True
 
-    prediction_valid = (
+    departure_valid = lead.speed > LEAD_MOVING_SPEED or (
       predicted_speed is not None
       and math.isfinite(predicted_speed)
       and predicted_speed > LEAD_DEPARTURE_SPEED
     )
-    if prediction_valid:
+    if departure_valid:
       self._prediction_s += self.dt
       self._cancel_s = 0.0
       if self._prediction_s + 1e-9 >= LEAD_DEPARTURE_CONFIRM:
