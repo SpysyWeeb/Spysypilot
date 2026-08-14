@@ -150,7 +150,7 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
   sm["carControl"] = SimpleNamespace(orientationNED=[])
   sm["vehicleParameters"] = SimpleNamespace(angleOffsetDeg=0.0)
   sm["selfdriveState"].personality = 1
-  sm["modelV2"].meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[]))
+  sm["modelV2"].meta = SimpleNamespace(laneChangeState=0, disengagePredictions=SimpleNamespace(gasPressProbs=[]))
   sm["modelV2"].leadsV3 = []
   absent_lead = SimpleNamespace(present=False, dRel=0.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=0.0)
   sm["radarState"] = SimpleNamespace(leadOne=absent_lead, leadTwo=absent_lead)
