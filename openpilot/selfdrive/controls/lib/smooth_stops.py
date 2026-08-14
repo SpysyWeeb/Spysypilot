@@ -42,6 +42,7 @@ class SmoothStopController:
 
   def __init__(self):
     self._no_stop_frames = 0
+    self._release_had_lead = False
     self.reset()
 
   def reset(self) -> None:
@@ -60,13 +61,25 @@ class SmoothStopController:
 
   def arm_hold(self) -> None:
     self._no_stop_frames = 0
+    self._release_had_lead = False
 
-  def hold_release(self, should_stop: bool) -> bool:
+  def hold_release(self, should_stop: bool, lead: LeadObservation | None = None) -> bool:
+    lead = lead if lead is not None else LeadObservation()
+    if not should_stop and lead.present and lead.speed >= LEAD_MOVING_ENTER:
+      self._no_stop_frames = 0
+      self._release_had_lead = False
+      return True
     if should_stop:
       self._no_stop_frames = 0
+      self._release_had_lead = lead.present and lead.speed < LEAD_MOVING_ENTER
     else:
+      if self._release_had_lead and lead.present and lead.speed >= LEAD_MOVING_ENTER:
+        self._release_had_lead = False
+        self._no_stop_frames = 0
+      self._release_had_lead |= lead.present and lead.speed < LEAD_MOVING_ENTER
       self._no_stop_frames += 1
-    return self._no_stop_frames >= HOLD_RELEASE_FRAMES
+    release_frames = round((LEAD_DROPOUT_GRACE if self._release_had_lead else HOLD_RELEASE_FRAMES * DT_CTRL) / DT_CTRL)
+    return self._no_stop_frames >= release_frames
 
   def _update_lead_motion(self, lead: LeadObservation) -> bool:
     if lead.present:

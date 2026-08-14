@@ -53,6 +53,7 @@ class LongControl:
 
   def update(self, active, CS, a_target, should_stop, accel_limits, lead: LeadObservation | None = None):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
+    lead = lead if lead is not None else LeadObservation()
     pos_limit = min(accel_limits[1], BLOTV2_ACCEL_MAX)
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = pos_limit
@@ -64,7 +65,7 @@ class LongControl:
     if active and should_stop and self.long_control_state in (LongCtrlState.off, LongCtrlState.pid):
       stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo, CS.standstill)
     elif active and self.long_control_state == LongCtrlState.stopping:
-      stop_now = not self.smooth_stop.hold_release(should_stop)
+      stop_now = not self.smooth_stop.hold_release(should_stop, lead)
     else:
       stop_now = should_stop
 
