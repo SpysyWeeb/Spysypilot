@@ -231,15 +231,23 @@ show the trajectory the newly selected e2e planner would have driven. The
 high-speed stop and false-handoff behavior therefore remain explicit owner
 field-test gates.
 
-### Force Stops replacement
+### Qualified Force Stops handoff
 
-The BLoTv2 tree has no `force_stops.py`, `ForceStops` planner member, or cruise
-speed cap. Conditional Experimental Mode replaces that strategy by selecting
-the already-existing e2e planner candidate; the planner, MPC, longcontrol,
-longitudinal PID, opendbc, and panda keep their existing responsibilities.
-When BLoTv2 is integrated into a tree that still contains the older Force Stops
-feature, its file, import, constructor hook, and `v_cruise` cap call must be
-removed. The two mechanisms must not run together.
+For owner-authorized testing, Conditional Experimental Mode qualifies one
+current model frame only after one second of complete, finite, lead-free stop
+evidence with a consistent world endpoint. That timestamp-bound capability lets
+the existing Force Stops owner begin reversible approach shaping and commit its
+fixed-world point before the classic geometry window. Force Stops retains pedal,
+lead, validity, and mode releases; MPC arbitrates the committed obstacle against
+closer leads; stock longcontrol owns final landing on standalone BLoTv2. CEM
+still owns no speed, acceleration, brake, or stop point.
+
+This handoff is in progress for testing only and its source candidate remains
+replay-rejected. Route-17 segment 20 stopped `1.324 m` behind its internal
+retained target; that target is not calibrated painted-line ground truth.
+Offline native LongControl did not reproduce the earlier segment-25
+no-standstill result, but neither result establishes road safety or stop-line
+placement.
 
 ## Strong
 

@@ -52,8 +52,15 @@ A qualifying stop also refreshes a `4 s` mode hold so brief prediction flicker
 cannot return the approach to Chill. The earlier route replay moved the first
 handoff from `39.1 mph` to `42.2 mph`; the new earlier threshold still requires
 fresh replay and field validation.
-publishes only through `selfdriveState.experimentalMode`; it adds no UI or
-user-facing Params and does not own target speed or braking.
+For owner-authorized testing, one second of current, complete, lead-free stop
+evidence also publishes a model-frame-bound capability to the existing Force
+Stops owner. Force Stops retains reversible approach shaping and the committed
+stop point; MPC arbitrates the obstacle, and longcontrol owns final landing.
+The source remains replay-rejected: route-17 segment 20 stopped `1.324 m`
+behind its internal retained target, which is not a calibrated painted-line
+measurement. Offline native LongControl did not reproduce the old segment-25
+no-standstill result, but neither result is road validation. No UI or
+user-facing Param is added; this is not production-ready.
 The implementation and signal mapping are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 

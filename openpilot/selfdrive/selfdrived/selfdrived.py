@@ -531,6 +531,9 @@ class SelfdriveD:
     ss.engageable = not self.events.contains(ET.NO_ENTRY)
     ss.experimentalMode = self.experimental_mode
     ss.personality = self.personality
+    ss.conditionalStopQualified = self.conditional_experimental_mode.stop_qualified
+    ss.conditionalStopDistance = self.conditional_experimental_mode.stop_distance or 0.0
+    ss.conditionalStopModelMonoTime = self.sm.logMonoTime['modelV2'] if self.conditional_experimental_mode.stop_qualified else 0
 
     ss.alertText1 = self.AM.current_alert.alert_text_1
     ss.alertText2 = self.AM.current_alert.alert_text_2
@@ -558,6 +561,7 @@ class SelfdriveD:
       controls_enabled=self.enabled and self.CP.openpilotLongitudinalControl,
       model_updated=bool(self.sm.updated['modelV2']),
       model_valid=bool(self.sm.valid['modelV2'] and self.sm.alive['modelV2'] and self.sm.freq_ok['modelV2']),
+      radar_valid=bool(self.sm.valid['radarState'] and self.sm.alive['radarState'] and self.sm.freq_ok['radarState']),
     )
     self.experimental_mode = bool(
       self.CP.openpilotLongitudinalControl and
