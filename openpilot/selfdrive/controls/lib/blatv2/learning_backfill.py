@@ -2022,7 +2022,7 @@ def _copy_live_torque_parameters(
 ) -> _RecordedLiveTorqueParameters:
   use_filtered = bool(message.useParams)
   return _RecordedLiveTorqueParameters(
-    live_valid=bool(message.liveValid),
+    live_valid=bool(message.valid),
     use_params=use_filtered,
     version=int(message.version),
     lat_accel_factor=float(

@@ -307,7 +307,7 @@ def extracted_fixture(
     "lateralTorqueParameters",
     base - 4_000_000,
     payload=SimpleNamespace(
-      liveValid=True, useParams=True, version=1,
+      valid=True, useParams=True, version=1,
       latAccelFactorFiltered=2.5, latAccelOffsetFiltered=0.0,
       frictionCoefficientFiltered=0.1, latAccelFactorRaw=2.5,
       latAccelOffsetRaw=0.0, frictionCoefficientRaw=0.1,

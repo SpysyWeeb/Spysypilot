@@ -2513,7 +2513,7 @@ struct VehicleParameters {
 }
 
 struct LateralTorqueParameters {
-  liveValid @0 :Bool;
+  valid @0 :Bool;
   latAccelFactorRaw @1 :Float32;
   latAccelOffsetRaw @2 :Float32;
   frictionCoefficientRaw @3 :Float32;
