@@ -45,9 +45,10 @@ Every test report must identify:
 - [x] Early urban intent, faster filter-only hints, intent-hold behavior,
   geometry validity, highway-slowdown rejection, and recent-lead hysteresis
   have deterministic unit coverage.
-- [x] BLoTv2 contains no legacy Force Stops speed-cap owner or planner hook.
-- [x] Combo's optional Force Stops owner is integrated separately from BLoTv2
-  CEM and Smooth Stops, with focused release and position-hold coverage.
+- [x] Qualified Force Stops authority is bound to the exact current model frame,
+  fails closed on malformed trajectories, health faults, leads, and pedals, and
+  retains combo's stable-braking latch, reversible cap, committed-point, MPC,
+  and Smooth Stops ownership boundaries.
 - [x] Stock longitudinal maneuver matrix passes.
 - [x] Final static and generated-solver build audit.
 
@@ -80,6 +81,11 @@ Replay must use the real production classes, not copied equations.
 - [x] All 62 segments of that route reject the observed highway-exit slowdown
   and transient lead-dropout window while retaining both intended stop
   handoffs.
+- [x] Offline native LongControl removes the simplified-harness segment-25
+  no-standstill artifact; this is diagnostic evidence, not field validation.
+- [ ] Route-17 segment 20 remains `1.324 m` behind its internal retained target;
+  physical stop-line placement remains an owner field gate because that target
+  is not calibrated painted-line ground truth.
 - [ ] The route-derived cubic envelope is repeated on-road without launch
   lunge, a 10 m/s authority cliff, delayed response, or added speed overshoot.
 - [ ] Five-mph set-speed increases and reductions at urban and highway speed

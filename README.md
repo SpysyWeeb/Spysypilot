@@ -23,7 +23,7 @@ Only two combined testing branches are maintained:
 
 ## Force Stops
 
-**Status: in progress; awaiting fresh route replay and owner field validation.**
+**Status: replay-rejected; owner testing only.**
 After CEM selects Experimental mode for a lead-free model stop, Force Stops
 tracks that model endpoint as ego advances, caps the planner's cruise candidate
 with a `0.65 m/s²` kinematic profile, and passes a committed physical stop point
@@ -35,6 +35,14 @@ invalid model/radar data, driver gas, disengagement, or standstill releases it
 immediately. Closer leads and stronger MPC/e2e braking
 still win; Smooth Stops remains the sole final-landing and standstill-handoff
 owner.
+
+One second of current, complete, lead-free stop evidence can grant Force Stops
+authority before the classic horizon. That capability is bound to the exact
+model frame and fails closed on stale timestamps, malformed trajectories,
+health faults, raw leads, or pedals. Route-17 segment 20 stopped `1.324 m`
+behind its internal retained target, which is not calibrated painted-line
+ground truth. Offline native LongControl did not reproduce the old segment-25
+no-standstill result, but neither result is road validation.
 
 ## BLoTv2 Conditional Experimental Mode
 
@@ -54,11 +62,14 @@ Chill. The earlier route replay moved the first handoff from `39.1 mph` to
 `42.2 mph`; the new earlier threshold still requires fresh replay and field
 validation.
 
-The effective state has one owner and publishes through
+After one full second of current evidence, CEM also publishes the frame-bound
+qualification consumed by Force Stops. CEM still owns no target speed, stop
+point, acceleration, or brake command.
+
+The effective mode has one owner and publishes through
 `selfdriveState.experimentalMode`, which drives both the stock on-road icon and
-planner strategy. The feature adds no UI or user-facing Params and does not own
-target speed, stop point, or braking. The implementation, signal mapping, and
-ownership boundaries are documented in
+planner strategy. The feature adds no UI or user-facing Params. The
+implementation, signal mapping, and ownership boundaries are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 
 ## BLoTv2 ordinary cruise comfort
