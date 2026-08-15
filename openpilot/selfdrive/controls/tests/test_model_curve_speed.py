@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from opendbc.car.hyundai.values import CAR
 from openpilot.common.constants import CV
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.model_curve_speed import (
@@ -26,6 +27,12 @@ def make_model(curvature=None, position_x=None, position_y=None, speed=15.0):
     velocity=SimpleNamespace(x=velocity_x),
     orientationRate=SimpleNamespace(z=curvature * velocity_x),
   )
+
+
+def make_cp(factor=2.0, offset=0.0, friction=0.1):
+  torque = SimpleNamespace(latAccelFactor=factor, latAccelOffset=offset, friction=friction)
+  return SimpleNamespace(carFingerprint=CAR.HYUNDAI_PALISADE,
+                         lateralTuning=SimpleNamespace(which=lambda: "torque", torque=torque))
 
 
 class TestModelCurveSpeed(unittest.TestCase):
@@ -80,6 +87,42 @@ class TestModelCurveSpeed(unittest.TestCase):
     self.assertEqual(limiter.update(spike_model, 30.0), 30.0)
     self.assertEqual(limiter.update(straight_model, 30.0), 30.0)
     self.assertFalse(limiter.active)
+
+  def test_future_torque_veto_is_debounced_and_fails_safe(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
+
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
+    self.assertFalse(limiter.torque_veto)
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
+    self.assertTrue(limiter.torque_veto)
+
+    curve.orientationRate.z = curve.orientationRate.z[:-1]
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
+    self.assertTrue(limiter.torque_veto)
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
+    self.assertFalse(limiter.torque_veto)
+
+  def test_partial_car_params_keeps_predictor_inactive(self):
+    limiter = ModelCurveSpeedLimiter(SimpleNamespace())
+    curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
+
+    self.assertFalse(limiter.torque_veto)
+
+  def test_live_torque_params_and_positive_accel_clamp(self):
+    from openpilot.selfdrive.controls.lib import longitudinal_planner
+
+    live = SimpleNamespace(latAccelFactorFiltered=20.0, latAccelOffsetFiltered=0.0,
+                           frictionCoefficientFiltered=0.1)
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True, torque_params=live)
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True, torque_params=live)
+
+    self.assertFalse(limiter.torque_veto)
+    self.assertEqual(longitudinal_planner.limit_accel_for_torque(0.4, True), 0.0)
+    self.assertEqual(longitudinal_planner.limit_accel_for_torque(-0.4, True), -0.4)
 
   def test_approach_distance_follows_path_arc_not_only_forward_position(self):
     curvature = np.zeros(ModelConstants.IDX_N)

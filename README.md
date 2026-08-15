@@ -4,7 +4,16 @@ This fork is **entirely vibe-coded** — including this README.
 
 It's a personal side project for SpysyWeeb. It is **not meant for others to use**, but it's available for anyone who wants to try it **at their own risk**.
 
-Any and all code and features generated in this project are free for others to use. SpysyWeeb can't take credit for the code itself, but if you build on an idea from here, a little credit for the idea would be appreciated. 🙏
+Any and all code and features generated in this project are free for others to use. SpysyWeeb doesn't take credit for the code itself, but if you build on an idea from here, a little credit for the idea would be appreciated. 🙏
+
+This branch keeps the existing model-path curve speed limiter and adds a
+Palisade-only future-torque throttle veto. When two of three model frames
+predict at least 95% feedforward steering demand at the current speed, only
+positive longitudinal acceleration is clamped to zero; braking is untouched.
+The 50/22/13 mph envelope remains until route and owner evidence support
+replacing it. See
+[`docs/ModelCurveSpeedLimit.md`](docs/ModelCurveSpeedLimit.md) for the design
+and remaining validation work.
 
 ## Branches
 
