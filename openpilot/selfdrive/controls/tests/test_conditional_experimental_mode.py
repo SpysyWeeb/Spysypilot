@@ -1,3 +1,4 @@
+import copy
 import math
 from types import SimpleNamespace
 
@@ -44,6 +45,17 @@ def model(*, should_stop=False, path_end=90.0, terminal_speed=10.0, desired_acce
     velocity=SimpleNamespace(x=velocity_x),
     orientation=SimpleNamespace(z=orientation_z),
   )
+
+
+def model_lead(*, prob=0.0, x=200.0, y=0.0):
+  count = len(ModelConstants.LEAD_T_IDXS)
+  return SimpleNamespace(prob=prob, x=[x] * count, y=[y] * count)
+
+
+def with_model_leads(md, *leads):
+  md.position.y = [0.0] * ModelConstants.IDX_N
+  md.leadsV3 = list(leads)
+  return md
 
 
 def car_state(*, v_ego=10.0, standstill=False, gas=False, brake=False,
@@ -226,6 +238,305 @@ def test_recent_lead_hysteresis_blocks_entry_during_a_short_radar_dropout():
   dropout_frames = int(LEAD_RELEASE_HYSTERESIS_S / DT) - 1
   assert not any(run_frames(cem, dropout_frames, stop, cs, radar_state()))
   assert run_frames(cem, 40, stop, cs, radar_state())[-1]
+
+
+def test_early_trajectory_alone_cannot_release_recent_lead_hysteresis():
+  cem = new_cem()
+  v_ego = 18.95
+  cs = car_state(v_ego=v_ego)
+  stop = with_model_leads(
+    route_d7_early_stop_model(),
+    model_lead(prob=0.0902, x=92.94, y=2.11),
+    model_lead(prob=0.0244, x=92.82, y=2.02),
+    model_lead(prob=0.0307, x=92.68, y=1.99),
+  )
+  run_frames(cem, 1, stop, cs, radar_state(present=True, distance=80.0))
+
+  outputs = run_frames(cem, 20, stop, cs, radar_state())
+
+  assert not any(outputs)
+  assert cem._lead_veto_remaining > 0.0
+
+
+def test_strict_clear_frame_starts_revocable_lead_release_through_strict_flicker():
+  cem = new_cem()
+  v_ego = 18.95
+  cs = car_state(v_ego=v_ego)
+  strict = with_model_leads(
+    model(path_end=83.6443, terminal_speed=0.6702, desired_accel=-0.7),
+    model_lead(prob=0.1, x=97.11, y=0.0),
+    model_lead(prob=0.1, x=96.62, y=0.0),
+    model_lead(prob=0.1, x=96.27, y=0.0),
+  )
+  early = with_model_leads(
+    route_d7_early_stop_model(),
+    model_lead(prob=0.0902, x=92.94, y=2.11),
+    model_lead(prob=0.0244, x=92.82, y=2.02),
+    model_lead(prob=0.0307, x=92.68, y=1.99),
+  )
+  run_frames(cem, 1, strict, cs, radar_state(present=True, distance=80.0))
+
+  assert not cem.update(strict, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+  outputs = run_frames(cem, 20, early, cs, radar_state())
+
+  assert outputs[-1]
+  assert cem._lead_veto_remaining > 0.0
+
+
+
+def test_recent_lead_hysteresis_releases_early_for_distant_model_lead_beyond_stop():
+  cem = new_cem()
+  v_ego = 15.0
+  cs = car_state(v_ego=v_ego)
+  strict = with_model_leads(
+    model(path_end=69.6756, terminal_speed=0.7223, desired_accel=-0.847),
+    model_lead(prob=0.4991, x=92.07, y=0.13),
+    model_lead(prob=0.4781, x=91.91, y=0.15),
+    model_lead(prob=0.4080, x=91.77, y=0.16),
+  )
+  stop = with_model_leads(
+    model(path_end=71.828, terminal_speed=1.137, desired_accel=-0.847),
+    model_lead(prob=0.4991, x=94.96, y=0.13),
+    model_lead(prob=0.4781, x=94.85, y=0.15),
+    model_lead(prob=0.4080, x=94.75, y=0.16),
+  )
+  run_frames(cem, 1, strict, cs, radar_state(present=True, distance=60.0))
+
+  assert not cem.update(strict, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+  outputs = run_frames(cem, 20, stop, cs, radar_state())
+
+  assert outputs[-1]
+  assert cem._lead_veto_remaining > 0.0
+
+
+def test_in_path_replacement_model_lead_preserves_recent_lead_hysteresis():
+  cem = new_cem()
+  v_ego = 15.0
+  cs = car_state(v_ego=v_ego)
+  stop = with_model_leads(
+    model(path_end=75.0, terminal_speed=1.0, desired_accel=-0.8),
+    model_lead(prob=0.2215, x=36.93, y=0.98),
+    model_lead(prob=0.2030, x=36.91, y=0.87),
+    model_lead(prob=0.3812, x=36.82, y=0.87),
+  )
+  run_frames(cem, 1, stop, cs, radar_state(present=True, distance=45.0))
+
+  outputs = run_frames(cem, 20, stop, cs, radar_state())
+
+  assert not any(outputs)
+  assert cem._lead_veto_remaining > 0.0
+
+
+def test_model_lead_corridor_clamps_to_authored_path_endpoint():
+  from openpilot.selfdrive.controls.lib.conditional_experimental_mode import model_lead_stop_path_clear
+
+  stop = with_model_leads(
+    model(path_end=75.0, terminal_speed=1.0, desired_accel=-0.8),
+    model_lead(prob=0.2, x=85.0, y=15.0),
+    model_lead(), model_lead(),
+  )
+  stop.position.y = [15.0 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
+
+  assert not model_lead_stop_path_clear(stop, 75.0)
+
+
+def test_model_lead_path_boundaries_are_inclusive_and_every_positive_probability_counts():
+  from openpilot.selfdrive.controls.lib.conditional_experimental_mode import model_lead_stop_path_clear
+
+  template = with_model_leads(
+    model(path_end=75.0, terminal_speed=0.5, desired_accel=-0.8),
+    model_lead(), model_lead(), model_lead(),
+  )
+
+  for x, y, probability, expected_clear in (
+    (85.0, 0.0, 1e-9, False),
+    (85.0 + 1e-6, 0.0, 1e-9, True),
+    (36.9, 1.5, 1e-9, False),
+    (36.9, 1.5 + 1e-6, 1e-9, True),
+    (36.9, 0.0, 0.0, True),
+    (36.9, 0.0, 1e-9, False),
+  ):
+    stop = copy.deepcopy(template)
+    stop.leadsV3[0] = model_lead(prob=probability, x=x, y=y)
+    assert model_lead_stop_path_clear(stop, 75.0) is expected_clear
+
+
+def test_model_lead_future_cut_in_blocks_early_release():
+  from openpilot.selfdrive.controls.lib.conditional_experimental_mode import model_lead_stop_path_clear
+
+  stop = with_model_leads(
+    model(path_end=75.0, terminal_speed=0.5, desired_accel=-0.8),
+    model_lead(prob=0.2, x=36.9, y=1.5 + 1e-6),
+    model_lead(), model_lead(),
+  )
+  stop.leadsV3[0].y[1] = 0.0
+
+  assert not model_lead_stop_path_clear(stop, 75.0)
+
+
+def test_model_lead_duplicate_path_points_fail_closed():
+  from openpilot.selfdrive.controls.lib.conditional_experimental_mode import model_lead_stop_path_clear
+
+  stop = with_model_leads(
+    model(path_end=75.0, terminal_speed=0.5, desired_accel=-0.8),
+    model_lead(), model_lead(), model_lead(),
+  )
+  stop.position.x[11] = stop.position.x[10]
+  stop.position.y[10] = 10.0
+  stop.leadsV3[0] = model_lead(prob=0.2, x=stop.position.x[10], y=0.0)
+
+  assert not model_lead_stop_path_clear(stop, 75.0)
+
+
+def test_active_lead_release_revokes_on_health_loss_or_replacement():
+  cs = car_state(v_ego=15.0)
+  strict = with_model_leads(
+    model(path_end=75.0, terminal_speed=0.5, desired_accel=-0.8),
+    model_lead(prob=0.2, x=95.0, y=0.0),
+    model_lead(prob=0.2, x=95.0, y=0.0),
+    model_lead(prob=0.2, x=95.0, y=0.0),
+  )
+  replacement = with_model_leads(
+    model(path_end=75.0, terminal_speed=0.5, desired_accel=-0.8),
+    model_lead(prob=1e-9, x=36.9, y=0.0),
+    model_lead(), model_lead(),
+  )
+
+  for fault in ("model", "radar", "replacement"):
+    cem = new_cem()
+    run_frames(cem, 1, strict, cs, radar_state(present=True, distance=45.0))
+    assert not cem.update(strict, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+    assert cem._lead_release_active
+
+    if fault == "model":
+      cem.update(strict, cs, radar_state(), controls_enabled=True, model_updated=False, model_valid=False)
+    elif fault == "radar":
+      cem.update(strict, cs, radar_state(), controls_enabled=True, model_updated=False, model_valid=True, radar_valid=False)
+    else:
+      cem.update(replacement, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+
+    assert not cem._lead_release_active
+    assert not cem.stop_qualified
+    assert cem._entry_elapsed == 0.0
+
+
+def test_malformed_model_lead_path_falls_back_to_recent_lead_hysteresis():
+  v_ego = 15.0
+  cs = car_state(v_ego=v_ego)
+  template = with_model_leads(
+    model(path_end=75.0, terminal_speed=1.0, desired_accel=-0.8),
+    model_lead(prob=0.2, x=95.0, y=0.0),
+    model_lead(prob=0.2, x=95.0, y=0.0),
+    model_lead(prob=0.2, x=95.0, y=0.0),
+  )
+
+  def assert_blocked(stop):
+    cem = new_cem()
+    run_frames(cem, 1, stop, cs, radar_state(present=True, distance=45.0))
+    assert not any(run_frames(cem, 20, stop, cs, radar_state()))
+    assert cem._lead_veto_remaining > 0.0
+
+  for bad_value in (float("nan"), float("inf"), float("-inf")):
+    for sample in range(ModelConstants.IDX_N):
+      stop = copy.deepcopy(template)
+      stop.position.y[sample] = bad_value
+      assert_blocked(stop)
+    for lead_index in range(3):
+      for axis in ("x", "y"):
+        for sample in range(len(ModelConstants.LEAD_T_IDXS)):
+          stop = copy.deepcopy(template)
+          getattr(stop.leadsV3[lead_index], axis)[sample] = bad_value
+          assert_blocked(stop)
+
+  for probability in (float("nan"), float("inf"), float("-inf"), -0.1, 1.1):
+    stop = copy.deepcopy(template)
+    stop.leadsV3[0].prob = probability
+    assert_blocked(stop)
+
+  for mutation in (
+    lambda stop: setattr(stop.position, "y", stop.position.y[:-1]),
+    lambda stop: setattr(stop, "leadsV3", stop.leadsV3[:-1]),
+    lambda stop: setattr(stop.leadsV3[0], "x", stop.leadsV3[0].x[:-1]),
+    lambda stop: setattr(stop.leadsV3[0], "y", stop.leadsV3[0].y[:-1]),
+    lambda stop: stop.position.x.__setitem__(10, stop.position.x[9] - 1.0),
+    lambda stop: stop.leadsV3[0].x.__setitem__(0, 0.0),
+  ):
+    stop = copy.deepcopy(template)
+    mutation(stop)
+    assert_blocked(stop)
+
+
+def test_direct_should_stop_cannot_bypass_recent_lead_hysteresis():
+  cem = new_cem()
+  cs = car_state(v_ego=15.0)
+  direct = with_model_leads(
+    model(should_stop=True, path_end=75.0, terminal_speed=15.0, desired_accel=-0.1),
+    model_lead(), model_lead(), model_lead(),
+  )
+  run_frames(cem, 1, direct, cs, radar_state(present=True, distance=45.0))
+
+  assert not any(run_frames(cem, 20, direct, cs, radar_state()))
+  assert cem._lead_veto_remaining > 0.0
+
+
+def test_raw_lead_reappearance_cancels_early_release_qualification_same_tick():
+  for raw_lead in (
+    radar_state(present=True, distance=45.0),
+    radar_state(secondary_present=True, secondary_distance=45.0),
+  ):
+    cem = new_cem()
+    cs = car_state(v_ego=15.0)
+    stop = with_model_leads(
+      model(path_end=75.0, terminal_speed=0.5, desired_accel=-0.8),
+      model_lead(prob=0.2, x=95.0, y=0.0),
+      model_lead(prob=0.2, x=95.0, y=0.0),
+      model_lead(prob=0.2, x=95.0, y=0.0),
+    )
+    run_frames(cem, 1, stop, cs, radar_state(present=True, distance=45.0))
+    assert not any(run_frames(cem, 3, stop, cs, radar_state()))
+    assert cem.intent_filter.x > 0.0
+    assert cem._lead_release_active
+
+    assert not cem.update(stop, cs, raw_lead, controls_enabled=True, model_updated=True, model_valid=True)
+    assert not cem._lead_release_active
+    assert not cem.stop_qualified
+    assert cem._entry_elapsed == 0.0
+
+
+def test_raw_lead_on_control_tick_clears_partial_admission_state():
+  for raw_lead in (
+    radar_state(present=True, distance=45.0),
+    radar_state(secondary_present=True, secondary_distance=45.0),
+  ):
+    cem = new_cem()
+    cs = car_state(v_ego=15.0)
+    stop = confirmed_stop_model(cs.vEgo)
+    for _ in range(20):
+      assert not cem.update(stop, cs, radar_state(), controls_enabled=True, model_updated=True, model_valid=True)
+      if cem._entry_elapsed > 0.0:
+        break
+    assert cem._entry_elapsed > 0.0
+    assert cem.intent_filter.x > 0.0
+
+    assert not cem.update(stop, cs, raw_lead, controls_enabled=True, model_updated=False, model_valid=True)
+    assert cem._entry_elapsed == 0.0
+    assert cem.intent_filter.x == 0.0
+    assert cem._intent_hold_remaining == 0.0
+
+
+def test_raw_lead_control_ticks_do_not_starve_active_mode_release():
+  control_dt = 0.01
+  cem = ConditionalExperimentalMode(control_dt=control_dt, model_dt=DT)
+  activate(cem)
+
+  outputs = []
+  for frame in range(int((STOP_INTENT_HOLD_S + 2.0) / control_dt)):
+    outputs.append(cem.update(
+      clear_model(), car_state(), radar_state(present=True, distance=1000.0),
+      controls_enabled=True, model_updated=frame % int(DT / control_dt) == 0, model_valid=True,
+    ))
+
+  assert not outputs[-1]
 
 
 def test_should_stop_is_direct_evidence_when_trajectory_is_missing():
