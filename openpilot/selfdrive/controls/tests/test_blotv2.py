@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.blotv2 import (
   ONSET_PAD_MAX,
   ONSET_RATE_DOWN,
   ONSET_RATE_UP,
+  STOPPED_LEAD_PAD_MAX,
   model_predicted_acceleration,
   model_predicted_speed,
 )
@@ -201,6 +202,11 @@ class TestSafetyAndContinuity(unittest.TestCase):
       policy.t_follow - T_FOLLOW_BASE,
       ONSET_PAD_MAX * 0.5,
     )
+
+  def test_stopped_lead_uses_larger_onset_pad(self):
+    policy = run(BLoTv2Supervisor(), lead(v=0.0, d=83.0), 14.0, -0.4, 2.0)
+    assert policy is not None
+    self.assertAlmostEqual(policy.t_follow - T_FOLLOW_BASE, STOPPED_LEAD_PAD_MAX)
 
   def test_onset_pad_respects_slew_rates(self):
     supervisor = BLoTv2Supervisor()
