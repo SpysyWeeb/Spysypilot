@@ -21,6 +21,10 @@ Only two combined testing branches are maintained:
 | [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) | stock comma release model |
 | [`rdf-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rdf-combo) | comma's [`rdf-driving`](https://github.com/commaai/openpilot/tree/rdf-driving) experimental RDF model |
 
+## Engagement CI
+
+Every `combo` push and pull request builds the tree, compiles Python, and runs the existing model-schema, torque-learning, all-car controller-construction, and platform-contract tests. Automated panda/opendbc bumps run the same gate before they can commit or push a new gitlink.
+
 ## Force Stops
 
 **Status: replay-rejected; owner testing only.**
