@@ -49,18 +49,37 @@ signals. The route-derived tiers now recognize a straight, lead-free near-stop
 trajectory earlier: weaker evidence can qualify at or below `22 m/s` after the
 filter/debounce, while the known `55 mph` highway slowdown remains filter-only.
 A qualifying stop also refreshes a `4 s` mode hold so brief prediction flicker
-cannot return the approach to Chill. The earlier route replay moved the first
-handoff from `39.1 mph` to `42.2 mph`; the new earlier threshold still requires
-fresh replay and field validation.
-For owner-authorized testing, one second of current, complete, lead-free stop
-evidence also publishes a model-frame-bound capability to the existing Force
-Stops owner. Force Stops retains reversible approach shaping and the committed
-stop point; MPC arbitrates the obstacle, and longcontrol owns final landing.
-The source remains replay-rejected: route-17 segment 20 stopped `1.324 m`
-behind its internal retained target, which is not a calibrated painted-line
-measurement. Offline native LongControl did not reproduce the old segment-25
-no-standstill result, but neither result is road validation. No UI or
-user-facing Param is added; this is not production-ready.
+cannot return the approach to Chill. The original `3 s` recent-lead guard is
+unchanged. During that guard, one current strict 33-point finite stop frame may
+mint a revocable release only when both raw radar leads are absent and all three
+complete finite `leadsV3` hypotheses are outside the predicted stop corridor.
+Every positive-probability hypothesis counts; malformed lead/path data, a raw
+lead on any control tick, health loss, or a committed turn revokes the release.
+Complete strong trajectory evidence may retain it through strict-tier flicker.
+Route 29 adds only the two intended CEM entries and still rejects the lower-
+confidence replacement vehicle near Connect `1440.989`; route 17 and route 27
+add no entries. Neither new route-29 entry bypasses the separate one-second
+Force Stops qualification.
+
+For owner-authorized testing, one second of current, complete, lead-free strict
+stop evidence still publishes the existing model-frame-bound capability to
+Force Stops. The recent-lead release does not shorten that qualification or
+change its exact current-frame binding. Force Stops retains reversible approach
+shaping and the committed stop point; MPC arbitrates the obstacle, and
+longcontrol owns final landing.
+
+Route-29 landing replay confirms both reported twitch windows hand `shouldStop`
+to control inside the logged `0.5 s` actuator delay. A combined lifetime/timing
+experiment still left the first handoff only `0.450 s` before standstill and
+relaxed an existing finite-endpoint fail-closed release, so it is intentionally
+not shipped. Cap, target geometry, MPC ownership, LongControl ramps, and hold
+pressure remain unchanged.
+
+Route-17 segment 20 still stopped `1.324 m` behind its internal retained target,
+which is not a calibrated painted-line measurement. Offline native LongControl
+did not reproduce the old segment-25 no-standstill result, but neither result is
+road validation. No UI or user-facing Param is added; this is not production-
+ready.
 The implementation and signal mapping are documented in
 [`docs/BLoTv2.md`](docs/BLoTv2.md#conditional-experimental-mode).
 

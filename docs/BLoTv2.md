@@ -185,9 +185,19 @@ what caused it.
 | Early urban prediction | inside an `8.0 s` horizon, terminal speed at most `55%` of ego speed, and desired acceleration at most `-0.25 m/s²`; at or below `22.0 m/s` it receives qualifying `0.70` confidence, while faster approaches remain a non-triggering `0.45` filter hint |
 | Early geometry guard | no turn signal, valid `action.desiredCurvature` below `1.0 m/s²` lateral acceleration, and valid terminal `orientation.z` within `20 degrees` |
 | Missing-velocity fallback | short path plus `action.desiredAcceleration <= -0.5 m/s²` |
-| Lead ownership | relevant `radarState.leadOne` blocks a new handoff; its veto persists `3.0 s` after loss so radar flicker cannot transfer a lead slowdown to CEM |
+| Lead ownership | relevant radar lead blocks a new handoff and starts an unchanged `3.0 s` grace. During that grace, one current strict 33-point stop may mint a revocable release only with both raw leads absent and every positive-probability model-lead hypothesis outside the predicted corridor; complete strong evidence may retain it through strict flicker |
 | Committed turn guard | low-speed blinker plus large steering angle/model curvature blocks a new handoff |
 | Release/override | stable model clear, resumed motion, gas, brake, invalid model, or disengagement |
+
+The recent-lead release validates exactly 33 finite path `x/y` samples with
+nondecreasing `x`, exactly three model-lead hypotheses, and exactly six finite
+`x/y` samples per hypothesis. Probability must be finite in `[0, 1]`; every
+value above zero counts. A hypothesis blocks the release at or inside both the
+stop endpoint plus `10.0 m` and the interpolated path center plus/minus `1.5 m`.
+The lateral path clamps at its authored endpoint over that extra margin rather
+than extrapolating unknown curvature. Missing, malformed, stale, unhealthy, or
+same-tick raw-lead data preserves the original grace and revokes any pending
+release.
 
 The evidence filter uses a `0.30 s` time constant, separate entry/release
 thresholds, `0.20 s` entry debounce, and `0.75 s` release hysteresis. Every
@@ -230,6 +240,33 @@ mode decision timing and rejection behavior, but it cannot close the loop to
 show the trajectory the newly selected e2e planner would have driven. The
 high-speed stop and false-handoff behavior therefore remain explicit owner
 field-test gates.
+
+### Route `00000029--74b84f1be9` lead-departure refinement
+
+Exact production-class replay preserves the `3.0 s` timer and adds only two
+strict-first, path-clear releases. The first strict-clear frame appears at route
+`291.288606`; CEM enters at `291.790260` / Connect `297.165686`, `0.526477 s`
+before recorded driver brake. The second strict-clear frame appears at route
+`780.904230`; CEM enters at `781.603402` / Connect `786.978828`, `2.156554 s`
+before brake. Neither entry reaches the separate one-second Force Stops
+qualification before recorded intervention.
+
+The negative sentinel at route `1435.612171` / Connect `1440.987597` contains
+three replacement hypotheses at roughly `36.82–36.93 m`, only
+`0.270–0.378 m` from the predicted path center despite probabilities of
+`0.20–0.38`. Every positive-probability hypothesis counts, so the release stays
+revoked and no CEM entry occurs. Route-wide replay adds no entry on route 17 or
+route 27. The conservative endpoint-placement case near Connect `364–380` is
+unchanged: no target setback or global endpoint adjustment is introduced.
+
+The same route proves both perceived twitch windows contain one late ownership
+handoff, not repeated planner/LongControl oscillation. A combined committed-
+lifetime and delay-projection experiment moved replay `shouldStop` to `0.450 s`
+and `0.550 s` before standstill, but the first still landed inside the logged
+`0.500 s` actuator delay and the experiment removed an existing finite-endpoint
+fail-closed release. It is therefore rejected from this change. Force Stops,
+planner acceleration, MPC geometry, stock LongControl, and integrated Smooth
+Stops remain unchanged.
 
 ### Qualified Force Stops handoff
 

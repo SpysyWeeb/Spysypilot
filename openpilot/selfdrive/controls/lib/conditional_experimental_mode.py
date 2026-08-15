@@ -82,6 +82,7 @@ DRIVER_OVERRIDE_SUPPRESS_S = 2.0
 LEAD_RELEVANCE_MIN_DISTANCE_M = 35.0
 LEAD_RELEVANCE_TIME_S = 3.5
 LEAD_PATH_MARGIN_M = 10.0
+LEAD_RELEASE_MODEL_PATH_HALF_WIDTH_M = 1.5
 LEAD_RELEASE_HYSTERESIS_S = 3.0
 COMMITTED_TURN_MAX_SPEED = 8.0
 COMMITTED_TURN_MIN_STEERING_DEG = 35.0
@@ -97,6 +98,7 @@ class StopIntentObservation:
   relevant_lead: bool = False
   committed_turn: bool = False
   trajectory_stop: bool = False
+  lead_release_stop: bool = False
 
 
 def _last_finite(values: Any, minimum_length: int = 1) -> float | None:
@@ -143,6 +145,60 @@ def _optional_finite_float(value: Any) -> float | None:
   except (TypeError, ValueError):
     return None
   return parsed if math.isfinite(parsed) else None
+
+
+def model_lead_stop_path_clear(model: Any, path_end_m: float) -> bool:
+  """Fail closed unless every nonzero model-lead hypothesis is outside the stop path."""
+  position = getattr(model, "position", None)
+  path_x = getattr(position, "x", ())
+  path_y = getattr(position, "y", ())
+  leads = getattr(model, "leadsV3", ())
+  lead_points = len(ModelConstants.LEAD_T_IDXS)
+  if (
+    len(path_x) != ModelConstants.IDX_N or len(path_y) != ModelConstants.IDX_N or
+    len(leads) != ModelConstants.LEAD_MHP_SELECTION or
+    not _finite_trajectory(path_x) or not _finite_trajectory(path_y)
+  ):
+    return False
+
+  path_x_values = [float(value) for value in path_x]
+  path_y_values = [float(value) for value in path_y]
+  if any(current <= previous for previous, current in zip(path_x_values, path_x_values[1:], strict=False)):
+    return False
+
+  for lead in leads:
+    probability = _optional_finite_float(getattr(lead, "prob", None))
+    lead_x = getattr(lead, "x", ())
+    lead_y = getattr(lead, "y", ())
+    if (
+      probability is None or not 0.0 <= probability <= 1.0 or
+      len(lead_x) != lead_points or len(lead_y) != lead_points or
+      not _finite_trajectory(lead_x) or not _finite_trajectory(lead_y)
+    ):
+      return False
+    if probability == 0.0:
+      continue
+
+    for lead_x_value, lead_y_value in zip(lead_x, lead_y, strict=True):
+      x = float(lead_x_value)
+      if x <= 0.0:
+        return False
+      if x > path_end_m + LEAD_PATH_MARGIN_M:
+        continue
+
+      if x <= path_x_values[0]:
+        path_center_y = path_y_values[0]
+      elif x >= path_x_values[-1]:
+        path_center_y = path_y_values[-1]
+      else:
+        index = next(i for i, path_position in enumerate(path_x_values) if path_position >= x)
+        x0, x1 = path_x_values[index - 1:index + 1]
+        y0, y1 = path_y_values[index - 1:index + 1]
+        path_center_y = y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+      if abs(float(lead_y_value) - path_center_y) <= LEAD_RELEASE_MODEL_PATH_HALF_WIDTH_M:
+        return False
+
+  return True
 
 
 def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> StopIntentObservation:
@@ -192,6 +248,7 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
     terminal_speed <= v_ego * STOP_EARLY_TERMINAL_SPEED_RATIO and
     desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX
   )
+  lead_release_stop = complete_trajectory and desired_accel_value is not None and (strict_trajectory_stop or early_stop)
 
   early_hint_path = path_end_m is not None and 0.0 < path_end_m <= v_ego * STOP_EARLY_HINT_HORIZON_S
   early_hint = bool(
@@ -234,7 +291,8 @@ def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> S
      (desired_curvature is not None and abs(desired_curvature) >= COMMITTED_TURN_MIN_CURVATURE))
   )
 
-  return StopIntentObservation(confidence, reason, path_end_m, terminal_speed, relevant_lead, committed_turn, bool(qualified_trajectory_stop))
+  return StopIntentObservation(confidence, reason, path_end_m, terminal_speed, relevant_lead, committed_turn,
+                               bool(qualified_trajectory_stop), bool(lead_release_stop))
 
 
 class ConditionalExperimentalMode:
@@ -258,6 +316,7 @@ class ConditionalExperimentalMode:
     self._standstill_seen = False
     self._invalid_elapsed = 0.0
     self._lead_veto_remaining = 0.0
+    self._lead_release_active = False
     self._post_stop_remaining = 0.0
     self._override_remaining = 0.0
     self._force_stop_qualified_elapsed = 0.0
@@ -287,6 +346,7 @@ class ConditionalExperimentalMode:
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
     self._intent_hold_remaining = 0.0
+    self._lead_release_active = False
     self._force_stop_qualified_elapsed = 0.0
     self._force_stop_tracked_endpoint = None
 
@@ -310,12 +370,26 @@ class ConditionalExperimentalMode:
       self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S
     else:
       self._lead_veto_remaining = max(self._lead_veto_remaining - self.model_dt, 0.0)
-    entry_veto = self._lead_veto_remaining > 0.0 or observation.committed_turn
-    confidence = observation.confidence if self.experimental_mode or not entry_veto else 0.0
     raw_lead_present = any(
       bool(getattr(lead, "present", getattr(lead, "status", False)))
       for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
     )
+    lead_release_safe = (
+      self._lead_veto_remaining > 0.0 and not raw_lead_present and not observation.committed_turn and
+      observation.path_end_m is not None and observation.path_end_m > 0.0 and
+      model_lead_stop_path_clear(model, observation.path_end_m)
+    )
+    if not lead_release_safe:
+      self._lead_release_active = False
+    elif self._lead_release_active:
+      self._lead_release_active = observation.lead_release_stop
+    elif (
+      not self.experimental_mode and observation.trajectory_stop and
+      observation.path_end_m is not None and observation.path_end_m < FORCE_STOP_COMMIT_DISTANCE_M
+    ):
+      self._lead_release_active = True
+    entry_veto = (self._lead_veto_remaining > 0.0 and not self._lead_release_active) or observation.committed_turn
+    confidence = observation.confidence if self.experimental_mode or not entry_veto else 0.0
     force_stop_evidence = (
       observation.trajectory_stop and not entry_veto and not raw_lead_present and
       observation.path_end_m is not None and 0.0 < observation.path_end_m < FORCE_STOP_COMMIT_DISTANCE_M
@@ -394,7 +468,10 @@ class ConditionalExperimentalMode:
       bool(getattr(lead, "present", getattr(lead, "status", False)))
       for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
     )
-    if not model_valid or not radar_valid or raw_lead_present:
+    if raw_lead_present and not model_updated and not self.experimental_mode:
+      self._clear_evidence()
+    elif not model_valid or not radar_valid or raw_lead_present:
+      self._lead_release_active = False
       self._force_stop_qualified_elapsed = 0.0
       self._force_stop_tracked_endpoint = None
 
