@@ -240,16 +240,18 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
   CP = SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
                        steerRatio=15.0, wheelbase=2.9)
   planner = LongitudinalPlanner(CP, init_v=v_ego)
-  planner.curve_speed_limiter.update = lambda model, v_cruise: v_cruise
+  planner.curve_speed_limiter.update = lambda model, v_cruise, v_ego=0.0, lateral_active=False, roll=0.0, torque_params=None: v_cruise
   planner.blotv2.update = lambda *args: SimpleNamespace(jerk_scale=1.0, t_follow=1.45, emergency=False)
   planner.lead_departure.update = lambda **kwargs: False
   sm = FakeSubMaster(model_length=100.0, should_stop=False, desired_accel=0.0, v_ego=v_ego)
   sm["carState"].vCruise = 100.0
   sm["carState"].aEgo = 0.0
   sm["carState"].steeringAngleDeg = 0.0
+  sm["carState"].steeringPressed = False
   sm["controlsState"] = SimpleNamespace(forceDecel=False, longControlState=LongCtrlState.pid)
-  sm["carControl"] = SimpleNamespace(orientationNED=[])
-  sm["vehicleParameters"] = SimpleNamespace(angleOffsetDeg=0.0)
+  sm["carControl"] = SimpleNamespace(orientationNED=[], latActive=True)
+  sm["vehicleParameters"] = SimpleNamespace(angleOffsetDeg=0.0, roll=0.0)
+  sm["lateralTorqueParameters"] = SimpleNamespace(useParams=False)
   sm["selfdriveState"].personality = 1
   sm["modelV2"].meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[]),
                                         laneChangeState=log.LaneChangeState.off)
