@@ -55,13 +55,19 @@ class TestRelativeLeadPhysics(unittest.TestCase):
       0.5,
     )
 
-  def test_total_requirement_includes_lead_braking(self):
+  def test_total_requirement_uses_finite_lead_stop_distance(self):
     lead = LeadObservation(True, distance=14.0, speed=8.0, acceleration=-1.0)
     closing_only = closing_decel_requirement(10.0, lead, 4.0, 1.0)
+    lead_stop_distance = lead.speed ** 2 / (2.0 * -lead.acceleration)
+    ego_stop_requirement = 10.0 ** 2 / (2.0 * (14.0 - 4.0 + lead_stop_distance))
     self.assertAlmostEqual(
       total_decel_requirement(10.0, lead, 4.0, 1.0),
-      1.0 + closing_only,
+      max(closing_only, ego_stop_requirement),
     )
+
+  def test_near_stopped_lead_does_not_sustain_instantaneous_deceleration(self):
+    lead = LeadObservation(True, distance=11.7, speed=0.22, acceleration=-0.81)
+    self.assertLess(total_decel_requirement(3.58, lead, 4.0, 1.0), 1.0)
 
   def test_ttc_ignores_nonclosing_lead(self):
     lead = LeadObservation(True, distance=10.0, speed=10.0)
