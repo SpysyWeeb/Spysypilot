@@ -56,6 +56,21 @@ jobs:
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
           echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
 
+      - name: Set up openpilot
+        if: steps.bump.outputs.changed != ''
+        run: ./tools/op.sh setup
+
+      - name: Build and check engagement contracts
+        if: steps.bump.outputs.changed != ''
+        run: |
+          scons -j$(nproc)
+          python -m compileall -q -j 0 openpilot
+          pytest -q \
+            openpilot/cereal/tests/test_model_schema_contract.py \
+            openpilot/selfdrive/locationd/test/test_torqued.py \
+            openpilot/selfdrive/car/tests/test_car_interfaces.py \
+            openpilot/system/loggerd/tests/test_platform_arch.py
+
       - name: Commit and push
         if: steps.bump.outputs.changed != ''
         run: |

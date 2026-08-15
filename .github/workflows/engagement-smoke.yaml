@@ -1,0 +1,45 @@
+name: engagement smoke
+
+on:
+  push:
+    branches:
+      - master
+      - combo
+      - rdf-combo
+      - tsf-combo
+      - tsfdo-combo
+      - SOL
+      - BLaTv2
+      - BLoTv2
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: engagement-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: 1
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  engagement-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up openpilot
+        run: ./tools/op.sh setup
+
+      - name: Build and check engagement contracts
+        run: |
+          scons -j$(nproc)
+          python -m compileall -q -j 0 openpilot
+          pytest -q \
+            openpilot/cereal/tests/test_model_schema_contract.py \
+            openpilot/selfdrive/locationd/test/test_torqued.py \
+            openpilot/selfdrive/car/tests/test_car_interfaces.py \
+            openpilot/system/loggerd/tests/test_platform_arch.py
