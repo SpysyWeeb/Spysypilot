@@ -92,7 +92,7 @@ class LongitudinalPlanner:
       v_cruise = 0.0
     else:
       torque_params = get_live_torque_params(sm)
-      lateral_active = sm['carControl'].latActive and not sm['carState'].steeringPressed
+      lateral_active = sm['carControl'].latActive
       v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise, v_ego=v_ego, lateral_active=lateral_active,
                                                  roll=sm['vehicleParameters'].roll, torque_params=torque_params)
 
