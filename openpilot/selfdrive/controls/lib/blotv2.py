@@ -52,10 +52,11 @@ JERK_SCALE_MIN = 0.3
 JERK_SCALE_RATE = 1.5
 ONSET_LEAD_DECEL = 0.4
 ONSET_PAD_MAX = 0.45
+STOPPED_LEAD_PAD_MAX = 0.75
 ONSET_FULL_DECEL = 1.5
 ONSET_MAX_A_REQ = 1.5
 EMERGENCY_SHORTFALL_MIN = 0.15
-ONSET_RATE_UP = 0.4
+ONSET_RATE_UP = 0.8
 ONSET_RATE_DOWN = 0.5
 MIN_TTC = 3.5
 MIN_SPEED = 1.0
@@ -279,7 +280,7 @@ class BLoTv2Supervisor:
         ):
           pad_target = max(
             pad_target,
-            ONSET_PAD_MAX * min(required_decel / 1.2, 1.0),
+            STOPPED_LEAD_PAD_MAX * min(required_decel / 1.2, 1.0),
           )
       else:
         for trigger in self._triggers:
