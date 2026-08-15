@@ -3,14 +3,9 @@ name: engagement smoke
 on:
   push:
     branches:
-      - master
       - combo
-      - rdf-combo
       - tsf-combo
       - tsfdo-combo
-      - SOL
-      - BLaTv2
-      - BLoTv2
   pull_request:
   workflow_dispatch:
 
