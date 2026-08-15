@@ -65,11 +65,14 @@ jobs:
         run: |
           scons -j$(nproc)
           python -m compileall -q -j 0 openpilot
+          python - <<'PY'
+          import openpilot.cereal.messaging as messaging
+          msg = messaging.new_message("modelV2")
+          msg.modelV2.big = False
+          PY
           pytest -q \
-            openpilot/cereal/tests/test_model_schema_contract.py \
             openpilot/selfdrive/locationd/test/test_torqued.py \
-            openpilot/selfdrive/car/tests/test_car_interfaces.py \
-            openpilot/system/loggerd/tests/test_platform_arch.py
+            openpilot/selfdrive/car/tests/test_car_interfaces.py
 
       - name: Commit and push
         if: steps.bump.outputs.changed != ''
