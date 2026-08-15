@@ -68,12 +68,19 @@ def closing_decel_requirement(v_ego: float, lead: LeadObservation, stop_distance
 
 def total_decel_requirement(v_ego: float, lead: LeadObservation, stop_distance: float,
                             min_gap_budget: float) -> float:
-  """Match measured lead braking and shed closing energy before the margin."""
+  """Shed closing speed and stop behind the lead's finite braking path."""
   if not lead.present:
     return 0.0
-  return max(-lead.acceleration, 0.0) + closing_decel_requirement(
-    v_ego, lead, stop_distance, min_gap_budget,
-  )
+
+  closing_requirement = closing_decel_requirement(v_ego, lead, stop_distance, min_gap_budget)
+  lead_braking = max(-lead.acceleration, 0.0)
+  if lead_braking == 0.0:
+    return closing_requirement
+
+  gap_budget = max(lead.distance - stop_distance, min_gap_budget)
+  lead_stop_distance = lead.speed * lead.speed / (2.0 * lead_braking)
+  stop_requirement = v_ego * v_ego / (2.0 * (gap_budget + lead_stop_distance))
+  return max(closing_requirement, stop_requirement)
 
 
 def time_to_collision(v_ego: float, lead: LeadObservation, min_closing_speed: float = 0.3) -> float:
