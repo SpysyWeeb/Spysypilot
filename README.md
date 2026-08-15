@@ -5,13 +5,14 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot).
 Status: **in progress pending field testing**. This feature must not be marked
 complete until the owner has tested it on-device.
 
-This branch adds a small model-path curve speed limiter to stock openpilot
-longitudinal planning. It spatially and temporally filters isolated curvature
-prediction spikes, maps the remaining predicted curvature to owner-calibrated
-maximum speeds, and caps cruise so the existing longitudinal controller can
-accelerate up to—but not through—the selected curve speed. See
+This branch keeps the existing model-path curve speed limiter and adds a
+Palisade-only future-torque throttle veto. When two of three model frames
+predict at least 95% feedforward steering demand at the current speed, only
+positive longitudinal acceleration is clamped to zero; braking is untouched.
+The 50/22/13 mph envelope remains until route and owner evidence support
+replacing it. See
 [`docs/ModelCurveSpeedLimit.md`](docs/ModelCurveSpeedLimit.md) for the design
-and calibration data.
+and remaining validation work.
 
 ---
 

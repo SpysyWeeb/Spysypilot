@@ -46,6 +46,10 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow
   return target_accel
 
 
+def limit_accel_for_torque(a_target, torque_veto):
+  return min(a_target, 0.0) if torque_veto else a_target
+
+
 class LongitudinalPlanner:
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
     self.CP = CP
@@ -53,7 +57,7 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
-    self.curve_speed_limiter = ModelCurveSpeedLimiter()
+    self.curve_speed_limiter = ModelCurveSpeedLimiter(CP)
 
     self.a_desired = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -77,7 +81,11 @@ class LongitudinalPlanner:
     if sm['controlsState'].forceDecel:
       v_cruise = 0.0
     else:
-      v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise)
+      torque_params = sm['lateralTorqueParameters']
+      torque_params = torque_params if sm.all_checks(['lateralTorqueParameters']) and torque_params.useParams else None
+      lateral_active = sm['carControl'].latActive and not sm['carState'].steeringPressed
+      v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise, v_ego=v_ego, lateral_active=lateral_active,
+                                                 roll=sm['vehicleParameters'].roll, torque_params=torque_params)
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
 
@@ -135,7 +143,8 @@ class LongitudinalPlanner:
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
-    self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
+    self.output_a_target = limit_accel_for_torque(np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX),
+                                                  self.curve_speed_limiter.torque_veto)
 
     self.a_desired = float(self.output_a_target)
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0

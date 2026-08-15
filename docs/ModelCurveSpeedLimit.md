@@ -4,56 +4,39 @@ Status: **in progress pending field testing**.
 
 ## Goal
 
-Use the driving model's predicted path to impose an owner-calibrated maximum
-speed through curves without introducing a separate turn-control state
-machine. The existing longitudinal planner remains responsible for
-acceleration, braking, and resuming the driver's cruise speed.
+Keep the existing model-path curve speed limiter while testing whether future
+path curvature can prevent additional throttle before steering authority is
+exhausted.
 
-The limiter must:
+## Existing speed envelope
 
-- look ahead using the model path;
-- reject isolated curvature prediction spikes;
-- allow normal acceleration while below the curve maximum;
-- stop accelerating at the maximum;
-- reduce speed before a curve only as early as required to meet the maximum;
-- release the cap automatically as the predicted path straightens; and
-- work for low-speed turns from a stop.
+The 50/22/13 mph curve envelope, spatial median, temporal median, and 0.5 m/s²
+approach calculation remain unchanged. They continue to own curve-entry speed
+and braking during this experiment.
 
-## Field calibration
+## Future-torque veto
 
-The initial maximum-speed envelope comes from three owner-driven route points
-recorded on 2026-07-24:
+For the Palisade's linear torque mapping, every valid future path sample is
+converted to normalized feedforward demand at the current vehicle speed using
+the controller's lateral-acceleration factor, offset, friction allowance, and
+live roll compensation. Valid filtered live torque parameters replace the
+static `CarParams` values.
 
-| Measured vehicle curvature | Model-path curvature | Maximum speed |
-|---:|---:|---:|
-| 0.00524 1/m | 0.00501 1/m | 50 mph |
-| 0.04339 1/m | 0.04666 1/m | 22 mph |
-| 0.07056 1/m | 0.08188 1/m | 13 mph |
+When predicted demand reaches `TORQUE_BUDGET = 0.95` on two of three consecutive
+model frames, the longitudinal planner clamps only positive final acceleration
+to zero:
 
-The model-path values are used by the online limiter because that is its input;
-the measured vehicle values document the physical curves that produced them.
-On 2026-07-25, the owner requested a 15% increase from the initial 38/19/11
-mph envelope, with each configured value rounded up to a whole mph. On
-2026-08-10, the owner raised the shallow 0.00501 1/m point from 44 to 50 mph
-and reduced the approach-deceleration target from 1.0 to 0.5 m/s². These are
-field-test starting points, not completed tuning.
+```python
+output_a_target = min(output_a_target, 0.0)
+```
 
-## Design
+Existing braking, stronger MPC/e2e/lead/stop deceleration, and driver override
+remain authoritative. Invalid geometry, inactive lateral control, or unusable
+parameters release the veto through the same two-of-three debounce rather than
+one-frame chatter.
 
-For each valid model horizon sample:
-
-1. Compute curvature from predicted yaw rate and speed.
-2. Apply a three-sample spatial median to reject an isolated bad path point.
-3. Convert curvature to a maximum speed using the field envelope.
-4. Compute the maximum speed allowed now to reach that future maximum with
-   comfortable deceleration over the predicted path distance.
-5. Apply a three-frame temporal median to the resulting allowance so one bad
-   model prediction cannot cause a sudden brake request.
-
-The lowest future allowance caps the driver's cruise setpoint before the
-existing longitudinal planner runs. No acceleration command is overridden,
-and no entering/turning/leaving state machine is added.
-
-The legacy instantaneous steering-angle total-acceleration limiter is retired;
-the calibrated speed cap now determines when curve-related acceleration must
-stop.
+This estimates path-driven feedforward and friction demand—not future PID
+feedback, tire grip, or a guaranteed full-controller 95% ceiling. The manual
+speed envelope must remain until exact-hash closed-loop route evidence and owner
+field testing show that the predictor activates early enough without needless
+throttle suppression.

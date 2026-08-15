@@ -2,7 +2,8 @@ from collections import deque
 
 import numpy as np
 
-from openpilot.common.constants import CV
+from opendbc.car.hyundai.values import CAR
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY, CV
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -14,6 +15,7 @@ CURVATURE_BP = np.array([0.00501, 0.04666, 0.08188])
 CURVE_SPEED_V = np.array([50.0, 22.0, 13.0]) * CV.MPH_TO_MS
 
 APPROACH_DECEL = 0.5  # m/s^2
+TORQUE_BUDGET = 0.95
 MIN_CURVATURE = 1e-4
 MIN_MODEL_SPEED = 1.0  # m/s; avoids unstable curvature near predicted stops
 MAX_CURVE_SPEED = V_CRUISE_MAX * CV.KPH_TO_MS
@@ -44,40 +46,79 @@ def curve_speed_for_curvature(curvature):
   return np.minimum(speed, MAX_CURVE_SPEED)
 
 
+def _torque_values(params):
+  try:
+    values = (float(params.latAccelFactorFiltered), float(params.latAccelOffsetFiltered),
+              float(params.frictionCoefficientFiltered))
+  except (AttributeError, TypeError, ValueError, OverflowError):
+    try:
+      values = (float(params.latAccelFactor), float(params.latAccelOffset), float(params.friction))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+      return None
+  return values if np.all(np.isfinite(values)) and values[0] > 0.0 and 0.0 <= values[2] < TORQUE_BUDGET else None
+
+
 class ModelCurveSpeedLimiter:
   """Caps cruise speed using filtered curvature over the model path."""
 
-  def __init__(self, approach_decel=APPROACH_DECEL):
+  def __init__(self, CP=None, approach_decel=APPROACH_DECEL):
     self.approach_decel = approach_decel
+    self.torque_params = None
+    if CP is not None and CP.carFingerprint == CAR.HYUNDAI_PALISADE and CP.lateralTuning.which() == "torque":
+      self.torque_params = _torque_values(CP.lateralTuning.torque)
     self._target_history = deque([MAX_CURVE_SPEED] * 3, maxlen=3)
+    self._torque_veto_history = deque([False] * 3, maxlen=3)
     self.active = False
+    self.torque_veto = False
+    self.predicted_torque = 0.0
     self.v_target = MAX_CURVE_SPEED
     self.curvature = 0.0
     self.distance = 0.0
 
-  def update(self, model, v_cruise):
+  def _invalid(self, v_cruise):
+    self._target_history.append(MAX_CURVE_SPEED)
+    self._torque_veto_history.append(False)
+    target = min(v_cruise, float(np.median(self._target_history)))
+    self.active = target < v_cruise
+    self.torque_veto = sum(self._torque_veto_history) >= 2
+    self.v_target = target
+    return target
+
+  def update(self, model, v_cruise, v_ego=0.0, lateral_active=False, roll=0.0, torque_params=None):
     self.active = False
     self.v_target = v_cruise
     self.curvature = 0.0
     self.distance = 0.0
+    self.predicted_torque = 0.0
 
-    position_x = np.asarray(model.position.x, dtype=float)
-    position_y = np.asarray(model.position.y, dtype=float)
-    velocity_x = np.asarray(model.velocity.x, dtype=float)
-    yaw_rate = np.asarray(model.orientationRate.z, dtype=float)
+    try:
+      position_x = np.asarray(model.position.x, dtype=float)
+      position_y = np.asarray(model.position.y, dtype=float)
+      velocity_x = np.asarray(model.velocity.x, dtype=float)
+      yaw_rate = np.asarray(model.orientationRate.z, dtype=float)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+      return self._invalid(v_cruise)
 
     expected_shape = (ModelConstants.IDX_N,)
     if any(a.shape != expected_shape for a in (position_x, position_y, velocity_x, yaw_rate)):
-      self._target_history = deque([MAX_CURVE_SPEED] * 3, maxlen=3)
-      return v_cruise
+      return self._invalid(v_cruise)
     if not all(np.all(np.isfinite(a)) for a in (position_x, position_y, velocity_x, yaw_rate)):
-      self._target_history = deque([MAX_CURVE_SPEED] * 3, maxlen=3)
-      return v_cruise
+      return self._invalid(v_cruise)
 
     path_distance = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(position_x), np.diff(position_y)))))
     curvature = np.abs(yaw_rate) / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED)
     filtered_curvature = _median_filter_three(curvature)
     curve_speed = curve_speed_for_curvature(filtered_curvature)
+
+    active_torque_params = _torque_values(torque_params) if torque_params is not None else None
+    active_torque_params = active_torque_params or self.torque_params
+    if lateral_active and active_torque_params is not None and np.isfinite(v_ego) and np.isfinite(roll):
+      factor, offset, friction = active_torque_params
+      signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
+      bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
+      self.predicted_torque = float(np.max(np.abs(signed_curvature * max(v_ego, 0.0) ** 2 - bias) / factor + friction))
+    self._torque_veto_history.append(self.predicted_torque >= TORQUE_BUDGET)
+    self.torque_veto = sum(self._torque_veto_history) >= 2
 
     # Kinematics rearranged from v_curve^2 = v_now^2 + 2*a*distance.
     # Each horizon point provides a maximum speed allowed now; the strictest
