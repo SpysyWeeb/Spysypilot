@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import math
 import unittest
 
 from openpilot.common.realtime import DT_MDL
@@ -123,6 +124,21 @@ class TestRecoveryAndLaunch(unittest.TestCase):
     self.assertAlmostEqual(policy.jerk_scale, JERK_SCALE_MIN)
     self.assertTrue(policy.model_active)
 
+  def test_model_forecast_uses_existing_onset_pad(self):
+    supervisor = BLoTv2Supervisor()
+    policy = None
+    for _ in range(frames(1.0)):
+      policy = supervisor.update(
+        lead(v=14.0, d=40.0),
+        15.0,
+        -0.5,
+        T_FOLLOW_BASE,
+        -0.75,
+      )
+    assert policy is not None
+    self.assertTrue(policy.model_active)
+    self.assertAlmostEqual(policy.t_follow - T_FOLLOW_BASE, ONSET_PAD_MAX * 0.5)
+
   def test_launch_relaxes_lagging_mpc(self):
     observation = lead(v=5.0, d=10.0, a=2.0)
     policy = run(BLoTv2Supervisor(), observation, 3.0, 0.2, 1.0)
@@ -136,6 +152,25 @@ class TestRecoveryAndLaunch(unittest.TestCase):
 
 
 class TestSafetyAndContinuity(unittest.TestCase):
+  def test_matched_mpc_braking_is_not_emergency(self):
+    policy = BLoTv2Supervisor().update(
+      lead(v=0.0, d=27.4, a=-0.15),
+      8.0,
+      -1.5,
+      T_FOLLOW_BASE,
+    )
+    self.assertGreater(policy.required_decel, 1.5)
+    self.assertFalse(policy.emergency)
+
+  def test_nonfinite_mpc_target_keeps_emergency(self):
+    policy = BLoTv2Supervisor().update(
+      lead(v=0.0, d=27.4, a=-0.15),
+      8.0,
+      math.nan,
+      T_FOLLOW_BASE,
+    )
+    self.assertTrue(policy.emergency)
+
   def test_emergency_returns_toward_stock_policy(self):
     supervisor = BLoTv2Supervisor()
     run(supervisor, lead(), 15.0, -2.0, 1.0)
