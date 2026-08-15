@@ -49,6 +49,10 @@ Every test report must identify:
   fails closed on malformed trajectories, health faults, leads, and pedals, and
   retains combo's stable-braking latch, reversible cap, committed-point, MPC,
   and Smooth Stops ownership boundaries.
+- [x] Recent-lead recovery preserves the `3.0 s` timer, starts only from one
+  strict 33-point frame, validates every positive-probability sample from all
+  three complete model-lead hypotheses, and revokes on malformed data, health
+  loss, turns, or either raw lead.
 - [x] Stock longitudinal maneuver matrix passes.
 - [x] Final static and generated-solver build audit.
 
@@ -81,6 +85,16 @@ Replay must use the real production classes, not copied equations.
 - [x] All 62 segments of that route reject the observed highway-exit slowdown
   and transient lead-dropout window while retaining both intended stop
   handoffs.
+- [x] Production-class route-29 replay adds only the two intended strict-first
+  entries, preserves nine Force Stops qualification transitions, and rejects
+  the replacement-vehicle sentinel near Connect `1440.989`.
+- [x] Production-class route-17 and route-27 replay add no early-release entries
+  and preserve their `8/34` and `6/11` entry/qualification counts.
+- [x] The route-29 landing experiment is rejected: it leaves the first handoff
+  inside actuator delay and weakens an existing finite-endpoint fail-closed
+  release. No landing, cap, target, MPC, or hold change ships here.
+- [x] The conservative Connect `364–380` endpoint-placement case is documented
+  without a global setback or endpoint adjustment.
 - [x] Offline native LongControl removes the simplified-harness segment-25
   no-standstill artifact; this is diagnostic evidence, not field validation.
 - [ ] Route-17 segment 20 remains `1.324 m` behind its internal retained target;

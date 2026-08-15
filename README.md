@@ -58,13 +58,29 @@ recognize a straight, lead-free near-stop trajectory earlier: weaker evidence
 can qualify at or below `22 m/s` after the filter/debounce, while the known
 `55 mph` highway slowdown remains filter-only. A qualifying stop also refreshes
 a `4 s` mode hold so brief prediction flicker cannot return the approach to
-Chill. The earlier route replay moved the first handoff from `39.1 mph` to
-`42.2 mph`; the new earlier threshold still requires fresh replay and field
-validation.
+Chill. The original `3 s` recent-lead guard is unchanged. During that guard,
+one current strict 33-point finite stop frame may mint a revocable release only
+when both raw radar leads are absent and every positive-probability sample from
+all three complete `leadsV3` hypotheses is outside the predicted stop corridor.
+Malformed lead/path data, a raw lead on any control tick, health loss, or a
+committed turn revokes the release.
+
+Route 29 adds only the two intended CEM entries and still rejects the lower-
+confidence replacement vehicle near Connect `1440.989`; routes 17 and 27 add no
+entries. Neither route-29 entry bypasses the separate one-second Force Stops
+qualification.
 
 After one full second of current evidence, CEM also publishes the frame-bound
-qualification consumed by Force Stops. CEM still owns no target speed, stop
-point, acceleration, or brake command.
+qualification consumed by Force Stops. Recent-lead recovery neither shortens
+that qualification nor changes its exact current-frame binding. CEM still owns
+no target speed, stop point, acceleration, or brake command.
+
+Route-29 landing replay confirms both reported twitch windows hand `shouldStop`
+to control inside the logged `0.5 s` actuator delay. A combined lifetime/timing
+experiment still left the first handoff only `0.450 s` before standstill and
+weakened an existing finite-endpoint fail-closed release, so it is not shipped.
+Cap, target geometry, MPC ownership, LongControl ramps, and hold pressure remain
+unchanged.
 
 The effective mode has one owner and publishes through
 `selfdriveState.experimentalMode`, which drives both the stock on-road icon and
