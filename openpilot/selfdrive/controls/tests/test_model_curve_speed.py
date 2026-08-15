@@ -110,6 +110,34 @@ class TestModelCurveSpeed(unittest.TestCase):
 
     self.assertFalse(limiter.torque_veto)
 
+  def test_optional_torque_service_does_not_invalidate_planner_outputs(self):
+    from openpilot.selfdrive.controls import plannerd
+
+    sm = plannerd.get_submaster()
+    for service in sm.services:
+      sm.alive[service] = sm.freq_ok[service] = sm.valid[service] = True
+    sm.alive['lateralTorqueParameters'] = False
+    sm.freq_ok['lateralTorqueParameters'] = False
+    sm.valid['lateralTorqueParameters'] = False
+
+    self.assertTrue(sm.all_checks())
+
+  def test_unhealthy_live_torque_params_fall_back_to_static(self):
+    from openpilot.selfdrive.controls.lib import longitudinal_planner
+
+    class FakeSubMaster(dict):
+      pass
+
+    live = SimpleNamespace(useParams=True)
+    sm = FakeSubMaster(lateralTorqueParameters=live)
+    sm.alive = {'lateralTorqueParameters': False}
+    sm.freq_ok = {'lateralTorqueParameters': True}
+    sm.valid = {'lateralTorqueParameters': True}
+
+    self.assertIsNone(longitudinal_planner.get_live_torque_params(sm))
+    sm.alive['lateralTorqueParameters'] = True
+    self.assertIs(longitudinal_planner.get_live_torque_params(sm), live)
+
   def test_live_torque_params_and_positive_accel_clamp(self):
     from openpilot.selfdrive.controls.lib import longitudinal_planner
 

@@ -8,6 +8,13 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 import openpilot.cereal.messaging as messaging
 
 
+def get_submaster():
+  optional = ['lateralTorqueParameters']
+  return messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'lateralTorqueParameters',
+                              'radarState', 'modelV2', 'selfdriveState'], poll='modelV2',
+                             ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional)
+
+
 def main():
   config_realtime_process(5, Priority.CTRL_LOW)
 
@@ -19,8 +26,7 @@ def main():
   ldw = LaneDepartureWarning()
   longitudinal_planner = LongitudinalPlanner(CP)
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance'])
-  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'lateralTorqueParameters',
-                            'radarState', 'modelV2', 'selfdriveState'], poll='modelV2')
+  sm = get_submaster()
 
   while True:
     sm.update()

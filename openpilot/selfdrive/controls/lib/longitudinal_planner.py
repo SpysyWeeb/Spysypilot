@@ -133,6 +133,16 @@ def limit_accel_for_torque(a_target, torque_veto):
   return min(a_target, 0.0) if torque_veto else a_target
 
 
+def get_live_torque_params(sm):
+  service = 'lateralTorqueParameters'
+  try:
+    params = sm[service]
+    healthy = sm.alive[service] and sm.freq_ok[service] and sm.valid[service]
+  except (AttributeError, KeyError):
+    return None
+  return params if healthy and params.useParams else None
+
+
 class LongitudinalPlanner:
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
     self.CP = CP
@@ -196,8 +206,7 @@ class LongitudinalPlanner:
     if force_decel:
       v_cruise = 0.0
     else:
-      torque_params = sm['lateralTorqueParameters']
-      torque_params = torque_params if sm.all_checks(['lateralTorqueParameters']) and torque_params.useParams else None
+      torque_params = get_live_torque_params(sm)
       lateral_active = sm['carControl'].latActive and not sm['carState'].steeringPressed
       v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise, v_ego=v_ego, lateral_active=lateral_active,
                                                  roll=sm['vehicleParameters'].roll, torque_params=torque_params)
