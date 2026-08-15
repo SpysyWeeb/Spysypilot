@@ -64,8 +64,10 @@ class ModelCurveSpeedLimiter:
   def __init__(self, CP=None, approach_decel=APPROACH_DECEL):
     self.approach_decel = approach_decel
     self.torque_params = None
-    if CP is not None and CP.carFingerprint == CAR.HYUNDAI_PALISADE and CP.lateralTuning.which() == "torque":
-      self.torque_params = _torque_values(CP.lateralTuning.torque)
+    lateral_tuning = getattr(CP, "lateralTuning", None)
+    if (getattr(CP, "carFingerprint", None) == CAR.HYUNDAI_PALISADE and lateral_tuning is not None
+        and lateral_tuning.which() == "torque"):
+      self.torque_params = _torque_values(lateral_tuning.torque)
     self._target_history = deque([MAX_CURVE_SPEED] * 3, maxlen=3)
     self._torque_veto_history = deque([False] * 3, maxlen=3)
     self.active = False

@@ -103,6 +103,13 @@ class TestModelCurveSpeed(unittest.TestCase):
     limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
     self.assertFalse(limiter.torque_veto)
 
+  def test_partial_car_params_keeps_predictor_inactive(self):
+    limiter = ModelCurveSpeedLimiter(SimpleNamespace())
+    curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
+    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
+
+    self.assertFalse(limiter.torque_veto)
+
   def test_live_torque_params_and_positive_accel_clamp(self):
     from openpilot.selfdrive.controls.lib import longitudinal_planner
 
