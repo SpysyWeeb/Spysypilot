@@ -154,7 +154,7 @@ class TestRecoveryAndLaunch(unittest.TestCase):
 class TestSafetyAndContinuity(unittest.TestCase):
   def test_matched_mpc_braking_is_not_emergency(self):
     policy = BLoTv2Supervisor().update(
-      lead(v=0.0, d=27.4, a=-0.15),
+      lead(v=0.0, d=24.0, a=-0.15),
       8.0,
       -1.5,
       T_FOLLOW_BASE,
@@ -164,7 +164,7 @@ class TestSafetyAndContinuity(unittest.TestCase):
 
   def test_nonfinite_mpc_target_keeps_emergency(self):
     policy = BLoTv2Supervisor().update(
-      lead(v=0.0, d=27.4, a=-0.15),
+      lead(v=0.0, d=24.0, a=-0.15),
       8.0,
       math.nan,
       T_FOLLOW_BASE,
