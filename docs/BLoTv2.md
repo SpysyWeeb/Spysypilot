@@ -172,15 +172,18 @@ It changes only solver inputs that already update at runtime:
 - **recovery response:** sustained MPC braking beyond measured necessity
   relaxes acceleration-change and jerk cost;
 - **model early response:** a sustained hard model lead forecast relaxes the
-  same cost before radar acceleration catches up;
+  same cost and contributes to the bounded dynamic-onset pad before radar
+  acceleration catches up;
 - **launch response:** a measured accelerating, receding lead and lagging MPC
   target relax the same cost;
-- **dynamic onset:** mild measured lead braking or closing on a stopped lead
-  adds up to `0.45 s` of following time so the obstacle cost opens earlier;
+- **dynamic onset:** mild measured or confirmed predicted lead braking, or
+  closing on a stopped lead, adds up to `0.45 s` of following time so the
+  obstacle cost opens earlier;
 - **whiplash ratchet:** cost does not stiffen during a lead-braking/ego-closing
   reversal;
-- **emergency stand-down:** low TTC plus high required deceleration removes all
-  adaptive targets and returns toward stock solver policy.
+- **emergency stand-down:** low TTC, high required deceleration, and a meaningful
+  shortfall versus the existing MPC brake target remove adaptive targets and
+  return toward stock solver policy.
 
 All adaptive outputs slew. Trigger debouncing uses the planner's actual `dt`
 instead of a hard-coded global frame period.
