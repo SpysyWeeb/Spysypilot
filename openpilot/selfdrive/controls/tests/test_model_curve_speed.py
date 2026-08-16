@@ -5,9 +5,11 @@ import numpy as np
 
 from opendbc.car.hyundai.values import CAR
 from openpilot.common.constants import CV
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.model_curve_speed import (
   CURVATURE_BP,
+  CURVE_TARGET_RELEASE_RATE,
   CURVE_SPEED_V,
   MAX_CURVE_SPEED,
   ModelCurveSpeedLimiter,
@@ -77,6 +79,22 @@ class TestModelCurveSpeed(unittest.TestCase):
     self.assertAlmostEqual(limiter.curvature, CURVATURE_BP[1])
     self.assertGreater(limiter.distance, 0.0)
     self.assertAlmostEqual(target, expected)
+
+  def test_curve_target_releases_slowly_until_curve_clears(self):
+    limiter = ModelCurveSpeedLimiter()
+    tight = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
+    opening = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[1]))
+    straight = make_model()
+    v_cruise = 30.0
+
+    limiter.update(tight, v_cruise)
+    tight_target = limiter.update(tight, v_cruise)
+    limiter.update(opening, v_cruise)
+    opening_target = limiter.update(opening, v_cruise)
+
+    self.assertAlmostEqual(opening_target - tight_target, CURVE_TARGET_RELEASE_RATE * DT_MDL)
+    limiter.update(straight, v_cruise)
+    self.assertEqual(limiter.update(straight, v_cruise), v_cruise)
 
   def test_single_frame_prediction_spike_is_rejected(self):
     limiter = ModelCurveSpeedLimiter()
