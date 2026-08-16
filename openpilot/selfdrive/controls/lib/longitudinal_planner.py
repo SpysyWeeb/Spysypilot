@@ -179,8 +179,8 @@ class LongitudinalPlanner:
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
 
-    # No change cost when user is controlling the speed, or when standstill
-    prev_accel_constraint = not (reset_state or sm['carState'].standstill)
+    # Keep the native acceleration-change cost through standstill release.
+    prev_accel_constraint = not reset_state
 
     force_stop_cap = self.force_stops.update(sm)
     stop_x = self.force_stops.remaining if self.force_stops.forcing else None

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import math
 import unittest
 
 import numpy as np
@@ -50,6 +51,54 @@ def model_lead(**overrides):
   }
   values.update(overrides)
   return SimpleNamespace(**values)
+
+
+class TestLaunchContinuity(unittest.TestCase):
+  def test_standstill_launch_keeps_previous_accel_constraint(self):
+    class SubMaster(dict):
+      def __init__(self):
+        lead = radar_lead(present=False)
+        super().__init__(
+          carState=SimpleNamespace(vEgo=0.0, vCruise=50.0, aEgo=0.0, standstill=True,
+                                   gasPressed=False, brakePressed=False, leftBlinker=False, rightBlinker=False,
+                                   steeringAngleDeg=0.0),
+          carControl=SimpleNamespace(orientationNED=[], latActive=False),
+          controlsState=SimpleNamespace(forceDecel=False, longControlState=longitudinal_planner.LongCtrlState.pid),
+          selfdriveState=SimpleNamespace(enabled=True, experimentalMode=True, personality=1),
+          vehicleParameters=SimpleNamespace(angleOffsetDeg=0.0, roll=0.0),
+          radarState=SimpleNamespace(leadOne=lead, leadTwo=lead),
+          modelV2=SimpleNamespace(
+            position=SimpleNamespace(x=np.full(longitudinal_planner.ModelConstants.IDX_N, 50.0)),
+            velocity=SimpleNamespace(x=np.full(longitudinal_planner.ModelConstants.IDX_N, 5.0)),
+            acceleration=SimpleNamespace(x=np.zeros(longitudinal_planner.ModelConstants.IDX_N)),
+            meta=SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[]),
+                                 laneChangeState=longitudinal_planner.log.LaneChangeState.off),
+            action=SimpleNamespace(desiredAcceleration=1.0, shouldStop=False),
+            leadsV3=[],
+          ),
+        )
+        self.valid = dict.fromkeys(self, True)
+        self.alive = dict.fromkeys(self, True)
+        self.freq_ok = dict.fromkeys(self, True)
+        self.logMonoTime = {"modelV2": 1}
+
+      def all_checks(self, services=None):
+        return True
+
+    planner = longitudinal_planner.LongitudinalPlanner(
+      SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
+                      steerRatio=15.0, wheelbase=2.9),
+    )
+    planner.force_stops.update = lambda sm: math.inf
+    planner.blotv2.update = lambda *args: SimpleNamespace(jerk_scale=1.0, t_follow=1.45, emergency=False)
+    planner.lead_departure.update = lambda **kwargs: False
+    constraints = []
+    planner.mpc.set_weights = lambda prev_accel_constraint, **kwargs: constraints.append(prev_accel_constraint)
+    planner.mpc.update = lambda *args, **kwargs: None
+
+    planner.update(SubMaster())
+
+    self.assertEqual(constraints, [True])
 
 
 class TestModelLeadTrajectory(unittest.TestCase):
