@@ -4,6 +4,7 @@ import numpy as np
 
 from opendbc.car.hyundai.values import CAR
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY, CV
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -15,6 +16,7 @@ CURVATURE_BP = np.array([0.00501, 0.04666, 0.08188])
 CURVE_SPEED_V = np.array([50.0, 22.0, 13.0]) * CV.MPH_TO_MS
 
 APPROACH_DECEL = 0.5  # m/s^2
+CURVE_TARGET_RELEASE_RATE = 0.2  # m/s^2; lower targets apply immediately, opening curves release gently
 TORQUE_BUDGET = 0.95
 MIN_CURVATURE = 1e-4
 MIN_MODEL_SPEED = 1.0  # m/s; avoids unstable curvature near predicted stops
@@ -77,18 +79,22 @@ class ModelCurveSpeedLimiter:
     self.curvature = 0.0
     self.distance = 0.0
 
-  def _invalid(self, v_cruise):
-    self._target_history.append(MAX_CURVE_SPEED)
-    self._torque_veto_history.append(False)
-    target = min(v_cruise, float(np.median(self._target_history)))
+  def _set_target(self, v_cruise, filtered_target):
+    target = min(v_cruise, filtered_target)
+    if target < v_cruise:
+      target = min(target, self.v_target + CURVE_TARGET_RELEASE_RATE * DT_MDL)
     self.active = target < v_cruise
-    self.torque_veto = sum(self._torque_veto_history) >= 2
     self.v_target = target
     return target
 
+  def _invalid(self, v_cruise):
+    self._target_history.append(MAX_CURVE_SPEED)
+    self._torque_veto_history.append(False)
+    self.torque_veto = sum(self._torque_veto_history) >= 2
+    return self._set_target(v_cruise, float(np.median(self._target_history)))
+
   def update(self, model, v_cruise, v_ego=0.0, lateral_active=False, roll=0.0, torque_params=None):
     self.active = False
-    self.v_target = v_cruise
     self.curvature = 0.0
     self.distance = 0.0
     self.predicted_torque = 0.0
@@ -129,10 +135,7 @@ class ModelCurveSpeedLimiter:
     target_idx = int(np.argmin(allowed_now))
     self._target_history.append(float(allowed_now[target_idx]))
     filtered_target = float(np.median(self._target_history))
-    target = min(v_cruise, filtered_target)
 
-    self.active = target < v_cruise
-    self.v_target = target
     self.curvature = float(filtered_curvature[target_idx])
     self.distance = float(path_distance[target_idx])
-    return target
+    return self._set_target(v_cruise, filtered_target)
