@@ -16,7 +16,7 @@ class FanController:
 
   def update(self, cur_temp: float, ignition: bool) -> int:
     self.controller.pos_limit = 100 if ignition else 30
-    self.controller.neg_limit = 30 if ignition else 0
+    self.controller.neg_limit = 30 if ignition else 10
 
     if ignition != self.last_ignition:
       self.controller.reset()
