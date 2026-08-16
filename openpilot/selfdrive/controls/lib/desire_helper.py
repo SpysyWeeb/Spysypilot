@@ -43,7 +43,7 @@ class DesireHelper:
         self.lane_change_timer = 0.0
         self.lane_change_wait_timer = 0.0
         self.nudgeless_used = False
-        self.brake_cancelled = False
+        self.brake_cancelled = carstate.brakePressed
         # Initialize lane change direction to prevent UI alert flicker
         self.lane_change_direction = self.get_lane_change_direction(carstate)
 
