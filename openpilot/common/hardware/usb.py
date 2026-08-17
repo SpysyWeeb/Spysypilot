@@ -1,10 +1,19 @@
+import os
 from pathlib import Path
 
-CHESTNUT_VENDOR_ID = 0xADD1
-CHESTNUT_PRODUCT_ID = 0x0001
+CHESTNUT_FW_VERSION = "ed4e39b7"
+CHESTNUT_USB_IDS = ((0xADD1, 0x0001), (0x3801, 0x0001))
+CHESTNUT_ROM_USB_IDS = ((0x174C, 0x2464), (0x174C, 0x2463))
 USB_DEVICES_PATH = Path("/sys/bus/usb/devices")
 TYPEC_CC_ORIENTATION_PATH = Path("/sys/class/power_supply/usb/typec_cc_orientation")
 PRIMARY_USB_CONTROLLER = "a600000.ssusb"
+
+
+def get_usb_topology() -> set[str]:
+  try:
+    return set(os.listdir(USB_DEVICES_PATH))
+  except OSError:
+    return set()
 
 
 def read(path: Path) -> str | None:
@@ -17,7 +26,7 @@ def read(path: Path) -> str | None:
 def read_int(path: Path, base: int = 10) -> int:
   try:
     return int(path.read_text(), base)
-  except (OSError, ValueError):
+  except (OSError, ValueError, TypeError):
     return 0
 
 
@@ -72,7 +81,7 @@ def set_usb_state(device_state, devices: list[dict]) -> None:
     entry.linkErrorCount = device["linkErrorCount"]
     entry.usb3Lane = device.get("usb3Lane", "unknown")
 
-    if (entry.vendorId, entry.productId) == (CHESTNUT_VENDOR_ID, CHESTNUT_PRODUCT_ID):
+    if (entry.vendorId, entry.productId) in CHESTNUT_USB_IDS:
       chestnut_present = True
 
   device_state.chestnutPresent = chestnut_present
