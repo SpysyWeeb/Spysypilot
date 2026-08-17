@@ -12,6 +12,7 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   CURVE_TARGET_RELEASE_RATE,
   CURVE_SPEED_V,
   MAX_CURVE_SPEED,
+  TORQUE_BUDGET,
   ModelCurveSpeedLimiter,
   curve_speed_for_curvature,
 )
@@ -31,9 +32,9 @@ def make_model(curvature=None, position_x=None, position_y=None, speed=15.0):
   )
 
 
-def make_cp(factor=2.0, offset=0.0, friction=0.1):
+def make_cp(factor=2.0, offset=0.0, friction=0.1, car=CAR.HYUNDAI_PALISADE):
   torque = SimpleNamespace(latAccelFactor=factor, latAccelOffset=offset, friction=friction)
-  return SimpleNamespace(carFingerprint=CAR.HYUNDAI_PALISADE,
+  return SimpleNamespace(carFingerprint=car,
                          lateralTuning=SimpleNamespace(which=lambda: "torque", torque=torque))
 
 
@@ -106,6 +107,26 @@ class TestModelCurveSpeed(unittest.TestCase):
     self.assertEqual(limiter.update(straight_model, 30.0), 30.0)
     self.assertFalse(limiter.active)
 
+  def test_future_torque_budget_caps_before_field_curve_speed(self):
+    curve_curvature = 0.002
+    for direction in (-1.0, 1.0):
+      with self.subTest(direction=direction):
+        curvature = np.zeros(ModelConstants.IDX_N)
+        curvature[12:17] = direction * curve_curvature
+        limiter = ModelCurveSpeedLimiter(make_cp())
+        model = make_model(curvature=curvature)
+        v_cruise = 30.0
+
+        limiter.update(model, v_cruise, v_ego=v_cruise, lateral_active=True)
+        target = limiter.update(model, v_cruise, v_ego=v_cruise, lateral_active=True)
+
+        field_target = np.sqrt(curve_speed_for_curvature(limiter.curvature) ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
+        torque_speed = np.sqrt((TORQUE_BUDGET - 0.1) * 2.0 / curve_curvature)
+        expected = np.sqrt(torque_speed ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
+        self.assertGreater(field_target, v_cruise)
+        self.assertTrue(limiter.active)
+        self.assertAlmostEqual(target, expected)
+
   def test_future_torque_veto_is_debounced_and_fails_safe(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
     curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
@@ -126,6 +147,18 @@ class TestModelCurveSpeed(unittest.TestCase):
     curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
     limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
 
+    self.assertFalse(limiter.torque_veto)
+
+  def test_live_torque_params_do_not_enable_unsupported_car(self):
+    live = SimpleNamespace(latAccelFactorFiltered=2.0, latAccelOffsetFiltered=0.0,
+                           frictionCoefficientFiltered=0.1)
+    limiter = ModelCurveSpeedLimiter(make_cp(car=CAR.HYUNDAI_SONATA))
+    curve = make_model(curvature=np.full(ModelConstants.IDX_N, 0.002))
+
+    limiter.update(curve, 30.0, v_ego=30.0, lateral_active=True, torque_params=live)
+    target = limiter.update(curve, 30.0, v_ego=30.0, lateral_active=True, torque_params=live)
+
+    self.assertEqual(target, 30.0)
     self.assertFalse(limiter.torque_veto)
 
   def test_optional_torque_service_does_not_invalidate_planner_outputs(self):
