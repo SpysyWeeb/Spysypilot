@@ -34,6 +34,8 @@ Only two combined testing branches are maintained:
 
 Every `combo` push and pull request builds the tree, compiles Python, and runs the existing model-schema, torque-learning, all-car controller-construction, and platform-contract tests. Automated panda/opendbc bumps build the updated tree and run the model-schema, torque-learning, and controller-construction checks before they can commit or push a new gitlink.
 
+The Python hardware contract keeps `COMMA_HARDWARE` as the TICI runtime alias and shares the current Chestnut USB IDs/topology API between `hardwared` and modeld.
+
 ## Force Stops
 
 **Status: replay-rejected; owner testing only.**
