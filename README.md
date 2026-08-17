@@ -28,7 +28,7 @@ Only two combined testing branches are maintained:
 | branch | driving model |
 |---|---|
 | [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) | stock comma release model |
-| [`rdf-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/rdf-combo) | comma's [`rdf-driving`](https://github.com/commaai/openpilot/tree/rdf-driving) experimental RDF model |
+| [`tsfdo-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/tsfdo-combo) | comma's [`tsfdo`](https://github.com/commaai/openpilot/tree/tsfdo) experimental small driving model |
 
 ## Engagement CI
 
