@@ -10,7 +10,7 @@ This branch keeps the existing model-path curve speed limiter and adds a
 Palisade-only future-torque envelope. Valid torque parameters can lower the
 future curve speed before the unchanged approach-distance calculation; the
 existing two-of-three veto still clamps only positive acceleration when
-predicted demand reaches 95%. The 50/22/13 mph field envelope and stronger
+predicted demand reaches 93%. The 50/22/13 mph field envelope and stronger
 braking remain intact. See
 [`docs/ModelCurveSpeedLimit.md`](docs/ModelCurveSpeedLimit.md) for the design
 and remaining validation work.
