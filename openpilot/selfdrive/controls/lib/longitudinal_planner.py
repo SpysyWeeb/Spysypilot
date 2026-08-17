@@ -80,9 +80,9 @@ def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
 
-def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, lead_present, speed_limiter_active=False):
-  """Limit comfort shaping to healthy, lead-free Chill cruise."""
-  return not (experimental_mode or force_decel or not radar_valid or lead_present or speed_limiter_active)
+def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, speed_limiter_active=False):
+  """Limit comfort shaping to healthy Chill cruise; lead MPC remains the safety owner."""
+  return not (experimental_mode or force_decel or not radar_valid or speed_limiter_active)
 
 
 def get_cruise_comfort_accel(v_cruise, v_ego, accel_coast):
@@ -243,7 +243,6 @@ class LongitudinalPlanner:
     personality = sm['selfdriveState'].personality
     radar_valid = sm.all_checks(['radarState'])
     lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
-    radar_has_lead = radar_valid and (sm['radarState'].leadOne.present or sm['radarState'].leadTwo.present)
     model_leads = sm['modelV2'].leadsV3
     model_lead_0 = model_leads[0] if len(model_leads) > 0 else None
     policy = self.blotv2.update(
@@ -347,7 +346,6 @@ class LongitudinalPlanner:
       experimental_mode,
       force_decel,
       radar_valid,
-      radar_has_lead,
       speed_limiter_active=self.curve_speed_limiter.active,
     )
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,

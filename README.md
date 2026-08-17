@@ -106,7 +106,7 @@ implementation, signal mapping, and ownership boundaries are documented in
 **Status: in progress; awaiting field validation.** Route
 `000000d9--6040563d1d` showed that an acceleration ceiling alone still makes a small
 highway set-speed correction use all available acceleration or the full
-`-1.2 m/s²` cruise deceleration limit. The current tune adds a lead-free Chill
+`-1.2 m/s²` cruise deceleration limit. The current tune adds an ordinary Chill
 cruise comfort response: above `15 m/s`, a `5 mph` error asks for about
 `0.40 m/s²`, tapers continuously as the error closes, and uses the
 pitch-compensated coast estimate during speed reductions. It blends in from
@@ -119,10 +119,11 @@ It retains the `4.0 m/s²` launch request without the abrupt 0-to-10 m/s drop,
 stays near the prior urban-speed tune, and reaches its highway floor smoothly.
 The deployed opendbc limit still clamps the request.
 
-Experimental mode, forced deceleration, invalid radar or lead-following
-operation, and an active model curve-speed limit bypass this shaping. The jerk
-schedule and planner candidate arbitration are unchanged. Production-function
-replay reduced the comparable route targets from approximately `+0.69` and
+Lead presence does not disable the shaped cruise candidate; lead MPC remains
+the safety owner and wins whenever it requests lower acceleration. Experimental
+mode, forced deceleration, invalid radar, and an active model curve-speed limit
+bypass this shaping. The jerk schedule and planner candidate arbitration are
+unchanged. Production-function replay reduced the comparable route targets from approximately `+0.69` and
 `-1.20 m/s²` to approximately `+0.40` and `-0.40 m/s²`; this is command replay,
 not closed-loop or field validation. Design and remaining gates are documented
 in [`docs/BLoTv2.md`](docs/BLoTv2.md#route-000000d9--6040563d1d-ordinary-cruise-comfort-refinement)
