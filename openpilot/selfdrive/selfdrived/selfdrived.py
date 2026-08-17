@@ -71,6 +71,7 @@ class SelfdriveD:
     self.excessive_actuation = self.params.get("Offroad_ExcessiveActuation") is not None
     self.big_model_loading = False
     self.big_model_active = False
+    self.big_model_failed = False
     self.big_model_ready_t = 0.
 
     # Setup sockets
@@ -171,19 +172,22 @@ class SelfdriveD:
     loading = self.params.get_bool("UsbGpuLoading")
     if self.big_model_loading and not loading:
       self.big_model_ready_t = time.monotonic()
-      if self.params.get_bool("UsbGpuActive"):
-        self.events.add(EventName.bigModelReady)
     self.big_model_loading = loading
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)
 
+    big_active = self.params.get("UsbGpuActive")
+    usbgpu_present = self.sm['deviceState'].chestnutPresent
+    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
+    big_failed = big_active is False or model_unavailable or (self.big_model_active and not usbgpu_present)
+    if big_failed and not self.big_model_failed:
+      self.events.add(EventName.bigModelFailed)
+    self.big_model_failed = big_failed
+
     # soft disable if the big model fails
-    big_active = self.params.get_bool("UsbGpuActive")
     if big_active:
       self.big_model_active = True
-    if self.enabled and self.big_model_active and not big_active:
-      self.events.add(EventName.modeldLagging)
-    if not self.enabled:
+    if not self.enabled and not model_unavailable:
       self.big_model_active = False
 
     if self.sm.recv_frame['lateralManeuverPlan'] > 0:
@@ -303,7 +307,7 @@ class SelfdriveD:
       device_pose = Pose.from_device_motion(self.sm['deviceMotion'])
       self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
 
-    if self.calibrated_pose is not None:
+    if self.calibrated_pose is not None and not self.CP.notCar:
       excessive_actuation = self.excessive_actuation_check.update(self.sm, CS, self.calibrated_pose)
       if not self.excessive_actuation and excessive_actuation is not None:
         set_offroad_alert("Offroad_ExcessiveActuation", True, extra_text=str(excessive_actuation))
@@ -348,6 +352,9 @@ class SelfdriveD:
     # Order is very intentional here. Be careful when modifying this.
     # All events here should at least have NO_ENTRY and SOFT_DISABLE.
     num_events = len(self.events)
+
+    if self.big_model_active and big_failed:
+      self.events.add(EventName.bigModelFailed)
 
     not_running = {p.name for p in self.sm['managerState'].processes if not p.running and p.shouldBeRunning}
     if self.sm.recv_frame['managerState'] and len(not_running):

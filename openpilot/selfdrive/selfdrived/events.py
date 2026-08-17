@@ -339,11 +339,6 @@ def low_memory_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaste
   return NormalPermanentAlert("Low Memory", f"{sm['deviceState'].memoryUsagePercent}% used")
 
 
-def high_cpu_usage_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  x = max(sm['deviceState'].cpuUsagePercent, default=0.)
-  return NormalPermanentAlert("High CPU Usage", f"{x}% used")
-
-
 def modeld_lagging_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   return NormalPermanentAlert("Driving Model Lagging", f"{sm['modelV2'].frameDropPerc:.1f}% frames dropped")
 
@@ -411,11 +406,11 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.bigModelLoading: {
     ET.NO_ENTRY: NoEntryAlert("Big Model Loading"),
-    ET.PERMANENT: NormalPermanentAlert("Big Model Loading"),
   },
 
-  EventName.bigModelReady: {
-    ET.PERMANENT: EngagementAlert(AudibleAlert.complete),
+  EventName.bigModelFailed: {
+    ET.SOFT_DISABLE: soft_disable_alert("Big Model Failed"),
+    ET.PERMANENT: NormalPermanentAlert("Big Model Failed ", "Restart the car to retry,\nsmall model is still available", duration=20.),
   },
 
   EventName.lateralManeuver: {
@@ -753,6 +748,10 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.resumeBlocked: {
     ET.NO_ENTRY: NoEntryAlert("Press Set to Engage"),
+  },
+
+  EventName.carNotReady: {
+    ET.NO_ENTRY: NoEntryAlert("Car Not Ready"),
   },
 
   EventName.wrongCruiseMode: {

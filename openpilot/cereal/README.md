@@ -29,6 +29,9 @@ then means breaking backwards-compatibility with all old logs of your fork. So w
 [custom.capnp](custom.capnp) that we will leave empty in mainline openpilot's cereal spec. **If you only modify those, you can ensure your
 fork will remain backwards-compatible with all versions of mainline openpilot and your fork.**
 
+Spysypilot keeps upstream `chestnutState` at Event ordinal `@152` and uses
+`@156` for current `lateralEvent`; historical `lateralEvent @152` routes require their exact source schema.
+
 An example of compatible changes:
 ```diff
 diff --git a/openpilot/cereal/custom.capnp b/openpilot/cereal/custom.capnp

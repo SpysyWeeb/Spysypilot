@@ -116,6 +116,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     canBusMissing @80;
     selfdrivedLagging @81;
     resumeBlocked @82;
+    carNotReady @103;
     steerTimeLimit @83;
     vehicleSensorsInvalid @84;
     locationdTemporaryError @85;
@@ -129,13 +130,14 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     userBookmark @95;
     excessiveActuation @96;
     bigModelLoading @100;
-    bigModelReady @101;
+    bigModelFailed @102;
 
     lowBatteryDEPRECATED @40;
     soundsUnavailableDEPRECATED @47;
     deviceFallingDEPRECATED @71;
     usbErrorDEPRECATED @78;
     audioFeedbackDEPRECATED @97;
+    bigModelReadyDEPRECATED @101;
   }
 }
 
@@ -712,6 +714,19 @@ struct UsbState {
   }
 }
 
+struct ChestnutState {
+  tempC @0 :Float32;
+  memoryTempC @1 :Float32;
+  powerDrawW @2 :Float32;
+  powerLimitW @3 :Float32;
+  gpuUsagePercent @4 :UInt8;
+  gpuClockMhz @5 :UInt16;
+  fanSpeedRpm @6 :UInt16;
+  pcieLtssm @7 :UInt8;
+  supplyVoltage @8 :UInt16;  # mV
+  supplyCurrent @9 :Int16;  # mA
+}
+
 struct RadarState @0x9a185389d6fdd05f {
   mdMonoTime @6 :UInt64;  # for debugging
   radarErrors @13 :Car.RadarData.Error;
@@ -755,7 +770,7 @@ struct RadarState @0x9a185389d6fdd05f {
   }
 }
 
-struct ExtrinsicsCalibration {
+struct ExtrinsicsCalibration @0x96df70754d8390bc {
   calStatus @11 :Status;
   calCycle @2 :Int32;
   calPerc @3 :Int8;
@@ -3463,6 +3478,7 @@ struct Event {
     procLog @33 :ProcLog;
     clocks @35 :Clocks;
     deviceState @6 :DeviceState;
+    chestnutState @152 :ChestnutState;
     logMessage @18 :Text;
     errorLogMessage @85 :Text;
 
@@ -3477,7 +3493,8 @@ struct Event {
     bookmarkButton @148 :UserBookmark;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
-    lateralEvent @152 :LateralEvent;
+    # Historical lateralEvent @152 routes require their exact source schema.
+    lateralEvent @156 :LateralEvent;
     drivingEvent @153 :DrivingEvent;
     drivingEventRecorded @154 :DrivingEventRecorded;
 
