@@ -4,39 +4,29 @@ Status: **in progress pending field testing**.
 
 ## Goal
 
-Keep the existing model-path curve speed limiter while testing whether future
-path curvature can prevent additional throttle before steering authority is
-exhausted.
+Slow for model-predicted curves before the Palisade exhausts steering authority.
 
-## Existing speed envelope
+## Curve-speed envelope
 
-The 50/22/13 mph curve envelope, spatial median, temporal median, and 0.5 m/s²
-approach calculation remain unchanged. They continue to own curve-entry speed
-and braking during this experiment.
+The existing 50/22/13 mph field envelope, spatial median, temporal median,
+target-release rate, and `0.5 m/s²` approach calculation remain unchanged.
+For valid Palisade torque parameters while lateral control is active, each
+future signed-curvature sample also gets the maximum speed that keeps predicted
+feedforward plus friction demand at or below `TORQUE_BUDGET = 0.95`. The lower
+of the field and torque-budget speeds enters the existing approach-distance
+calculation.
 
-## Future-torque veto
+Valid filtered live torque parameters replace the static `CarParams` values.
+Invalid geometry or unusable parameters retain field-envelope behavior rather
+than inventing a torque limit.
 
-For the Palisade's linear torque mapping, every valid future path sample is
-converted to normalized feedforward demand at the current vehicle speed using
-the controller's lateral-acceleration factor, offset, friction allowance, and
-live roll compensation. Valid filtered live torque parameters replace the
-static `CarParams` values.
+## Torque veto
 
-When predicted demand reaches `TORQUE_BUDGET = 0.95` on two of three consecutive
-model frames, the longitudinal planner clamps only positive final acceleration
-to zero:
+The existing two-of-three future-torque veto remains a backstop. When predicted
+demand reaches the budget, the longitudinal planner clamps only positive final
+acceleration to zero. Stronger MPC/e2e/lead/stop braking remains authoritative.
 
-```python
-output_a_target = min(output_a_target, 0.0)
-```
-
-Existing braking, stronger MPC/e2e/lead/stop deceleration, and driver override
-remain authoritative. Invalid geometry, inactive lateral control, or unusable
-parameters release the veto through the same two-of-three debounce rather than
-one-frame chatter.
-
-This estimates path-driven feedforward and friction demand—not future PID
-feedback, tire grip, or a guaranteed full-controller 95% ceiling. The manual
-speed envelope must remain until exact-hash closed-loop route evidence and owner
-field testing show that the predictor activates early enough without needless
-throttle suppression.
+This predicts path-driven feedforward and friction demand—not future PID
+feedback, tire grip, or a guaranteed full-controller 95% ceiling. Route replay
+must check final acceleration and jerk, false slowing on ordinary bends, and
+actual entry torque before owner field testing.
