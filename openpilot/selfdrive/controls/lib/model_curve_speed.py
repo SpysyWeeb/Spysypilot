@@ -118,12 +118,17 @@ class ModelCurveSpeedLimiter:
     filtered_curvature = _median_filter_three(curvature)
     curve_speed = curve_speed_for_curvature(filtered_curvature)
 
-    active_torque_params = _torque_values(torque_params) if torque_params is not None else None
+    active_torque_params = _torque_values(torque_params) if self.torque_params is not None and torque_params is not None else None
     active_torque_params = active_torque_params or self.torque_params
     if lateral_active and active_torque_params is not None and np.isfinite(v_ego) and np.isfinite(roll):
       factor, offset, friction = active_torque_params
       signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
       bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
+      torque_margin = (TORQUE_BUDGET - friction) * factor
+      torque_speed_squared = np.divide(bias + np.sign(signed_curvature) * torque_margin, signed_curvature,
+                                       out=np.full_like(signed_curvature, np.inf),
+                                       where=np.abs(signed_curvature) >= MIN_CURVATURE)
+      curve_speed = np.minimum(curve_speed, np.sqrt(np.maximum(torque_speed_squared, 0.0)))
       self.predicted_torque = float(np.max(np.abs(signed_curvature * max(v_ego, 0.0) ** 2 - bias) / factor + friction))
     self._torque_veto_history.append(self.predicted_torque >= TORQUE_BUDGET)
     self.torque_veto = sum(self._torque_veto_history) >= 2
