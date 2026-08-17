@@ -6,11 +6,11 @@ Status: **in progress pending field testing**. This feature must not be marked
 complete until the owner has tested it on-device.
 
 This branch keeps the existing model-path curve speed limiter and adds a
-Palisade-only future-torque throttle veto. When two of three model frames
-predict at least 95% feedforward steering demand at the current speed, only
-positive longitudinal acceleration is clamped to zero; braking is untouched.
-The 50/22/13 mph envelope remains until route and owner evidence support
-replacing it. See
+Palisade-only future-torque envelope. Valid torque parameters can lower the
+future curve speed before the unchanged approach-distance calculation; the
+existing two-of-three veto still clamps only positive acceleration when
+predicted demand reaches 95%. The 50/22/13 mph field envelope and stronger
+braking remain intact. See
 [`docs/ModelCurveSpeedLimit.md`](docs/ModelCurveSpeedLimit.md) for the design
 and remaining validation work.
 
