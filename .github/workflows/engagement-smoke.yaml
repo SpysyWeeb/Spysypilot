@@ -37,4 +37,5 @@ jobs:
             openpilot/cereal/tests/test_model_schema_contract.py \
             openpilot/selfdrive/locationd/test/test_torqued.py \
             openpilot/selfdrive/car/tests/test_car_interfaces.py \
-            openpilot/system/loggerd/tests/test_platform_arch.py
+            openpilot/system/loggerd/tests/test_platform_arch.py \
+            openpilot/selfdrive/modeld/tests/test_helpers.py
