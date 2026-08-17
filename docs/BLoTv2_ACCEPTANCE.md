@@ -31,9 +31,10 @@ Every test report must identify:
 - [x] The acceleration ceiling follows the owner-approved cubic envelope with
   deterministic endpoint, sample, monotonicity, convexity, continuity, and
   deployed-platform-clamp coverage.
-- [x] Ordinary lead-free Chill cruise uses a route-derived proportional
-  response with deterministic coverage for coast-down, low-speed blending,
-  large-error authority, jerk, invalid radar, and strategy bypasses.
+- [x] Ordinary Chill cruise uses a route-derived proportional response with
+  deterministic coverage for coast-down, low-speed blending, large-error
+  authority, jerk, invalid radar, lead-independent shaping with MPC safety
+  ownership, and strategy bypasses.
 - [x] Conditional Experimental Mode uses only existing BLoTv2 model/cereal
   signals and publishes through `selfdriveState.experimentalMode`.
 - [x] Conditional mode filtering, debounce, hysteresis, latch, lead/turn
