@@ -28,15 +28,17 @@ clamped to the deployed opendbc limit.
 
 Route `000000d9--6040563d1d` showed that an acceleration ceiling alone still makes a
 small highway set-speed correction use all available acceleration or the full
-`-1.2 m/s²` cruise deceleration limit. The current in-progress tune adds a
-lead-free Chill cruise comfort response: above `15 m/s`, a `5 mph` error asks
+`-1.2 m/s²` cruise deceleration limit. The current in-progress tune adds an
+ordinary Chill cruise comfort response: above `15 m/s`, a `5 mph` error asks
 for about `0.40 m/s²`, tapers continuously as the error closes, and uses the
 pitch-compensated coast estimate during speed reductions. It blends in from
 `8–15 m/s`, so low-speed launch response is retained, while larger errors can
-still reach the existing acceleration and braking envelope. Experimental
-mode, forced deceleration, radar-invalid or lead-following operation, and an
-active model curve-speed limit bypass this shaping. The jerk schedule remains
-unchanged. This is route-replay tuning and still requires owner field testing.
+still reach the existing acceleration and braking envelope. Lead presence does
+not disable the shaped cruise candidate; lead MPC remains the safety owner and
+wins whenever it requests lower acceleration. Experimental mode, forced
+deceleration, radar-invalid operation, and an active model curve-speed limit
+bypass this shaping. The jerk schedule remains unchanged. This is route-replay
+tuning and still requires owner field testing.
 
 Conditional Experimental Mode is **in progress**. Its target behavior is to
 keep BLoTv2 in Chill mode during ordinary driving, hand the existing

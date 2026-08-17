@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import math
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from opendbc.car.interfaces import ACCEL_MAX
@@ -558,13 +559,67 @@ class TestOrdinaryCruiseComfort(unittest.TestCase):
 
     self.assertAlmostEqual(first_target, jerk * self.DT)
 
+  def test_present_lead_does_not_disable_cruise_comfort(self):
+    class SubMaster(dict):
+      def __init__(self):
+        lead = radar_lead(dRel=100.0, vLead=80.0 * CV.MPH_TO_MS)
+        absent_lead = radar_lead(present=False)
+        super().__init__(
+          carState=SimpleNamespace(vEgo=80.0 * CV.MPH_TO_MS, vCruise=75.0 * CV.MPH_TO_KPH,
+                                   aEgo=0.0, standstill=False, gasPressed=False, brakePressed=False,
+                                   leftBlinker=False, rightBlinker=False, steeringAngleDeg=0.0),
+          carControl=SimpleNamespace(orientationNED=[], latActive=False),
+          controlsState=SimpleNamespace(forceDecel=False, longControlState=longitudinal_planner.LongCtrlState.pid),
+          selfdriveState=SimpleNamespace(enabled=True, experimentalMode=False, personality=1),
+          vehicleParameters=SimpleNamespace(angleOffsetDeg=0.0, roll=0.0),
+          radarState=SimpleNamespace(leadOne=lead, leadTwo=absent_lead),
+          modelV2=SimpleNamespace(
+            position=SimpleNamespace(x=np.full(longitudinal_planner.ModelConstants.IDX_N, 50.0)),
+            velocity=SimpleNamespace(x=np.full(longitudinal_planner.ModelConstants.IDX_N, 5.0)),
+            acceleration=SimpleNamespace(x=np.zeros(longitudinal_planner.ModelConstants.IDX_N)),
+            meta=SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]),
+                                 laneChangeState=longitudinal_planner.log.LaneChangeState.off),
+            action=SimpleNamespace(desiredAcceleration=1.0, shouldStop=False),
+            leadsV3=[],
+          ),
+        )
+
+      def all_checks(self, services=None):
+        return True
+
+    planner = longitudinal_planner.LongitudinalPlanner(
+      SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
+                      steerRatio=15.0, wheelbase=2.9),
+    )
+    sm = SubMaster()
+    policy = SimpleNamespace(jerk_scale=1.0, t_follow=1.45, emergency=False)
+    with (
+      patch.object(planner.force_stops, "update", return_value=math.inf),
+      patch.object(planner.blotv2, "update", return_value=policy),
+      patch.object(planner.lead_departure, "update", return_value=False),
+      patch.object(planner.mpc, "set_weights"),
+      patch.object(planner.mpc, "update"),
+    ):
+      with patch.object(longitudinal_planner, "get_accel_from_plan", return_value=0.0):
+        for _ in range(200):
+          planner.update(sm)
+
+      self.assertEqual(planner.mpc.source, LongitudinalPlanSource.cruise)
+      self.assertAlmostEqual(planner.output_a_target, -0.402336, places=6)
+
+      planner.mpc.source = LongitudinalPlanSource.lead0
+      with patch.object(longitudinal_planner, "get_accel_from_plan", return_value=-1.0):
+        planner.update(sm)
+
+      self.assertEqual(planner.mpc.source, LongitudinalPlanSource.lead0)
+      self.assertEqual(planner.output_a_target, -1.0)
+
   def test_comfort_eligibility_preserves_other_longitudinal_strategies(self):
-    self.assertTrue(ordinary_cruise_comfort_enabled(False, False, True, False))
-    self.assertFalse(ordinary_cruise_comfort_enabled(True, False, True, False))
-    self.assertFalse(ordinary_cruise_comfort_enabled(False, True, True, False))
-    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, False, False))
-    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, True, True))
-    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, True, False, speed_limiter_active=True))
+    self.assertTrue(ordinary_cruise_comfort_enabled(False, False, True))
+    self.assertFalse(ordinary_cruise_comfort_enabled(True, False, True))
+    self.assertFalse(ordinary_cruise_comfort_enabled(False, True, True))
+    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, False))
+    self.assertFalse(ordinary_cruise_comfort_enabled(False, False, True, speed_limiter_active=True))
 
   def test_disabled_comfort_matches_legacy_targets(self):
     v_ego = 80.0 * CV.MPH_TO_MS
