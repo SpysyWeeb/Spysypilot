@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 import runpy
 import subprocess
@@ -24,7 +25,11 @@ def test_comma_hardware_arch_contract():
 
 
 def test_comma_hardware_runtime_contract():
-  with patch("os.path.isfile", side_effect=lambda path: path == "/TICI"):
+  real_isfile = os.path.isfile
+  def marker_isfile(path):
+    return path == "/TICI" if path in ("/TICI", "/AGNOS") else real_isfile(path)
+
+  with patch("os.path.isfile", side_effect=marker_isfile):
     hardware = runpy.run_path(str(ROOT / "openpilot/common/hardware/__init__.py"))
 
   assert hardware["TICI"] is True
