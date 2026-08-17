@@ -76,7 +76,7 @@ class Spinner:
     try:
       self._write_file.write(spinner_text + '\n')
       self._write_file.flush()
-    except (BrokenPipeError, IOError):
+    except OSError:
       self._write_file = None
 
   def update_progress(self, cur: float, total: float):
