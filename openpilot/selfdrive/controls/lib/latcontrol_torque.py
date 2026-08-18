@@ -29,13 +29,17 @@ KP_INTERP = [250, 120, 65, 30, 11.5, 5.5, 3.5, 2.0, KP]
 PALISADE_LOW_SPEED_KP_END = float(np.float32(15 * CV.MPH_TO_MS))
 PALISADE_LOW_SPEED_KP_SPEEDS = [2.0, 3.0, 5.0, PALISADE_LOW_SPEED_KP_END]
 PALISADE_LOW_SPEED_KP = [65, 10, 10, np.interp(PALISADE_LOW_SPEED_KP_SPEEDS[-1], INTERP_SPEEDS, KP_INTERP)]
+PALISADE_TARGET_KP_SPEEDS = [2.0, 2.25, 5.0, PALISADE_LOW_SPEED_KP_END]
+PALISADE_TARGET_KP = [65, 4, 4, PALISADE_LOW_SPEED_KP[-1]]
+PALISADE_TARGET_ACCEL = [0.2, 0.25]
+PALISADE_TARGET_PROGRESS = [0.7, 1.0]
 
 LP_FILTER_CUTOFF_HZ = 1.2
 JERK_LOOKAHEAD_SECONDS = 0.19
 JERK_GAIN = 0.3
 LAT_ACCEL_REQUEST_BUFFER_SECONDS = 1.0
 VERSION = 1
-PALISADE_VERSION = 2
+PALISADE_VERSION = 3
 
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
@@ -100,7 +104,15 @@ class LatControlTorque(LatControl):
       # Keep stock PID state; only replace the Palisade's low-speed effective P term.
       effective_p = self.pid.p
       if self.palisade_low_speed_kp and PALISADE_LOW_SPEED_KP_SPEEDS[0] < CS.vEgo < PALISADE_LOW_SPEED_KP_SPEEDS[-1]:
-        effective_p = np.interp(CS.vEgo, PALISADE_LOW_SPEED_KP_SPEEDS, PALISADE_LOW_SPEED_KP) * pid_log.error
+        demand_weight = np.interp(abs(setpoint), PALISADE_TARGET_ACCEL, [0.0, 1.0])
+        demand_weight = demand_weight * demand_weight * (3.0 - 2.0 * demand_weight)
+        progress = 1.0 - pid_log.error * setpoint / max(setpoint ** 2, PALISADE_TARGET_ACCEL[0] ** 2)
+        soften_weight = np.interp(progress, PALISADE_TARGET_PROGRESS, [0.0, 1.0])
+        soften_weight = soften_weight * soften_weight * (3.0 - 2.0 * soften_weight)
+        soft_kp = np.interp(CS.vEgo, PALISADE_TARGET_KP_SPEEDS, PALISADE_TARGET_KP)
+        turn_kp = self.pid.k_p + (soft_kp - self.pid.k_p) * soften_weight
+        current_kp = np.interp(CS.vEgo, PALISADE_LOW_SPEED_KP_SPEEDS, PALISADE_LOW_SPEED_KP)
+        effective_p = (current_kp + (turn_kp - current_kp) * demand_weight) * pid_log.error
         output_lataccel = np.clip(effective_p + self.pid.i + self.pid.d + self.pid.f, self.pid.neg_limit, self.pid.pos_limit)
       output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
 
