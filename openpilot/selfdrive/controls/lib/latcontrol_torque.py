@@ -5,7 +5,7 @@ from collections import deque
 from openpilot.cereal import log
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
 from opendbc.car.hyundai.values import CAR as HYUNDAI
-from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY, CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
@@ -32,7 +32,13 @@ JERK_LOOKAHEAD_SECONDS = 0.19
 JERK_GAIN = 0.3
 LAT_ACCEL_REQUEST_BUFFER_SECONDS = 1.0
 VERSION = 1
-PALISADE_VERSION = 4
+PALISADE_VERSION = 5
+# Preserve learned breakaway friction at rest; use the observed ~0.03 lower torque once the rack moves.
+PALISADE_KINETIC_FRICTION_RATIO = 0.77
+PALISADE_STATIC_RATE = 4.0
+PALISADE_KINETIC_RATE = 8.0
+PALISADE_FRICTION_FILTER_RC = 0.1
+PALISADE_FRICTION_TAPER_SPEEDS = (20 * CV.MPH_TO_MS, 25 * CV.MPH_TO_MS)
 
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
@@ -40,7 +46,7 @@ class LatControlTorque(LatControl):
     self.torque_params = CP.lateralTuning.torque.as_builder()
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
     self.lateral_accel_from_torque = CI.lateral_accel_from_torque()
-    self.palisade_curvature_alignment = CP.carFingerprint == HYUNDAI.HYUNDAI_PALISADE
+    self.palisade_torque_experiment = CP.carFingerprint == HYUNDAI.HYUNDAI_PALISADE
     self.pid = PIDController([INTERP_SPEEDS, KP_INTERP], KI, rate=1/self.dt)
     self.update_limits()
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
@@ -49,6 +55,7 @@ class LatControlTorque(LatControl):
     self.curvature_request_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
     self.lookahead_frames = int(JERK_LOOKAHEAD_SECONDS / self.dt)
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
+    self.steering_rate_filter = FirstOrderFilter(0.0, PALISADE_FRICTION_FILTER_RC, self.dt)
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -62,7 +69,7 @@ class LatControlTorque(LatControl):
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = PALISADE_VERSION if self.palisade_curvature_alignment else VERSION
+    pid_log.version = PALISADE_VERSION if self.palisade_torque_experiment else VERSION
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     measurement = measured_curvature * CS.vEgo ** 2
     future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
@@ -75,7 +82,7 @@ class LatControlTorque(LatControl):
 
     delay_frames = int(np.clip(lat_delay / self.dt + 1, 1, self.lat_accel_request_buffer_len))
     expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
-    if self.palisade_curvature_alignment:
+    if self.palisade_torque_experiment:
       # Compare delayed desired and measured curvature at the same speed.
       expected_lateral_accel = self.curvature_request_buffer[-delay_frames] * CS.vEgo ** 2
     setpoint = expected_lateral_accel
@@ -88,7 +95,19 @@ class LatControlTorque(LatControl):
     ff = gravity_adjusted_future_lateral_accel
     # latAccelOffset corrects roll compensation bias from device roll misalignment relative to car roll
     ff -= self.torque_params.latAccelOffset
-    ff += get_friction(error + JERK_GAIN * desired_lateral_jerk, lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
+    friction_scale = 1.0
+    if self.palisade_torque_experiment:
+      if not active or CS.steeringPressed:
+        self.steering_rate_filter.x = 0.0
+      else:
+        steering_rate = abs(CS.steeringRateDeg)
+        self.steering_rate_filter.x = min(self.steering_rate_filter.x, steering_rate)
+        filtered_steering_rate = self.steering_rate_filter.update(steering_rate)
+        moving = np.interp(filtered_steering_rate, [PALISADE_STATIC_RATE, PALISADE_KINETIC_RATE], [0.0, 1.0])
+        low_speed = np.interp(CS.vEgo, PALISADE_FRICTION_TAPER_SPEEDS, [1.0, 0.0])
+        friction_scale -= (1.0 - PALISADE_KINETIC_FRICTION_RATIO) * moving * low_speed
+    ff += friction_scale * get_friction(error + JERK_GAIN * desired_lateral_jerk, lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
+    pid_log.frictionScale = float(friction_scale)
 
     if not active:
       output_torque = 0.0
