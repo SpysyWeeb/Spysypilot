@@ -11,6 +11,7 @@ from openpilot.common.realtime import config_realtime_process, DT_CTRL, Priority
 from openpilot.common.swaglog import cloudlog
 
 from opendbc.car.car_helpers import interfaces
+from opendbc.car.hyundai.values import CAR as HYUNDAI
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
@@ -60,7 +61,10 @@ class Controls:
     elif self.CP.lateralTuning.which() == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.CP.lateralTuning.which() == 'torque':
-      self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
+      self.LaC = LatControlTorque(
+        self.CP, self.CI, DT_CTRL,
+        use_rack_trajectory=self.CP.carFingerprint == HYUNDAI.HYUNDAI_PALISADE,
+      )
 
   def update(self):
     self.sm.update(15)
@@ -91,6 +95,11 @@ class Controls:
 
     long_plan = self.sm['longitudinalPlan']
     model_v2 = self.sm['modelV2']
+    if isinstance(self.LaC, LatControlTorque):
+      self.LaC.set_rack_trajectory_model(
+        model_v2 if self.sm.valid['modelV2'] else None,
+        self.sm.logMonoTime['selfdriveState'],
+      )
 
     CC = car.CarControl.new_message()
     CC.enabled = self.sm['selfdriveState'].enabled
@@ -196,6 +205,29 @@ class Controls:
     cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
     cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
     cs.desiredCurvature = self.desired_curvature
+    if isinstance(self.LaC, LatControlTorque) and self.LaC.rack_trajectory is not None:
+      rack_state = cs.rackTrajectoryState
+      rack_state.status = self.LaC.rack_trajectory.status
+      output = self.LaC.rack_trajectory_output
+      if output is not None:
+        rack_state.active = True
+        rack_state.targetSteeringAngleDeg = float(output.target_angle_deg)
+        rack_state.targetSteeringRateDegS = float(output.target_rate_deg_s)
+        rack_state.plannedSteeringAngleDeg = float(output.planned_angle_deg)
+        rack_state.plannedSteeringRateDegS = float(output.planned_rate_deg_s)
+        rack_state.plannedSteeringAccelerationDegS2 = float(output.planned_acceleration_deg_s2)
+        rack_state.measuredSteeringRateDegS = float(output.measured_rate_deg_s)
+        rack_state.feedbackTorque = float(output.feedback_torque)
+        rack_state.feedbackLimited = bool(output.feedback_limited)
+        rack_state.motionLimited = bool(output.motion_limited)
+        rack_state.torqueLimited = bool(output.torque_limited)
+        rack_state.infeasible = bool(output.infeasible)
+        rack_state.rateLimitDegS = float(output.rate_limit_deg_s)
+        rack_state.accelerationLimitDegS2 = float(output.acceleration_limit_deg_s2)
+        rack_state.jerkLimitDegS3 = float(output.jerk_limit_deg_s3)
+        rack_state.profileTransition = bool(output.profile_transition)
+        rack_state.pathLimited = bool(output.path_limited)
+        rack_state.targetCurvature = float(output.target_curvature)
     cs.longControlState = self.LoC.long_control_state
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)
