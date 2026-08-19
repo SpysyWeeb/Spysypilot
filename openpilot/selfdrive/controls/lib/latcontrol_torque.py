@@ -5,7 +5,7 @@ from collections import deque
 from openpilot.cereal import log
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
 from opendbc.car.hyundai.values import CAR as HYUNDAI
-from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY, CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
@@ -26,13 +26,20 @@ KI = 0.15
 
 INTERP_SPEEDS = [1, 1.5, 2.0, 3.0, 5, 7.5, 10, 15, 30]
 KP_INTERP = [250, 120, 65, 30, 11.5, 5.5, 3.5, 2.0, KP]
+PALISADE_LOW_SPEED_KP_END = float(np.float32(15 * CV.MPH_TO_MS))
+PALISADE_LOW_SPEED_KP_SPEEDS = [2.0, 3.0, 5.0, PALISADE_LOW_SPEED_KP_END]
+PALISADE_LOW_SPEED_KP = [65, 10, 10, np.interp(PALISADE_LOW_SPEED_KP_SPEEDS[-1], INTERP_SPEEDS, KP_INTERP)]
+PALISADE_TARGET_KP_SPEEDS = [2.0, 2.25, 5.0, PALISADE_LOW_SPEED_KP_END]
+PALISADE_TARGET_KP = [65, 4, 4, PALISADE_LOW_SPEED_KP[-1]]
+PALISADE_TARGET_ACCEL = [0.2, 0.25]
+PALISADE_TARGET_PROGRESS = [0.7, 1.0]
 
 LP_FILTER_CUTOFF_HZ = 1.2
 JERK_LOOKAHEAD_SECONDS = 0.19
 JERK_GAIN = 0.3
 LAT_ACCEL_REQUEST_BUFFER_SECONDS = 1.0
 VERSION = 1
-PALISADE_VERSION = 4
+PALISADE_VERSION = 3
 
 class LatControlTorque(LatControl):
   def __init__(self, CP, CI, dt):
@@ -40,13 +47,12 @@ class LatControlTorque(LatControl):
     self.torque_params = CP.lateralTuning.torque.as_builder()
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
     self.lateral_accel_from_torque = CI.lateral_accel_from_torque()
-    self.palisade_curvature_alignment = CP.carFingerprint == HYUNDAI.HYUNDAI_PALISADE
+    self.palisade_low_speed_kp = CP.carFingerprint == HYUNDAI.HYUNDAI_PALISADE
     self.pid = PIDController([INTERP_SPEEDS, KP_INTERP], KI, rate=1/self.dt)
     self.update_limits()
     self.steering_angle_deadzone_deg = self.torque_params.steeringAngleDeadzoneDeg
     self.lat_accel_request_buffer_len = int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / self.dt)
     self.lat_accel_request_buffer = deque([0.] * self.lat_accel_request_buffer_len , maxlen=self.lat_accel_request_buffer_len)
-    self.curvature_request_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
     self.lookahead_frames = int(JERK_LOOKAHEAD_SECONDS / self.dt)
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
 
@@ -62,12 +68,11 @@ class LatControlTorque(LatControl):
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = PALISADE_VERSION if self.palisade_curvature_alignment else VERSION
+    pid_log.version = PALISADE_VERSION if self.palisade_low_speed_kp else VERSION
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     measurement = measured_curvature * CS.vEgo ** 2
     future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
     self.lat_accel_request_buffer.append(future_desired_lateral_accel)
-    self.curvature_request_buffer.append(desired_curvature)
 
     roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
     curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
@@ -75,9 +80,6 @@ class LatControlTorque(LatControl):
 
     delay_frames = int(np.clip(lat_delay / self.dt + 1, 1, self.lat_accel_request_buffer_len))
     expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
-    if self.palisade_curvature_alignment:
-      # Compare delayed desired and measured curvature at the same speed.
-      expected_lateral_accel = self.curvature_request_buffer[-delay_frames] * CS.vEgo ** 2
     setpoint = expected_lateral_accel
     error = setpoint - measurement
 
@@ -99,10 +101,23 @@ class LatControlTorque(LatControl):
 
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
       output_lataccel = self.pid.update(pid_log.error, speed=CS.vEgo, feedforward=ff, freeze_integrator=freeze_integrator)
+      # Keep stock PID state; only replace the Palisade's low-speed effective P term.
+      effective_p = self.pid.p
+      if self.palisade_low_speed_kp and PALISADE_LOW_SPEED_KP_SPEEDS[0] < CS.vEgo < PALISADE_LOW_SPEED_KP_SPEEDS[-1]:
+        demand_weight = np.interp(abs(setpoint), PALISADE_TARGET_ACCEL, [0.0, 1.0])
+        demand_weight = demand_weight * demand_weight * (3.0 - 2.0 * demand_weight)
+        progress = 1.0 - pid_log.error * setpoint / max(setpoint ** 2, PALISADE_TARGET_ACCEL[0] ** 2)
+        soften_weight = np.interp(progress, PALISADE_TARGET_PROGRESS, [0.0, 1.0])
+        soften_weight = soften_weight * soften_weight * (3.0 - 2.0 * soften_weight)
+        soft_kp = np.interp(CS.vEgo, PALISADE_TARGET_KP_SPEEDS, PALISADE_TARGET_KP)
+        turn_kp = self.pid.k_p + (soft_kp - self.pid.k_p) * soften_weight
+        current_kp = np.interp(CS.vEgo, PALISADE_LOW_SPEED_KP_SPEEDS, PALISADE_LOW_SPEED_KP)
+        effective_p = (current_kp + (turn_kp - current_kp) * demand_weight) * pid_log.error
+        output_lataccel = np.clip(effective_p + self.pid.i + self.pid.d + self.pid.f, self.pid.neg_limit, self.pid.pos_limit)
       output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
 
       pid_log.active = True
-      pid_log.p = float(self.pid.p)
+      pid_log.p = float(effective_p)
       pid_log.i = float(self.pid.i)
       pid_log.d = float(self.pid.d)
       pid_log.f = float(self.pid.f)
