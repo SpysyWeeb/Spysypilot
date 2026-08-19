@@ -108,7 +108,7 @@ class TestModelCurveSpeed(unittest.TestCase):
     self.assertFalse(limiter.active)
 
   def test_future_torque_budget_caps_before_field_curve_speed(self):
-    self.assertEqual(TORQUE_BUDGET, 0.93)
+    self.assertEqual(TORQUE_BUDGET, 0.90)
     curve_curvature = 0.002
     for direction in (-1.0, 1.0):
       with self.subTest(direction=direction):
