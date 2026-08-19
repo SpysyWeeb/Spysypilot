@@ -17,7 +17,7 @@ CURVE_SPEED_V = np.array([50.0, 22.0, 13.0]) * CV.MPH_TO_MS
 
 APPROACH_DECEL = 0.5  # m/s^2
 CURVE_TARGET_RELEASE_RATE = 0.2  # m/s^2; lower targets apply immediately, opening curves release gently
-TORQUE_BUDGET = 0.93
+TORQUE_BUDGET = 0.90
 MIN_CURVATURE = 1e-4
 MIN_MODEL_SPEED = 1.0  # m/s; avoids unstable curvature near predicted stops
 MAX_CURVE_SPEED = V_CRUISE_MAX * CV.KPH_TO_MS
