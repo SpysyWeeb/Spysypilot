@@ -879,6 +879,7 @@ struct ControlsState @0x97ff69c53601abf1 {
   curvature @37 :Float32;  # path curvature from vehicle model
   desiredCurvature @61 :Float32;  # lag adjusted curvatures used by lateral controllers
   forceDecel @51 :Bool;
+  rackTrajectoryState @67 :RackTrajectoryState;
 
   lateralControlState :union {
     pidState @53 :LateralPIDState;
@@ -1135,6 +1136,28 @@ struct ControlsState @0x97ff69c53601abf1 {
     modularFinalCountMatchValid @221 :Bool;
     modularFinalLimiterAltered @222 :Bool;
    }
+
+  struct RackTrajectoryState {
+    active @0 :Bool;
+    targetSteeringAngleDeg @1 :Float32;
+    targetSteeringRateDegS @2 :Float32;
+    plannedSteeringAngleDeg @3 :Float32;
+    plannedSteeringRateDegS @4 :Float32;
+    plannedSteeringAccelerationDegS2 @5 :Float32;
+    measuredSteeringRateDegS @6 :Float32;
+    feedbackTorque @7 :Float32;
+    feedbackLimited @8 :Bool;
+    motionLimited @9 :Bool;
+    torqueLimited @10 :Bool;
+    infeasible @11 :Bool;
+    rateLimitDegS @12 :Float32;
+    accelerationLimitDegS2 @13 :Float32;
+    jerkLimitDegS3 @14 :Float32;
+    profileTransition @15 :Bool;
+    status @16 :UInt8; # 0 inactive, 1 active, 2 override, 3 no model, 4 invalid state, 5 stale, 6 invalid action time, 7 invalid path, 8 invalid output, 9 invalid planner state, 10 measured out of bounds, 11 planned out of bounds
+    pathLimited @17 :Bool;
+    targetCurvature @18 :Float32;
+  }
 
   struct LateralAngleState {
     active @0 :Bool;
