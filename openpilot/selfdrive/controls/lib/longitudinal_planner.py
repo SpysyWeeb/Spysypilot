@@ -122,9 +122,8 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, 
     comfort_weight = float(np.interp(v_ego, CRUISE_COMFORT_SPEED_BP, CRUISE_COMFORT_BLEND_V))
     target_accel = float(np.interp(comfort_weight, [0.0, 1.0], [legacy_target_accel, comfort_target_accel]))
 
-  if not e2e:
-    j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
-    target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
+  j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
+  target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
   return target_accel
 
@@ -155,11 +154,10 @@ class LongitudinalPlanner:
     self.curve_speed_limiter = ModelCurveSpeedLimiter(CP)
     self.force_stops = ForceStops(dt)
 
-    self.a_desired = init_a
     self.last_mpc_a_target = init_a
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
-    self.a_cruise = 0.0
-    self.output_a_target = 0.0
+    self.a_cruise = init_a
+    self.output_a_target = init_a
     self.output_should_stop = False
     self.launch_armed = False
     self.launch_open = FirstOrderFilter(0.0, 0.3, self.dt)
@@ -226,8 +224,9 @@ class LongitudinalPlanner:
 
     if reset_state:
       self.v_desired_filter.x = v_ego
-      self.a_desired = np.clip(sm['carState'].aEgo, ACCEL_MIN, BLOTV2_ACCEL_MAX)
-      self.last_mpc_a_target = float(self.a_desired)
+      self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, BLOTV2_ACCEL_MAX)
+      self.a_cruise = self.output_a_target
+      self.last_mpc_a_target = float(self.output_a_target)
       self.blotv2.reset()
       self.lead_departure.reset()
 
@@ -258,7 +257,7 @@ class LongitudinalPlanner:
       personality=personality,
       jerk_factor_scale=policy.jerk_scale,
     )
-    self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
+    self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     self.mpc.update(
       sm['radarState'],
       personality=personality,
@@ -285,7 +284,7 @@ class LongitudinalPlanner:
       cloudlog.info("FCW triggered")
 
     # Save starting point for next iteration
-    a_prev = self.a_desired
+    a_prev = self.output_a_target
 
     action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
     output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
@@ -363,7 +362,6 @@ class LongitudinalPlanner:
     self.output_a_target = limit_accel_for_torque(np.clip(output_a_target, ACCEL_MIN, BLOTV2_ACCEL_MAX),
                                                   self.curve_speed_limiter.torque_veto)
 
-    self.a_desired = float(self.output_a_target)
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 
   def publish(self, sm, pm):
