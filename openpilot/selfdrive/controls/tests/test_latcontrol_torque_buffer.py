@@ -69,7 +69,7 @@ class TestLatControlTorqueBuffer(OpenpilotTestCase):
       results = []
       for curvature in (0.02, -0.02):
         controller, output, lac_log = run_speed_change(HYUNDAI.HYUNDAI_PALISADE, old_speed, new_speed, curvature)
-        self.assertEqual(lac_log.version, 4)
+        self.assertEqual(lac_log.version, 5)
         self.assertAlmostEqual(lac_log.desiredLateralAccel, curvature * new_speed ** 2, delta=1e-6)
         self.assertAlmostEqual(lac_log.actualLateralAccel, curvature * new_speed ** 2, delta=1e-6)
         self.assertAlmostEqual(lac_log.error, 0.0, delta=1e-6)
@@ -79,10 +79,40 @@ class TestLatControlTorqueBuffer(OpenpilotTestCase):
       self.assertAlmostEqual(results[0][0], -results[1][0], delta=1e-6)
       self.assertAlmostEqual(results[0][1], -results[1][1], delta=1e-6)
 
+  def test_palisade_motion_uses_lower_kinetic_friction(self):
+    def run(rate, speed=6.0):
+      controller, VM = get_controller(HYUNDAI.HYUNDAI_PALISADE)
+      CS = car.CarState.new_message()
+      CS.vEgo = speed
+      CS.steeringRateDeg = rate
+      params = log.VehicleParameters.new_message()
+      desired, actual = 0.4, 0.19
+      set_curvature(CS, VM, actual / speed ** 2)
+      lac_log = None
+      for _ in range(int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / DT_CTRL)):
+        _, _, lac_log = controller.update(True, CS, VM, params, False, desired / speed ** 2, False, 0.2)
+      assert lac_log is not None
+      return controller, CS, VM, params, lac_log
+
+    stuck = run(0.0)
+    moving = run(20.0)
+    high_speed = run(20.0, 12.0)
+    self.assertEqual(stuck[-1].version, 5)
+    self.assertAlmostEqual(stuck[-1].frictionScale, 1.0)
+    self.assertAlmostEqual(moving[-1].frictionScale, 0.77, places=2)
+    self.assertLess(moving[-1].f, stuck[-1].f)
+    self.assertAlmostEqual(high_speed[-1].frictionScale, 1.0)
+
+    controller, CS, VM, params, _ = moving
+    CS.steeringPressed = True
+    _, _, override_log = controller.update(True, CS, VM, params, False, 0.4 / CS.vEgo ** 2, False, 0.2)
+    self.assertAlmostEqual(override_log.frictionScale, 1.0)
+
   def test_other_cars_keep_legacy_delayed_lateral_acceleration(self):
     curvature = 0.02
     _, _, lac_log = run_speed_change(TOYOTA.TOYOTA_COROLLA_TSS2, 3.0, 4.0, curvature)
     self.assertEqual(lac_log.version, 1)
+    self.assertAlmostEqual(lac_log.frictionScale, 1.0)
     self.assertAlmostEqual(lac_log.desiredLateralAccel, curvature * 3.0 ** 2, delta=1e-6)
     self.assertAlmostEqual(lac_log.error, curvature * (3.0 ** 2 - 4.0 ** 2), delta=1e-6)
 
