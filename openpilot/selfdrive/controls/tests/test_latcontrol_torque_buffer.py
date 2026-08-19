@@ -10,19 +10,41 @@ from opendbc.car.hyundai.values import CAR as HYUNDAI
 from opendbc.car.toyota.values import CAR as TOYOTA
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.realtime import DT_CTRL
-from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, LAT_ACCEL_REQUEST_BUFFER_SECONDS, PALISADE_LOW_SPEED_KP_END
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, LAT_ACCEL_REQUEST_BUFFER_SECONDS
+
 
 def get_controller(car_name):
   CarInterface = interfaces[car_name]
   CP = CarInterface.get_non_essential_params(car_name)
   CI = CarInterface(CP)
   VM = VehicleModel(CP)
-  controller = LatControlTorque(CP.as_reader(), CI, DT_CTRL)
-  return controller, VM
+  return LatControlTorque(CP.as_reader(), CI, DT_CTRL), VM
+
+
+def set_curvature(CS, VM, curvature):
+  CS.steeringAngleDeg = math.degrees(VM.get_steer_from_curvature(-curvature, CS.vEgo, 0.0))
+
+
+def run_speed_change(car_name, old_speed, new_speed, curvature):
+  controller, VM = get_controller(car_name)
+  CS = car.CarState.new_message()
+  CS.vEgo = old_speed
+  CS.steeringPressed = False
+  params = log.VehicleParameters.new_message()
+  set_curvature(CS, VM, curvature)
+
+  for _ in range(int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / DT_CTRL)):
+    controller.update(True, CS, VM, params, False, curvature, False, 0.2)
+
+  CS.vEgo = new_speed
+  set_curvature(CS, VM, curvature)
+  output, _, lac_log = controller.update(True, CS, VM, params, False, curvature, False, 0.2)
+  return controller, output, lac_log
+
 
 class TestLatControlTorqueBuffer(OpenpilotTestCase):
 
-  @parameterized.expand([(TOYOTA.TOYOTA_COROLLA_TSS2,)])
+  @parameterized.expand([(TOYOTA.TOYOTA_COROLLA_TSS2,), (HYUNDAI.HYUNDAI_PALISADE,)])
   def test_request_buffer_consistency(self, car_name):
     buffer_steps = int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / DT_CTRL)
     controller, VM = get_controller(car_name)
@@ -35,78 +57,50 @@ class TestLatControlTorqueBuffer(OpenpilotTestCase):
     for _ in range(buffer_steps):
       controller.update(True, CS, VM, params, False, 0.001, False, 0.2)
     assert all(val != 0 for val in controller.lat_accel_request_buffer)
+    assert all(val != 0 for val in controller.curvature_request_buffer)
 
     for _ in range(buffer_steps):
       controller.update(False, CS, VM, params, False, 0.0, False, 0.2)
     assert all(val == 0 for val in controller.lat_accel_request_buffer)
+    assert all(val == 0 for val in controller.curvature_request_buffer)
 
-  def test_palisade_low_speed_p_preserves_stock_state_and_high_speed_output(self):
-    def settle(controller, VM, speed, curvature=0.02):
-      CS = car.CarState.new_message()
-      CS.vEgo = speed
-      CS.steeringPressed = False
-      params = log.VehicleParameters.new_message()
-      for _ in range(int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / DT_CTRL)):
-        output, _, lac_log = controller.update(True, CS, VM, params, False, curvature, False, 0.2)
-      return CS, params, output, lac_log
+  def test_palisade_aligns_delayed_curvature_at_current_speed(self):
+    for old_speed, new_speed in ((3.0, 3.0), (3.0, 4.0), (4.0, 3.0)):
+      results = []
+      for curvature in (0.02, -0.02):
+        controller, output, lac_log = run_speed_change(HYUNDAI.HYUNDAI_PALISADE, old_speed, new_speed, curvature)
+        self.assertEqual(lac_log.version, 4)
+        self.assertAlmostEqual(lac_log.desiredLateralAccel, curvature * new_speed ** 2, delta=1e-6)
+        self.assertAlmostEqual(lac_log.actualLateralAccel, curvature * new_speed ** 2, delta=1e-6)
+        self.assertAlmostEqual(lac_log.error, 0.0, delta=1e-6)
+        self.assertAlmostEqual(lac_log.p, controller.pid.p, delta=1e-6)
+        results.append((output, lac_log.p))
 
-    candidate, candidate_vm = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    reference, reference_vm = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    reference.palisade_low_speed_kp = False
-    CS, params, candidate_output, candidate_log = settle(candidate, candidate_vm, 3.0)
-    _, _, reference_output, _ = settle(reference, reference_vm, 3.0)
+      self.assertAlmostEqual(results[0][0], -results[1][0], delta=1e-6)
+      self.assertAlmostEqual(results[0][1], -results[1][1], delta=1e-6)
 
-    self.assertEqual(candidate_log.version, 3)
-    self.assertAlmostEqual(candidate_log.p, 10 * candidate_log.error)
-    self.assertAlmostEqual(candidate.pid.p, reference.pid.p)
-    self.assertLess(abs(candidate_output), abs(reference_output))
-    self.assertAlmostEqual(candidate.pid.i, reference.pid.i)
-    self.assertAlmostEqual(candidate.pid.control, reference.pid.control)
-    self.assertSequenceEqual(list(candidate.lat_accel_request_buffer), list(reference.lat_accel_request_buffer))
-    self.assertAlmostEqual(candidate.jerk_filter.x, reference.jerk_filter.x)
+  def test_other_cars_keep_legacy_delayed_lateral_acceleration(self):
+    curvature = 0.02
+    _, _, lac_log = run_speed_change(TOYOTA.TOYOTA_COROLLA_TSS2, 3.0, 4.0, curvature)
+    self.assertEqual(lac_log.version, 1)
+    self.assertAlmostEqual(lac_log.desiredLateralAccel, curvature * 3.0 ** 2, delta=1e-6)
+    self.assertAlmostEqual(lac_log.error, curvature * (3.0 ** 2 - 4.0 ** 2), delta=1e-6)
 
-    mirrored, mirrored_vm = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    _, _, mirrored_output, mirrored_log = settle(mirrored, mirrored_vm, 3.0, -0.02)
-    self.assertAlmostEqual(mirrored_output, -candidate_output)
-    self.assertAlmostEqual(mirrored_log.p, -candidate_log.p)
+  def test_palisade_uses_stock_proportional_gain(self):
+    controller, VM = get_controller(HYUNDAI.HYUNDAI_PALISADE)
+    CS = car.CarState.new_message()
+    CS.vEgo = 3.0
+    CS.steeringPressed = False
+    params = log.VehicleParameters.new_message()
+    desired = 0.4
+    actual = 0.38
+    set_curvature(CS, VM, actual / CS.vEgo ** 2)
 
-    at_knot, at_knot_vm = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    at_knot_reference, at_knot_reference_vm = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-    at_knot_reference.palisade_low_speed_kp = False
-    _, _, _, at_knot_log = settle(at_knot, at_knot_vm, 5.0)
-    _, _, _, _ = settle(at_knot_reference, at_knot_reference_vm, 5.0)
-    self.assertAlmostEqual(at_knot_log.p, 11.5 * at_knot_log.error)
-    self.assertAlmostEqual(at_knot.pid.i, at_knot_reference.pid.i)
-    self.assertAlmostEqual(at_knot.pid.control, at_knot_reference.pid.control)
+    lac_log = None
+    for _ in range(int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / DT_CTRL)):
+      _, _, lac_log = controller.update(True, CS, VM, params, False, desired / CS.vEgo ** 2, False, 0.2)
 
-    other, other_vm = get_controller(TOYOTA.TOYOTA_COROLLA_TSS2)
-    _, _, _, other_log = settle(other, other_vm, 3.0)
-    self.assertEqual(other_log.version, 1)
-    self.assertAlmostEqual(other_log.p, other.pid.p, delta=1e-6)
-
-    CS.vEgo = PALISADE_LOW_SPEED_KP_END
-    candidate_output, _, candidate_log = candidate.update(True, CS, candidate_vm, params, False, 0.02, False, 0.2)
-    reference_output, _, reference_log = reference.update(True, CS, reference_vm, params, False, 0.02, False, 0.2)
-    self.assertEqual(candidate_output, reference_output)
-    self.assertEqual(candidate_log.p, reference_log.p)
-    self.assertAlmostEqual(candidate.pid.i, reference.pid.i)
-    self.assertAlmostEqual(candidate.pid.control, reference.pid.control)
-
-  def test_palisade_target_progress_preserves_entry_and_softens_overshoot(self):
-    def update(desired, actual):
-      controller, VM = get_controller(HYUNDAI.HYUNDAI_PALISADE)
-      CS = car.CarState.new_message()
-      CS.vEgo = 3.0
-      CS.steeringAngleDeg = math.degrees(VM.get_steer_from_curvature(-actual / CS.vEgo ** 2, CS.vEgo, 0.0))
-      params = log.VehicleParameters.new_message()
-      lac_log = None
-      for _ in range(int(LAT_ACCEL_REQUEST_BUFFER_SECONDS / DT_CTRL)):
-        _, _, lac_log = controller.update(True, CS, VM, params, False, desired / CS.vEgo ** 2, False, 0.2)
-      assert lac_log is not None
-      return lac_log
-
-    self.assertAlmostEqual(update(0.4, 0.2).p, 6.0, delta=1e-5)
-    self.assertAlmostEqual(update(0.4, 0.38).p, 0.1185185, delta=1e-5)
-    self.assertAlmostEqual(update(0.4, 0.6).p, -0.8, delta=1e-5)
-    self.assertAlmostEqual(update(0.1, 0.0).p, 1.0, delta=1e-5)
-    self.assertAlmostEqual(update(-0.4, -0.2).p, -6.0, delta=1e-5)
+    assert lac_log is not None
+    self.assertAlmostEqual(lac_log.error, desired - actual, delta=1e-6)
+    self.assertAlmostEqual(lac_log.p, 30.0 * (desired - actual), delta=1e-5)
+    self.assertAlmostEqual(lac_log.p, controller.pid.p, delta=1e-6)
