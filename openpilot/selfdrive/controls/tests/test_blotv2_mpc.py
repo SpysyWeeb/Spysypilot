@@ -559,6 +559,24 @@ class TestOrdinaryCruiseComfort(unittest.TestCase):
 
     self.assertAlmostEqual(first_target, jerk * self.DT)
 
+  def test_experimental_cruise_deceleration_uses_existing_jerk_schedule(self):
+    v_ego = 75.0 * CV.MPH_TO_MS
+    previous_target = 0.4
+    jerk = np.interp(v_ego, longitudinal_planner.J_CRUISE_BP, longitudinal_planner.J_CRUISE_VALS)
+    first_target = get_cruise_accel(
+      True,
+      v_ego - 5.0 * CV.MPH_TO_MS,
+      v_ego,
+      previous_target,
+      0.0,
+      self.CP,
+      self.DT,
+      -0.3,
+      True,
+    )
+
+    self.assertAlmostEqual(first_target, previous_target - jerk * self.DT)
+
   def test_present_lead_does_not_disable_cruise_comfort(self):
     class SubMaster(dict):
       def __init__(self):
