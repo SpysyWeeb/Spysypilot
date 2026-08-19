@@ -1134,6 +1134,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     modularFinalCountResidual @220 :Int32;
     modularFinalCountMatchValid @221 :Bool;
     modularFinalLimiterAltered @222 :Bool;
+    frictionScale @223 :Float32;
    }
 
   struct LateralAngleState {
