@@ -9,10 +9,14 @@ from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MA
 from openpilot.selfdrive.controls.lib.force_stops import MPC_PROFILE_OFFSET_M
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, LongitudinalMpc, LongitudinalPlanSource
-from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, get_cruise_accel
 
 
 DT = 0.05
+
+
+def test_force_stop_cruise_candidate_limits_decel_jerk_in_experimental_mode():
+  assert math.isclose(get_cruise_accel(True, 0.0, 10.0, 0.0, 0.0, None, DT, 0.0, True), -0.06)
 
 
 class FakeSubMaster(dict):
