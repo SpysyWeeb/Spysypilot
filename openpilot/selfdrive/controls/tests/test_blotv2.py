@@ -108,6 +108,14 @@ class TestRecoveryAndLaunch(unittest.TestCase):
     policy = run(BLoTv2Supervisor(), lead(), 15.0, -0.5, 2.0)
     self.assertEqual(policy.jerk_scale, 1.0)
 
+  def test_responsive_policy_survives_low_speed_lead_transition(self):
+    supervisor = BLoTv2Supervisor()
+    run(supervisor, lead(), 15.0, -2.0, 1.0)
+
+    policy = run(supervisor, lead(v=0.5, d=8.0), 0.5, 0.0, 1.0)
+
+    self.assertEqual(policy.jerk_scale, JERK_SCALE_MIN)
+
   def test_model_forecast_arms_response(self):
     supervisor = BLoTv2Supervisor()
     predicted_accel = model_predicted_acceleration(
@@ -178,6 +186,40 @@ class TestSafetyAndContinuity(unittest.TestCase):
     emergency_lead = lead(v=2.0, d=15.0, a=-2.0)
     policy = run(supervisor, emergency_lead, 10.0, -1.0, 1.0)
     self.assertTrue(policy.emergency)
+    self.assertEqual(policy.jerk_scale, 1.0)
+
+  def test_low_speed_transition_does_not_freeze_emergency_release(self):
+    supervisor = BLoTv2Supervisor()
+    run(supervisor, lead(), 15.0, -2.0, 1.0)
+    emergency_lead = lead(v=0.0, d=5.0, a=-2.0)
+    policy = supervisor.update(emergency_lead, 2.0, 0.0, T_FOLLOW_BASE)
+    self.assertTrue(policy.emergency)
+
+    policy = run(supervisor, emergency_lead, 0.5, 0.0, 1.0)
+
+    self.assertEqual(policy.jerk_scale, 1.0)
+
+  def test_low_speed_hold_releases_after_lead_loss(self):
+    supervisor = BLoTv2Supervisor()
+    run(supervisor, lead(), 15.0, -2.0, 1.0)
+    self.assertEqual(run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale, JERK_SCALE_MIN)
+
+    released = supervisor.update(LeadObservation(), 0.5, 0.0, T_FOLLOW_BASE)
+    self.assertGreater(released.jerk_scale, JERK_SCALE_MIN)
+    self.assertEqual(run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale, 1.0)
+
+    run(supervisor, lead(), 15.0, -2.0, 1.0)
+    self.assertEqual(run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale, JERK_SCALE_MIN)
+    supervisor.reset()
+    after_reset = supervisor.update(lead(), 0.5, 0.0, T_FOLLOW_BASE)
+    self.assertEqual(after_reset.jerk_scale, 1.0)
+
+  def test_low_speed_hold_requires_exact_minimum_state(self):
+    supervisor = BLoTv2Supervisor()
+    supervisor.jerk_scale = JERK_SCALE_MIN + 1e-10
+
+    policy = run(supervisor, lead(), 0.5, 0.0, 1.0)
+
     self.assertEqual(policy.jerk_scale, 1.0)
 
   def test_jerk_scale_never_steps(self):
