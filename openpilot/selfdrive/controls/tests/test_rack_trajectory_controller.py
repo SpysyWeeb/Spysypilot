@@ -402,7 +402,7 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
     scalar_action_plan_s=.5 if hasattr(model.action, "desiredCurvatureTime") else .2 + 1.5 * DT_MDL,
     plan_time_now_s=.05,
     measured_v_ego=3.0,
-    query_time_s=.45,
+    query_time_s=.55,
     vehicle_model=vehicle_model,
     roll_rad=0.0,
     angle_offset_deg=0.0,
