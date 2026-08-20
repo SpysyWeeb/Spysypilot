@@ -17,6 +17,8 @@ PREVIEW_S = .4
 RESPONSE_TIME_S = .4
 RATE_HORIZON_S = .1
 MAX_FEEDBACK_TORQUE = .35
+MAX_TURN_IN_FEEDBACK_TORQUE = .7
+MAX_DRIVER_ASSIST_TORQUE = .35
 MODEL_ACTION_OFFSET_S = 1.5 * DT_MDL  # modeld frame delay + midpoint action delay
 
 STATUS_INACTIVE = 0
@@ -231,6 +233,8 @@ class PalisadeRackTrajectoryController:
     self.model = None
     self.state_mono_ns = 0
     self.planner: JerkLimitedRackPlanner | None = None
+    self.transition_rate_limit: float | None = None
+    self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
     self.previous_angle_deg: float | None = None
     self.rack_direction = 0
@@ -244,6 +248,8 @@ class PalisadeRackTrajectoryController:
 
   def reset(self) -> None:
     self.planner = None
+    self.transition_rate_limit = None
+    self.transition_acceleration_limit = None
     self.previous_planned_lateral_accel = None
     self.previous_angle_deg = None
     self.rack_direction = 0
@@ -283,6 +289,33 @@ class PalisadeRackTrajectoryController:
       float(np.interp(speed_mph, _SPEED_PROFILE_MPH, _JERK_PROFILE_DEG_S3)),
     )
 
+  def _motion_limits(self, profile: MotionLimits) -> tuple[MotionLimits, bool]:
+    assert self.planner is not None
+    rate_headroom = _required_rate_headroom(
+      self.planner.rate_deg_s, self.planner.acceleration_deg_s2, profile.max_jerk_deg_s3, self.dt,
+    )
+    required_rate_limit = max(profile.max_rate_deg_s, abs(self.planner.rate_deg_s) + rate_headroom)
+    required_acceleration_limit = max(profile.max_acceleration_deg_s2, abs(self.planner.acceleration_deg_s2))
+    transition = (
+      required_rate_limit > profile.max_rate_deg_s + 1e-6
+      or required_acceleration_limit > profile.max_acceleration_deg_s2 + 1e-6
+    )
+    if not transition:
+      self.transition_rate_limit = None
+      self.transition_acceleration_limit = None
+      return profile, False
+    if self.transition_rate_limit is None or self.transition_acceleration_limit is None:
+      self.transition_rate_limit = required_rate_limit
+      self.transition_acceleration_limit = required_acceleration_limit
+    else:
+      self.transition_rate_limit = max(profile.max_rate_deg_s, min(self.transition_rate_limit, required_rate_limit))
+      self.transition_acceleration_limit = max(
+        profile.max_acceleration_deg_s2, min(self.transition_acceleration_limit, required_acceleration_limit),
+      )
+    return MotionLimits(
+      self.transition_rate_limit, self.transition_acceleration_limit, profile.max_jerk_deg_s3,
+    ), True
+
   @staticmethod
   def _feedback_gain(speed_mps: float) -> float:
     return float(
@@ -295,10 +328,6 @@ class PalisadeRackTrajectoryController:
              lat_delay: float, desired_curvature: float) -> RackTrajectoryOutput | None:
     if not active:
       self.reset()
-      return None
-    if CS.steeringPressed:
-      self.reset()
-      self.status = STATUS_DRIVER_OVERRIDE
       return None
     if self.model is None:
       self.reset()
@@ -367,37 +396,23 @@ class PalisadeRackTrajectoryController:
     if path_limited:
       bounded_angle = math.degrees(VM.get_steer_from_curvature(-bounded_curvature, bound_speed, params.roll)) + params.angleOffsetDeg
       target = PathTarget(bounded_curvature, target.speed_mps, bounded_angle, 0.0)
-    if self.planner is None:
-      self.planner = JerkLimitedRackPlanner(float(CS.steeringAngleDeg))
+    measured_rate, measured_rate_valid = self._measured_rate(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
     profile = self._limits(float(CS.vEgo))
+    if self.planner is None or CS.steeringPressed:
+      seed_rate = _clip(measured_rate, profile.max_rate_deg_s) if measured_rate_valid else 0.0
+      self.planner = JerkLimitedRackPlanner(float(CS.steeringAngleDeg), seed_rate)
     if 0.0 < abs(self.planner.rate_deg_s) - profile.max_rate_deg_s <= 1e-6:
       self.planner.rate_deg_s = math.copysign(profile.max_rate_deg_s, self.planner.rate_deg_s)
     if 0.0 < abs(self.planner.acceleration_deg_s2) - profile.max_acceleration_deg_s2 <= 1e-6:
       self.planner.acceleration_deg_s2 = math.copysign(profile.max_acceleration_deg_s2, self.planner.acceleration_deg_s2)
-    rate_headroom = _required_rate_headroom(
-      self.planner.rate_deg_s, self.planner.acceleration_deg_s2, profile.max_jerk_deg_s3, self.dt,
-    )
-    limits = MotionLimits(
-      max(profile.max_rate_deg_s, abs(self.planner.rate_deg_s) + rate_headroom),
-      max(profile.max_acceleration_deg_s2, abs(self.planner.acceleration_deg_s2)),
-      profile.max_jerk_deg_s3,
-    )
-    profile_transition = (
-      limits.max_rate_deg_s > profile.max_rate_deg_s + 1e-6
-      or limits.max_acceleration_deg_s2 > profile.max_acceleration_deg_s2 + 1e-6
-    )
+    limits, profile_transition = self._motion_limits(profile)
     rack_target = RackTarget(target.angle_deg, target.rate_deg_s)
-    if profile_transition:
-      brake_rate = math.copysign(min(abs(self.planner.rate_deg_s), profile.max_rate_deg_s), self.planner.rate_deg_s)
-      rack_target = RackTarget(self.planner.position_deg, brake_rate)
     try:
       plan = self.planner.update(rack_target, limits, self.dt)
     except ValueError:
       self.reset()
       self.status = STATUS_INVALID_PLANNER_STATE
       return None
-    measured_rate, measured_rate_valid = self._measured_rate(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
-
     planned_curvature = -VM.calc_curvature(math.radians(plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
     if not minimum_curvature - 1e-9 <= planned_curvature <= maximum_curvature + 1e-9:
       self.reset()
@@ -419,8 +434,14 @@ class PalisadeRackTrajectoryController:
       FRICTION_THRESHOLD,
       torque_params,
     )
+    target_lateral_accel = target.curvature * CS.vEgo ** 2
+    trajectory_feedforward_lateral_accel = planned_lateral_accel
+    if target_lateral_accel * planned_lateral_accel < 0.0:
+      trajectory_feedforward_lateral_accel = 0.0
+    elif abs(target_lateral_accel) < abs(planned_lateral_accel):
+      trajectory_feedforward_lateral_accel = target_lateral_accel
     feedforward_lateral_accel = (
-      planned_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
+      trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
     feedforward_torque = -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
 
@@ -434,11 +455,28 @@ class PalisadeRackTrajectoryController:
       gain * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate), torque_params,
     )) if measured_rate_valid else 0.0
     raw_feedback = position_feedback + rate_feedback
-    feedback = float(np.clip(raw_feedback, -MAX_FEEDBACK_TORQUE, MAX_FEEDBACK_TORQUE))
+    target_angle = target.angle_deg - params.angleOffsetDeg
+    measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
+    target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
+    turning_in = (
+      target_angle * measured_angle >= 0.0
+      and abs(target_angle) > abs(measured_angle)
+      and target_motion * target_angle > 0.0
+    )
+    if turning_in:
+      feedback_lower = -MAX_TURN_IN_FEEDBACK_TORQUE if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
+      feedback_upper = MAX_TURN_IN_FEEDBACK_TORQUE if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
+    else:
+      feedback_lower, feedback_upper = -MAX_FEEDBACK_TORQUE, MAX_FEEDBACK_TORQUE
+    feedback = float(np.clip(raw_feedback, feedback_lower, feedback_upper))
     feedback_limited = feedback != raw_feedback
     raw_torque = feedforward_torque + feedback
     torque = float(np.clip(raw_torque, -1.0, 1.0))
     torque_limited = torque != raw_torque
+    planned_angle = plan.position_deg - params.angleOffsetDeg
+    if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
+      torque_limited |= torque != 0.0
+      torque = 0.0
     motion_limited = plan.rate_limited or plan.acceleration_limited or plan.jerk_limited
     if not all(math.isfinite(value) for value in (
       torque, plan.position_deg, plan.rate_deg_s, plan.acceleration_deg_s2, measured_rate,
@@ -447,6 +485,15 @@ class PalisadeRackTrajectoryController:
       self.reset()
       self.status = STATUS_INVALID_OUTPUT
       return None
+    driver_torque = float(CS.steeringTorque)
+    if CS.steeringPressed:
+      if torque * driver_torque < 0.0 or target_motion * driver_torque <= 0.0:
+        self.reset()
+        self.status = STATUS_DRIVER_OVERRIDE
+        return None
+      assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
+      torque_limited |= assisted_torque != torque
+      torque = assisted_torque
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
       torque=torque,
