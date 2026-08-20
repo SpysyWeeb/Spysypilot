@@ -16,6 +16,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   model_path_target,
   PalisadeRackTrajectoryController,
   STATUS_INVALID_PATH,
+  STATUS_INVALID_VEHICLE_STATE,
   STATUS_MEASURED_OUT_OF_BOUNDS,
 )
 
@@ -120,13 +121,18 @@ def test_profile_transition_headroom_does_not_walk_outward() -> None:
   assert transition
   rate_ceiling = limits.max_rate_deg_s
   acceleration_ceiling = limits.max_acceleration_deg_s2
-  for _ in range(200):
-    plan = controller.planner.update(RackTarget(10_000.0, 10_000.0), limits, .01)
+  for index in range(600):
+    recovery_acceleration = controller._recovery_acceleration(profile, transition)
+    plan = controller.planner.update(RackTarget(10_000.0, 10_000.0), limits, .01, recovery_acceleration)
     limits, transition = controller._motion_limits(profile)
     assert limits.max_rate_deg_s <= rate_ceiling + 1e-9
     assert limits.max_acceleration_deg_s2 <= acceleration_ceiling + 1e-9
     assert abs(plan.rate_deg_s) <= rate_ceiling + 1e-9
     assert abs(plan.acceleration_deg_s2) <= acceleration_ceiling + 1e-9
+    if index == 199:
+      assert abs(plan.rate_deg_s) < 300.0
+  assert not transition
+  assert abs(plan.rate_deg_s) <= profile.max_rate_deg_s + 1e-6
 
 
 def test_live_candidate_is_process_selected_and_fails_closed() -> None:
@@ -279,7 +285,16 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   assert assist.rack_trajectory is not None
   assert assist.rack_trajectory.status == 2
 
+  invalid_driver = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  invalid_driver.set_rack_trajectory_model(model, 1_050_000_000)
+  state.steeringTorque = math.nan
+  torque, _, _ = invalid_driver.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  assert torque == 0.0
+  assert invalid_driver.rack_trajectory is not None
+  assert invalid_driver.rack_trajectory.status == STATUS_INVALID_VEHICLE_STATE
+
   state.steeringPressed = False
+  state.steeringTorque = 0.0
   invalid_model = messaging.new_message("modelV2").modelV2
   invalid_model.timestampEof = 1_000_000_000
   invalid_model.action.desiredCurvature = -.02
