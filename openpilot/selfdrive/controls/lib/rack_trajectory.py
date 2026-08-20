@@ -13,7 +13,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LATERAL_ACCEL_NO_ROLL, MIN_SPEED
 
 DT = .01
-PREVIEW_S = .4
+PREVIEW_S = .5
 RESPONSE_TIME_S = .4
 RATE_HORIZON_S = .1
 MAX_FEEDBACK_TORQUE = .35
