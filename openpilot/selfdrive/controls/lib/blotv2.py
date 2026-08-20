@@ -289,6 +289,10 @@ class BLoTv2Supervisor:
       for trigger in self._triggers:
         trigger.reset()
 
+    if (lead.present and v_ego <= MIN_SPEED and scale_target > self.jerk_scale
+        and self.jerk_scale == JERK_SCALE_MIN):
+      scale_target = self.jerk_scale
+
     self.jerk_scale = self._slew(
       self.jerk_scale,
       scale_target,
