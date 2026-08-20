@@ -112,6 +112,59 @@ def test_signed_rack_rate_handles_signed_and_unsigned_samples() -> None:
   assert controller._measured_rate(1.0, 5.0) == (-5.0, True)
 
 
+def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  interface = car_interface(car_params)
+  controller = PalisadeRackTrajectoryController()
+  vehicle_model = VehicleModel(car_params)
+  state = car.CarState.new_message()
+  state.vEgo = 5.0
+  params = log.VehicleParameters.new_message()
+  model = messaging.new_message("modelV2").modelV2
+  model.timestampEof = 1_000_000_000
+  model.action.desiredCurvature = -.02
+  if hasattr(model.action, "desiredCurvatureTime"):
+    model.action.desiredCurvatureTime = .5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
+  model.orientationRate.z = [0.0] * 5
+  model.velocity.x = [5.0] * 5
+
+  def update():
+    controller.set_model(model, 1_050_000_000)
+    return controller.update(
+      True, state, vehicle_model, params, car_params.lateralTuning.torque,
+      interface.torque_from_lateral_accel(), .2, -.02,
+    )
+
+  output = update()
+  assert output is not None
+  target_angle = output.target_angle_deg
+  feedforward = []
+  for index in range(100):
+    state.steeringAngleDeg = target_angle + (-.2 if index % 2 else .2)
+    output = update()
+    assert output is not None
+    feedforward.append(abs(output.feedforward_torque))
+  boundary_steps = [abs(feedforward[index + 1] - feedforward[index]) for index in range(0, len(feedforward), 2)]
+  assert max(boundary_steps) < .05
+
+  controller.reset()
+  state.steeringAngleDeg = target_angle + 20.0
+  output = update()
+  assert output is not None
+  assert abs(output.feedforward_torque) > .05
+
+  state.steeringPressed = True
+  state.steeringTorque = 300.0
+  assert update() is None
+  state.steeringPressed = False
+  state.steeringTorque = 0.0
+  output = update()
+  assert output is not None
+  assert abs(output.feedforward_torque) < .05
+
+
 def test_profile_transition_headroom_does_not_walk_outward() -> None:
   controller = PalisadeRackTrajectoryController()
   controller.planner = JerkLimitedRackPlanner(0.0, 300.0)

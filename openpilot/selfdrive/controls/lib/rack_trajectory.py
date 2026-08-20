@@ -240,6 +240,7 @@ class PalisadeRackTrajectoryController:
     self.previous_angle_deg: float | None = None
     self.rack_direction = 0
     self.raw_signed_episode = False
+    self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
 
@@ -255,6 +256,7 @@ class PalisadeRackTrajectoryController:
     self.previous_angle_deg = None
     self.rack_direction = 0
     self.raw_signed_episode = False
+    self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
 
@@ -439,6 +441,8 @@ class PalisadeRackTrajectoryController:
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
     target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
     unwinding = target_motion * target_angle < 0.0
+    if self.driver_override_resume and not unwinding:
+      self.driver_override_resume = False
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
       (planned_lateral_accel - self.previous_planned_lateral_accel) / self.dt
@@ -462,7 +466,7 @@ class PalisadeRackTrajectoryController:
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
-    feedforward_torque = 0.0 if unwinding else -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
+    feedforward_torque = 0.0 if self.driver_override_resume else -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
 
     curvature_per_degree = -VM.calc_curvature(math.radians(1.0), CS.vEgo, 0.0)
     lateral_accel_per_degree = curvature_per_degree * CS.vEgo ** 2
@@ -505,6 +509,7 @@ class PalisadeRackTrajectoryController:
     if CS.steeringPressed:
       if torque * driver_torque < 0.0 or target_motion * driver_torque <= 0.0:
         self.reset()
+        self.driver_override_resume = True
         self.status = STATUS_DRIVER_OVERRIDE
         return None
       assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
