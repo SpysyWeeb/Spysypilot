@@ -199,9 +199,10 @@ class JerkLimitedRackPlanner:
     self.rate_deg_s = float(rate_deg_s)
     self.acceleration_deg_s2 = 0.0
 
-  def update(self, target: RackTarget, limits: MotionLimits, dt: float) -> RackPlan:
+  def update(self, target: RackTarget, limits: MotionLimits, dt: float,
+             desired_acceleration_override: float | None = None) -> RackPlan:
     natural_frequency = 2.0 / limits.response_time_s
-    desired_acceleration_raw = (
+    desired_acceleration_raw = float(desired_acceleration_override) if desired_acceleration_override is not None else (
       natural_frequency * natural_frequency * (target.position_deg - self.position_deg)
       + 2.0 * natural_frequency * (target.rate_deg_s - self.rate_deg_s)
     )
@@ -316,6 +317,18 @@ class PalisadeRackTrajectoryController:
       self.transition_rate_limit, self.transition_acceleration_limit, profile.max_jerk_deg_s3,
     ), True
 
+  def _recovery_acceleration(self, profile: MotionLimits, transition: bool) -> float | None:
+    if not transition:
+      return None
+    assert self.planner is not None
+    rate = self.planner.rate_deg_s
+    acceleration = self.planner.acceleration_deg_s2
+    if abs(rate) > profile.max_rate_deg_s + 1e-6 or rate * acceleration > 0.0:
+      return -math.copysign(profile.max_acceleration_deg_s2, rate) if rate != 0.0 else 0.0
+    if abs(acceleration) > profile.max_acceleration_deg_s2:
+      return _clip(acceleration, profile.max_acceleration_deg_s2)
+    return None
+
   @staticmethod
   def _feedback_gain(speed_mps: float) -> float:
     return float(
@@ -334,7 +347,8 @@ class PalisadeRackTrajectoryController:
       self.status = STATUS_NO_MODEL
       return None
     if not all(math.isfinite(float(value)) for value in (
-      CS.vEgo, CS.steeringAngleDeg, CS.steeringRateDeg, params.roll, params.angleOffsetDeg, lat_delay, desired_curvature,
+      CS.vEgo, CS.steeringAngleDeg, CS.steeringRateDeg, CS.steeringTorque,
+      params.roll, params.angleOffsetDeg, lat_delay, desired_curvature,
     )):
       self.reset()
       self.status = STATUS_INVALID_VEHICLE_STATE
@@ -407,8 +421,9 @@ class PalisadeRackTrajectoryController:
       self.planner.acceleration_deg_s2 = math.copysign(profile.max_acceleration_deg_s2, self.planner.acceleration_deg_s2)
     limits, profile_transition = self._motion_limits(profile)
     rack_target = RackTarget(target.angle_deg, target.rate_deg_s)
+    recovery_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
-      plan = self.planner.update(rack_target, limits, self.dt)
+      plan = self.planner.update(rack_target, limits, self.dt, recovery_acceleration)
     except ValueError:
       self.reset()
       self.status = STATUS_INVALID_PLANNER_STATE
@@ -420,6 +435,10 @@ class PalisadeRackTrajectoryController:
       return None
     planned_lateral_accel = planned_curvature * CS.vEgo ** 2
     measured_lateral_accel = measured_curvature * CS.vEgo ** 2
+    target_angle = target.angle_deg - params.angleOffsetDeg
+    measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
+    target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
+    unwinding = target_motion * target_angle < 0.0
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
       (planned_lateral_accel - self.previous_planned_lateral_accel) / self.dt
@@ -443,7 +462,7 @@ class PalisadeRackTrajectoryController:
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
-    feedforward_torque = -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
+    feedforward_torque = 0.0 if unwinding else -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
 
     curvature_per_degree = -VM.calc_curvature(math.radians(1.0), CS.vEgo, 0.0)
     lateral_accel_per_degree = curvature_per_degree * CS.vEgo ** 2
@@ -455,9 +474,6 @@ class PalisadeRackTrajectoryController:
       gain * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate), torque_params,
     )) if measured_rate_valid else 0.0
     raw_feedback = position_feedback + rate_feedback
-    target_angle = target.angle_deg - params.angleOffsetDeg
-    measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
-    target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
     turning_in = (
       target_angle * measured_angle >= 0.0
       and abs(target_angle) > abs(measured_angle)
