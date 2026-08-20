@@ -12,12 +12,13 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
   MotionLimits,
+  RackReferenceGovernor,
   RackTarget,
   model_path_target,
   PalisadeRackTrajectoryController,
+  STATUS_ACTIVE,
   STATUS_INVALID_PATH,
   STATUS_INVALID_VEHICLE_STATE,
-  STATUS_MEASURED_OUT_OF_BOUNDS,
 )
 
 
@@ -26,6 +27,11 @@ class LinearVehicleModel:
   def get_steer_from_curvature(curvature: float, speed: float, roll: float) -> float:
     del speed, roll
     return curvature * 10.0
+
+
+def govern_reference(governor: RackReferenceGovernor, target: RackTarget, planner: JerkLimitedRackPlanner,
+                     model_frame: int, *, bypass: bool = False) -> RackTarget:
+  return governor.update(target, planner, 0.0, 1_000_000_000 + model_frame * 50_000_000, .01, bypass)
 
 
 def test_model_path_is_scalar_anchored_and_signed() -> None:
@@ -163,6 +169,179 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   output = update()
   assert output is not None
   assert abs(output.feedforward_torque) < .05
+
+
+def test_reference_governor_holds_short_small_reversal() -> None:
+  planner = JerkLimitedRackPlanner(5.0)
+  governor = RackReferenceGovernor()
+
+  assert govern_reference(governor, RackTarget(5.0, 0.0), planner, 0) == RackTarget(5.0, 0.0)
+  assert govern_reference(governor, RackTarget(5.5, 0.0), planner, 1) == RackTarget(5.5, 0.0)
+  accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, 2)
+  for _ in range(20):
+    accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, 2)
+    assert 4.9 < accepted.position_deg < 5.5
+    assert governor.limited
+    assert governor.reversal_s == 0.0
+
+
+def test_reference_governor_passes_large_persistent_and_necessary_reversals() -> None:
+  large = RackReferenceGovernor()
+  stationary = JerkLimitedRackPlanner(5.0)
+  govern_reference(large, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(large, RackTarget(6.0, 0.0), stationary, 1)
+  assert govern_reference(large, RackTarget(3.0, 0.0), stationary, 2) == RackTarget(3.0, 0.0)
+  assert large.accepted == RackTarget(3.0, 0.0)
+
+  persistent = RackReferenceGovernor()
+  govern_reference(persistent, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(persistent, RackTarget(5.5, 0.0), stationary, 1)
+  first = govern_reference(persistent, RackTarget(4.9, 0.0), stationary, 2)
+  accepted = first
+  for frame in (3, 4, 5):
+    accepted = govern_reference(persistent, RackTarget(4.9, 0.0), stationary, frame)
+  assert abs(persistent.reversal_s - .15) < 1e-9
+  assert abs(accepted.position_deg - 4.9) < abs(first.position_deg - 4.9)
+
+  necessary = RackReferenceGovernor()
+  lagging = JerkLimitedRackPlanner(5.0)
+  govern_reference(necessary, RackTarget(5.0, 0.0), lagging, 0)
+  govern_reference(necessary, RackTarget(5.5, 0.0), lagging, 1)
+  lagging.position_deg = 3.0
+  assert govern_reference(necessary, RackTarget(4.9, 0.0), lagging, 2) == RackTarget(4.9, 0.0)
+  assert not necessary.limited
+
+  crossing = RackReferenceGovernor()
+  govern_reference(crossing, RackTarget(0.0, 0.0), stationary, 0)
+  govern_reference(crossing, RackTarget(1.0, 0.0), stationary, 1)
+  assert govern_reference(crossing, RackTarget(-.1, 0.0), stationary, 2) == RackTarget(-.1, 0.0)
+  assert crossing.accepted == RackTarget(-.1, 0.0)
+
+  fast = RackReferenceGovernor()
+  govern_reference(fast, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(fast, RackTarget(5.5, 0.0), stationary, 1)
+  assert govern_reference(fast, RackTarget(5.0, -6.0), stationary, 2) == RackTarget(5.0, -6.0)
+  assert not fast.limited
+
+  recovery = RackReferenceGovernor()
+  govern_reference(recovery, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(recovery, RackTarget(5.5, 0.0), stationary, 1)
+  govern_reference(recovery, RackTarget(4.9, 0.0), stationary, 2)
+  assert recovery.active
+  assert govern_reference(recovery, RackTarget(4.8, 0.0), stationary, 3, bypass=True) == RackTarget(4.8, 0.0)
+  assert not recovery.active and not recovery.limited and recovery.direction == 0
+
+
+def test_model_wobble_is_governed_in_rack_space_at_every_speed() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  interface = car_interface(car_params)
+  vehicle_model = VehicleModel(car_params)
+  params = log.VehicleParameters.new_message()
+
+  for speed in (5.0, 15.0, 30.0):
+    controller = PalisadeRackTrajectoryController()
+    controller.planner = JerkLimitedRackPlanner(5.1)
+    state = car.CarState.new_message()
+    state.vEgo = speed
+    state.steeringAngleDeg = 5.1
+    model = messaging.new_message("modelV2").modelV2
+    model.timestampEof = 1_000_000_000
+    if hasattr(model.action, "desiredCurvatureTime"):
+      model.action.desiredCurvatureTime = .5
+    model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
+    model.orientationRate.z = [0.0] * 5
+    model.velocity.x = [speed] * 5
+
+    limited = []
+    accelerations = []
+    for index in range(15):
+      model_frame = index // 5
+      target_angle = (5.0, 5.5, 5.0)[model_frame]
+      desired_curvature = -vehicle_model.calc_curvature(math.radians(target_angle), speed, 0.0)
+      model.timestampEof = 1_000_000_000 + model_frame * 50_000_000
+      model.action.desiredCurvature = desired_curvature
+      controller.set_model(model, model.timestampEof + 50_000_000)
+      output = controller.update(
+        True, state, vehicle_model, params, car_params.lateralTuning.torque,
+        interface.torque_from_lateral_accel(), .2, desired_curvature,
+      )
+      assert output is not None
+      limited.append(controller.reference_governor.limited)
+      accelerations.append(output.planned_acceleration_deg_s2)
+
+    assert any(limited[10:])
+    assert accelerations[9] * accelerations[10] >= 0.0
+
+
+def test_reference_governor_threshold_edges_and_raw_feedforward_isolation() -> None:
+  stationary = JerkLimitedRackPlanner(5.0)
+
+  below_distance = RackReferenceGovernor()
+  govern_reference(below_distance, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(below_distance, RackTarget(5.5, 0.0), stationary, 1)
+  governed = govern_reference(below_distance, RackTarget(4.5001, 0.0), stationary, 2)
+  assert governed != RackTarget(4.5001, 0.0)
+  assert below_distance.limited
+
+  at_distance = RackReferenceGovernor()
+  govern_reference(at_distance, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(at_distance, RackTarget(5.5, 0.0), stationary, 1)
+  assert govern_reference(at_distance, RackTarget(4.5, 0.0), stationary, 2) == RackTarget(4.5, 0.0)
+  assert not at_distance.limited
+
+  below_rate = RackReferenceGovernor()
+  govern_reference(below_rate, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(below_rate, RackTarget(5.5, 0.0), stationary, 1)
+  assert govern_reference(below_rate, RackTarget(5.0, -4.9999), stationary, 2) != RackTarget(5.0, -4.9999)
+  assert below_rate.limited
+
+  at_rate = RackReferenceGovernor()
+  govern_reference(at_rate, RackTarget(5.0, 0.0), stationary, 0)
+  govern_reference(at_rate, RackTarget(5.5, 0.0), stationary, 1)
+  assert govern_reference(at_rate, RackTarget(5.0, -5.0), stationary, 2) == RackTarget(5.0, -5.0)
+  assert not at_rate.limited
+
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  interface = car_interface(car_params)
+  controller = PalisadeRackTrajectoryController()
+  controller.planner = JerkLimitedRackPlanner(5.1)
+  vehicle_model = VehicleModel(car_params)
+  state = car.CarState.new_message()
+  state.vEgo = 30.0
+  state.steeringAngleDeg = 5.1
+  params = log.VehicleParameters.new_message()
+  torque_params = car_params.lateralTuning.torque
+  torque_params.friction = 0.0
+  torque_params.latAccelOffset = 0.0
+  model = messaging.new_message("modelV2").modelV2
+  model.timestampEof = 1_000_000_000
+  if hasattr(model.action, "desiredCurvatureTime"):
+    model.action.desiredCurvatureTime = .5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
+  model.orientationRate.z = [0.0] * 5
+  model.velocity.x = [state.vEgo] * 5
+
+  output = None
+  for model_frame, target_angle in enumerate((5.0, 5.5, 5.0)):
+    desired_curvature = -vehicle_model.calc_curvature(math.radians(target_angle), state.vEgo, 0.0)
+    model.timestampEof = 1_000_000_000 + model_frame * 50_000_000
+    model.action.desiredCurvature = desired_curvature
+    controller.set_model(model, model.timestampEof + 50_000_000)
+    output = controller.update(
+      True, state, vehicle_model, params, torque_params,
+      interface.torque_from_lateral_accel(), .2, desired_curvature,
+    )
+    assert output is not None
+
+  assert output is not None
+  assert controller.reference_governor.limited
+  expected_planned = -float(interface.torque_from_lateral_accel()(output.desired_lateral_accel, torque_params))
+  raw_lateral_accel = output.target_curvature * state.vEgo ** 2
+  raw_bypass = -float(interface.torque_from_lateral_accel()(raw_lateral_accel, torque_params))
+  assert abs(output.feedforward_torque - expected_planned) < 1e-9
+  assert abs(output.feedforward_torque - raw_bypass) > 1e-4
 
 
 def test_profile_transition_headroom_does_not_walk_outward() -> None:
@@ -311,12 +490,30 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   assert abs(bounded_angle_curvature) * state.vEgo ** 2 <= 3.0 + 1e-6
 
   released = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  state.vEgo = 27.0
+  model.velocity.x = [27.0] * 5
   released.set_rack_trajectory_model(model, 1_050_000_000)
-  state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-5.0 / state.vEgo ** 2, state.vEgo, 0.0))
-  torque, _, _ = released.update(True, state, vehicle_model, params, False, 0.0, False, .2)
-  assert torque == 0.0
+  state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-3.7 / state.vEgo ** 2, state.vEgo, 0.0))
+  torque, _, _ = released.update(True, state, vehicle_model, params, False, -1.0, False, .2)
   assert released.rack_trajectory is not None
-  assert released.rack_trajectory.status == STATUS_MEASURED_OUT_OF_BOUNDS
+  assert released.rack_trajectory_output is not None
+  assert released.rack_trajectory.status == STATUS_ACTIVE
+  assert torque * state.steeringAngleDeg <= 0.0
+
+  state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-2.9 / state.vEgo ** 2, state.vEgo, 0.0))
+  released.set_rack_trajectory_model(model, 1_050_000_000)
+  released.update(True, state, vehicle_model, params, False, -1.0, False, .2)
+  assert released.rack_trajectory_output is not None
+  assert released.rack_trajectory.status == STATUS_ACTIVE
+
+  mirrored = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  mirrored.set_rack_trajectory_model(model, 1_050_000_000)
+  state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(3.7 / state.vEgo ** 2, state.vEgo, 0.0))
+  torque, _, _ = mirrored.update(True, state, vehicle_model, params, False, 1.0, False, .2)
+  assert mirrored.rack_trajectory_output is not None
+  assert mirrored.rack_trajectory is not None
+  assert mirrored.rack_trajectory.status == STATUS_ACTIVE
+  assert torque * state.steeringAngleDeg <= 0.0
 
   assist = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
   state.vEgo = 3.0
