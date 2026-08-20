@@ -20,6 +20,11 @@ MAX_FEEDBACK_TORQUE = .35
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .35
 MODEL_ACTION_OFFSET_S = 1.5 * DT_MDL  # modeld frame delay + midpoint action delay
+REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
+REFERENCE_REVERSAL_PERSISTENCE_S = .15
+REFERENCE_REVERSAL_RC_S = .3
+REFERENCE_PERSISTENT_RC_S = .05
+REFERENCE_MAX_RATE_DEG_S = 5.0
 
 STATUS_INACTIVE = 0
 STATUS_ACTIVE = 1
@@ -228,6 +233,104 @@ class JerkLimitedRackPlanner:
     )
 
 
+class RackReferenceGovernor:
+  """Smooth short, small rack-reference reversals before trajectory planning."""
+
+  def __init__(self) -> None:
+    self.accepted: RackTarget | None = None
+    self.last_model_timestamp_ns: int | None = None
+    self.last_replan_position_deg: float | None = None
+    self.direction = 0
+    self.reversal_start_model_ns: int | None = None
+    self.reversal_s = 0.0
+    self.active = False
+    self.limited = False
+
+  def reset(self) -> None:
+    self.accepted = None
+    self.last_model_timestamp_ns = None
+    self.last_replan_position_deg = None
+    self.direction = 0
+    self.reversal_start_model_ns = None
+    self.reversal_s = 0.0
+    self.active = False
+    self.limited = False
+
+  @staticmethod
+  def _sign(value: float) -> int:
+    return 1 if value > 1e-9 else -1 if value < -1e-9 else 0
+
+  def _accept(self, target: RackTarget) -> RackTarget:
+    self.accepted = target
+    self.reversal_start_model_ns = None
+    self.reversal_s = 0.0
+    self.active = False
+    self.limited = False
+    return target
+
+  def update(self, target: RackTarget, planner: JerkLimitedRackPlanner,
+             neutral_position_deg: float, model_timestamp_ns: int, dt: float,
+             bypass: bool = False) -> RackTarget:
+    timestamp_ns = int(model_timestamp_ns)
+    if self.accepted is None:
+      self.last_model_timestamp_ns = timestamp_ns
+      self.last_replan_position_deg = target.position_deg
+      return self._accept(target)
+
+    assert self.last_model_timestamp_ns is not None and self.last_replan_position_deg is not None
+    new_model = timestamp_ns != self.last_model_timestamp_ns
+    raw_change_direction = self._sign(target.position_deg - self.last_replan_position_deg) if new_model else 0
+    if bypass:
+      self.last_model_timestamp_ns = timestamp_ns
+      self.last_replan_position_deg = target.position_deg
+      self.direction = 0
+      return self._accept(target)
+    plan_error = abs(target.position_deg - planner.position_deg)
+    filter_error = abs(target.position_deg - self.accepted.position_deg)
+    crosses_neutral = (
+      (self.accepted.position_deg - neutral_position_deg) * (target.position_deg - neutral_position_deg) <= 0.0
+    )
+    coherent_motion = (
+      plan_error >= REFERENCE_REVERSAL_DISTANCE_DEG
+      or filter_error >= REFERENCE_REVERSAL_DISTANCE_DEG
+      or abs(target.rate_deg_s) >= REFERENCE_MAX_RATE_DEG_S
+      or crosses_neutral
+    )
+    reversal = new_model and raw_change_direction != 0 and self.direction != 0 and raw_change_direction != self.direction
+    if coherent_motion:
+      if new_model:
+        self.last_model_timestamp_ns = timestamp_ns
+        self.last_replan_position_deg = target.position_deg
+        if raw_change_direction:
+          self.direction = raw_change_direction
+      return self._accept(target)
+    if reversal:
+      self.active = True
+      self.reversal_start_model_ns = timestamp_ns
+      self.reversal_s = 0.0
+    if new_model:
+      self.last_model_timestamp_ns = timestamp_ns
+      self.last_replan_position_deg = target.position_deg
+      if raw_change_direction:
+        self.direction = raw_change_direction
+    if not self.active:
+      return self._accept(target)
+
+    assert self.reversal_start_model_ns is not None
+    self.reversal_s = max(0.0, (timestamp_ns - self.reversal_start_model_ns) * 1e-9)
+    rc = REFERENCE_PERSISTENT_RC_S if self.reversal_s >= REFERENCE_REVERSAL_PERSISTENCE_S else REFERENCE_REVERSAL_RC_S
+    alpha = dt / (rc + dt)
+    self.accepted = RackTarget(
+      self.accepted.position_deg + alpha * (target.position_deg - self.accepted.position_deg),
+      self.accepted.rate_deg_s + alpha * (target.rate_deg_s - self.accepted.rate_deg_s),
+    )
+    self.limited = (
+      abs(self.accepted.position_deg - target.position_deg) > 1e-9
+      or abs(self.accepted.rate_deg_s - target.rate_deg_s) > 1e-9
+    )
+    return self.accepted
+
+
 class PalisadeRackTrajectoryController:
   def __init__(self, dt: float = DT) -> None:
     self.dt = dt
@@ -243,6 +346,7 @@ class PalisadeRackTrajectoryController:
     self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
+    self.reference_governor = RackReferenceGovernor()
 
   def set_model(self, model, state_mono_ns: int) -> None:
     self.model = model
@@ -259,6 +363,7 @@ class PalisadeRackTrajectoryController:
     self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
+    self.reference_governor.reset()
 
   def _measured_rate(self, angle_deg: float, raw_rate_deg_s: float) -> tuple[float, bool]:
     magnitude = abs(raw_rate_deg_s)
@@ -397,10 +502,7 @@ class PalisadeRackTrajectoryController:
     measured_curvature = -VM.calc_curvature(
       math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), bound_speed, params.roll,
     )
-    if not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9:
-      self.reset()
-      self.status = STATUS_MEASURED_OUT_OF_BOUNDS
-      return None
+    measured_out_of_bounds = not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9
     bounded_curvature = float(np.clip(target.curvature, minimum_curvature, maximum_curvature))
     path_limited = bounded_curvature != target.curvature
     if not path_limited:
@@ -417,24 +519,28 @@ class PalisadeRackTrajectoryController:
     if self.planner is None or CS.steeringPressed:
       seed_rate = _clip(measured_rate, profile.max_rate_deg_s) if measured_rate_valid else 0.0
       self.planner = JerkLimitedRackPlanner(float(CS.steeringAngleDeg), seed_rate)
+      self.reference_governor.reset()
     if 0.0 < abs(self.planner.rate_deg_s) - profile.max_rate_deg_s <= 1e-6:
       self.planner.rate_deg_s = math.copysign(profile.max_rate_deg_s, self.planner.rate_deg_s)
     if 0.0 < abs(self.planner.acceleration_deg_s2) - profile.max_acceleration_deg_s2 <= 1e-6:
       self.planner.acceleration_deg_s2 = math.copysign(profile.max_acceleration_deg_s2, self.planner.acceleration_deg_s2)
     limits, profile_transition = self._motion_limits(profile)
     rack_target = RackTarget(target.angle_deg, target.rate_deg_s)
+    governed_target = self.reference_governor.update(
+      rack_target, self.planner, float(params.angleOffsetDeg), int(self.model.timestampEof), self.dt,
+      path_limited or measured_out_of_bounds or profile_transition,
+    )
     recovery_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
-      plan = self.planner.update(rack_target, limits, self.dt, recovery_acceleration)
+      plan = self.planner.update(
+        governed_target, limits, self.dt, recovery_acceleration,
+      )
     except ValueError:
       self.reset()
       self.status = STATUS_INVALID_PLANNER_STATE
       return None
     planned_curvature = -VM.calc_curvature(math.radians(plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
-    if not minimum_curvature - 1e-9 <= planned_curvature <= maximum_curvature + 1e-9:
-      self.reset()
-      self.status = STATUS_PLANNED_OUT_OF_BOUNDS
-      return None
+    planned_out_of_bounds = not minimum_curvature - 1e-9 <= planned_curvature <= maximum_curvature + 1e-9
     planned_lateral_accel = planned_curvature * CS.vEgo ** 2
     measured_lateral_accel = measured_curvature * CS.vEgo ** 2
     target_angle = target.angle_deg - params.angleOffsetDeg
@@ -458,11 +564,16 @@ class PalisadeRackTrajectoryController:
       torque_params,
     )
     target_lateral_accel = target.curvature * CS.vEgo ** 2
+    governed_curvature = -VM.calc_curvature(
+      math.radians(governed_target.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll,
+    )
+    governed_lateral_accel = governed_curvature * CS.vEgo ** 2
     trajectory_feedforward_lateral_accel = planned_lateral_accel
-    if target_lateral_accel * planned_lateral_accel < 0.0:
+    if target_lateral_accel * planned_lateral_accel <= 0.0:
       trajectory_feedforward_lateral_accel = 0.0
-    elif abs(target_lateral_accel) < abs(planned_lateral_accel):
-      trajectory_feedforward_lateral_accel = target_lateral_accel
+    elif (governed_lateral_accel * planned_lateral_accel > 0.0
+          and abs(governed_lateral_accel) < abs(planned_lateral_accel)):
+      trajectory_feedforward_lateral_accel = governed_lateral_accel
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
@@ -494,10 +605,17 @@ class PalisadeRackTrajectoryController:
     torque = float(np.clip(raw_torque, -1.0, 1.0))
     torque_limited = torque != raw_torque
     planned_angle = plan.position_deg - params.angleOffsetDeg
+    if ((measured_out_of_bounds and torque * measured_curvature < 0.0)
+        or (planned_out_of_bounds and torque * planned_curvature < 0.0)):
+      torque_limited |= torque != 0.0
+      torque = 0.0
     if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
       torque_limited |= torque != 0.0
       torque = 0.0
-    motion_limited = plan.rate_limited or plan.acceleration_limited or plan.jerk_limited
+    motion_limited = (
+      plan.rate_limited or plan.acceleration_limited or plan.jerk_limited
+      or measured_out_of_bounds or planned_out_of_bounds or self.reference_governor.limited
+    )
     if not all(math.isfinite(value) for value in (
       torque, plan.position_deg, plan.rate_deg_s, plan.acceleration_deg_s2, measured_rate,
       lateral_accel_error, position_feedback, rate_feedback, feedforward_torque,
