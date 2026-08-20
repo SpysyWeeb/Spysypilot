@@ -111,6 +111,24 @@ def test_signed_rack_rate_handles_signed_and_unsigned_samples() -> None:
   assert controller._measured_rate(1.0, 5.0) == (-5.0, True)
 
 
+def test_profile_transition_headroom_does_not_walk_outward() -> None:
+  controller = PalisadeRackTrajectoryController()
+  controller.planner = JerkLimitedRackPlanner(0.0, 300.0)
+  controller.planner.acceleration_deg_s2 = 500.0
+  profile = MotionLimits(40.0, 100.0, 5000.0)
+  limits, transition = controller._motion_limits(profile)
+  assert transition
+  rate_ceiling = limits.max_rate_deg_s
+  acceleration_ceiling = limits.max_acceleration_deg_s2
+  for _ in range(200):
+    plan = controller.planner.update(RackTarget(10_000.0, 10_000.0), limits, .01)
+    limits, transition = controller._motion_limits(profile)
+    assert limits.max_rate_deg_s <= rate_ceiling + 1e-9
+    assert limits.max_acceleration_deg_s2 <= acceleration_ceiling + 1e-9
+    assert abs(plan.rate_deg_s) <= rate_ceiling + 1e-9
+    assert abs(plan.acceleration_deg_s2) <= acceleration_ceiling + 1e-9
+
+
 def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
   car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
@@ -166,6 +184,13 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
     or controller.rack_trajectory_output.profile_transition
     or controller.rack_trajectory_output.path_limited
   )
+  max_turn_in_feedback = abs(controller.rack_trajectory_output.feedback_torque)
+  for _ in range(200):
+    controller.set_rack_trajectory_model(model, 1_050_000_000)
+    _, _, _ = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
+    assert controller.rack_trajectory_output is not None
+    max_turn_in_feedback = max(max_turn_in_feedback, abs(controller.rack_trajectory_output.feedback_torque))
+  assert .5 < max_turn_in_feedback <= .7
 
   transition = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
   assert transition.rack_trajectory is not None
@@ -179,12 +204,40 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   assert transition.rack_trajectory_output is not None
   assert transition.rack_trajectory_output.profile_transition
   assert transition.rack_trajectory_output.planned_rate_deg_s < 100.0
+  max_transition_excursion = abs(transition.rack_trajectory_output.planned_angle_deg)
   for _ in range(1000):
     transition.set_rack_trajectory_model(model, 1_050_000_000)
     _, _, _ = transition.update(True, state, vehicle_model, params, False, 0.0, False, .2)
+    if transition.rack_trajectory_output is not None:
+      max_transition_excursion = max(max_transition_excursion, abs(transition.rack_trajectory_output.planned_angle_deg))
   assert transition.rack_trajectory_output is not None
   assert not transition.rack_trajectory_output.profile_transition
   assert abs(transition.rack_trajectory_output.planned_rate_deg_s) <= transition.rack_trajectory._limits(20.0).max_rate_deg_s + 1e-9
+  assert max_transition_excursion < 60.0
+
+  unwind = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  assert unwind.rack_trajectory is not None
+  unwind.rack_trajectory.planner = JerkLimitedRackPlanner(200.0)
+  state.vEgo = 3.0
+  state.steeringAngleDeg = 200.0
+  model.velocity.x = [3.0] * 5
+  unwind.set_rack_trajectory_model(model, 1_050_000_000)
+  _, _, _ = unwind.update(True, state, vehicle_model, params, False, 0.0, False, .2)
+  assert unwind.rack_trajectory_output is not None
+  assert abs(unwind.rack_trajectory_output.target_angle_deg) < 1e-6
+  assert abs(unwind.rack_trajectory_output.feedforward_torque) < .05
+
+  crossing = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  assert crossing.rack_trajectory is not None
+  crossing.rack_trajectory.planner = JerkLimitedRackPlanner(20.0)
+  state.steeringAngleDeg = 20.0
+  crossing.set_rack_trajectory_model(model, 1_050_000_000)
+  _, _, _ = crossing.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  crossing.set_rack_trajectory_model(model, 1_050_000_000)
+  torque, _, _ = crossing.update(True, state, vehicle_model, params, False, .02, False, .2)
+  assert crossing.rack_trajectory_output is not None
+  assert crossing.rack_trajectory_output.planned_angle_deg * crossing.rack_trajectory_output.target_angle_deg < 0.0
+  assert torque * crossing.rack_trajectory_output.target_angle_deg >= 0.0
 
   bounded = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
   bounded.set_rack_trajectory_model(model, 1_050_000_000)
@@ -206,9 +259,25 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   assert released.rack_trajectory is not None
   assert released.rack_trajectory.status == STATUS_MEASURED_OUT_OF_BOUNDS
 
+  assist = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  state.vEgo = 3.0
+  state.steeringAngleDeg = 0.0
+  state.steeringRateDeg = 0.0
+  model.action.desiredCurvature = -.15
+  model.orientationRate.z = [0.0, -.03, -.06, -.09, -.12]
+  model.velocity.x = [3.0] * 5
+  assist.set_rack_trajectory_model(model, 1_050_000_000)
   state.steeringPressed = True
-  torque, _, _ = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  state.steeringTorque = 300.0
+  torque, _, _ = assist.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  assert 0.0 < torque <= .35
+
+  assist.set_rack_trajectory_model(model, 1_050_000_000)
+  state.steeringTorque = -300.0
+  torque, _, _ = assist.update(True, state, vehicle_model, params, False, -.02, False, .2)
   assert torque == 0.0
+  assert assist.rack_trajectory is not None
+  assert assist.rack_trajectory.status == 2
 
   state.steeringPressed = False
   invalid_model = messaging.new_message("modelV2").modelV2
