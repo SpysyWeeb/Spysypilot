@@ -8,11 +8,13 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.car.hyundai.values import CAR as HYUNDAI, CarControllerParams
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
+from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 import openpilot.selfdrive.controls.lib.rack_trajectory as rack_trajectory_module
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
+  DRIVER_OVERRIDE_ASSIST_SCALE,
   MEASURED_RATE_FILTER_RC_S,
   MotionLimits,
   RackRateEstimator,
@@ -29,6 +31,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   model_path_targets,
   PalisadeRackTrajectoryController,
   STATUS_ACTIVE,
+  STATUS_DRIVER_OVERRIDE,
   STATUS_INVALID_ACTION_TIME,
   STATUS_INVALID_PATH,
   STATUS_STALE_MODEL,
@@ -459,14 +462,34 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   state.steeringPressed = True
   state.steeringTorque = 300.0
   state.steeringAngleDeg += 2.0
-  assert update() is None
+  handoff_output = update()
+  assert handoff_output is not None
+  assert DRIVER_OVERRIDE_ASSIST_SCALE == .5
+  assert 0.0 < handoff_output.torque <= DRIVER_OVERRIDE_ASSIST_SCALE
+  expected_hold_torque = -DRIVER_OVERRIDE_ASSIST_SCALE * float(interface.torque_from_lateral_accel()(
+    handoff_output.actual_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - car_params.lateralTuning.torque.latAccelOffset,
+    car_params.lateralTuning.torque,
+  ))
+  assert abs(handoff_output.torque - max(-.5, min(.5, expected_hold_torque))) < 1e-12
+  assert handoff_output.feedforward_torque == handoff_output.torque
+  assert handoff_output.feedback_torque == 0.0
+  assert handoff_output.position_feedback_torque == 0.0
+  assert handoff_output.rate_feedback_torque == 0.0
+  assert controller.status == STATUS_DRIVER_OVERRIDE
   assert controller.planner is planner_before_override
   plan_offset_during_override = planner_before_override.position_deg - state.steeringAngleDeg
   assert abs(plan_offset_during_override - plan_offset_before_override) < .25
+  handoff_torques = [handoff_output.torque]
   for _ in range(199):
     state.steeringAngleDeg += .02
-    assert update() is None
+    handoff_output = update()
+    assert handoff_output is not None
+    assert 0.0 <= handoff_output.torque * state.steeringTorque
+    assert abs(handoff_output.torque) <= .5
+    assert controller.status == STATUS_DRIVER_OVERRIDE
     assert controller.planner is planner_before_override
+    handoff_torques.append(handoff_output.torque)
+  assert max(abs(current - previous) for previous, current in zip(handoff_torques, handoff_torques[1:], strict=False)) < .01
   state.steeringPressed = False
   state.steeringTorque = 0.0
 
@@ -475,10 +498,14 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   assert release_output.feedforward_torque == 0.0
   assert abs(release_output.torque) <= .35
   assert release_output.torque * (release_output.planned_angle_deg - state.steeringAngleDeg) >= 0.0
+  assert controller.status == STATUS_ACTIVE
 
   state.steeringPressed = True
   state.steeringTorque = 300.0
-  assert update() is None
+  handoff_output = update()
+  assert handoff_output is not None
+  assert handoff_output.torque * state.steeringTorque >= 0.0
+  assert controller.status == STATUS_DRIVER_OVERRIDE
   state.steeringPressed = False
   state.steeringTorque = 0.0
 
