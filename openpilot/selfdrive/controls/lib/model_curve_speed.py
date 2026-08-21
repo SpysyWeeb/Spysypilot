@@ -16,7 +16,7 @@ CURVATURE_BP = np.array([0.00501, 0.04666, 0.08188])
 CURVE_SPEED_V = np.array([50.0, 22.0, 13.0]) * CV.MPH_TO_MS
 
 APPROACH_DECEL = 0.5  # m/s^2
-APPROACH_RESPONSE_BUFFER_S = 0.6  # measured planner-to-vehicle response, route 51
+
 CURVE_TARGET_RELEASE_RATE = 0.2  # m/s^2; lower targets apply immediately, opening curves release gently
 TORQUE_BUDGET = 0.90
 MIN_CURVATURE = 1e-4
@@ -66,6 +66,13 @@ class ModelCurveSpeedLimiter:
 
   def __init__(self, CP=None, approach_decel=APPROACH_DECEL):
     self.approach_decel = approach_decel
+    self.approach_response_time = DT_MDL
+    try:
+      actuator_delay = float(getattr(CP, "longitudinalActuatorDelay", 0.0))
+      if np.isfinite(actuator_delay) and actuator_delay >= 0.0:
+        self.approach_response_time += actuator_delay
+    except (AttributeError, TypeError, ValueError, OverflowError):
+      pass
     self.torque_params = None
     lateral_tuning = getattr(CP, "lateralTuning", None)
     if (getattr(CP, "carFingerprint", None) == CAR.HYUNDAI_PALISADE and lateral_tuning is not None
@@ -154,7 +161,7 @@ class ModelCurveSpeedLimiter:
     # Kinematics rearranged from v_curve^2 = v_now^2 + 2*a*distance.
     # Each horizon point provides a maximum speed allowed now; the strictest
     # point makes braking begin only when needed to reach its curve speed.
-    response_distance = current_speed * APPROACH_RESPONSE_BUFFER_S
+    response_distance = current_speed * self.approach_response_time
     effective_distance = np.maximum(path_distance - response_distance, 0.0)
     allowed_now = np.sqrt(np.maximum(curve_speed ** 2 + 2.0 * self.approach_decel * effective_distance, 0.0))
     target_idx = int(np.argmin(allowed_now))

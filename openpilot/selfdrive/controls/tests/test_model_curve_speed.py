@@ -10,7 +10,6 @@ from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.model_curve_speed import (
-  APPROACH_RESPONSE_BUFFER_S,
   CURVATURE_BP,
   CURVE_TARGET_RELEASE_RATE,
   CURVE_SPEED_V,
@@ -69,6 +68,13 @@ class TestModelCurveSpeed(unittest.TestCase):
   def test_default_approach_deceleration_is_half_mps2(self):
     self.assertAlmostEqual(ModelCurveSpeedLimiter().approach_decel, 0.5)
 
+  def test_approach_response_uses_actuator_delay_plus_planner_cadence(self):
+    cp = make_cp()
+    cp.longitudinalActuatorDelay = 0.2
+    self.assertAlmostEqual(ModelCurveSpeedLimiter(cp).approach_response_time, 0.2 + DT_MDL)
+    cp.longitudinalActuatorDelay = math.nan
+    self.assertEqual(ModelCurveSpeedLimiter(cp).approach_response_time, DT_MDL)
+
   def test_sustained_curve_caps_cruise_using_approach_distance(self):
     curvature = np.zeros(ModelConstants.IDX_N)
     curvature[12:17] = CURVATURE_BP[1]
@@ -94,7 +100,7 @@ class TestModelCurveSpeed(unittest.TestCase):
     limiter.update(model, 30.0, v_ego=v_ego)
     target = limiter.update(model, 30.0, v_ego=v_ego)
 
-    effective_distance = max(limiter.distance - v_ego * APPROACH_RESPONSE_BUFFER_S, 0.0)
+    effective_distance = max(limiter.distance - v_ego * limiter.approach_response_time, 0.0)
     expected = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * effective_distance)
     unbuffered = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
     self.assertAlmostEqual(target, expected)
@@ -142,7 +148,7 @@ class TestModelCurveSpeed(unittest.TestCase):
 
         field_target = np.sqrt(curve_speed_for_curvature(limiter.curvature) ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
         torque_speed = np.sqrt((TORQUE_BUDGET - 0.1) * 2.0 / curve_curvature)
-        effective_distance = max(limiter.distance - v_cruise * APPROACH_RESPONSE_BUFFER_S, 0.0)
+        effective_distance = max(limiter.distance - v_cruise * limiter.approach_response_time, 0.0)
         expected = np.sqrt(torque_speed ** 2 + 2.0 * limiter.approach_decel * effective_distance)
         self.assertGreater(field_target, v_cruise)
         self.assertTrue(limiter.active)
