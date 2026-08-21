@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import MotionLimits, RackPlan, RackTarget
 
@@ -55,3 +56,35 @@ class JerkLimitedRackPlanner:
       desired_acceleration != desired_acceleration_raw,
       desired_acceleration < jerk_lower or desired_acceleration > jerk_upper,
     )
+
+
+def horizon_desired_acceleration(
+  planner: JerkLimitedRackPlanner,
+  timed_targets: Sequence[tuple[float, RackTarget]],
+) -> float:
+  """Fit one current acceleration to the model-authored future rack states."""
+  weighted_acceleration = 0.0
+  weight_total = 0.0
+  previous_time = 0.0
+  for time_s, target in timed_targets:
+    time = float(time_s)
+    values = (time, target.position_deg, target.rate_deg_s)
+    if not all(math.isfinite(value) for value in values) or time <= previous_time:
+      raise ValueError("invalid rack horizon")
+    # Initial acceleration of the cubic joining current position/rate to this
+    # model target. Near knots carry more weight but later path phases still
+    # influence preparation; the live planner applies the physical limits.
+    acceleration = (
+      6.0 * (target.position_deg - planner.position_deg) / time ** 2
+      - (4.0 * planner.rate_deg_s + 2.0 * target.rate_deg_s) / time
+    )
+    weight = 1.0 / time
+    weighted_acceleration += weight * acceleration
+    weight_total += weight
+    previous_time = time
+  if weight_total == 0.0:
+    raise ValueError("empty rack horizon")
+  result = weighted_acceleration / weight_total
+  if not math.isfinite(result):
+    raise ValueError("non-finite rack horizon")
+  return result

@@ -5,23 +5,33 @@ import math
 
 from openpilot.cereal import log, messaging
 from opendbc.car.car_helpers import interfaces
-from opendbc.car.hyundai.values import CAR as HYUNDAI
+from opendbc.car.hyundai.values import CAR as HYUNDAI, CarControllerParams
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.realtime import DT_CTRL
+import openpilot.selfdrive.controls.lib.rack_trajectory as rack_trajectory_module
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
   MEASURED_RATE_FILTER_RC_S,
   MotionLimits,
   RackRateEstimator,
+  RackPlan,
   RackReferenceGovernor,
   RackTarget,
+  HORIZON_OFFSETS_S,
+  HORIZON_ACCELERATION_BLEND,
+  HORIZON_POSITION_TOLERANCE_DEG,
+  PREVIEW_S,
+  horizon_desired_acceleration,
+  horizon_candidate_preserves_immediate_path,
   model_path_target,
+  model_path_targets,
   PalisadeRackTrajectoryController,
   STATUS_ACTIVE,
   STATUS_INVALID_ACTION_TIME,
   STATUS_INVALID_PATH,
+  STATUS_STALE_MODEL,
   STATUS_INVALID_VEHICLE_STATE,
 )
 
@@ -45,6 +55,182 @@ def test_rack_trajectory_components_are_independent_modules() -> None:
   assert RackReferenceGovernor is reference.RackReferenceGovernor
   assert RackRateEstimator is state.RackRateEstimator
   assert model_path_target is reference.model_path_target
+
+
+def test_palisade_actual_command_authority_is_409_4_7() -> None:
+  car_params = interfaces[HYUNDAI.HYUNDAI_PALISADE].get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  limits = CarControllerParams(car_params)
+  assert (limits.STEER_MAX, limits.STEER_DELTA_UP, limits.STEER_DELTA_DOWN) == (409, 4, 7)
+
+
+def test_model_path_compiles_complete_quarter_second_horizon() -> None:
+  targets = model_path_targets(
+    native_times_s=[0.0, 1.0, 2.0, 3.0],
+    orientation_rates_z=[0.0, .05, .1, .15],
+    velocities_x=[5.0] * 4,
+    scalar_curvature=.03,
+    scalar_action_plan_s=1.0,
+    plan_time_now_s=.1,
+    measured_v_ego=5.0,
+    query_times_s=[.1 + offset for offset in HORIZON_OFFSETS_S],
+    vehicle_model=LinearVehicleModel(),
+    roll_rad=0.0,
+    angle_offset_deg=0.0,
+  )
+  assert HORIZON_OFFSETS_S == tuple(index * .25 for index in range(9))
+  assert PREVIEW_S == .25
+  assert len(targets) == len(HORIZON_OFFSETS_S)
+  assert targets[0].curvature < targets[-1].curvature
+
+
+def test_horizon_acceleration_uses_future_shape_without_targeting_endpoint() -> None:
+  planner = JerkLimitedRackPlanner(0.0)
+  buildup = tuple(
+    (offset, RackTarget(0.0 if offset <= .5 else 10.0 * (offset - .5), 0.0))
+    for offset in HORIZON_OFFSETS_S if offset > 0.0
+  )
+  unwind = tuple(
+    (offset, RackTarget(5.0 if offset <= .5 else 5.0 - 4.0 * (offset - .5), 0.0))
+    for offset in HORIZON_OFFSETS_S if offset > 0.0
+  )
+  assert horizon_desired_acceleration(planner, buildup) > 0.0
+  assert horizon_desired_acceleration(JerkLimitedRackPlanner(5.0), unwind) < 0.0
+
+  endpoint_only = ((2.0, RackTarget(15.0, 0.0)),)
+  full_shape = tuple((offset, RackTarget(0.0 if offset < 2.0 else 15.0, 0.0))
+                     for offset in HORIZON_OFFSETS_S if offset > 0.0)
+  assert abs(horizon_desired_acceleration(planner, full_shape)) < abs(horizon_desired_acceleration(planner, endpoint_only))
+
+
+def test_horizon_admission_rejects_each_immediate_path_violation() -> None:
+  target = RackTarget(1.0, 0.0)
+  baseline = RackPlan(.1, 0.0, 0.0, False, False, False)
+  allowed = RackPlan(.2, .1, 0.0, False, False, False)
+  wrong_side = RackPlan(-.02, 0.0, 0.0, False, False, False)
+  position_worse = RackPlan(2.0, 0.0, 0.0, False, False, False)
+  rate_worse = RackPlan(.1, 1.0, 0.0, False, False, False)
+  assert horizon_candidate_preserves_immediate_path(0.0, target, baseline, allowed)
+  assert not horizon_candidate_preserves_immediate_path(0.0, target, baseline, wrong_side)
+  assert not horizon_candidate_preserves_immediate_path(0.0, target, baseline, position_worse)
+  assert not horizon_candidate_preserves_immediate_path(0.0, target, baseline, rate_worse)
+
+
+def test_live_horizon_prepares_for_future_shape_without_moving_the_immediate_target() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  interface = car_interface(car_params)
+  vehicle_model = VehicleModel(car_params)
+  params = log.VehicleParameters.new_message()
+  state = car.CarState.new_message()
+  state.vEgo = 5.0
+
+  def update(orientation_rates: list[float]):
+    controller = PalisadeRackTrajectoryController()
+    model = messaging.new_message("modelV2").modelV2
+    model.timestampEof = 1_000_000_000
+    model.action.desiredCurvature = 0.0
+    model.action.desiredCurvatureTime = .5
+    model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+    model.orientationRate.z = orientation_rates
+    model.velocity.x = [state.vEgo] * 6
+    controller.set_model(model, 1_050_000_000)
+    return controller.update(
+      True, state, vehicle_model, params, car_params.lateralTuning.torque,
+      interface.torque_from_lateral_accel(), .2, 0.0,
+    ), model
+
+  flat, _ = update([0.0] * 6)
+  future_turn, future_model = update([0.0, 0.0, .0001, .0002, .0001, 0.0])
+  assert flat is not None and future_turn is not None
+  assert abs(flat.target_angle_deg - future_turn.target_angle_deg) < 1e-9
+  assert abs(future_turn.target_angle_deg) < 1e-9
+  assert future_turn.planned_acceleration_deg_s2 != flat.planned_acceleration_deg_s2
+  assert abs(future_turn.planned_angle_deg) <= HORIZON_POSITION_TOLERANCE_DEG
+  future_targets = model_path_targets(
+    native_times_s=future_model.orientationRate.t,
+    orientation_rates_z=future_model.orientationRate.z,
+    velocities_x=future_model.velocity.x,
+    scalar_curvature=0.0,
+    scalar_action_plan_s=.5,
+    plan_time_now_s=.05,
+    measured_v_ego=state.vEgo,
+    query_times_s=[.05 + offset for offset in HORIZON_OFFSETS_S],
+    vehicle_model=vehicle_model,
+    roll_rad=0.0,
+    angle_offset_deg=0.0,
+  )
+  fitted = horizon_desired_acceleration(
+    JerkLimitedRackPlanner(0.0),
+    tuple((offset, RackTarget(target.angle_deg, target.rate_deg_s))
+          for offset, target in zip(HORIZON_OFFSETS_S, future_targets, strict=True) if offset > 0.0),
+  )
+  assert HORIZON_ACCELERATION_BLEND == .1
+  assert abs(future_turn.planned_acceleration_deg_s2 - HORIZON_ACCELERATION_BLEND * fitted) < 1e-9
+
+  original_admission = rack_trajectory_module.horizon_candidate_preserves_immediate_path
+  try:
+    rack_trajectory_module.horizon_candidate_preserves_immediate_path = lambda *_: False
+    fallback, _ = update([0.0, 0.0, .0001, .0002, .0001, 0.0])
+  finally:
+    rack_trajectory_module.horizon_candidate_preserves_immediate_path = original_admission
+  assert fallback is not None
+  assert fallback.planned_angle_deg == flat.planned_angle_deg
+  assert fallback.planned_rate_deg_s == flat.planned_rate_deg_s
+  assert fallback.planned_acceleration_deg_s2 == flat.planned_acceleration_deg_s2
+
+
+def test_full_horizon_faults_reset_and_recover_cold() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  interface = car_interface(car_params)
+  vehicle_model = VehicleModel(car_params)
+  params = log.VehicleParameters.new_message()
+  state = car.CarState.new_message()
+  state.vEgo = 5.0
+
+  def model(times, rates, speeds):
+    message = messaging.new_message("modelV2").modelV2
+    message.timestampEof = 1_000_000_000
+    message.action.desiredCurvature = 0.0
+    message.action.desiredCurvatureTime = .5
+    message.orientationRate.t = times
+    message.orientationRate.z = rates
+    message.velocity.x = speeds
+    return message
+
+  valid = model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6)
+
+  def update(controller, path, mono_ns=1_050_000_000):
+    controller.set_model(path, mono_ns)
+    return controller.update(
+      True, state, vehicle_model, params, car_params.lateralTuning.torque,
+      interface.torque_from_lateral_accel(), .2, 0.0,
+    )
+
+  invalid_paths = (
+    model([0.0, .5, 1.0], [0.0] * 3, [5.0] * 3),
+    model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 5, [5.0] * 6),
+    model([0.0, .5, .4, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6),
+    model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0, 0.0, math.nan, 0.0, 0.0, 0.0], [5.0] * 6),
+    model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [5.0, 5.0, 5.0, 0.0, 5.0, 5.0]),
+  )
+  cases = tuple((path, 1_050_000_000, STATUS_INVALID_PATH) for path in invalid_paths) + (
+    (valid, 1_200_000_001, STATUS_STALE_MODEL),
+  )
+  for invalid, mono_ns, expected_status in cases:
+    controller = PalisadeRackTrajectoryController()
+    assert update(controller, valid) is not None
+    assert controller.planner is not None and controller.reference_governor.accepted is not None
+    assert update(controller, invalid, mono_ns) is None
+    assert controller.status == expected_status
+    assert controller.planner is None
+    assert controller.reference_governor.accepted is None
+    recovered = update(controller, valid)
+    assert recovered is not None
+    assert controller.status == STATUS_ACTIVE
+    assert all(math.isfinite(value) for value in (
+      recovered.torque, recovered.planned_angle_deg, recovered.planned_rate_deg_s,
+    ))
 
 
 def test_rack_trajectory_is_palisade_not_telluride_scoped() -> None:
@@ -156,9 +342,9 @@ def test_envelope_recovery_does_not_drop_torque_for_virtual_or_measured_limit() 
   model.timestampEof = 1_000_000_000
   model.action.desiredCurvature = target_curvature
   model.action.desiredCurvatureTime = .5
-  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
-  model.orientationRate.z = [0.0] * 5
-  model.velocity.x = [state.vEgo] * 5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+  model.orientationRate.z = [0.0] * 6
+  model.velocity.x = [state.vEgo] * 6
 
   def update(controller: PalisadeRackTrajectoryController):
     controller.set_model(model, 1_050_000_000)
@@ -238,9 +424,9 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   model.timestampEof = 1_000_000_000
   model.action.desiredCurvature = -.02
   model.action.desiredCurvatureTime = .5
-  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
-  model.orientationRate.z = [0.0] * 5
-  model.velocity.x = [5.0] * 5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+  model.orientationRate.z = [0.0] * 6
+  model.velocity.x = [5.0] * 6
 
   def update():
     controller.set_model(model, 1_050_000_000)
@@ -389,9 +575,9 @@ def test_model_wobble_is_governed_in_rack_space_at_every_speed() -> None:
     model = messaging.new_message("modelV2").modelV2
     model.timestampEof = 1_000_000_000
     model.action.desiredCurvatureTime = .5
-    model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
-    model.orientationRate.z = [0.0] * 5
-    model.velocity.x = [speed] * 5
+    model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+    model.orientationRate.z = [0.0] * 6
+    model.velocity.x = [speed] * 6
 
     limited = []
     accelerations = []
@@ -458,9 +644,9 @@ def test_reference_governor_threshold_edges_and_raw_feedforward_isolation() -> N
   model = messaging.new_message("modelV2").modelV2
   model.timestampEof = 1_000_000_000
   model.action.desiredCurvatureTime = .5
-  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
-  model.orientationRate.z = [0.0] * 5
-  model.velocity.x = [state.vEgo] * 5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+  model.orientationRate.z = [0.0] * 6
+  model.velocity.x = [state.vEgo] * 6
 
   output = None
   for model_frame, target_angle in enumerate((5.0, 5.5, 5.0)):
@@ -522,9 +708,9 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   model = messaging.new_message("modelV2").modelV2
   model.timestampEof = 1_000_000_000
   model.action.desiredCurvature = -.15
-  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
-  model.orientationRate.z = [0.0, -.03, -.06, -.09, -.12]
-  model.velocity.x = [3.0] * 5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+  model.orientationRate.z = [0.0, -.03, -.06, -.09, -.12, -.15]
+  model.velocity.x = [3.0] * 6
 
   controller.set_rack_trajectory_model(model, 1_050_000_000)
   torque, _, _ = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
@@ -547,7 +733,7 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
     scalar_action_plan_s=.5,
     plan_time_now_s=.05,
     measured_v_ego=3.0,
-    query_time_s=.55,
+    query_time_s=.05 + PREVIEW_S,
     vehicle_model=vehicle_model,
     roll_rad=0.0,
     angle_offset_deg=0.0,
@@ -579,8 +765,8 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   assert transition.rack_trajectory is not None
   transition.rack_trajectory.planner = JerkLimitedRackPlanner(0.0, 100.0)
   model.action.desiredCurvature = 0.0
-  model.orientationRate.z = [0.0] * 5
-  model.velocity.x = [20.0] * 5
+  model.orientationRate.z = [0.0] * 6
+  model.velocity.x = [20.0] * 6
   state.vEgo = 20.0
   transition.set_rack_trajectory_model(model, 1_050_000_000)
   _, _, _ = transition.update(True, state, vehicle_model, params, False, 0.0, False, .2)
@@ -603,7 +789,7 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   unwind.rack_trajectory.planner = JerkLimitedRackPlanner(200.0)
   state.vEgo = 3.0
   state.steeringAngleDeg = 200.0
-  model.velocity.x = [3.0] * 5
+  model.velocity.x = [3.0] * 6
   unwind.set_rack_trajectory_model(model, 1_050_000_000)
   _, _, _ = unwind.update(True, state, vehicle_model, params, False, 0.0, False, .2)
   assert unwind.rack_trajectory_output is not None
@@ -636,7 +822,7 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
 
   released = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
   state.vEgo = 27.0
-  model.velocity.x = [27.0] * 5
+  model.velocity.x = [27.0] * 6
   released.set_rack_trajectory_model(model, 1_050_000_000)
   state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-3.7 / state.vEgo ** 2, state.vEgo, 0.0))
   torque, _, _ = released.update(True, state, vehicle_model, params, False, -1.0, False, .2)
@@ -673,8 +859,8 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   state.steeringAngleDeg = 0.0
   state.steeringRateDeg = 0.0
   model.action.desiredCurvature = -.15
-  model.orientationRate.z = [0.0, -.03, -.06, -.09, -.12]
-  model.velocity.x = [3.0] * 5
+  model.orientationRate.z = [0.0, -.03, -.06, -.09, -.12, -.15]
+  model.velocity.x = [3.0] * 6
   assist.set_rack_trajectory_model(model, 1_050_000_000)
   state.steeringPressed = True
   state.steeringTorque = 300.0
