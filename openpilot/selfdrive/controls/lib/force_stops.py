@@ -19,9 +19,9 @@ import math
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import FORCE_STOP_COMMIT_DISTANCE_M, model_trajectories_complete_and_finite
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 
 MODEL_STOP_TIME = 3.0     # s, path endpoint within v_ego * this reads as "model plans to stop"
+LATCH_STOP_TIME = 3.25    # s, commit braking evidence once its filtered stop intent is stable
 EARLY_STOP_TIME = 4.5     # s, widened detection window honored only while the model is actually
                           # braking (route 38 t=306: the model backloads lead-less red lights --
                           # still 28mph with the line 39m out -- and the v*3s window latches too
@@ -84,6 +84,7 @@ class ForceStops:
   def __init__(self, dt: float = DT_MDL):
     self.dt = dt
     self.detect_filter = FirstOrderFilter(0.0, DETECT_RC, dt)
+    self.braking_filter = FirstOrderFilter(0.0, DETECT_RC, dt)
     self.lead_filter = FirstOrderFilter(0.0, LEAD_RC, dt)
     self.forcing = False
     self.remaining = 0.0
@@ -92,6 +93,7 @@ class ForceStops:
 
   def _reset(self) -> None:
     self.detect_filter.x = 0.0
+    self.braking_filter.x = 0.0
     self.lead_filter.x = 0.0
     self.forcing = False
     self.remaining = 0.0
@@ -103,6 +105,7 @@ class ForceStops:
     if CS.gasPressed:
       self.override_timer = GAS_OVERRIDE_S
       self.detect_filter.x = 0.0
+      self.braking_filter.x = 0.0
       self.forcing = False
       self.position_hold_remaining = 0.0
       return NO_CAP
@@ -131,6 +134,7 @@ class ForceStops:
     tracking_lead = self.lead_filter.x > LEAD_GATE
     if lead_present:
       self.detect_filter.x = 0.0
+      self.braking_filter.x = 0.0
       self.forcing = False
       self.position_hold_remaining = 0.0
       return NO_CAP
@@ -175,11 +179,15 @@ class ForceStops:
       math.isfinite(terminal_heading) and abs(terminal_heading) <= EARLY_STOP_MAX_HEADING and
       not (CS.leftBlinker or CS.rightBlinker)
     )
-    stop_time = EARLY_STOP_TIME if desired_accel < EARLY_BRAKE_GATE else MODEL_STOP_TIME
+    braking = desired_accel < EARLY_BRAKE_GATE
+    stop_time = EARLY_STOP_TIME if braking else MODEL_STOP_TIME
     model_stopping = 0.0 < model_length < max(v_ego * stop_time, MIN_STOP_LENGTH)
-    latch_ready = 0.0 < model_length < max(v_ego * MODEL_STOP_TIME, MIN_STOP_LENGTH)
+    classic_latch_ready = 0.0 < model_length < max(v_ego * MODEL_STOP_TIME, MIN_STOP_LENGTH)
+    latch_time = LATCH_STOP_TIME if braking else MODEL_STOP_TIME
+    latch_ready = 0.0 < model_length < max(v_ego * latch_time, MIN_STOP_LENGTH)
     detected = ((model_stopping or action.shouldStop) and not tracking_lead) or cem_stop_qualified
     self.detect_filter.update(1.0 if detected else 0.0)
+    self.braking_filter.update(1.0 if detected and braking else 0.0)
     self.position_hold_remaining = max(self.position_hold_remaining - self.dt, 0.0)
     if detected:
       self.position_hold_remaining = STOP_POSITION_HOLD_S
@@ -201,7 +209,8 @@ class ForceStops:
 
     just_committed = False
     if not self.forcing:
-      if cem_stop_qualified or (self.detect_filter.x >= LATCH_THRESHOLD and latch_ready):
+      latch_confident = self.detect_filter.x if classic_latch_ready else self.braking_filter.x
+      if cem_stop_qualified or (latch_confident >= LATCH_THRESHOLD and latch_ready):
         # latch the route-calibrated stop point now, while the model is confident; from here we only
         # count down by distance actually traveled, immune to later dithering
         self.forcing = True
@@ -218,9 +227,6 @@ class ForceStops:
 
     if not just_committed:
       self.remaining -= v_ego * self.dt
-    if self.remaining <= -STOP_DISTANCE:
-      self._reset()
-      return NO_CAP
     # forward-ratchet: while the model still confidently plans this stop, follow its endpoint
     # as it extends (bounded rate, never backward -- shrinking happens only by travel above)
     if (self.remaining > 0.0 and detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD and

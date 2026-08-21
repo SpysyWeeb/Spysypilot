@@ -23,6 +23,7 @@ class FakeConditionalMode:
     self.driver_override_active = driver_override
     self.stop_qualified = stop_qualified
     self.stop_distance = stop_distance
+    self.stop_latched = conditional_request
     self.calls = []
 
   def update(self, *args, **kwargs):
@@ -157,3 +158,4 @@ def test_publish_selfdrive_state_uses_effective_experimental_mode(monkeypatch):
   assert sent['selfdriveState'].selfdriveState.conditionalStopQualified is True
   assert sent['selfdriveState'].selfdriveState.conditionalStopDistance == 42.5
   assert sent['selfdriveState'].selfdriveState.conditionalStopModelMonoTime == 123456789
+  assert sent['selfdriveState'].selfdriveState.conditionalStopLatched is True

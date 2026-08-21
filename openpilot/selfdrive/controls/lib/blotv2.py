@@ -99,31 +99,31 @@ class DebouncedTrigger:
 def model_predicted_acceleration(model_lead: Any) -> float | None:
   """Return the model lead's first-horizon acceleration when trustworthy."""
   try:
-    if model_lead is None or float(model_lead.prob) < MODEL_LEAD_PROB_MIN or len(model_lead.v) < 2:
-      return None
+    probability = float(model_lead.prob)
     v0 = float(model_lead.v[0])
     v1 = float(model_lead.v[1])
     horizon = float(ModelConstants.LEAD_T_IDXS[1] - ModelConstants.LEAD_T_IDXS[0])
   except (AttributeError, IndexError, TypeError, ValueError):
     return None
 
-  if horizon <= 0.0 or not all(math.isfinite(value) for value in (v0, v1, horizon)):
+  if (not (MODEL_LEAD_PROB_MIN < probability <= 1.0) or horizon <= 0.0
+      or not all(math.isfinite(value) for value in (probability, v0, v1, horizon))):
     return None
   return (v1 - v0) / horizon
 
 
 def model_predicted_speed(model_lead: Any, lead: LeadObservation) -> float | None:
   """Anchor the model's first future speed delta to filtered radar speed."""
-  if not lead.present:
+  if not lead.present or not math.isfinite(lead.model_prob) or not (MODEL_LEAD_PROB_MIN < lead.model_prob <= 1.0):
     return None
   try:
-    if model_lead is None or float(model_lead.prob) < MODEL_LEAD_PROB_MIN or len(model_lead.v) < 2:
-      return None
+    probability = float(model_lead.prob)
     v0 = float(model_lead.v[0])
     v1 = float(model_lead.v[1])
   except (AttributeError, IndexError, TypeError, ValueError):
     return None
-  if not all(math.isfinite(value) for value in (v0, v1)):
+  if (not (MODEL_LEAD_PROB_MIN < probability <= 1.0)
+      or not all(math.isfinite(value) for value in (probability, v0, v1))):
     return None
   return max(lead.speed + v1 - v0, 0.0)
 
