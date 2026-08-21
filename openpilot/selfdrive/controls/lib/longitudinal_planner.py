@@ -25,8 +25,6 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   LongitudinalMpc,
   LongitudinalPlanSource,
   get_T_FOLLOW,
-  get_safe_obstacle_distance,
-  get_stopped_equivalence_factor,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
@@ -100,21 +98,6 @@ def get_cruise_comfort_accel(v_cruise, v_ego, accel_coast):
     target_accel = min(target_accel, accel_coast * coast_weight)
 
   return float(target_accel)
-
-
-def get_lead_jerk_scale(personality, lead, v_ego, policy, model_lead_accel, model_valid):
-  if (personality != log.LongitudinalPersonality.aggressive or not lead.present or lead.speed < v_ego
-      or v_ego <= CRUISE_COMFORT_SPEED_BP[0] or policy.required_decel > 0.0 or policy.emergency or policy.model_active
-      or not model_valid or model_lead_accel is None or not np.isfinite(model_lead_accel) or model_lead_accel < 0.0):
-    return policy.jerk_scale
-
-  desired_lead_distance = get_safe_obstacle_distance(v_ego, policy.t_follow) - get_stopped_equivalence_factor(lead.speed)
-  if lead.distance <= desired_lead_distance:
-    return policy.jerk_scale
-
-  lead_speed_error = max(lead.speed - v_ego, 0.0)
-  comfort_weight = np.interp(lead_speed_error, [0.0, CRUISE_COMFORT_COAST_FULL_ERROR], [1.0, 0.0])
-  return float(policy.jerk_scale * (1.0 + comfort_weight))
 
 
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle,
@@ -261,21 +244,18 @@ class LongitudinalPlanner:
     lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
     model_leads = sm['modelV2'].leadsV3
     model_lead_0 = model_leads[0] if len(model_leads) > 0 else None
-    model_lead_accel = model_predicted_acceleration(model_lead_0)
     policy = self.blotv2.update(
       lead,
       v_ego,
       self.last_mpc_a_target,
       get_T_FOLLOW(personality),
-      model_lead_accel,
+      model_predicted_acceleration(model_lead_0),
     )
 
     self.mpc.set_weights(
       prev_accel_constraint,
       personality=personality,
-      jerk_factor_scale=get_lead_jerk_scale(
-        personality, lead, v_ego, policy, model_lead_accel, sm.all_checks(['modelV2']),
-      ),
+      jerk_factor_scale=policy.jerk_scale,
     )
     self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     self.mpc.update(
