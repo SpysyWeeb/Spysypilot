@@ -12,7 +12,9 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
+  MEASURED_RATE_FILTER_RC_S,
   MotionLimits,
+  RackRateEstimator,
   RackReferenceGovernor,
   RackTarget,
   model_path_target,
@@ -35,11 +37,13 @@ def test_rack_trajectory_components_are_independent_modules() -> None:
   contracts = importlib.import_module("openpilot.selfdrive.controls.lib.rack_trajectory_contracts")
   planner = importlib.import_module("openpilot.selfdrive.controls.lib.rack_trajectory_planner")
   reference = importlib.import_module("openpilot.selfdrive.controls.lib.rack_trajectory_reference")
+  state = importlib.import_module("openpilot.selfdrive.controls.lib.rack_trajectory_state")
 
   assert MotionLimits is contracts.MotionLimits
   assert RackTarget is contracts.RackTarget
   assert JerkLimitedRackPlanner is planner.JerkLimitedRackPlanner
   assert RackReferenceGovernor is reference.RackReferenceGovernor
+  assert RackRateEstimator is state.RackRateEstimator
   assert model_path_target is reference.model_path_target
 
 
@@ -140,11 +144,27 @@ def test_jerk_limited_planner_is_bounded_and_symmetric() -> None:
 def test_signed_rack_rate_handles_signed_and_unsigned_samples() -> None:
   controller = PalisadeRackTrajectoryController()
   assert controller._measured_rate(-1.0, -5.0) == (-5.0, True)
-  assert controller._measured_rate(-.9, 5.0) == (5.0, True)
+  positive_rate, valid = controller._measured_rate(-.9, 5.0)
+  alpha = DT_CTRL / (MEASURED_RATE_FILTER_RC_S + DT_CTRL)
+  assert valid and abs(positive_rate - (-5.0 + alpha * 10.0)) < 1e-12
+
   controller.reset()
   assert controller._measured_rate(1.0, 5.0) == (0.0, False)
-  assert controller._measured_rate(1.1, 5.0) == (5.0, True)
-  assert controller._measured_rate(1.0, 5.0) == (-5.0, True)
+  assert controller._measured_rate(1.0, 0.0) == (0.0, True)
+  step_rate = 0.0
+  for index in range(5):
+    step_rate, valid = controller._measured_rate(1.1 + index * .1, 8.0)
+  assert valid and abs(step_rate - 8.0 * (1.0 - (1.0 - alpha) ** 5)) < 1e-12
+  reversal_rate, valid = controller._measured_rate(1.0, 8.0)
+  assert valid and reversal_rate > 0.0
+  for index in range(100):
+    reversal_rate, valid = controller._measured_rate(.9 - index * .1, 8.0)
+  assert valid and abs(reversal_rate + 8.0) < .1
+
+  controller.reset()
+  assert controller._measured_rate(1.0, 5.0) == (0.0, False)
+  filtered = [controller._measured_rate(1.1 if index % 2 else 1.0, 8.0)[0] for index in range(1, 21)]
+  assert sum(abs(filtered[index] - filtered[index - 1]) for index in range(1, len(filtered))) < 8.0 * 19 * .4
 
 
 def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion() -> None:
@@ -188,6 +208,29 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   output = update()
   assert output is not None
   assert abs(output.feedforward_torque) > .05
+  planner_before_override = controller.planner
+  assert planner_before_override is not None
+  plan_offset_before_override = planner_before_override.position_deg - state.steeringAngleDeg
+
+  state.steeringPressed = True
+  state.steeringTorque = 300.0
+  state.steeringAngleDeg += 2.0
+  assert update() is None
+  assert controller.planner is planner_before_override
+  plan_offset_during_override = planner_before_override.position_deg - state.steeringAngleDeg
+  assert abs(plan_offset_during_override - plan_offset_before_override) < .25
+  for _ in range(199):
+    state.steeringAngleDeg += .02
+    assert update() is None
+    assert controller.planner is planner_before_override
+  state.steeringPressed = False
+  state.steeringTorque = 0.0
+
+  release_output = update()
+  assert release_output is not None
+  assert release_output.feedforward_torque == 0.0
+  assert abs(release_output.torque) <= .35
+  assert release_output.torque * (release_output.planned_angle_deg - state.steeringAngleDeg) >= 0.0
 
   state.steeringPressed = True
   state.steeringTorque = 300.0
