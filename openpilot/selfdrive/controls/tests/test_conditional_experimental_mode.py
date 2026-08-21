@@ -20,6 +20,7 @@ from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (
   STOP_PREDICTION_HORIZON_S,
   STOP_INTENT_HOLD_S,
   STOP_SAMPLE_MIN_CONFIDENCE,
+  model_stop_release_open,
   observe_model_stop_intent,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -823,6 +824,59 @@ def test_green_release_returns_to_chill_after_standstill_latch_and_hysteresis():
   outputs = run_frames(cem, 100, clear_model(), stopped)
   assert outputs[0]
   assert not outputs[-1]
+
+
+def test_sustained_open_model_releases_stop_hold_before_mode_hysteresis():
+  cem = new_cem()
+  activate(cem)
+  stopped = car_state(v_ego=0.0, standstill=True)
+  run_frames(cem, 25, model(should_stop=True, path_end=4.0, terminal_speed=0.0), stopped)
+
+  green = model(path_end=34.0, terminal_speed=12.0, desired_accel=0.3)
+  assert all(run_frames(cem, 4, green, stopped))
+  assert cem.stop_latched
+  assert run_frames(cem, 5, green, stopped)[-1]
+  assert cem.experimental_mode
+  assert not cem.stop_latched
+
+  run_frames(cem, 8, model(should_stop=True, path_end=4.0, terminal_speed=0.0), stopped)
+  assert cem.stop_latched
+
+
+def test_stop_hold_fails_closed_on_weak_or_malformed_open_predictions():
+  malformed = model(path_end=34.0, terminal_speed=12.0)
+  malformed.position.x[5] = math.nan
+  nonfinite_action = model(path_end=34.0, terminal_speed=12.0)
+  nonfinite_action.action.desiredAcceleration = math.nan
+  candidates = (
+    model(path_end=34.0, terminal_speed=2.0),
+    model(should_stop=True, path_end=34.0, terminal_speed=12.0),
+    model(path_end=15.0, terminal_speed=12.0),
+    model(path_end=34.0, terminal_speed=12.0, desired_accel=-1.0),
+  )
+  for candidate in candidates:
+    cem = new_cem()
+    activate(cem)
+    assert all(run_frames(cem, 20, candidate))
+    assert cem.stop_latched
+  assert not model_stop_release_open(malformed)
+  assert not model_stop_release_open(nonfinite_action)
+
+
+def test_confirmed_open_hold_recloses_on_health_lead_or_turn_veto():
+  green = model(path_end=34.0, terminal_speed=12.0, desired_accel=0.3)
+  for fault in ("model", "radar", "lead", "turn"):
+    cem = new_cem()
+    activate(cem)
+    run_frames(cem, 9, green)
+    assert not cem.stop_latched
+
+    kwargs = {"controls_enabled": True, "model_updated": True, "model_valid": fault != "model",
+              "radar_valid": fault != "radar"}
+    cs = car_state(v_ego=5.0, left_blinker=fault == "turn", steering_angle=40.0 if fault == "turn" else 0.0)
+    radar = radar_state(present=fault == "lead", distance=20.0)
+    assert cem.update(green, cs, radar, **kwargs)
+    assert cem.stop_latched
 
 
 def test_generic_stop_latch_does_not_release_on_a_brief_standstill_clear():
