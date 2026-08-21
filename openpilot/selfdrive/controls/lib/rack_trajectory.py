@@ -17,8 +17,16 @@ from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import (
   RackTarget,
   RESPONSE_TIME_S,
 )
-from openpilot.selfdrive.controls.lib.rack_trajectory_planner import JerkLimitedRackPlanner, _clip, _required_rate_headroom
+from openpilot.selfdrive.controls.lib.rack_trajectory_planner import (
+  JerkLimitedRackPlanner,
+  _clip,
+  _required_rate_headroom,
+  horizon_desired_acceleration,
+)
 from openpilot.selfdrive.controls.lib.rack_trajectory_reference import (
+  HORIZON_OFFSETS_S,
+  HORIZON_S,
+  HORIZON_STEP_S,
   REFERENCE_MAX_RATE_DEG_S,
   REFERENCE_PERSISTENT_RC_S,
   REFERENCE_REVERSAL_DISTANCE_DEG,
@@ -26,12 +34,19 @@ from openpilot.selfdrive.controls.lib.rack_trajectory_reference import (
   REFERENCE_REVERSAL_RC_S,
   RackReferenceGovernor,
   model_path_target,
+  model_path_targets,
 )
 from openpilot.selfdrive.controls.lib.rack_trajectory_state import MEASURED_RATE_FILTER_RC_S, RackRateEstimator
 
 __all__ = (
   "DT",
   "PREVIEW_S",
+  "HORIZON_S",
+  "HORIZON_STEP_S",
+  "HORIZON_OFFSETS_S",
+  "HORIZON_POSITION_TOLERANCE_DEG",
+  "HORIZON_ACCELERATION_BLEND",
+  "horizon_candidate_preserves_immediate_path",
   "RESPONSE_TIME_S",
   "RATE_HORIZON_S",
   "MAX_FEEDBACK_TORQUE",
@@ -59,15 +74,20 @@ __all__ = (
   "RackPlan",
   "RackTrajectoryOutput",
   "JerkLimitedRackPlanner",
+  "horizon_desired_acceleration",
   "RackReferenceGovernor",
   "RackRateEstimator",
   "model_path_target",
+  "model_path_targets",
   "PalisadeRackTrajectoryController",
 )
 
 DT = .01
-PREVIEW_S = .5
+PREVIEW_S = .25
 RATE_HORIZON_S = .1
+HORIZON_POSITION_TOLERANCE_DEG = .01
+HORIZON_RATE_TOLERANCE_DEG_S = .5
+HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .35
@@ -94,6 +114,29 @@ _STOCK_KP = np.asarray([250.0, 120.0, 65.0, 30.0, 11.5, 5.5, 3.5, 2.0, .8])
 _LOW_SPEED_KP_END = float(np.float32(15.0 * 0.44704))
 _LOW_SPEED_KP_SPEEDS = np.asarray([2.0, 3.0, 5.0, _LOW_SPEED_KP_END])
 _LOW_SPEED_KP = np.asarray([65.0, 10.0, 10.0, np.interp(_LOW_SPEED_KP_END, _STOCK_KP_SPEEDS, _STOCK_KP)])
+
+
+def horizon_candidate_preserves_immediate_path(
+  planner_position_deg: float,
+  target: RackTarget,
+  baseline: RackPlan,
+  candidate: RackPlan,
+) -> bool:
+  immediate_error = target.position_deg - planner_position_deg
+  candidate_motion = candidate.position_deg - planner_position_deg
+  wrong_side = (
+    immediate_error * candidate_motion < 0.0
+    and abs(candidate_motion) > HORIZON_POSITION_TOLERANCE_DEG
+  )
+  position_preserved = (
+    abs(target.position_deg - candidate.position_deg)
+    <= abs(target.position_deg - baseline.position_deg) + HORIZON_POSITION_TOLERANCE_DEG
+  )
+  rate_preserved = (
+    abs(target.rate_deg_s - candidate.rate_deg_s)
+    <= abs(target.rate_deg_s - baseline.rate_deg_s) + HORIZON_RATE_TOLERANCE_DEG_S
+  )
+  return not wrong_side and position_preserved and rate_preserved
 
 
 class PalisadeRackTrajectoryController:
@@ -219,7 +262,7 @@ class PalisadeRackTrajectoryController:
       return None
 
     try:
-      target = model_path_target(
+      raw_targets = model_path_targets(
         native_times_s=self.model.orientationRate.t,
         orientation_rates_z=self.model.orientationRate.z,
         velocities_x=self.model.velocity.x,
@@ -227,7 +270,7 @@ class PalisadeRackTrajectoryController:
         scalar_action_plan_s=scalar_action_plan_s,
         plan_time_now_s=model_age_s,
         measured_v_ego=float(CS.vEgo),
-        query_time_s=model_age_s + PREVIEW_S,
+        query_times_s=tuple(model_age_s + offset for offset in HORIZON_OFFSETS_S),
         vehicle_model=VM,
         roll_rad=float(params.roll),
         angle_offset_deg=float(params.angleOffsetDeg),
@@ -235,25 +278,46 @@ class PalisadeRackTrajectoryController:
     except (TypeError, ValueError, OverflowError):
       self._invalidate(STATUS_INVALID_PATH)
       return None
-    bound_speed = max(float(CS.vEgo), MIN_SPEED)
+
     roll_compensation = float(params.roll) * ACCELERATION_DUE_TO_GRAVITY
+
+    def bound_target(raw_target: PathTarget, speed_mps: float) -> tuple[PathTarget, bool]:
+      bound_speed = max(float(speed_mps), MIN_SPEED)
+      minimum = max(-MAX_CURVATURE, (-MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
+      maximum = min(MAX_CURVATURE, (MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
+      bounded_curvature = float(np.clip(raw_target.curvature, minimum, maximum))
+      limited = bounded_curvature != raw_target.curvature
+      if not limited:
+        angle_curvature = -VM.calc_curvature(
+          math.radians(raw_target.angle_deg - params.angleOffsetDeg), bound_speed, params.roll,
+        )
+        bounded_curvature = float(np.clip(angle_curvature, minimum, maximum))
+        limited = bounded_curvature != angle_curvature
+      if not limited:
+        return raw_target, False
+      bounded_angle = math.degrees(
+        VM.get_steer_from_curvature(-bounded_curvature, bound_speed, params.roll),
+      ) + params.angleOffsetDeg
+      return PathTarget(bounded_curvature, raw_target.speed_mps, bounded_angle, 0.0), True
+
+    targets: list[PathTarget] = []
+    target_limits: list[bool] = []
+    for offset, raw_target in zip(HORIZON_OFFSETS_S, raw_targets, strict=True):
+      target_speed = float(CS.vEgo) if offset <= PREVIEW_S else raw_target.speed_mps
+      bounded_target, target_limited = bound_target(raw_target, target_speed)
+      targets.append(bounded_target)
+      target_limits.append(target_limited)
+    preview_index = round(PREVIEW_S / HORIZON_STEP_S)
+    target = targets[preview_index]
+    path_limited = target_limits[preview_index]
+
+    bound_speed = max(float(CS.vEgo), MIN_SPEED)
     minimum_curvature = max(-MAX_CURVATURE, (-MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
     maximum_curvature = min(MAX_CURVATURE, (MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
     measured_curvature = -VM.calc_curvature(
       math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), bound_speed, params.roll,
     )
     measured_out_of_bounds = not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9
-    bounded_curvature = float(np.clip(target.curvature, minimum_curvature, maximum_curvature))
-    path_limited = bounded_curvature != target.curvature
-    if not path_limited:
-      current_target_curvature = -VM.calc_curvature(
-        math.radians(target.angle_deg - params.angleOffsetDeg), bound_speed, params.roll,
-      )
-      bounded_curvature = float(np.clip(current_target_curvature, minimum_curvature, maximum_curvature))
-      path_limited = bounded_curvature != current_target_curvature
-    if path_limited:
-      bounded_angle = math.degrees(VM.get_steer_from_curvature(-bounded_curvature, bound_speed, params.roll)) + params.angleOffsetDeg
-      target = PathTarget(bounded_curvature, target.speed_mps, bounded_angle, 0.0)
     previous_angle_deg = self.rack_rate_estimator.previous_angle_deg
     measured_rate, measured_rate_valid = self._measured_rate(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
     profile = self._limits(float(CS.vEgo))
@@ -273,10 +337,37 @@ class PalisadeRackTrajectoryController:
       rack_target, self.planner, float(params.angleOffsetDeg), int(self.model.timestampEof), self.dt,
       path_limited or measured_out_of_bounds or profile_transition,
     )
-    recovery_acceleration = self._recovery_acceleration(profile, profile_transition)
+    planner = self.planner
+    assert planner is not None
+    timed_targets = tuple(
+      (offset, governed_target if index == preview_index else RackTarget(path_target.angle_deg, path_target.rate_deg_s))
+      for index, (offset, path_target) in enumerate(zip(HORIZON_OFFSETS_S, targets, strict=True))
+      if offset > 0.0
+    )
+    desired_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
-      raw_plan = self.planner.update(
-        governed_target, limits, self.dt, recovery_acceleration,
+      if desired_acceleration is None:
+        fitted_acceleration = horizon_desired_acceleration(planner, timed_targets)
+        natural_frequency = 2.0 / limits.response_time_s
+        reactive_acceleration = (
+          natural_frequency ** 2 * (governed_target.position_deg - planner.position_deg)
+          + 2.0 * natural_frequency * (governed_target.rate_deg_s - planner.rate_deg_s)
+        )
+        horizon_acceleration = reactive_acceleration + HORIZON_ACCELERATION_BLEND * (
+          fitted_acceleration - reactive_acceleration
+        )
+
+        def preview(acceleration_override: float | None) -> RackPlan:
+          candidate = JerkLimitedRackPlanner(planner.position_deg, planner.rate_deg_s)
+          candidate.acceleration_deg_s2 = planner.acceleration_deg_s2
+          return candidate.update(governed_target, limits, self.dt, acceleration_override)
+
+        baseline = preview(None)
+        horizon = preview(horizon_acceleration)
+        if horizon_candidate_preserves_immediate_path(planner.position_deg, governed_target, baseline, horizon):
+          desired_acceleration = horizon_acceleration
+      raw_plan = planner.update(
+        governed_target, limits, self.dt, desired_acceleration,
       )
     except ValueError:
       self._invalidate(STATUS_INVALID_PLANNER_STATE)
