@@ -62,7 +62,7 @@ RELEASE_THRESHOLD = 0.30  # hysteresis: unlatch below this (the model wants to g
 OPEN_RELEASE_PATH_MIN = 20.0
 OPEN_RELEASE_TERMINAL_SPEED_MIN = 3.0
 OPEN_RELEASE_RC = 0.30
-OPEN_RELEASE_THRESHOLD = 0.70
+OPEN_RELEASE_THRESHOLD = 0.25
 LEAD_RC = 1.0             # s, filter on radar lead status
 LEAD_GATE = 0.45          # filtered lead level above which stopping is the lead logic's job
 RAMP_TIME = 3.0           # s, speed cap = remaining distance / this (linear-in-distance ramp to 0)
@@ -106,9 +106,9 @@ def model_stop_release_open(model) -> bool:
   inputs = _model_stop_release_inputs(model)
   if inputs is None:
     return False
-  position, velocity, desired_accel = inputs
+  position, velocity, _ = inputs
   return bool(
-    not model.action.shouldStop and desired_accel >= EARLY_BRAKE_GATE and position[-1] >= OPEN_RELEASE_PATH_MIN and
+    not model.action.shouldStop and position[-1] >= OPEN_RELEASE_PATH_MIN and
     velocity[-1] >= OPEN_RELEASE_TERMINAL_SPEED_MIN
   )
 
@@ -209,7 +209,7 @@ class ForceStops:
     detected = (model_stopping or action.shouldStop) and not tracking_lead
     self.detect_filter.update(1.0 if detected else 0.0)
     self.braking_filter.update(1.0 if detected and braking else 0.0)
-    if detected or not model_stop_release_inputs_valid(sm['modelV2']):
+    if not self.forcing or detected or not model_stop_release_inputs_valid(sm['modelV2']):
       self.open_release_filter.x = 0.0
     else:
       self.open_release_filter.update(1.0 if model_stop_release_open(sm['modelV2']) else 0.0)
