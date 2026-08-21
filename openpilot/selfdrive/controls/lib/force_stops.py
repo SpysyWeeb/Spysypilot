@@ -64,7 +64,7 @@ DETECT_RC = 1.0           # s, filter time constant on the (flickery) detector
 LATCH_THRESHOLD = 0.55    # filtered detector level that latches a forced stop
 RELEASE_THRESHOLD = 0.30  # hysteresis: unlatch below this (the model wants to go, e.g. green light)
 OPEN_RELEASE_RC = 0.30
-OPEN_RELEASE_THRESHOLD = 0.70
+OPEN_RELEASE_THRESHOLD = 0.25
 LEAD_RC = 1.0             # s, filter on radar lead status
 LEAD_GATE = 0.45          # filtered lead level above which stopping is the lead logic's job
 RAMP_TIME = 3.0           # s, speed cap = remaining distance / this (linear-in-distance ramp to 0)
@@ -203,10 +203,10 @@ class ForceStops:
     detected = ((model_stopping or action.shouldStop) and not tracking_lead) or cem_stop_qualified
     self.detect_filter.update(1.0 if detected else 0.0)
     self.braking_filter.update(1.0 if detected and braking else 0.0)
-    if detected:
+    if not self.forcing or detected:
       self.open_release_filter.x = 0.0
     else:
-      self.open_release_filter.update(1.0 if model_stop_release_open(model) else 0.0)
+      self.open_release_filter.update(1.0 if model_stop_release_open(model, require_nonbraking=False) else 0.0)
     self.position_hold_remaining = max(self.position_hold_remaining - self.dt, 0.0)
     if detected:
       self.position_hold_remaining = STOP_POSITION_HOLD_S
