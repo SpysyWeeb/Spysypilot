@@ -861,6 +861,7 @@ def test_stop_hold_fails_closed_on_weak_or_malformed_open_predictions():
     assert cem.stop_latched
   assert not model_stop_release_open(malformed)
   assert not model_stop_release_open(nonfinite_action)
+  assert model_stop_release_open(model(path_end=34.0, terminal_speed=12.0, desired_accel=-1.0), require_nonbraking=False)
 
 
 def test_confirmed_open_hold_recloses_on_health_lead_or_turn_veto():
