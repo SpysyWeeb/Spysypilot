@@ -27,6 +27,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory_reference import (
   RackReferenceGovernor,
   model_path_target,
 )
+from openpilot.selfdrive.controls.lib.rack_trajectory_state import MEASURED_RATE_FILTER_RC_S, RackRateEstimator
 
 __all__ = (
   "DT",
@@ -41,6 +42,7 @@ __all__ = (
   "REFERENCE_REVERSAL_RC_S",
   "REFERENCE_PERSISTENT_RC_S",
   "REFERENCE_MAX_RATE_DEG_S",
+  "MEASURED_RATE_FILTER_RC_S",
   "STATUS_INACTIVE",
   "STATUS_ACTIVE",
   "STATUS_DRIVER_OVERRIDE",
@@ -58,6 +60,7 @@ __all__ = (
   "RackTrajectoryOutput",
   "JerkLimitedRackPlanner",
   "RackReferenceGovernor",
+  "RackRateEstimator",
   "model_path_target",
   "PalisadeRackTrajectoryController",
 )
@@ -102,13 +105,11 @@ class PalisadeRackTrajectoryController:
     self.transition_rate_limit: float | None = None
     self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
-    self.previous_angle_deg: float | None = None
-    self.rack_direction = 0
-    self.raw_signed_episode = False
     self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_governor = RackReferenceGovernor()
+    self.rack_rate_estimator = RackRateEstimator(dt)
 
   def set_model(self, model, state_mono_ns: int) -> None:
     self.model = model
@@ -119,13 +120,11 @@ class PalisadeRackTrajectoryController:
     self.transition_rate_limit = None
     self.transition_acceleration_limit = None
     self.previous_planned_lateral_accel = None
-    self.previous_angle_deg = None
-    self.rack_direction = 0
-    self.raw_signed_episode = False
     self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_governor.reset()
+    self.rack_rate_estimator.reset()
 
   def _invalidate(self, status: int) -> None:
     driver_override_resume = self.driver_override_resume
@@ -134,27 +133,7 @@ class PalisadeRackTrajectoryController:
     self.status = status
 
   def _measured_rate(self, angle_deg: float, raw_rate_deg_s: float) -> tuple[float, bool]:
-    magnitude = abs(raw_rate_deg_s)
-    if magnitude == 0.0:
-      self.rack_direction = 0
-      self.raw_signed_episode = False
-      rate, valid = 0.0, True
-    elif raw_rate_deg_s < 0.0:
-      self.rack_direction = -1
-      self.raw_signed_episode = True
-      rate, valid = -magnitude, True
-    elif self.raw_signed_episode:
-      self.rack_direction = 1
-      rate, valid = magnitude, True
-    elif self.previous_angle_deg is not None and angle_deg != self.previous_angle_deg:
-      self.rack_direction = 1 if angle_deg > self.previous_angle_deg else -1
-      rate, valid = self.rack_direction * magnitude, True
-    elif self.rack_direction:
-      rate, valid = self.rack_direction * magnitude, True
-    else:
-      rate, valid = 0.0, False
-    self.previous_angle_deg = angle_deg
-    return rate, valid
+    return self.rack_rate_estimator.update(angle_deg, raw_rate_deg_s)
 
   @staticmethod
   def _limits(speed_mps: float) -> MotionLimits:
@@ -275,12 +254,15 @@ class PalisadeRackTrajectoryController:
     if path_limited:
       bounded_angle = math.degrees(VM.get_steer_from_curvature(-bounded_curvature, bound_speed, params.roll)) + params.angleOffsetDeg
       target = PathTarget(bounded_curvature, target.speed_mps, bounded_angle, 0.0)
+    previous_angle_deg = self.rack_rate_estimator.previous_angle_deg
     measured_rate, measured_rate_valid = self._measured_rate(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
     profile = self._limits(float(CS.vEgo))
-    if self.planner is None or CS.steeringPressed:
+    if self.planner is None:
       seed_rate = _clip(measured_rate, profile.max_rate_deg_s) if measured_rate_valid else 0.0
       self.planner = JerkLimitedRackPlanner(float(CS.steeringAngleDeg), seed_rate)
       self.reference_governor.reset()
+    elif CS.steeringPressed and previous_angle_deg is not None:
+      self.planner.position_deg += float(CS.steeringAngleDeg) - previous_angle_deg
     if 0.0 < abs(self.planner.rate_deg_s) - profile.max_rate_deg_s <= 1e-6:
       self.planner.rate_deg_s = math.copysign(profile.max_rate_deg_s, self.planner.rate_deg_s)
     if 0.0 < abs(self.planner.acceleration_deg_s2) - profile.max_acceleration_deg_s2 <= 1e-6:
@@ -307,8 +289,6 @@ class PalisadeRackTrajectoryController:
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
     target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
     unwinding = target_motion * target_angle < 0.0
-    if self.driver_override_resume and not unwinding:
-      self.driver_override_resume = False
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
       (planned_lateral_accel - self.previous_planned_lateral_accel) / self.dt
@@ -354,7 +334,9 @@ class PalisadeRackTrajectoryController:
       and abs(target_angle) > abs(measured_angle)
       and target_motion * target_angle > 0.0
     )
-    if turning_in:
+    if self.driver_override_resume:
+      feedback_lower, feedback_upper = -MAX_DRIVER_ASSIST_TORQUE, MAX_DRIVER_ASSIST_TORQUE
+    elif turning_in:
       feedback_lower = -MAX_TURN_IN_FEEDBACK_TORQUE if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
       feedback_upper = MAX_TURN_IN_FEEDBACK_TORQUE if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
     else:
@@ -385,13 +367,14 @@ class PalisadeRackTrajectoryController:
     driver_torque = float(CS.steeringTorque)
     if CS.steeringPressed:
       if torque * driver_torque < 0.0 or target_motion * driver_torque <= 0.0:
-        self.reset()
         self.driver_override_resume = True
         self.status = STATUS_DRIVER_OVERRIDE
         return None
       assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
       torque_limited |= assisted_torque != torque
       torque = assisted_torque
+    if self.driver_override_resume and not CS.steeringPressed and not unwinding:
+      self.driver_override_resume = False
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
       torque=torque,
