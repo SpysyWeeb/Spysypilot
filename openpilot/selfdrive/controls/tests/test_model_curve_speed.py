@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -203,6 +204,62 @@ class TestModelCurveSpeed(unittest.TestCase):
     self.assertFalse(limiter.torque_veto)
     self.assertEqual(longitudinal_planner.limit_accel_for_torque(0.4, True), 0.0)
     self.assertEqual(longitudinal_planner.limit_accel_for_torque(-0.4, True), -0.4)
+
+  def test_torque_veto_clamps_persistent_cruise_state_before_release(self):
+    from openpilot.selfdrive.controls.lib import longitudinal_planner
+
+    model = make_model()
+    absent = SimpleNamespace(present=False)
+    messages = {
+      'carState': SimpleNamespace(vEgo=15.0, vCruise=17.0 * CV.MS_TO_KPH, aEgo=0.0, standstill=False),
+      'carControl': SimpleNamespace(orientationNED=[], latActive=True),
+      'controlsState': SimpleNamespace(forceDecel=False, longControlState=longitudinal_planner.LongCtrlState.pid),
+      'selfdriveState': SimpleNamespace(enabled=True, experimentalMode=False, personality=1),
+      'vehicleParameters': SimpleNamespace(roll=0.0),
+      'modelV2': model,
+      'radarState': SimpleNamespace(leadOne=absent, leadTwo=absent),
+      'lateralTorqueParameters': SimpleNamespace(useParams=False),
+    }
+    model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]))
+    model.action = SimpleNamespace(desiredAcceleration=1.0, shouldStop=False)
+
+    class FakeSubMaster(dict):
+      def __init__(self, values):
+        super().__init__(values)
+        self.alive = self.freq_ok = self.valid = dict.fromkeys(values, True)
+
+      def all_checks(self, services=None):
+        return True
+
+    sm = FakeSubMaster(messages)
+    planner = longitudinal_planner.LongitudinalPlanner(
+      SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2),
+    )
+    planner.curve_speed_limiter.torque_veto = True
+    with (
+      patch.object(planner.curve_speed_limiter, 'update', return_value=17.0),
+      patch.object(planner.mpc, 'set_weights'),
+      patch.object(planner.mpc, 'set_cur_state'),
+      patch.object(planner.mpc, 'update'),
+      patch.object(longitudinal_planner, 'get_accel_from_plan', return_value=0.5),
+    ):
+      for _ in range(10):
+        planner.update(sm)
+      self.assertEqual(planner.a_cruise, 0.0)
+
+      planner.curve_speed_limiter.torque_veto = False
+      planner.update(sm)
+      released_accel = planner.a_cruise
+
+      sm['carState'].vEgo = 0.2
+      planner.a_cruise = 0.2
+      planner.curve_speed_limiter.torque_veto = True
+      planner.update(sm)
+      self.assertGreater(planner.a_cruise, 0.1)
+      self.assertFalse(planner.output_should_stop)
+
+    jerk = np.interp(15.0, longitudinal_planner.A_CRUISE_MAX_BP, longitudinal_planner.J_CRUISE_VALS)
+    self.assertLessEqual(released_accel, jerk * DT_MDL)
 
   def test_approach_distance_follows_path_arc_not_only_forward_position(self):
     curvature = np.zeros(ModelConstants.IDX_N)
