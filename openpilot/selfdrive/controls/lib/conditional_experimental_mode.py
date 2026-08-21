@@ -135,7 +135,7 @@ def model_trajectories_complete_and_finite(model: Any) -> bool:
   return len(position_x) == ModelConstants.IDX_N and len(velocity_x) == ModelConstants.IDX_N and model_trajectories_finite(model)
 
 
-def model_stop_release_open(model: Any) -> bool:
+def model_stop_release_open(model: Any, *, require_nonbraking: bool = True) -> bool:
   """Strong launch sample; callers still own temporal confirmation."""
   if not model_trajectories_complete_and_finite(model):
     return False
@@ -145,7 +145,7 @@ def model_stop_release_open(model: Any) -> bool:
   desired_accel = _optional_finite_float(getattr(action, "desiredAcceleration", None))
   return bool(
     not getattr(action, "shouldStop", True) and
-    desired_accel is not None and desired_accel > STOP_EARLY_DESIRED_ACCEL_MAX and
+    desired_accel is not None and (not require_nonbraking or desired_accel > STOP_EARLY_DESIRED_ACCEL_MAX) and
     path_end_m is not None and path_end_m >= STOP_RELEASE_PATH_MIN_DISTANCE_M and
     terminal_speed is not None and terminal_speed >= STOP_RELEASE_TERMINAL_SPEED_MIN
   )
