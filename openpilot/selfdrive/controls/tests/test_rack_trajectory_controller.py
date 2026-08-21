@@ -141,6 +141,64 @@ def test_jerk_limited_planner_is_bounded_and_symmetric() -> None:
   assert abs(positive.rate_deg_s) < 1.0
 
 
+def test_envelope_recovery_does_not_drop_torque_for_virtual_or_measured_limit() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  interface = car_interface(car_params)
+  vehicle_model = VehicleModel(car_params)
+  params = log.VehicleParameters.new_message()
+  state = car.CarState.new_message()
+  state.vEgo = 13.6
+  boundary_curvature = -3.0 / state.vEgo ** 2
+  boundary_angle = math.degrees(vehicle_model.get_steer_from_curvature(-boundary_curvature, state.vEgo, 0.0))
+  target_curvature = -2.99 / state.vEgo ** 2
+  model = messaging.new_message("modelV2").modelV2
+  model.timestampEof = 1_000_000_000
+  model.action.desiredCurvature = target_curvature
+  model.action.desiredCurvatureTime = .5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
+  model.orientationRate.z = [0.0] * 5
+  model.velocity.x = [state.vEgo] * 5
+
+  def update(controller: PalisadeRackTrajectoryController):
+    controller.set_model(model, 1_050_000_000)
+    return controller.update(
+      True, state, vehicle_model, params, car_params.lateralTuning.torque,
+      interface.torque_from_lateral_accel(), .2, target_curvature,
+    )
+
+  virtual = PalisadeRackTrajectoryController()
+  virtual.planner = JerkLimitedRackPlanner(boundary_angle + .2, 20.0)
+  raw_planner = virtual.planner
+  state.steeringAngleDeg = boundary_angle - 15.0
+  output = update(virtual)
+  assert output is not None
+  executed_curvature = -vehicle_model.calc_curvature(math.radians(output.planned_angle_deg), state.vEgo, 0.0)
+  assert abs(executed_curvature) * state.vEgo ** 2 <= 3.0 + 1e-6
+  assert output.torque > 0.0
+  torques = [output.torque]
+  for _ in range(300):
+    output = update(virtual)
+    assert output is not None and virtual.planner is raw_planner
+    executed_curvature = -vehicle_model.calc_curvature(math.radians(output.planned_angle_deg), state.vEgo, 0.0)
+    assert abs(executed_curvature) * state.vEgo ** 2 <= 3.0 + 1e-6
+    assert output.torque > 0.0
+    torques.append(output.torque)
+    if raw_planner.position_deg <= boundary_angle:
+      break
+  else:
+    raise AssertionError("raw planner did not recover inside the execution envelope")
+  assert max(abs(torques[index] - torques[index - 1]) for index in range(1, len(torques))) < .1
+
+  measured = PalisadeRackTrajectoryController()
+  state.steeringAngleDeg = boundary_angle + 10.0
+  output = update(measured)
+  assert output is not None
+  assert output.torque != 0.0
+  assert output.feedforward_torque > 0.0
+  assert output.position_feedback_torque * (output.planned_angle_deg - state.steeringAngleDeg) > 0.0
+
+
 def test_signed_rack_rate_handles_signed_and_unsigned_samples() -> None:
   controller = PalisadeRackTrajectoryController()
   assert controller._measured_rate(-1.0, -5.0) == (-5.0, True)
@@ -585,7 +643,11 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   assert released.rack_trajectory is not None
   assert released.rack_trajectory_output is not None
   assert released.rack_trajectory.status == STATUS_ACTIVE
-  assert torque * state.steeringAngleDeg <= 0.0
+  assert torque != 0.0
+  assert released.rack_trajectory_output.feedforward_torque != 0.0
+  assert released.rack_trajectory_output.position_feedback_torque * (
+    released.rack_trajectory_output.planned_angle_deg - state.steeringAngleDeg
+  ) > 0.0
 
   state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-2.9 / state.vEgo ** 2, state.vEgo, 0.0))
   released.set_rack_trajectory_model(model, 1_050_000_000)
@@ -600,7 +662,11 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   assert mirrored.rack_trajectory_output is not None
   assert mirrored.rack_trajectory is not None
   assert mirrored.rack_trajectory.status == STATUS_ACTIVE
-  assert torque * state.steeringAngleDeg <= 0.0
+  assert torque != 0.0
+  assert mirrored.rack_trajectory_output.feedforward_torque != 0.0
+  assert mirrored.rack_trajectory_output.position_feedback_torque * (
+    mirrored.rack_trajectory_output.planned_angle_deg - state.steeringAngleDeg
+  ) > 0.0
 
   assist = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
   state.vEgo = 3.0
