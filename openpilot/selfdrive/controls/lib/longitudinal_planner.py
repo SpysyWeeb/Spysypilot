@@ -361,6 +361,8 @@ class LongitudinalPlanner:
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle, comfort_enabled=comfort_enabled)
+    if not should_stop(v_ego, 0.0):
+      self.a_cruise = limit_accel_for_torque(self.a_cruise, self.curve_speed_limiter.torque_veto)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
