@@ -16,6 +16,7 @@ CURVATURE_BP = np.array([0.00501, 0.04666, 0.08188])
 CURVE_SPEED_V = np.array([50.0, 22.0, 13.0]) * CV.MPH_TO_MS
 
 APPROACH_DECEL = 0.5  # m/s^2
+APPROACH_RESPONSE_BUFFER_S = 0.6  # measured planner-to-vehicle response, route 51
 CURVE_TARGET_RELEASE_RATE = 0.2  # m/s^2; lower targets apply immediately, opening curves release gently
 TORQUE_BUDGET = 0.90
 MIN_CURVATURE = 1e-4
@@ -94,6 +95,23 @@ class ModelCurveSpeedLimiter:
     return self._set_target(v_cruise, float(np.median(self._target_history)))
 
   def update(self, model, v_cruise, v_ego=0.0, lateral_active=False, roll=0.0, torque_params=None):
+    try:
+      cruise_speed = float(v_cruise)
+    except (TypeError, ValueError, OverflowError):
+      return self.v_target
+    if not np.isfinite(cruise_speed):
+      return self.v_target
+    try:
+      parsed_speed = float(v_ego)
+      current_roll = float(roll)
+    except (TypeError, ValueError, OverflowError):
+      return min(cruise_speed, self.v_target)
+    if not np.isfinite(parsed_speed) or not np.isfinite(current_roll):
+      return min(cruise_speed, self.v_target)
+    current_speed = max(parsed_speed, 0.0)
+    v_cruise = cruise_speed
+    roll = current_roll
+
     self.active = False
     self.curvature = 0.0
     self.distance = 0.0
@@ -120,7 +138,7 @@ class ModelCurveSpeedLimiter:
 
     active_torque_params = _torque_values(torque_params) if self.torque_params is not None and torque_params is not None else None
     active_torque_params = active_torque_params or self.torque_params
-    if lateral_active and active_torque_params is not None and np.isfinite(v_ego) and np.isfinite(roll):
+    if lateral_active and active_torque_params is not None:
       factor, offset, friction = active_torque_params
       signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
       bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
@@ -129,14 +147,16 @@ class ModelCurveSpeedLimiter:
                                        out=np.full_like(signed_curvature, np.inf),
                                        where=np.abs(signed_curvature) >= MIN_CURVATURE)
       curve_speed = np.minimum(curve_speed, np.sqrt(np.maximum(torque_speed_squared, 0.0)))
-      self.predicted_torque = float(np.max(np.abs(signed_curvature * max(v_ego, 0.0) ** 2 - bias) / factor + friction))
+      self.predicted_torque = float(np.max(np.abs(signed_curvature * current_speed ** 2 - bias) / factor + friction))
     self._torque_veto_history.append(self.predicted_torque >= TORQUE_BUDGET)
     self.torque_veto = sum(self._torque_veto_history) >= 2
 
     # Kinematics rearranged from v_curve^2 = v_now^2 + 2*a*distance.
     # Each horizon point provides a maximum speed allowed now; the strictest
     # point makes braking begin only when needed to reach its curve speed.
-    allowed_now = np.sqrt(np.maximum(curve_speed ** 2 + 2.0 * self.approach_decel * path_distance, 0.0))
+    response_distance = current_speed * APPROACH_RESPONSE_BUFFER_S
+    effective_distance = np.maximum(path_distance - response_distance, 0.0)
+    allowed_now = np.sqrt(np.maximum(curve_speed ** 2 + 2.0 * self.approach_decel * effective_distance, 0.0))
     target_idx = int(np.argmin(allowed_now))
     self._target_history.append(float(allowed_now[target_idx]))
     filtered_target = float(np.median(self._target_history))
