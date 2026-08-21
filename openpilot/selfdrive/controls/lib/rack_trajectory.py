@@ -275,14 +275,20 @@ class PalisadeRackTrajectoryController:
     )
     recovery_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
-      plan = self.planner.update(
+      raw_plan = self.planner.update(
         governed_target, limits, self.dt, recovery_acceleration,
       )
     except ValueError:
       self._invalidate(STATUS_INVALID_PLANNER_STATE)
       return None
+    raw_planned_curvature = -VM.calc_curvature(math.radians(raw_plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
+    planned_out_of_bounds = not minimum_curvature - 1e-9 <= raw_planned_curvature <= maximum_curvature + 1e-9
+    plan = raw_plan
+    if planned_out_of_bounds:
+      planned_curvature = float(np.clip(raw_planned_curvature, minimum_curvature, maximum_curvature))
+      planned_angle = math.degrees(VM.get_steer_from_curvature(-planned_curvature, bound_speed, params.roll)) + params.angleOffsetDeg
+      plan = RackPlan(planned_angle, 0.0, 0.0, True, raw_plan.acceleration_limited, raw_plan.jerk_limited)
     planned_curvature = -VM.calc_curvature(math.radians(plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
-    planned_out_of_bounds = not minimum_curvature - 1e-9 <= planned_curvature <= maximum_curvature + 1e-9
     planned_lateral_accel = planned_curvature * CS.vEgo ** 2
     measured_lateral_accel = measured_curvature * CS.vEgo ** 2
     target_angle = target.angle_deg - params.angleOffsetDeg
@@ -317,7 +323,10 @@ class PalisadeRackTrajectoryController:
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
-    feedforward_torque = 0.0 if self.driver_override_resume else -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
+    feedforward_torque = (
+      0.0 if self.driver_override_resume
+      else -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
+    )
 
     curvature_per_degree = -VM.calc_curvature(math.radians(1.0), CS.vEgo, 0.0)
     lateral_accel_per_degree = curvature_per_degree * CS.vEgo ** 2
@@ -347,10 +356,6 @@ class PalisadeRackTrajectoryController:
     torque = float(np.clip(raw_torque, -1.0, 1.0))
     torque_limited = torque != raw_torque
     planned_angle = plan.position_deg - params.angleOffsetDeg
-    if ((measured_out_of_bounds and torque * measured_curvature < 0.0)
-        or (planned_out_of_bounds and torque * planned_curvature < 0.0)):
-      torque_limited |= torque != 0.0
-      torque = 0.0
     if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
       torque_limited |= torque != 0.0
       torque = 0.0
