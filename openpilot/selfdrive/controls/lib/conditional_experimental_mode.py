@@ -65,6 +65,10 @@ STOP_ENTRY_FILTER_THRESHOLD = 0.55
 STOP_RELEASE_FILTER_THRESHOLD = 0.25
 STOP_ENTRY_DEBOUNCE_S = 0.20
 STOP_RELEASE_HYSTERESIS_S = 0.75
+STOP_RELEASE_PATH_MIN_DISTANCE_M = 20.0
+STOP_RELEASE_TERMINAL_SPEED_MIN = 3.0
+STOP_OPEN_FILTER_TIME_CONSTANT_S = 0.30
+STOP_OPEN_FILTER_THRESHOLD = 0.70
 FORCE_STOP_QUALIFY_S = 1.0
 FORCE_STOP_COMMIT_DISTANCE_M = 100.0
 FORCE_STOP_WORLD_TOLERANCE_M = 5.0
@@ -129,6 +133,22 @@ def model_trajectories_complete_and_finite(model: Any) -> bool:
   position_x = getattr(getattr(model, "position", None), "x", ())
   velocity_x = getattr(getattr(model, "velocity", None), "x", ())
   return len(position_x) == ModelConstants.IDX_N and len(velocity_x) == ModelConstants.IDX_N and model_trajectories_finite(model)
+
+
+def model_stop_release_open(model: Any) -> bool:
+  """Strong launch sample; callers still own temporal confirmation."""
+  if not model_trajectories_complete_and_finite(model):
+    return False
+  action = getattr(model, "action", None)
+  path_end_m = _last_finite(getattr(getattr(model, "position", None), "x", ()), STOP_TRAJECTORY_MIN_POINTS)
+  terminal_speed = _last_finite(getattr(getattr(model, "velocity", None), "x", ()), STOP_TRAJECTORY_MIN_POINTS)
+  desired_accel = _optional_finite_float(getattr(action, "desiredAcceleration", None))
+  return bool(
+    not getattr(action, "shouldStop", True) and
+    desired_accel is not None and desired_accel > STOP_EARLY_DESIRED_ACCEL_MAX and
+    path_end_m is not None and path_end_m >= STOP_RELEASE_PATH_MIN_DISTANCE_M and
+    terminal_speed is not None and terminal_speed >= STOP_RELEASE_TERMINAL_SPEED_MIN
+  )
 
 
 def _finite_float(value: Any, default: float = 0.0) -> float:
@@ -302,11 +322,13 @@ class ConditionalExperimentalMode:
     self.control_dt = control_dt
     self.model_dt = model_dt
     self.intent_filter = FirstOrderFilter(0.0, STOP_FILTER_TIME_CONSTANT_S, model_dt)
+    self.stop_release_filter = FirstOrderFilter(0.0, STOP_OPEN_FILTER_TIME_CONSTANT_S, model_dt)
     self.reset()
 
   def reset(self) -> None:
     self.experimental_mode = False
     self.intent_filter.x = 0.0
+    self.stop_release_filter.x = 0.0
     self.last_observation = StopIntentObservation()
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
@@ -328,7 +350,7 @@ class ConditionalExperimentalMode:
 
   @property
   def stop_latched(self) -> bool:
-    return self.experimental_mode
+    return self.experimental_mode and self.stop_release_filter.x <= STOP_OPEN_FILTER_THRESHOLD
 
   @property
   def stop_qualified(self) -> bool:
@@ -342,6 +364,7 @@ class ConditionalExperimentalMode:
 
   def _clear_evidence(self) -> None:
     self.intent_filter.x = 0.0
+    self.stop_release_filter.x = 0.0
     self.last_observation = StopIntentObservation()
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
@@ -413,6 +436,12 @@ class ConditionalExperimentalMode:
       self._force_stop_qualified_elapsed = 0.0
       self._force_stop_tracked_endpoint = None
     raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
+    release_safe = model_valid and not entry_veto
+    if raw_stop or not release_safe:
+      self.stop_release_filter.x = 0.0
+    else:
+      release_open = model_stop_release_open(model)
+      self.stop_release_filter.update(1.0 if release_open else 0.0)
     if raw_stop:
       self._intent_hold_remaining = STOP_INTENT_HOLD_S
     # A filter-only hint can shorten later entry latency, but cannot sustain an
@@ -471,6 +500,7 @@ class ConditionalExperimentalMode:
     if raw_lead_present and not model_updated and not self.experimental_mode:
       self._clear_evidence()
     elif not model_valid or not radar_valid or raw_lead_present:
+      self.stop_release_filter.x = 0.0
       self._lead_release_active = False
       self._force_stop_qualified_elapsed = 0.0
       self._force_stop_tracked_endpoint = None
