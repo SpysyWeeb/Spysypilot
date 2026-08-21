@@ -6,7 +6,7 @@ from openpilot.cereal import log
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
-from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
+from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX, MODEL_LEAD_PROB_MIN
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function, ModelConstants
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU, RADAR_TO_CAMERA
@@ -26,7 +26,7 @@ EXPORT_DIR = os.path.join(LONG_MPC_DIR, "c_generated_code")
 JSON_FILE = os.path.join(LONG_MPC_DIR, "acados_ocp_long.json")
 
 LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
-MPC_SOURCES = (LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1, LongitudinalPlanSource.cruise)
+MPC_SOURCES = (LongitudinalPlanSource.lead0, LongitudinalPlanSource.lead1, LongitudinalPlanSource.stop)
 
 X_DIM = 3
 U_DIM = 1
@@ -65,7 +65,9 @@ LEAD_THREE_OUTSIDE = 2.6
 LEAD_THREE_X_STD_MAX = 10.0
 LEAD_THREE_Y_STD_MAX = 3.0
 LEAD_THREE_V_STD_MAX = 10.0
-LEAD_THREE_V_DELTA_MAX = 5.0
+ASSOCIATED_LEAD_X_STD_MAX = 50.0
+ASSOCIATED_LEAD_V_STD_MAX = 10.0
+MODEL_LEAD_V_DELTA_MAX = 5.0
 LEAD_THREE_X_ANCHOR_DELTA_MAX = 0.5
 LEAD_THREE_X_SHAPE_DELTA_MAX = 2.0
 LEAD_THREE_Y_DELTA_MAX = 0.5
@@ -114,6 +116,53 @@ def get_stopped_equivalence_factor(v_lead):
 
 def get_safe_obstacle_distance(v_ego, t_follow):
   return (v_ego**2) / (2 * COMFORT_BRAKE) + t_follow * v_ego + STOP_DISTANCE
+
+
+def get_valid_model_lead_trajectory(model_lead, radar_lead):
+  """Return one radar-associated, physically consistent model lead future."""
+  if model_lead is None or radar_lead is None or not radar_lead.present:
+    return None
+  try:
+    x_model = np.asarray(model_lead.x, dtype=np.float64)
+    x_std = np.asarray(model_lead.xStd, dtype=np.float64)
+    v_model = np.asarray(model_lead.v, dtype=np.float64)
+    v_std = np.asarray(model_lead.vStd, dtype=np.float64)
+    t_model = np.asarray(model_lead.t, dtype=np.float64)
+    model_prob = float(model_lead.prob)
+    radar_model_prob = float(radar_lead.modelProb)
+    radar_distance = float(radar_lead.dRel)
+    radar_speed = float(radar_lead.vLead)
+  except (AttributeError, TypeError, ValueError):
+    return None
+
+  valid = (
+    np.isfinite(model_prob)
+    and MODEL_LEAD_PROB_MIN < model_prob <= 1.0
+    and np.isfinite(radar_model_prob)
+    and MODEL_LEAD_PROB_MIN < radar_model_prob <= 1.0
+    and np.isfinite(radar_distance)
+    and radar_distance > 0.0
+    and np.isfinite(radar_speed)
+    and radar_speed >= 0.0
+    and all(a.shape == LEAD_T_IDXS_MODEL.shape for a in (x_model, x_std, v_model, v_std, t_model))
+    and all(np.all(np.isfinite(a)) for a in (x_model, x_std, v_model, v_std, t_model))
+    and np.array_equal(t_model, LEAD_T_IDXS_MODEL)
+    and np.all(x_std >= 0.0)
+    and np.max(x_std) < ASSOCIATED_LEAD_X_STD_MAX
+    and np.all(v_std >= 0.0)
+    and np.max(v_std) < ASSOCIATED_LEAD_V_STD_MAX
+    and np.all(np.diff(x_model) >= 0.0)
+    and np.all(v_model >= 0.0)
+    and np.max(np.abs(np.gradient(x_model, LEAD_T_IDXS_MODEL, edge_order=2) - v_model)) <= MODEL_LEAD_V_DELTA_MAX
+  )
+  if not valid:
+    return None
+
+  x_lead = radar_distance + x_model - x_model[0]
+  v_lead = radar_speed + v_model - v_model[0]
+  if np.max(np.abs(np.gradient(x_lead, LEAD_T_IDXS_MODEL, edge_order=2) - v_lead)) > MODEL_LEAD_V_DELTA_MAX:
+    return None
+  return x_model, v_model
 
 def gen_long_model():
   model = AcadosModel()
@@ -274,6 +323,8 @@ class LongitudinalMpc:
     self.lead_three_signature = None
     self.lead_three_ego_distance = 0.0
     self.lead_three_ego_speed = 0.0
+    self.lead0_policy_active = False
+    self.lead0_policy_adaptive = False
     self.source = LongitudinalPlanSource.cruise
     self.solution_status = 0
     # timers
@@ -302,7 +353,11 @@ class LongitudinalMpc:
     # BLoTv2 changes the cost of changing acceleration, never acceleration
     # constraints. Bound the runtime input so an invalid policy cannot silently
     # remove the solver's smoothness cost or make it stiffer than stock.
-    jerk_factor_scale = float(np.clip(jerk_factor_scale, 0.3, 1.0))
+    try:
+      jerk_factor_scale = float(jerk_factor_scale)
+    except (TypeError, ValueError):
+      jerk_factor_scale = 1.0
+    jerk_factor_scale = float(np.clip(jerk_factor_scale, 0.3, 1.0)) if np.isfinite(jerk_factor_scale) else 1.0
     jerk_factor = get_jerk_factor(personality) * jerk_factor_scale
     a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
     cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
@@ -350,24 +405,12 @@ class LongitudinalMpc:
 
   def process_lead_model(self, model_lead, radar_lead):
     """Use a finite model lead trajectory anchored to radar, else exact stock fallback."""
-    trajectory_valid = False
-    if model_lead is not None and radar_lead is not None and radar_lead.present:
-      try:
-        x_model = np.asarray(model_lead.x, dtype=np.float64)
-        v_model = np.asarray(model_lead.v, dtype=np.float64)
-        trajectory_valid = (
-          float(model_lead.prob) > 0.5
-          and x_model.shape == LEAD_T_IDXS_MODEL.shape
-          and v_model.shape == LEAD_T_IDXS_MODEL.shape
-          and np.all(np.isfinite(x_model))
-          and np.all(np.isfinite(v_model))
-        )
-      except (AttributeError, TypeError, ValueError):
-        trajectory_valid = False
-
-    if not trajectory_valid:
+    trajectory = get_valid_model_lead_trajectory(model_lead, radar_lead)
+    if trajectory is None:
       return self.process_lead(radar_lead)
 
+    assert radar_lead is not None
+    x_model, v_model = trajectory
     v_ego = self.x0[1]
     x_lead = float(radar_lead.dRel) + x_model - x_model[0]
     v_lead = float(radar_lead.vLead) + v_model - v_model[0]
@@ -430,7 +473,7 @@ class LongitudinalMpc:
 
     x_lead = x_model - RADAR_TO_CAMERA
     v_lead = np.clip(np.gradient(x_model, LEAD_T_IDXS_MODEL, edge_order=2), 0.0, 1e8)
-    if np.max(np.abs(v_lead - v_model)) > LEAD_THREE_V_DELTA_MAX:
+    if np.max(np.abs(v_lead - v_model)) > MODEL_LEAD_V_DELTA_MAX:
       return None
     min_x_lead = MIN_X_LEAD_FACTOR * (self.x0[1] + v_lead[0]) * (self.x0[1] - v_lead[0]) / (-ACCEL_MIN * 2)
     x_lead[0] = max(x_lead[0], min_x_lead)
@@ -440,7 +483,8 @@ class LongitudinalMpc:
     return np.column_stack((x_lead, v_lead))
 
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard,
-             t_follow=None, model_leads=None, model_position=None, allow_third_lead=False, v_ego=None, stop_x=None):
+             t_follow=None, model_leads=None, model_position=None, allow_third_lead=False, v_ego=None, stop_x=None,
+             prev_accel_constraint=None, lead0_policy_adaptive=False):
     if t_follow is None:
       t_follow = get_T_FOLLOW(personality)
 
@@ -507,7 +551,7 @@ class LongitudinalMpc:
 
     # The planner retains this obstacle for the lifetime of the committed stop.
     stop_obstacle = np.full(N + 1, np.inf)
-    if stop_x is not None and np.isfinite(stop_x) and stop_x + STOP_DISTANCE > 0.0:
+    if stop_x is not None and np.isfinite(stop_x) and stop_x + STOP_DISTANCE >= 0.0:
       stop_obstacle.fill(float(stop_x) + STOP_DISTANCE)
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, stop_obstacle])
     if lead_xv_2 is not None and self.lead_three_confirm + 1e-9 >= LEAD_THREE_CONFIRM:
@@ -516,7 +560,15 @@ class LongitudinalMpc:
       x_obstacles = np.column_stack([x_obstacles, lead_2_obstacle])
     else:
       lead_three_active = False
+    previous_lead0_policy_adaptive = self.lead0_policy_adaptive
     self.source = LongitudinalPlanSource.lead2 if lead_three_active else MPC_SOURCES[np.argmin(x_obstacles[0])]
+    self.lead0_policy_active = self.source == LongitudinalPlanSource.lead0
+    if prev_accel_constraint is not None and not self.lead0_policy_active:
+      if previous_lead0_policy_adaptive:
+        self.a_prev.fill(self.x0[2])
+      t_follow = get_T_FOLLOW(personality)
+      self.set_weights(prev_accel_constraint, personality=personality)
+    self.lead0_policy_adaptive = self.lead0_policy_active and lead0_policy_adaptive
 
     self.yref[:,:] = 0.0
     for i in range(N):

@@ -1,11 +1,13 @@
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
 from openpilot.cereal import log
 from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MAX, ForceStops,
-                                                           GAS_OVERRIDE_S, LATCH_SETBACK, LATCH_THRESHOLD)
+                                                           GAS_OVERRIDE_S, LATCH_SETBACK, LATCH_THRESHOLD,
+                                                           STOP_POSITION_HOLD_S)
 from openpilot.selfdrive.controls.lib.force_stops import MPC_PROFILE_OFFSET_M
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, LongitudinalMpc, LongitudinalPlanSource
@@ -25,14 +27,16 @@ class FakeSubMaster(dict):
   def __init__(self, *, model_length=20.0, should_stop=True, desired_accel=-0.6,
                v_ego=10.0, lead_present=False, model_valid=True, terminal_speed=0.0,
                conditional_stop_qualified=False, qualified_distance=0.0,
-               model_mono_time=2_000_000_000, qualified_model_mono_time=2_000_000_000):
+               model_mono_time=2_000_000_000, qualified_model_mono_time=2_000_000_000,
+               conditional_stop_latched=False):
     super().__init__(
       carState=SimpleNamespace(vEgo=v_ego, gasPressed=False, brakePressed=False, standstill=False,
                                leftBlinker=False, rightBlinker=False),
       selfdriveState=SimpleNamespace(enabled=True, experimentalMode=True,
                                      conditionalStopQualified=conditional_stop_qualified,
                                      conditionalStopDistance=qualified_distance,
-                                     conditionalStopModelMonoTime=qualified_model_mono_time),
+                                     conditionalStopModelMonoTime=qualified_model_mono_time,
+                                     conditionalStopLatched=conditional_stop_latched),
       radarState=SimpleNamespace(
         leadOne=SimpleNamespace(present=lead_present),
         leadTwo=SimpleNamespace(present=False),
@@ -107,6 +111,27 @@ def test_cem_qualified_stop_commits_before_classic_horizon():
 
   assert force_stops.forcing
   assert math.isclose(force_stops.remaining, 95.0 - LATCH_SETBACK)
+
+
+def test_widened_latch_requires_stable_braking_but_classic_latch_does_not():
+  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=-0.8)
+  force_stops = ForceStops(dt=DT)
+  for _ in range(30):
+    force_stops.update(sm)
+  assert force_stops.forcing
+
+  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=0.0)
+  force_stops = ForceStops(dt=DT)
+  while force_stops.detect_filter.x < LATCH_THRESHOLD:
+    force_stops.update(sm)
+  sm["modelV2"].action.desiredAcceleration = -0.8
+  force_stops.update(sm)
+  assert not force_stops.forcing
+
+  sm["modelV2"].action.desiredAcceleration = 0.0
+  sm["modelV2"].position.x[-1] = 30.0
+  force_stops.update(sm)
+  assert force_stops.forcing
 
 
 def test_cem_qualified_stop_requires_current_valid_bound_authority():
@@ -212,7 +237,7 @@ def test_committed_stop_is_the_mpc_obstacle_until_final_landing():
   for _ in range(4):
     mpc.update(radar_state, stop_x=30.0)
   np.testing.assert_allclose(mpc.params[:, 2], 30.0 + STOP_DISTANCE)
-  assert mpc.source == LongitudinalPlanSource.cruise
+  assert mpc.source == LongitudinalPlanSource.stop
   assert mpc.a_solution[1] < 0.0
   assert mpc.crash_cnt == 0
 
@@ -225,11 +250,13 @@ def test_committed_stop_is_the_mpc_obstacle_until_final_landing():
   assert mpc.source == LongitudinalPlanSource.lead1
   assert np.all(mpc.params[:, 2] <= 30.0 + STOP_DISTANCE)
 
-  for active_stop_x in (-STOP_DISTANCE + 0.25, 0.0, STOP_DISTANCE):
+  for active_stop_x in (-STOP_DISTANCE, -STOP_DISTANCE + 0.25, 0.0, STOP_DISTANCE):
     mpc.update(radar_state, stop_x=active_stop_x)
     np.testing.assert_allclose(mpc.params[:, 2], active_stop_x + STOP_DISTANCE)
+    assert mpc.solution_status == 0
+    assert np.all(np.isfinite(mpc.a_solution))
 
-  for released_stop_x in (-STOP_DISTANCE, -STOP_DISTANCE - 0.25, float("-inf"), float("inf"), float("nan")):
+  for released_stop_x in (-STOP_DISTANCE - 0.25, float("-inf"), float("inf"), float("nan")):
     mpc.update(radar_state, stop_x=released_stop_x)
     np.testing.assert_allclose(mpc.params[:, 2], baseline_obstacle)
 
@@ -282,13 +309,33 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
   np.testing.assert_allclose(planner.mpc.params[:, 2], planner.force_stops.remaining + STOP_DISTANCE)
   assert planner.output_should_stop
 
+  sm["carState"].vEgo = 1.0
+  planner.force_stops.remaining = -STOP_DISTANCE - 1.0
+  planner.force_stops.position_hold_remaining = 1.0
+  planner.update(sm)
+  assert planner.force_stops.forcing
+  np.testing.assert_allclose(planner.mpc.params[:, 2], 0.0)
+
   sm["selfdriveState"].experimentalMode = False
   planner.update(sm)
   assert not planner.force_stops.forcing
   assert np.all(planner.mpc.params[:, 2] > STOP_DISTANCE)
 
+  sm["selfdriveState"].experimentalMode = True
+  sm["selfdriveState"].conditionalStopLatched = True
+  sm["carState"].vEgo = 0.2
+  sm["carState"].standstill = True
+  sm["modelV2"].action.desiredAcceleration = 0.0
+  planner.a_cruise = 1.0
+  planner.output_a_target = 1.0
+  planner.v_desired_filter.x = 0.2
+  with patch("openpilot.selfdrive.controls.lib.longitudinal_planner.get_accel_from_plan", return_value=0.2):
+    planner.update(sm)
+  assert not planner.force_stops.forcing
+  assert planner.output_should_stop
 
-def test_force_stops_releases_at_mpc_obstacle_boundary():
+
+def test_force_stops_retains_and_clamps_the_crossed_mpc_obstacle():
   force_stops = ForceStops(dt=1.0)
   sm = FakeSubMaster(model_length=20.0, v_ego=1.0, should_stop=False, desired_accel=0.0)
   force_stops.forcing = True
@@ -296,9 +343,13 @@ def test_force_stops_releases_at_mpc_obstacle_boundary():
   force_stops.position_hold_remaining = 1.0
   force_stops.remaining = -STOP_DISTANCE + sm["carState"].vEgo
 
+  assert force_stops.update(sm) == 0.0
+  assert force_stops.forcing
+  assert force_stops.remaining == -STOP_DISTANCE
+
+  sm["selfdriveState"].experimentalMode = False
   assert math.isinf(force_stops.update(sm))
   assert not force_stops.forcing
-  assert force_stops.remaining == 0.0
 
 
 def test_incomplete_early_trajectory_cannot_shape():
@@ -393,7 +444,7 @@ def test_latched_position_survives_brief_model_clear():
   hold_frames = int(0.5 / DT)
   assert all(math.isfinite(force_stops.update(sm)) for _ in range(hold_frames))
   cap = 0.0
-  for _ in range(int(2.0 / DT)):
+  for _ in range(int(STOP_POSITION_HOLD_S / DT) + 1):
     cap = force_stops.update(sm)
   assert math.isinf(cap)
 
