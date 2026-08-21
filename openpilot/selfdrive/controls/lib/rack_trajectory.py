@@ -1,28 +1,73 @@
-"""Minimal Palisade rack-trajectory execution controller."""
+"""Palisade rack-trajectory execution controller."""
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable
 
 import numpy as np
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LATERAL_ACCEL_NO_ROLL, MIN_SPEED
+from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import (
+  MotionLimits,
+  PathTarget,
+  RackPlan,
+  RackTrajectoryOutput,
+  RackTarget,
+  RESPONSE_TIME_S,
+)
+from openpilot.selfdrive.controls.lib.rack_trajectory_planner import JerkLimitedRackPlanner, _clip, _required_rate_headroom
+from openpilot.selfdrive.controls.lib.rack_trajectory_reference import (
+  REFERENCE_MAX_RATE_DEG_S,
+  REFERENCE_PERSISTENT_RC_S,
+  REFERENCE_REVERSAL_DISTANCE_DEG,
+  REFERENCE_REVERSAL_PERSISTENCE_S,
+  REFERENCE_REVERSAL_RC_S,
+  RackReferenceGovernor,
+  model_path_target,
+)
+
+__all__ = (
+  "DT",
+  "PREVIEW_S",
+  "RESPONSE_TIME_S",
+  "RATE_HORIZON_S",
+  "MAX_FEEDBACK_TORQUE",
+  "MAX_TURN_IN_FEEDBACK_TORQUE",
+  "MAX_DRIVER_ASSIST_TORQUE",
+  "REFERENCE_REVERSAL_DISTANCE_DEG",
+  "REFERENCE_REVERSAL_PERSISTENCE_S",
+  "REFERENCE_REVERSAL_RC_S",
+  "REFERENCE_PERSISTENT_RC_S",
+  "REFERENCE_MAX_RATE_DEG_S",
+  "STATUS_INACTIVE",
+  "STATUS_ACTIVE",
+  "STATUS_DRIVER_OVERRIDE",
+  "STATUS_NO_MODEL",
+  "STATUS_INVALID_VEHICLE_STATE",
+  "STATUS_STALE_MODEL",
+  "STATUS_INVALID_ACTION_TIME",
+  "STATUS_INVALID_PATH",
+  "STATUS_INVALID_OUTPUT",
+  "STATUS_INVALID_PLANNER_STATE",
+  "PathTarget",
+  "MotionLimits",
+  "RackTarget",
+  "RackPlan",
+  "RackTrajectoryOutput",
+  "JerkLimitedRackPlanner",
+  "RackReferenceGovernor",
+  "model_path_target",
+  "PalisadeRackTrajectoryController",
+)
 
 DT = .01
 PREVIEW_S = .5
-RESPONSE_TIME_S = .4
 RATE_HORIZON_S = .1
 MAX_FEEDBACK_TORQUE = .35
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .35
-REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
-REFERENCE_REVERSAL_PERSISTENCE_S = .15
-REFERENCE_REVERSAL_RC_S = .3
-REFERENCE_PERSISTENT_RC_S = .05
-REFERENCE_MAX_RATE_DEG_S = 5.0
 
 STATUS_INACTIVE = 0
 STATUS_ACTIVE = 1
@@ -46,285 +91,6 @@ _STOCK_KP = np.asarray([250.0, 120.0, 65.0, 30.0, 11.5, 5.5, 3.5, 2.0, .8])
 _LOW_SPEED_KP_END = float(np.float32(15.0 * 0.44704))
 _LOW_SPEED_KP_SPEEDS = np.asarray([2.0, 3.0, 5.0, _LOW_SPEED_KP_END])
 _LOW_SPEED_KP = np.asarray([65.0, 10.0, 10.0, np.interp(_LOW_SPEED_KP_END, _STOCK_KP_SPEEDS, _STOCK_KP)])
-
-
-def _clip(value: float, limit: float) -> float:
-  return max(-limit, min(limit, value))
-
-
-def _rate_viable_acceleration(headroom: float, jerk: float, dt: float) -> float:
-  if headroom <= 0.0:
-    return 0.0
-  jerk_step = jerk * dt
-  return -jerk_step + math.sqrt(jerk_step * jerk_step + 2.0 * jerk * headroom)
-
-
-def _required_rate_headroom(rate: float, acceleration: float, jerk: float, dt: float) -> float:
-  outward_acceleration = abs(acceleration) if rate * acceleration > 0.0 else 0.0
-  return outward_acceleration * dt + outward_acceleration * outward_acceleration / (2.0 * jerk)
-
-
-@dataclass(frozen=True, slots=True)
-class PathTarget:
-  curvature: float
-  speed_mps: float
-  angle_deg: float
-  rate_deg_s: float
-
-
-@dataclass(frozen=True, slots=True)
-class MotionLimits:
-  max_rate_deg_s: float
-  max_acceleration_deg_s2: float
-  max_jerk_deg_s3: float
-  response_time_s: float = RESPONSE_TIME_S
-
-
-@dataclass(frozen=True, slots=True)
-class RackTarget:
-  position_deg: float
-  rate_deg_s: float
-
-
-@dataclass(frozen=True, slots=True)
-class RackPlan:
-  position_deg: float
-  rate_deg_s: float
-  acceleration_deg_s2: float
-  rate_limited: bool
-  acceleration_limited: bool
-  jerk_limited: bool
-
-
-@dataclass(frozen=True, slots=True)
-class RackTrajectoryOutput:
-  torque: float
-  target_curvature: float
-  target_angle_deg: float
-  target_rate_deg_s: float
-  planned_angle_deg: float
-  planned_rate_deg_s: float
-  planned_acceleration_deg_s2: float
-  measured_rate_deg_s: float
-  lateral_accel_error: float
-  rate_error_deg_s: float
-  position_feedback_torque: float
-  rate_feedback_torque: float
-  feedforward_torque: float
-  desired_lateral_accel: float
-  actual_lateral_accel: float
-  desired_lateral_jerk: float
-  feedback_torque: float
-  feedback_limited: bool
-  motion_limited: bool
-  torque_limited: bool
-  rate_limit_deg_s: float
-  acceleration_limit_deg_s2: float
-  jerk_limit_deg_s3: float
-  profile_transition: bool
-  path_limited: bool
-  infeasible: bool
-  saturated: bool
-
-
-def model_path_target(
-  *,
-  native_times_s: Sequence[float],
-  orientation_rates_z: Sequence[float],
-  velocities_x: Sequence[float],
-  scalar_curvature: float,
-  scalar_action_plan_s: float,
-  plan_time_now_s: float,
-  measured_v_ego: float,
-  query_time_s: float,
-  vehicle_model,
-  roll_rad: float,
-  angle_offset_deg: float,
-) -> PathTarget:
-  scalar = float(scalar_curvature)
-  measured_speed = float(measured_v_ego)
-  if not math.isfinite(scalar) or not math.isfinite(measured_speed) or measured_speed < 0.0:
-    raise ValueError("invalid scalar path target")
-
-  count = len(native_times_s)
-  valid = count >= 2 and len(orientation_rates_z) == count and len(velocities_x) == count
-  times: list[float] = []
-  curvatures: list[float] = []
-  speeds: list[float] = []
-  previous_time = -math.inf
-  if valid:
-    for native_time, orientation_rate, planned_speed in zip(
-      native_times_s, orientation_rates_z, velocities_x, strict=True,
-    ):
-      time = float(native_time)
-      speed = float(planned_speed)
-      rate = float(orientation_rate)
-      if not all(math.isfinite(value) for value in (time, speed, rate)) or time < 0.0 or time <= previous_time:
-        valid = False
-        break
-      if speed <= 0.0:
-        break
-      times.append(time)
-      curvatures.append(rate / speed)
-      speeds.append(speed)
-      previous_time = time
-
-  if not valid or len(times) < 2:
-    raise ValueError("invalid model path")
-  if not all(times[0] <= float(query) <= times[-1] for query in (
-    scalar_action_plan_s, plan_time_now_s, query_time_s,
-  )):
-    raise ValueError("model path does not cover requested timestamps")
-
-  def angle_at(query: float) -> tuple[float, float, float]:
-    plan_curvature = float(np.interp(query, times, curvatures))
-    anchor_curvature = float(np.interp(float(scalar_action_plan_s), times, curvatures))
-    curvature = scalar + plan_curvature - anchor_curvature
-    speed = max(.1, measured_speed + float(np.interp(query, times, speeds)) - float(np.interp(float(plan_time_now_s), times, speeds)))
-    angle = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, speed, roll_rad)) + angle_offset_deg
-    return curvature, speed, angle
-
-  query = float(query_time_s)
-  curvature, speed, angle = angle_at(query)
-  before = max(times[0], query - .05)
-  after = min(times[-1], query + .05)
-  rate = (angle_at(after)[2] - angle_at(before)[2]) / (after - before) if after > before else 0.0
-  if not all(math.isfinite(value) for value in (curvature, speed, angle, rate)):
-    raise ValueError("non-finite path target")
-  return PathTarget(curvature, speed, angle, rate)
-
-
-class JerkLimitedRackPlanner:
-  def __init__(self, position_deg: float, rate_deg_s: float = 0.0) -> None:
-    self.position_deg = float(position_deg)
-    self.rate_deg_s = float(rate_deg_s)
-    self.acceleration_deg_s2 = 0.0
-
-  def update(self, target: RackTarget, limits: MotionLimits, dt: float,
-             desired_acceleration_override: float | None = None) -> RackPlan:
-    natural_frequency = 2.0 / limits.response_time_s
-    desired_acceleration_raw = float(desired_acceleration_override) if desired_acceleration_override is not None else (
-      natural_frequency * natural_frequency * (target.position_deg - self.position_deg)
-      + 2.0 * natural_frequency * (target.rate_deg_s - self.rate_deg_s)
-    )
-    desired_acceleration = _clip(desired_acceleration_raw, limits.max_acceleration_deg_s2)
-    jerk_step = limits.max_jerk_deg_s3 * dt
-    jerk_lower = self.acceleration_deg_s2 - jerk_step
-    jerk_upper = self.acceleration_deg_s2 + jerk_step
-    rate_lower = -_rate_viable_acceleration(limits.max_rate_deg_s + self.rate_deg_s, limits.max_jerk_deg_s3, dt)
-    rate_upper = _rate_viable_acceleration(limits.max_rate_deg_s - self.rate_deg_s, limits.max_jerk_deg_s3, dt)
-    lower = max(-limits.max_acceleration_deg_s2, jerk_lower, rate_lower)
-    upper = min(limits.max_acceleration_deg_s2, jerk_upper, rate_upper)
-    if lower > upper + 1e-9:
-      raise ValueError("rack planner outside motion envelope")
-    acceleration = max(lower, min(upper, desired_acceleration))
-    rate = self.rate_deg_s + acceleration * dt
-    position = self.position_deg + .5 * (self.rate_deg_s + rate) * dt
-    self.position_deg, self.rate_deg_s, self.acceleration_deg_s2 = position, rate, acceleration
-    return RackPlan(
-      position, rate, acceleration,
-      desired_acceleration < rate_lower or desired_acceleration > rate_upper,
-      desired_acceleration != desired_acceleration_raw,
-      desired_acceleration < jerk_lower or desired_acceleration > jerk_upper,
-    )
-
-
-class RackReferenceGovernor:
-  """Smooth short, small rack-reference reversals before trajectory planning."""
-
-  def __init__(self) -> None:
-    self.accepted: RackTarget | None = None
-    self.last_model_timestamp_ns: int | None = None
-    self.last_replan_position_deg: float | None = None
-    self.direction = 0
-    self.reversal_start_model_ns: int | None = None
-    self.reversal_s = 0.0
-    self.active = False
-    self.limited = False
-
-  def reset(self) -> None:
-    self.accepted = None
-    self.last_model_timestamp_ns = None
-    self.last_replan_position_deg = None
-    self.direction = 0
-    self.reversal_start_model_ns = None
-    self.reversal_s = 0.0
-    self.active = False
-    self.limited = False
-
-  @staticmethod
-  def _sign(value: float) -> int:
-    return 1 if value > 1e-9 else -1 if value < -1e-9 else 0
-
-  def _accept(self, target: RackTarget) -> RackTarget:
-    self.accepted = target
-    self.reversal_start_model_ns = None
-    self.reversal_s = 0.0
-    self.active = False
-    self.limited = False
-    return target
-
-  def update(self, target: RackTarget, planner: JerkLimitedRackPlanner,
-             neutral_position_deg: float, model_timestamp_ns: int, dt: float,
-             bypass: bool = False) -> RackTarget:
-    timestamp_ns = int(model_timestamp_ns)
-    if self.accepted is None:
-      self.last_model_timestamp_ns = timestamp_ns
-      self.last_replan_position_deg = target.position_deg
-      return self._accept(target)
-
-    assert self.last_model_timestamp_ns is not None and self.last_replan_position_deg is not None
-    new_model = timestamp_ns != self.last_model_timestamp_ns
-    raw_change_direction = self._sign(target.position_deg - self.last_replan_position_deg) if new_model else 0
-    if bypass:
-      self.last_model_timestamp_ns = timestamp_ns
-      self.last_replan_position_deg = target.position_deg
-      self.direction = 0
-      return self._accept(target)
-    plan_error = abs(target.position_deg - planner.position_deg)
-    filter_error = abs(target.position_deg - self.accepted.position_deg)
-    crosses_neutral = (
-      (self.accepted.position_deg - neutral_position_deg) * (target.position_deg - neutral_position_deg) <= 0.0
-    )
-    coherent_motion = (
-      plan_error >= REFERENCE_REVERSAL_DISTANCE_DEG
-      or filter_error >= REFERENCE_REVERSAL_DISTANCE_DEG
-      or abs(target.rate_deg_s) >= REFERENCE_MAX_RATE_DEG_S
-      or crosses_neutral
-    )
-    reversal = new_model and raw_change_direction != 0 and self.direction != 0 and raw_change_direction != self.direction
-    if coherent_motion:
-      if new_model:
-        self.last_model_timestamp_ns = timestamp_ns
-        self.last_replan_position_deg = target.position_deg
-        if raw_change_direction:
-          self.direction = raw_change_direction
-      return self._accept(target)
-    if reversal:
-      self.active = True
-      self.reversal_start_model_ns = timestamp_ns
-      self.reversal_s = 0.0
-    if new_model:
-      self.last_model_timestamp_ns = timestamp_ns
-      self.last_replan_position_deg = target.position_deg
-      if raw_change_direction:
-        self.direction = raw_change_direction
-    if not self.active:
-      return self._accept(target)
-
-    assert self.reversal_start_model_ns is not None
-    self.reversal_s = max(0.0, (timestamp_ns - self.reversal_start_model_ns) * 1e-9)
-    rc = REFERENCE_PERSISTENT_RC_S if self.reversal_s >= REFERENCE_REVERSAL_PERSISTENCE_S else REFERENCE_REVERSAL_RC_S
-    alpha = dt / (rc + dt)
-    self.accepted = RackTarget(
-      self.accepted.position_deg + alpha * (target.position_deg - self.accepted.position_deg),
-      self.accepted.rate_deg_s + alpha * (target.rate_deg_s - self.accepted.rate_deg_s),
-    )
-    self.limited = (
-      abs(self.accepted.position_deg - target.position_deg) > 1e-9
-      or abs(self.accepted.rate_deg_s - target.rate_deg_s) > 1e-9
-    )
-    return self.accepted
 
 
 class PalisadeRackTrajectoryController:
