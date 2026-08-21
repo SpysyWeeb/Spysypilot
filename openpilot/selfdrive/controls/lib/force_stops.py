@@ -18,6 +18,7 @@ import math
 
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.modeld.constants import ModelConstants
 
 MODEL_STOP_TIME = 3.0     # s, path endpoint within v_ego * this reads as "model plans to stop"
 LATCH_STOP_TIME = 3.25    # s, commit braking evidence once its filtered stop intent is stable
@@ -58,6 +59,10 @@ MIN_STOP_LENGTH = 3.0     # m, floor of the detector window, keeps it alive at c
 DETECT_RC = 1.0           # s, filter time constant on the (flickery) detector
 LATCH_THRESHOLD = 0.55    # filtered detector level that latches a forced stop
 RELEASE_THRESHOLD = 0.30  # hysteresis: unlatch below this (the model wants to go, e.g. green light)
+OPEN_RELEASE_PATH_MIN = 20.0
+OPEN_RELEASE_TERMINAL_SPEED_MIN = 3.0
+OPEN_RELEASE_RC = 0.30
+OPEN_RELEASE_THRESHOLD = 0.70
 LEAD_RC = 1.0             # s, filter on radar lead status
 LEAD_GATE = 0.45          # filtered lead level above which stopping is the lead logic's job
 RAMP_TIME = 3.0           # s, speed cap = remaining distance / this (linear-in-distance ramp to 0)
@@ -78,12 +83,43 @@ DOWN_DEADBAND = 1.0       # m
 NO_CAP = float('inf')
 
 
+def _model_stop_release_inputs(model):
+  try:
+    position = [float(value) for value in model.position.x]
+    velocity = [float(value) for value in model.velocity.x]
+    desired_accel = float(model.action.desiredAcceleration)
+  except (AttributeError, TypeError, ValueError, OverflowError):
+    return None
+  if (
+    len(position) != ModelConstants.IDX_N or len(velocity) != ModelConstants.IDX_N or
+    not all(math.isfinite(value) for value in position + velocity) or not math.isfinite(desired_accel)
+  ):
+    return None
+  return position, velocity, desired_accel
+
+
+def model_stop_release_inputs_valid(model) -> bool:
+  return _model_stop_release_inputs(model) is not None
+
+
+def model_stop_release_open(model) -> bool:
+  inputs = _model_stop_release_inputs(model)
+  if inputs is None:
+    return False
+  position, velocity, desired_accel = inputs
+  return bool(
+    not model.action.shouldStop and desired_accel >= EARLY_BRAKE_GATE and position[-1] >= OPEN_RELEASE_PATH_MIN and
+    velocity[-1] >= OPEN_RELEASE_TERMINAL_SPEED_MIN
+  )
+
+
 class ForceStops:
   def __init__(self, dt: float = DT_MDL):
     self.dt = dt
     self.detect_filter = FirstOrderFilter(0.0, DETECT_RC, dt)
     self.braking_filter = FirstOrderFilter(0.0, DETECT_RC, dt)
     self.lead_filter = FirstOrderFilter(0.0, LEAD_RC, dt)
+    self.open_release_filter = FirstOrderFilter(0.0, OPEN_RELEASE_RC, dt)
     self.forcing = False
     self.remaining = 0.0
     self.override_timer = 0.0
@@ -93,6 +129,7 @@ class ForceStops:
     self.detect_filter.x = 0.0
     self.braking_filter.x = 0.0
     self.lead_filter.x = 0.0
+    self.open_release_filter.x = 0.0
     self.forcing = False
     self.remaining = 0.0
     self.position_hold_remaining = 0.0
@@ -106,6 +143,7 @@ class ForceStops:
       self.override_timer = GAS_OVERRIDE_S
       self.detect_filter.x = 0.0
       self.braking_filter.x = 0.0
+      self.open_release_filter.x = 0.0
       self.forcing = False
       self.position_hold_remaining = 0.0
       return NO_CAP
@@ -127,6 +165,7 @@ class ForceStops:
     if lead_present:
       self.detect_filter.x = 0.0
       self.braking_filter.x = 0.0
+      self.open_release_filter.x = 0.0
       self.forcing = False
       self.position_hold_remaining = 0.0
       return NO_CAP
@@ -141,18 +180,27 @@ class ForceStops:
     committed_length = max(model_length - LATCH_SETBACK, 0.0)
 
     action = sm['modelV2'].action
-    terminal_speed = float(sm['modelV2'].velocity.x[-1]) if len(sm['modelV2'].velocity.x) >= 2 else math.inf
-    terminal_heading = float(sm['modelV2'].orientation.z[-1]) if len(sm['modelV2'].orientation.z) >= 2 else math.inf
+    try:
+      desired_accel = float(action.desiredAcceleration)
+      desired_curvature = float(action.desiredCurvature)
+      terminal_speed = float(sm['modelV2'].velocity.x[-1]) if len(sm['modelV2'].velocity.x) >= 2 else math.inf
+      terminal_heading = float(sm['modelV2'].orientation.z[-1]) if len(sm['modelV2'].orientation.z) >= 2 else math.inf
+    except (TypeError, ValueError, OverflowError):
+      self._reset()
+      return NO_CAP
+    if not math.isfinite(desired_accel):
+      self._reset()
+      return NO_CAP
     early_stopping = (
       len(xs) >= 2 and not tracking_lead and v_ego >= EARLY_STOP_MIN_SPEED and
-      math.isfinite(action.desiredAcceleration) and action.desiredAcceleration <= EARLY_BRAKE_GATE and
+      desired_accel <= EARLY_BRAKE_GATE and
       model_length <= v_ego ** 2 / (2.0 * EARLY_STOP_COMFORT_DECEL) + v_ego * EARLY_STOP_RESPONSE_S and
       math.isfinite(terminal_speed) and terminal_speed <= min(EARLY_STOP_TERMINAL_MAX, v_ego * EARLY_STOP_TERMINAL_RATIO) and
-      math.isfinite(action.desiredCurvature) and abs(action.desiredCurvature) * v_ego ** 2 <= EARLY_STOP_MAX_LAT_ACCEL and
+      math.isfinite(desired_curvature) and abs(desired_curvature) * v_ego ** 2 <= EARLY_STOP_MAX_LAT_ACCEL and
       math.isfinite(terminal_heading) and abs(terminal_heading) <= EARLY_STOP_MAX_HEADING and
       not (CS.leftBlinker or CS.rightBlinker)
     )
-    braking = math.isfinite(action.desiredAcceleration) and action.desiredAcceleration < EARLY_BRAKE_GATE
+    braking = desired_accel < EARLY_BRAKE_GATE
     stop_time = EARLY_STOP_TIME if braking else MODEL_STOP_TIME
     model_stopping = 0.0 < model_length < max(v_ego * stop_time, MIN_STOP_LENGTH)
     classic_latch_ready = 0.0 < model_length < max(v_ego * MODEL_STOP_TIME, MIN_STOP_LENGTH)
@@ -161,6 +209,10 @@ class ForceStops:
     detected = (model_stopping or action.shouldStop) and not tracking_lead
     self.detect_filter.update(1.0 if detected else 0.0)
     self.braking_filter.update(1.0 if detected and braking else 0.0)
+    if detected or not model_stop_release_inputs_valid(sm['modelV2']):
+      self.open_release_filter.x = 0.0
+    else:
+      self.open_release_filter.update(1.0 if model_stop_release_open(sm['modelV2']) else 0.0)
     self.position_hold_remaining = max(self.position_hold_remaining - self.dt, 0.0)
     if detected:
       self.position_hold_remaining = STOP_POSITION_HOLD_S
@@ -177,6 +229,10 @@ class ForceStops:
     # tick, without latching a fresh forcing bout until the car is moving again -- a car
     # already at standstill is never "approaching" a stop, so it's outside this cap's job.
     if CS.standstill:
+      self._reset()
+      return NO_CAP
+
+    if self.forcing and self.open_release_filter.x > OPEN_RELEASE_THRESHOLD:
       self._reset()
       return NO_CAP
 
