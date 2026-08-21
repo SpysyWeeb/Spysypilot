@@ -29,6 +29,19 @@ Quick start: `bash <(curl -fsSL openpilot.comma.ai)`
 
 </div>
 
+## BLaTv2 branch status
+
+**In progress; replay-qualified, not field-approved.** This branch selects the
+rack-trajectory lateral controller only for the shared Palisade/Telluride
+platform when queried firmware identifies the Palisade `LX` family. Telluride
+`ON` and unknown firmware fail closed to the stock torque controller.
+
+The rack controller owns the normalized steering request; opendbc and panda
+remain the final platform/safety authorities. This superproject currently pins
+the stock `384/+3/-7` Hyundai envelope. Separate opendbc high-limit branches are
+not part of this branch until their gitlink is deliberately reviewed and moved.
+
+
 <table>
   <tr>
     <td><a href="https://youtu.be/NmBfgOanCyk" title="Video By Greer Viau"><img src="https://github.com/commaai/openpilot/assets/8762862/2f7112ae-f748-4f39-b617-fabd689c3772"></a></td>
