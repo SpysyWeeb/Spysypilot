@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import math
 
 from openpilot.cereal import log, messaging
@@ -28,6 +29,18 @@ class LinearVehicleModel:
   def get_steer_from_curvature(curvature: float, speed: float, roll: float) -> float:
     del speed, roll
     return curvature * 10.0
+
+
+def test_rack_trajectory_components_are_independent_modules() -> None:
+  contracts = importlib.import_module("openpilot.selfdrive.controls.lib.rack_trajectory_contracts")
+  planner = importlib.import_module("openpilot.selfdrive.controls.lib.rack_trajectory_planner")
+  reference = importlib.import_module("openpilot.selfdrive.controls.lib.rack_trajectory_reference")
+
+  assert MotionLimits is contracts.MotionLimits
+  assert RackTarget is contracts.RackTarget
+  assert JerkLimitedRackPlanner is planner.JerkLimitedRackPlanner
+  assert RackReferenceGovernor is reference.RackReferenceGovernor
+  assert model_path_target is reference.model_path_target
 
 
 def test_rack_trajectory_is_palisade_not_telluride_scoped() -> None:
