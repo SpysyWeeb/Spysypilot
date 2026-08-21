@@ -52,6 +52,7 @@ __all__ = (
   "MAX_FEEDBACK_TORQUE",
   "MAX_TURN_IN_FEEDBACK_TORQUE",
   "MAX_DRIVER_ASSIST_TORQUE",
+  "DRIVER_OVERRIDE_ASSIST_SCALE",
   "REFERENCE_REVERSAL_DISTANCE_DEG",
   "REFERENCE_REVERSAL_PERSISTENCE_S",
   "REFERENCE_REVERSAL_RC_S",
@@ -91,6 +92,7 @@ HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .35
+DRIVER_OVERRIDE_ASSIST_SCALE = .5
 
 STATUS_INACTIVE = 0
 STATUS_ACTIVE = 1
@@ -462,16 +464,33 @@ class PalisadeRackTrajectoryController:
       return None
     driver_torque = float(CS.steeringTorque)
     if CS.steeringPressed:
-      if torque * driver_torque < 0.0 or target_motion * driver_torque <= 0.0:
+      if self.driver_override_resume or torque * driver_torque < 0.0 or target_motion * driver_torque <= 0.0:
         self.driver_override_resume = True
+        driver_hold_lateral_accel = measured_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset
+        raw_driver_assist_torque = (
+          -DRIVER_OVERRIDE_ASSIST_SCALE * float(torque_from_lateral_accel(driver_hold_lateral_accel, torque_params))
+        )
+        if not math.isfinite(raw_driver_assist_torque):
+          self._invalidate(STATUS_INVALID_OUTPUT)
+          return None
+        driver_assist_torque = _clip(raw_driver_assist_torque, DRIVER_OVERRIDE_ASSIST_SCALE)
+        if driver_assist_torque * driver_torque <= 0.0:
+          driver_assist_torque = 0.0
+        torque_limited |= driver_assist_torque != torque
+        torque = driver_assist_torque
+        feedforward_torque = driver_assist_torque
+        position_feedback = 0.0
+        rate_feedback = 0.0
+        feedback = 0.0
         self.status = STATUS_DRIVER_OVERRIDE
-        return None
-      assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
-      torque_limited |= assisted_torque != torque
-      torque = assisted_torque
+      else:
+        assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
+        torque_limited |= assisted_torque != torque
+        torque = assisted_torque
     if self.driver_override_resume and not CS.steeringPressed and not unwinding:
       self.driver_override_resume = False
-    self.status = STATUS_ACTIVE
+    if not CS.steeringPressed or not self.driver_override_resume:
+      self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
       torque=torque,
       target_curvature=target.curvature,
