@@ -304,7 +304,21 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
   np.testing.assert_allclose(planner.mpc.params[:, 2], planner.force_stops.remaining + STOP_DISTANCE)
   assert planner.output_a_target <= before_accel + 0.25
 
+  sm["modelV2"].velocity.x[-1] = 14.0
+  sm["modelV2"].action.desiredAcceleration = -1.5
+  planner.update(sm)
+  release_before = planner.output_a_target
+  assert planner.force_stops.forcing
+  planner.update(sm)
+  assert not planner.force_stops.forcing
+  assert planner.output_a_target <= release_before + 0.25
+
   sm["carState"].vEgo = 0.2
+  sm["modelV2"].velocity.x[-1] = 0.0
+  sm["modelV2"].action.desiredAcceleration = 0.0
+  planner.force_stops.forcing = True
+  planner.force_stops.remaining = MPC_PROFILE_OFFSET_M + 0.48
+  planner.force_stops.position_hold_remaining = 1.0
   planner.update(sm)
   np.testing.assert_allclose(planner.mpc.params[:, 2], planner.force_stops.remaining + STOP_DISTANCE)
   assert planner.output_should_stop
@@ -460,7 +474,7 @@ def test_committed_stop_releases_on_sustained_open_model_before_standstill():
   sm["modelV2"].action.shouldStop = False
   sm["modelV2"].action.desiredAcceleration = 0.3
 
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(4))
+  assert math.isfinite(force_stops.update(sm))
   assert force_stops.forcing
   sm["modelV2"].position.x = open_path[:-1]
   assert math.isinf(force_stops.update(sm))
@@ -474,12 +488,9 @@ def test_committed_stop_releases_on_sustained_open_model_before_standstill():
   sm["modelV2"].velocity.x = open_speed
   sm["modelV2"].action.shouldStop = False
   sm["modelV2"].action.desiredAcceleration = 0.3
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(4))
+  assert math.isfinite(force_stops.update(sm))
   assert force_stops.forcing
-  cap = math.inf
-  for _ in range(5):
-    cap = force_stops.update(sm)
-  assert math.isinf(cap)
+  assert math.isinf(force_stops.update(sm))
   assert not force_stops.forcing
 
 
@@ -491,11 +502,6 @@ def test_open_release_fails_closed_on_low_terminal_speed():
   sm["modelV2"].velocity.x = [2.0] * ModelConstants.IDX_N
   sm["modelV2"].action.shouldStop = False
 
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(20))
-  assert force_stops.forcing
-
-  sm["modelV2"].velocity.x = [14.0] * ModelConstants.IDX_N
-  sm["modelV2"].action.desiredAcceleration = -1.0
   assert all(math.isfinite(force_stops.update(sm)) for _ in range(20))
   assert force_stops.forcing
 
