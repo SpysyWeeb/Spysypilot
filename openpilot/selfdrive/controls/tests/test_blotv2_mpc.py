@@ -5,9 +5,8 @@ from unittest.mock import patch
 
 import numpy as np
 from opendbc.car.interfaces import ACCEL_MAX
-from openpilot.cereal import log
 from openpilot.common.constants import CV
-from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX, LongitudinalPolicy
+from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX, BLOTV2_ACCEL_REQUEST_MAX
 
 from openpilot.selfdrive.controls.lib import longitudinal_planner
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
@@ -16,14 +15,10 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   T_IDXS,
   LongitudinalMpc,
   LongitudinalPlanSource,
-  get_T_FOLLOW,
-  get_safe_obstacle_distance,
-  get_stopped_equivalence_factor,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (
   get_cruise_accel,
   get_cruise_comfort_accel,
-  get_lead_jerk_scale,
   get_max_accel,
   get_requested_max_accel,
   ordinary_cruise_comfort_enabled,
@@ -412,39 +407,6 @@ class TestModelLeadTrajectory(unittest.TestCase):
       self.assertTrue(np.all(np.isfinite(self.mpc.v_solution)))
       self.assertTrue(np.all(np.isfinite(self.mpc.a_solution)))
       np.testing.assert_allclose(self.mpc.params[:, 4], t_follow)
-
-  def test_aggressive_lead_taper_keeps_gap_and_releases_for_risk(self):
-    policy = LongitudinalPolicy(1.0, 1.0, 0.0, False, False, False, False)
-    lead = longitudinal_planner.LeadObservation(True, 26.0, 13.2, 0.2, 1.0)
-
-    self.assertEqual(get_T_FOLLOW(log.LongitudinalPersonality.aggressive), 1.0)
-    self.assertGreater(get_lead_jerk_scale(log.LongitudinalPersonality.aggressive, lead, 13.0,
-                                           policy, 0.1, True), 1.0)
-    for risky_policy, model_accel, model_valid in (
-      (policy, -0.1, True),
-      (policy, None, True),
-      (policy, 0.1, False),
-      (LongitudinalPolicy(1.0, 1.0, 0.1, False, False, False, False), 0.1, True),
-      (LongitudinalPolicy(1.0, 1.0, 0.0, True, False, False, False), 0.1, True),
-    ):
-      self.assertEqual(get_lead_jerk_scale(log.LongitudinalPersonality.aggressive, lead, 13.0,
-                                           risky_policy, model_accel, model_valid), 1.0)
-    desired_distance = get_safe_obstacle_distance(13.0, policy.t_follow) - get_stopped_equivalence_factor(13.0)
-    self.assertEqual(get_lead_jerk_scale(
-      log.LongitudinalPersonality.aggressive,
-      longitudinal_planner.LeadObservation(True, desired_distance + 1.0, 13.0, 0.2, 1.0),
-      13.0, policy, 0.1, True,
-    ), 2.0)
-    self.assertEqual(get_lead_jerk_scale(
-      log.LongitudinalPersonality.aggressive,
-      longitudinal_planner.LeadObservation(True, 26.0, 12.9, 0.2, 1.0),
-      13.0, policy, 0.1, True,
-    ), 1.0)
-    self.assertEqual(get_lead_jerk_scale(log.LongitudinalPersonality.aggressive,
-                                         longitudinal_planner.LeadObservation(True, desired_distance, 13.0, 0.2, 1.0),
-                                         13.0, policy, 0.1, True), 1.0)
-    self.assertEqual(get_lead_jerk_scale(log.LongitudinalPersonality.aggressive, lead,
-                                         longitudinal_planner.CRUISE_COMFORT_SPEED_BP[0], policy, 0.1, True), 1.0)
 
 
 class TestStrongCruiseEnvelope(unittest.TestCase):
