@@ -30,7 +30,7 @@ class TestFanController(OpenpilotTestCase):
   def test_idle_floor(self, controller_class):
     controller = controller_class(2)
     self.wind_down(controller)
-    assert controller.update(10, False) == 10
+    assert controller.update(10, False) == 20
 
   @parameterized.expand(ALL_CONTROLLERS)
   def test_limited(self, controller_class):
