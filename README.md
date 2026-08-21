@@ -131,21 +131,18 @@ not closed-loop or field validation. Design and remaining gates are documented
 in [`docs/BLoTv2.md`](docs/BLoTv2.md#route-000000d9--6040563d1d-ordinary-cruise-comfort-refinement)
 and [`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
 
-## BLaTv2 archive
+## BLaTv2 rack trajectory
 
-**Status: reverted from `combo`; stock lateral control restored.** `controlsd`
-constructs and updates openpilot's stock `LatControlTorque` directly. The former
-`BLaTv2ExperimentalController` activation key and post-drive BLaTv2 feedback
-prompt are removed, so no BLaTv2 controller can own steering on `combo`.
+**Status: in progress; replay-qualified, not field-approved.** `controlsd` uses
+the current rack-trajectory controller only when the shared Palisade/Telluride
+platform has queried `LX` firmware. Telluride `ON` and unknown firmware remain
+on stock `LatControlTorque`.
 
-The BLaTv2 branch, commits, source modules, tests, route evidence, and design
-documents remain available as historical research. They are intentionally kept
-out of the live command path rather than deleted or rewritten. Any future
-Palisade work restarts from stock torque control and adds only a small,
-evidence-backed intervention after route analysis identifies a falsifiable
-cause. Existing research contracts are documented in
-[`docs/BLATV2_MODULAR.md`](docs/BLATV2_MODULAR.md) and
-[`docs/BLATV2_ACCEPTANCE.md`](docs/BLATV2_ACCEPTANCE.md).
+The former modular BLaTv2 stack and its design documents remain historical
+research; they are not the live command owner. The current controller owns one
+normalized request and leaves Hyundai rate/driver limiting and panda safety
+downstream. This tree still pins the stock `384/+3/-7` Hyundai envelope;
+separate opendbc high-limit branches are not deployed by this gitlink.
 
 ## To-Do
 
@@ -171,7 +168,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Better green lights](https://github.com/SpysyWeeb/Spysypilot/tree/better-green-lights)** — experimental-mode green-light launches start ~1.5–2s sooner by reading the model's path-length explosion instead of its laggy shouldStop bit, plus a launch assist that skips the dead time at the head of the model's speed plan &nbsp;*(personal idea)*
 - ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
-- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — archived research branch; its live controller and activation path are reverted from `combo`, which now uses stock `LatControlTorque` exclusively. Route analysis continues before any small stock-plus Palisade experiment is proposed &nbsp;*(personal idea; in progress)*
+- ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — Palisade `LX`-scoped rack-trajectory controller with model-authored timing, bounded motion planning, driver-override release, and stock fallback for Telluride/unknown firmware; still awaiting owner field validation &nbsp;*(personal idea; in progress)*
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_

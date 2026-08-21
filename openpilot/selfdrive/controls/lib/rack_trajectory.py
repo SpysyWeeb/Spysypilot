@@ -9,7 +9,6 @@ import numpy as np
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LATERAL_ACCEL_NO_ROLL, MIN_SPEED
 
 DT = .01
@@ -19,7 +18,6 @@ RATE_HORIZON_S = .1
 MAX_FEEDBACK_TORQUE = .35
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .35
-MODEL_ACTION_OFFSET_S = 1.5 * DT_MDL  # modeld frame delay + midpoint action delay
 REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
 REFERENCE_REVERSAL_PERSISTENCE_S = .15
 REFERENCE_REVERSAL_RC_S = .3
@@ -36,8 +34,6 @@ STATUS_INVALID_ACTION_TIME = 6
 STATUS_INVALID_PATH = 7
 STATUS_INVALID_OUTPUT = 8
 STATUS_INVALID_PLANNER_STATE = 9
-STATUS_MEASURED_OUT_OF_BOUNDS = 10
-STATUS_PLANNED_OUT_OF_BOUNDS = 11
 
 # Coherent-motion corpus: p99 rate/acceleration and p95 jerk by speed.
 _SPEED_PROFILE_MPH = np.asarray([7.25, 12.5, 17.5, 22.5, 30.0, 45.0])
@@ -365,6 +361,12 @@ class PalisadeRackTrajectoryController:
     self.jerk_filter.x = 0.0
     self.reference_governor.reset()
 
+  def _invalidate(self, status: int) -> None:
+    driver_override_resume = self.driver_override_resume
+    self.reset()
+    self.driver_override_resume = driver_override_resume
+    self.status = status
+
   def _measured_rate(self, angle_deg: float, raw_rate_deg_s: float) -> tuple[float, bool]:
     magnitude = abs(raw_rate_deg_s)
     if magnitude == 0.0:
@@ -450,31 +452,25 @@ class PalisadeRackTrajectoryController:
       self.reset()
       return None
     if self.model is None:
-      self.reset()
-      self.status = STATUS_NO_MODEL
+      self._invalidate(STATUS_NO_MODEL)
       return None
     if not all(math.isfinite(float(value)) for value in (
       CS.vEgo, CS.steeringAngleDeg, CS.steeringRateDeg, CS.steeringTorque,
       params.roll, params.angleOffsetDeg, lat_delay, desired_curvature,
     )):
-      self.reset()
-      self.status = STATUS_INVALID_VEHICLE_STATE
+      self._invalidate(STATUS_INVALID_VEHICLE_STATE)
       return None
     model_age_s = (self.state_mono_ns - int(self.model.timestampEof)) * 1e-9
     if not 0.0 <= model_age_s <= .2:
-      self.reset()
-      self.status = STATUS_STALE_MODEL
+      self._invalidate(STATUS_STALE_MODEL)
       return None
 
     try:
       scalar_action_plan_s = float(self.model.action.desiredCurvatureTime)
-    except AttributeError:
-      scalar_action_plan_s = float(lat_delay) + MODEL_ACTION_OFFSET_S
+    except (AttributeError, TypeError, ValueError):
+      scalar_action_plan_s = math.nan
     if not math.isfinite(scalar_action_plan_s) or scalar_action_plan_s <= 0.0:
-      scalar_action_plan_s = float(lat_delay) + MODEL_ACTION_OFFSET_S
-    if scalar_action_plan_s <= 0.0:
-      self.reset()
-      self.status = STATUS_INVALID_ACTION_TIME
+      self._invalidate(STATUS_INVALID_ACTION_TIME)
       return None
 
     try:
@@ -492,8 +488,7 @@ class PalisadeRackTrajectoryController:
         angle_offset_deg=float(params.angleOffsetDeg),
       )
     except (TypeError, ValueError, OverflowError):
-      self.reset()
-      self.status = STATUS_INVALID_PATH
+      self._invalidate(STATUS_INVALID_PATH)
       return None
     bound_speed = max(float(CS.vEgo), MIN_SPEED)
     roll_compensation = float(params.roll) * ACCELERATION_DUE_TO_GRAVITY
@@ -536,8 +531,7 @@ class PalisadeRackTrajectoryController:
         governed_target, limits, self.dt, recovery_acceleration,
       )
     except ValueError:
-      self.reset()
-      self.status = STATUS_INVALID_PLANNER_STATE
+      self._invalidate(STATUS_INVALID_PLANNER_STATE)
       return None
     planned_curvature = -VM.calc_curvature(math.radians(plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
     planned_out_of_bounds = not minimum_curvature - 1e-9 <= planned_curvature <= maximum_curvature + 1e-9
@@ -620,8 +614,7 @@ class PalisadeRackTrajectoryController:
       torque, plan.position_deg, plan.rate_deg_s, plan.acceleration_deg_s2, measured_rate,
       lateral_accel_error, position_feedback, rate_feedback, feedforward_torque,
     )):
-      self.reset()
-      self.status = STATUS_INVALID_OUTPUT
+      self._invalidate(STATUS_INVALID_OUTPUT)
       return None
     driver_torque = float(CS.steeringTorque)
     if CS.steeringPressed:

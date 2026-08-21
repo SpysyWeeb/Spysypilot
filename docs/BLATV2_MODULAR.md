@@ -1,5 +1,9 @@
 # BLaTv2 modular controller contract
 
+> **Historical design:** this modular controller is not the live command owner.
+> Current Palisade rack-trajectory behavior and status are documented in the
+> repository README.
+
 ## Purpose
 
 BLaTv2 is a ground-up, vehicle-portable lateral controller whose only path
