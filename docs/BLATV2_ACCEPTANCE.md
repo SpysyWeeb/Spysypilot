@@ -1,5 +1,9 @@
 # BLaTv2 modular acceptance
 
+> **Historical gates:** these apply to the retired modular architecture, not the
+> live Palisade rack-trajectory controller. See the repository README for the
+> current status and remaining field-validation gate.
+
 This document defines when the modular controller may progress from an
 offline artifact to shadow collection and, eventually, actuation. A later
 stage may not waive an earlier one. Until every activation gate passes, the

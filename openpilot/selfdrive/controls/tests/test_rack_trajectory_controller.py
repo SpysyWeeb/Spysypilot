@@ -7,8 +7,8 @@ from opendbc.car.car_helpers import interfaces
 from opendbc.car.hyundai.values import CAR as HYUNDAI
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
-from openpilot.common.realtime import DT_CTRL, DT_MDL
-from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
+from openpilot.common.realtime import DT_CTRL
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
   MotionLimits,
@@ -17,6 +17,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   model_path_target,
   PalisadeRackTrajectoryController,
   STATUS_ACTIVE,
+  STATUS_INVALID_ACTION_TIME,
   STATUS_INVALID_PATH,
   STATUS_INVALID_VEHICLE_STATE,
 )
@@ -27,6 +28,21 @@ class LinearVehicleModel:
   def get_steer_from_curvature(curvature: float, speed: float, roll: float) -> float:
     del speed, roll
     return curvature * 10.0
+
+
+def test_rack_trajectory_is_palisade_not_telluride_scoped() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+
+  def params_with_platform_code(code: bytes):
+    car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+    firmware = car.CarParams.CarFw.new_message()
+    firmware.fwVersion = b"\xf1\x00" + code + b" MFC  AT USA LHD 1.00 1.00 99211-S8100 220222"
+    car_params.carFw = [firmware]
+    return car_params
+
+  assert palisade_rack_trajectory_compatible(params_with_platform_code(b"LX2"))
+  assert not palisade_rack_trajectory_compatible(params_with_platform_code(b"ON"))
+  assert not palisade_rack_trajectory_compatible(car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE))
 
 
 def govern_reference(governor: RackReferenceGovernor, target: RackTarget, planner: JerkLimitedRackPlanner,
@@ -130,8 +146,7 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   model = messaging.new_message("modelV2").modelV2
   model.timestampEof = 1_000_000_000
   model.action.desiredCurvature = -.02
-  if hasattr(model.action, "desiredCurvatureTime"):
-    model.action.desiredCurvatureTime = .5
+  model.action.desiredCurvatureTime = .5
   model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
   model.orientationRate.z = [0.0] * 5
   model.velocity.x = [5.0] * 5
@@ -166,6 +181,18 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   assert update() is None
   state.steeringPressed = False
   state.steeringTorque = 0.0
+
+  invalid_model = messaging.new_message("modelV2").modelV2
+  invalid_model.timestampEof = 1_000_000_000
+  invalid_model.action.desiredCurvature = -.02
+  invalid_model.action.desiredCurvatureTime = .5
+  controller.set_model(invalid_model, 1_050_000_000)
+  assert controller.update(
+    True, state, vehicle_model, params, car_params.lateralTuning.torque,
+    interface.torque_from_lateral_accel(), .2, -.02,
+  ) is None
+  assert controller.driver_override_resume
+
   output = update()
   assert output is not None
   assert abs(output.feedforward_torque) < .05
@@ -247,8 +274,7 @@ def test_model_wobble_is_governed_in_rack_space_at_every_speed() -> None:
     state.steeringAngleDeg = 5.1
     model = messaging.new_message("modelV2").modelV2
     model.timestampEof = 1_000_000_000
-    if hasattr(model.action, "desiredCurvatureTime"):
-      model.action.desiredCurvatureTime = .5
+    model.action.desiredCurvatureTime = .5
     model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
     model.orientationRate.z = [0.0] * 5
     model.velocity.x = [speed] * 5
@@ -317,8 +343,7 @@ def test_reference_governor_threshold_edges_and_raw_feedforward_isolation() -> N
   torque_params.latAccelOffset = 0.0
   model = messaging.new_message("modelV2").modelV2
   model.timestampEof = 1_000_000_000
-  if hasattr(model.action, "desiredCurvatureTime"):
-    model.action.desiredCurvatureTime = .5
+  model.action.desiredCurvatureTime = .5
   model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
   model.orientationRate.z = [0.0] * 5
   model.velocity.x = [state.vEgo] * 5
@@ -383,11 +408,17 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   model = messaging.new_message("modelV2").modelV2
   model.timestampEof = 1_000_000_000
   model.action.desiredCurvature = -.15
-  if hasattr(model.action, "desiredCurvatureTime"):
-    model.action.desiredCurvatureTime = .5
   model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0]
   model.orientationRate.z = [0.0, -.03, -.06, -.09, -.12]
   model.velocity.x = [3.0] * 5
+
+  controller.set_rack_trajectory_model(model, 1_050_000_000)
+  torque, _, _ = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  assert torque == 0.0
+  assert controller.rack_trajectory is not None
+  assert controller.rack_trajectory.status == STATUS_INVALID_ACTION_TIME
+
+  model.action.desiredCurvatureTime = .5
   controller.set_rack_trajectory_model(model, 1_050_000_000)
   torque, _, controller_log = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
   assert torque > 0.0
@@ -399,7 +430,7 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
     orientation_rates_z=model.orientationRate.z,
     velocities_x=model.velocity.x,
     scalar_curvature=-.02,
-    scalar_action_plan_s=.5 if hasattr(model.action, "desiredCurvatureTime") else .2 + 1.5 * DT_MDL,
+    scalar_action_plan_s=.5,
     plan_time_now_s=.05,
     measured_v_ego=3.0,
     query_time_s=.55,
@@ -548,6 +579,7 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   invalid_model = messaging.new_message("modelV2").modelV2
   invalid_model.timestampEof = 1_000_000_000
   invalid_model.action.desiredCurvature = -.02
+  invalid_model.action.desiredCurvatureTime = .5
   controller.set_rack_trajectory_model(invalid_model, 1_050_000_000)
   torque, _, controller_log = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
   assert torque == 0.0
