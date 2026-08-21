@@ -152,9 +152,16 @@ the MPC receives the model's full future lead trajectory anchored to radar at
 the current frame. This lets visual lead braking and launch intent reach the
 solver before a measured acceleration estimate catches up.
 
-Malformed, non-finite, low-confidence, or unanchored model paths use the exact
-stock radar-physics extrapolation. FCW remains gated by the present
-vision-confirmed radar lead, not merely by model-path availability.
+The model service and radar/model association must both be healthy. Position
+derivative and predicted speed must agree within the existing `5 m/s` model-lead
+bound before and after radar anchoring; associated-lead position/speed uncertainty
+must remain below `50 m` / `10 m/s`. Malformed, non-finite, low-confidence,
+unconfirmed low-speed, physically inconsistent, or unanchored model paths use
+the exact stock radar-physics extrapolation. FCW remains gated by the present
+vision-confirmed radar lead, not merely by model-path availability. Invalid
+runtime jerk scaling similarly restores the incumbent MPC weights. An invalid
+model service contributes no model lead, model forecast, departure release, or
+e2e candidate during the existing soft-disable interval.
 
 ### Necessity supervisor
 
@@ -192,6 +199,13 @@ The supervisor compares necessity against the previous **MPC target**, not the
 planner's final selected e2e/cruise output. This prevents another planner source
 from accidentally arming MPC recovery state.
 
+Its runtime jerk/headway policy is installed only when lead0 is the current MPC
+obstacle source. Lead1, confirmed lead2, and the committed stop solve with the
+incumbent personality weights and base following time, so one lead cannot shape
+another owner's trajectory. If an actually adaptive lead0 solve hands off to a
+competing source, the MPC change-cost reference reanchors to the current command;
+nominal lead0 history is left intact.
+
 ### Standstill lead pre-release
 
 A valid lead that is already moving releases the MPC stop bit immediately. A
@@ -224,6 +238,9 @@ The existing stock `ExperimentalMode` Param remains only a manual request.
 The Params thread no longer writes the effective mode asynchronously;
 `selfdrived` resolves manual and conditional requests in one place, with a
 driver pedal override taking priority.
+The conditional latch is also published separately from the effective mode.
+Below the stock `0.3 m/s` stop boundary it preserves planner `shouldStop` through
+brief model-clear flicker; manual Experimental mode does not mint that hold.
 
 ### BLoTv2 signal mapping
 
@@ -332,7 +349,18 @@ native obstacle remains ahead and closer leads still win. Smooth Stops owns
 combo's final landing and standstill handoff. CEM still owns no speed,
 acceleration, brake, or stop point.
 
-This handoff is for testing only and its source candidate remains
+The standalone branch now carries the canonical Force Stops braking-confidence
+gate already composed in `combo`: the widened `3.25 s` latch requires sustained
+braking evidence, while the classic `3.0 s` latch retains its existing confidence.
+When the committed position obstacle owns MPC, telemetry publishes the dedicated
+`stop` source rather than the ordinary `cruise` label.
+
+After commitment, signed remaining distance continues to represent the same
+world point. The planner clamps only the MPC handoff at `-STOP_DISTANCE`; it does
+not delete ownership at that geometry boundary. Lead, pedal, invalid-service,
+mode, detector-clear, and standstill releases remain native Force Stops exits.
+
+This handoff is in progress for testing only and its source candidate remains
 replay-rejected. Route-17 segment 20 stopped `1.324 m` behind its internal
 retained target; that target is not calibrated painted-line ground truth.
 Offline native LongControl did not reproduce the earlier segment-25

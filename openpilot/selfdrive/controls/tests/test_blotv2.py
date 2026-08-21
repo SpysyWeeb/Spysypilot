@@ -77,6 +77,16 @@ class TestModelLeadHelpers(unittest.TestCase):
     self.assertIsNone(model_predicted_acceleration(model_lead([15.0, 10.0], prob=0.2)))
     self.assertIsNone(model_predicted_acceleration(None))
 
+    observation = lead(v=0.1)
+    for probability in (0.5, 1.1, math.nan, math.inf, -math.inf):
+      self.assertIsNone(model_predicted_acceleration(model_lead([15.0, 10.0], prob=probability)))
+      self.assertIsNone(model_predicted_speed(model_lead([2.0, 2.4], prob=probability), observation))
+
+    for radar_probability in (0.5, 1.1, math.nan, math.inf, -math.inf):
+      self.assertIsNone(model_predicted_speed(
+        model_lead([2.0, 2.4]), LeadObservation(True, 30.0, 0.1, 0.0, radar_probability),
+      ))
+
   def test_predicted_speed_is_radar_anchored(self):
     observation = lead(v=0.1)
     self.assertAlmostEqual(

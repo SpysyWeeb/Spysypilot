@@ -19,7 +19,6 @@ import math
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import FORCE_STOP_COMMIT_DISTANCE_M, model_trajectories_complete_and_finite
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 
 MODEL_STOP_TIME = 3.0     # s, path endpoint within v_ego * this reads as "model plans to stop"
 LATCH_STOP_TIME = 3.25    # s, commit braking evidence once its filtered stop intent is stable
@@ -228,9 +227,6 @@ class ForceStops:
 
     if not just_committed:
       self.remaining -= v_ego * self.dt
-    if self.remaining <= -STOP_DISTANCE:
-      self._reset()
-      return NO_CAP
     # forward-ratchet: while the model still confidently plans this stop, follow its endpoint
     # as it extends (bounded rate, never backward -- shrinking happens only by travel above)
     if (self.remaining > 0.0 and detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD and

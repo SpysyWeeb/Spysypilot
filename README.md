@@ -80,6 +80,13 @@ all three complete `leadsV3` hypotheses is outside the predicted stop corridor.
 Malformed lead/path data, a raw lead on any control tick, health loss, or a
 committed turn revokes the release.
 
+The controller audit now admits a model lead future only from a live model
+service and a vision-corresponding radar lead with finite, physically consistent
+position and speed. Unconfirmed low-speed radar tracks and malformed forecasts
+use the exact radar-physics fallback. When a committed Force Stops obstacle owns
+MPC, it publishes its own planner source instead of masquerading as ordinary
+cruise. Lead0-derived adaptive MPC policy stands down when lead1, lead2, or the
+committed stop is the current MPC owner.
 Route 29 adds only the two intended CEM entries and still rejects the lower-
 confidence replacement vehicle near Connect `1440.989`; routes 17 and 27 add no
 entries. Neither route-29 entry bypasses the separate one-second Force Stops
@@ -89,6 +96,11 @@ After one full second of current evidence, CEM also publishes the frame-bound
 qualification consumed by Force Stops. Recent-lead recovery neither shortens
 that qualification nor changes its exact current-frame binding. CEM still owns
 no target speed, stop point, acceleration, or brake command.
+Force Stops retains reversible approach shaping and the committed stop point;
+MPC arbitrates the obstacle, and Smooth Stops owns final landing. Signed target
+tracking remains bounded at the
+MPC's behind-ego limit until a native Force Stops release, while the conditional
+stop latch keeps `shouldStop` asserted through standstill prediction flicker.
 
 Route-29 landing replay confirms both reported twitch windows hand `shouldStop`
 to control inside the logged `0.5 s` actuator delay. A combined lifetime/timing
@@ -156,7 +168,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Comma 3X spinning steering wheel](https://github.com/SpysyWeeb/Spysypilot/tree/spinning-steering-wheel)** — rotates the existing top-right steering-wheel icon with the measured steering angle, with no settings toggle &nbsp;*(inspired by FrogPilot)*
 - ⚠️ **[Side panel quick-action buttons](https://github.com/SpysyWeeb/Spysypilot/tree/side-buttons)** — the home screen's right column is a stack of quick-access buttons: experimental-mode toggle, an update button with live download/install status, a screen-always-on toggle, and an error-log shortcut &nbsp;*(personal idea)*
 - ⚠️ **[Nudgeless lane changes](https://github.com/SpysyWeeb/Spysypilot/tree/nudgless-lane-changes)** — lane changes trigger on turn signal alone, one automatic change per blinker event; pressing the brake cancels auto for that blinker event entirely (manual nudge still works) &nbsp;*(inspired by sunnypilot)*
-- ⚠️ **[Better longitudinal tune v2 (BLoTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLoTv2)** — owns planner/MPC policy, lead response, Conditional Experimental Mode, and cruise behavior without implementing final stop landing; retains up to `4.0 m/s²` at launch under combo's existing opendbc/panda safety envelope, then fades the added authority into openpilot's exact stock acceleration gate by `10 m/s` (about `22 mph`) while preserving the reaction-time jerk tune; see [design](docs/BLoTv2.md) and [acceptance gates](docs/BLoTv2_ACCEPTANCE.md) &nbsp;*(in progress; awaiting owner field validation)*
+- ⚠️ **[Better longitudinal tune v2 (BLoTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLoTv2)** — owns planner/MPC policy, lead response, Conditional Experimental Mode, and cruise behavior without implementing final stop landing; requests a continuous cubic acceleration envelope from `4.0 m/s²` at launch to `0.6 m/s²` at `40 m/s`, clamped by combo's opendbc/panda safety envelope, while preserving the separate reaction-time jerk tune; see [design](docs/BLoTv2.md) and [acceptance gates](docs/BLoTv2_ACCEPTANCE.md) &nbsp;*(in progress; awaiting owner field validation)*
 - ⚠️ **[Smooth Stops](https://github.com/SpysyWeeb/Spysypilot/tree/smooth-stops)** — independently owns the final rolling landing and standstill handoff; planner/MPC necessity remains under BLoTv2 and stronger planner braking always passes through &nbsp;*(in progress; awaiting owner field validation)*
 - ✅\* **[Better boot screen](https://github.com/SpysyWeeb/Spysypilot/tree/better-boot-screen)** — the boot spinner shows live console output (build/manager), so hangs are immediately diagnosable from the device screen &nbsp;*(personal idea)*
 - ✅ **[Error log viewer](https://github.com/SpysyWeeb/Spysypilot/tree/error-log-viewer)** — crashes are saved to an on-device log; a dev-menu button views it before/during/after a drive, with delete-on-close &nbsp;*(inspired by sunnypilot)*

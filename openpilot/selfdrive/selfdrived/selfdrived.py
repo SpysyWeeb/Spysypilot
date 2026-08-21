@@ -561,6 +561,7 @@ class SelfdriveD:
     ss.conditionalStopQualified = self.conditional_experimental_mode.stop_qualified
     ss.conditionalStopDistance = self.conditional_experimental_mode.stop_distance or 0.0
     ss.conditionalStopModelMonoTime = self.sm.logMonoTime['modelV2'] if self.conditional_experimental_mode.stop_qualified else 0
+    ss.conditionalStopLatched = self.conditional_experimental_mode.stop_latched
 
     ss.alertText1 = self.AM.current_alert.alert_text_1
     ss.alertText2 = self.AM.current_alert.alert_text_2

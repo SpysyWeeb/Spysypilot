@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 import math
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from opendbc.car.interfaces import ACCEL_MAX
@@ -10,11 +10,13 @@ from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX, BLOTV2_ACC
 
 from openpilot.selfdrive.controls.lib import longitudinal_planner
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
+  A_CHANGE_COST,
   LEAD_THREE_CONFIRM,
   LEAD_T_IDXS_MODEL,
   T_IDXS,
   LongitudinalMpc,
   LongitudinalPlanSource,
+  get_T_FOLLOW,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (
   get_cruise_accel,
@@ -101,6 +103,57 @@ class TestLaunchContinuity(unittest.TestCase):
 
     self.assertEqual(constraints, [True])
 
+  def test_invalid_model_service_cannot_reach_lead_policy_or_mpc(self):
+    lead = radar_lead(vLeadK=0.1, vLead=0.1, modelProb=1.0)
+    absent_lead = radar_lead(present=False)
+    predicted_lead = model_lead(v=np.asarray([0.1, 1.1, 2.1, 3.1, 4.1, 5.1]))
+    messages = {
+      "carState": SimpleNamespace(vEgo=10.0, vCruise=50.0, aEgo=0.0, standstill=False,
+                                  gasPressed=False, brakePressed=False, leftBlinker=False, rightBlinker=False,
+                                  steeringAngleDeg=0.0),
+      "carControl": SimpleNamespace(orientationNED=[], latActive=False),
+      "controlsState": SimpleNamespace(forceDecel=False, longControlState=longitudinal_planner.LongCtrlState.pid),
+      "selfdriveState": SimpleNamespace(enabled=True, experimentalMode=True, personality=1,
+                                         conditionalStopLatched=False),
+      "vehicleParameters": SimpleNamespace(angleOffsetDeg=0.0, roll=0.0),
+      "radarState": SimpleNamespace(leadOne=lead, leadTwo=absent_lead),
+      "modelV2": SimpleNamespace(
+        position=SimpleNamespace(x=np.linspace(0.0, 100.0, longitudinal_planner.ModelConstants.IDX_N),
+                                 y=np.zeros(longitudinal_planner.ModelConstants.IDX_N)),
+        velocity=SimpleNamespace(x=np.zeros(longitudinal_planner.ModelConstants.IDX_N)),
+        acceleration=SimpleNamespace(x=np.zeros(longitudinal_planner.ModelConstants.IDX_N)),
+        meta=SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]),
+                             laneChangeState=longitudinal_planner.log.LaneChangeState.off),
+        action=SimpleNamespace(desiredAcceleration=-2.0, shouldStop=True),
+        leadsV3=[predicted_lead],
+      ),
+    }
+    sm = MagicMock()
+    sm.__getitem__.side_effect = messages.__getitem__
+    sm.all_checks.side_effect = lambda services=None: services != ["modelV2"]
+
+    planner = longitudinal_planner.LongitudinalPlanner(
+      SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
+                      steerRatio=15.0, wheelbase=2.9),
+    )
+    policy = SimpleNamespace(jerk_scale=1.0, t_follow=1.45, emergency=False)
+    with (
+      patch.object(planner.force_stops, "update", return_value=math.inf),
+      patch.object(planner.blotv2, "update", return_value=policy) as supervisor_update,
+      patch.object(planner.lead_departure, "update", return_value=False) as departure_update,
+      patch.object(planner.mpc, "set_weights"),
+      patch.object(planner.mpc, "update") as mpc_update,
+      patch.object(longitudinal_planner, "get_accel_from_plan", return_value=0.0),
+    ):
+      planner.update(sm)
+
+    self.assertIsNone(supervisor_update.call_args.args[-1])
+    self.assertIsNone(departure_update.call_args.kwargs["predicted_speed"])
+    self.assertIsNone(mpc_update.call_args.kwargs["model_leads"])
+    self.assertIsNone(mpc_update.call_args.kwargs["model_position"])
+    self.assertNotEqual(planner.mpc.source, LongitudinalPlanSource.e2e)
+    self.assertFalse(planner.output_should_stop)
+
 
 class TestModelLeadTrajectory(unittest.TestCase):
   def setUp(self):
@@ -115,13 +168,33 @@ class TestModelLeadTrajectory(unittest.TestCase):
 
   def test_model_contributes_future_shape_not_absolute_offset(self):
     model = model_lead(
-      x=100.0 + 8.0 * LEAD_T_IDXS_MODEL,
-      v=30.0 + LEAD_T_IDXS_MODEL,
+      x=100.0 + 8.0 * LEAD_T_IDXS_MODEL + 0.5 * LEAD_T_IDXS_MODEL ** 2,
+      v=8.0 + LEAD_T_IDXS_MODEL,
     )
     trajectory = self.mpc.process_lead_model(model, radar_lead())
-    self.assertAlmostEqual(trajectory[0, 0], 20.0)
-    self.assertAlmostEqual(trajectory[0, 1], 8.0)
-    self.assertGreater(trajectory[-1, 1], trajectory[0, 1])
+    expected_x = np.interp(T_IDXS, LEAD_T_IDXS_MODEL,
+                           20.0 + 8.0 * LEAD_T_IDXS_MODEL + 0.5 * LEAD_T_IDXS_MODEL ** 2)
+    expected_v = np.interp(T_IDXS, LEAD_T_IDXS_MODEL, 8.0 + LEAD_T_IDXS_MODEL)
+
+    np.testing.assert_allclose(trajectory[:, 0], expected_x)
+    np.testing.assert_allclose(trajectory[:, 1], expected_v)
+
+  def test_radar_speed_anchor_mismatch_uses_exact_stock_radar_fallback(self):
+    radar = radar_lead(aLeadK=-1.0)
+    mismatched = model_lead(
+      x=100.0 + 30.0 * LEAD_T_IDXS_MODEL + 0.5 * LEAD_T_IDXS_MODEL ** 2,
+      v=30.0 + LEAD_T_IDXS_MODEL,
+    )
+
+    np.testing.assert_allclose(self.mpc.process_lead_model(mismatched, radar), self.mpc.process_lead(radar))
+
+  def test_unconfirmed_radar_track_cannot_borrow_model_future(self):
+    radar = radar_lead(modelProb=0.0)
+    model = model_lead(
+      x=8.0 * LEAD_T_IDXS_MODEL + 0.5 * LEAD_T_IDXS_MODEL ** 2,
+      v=8.0 + LEAD_T_IDXS_MODEL,
+    )
+    np.testing.assert_allclose(self.mpc.process_lead_model(model, radar), self.mpc.process_lead(radar))
 
   def test_invalid_model_shape_uses_exact_stock_radar_fallback(self):
     radar = radar_lead(aLeadK=-1.0)
@@ -136,6 +209,33 @@ class TestModelLeadTrajectory(unittest.TestCase):
     x[2] = np.nan
     actual = self.mpc.process_lead_model(model_lead(x=x), radar)
     np.testing.assert_allclose(actual, expected)
+
+  def test_physically_inconsistent_model_uses_exact_stock_radar_fallback(self):
+    radar = radar_lead(aLeadK=-1.0)
+    expected = self.mpc.process_lead(radar)
+    inconsistent = model_lead(x=8.0 * LEAD_T_IDXS_MODEL,
+                              v=40.0 + 10.0 * LEAD_T_IDXS_MODEL)
+
+    np.testing.assert_allclose(self.mpc.process_lead_model(inconsistent, radar), expected)
+
+  def test_uncertain_or_malformed_associated_model_uses_exact_stock_radar_fallback(self):
+    radar = radar_lead(aLeadK=-1.0)
+    expected = self.mpc.process_lead(radar)
+    malformed = (
+      model_lead(prob=1.1),
+      model_lead(xStd=np.full(6, np.inf)),
+      model_lead(xStd=-np.ones(6)),
+      model_lead(xStd=np.full(6, 50.0)),
+      model_lead(vStd=np.full(6, np.inf)),
+      model_lead(vStd=-np.ones(6)),
+      model_lead(vStd=np.full(6, 10.0)),
+      model_lead(t=np.linspace(0.0, 0.5, 6)),
+      model_lead(x=np.array([0.0, 8.0, 7.0, 24.0, 32.0, 40.0])),
+      model_lead(v=np.array([8.0, 8.0, -1.0, 8.0, 8.0, 8.0])),
+    )
+
+    for model in malformed:
+      np.testing.assert_allclose(self.mpc.process_lead_model(model, radar), expected)
 
   def test_missing_radar_cannot_activate_model_trajectory(self):
     radar = radar_lead(present=False)
@@ -407,6 +507,85 @@ class TestModelLeadTrajectory(unittest.TestCase):
       self.assertTrue(np.all(np.isfinite(self.mpc.v_solution)))
       self.assertTrue(np.all(np.isfinite(self.mpc.a_solution)))
       np.testing.assert_allclose(self.mpc.params[:, 4], t_follow)
+
+  def test_lead0_policy_cannot_shape_a_competing_lead(self):
+    personality = longitudinal_planner.log.LongitudinalPersonality.aggressive
+    radar_state = SimpleNamespace(
+      leadOne=radar_lead(dRel=80.0, vLead=32.0),
+      leadTwo=radar_lead(dRel=20.0, vLead=10.0),
+    )
+    incumbent = LongitudinalMpc()
+    adaptive = LongitudinalMpc()
+    for mpc in (incumbent, adaptive):
+      mpc.set_cur_state(30.0, 0.0)
+
+    for _ in range(5):
+      incumbent.set_weights(personality=personality, jerk_factor_scale=1.0)
+      incumbent.update(radar_state, personality=personality, t_follow=get_T_FOLLOW(personality),
+                       prev_accel_constraint=True)
+      adaptive.set_weights(personality=personality, jerk_factor_scale=0.3)
+      adaptive.update(radar_state, personality=personality, t_follow=1.9,
+                      prev_accel_constraint=True)
+
+    self.assertFalse(adaptive.lead0_policy_active)
+    np.testing.assert_allclose(adaptive.params[:, 4], get_T_FOLLOW(personality))
+    np.testing.assert_allclose(adaptive.a_solution, incumbent.a_solution)
+
+    absent = radar_lead(present=False, modelProb=0.0)
+    radar_state = SimpleNamespace(leadOne=absent, leadTwo=absent)
+    incumbent = LongitudinalMpc()
+    adaptive = LongitudinalMpc()
+    for mpc in (incumbent, adaptive):
+      mpc.set_cur_state(15.0, 0.0)
+    for _ in range(5):
+      incumbent.set_weights(personality=personality, jerk_factor_scale=1.0)
+      incumbent.update(radar_state, personality=personality, stop_x=25.0,
+                       prev_accel_constraint=True)
+      adaptive.set_weights(personality=personality, jerk_factor_scale=0.3)
+      adaptive.update(radar_state, personality=personality, t_follow=1.9, stop_x=25.0,
+                      prev_accel_constraint=True)
+    self.assertFalse(adaptive.lead0_policy_active)
+    np.testing.assert_allclose(adaptive.a_solution, incumbent.a_solution)
+
+  def test_nonfinite_runtime_jerk_scale_uses_incumbent_weights(self):
+    with patch.object(self.mpc, "set_cost_weights") as set_cost_weights:
+      self.mpc.set_weights(jerk_factor_scale=np.nan)
+
+    cost_weights = np.asarray(set_cost_weights.call_args.args[0])
+    self.assertTrue(np.all(np.isfinite(cost_weights)))
+    self.assertEqual(cost_weights[4], A_CHANGE_COST)
+
+  def test_lead0_policy_warm_state_cannot_weaken_a_competing_lead(self):
+    personality = longitudinal_planner.log.LongitudinalPersonality.aggressive
+    far = radar_lead(dRel=80.0, vLead=32.0)
+    absent = radar_lead(present=False, modelProb=0.0)
+    warm_state = SimpleNamespace(leadOne=far, leadTwo=absent)
+    urgent_state = SimpleNamespace(leadOne=far, leadTwo=radar_lead(dRel=10.0, vLead=15.0, aLeadK=-2.0))
+    incumbent = LongitudinalMpc()
+    adaptive = LongitudinalMpc()
+    for mpc in (incumbent, adaptive):
+      mpc.set_cur_state(30.0, 0.0)
+
+    for _ in range(20):
+      incumbent.set_weights(personality=personality, jerk_factor_scale=1.0)
+      incumbent.update(warm_state, personality=personality, t_follow=get_T_FOLLOW(personality),
+                       prev_accel_constraint=True)
+      adaptive.set_weights(personality=personality, jerk_factor_scale=0.3)
+      adaptive.update(warm_state, personality=personality, t_follow=get_T_FOLLOW(personality),
+                      prev_accel_constraint=True, lead0_policy_adaptive=True)
+
+    for _ in range(12):
+      incumbent.set_weights(personality=personality, jerk_factor_scale=1.0)
+      incumbent.update(urgent_state, personality=personality, t_follow=get_T_FOLLOW(personality),
+                       prev_accel_constraint=True)
+      adaptive.set_weights(personality=personality, jerk_factor_scale=0.3)
+      adaptive.update(urgent_state, personality=personality, t_follow=get_T_FOLLOW(personality),
+                      prev_accel_constraint=True, lead0_policy_adaptive=True)
+      self.assertEqual(adaptive.source, LongitudinalPlanSource.lead1)
+      self.assertLessEqual(np.interp(0.25, T_IDXS, adaptive.a_solution),
+                           np.interp(0.25, T_IDXS, incumbent.a_solution) + 1e-8)
+      self.assertLessEqual(np.interp(0.60, T_IDXS, adaptive.a_solution),
+                           np.interp(0.60, T_IDXS, incumbent.a_solution) + 1e-8)
 
 
 class TestStrongCruiseEnvelope(unittest.TestCase):
