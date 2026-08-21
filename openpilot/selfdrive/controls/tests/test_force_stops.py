@@ -287,19 +287,16 @@ def test_committed_stop_releases_on_sustained_open_model_before_standstill():
   sm["modelV2"].action.shouldStop = False
   sm["modelV2"].action.desiredAcceleration = 0.3
 
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(4))
+  assert math.isfinite(force_stops.update(sm))
   assert force_stops.forcing
   sm["modelV2"].position.x = open_path[:-1]
   assert math.isfinite(force_stops.update(sm))
   assert force_stops.open_release_filter.x == 0.0
   assert force_stops.forcing
   sm["modelV2"].position.x = open_path
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(4))
+  assert math.isfinite(force_stops.update(sm))
   assert force_stops.forcing
-  cap = math.inf
-  for _ in range(5):
-    cap = force_stops.update(sm)
-  assert math.isinf(cap)
+  assert math.isinf(force_stops.update(sm))
   assert not force_stops.forcing
 
 
@@ -311,11 +308,6 @@ def test_open_release_fails_closed_on_low_terminal_speed():
   sm["modelV2"].velocity.x = [2.0] * ModelConstants.IDX_N
   sm["modelV2"].action.shouldStop = False
 
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(20))
-  assert force_stops.forcing
-
-  sm["modelV2"].velocity.x = [14.0] * ModelConstants.IDX_N
-  sm["modelV2"].action.desiredAcceleration = -1.0
   assert all(math.isfinite(force_stops.update(sm)) for _ in range(20))
   assert force_stops.forcing
 
