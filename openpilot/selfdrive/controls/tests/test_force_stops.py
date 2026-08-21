@@ -7,6 +7,7 @@ from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MA
                                                            GAS_OVERRIDE_S, LATCH_SETBACK, LATCH_THRESHOLD,
                                                            STOP_POSITION_HOLD_S)
 from openpilot.selfdrive.controls.lib.force_stops import MPC_PROFILE_OFFSET_M
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, get_cruise_accel
@@ -273,6 +274,55 @@ def test_latched_position_survives_brief_model_clear():
   for _ in range(int(1.0 / DT)):
     cap = force_stops.update(sm)
   assert math.isinf(cap)
+
+
+def test_committed_stop_releases_on_sustained_open_model_before_standstill():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster()
+  arm(force_stops, sm)
+  open_path = [93.5 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
+  open_speed = [4.2 + (14.0 - 4.2) * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
+  sm["modelV2"].position.x = open_path
+  sm["modelV2"].velocity.x = open_speed
+  sm["modelV2"].action.shouldStop = False
+  sm["modelV2"].action.desiredAcceleration = 0.3
+
+  assert all(math.isfinite(force_stops.update(sm)) for _ in range(4))
+  assert force_stops.forcing
+  sm["modelV2"].position.x = open_path[:-1]
+  assert math.isfinite(force_stops.update(sm))
+  assert force_stops.open_release_filter.x == 0.0
+  assert force_stops.forcing
+  sm["modelV2"].position.x = open_path
+  assert all(math.isfinite(force_stops.update(sm)) for _ in range(4))
+  assert force_stops.forcing
+  cap = math.inf
+  for _ in range(5):
+    cap = force_stops.update(sm)
+  assert math.isinf(cap)
+  assert not force_stops.forcing
+
+
+def test_open_release_fails_closed_on_low_terminal_speed():
+  force_stops = ForceStops(dt=DT)
+  sm = FakeSubMaster()
+  arm(force_stops, sm)
+  sm["modelV2"].position.x = [93.5 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
+  sm["modelV2"].velocity.x = [2.0] * ModelConstants.IDX_N
+  sm["modelV2"].action.shouldStop = False
+
+  assert all(math.isfinite(force_stops.update(sm)) for _ in range(20))
+  assert force_stops.forcing
+
+  sm["modelV2"].velocity.x = [14.0] * ModelConstants.IDX_N
+  sm["modelV2"].action.desiredAcceleration = -1.0
+  assert all(math.isfinite(force_stops.update(sm)) for _ in range(20))
+  assert force_stops.forcing
+
+  sm["modelV2"].action.desiredAcceleration = "invalid"
+  assert math.isinf(force_stops.update(sm))
+  assert force_stops.open_release_filter.x == 0.0
+  assert not force_stops.forcing
 
 
 def test_new_evidence_refreshes_position_hold():
