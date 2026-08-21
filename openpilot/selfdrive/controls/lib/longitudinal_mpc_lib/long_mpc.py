@@ -300,9 +300,10 @@ class LongitudinalMpc:
   def set_weights(self, prev_accel_constraint=True, personality=log.LongitudinalPersonality.standard,
                   jerk_factor_scale=1.0):
     # BLoTv2 changes the cost of changing acceleration, never acceleration
-    # constraints. Bound the runtime input so an invalid policy cannot silently
-    # remove the solver's smoothness cost or make it stiffer than stock.
-    jerk_factor_scale = float(np.clip(jerk_factor_scale, 0.3, 1.0))
+    # constraints. Aggressive may use up to 2x its 0.5 base factor, matching
+    # Standard smoothness without changing its following distance.
+    max_jerk_scale = 2.0 if personality == log.LongitudinalPersonality.aggressive else 1.0
+    jerk_factor_scale = float(np.clip(jerk_factor_scale, 0.3, max_jerk_scale))
     jerk_factor = get_jerk_factor(personality) * jerk_factor_scale
     a_change_cost = A_CHANGE_COST if prev_accel_constraint else 0
     cost_weights = [X_EGO_OBSTACLE_COST, X_EGO_COST, V_EGO_COST, A_EGO_COST, jerk_factor * a_change_cost, jerk_factor * J_EGO_COST]
