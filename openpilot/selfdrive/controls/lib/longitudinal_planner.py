@@ -23,7 +23,9 @@ from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (
   LongitudinalMpc,
   LongitudinalPlanSource,
+  STOP_DISTANCE,
   get_T_FOLLOW,
+  get_valid_model_lead_trajectory,
 )
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
@@ -182,20 +184,27 @@ class LongitudinalPlanner:
     prev_accel_constraint = not reset_state
 
     force_stop_cap = self.force_stops.update(sm)
-    stop_x = self.force_stops.remaining if self.force_stops.forcing else None
+    stop_x = max(self.force_stops.remaining, -STOP_DISTANCE) if self.force_stops.forcing else None
 
     personality = sm['selfdriveState'].personality
     radar_valid = sm.all_checks(['radarState'])
     lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
-    model_leads = sm['modelV2'].leadsV3
-    model_lead_0 = model_leads[0] if len(model_leads) > 0 else None
+    model_valid = sm.all_checks(['modelV2'])
+    model_leads = sm['modelV2'].leadsV3 if model_valid else None
+    model_position = sm['modelV2'].position if model_valid else None
+    model_lead_0 = model_leads[0] if model_leads is not None and len(model_leads) > 0 else None
+    model_lead_corresponds = (
+      model_valid
+      and get_valid_model_lead_trajectory(model_lead_0, sm['radarState'].leadOne) is not None
+    )
     policy = self.blotv2.update(
       lead,
       v_ego,
       self.last_mpc_a_target,
       get_T_FOLLOW(personality),
-      model_predicted_acceleration(model_lead_0),
+      model_predicted_acceleration(model_lead_0) if model_lead_corresponds else None,
     )
+    lead0_policy_adaptive = policy.jerk_scale < 1.0 or policy.t_follow > get_T_FOLLOW(personality)
 
     self.mpc.set_weights(
       prev_accel_constraint,
@@ -208,15 +217,17 @@ class LongitudinalPlanner:
       personality=personality,
       t_follow=policy.t_follow,
       model_leads=model_leads,
-      model_position=sm['modelV2'].position,
+      model_position=model_position,
       allow_third_lead=(
         not reset_state
-        and sm.all_checks(['modelV2'])
+        and model_valid
         and sm['modelV2'].meta.laneChangeState == log.LaneChangeState.off
         and not (sm['carState'].leftBlinker or sm['carState'].rightBlinker)
       ),
       stop_x=stop_x,
       v_ego=v_ego,
+      prev_accel_constraint=prev_accel_constraint,
+      lead0_policy_adaptive=lead0_policy_adaptive,
     )
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
@@ -240,7 +251,7 @@ class LongitudinalPlanner:
       active=self.CP.openpilotLongitudinalControl and not long_control_off,
       standstill=sm['carState'].standstill,
       lead=lead,
-      predicted_speed=model_predicted_speed(model_lead_0, lead),
+      predicted_speed=model_predicted_speed(model_lead_0, lead) if model_lead_corresponds else None,
     )
     if lead_departure_released:
       # Begin only the MPC hold-release leg; preserve its acceleration target
@@ -263,11 +274,15 @@ class LongitudinalPlanner:
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
-    if experimental_mode:
+    if experimental_mode and model_valid:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+    conditional_stop_hold = (
+      bool(getattr(sm['selfdriveState'], 'conditionalStopLatched', False))
+      and should_stop(v_ego, 0.0)
+    )
+    self.output_should_stop = conditional_stop_hold or any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, BLOTV2_ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0

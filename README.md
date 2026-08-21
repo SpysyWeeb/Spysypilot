@@ -40,6 +40,14 @@ deceleration, radar-invalid operation, and an active model curve-speed limit
 bypass this shaping. The jerk schedule remains unchanged. This is route-replay
 tuning and still requires owner field testing.
 
+The controller audit now admits a model lead future only from a live model
+service and a vision-corresponding radar lead with finite, physically consistent
+position and speed. Unconfirmed low-speed radar tracks and malformed forecasts
+use the exact radar-physics fallback. When a committed Force Stops obstacle owns
+MPC, it publishes its own planner source instead of masquerading as ordinary
+cruise. Lead0-derived adaptive MPC policy stands down when lead1, lead2, or the
+committed stop is the current MPC owner.
+
 Conditional Experimental Mode is **in progress**. Its target behavior is to
 keep BLoTv2 in Chill mode during ordinary driving, hand the existing
 longitudinal planner to Experimental mode for a confirmed, lead-free model
@@ -68,7 +76,9 @@ stop evidence still publishes the existing model-frame-bound capability to
 Force Stops. The recent-lead release does not shorten that qualification or
 change its exact current-frame binding. Force Stops retains reversible approach
 shaping and the committed stop point; MPC arbitrates the obstacle, and
-longcontrol owns final landing.
+longcontrol owns final landing. Signed target tracking remains bounded at the
+MPC's behind-ego limit until a native Force Stops release, while the conditional
+stop latch keeps `shouldStop` asserted through standstill prediction flicker.
 
 Route-29 landing replay confirms both reported twitch windows hand `shouldStop`
 to control inside the logged `0.5 s` actuator delay. A combined lifetime/timing

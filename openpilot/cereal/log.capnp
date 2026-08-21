@@ -823,6 +823,7 @@ struct SelfdriveState {
   conditionalStopQualified @14 :Bool;
   conditionalStopDistance @15 :Float32;
   conditionalStopModelMonoTime @16 :UInt64;
+  conditionalStopLatched @17 :Bool;
 
   enum AudibleAlert {
     none @0;
@@ -1248,6 +1249,7 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
     lead1 @2;
     lead2 @3;
     e2e @4;
+    stop @5;
   }
 
 

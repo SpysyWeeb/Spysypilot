@@ -25,6 +25,11 @@ Every test report must identify:
 - [x] Relative lead-physics unit coverage.
 - [x] MPC supervisor trigger, emergency, and slew coverage.
 - [x] Model lead trajectory shape/finite/fallback coverage.
+- [x] Model lead service validity, radar/model identity, probability boundaries,
+  bounded uncertainty, and pre/post-anchor position-speed consistency fail
+  closed to radar physics.
+- [x] Invalid model service omits model forecasts and the e2e candidate while
+  retaining healthy radar/cruise fallback.
 - [x] Low-speed radar override qualification coverage.
 - [x] `4.0 m/s²` request is clamped by the deployed opendbc envelope.
 - [x] Existing BLoTv2 jerk and MPC tune retained for isolated evaluation.
@@ -46,6 +51,12 @@ Every test report must identify:
 - [x] Qualified Force Stops authority is bound to the exact current model frame,
   fails closed on malformed trajectories, health faults, leads, and pedals, and
   retains the existing reversible cap, committed-point, and MPC ownership.
+- [x] Force Stops widened-latch confidence matches the canonical composed
+  implementation, and committed stop-obstacle ownership has a distinct source.
+- [x] Lead0 adaptive MPC policy cannot shape lead1, lead2, or committed-stop
+  solves; competing sources use incumbent weights and following time.
+- [x] Signed committed-stop geometry survives the MPC lower boundary, is clamped
+  at the solver handoff, and conditional stop intent preserves standstill hold.
 - [x] Recent-lead recovery preserves the `3.0 s` timer, starts only from one
   strict 33-point frame, validates all three complete model-lead hypotheses,
   and revokes on malformed data, health loss, turns, or either raw lead.
