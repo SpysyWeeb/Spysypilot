@@ -1,3 +1,4 @@
+import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,7 @@ from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.model_curve_speed import (
+  APPROACH_RESPONSE_BUFFER_S,
   CURVATURE_BP,
   CURVE_TARGET_RELEASE_RATE,
   CURVE_SPEED_V,
@@ -82,6 +84,22 @@ class TestModelCurveSpeed(unittest.TestCase):
     self.assertGreater(limiter.distance, 0.0)
     self.assertAlmostEqual(target, expected)
 
+  def test_approach_distance_reserves_measured_longitudinal_response_time(self):
+    curvature = np.zeros(ModelConstants.IDX_N)
+    curvature[12:17] = CURVATURE_BP[1]
+    limiter = ModelCurveSpeedLimiter()
+    model = make_model(curvature=curvature)
+    v_ego = 15.0
+
+    limiter.update(model, 30.0, v_ego=v_ego)
+    target = limiter.update(model, 30.0, v_ego=v_ego)
+
+    effective_distance = max(limiter.distance - v_ego * APPROACH_RESPONSE_BUFFER_S, 0.0)
+    expected = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * effective_distance)
+    unbuffered = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
+    self.assertAlmostEqual(target, expected)
+    self.assertLess(target, unbuffered)
+
   def test_curve_target_releases_slowly_until_curve_clears(self):
     limiter = ModelCurveSpeedLimiter()
     tight = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
@@ -124,7 +142,8 @@ class TestModelCurveSpeed(unittest.TestCase):
 
         field_target = np.sqrt(curve_speed_for_curvature(limiter.curvature) ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
         torque_speed = np.sqrt((TORQUE_BUDGET - 0.1) * 2.0 / curve_curvature)
-        expected = np.sqrt(torque_speed ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
+        effective_distance = max(limiter.distance - v_cruise * APPROACH_RESPONSE_BUFFER_S, 0.0)
+        expected = np.sqrt(torque_speed ** 2 + 2.0 * limiter.approach_decel * effective_distance)
         self.assertGreater(field_target, v_cruise)
         self.assertTrue(limiter.active)
         self.assertAlmostEqual(target, expected)
@@ -292,6 +311,38 @@ class TestModelCurveSpeed(unittest.TestCase):
 
         self.assertEqual(limiter.update(model, 20.0), 20.0)
         self.assertFalse(limiter.active)
+
+  def test_invalid_ego_preserves_the_last_conservative_curve_target(self):
+    curvature = np.zeros(ModelConstants.IDX_N)
+    curvature[12:17] = CURVATURE_BP[1]
+    model = make_model(curvature=curvature)
+    limiter = ModelCurveSpeedLimiter()
+    limiter.update(model, 30.0, v_ego=15.0)
+    target = limiter.update(model, 30.0, v_ego=15.0)
+    self.assertLess(target, 30.0)
+
+    for invalid_ego in (math.nan, math.inf, -math.inf, None, "invalid"):
+      with self.subTest(invalid_ego=invalid_ego):
+        self.assertEqual(limiter.update(model, 30.0, v_ego=invalid_ego), target)  # type: ignore[arg-type]
+        self.assertTrue(limiter.active)
+    self.assertEqual(limiter.update(model, target - 1.0, v_ego=None), target - 1.0)  # type: ignore[arg-type]
+
+    for invalid_cruise in (math.nan, math.inf, None, "invalid"):
+      with self.subTest(invalid_cruise=invalid_cruise):
+        self.assertEqual(limiter.update(model, invalid_cruise, v_ego=15.0), target)  # type: ignore[arg-type]
+        self.assertTrue(limiter.active)
+
+    torque_limiter = ModelCurveSpeedLimiter(make_cp())
+    torque_limiter.update(model, 30.0, v_ego=15.0, lateral_active=True)
+    torque_target = torque_limiter.update(model, 30.0, v_ego=15.0, lateral_active=True)
+    torque_veto = torque_limiter.torque_veto
+    for invalid_roll in (math.nan, math.inf, None, "invalid"):
+      with self.subTest(invalid_roll=invalid_roll):
+        self.assertEqual(torque_limiter.update(model, 30.0, v_ego=15.0, lateral_active=True,
+                                               roll=invalid_roll), torque_target)  # type: ignore[arg-type]
+        self.assertEqual(torque_limiter.torque_veto, torque_veto)
+    self.assertEqual(torque_limiter.update(model, torque_target - 1.0, v_ego=15.0, lateral_active=True,
+                                           roll=None), torque_target - 1.0)  # type: ignore[arg-type]
 
   def test_curve_speed_units_match_field_mph_values(self):
     np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [50.0, 22.0, 13.0])
