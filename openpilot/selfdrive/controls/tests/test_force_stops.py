@@ -306,6 +306,8 @@ def test_committed_stop_stays_with_mpc_until_force_stops_releases():
 
   sm["modelV2"].velocity.x[-1] = 14.0
   sm["modelV2"].action.desiredAcceleration = -1.5
+  sm["selfdriveState"].conditionalStopQualified = True
+  sm["selfdriveState"].conditionalStopDistance = 10.0
   planner.update(sm)
   release_before = planner.output_a_target
   assert planner.force_stops.forcing

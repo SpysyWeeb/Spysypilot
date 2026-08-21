@@ -203,7 +203,7 @@ class ForceStops:
     detected = ((model_stopping or action.shouldStop) and not tracking_lead) or cem_stop_qualified
     self.detect_filter.update(1.0 if detected else 0.0)
     self.braking_filter.update(1.0 if detected and braking else 0.0)
-    if not self.forcing or detected:
+    if not self.forcing:
       self.open_release_filter.x = 0.0
     else:
       self.open_release_filter.update(1.0 if model_stop_release_open(model, require_nonbraking=False) else 0.0)
