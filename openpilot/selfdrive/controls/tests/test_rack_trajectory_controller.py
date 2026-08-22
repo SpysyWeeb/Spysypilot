@@ -81,7 +81,7 @@ def test_model_path_compiles_complete_quarter_second_horizon() -> None:
     angle_offset_deg=0.0,
   )
   assert HORIZON_OFFSETS_S == tuple(index * .25 for index in range(9))
-  assert PREVIEW_S == .25
+  assert PREVIEW_S == 0.0
   assert len(targets) == len(HORIZON_OFFSETS_S)
   assert targets[0].curvature < targets[-1].curvature
 
@@ -118,7 +118,7 @@ def test_horizon_admission_rejects_each_immediate_path_violation() -> None:
   assert not horizon_candidate_preserves_immediate_path(0.0, target, baseline, rate_worse)
 
 
-def test_live_horizon_prepares_for_future_shape_without_moving_the_immediate_target() -> None:
+def test_zero_second_target_keeps_horizon_within_immediate_tolerance() -> None:
   car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
   car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
   interface = car_interface(car_params)
@@ -143,12 +143,29 @@ def test_live_horizon_prepares_for_future_shape_without_moving_the_immediate_tar
     ), model
 
   flat, _ = update([0.0] * 6)
+  immediate_turn, immediate_model = update([0.0, .0001, .0002, .0001, 0.0, 0.0])
+  immediate_targets = model_path_targets(
+    native_times_s=immediate_model.orientationRate.t,
+    orientation_rates_z=immediate_model.orientationRate.z,
+    velocities_x=immediate_model.velocity.x,
+    scalar_curvature=0.0,
+    scalar_action_plan_s=.5,
+    plan_time_now_s=.05,
+    measured_v_ego=state.vEgo,
+    query_times_s=[.05 + offset for offset in HORIZON_OFFSETS_S],
+    vehicle_model=vehicle_model,
+    roll_rad=0.0,
+    angle_offset_deg=0.0,
+  )
+  assert immediate_turn is not None
+  assert abs(immediate_turn.target_angle_deg - immediate_targets[0].angle_deg) < 1e-9
+  assert abs(immediate_turn.target_angle_deg - immediate_targets[1].angle_deg) > 1e-6
+
   future_turn, future_model = update([0.0, 0.0, .0001, .0002, .0001, 0.0])
   assert flat is not None and future_turn is not None
   assert abs(flat.target_angle_deg - future_turn.target_angle_deg) < 1e-9
   assert abs(future_turn.target_angle_deg) < 1e-9
-  assert future_turn.planned_acceleration_deg_s2 != flat.planned_acceleration_deg_s2
-  assert abs(future_turn.planned_angle_deg) <= HORIZON_POSITION_TOLERANCE_DEG
+  assert HORIZON_ACCELERATION_BLEND == .1
   future_targets = model_path_targets(
     native_times_s=future_model.orientationRate.t,
     orientation_rates_z=future_model.orientationRate.z,
@@ -167,8 +184,9 @@ def test_live_horizon_prepares_for_future_shape_without_moving_the_immediate_tar
     tuple((offset, RackTarget(target.angle_deg, target.rate_deg_s))
           for offset, target in zip(HORIZON_OFFSETS_S, future_targets, strict=True) if offset > 0.0),
   )
-  assert HORIZON_ACCELERATION_BLEND == .1
   assert abs(future_turn.planned_acceleration_deg_s2 - HORIZON_ACCELERATION_BLEND * fitted) < 1e-9
+  assert abs(future_turn.planned_angle_deg - flat.planned_angle_deg) <= HORIZON_POSITION_TOLERANCE_DEG
+  assert abs(future_turn.torque - flat.torque) < 1e-6
 
   original_admission = rack_trajectory_module.horizon_candidate_preserves_immediate_path
   try:
