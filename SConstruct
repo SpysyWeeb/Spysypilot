@@ -182,8 +182,7 @@ if arch == "comma_arm64":
   env.Append(LIBPATH=[
     "/usr/lib/aarch64-linux-gnu",
   ])
-  # This fork still has hardware headers gated by __TICI__ while current loggerd uses __COMMA_HARDWARE__.
-  arch_flags = ["-D__TICI__", "-D__COMMA_HARDWARE__", "-mcpu=cortex-a57"]
+  arch_flags = ["-D__COMMA_HARDWARE__", "-mcpu=cortex-a57"]
   env.Append(CCFLAGS=arch_flags)
   env.Append(CXXFLAGS=arch_flags)
 elif arch == "Darwin":
