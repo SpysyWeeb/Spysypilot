@@ -37,9 +37,10 @@ platform when queried firmware identifies the Palisade `LX` family. Telluride
 `ON` and unknown firmware fail closed to the stock torque controller.
 
 The rack controller owns the normalized steering request; opendbc and panda
-remain the final platform/safety authorities. This superproject currently pins
-the stock `384/+3/-7` Hyundai envelope. Separate opendbc high-limit branches are
-not part of this branch until their gitlink is deliberately reviewed and moved.
+remain the final platform/safety authorities. This superproject pins the reviewed
+BLaTv2 opendbc artifact, which selects the `409/+4/-7` Hyundai envelope for the
+shared Palisade/Telluride platform. Controller selection remains Palisade `LX`
+only; Telluride still uses the stock torque controller under that platform envelope.
 
 
 <table>
