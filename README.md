@@ -153,8 +153,9 @@ on stock `LatControlTorque`.
 The former modular BLaTv2 stack and its design documents remain historical
 research; they are not the live command owner. The current controller owns one
 normalized request and leaves Hyundai rate/driver limiting and panda safety
-downstream. This tree still pins the stock `384/+3/-7` Hyundai envelope;
-separate opendbc high-limit branches are not deployed by this gitlink.
+downstream. Combo pins the reviewed opendbc integration artifact, which selects
+the `409/+4/-7` envelope for the shared Palisade/Telluride platform. BLaTv2
+activation remains Palisade `LX` only; Telluride stays on stock `LatControlTorque`.
 
 ## To-Do
 
