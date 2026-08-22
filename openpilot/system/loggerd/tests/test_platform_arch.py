@@ -23,26 +23,37 @@ def test_comma_hardware_arch_contract():
   assert 'arch = "comma_arm64"' in text
   assert "larch64" not in text
 
+  attributes = (ROOT / ".gitattributes").read_text()
+  assert "openpilot/common/hardware/comma/updater filter=lfs" in attributes
+  assert "openpilot/common/hardware/tici/updater" not in attributes
+
 
 def test_comma_hardware_runtime_contract():
   real_isfile = os.path.isfile
   def marker_isfile(path):
-    return path == "/TICI" if path in ("/TICI", "/AGNOS") else real_isfile(path)
+    return path == "/AGNOS" if path in ("/TICI", "/AGNOS") else real_isfile(path)
 
   with patch("os.path.isfile", side_effect=marker_isfile):
     hardware = runpy.run_path(str(ROOT / "openpilot/common/hardware/__init__.py"))
 
-  assert hardware["TICI"] is True
-  assert hardware["AGNOS"] is False
+  assert hardware["AGNOS"] is True
   assert hardware["COMMA_HARDWARE"] is True
   assert hardware["PC"] is False
+
+
+def test_chestnut_build_contract():
+  text = (ROOT / "openpilot/selfdrive/modeld/SConscript").read_text()
+
+  assert "TC_OPT=2" in text
+  assert "from openpilot.system.hardware.chestnut.flash import link_up" in text
+  assert "Chestnut not ready, skipping big model build" in text
 
 
 def test_runtime_import_contract():
   subprocess.run([
     sys.executable,
     "-c",
-    "import openpilot.system.hardware.hardwared; import openpilot.selfdrive.modeld.usbgpu_link",
+    "import openpilot.system.hardware.hardwared; import openpilot.system.manager.process_config",
   ], cwd=ROOT, check=True)
 
 

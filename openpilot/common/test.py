@@ -6,7 +6,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from openpilot.common.hardware import HARDWARE, TICI
+from openpilot.common.hardware import HARDWARE, COMMA_HARDWARE
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.system.manager import manager
 
@@ -24,8 +24,7 @@ def clean_env():
 class OpenpilotTestCase(unittest.TestCase):
   """TestCase with openpilot's per-test isolation and legacy hook support."""
 
-  TICI_TEST = False
-  SKIP_TICI_SETUP = False
+  COMMA_HARDWARE_TEST = False
   SHARED_DOWNLOAD_CACHE = False
   SLOW_TEST = False
 
@@ -65,7 +64,7 @@ class OpenpilotTestCase(unittest.TestCase):
     # This boundary cannot live in setUp/tearDown: existing unittest classes
     # are allowed to override those hooks without calling super().
     if ((self.SLOW_TEST and os.environ.get("SKIP_SLOW")) or
-        (self.TICI_TEST and not TICI) or getattr(type(self), "__unittest_skip__", False)):
+        (self.COMMA_HARDWARE_TEST and not COMMA_HARDWARE) or getattr(type(self), "__unittest_skip__", False)):
       return super().run(result)
     test_env = clean_env()
     test_env.__enter__()
@@ -86,8 +85,8 @@ class OpenpilotTestCase(unittest.TestCase):
     super().setUpClass()
     if cls.SLOW_TEST and os.environ.get("SKIP_SLOW"):
       raise unittest.SkipTest("slow test")
-    if cls.TICI_TEST and not TICI:
-      raise unittest.SkipTest("Skipping tici test on PC")
+    if cls.COMMA_HARDWARE_TEST and not COMMA_HARDWARE:
+      raise unittest.SkipTest("Skipping comma hardware test on PC")
     cls._class_env = clean_env()
     cls._class_env.__enter__()
     setup_class = getattr(cls, "setup_class", None)
@@ -106,10 +105,10 @@ class OpenpilotTestCase(unittest.TestCase):
 
   def setUp(self):
     super().setUp()
-    if self.TICI_TEST and not TICI:
-      self.skipTest("Skipping tici test on PC")
+    if self.COMMA_HARDWARE_TEST and not COMMA_HARDWARE:
+      self.skipTest("Skipping comma hardware test on PC")
 
-    if self.TICI_TEST and not self.SKIP_TICI_SETUP:
+    if self.COMMA_HARDWARE_TEST:
       HARDWARE.initialize_hardware()
       HARDWARE.set_power_save(False)
       subprocess.run(["pkill", "-9", "-f", "athena"], check=False)
