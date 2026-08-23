@@ -10,9 +10,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import PathTarge
 from openpilot.selfdrive.controls.lib.rack_trajectory_planner import JerkLimitedRackPlanner
 
 REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
-REFERENCE_REVERSAL_PERSISTENCE_S = .3
-REFERENCE_REVERSAL_RC_S = .3
-REFERENCE_PERSISTENT_RC_S = .05
+REFERENCE_REVERSAL_RC_S = .15
 REFERENCE_MAX_RATE_DEG_S = 5.0
 
 
@@ -128,8 +126,6 @@ class RackReferenceGovernor:
     self.last_model_timestamp_ns: int | None = None
     self.last_replan_position_deg: float | None = None
     self.direction = 0
-    self.reversal_start_model_ns: int | None = None
-    self.reversal_s = 0.0
     self.active = False
     self.limited = False
 
@@ -138,8 +134,6 @@ class RackReferenceGovernor:
     self.last_model_timestamp_ns = None
     self.last_replan_position_deg = None
     self.direction = 0
-    self.reversal_start_model_ns = None
-    self.reversal_s = 0.0
     self.active = False
     self.limited = False
 
@@ -149,8 +143,6 @@ class RackReferenceGovernor:
 
   def _accept(self, target: RackTarget) -> RackTarget:
     self.accepted = target
-    self.reversal_start_model_ns = None
-    self.reversal_s = 0.0
     self.active = False
     self.limited = False
     return target
@@ -189,8 +181,6 @@ class RackReferenceGovernor:
       return self._accept(target)
     if reversal:
       self.active = True
-      self.reversal_start_model_ns = timestamp_ns
-      self.reversal_s = 0.0
     if new_model:
       self.last_model_timestamp_ns = timestamp_ns
       self.last_replan_position_deg = target.position_deg
@@ -199,10 +189,7 @@ class RackReferenceGovernor:
     if not self.active:
       return self._accept(target)
 
-    assert self.reversal_start_model_ns is not None
-    self.reversal_s = max(0.0, (timestamp_ns - self.reversal_start_model_ns) * 1e-9)
-    rc = REFERENCE_PERSISTENT_RC_S if self.reversal_s >= REFERENCE_REVERSAL_PERSISTENCE_S else REFERENCE_REVERSAL_RC_S
-    alpha = dt / (rc + dt)
+    alpha = dt / (REFERENCE_REVERSAL_RC_S + dt)
     self.accepted = RackTarget(
       self.accepted.position_deg + alpha * (target.position_deg - self.accepted.position_deg),
       self.accepted.rate_deg_s + alpha * (target.rate_deg_s - self.accepted.rate_deg_s),
