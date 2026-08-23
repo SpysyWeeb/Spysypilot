@@ -539,6 +539,53 @@ def test_reference_governor_holds_short_small_reversal() -> None:
     assert governor.reversal_s == 0.0
 
 
+def test_reference_governor_filters_small_neutral_reversal() -> None:
+  planner = JerkLimitedRackPlanner(0.0)
+  governor = RackReferenceGovernor()
+
+  govern_reference(governor, RackTarget(0.0, 0.0), planner, 0)
+  govern_reference(governor, RackTarget(.4, 0.0), planner, 1)
+  accepted = govern_reference(governor, RackTarget(-.2, 0.0), planner, 2)
+
+  assert -.2 < accepted.position_deg < .4
+  assert governor.limited
+
+
+def test_reference_governor_keeps_small_reversal_slow_for_300_ms() -> None:
+  planner = JerkLimitedRackPlanner(5.0)
+  governor = RackReferenceGovernor()
+
+  govern_reference(governor, RackTarget(5.0, 0.0), planner, 0)
+  govern_reference(governor, RackTarget(5.5, 0.0), planner, 1)
+  accepted = RackTarget(5.5, 0.0)
+  for model_frame in range(2, 7):
+    for _ in range(5):
+      accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, model_frame)
+
+  assert accepted.position_deg > 5.1
+  assert governor.limited
+
+
+def test_reference_governor_switches_to_persistent_response_at_300_ms() -> None:
+  planner = JerkLimitedRackPlanner(5.0)
+  governor = RackReferenceGovernor()
+
+  govern_reference(governor, RackTarget(5.0, 0.0), planner, 0)
+  govern_reference(governor, RackTarget(5.5, 0.0), planner, 1)
+  accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, 2)
+  previous = accepted
+  for model_frame in range(3, 8):
+    previous = accepted
+    accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, model_frame)
+  slow_step = abs(accepted.position_deg - previous.position_deg)
+
+  persistent = govern_reference(governor, RackTarget(4.9, 0.0), planner, 8)
+
+  assert abs(governor.reversal_s - .3) < 1e-9
+  assert abs(persistent.position_deg - accepted.position_deg) > 4.0 * slow_step
+  assert governor.limited
+
+
 def test_reference_governor_passes_large_persistent_and_necessary_reversals() -> None:
   large = RackReferenceGovernor()
   stationary = JerkLimitedRackPlanner(5.0)
