@@ -10,7 +10,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import PathTarge
 from openpilot.selfdrive.controls.lib.rack_trajectory_planner import JerkLimitedRackPlanner
 
 REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
-REFERENCE_REVERSAL_PERSISTENCE_S = .15
+REFERENCE_REVERSAL_PERSISTENCE_S = .3
 REFERENCE_REVERSAL_RC_S = .3
 REFERENCE_PERSISTENT_RC_S = .05
 REFERENCE_MAX_RATE_DEG_S = 5.0
@@ -174,14 +174,10 @@ class RackReferenceGovernor:
       return self._accept(target)
     plan_error = abs(target.position_deg - planner.position_deg)
     filter_error = abs(target.position_deg - self.accepted.position_deg)
-    crosses_neutral = (
-      (self.accepted.position_deg - neutral_position_deg) * (target.position_deg - neutral_position_deg) <= 0.0
-    )
     coherent_motion = (
       plan_error >= REFERENCE_REVERSAL_DISTANCE_DEG
       or filter_error >= REFERENCE_REVERSAL_DISTANCE_DEG
       or abs(target.rate_deg_s) >= REFERENCE_MAX_RATE_DEG_S
-      or crosses_neutral
     )
     reversal = new_model and raw_change_direction != 0 and self.direction != 0 and raw_change_direction != self.direction
     if coherent_motion:
