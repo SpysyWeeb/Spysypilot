@@ -21,6 +21,9 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   RackPlan,
   RackReferenceGovernor,
   RackTarget,
+  REFERENCE_PERSISTENT_RC_S,
+  REFERENCE_REVERSAL_PERSISTENCE_S,
+  REFERENCE_REVERSAL_RC_S,
   HORIZON_OFFSETS_S,
   HORIZON_ACCELERATION_BLEND,
   HORIZON_POSITION_TOLERANCE_DEG,
@@ -551,39 +554,56 @@ def test_reference_governor_filters_small_neutral_reversal() -> None:
   assert governor.limited
 
 
-def test_reference_governor_keeps_small_reversal_slow_for_300_ms() -> None:
+def test_reference_governor_switches_at_300_ms_and_converges() -> None:
   planner = JerkLimitedRackPlanner(5.0)
   governor = RackReferenceGovernor()
+  target = RackTarget(4.9, 0.0)
 
   govern_reference(governor, RackTarget(5.0, 0.0), planner, 0)
   govern_reference(governor, RackTarget(5.5, 0.0), planner, 1)
-  accepted = RackTarget(5.5, 0.0)
   for model_frame in range(2, 7):
     for _ in range(5):
-      accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, model_frame)
+      govern_reference(governor, target, planner, model_frame)
 
-  assert accepted.position_deg > 5.1
-  assert governor.limited
+  before_slow = governor.accepted
+  assert before_slow is not None
+  slow = govern_reference(governor, target, planner, 7)
+  slow_alpha = .01 / (REFERENCE_REVERSAL_RC_S + .01)
+  assert abs(slow.position_deg - (before_slow.position_deg + slow_alpha * (target.position_deg - before_slow.position_deg))) < 1e-12
+  for _ in range(4):
+    slow = govern_reference(governor, target, planner, 7)
+  assert abs(governor.reversal_s - .25) < 1e-9
+
+  persistent = govern_reference(governor, target, planner, 8)
+  persistent_alpha = .01 / (REFERENCE_PERSISTENT_RC_S + .01)
+  assert abs(persistent.position_deg - (slow.position_deg + persistent_alpha * (target.position_deg - slow.position_deg))) < 1e-12
+  assert abs(governor.reversal_s - REFERENCE_REVERSAL_PERSISTENCE_S) < 1e-9
+
+  for model_frame in range(8, 40):
+    for _ in range(5):
+      persistent = govern_reference(governor, target, planner, model_frame)
+  assert abs(persistent.position_deg - target.position_deg) < 1e-9
+  assert not governor.limited
 
 
-def test_reference_governor_switches_to_persistent_response_at_300_ms() -> None:
-  planner = JerkLimitedRackPlanner(5.0)
+def test_reference_governor_preserves_gradual_neutral_crossing_continuity() -> None:
+  planner = JerkLimitedRackPlanner(0.0)
   governor = RackReferenceGovernor()
 
-  govern_reference(governor, RackTarget(5.0, 0.0), planner, 0)
-  govern_reference(governor, RackTarget(5.5, 0.0), planner, 1)
-  accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, 2)
-  previous = accepted
-  for model_frame in range(3, 8):
-    previous = accepted
-    accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, model_frame)
-  slow_step = abs(accepted.position_deg - previous.position_deg)
+  govern_reference(governor, RackTarget(0.0, 0.0), planner, 0)
+  accepted = govern_reference(governor, RackTarget(.4, 2.0), planner, 1)
+  maximum_step = 0.0
+  frame_positions = []
+  for model_frame, position in enumerate((.3, .2, .1, 0.0, -.1, -.2, -.3, -.4), 2):
+    for _ in range(5):
+      previous = accepted
+      accepted = govern_reference(governor, RackTarget(position, -2.0), planner, model_frame)
+      assert accepted.position_deg <= previous.position_deg
+      maximum_step = max(maximum_step, previous.position_deg - accepted.position_deg)
+    frame_positions.append(accepted.position_deg)
 
-  persistent = govern_reference(governor, RackTarget(4.9, 0.0), planner, 8)
-
-  assert abs(governor.reversal_s - .3) < 1e-9
-  assert abs(persistent.position_deg - accepted.position_deg) > 4.0 * slow_step
-  assert governor.limited
+  assert frame_positions[5] > 0.0 > frame_positions[6]
+  assert maximum_step < .1
 
 
 def test_reference_governor_passes_large_persistent_and_necessary_reversals() -> None:
