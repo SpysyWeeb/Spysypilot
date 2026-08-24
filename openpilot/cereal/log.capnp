@@ -1155,7 +1155,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     accelerationLimitDegS2 @13 :Float32;
     jerkLimitDegS3 @14 :Float32;
     profileTransition @15 :Bool;
-    status @16 :UInt8; # 0 inactive, 1 active, 2 override, 3 no model, 4 invalid state, 5 stale, 6 invalid action time, 7 invalid path, 8 invalid output, 9 invalid planner state
+    status @16 :UInt8; # 0 inactive, 1 active, 2 reserved, 3 no model, 4 invalid state, 5 stale, 6 invalid action time, 7 invalid path, 8 invalid output, 9 invalid planner state
     pathLimited @17 :Bool;
     targetCurvature @18 :Float32;
   }
