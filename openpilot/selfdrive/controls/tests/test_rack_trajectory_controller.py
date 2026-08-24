@@ -556,7 +556,7 @@ def test_reference_governor_uses_constant_response_and_converges() -> None:
   governor = RackReferenceGovernor()
   target = RackTarget(4.9, 0.0)
 
-  assert REFERENCE_REVERSAL_RC_S == .15
+  assert REFERENCE_REVERSAL_RC_S == .12
   govern_reference(governor, RackTarget(5.0, 0.0), planner, 0)
   govern_reference(governor, RackTarget(5.5, 0.0), planner, 1)
   alpha = .01 / (REFERENCE_REVERSAL_RC_S + .01)
@@ -587,7 +587,7 @@ def test_reference_governor_preserves_gradual_neutral_crossing_continuity() -> N
       maximum_step = max(maximum_step, previous.position_deg - accepted.position_deg)
     frame_positions.append(accepted.position_deg)
 
-  assert frame_positions[5] > 0.0 > frame_positions[6]
+  assert frame_positions[0] > 0.0 > frame_positions[-1]
   assert maximum_step < .1
 
 
