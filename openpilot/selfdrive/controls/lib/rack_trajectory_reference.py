@@ -10,7 +10,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import PathTarge
 from openpilot.selfdrive.controls.lib.rack_trajectory_planner import JerkLimitedRackPlanner
 
 REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
-REFERENCE_REVERSAL_RC_S = .15
+REFERENCE_REVERSAL_RC_S = .12
 REFERENCE_MAX_RATE_DEG_S = 5.0
 
 
