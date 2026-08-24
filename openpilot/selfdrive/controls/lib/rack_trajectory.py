@@ -50,14 +50,12 @@ __all__ = (
   "MAX_FEEDBACK_TORQUE",
   "MAX_TURN_IN_FEEDBACK_TORQUE",
   "MAX_DRIVER_ASSIST_TORQUE",
-  "DRIVER_OVERRIDE_ASSIST_SCALE",
   "REFERENCE_REVERSAL_DISTANCE_DEG",
   "REFERENCE_REVERSAL_RC_S",
   "REFERENCE_MAX_RATE_DEG_S",
   "MEASURED_RATE_FILTER_RC_S",
   "STATUS_INACTIVE",
   "STATUS_ACTIVE",
-  "STATUS_DRIVER_OVERRIDE",
   "STATUS_NO_MODEL",
   "STATUS_INVALID_VEHICLE_STATE",
   "STATUS_STALE_MODEL",
@@ -87,12 +85,10 @@ HORIZON_RATE_TOLERANCE_DEG_S = .5
 HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
-MAX_DRIVER_ASSIST_TORQUE = .35
-DRIVER_OVERRIDE_ASSIST_SCALE = .5
+MAX_DRIVER_ASSIST_TORQUE = .5
 
 STATUS_INACTIVE = 0
 STATUS_ACTIVE = 1
-STATUS_DRIVER_OVERRIDE = 2
 STATUS_NO_MODEL = 3
 STATUS_INVALID_VEHICLE_STATE = 4
 STATUS_STALE_MODEL = 5
@@ -146,7 +142,6 @@ class PalisadeRackTrajectoryController:
     self.transition_rate_limit: float | None = None
     self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
-    self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_governor = RackReferenceGovernor()
@@ -161,16 +156,13 @@ class PalisadeRackTrajectoryController:
     self.transition_rate_limit = None
     self.transition_acceleration_limit = None
     self.previous_planned_lateral_accel = None
-    self.driver_override_resume = False
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_governor.reset()
     self.rack_rate_estimator.reset()
 
   def _invalidate(self, status: int) -> None:
-    driver_override_resume = self.driver_override_resume
     self.reset()
-    self.driver_override_resume = driver_override_resume
     self.status = status
 
   def _measured_rate(self, angle_deg: float, raw_rate_deg_s: float) -> tuple[float, bool]:
@@ -383,7 +375,6 @@ class PalisadeRackTrajectoryController:
     target_angle = target.angle_deg - params.angleOffsetDeg
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
     target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
-    unwinding = target_motion * target_angle < 0.0
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
       (planned_lateral_accel - self.previous_planned_lateral_accel) / self.dt
@@ -412,10 +403,7 @@ class PalisadeRackTrajectoryController:
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
-    feedforward_torque = (
-      0.0 if self.driver_override_resume
-      else -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
-    )
+    feedforward_torque = -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
 
     curvature_per_degree = -VM.calc_curvature(math.radians(1.0), CS.vEgo, 0.0)
     lateral_accel_per_degree = curvature_per_degree * CS.vEgo ** 2
@@ -432,9 +420,7 @@ class PalisadeRackTrajectoryController:
       and abs(target_angle) > abs(measured_angle)
       and target_motion * target_angle > 0.0
     )
-    if self.driver_override_resume:
-      feedback_lower, feedback_upper = -MAX_DRIVER_ASSIST_TORQUE, MAX_DRIVER_ASSIST_TORQUE
-    elif turning_in:
+    if turning_in:
       feedback_lower = -MAX_TURN_IN_FEEDBACK_TORQUE if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
       feedback_upper = MAX_TURN_IN_FEEDBACK_TORQUE if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
     else:
@@ -458,35 +444,11 @@ class PalisadeRackTrajectoryController:
     )):
       self._invalidate(STATUS_INVALID_OUTPUT)
       return None
-    driver_torque = float(CS.steeringTorque)
     if CS.steeringPressed:
-      if self.driver_override_resume or torque * driver_torque < 0.0 or target_motion * driver_torque <= 0.0:
-        self.driver_override_resume = True
-        driver_hold_lateral_accel = measured_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset
-        raw_driver_assist_torque = (
-          -DRIVER_OVERRIDE_ASSIST_SCALE * float(torque_from_lateral_accel(driver_hold_lateral_accel, torque_params))
-        )
-        if not math.isfinite(raw_driver_assist_torque):
-          self._invalidate(STATUS_INVALID_OUTPUT)
-          return None
-        driver_assist_torque = _clip(raw_driver_assist_torque, DRIVER_OVERRIDE_ASSIST_SCALE)
-        if driver_assist_torque * driver_torque <= 0.0:
-          driver_assist_torque = 0.0
-        torque_limited |= driver_assist_torque != torque
-        torque = driver_assist_torque
-        feedforward_torque = driver_assist_torque
-        position_feedback = 0.0
-        rate_feedback = 0.0
-        feedback = 0.0
-        self.status = STATUS_DRIVER_OVERRIDE
-      else:
-        assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
-        torque_limited |= assisted_torque != torque
-        torque = assisted_torque
-    if self.driver_override_resume and not CS.steeringPressed and not unwinding:
-      self.driver_override_resume = False
-    if not CS.steeringPressed or not self.driver_override_resume:
-      self.status = STATUS_ACTIVE
+      assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
+      torque_limited |= assisted_torque != torque
+      torque = assisted_torque
+    self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
       torque=torque,
       target_curvature=target.curvature,

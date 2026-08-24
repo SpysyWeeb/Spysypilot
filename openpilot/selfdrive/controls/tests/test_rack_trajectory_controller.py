@@ -6,15 +6,15 @@ import math
 from openpilot.cereal import log, messaging
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.hyundai.values import CAR as HYUNDAI, CarControllerParams
+from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
-from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.realtime import DT_CTRL
 import openpilot.selfdrive.controls.lib.rack_trajectory as rack_trajectory_module
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
-  DRIVER_OVERRIDE_ASSIST_SCALE,
+  MAX_DRIVER_ASSIST_TORQUE,
   MEASURED_RATE_FILTER_RC_S,
   MotionLimits,
   RackRateEstimator,
@@ -32,7 +32,6 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   model_path_targets,
   PalisadeRackTrajectoryController,
   STATUS_ACTIVE,
-  STATUS_DRIVER_OVERRIDE,
   STATUS_INVALID_ACTION_TIME,
   STATUS_INVALID_PATH,
   STATUS_STALE_MODEL,
@@ -415,7 +414,7 @@ def test_signed_rack_rate_handles_signed_and_unsigned_samples() -> None:
   assert sum(abs(filtered[index] - filtered[index - 1]) for index in range(1, len(filtered))) < 8.0 * 19 * .4
 
 
-def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion() -> None:
+def test_feedforward_boundary_and_driver_handoff_cap() -> None:
   car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
   car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
   interface = car_interface(car_params)
@@ -431,12 +430,13 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
   model.orientationRate.z = [0.0] * 6
   model.velocity.x = [5.0] * 6
+  torque_from_lateral_accel = interface.torque_from_lateral_accel()
 
-  def update():
+  def update(torque_scale: float = 1.0):
     controller.set_model(model, 1_050_000_000)
     return controller.update(
       True, state, vehicle_model, params, car_params.lateralTuning.torque,
-      interface.torque_from_lateral_accel(), .2, -.02,
+      lambda lateral_accel, torque_params: torque_scale * torque_from_lateral_accel(lateral_accel, torque_params), .2, -.02,
     )
 
   output = update()
@@ -461,69 +461,51 @@ def test_unwind_feedforward_ignores_boundary_chatter_but_suppresses_large_motion
   plan_offset_before_override = planner_before_override.position_deg - state.steeringAngleDeg
 
   state.steeringPressed = True
-  state.steeringTorque = 300.0
+  state.steeringTorque = -300.0
   state.steeringAngleDeg += 2.0
-  handoff_output = update()
+  handoff_output = update(4.0)
   assert handoff_output is not None
-  assert DRIVER_OVERRIDE_ASSIST_SCALE == .5
-  assert 0.0 < handoff_output.torque <= DRIVER_OVERRIDE_ASSIST_SCALE
-  expected_hold_torque = -DRIVER_OVERRIDE_ASSIST_SCALE * float(interface.torque_from_lateral_accel()(
-    handoff_output.actual_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - car_params.lateralTuning.torque.latAccelOffset,
-    car_params.lateralTuning.torque,
-  ))
-  assert abs(handoff_output.torque - max(-.5, min(.5, expected_hold_torque))) < 1e-12
-  assert handoff_output.feedforward_torque == handoff_output.torque
-  assert handoff_output.feedback_torque == 0.0
-  assert handoff_output.position_feedback_torque == 0.0
-  assert handoff_output.rate_feedback_torque == 0.0
-  assert controller.status == STATUS_DRIVER_OVERRIDE
+  assert MAX_DRIVER_ASSIST_TORQUE == .5
+  normal_torque = max(-1.0, min(1.0, handoff_output.feedforward_torque + handoff_output.feedback_torque))
+  assert normal_torque > MAX_DRIVER_ASSIST_TORQUE
+  assert handoff_output.torque == MAX_DRIVER_ASSIST_TORQUE
+  assert handoff_output.feedback_torque != 0.0
+  assert controller.status == STATUS_ACTIVE
+  assert not hasattr(controller, "driver_override_resume")
+
+  negative_handoff_output = update(-4.0)
+  assert negative_handoff_output is not None
+  normal_torque = max(-1.0, min(1.0, negative_handoff_output.feedforward_torque + negative_handoff_output.feedback_torque))
+  assert normal_torque < -MAX_DRIVER_ASSIST_TORQUE
+  assert negative_handoff_output.torque == -MAX_DRIVER_ASSIST_TORQUE
   assert controller.planner is planner_before_override
   plan_offset_during_override = planner_before_override.position_deg - state.steeringAngleDeg
   assert abs(plan_offset_during_override - plan_offset_before_override) < .25
-  handoff_torques = [handoff_output.torque]
-  for _ in range(199):
-    state.steeringAngleDeg += .02
-    handoff_output = update()
-    assert handoff_output is not None
-    assert 0.0 <= handoff_output.torque * state.steeringTorque
-    assert abs(handoff_output.torque) <= .5
-    assert controller.status == STATUS_DRIVER_OVERRIDE
-    assert controller.planner is planner_before_override
-    handoff_torques.append(handoff_output.torque)
-  assert max(abs(current - previous) for previous, current in zip(handoff_torques, handoff_torques[1:], strict=False)) < .01
+
   state.steeringPressed = False
   state.steeringTorque = 0.0
-
   release_output = update()
   assert release_output is not None
-  assert release_output.feedforward_torque == 0.0
-  assert abs(release_output.torque) <= .35
-  assert release_output.torque * (release_output.planned_angle_deg - state.steeringAngleDeg) >= 0.0
+  assert release_output.feedforward_torque != 0.0
   assert controller.status == STATUS_ACTIVE
 
+  controller.reset()
+  state.steeringAngleDeg = target_angle
   state.steeringPressed = True
-  state.steeringTorque = 300.0
-  handoff_output = update()
-  assert handoff_output is not None
-  assert handoff_output.torque * state.steeringTorque >= 0.0
-  assert controller.status == STATUS_DRIVER_OVERRIDE
-  state.steeringPressed = False
-  state.steeringTorque = 0.0
+  state.steeringTorque = -300.0
+  subcap_output = update()
+  assert subcap_output is not None
+  normal_torque = max(-1.0, min(1.0, subcap_output.feedforward_torque + subcap_output.feedback_torque))
+  assert abs(normal_torque) < MAX_DRIVER_ASSIST_TORQUE
+  assert subcap_output.torque == normal_torque
 
-  invalid_model = messaging.new_message("modelV2").modelV2
-  invalid_model.timestampEof = 1_000_000_000
-  invalid_model.action.desiredCurvature = -.02
-  invalid_model.action.desiredCurvatureTime = .5
-  controller.set_model(invalid_model, 1_050_000_000)
-  assert controller.update(
-    True, state, vehicle_model, params, car_params.lateralTuning.torque,
-    interface.torque_from_lateral_accel(), .2, -.02,
-  ) is None
-  assert controller.driver_override_resume
-
-  output = update()
-  assert output is not None
-  assert abs(output.feedforward_torque) < .05
+  limits = CarControllerParams(car_params)
+  capped_request = -round(MAX_DRIVER_ASSIST_TORQUE * limits.STEER_MAX)
+  for driver_torque, expected in ((150.0, capped_request), (200.0, -109), (255.0, 0)):
+    applied = capped_request
+    for _ in range(100):
+      applied = apply_driver_steer_torque_limits(capped_request, applied, driver_torque, limits)
+    assert applied == expected
 
 
 def test_reference_governor_holds_short_small_reversal() -> None:
@@ -943,14 +925,15 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   state.steeringPressed = True
   state.steeringTorque = 300.0
   torque, _, _ = assist.update(True, state, vehicle_model, params, False, -.02, False, .2)
-  assert 0.0 < torque <= .35
+  assert 0.0 < torque <= MAX_DRIVER_ASSIST_TORQUE
 
   assist.set_rack_trajectory_model(model, 1_050_000_000)
   state.steeringTorque = -300.0
   torque, _, _ = assist.update(True, state, vehicle_model, params, False, -.02, False, .2)
-  assert torque == 0.0
-  assert assist.rack_trajectory is not None
-  assert assist.rack_trajectory.status == 2
+  assert assist.rack_trajectory is not None and assist.rack_trajectory_output is not None
+  normal_torque = max(-1.0, min(1.0, assist.rack_trajectory_output.feedforward_torque + assist.rack_trajectory_output.feedback_torque))
+  assert torque == max(-MAX_DRIVER_ASSIST_TORQUE, min(MAX_DRIVER_ASSIST_TORQUE, normal_torque))
+  assert assist.rack_trajectory.status == STATUS_ACTIVE
 
   invalid_driver = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
   invalid_driver.set_rack_trajectory_model(model, 1_050_000_000)
