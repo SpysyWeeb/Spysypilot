@@ -375,6 +375,11 @@ class PalisadeRackTrajectoryController:
     target_angle = target.angle_deg - params.angleOffsetDeg
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
     target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
+    turning_in = (
+      target_angle * measured_angle >= 0.0
+      and abs(target_angle) > abs(measured_angle)
+      and target_motion * target_angle > 0.0
+    )
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
       (planned_lateral_accel - self.previous_planned_lateral_accel) / self.dt
@@ -400,6 +405,15 @@ class PalisadeRackTrajectoryController:
     elif (governed_lateral_accel * planned_lateral_accel > 0.0
           and abs(governed_lateral_accel) < abs(planned_lateral_accel)):
       trajectory_feedforward_lateral_accel = governed_lateral_accel
+    unwind_scale = 1.0
+    planned_angle = plan.position_deg - params.angleOffsetDeg
+    intended_angle = measured_angle + target_motion
+    if measured_angle != 0.0:
+      planned_hold_angle = abs(planned_angle) if planned_angle * measured_angle > 0.0 else 0.0
+      turn_in_angle = abs(intended_angle) if intended_angle * measured_angle > 0.0 else 0.0
+      unwind_scale = min(
+        1.0, max(planned_hold_angle, turn_in_angle) / abs(measured_angle),
+      )
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
@@ -415,11 +429,6 @@ class PalisadeRackTrajectoryController:
       gain * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate), torque_params,
     )) if measured_rate_valid else 0.0
     raw_feedback = position_feedback + rate_feedback
-    turning_in = (
-      target_angle * measured_angle >= 0.0
-      and abs(target_angle) > abs(measured_angle)
-      and target_motion * target_angle > 0.0
-    )
     if turning_in:
       feedback_lower = -MAX_TURN_IN_FEEDBACK_TORQUE if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
       feedback_upper = MAX_TURN_IN_FEEDBACK_TORQUE if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
@@ -428,9 +437,13 @@ class PalisadeRackTrajectoryController:
     feedback = float(np.clip(raw_feedback, feedback_lower, feedback_upper))
     feedback_limited = feedback != raw_feedback
     raw_torque = feedforward_torque + feedback
+    if raw_torque * measured_angle > 0.0:
+      raw_torque *= unwind_scale
+    elif (measured_angle == 0.0 and planned_angle * intended_angle > 0.0
+          and raw_torque * planned_angle < 0.0):
+      raw_torque = 0.0
     torque = float(np.clip(raw_torque, -1.0, 1.0))
     torque_limited = torque != raw_torque
-    planned_angle = plan.position_deg - params.angleOffsetDeg
     if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
       torque_limited |= torque != 0.0
       torque = 0.0
