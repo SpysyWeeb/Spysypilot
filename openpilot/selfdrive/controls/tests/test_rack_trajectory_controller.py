@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+from unittest.mock import patch
 
 from openpilot.cereal import log, messaging
 from opendbc.car.car_helpers import interfaces
@@ -21,6 +22,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   RackPlan,
   RackReferenceGovernor,
   RackTarget,
+  RESPONSE_TIME_S,
   REFERENCE_REVERSAL_RC_S,
   HORIZON_OFFSETS_S,
   HORIZON_ACCELERATION_BLEND,
@@ -414,6 +416,104 @@ def test_signed_rack_rate_handles_signed_and_unsigned_samples() -> None:
   assert sum(abs(filtered[index] - filtered[index - 1]) for index in range(1, len(filtered))) < 8.0 * 19 * .4
 
 
+def test_unwind_feedforward_releases_hold_torque_continuously() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  vehicle_model = VehicleModel(car_params)
+  params = log.VehicleParameters.new_message()
+  state = car.CarState.new_message()
+  state.vEgo = 13.6
+  torque_params = car_params.lateralTuning.torque
+  torque_params.friction = 0.0
+  torque_params.latAccelOffset = 0.0
+
+  def run(planned_angle: float, measured_angle: float, target_angle: float | None = None, feedback_gain: float | None = 0.0):
+    controller = PalisadeRackTrajectoryController()
+    controller.planner = JerkLimitedRackPlanner(planned_angle)
+    state.steeringAngleDeg = measured_angle
+    target_angle = planned_angle if target_angle is None else target_angle
+    target_curvature = -vehicle_model.calc_curvature(math.radians(target_angle), state.vEgo, 0.0)
+    model = messaging.new_message("modelV2").modelV2
+    model.timestampEof = 1_000_000_000
+    model.action.desiredCurvature = target_curvature
+    model.action.desiredCurvatureTime = .5
+    model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+    model.orientationRate.z = [0.0] * 6
+    model.velocity.x = [state.vEgo] * 6
+    controller.set_model(model, 1_050_000_000)
+    arguments = (
+      True, state, vehicle_model, params, torque_params, lambda lateral_accel, _: lateral_accel, .2, target_curvature,
+    )
+    if feedback_gain is None:
+      output = controller.update(*arguments)
+    else:
+      with patch.object(controller, "_feedback_gain", return_value=feedback_gain):
+        output = controller.update(*arguments)
+    assert output is not None
+    return output
+
+  hold = run(2.0, 2.0)
+  unwinds = [run(2.0, measured_angle) for measured_angle in (2.5, 3.0, 4.0)]
+  unwind = unwinds[-1]
+  turn_in = run(2.0, 1.0)
+  transient_turn_in_hold = run(1.0, 1.0, 4.0)
+  transient_turn_in_lag = run(1.0, 2.0, 4.0)
+  left_unwind = run(-2.0, -4.0)
+  cross_center = run(-2.0, 4.0)
+  at_center = run(-2.0, 0.0)
+  already_centerward = run(2.0, 4.0, feedback_gain=None)
+
+  assert abs(hold.feedforward_torque) > .1
+  assert math.isclose(turn_in.torque, hold.torque, rel_tol=0.0, abs_tol=1e-9)
+  assert math.isclose(transient_turn_in_lag.torque, transient_turn_in_hold.torque, rel_tol=0.0, abs_tol=1e-9)
+  for target_angle in (1.0, 1.5, 2.0, 2.5):
+    directional_hold = run(1.0, 1.0, target_angle)
+    directional_lag = run(1.0, 2.0, target_angle)
+    intended_angle = directional_lag.target_angle_deg + RESPONSE_TIME_S * directional_lag.target_rate_deg_s
+    turn_in_angle = abs(intended_angle) if intended_angle > 0.0 else 0.0
+    expected_scale = min(1.0, max(abs(directional_lag.planned_angle_deg), turn_in_angle) / 2.0)
+    assert math.isclose(
+      directional_lag.feedforward_torque, directional_hold.feedforward_torque, rel_tol=0.0, abs_tol=1e-9,
+    )
+    assert math.isclose(
+      directional_lag.torque, expected_scale * directional_hold.torque, rel_tol=0.0, abs_tol=1e-9,
+    )
+  for measured_angle, output in zip((2.5, 3.0, 4.0), unwinds, strict=True):
+    assert math.isclose(output.feedforward_torque, hold.feedforward_torque, rel_tol=0.0, abs_tol=1e-9)
+    assert math.isclose(output.torque, 2.0 / measured_angle * hold.torque, rel_tol=0.0, abs_tol=1e-9)
+  assert math.isclose(left_unwind.feedforward_torque, -unwind.feedforward_torque, rel_tol=0.0, abs_tol=1e-9)
+  assert math.isclose(left_unwind.torque, -unwind.torque, rel_tol=0.0, abs_tol=1e-9)
+  assert math.isclose(cross_center.torque, -hold.torque, rel_tol=0.0, abs_tol=1e-9)
+  assert math.isclose(at_center.torque, -hold.torque, rel_tol=0.0, abs_tol=1e-9)
+  assert already_centerward.torque * already_centerward.planned_angle_deg < 0.0
+  assert math.isclose(
+    already_centerward.torque,
+    already_centerward.feedforward_torque + already_centerward.feedback_torque,
+    rel_tol=0.0,
+    abs_tol=1e-9,
+  )
+
+  with patch.object(rack_trajectory_module, "get_friction", return_value=-.04):
+    hold_with_friction = run(2.0, 2.0)
+    unwind_with_friction = run(2.0, 4.0)
+  assert math.isclose(
+    hold_with_friction.feedforward_torque - hold.feedforward_torque,
+    unwind_with_friction.feedforward_torque - unwind.feedforward_torque,
+    rel_tol=0.0,
+    abs_tol=1e-9,
+  )
+
+  with patch.object(rack_trajectory_module, "get_friction", return_value=-.4):
+    outward_cross_center = run(-2.0, 4.0)
+    outward_at_center = run(-2.0, 0.0)
+  with patch.object(rack_trajectory_module, "get_friction", return_value=.4):
+    mirrored_outward_at_center = run(2.0, 0.0)
+  assert outward_cross_center.feedforward_torque > 0.0
+  assert outward_cross_center.torque == 0.0
+  assert outward_at_center.torque == 0.0
+  assert mirrored_outward_at_center.torque == 0.0
+
+
 def test_feedforward_boundary_and_driver_handoff_cap() -> None:
   car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
   car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
@@ -497,7 +597,7 @@ def test_feedforward_boundary_and_driver_handoff_cap() -> None:
   assert subcap_output is not None
   normal_torque = max(-1.0, min(1.0, subcap_output.feedforward_torque + subcap_output.feedback_torque))
   assert abs(normal_torque) < MAX_DRIVER_ASSIST_TORQUE
-  assert subcap_output.torque == normal_torque
+  assert math.isclose(subcap_output.torque, normal_torque, rel_tol=0.0, abs_tol=1e-9)
 
   limits = CarControllerParams(car_params)
   capped_request = -round(MAX_DRIVER_ASSIST_TORQUE * limits.STEER_MAX)
