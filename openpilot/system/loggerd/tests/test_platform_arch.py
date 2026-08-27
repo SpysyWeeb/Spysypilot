@@ -1,6 +1,7 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import runpy
 import subprocess
 import sys
@@ -47,6 +48,22 @@ def test_chestnut_build_contract():
   assert "TC_OPT=2" in text
   assert "from openpilot.system.hardware.chestnut.flash import link_up" in text
   assert "Chestnut not ready, skipping big model build" in text
+
+
+def test_camera_name_contract():
+  sources = [
+    ROOT / "openpilot/common/transformations/camera.py",
+    ROOT / "openpilot/selfdrive/modeld/modeld.py",
+    ROOT / "openpilot/selfdrive/monitoring/policy.py",
+    ROOT / "openpilot/selfdrive/test/process_replay/vision_meta.py",
+    ROOT / "openpilot/selfdrive/ui/mici/onroad/augmented_road_view.py",
+    ROOT / "openpilot/selfdrive/ui/onroad/augmented_road_view.py",
+  ]
+  text = "\n".join(path.read_text() for path in sources)
+
+  assert "narrow_road: CameraConfig" in text
+  assert "wide_road: CameraConfig" in text
+  assert re.search(r"\.(?:[fde]cam)\b", text) is None
 
 
 def test_runtime_import_contract():
