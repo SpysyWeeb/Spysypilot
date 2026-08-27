@@ -397,7 +397,9 @@ def test_signed_rack_rate_handles_signed_and_unsigned_samples() -> None:
   alpha = DT_CTRL / (MEASURED_RATE_FILTER_RC_S + DT_CTRL)
   assert valid and abs(positive_rate - (-5.0 + alpha * 10.0)) < 1e-12
 
+  controller.direction_guard_scale = 0.0
   controller.reset()
+  assert controller.direction_guard_scale == 1.0
   assert controller._measured_rate(1.0, 5.0) == (0.0, False)
   assert controller._measured_rate(1.0, 0.0) == (0.0, True)
   step_rate = 0.0
@@ -427,8 +429,10 @@ def test_unwind_feedforward_releases_hold_torque_continuously() -> None:
   torque_params.friction = 0.0
   torque_params.latAccelOffset = 0.0
 
-  def run(planned_angle: float, measured_angle: float, target_angle: float | None = None, feedback_gain: float | None = 0.0):
+  def run(planned_angle: float, measured_angle: float, target_angle: float | None = None,
+          feedback_gain: float | None = 0.0, direction_guard_scale: float = 1.0):
     controller = PalisadeRackTrajectoryController()
+    controller.direction_guard_scale = direction_guard_scale
     controller.planner = JerkLimitedRackPlanner(planned_angle)
     state.steeringAngleDeg = measured_angle
     target_angle = planned_angle if target_angle is None else target_angle
@@ -512,6 +516,17 @@ def test_unwind_feedforward_releases_hold_torque_continuously() -> None:
   assert outward_cross_center.torque == 0.0
   assert outward_at_center.torque == 0.0
   assert mirrored_outward_at_center.torque == 0.0
+
+  blocked = run(5.0, -14.0, -.8, feedback_gain=None)
+  released = run(5.0, -14.0, .1, feedback_gain=None, direction_guard_scale=0.0)
+  released_normal_torque = released.feedforward_torque + released.feedback_torque
+  assert blocked.torque == 0.0
+  assert math.isclose(
+    released.torque,
+    released_normal_torque * min(1.0, DT_CTRL / REFERENCE_REVERSAL_RC_S),
+    rel_tol=0.0,
+    abs_tol=1e-9,
+  )
 
 
 def test_feedforward_boundary_and_driver_handoff_cap() -> None:
