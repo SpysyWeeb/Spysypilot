@@ -142,6 +142,7 @@ class PalisadeRackTrajectoryController:
     self.transition_rate_limit: float | None = None
     self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
+    self.direction_guard_scale = 1.0
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_governor = RackReferenceGovernor()
@@ -156,6 +157,7 @@ class PalisadeRackTrajectoryController:
     self.transition_rate_limit = None
     self.transition_acceleration_limit = None
     self.previous_planned_lateral_accel = None
+    self.direction_guard_scale = 1.0
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_governor.reset()
@@ -445,8 +447,12 @@ class PalisadeRackTrajectoryController:
     torque = float(np.clip(raw_torque, -1.0, 1.0))
     torque_limited = torque != raw_torque
     if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
-      torque_limited |= torque != 0.0
-      torque = 0.0
+      self.direction_guard_scale = 0.0
+    else:
+      self.direction_guard_scale = min(1.0, self.direction_guard_scale + self.dt / REFERENCE_REVERSAL_RC_S)
+    guarded_torque = torque * self.direction_guard_scale
+    torque_limited |= guarded_torque != torque
+    torque = guarded_torque
     motion_limited = (
       plan.rate_limited or plan.acceleration_limited or plan.jerk_limited
       or measured_out_of_bounds or planned_out_of_bounds or self.reference_governor.limited
