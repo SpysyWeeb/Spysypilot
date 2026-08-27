@@ -19,7 +19,7 @@ A dedicated state machine (`AolDriver` + `AolStateMachine`) runs alongside selfd
 - `openpilot/spysypilot/aol/` *(new)* — `aol.py` (the `AolDriver` state machine and alert plumbing), `state.py` (`AolStateMachine`, active/enabled states), `helpers.py` (Hyundai always-allow detection).
 - `openpilot/selfdrive/selfdrived/selfdrived.py`, `controlsd.py`, `controlsd_ext.py`, `card.py` — SOL driver wired beside the main state machine; lateral-allowed decision routed through it.
 - `openpilot/cereal/custom.capnp`, `log.capnp`, `services.py` — SOL state message/service (named `aol` on the wire).
-- `openpilot/selfdrive/pandad/` (`panda.cc/h`, `pandad.cc`) — safety-param plumbing so the panda knows SOL mode.
+- `openpilot/selfdrive/pandad/` (`panda.cc/h`, `pandad.cc`) — safety-param plumbing and compact health-flag decoding so the panda's SOL permission remains visible to the host.
 - `openpilot/selfdrive/ui/` (`ui_state.py`, `augmented_road_view.py`) — steering-active-without-engagement rendering.
 - `.gitmodules` + submodule pointers — `opendbc` and `panda` point at the SpysyWeeb forks (branch `Spysypilot`) carrying the SOL safety-mode code.
 
