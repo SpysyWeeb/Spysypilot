@@ -7,7 +7,7 @@ from openpilot.selfdrive.modeld import helpers
 
 
 class TestHelpers(unittest.TestCase):
-  def test_usbgpu_present_requires_current_firmware(self):
+  def test_chestnut_present_requires_current_firmware(self):
     cases = [
       ("add1", "0001", "custom ed4e39b7-CLEAN", True),
       ("3801", "0001", "custom ed4e39b7-CLEAN", True),
@@ -23,4 +23,4 @@ class TestHelpers(unittest.TestCase):
           (device / "idProduct").write_text(product_id)
           (device / "product").write_text(product)
           with patch.object(helpers, "USB_DEVICES_PATH", root):
-            self.assertIs(helpers.usbgpu_present(), expected)
+            self.assertIs(helpers.chestnut_present(), expected)
