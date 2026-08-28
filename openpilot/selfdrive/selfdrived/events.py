@@ -255,9 +255,9 @@ def below_steer_speed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.S
 
 
 def calibration_incomplete_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  first_word = 'Recalibrating' if sm['liveCalibration'].calStatus == log.LiveCalibrationData.Status.recalibrating else 'Calibrating'
+  first_word = 'Recalibrating' if sm['extrinsicsCalibration'].calStatus == log.ExtrinsicsCalibration.Status.recalibrating else 'Calibrating'
   return Alert(
-    f"{first_word}: {sm['liveCalibration'].calPerc:.0f}%",
+    f"{first_word}: {sm['extrinsicsCalibration'].calPerc:.0f}%",
     f"Drive Above {get_display_speed(MIN_SPEED_FILTER, metric)}",
     AlertStatus.normal, AlertSize.mid,
     Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2)
@@ -268,10 +268,6 @@ def too_distracted_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubM
     mins_left = sm['driverMonitoringState'].lockoutMinutesRemaining
     return NoEntryAlert("Too Distracted", f"{mins_left} minute{'s' if mins_left != 1 else ''} Left", priority=Priority.HIGH)
   return NoEntryAlert("Pay Attention to Engage", priority=Priority.HIGH)
-
-
-def user_bookmark_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  return NormalPermanentAlert("Bookmark Saved", "", duration=1.5, priority=Priority.LOWER)
 
 
 # *** debug alerts ***
@@ -301,13 +297,13 @@ def comm_issue_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaste
 
 
 def camera_malfunction_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  all_cams = ('roadCameraState', 'driverCameraState', 'wideRoadCameraState')
+  all_cams = ('narrowRoadCameraState', 'cabinCameraState', 'wideRoadCameraState')
   bad_cams = [s.replace('State', '') for s in all_cams if s in sm.data.keys() and not sm.all_checks([s, ])]
   return NormalPermanentAlert("Camera Malfunction", ', '.join(bad_cams))
 
 
 def calibration_invalid_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  rpy = sm['liveCalibration'].rpyCalib
+  rpy = sm['extrinsicsCalibration'].rpyCalib
   yaw = math.degrees(rpy[2] if len(rpy) == 3 else math.nan)
   pitch = math.degrees(rpy[1] if len(rpy) == 3 else math.nan)
   angles = f"Remount Device (Pitch: {pitch:.1f}°, Yaw: {yaw:.1f}°)"
@@ -315,16 +311,16 @@ def calibration_invalid_alert(CP: car.CarParams, CS: car.CarState, sm: messaging
 
 
 def paramsd_invalid_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  if not sm['liveParameters'].angleOffsetValid:
-    angle_offset_deg = sm['liveParameters'].angleOffsetDeg
+  if not sm['vehicleParameters'].angleOffsetValid:
+    angle_offset_deg = sm['vehicleParameters'].angleOffsetDeg
     title = "Steering misalignment detected"
     text = f"Angle offset too high (Offset: {angle_offset_deg:.1f}°)"
-  elif not sm['liveParameters'].steerRatioValid:
-    steer_ratio = sm['liveParameters'].steerRatio
+  elif not sm['vehicleParameters'].steerRatioValid:
+    steer_ratio = sm['vehicleParameters'].steerRatio
     title = "Steer ratio mismatch"
     text = f"Steering rack geometry may be off (Ratio: {steer_ratio:.1f})"
-  elif not sm['liveParameters'].stiffnessFactorValid:
-    stiffness_factor = sm['liveParameters'].stiffnessFactor
+  elif not sm['vehicleParameters'].stiffnessFactorValid:
+    stiffness_factor = sm['vehicleParameters'].stiffnessFactor
     title = "Abnormal tire stiffness"
     text = f"Check tires, pressure, or alignment (Factor: {stiffness_factor:.1f})"
   else:
@@ -341,11 +337,6 @@ def overheat_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster,
 
 def low_memory_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   return NormalPermanentAlert("Low Memory", f"{sm['deviceState'].memoryUsagePercent}% used")
-
-
-def high_cpu_usage_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  x = max(sm['deviceState'].cpuUsagePercent, default=0.)
-  return NormalPermanentAlert("High CPU Usage", f"{x}% used")
 
 
 def modeld_lagging_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
@@ -418,7 +409,8 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.bigModelFailed: {
-    ET.PERMANENT: NormalPermanentAlert("Big Model Failed ", "Restart the car to retry,\nnow driving on small model", duration=20.),
+    ET.SOFT_DISABLE: soft_disable_alert("Big Model Failed"),
+    ET.PERMANENT: NormalPermanentAlert("Big Model Failed ", "Restart the car to retry,\nsmall model is still available", duration=20.),
   },
 
   EventName.lateralManeuver: {
@@ -1014,7 +1006,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.userBookmark: {
-    ET.PERMANENT: user_bookmark_alert,
+    ET.PERMANENT: NormalPermanentAlert("Bookmark Saved", duration=1.5),
   },
 }
 

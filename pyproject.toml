@@ -15,7 +15,7 @@ dependencies = [
   "tqdm",         # cars (fw_versions.py) on start + many one-off uses
 
   # core
-  "scons",
+  "scons==4.10.1",  # 4.11 removed the qt3 tool still used to build Cabana
   "pycapnp==2.1.0",  # 2.2 introduces a memory leak due to cyclic references
   "numpy >=2.0",
 
@@ -41,6 +41,7 @@ dependencies = [
   "sentry-sdk",
   "setproctitle",
   "jeepney",
+  "pillow",
   "zstandard",  # this can go once we're on Python 3.14+
 
   # ui
@@ -49,16 +50,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+docs = [
+  "zensical",
+]
+
 testing = [
   "coverage",   # line coverage
   "ty",         # type checking
   "ruff",       # linting
   "codespell",  # spellcheck
+
+  # TODO: replace these with our own nice simple test runner
+  "pytest",
+  "pytest-xdist",
+]
+
+dev = [
+  "matplotlib",
 ]
 
 tools = [
-  "matplotlib",
-
   "comma-deps-imgui",
   "comma-deps-bootstrap-icons",
   "comma-deps-libusb",
@@ -97,6 +108,14 @@ packages = [
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-Werror --strict-config --durations=10"
+python_files = "test_*.py"
+testpaths = [
+  "openpilot",
+]
+
 [tool.codespell]
 quiet-level = 3
 # if you've got a short variable name that's getting flagged, add it here
@@ -129,7 +148,11 @@ line-length = 160
 lint.flake8-implicit-str-concat.allow-multiline = false
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-"time.time".msg = "Use time.monotonic. time.time can skip due to its reference clock, you probably want a monotonic clock"
+"pytest".msg = "Use unittest"
+"pytest.main".msg = "pytest.main requires special handling that is easy to mess up!"
+"time.time".msg = "Use time.monotonic"  # time.time can skip due to its reference clock, you probably want a monotonic clock
+
+# raylib banned APIs
 "pyray.measure_text_ex".msg = "Use openpilot.system.ui.lib.text_measure"
 "pyray.is_mouse_button_pressed".msg = "This can miss events. Use Widget._handle_mouse_press"
 "pyray.is_mouse_button_released".msg = "This can miss events. Use Widget._handle_mouse_release"

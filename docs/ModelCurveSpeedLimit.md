@@ -4,54 +4,29 @@ Status: **in progress pending field testing**.
 
 ## Goal
 
-Use the driving model's predicted path to impose an owner-calibrated maximum
-speed through curves without introducing a separate turn-control state
-machine. The existing longitudinal planner remains responsible for
-acceleration, braking, and resuming the driver's cruise speed.
+Slow for model-predicted curves before the Palisade exhausts steering authority.
 
-The limiter must:
+## Curve-speed envelope
 
-- look ahead using the model path;
-- reject isolated curvature prediction spikes;
-- allow normal acceleration while below the curve maximum;
-- stop accelerating at the maximum;
-- reduce speed before a curve only as early as required to meet the maximum;
-- release the cap automatically as the predicted path straightens; and
-- work for low-speed turns from a stop.
+The existing 50/22/13 mph field envelope, spatial median, temporal median,
+target-release rate, and `0.5 m/s²` approach calculation remain unchanged.
+For valid Palisade torque parameters while lateral control is active, each
+future signed-curvature sample also gets the maximum speed that keeps predicted
+feedforward plus friction demand at or below `TORQUE_BUDGET = 0.90`. The lower
+of the field and torque-budget speeds enters the existing approach-distance
+calculation.
 
-## Field calibration
+Valid filtered live torque parameters replace the static `CarParams` values.
+Invalid geometry or unusable parameters retain field-envelope behavior rather
+than inventing a torque limit.
 
-The initial maximum-speed envelope comes from three owner-driven route points
-recorded on 2026-07-24:
+## Torque veto
 
-| Measured vehicle curvature | Model-path curvature | Maximum speed |
-|---:|---:|---:|
-| 0.00524 1/m | 0.00501 1/m | 44 mph |
-| 0.04339 1/m | 0.04666 1/m | 22 mph |
-| 0.07056 1/m | 0.08188 1/m | 13 mph |
+The existing two-of-three future-torque veto remains a backstop. When predicted
+demand reaches the budget, the longitudinal planner clamps only positive final
+acceleration to zero. Stronger MPC/e2e/lead/stop braking remains authoritative.
 
-The model-path values are used by the online limiter because that is its input;
-the measured vehicle values document the physical curves that produced them.
-On 2026-07-25, the owner requested a 15% increase from the initial 38/19/11
-mph envelope, with each configured value rounded up to a whole mph. These are
-field-test starting points, not completed tuning.
-
-## Design
-
-For each valid model horizon sample:
-
-1. Compute curvature from predicted yaw rate and speed.
-2. Apply a three-sample spatial median to reject an isolated bad path point.
-3. Convert curvature to a maximum speed using the field envelope.
-4. Compute the maximum speed allowed now to reach that future maximum with
-   comfortable deceleration over the predicted path distance.
-5. Apply a three-frame temporal median to the resulting allowance so one bad
-   model prediction cannot cause a sudden brake request.
-
-The lowest future allowance caps the driver's cruise setpoint before the
-existing longitudinal planner runs. No acceleration command is overridden,
-and no entering/turning/leaving state machine is added.
-
-The legacy instantaneous steering-angle total-acceleration limiter is retired;
-the calibrated speed cap now determines when curve-related acceleration must
-stop.
+This predicts path-driven feedforward and friction demand—not future PID
+feedback, tire grip, or a guaranteed full-controller 90% ceiling. Route replay
+must check final acceleration and jerk, false slowing on ordinary bends, and
+actual entry torque before owner field testing.

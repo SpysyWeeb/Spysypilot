@@ -5,11 +5,6 @@ from enum import IntEnum
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.widgets.offroad_alerts import UpdateAlert, OffroadAlert
 from openpilot.selfdrive.ui.widgets.exp_mode_button import ExperimentalModeButton
-from openpilot.selfdrive.ui.widgets.drive_stats import DriveStatsWidget
-from openpilot.selfdrive.ui.widgets.override_stats import OverrideStatsWidget
-from openpilot.selfdrive.ui.widgets.straight_stats import StraightStatsWidget
-from openpilot.selfdrive.ui.widgets.curve_stats import CurveStatsWidget
-from openpilot.selfdrive.ui.widgets.turn_stats import TurnStatsWidget
 from openpilot.selfdrive.ui.widgets.terminal_widget import TerminalWidget
 from openpilot.selfdrive.ui.widgets.screen_timeout_button import ScreenTimeoutButton
 from openpilot.selfdrive.ui.widgets.update_button import UpdateButton
@@ -17,7 +12,7 @@ from openpilot.selfdrive.ui.widgets.error_log_button import ErrorLogButton
 from openpilot.selfdrive.ui.widgets.system_stats import SystemStatsWidget
 from openpilot.selfdrive.ui.widgets.setup import SetupWidget
 from openpilot.system.ui.lib.text_measure import measure_text_cached
-from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
+from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos, TextAlignment
 from openpilot.system.ui.lib.multilang import tr, trn
 from openpilot.system.ui.widgets.label import gui_label
 from openpilot.system.ui.widgets import Widget
@@ -65,19 +60,13 @@ class HomeLayout(Widget):
     self.update_notif_rect = rl.Rectangle(0, 0, 200, HEADER_HEIGHT - 10)
     self.alert_notif_rect = rl.Rectangle(0, 0, 220, HEADER_HEIGHT - 10)
 
-    self._stats_widget = DriveStatsWidget()
-    self._override_stats_widget = OverrideStatsWidget()
-    self._straight_stats_widget = StraightStatsWidget()
-    self._curve_stats_widget = CurveStatsWidget()
-    self._turn_stats_widget = TurnStatsWidget()
     self._terminal_widget = TerminalWidget()
     self._system_stats_widget = SystemStatsWidget()
     self._setup_widget = SetupWidget()
 
     self._left_windows: list[Widget] = [
-      self._stats_widget, self._override_stats_widget,
-      self._straight_stats_widget, self._curve_stats_widget, self._turn_stats_widget,
-      self._terminal_widget, self._system_stats_widget,
+      self._terminal_widget,
+      self._system_stats_widget,
     ]
     self._current_left_idx: int = 0
     for w in self._left_windows:
@@ -223,7 +212,7 @@ class HomeLayout(Widget):
 
     version_rect = rl.Rectangle(self.header_rect.x + self.header_rect.width - version_text_width, self.header_rect.y,
                                 version_text_width, self.header_rect.height)
-    gui_label(version_rect, self._version_text, 48, rl.WHITE, alignment=rl.GuiTextAlignment.TEXT_ALIGN_RIGHT)
+    gui_label(version_rect, self._version_text, 48, rl.WHITE, alignment=TextAlignment.RIGHT)
 
   def _render_home_content(self):
     self._render_left_column()

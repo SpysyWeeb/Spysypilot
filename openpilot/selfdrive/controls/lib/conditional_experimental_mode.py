@@ -1,0 +1,547 @@
+"""Conditional Experimental Mode for BLoTv2.
+
+This module detects a generic, lead-free model stop intent and requests the
+existing Experimental longitudinal strategy. It never chooses a target speed,
+acceleration, brake command, or stop point.
+
+The deployed model does not publish traffic-light or stop-sign classes. Its
+available stop evidence is ``action.shouldStop`` plus the finite 10-second
+position/velocity trajectory. Confidence below is therefore confidence in a
+temporally persistent stop *intent*, not semantic confidence that an object is
+a red light or stop sign.
+"""
+
+from dataclasses import dataclass
+import math
+from typing import Any
+
+from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.realtime import DT_CTRL, DT_MDL
+from openpilot.selfdrive.modeld.constants import ModelConstants
+
+
+# Model-stop observation tuning. All distances are meters and speeds are m/s.
+STOP_PREDICTION_HORIZON_S = 5.0
+STOP_PATH_MIN_DISTANCE_M = 4.0
+STOP_TERMINAL_SPEED_MAX = 1.0
+STOP_FALLBACK_ACCEL_MAX = -0.5
+STOP_TRAJECTORY_MIN_POINTS = 2
+
+# The strict detector above is intentionally retained for low-speed and
+# ambiguous scenes. At urban-road speed, waiting for the model's ten-second
+# terminal velocity to reach almost zero can leave less than a comfortable
+# stopping distance. The early tier recognizes a sustained *shape* of model
+# intent instead: the path has contracted inside a comfort-deceleration
+# envelope, the terminal velocity has fallen substantially, and the action is
+# already braking. It is limited to straight, unsignaled, lead-free approaches
+# by the scene guards below and by the existing entry veto.
+STOP_EARLY_MIN_SPEED = 13.0
+STOP_EARLY_COMFORT_DECEL = 1.3
+STOP_EARLY_RESPONSE_BUFFER_S = 0.5
+STOP_EARLY_TERMINAL_SPEED_RATIO = 0.35
+STOP_EARLY_TERMINAL_SPEED_MAX = 6.5
+STOP_EARLY_DESIRED_ACCEL_MAX = -0.5
+STOP_EARLY_MAX_LATERAL_ACCEL = 1.0
+STOP_EARLY_MAX_HEADING_CHANGE = math.radians(20.0)
+
+# Weaker early evidence may request Experimental on urban-speed approaches after
+# the normal filter and debounce. Above the urban ceiling it remains filter-only,
+# which preserves rejection of the known 55 mph highway slowdown.
+STOP_EARLY_HINT_HORIZON_S = 8.0
+STOP_EARLY_HINT_TERMINAL_SPEED_RATIO = 0.55
+STOP_EARLY_HINT_DESIRED_ACCEL_MAX = -0.25
+STOP_EARLY_HINT_ENTRY_MAX_SPEED = 22.0
+
+# Evidence strengths and temporal qualification.
+STOP_DIRECT_CONFIDENCE = 1.0
+STOP_TRAJECTORY_CONFIDENCE = 0.85
+STOP_EARLY_CONFIDENCE = 0.80
+STOP_FALLBACK_CONFIDENCE = 0.70
+STOP_EARLY_HINT_CONFIDENCE = 0.45
+STOP_EARLY_HINT_ENTRY_CONFIDENCE = 0.70
+STOP_SAMPLE_MIN_CONFIDENCE = 0.70
+STOP_FILTER_TIME_CONSTANT_S = 0.30
+STOP_ENTRY_FILTER_THRESHOLD = 0.55
+STOP_RELEASE_FILTER_THRESHOLD = 0.25
+STOP_ENTRY_DEBOUNCE_S = 0.20
+STOP_RELEASE_HYSTERESIS_S = 0.75
+STOP_RELEASE_PATH_MIN_DISTANCE_M = 20.0
+STOP_RELEASE_TERMINAL_SPEED_MIN = 3.0
+STOP_OPEN_FILTER_TIME_CONSTANT_S = 0.30
+STOP_OPEN_FILTER_THRESHOLD = 0.70
+FORCE_STOP_QUALIFY_S = 1.0
+FORCE_STOP_COMMIT_DISTANCE_M = 100.0
+FORCE_STOP_WORLD_TOLERANCE_M = 5.0
+
+# Latching and release behavior.
+MODE_MIN_LATCH_S = 1.0
+STOP_INTENT_HOLD_S = 4.0
+STANDSTILL_MIN_LATCH_S = 1.0
+MODEL_INVALID_RELEASE_S = 0.50
+RESUME_RELEASE_SPEED = 0.8
+POST_STOP_SUPPRESS_S = 2.0
+DRIVER_OVERRIDE_SUPPRESS_S = 2.0
+
+# Entry vetoes keep existing lead and committed-turn behavior in charge.
+LEAD_RELEVANCE_MIN_DISTANCE_M = 35.0
+LEAD_RELEVANCE_TIME_S = 3.5
+LEAD_PATH_MARGIN_M = 10.0
+LEAD_RELEASE_MODEL_PATH_HALF_WIDTH_M = 1.5
+LEAD_RELEASE_HYSTERESIS_S = 3.0
+COMMITTED_TURN_MAX_SPEED = 8.0
+COMMITTED_TURN_MIN_STEERING_DEG = 35.0
+COMMITTED_TURN_MIN_CURVATURE = 0.04
+
+
+@dataclass(frozen=True)
+class StopIntentObservation:
+  confidence: float = 0.0
+  reason: str = "none"
+  path_end_m: float | None = None
+  terminal_speed: float | None = None
+  relevant_lead: bool = False
+  committed_turn: bool = False
+  trajectory_stop: bool = False
+  lead_release_stop: bool = False
+
+
+def _last_finite(values: Any, minimum_length: int = 1) -> float | None:
+  try:
+    if len(values) < minimum_length:
+      return None
+    value = float(values[-1])
+  except (AttributeError, IndexError, TypeError, ValueError):
+    return None
+  return value if math.isfinite(value) else None
+
+
+def _finite_trajectory(values: Any) -> bool:
+  try:
+    return all(math.isfinite(float(value)) for value in values)
+  except (TypeError, ValueError):
+    return False
+
+
+def model_trajectories_finite(model: Any) -> bool:
+  return (
+    _finite_trajectory(getattr(getattr(model, "position", None), "x", ())) and
+    _finite_trajectory(getattr(getattr(model, "velocity", None), "x", ()))
+  )
+
+
+def model_trajectories_complete_and_finite(model: Any) -> bool:
+  position_x = getattr(getattr(model, "position", None), "x", ())
+  velocity_x = getattr(getattr(model, "velocity", None), "x", ())
+  return len(position_x) == ModelConstants.IDX_N and len(velocity_x) == ModelConstants.IDX_N and model_trajectories_finite(model)
+
+
+def model_stop_release_open(model: Any, *, require_nonbraking: bool = True) -> bool:
+  """Strong launch sample; callers still own temporal confirmation."""
+  if not model_trajectories_complete_and_finite(model):
+    return False
+  action = getattr(model, "action", None)
+  path_end_m = _last_finite(getattr(getattr(model, "position", None), "x", ()), STOP_TRAJECTORY_MIN_POINTS)
+  terminal_speed = _last_finite(getattr(getattr(model, "velocity", None), "x", ()), STOP_TRAJECTORY_MIN_POINTS)
+  desired_accel = _optional_finite_float(getattr(action, "desiredAcceleration", None))
+  return bool(
+    not getattr(action, "shouldStop", True) and
+    desired_accel is not None and (not require_nonbraking or desired_accel > STOP_EARLY_DESIRED_ACCEL_MAX) and
+    path_end_m is not None and path_end_m >= STOP_RELEASE_PATH_MIN_DISTANCE_M and
+    terminal_speed is not None and terminal_speed >= STOP_RELEASE_TERMINAL_SPEED_MIN
+  )
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+  try:
+    parsed = float(value)
+  except (TypeError, ValueError):
+    return default
+  return parsed if math.isfinite(parsed) else default
+
+
+def _optional_finite_float(value: Any) -> float | None:
+  try:
+    parsed = float(value)
+  except (TypeError, ValueError):
+    return None
+  return parsed if math.isfinite(parsed) else None
+
+
+def model_lead_stop_path_clear(model: Any, path_end_m: float) -> bool:
+  """Fail closed unless every nonzero model-lead hypothesis is outside the stop path."""
+  position = getattr(model, "position", None)
+  path_x = getattr(position, "x", ())
+  path_y = getattr(position, "y", ())
+  leads = getattr(model, "leadsV3", ())
+  lead_points = len(ModelConstants.LEAD_T_IDXS)
+  if (
+    len(path_x) != ModelConstants.IDX_N or len(path_y) != ModelConstants.IDX_N or
+    len(leads) != ModelConstants.LEAD_MHP_SELECTION or
+    not _finite_trajectory(path_x) or not _finite_trajectory(path_y)
+  ):
+    return False
+
+  path_x_values = [float(value) for value in path_x]
+  path_y_values = [float(value) for value in path_y]
+  if any(current <= previous for previous, current in zip(path_x_values, path_x_values[1:], strict=False)):
+    return False
+
+  for lead in leads:
+    probability = _optional_finite_float(getattr(lead, "prob", None))
+    lead_x = getattr(lead, "x", ())
+    lead_y = getattr(lead, "y", ())
+    if (
+      probability is None or not 0.0 <= probability <= 1.0 or
+      len(lead_x) != lead_points or len(lead_y) != lead_points or
+      not _finite_trajectory(lead_x) or not _finite_trajectory(lead_y)
+    ):
+      return False
+    if probability == 0.0:
+      continue
+
+    for lead_x_value, lead_y_value in zip(lead_x, lead_y, strict=True):
+      x = float(lead_x_value)
+      if x <= 0.0:
+        return False
+      if x > path_end_m + LEAD_PATH_MARGIN_M:
+        continue
+
+      if x <= path_x_values[0]:
+        path_center_y = path_y_values[0]
+      elif x >= path_x_values[-1]:
+        path_center_y = path_y_values[-1]
+      else:
+        index = next(i for i, path_position in enumerate(path_x_values) if path_position >= x)
+        x0, x1 = path_x_values[index - 1:index + 1]
+        y0, y1 = path_y_values[index - 1:index + 1]
+        path_center_y = y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+      if abs(float(lead_y_value) - path_center_y) <= LEAD_RELEASE_MODEL_PATH_HALF_WIDTH_M:
+        return False
+
+  return True
+
+
+def observe_model_stop_intent(model: Any, car_state: Any, radar_state: Any) -> StopIntentObservation:
+  """Translate current BLoTv2 cereal messages into one stop-intent sample."""
+  if not model_trajectories_finite(model):
+    return StopIntentObservation()
+
+  v_ego_value = _optional_finite_float(getattr(car_state, "vEgo", None))
+  if v_ego_value is None:
+    return StopIntentObservation()
+  v_ego = max(v_ego_value, 0.0)
+  action = getattr(model, "action", None)
+  should_stop = bool(getattr(action, "shouldStop", False))
+  desired_accel_value = _optional_finite_float(getattr(action, "desiredAcceleration", None))
+  desired_accel = desired_accel_value if desired_accel_value is not None else 0.0
+  desired_curvature = _optional_finite_float(getattr(action, "desiredCurvature", None))
+
+  position = getattr(model, "position", None)
+  velocity = getattr(model, "velocity", None)
+  orientation = getattr(model, "orientation", None)
+  path_end_m = _last_finite(getattr(position, "x", ()), STOP_TRAJECTORY_MIN_POINTS)
+  terminal_speed = _last_finite(getattr(velocity, "x", ()), STOP_TRAJECTORY_MIN_POINTS)
+  terminal_heading = _last_finite(getattr(orientation, "z", ()), STOP_TRAJECTORY_MIN_POINTS)
+
+  blinker = bool(getattr(car_state, "leftBlinker", False) or getattr(car_state, "rightBlinker", False))
+  lateral_accel = abs(desired_curvature) * v_ego ** 2 if desired_curvature is not None else None
+  straight_approach = bool(
+    not blinker and
+    lateral_accel is not None and lateral_accel <= STOP_EARLY_MAX_LATERAL_ACCEL and
+    terminal_heading is not None and abs(terminal_heading) <= STOP_EARLY_MAX_HEADING_CHANGE
+  )
+
+  distance_limit = max(STOP_PATH_MIN_DISTANCE_M, v_ego * STOP_PREDICTION_HORIZON_S)
+  path_in_horizon = path_end_m is not None and 0.0 < path_end_m <= distance_limit
+  strict_trajectory_stop = path_in_horizon and terminal_speed is not None and terminal_speed <= STOP_TERMINAL_SPEED_MAX
+  complete_trajectory = model_trajectories_complete_and_finite(model)
+  qualified_trajectory_stop = complete_trajectory and strict_trajectory_stop and desired_accel_value is not None
+  fallback_stop = path_in_horizon and terminal_speed is None and desired_accel <= STOP_FALLBACK_ACCEL_MAX
+
+  early_distance_limit = (
+    v_ego ** 2 / (2.0 * STOP_EARLY_COMFORT_DECEL) + v_ego * STOP_EARLY_RESPONSE_BUFFER_S
+  )
+  early_path = path_end_m is not None and 0.0 < path_end_m <= early_distance_limit
+  early_stop = bool(
+    v_ego >= STOP_EARLY_MIN_SPEED and straight_approach and early_path and
+    terminal_speed is not None and terminal_speed <= STOP_EARLY_TERMINAL_SPEED_MAX and
+    terminal_speed <= v_ego * STOP_EARLY_TERMINAL_SPEED_RATIO and
+    desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX
+  )
+  lead_release_stop = complete_trajectory and desired_accel_value is not None and (strict_trajectory_stop or early_stop)
+
+  early_hint_path = path_end_m is not None and 0.0 < path_end_m <= v_ego * STOP_EARLY_HINT_HORIZON_S
+  early_hint = bool(
+    v_ego >= STOP_EARLY_MIN_SPEED and straight_approach and early_hint_path and
+    terminal_speed is not None and terminal_speed <= v_ego * STOP_EARLY_HINT_TERMINAL_SPEED_RATIO and
+    desired_accel <= STOP_EARLY_HINT_DESIRED_ACCEL_MAX
+  )
+
+  confidence = 0.0
+  reason = "none"
+  if should_stop:
+    confidence = STOP_DIRECT_CONFIDENCE
+    reason = "shouldStop"
+  elif strict_trajectory_stop:
+    confidence = STOP_TRAJECTORY_CONFIDENCE
+    reason = "trajectory"
+  elif early_stop:
+    confidence = STOP_EARLY_CONFIDENCE
+    reason = "earlyTrajectory"
+  elif fallback_stop:
+    confidence = STOP_FALLBACK_CONFIDENCE
+    reason = "path+braking"
+  elif early_hint:
+    confidence = STOP_EARLY_HINT_ENTRY_CONFIDENCE if v_ego <= STOP_EARLY_HINT_ENTRY_MAX_SPEED else STOP_EARLY_HINT_CONFIDENCE
+    reason = "earlyHint"
+
+  lead_limit = max(LEAD_RELEVANCE_MIN_DISTANCE_M, v_ego * LEAD_RELEVANCE_TIME_S)
+  if path_end_m is not None:
+    lead_limit = max(lead_limit, path_end_m + LEAD_PATH_MARGIN_M)
+  relevant_lead = any(
+    bool(getattr(lead, "present", getattr(lead, "status", False))) and
+    0.0 <= _finite_float(getattr(lead, "dRel", math.inf), math.inf) <= lead_limit
+    for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
+  )
+
+  steering_angle = abs(_finite_float(getattr(car_state, "steeringAngleDeg", 0.0)))
+  committed_turn = bool(
+    blinker and v_ego <= COMMITTED_TURN_MAX_SPEED and
+    (steering_angle >= COMMITTED_TURN_MIN_STEERING_DEG or
+     (desired_curvature is not None and abs(desired_curvature) >= COMMITTED_TURN_MIN_CURVATURE))
+  )
+
+  return StopIntentObservation(confidence, reason, path_end_m, terminal_speed, relevant_lead, committed_turn,
+                               bool(qualified_trajectory_stop), bool(lead_release_stop))
+
+
+class ConditionalExperimentalMode:
+  """Filtered and latched owner of BLoTv2's conditional mode request."""
+
+  def __init__(self, control_dt: float = DT_CTRL, model_dt: float = DT_MDL):
+    self.control_dt = control_dt
+    self.model_dt = model_dt
+    self.intent_filter = FirstOrderFilter(0.0, STOP_FILTER_TIME_CONSTANT_S, model_dt)
+    self.stop_release_filter = FirstOrderFilter(0.0, STOP_OPEN_FILTER_TIME_CONSTANT_S, model_dt)
+    self.reset()
+
+  def reset(self) -> None:
+    self.experimental_mode = False
+    self.intent_filter.x = 0.0
+    self.stop_release_filter.x = 0.0
+    self.last_observation = StopIntentObservation()
+    self._entry_elapsed = 0.0
+    self._clear_elapsed = 0.0
+    self._active_elapsed = 0.0
+    self._intent_hold_remaining = 0.0
+    self._standstill_elapsed = 0.0
+    self._standstill_seen = False
+    self._invalid_elapsed = 0.0
+    self._lead_veto_remaining = 0.0
+    self._lead_release_active = False
+    self._post_stop_remaining = 0.0
+    self._override_remaining = 0.0
+    self._force_stop_qualified_elapsed = 0.0
+    self._force_stop_tracked_endpoint = None
+
+  @property
+  def driver_override_active(self) -> bool:
+    return self._override_remaining > 0.0
+
+  @property
+  def stop_latched(self) -> bool:
+    return self.experimental_mode and self.stop_release_filter.x <= STOP_OPEN_FILTER_THRESHOLD
+
+  @property
+  def stop_qualified(self) -> bool:
+    return self._invalid_elapsed <= 0.0 and self._force_stop_qualified_elapsed + 1e-6 >= FORCE_STOP_QUALIFY_S
+
+  @property
+  def stop_distance(self) -> float | None:
+    # The hidden tracker qualifies world consistency; actuation is bound to the
+    # exact published model frame and its endpoint, never to hidden geometry.
+    return self.last_observation.path_end_m if self.stop_qualified else None
+
+  def _clear_evidence(self) -> None:
+    self.intent_filter.x = 0.0
+    self.stop_release_filter.x = 0.0
+    self.last_observation = StopIntentObservation()
+    self._entry_elapsed = 0.0
+    self._clear_elapsed = 0.0
+    self._intent_hold_remaining = 0.0
+    self._lead_release_active = False
+    self._force_stop_qualified_elapsed = 0.0
+    self._force_stop_tracked_endpoint = None
+
+  def _deactivate(self, suppress_for: float) -> None:
+    self.experimental_mode = False
+    self._active_elapsed = 0.0
+    self._standstill_elapsed = 0.0
+    self._standstill_seen = False
+    self._post_stop_remaining = max(self._post_stop_remaining, suppress_for)
+    self._clear_evidence()
+
+  def _update_model_evidence(self, model: Any, car_state: Any, radar_state: Any, model_valid: bool) -> None:
+    observation = observe_model_stop_intent(model, car_state, radar_state) if model_valid else StopIntentObservation()
+    self.last_observation = observation
+
+    # A short radar dropout must not transfer a lead-owned slowdown to CEM.
+    # Leads and committed turns veto only a new handoff. Once a model stop has
+    # qualified, later scene churn cannot flick the mode off while that model
+    # stop evidence itself remains present.
+    if observation.relevant_lead:
+      self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S
+    else:
+      self._lead_veto_remaining = max(self._lead_veto_remaining - self.model_dt, 0.0)
+    raw_lead_present = any(
+      bool(getattr(lead, "present", getattr(lead, "status", False)))
+      for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
+    )
+    lead_release_safe = (
+      self._lead_veto_remaining > 0.0 and not raw_lead_present and not observation.committed_turn and
+      observation.path_end_m is not None and observation.path_end_m > 0.0 and
+      model_lead_stop_path_clear(model, observation.path_end_m)
+    )
+    if not lead_release_safe:
+      self._lead_release_active = False
+    elif self._lead_release_active:
+      self._lead_release_active = observation.lead_release_stop
+    elif (
+      not self.experimental_mode and observation.trajectory_stop and
+      observation.path_end_m is not None and observation.path_end_m < FORCE_STOP_COMMIT_DISTANCE_M
+    ):
+      self._lead_release_active = True
+    entry_veto = (self._lead_veto_remaining > 0.0 and not self._lead_release_active) or observation.committed_turn
+    confidence = observation.confidence if self.experimental_mode or not entry_veto else 0.0
+    force_stop_evidence = (
+      observation.trajectory_stop and not entry_veto and not raw_lead_present and
+      observation.path_end_m is not None and 0.0 < observation.path_end_m < FORCE_STOP_COMMIT_DISTANCE_M
+    )
+    if force_stop_evidence:
+      v_ego = max(_finite_float(getattr(car_state, "vEgo", 0.0)), 0.0)
+      path_end_m = observation.path_end_m
+      assert path_end_m is not None
+      if self._force_stop_tracked_endpoint is None:
+        self._force_stop_qualified_elapsed = 0.0
+        self._force_stop_tracked_endpoint = path_end_m
+      else:
+        predicted_endpoint = self._force_stop_tracked_endpoint - v_ego * self.model_dt
+        if abs(path_end_m - predicted_endpoint) > FORCE_STOP_WORLD_TOLERANCE_M:
+          self._force_stop_qualified_elapsed = 0.0
+          self._force_stop_tracked_endpoint = path_end_m
+        else:
+          self._force_stop_qualified_elapsed += self.model_dt
+          self._force_stop_tracked_endpoint = predicted_endpoint
+    else:
+      self._force_stop_qualified_elapsed = 0.0
+      self._force_stop_tracked_endpoint = None
+    raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
+    release_safe = model_valid and not entry_veto
+    if raw_stop or not release_safe:
+      self.stop_release_filter.x = 0.0
+    else:
+      release_open = model_stop_release_open(model)
+      self.stop_release_filter.update(1.0 if release_open else 0.0)
+    if raw_stop:
+      self._intent_hold_remaining = STOP_INTENT_HOLD_S
+    # A filter-only hint can shorten later entry latency, but cannot sustain an
+    # already active latch indefinitely after qualifying evidence disappears.
+    filter_input = confidence if not self.experimental_mode or raw_stop else 0.0
+    filtered_confidence = self.intent_filter.update(filter_input)
+
+    if self.experimental_mode:
+      self._entry_elapsed = 0.0
+      if not raw_stop and filtered_confidence <= STOP_RELEASE_FILTER_THRESHOLD:
+        self._clear_elapsed += self.model_dt
+      else:
+        self._clear_elapsed = 0.0
+    else:
+      self._clear_elapsed = 0.0
+      entry_ready = raw_stop and filtered_confidence >= STOP_ENTRY_FILTER_THRESHOLD
+      if entry_ready and self._post_stop_remaining <= 0.0:
+        self._entry_elapsed += self.model_dt
+      else:
+        self._entry_elapsed = 0.0
+
+  def update(self, model: Any, car_state: Any, radar_state: Any, *,
+             controls_enabled: bool, model_updated: bool, model_valid: bool, radar_valid: bool = True) -> bool:
+    """Return the conditional Experimental request for the current control tick."""
+    if not controls_enabled:
+      self.reset()
+      return False
+
+    self._post_stop_remaining = max(self._post_stop_remaining - self.control_dt, 0.0)
+    self._intent_hold_remaining = max(self._intent_hold_remaining - self.control_dt, 0.0)
+
+    driver_override = bool(getattr(car_state, "gasPressed", False) or getattr(car_state, "brakePressed", False))
+    if driver_override:
+      self._override_remaining = DRIVER_OVERRIDE_SUPPRESS_S
+      self._deactivate(0.0)
+      return False
+
+    if self._override_remaining > 0.0:
+      self._override_remaining = max(self._override_remaining - self.control_dt, 0.0)
+      self._clear_evidence()
+      return False
+
+    trajectories_finite = model_trajectories_finite(model)
+    model_valid = model_valid and trajectories_finite
+    if model_valid:
+      self._invalid_elapsed = 0.0
+    else:
+      self._invalid_elapsed += self.control_dt
+    if not trajectories_finite:
+      self._clear_evidence()
+
+    raw_lead_present = any(
+      bool(getattr(lead, "present", getattr(lead, "status", False)))
+      for lead in (getattr(radar_state, "leadOne", None), getattr(radar_state, "leadTwo", None))
+    )
+    if raw_lead_present and not model_updated and not self.experimental_mode:
+      self._clear_evidence()
+    elif not model_valid or not radar_valid or raw_lead_present:
+      self.stop_release_filter.x = 0.0
+      self._lead_release_active = False
+      self._force_stop_qualified_elapsed = 0.0
+      self._force_stop_tracked_endpoint = None
+
+    if model_updated:
+      self._update_model_evidence(model, car_state, radar_state, model_valid and radar_valid)
+
+    if not self.experimental_mode and self._invalid_elapsed >= MODEL_INVALID_RELEASE_S:
+      self._clear_evidence()
+
+    if self.experimental_mode:
+      self._active_elapsed += self.control_dt
+      standstill = bool(getattr(car_state, "standstill", False))
+      if standstill:
+        self._standstill_seen = True
+        self._standstill_elapsed += self.control_dt
+
+      v_ego = max(_finite_float(getattr(car_state, "vEgo", 0.0)), 0.0)
+      resumed_after_stop = self._standstill_seen and v_ego >= RESUME_RELEASE_SPEED
+      invalid_too_long = self._invalid_elapsed >= MODEL_INVALID_RELEASE_S
+      standstill_latch_satisfied = not self._standstill_seen or self._standstill_elapsed >= STANDSTILL_MIN_LATCH_S
+      stable_clear = (
+        self._active_elapsed >= MODE_MIN_LATCH_S and
+        self._intent_hold_remaining <= 0.0 and
+        standstill_latch_satisfied and
+        self._clear_elapsed >= STOP_RELEASE_HYSTERESIS_S
+      )
+
+      if resumed_after_stop or stable_clear:
+        self._deactivate(POST_STOP_SUPPRESS_S)
+      elif invalid_too_long:
+        self._deactivate(0.0)
+    elif (
+      self._post_stop_remaining <= 0.0 and
+      self._invalid_elapsed < MODEL_INVALID_RELEASE_S and
+      self._entry_elapsed >= STOP_ENTRY_DEBOUNCE_S
+    ):
+      self.experimental_mode = True
+      self._active_elapsed = 0.0
+      self._standstill_elapsed = 0.0
+      self._standstill_seen = False
+      self._entry_elapsed = 0.0
+
+    return self.experimental_mode

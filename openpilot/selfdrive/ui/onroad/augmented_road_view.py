@@ -1,7 +1,7 @@
 import numpy as np
 import pyray as rl
 from openpilot.cereal import log
-from msgq.visionipc import VisionStreamType
+from openpilot.cereal.visionipc import VisionStreamType
 from openpilot.selfdrive.ui import UI_BORDER_SIZE
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
@@ -9,14 +9,13 @@ from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
-from openpilot.selfdrive.ui.onroad.driving_event_notification import DrivingEventNotification
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 
 OpState = log.SelfdriveState.OpenpilotState
-CALIBRATED = log.LiveCalibrationData.Status.calibrated
-ROAD_CAM = VisionStreamType.VISION_STREAM_ROAD
+CALIBRATED = log.ExtrinsicsCalibration.Status.calibrated
+ROAD_CAM = VisionStreamType.VISION_STREAM_NARROW_ROAD
 WIDE_CAM = VisionStreamType.VISION_STREAM_WIDE_ROAD
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
 
@@ -33,7 +32,7 @@ INF_POINT = np.array([1000.0, 0.0, 0.0])
 
 
 class AugmentedRoadView(CameraView):
-  def __init__(self, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_ROAD):
+  def __init__(self, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_NARROW_ROAD):
     super().__init__("camerad", stream_type)
     self._set_placeholder_color(BORDER_COLORS[UIStatus.DISENGAGED])
 
@@ -49,7 +48,6 @@ class AugmentedRoadView(CameraView):
     self._hud_renderer = HudRenderer()
     self.alert_renderer = AlertRenderer()
     self.driver_state_renderer = DriverStateRenderer()
-    self.driving_event_notification = DrivingEventNotification()
 
   def _render(self, rect):
     # Only render when system is started to avoid invalid data access
@@ -84,8 +82,6 @@ class AugmentedRoadView(CameraView):
     # Draw all UI overlays
     self.model_renderer.render(self._content_rect)
     self._hud_renderer.render(self._content_rect)
-    alert = self.alert_renderer.get_alert(ui_state.sm)
-    self.driving_event_notification.render(self._content_rect, alert is not None)
     self.alert_renderer.render(self._content_rect)
     self.driver_state_renderer.render(self._content_rect)
 
@@ -133,14 +129,14 @@ class AugmentedRoadView(CameraView):
   def _update_calibration(self):
     # Update device camera if not already set
     sm = ui_state.sm
-    if not self.device_camera and sm.seen['roadCameraState'] and sm.seen['deviceState']:
-      self.device_camera = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['roadCameraState'].sensor))]
+    if not self.device_camera and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
+      self.device_camera = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
 
     # Check if live calibration data is available and valid
-    if not (sm.updated["liveCalibration"] and sm.valid['liveCalibration']):
+    if not (sm.updated["extrinsicsCalibration"] and sm.valid['extrinsicsCalibration']):
       return
 
-    calib = sm['liveCalibration']
+    calib = sm['extrinsicsCalibration']
     if len(calib.rpyCalib) != 3 or calib.calStatus != CALIBRATED:
       return
 
@@ -156,7 +152,7 @@ class AugmentedRoadView(CameraView):
   def _calc_frame_matrix(self, rect: rl.Rectangle) -> np.ndarray:
     # Check if we can use cached matrix
     cache_key = (
-      ui_state.sm.recv_frame['liveCalibration'],
+      ui_state.sm.recv_frame['extrinsicsCalibration'],
       self._content_rect.width,
       self._content_rect.height,
       self.stream_type
@@ -167,7 +163,7 @@ class AugmentedRoadView(CameraView):
     # Get camera configuration
     device_camera = self.device_camera or DEFAULT_DEVICE_CAMERA
     is_wide_camera = self.stream_type == WIDE_CAM
-    intrinsic = device_camera.ecam.intrinsics if is_wide_camera else device_camera.fcam.intrinsics
+    intrinsic = device_camera.wide_road.intrinsics if is_wide_camera else device_camera.narrow_road.intrinsics
     calibration = self.view_from_wide_calib if is_wide_camera else self.view_from_calib
     zoom = 2.0 if is_wide_camera else 1.1
 

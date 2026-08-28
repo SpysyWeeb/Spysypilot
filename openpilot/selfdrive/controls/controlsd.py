@@ -17,9 +17,9 @@ from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
-from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
-from openpilot.selfdrive.controls.lib.lateral_reference_planner import ActuatorPreviewConfig, LateralReferencePlanner
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
@@ -39,6 +39,17 @@ def get_steer_limited_by_safety(CP, CC, CO) -> bool:
   return abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
 
 
+def force_decel_requested(selfdrive_state, driver_monitoring_state) -> bool:
+  """Return the driver-monitoring/soft-disable emergency braking request.
+
+  ``controlsState`` is published by this process, so it is not available in
+  the controlsd SubMaster. Keep this decision on the inputs controlsd already
+  owns instead of creating a self-subscription cycle.
+  """
+  return bool(driver_monitoring_state.noResponseForceDecel or
+              selfdrive_state.state == State.softDisabling)
+
+
 class Controls:
   def __init__(self) -> None:
     self.params = Params()
@@ -50,13 +61,13 @@ class Controls:
 
     self.sm = messaging.SubMaster(
       [
-        'liveDelay',
-        'liveParameters',
-        'liveTorqueParameters',
+        'lateralDelay',
+        'vehicleParameters',
+        'lateralTorqueParameters',
         'modelV2',
         'selfdriveState',
-        'liveCalibration',
-        'livePose',
+        'extrinsicsCalibration',
+        'deviceMotion',
         'longitudinalPlan',
         'lateralManeuverPlan',
         'carState',
@@ -76,7 +87,6 @@ class Controls:
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
-    self.lateral_reference_planner = LateralReferencePlanner(DT_CTRL)
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -93,37 +103,26 @@ class Controls:
     elif self.lateral_tuning_type == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.is_torque_lateral:
-      self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
-
-    # BLaT's actuator-aware path timing is currently calibrated from the
-    # Hyundai controller limits. Keep every other platform on the legacy path
-    # reference until its delivery limits have been measured independently.
-    if self.CP.brand == "hyundai" and self.is_torque_lateral:
-      hyundai_params = self.CI.CC.params
-      self.lateral_reference_planner.configure_actuator(
-        ActuatorPreviewConfig(
-          max_torque=hyundai_params.STEER_MAX,
-          delta_up=hyundai_params.STEER_DELTA_UP,
-          delta_down=hyundai_params.STEER_DELTA_DOWN,
-          steer_step=hyundai_params.STEER_STEP,
-        )
+      self.LaC = LatControlTorque(
+        self.CP, self.CI, DT_CTRL,
+        use_rack_trajectory=palisade_rack_trajectory_compatible(self.CP),
       )
 
     self.controls_ext = ControlsExt()
 
   def update(self):
     self.sm.update(15)
-    if self.sm.updated["liveCalibration"]:
-      self.pose_calibrator.feed_live_calib(self.sm['liveCalibration'])
-    if self.sm.updated["livePose"]:
-      device_pose = Pose.from_live_pose(self.sm['livePose'])
+    if self.sm.updated["extrinsicsCalibration"]:
+      self.pose_calibrator.feed_extrinsics_calibration(self.sm['extrinsicsCalibration'])
+    if self.sm.updated["deviceMotion"]:
+      device_pose = Pose.from_device_motion(self.sm['deviceMotion'])
       self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
 
   def state_control(self):
     CS = self.sm['carState']
 
     # Update VehicleModel
-    lp = self.sm['liveParameters']
+    lp = self.sm['vehicleParameters']
     x = max(lp.stiffnessFactor, 0.1)
     sr = max(lp.steerRatio, 0.1)
     self.VM.update_params(x, sr)
@@ -133,14 +132,18 @@ class Controls:
 
     # Update Torque Params
     if self.is_torque_lateral:
-      torque_params = self.sm['liveTorqueParameters']
-      if self.sm.all_checks(['liveTorqueParameters']) and torque_params.useParams:
-        self.LaC.update_live_torque_params(
-          torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered, torque_params.frictionCoefficientFiltered
-        )
+      torque_params = self.sm['lateralTorqueParameters']
+      if self.sm.all_checks(['lateralTorqueParameters']) and torque_params.useParams:
+        self.LaC.update_torque_parameters(torque_params.latAccelFactorFiltered, torque_params.latAccelOffsetFiltered,
+                                           torque_params.frictionCoefficientFiltered)
 
     long_plan = self.sm['longitudinalPlan']
     model_v2 = self.sm['modelV2']
+    if isinstance(self.LaC, LatControlTorque):
+      self.LaC.set_rack_trajectory_model(
+        model_v2 if self.sm.valid['modelV2'] else None,
+        self.sm.logMonoTime['selfdriveState'],
+      )
 
     CC = car.CarControl.new_message()
     CC.enabled = self.sm['selfdriveState'].enabled
@@ -148,7 +151,8 @@ class Controls:
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
     CC.latActive = (
-      self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and (not standstill or self.CP.steerAtStandstill)
+      self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and
+      (not standstill or self.CP.steerAtStandstill)
     )
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
@@ -167,91 +171,32 @@ class Controls:
 
     # accel PID loop
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
-    radar_lead = self.sm['radarState'].leadOne
-    # all_checks (alive + freq + valid), not just valid: valid only updates when a message
-    # arrives, so a dead radard would leave the last lead frozen-but-"valid" forever
-    has_lead = bool(radar_lead.present) and self.sm.all_checks(['radarState'])
-    actuators.accel = float(
-      self.LoC.update(
-        CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits, radar_lead.dRel, has_lead, max(float(radar_lead.vLeadK), 0.0)
-      )
+    lead = LeadObservation.from_radar(
+      self.sm['radarState'].leadOne,
+      self.sm.all_checks(['radarState']),
     )
+    actuators.accel = float(self.LoC.update(
+      CC.longActive,
+      CS,
+      long_plan.aTarget,
+      long_plan.shouldStop,
+      pid_accel_limits,
+      lead,
+    ))
 
-    # Steering PID loop and future-aware lateral reference planner
+    # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
-    lat_delay = self.sm["liveDelay"].lateralDelay + LAT_SMOOTH_SECONDS
-    applied_torque = self.sm['carOutput'].actuatorsOutput.torque
     if self.sm.valid['lateralManeuverPlan']:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
-      self.lateral_reference_planner.reset()
     else:
-      raw_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
-      if not CC.latActive or not self.sm.valid['modelV2']:
-        self.lateral_reference_planner.reset()
-      elif self.sm.updated['modelV2']:
-        self.lateral_reference_planner.update(model_v2, self.curvature, CS.vEgo)
-      if self.is_torque_lateral:
-        new_desired_curvature = self.lateral_reference_planner.get_curvature(
-          raw_desired_curvature,
-          CS.vEgo,
-          lat_delay,
-          applied_torque,
-          self.LaC.torque_params.latAccelFactor,
-          self.LaC.torque_params.friction,
-          lp.roll,
-          self.LaC.torque_params.latAccelOffset,
-        )
-      else:
-        new_desired_curvature = self.lateral_reference_planner.get_curvature(raw_desired_curvature, CS.vEgo, lat_delay)
+      new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
+    lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
     actuators.curvature = self.desired_curvature
-    if self.is_torque_lateral:
-      reference_log = self.lateral_reference_planner.diagnostics
-      steer, lateral_output, lac_log = self.LaC.update(
-        CC.latActive,
-        CS,
-        self.VM,
-        lp,
-        self.steer_limited_by_safety,
-        self.desired_curvature,
-        curvature_limited,
-        lat_delay,
-        applied_torque,
-        reference_log.unwind_scale,
-        reference_log.target_torque,
-        reference_log.geometric_target_torque,
-        reference_log.episode_target_torque,
-        reference_log.output_curvature * CS.vEgo**2,
-        reference_log.episode_lateral_accel,
-        (reference_log.trajectory_curvature_rate if reference_log.trajectory_rate_valid else None),
-      )
-    else:
-      steer, lateral_output, lac_log = self.LaC.update(
-        CC.latActive, CS, self.VM, lp, self.steer_limited_by_safety, self.desired_curvature, curvature_limited, lat_delay
-      )
-    actuators.torqueDampingBlocked = bool(self.is_torque_lateral and lac_log.dampingTurnInBlocked)
-    if self.is_torque_lateral:
-      lac_log.referenceVersion = reference_log.version
-      # np.interp/np.clip may return NumPy scalar types, which pycapnp refuses.
-      # Convert every planner diagnostic at the cereal boundary.
-      lac_log.referenceBaseCurvature = float(reference_log.base_curvature)
-      lac_log.referenceOutputCurvature = float(reference_log.output_curvature)
-      lac_log.trajectoryReferenceCurvatureRate = float(reference_log.trajectory_curvature_rate)
-      lac_log.trajectoryReferenceRateValid = bool(reference_log.trajectory_rate_valid)
-      lac_log.referencePreviewTime = float(reference_log.sample_time)
-      lac_log.referencePreviewExtraTime = float(reference_log.extra_time)
-      lac_log.referenceTargetTorque = float(reference_log.target_torque)
-      lac_log.referenceAppliedTorque = float(reference_log.applied_torque)
-      lac_log.referenceUnwindScale = float(reference_log.unwind_scale)
-      lac_log.referenceAuthorityRestored = float(reference_log.authority_restored)
-      lac_log.referencePreviewCorrection = float(reference_log.preview_correction)
-      lac_log.referenceGeometricTargetTorque = float(reference_log.geometric_target_torque)
-      lac_log.referenceNeutralTorque = float(reference_log.neutral_torque)
-      lac_log.referenceReachableTargetTorque = float(reference_log.reachable_target_torque)
-      lac_log.referenceSustainedUnwindScale = float(reference_log.sustained_unwind_scale)
-      lac_log.referenceEpisodeTargetTorque = float(reference_log.episode_target_torque)
-      lac_log.referenceEpisodeLateralAccel = float(reference_log.episode_lateral_accel)
+    steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
+                                                     self.steer_limited_by_safety, self.desired_curvature,
+                                                     curvature_limited, lat_delay)
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
@@ -297,11 +242,13 @@ class Controls:
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    # AOL can steer while selfdriveState is inactive. Keep limiter feedback live whenever lateral control is active.
-    self.steer_limited_by_safety = get_steer_limited_by_safety(self.CP, CC, self.sm['carOutput'])
-
-    # TODO: both controlsState and carControl valids should be set by
-    #       sm.all_checks(), but this creates a circular dependency
+    # AOL can steer while selfdriveState is inactive, so keep stock limiter
+    # feedback live whenever lateral control is active.
+    self.steer_limited_by_safety = get_steer_limited_by_safety(
+      self.CP,
+      CC,
+      self.sm['carOutput'],
+    )
 
     # controlsState
     dat = messaging.new_message('controlsState')
@@ -312,11 +259,34 @@ class Controls:
     cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
     cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
     cs.desiredCurvature = self.desired_curvature
+    if isinstance(self.LaC, LatControlTorque) and self.LaC.rack_trajectory is not None:
+      rack_state = cs.rackTrajectoryState
+      rack_state.status = self.LaC.rack_trajectory.status
+      output = self.LaC.rack_trajectory_output
+      if output is not None:
+        rack_state.active = True
+        rack_state.targetSteeringAngleDeg = float(output.target_angle_deg)
+        rack_state.targetSteeringRateDegS = float(output.target_rate_deg_s)
+        rack_state.plannedSteeringAngleDeg = float(output.planned_angle_deg)
+        rack_state.plannedSteeringRateDegS = float(output.planned_rate_deg_s)
+        rack_state.plannedSteeringAccelerationDegS2 = float(output.planned_acceleration_deg_s2)
+        rack_state.measuredSteeringRateDegS = float(output.measured_rate_deg_s)
+        rack_state.feedbackTorque = float(output.feedback_torque)
+        rack_state.feedbackLimited = bool(output.feedback_limited)
+        rack_state.motionLimited = bool(output.motion_limited)
+        rack_state.torqueLimited = bool(output.torque_limited)
+        rack_state.infeasible = bool(output.infeasible)
+        rack_state.rateLimitDegS = float(output.rate_limit_deg_s)
+        rack_state.accelerationLimitDegS2 = float(output.acceleration_limit_deg_s2)
+        rack_state.jerkLimitDegS3 = float(output.jerk_limit_deg_s3)
+        rack_state.profileTransition = bool(output.profile_transition)
+        rack_state.pathLimited = bool(output.path_limited)
+        rack_state.targetCurvature = float(output.target_curvature)
     cs.longControlState = self.LoC.long_control_state
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)
     cs.ufAccelCmd = float(self.LoC.pid.f)
-    cs.forceDecel = bool(self.sm['driverMonitoringState'].noResponseForceDecel or (self.sm['selfdriveState'].state == State.softDisabling))
+    cs.forceDecel = force_decel_requested(self.sm['selfdriveState'], self.sm['driverMonitoringState'])
 
     # trigger the car's stock driver monitoring escalation
     CC.driverMonitoringEscalation = cs.forceDecel

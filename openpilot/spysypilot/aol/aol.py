@@ -5,7 +5,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.selfdrived.events import (ET, Events, Alert, Priority, AlertSize,
                                                    AlertStatus, VisualAlert, AudibleAlert)
-from openpilot.spysypilot.aol.state import AolStateMachine, ACTIVE_STATES, ENABLED_STATES, State
+from openpilot.spysypilot.aol.state import AolStateMachine, State
 from openpilot.spysypilot.aol.helpers import is_hyundai_always_allow
 
 ButtonType = car.CarState.ButtonEvent.Type
@@ -78,6 +78,9 @@ class AolDriver:
     """Process car state and generate AOL events for the state machine."""
     self.state_machine.clear_events()
     self.check_panda_mismatch()
+    if self.active and not self.sd.enabled and not self.sd.sm.valid['controlsState']:
+      cloudlog.error("AOL: controlsState invalid, forcing immediateDisable")
+      self.state_machine.add_event('immediateDisable')
 
     cruise_available = CS.cruiseState.available
 

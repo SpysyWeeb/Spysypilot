@@ -148,9 +148,10 @@ DEFAULT_MAX_LAT_ACCEL = 3.0  # m/s^2
 
 
 class TorqueBar(Widget):
-  def __init__(self, demo: bool = False):
+  def __init__(self, demo: bool = False, scale: float = 1.0):
     super().__init__()
     self._demo = demo
+    self._scale = scale
     self._torque_filter = FirstOrderFilter(0, 0.1, 1 / gui_app.target_fps)
     self._torque_line_alpha_filter = FirstOrderFilter(0.0, 0.1, 1 / gui_app.target_fps)
 
@@ -166,7 +167,7 @@ class TorqueBar(Widget):
     if ui_state.sm['controlsState'].lateralControlState.which() in ('angleState', 'curvatureState'):
       controls_state = ui_state.sm['controlsState']
       car_state = ui_state.sm['carState']
-      live_parameters = ui_state.sm['liveParameters']
+      vehicle_parameters = ui_state.sm['vehicleParameters']
       car_control = ui_state.sm['carControl']
 
       # Include lateral accel error in estimated torque utilization
@@ -176,7 +177,7 @@ class TorqueBar(Widget):
 
       # Include road roll in estimated torque utilization
       # Roll is less accurate near standstill, so reduce its effect at low speed
-      roll_compensation = live_parameters.roll * ACCELERATION_DUE_TO_GRAVITY * np.interp(car_state.vEgo, [5, 15], [0.0, 1.0])
+      roll_compensation = vehicle_parameters.roll * ACCELERATION_DUE_TO_GRAVITY * np.interp(car_state.vEgo, [5, 15], [0.0, 1.0])
       lateral_acceleration = actual_lateral_accel - roll_compensation
       max_lateral_acceleration = ui_state.CP.maxLateralAccel if ui_state.CP else DEFAULT_MAX_LAT_ACCEL
 
@@ -189,8 +190,8 @@ class TorqueBar(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     # adjust y pos with torque
-    torque_line_offset = np.interp(abs(self._torque_filter.x), [0.5, 1], [22, 26])
-    torque_line_height = np.interp(abs(self._torque_filter.x), [0.5, 1], [14, 56])
+    torque_line_offset = np.interp(abs(self._torque_filter.x), [0.5, 1], [22, 26]) * self._scale
+    torque_line_height = np.interp(abs(self._torque_filter.x), [0.5, 1], [14, 56]) * self._scale
 
     # animate alpha and angle span
     if not self._demo:
@@ -204,7 +205,7 @@ class TorqueBar(Widget):
       torque_line_bg_color = rl.Color(255, 255, 255, int(255 * 0.15 * self._torque_line_alpha_filter.x))
 
     # draw curved line polygon torque bar
-    torque_line_radius = 1200
+    torque_line_radius = 1200 * self._scale
     top_angle = -90
     torque_bg_angle_span = self._torque_line_alpha_filter.x * TORQUE_ANGLE_SPAN
     torque_start_angle = top_angle - torque_bg_angle_span / 2
@@ -217,13 +218,13 @@ class TorqueBar(Widget):
     offset = np.array([cx, cy], dtype=np.float32)
 
     # draw bg torque indicator line
-    bg_pts = arc_bar_pts(mid_r, torque_line_height, torque_start_angle, torque_end_angle) + offset
+    bg_pts = arc_bar_pts(mid_r, torque_line_height, torque_start_angle, torque_end_angle, cap_radius=7 * self._scale) + offset
     draw_polygon(rect, bg_pts, color=torque_line_bg_color)
 
     # draw torque indicator line
     a0s = top_angle
     a1s = a0s + torque_bg_angle_span / 2 * self._torque_filter.x
-    sl_pts = arc_bar_pts(mid_r, torque_line_height, a0s, a1s) + offset
+    sl_pts = arc_bar_pts(mid_r, torque_line_height, a0s, a1s, cap_radius=7 * self._scale) + offset
 
     # draw beautiful gradient from center to 65% of the bg torque bar width
     start_grad_pt = cx / rect.width
@@ -262,5 +263,5 @@ class TorqueBar(Widget):
     # draw center torque bar dot
     if abs(self._torque_filter.x) < 0.5:
       dot_y = self._rect.y + self._rect.height - torque_line_offset - torque_line_height / 2
-      rl.draw_circle(int(cx), int(dot_y), 10 // 2,
+      rl.draw_circle(int(cx), int(dot_y), 5 * self._scale,
                      rl.Color(182, 182, 182, int(255 * 0.9 * self._torque_line_alpha_filter.x)))

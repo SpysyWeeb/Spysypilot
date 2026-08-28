@@ -35,7 +35,8 @@ jobs:
     - name: Build docs
       run: |
         git lfs pull
-        python docs/serve.py --build
+        pip install zensical
+        python scripts/docs.py build
 
     # Push to docs.comma.ai
     - uses: actions/checkout@v7
@@ -56,7 +57,7 @@ jobs:
         git rm -rf .
 
         # copy over docs
-        cp -r ../docs/_site/ docs/
+        cp -r ../docs_site/ docs/
 
         # GitHub pages config
         touch docs/.nojekyll

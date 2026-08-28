@@ -28,6 +28,9 @@ jobs:
           - auto-update
           - custom-main-menu
           - side-buttons
+          - BLoT
+          - driving-event-platform
+          - BLaTv2
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
