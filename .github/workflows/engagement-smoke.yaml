@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - combo
-      - tsf-combo
-      - tsfdo-combo
   pull_request:
   workflow_dispatch:
 
