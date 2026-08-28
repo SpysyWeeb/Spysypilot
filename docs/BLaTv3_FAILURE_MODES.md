@@ -1,0 +1,413 @@
+# BLaTv3 — design-for-failure catalog
+
+Scope: the planned rewrite of Spysypilot's Palisade rack-trajectory lateral controller
+(origin/BLaTv2 → "BLaTv3"). Lists how the system can fail and the design rule / test that
+prevents each failure. v2 folds in a 7-lens red-team pass (30 additions, 15 accepted rule
+critiques). This document is
+the spec the implementation is tested against.
+
+## 0. Design as agreed so far
+
+Ownership (unchanged rulings): the driving model owns *where/when* (the path); the controller
+owns *how the rack gets there*; opendbc/panda own platform limits and safety; torqued/lagd own
+the learned static torque map and the lateral delay. No lane-placement opinions in the
+controller.
+
+Shape ("upstream-shaped controller"):
+- `LatControlRack(LatControl)` in one file `openpilot/selfdrive/controls/lib/latcontrol_rack.py`.
+- Selected in controlsd from `CP.flags & HyundaiFlags.RACK_TRAJECTORY`, set in opendbc's
+  `hyundai/interface.py:_get_params` from the LX platform code in `car_fw` (Telluride `ON`,
+  mixed, or empty firmware → stock). `lateralTuning` stays `torque` so torqued keeps learning.
+  The raised 409/+4/−7 envelope (`BLATV2_HIGH_LIMITS`) is gated by the **same** firmware test.
+- Own `lateralControlState` union arm `rackState` (carries `saturated` for lagd, a `fallback`
+  flag, status, `t_p`, planned/measured rack state, FF/P/D terms, restriction reason).
+- Owns a stock `LatControlTorque` that runs in shadow every frame with `active = CC.latActive`
+  (so its integrator is warm) while its output is discarded; any invalidation hands the frame
+  to it (never zero torque). Two booleans, never one: `car_is_steering` vs `rack_is_driving`.
+- modeld publishes a short curvature preview on `ModelDataV2.Action` next to
+  `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar.
+
+Layers (the input side is now explicit — see L8):
+0. Upstream inputs — `clip_curvature` (ISO 3 m/s² / 5 m/s³ clamp with its own rate state),
+   `lateralDelay` (only trusted when `status == estimated`), `lateralTorqueParameters`
+   (`useParams`), `vehicleParameters` (roll, angle offset, steer ratio).
+1. Reference — scalar-pinned target `κ_ref(t) = κ_scalar + κ_plan(t) − κ_plan(t_action)`,
+   converted to steering angle + rate with the live VehicleModel; preview time `t_p`
+   scheduled between `t_action` (≈0.25 s) and 2 s by *path consistency* (R2).
+2. Motion — a virtual rack moved toward the target under a speed-dependent rate/accel/jerk
+   envelope (comfort envelope, separate from the physical limits).
+3. Tracking — torque = feedforward (planned lateral accel through the torque map + friction
+   + roll + self-aligning term) + angle P + rate D, **in angle space** (no v² in the gain).
+4. Output — torque trajectory planned inside the platform limiters (R9) and led by the
+   measured lateral delay; `saturated` means |torque| at the platform limit.
+5. Driver — plan position *and rate* follow the hand; assist torque capped from the first
+   frame of real driver torque; re-anchor on release.
+6. Fallback — warm stock shadow, switched with hysteresis, logged.
+7. Adaptation — **two separately learned surfaces, used together** (owner decision 2026-08-28),
+   replacing the static envelope tables: a *hold-torque* surface `H(v, angle, lateral load incl.
+   bank, direction)` (prior = torqued's linear fit; anchors = residuals from steady frames) and a
+   *rate-gain* surface `G(same axes)` (prior = physics shape: stiff at ~2 mph, easiest ~10 mph,
+   stiffening with v², lighter when banked; anchors from clean turn-in/unwind frames). Decision
+   each frame: `torque = H + planned_rate/G + feedback`; planner envelope = `(headroom − H) × G`,
+   opened only as far as the *less-confident* surface supports at that cell, otherwise the comfort
+   envelope. Quasi-static only (no inertia/breakaway); anchors from clean frames; decay; never
+   lowers authority below stock; both confidences logged in `rackState`.
+
+Phases: (0) safety fixes on today's branch + back-port combo's direction-guard fix;
+(1) behavior-preserving port from **combo's** controller files, replay-identical;
+(2) scheduled preview (measure first; retire the reversal governor if it works);
+(3) rack-aware output + asymmetric feedforward (turn-in / unwind become two named knobs);
+(4) bounded observer.
+
+## 1. Governing rules
+
+- **R1 Near-target authority.** The `t_action` target is the magnitude truth every frame. A
+  longer preview may only be used when it *agrees* with the near target; it never replaces
+  it. When `lateralManeuverPlan` is the active scalar source, `t_p = t_action` for its whole
+  validity window (the model's shape channel describes a different lane).
+- **R2 Preview by path consistency, in metres, with uncertainty.** `t_p` may extend beyond
+  `t_action` only while all of: (a) the predicted lateral deviation over `[t_action, t_p]`
+  between the model path (`modelV2.position.x/y`) and the path the car would follow steering
+  to the far target — using a clothoid-consistent extrapolation (linear curvature buildup
+  allowed), not a pure arc — stays under `δ_y` (≈0.15 m); (b) near and far target angles agree
+  within `δ_θ` (≈1°); (c) the model's own position uncertainty (`position.yStd`) over the
+  window stays under a threshold and `modelV2.confidence` is not red. Self-consistency proves
+  smoothness, not correctness — (c) is what stops "smooth but wrong". `|κ(t_p)|` alone is
+  never a straightness test: at 40 mph, `|κ| < 0.001` (3.9° at the wheel) still allows 0.64 m
+  of drift over a 36 m preview. No cross-checks against lane lines/road edges (lane-placement
+  ruling).
+- **R3 Shorten fast, lengthen slowly, don't starve.** `t_p` collapses to `t_action` within at
+  most two consecutive failing model frames (≤100 ms ≈ 1.8 m at 40 mph); it grows back at a
+  bounded rate. Growth progress is a decaying score, not reset by one isolated failing frame,
+  so periodic texture (bridge joints, rumble strips) cannot pin `t_p` at `t_action`.
+- **R4 The envelope bounds rate/accel/jerk, never amplitude — and opens ahead of need.** Two
+  triggers open the comfort envelope: *proactive* — R2 has confirmed a real deviation ahead, so
+  the envelope pre-opens to the rate the model path itself requires; *reactive* — measured
+  near-target error. How far it opens depends on how the error arrived (growing over several
+  frames → smooth opening; a genuinely sudden step → fast opening) with corroboration
+  (position path agrees, confidence not red) before exceeding comfort. The ceiling is the
+  upstream ISO clamp (`clip_curvature`: 3 m/s², 5 m/s³ — 36° and κ=0.0046 in 0.29 s at 40 mph),
+  which stays in place. The comfort table above ~35 mph must be re-derived: the smoothest
+  possible island jog (1.5 m over 40 m) needs 25.1 °/s at 40 mph against today's 25.7 °/s cap;
+  a brisker one needs 2–4×.
+- **R5 Filtering is bounded in amplitude *and* time.** Any smoothing of the reference may
+  delay a real change by at most one model frame (50 ms).
+- **R6 No frame is ever invalid-to-zero; degrade to warm stock, not to a weaker tier.** The
+  only fallback is the stock shadow (it has the integrator a scalar-only rack tier lacks).
+  One staleness threshold, owned by the controller, checked against `timestampEof` **and**
+  `sm.alive` (`sm.valid` never decays and cannot detect a hung publisher); below it, *hold*
+  state, never reset; above it, hand over with hysteresis (≥0.5 s in stock).
+- **R7 Continuity.** Every rule is continuous in its inputs; sweep tests across every rule
+  boundary are required unit tests. No exact-zero special cases.
+- **R8 Fail closed at selection — for the controller *and* the torque authority.** Unknown,
+  mixed, or empty firmware → stock controller **and** stock 384/3/7 envelope, from the same test.
+- **R9 The controller knows every platform limiter by name:** opendbc slew 409/+4/−7 with its
+  sign-aware reversal cost (+409 → −409 takes ~1.6 s); the driver-torque allowance
+  (`STEER_DRIVER_ALLOWANCE` = 50 counts) that clips authority before `steeringPressed` trips;
+  panda's real-time rate window; the 85°/890 ms/2-frame LKAS angle-fault-avoidance cycle;
+  the upstream ISO `clip_curvature`; the measured lateral delay (default when lagd reports
+  `unestimated`). Anchor on `carOutput.actuatorsOutput.torque`, sanity-checked against
+  `CS.steeringTorqueEps`.
+- **R10 Adaptation is slow, bounded, single-purpose, and stays inside known ground.** One
+  gain; hard limits; frozen when raw driver torque exceeds the allowance, under saturation,
+  below torqued's validated speed floor (15 m/s — below it the band is fixed), during
+  fallback frames, and while torqued's filtered params are moving; torqued's collection is
+  down-weighted while the observer's gain is moving. Persisted state is versioned by the band
+  boundaries and has a staleness bound; a maintenance reset clears both learners.
+- **R11 Measured time.** The planner, rate estimator and governor use the measured control
+  `dt` (clamped), not the compile-time constant; a lag spike must not shrink a planned motion.
+- **R12 Evidence matches the layer.** Open-loop route replay grades the reference/planner
+  layer only. Anything that depends on the vehicle's response to the candidate's *own* torque
+  (tracking, feel, observer fitting) needs closed-loop counterfactual replay (route-audit's
+  PlantTwin harness) or a field drive. Phase 1's baseline is combo's controller files.
+
+## 2. Failure-mode catalog
+
+Format: **ID — name.** Scenario. *Mechanism.* → Design rule. → Test. `[v2]` = added by the
+red-team pass.
+
+### L0/L8 Upstream inputs (new)
+
+- **FM8.1 — `clip_curvature` precedes the controller. [v2]** A hard avoidance swerve, or a
+  hands-off island jog. *controlsd rate-limits `desired_curvature` through the ISO clamp with
+  its own persistent state before the controller sees it; `curvature_limited` only feeds the
+  alert path.* → Name it in R4/R9; the ISO clamp stays (it is sufficient: 36°, 0.29 s to
+  κ=0.0046 at 40 mph); the preview series must be built from the *model* curvature, pinned to
+  the clamped scalar, so the clamp shapes magnitude, not the plan's shape. → Unit: step to
+  MAX_CURVATURE; assert preview shape unaffected and scalar follows the ISO ramp.
+- **FM8.2 — `lateralDelay` trusted while unestimated. [v2]** Fresh install, factory reset,
+  lagd restart mid-drive. *controlsd reads `lateralDelay` with no `status` check, unlike
+  `lateralTorqueParameters.useParams`; lagd publishes `steerActuatorDelay + 0.2` as the
+  initial value.* → Gate on `status == estimated`; documented default otherwise;
+  `rackState.delayEstimated`. → Unit with a mocked unestimated message.
+- **FM8.3 — Roll estimate lags a banked ramp. [v2]** Cloverleaf/flyover superelevation building
+  over 50–100 m at 30–45 mph. *The lateral-accel clamp uses paramsd's roll; if it lags the
+  true bank, the clamp starves curvature authority at the tightest point.* → Roll's
+  contribution to the clamp tracks at its natural rate with an uncertainty margin while
+  paramsd is unconverged; the FM1.9 rate-limit applies to angle offset only. → Lagged-roll
+  synthetic (1–2 s time constant): clamp never below the true budget by more than the margin.
+
+### L1 Reference / preview
+
+- **FM1.1 — Far-point blindness to lateral offset.** Pedestrian refuge island on a straight
+  40 mph road (S Tamarac Dr): the path jogs ~1.5 m over ~40 m and back (≈18° at the wheel,
+  1.5 m/s², 2.2 s per half); a lane shift around a parked car; construction shift; a lane
+  change. *At 2 s (36 m) the path is straight again; curvature at the far point ≈ 0 while the
+  path between is an S.* → R1 + R2. → Phase 1: fixed 0.25 s target stays authoritative through
+  the jog. Phase 2: synthetic S-jog (1.5 m / 40 m / 17.9 m/s): `t_p == t_action` throughout;
+  Tamarac route replay.
+- **FM1.2 — Preview chatter.** Curvature hovering at the consistency threshold. → R3. → Path
+  oscillating ±10 % around `δ_y`: `t_p` changes ≤ once per second.
+- **FM1.3 — Model replan flip-flop.** Faded lines, tar snakes, merges. → R4/R5: the envelope,
+  not a filter, bounds what reaches the rack; any small-reversal filter bounded in time. →
+  Alternating-path replay.
+- **FM1.4 — Scalar/plan anchor mismatch.** Action head vs plan-derived curvature; the
+  look-ahead formula vs interpolation (+12–14 % bias found on curve entry). → Preview
+  computed in modeld by the same function; `preview[0] == desiredCurvature`. → Bit-exact unit.
+- **FM1.5 — Truncated or invalid plan.** Approaching a stop the plan's velocity reaches ≤ 0
+  inside the horizon. *Today: whole frame invalid → zero torque while still rolling.* → R6:
+  clip the horizon to the covered range; `t_p → t_action`. → Plan hitting 0 at 1.5 s, vEgo
+  3 m/s: torque continuous.
+- **FM1.6 — Stale or dropped model frame.** One dropped camera frame; a 150–250 ms pipeline
+  stall (3–5 skipped publishes, inside SubMaster's 0.5 s). *Today: 0.2 s hard cutoff, and
+  `_invalidate()` resets planner/governor/estimator → zero torque and a re-seed.* → R6: one
+  threshold, hold not reset below it; `modelV2.valid` reacts to same-frame drops but never
+  decays with time, so freshness must come from `sm.alive`/timestamps. → Gaps of 50/150/250/
+  450 ms: no reset, continuous torque; fallback only above the threshold.
+- **FM1.7 — Lane change.** 3.5 m shift over 3–5 s; far point straight in the new lane. → Same
+  as FM1.1; on `laneChangeStarting` shorten `t_p` — but a *nudgeless* start is provisional
+  for its 0.5 s reconsideration window (see FM4.7). → Lane-change replay.
+- **FM1.8 — Speed change during preview.** Braking toward a curve. → Preview in time at the
+  planned speed, capped in distance (≈40 m). → Braking-into-curve replay.
+- **FM1.9 — Angle-offset jumps.** paramsd re-converges; `angleOffsetDeg` steps. → Rate-limit
+  the *change* of the offset's effect on the reference angle (roll excluded — FM8.3). → Step
+  offset 1°: rack motion inside envelope.
+- **FM1.10 — Model sees the obstacle late or not at all.** Out of scope for the controller;
+  it must execute a late, hard correction at full (ISO-bounded) authority and the driver
+  override must be effortless. → Late 30° step at 40 mph: time-to-target ≤ stock.
+- **FM1.11 — Unfloored curvature division and single-sample `break`. [v2]** Parking-lot
+  creep, drive-through, any stop approach; or one spurious non-positive velocity sample on a
+  normal highway plan. *`curvatures.append(rate / speed)` with no floor: tiny planned speeds
+  turn yaw-rate noise into curvature spikes; one bad sample truncates everything after it
+  while `valid` stays True → coverage error → today, zero torque.* → Floor the denominator at
+  `MIN_SPEED` at the division; never let one bad sample truncate coverage of earlier times.
+  → Unit: 0.05 m/s sample bounded; injected 0.0 sample mid-array still yields output.
+- **FM1.12 — Two model channels, no cross-check. [v2]** A feature revealed abruptly; a lane
+  change onto a lane of different curvature under `lateralManeuverPlan`. *Scalar (action head)
+  and shape (plan tensor) are decoded separately and may disagree for a frame or two; the
+  anchor formula assumes they describe the same path.* → Disagreement = R2 failure → `t_p →
+  t_action`, flagged distinctly; under `lateralManeuverPlan`, `t_p = t_action`. → S-jog replay
+  with a 1-frame lag injected on one channel: no preview extension in the window.
+- **FM1.13 — Smooth but wrong. [v2]** Wide-lane wander (4–6 s period), apex-cutting on a
+  decreasing-radius ramp, a confidently wrong branch at an ambiguous exit. *A mean-path
+  consistency test passes anything smooth.* → R2(c): uncertainty + confidence gates. →
+  Synthetic 0.3–0.5 m sinusoidal wander: `t_p` never reaches max.
+- **FM1.14 — Confidence never consulted. [v2]** Night, rain, glare. *`modelV2.confidence`
+  rises before curvature error appears; nothing reads it.* → Yellow/red: no extension past
+  `t_action`; stronger corroboration before R4 exceeds comfort. Never *reduces* authority.
+  → Red-confidence frame: `t_p` pinned, reason logged.
+- **FM1.15 — Clothoid entries rejected by an arc test. [v2]** Every standard highway curve
+  entry. → R2(a) clothoid-consistent extrapolation; tolerance scales with the expected
+  buildup-vs-arc gap. → Six AASHTO-typical transitions pass consistency.
+- **FM1.16 — Periodic texture starves `t_p`. [v2]** Bridge joints every 15–20 m, rumble
+  strips. → R3 decaying score. → 0.5–1.5 Hz periodic deviation for 30 s: time-averaged `t_p`
+  above a target fraction.
+- **FM1.17 — Preview under-samples short features. [v2]** A quick jink or a narrow chicane
+  shorter than the T_IDXS spacing in the 1–2 s range. → Consistency evaluated on the native
+  model grid, not on a 0.25 s resample. → Synthetic 8 m chicane at 2 s: flagged inconsistent.
+
+### L2 Motion planner (virtual rack)
+
+- **FM2.1 — Virtual rack diverges from the real rack.** Driver holds, curb strike, ice, opendbc
+  clipped the request. → Re-anchor when tracking error exceeds a bound **for ≥100–150 ms or
+  together with driver torque** (a single-frame magnitude test misfires on speed humps and
+  railroad crossings); plan follows the hand while pressed. → Hold 3 s then release: step
+  < 0.1; speed-hump jolt: no re-anchor.
+- **FM2.2 — Envelope tightens mid-motion.** Speed rises mid-turn. → One explicit decay-inside
+  rule; continuous. → 5→20 m/s ramp holding ±10°: no discontinuity.
+- **FM2.3 — Comfort envelope blocks an evasive motion.** → R4. → 30° step: time-to-target ≤
+  stock.
+- **FM2.4 — Numerical edge cases.** → Planner clamps its own state; no exceptions in the
+  loop. → 100k random steps inside the envelope.
+- **FM2.5 — Standstill and creep.** κ→angle scales as 1/v². → `MIN_SPEED` floor at every
+  division (reference *and* feedback — see FM3.10); hold-angle behavior 0.3–1 m/s. → Creep at
+  0.5 m/s: bounded target.
+- **FM2.6 — Envelope tables mis-scaled.** p99 of how the rack *was* moved, not what the EPS
+  can do; at 40 mph the cap equals the smoothest necessary jog. → Comfort and physical
+  envelopes as two named, cited things; re-derive the comfort table above 35 mph with jogs in
+  the corpus. → Island jog inside the comfort envelope with margin.
+- **FM2.7 — Ordinary tight turns trip the "evasive" trigger. [v2]** A signed right turn off a
+  35 mph arterial: cross-street curvature appears in the last 0.5–1 s; ~370° of wheel. → R4's
+  opening depends on how the error arrived (growing over frames → smooth opening). → Curb-
+  return synthetic at 4.5 m/s: deviation < 0.3–0.5 m, no full-limit step.
+- **FM2.8 — Reactive-only opening is late for a necessary jog. [v2]** The island at 40 mph.
+  → R4 proactive trigger from R2's confirmed deviation. → Tamarac replay: rack rate tracks the
+  path's required rate from the first consistent frame.
+- **FM2.9 — SOL long stop freezes the scalar. [v2]** Under SOL, 30–90 s at a red light with
+  the wheel off-center. *modeld holds `desiredCurvature` below 0.3 m/s; on resume the first
+  live value can differ sharply and R4 would treat it as a hazard.* → Track time-since-frozen;
+  after a freeze longer than one horizon, the first live value is a fresh reference with the
+  comfort ramp. → 45 s at 0 then creep: comfort ramp, not full authority.
+- **FM2.10 — Model swap or noise ramp read as a hazard. [v2]** Big↔small model failover
+  mid-curve (`modelV2.big` never read today), action-head jitter with `LAT_SMOOTH_SECONDS = 0`.
+  → R4 corroboration before exceeding comfort; a single frame may open partway. → Flip
+  `modelV2.big` mid-curve: comfort ramp until the value persists.
+
+### L3 Tracking and output
+
+- **FM3.1 — Feedforward wrong.** Cold rack, tires, torqued defaults after reboot, trailer. →
+  P feedback + bounded observer; correct `saturated`. → FF ±30 %: bounded error, no alert.
+- **FM3.2 — Request clipped by opendbc unknowingly.** → R9; anchor on `carOutput`, check
+  `steeringTorqueEps`. → Step demand: no overshoot after the ramp.
+- **FM3.3 — Lateral-delay mismatch.** → Preview floor ≥ measured delay; FM8.2 gating. →
+  ±50 ms: bounded, no oscillation.
+- **FM3.4 — Sign or convention error.** → Mirror property tests.
+- **FM3.5 — Discontinuity at a rule boundary.** → R7 sweeps, jump < 0.05.
+- **FM3.6 — Saturation semantics.** *Three consumers read one flag: the driver alert (via
+  `curvature_limited` too), lagd's data-quality gate, R4.* → Separate signals:
+  `saturated` = platform limit; `feedbackLimited` distinct; `curvature_limited` handled
+  separately in the alert path. → Feedback clipped 1 s at 0.6 torque: no alert; lagd gate
+  unaffected.
+- **FM3.7 — Aligning feedforward on banked roads.** → Roll-compensated lateral accel. → Roll
+  sweep ±5°: monotonic.
+- **FM3.8 — Rate signal quality.** Unsigned 4 °/s `SAS_Speed`; wrong sign 1–4 frames after a
+  reversal. → Rate from the angle derivative, magnitude as validity; invalid until two
+  consistent ticks. → No wrong-sign valid samples.
+- **FM3.9 — Zero-crossing special cases.** → None; continuous through zero.
+- **FM3.10 — Feedback authority is exactly zero at standstill. [v2]** SOL engaged while
+  stopped with the wheel off-center; first creeping frames. *`lateral_accel_per_degree =
+  curvature_per_degree × vEgo²` with raw vEgo → gain 0 at v = 0.* → Feedback in angle space
+  (no v² in the gain), or floor the same speed variable. → vEgo = 0, 10° error: converges.
+- **FM3.11 — Reversal cost invisible to the angle-space envelope. [v2]** Second half of the
+  island jog right after firm torque the other way. *+4 up / −7 down per frame, sign-aware:
+  a full reversal takes ~1.6 s.* → R9 reversal-cost model; start the return leg early enough
+  to fit. → Unit reproducing the slew timing; saturated turn-in then reversal replay.
+- **FM3.12 — Undebounced EPS fault bit resets the controller. [v2]** A 1–3 frame
+  `CF_Mdps_ToiUnavail`/`ToiFlt` flicker during a firm turn. *`steerFaultTemporary` has no
+  debounce; latActive drops; today the rack state is wiped and re-seeded.* → Below a short
+  debounce, hold state (R6); reserve reset for persistent faults. → 1/2/3-frame fault
+  injection: state unchanged after.
+- **FM3.13 — The 85°/890 ms/2-frame angle-fault-avoidance cycle. [v2]** Driveway, tight
+  neighborhood corner, garage turn with lateral active. *Past ~0.9 s above 85° at the wheel
+  (~4.7° road wheel) opendbc drops `CF_Lkas_ActToi` for 2 frames, repeatedly.* → Named in R9;
+  a sustained high-angle hold is a budgeted state; empirically resolve whether the cycle
+  round-trips into `steerFaultTemporary`. → Bench hold ≥85° for 3 s logging LKAS/MDPS bits.
+
+### L4 Driver interaction
+
+- **FM4.1 — Override then release.** → Re-anchor on release; torque ramps at the slew. →
+  Step < 0.1.
+- **FM4.2 — Resting hand.** → R10 freeze in raw counts tied to `STEER_DRIVER_ALLOWANCE`
+  (the platform clips authority ~100 counts before `steeringPressed` trips). → Bias injection:
+  gain unchanged.
+- **FM4.3 — Driver fights a real jog.** → Assist cap, no windup, plan follows the hand.
+- **FM4.4 — Engage mid-curve; hybrid states.** Engage at 20° with 10 °/s; and the common
+  fork case: `longActive` drops on brake/gas while `latActive` stays (SOL/AOL). → Seed from
+  the measured rack and rate; the hybrid state is a first-class tested state. → First-frame
+  continuity; hybrid-state replay.
+- **FM4.5 — The first 50 ms of a grab. [v2]** *`steeringPressed` is 5-frame debounced; the
+  plan follows the hand and the assist cap apply only after it trips.* → "Back off now" keyed
+  to raw torque/angle (≤1-frame); `steeringPressed` kept for UI/torqued. → Ramp torque past
+  threshold with 150–250 °/s angle for 5 frames: assist cap from frame 1.
+- **FM4.6 — Release during motion. [v2]** Driver lets go while still rotating back toward
+  center mid-jog. *Only the plan's position follows the hand; its rate stays stale.* → Sync
+  `planner.rate` to the measured rate every pressed frame. → 40 °/s ramp then release: plan
+  rate within tolerance at the release frame.
+- **FM4.7 — Nudgeless self-abort window. [v2]** Blinker tap fires the change; the model
+  reverts within its 0.5 s reconsideration window. *Shortening `t_p` instantly commits to the
+  new lane during the very window the model may abort.* → Nudgeless starts provisional:
+  cap excursion rate until past the window; torque-confirmed starts commit immediately. →
+  Abort at 0.5 s: excursion below bound.
+- **FM4.8 — Brake mid-nudgeless-change under SOL/AOL. [v2]** Brake stab to abort. *Brake
+  drops `enabled` but AOL keeps `latActive`; the auto change continues.* → **Owner decision
+  2026-08-28: no** — a brake press does not abort an auto-started change; under SOL/AOL the
+  brake is a longitudinal input only and the driver aborts with the wheel. Mitigations are
+  therefore FM4.7's provisional window, the assist cap, and the wheel nudge. → Brake
+  mid-change: lane change continues, longitudinal disengages, no steering discontinuity;
+  wheel nudge mid-change: reverts within one model frame.
+
+### L5 Runtime, fallback, integration
+
+- **FM5.1 — Exception escapes controlsd.** → No exceptions as control flow; last-resort guard
+  returns the stock shadow's torque and logs. → Fault injection.
+- **FM5.2 — Fallback thrash / cold fallback.** → Shadow updated every frame with `active =
+  CC.latActive` (integrator warm), output discarded while the rack drives, frozen while the
+  rack is saturated; switch with hysteresis; logged. → Curvy replay with a forced
+  invalidation mid-jog: first stock frame within bound; ≤1 switch/s.
+- **FM5.3 — Runtime budget.** → p99 < 2 ms, no per-frame allocation. → Device CI timing.
+- **FM5.4 — Firmware gate wrong.** → R8, incl. torque authority. → Real fingerprints:
+  Telluride-only, mixed, empty → stock controller **and** 384/3/7.
+- **FM5.5 — opendbc/panda pin drift.** *A clean upstream sync already dropped the fork's 409
+  carve-out once (`df07a2de` restored it).* → Fork-owned golden test resolving
+  `CarControllerParams` for the real Palisade fingerprint asserting (409, 4, 7), run on every
+  sync workflow. → Sync dry-run.
+- **FM5.6 — Upstream sync collision.** → Union-arm ordinal only; sync workflow raises an issue.
+- **FM5.7 — Device/replay divergence.** → One code path. → Replay A/A bit-exact.
+- **FM5.8 — Interplay with other fork features.** SOL, nudgeless, curve-speed limiter,
+  hot-swap. → Combo replays; FM2.9/4.7/4.8 are the concrete cases.
+- **FM5.9 — Stale-model timing hole. [v2]** modeld hangs without exiting (no restart, no
+  terminal invalid message); a 20–30 ms controlsd stall. *`sm.valid` holds forever;
+  `dt` assumed 10 ms.* → R6 freshness by alive+timestamp; R11 measured `dt`. → Freeze
+  modelV2 for 5 s with `valid=True`: fallback well before selfdrived's 3 s soft-disable.
+
+### L6 Adaptation and data
+
+- **FM6.1 — Observer learns a disturbance.** → R10 bounds; offset stays torqued's job. →
+  2 m/s² bias 10 s: gain moves < 5 %.
+- **FM6.2 — Two learners fight (both directions).** → Disjoint variables; each frozen/
+  down-weighted while the other moves. → Co-simulation: no limit cycle.
+- **FM6.3 — Overfitting one route.** → Promotion bar: agreement within tolerance across ≥2
+  geometrically distinct routes (one jog-heavy, one highway) — the single-route analysis rule
+  stays for *feel* attribution, not for promotion.
+- **FM6.4 — Bad learned state survives. [v2 expanded]** Alignment, tires, a band-boundary
+  change. *torqued's restore key ignores physical events; its decay only slows.* → R10
+  staleness bound + maintenance reset for both learners; state versioned by band boundaries.
+- **FM6.6 — The two surfaces disagree at a cell.** One surface anchored, the other prior-only
+  (e.g. many steady-curve frames but no turn-ins on a banked ramp); or anchors of opposite
+  sign from a contaminated frame. *A combined decision mixes measured and guessed values.* →
+  Envelope opening keyed to the less-confident surface; a residual anchor is admitted only
+  if it agrees in sign with the physics prior or is corroborated by a neighbouring anchored
+  cell; disagreement logged. → Synthetic: anchor `H` only on a cell, leave `G` prior; assert the
+  envelope stays at comfort and `rackState` reports the limiting surface.
+- **FM6.5 — Low-speed band outside torqued's domain. [v2]** Garage ramps, driveways at
+  2–15 mph. *torqued never fits below 15 m/s; the observer would sit on an unfitted map.* →
+  Bands ⊆ torqued's domain; below it fixed. → Low-speed battery: band gain does not move.
+
+### L7 Sensing and timing
+
+- **FM7.1 — Model latency varies.** → Times relative to `timestampEof`. → +100 ms: no
+  invalidation.
+- **FM7.2 — Clock domains.** → Verified same domain; replay assertion.
+- **FM7.3 — CAN dropout.** → `CS.canValid`; rate estimator invalid. → Freeze angle 5 frames:
+  no spike.
+
+### L9 Process and evidence (new)
+
+- **FM9.1 — Porting from the wrong baseline. [v2]** *combo carries `ecec8d387e` (direction-
+  guard ramp) that BLaTv2 lacks.* → R12: phase-1 baseline = combo's controller files; CI:
+  `git log <baseline>..origin/combo -- <controller files>` must be empty or accounted for.
+- **FM9.2 — Open-loop replay grading a closed-loop change. [v2]** Phase 2/3 "validated by
+  replay". *Logged steering response is the outcome of the *original* torque.* → R12:
+  closed-loop counterfactual (PlantTwin) or field for tracking/feel. → Process gate on PRs.
+
+## 3. Test strategy
+
+1. Property/mirror/sweep unit tests for L2–L3 (continuity, symmetry, envelope), upstream style
+   (`OpenpilotTestCase`, parameterized), one file, short tests.
+2. Synthetic-scenario tests with hand-built model paths: island S-jog, lane change (confirmed
+   and nudgeless-with-abort), stop approach, dropped/stalled frames, evasive step, tight turn
+   revealed late, speed ramp mid-turn, SOL long stop, driver grab/release-in-motion.
+3. Route replays on the route-audit harness: A/A bit-exact for the phase-1 port; open-loop
+   replay for reference-layer changes only; closed-loop counterfactual for tracking changes.
+4. Field checklist per phase, one behavior per drive, evidence = logged `rackState` (status,
+   `t_p`, restriction reason, fallback, saturated/feedbackLimited, delayEstimated).
+5. Fork-owned golden tests that survive upstream syncs: (409, 4, 7) for the Palisade
+   fingerprint; firmware gate on real fingerprints; capnp union arm present.
+
+## 4. Owner decisions
+
+1. FM4.8 — brake press aborts an *auto-started* lane change under SOL/AOL? **No (2026-08-28).**
+2. FM6.3 — two-route promotion bar alongside the single-route feel rule? **Yes (2026-08-28).**
+3. FM2.6 — source of the comfort-envelope corpus and re-derivation above 35 mph: **open** —
+   provenance of the current tables is undocumented (introduced in `24b0eb0beb` with no
+   derivation script); see the re-derivation plan in the design notes.
