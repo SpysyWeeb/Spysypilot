@@ -21,14 +21,9 @@ and remaining validation work.
 - **`combo`** — all features merged together for testing
 - Feature branches are cut from `stock` and merged into `combo` when ready; each feature branch's own README explains that feature in depth
 
-### Combo variants
+### Integration branch
 
-Only two combined testing branches are maintained:
-
-| branch | driving model |
-|---|---|
-| [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) | stock comma release model |
-| [`tsfdo-combo`](https://github.com/SpysyWeeb/Spysypilot/tree/tsfdo-combo) | comma's [`tsfdo`](https://github.com/commaai/openpilot/tree/tsfdo) experimental small driving model |
+[`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) is the only maintained combined testing branch and uses comma's stock release model. No standalone model-variant branch is active; the former `tsfdo-combo` branch was retired and deleted.
 
 ## Engagement CI
 
