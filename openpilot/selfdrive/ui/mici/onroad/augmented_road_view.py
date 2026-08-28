@@ -21,7 +21,7 @@ from enum import IntEnum
 
 OpState = log.SelfdriveState.OpenpilotState
 CALIBRATED = log.ExtrinsicsCalibration.Status.calibrated
-ROAD_CAM = VisionStreamType.VISION_STREAM_NARROW_ROAD
+NARROW_ROAD_CAM = VisionStreamType.VISION_STREAM_NARROW_ROAD
 WIDE_CAM = VisionStreamType.VISION_STREAM_WIDE_ROAD
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
 
@@ -250,12 +250,12 @@ class AugmentedRoadView(CameraView):
       if v_ego < WIDE_CAM_MAX_SPEED:
         target = WIDE_CAM
       elif v_ego > ROAD_CAM_MIN_SPEED:
-        target = ROAD_CAM
+        target = NARROW_ROAD_CAM
       else:
         # Hysteresis zone - keep current stream
         target = self.stream_type
     else:
-      target = ROAD_CAM
+      target = NARROW_ROAD_CAM
 
     if self.stream_type != target:
       self.switch_stream(target)
@@ -266,7 +266,7 @@ class AugmentedRoadView(CameraView):
     if not self.device_camera and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       self.device_camera = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
 
-    # Check if live calibration data is available and valid
+    # Check if camera calibration data is available and valid
     if not (sm.updated["extrinsicsCalibration"] and sm.valid['extrinsicsCalibration']):
       return
 
@@ -353,14 +353,14 @@ class AugmentedRoadView(CameraView):
 
 if __name__ == "__main__":
   gui_app.init_window("OnRoad Camera View")
-  road_camera_view = AugmentedRoadView(lambda: None, stream_type=ROAD_CAM)
+  road_camera_view = AugmentedRoadView(lambda: None, stream_type=NARROW_ROAD_CAM)
   print("***press space to switch camera view***")
   try:
     for _ in gui_app.render():
       ui_state.update()
       if rl.is_key_released(rl.KeyboardKey.KEY_SPACE):
         if WIDE_CAM in road_camera_view.available_streams:
-          stream = ROAD_CAM if road_camera_view.stream_type == WIDE_CAM else WIDE_CAM
+          stream = NARROW_ROAD_CAM if road_camera_view.stream_type == WIDE_CAM else WIDE_CAM
           road_camera_view.switch_stream(stream)
       road_camera_view.render(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
   finally:
