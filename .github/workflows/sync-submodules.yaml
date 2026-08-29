@@ -70,7 +70,7 @@ jobs:
           msg = messaging.new_message("modelV2")
           msg.modelV2.big = False
           PY
-          pytest -q \
+          .venv/bin/python -m pytest -q \
             openpilot/selfdrive/locationd/test/test_torqued.py \
             openpilot/selfdrive/car/tests/test_car_interfaces.py
 
