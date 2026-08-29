@@ -2,6 +2,8 @@ from collections import deque
 from dataclasses import dataclass
 import math
 
+import numpy as np
+
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
@@ -38,7 +40,8 @@ DOWN_SPEED = 3.0          # m/s, below this the latched point also follows the e
                           # a stale latch must not roll into the crosswalk); above it the latch is immune to collapse
 DOWN_RATE = 2.0
 DOWN_DEADBAND = 1.0
-QUALIFY_S = 1.0           # s of consistent strict, lead-free stop evidence that commits before the classic window
+QUALIFY_S = 0.3           # s of consistent strict, lead-free stop evidence on a world-fixed endpoint that commits before the
+                          # classic window (was 1.0: the model calls a red light only 4-5 s out, every 0.1 s is 1.4 m at 14 m/s)
 QUALIFY_WORLD_TOLERANCE = 5.0
 RELEASE_RC = 0.30         # s, filter on the model's launch evidence while holding
 RELEASE_OPEN_THRESHOLD = 0.70
@@ -48,12 +51,25 @@ CLEAR_WINDOW_S = 4.0      # s, fallback release while holding: mostly clear, mov
 CLEAR_WINDOW_FRACTION = 0.8
 NO_CAP = math.inf
 
+# The committed approach profile. The MPC's stop column is a soft quadratic obstacle: it starts braking late and
+# hard (route 24, 2026-08-29: +1.45 -> -1.86 over 1.5 s after a commit that needed 1.9 m/s^2). The owner's own
+# stops do the opposite: reach the needed deceleration within a second, hold it, ease off at the end. The profile
+# below is that shape as a plan candidate: the constant deceleration that lands short of the committed point,
+# jerk-limited, faded out at low speed so the column's own easing landing (and the hold) take the last metres.
+PROFILE_JERK = 2.0             # m/s^3, the candidate moves at most this fast (the owner builds braking at 1-2 m/s^3)
+PROFILE_LANDING = 4.5          # m, the constant-deceleration profile lands this far short of the committed point
+PROFILE_MIN_DISTANCE = 0.5     # m, closer than this to the landing the column owns the rest
+PROFILE_MAX_DECEL = 3.0        # m/s^2, past this the approach is no longer a comfort matter; column and e2e remain
+PROFILE_HANDOVER_SPEED = 3.0   # m/s, the profile starts fading out here ...
+PROFILE_FADE_SPEED = 1.5       # m/s, ... and is gone here
+
 
 @dataclass(frozen=True, slots=True)
 class ForceStopsResult:
   v_cruise_cap: float = NO_CAP
   stop_x: float | None = None
   holding: bool = False
+  a_target: float | None = None   # the committed approach profile, a plan candidate while a commitment is moving
 
 
 class ForceStops:
@@ -81,14 +97,30 @@ class ForceStops:
     self.position_hold_remaining = 0.0
     self.qualified_s = 0.0
     self.qualified_endpoint = None
+    self.profile_accel = None
 
-  def _result(self, v_ego):
+  def _profile(self, v_ego, a_ego):
+    # constant deceleration to the landing, entered from the car's current acceleration and jerk-limited from there
+    distance = self.remaining - PROFILE_LANDING
+    if distance <= PROFILE_MIN_DISTANCE or v_ego <= PROFILE_FADE_SPEED:
+      self.profile_accel = None
+      return None
+    need = min(v_ego ** 2 / (2.0 * distance), PROFILE_MAX_DECEL)
+    fade = float(np.clip((v_ego - PROFILE_FADE_SPEED) / (PROFILE_HANDOVER_SPEED - PROFILE_FADE_SPEED), 0.0, 1.0))
+    start = self.profile_accel if self.profile_accel is not None else min(a_ego, 0.0)
+    step = PROFILE_JERK * self.dt
+    self.profile_accel = float(np.clip(-need * fade, start - step, start + step))
+    return self.profile_accel
+
+  def _result(self, v_ego, a_ego=0.0):
     if self.holding:
+      self.profile_accel = None
       return ForceStopsResult(0.0, max(self.remaining, -STOP_DISTANCE), True)
     if self.forcing:
       profile_distance = max(self.remaining - MPC_PROFILE_OFFSET, 0.0)
       cap = min(profile_distance / RAMP_TIME, math.sqrt(2.0 * A_STOP_ENVELOPE * profile_distance))
-      return ForceStopsResult(max(cap, v_ego - DV_MAX), max(self.remaining, -STOP_DISTANCE), False)
+      return ForceStopsResult(max(cap, v_ego - DV_MAX), max(self.remaining, -STOP_DISTANCE), False, self._profile(v_ego, a_ego))
+    self.profile_accel = None
     return ForceStopsResult()
 
   def _qualify(self, obs, v_ego, tracking_lead):
@@ -111,6 +143,7 @@ class ForceStops:
       self.rearm_remaining = 0.0
       return ForceStopsResult()
     v_ego = max(CS.vEgo, 0.0)
+    a_ego = CS.aEgo if math.isfinite(CS.aEgo) else 0.0
 
     if CS.gasPressed:
       self.override_timer = GAS_OVERRIDE_S
@@ -131,14 +164,15 @@ class ForceStops:
       if self.invalid_s >= MODEL_INVALID_RELEASE_S:
         self.reset()
         return ForceStopsResult()
-      return self._result(v_ego)
+      return self._result(v_ego, a_ego)
 
     self.lead_filter.update(1.0 if obs.lead_present else 0.0)
     tracking_lead = self.lead_filter.x > LEAD_GATE
     if self.holding:
-      return self._hold(obs, v_ego)
-    if obs.lead_present:
-      # a raw lead while moving hands the stop back to the lead logic; a broken commitment may re-form as a hold
+      return self._hold(obs, v_ego, a_ego)
+    if tracking_lead:
+      # a tracked lead while moving hands the stop back to the lead logic; a broken commitment may re-form as a hold.
+      # One radar frame is not a lead (route 24: a single frame reset a red-light commitment 0.5 s before the driver braked)
       if self.forcing:
         self.rearm_remaining = REARM_S
       self.reset()
@@ -170,7 +204,7 @@ class ForceStops:
       self.remaining = min(self.remaining, 0.0) if self.remaining > 0.0 else self.remaining
       self.release_filter.x = 0.0
       self.clear_window.clear()
-      return self._result(v_ego)
+      return self._result(v_ego, a_ego)
 
     if self.override_timer > 0.0:
       return ForceStopsResult()
@@ -199,14 +233,14 @@ class ForceStops:
     if self.detect_filter.x < RELEASE_THRESHOLD and self.position_hold_remaining <= 0.0:
       self.forcing = False
       return ForceStopsResult()
-    return self._result(v_ego)
+    return self._result(v_ego, a_ego)
 
-  def _hold(self, obs, v_ego):
+  def _hold(self, obs, v_ego, a_ego):
     if v_ego >= RESUME_SPEED:
       # rolling again (creep or a grade): back to a moving commitment, the latch survives
       self.holding = False
       self.forcing = True
-      return self._result(v_ego)
+      return self._result(v_ego, a_ego)
     if obs.relevant_lead:
       self.reset()
       self.rearm_remaining = REARM_S
@@ -219,4 +253,4 @@ class ForceStops:
     if self.release_filter.x > RELEASE_OPEN_THRESHOLD or window_clear:
       self.reset()
       return ForceStopsResult()
-    return self._result(v_ego)
+    return self._result(v_ego, a_ego)

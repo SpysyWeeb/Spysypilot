@@ -29,6 +29,8 @@ class Maneuver:
     self.e2e = kwargs.get("e2e", False)
     self.personality = kwargs.get("personality", 0)
     self.force_decel = kwargs.get("force_decel", False)
+    self.stop_line = kwargs.get("stop_line", None)
+    self.stop_line_horizon_s = kwargs.get("stop_line_horizon_s", 5.0)
 
     self.duration = duration
     self.title = title
@@ -44,6 +46,8 @@ class Maneuver:
       e2e=self.e2e,
       personality=self.personality,
       force_decel=self.force_decel,
+      stop_line=self.stop_line,
+      stop_line_horizon_s=self.stop_line_horizon_s,
     )
 
     valid = True

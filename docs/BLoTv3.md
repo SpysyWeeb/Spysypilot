@@ -45,6 +45,10 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 | D9 | Module names | `longitudinal_lead.py` (kept — combo imports it), `necessity_supervisor.py`, `stop_helpers.py`, `force_stops.py`, `conditional_experimental_mode.py` |
 | D10 | Hold release fallback | 4 s window in which ≥ 80 % of model frames show no stop tier, terminal speed ≥ 1 m/s and the stop corridor is lead-free — positive "clear" evidence, not absence |
 | D11 | `selfdrived.py` on combo | collaborator (SOL/AOL) area; ask before phase 4d touches it; the CEM hook lands around the AOL calls without moving them |
+| D13 | Committed approach profile (2026-08-29 field test 2) | Force Stops publishes its own plan candidate while a commitment is moving: the constant deceleration that lands `PROFILE_LANDING` short of the point, entered from the car's current deceleration at `PROFILE_JERK`, capped at `PROFILE_MAX_DECEL`, faded out between `PROFILE_HANDOVER_SPEED` and `PROFILE_FADE_SPEED` so the MPC column's own easing and the hold land the car. The MPC's quadratic stop column cannot be front-loaded (route 24: +1.45 → −1.86 over 1.5 s after a commit that needed 1.9 m/s²); the owner's own stops reach the needed deceleration within a second, hold it, ease off |
+| D14 | Change-cost anchor on obstacle handoff | the MPC refills `a_prev` with the current acceleration whenever the binding obstacle column changes (lead0/lead1/stop), not only when an adaptive lead0 policy ends; a committed stop used to inherit the free run's accelerating solution |
+| D15 | Commit speed | `QUALIFY_S` 1.0 → 0.3 s (world-fixed endpoint under strict evidence); only a *tracked* lead (`lead_filter` above `LEAD_GATE`) breaks a moving commitment — one radar frame reset a red-light commitment 0.5 s before the driver braked |
+| D16 | Arbitration with e2e | unchanged: `min()` over MPC, cruise, e2e and the committed profile; with a front-loaded profile the car is slower when the model's late demand would come, so e2e loses the early phase and is milder late. Excluding e2e while committed stays an option if a drive shows otherwise |
 | D12 | Fallback to "stop as MPC obstacle only, no mode switching" | if after two fix rounds the phase-3 field test still shows a resume pulse or `shouldStop` dither at a real stop, or the driver had to break a hold at a green more than once per ~10 stops |
 
 ## 3. Module contracts
@@ -103,7 +107,7 @@ publishes at standstill, is a legal straight corridor, a reversing one is not. `
 defined here and shared. Typed capnp access; no `getattr` guards.
 
 ### force_stops.py
-`ForceStops.update(observation, car_state, experimental_mode, enabled, model_valid) -> (v_cruise_cap, stop_x, holding)`; the observation
+`ForceStops.update(observation, car_state, experimental_mode, enabled, model_valid) -> (v_cruise_cap, stop_x, holding, a_target)`; the observation
 carries lead presence/relevance, launch evidence and the corridor verdict, and `enabled` is the planner's own active signal.
 States: `idle → shaping → committed → holding → (committed | idle)`.
 - Entry requires Experimental mode (**entry only** — a later mode exit never releases a hold), no
@@ -112,7 +116,10 @@ States: `idle → shaping → committed → holding → (committed | idle)`.
 - `committed`: `remaining` decremented by ego travel, forward-ratcheted toward a re-extending
   endpoint (`EXTEND_RATE`/`EXTEND_DEADBAND`) and, below `DOWN_SPEED`, down-ratcheted toward a
   collapsing one (route 38 t=351); `LATCH_SETBACK`; `stop_x = max(remaining, −STOP_DISTANCE)`;
-  `v_cruise_cap ≥ v_ego − DV_MAX`. Model invalid releases only after `MODEL_INVALID_RELEASE_S`.
+  `v_cruise_cap ≥ v_ego − DV_MAX`; `a_target` = the committed approach profile (D13), a plan
+  candidate with source `stop` while the commitment is moving. Model invalid releases only after
+  `MODEL_INVALID_RELEASE_S`. A tracked lead (not one radar frame) hands a moving commitment to the
+  lead logic (D15).
 - `holding`: entered at `CS.standstill` while committed, or within 10 s of a lead or a gas tap breaking
   a commitment or a hold when the car is stopped with stop evidence; `stop_x = 0` and `holding` forces
   `shouldStop`, so `controlsd`'s `cruiseControl.resume` cannot pulse. Leaves to `committed` (not
@@ -199,3 +206,20 @@ switch"; no difference noticed otherwise.
      departing lead).
 - Not changed: no launch-staging cap in LongControl — with the hold releasing ~0.9 s earlier the car should break
   free while the plan is still 0.3–0.5 m/s². Reassess after the next drive.
+
+**2026-08-29, route 24 (combo 2f7ba629d0).** Two disengagements at red lights ("didn't feel like we'd stop in time"),
+both Experimental-mode e2e stops without a lead; a launch felt odd. Owner baselines from the same drives: comfortable
+stops from 18 m/s are ≈ −1.5 m/s² held for ~10 s then eased to −0.6; comfortable launches peak at 4 m/s² and hold ~3
+to 4 m/s, tapering to 1.2 by 12 m/s. The car's SCC saturates at ≈ 1.6–1.9 m/s² for any request above 1.5 (CAN
+`ACCEL_REF_ACC`), so openpilot launches are bounded by the vehicle.
+
+- The model calls a red light 4–5 s out (strict evidence at ~70 m / 14 m/s, need ≥ 1.7 m/s²) and its e2e request
+  ramps −0.7 … −1.3 → −2.5 into the last 3 s. Force Stops committed 4.5 s (#1) and 0.5 s (#2) before the driver braked:
+  #1 lost every arbitration frame to e2e because the MPC's stop column started at +1.45 and took 1.5 s to reach −1.6
+  (stale free-run `a_prev` under `A_CHANGE_COST`, quadratic obstacle cost); #2 was reset by one radar frame.
+- Fixes: D13 committed approach profile, D14 change-cost re-anchor on any obstacle handoff, D15 faster commit and
+  tracked-lead release. Closed-loop check: the maneuver plant gained a world-fixed stop line the fake model calls 5 s
+  out (`Plant(stop_line=…)`); the red-light maneuver must stop short of the line with the needed deceleration reached
+  within a second and eased off at the end.
+- Launch: with the SCC's ~1.9 m/s² ceiling the remaining lever is starting early (field test 1); the green-light
+  cap `LAUNCH_MAX_ACCEL` on combo (1.5) is worth raising toward the ceiling.

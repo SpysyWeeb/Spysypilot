@@ -69,6 +69,21 @@ class TestUpdateProtocol:
     assert not mpc.lead0_policy_adaptive
     assert np.allclose(mpc.params[:, 3], -1.0)
 
+  def test_a_new_binding_obstacle_reanchors_the_change_cost(self):
+    # a committed stop used to inherit the free run's accelerating solution through the change cost and start 1.5 s late
+    mpc = LongitudinalMpc()
+    for _ in range(20):
+      mpc.set_cur_state(13.0, 0.0)
+      mpc.update(radar_state(), STANDARD)
+    assert mpc.a_prev.max() > 0.5
+    mpc.set_cur_state(13.0, -1.2)
+    mpc.update(radar_state(), STANDARD, stop_x=50.0)
+    assert mpc.source == LongitudinalPlanSource.stop
+    assert np.allclose(mpc.params[:, 3], -1.2)
+    mpc.set_cur_state(13.0, -1.2)
+    mpc.update(radar_state(), STANDARD, stop_x=49.4)
+    assert not np.allclose(mpc.params[:, 3], -1.2)
+
   def test_model_anchor_replaces_the_radar_extrapolation(self):
     mpc = LongitudinalMpc()
     mpc.set_cur_state(10.0, 0.0)

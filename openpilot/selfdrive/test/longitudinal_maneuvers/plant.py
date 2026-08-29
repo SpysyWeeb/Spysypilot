@@ -49,7 +49,8 @@ class Plant:
   messaging_initialized = False
 
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
-               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False):
+               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
+               stop_line=None, stop_line_horizon_s=5.0):
     self.rate = 1. / DT_MDL
 
     if not Plant.messaging_initialized:
@@ -76,6 +77,10 @@ class Plant:
     self.e2e = e2e
     self.personality = personality
     self.force_decel = force_decel
+    # a world-fixed stop line the fake model plans to stop at once it is within stop_line_horizon_s of travel,
+    # the way the real model calls a red light only a few seconds out
+    self.stop_line = stop_line
+    self.stop_line_horizon_s = stop_line_horizon_s
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
@@ -86,6 +91,34 @@ class Plant:
     from opendbc.car.honda.interface import CarInterface
 
     self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=self.speed)
+
+  def _plan_stop_line(self, model):
+    # the model's path ends at the line with a constant-deceleration speed profile; its e2e request is
+    # deliberately softer than that need, as the real model's early request is
+    d_line = self.stop_line - self.distance
+    t = np.array(ModelConstants.T_IDXS)
+    if d_line <= 0.5 or self.speed < 0.3:
+      x = np.zeros_like(t)
+      v = np.zeros_like(t)
+      model.action.shouldStop = True
+      model.action.desiredAcceleration = float(min(self.acceleration, 0.0)) if self.speed >= 0.3 else 0.0
+    elif d_line <= self.speed * self.stop_line_horizon_s:
+      a_req = self.speed ** 2 / (2.0 * d_line)
+      t_stop = self.speed / a_req
+      tc = np.minimum(t, t_stop)
+      x = self.speed * tc - 0.5 * a_req * tc ** 2
+      v = np.maximum(self.speed - a_req * tc, 0.0)
+      model.action.shouldStop = bool(d_line < 3.0)
+      model.action.desiredAcceleration = float(-0.7 * a_req)
+    else:
+      return
+    position = log.XYZTData.new_message()
+    position.x = [float(xx) for xx in x]
+    model.position = position
+    velocity = log.XYZTData.new_message()
+    velocity.x = [float(vv) for vv in v]
+    velocity.x[0] = float(self.speed)
+    model.velocity = velocity
 
   @property
   def current_time(self):
@@ -150,6 +183,8 @@ class Plant:
     acceleration = log.XYZTData.new_message()
     acceleration.x = [float(x) for x in np.zeros_like(ModelConstants.T_IDXS)]
     model.modelV2.acceleration = acceleration
+    if self.stop_line is not None:
+      self._plan_stop_line(model.modelV2)
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
     # lead0 mirrors the radar lead above; lead1/lead2 are shaped but carry no probability
@@ -174,6 +209,7 @@ class Plant:
     ss.selfdriveState.enabled = bool(self.enabled)
     control.controlsState.forceDecel = self.force_decel
     car_state.carState.vEgo = float(self.speed)
+    car_state.carState.aEgo = float(self.acceleration)
     car_state.carState.standstill = bool(self.speed < 0.01)
     car_state.carState.vCruise = float(v_cruise * 3.6)
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
