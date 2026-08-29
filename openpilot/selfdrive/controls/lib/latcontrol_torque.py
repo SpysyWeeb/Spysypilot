@@ -87,6 +87,10 @@ class LatControlTorque(LatControl):
     pid_log.version = VERSION
     future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
     self.lat_accel_request_buffer.append(future_desired_lateral_accel)
+    delay_frames = int(np.clip(lat_delay / self.dt + 1, 1, self.lat_accel_request_buffer_len))
+    lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len+1, -2))
+    raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx+1] - self.lat_accel_request_buffer[lookahead_idx-1]) / (2 * self.dt)
+    desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
     if self.rack_trajectory is not None:
       output = self.rack_trajectory.update(
         active, CS, VM, params, self.torque_params, self.torque_from_lateral_accel, lat_delay, desired_curvature,
@@ -127,14 +131,10 @@ class LatControlTorque(LatControl):
     curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
     lateral_accel_deadzone = curvature_deadzone * CS.vEgo ** 2
 
-    delay_frames = int(np.clip(lat_delay / self.dt + 1, 1, self.lat_accel_request_buffer_len))
     expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
     setpoint = expected_lateral_accel
     error = setpoint - measurement
 
-    lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len+1, -2))
-    raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx+1] - self.lat_accel_request_buffer[lookahead_idx-1]) / (2 * self.dt)
-    desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
     gravity_adjusted_future_lateral_accel = future_desired_lateral_accel - roll_compensation
     ff = gravity_adjusted_future_lateral_accel
     # latAccelOffset corrects roll compensation bias from device roll misalignment relative to car roll

@@ -57,8 +57,12 @@ def model_path_targets(
         valid = False
         break
       times.append(time)
-      # a plan that stops inside the horizon still covers it; keep those samples and floor the speed
-      curvatures.append(rate / max(speed, MIN_SPEED))
+      # a plan that stops inside the horizon still covers it. Below MIN_SPEED the yaw rate/speed
+      # ratio is ill-conditioned, so hold the last well-conditioned curvature: the wheel stays put.
+      if speed >= MIN_SPEED or not curvatures:
+        curvatures.append(rate / max(speed, MIN_SPEED))
+      else:
+        curvatures.append(curvatures[-1])
       speeds.append(speed)
       previous_time = time
 

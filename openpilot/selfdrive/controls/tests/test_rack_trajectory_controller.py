@@ -12,7 +12,6 @@ from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.realtime import DT_CTRL
 import openpilot.selfdrive.controls.lib.rack_trajectory as rack_trajectory_module
-from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, VERSION, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
@@ -317,8 +316,8 @@ def test_model_path_is_scalar_anchored_and_signed() -> None:
     roll_rad=0.0,
     angle_offset_deg=0.0,
   )
-  # the stopped sample is kept, with its curvature floored at MIN_SPEED instead of dividing by zero
-  assert abs(stopped.curvature - (.03 + .1 / MIN_SPEED - .05 / 5.0)) < 1e-12
+  # the stopped samples are kept and hold the last well-conditioned curvature (the .05 / 5.0 knot at 1 s)
+  assert abs(stopped.curvature - .03) < 1e-12
   assert math.isfinite(stopped.angle_deg)
 
 
@@ -874,6 +873,44 @@ def test_profile_transition_headroom_does_not_walk_outward() -> None:
       assert abs(plan.rate_deg_s) < 300.0
   assert not transition
   assert abs(plan.rate_deg_s) <= profile.max_rate_deg_s + 1e-6
+
+
+def test_rack_fallback_is_the_stock_controller_after_rack_frames() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  controller = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  stock = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL)
+  vehicle_model = VehicleModel(car_params)
+  state = car.CarState.new_message()
+  state.vEgo = 15.0
+  params = log.VehicleParameters.new_message()
+  model = messaging.new_message("modelV2").modelV2
+  model.action.desiredCurvatureTime = .5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+  model.velocity.x = [15.0] * 6
+
+  # a curve entry steered by the rack controller: the stock reference mirrors its idle, reset PID
+  for frame in range(150):
+    curvature = min(.004, frame * .00004)
+    state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, state.vEgo, 0.0))
+    model.action.desiredCurvature = curvature
+    model.orientationRate.z = [curvature * state.vEgo] * 6
+    model.timestampEof = 1_000_000_000 + frame * 10_000_000
+    controller.set_rack_trajectory_model(model, model.timestampEof + 50_000_000)
+    _, _, controller_log = controller.update(True, state, vehicle_model, params, False, curvature, False, .2)
+    stock.update(True, state, vehicle_model, params, False, curvature, False, .2)
+    stock.pid.reset()
+    assert controller_log.version == 6
+
+  # the model goes stale: every fallback frame is exactly what the stock controller would have done
+  controller.set_rack_trajectory_model(model, model.timestampEof + 500_000_000)
+  for _ in range(50):
+    torque, _, controller_log = controller.update(True, state, vehicle_model, params, False, .004, False, .2)
+    stock_torque, _, stock_log = stock.update(True, state, vehicle_model, params, False, .004, False, .2)
+    assert controller.rack_trajectory.status == STATUS_STALE_MODEL
+    assert controller_log.version == VERSION
+    assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(controller_log.f, stock_log.f, rel_tol=0.0, abs_tol=1e-12)
 
 
 def test_live_candidate_is_process_selected_and_fails_closed() -> None:
