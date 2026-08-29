@@ -80,7 +80,13 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   smoothness, not correctness — (c) is what stops "smooth but wrong". `|κ(t_p)|` alone is
   never a straightness test: at 40 mph, `|κ| < 0.001` (3.9° at the wheel) still allows 0.64 m
   of drift over a 36 m preview. No cross-checks against lane lines/road edges (lane-placement
-  ruling).
+  ruling). *Measured 2026-08-29 on 49 owner routes (816,450 engaged model frames): on straight
+  frames the 2 s target is 1.98× calmer than the 0.25 s target (frame-to-frame std 0.111° vs
+  0.220°, holding in every speed band); `δ_y = 0.15 m` is the knee (admits 78 % of straight
+  driving at 2 s with the clothoid idealization, 74 % arc; 0.25 m adds only 1.6 points) and
+  rejects every one of the 475 island-class frames by 3–16×; the clothoid is uniformly the right
+  idealization (arc p99 deviation 2.6 m vs 0.96 m). The far target moves the wheel only 0.48°
+  RMS relative to the near one on admitted frames.*
 - **R3 Shorten fast, lengthen slowly, don't starve.** `t_p` collapses to `t_action` within at
   most two consecutive failing model frames (≤100 ms ≈ 1.8 m at 40 mph); it grows back at a
   bounded rate. Growth progress is a decaying score, not reset by one isolated failing frame,
@@ -160,7 +166,9 @@ red-team pass.
   change. *At 2 s (36 m) the path is straight again; curvature at the far point ≈ 0 while the
   path between is an S.* → R1 + R2. → Phase 1: fixed 0.25 s target stays authoritative through
   the jog. Phase 2: synthetic S-jog (1.5 m / 40 m / 17.9 m/s): `t_p == t_action` throughout;
-  Tamarac route replay.
+  Tamarac route replay; and the recorded island-class event on route `00000020` seg 6 at 374 s
+  (`θ_near −134.5°`, `θ_2s +1.6°`, `κ_2s −0.00018`, clothoid deviation 1.77 m) must be rejected at
+  every `δ_y`.
 - **FM1.2 — Preview chatter.** Curvature hovering at the consistency threshold. → R3. → Path
   oscillating ±10 % around `δ_y`: `t_p` changes ≤ once per second.
 - **FM1.3 — Model replan flip-flop.** Faded lines, tar snakes, merges. → R4/R5: the envelope,
@@ -220,6 +228,16 @@ red-team pass.
 - **FM1.17 — Preview under-samples short features. [v2]** A quick jink or a narrow chicane
   shorter than the T_IDXS spacing in the 1–2 s range. → Consistency evaluated on the native
   model grid, not on a 0.25 s resample. → Synthetic 8 m chicane at 2 s: flagged inconsistent.
+- **FM1.18 — The far target can be *noisier* than the near one. [measured 2026-08-29]** Highway
+  speed (16–27 m/s) on two routes: `κ(2 s)` flickers across the ±0.0005 "straight" boundary from
+  ordinary replan noise and the curvature→angle conversion's v² understeer term amplifies that
+  into 1–2° swings of `θ_far` while `θ_near` barely moves. *A far target is only calmer when its
+  curvature is stable, not merely small.* → The far target's curvature is admitted through the
+  same smoothness/agreement gates as its position: R2(b)'s `δ_θ` compares `θ_far` frame-to-frame
+  as well as to `θ_near`, and a far target whose own frame-to-frame swing exceeds the near
+  target's is not used (the preview then shortens per R3). → Synthetic: `κ_far` dithering ±0.0006
+  at 20 m/s on a straight path — assert the preview does not lengthen and the commanded angle
+  jitter is ≤ the near target's.
 
 ### L2 Motion planner (virtual rack)
 
