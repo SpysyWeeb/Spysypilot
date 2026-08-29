@@ -81,7 +81,8 @@ class TestTriggers:
 
 class TestPads:
   def test_onset_pad_is_proportional(self):
-    assert math.isclose(run(NecessitySupervisor(), lead(v=14.0, d=40.0, a=-0.75), 15.0, -0.5, 2.0).t_follow_pad, ONSET_PAD_MAX * 0.5, rel_tol=1e-6, abs_tol=1e-9)
+    pad = run(NecessitySupervisor(), lead(v=14.0, d=40.0, a=-0.75), 15.0, -0.5, 2.0).t_follow_pad
+    assert math.isclose(pad, ONSET_PAD_MAX * 0.5, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_stopped_lead_gets_the_larger_pad(self):
     assert math.isclose(run(NecessitySupervisor(), lead(v=0.0, d=83.0), 14.0, -0.4, 2.0).t_follow_pad, STOPPED_LEAD_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)

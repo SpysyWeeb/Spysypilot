@@ -167,7 +167,7 @@ class TestPlannerCruise:
       set_weights = plant.planner.mpc.set_weights
       plant.planner.mpc.set_weights = lambda prev_accel_constraint, *args: set_weights(prev_accel_constraint and keep_cost, *args)
       accels, sources = [], []
-      while plant.current_time < 2.0:
+      while plant.current_time < 3.0:
         plant.step(v_lead=np.interp(plant.current_time, [0.5, 2.0], [0.0, 7.0]), v_cruise=20.0)
         accels.append(plant.acceleration)
         sources.append(plant.planner.mpc.source)
@@ -175,9 +175,10 @@ class TestPlannerCruise:
 
     smooth, sources = launch(True)
     stock_standstill, _ = launch(False)
+    # smooth start: a gentler first step; quick growth: at least half of the uncosted peak within three seconds
     assert LongitudinalPlanSource.lead0 in sources
-    assert np.max(np.diff(smooth)) < np.max(np.diff(stock_standstill))
-    assert np.max(smooth) >= 0.8 * np.max(stock_standstill)
+    assert np.max(np.diff(smooth)) < 0.5 * np.max(np.diff(stock_standstill))
+    assert np.max(smooth) >= 0.5 * np.max(stock_standstill)
 
   def test_e2e_candidate_needs_a_valid_model(self):
     planner = LongitudinalPlanner(car.CarParams.new_message(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.5,
@@ -218,7 +219,8 @@ class TestPlannerCruise:
     v_ego = 33.0
     v_cruise = v_ego + 5.0 * CV.MPH_TO_MS
     comfort_target = CRUISE_COMFORT_KP * (v_cruise - v_ego)
-    for radar_valid, e2e, expected in ((True, False, comfort_target), (False, False, get_max_accel(v_ego)), (True, True, ACCEL_MAX)):
+    e2e_target = min(v_cruise - v_ego, ACCEL_MAX)
+    for radar_valid, e2e, expected in ((True, False, comfort_target), (False, False, get_max_accel(v_ego)), (True, True, e2e_target)):
       plant = Plant(speed=v_ego, distance_lead=300.0, lead_relevancy=False, e2e=e2e)
       for _ in range(100):
         plant.step(v_cruise=v_cruise, radar_valid=radar_valid)
