@@ -253,7 +253,7 @@ class TestModelCurveSpeed(unittest.TestCase):
     model.leadsV3 = []
     model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]),
                                  laneChangeState=log.LaneChangeState.off)
-    model.action = SimpleNamespace(desiredAcceleration=1.0, shouldStop=False)
+    model.action = SimpleNamespace(desiredCurvature=0.0, desiredAcceleration=1.0, shouldStop=False)
 
     class FakeSubMaster(dict):
       def __init__(self, values):
