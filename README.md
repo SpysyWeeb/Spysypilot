@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 1 (behavior-preserving port of BLaTv2) merged into combo and field-validated 2026-08-29; phase 2 (scheduled preview) in progress.**
+**Status: ⚠️ in progress — phase 1 (behavior-preserving port of BLaTv2) merged into combo and field-validated 2026-08-29; phase 2 in progress: steps 2 and 3 (hold through model gaps; modeld's curvature preview as the rack path) merged into combo and field-validated 2026-08-29 (routes 00000023/24: every model frame carried the preview, all engaged frames `active`, no fallbacks, all stop approaches clean; the path-compile fix took controlsd from 36 % to 25 % of its core with zero skipped control frames); step 4 (bounded reference filter + scheduled preview) next.**
 
 ## What it does
 
@@ -59,6 +59,7 @@ builds, never past a refuge island.
   20–40 m/s the immediate target moves by 0.10° (p50) / 0.35° (p95) and torque by 0.013 / 0.055; below
   10 m/s the immediate target becomes the scalar itself instead of lagging it ~12 % while curvature
   builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
+  Field-validated 2026-08-29 (route 00000024, "no complaints").
 - Phase 2, cost — `model_path_targets` interpolates every query and its rate stencil in one pass per
   series (81 scalar `np.interp` calls a frame became two) and the scalar clips in `bound_target` and the
   torque tail use `min`/`max`: bit-exact (20k randomized inputs; A/A replay on routes 00000020/21/22),
