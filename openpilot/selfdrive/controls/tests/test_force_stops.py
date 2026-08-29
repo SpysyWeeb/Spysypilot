@@ -4,7 +4,8 @@ import math
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DV_MAX, ForceStops, GAS_OVERRIDE_S, LATCH_SETBACK,
-                                                           MPC_PROFILE_OFFSET, NO_CAP, QUALIFY_S, REARM_S)
+                                                           MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK, PROFILE_LANDING,
+                                                           PROFILE_MAX_DECEL, QUALIFY_S, REARM_S)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, StopObservation
 
@@ -42,6 +43,22 @@ def committed(fs=None, v_ego=10.0, path_end=20.0):
   return fs, result
 
 
+def car_state_accel(v_ego, a_ego):
+  cs = car_state(v_ego)
+  cs.aEgo = a_ego
+  return cs
+
+
+def commit_on_strict_evidence(v_ego, path_end, a_ego=0.0):
+  # a world-fixed endpoint under strict evidence commits through the qualify path, as a red light does
+  fs = ForceStops()
+  for i in range(frames(QUALIFY_S) + 2):
+    result = fs.update(obs(path_end=path_end - v_ego * DT_MDL * i, should_stop=False, strict=True, braking=False),
+                       car_state_accel(v_ego, a_ego), True, True, True)
+  assert fs.forcing
+  return fs, result
+
+
 def holding(fs=None):
   fs, _ = committed(fs)
   result = run(fs, 0.1, obs(path_end=4.0), car_state(0.0, standstill=True))
@@ -70,7 +87,7 @@ class TestEntry:
     assert math.isclose(result.v_cruise_cap, max(math.sqrt(2.0 * A_STOP_ENVELOPE * (60.0 - MPC_PROFILE_OFFSET)), 15.0 - DV_MAX), rel_tol=1e-6, abs_tol=1e-9)
     assert result.stop_x is None
 
-  def test_a_second_of_strict_world_fixed_evidence_commits_before_the_classic_window(self):
+  def test_a_short_window_of_strict_world_fixed_evidence_commits_before_the_classic_window(self):
     fs = ForceStops()
     path_end = 60.0
     for i in range(frames(QUALIFY_S) + 2):
@@ -94,9 +111,11 @@ class TestEntry:
 
 
 class TestMovingReleases:
-  def test_raw_lead_hands_the_stop_to_the_lead_logic_and_the_hold_can_re_form(self):
+  def test_a_tracked_lead_hands_the_stop_to_the_lead_logic_and_the_hold_can_re_form(self):
     fs, _ = committed()
-    assert run(fs, 0.05, obs(lead=True), car_state(10.0)).stop_x is None and not fs.forcing
+    # one radar frame is not a lead: the commitment survives it (route 24 lost a red-light commitment to a single frame)
+    assert run(fs, DT_MDL, obs(lead=True), car_state(10.0)).stop_x is not None and fs.forcing
+    assert run(fs, 0.8, obs(lead=True), car_state(10.0)).stop_x is None and not fs.forcing
     assert run(fs, 3.0, obs(path_end=30.0, should_stop=False, braking=False), car_state(2.0)).stop_x is None
     assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
 
@@ -193,3 +212,51 @@ class TestHold:
     for i in range(frames(CLEAR_WINDOW_S + 1.0)):
       result = fs.update(obs(path_end=30.0, should_stop=(i % 3 != 0), braking=False, moving=True), car_state(0.0, standstill=True), True, True, True)
     assert result.holding
+
+
+class TestApproachProfile:
+  def test_the_profile_is_the_constant_deceleration_to_the_landing_entered_at_the_jerk_limit(self):
+    fs, result = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.2)
+    world = fs.remaining
+    previous = result.a_target
+    assert -1.2 - PROFILE_JERK * DT_MDL * 3 <= previous <= -1.2   # entered from the car's own deceleration, not from zero
+    for _ in range(frames(1.0)):
+      world -= 13.0 * DT_MDL
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(13.0, previous), True, True, True)
+      assert result.a_target is not None and result.a_target <= 0.0
+      assert previous - result.a_target <= PROFILE_JERK * DT_MDL + 1e-9
+      previous = result.a_target
+    need = 13.0 ** 2 / (2.0 * (fs.remaining - PROFILE_LANDING))
+    assert math.isclose(result.a_target, -need, rel_tol=1e-6, abs_tol=1e-9)
+
+  def test_following_the_profile_holds_it_flat_and_hands_over_short_of_the_point(self):
+    fs, _ = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.0)
+    v = 13.0
+    a = -1.0
+    world = fs.remaining
+    history = []
+    for _ in range(frames(15.0)):
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(v, a), True, True, True)
+      if result.a_target is None:
+        break
+      a = result.a_target
+      history.append((v, a, fs.remaining))
+      v = max(v + a * DT_MDL, 0.0)
+      world -= v * DT_MDL
+    flat = [a for v, a, _ in history if 5.0 < v < 11.0]
+    assert max(flat) - min(flat) < 0.1                           # constant deceleration through the middle of the approach
+    assert min(a for _, a, _ in history) > -2.2                  # a 13 m/s stop seen 60 m out never needs more than ~2 m/s^2
+    assert history[-1][0] <= PROFILE_HANDOVER_SPEED               # the profile fades out below the handover speed ...
+    assert history[-1][2] >= PROFILE_LANDING - 1.0               # ... and is gone short of the committed point: the column lands
+
+  def test_the_profile_is_capped_and_absent_without_a_moving_commitment(self):
+    fs, _ = commit_on_strict_evidence(20.0, 60.0)
+    world = fs.remaining
+    for _ in range(frames(1.6)):
+      world -= 20.0 * DT_MDL
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(20.0, 0.0), True, True, True)
+    assert math.isclose(result.a_target, -PROFILE_MAX_DECEL, rel_tol=1e-6, abs_tol=1e-9)
+    shaping = ForceStops()
+    assert run(shaping, 0.5, obs(path_end=80.0, should_stop=False, early=True, braking=True), car_state(15.0)).a_target is None
+    _, held = holding()
+    assert held.a_target is None

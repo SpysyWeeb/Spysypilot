@@ -244,6 +244,7 @@ class LongitudinalMpc:
     self.source = LongitudinalPlanSource.cruise
     self.lead0_policy_active = False
     self.lead0_policy_adaptive = False
+    self.binding_obstacle = None
     self.solution_status = 0
     # timers
     self.solve_time = 0.0
@@ -328,8 +329,6 @@ class LongitudinalMpc:
 
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard, lead0_anchor=None, lead1_anchor=None,
              stop_x=None, jerk_scale=1.0, t_follow_pad=0.0, prev_accel_constraint=True):
-    previous_lead0_policy_adaptive = self.lead0_policy_adaptive
-
     lead_xv_0 = self.process_lead_model(lead0_anchor, radarstate.leadOne)
     lead_xv_1 = self.process_lead_model(lead1_anchor, radarstate.leadTwo)
 
@@ -345,15 +344,21 @@ class LongitudinalMpc:
       stop_obstacle.fill(stop_x + STOP_DISTANCE)
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, stop_obstacle])
-    self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]
+    binding = int(np.argmin(x_obstacles[0]))
+    self.source = MPC_SOURCES[binding]
+
+    # a new binding obstacle re-anchors the change cost on the current acceleration: continuity with the
+    # previous owner's solution (a free run, a departed lead, a policy that just ended) would drag the
+    # first solves toward it -- a committed stop used to start 1.5 s late for exactly that reason
+    if binding != self.binding_obstacle:
+      self.a_prev.fill(self.x0[2])
+    self.binding_obstacle = binding
 
     # the supervisor's policy shapes lead0's solve only; another owner solves with the incumbent weights
     self.lead0_policy_active = self.source == LongitudinalPlanSource.lead0
     if not self.lead0_policy_active:
       jerk_scale = 1.0
       t_follow_pad = 0.0
-      if previous_lead0_policy_adaptive:
-        self.a_prev.fill(self.x0[2])
     self.lead0_policy_adaptive = self.lead0_policy_active and (jerk_scale < 1.0 or t_follow_pad > 0.0)
     t_follow = get_T_FOLLOW(personality) + t_follow_pad
     self.set_weights(prev_accel_constraint, personality, jerk_scale)

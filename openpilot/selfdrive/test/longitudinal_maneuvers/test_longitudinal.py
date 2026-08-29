@@ -1,5 +1,6 @@
 import itertools
 import numpy as np
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized_class
 
@@ -226,3 +227,28 @@ class TestManeuverHarnessLiveness(OpenpilotTestCase):
       seen_model_drop = seen_model_drop or not model_valid
 
     assert seen_radar_drop and seen_model_drop
+
+
+class TestRedLightStop(OpenpilotTestCase):
+  def test_a_late_red_light_stops_front_loaded_short_of_the_line(self):
+    # route 24, 2026-08-29: the model calls a red light ~5 s out; the owner wants the needed deceleration reached
+    # within a second, held, and eased off at the end -- never still increasing in the last metres
+    maneuver = Maneuver('approach a red light at 14 m/s, seen 5 s out', duration=30.0, initial_speed=14.0,
+                        cruise_values=[14.0, 14.0], e2e=True, stop_line=160.0)
+    valid, logs = maneuver.evaluate()
+    assert valid
+    x, v, a = logs[:, 1], logs[:, 3], logs[:, 5]
+    stopped = np.flatnonzero(v < 0.05)
+    assert len(stopped) > 0, 'did not stop'
+    i_stop = int(stopped[0])
+    assert maneuver.stop_line - 9.0 <= x[i_stop] <= maneuver.stop_line, x[i_stop]
+    onset = int(np.flatnonzero(a < -0.3)[0])
+    approach = a[onset:i_stop]
+    peak = float(approach.min())
+    assert peak >= -2.6, peak
+    first_second = a[onset:onset + int(1.0 / DT_MDL)]
+    assert first_second.mean() <= 0.6 * peak, (first_second.mean(), peak)        # front-loaded: most of the braking within a second
+    last_second = a[max(i_stop - int(1.0 / DT_MDL), onset):i_stop]
+    assert last_second.mean() >= 0.5 * peak, (last_second.mean(), peak)         # eased off at the end
+    assert approach.max() <= 0.05, approach.max()                                # never lets go during the approach
+    assert np.all(v[i_stop:] < 0.3), 'crept away after the stop'

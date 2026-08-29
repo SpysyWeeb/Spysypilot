@@ -271,6 +271,9 @@ class LongitudinalPlanner:
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
     if experimental_mode and model_valid:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
+    if force_stop.a_target is not None:
+      # a committed stop's own approach profile competes like any candidate; the column and the hold still own the landing
+      candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = force_stop.holding or any(should_stop for _, _, should_stop in candidates)
