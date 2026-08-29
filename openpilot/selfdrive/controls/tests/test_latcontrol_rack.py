@@ -516,7 +516,20 @@ class TestLatControlRack(OpenpilotTestCase):
     CS.steeringAngleDeg = 3.0
     controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_090_000_000)
     assert controller.rack.planner is not None
-    assert abs(controller.rack.planner.position_deg - held_position) > 2.0
+    assert abs(controller.rack.planner.position_deg - held_position - 3.0) < 0.1
+
+    # the same, with the driver's hand on the wheel as the plan resumes: the motion is carried once, not twice
+    controller, _, VM = get_rack_controller()
+    CS.steeringAngleDeg = 0.0
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    held_position = controller.rack.planner.position_deg
+    for _ in range(3):
+      controller.reset()
+      controller.update(False, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    CS.steeringAngleDeg = 3.0
+    CS.steeringPressed = True
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_090_000_000)
+    assert abs(controller.rack.planner.position_deg - held_position - 3.0) < 0.1
 
   def test_blip_during_a_fallback_hold_keeps_the_hold(self):
     controller, _, VM = get_rack_controller()

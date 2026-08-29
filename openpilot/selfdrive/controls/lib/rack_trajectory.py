@@ -547,8 +547,9 @@ class RackTrajectoryController:
       self.hold()
       return None
     if self.inactive_frames and self.planner is not None and self.hold_angle_deg is not None:
-      # the wheel may have moved while the plan was held: carry the plan along with it
+      # the wheel may have moved while the plan was held: carry the plan along with it, once
       self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
+      self.rack_rate_estimator.previous_angle_deg = float(CS.steeringAngleDeg)
     self.inactive_frames = 0
     self.hold_angle_deg = None
     if self.model is None:
