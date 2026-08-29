@@ -53,7 +53,11 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 `LeadObservation.from_radar(lead, service_valid)` (filtered speed/accel, finite, `dRel > 0`),
 `lead_present(radar_state)`, `relevant_lead(radar_state, v_ego, path_end_m)` (BLoTv2's distance/time
 relevance rule — the only filtered presence check in the tree), `anchor_model_lead(model_lead, radar_lead)`
-(BLoTv2's validity gate plus first-horizon acceleration/speed, computed once per frame), and the
+(BLoTv2's validity gate plus first-horizon acceleration/speed, computed once per frame; since the
+2026-08-29 field test the gate tolerates `MODEL_LEAD_STATIONARY_NOISE` = 0.2 m/s of below-zero sensor
+noise on a stopped lead — the strict `>= 0` gate dropped the anchor for 0.1–0.5 s chunks through every
+lead launch, collapsing the departure forecast, re-raising the stop bit and resetting the hold release;
+a reversing lead still fails closed), and the
 closing-speed / `total_decel_requirement` / TTC physics. `total_decel_requirement` is
 `max(closing_requirement, stop_requirement)`, not the sum BLoTv2's doc stated.
 

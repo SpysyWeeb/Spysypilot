@@ -10,6 +10,7 @@ MODEL_LEAD_PROB_MIN = 0.5
 MODEL_LEAD_X_STD_MAX = 50.0
 MODEL_LEAD_V_STD_MAX = 10.0
 MODEL_LEAD_V_DELTA_MAX = 5.0
+MODEL_LEAD_STATIONARY_NOISE = 0.2  # m/s; a stopped lead reads a few cm/s below zero on both sensors, a reversing one reads much less
 # a lead this close in time or distance keeps stop handling with the lead logic
 LEAD_RELEVANCE_MIN_DISTANCE = 35.0
 LEAD_RELEVANCE_TIME = 3.5
@@ -67,18 +68,19 @@ def anchor_model_lead(model_lead, radar_lead):
   valid = (all(math.isfinite(s) for s in scalars)
            and MODEL_LEAD_PROB_MIN < model_lead.prob <= 1.0
            and MODEL_LEAD_PROB_MIN < radar_lead.modelProb <= 1.0
-           and radar_lead.dRel > 0.0 and radar_lead.vLead >= 0.0
+           and radar_lead.dRel > 0.0 and radar_lead.vLead >= -MODEL_LEAD_STATIONARY_NOISE
            and all(a.shape == LEAD_T_IDXS.shape and np.all(np.isfinite(a)) for a in (x, x_std, v, v_std, t))
            and np.array_equal(t, LEAD_T_IDXS)
            and np.all(x_std >= 0.0) and np.max(x_std) < MODEL_LEAD_X_STD_MAX
            and np.all(v_std >= 0.0) and np.max(v_std) < MODEL_LEAD_V_STD_MAX
-           and np.all(np.diff(x) >= 0.0) and np.all(v >= 0.0)
+           and np.all(np.diff(x) >= -MODEL_LEAD_STATIONARY_NOISE * np.diff(LEAD_T_IDXS)) and np.all(v >= -MODEL_LEAD_STATIONARY_NOISE)
            and np.max(np.abs(np.gradient(x, LEAD_T_IDXS, edge_order=2) - v)) <= MODEL_LEAD_V_DELTA_MAX)
   if not valid:
     return None
-  # the model contributes the future shape; radar anchors where the lead is and how fast it goes now
-  x_lead = radar_lead.dRel + x - x[0]
-  v_lead = radar_lead.vLead + v - v[0]
+  # the model contributes the future shape; radar anchors where the lead is and how fast it goes now.
+  # Sensor noise on a stopped lead is tolerated above and squashed here: the MPC only knows forward motion
+  x_lead = np.maximum.accumulate(radar_lead.dRel + x - x[0])
+  v_lead = np.maximum(max(radar_lead.vLead, 0.0) + v - v[0], 0.0)
   if np.max(np.abs(np.gradient(x_lead, LEAD_T_IDXS, edge_order=2) - v_lead)) > MODEL_LEAD_V_DELTA_MAX:
     return None
   horizon = LEAD_T_IDXS[1] - LEAD_T_IDXS[0]

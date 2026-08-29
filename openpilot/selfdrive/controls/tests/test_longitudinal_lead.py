@@ -115,6 +115,16 @@ class TestModelLeadAnchor:
   def test_rejects_a_shape_that_contradicts_its_speeds(self):
     assert anchor_model_lead(model_lead([10.0] * 6, x=[0.0] * 6), radar_lead(dRel=30.0, vLead=10.0)) is None
 
+  def test_tolerates_stationary_sensor_noise_but_not_a_reversing_lead(self):
+    # a stopped lead reads a few cm/s below zero on radar and in the model; the departure forecast must survive that
+    noisy = model_lead([-0.04, 2.6, 4.0, 5.0, 6.0, 7.0])
+    anchor = anchor_model_lead(noisy, radar_lead(dRel=6.3, vLead=-0.03, vLeadK=-0.01))
+    assert anchor is not None
+    assert anchor.v[0] == 0.0 and math.isclose(anchor.x[0], 6.3, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(anchor.speed, 2.64, rel_tol=1e-6, abs_tol=1e-9)
+    assert anchor_model_lead(model_lead([-0.5, 0.0, 0.0, 0.0, 0.0, 0.0]), radar_lead(dRel=6.3, vLead=0.0)) is None
+    assert anchor_model_lead(noisy, radar_lead(dRel=6.3, vLead=-0.5)) is None
+
   def test_needs_a_confirmed_radar_lead(self):
     forecast = model_lead([10.0] * 6)
     assert anchor_model_lead(forecast, radar_lead(present=False)) is None

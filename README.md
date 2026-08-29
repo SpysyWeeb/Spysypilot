@@ -71,7 +71,8 @@ upstream uses for the planner, and the defects found in the 2026-08-28 review of
 - Phase 2 (2026-08-29, branch `BLoTv3-phase2`) — the lead layer. `longitudinal_lead.py`: the one
   definition of a usable lead (`LeadObservation`, `lead_present`, `relevant_lead`) and
   `anchor_model_lead`, which validates the model's lead forecast once per frame and anchors it to
-  radar. `necessity_supervisor.py`: BLoTv2's supervisor with two fixes — the following-time pads
+  radar (tolerating the few cm/s of below-zero noise a stopped lead reads on both sensors — the
+  strict gate dropped the anchor mid-launch in the 2026-08-29 field test; reversing still fails closed). `necessity_supervisor.py`: BLoTv2's supervisor with two fixes — the following-time pads
   saturate instead of vanishing above 1.5 m/s² of required deceleration, and the low-speed hold
   keeps whatever softening was built while necessity-braking (a stand-down or lead loss still
   releases it); its stand-down never reaches an alert. `long_mpc.py`: one `update()` call takes
