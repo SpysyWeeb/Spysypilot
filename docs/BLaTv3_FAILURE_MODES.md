@@ -30,7 +30,8 @@ Shape ("upstream-shaped controller"):
   and a `latActive` blip of up to five frames holds the planned rack and carries it along with any
   wheel motion meanwhile (R6, FM1.6, FM3.12, FM5.2). A warm integrator in the shadow is still open.
 - modeld publishes a short curvature preview on `ModelDataV2.Action` next to
-  `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar.
+  `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar
+  (phase 2 step 3: `desiredCurvaturePreview[Times]`, 0.25 s apart from the action time to 2 s past it).
 
 Layers (the input side is now explicit — see L8):
 0. Upstream inputs — `clip_curvature` (ISO 3 m/s² / 5 m/s³ clamp with its own rate state),
@@ -177,6 +178,19 @@ red-team pass.
 - **FM1.4 — Scalar/plan anchor mismatch.** Action head vs plan-derived curvature; the
   look-ahead formula vs interpolation (+12–14 % bias found on curve entry). → Preview
   computed in modeld by the same function; `preview[0] == desiredCurvature`. → Bit-exact unit.
+  *Phase 2 step 3 (2026-08-29): done.* modeld's `get_action_from_model` evaluates
+  `get_curvature_from_plan` at `LAT_PREVIEW_OFFSETS` past the action time and pins the list to the
+  published scalar (`test_preview_is_the_scalar_function_along_the_plan` asserts the pin bit-exact,
+  also through the action head and the low-speed hold); `model_path_targets` reads the preview and
+  no longer touches `orientationRate`. The preview is the scalar's timeline from the action time on;
+  lagd's action time already covers the model's age, so a query `offset` past now reads the preview
+  `offset` past the action time (`PREVIEW_S` = 0: the immediate target is the scalar as published;
+  later samples are interpolated 0.25 s apart). No query precedes the action time and a target's
+  position and rate come from one curve — the review of the first cut caught a borrowed-rate variant
+  (flat position, first-segment slope as rate) that fed the planner a fictitious lead on every frame
+  at lagd's 0.375 s action time, and a second cut that added the plan's age on top of the action time
+  double-counted lagd's delay. Past the preview's end the last sample holds. Missing preview →
+  status 6, stock steers (R8).
 - **FM1.5 — Truncated or invalid plan.** Approaching a stop the plan's velocity reaches ≤ 0
   inside the horizon. *Today: whole frame invalid → zero torque while still rolling.* → R6:
   clip the horizon to the covered range; `t_p → t_action`. → Plan hitting 0 at 1.5 s, vEgo

@@ -46,6 +46,19 @@ builds, never past a refuge island.
   private 0.2 s; once stock has taken over it keeps steering for 0.5 s before the rack re-seeds and
   resumes; a `latActive` blip of up to five frames (the standstill gate) holds the planned rack instead
   of starting over. Replay on the two field routes: no change in ordinary driving.
+- Phase 2, step 3 — modeld publishes a curvature preview on `ModelDataV2.Action`
+  (`desiredCurvaturePreview` / `desiredCurvaturePreviewTimes`): `desiredCurvature`'s own function
+  evaluated every 0.25 s from the action time to 2 s past it, pinned so the first sample *is*
+  `desiredCurvature`. The rack controller builds its path from that preview (re-pinned to controlsd's
+  ISO-clipped scalar) instead of re-deriving curvature from `orientationRate / velocity`. The preview
+  is the scalar's own timeline from the action time on, and lagd's action time already covers the
+  model's age, so the immediate target is the scalar as published (stock's target), the far targets are
+  the same quantity further past the action time, and a target's position and rate come from one curve
+  (catalog FM1.4). A model without a preview reports status 6 `invalid preview` and stock steers.
+  Open-loop replay on routes 00000020/21/22 (571k engaged frames, all `active`, no fallbacks): at
+  20–40 m/s the immediate target moves by 0.10° (p50) / 0.35° (p95) and torque by 0.013 / 0.055; below
+  10 m/s the immediate target becomes the scalar itself instead of lagging it ~12 % while curvature
+  builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
 - `openpilot/selfdrive/controls/lib/rack_trajectory.py` — BLaTv2's controller math (reference
   compile, jerk-limited rack planner, reversal governor, rate estimator, torque tail) moved unchanged
   into one module: the class is renamed `RackTrajectoryController`, the one-line `_measured_rate`
