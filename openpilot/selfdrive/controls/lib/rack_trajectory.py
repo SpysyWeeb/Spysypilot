@@ -1,81 +1,382 @@
-"""Palisade rack-trajectory execution controller."""
-from __future__ import annotations
-
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import numpy as np
+
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LATERAL_ACCEL_NO_ROLL, MIN_SPEED
-from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import (
-  MotionLimits,
-  PathTarget,
-  RackPlan,
-  RackTrajectoryOutput,
-  RackTarget,
-  RESPONSE_TIME_S,
-)
-from openpilot.selfdrive.controls.lib.rack_trajectory_planner import (
-  JerkLimitedRackPlanner,
-  _clip,
-  _required_rate_headroom,
-  horizon_desired_acceleration,
-)
-from openpilot.selfdrive.controls.lib.rack_trajectory_reference import (
-  HORIZON_OFFSETS_S,
-  HORIZON_S,
-  HORIZON_STEP_S,
-  REFERENCE_MAX_RATE_DEG_S,
-  REFERENCE_REVERSAL_DISTANCE_DEG,
-  REFERENCE_REVERSAL_RC_S,
-  RackReferenceGovernor,
-  model_path_target,
-  model_path_targets,
-)
-from openpilot.selfdrive.controls.lib.rack_trajectory_state import MEASURED_RATE_FILTER_RC_S, RackRateEstimator
 
-__all__ = (
-  "DT",
-  "PREVIEW_S",
-  "HORIZON_S",
-  "HORIZON_STEP_S",
-  "HORIZON_OFFSETS_S",
-  "HORIZON_POSITION_TOLERANCE_DEG",
-  "HORIZON_ACCELERATION_BLEND",
-  "horizon_candidate_preserves_immediate_path",
-  "RESPONSE_TIME_S",
-  "RATE_HORIZON_S",
-  "MAX_FEEDBACK_TORQUE",
-  "MAX_TURN_IN_FEEDBACK_TORQUE",
-  "MAX_DRIVER_ASSIST_TORQUE",
-  "REFERENCE_REVERSAL_DISTANCE_DEG",
-  "REFERENCE_REVERSAL_RC_S",
-  "REFERENCE_MAX_RATE_DEG_S",
-  "MEASURED_RATE_FILTER_RC_S",
-  "STATUS_INACTIVE",
-  "STATUS_ACTIVE",
-  "STATUS_NO_MODEL",
-  "STATUS_INVALID_VEHICLE_STATE",
-  "STATUS_STALE_MODEL",
-  "STATUS_INVALID_ACTION_TIME",
-  "STATUS_INVALID_PATH",
-  "STATUS_INVALID_OUTPUT",
-  "STATUS_INVALID_PLANNER_STATE",
-  "PathTarget",
-  "MotionLimits",
-  "RackTarget",
-  "RackPlan",
-  "RackTrajectoryOutput",
-  "JerkLimitedRackPlanner",
-  "horizon_desired_acceleration",
-  "RackReferenceGovernor",
-  "RackRateEstimator",
-  "model_path_target",
-  "model_path_targets",
-  "PalisadeRackTrajectoryController",
-)
+# Palisade rack trajectory controller: compiles the model path into a steering-angle target,
+# moves a jerk-limited virtual rack toward it and tracks that motion with feedforward torque
+# plus angle and rate feedback. Ported unchanged from BLaTv2; see docs/BLaTv3_FAILURE_MODES.md.
+
+RESPONSE_TIME_S = .4
+
+
+@dataclass(frozen=True, slots=True)
+class PathTarget:
+  curvature: float
+  speed_mps: float
+  angle_deg: float
+  rate_deg_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class MotionLimits:
+  max_rate_deg_s: float
+  max_acceleration_deg_s2: float
+  max_jerk_deg_s3: float
+  response_time_s: float = RESPONSE_TIME_S
+
+
+@dataclass(frozen=True, slots=True)
+class RackTarget:
+  position_deg: float
+  rate_deg_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class RackPlan:
+  position_deg: float
+  rate_deg_s: float
+  acceleration_deg_s2: float
+  rate_limited: bool
+  acceleration_limited: bool
+  jerk_limited: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RackTrajectoryOutput:
+  torque: float
+  target_curvature: float
+  target_angle_deg: float
+  target_rate_deg_s: float
+  planned_angle_deg: float
+  planned_rate_deg_s: float
+  planned_acceleration_deg_s2: float
+  measured_rate_deg_s: float
+  lateral_accel_error: float
+  rate_error_deg_s: float
+  position_feedback_torque: float
+  rate_feedback_torque: float
+  feedforward_torque: float
+  desired_lateral_accel: float
+  actual_lateral_accel: float
+  desired_lateral_jerk: float
+  feedback_torque: float
+  feedback_limited: bool
+  motion_limited: bool
+  torque_limited: bool
+  rate_limit_deg_s: float
+  acceleration_limit_deg_s2: float
+  jerk_limit_deg_s3: float
+  profile_transition: bool
+  path_limited: bool
+  infeasible: bool
+  saturated: bool
+
+
+MEASURED_RATE_FILTER_RC_S = .05
+
+
+class RackRateEstimator:
+  def __init__(self, dt: float, filter_rc_s: float = MEASURED_RATE_FILTER_RC_S) -> None:
+    self.dt = dt
+    self.filter_rc_s = filter_rc_s
+    self.previous_angle_deg: float | None = None
+    self.direction = 0
+    self.raw_signed_episode = False
+    self.rate_filter = FirstOrderFilter(0.0, filter_rc_s, dt)
+    self.rate_filter_valid = False
+
+  def reset(self) -> None:
+    self.previous_angle_deg = None
+    self.direction = 0
+    self.raw_signed_episode = False
+    self.rate_filter.x = 0.0
+    self.rate_filter_valid = False
+
+  def update(self, angle_deg: float, raw_rate_deg_s: float) -> tuple[float, bool]:
+    magnitude = abs(raw_rate_deg_s)
+    if magnitude == 0.0:
+      self.direction = 0
+      self.raw_signed_episode = False
+      rate, valid = 0.0, True
+    elif raw_rate_deg_s < 0.0:
+      self.direction = -1
+      self.raw_signed_episode = True
+      rate, valid = -magnitude, True
+    elif self.raw_signed_episode:
+      self.direction = 1
+      rate, valid = magnitude, True
+    elif self.previous_angle_deg is not None and angle_deg != self.previous_angle_deg:
+      self.direction = 1 if angle_deg > self.previous_angle_deg else -1
+      rate, valid = self.direction * magnitude, True
+    elif self.direction:
+      rate, valid = self.direction * magnitude, True
+    else:
+      rate, valid = 0.0, False
+    self.previous_angle_deg = angle_deg
+    if not valid:
+      return rate, False
+    if not self.rate_filter_valid:
+      self.rate_filter.x = rate
+      self.rate_filter_valid = True
+    else:
+      rate = float(self.rate_filter.update(rate))
+    return rate, True
+
+
+def _clip(value: float, limit: float) -> float:
+  return max(-limit, min(limit, value))
+
+
+def _rate_viable_acceleration(headroom: float, jerk: float, dt: float) -> float:
+  if headroom <= 0.0:
+    return 0.0
+  jerk_step = jerk * dt
+  return -jerk_step + math.sqrt(jerk_step * jerk_step + 2.0 * jerk * headroom)
+
+
+def _required_rate_headroom(rate: float, acceleration: float, jerk: float, dt: float) -> float:
+  outward_acceleration = abs(acceleration) if rate * acceleration > 0.0 else 0.0
+  return outward_acceleration * dt + outward_acceleration * outward_acceleration / (2.0 * jerk)
+
+
+class JerkLimitedRackPlanner:
+  def __init__(self, position_deg: float, rate_deg_s: float = 0.0) -> None:
+    self.position_deg = float(position_deg)
+    self.rate_deg_s = float(rate_deg_s)
+    self.acceleration_deg_s2 = 0.0
+
+  def update(self, target: RackTarget, limits: MotionLimits, dt: float,
+             desired_acceleration_override: float | None = None) -> RackPlan:
+    natural_frequency = 2.0 / limits.response_time_s
+    desired_acceleration_raw = float(desired_acceleration_override) if desired_acceleration_override is not None else (
+      natural_frequency * natural_frequency * (target.position_deg - self.position_deg)
+      + 2.0 * natural_frequency * (target.rate_deg_s - self.rate_deg_s)
+    )
+    desired_acceleration = _clip(desired_acceleration_raw, limits.max_acceleration_deg_s2)
+    jerk_step = limits.max_jerk_deg_s3 * dt
+    jerk_lower = self.acceleration_deg_s2 - jerk_step
+    jerk_upper = self.acceleration_deg_s2 + jerk_step
+    rate_lower = -_rate_viable_acceleration(limits.max_rate_deg_s + self.rate_deg_s, limits.max_jerk_deg_s3, dt)
+    rate_upper = _rate_viable_acceleration(limits.max_rate_deg_s - self.rate_deg_s, limits.max_jerk_deg_s3, dt)
+    lower = max(-limits.max_acceleration_deg_s2, jerk_lower, rate_lower)
+    upper = min(limits.max_acceleration_deg_s2, jerk_upper, rate_upper)
+    if lower > upper + 1e-9:
+      raise ValueError("rack planner outside motion envelope")
+    acceleration = max(lower, min(upper, desired_acceleration))
+    rate = self.rate_deg_s + acceleration * dt
+    position = self.position_deg + .5 * (self.rate_deg_s + rate) * dt
+    self.position_deg, self.rate_deg_s, self.acceleration_deg_s2 = position, rate, acceleration
+    return RackPlan(
+      position, rate, acceleration,
+      desired_acceleration < rate_lower or desired_acceleration > rate_upper,
+      desired_acceleration != desired_acceleration_raw,
+      desired_acceleration < jerk_lower or desired_acceleration > jerk_upper,
+    )
+
+
+def horizon_desired_acceleration(
+  planner: JerkLimitedRackPlanner,
+  timed_targets: Sequence[tuple[float, RackTarget]],
+) -> float:
+  """Fit one current acceleration to the model-authored future rack states."""
+  weighted_acceleration = 0.0
+  weight_total = 0.0
+  previous_time = 0.0
+  for time_s, target in timed_targets:
+    time = float(time_s)
+    values = (time, target.position_deg, target.rate_deg_s)
+    if not all(math.isfinite(value) for value in values) or time <= previous_time:
+      raise ValueError("invalid rack horizon")
+    # Initial acceleration of the cubic joining current position/rate to this
+    # model target. Near knots carry more weight but later path phases still
+    # influence preparation; the live planner applies the physical limits.
+    acceleration = (
+      6.0 * (target.position_deg - planner.position_deg) / time ** 2
+      - (4.0 * planner.rate_deg_s + 2.0 * target.rate_deg_s) / time
+    )
+    weight = 1.0 / time
+    weighted_acceleration += weight * acceleration
+    weight_total += weight
+    previous_time = time
+  if weight_total == 0.0:
+    raise ValueError("empty rack horizon")
+  result = weighted_acceleration / weight_total
+  if not math.isfinite(result):
+    raise ValueError("non-finite rack horizon")
+  return result
+
+
+REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
+REFERENCE_REVERSAL_RC_S = .12
+REFERENCE_MAX_RATE_DEG_S = 5.0
+
+
+HORIZON_S = 2.0
+HORIZON_STEP_S = .25
+HORIZON_OFFSETS_S = tuple(index * HORIZON_STEP_S for index in range(round(HORIZON_S / HORIZON_STEP_S) + 1))
+
+
+def model_path_targets(
+  *,
+  native_times_s: Sequence[float],
+  orientation_rates_z: Sequence[float],
+  velocities_x: Sequence[float],
+  scalar_curvature: float,
+  scalar_action_plan_s: float,
+  plan_time_now_s: float,
+  measured_v_ego: float,
+  query_times_s: Sequence[float],
+  vehicle_model,
+  roll_rad: float,
+  angle_offset_deg: float,
+) -> tuple[PathTarget, ...]:
+  scalar = float(scalar_curvature)
+  measured_speed = float(measured_v_ego)
+  queries = tuple(float(query) for query in query_times_s)
+  if not queries or not math.isfinite(scalar) or not math.isfinite(measured_speed) or measured_speed < 0.0:
+    raise ValueError("invalid scalar path target")
+
+  count = len(native_times_s)
+  valid = count >= 2 and len(orientation_rates_z) == count and len(velocities_x) == count
+  times: list[float] = []
+  curvatures: list[float] = []
+  speeds: list[float] = []
+  previous_time = -math.inf
+  if valid:
+    for native_time, orientation_rate, planned_speed in zip(
+      native_times_s, orientation_rates_z, velocities_x, strict=True,
+    ):
+      time = float(native_time)
+      speed = float(planned_speed)
+      rate = float(orientation_rate)
+      if not all(math.isfinite(value) for value in (time, speed, rate)) or time < 0.0 or time <= previous_time:
+        valid = False
+        break
+      times.append(time)
+      # a plan that stops inside the horizon still covers it. Below MIN_SPEED the yaw rate/speed
+      # ratio is ill-conditioned, so hold the last well-conditioned curvature: the wheel stays put.
+      if speed >= MIN_SPEED or not curvatures:
+        curvatures.append(rate / max(speed, MIN_SPEED))
+      else:
+        curvatures.append(curvatures[-1])
+      speeds.append(speed)
+      previous_time = time
+
+  if not valid or len(times) < 2:
+    raise ValueError("invalid model path")
+  if not all(times[0] <= float(query) <= times[-1] for query in (
+    scalar_action_plan_s, plan_time_now_s, *queries,
+  )):
+    raise ValueError("model path does not cover requested timestamps")
+
+  def angle_at(query: float) -> tuple[float, float, float]:
+    plan_curvature = float(np.interp(query, times, curvatures))
+    anchor_curvature = float(np.interp(float(scalar_action_plan_s), times, curvatures))
+    curvature = scalar + plan_curvature - anchor_curvature
+    speed = max(MIN_SPEED, measured_speed + float(np.interp(query, times, speeds)) - float(np.interp(float(plan_time_now_s), times, speeds)))
+    angle = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, speed, roll_rad)) + angle_offset_deg
+    return curvature, speed, angle
+
+  targets: list[PathTarget] = []
+  for query in queries:
+    curvature, speed, angle = angle_at(query)
+    before = max(times[0], query - .05)
+    after = min(times[-1], query + .05)
+    rate = (angle_at(after)[2] - angle_at(before)[2]) / (after - before) if after > before else 0.0
+    if not all(math.isfinite(value) for value in (curvature, speed, angle, rate)):
+      raise ValueError("non-finite path target")
+    targets.append(PathTarget(curvature, speed, angle, rate))
+  return tuple(targets)
+
+
+class RackReferenceGovernor:
+  """Smooth short, small rack-reference reversals before trajectory planning."""
+
+  def __init__(self) -> None:
+    self.accepted: RackTarget | None = None
+    self.last_model_timestamp_ns: int | None = None
+    self.last_replan_position_deg: float | None = None
+    self.direction = 0
+    self.active = False
+    self.limited = False
+
+  def reset(self) -> None:
+    self.accepted = None
+    self.last_model_timestamp_ns = None
+    self.last_replan_position_deg = None
+    self.direction = 0
+    self.active = False
+    self.limited = False
+
+  @staticmethod
+  def _sign(value: float) -> int:
+    return 1 if value > 1e-9 else -1 if value < -1e-9 else 0
+
+  def _accept(self, target: RackTarget) -> RackTarget:
+    self.accepted = target
+    self.active = False
+    self.limited = False
+    return target
+
+  def update(self, target: RackTarget, planner: JerkLimitedRackPlanner, model_timestamp_ns: int, dt: float,
+             bypass: bool = False) -> RackTarget:
+    timestamp_ns = int(model_timestamp_ns)
+    if self.accepted is None:
+      self.last_model_timestamp_ns = timestamp_ns
+      self.last_replan_position_deg = target.position_deg
+      return self._accept(target)
+
+    assert self.last_model_timestamp_ns is not None and self.last_replan_position_deg is not None
+    new_model = timestamp_ns != self.last_model_timestamp_ns
+    raw_change_direction = self._sign(target.position_deg - self.last_replan_position_deg) if new_model else 0
+    if bypass:
+      self.last_model_timestamp_ns = timestamp_ns
+      self.last_replan_position_deg = target.position_deg
+      self.direction = 0
+      return self._accept(target)
+    plan_error = abs(target.position_deg - planner.position_deg)
+    filter_error = abs(target.position_deg - self.accepted.position_deg)
+    coherent_motion = (
+      plan_error >= REFERENCE_REVERSAL_DISTANCE_DEG
+      or filter_error >= REFERENCE_REVERSAL_DISTANCE_DEG
+      or abs(target.rate_deg_s) >= REFERENCE_MAX_RATE_DEG_S
+    )
+    reversal = new_model and raw_change_direction != 0 and self.direction != 0 and raw_change_direction != self.direction
+    if coherent_motion:
+      if new_model:
+        self.last_model_timestamp_ns = timestamp_ns
+        self.last_replan_position_deg = target.position_deg
+        if raw_change_direction:
+          self.direction = raw_change_direction
+      return self._accept(target)
+    if reversal:
+      self.active = True
+    if new_model:
+      self.last_model_timestamp_ns = timestamp_ns
+      self.last_replan_position_deg = target.position_deg
+      if raw_change_direction:
+        self.direction = raw_change_direction
+    if not self.active:
+      return self._accept(target)
+
+    alpha = dt / (REFERENCE_REVERSAL_RC_S + dt)
+    self.accepted = RackTarget(
+      self.accepted.position_deg + alpha * (target.position_deg - self.accepted.position_deg),
+      self.accepted.rate_deg_s + alpha * (target.rate_deg_s - self.accepted.rate_deg_s),
+    )
+    self.limited = (
+      abs(self.accepted.position_deg - target.position_deg) > 1e-9
+      or abs(self.accepted.rate_deg_s - target.rate_deg_s) > 1e-9
+    )
+    return self.accepted
+
 
 DT = .01
 PREVIEW_S = .25
@@ -97,7 +398,9 @@ STATUS_INVALID_PATH = 7
 STATUS_INVALID_OUTPUT = 8
 STATUS_INVALID_PLANNER_STATE = 9
 
-# Coherent-motion corpus: p99 rate/acceleration and p95 jerk by speed.
+# Coherent-motion corpus: p99 rate/acceleration and p95 jerk by speed. Re-derived from the owner's
+# routes in docs/BLaTv3_FAILURE_MODES.md (FM2.6): the rate rows are the p99 steering-angle rate over
+# all driving; the acceleration rows match no population. Retired by the learned rack-effort surfaces.
 _SPEED_PROFILE_MPH = np.asarray([7.25, 12.5, 17.5, 22.5, 30.0, 45.0])
 _RATE_PROFILE_DEG_S = np.asarray([315.848, 289.402, 128.744, 77.716, 35.104, 21.057])
 _ACCEL_PROFILE_DEG_S2 = np.asarray([891.046, 827.645, 561.569, 334.476, 172.041, 97.740])
@@ -133,7 +436,7 @@ def horizon_candidate_preserves_immediate_path(
   return not wrong_side and position_preserved and rate_preserved
 
 
-class PalisadeRackTrajectoryController:
+class RackTrajectoryController:
   def __init__(self, dt: float = DT) -> None:
     self.dt = dt
     self.model = None
@@ -166,9 +469,6 @@ class PalisadeRackTrajectoryController:
   def _invalidate(self, status: int) -> None:
     self.reset()
     self.status = status
-
-  def _measured_rate(self, angle_deg: float, raw_rate_deg_s: float) -> tuple[float, bool]:
-    return self.rack_rate_estimator.update(angle_deg, raw_rate_deg_s)
 
   @staticmethod
   def _limits(speed_mps: float) -> MotionLimits:
@@ -311,7 +611,7 @@ class PalisadeRackTrajectoryController:
     )
     measured_out_of_bounds = not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9
     previous_angle_deg = self.rack_rate_estimator.previous_angle_deg
-    measured_rate, measured_rate_valid = self._measured_rate(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
+    measured_rate, measured_rate_valid = self.rack_rate_estimator.update(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
     profile = self._limits(float(CS.vEgo))
     if self.planner is None:
       seed_rate = _clip(measured_rate, profile.max_rate_deg_s) if measured_rate_valid else 0.0
@@ -326,7 +626,7 @@ class PalisadeRackTrajectoryController:
     limits, profile_transition = self._motion_limits(profile)
     rack_target = RackTarget(target.angle_deg, target.rate_deg_s)
     governed_target = self.reference_governor.update(
-      rack_target, self.planner, float(params.angleOffsetDeg), int(self.model.timestampEof), self.dt,
+      rack_target, self.planner, int(self.model.timestampEof), self.dt,
       path_limited or measured_out_of_bounds or profile_transition,
     )
     planner = self.planner

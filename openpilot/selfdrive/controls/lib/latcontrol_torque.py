@@ -4,12 +4,10 @@ from collections import deque
 
 from openpilot.cereal import log
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
-from opendbc.car.hyundai.values import CAR as HYUNDAI, get_platform_codes
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
-from openpilot.selfdrive.controls.lib.rack_trajectory import PalisadeRackTrajectoryController
 
 # At higher speeds (25+mph) we can assume:
 # Lateral acceleration achieved by a specific car correlates to
@@ -34,20 +32,8 @@ JERK_GAIN = 0.3
 LAT_ACCEL_REQUEST_BUFFER_SECONDS = 1.0
 VERSION = 1
 
-
-def palisade_rack_trajectory_compatible(CP) -> bool:
-  if CP.carFingerprint != HYUNDAI.HYUNDAI_PALISADE:
-    return False
-  platform_codes = {
-    code.split(b"-", 1)[0][:2]
-    for firmware in CP.carFw
-    for code, _ in get_platform_codes([bytes(firmware.fwVersion)])
-  }
-  # HYUNDAI_PALISADE is shared with the Kia Telluride; unknown firmware fails closed to stock.
-  return b"LX" in platform_codes and b"ON" not in platform_codes
-
 class LatControlTorque(LatControl):
-  def __init__(self, CP, CI, dt, use_rack_trajectory=False):
+  def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
     self.torque_params = CP.lateralTuning.torque.as_builder()
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
@@ -59,18 +45,6 @@ class LatControlTorque(LatControl):
     self.lat_accel_request_buffer = deque([0.] * self.lat_accel_request_buffer_len , maxlen=self.lat_accel_request_buffer_len)
     self.lookahead_frames = int(JERK_LOOKAHEAD_SECONDS / self.dt)
     self.jerk_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
-    self.rack_trajectory = PalisadeRackTrajectoryController(dt) if use_rack_trajectory else None
-    self.rack_trajectory_output = None
-
-  def set_rack_trajectory_model(self, model, state_mono_ns):
-    if self.rack_trajectory is not None:
-      self.rack_trajectory.set_model(model, state_mono_ns)
-
-  def reset(self):
-    super().reset()
-    self.rack_trajectory_output = None
-    if self.rack_trajectory is not None:
-      self.rack_trajectory.reset()
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -82,59 +56,26 @@ class LatControlTorque(LatControl):
     self.pid.set_limits(self.lateral_accel_from_torque(self.steer_max, self.torque_params),
                         self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
 
-  def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay):
+  def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay, model=None, mono_time_ns=0):
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
-    future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
-    self.lat_accel_request_buffer.append(future_desired_lateral_accel)
-    delay_frames = int(np.clip(lat_delay / self.dt + 1, 1, self.lat_accel_request_buffer_len))
-    lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len+1, -2))
-    raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx+1] - self.lat_accel_request_buffer[lookahead_idx-1]) / (2 * self.dt)
-    desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
-    if self.rack_trajectory is not None:
-      output = self.rack_trajectory.update(
-        active, CS, VM, params, self.torque_params, self.torque_from_lateral_accel, lat_delay, desired_curvature,
-      )
-      self.rack_trajectory_output = output
-      if output is None:
-        # no rack request this frame (no or stale model, invalid path, infeasible plan):
-        # the stock torque controller below steers instead of dropping to zero torque
-        pass
-      else:
-        pid_log.version = 6
-        pid_log.active = True
-        pid_log.error = float(output.lateral_accel_error)
-        pid_log.errorRate = float(output.rate_error_deg_s)
-        pid_log.p = float(output.position_feedback_torque)
-        pid_log.i = 0.0
-        pid_log.d = float(output.rate_feedback_torque)
-        pid_log.f = float(output.feedforward_torque)
-        pid_log.output = float(output.torque)
-        pid_log.actualLateralAccel = float(output.actual_lateral_accel)
-        pid_log.desiredLateralAccel = float(output.desired_lateral_accel)
-        pid_log.desiredLateralJerk = float(output.desired_lateral_jerk)
-
-        pid_log.saturated = bool(self._check_saturation(
-          output.saturated or self.steer_max - abs(output.torque) < 1e-3,
-          CS,
-          steer_limited_by_safety,
-          curvature_limited,
-        ))
-        # the stock PID is idle while the rack controller steers; if it has to take over it starts clean
-        self.pid.reset()
-        return output.torque, output.planned_angle_deg, pid_log
-
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     measurement = measured_curvature * CS.vEgo ** 2
+    future_desired_lateral_accel = desired_curvature * CS.vEgo ** 2
+    self.lat_accel_request_buffer.append(future_desired_lateral_accel)
 
     roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
     curvature_deadzone = abs(VM.calc_curvature(math.radians(self.steering_angle_deadzone_deg), CS.vEgo, 0.0))
     lateral_accel_deadzone = curvature_deadzone * CS.vEgo ** 2
 
+    delay_frames = int(np.clip(lat_delay / self.dt + 1, 1, self.lat_accel_request_buffer_len))
     expected_lateral_accel = self.lat_accel_request_buffer[-delay_frames]
     setpoint = expected_lateral_accel
     error = setpoint - measurement
 
+    lookahead_idx = int(np.clip(-delay_frames + self.lookahead_frames, -self.lat_accel_request_buffer_len+1, -2))
+    raw_lateral_jerk = (self.lat_accel_request_buffer[lookahead_idx+1] - self.lat_accel_request_buffer[lookahead_idx-1]) / (2 * self.dt)
+    desired_lateral_jerk = self.jerk_filter.update(raw_lateral_jerk)
     gravity_adjusted_future_lateral_accel = future_desired_lateral_accel - roll_compensation
     ff = gravity_adjusted_future_lateral_accel
     # latAccelOffset corrects roll compensation bias from device roll misalignment relative to car roll

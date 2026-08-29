@@ -17,7 +17,8 @@ from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
-from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
+from openpilot.selfdrive.controls.lib.latcontrol_rack import LatControlRack
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
@@ -103,10 +104,10 @@ class Controls:
     elif self.lateral_tuning_type == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.is_torque_lateral:
-      self.LaC = LatControlTorque(
-        self.CP, self.CI, DT_CTRL,
-        use_rack_trajectory=palisade_rack_trajectory_compatible(self.CP),
-      )
+      if self.CP.lateralTuning.torque.useRackTrajectory:
+        self.LaC = LatControlRack(self.CP, self.CI, DT_CTRL)
+      else:
+        self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
 
     self.controls_ext = ControlsExt()
 
@@ -139,11 +140,6 @@ class Controls:
 
     long_plan = self.sm['longitudinalPlan']
     model_v2 = self.sm['modelV2']
-    if isinstance(self.LaC, LatControlTorque):
-      self.LaC.set_rack_trajectory_model(
-        model_v2 if self.sm.valid['modelV2'] else None,
-        self.sm.logMonoTime['selfdriveState'],
-      )
 
     CC = car.CarControl.new_message()
     CC.enabled = self.sm['selfdriveState'].enabled
@@ -196,7 +192,9 @@ class Controls:
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                      self.steer_limited_by_safety, self.desired_curvature,
-                                                     curvature_limited, lat_delay)
+                                                     curvature_limited, lat_delay,
+                                                     model=model_v2 if self.sm.valid['modelV2'] else None,
+                                                     mono_time_ns=self.sm.logMonoTime['selfdriveState'])
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
@@ -259,29 +257,6 @@ class Controls:
     cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
     cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
     cs.desiredCurvature = self.desired_curvature
-    if isinstance(self.LaC, LatControlTorque) and self.LaC.rack_trajectory is not None:
-      rack_state = cs.rackTrajectoryState
-      rack_state.status = self.LaC.rack_trajectory.status
-      output = self.LaC.rack_trajectory_output
-      if output is not None:
-        rack_state.active = True
-        rack_state.targetSteeringAngleDeg = float(output.target_angle_deg)
-        rack_state.targetSteeringRateDegS = float(output.target_rate_deg_s)
-        rack_state.plannedSteeringAngleDeg = float(output.planned_angle_deg)
-        rack_state.plannedSteeringRateDegS = float(output.planned_rate_deg_s)
-        rack_state.plannedSteeringAccelerationDegS2 = float(output.planned_acceleration_deg_s2)
-        rack_state.measuredSteeringRateDegS = float(output.measured_rate_deg_s)
-        rack_state.feedbackTorque = float(output.feedback_torque)
-        rack_state.feedbackLimited = bool(output.feedback_limited)
-        rack_state.motionLimited = bool(output.motion_limited)
-        rack_state.torqueLimited = bool(output.torque_limited)
-        rack_state.infeasible = bool(output.infeasible)
-        rack_state.rateLimitDegS = float(output.rate_limit_deg_s)
-        rack_state.accelerationLimitDegS2 = float(output.acceleration_limit_deg_s2)
-        rack_state.jerkLimitDegS3 = float(output.jerk_limit_deg_s3)
-        rack_state.profileTransition = bool(output.profile_transition)
-        rack_state.pathLimited = bool(output.path_limited)
-        rack_state.targetCurvature = float(output.target_curvature)
     cs.longControlState = self.LoC.long_control_state
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)
@@ -299,7 +274,10 @@ class Controls:
     elif lat_tuning == 'pid':
       cs.lateralControlState.pidState = lac_log
     elif lat_tuning == 'torque':
-      cs.lateralControlState.torqueState = lac_log
+      if self.CP.lateralTuning.torque.useRackTrajectory:
+        cs.lateralControlState.rackState = lac_log
+      else:
+        cs.lateralControlState.torqueState = lac_log
 
     self.pm.send('controlsState', dat)
 

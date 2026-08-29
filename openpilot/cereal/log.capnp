@@ -881,7 +881,6 @@ struct ControlsState @0x97ff69c53601abf1 {
   curvature @37 :Float32;  # path curvature from vehicle model
   desiredCurvature @61 :Float32;  # lag adjusted curvatures used by lateral controllers
   forceDecel @51 :Bool;
-  rackTrajectoryState @67 :RackTrajectoryState;
 
   lateralControlState :union {
     pidState @53 :LateralPIDState;
@@ -890,6 +889,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     torqueState @60 :LateralTorqueState;
 
     curvatureState @65 :LateralCurvatureState;
+    rackState @67 :LateralRackState;
     lqrStateDEPRECATED @55 :Deprecated.LateralLQRState;
     indiStateDEPRECATED @52 :Deprecated.LateralINDIState;
   }
@@ -1139,26 +1139,36 @@ struct ControlsState @0x97ff69c53601abf1 {
     modularFinalLimiterAltered @222 :Bool;
    }
 
-  struct RackTrajectoryState {
+  struct LateralRackState {
     active @0 :Bool;
-    targetSteeringAngleDeg @1 :Float32;
-    targetSteeringRateDegS @2 :Float32;
-    plannedSteeringAngleDeg @3 :Float32;
-    plannedSteeringRateDegS @4 :Float32;
-    plannedSteeringAccelerationDegS2 @5 :Float32;
-    measuredSteeringRateDegS @6 :Float32;
-    feedbackTorque @7 :Float32;
-    feedbackLimited @8 :Bool;
-    motionLimited @9 :Bool;
-    torqueLimited @10 :Bool;
-    infeasible @11 :Bool;
-    rateLimitDegS @12 :Float32;
-    accelerationLimitDegS2 @13 :Float32;
-    jerkLimitDegS3 @14 :Float32;
-    profileTransition @15 :Bool;
-    status @16 :UInt8; # 0 inactive, 1 active, 2 reserved, 3 no model, 4 invalid state, 5 stale, 6 invalid action time, 7 invalid path, 8 invalid output, 9 invalid planner state
-    pathLimited @17 :Bool;
-    targetCurvature @18 :Float32;
+    fallback @1 :Bool;  # the stock torque controller steered this frame
+    status @2 :UInt8;  # rack_trajectory.STATUS_*
+    error @3 :Float32;
+    errorRate @4 :Float32;
+    p @5 :Float32;
+    d @6 :Float32;
+    f @7 :Float32;
+    output @8 :Float32;
+    saturated @9 :Bool;
+    actualLateralAccel @10 :Float32;
+    desiredLateralAccel @11 :Float32;
+    desiredLateralJerk @12 :Float32;
+    targetCurvature @13 :Float32;
+    targetSteeringAngleDeg @14 :Float32;
+    targetSteeringRateDegS @15 :Float32;
+    plannedSteeringAngleDeg @16 :Float32;
+    plannedSteeringRateDegS @17 :Float32;
+    plannedSteeringAccelerationDegS2 @18 :Float32;
+    measuredSteeringRateDegS @19 :Float32;
+    rateLimitDegS @20 :Float32;
+    accelerationLimitDegS2 @21 :Float32;
+    jerkLimitDegS3 @22 :Float32;
+    feedbackLimited @23 :Bool;
+    motionLimited @24 :Bool;
+    torqueLimited @25 :Bool;
+    pathLimited @26 :Bool;
+    profileTransition @27 :Bool;
+    version @28 :Int32;
   }
 
   struct LateralAngleState {
