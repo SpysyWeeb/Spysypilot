@@ -3,13 +3,18 @@ import pytest
 
 from opendbc.car.interfaces import ACCEL_MAX
 from opendbc.car.structs import car
+from openpilot.cereal import log
+import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
                                                                    A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
-                                                                   get_cruise_accel, get_cruise_comfort_accel, get_max_accel,
-                                                                   get_max_accel_request)
-from openpilot.selfdrive.test.longitudinal_maneuvers.plant import Plant
+                                                                   LongitudinalPlanner, get_cruise_accel, get_cruise_comfort_accel,
+                                                                   get_max_accel, get_max_accel_request, ordinary_cruise_comfort_enabled)
+from openpilot.selfdrive.test.longitudinal_maneuvers.plant import Plant, _PlantSubMaster
+
+LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 
 CP = car.CarParams.new_message(steerRatio=17.94, wheelbase=2.9)  # Palisade
 
@@ -40,8 +45,10 @@ class TestAccelEnvelope:
     assert abs(requests[-1] - requests[-2]) < 1e-4
 
   def test_deployed_platform_clamps_the_request(self):
-    for v_ego in (0.0, 5.0, 10.0, 20.0, 35.0):
-      assert get_max_accel(v_ego) == min(get_max_accel_request(v_ego), ACCEL_MAX)
+    assert ACCEL_MAX <= A_CRUISE_MAX_LAUNCH
+    assert get_max_accel(0.0) == pytest.approx(ACCEL_MAX)
+    assert get_max_accel(20.0) == pytest.approx(1.025, abs=1e-3)
+    assert get_max_accel(30.0) == pytest.approx(0.653, abs=1e-3)
 
   def test_jerk_schedule_bounds_the_first_step(self):
     v_ego = 75.0 * CV.MPH_TO_MS
@@ -106,6 +113,22 @@ class TestCruiseComfort:
     v_cruise = v_ego + 5.0 * CV.MPH_TO_MS
     assert settled_cruise_accel(v_cruise, v_ego, comfort=True) == pytest.approx(settled_cruise_accel(v_cruise, v_ego, comfort=False))
 
+  def test_comfort_is_only_for_ordinary_chill_cruise(self):
+    assert ordinary_cruise_comfort_enabled(False, False, True)
+    assert not ordinary_cruise_comfort_enabled(True, False, True)
+    assert not ordinary_cruise_comfort_enabled(False, True, True)
+    assert not ordinary_cruise_comfort_enabled(False, False, False)
+    assert not ordinary_cruise_comfort_enabled(False, False, True, speed_limiter_active=True)
+
+  def test_coast_limit_still_applies_with_comfort(self):
+    v_ego = 4.0
+    v_cruise = v_ego + 5.0 * CV.MPH_TO_MS
+    for comfort in (False, True):
+      target = 0.0
+      for _ in range(200):
+        target = get_cruise_accel(False, v_cruise, v_ego, target, 0.0, CP, DT_MDL, -0.3, False, comfort)
+      assert target == pytest.approx(np.interp(v_ego, [2.5, 5.0], [get_max_accel(v_ego), -0.3]))
+
   def test_comfort_blends_in_between_8_and_15_mps(self):
     v_ego = 11.5
     v_cruise = v_ego + 5.0 * CV.MPH_TO_MS
@@ -124,8 +147,9 @@ class TestPlannerCruise:
     return plant, log
 
   def test_standstill_launch_starts_smooth_and_grows_quickly(self):
-    # owner acceptance: smooth onset, then at least half the envelope within a second
-    _, log = self.run_plant(1.2, speed=0.0, distance_lead=200.0, lead_relevancy=False)
+    # owner acceptance: smooth onset, then at least half the envelope within a second; the cruise candidate owns this launch
+    plant, log = self.run_plant(1.2, speed=0.0, distance_lead=200.0, lead_relevancy=False)
+    assert plant.planner.mpc.source == LongitudinalPlanSource.cruise
     first = [a for t, _, a in log if t <= 0.1]
     assert max(first) <= np.interp(0.0, J_CRUISE_BP, J_CRUISE_VALS) * 0.1 + 1e-6
     by_one_second = [a for t, v, a in log if 0.9 <= t <= 1.0]
@@ -133,6 +157,51 @@ class TestPlannerCruise:
     assert max(by_one_second) >= 0.5 * get_max_accel(v_at_one)
     accels = [a for _, _, a in log]
     assert all(b >= a - 1e-6 for a, b in zip(accels, accels[1:], strict=False) if b < get_max_accel(0.0) - 1e-3)
+
+  def test_lead_launch_starts_smooth_because_the_change_cost_stays_on(self):
+    # behind a departing lead the MPC owns the launch; keeping the change cost through standstill softens its first step
+    def launch(keep_cost):
+      plant = Plant(speed=0.0, distance_lead=7.0, lead_relevancy=True)
+      set_weights = plant.planner.mpc.set_weights
+      plant.planner.mpc.set_weights = lambda prev_accel_constraint, **kwargs: set_weights(prev_accel_constraint and keep_cost, **kwargs)
+      accels, sources = [], []
+      while plant.current_time < 2.0:
+        plant.step(v_lead=np.interp(plant.current_time, [0.5, 2.0], [0.0, 7.0]), v_cruise=20.0)
+        accels.append(plant.acceleration)
+        sources.append(plant.planner.mpc.source)
+      return np.array(accels), sources
+
+    smooth, sources = launch(True)
+    stock_standstill, _ = launch(False)
+    assert LongitudinalPlanSource.lead0 in sources
+    assert np.max(np.diff(smooth)) < np.max(np.diff(stock_standstill))
+    assert np.max(smooth) >= 0.8 * np.max(stock_standstill)
+
+  def test_e2e_candidate_needs_a_valid_model(self):
+    planner = LongitudinalPlanner(car.CarParams.new_message(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.5,
+                                                            steerRatio=CP.steerRatio, wheelbase=CP.wheelbase))
+    car_state = messaging.new_message('carState').carState
+    car_state.vEgo = 10.0
+    car_state.vCruise = 100.0
+    model = messaging.new_message('modelV2').modelV2
+    model.action.shouldStop = True
+    model.action.desiredAcceleration = -3.0
+    controls_state = messaging.new_message('controlsState').controlsState
+    controls_state.longControlState = LongCtrlState.pid
+    selfdrive_state = messaging.new_message('selfdriveState').selfdriveState
+    selfdrive_state.enabled = True
+    selfdrive_state.experimentalMode = True
+    data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
+            'radarState': messaging.new_message('radarState').radarState, 'carControl': messaging.new_message('carControl').carControl,
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+    for _ in range(5):
+      planner.update(_PlantSubMaster(data, 0))
+    assert planner.mpc.source == LongitudinalPlanSource.e2e
+    assert planner.output_a_target == pytest.approx(-3.0)
+    for _ in range(5):
+      planner.update(_PlantSubMaster(data, 0, invalid=('modelV2',)))
+    assert planner.mpc.source != LongitudinalPlanSource.e2e
+    assert planner.output_a_target > -3.0
 
   def test_standstill_keeps_the_acceleration_change_cost(self):
     plant = Plant(speed=0.0, distance_lead=200.0, lead_relevancy=False)

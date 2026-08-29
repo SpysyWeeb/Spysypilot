@@ -36,7 +36,7 @@ Only `selfdriveState.experimentalMode` crosses processes. The BLoTv2 fields
 | D1 | Architecture | mode in selfdrived, everything else in plannerd, shared stateless classifier |
 | D2 | Turn budget | `a_total_max = max(envelope(v), interp(v, [20, 40], [1.7, 3.2]))` — launch never clipped, corners consume budget; composed before `curve-speed-limit`'s torque veto on combo |
 | D3 | `STOP_DISTANCE` | keep 7 m (owner prefers the extra distance); documented fork change |
-| D4 | Acceleration-change cost through standstill | keep BLoTv2's behavior (cost stays on). Owner requirement: launches start smooth but grow quickly — acceptance metric: from a no-lead standstill launch, commanded acceleration reaches 50 % of the envelope within ~1.0 s with no dip; tune the low-speed cruise jerk or the supervisor launch response if not, never by removing the cost |
+| D4 | Acceleration-change cost through standstill | keep BLoTv2's behavior (cost stays on). Owner requirement: launches start smooth but grow quickly — acceptance metric: from a no-lead standstill launch, commanded acceleration reaches 50 % of the envelope within ~1.0 s with no dip; tune the low-speed cruise jerk or the supervisor launch response if not, never by removing the cost. Measured with the real MPC behind a departing lead: first step 0.13 vs 0.40 m/s² per frame with the cost off, half of peak at 1.35 s vs 0.70 s — the owner judges this in the phase-2 field test |
 | D5 | Third model lead ("ponytail") | delete (owner never felt it act) |
 | D6 | Supervisor lead speed | filtered `vLeadK`/`aLeadK`; MPC keeps raw `vLead` as stock; documented in one place |
 | D7 | Supervisor stand-down → FCW alert | no; FCW keeps stock's form |

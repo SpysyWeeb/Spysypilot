@@ -62,6 +62,9 @@ upstream uses for the planner, and the defects found in the 2026-08-28 review of
   coast on reductions, blended in from 8 m/s) whenever the radar is healthy; the turn budget is
   `max(envelope, stock [1.7, 3.2])` so a straight launch is never clipped but cornering consumes it
   again; the MPC's acceleration-change cost stays on through standstill. Behavioral tests in
-  `openpilot/selfdrive/controls/tests/test_longitudinal_planner.py`. Replay against BLoTv2 on
-  route d7 segment 0: every cruise-candidate difference is the turn budget; lead-candidate
-  differences are phase 2's.
+  `openpilot/selfdrive/controls/tests/test_longitudinal_planner.py`. The e2e candidate only enters
+  arbitration with a valid model, as in BLoTv2. Replay against BLoTv2 on routes d7, d9 and d2:
+  every cruise-candidate difference is the turn budget, and the three 75↔80 mph corrections on
+  d9 settle at the same +0.40 / −0.40 / +0.40 m/s² in both; lead-candidate differences are
+  phase 2's. Measured cost of D4 behind a departing lead: the first step is 3× gentler and the
+  launch reaches half its peak at 1.35 s instead of 0.70 s — a phase-2 field item.

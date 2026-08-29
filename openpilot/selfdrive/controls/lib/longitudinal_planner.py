@@ -54,6 +54,10 @@ def get_cruise_comfort_accel(v_cruise, v_ego, accel_coast):
     target_accel = min(target_accel, accel_coast * coast_weight)
   return float(target_accel)
 
+def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, speed_limiter_active=False):
+  # comfort shaping only for ordinary cruise with a healthy radar; lead following, e2e and a curve limiter keep their own targets
+  return not (experimental_mode or force_decel or not radar_valid or speed_limiter_active)
+
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle, comfort=False):
   max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
 
@@ -156,9 +160,9 @@ class LongitudinalPlanner:
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
-    # comfort shaping only for ordinary cruise with a healthy radar; lead following and e2e keep their own targets
     experimental_mode = sm['selfdriveState'].experimentalMode
-    comfort = not experimental_mode and not force_decel and sm.all_checks(['radarState'])
+    model_valid = sm.all_checks(['modelV2'])
+    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, sm.all_checks(['radarState']))
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle, comfort)
@@ -166,7 +170,7 @@ class LongitudinalPlanner:
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
-    if experimental_mode:
+    if experimental_mode and model_valid:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
