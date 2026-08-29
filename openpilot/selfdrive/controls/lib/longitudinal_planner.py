@@ -35,10 +35,6 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
-# Lookup table for turns
-_A_TOTAL_MAX_V = [1.7, 3.2]
-_A_TOTAL_MAX_BP = [20., 40.]
-
 def get_max_accel_request(v_ego):
   remaining = 1.0 - np.clip(v_ego / A_CRUISE_MAX_SPEED, 0.0, 1.0)
   return float(A_CRUISE_MAX_HIGH_SPEED + (A_CRUISE_MAX_LAUNCH - A_CRUISE_MAX_HIGH_SPEED) * remaining ** 3)
@@ -62,15 +58,11 @@ def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid,
   # comfort shaping only for ordinary cruise with a healthy radar; lead following, e2e and a curve limiter keep their own targets
   return not (experimental_mode or force_decel or not radar_valid or speed_limiter_active)
 
-def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle, comfort=False):
+def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow_throttle, comfort=False):
+  # the envelope alone bounds cruise acceleration; stock's shared lateral budget held the car back out of curves (owner ruling)
   max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
 
   if not e2e:
-    # lateral acceleration consumes the turn budget, but the budget never clips a straight launch
-    a_total_max = max(max_accel, np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V))
-    a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
-    a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
-    max_accel = min(max_accel, a_x_allowed)
     if not allow_throttle:
       clipped_accel_coast = max(accel_coast, ACCEL_MIN)
       coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [max_accel, clipped_accel_coast])
@@ -132,8 +124,6 @@ class LongitudinalPlanner:
     throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
     self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
 
-    steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
-
     if reset_state:
       self.v_desired_filter.x = v_ego
       self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
@@ -193,9 +183,7 @@ class LongitudinalPlanner:
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
-    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
-                                     self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle, comfort)
+    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),

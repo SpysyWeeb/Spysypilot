@@ -21,14 +21,10 @@ LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 CP = car.CarParams.new_message(steerRatio=17.94, wheelbase=2.9)  # Palisade
 
 
-def steer_angle_for(a_y, v_ego):
-  return a_y * CP.steerRatio * CP.wheelbase / (v_ego ** 2 * CV.DEG_TO_RAD)
-
-
-def settled_cruise_accel(v_cruise, v_ego, angle_steers=0.0, accel_coast=-0.3, comfort=True, e2e=False):
+def settled_cruise_accel(v_cruise, v_ego, accel_coast=-0.3, comfort=True, e2e=False):
   target = 0.0
   for _ in range(200):
-    target = get_cruise_accel(e2e, v_cruise, v_ego, target, angle_steers, CP, DT_MDL, accel_coast, True, comfort)
+    target = get_cruise_accel(e2e, v_cruise, v_ego, target, DT_MDL, accel_coast, True, comfort)
   return target
 
 
@@ -54,28 +50,8 @@ class TestAccelEnvelope:
 
   def test_jerk_schedule_bounds_the_first_step(self):
     v_ego = 75.0 * CV.MPH_TO_MS
-    first = get_cruise_accel(False, v_ego + 5.0 * CV.MPH_TO_MS, v_ego, 0.0, 0.0, CP, DT_MDL, -0.3, True)
+    first = get_cruise_accel(False, v_ego + 5.0 * CV.MPH_TO_MS, v_ego, 0.0, DT_MDL, -0.3, True)
     assert math.isclose(first, np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS) * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
-
-
-class TestTurnBudget:
-  def test_straight_launch_is_never_clipped(self):
-    for v_ego in (0.5, 5.0, 10.0):
-      assert math.isclose(settled_cruise_accel(v_ego + 20.0, v_ego, comfort=False), get_max_accel(v_ego), rel_tol=1e-6, abs_tol=1e-9)
-
-  def test_lateral_acceleration_consumes_the_budget_at_road_speed(self):
-    v_ego = 20.0
-    a_x_allowed = np.sqrt(1.7 ** 2 - 1.5 ** 2)
-    assert a_x_allowed < get_max_accel(v_ego)
-    settled = settled_cruise_accel(v_ego + 10.0, v_ego, angle_steers=steer_angle_for(1.5, v_ego), comfort=False)
-    assert math.isclose(settled, a_x_allowed, rel_tol=1e-6, abs_tol=1e-9)
-
-  def test_budget_grows_with_the_envelope_at_low_speed(self):
-    v_ego = 5.0
-    envelope = get_max_accel(v_ego)
-    a_x_allowed = np.sqrt(max(envelope, 1.7) ** 2 - 1.5 ** 2)
-    settled = settled_cruise_accel(v_ego + 20.0, v_ego, angle_steers=steer_angle_for(1.5, v_ego), comfort=False)
-    assert math.isclose(settled, min(envelope, a_x_allowed), rel_tol=1e-6, abs_tol=1e-9)
 
 
 class TestCruiseComfort:
@@ -128,7 +104,7 @@ class TestCruiseComfort:
     for comfort in (False, True):
       target = 0.0
       for _ in range(200):
-        target = get_cruise_accel(False, v_cruise, v_ego, target, 0.0, CP, DT_MDL, -0.3, False, comfort)
+        target = get_cruise_accel(False, v_cruise, v_ego, target, DT_MDL, -0.3, False, comfort)
       assert math.isclose(target, np.interp(v_ego, [2.5, 5.0], [get_max_accel(v_ego), -0.3]), rel_tol=1e-6, abs_tol=1e-9)
 
   def test_comfort_blends_in_between_8_and_15_mps(self):
