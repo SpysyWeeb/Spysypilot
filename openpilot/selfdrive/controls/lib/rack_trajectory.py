@@ -11,7 +11,8 @@ from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LA
 
 # Palisade rack trajectory controller: compiles the model path into a steering-angle target,
 # moves a jerk-limited virtual rack toward it and tracks that motion with feedforward torque
-# plus angle and rate feedback. Ported unchanged from BLaTv2; see docs/BLaTv3_FAILURE_MODES.md.
+# plus angle and rate feedback. Ported from BLaTv2; since phase 2 step 3 the path comes from modeld's
+# curvature preview (the scalar's own function evaluated along the plan). See docs/BLaTv3_FAILURE_MODES.md.
 
 RESPONSE_TIME_S = .4
 
@@ -226,10 +227,10 @@ HORIZON_OFFSETS_S = tuple(index * HORIZON_STEP_S for index in range(round(HORIZO
 def model_path_targets(
   *,
   native_times_s: Sequence[float],
-  orientation_rates_z: Sequence[float],
   velocities_x: Sequence[float],
+  preview_times_s: Sequence[float],
+  preview_curvatures: Sequence[float],
   scalar_curvature: float,
-  scalar_action_plan_s: float,
   plan_time_now_s: float,
   measured_v_ego: float,
   query_times_s: Sequence[float],
@@ -237,59 +238,63 @@ def model_path_targets(
   roll_rad: float,
   angle_offset_deg: float,
 ) -> tuple[PathTarget, ...]:
+  """Steering targets along the plan: modeld's curvature preview, pinned to the scalar curvature
+  controlsd hands down, converted to a wheel angle at the speed the plan expects at each query time.
+
+  Queries are on the vehicle's timeline (seconds from the plan origin; the plan's age is now). The
+  preview is desiredCurvature's own function from the action time on, so it is read one action time
+  ahead of each query: at the plan's age it is the scalar the plan would publish now, and further out
+  it is the scalar's future. Past the preview's end the last sample holds: the covered range is the
+  horizon.
+  """
   scalar = float(scalar_curvature)
   measured_speed = float(measured_v_ego)
   queries = tuple(float(query) for query in query_times_s)
   if not queries or not math.isfinite(scalar) or not math.isfinite(measured_speed) or measured_speed < 0.0:
     raise ValueError("invalid scalar path target")
 
-  count = len(native_times_s)
-  valid = count >= 2 and len(orientation_rates_z) == count and len(velocities_x) == count
-  times: list[float] = []
-  curvatures: list[float] = []
-  speeds: list[float] = []
-  previous_time = -math.inf
-  if valid:
-    for native_time, orientation_rate, planned_speed in zip(
-      native_times_s, orientation_rates_z, velocities_x, strict=True,
-    ):
-      time = float(native_time)
-      speed = float(planned_speed)
-      rate = float(orientation_rate)
-      if not all(math.isfinite(value) for value in (time, speed, rate)) or time < 0.0 or time <= previous_time:
-        valid = False
-        break
-      times.append(time)
-      # a plan that stops inside the horizon still covers it. Below MIN_SPEED the yaw rate/speed
-      # ratio is ill-conditioned, so hold the last well-conditioned curvature: the wheel stays put.
-      if speed >= MIN_SPEED or not curvatures:
-        curvatures.append(rate / max(speed, MIN_SPEED))
-      else:
-        curvatures.append(curvatures[-1])
-      speeds.append(speed)
-      previous_time = time
+  def series(raw_times: Sequence[float], raw_values: Sequence[float], name: str) -> tuple[np.ndarray, np.ndarray]:
+    count = len(raw_times)
+    if count < 2 or len(raw_values) != count:
+      raise ValueError(f"invalid {name}")
+    times = np.array(raw_times, dtype=np.float64)
+    values = np.array(raw_values, dtype=np.float64)
+    if not (np.isfinite(times).all() and np.isfinite(values).all()) or times[0] < 0.0 or not (np.diff(times) > 0.0).all():
+      raise ValueError(f"invalid {name}")
+    return times, values
 
-  if not valid or len(times) < 2:
-    raise ValueError("invalid model path")
-  if not all(times[0] <= float(query) <= times[-1] for query in (
-    scalar_action_plan_s, plan_time_now_s, *queries,
-  )):
+  # a plan that stops inside the horizon still covers it; the speed is floored below
+  times, speeds = series(native_times_s, velocities_x, "model path")
+  preview_times, previews = series(preview_times_s, preview_curvatures, "curvature preview")
+  if preview_times[0] <= 0.0:
+    raise ValueError("invalid curvature preview")
+  now = float(plan_time_now_s)
+  if not all(times[0] <= query <= times[-1] for query in (now, *queries)):
     raise ValueError("model path does not cover requested timestamps")
+  # controlsd's scalar is the model's first sample after the ISO clip, so the pin keeps the clip
+  curvatures = np.array([scalar + preview - previews[0] for preview in previews])
 
-  def angle_at(query: float) -> tuple[float, float, float]:
-    plan_curvature = float(np.interp(query, times, curvatures))
-    anchor_curvature = float(np.interp(float(scalar_action_plan_s), times, curvatures))
-    curvature = scalar + plan_curvature - anchor_curvature
-    speed = max(MIN_SPEED, measured_speed + float(np.interp(query, times, speeds)) - float(np.interp(float(plan_time_now_s), times, speeds)))
-    angle = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, speed, roll_rad)) + angle_offset_deg
-    return curvature, speed, angle
+  # every query and its rate stencil, interpolated in one pass per series
+  count = len(queries)
+  # the rate stencil stays inside the preview: at the action time it is the forward difference
+  befores = [max(times[0], now, query - .05) for query in queries]
+  afters = [min(times[-1], query + .05) for query in queries]
+  points = np.array([*queries, *befores, *afters])
+  curvature_at = np.interp(points - now + preview_times[0], preview_times, curvatures)
+  speed_now = float(np.interp(now, times, speeds))
+  speed_at = np.interp(points, times, speeds)
+
+  def angle_at(index: int) -> tuple[float, float]:
+    speed = max(MIN_SPEED, measured_speed + float(speed_at[index]) - speed_now)
+    angle = math.degrees(vehicle_model.get_steer_from_curvature(-float(curvature_at[index]), speed, roll_rad)) + angle_offset_deg
+    return speed, angle
 
   targets: list[PathTarget] = []
-  for query in queries:
-    curvature, speed, angle = angle_at(query)
-    before = max(times[0], query - .05)
-    after = min(times[-1], query + .05)
-    rate = (angle_at(after)[2] - angle_at(before)[2]) / (after - before) if after > before else 0.0
+  for index in range(count):
+    speed, angle = angle_at(index)
+    before, after = befores[index], afters[index]
+    rate = (angle_at(2 * count + index)[1] - angle_at(count + index)[1]) / (after - before) if after > before else 0.0
+    curvature = float(curvature_at[index])
     if not all(math.isfinite(value) for value in (curvature, speed, angle, rate)):
       raise ValueError("non-finite path target")
     targets.append(PathTarget(curvature, speed, angle, rate))
@@ -379,7 +384,7 @@ class RackReferenceGovernor:
 
 
 DT = .01
-PREVIEW_S = .25
+PREVIEW_S = 0.0  # the immediate target is the scalar itself; the horizon beyond it only shapes the plan
 RATE_HORIZON_S = .1
 HORIZON_POSITION_TOLERANCE_DEG = .01
 HORIZON_RATE_TOLERANCE_DEG_S = .5
@@ -395,7 +400,7 @@ STATUS_ACTIVE = 1
 STATUS_NO_MODEL = 3
 STATUS_INVALID_VEHICLE_STATE = 4
 STATUS_STALE_MODEL = 5
-STATUS_INVALID_ACTION_TIME = 6
+STATUS_INVALID_PREVIEW = 6
 STATUS_INVALID_PATH = 7
 STATUS_INVALID_OUTPUT = 8
 STATUS_INVALID_PLANNER_STATE = 9
@@ -566,21 +571,20 @@ class RackTrajectoryController:
       self._invalidate(STATUS_STALE_MODEL)
       return None
 
-    try:
-      scalar_action_plan_s = float(self.model.action.desiredCurvatureTime)
-    except (AttributeError, TypeError, ValueError):
-      scalar_action_plan_s = math.nan
-    if not math.isfinite(scalar_action_plan_s) or scalar_action_plan_s <= 0.0:
-      self._invalidate(STATUS_INVALID_ACTION_TIME)
+    preview_times = self.model.action.desiredCurvaturePreviewTimes
+    preview = self.model.action.desiredCurvaturePreview
+    if len(preview_times) < 2 or len(preview) != len(preview_times):
+      # a modeld that publishes no usable preview: there is no path to build, stock steers
+      self._invalidate(STATUS_INVALID_PREVIEW)
       return None
 
     try:
       raw_targets = model_path_targets(
-        native_times_s=self.model.orientationRate.t,
-        orientation_rates_z=self.model.orientationRate.z,
+        native_times_s=self.model.velocity.t,
         velocities_x=self.model.velocity.x,
+        preview_times_s=preview_times,
+        preview_curvatures=preview,
         scalar_curvature=float(desired_curvature),
-        scalar_action_plan_s=scalar_action_plan_s,
         plan_time_now_s=model_age_s,
         measured_v_ego=float(CS.vEgo),
         query_times_s=tuple(model_age_s + offset for offset in HORIZON_OFFSETS_S),
@@ -598,13 +602,13 @@ class RackTrajectoryController:
       bound_speed = max(float(speed_mps), MIN_SPEED)
       minimum = max(-MAX_CURVATURE, (-MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
       maximum = min(MAX_CURVATURE, (MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
-      bounded_curvature = float(np.clip(raw_target.curvature, minimum, maximum))
+      bounded_curvature = min(max(raw_target.curvature, minimum), maximum)
       limited = bounded_curvature != raw_target.curvature
       if not limited:
         angle_curvature = -VM.calc_curvature(
           math.radians(raw_target.angle_deg - params.angleOffsetDeg), bound_speed, params.roll,
         )
-        bounded_curvature = float(np.clip(angle_curvature, minimum, maximum))
+        bounded_curvature = min(max(angle_curvature, minimum), maximum)
         limited = bounded_curvature != angle_curvature
       if not limited:
         return raw_target, False
@@ -689,7 +693,7 @@ class RackTrajectoryController:
     planned_out_of_bounds = not minimum_curvature - 1e-9 <= raw_planned_curvature <= maximum_curvature + 1e-9
     plan = raw_plan
     if planned_out_of_bounds:
-      planned_curvature = float(np.clip(raw_planned_curvature, minimum_curvature, maximum_curvature))
+      planned_curvature = min(max(raw_planned_curvature, minimum_curvature), maximum_curvature)
       planned_angle = math.degrees(VM.get_steer_from_curvature(-planned_curvature, bound_speed, params.roll)) + params.angleOffsetDeg
       plan = RackPlan(planned_angle, 0.0, 0.0, True, raw_plan.acceleration_limited, raw_plan.jerk_limited)
     planned_curvature = -VM.calc_curvature(math.radians(plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
@@ -757,7 +761,7 @@ class RackTrajectoryController:
       feedback_upper = MAX_TURN_IN_FEEDBACK_TORQUE if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
     else:
       feedback_lower, feedback_upper = -MAX_FEEDBACK_TORQUE, MAX_FEEDBACK_TORQUE
-    feedback = float(np.clip(raw_feedback, feedback_lower, feedback_upper))
+    feedback = min(max(raw_feedback, feedback_lower), feedback_upper)
     feedback_limited = feedback != raw_feedback
     raw_torque = feedforward_torque + feedback
     if raw_torque * measured_angle > 0.0:
@@ -765,7 +769,7 @@ class RackTrajectoryController:
     elif (measured_angle == 0.0 and planned_angle * intended_angle > 0.0
           and raw_torque * planned_angle < 0.0):
       raw_torque = 0.0
-    torque = float(np.clip(raw_torque, -1.0, 1.0))
+    torque = min(max(raw_torque, -1.0), 1.0)
     torque_limited = torque != raw_torque
     if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
       self.direction_guard_scale = 0.0

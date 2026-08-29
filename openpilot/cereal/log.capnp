@@ -1408,7 +1408,10 @@ struct ModelDataV2 {
     desiredCurvature @0 :Float32;
     desiredAcceleration @1 :Float32;
     shouldStop @2 :Bool;
-    desiredCurvatureTime @3 :Float32; # seconds from the model plan/timestampEof origin
+    desiredCurvatureTime @3 :Float32;  # seconds from the plan origin at which desiredCurvature is read
+    # desiredCurvature's own function evaluated further along the plan, pinned so [0] is desiredCurvature
+    desiredCurvaturePreview @4 :List(Float32);
+    desiredCurvaturePreviewTimes @5 :List(Float32);  # seconds from the plan origin, starting at desiredCurvatureTime
   }
 
   deprecated :group {

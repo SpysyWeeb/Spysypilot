@@ -1,5 +1,7 @@
 import math
 
+import numpy as np
+
 from openpilot.common.test import OpenpilotTestCase
 
 from openpilot.cereal import log, messaging
@@ -9,7 +11,7 @@ from opendbc.car.lateral import apply_driver_steer_torque_limits
 from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.realtime import DT_CTRL
-from openpilot.selfdrive.controls.lib.drive_helpers import MAX_LATERAL_ACCEL_NO_ROLL
+from openpilot.selfdrive.controls.lib.drive_helpers import MAX_LATERAL_ACCEL_NO_ROLL, MIN_SPEED
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.latcontrol_rack import FALLBACK_HOLD_S, LatControlRack
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
@@ -29,9 +31,10 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   RackTrajectoryController,
   model_path_targets,
   REFERENCE_REVERSAL_RC_S,
+  RESPONSE_TIME_S,
   STATUS_ACTIVE,
   STATUS_INACTIVE,
-  STATUS_INVALID_ACTION_TIME,
+  STATUS_INVALID_PREVIEW,
   STATUS_INVALID_PATH,
   STATUS_INVALID_VEHICLE_STATE,
   STATUS_NO_MODEL,
@@ -62,14 +65,29 @@ def get_rack_controller(car_name=HYUNDAI.HYUNDAI_PALISADE):
   return controller, stock, VM
 
 
+def set_curvature_preview(model, action_t=0.5):
+  """Fill the action's curvature preview from the message's own yaw-rate and speed plan, the way
+  modeld fills it from its plan head: sampled from the action time on, one horizon step apart."""
+  times = list(model.orientationRate.t)
+  rates = list(model.orientationRate.z)
+  speeds = list(model.velocity.x)
+  preview_times = [action_t + offset for offset in HORIZON_OFFSETS_S]
+  model.action.desiredCurvatureTime = action_t
+  model.action.desiredCurvaturePreviewTimes = preview_times
+  model.action.desiredCurvaturePreview = [
+    float(np.interp(t, times, rates)) / max(float(np.interp(t, times, speeds)), MIN_SPEED) for t in preview_times
+  ]
+
+
 def horizon_model(times, rates, speeds):
   message = messaging.new_message("modelV2").modelV2
   message.timestampEof = 1_000_000_000
   message.action.desiredCurvature = 0.0
-  message.action.desiredCurvatureTime = 0.5
   message.orientationRate.t = times
   message.orientationRate.z = rates
+  message.velocity.t = times
   message.velocity.x = speeds
+  set_curvature_preview(message)
   return message
 
 
@@ -82,13 +100,8 @@ def build_feedforward_boundary_controller():
   state = car.CarState.new_message()
   state.vEgo = 5.0
   params = log.VehicleParameters.new_message()
-  model = messaging.new_message("modelV2").modelV2
-  model.timestampEof = 1_000_000_000
+  model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6)
   model.action.desiredCurvature = -0.02
-  model.action.desiredCurvatureTime = 0.5
-  model.orientationRate.t = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
-  model.orientationRate.z = [0.0] * 6
-  model.velocity.x = [5.0] * 6
   torque_from_lateral_accel = interface.torque_from_lateral_accel()
 
   def update(torque_scale=1.0):
@@ -115,36 +128,58 @@ class TestLatControlRack(OpenpilotTestCase):
   # ---- model_path_targets / JerkLimitedRackPlanner / RackReferenceGovernor / RackRateEstimator ----
 
   def test_model_path_is_scalar_anchored_and_signed(self):
-    times = [0.0, 1.0, 2.0, 3.0]
-    speeds = [5.0] * 4
+    times = [0.0, 1.0, 2.0, 3.0, 4.0]
+    speeds = [5.0] * 5
+    # modeld's preview from the action time (1 s) on, 0.01 of curvature per second; the pin puts the
+    # scalar (0.03) at the action time. A query one second past now reads one second past the action time
+    preview_times = [1.0, 2.0, 3.0]
+    preview = [0.01, 0.02, 0.03]
     target = model_path_targets(
-      native_times_s=times, orientation_rates_z=[0.0, 0.05, 0.1, 0.15], velocities_x=speeds,
-      scalar_curvature=0.03, scalar_action_plan_s=1.0, plan_time_now_s=0.1, measured_v_ego=5.0,
-      query_times_s=(2.0,), vehicle_model=LinearVehicleModel(), roll_rad=0.0, angle_offset_deg=0.0,
+      native_times_s=times, velocities_x=speeds, preview_times_s=preview_times, preview_curvatures=preview,
+      scalar_curvature=0.03, plan_time_now_s=0.1, measured_v_ego=5.0,
+      query_times_s=(1.1,), vehicle_model=LinearVehicleModel(), roll_rad=0.0, angle_offset_deg=0.0,
     )[0]
-    expected_curvature = 0.03 + (0.1 / 5.0) - (0.05 / 5.0)
+    expected_curvature = 0.03 + 0.02 - 0.01
     assert abs(target.curvature - expected_curvature) < 1e-12
     assert abs(target.angle_deg - math.degrees(-expected_curvature * 10.0)) < 1e-12
-    assert target.rate_deg_s < 0.0
+    assert abs(target.rate_deg_s - math.degrees(-0.01 * 10.0)) < 1e-9
 
-    raised = False
-    try:
-      model_path_targets(
-        native_times_s=times, orientation_rates_z=[0.0, 0.05, 0.1, 0.15], velocities_x=speeds,
-        scalar_curvature=0.03, scalar_action_plan_s=1.0, plan_time_now_s=0.1, measured_v_ego=5.0,
-        query_times_s=(4.0,), vehicle_model=LinearVehicleModel(), roll_rad=0.0, angle_offset_deg=0.0,
-      )
-    except ValueError:
-      raised = True
-    assert raised
+    # at the plan's age the target is the scalar as published, moving at the preview's slope; past the
+    # preview's end the last sample holds, at rest
+    now, late = model_path_targets(
+      native_times_s=times, velocities_x=speeds, preview_times_s=preview_times, preview_curvatures=preview,
+      scalar_curvature=0.03, plan_time_now_s=0.1, measured_v_ego=5.0,
+      query_times_s=(0.1, 3.5), vehicle_model=LinearVehicleModel(), roll_rad=0.0, angle_offset_deg=0.0,
+    )
+    assert abs(now.curvature - 0.03) < 1e-12
+    assert abs(now.rate_deg_s - target.rate_deg_s) < 1e-9
+    assert abs(late.curvature - 0.05) < 1e-12
+    assert abs(late.rate_deg_s) < 1e-9
+
+    for bad in (
+      {"query_times_s": (5.0,)},  # the speed plan does not cover the query
+      {"preview_times_s": [0.0, 1.0, 2.0]},  # a preview starting at the plan origin has no action time
+      {"preview_curvatures": [0.01, math.nan, 0.03]},
+      {"preview_curvatures": [0.01, 0.02]},
+      {"velocities_x": [5.0, math.nan, 5.0, 5.0]},
+    ):
+      arguments = {
+        "native_times_s": times, "velocities_x": speeds, "preview_times_s": preview_times, "preview_curvatures": preview,
+        "scalar_curvature": 0.03, "plan_time_now_s": 0.1, "measured_v_ego": 5.0,
+        "query_times_s": (2.0,), "vehicle_model": LinearVehicleModel(), "roll_rad": 0.0, "angle_offset_deg": 0.0,
+      }
+      arguments.update(bad)
+      with self.assertRaises(ValueError):
+        model_path_targets(**arguments)
 
     stopped = model_path_targets(
-      native_times_s=times, orientation_rates_z=[0.0, 0.05, 0.1, 0.15], velocities_x=[5.0, 5.0, 0.0, 0.0],
-      scalar_curvature=0.03, scalar_action_plan_s=1.0, plan_time_now_s=0.1, measured_v_ego=5.0,
+      native_times_s=times, velocities_x=[5.0, 5.0, 0.0, 0.0, 0.0], preview_times_s=preview_times, preview_curvatures=preview,
+      scalar_curvature=0.03, plan_time_now_s=0.1, measured_v_ego=5.0,
       query_times_s=(2.0,), vehicle_model=LinearVehicleModel(), roll_rad=0.0, angle_offset_deg=0.0,
     )[0]
-    # the stopped samples are kept and hold the last well-conditioned curvature (the 0.05 / 5.0 knot at 1 s)
-    assert abs(stopped.curvature - 0.03) < 1e-12
+    # a plan that stops inside the horizon still covers it: the curvature is the preview's, the speed floors
+    assert abs(stopped.curvature - (0.03 + 0.029 - 0.01)) < 1e-12
+    assert stopped.speed_mps == MIN_SPEED
     assert math.isfinite(stopped.angle_deg)
 
   def test_jerk_limited_planner_is_bounded_and_symmetric(self):
@@ -246,13 +281,15 @@ class TestLatControlRack(OpenpilotTestCase):
   def test_full_horizon_faults_reset_and_recover_cold(self):
     self.CS.vEgo = 5.0
     valid = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6)
+    short_preview = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6)
+    short_preview.action.desiredCurvaturePreview = list(short_preview.action.desiredCurvaturePreview)[:-1]
     invalid_paths = (
       horizon_model([0.0, 0.5, 1.0], [0.0] * 3, [5.0] * 3),
-      horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 5, [5.0] * 6),
       horizon_model([0.0, 0.5, 0.4, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6),
       horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0, 0.0, math.nan, 0.0, 0.0, 0.0], [5.0] * 6),
     )
     cases = tuple((path, 1_050_000_000, STATUS_INVALID_PATH) for path in invalid_paths) + (
+      (short_preview, 1_050_000_000, STATUS_INVALID_PREVIEW),
       (valid, 1_600_000_001, STATUS_STALE_MODEL),
     )
     for invalid, mono_ns, expected_status in cases:
@@ -360,10 +397,7 @@ class TestLatControlRack(OpenpilotTestCase):
     CS = car.CarState.new_message()
     CS.vEgo = 15.0
     params = log.VehicleParameters.new_message()
-    model = messaging.new_message("modelV2").modelV2
-    model.action.desiredCurvatureTime = 0.5
-    model.orientationRate.t = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
-    model.velocity.x = [15.0] * 6
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [15.0] * 6)
 
     # a curve entry steered by the rack controller: the stock reference mirrors its idle, reset PID
     for frame in range(150):
@@ -371,6 +405,7 @@ class TestLatControlRack(OpenpilotTestCase):
       CS.steeringAngleDeg = math.degrees(VM.get_steer_from_curvature(-curvature, CS.vEgo, 0.0))
       model.action.desiredCurvature = curvature
       model.orientationRate.z = [curvature * CS.vEgo] * 6
+      set_curvature_preview(model)
       model.timestampEof = 1_000_000_000 + frame * 10_000_000
       mono_ns = model.timestampEof + 50_000_000
       _, _, rack_log = controller.update(True, CS, VM, params, False, curvature, False, 0.2, model=model, mono_time_ns=mono_ns)
@@ -403,13 +438,8 @@ class TestLatControlRack(OpenpilotTestCase):
     assert controller.torque.torque_params.friction == 0.25
 
   def _curve_model(self):
-    model = messaging.new_message("modelV2").modelV2
-    model.timestampEof = 1_000_000_000
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.03] * 6, [15.0] * 6)
     model.action.desiredCurvature = 0.002
-    model.action.desiredCurvatureTime = 0.5
-    model.orientationRate.t = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
-    model.orientationRate.z = [0.03] * 6
-    model.velocity.x = [15.0] * 6
     return model
 
   def test_dropped_model_frames_keep_the_last_plan(self):
@@ -492,10 +522,12 @@ class TestLatControlRack(OpenpilotTestCase):
 
     # one garbage model frame is steered by stock; a good frame right after resumes the rack without a hold
     model.orientationRate.z = [0.03, 0.03, math.nan, 0.03, 0.03, 0.03]
+    set_curvature_preview(model)
     _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_060_000_000)
     assert rack_log.fallback
     assert rack_log.status == STATUS_INVALID_PATH
     model.orientationRate.z = [0.03] * 6
+    set_curvature_preview(model)
     _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_070_000_000)
     assert not rack_log.fallback
     assert rack_log.status == STATUS_ACTIVE
@@ -559,13 +591,7 @@ class TestLatControlRack(OpenpilotTestCase):
     CS = car.CarState.new_message()
     CS.vEgo = 15.0
     params = log.VehicleParameters.new_message()
-    model = messaging.new_message("modelV2").modelV2
-    model.timestampEof = 1_000_000_000
-    model.action.desiredCurvature = 0.002
-    model.action.desiredCurvatureTime = 0.5
-    model.orientationRate.t = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
-    model.orientationRate.z = [0.03] * 6
-    model.velocity.x = [15.0] * 6
+    model = self._curve_model()
     controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
     assert controller.rack.status == STATUS_ACTIVE
     assert controller.output is not None
@@ -830,17 +856,19 @@ class TestLatControlRack(OpenpilotTestCase):
     assert rack_log.fallback
     assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
 
-  def test_invalid_action_time_falls_back_to_stock_torque_and_status(self):
+  def test_missing_preview_falls_back_to_stock_torque_and_status(self):
     controller, stock, VM = get_rack_controller()
     CS = car.CarState.new_message()
     CS.vEgo = 15.0
     params = log.VehicleParameters.new_message()
     model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [.03] * 6, [15.0] * 6)
     model.action.desiredCurvature = 0.002
-    model.action.desiredCurvatureTime = 0.0  # left at its zero default: the action horizon is undefined
+    # a modeld that predates the preview leaves the lists empty: there is no path to build
+    model.action.desiredCurvaturePreview = []
+    model.action.desiredCurvaturePreviewTimes = []
     torque, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, .2, model=model, mono_time_ns=1_050_000_000)
     stock_torque, _, _ = stock.update(True, CS, VM, params, False, 0.002, False, .2)
-    assert controller.rack.status == STATUS_INVALID_ACTION_TIME
+    assert controller.rack.status == STATUS_INVALID_PREVIEW
     assert rack_log.fallback
     assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
 
@@ -887,14 +915,17 @@ class TestLatControlRack(OpenpilotTestCase):
     flat, _ = update([0.0] * 6)
     future_turn, future_model = update([0.0, 0.0, .0001, .0002, .0001, 0.0])
     assert flat is not None and future_turn is not None
+    # the immediate target is the scalar as published, with the preview's slope at the action time as its rate
     assert abs(flat.target_angle_deg - future_turn.target_angle_deg) < 1e-9
     assert abs(future_turn.target_angle_deg) < 1e-9
+    assert -0.2 < future_turn.target_rate_deg_s < 0.0
     assert future_turn.planned_acceleration_deg_s2 != flat.planned_acceleration_deg_s2
     assert abs(future_turn.planned_angle_deg) <= HORIZON_POSITION_TOLERANCE_DEG
 
     future_targets = model_path_targets(
-      native_times_s=future_model.orientationRate.t, orientation_rates_z=future_model.orientationRate.z,
-      velocities_x=future_model.velocity.x, scalar_curvature=0.0, scalar_action_plan_s=.5, plan_time_now_s=.05,
+      native_times_s=future_model.velocity.t, velocities_x=future_model.velocity.x,
+      preview_times_s=future_model.action.desiredCurvaturePreviewTimes,
+      preview_curvatures=future_model.action.desiredCurvaturePreview, scalar_curvature=0.0, plan_time_now_s=.05,
       measured_v_ego=self.CS.vEgo, query_times_s=[.05 + offset for offset in HORIZON_OFFSETS_S],
       vehicle_model=self.VM, roll_rad=0.0, angle_offset_deg=0.0,
     )
@@ -904,7 +935,10 @@ class TestLatControlRack(OpenpilotTestCase):
             for offset, target in zip(HORIZON_OFFSETS_S, future_targets, strict=True) if offset > 0.0),
     )
     assert HORIZON_ACCELERATION_BLEND == .1
-    assert abs(future_turn.planned_acceleration_deg_s2 - HORIZON_ACCELERATION_BLEND * fitted) < 1e-9
+    # a fresh planner at rest at zero: the reactive term is the critically damped tracker's response
+    natural_frequency = 2.0 / RESPONSE_TIME_S
+    reactive = natural_frequency ** 2 * future_turn.target_angle_deg + 2.0 * natural_frequency * future_turn.target_rate_deg_s
+    assert abs(future_turn.planned_acceleration_deg_s2 - (reactive + HORIZON_ACCELERATION_BLEND * (fitted - reactive))) < 1e-9
 
   def test_driver_handoff_converges_through_platform_torque_limits(self):
     limits = CarControllerParams(self.CP)
