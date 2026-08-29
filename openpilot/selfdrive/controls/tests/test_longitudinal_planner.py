@@ -8,6 +8,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.necessity_supervisor import LongitudinalPolicy
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
                                                                    A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
                                                                    LongitudinalPlanner, get_cruise_accel, get_cruise_comfort_accel,
@@ -222,3 +223,10 @@ class TestPlannerCruise:
         plant.step(v_cruise=v_cruise, radar_valid=radar_valid)
         plant.speed = v_ego  # hold speed so the settled cruise target is observable
       assert plant.planner.a_cruise == pytest.approx(expected, abs=0.02), (radar_valid, e2e)
+
+  def test_fcw_comes_only_from_the_mpc_crash_counter(self):
+    plant = Plant(speed=15.0, distance_lead=40.0, lead_relevancy=True)
+    plant.planner.supervisor.update = lambda *args: LongitudinalPolicy(1.0, 0.0, True)
+    plant.step(v_lead=15.0)
+    assert plant.planner.supervisor.update().stand_down
+    assert not plant.planner.fcw

@@ -87,3 +87,17 @@ class TestUpdateProtocol:
     assert np.all(mpc.params[:, 2] == pytest.approx(10.0 + STOP_DISTANCE))
     assert np.min(mpc.a_solution) < -0.5
     assert mpc.v_solution[-1] < 1.0
+
+  def test_fcw_counter_needs_a_confirmed_present_lead(self):
+    mpc = LongitudinalMpc()
+    mpc.set_cur_state(20.0, 0.0)
+    mpc.update(radar_state(d_one=6.0, v_one=0.0), STANDARD)
+    assert mpc.crash_cnt == 1
+    unconfirmed = radar_state(d_one=6.0, v_one=0.0)
+    unconfirmed.leadOne.modelProb = 0.5
+    mpc.update(unconfirmed, STANDARD)
+    assert mpc.crash_cnt == 0
+    ghost = radar_state(d_one=6.0, v_one=0.0)
+    ghost.leadOne.present = False
+    mpc.update(ghost, STANDARD)
+    assert mpc.crash_cnt == 0

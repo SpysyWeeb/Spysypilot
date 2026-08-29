@@ -74,8 +74,9 @@ handoff refills `a_prev`; applies `jerk_scale`/`t_follow_pad` only while lead0 i
 `set_weights` exactly once; solves; scores `crash_cnt` against the lead trajectory the solve used
 (model-anchored when valid, radar extrapolation otherwise — a disclosed departure from stock FCW
 sensitivity; scoring a radar-only path against a model-anchored solve would produce phantom
-warnings). The third-lead machinery is removed. `params[:, 1] = A_MAX`,
-`A_MAX = min(ACCEL_MAX, A_REQUEST_MAX)` defined once in the planner.
+warnings). The third-lead machinery is removed. The MPC's acceleration bound stays opendbc's
+`ACCEL_MAX` as in stock (BLoTv2's `min(ACCEL_MAX, 4.0)` always equalled it); only the cruise
+envelope carries the 4.0 m/s² launch request.
 
 ### longitudinal_planner.py
 Envelope (`a_max = 0.6 + 3.4 (1 − v/40)³`, clamped by `A_MAX`), jerk schedule, ordinary-cruise
