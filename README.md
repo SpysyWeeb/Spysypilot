@@ -59,12 +59,12 @@ upstream uses for the planner, and the defects found in the 2026-08-28 review of
   acceleration ceiling is the continuous cubic envelope `0.6 + 3.4 (1 − v/40)³`, clamped by the
   deployed opendbc `ACCEL_MAX`; the jerk schedule is `[2.0, 1.6, 1.0, 0.6] m/s³`; ordinary Chill
   cruise above 15 m/s uses the proportional comfort target (5 mph ≈ 0.40 m/s², pitch-compensated
-  coast on reductions, blended in from 8 m/s) whenever the radar is healthy; the turn budget is
-  `max(envelope, stock [1.7, 3.2])` so a straight launch is never clipped but cornering consumes it
-  again; the MPC's acceleration-change cost stays on through standstill. Behavioral tests in
+  coast on reductions, blended in from 8 m/s) whenever the radar is healthy; there is no lateral turn budget (removed after the
+  2026-08-29 field test — accelerating out of curves felt held back); the MPC's acceleration-change
+  cost stays on through standstill. Behavioral tests in
   `openpilot/selfdrive/controls/tests/test_longitudinal_planner.py`. The e2e candidate only enters
   arbitration with a valid model, as in BLoTv2. Replay against BLoTv2 on routes d7, d9 and d2:
-  every cruise-candidate difference is the turn budget, and the three 75↔80 mph corrections on
+  every cruise-candidate difference was the (since removed) turn budget, and the three 75↔80 mph corrections on
   d9 settle at the same +0.40 / −0.40 / +0.40 m/s² in both; lead-candidate differences are
   phase 2's. Measured cost of D4 behind a departing lead: the first step is 3× gentler and the
   launch reaches half its peak at 1.35 s instead of 0.70 s — a phase-2 field item.

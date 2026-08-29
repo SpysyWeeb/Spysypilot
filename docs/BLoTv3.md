@@ -138,7 +138,7 @@ standstill, e2e candidate dropped while the model is invalid.
 Changed: CEM can enter with an irrelevant lead in view; hold through standstill owned by Force
 Stops and not released by a mode exit; FCW in stock's form, scored against the solved trajectory;
 manual Experimental survives pedal taps; pad saturation and low-speed hold; third lead removed;
-turn budget active again; no cross-process stop fields; `longcontrol.py` is stock.
+no turn budget; no cross-process stop fields; `longcontrol.py` is stock.
 
 ## 5. Phases and gates
 Every phase: behavioral unit tests (real capnp messages, no constant echoes), the longitudinal
@@ -163,7 +163,7 @@ the owner's field test before the next phase.
    and drop the audited combo-only commits.
 
 ## 6. Verification map
-Envelope samples on the requested curve; comfort; turn budget with steering ≠ 0 (unit test);
+Envelope samples on the requested curve; comfort;
 arbitration incl. hold; no FCW from the removed stand-down path; pad saturation across 1.5 m/s²;
 low-speed hold at partial softening with emergency/lead-loss release still reaching 1.0; whiplash
 ratchet and hold in one scenario; row-0 policy; single `set_weights`; `a_prev` refill on the exact
