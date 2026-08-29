@@ -1,9 +1,11 @@
 import itertools
+import numpy as np
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized_class
 
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.test.longitudinal_maneuvers.maneuver import Maneuver
+from openpilot.selfdrive.test.longitudinal_maneuvers.plant import Plant
 
 
 # TODO: make new FCW tests
@@ -192,3 +194,35 @@ class TestLongitudinalControl(OpenpilotTestCase):
         print(maneuver.title, f'in {"e2e" if maneuver.e2e else "acc"} mode')
         valid, _ = maneuver.evaluate()
         assert valid
+
+
+class TestManeuverHarnessLiveness(OpenpilotTestCase):
+  # the planner never sees sm.all_checks(); this checks the shim itself, since
+  # that is the only place a scheduled radar/model validity drop is observable
+  def test_scheduled_validity_drop_visible_through_shim(self):
+    maneuver = Maneuver(
+      'liveness shim schedule',
+      duration=0.6,
+      radar_valid_breakpoints=[0.0, 0.2, 0.4],
+      radar_valid_values=[1.0, 0.0, 1.0],
+      model_valid_breakpoints=[0.0, 0.3],
+      model_valid_values=[1.0, 0.0],
+    )
+    plant = Plant()
+    seen_radar_drop = False
+    seen_model_drop = False
+    while plant.current_time < maneuver.duration:
+      t = plant.current_time
+      radar_valid = bool(np.interp(t, maneuver.radar_valid_breakpoints, maneuver.radar_valid_values) > 0.5)
+      model_valid = bool(np.interp(t, maneuver.model_valid_breakpoints, maneuver.model_valid_values) > 0.5)
+      plant.step(radar_valid=radar_valid, model_valid=model_valid)
+
+      assert plant.last_sm.all_checks(['radarState']) == radar_valid
+      assert plant.last_sm.all_checks(['modelV2']) == model_valid
+      assert plant.last_sm.all_checks(['carState']) is True
+      assert plant.last_sm.all_checks() == (radar_valid and model_valid)
+
+      seen_radar_drop = seen_radar_drop or not radar_valid
+      seen_model_drop = seen_model_drop or not model_valid
+
+    assert seen_radar_drop and seen_model_drop

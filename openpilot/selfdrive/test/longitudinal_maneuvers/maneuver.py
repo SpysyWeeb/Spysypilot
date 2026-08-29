@@ -16,6 +16,11 @@ class Maneuver:
     self.cruise_values = kwargs.get("cruise_values", [50.0 for i in range(len(self.breakpoints))])
     self.pitch_values = kwargs.get("pitch_values", [0.0 for i in range(len(self.breakpoints))])
 
+    self.radar_valid_breakpoints = kwargs.get("radar_valid_breakpoints", self.breakpoints)
+    self.radar_valid_values = kwargs.get("radar_valid_values", [1.0 for i in range(len(self.radar_valid_breakpoints))])
+    self.model_valid_breakpoints = kwargs.get("model_valid_breakpoints", self.breakpoints)
+    self.model_valid_values = kwargs.get("model_valid_values", [1.0 for i in range(len(self.model_valid_breakpoints))])
+
     self.only_lead2 = kwargs.get("only_lead2", False)
     self.only_radar = kwargs.get("only_radar", False)
     self.ensure_start = kwargs.get("ensure_start", False)
@@ -50,7 +55,9 @@ class Maneuver:
       cruise = np.interp(plant.current_time, self.breakpoints, self.cruise_values)
       pitch = np.interp(plant.current_time, self.breakpoints, self.pitch_values)
       prob_throttle = np.interp(plant.current_time, self.breakpoints, self.prob_throttle_values)
-      log = plant.step(speed_lead, prob_lead, cruise, pitch, prob_throttle)
+      radar_valid = bool(np.interp(plant.current_time, self.radar_valid_breakpoints, self.radar_valid_values) > 0.5)
+      model_valid = bool(np.interp(plant.current_time, self.model_valid_breakpoints, self.model_valid_values) > 0.5)
+      log = plant.step(speed_lead, prob_lead, cruise, pitch, prob_throttle, radar_valid, model_valid)
 
       d_rel = log['distance_lead'] - log['distance'] if self.lead_relevancy else 200.
       v_rel = speed_lead - log['speed'] if self.lead_relevancy else 0.

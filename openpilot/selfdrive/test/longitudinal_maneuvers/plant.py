@@ -11,6 +11,40 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
+class _PlantSubMaster:
+  # mimics messaging.SubMaster's liveness contract so the planner (and future
+  # BLoTv3 modules) see a real all_checks() instead of one that is always True
+  def __init__(self, data, mono_time, invalid=()):
+    self.data = data
+    self.updated = dict.fromkeys(data, True)
+    self.logMonoTime = dict.fromkeys(data, mono_time)
+    self.valid = {s: s not in invalid for s in data}
+    self.alive = dict(self.valid)
+    self.freq_ok = dict.fromkeys(data, True)
+
+  def __getitem__(self, s):
+    return self.data[s]
+
+  def all_checks(self, service_list=None):
+    services = self.data.keys() if service_list is None else service_list
+    return all(self.valid[s] and self.alive[s] and self.freq_ok[s] for s in services)
+
+
+def _model_lead_v3(x, v, prob):
+  n = len(ModelConstants.LEAD_T_IDXS)
+  lead = log.ModelDataV2.LeadDataV3.new_message()
+  lead.prob = float(prob)
+  lead.probTime = 0.0
+  lead.t = [float(t) for t in ModelConstants.LEAD_T_IDXS]
+  lead.x = [float(p) for p in x]
+  lead.xStd = [1.0] * n
+  lead.y = [0.0] * n
+  lead.yStd = [1.0] * n
+  lead.v = [float(vv) for vv in v]
+  lead.vStd = [0.5] * n
+  return lead
+
+
 class Plant:
   messaging_initialized = False
 
@@ -57,7 +91,8 @@ class Plant:
   def current_time(self):
     return float(self.rk.frame) / self.rate
 
-  def step(self, v_lead=0.0, prob_lead=1.0, v_cruise=50., pitch=0.0, prob_throttle=1.0):
+  def step(self, v_lead=0.0, prob_lead=1.0, v_cruise=50., pitch=0.0, prob_throttle=1.0,
+           radar_valid=True, model_valid=True):
     # ******** publish a fake model going straight and fake calibration ********
     # note that this is worst case for MPC, since model will delay long mpc by one time step
     radar = messaging.new_message('radarState')
@@ -117,9 +152,26 @@ class Plant:
     model.modelV2.acceleration = acceleration
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
+    # lead0 mirrors the radar lead above; lead1/lead2 are shaped but carry no probability
+    lead_t = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
+    if a_lead < 0.0:
+      stop_t = np.minimum(lead_t, max(-v_lead / a_lead, 0.0))
+    else:
+      stop_t = lead_t
+    lead0_v = np.maximum(v_lead + a_lead * lead_t, 0.0)
+    lead0_x = np.maximum.accumulate(d_rel + v_lead * stop_t + 0.5 * a_lead * stop_t ** 2)
+    lead0_prob = float(prob_lead) if self.lead_relevancy else 0.0
+    zeros = np.zeros_like(lead_t)
+    model.modelV2.leadsV3 = [
+      _model_lead_v3(lead0_x, lead0_v, lead0_prob),
+      _model_lead_v3(zeros, zeros, 0.0),
+      _model_lead_v3(zeros, zeros, 0.0),
+    ]
+
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
     ss.selfdriveState.experimentalMode = self.e2e
     ss.selfdriveState.personality = self.personality
+    ss.selfdriveState.enabled = bool(self.enabled)
     control.controlsState.forceDecel = self.force_decel
     car_state.carState.vEgo = float(self.speed)
     car_state.carState.standstill = bool(self.speed < 0.01)
@@ -127,13 +179,20 @@ class Plant:
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = {'radarState': radar.radarState,
-          'carState': car_state.carState,
-          'carControl': car_control.carControl,
-          'controlsState': control.controlsState,
-          'selfdriveState': ss.selfdriveState,
-          'vehicleParameters': lp.vehicleParameters,
-          'modelV2': model.modelV2}
+    invalid = set()
+    if not radar_valid:
+      invalid.add('radarState')
+    if not model_valid:
+      invalid.add('modelV2')
+    sm = _PlantSubMaster({'radarState': radar.radarState,
+                           'carState': car_state.carState,
+                           'carControl': car_control.carControl,
+                           'controlsState': control.controlsState,
+                           'selfdriveState': ss.selfdriveState,
+                           'vehicleParameters': lp.vehicleParameters,
+                           'modelV2': model.modelV2},
+                          mono_time=int(self.current_time * 1e9), invalid=invalid)
+    self.last_sm = sm
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
