@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 1 (cruise layer) implemented 2026-08-29 and awaiting the owner's field test on `BLoTv3`; phases 2 (lead layer) and 3 (stop layer) implemented on `BLoTv3-phase2`, merged one at a time after each field verdict.**
+**Status: ⚠️ in progress — phases 1–3 implemented and replay-gated against BLoTv2; merged into `combo` 2026-08-29 (replacing BLoTv2) for the owner's field test.**
 
 ## What it does
 

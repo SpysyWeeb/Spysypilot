@@ -1,8 +1,9 @@
 # BLoTv3 — design
 
 **Status: in progress. Not field validated. Do not mark complete before owner field testing and
-explicit approval.** Phase 0 done; phase 1 (cruise layer) implemented 2026-08-29 on `BLoTv3` and awaiting the owner's
-field test; phases 2 (lead layer) and 3 (stop layer) implemented on `BLoTv3-phase2`, merged one at a time after each field verdict.
+explicit approval.** Phases 0–3 implemented on `BLoTv3` and replay-gated against BLoTv2; merged into `combo` on
+2026-08-29 (phase 4a, replacing BLoTv2) for the owner's field test. Phases 4b–4d (smooth-stops
+re-authoring, curve-limiter composition review, SOL/AOL hook review) follow the field verdict.
 
 BLoTv3 restructures [BLoTv2](https://github.com/SpysyWeeb/Spysypilot/tree/BLoTv2) from `stock`.
 It keeps BLoTv2's tuned behavior where BLoTv2 was right and fixes the verified defects; it does
