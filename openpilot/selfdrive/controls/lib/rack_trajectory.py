@@ -444,6 +444,7 @@ class RackTrajectoryController:
     self.model = None
     self.state_mono_ns = 0
     self.inactive_frames = 0
+    self.hold_angle_deg: float | None = None
     self.planner: JerkLimitedRackPlanner | None = None
     self.transition_rate_limit: float | None = None
     self.transition_acceleration_limit: float | None = None
@@ -464,7 +465,9 @@ class RackTrajectoryController:
     # inactive for a frame: keep the planned rack through a short blip, start over after a real disengage
     self.inactive_frames += 1
     self.status = STATUS_INACTIVE
-    if self.inactive_frames > INACTIVE_HOLD_FRAMES:
+    if self.inactive_frames == 1:
+      self.hold_angle_deg = self.rack_rate_estimator.previous_angle_deg
+    elif self.inactive_frames == INACTIVE_HOLD_FRAMES + 1:
       self.reset()
 
   def reset(self) -> None:
@@ -543,7 +546,11 @@ class RackTrajectoryController:
     if not active:
       self.hold()
       return None
+    if self.inactive_frames and self.planner is not None and self.hold_angle_deg is not None:
+      # the wheel may have moved while the plan was held: carry the plan along with it
+      self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
     self.inactive_frames = 0
+    self.hold_angle_deg = None
     if self.model is None:
       self._invalidate(STATUS_NO_MODEL)
       return None

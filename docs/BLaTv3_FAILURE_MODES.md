@@ -26,8 +26,9 @@ Shape ("upstream-shaped controller"):
   The shadow's request buffer, jerk filter and the shared saturation timer are warm; its
   integrator starts clean on handover. Since phase 2 step 2: a dropped model frame keeps the last
   plan, a model is stale past 0.5 s (SubMaster's alive window), stock holds for 0.5 s before the
-  rack resumes, and a `latActive` blip of up to five frames holds the planned rack (R6, FM1.6,
-  FM1.15, FM4.4, FM5.2). A warm integrator in the shadow is still open.
+  rack resumes (stale model only — a one-frame content fault hands back on the next good frame),
+  and a `latActive` blip of up to five frames holds the planned rack and carries it along with any
+  wheel motion meanwhile (R6, FM1.6, FM3.12, FM5.2). A warm integrator in the shadow is still open.
 - modeld publishes a short curvature preview on `ModelDataV2.Action` next to
   `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar.
 

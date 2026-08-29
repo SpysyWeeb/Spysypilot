@@ -135,7 +135,7 @@ class Controls:
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                      self.steer_limited_by_safety, self.desired_curvature,
                                                      curvature_limited, lat_delay,
-                                                     model=model_v2 if self.sm.valid['modelV2'] else None,
+                                                     model=model_v2 if self.sm.valid['modelV2'] and self.sm.alive['modelV2'] else None,
                                                      mono_time_ns=self.sm.logMonoTime['selfdriveState'])
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
