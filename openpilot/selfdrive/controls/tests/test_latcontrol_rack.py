@@ -395,10 +395,10 @@ class TestLatControlRack(OpenpilotTestCase):
 
   def test_torque_parameters_reach_the_stock_shadow(self):
     controller, _, _ = get_rack_controller()
-    controller.update_torque_parameters(2.5, 0.1, 0.2)
+    controller.update_torque_parameters(2.5, 0.125, 0.25)
     assert controller.torque.torque_params.latAccelFactor == 2.5
-    assert controller.torque.torque_params.latAccelOffset == 0.1
-    assert controller.torque.torque_params.friction == 0.2
+    assert controller.torque.torque_params.latAccelOffset == 0.125
+    assert controller.torque.torque_params.friction == 0.25
 
   def test_reset_clears_rack_state_and_output(self):
     controller, _, VM = get_rack_controller()
