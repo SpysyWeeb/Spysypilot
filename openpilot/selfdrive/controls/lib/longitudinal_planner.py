@@ -9,7 +9,9 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
@@ -89,6 +91,9 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
+    self.supervisor = NecessitySupervisor(dt)
+    self.lead_departure = LeadDeparturePreRelease(dt)
+    self.mpc_a_target = init_a
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -130,6 +135,9 @@ class LongitudinalPlanner:
       self.v_desired_filter.x = v_ego
       self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
       self.a_cruise = self.output_a_target
+      self.mpc_a_target = float(self.output_a_target)
+      self.supervisor.reset()
+      self.lead_departure.reset()
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -137,9 +145,18 @@ class LongitudinalPlanner:
     # No change cost when user is controlling the speed; it stays on through standstill so launches start smooth
     prev_accel_constraint = not reset_state
 
-    self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
+    radar_valid = sm.all_checks(['radarState'])
+    model_valid = sm.all_checks(['modelV2'])
+    lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
+    model_leads = sm['modelV2'].leadsV3 if model_valid else []
+    lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if len(model_leads) > 0 else None
+    lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
+    policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
+
+    personality = sm['selfdriveState'].personality
     self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
-    self.mpc.update(sm['radarState'], personality=sm['selfdriveState'].personality)
+    self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, None,
+                    policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -156,13 +173,18 @@ class LongitudinalPlanner:
     action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
     output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                               action_t=action_t)
+    self.mpc_a_target = float(output_a_target_mpc)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
+    # a stopped lead that is confirmed leaving releases the MPC's stop bit early; its acceleration target is untouched
+    lead_departing = self.lead_departure.update(self.CP.openpilotLongitudinalControl and not long_control_off, sm['carState'].standstill,
+                                                lead, lead0_anchor.speed if lead0_anchor is not None else None)
+    if lead_departing:
+      output_should_stop_mpc = False
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
     experimental_mode = sm['selfdriveState'].experimentalMode
-    model_valid = sm.all_checks(['modelV2'])
-    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, sm.all_checks(['radarState']))
+    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
                                      accel_coast, self.allow_throttle, comfort)

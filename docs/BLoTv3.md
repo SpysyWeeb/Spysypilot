@@ -1,8 +1,8 @@
 # BLoTv3 — design
 
 **Status: in progress. Not field validated. Do not mark complete before owner field testing and
-explicit approval.** Phase 0 done and phase 1 (cruise layer) implemented 2026-08-29; phase 1 awaits the
-owner's field test (Chill, no lead: urban and highway set-speed steps, one on-ramp, the D4 launch metric).
+explicit approval.** Phase 0 done; phase 1 (cruise layer) implemented 2026-08-29 on `BLoTv3` and awaiting the owner's
+field test; phase 2 (lead layer) implemented on `BLoTv3-phase2`, merged after the phase 1 verdict.
 
 BLoTv3 restructures [BLoTv2](https://github.com/SpysyWeeb/Spysypilot/tree/BLoTv2) from `stock`.
 It keeps BLoTv2's tuned behavior where BLoTv2 was right and fixes the verified defects; it does

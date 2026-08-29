@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 1 (cruise layer) implemented 2026-08-29, awaiting the owner's field test; phase 0 (branch, docs, honest harness, replay tooling) done.**
+**Status: ⚠️ in progress — phase 1 (cruise layer) implemented 2026-08-29 and awaiting the owner's field test on `BLoTv3`; phase 2 (lead layer) implemented on `BLoTv3-phase2`, to be merged after the phase 1 verdict.**
 
 ## What it does
 
@@ -68,3 +68,17 @@ upstream uses for the planner, and the defects found in the 2026-08-28 review of
   d9 settle at the same +0.40 / −0.40 / +0.40 m/s² in both; lead-candidate differences are
   phase 2's. Measured cost of D4 behind a departing lead: the first step is 3× gentler and the
   launch reaches half its peak at 1.35 s instead of 0.70 s — a phase-2 field item.
+- Phase 2 (2026-08-29, branch `BLoTv3-phase2`) — the lead layer. `longitudinal_lead.py`: the one
+  definition of a usable lead (`LeadObservation`, `lead_present`, `relevant_lead`) and
+  `anchor_model_lead`, which validates the model's lead forecast once per frame and anchors it to
+  radar. `necessity_supervisor.py`: BLoTv2's supervisor with two fixes — the following-time pads
+  saturate instead of vanishing above 1.5 m/s² of required deceleration, and the low-speed hold
+  keeps whatever softening was built while necessity-braking (a stand-down or lead loss still
+  releases it); its stand-down never reaches an alert. `long_mpc.py`: one `update()` call takes
+  the anchors, the supervisor's jerk scale and pad, and a committed stop point; it sets the cost
+  weights exactly once, applies the policy only while lead0 owns the solve, re-anchors the
+  change cost on a handoff, and has no third-lead machinery; `STOP_DISTANCE` is 7 m and the
+  aggressive personality follows at 1.0 s as in BLoTv2. The planner wires the two and the
+  lead-departure pre-release. `LongitudinalPlanSource.stop` is added to cereal. Replay against
+  BLoTv2 on route d7 segment 0: every lead-candidate frame now matches to the float; only the 64
+  turn-budget frames from phase 1 differ.

@@ -163,7 +163,7 @@ class TestPlannerCruise:
     def launch(keep_cost):
       plant = Plant(speed=0.0, distance_lead=7.0, lead_relevancy=True)
       set_weights = plant.planner.mpc.set_weights
-      plant.planner.mpc.set_weights = lambda prev_accel_constraint, **kwargs: set_weights(prev_accel_constraint and keep_cost, **kwargs)
+      plant.planner.mpc.set_weights = lambda prev_accel_constraint, *args: set_weights(prev_accel_constraint and keep_cost, *args)
       accels, sources = [], []
       while plant.current_time < 2.0:
         plant.step(v_lead=np.interp(plant.current_time, [0.5, 2.0], [0.0, 7.0]), v_cruise=20.0)
