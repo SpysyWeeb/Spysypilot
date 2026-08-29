@@ -59,6 +59,12 @@ builds, never past a refuge island.
   20–40 m/s the immediate target moves by 0.10° (p50) / 0.35° (p95) and torque by 0.013 / 0.055; below
   10 m/s the immediate target becomes the scalar itself instead of lagging it ~12 % while curvature
   builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
+- Phase 2, cost — `model_path_targets` interpolates every query and its rate stencil in one pass per
+  series (81 scalar `np.interp` calls a frame became two) and the scalar clips in `bound_target` and the
+  torque tail use `min`/`max`: bit-exact (20k randomized inputs; A/A replay on routes 00000020/21/22),
+  `RackTrajectoryController.update` 4.0 → 1.75 ms per frame on the device's little cores. Motivation:
+  route 00000022 ran core 4 (card + controlsd + selfdrived) at 100 % with card merging CAN batches at
+  highway speed, and the rack controller was 5.7 ms of controlsd's 10 ms frame against 0.45 ms for stock.
 - `openpilot/selfdrive/controls/lib/rack_trajectory.py` — BLaTv2's controller math (reference
   compile, jerk-limited rack planner, reversal governor, rate estimator, torque tail) moved unchanged
   into one module: the class is renamed `RackTrajectoryController`, the one-line `_measured_rate`
