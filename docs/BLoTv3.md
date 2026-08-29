@@ -88,24 +88,27 @@ mode with a valid model) → `output_should_stop = any(candidate stops) or force
 
 ### stop_helpers.py
 `observe_model_stop(model, car_state, radar_state) -> StopObservation` — BLoTv2's tiers
-(`shouldStop`, strict trajectory, early high-speed, fallback, early hint), straight-approach guard,
-relevant lead, committed turn. `stop_release_open(model)` — one definition, non-braking not
+(`shouldStop`, strict trajectory, early high-speed, early hint; BLoTv2's missing-velocity fallback
+tier cannot occur with complete typed messages and is gone), straight-approach guard, relevant lead,
+committed turn, and per frame the launch-evidence and corridor verdicts. `stop_release_open(model)` — one definition, non-braking not
 required (combo's field-tested semantics). `leads_clear_of_stop_path(model, path_end_m)` — fails
 closed unless **every** model-lead hypothesis with probability > 0 is outside the corridor, and on
-any shape/finite irregularity (route-29 negative sentinel). `MODEL_INVALID_RELEASE_S = 0.5` is
+any shape/finite irregularity (route-29 negative sentinel); a flat path, which is what the model
+publishes at standstill, is a legal straight corridor, a reversing one is not. `MODEL_INVALID_RELEASE_S = 0.5` is
 defined here and shared. Typed capnp access; no `getattr` guards.
 
 ### force_stops.py
 `ForceStops.update(observation, car_state, lead, experimental_mode, enabled, model_valid) -> (v_cruise_cap, stop_x, holding)`.
 States: `idle → shaping → committed → holding → (committed | idle)`.
 - Entry requires Experimental mode (**entry only** — a later mode exit never releases a hold), no
-  relevant lead, a valid model, BLoTv2's tiers, path-length window and latch confidence, plus
+  raw lead, a valid model, BLoTv2's tiers, path-length window and latch confidence, plus
   the committed-turn veto. Pre-latch shaping cap on the live endpoint as BLoTv2.
 - `committed`: `remaining` decremented by ego travel, forward-ratcheted toward a re-extending
   endpoint (`EXTEND_RATE`/`EXTEND_DEADBAND`) and, below `DOWN_SPEED`, down-ratcheted toward a
   collapsing one (route 38 t=351); `LATCH_SETBACK`; `stop_x = max(remaining, −STOP_DISTANCE)`;
   `v_cruise_cap ≥ v_ego − DV_MAX`. Model invalid releases only after `MODEL_INVALID_RELEASE_S`.
-- `holding`: entered at `CS.standstill` while committed; `stop_x = 0` and `holding` forces
+- `holding`: entered at `CS.standstill` while committed, or within 10 s of a lead or a gas tap breaking
+  a hold when the car is stopped again with stop evidence; `stop_x = 0` and `holding` forces
   `shouldStop`, so `controlsd`'s `cruiseControl.resume` cannot pulse. Leaves to `committed` (not
   idle) at `v_ego ≥ 0.8 m/s`, so an unsigned wheel-speed flicker on a grade never drops the latch.
 - Release to idle: filtered launch evidence (`stop_release_open`, 0.30 s time constant); gas;
