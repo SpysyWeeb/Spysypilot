@@ -15,10 +15,18 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.common.swaglog import cloudlog
 
-A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
-A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
-J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
+# one convex curve from launch authority to the high speed floor, no speed node corners;
+# the deployed opendbc ACCEL_MAX clamps the request (2.0 stock, 4.0 with the fork's opendbc/panda)
+A_CRUISE_MAX_LAUNCH = 4.0
+A_CRUISE_MAX_HIGH_SPEED = 0.6
+A_CRUISE_MAX_SPEED = 40.
+J_CRUISE_VALS = [2.0, 1.6, 1.0, 0.6]
+J_CRUISE_BP = [0., 10.0, 25., 40.]
 A_CRUISE_MIN = -1.2
+# ordinary set-speed corrections at road speed use a proportional target, so a 5 mph error asks for ~0.4 m/s^2
+CRUISE_COMFORT_KP = 0.18
+CRUISE_COMFORT_BP = [8.0, 15.0]
+CRUISE_COMFORT_COAST_ERROR = 5.0 * CV.MPH_TO_MS
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
@@ -27,17 +35,31 @@ MIN_ALLOW_THROTTLE_SPEED = 2.5
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
+def get_max_accel_request(v_ego):
+  remaining = 1.0 - np.clip(v_ego / A_CRUISE_MAX_SPEED, 0.0, 1.0)
+  return float(A_CRUISE_MAX_HIGH_SPEED + (A_CRUISE_MAX_LAUNCH - A_CRUISE_MAX_HIGH_SPEED) * remaining ** 3)
+
 def get_max_accel(v_ego):
-  return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
+  return min(get_max_accel_request(v_ego), ACCEL_MAX)
 
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
-def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle):
+def get_cruise_comfort_accel(v_cruise, v_ego, accel_coast):
+  speed_error = v_cruise - v_ego
+  target_accel = CRUISE_COMFORT_KP * speed_error
+  if speed_error < 0.0 and np.isfinite(accel_coast):
+    # lift off toward a full coast by a 5 mph reduction: an uphill slows the car by itself, a downhill still gets gentle braking
+    coast_weight = np.interp(-speed_error, [0.0, CRUISE_COMFORT_COAST_ERROR], [0.0, 1.0])
+    target_accel = min(target_accel, accel_coast * coast_weight)
+  return float(target_accel)
+
+def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle, comfort=False):
   max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
 
   if not e2e:
-    a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
+    # lateral acceleration consumes the turn budget, but the budget never clips a straight launch
+    a_total_max = max(max_accel, np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V))
     a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
     a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
     max_accel = min(max_accel, a_x_allowed)
@@ -47,7 +69,10 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, 
       max_accel = min(max_accel, coast_limit)
 
   target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel)
-  j_cruise = np.interp(v_ego, A_CRUISE_MAX_BP, J_CRUISE_VALS)
+  if comfort:
+    comfort_accel = np.clip(get_cruise_comfort_accel(v_cruise, v_ego, accel_coast), A_CRUISE_MIN, max_accel)
+    target_accel = np.interp(v_ego, CRUISE_COMFORT_BP, [target_accel, comfort_accel])
+  j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
   target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
   return target_accel
@@ -79,7 +104,8 @@ class LongitudinalPlanner:
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
-    if sm['controlsState'].forceDecel:
+    force_decel = sm['controlsState'].forceDecel
+    if force_decel:
       v_cruise = 0.0
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
@@ -104,8 +130,8 @@ class LongitudinalPlanner:
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
 
-    # No change cost when user is controlling the speed, or when standstill
-    prev_accel_constraint = not (reset_state or sm['carState'].standstill)
+    # No change cost when user is controlling the speed; it stays on through standstill so launches start smooth
+    prev_accel_constraint = not reset_state
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
@@ -130,14 +156,17 @@ class LongitudinalPlanner:
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
-    self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
+    # comfort shaping only for ordinary cruise with a healthy radar; lead following and e2e keep their own targets
+    experimental_mode = sm['selfdriveState'].experimentalMode
+    comfort = not experimental_mode and not force_decel and sm.all_checks(['radarState'])
+    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle)
+                                     accel_coast, self.allow_throttle, comfort)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
-    if sm['selfdriveState'].experimentalMode:
+    if experimental_mode:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])

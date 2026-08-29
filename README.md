@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 0 (branch cut from `stock`, design doc, honest test harness, longitudinal replay tooling) started 2026-08-29; nothing field-tested yet.**
+**Status: ⚠️ in progress — phase 1 (cruise layer) implemented 2026-08-29, awaiting the owner's field test; phase 0 (branch, docs, honest harness, replay tooling) done.**
 
 ## What it does
 
@@ -52,5 +52,16 @@ upstream uses for the planner, and the defects found in the 2026-08-28 review of
 
 ## What changed
 
-- Phase 0 (2026-08-29): branch cut from `stock` `511f2b60b4`; `docs/BLoTv3.md` added; no
-  driving code yet.
+- Phase 0 (2026-08-29): branch cut from `stock` `511f2b60b4`; `docs/BLoTv3.md` added; the
+  longitudinal maneuver harness got a real `all_checks()` shim, radar/model validity schedules,
+  `selfdriveState.enabled`, and three distinct, fully populated `leadsV3` messages.
+- Phase 1 (2026-08-29) — `openpilot/selfdrive/controls/lib/longitudinal_planner.py`: the cruise
+  acceleration ceiling is the continuous cubic envelope `0.6 + 3.4 (1 − v/40)³`, clamped by the
+  deployed opendbc `ACCEL_MAX`; the jerk schedule is `[2.0, 1.6, 1.0, 0.6] m/s³`; ordinary Chill
+  cruise above 15 m/s uses the proportional comfort target (5 mph ≈ 0.40 m/s², pitch-compensated
+  coast on reductions, blended in from 8 m/s) whenever the radar is healthy; the turn budget is
+  `max(envelope, stock [1.7, 3.2])` so a straight launch is never clipped but cornering consumes it
+  again; the MPC's acceleration-change cost stays on through standstill. Behavioral tests in
+  `openpilot/selfdrive/controls/tests/test_longitudinal_planner.py`. Replay against BLoTv2 on
+  route d7 segment 0: every cruise-candidate difference is the turn budget; lead-candidate
+  differences are phase 2's.
