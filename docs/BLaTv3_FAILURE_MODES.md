@@ -15,15 +15,17 @@ controller.
 
 Shape ("upstream-shaped controller"):
 - `LatControlRack(LatControl)` in one file `openpilot/selfdrive/controls/lib/latcontrol_rack.py`.
-- Selected in controlsd from `CP.flags & HyundaiFlags.RACK_TRAJECTORY`, set in opendbc's
-  `hyundai/interface.py:_get_params` from the LX platform code in `car_fw` (Telluride `ON`,
+- Selected in controlsd from `CP.lateralTuning.torque.useRackTrajectory`, which opendbc's
+  `hyundai/interface.py:_get_params` sets from the LX platform code in `car_fw` (Telluride `ON`,
   mixed, or empty firmware → stock). `lateralTuning` stays `torque` so torqued keeps learning.
   The raised 409/+4/−7 envelope (`BLATV2_HIGH_LIMITS`) is gated by the **same** firmware test.
 - Own `lateralControlState` union arm `rackState` (carries `saturated` for lagd, a `fallback`
   flag, status, `t_p`, planned/measured rack state, FF/P/D terms, restriction reason).
 - Owns a stock `LatControlTorque` that runs in shadow every frame with `active = CC.latActive`
-  (so its integrator is warm) while its output is discarded; any invalidation hands the frame
-  to it (never zero torque). Two booleans, never one: `car_is_steering` vs `rack_is_driving`.
+  while its output is discarded; any invalidation hands the frame to it (never zero torque).
+  Phase 1 keeps BLaTv2's semantics: the shadow's request buffer, jerk filter and the shared
+  saturation timer are warm, its integrator starts clean on handover; hysteresis on the handover
+  (R6, FM5.2) and a warm integrator arrive with the phase-2 staleness rework.
 - modeld publishes a short curvature preview on `ModelDataV2.Action` next to
   `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar.
 

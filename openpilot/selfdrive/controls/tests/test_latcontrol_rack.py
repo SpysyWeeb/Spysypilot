@@ -364,16 +364,23 @@ class TestLatControlRack(OpenpilotTestCase):
       stock.update(True, CS, VM, params, False, curvature, False, 0.2)
       stock.pid.reset()
       assert not rack_log.fallback
+      assert not rack_log.saturated
+      # one saturation timer, shared with the idle stock controller
+      assert controller.torque.sat_time == controller.sat_time
 
     # the model goes stale: every fallback frame is exactly what the stock controller would have done
     mono_ns = model.timestampEof + 500_000_000
-    for _ in range(50):
+    for frame in range(50):
       torque, _, rack_log = controller.update(True, CS, VM, params, False, 0.004, False, 0.2, model=model, mono_time_ns=mono_ns)
       stock_torque, _, stock_log = stock.update(True, CS, VM, params, False, 0.004, False, 0.2)
       assert controller.rack.status == STATUS_STALE_MODEL
       assert rack_log.fallback
       assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
       assert math.isclose(rack_log.f, stock_log.f, rel_tol=0.0, abs_tol=1e-12)
+      assert controller.torque.sat_time == controller.sat_time
+      if frame == 0:
+        # the rack controller never saturated, so the handover must not report saturation from the idle stock controller
+        assert not rack_log.saturated
 
   def test_reset_clears_rack_state_and_output(self):
     controller, _, VM = get_rack_controller()

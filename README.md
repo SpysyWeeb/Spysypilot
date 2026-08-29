@@ -37,11 +37,16 @@ builds, never past a refuge island.
 ## What changed
 
 - `openpilot/selfdrive/controls/lib/latcontrol_rack.py` — `LatControlRack(LatControl)`: steers with
-  the rack trajectory controller when it has a request and with a stock `LatControlTorque` (stepped
-  every frame, so it is warm) when it does not; logs into `lateralControlState.rackState`.
+  the rack trajectory controller when it has a request and with a stock `LatControlTorque` when it
+  does not. The stock controller is stepped every frame so its request buffer and jerk filter follow
+  the live history and the two share one saturation timer; as in BLaTv2, its integrator starts clean
+  when it takes over. Logs into `lateralControlState.rackState`.
 - `openpilot/selfdrive/controls/lib/rack_trajectory.py` — BLaTv2's controller math (reference
   compile, jerk-limited rack planner, reversal governor, rate estimator, torque tail) moved unchanged
-  into one module; only its re-export facade, an unused parameter and a test-only helper were dropped.
+  into one module: the class is renamed `RackTrajectoryController`, the one-line `_measured_rate`
+  wrapper is inlined at its call, and the re-export facade, an unused governor parameter and the
+  test-only `model_path_target` helper are dropped. Replay against combo's controller on two field
+  routes (312,983 frames) is bit-exact.
 - `openpilot/selfdrive/controls/controlsd.py` — selects `LatControlRack` when
   `CarParams.lateralTuning.torque.useRackTrajectory` is set and fills the `rackState` union arm; no
   brand-specific imports, no `isinstance` hooks.

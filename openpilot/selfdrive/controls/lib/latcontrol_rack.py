@@ -6,7 +6,9 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import RackTrajectoryContr
 # Executes the model path as a planned rack motion (see rack_trajectory.py) and tracks it with
 # torque. A stock torque controller is stepped alongside every frame, so any frame the rack
 # controller cannot produce a request for (no or stale model, invalid path, infeasible plan)
-# is steered by stock instead of dropping torque.
+# is steered by stock instead of dropping torque. Its request buffer and jerk filter follow the
+# live history; its integrator starts clean when it takes over, and the two controllers share
+# one steering saturation timer.
 
 VERSION = 1
 
@@ -40,10 +42,12 @@ class LatControlRack(LatControl):
     rack_log.status = self.rack.status
     if self.output is None:
       # steered by the stock controller this frame
+      self.sat_time = self.torque.sat_time
       rack_log.active = stock_log.active
       rack_log.fallback = bool(active)
       rack_log.error = stock_log.error
       rack_log.p = stock_log.p
+      rack_log.d = stock_log.d
       rack_log.f = stock_log.f
       rack_log.output = stock_log.output
       rack_log.actualLateralAccel = stock_log.actualLateralAccel
@@ -52,7 +56,7 @@ class LatControlRack(LatControl):
       rack_log.saturated = stock_log.saturated
       return stock_torque, 0.0, rack_log
 
-    # the stock controller is idle while the rack controller steers; if it has to take over it starts clean
+    # the stock controller is idle while the rack controller steers; its integrator starts clean if it takes over
     self.torque.pid.reset()
     output = self.output
     rack_log.active = True
@@ -82,4 +86,5 @@ class LatControlRack(LatControl):
     rack_log.profileTransition = bool(output.profile_transition)
     rack_log.saturated = bool(self._check_saturation(output.saturated or self.steer_max - abs(output.torque) < 1e-3, CS,
                                                      steer_limited_by_safety, curvature_limited))
+    self.torque.sat_time = self.sat_time
     return output.torque, output.planned_angle_deg, rack_log

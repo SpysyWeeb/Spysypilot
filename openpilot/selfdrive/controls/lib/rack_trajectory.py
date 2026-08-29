@@ -398,7 +398,9 @@ STATUS_INVALID_PATH = 7
 STATUS_INVALID_OUTPUT = 8
 STATUS_INVALID_PLANNER_STATE = 9
 
-# Coherent-motion corpus: p99 rate/acceleration and p95 jerk by speed.
+# Coherent-motion corpus: p99 rate/acceleration and p95 jerk by speed. Re-derived from the owner's
+# routes in docs/BLaTv3_FAILURE_MODES.md (FM2.6): the rate rows are the p99 steering-angle rate over
+# all driving; the acceleration rows match no population. Retired by the learned rack-effort surfaces.
 _SPEED_PROFILE_MPH = np.asarray([7.25, 12.5, 17.5, 22.5, 30.0, 45.0])
 _RATE_PROFILE_DEG_S = np.asarray([315.848, 289.402, 128.744, 77.716, 35.104, 21.057])
 _ACCEL_PROFILE_DEG_S2 = np.asarray([891.046, 827.645, 561.569, 334.476, 172.041, 97.740])
