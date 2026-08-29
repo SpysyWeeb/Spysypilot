@@ -11,7 +11,7 @@ from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import MAX_LATERAL_ACCEL_NO_ROLL
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
-from openpilot.selfdrive.controls.lib.latcontrol_rack import LatControlRack
+from openpilot.selfdrive.controls.lib.latcontrol_rack import FALLBACK_HOLD_S, LatControlRack
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   HORIZON_ACCELERATION_BLEND,
   HORIZON_OFFSETS_S,
@@ -36,6 +36,8 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   STATUS_INVALID_VEHICLE_STATE,
   STATUS_NO_MODEL,
   STATUS_STALE_MODEL,
+  INACTIVE_HOLD_FRAMES,
+  STALE_MODEL_S,
 )
 
 
@@ -251,7 +253,7 @@ class TestLatControlRack(OpenpilotTestCase):
       horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0, 0.0, math.nan, 0.0, 0.0, 0.0], [5.0] * 6),
     )
     cases = tuple((path, 1_050_000_000, STATUS_INVALID_PATH) for path in invalid_paths) + (
-      (valid, 1_200_000_001, STATUS_STALE_MODEL),
+      (valid, 1_600_000_001, STATUS_STALE_MODEL),
     )
     for invalid, mono_ns, expected_status in cases:
       controller = RackTrajectoryController()
@@ -380,7 +382,7 @@ class TestLatControlRack(OpenpilotTestCase):
       assert controller.torque.sat_time == controller.sat_time
 
     # the model goes stale: every fallback frame is exactly what the stock controller would have done
-    mono_ns = model.timestampEof + 500_000_000
+    mono_ns = model.timestampEof + 600_000_000
     for frame in range(50):
       torque, _, rack_log = controller.update(True, CS, VM, params, False, 0.004, False, 0.2, model=model, mono_time_ns=mono_ns)
       stock_torque, _, stock_log = stock.update(True, CS, VM, params, False, 0.004, False, 0.2)
@@ -400,6 +402,158 @@ class TestLatControlRack(OpenpilotTestCase):
     assert controller.torque.torque_params.latAccelOffset == 0.125
     assert controller.torque.torque_params.friction == 0.25
 
+  def _curve_model(self):
+    model = messaging.new_message("modelV2").modelV2
+    model.timestampEof = 1_000_000_000
+    model.action.desiredCurvature = 0.002
+    model.action.desiredCurvatureTime = 0.5
+    model.orientationRate.t = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+    model.orientationRate.z = [0.03] * 6
+    model.velocity.x = [15.0] * 6
+    return model
+
+  def test_dropped_model_frames_keep_the_last_plan(self):
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = self._curve_model()
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    planner = controller.rack.planner
+
+    # dropped model frames inside the stale window: the last plan is kept and advanced
+    for frame in range(1, 4):
+      _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=None, mono_time_ns=1_050_000_000 + frame * 10_000_000)
+      assert rack_log.status == STATUS_ACTIVE
+      assert not rack_log.fallback
+      assert controller.rack.planner is planner
+
+    # beyond the window the stock controller takes over and the rack starts over
+    stale_ns = 1_000_000_000 + int(STALE_MODEL_S * 1e9) + 10_000_000
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=None, mono_time_ns=stale_ns)
+    assert rack_log.fallback
+    assert rack_log.status == STATUS_STALE_MODEL
+    assert controller.rack.planner is None
+
+  def test_fallback_holds_before_the_rack_resumes(self):
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = self._curve_model()
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    stale_ns = 1_000_000_000 + int(STALE_MODEL_S * 1e9) + 10_000_000
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=stale_ns)
+    assert rack_log.fallback
+
+    # a fresh model the very next frame does not hand control back until the hold has elapsed
+    hold_frames = int(FALLBACK_HOLD_S / DT_CTRL)
+    for frame in range(hold_frames):
+      model.timestampEof = stale_ns + frame * 10_000_000
+      _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=model.timestampEof)
+      assert rack_log.fallback
+    model.timestampEof = stale_ns + hold_frames * 10_000_000
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=model.timestampEof)
+    assert not rack_log.fallback
+    assert rack_log.status == STATUS_ACTIVE
+
+  def test_short_inactive_blip_keeps_the_planned_rack(self):
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = self._curve_model()
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    planner = controller.rack.planner
+
+    # controlsd resets the controller before every inactive frame, e.g. across the standstill gate
+    for _ in range(INACTIVE_HOLD_FRAMES):
+      controller.reset()
+      torque, _, rack_log = controller.update(False, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+      assert torque == 0.0
+      assert not rack_log.active
+    assert controller.rack.planner is planner
+
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_060_000_000)
+    assert controller.rack.planner is planner
+    assert controller.rack.status == STATUS_ACTIVE
+
+    for _ in range(INACTIVE_HOLD_FRAMES + 1):
+      controller.reset()
+    assert controller.rack.planner is None
+
+  def test_content_fault_hands_back_on_the_next_good_frame(self):
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = self._curve_model()
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+
+    # one garbage model frame is steered by stock; a good frame right after resumes the rack without a hold
+    model.orientationRate.z = [0.03, 0.03, math.nan, 0.03, 0.03, 0.03]
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_060_000_000)
+    assert rack_log.fallback
+    assert rack_log.status == STATUS_INVALID_PATH
+    model.orientationRate.z = [0.03] * 6
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_070_000_000)
+    assert not rack_log.fallback
+    assert rack_log.status == STATUS_ACTIVE
+
+  def test_held_plan_follows_the_wheel_through_a_blip(self):
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = self._curve_model()
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    held_position = controller.rack.planner.position_deg
+
+    # the wheel moves 3 degrees while the plan is held: the plan is carried along on resumption
+    for _ in range(3):
+      controller.reset()
+      controller.update(False, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    CS.steeringAngleDeg = 3.0
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_090_000_000)
+    assert controller.rack.planner is not None
+    assert abs(controller.rack.planner.position_deg - held_position - 3.0) < 0.1
+
+    # the same, with the driver's hand on the wheel as the plan resumes: the motion is carried once, not twice
+    controller, _, VM = get_rack_controller()
+    CS.steeringAngleDeg = 0.0
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    held_position = controller.rack.planner.position_deg
+    for _ in range(3):
+      controller.reset()
+      controller.update(False, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    CS.steeringAngleDeg = 3.0
+    CS.steeringPressed = True
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_090_000_000)
+    assert abs(controller.rack.planner.position_deg - held_position - 3.0) < 0.1
+
+  def test_blip_during_a_fallback_hold_keeps_the_hold(self):
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = self._curve_model()
+    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    stale_ns = 1_000_000_000 + int(STALE_MODEL_S * 1e9) + 10_000_000
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=stale_ns)
+    assert rack_log.fallback
+
+    # an inactive blip inside the hold pauses it rather than ending it
+    controller.reset()
+    controller.update(False, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=stale_ns)
+    model.timestampEof = stale_ns
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=stale_ns)
+    assert rack_log.fallback
+    # a real disengage ends it
+    for _ in range(INACTIVE_HOLD_FRAMES + 1):
+      controller.reset()
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=stale_ns)
+    assert not rack_log.fallback
+
   def test_reset_clears_rack_state_and_output(self):
     controller, _, VM = get_rack_controller()
     CS = car.CarState.new_message()
@@ -416,9 +570,17 @@ class TestLatControlRack(OpenpilotTestCase):
     assert controller.rack.status == STATUS_ACTIVE
     assert controller.output is not None
 
+    # one inactive frame holds the planned rack; a real disengage clears it
     controller.reset()
     assert controller.rack.status == STATUS_INACTIVE
+    assert controller.rack.planner is not None
+    assert controller.output is None
+    for _ in range(INACTIVE_HOLD_FRAMES):
+      controller.reset()
     assert controller.rack.planner is None
+    assert controller.rack.reference_governor.accepted is None
+    assert controller.rack.rack_rate_estimator.previous_angle_deg is None
+    assert controller.rack.jerk_filter.x == 0.0
     assert controller.output is None
 
   # ---- behaviors carried over from BLaTv2's test_rack_trajectory_controller.py ----
