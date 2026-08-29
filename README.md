@@ -143,7 +143,10 @@ and [`docs/BLoTv2_ACCEPTANCE.md`](docs/BLoTv2_ACCEPTANCE.md).
 **Status: in progress; replay-qualified, not field-approved.** `controlsd` uses
 the current rack-trajectory controller only when the shared Palisade/Telluride
 platform has queried `LX` firmware. Telluride `ON` and unknown firmware remain
-on stock `LatControlTorque`.
+on stock `LatControlTorque`. At runtime, any frame the rack controller cannot
+produce a request for (no or stale model, invalid path, infeasible plan) is
+steered by the stock torque controller rather than zero torque, and a model plan
+that stops inside the horizon is a complete path, not a fault.
 
 The former modular BLaTv2 stack and its design documents remain historical
 research; they are not the live command owner. The current controller owns one
@@ -177,6 +180,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Model curve speed limit](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — uses the model path and three owner-driven calibration points to cap cruise through curves, with spatial/temporal prediction-spike filtering and simple lookahead braking; see [docs/ModelCurveSpeedLimit.md](docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea)*
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
 - ⚠️ **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — Palisade `LX`-scoped rack-trajectory controller with model-authored timing, bounded motion planning, driver-override release, and stock fallback for Telluride/unknown firmware; still awaiting owner field validation &nbsp;*(personal idea; in progress)*
+- ⚠️ **[Better lateral tune v3 (BLaTv3)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv3)** — ground-up rewrite of the Palisade rack-trajectory controller in the upstream controller shape (`LatControlRack`, opendbc firmware flag, own log union arm, warm stock fallback), designed from a written failure-mode catalog; keeps the model as path authority, turn-in/unwind boost as feedforward physics, and a scheduled 2 s preview that never overrides the near target, and replaces the static comfort-envelope tables with two learned rack-effort surfaces (hold torque, rate gain); see [docs/BLaTv3_FAILURE_MODES.md](https://github.com/SpysyWeeb/Spysypilot/blob/BLaTv3/docs/BLaTv3_FAILURE_MODES.md) &nbsp;*(personal idea; phase 0 — no controller code yet)*
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_
