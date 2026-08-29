@@ -387,6 +387,8 @@ HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .5
+STALE_MODEL_S = 0.5  # SubMaster's alive window for modelV2: ten model frames
+INACTIVE_HOLD_FRAMES = 5  # keep the planned rack through a short latActive blip, e.g. at the standstill gate
 
 STATUS_INACTIVE = 0
 STATUS_ACTIVE = 1
@@ -441,6 +443,7 @@ class RackTrajectoryController:
     self.dt = dt
     self.model = None
     self.state_mono_ns = 0
+    self.inactive_frames = 0
     self.planner: JerkLimitedRackPlanner | None = None
     self.transition_rate_limit: float | None = None
     self.transition_acceleration_limit: float | None = None
@@ -452,8 +455,17 @@ class RackTrajectoryController:
     self.rack_rate_estimator = RackRateEstimator(dt)
 
   def set_model(self, model, state_mono_ns: int) -> None:
-    self.model = model
+    # a dropped or invalid model frame keeps the last good plan; staleness is judged by its age
+    if model is not None:
+      self.model = model
     self.state_mono_ns = int(state_mono_ns)
+
+  def hold(self) -> None:
+    # inactive for a frame: keep the planned rack through a short blip, start over after a real disengage
+    self.inactive_frames += 1
+    self.status = STATUS_INACTIVE
+    if self.inactive_frames > INACTIVE_HOLD_FRAMES:
+      self.reset()
 
   def reset(self) -> None:
     self.planner = None
@@ -529,8 +541,9 @@ class RackTrajectoryController:
   def update(self, active: bool, CS, VM, params, torque_params, torque_from_lateral_accel: Callable[[float, object], float],
              lat_delay: float, desired_curvature: float) -> RackTrajectoryOutput | None:
     if not active:
-      self.reset()
+      self.hold()
       return None
+    self.inactive_frames = 0
     if self.model is None:
       self._invalidate(STATUS_NO_MODEL)
       return None
@@ -541,7 +554,7 @@ class RackTrajectoryController:
       self._invalidate(STATUS_INVALID_VEHICLE_STATE)
       return None
     model_age_s = (self.state_mono_ns - int(self.model.timestampEof)) * 1e-9
-    if not 0.0 <= model_age_s <= .2:
+    if not 0.0 <= model_age_s <= STALE_MODEL_S:
       self._invalidate(STATUS_STALE_MODEL)
       return None
 

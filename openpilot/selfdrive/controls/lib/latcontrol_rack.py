@@ -8,9 +8,11 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import RackTrajectoryContr
 # controller cannot produce a request for (no or stale model, invalid path, infeasible plan)
 # is steered by stock instead of dropping torque. Its request buffer and jerk filter follow the
 # live history; its integrator starts clean when it takes over, and the two controllers share
-# one steering saturation timer.
+# one steering saturation timer. Once stock has taken over it keeps steering for a hold time, so
+# the two controllers cannot trade places every frame around a threshold.
 
 VERSION = 1
+FALLBACK_HOLD_S = 0.5
 
 
 class LatControlRack(LatControl):
@@ -18,6 +20,8 @@ class LatControlRack(LatControl):
     super().__init__(CP, CI, dt)
     self.torque = LatControlTorque(CP, CI, dt)
     self.rack = RackTrajectoryController(dt)
+    self.fallback_hold_frames = int(FALLBACK_HOLD_S / dt)
+    self.fallback_frames = 0
     self.output = None
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
@@ -26,7 +30,8 @@ class LatControlRack(LatControl):
   def reset(self):
     super().reset()
     self.torque.reset()
-    self.rack.reset()
+    self.rack.hold()
+    self.fallback_frames = 0
     self.output = None
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay,
@@ -34,8 +39,17 @@ class LatControlRack(LatControl):
     stock_torque, _, stock_log = self.torque.update(active, CS, VM, params, steer_limited_by_safety, desired_curvature,
                                                     curvature_limited, lat_delay)
     self.rack.set_model(model, mono_time_ns)
-    self.output = self.rack.update(active, CS, VM, params, self.torque.torque_params, self.torque.torque_from_lateral_accel,
-                                   lat_delay, desired_curvature)
+    if not active:
+      self.output = None
+    elif self.fallback_frames > 0:
+      # stock keeps steering through the hold; the rack controller re-seeds when it resumes
+      self.fallback_frames -= 1
+      self.output = None
+    else:
+      self.output = self.rack.update(active, CS, VM, params, self.torque.torque_params, self.torque.torque_from_lateral_accel,
+                                     lat_delay, desired_curvature)
+      if self.output is None:
+        self.fallback_frames = self.fallback_hold_frames
 
     rack_log = log.ControlsState.LateralRackState.new_message()
     rack_log.version = VERSION
