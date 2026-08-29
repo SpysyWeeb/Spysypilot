@@ -42,22 +42,29 @@ SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
+LAT_PREVIEW_SECONDS = 2.0  # how far past the action time the curvature preview reaches
+LAT_PREVIEW_STEP_SECONDS = 0.25
+LAT_PREVIEW_OFFSETS = tuple(i * LAT_PREVIEW_STEP_SECONDS for i in range(round(LAT_PREVIEW_SECONDS / LAT_PREVIEW_STEP_SECONDS) + 1))
 BIG_MODEL_TIMEOUT = 60
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                           lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
-  if 'action' not in model_output:
+  preview_times = [lat_action_t + offset for offset in LAT_PREVIEW_OFFSETS]
+  plan_curvatures = []
+  if 'plan' in model_output:
     plan = model_output['plan'][0]
+    plan_curvatures = [get_curvature_from_plan(plan[:,Plan.T_FROM_CURRENT_EULER][:,2],
+                                               plan[:,Plan.ORIENTATION_RATE][:,2],
+                                               ModelConstants.T_IDXS,
+                                               v_ego,
+                                               t) for t in preview_times]
+  if 'action' not in model_output:
     desired_accel = get_accel_from_plan(plan[:,Plan.VELOCITY][:,0],
                                         plan[:,Plan.ACCELERATION][:,0],
                                         ModelConstants.T_IDXS,
                                         action_t=long_action_t)
-    desired_curvature = get_curvature_from_plan(plan[:,Plan.T_FROM_CURRENT_EULER][:,2],
-                                                plan[:,Plan.ORIENTATION_RATE][:,2],
-                                                ModelConstants.T_IDXS,
-                                                v_ego,
-                                                lat_action_t)
+    desired_curvature = plan_curvatures[0]
   else:
     desired_accel = model_output['action'][0,1]
     desired_curvature = model_output['action'][0,0] / (max(1.0, v_ego))**2
@@ -67,11 +74,18 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
     desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, LAT_SMOOTH_SECONDS)
   else:
     desired_curvature = prev_action.desiredCurvature
+  # the preview is pinned to the published curvature: its first sample is desiredCurvature and the
+  # rest carry the plan's curvature change past the action time, so a consumer never has to relate
+  # two definitions of curvature. Without a plan head there is no preview.
+  desired_curvature = float(desired_curvature)
+  preview = [desired_curvature + float(curvature - plan_curvatures[0]) for curvature in plan_curvatures]
 
-  return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
+  return log.ModelDataV2.Action(desiredCurvature=desired_curvature,
                                 desiredAcceleration=float(desired_accel),
                                 shouldStop=bool(stop),
-                                desiredCurvatureTime=float(lat_action_t))
+                                desiredCurvatureTime=float(lat_action_t),
+                                desiredCurvaturePreview=preview,
+                                desiredCurvaturePreviewTimes=[float(t) for t in preview_times] if preview else [])
 
 
 class ChestnutState:
