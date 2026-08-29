@@ -5,7 +5,7 @@ import pytest
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DV_MAX, ForceStops, GAS_OVERRIDE_S, LATCH_SETBACK,
-                                                           MPC_PROFILE_OFFSET, NO_CAP, QUALIFY_S)
+                                                           MPC_PROFILE_OFFSET, NO_CAP, QUALIFY_S, REARM_S)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, StopObservation
 
@@ -130,6 +130,14 @@ class TestMovingReleases:
 
 
 class TestHold:
+  def test_a_hold_needs_a_commitment_or_a_recent_release(self):
+    fs = ForceStops()
+    assert not run(fs, 2.0, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+    fs, _ = holding()
+    run(fs, 0.05, obs(path_end=4.0, lead=True, relevant=True), car_state(0.0, standstill=True))
+    run(fs, REARM_S + 0.5, obs(path_end=90.0, should_stop=False, braking=False, moving=True), car_state(0.0, standstill=True))
+    assert not run(fs, 0.5, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
   def test_standstill_turns_a_commitment_into_a_hold(self):
     _, result = holding()
     assert result.holding and result.v_cruise_cap == 0.0 and result.stop_x is not None and result.stop_x >= -STOP_DISTANCE

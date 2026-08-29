@@ -114,8 +114,14 @@ class TestRelease:
 
   def test_malformed_paths_and_hypotheses_fail_closed(self):
     md = model(path_end=40.0, leads=((0.0, 20.0, 0.0),) * 3)
-    md.position.x = [1.0] * N
+    md.position.x = [float(N - i) for i in range(N)]
     assert not leads_clear_of_stop_path(md, 40.0)
+    # a flat path is what the model publishes at standstill; a lead straight ahead still blocks, one beside does not
+    flat = model(path_end=40.0, leads=((0.5, 10.0, 0.5), (0.0, 20.0, 0.0), (0.0, 20.0, 0.0)))
+    flat.position.x = [0.0] * N
+    assert not leads_clear_of_stop_path(flat, 0.0)
+    flat.leadsV3[0].y = [3.0] * len(ModelConstants.LEAD_T_IDXS)
+    assert leads_clear_of_stop_path(flat, 0.0)
     assert not leads_clear_of_stop_path(model(path_end=40.0, leads=((0.0, 20.0, 0.0),) * 2), 40.0)
     md = model(path_end=40.0, leads=((0.5, 20.0, 5.0),) * 3)
     md.leadsV3[0].x = [20.0] * 3

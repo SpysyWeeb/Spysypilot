@@ -9,7 +9,6 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 STOP_PREDICTION_HORIZON_S = 5.0
 STOP_PATH_MIN_DISTANCE = 4.0
 STOP_TERMINAL_SPEED_MAX = 1.0
-STOP_FALLBACK_ACCEL_MAX = -0.5
 
 # at urban speed the strict tier recognizes a stop too late for a comfortable approach; the early tier
 # reads the shape of the intent instead, on straight, unsignaled, lead-free approaches only
@@ -29,7 +28,6 @@ STOP_EARLY_HINT_ENTRY_MAX_SPEED = 22.0
 STOP_DIRECT_CONFIDENCE = 1.0
 STOP_TRAJECTORY_CONFIDENCE = 0.85
 STOP_EARLY_CONFIDENCE = 0.80
-STOP_FALLBACK_CONFIDENCE = 0.70
 STOP_EARLY_HINT_CONFIDENCE = 0.45
 STOP_EARLY_HINT_ENTRY_CONFIDENCE = 0.70
 STOP_SAMPLE_MIN_CONFIDENCE = 0.70
@@ -84,7 +82,7 @@ def leads_clear_of_stop_path(model, path_end):
   path_x, path_y, leads = list(model.position.x), list(model.position.y), model.leadsV3
   n_lead = len(ModelConstants.LEAD_T_IDXS)
   if (len(path_x) != ModelConstants.IDX_N or len(path_y) != ModelConstants.IDX_N or len(leads) != ModelConstants.LEAD_MHP_SELECTION
-      or not _finite(path_x) or not _finite(path_y) or any(b <= a for a, b in zip(path_x, path_x[1:], strict=False))):
+      or not _finite(path_x) or not _finite(path_y) or any(b < a for a, b in zip(path_x, path_x[1:], strict=False))):
     return False
   for lead in leads:
     lead_x, lead_y = list(lead.x), list(lead.y)
@@ -104,7 +102,8 @@ def leads_clear_of_stop_path(model, path_end):
         center = path_y[-1]
       else:
         i = next(i for i, px in enumerate(path_x) if px >= x)
-        center = path_y[i - 1] + (x - path_x[i - 1]) / (path_x[i] - path_x[i - 1]) * (path_y[i] - path_y[i - 1])
+        span = path_x[i] - path_x[i - 1]
+        center = path_y[i - 1] + (x - path_x[i - 1]) / span * (path_y[i] - path_y[i - 1]) if span > 0.0 else path_y[i]
       if abs(y - center) <= LEAD_STOP_PATH_HALF_WIDTH:
         return False
   return True

@@ -2,7 +2,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import lead_present
 from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_COMMIT_MAX_DISTANCE, STOP_SAMPLE_MIN_CONFIDENCE,
-                                                           StopObservation, observe_model_stop)
+                                                           StopObservation, model_complete_and_finite, observe_model_stop)
 
 # Requests Experimental mode for a confirmed, lead-free model stop so the e2e candidate can plan the
 # approach; it never chooses a speed, an acceleration, a brake command or a stop point.
@@ -42,6 +42,7 @@ class ConditionalExperimentalMode:
     self._lead_release_active = False
     self._post_stop_remaining = 0.0
     self._override_remaining = 0.0
+    self._model_complete = True
 
   def _clear_evidence(self):
     self.intent_filter.x = 0.0
@@ -62,6 +63,7 @@ class ConditionalExperimentalMode:
   def _update_model_evidence(self, model, car_state, radar_state, model_valid):
     obs = observe_model_stop(model, car_state, radar_state) if model_valid else StopObservation()
     self.last_observation = obs
+    self._model_complete = obs.complete or not model_valid
 
     # a relevant lead vetoes a new handoff and starts a grace; during it one strict frame may mint a revocable release
     # if both raw leads are gone and every model lead hypothesis is outside the stop corridor
@@ -108,7 +110,9 @@ class ConditionalExperimentalMode:
       self._clear_evidence()
       return False
 
-    self._invalid_elapsed = 0.0 if model_valid else self._invalid_elapsed + self.control_dt
+    if model_updated and model_valid and not model_complete_and_finite(model):
+      self._model_complete = False
+    self._invalid_elapsed = 0.0 if model_valid and self._model_complete else self._invalid_elapsed + self.control_dt
     if lead_present(radar_state) or not model_valid or not radar_valid:
       # a raw lead on any control tick revokes a pending recent-lead release; entry evidence itself is only judged on model frames
       self._lead_release_active = False

@@ -43,6 +43,7 @@ QUALIFY_WORLD_TOLERANCE = 5.0
 RELEASE_RC = 0.30         # s, filter on the model's launch evidence while holding
 RELEASE_OPEN_THRESHOLD = 0.70
 RESUME_SPEED = 0.8        # m/s, above this a hold becomes a moving commitment again
+REARM_S = 10.0            # s, after a lead or a gas tap breaks a hold, stopping again with stop evidence re-enters it directly
 CLEAR_WINDOW_S = 4.0      # s, fallback release while holding: mostly clear, moving, lead-free model frames
 CLEAR_WINDOW_FRACTION = 0.8
 NO_CAP = math.inf
@@ -65,6 +66,7 @@ class ForceStops:
     self.clear_window = deque(maxlen=round(CLEAR_WINDOW_S / dt))
     self.override_timer = 0.0
     self.invalid_s = 0.0
+    self.rearm_remaining = 0.0
     self.reset()
 
   def reset(self):
@@ -89,9 +91,9 @@ class ForceStops:
       return ForceStopsResult(max(cap, v_ego - DV_MAX), max(self.remaining, -STOP_DISTANCE), False)
     return ForceStopsResult()
 
-  def _qualify(self, obs, v_ego):
+  def _qualify(self, obs, v_ego, tracking_lead):
     # one second of strict, lead-free stop evidence on a world-fixed endpoint commits before the classic window
-    if not (obs.strict_stop and not obs.lead_present and not obs.committed_turn and 0.0 < obs.path_end < STOP_COMMIT_MAX_DISTANCE):
+    if not (obs.strict_stop and not tracking_lead and not obs.committed_turn and 0.0 < obs.path_end < STOP_COMMIT_MAX_DISTANCE):
       self.qualified_s = 0.0
       self.qualified_endpoint = None
       return False
@@ -106,14 +108,18 @@ class ForceStops:
   def update(self, obs, CS, experimental_mode, enabled, model_valid):
     if not math.isfinite(CS.vEgo) or CS.brakePressed or not enabled:
       self.reset()
+      self.rearm_remaining = 0.0
       return ForceStopsResult()
     v_ego = max(CS.vEgo, 0.0)
 
     if CS.gasPressed:
       self.override_timer = GAS_OVERRIDE_S
+      if self.holding:
+        self.rearm_remaining = REARM_S
       self.reset()
       return ForceStopsResult()
     self.override_timer = max(self.override_timer - self.dt, 0.0)
+    self.rearm_remaining = max(self.rearm_remaining - self.dt, 0.0)
 
     # the mode gates entry only; a later mode exit never strips a commitment or a hold
     if not (self.forcing or self.holding) and not experimental_mode:
@@ -141,7 +147,7 @@ class ForceStops:
       self.reset()
       return ForceStopsResult()
 
-    qualified = self._qualify(obs, v_ego)
+    qualified = self._qualify(obs, v_ego, tracking_lead)
     committed_length = max(model_length - LATCH_SETBACK, 0.0)
     stop_time = EARLY_STOP_TIME if obs.braking else MODEL_STOP_TIME
     model_stopping = 0.0 < model_length < max(v_ego * stop_time, MIN_STOP_LENGTH)
@@ -154,8 +160,9 @@ class ForceStops:
     if detected:
       self.position_hold_remaining = STOP_POSITION_HOLD_S
 
-    if CS.standstill and (self.forcing or (detected and not obs.committed_turn)):
-      # the stop is reached (or re-reached after a lead or a gas tap): hold it until the model plans a launch
+    if CS.standstill and (self.forcing or (self.rearm_remaining > 0.0 and detected and not obs.committed_turn)):
+      # the stop is reached, or re-reached shortly after a lead or a gas tap broke the hold: hold it until the model plans a launch
+      self.rearm_remaining = 0.0
       self.holding = True
       self.forcing = False
       self.remaining = min(self.remaining, 0.0) if self.remaining > 0.0 else self.remaining
@@ -200,6 +207,7 @@ class ForceStops:
       return self._result(v_ego)
     if obs.relevant_lead:
       self.reset()
+      self.rearm_remaining = REARM_S
       return ForceStopsResult()
     self.release_filter.update(1.0 if obs.release_open else 0.0)
     stop_evidence = obs.should_stop or obs.strict_stop

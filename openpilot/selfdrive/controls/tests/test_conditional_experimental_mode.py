@@ -150,6 +150,13 @@ class TestExitAndHold:
     assert run(cem, MODEL_INVALID_RELEASE_S - 0.1, stop_model(), model_valid=False, model_updates=False)
     assert not run(cem, 0.2, stop_model(), model_valid=False, model_updates=False)
 
+  def test_a_nonfinite_trajectory_counts_as_an_invalid_model(self):
+    cem = self.entered()
+    broken = stop_model()
+    broken.velocity.x = [float('nan')] * N
+    assert run(cem, MODEL_INVALID_RELEASE_S - 0.1, broken)
+    assert not run(cem, 0.2, broken)
+
   def test_disable_resets_to_chill(self):
     cem = self.entered()
     assert not run(cem, 0.05, stop_model(), enabled=False)

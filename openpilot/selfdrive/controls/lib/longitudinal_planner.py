@@ -158,7 +158,7 @@ class LongitudinalPlanner:
 
     experimental_mode = sm['selfdriveState'].experimentalMode
     stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
-    force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, sm['selfdriveState'].enabled, model_valid)
+    force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, not reset_state, model_valid)
     stop_x = force_stop.stop_x if force_stop.stop_x is not None and math.isfinite(force_stop.stop_x) else None
     v_cruise = min(v_cruise, force_stop.v_cruise_cap)
 
