@@ -34,7 +34,12 @@ Quick start: `bash <(curl -fsSL openpilot.comma.ai)`
 **In progress; replay-qualified, not field-approved.** This branch selects the
 rack-trajectory lateral controller only for the shared Palisade/Telluride
 platform when queried firmware identifies the Palisade `LX` family. Telluride
-`ON` and unknown firmware fail closed to the stock torque controller.
+`ON` and unknown firmware fail closed to the stock torque controller. At runtime,
+any frame the rack controller cannot produce a request for (no or stale model,
+invalid path, infeasible plan) is steered by the stock torque controller rather
+than zero torque; `lateralControlState.torqueState.version` reads 1 on those frames
+and `rackTrajectoryState.status` names the reason. A model plan that stops inside
+the horizon is a complete path, not a fault.
 
 The rack controller owns the normalized steering request; opendbc and panda
 remain the final platform/safety authorities. This superproject pins the reviewed
