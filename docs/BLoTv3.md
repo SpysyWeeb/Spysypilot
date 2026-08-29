@@ -176,3 +176,26 @@ flickering model stop signal while holding never drops `shouldStop`; grade flick
 `committed`; lead passes through then fast re-entry; gas tap re-stop; CEM entry with a far lead;
 model hang releases within 0.5 s; pedal latency; the selfdrived hook keeps manual mode under
 override.
+
+## 8. Field test log
+
+**2026-08-29, route 23 (combo 83ccd10ab5), Palisade.** Owner: "accelerating out of a curve feels held back"; "at
+stops with a lead, when it was time to accelerate, it felt like a harsh jolt rather than a smooth and quick
+switch"; no difference noticed otherwise.
+
+- Curve: the lateral turn budget (D2) was the only thing clipping cruise acceleration in bends. Removed.
+- Lead launch, from the rlog and the CAN bus (TCS13 / SCC12 / SCC14 decoded):
+  1. The car's ESP runs a fixed ~1.3–1.5 s standstill-exit sequence after `StopReq` drops, ignoring the
+     acceleration request, then snaps its own reference to ~0.4 m/s² *above* the request at ~11 m/s³. The lurch
+     therefore scales with whatever the plan asks at that instant; `JerkUpperLimit` does not gate it.
+  2. Every launch's request had already climbed to 1.3–1.8 m/s² by then because the hold released late:
+     `anchor_model_lead` rejected the lead's forecast on the −0.00…−0.04 m/s a stationary lead reads on both
+     sensors, so the anchor flapped through the launch, the departure forecast collapsed, the stop bit flickered,
+     the pre-release cancelled and the hold-release grace restarted. Fixed with a 0.2 m/s stationary-noise
+     tolerance (reversing still fails closed). Like-for-like replay of the four launches: sustained release
+     0.45–0.60 s earlier on three, stop-bit flicker 3 → 1, 37 short whole-route differences, all smoother.
+  3. Smooth Stops' extra 0.5 s hold-release grace for a stopped radar lead was pure launch latency on top of the
+     car's own sequence; removed on `smooth-stops` (10-frame debounce for every stop, immediate on a measured
+     departing lead).
+- Not changed: no launch-staging cap in LongControl — with the hold releasing ~0.9 s earlier the car should break
+  free while the plan is still 0.3–0.5 m/s². Reassess after the next drive.
