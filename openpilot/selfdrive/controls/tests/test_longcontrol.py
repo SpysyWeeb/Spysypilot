@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState, long_control_state_trans
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.smooth_stops import HOLD_RELEASE_FRAMES, LEAD_DROPOUT_GRACE
@@ -74,21 +73,6 @@ def hold_car_state():
 
 
 class TestSmoothStopLongControlIntegration(OpenpilotTestCase):
-  def test_final_command_honors_blotv2_platform_ceiling(self):
-    control = long_control()
-    CS = car_state(5.0)
-    CS.aEgo = -2.0
-    output = control.update(
-      True,
-      CS,
-      BLOTV2_ACCEL_MAX,
-      False,
-      (-3.5, 10.0),
-      LeadObservation(),
-    )
-    assert control.pid.pos_limit == BLOTV2_ACCEL_MAX
-    assert output == BLOTV2_ACCEL_MAX
-
   def test_engaged_rolling_stop_stays_in_pid_settle(self):
     control = long_control()
     output = control.update(

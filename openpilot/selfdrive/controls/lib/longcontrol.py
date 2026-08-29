@@ -3,7 +3,6 @@ from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
-from openpilot.selfdrive.controls.lib.blotv2 import BLOTV2_ACCEL_MAX
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.smooth_stops import SmoothStopController
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -53,7 +52,7 @@ class LongControl:
   def update(self, active, CS, a_target, should_stop, accel_limits, lead: LeadObservation | None = None):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     lead = lead if lead is not None else LeadObservation()
-    pos_limit = min(accel_limits[1], BLOTV2_ACCEL_MAX)
+    pos_limit = accel_limits[1]
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = pos_limit
 

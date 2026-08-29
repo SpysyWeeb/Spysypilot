@@ -821,10 +821,6 @@ struct SelfdriveState {
   # configurable driving settings
   experimentalMode @10 :Bool;
   personality @11 :LongitudinalPersonality;
-  conditionalStopQualified @14 :Bool;
-  conditionalStopDistance @15 :Float32;
-  conditionalStopModelMonoTime @16 :UInt64;
-  conditionalStopLatched @17 :Bool;
 
   enum AudibleAlert {
     none @0;
@@ -867,6 +863,10 @@ struct SelfdriveState {
 
   deprecated :group {
     alertSound @8 :Car.CarControl.HUDControl.AudibleAlert;
+    conditionalStopQualified @14 :Bool;
+    conditionalStopDistance @15 :Float32;
+    conditionalStopModelMonoTime @16 :UInt64;
+    conditionalStopLatched @17 :Bool;
   }
 }
 

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import numpy as np
 
 from opendbc.car.hyundai.values import CAR
+from openpilot.cereal import log
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
@@ -30,6 +31,7 @@ def make_model(curvature=None, position_x=None, position_y=None, speed=15.0):
   return SimpleNamespace(
     position=SimpleNamespace(x=position_x, y=position_y),
     velocity=SimpleNamespace(x=velocity_x),
+    orientation=SimpleNamespace(z=np.zeros(ModelConstants.IDX_N)),
     orientationRate=SimpleNamespace(z=curvature * velocity_x),
   )
 
@@ -250,7 +252,7 @@ class TestModelCurveSpeed(unittest.TestCase):
     model.acceleration = SimpleNamespace(x=np.zeros(ModelConstants.IDX_N))
     model.leadsV3 = []
     model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]),
-                                 laneChangeState=longitudinal_planner.log.LaneChangeState.off)
+                                 laneChangeState=log.LaneChangeState.off)
     model.action = SimpleNamespace(desiredAcceleration=1.0, shouldStop=False)
 
     class FakeSubMaster(dict):
