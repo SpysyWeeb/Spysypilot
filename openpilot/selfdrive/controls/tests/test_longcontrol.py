@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState, long_control_state_trans
-from openpilot.selfdrive.controls.lib.smooth_stops import LEAD_DROPOUT_GRACE
+from openpilot.selfdrive.controls.lib.smooth_stops import HOLD_RELEASE_FRAMES
 
 
 class TestLongControlStateTransition(OpenpilotTestCase):
@@ -62,6 +62,7 @@ def car_state():
 
 class TestSmoothStopRoute17Continuity(OpenpilotTestCase):
   def test_route17_plan_chatter_does_not_release_hold(self):
+    # plan chatter shorter than the release debounce never lets go of the hold, lead or not
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.last_output_accel = -0.75
@@ -69,8 +70,7 @@ class TestSmoothStopRoute17Continuity(OpenpilotTestCase):
 
     states = []
     outputs = []
-    release_s = LEAD_DROPOUT_GRACE - DT_CTRL
-    for should_stop in [True] * 20 + [False] * round(release_s / DT_CTRL) + [True] * 20:
+    for should_stop in [True] * 20 + [False] * (HOLD_RELEASE_FRAMES - 1) + [True] * 20:
       outputs.append(control.update(
         True, car_state(), -0.24, should_stop, (-3.5, 2.0),
         lead_distance=4.3, has_lead=True, lead_speed=0.262,
@@ -80,16 +80,17 @@ class TestSmoothStopRoute17Continuity(OpenpilotTestCase):
     assert set(states) == {LongCtrlState.stopping}
     assert all(output <= -0.75 for output in outputs)
 
-  def test_stopped_lead_dropout_release_is_bounded(self):
+  def test_stopped_lead_release_is_the_same_debounce(self):
+    # a stopped lead in radar view adds nothing to the wait: the car's own standstill exit already costs ~1.3 s
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.smooth.arm_hold()
 
     control.update(True, car_state(), 0.2, True, (-3.5, 2.0), has_lead=True)
-    for _ in range(round(LEAD_DROPOUT_GRACE / DT_CTRL) - 1):
-      control.update(True, car_state(), 0.2, False, (-3.5, 2.0))
+    for _ in range(HOLD_RELEASE_FRAMES - 1):
+      control.update(True, car_state(), 0.2, False, (-3.5, 2.0), has_lead=True)
       assert control.long_control_state == LongCtrlState.stopping
-    control.update(True, car_state(), 0.2, False, (-3.5, 2.0))
+    control.update(True, car_state(), 0.2, False, (-3.5, 2.0), has_lead=True)
     assert control.long_control_state == LongCtrlState.pid
 
   def test_measured_lead_departure_releases_immediately(self):
