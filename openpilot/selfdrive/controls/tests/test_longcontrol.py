@@ -1,6 +1,5 @@
 from types import SimpleNamespace
 
-from openpilot.common.realtime import DT_CTRL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState, long_control_state_trans
 from openpilot.selfdrive.controls.lib.smooth_stops import HOLD_RELEASE_FRAMES
