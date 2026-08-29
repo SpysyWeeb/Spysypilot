@@ -8,6 +8,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, ForceStopsResult
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LongitudinalPolicy
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
                                                                    A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
@@ -230,3 +231,16 @@ class TestPlannerCruise:
     plant.step(v_lead=15.0)
     assert plant.planner.supervisor.update().stand_down
     assert not plant.planner.fcw
+
+  def test_a_force_stops_hold_forces_should_stop_and_caps_cruise(self):
+    plant = Plant(speed=0.0, distance_lead=200.0, lead_relevancy=False, e2e=True)
+    plant.planner.force_stops.update = lambda *args: ForceStopsResult(0.0, 0.0, True)
+    plant.step(v_cruise=20.0)
+    assert plant.planner.output_should_stop
+    assert plant.planner.output_a_target <= 0.0
+
+  def test_a_nonfinite_stop_point_never_reaches_the_mpc(self):
+    plant = Plant(speed=10.0, distance_lead=200.0, lead_relevancy=False, e2e=True)
+    plant.planner.force_stops.update = lambda *args: ForceStopsResult(NO_CAP, float('nan'), False)
+    plant.step(v_cruise=20.0)
+    assert plant.planner.mpc.source != LongitudinalPlanSource.stop

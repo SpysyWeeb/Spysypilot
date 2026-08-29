@@ -2,7 +2,7 @@
 
 **Status: in progress. Not field validated. Do not mark complete before owner field testing and
 explicit approval.** Phase 0 done; phase 1 (cruise layer) implemented 2026-08-29 on `BLoTv3` and awaiting the owner's
-field test; phase 2 (lead layer) implemented on `BLoTv3-phase2`, merged after the phase 1 verdict.
+field test; phases 2 (lead layer) and 3 (stop layer) implemented on `BLoTv3-phase2`, merged one at a time after each field verdict.
 
 BLoTv3 restructures [BLoTv2](https://github.com/SpysyWeeb/Spysypilot/tree/BLoTv2) from `stock`.
 It keeps BLoTv2's tuned behavior where BLoTv2 was right and fixes the verified defects; it does
@@ -24,10 +24,10 @@ not add tuning knobs or toggles. Standalone BLoTv3 runs on the stock opendbc poi
 | Stop profile and standstill handoff | stock `longcontrol.py`; `smooth-stops` in `combo` |
 | Vehicle command limits / safety ceiling | opendbc / panda |
 
-Only `selfdriveState.experimentalMode` crosses processes. The BLoTv2 fields
-`SelfdriveState.conditionalStop{Qualified,Distance,ModelMonoTime,Latched}` are retired into a
-`deprecated` group so their ordinals stay reserved and BLoTv2-era logs stay readable.
-`LongitudinalPlanSource.stop` is kept.
+Only `selfdriveState.experimentalMode` crosses processes. Stock never had BLoTv2's
+`SelfdriveState.conditionalStop{Qualified,Distance,ModelMonoTime,Latched}` fields, so this branch adds
+nothing to `SelfdriveState`; on `combo` those fields move into a `deprecated` group at integration so
+their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 
 ## 2. Owner decisions (2026-08-29)
 

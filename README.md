@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 1 (cruise layer) implemented 2026-08-29 and awaiting the owner's field test on `BLoTv3`; phase 2 (lead layer) implemented on `BLoTv3-phase2`, to be merged after the phase 1 verdict.**
+**Status: ⚠️ in progress — phase 1 (cruise layer) implemented 2026-08-29 and awaiting the owner's field test on `BLoTv3`; phases 2 (lead layer) and 3 (stop layer) implemented on `BLoTv3-phase2`, merged one at a time after each field verdict.**
 
 ## What it does
 
@@ -82,3 +82,19 @@ upstream uses for the planner, and the defects found in the 2026-08-28 review of
   lead-departure pre-release. `LongitudinalPlanSource.stop` is added to cereal. Replay against
   BLoTv2 on route d7 segment 0: every lead-candidate frame now matches to the float; only the 64
   turn-budget frames from phase 1 differ.
+- Phase 3 (2026-08-29, branch `BLoTv3-phase2`) — the stop layer. `stop_helpers.py`: one stateless
+  classifier of model stop intent (every stop tier, guard and constant in one place, typed capnp
+  access), the launch-evidence test, and the corridor rule that fails closed unless every lead
+  hypothesis with any probability is outside the stop path. `force_stops.py`: rewritten as the sole
+  owner of shaping → commitment → **hold through standstill** → release, fed only by that
+  classifier and `carState`; the mode gates entry only, a standstill flicker on a grade drops back to
+  a commitment rather than to nothing, a relevant lead or a gas tap releases the hold and it re-enters
+  as soon as the car is stopped with stop evidence again, launch evidence or a mostly-clear, moving,
+  lead-free 4 s window releases it, and its `holding` output forces `shouldStop` in the planner.
+  `conditional_experimental_mode.py`: mode request only, still stepped every control tick (a hung
+  model releases within 0.5 s), evidence judged on model frames; a raw lead on a control tick now
+  revokes only a pending recent-lead release instead of wiping entry evidence, so a distant vehicle
+  no longer blocks the handoff. `selfdrived.py`: a small hook resolves the manual setting and the
+  conditional request; a pedal tap no longer switches a manually enabled Experimental mode off. No
+  cereal fields are added; the planner reads the stop point from Force Stops directly. Replay against
+  BLoTv2 on d7 segment 37 (the route's Experimental-mode stop): planner and mode transitions identical.

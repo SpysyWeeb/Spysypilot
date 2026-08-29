@@ -8,10 +8,12 @@ from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
+from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
@@ -93,6 +95,7 @@ class LongitudinalPlanner:
     self.allow_throttle = True
     self.supervisor = NecessitySupervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt)
+    self.force_stops = ForceStops(dt)
     self.mpc_a_target = init_a
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -153,9 +156,15 @@ class LongitudinalPlanner:
     lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
     policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
 
+    experimental_mode = sm['selfdriveState'].experimentalMode
+    stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
+    force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, sm['selfdriveState'].enabled, model_valid)
+    stop_x = force_stop.stop_x if force_stop.stop_x is not None and math.isfinite(force_stop.stop_x) else None
+    v_cruise = min(v_cruise, force_stop.v_cruise_cap)
+
     personality = sm['selfdriveState'].personality
     self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
-    self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, None,
+    self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, stop_x,
                     policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
@@ -183,7 +192,6 @@ class LongitudinalPlanner:
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
-    experimental_mode = sm['selfdriveState'].experimentalMode
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
@@ -196,7 +204,7 @@ class LongitudinalPlanner:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
+    self.output_should_stop = force_stop.holding or any(should_stop for _, _, should_stop in candidates)
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
