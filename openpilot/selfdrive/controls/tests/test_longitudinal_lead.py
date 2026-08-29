@@ -1,7 +1,6 @@
 import math
 
 import numpy as np
-import pytest
 
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
@@ -57,13 +56,13 @@ class TestLeadPhysics:
     assert closing_decel_requirement(0.6, LeadObservation(True, distance=2.9, speed=0.6), 2.5, 0.15) == 0.0
 
   def test_stopped_lead_is_v_squared_over_two_d(self):
-    assert closing_decel_requirement(2.0, LeadObservation(True, distance=6.5, speed=0.0), 2.5, 0.15) == pytest.approx(0.5)
+    assert math.isclose(closing_decel_requirement(2.0, LeadObservation(True, distance=6.5, speed=0.0), 2.5, 0.15), 0.5, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_total_requirement_takes_the_larger_of_closing_and_stopping(self):
     lead = LeadObservation(True, distance=14.0, speed=8.0, acceleration=-1.0)
     # closing: 2^2 / (2 * 10) = 0.2; stopping behind the lead's 32 m braking path: 10^2 / (2 * 42) = 1.19
-    assert total_decel_requirement(10.0, lead, 4.0, 1.0) == pytest.approx(1.190, abs=1e-3)
-    assert total_decel_requirement(10.0, LeadObservation(True, distance=14.0, speed=8.0), 4.0, 1.0) == pytest.approx(0.2)
+    assert abs((total_decel_requirement(10.0, lead, 4.0, 1.0)) - (1.190)) <= 1e-3
+    assert math.isclose(total_decel_requirement(10.0, LeadObservation(True, distance=14.0, speed=8.0), 4.0, 1.0), 0.2, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_near_stopped_lead_does_not_sustain_its_instantaneous_deceleration(self):
     assert total_decel_requirement(3.58, LeadObservation(True, distance=11.7, speed=0.22, acceleration=-0.81), 4.0, 1.0) < 1.0
@@ -71,7 +70,7 @@ class TestLeadPhysics:
   def test_ttc_ignores_a_lead_that_is_not_closing(self):
     lead = LeadObservation(True, distance=10.0, speed=10.0)
     assert math.isinf(time_to_collision(9.0, lead))
-    assert time_to_collision(12.0, lead) == pytest.approx(5.0)
+    assert math.isclose(time_to_collision(12.0, lead), 5.0, rel_tol=1e-6, abs_tol=1e-9)
 
 
 class TestLeadPresence:
@@ -98,22 +97,20 @@ class TestModelLeadAnchor:
   def test_anchors_the_model_shape_to_radar(self):
     anchor = anchor_model_lead(model_lead([10.0, 8.0, 6.0, 4.0, 2.0, 0.0]), radar_lead(dRel=30.0, vLead=12.0, vLeadK=11.5))
     assert anchor is not None
-    assert anchor.x[0] == pytest.approx(30.0)
-    assert anchor.v[0] == pytest.approx(12.0)
-    assert anchor.v[-1] == pytest.approx(2.0)
-    assert anchor.accel == pytest.approx(-1.0)
-    assert anchor.speed == pytest.approx(11.5 - 2.0)
+    assert math.isclose(anchor.x[0], 30.0, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(anchor.v[0], 12.0, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(anchor.v[-1], 2.0, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(anchor.accel, -1.0, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(anchor.speed, 11.5 - 2.0, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_predicted_speed_never_goes_negative(self):
     anchor = anchor_model_lead(model_lead([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]), radar_lead(dRel=8.0, vLead=1.9, vLeadK=0.1))
     assert anchor is not None
     assert anchor.speed == 0.0
 
-  @pytest.mark.parametrize('bad', [
-    {'prob': 0.5}, {'prob': 1.1}, {'x_std': 60.0}, {'v_std': 20.0}, {'t': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]},
-  ])
-  def test_rejects_untrusted_or_malformed_forecasts(self, bad):
-    assert anchor_model_lead(model_lead([10.0] * 6, **bad), radar_lead(dRel=30.0, vLead=10.0)) is None
+  def test_rejects_untrusted_or_malformed_forecasts(self):
+    for bad in ({'prob': 0.5}, {'prob': 1.1}, {'x_std': 60.0}, {'v_std': 20.0}, {'t': [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}):
+      assert anchor_model_lead(model_lead([10.0] * 6, **bad), radar_lead(dRel=30.0, vLead=10.0)) is None, bad
 
   def test_rejects_a_shape_that_contradicts_its_speeds(self):
     assert anchor_model_lead(model_lead([10.0] * 6, x=[0.0] * 6), radar_lead(dRel=30.0, vLead=10.0)) is None

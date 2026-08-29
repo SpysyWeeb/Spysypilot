@@ -1,6 +1,5 @@
 import math
 
-import pytest
 
 import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.stop_helpers import (STOP_DIRECT_CONFIDENCE, STOP_EARLY_CONFIDENCE, STOP_EARLY_HINT_CONFIDENCE,
@@ -132,4 +131,4 @@ class TestRelease:
   def test_observation_carries_release_and_corridor_facts(self):
     obs = observe(model(path_end=60.0, terminal_speed=8.0, leads=((0.0, 20.0, 0.0),) * 3))
     assert obs.release_open and obs.corridor_clear and obs.terminal_moving and not obs.braking
-    assert pytest.approx(60.0) == obs.path_end
+    assert math.isclose(obs.path_end, 60.0, rel_tol=1e-6, abs_tol=1e-9)

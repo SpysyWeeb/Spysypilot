@@ -1,5 +1,5 @@
+import math
 import numpy as np
-import pytest
 
 from opendbc.car.interfaces import ACCEL_MAX
 from opendbc.car.structs import car
@@ -34,9 +34,9 @@ def settled_cruise_accel(v_cruise, v_ego, angle_steers=0.0, accel_coast=-0.3, co
 
 class TestAccelEnvelope:
   def test_curve_endpoints_and_floor(self):
-    assert get_max_accel_request(0.0) == pytest.approx(A_CRUISE_MAX_LAUNCH)
-    assert get_max_accel_request(A_CRUISE_MAX_SPEED) == pytest.approx(A_CRUISE_MAX_HIGH_SPEED)
-    assert get_max_accel_request(A_CRUISE_MAX_SPEED + 15.0) == pytest.approx(A_CRUISE_MAX_HIGH_SPEED)
+    assert math.isclose(get_max_accel_request(0.0), A_CRUISE_MAX_LAUNCH, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(get_max_accel_request(A_CRUISE_MAX_SPEED), A_CRUISE_MAX_HIGH_SPEED, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(get_max_accel_request(A_CRUISE_MAX_SPEED + 15.0), A_CRUISE_MAX_HIGH_SPEED, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_curve_is_smooth_monotonic_and_convex(self):
     speeds = np.linspace(0.0, A_CRUISE_MAX_SPEED, 401)
@@ -48,34 +48,34 @@ class TestAccelEnvelope:
 
   def test_deployed_platform_clamps_the_request(self):
     assert ACCEL_MAX <= A_CRUISE_MAX_LAUNCH
-    assert get_max_accel(0.0) == pytest.approx(ACCEL_MAX)
-    assert get_max_accel(20.0) == pytest.approx(1.025, abs=1e-3)
-    assert get_max_accel(30.0) == pytest.approx(0.653, abs=1e-3)
+    assert math.isclose(get_max_accel(0.0), ACCEL_MAX, rel_tol=1e-6, abs_tol=1e-9)
+    assert abs((get_max_accel(20.0)) - (1.025)) <= 1e-3
+    assert abs((get_max_accel(30.0)) - (0.653)) <= 1e-3
 
   def test_jerk_schedule_bounds_the_first_step(self):
     v_ego = 75.0 * CV.MPH_TO_MS
     first = get_cruise_accel(False, v_ego + 5.0 * CV.MPH_TO_MS, v_ego, 0.0, 0.0, CP, DT_MDL, -0.3, True)
-    assert first == pytest.approx(np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS) * DT_MDL)
+    assert math.isclose(first, np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS) * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
 
 
 class TestTurnBudget:
   def test_straight_launch_is_never_clipped(self):
     for v_ego in (0.5, 5.0, 10.0):
-      assert settled_cruise_accel(v_ego + 20.0, v_ego, comfort=False) == pytest.approx(get_max_accel(v_ego))
+      assert math.isclose(settled_cruise_accel(v_ego + 20.0, v_ego, comfort=False), get_max_accel(v_ego), rel_tol=1e-6, abs_tol=1e-9)
 
   def test_lateral_acceleration_consumes_the_budget_at_road_speed(self):
     v_ego = 20.0
     a_x_allowed = np.sqrt(1.7 ** 2 - 1.5 ** 2)
     assert a_x_allowed < get_max_accel(v_ego)
     settled = settled_cruise_accel(v_ego + 10.0, v_ego, angle_steers=steer_angle_for(1.5, v_ego), comfort=False)
-    assert settled == pytest.approx(a_x_allowed)
+    assert math.isclose(settled, a_x_allowed, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_budget_grows_with_the_envelope_at_low_speed(self):
     v_ego = 5.0
     envelope = get_max_accel(v_ego)
     a_x_allowed = np.sqrt(max(envelope, 1.7) ** 2 - 1.5 ** 2)
     settled = settled_cruise_accel(v_ego + 20.0, v_ego, angle_steers=steer_angle_for(1.5, v_ego), comfort=False)
-    assert settled == pytest.approx(min(envelope, a_x_allowed))
+    assert math.isclose(settled, min(envelope, a_x_allowed), rel_tol=1e-6, abs_tol=1e-9)
 
 
 class TestCruiseComfort:
@@ -83,37 +83,37 @@ class TestCruiseComfort:
     v_ego = 74.5 * CV.MPH_TO_MS
     v_cruise = 79.5 * CV.MPH_TO_MS
     expected = CRUISE_COMFORT_KP * (v_cruise - v_ego)
-    assert expected == pytest.approx(0.402, abs=1e-3)
-    assert settled_cruise_accel(v_cruise, v_ego, accel_coast=-0.25) == pytest.approx(expected)
+    assert abs((expected) - (0.402)) <= 1e-3
+    assert math.isclose(settled_cruise_accel(v_cruise, v_ego, accel_coast=-0.25), expected, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_five_mph_reduction_coasts_instead_of_full_braking(self):
     v_ego = 79.6 * CV.MPH_TO_MS
     v_cruise = 74.6 * CV.MPH_TO_MS
     settled = settled_cruise_accel(v_cruise, v_ego, accel_coast=-0.39)
-    assert settled == pytest.approx(-0.402, abs=1e-3)
+    assert abs((settled) - (-0.402)) <= 1e-3
     assert settled > A_CRUISE_MIN
 
   def test_reduction_follows_an_uphill_coast_but_not_a_downhill_push(self):
     v_ego = 80.0 * CV.MPH_TO_MS
     v_cruise = 75.0 * CV.MPH_TO_MS
-    assert get_cruise_comfort_accel(v_cruise, v_ego, -0.6) == pytest.approx(-0.6)
-    assert get_cruise_comfort_accel(v_cruise, v_ego, 0.2) == pytest.approx(-0.402, abs=1e-3)
+    assert math.isclose(get_cruise_comfort_accel(v_cruise, v_ego, -0.6), -0.6, rel_tol=1e-6, abs_tol=1e-9)
+    assert abs((get_cruise_comfort_accel(v_cruise, v_ego, 0.2)) - (-0.402)) <= 1e-3
 
   def test_small_corrections_taper_continuously(self):
     v_ego = 75.0 * CV.MPH_TO_MS
     half = get_cruise_comfort_accel(v_ego + 2.5 * CV.MPH_TO_MS, v_ego, -0.3)
     full = get_cruise_comfort_accel(v_ego + 5.0 * CV.MPH_TO_MS, v_ego, -0.3)
-    assert half == pytest.approx(full / 2.0)
+    assert math.isclose(half, full / 2.0, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_large_errors_keep_the_envelope_and_braking_limit(self):
     v_ego = 75.0 * CV.MPH_TO_MS
-    assert settled_cruise_accel(v_ego + 15.0 * CV.MPH_TO_MS, v_ego) == pytest.approx(get_max_accel(v_ego))
-    assert settled_cruise_accel(v_ego - 15.0 * CV.MPH_TO_MS, v_ego) == pytest.approx(A_CRUISE_MIN)
+    assert math.isclose(settled_cruise_accel(v_ego + 15.0 * CV.MPH_TO_MS, v_ego), get_max_accel(v_ego), rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(settled_cruise_accel(v_ego - 15.0 * CV.MPH_TO_MS, v_ego), A_CRUISE_MIN, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_low_speed_launch_keeps_legacy_authority(self):
     v_ego = 5.0
     v_cruise = v_ego + 5.0 * CV.MPH_TO_MS
-    assert settled_cruise_accel(v_cruise, v_ego, comfort=True) == pytest.approx(settled_cruise_accel(v_cruise, v_ego, comfort=False))
+    assert math.isclose(settled_cruise_accel(v_cruise, v_ego, comfort=True), settled_cruise_accel(v_cruise, v_ego, comfort=False), rel_tol=1e-6, abs_tol=1e-9)
 
   def test_comfort_is_only_for_ordinary_chill_cruise(self):
     assert ordinary_cruise_comfort_enabled(False, False, True)
@@ -129,14 +129,14 @@ class TestCruiseComfort:
       target = 0.0
       for _ in range(200):
         target = get_cruise_accel(False, v_cruise, v_ego, target, 0.0, CP, DT_MDL, -0.3, False, comfort)
-      assert target == pytest.approx(np.interp(v_ego, [2.5, 5.0], [get_max_accel(v_ego), -0.3]))
+      assert math.isclose(target, np.interp(v_ego, [2.5, 5.0], [get_max_accel(v_ego), -0.3]), rel_tol=1e-6, abs_tol=1e-9)
 
   def test_comfort_blends_in_between_8_and_15_mps(self):
     v_ego = 11.5
     v_cruise = v_ego + 5.0 * CV.MPH_TO_MS
     legacy = settled_cruise_accel(v_cruise, v_ego, comfort=False)
     full = np.clip(get_cruise_comfort_accel(v_cruise, v_ego, -0.3), A_CRUISE_MIN, get_max_accel(v_ego))
-    assert settled_cruise_accel(v_cruise, v_ego) == pytest.approx((legacy + full) / 2.0)
+    assert math.isclose(settled_cruise_accel(v_cruise, v_ego), (legacy + full) / 2.0, rel_tol=1e-6, abs_tol=1e-9)
 
 
 class TestPlannerCruise:
@@ -199,7 +199,7 @@ class TestPlannerCruise:
     for _ in range(5):
       planner.update(_PlantSubMaster(data, 0))
     assert planner.mpc.source == LongitudinalPlanSource.e2e
-    assert planner.output_a_target == pytest.approx(-3.0)
+    assert math.isclose(planner.output_a_target, -3.0, rel_tol=1e-6, abs_tol=1e-9)
     for _ in range(5):
       planner.update(_PlantSubMaster(data, 0, invalid=('modelV2',)))
     assert planner.mpc.source != LongitudinalPlanSource.e2e
@@ -223,7 +223,7 @@ class TestPlannerCruise:
       for _ in range(100):
         plant.step(v_cruise=v_cruise, radar_valid=radar_valid)
         plant.speed = v_ego  # hold speed so the settled cruise target is observable
-      assert plant.planner.a_cruise == pytest.approx(expected, abs=0.02), (radar_valid, e2e)
+      assert abs((plant.planner.a_cruise) - (expected)) <= 0.02, (radar_valid, e2e)
 
   def test_fcw_comes_only_from_the_mpc_crash_counter(self):
     plant = Plant(speed=15.0, distance_lead=40.0, lead_relevancy=True)

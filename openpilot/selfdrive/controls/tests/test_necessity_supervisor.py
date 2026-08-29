@@ -1,6 +1,5 @@
 import math
 
-import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
@@ -53,20 +52,20 @@ class TestScope:
 
 class TestTriggers:
   def test_recovery_relaxes_stale_mpc_braking(self):
-    assert run(NecessitySupervisor(), lead(), 15.0, -2.0, 1.0).jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    assert math.isclose(run(NecessitySupervisor(), lead(), 15.0, -2.0, 1.0).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_recovery_ignores_a_small_trim(self):
     assert run(NecessitySupervisor(), lead(), 15.0, -0.5, 2.0).jerk_scale == 1.0
 
   def test_model_forecast_arms_the_response(self):
-    assert run(NecessitySupervisor(), lead(), 15.0, 0.0, 1.0, predicted_lead_accel=-1.0).jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    assert math.isclose(run(NecessitySupervisor(), lead(), 15.0, 0.0, 1.0, predicted_lead_accel=-1.0).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_model_forecast_opens_the_onset_pad(self):
     policy = run(NecessitySupervisor(), lead(v=14.0, d=40.0), 15.0, -0.5, 1.0, predicted_lead_accel=-0.75)
-    assert policy.t_follow_pad == pytest.approx(ONSET_PAD_MAX * 0.5)
+    assert math.isclose(policy.t_follow_pad, ONSET_PAD_MAX * 0.5, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_launch_relaxes_a_lagging_mpc(self):
-    assert run(NecessitySupervisor(), lead(v=5.0, d=10.0, a=2.0), 3.0, 0.2, 1.0).jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    assert math.isclose(run(NecessitySupervisor(), lead(v=5.0, d=10.0, a=2.0), 3.0, 0.2, 1.0).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_constant_speed_pull_away_does_not_arm(self):
     assert run(NecessitySupervisor(), lead(v=8.0, d=15.0, a=0.0), 3.0, 0.0, 2.0).jerk_scale == 1.0
@@ -82,19 +81,19 @@ class TestTriggers:
 
 class TestPads:
   def test_onset_pad_is_proportional(self):
-    assert run(NecessitySupervisor(), lead(v=14.0, d=40.0, a=-0.75), 15.0, -0.5, 2.0).t_follow_pad == pytest.approx(ONSET_PAD_MAX * 0.5)
+    assert math.isclose(run(NecessitySupervisor(), lead(v=14.0, d=40.0, a=-0.75), 15.0, -0.5, 2.0).t_follow_pad, ONSET_PAD_MAX * 0.5, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_stopped_lead_gets_the_larger_pad(self):
-    assert run(NecessitySupervisor(), lead(v=0.0, d=83.0), 14.0, -0.4, 2.0).t_follow_pad == pytest.approx(STOPPED_LEAD_PAD_MAX)
+    assert math.isclose(run(NecessitySupervisor(), lead(v=0.0, d=83.0), 14.0, -0.4, 2.0).t_follow_pad, STOPPED_LEAD_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_pads_saturate_instead_of_vanishing_above_the_onset_limit(self):
     # 10 m/s toward a stopped lead 30 m out needs 1.9 m/s^2, past ONSET_MAX_A_REQ; the pad must stay at its ceiling
     policy = run(NecessitySupervisor(), lead(v=0.0, d=30.0), 10.0, -1.9, 2.0)
     assert not policy.stand_down
-    assert policy.t_follow_pad == pytest.approx(STOPPED_LEAD_PAD_MAX)
+    assert math.isclose(policy.t_follow_pad, STOPPED_LEAD_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
     policy = run(NecessitySupervisor(), lead(v=10.0, d=20.0, a=-3.0), 15.0, -3.4, 2.0)
     assert not policy.stand_down
-    assert policy.t_follow_pad == pytest.approx(ONSET_PAD_MAX)
+    assert math.isclose(policy.t_follow_pad, ONSET_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_pads_respect_their_slew_rates(self):
     supervisor = NecessitySupervisor()
@@ -125,13 +124,13 @@ class TestLowSpeedHold:
   def test_responsive_policy_survives_the_crawl(self):
     supervisor = NecessitySupervisor()
     run(supervisor, lead(), 15.0, -2.0, 1.0)
-    assert run(supervisor, lead(v=0.5, d=8.0), 0.5, 0.0, 1.0).jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    assert math.isclose(run(supervisor, lead(v=0.5, d=8.0), 0.5, 0.0, 1.0).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_partial_softening_is_kept_too(self):
     supervisor = NecessitySupervisor()
     partial = run(supervisor, lead(), 15.0, -2.0, 0.6).jerk_scale
     assert JERK_SCALE_MIN < partial < 1.0
-    assert run(supervisor, lead(v=0.5, d=8.0), 0.5, 0.0, 1.0).jerk_scale == pytest.approx(partial)
+    assert math.isclose(run(supervisor, lead(v=0.5, d=8.0), 0.5, 0.0, 1.0).jerk_scale, partial, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_a_stand_down_release_is_not_frozen_by_the_crawl(self):
     supervisor = NecessitySupervisor()
@@ -142,11 +141,11 @@ class TestLowSpeedHold:
   def test_the_hold_releases_after_lead_loss_and_reset(self):
     supervisor = NecessitySupervisor()
     run(supervisor, lead(), 15.0, -2.0, 1.0)
-    assert run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    assert math.isclose(run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
     assert supervisor.update(LeadObservation(), 0.5, 0.0).jerk_scale > JERK_SCALE_MIN
     assert run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale == 1.0
     run(supervisor, lead(), 15.0, -2.0, 1.0)
-    assert run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    assert math.isclose(run(supervisor, lead(), 0.5, 0.0, 1.0).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
     supervisor.reset()
     assert supervisor.update(lead(), 0.5, 0.0).jerk_scale == 1.0
 
@@ -154,8 +153,8 @@ class TestLowSpeedHold:
     supervisor = NecessitySupervisor()
     run(supervisor, lead(), 15.0, -2.0, 1.0)
     # a braking lead we are still closing on must not stiffen the solution, at speed or at the crawl
-    assert run(supervisor, lead(v=10.0, d=30.0, a=-0.5), 12.0, -0.5, 0.5).jerk_scale == pytest.approx(JERK_SCALE_MIN)
-    assert run(supervisor, lead(v=0.2, d=8.0, a=-0.5), 0.8, -0.5, 0.5).jerk_scale == pytest.approx(JERK_SCALE_MIN)
+    assert math.isclose(run(supervisor, lead(v=10.0, d=30.0, a=-0.5), 12.0, -0.5, 0.5).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(run(supervisor, lead(v=0.2, d=8.0, a=-0.5), 0.8, -0.5, 0.5).jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
 
 
 class TestLeadDeparturePreRelease:

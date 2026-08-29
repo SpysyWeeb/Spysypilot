@@ -1,6 +1,5 @@
 import math
 
-import pytest
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_MDL
@@ -53,7 +52,7 @@ def holding(fs=None):
 class TestEntry:
   def test_classic_latch_commits_the_model_endpoint_with_its_setback(self):
     fs, result = committed()
-    assert result.stop_x == pytest.approx(20.0 - LATCH_SETBACK - 10.0 * DT_MDL * (frames(1.5) - frames(1.5) + 0), abs=10.0 * DT_MDL * frames(1.5))
+    assert abs((result.stop_x) - (20.0 - LATCH_SETBACK - 10.0 * DT_MDL * (frames(1.5) - frames(1.5) + 0))) <= 10.0 * DT_MDL * frames(1.5)
     assert math.isfinite(result.v_cruise_cap) and result.v_cruise_cap < 10.0
 
   def test_widened_window_needs_braking_evidence(self):
@@ -68,7 +67,7 @@ class TestEntry:
     fs = ForceStops()
     result = fs.update(obs(path_end=60.0, should_stop=False, early=True), car_state(15.0), True, True, True)
     assert not fs.forcing
-    assert result.v_cruise_cap == pytest.approx(max(math.sqrt(2.0 * A_STOP_ENVELOPE * (60.0 - MPC_PROFILE_OFFSET)), 15.0 - DV_MAX))
+    assert math.isclose(result.v_cruise_cap, max(math.sqrt(2.0 * A_STOP_ENVELOPE * (60.0 - MPC_PROFILE_OFFSET)), 15.0 - DV_MAX), rel_tol=1e-6, abs_tol=1e-9)
     assert result.stop_x is None
 
   def test_a_second_of_strict_world_fixed_evidence_commits_before_the_classic_window(self):
@@ -125,10 +124,10 @@ class TestMovingReleases:
     fs, _ = committed(path_end=20.0)
     before = fs.remaining
     fs.update(obs(path_end=30.0), car_state(10.0), True, True, True)
-    assert fs.remaining == pytest.approx(before - 10.0 * DT_MDL + 3.0 * DT_MDL)
+    assert math.isclose(fs.remaining, before - 10.0 * DT_MDL + 3.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
     fs.remaining = 12.0
     fs.update(obs(path_end=8.0), car_state(2.0), True, True, True)
-    assert fs.remaining == pytest.approx(12.0 - 2.0 * DT_MDL - 2.0 * DT_MDL)
+    assert math.isclose(fs.remaining, 12.0 - 2.0 * DT_MDL - 2.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
 
 
 class TestHold:

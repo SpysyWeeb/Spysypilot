@@ -1,5 +1,5 @@
+import math
 import numpy as np
-import pytest
 
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
@@ -49,13 +49,13 @@ class TestUpdateProtocol:
     assert mpc.source == LongitudinalPlanSource.lead0
     assert mpc.lead0_policy_active
     assert weights[-1][2] == 0.3
-    assert mpc.params[0, 4] == pytest.approx(get_T_FOLLOW(STANDARD) + 0.5)
+    assert math.isclose(mpc.params[0, 4], get_T_FOLLOW(STANDARD) + 0.5, rel_tol=1e-6, abs_tol=1e-9)
 
     mpc.update(radar_state(d_one=80.0, v_one=8.0, d_two=20.0, v_two=8.0), STANDARD, jerk_scale=0.3, t_follow_pad=0.5)
     assert mpc.source == LongitudinalPlanSource.lead1
     assert not mpc.lead0_policy_active
     assert weights[-1][2] == 1.0
-    assert mpc.params[0, 4] == pytest.approx(get_T_FOLLOW(STANDARD))
+    assert math.isclose(mpc.params[0, 4], get_T_FOLLOW(STANDARD), rel_tol=1e-6, abs_tol=1e-9)
 
   def test_handoff_from_an_adaptive_lead0_reanchors_the_change_cost(self):
     mpc = LongitudinalMpc()
@@ -76,7 +76,7 @@ class TestUpdateProtocol:
     radar_only = np.array(mpc.params[:, 2])
     mpc.update(radar_state(d_one=30.0, v_one=10.0), STANDARD, lead0_anchor=anchor(30.0, 10.0, 2.0))
     braking_forecast = np.array(mpc.params[:, 2])
-    assert braking_forecast[0] == pytest.approx(radar_only[0])
+    assert math.isclose(braking_forecast[0], radar_only[0], rel_tol=1e-6, abs_tol=1e-9)
     assert np.all(braking_forecast[3:] < radar_only[3:])
 
   def test_committed_stop_is_a_fixed_obstacle(self):
@@ -84,7 +84,7 @@ class TestUpdateProtocol:
     mpc.set_cur_state(5.0, 0.0)
     mpc.update(radar_state(), STANDARD, stop_x=10.0)
     assert mpc.source == LongitudinalPlanSource.stop
-    assert np.all(mpc.params[:, 2] == pytest.approx(10.0 + STOP_DISTANCE))
+    assert np.allclose(mpc.params[:, 2], 10.0 + STOP_DISTANCE)
     assert np.min(mpc.a_solution) < -0.5
     assert mpc.v_solution[-1] < 1.0
 
