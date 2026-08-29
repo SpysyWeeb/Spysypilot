@@ -36,10 +36,6 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
 
-# Lookup table for turns
-_A_TOTAL_MAX_V = [1.7, 3.2]
-_A_TOTAL_MAX_BP = [20., 40.]
-
 LAUNCH_DISARM_SPEED = 2.0
 LAUNCH_COMMIT_T = 3.5
 LAUNCH_MOVING_SPEED = 1.2
@@ -86,15 +82,11 @@ def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid,
   # comfort shaping only for ordinary cruise with a healthy radar; lead following, e2e and a curve limiter keep their own targets
   return not (experimental_mode or force_decel or not radar_valid or speed_limiter_active)
 
-def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle, comfort=False):
+def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow_throttle, comfort=False):
+  # the envelope alone bounds cruise acceleration; stock's shared lateral budget held the car back out of curves (owner ruling)
   max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
 
   if not e2e:
-    # lateral acceleration consumes the turn budget, but the budget never clips a straight launch
-    a_total_max = max(max_accel, np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V))
-    a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
-    a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
-    max_accel = min(max_accel, a_x_allowed)
     if not allow_throttle:
       clipped_accel_coast = max(accel_coast, ACCEL_MIN)
       coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [max_accel, clipped_accel_coast])
@@ -179,8 +171,6 @@ class LongitudinalPlanner:
 
     _, model_v, model_a, _, throttle_prob = self.parse_model(sm['modelV2'])
     self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
-
-    steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
 
     if reset_state:
       self.v_desired_filter.x = v_ego
@@ -272,9 +262,7 @@ class LongitudinalPlanner:
       output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
 
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, speed_limiter_active=self.curve_speed_limiter.active)
-    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego,
-                                     self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle, comfort)
+    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
     if not should_stop(v_ego, 0.0):
       self.a_cruise = limit_accel_for_torque(self.a_cruise, self.curve_speed_limiter.torque_veto)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)

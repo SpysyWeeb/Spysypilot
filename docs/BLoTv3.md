@@ -35,7 +35,7 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 | # | Decision | Ruling |
 |---|---|---|
 | D1 | Architecture | mode in selfdrived, everything else in plannerd, shared stateless classifier |
-| D2 | Turn budget | `a_total_max = max(envelope(v), interp(v, [20, 40], [1.7, 3.2]))` — launch never clipped, corners consume budget; composed before `curve-speed-limit`'s torque veto on combo |
+| D2 | Turn budget | **removed after the 2026-08-29 field test** ("accelerating out of a curve feels held back"): cruise acceleration is bounded by the envelope alone; `curve-speed-limit`'s limiter and torque veto remain combo's only curve mechanism |
 | D3 | `STOP_DISTANCE` | keep 7 m (owner prefers the extra distance); documented fork change |
 | D4 | Acceleration-change cost through standstill | keep BLoTv2's behavior (cost stays on). Owner requirement: launches start smooth but grow quickly — acceptance metric: from a no-lead standstill launch, commanded acceleration reaches 50 % of the envelope within ~1.0 s with no dip; tune the low-speed cruise jerk or the supervisor launch response if not, never by removing the cost. Measured with the real MPC behind a departing lead: first step 0.13 vs 0.40 m/s² per frame with the cost off, half of peak at 1.35 s vs 0.70 s — the owner judges this in the phase-2 field test |
 | D5 | Third model lead ("ponytail") | delete (owner never felt it act) |
@@ -80,9 +80,9 @@ warnings). The third-lead machinery is removed. The MPC's acceleration bound sta
 envelope carries the 4.0 m/s² launch request.
 
 ### longitudinal_planner.py
-Envelope (`a_max = 0.6 + 3.4 (1 − v/40)³`, clamped by `A_MAX`), jerk schedule, ordinary-cruise
-comfort shaping (with the `comfort_enabled` hook combo's curve limiter uses) as BLoTv2. Turn budget
-per D2. `update()` order: reset state → lead, anchors, stop observation (each once) →
+Envelope (`a_max = 0.6 + 3.4 (1 − v/40)³`, clamped by opendbc's `ACCEL_MAX`), jerk schedule, ordinary-cruise
+comfort shaping (with the `comfort_enabled` hook combo's curve limiter uses) as BLoTv2. No lateral
+turn budget (D2). `update()` order: reset state → lead, anchors, stop observation (each once) →
 `force_stops.update(...)` → `mpc.set_cur_state` → supervisor → `mpc.update(...)` →
 `fcw = mpc.crash_cnt > 2 and not standstill` → candidates (MPC, cruise, e2e only in Experimental
 mode with a valid model) → `output_should_stop = any(candidate stops) or force_stops.holding`.
