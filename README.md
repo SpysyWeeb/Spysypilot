@@ -41,6 +41,11 @@ builds, never past a refuge island.
   does not. The stock controller is stepped every frame so its request buffer and jerk filter follow
   the live history and the two share one saturation timer; as in BLaTv2, its integrator starts clean
   when it takes over. Logs into `lateralControlState.rackState`.
+- Phase 2, step 2 — a dropped or invalid model frame keeps the last good plan (the reference already
+  advances along it by its age); a model is stale only past SubMaster's 0.5 s alive window instead of a
+  private 0.2 s; once stock has taken over it keeps steering for 0.5 s before the rack re-seeds and
+  resumes; a `latActive` blip of up to five frames (the standstill gate) holds the planned rack instead
+  of starting over. Replay on the two field routes: no change in ordinary driving.
 - `openpilot/selfdrive/controls/lib/rack_trajectory.py` — BLaTv2's controller math (reference
   compile, jerk-limited rack planner, reversal governor, rate estimator, torque tail) moved unchanged
   into one module: the class is renamed `RackTrajectoryController`, the one-line `_measured_rate`

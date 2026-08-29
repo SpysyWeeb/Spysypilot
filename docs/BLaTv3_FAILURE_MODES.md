@@ -23,9 +23,11 @@ Shape ("upstream-shaped controller"):
   flag, status, `t_p`, planned/measured rack state, FF/P/D terms, restriction reason).
 - Owns a stock `LatControlTorque` that runs in shadow every frame with `active = CC.latActive`
   while its output is discarded; any invalidation hands the frame to it (never zero torque).
-  Phase 1 keeps BLaTv2's semantics: the shadow's request buffer, jerk filter and the shared
-  saturation timer are warm, its integrator starts clean on handover; hysteresis on the handover
-  (R6, FM5.2) and a warm integrator arrive with the phase-2 staleness rework.
+  The shadow's request buffer, jerk filter and the shared saturation timer are warm; its
+  integrator starts clean on handover. Since phase 2 step 2: a dropped model frame keeps the last
+  plan, a model is stale past 0.5 s (SubMaster's alive window), stock holds for 0.5 s before the
+  rack resumes, and a `latActive` blip of up to five frames holds the planned rack (R6, FM1.6,
+  FM1.15, FM4.4, FM5.2). A warm integrator in the shadow is still open.
 - modeld publishes a short curvature preview on `ModelDataV2.Action` next to
   `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar.
 
