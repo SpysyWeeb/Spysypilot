@@ -31,7 +31,11 @@ Quick start: `bash <(curl -fsSL openpilot.comma.ai)`
 
 ## BLaTv2 branch status
 
-**In progress; replay-qualified, not field-approved.** This branch selects the
+**Superseded by [BLaTv3](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv3) (2026-08-28).** The
+controller on this branch was ported bit-exact into BLaTv3's `LatControlRack`, which now runs on
+combo; this branch is kept as the reference the port was proven against and receives no new work.
+
+**Previously: in progress; replay-qualified, not field-approved.** This branch selects the
 rack-trajectory lateral controller only for the shared Palisade/Telluride
 platform when queried firmware identifies the Palisade `LX` family. Telluride
 `ON` and unknown firmware fail closed to the stock torque controller. At runtime,
