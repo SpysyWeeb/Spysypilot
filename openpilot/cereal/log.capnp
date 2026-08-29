@@ -885,6 +885,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     torqueState @60 :LateralTorqueState;
 
     curvatureState @65 :LateralCurvatureState;
+    rackState @67 :LateralRackState;
     lqrStateDEPRECATED @55 :Deprecated.LateralLQRState;
     indiStateDEPRECATED @52 :Deprecated.LateralINDIState;
   }
@@ -917,6 +918,38 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
    }
+
+  struct LateralRackState {
+    active @0 :Bool;
+    fallback @1 :Bool;  # the stock torque controller steered this frame
+    status @2 :UInt8;  # rack_trajectory.STATUS_*
+    error @3 :Float32;
+    errorRate @4 :Float32;
+    p @5 :Float32;
+    d @6 :Float32;
+    f @7 :Float32;
+    output @8 :Float32;
+    saturated @9 :Bool;
+    actualLateralAccel @10 :Float32;
+    desiredLateralAccel @11 :Float32;
+    desiredLateralJerk @12 :Float32;
+    targetCurvature @13 :Float32;
+    targetSteeringAngleDeg @14 :Float32;
+    targetSteeringRateDegS @15 :Float32;
+    plannedSteeringAngleDeg @16 :Float32;
+    plannedSteeringRateDegS @17 :Float32;
+    plannedSteeringAccelerationDegS2 @18 :Float32;
+    measuredSteeringRateDegS @19 :Float32;
+    rateLimitDegS @20 :Float32;
+    accelerationLimitDegS2 @21 :Float32;
+    jerkLimitDegS3 @22 :Float32;
+    feedbackLimited @23 :Bool;
+    motionLimited @24 :Bool;
+    torqueLimited @25 :Bool;
+    pathLimited @26 :Bool;
+    profileTransition @27 :Bool;
+    version @28 :Int32;
+  }
 
   struct LateralAngleState {
     active @0 :Bool;
@@ -1155,6 +1188,7 @@ struct ModelDataV2 {
     desiredCurvature @0 :Float32;
     desiredAcceleration @1 :Float32;
     shouldStop @2 :Bool;
+    desiredCurvatureTime @3 :Float32;  # seconds from the plan origin at which desiredCurvature is read
   }
 
   deprecated :group {

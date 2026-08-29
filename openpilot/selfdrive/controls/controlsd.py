@@ -17,6 +17,7 @@ from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
+from openpilot.selfdrive.controls.lib.latcontrol_rack import LatControlRack
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
@@ -60,7 +61,10 @@ class Controls:
     elif self.CP.lateralTuning.which() == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.CP.lateralTuning.which() == 'torque':
-      self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
+      if self.CP.lateralTuning.torque.useRackTrajectory:
+        self.LaC = LatControlRack(self.CP, self.CI, DT_CTRL)
+      else:
+        self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
 
   def update(self):
     self.sm.update(15)
@@ -130,7 +134,9 @@ class Controls:
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                      self.steer_limited_by_safety, self.desired_curvature,
-                                                     curvature_limited, lat_delay)
+                                                     curvature_limited, lat_delay,
+                                                     model=model_v2 if self.sm.valid['modelV2'] else None,
+                                                     mono_time_ns=self.sm.logMonoTime['selfdriveState'])
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
@@ -214,7 +220,10 @@ class Controls:
     elif lat_tuning == 'pid':
       cs.lateralControlState.pidState = lac_log
     elif lat_tuning == 'torque':
-      cs.lateralControlState.torqueState = lac_log
+      if self.CP.lateralTuning.torque.useRackTrajectory:
+        cs.lateralControlState.rackState = lac_log
+      else:
+        cs.lateralControlState.torqueState = lac_log
 
     self.pm.send('controlsState', dat)
 
