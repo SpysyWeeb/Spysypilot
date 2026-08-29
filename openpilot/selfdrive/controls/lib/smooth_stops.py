@@ -42,7 +42,6 @@ class SmoothStopController:
 
   def __init__(self):
     self._no_stop_frames = 0
-    self._release_had_lead = False
     self.reset()
 
   def reset(self) -> None:
@@ -61,25 +60,20 @@ class SmoothStopController:
 
   def arm_hold(self) -> None:
     self._no_stop_frames = 0
-    self._release_had_lead = False
 
   def hold_release(self, should_stop: bool, lead: LeadObservation | None = None) -> bool:
+    # Debounce the hold exit: the plan's should_stop can flicker false for a frame while
+    # stopped, which would blip the brake at standstill. Only release once should_stop has
+    # been false for HOLD_RELEASE_FRAMES straight; a measured departing lead releases at
+    # once. A stopped lead in radar view gets no longer wait: the plan owns departure
+    # confirmation, and the car itself needs ~1.3 s to exit standstill after the release
+    # (Palisade, field-measured 2026-08-29), so every extra frame here lands on launch latency.
     lead = lead if lead is not None else LeadObservation()
     if not should_stop and lead.present and lead.speed >= LEAD_MOVING_ENTER:
       self._no_stop_frames = 0
-      self._release_had_lead = False
       return True
-    if should_stop:
-      self._no_stop_frames = 0
-      self._release_had_lead = lead.present and lead.speed < LEAD_MOVING_ENTER
-    else:
-      if self._release_had_lead and lead.present and lead.speed >= LEAD_MOVING_ENTER:
-        self._release_had_lead = False
-        self._no_stop_frames = 0
-      self._release_had_lead |= lead.present and lead.speed < LEAD_MOVING_ENTER
-      self._no_stop_frames += 1
-    release_frames = round((LEAD_DROPOUT_GRACE if self._release_had_lead else HOLD_RELEASE_FRAMES * DT_CTRL) / DT_CTRL)
-    return self._no_stop_frames >= release_frames
+    self._no_stop_frames = 0 if should_stop else self._no_stop_frames + 1
+    return self._no_stop_frames >= HOLD_RELEASE_FRAMES
 
   def _update_lead_motion(self, lead: LeadObservation) -> bool:
     if lead.present:

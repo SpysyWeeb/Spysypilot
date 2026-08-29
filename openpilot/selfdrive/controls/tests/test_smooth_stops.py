@@ -33,6 +33,17 @@ class TestSmoothStopHandoff(unittest.TestCase):
     self.assertTrue(controller.hold_release(False))
     self.assertFalse(controller.hold_release(True))
 
+  def test_stopped_lead_does_not_lengthen_the_release(self):
+    # the plan already corroborates a lead's departure before dropping its stop bit; the car adds ~1.3 s of its own
+    controller = SmoothStopController()
+    controller.arm_hold()
+    stopped_lead = LeadObservation(True, distance=4.3, speed=0.0)
+    for _ in range(HOLD_RELEASE_FRAMES - 1):
+      self.assertFalse(controller.hold_release(False, stopped_lead))
+    self.assertTrue(controller.hold_release(False, stopped_lead))
+    controller.arm_hold()
+    self.assertTrue(controller.hold_release(False, LeadObservation(True, distance=4.3, speed=0.5)))
+
 
 class TestSmoothStopSettle(unittest.TestCase):
   def test_entry_is_continuous(self):
