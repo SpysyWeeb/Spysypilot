@@ -233,9 +233,15 @@ red-team pass.
   division (reference *and* feedback — see FM3.10); hold-angle behavior 0.3–1 m/s. → Creep at
   0.5 m/s: bounded target.
 - **FM2.6 — Envelope tables mis-scaled.** p99 of how the rack *was* moved, not what the EPS
-  can do; at 40 mph the cap equals the smoothest necessary jog. → Comfort and physical
-  envelopes as two named, cited things; re-derive the comfort table above 35 mph with jogs in
-  the corpus. → Island jog inside the comfort envelope with margin.
+  can do; at 40 mph the cap equals the smoothest necessary jog. *Provenance re-derived
+  2026-08-28 from 31 of the owner's routes (independently reproduced): the shipped rate table
+  is p99 of the smoothed steering-angle derivative over ALL frames, driver and openpilot
+  together (0.91–1.27× per bin; the 5–10 mph value is a human hand-over-hand signature); the
+  acceleration table matches no population (real p99 is ~3× it at 35–55 mph); real driving
+  exceeds the rate cap in < 1.1 % of frames, openpilot's own steering in < 0.9 %.* → The
+  tables are retired in favour of the two learned surfaces (layer 7); until then they are the
+  seed of the rate-gain prior only, cited to the derivation script. → Island jog inside the
+  comfort envelope with margin.
 - **FM2.7 — Ordinary tight turns trip the "evasive" trigger. [v2]** A signed right turn off a
   35 mph arterial: cross-street curvature appears in the last 0.5–1 s; ~370° of wheel. → R4's
   opening depends on how the error arrived (growing over frames → smooth opening). → Curb-
