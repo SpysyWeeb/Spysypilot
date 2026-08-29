@@ -12,7 +12,7 @@ from opendbc.car.structs import car
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.realtime import DT_CTRL
 import openpilot.selfdrive.controls.lib.rack_trajectory as rack_trajectory_module
-from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, VERSION, palisade_rack_trajectory_compatible
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
   MAX_DRIVER_ASSIST_TORQUE,
@@ -36,6 +36,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   STATUS_ACTIVE,
   STATUS_INVALID_ACTION_TIME,
   STATUS_INVALID_PATH,
+  STATUS_NO_MODEL,
   STATUS_STALE_MODEL,
   STATUS_INVALID_VEHICLE_STATE,
 )
@@ -217,7 +218,6 @@ def test_full_horizon_faults_reset_and_recover_cold() -> None:
     model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 5, [5.0] * 6),
     model([0.0, .5, .4, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6),
     model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0, 0.0, math.nan, 0.0, 0.0, 0.0], [5.0] * 6),
-    model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [5.0, 5.0, 5.0, 0.0, 5.0, 5.0]),
   )
   cases = tuple((path, 1_050_000_000, STATUS_INVALID_PATH) for path in invalid_paths) + (
     (valid, 1_200_000_001, STATUS_STALE_MODEL),
@@ -236,6 +236,12 @@ def test_full_horizon_faults_reset_and_recover_cold() -> None:
     assert all(math.isfinite(value) for value in (
       recovered.torque, recovered.planned_angle_deg, recovered.planned_rate_deg_s,
     ))
+
+  # a plan that stops inside the horizon is a complete path, not a fault
+  stopping = model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0, .02, .02, 0.0, 0.0, 0.0], [5.0, 4.0, 2.0, 0.0, 0.0, 0.0])
+  controller = PalisadeRackTrajectoryController()
+  assert update(controller, stopping) is not None
+  assert controller.status == STATUS_ACTIVE
 
 
 def test_rack_trajectory_is_palisade_not_telluride_scoped() -> None:
@@ -302,14 +308,16 @@ def test_model_path_is_scalar_anchored_and_signed() -> None:
     orientation_rates_z=[0.0, .05, .1, .15],
     velocities_x=[5.0, 5.0, 0.0, 0.0],
     scalar_curvature=.03,
-    scalar_action_plan_s=.5,
+    scalar_action_plan_s=1.0,
     plan_time_now_s=.1,
     measured_v_ego=5.0,
-    query_time_s=1.0,
+    query_time_s=2.0,
     vehicle_model=LinearVehicleModel(),
     roll_rad=0.0,
     angle_offset_deg=0.0,
   )
+  # the stopped samples are kept and hold the last well-conditioned curvature (the .05 / 5.0 knot at 1 s)
+  assert abs(stopped.curvature - .03) < 1e-12
   assert math.isfinite(stopped.angle_deg)
 
 
@@ -867,18 +875,64 @@ def test_profile_transition_headroom_does_not_walk_outward() -> None:
   assert abs(plan.rate_deg_s) <= profile.max_rate_deg_s + 1e-6
 
 
+def test_rack_fallback_is_the_stock_controller_after_rack_frames() -> None:
+  car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
+  car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
+  controller = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  stock = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL)
+  vehicle_model = VehicleModel(car_params)
+  state = car.CarState.new_message()
+  state.vEgo = 15.0
+  params = log.VehicleParameters.new_message()
+  model = messaging.new_message("modelV2").modelV2
+  model.action.desiredCurvatureTime = .5
+  model.orientationRate.t = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+  model.velocity.x = [15.0] * 6
+
+  # a curve entry steered by the rack controller: the stock reference mirrors its idle, reset PID
+  for frame in range(150):
+    curvature = min(.004, frame * .00004)
+    state.steeringAngleDeg = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, state.vEgo, 0.0))
+    model.action.desiredCurvature = curvature
+    model.orientationRate.z = [curvature * state.vEgo] * 6
+    model.timestampEof = 1_000_000_000 + frame * 10_000_000
+    controller.set_rack_trajectory_model(model, model.timestampEof + 50_000_000)
+    _, _, controller_log = controller.update(True, state, vehicle_model, params, False, curvature, False, .2)
+    stock.update(True, state, vehicle_model, params, False, curvature, False, .2)
+    stock.pid.reset()
+    assert controller_log.version == 6
+
+  # the model goes stale: every fallback frame is exactly what the stock controller would have done
+  controller.set_rack_trajectory_model(model, model.timestampEof + 500_000_000)
+  for _ in range(50):
+    torque, _, controller_log = controller.update(True, state, vehicle_model, params, False, .004, False, .2)
+    stock_torque, _, stock_log = stock.update(True, state, vehicle_model, params, False, .004, False, .2)
+    assert controller.rack_trajectory.status == STATUS_STALE_MODEL
+    assert controller_log.version == VERSION
+    assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(controller_log.f, stock_log.f, rel_tol=0.0, abs_tol=1e-12)
+
+
 def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
   car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
   controller = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
+  stock = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL)
   vehicle_model = VehicleModel(car_params)
   state = car.CarState.new_message()
   state.vEgo = 3.0
   params = log.VehicleParameters.new_message()
 
+  # without a model the stock torque controller steers, not zero torque
   torque, _, controller_log = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
-  assert torque == 0.0
-  assert controller_log.version == 6
+  stock_torque, _, _ = stock.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  assert torque != 0.0
+  assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
+  assert controller_log.active
+  assert controller_log.version == VERSION
+  assert controller.rack_trajectory_output is None
+  assert controller.rack_trajectory is not None
+  assert controller.rack_trajectory.status == STATUS_NO_MODEL
 
   model = messaging.new_message("modelV2").modelV2
   model.timestampEof = 1_000_000_000
@@ -888,9 +942,10 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   model.velocity.x = [3.0] * 6
 
   controller.set_rack_trajectory_model(model, 1_050_000_000)
-  torque, _, _ = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
-  assert torque == 0.0
-  assert controller.rack_trajectory is not None
+  torque, _, controller_log = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  stock_torque, _, _ = stock.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
+  assert controller_log.version == VERSION
   assert controller.rack_trajectory.status == STATUS_INVALID_ACTION_TIME
 
   model.action.desiredCurvatureTime = .5
@@ -1053,8 +1108,10 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   invalid_driver = LatControlTorque(car_params.as_reader(), car_interface(car_params), DT_CTRL, use_rack_trajectory=True)
   invalid_driver.set_rack_trajectory_model(model, 1_050_000_000)
   state.steeringTorque = math.nan
-  torque, _, _ = invalid_driver.update(True, state, vehicle_model, params, False, -.02, False, .2)
-  assert torque == 0.0
+  torque, _, controller_log = invalid_driver.update(True, state, vehicle_model, params, False, -.02, False, .2)
+  # invalid vehicle state hands the frame to the stock torque controller
+  assert torque != 0.0
+  assert controller_log.version == VERSION
   assert invalid_driver.rack_trajectory is not None
   assert invalid_driver.rack_trajectory.status == STATUS_INVALID_VEHICLE_STATE
 
@@ -1066,7 +1123,8 @@ def test_live_candidate_is_process_selected_and_fails_closed() -> None:
   invalid_model.action.desiredCurvatureTime = .5
   controller.set_rack_trajectory_model(invalid_model, 1_050_000_000)
   torque, _, controller_log = controller.update(True, state, vehicle_model, params, False, -.02, False, .2)
-  assert torque == 0.0
-  assert not controller_log.active
+  assert torque != 0.0
+  assert controller_log.active
+  assert controller_log.version == VERSION
   assert controller.rack_trajectory is not None
   assert controller.rack_trajectory.status == STATUS_INVALID_PATH

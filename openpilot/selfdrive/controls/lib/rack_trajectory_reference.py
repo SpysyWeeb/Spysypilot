@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from openpilot.selfdrive.controls.lib.drive_helpers import MIN_SPEED
 from openpilot.selfdrive.controls.lib.rack_trajectory_contracts import PathTarget, RackTarget
 from openpilot.selfdrive.controls.lib.rack_trajectory_planner import JerkLimitedRackPlanner
 
@@ -55,10 +56,13 @@ def model_path_targets(
       if not all(math.isfinite(value) for value in (time, speed, rate)) or time < 0.0 or time <= previous_time:
         valid = False
         break
-      if speed <= 0.0:
-        break
       times.append(time)
-      curvatures.append(rate / speed)
+      # a plan that stops inside the horizon still covers it. Below MIN_SPEED the yaw rate/speed
+      # ratio is ill-conditioned, so hold the last well-conditioned curvature: the wheel stays put.
+      if speed >= MIN_SPEED or not curvatures:
+        curvatures.append(rate / max(speed, MIN_SPEED))
+      else:
+        curvatures.append(curvatures[-1])
       speeds.append(speed)
       previous_time = time
 
@@ -73,7 +77,7 @@ def model_path_targets(
     plan_curvature = float(np.interp(query, times, curvatures))
     anchor_curvature = float(np.interp(float(scalar_action_plan_s), times, curvatures))
     curvature = scalar + plan_curvature - anchor_curvature
-    speed = max(.1, measured_speed + float(np.interp(query, times, speeds)) - float(np.interp(float(plan_time_now_s), times, speeds)))
+    speed = max(MIN_SPEED, measured_speed + float(np.interp(query, times, speeds)) - float(np.interp(float(plan_time_now_s), times, speeds)))
     angle = math.degrees(vehicle_model.get_steer_from_curvature(-curvature, speed, roll_rad)) + angle_offset_deg
     return curvature, speed, angle
 
