@@ -98,7 +98,8 @@ publishes at standstill, is a legal straight corridor, a reversing one is not. `
 defined here and shared. Typed capnp access; no `getattr` guards.
 
 ### force_stops.py
-`ForceStops.update(observation, car_state, lead, experimental_mode, enabled, model_valid) -> (v_cruise_cap, stop_x, holding)`.
+`ForceStops.update(observation, car_state, experimental_mode, enabled, model_valid) -> (v_cruise_cap, stop_x, holding)`; the observation
+carries lead presence/relevance, launch evidence and the corridor verdict, and `enabled` is the planner's own active signal.
 States: `idle → shaping → committed → holding → (committed | idle)`.
 - Entry requires Experimental mode (**entry only** — a later mode exit never releases a hold), no
   raw lead, a valid model, BLoTv2's tiers, path-length window and latch confidence, plus
@@ -108,7 +109,7 @@ States: `idle → shaping → committed → holding → (committed | idle)`.
   collapsing one (route 38 t=351); `LATCH_SETBACK`; `stop_x = max(remaining, −STOP_DISTANCE)`;
   `v_cruise_cap ≥ v_ego − DV_MAX`. Model invalid releases only after `MODEL_INVALID_RELEASE_S`.
 - `holding`: entered at `CS.standstill` while committed, or within 10 s of a lead or a gas tap breaking
-  a hold when the car is stopped again with stop evidence; `stop_x = 0` and `holding` forces
+  a commitment or a hold when the car is stopped with stop evidence; `stop_x = 0` and `holding` forces
   `shouldStop`, so `controlsd`'s `cruiseControl.resume` cannot pulse. Leaves to `committed` (not
   idle) at `v_ego ≥ 0.8 m/s`, so an unsigned wheel-speed flicker on a grade never drops the latch.
 - Release to idle: filtered launch evidence (`stop_release_open`, 0.30 s time constant); gas;

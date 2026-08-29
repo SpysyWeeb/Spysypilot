@@ -95,9 +95,11 @@ class TestEntry:
 
 
 class TestMovingReleases:
-  def test_raw_lead_hands_the_stop_to_the_lead_logic(self):
+  def test_raw_lead_hands_the_stop_to_the_lead_logic_and_the_hold_can_re_form(self):
     fs, _ = committed()
     assert run(fs, 0.05, obs(lead=True), car_state(10.0)).stop_x is None and not fs.forcing
+    assert run(fs, 3.0, obs(path_end=30.0, should_stop=False, braking=False), car_state(2.0)).stop_x is None
+    assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
 
   def test_brake_releases_and_gas_suppresses_shaping_for_the_grace(self):
     fs, _ = committed()

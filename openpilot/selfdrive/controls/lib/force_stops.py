@@ -43,7 +43,7 @@ QUALIFY_WORLD_TOLERANCE = 5.0
 RELEASE_RC = 0.30         # s, filter on the model's launch evidence while holding
 RELEASE_OPEN_THRESHOLD = 0.70
 RESUME_SPEED = 0.8        # m/s, above this a hold becomes a moving commitment again
-REARM_S = 10.0            # s, after a lead or a gas tap breaks a hold, stopping again with stop evidence re-enters it directly
+REARM_S = 10.0            # s, after a lead or a gas tap breaks a commitment or a hold, stopping with stop evidence re-enters the hold
 CLEAR_WINDOW_S = 4.0      # s, fallback release while holding: mostly clear, moving, lead-free model frames
 CLEAR_WINDOW_FRACTION = 0.8
 NO_CAP = math.inf
@@ -138,7 +138,9 @@ class ForceStops:
     if self.holding:
       return self._hold(obs, v_ego)
     if obs.lead_present:
-      # a raw lead while moving hands the stop back to the lead logic
+      # a raw lead while moving hands the stop back to the lead logic; a broken commitment may re-form as a hold
+      if self.forcing:
+        self.rearm_remaining = REARM_S
       self.reset()
       return ForceStopsResult()
 
