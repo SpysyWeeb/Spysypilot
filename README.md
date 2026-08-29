@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 0, no controller code yet, nothing field-tested.**
+**Status: ⚠️ in progress — phase 1 (behavior-preserving port of BLaTv2) landed; replay-equivalence gate and field test pending.**
 
 ## What it does
 
@@ -36,7 +36,22 @@ builds, never past a refuge island.
 
 ## What changed
 
-- `.gitmodules` / `opendbc_repo` — tracks SpysyWeeb/opendbc `blatv2-409-horizon`
-  (`69818202`), which selects the 409/+4/−7 Hyundai torque envelope and the matching panda
-  safety flag for the Palisade platform. Same pin as BLaTv2.
+- `openpilot/selfdrive/controls/lib/latcontrol_rack.py` — `LatControlRack(LatControl)`: steers with
+  the rack trajectory controller when it has a request and with a stock `LatControlTorque` (stepped
+  every frame, so it is warm) when it does not; logs into `lateralControlState.rackState`.
+- `openpilot/selfdrive/controls/lib/rack_trajectory.py` — BLaTv2's controller math (reference
+  compile, jerk-limited rack planner, reversal governor, rate estimator, torque tail) moved unchanged
+  into one module; only its re-export facade, an unused parameter and a test-only helper were dropped.
+- `openpilot/selfdrive/controls/controlsd.py` — selects `LatControlRack` when
+  `CarParams.lateralTuning.torque.useRackTrajectory` is set and fills the `rackState` union arm; no
+  brand-specific imports, no `isinstance` hooks.
+- `openpilot/selfdrive/controls/lib/latcontrol*.py` — `LatControl.update` gains `model` and
+  `mono_time_ns` for controllers that consume the model plan (as `lat_delay` was added upstream).
+- `openpilot/cereal/log.capnp` — `ControlsState.lateralControlState.rackState @67 :LateralRackState`;
+  `ModelDataV2.Action.desiredCurvatureTime @3`.
+- `openpilot/selfdrive/modeld/modeld.py` — publishes the plan time at which `desiredCurvature` is read.
+- `.gitmodules` / `opendbc_repo` — tracks SpysyWeeb/opendbc `BLaTv3` (`a2c02f09`): adds
+  `LateralTorqueTuning.useRackTrajectory`, set for the Palisade only when the queried platform code is
+  `LX` (not Telluride `ON`, not unknown), and gates the 409/+4/−7 envelope and its panda safety flag on
+  the same test, so unknown firmware fails closed to the stock controller and the stock 384/3/7 envelope.
 - `docs/BLaTv3_FAILURE_MODES.md` — the design-for-failure catalog.
