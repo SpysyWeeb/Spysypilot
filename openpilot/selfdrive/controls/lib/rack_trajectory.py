@@ -575,6 +575,7 @@ class RackTrajectoryController:
     self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
     self.direction_guard_scale = 1.0
+    self.releasing = False
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_filter = ReferenceFilter()
@@ -602,6 +603,7 @@ class RackTrajectoryController:
     self.transition_acceleration_limit = None
     self.previous_planned_lateral_accel = None
     self.direction_guard_scale = 1.0
+    self.releasing = False
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_filter.reset()
@@ -663,7 +665,7 @@ class RackTrajectoryController:
 
   def _early_release(self, raw_torque: float, applied_torque: float, targets: Sequence[PathTarget],
                      angle_offset_deg: float, torque_from_lateral_accel: Callable[[float, object], float],
-                     torque_params, direction_fraction: float) -> tuple[float, bool]:
+                     torque_params, target_motion_deg: float) -> tuple[float, bool]:
     # If the horizon shows the required torque flipping sign sooner than the EPS slew can shed the
     # torque it is actually applying and build the opposite side, begin releasing now: the fastest
     # release trajectory becomes a ceiling on how far the request may still ask in the old direction,
@@ -673,7 +675,15 @@ class RackTrajectoryController:
     # next leg's reversal for seconds while the wheel is still short of THIS leg's target, and
     # releasing on that foresight starves the turn (found closed-loop on route 2b's s-turn).
     applied_direction = math.copysign(1.0, applied_torque) if abs(applied_torque) > APPLIED_TORQUE_EPS else 0.0
-    if applied_direction == 0.0 or raw_torque * applied_direction <= 0.0 or direction_fraction < 0.0:
+    if applied_direction == 0.0 or raw_torque * applied_direction <= 0.0:
+      self.releasing = False
+      return raw_torque, False
+    if not self.releasing and raw_torque * target_motion_deg > 0.0:
+      # the ask is still doing the plan's own work -- driving the wheel toward a served target it has
+      # not reached (a turn-in, or an S-course leg being rebuilt while the horizon already carries the
+      # NEXT leg's reversal; both starved closed-loop on routes 2b/2c when released). A release may
+      # only BEGIN once the target has come back to, or past, the wheel -- old-direction torque then
+      # holds beyond the need. Latched, it rides through its own shed until the flip clears.
       return raw_torque, False
     now_rate = targets[0].rate_deg_s
     # the side a flip is judged against: the immediate target, or the applied torque itself when the
@@ -702,6 +712,7 @@ class RackTrajectoryController:
       previous_angle = angle
       previous_rate = path_target.rate_deg_s
     if flip_time is None:
+      self.releasing = False
       return raw_torque, False
     # the torque wanted on the other side, estimated cheaply as the feedforward at the flip target's
     # own lateral acceleration -- a stated approximation, not a re-run of the tracking law
@@ -709,10 +720,13 @@ class RackTrajectoryController:
     opposite = min(abs(float(torque_from_lateral_accel(flip_target.curvature * flip_speed ** 2, torque_params))), 1.0)
     release_budget_s = abs(applied_torque) / TORQUE_RATE_DOWN_PER_S + opposite / TORQUE_RATE_UP_PER_S
     if release_budget_s <= 0.0:
+      self.releasing = False
       return raw_torque, False
     blend = min(max(1.0 - (flip_time - release_budget_s) / release_budget_s, 0.0), 1.0)
     if blend <= 0.0:
+      self.releasing = False
       return raw_torque, False
+    self.releasing = True
     release_torque = applied_direction * max(0.0, abs(applied_torque) - TORQUE_RATE_DOWN_PER_S * self.dt)
     ceiling = blend * release_torque + (1.0 - blend) * raw_torque
     if abs(ceiling) >= abs(raw_torque):
@@ -967,7 +981,7 @@ class RackTrajectoryController:
       raw_torque = 0.0
     raw_torque, early_release = self._early_release(
       raw_torque, applied_torque, targets, params.angleOffsetDeg, torque_from_lateral_accel, torque_params,
-      direction_fraction,
+      target_angle - measured_angle,
     )
     torque = min(max(raw_torque, -1.0), 1.0)
     platform_saturated = torque != raw_torque

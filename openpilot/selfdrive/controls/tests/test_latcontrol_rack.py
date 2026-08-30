@@ -1200,12 +1200,13 @@ class TestLatControlRack(OpenpilotTestCase):
     controller = RackTrajectoryController()
     steady = PathTarget(-0.004, 15.0, 10.0, 5.0)
 
-    def walk(raw, applied, overrides, direction_fraction=0.0):
+    def walk(raw, applied, overrides, target_motion=0.0, latched=True):
+      controller.releasing = latched
       targets = [steady] * len(HORIZON_OFFSETS_S)
       for index, target in overrides.items():
         targets[index] = target
       return controller._early_release(raw, applied, targets, 0.0, lambda lateral_accel, _: lateral_accel, None,
-                                       direction_fraction)
+                                       target_motion)
 
     release_step = TORQUE_RATE_DOWN_PER_S * controller.dt
 
@@ -1225,9 +1226,17 @@ class TestLatControlRack(OpenpilotTestCase):
     assert walk(0.2, 0.9, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}) == (0.2, False)
     # nothing applied, nothing to release
     assert walk(1.2, 0.005, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}) == (1.2, False)
-    # never during a turn-in: the old-direction torque is still the torque the plan needs, even
-    # when the horizon already carries the next leg of an S-course
-    assert walk(1.2, 0.6, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}, direction_fraction=-0.01) == (1.2, False)
+
+    # ENTRY: a release may only begin once the served target has come back to (or past) the wheel;
+    # while the ask still drives toward an unreached target -- a turn-in, or an S-course leg being
+    # rebuilt with the next reversal already on the horizon -- it is blocked. Latched, it rides on.
+    flip = {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}
+    assert walk(0.599, 0.6, flip, target_motion=5.0, latched=False) == (0.599, False)  # target beyond wheel
+    torque, released = walk(0.599, 0.6, flip, target_motion=-5.0, latched=False)  # wheel beyond target
+    assert released and math.isclose(torque, 0.6 - release_step, abs_tol=1e-12)
+    assert controller.releasing
+    torque, released = walk(1.2, 0.6, flip, target_motion=5.0, latched=True)  # latched: the shed rides on
+    assert released and math.isclose(torque, 0.6 - release_step, abs_tol=1e-12)
 
     # a flip farther out than twice the reversal budget is left to the raw law; inside the
     # approach window the ceiling blends between the raw request and the release trajectory,
@@ -1241,10 +1250,12 @@ class TestLatControlRack(OpenpilotTestCase):
     torque, released = walk(1.2, 0.6, {3: far_flip})
     assert released and 0.0 < blend < 1.0 and math.isclose(torque, expected, abs_tol=1e-12)
 
-    # the gate boundary is exactly zero: at the need (0.0, and -0.0) the release may act
+    # the gate boundary is exactly zero: with the wheel exactly on the served target (a pre-flip
+    # hold, the design case) the release may begin
     for boundary in (0.0, -0.0):
-      torque, released = walk(1.2, 0.6, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}, direction_fraction=boundary)
-      assert released and torque < 1.2
+      torque, released = walk(0.599, 0.6, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)},
+                              target_motion=boundary, latched=False)
+      assert released and torque < 0.599
     # an immediate target exactly at zero: the flip is judged against the applied torque's own side
     zero_now = [PathTarget(0.0, 15.0, 0.0, 0.0)] * len(HORIZON_OFFSETS_S)
     zero_now[3] = PathTarget(0.003, 15.0, -6.0, 0.0)
@@ -1280,12 +1291,12 @@ class TestLatControlRack(OpenpilotTestCase):
     for flip_true in [1.5 - 0.01 * i for i in range(140)]:
       targets = [PathTarget(-0.0001, 15.0, slope * (flip_true - offset), -slope)
                  for offset in HORIZON_OFFSETS_S]
-      torque, _ = controller._early_release(1.0, 0.3, targets, 0.0, lambda lateral_accel, _: lateral_accel,
-                                            None, 0.0)
+      torque, _ = controller._early_release(0.3, 0.3, targets, 0.0, lambda lateral_accel, _: lateral_accel,
+                                            None, 0.0)  # wheel on target
       if previous is not None:
         assert abs(torque - previous) < 0.05, (flip_true, previous, torque)
       previous = torque
-    assert previous is not None and previous < 1.0
+    assert previous is not None and previous < 0.3
 
   def test_direction_fraction_fades_at_center(self):
     # a near-center dither with the plan lagging to one side must not pin the fraction at +/-1,
@@ -1315,12 +1326,20 @@ class TestLatControlRack(OpenpilotTestCase):
     self.CS.steeringAngleDeg = 15.0
     self.CS.steeringPressed = True
     model, curvature_now = self._flip_model(15.0)
-    controller = RackTrajectoryController()
-    controller.planner = JerkLimitedRackPlanner(15.0)
-    controller.set_model(model, 1_050_000_000)
-    output = controller.update(True, self.CS, self.VM, self.params, torque_params,
+
+    def run(applied):
+      controller = RackTrajectoryController()
+      controller.planner = JerkLimitedRackPlanner(15.0)
+      controller.set_model(model, 1_050_000_000)
+      return controller.update(True, self.CS, self.VM, self.params, torque_params,
                                lambda lateral_accel, _: lateral_accel, .2, curvature_now,
-                               applied_torque=.65)
+                               applied_torque=applied)
+
+    self.CS.steeringPressed = False
+    probe = run(0.0)
+    assert probe is not None
+    self.CS.steeringPressed = True
+    output = run(float(probe.torque))
     self.CS.steeringPressed = False
     assert output is not None
     assert output.early_release and output.driver_assist_limited
@@ -1344,12 +1363,18 @@ class TestLatControlRack(OpenpilotTestCase):
 
     baseline = run(0.0)
     assert not baseline.early_release
-    hold_sign = math.copysign(1.0, baseline.torque)
     assert abs(baseline.torque) > .65
-    released = run(hold_sign * .65)
+    # the EPS already carries the whole ask (holding at parity): the release begins and sheds
+    applied = baseline.torque
+    released = run(applied)
     assert released.early_release
     assert abs(released.torque) < abs(baseline.torque)
-    assert math.isclose(abs(released.torque), .65 - TORQUE_RATE_DOWN_PER_S * .01, abs_tol=1e-9)
+    assert math.isclose(abs(released.torque), abs(applied) - TORQUE_RATE_DOWN_PER_S * .01, abs_tol=1e-9)
+    # a target still beyond the wheel is a leg in progress: no release
+    self.CS.steeringAngleDeg = 10.0
+    leg_in_progress = run(applied)
+    self.CS.steeringAngleDeg = 15.0
+    assert not leg_in_progress.early_release
 
     steady_model, steady_curvature = self._flip_model(15.0, flip=False)
     controller = RackTrajectoryController()
@@ -1357,7 +1382,7 @@ class TestLatControlRack(OpenpilotTestCase):
     controller.set_model(steady_model, 1_050_000_000)
     steady = controller.update(True, self.CS, self.VM, self.params, torque_params,
                                lambda lateral_accel, _: lateral_accel, .2, steady_curvature,
-                               applied_torque=hold_sign * .65)
+                               applied_torque=applied)
     assert steady is not None and not steady.early_release
 
   def test_applied_torque_reaches_the_rack_log(self):
@@ -1384,7 +1409,7 @@ class TestLatControlRack(OpenpilotTestCase):
 
     unthreaded = run(0.0)
     assert not unthreaded.earlyRelease
-    threaded = run(0.7)
+    threaded = run(1.0)
     assert threaded.earlyRelease
     assert abs(threaded.output) < abs(unthreaded.output)
 
