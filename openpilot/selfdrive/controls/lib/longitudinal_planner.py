@@ -141,7 +141,8 @@ class LongitudinalPlanner:
                                             lateral_active=sm['carControl'].latActive, steering_pressed=sm['carState'].steeringPressed,
                                             roll=sm['vehicleParameters'].roll, accel_coast=accel_coast,
                                             torque_params=get_live_torque_params(sm),
-                                            lateral_state=LateralState.from_controls_state(sm['controlsState']))
+                                            lateral_state=LateralState.from_controls_state(sm['controlsState']),
+                                            gas_pressed=sm['carState'].gasPressed)
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]

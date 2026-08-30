@@ -119,6 +119,27 @@ class TestAnticipation(unittest.TestCase):
     kappa = np.full(N, 0.05)
     self.assertLess(float(curve_speed_limits(kappa, TORQUE, 0.0)[0]), math.sqrt(A_LAT_COMFORT / 0.05))
 
+  def test_a_gas_override_earns_a_grace_where_anticipation_never_brakes(self):
+    # route 0x2c t=885: released the pedal 1.4 m/s above the in-curve limit and the episode pulled it back to -1.0
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    model = make_model(9.0, np.full(N, 0.05))                                # ~2.5 m/s over the curve's limit
+    limiter.update(model, v_ego=9.0, lateral_active=True, lateral_state=tracking(), gas_pressed=True)
+    result = settle(limiter, model, 20, v_ego=9.0, a_ego=0.0, lateral_active=True, lateral_state=tracking())
+    self.assertEqual(result.a_target, 0.0)                                   # holds, does not brake
+    for _ in range(int(5.0 / DT_MDL)):                                       # the grace expires ...
+      result = limiter.update(model, v_ego=9.0, a_ego=0.0, lateral_active=True, lateral_state=tracking())
+    self.assertLess(result.a_target, -0.5)                                   # ... and the limit binds again
+
+  def test_the_brake_regime_still_runs_inside_the_grace(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    model = make_model(9.0, np.full(N, 0.05))
+    limiter.update(model, v_ego=9.0, lateral_active=True, lateral_state=tracking(), gas_pressed=True)
+    pinned = tracking(torque=0.97, error=0.5, lat=3.0, pinned=True)
+    for _ in range(int(BRAKE_ENTER_S / DT_MDL) + 2):
+      result = limiter.update(model, v_ego=9.0, a_ego=0.0, lateral_active=True, lateral_state=pinned)
+    self.assertEqual(limiter.regime, REGIME_BRAKE)
+    self.assertLess(result.a_target, 0.0)
+
   def test_a_straight_path_has_nothing_to_say(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
     result = settle(limiter, make_model(20.0), 5, v_ego=20.0, lateral_active=True, lateral_state=tracking())
