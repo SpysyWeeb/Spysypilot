@@ -37,7 +37,9 @@ ONSET_RATE_DOWN = 0.5
 MIN_TTC = 3.5
 MIN_SPEED = 1.0
 
-LEAD_DEPARTURE_SPEED = 0.3
+LEAD_DEPARTURE_SPEED = 0.5   # m/s of lead speed that releases at once; 0.3 released the hold for a lead that crept at
+                             # 0.65 m/s and stopped again (route 0x2b t=1540: StopReq cycled off and back on under a
+                             # standing car); slower creeps go through the confirmed path below
 LEAD_MOVING_SPEED = 0.25
 LEAD_DEPARTURE_CONFIRM = 0.2
 LEAD_DEPARTURE_CANCEL = 0.2

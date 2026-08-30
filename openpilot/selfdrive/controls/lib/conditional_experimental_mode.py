@@ -13,6 +13,10 @@ STOP_ENTRY_DEBOUNCE_S = 0.20
 STOP_RELEASE_HYSTERESIS_S = 0.75
 MODE_MIN_LATCH_S = 1.0
 STOP_INTENT_HOLD_S = 4.0
+STOP_HOLD_MIN_CONFIDENCE = 0.8  # while active, only early/strict/direct tiers refresh the hold: route 0x2b, lone 0.70-confidence
+                                # hint frames refreshed it 35+ times and kept the mode searching 17.5 s past the light
+CLEAR_CANCEL_S = 0.75           # s of sustained open road (a long, moving model path) that cancels the hold outright:
+                                # the road being clear is positive evidence the stop is behind us, not mere absence
 STANDSTILL_MIN_LATCH_S = 1.0
 RESUME_RELEASE_SPEED = 0.8
 POST_STOP_SUPPRESS_S = 2.0
@@ -28,6 +32,7 @@ class ConditionalExperimentalMode:
     self.reset()
 
   def reset(self):
+    self._open_elapsed = 0.0
     self.experimental_mode = False
     self.intent_filter.x = 0.0
     self.last_observation = StopObservation()
@@ -46,6 +51,7 @@ class ConditionalExperimentalMode:
 
   def _clear_evidence(self):
     self.intent_filter.x = 0.0
+    self._open_elapsed = 0.0
     self.last_observation = StopObservation()
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
@@ -80,8 +86,13 @@ class ConditionalExperimentalMode:
 
     confidence = obs.confidence if self.experimental_mode or not entry_veto else 0.0
     raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
-    if raw_stop:
+    if raw_stop and (not self.experimental_mode or confidence >= STOP_HOLD_MIN_CONFIDENCE):
+      # entry evidence arms the hold; once active, a lone borderline hint may not keep the search alive
       self._intent_hold_remaining = STOP_INTENT_HOLD_S
+    # sustained open road is positive clear evidence: it cancels the hold, and the ordinary clear hysteresis finishes the exit
+    self._open_elapsed = self._open_elapsed + self.model_dt if obs.release_open and not raw_stop else 0.0
+    if self._open_elapsed + 1e-9 >= CLEAR_CANCEL_S:
+      self._intent_hold_remaining = 0.0
     # a filter-only hint shortens entry, but cannot sustain an active latch after qualifying evidence disappears
     filtered = self.intent_filter.update(confidence if not self.experimental_mode or raw_stop else 0.0)
 

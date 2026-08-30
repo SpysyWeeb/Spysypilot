@@ -35,7 +35,10 @@ re-anchor on any obstacle handoff, faster commits, green release in three frames
 a creep floor, both tapering to a 0.15 m/s² kiss at walking pace) that latches through the MPC's hover and through standstill
 until a real launch; lead physics never blocked; and a one-way **release lift** that asks for less braking when the car's measured
 deceleration exceeds the plan's, because the Palisade's ESP releases the brake ~0.7 s behind the request. The owner's original June
-Smooth Stops design rehomed in the planner, with his accelerometer idea closing the loop.
+Smooth Stops design rehomed in the planner, with his accelerometer idea closing the loop. Since 2026-08-31 the kiss arrives a full
+ESP-release-lag before the wheels stop (0.40 m/s), the lead-departure pre-release needs 0.5 m/s, and Conditional Experimental Mode
+releases its stop search when the model's own path shows the road open — a lone borderline hint can start the search but not keep it
+alive past a green light.
 
 ## How it works (planned)
 

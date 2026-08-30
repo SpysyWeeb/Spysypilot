@@ -171,7 +171,10 @@ class TestLeadDeparturePreRelease:
       assert not release.update(True, True, lead(v=speed, d=4.3), None)
 
   def test_strong_measured_motion_releases_immediately(self):
-    assert LeadDeparturePreRelease().update(True, True, lead(v=0.4, d=4.3), None)
+    assert LeadDeparturePreRelease().update(True, True, lead(v=0.6, d=4.3), None)
+    # a creep is not a departure: 0.65 m/s that stopped again cycled the hold under a standing car (route 0x2b t=1540);
+    # below the immediate threshold the confirmed path decides
+    assert not LeadDeparturePreRelease().update(True, True, lead(v=0.4, d=4.3), None)
 
   def test_a_collapsed_prediction_reapplies_the_hold(self):
     release = LeadDeparturePreRelease()
