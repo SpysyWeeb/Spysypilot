@@ -23,6 +23,10 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 # stationary qualification parameters
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 LOW_SPEED_LEAD_MIN_CNT = 20  # ~1s at 20Hz: the unconfirmed low-speed override only trusts tracks that were
+LOW_SPEED_LEAD_MIN_TIME = 0.6  # s of travel: an unconfirmed track closer than this cannot become the lead. This radar's ground
+                               # returns live there -- a plate the car drove over (route 0x2a t=498, 2026-08-30) was tracked
+                               # from 3 m to under the bumper and became the lead at 1.1 m the moment it was old enough,
+                               # for a -2.6 m/s^2 landing -- and nothing useful can be done about a real object that close
                              # tracked in from a distance. A real stopped lead is tracked for seconds on
                              # approach; clutter and crossing traffic pop into existence at close range
                              # (seen max-braking a stop for a 0.8s ghost 3.6m ahead with modelProb 0.00)
@@ -104,7 +108,8 @@ class Track:
     # Radar points closer than 0.75, are almost always glitches on toyota radars
     # Require track age: vision-confirmed leads bypass this path entirely, so radar alone
     # only gets to declare a close lead for objects it tracked arriving (see LOW_SPEED_LEAD_MIN_CNT)
-    return abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (0.75 < self.dRel < 25) and (self.cnt >= LOW_SPEED_LEAD_MIN_CNT)
+    return (abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (self.cnt >= LOW_SPEED_LEAD_MIN_CNT)
+            and (max(0.75, LOW_SPEED_LEAD_MIN_TIME * v_ego) < self.dRel < 25))
 
   def __str__(self):
     ret = f"x: {self.dRel:4.1f}  y: {self.yRel:4.1f}  v: {self.vRel:4.1f}  a: {self.aLeadK:4.1f}"

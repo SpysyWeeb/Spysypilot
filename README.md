@@ -4,6 +4,10 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see 
 
 **Status: in progress — thin handoff rewrite of 2026-08-29, not yet field tested.**
 
+**2026-08-30 — radard's low-speed override gets a distance floor.** An unconfirmed radar return closer than 0.6 s of travel can no
+longer become the lead: on route 0x2a a stationary return the car drove over (tracked from 3 m to under the bumper) became the lead at
+1.1 m the moment it passed the 1 s age gate and put −2.6 m/s² into a landing. Below the stock 0.75 m floor nothing changes.
+
 ## What it does
 
 Kills the **"headbang" at the end of every stop**. Stock openpilot jumps to the `stopping` state the moment the
