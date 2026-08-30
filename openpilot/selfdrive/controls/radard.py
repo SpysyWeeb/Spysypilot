@@ -23,6 +23,10 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 # stationary qualification parameters
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
 LOW_SPEED_LEAD_MIN_CNT = 20  # ~1 s at 20 Hz before an unconfirmed close radar track can override vision
+LOW_SPEED_LEAD_MIN_TIME = 0.6  # s of travel: an unconfirmed track closer than this cannot become the lead. This radar's ground
+                               # returns live there -- a plate the car drove over (route 0x2a t=498, 2026-08-30) was tracked
+                               # from 3 m to under the bumper and became the lead at 1.1 m the moment it was old enough,
+                               # for a -2.6 m/s^2 landing -- and nothing useful can be done about a real object that close
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
@@ -105,7 +109,7 @@ class Track:
     return (
       abs(self.yRel) < 1.0
       and v_ego < V_EGO_STATIONARY
-      and 0.75 < self.dRel < 25
+      and max(0.75, LOW_SPEED_LEAD_MIN_TIME * v_ego) < self.dRel < 25
       and self.cnt >= LOW_SPEED_LEAD_MIN_CNT
     )
 
