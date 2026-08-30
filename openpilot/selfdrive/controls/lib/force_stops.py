@@ -47,6 +47,9 @@ QUALIFY_S = 0.3           # s of consistent strict, lead-free stop evidence on a
 QUALIFY_WORLD_TOLERANCE = 5.0
 RELEASE_RC = 0.30         # s, filter on the model's launch evidence while holding
 RELEASE_OPEN_THRESHOLD = 0.70
+RELEASE_OPEN_LENGTH = 30.0    # m, a path this long ...
+RELEASE_OPEN_FRAMES = 3       # ... for this many consecutive frames releases the hold at once (a green): the filtered path
+                              # needed ~0.4 s more, and a one- or two-frame flash (route 27 t=263) is not a green
 RESUME_SPEED = 0.8        # m/s, above this a hold becomes a moving commitment again
 REARM_S = 10.0            # s, after a lead or a gas tap breaks a commitment or a hold, stopping with stop evidence re-enters the hold
 CLEAR_WINDOW_S = 4.0      # s, fallback release while holding: mostly clear, moving, lead-free model frames
@@ -62,7 +65,9 @@ PROFILE_JERK = 2.0             # m/s^3, the candidate moves at most this fast (t
 PROFILE_LANDING = 2.5          # m, the constant-deceleration profile lands this far short of the committed point, so the
                                # column's easing landing has room with the car's actuation lag. The car stops about a metre
                                # past the landing (closed-loop plant), so this margin sets the stop position almost 1:1
-PROFILE_MIN_DISTANCE = 0.5     # m, closer than this to the landing the column owns the rest
+PROFILE_MIN_DISTANCE = 0.5     # m, past the committed point the column and the hold own everything
+PROFILE_MIN_TIME = 1.0         # s, the profile never plans to reach its landing sooner than this: the need tapers with
+                               # the speed (v/2 at the end) instead of blowing up as the landing closes (route 27 t=1052)
 PROFILE_MAX_DECEL = 3.0        # m/s^2, past this the approach is no longer a comfort matter; column and e2e remain
 PROFILE_HANDOVER_SPEED = 3.0   # m/s, the profile starts fading out here ...
 PROFILE_FADE_SPEED = 1.5       # m/s, ... and is gone here
@@ -102,13 +107,14 @@ class ForceStops:
     self.qualified_s = 0.0
     self.qualified_endpoint = None
     self.profile_accel = None
+    self._open_frames = 0
 
   def _profile(self, v_ego, a_ego):
     # constant deceleration to the landing, entered from the car's current acceleration and jerk-limited from there
-    distance = self.remaining - PROFILE_LANDING
-    if distance <= PROFILE_MIN_DISTANCE or v_ego <= PROFILE_FADE_SPEED:
+    if self.remaining <= PROFILE_MIN_DISTANCE or v_ego <= PROFILE_FADE_SPEED:
       self.profile_accel = None
       return None
+    distance = max(self.remaining - PROFILE_LANDING, v_ego * PROFILE_MIN_TIME)
     need = min(v_ego ** 2 / (2.0 * distance), PROFILE_MAX_DECEL)
     fade = float(np.clip((v_ego - PROFILE_FADE_SPEED) / (PROFILE_HANDOVER_SPEED - PROFILE_FADE_SPEED), 0.0, 1.0))
     start = self.profile_accel if self.profile_accel is not None else min(a_ego, 0.0)
@@ -121,9 +127,9 @@ class ForceStops:
       self.profile_accel = None
       return ForceStopsResult(0.0, max(self.remaining, -STOP_DISTANCE), True)
     if self.forcing:
-      profile_distance = max(self.remaining - MPC_PROFILE_OFFSET, 0.0)
-      cap = min(profile_distance / RAMP_TIME, math.sqrt(2.0 * A_STOP_ENVELOPE * profile_distance))
-      return ForceStopsResult(max(cap, v_ego - DV_MAX), max(self.remaining, -STOP_DISTANCE), False, self._profile(v_ego, a_ego))
+      # no speed cap once committed: the profile, the column and the hold own the stop. The cap's cruise floor used to land
+      # the car at -1.2 m/s^2 down to walking pace once the profile had faded (route 27 t=1053)
+      return ForceStopsResult(NO_CAP, max(self.remaining, -STOP_DISTANCE), False, self._profile(v_ego, a_ego))
     self.profile_accel = None
     return ForceStopsResult()
 
@@ -174,6 +180,11 @@ class ForceStops:
     tracking_lead = self.lead_filter.x > LEAD_GATE
     if self.holding:
       return self._hold(obs, v_ego, a_ego)
+    if obs.lane_change and not self.holding:
+      # the endpoint is about to belong to another lane (route 27 t=379: the through lane's line held a stop that the
+      # left-turn lane's line was 15 m beyond); drop shaping and any commitment and re-qualify on the new lane's path
+      self.reset()
+      return ForceStopsResult()
     if tracking_lead or (obs.lead_present and not self.forcing):
       # a lead while moving hands the stop to the lead logic; a broken commitment may re-form as a hold. A raw lead blocks a
       # new commitment, only a tracked one breaks an existing one: a single radar frame reset a red-light commitment 0.5 s
@@ -254,6 +265,10 @@ class ForceStops:
       self.rearm_remaining = REARM_S
       return ForceStopsResult()
     self.release_filter.update(1.0 if obs.release_open else 0.0)
+    self._open_frames = self._open_frames + 1 if (obs.path_end is not None and obs.path_end > RELEASE_OPEN_LENGTH) else 0
+    if self._open_frames >= RELEASE_OPEN_FRAMES:
+      self.reset()
+      return ForceStopsResult()
     stop_evidence = obs.should_stop or obs.strict_stop
     self.clear_window.append(not stop_evidence and obs.terminal_moving and obs.corridor_clear)
     window_clear = (len(self.clear_window) == self.clear_window.maxlen

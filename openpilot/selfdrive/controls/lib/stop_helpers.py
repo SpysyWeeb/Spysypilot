@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import math
 
+from openpilot.cereal import log
 from openpilot.selfdrive.controls.lib.longitudinal_lead import lead_present, relevant_lead
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -59,6 +60,7 @@ class StopObservation:
   committed_turn: bool = False
   release_open: bool = False
   corridor_clear: bool = False
+  lane_change: bool = False     # the model is changing lanes: its endpoint is about to belong to another lane
 
 
 def _finite(values):
@@ -151,4 +153,11 @@ def observe_model_stop(model, car_state, radar_state):
                          desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX, terminal_speed >= STOP_TERMINAL_SPEED_MAX,
                          relevant_lead(radar_state, v_ego, path_end),
                          lead_present(radar_state), committed_turn, stop_release_open(model),
-                         path_end > 0.0 and leads_clear_of_stop_path(model, path_end))
+                         path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model))
+
+
+def lane_changing(model):
+  try:
+    return model.meta.laneChangeState != log.LateralPlan.LaneChangeState.off
+  except (AttributeError, TypeError, ValueError):
+    return False
