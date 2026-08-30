@@ -4,8 +4,8 @@ from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.stop_landing import (CREEP_DECEL, CREEP_FADE_SPEED, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
-                                                            LAUNCH_FRAMES, LEAD_FULL_AUTHORITY, LEAD_LANDING_GAP, STALL_RELEASE_RATE, STALL_S,
-                                                            StopLanding, landing_bound, landing_floor)
+                                                            LAUNCH_FRAMES, LEAD_FULL_AUTHORITY, LEAD_LANDING_GAP, RELEASE_DEADBAND, RELEASE_GAIN,
+                                                            RELEASE_LIFT_MAX, STALL_RELEASE_RATE, STALL_S, StopLanding, landing_bound, landing_floor)
 
 NO_LEAD = LeadObservation()
 
@@ -146,3 +146,39 @@ class TestWatchdog:
     for _ in range(frames(5.0)):
       out = law.update(-2.0, 0.05, NO_LEAD, True)
     assert math.isclose(out, -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+
+
+class TestReleaseLift:
+  # route 0x2a (2026-08-30): the ESP follows a braking increase with ~0.2 s and a release with ~0.7 s, so the car brakes
+  # harder than the plan asks through every landing; the lift asks for less in proportion to the measured surplus
+  def test_the_lift_follows_the_measured_surplus_one_way_only(self):
+    law = landing(2.0, -1.0)
+    # the car brakes as asked, or less: nothing changes
+    assert law.update(-1.0, 2.0, NO_LEAD, True, a_ego=-1.0) == -1.0
+    assert law.update(-1.0, 2.0, NO_LEAD, True, a_ego=-0.6) == -1.0
+    # the car brakes 0.8 harder than asked: the request is lifted by gain * surplus less the deadband
+    expected = -1.0 + RELEASE_GAIN * 0.8 - RELEASE_DEADBAND
+    assert math.isclose(law.update(-1.0, 2.0, NO_LEAD, True, a_ego=-1.8), expected, rel_tol=1e-9, abs_tol=1e-9)
+    # capped
+    assert math.isclose(law.update(-2.5, 2.0, NO_LEAD, True, a_ego=-5.0), -2.5 + RELEASE_LIFT_MAX, rel_tol=1e-9, abs_tol=1e-9)
+    # no measurement, no lift
+    assert law.update(-1.0, 2.0, NO_LEAD, True) == -1.0
+
+  def test_the_lift_never_crosses_the_floor_or_the_leads_requirement(self):
+    law = landing(0.8, -0.6)
+    # a surplus at walking pace: the floor still holds the landing
+    assert math.isclose(law.update(-0.6, 0.8, NO_LEAD, True, a_ego=-1.6), -landing_floor(0.8), rel_tol=1e-9, abs_tol=1e-9)
+    # a stopped lead 8 m out at 3 m/s needs 9 / (2 * 4) = 1.125 m/s^2: the lift stops there
+    law = landing(3.0, -1.5)
+    needed = 3.0 ** 2 / (2.0 * (8.0 - LEAD_LANDING_GAP))
+    assert math.isclose(law.update(-1.5, 3.0, lead(8.0), True, a_ego=-2.5), -needed, rel_tol=1e-9, abs_tol=1e-9)
+    # a plan already braking less than the requirement is left alone, never pushed down to it (route 0x2a replay: a radar
+    # return at 1.1 m once turned this clamp into -3.5 m/s^2)
+    assert law.update(-0.8, 3.0, lead(8.0), True, a_ego=-0.8) == -0.8
+    assert law.update(-0.8, 3.0, lead(8.0), True, a_ego=-2.0) == -0.8
+
+  def test_the_lift_sleeps_at_walking_pace_and_on_a_positive_plan(self):
+    law = landing(0.2, -0.2)
+    assert math.isclose(law.update(-0.2, 0.1, NO_LEAD, True, a_ego=-1.0), -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+    law = landing(1.0, -0.5)
+    assert law.update(0.05, 1.0, NO_LEAD, True, a_ego=-1.0) == -landing_floor(1.0)

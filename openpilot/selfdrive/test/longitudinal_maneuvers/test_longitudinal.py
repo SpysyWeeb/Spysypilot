@@ -324,9 +324,21 @@ class TestStopLanding(OpenpilotTestCase):
     assert landing_excess(logs) <= 0.02
     # the same ramp with the law bypassed lands well outside it: the test is about the law, not the plant
     original = StopLanding.update
-    StopLanding.update = lambda self, a_target, v_ego, lead, stop_intent, launch=False: a_target
+    StopLanding.update = lambda self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None: a_target
     try:
       _, unbounded = Maneuver('red light with a late model ramp, no law', **kwargs).evaluate()
     finally:
       StopLanding.update = original
     assert landing_excess(unbounded) >= 0.5, landing_excess(unbounded)
+
+  def test_a_car_that_lets_go_of_the_brake_slowly_still_lands_close_to_the_law(self):
+    # the Palisade's ESP: ~0.2 s to take braking up, ~0.7 s to let it off (route 0x2a). Through that actuator the car may
+    # not brake much harder than the corridor allows in the last metres, and it still stops behind the lead
+    kwargs = {'duration': 25.0, 'initial_speed': 10.0, 'lead_relevancy': True, 'initial_distance_lead': 90.0,
+              'speed_lead_values': [0.0, 0.0], 'cruise_values': [10.0, 10.0], 'actuator_lag': (0.2, 0.7)}
+    valid, logs = Maneuver('stopped lead through a slow-release actuator', **kwargs).evaluate()
+    assert valid
+    v, d_rel = logs[:, 3], logs[:, 6]
+    assert np.any(v < 0.05), 'did not stop'
+    assert d_rel[-1] >= LEAD_LANDING_GAP
+    assert landing_excess(logs, lead=True) <= 0.15, landing_excess(logs, lead=True)

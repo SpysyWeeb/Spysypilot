@@ -46,6 +46,15 @@ LEAD_MIN_GAP_BUDGET = 0.5    # m, floor of that gap budget, keeps the requiremen
 STALL_S = 1.0                # s, the car not slowing under the corridor for this long ...
 STALL_PROGRESS = 0.02        # m/s, ... (speed not falling by this below its low mark) ...
 STALL_RELEASE_RATE = 0.15    # m/s^2 per s, ... shifts the whole corridor toward more braking this fast, while rolling
+# The car lets go of the brake slowly: the Palisade's ESP follows a braking increase with ~0.2 s and a release with ~0.7 s
+# (route 0x2a, 2026-08-30, request vs measured over 50 s of low-speed braking), so through a landing the car brakes harder
+# than the plan asks by 0.6 m/s^2 typically, 1.0 at worst. The landing closes the loop on the measured deceleration, one
+# way only: when the car decelerates more than the plan wants, the request is lifted in proportion, so the ESP starts
+# releasing early enough to arrive where the plan is. It never lifts above the floor or the lead's own requirement
+RELEASE_GAIN = 0.5           # of the measured surplus deceleration: a lagging actuator under proportional lift settles faster; kept well below
+                             # the gain where the ESP's dead time (~0.2 s) would make it ring
+RELEASE_DEADBAND = 0.1       # m/s^2 of surplus before the lift starts; the wheel-speed acceleration carries that much noise
+RELEASE_LIFT_MAX = 1.0       # m/s^2, the most the request is lifted above the plan
 
 
 def landing_bound(v_ego):
@@ -86,13 +95,14 @@ class StopLanding:
       self._stall_s += self.dt
     return max(self._stall_s - STALL_S, 0.0) * STALL_RELEASE_RATE
 
-  def update(self, a_target, v_ego, lead, stop_intent, launch=False):
+  def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None):
     """Bound the arbitrated acceleration target through a landing; returns the plan unchanged otherwise.
 
     lead is the planner's LeadObservation, stop_intent says the plan ends in a stop this frame, launch says the planner
-    itself is letting the car go (a lead-departure pre-release, a hold release). A landing starts on intent with the plan
-    braking more than the kiss below LANDING_SPEED, and then lasts -- through the MPC's hover around zero and through standstill -- until a
-    launch, the plan climbing above zero for LAUNCH_FRAMES in a row, or the speed leaving the window.
+    itself is letting the car go (a lead-departure pre-release, a hold release), a_ego is the car's measured acceleration
+    (None: no release lift). A landing starts on intent with the plan braking more than the kiss below LANDING_SPEED, and
+    then lasts -- through the MPC's hover around zero and through standstill -- until a launch, the plan climbing above
+    zero for LAUNCH_FRAMES in a row, or the speed leaving the window.
     """
     if v_ego >= LANDING_SPEED:
       self.reset()
@@ -114,12 +124,19 @@ class StopLanding:
     release = self._stall_release(v_ego)
     floor = landing_floor(v_ego)
     floor = floor + release if floor > 0.0 else 0.0
+    requirement = total_decel_requirement(v_ego, lead, LEAD_LANDING_GAP, LEAD_MIN_GAP_BUDGET)
     if lead.present and lead.distance < LEAD_FULL_AUTHORITY:
       bound = math.inf
     else:
       # the bound softens surplus braking only: whatever stopping LEAD_LANDING_GAP behind the lead needs always passes
-      bound = max(landing_bound(v_ego) + release, total_decel_requirement(v_ego, lead, LEAD_LANDING_GAP, LEAD_MIN_GAP_BUDGET))
-    output = min(a_target, -floor) if floor > 0.0 else a_target
+      bound = max(landing_bound(v_ego) + release, requirement)
+    output = a_target
+    if a_ego is not None and math.isfinite(a_ego) and v_ego > KISS_SPEED and a_target < 0.0:
+      # the car is braking harder than the plan asks: lift the request so the slow release lands where the plan is
+      lift = min(max(RELEASE_GAIN * (a_target - a_ego) - RELEASE_DEADBAND, 0.0), RELEASE_LIFT_MAX)
+      # never lifted above the lead's requirement; a plan already braking less than that is left where it is
+      output = min(a_target + lift, max(a_target, -requirement))
+    output = min(output, -floor) if floor > 0.0 else output
     output = max(output, -bound, ACCEL_MIN)
     self.active = output != a_target
     return output

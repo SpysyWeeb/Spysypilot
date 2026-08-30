@@ -32,6 +32,7 @@ class Maneuver:
     self.stop_line = kwargs.get("stop_line", None)
     self.stop_line_horizon_s = kwargs.get("stop_line_horizon_s", 5.0)
     self.e2e_landing_push = kwargs.get("e2e_landing_push", 0.0)
+    self.actuator_lag = kwargs.get("actuator_lag", None)
 
     self.duration = duration
     self.title = title
@@ -50,6 +51,7 @@ class Maneuver:
       stop_line=self.stop_line,
       stop_line_horizon_s=self.stop_line_horizon_s,
       e2e_landing_push=self.e2e_landing_push,
+      actuator_lag=self.actuator_lag,
     )
 
     valid = True

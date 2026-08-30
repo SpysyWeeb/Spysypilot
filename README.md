@@ -33,7 +33,9 @@ Since the 2026-08-29/30 field tests: the committed approach profile (front-loade
 re-anchor on any obstacle handoff, faster commits, green release in three frames, lane-change re-qualification, and the
 **landing law** — the planner's last word on every stop's final metres: a corridor (allowed braking 0.70·v + 0.30 m/s²,
 a creep floor, both tapering to a 0.15 m/s² kiss at walking pace) that latches through the MPC's hover and through standstill
-until a real launch; lead physics never blocked. The owner's original June Smooth Stops design rehomed in the planner.
+until a real launch; lead physics never blocked; and a one-way **release lift** that asks for less braking when the car's measured
+deceleration exceeds the plan's, because the Palisade's ESP releases the brake ~0.7 s behind the request. The owner's original June
+Smooth Stops design rehomed in the planner, with his accelerometer idea closing the loop.
 
 ## How it works (planned)
 
