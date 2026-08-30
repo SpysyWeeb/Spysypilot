@@ -14,7 +14,7 @@ class LatControl(ABC):
 
   @abstractmethod
   def update(self, active: bool, CS, VM, params, steer_limited_by_safety: bool, desired_curvature: float, curvature_limited: bool, lat_delay: float,
-             model=None, mono_time_ns=0):
+             model=None, mono_time_ns=0, applied_torque=0.0):
     pass
 
   def reset(self):

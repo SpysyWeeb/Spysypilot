@@ -13,7 +13,8 @@ class LatControlAngle(LatControl):
     self.sat_check_min_speed = 5.
     self.use_steer_limited_by_safety = CP.brand in ("tesla", "hyundai")
 
-  def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay, model=None, mono_time_ns=0):
+  def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay,
+             model=None, mono_time_ns=0, applied_torque=0.0):
     angle_log = log.ControlsState.LateralAngleState.new_message()
 
     if not active:

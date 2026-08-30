@@ -37,7 +37,7 @@ class LatControlRack(LatControl):
     self.output = None
 
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, curvature_limited, lat_delay,
-             model=None, mono_time_ns=0):
+             model=None, mono_time_ns=0, applied_torque=0.0):
     stock_torque, _, stock_log = self.torque.update(active, CS, VM, params, steer_limited_by_safety, desired_curvature,
                                                     curvature_limited, lat_delay)
     self.rack.set_model(model, mono_time_ns)
@@ -49,7 +49,7 @@ class LatControlRack(LatControl):
       self.output = None
     else:
       self.output = self.rack.update(active, CS, VM, params, self.torque.torque_params, self.torque.torque_from_lateral_accel,
-                                     lat_delay, desired_curvature)
+                                     lat_delay, desired_curvature, applied_torque=applied_torque)
       if self.output is None and self.rack.status == STATUS_STALE_MODEL:
         self.fallback_frames = self.fallback_hold_frames
 
@@ -105,6 +105,8 @@ class LatControlRack(LatControl):
     rack_log.nearSteeringAngleDeg = float(output.near_target_angle_deg)
     rack_log.directionGuarded = bool(output.direction_guarded)
     rack_log.driverAssistLimited = bool(output.driver_assist_limited)
+    rack_log.earlyRelease = bool(output.early_release)
+    rack_log.directionFraction = float(output.direction_fraction)
     rack_log.saturated = bool(self._check_saturation(output.saturated or self.steer_max - abs(output.torque) < 1e-3, CS,
                                                      steer_limited_by_safety, curvature_limited))
     self.torque.sat_time = self.sat_time

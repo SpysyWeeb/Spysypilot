@@ -954,6 +954,8 @@ struct ControlsState @0x97ff69c53601abf1 {
     nearSteeringAngleDeg @31 :Float32;  # the model's target at the action time, before the filter
     directionGuarded @32 :Bool;
     driverAssistLimited @33 :Bool;
+    earlyRelease @34 :Bool;
+    directionFraction @35 :Float32;
   }
 
   struct LateralAngleState {

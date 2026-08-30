@@ -136,7 +136,8 @@ class Controls:
                                                      self.steer_limited_by_safety, self.desired_curvature,
                                                      curvature_limited, lat_delay,
                                                      model=model_v2 if self.sm.valid['modelV2'] and self.sm.alive['modelV2'] else None,
-                                                     mono_time_ns=self.sm.logMonoTime['selfdriveState'])
+                                                     mono_time_ns=self.sm.logMonoTime['selfdriveState'],
+                                                     applied_torque=float(self.sm['carOutput'].actuatorsOutput.torque))
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
