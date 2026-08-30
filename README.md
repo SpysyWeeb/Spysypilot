@@ -2,7 +2,10 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 1 (behavior-preserving port of BLaTv2) merged into combo and field-validated 2026-08-29; phase 2 in progress: steps 2 and 3 (hold through model gaps; modeld's curvature preview as the rack path) merged into combo and field-validated 2026-08-29 (routes 00000023/24: every model frame carried the preview, all engaged frames `active`, no fallbacks, all stop approaches clean; the path-compile fix took controlsd from 36 % to 25 % of its core with zero skipped control frames); step 4 (bounded reference filter + scheduled preview) next.**
+**Status: ⚠️ in progress — phase 1 (behavior-preserving port of BLaTv2) merged into combo and field-validated 2026-08-29; phase 2 in progress: steps 2 and 3 (hold through model gaps; modeld's curvature preview as the rack path) merged into combo and field-validated 2026-08-29 (routes 00000023/24: every model frame carried the preview, all engaged frames `active`, no fallbacks, all stop approaches clean; the path-compile fix took controlsd from 36 % to 25 % of its core with zero skipped control frames); step 4 (bounded reference filter + scheduled preview) merged 2026-08-29, corrected 2026-08-30 after its first
+drive (the preview no longer replaces the near target) and field-validated 2026-08-30 (route 00000029: the served target within
+0.03 m/s² of the near target's demand while the preview is open, all engaged frames `active`, no preview with hands on). Next:
+phase 3, the rack-aware output stage.**
 
 ## What it does
 
@@ -74,6 +77,7 @@ builds, never past a refuge island.
   52 such cycles in 46 min, 0.05–0.14 m/s² of the near target's correction ignored while open) — it only earns the tracker a calmer
   reference (filter time constant 0.1 → 0.3 s) and a longer response time (0.4 → 0.5 s). Costs
   +0.4 ms a frame on the device.
+  Field-validated 2026-08-30 (route 00000029, "road test good").
   Open-loop replay on routes 00000020–24 (754k engaged frames, all `active`, no fallbacks): at 5–30 mph the served
   target's per-frame step p95 1.1–2.1° → 0.27–0.52° and its reversals −85–92 %, never more than 3° from the model's;
   the twelve largest low-speed turn-ins/unwinds per route pass within that bound with no far preview; the recorded
