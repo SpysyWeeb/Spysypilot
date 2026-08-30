@@ -22,6 +22,7 @@ not add tuning knobs or toggles. Standalone BLoTv3 runs on the stock opendbc poi
 | MPC response cost and dynamic headway | `necessity_supervisor.py` (`NecessitySupervisor`) |
 | Lead trajectory and obstacle optimization | stock Acados MPC; `long_mpc.py` sets weights once per frame |
 | Cruise acceleration target and final arbitration | `longitudinal_planner.py` |
+| Landing bound on every stop's last metres | `stop_landing.py` (plannerd), applied after the arbitration |
 | Stop profile and standstill handoff | stock `longcontrol.py`; `smooth-stops` in `combo` |
 | Vehicle command limits / safety ceiling | opendbc / panda |
 
@@ -52,6 +53,7 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 | D19 | No speed cap once committed | `v_cruise_cap` is `NO_CAP` while forcing: the shaping cap's cruise floor used to land the car at −1.2 down to walking pace once the profile had faded (route 27 t=1053); the profile, the MPC column (which eases −0.9 → −0.4) and the hold own a committed stop |
 | D20 | e2e against a committed profile | while the profile is moving the car, the model's own request joins the arbitration only if it is more urgent by `E2E_STOP_MARGIN` (0.5 m/s²): its late ramp used to overtake the flat profile through `min()` and put the heavy braking back at the end (route 27 t=250) |
 | D21 | Green release and lane changes | a path longer than `RELEASE_OPEN_LENGTH` (30 m) for `RELEASE_OPEN_FRAMES` (3) releases a hold at once (saves ~0.2 s of the ~0.5 s the filtered release took; a one- or two-frame flash, route 27 t=263, does not); a lane change (`meta.laneChangeState`) drops shaping and a moving commitment so the stop re-qualifies on the new lane's endpoint (route 27 t=379: the through lane's line held a stop 15 m short of the left-turn lane's) |
+| D22 | Landing law for every stop (2026-08-30) | the planner bounds the arbitrated target through the last metres of any stop: below `LANDING_SPEED` (3.5 m/s), with stop intent, allowed braking is `LANDING_K`·v + `LANDING_C` (0.70·v + 0.30: 1.35 m/s² at 1.5 m/s, 0.65 at 0.5), so the speed decays exponentially into the stop instead of the plan stepping into the ESP's bite. It only removes surplus braking: a lead within `LEAD_FULL_AUTHORITY` (5 m) switches it off, the braking that stopping `LEAD_LANDING_GAP` (4 m) behind a lead needs always passes (`total_decel_requirement`), a watchdog releases the bound at 0.15 m/s² per second once the car has not slowed for 1 s, and a 0.40 m/s² creep floor below 1 m/s keeps the stop completing. The landing latches once started (the model's stop bit flickers; the landing must not). This is the owner's original Smooth Stops design (sunnypilot `smooth-stops-dev` v01–v13, June 2026 — a planner-side cap the July re-port had lost), rehomed here because D13/D18's taper only covers committed stops: over routes 23–27 the lead-free landings exceeded this law in 32–66 % of their last-3 m/s frames, by up to 1.1 m/s² at walking pace, and the e2e, MPC-column and cruise-floor landings had no law at all |
 | D17 | Latched point follows a drifting endpoint | the forward extension (`EXTEND_RATE`/`EXTEND_DEADBAND`) needs only the model still calling the stop with latch confidence, not the latch window: route 25 t=1547 (field test 3) drifted 3 m beyond a frozen commitment and, with the 5 m setback, headed for a stop ~10 m short of the line |
 | D16 | Arbitration with e2e | unchanged: `min()` over MPC, cruise, e2e and the committed profile; with a front-loaded profile the car is slower when the model's late demand would come, so e2e loses the early phase and is milder late. Excluding e2e while committed stays an option if a drive shows otherwise |
 | D12 | Fallback to "stop as MPC obstacle only, no mode switching" | if after two fix rounds the phase-3 field test still shows a resume pulse or `shouldStop` dither at a real stop, or the driver had to break a hold at a green more than once per ~10 stops |
@@ -91,6 +93,15 @@ sensitivity; scoring a radar-only path against a model-anchored solve would prod
 warnings). The third-lead machinery is removed. The MPC's acceleration bound stays opendbc's
 `ACCEL_MAX` as in stock (BLoTv2's `min(ACCEL_MAX, 4.0)` always equalled it); only the cruise
 envelope carries the 4.0 m/s² launch request.
+
+### stop_landing.py
+`StopLanding.update(a_target, v_ego, lead, stop_intent) -> a_target` bounds the arbitrated target while a landing is
+live (D22): intent starts it, the plan lifting (`a_target >= 0`) or the speed leaving `(STANDSTILL_SPEED, LANDING_SPEED)`
+ends it. `landing_bound(v)` is the allowed braking. The planner computes intent as: a committed stop or hold, the MPC's own
+horizon ending below `STOP_INTENT_SPEED` (a stopped lead, the committed column), or the model calling a stop in Experimental
+mode (`should_stop`/`strict_stop`). The lead is the planner's `LeadObservation`; the gap physics come from
+`longitudinal_lead.total_decel_requirement`. `reset()` on the planner's reset. The law never sets the stop bit and never adds
+braking above the creep floor; LongControl's thin handoff (`smooth-stops`) still owns the clamp and the kiss below 0.3 m/s.
 
 ### longitudinal_planner.py
 Envelope (`a_max = 0.6 + 3.4 (1 − v/40)³`, clamped by opendbc's `ACCEL_MAX`), jerk schedule, ordinary-cruise
@@ -187,7 +198,7 @@ handoff frame; corridor rule with a 0.2-probability hypothesis; commit → hold 
 flickering model stop signal while holding never drops `shouldStop`; grade flicker returns to
 `committed`; lead passes through then fast re-entry; gas tap re-stop; CEM entry with a far lead;
 model hang releases within 0.5 s; pedal latency; the selfdrived hook keeps manual mode under
-override.
+override. Landing law: bound shape, window, intent latch through a flicker, close-lead authority, gap physics never blocked, watchdog release, creep floor; the planner bounds whichever candidate lands (e2e at walking pace) and not above the window or beside a close lead; plant: a stopped lead, a red light and a hard close lead stop all land inside the law and still stop, and the model's late ramp (`e2e_landing_push`) is bounded with the law and not without.
 
 ## 8. Field test log
 

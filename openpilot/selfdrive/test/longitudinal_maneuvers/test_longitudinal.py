@@ -1,6 +1,7 @@
 import itertools
 import numpy as np
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.stop_landing import LANDING_SPEED, LEAD_LANDING_GAP, LEAD_FULL_AUTHORITY, StopLanding, landing_bound
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized_class
 
@@ -252,3 +253,80 @@ class TestRedLightStop(OpenpilotTestCase):
     assert last_second.mean() >= 0.5 * peak, (last_second.mean(), peak)         # eased off at the end
     assert approach.max() <= 0.05, approach.max()                                # never lets go during the approach
     assert np.all(v[i_stop:] < 0.3), 'crept away after the stop'
+
+
+def landing_excess(logs, lead=False):
+  # the most the commanded braking exceeded the landing law through the last metres (0.3 m/s .. LANDING_SPEED, plan braking).
+  # Each row's plan was computed from the previous row's state (the plant logs after integrating), so the law is judged at
+  # that speed and gap; below 0.3 m/s the plant's own stop bit forces -0.5. With a lead, the braking that stopping
+  # LEAD_LANDING_GAP behind it needs passes
+  v, a, d_rel, v_lead = logs[:, 3], logs[:, 5], logs[:, 6], logs[:, 4]
+  excess = 0.0
+  for i in range(1, len(v)):
+    v_seen, d_seen, v_lead_seen = v[i - 1], d_rel[i - 1], v_lead[i - 1]
+    if not (0.3 <= v_seen < LANDING_SPEED) or a[i] >= 0.0:
+      continue
+    allowed = landing_bound(v_seen)
+    if lead:
+      if d_seen < LEAD_FULL_AUTHORITY:
+        continue
+      closing = max(v_seen - v_lead_seen, 0.0)
+      allowed = max(allowed, closing ** 2 / (2.0 * max(d_seen - LEAD_LANDING_GAP, 0.5)))
+    excess = max(excess, -a[i] - allowed)
+  return excess
+
+
+class TestStopLanding(OpenpilotTestCase):
+  def test_a_stopped_lead_is_landed_within_the_law_and_the_car_still_stops_behind_it(self):
+    maneuver = Maneuver('approach a stopped lead at 10 m/s', duration=25.0, initial_speed=10.0, lead_relevancy=True,
+                        initial_distance_lead=90.0, speed_lead_values=[0.0, 0.0], cruise_values=[10.0, 10.0])
+    valid, logs = maneuver.evaluate()
+    assert valid
+    v, d_rel = logs[:, 3], logs[:, 6]
+    assert np.any(v < 0.05), 'did not stop'
+    assert d_rel[-1] >= LEAD_LANDING_GAP, d_rel[-1]
+    assert landing_excess(logs, lead=True) <= 0.02
+
+  def test_a_red_light_is_landed_within_the_law(self):
+    maneuver = Maneuver('approach a red light at 14 m/s, seen 5 s out', duration=30.0, initial_speed=14.0,
+                        cruise_values=[14.0, 14.0], e2e=True, stop_line=160.0)
+    valid, logs = maneuver.evaluate()
+    assert valid
+    x, v = logs[:, 1], logs[:, 3]
+    stopped = np.flatnonzero(v < 0.05)
+    assert len(stopped) > 0, 'did not stop'
+    assert maneuver.stop_line - 5.0 <= x[int(stopped[0])] <= maneuver.stop_line
+    assert landing_excess(logs) <= 0.02
+
+  def test_a_lead_braking_hard_close_ahead_is_never_softened_into(self):
+    # the law only removes surplus braking: with a lead stopping 25 m ahead from 8 m/s the physics floor keeps the
+    # deceleration the gap needs, and the car lands behind the lead without a crash
+    maneuver = Maneuver('lead 25 m ahead brakes to a stop from 8 m/s', duration=20.0, initial_speed=8.0, lead_relevancy=True,
+                        initial_distance_lead=25.0, breakpoints=[0.0, 1.0, 3.5, 20.0], speed_lead_values=[8.0, 8.0, 0.0, 0.0],
+                        cruise_values=[8.0, 8.0, 8.0, 8.0])
+    valid, logs = maneuver.evaluate()
+    assert valid, 'crashed'
+    v, d_rel = logs[:, 3], logs[:, 6]
+    assert np.any(v < 0.05), 'did not stop'
+    assert d_rel.min() >= 2.0, d_rel.min()
+    assert landing_excess(logs, lead=True) <= 0.02
+
+  def test_the_models_late_ramp_is_bounded_and_the_car_still_stops_before_the_line(self):
+    # route 27 t=1052: the model's request ramps hard into the last metres of a stop the car is already landing. The law
+    # bounds that landing to its taper; the stop still lands short of the line
+    kwargs = {'duration': 30.0, 'initial_speed': 14.0, 'cruise_values': [14.0, 14.0], 'e2e': True, 'stop_line': 160.0, 'e2e_landing_push': 3.5}
+    valid, logs = Maneuver('red light with a late model ramp', **kwargs).evaluate()
+    assert valid
+    x, v = logs[:, 1], logs[:, 3]
+    stopped = np.flatnonzero(v < 0.05)
+    assert len(stopped) > 0, 'did not stop'
+    assert kwargs['stop_line'] - 5.0 <= x[int(stopped[0])] <= kwargs['stop_line'], x[int(stopped[0])]
+    assert landing_excess(logs) <= 0.02
+    # the same ramp with the law bypassed lands well outside it: the test is about the law, not the plant
+    original = StopLanding.update
+    StopLanding.update = lambda self, a_target, v_ego, lead, stop_intent: a_target
+    try:
+      _, unbounded = Maneuver('red light with a late model ramp, no law', **kwargs).evaluate()
+    finally:
+      StopLanding.update = original
+    assert landing_excess(unbounded) >= 0.5, landing_excess(unbounded)

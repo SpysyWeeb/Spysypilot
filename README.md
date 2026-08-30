@@ -29,6 +29,11 @@ upstream uses for the planner, and the defects found in the 2026-08-28 review of
   supervisor's policy while lead0 was still the nearest car.
 - `force_stops.py` existed in three divergent copies (`force-stops`, `BLoTv2`, `combo`).
 
+Since the 2026-08-29/30 field tests: the committed approach profile (front-loaded, tapered landing), the change-cost
+re-anchor on any obstacle handoff, faster commits, green release in three frames, lane-change re-qualification, and the
+**landing law** — the planner's last bound on every stop's final metres (allowed braking 0.70·v + 0.30 m/s² below
+3.5 m/s, lead physics never blocked), the owner's original June Smooth Stops design rehomed in the planner.
+
 ## How it works (planned)
 
 - **selfdrived** keeps owning the effective Chill/Experimental mode, exactly where stock publishes

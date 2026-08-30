@@ -45,12 +45,15 @@ def _model_lead_v3(x, v, prob):
   return lead
 
 
+E2E_PUSH_DISTANCE = 12.0  # m, the fake model's late ramp builds over this distance to the line
+
+
 class Plant:
   messaging_initialized = False
 
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
                enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
-               stop_line=None, stop_line_horizon_s=5.0):
+               stop_line=None, stop_line_horizon_s=5.0, e2e_landing_push=0.0):
     self.rate = 1. / DT_MDL
 
     if not Plant.messaging_initialized:
@@ -81,6 +84,9 @@ class Plant:
     # the way the real model calls a red light only a few seconds out
     self.stop_line = stop_line
     self.stop_line_horizon_s = stop_line_horizon_s
+    # extra braking the fake model asks for over the last metres before the line, the way the real model's request
+    # ramps late (route 24/27: -0.7 ... -1.3 -> -2.5 into the last seconds)
+    self.e2e_landing_push = e2e_landing_push
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
@@ -109,7 +115,8 @@ class Plant:
       x = self.speed * tc - 0.5 * a_req * tc ** 2
       v = np.maximum(self.speed - a_req * tc, 0.0)
       model.action.shouldStop = bool(d_line < 3.0)
-      model.action.desiredAcceleration = float(-0.7 * a_req)
+      push = self.e2e_landing_push * float(np.clip((E2E_PUSH_DISTANCE - d_line) / E2E_PUSH_DISTANCE, 0.0, 1.0))
+      model.action.desiredAcceleration = float(-0.7 * a_req - push)
     else:
       return
     position = log.XYZTData.new_message()
