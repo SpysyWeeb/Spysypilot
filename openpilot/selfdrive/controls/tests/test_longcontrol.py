@@ -2,8 +2,7 @@ from types import SimpleNamespace
 
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState, long_control_state_trans
-from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
-from openpilot.selfdrive.controls.lib.smooth_stops import HOLD_RELEASE_FRAMES
+from openpilot.selfdrive.controls.lib.smooth_stops import HOLD_RELEASE_FRAMES, STOP_KISS_DECEL
 
 
 class TestLongControlStateTransition(OpenpilotTestCase):
@@ -46,121 +45,53 @@ class TestLongControlStateTransition(OpenpilotTestCase):
 
 
 def long_control():
-  tuning = SimpleNamespace(
-    kpBP=[0.0],
-    kpV=[1.0],
-    kiBP=[0.0],
-    kiV=[0.0],
-  )
+  tuning = SimpleNamespace(kpBP=[0.0], kpV=[1.0], kiBP=[0.0], kiV=[0.0])
   return LongControl(SimpleNamespace(longitudinalTuning=tuning, stopAccel=-2.0))
 
 
-def car_state(v_ego, standstill=False):
+def car_state():
   return SimpleNamespace(
-    vEgo=v_ego,
+    vEgo=0.0,
     aEgo=0.0,
     brakePressed=False,
-    standstill=standstill,
-    cruiseState=SimpleNamespace(standstill=standstill),
+    standstill=True,
+    cruiseState=SimpleNamespace(standstill=False),
   )
 
 
-def hold_car_state():
-  CS = car_state(0.0, True)
-  CS.cruiseState.standstill = False
-  return CS
-
-
-class TestSmoothStopLongControlIntegration(OpenpilotTestCase):
-  def test_engaged_rolling_stop_stays_in_pid_settle(self):
-    control = long_control()
-    output = control.update(
-      True,
-      car_state(0.6),
-      -0.4,
-      True,
-      (-3.5, 2.0),
-      LeadObservation(),
-    )
-    assert control.long_control_state == LongCtrlState.pid
-    assert output <= -0.4
-
-  def test_true_standstill_hands_off_to_stock_hold(self):
+class TestSmoothStopHandoff(OpenpilotTestCase):
+  def test_the_clamp_waits_for_the_car_to_stop_and_the_landing_owns_the_meantime(self):
     control = long_control()
     control.long_control_state = LongCtrlState.pid
-    control.update(
-      True,
-      car_state(0.04),
-      -0.1,
-      True,
-      (-3.5, 2.0),
-      LeadObservation(),
-    )
-    assert control.long_control_state == LongCtrlState.stopping
+    control.last_output_accel = -0.4
+    rolling = car_state()
+    rolling.vEgo = 0.25
+    rolling.standstill = False
+    output = control.update(True, rolling, -0.05, True, (-3.5, 2.0))
+    assert control.long_control_state == LongCtrlState.pid               # still rolling: no clamp
+    assert output <= -STOP_KISS_DECEL                                     # the landing keeps the kiss on
+    stopped = car_state()
+    control.update(True, stopped, -0.05, True, (-3.5, 2.0))
+    assert control.long_control_state == LongCtrlState.stopping          # stopped: the clamp arms
 
-  def test_hold_release_is_debounced_before_pid(self):
-    control = long_control()
-    control.long_control_state = LongCtrlState.stopping
-    control.smooth_stop.arm_hold()
-    for _ in range(HOLD_RELEASE_FRAMES - 1):
-      control.update(
-        True,
-        car_state(0.0),
-        0.2,
-        False,
-        (-3.5, 2.0),
-        LeadObservation(),
-      )
-      assert control.long_control_state == LongCtrlState.stopping
-
-    control.update(
-      True,
-      car_state(0.0),
-      0.2,
-      False,
-      (-3.5, 2.0),
-      LeadObservation(),
-    )
-    assert control.long_control_state == LongCtrlState.pid
-
-  def test_route17_plan_chatter_does_not_release_hold(self):
-    # plan chatter shorter than the release debounce never lets go of the hold, lead or not
+  def test_plan_chatter_shorter_than_the_debounce_does_not_release_the_hold(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.last_output_accel = -0.75
     control.smooth_stop.arm_hold()
-    stopped_lead = LeadObservation(True, distance=4.3, speed=0.262)
-
     states = []
-    outputs = []
     for should_stop in [True] * 20 + [False] * (HOLD_RELEASE_FRAMES - 1) + [True] * 20:
-      outputs.append(control.update(True, hold_car_state(), -0.24, should_stop, (-3.5, 2.0), stopped_lead))
+      control.update(True, car_state(), -0.24, should_stop, (-3.5, 2.0))
       states.append(control.long_control_state)
-
     assert set(states) == {LongCtrlState.stopping}
-    assert all(output <= -0.75 for output in outputs)
 
-  def test_stopped_lead_release_is_the_same_debounce(self):
-    # a stopped lead in radar view adds nothing to the wait: the car's own standstill exit already costs ~1.3 s
+  def test_the_hold_releases_after_the_debounce(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.smooth_stop.arm_hold()
-    stopped_lead = LeadObservation(True, distance=4.3, speed=0.0)
-
-    control.update(True, hold_car_state(), 0.2, True, (-3.5, 2.0), stopped_lead)
+    control.update(True, car_state(), 0.2, True, (-3.5, 2.0))
     for _ in range(HOLD_RELEASE_FRAMES - 1):
-      control.update(True, hold_car_state(), 0.2, False, (-3.5, 2.0), stopped_lead)
+      control.update(True, car_state(), 0.2, False, (-3.5, 2.0))
       assert control.long_control_state == LongCtrlState.stopping
-    control.update(True, hold_car_state(), 0.2, False, (-3.5, 2.0), stopped_lead)
-    assert control.long_control_state == LongCtrlState.pid
-
-  def test_measured_lead_departure_releases_immediately(self):
-    control = long_control()
-    control.long_control_state = LongCtrlState.stopping
-    control.smooth_stop.arm_hold()
-    stopped_lead = LeadObservation(True, distance=4.3, speed=0.0)
-    moving_lead = LeadObservation(True, distance=4.3, speed=0.4)
-    control.update(True, hold_car_state(), 0.2, True, (-3.5, 2.0), stopped_lead)
-
-    control.update(True, hold_car_state(), 0.2, False, (-3.5, 2.0), moving_lead)
+    control.update(True, car_state(), 0.2, False, (-3.5, 2.0))
     assert control.long_control_state == LongCtrlState.pid

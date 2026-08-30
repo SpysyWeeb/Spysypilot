@@ -1,138 +1,72 @@
-"""Smooth Stops final-approach and standstill-handoff controller.
+"""Smooth Stops: the last 0.3 m/s of a stop, inside longcontrol.
 
-Smooth Stops owns only the last low-speed landing. The planner remains the
-collision-avoidance authority: any stronger planner braking passes through
-immediately.
+The planner owns the approach and its ease-off; its stop bit (`should_stop`, v < 0.3 m/s) hands the last few
+decimetres to this controller, which has exactly two jobs:
+
+* never clamp while rolling -- stock jumps to the `stopping` state (a ramp to stopAccel) the moment the stop bit sets,
+  i.e. while the car is still moving; the hold is armed here only once the car has actually stopped;
+* guarantee the stop completes, gently -- the plan's own request may fade to nothing right at the end; at least a small
+  "kiss" of braking stays on, and if the car stops making progress (a grade, creep torque) the pressure ratchets up
+  until it does. Harder planner braking always passes straight through.
+
+Field audit 2026-08-29 (routes 23-27, 22 stops, CAN-decoded): this window is the last 0.3 m/s and lasts under 1.3 s; a
+lead floor and a queue-aware anti-creep ratchet that lived here never triggered, and the planner already owns leads, so
+they are gone; below ~0.3 m/s the Palisade's ESP brings the car to rest with its own brake whatever is requested.
 """
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_CTRL
-from openpilot.selfdrive.controls.lib.longitudinal_lead import (
-  LeadObservation,
-  closing_decel_requirement,
-)
 
-# Handoff to the stock standstill clamp.
-STANDSTILL_SPEED = 0.05
-STANDSTILL_HOLD_SPEED = 0.15
-HOLD_RELEASE_FRAMES = 10
+# Handoff to the hold clamp.
+STANDSTILL_SPEED = 0.05        # m/s, arm the stopping/hold clamp once the car is essentially stopped
+STANDSTILL_HOLD_SPEED = 0.15   # m/s, ceiling for trusting CS.standstill (the Palisade asserts it a hair early)
+HOLD_RELEASE_FRAMES = 2        # frames of should_stop=False before the hold releases. The planner's hold already corroborates
+                               # a launch; ~22 min of standstill on the audit routes showed no stop-bit flicker at all
 
-# Entry-anchored landing taper.
-STOP_KISS_DECEL = 0.12
-MIN_ENTRY_SPEED = 0.1
-SETTLE_JERK = 2.5
-
-# Relative-frame lead margin and anti-creep.
-STOP_GAP_MARGIN = 2.5
-MIN_GAP_BUDGET = 0.15
-PROGRESS_EPS = 0.02
-ANTI_CREEP_RATE = 0.50
-URGENT_GAP = 2.0
-URGENT_RATE_MULT = 4.0
-
-# A moving queue is not vehicle creep. Hysteresis rejects threshold chatter,
-# and a short radar dropout does not permanently ratchet in more brake.
-LEAD_MOVING_ENTER = 0.30
-LEAD_MOVING_EXIT = 0.18
-LEAD_DROPOUT_GRACE = 0.50
-CREEP_DECAY_RATE = 1.0
+# The landing.
+STOP_KISS_DECEL = 0.12         # m/s^2, the least braking kept on while the stop completes
+STALL_S = 0.5                  # s without progress before the ratchet starts
+STALL_RATE = 0.5               # m/s^2 per stalled second added until the car moves again toward the stop
+PROGRESS_EPS = 0.02            # m/s, a speed drop below the running minimum counts as progress
+SETTLE_JERK = 2.5              # m/s^3, smoothness of the landing command (planner braking is never feathered)
 
 
 class SmoothStopController:
-  """Feather a rolling stop to zero speed before entering the stock hold state."""
+  """The last 0.3 m/s: bound the plan from below by the kiss, ratchet on a stall, hand off to the clamp once stopped."""
 
   def __init__(self):
     self._no_stop_frames = 0
     self.reset()
 
   def reset(self) -> None:
-    self._v_min = float("inf")
+    self._v_min = float('inf')
     self._stall_s = 0.0
-    self._creep_decel = 0.0
-    self._entry_v = 0.0
-    self._entry_decel = 0.0
-    self._lead_moving = False
-    self._lead_dropout_s = 0.0
 
   def want_hold(self, should_stop: bool, v_ego: float, standstill: bool) -> bool:
-    return bool(should_stop and (
-      v_ego <= STANDSTILL_SPEED or (standstill and v_ego <= STANDSTILL_HOLD_SPEED)
-    ))
+    # the clamp lands on a stopped car: v at or below STANDSTILL_SPEED, or the car's own standstill flag while it is
+    # slow enough to be believed
+    return bool(should_stop and (v_ego <= STANDSTILL_SPEED or (standstill and v_ego <= STANDSTILL_HOLD_SPEED)))
 
   def arm_hold(self) -> None:
+    # every entry into the hold gets a fresh release debounce; reset() runs every frame while holding and must not
     self._no_stop_frames = 0
 
-  def hold_release(self, should_stop: bool, lead: LeadObservation | None = None) -> bool:
-    # Debounce the hold exit: the plan's should_stop can flicker false for a frame while
-    # stopped, which would blip the brake at standstill. Only release once should_stop has
-    # been false for HOLD_RELEASE_FRAMES straight; a measured departing lead releases at
-    # once. A stopped lead in radar view gets no longer wait: the plan owns departure
-    # confirmation, and the car itself needs ~1.3 s to exit standstill after the release
-    # (Palisade, field-measured 2026-08-29), so every extra frame here lands on launch latency.
-    lead = lead if lead is not None else LeadObservation()
-    if not should_stop and lead.present and lead.speed >= LEAD_MOVING_ENTER:
-      self._no_stop_frames = 0
-      return True
+  def hold_release(self, should_stop: bool) -> bool:
     self._no_stop_frames = 0 if should_stop else self._no_stop_frames + 1
     return self._no_stop_frames >= HOLD_RELEASE_FRAMES
 
-  def _update_lead_motion(self, lead: LeadObservation) -> bool:
-    if lead.present:
-      self._lead_dropout_s = 0.0
-      if lead.speed >= LEAD_MOVING_ENTER:
-        self._lead_moving = True
-      elif lead.speed <= LEAD_MOVING_EXIT:
-        self._lead_moving = False
-    elif self._lead_moving:
-      self._lead_dropout_s += DT_CTRL
-      if self._lead_dropout_s > LEAD_DROPOUT_GRACE:
-        self._lead_moving = False
-
-    return self._lead_moving
-
-  def settle(self, a_target: float, v_ego: float, last_output: float,
-             lead: LeadObservation | None = None) -> float:
-    lead = lead if lead is not None else LeadObservation()
-
-    # Latch the pressure present at settle entry and release it continuously as
-    # speed falls. This gives a no-step entry and the low residual "kiss."
-    if self._entry_v <= 0.0:
-      self._entry_v = max(v_ego, MIN_ENTRY_SPEED)
-      self._entry_decel = max(-last_output, STOP_KISS_DECEL)
-    landing = STOP_KISS_DECEL + (self._entry_decel - STOP_KISS_DECEL) * min(
-      max(v_ego, 0.0) / self._entry_v, 1.0,
-    )
-    a_settle = -landing
-
-    # Add only the braking required by relative closing motion. The old
-    # absolute-ego-speed floor over-braked equal-speed creeping queues.
-    creep_rate = ANTI_CREEP_RATE
-    if lead.present:
-      a_settle = min(a_settle, -closing_decel_requirement(
-        v_ego, lead, STOP_GAP_MARGIN, MIN_GAP_BUDGET,
-      ))
-      gap = max(lead.distance - STOP_GAP_MARGIN, MIN_GAP_BUDGET)
-      urgency = min(max(1.0 - gap / URGENT_GAP, 0.0), 1.0)
-      creep_rate *= 1.0 + urgency * (URGENT_RATE_MULT - 1.0)
-
-    # A trusted moving lead means ego is queue-following, not stuck against
-    # creep torque. Decay prior ratchet pressure smoothly and re-anchor progress
-    # at the current queue speed. Brief radar loss retains this state.
-    if self._update_lead_motion(lead):
+  def settle(self, a_target: float, v_ego: float, last_output: float) -> float:
+    # progress bookkeeping: the running minimum speed, and how long the car has not been getting slower
+    if v_ego < self._v_min - PROGRESS_EPS:
       self._v_min = v_ego
-      self._stall_s = max(self._stall_s - DT_CTRL, 0.0)
-      self._creep_decel = max(self._creep_decel - CREEP_DECAY_RATE * DT_CTRL, 0.0)
+      self._stall_s = 0.0
     else:
-      if v_ego < self._v_min - PROGRESS_EPS:
-        self._v_min = v_ego
-        self._stall_s = 0.0
-      else:
-        self._stall_s += DT_CTRL
-      self._creep_decel = max(self._creep_decel, creep_rate * self._stall_s)
+      self._stall_s += DT_CTRL
+    ratchet = STALL_RATE * max(self._stall_s - STALL_S, 0.0)
 
-    a_settle = max(a_settle - self._creep_decel, ACCEL_MIN)
+    # the plan, bounded from below by the kiss (plus whatever a stall has ratcheted in); harder plan braking passes through
+    a_settle = min(a_target, -(STOP_KISS_DECEL + ratchet))
+    a_settle = max(a_settle, ACCEL_MIN)
 
-    # Jerk-limit only comfort pressure. Stronger planner braking is an immediate
-    # pass-through so Smooth Stops cannot weaken collision avoidance.
+    # one smooth command: the landing may not step, in either direction
     step = SETTLE_JERK * DT_CTRL
-    a_settle = min(max(a_settle, last_output - step), last_output + step)
-    return min(a_settle, a_target)
+    return min(max(a_settle, last_output - step), last_output + step)
