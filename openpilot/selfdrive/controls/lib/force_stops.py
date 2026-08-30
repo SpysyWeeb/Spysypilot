@@ -229,8 +229,11 @@ class ForceStops:
 
     if not just_committed:
       self.remaining -= v_ego * self.dt
-    if (self.remaining > 0.0 and detected and latch_ready and self.detect_filter.x >= LATCH_THRESHOLD
+    if (self.remaining > 0.0 and detected and self.detect_filter.x >= LATCH_THRESHOLD
         and committed_length > self.remaining + EXTEND_DEADBAND):
+      # the latched point follows an endpoint that keeps sitting beyond it while the model still calls the stop; it
+      # is not gated on the latch window any more -- a slow forward drift of a far endpoint left a commitment 3 m
+      # short and the car heading for a stop ~10 m before the line (route 25 t=1547, field test 3)
       self.remaining = min(self.remaining + EXTEND_RATE * self.dt, committed_length)
     if self.remaining > 0.0 and v_ego < DOWN_SPEED and committed_length < self.remaining - DOWN_DEADBAND:
       self.remaining = max(self.remaining - DOWN_RATE * self.dt, committed_length)
