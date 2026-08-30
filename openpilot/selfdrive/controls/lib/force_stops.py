@@ -57,7 +57,8 @@ NO_CAP = math.inf
 # below is that shape as a plan candidate: the constant deceleration that lands short of the committed point,
 # jerk-limited, faded out at low speed so the column's own easing landing (and the hold) take the last metres.
 PROFILE_JERK = 2.0             # m/s^3, the candidate moves at most this fast (the owner builds braking at 1-2 m/s^3)
-PROFILE_LANDING = 4.5          # m, the constant-deceleration profile lands this far short of the committed point
+PROFILE_LANDING = 4.5          # m, the constant-deceleration profile lands this far short of the committed point, so the
+                               # column's easing landing has room even with the car's actuation lag
 PROFILE_MIN_DISTANCE = 0.5     # m, closer than this to the landing the column owns the rest
 PROFILE_MAX_DECEL = 3.0        # m/s^2, past this the approach is no longer a comfort matter; column and e2e remain
 PROFILE_HANDOVER_SPEED = 3.0   # m/s, the profile starts fading out here ...
@@ -170,9 +171,10 @@ class ForceStops:
     tracking_lead = self.lead_filter.x > LEAD_GATE
     if self.holding:
       return self._hold(obs, v_ego, a_ego)
-    if tracking_lead:
-      # a tracked lead while moving hands the stop back to the lead logic; a broken commitment may re-form as a hold.
-      # One radar frame is not a lead (route 24: a single frame reset a red-light commitment 0.5 s before the driver braked)
+    if tracking_lead or (obs.lead_present and not self.forcing):
+      # a lead while moving hands the stop to the lead logic; a broken commitment may re-form as a hold. A raw lead blocks a
+      # new commitment, only a tracked one breaks an existing one: a single radar frame reset a red-light commitment 0.5 s
+      # before the driver braked (route 24), and a flickering lead must not mint a commitment between its frames (route 23)
       if self.forcing:
         self.rearm_remaining = REARM_S
       self.reset()

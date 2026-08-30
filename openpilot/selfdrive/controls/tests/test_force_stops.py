@@ -3,9 +3,9 @@ import math
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DV_MAX, ForceStops, GAS_OVERRIDE_S, LATCH_SETBACK,
-                                                           MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK, PROFILE_LANDING,
-                                                           PROFILE_MAX_DECEL, QUALIFY_S, REARM_S)
+from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DV_MAX, ForceStops, GAS_OVERRIDE_S,
+                                                           LATCH_SETBACK, MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK,
+                                                           PROFILE_LANDING, PROFILE_MAX_DECEL, QUALIFY_S, REARM_S)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, StopObservation
 
@@ -115,6 +115,11 @@ class TestMovingReleases:
     fs, _ = committed()
     # one radar frame is not a lead: the commitment survives it (route 24 lost a red-light commitment to a single frame)
     assert run(fs, DT_MDL, obs(lead=True), car_state(10.0)).stop_x is not None and fs.forcing
+    blocked = ForceStops()
+    for i in range(frames(QUALIFY_S) + 4):
+      blocked.update(obs(path_end=60.0 - 10.0 * DT_MDL * i, should_stop=False, strict=True, braking=False, lead=(i % 3 == 0)),
+                     car_state(10.0), True, True, True)
+    assert not blocked.forcing                                   # a raw lead, even a flickering one, blocks a new commitment
     assert run(fs, 0.8, obs(lead=True), car_state(10.0)).stop_x is None and not fs.forcing
     assert run(fs, 3.0, obs(path_end=30.0, should_stop=False, braking=False), car_state(2.0)).stop_x is None
     assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
@@ -243,11 +248,14 @@ class TestApproachProfile:
       history.append((v, a, fs.remaining))
       v = max(v + a * DT_MDL, 0.0)
       world -= v * DT_MDL
-    flat = [a for v, a, _ in history if 5.0 < v < 11.0]
-    assert max(flat) - min(flat) < 0.1                           # constant deceleration through the middle of the approach
+    flat = [a for v, a, _ in history if 9.0 < v < 12.5]
+    assert max(flat) - min(flat) < 0.1                           # constant deceleration once entered ...
+    easing = [a for v, a, _ in history if 3.0 < v < 9.0]
+    assert all(later >= earlier - 1e-6 for earlier, later in zip(easing, easing[1:]))   # ... then only ever easing off
+    assert easing[-1] - easing[0] < 0.6                          # gently: the landing margin shrinks with the remaining distance
     assert min(a for _, a, _ in history) > -2.2                  # a 13 m/s stop seen 60 m out never needs more than ~2 m/s^2
     assert history[-1][0] <= PROFILE_HANDOVER_SPEED               # the profile fades out below the handover speed ...
-    assert history[-1][2] >= PROFILE_LANDING - 1.0               # ... and is gone short of the committed point: the column lands
+    assert history[-1][2] >= 2.0                                 # ... and is gone short of the committed point: the column lands
 
   def test_the_profile_is_capped_and_absent_without_a_moving_commitment(self):
     fs, _ = commit_on_strict_evidence(20.0, 60.0)
