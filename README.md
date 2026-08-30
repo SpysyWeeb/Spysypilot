@@ -47,7 +47,10 @@ a pedal tap no longer switches a manually enabled Experimental mode off, FCW kee
 the third-lead machinery is gone. Since 2026-08-30 the planner also bounds every stop's last metres with the
 landing law (D22: a corridor — allowed braking 0.70·v + 0.30 m/s², a creep floor, both tapering to a 0.15 m/s² kiss at
 walking pace — that latches through the MPC's hover and standstill until a real launch; lead physics never blocked; the owner's
-original June Smooth Stops design rehomed in the planner). The standstill hold stays on StopReq: a 2026-08-30 drive without it
+original June Smooth Stops design rehomed in the planner), and since 2026-08-30 a one-way **release lift**: the ESP takes braking
+up in ~0.2 s but lets it off in ~0.7 s, so when the car's measured deceleration exceeds the plan's the request is lifted in
+proportion (the owner's accelerometer idea). radard's low-speed override no longer adopts an unconfirmed return closer than 0.6 s
+of travel (a ground return the car drove over became the lead at 1.1 m on route 0x2a). The standstill hold stays on StopReq: a 2026-08-30 drive without it
 (route 29) showed the SCC building brake pressure at standstill without end, chasing a deceleration it cannot measure on a stopped
 car — the ESP's ~1.4 s standstill-exit sequence is the price of its own hold; Smooth Stops owns the standstill handoff (deferred
 clamp, kiss below 0.3 m/s), and the curve policy shapes cruise through curves. Design, owner decisions
