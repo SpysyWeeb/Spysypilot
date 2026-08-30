@@ -245,23 +245,29 @@ class LongitudinalPlanner:
       else:
         output_should_stop_e2e = False
 
+    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
+    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
+    cruise_should_stop = should_stop(v_ego, self.a_cruise)
+
     if sm['carState'].standstill:
       self.launch_armed = True
     elif v_ego > LAUNCH_DISARM_SPEED:
       self.launch_armed = False
-    if (self.launch_armed and experimental_mode and not output_should_stop_e2e and
-        np.interp(LAUNCH_COMMIT_T, T_IDXS_MPC, model_v) > LAUNCH_DISARM_SPEED):
-      t_cut = min(float(T_IDXS_MPC[np.argmax(model_v > LAUNCH_MOVING_SPEED)]), LAUNCH_COMMIT_T)
-      t_shifted = T_IDXS_MPC + t_cut
-      v_shifted = np.interp(t_shifted, T_IDXS_MPC, model_v)
-      a_shifted = np.interp(t_shifted, T_IDXS_MPC, model_a)
-      a_launch = get_accel_from_plan(v_shifted, a_shifted, T_IDXS_MPC, action_t=action_t)
+    if self.launch_armed and experimental_mode and not output_should_stop_e2e and v_ego < LAUNCH_DISARM_SPEED:
       a_launch_max = np.interp(v_ego, [LAUNCH_MOVING_SPEED, LAUNCH_DISARM_SPEED], [LAUNCH_MAX_ACCEL, 0.])
-      output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
-
-    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
-    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
-    cruise_should_stop = should_stop(v_ego, self.a_cruise)
+      if np.interp(LAUNCH_COMMIT_T, T_IDXS_MPC, model_v) > LAUNCH_DISARM_SPEED:
+        t_cut = min(float(T_IDXS_MPC[np.argmax(model_v > LAUNCH_MOVING_SPEED)]), LAUNCH_COMMIT_T)
+        t_shifted = T_IDXS_MPC + t_cut
+        v_shifted = np.interp(t_shifted, T_IDXS_MPC, model_v)
+        a_shifted = np.interp(t_shifted, T_IDXS_MPC, model_a)
+        a_launch = get_accel_from_plan(v_shifted, a_shifted, T_IDXS_MPC, action_t=action_t)
+        output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
+      elif self.anticipating and output_a_target_e2e >= 0.0:
+        # the path is open but the model's own plan has not committed to a launch (route 28 t=2245: +0.05 m/s^2 for a full
+        # second after the release, its shouldStop still set, its speed plan under 2 m/s at 3.5 s): launch on the cruise
+        # ramp instead -- the same ramp a Chill standstill launch uses -- under the assist's cap and taper. The lead
+        # candidate still guards a car ahead through the min(); a model request below zero keeps its own braking
+        output_a_target_e2e = max(output_a_target_e2e, min(self.a_cruise, a_launch_max))
 
     # the curve policy: anticipation from the model path, reaction to the measured steering state; one candidate
     # that can only lower the chosen acceleration

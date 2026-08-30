@@ -11,10 +11,12 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, ForceStopsResult
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LongitudinalPolicy
 from openpilot.selfdrive.controls.lib.stop_landing import KISS_DECEL, LEAD_FULL_AUTHORITY, landing_bound
-from openpilot.selfdrive.controls.lib.longitudinal_planner import (A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
+from openpilot.selfdrive.controls.lib.longitudinal_planner import (LAUNCH_MAX_ACCEL, LAUNCH_OPEN_LENGTH,
+                                                                   A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
                                                                    A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
                                                                    LongitudinalPlanner, get_cruise_accel, get_cruise_comfort_accel,
                                                                    get_max_accel, get_max_accel_request, ordinary_cruise_comfort_enabled)
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.test.longitudinal_maneuvers.plant import Plant, _PlantSubMaster
 
 LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
@@ -293,3 +295,77 @@ class TestStopLanding:
     assert all(s for _, s in held), 'stop bit dropped while the lead stood still'
     launched = [t for t, _, a, s in log if t > 14.0 and a > 0.1 and not s]
     assert launched and launched[0] - 14.0 < 1.5, launched[:1]                             # the lead leaving releases the landing
+
+
+class TestGreenLaunch:
+  # route 28 t=2245 (2026-08-30): the model's path opened at the green 1.5-2 s before its shouldStop bit cleared, and its own
+  # acceleration request stayed +0.05 m/s^2 the whole time; the e2e candidate won the min() and the car sat there
+  def planner_and_data(self, e2e_accel=0.05, lead_distance=None):
+    planner = LongitudinalPlanner(car.CarParams.new_message(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.5,
+                                                            steerRatio=CP.steerRatio, wheelbase=CP.wheelbase))
+    car_state = messaging.new_message('carState').carState
+    car_state.vEgo = 0.0
+    car_state.standstill = True
+    car_state.vCruise = 100.0
+    model = messaging.new_message('modelV2').modelV2
+    model.action.shouldStop = True
+    model.action.desiredAcceleration = e2e_accel
+    controls_state = messaging.new_message('controlsState').controlsState
+    controls_state.longControlState = LongCtrlState.stopping
+    selfdrive_state = messaging.new_message('selfdriveState').selfdriveState
+    selfdrive_state.enabled = True
+    selfdrive_state.experimentalMode = True
+    radar = messaging.new_message('radarState').radarState
+    if lead_distance is not None:
+      radar.leadOne.present = True
+      radar.leadOne.dRel = lead_distance
+      radar.leadOne.modelProb = 1.0
+    data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
+            'radarState': radar, 'carControl': messaging.new_message('carControl').carControl,
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+    return planner, data
+
+  @staticmethod
+  def set_path(model, length, terminal_speed):
+    # the model's plan: a path of the given length, its speed plan creeping up to terminal_speed (below the assist's 2 m/s commit)
+    n = ModelConstants.IDX_N
+    t = np.array(ModelConstants.T_IDXS)
+    model.position.x = [float(x) for x in np.linspace(0.0, length, n)]
+    model.velocity.x = [float(v) for v in np.linspace(0.0, terminal_speed, n)]
+    model.acceleration.x = [0.0] * n
+    model.position.y = [0.0] * n
+    _ = t
+
+  def run(self, planner, data, seconds):
+    targets = []
+    for _ in range(round(seconds / DT_MDL)):
+      planner.update(_PlantSubMaster(data, 0))
+      targets.append((float(planner.output_a_target), bool(planner.output_should_stop)))
+    return targets
+
+  def test_an_open_path_launches_on_the_cruise_ramp_when_the_models_own_plan_has_not_committed(self):
+    planner, data = self.planner_and_data()
+    self.set_path(data['modelV2'], 5.0, 0.0)
+    held = self.run(planner, data, 1.0)
+    assert all(stop for _, stop in held) and max(a for a, _ in held) <= 0.1
+    # the green: the path opens, the model's bit and its request lag
+    self.set_path(data['modelV2'], LAUNCH_OPEN_LENGTH * 2.0, 1.0)
+    launch = self.run(planner, data, 1.5)
+    released = [i for i, (_, stop) in enumerate(launch) if not stop]
+    assert released and released[0] * DT_MDL < 0.8, released[:1]                       # the stop bit clears on the open path
+    peak = max(a for a, _ in launch)
+    assert 1.0 <= peak <= LAUNCH_MAX_ACCEL + 1e-6, peak                                  # and the launch ramps under the cap ...
+    assert launch[released[0] + round(0.5 / DT_MDL)][0] >= 0.8                            # ... within half a second of the release
+
+  def test_the_boost_never_overrides_the_models_own_braking_or_a_lead(self):
+    planner, data = self.planner_and_data(e2e_accel=-0.3)
+    self.set_path(data['modelV2'], 5.0, 0.0)
+    self.run(planner, data, 1.0)
+    self.set_path(data['modelV2'], LAUNCH_OPEN_LENGTH * 2.0, 1.0)
+    # the model keeps braking: no launch (the landing corridor pins a standing car at its kiss, not at the model's -0.3)
+    assert max(a for a, _ in self.run(planner, data, 1.5)) < 0.0
+    planner, data = self.planner_and_data(lead_distance=6.0)
+    self.set_path(data['modelV2'], 5.0, 0.0)
+    self.run(planner, data, 1.0)
+    self.set_path(data['modelV2'], LAUNCH_OPEN_LENGTH * 2.0, 1.0)
+    assert max(a for a, _ in self.run(planner, data, 1.5)) <= 0.1
