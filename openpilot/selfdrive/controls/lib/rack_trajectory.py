@@ -81,6 +81,8 @@ class RackTrajectoryOutput:
   preview_time_s: float
   reference_limited: bool
   near_target_angle_deg: float
+  direction_guarded: bool
+  driver_assist_limited: bool
 
 
 MEASURED_RATE_FILTER_RC_S = .05
@@ -493,6 +495,7 @@ HORIZON_POSITION_TOLERANCE_DEG = .01
 HORIZON_RATE_TOLERANCE_DEG_S = .5
 HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
+TURN_IN_BLEND_DEG = 3.0  # the feedback cap blends between its two values over this much angle, not a boolean jump
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .5
 STALE_MODEL_S = 0.5  # SubMaster's alive window for modelV2: ten model frames
@@ -815,10 +818,13 @@ class RackTrajectoryController:
     target_angle = filtered_target.position_deg - params.angleOffsetDeg
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
     target_motion = target_angle - measured_angle + RESPONSE_TIME_S * filtered_target.rate_deg_s
-    turning_in = (
-      target_angle * measured_angle >= 0.0
-      and abs(target_angle) > abs(measured_angle)
-      and target_motion * target_angle > 0.0
+    # how much of a turn-in this frame is, continuously: the wheel on (or near) the target's side, the
+    # target beyond it, and the motion demanded toward it -- each condition a ramp, not a test (R7)
+    toward = math.copysign(1.0, target_angle) if target_angle != 0.0 else 0.0
+    turn_in_fraction = (
+      (1.0 - min(max(-measured_angle * toward / TURN_IN_BLEND_DEG, 0.0), 1.0))
+      * min(max((abs(target_angle) - abs(measured_angle)) / TURN_IN_BLEND_DEG, 0.0), 1.0)
+      * min(max(target_motion * toward / TURN_IN_BLEND_DEG, 0.0), 1.0)
     )
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
@@ -859,8 +865,9 @@ class RackTrajectoryController:
     )
     feedforward_torque = -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
 
-    curvature_per_degree = -VM.calc_curvature(math.radians(1.0), CS.vEgo, 0.0)
-    lateral_accel_per_degree = curvature_per_degree * CS.vEgo ** 2
+    # feedback keeps authority at standstill: the per-degree gain uses the floored speed (creep must correct)
+    curvature_per_degree = -VM.calc_curvature(math.radians(1.0), bound_speed, 0.0)
+    lateral_accel_per_degree = curvature_per_degree * bound_speed ** 2
     gain = self._feedback_gain(float(CS.vEgo))
     position_feedback = -float(torque_from_lateral_accel(
       gain * lateral_accel_per_degree * (plan.position_deg - CS.steeringAngleDeg), torque_params,
@@ -869,11 +876,9 @@ class RackTrajectoryController:
       gain * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate), torque_params,
     )) if measured_rate_valid else 0.0
     raw_feedback = position_feedback + rate_feedback
-    if turning_in:
-      feedback_lower = -MAX_TURN_IN_FEEDBACK_TORQUE if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
-      feedback_upper = MAX_TURN_IN_FEEDBACK_TORQUE if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
-    else:
-      feedback_lower, feedback_upper = -MAX_FEEDBACK_TORQUE, MAX_FEEDBACK_TORQUE
+    turn_in_cap = MAX_FEEDBACK_TORQUE + turn_in_fraction * (MAX_TURN_IN_FEEDBACK_TORQUE - MAX_FEEDBACK_TORQUE)
+    feedback_lower = -turn_in_cap if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
+    feedback_upper = turn_in_cap if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
     feedback = min(max(raw_feedback, feedback_lower), feedback_upper)
     feedback_limited = feedback != raw_feedback
     raw_torque = feedforward_torque + feedback
@@ -883,13 +888,13 @@ class RackTrajectoryController:
           and raw_torque * planned_angle < 0.0):
       raw_torque = 0.0
     torque = min(max(raw_torque, -1.0), 1.0)
-    torque_limited = torque != raw_torque
+    platform_saturated = torque != raw_torque
     if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
-      self.direction_guard_scale = 0.0
+      self.direction_guard_scale = max(0.0, self.direction_guard_scale - self.dt / DIRECTION_GUARD_RC_S)
     else:
       self.direction_guard_scale = min(1.0, self.direction_guard_scale + self.dt / DIRECTION_GUARD_RC_S)
     guarded_torque = torque * self.direction_guard_scale
-    torque_limited |= guarded_torque != torque
+    direction_guarded = guarded_torque != torque
     torque = guarded_torque
     motion_limited = (
       plan.rate_limited or plan.acceleration_limited or plan.jerk_limited
@@ -901,9 +906,10 @@ class RackTrajectoryController:
     )):
       self._invalidate(STATUS_INVALID_OUTPUT)
       return None
+    driver_assist_limited = False
     if CS.steeringPressed:
       assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
-      torque_limited |= assisted_torque != torque
+      driver_assist_limited = assisted_torque != torque
       torque = assisted_torque
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
@@ -926,14 +932,17 @@ class RackTrajectoryController:
       feedback_torque=feedback,
       feedback_limited=feedback_limited,
       motion_limited=motion_limited,
-      torque_limited=torque_limited,
+      torque_limited=platform_saturated or direction_guarded or driver_assist_limited,
       rate_limit_deg_s=limits.max_rate_deg_s,
       acceleration_limit_deg_s2=limits.max_acceleration_deg_s2,
       jerk_limit_deg_s3=limits.max_jerk_deg_s3,
       profile_transition=profile_transition,
       path_limited=path_limited,
-      infeasible=motion_limited or feedback_limited or torque_limited or profile_transition or path_limited,
-      saturated=feedback_limited or torque_limited,
+      infeasible=motion_limited or feedback_limited or platform_saturated or direction_guarded or driver_assist_limited
+      or profile_transition or path_limited,
+      saturated=platform_saturated,
+      direction_guarded=direction_guarded,
+      driver_assist_limited=driver_assist_limited,
       preview_time_s=preview_s,
       reference_limited=self.reference_filter.limited,
       near_target_angle_deg=target.angle_deg,
