@@ -63,6 +63,16 @@ builds, never past a refuge island.
   10 m/s the immediate target becomes the scalar itself instead of lagging it ~12 % while curvature
   builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
   Field-validated 2026-08-29 (route 00000024, "no complaints").
+- Phase 3, step 1 — continuity and truth-telling in the torque tail, from the phase-3 design panel
+  (`route-audit/phase3/design/phase3_design.md`): the turn-in feedback cap blends continuously between
+  its two values instead of jumping 0.35 units at a boolean; the direction guard ramps down at its own
+  time constant instead of snapping to zero; feedback keeps its authority at standstill (the per-degree
+  gain used the raw speed, so creep steering sat inert); `saturated` now means the platform ceiling
+  alone, with the direction guard and driver-assist cap logged as their own fields. Replay on routes
+  20–24/28 (1.0M engaged frames): 2–4 % of frames change, exactly where intended — three quarters of
+  all standstill frames (the restored authority), the direction-guard events (the old instant zero-torque
+  holes become a 0.12 s ramp-out, the largest deltas), and the turn-in boundary (|Δ| p99 0.009–0.036
+  at speed); everywhere else unchanged.
 - Phase 2, step 4 — the immediate target passes through a bounded reference filter and is read at a
   scheduled preview time; the small-reversal governor is retired. `ReferenceFilter`: first-order,
   τ = 0.1 s, and the served target may trail the model's by at most `min(0.2 m/s² / v², 3°)` — so a

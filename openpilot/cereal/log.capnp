@@ -952,6 +952,8 @@ struct ControlsState @0x97ff69c53601abf1 {
     previewTime @29 :Float32;  # seconds past the action time the immediate target is read at
     referenceLimited @30 :Bool;  # the served target trails the model's by the filter's bound
     nearSteeringAngleDeg @31 :Float32;  # the model's target at the action time, before the filter
+    directionGuarded @32 :Bool;
+    driverAssistLimited @33 :Bool;
   }
 
   struct LateralAngleState {

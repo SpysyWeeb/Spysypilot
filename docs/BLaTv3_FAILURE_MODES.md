@@ -350,11 +350,20 @@ red-team pass.
   ±50 ms: bounded, no oscillation.
 - **FM3.4 — Sign or convention error.** → Mirror property tests.
 - **FM3.5 — Discontinuity at a rule boundary.** → R7 sweeps, jump < 0.05.
+  *Phase 3 step 1 (2026-08-30): the turn-in feedback cap blends continuously between 0.35 and 0.7
+  over ±3° (`turn_in_fraction`, three ramps replacing three boolean tests) and the direction guard
+  ramps down at its own time constant instead of snapping to zero (`test_turn_in_feedback_cap_is_continuous`,
+  `test_direction_guard_ramps_down_not_snaps`). A flickering guard condition holds the scale mid-way
+  instead of draining — accepted: the condition only flickers while the pre-guard torque crosses zero,
+  where there is nothing worth suppressing.*
 - **FM3.6 — Saturation semantics.** *Three consumers read one flag: the driver alert (via
   `curvature_limited` too), lagd's data-quality gate, R4.* → Separate signals:
   `saturated` = platform limit; `feedbackLimited` distinct; `curvature_limited` handled
   separately in the alert path. → Feedback clipped 1 s at 0.6 torque: no alert; lagd gate
   unaffected.
+  *Phase 3 step 1: `saturated` now means the ±1.0 platform ceiling alone; the direction guard and
+  the driver-assist cap report as their own log fields (`directionGuarded` @32, `driverAssistLimited`
+  @33); `torqueLimited` stays their union for compatibility.*
 - **FM3.7 — Aligning feedforward on banked roads.** → Roll-compensated lateral accel. → Roll
   sweep ±5°: monotonic.
 - **FM3.8 — Rate signal quality.** Unsigned 4 °/s `SAS_Speed`; wrong sign 1–4 frames after a
@@ -365,6 +374,8 @@ red-team pass.
   stopped with the wheel off-center; first creeping frames. *`lateral_accel_per_degree =
   curvature_per_degree × vEgo²` with raw vEgo → gain 0 at v = 0.* → Feedback in angle space
   (no v² in the gain), or floor the same speed variable. → vEgo = 0, 10° error: converges.
+  *Phase 3 step 1: the per-degree feedback gain uses the floored speed (`bound_speed`), so creep and
+  standstill keep corrective authority (`test_feedback_keeps_authority_at_standstill`).*
 - **FM3.11 — Reversal cost invisible to the angle-space envelope. [v2]** Second half of the
   island jog right after firm torque the other way. *+4 up / −7 down per frame, sign-aware:
   a full reversal takes ~1.6 s.* → R9 reversal-cost model; start the return leg early enough

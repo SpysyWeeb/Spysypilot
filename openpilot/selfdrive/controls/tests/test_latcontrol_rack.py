@@ -37,6 +37,8 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   ReferenceFilter,
   reference_trail_limit_deg,
   RESPONSE_TIME_PREVIEW_S,
+  DIRECTION_GUARD_RC_S,
+  TURN_IN_BLEND_DEG,
   RESPONSE_TIME_S,
   STATUS_ACTIVE,
   STATUS_INACTIVE,
@@ -325,6 +327,97 @@ class TestLatControlRack(OpenpilotTestCase):
     assert quick[-1] > calm[-1] > 0.0
     # a step past the bound is served at the bound regardless of the time constant
     assert math.isclose(filter_.update(RackTarget(20.0, 100.0), 3.0, 0.01, rc_s=0.3).position_deg, 17.0)
+
+  def test_feedback_keeps_authority_at_standstill(self):
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = 0.0
+    CS.steeringAngleDeg = 10.0
+    params = log.VehicleParameters.new_message()
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [0.0] * 6)
+    output = None
+    for frame in range(300):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None
+    # a 10 degree error while stopped produces corrective torque toward zero, not silence
+    assert output.position_feedback_torque < -0.01
+
+  def test_turn_in_feedback_cap_is_continuous(self):
+    caps = []
+    assert TURN_IN_BLEND_DEG > 0.0
+    for offset in [x * 0.1 for x in range(-60, 61)]:
+      # sweep the target past the measured angle and record the cap the controller applies
+      controller = RackTrajectoryController()
+      controller.planner = JerkLimitedRackPlanner(5.0)
+      CS = car.CarState.new_message()
+      CS.vEgo = 15.0
+      CS.steeringAngleDeg = 5.0
+      params = log.VehicleParameters.new_message()
+      target_angle = 5.0 + offset
+      curvature = -self.VM.calc_curvature(math.radians(target_angle), CS.vEgo, 0.0)
+      model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [curvature * CS.vEgo] * 6, [CS.vEgo] * 6)
+      model.action.desiredCurvature = curvature
+      controller.set_model(model, 1_050_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, curvature)
+      assert output is not None
+      caps.append(output.feedback_torque)
+    steps = [abs(b - a) for a, b in zip(caps, caps[1:], strict=False)]
+    assert max(steps) < 0.06  # no 0.35-unit jump anywhere in the sweep (FM3.5)
+
+  def test_direction_guard_ramps_down_not_snaps(self):
+    # the plan still on the old side of a reversal while the target is across zero: feedback pulls
+    # toward the plan, opposing the target, and the guard drains the torque at its time constant
+    controller = RackTrajectoryController()
+    controller.planner = JerkLimitedRackPlanner(-8.0)
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    CS.steeringAngleDeg = 0.0
+    params = log.VehicleParameters.new_message()
+    target_angle = 5.0
+    curvature = -self.VM.calc_curvature(math.radians(target_angle), CS.vEgo, 0.0)
+    model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [curvature * CS.vEgo] * 6, [CS.vEgo] * 6)
+    model.action.desiredCurvature = curvature
+    controller.set_model(model, 1_050_000_000)
+    scales = []
+    for _ in range(4):
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, curvature)
+      assert output is not None
+      scales.append(controller.direction_guard_scale)
+    steps = [a - b for a, b in zip(scales, scales[1:], strict=False)]
+    assert all(0.0 < scales[i + 1] < scales[i] for i in range(len(scales) - 1))
+    assert all(abs(step - controller.dt / DIRECTION_GUARD_RC_S) < 1e-9 for step in steps)
+    assert output.direction_guarded and not output.saturated
+
+  def test_driver_assist_cap_reports_itself_not_saturation(self):
+    controller, state, update = build_feedforward_boundary_controller()
+    state.steeringPressed = True
+    state.steeringTorque = -300.0
+    output = None
+    for _ in range(20):
+      # a demand between the driver-assist cap and the platform ceiling: only the cap engages
+      output = update(torque_scale=2.0)
+      assert output is not None
+    assert abs(output.torque) == MAX_DRIVER_ASSIST_TORQUE
+    assert output.driver_assist_limited and not output.saturated
+
+  def test_saturated_means_the_platform_ceiling_only(self):
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 3.0
+    CS.steeringAngleDeg = 0.0
+    params = log.VehicleParameters.new_message()
+    curvature = 0.09
+    model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [curvature * 3.0] * 6, [3.0] * 6)
+    model.action.desiredCurvature = curvature
+    for frame in range(200):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.rack.set_model(model, model.timestampEof + 30_000_000)
+      controller.update(True, CS, VM, params, False, curvature, False, .2, model=model, mono_time_ns=model.timestampEof + 30_000_000)
+    # a huge demand at low speed rides the +-1.0 clip: the output reports it as saturation
+    assert controller.output is not None and abs(controller.output.torque) > 0.99
+    assert controller.output.saturated and not controller.output.driver_assist_limited
 
   def test_full_preview_keeps_steering_without_a_farther_target(self):
     controller = RackTrajectoryController()

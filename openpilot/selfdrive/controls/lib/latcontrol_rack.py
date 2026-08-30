@@ -103,6 +103,8 @@ class LatControlRack(LatControl):
     rack_log.previewTime = float(output.preview_time_s)
     rack_log.referenceLimited = bool(output.reference_limited)
     rack_log.nearSteeringAngleDeg = float(output.near_target_angle_deg)
+    rack_log.directionGuarded = bool(output.direction_guarded)
+    rack_log.driverAssistLimited = bool(output.driver_assist_limited)
     rack_log.saturated = bool(self._check_saturation(output.saturated or self.steer_max - abs(output.torque) < 1e-3, CS,
                                                      steer_limited_by_safety, curvature_limited))
     self.torque.sat_time = self.sat_time
