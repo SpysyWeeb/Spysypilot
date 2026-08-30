@@ -397,9 +397,15 @@ red-team pass.
   `raw · (served target − measured) > 0` (the ask still doing the plan's own work — subsumes turn-in
   and rebuild), then a one-bit latch rides the release through its own shed until the flip clears.
   All four replay windows (2b s-turn, route-23 owner unwind, 2c s-turn, 2c unwind) equal or better
-  vs step 1; closed-loop release duty 0–0.8 % — it binds only in its designed pocket, the
-  held-at-parity approach to a visible reversal. The anticipated-reversal
-  `max_rate` reduction is still open (a later step).*
+  vs step 1; closed-loop release duty 0–0.8 %. **RETIRED after the first field drive (route 2d,
+  2026-08-30, six owner bookmarks):** the rate-flip test reads a visible curve *exit* as a coming
+  reversal — during ordinary sustained curves a "flip" is present for seconds, entry opened at benign
+  wheel-past-target tracking dither, the latch had no exit when the target climbed back beyond the
+  wheel, and holding torque was shed mid-curve (output 0.44 → 0.05 in 1 s while the target rose; the
+  car ran wide). Lesson for the redesign: the flip detector must witness a true *torque sign
+  reversal* (an angle crossing with commitment), never a rate reversal, and any latch needs the
+  entry condition re-checked as an exit. The plumbing (carOutput applied torque, earlyRelease @34)
+  remains. The anticipated-reversal `max_rate` reduction is still open (a later step).*
 - **FM3.12 — Undebounced EPS fault bit resets the controller. [v2]** A 1–3 frame
   `CF_Mdps_ToiUnavail`/`ToiFlt` flicker during a firm turn. *`steerFaultTemporary` has no
   debounce; latActive drops; today the rack state is wiped and re-seeded.* → Below a short

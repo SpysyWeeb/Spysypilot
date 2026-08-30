@@ -64,14 +64,13 @@ builds, never past a refuge island.
   builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
   Field-validated 2026-08-29 (route 00000024, "no complaints").
 - Phase 3, step 2 — the controller reads the torque the EPS is actually applying (`carOutput`) and
-  uses it two ways. A slew-aware early release: the horizon targets are walked for the earliest coming
-  sign flip, and once the flip lands inside the platform's own reversal budget (release at 7/409 per
-  frame, rebuild at 4/409) the fastest-release trajectory becomes a ceiling on how far the request may
-  still ask in the old direction — never raising a request, never touching one already reversing, and
-  never while the ask is still doing the plan's own work: the release begins only once the served target
-  has come back to (or past) the wheel, then rides latched through its own shed (closed-loop replay
-  against the fitted rack plant caught two premature forms on the s-turns — a starved turn-in, and a leg
-  rebuilt through center trimmed because the S's next reversal was already visible). And the unwind magnitude clamp
+  uses it for the direction fraction below; a slew-aware early release was built, closed-loop
+  validated, and then RETIRED after its first field drive (route 2d, six owner bookmarks): the
+  rate-flip test read visible curve exits as coming reversals, so during ordinary sustained curves the
+  release latched at benign wheel-past-target dither and shed holding torque while the curve tightened
+  (output 0.44 → 0.05 in 1 s, the car ran wide toward the curb). With zero measured reversal-lag
+  benefit in every plant window, it is removed rather than re-gated; the applied-torque plumbing and
+  log fields stay for a future redesign against a true torque-reversal test. And the unwind magnitude clamp
   is retired: a signed continuous direction fraction relaxes only the rate feedback during unwinds, so a
   return the rack's own self-aligning torque is producing is not resisted, while the feedforward keeps
   following the plan. Closed-loop A/B vs step 1 on the four hardest windows (the 2b and 2c s-turns, the
