@@ -91,6 +91,7 @@ class LongitudinalPlanner:
     self.lead_departure = LeadDeparturePreRelease(dt)
     self.force_stops = ForceStops(dt)
     self.stop_landing = StopLanding(dt)
+    self.holding_prev = False
     self.mpc_a_target = init_a
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -135,6 +136,7 @@ class LongitudinalPlanner:
       self.supervisor.reset()
       self.lead_departure.reset()
       self.stop_landing.reset()
+      self.holding_prev = False
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -202,13 +204,19 @@ class LongitudinalPlanner:
       candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False))
 
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
-    self.output_should_stop = force_stop.holding or any(should_stop for _, _, should_stop in candidates)
-    # the landing law is the last bound on every stop's final metres, whichever candidate is landing it. Intent: a
+    # the landing law is the last word on every stop's final metres, whichever candidate is landing it. Intent: a
     # committed stop or hold, the MPC's own horizon ending in a stop (a stopped lead, the committed column), or the
-    # model calling a stop in Experimental mode; the law itself latches through the landing once started
+    # model calling a stop in Experimental mode. The law latches through the landing once started; the planner's own
+    # releases (a corroborated lead departure, a hold release) end it at once, a climbing plan ends it by itself
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
-    output_a_target = self.stop_landing.update(output_a_target, v_ego, lead, stop_intent)
+    launch = lead_departing or (self.holding_prev and not force_stop.holding)
+    self.holding_prev = force_stop.holding
+    output_a_target = self.stop_landing.update(output_a_target, v_ego, lead, stop_intent, launch)
+    # the stop bit follows the landed target too: the MPC's hover around zero at walking pace must not flicker it
+    # (route 28: one positive frame released the hold clamp under a stopped car)
+    self.output_should_stop = (force_stop.holding or any(should_stop for _, _, should_stop in candidates)
+                               or (self.stop_landing.landing and should_stop(v_ego, output_a_target)))
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
