@@ -28,8 +28,9 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 # Steering authority and comfort.
 TORQUE_BUDGET = 0.90          # of the EPS limit, the demand a path node may need at the speed the car will have there
-A_LAT_COMFORT = 3.0           # m/s^2, the owner's own turns (p90 of manual driving, routes 25/26). Inert on the Palisade today:
-                              # the authority binds first; it is the ceiling should the torque headroom grow
+A_LAT_COMFORT = 3.4           # m/s^2, deliberately above the owner's own turns (manual archive max 2.86, route 22 sweeper) so the
+                              # calibrated steering authority is the ceiling that binds (owner ruling 2026-08-31: push closer to the
+                              # limit, hold steady); comfort remains the backstop against an implausible learned authority
 MIN_CURVATURE = 1e-4          # 1/m, straighter than this is a straight
 MIN_MODEL_SPEED = 1.0         # m/s, avoids unstable curvature near predicted stops
 
@@ -44,6 +45,8 @@ T_APPROACH = 1.5              # s, proportional approach to a limit that is near
 D_MIN = 1.0                   # m, shortest distance the kinematic candidate divides by
 A_CURVE_MIN = -2.0            # m/s^2, comfort floor; harder braking is the lead and stop logic's business
 A_CURVE_FREE = 4.0            # m/s^2, a candidate above this has nothing to say
+V_HOLD_BAND = 0.3             # m/s, at the limit the candidate is a flat zero: the settled car sits still instead of
+                              # stitching gas/brake corrections across the zero crossing; the band edges correct the drift
 J_DOWN = 2.0                  # m/s^3, how fast the candidate may pull the acceleration down ...
 J_UP = 3.0                    # m/s^3, ... and let it back up (curves release in about a second, not at 0.2 m/s^2)
 
@@ -217,7 +220,11 @@ class ModelCurveSpeedLimiter:
     idx = int(np.argmin(np.where(finite, per_node, np.inf)))
     self.v_limit = float(limits[idx])
     self.distance = float(path_distance[idx])
-    return float(per_node[idx])
+    chosen = float(per_node[idx])
+    # the hold band (owner ruling 2026-08-31): riding the limit means holding it, not correcting around it
+    if math.isfinite(self.v_limit) and abs(v_ego - self.v_limit) <= V_HOLD_BAND:
+      chosen = 0.0
+    return chosen
 
   def _react(self, state, v_ego, accel_coast, params, roll):
     # the regime machine: free -> coast when the torque is heavy, coast -> brake when pinned and understeering, and back;

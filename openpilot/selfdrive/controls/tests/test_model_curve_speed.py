@@ -20,6 +20,7 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   REGIME_FREE,
   T_APPROACH,
   T_COAST,
+  V_HOLD_BAND,
   TORQUE_BUDGET,
   LateralState,
   ModelCurveSpeedLimiter,
@@ -96,6 +97,27 @@ class TestAnticipation(unittest.TestCase):
     limit = math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / 0.05)
     self.assertAlmostEqual(result.a_target, (limit - 6.0) / T_APPROACH, places=5)
     self.assertLess(result.a_target, 0.5)
+
+  def test_at_the_limit_the_candidate_is_a_flat_zero_and_the_band_edges_correct(self):
+    # owner ruling 2026-08-31: riding the limit means holding it, not stitching corrections across the zero crossing
+    limit = math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / 0.05)
+    for v_ego, expect_zero in ((limit, True), (limit - V_HOLD_BAND + 0.05, True), (limit + V_HOLD_BAND - 0.05, True),
+                               (limit - V_HOLD_BAND - 0.2, False), (limit + V_HOLD_BAND + 0.2, False)):
+      limiter = ModelCurveSpeedLimiter(make_cp())
+      model = make_model(v_ego, np.full(N, 0.05))
+      result = settle(limiter, model, 30, v_ego=v_ego, a_ego=0.0, lateral_active=True, lateral_state=tracking())
+      if expect_zero:
+        self.assertEqual(result.a_target, 0.0, v_ego)
+      else:
+        self.assertNotEqual(result.a_target, 0.0, v_ego)
+        self.assertAlmostEqual(result.a_target, (limit - v_ego) / T_APPROACH, places=5)
+
+  def test_comfort_sits_above_the_owners_manual_envelope(self):
+    # 3.4: deliberately above the manual archive's max lateral (2.86), so the calibrated authority binds and comfort
+    # is only the backstop against an implausible learned authority
+    self.assertGreater(A_LAT_COMFORT, 3.0)
+    kappa = np.full(N, 0.05)
+    self.assertLess(float(curve_speed_limits(kappa, TORQUE, 0.0)[0]), math.sqrt(A_LAT_COMFORT / 0.05))
 
   def test_a_straight_path_has_nothing_to_say(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
