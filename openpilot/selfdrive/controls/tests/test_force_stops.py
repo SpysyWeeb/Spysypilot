@@ -5,7 +5,8 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DV_MAX, ForceStops, GAS_OVERRIDE_S,
                                                            LATCH_SETBACK, MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK,
-                                                           PROFILE_LANDING, PROFILE_MAX_DECEL, QUALIFY_S, REARM_S)
+                                                           PROFILE_LANDING, PROFILE_MAX_DECEL, PROFILE_MIN_TIME, QUALIFY_S, REARM_S,
+                                                           RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, StopObservation
 
@@ -15,9 +16,9 @@ def frames(seconds):
 
 
 def obs(path_end=20.0, should_stop=True, braking=True, strict=False, early=False, lead=False, relevant=False, turn=False,
-        release_open=False, moving=False, corridor_clear=True):
+        release_open=False, moving=False, corridor_clear=True, lane_change=False):
   return StopObservation(1.0 if should_stop else 0.0, path_end, should_stop, strict, early, True, braking, moving, relevant, lead, turn,
-                         release_open, corridor_clear)
+                         release_open, corridor_clear, lane_change)
 
 
 def car_state(v_ego=10.0, standstill=False, gas=False, brake=False):
@@ -70,7 +71,7 @@ class TestEntry:
   def test_classic_latch_commits_the_model_endpoint_with_its_setback(self):
     fs, result = committed()
     assert abs((result.stop_x) - (20.0 - LATCH_SETBACK - 10.0 * DT_MDL * (frames(1.5) - frames(1.5) + 0))) <= 10.0 * DT_MDL * frames(1.5)
-    assert math.isfinite(result.v_cruise_cap) and result.v_cruise_cap < 10.0
+    assert result.v_cruise_cap == NO_CAP                            # no speed cap once committed (D19)
 
   def test_widened_window_needs_braking_evidence(self):
     slow_brake = ForceStops()
@@ -264,7 +265,7 @@ class TestApproachProfile:
     assert easing[-1] - easing[0] < 0.6                          # gently: the landing margin shrinks with the remaining distance
     assert min(a for _, a, _ in history) > -2.2                  # a 13 m/s stop seen 60 m out never needs more than ~2 m/s^2
     assert history[-1][0] <= PROFILE_HANDOVER_SPEED               # the profile fades out below the handover speed ...
-    assert history[-1][2] >= 2.0                                 # ... and is gone short of the committed point: the column lands
+    assert history[-1][2] >= 0.0                                 # ... never past the committed point: the column and the hold land
 
   def test_the_profile_is_capped_and_absent_without_a_moving_commitment(self):
     fs, _ = commit_on_strict_evidence(20.0, 60.0)
@@ -277,3 +278,44 @@ class TestApproachProfile:
     assert run(shaping, 0.5, obs(path_end=80.0, should_stop=False, early=True, braking=True), car_state(15.0)).a_target is None
     _, held = holding()
     assert held.a_target is None
+
+
+class TestFieldTest4:
+  def test_the_profile_tapers_with_the_speed_as_the_landing_closes(self):
+    fs, _ = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.0)
+    v, a, world = 13.0, -1.0, fs.remaining
+    history = []
+    for _ in range(frames(15.0)):
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(v, a), True, True, True)
+      if result.a_target is None:
+        break
+      a = result.a_target
+      history.append((v, a, fs.remaining))
+      v = max(v + a * DT_MDL, 0.0)
+      world -= v * DT_MDL
+    tail = [(v, a) for v, a, _ in history if v < 3.0]
+    assert all(-a <= v / (2.0 * PROFILE_MIN_TIME) + 1e-6 for v, a in tail)          # never harder than v/2 near the end ...
+    assert all(later >= earlier - 1e-3 for (_, earlier), (_, later) in zip(tail, tail[1:], strict=False))   # ... and only easing
+
+  def test_no_speed_cap_once_committed(self):
+    fs, result = committed()
+    assert result.v_cruise_cap == NO_CAP and result.stop_x is not None
+    shaping = ForceStops()
+    assert run(shaping, 0.5, obs(path_end=80.0, should_stop=False, early=True, braking=True), car_state(15.0)).v_cruise_cap < NO_CAP
+
+  def test_a_lane_change_drops_the_commitment_and_the_shaping(self):
+    fs, _ = committed()
+    assert run(fs, DT_MDL, obs(lane_change=True), car_state(10.0)).stop_x is None and not fs.forcing
+    shaping = ForceStops()
+    assert run(shaping, 0.5, obs(path_end=80.0, should_stop=False, early=True, braking=True, lane_change=True), car_state(15.0)).v_cruise_cap == NO_CAP
+    fs, held = holding()
+    assert run(fs, DT_MDL, obs(path_end=4.0, lane_change=True), car_state(0.0, standstill=True)).holding   # a hold is not a lane
+
+  def test_an_open_path_releases_the_hold_in_three_frames_but_a_flash_does_not(self):
+    fs, _ = holding()
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      assert run(fs, DT_MDL, obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False), car_state(0.0, standstill=True)).holding
+    assert run(fs, DT_MDL, obs(path_end=4.0), car_state(0.0, standstill=True)).holding                       # the flash ends: still held
+    for _ in range(RELEASE_OPEN_FRAMES):
+      result = run(fs, DT_MDL, obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False), car_state(0.0, standstill=True))
+    assert not result.holding and not fs.holding

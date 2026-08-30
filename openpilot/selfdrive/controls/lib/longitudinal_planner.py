@@ -28,6 +28,7 @@ A_CRUISE_MAX_SPEED = 40.
 J_CRUISE_VALS = [2.0, 1.6, 1.0, 0.6]
 J_CRUISE_BP = [0., 10.0, 25., 40.]
 A_CRUISE_MIN = -1.2
+E2E_STOP_MARGIN = 0.5  # m/s^2, how much more urgent the model's request must be to override a committed stop profile
 # ordinary set-speed corrections at road speed use a proportional target, so a 5 mph error asks for ~0.4 m/s^2
 CRUISE_COMFORT_KP = 0.18
 CRUISE_COMFORT_BP = [8.0, 15.0]
@@ -268,7 +269,10 @@ class LongitudinalPlanner:
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
     if experimental_mode and model_valid:
-      candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
+      # while a committed stop's profile is moving the car, the model's own request joins only if it is clearly more urgent:
+      # its late ramp used to overtake the profile through min() and put the heavy braking back at the end (route 27 t=250)
+      if force_stop.a_target is None or output_a_target_e2e < force_stop.a_target - E2E_STOP_MARGIN:
+        candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
     if force_stop.a_target is not None:
       # a committed stop's own approach profile competes like any candidate; the column and the hold still own the landing
       candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False))
