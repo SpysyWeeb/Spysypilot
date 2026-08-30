@@ -251,7 +251,7 @@ class TestApproachProfile:
     flat = [a for v, a, _ in history if 9.0 < v < 12.5]
     assert max(flat) - min(flat) < 0.1                           # constant deceleration once entered ...
     easing = [a for v, a, _ in history if 3.0 < v < 9.0]
-    assert all(later >= earlier - 1e-6 for earlier, later in zip(easing, easing[1:]))   # ... then only ever easing off
+    assert all(later >= earlier - 1e-6 for earlier, later in zip(easing, easing[1:], strict=False))   # ... then only ever easing off
     assert easing[-1] - easing[0] < 0.6                          # gently: the landing margin shrinks with the remaining distance
     assert min(a for _, a, _ in history) > -2.2                  # a 13 m/s stop seen 60 m out never needs more than ~2 m/s^2
     assert history[-1][0] <= PROFILE_HANDOVER_SPEED               # the profile fades out below the handover speed ...
