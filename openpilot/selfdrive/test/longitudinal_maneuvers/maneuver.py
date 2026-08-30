@@ -35,6 +35,7 @@ class Maneuver:
     self.torque_factor = kwargs.get("torque_factor", 2.7)
     self.torque_friction = kwargs.get("torque_friction", 0.11)
     self.curve_model_scale = kwargs.get("curve_model_scale", 1.0)
+    self.e2e_landing_push = kwargs.get("e2e_landing_push", 0.0)
 
     self.duration = duration
     self.title = title
@@ -56,6 +57,7 @@ class Maneuver:
       torque_factor=self.torque_factor,
       torque_friction=self.torque_friction,
       curve_model_scale=self.curve_model_scale,
+      e2e_landing_push=self.e2e_landing_push,
     )
 
     valid = True

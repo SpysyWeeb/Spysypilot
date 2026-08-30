@@ -10,6 +10,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, ForceStopsResult
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LongitudinalPolicy
+from openpilot.selfdrive.controls.lib.stop_landing import LEAD_FULL_AUTHORITY, landing_bound
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
                                                                    A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
                                                                    LongitudinalPlanner, get_cruise_accel, get_cruise_comfort_accel,
@@ -221,3 +222,49 @@ class TestPlannerCruise:
     plant.planner.force_stops.update = lambda *args: ForceStopsResult(NO_CAP, float('nan'), False)
     plant.step(v_cruise=20.0)
     assert plant.planner.mpc.source != LongitudinalPlanSource.stop
+
+
+class TestStopLanding:
+  def planner_and_data(self, v_ego, e2e_accel, lead_distance=None):
+    planner = LongitudinalPlanner(car.CarParams.new_message(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.5,
+                                                            steerRatio=CP.steerRatio, wheelbase=CP.wheelbase))
+    car_state = messaging.new_message('carState').carState
+    car_state.vEgo = v_ego
+    car_state.vCruise = 100.0
+    model = messaging.new_message('modelV2').modelV2
+    model.action.shouldStop = True
+    model.action.desiredAcceleration = e2e_accel
+    controls_state = messaging.new_message('controlsState').controlsState
+    controls_state.longControlState = LongCtrlState.pid
+    selfdrive_state = messaging.new_message('selfdriveState').selfdriveState
+    selfdrive_state.enabled = True
+    selfdrive_state.experimentalMode = True
+    radar = messaging.new_message('radarState').radarState
+    if lead_distance is not None:
+      radar.leadOne.present = True
+      radar.leadOne.dRel = lead_distance
+      radar.leadOne.modelProb = 1.0
+    data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
+            'radarState': radar, 'carControl': messaging.new_message('carControl').carControl,
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+    return planner, data
+
+  def test_the_law_bounds_whichever_candidate_lands_the_stop(self):
+    # the model calls a stop and asks for -3.0 at walking pace: e2e wins the arbitration and the landing law bounds it
+    planner, data = self.planner_and_data(1.0, -3.0)
+    for _ in range(5):
+      planner.update(_PlantSubMaster(data, 0))
+    assert planner.mpc.source == LongitudinalPlanSource.e2e
+    assert math.isclose(planner.output_a_target, -landing_bound(1.0), rel_tol=1e-6, abs_tol=1e-9)
+    assert planner.stop_landing.active
+
+  def test_the_law_is_off_above_its_window_and_next_to_a_close_lead(self):
+    planner, data = self.planner_and_data(10.0, -3.0)
+    for _ in range(5):
+      planner.update(_PlantSubMaster(data, 0))
+    assert math.isclose(planner.output_a_target, -3.0, rel_tol=1e-6, abs_tol=1e-9)
+    planner, data = self.planner_and_data(1.0, -3.0, lead_distance=LEAD_FULL_AUTHORITY - 1.0)
+    for _ in range(5):
+      planner.update(_PlantSubMaster(data, 0))
+    assert math.isclose(planner.output_a_target, -3.0, rel_tol=1e-6, abs_tol=1e-9)
+    assert not planner.stop_landing.active
