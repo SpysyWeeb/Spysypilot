@@ -360,7 +360,7 @@ class TestStopLanding(OpenpilotTestCase):
     assert landing_excess(logs) <= 0.02
     # the same ramp with the law bypassed lands well outside it: the test is about the law, not the plant
     original = StopLanding.update
-    StopLanding.update = lambda self, a_target, v_ego, lead, stop_intent: a_target
+    StopLanding.update = lambda self, a_target, v_ego, lead, stop_intent, launch=False: a_target
     try:
       _, unbounded = Maneuver('red light with a late model ramp, no law', **kwargs).evaluate()
     finally:

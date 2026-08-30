@@ -45,7 +45,8 @@ stop, so no stop fields cross processes any more. There is no lateral turn budge
 the 2026-08-29 field test: accelerating out of curves felt held back), Conditional Experimental Mode can engage with a distant vehicle in radar view,
 a pedal tap no longer switches a manually enabled Experimental mode off, FCW keeps stock's form, and
 the third-lead machinery is gone. Since 2026-08-30 the planner also bounds every stop's last metres with the
-landing law (D22: allowed braking 0.70·v + 0.30 m/s² below 3.5 m/s, lead physics never blocked — the owner's
+landing law (D22: a corridor — allowed braking 0.70·v + 0.30 m/s², a creep floor, both tapering to a 0.15 m/s² kiss at
+walking pace — that latches through the MPC's hover and standstill until a real launch; lead physics never blocked; the owner's
 original June Smooth Stops design rehomed in the planner); Smooth Stops owns the standstill handoff (deferred
 clamp, kiss below 0.3 m/s), and the curve policy shapes cruise through curves. Design, owner decisions
 and acceptance gates: [`docs/BLoTv3.md`](https://github.com/SpysyWeeb/Spysypilot/blob/BLoTv3/docs/BLoTv3.md).

@@ -3,9 +3,9 @@ import math
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
-from openpilot.selfdrive.controls.lib.stop_landing import (CREEP_DECEL, CREEP_SPEED, LANDING_C, LANDING_K, LANDING_SPEED, LEAD_FULL_AUTHORITY,
-                                                            LEAD_LANDING_GAP, STALL_RELEASE_RATE, STALL_S, STANDSTILL_SPEED, StopLanding,
-                                                            landing_bound)
+from openpilot.selfdrive.controls.lib.stop_landing import (CREEP_DECEL, CREEP_FADE_SPEED, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
+                                                            LAUNCH_FRAMES, LEAD_FULL_AUTHORITY, LEAD_LANDING_GAP, STALL_RELEASE_RATE, STALL_S,
+                                                            StopLanding, landing_bound, landing_floor)
 
 NO_LEAD = LeadObservation()
 
@@ -18,46 +18,101 @@ def frames(seconds):
   return round(seconds / DT_MDL)
 
 
-class TestLandingBound:
+def landing(v_ego=1.5, a_target=-2.0):
+  law = StopLanding()
+  law.update(a_target, v_ego, NO_LEAD, True)
+  assert law.landing
+  return law
+
+
+class TestCorridor:
   def test_the_bound_falls_linearly_with_speed_and_only_removes_surplus_braking(self):
     law = StopLanding()
     assert math.isclose(landing_bound(1.5), 1.35, rel_tol=1e-9, abs_tol=1e-9)
     assert math.isclose(landing_bound(0.5), 0.65, rel_tol=1e-9, abs_tol=1e-9)
-    assert math.isclose(landing_bound(0.0), LANDING_C, rel_tol=1e-9, abs_tol=1e-9)
+    assert math.isclose(landing_bound(KISS_SPEED), KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
     # at the top of the window the bound sits above any comfort approach
     assert law.update(-2.0, 3.0, NO_LEAD, True) == -2.0 and not law.active
-    assert math.isclose(law.update(-2.0, 1.5, NO_LEAD, True), -(LANDING_K * 1.5 + LANDING_C), rel_tol=1e-9, abs_tol=1e-9)
+    assert math.isclose(law.update(-2.0, 1.5, NO_LEAD, True), -1.35, rel_tol=1e-9, abs_tol=1e-9)
     assert law.active
     assert math.isclose(law.update(-2.0, 0.5, NO_LEAD, True), -0.65, rel_tol=1e-9, abs_tol=1e-9)
-    # a plan already inside the law passes untouched
+    # a plan inside the corridor passes untouched
     assert law.update(-0.5, 1.5, NO_LEAD, True) == -0.5 and not law.active
 
-  def test_the_law_lives_only_in_the_window(self):
-    law = StopLanding()
-    assert law.update(-2.0, LANDING_SPEED + 0.1, NO_LEAD, True) == -2.0
-    assert law.update(-2.0, STANDSTILL_SPEED / 2.0, NO_LEAD, True) == -2.0
-    assert law.update(0.5, 1.0, NO_LEAD, True) == 0.5
-    assert not law.landing
+  def test_the_floor_keeps_a_landing_braking_and_fades_above_creep_speed(self):
+    assert math.isclose(landing_floor(CREEP_SPEED), CREEP_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+    assert landing_floor(CREEP_FADE_SPEED) == 0.0
+    assert math.isclose(landing_floor(KISS_SPEED), KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+    law = landing()
+    assert math.isclose(law.update(-0.05, 0.8, NO_LEAD, True), -landing_floor(0.8), rel_tol=1e-9, abs_tol=1e-9)
+    assert law.active
+    # above the fade the floor is gone: an easing plan in a queue is not dragged to a stop
+    assert law.update(-0.05, 2.0, NO_LEAD, True) == -0.05 and not law.active
+    # the floor never starts a landing on its own
+    assert StopLanding().update(-0.05, 0.8, NO_LEAD, False) == -0.05
 
-  def test_a_landing_needs_stop_intent_and_then_survives_its_flicker(self):
+  def test_both_edges_meet_at_the_kiss_by_walking_pace(self):
+    law = landing()
+    for v_ego in (KISS_SPEED, 0.1, 0.05, 0.0):
+      assert math.isclose(law.update(-2.0, v_ego, NO_LEAD, True), -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+      assert math.isclose(law.update(-0.02, v_ego, NO_LEAD, True), -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+      assert math.isclose(law.update(0.05, v_ego, NO_LEAD, True), -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+    assert law.landing
+
+  def test_the_law_lives_below_landing_speed_and_starts_only_on_braking_intent(self):
     law = StopLanding()
+    assert law.update(-2.0, LANDING_SPEED + 0.1, NO_LEAD, True) == -2.0 and not law.landing
     assert law.update(-2.0, 1.5, NO_LEAD, False) == -2.0 and not law.landing
+    assert law.update(0.5, 1.0, NO_LEAD, True) == 0.5 and not law.landing
+    # a hover frame with intent is not a stop: the plan must brake more than the kiss to start one
+    assert law.update(-KISS_DECEL / 2.0, 0.2, NO_LEAD, True) == -KISS_DECEL / 2.0 and not law.landing
     assert law.update(-2.0, 1.5, NO_LEAD, True) < -1.0 and law.landing
-    # the model's stop bit flickers off for a frame: the landing holds
+    # intent flickering off does not end it
     assert math.isclose(law.update(-2.0, 1.4, NO_LEAD, False), -landing_bound(1.4), rel_tol=1e-9, abs_tol=1e-9)
-    # the plan lifting ends the landing, and intent is needed again afterwards
-    assert law.update(0.2, 1.4, NO_LEAD, False) == 0.2 and not law.landing
-    assert law.update(-2.0, 1.4, NO_LEAD, False) == -2.0 and not law.landing
+    assert law.landing
+    # leaving the window does
+    assert law.update(-2.0, LANDING_SPEED, NO_LEAD, True) == -2.0 and not law.landing
+
+
+class TestLatchAndLaunch:
+  def test_a_hover_around_zero_is_held_at_the_floor_and_never_flickers(self):
+    # route 28: the MPC column lets go of the brake by 0.2 m/s and alternates +-0.1 around zero
+    law = landing(0.3, -0.2)
+    outputs = [law.update(a, 0.2, NO_LEAD, True) for a in (0.03, -0.2, 0.09, -0.2, 0.13, -0.05, 0.16, 0.02)]
+    # every frame braking, inside the corridor: the plan's own braking passes, the rest sits on the floor
+    assert all(-landing_bound(0.2) <= o <= -landing_floor(0.2) for o in outputs), outputs
+    assert max(outputs) - min(outputs) < 0.05
+    assert law.landing
+
+  def test_a_climbing_plan_ends_the_landing_after_launch_frames(self):
+    law = landing(0.2, -0.2)
+    for i in range(LAUNCH_FRAMES - 1):
+      assert law.update(0.1 * (i + 1), 0.1, NO_LEAD, True) == -KISS_DECEL and law.landing
+    assert law.update(0.1 * LAUNCH_FRAMES, 0.1, NO_LEAD, True) == 0.1 * LAUNCH_FRAMES and not law.landing
+    # and a fresh landing needs braking intent again
+    assert law.update(0.3, 0.2, NO_LEAD, True) == 0.3 and not law.landing
+
+  def test_the_planners_own_release_ends_the_landing_at_once(self):
+    law = landing(0.2, -0.2)
+    assert law.update(0.02, 0.0, NO_LEAD, True) == -KISS_DECEL
+    assert law.update(0.02, 0.0, NO_LEAD, True, launch=True) == 0.02 and not law.landing
+
+  def test_reset_forgets_the_landing(self):
+    law = landing()
+    law.reset()
+    assert not law.landing and not law.active
+    assert law.update(-2.0, 1.5, NO_LEAD, False) == -2.0
 
 
 class TestLead:
-  def test_a_close_lead_keeps_full_authority(self):
-    law = StopLanding()
+  def test_a_close_lead_lifts_the_bound_but_keeps_the_floor(self):
+    law = landing()
     assert law.update(-2.5, 1.0, lead(LEAD_FULL_AUTHORITY - 0.5), True) == -2.5 and not law.active
-    assert law.update(-2.5, 1.0, lead(LEAD_FULL_AUTHORITY + 0.5), True) == -landing_bound(1.0)
+    assert math.isclose(law.update(0.05, 0.5, lead(LEAD_FULL_AUTHORITY - 0.5), True), -landing_floor(0.5), rel_tol=1e-9, abs_tol=1e-9)
+    assert math.isclose(law.update(-2.5, 1.0, lead(LEAD_FULL_AUTHORITY + 0.5), True), -landing_bound(1.0), rel_tol=1e-9, abs_tol=1e-9)
 
   def test_the_braking_needed_to_stop_behind_the_lead_always_passes(self):
-    law = StopLanding()
+    law = landing(3.4, -3.5)
     # a stopped lead 5.5 m out at 3.4 m/s needs 11.56 / (2 * 1.5) = 3.85 m/s^2 to stop LEAD_LANDING_GAP behind it: more than the law
     v_ego, distance = 3.4, LEAD_FULL_AUTHORITY + 0.5
     needed = v_ego ** 2 / (2.0 * (distance - LEAD_LANDING_GAP))
@@ -69,33 +124,25 @@ class TestLead:
     assert math.isclose(law.update(-3.5, v_ego, lead(distance, speed=v_ego), True), -landing_bound(v_ego), rel_tol=1e-9, abs_tol=1e-9)
 
 
-class TestGuards:
-  def test_the_watchdog_releases_a_bound_that_holds_speed(self):
-    law = StopLanding()
+class TestWatchdog:
+  def test_a_stall_shifts_the_corridor_toward_more_braking_while_rolling(self):
+    law = landing()
     v_ego = 1.2
     for _ in range(frames(STALL_S)):
       out = law.update(-2.5, v_ego, NO_LEAD, True)
     assert math.isclose(out, -landing_bound(v_ego), rel_tol=1e-6, abs_tol=1e-9)
     for _ in range(frames(2.0)):
       out = law.update(-2.5, v_ego, NO_LEAD, True)
-    stalled = (frames(STALL_S) + frames(2.0) - 1) * DT_MDL - STALL_S    # the first frame under the bound is its own low mark
-    assert math.isclose(out, -(landing_bound(v_ego) + stalled * STALL_RELEASE_RATE), rel_tol=1e-6, abs_tol=1e-9)
+      floor = law.update(-0.05, v_ego, NO_LEAD, True)
+    stalled = (frames(STALL_S) + 2 * frames(2.0) - 1) * DT_MDL - STALL_S    # the first frame under the corridor is its own low mark
+    assert math.isclose(out, -(landing_bound(v_ego) + (stalled - DT_MDL) * STALL_RELEASE_RATE), rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(floor, -(landing_floor(v_ego) + stalled * STALL_RELEASE_RATE), rel_tol=1e-6, abs_tol=1e-9)
     # slowing again is progress: the release resets
-    out = law.update(-2.5, v_ego - 0.1, NO_LEAD, True)
-    assert math.isclose(out, -landing_bound(v_ego - 0.1), rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(law.update(-2.5, v_ego - 0.1, NO_LEAD, True), -landing_bound(v_ego - 0.1), rel_tol=1e-6, abs_tol=1e-9)
 
-  def test_the_creep_floor_keeps_a_landing_plan_braking(self):
-    law = StopLanding()
-    assert law.update(-0.2, CREEP_SPEED - 0.2, NO_LEAD, True) == -CREEP_DECEL and law.active
-    assert law.update(-0.2, CREEP_SPEED + 0.2, NO_LEAD, True) == -0.2 and not law.active
-    # the floor is a landing matter: without intent a gentle plan at walking pace is left alone
-    fresh = StopLanding()
-    assert fresh.update(-0.2, CREEP_SPEED - 0.2, NO_LEAD, False) == -0.2
-
-  def test_reset_forgets_the_landing(self):
-    law = StopLanding()
-    law.update(-2.0, 1.5, NO_LEAD, True)
-    assert law.landing
-    law.reset()
-    assert not law.landing and not law.active
-    assert law.update(-2.0, 1.5, NO_LEAD, False) == -2.0
+  def test_the_watchdog_sleeps_at_walking_pace(self):
+    # a stopped car does not slow: the kiss must not drift, it is the next launch's starting point
+    law = landing()
+    for _ in range(frames(5.0)):
+      out = law.update(-2.0, 0.05, NO_LEAD, True)
+    assert math.isclose(out, -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
