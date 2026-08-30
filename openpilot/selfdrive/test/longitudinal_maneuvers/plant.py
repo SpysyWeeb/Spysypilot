@@ -54,7 +54,7 @@ class Plant:
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
                enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
                stop_line=None, stop_line_horizon_s=5.0,
-               curve=None, torque_factor=2.7, torque_friction=0.11, curve_model_scale=1.0, e2e_landing_push=0.0):
+               curve=None, torque_factor=2.7, torque_friction=0.11, curve_model_scale=1.0, e2e_landing_push=0.0, actuator_lag=None):
     self.rate = 1. / DT_MDL
 
     if not Plant.messaging_initialized:
@@ -96,6 +96,11 @@ class Plant:
     # extra braking the fake model asks for over the last metres before the line, the way the real model's request
     # ramps late (route 24/27: -0.7 ... -1.3 -> -2.5 into the last seconds)
     self.e2e_landing_push = e2e_landing_push
+    # the car's brake actuation as a first-order response to the plan, with separate time constants for taking braking
+    # up and letting it off: the Palisade's ESP follows a braking increase with ~0.2 s and a release with ~0.7 s (route 0x2a,
+    # 2026-08-30). None keeps the ideal car that applies the plan at once
+    self.actuator_lag = actuator_lag
+    self.applied_accel = 0.0
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
@@ -284,6 +289,12 @@ class Plant:
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
       self.acceleration = min(-0.5, self.acceleration)
+    if self.actuator_lag is not None:
+      # the car lags the plan: braking builds at tau_up, releases at tau_down
+      tau_up, tau_down = self.actuator_lag
+      tau = tau_up if self.acceleration < self.applied_accel else tau_down
+      self.applied_accel += (self.acceleration - self.applied_accel) * min(self.ts / tau, 1.0)
+      self.acceleration = self.applied_accel
     self.speed = self.speed + self.acceleration * self.ts
     self.should_stop = self.planner.output_should_stop
     fcw = self.planner.fcw

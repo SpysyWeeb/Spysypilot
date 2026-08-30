@@ -301,7 +301,7 @@ class LongitudinalPlanner:
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
     launch = lead_departing or (self.holding_prev and not force_stop.holding)
     self.holding_prev = force_stop.holding
-    output_a_target = self.stop_landing.update(output_a_target, v_ego, lead, stop_intent, launch)
+    output_a_target = self.stop_landing.update(output_a_target, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo)
     # the stop bit follows the landed target too: the MPC's hover around zero at walking pace must not flicker it
     # (route 28: one positive frame released the hold clamp under a stopped car)
     self.output_should_stop = (force_stop.holding or any(should_stop for _, _, should_stop in candidates)
