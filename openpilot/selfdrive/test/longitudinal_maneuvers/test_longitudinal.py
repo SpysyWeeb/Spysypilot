@@ -1,7 +1,7 @@
 import itertools
 import numpy as np
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.stop_landing import LANDING_SPEED, LEAD_LANDING_GAP, LEAD_FULL_AUTHORITY, StopLanding, landing_bound
+from openpilot.selfdrive.controls.lib.stop_landing import KISS_SPEED, LANDING_SPEED, LEAD_LANDING_GAP, LEAD_FULL_AUTHORITY, StopLanding, landing_bound
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized_class
 
@@ -291,8 +291,9 @@ class TestCurvePolicy(OpenpilotTestCase):
     assert v[inside][-1] < v[inside][0]                                     # ... and is slower deep in the curve
 
 
-def landing_excess(logs, lead=False, v_min=0.3):
-  # the most the commanded braking exceeded the landing law through the last metres (0.3 m/s .. LANDING_SPEED, plan braking).
+def landing_excess(logs, lead=False, v_min=KISS_SPEED):
+  # the most the commanded braking exceeded the landing law through the last metres (KISS_SPEED .. LANDING_SPEED, plan braking).
+  # Below the kiss speed the corridor is the kiss plus the anti-creep press by design, and the aEgo checks judge that end.
   # Each row's plan was computed from the previous row's state (the plant logs after integrating), so the law is judged at
   # that speed and gap; below 0.3 m/s the plant's own stop bit forces -0.5. With a lead, the braking that stopping
   # LEAD_LANDING_GAP behind it needs passes

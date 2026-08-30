@@ -220,6 +220,7 @@ class ForceStops:
       self.remaining = min(self.remaining, 0.0) if self.remaining > 0.0 else self.remaining
       self.release_filter.x = 0.0
       self.clear_window.clear()
+      self._open_frames = 0
       return self._result(v_ego, a_ego)
 
     if self.override_timer > 0.0:
@@ -241,6 +242,15 @@ class ForceStops:
 
     if not just_committed:
       self.remaining -= v_ego * self.dt
+    # the green: a long, moving path with no stop evidence releases a moving commitment at once, like the hold's D21
+    # release -- the filtered detector plus the 4 s position hold kept the profile braking 1.2-1.7 s after the road had
+    # opened, until the owner's own gas ended it (route 0x2c t=1105/1135; the hold was even re-armed by noisy path dips)
+    self._open_frames = (self._open_frames + 1
+                         if (obs.path_end is not None and obs.path_end > RELEASE_OPEN_LENGTH
+                             and not (obs.should_stop or obs.strict_stop)) else 0)
+    if self._open_frames >= RELEASE_OPEN_FRAMES:
+      self.reset()
+      return ForceStopsResult()
     if (self.remaining > 0.0 and detected and self.detect_filter.x >= LATCH_THRESHOLD
         and committed_length > self.remaining + EXTEND_DEADBAND):
       # the latched point follows an endpoint that keeps sitting beyond it while the model still calls the stop; it

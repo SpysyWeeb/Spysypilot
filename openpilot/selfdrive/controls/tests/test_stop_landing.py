@@ -3,9 +3,11 @@ import math
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
-from openpilot.selfdrive.controls.lib.stop_landing import (CREEP_DECEL, CREEP_FADE_SPEED, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
-                                                            LAUNCH_FRAMES, LEAD_FULL_AUTHORITY, LEAD_LANDING_GAP, RELEASE_DEADBAND, RELEASE_GAIN,
-                                                            RELEASE_LIFT_MAX, STALL_RELEASE_RATE, STALL_S, StopLanding, landing_bound, landing_floor)
+from openpilot.selfdrive.controls.lib.stop_landing import (CREEP_DECEL, CREEP_FADE_SPEED, CREEP_PRESS_DEADBAND, CREEP_PRESS_GAIN,
+                                                            CREEP_PRESS_MAX, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
+                                                            LAUNCH_FRAMES, LEAD_FULL_AUTHORITY, LEAD_LANDING_GAP, RELEASE_DEADBAND,
+                                                            RELEASE_GAIN, RELEASE_LIFT_MAX, STALL_RELEASE_RATE, STALL_S, StopLanding,
+                                                            landing_bound, landing_floor)
 
 NO_LEAD = LeadObservation()
 
@@ -188,3 +190,23 @@ class TestReleaseLift:
     assert math.isclose(law.update(-0.2, 0.1, NO_LEAD, True, a_ego=-1.0), -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
     law = landing(1.0, -0.5)
     assert law.update(0.05, 1.0, NO_LEAD, True, a_ego=-1.0) == -landing_floor(1.0)
+
+
+class TestCreepPress:
+  # route 0x2c t=727: creep torque beat the kiss and the car re-accelerated with the brake light off
+  def test_a_measured_shortfall_presses_the_corridor_down_at_once(self):
+    law = landing(0.3, -0.2)
+    # the car holds speed (a_ego 0) while the landing asks -0.15: pressed by gain * 0.15 - deadband
+    expected = KISS_DECEL + CREEP_PRESS_GAIN * KISS_DECEL - CREEP_PRESS_DEADBAND
+    assert math.isclose(law.update(-KISS_DECEL, 0.3, NO_LEAD, True, a_ego=0.0), -expected, rel_tol=1e-9, abs_tol=1e-9)
+    # the car creeping forward presses harder; capped
+    assert math.isclose(law.update(-KISS_DECEL, 0.3, NO_LEAD, True, a_ego=2.0), -(KISS_DECEL + CREEP_PRESS_MAX), rel_tol=1e-9, abs_tol=1e-9)
+
+  def test_the_press_relaxes_as_the_car_slows_and_sleeps_above_the_kiss_speed(self):
+    law = landing(0.3, -0.2)
+    # slowing as asked: no press, the kiss stands
+    assert math.isclose(law.update(-KISS_DECEL, 0.3, NO_LEAD, True, a_ego=-0.2), -KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
+    # above the kiss speed the release lift owns the loop; a shortfall there is the plan easing, not creep
+    law2 = landing(1.0, -0.5)
+    out = law2.update(-0.3, 1.0, NO_LEAD, True, a_ego=0.0)
+    assert out >= -landing_floor(1.0) - 1e-9

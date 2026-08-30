@@ -139,11 +139,16 @@ class TestMovingReleases:
     assert run(fs, MODEL_INVALID_RELEASE_S - 0.1, obs(), car_state(10.0), valid=False).stop_x is not None
     assert run(fs, 0.2, obs(), car_state(10.0), valid=False).stop_x is None and not fs.forcing
 
-  def test_clear_model_releases_after_the_position_hold(self):
+  def test_an_open_clear_path_releases_at_once_and_an_ambiguous_one_waits_out_the_position_hold(self):
+    # D28: a long, evidence-free path is a green and releases within RELEASE_OPEN_FRAMES; a clear but SHORT path
+    # (nothing to drive toward yet) still goes the slow way -- filtered detector decay plus the position hold
     fs, _ = committed()
-    clear = obs(path_end=90.0, should_stop=False, braking=False, moving=True)
-    assert run(fs, 3.0, clear, car_state(5.0)).stop_x is not None
-    assert run(fs, 3.0, clear, car_state(5.0)).stop_x is None
+    open_road = obs(path_end=90.0, should_stop=False, braking=False, moving=True)
+    assert run(fs, (RELEASE_OPEN_FRAMES + 1) * DT_MDL, open_road, car_state(5.0)).stop_x is None
+    fs2, _ = committed()
+    short_clear = obs(path_end=25.0, should_stop=False, braking=False, moving=True)
+    assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is not None
+    assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is None
 
   def test_latched_point_follows_the_model_forward_and_down_at_bounded_rates(self):
     fs, _ = committed(path_end=20.0)
@@ -319,3 +324,28 @@ class TestFieldTest4:
     for _ in range(RELEASE_OPEN_FRAMES):
       result = run(fs, DT_MDL, obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False), car_state(0.0, standstill=True))
     assert not result.holding and not fs.holding
+
+
+class TestMovingGreenRelease:
+  # route 0x2c t=1105/1135: the light turned green mid-approach; the commitment must let go with the road, not 4 s later
+  def test_an_open_path_releases_a_moving_commitment_in_three_frames(self):
+    fs, _ = committed()
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      result = fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+      assert result.a_target is not None or result.stop_x is not None or fs.forcing
+    result = fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+    assert not fs.forcing and result.stop_x is None
+
+  def test_a_noisy_dip_or_lingering_stop_evidence_resets_the_release(self):
+    fs, _ = committed()
+    fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+    # one short-path frame between open frames: the counter starts over
+    fs.update(obs(path_end=10.0), car_state(8.0), True, True, True)
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+    assert fs.forcing
+    # a long path that still carries strict stop evidence is not a green
+    fs2, _ = committed()
+    for _ in range(RELEASE_OPEN_FRAMES + 2):
+      fs2.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, strict=True, moving=True), car_state(8.0), True, True, True)
+    assert fs2.forcing
