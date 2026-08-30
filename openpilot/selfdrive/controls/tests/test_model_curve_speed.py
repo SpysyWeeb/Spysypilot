@@ -36,9 +36,10 @@ TORQUE = (FACTOR, 0.0, FRICTION)
 def make_model(speed=15.0, curvature=None, position_y=None):
   x = speed * T
   curvature = np.zeros(N) if curvature is None else np.asarray(curvature, dtype=float)
+  # the fields the policy reads, plus what a planner parses from a model message in the integration test
   return SimpleNamespace(position=SimpleNamespace(x=x, y=np.zeros(N) if position_y is None else np.asarray(position_y)),
-                         velocity=SimpleNamespace(x=np.full(N, speed)),
-                         orientationRate=SimpleNamespace(z=curvature * speed))
+                         velocity=SimpleNamespace(x=np.full(N, speed)), acceleration=SimpleNamespace(x=np.zeros(N)),
+                         orientation=SimpleNamespace(z=np.zeros(N)), orientationRate=SimpleNamespace(z=curvature * speed), leadsV3=[])
 
 
 def curve_ahead(speed, start, length, curvature):
@@ -194,10 +195,11 @@ class TestPlannerIntegration(unittest.TestCase):
     from unittest.mock import patch
     model = make_model(15.0)
     model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]))
-    model.action = SimpleNamespace(desiredAcceleration=1.0, shouldStop=False)
+    model.action = SimpleNamespace(desiredAcceleration=1.0, shouldStop=False, desiredCurvature=0.0)
     absent = SimpleNamespace(present=False)
     messages = {
-      'carState': SimpleNamespace(vEgo=15.0, vCruise=25.0 * 3.6, aEgo=0.0, standstill=False, steeringPressed=False),
+      'carState': SimpleNamespace(vEgo=15.0, vCruise=25.0 * 3.6, aEgo=0.0, standstill=False, steeringPressed=False, leftBlinker=False,
+                                  rightBlinker=False, steeringAngleDeg=0.0, gasPressed=False, brakePressed=False),
       'carControl': SimpleNamespace(orientationNED=[], latActive=True),
       'controlsState': SimpleNamespace(forceDecel=False, longControlState=longitudinal_planner.LongCtrlState.pid,
                                        lateralControlState=SimpleNamespace(which=lambda: 'pidState')),
@@ -214,7 +216,8 @@ class TestPlannerIntegration(unittest.TestCase):
         self.alive = self.freq_ok = self.valid = dict.fromkeys(values, True)
 
       def all_checks(self, services=None):
-        return True
+        # the model message here is a stub: planners that classify stops or anchor leads from it must see it invalid
+        return services is not None and 'modelV2' not in services
 
     planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2))
     sm = FakeSubMaster(messages)
