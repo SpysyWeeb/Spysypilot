@@ -385,13 +385,20 @@ red-team pass.
   |opposite|/RATE_UP` from the carOutput applied torque, fastest-release ceiling blended in over one
   budget. Closed-loop replay against the phase-3 plant caught it firing during turn-ins (route 2b
   s-turn: the 2 s horizon holds the next leg of an S while the wheel is still 200° short of this
-  one, and the release starved the turn) — gated on `direction_fraction ≥ 0`, so it acts only once
-  the wheel has reached what the plan still needs on its side. Review (wf_97492c7f) then confirmed
+  one, and the release starved the turn) . Review (wf_97492c7f) then confirmed
   three more: the flip time snapped to the 0.25 s horizon grid, swinging the blend by up to 0.53
   torque in one frame (R7) — the crossing is now interpolated inside its grid segment; the sign test
   was blind when the immediate target sat exactly at zero — it now falls back to the applied torque's
   own side; and `carOutput` was trusted without an alive/valid check — a dead `card` now reads as
-  zero applied torque, which disables the release rather than latching it. The anticipated-reversal
+  zero applied torque, which disables the release rather than latching it. The step-1 field drive
+  (route 2c) settled the entry condition: a direction-fraction gate was blind to an S-leg REBUILT
+  through center (wheel on the far side, ask cap-limited, next reversal visible — released, it cost
+  0.4 s of crossing on the owner-flagged 63–74 s unwind). Final form: entry blocked while
+  `raw · (served target − measured) > 0` (the ask still doing the plan's own work — subsumes turn-in
+  and rebuild), then a one-bit latch rides the release through its own shed until the flip clears.
+  All four replay windows (2b s-turn, route-23 owner unwind, 2c s-turn, 2c unwind) equal or better
+  vs step 1; closed-loop release duty 0–0.8 % — it binds only in its designed pocket, the
+  held-at-parity approach to a visible reversal. The anticipated-reversal
   `max_rate` reduction is still open (a later step).*
 - **FM3.12 — Undebounced EPS fault bit resets the controller. [v2]** A 1–3 frame
   `CF_Mdps_ToiUnavail`/`ToiFlt` flicker during a firm turn. *`steerFaultTemporary` has no

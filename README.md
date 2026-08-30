@@ -68,12 +68,14 @@ builds, never past a refuge island.
   sign flip, and once the flip lands inside the platform's own reversal budget (release at 7/409 per
   frame, rebuild at 4/409) the fastest-release trajectory becomes a ceiling on how far the request may
   still ask in the old direction — never raising a request, never touching one already reversing, and
-  never during a turn-in (a closed-loop replay against the fitted rack plant caught the ungated release
-  starving an s-turn whose next leg was already visible on the horizon). And the unwind magnitude clamp
+  never while the ask is still doing the plan's own work: the release begins only once the served target
+  has come back to (or past) the wheel, then rides latched through its own shed (closed-loop replay
+  against the fitted rack plant caught two premature forms on the s-turns — a starved turn-in, and a leg
+  rebuilt through center trimmed because the S's next reversal was already visible). And the unwind magnitude clamp
   is retired: a signed continuous direction fraction relaxes only the rate feedback during unwinds, so a
   return the rack's own self-aligning torque is producing is not resisted, while the feedforward keeps
-  following the plan. Closed-loop A/B vs step 1 on the two hardest windows (route 2b s-turn, route 23
-  owner unwind): tracking equal, release engaging only in unwind/near-center pockets (1.4–2.6 % duty).
+  following the plan. Closed-loop A/B vs step 1 on the four hardest windows (the 2b and 2c s-turns, the
+  route-23 owner unwind, the 2c 63–74 s unwind): equal or better on every one, release duty 0–0.8 %.
   A 16-agent review then confirmed and fixed four more: the flip time is interpolated inside the
   horizon grid (was a 0.25 s snap that could swing the blend by half the torque scale in one frame),
   a target sitting exactly at zero no longer blinds the sign test, `carOutput` is alive/valid-guarded
