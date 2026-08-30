@@ -102,6 +102,7 @@ class LatControlRack(LatControl):
     rack_log.profileTransition = bool(output.profile_transition)
     rack_log.previewTime = float(output.preview_time_s)
     rack_log.referenceLimited = bool(output.reference_limited)
+    rack_log.nearSteeringAngleDeg = float(output.near_target_angle_deg)
     rack_log.saturated = bool(self._check_saturation(output.saturated or self.steer_max - abs(output.torque) < 1e-3, CS,
                                                      steer_limited_by_safety, curvature_limited))
     self.torque.sat_time = self.sat_time
