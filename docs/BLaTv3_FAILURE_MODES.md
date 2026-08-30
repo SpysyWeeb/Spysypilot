@@ -380,6 +380,14 @@ red-team pass.
   island jog right after firm torque the other way. *+4 up / −7 down per frame, sign-aware:
   a full reversal takes ~1.6 s.* → R9 reversal-cost model; start the return leg early enough
   to fit. → Unit reproducing the slew timing; saturated turn-in then reversal replay.
+  *Phase 3 step 2: implemented as the slew-aware early release — walk the horizon for the earliest
+  sign flip (angle sign, or a rate reversal above 1 °/s), budget `T_rev = |applied|/RATE_DOWN +
+  |opposite|/RATE_UP` from the carOutput applied torque, fastest-release ceiling blended in over one
+  budget. Closed-loop replay against the phase-3 plant caught it firing during turn-ins (route 2b
+  s-turn: the 2 s horizon holds the next leg of an S while the wheel is still 200° short of this
+  one, and the release starved the turn) — gated on `direction_fraction ≥ 0`, so it acts only once
+  the wheel has reached what the plan still needs on its side. The anticipated-reversal `max_rate`
+  reduction is still open (a later step).*
 - **FM3.12 — Undebounced EPS fault bit resets the controller. [v2]** A 1–3 frame
   `CF_Mdps_ToiUnavail`/`ToiFlt` flicker during a firm turn. *`steerFaultTemporary` has no
   debounce; latActive drops; today the rack state is wiped and re-seeded.* → Below a short

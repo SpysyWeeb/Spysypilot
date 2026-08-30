@@ -63,6 +63,18 @@ builds, never past a refuge island.
   10 m/s the immediate target becomes the scalar itself instead of lagging it ~12 % while curvature
   builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
   Field-validated 2026-08-29 (route 00000024, "no complaints").
+- Phase 3, step 2 — the controller reads the torque the EPS is actually applying (`carOutput`) and
+  uses it two ways. A slew-aware early release: the horizon targets are walked for the earliest coming
+  sign flip, and once the flip lands inside the platform's own reversal budget (release at 7/409 per
+  frame, rebuild at 4/409) the fastest-release trajectory becomes a ceiling on how far the request may
+  still ask in the old direction — never raising a request, never touching one already reversing, and
+  never during a turn-in (a closed-loop replay against the fitted rack plant caught the ungated release
+  starving an s-turn whose next leg was already visible on the horizon). And the unwind magnitude clamp
+  is retired: a signed continuous direction fraction relaxes only the rate feedback during unwinds, so a
+  return the rack's own self-aligning torque is producing is not resisted, while the feedforward keeps
+  following the plan. Closed-loop A/B vs step 1 on the two hardest windows (route 2b s-turn, route 23
+  owner unwind): tracking equal, release engaging only in unwind/near-center pockets (1.4–2.6 % duty).
+  ⚠️ awaiting the step-1 field drive before this merges anywhere.
 - Phase 3, step 1 — continuity and truth-telling in the torque tail, from the phase-3 design panel
   (`route-audit/phase3/design/phase3_design.md`): the turn-in feedback cap blends continuously between
   its two values instead of jumping 0.35 units at a boolean; the direction guard ramps down at its own
