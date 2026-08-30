@@ -230,6 +230,8 @@ to 4 m/s, tapering to 1.2 by 12 m/s. The car's SCC saturates at ≈ 1.6–1.9 m/
 column's overshoot, which the profile no longer has (route 24 red light 1: the endpoint sat ~1.5 m beyond the owner's own
 stop). `PROFILE_LANDING` 4.5 → 2.5 m: the closed-loop plant stops about a metre past the landing, so the margin sets the
 stop position almost 1:1 — the driven build landed ≈ 8.5 m short of the endpoint, this one ≈ 3.5 m with the same
-−0.45 m/s² last second. Calibrated on routes 25/26: on the car the stop lands ~0.6 m *past* the committed point (the plant's column shortfall does
-not exist on the real ESP/hold), so the setback is the position lever and the landing margin is feel; the owner's
-preferred spot sat at endpoint −1.5, −1.5 and +0.9 m on three lights. 2 m setback ⇒ ≈1.4 m short of the endpoint.
+−0.45 m/s² last second. Calibrated on routes 25/26 against the world-fixed committed point: the car stops ~0.6 m short of it (the plant's 3.5 m
+column shortfall does not exist on the real ESP/hold), so the setback is the position lever and the landing margin is
+feel; the owner's preferred spot sat ~2.7 m (route 25 t=1041), ~1.5 m (route 24) short of the model's endpoint and
+once ~0.5 m past it (route 25 t=1558). `LATCH_SETBACK` 3 m ⇒ the car lands ≈ 3.6 m short of the endpoint, about a
+metre before the owner's usual spot.

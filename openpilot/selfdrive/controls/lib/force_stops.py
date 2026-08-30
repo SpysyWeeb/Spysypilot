@@ -23,8 +23,9 @@ MPC_PROFILE_OFFSET = 6.0  # m, the profile reaches zero this far before its targ
 PRE_LATCH_GATE = 0.35     # filtered detector level that turns on shaping of the model's live endpoint
 DV_MAX = 2.0              # m/s, the cap may never sit further below current speed while shaping: v_cruise is a target
                           # the MPC erases in seconds, so a collapsing path must not command a slam
-LATCH_SETBACK = 2.0       # m, short of the model's endpoint. 5.0 was calibrated for the soft MPC column that overshot its point;
-                          # with the committed profile the car stops at the point, and the owner found 5 m early (field test 3)
+LATCH_SETBACK = 3.0       # m, short of the model's endpoint. 5.0 was calibrated for the soft MPC column that overshot its point;
+                          # with the committed profile the car stops ~0.6 m short of the point (routes 25/26), and the owner's
+                          # own stops sat 1.5-2.7 m short of the model's endpoint: 3 m lands about a metre before them
 MIN_STOP_LENGTH = 3.0     # m, floor of the detector window, keeps it alive at crawl speeds
 DETECT_RC = 1.0           # s
 LATCH_THRESHOLD = 0.55
