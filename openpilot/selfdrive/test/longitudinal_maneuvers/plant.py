@@ -288,7 +288,9 @@ class Plant:
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
-      self.acceleration = min(-0.5, self.acceleration)
+      # the thin-handoff LongControl settles on the plan bounded by its kiss while rolling; the old flat -0.5 stand-in
+      # overwrote exactly the landing behavior these tests exist to judge
+      self.acceleration = min(self.acceleration, -0.12)
     if self.actuator_lag is not None:
       # the car lags the plan: braking builds at tau_up, releases at tau_down
       tau_up, tau_down = self.actuator_lag

@@ -30,13 +30,15 @@ from openpilot.selfdrive.controls.lib.longitudinal_lead import total_decel_requi
 # clamp and its own kiss below the stop bit.
 LANDING_SPEED = 3.5          # m/s, the law acts below this; at the top the bound (2.75 m/s^2) exceeds any comfort approach
 STOP_INTENT_SPEED = 0.5      # m/s, the MPC's horizon must reach below this for a slowdown to count as a stop
-KISS_SPEED = 0.15            # m/s, from here down the corridor is the kiss alone (the Palisade reports standstill at ~0.1)
+KISS_SPEED = 0.40            # m/s, from here down the corridor is the kiss alone. 0.15 left the car carrying -0.35 of measured
+                             # deceleration into the wheel stop (route 0x2b): the ESP releases the brake ~0.7 s behind the request,
+                             # so the request must reach the kiss about that long before the wheels stop for the body not to rock
 KISS_DECEL = 0.15            # m/s^2, the braking the wheels stop under; the hold and the car's own clamp take over after
 CREEP_SPEED = 1.0            # m/s, the floor peaks at CREEP_DECEL here: enough to keep slowing against creep torque, and
 CREEP_DECEL = 0.40           # m/s^2, where the MPC column eases to anyway ...
 CREEP_FADE_SPEED = 1.5       # m/s, ... and it is gone here: a queue rolling at 2 m/s is not held to a stop's floor
-BOUND_BP = [KISS_SPEED, 0.5, LANDING_SPEED]    # allowed braking: 0.70 * v + 0.30 above 0.5 m/s (1.35 m/s^2 at 1.5 m/s,
-BOUND_V = [KISS_DECEL, 0.65, 2.75]             # 0.65 at 0.5), straight down to the kiss below
+BOUND_BP = [KISS_SPEED, 0.9, LANDING_SPEED]    # allowed braking: 0.70 * v + 0.30 above 0.9 m/s (1.35 m/s^2 at 1.5 m/s,
+BOUND_V = [KISS_DECEL, 0.93, 2.75]             # 0.93 at 0.9), straight down to the kiss below
 FLOOR_BP = [KISS_SPEED, CREEP_SPEED, CREEP_FADE_SPEED]
 FLOOR_V = [KISS_DECEL, CREEP_DECEL, 0.0]
 LAUNCH_FRAMES = 3            # consecutive frames of a positive plan that end a landing: a hover alternates, a launch climbs
@@ -53,7 +55,7 @@ STALL_RELEASE_RATE = 0.15    # m/s^2 per s, ... shifts the whole corridor toward
 # releasing early enough to arrive where the plan is. It never lifts above the floor or the lead's own requirement
 RELEASE_GAIN = 0.5           # of the measured surplus deceleration: a lagging actuator under proportional lift settles faster; kept well below
                              # the gain where the ESP's dead time (~0.2 s) would make it ring
-RELEASE_DEADBAND = 0.1       # m/s^2 of surplus before the lift starts; the wheel-speed acceleration carries that much noise
+RELEASE_DEADBAND = 0.05      # m/s^2 of surplus before the lift starts (0.1 left the lift inert through the last half metre)
 RELEASE_LIFT_MAX = 1.0       # m/s^2, the most the request is lifted above the plan
 
 
@@ -116,7 +118,9 @@ class StopLanding:
       self._positive_frames = 0
       self._reset_watchdog()
     else:
-      self._positive_frames = self._positive_frames + 1 if a_target > 0.0 else 0
+      # a climbing plan ends the landing only while rolling: at standstill the MPC's hover can drift positive for
+      # a few frames against a standing lead, and the launch authority there is the planner's own release
+      self._positive_frames = self._positive_frames + 1 if a_target > 0.0 and v_ego > KISS_SPEED else 0
       if launch or self._positive_frames >= LAUNCH_FRAMES:
         self.reset()
         return a_target

@@ -29,13 +29,14 @@ class TestCorridor:
   def test_the_bound_falls_linearly_with_speed_and_only_removes_surplus_braking(self):
     law = StopLanding()
     assert math.isclose(landing_bound(1.5), 1.35, rel_tol=1e-9, abs_tol=1e-9)
-    assert math.isclose(landing_bound(0.5), 0.65, rel_tol=1e-9, abs_tol=1e-9)
+    assert math.isclose(landing_bound(0.9), 0.93, rel_tol=1e-9, abs_tol=1e-9)
     assert math.isclose(landing_bound(KISS_SPEED), KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
     # at the top of the window the bound sits above any comfort approach
     assert law.update(-2.0, 3.0, NO_LEAD, True) == -2.0 and not law.active
     assert math.isclose(law.update(-2.0, 1.5, NO_LEAD, True), -1.35, rel_tol=1e-9, abs_tol=1e-9)
     assert law.active
-    assert math.isclose(law.update(-2.0, 0.5, NO_LEAD, True), -0.65, rel_tol=1e-9, abs_tol=1e-9)
+    assert math.isclose(law.update(-2.0, 0.5, NO_LEAD, True), -landing_bound(0.5), rel_tol=1e-9, abs_tol=1e-9)
+    assert landing_bound(0.5) < 0.35    # the kiss arrives early enough for the ESP's ~0.7 s release to land by the wheel stop
     # a plan inside the corridor passes untouched
     assert law.update(-0.5, 1.5, NO_LEAD, True) == -0.5 and not law.active
 
@@ -84,13 +85,18 @@ class TestLatchAndLaunch:
     assert max(outputs) - min(outputs) < 0.05
     assert law.landing
 
-  def test_a_climbing_plan_ends_the_landing_after_launch_frames(self):
-    law = landing(0.2, -0.2)
+  def test_a_climbing_plan_ends_the_landing_after_launch_frames_only_while_rolling(self):
+    law = landing(0.6, -0.3)
     for i in range(LAUNCH_FRAMES - 1):
-      assert law.update(0.1 * (i + 1), 0.1, NO_LEAD, True) == -KISS_DECEL and law.landing
-    assert law.update(0.1 * LAUNCH_FRAMES, 0.1, NO_LEAD, True) == 0.1 * LAUNCH_FRAMES and not law.landing
+      assert law.update(0.1 * (i + 1), 0.6, NO_LEAD, True) == -landing_floor(0.6) and law.landing
+    assert law.update(0.1 * LAUNCH_FRAMES, 0.6, NO_LEAD, True) == 0.1 * LAUNCH_FRAMES and not law.landing
     # and a fresh landing needs braking intent again
-    assert law.update(0.3, 0.2, NO_LEAD, True) == 0.3 and not law.landing
+    assert law.update(0.3, 0.6, NO_LEAD, True) == 0.3 and not law.landing
+    # at standstill the hover may drift positive without ending the landing: the planner's release is the authority there
+    law = landing(0.6, -0.3)
+    for _ in range(LAUNCH_FRAMES * 3):
+      assert law.update(0.12, 0.05, NO_LEAD, True) == -KISS_DECEL and law.landing
+    assert law.update(0.12, 0.05, NO_LEAD, True, launch=True) == 0.12 and not law.landing
 
   def test_the_planners_own_release_ends_the_landing_at_once(self):
     law = landing(0.2, -0.2)

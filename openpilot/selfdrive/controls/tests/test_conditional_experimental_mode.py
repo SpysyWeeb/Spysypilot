@@ -2,7 +2,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (ConditionalExperimentalMode, DRIVER_OVERRIDE_SUPPRESS_S,
                                                                             LEAD_RELEASE_HYSTERESIS_S, POST_STOP_SUPPRESS_S,
-                                                                            STOP_INTENT_HOLD_S)
+                                                                            STOP_INTENT_HOLD_S, CLEAR_CANCEL_S)
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -120,11 +120,12 @@ class TestExitAndHold:
     return cem
 
   def test_a_confirmed_stop_holds_through_prediction_flicker(self):
+    # the flicker is evidence dropping out, not the road opening: a short, slow path (an open road now cancels the hold)
     cem = self.entered()
     for _ in range(3):
-      assert run(cem, 0.3)
+      assert run(cem, 0.3, model(path_end=15.0, terminal_speed=2.0))
       assert run(cem, 0.3, stop_model())
-    assert run(cem, STOP_INTENT_HOLD_S - 0.5)
+    assert run(cem, STOP_INTENT_HOLD_S - 0.5, model(path_end=15.0, terminal_speed=2.0))
 
   def test_stable_clear_returns_to_chill(self):
     cem = self.entered()
@@ -161,3 +162,56 @@ class TestExitAndHold:
     cem = self.entered()
     assert not run(cem, 0.05, stop_model(), enabled=False)
     assert not cem.experimental_mode and cem.intent_filter.x == 0.0
+
+
+def hint_model(v_ego=15.0):
+  # borderline evidence: the hint tier alone, confidence exactly 0.70 (route 0x2b's sustaining frames)
+  return model(path_end=v_ego * 6.0, terminal_speed=5.0, desired_accel=-0.3)
+
+
+def early_model(v_ego=15.0):
+  # committed evidence: the early tier, confidence 0.80
+  return model(path_end=v_ego * 6.0, terminal_speed=5.0, desired_accel=-0.6)
+
+
+def murky_model():
+  # neither stop evidence nor an open road: a short, slow path
+  return model(path_end=15.0, terminal_speed=2.0)
+
+
+class TestSearchRelease:
+  # route 0x2b t=1291-1317: the mode engaged for a real red light, the car passed it, and lone 0.70-confidence hint
+  # frames kept refreshing the 4 s hold for 17.5 s while the model's own path showed the road open twice
+
+  def enter_on_hints(self):
+    cem = ConditionalExperimentalMode()
+    assert run(cem, 1.0, hint_model(), car_state(15.0))
+    return cem
+
+  def test_a_lone_hint_cannot_sustain_the_search(self):
+    cem = self.enter_on_hints()
+    # after entry: murky frames with a single hint frame every 1.5 s -- the old behavior stayed latched indefinitely
+    for _ in range(4):
+      run(cem, 1.5, murky_model(), car_state(15.0))
+      run(cem, DT_MDL, hint_model(), car_state(15.0))
+    assert not cem.experimental_mode
+
+  def test_committed_evidence_still_sustains(self):
+    cem = self.enter_on_hints()
+    for _ in range(4):
+      run(cem, 1.5, murky_model(), car_state(15.0))
+      run(cem, DT_MDL, early_model(), car_state(15.0))
+    assert cem.experimental_mode
+
+  def test_an_open_road_cancels_the_hold(self):
+    cem = ConditionalExperimentalMode()
+    assert run(cem, 1.0, stop_model(), car_state(10.0))
+    # the road opens (a long, moving path): the hold is cancelled and the ordinary clear hysteresis exits well
+    # before the 4 s the last strict frame would have held
+    assert not run(cem, CLEAR_CANCEL_S + 1.0, model(path_end=150.0, terminal_speed=12.0), car_state(10.0))
+
+  def test_a_short_open_flash_does_not_cancel(self):
+    cem = ConditionalExperimentalMode()
+    assert run(cem, 1.0, stop_model(), car_state(10.0))
+    run(cem, CLEAR_CANCEL_S * 0.6, model(path_end=150.0, terminal_speed=12.0), car_state(10.0))
+    assert run(cem, DT_MDL, stop_model(), car_state(10.0))

@@ -277,24 +277,24 @@ class TestStopLanding:
     plant = Plant(speed=6.0, distance_lead=60.0, lead_relevancy=True)
     log = []
     v_lead = 0.0
-    while plant.current_time < 20.0:
-      if plant.current_time > 14.0:
+    while plant.current_time < 24.0:
+      if plant.current_time > 16.0:
         v_lead = min(v_lead + 2.0 * DT_MDL, 5.0)         # the lead pulls away at 2 m/s^2 after 14 s
       plant.step(v_lead=v_lead, v_cruise=10.0)
       log.append((plant.current_time, plant.speed, float(plant.planner.output_a_target), bool(plant.planner.output_should_stop)))
     stopped = [i for i, (_, v, _, _) in enumerate(log) if v < 0.05]
     assert stopped, 'did not stop'
     i_stop = stopped[0]
-    assert log[i_stop][0] < 14.0, 'stopped only after the lead left'
+    assert log[i_stop][0] < 16.0, 'stopped only after the lead left'
     last_rolling = [a for _, v, a, _ in log[:i_stop] if v > 0.05][-1]
     assert -0.3 <= last_rolling <= -KISS_DECEL + 1e-6, last_rolling                       # the wheels stop under a whisper
     tail = [a for t, _, a, _ in log[:i_stop] if t >= log[i_stop][0] - 1.0]
     assert max(tail) < 0.0, max(tail)                                                     # no throttle blip in the last second
     assert max(abs(b - a) for a, b in zip(tail, tail[1:], strict=False)) < 0.15             # and no square wave
-    held = [(t, s) for t, v, _, s in log if log[i_stop][0] <= t <= 14.0]
+    held = [(t, s) for t, v, _, s in log if log[i_stop][0] <= t <= 16.0]
     assert all(s for _, s in held), 'stop bit dropped while the lead stood still'
-    launched = [t for t, _, a, s in log if t > 14.0 and a > 0.1 and not s]
-    assert launched and launched[0] - 14.0 < 1.5, launched[:1]                             # the lead leaving releases the landing
+    launched = [t for t, _, a, s in log if t > 16.0 and a > 0.1 and not s]
+    assert launched and launched[0] - 16.0 < 1.5, launched[:1]                             # the lead leaving releases the landing
 
 
 class TestGreenLaunch:
