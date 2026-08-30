@@ -65,12 +65,15 @@ builds, never past a refuge island.
   τ = 0.1 s, and the served target may trail the model's by at most `min(0.2 m/s² / v², 3°)` — so a
   turn-in or unwind passes at once, at its own rate, short of the raw target by no more than 3°, while
   the 4–7° per-frame jitter of the model's target at 5–30 mph is smoothed. `PreviewScheduler`: the
-  target is read up to 2 s past the action time, one 0.25 s step per two agreeing model frames, only
+  plan is trusted up to 2 s past the action time, one 0.25 s step per two agreeing model frames, only
   while the model's own path stays within 0.15 m of the clothoid between the near and far targets
   (0.20 m to keep), the far wheel angle within 1° of the near one, the path's uncertainty low, the far
   target no jumpier than the near one, and at most 40 m ahead; two disagreeing frames, hands on the
-  wheel, a lane change or a limited target bring it back to the action time. The tracker's response
-  time grows from 0.4 s to 0.5 s with the preview. Costs +0.4 ms a frame on the device.
+  wheel, a lane change or a limited target collapse it. The preview never replaces the near target —
+  the first cut did, within the 1° gate, and drifted-then-corrected on straights (route 00000028:
+  52 such cycles in 46 min, 0.05–0.14 m/s² of the near target's correction ignored while open) — it only earns the tracker a calmer
+  reference (filter time constant 0.1 → 0.3 s) and a longer response time (0.4 → 0.5 s). Costs
+  +0.4 ms a frame on the device.
   Open-loop replay on routes 00000020–24 (754k engaged frames, all `active`, no fallbacks): at 5–30 mph the served
   target's per-frame step p95 1.1–2.1° → 0.27–0.52° and its reversals −85–92 %, never more than 3° from the model's;
   the twelve largest low-speed turn-ins/unwinds per route pass within that bound with no far preview; the recorded

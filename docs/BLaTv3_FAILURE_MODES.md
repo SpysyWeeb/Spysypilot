@@ -32,8 +32,9 @@ Shape ("upstream-shaped controller"):
 - modeld publishes a short curvature preview on `ModelDataV2.Action` next to
   `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar
   (phase 2 step 3: `desiredCurvaturePreview[Times]`, 0.25 s apart from the action time to 2 s past it).
-- The immediate target passes through a bounded reference filter (R5) and is read at a scheduled
-  preview time (R2–R4) — phase 2 step 4; the small-reversal governor is gone.
+- The immediate target passes through a bounded reference filter (R5); a scheduled preview (R2–R4)
+  measures how far the plan is consistent and earns the tracker a calmer reference and a longer
+  response time, never replacing the near target — phase 2 step 4; the small-reversal governor is gone.
 
 Layers (the input side is now explicit — see L8):
 0. Upstream inputs — `clip_curvature` (ISO 3 m/s² / 5 m/s³ clamp with its own rate state),
@@ -90,6 +91,12 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   rejects every one of the 475 island-class frames by 3–16×; the clothoid is uniformly the right
   idealization (arc p99 deviation 2.6 m vs 0.96 m). The far target moves the wheel only 0.48°
   RMS relative to the near one on admitted frames.*
+  *Field 2026-08-30 (route 00000028, the first step-4 drive): the first cut served the far target
+  whenever it agreed with the near one within 1°, which is exactly where the model's lateral-position
+  corrections live at speed (1° ≈ 0.15 m/s² at 25 m/s) — the served target sat 0.77° (p90) / 1.2° (p99)
+  from the near one while open, 0.05–0.14 m/s² of correction ignored, 52 drift-then-correct cycles in
+  46 min; the owner felt them. Fixed the same day: the preview never replaces the near target; it schedules the
+  reference filter's time constant (0.1 → 0.3 s) and the response time instead.*
   *Phase 2 step 4 (2026-08-29): `PreviewScheduler` walks the horizon grid one step at a time; a
   step is admitted only if (a) the model's own path samples inside `[t_action, t_action + step]`
   lie within 0.15 m of the clothoid from the near to the far curvature (0.20 m to keep an
@@ -117,7 +124,8 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   possible island jog (1.5 m over 40 m) needs 25.1 °/s at 40 mph against today's 25.7 °/s cap;
   a brisker one needs 2–4×.
   *Phase 2 step 4 implements only the response-time side: the tracker's response time is
-  scheduled from 0.4 s at the action time to 0.5 s at the full 2 s preview (`RESPONSE_TIME_PREVIEW_S`),
+  scheduled from 0.4 s at the action time to 0.5 s at the full 2 s preview (`RESPONSE_TIME_PREVIEW_S`)
+  and the reference filter's time constant from 0.1 s to 0.3 s (`REFERENCE_FILTER_PREVIEW_RC_S`),
   and carried through profile transitions (a branch of `_motion_limits` used to drop it). The
   proactive and corroborated opening of the comfort envelope itself is still open: it belongs to
   the phase-4 envelope `(headroom − H) × G`.*

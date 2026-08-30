@@ -299,6 +299,33 @@ class TestLatControlRack(OpenpilotTestCase):
       output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
       assert output is not None and output.preview_time_s == 0.0
 
+  def test_preview_never_replaces_the_near_target(self):
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    # a consistent straight whose far targets bend gently within the heading gate: the near target stays in charge
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    model = horizon_model(times, [0.0, 0.0, 0.0005, 0.001, 0.0015, 0.002, 0.002], [15.0] * 7)
+    for frame in range(150):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None
+    assert output.preview_time_s >= 1.0
+    assert abs(output.target_angle_deg) < 1e-6 and abs(output.target_curvature) < 1e-9
+
+  def test_preview_slows_the_filter_within_its_bound(self):
+    filter_ = ReferenceFilter()
+    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    quick = [filter_.update(RackTarget(1.0, 0.0), 3.0, 0.01).position_deg for _ in range(10)]
+    filter_.reset()
+    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    calm = [filter_.update(RackTarget(1.0, 0.0), 3.0, 0.01, rc_s=0.3).position_deg for _ in range(10)]
+    assert quick[-1] > calm[-1] > 0.0
+    # a step past the bound is served at the bound regardless of the time constant
+    assert math.isclose(filter_.update(RackTarget(20.0, 100.0), 3.0, 0.01, rc_s=0.3).position_deg, 17.0)
+
   def test_full_preview_keeps_steering_without_a_farther_target(self):
     controller = RackTrajectoryController()
     CS = car.CarState.new_message()

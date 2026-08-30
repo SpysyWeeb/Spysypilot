@@ -80,6 +80,7 @@ class RackTrajectoryOutput:
   saturated: bool
   preview_time_s: float
   reference_limited: bool
+  near_target_angle_deg: float
 
 
 MEASURED_RATE_FILTER_RC_S = .05
@@ -299,6 +300,7 @@ def model_path_targets(
 
 
 REFERENCE_FILTER_RC_S = .1
+REFERENCE_FILTER_PREVIEW_RC_S = .2  # added to the time constant at the full preview: a consistent road earns calmer tracking
 REFERENCE_FILTER_TRAIL_LATERAL_ACCEL = .2  # m/s^2: how far the served target may trail the raw one
 REFERENCE_FILTER_TRAIL_MAX_DEG = 3.0  # and in wheel angle, which is the tighter bound below ~12 m/s
 DIRECTION_GUARD_RC_S = .12
@@ -331,12 +333,13 @@ class ReferenceFilter:
     self.target = None
     self.limited = False
 
-  def update(self, target: RackTarget, trail_limit_deg: float, dt: float, bypass: bool = False) -> RackTarget:
+  def update(self, target: RackTarget, trail_limit_deg: float, dt: float, bypass: bool = False,
+             rc_s: float = REFERENCE_FILTER_RC_S) -> RackTarget:
     if self.target is None or bypass:
       self.target = target
       self.limited = False
       return target
-    alpha = dt / (REFERENCE_FILTER_RC_S + dt)
+    alpha = dt / (rc_s + dt)
     position = self.target.position_deg + alpha * (target.position_deg - self.target.position_deg)
     rate = self.target.rate_deg_s + alpha * (target.rate_deg_s - self.target.rate_deg_s)
     trail = target.position_deg - position
@@ -385,13 +388,14 @@ def _clothoid_y(curvature_near: float, curvature_far: float, x_action: float, x_
 
 
 class PreviewScheduler:
-  """Schedule how far along the plan the immediate target is read.
+  """Schedule how far ahead the plan is trusted to be consistent.
 
   On a path the model draws consistently -- a clothoid from the near curvature to the far one,
-  within a lateral tolerance in metres, with the far target as steady as the near one -- the target
-  is read further ahead, one horizon step at a time. The moment the path stops agreeing (a jog, a
-  curve entry, a flickering far point, a lane change, the driver's hands, a limited path) it is
-  read at the action time again within two model frames.
+  within a lateral tolerance in metres, with the far target as steady as the near one -- the
+  preview lengthens one horizon step at a time; the moment the path stops agreeing (a jog, a curve
+  entry, a flickering far point, a lane change, the driver's hands, a limited path) it collapses
+  within two model frames. The preview never replaces the near target: it only earns the tracker a
+  calmer reference (a longer filter time constant) and a longer response time.
   """
 
   def __init__(self) -> None:
@@ -736,13 +740,13 @@ class RackTrajectoryController:
     measured_out_of_bounds = not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9
     # the driver's hands, a lane change or a limited immediate target pin the preview at the action time
     lane_changing = str(self.model.meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
-    preview_index = self.preview_scheduler.update(
+    self.preview_scheduler.update(
       self.model, int(self.model.timestampEof), float(preview_times[0]), targets,
       bool(CS.steeringPressed) or lane_changing or target_limits[0] or measured_out_of_bounds,
     )
     preview_s = self.preview_scheduler.preview_s
-    target = targets[preview_index]
-    path_limited = target_limits[preview_index]
+    target = targets[0]
+    path_limited = target_limits[0]
     previous_angle_deg = self.rack_rate_estimator.previous_angle_deg
     measured_rate, measured_rate_valid = self.rack_rate_estimator.update(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
     # a far, steady target may be approached more slowly
@@ -761,17 +765,18 @@ class RackTrajectoryController:
     filtered_target = self.reference_filter.update(
       RackTarget(target.angle_deg, target.rate_deg_s), reference_trail_limit_deg(VM, CS.vEgo), self.dt,
       path_limited or measured_out_of_bounds or profile_transition,
+      REFERENCE_FILTER_RC_S + REFERENCE_FILTER_PREVIEW_RC_S * preview_s / HORIZON_S,
     )
     planner = self.planner
     assert planner is not None
     timed_targets = tuple(
       (offset, RackTarget(path_target.angle_deg, path_target.rate_deg_s))
       for offset, path_target in zip(HORIZON_OFFSETS_S, targets, strict=True)
-      if offset > preview_s
+      if offset > 0.0
     )
     desired_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
-      if desired_acceleration is None and timed_targets:
+      if desired_acceleration is None:
         fitted_acceleration = horizon_desired_acceleration(planner, timed_targets)
         natural_frequency = 2.0 / limits.response_time_s
         reactive_acceleration = (
@@ -931,4 +936,5 @@ class RackTrajectoryController:
       saturated=feedback_limited or torque_limited,
       preview_time_s=preview_s,
       reference_limited=self.reference_filter.limited,
+      near_target_angle_deg=target.angle_deg,
     )
