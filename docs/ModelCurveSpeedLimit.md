@@ -68,3 +68,13 @@ always-on lateral with the steering at 0.45–0.9 torque and error ≤ 0.3 while
 ## Previous design (replaced)
 A model-path curve speed cap fed in as a lower `v_cruise` (three field points 50/22/13 mph, a Palisade torque-budget
 speed, 0.5 m/s² approach, 0.2 m/s² release) plus a two-of-three predicted-torque veto that clamped positive acceleration.
+
+## 2026-08-31 — ride the authority, hold it steady (owner ruling)
+
+`A_LAT_COMFORT` 3.0 → 3.4 m/s²: the owner's manual cornering tops out at 2.86 (181 manual cornering frames in the whole
+archive — always-on-lateral steers everything else), and the ruling is to push closer to the limit. With comfort above the
+calibrated authority, the steering's own per-curve, bank-aware ceiling binds nearly everywhere; comfort stays as the
+backstop against an implausible learned authority. And `V_HOLD_BAND` 0.3 m/s: within the band of the binding limit the
+candidate is a flat zero, so the settled car holds the limit instead of stitching gas/brake corrections across the zero
+crossing; drift is corrected at the band edges by the proportional approach. Route 22 sweeper: the in-curve limit moves
+from ~25–26 (comfort-bound) to ~27–28 m/s (authority-bound with the bank).
