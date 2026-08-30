@@ -15,7 +15,8 @@ class Plant:
   messaging_initialized = False
 
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
-               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False):
+               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
+               curve=None, torque_factor=2.7, torque_friction=0.11, curve_model_scale=1.0):
     self.rate = 1. / DT_MDL
 
     if not Plant.messaging_initialized:
@@ -42,6 +43,14 @@ class Plant:
     self.e2e = e2e
     self.personality = personality
     self.force_decel = force_decel
+    # a world-fixed curve (start distance, length, curvature) the fake model shows along its path; the fake steering
+    # holds the path up to its torque authority and reports the torque controller state the curve policy reads
+    self.curve = curve
+    self.curve_model_scale = curve_model_scale       # the model reads the curve at this fraction of its true curvature
+    self.torque_factor = torque_factor
+    self.torque_friction = torque_friction
+    self.lateral_accel = 0.0
+    self.torque = 0.0
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
@@ -51,7 +60,40 @@ class Plant:
     from opendbc.car.honda.values import CAR
     from opendbc.car.honda.interface import CarInterface
 
-    self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=self.speed)
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    if self.curve is not None:
+      torque = CP.lateralTuning.init('torque')
+      torque.latAccelFactor = self.torque_factor
+      torque.latAccelOffset = 0.0
+      torque.friction = self.torque_friction
+    self.planner = LongitudinalPlanner(CP, init_v=self.speed)
+
+  def _curvature_at(self, world_x):
+    start, length, curvature = self.curve
+    return curvature if start <= world_x <= start + length else 0.0
+
+  def _plan_curve(self, model, controls_state, car_control):
+    # path curvature along the model's own positions, and a steering state: the car holds the path up to the torque
+    # authority factor * (1 - friction); beyond it the torque pins at 1 and the tracking error is the shortfall
+    positions = np.asarray(model.position.x, dtype=float)
+    speeds = np.asarray(model.velocity.x, dtype=float)
+    model.position.y = [0.0] * len(positions)          # the policy measures arc length from x and y
+    curvatures = np.array([self._curvature_at(self.distance + x) for x in positions])
+    rate = log.XYZTData.new_message()
+    rate.z = [float(k * self.curve_model_scale * v) for k, v in zip(curvatures, speeds, strict=True)]
+    model.orientationRate = rate
+    desired = self.speed ** 2 * self._curvature_at(self.distance)
+    authority = self.torque_factor * (1.0 - self.torque_friction)
+    self.lateral_accel = min(desired, authority)
+    self.torque = min(desired / self.torque_factor + self.torque_friction, 1.0) if desired > 0.0 else 0.0
+    state = controls_state.lateralControlState.init('torqueState')
+    state.active = True
+    state.output = float(self.torque)
+    state.error = float(desired - self.lateral_accel)
+    state.actualLateralAccel = float(self.lateral_accel)
+    state.desiredLateralAccel = float(desired)
+    state.saturated = bool(self.torque >= 1.0)
+    car_control.latActive = True
 
   @property
   def current_time(self):
@@ -115,6 +157,8 @@ class Plant:
     acceleration = log.XYZTData.new_message()
     acceleration.x = [float(x) for x in np.zeros_like(ModelConstants.T_IDXS)]
     model.modelV2.acceleration = acceleration
+    if self.curve is not None:
+      self._plan_curve(model.modelV2, control.controlsState, car_control.carControl)
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
@@ -174,6 +218,8 @@ class Plant:
       "should_stop": self.should_stop,
       "distance_lead": self.distance_lead,
       "fcw": fcw,
+      "lateral_accel": self.lateral_accel,
+      "torque": self.torque,
     }
 
 # simple engage in standalone mode

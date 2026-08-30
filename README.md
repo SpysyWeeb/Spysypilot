@@ -5,14 +5,13 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot).
 Status: **in progress pending field testing**. This feature must not be marked
 complete until the owner has tested it on-device.
 
-This branch keeps the existing model-path curve speed limiter and adds a
-Palisade-only future-torque envelope. Valid torque parameters can lower the
-future curve speed before the unchanged approach-distance calculation; the
-existing two-of-three veto still clamps only positive acceleration when
-predicted demand reaches 90%. The 50/22/13 mph field envelope and stronger
-braking remain intact. See
-[`docs/ModelCurveSpeedLimit.md`](docs/ModelCurveSpeedLimit.md) for the design
-and remaining validation work.
+Rebuilt 2026-08-29 as a curve longitudinal *policy*: the model path's curves become one
+acceleration candidate in the planner's arbitration (anticipation from a per-node torque
+budget whose steering authority is calibrated online), and the measured steering state
+decides in-curve behaviour — heavy torque lifts off the throttle, a pinned and understeering
+car brakes to the speed that restores margin. The previous speed cap, its 0.2 m/s² release
+and the 90 % predicted-torque veto are gone. See
+[`docs/ModelCurveSpeedLimit.md`](docs/ModelCurveSpeedLimit.md).
 
 ---
 

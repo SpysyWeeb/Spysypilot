@@ -8,7 +8,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.model_curve_speed import ModelCurveSpeedLimiter
+from openpilot.selfdrive.controls.lib.model_curve_speed import LateralState, ModelCurveSpeedLimiter
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
@@ -43,10 +43,6 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow
   target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
   return target_accel
-
-
-def limit_accel_for_torque(a_target, torque_veto):
-  return min(a_target, 0.0) if torque_veto else a_target
 
 
 def get_live_torque_params(sm):
@@ -88,11 +84,6 @@ class LongitudinalPlanner:
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
     if sm['controlsState'].forceDecel:
       v_cruise = 0.0
-    else:
-      torque_params = get_live_torque_params(sm)
-      lateral_active = sm['carControl'].latActive
-      v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise, v_ego=v_ego, lateral_active=lateral_active,
-                                                 roll=sm['vehicleParameters'].roll, torque_params=torque_params)
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
 
@@ -142,19 +133,28 @@ class LongitudinalPlanner:
 
     self.a_cruise = get_cruise_accel(sm['selfdriveState'].experimentalMode, v_cruise, v_ego,
                                      self.a_cruise, self.dt, accel_coast, self.allow_throttle)
-    if not should_stop(v_ego, 0.0):
-      self.a_cruise = limit_accel_for_torque(self.a_cruise, self.curve_speed_limiter.torque_veto)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
+
+    # the curve policy: anticipation from the model path, reaction to the measured steering state; one candidate
+    # that can only lower the chosen acceleration
+    curve = self.curve_speed_limiter.update(sm['modelV2'], v_ego=v_ego, a_ego=sm['carState'].aEgo,
+                                            lateral_active=sm['carControl'].latActive, steering_pressed=sm['carState'].steeringPressed,
+                                            roll=sm['vehicleParameters'].roll, accel_coast=accel_coast,
+                                            torque_params=get_live_torque_params(sm),
+                                            lateral_state=LateralState.from_controls_state(sm['controlsState']))
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
     if sm['selfdriveState'].experimentalMode:
       candidates.append((output_a_target_e2e, LongitudinalPlanSource.e2e, output_should_stop_e2e))
 
+    if curve.a_target is not None and not reset_state:
+      # a frame after engaging the arbitration would otherwise seed the MPC with a stale floored candidate
+      candidates.append((curve.a_target, LongitudinalPlanSource.curve, False))
+
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates)
-    self.output_a_target = limit_accel_for_torque(np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX),
-                                                  self.curve_speed_limiter.torque_veto)
+    self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 

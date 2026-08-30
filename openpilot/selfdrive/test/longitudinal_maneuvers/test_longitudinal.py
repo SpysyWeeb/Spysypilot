@@ -1,4 +1,6 @@
 import itertools
+import numpy as np
+from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized_class
 
@@ -192,3 +194,39 @@ class TestLongitudinalControl(OpenpilotTestCase):
         print(maneuver.title, f'in {"e2e" if maneuver.e2e else "acc"} mode')
         valid, _ = maneuver.evaluate()
         assert valid
+
+
+class TestCurvePolicy(OpenpilotTestCase):
+  def _run(self, **kwargs):
+    maneuver = Maneuver(kwargs.pop('title'), duration=kwargs.pop('duration', 30.0), **kwargs)
+    valid, logs = maneuver.evaluate()
+    assert valid
+    return logs[:, 1], logs[:, 3], logs[:, 5]     # distance, speed, acceleration
+
+  def test_a_curve_ahead_is_approached_at_the_needed_deceleration_without_a_burst(self):
+    # a 0.05 1/m curve (authority ~6.5 m/s with factor 2.7, friction 0.11) 120 m ahead at 20 m/s
+    x, v, a = self._run(title='approach a tight curve', initial_speed=20.0, cruise_values=[20.0, 20.0], curve=(120.0, 80.0, 0.05))
+    entry = int(np.flatnonzero(x >= 120.0)[0])
+    assert v[entry] <= 7.5, v[entry]                                       # slowed to the curve's limit by its start
+    assert a[:entry].min() >= -2.05, a[:entry].min()                       # never harder than the comfort floor
+    onset = int(np.flatnonzero(a < -0.3)[0])
+    assert a[onset:entry].max() <= 0.3, a[onset:entry].max()                # no burst toward the limit once braking has begun
+    exit_ = int(np.flatnonzero(x >= 200.0)[0])
+    after = a[exit_:exit_ + int(2.0 / DT_MDL)]
+    assert after.max() >= 1.0, after.max()                                  # and it accelerates again within two seconds of the exit
+
+  def test_pinned_but_tracking_coasts_and_pinned_understeering_brakes(self):
+    # a curve the steering can only just hold: heavy torque, tracking -> coast; then a tighter one it cannot -> brake
+    x, v, a = self._run(title='coast in a heavy curve', initial_speed=8.0, cruise_values=[8.0, 8.0], curve=(30.0, 150.0, 0.038),
+                        duration=25.0)
+    inside = (x > 40.0) & (x < 150.0)
+    assert np.all(a[inside] <= 0.05), a[inside].max()                       # foot off through the curve ...
+    assert a[inside].min() >= -1.0, a[inside].min()                         # ... but no real braking while it tracks
+    # a curve the model reads at half its true curvature: anticipation lets the car in too fast, the steering pins
+    # and understeers, and the reaction layer must brake it down
+    x, v, a = self._run(title='brake in a curve the steering cannot hold', initial_speed=9.0, cruise_values=[9.0, 9.0],
+                        curve=(30.0, 150.0, 0.06), curve_model_scale=0.5, duration=25.0)
+    inside = (x > 35.0) & (x < 150.0)
+    assert a[inside].min() <= -0.8, a[inside].min()                         # it brakes ...
+    assert a[inside].min() >= -2.05                                         # ... within the floor
+    assert v[inside][-1] < v[inside][0]                                     # ... and is slower deep in the curve

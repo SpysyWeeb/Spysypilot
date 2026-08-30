@@ -24,6 +24,10 @@ class Maneuver:
     self.e2e = kwargs.get("e2e", False)
     self.personality = kwargs.get("personality", 0)
     self.force_decel = kwargs.get("force_decel", False)
+    self.curve = kwargs.get("curve", None)
+    self.torque_factor = kwargs.get("torque_factor", 2.7)
+    self.torque_friction = kwargs.get("torque_friction", 0.11)
+    self.curve_model_scale = kwargs.get("curve_model_scale", 1.0)
 
     self.duration = duration
     self.title = title
@@ -39,6 +43,10 @@ class Maneuver:
       e2e=self.e2e,
       personality=self.personality,
       force_decel=self.force_decel,
+      curve=self.curve,
+      torque_factor=self.torque_factor,
+      torque_friction=self.torque_friction,
+      curve_model_scale=self.curve_model_scale,
     )
 
     valid = True
