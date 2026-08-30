@@ -83,6 +83,8 @@ class RackTrajectoryOutput:
   near_target_angle_deg: float
   direction_guarded: bool
   driver_assist_limited: bool
+  early_release: bool
+  direction_fraction: float
 
 
 MEASURED_RATE_FILTER_RC_S = .05
@@ -134,6 +136,11 @@ class RackRateEstimator:
     else:
       rate = float(self.rate_filter.update(rate))
     return rate, True
+
+
+def _smoothstep(value: float, edge0: float, edge1: float) -> float:
+  blend = min(max((value - edge0) / (edge1 - edge0), 0.0), 1.0)
+  return blend * blend * (3.0 - 2.0 * blend)
 
 
 def _clip(value: float, limit: float) -> float:
@@ -498,6 +505,13 @@ MAX_FEEDBACK_TORQUE = .35
 TURN_IN_BLEND_DEG = 3.0  # the feedback cap blends between its two values over this much angle, not a boolean jump
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .5
+# EPS request slew (opendbc Hyundai high limits: 409 max, +4/frame build, -7/frame release at 100 Hz),
+# normalized to the [-1, 1] torque scale. A full reversal costs |applied|/DOWN to shed the old side
+# plus |opposite|/UP to build the new one; the early release walks the horizon against that budget.
+TORQUE_RATE_UP_PER_S = 4.0 / 409.0 / DT
+TORQUE_RATE_DOWN_PER_S = 7.0 / 409.0 / DT
+FLIP_RATE_EPS_DEG_S = 1.0  # horizon rate reversals smaller than this are noise, not a coming flip
+APPLIED_TORQUE_EPS = 4.0 / 409.0  # below one build step there is nothing worth releasing early
 STALE_MODEL_S = 0.5  # SubMaster's alive window for modelV2: ten model frames
 INACTIVE_HOLD_FRAMES = 5  # keep the planned rack through a short latActive blip, e.g. at the standstill gate
 
@@ -561,6 +575,7 @@ class RackTrajectoryController:
     self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
     self.direction_guard_scale = 1.0
+    self.releasing = False
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_filter = ReferenceFilter()
@@ -588,6 +603,7 @@ class RackTrajectoryController:
     self.transition_acceleration_limit = None
     self.previous_planned_lateral_accel = None
     self.direction_guard_scale = 1.0
+    self.releasing = False
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_filter.reset()
@@ -647,6 +663,76 @@ class RackTrajectoryController:
       return _clip(acceleration, profile.max_acceleration_deg_s2)
     return None
 
+  def _early_release(self, raw_torque: float, applied_torque: float, targets: Sequence[PathTarget],
+                     angle_offset_deg: float, torque_from_lateral_accel: Callable[[float, object], float],
+                     torque_params, target_motion_deg: float) -> tuple[float, bool]:
+    # If the horizon shows the required torque flipping sign sooner than the EPS slew can shed the
+    # torque it is actually applying and build the opposite side, begin releasing now: the fastest
+    # release trajectory becomes a ceiling on how far the request may still ask in the old direction,
+    # blended in over one budget's width. It never raises a request, never touches a request already
+    # reversing on its own, and never acts during a turn-in (direction fraction below zero): there the
+    # old-direction torque is still the torque the plan needs -- on an S-course the horizon holds the
+    # next leg's reversal for seconds while the wheel is still short of THIS leg's target, and
+    # releasing on that foresight starves the turn (found closed-loop on route 2b's s-turn).
+    applied_direction = math.copysign(1.0, applied_torque) if abs(applied_torque) > APPLIED_TORQUE_EPS else 0.0
+    if applied_direction == 0.0 or raw_torque * applied_direction <= 0.0:
+      self.releasing = False
+      return raw_torque, False
+    if not self.releasing and raw_torque * target_motion_deg > 0.0:
+      # the ask is still doing the plan's own work -- driving the wheel toward a served target it has
+      # not reached (a turn-in, or an S-course leg being rebuilt while the horizon already carries the
+      # NEXT leg's reversal; both starved closed-loop on routes 2b/2c when released). A release may
+      # only BEGIN once the target has come back to, or past, the wheel -- old-direction torque then
+      # holds beyond the need. Latched, it rides through its own shed until the flip clears.
+      return raw_torque, False
+    now_rate = targets[0].rate_deg_s
+    # the side a flip is judged against: the immediate target, or the applied torque itself when the
+    # immediate target sits exactly at zero (a far target opposite the held torque is still a reversal)
+    now_angle = targets[0].angle_deg - angle_offset_deg
+    angle_reference = now_angle if now_angle != 0.0 else applied_direction
+    flip_time = None
+    flip_target = None
+    previous_offset = float(HORIZON_OFFSETS_S[0])
+    previous_angle = now_angle
+    previous_rate = now_rate
+    for offset, path_target in zip(HORIZON_OFFSETS_S[1:], targets[1:], strict=True):
+      angle = path_target.angle_deg - angle_offset_deg
+      angle_flip = angle * angle_reference < 0.0
+      rate_flip = path_target.rate_deg_s * now_rate < 0.0 and abs(path_target.rate_deg_s) > FLIP_RATE_EPS_DEG_S
+      if angle_flip or rate_flip:
+        # the crossing time interpolated within the grid segment, so the blend below moves
+        # continuously as a real reversal approaches (R7) instead of in whole grid steps
+        before, after = (previous_angle, angle) if angle_flip else (previous_rate, path_target.rate_deg_s)
+        span = before - after
+        fraction = min(max(before / span if span != 0.0 else 0.0, 0.0), 1.0)
+        flip_time = previous_offset + (float(offset) - previous_offset) * fraction
+        flip_target = path_target
+        break
+      previous_offset = float(offset)
+      previous_angle = angle
+      previous_rate = path_target.rate_deg_s
+    if flip_time is None:
+      self.releasing = False
+      return raw_torque, False
+    # the torque wanted on the other side, estimated cheaply as the feedforward at the flip target's
+    # own lateral acceleration -- a stated approximation, not a re-run of the tracking law
+    flip_speed = max(float(flip_target.speed_mps), MIN_SPEED)
+    opposite = min(abs(float(torque_from_lateral_accel(flip_target.curvature * flip_speed ** 2, torque_params))), 1.0)
+    release_budget_s = abs(applied_torque) / TORQUE_RATE_DOWN_PER_S + opposite / TORQUE_RATE_UP_PER_S
+    if release_budget_s <= 0.0:
+      self.releasing = False
+      return raw_torque, False
+    blend = min(max(1.0 - (flip_time - release_budget_s) / release_budget_s, 0.0), 1.0)
+    if blend <= 0.0:
+      self.releasing = False
+      return raw_torque, False
+    self.releasing = True
+    release_torque = applied_direction * max(0.0, abs(applied_torque) - TORQUE_RATE_DOWN_PER_S * self.dt)
+    ceiling = blend * release_torque + (1.0 - blend) * raw_torque
+    if abs(ceiling) >= abs(raw_torque):
+      return raw_torque, False
+    return ceiling, True
+
   @staticmethod
   def _feedback_gain(speed_mps: float) -> float:
     return float(
@@ -656,7 +742,7 @@ class RackTrajectoryController:
     )
 
   def update(self, active: bool, CS, VM, params, torque_params, torque_from_lateral_accel: Callable[[float, object], float],
-             lat_delay: float, desired_curvature: float) -> RackTrajectoryOutput | None:
+             lat_delay: float, desired_curvature: float, applied_torque: float = 0.0) -> RackTrajectoryOutput | None:
     if not active:
       self.hold()
       return None
@@ -851,15 +937,22 @@ class RackTrajectoryController:
     elif (filtered_lateral_accel * planned_lateral_accel > 0.0
           and abs(filtered_lateral_accel) < abs(planned_lateral_accel)):
       trajectory_feedforward_lateral_accel = filtered_lateral_accel
-    unwind_scale = 1.0
     planned_angle = plan.position_deg - params.angleOffsetDeg
     intended_angle = measured_angle + target_motion
+    # how far past what is still needed the wheel already is, signed and continuous: +1 a pure unwind
+    # (neither the plan nor the commanded motion holds any of the current angle), 0 exactly at the need
+    # (bit-identical to no relaxation), negative a turn-in still short of the need. Generalizes the
+    # retired unwind magnitude clamp: instead of scaling the whole request, only the rate feedback
+    # relaxes, so a return the rack's own self-aligning torque is already producing is not resisted.
+    direction_fraction = 0.0
     if measured_angle != 0.0:
       planned_hold_angle = abs(planned_angle) if planned_angle * measured_angle > 0.0 else 0.0
       turn_in_angle = abs(intended_angle) if intended_angle * measured_angle > 0.0 else 0.0
-      unwind_scale = min(
-        1.0, max(planned_hold_angle, turn_in_angle) / abs(measured_angle),
-      )
+      # faded out within TURN_IN_BLEND_DEG of center: a near-center dither must not pin the fraction
+      # at its endpoints and strip the rate damping (or arm the guard) frame to frame (R7)
+      direction_fraction = min(max(
+        1.0 - max(planned_hold_angle, turn_in_angle) / abs(measured_angle), -1.0), 1.0,
+      ) * min(abs(measured_angle) / TURN_IN_BLEND_DEG, 1.0)
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
@@ -872,8 +965,9 @@ class RackTrajectoryController:
     position_feedback = -float(torque_from_lateral_accel(
       gain * lateral_accel_per_degree * (plan.position_deg - CS.steeringAngleDeg), torque_params,
     ))
+    rate_gain_scale = _smoothstep(-direction_fraction, -1.0, 0.0)
     rate_feedback = -float(torque_from_lateral_accel(
-      gain * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate), torque_params,
+      gain * rate_gain_scale * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate), torque_params,
     )) if measured_rate_valid else 0.0
     raw_feedback = position_feedback + rate_feedback
     turn_in_cap = MAX_FEEDBACK_TORQUE + turn_in_fraction * (MAX_TURN_IN_FEEDBACK_TORQUE - MAX_FEEDBACK_TORQUE)
@@ -882,14 +976,19 @@ class RackTrajectoryController:
     feedback = min(max(raw_feedback, feedback_lower), feedback_upper)
     feedback_limited = feedback != raw_feedback
     raw_torque = feedforward_torque + feedback
-    if raw_torque * measured_angle > 0.0:
-      raw_torque *= unwind_scale
-    elif (measured_angle == 0.0 and planned_angle * intended_angle > 0.0
-          and raw_torque * planned_angle < 0.0):
+    if (measured_angle == 0.0 and planned_angle * intended_angle > 0.0
+        and raw_torque * planned_angle < 0.0):
       raw_torque = 0.0
+    raw_torque, early_release = self._early_release(
+      raw_torque, applied_torque, targets, params.angleOffsetDeg, torque_from_lateral_accel, torque_params,
+      target_angle - measured_angle,
+    )
     torque = min(max(raw_torque, -1.0), 1.0)
     platform_saturated = torque != raw_torque
-    if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
+    # torque with no defense ramps out: pushing opposite a plan and target on the other side, or pushing
+    # the wheel further out when neither the plan nor the commanded motion holds any of the current angle
+    if ((planned_angle * target_angle < 0.0 and torque * target_angle < 0.0)
+        or (direction_fraction >= 1.0 and torque * measured_angle > 0.0)):
       self.direction_guard_scale = max(0.0, self.direction_guard_scale - self.dt / DIRECTION_GUARD_RC_S)
     else:
       self.direction_guard_scale = min(1.0, self.direction_guard_scale + self.dt / DIRECTION_GUARD_RC_S)
@@ -943,6 +1042,8 @@ class RackTrajectoryController:
       saturated=platform_saturated,
       direction_guarded=direction_guarded,
       driver_assist_limited=driver_assist_limited,
+      early_release=early_release,
+      direction_fraction=direction_fraction,
       preview_time_s=preview_s,
       reference_limited=self.reference_filter.limited,
       near_target_angle_deg=target.angle_deg,
