@@ -241,7 +241,7 @@ class TestRedLightStop(OpenpilotTestCase):
     stopped = np.flatnonzero(v < 0.05)
     assert len(stopped) > 0, 'did not stop'
     i_stop = int(stopped[0])
-    assert maneuver.stop_line - 9.0 <= x[i_stop] <= maneuver.stop_line, x[i_stop]
+    assert maneuver.stop_line - 5.0 <= x[i_stop] <= maneuver.stop_line, x[i_stop]
     onset = int(np.flatnonzero(a < -0.3)[0])
     approach = a[onset:i_stop]
     peak = float(approach.min())

@@ -23,7 +23,8 @@ MPC_PROFILE_OFFSET = 6.0  # m, the profile reaches zero this far before its targ
 PRE_LATCH_GATE = 0.35     # filtered detector level that turns on shaping of the model's live endpoint
 DV_MAX = 2.0              # m/s, the cap may never sit further below current speed while shaping: v_cruise is a target
                           # the MPC erases in seconds, so a collapsing path must not command a slam
-LATCH_SETBACK = 5.0       # m, route-calibrated distance short of the model's endpoint
+LATCH_SETBACK = 2.0       # m, short of the model's endpoint. 5.0 was calibrated for the soft MPC column that overshot its point;
+                          # with the committed profile the car stops at the point, and the owner found 5 m early (field test 3)
 MIN_STOP_LENGTH = 3.0     # m, floor of the detector window, keeps it alive at crawl speeds
 DETECT_RC = 1.0           # s
 LATCH_THRESHOLD = 0.55
@@ -57,8 +58,9 @@ NO_CAP = math.inf
 # below is that shape as a plan candidate: the constant deceleration that lands short of the committed point,
 # jerk-limited, faded out at low speed so the column's own easing landing (and the hold) take the last metres.
 PROFILE_JERK = 2.0             # m/s^3, the candidate moves at most this fast (the owner builds braking at 1-2 m/s^3)
-PROFILE_LANDING = 4.5          # m, the constant-deceleration profile lands this far short of the committed point, so the
-                               # column's easing landing has room even with the car's actuation lag
+PROFILE_LANDING = 2.5          # m, the constant-deceleration profile lands this far short of the committed point, so the
+                               # column's easing landing has room with the car's actuation lag. The car stops about a metre
+                               # past the landing (closed-loop plant), so this margin sets the stop position almost 1:1
 PROFILE_MIN_DISTANCE = 0.5     # m, closer than this to the landing the column owns the rest
 PROFILE_MAX_DECEL = 3.0        # m/s^2, past this the approach is no longer a comfort matter; column and e2e remain
 PROFILE_HANDOVER_SPEED = 3.0   # m/s, the profile starts fading out here ...

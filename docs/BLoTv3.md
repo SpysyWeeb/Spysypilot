@@ -223,3 +223,10 @@ to 4 m/s, tapering to 1.2 by 12 m/s. The car's SCC saturates at ≈ 1.6–1.9 m/
   within a second and eased off at the end.
 - Launch: with the SCC's ~1.9 m/s² ceiling the remaining lever is starting early (field test 1); the green-light
   cap `LAUNCH_MAX_ACCEL` on combo (1.5) is worth raising toward the ceiling.
+
+**2026-08-29, field test 3 (live report).** Stops follow the flat, eased profile but land earlier than the owner wants.
+`LATCH_SETBACK` 5 → 2 m: the committed point sits that far short of the model's endpoint; 5 m compensated for the soft
+column's overshoot, which the profile no longer has (route 24 red light 1: the endpoint sat ~1.5 m beyond the owner's own
+stop). `PROFILE_LANDING` 4.5 → 2.5 m: the closed-loop plant stops about a metre past the landing, so the margin sets the
+stop position almost 1:1 — the driven build landed ≈ 8.5 m short of the endpoint, this one ≈ 3.5 m with the same
+−0.45 m/s² last second. Both to be calibrated against the rlogs of this drive.
