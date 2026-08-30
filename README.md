@@ -66,12 +66,13 @@ response time are relaxed (0.1 → 0.3 s, 0.4 → 0.5 s) — the first cut inste
 on route 00000028, 52 cycles in 46 min; the small-reversal governor is retired. Replay on routes 20–24 and 28: no fallbacks,
 the twelve largest low-speed turn-ins/unwinds within 3°, the island event with no preview, the served target within 0.3°
 (p90) of the near target whether the preview is open or not; route 00000029 drove clean. Phase 3 step 1 (torque-tail continuity:
-no cap jump, guard ramps out, standstill authority, honest flags) merged and field-validated 2026-08-30. Step 2 merged
-2026-08-30 and awaiting a drive: the controller reads the torque the EPS actually applies and releases early ahead of a
-horizon reversal — but only once the served target has come back to the wheel — and the unwind magnitude clamp is retired
-for a direction fraction that relaxes only the rate feedback (the field logs showed the clamp holding exactly zero torque
-for up to 1.8 s near center while micro-corrections were wanted); watch for steadier near-center, slightly firmer
-curve exits, unwinds not fought.** `controlsd`
+no cap jump, guard ramps out, standstill authority, honest flags) merged and field-validated 2026-08-30. Step 2 merged 2026-08-30; its first
+drive (route 2d) caught the slew-aware early release shedding holding torque midway through ordinary curves (the rate-flip
+test read visible curve exits as coming reversals; the car ran wide, six owner bookmarks) — the release is retired
+outright as of the same day, and the rest of step 2 stands: the unwind magnitude clamp is replaced by a direction fraction
+that relaxes only the rate feedback (the field logs showed the clamp holding exactly zero torque for up to 1.8 s near
+center while micro-corrections were wanted), with the carOutput plumbing kept for a future redesign. Awaiting a clean
+drive; watch for steadier near-center, slightly firmer curve exits, unwinds not fought.** `controlsd`
 selects `LatControlRack` when opendbc sets `lateralTuning.torque.useRackTrajectory`,
 which it does only for the Palisade when the queried platform code is `LX`; Telluride
 `ON`, mixed and unknown firmware fail closed to stock `LatControlTorque` *and* the stock
