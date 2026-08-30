@@ -1504,6 +1504,7 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
     lead2 @3;
     e2e @4;
     stop @5;
+    curve @6;
   }
 
 

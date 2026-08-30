@@ -11,7 +11,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
-from openpilot.selfdrive.controls.lib.model_curve_speed import ModelCurveSpeedLimiter
+from openpilot.selfdrive.controls.lib.model_curve_speed import LateralState, ModelCurveSpeedLimiter
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
 from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop
@@ -64,10 +64,6 @@ def get_cruise_comfort_accel(v_cruise, v_ego, accel_coast):
     target_accel = min(target_accel, accel_coast * coast_weight)
   return float(target_accel)
 
-def limit_accel_for_torque(a_target, torque_veto):
-  return min(a_target, 0.0) if torque_veto else a_target
-
-
 def get_live_torque_params(sm):
   service = 'lateralTorqueParameters'
   try:
@@ -78,9 +74,9 @@ def get_live_torque_params(sm):
   return params if healthy and params.useParams else None
 
 
-def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, speed_limiter_active=False):
-  # comfort shaping only for ordinary cruise with a healthy radar; lead following, e2e and a curve limiter keep their own targets
-  return not (experimental_mode or force_decel or not radar_valid or speed_limiter_active)
+def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid):
+  # comfort shaping only for ordinary cruise with a healthy radar; lead following and e2e keep their own targets
+  return not (experimental_mode or force_decel or not radar_valid)
 
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow_throttle, comfort=False):
   # the envelope alone bounds cruise acceleration; stock's shared lateral budget held the car back out of curves (owner ruling)
@@ -156,10 +152,6 @@ class LongitudinalPlanner:
     force_decel = sm['controlsState'].forceDecel
     if force_decel:
       v_cruise = 0.0
-    else:
-      torque_params = get_live_torque_params(sm)
-      v_cruise = self.curve_speed_limiter.update(sm['modelV2'], v_cruise, v_ego=v_ego, lateral_active=sm['carControl'].latActive,
-                                                 roll=sm['vehicleParameters'].roll, torque_params=torque_params)
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
 
@@ -261,11 +253,17 @@ class LongitudinalPlanner:
       a_launch_max = np.interp(v_ego, [LAUNCH_MOVING_SPEED, LAUNCH_DISARM_SPEED], [LAUNCH_MAX_ACCEL, 0.])
       output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
 
-    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, speed_limiter_active=self.curve_speed_limiter.active)
+    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
-    if not should_stop(v_ego, 0.0):
-      self.a_cruise = limit_accel_for_torque(self.a_cruise, self.curve_speed_limiter.torque_veto)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
+
+    # the curve policy: anticipation from the model path, reaction to the measured steering state; one candidate
+    # that can only lower the chosen acceleration
+    curve = self.curve_speed_limiter.update(sm['modelV2'], v_ego=v_ego, a_ego=sm['carState'].aEgo,
+                                            lateral_active=sm['carControl'].latActive, steering_pressed=sm['carState'].steeringPressed,
+                                            roll=sm['vehicleParameters'].roll, accel_coast=accel_coast,
+                                            torque_params=get_live_torque_params(sm),
+                                            lateral_state=LateralState.from_controls_state(sm['controlsState']))
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
                   (self.a_cruise, LongitudinalPlanSource.cruise, cruise_should_stop)]
@@ -275,9 +273,13 @@ class LongitudinalPlanner:
       # a committed stop's own approach profile competes like any candidate; the column and the hold still own the landing
       candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False))
 
+    if curve.a_target is not None and not reset_state:
+      # a frame after engaging the arbitration would otherwise seed the MPC with a stale floored candidate
+      candidates.append((curve.a_target, LongitudinalPlanSource.curve, False))
+
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.output_should_stop = force_stop.holding or any(should_stop for _, _, should_stop in candidates)
-    self.output_a_target = limit_accel_for_torque(np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX), self.curve_speed_limiter.torque_veto)
+    self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
 

@@ -1,259 +1,214 @@
+from types import SimpleNamespace
 import math
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 
-from opendbc.car.hyundai.values import CAR
-from openpilot.cereal import log
-from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
 from openpilot.selfdrive.controls.lib.model_curve_speed import (
-  CURVATURE_BP,
-  CURVE_TARGET_RELEASE_RATE,
-  CURVE_SPEED_V,
-  MAX_CURVE_SPEED,
+  A_CURVE_MIN,
+  A_LAT_COMFORT,
+  AUTHORITY_BOUNDS,
+  BRAKE_ENTER_S,
+  COAST_ENTER_S,
+  COAST_EXIT_S,
+  J_DOWN,
+  J_UP,
+  REGIME_ANTICIPATE,
+  REGIME_BRAKE,
+  REGIME_COAST,
+  REGIME_FREE,
+  T_APPROACH,
+  T_COAST,
   TORQUE_BUDGET,
+  LateralState,
   ModelCurveSpeedLimiter,
-  curve_speed_for_curvature,
+  curve_speed_limits,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
-
-def make_model(curvature=None, position_x=None, position_y=None, speed=15.0):
-  sample_count = ModelConstants.IDX_N
-  curvature = np.zeros(sample_count) if curvature is None else np.asarray(curvature)
-  position_x = np.arange(sample_count, dtype=float) if position_x is None else np.asarray(position_x)
-  position_y = np.zeros(sample_count) if position_y is None else np.asarray(position_y)
-  velocity_x = np.full(sample_count, speed)
-  return SimpleNamespace(
-    position=SimpleNamespace(x=position_x, y=position_y),
-    velocity=SimpleNamespace(x=velocity_x),
-    orientation=SimpleNamespace(z=np.zeros(ModelConstants.IDX_N)),
-    orientationRate=SimpleNamespace(z=curvature * velocity_x),
-  )
+N = ModelConstants.IDX_N
+T = np.array(ModelConstants.T_IDXS)
+FACTOR, FRICTION = 2.7, 0.11
+TORQUE = (FACTOR, 0.0, FRICTION)
 
 
-def make_cp(factor=2.0, offset=0.0, friction=0.1, car=CAR.HYUNDAI_PALISADE):
-  torque = SimpleNamespace(latAccelFactor=factor, latAccelOffset=offset, friction=friction)
-  return SimpleNamespace(carFingerprint=car,
-                         lateralTuning=SimpleNamespace(which=lambda: "torque", torque=torque))
+def make_model(speed=15.0, curvature=None, position_y=None):
+  x = speed * T
+  curvature = np.zeros(N) if curvature is None else np.asarray(curvature, dtype=float)
+  # the fields the policy reads, plus what a planner parses from a model message in the integration test
+  return SimpleNamespace(position=SimpleNamespace(x=x, y=np.zeros(N) if position_y is None else np.asarray(position_y)),
+                         velocity=SimpleNamespace(x=np.full(N, speed)), acceleration=SimpleNamespace(x=np.zeros(N)),
+                         orientation=SimpleNamespace(z=np.zeros(N)), orientationRate=SimpleNamespace(z=curvature * speed), leadsV3=[])
 
 
-class TestModelCurveSpeed(unittest.TestCase):
-  def test_field_calibration_points(self):
-    for curvature, speed in zip(CURVATURE_BP, CURVE_SPEED_V, strict=True):
-      with self.subTest(curvature=curvature):
-        self.assertAlmostEqual(curve_speed_for_curvature(curvature), speed)
+def curve_ahead(speed, start, length, curvature):
+  x = speed * T
+  return make_model(speed, np.where((x >= start) & (x <= start + length), curvature, 0.0))
 
-  def test_curvature_speed_envelope_is_monotonic_and_fail_open_for_straight_path(self):
-    curvature = np.array([0.0, CURVATURE_BP[0] / 2.0, *CURVATURE_BP, CURVATURE_BP[-1] * 2.0])
-    speed = curve_speed_for_curvature(curvature)
 
-    self.assertEqual(speed[0], MAX_CURVE_SPEED)
-    self.assertTrue(np.all(np.diff(speed) <= 0.0))
-    self.assertLess(speed[-1], CURVE_SPEED_V[-1])
+def make_cp(factor=FACTOR, friction=FRICTION, delay=0.5):
+  torque = SimpleNamespace(latAccelFactor=factor, latAccelOffset=0.0, friction=friction)
+  return SimpleNamespace(longitudinalActuatorDelay=delay, lateralTuning=SimpleNamespace(which=lambda: "torque", torque=torque))
 
-  def test_single_sample_prediction_spike_is_rejected(self):
-    for spike_index in (0, 12, ModelConstants.IDX_N - 1):
-      with self.subTest(spike_index=spike_index):
-        curvature = np.zeros(ModelConstants.IDX_N)
-        curvature[spike_index] = CURVATURE_BP[-1]
-        limiter = ModelCurveSpeedLimiter()
-        v_cruise = 30.0
 
-        self.assertEqual(limiter.update(make_model(curvature=curvature), v_cruise), v_cruise)
-        self.assertFalse(limiter.active)
+def tracking(torque=0.3, error=0.05, lat=1.0, pinned=False, desired=None):
+  return LateralState(True, torque, error, lat, lat + error if desired is None else desired, pinned)
 
-  def test_default_approach_deceleration_is_half_mps2(self):
-    self.assertAlmostEqual(ModelCurveSpeedLimiter().approach_decel, 0.5)
 
-  def test_approach_response_uses_actuator_delay_plus_planner_cadence(self):
-    cp = make_cp()
-    cp.longitudinalActuatorDelay = 0.2
-    self.assertAlmostEqual(ModelCurveSpeedLimiter(cp).approach_response_time, 0.2 + DT_MDL)
-    cp.longitudinalActuatorDelay = math.nan
-    self.assertEqual(ModelCurveSpeedLimiter(cp).approach_response_time, DT_MDL)
+def settle(limiter, model, frames, **kwargs):
+  result = None
+  for _ in range(frames):
+    result = limiter.update(model, **kwargs)
+  return result
 
-  def test_sustained_curve_caps_cruise_using_approach_distance(self):
-    curvature = np.zeros(ModelConstants.IDX_N)
-    curvature[12:17] = CURVATURE_BP[1]
-    limiter = ModelCurveSpeedLimiter()
 
-    model = make_model(curvature=curvature)
-    limiter.update(model, 30.0)
-    target = limiter.update(model, 30.0)
+class TestSpeedLimits(unittest.TestCase):
+  def test_authority_is_the_torque_budget_at_that_node_and_comfort_the_owner_number(self):
+    kappa = np.array([0.05])
+    authority = math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / 0.05)
+    self.assertAlmostEqual(float(curve_speed_limits(kappa, TORQUE, 0.0)[0]), authority)
+    self.assertAlmostEqual(float(curve_speed_limits(kappa, None, 0.0)[0]), math.sqrt(A_LAT_COMFORT / 0.05))
+    self.assertLess(authority, math.sqrt(A_LAT_COMFORT / 0.05))            # the Palisade's authority binds before comfort
 
-    expected = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
-    self.assertTrue(limiter.active)
-    self.assertAlmostEqual(limiter.curvature, CURVATURE_BP[1])
-    self.assertGreater(limiter.distance, 0.0)
-    self.assertAlmostEqual(target, expected)
+  def test_banking_helps_the_inside_and_a_straight_has_no_limit(self):
+    kappa = np.array([0.05, -0.05, 0.0])
+    limits = curve_speed_limits(kappa, TORQUE, roll=0.05)
+    self.assertGreater(limits[0], limits[1])                                 # roll bias adds authority in one direction
+    self.assertTrue(math.isinf(limits[2]))
 
-  def test_approach_distance_reserves_measured_longitudinal_response_time(self):
-    curvature = np.zeros(ModelConstants.IDX_N)
-    curvature[12:17] = CURVATURE_BP[1]
-    limiter = ModelCurveSpeedLimiter()
-    model = make_model(curvature=curvature)
-    v_ego = 15.0
 
-    limiter.update(model, 30.0, v_ego=v_ego)
-    target = limiter.update(model, 30.0, v_ego=v_ego)
-
-    effective_distance = max(limiter.distance - v_ego * limiter.approach_response_time, 0.0)
-    expected = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * effective_distance)
-    unbuffered = np.sqrt(CURVE_SPEED_V[1] ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
-    self.assertAlmostEqual(target, expected)
-    self.assertLess(target, unbuffered)
-
-  def test_curve_target_releases_slowly_until_curve_clears(self):
-    limiter = ModelCurveSpeedLimiter()
-    tight = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
-    opening = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[1]))
-    straight = make_model()
-    v_cruise = 30.0
-
-    limiter.update(tight, v_cruise)
-    tight_target = limiter.update(tight, v_cruise)
-    limiter.update(opening, v_cruise)
-    opening_target = limiter.update(opening, v_cruise)
-
-    self.assertAlmostEqual(opening_target - tight_target, CURVE_TARGET_RELEASE_RATE * DT_MDL)
-    limiter.update(straight, v_cruise)
-    self.assertEqual(limiter.update(straight, v_cruise), v_cruise)
-
-  def test_single_frame_prediction_spike_is_rejected(self):
-    limiter = ModelCurveSpeedLimiter()
-    straight_model = make_model()
-    spike_model = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
-
-    self.assertEqual(limiter.update(straight_model, 30.0), 30.0)
-    self.assertEqual(limiter.update(spike_model, 30.0), 30.0)
-    self.assertEqual(limiter.update(straight_model, 30.0), 30.0)
-    self.assertFalse(limiter.active)
-
-  def test_future_torque_budget_caps_before_field_curve_speed(self):
-    self.assertEqual(TORQUE_BUDGET, 0.90)
-    curve_curvature = 0.002
-    for direction in (-1.0, 1.0):
-      with self.subTest(direction=direction):
-        curvature = np.zeros(ModelConstants.IDX_N)
-        curvature[12:17] = direction * curve_curvature
-        limiter = ModelCurveSpeedLimiter(make_cp())
-        model = make_model(curvature=curvature)
-        v_cruise = 30.0
-
-        limiter.update(model, v_cruise, v_ego=v_cruise, lateral_active=True)
-        target = limiter.update(model, v_cruise, v_ego=v_cruise, lateral_active=True)
-
-        field_target = np.sqrt(curve_speed_for_curvature(limiter.curvature) ** 2 + 2.0 * limiter.approach_decel * limiter.distance)
-        torque_speed = np.sqrt((TORQUE_BUDGET - 0.1) * 2.0 / curve_curvature)
-        effective_distance = max(limiter.distance - v_cruise * limiter.approach_response_time, 0.0)
-        expected = np.sqrt(torque_speed ** 2 + 2.0 * limiter.approach_decel * effective_distance)
-        self.assertGreater(field_target, v_cruise)
-        self.assertTrue(limiter.active)
-        self.assertAlmostEqual(target, expected)
-
-  def test_future_torque_veto_is_debounced_and_fails_safe(self):
+class TestAnticipation(unittest.TestCase):
+  def test_a_curve_ahead_asks_the_kinematic_deceleration_to_its_limit(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
-    curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
+    model = curve_ahead(15.0, 60.0, 60.0, 0.05)
+    result = settle(limiter, model, 60, v_ego=15.0, a_ego=-1.5, lateral_active=True, lateral_state=tracking())
+    limit = math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / 0.05)
+    need = (limit ** 2 - 15.0 ** 2) / (2.0 * (result.distance - 15.0 * limiter.response_time))
+    self.assertEqual(result.regime, REGIME_ANTICIPATE)
+    self.assertAlmostEqual(result.v_limit, limit)
+    self.assertAlmostEqual(result.a_target, need, places=5)
 
-    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
-    self.assertFalse(limiter.torque_veto)
-    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
-    self.assertTrue(limiter.torque_veto)
-
-    curve.orientationRate.z = curve.orientationRate.z[:-1]
-    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
-    self.assertTrue(limiter.torque_veto)
-    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
-    self.assertFalse(limiter.torque_veto)
-
-  def test_partial_car_params_keeps_predictor_inactive(self):
-    limiter = ModelCurveSpeedLimiter(SimpleNamespace())
-    curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
-    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True)
-
-    self.assertFalse(limiter.torque_veto)
-
-  def test_live_torque_params_do_not_enable_unsupported_car(self):
-    live = SimpleNamespace(latAccelFactorFiltered=2.0, latAccelOffsetFiltered=0.0,
-                           frictionCoefficientFiltered=0.1)
-    limiter = ModelCurveSpeedLimiter(make_cp(car=CAR.HYUNDAI_SONATA))
-    curve = make_model(curvature=np.full(ModelConstants.IDX_N, 0.002))
-
-    limiter.update(curve, 30.0, v_ego=30.0, lateral_active=True, torque_params=live)
-    target = limiter.update(curve, 30.0, v_ego=30.0, lateral_active=True, torque_params=live)
-
-    self.assertEqual(target, 30.0)
-    self.assertFalse(limiter.torque_veto)
-
-  def test_optional_torque_service_does_not_invalidate_planner_outputs(self):
-    from openpilot.selfdrive.controls import plannerd
-
-    sm = plannerd.get_submaster()
-    for service in sm.services:
-      sm.alive[service] = sm.freq_ok[service] = sm.valid[service] = True
-    sm.alive['lateralTorqueParameters'] = False
-    sm.freq_ok['lateralTorqueParameters'] = False
-    sm.valid['lateralTorqueParameters'] = False
-
-    self.assertTrue(sm.all_checks())
-
-  def test_unhealthy_live_torque_params_fall_back_to_static(self):
-    from openpilot.selfdrive.controls.lib import longitudinal_planner
-
-    class FakeSubMaster(dict):
-      pass
-
-    live = SimpleNamespace(useParams=True)
-    sm = FakeSubMaster(lateralTorqueParameters=live)
-    sm.alive = {'lateralTorqueParameters': False}
-    sm.freq_ok = {'lateralTorqueParameters': True}
-    sm.valid = {'lateralTorqueParameters': True}
-
-    self.assertIsNone(longitudinal_planner.get_live_torque_params(sm))
-    sm.alive['lateralTorqueParameters'] = True
-    self.assertIs(longitudinal_planner.get_live_torque_params(sm), live)
-
-  def test_live_torque_params_and_positive_accel_clamp(self):
-    from openpilot.selfdrive.controls.lib import longitudinal_planner
-
-    live = SimpleNamespace(latAccelFactorFiltered=20.0, latAccelOffsetFiltered=0.0,
-                           frictionCoefficientFiltered=0.1)
+  def test_near_a_limit_the_candidate_is_a_small_proportional_approach_not_a_burst(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
-    curve = make_model(curvature=np.full(ModelConstants.IDX_N, CURVATURE_BP[-1]))
-    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True, torque_params=live)
-    limiter.update(curve, 30.0, v_ego=10.0, lateral_active=True, torque_params=live)
+    model = make_model(6.0, np.full(N, 0.05))                                # already in the curve, 0.5 m/s under its limit
+    result = settle(limiter, model, 20, v_ego=6.0, a_ego=0.0, lateral_active=True, lateral_state=tracking())
+    limit = math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / 0.05)
+    self.assertAlmostEqual(result.a_target, (limit - 6.0) / T_APPROACH, places=5)
+    self.assertLess(result.a_target, 0.5)
 
-    self.assertFalse(limiter.torque_veto)
-    self.assertEqual(longitudinal_planner.limit_accel_for_torque(0.4, True), 0.0)
-    self.assertEqual(longitudinal_planner.limit_accel_for_torque(-0.4, True), -0.4)
+  def test_a_straight_path_has_nothing_to_say(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    result = settle(limiter, make_model(20.0), 5, v_ego=20.0, lateral_active=True, lateral_state=tracking())
+    self.assertIsNone(result.a_target)
+    self.assertEqual(result.regime, REGIME_FREE)
 
-  def test_torque_veto_clamps_persistent_cruise_state_before_release(self):
+  def test_one_frame_spikes_are_rejected_and_invalid_models_ignored(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight, spike = make_model(20.0), make_model(20.0, np.full(N, 0.1))
+    limiter.update(straight, v_ego=20.0)
+    self.assertIsNone(limiter.update(spike, v_ego=20.0).a_target)
+    self.assertIsNone(limiter.update(straight, v_ego=20.0).a_target)
+    self.assertIsNone(limiter.update(SimpleNamespace(), v_ego=20.0).a_target)
+
+  def test_the_candidate_is_jerk_limited_from_the_car_and_floored(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    model = make_model(20.0, np.full(N, 0.1))                                 # deep inside a tight curve at speed
+    first = settle(limiter, model, 3, v_ego=20.0, a_ego=0.5, lateral_active=True, lateral_state=tracking())
+    self.assertGreaterEqual(first.a_target, 0.5 - 2 * J_DOWN * DT_MDL - 1e-9)   # pulls down from the car's acceleration
+    last = settle(limiter, model, 60, v_ego=20.0, a_ego=-2.0, lateral_active=True, lateral_state=tracking())
+    self.assertAlmostEqual(last.a_target, A_CURVE_MIN)
+    released = limiter.update(make_model(20.0), v_ego=20.0, a_ego=-2.0, lateral_active=True, lateral_state=tracking())
+    self.assertLessEqual(released.a_target - last.a_target, J_UP * DT_MDL + 1e-9)
+
+
+class TestReaction(unittest.TestCase):
+  def test_heavy_but_tracking_coasts_and_releases_with_hysteresis(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(15.0)
+    result = settle(limiter, straight, round(COAST_ENTER_S / DT_MDL) - 1, v_ego=15.0, lateral_active=True, accel_coast=-0.3,
+                    lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0))
+    self.assertNotEqual(result.regime, REGIME_COAST)                        # heavy torque must dwell before the foot comes off
+    result = settle(limiter, straight, 12, v_ego=15.0, lateral_active=True, accel_coast=-0.3, lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0))
+    self.assertEqual(result.regime, REGIME_COAST)
+    self.assertLessEqual(result.a_target, -0.3 + 1e-9)
+    downhill = settle(limiter, straight, 3, v_ego=15.0, lateral_active=True, accel_coast=0.4, lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0))
+    self.assertLessEqual(downhill.a_target, 0.0)                            # never a net acceleration while heavy, downhill included
+    heavy_wide = settle(ModelCurveSpeedLimiter(make_cp()), straight, 12, v_ego=15.0, lateral_active=True, accel_coast=-0.3,
+                        lateral_state=tracking(torque=0.94, error=0.33, lat=2.0))
+    self.assertEqual(heavy_wide.regime, REGIME_COAST)                       # heavy and wide but not pinned: foot off, no brake
+    result = settle(limiter, straight, 3, v_ego=15.0, lateral_active=True, accel_coast=-0.3, lateral_state=tracking(torque=0.8, error=0.1, lat=2.0))
+    self.assertEqual(result.regime, REGIME_COAST)                            # still heavy: no release above T_COAST_EXIT
+    self.assertAlmostEqual(result.a_target, -0.15)                           # and the lift is proportional to how heavy
+    result = settle(limiter, straight, round(COAST_EXIT_S / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5))
+    self.assertEqual(result.regime, REGIME_FREE)
+    self.assertIsNone(result.a_target)
+
+  def test_pinned_and_losing_brakes_toward_the_speed_that_restores_margin_after_a_debounce(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(15.0)
+    losing = tracking(torque=1.0, error=0.6, lat=2.3, pinned=True)
+    result = settle(limiter, straight, round(BRAKE_ENTER_S / DT_MDL) - 1, v_ego=15.0, lateral_active=True, lateral_state=losing)
+    self.assertNotEqual(result.regime, REGIME_BRAKE)                        # not on a single sample
+    result = settle(limiter, straight, 40, v_ego=15.0, a_ego=-1.0, lateral_active=True, accel_coast=-0.3, lateral_state=losing)
+    self.assertEqual(result.regime, REGIME_BRAKE)
+    a_lat_ok = (TORQUE_BUDGET - FRICTION) * result.authority_factor
+    v_ok = math.sqrt(a_lat_ok / (2.9 / 15.0 ** 2))                           # the demanded 2.9, not the achieved 2.3
+    self.assertAlmostEqual(result.a_target, max((v_ok - 15.0) / 1.0, A_CURVE_MIN), places=5)
+    overshoot = tracking(torque=1.0, error=-0.6, lat=2.3, pinned=True)     # actual above desired: an exit, not understeer
+    fresh = ModelCurveSpeedLimiter(make_cp())
+    self.assertNotEqual(settle(fresh, straight, 40, v_ego=15.0, lateral_active=True, lateral_state=overshoot).regime, REGIME_BRAKE)
+    right = LateralState(True, 1.0, -0.6, -2.3, -2.9, True)                # a right-hand curve: understeer reads negative
+    right_hand = settle(ModelCurveSpeedLimiter(make_cp()), straight, 40, v_ego=15.0, lateral_active=True, lateral_state=right)
+    self.assertEqual(right_hand.regime, REGIME_BRAKE)
+    back = settle(limiter, straight, 3, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=1.0, error=0.1, lat=2.3, pinned=True))
+    self.assertEqual(back.regime, REGIME_COAST)                              # tracking again: hand back to coasting
+
+  def test_no_reaction_without_active_lateral_or_with_the_driver_steering_or_at_crawl_speed(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(15.0)
+    losing = tracking(torque=1.0, error=0.6, lat=2.3, pinned=True)
+    self.assertIsNone(settle(limiter, straight, 20, v_ego=15.0, lateral_active=False, lateral_state=losing).a_target)
+    self.assertIsNone(settle(limiter, straight, 20, v_ego=15.0, lateral_active=True, steering_pressed=True, lateral_state=losing).a_target)
+    slow = settle(limiter, make_model(2.0), 20, v_ego=2.0, lateral_active=True, lateral_state=losing)
+    self.assertNotEqual(slow.regime, REGIME_BRAKE)
+
+  def test_lateral_state_reads_both_controllers_and_fails_closed(self):
+    torque = SimpleNamespace(active=True, output=-0.9, error=0.2, actualLateralAccel=-2.0, desiredLateralAccel=-2.2, saturated=False)
+    cs = SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'torqueState', torqueState=torque))
+    state = LateralState.from_controls_state(cs)
+    self.assertTrue(state.active and math.isclose(state.torque, 0.9) and not state.pinned)
+    self.assertAlmostEqual(state.understeer, -0.2)                            # desired -2.2, actual -2.0: exit overshoot, not understeer
+    rack = SimpleNamespace(active=True, output=0.99, error=0.5, actualLateralAccel=2.3, desiredLateralAccel=2.8, saturated=False,
+                           torqueLimited=True)
+    cs = SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'rackState', rackState=rack))
+    self.assertTrue(LateralState.from_controls_state(cs).pinned)
+    self.assertFalse(LateralState.from_controls_state(SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'pidState'))).active)
+    bad = SimpleNamespace(active=True, output=math.nan, error=0.0, actualLateralAccel=0.0, desiredLateralAccel=0.0, saturated=False)
+    cs = SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'torqueState', torqueState=bad))
+    self.assertFalse(LateralState.from_controls_state(cs).active)
+
+
+class TestPlannerIntegration(unittest.TestCase):
+  def test_the_candidate_only_ever_lowers_the_plan(self):
     from openpilot.selfdrive.controls.lib import longitudinal_planner
-
-    model = make_model()
+    from unittest.mock import patch
+    model = make_model(15.0)
+    model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]))
+    model.action = SimpleNamespace(desiredAcceleration=1.0, shouldStop=False, desiredCurvature=0.0)
     absent = SimpleNamespace(present=False)
     messages = {
-      'carState': SimpleNamespace(vEgo=15.0, vCruise=17.0 * CV.MS_TO_KPH, aEgo=0.0, standstill=False,
-                                  gasPressed=False, brakePressed=False, leftBlinker=False, rightBlinker=False,
-                                  steeringAngleDeg=0.0),
+      'carState': SimpleNamespace(vEgo=15.0, vCruise=25.0 * 3.6, aEgo=0.0, standstill=False, steeringPressed=False, leftBlinker=False,
+                                  rightBlinker=False, steeringAngleDeg=0.0, gasPressed=False, brakePressed=False),
       'carControl': SimpleNamespace(orientationNED=[], latActive=True),
-      'controlsState': SimpleNamespace(forceDecel=False, longControlState=longitudinal_planner.LongCtrlState.pid),
+      'controlsState': SimpleNamespace(forceDecel=False, longControlState=longitudinal_planner.LongCtrlState.pid,
+                                       lateralControlState=SimpleNamespace(which=lambda: 'pidState')),
       'selfdriveState': SimpleNamespace(enabled=True, experimentalMode=False, personality=1),
-      'vehicleParameters': SimpleNamespace(roll=0.0, angleOffsetDeg=0.0),
+      'vehicleParameters': SimpleNamespace(roll=0.0),
       'modelV2': model,
       'radarState': SimpleNamespace(leadOne=absent, leadTwo=absent),
       'lateralTorqueParameters': SimpleNamespace(useParams=False),
     }
-    model.acceleration = SimpleNamespace(x=np.zeros(ModelConstants.IDX_N))
-    model.leadsV3 = []
-    model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]),
-                                 laneChangeState=log.LaneChangeState.off)
-    model.action = SimpleNamespace(desiredCurvature=0.0, desiredAcceleration=1.0, shouldStop=False)
 
     class FakeSubMaster(dict):
       def __init__(self, values):
@@ -261,97 +216,54 @@ class TestModelCurveSpeed(unittest.TestCase):
         self.alive = self.freq_ok = self.valid = dict.fromkeys(values, True)
 
       def all_checks(self, services=None):
-        return True
+        # the model message here is a stub: planners that classify stops or anchor leads from it must see it invalid
+        return services is not None and 'modelV2' not in services
 
+    planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2))
     sm = FakeSubMaster(messages)
-    planner = longitudinal_planner.LongitudinalPlanner(
-      SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
-                      steerRatio=15.0, wheelbase=2.9),
-    )
-    planner.curve_speed_limiter.torque_veto = True
-    with (
-      patch.object(planner.curve_speed_limiter, 'update', return_value=17.0),
-      patch.object(planner.mpc, 'set_weights'),
-      patch.object(planner.mpc, 'set_cur_state'),
-      patch.object(planner.mpc, 'update'),
-      patch.object(longitudinal_planner, 'get_accel_from_plan', return_value=0.5),
-    ):
-      for _ in range(10):
+    with (patch.object(planner.mpc, 'set_weights'), patch.object(planner.mpc, 'set_cur_state'), patch.object(planner.mpc, 'update'),
+          patch.object(longitudinal_planner, 'get_accel_from_plan', return_value=0.5)):
+      with patch.object(planner.curve_speed_limiter, 'update', return_value=longitudinal_planner.LateralState.__class__ and
+                        __import__('openpilot.selfdrive.controls.lib.model_curve_speed', fromlist=['CurveResult']).CurveResult(2.5, 'anticipate')):
         planner.update(sm)
-      self.assertEqual(planner.a_cruise, 0.0)
+        self.assertLessEqual(planner.output_a_target, 0.5)                     # a higher candidate never raises the plan
+      with patch.object(planner.curve_speed_limiter, 'update', return_value=
+                        __import__('openpilot.selfdrive.controls.lib.model_curve_speed', fromlist=['CurveResult']).CurveResult(-1.2, 'coast')):
+        planner.update(sm)
+        self.assertAlmostEqual(planner.output_a_target, -1.2)                  # a lower one binds
 
-      planner.curve_speed_limiter.torque_veto = False
-      planner.update(sm)
-      released_accel = planner.a_cruise
 
-      sm['carState'].vEgo = 0.2
-      planner.a_cruise = 0.2
-      planner.curve_speed_limiter.torque_veto = True
-      planner.update(sm)
-      self.assertGreater(planner.a_cruise, 0.1)
-      self.assertFalse(planner.output_should_stop)
+if __name__ == "__main__":
+  unittest.main()
 
-    self.assertLessEqual(released_accel, max(longitudinal_planner.J_CRUISE_VALS) * DT_MDL)
 
-  def test_approach_distance_follows_path_arc_not_only_forward_position(self):
-    curvature = np.zeros(ModelConstants.IDX_N)
-    curvature[20:25] = CURVATURE_BP[-1]
-    x = np.minimum(np.arange(ModelConstants.IDX_N, dtype=float), 10.0)
-    y = np.maximum(np.arange(ModelConstants.IDX_N, dtype=float) - 10.0, 0.0)
-    limiter = ModelCurveSpeedLimiter()
+class TestAuthorityCalibration(unittest.TestCase):
+  def test_the_measured_ratio_moves_the_authority_inside_its_bounds(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(20.0)
+    self.assertAlmostEqual(limiter.update(straight, v_ego=20.0, lateral_active=True, lateral_state=tracking()).authority_factor, FACTOR)
+    strong = tracking(torque=0.9, error=0.1, lat=3.1)                       # route 22: 3.1 m/s^2 at 0.9 torque
+    result = settle(limiter, straight, 400, v_ego=20.0, lateral_active=True, lateral_state=strong)
+    self.assertAlmostEqual(result.authority_factor, min(3.1 / (0.9 - FRICTION), AUTHORITY_BOUNDS[1] * FACTOR), places=1)
+    weak = tracking(torque=0.9, error=0.1, lat=1.0)
+    result = settle(limiter, straight, 1200, v_ego=20.0, lateral_active=True, lateral_state=weak)
+    self.assertAlmostEqual(result.authority_factor, AUTHORITY_BOUNDS[0] * FACTOR, places=2)
+    idle = settle(limiter, straight, 100, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.2, lat=0.1))
+    self.assertAlmostEqual(idle.authority_factor, result.authority_factor)    # light steering teaches nothing
 
-    model = make_model(curvature=curvature, position_x=x, position_y=y)
-    limiter.update(model, 30.0)
-    limiter.update(model, 30.0)
+  def test_calibrated_authority_raises_the_speed_limit(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    model = curve_ahead(15.0, 60.0, 60.0, 0.05)
+    before = settle(limiter, model, 60, v_ego=15.0, a_ego=-1.5, lateral_active=True, lateral_state=tracking()).v_limit
+    settle(limiter, make_model(15.0), 400, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.9, error=0.1, lat=3.1))
+    after = settle(limiter, model, 60, v_ego=15.0, a_ego=-1.5, lateral_active=True, lateral_state=tracking()).v_limit
+    self.assertGreater(after, before)
 
-    self.assertTrue(limiter.active)
-    self.assertGreater(limiter.distance, np.ptp(x))
 
-  def test_invalid_model_data_does_not_change_cruise(self):
-    for invalid_value in ("short", "nan"):
-      with self.subTest(invalid_value=invalid_value):
-        model = make_model()
-        if invalid_value == "short":
-          model.orientationRate.z = model.orientationRate.z[:-1]
-        else:
-          model.position.x[5] = np.nan
-        limiter = ModelCurveSpeedLimiter()
-
-        self.assertEqual(limiter.update(model, 20.0), 20.0)
-        self.assertFalse(limiter.active)
-
-  def test_invalid_ego_preserves_the_last_conservative_curve_target(self):
-    curvature = np.zeros(ModelConstants.IDX_N)
-    curvature[12:17] = CURVATURE_BP[1]
-    model = make_model(curvature=curvature)
-    limiter = ModelCurveSpeedLimiter()
-    limiter.update(model, 30.0, v_ego=15.0)
-    target = limiter.update(model, 30.0, v_ego=15.0)
-    self.assertLess(target, 30.0)
-
-    for invalid_ego in (math.nan, math.inf, -math.inf, None, "invalid"):
-      with self.subTest(invalid_ego=invalid_ego):
-        self.assertEqual(limiter.update(model, 30.0, v_ego=invalid_ego), target)  # type: ignore[arg-type]
-        self.assertTrue(limiter.active)
-    self.assertEqual(limiter.update(model, target - 1.0, v_ego=None), target - 1.0)  # type: ignore[arg-type]
-
-    for invalid_cruise in (math.nan, math.inf, None, "invalid"):
-      with self.subTest(invalid_cruise=invalid_cruise):
-        self.assertEqual(limiter.update(model, invalid_cruise, v_ego=15.0), target)  # type: ignore[arg-type]
-        self.assertTrue(limiter.active)
-
-    torque_limiter = ModelCurveSpeedLimiter(make_cp())
-    torque_limiter.update(model, 30.0, v_ego=15.0, lateral_active=True)
-    torque_target = torque_limiter.update(model, 30.0, v_ego=15.0, lateral_active=True)
-    torque_veto = torque_limiter.torque_veto
-    for invalid_roll in (math.nan, math.inf, None, "invalid"):
-      with self.subTest(invalid_roll=invalid_roll):
-        self.assertEqual(torque_limiter.update(model, 30.0, v_ego=15.0, lateral_active=True,
-                                               roll=invalid_roll), torque_target)  # type: ignore[arg-type]
-        self.assertEqual(torque_limiter.torque_veto, torque_veto)
-    self.assertEqual(torque_limiter.update(model, torque_target - 1.0, v_ego=15.0, lateral_active=True,
-                                           roll=None), torque_target - 1.0)  # type: ignore[arg-type]
-
-  def test_curve_speed_units_match_field_mph_values(self):
-    np.testing.assert_allclose(CURVE_SPEED_V / CV.MPH_TO_MS, [50.0, 22.0, 13.0])
-    self.assertEqual(MAX_CURVE_SPEED, V_CRUISE_MAX * CV.KPH_TO_MS)
+class TestLegacySurface(unittest.TestCase):
+  def test_the_planner_no_longer_carries_the_veto_or_the_cap(self):
+    import inspect
+    from openpilot.selfdrive.controls.lib import longitudinal_planner
+    source = inspect.getsource(longitudinal_planner)
+    for legacy in ('torque_veto', 'limit_accel_for_torque', 'speed_limiter_active', 'predicted_torque'):
+      self.assertNotIn(legacy, source)

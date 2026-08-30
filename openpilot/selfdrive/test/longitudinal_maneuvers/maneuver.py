@@ -31,6 +31,10 @@ class Maneuver:
     self.force_decel = kwargs.get("force_decel", False)
     self.stop_line = kwargs.get("stop_line", None)
     self.stop_line_horizon_s = kwargs.get("stop_line_horizon_s", 5.0)
+    self.curve = kwargs.get("curve", None)
+    self.torque_factor = kwargs.get("torque_factor", 2.7)
+    self.torque_friction = kwargs.get("torque_friction", 0.11)
+    self.curve_model_scale = kwargs.get("curve_model_scale", 1.0)
 
     self.duration = duration
     self.title = title
@@ -48,6 +52,10 @@ class Maneuver:
       force_decel=self.force_decel,
       stop_line=self.stop_line,
       stop_line_horizon_s=self.stop_line_horizon_s,
+      curve=self.curve,
+      torque_factor=self.torque_factor,
+      torque_friction=self.torque_friction,
+      curve_model_scale=self.curve_model_scale,
     )
 
     valid = True

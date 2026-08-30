@@ -96,7 +96,6 @@ class TestCruiseComfort:
     assert not ordinary_cruise_comfort_enabled(True, False, True)
     assert not ordinary_cruise_comfort_enabled(False, True, True)
     assert not ordinary_cruise_comfort_enabled(False, False, False)
-    assert not ordinary_cruise_comfort_enabled(False, False, True, speed_limiter_active=True)
 
   def test_coast_limit_still_applies_with_comfort(self):
     v_ego = 4.0
