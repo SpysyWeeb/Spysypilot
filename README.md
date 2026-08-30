@@ -1,3 +1,8 @@
+> **Experiment branch (2026-08-29): `combo-stopreq-experiment` = combo with the opendbc fork branch
+> `experiment-hold-without-stopreq` — the car holds at standstill on the brake request alone, never `StopReq`, to
+> measure whether the Palisade ESP's ~1.4 s standstill-exit sequence is tied to `StopReq`. One drive, flat roads until the
+> hold is proven; switch back to `combo` afterwards.**
+
 # Spysypilot
 
 This fork is **entirely vibe-coded** — including this README.
