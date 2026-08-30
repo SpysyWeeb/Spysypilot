@@ -271,4 +271,10 @@ against the MPC's hover made the target alternate −0.40 / +0.1 per frame, the 
 fourth stop (t≈1890) was a stop-and-go the MPC read right from the lead's creep. Fix: the corridor form of D22. The green: our hold released
 0.4 s after the model's path opened (D21 working), then the plan asked +0.05 m/s² for 0.9 s — the e2e candidate's own request, with the model's
 `shouldStop` still set while its path opened, wins the `min()` against the cruise ramp; combo's launch assist needs the model's own plan above
-2 m/s at 3.5 s and did not fire. Not changed here (collaborator code on combo; decision pending).
+2 m/s at 3.5 s and did not fire. Built on `combo` the same day at the owner's direction (the launch code lives there): when the path is
+confirmed open, the model's own request is not negative and its plan has not committed, the e2e candidate launches on the cruise ramp under the
+assist's cap (`LAUNCH_MAX_ACCEL` 1.5, tapering out by 2 m/s); the lead candidate still guards a car ahead through the `min()`. Standalone BLoTv3
+has no launch assist: after a hold release the e2e candidate's stuck stop bit keeps the plan's stop bit set until the model clears it (known
+gap, combo-only behavior). Also at the owner's direction the Hyundai standstill hold moved to the brake request alone, no StopReq (opendbc
+`combo-blatv2-409-horizon` befe6683, promoted from the field-experiment branch): the ESP's ~1.4 s exit sequence should disappear with it;
+the hold on grades and over long waits is unverified until the owner drives it.
