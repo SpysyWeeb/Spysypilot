@@ -61,6 +61,9 @@ E_TRACK_EXIT = 0.20           # m/s^2, understeer below which the brake regime h
 BRAKE_ENTER_S = 0.3           # s, the loss must persist this long before the brake regime enters
 T_RESTORE = 1.0               # s, time in which the brake regime aims to restore the torque margin
 V_REACT_MIN = 3.0             # m/s, below this the reaction layer never brakes: measured curvature is noise there
+CURVE_GAS_GRACE_S = 5.0       # s after a driver gas override in which the anticipation may hold but never brake: the owner
+                              # pushed past the curve's limit on purpose (route 0x2c t=885: the still-active episode pulled the
+                              # exit back to -1.0 mid-corner after the pedal was released); the reaction brake regime still runs
 
 REGIME_FREE, REGIME_ANTICIPATE, REGIME_COAST, REGIME_BRAKE = 'free', 'anticipate', 'coast', 'brake'
 
@@ -172,6 +175,7 @@ class ModelCurveSpeedLimiter:
     self.active = False
     self.v_limit = math.inf
     self.distance = 0.0
+    self._gas_grace_s = 0.0
 
   def _calibrated(self, params, state, v_ego, lateral_active):
     # the torque tuning's factor is the prior; the measured ratio moves it inside AUTHORITY_BOUNDS while the steering
@@ -269,7 +273,7 @@ class ModelCurveSpeedLimiter:
     return A_CURVE_FREE
 
   def update(self, model, v_ego=0.0, a_ego=0.0, lateral_active=False, steering_pressed=False, roll=0.0, accel_coast=-0.3,
-             torque_params=None, lateral_state=None):
+             torque_params=None, lateral_state=None, gas_pressed=False):
     try:
       v_ego = max(float(v_ego), 0.0)
       a_ego = float(a_ego)
@@ -285,9 +289,13 @@ class ModelCurveSpeedLimiter:
     live = _torque_values(torque_params) if torque_params is not None else None
     params = self._calibrated(live or self.torque_params, state, v_ego, steering)
 
+    self._gas_grace_s = CURVE_GAS_GRACE_S if gas_pressed else max(self._gas_grace_s - self.dt, 0.0)
     anticipation = self._anticipate(model, v_ego, roll, params, steering)
     if anticipation is None:
       anticipation = A_CURVE_FREE          # no usable path: nothing to anticipate; the reaction layer alone still runs
+    elif self._gas_grace_s > 0.0:
+      # the grace after a gas override: the owner chose this speed; anticipation may hold it, never pull it back down
+      anticipation = max(anticipation, 0.0)
     self._candidate_history = self._candidate_history[1:] + [anticipation]
     anticipation = float(np.median(self._candidate_history))
 

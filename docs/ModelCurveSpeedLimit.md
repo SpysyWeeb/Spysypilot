@@ -78,3 +78,10 @@ backstop against an implausible learned authority. And `V_HOLD_BAND` 0.3 m/s: wi
 candidate is a flat zero, so the settled car holds the limit instead of stitching gas/brake corrections across the zero
 crossing; drift is corrected at the band edges by the proportional approach. Route 22 sweeper: the in-curve limit moves
 from ~25–26 (comfort-bound) to ~27–28 m/s (authority-bound with the bank).
+
+## 2026-08-31 — a gas override earns a grace
+
+`CURVE_GAS_GRACE_S` 5.0: after the driver's gas press, the anticipation layer may hold the speed but never pull it back down
+for five seconds — route 0x2c t=885: the owner released the pedal 1.4 m/s above the in-curve limit and the still-active episode
+dragged the exit from +1.8 back to −1.0 mid-corner. The reaction brake regime (pinned and understeering) still runs inside the
+grace, and the grace re-arms on every gas frame.
