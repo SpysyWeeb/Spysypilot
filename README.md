@@ -74,6 +74,15 @@ builds, never past a refuge island.
   return the rack's own self-aligning torque is producing is not resisted, while the feedforward keeps
   following the plan. Closed-loop A/B vs step 1 on the two hardest windows (route 2b s-turn, route 23
   owner unwind): tracking equal, release engaging only in unwind/near-center pockets (1.4–2.6 % duty).
+  A 16-agent review then confirmed and fixed four more: the flip time is interpolated inside the
+  horizon grid (was a 0.25 s snap that could swing the blend by half the torque scale in one frame),
+  a target sitting exactly at zero no longer blinds the sign test, `carOutput` is alive/valid-guarded
+  (a dead card disables the release instead of latching it), and the direction fraction fades out
+  within 3° of center so a near-center dither cannot strip the rate damping frame to frame. One
+  deliberate feel change to listen for on the drive: with the unwind clamp retired, holding torque
+  through an ordinary curve exit is higher than step 1 (up to ~+0.2 on the ±1 scale at highway speed
+  in a synthetic sweep; p95 +0.07 over the two replay routes) — the plan is held honestly instead of
+  being bled off by the wheel's own position.
   ⚠️ awaiting the step-1 field drive before this merges anywhere.
 - Phase 3, step 1 — continuity and truth-telling in the torque tail, from the phase-3 design panel
   (`route-audit/phase3/design/phase3_design.md`): the turn-in feedback cap blends continuously between

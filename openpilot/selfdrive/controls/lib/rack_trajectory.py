@@ -675,17 +675,32 @@ class RackTrajectoryController:
     applied_direction = math.copysign(1.0, applied_torque) if abs(applied_torque) > APPLIED_TORQUE_EPS else 0.0
     if applied_direction == 0.0 or raw_torque * applied_direction <= 0.0 or direction_fraction < 0.0:
       return raw_torque, False
-    now_angle = targets[0].angle_deg - angle_offset_deg
     now_rate = targets[0].rate_deg_s
+    # the side a flip is judged against: the immediate target, or the applied torque itself when the
+    # immediate target sits exactly at zero (a far target opposite the held torque is still a reversal)
+    now_angle = targets[0].angle_deg - angle_offset_deg
+    angle_reference = now_angle if now_angle != 0.0 else applied_direction
     flip_time = None
     flip_target = None
+    previous_offset = float(HORIZON_OFFSETS_S[0])
+    previous_angle = now_angle
+    previous_rate = now_rate
     for offset, path_target in zip(HORIZON_OFFSETS_S[1:], targets[1:], strict=True):
-      angle_flip = (path_target.angle_deg - angle_offset_deg) * now_angle < 0.0
+      angle = path_target.angle_deg - angle_offset_deg
+      angle_flip = angle * angle_reference < 0.0
       rate_flip = path_target.rate_deg_s * now_rate < 0.0 and abs(path_target.rate_deg_s) > FLIP_RATE_EPS_DEG_S
       if angle_flip or rate_flip:
-        flip_time = float(offset)
+        # the crossing time interpolated within the grid segment, so the blend below moves
+        # continuously as a real reversal approaches (R7) instead of in whole grid steps
+        before, after = (previous_angle, angle) if angle_flip else (previous_rate, path_target.rate_deg_s)
+        span = before - after
+        fraction = min(max(before / span if span != 0.0 else 0.0, 0.0), 1.0)
+        flip_time = previous_offset + (float(offset) - previous_offset) * fraction
         flip_target = path_target
         break
+      previous_offset = float(offset)
+      previous_angle = angle
+      previous_rate = path_target.rate_deg_s
     if flip_time is None:
       return raw_torque, False
     # the torque wanted on the other side, estimated cheaply as the feedforward at the flip target's
@@ -919,8 +934,11 @@ class RackTrajectoryController:
     if measured_angle != 0.0:
       planned_hold_angle = abs(planned_angle) if planned_angle * measured_angle > 0.0 else 0.0
       turn_in_angle = abs(intended_angle) if intended_angle * measured_angle > 0.0 else 0.0
+      # faded out within TURN_IN_BLEND_DEG of center: a near-center dither must not pin the fraction
+      # at its endpoints and strip the rate damping (or arm the guard) frame to frame (R7)
       direction_fraction = min(max(
-        1.0 - max(planned_hold_angle, turn_in_angle) / abs(measured_angle), -1.0), 1.0)
+        1.0 - max(planned_hold_angle, turn_in_angle) / abs(measured_angle), -1.0), 1.0,
+      ) * min(abs(measured_angle) / TURN_IN_BLEND_DEG, 1.0)
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )

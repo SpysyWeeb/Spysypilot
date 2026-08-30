@@ -1230,14 +1230,101 @@ class TestLatControlRack(OpenpilotTestCase):
     assert walk(1.2, 0.6, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}, direction_fraction=-0.01) == (1.2, False)
 
     # a flip farther out than twice the reversal budget is left to the raw law; inside the
-    # approach window the ceiling blends between the raw request and the release trajectory
+    # approach window the ceiling blends between the raw request and the release trajectory,
+    # with the crossing time interpolated inside its grid segment (rate 5 -> -20 crosses 20% in)
     far_flip = PathTarget(-0.0001, 15.0, 10.0, -20.0)
     assert walk(1.2, 0.6, {len(HORIZON_OFFSETS_S) - 1: far_flip}) == (1.2, False)
     budget = 0.6 / (7.0 / 409.0 / 0.01) + (0.0001 * 15.0 ** 2) / (4.0 / 409.0 / 0.01)
-    blend = 1.0 - (0.5 - budget) / budget
+    flip_time = 0.5 + 0.25 * (5.0 / 25.0)
+    blend = 1.0 - (flip_time - budget) / budget
     expected = blend * (0.6 - release_step) + (1.0 - blend) * 1.2
-    torque, released = walk(1.2, 0.6, {2: far_flip})
+    torque, released = walk(1.2, 0.6, {3: far_flip})
     assert released and 0.0 < blend < 1.0 and math.isclose(torque, expected, abs_tol=1e-12)
+
+    # the gate boundary is exactly zero: at the need (0.0, and -0.0) the release may act
+    for boundary in (0.0, -0.0):
+      torque, released = walk(1.2, 0.6, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}, direction_fraction=boundary)
+      assert released and torque < 1.2
+    # an immediate target exactly at zero: the flip is judged against the applied torque's own side
+    zero_now = [PathTarget(0.0, 15.0, 0.0, 0.0)] * len(HORIZON_OFFSETS_S)
+    zero_now[3] = PathTarget(0.003, 15.0, -6.0, 0.0)
+    torque, released = controller._early_release(1.2, 0.6, zero_now, 0.0, lambda lateral_accel, _: lateral_accel,
+                                                 None, 0.0)
+    assert released and math.isclose(torque, 0.6 - release_step, abs_tol=1e-12)
+    # the angle offset is subtracted before the sign test: a raw angle on the target's side of zero
+    # but past the offset is a flip
+    offset_targets = [PathTarget(-0.004, 15.0, 15.0, 5.0)] * len(HORIZON_OFFSETS_S)
+    offset_targets[3] = PathTarget(0.003, 15.0, 4.0, 5.0)  # corrected -1 against corrected +10
+    torque, released = controller._early_release(1.2, 0.6, offset_targets, 5.0,
+                                                 lambda lateral_accel, _: lateral_accel, None, 0.0)
+    assert released and torque < 1.2
+    # the opposite-torque estimate floors a stopped flip target's speed and clamps at one
+    slow_flip = PathTarget(-0.05, 0.0, 10.0, -20.0)
+    slow_budget = 0.6 / (7.0 / 409.0 / 0.01) + min(0.05 * MIN_SPEED ** 2, 1.0) / (4.0 / 409.0 / 0.01)
+    slow_time = 0.5 + 0.25 * (5.0 / 25.0)
+    slow_blend = min(max(1.0 - (slow_time - slow_budget) / slow_budget, 0.0), 1.0)
+    torque, released = walk(1.2, 0.6, {3: slow_flip})
+    assert released and 0.0 < slow_blend < 1.0
+    assert math.isclose(torque, slow_blend * (0.6 - release_step) + (1.0 - slow_blend) * 1.2, abs_tol=1e-12)
+    huge_flip = PathTarget(9.0, 15.0, -6.0, 0.0)
+    clamp_budget = 0.6 / (7.0 / 409.0 / 0.01) + 1.0 / (4.0 / 409.0 / 0.01)
+    torque, released = walk(1.2, 0.6, {2: huge_flip})
+    assert released and clamp_budget > 1.0 and math.isclose(torque, 0.6 - release_step, abs_tol=1e-12)
+
+  def test_early_release_is_continuous_as_a_reversal_approaches(self):
+    # R7: as the true crossing sweeps toward now, the released torque must move continuously --
+    # the crossing is interpolated inside the horizon grid, never snapped to a 0.25 s step
+    controller = RackTrajectoryController()
+    slope = 12.0
+    previous = None
+    for flip_true in [1.5 - 0.01 * i for i in range(140)]:
+      targets = [PathTarget(-0.0001, 15.0, slope * (flip_true - offset), -slope)
+                 for offset in HORIZON_OFFSETS_S]
+      torque, _ = controller._early_release(1.0, 0.3, targets, 0.0, lambda lateral_accel, _: lateral_accel,
+                                            None, 0.0)
+      if previous is not None:
+        assert abs(torque - previous) < 0.05, (flip_true, previous, torque)
+      previous = torque
+    assert previous is not None and previous < 1.0
+
+  def test_direction_fraction_fades_at_center(self):
+    # a near-center dither with the plan lagging to one side must not pin the fraction at +/-1,
+    # strip the rate damping, or arm the direction guard on alternating frames
+    torque_params = self.CP.lateralTuning.torque
+    torque_params.friction = 0.0
+    torque_params.latAccelOffset = 0.0
+    controller = RackTrajectoryController()
+    controller.planner = JerkLimitedRackPlanner(1.8)
+    model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [15.0] * 6)
+    model.action.desiredCurvature = 0.0
+    controller.set_model(model, 1_050_000_000)
+    for frame in range(8):
+      self.CS.steeringAngleDeg = 0.1 if frame % 2 == 0 else -0.1
+      self.CS.steeringRateDeg = -20.0
+      output = controller.update(True, self.CS, self.VM, self.params, torque_params,
+                                 lambda lateral_accel, _: lateral_accel, .2, 0.0)
+      assert output is not None
+      assert abs(output.direction_fraction) < 0.05
+      assert not output.direction_guarded
+
+  def test_early_release_then_driver_assist_cap(self):
+    # the driver-assist clamp still runs downstream of the release
+    torque_params = self.CP.lateralTuning.torque
+    torque_params.friction = 0.0
+    torque_params.latAccelOffset = 0.0
+    self.CS.steeringAngleDeg = 15.0
+    self.CS.steeringPressed = True
+    model, curvature_now = self._flip_model(15.0)
+    controller = RackTrajectoryController()
+    controller.planner = JerkLimitedRackPlanner(15.0)
+    controller.set_model(model, 1_050_000_000)
+    output = controller.update(True, self.CS, self.VM, self.params, torque_params,
+                               lambda lateral_accel, _: lateral_accel, .2, curvature_now,
+                               applied_torque=.65)
+    self.CS.steeringPressed = False
+    assert output is not None
+    assert output.early_release and output.driver_assist_limited
+    assert abs(output.torque) == MAX_DRIVER_ASSIST_TORQUE
 
   def test_early_release_engages_before_a_horizon_reversal(self):
     torque_params = self.CP.lateralTuning.torque
@@ -1338,6 +1425,13 @@ class TestLatControlRack(OpenpilotTestCase):
     assert math.isclose(unwind.rate_feedback_torque, expected, rel_tol=1e-9, abs_tol=1e-12)
     assert abs(unwind.rate_feedback_torque) > 1e-6
 
+    # the fraction is computed on offset-corrected angles: shifting the whole scene by the
+    # angle offset leaves it unchanged
+    self.params.angleOffsetDeg = 4.0
+    shifted = run(3.0 + 4.0, 12.0 + 4.0, 0.0)
+    self.params.angleOffsetDeg = 0.0
+    assert math.isclose(shifted.direction_fraction, unwind.direction_fraction, abs_tol=1e-6)
+
     # holding the needed angle: fraction zero, bit-identical to the unscaled law
     hold = run(12.0, 12.0, 12.0)
     assert abs(hold.direction_fraction) < 1e-6
@@ -1373,10 +1467,15 @@ class TestLatControlRack(OpenpilotTestCase):
       assert 0.0 < scale < 1.0
       # mechanism 1: what the relaxed rate feedback gave up relative to the unscaled law
       mechanism_1 = output.rate_feedback_torque - output.rate_feedback_torque / scale
-      # mechanism 2 (cross-check only): the aligning surplus the road supplies beyond the plan's need,
-      # feedforward evaluated at measured instead of planned lateral accel; the FF sign convention
-      # cancels in the difference, leaving signed torque toward center
-      mechanism_2 = output.actual_lateral_accel - output.desired_lateral_accel
+      # mechanism 2 (cross-check only): the feedforward re-evaluated at MEASURED instead of planned
+      # lateral accel, with the file's own negation. During an unwind the wheel sits beyond the plan,
+      # so this delta is EXTRA torque toward holding -- the surplus the road's self-aligning force is
+      # already supplying on its own. Mechanism 1 gives up resistance instead of adding that surplus,
+      # so its delta must OPPOSE mechanism 2's sign while tracking its rough magnitude. (The design
+      # text asked for sign agreement; on its own reference frame the literal FF delta and the
+      # relaxation are numerically opposite -- review-verified -- because one measures the surplus
+      # and the other the resistance given up.)
+      mechanism_2 = -output.actual_lateral_accel + output.desired_lateral_accel
       assert abs(mechanism_1) > 1e-6 and abs(mechanism_2) > 1e-6
-      assert mechanism_1 * mechanism_2 > 0.0
+      assert mechanism_1 * mechanism_2 < 0.0
       assert 1.0 / 30.0 < abs(mechanism_1) / abs(mechanism_2) < 30.0

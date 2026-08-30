@@ -386,8 +386,13 @@ red-team pass.
   budget. Closed-loop replay against the phase-3 plant caught it firing during turn-ins (route 2b
   s-turn: the 2 s horizon holds the next leg of an S while the wheel is still 200° short of this
   one, and the release starved the turn) — gated on `direction_fraction ≥ 0`, so it acts only once
-  the wheel has reached what the plan still needs on its side. The anticipated-reversal `max_rate`
-  reduction is still open (a later step).*
+  the wheel has reached what the plan still needs on its side. Review (wf_97492c7f) then confirmed
+  three more: the flip time snapped to the 0.25 s horizon grid, swinging the blend by up to 0.53
+  torque in one frame (R7) — the crossing is now interpolated inside its grid segment; the sign test
+  was blind when the immediate target sat exactly at zero — it now falls back to the applied torque's
+  own side; and `carOutput` was trusted without an alive/valid check — a dead `card` now reads as
+  zero applied torque, which disables the release rather than latching it. The anticipated-reversal
+  `max_rate` reduction is still open (a later step).*
 - **FM3.12 — Undebounced EPS fault bit resets the controller. [v2]** A 1–3 frame
   `CF_Mdps_ToiUnavail`/`ToiFlt` flicker during a firm turn. *`steerFaultTemporary` has no
   debounce; latActive drops; today the rack state is wiped and re-seeded.* → Below a short
