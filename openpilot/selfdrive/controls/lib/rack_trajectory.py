@@ -663,14 +663,17 @@ class RackTrajectoryController:
 
   def _early_release(self, raw_torque: float, applied_torque: float, targets: Sequence[PathTarget],
                      angle_offset_deg: float, torque_from_lateral_accel: Callable[[float, object], float],
-                     torque_params) -> tuple[float, bool]:
+                     torque_params, direction_fraction: float) -> tuple[float, bool]:
     # If the horizon shows the required torque flipping sign sooner than the EPS slew can shed the
     # torque it is actually applying and build the opposite side, begin releasing now: the fastest
     # release trajectory becomes a ceiling on how far the request may still ask in the old direction,
-    # blended in over one budget's width. It never raises a request and never touches a request
-    # already reversing on its own.
+    # blended in over one budget's width. It never raises a request, never touches a request already
+    # reversing on its own, and never acts during a turn-in (direction fraction below zero): there the
+    # old-direction torque is still the torque the plan needs -- on an S-course the horizon holds the
+    # next leg's reversal for seconds while the wheel is still short of THIS leg's target, and
+    # releasing on that foresight starves the turn (found closed-loop on route 2b's s-turn).
     applied_direction = math.copysign(1.0, applied_torque) if abs(applied_torque) > APPLIED_TORQUE_EPS else 0.0
-    if applied_direction == 0.0 or raw_torque * applied_direction <= 0.0:
+    if applied_direction == 0.0 or raw_torque * applied_direction <= 0.0 or direction_fraction < 0.0:
       return raw_torque, False
     now_angle = targets[0].angle_deg - angle_offset_deg
     now_rate = targets[0].rate_deg_s
@@ -946,6 +949,7 @@ class RackTrajectoryController:
       raw_torque = 0.0
     raw_torque, early_release = self._early_release(
       raw_torque, applied_torque, targets, params.angleOffsetDeg, torque_from_lateral_accel, torque_params,
+      direction_fraction,
     )
     torque = min(max(raw_torque, -1.0), 1.0)
     platform_saturated = torque != raw_torque

@@ -1200,11 +1200,12 @@ class TestLatControlRack(OpenpilotTestCase):
     controller = RackTrajectoryController()
     steady = PathTarget(-0.004, 15.0, 10.0, 5.0)
 
-    def walk(raw, applied, overrides):
+    def walk(raw, applied, overrides, direction_fraction=0.0):
       targets = [steady] * len(HORIZON_OFFSETS_S)
       for index, target in overrides.items():
         targets[index] = target
-      return controller._early_release(raw, applied, targets, 0.0, lambda lateral_accel, _: lateral_accel, None)
+      return controller._early_release(raw, applied, targets, 0.0, lambda lateral_accel, _: lateral_accel, None,
+                                       direction_fraction)
 
     release_step = TORQUE_RATE_DOWN_PER_S * controller.dt
 
@@ -1224,6 +1225,9 @@ class TestLatControlRack(OpenpilotTestCase):
     assert walk(0.2, 0.9, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}) == (0.2, False)
     # nothing applied, nothing to release
     assert walk(1.2, 0.005, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}) == (1.2, False)
+    # never during a turn-in: the old-direction torque is still the torque the plan needs, even
+    # when the horizon already carries the next leg of an S-course
+    assert walk(1.2, 0.6, {2: PathTarget(-0.004, 15.0, 10.0, -20.0)}, direction_fraction=-0.01) == (1.2, False)
 
     # a flip farther out than twice the reversal budget is left to the raw law; inside the
     # approach window the ceiling blends between the raw request and the release trajectory
