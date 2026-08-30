@@ -57,6 +57,14 @@ RELEASE_GAIN = 0.5           # of the measured surplus deceleration: a lagging a
                              # the gain where the ESP's dead time (~0.2 s) would make it ring
 RELEASE_DEADBAND = 0.05      # m/s^2 of surplus before the lift starts (0.1 left the lift inert through the last half metre)
 RELEASE_LIFT_MAX = 1.0       # m/s^2, the most the request is lifted above the plan
+# The accelerometer's other direction. Route 0x2c t=727: entering the kiss band slowly, driveline creep beat the -0.15
+# request -- the car bottomed at 0.22 m/s, re-accelerated for a second with the brake light off, and only LongControl's
+# slow stall ratchet caught it 2 s later. When the measured acceleration says the car is not slowing as the landing asks,
+# the whole corridor is pressed toward more braking immediately and in proportion; the press relaxes by itself as the car
+# slows again, so the wheel stop stays as soft as the kiss intends
+CREEP_PRESS_GAIN = 1.0       # of the measured shortfall (a_ego above the target)
+CREEP_PRESS_DEADBAND = 0.05  # m/s^2 of shortfall before the press starts
+CREEP_PRESS_MAX = 0.5        # m/s^2, the most the corridor is pressed down
 
 
 def landing_bound(v_ego):
@@ -126,6 +134,9 @@ class StopLanding:
         return a_target
 
     release = self._stall_release(v_ego)
+    if a_ego is not None and math.isfinite(a_ego) and v_ego <= KISS_SPEED and a_target < 0.0:
+      # anti-creep: below the kiss speed a measured shortfall presses the corridor down at once (see CREEP_PRESS_GAIN)
+      release += min(max(CREEP_PRESS_GAIN * (a_ego - a_target) - CREEP_PRESS_DEADBAND, 0.0), CREEP_PRESS_MAX)
     floor = landing_floor(v_ego)
     floor = floor + release if floor > 0.0 else 0.0
     requirement = total_decel_requirement(v_ego, lead, LEAD_LANDING_GAP, LEAD_MIN_GAP_BUDGET)

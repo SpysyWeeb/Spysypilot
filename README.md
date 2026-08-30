@@ -38,7 +38,9 @@ deceleration exceeds the plan's, because the Palisade's ESP releases the brake ~
 Smooth Stops design rehomed in the planner, with his accelerometer idea closing the loop. Since 2026-08-31 the kiss arrives a full
 ESP-release-lag before the wheels stop (0.40 m/s), the lead-departure pre-release needs 0.5 m/s, and Conditional Experimental Mode
 releases its stop search when the model's own path shows the road open — a lone borderline hint can start the search but not keep it
-alive past a green light.
+alive past a green light. Route 0x2c polish: an anti-creep press (a measured shortfall below the kiss speed presses the corridor
+down at once — creep torque beat the kiss on one slow entry) and a moving commitment now releases within three frames of the
+road opening, like the hold — it used to brake 1–2 s past a rolling green.
 
 ## How it works (planned)
 
