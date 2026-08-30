@@ -47,9 +47,9 @@ a pedal tap no longer switches a manually enabled Experimental mode off, FCW kee
 the third-lead machinery is gone. Since 2026-08-30 the planner also bounds every stop's last metres with the
 landing law (D22: a corridor — allowed braking 0.70·v + 0.30 m/s², a creep floor, both tapering to a 0.15 m/s² kiss at
 walking pace — that latches through the MPC's hover and standstill until a real launch; lead physics never blocked; the owner's
-original June Smooth Stops design rehomed in the planner). Since 2026-08-30 the Hyundai standstill hold is the brake request
-alone — no StopReq, so the ESP's ~1.4 s standstill-exit sequence should be gone from every launch (opendbc fork, promoted from
-the field-experiment branch; the hold on grades and over long waits is **unverified** until the owner drives it); Smooth Stops owns the standstill handoff (deferred
+original June Smooth Stops design rehomed in the planner). The standstill hold stays on StopReq: a 2026-08-30 drive without it
+(route 29) showed the SCC building brake pressure at standstill without end, chasing a deceleration it cannot measure on a stopped
+car — the ESP's ~1.4 s standstill-exit sequence is the price of its own hold; Smooth Stops owns the standstill handoff (deferred
 clamp, kiss below 0.3 m/s), and the curve policy shapes cruise through curves. Design, owner decisions
 and acceptance gates: [`docs/BLoTv3.md`](https://github.com/SpysyWeeb/Spysypilot/blob/BLoTv3/docs/BLoTv3.md).
 
