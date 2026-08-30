@@ -949,6 +949,8 @@ struct ControlsState @0x97ff69c53601abf1 {
     pathLimited @26 :Bool;
     profileTransition @27 :Bool;
     version @28 :Int32;
+    previewTime @29 :Float32;  # seconds past the action time the immediate target is read at
+    referenceLimited @30 :Bool;  # the served target trails the model's by the filter's bound
   }
 
   struct LateralAngleState {

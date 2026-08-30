@@ -78,6 +78,8 @@ class RackTrajectoryOutput:
   path_limited: bool
   infeasible: bool
   saturated: bool
+  preview_time_s: float
+  reference_limited: bool
 
 
 MEASURED_RATE_FILTER_RC_S = .05
@@ -214,11 +216,6 @@ def horizon_desired_acceleration(
   return result
 
 
-REFERENCE_REVERSAL_DISTANCE_DEG = 1.0
-REFERENCE_REVERSAL_RC_S = .12
-REFERENCE_MAX_RATE_DEG_S = 5.0
-
-
 HORIZON_S = 2.0
 HORIZON_STEP_S = .25
 HORIZON_OFFSETS_S = tuple(index * HORIZON_STEP_S for index in range(round(HORIZON_S / HORIZON_STEP_S) + 1))
@@ -301,90 +298,192 @@ def model_path_targets(
   return tuple(targets)
 
 
-class RackReferenceGovernor:
-  """Smooth short, small rack-reference reversals before trajectory planning."""
+REFERENCE_FILTER_RC_S = .1
+REFERENCE_FILTER_TRAIL_LATERAL_ACCEL = .2  # m/s^2: how far the served target may trail the raw one
+REFERENCE_FILTER_TRAIL_MAX_DEG = 3.0  # and in wheel angle, which is the tighter bound below ~12 m/s
+DIRECTION_GUARD_RC_S = .12
+
+
+def reference_trail_limit_deg(vehicle_model, speed_mps: float) -> float:
+  """How far the served target may trail the model's: a lateral acceleration, capped in wheel angle."""
+  speed = max(float(speed_mps), MIN_SPEED)
+  return min(
+    abs(math.degrees(vehicle_model.get_steer_from_curvature(REFERENCE_FILTER_TRAIL_LATERAL_ACCEL / speed ** 2, speed, 0.0))),
+    REFERENCE_FILTER_TRAIL_MAX_DEG,
+  )
+
+
+class ReferenceFilter:
+  """Smooth the immediate target without holding it back by more than a bounded amount.
+
+  A first-order filter removes the frame-to-frame jitter of the model's target: a few degrees of
+  wheel at low speed and nothing in lateral acceleration. The served target may trail the raw one
+  by at most a lateral acceleration, capped in wheel angle, so a turn-in or an unwind passes with
+  at most that trailing, at the raw target's own rate, and any trailing decays with the time
+  constant once the raw target settles.
+  """
 
   def __init__(self) -> None:
-    self.accepted: RackTarget | None = None
-    self.last_model_timestamp_ns: int | None = None
-    self.last_replan_position_deg: float | None = None
-    self.direction = 0
-    self.active = False
+    self.target: RackTarget | None = None
     self.limited = False
 
   def reset(self) -> None:
-    self.accepted = None
+    self.target = None
+    self.limited = False
+
+  def update(self, target: RackTarget, trail_limit_deg: float, dt: float, bypass: bool = False) -> RackTarget:
+    if self.target is None or bypass:
+      self.target = target
+      self.limited = False
+      return target
+    alpha = dt / (REFERENCE_FILTER_RC_S + dt)
+    position = self.target.position_deg + alpha * (target.position_deg - self.target.position_deg)
+    rate = self.target.rate_deg_s + alpha * (target.rate_deg_s - self.target.rate_deg_s)
+    trail = target.position_deg - position
+    self.limited = abs(trail) > trail_limit_deg
+    if self.limited:
+      position = target.position_deg - math.copysign(trail_limit_deg, trail)
+      rate = target.rate_deg_s
+    self.target = RackTarget(position, rate)
+    return self.target
+
+
+PREVIEW_ADMIT_DEVIATION_M = .15  # path consistency, in metres, to read the target one step further ahead
+PREVIEW_KEEP_DEVIATION_M = .2  # and to keep reading it there
+PREVIEW_ADMIT_HEADING_DEG = 1.0
+PREVIEW_KEEP_HEADING_DEG = 1.33
+PREVIEW_FLICKER_TOLERANCE_DEG = .25  # a far target may not swing more than the near one between model frames
+PREVIEW_MAX_DISTANCE_M = 40.0
+PREVIEW_MAX_Y_STD_M = .35  # p99 of the path's yStd at 2 s on straight frames (routes 20/22)
+PREVIEW_SHORTEN_UPDATES = 2  # model frames of disagreement before the preview shortens
+PREVIEW_LENGTHEN_UPDATES = 2  # model frames of agreement before it lengthens by one step
+RESPONSE_TIME_PREVIEW_S = .1  # extra tracker response time granted at the full preview
+CLOTHOID_STEPS = 20
+
+
+def _arc_y(curvature: float, x: np.ndarray) -> np.ndarray:
+  if abs(curvature) < 1e-9:
+    return 0.5 * curvature * x * x
+  return (1.0 - np.cos(curvature * x)) / curvature
+
+
+def _clothoid_y(curvature_near: float, curvature_far: float, x_action: float, x_far: float, x_query: np.ndarray) -> np.ndarray:
+  """Lateral position of the path whose curvature is held at the near value to x_action and then
+  ramps linearly to the far value at x_far: the shape a consistent plan draws between its targets."""
+  heading = curvature_near * x_action
+  y_action = float(_arc_y(curvature_near, np.array(x_action)))
+  span = x_far - x_action
+  if span <= 1e-6:
+    return np.full_like(x_query, y_action)
+  xs = np.linspace(x_action, x_far, CLOTHOID_STEPS + 1)
+  curvatures = curvature_near + (curvature_far - curvature_near) * (xs - x_action) / span
+  dx = xs[1] - xs[0]
+  headings = heading + np.concatenate(([0.0], np.cumsum(dx * 0.5 * (curvatures[:-1] + curvatures[1:]))))
+  slopes = np.sin(headings)
+  ys = y_action + np.concatenate(([0.0], np.cumsum(dx * 0.5 * (slopes[:-1] + slopes[1:]))))
+  return np.interp(x_query, xs, ys)
+
+
+class PreviewScheduler:
+  """Schedule how far along the plan the immediate target is read.
+
+  On a path the model draws consistently -- a clothoid from the near curvature to the far one,
+  within a lateral tolerance in metres, with the far target as steady as the near one -- the target
+  is read further ahead, one horizon step at a time. The moment the path stops agreeing (a jog, a
+  curve entry, a flickering far point, a lane change, the driver's hands, a limited path) it is
+  read at the action time again within two model frames.
+  """
+
+  def __init__(self) -> None:
+    self.index = 0
+    self.fail_updates = 0
+    self.pass_updates = 0
+    self.last_model_timestamp_ns: int | None = None
+    self.previous_angles: tuple[float, ...] | None = None
+
+  def reset(self) -> None:
+    self.index = 0
+    self.fail_updates = 0
+    self.pass_updates = 0
     self.last_model_timestamp_ns = None
-    self.last_replan_position_deg = None
-    self.direction = 0
-    self.active = False
-    self.limited = False
+    self.previous_angles = None
 
-  @staticmethod
-  def _sign(value: float) -> int:
-    return 1 if value > 1e-9 else -1 if value < -1e-9 else 0
+  @property
+  def preview_s(self) -> float:
+    return HORIZON_OFFSETS_S[self.index]
 
-  def _accept(self, target: RackTarget) -> RackTarget:
-    self.accepted = target
-    self.active = False
-    self.limited = False
-    return target
+  def update(self, model, model_timestamp_ns: int, action_time_s: float, targets: Sequence[PathTarget], forced: bool) -> int:
+    if forced:
+      self.index = 0
+      self.fail_updates = 0
+      self.pass_updates = 0
+    timestamp = int(model_timestamp_ns)
+    if timestamp == self.last_model_timestamp_ns:
+      return self.index
+    self.last_model_timestamp_ns = timestamp
+    angles = tuple(target.angle_deg for target in targets)
+    admissible = 0 if forced else self._admissible(model, action_time_s, targets, angles)
+    self.previous_angles = angles
+    if forced:
+      return 0
+    if admissible < self.index:
+      self.fail_updates += 1
+      if self.fail_updates >= PREVIEW_SHORTEN_UPDATES:
+        self.index = admissible
+        self.fail_updates = 0
+        self.pass_updates = 0
+    else:
+      self.fail_updates = 0
+      if admissible > self.index:
+        self.pass_updates += 1
+        if self.pass_updates >= PREVIEW_LENGTHEN_UPDATES:
+          self.index += 1
+          self.pass_updates = 0
+      else:
+        self.pass_updates = 0
+    return self.index
 
-  def update(self, target: RackTarget, planner: JerkLimitedRackPlanner, model_timestamp_ns: int, dt: float,
-             bypass: bool = False) -> RackTarget:
-    timestamp_ns = int(model_timestamp_ns)
-    if self.accepted is None:
-      self.last_model_timestamp_ns = timestamp_ns
-      self.last_replan_position_deg = target.position_deg
-      return self._accept(target)
+  def _admissible(self, model, action_time_s: float, targets: Sequence[PathTarget], angles: tuple[float, ...]) -> int:
+    position = model.position
+    times = np.asarray(position.t, dtype=np.float64)
+    if len(times) < 2 or len(position.x) != len(times) or len(position.y) != len(times) or str(model.confidence) == "red":
+      return 0
+    xs = np.asarray(position.x, dtype=np.float64)
+    ys = np.asarray(position.y, dtype=np.float64)
+    y_std = np.asarray(position.yStd, dtype=np.float64) if len(position.yStd) == len(times) else None
+    speed_times = np.asarray(model.velocity.t, dtype=np.float64)
+    speeds = np.asarray(model.velocity.x, dtype=np.float64)
+    # a path with a hole in it proves nothing: comparisons against NaN never fail, so check up front
+    if not all(np.isfinite(array).all() for array in (times, xs, ys, speed_times, speeds)) or (y_std is not None and not np.isfinite(y_std).all()):
+      return 0
+    x_action = float(np.interp(action_time_s, times, xs))
+    near = targets[0]
+    admitted = 0
+    for index in range(1, len(targets)):
+      far_time = action_time_s + HORIZON_OFFSETS_S[index]
+      keeping = index <= self.index
+      window = (times >= action_time_s) & (times <= far_time)
+      if window.any():
+        x_far = float(np.interp(far_time, times, xs))
+        deviation = float(np.max(np.abs(ys[window] - _clothoid_y(near.curvature, targets[index].curvature, x_action, x_far, xs[window]))))
+        if deviation >= (PREVIEW_KEEP_DEVIATION_M if keeping else PREVIEW_ADMIT_DEVIATION_M):
+          break
+        if y_std is not None and float(np.max(y_std[window])) > PREVIEW_MAX_Y_STD_M:
+          break
+      if abs(angles[index] - angles[0]) > (PREVIEW_KEEP_HEADING_DEG if keeping else PREVIEW_ADMIT_HEADING_DEG):
+        break
+      if self.previous_angles is not None and len(self.previous_angles) == len(angles):
+        if abs(angles[index] - self.previous_angles[index]) > abs(angles[0] - self.previous_angles[0]) + PREVIEW_FLICKER_TOLERANCE_DEG:
+          break
+      sample_times = np.linspace(action_time_s, far_time, 9)
+      if float(np.trapezoid(np.interp(sample_times, speed_times, speeds), sample_times)) > PREVIEW_MAX_DISTANCE_M:
+        break
+      admitted = index
+    return admitted
 
-    assert self.last_model_timestamp_ns is not None and self.last_replan_position_deg is not None
-    new_model = timestamp_ns != self.last_model_timestamp_ns
-    raw_change_direction = self._sign(target.position_deg - self.last_replan_position_deg) if new_model else 0
-    if bypass:
-      self.last_model_timestamp_ns = timestamp_ns
-      self.last_replan_position_deg = target.position_deg
-      self.direction = 0
-      return self._accept(target)
-    plan_error = abs(target.position_deg - planner.position_deg)
-    filter_error = abs(target.position_deg - self.accepted.position_deg)
-    coherent_motion = (
-      plan_error >= REFERENCE_REVERSAL_DISTANCE_DEG
-      or filter_error >= REFERENCE_REVERSAL_DISTANCE_DEG
-      or abs(target.rate_deg_s) >= REFERENCE_MAX_RATE_DEG_S
-    )
-    reversal = new_model and raw_change_direction != 0 and self.direction != 0 and raw_change_direction != self.direction
-    if coherent_motion:
-      if new_model:
-        self.last_model_timestamp_ns = timestamp_ns
-        self.last_replan_position_deg = target.position_deg
-        if raw_change_direction:
-          self.direction = raw_change_direction
-      return self._accept(target)
-    if reversal:
-      self.active = True
-    if new_model:
-      self.last_model_timestamp_ns = timestamp_ns
-      self.last_replan_position_deg = target.position_deg
-      if raw_change_direction:
-        self.direction = raw_change_direction
-    if not self.active:
-      return self._accept(target)
-
-    alpha = dt / (REFERENCE_REVERSAL_RC_S + dt)
-    self.accepted = RackTarget(
-      self.accepted.position_deg + alpha * (target.position_deg - self.accepted.position_deg),
-      self.accepted.rate_deg_s + alpha * (target.rate_deg_s - self.accepted.rate_deg_s),
-    )
-    self.limited = (
-      abs(self.accepted.position_deg - target.position_deg) > 1e-9
-      or abs(self.accepted.rate_deg_s - target.rate_deg_s) > 1e-9
-    )
-    return self.accepted
 
 
 DT = .01
-PREVIEW_S = 0.0  # the immediate target is the scalar itself; the horizon beyond it only shapes the plan
 RATE_HORIZON_S = .1
 HORIZON_POSITION_TOLERANCE_DEG = .01
 HORIZON_RATE_TOLERANCE_DEG_S = .5
@@ -457,7 +556,8 @@ class RackTrajectoryController:
     self.direction_guard_scale = 1.0
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
-    self.reference_governor = RackReferenceGovernor()
+    self.reference_filter = ReferenceFilter()
+    self.preview_scheduler = PreviewScheduler()
     self.rack_rate_estimator = RackRateEstimator(dt)
 
   def set_model(self, model, state_mono_ns: int) -> None:
@@ -483,7 +583,8 @@ class RackTrajectoryController:
     self.direction_guard_scale = 1.0
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
-    self.reference_governor.reset()
+    self.reference_filter.reset()
+    self.preview_scheduler.reset()
     self.rack_rate_estimator.reset()
 
   def _invalidate(self, status: int) -> None:
@@ -491,12 +592,13 @@ class RackTrajectoryController:
     self.status = status
 
   @staticmethod
-  def _limits(speed_mps: float) -> MotionLimits:
+  def _limits(speed_mps: float, response_time_s: float = RESPONSE_TIME_S) -> MotionLimits:
     speed_mph = speed_mps * 2.2369362920544
     return MotionLimits(
       float(np.interp(speed_mph, _SPEED_PROFILE_MPH, _RATE_PROFILE_DEG_S)),
       float(np.interp(speed_mph, _SPEED_PROFILE_MPH, _ACCEL_PROFILE_DEG_S2)),
       float(np.interp(speed_mph, _SPEED_PROFILE_MPH, _JERK_PROFILE_DEG_S3)),
+      response_time_s,
     )
 
   def _motion_limits(self, profile: MotionLimits) -> tuple[MotionLimits, bool]:
@@ -523,7 +625,7 @@ class RackTrajectoryController:
         profile.max_acceleration_deg_s2, min(self.transition_acceleration_limit, required_acceleration_limit),
       )
     return MotionLimits(
-      self.transition_rate_limit, self.transition_acceleration_limit, profile.max_jerk_deg_s3,
+      self.transition_rate_limit, self.transition_acceleration_limit, profile.max_jerk_deg_s3, profile.response_time_s,
     ), True
 
   def _recovery_acceleration(self, profile: MotionLimits, transition: bool) -> float | None:
@@ -620,13 +722,10 @@ class RackTrajectoryController:
     targets: list[PathTarget] = []
     target_limits: list[bool] = []
     for offset, raw_target in zip(HORIZON_OFFSETS_S, raw_targets, strict=True):
-      target_speed = float(CS.vEgo) if offset <= PREVIEW_S else raw_target.speed_mps
+      target_speed = float(CS.vEgo) if offset == 0.0 else raw_target.speed_mps
       bounded_target, target_limited = bound_target(raw_target, target_speed)
       targets.append(bounded_target)
       target_limits.append(target_limited)
-    preview_index = round(PREVIEW_S / HORIZON_STEP_S)
-    target = targets[preview_index]
-    path_limited = target_limits[preview_index]
 
     bound_speed = max(float(CS.vEgo), MIN_SPEED)
     minimum_curvature = max(-MAX_CURVATURE, (-MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
@@ -635,13 +734,23 @@ class RackTrajectoryController:
       math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), bound_speed, params.roll,
     )
     measured_out_of_bounds = not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9
+    # the driver's hands, a lane change or a limited immediate target pin the preview at the action time
+    lane_changing = str(self.model.meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
+    preview_index = self.preview_scheduler.update(
+      self.model, int(self.model.timestampEof), float(preview_times[0]), targets,
+      bool(CS.steeringPressed) or lane_changing or target_limits[0] or measured_out_of_bounds,
+    )
+    preview_s = self.preview_scheduler.preview_s
+    target = targets[preview_index]
+    path_limited = target_limits[preview_index]
     previous_angle_deg = self.rack_rate_estimator.previous_angle_deg
     measured_rate, measured_rate_valid = self.rack_rate_estimator.update(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
-    profile = self._limits(float(CS.vEgo))
+    # a far, steady target may be approached more slowly
+    profile = self._limits(float(CS.vEgo), RESPONSE_TIME_S + RESPONSE_TIME_PREVIEW_S * preview_s / HORIZON_S)
     if self.planner is None:
       seed_rate = _clip(measured_rate, profile.max_rate_deg_s) if measured_rate_valid else 0.0
       self.planner = JerkLimitedRackPlanner(float(CS.steeringAngleDeg), seed_rate)
-      self.reference_governor.reset()
+      self.reference_filter.reset()
     elif CS.steeringPressed and previous_angle_deg is not None:
       self.planner.position_deg += float(CS.steeringAngleDeg) - previous_angle_deg
     if 0.0 < abs(self.planner.rate_deg_s) - profile.max_rate_deg_s <= 1e-6:
@@ -649,26 +758,25 @@ class RackTrajectoryController:
     if 0.0 < abs(self.planner.acceleration_deg_s2) - profile.max_acceleration_deg_s2 <= 1e-6:
       self.planner.acceleration_deg_s2 = math.copysign(profile.max_acceleration_deg_s2, self.planner.acceleration_deg_s2)
     limits, profile_transition = self._motion_limits(profile)
-    rack_target = RackTarget(target.angle_deg, target.rate_deg_s)
-    governed_target = self.reference_governor.update(
-      rack_target, self.planner, int(self.model.timestampEof), self.dt,
+    filtered_target = self.reference_filter.update(
+      RackTarget(target.angle_deg, target.rate_deg_s), reference_trail_limit_deg(VM, CS.vEgo), self.dt,
       path_limited or measured_out_of_bounds or profile_transition,
     )
     planner = self.planner
     assert planner is not None
     timed_targets = tuple(
-      (offset, governed_target if index == preview_index else RackTarget(path_target.angle_deg, path_target.rate_deg_s))
-      for index, (offset, path_target) in enumerate(zip(HORIZON_OFFSETS_S, targets, strict=True))
-      if offset > 0.0
+      (offset, RackTarget(path_target.angle_deg, path_target.rate_deg_s))
+      for offset, path_target in zip(HORIZON_OFFSETS_S, targets, strict=True)
+      if offset > preview_s
     )
     desired_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
-      if desired_acceleration is None:
+      if desired_acceleration is None and timed_targets:
         fitted_acceleration = horizon_desired_acceleration(planner, timed_targets)
         natural_frequency = 2.0 / limits.response_time_s
         reactive_acceleration = (
-          natural_frequency ** 2 * (governed_target.position_deg - planner.position_deg)
-          + 2.0 * natural_frequency * (governed_target.rate_deg_s - planner.rate_deg_s)
+          natural_frequency ** 2 * (filtered_target.position_deg - planner.position_deg)
+          + 2.0 * natural_frequency * (filtered_target.rate_deg_s - planner.rate_deg_s)
         )
         horizon_acceleration = reactive_acceleration + HORIZON_ACCELERATION_BLEND * (
           fitted_acceleration - reactive_acceleration
@@ -677,14 +785,14 @@ class RackTrajectoryController:
         def preview(acceleration_override: float | None) -> RackPlan:
           candidate = JerkLimitedRackPlanner(planner.position_deg, planner.rate_deg_s)
           candidate.acceleration_deg_s2 = planner.acceleration_deg_s2
-          return candidate.update(governed_target, limits, self.dt, acceleration_override)
+          return candidate.update(filtered_target, limits, self.dt, acceleration_override)
 
         baseline = preview(None)
         horizon = preview(horizon_acceleration)
-        if horizon_candidate_preserves_immediate_path(planner.position_deg, governed_target, baseline, horizon):
+        if horizon_candidate_preserves_immediate_path(planner.position_deg, filtered_target, baseline, horizon):
           desired_acceleration = horizon_acceleration
       raw_plan = planner.update(
-        governed_target, limits, self.dt, desired_acceleration,
+        filtered_target, limits, self.dt, desired_acceleration,
       )
     except ValueError:
       self._invalidate(STATUS_INVALID_PLANNER_STATE)
@@ -699,9 +807,9 @@ class RackTrajectoryController:
     planned_curvature = -VM.calc_curvature(math.radians(plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
     planned_lateral_accel = planned_curvature * CS.vEgo ** 2
     measured_lateral_accel = measured_curvature * CS.vEgo ** 2
-    target_angle = target.angle_deg - params.angleOffsetDeg
+    target_angle = filtered_target.position_deg - params.angleOffsetDeg
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
-    target_motion = target_angle - measured_angle + RESPONSE_TIME_S * target.rate_deg_s
+    target_motion = target_angle - measured_angle + RESPONSE_TIME_S * filtered_target.rate_deg_s
     turning_in = (
       target_angle * measured_angle >= 0.0
       and abs(target_angle) > abs(measured_angle)
@@ -722,16 +830,16 @@ class RackTrajectoryController:
       torque_params,
     )
     target_lateral_accel = target.curvature * CS.vEgo ** 2
-    governed_curvature = -VM.calc_curvature(
-      math.radians(governed_target.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll,
+    filtered_curvature = -VM.calc_curvature(
+      math.radians(filtered_target.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll,
     )
-    governed_lateral_accel = governed_curvature * CS.vEgo ** 2
+    filtered_lateral_accel = filtered_curvature * CS.vEgo ** 2
     trajectory_feedforward_lateral_accel = planned_lateral_accel
     if target_lateral_accel * planned_lateral_accel <= 0.0:
       trajectory_feedforward_lateral_accel = 0.0
-    elif (governed_lateral_accel * planned_lateral_accel > 0.0
-          and abs(governed_lateral_accel) < abs(planned_lateral_accel)):
-      trajectory_feedforward_lateral_accel = governed_lateral_accel
+    elif (filtered_lateral_accel * planned_lateral_accel > 0.0
+          and abs(filtered_lateral_accel) < abs(planned_lateral_accel)):
+      trajectory_feedforward_lateral_accel = filtered_lateral_accel
     unwind_scale = 1.0
     planned_angle = plan.position_deg - params.angleOffsetDeg
     intended_angle = measured_angle + target_motion
@@ -774,13 +882,13 @@ class RackTrajectoryController:
     if planned_angle * target_angle < 0.0 and torque * target_angle < 0.0:
       self.direction_guard_scale = 0.0
     else:
-      self.direction_guard_scale = min(1.0, self.direction_guard_scale + self.dt / REFERENCE_REVERSAL_RC_S)
+      self.direction_guard_scale = min(1.0, self.direction_guard_scale + self.dt / DIRECTION_GUARD_RC_S)
     guarded_torque = torque * self.direction_guard_scale
     torque_limited |= guarded_torque != torque
     torque = guarded_torque
     motion_limited = (
       plan.rate_limited or plan.acceleration_limited or plan.jerk_limited
-      or measured_out_of_bounds or planned_out_of_bounds or self.reference_governor.limited
+      or measured_out_of_bounds or planned_out_of_bounds or self.reference_filter.limited
     )
     if not all(math.isfinite(value) for value in (
       torque, plan.position_deg, plan.rate_deg_s, plan.acceleration_deg_s2, measured_rate,
@@ -796,8 +904,8 @@ class RackTrajectoryController:
     return RackTrajectoryOutput(
       torque=torque,
       target_curvature=target.curvature,
-      target_angle_deg=target.angle_deg,
-      target_rate_deg_s=target.rate_deg_s,
+      target_angle_deg=filtered_target.position_deg,
+      target_rate_deg_s=filtered_target.rate_deg_s,
       planned_angle_deg=plan.position_deg,
       planned_rate_deg_s=plan.rate_deg_s,
       planned_acceleration_deg_s2=plan.acceleration_deg_s2,
@@ -821,4 +929,6 @@ class RackTrajectoryController:
       path_limited=path_limited,
       infeasible=motion_limited or feedback_limited or torque_limited or profile_transition or path_limited,
       saturated=feedback_limited or torque_limited,
+      preview_time_s=preview_s,
+      reference_limited=self.reference_filter.limited,
     )

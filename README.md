@@ -60,6 +60,22 @@ builds, never past a refuge island.
   10 m/s the immediate target becomes the scalar itself instead of lagging it ~12 % while curvature
   builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
   Field-validated 2026-08-29 (route 00000024, "no complaints").
+- Phase 2, step 4 — the immediate target passes through a bounded reference filter and is read at a
+  scheduled preview time; the small-reversal governor is retired. `ReferenceFilter`: first-order,
+  τ = 0.1 s, and the served target may trail the model's by at most `min(0.2 m/s² / v², 3°)` — so a
+  turn-in or unwind passes at once, at its own rate, short of the raw target by no more than 3°, while
+  the 4–7° per-frame jitter of the model's target at 5–30 mph is smoothed. `PreviewScheduler`: the
+  target is read up to 2 s past the action time, one 0.25 s step per two agreeing model frames, only
+  while the model's own path stays within 0.15 m of the clothoid between the near and far targets
+  (0.20 m to keep), the far wheel angle within 1° of the near one, the path's uncertainty low, the far
+  target no jumpier than the near one, and at most 40 m ahead; two disagreeing frames, hands on the
+  wheel, a lane change or a limited target bring it back to the action time. The tracker's response
+  time grows from 0.4 s to 0.5 s with the preview. Costs +0.4 ms a frame on the device.
+  Open-loop replay on routes 00000020–24 (754k engaged frames, all `active`, no fallbacks): at 5–30 mph the served
+  target's per-frame step p95 1.1–2.1° → 0.27–0.52° and its reversals −85–92 %, never more than 3° from the model's;
+  the twelve largest low-speed turn-ins/unwinds per route pass within that bound with no far preview; the recorded
+  refuge-island event keeps the preview at the action time; on highway straights the preview is ≥ 1 s for 30–54 % of
+  the time in runs of ~2 s median (p90 11–14 s), held back mostly by gentle curvature inside the next 2 s.
 - Phase 2, cost — `model_path_targets` interpolates every query and its rate stencil in one pass per
   series (81 scalar `np.interp` calls a frame became two) and the scalar clips in `bound_target` and the
   torque tail use `min`/`max`: bit-exact (20k randomized inputs; A/A replay on routes 00000020/21/22),

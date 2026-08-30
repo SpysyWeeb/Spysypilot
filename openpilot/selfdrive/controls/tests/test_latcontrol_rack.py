@@ -24,13 +24,19 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   MAX_DRIVER_ASSIST_TORQUE,
   MEASURED_RATE_FILTER_RC_S,
   MotionLimits,
+  PathTarget,
   RackPlan,
   RackRateEstimator,
-  RackReferenceGovernor,
   RackTarget,
   RackTrajectoryController,
   model_path_targets,
-  REFERENCE_REVERSAL_RC_S,
+  PREVIEW_ADMIT_DEVIATION_M,
+  PREVIEW_LENGTHEN_UPDATES,
+  PreviewScheduler,
+  REFERENCE_FILTER_TRAIL_MAX_DEG,
+  ReferenceFilter,
+  reference_trail_limit_deg,
+  RESPONSE_TIME_PREVIEW_S,
   RESPONSE_TIME_S,
   STATUS_ACTIVE,
   STATUS_INACTIVE,
@@ -49,10 +55,6 @@ class LinearVehicleModel:
   def get_steer_from_curvature(curvature, speed, roll):
     del speed, roll
     return curvature * 10.0
-
-
-def govern_reference(governor, target, planner, model_frame, *, bypass=False):
-  return governor.update(target, planner, 1_000_000_000 + model_frame * 50_000_000, 0.01, bypass)
 
 
 def get_rack_controller(car_name=HYUNDAI.HYUNDAI_PALISADE):
@@ -79,7 +81,7 @@ def set_curvature_preview(model, action_t=0.5):
   ]
 
 
-def horizon_model(times, rates, speeds):
+def horizon_model(times, rates, speeds, path_y=None):
   message = messaging.new_message("modelV2").modelV2
   message.timestampEof = 1_000_000_000
   message.action.desiredCurvature = 0.0
@@ -87,6 +89,12 @@ def horizon_model(times, rates, speeds):
   message.orientationRate.z = rates
   message.velocity.t = times
   message.velocity.x = speeds
+  # the plan's path: driven at the plan's speed, straight unless the test says otherwise
+  message.position.t = times
+  message.position.x = [float(x) for x in np.concatenate(([0.0], np.cumsum(np.diff(times) * 0.5 * (np.array(speeds[1:]) + np.array(speeds[:-1])))))]
+  message.position.y = list(path_y) if path_y is not None else [0.0] * len(times)
+  message.position.yStd = [0.0] * len(times)
+  message.confidence = "green"  # the schema's default is red, which admits no preview
   set_curvature_preview(message)
   return message
 
@@ -125,7 +133,7 @@ class TestLatControlRack(OpenpilotTestCase):
     self.CS.vEgo = 15.0
     self.params = log.VehicleParameters.new_message()
 
-  # ---- model_path_targets / JerkLimitedRackPlanner / RackReferenceGovernor / RackRateEstimator ----
+  # ---- model_path_targets / JerkLimitedRackPlanner / ReferenceFilter / PreviewScheduler / RackRateEstimator ----
 
   def test_model_path_is_scalar_anchored_and_signed(self):
     times = [0.0, 1.0, 2.0, 3.0, 4.0]
@@ -200,49 +208,192 @@ class TestLatControlRack(OpenpilotTestCase):
     assert abs(positive.position_deg - 90.0) < 0.25
     assert abs(positive.rate_deg_s) < 1.0
 
-  def test_reference_governor_holds_and_filters_small_reversals(self):
-    planner = JerkLimitedRackPlanner(5.0)
-    governor = RackReferenceGovernor()
-    assert govern_reference(governor, RackTarget(5.0, 0.0), planner, 0) == RackTarget(5.0, 0.0)
-    assert govern_reference(governor, RackTarget(5.5, 0.0), planner, 1) == RackTarget(5.5, 0.0)
-    accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, 2)
-    for _ in range(20):
-      accepted = govern_reference(governor, RackTarget(4.9, 0.0), planner, 2)
-      assert 4.9 < accepted.position_deg < 5.5
-      assert governor.limited
+  def test_reference_filter_passes_a_large_step_within_its_bound_and_settles(self):
+    filter_ = ReferenceFilter()
+    assert filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01) == RackTarget(0.0, 0.0)
+    served = filter_.update(RackTarget(30.0, 300.0), 3.0, 0.01)
+    # the step passes at once, short of the target by the bound, at the target's own rate
+    assert math.isclose(served.position_deg, 27.0) and served.rate_deg_s == 300.0 and filter_.limited
+    for _ in range(30):
+      served = filter_.update(RackTarget(30.0, 0.0), 3.0, 0.01)
+      assert 27.0 - 1e-9 <= served.position_deg <= 30.0
+    assert abs(30.0 - served.position_deg) < 0.2 and not filter_.limited
 
-    neutral_planner = JerkLimitedRackPlanner(0.0)
-    neutral_governor = RackReferenceGovernor()
-    govern_reference(neutral_governor, RackTarget(0.0, 0.0), neutral_planner, 0)
-    govern_reference(neutral_governor, RackTarget(0.4, 0.0), neutral_planner, 1)
-    neutral_accepted = govern_reference(neutral_governor, RackTarget(-0.2, 0.0), neutral_planner, 2)
-    assert -0.2 < neutral_accepted.position_deg < 0.4
-    assert neutral_governor.limited
+  def test_reference_filter_smooths_small_jitter(self):
+    filter_ = ReferenceFilter()
+    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    served = []
+    for frame in range(400):
+      # the model's target flipping by 2 degrees every model frame, as it does at low speed
+      raw = 2.0 if (frame // 5) % 2 == 0 else -2.0
+      served.append(filter_.update(RackTarget(raw, 0.0), 3.0, 0.01).position_deg)
+    assert max(abs(value) for value in served[100:]) < 1.0
+    assert not filter_.limited
 
-  def test_reference_governor_passes_large_persistent_and_necessary_reversals(self):
-    stationary = JerkLimitedRackPlanner(5.0)
+  def test_reference_filter_bypass_and_reset(self):
+    filter_ = ReferenceFilter()
+    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    assert filter_.update(RackTarget(20.0, 0.0), 3.0, 0.01, bypass=True) == RackTarget(20.0, 0.0) and not filter_.limited
+    filter_.reset()
+    assert filter_.target is None
+    assert filter_.update(RackTarget(-5.0, 1.0), 3.0, 0.01) == RackTarget(-5.0, 1.0)
 
-    large = RackReferenceGovernor()
-    govern_reference(large, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(large, RackTarget(6.0, 0.0), stationary, 1)
-    assert govern_reference(large, RackTarget(3.0, 0.0), stationary, 2) == RackTarget(3.0, 0.0)
+  def test_reference_trail_limit_is_the_wheel_cap_at_low_speed_and_a_lateral_accel_at_speed(self):
+    assert reference_trail_limit_deg(self.VM, 5.0) == REFERENCE_FILTER_TRAIL_MAX_DEG
+    assert reference_trail_limit_deg(self.VM, 0.0) == REFERENCE_FILTER_TRAIL_MAX_DEG
+    fast = reference_trail_limit_deg(self.VM, 30.0)
+    assert 0.5 < fast < 2.0
+    assert reference_trail_limit_deg(self.VM, 20.0) > fast
 
-    persistent = RackReferenceGovernor()
-    govern_reference(persistent, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(persistent, RackTarget(5.5, 0.0), stationary, 1)
-    first = govern_reference(persistent, RackTarget(4.9, 0.0), stationary, 2)
-    accepted = first
-    for frame in (3, 4, 5):
-      accepted = govern_reference(persistent, RackTarget(4.9, 0.0), stationary, frame)
-    assert abs(accepted.position_deg - 4.9) < abs(first.position_deg - 4.9)
+  def _scheduler_targets(self, curvatures, speed):
+    return tuple(PathTarget(k, speed, math.degrees(self.VM.get_steer_from_curvature(-k, speed, 0.0)), 0.0) for k in curvatures)
 
-    necessary = RackReferenceGovernor()
-    lagging = JerkLimitedRackPlanner(5.0)
-    govern_reference(necessary, RackTarget(5.0, 0.0), lagging, 0)
-    govern_reference(necessary, RackTarget(5.5, 0.0), lagging, 1)
-    lagging.position_deg = 3.0
-    assert govern_reference(necessary, RackTarget(4.9, 0.0), lagging, 2) == RackTarget(4.9, 0.0)
-    assert not necessary.limited
+  def test_preview_scheduler_lengthens_on_a_consistent_straight_and_shortens_fast(self):
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    straight = horizon_model(times, [0.0] * 7, [20.0] * 7)
+    targets = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), 20.0)
+    scheduler = PreviewScheduler()
+    for frame in range(1, 40):
+      index = scheduler.update(straight, frame, 0.5, targets, False)
+      assert index == min(8, frame // PREVIEW_LENGTHEN_UPDATES)
+    assert scheduler.preview_s == 2.0
+    # the same model frame again decides nothing new
+    assert scheduler.update(straight, 39, 0.5, targets, False) == 8
+    # the path now jogs 1.5 m from 1.5 s on: everything past 1 s disagrees, and the preview shortens in two frames
+    jog = horizon_model(times, [0.0] * 7, [20.0] * 7, path_y=[0.0, 0.0, 0.0, 1.5, 1.5, 1.5, 1.5])
+    assert scheduler.update(jog, 40, 0.5, targets, False) == 8
+    assert scheduler.update(jog, 41, 0.5, targets, False) == 3
+    assert scheduler.preview_s == 0.75
+
+  def test_preview_scheduler_grows_through_periodic_texture(self):
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    straight = horizon_model(times, [0.0] * 7, [20.0] * 7)
+    bump = horizon_model(times, [0.0] * 7, [20.0] * 7, path_y=[0.0] * 2 + [0.3] * 5)
+    targets = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), 20.0)
+    scheduler = PreviewScheduler()
+    # every third model frame disagrees (a joint, a rumble strip): the preview still grows and never shortens
+    for frame in range(1, 40):
+      index = scheduler.update(bump if frame % 3 == 0 else straight, frame, 0.5, targets, False)
+      assert index >= min(8, (frame - frame // 3) // PREVIEW_LENGTHEN_UPDATES) - 1
+    assert scheduler.index == 8
+
+  def test_hands_and_lane_changes_pin_the_preview_through_the_controller(self):
+    for what in ("hands", "lane change"):
+      controller = RackTrajectoryController()
+      CS = car.CarState.new_message()
+      CS.vEgo = 15.0
+      params = log.VehicleParameters.new_message()
+      model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [15.0] * 7)
+      output = None
+      for frame in range(100):
+        model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+        controller.set_model(model, model.timestampEof + 30_000_000)
+        output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None and output.preview_time_s > 1.0
+      if what == "hands":
+        CS.steeringPressed = True
+      else:
+        model.meta.laneChangeState = "laneChangeStarting"
+      model.timestampEof += 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None and output.preview_time_s == 0.0
+
+  def test_full_preview_keeps_steering_without_a_farther_target(self):
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0  # 40 m of preview covers the full 2 s only below 20 m/s
+    params = log.VehicleParameters.new_message()
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [15.0] * 7)
+    for frame in range(150):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None and controller.status == STATUS_ACTIVE
+    assert output.preview_time_s == 2.0
+
+  def test_preview_scheduler_holds_inside_the_hysteresis_band(self):
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    straight = horizon_model(times, [0.0] * 7, [20.0] * 7)
+    targets = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), 20.0)
+    scheduler = PreviewScheduler()
+    for frame in range(1, 20):
+      scheduler.update(straight, frame, 0.5, targets, False)
+    assert scheduler.index == 8
+    # a deviation above the admission tolerance but below the keep tolerance keeps the preview where it is
+    wobble = horizon_model(times, [0.0] * 7, [20.0] * 7, path_y=[0.0] * 3 + [PREVIEW_ADMIT_DEVIATION_M + 0.02] * 4)
+    for frame in range(20, 30):
+      assert scheduler.update(wobble, frame, 0.5, targets, False) == 8
+    fresh = PreviewScheduler()
+    for frame in range(1, 20):
+      fresh.update(wobble, frame, 0.5, targets, False)
+    assert fresh.index == 3
+
+  def test_preview_scheduler_gates_heading_flicker_distance_hands_and_confidence(self):
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    model = horizon_model(times, [0.0] * 7, [20.0] * 7)
+    # the far target turns: admitted only as far as the heading stays within a degree of the near target
+    turning = self._scheduler_targets([0.0, 0.0, 0.0002, 0.0002, 0.001, 0.001, 0.001, 0.001, 0.001], 20.0)
+    scheduler = PreviewScheduler()
+    assert scheduler._admissible(model, 0.5, turning, tuple(t.angle_deg for t in turning)) == 3
+    # a far target that swings between model frames more than the near one is not admitted
+    steady = self._scheduler_targets([0.0] * 9, 20.0)
+    flicker = list(steady)
+    flicker[6] = PathTarget(0.0, 20.0, 1.5, 0.0)
+    scheduler = PreviewScheduler()
+    scheduler.update(model, 1, 0.5, steady, False)
+    assert scheduler._admissible(model, 0.5, tuple(flicker), tuple(t.angle_deg for t in flicker)) == 5
+    # 40 m of preview at 35 m/s is 1.14 s
+    fast = horizon_model(times, [0.0] * 7, [35.0] * 7)
+    assert PreviewScheduler()._admissible(fast, 0.5, steady, tuple(t.angle_deg for t in steady)) == 4
+    # the driver's hands pin the preview at the action time at once
+    scheduler = PreviewScheduler()
+    for frame in range(1, 20):
+      scheduler.update(model, frame, 0.5, steady, False)
+    assert scheduler.update(model, 20, 0.5, steady, True) == 0 and scheduler.preview_s == 0.0
+    # a red-confidence model admits nothing, and neither does a path with a hole in it
+    model.confidence = "red"
+    assert PreviewScheduler()._admissible(model, 0.5, steady, tuple(t.angle_deg for t in steady)) == 0
+    holed = horizon_model(times, [0.0] * 7, [20.0] * 7)
+    holed.position.y = [0.0, 0.0, math.nan, 0.0, 0.0, 0.0, 0.0]
+    assert PreviewScheduler()._admissible(holed, 0.5, steady, tuple(t.angle_deg for t in steady)) == 0
+    holed = horizon_model(times, [0.0] * 7, [20.0] * 7)
+    holed.position.yStd = [0.0, 0.0, 0.0, math.nan, 0.0, 0.0, 0.0]
+    assert PreviewScheduler()._admissible(holed, 0.5, steady, tuple(t.angle_deg for t in steady)) == 0
+
+  def test_motion_limits_carry_the_scheduled_response_time_through_a_transition(self):
+    controller = RackTrajectoryController()
+    profile = controller._limits(20.0, RESPONSE_TIME_S + RESPONSE_TIME_PREVIEW_S)
+    assert profile.response_time_s == 0.5
+    controller.planner = JerkLimitedRackPlanner(0.0, 2.0 * profile.max_rate_deg_s)
+    limits, transition = controller._motion_limits(profile)
+    assert transition and limits.response_time_s == 0.5
+
+  def test_low_speed_turn_in_and_unwind_pass_the_filter_within_its_bound(self):
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = 4.0
+    params = log.VehicleParameters.new_message()
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [4.0] * 6)
+    # a 250 degree turn-in over 3 s and its unwind, the plan's curvature still building along the horizon: the served
+    # target follows within the bound every frame and the far preview is never admitted
+    worst = 0.0
+    for frame in range(600):
+      curvature = 0.08 * min(1.0, frame / 300.0) if frame < 300 else 0.08 * max(0.0, 1.0 - (frame - 300) / 300.0)
+      slope = 0.08 / 3.0 if frame < 300 else -0.08 / 3.0
+      model.orientationRate.z = [max(0.0, curvature + slope * t) * 4.0 for t in model.orientationRate.t]
+      set_curvature_preview(model)
+      model.action.desiredCurvature = curvature
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, curvature)
+      assert output is not None
+      # while the plan is still curving no far preview is admitted; once it has straightened it may be
+      assert curvature < 0.02 or output.preview_time_s == 0.0
+      raw_angle = math.degrees(self.VM.get_steer_from_curvature(-curvature, 4.0, 0.0))
+      worst = max(worst, abs(output.target_angle_deg - raw_angle))
+    assert worst <= REFERENCE_FILTER_TRAIL_MAX_DEG + 1e-6
+    assert abs(worst - REFERENCE_FILTER_TRAIL_MAX_DEG) < 0.5
 
   def test_signed_rack_rate_handles_signed_and_unsigned_samples(self):
     estimator = RackRateEstimator(DT_CTRL)
@@ -295,11 +446,11 @@ class TestLatControlRack(OpenpilotTestCase):
     for invalid, mono_ns, expected_status in cases:
       controller = RackTrajectoryController()
       assert self._update_horizon(controller, valid) is not None
-      assert controller.planner is not None and controller.reference_governor.accepted is not None
+      assert controller.planner is not None and controller.reference_filter.target is not None
       assert self._update_horizon(controller, invalid, mono_ns) is None
       assert controller.status == expected_status
       assert controller.planner is None
-      assert controller.reference_governor.accepted is None
+      assert controller.reference_filter.target is None
       recovered = self._update_horizon(controller, valid)
       assert recovered is not None
       assert controller.status == STATUS_ACTIVE
@@ -604,7 +755,7 @@ class TestLatControlRack(OpenpilotTestCase):
     for _ in range(INACTIVE_HOLD_FRAMES):
       controller.reset()
     assert controller.rack.planner is None
-    assert controller.rack.reference_governor.accepted is None
+    assert controller.rack.reference_filter.target is None
     assert controller.rack.rack_rate_estimator.previous_angle_deg is None
     assert controller.rack.jerk_filter.x == 0.0
     assert controller.output is None
@@ -677,69 +828,7 @@ class TestLatControlRack(OpenpilotTestCase):
     assert outward_cross_center.torque == 0.0
     assert outward_at_center.torque == 0.0
 
-  def test_reference_governor_uses_constant_response_and_converges(self):
-    planner = JerkLimitedRackPlanner(5.0)
-    governor = RackReferenceGovernor()
-    target = RackTarget(4.9, 0.0)
-    assert REFERENCE_REVERSAL_RC_S == .12
-    govern_reference(governor, RackTarget(5.0, 0.0), planner, 0)
-    govern_reference(governor, RackTarget(5.5, 0.0), planner, 1)
-    alpha = .01 / (REFERENCE_REVERSAL_RC_S + .01)
-    accepted = governor.accepted
-    assert accepted is not None
-    for model_frame in range(2, 80):
-      for _ in range(5):
-        previous = accepted
-        accepted = govern_reference(governor, target, planner, model_frame)
-        assert abs(accepted.position_deg - (previous.position_deg + alpha * (target.position_deg - previous.position_deg))) < 1e-12
-    assert abs(accepted.position_deg - target.position_deg) < 1e-9
-    assert not governor.limited
-
-  def test_reference_governor_preserves_gradual_neutral_crossing_continuity(self):
-    planner = JerkLimitedRackPlanner(0.0)
-    governor = RackReferenceGovernor()
-    govern_reference(governor, RackTarget(0.0, 0.0), planner, 0)
-    accepted = govern_reference(governor, RackTarget(.4, 2.0), planner, 1)
-    maximum_step = 0.0
-    frame_positions = []
-    for model_frame, position in enumerate((.3, .2, .1, 0.0, -.1, -.2, -.3, -.4), 2):
-      for _ in range(5):
-        previous = accepted
-        accepted = govern_reference(governor, RackTarget(position, -2.0), planner, model_frame)
-        assert accepted.position_deg <= previous.position_deg
-        maximum_step = max(maximum_step, previous.position_deg - accepted.position_deg)
-      frame_positions.append(accepted.position_deg)
-    assert frame_positions[0] > 0.0 > frame_positions[-1]
-    assert maximum_step < .1
-
-  def test_reference_governor_threshold_edges_for_distance_and_rate(self):
-    stationary = JerkLimitedRackPlanner(5.0)
-
-    below_distance = RackReferenceGovernor()
-    govern_reference(below_distance, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(below_distance, RackTarget(5.5, 0.0), stationary, 1)
-    governed = govern_reference(below_distance, RackTarget(4.5001, 0.0), stationary, 2)
-    assert governed != RackTarget(4.5001, 0.0) and below_distance.limited
-
-    at_distance = RackReferenceGovernor()
-    govern_reference(at_distance, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(at_distance, RackTarget(5.5, 0.0), stationary, 1)
-    assert govern_reference(at_distance, RackTarget(4.5, 0.0), stationary, 2) == RackTarget(4.5, 0.0)
-    assert not at_distance.limited
-
-    below_rate = RackReferenceGovernor()
-    govern_reference(below_rate, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(below_rate, RackTarget(5.5, 0.0), stationary, 1)
-    assert govern_reference(below_rate, RackTarget(5.0, -4.9999), stationary, 2) != RackTarget(5.0, -4.9999)
-    assert below_rate.limited
-
-    at_rate = RackReferenceGovernor()
-    govern_reference(at_rate, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(at_rate, RackTarget(5.5, 0.0), stationary, 1)
-    assert govern_reference(at_rate, RackTarget(5.0, -5.0), stationary, 2) == RackTarget(5.0, -5.0)
-    assert not at_rate.limited
-
-  def test_reference_governor_isolates_raw_feedforward_during_a_limited_reversal(self):
+  def test_reference_filter_isolates_raw_feedforward_during_a_small_reversal(self):
     controller = RackTrajectoryController()
     controller.planner = JerkLimitedRackPlanner(5.1)
     self.CS.vEgo = 30.0
@@ -760,36 +849,14 @@ class TestLatControlRack(OpenpilotTestCase):
                                   torque_from_lateral_accel, .2, desired_curvature)
       assert output is not None
 
-    assert controller.reference_governor.limited
+    # the served target is still on its way back from the wobble: the feedforward follows the plan, not the raw target
+    assert controller.reference_filter.target is not None and controller.reference_filter.target.position_deg > 5.02
     expected_planned = -float(torque_from_lateral_accel(output.desired_lateral_accel, torque_params))
     raw_bypass = -float(torque_from_lateral_accel(output.target_curvature * self.CS.vEgo ** 2, torque_params))
-    assert abs(output.feedforward_torque - expected_planned) < 1e-9
+    assert abs(output.feedforward_torque - expected_planned) < 0.01
     assert abs(output.feedforward_torque - raw_bypass) > 1e-4
 
-  def test_reference_governor_passes_crossing_and_fast_reversals_and_bypass_recovery(self):
-    stationary = JerkLimitedRackPlanner(5.0)
-
-    crossing = RackReferenceGovernor()
-    govern_reference(crossing, RackTarget(0.0, 0.0), stationary, 0)
-    govern_reference(crossing, RackTarget(1.0, 0.0), stationary, 1)
-    assert govern_reference(crossing, RackTarget(-.1, 0.0), stationary, 2) == RackTarget(-.1, 0.0)
-    assert crossing.accepted == RackTarget(-.1, 0.0)
-
-    fast = RackReferenceGovernor()
-    govern_reference(fast, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(fast, RackTarget(5.5, 0.0), stationary, 1)
-    assert govern_reference(fast, RackTarget(5.0, -6.0), stationary, 2) == RackTarget(5.0, -6.0)
-    assert not fast.limited
-
-    recovery = RackReferenceGovernor()
-    govern_reference(recovery, RackTarget(5.0, 0.0), stationary, 0)
-    govern_reference(recovery, RackTarget(5.5, 0.0), stationary, 1)
-    govern_reference(recovery, RackTarget(4.9, 0.0), stationary, 2)
-    assert recovery.active
-    assert govern_reference(recovery, RackTarget(4.8, 0.0), stationary, 3, bypass=True) == RackTarget(4.8, 0.0)
-    assert not recovery.active and not recovery.limited and recovery.direction == 0
-
-  def test_model_wobble_is_governed_in_rack_space_at_every_speed(self):
+  def test_model_wobble_is_smoothed_in_rack_space_at_every_speed(self):
     torque_from_lateral_accel = self.CI.torque_from_lateral_accel()
     for speed in (5.0, 15.0, 30.0):
       controller = RackTrajectoryController()
@@ -799,7 +866,7 @@ class TestLatControlRack(OpenpilotTestCase):
       CS.steeringAngleDeg = 5.1
       model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [speed] * 6)
 
-      limited = []
+      served = []
       accelerations = []
       for index in range(15):
         model_frame = index // 5
@@ -811,10 +878,11 @@ class TestLatControlRack(OpenpilotTestCase):
         output = controller.update(True, CS, self.VM, self.params, self.CP.lateralTuning.torque,
                                     torque_from_lateral_accel, .2, desired_curvature)
         assert output is not None
-        limited.append(controller.reference_governor.limited)
+        served.append(output.target_angle_deg)
         accelerations.append(output.planned_acceleration_deg_s2)
 
-      assert any(limited[10:])
+      # after the wobble reverses, the served target is still between the two raw values
+      assert all(5.0 < angle < 5.5 for angle in served[10:])
       assert accelerations[9] * accelerations[10] >= 0.0
 
   def test_profile_transition_headroom_does_not_walk_outward(self):

@@ -32,6 +32,8 @@ Shape ("upstream-shaped controller"):
 - modeld publishes a short curvature preview on `ModelDataV2.Action` next to
   `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar
   (phase 2 step 3: `desiredCurvaturePreview[Times]`, 0.25 s apart from the action time to 2 s past it).
+- The immediate target passes through a bounded reference filter (R5) and is read at a scheduled
+  preview time (R2–R4) — phase 2 step 4; the small-reversal governor is gone.
 
 Layers (the input side is now explicit — see L8):
 0. Upstream inputs — `clip_curvature` (ISO 3 m/s² / 5 m/s³ clamp with its own rate state),
@@ -88,10 +90,22 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   rejects every one of the 475 island-class frames by 3–16×; the clothoid is uniformly the right
   idealization (arc p99 deviation 2.6 m vs 0.96 m). The far target moves the wheel only 0.48°
   RMS relative to the near one on admitted frames.*
+  *Phase 2 step 4 (2026-08-29): `PreviewScheduler` walks the horizon grid one step at a time; a
+  step is admitted only if (a) the model's own path samples inside `[t_action, t_action + step]`
+  lie within 0.15 m of the clothoid from the near to the far curvature (0.20 m to keep an
+  admitted step), (b) the far wheel angle is within 1° of the near one (1.33° to keep), (c) the
+  path's `yStd` stays under 0.35 m (its p99 at 2 s on straight frames) and `confidence` is not red, (d) the far target's swing since
+  the previous model frame is no larger than the near target's plus 0.25° (FM1.18), and (e) the
+  preview covers at most 40 m at the plan's own speed (FM1.8). Hands on the wheel, a lane change
+  starting or finishing, a limited immediate target or a measured curvature out of bounds pin the
+  preview at the action time at once.*
 - **R3 Shorten fast, lengthen slowly, don't starve.** `t_p` collapses to `t_action` within at
   most two consecutive failing model frames (≤100 ms ≈ 1.8 m at 40 mph); it grows back at a
   bounded rate. Growth progress is a decaying score, not reset by one isolated failing frame,
   so periodic texture (bridge joints, rumble strips) cannot pin `t_p` at `t_action`.
+  *Phase 2 step 4: the preview shortens to the largest admissible step after two consecutive
+  disagreeing model frames (≤ 100 ms) and lengthens one 0.25 s step per two agreeing frames
+  (0 → 2 s in ~0.8 s); an isolated disagreeing frame does not reset the growth count (FM1.16).*
 - **R4 The envelope bounds rate/accel/jerk, never amplitude — and opens ahead of need.** Two
   triggers open the comfort envelope: *proactive* — R2 has confirmed a real deviation ahead, so
   the envelope pre-opens to the rate the model path itself requires; *reactive* — measured
@@ -102,8 +116,25 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   which stays in place. The comfort table above ~35 mph must be re-derived: the smoothest
   possible island jog (1.5 m over 40 m) needs 25.1 °/s at 40 mph against today's 25.7 °/s cap;
   a brisker one needs 2–4×.
+  *Phase 2 step 4 implements only the response-time side: the tracker's response time is
+  scheduled from 0.4 s at the action time to 0.5 s at the full 2 s preview (`RESPONSE_TIME_PREVIEW_S`),
+  and carried through profile transitions (a branch of `_motion_limits` used to drop it). The
+  proactive and corroborated opening of the comfort envelope itself is still open: it belongs to
+  the phase-4 envelope `(headroom − H) × G`.*
 - **R5 Filtering is bounded in amplitude *and* time.** Any smoothing of the reference may
-  delay a real change by at most one model frame (50 ms).
+  hold the served target back from the model's by at most a stated amplitude, and any such
+  trailing must decay with a stated time constant; a real change always passes at once, short
+  of the raw target by no more than the amplitude bound and at the raw target's own rate.
+  *Phase 2 step 4 (2026-08-29): `ReferenceFilter` — first-order, τ = 0.10 s, bound
+  `min(0.2 m/s² / v² in wheel angle, 3°)` (the 3° cap binds below ~12 m/s, the lateral
+  acceleration above). Chosen by replaying three mechanisms on the logged targets of routes
+  00000023/22 at 2–13.5 m/s (`phase2/step4_design/filter_sim/`): a one-model-frame hold of
+  small reversals removed 6 % of the p95 step and froze the target for 20° mid-unwind (model
+  noise reverses sign inside real moves); the old governor removed nothing (its 1° / 5 °/s gates
+  sit below the jitter); the bounded-lag low-pass removed 60 % of the p95 step and 91 % of the
+  reversals with the 3° hard bound. The owner's bound: ≤ 3° in the twelve largest low-speed
+  turn-ins/unwinds, checked in replay. The reversal governor is retired; its 0.12 s constant
+  survives as `DIRECTION_GUARD_RC_S` for the direction guard's recovery ramp.*
 - **R6 No frame is ever invalid-to-zero; degrade to warm stock, not to a weaker tier.** The
   only fallback is the stock shadow (it has the integrator a scalar-only rack tier lacks).
   One staleness threshold, owned by the controller, checked against `timestampEof` **and**
@@ -126,7 +157,7 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   fallback frames, and while torqued's filtered params are moving; torqued's collection is
   down-weighted while the observer's gain is moving. Persisted state is versioned by the band
   boundaries and has a staleness bound; a maintenance reset clears both learners.
-- **R11 Measured time.** The planner, rate estimator and governor use the measured control
+- **R11 Measured time.** The planner, rate estimator and reference filter use the measured control
   `dt` (clamped), not the compile-time constant; a lag spike must not shrink a planned motion.
 - **R12 Evidence matches the layer.** Open-loop route replay grades the reference/planner
   layer only. Anything that depends on the vehicle's response to the candidate's *own* torque
@@ -204,8 +235,10 @@ red-team pass.
 - **FM1.7 — Lane change.** 3.5 m shift over 3–5 s; far point straight in the new lane. → Same
   as FM1.1; on `laneChangeStarting` shorten `t_p` — but a *nudgeless* start is provisional
   for its 0.5 s reconsideration window (see FM4.7). → Lane-change replay.
+  *Phase 2 step 4: `laneChangeStarting` and `laneChangeFinishing` pin the preview at the action time.*
 - **FM1.8 — Speed change during preview.** Braking toward a curve. → Preview in time at the
   planned speed, capped in distance (≈40 m). → Braking-into-curve replay.
+  *Phase 2 step 4: the 40 m cap integrates the plan's own speed profile.*
 - **FM1.9 — Angle-offset jumps.** paramsd re-converges; `angleOffsetDeg` steps. → Rate-limit
   the *change* of the offset's effect on the reference angle (roll excluded — FM8.3). → Step
   offset 1°: rack motion inside envelope.
@@ -239,9 +272,11 @@ red-team pass.
 - **FM1.16 — Periodic texture starves `t_p`. [v2]** Bridge joints every 15–20 m, rumble
   strips. → R3 decaying score. → 0.5–1.5 Hz periodic deviation for 30 s: time-averaged `t_p`
   above a target fraction.
+  *Phase 2 step 4: an isolated disagreeing model frame neither shortens the preview nor resets its growth count.*
 - **FM1.17 — Preview under-samples short features. [v2]** A quick jink or a narrow chicane
   shorter than the T_IDXS spacing in the 1–2 s range. → Consistency evaluated on the native
   model grid, not on a 0.25 s resample. → Synthetic 8 m chicane at 2 s: flagged inconsistent.
+  *Phase 2 step 4: the clothoid deviation is evaluated on every native path sample inside each window, not only at the grid points.*
 - **FM1.18 — The far target can be *noisier* than the near one. [measured 2026-08-29]** Highway
   speed (16–27 m/s) on two routes: `κ(2 s)` flickers across the ±0.0005 "straight" boundary from
   ordinary replan noise and the curvature→angle conversion's v² understeer term amplifies that
@@ -255,6 +290,7 @@ red-team pass.
 
 ### L2 Motion planner (virtual rack)
 
+  *Phase 2 step 4: implemented as R2(d), the far target's frame-to-frame swing gate.*
 - **FM2.1 — Virtual rack diverges from the real rack.** Driver holds, curb strike, ice, opendbc
   clipped the request. → Re-anchor when tracking error exceeds a bound **for ≥100–150 ms or
   together with driver torque** (a single-frame magnitude test misfires on speed humps and
