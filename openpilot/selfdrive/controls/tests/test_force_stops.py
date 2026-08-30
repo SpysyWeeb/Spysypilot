@@ -153,6 +153,15 @@ class TestMovingReleases:
     fs.update(obs(path_end=8.0), car_state(2.0), True, True, True)
     assert math.isclose(fs.remaining, 12.0 - 2.0 * DT_MDL - 2.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
 
+  def test_the_latched_point_follows_a_far_drifting_endpoint_while_the_model_still_calls_the_stop(self):
+    fs, _ = committed(path_end=20.0)
+    before = fs.remaining
+    fs.update(obs(path_end=60.0), car_state(10.0), True, True, True)   # 6 s out: beyond the latch window, still a stop
+    assert math.isclose(fs.remaining, before - 10.0 * DT_MDL + 3.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    before = fs.remaining
+    fs.update(obs(path_end=60.0, should_stop=False, braking=False), car_state(10.0), True, True, True)   # a green: no stop call, no extension
+    assert math.isclose(fs.remaining, before - 10.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+
 
 class TestHold:
   def test_a_hold_needs_a_commitment_or_a_recent_release(self):
