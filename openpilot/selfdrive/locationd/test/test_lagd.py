@@ -87,7 +87,7 @@ class TestLagd(OpenpilotTestCase):
         assert retrieve_initial_lag(params, CP) is None
 
   def test_rack_controller_clipped_frames_count_as_saturated(self):
-    estimator = LateralLagEstimator(get_test_car_params(), DT)
+    estimator = LateralLagEstimator(car.CarParams(), DT)  # no route needed: the flag path reads no CP fields
     # the rack arm splits the platform ceiling from its own clipping; lag estimation must skip both
     for rack, expected in (({"saturated": False, "torqueLimited": False}, False),
                            ({"saturated": True, "torqueLimited": True}, True),
