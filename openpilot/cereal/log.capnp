@@ -2369,6 +2369,50 @@ struct LateralTorqueParameters @0xe61690eb0b091692 {
   calPerc @13 :Int8;
 }
 
+# Step 3-C: Rack Effort Shadow Observer (RESO) -- log-only hold-torque (H)
+# shadow learner, selfdrive/locationd/rack_effort_observer.py. Zero torque
+# authority: nothing reads these back into carControl. See
+# docs/RACK_EFFORT_OBSERVER.md and phase3/step3c_design/shadow_learner_design.md.
+struct RackEffortFrame @0xeef1eea48520927c {
+  version @0 :UInt8;
+  runId @1 :UInt32;          # monotonic per-cell-contiguous-run counter, see RackEffortAccumulator
+  vBandIdx @2 :Int8;
+  angleBandIdx @3 :Int8;
+  latAccelBinIdx @4 :Int8;
+  direction @5 :Int8;        # -1 right, 0 center, +1 left (0.05deg deadband)
+  hMeasured @6 :Float32;     # carOutput.actuatorsOutput.torque at this frame
+  hPrior @7 :Float32;        # torqued-linear-model physics prior, extract.py's h_prior_vec
+  freezeBits @8 :UInt8;      # bit0 driverOverride, bit1 saturated, bit2 paramsMoving,
+                             # bit3 rackFallback (audit-only, non-gating in v1)
+  steeringTorqueRaw @9 :Float32;  # lets offline re-derive under either the on-device or offline cut
+  calPerc @10 :UInt8;        # lateralTorqueParameters.calPerc at this frame
+  vEgo @11 :Float32;
+}
+
+struct RackEffortSnapshot @0xcd0459f3e4061c7b {
+  version @0 :UInt8;
+  gridVersion @1 :UInt8;   # bumps only if V_BANDS/ANGLE_BANDS/bin width change
+  defVersion @2 :UInt8;    # bumps only if the mask/hPrior definition itself changes
+  epoch @3 :Int64;         # logMonoTime this snapshot was taken
+  cells @4 :List(Cell);
+
+  struct Cell {
+    vBandIdx @0 :Int8;
+    angleBandIdx @1 :Int8;
+    latAccelBinIdx @2 :Int8;
+    direction @3 :Int8;
+    biasHat @4 :Float32;      # count-capped EMA of hResidual, learner_note.md section 3
+    nEvents @5 :UInt16;
+    routeSketch @6 :List(RouteCount);  # capped ROUTE_SKETCH_CAP, a documented lower-bound sketch
+    lastUpdateMonoTime @7 :Int64;
+
+    struct RouteCount {
+      routeIdHash @0 :UInt64;
+      nEvents @1 :UInt16;
+    }
+  }
+}
+
 struct LateralDelay @0x98dfdb22c44df8d4 {
   lateralDelay @0 :Float32;
   validBlocks @1 :Int32;
@@ -2602,6 +2646,15 @@ struct Event {
     gpsLocation @21 :GpsLocationData;
     vehicleParameters @61 :VehicleParameters;
     lateralTorqueParameters @94 :LateralTorqueParameters;
+    # KNOWN MERGE COLLISION (capnp ordinals must be sequential with no holes, so this
+    # branch cannot skip ahead to dodge it): combo's log.capnp independently reused
+    # 154-157 for drivingEventRecorded/blatV2Shadow/lateralEvent/chestnutGpuState --
+    # unrelated features not yet rebased onto BLaTv3, whose own chestnutGpuState sits
+    # at @153. Per the upstream-sync convention (conflict = manual renumber at merge
+    # time, never a silent push), whichever side merges second must renumber its new
+    # fields past the other's max. See docs/RACK_EFFORT_OBSERVER.md.
+    rackEffortFrame @154 :RackEffortFrame;        # step 3-C shadow observer, log-only, see RESO
+    rackEffortSnapshot @155 :RackEffortSnapshot;  # (next free ordinals after chestnutGpuState@153)
     lateralDelay @146 : LateralDelay;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
