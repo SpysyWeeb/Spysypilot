@@ -3521,6 +3521,9 @@ struct Event {
     clocks @35 :Clocks;
     deviceState @6 :DeviceState;
     chestnutState @152 :ChestnutState;
+    # @153 is occupied by the fork's historical drivingEvent; preserve its
+    # wire meaning and append the upstream GPU state at the next free ordinal.
+    chestnutGpuState @157 :ChestnutState;
     logMessage @18 :Text;
     errorLogMessage @85 :Text;
 
