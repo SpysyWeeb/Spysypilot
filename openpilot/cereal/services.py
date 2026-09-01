@@ -42,6 +42,10 @@ _services: dict[str, tuple] = {
   "errorLogMessage": (True, 0., 1, QueueSize.BIG),
   "extrinsicsCalibration": (True, 4., 4),
   "lateralTorqueParameters": (True, 4., 1),
+  # step 3-C shadow observer: frames only on qualifying candidate frames (up to
+  # controlsState's 100 Hz, but steady dwells are sparse in practice), snapshot every 60s.
+  "rackEffortFrame": (True, 100., 1),
+  "rackEffortSnapshot": (True, 1. / 60., 1),
   "lateralDelay": (True, 4., 1),
   "blatV2Shadow": (True, 100., 10),
   "operatingSystemLog": (True, 0.),

@@ -505,6 +505,18 @@ MAX_FEEDBACK_TORQUE = .35
 TURN_IN_BLEND_DEG = 3.0  # the feedback cap blends between its two values over this much angle, not a boolean jump
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .5
+# Direction guard v2 (target-referred bounded fallback, docs/BLaTv3_FAILURE_MODES.md FM3.5/FM3.9/R7/R10):
+R7_MAX_TORQUE_STEP = .05  # existing rule bound (FM3.5: "R7 sweeps, jump < 0.05"), reused on the output verbatim
+GUARD_TORQUE_BLEND = .05  # set equal to R7_MAX_TORQUE_STEP: an opposing torque smaller than the R7 step can't
+                           # produce a meaningful "opposing push", so the sign-disagreement trip only arms above it
+GUARD_UNWIND_BLEND = .15  # ramps the old direction_fraction>=1.0 snap over the top 15% of its range instead,
+                           # matching the file's existing blend-width precedent (turn_in_fraction, rate_gain_scale)
+GUARD_FALLBACK_TORQUE_CAP = .18  # empirically derived from real 2c/2d/2e replay: the uncapped target-referred
+                                  # feedback at every historical exact-zero episode has p50=0.036, p75=0.082,
+                                  # p90=0.467, p99=3.80; 0.18 sits at ~85th percentile, resolving the dominant
+                                  # near-center regime without clipping while hard-capping the reversal-lag tail.
+                                  # Fit to the old build's zero-episode geometry, which this change eliminates --
+                                  # owner decision 2026-09-01: ship now, re-derive after the next field drive.
 STALE_MODEL_S = 0.5  # SubMaster's alive window for modelV2: ten model frames
 INACTIVE_HOLD_FRAMES = 5  # keep the planned rack through a short latActive blip, e.g. at the standstill gate
 
@@ -556,6 +568,61 @@ def horizon_candidate_preserves_immediate_path(
   return not wrong_side and position_preserved and rate_preserved
 
 
+def _direction_guard(
+  scale: float, previous_output: float | None, torque: float,
+  planned_angle: float, target_angle: float, measured_angle: float, direction_fraction: float,
+  dt: float, gain: float, lateral_accel_per_degree: float, torque_params,
+  torque_from_lateral_accel: Callable[[float, object], float],
+) -> tuple[float, float, bool]:
+  """Direction guard v2 (target-referred bounded fallback). Replaces the old zero-attractor scale
+  (torque *= direction_guard_scale, snapping to a raw_torque==0 special case at measured_angle==0,
+  FM3.9) with a continuous mix toward a capped, target-referred fallback -- "the model wins,
+  bounded" -- built from the file's own torque_from_lateral_accel machinery, re-pointed at the
+  served target instead of the plan. `scale` is a mix weight (0 = no conflict, 1 = full fallback)
+  low-passed at DIRECTION_GUARD_RC_S toward a continuous conflict signal (fuzzy-OR of the straddle
+  and full-unwind trips, each a ramp over TURN_IN_BLEND_DEG/GUARD_TORQUE_BLEND/GUARD_UNWIND_BLEND
+  instead of a boolean). R7 (FM3.5: "rule boundaries are continuous, jump < 0.05") is enforced
+  algebraically on the resultant *output* against the previous frame's output, but ONLY while this
+  guard itself is blending (mix > 0) -- R7 bounds the discontinuity this rule's own transition could
+  introduce, it is not a general-purpose rate limiter on every torque change the controller ever
+  makes. Gating it on `mix` (rather than applying it unconditionally) is what keeps the mandatory
+  "bit-identical outside conflict" replay invariant true: outside a conflict mix is exactly 0, so
+  guarded_torque == torque bit-for-bit and there is nothing for R7 to clamp. `previous_output` is
+  supplied by the caller and should be the torque actually committed on the previous frame -- this
+  function only reads it, it does not own persisting the controller's R7 baseline (the caller must
+  latch that from its own final, post-downstream-clip torque, not from this function's return, so a
+  saturated frame elsewhere in the pipeline can't leave a phantom baseline behind). Returns
+  (guarded_torque, new_scale, direction_guarded)."""
+  toward = math.copysign(1.0, target_angle) if target_angle != 0.0 else 0.0
+  # reference_conflict: degrees the plan sits past zero on the wrong side of target, ramped over
+  # TURN_IN_BLEND_DEG (reused, not a new width) -- continuous form of planned_angle*target_angle<0
+  reference_conflict = min(max(-planned_angle * toward / TURN_IN_BLEND_DEG, 0.0), 1.0)
+  torque_away_from_target = min(max(-torque * toward / GUARD_TORQUE_BLEND, 0.0), 1.0)
+  straddle_conflict = reference_conflict * torque_away_from_target
+
+  measured_sign = math.copysign(1.0, measured_angle) if measured_angle != 0.0 else 0.0
+  unwind_progress = _smoothstep(direction_fraction, 1.0 - GUARD_UNWIND_BLEND, 1.0)
+  torque_deepens_unwind = min(max(torque * measured_sign / GUARD_TORQUE_BLEND, 0.0), 1.0)
+  unwind_conflict = unwind_progress * torque_deepens_unwind
+
+  guard_conflict = max(straddle_conflict, unwind_conflict)  # continuous OR, replaces `or`
+
+  raw_target_feedback = -float(torque_from_lateral_accel(
+    gain * lateral_accel_per_degree * (target_angle - measured_angle), torque_params,
+  ))
+  bounded_target_feedback = min(max(raw_target_feedback, -GUARD_FALLBACK_TORQUE_CAP), GUARD_FALLBACK_TORQUE_CAP)
+  assert GUARD_FALLBACK_TORQUE_CAP < MAX_FEEDBACK_TORQUE  # R10: checked, not implicit
+
+  new_scale = scale + min(max(guard_conflict - scale, -dt / DIRECTION_GUARD_RC_S), dt / DIRECTION_GUARD_RC_S)
+  mix = min(max(new_scale, 0.0), 1.0)
+  guarded_torque = torque * (1.0 - mix) + bounded_target_feedback * mix
+
+  if previous_output is not None and mix > 0.0:  # R7 on the OUTPUT, scoped to this rule's own blend
+    guarded_torque = min(max(guarded_torque, previous_output - R7_MAX_TORQUE_STEP), previous_output + R7_MAX_TORQUE_STEP)
+
+  return guarded_torque, new_scale, guarded_torque != torque
+
+
 class RackTrajectoryController:
   def __init__(self, dt: float = DT) -> None:
     self.dt = dt
@@ -567,7 +634,8 @@ class RackTrajectoryController:
     self.transition_rate_limit: float | None = None
     self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
-    self.direction_guard_scale = 1.0
+    self.direction_guard_scale = 0.0  # v2: a mix weight (0 = no conflict), not a survival scale
+    self.previous_output_torque: float | None = None  # R7 baseline; None on a fresh engage (not a rule boundary)
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_filter = ReferenceFilter()
@@ -594,7 +662,8 @@ class RackTrajectoryController:
     self.transition_rate_limit = None
     self.transition_acceleration_limit = None
     self.previous_planned_lateral_accel = None
-    self.direction_guard_scale = 1.0
+    self.direction_guard_scale = 0.0
+    self.previous_output_torque = None  # a fresh engage is not a rule boundary (R7); re-seeds freely
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_filter.reset()
@@ -897,9 +966,8 @@ class RackTrajectoryController:
     feedback = min(max(raw_feedback, feedback_lower), feedback_upper)
     feedback_limited = feedback != raw_feedback
     raw_torque = feedforward_torque + feedback
-    if (measured_angle == 0.0 and planned_angle * intended_angle > 0.0
-        and raw_torque * planned_angle < 0.0):
-      raw_torque = 0.0
+    # FM3.9 retired: the old measured_angle==0.0 exact-zero special case is now covered by the
+    # continuous direction guard below -- a target-referred bounded fallback, not a zero spike.
     # The phase-3 slew-aware early release is RETIRED: in the field (route 2d, six owner bookmarks)
     # it latched during ordinary sustained curves -- the rate-flip test reads a visible curve exit as
     # a coming reversal, entry opened at benign wheel-past-target tracking dither, and the latch had
@@ -911,16 +979,13 @@ class RackTrajectoryController:
     early_release = False
     torque = min(max(raw_torque, -1.0), 1.0)
     platform_saturated = torque != raw_torque
-    # torque with no defense ramps out: pushing opposite a plan and target on the other side, or pushing
-    # the wheel further out when neither the plan nor the commanded motion holds any of the current angle
-    if ((planned_angle * target_angle < 0.0 and torque * target_angle < 0.0)
-        or (direction_fraction >= 1.0 and torque * measured_angle > 0.0)):
-      self.direction_guard_scale = max(0.0, self.direction_guard_scale - self.dt / DIRECTION_GUARD_RC_S)
-    else:
-      self.direction_guard_scale = min(1.0, self.direction_guard_scale + self.dt / DIRECTION_GUARD_RC_S)
-    guarded_torque = torque * self.direction_guard_scale
-    direction_guarded = guarded_torque != torque
-    torque = guarded_torque
+    # Direction guard v2: continuously blends torque toward a capped, target-referred fallback
+    # instead of scaling it toward zero (FM3.5/FM3.9/R7/R10; docs/BLaTv3_FAILURE_MODES.md).
+    torque, self.direction_guard_scale, direction_guarded = _direction_guard(
+      self.direction_guard_scale, self.previous_output_torque, torque,
+      planned_angle, target_angle, measured_angle, direction_fraction,
+      self.dt, gain, lateral_accel_per_degree, torque_params, torque_from_lateral_accel,
+    )
     motion_limited = (
       plan.rate_limited or plan.acceleration_limited or plan.jerk_limited
       or measured_out_of_bounds or planned_out_of_bounds or self.reference_filter.limited
@@ -936,6 +1001,10 @@ class RackTrajectoryController:
       assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
       driver_assist_limited = assisted_torque != torque
       torque = assisted_torque
+    # R7's baseline is the torque actually committed this frame, taken after the driver-assist clip
+    # -- not the guard's own pre-clip value -- so a saturated hand-off can't leave a phantom-high
+    # baseline that forces an unwanted high-torque hold the instant the driver releases the wheel.
+    self.previous_output_torque = torque
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
       torque=torque,

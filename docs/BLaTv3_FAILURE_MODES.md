@@ -356,6 +356,30 @@ red-team pass.
   `test_direction_guard_ramps_down_not_snaps`). A flickering guard condition holds the scale mid-way
   instead of draining — accepted: the condition only flickers while the pre-guard torque crosses zero,
   where there is nothing worth suppressing.*
+  *Phase 3 step 4 (2026-09-01, direction guard v2 — target-referred bounded fallback): the guard no
+  longer drains toward zero — `direction_guard_scale` is repurposed from a survival scale into a mix
+  weight blending torque toward a capped, target-referred fallback, and the two boolean trip
+  conditions become continuous conflict fractions (fuzzy-OR via `max()`). R7 is now enforced
+  algebraically on the output itself against the previous frame's output
+  (`GUARD_FALLBACK_TORQUE_CAP` = 0.18, re-derive after the next drive), closing the scale-step ×
+  torque gap this same phase's replay measured. `test_direction_guard_ramps_down_not_snaps` is
+  replaced by `test_direction_guard_output_step_is_bounded_across_torque_magnitudes` plus the
+  `test_guard_*` suite (conflict continuity through sign singularities, bit-identity outside
+  conflict, target-following, no rate term, R10's cap invariant, R10's never-widen-authority bound).*
+  *Reconcile pass (2026-09-01): the first cut applied R7's output clamp unconditionally, every
+  frame, regardless of whether this guard was actually blending -- breaking the mandatory
+  bit-identical-outside-conflict replay gate on an ordinary large torque swing with no direction
+  conflict, and mislabeling `direction_guarded` on frames the guard never touched. Fixed by gating
+  the clamp on `mix > 0` (R7 bounds this rule's own transition, not every torque change the
+  controller makes -- see `test_guard_r7_inert_outside_conflict_even_across_a_large_torque_jump`).
+  Separately, `previous_output_torque` was latched from the guard's pre-driver-assist-clip value;
+  a saturated driver hand-off could then leave a phantom-high R7 baseline that forced an unwanted
+  torque hold the instant the driver released the wheel. Fixed by latching it from the actual
+  post-clip committed torque in `update()` instead. The never-widens-authority bound (R10) is
+  confirmed NOT unconditional once R7 is active against a stale baseline -- see
+  `test_guard_authority_decays_at_the_r7_rate_with_a_stale_baseline`, an accepted trade-off (R7
+  continuity over instant suppression), now pinned by a test instead of an unqualified "always"
+  claim.*
 - **FM3.6 — Saturation semantics.** *Three consumers read one flag: the driver alert (via
   `curvature_limited` too), lagd's data-quality gate, R4.* → Separate signals:
   `saturated` = platform limit; `feedbackLimited` distinct; `curvature_limited` handled
@@ -370,6 +394,12 @@ red-team pass.
   reversal. → Rate from the angle derivative, magnitude as validity; invalid until two
   consistent ticks. → No wrong-sign valid samples.
 - **FM3.9 — Zero-crossing special cases.** → None; continuous through zero.
+  *Phase 3 step 4 (2026-09-01): the last exact-zero special case (`measured_angle == 0.0` forcing
+  `raw_torque = 0.0`, just above the direction guard) is deleted — direction guard v2's continuous
+  conflict fractions cover the boundary without a discontinuous branch.
+  `test_unwind_feedforward_releases_hold_torque_continuously`'s old zero-crossing fixture now
+  asserts a nonzero, continuous output (swept on both sides of `measured_angle == 0.0`) instead of
+  the old exact-zero spike.*
 - **FM3.10 — Feedback authority is exactly zero at standstill. [v2]** SOL engaged while
   stopped with the wheel off-center; first creeping frames. *`lateral_accel_per_degree =
   curvature_per_degree × vEgo²` with raw vEgo → gain 0 at v = 0.* → Feedback in angle space
