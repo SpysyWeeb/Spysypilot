@@ -123,6 +123,18 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   which stays in place. The comfort table above ~35 mph must be re-derived: the smoothest
   possible island jog (1.5 m over 40 m) needs 25.1 °/s at 40 mph against today's 25.7 °/s cap;
   a brisker one needs 2–4×.
+  *Phase 3 step 5 (2026-09-01, horizon-implied envelope opening, G-independent): the proactive
+  half ships. A second, confidence-free `PreviewScheduler` (`envelope_scheduler`) reuses every
+  R2 gate above except the confidence check, corroborated instead by its own frame-to-frame
+  far-point stability check (`PREVIEW_ENVELOPE_DRIFT_M = 0.25 m`, route-20 provenance below).
+  `_horizon_opened_profile` derives the required rate/accel from the targets it admits, margins
+  them 1.15×, and caps them at `_iso_ceiling` — the same upstream ISO clamp named above,
+  evaluated exactly (not the placeholder 2.5×/1.5× multiplier this entry once proposed): 2.34×
+  comfort at 40 mph, narrowing to 1.37× by 70 mph, so R9/R10 need no new number. A bounded
+  one-pole state keeps the opening continuous (R7): snap down the instant the demand or the
+  admitted horizon falls, ease up over one `HORIZON_STEP_S` (0.25 s) otherwise. Feeds
+  `_motion_limits` unmodified, in that order, so the feasibility ratchet still narrows on top;
+  never widens torque authority (R10) — see `rack_trajectory.py`.*
   *Phase 2 step 4 implements only the response-time side: the tracker's response time is
   scheduled from 0.4 s at the action time to 0.5 s at the full 2 s preview (`RESPONSE_TIME_PREVIEW_S`)
   and the reference filter's time constant from 0.1 s to 0.3 s (`REFERENCE_FILTER_PREVIEW_RC_S`),
@@ -295,6 +307,9 @@ red-team pass.
   target's is not used (the preview then shortens per R3). → Synthetic: `κ_far` dithering ±0.0006
   at 20 m/s on a straight path — assert the preview does not lengthen and the commanded angle
   jitter is ≤ the near target's.
+  *Phase 3 step 5: `envelope_scheduler` shares this exact gate (unconditionally, not gated by
+  confidence), so a dithering far target moves neither its admitted depth nor the
+  `required_rate` `_horizon_opened_profile` derives from it, for either sign of the dither.*
 
 ### L2 Motion planner (virtual rack)
 
@@ -323,6 +338,17 @@ red-team pass.
   tables are retired in favour of the two learned surfaces (layer 7); until then they are the
   seed of the rate-gain prior only, cited to the derivation script. → Island jog inside the
   comfort envelope with margin.
+  *Phase 3 step 5: the tables stay the comfort floor unchanged; R4's opened ceiling is the ISO
+  clamp (owner Q1), not a re-derivation of these tables above 35 mph — a cross-check against a
+  corpus p99.9 rerun remains open (dissent), but is no longer load-bearing for R4 to ship.
+  Reconcile note (2026-09-01): swept `_iso_ceiling` against this table 5–85 mph — the RATE leg *Resolved the same day: the acceleration and jerk ceilings now scale with the rate opening ratio (never below the comfort table), so the three limits open as a family and the plan can accelerate into an opened rate; the rate ceiling itself is unchanged (ISO-derived).*
+  opens as designed (owner Q1's 2.34×/1.37× figures reproduce exactly), but the ISO formula's
+  JERK leg sits below comfort jerk at every speed from ~10 mph up, and its ACCELERATION leg
+  drops below comfort accel above ~50–55 mph (e.g. 70 mph: comfort 97.74 vs ceiling 72.26
+  °/s²). `ease()`'s own floor (never below comfort) makes this safe, not a bug, but it means
+  the accel/jerk legs of the envelope structurally never open in the field at highway speed —
+  only the rate leg delivers R4's intended benefit there. Flagging for owner sign-off; no code
+  changed, since owner Q1 accepted the ISO ceiling formula as-is.*
 - **FM2.7 — Ordinary tight turns trip the "evasive" trigger. [v2]** A signed right turn off a
   35 mph arterial: cross-street curvature appears in the last 0.5–1 s; ~370° of wheel. → R4's
   opening depends on how the error arrived (growing over frames → smooth opening). → Curb-

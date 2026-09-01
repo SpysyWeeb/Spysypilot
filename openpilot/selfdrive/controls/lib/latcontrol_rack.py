@@ -124,6 +124,10 @@ class LatControlRack(LatControl):
     rack_log.driverAssistCap = float(output.driver_assist_cap)
     rack_log.earlyRelease = bool(output.early_release)
     rack_log.directionFraction = float(output.direction_fraction)
+    rack_log.envelopeRateDegS = float(output.envelope_open_rate_deg_s)
+    rack_log.envelopeAccelerationDegS2 = float(output.envelope_open_acceleration_deg_s2)
+    rack_log.envelopeJerkDegS3 = float(output.envelope_open_jerk_deg_s3)
+    rack_log.envelopePreviewTime = float(output.envelope_preview_time_s)
     rack_log.saturated = bool(self._check_saturation(output.saturated or self.steer_max - abs(output.torque) < 1e-3, CS,
                                                      steer_limited_by_safety, curvature_limited))
     self.torque.sat_time = self.sat_time

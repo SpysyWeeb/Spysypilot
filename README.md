@@ -49,6 +49,21 @@ builds, never past a refuge island.
   does not. The stock controller is stepped every frame so its request buffer and jerk filter follow
   the live history and the two share one saturation timer; as in BLaTv2, its integrator starts clean
   when it takes over. Logs into `lateralControlState.rackState`.
+- Phase 3, step 5 — horizon-implied envelope opening (R4, G-independent): a second,
+  confidence-free `PreviewScheduler` (`envelope_scheduler`) reuses every R2 gate except the
+  confidence check, corroborated instead by its own frame-to-frame far-point stability check
+  (`PREVIEW_ENVELOPE_DRIFT_M = 0.25 m`, from route 20's near/far swing decode: the 2 s point
+  swings 0.2-2.0 m through the island window while the 1 s point stays 0.03-0.25 m). The admitted
+  horizon's own implied rate/acceleration, margined 1.15×, is capped at the upstream ISO clamp
+  evaluated exactly with the real VM (2.34× comfort at 40 mph, narrowing to 1.37× by 70 mph — no
+  corpus re-derivation needed) through a bounded one-pole state that snaps shut the instant the
+  demand or the admitted horizon falls and eases open over one horizon step (0.25 s) otherwise;
+  feeds `_motion_limits` unmodified, so the feasibility ratchet still narrows on top and torque
+  authority is untouched (R10). Logs `envelopeRateDegS`/`AccelerationDegS2`/`JerkDegS3`/`PreviewTime`
+  into `rackState`. Nine new unit tests (confidence independence, the opening/collapse continuity
+  sweep, the drift-graft rejection, FM1.18 dither immunity, forced-zero parity, the R10
+  architectural check, the call-order regression, and an island-jog walkthrough) join the 68
+  carried over unchanged. Replay validation against the field routes is pending.
 - Phase 2, step 2 — a dropped or invalid model frame keeps the last good plan (the reference already
   advances along it by its age); a model is stale only past SubMaster's 0.5 s alive window instead of a
   private 0.2 s; once stock has taken over it keeps steering for 0.5 s before the rack re-seeds and

@@ -1,3 +1,5 @@
+import ast
+import inspect
 import math
 
 import numpy as np
@@ -15,15 +17,20 @@ from openpilot.selfdrive.controls.lib.drive_helpers import MAX_LATERAL_ACCEL_NO_
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.latcontrol_rack import FALLBACK_HOLD_S, LatControlRack
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
+  _arc_y,
+  _clothoid_y,
   _direction_guard,
   _driver_assist_envelope,
   _smoothstep,
   DriverAssistLimits,
   DRIVER_ASSIST_CEILING,
+  ENVELOPE_EASE_UP_RC_S,
+  ENVELOPE_OPEN_MARGIN,
   GUARD_FALLBACK_TORQUE_CAP,
   HORIZON_ACCELERATION_BLEND,
   HORIZON_OFFSETS_S,
   HORIZON_POSITION_TOLERANCE_DEG,
+  HORIZON_S,
   horizon_candidate_preserves_immediate_path,
   horizon_desired_acceleration,
   JerkLimitedRackPlanner,
@@ -32,6 +39,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   MEASURED_RATE_FILTER_RC_S,
   MotionLimits,
   PathTarget,
+  PREVIEW_ENVELOPE_DRIFT_M,
   R7_MAX_TORQUE_STEP,
   RackPlan,
   RackRateEstimator,
@@ -1654,3 +1662,383 @@ class TestLatControlRack(OpenpilotTestCase):
       assert abs(mechanism_1) > 1e-6 and abs(mechanism_2) > 1e-6
       assert mechanism_1 * mechanism_2 < 0.0
       assert 1.0 / 30.0 < abs(mechanism_1) / abs(mechanism_2) < 30.0
+
+  # ---- R4 horizon-implied envelope opening (G-independent), docs/BLaTv3_FAILURE_MODES.md ----
+
+  def test_envelope_scheduler_confidence_independent(self):
+    # tests_required item 1: red confidence must not stop the envelope scheduler, only preview_scheduler.
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [15.0] * 7)
+    model.confidence = "red"
+    output = None
+    for frame in range(150):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
+                                  self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None
+    assert controller.preview_scheduler.index == 0  # confidence red: unaffected, still closed
+    assert controller.envelope_scheduler.index > 0  # R4: confidence-free, opens on the same clean straight
+
+  def test_envelope_opening_sweep_is_bounded_except_on_snap_down(self):
+    # tests_required item 2(a): g_env ramps 0->8->8->0 with a discontinuous required_rate jump at
+    # the very first admit boundary (index 1), well past the ISO ceiling once fully open; assert
+    # every per-frame change in the eased rate/accel/jerk is bounded by the one-pole's own step
+    # except exactly where g_env==0 or the raw demand doesn't increase (a permitted snap-down).
+    controller = RackTrajectoryController()
+    speed = 15.0
+    comfort = controller._limits(speed)
+    ceiling = controller._iso_ceiling(speed, self.VM, 0.0, comfort)
+    assert ceiling.max_rate_deg_s > comfort.max_rate_deg_s  # owner Q1: the ceiling clears comfort here
+    demand = ceiling.max_rate_deg_s * 3.0  # deliberately past the ceiling once admitted
+
+    def targets_for(g_env):
+      return tuple(PathTarget(0.0, speed, 0.0, demand if i == max(g_env, 0) else 0.0)
+                   for i in range(len(HORIZON_OFFSETS_S)))
+
+    schedule = [0] * 3 + list(range(1, 9)) + [8] * 40 + list(range(7, -1, -1)) + [0] * 3
+    alpha_bound = controller.dt / (ENVELOPE_EASE_UP_RC_S + controller.dt)
+    max_increase_bound = alpha_bound * (ceiling.max_rate_deg_s - comfort.max_rate_deg_s) + 1e-6
+    previous = None
+    for g_env in schedule:
+      # targets is ignored entirely by _horizon_opened_profile when g_env == 0 (comfort floor)
+      targets = targets_for(g_env)
+      profile = controller._horizon_opened_profile(comfort, targets, g_env, ceiling)
+      assert comfort.max_rate_deg_s - 1e-9 <= profile.max_rate_deg_s <= ceiling.max_rate_deg_s + 1e-9
+      if previous is not None:
+        snap_case = g_env == 0 or profile.max_rate_deg_s <= previous.max_rate_deg_s
+        if not snap_case:
+          assert profile.max_rate_deg_s - previous.max_rate_deg_s <= max_increase_bound
+      previous = profile
+    assert previous is not None
+    assert math.isclose(previous.max_rate_deg_s, comfort.max_rate_deg_s, abs_tol=1e-6)  # ends closed
+
+  def test_envelope_opening_and_collapse_is_torque_continuous_through_the_pipeline(self):
+    # tests_required item 2(b): drive the REAL update() pipeline through a consistent curvature
+    # buildup (confidence forced red to isolate R4's authority from preview_scheduler) so g_env
+    # ramps up through a real admit boundary, then force an immediate g_env collapse
+    # (steeringPressed) while still open; every per-frame torque step stays within R7's bound,
+    # including exactly at the admit-growth frames and the forced-drop frame.
+    speed = 15.0
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = speed
+    params = log.VehicleParameters.new_message()
+    times = [0.0, .5, 1.0, 1.5, 2.0, 2.5]
+    force_frame = None
+    previous_torque = None
+    saw_open_index = False
+    for frame in range(260):
+      build = min(1.0, frame / 120.0)
+      peak_curvature = 0.01 * build
+      rates = [peak_curvature * speed * (t / 2.5) for t in times]
+      model = horizon_model(times, rates, [speed] * len(times))
+      model.confidence = "red"
+      model.timestampEof = 1_000_000_000 + frame * 10_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      CS.steeringPressed = force_frame is not None and frame == force_frame
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
+                                  self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None
+      saw_open_index = saw_open_index or controller.envelope_scheduler.index > 0
+      if previous_torque is not None:
+        assert abs(output.torque - previous_torque) <= R7_MAX_TORQUE_STEP + 1e-9
+      previous_torque = output.torque
+      if force_frame is None and controller.envelope_scheduler.index >= 4:
+        force_frame = frame + 3  # force the collapse a few frames after a real admit depth
+    assert saw_open_index and force_frame is not None
+
+  def test_envelope_dcpc_graft_rejects_a_temporally_jittering_far_prediction(self):
+    # tests_required item 3: a far Y that would pass the existing clothoid/heading gates alone
+    # (each frame is internally a perfect constant-curvature arc) must still be rejected once its
+    # ABSOLUTE position swings more than PREVIEW_ENVELOPE_DRIFT_M between consecutive model frames.
+    speed = 15.0
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    xs = np.array([speed * t for t in times])
+    action_t = 0.5
+
+    def targets_for(k):
+      angle = math.degrees(self.VM.get_steer_from_curvature(-k, speed, 0.0))
+      return tuple(PathTarget(k, speed, angle, 0.0) for _ in range(len(HORIZON_OFFSETS_S)))
+
+    def message_for(k):
+      message = horizon_model(times, [0.0] * len(times), [speed] * len(times))
+      message.position.x = [float(x) for x in xs]
+      message.position.y = [float(y) for y in _arc_y(k, xs)]
+      return message
+
+    k1, k2 = 0.0, 0.00045  # a curvature shift small enough to be a plausible replan wobble
+    m1, m2 = message_for(k1), message_for(k2)
+    t1, t2 = targets_for(k1), targets_for(k2)
+    far_index = len(HORIZON_OFFSETS_S) - 1
+    far_time = action_t + HORIZON_OFFSETS_S[far_index]
+    drift = abs(float(np.interp(far_time, times, m2.position.y)) - float(np.interp(far_time, times, m1.position.y)))
+    assert drift > PREVIEW_ENVELOPE_DRIFT_M  # the fixture actually exercises the gate
+
+    plain = PreviewScheduler(require_confidence=True)  # confidence green: geometry alone decides
+    plain.update(m1, 1, action_t, t1, False)
+    plain_admitted = plain._admissible(m2, action_t, t2, tuple(t.angle_deg for t in t2))
+    assert plain_admitted == far_index  # would pass the existing clothoid/heading gates alone
+
+    envelope = PreviewScheduler(require_confidence=False)
+    envelope.update(m1, 1, action_t, t1, False)
+    envelope_admitted = envelope._admissible(m2, action_t, t2, tuple(t.angle_deg for t in t2))
+    assert envelope_admitted < plain_admitted  # DCPC graft: the swinging far end is not trusted
+
+  def test_envelope_dcpc_baseline_clears_across_a_malformed_or_forced_frame(self):
+    # Reconcile regression: previous_far_y (the DCPC-graft baseline above) must not survive an
+    # early return inside _admissible (the pre-existing NaN/length-mismatch guard) or a forced
+    # frame in update() (which skips calling _admissible at all) -- either gap must leave
+    # previous_far_y back at None, exactly like the scheduler's first-ever frame, so a resumed good
+    # frame is never silently compared against a baseline from before the gap. previous_angles has
+    # no such hole (update() always refreshes it unconditionally); this pins the same guarantee for
+    # previous_far_y.
+    speed = 15.0
+    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    xs = np.array([speed * t for t in times])
+    action_t = 0.5
+
+    def targets_for(k):
+      angle = math.degrees(self.VM.get_steer_from_curvature(-k, speed, 0.0))
+      return tuple(PathTarget(k, speed, angle, 0.0) for _ in range(len(HORIZON_OFFSETS_S)))
+
+    def message_for(k):
+      message = horizon_model(times, [0.0] * len(times), [speed] * len(times))
+      message.position.x = [float(x) for x in xs]
+      message.position.y = [float(y) for y in _arc_y(k, xs)]
+      return message
+
+    k1, k2 = 0.0, 0.00045  # the same drift-inducing pair as the DCPC-graft test above
+    m1, t1 = message_for(k1), targets_for(k1)
+    m2, t2 = message_for(k2), targets_for(k2)
+    angles2 = tuple(t.angle_deg for t in t2)
+    far_index = len(HORIZON_OFFSETS_S) - 1
+
+    holed = message_for(k1)
+    holed_y = list(holed.position.y)
+    holed_y[2] = math.nan  # trips the pre-existing finiteness guard, not the DCPC check itself
+    holed.position.y = holed_y
+
+    # baseline: a real m1 immediately before m2 -- DCPC actively rejects the swinging far end
+    direct = PreviewScheduler(require_confidence=False)
+    direct.update(m1, 1, action_t, t1, False)
+    direct_admitted = direct._admissible(m2, action_t, t2, angles2)
+    assert direct_admitted < far_index
+
+    # a malformed frame between them: _admissible returns 0 early and must drop the baseline
+    gapped = PreviewScheduler(require_confidence=False)
+    gapped.update(m1, 1, action_t, t1, False)
+    gapped.update(holed, 2, action_t, t1, False)
+    assert gapped.previous_far_y is None  # the fix -- pre-fix this was still m1's far_y tuple
+    gapped_admitted = gapped._admissible(m2, action_t, t2, angles2)
+    # with no baseline to compare against, DCPC defers entirely to the other gates (same
+    # previous_angles state as `direct` above), which is exactly what confidence-gated PreviewScheduler
+    # already does for this pair -- i.e. full admission, not a stale-vs-m1 verdict either way
+    assert gapped_admitted == far_index
+
+    # a forced frame (hands/lane-change) skips _admissible outright -- same fix, other call site
+    forced = PreviewScheduler(require_confidence=False)
+    forced.update(m1, 1, action_t, t1, False)
+    forced.update(m1, 2, action_t, t1, True)
+    assert forced.previous_far_y is None
+
+  def test_envelope_far_curvature_dither_does_not_move_g_env_or_required_rate(self):
+    # tests_required item 4 (FM1.18): kappa_far dithering +-0.0006 at 20 m/s must not move the
+    # admitted depth or the required_rate it implies for either sign of the dither.
+    speed = 20.0
+    model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [speed] * 7)
+    steady = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), speed)
+
+    def dithered(sign):
+      curvatures = [0.0] * len(HORIZON_OFFSETS_S)
+      curvatures[-1] = sign * 0.0006
+      return self._scheduler_targets(curvatures, speed)
+
+    def admitted_for(sign):
+      scheduler = PreviewScheduler(require_confidence=False)
+      scheduler.update(model, 1, 0.5, steady, False)
+      targets = dithered(sign)
+      return scheduler._admissible(model, 0.5, targets, tuple(t.angle_deg for t in targets)), targets
+
+    idx_plus, targets_plus = admitted_for(1.0)
+    idx_minus, targets_minus = admitted_for(-1.0)
+    far_index = len(HORIZON_OFFSETS_S) - 1
+    assert idx_plus == idx_minus < far_index  # the dithering far step itself is never admitted
+
+    controller = RackTrajectoryController()
+    comfort = controller._limits(speed)
+    ceiling = controller._iso_ceiling(speed, self.VM, 0.0, comfort)
+    profile_plus = controller._horizon_opened_profile(comfort, targets_plus, idx_plus, ceiling)
+    profile_minus = RackTrajectoryController()._horizon_opened_profile(comfort, targets_minus, idx_minus, ceiling)
+    assert profile_plus.max_rate_deg_s == profile_minus.max_rate_deg_s  # required_rate reads only the admitted prefix
+
+  def test_envelope_forced_zero_parity_with_preview_scheduler(self):
+    # tests_required item 5: steeringPressed/lane-change zero envelope_scheduler.index and snap
+    # envelope_open_* back to comfort the same frame preview_scheduler is zeroed.
+    for what in ("hands", "lane change"):
+      controller = RackTrajectoryController()
+      CS = car.CarState.new_message()
+      CS.vEgo = 15.0
+      params = log.VehicleParameters.new_message()
+      model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [15.0] * 7)
+      output = None
+      for frame in range(100):
+        model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+        controller.set_model(model, model.timestampEof + 30_000_000)
+        output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
+                                    self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None and output.preview_time_s > 1.0 and controller.envelope_scheduler.index > 0
+      comfort = RackTrajectoryController._limits(CS.vEgo)
+      if what == "hands":
+        CS.steeringPressed = True
+      else:
+        model.meta.laneChangeState = "laneChangeStarting"
+      model.timestampEof += 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
+                                  self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None and output.preview_time_s == 0.0
+      assert controller.envelope_scheduler.index == 0
+      assert output.envelope_preview_time_s == 0.0
+      assert output.envelope_open_rate_deg_s == comfort.max_rate_deg_s
+      assert output.envelope_open_acceleration_deg_s2 == comfort.max_acceleration_deg_s2
+      assert output.envelope_open_jerk_deg_s3 == comfort.max_jerk_deg_s3
+
+  def test_envelope_functions_never_touch_torque_authority(self):
+    # tests_required item 6 (R10 architectural check): _iso_ceiling/_horizon_opened_profile widen
+    # only the planner's motion limits (rate/accel/jerk in degrees), never anything torque-shaped;
+    # confirmed structurally so a future edit can't quietly wire one into the other. The platform
+    # authority numbers themselves (409/+4/-7) are the opendbc fork's own golden test
+    # (opendbc/car/hyundai/tests/test_hyundai.py::test_blatv2_high_limits, unaffected by this file).
+    import openpilot.selfdrive.controls.lib.rack_trajectory as rack_trajectory_module
+    tree = ast.parse(inspect.getsource(rack_trajectory_module))
+    found = {}
+    for node in ast.walk(tree):
+      if isinstance(node, ast.FunctionDef) and node.name in ("_iso_ceiling", "_horizon_opened_profile"):
+        tokens = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        tokens |= {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+        found[node.name] = tokens
+    assert set(found) == {"_iso_ceiling", "_horizon_opened_profile"}
+    for name, tokens in found.items():
+      hits = {token for token in tokens if "torque" in token.lower()}
+      assert not hits, f"{name} references a torque-authority token: {hits}"
+    # this file's own torque-authority constants must be untouched by this change
+    assert MAX_DRIVER_ASSIST_TORQUE == 0.5
+    assert DRIVER_ASSIST_CEILING == 1.0
+
+  def test_opened_profile_feeds_motion_limits_not_the_reverse(self):
+    # tests_required item 7: ordering regression pinning the panel's top implementation risk --
+    # _motion_limits must receive whatever _horizon_opened_profile computes, not the bare comfort
+    # profile with its result silently discarded. Stub _horizon_opened_profile to a distinctive,
+    # unmistakably-widened profile and spy on _motion_limits' own argument: this fails under a
+    # swapped-order or dropped-result regression regardless of surface code shape, independent of
+    # whether any one synthetic scenario happens to organically exceed comfort (island-jog covers that).
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [15.0] * 6)
+
+    widened = MotionLimits(999.0, 999.0, 999.0, RESPONSE_TIME_S)
+    captured = []
+    original_motion_limits = controller._motion_limits
+
+    def spy(profile):
+      captured.append(profile)
+      return original_motion_limits(profile)
+
+    controller._horizon_opened_profile = lambda *args, **kwargs: widened
+    controller._motion_limits = spy
+    controller.set_model(model, 1_050_000_000)
+    output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
+                                self.CI.torque_from_lateral_accel(), .2, 0.0)
+    assert output is not None
+    assert captured and captured[0] is widened, "_motion_limits did not receive the opened profile verbatim"
+
+  def test_island_jog_envelope_tracks_required_rate_and_collapses_at_reversal(self):
+    # tests_required item 8: 1.5 m over 40 m at 40 mph -- smooth and 2x/4x time-compressed variants
+    # (the SAME jog, reached sooner: the panel's "brisker" framing, not a bigger one). The opened
+    # rate must track required_rate * ENVELOPE_OPEN_MARGIN up to the ISO ceiling, and a genuine
+    # curvature-direction reversal after a consistent buildup must collapse admission sharply.
+    speed = 17.8816  # 40 mph
+    lateral_m, span_m = 1.5, 40.0
+    k_peak = 2.0 * lateral_m / span_m ** 2
+    angle_peak = abs(math.degrees(self.VM.get_steer_from_curvature(-k_peak, speed, 0.0)))
+    controller = RackTrajectoryController()
+    comfort = controller._limits(speed)
+    ceiling = controller._iso_ceiling(speed, self.VM, 0.0, comfort)
+    far_index = len(HORIZON_OFFSETS_S) - 1
+
+    def opened_rate_for(compression):
+      required_rate = angle_peak / (HORIZON_S / compression)
+      targets = tuple(PathTarget(0.0, speed, 0.0, required_rate if i > 0 else 0.0)
+                       for i in range(len(HORIZON_OFFSETS_S)))
+      probe = RackTrajectoryController()
+      profile = None
+      for _ in range(400):  # converge the eased state so the reported rate reflects `raw`
+        profile = probe._horizon_opened_profile(comfort, targets, far_index, ceiling)
+      return profile.max_rate_deg_s, required_rate
+
+    for compression in (1, 2, 4):  # smooth, 2x, 4x compressed
+      opened, required = opened_rate_for(compression)
+      expected = min(max(comfort.max_rate_deg_s, required * ENVELOPE_OPEN_MARGIN), ceiling.max_rate_deg_s)
+      assert math.isclose(opened, expected, rel_tol=1e-6)
+
+    # sharp enough to actually saturate the ISO ceiling (not one of the panel's named variants,
+    # just confirming the clamp itself engages somewhere along this same physical family)
+    opened, required = opened_rate_for(64)
+    assert required * ENVELOPE_OPEN_MARGIN > ceiling.max_rate_deg_s
+    assert math.isclose(opened, ceiling.max_rate_deg_s, rel_tol=1e-6)
+
+    # collapse at curvature reversal: a smooth, self-consistent buildup admits several steps deep;
+    # the instant the far curvature reverses sign, the shared clothoid/heading/flicker gates must
+    # reject it (R3's own 2-frame shorten timer then retires the stale index through update()).
+    times = [0.0, .25, .5, .75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0]
+    xs = np.array([speed * t for t in times])
+    action_t = 0.5
+
+    def targets_and_model(k_far, frame):
+      x_action = float(np.interp(action_t, times, xs))
+      x_far = float(np.interp(action_t + HORIZON_OFFSETS_S[-1], times, xs))
+      message = horizon_model(times, [0.0] * len(times), [speed] * len(times))
+      message.timestampEof = 1_000_000_000 + frame * 50_000_000
+      message.position.x = [float(x) for x in xs]
+      message.position.y = [float(y) for y in _clothoid_y(0.0, k_far, x_action, x_far, xs)]
+      message.confidence = "red"
+      targets = tuple(
+        PathTarget(k_far * (o / HORIZON_S), speed,
+                   math.degrees(self.VM.get_steer_from_curvature(-k_far * (o / HORIZON_S), speed, 0.0)), 0.0)
+        for o in HORIZON_OFFSETS_S
+      )
+      return message, targets
+
+    envelope = PreviewScheduler(require_confidence=False)
+    buildup_frames = 8
+    depth = 0
+    for frame in range(buildup_frames):
+      k = k_peak * 0.3 * (frame + 1) / buildup_frames
+      message, targets = targets_and_model(k, frame)
+      depth = envelope.update(message, frame, action_t, targets, False)
+    assert depth >= 2  # a genuine, if modest, admitted depth before the reversal
+
+    message, targets = targets_and_model(-k_peak * 0.3, buildup_frames + 1)
+    raw_after_reversal = envelope._admissible(message, action_t, targets, tuple(t.angle_deg for t in targets))
+    assert raw_after_reversal < depth  # the reversal is rejected outright, not merely capped
+
+  def test_iso_ceiling_opens_all_three_limits_as_a_family(self):
+    # the acceleration and jerk ceilings scale with the rate opening ratio, so they never sit below
+    # the comfort table (the response-time derivation did, and pinned the plan at comfort at speed)
+    controller = RackTrajectoryController()
+    for speed in (3.0, 8.9, 13.4, 17.9, 22.4, 26.8, 31.3):
+      comfort = controller._limits(speed, RESPONSE_TIME_S)
+      ceiling = controller._iso_ceiling(speed, self.VM, 0.0, comfort)
+      opening = max(ceiling.max_rate_deg_s / comfort.max_rate_deg_s, 1.0)
+      assert ceiling.max_acceleration_deg_s2 >= comfort.max_acceleration_deg_s2 - 1e-9
+      assert ceiling.max_jerk_deg_s3 >= comfort.max_jerk_deg_s3 - 1e-9
+      assert math.isclose(ceiling.max_acceleration_deg_s2, comfort.max_acceleration_deg_s2 * opening, rel_tol=1e-9)
+      assert math.isclose(ceiling.max_jerk_deg_s3, comfort.max_jerk_deg_s3 * opening, rel_tol=1e-9)
+    comfort_40 = controller._limits(17.9, RESPONSE_TIME_S)
+    assert controller._iso_ceiling(17.9, self.VM, 0.0, comfort_40).max_rate_deg_s > 2.0 * comfort_40.max_rate_deg_s
