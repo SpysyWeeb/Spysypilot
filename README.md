@@ -71,8 +71,12 @@ drive (route 2d) caught the slew-aware early release shedding holding torque mid
 test read visible curve exits as coming reversals; the car ran wide, six owner bookmarks) — the release is retired
 outright as of the same day, and the rest of step 2 stands: the unwind magnitude clamp is replaced by a direction fraction
 that relaxes only the rate feedback (the field logs showed the clamp holding exactly zero torque for up to 1.8 s near
-center while micro-corrections were wanted), with the carOutput plumbing kept for a future redesign. Awaiting a clean
-drive; watch for steadier near-center, slightly firmer curve exits, unwinds not fought.** `controlsd`
+center while micro-corrections were wanted), with the carOutput plumbing kept for a future redesign. Merged 2026-09-01 on top of
+that: direction guard v2 (plan/target disagreement now yields bounded feedback toward the served target instead of zero torque
+— replay: exact-zero-while-active duty 1.2–1.7 % → 0.000 % on three routes) and the log-only rack-effort shadow observer
+(step 3-C: records the hold torque the EPS actually applies per speed/angle/load cell, zero torque effect; `params_keys.h`
+changed, so the device needs a real rebuild — SSH `git pull` then reboot, not the onboard updater). Awaiting a drive; watch for
+steadier near-center, no zero-torque holds when the plan and the path disagree, slightly firmer curve exits, unwinds not fought.** `controlsd`
 selects `LatControlRack` when opendbc sets `lateralTuning.torque.useRackTrajectory`,
 which it does only for the Palisade when the queried platform code is `LX`; Telluride
 `ON`, mixed and unknown firmware fail closed to stock `LatControlTorque` *and* the stock
