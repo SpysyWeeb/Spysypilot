@@ -15,7 +15,9 @@ from openpilot.selfdrive.controls.lib.drive_helpers import MAX_LATERAL_ACCEL_NO_
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.latcontrol_rack import FALLBACK_HOLD_S, LatControlRack
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
+  _direction_guard,
   _smoothstep,
+  GUARD_FALLBACK_TORQUE_CAP,
   HORIZON_ACCELERATION_BLEND,
   HORIZON_OFFSETS_S,
   HORIZON_POSITION_TOLERANCE_DEG,
@@ -23,9 +25,11 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   horizon_desired_acceleration,
   JerkLimitedRackPlanner,
   MAX_DRIVER_ASSIST_TORQUE,
+  MAX_FEEDBACK_TORQUE,
   MEASURED_RATE_FILTER_RC_S,
   MotionLimits,
   PathTarget,
+  R7_MAX_TORQUE_STEP,
   RackPlan,
   RackRateEstimator,
   RackTarget,
@@ -38,7 +42,6 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   ReferenceFilter,
   reference_trail_limit_deg,
   RESPONSE_TIME_PREVIEW_S,
-  DIRECTION_GUARD_RC_S,
   TURN_IN_BLEND_DEG,
   RESPONSE_TIME_S,
   STATUS_ACTIVE,
@@ -367,9 +370,86 @@ class TestLatControlRack(OpenpilotTestCase):
     steps = [abs(b - a) for a, b in zip(caps, caps[1:], strict=False)]
     assert max(steps) < 0.06  # no 0.35-unit jump anywhere in the sweep (FM3.5)
 
-  def test_direction_guard_ramps_down_not_snaps(self):
-    # the plan still on the old side of a reversal while the target is across zero: feedback pulls
-    # toward the plan, opposing the target, and the guard drains the torque at its time constant
+  def test_direction_guard_output_step_is_bounded_across_torque_magnitudes(self):
+    # Direction guard v2's R7 fix is on the OUTPUT itself, not the mix weight: the requested guard
+    # output-step sweep, re-creating and closing the panel's measured breach (a 0.083 scale-step x
+    # 0.78 torque = 0.067 jump). Same plan=-8/target=+5 reversal straddle as before, swept across
+    # torque magnitudes from a small opposing push up to a fully platform-saturated one.
+    for magnitude in (0.1, 0.5, 0.9, 1.0):
+      scale, previous_output = 0.0, None
+      outputs = []
+      for _ in range(10):
+        guarded, scale, _ = _direction_guard(
+          scale, previous_output, -magnitude,
+          planned_angle=-8.0, target_angle=5.0, measured_angle=0.0, direction_fraction=0.0,
+          dt=0.01, gain=1.0, lateral_accel_per_degree=1.0, torque_params=None,
+          torque_from_lateral_accel=lambda accel, _: accel,
+        )
+        previous_output = guarded  # the caller (not _direction_guard) owns the R7 baseline
+        outputs.append(guarded)
+      steps = [abs(b - a) for a, b in zip(outputs, outputs[1:], strict=False)]
+      assert max(steps) <= R7_MAX_TORQUE_STEP + 1e-9
+
+  def test_guard_conflict_continuous_through_sign_singularities(self):
+    # math.copysign(1.0, 0.0) is a 3-valued point where `toward`/`measured_sign` can jump between
+    # -1, 0 and +1: confirm the guard's R7 output-step bound survives target_angle, then
+    # measured_angle, sweeping straight through exactly zero (closes v2's own flagged failure mode).
+    def sweep(target_angles, measured_angles, direction_fraction):
+      scale, previous_output = 0.0, None
+      outputs = []
+      for target_angle, measured_angle in zip(target_angles, measured_angles, strict=True):
+        guarded, scale, _ = _direction_guard(
+          scale, previous_output, -0.6,
+          planned_angle=-8.0, target_angle=target_angle, measured_angle=measured_angle,
+          direction_fraction=direction_fraction, dt=0.01, gain=1.0, lateral_accel_per_degree=1.0,
+          torque_params=None, torque_from_lateral_accel=lambda accel, _: accel,
+        )
+        previous_output = guarded  # the caller (not _direction_guard) owns the R7 baseline
+        outputs.append(guarded)
+      steps = [abs(b - a) for a, b in zip(outputs, outputs[1:], strict=False)]
+      assert max(steps) <= R7_MAX_TORQUE_STEP + 1e-9
+
+    crossing = [-0.5 + 0.05 * i for i in range(21)]  # steps straight through exactly 0.0
+    sweep(crossing, [3.0] * len(crossing), 0.0)
+    sweep([5.0] * len(crossing), crossing, 1.0)
+
+  def test_guard_bit_identical_outside_conflict(self):
+    # RBDG's "bit-identical outside conflict" invariant, grafted in as an explicit regression: with
+    # a synthetic agreeing-sign fixture (plan and target on the same side, as in an ordinary lane
+    # change) guard_conflict is zero throughout, so the guarded output is exactly the pre-guard
+    # torque, frame for frame -- matching the old build's untripped (scale == 1, multiplicative)
+    # behavior bit-for-bit. (The route-wide old-build-vs-new frame check is the replay verifier's
+    # job against the real route pickles in spysypilot-route-audit/phase1, not this unit test.)
+    scale, previous_output = 0.0, None
+    for torque in (0.05, 0.08, 0.05, 0.02, -0.01, -0.04, -0.02):  # small, realistic per-frame deltas
+      guarded, scale, direction_guarded = _direction_guard(
+        scale, previous_output, torque,
+        planned_angle=6.0, target_angle=8.0, measured_angle=2.0, direction_fraction=0.0,
+        dt=0.01, gain=1.0, lateral_accel_per_degree=1.0, torque_params=None,
+        torque_from_lateral_accel=lambda accel, _: accel,
+      )
+      previous_output = guarded
+      assert guarded == torque and not direction_guarded and scale == 0.0
+
+  def test_guard_r7_inert_outside_conflict_even_across_a_large_torque_jump(self):
+    # Regression for the confirmed reconcile finding: R7's output clamp must be scoped to this
+    # rule's own blend (mix > 0), not applied unconditionally to every frame's torque -- otherwise
+    # an ordinary large single-frame torque swing with zero direction conflict (a driver grab, a
+    # plan replan, an engage transient) gets silently rate-limited and mislabeled
+    # direction_guarded=True, breaking the mandatory bit-identical-outside-conflict replay gate.
+    # Same no-conflict fixture as above (plan/target agreeing, guard_conflict == 0 throughout), but
+    # with a single-frame jump from 0.05 to 0.9 -- far beyond R7_MAX_TORQUE_STEP.
+    guarded, scale, direction_guarded = _direction_guard(
+      0.0, 0.05, 0.9,
+      planned_angle=6.0, target_angle=8.0, measured_angle=2.0, direction_fraction=0.0,
+      dt=0.01, gain=1.0, lateral_accel_per_degree=1.0, torque_params=None,
+      torque_from_lateral_accel=lambda accel, _: accel,
+    )
+    assert guarded == 0.9 and not direction_guarded and scale == 0.0
+
+  def test_guard_follows_target_not_zero(self):
+    # the straddle fixture (also an FM3.9 boundary instance: measured_angle == 0.0 exactly) run to
+    # convergence: the old zero-attractor guard drove this to zero; v2 follows the target instead.
     controller = RackTrajectoryController()
     controller.planner = JerkLimitedRackPlanner(-8.0)
     CS = car.CarState.new_message()
@@ -381,15 +461,107 @@ class TestLatControlRack(OpenpilotTestCase):
     model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [curvature * CS.vEgo] * 6, [CS.vEgo] * 6)
     model.action.desiredCurvature = curvature
     controller.set_model(model, 1_050_000_000)
-    scales = []
-    for _ in range(4):
+    output = None
+    for _ in range(15):
       output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, curvature)
       assert output is not None
-      scales.append(controller.direction_guard_scale)
-    steps = [a - b for a, b in zip(scales, scales[1:], strict=False)]
-    assert all(0.0 < scales[i + 1] < scales[i] for i in range(len(scales) - 1))
-    assert all(abs(step - controller.dt / DIRECTION_GUARD_RC_S) < 1e-9 for step in steps)
-    assert output.direction_guarded and not output.saturated
+    # signed toward (target_angle - measured_angle) = +5, bounded by the fallback cap, not zero
+    assert output.torque > 0.0
+    assert math.isclose(output.torque, GUARD_FALLBACK_TORQUE_CAP, abs_tol=1e-9)
+    assert output.direction_guarded
+
+  def test_guard_unwind_follows_target(self):
+    # full-unwind fixture (direction_fraction == 1.0: neither the plan nor the commanded motion
+    # holds any of the current angle) run to convergence: follows the target, not zero.
+    CS = car.CarState.new_message()
+    CS.vEgo = 13.6
+    params = log.VehicleParameters.new_message()
+    torque_params = self.CP.lateralTuning.torque
+    torque_params.friction = -.5
+    torque_params.latAccelOffset = 0.0
+    controller = RackTrajectoryController()
+    controller.planner = JerkLimitedRackPlanner(-2.0)
+    CS.steeringAngleDeg = 4.0
+    target_curvature = -self.VM.calc_curvature(math.radians(-2.0), CS.vEgo, 0.0)
+    model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [CS.vEgo] * 6)
+    model.action.desiredCurvature = target_curvature
+    controller.set_model(model, 1_050_000_000)
+    output = None
+    for _ in range(20):
+      output = controller.update(True, CS, self.VM, params, torque_params,
+                                  lambda lateral_accel, _: lateral_accel, .2, target_curvature)
+      assert output is not None
+    # signed toward (target_angle - measured_angle) = -2 - 4 = -6, bounded by the fallback cap
+    assert output.torque < 0.0
+    assert math.isclose(output.torque, -GUARD_FALLBACK_TORQUE_CAP, abs_tol=1e-9)
+    assert output.direction_guarded
+
+  def test_guard_fallback_has_no_rate_term(self):
+    # bounded_target_feedback never resists a real self-aligning return: with the mix pinned at
+    # full fallback (guard_conflict == 1 both times), the only difference between the two calls is
+    # `torque` -- standing in for two different upstream rate feedbacks -- and the fallback the
+    # guard converges to is identical either way.
+    kwargs = {
+      "planned_angle": -8.0, "target_angle": 5.0, "measured_angle": 0.0, "direction_fraction": 0.0,
+      "dt": 0.01, "gain": 1.0, "lateral_accel_per_degree": 1.0, "torque_params": None,
+      "torque_from_lateral_accel": lambda accel, _: accel,
+    }
+    slow, _, _ = _direction_guard(1.0, None, -0.9, **kwargs)
+    fast, _, _ = _direction_guard(1.0, None, -0.3, **kwargs)
+    assert slow == fast
+    assert abs(slow) == GUARD_FALLBACK_TORQUE_CAP
+
+  def test_guard_fallback_cap_below_feedback_ceiling(self):
+    # R10: checked, not implicit -- also enforced live by the assert inside _direction_guard itself.
+    assert GUARD_FALLBACK_TORQUE_CAP < MAX_FEEDBACK_TORQUE
+
+  def test_guard_never_widens_authority(self):
+    # a convex combination of torque and the fallback can't exceed either endpoint's magnitude;
+    # assert it directly (convexity guard against a future edit), sweeping the mix over [0, 1].
+    # NOTE: this bound holds with R7 inert (previous_output=None, as below). Once R7 is active
+    # against a stale previous_output_torque the bound does not hold unconditionally -- see
+    # test_guard_authority_decays_at_the_r7_rate_with_a_stale_baseline for that accepted trade-off.
+    for mix_target in (0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0):
+      # reference_conflict alone lands the mix at mix_target: planned partway across
+      # TURN_IN_BLEND_DEG, torque fully opposing so torque_away_from_target saturates to 1, and the
+      # unwind side stays inert (measured_angle == 0.0)
+      planned_angle = -mix_target * TURN_IN_BLEND_DEG
+      for torque in (0.05, 0.35, 1.0):
+        guarded, new_scale, _ = _direction_guard(
+          mix_target, None, -torque,
+          planned_angle=planned_angle, target_angle=5.0, measured_angle=0.0, direction_fraction=0.0,
+          dt=0.01, gain=1.0, lateral_accel_per_degree=1.0, torque_params=None,
+          torque_from_lateral_accel=lambda accel, _: accel,
+        )
+        assert abs(new_scale - mix_target) < 1e-9  # confirms the mix actually landed where intended
+        assert abs(guarded) <= max(torque, GUARD_FALLBACK_TORQUE_CAP) + 1e-9
+
+  def test_guard_authority_decays_at_the_r7_rate_with_a_stale_baseline(self):
+    # Reconcile-pass regression: the convexity bound above is NOT unconditional. Once the guard is
+    # fully tripped (mix == 1) against a previous_output_torque that went stale before the conflict
+    # onset (a realistic case: sustained near-saturation torque with no conflict, then a conflict
+    # trips fully within one DIRECTION_GUARD_RC_S), R7's continuity guarantee wins over instant
+    # suppression -- the design's own stated priority -- so authority sits above
+    # max(|torque|, GUARD_FALLBACK_TORQUE_CAP) for several frames while it decays at exactly
+    # R7_MAX_TORQUE_STEP/frame, rather than snapping to the fallback immediately. Pin the actual
+    # guarantee: a monotonic, R7-bounded decay that fully converges on the capped, target-referred
+    # fallback -- so this known trade-off stays a documented, checked behavior, not a silent gap.
+    kwargs = {
+      "planned_angle": -TURN_IN_BLEND_DEG, "target_angle": 5.0, "measured_angle": 0.0,
+      "direction_fraction": 0.0, "dt": 0.01, "gain": 1.0, "lateral_accel_per_degree": 1.0,
+      "torque_params": None, "torque_from_lateral_accel": lambda accel, _: accel,
+    }
+    scale, previous_output = 1.0, 0.9  # fully tripped, stale baseline from before the conflict onset
+    outputs = []
+    for _ in range(40):
+      guarded, scale, _ = _direction_guard(scale, previous_output, -1.0, **kwargs)
+      outputs.append(guarded)
+      previous_output = guarded
+    # exceeds the convexity bound early on -- the known, accepted trade-off, not a regression
+    assert outputs[0] > GUARD_FALLBACK_TORQUE_CAP + R7_MAX_TORQUE_STEP
+    steps = [b - a for a, b in zip(outputs, outputs[1:], strict=False)]
+    assert all(-R7_MAX_TORQUE_STEP - 1e-9 <= step <= 1e-9 for step in steps)  # non-increasing, R7-bounded
+    assert math.isclose(outputs[-1], -GUARD_FALLBACK_TORQUE_CAP, abs_tol=1e-9)  # fully converges
 
   def test_driver_assist_cap_reports_itself_not_saturation(self):
     controller, state, update = build_feedforward_boundary_controller()
@@ -602,31 +774,44 @@ class TestLatControlRack(OpenpilotTestCase):
     assert max(boundary_steps) < 0.05
 
   def test_driver_handoff_caps_torque_and_preserves_plan_offset(self):
+    # Direction guard v2's R7 output-step ceiling is scoped to this rule's own blend (mix > 0): a
+    # driver overpowering the wheel trips no straddle/unwind conflict, so the guard stays inert
+    # (mix == 0) and the driver-assist cap below still snaps instantly, exactly as before this
+    # pass -- an unrelated large torque swing must not get silently rate-limited by R7 (see
+    # test_guard_r7_inert_outside_conflict_even_across_a_large_torque_jump). The plan-pin (R5) is
+    # checked on the very first pressed frame. A large torque_scale keeps feedback platform-saturated for the
+    # whole ramp so the cap is a stable plateau, not a transient the plan's own convergence erodes.
     _, _, probe = build_feedforward_boundary_controller()
     target_angle = probe().target_angle_deg
 
-    # a fresh planner seeded far from the target: the driver has already overpowered it
-    controller, state, update = build_feedforward_boundary_controller()
-    state.steeringAngleDeg = target_angle + 20.0
-    output = update()
-    assert output is not None and abs(output.feedforward_torque) > 0.05
-    offset_before = output.planned_angle_deg - state.steeringAngleDeg
+    def handoff_to_cap(torque_scale, hand_delta, steering_torque):
+      controller, state, update = build_feedforward_boundary_controller()
+      state.steeringAngleDeg = target_angle + 20.0
+      output = update()
+      assert output is not None and abs(output.feedforward_torque) > 0.05
+      offset_before = output.planned_angle_deg - state.steeringAngleDeg
 
-    state.steeringPressed = True
-    state.steeringTorque = -300.0
-    state.steeringAngleDeg += 2.0
-    handoff = update(4.0)
-    assert handoff is not None
-    normal_torque = max(-1.0, min(1.0, handoff.feedforward_torque + handoff.feedback_torque))
-    assert normal_torque > MAX_DRIVER_ASSIST_TORQUE and handoff.torque == MAX_DRIVER_ASSIST_TORQUE
-    assert handoff.feedback_torque != 0.0 and controller.status == STATUS_ACTIVE
+      state.steeringPressed = True
+      state.steeringTorque = steering_torque
+      state.steeringAngleDeg += hand_delta
+      pinned = update(torque_scale)
+      assert pinned is not None
+      offset_during = pinned.planned_angle_deg - state.steeringAngleDeg
+      assert abs(offset_during - offset_before) < 0.25
 
-    negative_handoff = update(-4.0)
-    assert negative_handoff is not None
-    normal_torque = max(-1.0, min(1.0, negative_handoff.feedforward_torque + negative_handoff.feedback_torque))
-    assert normal_torque < -MAX_DRIVER_ASSIST_TORQUE and negative_handoff.torque == -MAX_DRIVER_ASSIST_TORQUE
-    offset_during = negative_handoff.planned_angle_deg - state.steeringAngleDeg
-    assert abs(offset_during - offset_before) < 0.25
+      handoff = pinned
+      for _ in range(20):
+        handoff = update(torque_scale)
+      assert handoff is not None
+      normal_torque = max(-1.0, min(1.0, handoff.feedforward_torque + handoff.feedback_torque))
+      cap = math.copysign(MAX_DRIVER_ASSIST_TORQUE, torque_scale)
+      assert normal_torque * math.copysign(1.0, torque_scale) > MAX_DRIVER_ASSIST_TORQUE
+      assert math.isclose(handoff.torque, cap, abs_tol=1e-9)
+      assert handoff.feedback_torque != 0.0 and controller.status == STATUS_ACTIVE
+      return controller, state, update
+
+    handoff_to_cap(50.0, 2.0, -300.0)
+    controller, state, update = handoff_to_cap(-50.0, -2.0, 300.0)
 
     state.steeringPressed = False
     state.steeringTorque = 0.0
@@ -945,13 +1130,20 @@ class TestLatControlRack(OpenpilotTestCase):
     outward_at_center = run(-2.0, 0.0)
     # strong friction the wrong way flips feedforward's sign; with the plan and the commanded motion both
     # past center there is nothing left to hold, so torque still pushing the wheel outward is indefensible:
-    # the direction guard ramps it out (at center exactly, the zero-crossing guard still zeroes outright)
+    # the direction guard ramps it out toward the target, not to zero
     assert outward_cross_center.feedforward_torque > 0.0
     assert outward_cross_center.direction_guarded
     assert 0.0 <= outward_cross_center.torque < outward_cross_center.feedforward_torque + outward_cross_center.feedback_torque
-    assert outward_at_center.torque == 0.0
+    # FM3.9 retired: the old exact-zero special case (measured_angle == 0.0) is gone -- this frame is
+    # just the ordinary continuous feedback now, not an artificial zero, and stays continuous
+    # sweeping straight through the boundary (no discontinuity from removing the special case)
+    assert outward_at_center.torque != 0.0
+    just_positive = run(-2.0, 1e-6)
+    just_negative = run(-2.0, -1e-6)
+    assert math.isclose(just_positive.torque, outward_at_center.torque, abs_tol=1e-3)
+    assert math.isclose(just_negative.torque, outward_at_center.torque, abs_tol=1e-3)
 
-    # held in the same state, the guard converges to zero torque within its ramp time
+    # held in the same state, direction guard v2 converges to the target-referred fallback, not zero
     controller = RackTrajectoryController()
     controller.planner = JerkLimitedRackPlanner(-2.0)
     self.CS.steeringAngleDeg = 4.0
@@ -959,15 +1151,17 @@ class TestLatControlRack(OpenpilotTestCase):
     model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [self.CS.vEgo] * 6)
     model.action.desiredCurvature = target_curvature
     controller.set_model(model, 1_050_000_000)
-    previous = math.inf
+    previous = None
     output = None
-    for _ in range(14):
+    for _ in range(20):
       output = controller.update(True, self.CS, self.VM, self.params, torque_params,
                                  lambda lateral_accel, _: lateral_accel, .2, target_curvature)
       assert output is not None
-      assert output.torque <= previous + 1e-12
+      if previous is not None:
+        assert abs(output.torque - previous) <= R7_MAX_TORQUE_STEP + 1e-9  # every step satisfies R7
       previous = output.torque
-    assert output.torque == 0.0
+    assert output.torque != 0.0
+    assert math.isclose(output.torque, -GUARD_FALLBACK_TORQUE_CAP, abs_tol=1e-9)
     assert output.direction_guarded
 
   def test_reference_filter_isolates_raw_feedforward_during_a_small_reversal(self):
