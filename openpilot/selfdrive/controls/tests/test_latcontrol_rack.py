@@ -16,7 +16,10 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.latcontrol_rack import FALLBACK_HOLD_S, LatControlRack
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   _direction_guard,
+  _driver_assist_envelope,
   _smoothstep,
+  DriverAssistLimits,
+  DRIVER_ASSIST_CEILING,
   GUARD_FALLBACK_TORQUE_CAP,
   HORIZON_ACCELERATION_BLEND,
   HORIZON_OFFSETS_S,
@@ -105,11 +108,11 @@ def horizon_model(times, rates, speeds, path_y=None):
   return message
 
 
-def build_feedforward_boundary_controller():
+def build_feedforward_boundary_controller(driver_assist_limits=None):
   car_interface = interfaces[HYUNDAI.HYUNDAI_PALISADE]
   car_params = car_interface.get_non_essential_params(HYUNDAI.HYUNDAI_PALISADE)
   interface = car_interface(car_params)
-  controller = RackTrajectoryController()
+  controller = RackTrajectoryController(driver_assist_limits=driver_assist_limits)
   vehicle_model = VehicleModel(car_params)
   state = car.CarState.new_message()
   state.vEgo = 5.0
@@ -575,6 +578,150 @@ class TestLatControlRack(OpenpilotTestCase):
     assert abs(output.torque) == MAX_DRIVER_ASSIST_TORQUE
     assert output.driver_assist_limited and not output.saturated
 
+  # ---- driver-assist cap relaxation when agreeing (panel design, docs/BLaTv3_FAILURE_MODES.md FM4.9) ----
+
+  def _palisade_assist_limits(self):
+    limits = CarControllerParams(self.CP)
+    return limits, DriverAssistLimits(
+      STEER_MAX=float(limits.STEER_MAX),
+      STEER_DRIVER_ALLOWANCE=float(limits.STEER_DRIVER_ALLOWANCE),
+      STEER_DRIVER_MULTIPLIER=float(limits.STEER_DRIVER_MULTIPLIER),
+      STEER_DRIVER_FACTOR=float(limits.STEER_DRIVER_FACTOR),
+    )
+
+  def test_driver_assist_cap_relaxes_when_agreeing(self):
+    # Same shape as test_driver_assist_cap_reports_itself_not_saturation (press from frame 1, same
+    # torque_scale=2.0 saturating fixture whose converged sign is verified positive by that test's
+    # own -300 "opposing" fixture) but with a same-sign steeringTorque: agreement, not opposition.
+    _, assist_limits = self._palisade_assist_limits()
+    controller, state, update = build_feedforward_boundary_controller(driver_assist_limits=assist_limits)
+    state.steeringPressed = True
+    state.steeringTorque = 236.0  # comfortably above the -50 breakpoint: full agreement
+    output = None
+    for _ in range(20):
+      output = update(torque_scale=2.0)
+      assert output is not None
+    # algebraic, not approximate: the envelope this frame is exactly the ceiling, not the old fixed cap
+    assert output.driver_assist_cap == DRIVER_ASSIST_CEILING == 1.0
+    # NOT pinned at the old fixed cap -- the R7 backstop may still be damping the plan's own ramp-up
+    # (accepted per the replay gate: every pressed frame's step is <= R7_MAX_TORQUE_STEP regardless
+    # of agreement), but the ceiling itself is 1.0, not 0.5, so authority keeps climbing past it.
+    assert abs(output.torque) > MAX_DRIVER_ASSIST_TORQUE
+
+  def test_driver_assist_envelope_matches_platform_formula(self):
+    # Automated R10 proof: within the ramp/ceiling region the envelope reproduces the real platform
+    # limiter's own driver-allowance term (mod integer rounding across many iterations, the same
+    # convergence idiom as test_driver_handoff_converges_through_platform_torque_limits, to wash
+    # out apply_driver_steer_torque_limits' own slew term). Below the ramp's floor breakpoint the
+    # two intentionally diverge: this envelope floors at MAX_DRIVER_ASSIST_TORQUE (never regress
+    # below today's fixed cap) while the real limiter keeps shrinking toward 0 -- re-enforced for
+    # real downstream at the CAN layer regardless (R10), not re-derived here.
+    limits, assist_limits = self._palisade_assist_limits()
+    floor_d = ((MAX_DRIVER_ASSIST_TORQUE - 1.0) * limits.STEER_MAX / limits.STEER_DRIVER_MULTIPLIER
+               - limits.STEER_DRIVER_ALLOWANCE) / limits.STEER_DRIVER_FACTOR
+    for direction in (1.0, -1.0):
+      request = math.copysign(float(limits.STEER_MAX), direction)
+      for driver_torque_counts in range(-400, 401, 8):
+        envelope = _driver_assist_envelope(float(driver_torque_counts), direction, assist_limits)
+        d = driver_torque_counts * direction
+        if d < floor_d:
+          assert envelope == MAX_DRIVER_ASSIST_TORQUE
+          continue
+        applied = request
+        for _ in range(400):
+          applied = apply_driver_steer_torque_limits(request, applied, float(driver_torque_counts), limits)
+        assert abs(abs(applied) - envelope * limits.STEER_MAX) <= 1.0
+
+  def test_driver_assist_envelope_bounds(self):
+    _, assist_limits = self._palisade_assist_limits()
+    for driver_torque_counts in range(-600, 601, 15):
+      for direction in (1.0, -1.0):
+        envelope = _driver_assist_envelope(float(driver_torque_counts), direction, assist_limits)
+        assert MAX_DRIVER_ASSIST_TORQUE <= envelope <= DRIVER_ASSIST_CEILING
+    assert _driver_assist_envelope(123.0, 0.0, assist_limits) == DRIVER_ASSIST_CEILING  # no commanded direction
+
+  def test_driver_assist_r7_backstop_real_deltas(self):
+    _, assist_limits = self._palisade_assist_limits()
+    controller, state, update = build_feedforward_boundary_controller(driver_assist_limits=assist_limits)
+    output = update(torque_scale=2.0)
+    assert output is not None
+    sign = math.copysign(1.0, output.torque)
+    state.steeringPressed = True
+
+    # settle inside the ramp band first so the backstop under test, not the initial engage snap, is measured
+    d = -100.0
+    state.steeringTorque = sign * d
+    for _ in range(30):
+      output = update(torque_scale=2.0)
+    previous_torque = output.torque
+
+    # real frame-to-frame steeringTorque deltas measured from route2e this session (sustained
+    # agreement, up to 31 counts/frame), walked around d=-100 (mid-ramp)
+    for delta in (12.0, -31.0, 9.0, -18.0, 22.0, -7.0, 15.0, -25.0, 11.0, -4.0):
+      d += delta
+      state.steeringTorque = sign * d
+      output = update(torque_scale=2.0)
+      assert output is not None
+      assert abs(output.torque - previous_torque) <= R7_MAX_TORQUE_STEP + 1e-9
+      previous_torque = output.torque
+
+    # settle at the ramp floor, then a synthetic worst-case single-frame 102-count swing landing
+    # entirely inside the documented [-152.25, -50] ramp band (both endpoints inside it)
+    d = -152.0
+    state.steeringTorque = sign * d
+    for _ in range(30):
+      output = update(torque_scale=2.0)
+    previous_torque = output.torque
+    d = -50.0  # +102 counts in one frame
+    state.steeringTorque = sign * d
+    output = update(torque_scale=2.0)
+    assert output is not None
+    assert abs(output.torque - previous_torque) <= R7_MAX_TORQUE_STEP + 1e-9
+
+  def test_previous_output_torque_updated_by_driver_assist(self):
+    controller, state, update = build_feedforward_boundary_controller()
+    state.steeringPressed = True
+    state.steeringTorque = -300.0  # opposing: pins at MAX_DRIVER_ASSIST_TORQUE
+    output = None
+    for _ in range(20):
+      output = update(torque_scale=2.0)
+    assert output is not None
+    assert abs(output.torque) == MAX_DRIVER_ASSIST_TORQUE
+    # next frame's R7 baseline is the post-cap value, not direction_guard's pre-cap one
+    assert controller.previous_output_torque == output.torque
+    uncapped_estimate = max(-1.0, min(1.0, output.feedforward_torque + output.feedback_torque))
+    assert abs(uncapped_estimate) > abs(controller.previous_output_torque) + 0.1
+
+  def test_hands_off_baseline_not_gated(self):
+    # steeringPressed False (the real 5-frame debounce keeps the observed ~71-count hands-off noise
+    # ceiling from ever tripping it): the driver-assist branch must never execute, so the output is
+    # byte-identical whether or not driver_assist_limits is configured at all.
+    _, assist_limits = self._palisade_assist_limits()
+    baseline_controller, baseline_state, baseline_update = build_feedforward_boundary_controller(driver_assist_limits=None)
+    gated_controller, gated_state, gated_update = build_feedforward_boundary_controller(driver_assist_limits=assist_limits)
+    baseline_state.steeringPressed = False
+    gated_state.steeringPressed = False
+    for steering_torque in (0.0, 45.0, -71.0, 71.0, -45.0, 12.0):
+      baseline_state.steeringTorque = steering_torque
+      gated_state.steeringTorque = steering_torque
+      baseline_output = baseline_update(torque_scale=2.0)
+      gated_output = gated_update(torque_scale=2.0)
+      assert baseline_output is not None and gated_output is not None
+      assert not baseline_output.driver_assist_limited and not gated_output.driver_assist_limited
+      assert gated_output.torque == baseline_output.torque  # bit-identical: the branch never ran
+      assert gated_output.driver_assist_cap == DRIVER_ASSIST_CEILING == baseline_output.driver_assist_cap
+
+  def test_latcontrol_rack_grafts_driver_assist_limits(self):
+    # Q2 wiring check: LatControlRack builds CarControllerParams(CP) itself and threads the four
+    # constants into the rack controller as plain floats -- confirm the graft actually happened.
+    limits = CarControllerParams(self.CP)
+    controller, _, _ = get_rack_controller()
+    assert controller.rack.driver_assist_limits is not None
+    assert controller.rack.driver_assist_limits.STEER_MAX == float(limits.STEER_MAX)
+    assert controller.rack.driver_assist_limits.STEER_DRIVER_ALLOWANCE == float(limits.STEER_DRIVER_ALLOWANCE)
+    assert controller.rack.driver_assist_limits.STEER_DRIVER_MULTIPLIER == float(limits.STEER_DRIVER_MULTIPLIER)
+    assert controller.rack.driver_assist_limits.STEER_DRIVER_FACTOR == float(limits.STEER_DRIVER_FACTOR)
+
   def test_saturated_means_the_platform_ceiling_only(self):
     controller, _, VM = get_rack_controller()
     CS = car.CarState.new_message()
@@ -848,6 +995,9 @@ class TestLatControlRack(OpenpilotTestCase):
       assert rack_log.fallback
       assert rack_log.status == STATUS_NO_MODEL
       assert rack_log.schema.node.id == log.ControlsState.LateralRackState.schema.node.id
+      # no cap was evaluated this frame (stock is steering) -- must read as "not active" (the
+      # ceiling), never the capnp Float32 default of 0.0, which would misread as "capped to zero"
+      assert rack_log.driverAssistCap == DRIVER_ASSIST_CEILING
 
   def test_rack_fallback_is_the_stock_controller_after_rack_frames(self):
     controller, stock, VM = get_rack_controller()
@@ -882,6 +1032,7 @@ class TestLatControlRack(OpenpilotTestCase):
       assert rack_log.fallback
       assert math.isclose(torque, stock_torque, rel_tol=0.0, abs_tol=1e-12)
       assert math.isclose(rack_log.f, stock_log.f, rel_tol=0.0, abs_tol=1e-12)
+      assert rack_log.driverAssistCap == DRIVER_ASSIST_CEILING
       assert controller.torque.sat_time == controller.sat_time
       if frame == 0:
         # the rack controller never saturated, so the handover must not report saturation from the idle stock controller

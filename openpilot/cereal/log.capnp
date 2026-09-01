@@ -956,6 +956,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     driverAssistLimited @33 :Bool;
     earlyRelease @34 :Bool;
     directionFraction @35 :Float32;
+    driverAssistCap @36 :Float32;  # the envelope's effective cap this frame; 1.0 (no cap) when not pressed
   }
 
   struct LateralAngleState {

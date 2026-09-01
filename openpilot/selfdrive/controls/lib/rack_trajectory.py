@@ -83,6 +83,7 @@ class RackTrajectoryOutput:
   near_target_angle_deg: float
   direction_guarded: bool
   driver_assist_limited: bool
+  driver_assist_cap: float
   early_release: bool
   direction_fraction: float
 
@@ -504,7 +505,8 @@ HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
 TURN_IN_BLEND_DEG = 3.0  # the feedback cap blends between its two values over this much angle, not a boolean jump
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
-MAX_DRIVER_ASSIST_TORQUE = .5
+MAX_DRIVER_ASSIST_TORQUE = .5     # unchanged value; now the envelope's FLOOR, not its fixed cap
+DRIVER_ASSIST_CEILING = 1.0       # == the ISO clip already applied upstream; not a new ceiling (R10)
 # Direction guard v2 (target-referred bounded fallback, docs/BLaTv3_FAILURE_MODES.md FM3.5/FM3.9/R7/R10):
 R7_MAX_TORQUE_STEP = .05  # existing rule bound (FM3.5: "R7 sweeps, jump < 0.05"), reused on the output verbatim
 GUARD_TORQUE_BLEND = .05  # set equal to R7_MAX_TORQUE_STEP: an opposing torque smaller than the R7 step can't
@@ -623,9 +625,40 @@ def _direction_guard(
   return guarded_torque, new_scale, guarded_torque != torque
 
 
+@dataclass(frozen=True, slots=True)
+class DriverAssistLimits:
+  """The four opendbc.car.hyundai.values.CarControllerParams fields _driver_assist_envelope needs,
+  threaded in by LatControlRack as plain floats -- this module never imports opendbc.car.hyundai
+  (owner decision, docs/BLaTv3_FAILURE_MODES.md FM4.9): the driver-allowance term crosses the
+  package boundary, not the platform import. Field names match the real dataclass's own so the
+  formula below reads exactly like opendbc's."""
+  STEER_MAX: float
+  STEER_DRIVER_ALLOWANCE: float
+  STEER_DRIVER_MULTIPLIER: float
+  STEER_DRIVER_FACTOR: float
+
+
+def _driver_assist_envelope(driver_torque_counts: float, commanded_torque: float, limits: DriverAssistLimits) -> float:
+  """Mirrors opendbc.car.lateral.apply_driver_steer_torque_limits' own driver-allowance term for
+  commanded_torque's direction (opendbc_repo/opendbc/car/lateral.py:76-79): a driver already
+  pushing with the controller's own live intent widens the cap toward DRIVER_ASSIST_CEILING exactly
+  as far as the platform's own driver-override limiter already would; an opposing driver still
+  floors at MAX_DRIVER_ASSIST_TORQUE (never less than today's fixed cap -- the real limiter is
+  re-enforced for real downstream at the CAN layer regardless, R10). Pure, stateless."""
+  if commanded_torque == 0.0:
+    return DRIVER_ASSIST_CEILING
+  direction = math.copysign(1.0, commanded_torque)
+  d = driver_torque_counts * direction            # d>0: driver pushes WITH the command
+  allowed = limits.STEER_MAX + (limits.STEER_DRIVER_ALLOWANCE
+                                 + d * limits.STEER_DRIVER_FACTOR) * limits.STEER_DRIVER_MULTIPLIER
+  allowed = max(min(limits.STEER_MAX, allowed), 0.0)          # identical clamp to the real fn
+  return max(allowed / limits.STEER_MAX, MAX_DRIVER_ASSIST_TORQUE)
+
+
 class RackTrajectoryController:
-  def __init__(self, dt: float = DT) -> None:
+  def __init__(self, dt: float = DT, driver_assist_limits: DriverAssistLimits | None = None) -> None:
     self.dt = dt
+    self.driver_assist_limits = driver_assist_limits  # None preserves the fixed cap for callers without a CP
     self.model = None
     self.state_mono_ns = 0
     self.inactive_frames = 0
@@ -997,13 +1030,27 @@ class RackTrajectoryController:
       self._invalidate(STATUS_INVALID_OUTPUT)
       return None
     driver_assist_limited = False
+    driver_assist_cap = DRIVER_ASSIST_CEILING
     if CS.steeringPressed:
-      assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
+      # Agreement relaxation (docs/BLaTv3_FAILURE_MODES.md FM4.9): a driver pushing with the
+      # controller's own live intent widens the cap toward 1.0, exactly as far as the platform's
+      # own driver-allowance limiter already would; an opposing driver still floors at
+      # MAX_DRIVER_ASSIST_TORQUE. Falls back to the old fixed cap for callers with no CP (tests,
+      # any future caller that hasn't threaded driver_assist_limits through).
+      driver_assist_cap = (
+        _driver_assist_envelope(CS.steeringTorque, torque, self.driver_assist_limits)
+        if self.driver_assist_limits is not None else MAX_DRIVER_ASSIST_TORQUE
+      )
+      assisted_torque = _clip(torque, driver_assist_cap)
+      if self.previous_output_torque is not None:  # same R7 idiom as _direction_guard, scoped to this branch
+        assisted_torque = min(max(assisted_torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
+                               self.previous_output_torque + R7_MAX_TORQUE_STEP)
       driver_assist_limited = assisted_torque != torque
       torque = assisted_torque
     # R7's baseline is the torque actually committed this frame, taken after the driver-assist clip
-    # -- not the guard's own pre-clip value -- so a saturated hand-off can't leave a phantom-high
-    # baseline that forces an unwanted high-torque hold the instant the driver releases the wheel.
+    # (and its own backstop above) -- not the guard's own pre-clip value -- so a saturated hand-off
+    # can't leave a phantom-high baseline that forces an unwanted high-torque hold the instant the
+    # driver releases the wheel.
     self.previous_output_torque = torque
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
@@ -1037,6 +1084,7 @@ class RackTrajectoryController:
       saturated=platform_saturated,
       direction_guarded=direction_guarded,
       driver_assist_limited=driver_assist_limited,
+      driver_assist_cap=driver_assist_cap,
       early_release=early_release,
       direction_fraction=direction_fraction,
       preview_time_s=preview_s,

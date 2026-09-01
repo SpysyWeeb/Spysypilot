@@ -482,6 +482,25 @@ red-team pass.
   therefore FM4.7's provisional window, the assist cap, and the wheel nudge. → Brake
   mid-change: lane change continues, longitudinal disengages, no steering discontinuity;
   wheel nudge mid-change: reverts within one model frame.
+- **FM4.9 — Fixed assist cap ignores agreement. [v3]** *The flat `MAX_DRIVER_ASSIST_TORQUE`=0.5
+  cap pinned even when the driver pushed with the controller's own live intent, discarding
+  authority the platform's own driver-allowance limiter would already grant.* → `_driver_assist_envelope`
+  mirrors `apply_driver_steer_torque_limits`'s driver-allowance term for the commanded direction
+  (ceiling 1.0 pre-existing, R10; 0.5 is now the floor, never the cap); R7-backstopped on the
+  output every pressed frame, same idiom as the direction guard but unscoped (every pressed-frame
+  step ≤ 0.05, agreeing or not). → Envelope==1.0 exact when agreeing; opposing -300 still pins at
+  0.5; envelope matches the real limiter across a driver-torque sweep; R7 holds across the ramp's
+  102-count worst-case swing; unpressed frames stay bit-identical.
+- **FM4.10 — Fresh-grab-to-oppose inherits an unpressed baseline. [v3]** A driver who grips to
+  *oppose* right after an unpressed frame (no cap active) makes R7's baseline the prior unpressed
+  torque, not the fixed cap the old build snapped to instantly, so a full-authority-to-floor
+  transition costs up to 10 frames (0.1 s) instead of one. → Owner-accepted (Q3): the bound is
+  exactly the ceiling-to-floor distance at the R7 step, and the platform's own driver-allowance
+  limiter still yields immediately downstream (R10) regardless of this branch. → Route 2d's
+  observed worst case (idx≈1780, unpressed -0.79 into a hard opposing grab) resolves in 6 of the
+  10 allowed frames; `rack_log.driverAssistCap` now reports `DRIVER_ASSIST_CEILING` rather than the
+  capnp `Float32` default on fallback (stock-steered) frames, so this field never reads as "capped
+  to zero" when the cap simply wasn't evaluated that frame.
 
 ### L5 Runtime, fallback, integration
 
