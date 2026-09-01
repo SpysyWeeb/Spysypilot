@@ -405,7 +405,10 @@ red-team pass.
   car ran wide). Lesson for the redesign: the flip detector must witness a true *torque sign
   reversal* (an angle crossing with commitment), never a rate reversal, and any latch needs the
   entry condition re-checked as an exit. The plumbing (carOutput applied torque, earlyRelease @34)
-  remains. The anticipated-reversal `max_rate` reduction is still open (a later step).*
+  remains. The anticipated-reversal `max_rate` reduction is DROPPED from phase 3 (owner decision 2026-08-30 after the
+  65-agent panel): it may not reuse the retired t_flip/t_budget scaffolding; if it returns in phase 4 it needs a true
+  torque-sign-commitment detector with an entry condition re-checked as an exit, validated on ordinary sustained
+  curves at 15–35 m/s before any drive.*
 - **FM3.12 — Undebounced EPS fault bit resets the controller. [v2]** A 1–3 frame
   `CF_Mdps_ToiUnavail`/`ToiFlt` flicker during a firm turn. *`steerFaultTemporary` has no
   debounce; latActive drops; today the rack state is wiped and re-seeded.* → Below a short
@@ -532,6 +535,7 @@ red-team pass.
 
 1. FM4.8 — brake press aborts an *auto-started* lane change under SOL/AOL? **No (2026-08-28).**
 2. FM6.3 — two-route promotion bar alongside the single-route feel rule? **Yes (2026-08-28).**
-3. FM2.6 — source of the comfort-envelope corpus and re-derivation above 35 mph: **open** —
-   provenance of the current tables is undocumented (introduced in `24b0eb0beb` with no
-   derivation script); see the re-derivation plan in the design notes.
+3. FM2.6 — source of the comfort-envelope corpus and re-derivation above 35 mph: **closed
+   (2026-08-30)** — the tables were re-derived from the owner's 31 frozen routes (see FM2.6's own
+   entry above; under 1.1 % violation), and no further static tuning is planned because the
+   tables are slated for retirement once the learned rate-gain surface exists (phase 4).

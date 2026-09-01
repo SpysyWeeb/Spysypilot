@@ -262,7 +262,11 @@ class LateralLagEstimator:
       self.steering_pressed = msg.steeringPressed
       self.v_ego = msg.vEgo
     elif which == "controlsState":
-      self.steering_saturated = getattr(msg.lateralControlState, msg.lateralControlState.which()).saturated
+      lateral = msg.lateralControlState
+      state = getattr(lateral, lateral.which())
+      # the rack controller reports only the platform ceiling as saturated; frames it clipped for its own
+      # reasons (direction guard, driver assist) are just as unfit for lag estimation, so take its union flag
+      self.steering_saturated = bool(state.saturated or (lateral.which() == "rackState" and state.torqueLimited))
       self.desired_curvature = msg.desiredCurvature
     elif which == "extrinsicsCalibration":
       self.calibrator.feed_extrinsics_calibration(msg)
