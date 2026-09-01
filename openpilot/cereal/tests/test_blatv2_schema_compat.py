@@ -509,6 +509,7 @@ class TestBLaTv2SchemaCompatibility(unittest.TestCase):
       154: ("drivingEventRecorded", log.DrivingEventRecorded),
       155: ("blatV2Shadow", log.BlatV2Shadow),
       156: ("lateralEvent", log.LateralEvent),
+      157: ("chestnutGpuState", log.ChestnutState),
     }
     for ordinal, (name, struct_module) in expected.items():
       with self.subTest(ordinal=ordinal, name=name):
