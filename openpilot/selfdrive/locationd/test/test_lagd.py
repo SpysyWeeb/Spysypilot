@@ -86,6 +86,18 @@ class TestLagd(OpenpilotTestCase):
         params.put("CarParamsPrevRoute", CP.as_builder().to_bytes(), block=True)
         assert retrieve_initial_lag(params, CP) is None
 
+  def test_rack_controller_clipped_frames_count_as_saturated(self):
+    estimator = LateralLagEstimator(get_test_car_params(), DT)
+    # the rack arm splits the platform ceiling from its own clipping; lag estimation must skip both
+    for rack, expected in (({"saturated": False, "torqueLimited": False}, False),
+                           ({"saturated": True, "torqueLimited": True}, True),
+                           ({"saturated": False, "torqueLimited": True}, True)):
+      estimator.handle_log(0.0, "controlsState", log.ControlsState(lateralControlState={"rackState": rack}))
+      assert estimator.steering_saturated is expected
+    # other arms keep the generic field
+    estimator.handle_log(0.0, "controlsState", log.ControlsState(lateralControlState={"torqueState": {"saturated": True}}))
+    assert estimator.steering_saturated is True
+
   def test_ncc(self):
     rng = np.random.default_rng()
     lag_frames = random.randint(1, 19)

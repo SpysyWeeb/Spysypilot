@@ -4,8 +4,12 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see 
 
 **Status: ⚠️ in progress — phase 1 (behavior-preserving port of BLaTv2) merged into combo and field-validated 2026-08-29; phase 2 in progress: steps 2 and 3 (hold through model gaps; modeld's curvature preview as the rack path) merged into combo and field-validated 2026-08-29 (routes 00000023/24: every model frame carried the preview, all engaged frames `active`, no fallbacks, all stop approaches clean; the path-compile fix took controlsd from 36 % to 25 % of its core with zero skipped control frames); step 4 (bounded reference filter + scheduled preview) merged 2026-08-29, corrected 2026-08-30 after its first
 drive (the preview no longer replaces the near target) and field-validated 2026-08-30 (route 00000029: the served target within
-0.03 m/s² of the near target's demand while the preview is open, all engaged frames `active`, no preview with hands on). Next:
-phase 3, the rack-aware output stage.**
+0.03 m/s² of the near target's demand while the preview is open, all engaged frames `active`, no preview with hands on). Phase 3
+in progress: step 1 (torque-tail continuity) merged and field-validated 2026-08-30; step 2 merged 2026-08-30 — its slew-aware early
+release shed holding torque mid-curve on its first drives and was retired the same day, the rest of the step (unwind clamp replaced
+by a direction fraction, applied-torque plumbing) stands and awaits a clean drive; step 3 is a log-only on-device hold-torque
+learner (the global recalibration of torqued's prior was falsified per cell and never enters the torque path); a 65-agent panel
+review of the whole phase is in `route-audit/phase3/panel_2026-08-30/`.**
 
 ## What it does
 
@@ -13,8 +17,9 @@ BLaTv3 is the rewrite of the Palisade rack-trajectory lateral controller
 ([BLaTv2](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)). The goal is unchanged —
 steer the Palisade better than stock by executing the model's path as one smooth, swift,
 strong rack motion — but the controller is rebuilt in the shape upstream uses for a lateral
-controller, designed from a written catalog of the ways it can fail, and it retires the static
-"comfort envelope" tables in favor of two learned rack-effort surfaces.
+controller, designed from a written catalog of the ways it can fail, and it is meant to retire the static
+"comfort envelope" tables in favor of two learned rack-effort surfaces (the tables still bound
+the planned rate today; the learned surfaces are phase 4).
 
 Kept from BLaTv2 by owner decision: turn-in boost and unwind boost (as feedforward physics
 rather than sign rules), the model as the sole path authority, and the 2 s horizon — this
@@ -84,7 +89,7 @@ builds, never past a refuge island.
   through an ordinary curve exit is higher than step 1 (up to ~+0.2 on the ±1 scale at highway speed
   in a synthetic sweep; p95 +0.07 over the two replay routes) — the plan is held honestly instead of
   being bled off by the wheel's own position.
-  ⚠️ awaiting the step-1 field drive before this merges anywhere.
+  ⚠️ on combo since 2026-08-30 with the release retired; awaiting a clean drive.
 - Phase 3, step 1 — continuity and truth-telling in the torque tail, from the phase-3 design panel
   (`route-audit/phase3/design/phase3_design.md`): the turn-in feedback cap blends continuously between
   its two values instead of jumping 0.35 units at a boolean; the direction guard ramps down at its own
