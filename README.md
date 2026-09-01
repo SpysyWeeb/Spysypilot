@@ -83,6 +83,22 @@ builds, never past a refuge island.
   10 m/s the immediate target becomes the scalar itself instead of lagging it ~12 % while curvature
   builds — the intended fix, and the part a drive has to judge (intersection turns, roundabouts, creep).
   Field-validated 2026-08-29 (route 00000024, "no complaints").
+- Phase 3, step 4b — the driver-assist cap relaxes when the driver agrees: instead of a fixed 0.5 clip
+  whenever the wheel is held, the cap is a per-frame envelope mirroring opendbc's own driver-allowance
+  term for the commanded direction (a driver pushing with the controller lifts the cap toward the ISO
+  ceiling as far as the platform limiter would; an opposing driver still floors at 0.5), with the R7
+  step bound inside the branch. Replay: unpressed frames byte-identical; cap-limited hold collapses
+  2d 9 → 2, 2e 6 → 0. ⚠️ awaiting a drive.
+- Phase 3, step 4 — direction guard v2: when the plan and the served target disagree in sign, torque
+  blends toward a bounded, target-referred feedback (cap 0.18) instead of ramping to exactly zero;
+  the two boolean trips became continuous conflict fractions and R7 is enforced on the output step
+  within the guard's own blend. Replay vs step 3: exact-zero-while-active duty 1.2–1.7 % → 0.000 % on
+  three routes, bit-identical outside conflict. Merged into combo 2026-09-01, awaiting a drive.
+- Phase 3, step 3-C — the rack-effort shadow observer (`selfdrive/locationd/rack_effort_observer.py`):
+  a log-only sibling of torqued recording the hold torque the EPS actually applies against the physics
+  prior, per speed/angle/lateral-load/direction cell, bit-exact with the offline seed extractor; zero
+  torque effect by construction and by test. Its cells earn authority only later, behind a promotion
+  bar (two routes, no route over half the events, ten events). Merged into combo 2026-09-01.
 - Phase 3, step 2 — the controller reads the torque the EPS is actually applying (`carOutput`) and
   uses it for the direction fraction below; a slew-aware early release was built, closed-loop
   validated, and then RETIRED after its first field drive (route 2d, six owner bookmarks): the
