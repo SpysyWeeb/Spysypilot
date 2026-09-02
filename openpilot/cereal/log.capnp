@@ -1176,6 +1176,11 @@ struct ControlsState @0x97ff69c53601abf1 {
     driverAssistLimited @33 :Bool;
     earlyRelease @34 :Bool;
     directionFraction @35 :Float32;
+    driverAssistCap @36 :Float32;  # the envelope's effective cap this frame; 1.0 (no cap) when not pressed
+    envelopeRateDegS @37 :Float32;  # R4: the horizon-implied envelope's opened rate limit this frame, deg/s (floors at comfort)
+    envelopeAccelerationDegS2 @38 :Float32;  # and the opened acceleration limit, deg/s^2
+    envelopeJerkDegS3 @39 :Float32;  # and the opened jerk limit, deg/s^3
+    envelopePreviewTime @40 :Float32;  # seconds the confidence-free envelope scheduler's own admitted horizon reaches
   }
 
   struct LateralAngleState {

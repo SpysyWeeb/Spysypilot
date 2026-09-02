@@ -7,7 +7,7 @@ import numpy as np
 from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
-from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LATERAL_ACCEL_NO_ROLL, MIN_SPEED
+from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LATERAL_ACCEL_NO_ROLL, MAX_LATERAL_JERK, MIN_SPEED
 
 # Palisade rack trajectory controller: compiles the model path into a steering-angle target,
 # moves a jerk-limited virtual rack toward it and tracks that motion with feedforward torque
@@ -83,8 +83,13 @@ class RackTrajectoryOutput:
   near_target_angle_deg: float
   direction_guarded: bool
   driver_assist_limited: bool
+  driver_assist_cap: float
   early_release: bool
   direction_fraction: float
+  envelope_open_rate_deg_s: float
+  envelope_open_acceleration_deg_s2: float
+  envelope_open_jerk_deg_s3: float
+  envelope_preview_time_s: float
 
 
 MEASURED_RATE_FILTER_RC_S = .05
@@ -372,6 +377,18 @@ PREVIEW_LENGTHEN_UPDATES = 2  # model frames of agreement before it lengthens by
 RESPONSE_TIME_PREVIEW_S = .1  # extra tracker response time granted at the full preview
 CLOTHOID_STEPS = 20
 
+# R4 horizon-implied envelope opening (G-independent, docs/BLaTv3_FAILURE_MODES.md): a second,
+# confidence-free PreviewScheduler (envelope_scheduler, below) reuses every gate above except the
+# confidence check, corroborated instead by its own DCPC-graft frame-to-frame far-point stability
+# check (previous_far_y / PREVIEW_ENVELOPE_DRIFT_M).
+PREVIEW_ENVELOPE_DRIFT_M = .25  # route-20 decode (owner Q2, 31,107 model frames): |dy@2s| between
+                                 # consecutive model frames swings 0.2-2.0 m through the island
+                                 # window while the 1s point stays 0.03-0.25 m; this flat gate
+                                 # admits the stable near approach and rejects the swinging far end
+ENVELOPE_OPEN_MARGIN = 1.15  # demand is re-derived from the live horizon every frame, so a modest margin suffices
+ENVELOPE_EASE_UP_RC_S = HORIZON_STEP_S  # owner Q4: tied to the scheduler's own lengthen pace so
+                                         # ease-up can never lag PREVIEW_LENGTHEN_UPDATES's own admission rate
+
 
 def _arc_y(curvature: float, x: np.ndarray) -> np.ndarray:
   if abs(curvature) < 1e-9:
@@ -407,12 +424,16 @@ class PreviewScheduler:
   calmer reference (a longer filter time constant) and a longer response time.
   """
 
-  def __init__(self) -> None:
+  def __init__(self, require_confidence: bool = True) -> None:
+    # require_confidence=False (R4's envelope_scheduler): every gate above still applies except
+    # the confidence check, corroborated instead by previous_far_y's own temporal-stability check.
+    self.require_confidence = require_confidence
     self.index = 0
     self.fail_updates = 0
     self.pass_updates = 0
     self.last_model_timestamp_ns: int | None = None
     self.previous_angles: tuple[float, ...] | None = None
+    self.previous_far_y: tuple[float, ...] | None = None
 
   def reset(self) -> None:
     self.index = 0
@@ -420,6 +441,7 @@ class PreviewScheduler:
     self.pass_updates = 0
     self.last_model_timestamp_ns = None
     self.previous_angles = None
+    self.previous_far_y = None
 
   @property
   def preview_s(self) -> float:
@@ -430,6 +452,11 @@ class PreviewScheduler:
       self.index = 0
       self.fail_updates = 0
       self.pass_updates = 0
+      # R4 fix: a forced frame skips _admissible entirely below, so it must clear the DCPC
+      # baseline itself -- otherwise the next real frame compares against a pre-event far point
+      # instead of treating the resumed data as having no baseline yet (previous_angles has no
+      # analogous gap: it is always refreshed unconditionally a few lines down).
+      self.previous_far_y = None
     timestamp = int(model_timestamp_ns)
     if timestamp == self.last_model_timestamp_ns:
       return self.index
@@ -459,7 +486,11 @@ class PreviewScheduler:
   def _admissible(self, model, action_time_s: float, targets: Sequence[PathTarget], angles: tuple[float, ...]) -> int:
     position = model.position
     times = np.asarray(position.t, dtype=np.float64)
-    if len(times) < 2 or len(position.x) != len(times) or len(position.y) != len(times) or str(model.confidence) == "red":
+    if len(times) < 2 or len(position.x) != len(times) or len(position.y) != len(times):
+      self.previous_far_y = None  # R4 fix: no valid position data -- drop the DCPC baseline
+                                    # rather than let a later frame compare against it stale
+      return 0
+    if self.require_confidence and str(model.confidence) == "red":
       return 0
     xs = np.asarray(position.x, dtype=np.float64)
     ys = np.asarray(position.y, dtype=np.float64)
@@ -468,6 +499,8 @@ class PreviewScheduler:
     speeds = np.asarray(model.velocity.x, dtype=np.float64)
     # a path with a hole in it proves nothing: comparisons against NaN never fail, so check up front
     if not all(np.isfinite(array).all() for array in (times, xs, ys, speed_times, speeds)) or (y_std is not None and not np.isfinite(y_std).all()):
+      self.previous_far_y = None  # R4 fix: same rationale -- a NaN/holed frame must not leave a
+                                    # stale (or, worse, NaN-poisoned) baseline for the next frame
       return 0
     x_action = float(np.interp(action_time_s, times, xs))
     near = targets[0]
@@ -491,7 +524,16 @@ class PreviewScheduler:
       sample_times = np.linspace(action_time_s, far_time, 9)
       if float(np.trapezoid(np.interp(sample_times, speed_times, speeds), sample_times)) > PREVIEW_MAX_DISTANCE_M:
         break
+      if not self.require_confidence:
+        # DCPC graft: cheap insurance for the "smooth but wrong" defense that dropping confidence
+        # removes -- this step's own far prediction must hold steady frame to frame, not just be
+        # smooth against the current frame's own near-to-far shape.
+        y_far = float(np.interp(far_time, times, ys))
+        if self.previous_far_y is not None and abs(y_far - self.previous_far_y[index]) > PREVIEW_ENVELOPE_DRIFT_M:
+          break
       admitted = index
+    if not self.require_confidence:
+      self.previous_far_y = tuple(float(np.interp(action_time_s + offset, times, ys)) for offset in HORIZON_OFFSETS_S)
     return admitted
 
 
@@ -504,7 +546,8 @@ HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
 TURN_IN_BLEND_DEG = 3.0  # the feedback cap blends between its two values over this much angle, not a boolean jump
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
-MAX_DRIVER_ASSIST_TORQUE = .5
+MAX_DRIVER_ASSIST_TORQUE = .5     # unchanged value; now the envelope's FLOOR, not its fixed cap
+DRIVER_ASSIST_CEILING = 1.0       # == the ISO clip already applied upstream; not a new ceiling (R10)
 # Direction guard v2 (target-referred bounded fallback, docs/BLaTv3_FAILURE_MODES.md FM3.5/FM3.9/R7/R10):
 R7_MAX_TORQUE_STEP = .05  # existing rule bound (FM3.5: "R7 sweeps, jump < 0.05"), reused on the output verbatim
 GUARD_TORQUE_BLEND = .05  # set equal to R7_MAX_TORQUE_STEP: an opposing torque smaller than the R7 step can't
@@ -623,9 +666,40 @@ def _direction_guard(
   return guarded_torque, new_scale, guarded_torque != torque
 
 
+@dataclass(frozen=True, slots=True)
+class DriverAssistLimits:
+  """The four opendbc.car.hyundai.values.CarControllerParams fields _driver_assist_envelope needs,
+  threaded in by LatControlRack as plain floats -- this module never imports opendbc.car.hyundai
+  (owner decision, docs/BLaTv3_FAILURE_MODES.md FM4.9): the driver-allowance term crosses the
+  package boundary, not the platform import. Field names match the real dataclass's own so the
+  formula below reads exactly like opendbc's."""
+  STEER_MAX: float
+  STEER_DRIVER_ALLOWANCE: float
+  STEER_DRIVER_MULTIPLIER: float
+  STEER_DRIVER_FACTOR: float
+
+
+def _driver_assist_envelope(driver_torque_counts: float, commanded_torque: float, limits: DriverAssistLimits) -> float:
+  """Mirrors opendbc.car.lateral.apply_driver_steer_torque_limits' own driver-allowance term for
+  commanded_torque's direction (opendbc_repo/opendbc/car/lateral.py:76-79): a driver already
+  pushing with the controller's own live intent widens the cap toward DRIVER_ASSIST_CEILING exactly
+  as far as the platform's own driver-override limiter already would; an opposing driver still
+  floors at MAX_DRIVER_ASSIST_TORQUE (never less than today's fixed cap -- the real limiter is
+  re-enforced for real downstream at the CAN layer regardless, R10). Pure, stateless."""
+  if commanded_torque == 0.0:
+    return DRIVER_ASSIST_CEILING
+  direction = math.copysign(1.0, commanded_torque)
+  d = driver_torque_counts * direction            # d>0: driver pushes WITH the command
+  allowed = limits.STEER_MAX + (limits.STEER_DRIVER_ALLOWANCE
+                                 + d * limits.STEER_DRIVER_FACTOR) * limits.STEER_DRIVER_MULTIPLIER
+  allowed = max(min(limits.STEER_MAX, allowed), 0.0)          # identical clamp to the real fn
+  return max(allowed / limits.STEER_MAX, MAX_DRIVER_ASSIST_TORQUE)
+
+
 class RackTrajectoryController:
-  def __init__(self, dt: float = DT) -> None:
+  def __init__(self, dt: float = DT, driver_assist_limits: DriverAssistLimits | None = None) -> None:
     self.dt = dt
+    self.driver_assist_limits = driver_assist_limits  # None preserves the fixed cap for callers without a CP
     self.model = None
     self.state_mono_ns = 0
     self.inactive_frames = 0
@@ -640,6 +714,8 @@ class RackTrajectoryController:
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_filter = ReferenceFilter()
     self.preview_scheduler = PreviewScheduler()
+    self.envelope_scheduler = PreviewScheduler(require_confidence=False)  # R4: proactive, G-independent
+    self.envelope_open_rate = self.envelope_open_accel = self.envelope_open_jerk = 0.0  # eased state; floors at comfort
     self.rack_rate_estimator = RackRateEstimator(dt)
 
   def set_model(self, model, state_mono_ns: int) -> None:
@@ -668,6 +744,8 @@ class RackTrajectoryController:
     self.jerk_filter.x = 0.0
     self.reference_filter.reset()
     self.preview_scheduler.reset()
+    self.envelope_scheduler.reset()
+    self.envelope_open_rate = self.envelope_open_accel = self.envelope_open_jerk = 0.0
     self.rack_rate_estimator.reset()
 
   def _invalidate(self, status: int) -> None:
@@ -682,6 +760,62 @@ class RackTrajectoryController:
       float(np.interp(speed_mph, _SPEED_PROFILE_MPH, _ACCEL_PROFILE_DEG_S2)),
       float(np.interp(speed_mph, _SPEED_PROFILE_MPH, _JERK_PROFILE_DEG_S3)),
       response_time_s,
+    )
+
+  @staticmethod
+  def _iso_ceiling(speed_mps: float, VM, roll: float, comfort: MotionLimits) -> MotionLimits:
+    """R4/R9/R10: the envelope's ceiling is the ISO clamp already enforced upstream on
+    desired_curvature (drive_helpers.clip_curvature: MAX_LATERAL_JERK, MAX_LATERAL_ACCEL_NO_ROLL),
+    not a new number -- provably no more permissive than what the scalar curvature itself could
+    ever ramp to. Owner Q1 (computed with the real Palisade VM, roll 0): clears the documented
+    2-4x brisker-reaction band at the island scenario's speed (2.34x comfort at 40 mph), narrowing
+    to 1.37x by 70 mph -- accepted as-is, no corpus p99.9 blend."""
+    speed = max(speed_mps, MIN_SPEED)
+    curvature_rate = MAX_LATERAL_JERK / speed ** 2  # clip_curvature's own formula
+    deg_per_curvature = 1.0 / max(abs(-VM.calc_curvature(math.radians(1.0), speed, roll)), 1e-9)
+    rate_ceiling = curvature_rate * deg_per_curvature
+    # the acceleration and jerk legs open by the same factor the ISO rate ceiling allows over the
+    # comfort table (never below it): deriving them by dividing the rate by the response time put
+    # them under the comfort tables at nearly every speed, so the rate opened and the plan could not
+    # accelerate into it -- exactly the blunting the design's dissent asked to check with numbers
+    opening = max(rate_ceiling / max(comfort.max_rate_deg_s, 1e-9), 1.0)
+    return MotionLimits(rate_ceiling, comfort.max_acceleration_deg_s2 * opening, comfort.max_jerk_deg_s3 * opening,
+                        comfort.response_time_s)
+
+  def _horizon_opened_profile(
+    self, comfort: MotionLimits, targets: Sequence[PathTarget], g_env: int, ceiling: MotionLimits,
+  ) -> MotionLimits:
+    """R4 proactive opening (G-independent): how far the comfort envelope opens is driven by what
+    the model's own admitted horizon (envelope_scheduler.index, g_env) already implies the plan
+    will need -- margined (ENVELOPE_OPEN_MARGIN) and capped at the ISO ceiling -- never by the
+    current lateral acceleration or error. A bounded one-pole state per limit keeps the OPENING
+    side continuous (R7): snap down the same frame the demand or the admitted horizon falls, ease
+    up over one horizon step otherwise (owner Q4, ENVELOPE_EASE_UP_RC_S = HORIZON_STEP_S). The
+    resulting profile feeds _motion_limits unmodified, which only ever narrows further."""
+    if g_env == 0:
+      required_rate = required_accel = 0.0
+    else:
+      admitted = targets[:g_env + 1]
+      required_rate = max(abs(target.rate_deg_s) for target in admitted[1:])
+      required_accel = max(
+        abs(admitted[index].rate_deg_s - admitted[index - 1].rate_deg_s) / HORIZON_STEP_S
+        for index in range(1, len(admitted))
+      )
+    raw_rate = min(max(comfort.max_rate_deg_s, required_rate * ENVELOPE_OPEN_MARGIN), ceiling.max_rate_deg_s)
+    raw_accel = min(max(comfort.max_acceleration_deg_s2, required_accel * ENVELOPE_OPEN_MARGIN), ceiling.max_acceleration_deg_s2)
+    raw_jerk = min(max(comfort.max_jerk_deg_s3, raw_accel / RESPONSE_TIME_S), ceiling.max_jerk_deg_s3)
+
+    def ease(attribute: str, raw: float, floor: float) -> float:
+      current = getattr(self, attribute)
+      new = raw if (g_env == 0 or raw <= current) else current + (self.dt / (ENVELOPE_EASE_UP_RC_S + self.dt)) * (raw - current)
+      setattr(self, attribute, new)
+      return max(new, floor)
+
+    return MotionLimits(
+      ease("envelope_open_rate", raw_rate, comfort.max_rate_deg_s),
+      ease("envelope_open_accel", raw_accel, comfort.max_acceleration_deg_s2),
+      ease("envelope_open_jerk", raw_jerk, comfort.max_jerk_deg_s3),
+      comfort.response_time_s,
     )
 
   def _motion_limits(self, profile: MotionLimits) -> tuple[MotionLimits, bool]:
@@ -819,10 +953,10 @@ class RackTrajectoryController:
     measured_out_of_bounds = not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9
     # the driver's hands, a lane change or a limited immediate target pin the preview at the action time
     lane_changing = str(self.model.meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
-    self.preview_scheduler.update(
-      self.model, int(self.model.timestampEof), float(preview_times[0]), targets,
-      bool(CS.steeringPressed) or lane_changing or target_limits[0] or measured_out_of_bounds,
-    )
+    forced = bool(CS.steeringPressed) or lane_changing or target_limits[0] or measured_out_of_bounds
+    self.preview_scheduler.update(self.model, int(self.model.timestampEof), float(preview_times[0]), targets, forced)
+    # R4 envelope scheduler: same gates and hysteresis, confidence-free (docs/BLaTv3_FAILURE_MODES.md R4)
+    self.envelope_scheduler.update(self.model, int(self.model.timestampEof), float(preview_times[0]), targets, forced)
     preview_s = self.preview_scheduler.preview_s
     target = targets[0]
     path_limited = target_limits[0]
@@ -840,7 +974,9 @@ class RackTrajectoryController:
       self.planner.rate_deg_s = math.copysign(profile.max_rate_deg_s, self.planner.rate_deg_s)
     if 0.0 < abs(self.planner.acceleration_deg_s2) - profile.max_acceleration_deg_s2 <= 1e-6:
       self.planner.acceleration_deg_s2 = math.copysign(profile.max_acceleration_deg_s2, self.planner.acceleration_deg_s2)
-    limits, profile_transition = self._motion_limits(profile)
+    ceiling = self._iso_ceiling(float(CS.vEgo), VM, float(params.roll), profile)
+    opened_profile = self._horizon_opened_profile(profile, targets, self.envelope_scheduler.index, ceiling)
+    limits, profile_transition = self._motion_limits(opened_profile)  # opened profile feeds the ratchet, never the reverse (R4/R10)
     filtered_target = self.reference_filter.update(
       RackTarget(target.angle_deg, target.rate_deg_s), reference_trail_limit_deg(VM, CS.vEgo), self.dt,
       path_limited or measured_out_of_bounds or profile_transition,
@@ -997,13 +1133,27 @@ class RackTrajectoryController:
       self._invalidate(STATUS_INVALID_OUTPUT)
       return None
     driver_assist_limited = False
+    driver_assist_cap = DRIVER_ASSIST_CEILING
     if CS.steeringPressed:
-      assisted_torque = _clip(torque, MAX_DRIVER_ASSIST_TORQUE)
+      # Agreement relaxation (docs/BLaTv3_FAILURE_MODES.md FM4.9): a driver pushing with the
+      # controller's own live intent widens the cap toward 1.0, exactly as far as the platform's
+      # own driver-allowance limiter already would; an opposing driver still floors at
+      # MAX_DRIVER_ASSIST_TORQUE. Falls back to the old fixed cap for callers with no CP (tests,
+      # any future caller that hasn't threaded driver_assist_limits through).
+      driver_assist_cap = (
+        _driver_assist_envelope(CS.steeringTorque, torque, self.driver_assist_limits)
+        if self.driver_assist_limits is not None else MAX_DRIVER_ASSIST_TORQUE
+      )
+      assisted_torque = _clip(torque, driver_assist_cap)
+      if self.previous_output_torque is not None:  # same R7 idiom as _direction_guard, scoped to this branch
+        assisted_torque = min(max(assisted_torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
+                               self.previous_output_torque + R7_MAX_TORQUE_STEP)
       driver_assist_limited = assisted_torque != torque
       torque = assisted_torque
     # R7's baseline is the torque actually committed this frame, taken after the driver-assist clip
-    # -- not the guard's own pre-clip value -- so a saturated hand-off can't leave a phantom-high
-    # baseline that forces an unwanted high-torque hold the instant the driver releases the wheel.
+    # (and its own backstop above) -- not the guard's own pre-clip value -- so a saturated hand-off
+    # can't leave a phantom-high baseline that forces an unwanted high-torque hold the instant the
+    # driver releases the wheel.
     self.previous_output_torque = torque
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
@@ -1037,9 +1187,16 @@ class RackTrajectoryController:
       saturated=platform_saturated,
       direction_guarded=direction_guarded,
       driver_assist_limited=driver_assist_limited,
+      driver_assist_cap=driver_assist_cap,
       early_release=early_release,
       direction_fraction=direction_fraction,
       preview_time_s=preview_s,
       reference_limited=self.reference_filter.limited,
       near_target_angle_deg=target.angle_deg,
+      # the floored (effective) values -- what _motion_limits actually received -- not the raw
+      # internal one-pole state, which the jerk leg in particular can transiently sit below
+      envelope_open_rate_deg_s=opened_profile.max_rate_deg_s,
+      envelope_open_acceleration_deg_s2=opened_profile.max_acceleration_deg_s2,
+      envelope_open_jerk_deg_s3=opened_profile.max_jerk_deg_s3,
+      envelope_preview_time_s=self.envelope_scheduler.preview_s,
     )

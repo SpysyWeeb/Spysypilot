@@ -1,7 +1,10 @@
+from opendbc.car.hyundai.values import CarControllerParams
 from openpilot.cereal import log
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
-from openpilot.selfdrive.controls.lib.rack_trajectory import INACTIVE_HOLD_FRAMES, STATUS_STALE_MODEL, RackTrajectoryController
+from openpilot.selfdrive.controls.lib.rack_trajectory import (
+  DRIVER_ASSIST_CEILING, DriverAssistLimits, INACTIVE_HOLD_FRAMES, STATUS_STALE_MODEL, RackTrajectoryController,
+)
 
 # Executes the model path as a planned rack motion (see rack_trajectory.py) and tracks it with
 # torque. A stock torque controller is stepped alongside every frame, so any frame the rack
@@ -20,7 +23,17 @@ class LatControlRack(LatControl):
   def __init__(self, CP, CI, dt):
     super().__init__(CP, CI, dt)
     self.torque = LatControlTorque(CP, CI, dt)
-    self.rack = RackTrajectoryController(dt)
+    # driver-assist agreement relaxation (docs/BLaTv3_FAILURE_MODES.md FM4.9): build the platform's
+    # own driver-override limits here (this class already holds CP/CI) and hand the rack controller
+    # only the four constants it needs, as plain floats -- rack_trajectory.py never imports
+    # opendbc.car.hyundai.
+    limits = CarControllerParams(CP)
+    self.rack = RackTrajectoryController(dt, driver_assist_limits=DriverAssistLimits(
+      STEER_MAX=float(limits.STEER_MAX),
+      STEER_DRIVER_ALLOWANCE=float(limits.STEER_DRIVER_ALLOWANCE),
+      STEER_DRIVER_MULTIPLIER=float(limits.STEER_DRIVER_MULTIPLIER),
+      STEER_DRIVER_FACTOR=float(limits.STEER_DRIVER_FACTOR),
+    ))
     self.fallback_hold_frames = int(FALLBACK_HOLD_S / dt)
     self.fallback_frames = 0
     self.output = None
@@ -70,6 +83,9 @@ class LatControlRack(LatControl):
       rack_log.desiredLateralAccel = stock_log.desiredLateralAccel
       rack_log.desiredLateralJerk = stock_log.desiredLateralJerk
       rack_log.saturated = stock_log.saturated
+      # no rack-computed cap applies this frame (stock is steering); log the ceiling rather than
+      # the Float32 default of 0.0, which would misread as "capped to zero" instead of "not active"
+      rack_log.driverAssistCap = DRIVER_ASSIST_CEILING
       return stock_torque, 0.0, rack_log
 
     # the stock controller is idle while the rack controller steers; its integrator starts clean if it takes over
@@ -105,8 +121,13 @@ class LatControlRack(LatControl):
     rack_log.nearSteeringAngleDeg = float(output.near_target_angle_deg)
     rack_log.directionGuarded = bool(output.direction_guarded)
     rack_log.driverAssistLimited = bool(output.driver_assist_limited)
+    rack_log.driverAssistCap = float(output.driver_assist_cap)
     rack_log.earlyRelease = bool(output.early_release)
     rack_log.directionFraction = float(output.direction_fraction)
+    rack_log.envelopeRateDegS = float(output.envelope_open_rate_deg_s)
+    rack_log.envelopeAccelerationDegS2 = float(output.envelope_open_acceleration_deg_s2)
+    rack_log.envelopeJerkDegS3 = float(output.envelope_open_jerk_deg_s3)
+    rack_log.envelopePreviewTime = float(output.envelope_preview_time_s)
     rack_log.saturated = bool(self._check_saturation(output.saturated or self.steer_max - abs(output.torque) < 1e-3, CS,
                                                      steer_limited_by_safety, curvature_limited))
     self.torque.sat_time = self.sat_time
