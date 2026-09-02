@@ -3,18 +3,17 @@ import math
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
-from openpilot.selfdrive.controls.lib.smooth_stops import (HOLD_RELEASE_FRAMES, SETTLE_JERK, STANDSTILL_HOLD_SPEED,
-                                                            STANDSTILL_SPEED, STOP_KISS_DECEL, SmoothStopController)
+from openpilot.selfdrive.controls.lib.smooth_stops import (HOLD_RELEASE_FRAMES, SETTLE_JERK, STANDSTILL_SPEED, STOP_KISS_DECEL,
+                                                            SmoothStopController)
 
 
 def test_the_hold_only_arms_on_a_stopped_car_and_inside_the_plans_stop_window():
   controller = SmoothStopController()
-  assert not controller.want_hold(True, 0.2, standstill=False)
-  assert controller.want_hold(True, STANDSTILL_SPEED, standstill=False)
-  assert controller.want_hold(True, 0.1, standstill=True)
-  assert not controller.want_hold(True, 0.2, standstill=True)             # the car's flag is not believed while rolling
-  assert not controller.want_hold(False, 0.0, standstill=True)
-  assert should_stop(STANDSTILL_HOLD_SPEED, 0.0)                          # the two gates nest: hold speeds sit inside the stop window
+  assert not controller.want_hold(True, 0.2)
+  assert controller.want_hold(True, STANDSTILL_SPEED)
+  assert not controller.want_hold(True, 0.1)                              # still rolling: the kiss keeps the stop, not the car
+  assert not controller.want_hold(False, 0.0)
+  assert should_stop(STANDSTILL_SPEED, 0.0)                               # the two gates nest: the hold speed sits inside the stop window
 
 
 def test_the_landing_keeps_the_kiss_on_and_passes_harder_plan_braking_through():

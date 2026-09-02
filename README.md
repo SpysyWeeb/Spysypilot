@@ -40,6 +40,8 @@ with its own brake whatever is requested — the last moment of a stop is the ca
 
 ## What changed
 
+- **2026-09-02 — the hand-off waits for 0.05 m/s.** `want_hold` no longer trusts the car's standstill flag (the Palisade asserts it at ~0.6 m/s). Route 0x3e: after StopReq the ESP ignores the request for ~0.8 s, so a hand-off at 0.10 m/s rolled 4 cm on the flat and 16–21 cm on a 7 % downhill, felt as "stopped, then creeping". The kiss now carries the car to 0.05 m/s before the hold. Awaiting the owner's drive.
+
 - `openpilot/selfdrive/controls/lib/smooth_stops.py` *(new)* — the `SmoothStopController`: hold arm/release and the landing.
 - `openpilot/selfdrive/controls/lib/longcontrol.py` — the stopping-state transition and hold release route through the
   controller; the pid branch lands the car while the plan's stop bit is set.
