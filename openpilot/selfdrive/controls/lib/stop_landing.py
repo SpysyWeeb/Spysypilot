@@ -84,7 +84,6 @@ class StopLanding:
 
   def reset(self):
     self.landing = False
-    self.active = False       # the law changed the plan this frame
     self._positive_frames = 0
     self._reset_watchdog()
 
@@ -114,13 +113,13 @@ class StopLanding:
     then lasts -- through the MPC's hover around zero and through standstill -- until a launch, the plan climbing above
     zero for LAUNCH_FRAMES in a row, or the speed leaving the window.
     """
-    if v_ego >= LANDING_SPEED:
+    if not math.isfinite(v_ego) or v_ego >= LANDING_SPEED:
       self.reset()
       return a_target
+    v_ego = max(v_ego, 0.0)
     if not self.landing:
       # a landing starts on intent with the plan braking more than the kiss: a hover frame right after a launch is not a stop
       if not (stop_intent and a_target < -KISS_DECEL):
-        self.active = False
         return a_target
       self.landing = True
       self._positive_frames = 0
@@ -152,6 +151,4 @@ class StopLanding:
       # never lifted above the lead's requirement; a plan already braking less than that is left where it is
       output = min(a_target + lift, max(a_target, -requirement))
     output = min(output, -floor) if floor > 0.0 else output
-    output = max(output, -bound, ACCEL_MIN)
-    self.active = output != a_target
-    return output
+    return max(output, -bound, ACCEL_MIN)

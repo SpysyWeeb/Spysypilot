@@ -13,7 +13,7 @@ def frames(seconds):
 
 
 def lead(v=15.0, d=30.0, a=0.0):
-  return LeadObservation(True, distance=d, speed=v, acceleration=a, model_prob=1.0)
+  return LeadObservation(True, distance=d, speed=v, acceleration=a)
 
 
 def run(supervisor, observation, v_ego, a_mpc, seconds, predicted_lead_accel=None):
@@ -90,10 +90,8 @@ class TestPads:
   def test_pads_saturate_instead_of_vanishing_above_the_onset_limit(self):
     # 10 m/s toward a stopped lead 30 m out needs 1.9 m/s^2, past ONSET_MAX_A_REQ; the pad must stay at its ceiling
     policy = run(NecessitySupervisor(), lead(v=0.0, d=30.0), 10.0, -1.9, 2.0)
-    assert not policy.stand_down
     assert math.isclose(policy.t_follow_pad, STOPPED_LEAD_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
     policy = run(NecessitySupervisor(), lead(v=10.0, d=20.0, a=-3.0), 15.0, -3.4, 2.0)
-    assert not policy.stand_down
     assert math.isclose(policy.t_follow_pad, ONSET_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_pads_respect_their_slew_rates(self):
@@ -107,18 +105,19 @@ class TestPads:
 
 
 class TestStandDown:
+  # a stand-down is observable only as the stock policy: no pad, no softening
   def test_matched_mpc_braking_is_not_a_stand_down(self):
-    assert not NecessitySupervisor().update(lead(v=0.0, d=24.0, a=-0.15), 8.0, -1.5).stand_down
+    assert NecessitySupervisor().update(lead(v=0.0, d=24.0, a=-0.15), 8.0, -1.5).t_follow_pad > 0.0
 
   def test_a_nonfinite_mpc_target_stands_down(self):
-    assert NecessitySupervisor().update(lead(v=0.0, d=24.0, a=-0.15), 8.0, math.nan).stand_down
+    policy = NecessitySupervisor().update(lead(v=0.0, d=24.0, a=-0.15), 8.0, math.nan)
+    assert policy.t_follow_pad == 0.0 and policy.jerk_scale == 1.0
 
   def test_stand_down_returns_toward_the_stock_policy(self):
     supervisor = NecessitySupervisor()
     run(supervisor, lead(), 15.0, -2.0, 1.0)
     policy = run(supervisor, lead(v=2.0, d=15.0, a=-2.0), 10.0, -1.0, 1.0)
-    assert policy.stand_down
-    assert policy.jerk_scale == 1.0
+    assert policy.jerk_scale == 1.0 and policy.t_follow_pad == 0.0
 
 
 class TestLowSpeedHold:
@@ -136,7 +135,7 @@ class TestLowSpeedHold:
   def test_a_stand_down_release_is_not_frozen_by_the_crawl(self):
     supervisor = NecessitySupervisor()
     run(supervisor, lead(), 15.0, -2.0, 1.0)
-    assert supervisor.update(lead(v=0.0, d=5.0, a=-2.0), 2.0, 0.0).stand_down
+    assert supervisor.update(lead(v=0.0, d=5.0, a=-2.0), 2.0, 0.0).jerk_scale > JERK_SCALE_MIN
     assert run(supervisor, lead(v=0.0, d=5.0, a=-2.0), 0.5, 0.0, 1.0).jerk_scale == 1.0
 
   def test_the_hold_releases_after_lead_loss_and_reset(self):

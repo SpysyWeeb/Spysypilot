@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import math
 
 from openpilot.cereal import log
-from openpilot.selfdrive.controls.lib.longitudinal_lead import lead_present, relevant_lead
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LEAD_PATH_MARGIN, lead_present, relevant_lead
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 # The deployed model publishes no traffic-light or stop-sign class. These tiers describe a generic,
@@ -34,10 +34,10 @@ STOP_EARLY_HINT_ENTRY_CONFIDENCE = 0.70
 STOP_SAMPLE_MIN_CONFIDENCE = 0.70
 
 STOP_RELEASE_PATH_MIN_DISTANCE = 20.0
+PATH_OPEN_LENGTH = 30.0    # m, a raw path this long reads as "the way ahead is open" (red-light stubs sit at 2-5 m; greens open 30-60 m)
 STOP_RELEASE_TERMINAL_SPEED_MIN = 3.0
 STOP_COMMIT_MAX_DISTANCE = 100.0
 LEAD_STOP_PATH_HALF_WIDTH = 1.5
-LEAD_PATH_MARGIN = 10.0
 MODEL_INVALID_RELEASE_S = 0.5
 
 COMMITTED_TURN_MAX_SPEED = 8.0
@@ -70,6 +70,11 @@ def _finite(values):
 def model_complete_and_finite(model):
   return (len(model.position.x) == ModelConstants.IDX_N and len(model.velocity.x) == ModelConstants.IDX_N
           and _finite(model.position.x) and _finite(model.velocity.x))
+
+
+def path_open(path_end):
+  # the one "road opened" predicate on the raw path length; stop_release_open below is its moving-path form
+  return path_end is not None and path_end > PATH_OPEN_LENGTH
 
 
 def stop_release_open(model):
@@ -157,7 +162,6 @@ def observe_model_stop(model, car_state, radar_state):
 
 
 def lane_changing(model):
-  try:
-    return model.meta.laneChangeState != log.LateralPlan.LaneChangeState.off
-  except (AttributeError, TypeError, ValueError):
-    return False
+  # log.LaneChangeState is the top-level enum (as controlsd and desire_helper read it); the earlier guarded lookup under
+  # LateralPlan never resolved and returned False on every frame, so the lane-change re-qualification (D21) was inert until 2026-09-02
+  return model.meta.laneChangeState != log.LaneChangeState.off

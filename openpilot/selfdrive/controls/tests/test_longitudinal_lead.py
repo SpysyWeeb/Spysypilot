@@ -48,7 +48,6 @@ class TestLeadObservation:
     assert lead.present
     assert lead.speed == 0.0
     assert lead.acceleration == -10.0
-    assert lead.model_prob == 1.0
 
 
 class TestLeadPhysics:

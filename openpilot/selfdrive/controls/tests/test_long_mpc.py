@@ -47,13 +47,11 @@ class TestUpdateProtocol:
     mpc.set_cur_state(10.0, 0.0)
     mpc.update(radar_state(d_one=20.0, v_one=8.0), STANDARD, jerk_scale=0.3, t_follow_pad=0.5)
     assert mpc.source == LongitudinalPlanSource.lead0
-    assert mpc.lead0_policy_active
     assert weights[-1][2] == 0.3
     assert math.isclose(mpc.params[0, 4], get_T_FOLLOW(STANDARD) + 0.5, rel_tol=1e-6, abs_tol=1e-9)
 
     mpc.update(radar_state(d_one=80.0, v_one=8.0, d_two=20.0, v_two=8.0), STANDARD, jerk_scale=0.3, t_follow_pad=0.5)
     assert mpc.source == LongitudinalPlanSource.lead1
-    assert not mpc.lead0_policy_active
     assert weights[-1][2] == 1.0
     assert math.isclose(mpc.params[0, 4], get_T_FOLLOW(STANDARD), rel_tol=1e-6, abs_tol=1e-9)
 
@@ -62,11 +60,9 @@ class TestUpdateProtocol:
     mpc.set_cur_state(10.0, -1.0)
     for _ in range(5):
       mpc.update(radar_state(d_one=15.0, v_one=6.0), STANDARD, jerk_scale=0.3)
-    assert mpc.lead0_policy_adaptive
     assert not np.allclose(mpc.params[:, 3], -1.0)
     mpc.set_cur_state(10.0, -1.0)
     mpc.update(radar_state(d_one=80.0, v_one=8.0, d_two=15.0, v_two=6.0), STANDARD, jerk_scale=0.3)
-    assert not mpc.lead0_policy_adaptive
     assert np.allclose(mpc.params[:, 3], -1.0)
 
   def test_a_new_binding_obstacle_reanchors_the_change_cost(self):

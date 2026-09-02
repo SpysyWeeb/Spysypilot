@@ -13,7 +13,7 @@ NO_LEAD = LeadObservation()
 
 
 def lead(distance, speed=0.0, acceleration=0.0):
-  return LeadObservation(True, distance, speed, acceleration, 1.0)
+  return LeadObservation(True, distance, speed, acceleration)
 
 
 def frames(seconds):
@@ -34,13 +34,12 @@ class TestCorridor:
     assert math.isclose(landing_bound(0.9), 0.93, rel_tol=1e-9, abs_tol=1e-9)
     assert math.isclose(landing_bound(KISS_SPEED), KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
     # at the top of the window the bound sits above any comfort approach
-    assert law.update(-2.0, 3.0, NO_LEAD, True) == -2.0 and not law.active
+    assert law.update(-2.0, 3.0, NO_LEAD, True) == -2.0
     assert math.isclose(law.update(-2.0, 1.5, NO_LEAD, True), -1.35, rel_tol=1e-9, abs_tol=1e-9)
-    assert law.active
     assert math.isclose(law.update(-2.0, 0.5, NO_LEAD, True), -landing_bound(0.5), rel_tol=1e-9, abs_tol=1e-9)
     assert landing_bound(0.5) < 0.35    # the kiss arrives early enough for the ESP's ~0.7 s release to land by the wheel stop
     # a plan inside the corridor passes untouched
-    assert law.update(-0.5, 1.5, NO_LEAD, True) == -0.5 and not law.active
+    assert law.update(-0.5, 1.5, NO_LEAD, True) == -0.5
 
   def test_the_floor_keeps_a_landing_braking_and_fades_above_creep_speed(self):
     assert math.isclose(landing_floor(CREEP_SPEED), CREEP_DECEL, rel_tol=1e-9, abs_tol=1e-9)
@@ -48,9 +47,8 @@ class TestCorridor:
     assert math.isclose(landing_floor(KISS_SPEED), KISS_DECEL, rel_tol=1e-9, abs_tol=1e-9)
     law = landing()
     assert math.isclose(law.update(-0.05, 0.8, NO_LEAD, True), -landing_floor(0.8), rel_tol=1e-9, abs_tol=1e-9)
-    assert law.active
     # above the fade the floor is gone: an easing plan in a queue is not dragged to a stop
-    assert law.update(-0.05, 2.0, NO_LEAD, True) == -0.05 and not law.active
+    assert law.update(-0.05, 2.0, NO_LEAD, True) == -0.05
     # the floor never starts a landing on its own
     assert StopLanding().update(-0.05, 0.8, NO_LEAD, False) == -0.05
 
@@ -78,6 +76,12 @@ class TestCorridor:
 
 
 class TestLatchAndLaunch:
+  def test_a_nonfinite_speed_leaves_the_plan_alone(self):
+    law = landing()
+    assert law.update(-2.0, math.nan, NO_LEAD, True) == -2.0 and not law.landing
+    assert law.update(-2.0, math.inf, NO_LEAD, True) == -2.0
+    assert math.isclose(law.update(-2.0, -0.01, NO_LEAD, True), -2.0, rel_tol=1e-9, abs_tol=1e-9) or law.landing
+
   def test_a_hover_around_zero_is_held_at_the_floor_and_never_flickers(self):
     # route 28: the MPC column lets go of the brake by 0.2 m/s and alternates +-0.1 around zero
     law = landing(0.3, -0.2)
@@ -108,14 +112,14 @@ class TestLatchAndLaunch:
   def test_reset_forgets_the_landing(self):
     law = landing()
     law.reset()
-    assert not law.landing and not law.active
+    assert not law.landing
     assert law.update(-2.0, 1.5, NO_LEAD, False) == -2.0
 
 
 class TestLead:
   def test_a_close_lead_lifts_the_bound_but_keeps_the_floor(self):
     law = landing()
-    assert law.update(-2.5, 1.0, lead(LEAD_FULL_AUTHORITY - 0.5), True) == -2.5 and not law.active
+    assert law.update(-2.5, 1.0, lead(LEAD_FULL_AUTHORITY - 0.5), True) == -2.5
     assert math.isclose(law.update(0.05, 0.5, lead(LEAD_FULL_AUTHORITY - 0.5), True), -landing_floor(0.5), rel_tol=1e-9, abs_tol=1e-9)
     assert math.isclose(law.update(-2.5, 1.0, lead(LEAD_FULL_AUTHORITY + 0.5), True), -landing_bound(1.0), rel_tol=1e-9, abs_tol=1e-9)
 

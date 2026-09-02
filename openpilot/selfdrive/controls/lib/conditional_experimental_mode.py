@@ -35,7 +35,6 @@ class ConditionalExperimentalMode:
     self._open_elapsed = 0.0
     self.experimental_mode = False
     self.intent_filter.x = 0.0
-    self.last_observation = StopObservation()
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
     self._active_elapsed = 0.0
@@ -52,7 +51,6 @@ class ConditionalExperimentalMode:
   def _clear_evidence(self):
     self.intent_filter.x = 0.0
     self._open_elapsed = 0.0
-    self.last_observation = StopObservation()
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
     self._intent_hold_remaining = 0.0
@@ -68,7 +66,6 @@ class ConditionalExperimentalMode:
 
   def _update_model_evidence(self, model, car_state, radar_state, model_valid):
     obs = observe_model_stop(model, car_state, radar_state) if model_valid else StopObservation()
-    self.last_observation = obs
     self._model_complete = obs.complete or not model_valid
 
     # a relevant lead vetoes a new handoff and starts a grace; during it one strict frame may mint a revocable release
