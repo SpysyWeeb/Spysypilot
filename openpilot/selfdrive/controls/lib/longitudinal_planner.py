@@ -113,6 +113,7 @@ class LongitudinalPlanner:
     self.curve_speed_limiter = ModelCurveSpeedLimiter(CP)
     self.stop_landing = StopLanding(dt)
     self.holding_prev = False
+    self.anticipating_prev = False
     self.mpc_a_target = init_a
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
@@ -177,6 +178,7 @@ class LongitudinalPlanner:
       self.lead_departure.reset()
       self.stop_landing.reset()
       self.holding_prev = False
+      self.anticipating_prev = False
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -300,7 +302,10 @@ class LongitudinalPlanner:
     # releases (a corroborated lead departure, a hold release) end it at once, a climbing plan ends it by itself
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
-    launch = lead_departing or (self.holding_prev and not force_stop.holding)
+    # all three of combo's launch sources release the landing on the same frame: the lead-departure pre-release, the hold
+    # release, and the green-light anticipation opening (audit 2026-09-02: the third relied on the corridor's frame watchdog)
+    launch = lead_departing or (self.holding_prev and not force_stop.holding) or (self.anticipating and not self.anticipating_prev)
+    self.anticipating_prev = self.anticipating
     self.holding_prev = force_stop.holding
     output_a_target = self.stop_landing.update(output_a_target, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo)
     # the stop bit follows the landed target too: the MPC's hover around zero at walking pace must not flicker it
