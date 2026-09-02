@@ -18,8 +18,10 @@ from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_CTRL
 
 # Handoff to the hold clamp.
-STANDSTILL_SPEED = 0.05        # m/s, arm the stopping/hold clamp once the car is essentially stopped
-STANDSTILL_HOLD_SPEED = 0.15   # m/s, ceiling for trusting CS.standstill (the Palisade asserts it a hair early)
+STANDSTILL_SPEED = 0.05        # m/s, hand the stop to the car's own hold only here: after StopReq the ESP stops following the
+                               # request and takes ~0.8 s to clamp, so a hand-off while still rolling is a roll (route 0x3e: 4 cm
+                               # on the flat, 16-21 cm on a 7 % downhill from a 0.10 m/s hand-off). The Palisade's standstill flag
+                               # asserts at ~0.6 m/s and is not believed
 HOLD_RELEASE_FRAMES = 2        # frames of should_stop=False before the hold releases. The planner's hold already corroborates
                                # a launch; ~22 min of standstill on the audit routes showed no stop-bit flicker at all
 
@@ -39,10 +41,9 @@ class SmoothStopController:
     # the settle keeps no state between landings; the hold debounce has its own arm
     pass
 
-  def want_hold(self, should_stop: bool, v_ego: float, standstill: bool) -> bool:
-    # the clamp lands on a stopped car: v at or below STANDSTILL_SPEED, or the car's own standstill flag while it is
-    # slow enough to be believed
-    return bool(should_stop and (v_ego <= STANDSTILL_SPEED or (standstill and v_ego <= STANDSTILL_HOLD_SPEED)))
+  def want_hold(self, should_stop: bool, v_ego: float) -> bool:
+    # the clamp lands on a stopped car: the kiss carries it down to STANDSTILL_SPEED first
+    return bool(should_stop and v_ego <= STANDSTILL_SPEED)
 
   def arm_hold(self) -> None:
     # every entry into the hold gets a fresh release debounce; reset() runs every frame while holding and must not

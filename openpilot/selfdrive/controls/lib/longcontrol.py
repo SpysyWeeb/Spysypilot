@@ -57,7 +57,7 @@ class LongControl:
     # the car; once holding, the release is debounced. The off edge takes the stock path: engaging into a stop at
     # standstill must clamp at once, and there is no separate starting command that could blip on off -> pid.
     if active and self.long_control_state == LongCtrlState.pid:
-      stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo, CS.standstill)
+      stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo)
     elif active and self.long_control_state == LongCtrlState.stopping:
       stop_now = not self.smooth_stop.hold_release(should_stop)
     else:
