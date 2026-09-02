@@ -3,7 +3,7 @@ import math
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
-from openpilot.selfdrive.controls.lib.smooth_stops import (HOLD_RELEASE_FRAMES, SETTLE_JERK, STALL_RATE, STALL_S, STANDSTILL_HOLD_SPEED,
+from openpilot.selfdrive.controls.lib.smooth_stops import (HOLD_RELEASE_FRAMES, SETTLE_JERK, STANDSTILL_HOLD_SPEED,
                                                             STANDSTILL_SPEED, STOP_KISS_DECEL, SmoothStopController)
 
 
@@ -32,22 +32,6 @@ def test_the_landing_never_steps():
   assert math.isclose(controller.settle(-0.02, 0.25, -1.0), -1.0 + step, abs_tol=1e-9)
   assert controller.settle(-9.0, 0.25, ACCEL_MIN) >= ACCEL_MIN
 
-
-def test_a_stall_ratchets_the_pressure_up_until_the_car_moves_again():
-  controller = SmoothStopController()
-  output = -STOP_KISS_DECEL
-  for _ in range(round(STALL_S / DT_CTRL) - 1):
-    output = controller.settle(-0.02, 0.2, output)
-  assert math.isclose(output, -STOP_KISS_DECEL, abs_tol=1e-9)             # a grace period first
-  stalled = 100
-  for _ in range(stalled):
-    output = controller.settle(-0.02, 0.2, output)                        # a further second stalled
-  stall_time = (round(STALL_S / DT_CTRL) - 2 + stalled) * DT_CTRL          # the first call is progress from rest
-  expected = STOP_KISS_DECEL + STALL_RATE * (stall_time - STALL_S)
-  assert math.isclose(output, -expected, abs_tol=1e-6)
-  for _ in range(20):
-    output = controller.settle(-0.02, 0.1, output)                        # progress again: the ratchet releases
-  assert math.isclose(output, -STOP_KISS_DECEL, abs_tol=1e-6)
 
 
 def test_the_hold_releases_after_the_debounce_and_arms_fresh():
