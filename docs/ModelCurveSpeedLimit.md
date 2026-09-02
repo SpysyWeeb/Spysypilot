@@ -101,13 +101,15 @@ the measured lateral acceleration has read under `BEND_OPEN_A_LAT` 1.0 m/s² for
 crossover does not release it) or `HOLD_MAX_S` 30 s has passed (a backstop, not a release path). The clamp only ever pulls a
 positive fallthrough down to zero: it never adds braking, never applies while the driver steers or within the gas grace, and
 a road the anticipation reads as free has nothing to hold. The car therefore lifts once on the way in, holds the speed the
-steering settled at through the bend, and accelerates at the bend's end exactly as before (the route 0x33 exit step is
-byte-identical). A steering dropout arms the hold too and keeps it for the resumption; an idle controller's zero lateral
+steering settled at through the bend, and accelerates once the car is through it: on combo's replay of route 0x33 the exit
+acceleration begins at t=2545.6, when the measured lateral acceleration has been under 1 m/s² for the dwell, 1.7 s after the
+model's own release at 2543.9 — where the car was still at 2–3 m/s² and the old release drew the third brake tap. The
+dwell is the price of not releasing into an S-bend's crossover. A steering dropout arms the hold too and keeps it for the resumption; an idle controller's zero lateral
 acceleration no longer feeds the open test (`_lateral_history` freezes until the steering is back), and a disengagement
 resets the policy (`reset()`, called from the planner's reset path).
 
-Replay, route 0x33 active episode t=2519.65–2546: source handoffs 16 → 4, frames asking more than +0.5 m/s² 234 → 42 (all
-after the exit at 2543.9), peak braking and the exit step unchanged. Route 0x2c t=878–896 (the gas-grace exit): byte-identical.
+Replay, route 0x33 t=2519.65–2546 on combo: source handoffs 18 → 4, frames asking more than +0.5 m/s² 236 → 8 (the exit
+acceleration itself, now from 2545.6), peak braking unchanged at −0.92. Route 0x2c t=878–896 (the gas-grace exit): byte-identical.
 Route 22: no lift in the whole route's replay, so it says nothing about the hold. Plant: `test_a_lift_ends_in_a_hold_until_the_bend_opens`
 (a bend that opens to a still-bent section holds through it; one that opens under 1 m/s² releases within the dwell).
 
