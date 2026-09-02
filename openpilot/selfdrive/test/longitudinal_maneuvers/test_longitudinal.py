@@ -1,7 +1,8 @@
 import itertools
 import numpy as np
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.stop_landing import KISS_SPEED, LANDING_SPEED, LEAD_LANDING_GAP, LEAD_FULL_AUTHORITY, StopLanding, landing_bound
+from openpilot.selfdrive.controls.lib.stop_landing import (CREEP_PRESS_MAX, KISS_SPEED, LANDING_SPEED, LEAD_LANDING_GAP, LEAD_FULL_AUTHORITY,
+                                                            StopLanding, landing_bound)
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.parameterized import parameterized_class
 
@@ -255,7 +256,7 @@ class TestRedLightStop(OpenpilotTestCase):
     assert np.all(v[i_stop:] < 0.3), 'crept away after the stop'
 
 
-def landing_excess(logs, lead=False, v_min=KISS_SPEED):
+def landing_excess(logs, lead=False, v_min=KISS_SPEED, v_max=LANDING_SPEED):
   # the most the commanded braking exceeded the landing law through the last metres (KISS_SPEED .. LANDING_SPEED, plan braking).
   # Below the kiss speed the corridor is the kiss plus the anti-creep press by design, and the aEgo checks judge that end.
   # Each row's plan was computed from the previous row's state (the plant logs after integrating), so the law is judged at
@@ -265,7 +266,7 @@ def landing_excess(logs, lead=False, v_min=KISS_SPEED):
   excess = 0.0
   for i in range(1, len(v)):
     v_seen, d_seen, v_lead_seen = v[i - 1], d_rel[i - 1], v_lead[i - 1]
-    if not (v_min <= v_seen < LANDING_SPEED) or a[i] >= 0.0:
+    if not (v_min <= v_seen < v_max) or a[i] >= 0.0:
       continue
     allowed = landing_bound(v_seen)
     if lead:
@@ -346,5 +347,7 @@ class TestStopLanding(OpenpilotTestCase):
     # corridor-excess check applies above it; the low end is judged by what matters -- the deceleration still on the
     # car as the wheels are about to stop (route 0x2b: -0.37 measured at 0.15 m/s was the body-rock cause)
     assert landing_excess(logs, lead=True, v_min=0.5) <= 0.15, landing_excess(logs, lead=True, v_min=0.5)
+    # below the kiss speed the anti-creep press may exceed the bound, by at most its cap
+    assert landing_excess(logs, lead=True, v_min=0.3, v_max=KISS_SPEED) <= CREEP_PRESS_MAX + 0.02
     last_rolling = int(np.flatnonzero(v >= 0.15)[-1])
     assert a[last_rolling] >= -0.25, a[last_rolling]

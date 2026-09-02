@@ -24,16 +24,15 @@ class LeadObservation:
   distance: float = math.inf
   speed: float = 0.0
   acceleration: float = 0.0
-  model_prob: float = 0.0
 
   @classmethod
   def from_radar(cls, lead, service_valid):
     if not service_valid or not lead.present:
       return cls()
-    values = (lead.dRel, lead.vLeadK, lead.aLeadK, lead.modelProb)
+    values = (lead.dRel, lead.vLeadK, lead.aLeadK)
     if not all(math.isfinite(v) for v in values) or lead.dRel <= 0.0:
       return cls()
-    return cls(True, lead.dRel, max(lead.vLeadK, 0.0), float(np.clip(lead.aLeadK, -10.0, 5.0)), float(np.clip(lead.modelProb, 0.0, 1.0)))
+    return cls(True, lead.dRel, max(lead.vLeadK, 0.0), float(np.clip(lead.aLeadK, -10.0, 5.0)))
 
 
 @dataclass(frozen=True, slots=True)

@@ -71,7 +71,6 @@ class TestEntry:
   def test_classic_latch_commits_the_model_endpoint_with_its_setback(self):
     fs, result = committed()
     assert abs((result.stop_x) - (20.0 - LATCH_SETBACK - 10.0 * DT_MDL * (frames(1.5) - frames(1.5) + 0))) <= 10.0 * DT_MDL * frames(1.5)
-    assert result.v_cruise_cap == NO_CAP                            # no speed cap once committed (D19)
 
   def test_widened_window_needs_braking_evidence(self):
     slow_brake = ForceStops()

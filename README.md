@@ -88,7 +88,7 @@ road opening, like the hold — it used to brake 1–2 s past a rolling green.
   strict gate dropped the anchor mid-launch in the 2026-08-29 field test; reversing still fails closed). `necessity_supervisor.py`: BLoTv2's supervisor with two fixes — the following-time pads
   `force_stops.py` also owns the committed approach profile (field test 2, 2026-08-29): the constant
   deceleration that lands short of the committed point, entered from the car's own deceleration at 2 m/s³,
-  capped at 3 m/s², faded out below 3 m/s so the MPC column and the hold land the car — the MPC's quadratic
+  capped at 3 m/s², fading out from 3 m/s to gone at 1.5 m/s so the MPC column and the hold land the car — the MPC's quadratic
   stop column cannot be front-loaded on its own. A commitment forms after 0.3 s of strict world-fixed
   evidence and only a tracked lead breaks it; the MPC re-anchors its change cost on every obstacle handoff.
   saturate instead of vanishing above 1.5 m/s² of required deceleration, and the low-speed hold

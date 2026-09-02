@@ -1,3 +1,4 @@
+from openpilot.cereal import log
 import math
 
 
@@ -132,3 +133,13 @@ class TestRelease:
     obs = observe(model(path_end=60.0, terminal_speed=8.0, leads=((0.0, 20.0, 0.0),) * 3))
     assert obs.release_open and obs.corridor_clear and obs.terminal_moving and not obs.braking
     assert math.isclose(obs.path_end, 60.0, rel_tol=1e-6, abs_tol=1e-9)
+
+
+class TestLaneChanging:
+  def test_reads_the_models_lane_change_state(self):
+    # the enum lives at log.LaneChangeState; a wrong path here silently disabled the lane-change re-qualification for three days
+    from openpilot.selfdrive.controls.lib.stop_helpers import lane_changing
+    md = messaging.new_message('modelV2').modelV2
+    assert not lane_changing(md)
+    md.meta.laneChangeState = log.LaneChangeState.laneChangeStarting
+    assert lane_changing(md)

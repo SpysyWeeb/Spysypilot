@@ -7,7 +7,7 @@ import numpy as np
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
-from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, STOP_COMMIT_MAX_DISTANCE
+from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, PATH_OPEN_LENGTH, STOP_COMMIT_MAX_DISTANCE, path_open
 
 # In Experimental mode the model sometimes plans a stop but never commits: shouldStop dithers and the car
 # crawls toward the line. The tell is the planned path, whose endpoint closes in while the intent flickers.
@@ -32,7 +32,6 @@ LATCH_THRESHOLD = 0.55
 RELEASE_THRESHOLD = 0.30
 LEAD_RC = 1.0             # s
 LEAD_GATE = 0.45          # filtered lead level above which stopping is the lead logic's job
-RAMP_TIME = 3.0           # s, speed cap = remaining distance / this
 GAS_OVERRIDE_S = 10.0     # s, a gas press cancels approach shaping for this long; the hold may still re-enter
 STOP_POSITION_HOLD_S = 4.0
 EXTEND_RATE = 3.0         # m/s, the latched point may follow the model's endpoint forward this fast: the latch trips
@@ -47,7 +46,7 @@ QUALIFY_S = 0.3           # s of consistent strict, lead-free stop evidence on a
 QUALIFY_WORLD_TOLERANCE = 5.0
 RELEASE_RC = 0.30         # s, filter on the model's launch evidence while holding
 RELEASE_OPEN_THRESHOLD = 0.70
-RELEASE_OPEN_LENGTH = 30.0    # m, a path this long ...
+RELEASE_OPEN_LENGTH = PATH_OPEN_LENGTH   # m, a path this long ...
 RELEASE_OPEN_FRAMES = 3       # ... for this many consecutive frames releases the hold at once (a green): the filtered path
                               # needed ~0.4 s more, and a one- or two-frame flash (route 27 t=263) is not a green
 RESUME_SPEED = 0.8        # m/s, above this a hold becomes a moving commitment again
@@ -95,6 +94,8 @@ class ForceStops:
     self.reset()
 
   def reset(self):
+    # the episode state only: override_timer, invalid_s and rearm_remaining are memories that must survive the transient
+    # resets a lingering lead, a lane change or a model dropout cause; a disengage clears them in update()
     self.detect_filter.x = 0.0
     self.braking_filter.x = 0.0
     self.lead_filter.x = 0.0
@@ -150,6 +151,8 @@ class ForceStops:
   def update(self, obs, CS, experimental_mode, enabled, model_valid):
     if not math.isfinite(CS.vEgo) or CS.brakePressed or not enabled:
       self.reset()
+      self.override_timer = 0.0
+      self.invalid_s = 0.0
       self.rearm_remaining = 0.0
       return ForceStopsResult()
     v_ego = max(CS.vEgo, 0.0)
@@ -180,7 +183,7 @@ class ForceStops:
     tracking_lead = self.lead_filter.x > LEAD_GATE
     if self.holding:
       return self._hold(obs, v_ego, a_ego)
-    if obs.lane_change and not self.holding:
+    if obs.lane_change:
       # the endpoint is about to belong to another lane (route 27 t=379: the through lane's line held a stop that the
       # left-turn lane's line was 15 m beyond); drop shaping and any commitment and re-qualify on the new lane's path
       self.reset()
@@ -245,9 +248,7 @@ class ForceStops:
     # the green: a long, moving path with no stop evidence releases a moving commitment at once, like the hold's D21
     # release -- the filtered detector plus the 4 s position hold kept the profile braking 1.2-1.7 s after the road had
     # opened, until the owner's own gas ended it (route 0x2c t=1105/1135; the hold was even re-armed by noisy path dips)
-    self._open_frames = (self._open_frames + 1
-                         if (obs.path_end is not None and obs.path_end > RELEASE_OPEN_LENGTH
-                             and not (obs.should_stop or obs.strict_stop)) else 0)
+    self._open_frames = self._open_frames + 1 if (path_open(obs.path_end) and not (obs.should_stop or obs.strict_stop)) else 0
     if self._open_frames >= RELEASE_OPEN_FRAMES:
       self.reset()
       return ForceStopsResult()
@@ -275,7 +276,7 @@ class ForceStops:
       self.rearm_remaining = REARM_S
       return ForceStopsResult()
     self.release_filter.update(1.0 if obs.release_open else 0.0)
-    self._open_frames = self._open_frames + 1 if (obs.path_end is not None and obs.path_end > RELEASE_OPEN_LENGTH) else 0
+    self._open_frames = self._open_frames + 1 if path_open(obs.path_end) else 0
     if self._open_frames >= RELEASE_OPEN_FRAMES:
       self.reset()
       return ForceStopsResult()

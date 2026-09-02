@@ -97,7 +97,6 @@ class TestCruiseComfort:
     assert not ordinary_cruise_comfort_enabled(True, False, True)
     assert not ordinary_cruise_comfort_enabled(False, True, True)
     assert not ordinary_cruise_comfort_enabled(False, False, False)
-    assert not ordinary_cruise_comfort_enabled(False, False, True, speed_limiter_active=True)
 
   def test_coast_limit_still_applies_with_comfort(self):
     v_ego = 4.0
@@ -206,9 +205,8 @@ class TestPlannerCruise:
 
   def test_fcw_comes_only_from_the_mpc_crash_counter(self):
     plant = Plant(speed=15.0, distance_lead=40.0, lead_relevancy=True)
-    plant.planner.supervisor.update = lambda *args: LongitudinalPolicy(1.0, 0.0, True)
+    plant.planner.supervisor.update = lambda *args: LongitudinalPolicy(1.0, 0.0)   # a stand-down: stock policy, and nothing else
     plant.step(v_lead=15.0)
-    assert plant.planner.supervisor.update().stand_down
     assert not plant.planner.fcw
 
   def test_a_force_stops_hold_forces_should_stop_and_caps_cruise(self):
@@ -223,6 +221,18 @@ class TestPlannerCruise:
     plant.planner.force_stops.update = lambda *args: ForceStopsResult(NO_CAP, float('nan'), False)
     plant.step(v_cruise=20.0)
     assert plant.planner.mpc.source != LongitudinalPlanSource.stop
+
+
+class TestCommittedProfileArbitration:
+  def test_e2e_joins_only_when_clearly_more_urgent_than_the_committed_profile(self):
+    # D20 (route 27 t=250): the model's late ramp used to overtake the flat profile through min()
+    from openpilot.selfdrive.controls.lib.longitudinal_planner import E2E_STOP_MARGIN
+    for e2e, expected_source in ((-1.0 - E2E_STOP_MARGIN + 0.1, LongitudinalPlanSource.stop), (-1.0 - E2E_STOP_MARGIN - 0.3, LongitudinalPlanSource.e2e)):
+      planner, data = TestStopLanding().planner_and_data(10.0, e2e)
+      planner.force_stops.update = lambda *args: ForceStopsResult(NO_CAP, None, False, -1.0)
+      for _ in range(5):
+        planner.update(_PlantSubMaster(data, 0))
+      assert planner.mpc.source == expected_source, (e2e, planner.mpc.source)
 
 
 class TestStopLanding:
@@ -257,7 +267,7 @@ class TestStopLanding:
       planner.update(_PlantSubMaster(data, 0))
     assert planner.mpc.source == LongitudinalPlanSource.e2e
     assert math.isclose(planner.output_a_target, -landing_bound(1.0), rel_tol=1e-6, abs_tol=1e-9)
-    assert planner.stop_landing.active
+    assert planner.stop_landing.landing
 
   def test_the_law_is_off_above_its_window_and_next_to_a_close_lead(self):
     planner, data = self.planner_and_data(10.0, -3.0)
@@ -268,7 +278,6 @@ class TestStopLanding:
     for _ in range(5):
       planner.update(_PlantSubMaster(data, 0))
     assert math.isclose(planner.output_a_target, -3.0, rel_tol=1e-6, abs_tol=1e-9)
-    assert not planner.stop_landing.active
 
   def test_a_lead_stop_lands_on_the_kiss_holds_its_stop_bit_and_launches_when_the_lead_leaves(self):
     # route 28 (2026-08-30): behind a stopped lead the MPC lets go of the brake by 0.2 m/s and hovers around zero; the

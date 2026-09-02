@@ -56,9 +56,9 @@ def get_cruise_comfort_accel(v_cruise, v_ego, accel_coast):
     target_accel = min(target_accel, accel_coast * coast_weight)
   return float(target_accel)
 
-def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid, speed_limiter_active=False):
-  # comfort shaping only for ordinary cruise with a healthy radar; lead following, e2e and a curve limiter keep their own targets
-  return not (experimental_mode or force_decel or not radar_valid or speed_limiter_active)
+def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid):
+  # comfort shaping only for ordinary cruise with a healthy radar; lead following and e2e keep their own targets
+  return not (experimental_mode or force_decel or not radar_valid)
 
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow_throttle, comfort=False):
   # the envelope alone bounds cruise acceleration; stock's shared lateral budget held the car back out of curves (owner ruling)

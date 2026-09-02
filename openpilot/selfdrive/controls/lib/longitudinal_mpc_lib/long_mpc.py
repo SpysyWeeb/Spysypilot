@@ -242,8 +242,6 @@ class LongitudinalMpc:
     self.last_cloudlog_t = 0
     self.crash_cnt = 0.0
     self.source = LongitudinalPlanSource.cruise
-    self.lead0_policy_active = False
-    self.lead0_policy_adaptive = False
     self.binding_obstacle = None
     self.solution_status = 0
     # timers
@@ -355,11 +353,9 @@ class LongitudinalMpc:
     self.binding_obstacle = binding
 
     # the supervisor's policy shapes lead0's solve only; another owner solves with the incumbent weights
-    self.lead0_policy_active = self.source == LongitudinalPlanSource.lead0
-    if not self.lead0_policy_active:
+    if self.source != LongitudinalPlanSource.lead0:
       jerk_scale = 1.0
       t_follow_pad = 0.0
-    self.lead0_policy_adaptive = self.lead0_policy_active and (jerk_scale < 1.0 or t_follow_pad > 0.0)
     t_follow = get_T_FOLLOW(personality) + t_follow_pad
     self.set_weights(prev_accel_constraint, personality, jerk_scale)
 

@@ -49,7 +49,6 @@ LEAD_DEPARTURE_CANCEL = 0.2
 class LongitudinalPolicy:
   jerk_scale: float
   t_follow_pad: float
-  stand_down: bool
 
 
 class DebouncedTrigger:
@@ -189,4 +188,4 @@ class NecessitySupervisor:
 
     self.jerk_scale = self._slew(self.jerk_scale, scale_target, JERK_SCALE_RATE)
     self.t_follow_pad = self._slew(self.t_follow_pad, pad_target, ONSET_RATE_UP if pad_target > self.t_follow_pad else ONSET_RATE_DOWN)
-    return LongitudinalPolicy(self.jerk_scale, self.t_follow_pad, stand_down)
+    return LongitudinalPolicy(self.jerk_scale, self.t_follow_pad)
