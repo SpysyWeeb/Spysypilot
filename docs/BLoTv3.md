@@ -284,7 +284,9 @@ assist's cap (`LAUNCH_MAX_ACCEL` 1.5, tapering out by 2 m/s); the lead candidate
 has no launch assist: after a hold release the e2e candidate's stuck stop bit keeps the plan's stop bit set until the model clears it (known
 gap, combo-only behavior). Also at the owner's direction the Hyundai standstill hold moved to the brake request alone, no StopReq (opendbc
 `combo-blatv2-409-horizon` befe6683, promoted from the field-experiment branch): the ESP's ~1.4 s exit sequence should disappear with it;
-the hold on grades and over long waits is unverified until the owner drives it.
+the hold on grades and over long waits is unverified until the owner drives it. **Verdict (route 29, 2026-08-30): no-go, reverted** —
+without StopReq the SCC keeps building brake pressure at standstill (brake lights on, `CF_Esc_BrkCtl` active, ESP reference 0), chasing a
+deceleration it cannot measure on a stopped car; the ESP's ~1.4 s standstill-exit sequence is the price of its own hold.
 
 **2026-08-30, route 0x2a (combo 04af1155e3: corridor + cruise-ramp greens, StopReq hold back).** Owner: landings from ~5 mph still
 harsh (t≈500), greens still slow. Greens: over the route's six launches the model's path opens → our stop bit clears in 0.09 s → StopReq
