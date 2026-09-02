@@ -252,6 +252,7 @@ class Plant:
     ]
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
+    ss.selfdriveState.enabled = self.enabled
     ss.selfdriveState.experimentalMode = self.e2e
     ss.selfdriveState.personality = self.personality
     ss.selfdriveState.enabled = bool(self.enabled)

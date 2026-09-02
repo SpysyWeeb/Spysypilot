@@ -179,6 +179,10 @@ class LongitudinalPlanner:
       self.stop_landing.reset()
       self.holding_prev = False
       self.anticipating_prev = False
+
+    # the curve policy forgets only on a real disengagement, not on a driver's gas override (route 0x3a t=329: a level-
+    # triggered reset wiped its regime and hold every frame of a 3.9 s override while the steering was still pinned in the bend)
+    if not sm['selfdriveState'].enabled:
       self.curve_speed_limiter.reset()
 
     # Prevent divergence, smooth in current v_ego
