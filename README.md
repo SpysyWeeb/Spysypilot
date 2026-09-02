@@ -65,6 +65,8 @@ road opening, like the hold — it used to brake 1–2 s past a rolling green.
 
 ## What changed
 
+**2026-09-02 — D29, the pursuit tail.** Braking for a truck that then drove off (route 0x3b t=390–405), the supervisor's low jerk cost switched off at the plan's zero crossing, exactly where the MPC had to swing to acceleration; it now stays for 3 s after excess braking behind a lead that is accelerating away. Replay on that event and the supervisor tests gate it; awaiting the owner's drive.
+
 - Phase 0 (2026-08-29): branch cut from `stock` `511f2b60b4`; `docs/BLoTv3.md` added; the
   longitudinal maneuver harness got a real `all_checks()` shim, radar/model validity schedules,
   `selfdriveState.enabled`, and three distinct, fully populated `leadsV3` messages.
