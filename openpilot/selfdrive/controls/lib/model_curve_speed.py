@@ -333,7 +333,8 @@ class ModelCurveSpeedLimiter:
     # hold times out. A steering dropout arms it too (the regime falls to free) and keeps it for the resumption; the driver's
     # own steering or gas is never held. The anticipation reading free does not end it: the path sees the exit before the
     # car is through the bend, and a straight road reads open within the dwell anyway
-    if lifting and self.regime not in (REGIME_COAST, REGIME_BRAKE):
+    if lifting and self.regime not in (REGIME_COAST, REGIME_BRAKE) and not self._holding:
+      # a lift inside a hold does not restart its clock: the backstop measures the whole hold
       self._holding = True
       self._hold_s = self._open_s = 0.0
     if self._holding:
