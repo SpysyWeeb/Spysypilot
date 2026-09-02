@@ -9,7 +9,16 @@ in progress: step 1 (torque-tail continuity) merged and field-validated 2026-08-
 release shed holding torque mid-curve on its first drives and was retired the same day, the rest of the step (unwind clamp replaced
 by a direction fraction, applied-torque plumbing) stands and awaits a clean drive; step 3 is a log-only on-device hold-torque
 learner (the global recalibration of torqued's prior was falsified per cell and never enters the torque path); a 65-agent panel
-review of the whole phase is in `route-audit/phase3/panel_2026-08-30/`.**
+review of the whole phase is in `route-audit/phase3/panel_2026-08-30/`. Step 2's direction fraction field-validated 2026-09-01
+(routes 34/35, 40 min on the release-retirement build: unpressed hold collapses 8–9 per route → 0–1). Step 4 (direction guard v2)
+and step 3-C (the log-only rack-effort shadow observer) merged into combo 2026-09-01 and driven 2026-09-01 (routes 36/37, 15 min):
+zero-torque tails while active 2.8–3.0 % → 0.4–1.0 %, none longer than 60 ms (was 1.2–2.3 s) and none guard-caused (was 99.8 %),
+near-center exact-zero duty 1.7–2.0 % → 0.0 %, the R7 output-step bound held at exactly 0.05, the observer logging 23–25 cells with
+finite biases; the guard now acts mostly at low speed with the driver's hands on, and a 149 ms hold-collapse flag at 12 m/s was
+post-override recovery, not a shed. Step 4b (driver-assist envelope) and step 5 (R4 proactive envelope opening) merged into combo
+2026-09-02, awaiting a drive — the post-release torque swing baseline to compare against is p50 0.18–0.37, p90 0.53–0.73
+(`route-audit/phase3/verify_2026-09-02/`). `params_keys.h` changed with step 3-C: a device that crash-loops with `UnknownKeyName`
+after updating needs `rm -f /data/openpilot/openpilot/common/params_pyx*.so` and a reboot.**
 
 ## What it does
 
