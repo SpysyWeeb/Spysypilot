@@ -403,6 +403,15 @@ class TestHold(unittest.TestCase):
     self.assertEqual(result.regime, REGIME_ANTICIPATE)
     self.assertGreater(result.a_target, 0.0)
 
+  def test_a_lift_inside_the_hold_does_not_restart_its_clock(self):
+    limiter, bend, _ = self._lifted()
+    settle(limiter, bend, round(HOLD_MAX_S / DT_MDL) - 40, v_ego=15.0, lateral_active=True, lateral_state=self.held())
+    settle(limiter, bend, round(COAST_ENTER_S / DT_MDL) + 4, v_ego=15.0, lateral_active=True, accel_coast=-0.3,
+           lateral_state=tracking(torque=T_COAST, error=0.35, lat=2.0))                 # heavy again: a second lift ...
+    result = settle(limiter, bend, round(COAST_EXIT_S / DT_MDL) + 40, v_ego=15.0, lateral_active=True, lateral_state=self.held())
+    self.assertFalse(result.holding)                                          # ... and the backstop still ends the hold on time
+    self.assertGreater(result.a_target, 0.0)
+
   def test_the_hold_constants_are_ordered(self):
     self.assertGreater(BEND_OPEN_A_LAT, 0.0)
     self.assertLess(0.0, BEND_OPEN_S)
