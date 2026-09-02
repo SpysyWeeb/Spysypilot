@@ -1009,6 +1009,7 @@ struct DrivingModelData {
   frameIdExtra @1 :UInt32;
   frameDropPerc @6 :Float32;
   modelExecutionTime @7 :Float32;
+  big @8 :Bool;
 
   action @2 :ModelDataV2.Action;
 
@@ -2598,7 +2599,6 @@ struct Event {
     clocks @35 :Clocks;
     deviceState @6 :DeviceState;
     chestnutState @152 :ChestnutState;
-    chestnutGpuState @153 :ChestnutState;
     logMessage @18 :Text;
     errorLogMessage @85 :Text;
 
