@@ -18,6 +18,9 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   REGIME_BRAKE,
   REGIME_COAST,
   REGIME_FREE,
+  BEND_OPEN_A_LAT,
+  BEND_OPEN_S,
+  HOLD_MAX_S,
   T_APPROACH,
   T_COAST,
   V_HOLD_BAND,
@@ -184,7 +187,10 @@ class TestReaction(unittest.TestCase):
     self.assertEqual(result.regime, REGIME_COAST)                            # still heavy: no release above T_COAST_EXIT
     self.assertAlmostEqual(result.a_target, -0.15)                           # and the lift is proportional to how heavy
     result = settle(limiter, straight, round(COAST_EXIT_S / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5))
-    self.assertEqual(result.regime, REGIME_FREE)
+    self.assertNotEqual(result.regime, REGIME_COAST)                        # the lift has ended ...
+    self.assertTrue(result.holding)                                           # ... into the hold: the road still reads 1.0 m/s^2
+    result = settle(limiter, straight, round(BEND_OPEN_S / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=0.5))
+    self.assertEqual(result.regime, REGIME_FREE)                              # the road open for the dwell: released
     self.assertIsNone(result.a_target)
 
   def test_pinned_and_losing_brakes_toward_the_speed_that_restores_margin_after_a_debounce(self):
@@ -310,3 +316,94 @@ class TestLegacySurface(unittest.TestCase):
     source = inspect.getsource(longitudinal_planner)
     for legacy in ('torque_veto', 'limit_accel_for_torque', 'speed_limiter_active', 'predicted_torque'):
       self.assertNotIn(legacy, source)
+
+
+class TestHold(unittest.TestCase):
+  # a curve whose limit sits just above the car: the anticipation has something to say (a small positive candidate) and the
+  # steering, fed heavy, says the limit is here
+  CURVATURE = 0.0074
+
+  def _lifted(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    bend = make_model(15.0, np.full(N, self.CURVATURE))
+    settle(limiter, bend, round(COAST_ENTER_S / DT_MDL) + 12, v_ego=15.0, lateral_active=True, accel_coast=-0.3,
+           lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0))
+    self.assertEqual(limiter.regime, REGIME_COAST)
+    result = settle(limiter, bend, round(COAST_EXIT_S / DT_MDL) + 8, v_ego=15.0, lateral_active=True, accel_coast=-0.3,
+                    lateral_state=self.held())
+    self.assertNotEqual(result.regime, REGIME_COAST)
+    return limiter, bend, result
+
+  @staticmethod
+  def held():
+    # light torque, the bend still on; the tracking error keeps the authority calibration out of these tests
+    return tracking(torque=0.5, error=0.35, lat=2.0)
+
+  def test_the_lift_ends_into_a_hold_while_the_bend_is_still_on(self):
+    limiter, bend, result = self._lifted()
+    self.assertTrue(result.holding)
+    self.assertLessEqual(result.a_target, 1e-9)                              # the candidate is zero, not the anticipation's +1.3
+    result = settle(limiter, bend, 60, v_ego=15.0, lateral_active=True, accel_coast=-0.3, lateral_state=self.held())
+    self.assertTrue(result.holding)
+    self.assertLessEqual(result.a_target, 1e-9)                              # and stays zero for as long as the bend reads on
+
+  def test_the_bend_reading_open_for_a_second_releases_the_hold(self):
+    limiter, bend, _ = self._lifted()
+    result = settle(limiter, bend, round(BEND_OPEN_S / DT_MDL) - 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
+    self.assertTrue(result.holding)                                           # not before the dwell
+    result = settle(limiter, bend, 4, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
+    self.assertFalse(result.holding)
+    self.assertGreater(result.a_target, 0.0)                                  # the anticipation's own candidate is back
+
+  def test_the_hold_times_out_on_a_bend_that_never_reads_open(self):
+    limiter, bend, _ = self._lifted()
+    result = settle(limiter, bend, round(HOLD_MAX_S / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=self.held())
+    self.assertFalse(result.holding)
+    self.assertGreater(result.a_target, 0.0)
+
+  def test_the_path_seeing_the_exit_does_not_end_the_hold_the_road_opening_does(self):
+    limiter, _, _ = self._lifted()
+    straight = make_model(15.0)
+    result = settle(limiter, straight, 3, v_ego=15.0, lateral_active=True, lateral_state=self.held())
+    self.assertTrue(result.holding)                                           # the model sees the exit; the car is still in the bend
+    self.assertLessEqual(result.a_target, 1e-9)
+    result = settle(limiter, straight, round(BEND_OPEN_S / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.3))
+    self.assertFalse(result.holding)                                          # the road reads open: released within the dwell
+    self.assertIsNone(result.a_target)                                        # and a straight road has nothing to say
+
+  def test_the_drivers_gas_is_never_held(self):
+    limiter, bend, _ = self._lifted()
+    result = limiter.update(bend, v_ego=15.0, lateral_active=True, lateral_state=self.held(), gas_pressed=True)
+    self.assertGreater(result.a_target, 0.0)
+
+  def test_a_steering_dropout_keeps_the_hold_for_the_resumption(self):
+    limiter, bend, _ = self._lifted()
+    # the idle controller reports zero lateral acceleration; that must not read as the bend opening
+    result = settle(limiter, bend, round(2.0 / DT_MDL), v_ego=15.0, lateral_active=False, lateral_state=LateralState())
+    self.assertTrue(result.holding)
+    self.assertIsNone(result.a_target)                                        # nothing is held while the driver steers
+    result = settle(limiter, bend, 8, v_ego=15.0, lateral_active=True, lateral_state=self.held())
+    self.assertTrue(result.holding)
+    self.assertLessEqual(result.a_target, 1e-9)                              # held again the moment we steer
+
+  def test_a_lift_that_ends_in_a_steering_dropout_arms_the_hold(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    bend = make_model(15.0, np.full(N, self.CURVATURE))
+    settle(limiter, bend, round(COAST_ENTER_S / DT_MDL) + 12, v_ego=15.0, lateral_active=True, accel_coast=-0.3,
+           lateral_state=tracking(torque=T_COAST, error=0.1, lat=2.0))
+    result = limiter.update(bend, v_ego=15.0, lateral_active=True, steering_pressed=True, lateral_state=tracking(torque=T_COAST, lat=2.0))
+    self.assertNotEqual(result.regime, REGIME_COAST)
+    self.assertTrue(result.holding)
+
+  def test_a_disengagement_clears_the_hold(self):
+    limiter, bend, _ = self._lifted()
+    limiter.reset()
+    result = settle(limiter, bend, 3, v_ego=15.0, lateral_active=True, lateral_state=self.held())
+    self.assertFalse(result.holding)
+    self.assertEqual(result.regime, REGIME_ANTICIPATE)
+    self.assertGreater(result.a_target, 0.0)
+
+  def test_the_hold_constants_are_ordered(self):
+    self.assertGreater(BEND_OPEN_A_LAT, 0.0)
+    self.assertLess(0.0, BEND_OPEN_S)
+    self.assertLess(BEND_OPEN_S, HOLD_MAX_S)

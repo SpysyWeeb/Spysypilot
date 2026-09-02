@@ -179,6 +179,7 @@ class LongitudinalPlanner:
       self.stop_landing.reset()
       self.holding_prev = False
       self.anticipating_prev = False
+      self.curve_speed_limiter.reset()
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))

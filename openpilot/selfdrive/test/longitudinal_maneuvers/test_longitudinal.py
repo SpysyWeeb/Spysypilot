@@ -1,5 +1,6 @@
 import itertools
 import numpy as np
+from openpilot.selfdrive.controls.lib.model_curve_speed import BEND_OPEN_S
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.stop_landing import (CREEP_PRESS_MAX, KISS_SPEED, LANDING_SPEED, LEAD_LANDING_GAP, LEAD_FULL_AUTHORITY,
                                                             StopLanding, landing_bound)
@@ -291,6 +292,22 @@ class TestCurvePolicy(OpenpilotTestCase):
     assert a[inside].min() >= -2.05                                         # ... within the floor
     assert v[inside][-1] < v[inside][0]                                     # ... and is slower deep in the curve
 
+  def test_a_lift_ends_in_a_hold_until_the_bend_opens(self):
+    # a tight entry the steering can only just hold, then a looser section that is still a bend (1.2 m/s^2 at the settled
+    # speed): the coast releases as the torque eases, and the cruise set speed of 12 m/s wants the car back up at once
+    x, v, a = self._run(title='hold through the looser half', initial_speed=9.0, cruise_values=[12.0, 12.0],
+                        curve=[(30.0, 60.0, 0.038), (90.0, 100.0, 0.025)], duration=40.0)
+    enter, exit_ = int(np.flatnonzero(x >= 92.0)[0]), int(np.flatnonzero(x >= 192.0)[0])
+    assert a[enter:exit_].max() <= 0.05, a[enter:exit_].max()               # no acceleration for the rest of the bend ...
+    assert abs(v[enter:exit_].max() - v[enter]) <= 0.3                      # ... the speed simply holds
+    after = a[exit_:exit_ + int((BEND_OPEN_S + 1.5) / DT_MDL)]
+    assert after.max() >= 0.3, after.max()                                  # and the bend's end gives the acceleration back
+    # the same entry into a section that reads open (0.9 m/s^2 at the settled speed): the hold releases within its dwell
+    x, v, a = self._run(title='release when the bend opens', initial_speed=9.0, cruise_values=[12.0, 12.0],
+                        curve=[(30.0, 60.0, 0.038), (90.0, 120.0, 0.02)], duration=35.0)
+    enter = int(np.flatnonzero(x >= 92.0)[0])
+    soon = a[enter:enter + int((BEND_OPEN_S + 1.5) / DT_MDL)]
+    assert soon.max() >= 0.3, soon.max()                                    # not held back once the road has opened
 
 def landing_excess(logs, lead=False, v_min=KISS_SPEED, v_max=LANDING_SPEED):
   # the most the commanded braking exceeded the landing law through the last metres (KISS_SPEED .. LANDING_SPEED, plan braking).
