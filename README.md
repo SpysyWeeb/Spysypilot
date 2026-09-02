@@ -8,6 +8,10 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see 
 longer become the lead: on route 0x2a a stationary return the car drove over (tracked from 3 m to under the bumper) became the lead at
 1.1 m the moment it passed the 1 s age gate and put −2.6 m/s² into a landing. Below the stock 0.75 m floor nothing changes.
 
+**2026-09-02 — the settle's stall ratchet is retired.** BLoTv3's landing corridor now closes the loop on the car's measured
+acceleration (its anti-creep press), so the handoff keeps only the kiss (0.15 m/s², the corridor's own number) and the deferred
+clamp; two ratchets had been stacking on one output.
+
 ## What it does
 
 Kills the **"headbang" at the end of every stop**. Stock openpilot jumps to the `stopping` state the moment the
