@@ -43,50 +43,17 @@ decision is, why, and what the field said: the BLoTv3 README and
 
 ## BLaTv3 rack trajectory
 
-**Status: phase 1 field-validated 2026-08-29; phase 2 steps 2 and 3 merged and field-validated 2026-08-29; step 4 merged
-2026-08-29, corrected and field-validated 2026-08-30 — the immediate target passes through a bounded reference filter
-(τ 0.1 s, at most `min(0.2 m/s² / v², 3°)` behind the model's target: the 4–7° per-frame jitter at 5–30 mph is smoothed
-while turn-ins and unwinds pass at their own rate); on straights the model draws consistently the filter and the tracker's
-response time are relaxed (0.1 → 0.3 s, 0.4 → 0.5 s) — the first cut instead served the far target and drifted-then-corrected
-on route 00000028, 52 cycles in 46 min; the small-reversal governor is retired. Replay on routes 20–24 and 28: no fallbacks,
-the twelve largest low-speed turn-ins/unwinds within 3°, the island event with no preview, the served target within 0.3°
-(p90) of the near target whether the preview is open or not; route 00000029 drove clean. Phase 3 step 1 (torque-tail continuity:
-no cap jump, guard ramps out, standstill authority, honest flags) merged and field-validated 2026-08-30. Step 2 merged 2026-08-30; its first
-drive (route 2d) caught the slew-aware early release shedding holding torque midway through ordinary curves (the rate-flip
-test read visible curve exits as coming reversals; the car ran wide, six owner bookmarks) — the release is retired
-outright as of the same day, and the rest of step 2 stands: the unwind magnitude clamp is replaced by a direction fraction
-that relaxes only the rate feedback (the field logs showed the clamp holding exactly zero torque for up to 1.8 s near
-center while micro-corrections were wanted), with the carOutput plumbing kept for a future redesign. Merged 2026-09-01 on top of
-that: direction guard v2 (plan/target disagreement now yields bounded feedback toward the served target instead of zero torque
-— replay: exact-zero-while-active duty 1.2–1.7 % → 0.000 % on three routes) and the log-only rack-effort shadow observer
-(step 3-C: records the hold torque the EPS actually applies per speed/angle/load cell, zero torque effect; `params_keys.h`
-changed: if the device crash-loops with `UnknownKeyName` after updating, delete the stale extension —
-`rm -f /data/openpilot/openpilot/common/params_pyx*.so` — and reboot; the onboard updater is fine otherwise). Driven 2026-09-01
-(routes 36/37, 15 min): zero-torque tails while active 2.8–3.0 % → 0.4–1.0 % with no tail longer than 60 ms (was 1.2–2.3 s),
-none of them guard-caused (was 99.8 %), near-center exact-zero duty 1.7–2.0 % → 0.0 %, the R7 output-step bound held at exactly
-0.05, observer logging 23–25 cells with finite biases; the two long drives the same day (routes 34/35, 40 min) ran the
-release-retirement build and showed the mid-curve shedding gone (0–1 hold collapses vs 8–9 before). Merged 2026-09-02 on top of that,
-not yet driven: the driver-assist envelope (the fixed 0.5 cap while the driver's hands are on the wheel becomes the platform's
-own driver-torque envelope — full authority when the driver is not opposing, 0.5 only against a hard push) and the R4
-proactive envelope opening (a confidence-free preview scheduler lets the motion envelope open toward the ISO lateral-jerk
-ceiling ahead of a seen curve, snapping shut on drift). Watch for: firmer hands-on assist that never fights, earlier and
-smoother turn-ins on long seen curves, and the post-release torque swing (baseline p50 0.18–0.37, p90 0.53–0.73).** `controlsd`
-selects `LatControlRack` when opendbc sets `lateralTuning.torque.useRackTrajectory`,
-which it does only for the Palisade when the queried platform code is `LX`; Telluride
-`ON`, mixed and unknown firmware fail closed to stock `LatControlTorque` *and* the stock
-384/3/7 torque envelope. The controller math is BLaTv2's, moved unchanged
-(bit-exact on 312,983 replayed field frames). Any frame the rack controller cannot
-produce a request for is steered by a stock torque controller stepped alongside it,
-and a model plan that stops inside the horizon is a complete path, not a fault.
-It logs under `lateralControlState.rackState`; the design and its failure-mode
-catalog live in [`docs/BLaTv3_FAILURE_MODES.md`](https://github.com/SpysyWeeb/Spysypilot/blob/BLaTv3/docs/BLaTv3_FAILURE_MODES.md).
-
-The former modular BLaTv2 stack and its design documents remain historical
-research; they are not the live command owner. The current controller owns one
-normalized request and leaves Hyundai rate/driver limiting and panda safety
-downstream. Combo pins the reviewed opendbc integration artifact, which selects
-the `409/+4/-7` envelope for the shared Palisade/Telluride platform. BLaTv2
-activation remains Palisade `LX` only; Telluride stays on stock `LatControlTorque`.
+**Status: ⚠️ in progress — phases 1 and 2 field-validated; phase 3 in progress.** On combo, `controlsd` selects
+`LatControlRack` when opendbc sets `lateralTuning.torque.useRackTrajectory`, which it does only for the Palisade when the
+queried platform code is `LX`; Telluride `ON`, mixed and unknown firmware fail closed to stock `LatControlTorque` and the
+stock torque envelope. Any frame the rack controller cannot produce a request for is steered by a stock torque controller
+stepped alongside it, and it logs under `lateralControlState.rackState`. Merged 2026-09-02 and not yet driven: the
+driver-assist envelope and the R4 proactive envelope opening — watch for hands-on assist that never fights, earlier and
+smoother turn-ins on long seen curves, and the wheel in the second after a release. A device that crash-loops with
+`UnknownKeyName` after updating needs `rm -f /data/openpilot/openpilot/common/params_pyx*.so` and a reboot. Design,
+step-by-step chronology with field numbers, and the failure-mode catalog live on the
+[BLaTv3 branch README](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv3) and in
+[`docs/BLaTv3_FAILURE_MODES.md`](https://github.com/SpysyWeeb/Spysypilot/blob/BLaTv3/docs/BLaTv3_FAILURE_MODES.md).
 
 ## To-Do
 
@@ -114,7 +81,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ⚠️ **[Curve longitudinal policy](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit)** — one plan candidate: anticipation from the model path against the steering's calibrated authority, reaction to the measured steering (coast when heavy, brake when pinned and understeering); see [docs/ModelCurveSpeedLimit.md](https://github.com/SpysyWeeb/Spysypilot/blob/curve-speed-limit/docs/ModelCurveSpeedLimit.md) &nbsp;*(personal idea; under owner field testing)*
 - 🔒 **[Better lateral tune (BLaT)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaT)** — frozen reference implementation at the field-tested controller v14 tree from rollback authority `5e533e3ec6`; the rejected v15.x line is closed, and future ground-up lateral work belongs on stock-based `BLaTv2` &nbsp;*(personal idea)*
 - 🔒 **[Better lateral tune v2 (BLaTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv2)** — superseded by BLaTv3: its rack-trajectory controller now runs on combo as `LatControlRack`, ported bit-exact; the branch is kept as the reference the port was proven against &nbsp;*(personal idea)*
-- ⚠️ **[Better lateral tune v3 (BLaTv3)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv3)** — ground-up rewrite of the Palisade rack-trajectory controller in the upstream controller shape (`LatControlRack`, opendbc firmware flag, own log union arm, warm stock fallback), designed from a written failure-mode catalog; keeps the model as path authority, turn-in/unwind boost as feedforward physics, and a scheduled 2 s preview that never overrides the near target, and replaces the static comfort-envelope tables with two learned rack-effort surfaces (hold torque, rate gain); see [docs/BLaTv3_FAILURE_MODES.md](https://github.com/SpysyWeeb/Spysypilot/blob/BLaTv3/docs/BLaTv3_FAILURE_MODES.md) &nbsp;*(personal idea; phase 1 — BLaTv2's controller ported bit-exact into the upstream controller shape — field-validated 2026-08-29; phase 2 in progress: step 2, holding the plan through model gaps and inactive blips, driven 2026-08-29; step 3, modeld's curvature preview as the rack path, merged and field-validated 2026-08-29; step 4, the bounded reference filter and scheduled preview, merged 2026-08-29, corrected 2026-08-30 after the first drive — the preview no longer replaces the near target — and field-validated 2026-08-30; phase 3 in progress: step 1, continuity and truth-telling in the torque tail — continuous turn-in cap, direction guard ramps out instead of snapping to zero, feedback authority at standstill, honest saturation flags — merged and field-validated 2026-08-30; step 2, the direction fraction that retires the unwind clamp, merged 2026-08-30 and field-validated 2026-09-01 — its slew-aware early release was retired 2026-08-31 after route 2d; direction guard v2 and the log-only rack-effort shadow observer (step 3-C) merged 2026-09-01 and driven clean 2026-09-01; the driver-assist envelope and the R4 proactive envelope opening merged 2026-09-02 and awaiting a drive)*
+- ⚠️ **[Better lateral tune v3 (BLaTv3)](https://github.com/SpysyWeeb/Spysypilot/tree/BLaTv3)** — ground-up rewrite of the Palisade rack-trajectory controller in the upstream controller shape (`LatControlRack`, opendbc firmware flag, own log union arm, warm stock fallback), designed from a written failure-mode catalog: the model stays path authority, a scheduled preview never overrides the near target, and the static comfort-envelope tables give way to learned rack-effort surfaces &nbsp;*(personal idea; phases 1–2 field-validated 2026-08-29/30; phase 3 in progress — direction guard v2 and the shadow observer driven clean 2026-09-01, driver-assist envelope and R4 envelope opening merged 2026-09-02 and awaiting a drive)*
 - ✅ **[Detailed system stats sidebar](https://github.com/SpysyWeeb/Spysypilot/tree/detailed-stats-sidebar)** — replace the "Temp Good / Vehicle Online / Connect Online" status pills with real data: actual CPU temp in °C, RAM usage, and power draw in watts &nbsp;*(inspired by FrogPilot)*
 
 _\* = functional but could be better_
