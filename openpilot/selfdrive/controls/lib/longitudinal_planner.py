@@ -101,6 +101,10 @@ class LongitudinalPlanner:
       self.v_desired_filter.x = v_ego
       self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
       self.a_cruise = self.output_a_target
+
+    # the curve policy forgets only on a real disengagement, not on a driver's gas override (route 0x3a t=329: a level-
+    # triggered reset wiped its regime and hold every frame of a 3.9 s override while the steering was still pinned in the bend)
+    if not sm['selfdriveState'].enabled:
       self.curve_speed_limiter.reset()
 
     # Prevent divergence, smooth in current v_ego
