@@ -23,6 +23,9 @@ LAUNCH_SHORTFALL_ON = 0.6
 LAUNCH_SHORTFALL_OFF = 0.2
 LAUNCH_DEBOUNCE = 0.4
 RATCHET_LEAD_BRAKE = 0.2
+PURSUIT_TAIL_S = 3.0          # s, after excess braking eases behind a lead that is pulling away, the low jerk cost stays this
+                              # long: the recovery trigger disarms at the zero crossing, exactly where the MPC has to swing to
+                              # acceleration as fast as it braked (route 0x3b t=392: +0.26 m/s^2 early in the pickup)
 
 JERK_SCALE_MIN = 0.3
 JERK_SCALE_RATE = 1.5
@@ -118,6 +121,7 @@ class NecessitySupervisor:
     self.jerk_scale = 1.0
     self.t_follow_pad = 0.0
     self._responsive = False
+    self._pursuit_s = 0.0
     for trigger in self._triggers:
       trigger.reset()
 
@@ -153,7 +157,16 @@ class NecessitySupervisor:
                                           disarm=(shortfall < LAUNCH_SHORTFALL_OFF or lead.acceleration < LAUNCH_ALEAD_ON
                                                   or receding < LAUNCH_VREL_OFF))
 
-        if recovery_active or model_active or launch_active:
+        # the pursuit tail: excess braking behind a lead that is already pulling away keeps the low jerk cost for a
+        # bounded time after the braking eases, so the swing to acceleration is not made with the stiff cost
+        if recovery_active and lead.acceleration > LAUNCH_ALEAD_ON:
+          self._pursuit_s = PURSUIT_TAIL_S
+        elif lead.acceleration <= 0.0:
+          self._pursuit_s = 0.0
+        else:
+          self._pursuit_s = max(self._pursuit_s - self.dt, 0.0)
+
+        if recovery_active or model_active or launch_active or self._pursuit_s > 0.0:
           scale_target = JERK_SCALE_MIN
 
         # do not stiffen a responsive solution in the middle of a lead-braking / ego-closing reversal
@@ -174,11 +187,13 @@ class NecessitySupervisor:
         self._responsive = scale_target < 1.0 or pad_target > 0.0
       else:
         self._responsive = False
+        self._pursuit_s = 0.0
         for trigger in self._triggers:
           trigger.reset()
     else:
       if not lead.present:
         self._responsive = False
+      self._pursuit_s = 0.0
       for trigger in self._triggers:
         trigger.reset()
 

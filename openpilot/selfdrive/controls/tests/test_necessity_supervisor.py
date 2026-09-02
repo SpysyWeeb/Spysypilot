@@ -5,7 +5,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.necessity_supervisor import (DebouncedTrigger, JERK_SCALE_MIN, JERK_SCALE_RATE, LEAD_DEPARTURE_CANCEL,
                                                                    LEAD_DEPARTURE_CONFIRM, LeadDeparturePreRelease, NecessitySupervisor,
-                                                                   ONSET_PAD_MAX, ONSET_RATE_DOWN, ONSET_RATE_UP, STOPPED_LEAD_PAD_MAX)
+                                                                   ONSET_PAD_MAX, ONSET_RATE_DOWN, ONSET_RATE_UP, PURSUIT_TAIL_S, STOPPED_LEAD_PAD_MAX)
 
 
 def frames(seconds):
@@ -69,6 +69,27 @@ class TestTriggers:
 
   def test_constant_speed_pull_away_does_not_arm(self):
     assert run(NecessitySupervisor(), lead(v=8.0, d=15.0, a=0.0), 3.0, 0.0, 2.0).jerk_scale == 1.0
+
+  def test_the_low_jerk_cost_outlasts_the_braking_behind_a_lead_pulling_away(self):
+    supervisor = NecessitySupervisor()
+    run(supervisor, lead(v=0.5, d=8.0, a=1.0), 4.0, -2.0, 1.0)              # excess braking while the lead is already leaving
+    assert math.isclose(supervisor.jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)
+    policy = run(supervisor, lead(v=2.0, d=9.0, a=2.0), 3.0, -0.2, 1.0)     # our braking has eased: the recovery trigger is off ...
+    assert math.isclose(policy.jerk_scale, JERK_SCALE_MIN, rel_tol=1e-6, abs_tol=1e-9)   # ... and the tail keeps the low cost
+    policy = run(supervisor, lead(v=6.0, d=14.0, a=2.0), 4.0, 1.8, PURSUIT_TAIL_S)
+    assert policy.jerk_scale == 1.0                                          # the tail ends on its own
+
+  def test_the_tail_ends_when_the_lead_stops_pulling_away(self):
+    supervisor = NecessitySupervisor()
+    run(supervisor, lead(v=0.5, d=8.0, a=1.0), 4.0, -2.0, 1.0)
+    policy = run(supervisor, lead(v=2.0, d=9.0, a=0.0), 3.0, -0.2, 1.0)
+    assert policy.jerk_scale == 1.0
+
+  def test_easing_behind_a_lead_that_never_pulled_away_returns_to_stock(self):
+    supervisor = NecessitySupervisor()
+    run(supervisor, lead(v=0.5, d=8.0, a=0.0), 4.0, -2.0, 1.0)
+    policy = run(supervisor, lead(v=0.5, d=8.0, a=0.0), 2.0, -0.2, 1.0)
+    assert policy.jerk_scale == 1.0
 
   def test_jerk_scale_never_steps(self):
     supervisor = NecessitySupervisor()
