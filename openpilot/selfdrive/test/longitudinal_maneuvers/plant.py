@@ -69,8 +69,12 @@ class Plant:
     self.planner = LongitudinalPlanner(CP, init_v=self.speed)
 
   def _curvature_at(self, world_x):
-    start, length, curvature = self.curve
-    return curvature if start <= world_x <= start + length else 0.0
+    # one (start, length, curvature) or a list of them: a bend that tightens or opens along the way
+    segments = self.curve if isinstance(self.curve[0], tuple | list) else [self.curve]
+    for start, length, curvature in segments:
+      if start <= world_x <= start + length:
+        return curvature
+    return 0.0
 
   def _plan_curve(self, model, controls_state, car_control):
     # path curvature along the model's own positions, and a steering state: the car holds the path up to the torque

@@ -85,3 +85,33 @@ from ~25–26 (comfort-bound) to ~27–28 m/s (authority-bound with the bank).
 for five seconds — route 0x2c t=885: the owner released the pedal 1.4 m/s above the in-curve limit and the still-active episode
 dragged the exit from +1.8 back to −1.0 mid-corner. The reaction brake regime (pinned and understeering) still runs inside the
 grace, and the grace re-arms on every gas frame.
+
+## 2026-09-02 — a lift ends in a hold
+
+Route 0x33 t=2524–2544, a 20 s bend at a 74.6 mph set speed: the reaction layer lifted seven times, and every release handed
+the plan straight back to the cruise or lead candidate at +0.75 m/s², which drove the car back into heavy steering — a square
+wave between +0.75 and the coast, 16 source handoffs, 6 throttle closes and 3 brake taps, the speed 59.7 → 55.1 → 61.8 mph
+inside one bend. The steering itself held its line (no oscillation, no driver input) but ran torque-limited on 22 % of the
+bend's frames: the anticipation planned to a limit ~1.7 m/s above what the steering could hold, because the lateral
+acceleration it calibrates on is derived from the steering angle and overstates at the limit (accelerometer ≈ 0.54× of it at
+the peak). That bias is a separate item; this change takes the cycling away.
+
+**The hold.** When the coast or brake regime releases, the candidate holds at zero instead of falling back to "free", until
+the measured lateral acceleration has read under `BEND_OPEN_A_LAT` 1.0 m/s² for `BEND_OPEN_S` 1.0 s (an S-bend's
+crossover does not release it) or `HOLD_MAX_S` 30 s has passed (a backstop, not a release path). The clamp only ever pulls a
+positive fallthrough down to zero: it never adds braking, never applies while the driver steers or within the gas grace, and
+a road the anticipation reads as free has nothing to hold. The car therefore lifts once on the way in, holds the speed the
+steering settled at through the bend, and accelerates at the bend's end exactly as before (the route 0x33 exit step is
+byte-identical). A steering dropout arms the hold too and keeps it for the resumption; an idle controller's zero lateral
+acceleration no longer feeds the open test (`_lateral_history` freezes until the steering is back), and a disengagement
+resets the policy (`reset()`, called from the planner's reset path).
+
+Replay, route 0x33 active episode t=2519.65–2546: source handoffs 16 → 4, frames asking more than +0.5 m/s² 234 → 42 (all
+after the exit at 2543.9), peak braking and the exit step unchanged. Route 0x2c t=878–896 (the gas-grace exit): byte-identical.
+Route 22: no lift in the whole route's replay, so it says nothing about the hold. Plant: `test_a_lift_ends_in_a_hold_until_the_bend_opens`
+(a bend that opens to a still-bent section holds through it; one that opens under 1 m/s² releases within the dwell).
+
+Field questions for the next drive: does the held part of a bend feel like a steady speed or a light drag; and uphill exits,
+where a zero candidate means no acceleration until the bend reads open. Not yet addressed: the coast threshold (0.85) still
+sits below the planning budget (0.90), so the settle point is the same as today's; and the calibration's steering-derived
+lateral acceleration.

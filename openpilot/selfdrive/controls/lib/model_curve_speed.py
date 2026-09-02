@@ -65,6 +65,16 @@ CURVE_GAS_GRACE_S = 5.0       # s after a driver gas override in which the antic
                               # pushed past the curve's limit on purpose (route 0x2c t=885: the still-active episode pulled the
                               # exit back to -1.0 mid-corner after the pedal was released); the reaction brake regime still runs
 
+# The hold after a lift. Leaving the coast or brake regime used to hand the plan straight back to whichever candidate
+# wanted to accelerate, and that candidate drove the car back into heavy steering: route 0x33 t=2524-2544, seven lifts in
+# one 20 s bend, the request a square wave between +0.75 and the coast. Once the steering has said the curve is at its
+# limit, the candidate holds zero for the rest of the bend instead
+BEND_OPEN_A_LAT = 1.0         # m/s^2, measured lateral acceleration below which the bend has ended ...
+BEND_OPEN_S = 1.0             # s, ... for this long: the crossover of an S does not release the hold
+HOLD_MAX_S = 30.0             # s, the hold ends regardless. A backstop, not a release path: the open test reads the live
+                              # measurement whenever the hold clamps, so it cannot be fooled by a frozen reading; a bend
+                              # longer than this is held at the lifted speed for the rest of it (route 0x33's is 20 s)
+
 REGIME_FREE, REGIME_ANTICIPATE, REGIME_COAST, REGIME_BRAKE = 'free', 'anticipate', 'coast', 'brake'
 
 
@@ -107,6 +117,7 @@ class CurveResult:
   v_limit: float = math.inf       # the strictest node's speed limit, for logging and tests
   distance: float = 0.0           # its distance along the path
   authority_factor: float = 0.0   # lateral acceleration per unit of torque the policy currently counts on
+  holding: bool = False           # the hold after a lift is on: no acceleration until the bend reads open
 
 
 def _median_filter_three(values):
@@ -165,6 +176,14 @@ class ModelCurveSpeedLimiter:
     if lateral_tuning is not None and lateral_tuning.which() == "torque":
       self.torque_params = _torque_values(lateral_tuning.torque)
     self.authority = None                        # FirstOrderFilter on the measured lateral acceleration per unit torque
+    self.v_limit = math.inf
+    self.distance = 0.0
+    self._gas_grace_s = 0.0
+    self.reset()
+
+  def reset(self):
+    # the car is not under our longitudinal control: no regime, no hold and no jerk anchor carries into the next engagement.
+    # The calibrated authority and the gas grace are about the car and the driver, not the engagement, and stay
     self._candidate_history = [A_CURVE_FREE] * 3
     self._lateral_history = [0.0] * 3
     self._output = A_CURVE_FREE
@@ -173,9 +192,9 @@ class ModelCurveSpeedLimiter:
     self._losing_s = 0.0
     self.regime = REGIME_FREE
     self.active = False
-    self.v_limit = math.inf
-    self.distance = 0.0
-    self._gas_grace_s = 0.0
+    self._holding = False
+    self._hold_s = 0.0
+    self._open_s = 0.0
 
   def _calibrated(self, params, state, v_ego, lateral_active):
     # the torque tuning's factor is the prior; the measured ratio moves it inside AUTHORITY_BOUNDS while the steering
@@ -284,7 +303,10 @@ class ModelCurveSpeedLimiter:
     if not all(math.isfinite(x) for x in (v_ego, a_ego, roll, accel_coast)):
       return CurveResult()
     state = lateral_state if lateral_state is not None else LateralState()
-    self._lateral_history = self._lateral_history[1:] + [max(abs(state.desired_lateral_accel), abs(state.actual_lateral_accel))]
+    if lateral_active and state.active:
+      # an idle controller reports no lateral acceleration at all, which would read as an open road mid-corner: the last
+      # measurement stands until the steering is back
+      self._lateral_history = self._lateral_history[1:] + [max(abs(state.desired_lateral_accel), abs(state.actual_lateral_accel))]
     steering = lateral_active and state.active and not steering_pressed
     live = _torque_values(torque_params) if torque_params is not None else None
     params = self._calibrated(live or self.torque_params, state, v_ego, steering)
@@ -299,12 +321,28 @@ class ModelCurveSpeedLimiter:
     self._candidate_history = self._candidate_history[1:] + [anticipation]
     anticipation = float(np.median(self._candidate_history))
 
+    lifting = self.regime in (REGIME_COAST, REGIME_BRAKE)
     if steering:
       reaction = self._react(state, v_ego, accel_coast, params, roll)
     else:
       self.regime = REGIME_FREE
       self._losing_s = self._coast_enter_s = self._coast_exit_s = 0.0
       reaction = A_CURVE_FREE
+
+    # the hold: a lift ends into zero, not into whichever candidate wants to accelerate, until the bend reads open or the
+    # hold times out. A steering dropout arms it too (the regime falls to free) and keeps it for the resumption; the driver's
+    # own steering or gas is never held. The anticipation reading free does not end it: the path sees the exit before the
+    # car is through the bend, and a straight road reads open within the dwell anyway
+    if lifting and self.regime not in (REGIME_COAST, REGIME_BRAKE):
+      self._holding = True
+      self._hold_s = self._open_s = 0.0
+    if self._holding:
+      self._hold_s += self.dt
+      self._open_s = self._open_s + self.dt if float(np.median(self._lateral_history)) < BEND_OPEN_A_LAT else 0.0
+      if self._open_s + 1e-9 >= BEND_OPEN_S or self._hold_s + 1e-9 >= HOLD_MAX_S:
+        self._holding = False
+    if self._holding and steering and self._gas_grace_s <= 0.0:
+      reaction = min(reaction, 0.0)
 
     raw = max(min(anticipation, reaction), A_CURVE_MIN)
     factor = params[0] if params is not None else 0.0
@@ -314,10 +352,10 @@ class ModelCurveSpeedLimiter:
       self.active = False
       if self.regime == REGIME_ANTICIPATE:
         self.regime = REGIME_FREE
-      return CurveResult(None, self.regime, self.v_limit, self.distance, factor)
+      return CurveResult(None, self.regime, self.v_limit, self.distance, factor, self._holding)
     anchor = min(self._output, max(a_ego, raw) + J_DOWN * self.dt) if self._output >= A_CURVE_FREE else self._output
     self._output = float(np.clip(raw, anchor - J_DOWN * self.dt, anchor + J_UP * self.dt))
     self.active = True
     if self.regime == REGIME_FREE:
       self.regime = REGIME_ANTICIPATE
-    return CurveResult(self._output, self.regime, self.v_limit, self.distance, factor)
+    return CurveResult(self._output, self.regime, self.v_limit, self.distance, factor, self._holding)

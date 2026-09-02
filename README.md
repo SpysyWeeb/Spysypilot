@@ -5,6 +5,8 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot).
 Status: **in progress pending field testing**. This feature must not be marked
 complete until the owner has tested it on-device.
 
+2026-09-02: a lift now ends in a hold — after the coast or brake regime releases, the candidate holds zero until the bend reads open (`BEND_OPEN_A_LAT` 1.0 m/s² for 1 s) instead of handing the plan back to the accelerating candidate (route 0x33: 16 → 4 source handoffs). Replay-gated, plant-gated, awaiting the owner's drive. Details: docs/ModelCurveSpeedLimit.md.
+
 Rebuilt 2026-08-29 as a curve longitudinal *policy*: the model path's curves become one
 acceleration candidate in the planner's arbitration (anticipation from a per-node torque
 budget whose steering authority is calibrated online), and the measured steering state
