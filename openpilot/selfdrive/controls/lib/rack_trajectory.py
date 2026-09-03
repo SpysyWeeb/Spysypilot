@@ -90,6 +90,8 @@ class RackTrajectoryOutput:
   envelope_open_acceleration_deg_s2: float
   envelope_open_jerk_deg_s3: float
   envelope_preview_time_s: float
+  hold_topup_torque: float
+  hold_topup_growing: bool
 
 
 MEASURED_RATE_FILTER_RC_S = .05
@@ -150,6 +152,18 @@ def _smoothstep(value: float, edge0: float, edge1: float) -> float:
 
 def _clip(value: float, limit: float) -> float:
   return max(-limit, min(limit, value))
+
+
+def _hold_topup_step(state: float, error_deg: float, steady_gate: float, accumulating: bool, fast_leak: bool, dt: float) -> float:
+  """One frame of the hold top-up's leaky integrator (FM3.14). The caller resolves the anti-windup gates
+  (`accumulating`) and the steadiness weight (`steady_gate`); this owns only the ODE, the leak selection,
+  the hard bound and the zero snap. Growth and the fast leak never apply in the same call (the caller
+  passes accumulating=False whenever fast_leak=True), so the per-frame step is bounded by
+  dt * MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S = 0.0067, well inside R7_MAX_TORQUE_STEP."""
+  growth = HOLD_TOPUP_RATE * _clip(error_deg, HOLD_TOPUP_ERROR_CAP_DEG) * steady_gate if accumulating else 0.0
+  leak_rc = HOLD_TOPUP_OVERRIDE_DECAY_S if fast_leak else HOLD_TOPUP_LEAK_RC_S
+  state = _clip(state + dt * (growth - state / leak_rc), MAX_HOLD_TOPUP_TORQUE)
+  return 0.0 if abs(state) < HOLD_TOPUP_ZERO_EPS_TORQUE else state
 
 
 def _rate_viable_acceleration(headroom: float, jerk: float, dt: float) -> float:
@@ -558,6 +572,26 @@ GUARD_FALLBACK_TORQUE_CAP = .18  # empirically derived from real 2c/2d/2e replay
                                   # feedback at every historical exact-zero episode has p50=0.036, p75=0.082,
                                   # p90=0.467, p99=3.80; 0.18 sits at ~85th percentile, resolving the dominant
                                   # near-center regime without clipping while hard-capping the reversal-lag tail.
+# Hold top-up (docs/BLaTv3_FAILURE_MODES.md FM3.14): the third torque term. Feedforward predicts, position/rate
+# feedback correct, and this bounded leaky integrator makes up whatever standing shortfall is left while the
+# wheel is meant to hold -- in angle space, deliberately NOT through gain(v) * lateral_accel_per_degree, since
+# that v^2-scaled pipeline is what under-supplied the real hold effort on route 0x3e (request -0.57 -> -0.36 at a
+# constant 35 deg as the car slowed 9.4 -> 7.9 m/s; the wheel crept out while the plan tracked it).
+HOLD_TOPUP_RATE = .1                    # torque per (deg * s): a held 1.5 deg error is worth an R7 step within ~0.35 s
+MAX_HOLD_TOPUP_TORQUE = .2              # the field event's own measured gap (0.21); must stay under MAX_FEEDBACK_TORQUE
+HOLD_TOPUP_ERROR_CAP_DEG = 5.           # beyond this the error is no longer a small shortfall; P/D and the filter own it
+HOLD_TOPUP_LEAK_RC_S = 3.               # always-on passive leak: a curve hold barely bleeds, nothing outlives its cause
+HOLD_TOPUP_OVERRIDE_DECAY_S = .3        # fast leak while the driver presses and through the release cooldown below
+HOLD_TOPUP_RELEASE_COOLDOWN_S = .3      # a brief grab must not hand a barely-decayed residual back to the slow leak
+HOLD_TOPUP_ZERO_EPS_TORQUE = 1e-4       # snap to exact 0.0 below this so bit-identity with no top-up is reachable
+HOLD_TOPUP_PLAN_RATE_DEG_S = 5.         # the virtual rack is holding, not chasing, below this planned rate ...
+HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S = 3.   # ... fading out continuously by 8 deg/s (R7: no boolean gate on a ramp)
+HOLD_TOPUP_MEASURED_RATE_DEG_S = 8.     # the real wheel is not actively turning below this: above the shadow observer's
+HOLD_TOPUP_MEASURED_RATE_BLEND_DEG_S = 4.  # 2 deg/s steady bar on purpose -- the 2 deg/s creep must still be corrected
+HOLD_TOPUP_APPROACH_RATE_DEG_S = .5      # the wheel already closing on the plan faster than this is not a standing
+HOLD_TOPUP_APPROACH_BLEND_DEG_S = 1.5    # shortfall: growth fades out by 2 deg/s of approach so the last additions are
+                                         # allowed to finish their work before more is added (no integrator overshoot)
+assert MAX_HOLD_TOPUP_TORQUE < MAX_FEEDBACK_TORQUE  # the two sum directly in raw_torque (R10: checked, not implicit)
                                   # Fit to the old build's zero-episode geometry, which this change eliminates --
                                   # owner decision 2026-09-01: ship now, re-derive after the next field drive.
 STALE_MODEL_S = 0.5  # SubMaster's alive window for modelV2: ten model frames
@@ -709,6 +743,8 @@ class RackTrajectoryController:
     self.transition_acceleration_limit: float | None = None
     self.previous_planned_lateral_accel: float | None = None
     self.direction_guard_scale = 0.0  # v2: a mix weight (0 = no conflict), not a survival scale
+    self.hold_topup_torque = 0.0  # FM3.14: the third torque term, torque units, always starts at exactly 0.0
+    self.hold_topup_cooldown_frames = 0  # frames of fast leak + frozen growth still owed after a release
     self.previous_output_torque: float | None = None  # R7 baseline; None on a fresh engage (not a rule boundary)
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
@@ -740,6 +776,8 @@ class RackTrajectoryController:
     self.previous_planned_lateral_accel = None
     self.direction_guard_scale = 0.0
     self.previous_output_torque = None  # a fresh engage is not a rule boundary (R7); re-seeds freely
+    self.hold_topup_torque = 0.0
+    self.hold_topup_cooldown_frames = 0
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_filter.reset()
@@ -1101,7 +1139,10 @@ class RackTrajectoryController:
     feedback_upper = turn_in_cap if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
     feedback = min(max(raw_feedback, feedback_lower), feedback_upper)
     feedback_limited = feedback != raw_feedback
-    raw_torque = feedforward_torque + feedback
+    # the hold top-up applied cold from last frame's fully resolved state; this frame's growth is decided
+    # below, after the platform clip, the guard and the driver-assist envelope have all had their say
+    topup_applied = self.hold_topup_torque
+    raw_torque = feedforward_torque + feedback + topup_applied
     # FM3.9 retired: the old measured_angle==0.0 exact-zero special case is now covered by the
     # continuous direction guard below -- a target-referred bounded fallback, not a zero spike.
     # The phase-3 slew-aware early release is RETIRED: in the field (route 2d, six owner bookmarks)
@@ -1128,7 +1169,7 @@ class RackTrajectoryController:
     )
     if not all(math.isfinite(value) for value in (
       torque, plan.position_deg, plan.rate_deg_s, plan.acceleration_deg_s2, measured_rate,
-      lateral_accel_error, position_feedback, rate_feedback, feedforward_torque,
+      lateral_accel_error, position_feedback, rate_feedback, feedforward_torque, topup_applied,
     )):
       self._invalidate(STATUS_INVALID_OUTPUT)
       return None
@@ -1155,6 +1196,45 @@ class RackTrajectoryController:
     # can't leave a phantom-high baseline that forces an unwanted high-torque hold the instant the
     # driver releases the wheel.
     self.previous_output_torque = torque
+    # Hold top-up, deferred write (FM3.14): grow only while the wheel is meant to be steady and nothing
+    # upstream already binds in the error's own direction -- the platform clip and the feedback cap flags
+    # above are the real applied-composition flags (last frame's top-up included), and the guard mix is this
+    # frame's resolved value, not a stale one. A press freezes growth and selects the fast leak, and the
+    # cooldown keeps both for HOLD_TOPUP_RELEASE_COOLDOWN_S after the hand comes off, so a brief grab can't
+    # hand a barely-decayed residual back to the slow leak. Stock fallback never reaches here (reset() ran).
+    in_release_cooldown = not CS.steeringPressed and self.hold_topup_cooldown_frames > 0
+    if CS.steeringPressed:
+      self.hold_topup_cooldown_frames = round(HOLD_TOPUP_RELEASE_COOLDOWN_S / self.dt)
+    elif in_release_cooldown:
+      self.hold_topup_cooldown_frames -= 1
+    position_error_deg = plan.position_deg - float(CS.steeringAngleDeg)
+    error_sign = math.copysign(1.0, position_error_deg) if position_error_deg != 0.0 else 0.0
+    platform_bind = platform_saturated and error_sign != 0.0 and math.copysign(1.0, raw_torque) == error_sign
+    feedback_bind = feedback_limited and error_sign != 0.0 and math.copysign(1.0, feedback) == error_sign
+    accumulating = (
+      not CS.steeringPressed and not in_release_cooldown and self.direction_guard_scale <= 0.0
+      and not platform_bind and not feedback_bind
+    )
+    plan_rate_gate = 1.0 - _smoothstep(
+      abs(plan.rate_deg_s), HOLD_TOPUP_PLAN_RATE_DEG_S, HOLD_TOPUP_PLAN_RATE_DEG_S + HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S,
+    )
+    measured_rate_gate = (1.0 - _smoothstep(
+      abs(measured_rate), HOLD_TOPUP_MEASURED_RATE_DEG_S, HOLD_TOPUP_MEASURED_RATE_DEG_S + HOLD_TOPUP_MEASURED_RATE_BLEND_DEG_S,
+    )) if measured_rate_valid else 0.0
+    approach_gate = (1.0 - _smoothstep(
+      measured_rate * error_sign, HOLD_TOPUP_APPROACH_RATE_DEG_S, HOLD_TOPUP_APPROACH_RATE_DEG_S + HOLD_TOPUP_APPROACH_BLEND_DEG_S,
+    )) if measured_rate_valid else 0.0
+    # none against a wanted unwind (the rate feedback's own relaxation), none while the plan itself is moving,
+    # none while the wheel is swinging, none while the wheel is already visibly closing on the plan. Deliberately
+    # NOT the turn-in fraction: a wheel standing short of a static plan and target is exactly the standing
+    # shortfall, and the turn-in fraction reads any wheel more than TURN_IN_BLEND_DEG short of the target as a
+    # turn-in -- gated on it the term never acted on the route 0x3e window it exists for. What separates an
+    # active turn-in from a standing shortfall is motion: the plan's, the wheel's, or the wheel's approach.
+    steady_gate = rate_gain_scale * plan_rate_gate * measured_rate_gate * approach_gate
+    self.hold_topup_torque = _hold_topup_step(
+      self.hold_topup_torque, position_error_deg, steady_gate, accumulating,
+      bool(CS.steeringPressed) or in_release_cooldown, self.dt,
+    )
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
       torque=torque,
@@ -1199,4 +1279,6 @@ class RackTrajectoryController:
       envelope_open_acceleration_deg_s2=opened_profile.max_acceleration_deg_s2,
       envelope_open_jerk_deg_s3=opened_profile.max_jerk_deg_s3,
       envelope_preview_time_s=self.envelope_scheduler.preview_s,
+      hold_topup_torque=topup_applied,  # this frame's applied contribution, already inside `torque`
+      hold_topup_growing=accumulating,
     )

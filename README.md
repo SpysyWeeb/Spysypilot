@@ -58,6 +58,17 @@ builds, never past a refuge island.
   does not. The stock controller is stepped every frame so its request buffer and jerk filter follow
   the live history and the two share one saturation timer; as in BLaTv2, its integrator starts clean
   when it takes over. Logs into `lateralControlState.rackState`.
+- Phase 3, step 6 — the hold top-up (FM3.14), the third torque term: feedforward predicts, position and
+  rate feedback correct, and a bounded (0.20), leaky (3 s; 0.3 s under a press and through a 0.3 s
+  release cooldown), angle-space integrator makes up whatever standing shortfall is left while the wheel
+  is meant to hold — in degrees, deliberately outside the `gain(v) · lateral_accel_per_degree` pipeline
+  whose v²-scaled feedforward under-supplied the real hold effort on route 0x3e (request −0.57 → −0.36 at a
+  constant 35° as the car slowed 9.4 → 7.9 m/s; the wheel crept out within 1° of the plan and let go).
+  Growth only while the plan and the wheel are still and the wheel is not already closing on the plan,
+  never against a wanted unwind, never while a press, the release cooldown, the direction guard, the
+  platform clip or the feedback cap already binds in the error's own direction; per-frame step ≤ 0.0067
+  (R7), snaps to exact 0.0, reset with the controller, never persisted. Logged as `holdTopupTorque` /
+  `holdTopupGrowing`. Design panel and refutation round in `route-audit/phase3/step6_topup_design/`.
 - Phase 3, step 5 — horizon-implied envelope opening (R4, G-independent): a second,
   confidence-free `PreviewScheduler` (`envelope_scheduler`) reuses every R2 gate except the
   confidence check, corroborated instead by its own frame-to-frame far-point stability check
