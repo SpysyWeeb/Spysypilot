@@ -22,7 +22,7 @@ from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
 
-MIN_FINGERPRINT_TIME_S = 4.0  # seconds from the first CAN wait until pandad may apply the car safety mode
+MIN_FINGERPRINT_TIME_S = 0.0  # EXPERIMENT 2026-09-03: dwell off, manager's offroad clear kept -- does the relay fault return?
 REPLAY = "REPLAY" in os.environ
 
 EventName = log.OnroadEvent.EventName
