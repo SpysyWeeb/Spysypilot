@@ -22,7 +22,6 @@ from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
 
-MIN_FINGERPRINT_TIME_S = 0.0  # EXPERIMENT 2026-09-03: dwell off, manager's offroad clear kept -- does the relay fault return?
 REPLAY = "REPLAY" in os.environ
 
 EventName = log.OnroadEvent.EventName
@@ -85,7 +84,6 @@ class Car:
     is_release = self.params.get_bool("IsReleaseBranch")
 
     if CI is None:
-      fingerprint_start = time.monotonic()
       # wait for one pandaState and one CAN packet
       print("Waiting for CAN messages...")
       while True:
@@ -104,12 +102,6 @@ class Car:
       self.CI = get_car(*self.can_callbacks, obd_callback(self.params), alpha_long_allowed, is_release, cached_params)
       self.RI = interfaces[self.CI.CP.carFingerprint].RadarInterface(self.CI.CP)
       self.CP = self.CI.CP
-
-      # A cached fingerprint returns within a second of ignition, while the car is still powering up. The car
-      # safety mode (and with it the harness relay) must not be applied that early: on a 2021 Palisade the
-      # panda's relay check tripped in that window and stayed latched for the whole drive. The firmware query
-      # used to take longer than this on its own.
-      time.sleep(max(0.0, MIN_FINGERPRINT_TIME_S - (time.monotonic() - fingerprint_start)))
 
       # continue onto next fingerprinting step in pandad
       self.params.put_bool("FirmwareQueryDone", True, block=True)
