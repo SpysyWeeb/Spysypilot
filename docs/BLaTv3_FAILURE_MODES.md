@@ -487,9 +487,13 @@ red-team pass.
   steady — `rate_gain_scale · plan_rate_gate · measured_rate_gate · approach_gate` (not the turn-in
   fraction: a wheel standing short of a static plan is the standing shortfall itself, and the turn-in fraction
   reads it as a turn-in; motion is what separates the two) — and only while nothing already binds in the error's own direction (press, release
-  cooldown, guard mix > 0, platform clip, feedback cap); the approach gate fades growth out as the wheel
-  is already closing on the plan (0.5–2 deg/s) so the last additions finish their work before more is
-  added. Per-frame step from the term ≤ 0.0067 (any gate history), inside R7; snaps to exact 0.0 so
+  cooldown, guard mix > 0, platform clip, feedback cap) and only while the plan and the served target lie
+  on the same side of the wheel (near center at speed the plan sits half a degree one way and the target
+  the other; a term chasing the plan there pushes against the target and doubles the guard's engagement
+  at a mix too small to correct it); the approach gate fades growth out as the wheel is already closing
+  on the plan (0.5–2 deg/s) so the last additions finish their work before more is added; a push the
+  target does not want, or a residual the current error already opposes, drains at the fast rate.
+  Per-frame step from the term ≤ 0.0117 (any gate history), inside R7; snaps to exact 0.0 so
   bit-identity with no top-up is a reachable state; reset with the rest of the controller, never
   persisted, structurally exempt from R10's persisted-surface machinery. → Route `0000003e` 1552–1558
   open-loop replay: the request no longer decays with speed at a constant angle; unit plant with a hold

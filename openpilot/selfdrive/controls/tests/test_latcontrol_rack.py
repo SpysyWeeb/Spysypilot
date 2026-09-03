@@ -2158,15 +2158,15 @@ class TestHoldTopup(OpenpilotTestCase):
 
   def test_step_per_frame_bound_under_gate_thrashing(self):
     rng = np.random.default_rng(7)
-    bound = 0.01 * MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S
+    bound = 0.01 * (HOLD_TOPUP_RATE * HOLD_TOPUP_ERROR_CAP_DEG + MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S)
     state = 0.0
     for _ in range(5000):
       fast = bool(rng.integers(2))
-      accumulating = (not fast) and bool(rng.integers(2))
+      accumulating = bool(rng.integers(2))
       new = _hold_topup_step(state, float(rng.choice([-40.0, -5.0, -1.0, 1.0, 5.0, 40.0])), float(rng.random()), accumulating, fast, 0.01)
       assert abs(new - state) <= bound + 1e-9
       state = new
-    assert bound < R7_MAX_TORQUE_STEP / 5
+    assert bound < R7_MAX_TORQUE_STEP / 4
 
   # ---- through the controller ----
 
@@ -2391,3 +2391,28 @@ class TestHoldTopup(OpenpilotTestCase):
       assert not rack_log.fallback
     assert abs(rack_log.holdTopupTorque) > 0.02
     assert rack_log.holdTopupGrowing
+
+  def test_no_growth_when_the_target_disagrees_with_the_plan_and_a_reversed_residual_drains_fast(self):
+    controller, CS, step = hold_fixture()
+    output, frame = settle(controller, CS, step)
+    for i in range(1, 301):
+      pin_short_of_plan(CS, output, 1.5)
+      output = step(frame + i)
+    frame += 300
+    grown = output.hold_topup_torque
+    assert abs(grown) > 0.1
+    # the wheel now beyond the plan: the accumulated push opposes the error and must drain at the fast
+    # rate (gone within ~0.3 s), not linger for seconds at the passive leak
+    for i in range(1, 31):
+      pin_short_of_plan(CS, output, -1.5)
+      output = step(frame + i)
+    frame += 30
+    assert abs(output.hold_topup_torque) < 0.45 * abs(grown), (output.hold_topup_torque, grown)
+    # plan and target on opposite sides of the wheel: no growth at all, whatever the plan error
+    controller.hold_topup_torque = 0.0
+    for i in range(1, 201):
+      # a wheel past the served target on the target's side while the plan is still short of it
+      CS.steeringAngleDeg = output.near_target_angle_deg * 1.02 if abs(output.planned_angle_deg) < abs(output.near_target_angle_deg) else output.planned_angle_deg
+      output = step(frame + i)
+      if abs(output.planned_angle_deg) < abs(output.near_target_angle_deg) and abs(CS.steeringAngleDeg) > abs(output.planned_angle_deg):
+        assert not output.hold_topup_growing

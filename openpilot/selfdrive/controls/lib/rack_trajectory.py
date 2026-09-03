@@ -158,8 +158,9 @@ def _hold_topup_step(state: float, error_deg: float, steady_gate: float, accumul
   """One frame of the hold top-up's leaky integrator (FM3.14). The caller resolves the anti-windup gates
   (`accumulating`) and the steadiness weight (`steady_gate`); this owns only the ODE, the leak selection,
   the hard bound and the zero snap. Growth and the fast leak never apply in the same call (the caller
-  passes accumulating=False whenever fast_leak=True), so the per-frame step is bounded by
-  dt * MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S = 0.0067, well inside R7_MAX_TORQUE_STEP."""
+  passes accumulating=False whenever the driver's hand selects the fast leak), so the per-frame step is
+  bounded by dt * (HOLD_TOPUP_RATE * HOLD_TOPUP_ERROR_CAP_DEG + MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S)
+  = 0.0117 even when a reversed error drains the state while growing the other way -- inside R7_MAX_TORQUE_STEP."""
   growth = HOLD_TOPUP_RATE * _clip(error_deg, HOLD_TOPUP_ERROR_CAP_DEG) * steady_gate if accumulating else 0.0
   leak_rc = HOLD_TOPUP_OVERRIDE_DECAY_S if fast_leak else HOLD_TOPUP_LEAK_RC_S
   state = _clip(state + dt * (growth - state / leak_rc), MAX_HOLD_TOPUP_TORQUE)
@@ -1209,10 +1210,17 @@ class RackTrajectoryController:
       self.hold_topup_cooldown_frames -= 1
     position_error_deg = plan.position_deg - float(CS.steeringAngleDeg)
     error_sign = math.copysign(1.0, position_error_deg) if position_error_deg != 0.0 else 0.0
+    # a shortfall is only worth making up when the plan and the served target both lie on the same side
+    # of the wheel: near center at speed the plan sits half a degree one way and the target the other,
+    # and a term chasing the plan there pushes against the target (replay: the guard engaged twice as
+    # often, at a mix too small to correct it). A push the target does not want drains at the fast rate,
+    # as does a residual the current error already opposes -- a stale push never outlives ~0.3 s.
+    aligned = position_error_deg * (target_angle - measured_angle) > 0.0
+    reversed_residual = self.hold_topup_torque * position_error_deg < 0.0
     platform_bind = platform_saturated and error_sign != 0.0 and math.copysign(1.0, raw_torque) == error_sign
     feedback_bind = feedback_limited and error_sign != 0.0 and math.copysign(1.0, feedback) == error_sign
     accumulating = (
-      not CS.steeringPressed and not in_release_cooldown and self.direction_guard_scale <= 0.0
+      aligned and not CS.steeringPressed and not in_release_cooldown and self.direction_guard_scale <= 0.0
       and not platform_bind and not feedback_bind
     )
     plan_rate_gate = 1.0 - _smoothstep(
@@ -1233,7 +1241,7 @@ class RackTrajectoryController:
     steady_gate = rate_gain_scale * plan_rate_gate * measured_rate_gate * approach_gate
     self.hold_topup_torque = _hold_topup_step(
       self.hold_topup_torque, position_error_deg, steady_gate, accumulating,
-      bool(CS.steeringPressed) or in_release_cooldown, self.dt,
+      bool(CS.steeringPressed) or in_release_cooldown or not aligned or reversed_residual, self.dt,
     )
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
