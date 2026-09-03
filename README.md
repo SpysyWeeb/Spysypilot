@@ -66,7 +66,7 @@ builds, never past a refuge island.
   constant 35° as the car slowed 9.4 → 7.9 m/s; the wheel crept out within 1° of the plan and let go).
   Growth only while the plan and the wheel are still and the wheel is not already closing on the plan,
   never against a wanted unwind, never while a press, the release cooldown, the direction guard, the
-  platform clip or the feedback cap already binds in the error's own direction; per-frame step ≤ 0.0067
+  platform clip or the feedback cap already binds in the error's own direction; per-frame step ≤ 0.0117
   (R7), snaps to exact 0.0, reset with the controller, never persisted. Logged as `holdTopupTorque` /
   `holdTopupGrowing`. Design panel and refutation round in `route-audit/phase3/step6_topup_design/`.
 - Phase 3, step 5 — horizon-implied envelope opening (R4, G-independent): a second,

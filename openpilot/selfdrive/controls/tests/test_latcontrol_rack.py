@@ -2412,7 +2412,125 @@ class TestHoldTopup(OpenpilotTestCase):
     controller.hold_topup_torque = 0.0
     for i in range(1, 201):
       # a wheel past the served target on the target's side while the plan is still short of it
-      CS.steeringAngleDeg = output.near_target_angle_deg * 1.02 if abs(output.planned_angle_deg) < abs(output.near_target_angle_deg) else output.planned_angle_deg
+      plan_short = abs(output.planned_angle_deg) < abs(output.near_target_angle_deg)
+      CS.steeringAngleDeg = output.near_target_angle_deg * 1.02 if plan_short else output.planned_angle_deg
       output = step(frame + i)
       if abs(output.planned_angle_deg) < abs(output.near_target_angle_deg) and abs(CS.steeringAngleDeg) > abs(output.planned_angle_deg):
         assert not output.hold_topup_growing
+
+  def test_composed_torque_r7_bound_across_a_press_and_release(self):
+    # the review's finding: the assist branch slews the committed torque toward its cap during an
+    # opposing press, and on release the composed request -- the term's carried-in value included --
+    # must not come back in one step; the slew carries on until the request is within a step
+    controller, CS, step = hold_fixture()
+    output, frame = settle(controller, CS, step)
+    for i in range(1, 1201):
+      pin_short_of_plan(CS, output, 4.5)
+      output = step(frame + i)
+    frame += 1200
+    assert abs(output.hold_topup_torque) == MAX_HOLD_TOPUP_TORQUE
+    assert abs(output.torque) > 0.6
+    previous = output.torque
+    CS.steeringPressed = True
+    CS.steeringTorque = -math.copysign(200.0, output.torque)  # an opposing hand above the pressed threshold
+    trace = []
+    for i in range(1, 16):
+      pin_short_of_plan(CS, output, 4.5)
+      output = step(frame + i)
+      trace.append(output.torque - previous)
+      previous = output.torque
+    frame += 15
+    assert abs(output.torque) <= 0.5 + 1e-9  # slewed down to the opposing-driver floor
+    CS.steeringPressed = False
+    CS.steeringTorque = 0.0
+    for i in range(1, 61):
+      pin_short_of_plan(CS, output, 4.5)
+      output = step(frame + i)
+      trace.append(output.torque - previous)
+      previous = output.torque
+    assert max(abs(d) for d in trace) <= R7_MAX_TORQUE_STEP + 1e-9, max(abs(d) for d in trace)
+    assert abs(output.torque) > 0.55  # and the request did come back once reconciled
+
+  def test_creeping_wheel_grows_and_an_approaching_wheel_fades(self):
+    # the route 0x3e geometry: the plan static, the wheel leaving it at 2 deg/s -- the term must grow;
+    # a wheel already closing on the plan at 1 deg/s -- growth must fade (the approach gate)
+    def run(rate_deg_s, offset_deg, frames=100):
+      controller, CS, step = hold_fixture()
+      output, frame = settle(controller, CS, step)
+      plan = output.planned_angle_deg
+      away = -math.copysign(1.0, plan)  # toward center, i.e. short of the plan
+      angle = plan + away * offset_deg
+      for i in range(1, frames + 1):
+        angle += away * rate_deg_s * 0.01
+        CS.steeringAngleDeg = angle
+        CS.steeringRateDeg = away * rate_deg_s
+        output = step(frame + i)
+      return abs(output.hold_topup_torque)
+    departing = run(2.0, 0.5)
+    approaching = run(-1.0, 2.5)
+    assert departing > 0.02, departing
+    assert approaching < 0.3 * departing, (approaching, departing)
+
+  def test_growth_resumes_on_the_first_frame_after_the_cooldown(self):
+    controller, CS, step = hold_fixture()
+    output, frame = settle(controller, CS, step)
+    for i in range(1, 201):
+      pin_short_of_plan(CS, output, 1.5)
+      output = step(frame + i)
+    frame += 200
+    CS.steeringPressed = True
+    for i in range(1, 6):
+      pin_short_of_plan(CS, output, 1.5)
+      output = step(frame + i)
+    frame += 5
+    CS.steeringPressed = False
+    cooldown = round(HOLD_TOPUP_RELEASE_COOLDOWN_S / 0.01)
+    for i in range(1, cooldown + 1):
+      pin_short_of_plan(CS, output, 1.5)
+      output = step(frame + i)
+      assert not output.hold_topup_growing, i
+    pin_short_of_plan(CS, output, 1.5)
+    output = step(frame + cooldown + 1)
+    assert output.hold_topup_growing
+
+  def test_six_inactive_frames_reset_the_term_through_hold(self):
+    controller, CS, step = hold_fixture()
+    output, frame = settle(controller, CS, step)
+    for i in range(1, 201):
+      pin_short_of_plan(CS, output, 1.5)
+      output = step(frame + i)
+    assert abs(controller.hold_topup_torque) > 0.05
+    for _ in range(INACTIVE_HOLD_FRAMES + 1):
+      controller.hold()
+    assert controller.hold_topup_torque == 0.0
+    assert controller.hold_topup_cooldown_frames == 0
+    assert not controller.release_reconcile
+
+  def test_stale_model_fallback_zeroes_a_grown_term_and_resumes_from_zero(self):
+    controller, stock, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 8.0
+    params = log.VehicleParameters.new_message()
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0156 * 8.0] * 6, [8.0] * 6)
+    model.action.desiredCurvature = 0.0156
+    planned = 0.0
+    for frame in range(600):
+      CS.steeringAngleDeg = planned - math.copysign(1.5, planned) if planned != 0.0 else 0.0
+      model.timestampEof = 1_000_000_000 + frame * 10_000_000
+      _, planned, rack_log = controller.update(True, CS, VM, params, False, 0.0156, False, 0.2, model=model, mono_time_ns=model.timestampEof + 50_000_000)
+    assert abs(rack_log.holdTopupTorque) > 0.02
+    stale_ns = model.timestampEof + int(STALE_MODEL_S * 1e9) + 10_000_000
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.0156, False, 0.2, model=model, mono_time_ns=stale_ns)
+    assert rack_log.fallback
+    assert controller.rack.hold_topup_torque == 0.0
+    assert rack_log.holdTopupTorque == 0.0
+    hold_frames = int(FALLBACK_HOLD_S / DT_CTRL)
+    for frame in range(hold_frames):
+      model.timestampEof = stale_ns + frame * 10_000_000
+      _, _, rack_log = controller.update(True, CS, VM, params, False, 0.0156, False, 0.2, model=model, mono_time_ns=model.timestampEof)
+      assert rack_log.fallback
+      assert rack_log.holdTopupTorque == 0.0
+    model.timestampEof = stale_ns + hold_frames * 10_000_000
+    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.0156, False, 0.2, model=model, mono_time_ns=model.timestampEof)
+    assert not rack_log.fallback
+    assert rack_log.holdTopupTorque == 0.0

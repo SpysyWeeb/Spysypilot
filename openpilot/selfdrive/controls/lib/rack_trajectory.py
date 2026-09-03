@@ -573,6 +573,8 @@ GUARD_FALLBACK_TORQUE_CAP = .18  # empirically derived from real 2c/2d/2e replay
                                   # feedback at every historical exact-zero episode has p50=0.036, p75=0.082,
                                   # p90=0.467, p99=3.80; 0.18 sits at ~85th percentile, resolving the dominant
                                   # near-center regime without clipping while hard-capping the reversal-lag tail.
+                                  # Fit to the old build's zero-episode geometry, which this change eliminates --
+                                  # owner decision 2026-09-01: ship now, re-derive after the next field drive.
 # Hold top-up (docs/BLaTv3_FAILURE_MODES.md FM3.14): the third torque term. Feedforward predicts, position/rate
 # feedback correct, and this bounded leaky integrator makes up whatever standing shortfall is left while the
 # wheel is meant to hold -- in angle space, deliberately NOT through gain(v) * lateral_accel_per_degree, since
@@ -589,12 +591,10 @@ HOLD_TOPUP_PLAN_RATE_DEG_S = 5.         # the virtual rack is holding, not chasi
 HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S = 3.   # ... fading out continuously by 8 deg/s (R7: no boolean gate on a ramp)
 HOLD_TOPUP_MEASURED_RATE_DEG_S = 8.     # the real wheel is not actively turning below this: above the shadow observer's
 HOLD_TOPUP_MEASURED_RATE_BLEND_DEG_S = 4.  # 2 deg/s steady bar on purpose -- the 2 deg/s creep must still be corrected
-HOLD_TOPUP_APPROACH_RATE_DEG_S = .5      # the wheel already closing on the plan faster than this is not a standing
-HOLD_TOPUP_APPROACH_BLEND_DEG_S = 1.5    # shortfall: growth fades out by 2 deg/s of approach so the last additions are
+HOLD_TOPUP_APPROACH_RATE_DEG_S = .25     # the wheel already closing on the plan faster than this is not a standing
+HOLD_TOPUP_APPROACH_BLEND_DEG_S = .75    # shortfall: growth fades out by 1 deg/s of approach so the last additions are
                                          # allowed to finish their work before more is added (no integrator overshoot)
 assert MAX_HOLD_TOPUP_TORQUE < MAX_FEEDBACK_TORQUE  # the two sum directly in raw_torque (R10: checked, not implicit)
-                                  # Fit to the old build's zero-episode geometry, which this change eliminates --
-                                  # owner decision 2026-09-01: ship now, re-derive after the next field drive.
 STALE_MODEL_S = 0.5  # SubMaster's alive window for modelV2: ten model frames
 INACTIVE_HOLD_FRAMES = 5  # keep the planned rack through a short latActive blip, e.g. at the standstill gate
 
@@ -746,6 +746,7 @@ class RackTrajectoryController:
     self.direction_guard_scale = 0.0  # v2: a mix weight (0 = no conflict), not a survival scale
     self.hold_topup_torque = 0.0  # FM3.14: the third torque term, torque units, always starts at exactly 0.0
     self.hold_topup_cooldown_frames = 0  # frames of fast leak + frozen growth still owed after a release
+    self.release_reconcile = False  # the assist branch's R7 slew carries on after a release until caught up
     self.previous_output_torque: float | None = None  # R7 baseline; None on a fresh engage (not a rule boundary)
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
@@ -779,6 +780,7 @@ class RackTrajectoryController:
     self.previous_output_torque = None  # a fresh engage is not a rule boundary (R7); re-seeds freely
     self.hold_topup_torque = 0.0
     self.hold_topup_cooldown_frames = 0
+    self.release_reconcile = False
     self.status = STATUS_INACTIVE
     self.jerk_filter.x = 0.0
     self.reference_filter.reset()
@@ -1192,6 +1194,18 @@ class RackTrajectoryController:
                                self.previous_output_torque + R7_MAX_TORQUE_STEP)
       driver_assist_limited = assisted_torque != torque
       torque = assisted_torque
+      self.release_reconcile = True
+    elif self.release_reconcile and self.previous_output_torque is not None:
+      # The hand comes off: the branch above has slewed the committed torque toward the cap, and the
+      # composed request (the hold top-up's carried-in value included -- the fast leak only starts
+      # this frame) may sit a full step or more away. Keep the same R7 slew until the request is
+      # within a step of what was committed, then hand over cleanly (FM3.14 review: an unclamped
+      # release frame jumped by the term's whole value; the pre-existing gap was smaller, same shape).
+      reconciled_torque = min(max(torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
+                              self.previous_output_torque + R7_MAX_TORQUE_STEP)
+      self.release_reconcile = reconciled_torque != torque
+      driver_assist_limited = self.release_reconcile
+      torque = reconciled_torque
     # R7's baseline is the torque actually committed this frame, taken after the driver-assist clip
     # (and its own backstop above) -- not the guard's own pre-clip value -- so a saturated hand-off
     # can't leave a phantom-high baseline that forces an unwanted high-torque hold the instant the

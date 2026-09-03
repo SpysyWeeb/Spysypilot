@@ -491,7 +491,7 @@ red-team pass.
   on the same side of the wheel (near center at speed the plan sits half a degree one way and the target
   the other; a term chasing the plan there pushes against the target and doubles the guard's engagement
   at a mix too small to correct it); the approach gate fades growth out as the wheel is already closing
-  on the plan (0.5–2 deg/s) so the last additions finish their work before more is added; a push the
+  on the plan (0.25–1 deg/s) so the last additions finish their work before more is added; a push the
   target does not want, or a residual the current error already opposes, drains at the fast rate.
   Per-frame step from the term ≤ 0.0117 (any gate history), inside R7; snaps to exact 0.0 so
   bit-identity with no top-up is a reachable state; reset with the rest of the controller, never
