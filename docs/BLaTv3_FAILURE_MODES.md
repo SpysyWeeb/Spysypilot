@@ -496,9 +496,15 @@ red-team pass.
   Per-frame step from the term ≤ 0.0117 (any gate history), inside R7; snaps to exact 0.0 so
   bit-identity with no top-up is a reachable state; reset with the rest of the controller, never
   persisted, structurally exempt from R10's persisted-surface machinery. → Route `0000003e` 1552–1558
-  open-loop replay: the request no longer decays with speed at a constant angle; unit plant with a hold
-  need 30 % above the feedforward: steady-state gap cut by more than half with no overshoot. Regression
-  on 2c/2d/34–37 bit-identical on every frame where the term is exactly zero.
+  open-loop replay: the term climbs to −0.08 through the hold and the request sits at −0.42…−0.48 where
+  it had decayed to −0.36 (about 40 % of the measured gap inside the one second the hold lasted; a longer
+  hold reaches the cap); the closed-loop plant is stiction-bound in this regime and does not resolve the
+  creep either way (a documented plant limit, not evidence). Unit plant with a hold need 30 % above the
+  feedforward: steady-state gap cut by more than half, no overshoot. Regression on 2c/2d/34–37: bit-identical
+  on every frame where the term is exactly zero, per-frame step 0.0067, error-gated stall share 6–12 % →
+  3–6 %, unpressed hold collapses 9 → 5 on 2c; the direction guard engages 1.5–2× more often, almost all of
+  it lingering sub-percent mixes near center that leave 98 % of the term in the output (open-loop replay
+  winds the term up on errors the real wheel would close, so field magnitudes will be smaller).
   *Phase 3 step 6 (2026-09-02): field event verified in `route-audit/phase3/event_2026-09-02_3e/`
   (route `0000003e` seg 25–26, commit `9b9ec5cc3a`): the EPS delivered exactly the request
   (steeringTorqueEps = 14.0 × request, corr 0.95) while the request fell −0.57 → −0.36 at a constant
