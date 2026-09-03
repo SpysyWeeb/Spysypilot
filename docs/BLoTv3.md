@@ -42,7 +42,7 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 | D5 | Third model lead ("ponytail") | delete (owner never felt it act) |
 | D6 | Supervisor lead speed | filtered `vLeadK`/`aLeadK`; MPC keeps raw `vLead` as stock; documented in one place |
 | D7 | Supervisor stand-down → FCW alert | no; FCW keeps stock's form |
-| D8 | Branches | retire `force-stops` (its README folded here); `BLoTv2` → `BLoTv2-Archive` after BLoTv3 is in combo; the radard low-speed age gate stays owned by `smooth-stops`; remove `force-stops` from `.github/workflows/sync-branches.yaml` (needs a PAT push) before deleting the branch |
+| D8 | Branches | `force-stops` retired 2026-09-03 after its README was folded here; its sync entry was removed before the ref was deleted. `BLoTv2` remains the frozen replay reference; the radard low-speed age gate stays owned by `smooth-stops` |
 | D9 | Module names | `longitudinal_lead.py` (kept — combo imports it), `necessity_supervisor.py`, `stop_helpers.py`, `force_stops.py`, `conditional_experimental_mode.py` |
 | D10 | Hold release fallback | 4 s window in which ≥ 80 % of model frames show no stop tier, terminal speed ≥ 1 m/s and the stop corridor is lead-free — positive "clear" evidence, not absence |
 | D11 | `selfdrived.py` on combo | collaborator (SOL/AOL) area; ask before phase 4d touches it; the CEM hook lands around the AOL calls without moving them |
