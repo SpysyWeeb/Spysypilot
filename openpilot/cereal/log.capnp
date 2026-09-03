@@ -2661,8 +2661,9 @@ struct Event {
     # at @153. Per the upstream-sync convention (conflict = manual renumber at merge
     # time, never a silent push), whichever side merges second must renumber its new
     # fields past the other's max. See docs/RACK_EFFORT_OBSERVER.md.
-    rackEffortFrame @154 :RackEffortFrame;        # step 3-C shadow observer, log-only, see RESO
-    rackEffortSnapshot @155 :RackEffortSnapshot;  # (next free ordinals after chestnutGpuState@153)
+    rackEffortFrame @153 :RackEffortFrame;        # step 3-C shadow observer, log-only, see RESO
+    rackEffortSnapshot @154 :RackEffortSnapshot;  # (next free ordinals after chestnutState@152; upstream
+                                                  # retired chestnutGpuState@153 on 2026-09-02; combo carries @158/@159)
     lateralDelay @146 : LateralDelay;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
