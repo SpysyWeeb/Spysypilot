@@ -141,6 +141,9 @@ def manager_thread(boot_spinner: Spinner | None = None) -> None:
       params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
     elif not started and started_prev:
       params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
+      # clear the onroad-transition keys on the way out too: pandad reacts to the next ignition before this loop
+      # does, and must not find the previous drive's FirmwareQueryDone / ControlsReady / CarParams still set
+      params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
 
     ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
     if ignition and not ignition_prev:
