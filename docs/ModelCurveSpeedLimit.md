@@ -129,7 +129,8 @@ measured by running the limit function on the recorded path:
 
 * **the live roll was applied to every path node** — the approach's crown (+0.044 rad, real) charged against a node banked
   the other way, worth 2–5 m/s of limit there. Nodes farther than `ROLL_HORIZON_S` (2 s of travel) now get no roll either
-  way; the near nodes and the brake regime keep the live value. Replay: 0x4c's candidate minimum −1.79 → −1.34 and the
+  way; the near nodes keep the live value, and the brake regime now charges the bank by the turn's sign too (it had
+  used the magnitude, so a crown against the turn was credited as help). Replay: 0x4c's candidate minimum −1.79 → −1.34 and the
   brake starts 10 m later; 0x4d unchanged.
 * **the online authority factor drifted with the last road driven** — 2.33 carried into 0x4c from town corners 300 s
   earlier, 4.13 into 0x4d from banked sweepers; swap them and the outcomes swap. The factor learned from the rack's

@@ -12,7 +12,6 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   BRAKE_ENTER_S,
   COAST_ENTER_S,
   COAST_EXIT_S,
-  J_DOWN,
   REGIME_ANTICIPATE,
   REGIME_BRAKE,
   REGIME_COAST,
@@ -23,6 +22,7 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   J_UP,
   A_CURVE_FREE,
   BEND_OPEN_A_LAT,
+  J_DOWN,
   BEND_OPEN_S,
   HOLD_MAX_S,
   T_APPROACH,
@@ -210,6 +210,12 @@ class TestReaction(unittest.TestCase):
     a_lat_ok = (TORQUE_BUDGET - FRICTION) * result.authority_factor
     v_ok = math.sqrt(a_lat_ok / (2.9 / 15.0 ** 2))                           # the demanded 2.9, not the achieved 2.3
     self.assertAlmostEqual(result.a_target, max((v_ok - 15.0) / 1.0, A_CURVE_MIN), places=5)
+    helped = settle(ModelCurveSpeedLimiter(make_cp()), straight, 40, v_ego=15.0, a_ego=-1.0, lateral_active=True, accel_coast=-0.3,
+                    roll=0.05, lateral_state=losing)                        # a bank in the turn's favour (the same sign as its lateral) ...
+    self.assertGreater(helped.a_target, result.a_target)                     # ... asks for less than the flat ...
+    adverse = settle(ModelCurveSpeedLimiter(make_cp()), straight, 40, v_ego=15.0, a_ego=-1.0, lateral_active=True, accel_coast=-0.3,
+                     roll=-0.05, lateral_state=losing)                      # ... and a crown against it never for less
+    self.assertLessEqual(adverse.a_target, result.a_target + 1e-9)
     overshoot = tracking(torque=1.0, error=-0.6, lat=2.3, pinned=True)     # actual above desired: an exit, not understeer
     fresh = ModelCurveSpeedLimiter(make_cp())
     self.assertNotEqual(settle(fresh, straight, 40, v_ego=15.0, lateral_active=True, lateral_state=overshoot).regime, REGIME_BRAKE)
@@ -310,6 +316,14 @@ class TestRollHorizon(unittest.TestCase):
     b = settle(level, model, 3, v_ego=20.0, lateral_active=True, roll=0.0, lateral_state=tracking())
     self.assertAlmostEqual(a.v_limit, b.v_limit, places=6)
 
+  def test_the_anticipation_charges_the_crown_for_a_bend_within_the_horizon(self):
+    model = curve_ahead(20.0, 10.0, 20.0, 0.01)                              # a bend 10 m out: inside 2 s of travel
+    crowned = ModelCurveSpeedLimiter(make_cp())
+    level = ModelCurveSpeedLimiter(make_cp())
+    a = settle(crowned, model, 3, v_ego=20.0, lateral_active=True, roll=-0.05, lateral_state=tracking())
+    b = settle(level, model, 3, v_ego=20.0, lateral_active=True, roll=0.0, lateral_state=tracking())
+    self.assertLess(a.v_limit, b.v_limit)
+
 
 class TestAuthorityCalibration(unittest.TestCase):
   def test_town_corners_and_light_corners_teach_nothing(self):
@@ -320,6 +334,9 @@ class TestAuthorityCalibration(unittest.TestCase):
     light = settle(limiter, make_model(20.0), 400, v_ego=20.0, lateral_active=True,
                    lateral_state=tracking(torque=0.9, error=0.1, lat=AUTHORITY_MIN_LATERAL - 0.1))
     self.assertAlmostEqual(light.authority_factor, FACTOR)                    # heavy torque for little lateral: friction, not authority
+    banked = settle(limiter, make_model(20.0), 400, v_ego=20.0, lateral_active=True, roll=0.07,
+                    lateral_state=tracking(torque=0.4, error=0.1, lat=1.0))
+    self.assertAlmostEqual(banked.authority_factor, FACTOR)                   # a bank's 0.7 m/s^2 of the 1.0 was not the steering's
 
   def test_the_bank_is_not_the_steerings_doing(self):
     banked = ModelCurveSpeedLimiter(make_cp())
@@ -466,6 +483,24 @@ class TestHold(unittest.TestCase):
     second = limiter.update(straight, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5)).a_target
     self.assertIsNotNone(first)
     self.assertAlmostEqual(second - first, J_UP * DT_MDL, places=6)
+
+  def test_a_bend_that_pinches_again_during_the_release_pulls_from_the_car(self):
+    limiter, bend, _ = self._lifted()
+    settle(limiter, bend, round(BEND_OPEN_S / DT_MDL) + 1, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
+    straight = make_model(15.0)
+    settle(limiter, straight, 10, v_ego=15.0, a_ego=0.3, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))   # 0.5 s of ramp-out
+    tight = make_model(15.0, np.full(N, 0.03))                                # a bend the limit puts well below 15 m/s
+    first = settle(limiter, tight, 2, v_ego=15.0, a_ego=0.3, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))   # the 3-sample median needs two
+    self.assertLessEqual(first.a_target, 0.3 + J_DOWN * DT_MDL + 1e-9)       # anchored on the car, not on the ramp
+    later = settle(limiter, tight, round(0.7 / DT_MDL), v_ego=15.0, a_ego=-0.5, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
+    self.assertLessEqual(later.a_target, -1.0)                                # and braking within the second
+
+  def test_the_drivers_wheel_ends_the_release_ramp_at_once(self):
+    limiter, bend, _ = self._lifted()
+    settle(limiter, bend, round(BEND_OPEN_S / DT_MDL) + 1, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
+    straight = make_model(15.0)
+    self.assertIsNotNone(limiter.update(straight, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5)).a_target)
+    self.assertIsNone(limiter.update(straight, v_ego=15.0, lateral_active=True, steering_pressed=True, lateral_state=tracking(torque=0.3, lat=0.5)).a_target)
 
   def test_the_hold_constants_are_ordered(self):
     self.assertGreater(BEND_OPEN_A_LAT, 0.0)
