@@ -33,12 +33,26 @@ def test_the_landing_never_steps():
 
 
 
-def test_the_hold_releases_after_the_debounce_and_arms_fresh():
+def test_a_launch_releases_the_hold_on_its_first_frame():
+  controller = SmoothStopController()
+  controller.arm_hold()
+  assert controller.hold_release(False, 0.1)                                # the stop bit drops with the plan asking to move
+
+
+def test_a_stop_bit_flicker_with_the_plan_still_braking_does_not_release():
+  controller = SmoothStopController()
+  controller.arm_hold()
+  for _ in range(5):                                                       # a planner frame of dropped bit, plan at the kiss
+    assert not controller.hold_release(False, -0.15)
+  assert not controller.hold_release(True, -0.15)
+
+
+def test_a_plan_sitting_at_zero_releases_after_the_backstop_and_arms_fresh():
   controller = SmoothStopController()
   controller.arm_hold()
   for _ in range(HOLD_RELEASE_FRAMES - 1):
-    assert not controller.hold_release(False)
-  assert controller.hold_release(False)
-  assert not controller.hold_release(True)
+    assert not controller.hold_release(False, 0.0)
+  assert controller.hold_release(False, 0.0)
+  assert not controller.hold_release(True, 0.0)
   controller.arm_hold()
-  assert not controller.hold_release(False)
+  assert not controller.hold_release(False, 0.0)
