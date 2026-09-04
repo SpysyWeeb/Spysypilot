@@ -91,6 +91,15 @@ class TestLatchAndLaunch:
     assert max(outputs) - min(outputs) < 0.05
     assert law.landing
 
+  def test_a_launch_frame_never_starts_a_landing(self):
+    law = StopLanding()
+    for _ in range(frames(1.0)):
+      out = law.update(-0.3, 0.05, NO_LEAD, True, launch=True)
+      assert not law.landing
+      assert out == -0.3                                                    # the plan passes through untouched, every frame
+    law.update(-0.3, 0.05, NO_LEAD, True, launch=False)
+    assert law.landing                                                      # the next stop intent without a launch latches as before
+
   def test_a_climbing_plan_ends_the_landing_after_launch_frames_only_while_rolling(self):
     law = landing(0.6, -0.3)
     for i in range(LAUNCH_FRAMES - 1):

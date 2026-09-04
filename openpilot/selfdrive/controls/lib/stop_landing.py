@@ -118,8 +118,10 @@ class StopLanding:
       return a_target
     v_ego = max(v_ego, 0.0)
     if not self.landing:
-      # a landing starts on intent with the plan braking more than the kiss: a hover frame right after a launch is not a stop
-      if not (stop_intent and a_target < -KISS_DECEL):
+      # a landing starts on intent with the plan braking more than the kiss: a hover frame right after a launch is not a stop,
+      # and a launch frame never starts one (route 0x4b t=299: the entry re-latched on every frame the pre-release ended it,
+      # and the alternating stop bit toggled StopReq)
+      if launch or not (stop_intent and a_target < -KISS_DECEL):
         return a_target
       self.landing = True
       self._positive_frames = 0
