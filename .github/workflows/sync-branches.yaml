@@ -18,7 +18,6 @@ jobs:
           - swapped-cruise-speed
           - nudgless-lane-changes
           - hot-swap-experimental
-          - force-stops
           - error-log-viewer
           - detailed-stats-sidebar
           - better-green-lights
@@ -28,10 +27,13 @@ jobs:
           - auto-update
           - custom-main-menu
           - side-buttons
-          - BLoT
-          - driving-event-platform
-          - BLaTv2
           - BLaTv3
+          - BLoTv3
+          - curve-speed-limit
+          - fan-control
+          - params-clear-pandad-keys-at-offroad
+          - spinning-steering-wheel
+          - torque-bar
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
