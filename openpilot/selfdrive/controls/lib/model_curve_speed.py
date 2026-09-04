@@ -8,9 +8,9 @@ Two layers decide how the car should accelerate through the curves the model pat
 * reaction -- the measured steering state (torque, tracking error) says what the car is doing right now: heavy but
   tracking, take the foot off (coast); pinned and understeering, brake to the speed that restores margin.
 
-The steering authority the anticipation counts on is calibrated online from what the steering actually achieves per
-unit of torque (the feedforward model under-reads it by up to a third on banked highway sweepers, route 22), bounded
-around the torque tuning's own factor.
+The steering authority the anticipation counts on is calibrated online from the steering's own share of the lateral
+acceleration per unit of torque (the ground-plane value the rack reports, less the bank the limit adds back), measured
+only in real corners at speed and bounded around the torque tuning's own factor.
 
 The result is one plan candidate. The planner's arbitration can only lower the chosen acceleration with it, never raise
 it, and the candidate is never positive while the steering is heavy. Nothing here touches the cruise target, the stop
@@ -213,11 +213,10 @@ class ModelCurveSpeedLimiter:
     factor, offset, friction = params
     if self.authority is None:
       self.authority = FirstOrderFilter(factor, AUTHORITY_RC, self.dt)
+    share = abs(state.actual_lateral_accel - (roll * ACCELERATION_DUE_TO_GRAVITY + offset))
     if (lateral_active and state.active and v_ego >= AUTHORITY_MIN_SPEED and state.torque >= AUTHORITY_MIN_TORQUE
-        and abs(state.actual_lateral_accel) >= AUTHORITY_MIN_LATERAL and abs(state.error) <= AUTHORITY_MAX_ERROR
-        and state.torque > friction + 0.05):
-      bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
-      measured = abs(state.actual_lateral_accel - bias) / (state.torque - friction)
+        and share >= AUTHORITY_MIN_LATERAL and abs(state.error) <= AUTHORITY_MAX_ERROR and state.torque > friction + 0.05):
+      measured = share / (state.torque - friction)
       self.authority.update(float(np.clip(measured, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)))
     return (float(np.clip(self.authority.x, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)), offset, friction)
 
@@ -296,7 +295,8 @@ class ModelCurveSpeedLimiter:
       curvature_now = abs(lateral) / max(v_ego, V_REACT_MIN) ** 2
       if params is not None:
         factor, offset, friction = params
-        a_lat_ok = max((TORQUE_BUDGET - friction) * factor + abs(roll) * ACCELERATION_DUE_TO_GRAVITY + offset, 0.5)
+        turn = math.copysign(1.0, state.desired_lateral_accel) if state.desired_lateral_accel != 0.0 else 1.0
+        a_lat_ok = max((TORQUE_BUDGET - friction) * factor + turn * (roll * ACCELERATION_DUE_TO_GRAVITY + offset), 0.5)
       else:
         a_lat_ok = A_LAT_COMFORT
       v_ok = math.sqrt(a_lat_ok / max(curvature_now, MIN_CURVATURE))
@@ -362,7 +362,7 @@ class ModelCurveSpeedLimiter:
     if not math.isfinite(raw) or raw >= A_CURVE_FREE:
       if self.regime == REGIME_ANTICIPATE:
         self.regime = REGIME_FREE
-      if self._output < A_CURVE_FREE:
+      if self._output < A_CURVE_FREE and steering:
         # nothing binds any more: the candidate ramps out at J_UP instead of vanishing, so a hold's end is a ramp
         # into the next candidate, not a step (route 0x4d t=2790: 0.00 -> +0.48 in one frame)
         self._output = min(self._output + J_UP * self.dt, A_CURVE_FREE)
@@ -373,7 +373,9 @@ class ModelCurveSpeedLimiter:
       self._output = A_CURVE_FREE
       self.active = False
       return CurveResult(None, self.regime, self.v_limit, self.distance, factor, self._holding)
-    anchor = min(self._output, max(a_ego, raw) + J_DOWN * self.dt) if self._output >= A_CURVE_FREE else self._output
+    # the anchor is the car whenever the last output sat above both the car and the demand (a ramp-out, a value that
+    # was not binding): a bend that pinches again right after a release must pull from where the car is, not from the ramp
+    anchor = min(self._output, max(a_ego, raw) + J_DOWN * self.dt)
     self._output = float(np.clip(raw, anchor - J_DOWN * self.dt, anchor + J_UP * self.dt))
     self.active = True
     if self.regime == REGIME_FREE:
