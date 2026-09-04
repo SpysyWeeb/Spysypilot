@@ -475,6 +475,51 @@ red-team pass.
   (~4.7° road wheel) opendbc drops `CF_Lkas_ActToi` for 2 frames, repeatedly.* → Named in R9;
   a sustained high-angle hold is a budgeted state; empirically resolve whether the cycle
   round-trips into `steerFaultTemporary`. → Bench hold ≥85° for 3 s logging LKAS/MDPS bits.
+- **FM3.14 — Standing torque shortfall with no third (integral) term.** A held or slow-following
+  steering angle where feedforward and proportional position/rate feedback together under-supply the
+  real static hold torque — a decelerating turn-lane hold, feedforward's v²-scaled model falling faster
+  than the true need, the wheel creeping outward while the jerk-limited plan keeps the logged position
+  error small. *All three of feedforward / position feedback / rate feedback are proportional; a
+  systematic bias under a P-only loop leaves a permanent steady-state error the loop cannot integrate
+  away.* → `hold_topup_torque`: a bounded (`MAX_HOLD_TOPUP_TORQUE` 0.20), leaky (3.0 s passive, 0.30 s
+  under a press and through a 0.30 s release cooldown), angle-space integrator entering as its own third
+  addend before the platform clip and the direction guard. Growth only while the wheel is meant to be
+  steady — `rate_gain_scale · plan_rate_gate · measured_rate_gate · approach_gate` (not the turn-in
+  fraction: a wheel standing short of a static plan is the standing shortfall itself, and the turn-in fraction
+  reads it as a turn-in; motion is what separates the two) — and only while nothing already binds in the error's own direction (press, release
+  cooldown, guard mix > 0, platform clip, feedback cap) and only while the plan and the served target lie
+  on the same side of the wheel (near center at speed the plan sits half a degree one way and the target
+  the other; a term chasing the plan there pushes against the target and doubles the guard's engagement
+  at a mix too small to correct it); the approach gate fades growth out as the wheel is already closing
+  on the plan (0.25–1 deg/s) so the last additions finish their work before more is added; a push the
+  target does not want, or a residual the current error already opposes, drains at the fast rate.
+  Per-frame step from the term ≤ 0.0117 (any gate history), inside R7; snaps to exact 0.0 so
+  bit-identity with no top-up is a reachable state; reset with the rest of the controller, never
+  persisted, structurally exempt from R10's persisted-surface machinery. → Route `0000003e` 1552–1558
+  open-loop replay: the term climbs to −0.08 through the hold and the request sits at −0.42…−0.48 where
+  it had decayed to −0.36 (about 40 % of the measured gap inside the one second the hold lasted; a longer
+  hold reaches the cap); the closed-loop plant is stiction-bound in this regime and does not resolve the
+  creep either way (a documented plant limit, not evidence). Unit plant with a hold need 30 % above the
+  feedforward: steady-state gap cut by more than half, no overshoot. Regression on 2c/2d/34–37: bit-identical
+  on every frame where the term is exactly zero, per-frame step 0.0067, error-gated stall share 6–12 % →
+  3–6 %, unpressed hold collapses 9 → 5 on 2c; the direction guard engages 1.5–2× more often, almost all of
+  it lingering sub-percent mixes near center that leave 98 % of the term in the output (open-loop replay
+  winds the term up on errors the real wheel would close, so field magnitudes will be smaller).
+  *Phase 3 step 6 (2026-09-02): field event verified in `route-audit/phase3/event_2026-09-02_3e/`
+  (route `0000003e` seg 25–26, commit `9b9ec5cc3a`): the EPS delivered exactly the request
+  (steeringTorqueEps = 14.0 × request, corr 0.95) while the request fell −0.57 → −0.36 at a constant
+  ~35° decelerating 9.4 → 7.9 m/s; the wheel crept out at ~2 deg/s within 1° of the plan, then released
+  as the driver's hands arrived. The shadow observer recorded nothing (its steady gate rejects a slipping
+  wheel), so the learned hold surface (step 3-A) could not have helped either: the term is what makes such
+  holds steady enough to record, and the torque it supplies is captured as the measured hold torque.
+  Considered and rejected: routing the correction through the feedback cap (shares a turn-in-tuned cap
+  with a fast P/D pair), through the feedforward (blurs predict and make-up and re-enters the v² pipeline),
+  and integrating on lateral-accel error (keeps the v² fade). Not taken from the design panel's
+  refutation round: re-pointing the driver-assist envelope at the pre-top-up sum and an R7 clamp on the
+  release frame — both change behavior with the term at zero, and the term is continuous through a
+  press, so the release jump they target is the assist cap's own, pre-existing and out of scope.
+  Documented exemption: every driver gate is keyed on `steeringPressed` (150 raw counts on the Palisade),
+  so a sustained light hand below the threshold is invisible to this term as to every other.*
 
 ### L4 Driver interaction
 

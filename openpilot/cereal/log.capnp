@@ -1181,6 +1181,8 @@ struct ControlsState @0x97ff69c53601abf1 {
     envelopeAccelerationDegS2 @38 :Float32;  # and the opened acceleration limit, deg/s^2
     envelopeJerkDegS3 @39 :Float32;  # and the opened jerk limit, deg/s^3
     envelopePreviewTime @40 :Float32;  # seconds the confidence-free envelope scheduler's own admitted horizon reaches
+    holdTopupTorque @41 :Float32;  # FM3.14 hold top-up applied this frame, already summed into output; 0 when stock steers
+    holdTopupGrowing @42 :Bool;  # this frame's anti-windup gates admitted growth (the leak runs every active frame regardless)
   }
 
   struct LateralAngleState {

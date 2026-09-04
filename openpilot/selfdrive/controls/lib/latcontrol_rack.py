@@ -128,6 +128,8 @@ class LatControlRack(LatControl):
     rack_log.envelopeAccelerationDegS2 = float(output.envelope_open_acceleration_deg_s2)
     rack_log.envelopeJerkDegS3 = float(output.envelope_open_jerk_deg_s3)
     rack_log.envelopePreviewTime = float(output.envelope_preview_time_s)
+    rack_log.holdTopupTorque = float(output.hold_topup_torque)
+    rack_log.holdTopupGrowing = bool(output.hold_topup_growing)
     rack_log.saturated = bool(self._check_saturation(output.saturated or self.steer_max - abs(output.torque) < 1e-3, CS,
                                                      steer_limited_by_safety, curvature_limited))
     self.torque.sat_time = self.sat_time
