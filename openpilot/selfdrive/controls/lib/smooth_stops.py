@@ -18,12 +18,14 @@ from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_CTRL
 
 # Handoff to the hold clamp.
-STANDSTILL_SPEED = 0.05        # m/s, hand the stop to the car's own hold only here: after StopReq the ESP stops following the
-                               # request and takes ~0.8 s to clamp, so a hand-off while still rolling is a roll (route 0x3e: 4 cm
-                               # on the flat, 16-21 cm on a 7 % downhill from a 0.10 m/s hand-off). The Palisade's standstill flag
-                               # asserts at ~0.6 m/s and is not believed
-HOLD_RELEASE_FRAMES = 2        # frames of should_stop=False before the hold releases. The planner's hold already corroborates
-                               # a launch; ~22 min of standstill on the audit routes showed no stop-bit flicker at all
+STANDSTILL_SPEED = 0.10        # m/s, hand the stop to the car's own hold here. Below ~0.06 m/s the ESP fades its braking
+                               # whatever the request says, and after StopReq it coasts ~1 s before its own clamp bites: a
+                               # hand-off at 0.05 (route 0x4b t=402) was 1.5 s of fade plus 1.4 s of coast, felt as a stop
+                               # that keeps creeping; at 0.10 (routes 0x33-0x3e, 25+ stops) the clamp lands after 4 cm and
+                               # 0.8 s. The Palisade's standstill flag asserts at ~0.6 m/s and is not believed
+HOLD_RELEASE_FRAMES = 10       # control frames (0.1 s, two planner frames) of should_stop=False before the hold releases:
+                               # a single-frame stop-bit dropout must not lift StopReq (route 0x4b t=299: four toggles in
+                               # 0.4 s read as the brakes slipping); a real launch loses 80 ms
 
 # The landing.
 STOP_KISS_DECEL = 0.15         # m/s^2, the least braking kept on while the stop completes; the same number as the planner
