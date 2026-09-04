@@ -13,11 +13,15 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   COAST_ENTER_S,
   COAST_EXIT_S,
   J_DOWN,
-  J_UP,
   REGIME_ANTICIPATE,
   REGIME_BRAKE,
   REGIME_COAST,
   REGIME_FREE,
+  ROLL_HORIZON_S,
+  AUTHORITY_MIN_LATERAL,
+  AUTHORITY_MIN_SPEED,
+  J_UP,
+  A_CURVE_FREE,
   BEND_OPEN_A_LAT,
   BEND_OPEN_S,
   HOLD_MAX_S,
@@ -190,7 +194,9 @@ class TestReaction(unittest.TestCase):
     self.assertNotEqual(result.regime, REGIME_COAST)                        # the lift has ended ...
     self.assertTrue(result.holding)                                           # ... into the hold: the road still reads 1.0 m/s^2
     result = settle(limiter, straight, round(BEND_OPEN_S / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=0.5))
-    self.assertEqual(result.regime, REGIME_FREE)                              # the road open for the dwell: released
+    self.assertEqual(result.regime, REGIME_FREE)                              # the road open for the dwell: released ...
+    self.assertGreater(result.a_target, 0.0)                                  # ... into a ramp, not a step
+    result = settle(limiter, straight, round(A_CURVE_FREE / J_UP / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=0.5))
     self.assertIsNone(result.a_target)
 
   def test_pinned_and_losing_brakes_toward_the_speed_that_restores_margin_after_a_debounce(self):
@@ -286,7 +292,45 @@ if __name__ == "__main__":
   unittest.main()
 
 
+class TestRollHorizon(unittest.TestCase):
+  def test_a_far_node_gets_no_bank_a_near_one_the_live_roll(self):
+    kappa = np.full(N, 0.01)
+    x = 20.0 * T                                                              # nodes from 0 to 200 m at 20 m/s
+    near = x <= 20.0 * ROLL_HORIZON_S
+    adverse = curve_speed_limits(kappa, TORQUE, np.where(near, -0.05, 0.0))   # what _anticipate builds: live roll near, zero far
+    flat = curve_speed_limits(kappa, TORQUE, 0.0)
+    np.testing.assert_allclose(adverse[~near], flat[~near])                   # beyond the horizon the crown is not charged
+    self.assertLess(adverse[near][0], flat[near][0])                          # within it, a crown against the turn still lowers the limit
+
+  def test_the_anticipation_ignores_the_crown_for_a_curve_far_ahead(self):
+    model = curve_ahead(20.0, 120.0, 40.0, 0.006)                            # a bend 120 m out at 20 m/s (6 s of travel)
+    crowned = ModelCurveSpeedLimiter(make_cp())
+    level = ModelCurveSpeedLimiter(make_cp())
+    a = settle(crowned, model, 3, v_ego=20.0, lateral_active=True, roll=0.05, lateral_state=tracking())
+    b = settle(level, model, 3, v_ego=20.0, lateral_active=True, roll=0.0, lateral_state=tracking())
+    self.assertAlmostEqual(a.v_limit, b.v_limit, places=6)
+
+
 class TestAuthorityCalibration(unittest.TestCase):
+  def test_town_corners_and_light_corners_teach_nothing(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(8.0)
+    slow = settle(limiter, straight, 400, v_ego=AUTHORITY_MIN_SPEED - 1.0, lateral_active=True, lateral_state=tracking(torque=0.9, error=0.1, lat=1.5))
+    self.assertAlmostEqual(slow.authority_factor, FACTOR)                     # a tight town corner: the assist is not the highway's
+    light = settle(limiter, make_model(20.0), 400, v_ego=20.0, lateral_active=True,
+                   lateral_state=tracking(torque=0.9, error=0.1, lat=AUTHORITY_MIN_LATERAL - 0.1))
+    self.assertAlmostEqual(light.authority_factor, FACTOR)                    # heavy torque for little lateral: friction, not authority
+
+  def test_the_bank_is_not_the_steerings_doing(self):
+    banked = ModelCurveSpeedLimiter(make_cp())
+    flat = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(20.0)
+    state = tracking(torque=0.9, error=0.1, lat=-2.9)                        # a left sweeper: 2.9 of ground-plane lateral at 0.9 torque
+    b = settle(banked, straight, 400, v_ego=20.0, lateral_active=True, roll=-0.05, lateral_state=state)   # banked 0.05 rad in its favour
+    f = settle(flat, straight, 400, v_ego=20.0, lateral_active=True, roll=0.0, lateral_state=state)
+    self.assertLess(b.authority_factor, f.authority_factor)                   # the bank's 0.49 m/s^2 is not credited to the steering
+    self.assertAlmostEqual(b.authority_factor, (2.9 - 0.05 * 9.81) / (0.9 - FRICTION), places=1)
+
   def test_the_measured_ratio_moves_the_authority_inside_its_bounds(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
     straight = make_model(20.0)
@@ -369,7 +413,9 @@ class TestHold(unittest.TestCase):
     self.assertLessEqual(result.a_target, 1e-9)
     result = settle(limiter, straight, round(BEND_OPEN_S / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.3))
     self.assertFalse(result.holding)                                          # the road reads open: released within the dwell
-    self.assertIsNone(result.a_target)                                        # and a straight road has nothing to say
+    self.assertGreater(result.a_target, 0.0)                                  # the candidate ramps out from the hold's zero ...
+    result = settle(limiter, straight, round(A_CURVE_FREE / J_UP / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.3))
+    self.assertIsNone(result.a_target)                                        # ... and a straight road then has nothing to say
 
   def test_the_drivers_gas_is_never_held(self):
     limiter, bend, _ = self._lifted()
@@ -411,6 +457,15 @@ class TestHold(unittest.TestCase):
     result = settle(limiter, bend, round(COAST_EXIT_S / DT_MDL) + 40, v_ego=15.0, lateral_active=True, lateral_state=self.held())
     self.assertFalse(result.holding)                                          # ... and the backstop still ends the hold on time
     self.assertGreater(result.a_target, 0.0)
+
+  def test_the_release_is_a_ramp_at_the_up_jerk(self):
+    limiter, bend, _ = self._lifted()
+    settle(limiter, bend, round(BEND_OPEN_S / DT_MDL) + 1, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
+    straight = make_model(15.0)
+    first = limiter.update(straight, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5)).a_target
+    second = limiter.update(straight, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5)).a_target
+    self.assertIsNotNone(first)
+    self.assertAlmostEqual(second - first, J_UP * DT_MDL, places=6)
 
   def test_the_hold_constants_are_ordered(self):
     self.assertGreater(BEND_OPEN_A_LAT, 0.0)

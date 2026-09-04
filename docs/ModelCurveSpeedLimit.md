@@ -117,3 +117,28 @@ Field questions for the next drive: does the held part of a bend feel like a ste
 where a zero candidate means no acceleration until the bend reads open. Not yet addressed: the coast threshold (0.85) still
 sits below the planning budget (0.90), so the settle point is the same as today's; and the calibration's steering-derived
 lateral acceleration.
+
+## 2026-09-04 — the same bend twice: the roll horizon, a cleaner calibration, a ramped release
+
+Routes 0x4c t=773–802 and 0x4d t=2756–2796 are one bend (520 m, R≈250 m with a 200 m pinch, banked 3–3.5° in its
+favour, an adverse crown on the approach), both at an 80 mph set speed, on the same policy. The first pass was braked at
+−1.84 m/s² for 2.5 s (57 → 48 mph) for a node 143 m ahead read at 19.7 m/s, and cruise then pulled the car back to 55 mph
+at the tightest point; the second pass was never braked by the anticipation (the node read 27–30 m/s), the reaction layer
+found the rack's limit in three lifts and the hold kept 24.0 ± 0.14 m/s for 9 s. Two inputs made the difference, each
+measured by running the limit function on the recorded path:
+
+* **the live roll was applied to every path node** — the approach's crown (+0.044 rad, real) charged against a node banked
+  the other way, worth 2–5 m/s of limit there. Nodes farther than `ROLL_HORIZON_S` (2 s of travel) now get no roll either
+  way; the near nodes and the brake regime keep the live value. Replay: 0x4c's candidate minimum −1.79 → −1.34 and the
+  brake starts 10 m later; 0x4d unchanged.
+* **the online authority factor drifted with the last road driven** — 2.33 carried into 0x4c from town corners 300 s
+  earlier, 4.13 into 0x4d from banked sweepers; swap them and the outcomes swap. The factor learned from the rack's
+  ground-plane lateral, so a bank was credited to the steering and then added again by the limit's bias. The measurement
+  is now the steering's own share (`actual − (roll·g + offset)`), taken only in real corners
+  (`AUTHORITY_MIN_LATERAL` 1.0 m/s²) at speed (`AUTHORITY_MIN_SPEED` 10 m/s, where the assist resembles the highway's).
+
+And the hold's release was a one-frame step from 0.00 to whatever the next candidate asked (+0.48 on 0x4d): the candidate
+now ramps out at `J_UP` when nothing binds any more, so the hand-off is a ramp of a few tenths of a second.
+
+Not changed: the hold is still speed-blind (it keeps the speed the lift left), and a bend that pinches repeatedly still
+earns a lift per pinch. Awaiting the owner's drive.

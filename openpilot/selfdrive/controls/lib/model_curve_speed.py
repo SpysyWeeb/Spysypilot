@@ -37,8 +37,14 @@ MIN_MODEL_SPEED = 1.0         # m/s, avoids unstable curvature near predicted st
 # Online authority calibration: lateral acceleration achieved per unit of torque above friction.
 AUTHORITY_RC = 5.0            # s, filter on the measured ratio
 AUTHORITY_MIN_TORQUE = 0.40   # measure only when the steering is working ...
-AUTHORITY_MAX_ERROR = 0.30    # m/s^2, ... and tracking
+AUTHORITY_MAX_ERROR = 0.30    # m/s^2, ... and tracking ...
+AUTHORITY_MIN_LATERAL = 1.0   # m/s^2, ... in a real corner (the friction term dominates the ratio below this) ...
+AUTHORITY_MIN_SPEED = 10.0    # m/s, ... at a speed where the assist resembles the highway's: town corners at 5-8 m/s
+                              # dragged the factor to 0.9x the tuning and a bend 300 s later was braked for (route 0x4c)
 AUTHORITY_BOUNDS = (0.8, 1.8) # times the torque tuning's own factor
+ROLL_HORIZON_S = 2.0          # s of travel over which the car's live roll still describes the road: farther path nodes get
+                              # no bank either way. Route 0x4c: the approach's crown was charged to a node 143 m ahead that
+                              # is banked the other way, and the limit there read 19.7 m/s instead of 25
 
 # Anticipation.
 T_APPROACH = 1.5              # s, proportional approach to a limit that is near or already reached
@@ -144,7 +150,8 @@ def _torque_values(params):
 def curve_speed_limits(signed_curvature, torque_params, roll, lateral_active=True):
   """Per-node speed limits: the lower of the steering authority at the torque budget and the comfort lateral acceleration.
 
-  torque_params is (lateral acceleration per unit torque, offset, friction); the authority applies only while openpilot steers."""
+  torque_params is (lateral acceleration per unit torque, offset, friction); the authority applies only while openpilot steers.
+  roll is a scalar or one value per node (the live roll near the car, zero beyond ROLL_HORIZON_S)."""
   curvature = np.abs(signed_curvature)
   comfort = np.where(curvature >= MIN_CURVATURE, np.sqrt(A_LAT_COMFORT / np.maximum(curvature, MIN_CURVATURE)), np.inf)
   if torque_params is None or not lateral_active:
@@ -196,17 +203,21 @@ class ModelCurveSpeedLimiter:
     self._hold_s = 0.0
     self._open_s = 0.0
 
-  def _calibrated(self, params, state, v_ego, lateral_active):
+  def _calibrated(self, params, state, v_ego, lateral_active, roll):
     # the torque tuning's factor is the prior; the measured ratio moves it inside AUTHORITY_BOUNDS while the steering
-    # is working and tracking
+    # is working and tracking through a real corner at speed. The measurement is the steering's own share of the
+    # lateral acceleration: the rack reports the ground-plane value, and the bank's share is the same bias the limit
+    # adds back (route 0x4d: sweepers banked 3-4 deg railed the factor to 1.6x the tuning)
     if params is None:
       return None
     factor, offset, friction = params
     if self.authority is None:
       self.authority = FirstOrderFilter(factor, AUTHORITY_RC, self.dt)
-    if (lateral_active and state.active and v_ego >= V_REACT_MIN and state.torque >= AUTHORITY_MIN_TORQUE
-        and abs(state.error) <= AUTHORITY_MAX_ERROR and state.torque > friction + 0.05):
-      measured = abs(state.actual_lateral_accel) / (state.torque - friction)
+    if (lateral_active and state.active and v_ego >= AUTHORITY_MIN_SPEED and state.torque >= AUTHORITY_MIN_TORQUE
+        and abs(state.actual_lateral_accel) >= AUTHORITY_MIN_LATERAL and abs(state.error) <= AUTHORITY_MAX_ERROR
+        and state.torque > friction + 0.05):
+      bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
+      measured = abs(state.actual_lateral_accel - bias) / (state.torque - friction)
       self.authority.update(float(np.clip(measured, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)))
     return (float(np.clip(self.authority.x, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)), offset, friction)
 
@@ -226,7 +237,8 @@ class ModelCurveSpeedLimiter:
 
     path_distance = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(position_x), np.diff(position_y)))))
     signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
-    limits = curve_speed_limits(signed_curvature, params, roll, lateral_active)
+    node_roll = np.where(path_distance <= v_ego * ROLL_HORIZON_S, roll, 0.0)
+    limits = curve_speed_limits(signed_curvature, params, node_roll, lateral_active)
 
     # per node, the less demanding of the kinematic acceleration that meets its limit at its distance and a proportional
     # approach: far limits are kinematic, near or reached ones proportional, and the two meet continuously. Small and
@@ -309,7 +321,7 @@ class ModelCurveSpeedLimiter:
       self._lateral_history = self._lateral_history[1:] + [max(abs(state.desired_lateral_accel), abs(state.actual_lateral_accel))]
     steering = lateral_active and state.active and not steering_pressed
     live = _torque_values(torque_params) if torque_params is not None else None
-    params = self._calibrated(live or self.torque_params, state, v_ego, steering)
+    params = self._calibrated(live or self.torque_params, state, v_ego, steering, roll)
 
     self._gas_grace_s = CURVE_GAS_GRACE_S if gas_pressed else max(self._gas_grace_s - self.dt, 0.0)
     anticipation = self._anticipate(model, v_ego, roll, params, steering)
@@ -348,11 +360,18 @@ class ModelCurveSpeedLimiter:
     raw = max(min(anticipation, reaction), A_CURVE_MIN)
     factor = params[0] if params is not None else 0.0
     if not math.isfinite(raw) or raw >= A_CURVE_FREE:
+      if self.regime == REGIME_ANTICIPATE:
+        self.regime = REGIME_FREE
+      if self._output < A_CURVE_FREE:
+        # nothing binds any more: the candidate ramps out at J_UP instead of vanishing, so a hold's end is a ramp
+        # into the next candidate, not a step (route 0x4d t=2790: 0.00 -> +0.48 in one frame)
+        self._output = min(self._output + J_UP * self.dt, A_CURVE_FREE)
+        if self._output < A_CURVE_FREE:
+          self.active = True
+          return CurveResult(self._output, self.regime, self.v_limit, self.distance, factor, self._holding)
       # nothing binds: the limiter follows the car so a curve that appears starts pulling from where the car is
       self._output = A_CURVE_FREE
       self.active = False
-      if self.regime == REGIME_ANTICIPATE:
-        self.regime = REGIME_FREE
       return CurveResult(None, self.regime, self.v_limit, self.distance, factor, self._holding)
     anchor = min(self._output, max(a_ego, raw) + J_DOWN * self.dt) if self._output >= A_CURVE_FREE else self._output
     self._output = float(np.clip(raw, anchor - J_DOWN * self.dt, anchor + J_UP * self.dt))
