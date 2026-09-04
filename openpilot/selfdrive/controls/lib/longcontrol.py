@@ -59,7 +59,7 @@ class LongControl:
     if active and self.long_control_state == LongCtrlState.pid:
       stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo)
     elif active and self.long_control_state == LongCtrlState.stopping:
-      stop_now = not self.smooth_stop.hold_release(should_stop)
+      stop_now = not self.smooth_stop.hold_release(should_stop, a_target)
     else:
       stop_now = should_stop
 

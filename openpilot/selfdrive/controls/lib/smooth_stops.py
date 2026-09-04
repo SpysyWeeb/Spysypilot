@@ -23,9 +23,11 @@ STANDSTILL_SPEED = 0.10        # m/s, hand the stop to the car's own hold here. 
                                # hand-off at 0.05 (route 0x4b t=402) was 1.5 s of fade plus 1.4 s of coast, felt as a stop
                                # that keeps creeping; at 0.10 (routes 0x33-0x3e, 25+ stops) the clamp lands after 4 cm and
                                # 0.8 s. The Palisade's standstill flag asserts at ~0.6 m/s and is not believed
-HOLD_RELEASE_FRAMES = 10       # control frames (0.1 s, two planner frames) of should_stop=False before the hold releases:
-                               # a single-frame stop-bit dropout must not lift StopReq (route 0x4b t=299: four toggles in
-                               # 0.4 s read as the brakes slipping); a real launch loses 80 ms
+HOLD_RELEASE_FRAMES = 50       # control frames (0.5 s) of should_stop=False that release the hold on their own. The release
+                               # itself is free of delay: the frame the stop bit drops with the plan asking to move lifts
+                               # StopReq at once. The count is the backstop for a plan that sits at zero, and it is what
+                               # keeps a stop-bit flicker with the plan still braking from lifting the hold (route 0x4b
+                               # t=299: four toggles in 0.4 s read as the brakes slipping)
 
 # The landing.
 STOP_KISS_DECEL = 0.15         # m/s^2, the least braking kept on while the stop completes; the same number as the planner
@@ -51,7 +53,12 @@ class SmoothStopController:
     # every entry into the hold gets a fresh release debounce; reset() runs every frame while holding and must not
     self._no_stop_frames = 0
 
-  def hold_release(self, should_stop: bool) -> bool:
+  def hold_release(self, should_stop: bool, a_target: float) -> bool:
+    # a launch is the stop bit dropping with the plan asking to move: released on that frame, no debounce (the owner's
+    # ruling: response time is not for sale). A dropped bit with the plan still braking is a flicker until it lasts
+    if not should_stop and a_target > 0.0:
+      self._no_stop_frames = 0
+      return True
     self._no_stop_frames = 0 if should_stop else self._no_stop_frames + 1
     return self._no_stop_frames >= HOLD_RELEASE_FRAMES
 

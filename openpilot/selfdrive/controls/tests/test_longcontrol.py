@@ -85,13 +85,30 @@ class TestSmoothStopHandoff(OpenpilotTestCase):
       states.append(control.long_control_state)
     assert set(states) == {LongCtrlState.stopping}
 
-  def test_the_hold_releases_after_the_debounce(self):
+  def test_a_launch_releases_the_hold_on_its_first_frame(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.smooth_stop.arm_hold()
     control.update(True, car_state(), 0.2, True, (-3.5, 2.0))
-    for _ in range(HOLD_RELEASE_FRAMES - 1):
-      control.update(True, car_state(), 0.2, False, (-3.5, 2.0))
+    control.update(True, car_state(), 0.2, False, (-3.5, 2.0))            # the stop bit drops with the plan asking to move
+    assert control.long_control_state == LongCtrlState.pid
+
+  def test_a_stop_bit_flicker_with_the_plan_still_braking_keeps_the_hold(self):
+    control = long_control()
+    control.long_control_state = LongCtrlState.stopping
+    control.smooth_stop.arm_hold()
+    for _ in range(5):                                                     # one planner frame of dropped bit at the kiss
+      control.update(True, car_state(), -0.15, False, (-3.5, 2.0))
       assert control.long_control_state == LongCtrlState.stopping
-    control.update(True, car_state(), 0.2, False, (-3.5, 2.0))
+    control.update(True, car_state(), -0.15, True, (-3.5, 2.0))
+    assert control.long_control_state == LongCtrlState.stopping
+
+  def test_a_plan_sitting_at_zero_releases_after_the_backstop(self):
+    control = long_control()
+    control.long_control_state = LongCtrlState.stopping
+    control.smooth_stop.arm_hold()
+    for _ in range(HOLD_RELEASE_FRAMES - 1):
+      control.update(True, car_state(), 0.0, False, (-3.5, 2.0))
+      assert control.long_control_state == LongCtrlState.stopping
+    control.update(True, car_state(), 0.0, False, (-3.5, 2.0))
     assert control.long_control_state == LongCtrlState.pid
