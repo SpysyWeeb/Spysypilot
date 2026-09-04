@@ -350,8 +350,10 @@ class ReferenceFilter:
   A first-order filter removes the frame-to-frame jitter of the model's target: a few degrees of
   wheel at low speed and nothing in lateral acceleration. The served target may trail the raw one
   by at most a lateral acceleration, capped in wheel angle, so a turn-in or an unwind passes with
-  at most that trailing, at the raw target's own rate, and any trailing decays with the time
-  constant once the raw target settles.
+  at most that trailing at once, and any trailing decays with the time constant once the raw target
+  settles. The served rate is always the filtered rate -- the trail bound only clamps position, it
+  never substitutes the raw target's own (unfiltered) rate for the served one, so a fast excursion
+  that reaches the trail bound still hands the tracker a smoothed rate, not a step.
   """
 
   def __init__(self) -> None:
@@ -374,8 +376,13 @@ class ReferenceFilter:
     trail = target.position_deg - position
     self.limited = abs(trail) > trail_limit_deg
     if self.limited:
+      # Bound the position at the trail limit so a real change still passes at once (R5); leave
+      # `rate` as the filtered value computed above instead of snapping it to the raw target's own
+      # rate. Snapping removed rate smoothing exactly during the fast excursions that reach this
+      # branch -- a step straight into the planner's rate-tracking term -- while the alpha blend
+      # above is already bounded between the previous served rate and the raw one, so this still
+      # converges to the raw rate (within one time constant) without the discontinuity.
       position = target.position_deg - math.copysign(trail_limit_deg, trail)
-      rate = target.rate_deg_s
     self.target = RackTarget(position, rate)
     return self.target
 

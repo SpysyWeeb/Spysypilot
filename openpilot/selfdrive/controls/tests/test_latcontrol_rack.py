@@ -229,12 +229,52 @@ class TestLatControlRack(OpenpilotTestCase):
     filter_ = ReferenceFilter()
     assert filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01) == RackTarget(0.0, 0.0)
     served = filter_.update(RackTarget(30.0, 300.0), 3.0, 0.01)
-    # the step passes at once, short of the target by the bound, at the target's own rate
-    assert math.isclose(served.position_deg, 27.0) and served.rate_deg_s == 300.0 and filter_.limited
+    # the position passes at once, short of the target by the bound; the rate stays the filtered
+    # value (F4: the trail-limited branch no longer snaps it to the raw target's own rate) -- here
+    # the first-order blend of 0.0 -> 300.0 at alpha = dt / (rc_s + dt) = 1/11
+    assert math.isclose(served.position_deg, 27.0) and filter_.limited
+    assert math.isclose(served.rate_deg_s, 300.0 / 11.0) and 0.0 < served.rate_deg_s < 300.0
     for _ in range(30):
       served = filter_.update(RackTarget(30.0, 0.0), 3.0, 0.01)
       assert 27.0 - 1e-9 <= served.position_deg <= 30.0
     assert abs(30.0 - served.position_deg) < 0.2 and not filter_.limited
+
+  def test_reference_filter_trail_bound_does_not_snap_the_rate_to_the_raw_target(self):
+    # F4: same raw step from the same filter history, only the trail bound differs (50deg, wide
+    # enough to never bind, vs 3deg, which binds hard on this 30deg/300deg-per-s step). The served
+    # rate must come out identical either way -- position is the only thing the trail bound may
+    # change -- because a real fix bounds the rate by continuing to filter it, it does not special
+    # -case it on whether the position got clamped.
+    unlimited = ReferenceFilter()
+    unlimited.update(RackTarget(0.0, 0.0), 50.0, 0.01)
+    served_unlimited = unlimited.update(RackTarget(30.0, 300.0), 50.0, 0.01)
+    assert not unlimited.limited
+
+    limited = ReferenceFilter()
+    limited.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    served_limited = limited.update(RackTarget(30.0, 300.0), 3.0, 0.01)
+    assert limited.limited
+
+    assert math.isclose(served_unlimited.rate_deg_s, served_limited.rate_deg_s)
+    assert not math.isclose(served_unlimited.position_deg, served_limited.position_deg)
+
+  def test_reference_filter_rate_converges_to_the_raw_rate_while_the_trail_stays_pinned(self):
+    # A sustained fast excursion (300deg/s, as in the mechanism's own turn-in/reversal excursions)
+    # keeps the trail pinned exactly at its bound every frame -- R5's "a real change still passes
+    # at once" -- while the served rate climbs toward the raw rate continuously (first-order, never
+    # exceeding it) instead of jumping straight to it the instant the bound first binds.
+    filter_ = ReferenceFilter()
+    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    raw_position = 0.0
+    previous_rate = 0.0
+    for frame in range(60):
+      raw_position += 300.0 * 0.01
+      served = filter_.update(RackTarget(raw_position, 300.0), 3.0, 0.01)
+      if frame >= 1:
+        assert math.isclose(raw_position - served.position_deg, 3.0)  # trail pinned at the bound
+        assert previous_rate - 1e-9 <= served.rate_deg_s <= 300.0 + 1e-9  # monotonic, never overshoots
+      previous_rate = served.rate_deg_s
+    assert served.rate_deg_s > 295.0  # converged close to the raw rate after ~0.6s of sustained excursion
 
   def test_reference_filter_smooths_small_jitter(self):
     filter_ = ReferenceFilter()
