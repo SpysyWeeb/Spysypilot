@@ -9,9 +9,9 @@ from openpilot.selfdrive.controls.lib.smooth_stops import (HOLD_RELEASE_FRAMES, 
 
 def test_the_hold_only_arms_on_a_stopped_car_and_inside_the_plans_stop_window():
   controller = SmoothStopController()
-  assert not controller.want_hold(True, 0.2)
+  assert not controller.want_hold(True, 0.2)                              # still rolling: the kiss keeps the stop, not the car
   assert controller.want_hold(True, STANDSTILL_SPEED)
-  assert not controller.want_hold(True, 0.1)                              # still rolling: the kiss keeps the stop, not the car
+  assert not controller.want_hold(True, STANDSTILL_SPEED + 0.05)
   assert not controller.want_hold(False, 0.0)
   assert should_stop(STANDSTILL_SPEED, 0.0)                               # the two gates nest: the hold speed sits inside the stop window
 
