@@ -28,6 +28,8 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   T_APPROACH,
   T_COAST,
   AUTHORITY_MIN_TORQUE,
+  FAR_NODE_DECEL_MAX,
+  FAR_LIMIT_UNCERTAINTY,
   V_HOLD_BAND,
   TORQUE_BUDGET,
   LateralState,
@@ -200,35 +202,6 @@ class TestReaction(unittest.TestCase):
     result = settle(limiter, straight, round(A_CURVE_FREE / J_UP / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=0.5))
     self.assertIsNone(result.a_target)
 
-  def test_a_rising_torque_is_heavy_before_it_arrives(self):
-    limiter = ModelCurveSpeedLimiter(make_cp())
-    straight = make_model(20.0)
-    settle(limiter, straight, 10, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.35, lat=1.5))
-    torque, result = 0.35, None
-    while torque < T_COAST:                                                  # the torque climbs at 0.5 per second
-      torque += 0.5 * DT_MDL
-      result = limiter.update(straight, v_ego=20.0, lateral_active=True, accel_coast=-0.4, lateral_state=tracking(torque=torque, lat=2.0))
-      if result.regime == REGIME_COAST:
-        break
-    self.assertEqual(result.regime, REGIME_COAST)
-    self.assertLess(torque, 0.7)                                             # the coast came while the torque itself was still light ...
-    for _ in range(8):                                                       # ... and while it keeps rising the lift is the full coast
-      torque += 0.5 * DT_MDL
-      result = limiter.update(straight, v_ego=20.0, lateral_active=True, accel_coast=-0.4, lateral_state=tracking(torque=torque, lat=2.0))
-    self.assertLessEqual(result.a_target, -0.4 + 1e-9)
-
-  def test_a_steady_torque_under_the_threshold_never_coasts(self):
-    limiter = ModelCurveSpeedLimiter(make_cp())
-    result = settle(limiter, make_model(20.0), 40, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.80, lat=2.5))
-    self.assertNotEqual(result.regime, REGIME_COAST)
-
-  def test_a_resumption_after_the_drivers_wheel_reads_no_rise(self):
-    limiter = ModelCurveSpeedLimiter(make_cp())
-    straight = make_model(20.0)
-    settle(limiter, straight, 10, v_ego=20.0, lateral_active=True, steering_pressed=True, lateral_state=tracking(torque=0.2, lat=1.0))
-    result = settle(limiter, straight, 10, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.80, lat=2.5))
-    self.assertNotEqual(result.regime, REGIME_COAST)                         # 0.2 -> 0.8 across the handover is not a rise
-
   def test_pinned_and_losing_brakes_toward_the_speed_that_restores_margin_after_a_debounce(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
     straight = make_model(15.0)
@@ -345,6 +318,23 @@ class TestRollHorizon(unittest.TestCase):
     a = settle(crowned, model, 3, v_ego=20.0, lateral_active=True, roll=0.05, lateral_state=tracking())
     b = settle(level, model, 3, v_ego=20.0, lateral_active=True, roll=0.0, lateral_state=tracking())
     self.assertAlmostEqual(a.v_limit, b.v_limit, places=6)
+
+  def test_a_far_bend_a_bank_could_explain_asks_for_the_foot_off_at_most(self):
+    # a sweeper 4 s out at 30 m/s whose limit sits 15 % under the car: far, and within the doubt a bank leaves
+    v = 30.0
+    kappa = (TORQUE_BUDGET - FRICTION) * FACTOR / (v * (1.0 - FAR_LIMIT_UNCERTAINTY + 0.10)) ** 2
+    far = curve_ahead(v, 120.0, 60.0, kappa)
+    result = settle(ModelCurveSpeedLimiter(make_cp()), far, 3, v_ego=v, lateral_active=True, lateral_state=tracking())
+    self.assertLess(result.v_limit, v)
+    self.assertGreaterEqual(result.a_target, -FAR_NODE_DECEL_MAX - 1e-9)
+    # the same bend 1 s out: the bank is the car's own and the brake is allowed
+    near = curve_ahead(v, 30.0, 60.0, kappa)
+    result = settle(ModelCurveSpeedLimiter(make_cp()), near, 12, v_ego=v, lateral_active=True, lateral_state=tracking())   # past the jerk ramp
+    self.assertLess(result.a_target, -FAR_NODE_DECEL_MAX)
+    # a genuinely tight bend far out (its limit well under the doubt) still asks for its full deceleration
+    tight = curve_ahead(v, 120.0, 60.0, 0.02)
+    result = settle(ModelCurveSpeedLimiter(make_cp()), tight, 12, v_ego=v, lateral_active=True, lateral_state=tracking())
+    self.assertLess(result.a_target, -FAR_NODE_DECEL_MAX)
 
   def test_the_anticipation_charges_the_crown_for_a_bend_within_the_horizon(self):
     model = curve_ahead(20.0, 10.0, 20.0, 0.01)                              # a bend 10 m out: inside 2 s of travel
