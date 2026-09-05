@@ -350,8 +350,11 @@ class ReferenceFilter:
   A first-order filter removes the frame-to-frame jitter of the model's target: a few degrees of
   wheel at low speed and nothing in lateral acceleration. The served target may trail the raw one
   by at most a lateral acceleration, capped in wheel angle, so a turn-in or an unwind passes with
-  at most that trailing, at the raw target's own rate, and any trailing decays with the time
-  constant once the raw target settles.
+  at most that trailing at once, and any trailing decays with the time constant once the raw target
+  settles. The served rate is the rate the served position has: the filtered rate while the filter
+  runs free, and the raw target's own rate while the bound holds the served position against it (a
+  pinned trail no longer changes, so the two move together) -- reached with a bounded step, not the
+  one-frame snap the bound used to make.
   """
 
   def __init__(self) -> None:
@@ -374,8 +377,18 @@ class ReferenceFilter:
     trail = target.position_deg - position
     self.limited = abs(trail) > trail_limit_deg
     if self.limited:
+      # Bound the position at the trail limit so a real change still passes at once (R5), and serve
+      # the rate that bounded position actually has. Held against the raw target the trail stops
+      # changing, so the served position tracks the raw target one for one and its rate is the raw
+      # target's own rate -- the low-passed rate describes a motion the served target is not making,
+      # and the tracker's rate term is driven by the difference. Reach it with a bounded step rather
+      # than the snap this branch used to make: the branch may move the served rate at most
+      # trail_limit_deg / rc_s away from what the free-running filter would have served, which is
+      # the rate the served position has exactly where this branch begins (both branches step the
+      # position by trail_limit_deg * dt / rc_s there), so no crossing of this boundary hands the
+      # tracker a rate step larger than the filter's own smoothing already produces at it.
       position = target.position_deg - math.copysign(trail_limit_deg, trail)
-      rate = target.rate_deg_s
+      rate += _clip(target.rate_deg_s - rate, trail_limit_deg / rc_s)
     self.target = RackTarget(position, rate)
     return self.target
 
@@ -595,6 +608,55 @@ HOLD_TOPUP_APPROACH_RATE_DEG_S = .25     # the wheel already closing on the plan
 HOLD_TOPUP_APPROACH_BLEND_DEG_S = .75    # shortfall: growth fades out by 1 deg/s of approach so the last additions are
                                          # allowed to finish their work before more is added (no integrator overshoot)
 assert MAX_HOLD_TOPUP_TORQUE < MAX_FEEDBACK_TORQUE  # the two sum directly in raw_torque (R10: checked, not implicit)
+
+# F3 highway feedforward taper (report.md S2 rank 3): on a highway-speed straight, a flat,
+# speed-independent amount of angle-level noise (route audit torque_decomp/speed_vs_chatter.py:
+# mean|d wheel| 0.082-0.095 deg/frame from 0-150 km/h) becomes a v^2-scaled feedforward swing (mean|d
+# f| 0.00038 at 0-20 km/h to 0.01055 at 120-150 km/h, 28x; mean|d output| only 4.3x, because P/D
+# partly cancels it -- segments 37-44, 128 km/h, are the route's roughest stretch by that measure).
+# Re-verified directly against route 4d (impl_F3/speed_chatter_before_after.py,
+# impl_F3/measured_vs_target_chatter.py): in the 120-150 km/h near-zero-curvature bucket, |d f| on
+# real route data correlates 0.93 with |d measured_lateral_accel| (CS.steeringAngleDeg's own noise,
+# fed in through the friction term's lateral_accel_error, opendbc/car/lateral.py get_friction) and
+# only 0.02 with |d target_lateral_accel| (the model's own target dither) -- the measured-angle path
+# through friction dominates the real signal by ~10x (mean|d measured_lateral_accel| 0.0169 vs
+# mean|d target_lateral_accel| 0.0016 in that bucket), not the plan/target path alone. So this tapers
+# the FULL feedforward_lateral_accel (trajectory term + friction, everything torque_from_lateral_accel
+# actually receives) rather than only the plan-derived trajectory_feedforward_lateral_accel term --
+# still exactly "the feedforward layer" the fix's own mandate names, just downstream of where friction
+# joins it, so the taper reaches whichever of the two inputs is actually chattering that frame.
+# Low-passes that combined input, but ONLY while every one of three smoothstep gates (R7) is open:
+# near-zero curvature (reuses TURN_IN_BLEND_DEG, the same near-center deadband turn_in_fraction and
+# direction_fraction already use, and the report's own "near-straight" definition -- the worst 128
+# km/h windows in torque_decomp/rough_windows.json sit at 0.4-1.6 deg near/target range), holding
+# rather than moving (reuses HOLD_TOPUP_PLAN_RATE_DEG_S/BLEND, the top-up's own "holding not chasing"
+# threshold, applied to whichever of the served target's own rate and the plan's is larger -- the
+# served rate leads the plan into a real highway turn-in, so the plan's rate alone leaves the taper
+# open for the first frames of the move), and highway speed (FF_TAPER_SPEED_MPS matches
+# _STOCK_KP_SPEEDS[-1] below: above it P/D gain no longer grows with speed while feedforward keeps
+# scaling as v^2, so the same angle-level dither buys ever less P/D counter-authority as speed climbs
+# further). A turn-in or unwind at any speed, a curve already held, or the driver's hands on the wheel
+# drives the gate to exactly 0.0, so the low-passed term contributes nothing and today's code
+# reproduces bit-for-bit (R5/R7).
+FF_TAPER_SPEED_MPS = 30.0               # m/s (108 km/h); == _STOCK_KP_SPEEDS[-1] (below)
+FF_TAPER_SPEED_BLEND_MPS = 8.0          # opens from 22 m/s (79 km/h): speed_vs_chatter.py's own
+                                         # 60-80/80-100 km/h bucket boundary, already 13-19x the
+                                         # 0-20 km/h mean|d f| baseline; fully open well inside
+                                         # segments 37-44's 120-129 km/h (33.3-35.8 m/s)
+FF_TAPER_ANGLE_DEG = TURN_IN_BLEND_DEG  # 3 deg: reused, not re-tuned -- see the comment block above
+FF_TAPER_RATE_DEG_S = HOLD_TOPUP_PLAN_RATE_DEG_S              # 5 deg/s: reused, ditto
+FF_TAPER_RATE_BLEND_DEG_S = HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S  # 3 deg/s: reused, ditto
+FF_TAPER_RC_S = REFERENCE_FILTER_RC_S   # reused verbatim, not re-tuned: measured on route 4d
+                                         # (impl_F3/speed_chatter_before_after.py) against a slower
+                                         # 0.2s candidate -- 0.1s gives the same highway-chatter
+                                         # reduction (120-150 km/h bucket: mean|d output| -35.5% vs
+                                         # -36.5%, mean|d f| -56.2% vs -57.9%) while cutting the worst
+                                         # measured highway turn-in transient by ~26% (0.051 vs 0.069
+                                         # peak |d torque| across 17 route-4d highway turn-ins,
+                                         # impl_F3/highway_turnin_scan.py) -- the smaller value changes
+                                         # response least for equivalent benefit (R7: transient bounded
+                                         # by construction, decays with this same time constant once a
+                                         # gate closes)
 STALE_MODEL_S = 0.5  # SubMaster's alive window for modelV2: ten model frames
 INACTIVE_HOLD_FRAMES = 5  # keep the planned rack through a short latActive blip, e.g. at the standstill gate
 
@@ -731,6 +793,36 @@ def _driver_assist_envelope(driver_torque_counts: float, commanded_torque: float
   return max(allowed / limits.STEER_MAX, MAX_DRIVER_ASSIST_TORQUE)
 
 
+def _ff_taper_gate(v_ego_mps: float, target_angle_deg: float, measured_angle_deg: float,
+                   plan_rate_deg_s: float, target_rate_deg_s: float, driver_pressed: bool) -> float:
+  """F3 highway feedforward taper: 1.0 only on a highway-speed, near-zero-curvature hold with the
+  driver's hands off, 0.0 the instant any one of the underlying conditions lifts -- each its own
+  smoothstep (R7), so a turn-in, an unwind, a curve already held, or anything below highway speed
+  drives at least one factor to exactly 0.0 and the caller's blend contributes nothing
+  (bit-identical, R5).
+
+  The motion gate reads the SERVED target's rate alongside the plan's: the reference-filtered target
+  is what the plan is chasing, so it leads the plan into a real move and the plan's own rate alone
+  leaves the taper open through the lead-in frames of a highway turn-in or unwind (route 4d/4c:
+  r2_impl_F3/gate_change_scan.py, 111/114 active frames where the served rate is the larger of the
+  two, every one of them at 79-129 km/h inside a real leg, the gate dropping by up to 0.62/0.76).
+  Whichever rate is larger governs, so this can only ever close the gate sooner, never open it.
+
+  A hand on the wheel closes it outright, like every other steeringPressed site in this file: while
+  the driver steers, the wheel's own motion -- not a model dither -- is what the friction term reads,
+  and softening feedforward there subtracts from what the driver is being helped with (route 4d:
+  2692.50-2694.06 s, 134 frames at 128 km/h with the gate fully open, up to 0.091 torque of
+  softening, the largest single deviation the round-1 taper produced on either route)."""
+  if driver_pressed:
+    return 0.0
+  return (
+    _smoothstep(v_ego_mps, FF_TAPER_SPEED_MPS - FF_TAPER_SPEED_BLEND_MPS, FF_TAPER_SPEED_MPS)
+    * (1.0 - _smoothstep(max(abs(target_angle_deg), abs(measured_angle_deg)), 0.0, FF_TAPER_ANGLE_DEG))
+    * (1.0 - _smoothstep(max(abs(plan_rate_deg_s), abs(target_rate_deg_s)),
+                         FF_TAPER_RATE_DEG_S, FF_TAPER_RATE_DEG_S + FF_TAPER_RATE_BLEND_DEG_S))
+  )
+
+
 class RackTrajectoryController:
   def __init__(self, dt: float = DT, driver_assist_limits: DriverAssistLimits | None = None) -> None:
     self.dt = dt
@@ -755,6 +847,7 @@ class RackTrajectoryController:
     self.envelope_scheduler = PreviewScheduler(require_confidence=False)  # R4: proactive, G-independent
     self.envelope_open_rate = self.envelope_open_accel = self.envelope_open_jerk = 0.0  # eased state; floors at comfort
     self.rack_rate_estimator = RackRateEstimator(dt)
+    self.ff_taper_filter = FirstOrderFilter(0.0, FF_TAPER_RC_S, dt)  # F3: always warm, only ever blended in when gated
 
   def set_model(self, model, state_mono_ns: int) -> None:
     # a dropped or invalid model frame keeps the last good plan; staleness is judged by its age
@@ -788,6 +881,7 @@ class RackTrajectoryController:
     self.envelope_scheduler.reset()
     self.envelope_open_rate = self.envelope_open_accel = self.envelope_open_jerk = 0.0
     self.rack_rate_estimator.reset()
+    self.ff_taper_filter.x = 0.0
 
   def _invalidate(self, status: int) -> None:
     self.reset()
@@ -1123,6 +1217,12 @@ class RackTrajectoryController:
     feedforward_lateral_accel = (
       trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
     )
+    # F3 highway feedforward taper -- see the FF_TAPER_* block comment above for the mechanism and data.
+    filtered_ff_lateral_accel = float(self.ff_taper_filter.update(feedforward_lateral_accel))
+    ff_taper_gate = _ff_taper_gate(float(CS.vEgo), target_angle, measured_angle, plan.rate_deg_s,
+                                    filtered_target.rate_deg_s, bool(CS.steeringPressed))
+    if ff_taper_gate != 0.0:  # exact 0.0 whenever any gate is fully closed: bit-identical to today's code (R7)
+      feedforward_lateral_accel += ff_taper_gate * (filtered_ff_lateral_accel - feedforward_lateral_accel)
     feedforward_torque = -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
 
     # feedback keeps authority at standstill: the per-degree gain uses the floored speed (creep must correct)
