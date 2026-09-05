@@ -44,6 +44,12 @@ AUTHORITY_MIN_LATERAL = 1.0   # m/s^2, ... in a real corner (the friction term d
 AUTHORITY_MIN_SPEED = 10.0    # m/s, ... at a speed where the assist resembles the highway's: town corners at 5-8 m/s
                               # dragged the factor to 0.9x the tuning and a bend 300 s later was braked for (route 0x4c)
 AUTHORITY_BOUNDS = (0.8, 1.8) # times the torque tuning's own factor
+FAR_NODE_DECEL_MAX = 0.5      # m/s^2, the most a node beyond the roll horizon may ask for when its shortfall is one a bank could
+                              # explain: the bank there is unknown, and a banked sweeper read without it is 10-15 % too slow
+                              # (route 0x4d: the far limit 20.7 for a bend the rack held at 24, the candidate at the -2.0 floor
+                              # five seconds out). Far ahead the answer is the foot off; the brake waits for the node to come
+                              # within the horizon, where the bank is the car's own
+FAR_LIMIT_UNCERTAINTY = 0.25  # of the speed: a far limit this far under the car is a bank-sized doubt; farther under is a real bend
 ROLL_HORIZON_S = 2.0          # s of travel over which the car's live roll still describes the road: farther path nodes get
                               # no bank either way. Route 0x4c: the approach's crown was charged to a node 143 m ahead that
                               # is banked the other way, and the limit there read 19.7 m/s instead of 25
@@ -60,10 +66,6 @@ J_UP = 3.0                    # m/s^3, ... and let it back up (curves release in
 
 # Reaction to the measured steering state.
 T_COAST = 0.85                # torque above which the foot comes off, tracking or not ...
-COAST_LOOKAHEAD_S = 1.0       # s, the torque's rise projected this far ahead counts as heavy: a bend the model under-read
-                              # shows first in the steering's rise (route 0x54: 0.40 -> 1.00 in 1.1 s; the lift came 0.9 s
-                              # after the rise could have called it)
-TORQUE_RATE_WINDOW_S = 0.5    # s, the window the rise is measured over
 T_COAST_EXIT = 0.75           # ... and below which coasting ends (hysteresis)
 COAST_ENTER_S = 0.3           # s, the torque must stay heavy this long before coasting starts (no breathing on a sweeper)
 COAST_EXIT_S = 0.5            # s, coasting persists this long after the torque has dropped
@@ -199,7 +201,6 @@ class ModelCurveSpeedLimiter:
     # The calibrated authority and the gas grace are about the car and the driver, not the engagement, and stay
     self._candidate_history = [A_CURVE_FREE] * 3
     self._lateral_history = [0.0] * 3
-    self._torque_history = None                  # primed with the first torque we steer with: no rise is read into a start
     self._output = A_CURVE_FREE
     self._coast_enter_s = 0.0
     self._coast_exit_s = 0.0
@@ -243,8 +244,8 @@ class ModelCurveSpeedLimiter:
 
     path_distance = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(position_x), np.diff(position_y)))))
     signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
-    node_roll = np.where(path_distance <= v_ego * ROLL_HORIZON_S, roll, 0.0)
-    limits = curve_speed_limits(signed_curvature, params, node_roll, lateral_active)
+    near = path_distance <= v_ego * ROLL_HORIZON_S
+    limits = curve_speed_limits(signed_curvature, params, np.where(near, roll, 0.0), lateral_active)
 
     # per node, the less demanding of the kinematic acceleration that meets its limit at its distance and a proportional
     # approach: far limits are kinematic, near or reached ones proportional, and the two meet continuously. Small and
@@ -253,6 +254,8 @@ class ModelCurveSpeedLimiter:
     kinematic = (limits ** 2 - v_ego ** 2) / (2.0 * effective_distance)
     proportional = (limits - v_ego) / T_APPROACH
     per_node = np.maximum(kinematic, proportional)
+    doubtful = ~near & (limits >= v_ego * (1.0 - FAR_LIMIT_UNCERTAINTY))
+    per_node = np.where(doubtful, np.maximum(per_node, -FAR_NODE_DECEL_MAX), per_node)   # far and bank-sized: the foot off at most
     finite = np.isfinite(per_node)
     if not np.any(finite):
       self.v_limit = math.inf
@@ -271,10 +274,7 @@ class ModelCurveSpeedLimiter:
     # the regime machine: free -> coast when the torque is heavy, coast -> brake when pinned and understeering, and back;
     # every entry and exit is dwelled so a single sample never switches it. Coasting does not wait for the tracking
     # error: heavy and understeering below the pin (route 25 t=216, 0.94 torque, 0.33 m/s^2 wide) still wants the foot off
-    # the torque where it is heading, not only where it is: a rise over the window, projected ahead, never a fall
-    rate = max(state.torque - self._torque_history[0], 0.0) / (len(self._torque_history) * self.dt) if self._torque_history else 0.0
-    torque_ahead = min(state.torque + rate * COAST_LOOKAHEAD_S, 1.0)
-    heavy = torque_ahead >= T_COAST
+    heavy = state.torque >= T_COAST
     pinned = state.pinned or state.torque >= T_PIN
     understeer = state.understeer
     if self.regime == REGIME_BRAKE and (understeer < E_TRACK_EXIT or not pinned):
@@ -297,7 +297,7 @@ class ModelCurveSpeedLimiter:
       # continuous in the torque: hold speed at the exit threshold, fully off the throttle at the coast threshold, so the
       # car settles where the steering is comfortably heavy instead of breathing between lift-off and free -- and never a
       # net acceleration while the steering is heavy, downhill included
-      return min(float(np.interp(torque_ahead, [T_COAST_EXIT, T_COAST], [0.0, accel_coast])), 0.0)
+      return min(float(np.interp(state.torque, [T_COAST_EXIT, T_COAST], [0.0, accel_coast])), 0.0)
     if self.regime == REGIME_BRAKE:
       # the speed at which the curvature the path demands fits back inside the budget, approached in T_RESTORE. The
       # demanded lateral acceleration, not the achieved one: a pinned car achieves less than the curve asks
@@ -345,11 +345,8 @@ class ModelCurveSpeedLimiter:
 
     lifting = self.regime in (REGIME_COAST, REGIME_BRAKE)
     if steering:
-      window = max(round(TORQUE_RATE_WINDOW_S / self.dt), 1)
-      self._torque_history = [state.torque] * window if self._torque_history is None else self._torque_history[1:] + [state.torque]
       reaction = self._react(state, v_ego, accel_coast, params, roll)
     else:
-      self._torque_history = None                # a resumption starts its window afresh: the driver's torque is not a rise
       self.regime = REGIME_FREE
       self._losing_s = self._coast_enter_s = self._coast_exit_s = 0.0
       reaction = A_CURVE_FREE
