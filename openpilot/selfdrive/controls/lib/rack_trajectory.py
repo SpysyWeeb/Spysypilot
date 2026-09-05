@@ -351,9 +351,10 @@ class ReferenceFilter:
   wheel at low speed and nothing in lateral acceleration. The served target may trail the raw one
   by at most a lateral acceleration, capped in wheel angle, so a turn-in or an unwind passes with
   at most that trailing at once, and any trailing decays with the time constant once the raw target
-  settles. The served rate is always the filtered rate -- the trail bound only clamps position, it
-  never substitutes the raw target's own (unfiltered) rate for the served one, so a fast excursion
-  that reaches the trail bound still hands the tracker a smoothed rate, not a step.
+  settles. The served rate is the rate the served position has: the filtered rate while the filter
+  runs free, and the raw target's own rate while the bound holds the served position against it (a
+  pinned trail no longer changes, so the two move together) -- reached with a bounded step, not the
+  one-frame snap the bound used to make.
   """
 
   def __init__(self) -> None:
@@ -376,13 +377,18 @@ class ReferenceFilter:
     trail = target.position_deg - position
     self.limited = abs(trail) > trail_limit_deg
     if self.limited:
-      # Bound the position at the trail limit so a real change still passes at once (R5); leave
-      # `rate` as the filtered value computed above instead of snapping it to the raw target's own
-      # rate. Snapping removed rate smoothing exactly during the fast excursions that reach this
-      # branch -- a step straight into the planner's rate-tracking term -- while the alpha blend
-      # above is already bounded between the previous served rate and the raw one, so this still
-      # converges to the raw rate (within one time constant) without the discontinuity.
+      # Bound the position at the trail limit so a real change still passes at once (R5), and serve
+      # the rate that bounded position actually has. Held against the raw target the trail stops
+      # changing, so the served position tracks the raw target one for one and its rate is the raw
+      # target's own rate -- the low-passed rate describes a motion the served target is not making,
+      # and the tracker's rate term is driven by the difference. Reach it with a bounded step rather
+      # than the snap this branch used to make: the branch may move the served rate at most
+      # trail_limit_deg / rc_s away from what the free-running filter would have served, which is
+      # the rate the served position has exactly where this branch begins (both branches step the
+      # position by trail_limit_deg * dt / rc_s there), so no crossing of this boundary hands the
+      # tracker a rate step larger than the filter's own smoothing already produces at it.
       position = target.position_deg - math.copysign(trail_limit_deg, trail)
+      rate += _clip(target.rate_deg_s - rate, trail_limit_deg / rc_s)
     self.target = RackTarget(position, rate)
     return self.target
 
