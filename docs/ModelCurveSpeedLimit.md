@@ -143,3 +143,24 @@ now ramps out at `J_UP` when nothing binds any more, so the hand-off is a ramp o
 
 Not changed: the hold is still speed-blind (it keeps the speed the lift left), and a bend that pinches repeatedly still
 earns a lift per pinch. Awaiting the owner's drive.
+
+## 2026-09-05 — the calibration measures at the budget, and the coast reads the torque's rise (route 0x54)
+
+Route 0x54 t=2825–2853: a 75 mph approach into a right-hander tightening to R≈220 m. The anticipation saw the bend from
+224 m but computed 29–31 m/s for it against the car's 31.4, let off by only −0.15…−0.4, and the tighter section only
+entered the model's view at 58 m: −1.7 then the brake regime's −2.0, the rack at 100 % torque for 2.5 s, the car 0.85 m
+from the left line and the owner adding torque. The rack could hold about 24.5 m/s here (yaw·v 3.3 m/s² at 1.00 torque
+with 0.4 m/s² of favourable bank).
+
+* **The lateral per unit of torque is not a constant**: on the 250 s before the bend it was 5.6 at 0.4–0.6 torque, 3.5
+  at 0.6–0.8, 2.8–3.0 from 0.8 up and 3.2 on the pinned apex frames. The filter averaged the moderate-torque samples to
+  3.79 while the anticipation plans to a 0.90 budget where the number is about 3.0 — every limit 14 % high.
+  `AUTHORITY_MIN_TORQUE` 0.40 → 0.70: the samples come from where the plan is aimed.
+* **The steering's rise is the earliest sign of a bend the model under-read** (the model implied R 315 m at 170 m and
+  283 m at 58 m for a 220 m bend). The torque climbed 0.40 → 1.00 in 1.1 s; the coast regime now reads the torque
+  projected `COAST_LOOKAHEAD_S` (1 s) ahead by its rise over `TORQUE_RATE_WINDOW_S` (0.5 s), for its entry and for the
+  shape of its lift, never a fall, and the window is primed afresh on every start and resumption. On this approach the
+  projected torque crossed 0.85 at 2827.5, 0.9 s before the torque itself.
+
+The model's far-curvature under-read is the remaining gap; a margin on far nodes would cover it at the cost of gentle
+sweepers, and waits for these two to be driven.
