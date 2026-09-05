@@ -27,6 +27,7 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   HOLD_MAX_S,
   T_APPROACH,
   T_COAST,
+  AUTHORITY_MIN_TORQUE,
   V_HOLD_BAND,
   TORQUE_BUDGET,
   LateralState,
@@ -199,6 +200,35 @@ class TestReaction(unittest.TestCase):
     result = settle(limiter, straight, round(A_CURVE_FREE / J_UP / DT_MDL) + 2, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.5, lat=0.5))
     self.assertIsNone(result.a_target)
 
+  def test_a_rising_torque_is_heavy_before_it_arrives(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(20.0)
+    settle(limiter, straight, 10, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.35, lat=1.5))
+    torque, result = 0.35, None
+    while torque < T_COAST:                                                  # the torque climbs at 0.5 per second
+      torque += 0.5 * DT_MDL
+      result = limiter.update(straight, v_ego=20.0, lateral_active=True, accel_coast=-0.4, lateral_state=tracking(torque=torque, lat=2.0))
+      if result.regime == REGIME_COAST:
+        break
+    self.assertEqual(result.regime, REGIME_COAST)
+    self.assertLess(torque, 0.7)                                             # the coast came while the torque itself was still light ...
+    for _ in range(8):                                                       # ... and while it keeps rising the lift is the full coast
+      torque += 0.5 * DT_MDL
+      result = limiter.update(straight, v_ego=20.0, lateral_active=True, accel_coast=-0.4, lateral_state=tracking(torque=torque, lat=2.0))
+    self.assertLessEqual(result.a_target, -0.4 + 1e-9)
+
+  def test_a_steady_torque_under_the_threshold_never_coasts(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    result = settle(limiter, make_model(20.0), 40, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.80, lat=2.5))
+    self.assertNotEqual(result.regime, REGIME_COAST)
+
+  def test_a_resumption_after_the_drivers_wheel_reads_no_rise(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(20.0)
+    settle(limiter, straight, 10, v_ego=20.0, lateral_active=True, steering_pressed=True, lateral_state=tracking(torque=0.2, lat=1.0))
+    result = settle(limiter, straight, 10, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.80, lat=2.5))
+    self.assertNotEqual(result.regime, REGIME_COAST)                         # 0.2 -> 0.8 across the handover is not a rise
+
   def test_pinned_and_losing_brakes_toward_the_speed_that_restores_margin_after_a_debounce(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
     straight = make_model(15.0)
@@ -359,7 +389,9 @@ class TestAuthorityCalibration(unittest.TestCase):
     result = settle(limiter, straight, 1200, v_ego=20.0, lateral_active=True, lateral_state=weak)
     self.assertAlmostEqual(result.authority_factor, AUTHORITY_BOUNDS[0] * FACTOR, places=2)
     idle = settle(limiter, straight, 100, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=0.2, lat=0.1))
-    self.assertAlmostEqual(idle.authority_factor, result.authority_factor)    # light steering teaches nothing
+    self.assertAlmostEqual(idle.authority_factor, result.authority_factor)    # light steering teaches nothing ...
+    moderate = settle(limiter, straight, 100, v_ego=20.0, lateral_active=True, lateral_state=tracking(torque=AUTHORITY_MIN_TORQUE - 0.1, error=0.1, lat=3.0))
+    self.assertAlmostEqual(moderate.authority_factor, result.authority_factor)  # ... and so does moderate torque: the ratio there is not the budget's
 
   def test_calibrated_authority_raises_the_speed_limit(self):
     limiter = ModelCurveSpeedLimiter(make_cp())

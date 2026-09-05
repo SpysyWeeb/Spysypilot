@@ -5,6 +5,8 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot).
 Status: **in progress pending field testing**. This feature must not be marked
 complete until the owner has tested it on-device.
 
+2026-09-05: route 0x54's late lift — the authority calibration samples only at torque ≥ 0.70 (`AUTHORITY_MIN_TORQUE`, the ratio is not constant in torque and the plan is aimed at the 0.90 budget), and the coast regime reads the torque's rise projected 1 s ahead (`COAST_LOOKAHEAD_S`). Replay-gated on routes 0x54, 0x4c, 0x4d; awaiting the owner's drive.
+
 2026-09-04: the same bend twice (routes 0x4c/0x4d) — far path nodes no longer get the car's live roll (`ROLL_HORIZON_S` 2 s), the authority calibration learns only from real corners at speed with the bank taken out of the measurement, and the hold releases as a `J_UP` ramp instead of a step. Replay-gated on both passes; awaiting the owner's drive. Details: docs/ModelCurveSpeedLimit.md.
 
 2026-09-02: a lift now ends in a hold — after the coast or brake regime releases, the candidate holds zero until the bend reads open (`BEND_OPEN_A_LAT` 1.0 m/s² for 1 s) instead of handing the plan back to the accelerating candidate (route 0x33: 16 → 4 source handoffs). Replay-gated, plant-gated, awaiting the owner's drive. Details: docs/ModelCurveSpeedLimit.md.
