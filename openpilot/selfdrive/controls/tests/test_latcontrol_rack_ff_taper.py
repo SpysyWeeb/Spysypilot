@@ -33,47 +33,89 @@ class TestFFTaperGate(OpenpilotTestCase):
   def test_zero_below_highway_speed_regardless_of_angle_or_rate(self):
     # the two owner windows sit at 13-15 m/s (35-53 km/h): nowhere near FF_TAPER_SPEED_MPS
     for angle, rate in ((0.0, 0.0), (28.0, 0.0), (0.0, 40.0), (15.0, 15.0)):
-      assert _ff_taper_gate(13.0, angle, angle, rate) == 0.0
+      assert _ff_taper_gate(13.0, angle, angle, rate, rate, False) == 0.0
     # and exactly at the speed gate's own lower edge, still exactly 0.0 (not epsilon over)
-    assert _ff_taper_gate(FF_TAPER_SPEED_MPS - FF_TAPER_SPEED_BLEND_MPS, 0.0, 0.0, 0.0) == 0.0
+    assert _ff_taper_gate(FF_TAPER_SPEED_MPS - FF_TAPER_SPEED_BLEND_MPS, 0.0, 0.0, 0.0, 0.0, False) == 0.0
 
   def test_zero_at_highway_speed_once_curvature_or_rate_leaves_the_deadband(self):
     # a genuine highway curve (target_angle past the deadband) must not be touched, whatever the wheel is doing
-    assert _ff_taper_gate(35.0, FF_TAPER_ANGLE_DEG, 0.0, 0.0) == 0.0
-    assert _ff_taper_gate(35.0, 10.0, 0.0, 0.0) == 0.0
+    assert _ff_taper_gate(35.0, FF_TAPER_ANGLE_DEG, 0.0, 0.0, 0.0, False) == 0.0
+    assert _ff_taper_gate(35.0, 10.0, 0.0, 0.0, 0.0, False) == 0.0
     # ditto a genuine turn-in/unwind in progress (plan rate past the deadband), even at zero curvature
-    assert _ff_taper_gate(35.0, 0.0, 0.0, FF_TAPER_RATE_DEG_S + FF_TAPER_RATE_BLEND_DEG_S) == 0.0
-    assert _ff_taper_gate(35.0, 0.0, 0.0, 20.0) == 0.0
+    assert _ff_taper_gate(35.0, 0.0, 0.0, FF_TAPER_RATE_DEG_S + FF_TAPER_RATE_BLEND_DEG_S, 0.0, False) == 0.0
+    assert _ff_taper_gate(35.0, 0.0, 0.0, 20.0, 0.0, False) == 0.0
     # either side alone reopening (angle small again but rate still high, and vice versa) stays shut
-    assert _ff_taper_gate(35.0, 0.2, 0.2, 20.0) == 0.0
-    assert _ff_taper_gate(35.0, 10.0, 10.0, 0.5) == 0.0
+    assert _ff_taper_gate(35.0, 0.2, 0.2, 20.0, 0.0, False) == 0.0
+    assert _ff_taper_gate(35.0, 10.0, 10.0, 0.5, 0.5, False) == 0.0
+
+  def test_served_target_rate_closes_the_gate_on_its_own(self):
+    """Round-2 required change (a): the served (reference-filtered) target leads the plan into a real
+    move, so its rate has to shut the gate even while the plan is still at rest -- otherwise the
+    taper stays open through the lead-in frames of a highway turn-in."""
+    # plan still at rest, served target already moving past the deadband: shut, exactly 0.0
+    assert _ff_taper_gate(35.0, 0.0, 0.0, 0.0, FF_TAPER_RATE_DEG_S + FF_TAPER_RATE_BLEND_DEG_S, False) == 0.0
+    assert _ff_taper_gate(35.0, 0.0, 0.0, 0.0, -20.0, False) == 0.0
+    # and partly closed through the blend, monotonically, from either rate
+    for served in (5.5, 6.0, 6.5, 7.0, 7.5):
+      assert (_ff_taper_gate(35.0, 0.0, 0.0, 0.0, served, False)
+              == _ff_taper_gate(35.0, 0.0, 0.0, served, 0.0, False))
+    # whichever rate is larger governs: adding a served rate can only close the gate further
+    for plan_rate in (0.0, 2.0, 5.0, 6.0, 9.0):
+      for served in (0.0, 1.0, 4.0, 6.5, 12.0):
+        assert (_ff_taper_gate(35.0, 0.0, 0.0, plan_rate, served, False)
+                <= _ff_taper_gate(35.0, 0.0, 0.0, plan_rate, 0.0, False))
+    # a served rate under the plan's changes nothing (bit-identical to the round-1 gate there)
+    assert (_ff_taper_gate(35.0, 0.5, 0.5, 6.0, 1.0, False)
+            == _ff_taper_gate(35.0, 0.5, 0.5, 6.0, 0.0, False))
+
+  def test_driver_press_closes_the_gate_outright(self):
+    """Round-2 required change (b): a hand on the wheel returns feedforward untouched, like every
+    other steeringPressed site in this file -- exactly 0.0, whatever the other three conditions say."""
+    for speed in (35.0, 30.0, 25.0, 13.0):
+      for angle in (0.0, 0.5, 10.0):
+        for rate in (0.0, 2.0, 20.0):
+          assert _ff_taper_gate(speed, angle, angle, rate, rate, True) == 0.0
+    # deep in the taper's own best case (fully open unpressed), the press alone shuts it
+    assert _ff_taper_gate(35.0, 0.0, 0.0, 0.0, 0.0, False) == 1.0
+    assert _ff_taper_gate(35.0, 0.0, 0.0, 0.0, 0.0, True) == 0.0
 
   def test_fully_open_deep_in_a_highway_straight_hold(self):
-    assert _ff_taper_gate(35.0, 0.0, 0.0, 0.0) == 1.0
+    assert _ff_taper_gate(35.0, 0.0, 0.0, 0.0, 0.0, False) == 1.0
     # matches the report's own worst window (seg 44, torque_decomp/rough_windows.json: 128 km/h,
     # near range 0.77 deg, target range 0.40 deg) -- well inside the deadband, meaningfully open
-    gate = _ff_taper_gate(35.6, 0.8, 0.8, 0.0)
+    gate = _ff_taper_gate(35.6, 0.8, 0.8, 0.0, 0.0, False)
     assert 0.5 < gate < 1.0
 
   def test_continuous_through_every_boundary(self):
     # R7: each factor is a smoothstep, so the product is continuous everywhere, never a step
     speeds = [FF_TAPER_SPEED_MPS - FF_TAPER_SPEED_BLEND_MPS + step for step in range(0, 9)]
-    gates = [_ff_taper_gate(speed, 0.0, 0.0, 0.0) for speed in speeds]
+    gates = [_ff_taper_gate(speed, 0.0, 0.0, 0.0, 0.0, False) for speed in speeds]
     assert gates == sorted(gates)  # monotonic in speed
     assert all(0.0 <= gate <= 1.0 for gate in gates)
     for previous, current in zip(gates, gates[1:]):
       assert current - previous < 0.4  # no boundary jump; a 1 m/s step moves the gate smoothly
 
     angles = [step * FF_TAPER_ANGLE_DEG / 8.0 for step in range(9)]
-    angle_gates = [_ff_taper_gate(35.0, angle, angle, 0.0) for angle in angles]
+    angle_gates = [_ff_taper_gate(35.0, angle, angle, 0.0, 0.0, False) for angle in angles]
     assert angle_gates == sorted(angle_gates, reverse=True)  # monotonically closes as curvature grows
     for previous, current in zip(angle_gates, angle_gates[1:]):
+      assert previous - current < 0.4
+
+    # the served-rate half of the motion gate is a smoothstep too, not a test
+    rates = [step * (FF_TAPER_RATE_DEG_S + FF_TAPER_RATE_BLEND_DEG_S) / 16.0 for step in range(17)]
+    rate_gates = [_ff_taper_gate(35.0, 0.0, 0.0, 0.0, rate, False) for rate in rates]
+    assert rate_gates == sorted(rate_gates, reverse=True)
+    for previous, current in zip(rate_gates, rate_gates[1:], strict=False):
       assert previous - current < 0.4
 
   def test_symmetric_in_sign(self):
     # a left turn's dither must taper exactly as much as a right turn's (angle and rate enter as abs())
     for angle, rate in ((1.0, -2.0), (-1.0, 2.0), (-1.0, -2.0), (1.0, 2.0)):
-      assert math.isclose(_ff_taper_gate(35.0, angle, angle, rate), _ff_taper_gate(35.0, 1.0, 1.0, 2.0))
+      assert math.isclose(_ff_taper_gate(35.0, angle, angle, rate, rate, False),
+                          _ff_taper_gate(35.0, 1.0, 1.0, 2.0, 2.0, False))
+    for served in (-4.0, 4.0):
+      assert math.isclose(_ff_taper_gate(35.0, 1.0, 1.0, 2.0, served, False),
+                          _ff_taper_gate(35.0, 1.0, 1.0, 2.0, 4.0, False))
 
 
 class TestFFTaperController(OpenpilotTestCase):
@@ -85,7 +127,8 @@ class TestFFTaperController(OpenpilotTestCase):
     self.VM = VehicleModel(self.CP)
     self.params = log.VehicleParameters.new_message()
 
-  def _run_highway_dither(self, speed, disable_taper=False, frames=80, half_period_frames=3, dither_deg=0.6):
+  def _run_highway_dither(self, speed, disable_taper=False, frames=80, half_period_frames=3, dither_deg=0.6,
+                          pressed=False, record_gate_args=None):
     """A near-zero-curvature target flipping sign every `half_period_frames` model frames -- the
     same kind of small, fast near-target dither the report's rough_windows.json finds dominating
     segments 37-44 (near/target range well under a degree at ~128 km/h), reproduced here at a
@@ -96,8 +139,17 @@ class TestFFTaperController(OpenpilotTestCase):
     CS = car.CarState.new_message()
     CS.vEgo = speed
     CS.steeringAngleDeg = 0.0
+    CS.steeringPressed = pressed
     model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [speed] * 6)
     patches = [mock.patch.object(rack_trajectory, "FF_TAPER_SPEED_MPS", 1e9)] if disable_taper else []
+    if record_gate_args is not None:
+      real_gate = rack_trajectory._ff_taper_gate
+
+      def recording_gate(*args):
+        record_gate_args.append(args)
+        return real_gate(*args)
+
+      patches.append(mock.patch.object(rack_trajectory, "_ff_taper_gate", recording_gate))
     for patch in patches:
       patch.start()
     try:
@@ -208,6 +260,37 @@ class TestFFTaperController(OpenpilotTestCase):
     for baseline_output, taper_output in list(zip(without, with_taper))[11:]:
       assert taper_output.torque == baseline_output.torque
       assert taper_output.feedforward_torque == baseline_output.feedforward_torque
+
+  def test_driver_press_makes_the_taper_bit_identical_at_highway_speed(self):
+    """Round-2 required change (b), through the controller: with the driver's hand on the wheel the
+    whole highway-straight fixture -- the taper's own best case, gate fully open unpressed -- is
+    bit-for-bit the untapered code, feedforward and composed torque alike. Measured on route 4d, the
+    round-1 taper's largest single deviation on either route lived exactly here: 134 frames at
+    2692.50-2694.06 s, 128 km/h, driver pressing, up to 0.091 torque of softening."""
+    speed = 35.0
+    without = self._run_highway_dither(speed, disable_taper=True, pressed=True)
+    with_taper = self._run_highway_dither(speed, disable_taper=False, pressed=True)
+    # sanity: unpressed, this same fixture is NOT identical (the gate really is open here)
+    assert any(a.torque != b.torque for a, b in zip(self._run_highway_dither(speed, disable_taper=True),
+                                                     self._run_highway_dither(speed, disable_taper=False),
+                                                     strict=True))
+    for baseline_output, taper_output in zip(without, with_taper, strict=True):
+      assert taper_output.feedforward_torque == baseline_output.feedforward_torque
+      assert taper_output.torque == baseline_output.torque
+
+  def test_call_site_passes_the_served_target_rate_and_the_press_flag(self):
+    """The gate can only close on the served rate and the driver's hand if the call site hands it
+    both: pin the wiring (rack_trajectory.py's _ff_taper_gate call) against the controller's own
+    logged served rate, frame for frame, pressed and unpressed."""
+    for pressed in (False, True):
+      recorded = []
+      outputs = self._run_highway_dither(35.0, pressed=pressed, record_gate_args=recorded, frames=40)
+      assert len(recorded) == len(outputs)
+      for args, output in zip(recorded, outputs, strict=True):
+        assert args[4] == output.target_rate_deg_s  # the SERVED (reference-filtered) target's rate
+        assert args[5] is pressed
+      if pressed:
+        assert all(rack_trajectory._ff_taper_gate(*args) == 0.0 for args in recorded)
 
   def test_reset_zeroes_the_taper_filter(self):
     controller = RackTrajectoryController()

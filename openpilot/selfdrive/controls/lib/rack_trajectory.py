@@ -617,11 +617,14 @@ assert MAX_HOLD_TOPUP_TORQUE < MAX_FEEDBACK_TORQUE  # the two sum directly in ra
 # direction_fraction already use, and the report's own "near-straight" definition -- the worst 128
 # km/h windows in torque_decomp/rough_windows.json sit at 0.4-1.6 deg near/target range), holding
 # rather than moving (reuses HOLD_TOPUP_PLAN_RATE_DEG_S/BLEND, the top-up's own "holding not chasing"
-# threshold), and highway speed (FF_TAPER_SPEED_MPS matches _STOCK_KP_SPEEDS[-1] below: above it P/D
-# gain no longer grows with speed while feedforward keeps scaling as v^2, so the same angle-level
-# dither buys ever less P/D counter-authority as speed climbs further). A turn-in or unwind at any
-# speed, or a curve already held, drives at least one gate to exactly 0.0, so the low-passed term
-# contributes nothing and today's code reproduces bit-for-bit (R5/R7).
+# threshold, applied to whichever of the served target's own rate and the plan's is larger -- the
+# served rate leads the plan into a real highway turn-in, so the plan's rate alone leaves the taper
+# open for the first frames of the move), and highway speed (FF_TAPER_SPEED_MPS matches
+# _STOCK_KP_SPEEDS[-1] below: above it P/D gain no longer grows with speed while feedforward keeps
+# scaling as v^2, so the same angle-level dither buys ever less P/D counter-authority as speed climbs
+# further). A turn-in or unwind at any speed, a curve already held, or the driver's hands on the wheel
+# drives the gate to exactly 0.0, so the low-passed term contributes nothing and today's code
+# reproduces bit-for-bit (R5/R7).
 FF_TAPER_SPEED_MPS = 30.0               # m/s (108 km/h); == _STOCK_KP_SPEEDS[-1] (below)
 FF_TAPER_SPEED_BLEND_MPS = 8.0          # opens from 22 m/s (79 km/h): speed_vs_chatter.py's own
                                          # 60-80/80-100 km/h bucket boundary, already 13-19x the
@@ -777,15 +780,33 @@ def _driver_assist_envelope(driver_torque_counts: float, commanded_torque: float
   return max(allowed / limits.STEER_MAX, MAX_DRIVER_ASSIST_TORQUE)
 
 
-def _ff_taper_gate(v_ego_mps: float, target_angle_deg: float, measured_angle_deg: float, plan_rate_deg_s: float) -> float:
-  """F3 highway feedforward taper: 1.0 only on a highway-speed, near-zero-curvature hold, 0.0 the
-  instant any one of the three underlying conditions lifts -- each its own smoothstep (R7), so a
-  turn-in, an unwind, a curve already held, or anything below highway speed drives at least one
-  factor to exactly 0.0 and the caller's blend contributes nothing (bit-identical, R5)."""
+def _ff_taper_gate(v_ego_mps: float, target_angle_deg: float, measured_angle_deg: float,
+                   plan_rate_deg_s: float, target_rate_deg_s: float, driver_pressed: bool) -> float:
+  """F3 highway feedforward taper: 1.0 only on a highway-speed, near-zero-curvature hold with the
+  driver's hands off, 0.0 the instant any one of the underlying conditions lifts -- each its own
+  smoothstep (R7), so a turn-in, an unwind, a curve already held, or anything below highway speed
+  drives at least one factor to exactly 0.0 and the caller's blend contributes nothing
+  (bit-identical, R5).
+
+  The motion gate reads the SERVED target's rate alongside the plan's: the reference-filtered target
+  is what the plan is chasing, so it leads the plan into a real move and the plan's own rate alone
+  leaves the taper open through the lead-in frames of a highway turn-in or unwind (route 4d/4c:
+  r2_impl_F3/gate_change_scan.py, 111/114 active frames where the served rate is the larger of the
+  two, every one of them at 79-129 km/h inside a real leg, the gate dropping by up to 0.62/0.76).
+  Whichever rate is larger governs, so this can only ever close the gate sooner, never open it.
+
+  A hand on the wheel closes it outright, like every other steeringPressed site in this file: while
+  the driver steers, the wheel's own motion -- not a model dither -- is what the friction term reads,
+  and softening feedforward there subtracts from what the driver is being helped with (route 4d:
+  2692.50-2694.06 s, 134 frames at 128 km/h with the gate fully open, up to 0.091 torque of
+  softening, the largest single deviation the round-1 taper produced on either route)."""
+  if driver_pressed:
+    return 0.0
   return (
     _smoothstep(v_ego_mps, FF_TAPER_SPEED_MPS - FF_TAPER_SPEED_BLEND_MPS, FF_TAPER_SPEED_MPS)
     * (1.0 - _smoothstep(max(abs(target_angle_deg), abs(measured_angle_deg)), 0.0, FF_TAPER_ANGLE_DEG))
-    * (1.0 - _smoothstep(abs(plan_rate_deg_s), FF_TAPER_RATE_DEG_S, FF_TAPER_RATE_DEG_S + FF_TAPER_RATE_BLEND_DEG_S))
+    * (1.0 - _smoothstep(max(abs(plan_rate_deg_s), abs(target_rate_deg_s)),
+                         FF_TAPER_RATE_DEG_S, FF_TAPER_RATE_DEG_S + FF_TAPER_RATE_BLEND_DEG_S))
   )
 
 
@@ -1185,7 +1206,8 @@ class RackTrajectoryController:
     )
     # F3 highway feedforward taper -- see the FF_TAPER_* block comment above for the mechanism and data.
     filtered_ff_lateral_accel = float(self.ff_taper_filter.update(feedforward_lateral_accel))
-    ff_taper_gate = _ff_taper_gate(float(CS.vEgo), target_angle, measured_angle, plan.rate_deg_s)
+    ff_taper_gate = _ff_taper_gate(float(CS.vEgo), target_angle, measured_angle, plan.rate_deg_s,
+                                    filtered_target.rate_deg_s, bool(CS.steeringPressed))
     if ff_taper_gate != 0.0:  # exact 0.0 whenever any gate is fully closed: bit-identical to today's code (R7)
       feedforward_lateral_accel += ff_taper_gate * (filtered_ff_lateral_accel - feedforward_lateral_accel)
     feedforward_torque = -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
