@@ -18,7 +18,12 @@ finite biases; the guard now acts mostly at low speed with the driver's hands on
 post-override recovery, not a shed. Step 4b (driver-assist envelope) and step 5 (R4 proactive envelope opening) merged into combo
 2026-09-02, awaiting a drive — the post-release torque swing baseline to compare against is p50 0.18–0.37, p90 0.53–0.73
 (`route-audit/phase3/verify_2026-09-02/`). `params_keys.h` changed with step 3-C: a device that crash-loops with `UnknownKeyName`
-after updating needs `rm -f /data/openpilot/openpilot/common/params_pyx*.so` and a reboot.**
+after updating needs `rm -f /data/openpilot/openpilot/common/params_pyx*.so` and a reboot. Step 6 (the hold top-up) merged into
+combo 2026-09-04 and driven (routes 4b–4d, ~1.5 h engaged): it pushes with the lateral-accel error 65–70 % of its active time and
+agrees with the P term 83–90 %, working as designed; the same drives showed the hold-phase wobble and the mid-turn re-commits are the
+model's own target (`route-audit/phase3/stability_2026-09-04_4d/report.md`). Step 7 (execution shaping: the highway feedforward taper
+and the reference filter's rate consistency) landed 2026-09-05 after three replay gauntlet rounds, ⚠️ awaiting a drive; open item: two
+highway turn-in legs on routes 4d/4c trail by +48/+29 ms with the taper, shown not to be the filter fix's doing.**
 
 ## What it does
 
@@ -58,6 +63,24 @@ builds, never past a refuge island.
   does not. The stock controller is stepped every frame so its request buffer and jerk filter follow
   the live history and the two share one saturation timer; as in BLaTv2, its integrator starts clean
   when it takes over. Logs into `lateralControlState.rackState`.
+- Phase 3, step 7 — execution shaping, from the route-4d stability study and three replay gauntlet rounds
+  (`route-audit/phase3/stability_2026-09-04_4d/`: `report.md`, `GAUNTLET.md`, `GAUNTLET2.md`, `GAUNTLET3.md`; every candidate was
+  replayed open-loop on routes 4d/4c and closed-loop against the phase-3 rack plant, scored by one shared scorecard for late or
+  early turn-ins and unwinds, and attacked by three reviewers before it could land). (a) The highway feedforward taper: near zero
+  curvature at speed the feedforward's v²-scaled gain turned the model's frame-to-frame dither into torque steps 28× larger at
+  120–150 km/h than at low speed while the wheel's own motion stayed flat, the roughest stretch of the route; a continuous gate
+  (speed, near-zero target, low plan AND served-target rate, never under a press) tapers that sensitivity — straight-road reversals
+  above 100 km/h 12.4 → 1.7 per minute, per-frame step p50 −49 %, the rack plan bit-identical, 0 late turn-ins or unwinds of 187
+  events. Residual, open: two highway turn-in legs (4d 2929.8 s +48 ms, 4c 465.7 s +29 ms) where the taper releases on the plan's
+  rate after the served rate has already moved. (b) The reference filter's trail branch: while the trail bound bound the served
+  target, its served rate was still the pre-clamp alpha blend, disagreeing with the served position's own derivative by 9 °/s
+  median and up to 314 °/s and feeding the D term with it (live during route 4d's 1485.6 s re-commit); it now steps toward the raw
+  target's rate one bounded step per frame (trail limit ÷ time constant), byte-identical closed-loop on every owner window, late
+  events 49 → 8 on 4d, an onset suppression at 1624 s and a slow release at 1784 s gone. Dropped after the same gauntlet: a slower
+  hold time constant (its remaining cost sat in the tails of unwinds) and a plan-shape near-target source (window-1 closed-loop
+  +42 % across two rebuilds). Pinned for step 8 once this step is driven: the planner's deceleration anticipation and the feedforward
+  headroom cap (`gauntlet-2026-09-05/r2-f1`, `r2-f2`, local; together with this step `r3-combo-all`, whose only new cost is a
+  rougher parking-lot full-lock cluster).
 - Phase 3, step 6 — the hold top-up (FM3.14), the third torque term: feedforward predicts, position and
   rate feedback correct, and a bounded (0.20), leaky (3 s; 0.3 s under a press and through a 0.3 s
   release cooldown), angle-space integrator makes up whatever standing shortfall is left while the wheel
