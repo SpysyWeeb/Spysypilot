@@ -22,8 +22,11 @@ after updating needs `rm -f /data/openpilot/openpilot/common/params_pyx*.so` and
 combo 2026-09-04 and driven (routes 4b–4d, ~1.5 h engaged): it pushes with the lateral-accel error 65–70 % of its active time and
 agrees with the P term 83–90 %, working as designed; the same drives showed the hold-phase wobble and the mid-turn re-commits are the
 model's own target (`route-audit/phase3/stability_2026-09-04_4d/report.md`). Step 7 (execution shaping: the highway feedforward taper
-and the reference filter's rate consistency) landed 2026-09-05 after three replay gauntlet rounds, ⚠️ awaiting a drive; open item: two
-highway turn-in legs on routes 4d/4c trail by +48/+29 ms with the taper, shown not to be the filter fix's doing.**
+and the reference filter's rate consistency) landed 2026-09-05 after three replay gauntlet rounds and ✅ field-validated the same day
+(route 54, 47 min, replayed on its own logged inputs with and without the step: straight-road torque step above 100 km/h −48 % at
+the median, reversals 10.9 → 1.3 per minute, onset/overshoot/unwind timing unchanged at every percentile; owner: "highway did feel
+calmer, and curves felt fine"). Open item carried: 7 of 21 gentle highway moves build torque 40–300 ms more slowly with the taper
+(onset unchanged) because its 5 °/s wheel-rate gate sits above the 2–5 °/s of such moves; a speed-scaled gate is the follow-up.**
 
 ## What it does
 
@@ -76,7 +79,10 @@ builds, never past a refuge island.
   target, its served rate was still the pre-clamp alpha blend, disagreeing with the served position's own derivative by 9 °/s
   median and up to 314 °/s and feeding the D term with it (live during route 4d's 1485.6 s re-commit); it now steps toward the raw
   target's rate one bounded step per frame (trail limit ÷ time constant), byte-identical closed-loop on every owner window, late
-  events 49 → 8 on 4d, an onset suppression at 1624 s and a slow release at 1784 s gone. Dropped after the same gauntlet: a slower
+  events 49 → 8 on 4d, an onset suppression at 1624 s and a slow release at 1784 s gone. Field result (route 54, 2026-09-05,
+  `route-audit/phase3/step7_field_2026-09-05/findings.md`): the highway calm arrived as replayed (−48 % / −36 % / −88 % on straights
+  above 100 km/h, curves above 100 km/h −45 % reversals, nothing below 60 km/h), timing unchanged, 7 of 21 gentle highway moves rise
+  40–297 ms more slowly, hold collapses in the parking stretch identical with and without the step. Dropped after the same gauntlet: a slower
   hold time constant (its remaining cost sat in the tails of unwinds) and a plan-shape near-target source (window-1 closed-loop
   +42 % across two rebuilds). Pinned for step 8 once this step is driven: the planner's deceleration anticipation and the feedforward
   headroom cap (`gauntlet-2026-09-05/r2-f1`, `r2-f2`, local; together with this step `r3-combo-all`, whose only new cost is a
