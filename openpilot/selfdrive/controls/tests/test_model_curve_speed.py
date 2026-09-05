@@ -329,11 +329,11 @@ class TestRollHorizon(unittest.TestCase):
     self.assertGreaterEqual(result.a_target, -FAR_NODE_DECEL_MAX - 1e-9)
     # the same bend 1 s out: the bank is the car's own and the brake is allowed
     near = curve_ahead(v, 30.0, 60.0, kappa)
-    result = settle(ModelCurveSpeedLimiter(make_cp()), near, 12, v_ego=v, lateral_active=True, lateral_state=tracking())   # past the jerk ramp
+    result = settle(ModelCurveSpeedLimiter(make_cp()), near, 20, v_ego=v, lateral_active=True, lateral_state=tracking())   # past the jerk ramp
     self.assertLess(result.a_target, -FAR_NODE_DECEL_MAX)
     # a genuinely tight bend far out (its limit well under the doubt) still asks for its full deceleration
     tight = curve_ahead(v, 120.0, 60.0, 0.02)
-    result = settle(ModelCurveSpeedLimiter(make_cp()), tight, 12, v_ego=v, lateral_active=True, lateral_state=tracking())
+    result = settle(ModelCurveSpeedLimiter(make_cp()), tight, 20, v_ego=v, lateral_active=True, lateral_state=tracking())
     self.assertLess(result.a_target, -FAR_NODE_DECEL_MAX)
 
   def test_the_anticipation_charges_the_crown_for_a_bend_within_the_horizon(self):

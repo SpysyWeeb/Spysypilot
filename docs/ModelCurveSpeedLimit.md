@@ -144,23 +144,29 @@ now ramps out at `J_UP` when nothing binds any more, so the hand-off is a ramp o
 Not changed: the hold is still speed-blind (it keeps the speed the lift left), and a bend that pinches repeatedly still
 earns a lift per pinch. Awaiting the owner's drive.
 
-## 2026-09-05 — the calibration measures at the budget, and the coast reads the torque's rise (route 0x54)
+## 2026-09-05 — the calibration measures at the budget, and a far node asks for a moderate deceleration at most (route 0x54)
 
 Route 0x54 t=2825–2853: a 75 mph approach into a right-hander tightening to R≈220 m. The anticipation saw the bend from
 224 m but computed 29–31 m/s for it against the car's 31.4, let off by only −0.15…−0.4, and the tighter section only
 entered the model's view at 58 m: −1.7 then the brake regime's −2.0, the rack at 100 % torque for 2.5 s, the car 0.85 m
-from the left line and the owner adding torque. The rack could hold about 24.5 m/s here (yaw·v 3.3 m/s² at 1.00 torque
-with 0.4 m/s² of favourable bank).
+from the left line and the owner adding torque. The rack could hold about 24.5 m/s here.
 
 * **The lateral per unit of torque is not a constant**: on the 250 s before the bend it was 5.6 at 0.4–0.6 torque, 3.5
   at 0.6–0.8, 2.8–3.0 from 0.8 up and 3.2 on the pinned apex frames. The filter averaged the moderate-torque samples to
   3.79 while the anticipation plans to a 0.90 budget where the number is about 3.0 — every limit 14 % high.
-  `AUTHORITY_MIN_TORQUE` 0.40 → 0.70: the samples come from where the plan is aimed.
-* **The steering's rise is the earliest sign of a bend the model under-read** (the model implied R 315 m at 170 m and
-  283 m at 58 m for a 220 m bend). The torque climbed 0.40 → 1.00 in 1.1 s; the coast regime now reads the torque
-  projected `COAST_LOOKAHEAD_S` (1 s) ahead by its rise over `TORQUE_RATE_WINDOW_S` (0.5 s), for its entry and for the
-  shape of its lift, never a fall, and the window is primed afresh on every start and resumption. On this approach the
-  projected torque crossed 0.85 at 2827.5, 0.9 s before the torque itself.
+  `AUTHORITY_MIN_TORQUE` 0.40 → 0.70: the samples come from where the plan is aimed. Replay: the first lift on this
+  approach moves from 2827.3 to 2824.6.
+* **A node beyond the roll horizon whose shortfall a bank could explain asks for a moderate deceleration at most**
+  (`FAR_NODE_DECEL_MAX` 1.0 m/s², for far limits within `FAR_LIMIT_UNCERTAINTY` 25 % of the car's speed; a far bend well
+  under that keeps its full deceleration). With an honest factor, a banked sweeper read without its bank is 10–15 % too
+  slow: route 0x4d's far limit came out at 20.7 m/s for a bend the rack held at 24, and the kinematic candidate hit the
+  −2.0 floor five seconds out. A cap of 0.5 left that car 4 m/s over at the horizon and the floor still came; at 1.0 the
+  early, moderate deceleration sheds the doubt-sized shortfall before the node comes within the horizon, where the bank
+  is the car's own and the hard brake is allowed.
 
-The model's far-curvature under-read is the remaining gap; a margin on far nodes would cover it at the cost of gentle
-sweepers, and waits for these two to be driven.
+Tried and dropped: a coast trigger on the torque's projected rise. On this approach it would have lifted 0.9 s earlier,
+but on route 0x4c's bend, where the rack's torque swings 0.2–0.9 with a 2–3 s period at a steady lateral, it called
+heavy on every upswing (the first coast 4 s early and a third more curve-bound frames) — the alternation the owner's
+ruling forbids.
+
+The model's far-curvature under-read is the remaining gap (R 315 m shown at 170 m and 283 m at 58 m for a 220 m bend).
