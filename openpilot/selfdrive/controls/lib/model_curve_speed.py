@@ -44,11 +44,12 @@ AUTHORITY_MIN_LATERAL = 1.0   # m/s^2, ... in a real corner (the friction term d
 AUTHORITY_MIN_SPEED = 10.0    # m/s, ... at a speed where the assist resembles the highway's: town corners at 5-8 m/s
                               # dragged the factor to 0.9x the tuning and a bend 300 s later was braked for (route 0x4c)
 AUTHORITY_BOUNDS = (0.8, 1.8) # times the torque tuning's own factor
-FAR_NODE_DECEL_MAX = 0.5      # m/s^2, the most a node beyond the roll horizon may ask for when its shortfall is one a bank could
+FAR_NODE_DECEL_MAX = 1.0      # m/s^2, the most a node beyond the roll horizon may ask for when its shortfall is one a bank could
                               # explain: the bank there is unknown, and a banked sweeper read without it is 10-15 % too slow
                               # (route 0x4d: the far limit 20.7 for a bend the rack held at 24, the candidate at the -2.0 floor
-                              # five seconds out). Far ahead the answer is the foot off; the brake waits for the node to come
-                              # within the horizon, where the bank is the car's own
+                              # five seconds out). Far ahead the answer is a moderate, early deceleration (0.5 left the car
+                              # 4 m/s over at the horizon and the -2.0 floor still came); the hard brake waits for the node to
+                              # come within the horizon, where the bank is the car's own
 FAR_LIMIT_UNCERTAINTY = 0.25  # of the speed: a far limit this far under the car is a bank-sized doubt; farther under is a real bend
 ROLL_HORIZON_S = 2.0          # s of travel over which the car's live roll still describes the road: farther path nodes get
                               # no bank either way. Route 0x4c: the approach's crown was charged to a node 143 m ahead that
