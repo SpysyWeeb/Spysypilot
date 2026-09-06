@@ -65,6 +65,8 @@ road opening, like the hold — it used to brake 1–2 s past a rolling green.
 
 ## What changed
 
+**2026-09-06 — D30, the committed point follows the model on confirmed evidence.** Two stops (routes 0x58 t=548, 0x59 t=609) rested 3–4 m past the model's settled endpoint while the day's good stops rest ~1.7 m before it. In one the commit took the first strict frames' endpoint, 5.8 m long, and the follow-down waited for 3 m/s; in the other the forward follow chased a 1.5 s endpoint excursion of +8..+14 m during the braking onset and moved the point 4 m with no way back above 3 m/s. `FOLLOW_CONFIRM_S` (1 s of evidence past the deadband, drained only by contrary frames) now gates the forward follow at any speed and the follow-down above `DOWN_SPEED`; below it the follow-down stays immediate. Open-loop replay puts both committed points back at the good stops' placement (−3.0 / −2.8 m vs +0.8 / +2.5 before); route 25's stuttering drift extends 0.9 m less. Field test pending.
+
 **2026-09-02 — D29, the pursuit tail.** Braking for a truck that then drove off (route 0x3b t=390–405), the supervisor's low jerk cost switched off at the plan's zero crossing, exactly where the MPC had to swing to acceleration; it now stays for 3 s after excess braking behind a lead that is accelerating away. Replay on that event and the supervisor tests gate it; awaiting the owner's drive.
 
 - Phase 0 (2026-08-29): branch cut from `stock` `511f2b60b4`; `docs/BLoTv3.md` added; the
