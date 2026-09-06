@@ -37,10 +37,15 @@ STOP_POSITION_HOLD_S = 4.0
 EXTEND_RATE = 3.0         # m/s, the latched point may follow the model's endpoint forward this fast: the latch trips
                           # mid-collapse of the path, and a frozen target would park the car short of the real line
 EXTEND_DEADBAND = 2.0
-DOWN_SPEED = 3.0          # m/s, below this the latched point also follows the endpoint down (route 38 t=351:
-                          # a stale latch must not roll into the crosswalk); above it the latch is immune to collapse
+DOWN_SPEED = 3.0          # m/s, below this the latched point follows the endpoint down at once (route 38 t=351:
+                          # a stale latch must not roll into the crosswalk)
 DOWN_RATE = 2.0
 DOWN_DEADBAND = 1.0
+FOLLOW_CONFIRM_S = 1.0    # s, net evidence before the point follows the endpoint forward at any speed, or down above DOWN_SPEED:
+                          # a count of frames with the endpoint past the deadband that only contrary frames drain, so a
+                          # stuttering drift (route 25) still counts. Route 0x59 t=609: a 1.5 s excursion of +8..+14 m during the braking onset extended the point
+                          # 4 m and nothing could bring it back above 3 m/s; route 0x58 t=548: the commit took the first strict
+                          # frames' endpoint, 5.8 m long, and the settled point sat 5 m short for 7 s while the follow-down waited
 QUALIFY_S = 0.3           # s of consistent strict, lead-free stop evidence on a world-fixed endpoint that commits before the
                           # classic window (was 1.0: the model calls a red light only 4-5 s out, every 0.1 s is 1.4 m at 14 m/s)
 QUALIFY_WORLD_TOLERANCE = 5.0
@@ -109,6 +114,8 @@ class ForceStops:
     self.qualified_endpoint = None
     self.profile_accel = None
     self._open_frames = 0
+    self._extend_evidence = 0
+    self._down_evidence = 0
 
   def _profile(self, v_ego, a_ego):
     # constant deceleration to the landing, entered from the car's current acceleration and jerk-limited from there
@@ -252,13 +259,25 @@ class ForceStops:
     if self._open_frames >= RELEASE_OPEN_FRAMES:
       self.reset()
       return ForceStopsResult()
-    if (self.remaining > 0.0 and detected and self.detect_filter.x >= LATCH_THRESHOLD
-        and committed_length > self.remaining + EXTEND_DEADBAND):
-      # the latched point follows an endpoint that keeps sitting beyond it while the model still calls the stop; it
-      # is not gated on the latch window any more -- a slow forward drift of a far endpoint left a commitment 3 m
-      # short and the car heading for a stop ~10 m before the line (route 25 t=1547, field test 3)
+    # the latched point follows an endpoint that keeps sitting beyond it while the model still calls the stop; it is not
+    # gated on the latch window -- a slow forward drift of a far endpoint left a commitment 3 m short and the car heading
+    # for a stop ~10 m before the line (route 25 t=1547, field test 3). Either direction needs FOLLOW_CONFIRM_S of net
+    # evidence first, except the follow-down below DOWN_SPEED, which stays immediate
+    if just_committed:
+      self._extend_evidence = 0
+      self._down_evidence = 0
+    confirm_frames = round(FOLLOW_CONFIRM_S / self.dt)
+    beyond = (self.remaining > 0.0 and detected and self.detect_filter.x >= LATCH_THRESHOLD
+              and committed_length > self.remaining + EXTEND_DEADBAND)
+    short = self.remaining > 0.0 and committed_length < self.remaining - DOWN_DEADBAND
+    # only contrary evidence drains a count: frames inside the deadband neither confirm nor deny
+    self._extend_evidence = (min(self._extend_evidence + 1, confirm_frames) if beyond
+                             else max(self._extend_evidence - 1, 0) if committed_length < self.remaining else self._extend_evidence)
+    self._down_evidence = (min(self._down_evidence + 1, confirm_frames) if short
+                           else max(self._down_evidence - 1, 0) if committed_length > self.remaining else self._down_evidence)
+    if beyond and self._extend_evidence >= confirm_frames:
       self.remaining = min(self.remaining + EXTEND_RATE * self.dt, committed_length)
-    if self.remaining > 0.0 and v_ego < DOWN_SPEED and committed_length < self.remaining - DOWN_DEADBAND:
+    if short and (v_ego < DOWN_SPEED or self._down_evidence >= confirm_frames):
       self.remaining = max(self.remaining - DOWN_RATE * self.dt, committed_length)
     if self.detect_filter.x < RELEASE_THRESHOLD and self.position_hold_remaining <= 0.0:
       self.forcing = False

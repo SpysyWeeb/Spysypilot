@@ -3,7 +3,8 @@ import math
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DV_MAX, ForceStops, GAS_OVERRIDE_S,
+from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DOWN_RATE, DV_MAX, EXTEND_RATE, FOLLOW_CONFIRM_S,
+                                                           ForceStops, GAS_OVERRIDE_S,
                                                            LATCH_SETBACK, MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK,
                                                            PROFILE_LANDING, PROFILE_MAX_DECEL, PROFILE_MIN_TIME, QUALIFY_S, REARM_S,
                                                            RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH)
@@ -149,23 +150,71 @@ class TestMovingReleases:
     assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is not None
     assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is None
 
-  def test_latched_point_follows_the_model_forward_and_down_at_bounded_rates(self):
+  def test_latched_point_follows_the_model_forward_after_the_confirmation_and_down_at_once_below_walking_pace(self):
     fs, _ = committed(path_end=20.0)
     before = fs.remaining
-    fs.update(obs(path_end=30.0), car_state(10.0), True, True, True)
-    assert math.isclose(fs.remaining, before - 10.0 * DT_MDL + 3.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    fs.remaining, fs._extend_evidence = 40.0, 0   # the car sits still in this test; the endpoint stays 12 m beyond the point
+    run(fs, FOLLOW_CONFIRM_S - DT_MDL, obs(path_end=55.0), car_state(0.0))
+    assert math.isclose(fs.remaining, 40.0, abs_tol=1e-9)
+    fs.update(obs(path_end=55.0), car_state(0.0), True, True, True)   # the frame that completes the confirmation follows
+    assert math.isclose(fs.remaining, 40.0 + EXTEND_RATE * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
     fs.remaining = 12.0
     fs.update(obs(path_end=8.0), car_state(2.0), True, True, True)
-    assert math.isclose(fs.remaining, 12.0 - 2.0 * DT_MDL - 2.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    assert math.isclose(fs.remaining, 12.0 - 2.0 * DT_MDL - DOWN_RATE * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    del before
 
   def test_the_latched_point_follows_a_far_drifting_endpoint_while_the_model_still_calls_the_stop(self):
     fs, _ = committed(path_end=20.0)
+    fs.remaining, fs._extend_evidence = 40.0, 0
+    run(fs, FOLLOW_CONFIRM_S - DT_MDL, obs(path_end=60.0), car_state(0.0))   # beyond the latch window, still a stop: confirmed
+    fs.update(obs(path_end=60.0), car_state(0.0), True, True, True)
+    assert math.isclose(fs.remaining, 40.0 + EXTEND_RATE * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
     before = fs.remaining
-    fs.update(obs(path_end=60.0), car_state(10.0), True, True, True)   # 6 s out: beyond the latch window, still a stop
-    assert math.isclose(fs.remaining, before - 10.0 * DT_MDL + 3.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    fs.update(obs(path_end=60.0, should_stop=False, braking=False), car_state(0.0), True, True, True)   # a green: no stop call, no extension
+    assert math.isclose(fs.remaining, before, abs_tol=1e-9)
+
+
+def _follow(fs, seconds, offset, v_ego, pattern=None):
+  # drives a moving commitment with the model's endpoint `offset` m from the committed point (a callable gives the offset per
+  # frame); returns how far the point moved on its own, odometer removed
+  moved = 0.0
+  for i in range(frames(seconds)):
+    off = offset(i) if callable(offset) else offset
     before = fs.remaining
-    fs.update(obs(path_end=60.0, should_stop=False, braking=False), car_state(10.0), True, True, True)   # a green: no stop call, no extension
-    assert math.isclose(fs.remaining, before - 10.0 * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    fs.update(obs(path_end=fs.remaining + LATCH_SETBACK + off, strict=True), car_state(v_ego), True, True, True)
+    moved += fs.remaining - (before - v_ego * DT_MDL)
+  return moved
+
+
+class TestFollowConfirmation:
+  # route 0x59 t=609 and 0x58 t=548 (2026-09-06): both stops ended 3-4 m past the model's settled endpoint. One followed a
+  # 1.5 s endpoint excursion forward by 4 m, the other committed on a 5.8 m long first reading; neither could follow back
+  # down above 3 m/s. The good stops of the day rest ~1.7 m before the settled endpoint
+
+  def test_a_short_excursion_beyond_the_point_barely_moves_it(self):
+    fs, _ = commit_on_strict_evidence(20.0, 90.0)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 20.0), 0.0, abs_tol=1e-9)   # the detector settles on the committed point
+    moved = _follow(fs, 1.5, 12.0, 20.0)
+    assert EXTEND_RATE * 0.4 <= moved <= EXTEND_RATE * 0.6   # 1.5 s of excursion, 1 s of it spent confirming (was 4.5 m)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 20.0), 0.0, abs_tol=1e-9)
+
+  def test_a_stuttering_drift_beyond_the_point_still_extends(self):
+    # route 25 t=1547: the excess sat beyond the deadband in 0.45 s runs with 0.1 s dips between them
+    fs, _ = commit_on_strict_evidence(8.0, 70.0)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 8.0), 0.0, abs_tol=1e-9)
+    moved = _follow(fs, 3.0, lambda i: 5.0 if (i % 11) < 9 else 1.0, 8.0)
+    assert moved >= 3.0   # the dips sit inside the deadband and do not drain the count
+
+  def test_a_sustained_nearer_endpoint_pulls_the_point_in_at_speed(self):
+    fs, _ = commit_on_strict_evidence(10.0, 70.0)
+    assert math.isclose(_follow(fs, FOLLOW_CONFIRM_S - DT_MDL, -6.0, 10.0), 0.0, abs_tol=1e-9)   # nothing yet
+    moved = _follow(fs, 3.5, -6.0, 10.0)
+    assert moved <= -5.9 and fs.remaining > 0.0   # converged onto the model's point at DOWN_RATE, well before the landing
+
+  def test_a_brief_nearer_dip_at_speed_leaves_the_point_alone(self):
+    fs, _ = commit_on_strict_evidence(10.0, 70.0)
+    assert math.isclose(_follow(fs, 0.6, -6.0, 10.0), 0.0, abs_tol=1e-9)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 10.0), 0.0, abs_tol=1e-9)
 
 
 class TestHold:
