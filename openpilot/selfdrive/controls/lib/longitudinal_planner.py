@@ -178,7 +178,13 @@ class LongitudinalPlanner:
       self.lead_departure.reset()
       self.stop_landing.reset()
       self.holding_prev = False
+      # the whole launch state, not just its edge memory: clearing anticipating_prev alone left `anticipating` set
+      # from before the reset, so the next frame read as a fresh green-light opening and fired a launch edge that
+      # tore down the landing law. Re-engaging at a light with an open path is exactly that case
+      self.anticipating = False
       self.anticipating_prev = False
+      self.launch_armed = False
+      self.launch_open.x = 0.0
 
     # the curve policy forgets only on a real disengagement, not on a driver's gas override (route 0x3a t=329: a level-
     # triggered reset wiped its regime and hold every frame of a 3.9 s override while the steering was still pinned in the bend)

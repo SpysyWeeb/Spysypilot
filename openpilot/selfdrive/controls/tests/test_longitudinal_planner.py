@@ -117,6 +117,41 @@ class TestCruiseComfort:
     assert math.isclose(settled_cruise_accel(v_cruise, v_ego), (legacy + full) / 2.0, rel_tol=1e-6, abs_tol=1e-9)
 
 
+class TestResetClearsTheLaunchState:
+  # a reset cleared anticipating_prev but not anticipating, so the frame after a re-engage at an open light read as a
+  # fresh green-light opening and fired the launch edge that releases the landing law (2026-09-06)
+  def _planner(self):
+    planner = LongitudinalPlanner(CP, init_v=0.0)
+    planner.anticipating = True
+    planner.anticipating_prev = True
+    planner.launch_armed = True
+    planner.launch_open.x = 1.0
+    return planner
+
+  def test_a_reset_clears_the_whole_launch_state_not_just_its_edge_memory(self):
+    plant = Plant(speed=0.0, distance_lead=200.0, lead_relevancy=False, enabled=False)
+    plant.planner = self._planner()
+    plant.step(v_cruise=50.0)
+    assert not plant.planner.anticipating
+    assert not plant.planner.anticipating_prev
+    assert plant.planner.launch_open.x == 0.0
+
+  def test_a_reset_while_rolling_below_the_disarm_speed_also_disarms_the_launch(self):
+    # launch_armed is sticky between standstill and LAUNCH_DISARM_SPEED, so a reset in that band has to clear it;
+    # at a standstill it is re-armed on the same frame by design
+    plant = Plant(speed=1.0, distance_lead=200.0, lead_relevancy=False, enabled=False)
+    plant.planner = self._planner()
+    plant.step(v_cruise=50.0)
+    assert not plant.planner.launch_armed
+
+  def test_a_reset_does_not_fire_a_launch_edge(self):
+    # the edge is `anticipating and not anticipating_prev`; with both cleared together it cannot fire on the next frame
+    plant = Plant(speed=0.0, distance_lead=200.0, lead_relevancy=False, enabled=False)
+    plant.planner = self._planner()
+    plant.step(v_cruise=50.0)
+    assert not (plant.planner.anticipating and not plant.planner.anticipating_prev)
+
+
 class TestPlannerCruise:
   def run_plant(self, seconds, **kwargs):
     plant = Plant(**kwargs)
