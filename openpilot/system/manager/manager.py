@@ -210,7 +210,7 @@ def main() -> None:
       manager_thread(boot_spinner)  # closes boot_spinner internally when UI is live
     except Exception:
       traceback.print_exc()
-      sentry.capture_exception()
+      cloudlog.exception("crash")
     finally:
       manager_cleanup()
   finally:
