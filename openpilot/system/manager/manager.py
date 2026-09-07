@@ -8,7 +8,6 @@ import traceback
 
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
-import openpilot.system.sentry as sentry
 from openpilot.common.utils import atomic_write
 from openpilot.common.params import Params, ParamKeyFlag
 from openpilot.common.spinner import Spinner
@@ -20,6 +19,7 @@ from openpilot.system.manager.process_config import managed_processes
 from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.common.version import get_build_metadata
+from openpilot.system.sentry import capture_exception
 from openpilot.common.hardware.hw import Paths
 
 
@@ -83,7 +83,6 @@ def manager_init(boot_spinner: Spinner | None = None) -> None:
     os.environ['CLEAN'] = '1'
 
   # init logging
-  sentry.init(sentry.SentryProject.SELFDRIVE)
   cloudlog.bind_global(dongle_id=dongle_id,
                        version=build_metadata.openpilot.version,
                        origin=build_metadata.openpilot.git_normalized_origin,
@@ -210,7 +209,7 @@ def main() -> None:
       manager_thread(boot_spinner)  # closes boot_spinner internally when UI is live
     except Exception:
       traceback.print_exc()
-      cloudlog.exception("crash")
+      capture_exception()
     finally:
       manager_cleanup()
   finally:
