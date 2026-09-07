@@ -9,6 +9,10 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   A_CURVE_MIN,
   A_LAT_COMFORT,
   AUTHORITY_BOUNDS,
+  AUTHORITY_HELD_LATERAL,
+  AUTHORITY_HELD_SPEED,
+  authority_margin,
+  held_lateral,
   BRAKE_ENTER_S,
   COAST_ENTER_S,
   COAST_EXIT_S,
@@ -87,6 +91,54 @@ class TestSpeedLimits(unittest.TestCase):
     limits = curve_speed_limits(kappa, TORQUE, roll=0.05)
     self.assertGreater(limits[0], limits[1])                                 # roll bias adds authority in one direction
     self.assertTrue(math.isinf(limits[2]))
+
+
+class TestDemonstratedHold(unittest.TestCase):
+  # route 0x5b, the owner's sweeper: the car held 2.28 m/s^2 of lateral at 0.70 rack torque, above the 2.13 the torque model
+  # says the FULL 0.90 budget could buy. The model extrapolates a slope the car saturates out of, so what the rack has been
+  # measured holding inside the budget is a floor under the price, not a ceiling on it
+
+  def test_the_floor_only_ever_raises_the_torque_model(self):
+    model_margin = (TORQUE_BUDGET - FRICTION) * FACTOR
+    self.assertAlmostEqual(authority_margin(FACTOR, FRICTION, 0.0), model_margin)
+    self.assertAlmostEqual(authority_margin(FACTOR, FRICTION, model_margin - 1.0), model_margin)   # a lower hold never lowers it
+    self.assertAlmostEqual(authority_margin(FACTOR, FRICTION, model_margin + 1.0), model_margin + 1.0)
+
+  def test_the_floor_is_a_highway_statement_and_town_keeps_the_torque_model(self):
+    # every one of route 0x5b's at-budget frames was under 20 m/s: in town the rack genuinely pins and the term is honest
+    self.assertEqual(held_lateral(0.0), 0.0)
+    self.assertEqual(held_lateral(AUTHORITY_HELD_SPEED[0]), 0.0)
+    self.assertAlmostEqual(held_lateral(AUTHORITY_HELD_SPEED[1]), AUTHORITY_HELD_LATERAL)
+    self.assertAlmostEqual(held_lateral(35.0), AUTHORITY_HELD_LATERAL)
+    mid = held_lateral(sum(AUTHORITY_HELD_SPEED) / 2.0)                       # blended, so the cap has no step at the edge
+    self.assertGreater(mid, 0.0)
+    self.assertLess(mid, AUTHORITY_HELD_LATERAL)
+
+  def test_a_highway_bend_is_priced_higher_than_the_same_bend_in_town(self):
+    kappa = np.array([0.005])
+    town = float(curve_speed_limits(kappa, TORQUE, 0.0, True, held_lateral(10.0))[0])
+    highway = float(curve_speed_limits(kappa, TORQUE, 0.0, True, held_lateral(25.0))[0])
+    self.assertAlmostEqual(town, math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / 0.005))
+    self.assertAlmostEqual(highway, math.sqrt(AUTHORITY_HELD_LATERAL / 0.005))
+    self.assertGreater(highway, town)
+    # the owner's sweeper, priced at his own ask: about 5 mph more through it
+    self.assertGreater(highway - town, 1.5)
+
+  def test_comfort_is_still_the_ceiling_over_the_floor(self):
+    kappa = np.array([0.05])
+    self.assertLess(AUTHORITY_HELD_LATERAL, A_LAT_COMFORT)
+    limit = float(curve_speed_limits(kappa, TORQUE, 0.0, True, held_lateral(30.0))[0])
+    self.assertAlmostEqual(limit, math.sqrt(AUTHORITY_HELD_LATERAL / 0.05))
+    # and a learned authority above comfort still hands the ceiling back to comfort
+    strong = (AUTHORITY_BOUNDS[1] * FACTOR, 0.0, FRICTION)
+    self.assertAlmostEqual(float(curve_speed_limits(kappa, strong, 0.0, True, held_lateral(30.0))[0]),
+                           math.sqrt(A_LAT_COMFORT / 0.05))
+
+  def test_the_floor_does_not_touch_the_measured_authority_factor(self):
+    # the reported factor stays a measurement of the torque ratio; the floor is a statement about the budget, not the ratio
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    result = settle(limiter, make_model(25.0), 20, v_ego=25.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
+    self.assertAlmostEqual(result.authority_factor, FACTOR)
 
 
 class TestAnticipation(unittest.TestCase):
@@ -437,6 +489,21 @@ class TestHold(unittest.TestCase):
     result = settle(limiter, bend, 4, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=0.3, lat=0.5))
     self.assertFalse(result.holding)
     self.assertGreater(result.a_target, 0.0)                                  # the anticipation's own candidate is back
+
+  def test_the_hold_releases_where_the_owner_goes_back_to_power(self):
+    # his six clean accelerate-out onsets sit at 1.13-2.26 m/s^2 of lateral; the policy used to wait for under 1.0
+    limiter, bend, _ = self._lifted()
+    opening = tracking(torque=0.3, lat=(BEND_OPEN_A_LAT + 1.0) / 2.0)         # 1.25: he is already on the throttle here
+    result = settle(limiter, bend, round(BEND_OPEN_S / DT_MDL) + 4, v_ego=15.0, lateral_active=True, lateral_state=opening)
+    self.assertFalse(result.holding)
+    self.assertGreater(result.a_target, 0.0)
+
+  def test_a_bend_still_at_the_owners_own_cornering_level_still_holds(self):
+    limiter, bend, _ = self._lifted()
+    cornering = tracking(torque=0.5, error=0.35, lat=BEND_OPEN_A_LAT + 0.5)
+    result = settle(limiter, bend, round(HOLD_MAX_S / DT_MDL) - 20, v_ego=15.0, lateral_active=True, lateral_state=cornering)
+    self.assertTrue(result.holding)
+    self.assertLessEqual(result.a_target, 1e-9)
 
   def test_the_hold_times_out_on_a_bend_that_never_reads_open(self):
     limiter, bend, _ = self._lifted()
