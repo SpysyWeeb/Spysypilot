@@ -170,3 +170,48 @@ heavy on every upswing (the first coast 4 s early and a third more curve-bound f
 ruling forbids.
 
 The model's far-curvature under-read is the remaining gap (R 315 m shown at 170 m and 283 m at 58 m for a 220 m bend).
+
+## 2026-09-07 — the cap was always the torque model, and the torque model was wrong
+
+Route 0x5b, the owner: "it feels like it's starting to get sloppy… braking too harshly for a curve I know it can
+handle fine", and "it takes too long to start accelerating when a curve comes to an end".
+
+**The comfort limit has never bound.** Both terms scale as `sqrt(x / kappa)`, so `min(comfort, authority)` reduces to
+whichever constant is smaller: authority wins whenever `margin + bias < A_LAT_COMFORT`. The deployed margin is
+`(0.90 − 0.114) × 2.63 = 2.07` against a comfort limit of 3.4, so comfort could only win on a road banked past ~7.8°
+(this route peaks at 5.9°). Measured: authority bound on 2265 of 2265 active frames.
+
+**And 2.07 is falsified by the car.** On the owner's own sweeper (t=2655–2675) the rack held 2.28 m/s² of lateral at
+0.70 torque — more than the model claims the *full* budget could buy, at 78 % of it. Across 7 routes and 204k steering
+frames, settled and tracking with the driver off the wheel, the rack held 2.86 m/s² at 0.64 torque (20–25 m/s) and 3.03
+at 0.68 (25–30 m/s); 686 frames held more than 2.07 with torque still under 0.75. The ratio saturates — 8.8 at 0.20–0.35
+torque down to 3.1 at 0.80–1.01 — so extrapolating the tuning's slope out to 0.90 under-prices the corner by ~40 %.
+More torque cannot buy less lateral in steady state, so the budget holds at least what has already been held.
+
+`AUTHORITY_HELD_LATERAL` 2.5 m/s² is that floor, blended in over `AUTHORITY_HELD_SPEED` 15→20 m/s so the cap has no
+step. It never lowers the model, and comfort remains the ceiling above both — including for a learned authority, which
+can now reach comfort where before it could not. Below the blend nothing changes: every one of this route's 534
+at-budget frames was under 20 m/s and 18 of 43 curve episodes that peaked at the budget were town corners. The rack
+genuinely pins in town; it does not up here.
+
+The harsh entry was the same defect. A low cap forces a large required deceleration, which `A_CURVE_MIN` then clips:
+38 frames sat on the −2.0 floor. Open-loop replay of t=2644–2690 with the floor in: the sustained cap rises from
+~22.0 to ~24.1 m/s (+4.7 mph, the owner asked for about 5) and the deepest request is −1.39, so the floor is never
+reached.
+
+**The hold released nowhere near where he does.** Over 70 holds on three routes it released at a median measured
+lateral of 0.28 m/s² and never once above 0.88. His own six clean accelerate-out onsets are 1.13, 1.22, 1.48, 1.71,
+1.75 and 2.26 (median 1.59) — the policy was about five times more conservative than his foot. `BEND_OPEN_A_LAT` 1.0 →
+1.5 sits above his minimum and below his median. `BEND_OPEN_S` 1.0 → 0.5: all six observed holds released exactly one
+frame after the dwell elapsed, so it was a flat tax on every exit; it must not reach zero, since it is what stops a
+bend whose lateral dips mid-corner from chattering (route 0x33). Measured ceiling: 1.8 releases this route's t=2660
+hold while the car is still in the bend. Hold time on 0x5b falls 113.6 → 59.2 s, on 0x58 45.8 → 15.6 s.
+
+Order matters: at the old budget the hold clamped a candidate that wanted to accelerate for only 7.3 s of this event's
+21.9 s hold, because the cap itself was binding. Both changes together, or the budget change is masked.
+
+Not a curve defect, found alongside: there was no overshoot anywhere on this route (0 of 875 live-candidate frames ran
+past the priced cap, peak engaged lateral 2.47 against comfort 3.4). What reads as "not braking soon enough" is a late,
+harsh catch caused by the model's far-curvature under-read — 0.72 of truth at 180–200 m, 0.60 at 200–220, and 36 % of
+curved road beyond 150 m reported straight. Still the remaining gap. Separately, once the policy lets go the plan rides
+`get_max_accel_request` frame-exact, so a slow pick-up after the hold is fixed is the cruise envelope, not this policy.

@@ -44,6 +44,18 @@ AUTHORITY_MIN_LATERAL = 1.0   # m/s^2, ... in a real corner (the friction term d
 AUTHORITY_MIN_SPEED = 10.0    # m/s, ... at a speed where the assist resembles the highway's: town corners at 5-8 m/s
                               # dragged the factor to 0.9x the tuning and a bend 300 s later was braked for (route 0x4c)
 AUTHORITY_BOUNDS = (0.8, 1.8) # times the torque tuning's own factor
+AUTHORITY_HELD_LATERAL = 2.5  # m/s^2, the lateral acceleration the rack is known to hold INSIDE the budget at highway speed,
+                              # and therefore a floor under what the budget may be priced at. `margin` below asserts that
+                              # lateral acceleration is linear in torque and extrapolates the tuning's slope out to the
+                              # budget; the car measurably saturates instead (the ratio falls from 8.8 at 0.20-0.35 torque
+                              # to 3.1 at 0.80-1.01), so the extrapolation under-prices the corner by ~40 % up here. Measured
+                              # over 7 routes / 204k steering frames: settled, tracking, driver off the wheel, the rack held
+                              # 2.86 at 0.64 torque (20-25 m/s) and 3.03 at 0.68 (25-30 m/s), and 686 frames held more than
+                              # the deployed 2.07 with torque still under 0.75. More torque cannot buy less lateral in steady
+                              # state, so 0.90 holds at least that. 2.5 keeps a reserve under the demonstrated 2.86
+AUTHORITY_HELD_SPEED = (15.0, 20.0)  # m/s, the floor blends in over this range. Below it the term is honest and stays: every
+                              # one of route 5b's 534 at-budget frames was under 20 m/s, and 18 of 43 curve episodes that
+                              # peaked at the budget were town corners. The rack genuinely pins in town; it does not up here
 FAR_NODE_DECEL_MAX = 1.0      # m/s^2, the most a node beyond the roll horizon may ask for when its shortfall is one a bank could
                               # explain: the bank there is unknown, and a banked sweeper read without it is 10-15 % too slow
                               # (route 0x4d: the far limit 20.7 for a bend the rack held at 24, the candidate at the -2.0 floor
@@ -84,8 +96,16 @@ CURVE_GAS_GRACE_S = 5.0       # s after a driver gas override in which the antic
 # wanted to accelerate, and that candidate drove the car back into heavy steering: route 0x33 t=2524-2544, seven lifts in
 # one 20 s bend, the request a square wave between +0.75 and the coast. Once the steering has said the curve is at its
 # limit, the candidate holds zero for the rest of the bend instead
-BEND_OPEN_A_LAT = 1.0         # m/s^2, measured lateral acceleration below which the bend has ended ...
-BEND_OPEN_S = 1.0             # s, ... for this long: the crossover of an S does not release the hold
+BEND_OPEN_A_LAT = 1.5         # m/s^2, measured lateral acceleration below which the bend has ended ...
+BEND_OPEN_S = 0.5             # s, ... for this long: the crossover of an S does not release the hold.
+                              # Set from the owner's own foot rather than from taste: over six clean accelerate-out onsets
+                              # he goes back to power at 1.13, 1.22, 1.48, 1.71, 1.75 and 2.26 m/s^2 (median 1.59), while
+                              # the policy over 70 holds released at a median of 0.28 and never once above 0.88 -- about
+                              # five times more conservative than he is. 1.5 sits above his minimum and below his median.
+                              # The dwell was a flat tax: all six observed holds released exactly one frame after it
+                              # elapsed. It must not go to zero, since it is what stops a bend whose lateral dips mid-corner
+                              # from chattering (route 0x33). Measured ceiling above: 1.8 releases route 0x5b's t=2660 hold
+                              # while the car is still in the bend
 HOLD_MAX_S = 30.0             # s, the hold ends regardless. A backstop, not a release path: the open test reads the live
                               # measurement whenever the hold clamps, so it cannot be fooled by a frozen reading; a bend
                               # longer than this is held at the lifted speed for the rest of it (route 0x33's is 20 s)
@@ -156,7 +176,18 @@ def _torque_values(params):
   return values if np.all(np.isfinite(values)) and values[0] > 0.0 and 0.0 <= values[2] < TORQUE_BUDGET else None
 
 
-def curve_speed_limits(signed_curvature, torque_params, roll, lateral_active=True):
+def held_lateral(v_ego):
+  """The demonstrated lateral hold that applies at this speed, blended in so the cap has no step at the boundary."""
+  return float(np.interp(v_ego, AUTHORITY_HELD_SPEED, (0.0, AUTHORITY_HELD_LATERAL)))
+
+
+def authority_margin(factor, friction, held=0.0):
+  """Lateral acceleration the steering budget can hold: the torque model, floored by what the rack has been measured
+  holding inside that same budget. The floor never lowers the model, and comfort remains the ceiling above both."""
+  return max((TORQUE_BUDGET - friction) * factor, held)
+
+
+def curve_speed_limits(signed_curvature, torque_params, roll, lateral_active=True, held=0.0):
   """Per-node speed limits: the lower of the steering authority at the torque budget and the comfort lateral acceleration.
 
   torque_params is (lateral acceleration per unit torque, offset, friction); the authority applies only while openpilot steers.
@@ -167,7 +198,7 @@ def curve_speed_limits(signed_curvature, torque_params, roll, lateral_active=Tru
     return comfort
   factor, offset, friction = torque_params
   bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
-  margin = (TORQUE_BUDGET - friction) * factor
+  margin = authority_margin(factor, friction, held)
   available = np.sign(signed_curvature) * margin + bias          # lateral acceleration the budget can hold in this direction
   authority_sq = np.divide(available, signed_curvature, out=np.full_like(signed_curvature, np.inf),
                            where=curvature >= MIN_CURVATURE)
@@ -246,7 +277,7 @@ class ModelCurveSpeedLimiter:
     path_distance = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(position_x), np.diff(position_y)))))
     signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
     near = path_distance <= v_ego * ROLL_HORIZON_S
-    limits = curve_speed_limits(signed_curvature, params, np.where(near, roll, 0.0), lateral_active)
+    limits = curve_speed_limits(signed_curvature, params, np.where(near, roll, 0.0), lateral_active, held_lateral(v_ego))
 
     # per node, the less demanding of the kinematic acceleration that meets its limit at its distance and a proportional
     # approach: far limits are kinematic, near or reached ones proportional, and the two meet continuously. Small and
@@ -307,7 +338,8 @@ class ModelCurveSpeedLimiter:
       if params is not None:
         factor, offset, friction = params
         turn = math.copysign(1.0, state.desired_lateral_accel) if state.desired_lateral_accel != 0.0 else 1.0
-        a_lat_ok = max((TORQUE_BUDGET - friction) * factor + turn * (roll * ACCELERATION_DUE_TO_GRAVITY + offset), 0.5)
+        a_lat_ok = max(authority_margin(factor, friction, held_lateral(v_ego))
+                       + turn * (roll * ACCELERATION_DUE_TO_GRAVITY + offset), 0.5)
       else:
         a_lat_ok = A_LAT_COMFORT
       v_ok = math.sqrt(a_lat_ok / max(curvature_now, MIN_CURVATURE))
