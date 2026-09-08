@@ -31,6 +31,7 @@ jobs:
           - BLoTv3
           - curve-speed-limit
           - fan-control
+          - params-clear-pandad-keys
           - params-clear-pandad-keys-at-offroad
           - spinning-steering-wheel
           - torque-bar
