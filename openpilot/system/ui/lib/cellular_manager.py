@@ -6,7 +6,6 @@ from dataclasses import replace
 from openpilot.common.hardware import HARDWARE
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.esim.base import LPABase, Profile
-from openpilot.common.esim.esim import execute_and_process_notifications
 
 
 class CellularManager:
@@ -138,7 +137,7 @@ class CellularManager:
 
   def switch_profile(self, iccid: str):
     def switch(lpa: LPABase):
-      execute_and_process_notifications(lpa, lambda: lpa.switch_profile(iccid))
+      lpa.switch_profile(iccid)
 
     # optimistic: list_profiles() can briefly return stale enabled state after a switch
     self._set_profiles([replace(p, enabled=(p.iccid == iccid)) for p in self._profiles])
