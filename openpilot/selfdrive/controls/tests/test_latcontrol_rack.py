@@ -31,6 +31,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   HORIZON_OFFSETS_S,
   HORIZON_POSITION_TOLERANCE_DEG,
   HORIZON_S,
+  HORIZON_STEP_S,
   horizon_candidate_preserves_immediate_path,
   horizon_desired_acceleration,
   JerkLimitedRackPlanner,
@@ -47,6 +48,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   RackTrajectoryController,
   model_path_targets,
   PREVIEW_ADMIT_DEVIATION_M,
+  PREVIEW_MAX_DISTANCE_M,
   PREVIEW_LENGTHEN_UPDATES,
   PreviewScheduler,
   REFERENCE_FILTER_TRAIL_MAX_DEG,
@@ -861,13 +863,18 @@ class TestLatControlRack(OpenpilotTestCase):
     turning = self._scheduler_targets([0.0, 0.0, 0.0002, 0.0002, 0.001, 0.001, 0.001, 0.001, 0.001], 20.0)
     scheduler = PreviewScheduler()
     assert scheduler._admissible(model, 0.5, turning, tuple(t.angle_deg for t in turning)) == 3
-    # a far target that swings between model frames more than the near one is not admitted
+    # a far target that re-plans between model frames more than the near one is not admitted. the
+    # tolerance is a lateral acceleration shaped by the look-ahead, so at 20 m/s the .5 s step allows
+    # .15 / 20**2 * sqrt(.5 / 2) = 1.88e-4 1/m: 2.1e-4 breaks it while staying inside the 1 deg
+    # heading gate (.86 deg) and the .15 m clothoid gate (.004 m), so this is the gate under test.
     steady = self._scheduler_targets([0.0] * 9, 20.0)
     flicker = list(steady)
-    flicker[6] = PathTarget(0.0, 20.0, 1.5, 0.0)
+    flicker[2] = self._scheduler_targets([2.1e-4], 20.0)[0]
     scheduler = PreviewScheduler()
     scheduler.update(model, 1, 0.5, steady, False)
-    assert scheduler._admissible(model, 0.5, tuple(flicker), tuple(t.angle_deg for t in flicker)) == 5
+    assert scheduler._admissible(model, 0.5, tuple(flicker), tuple(t.angle_deg for t in flicker)) == 1
+    # with no previous frame to compare against, the same targets pass every other gate
+    assert PreviewScheduler()._admissible(model, 0.5, tuple(flicker), tuple(t.angle_deg for t in flicker)) == 8
     # 40 m of preview at 35 m/s is 1.14 s
     fast = horizon_model(times, [0.0] * 7, [35.0] * 7)
     assert PreviewScheduler()._admissible(fast, 0.5, steady, tuple(t.angle_deg for t in steady)) == 4
@@ -885,6 +892,105 @@ class TestLatControlRack(OpenpilotTestCase):
     holed = horizon_model(times, [0.0] * 7, [20.0] * 7)
     holed.position.yStd = [0.0, 0.0, 0.0, math.nan, 0.0, 0.0, 0.0]
     assert PreviewScheduler()._admissible(holed, 0.5, steady, tuple(t.angle_deg for t in steady)) == 0
+
+  def test_preview_flicker_gate_admits_the_model_own_replan_noise_at_speed(self):
+    # the defect this gate's scaling fixes: at 31 m/s the model re-plans its own curvature preview by
+    # ~4e-5 1/m per model frame on a dead-straight road (route 5b, 2844-2938 s), which the v^2
+    # understeer term turns into .22 deg of wheel angle -- inside a fixed .25 deg tolerance, so the
+    # gate fired on its own noise and collapsed the preview 38 times a minute. in lateral
+    # acceleration that same re-plan is .04 m/s^2 against a 1.25 s floor of .15 * sqrt(1.25 / 2) = .12.
+    speed = 31.0
+    times = [i * 0.25 for i in range(13)]
+    model = horizon_model(times, [0.0] * 13, [speed] * 13)
+    steady = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), speed)
+    capped = 5  # 40 m at 31 m/s: the distance cap, and the deepest step any gate can admit here
+
+    def admitted_after(step, curvature):
+      curvatures = [0.0] * len(HORIZON_OFFSETS_S)
+      curvatures[step] = curvature
+      targets = list(steady)
+      targets[step] = self._scheduler_targets([curvature], speed)[0]
+      scheduler = PreviewScheduler()
+      scheduler.update(model, 1, 0.5, steady, False)
+      return scheduler._admissible(model, 0.5, tuple(targets), tuple(t.angle_deg for t in targets))
+
+    # 1.0e-4 1/m at the 1.25 s step is .096 m/s^2 of re-plan, under the floor: admitted to the cap.
+    # in wheel angle it is .56 deg, so the old fixed .25 deg tolerance rejected it and lost two steps.
+    assert admitted_after(capped, 1.0e-4) == capped
+    # 1.5e-4 at the 1.0 s step is .144 against a floor of .110: still rejected, and by this gate --
+    # its heading is .84 deg and its clothoid deviation .02 m, both well inside their own gates
+    assert admitted_after(4, 1.5e-4) == 3
+    fresh = list(steady)
+    fresh[4] = self._scheduler_targets([1.5e-4], speed)[0]
+    assert PreviewScheduler()._admissible(model, 0.5, tuple(fresh), tuple(t.angle_deg for t in fresh)) == capped
+
+  def test_preview_flicker_gate_still_collapses_a_far_plan_reversal_at_once(self):
+    # R5: the tolerance may only clear the model's own noise, never a real change of mind. a plan
+    # whose curvature ramps to a peak and then reverses sign in one model frame (FM1.3) must still
+    # empty the horizon in the two frames PREVIEW_SHORTEN_UPDATES allows, at highway speed where the
+    # floor is loosest and at the 40 mph of the island jog, where the shaped floor is what catches it.
+    for speed, peak in ((31.0, 2.4e-4), (17.8816, 5.625e-4)):
+      times = [i * 0.25 for i in range(13)]
+      model = horizon_model(times, [0.0] * 13, [speed] * 13)
+
+      def ramp(k, speed=speed):
+        return self._scheduler_targets([k * offset / HORIZON_S for offset in HORIZON_OFFSETS_S], speed)
+
+      scheduler = PreviewScheduler()
+      for frame in range(1, 30):  # a smooth, self-consistent buildup: the preview grows through it
+        scheduler.update(model, frame, 0.5, ramp(peak * min(1.0, frame / 12.0)), False)
+      grown = scheduler.index
+      assert grown >= 3
+
+      # the frame the plan reverses, the gate rejects it outright
+      reversed_targets = ramp(-peak)
+      assert scheduler._admissible(model, 0.5, reversed_targets, tuple(t.angle_deg for t in reversed_targets)) < grown
+      # a plan that keeps changing its mind (FM1.3) fails two frames running, and R3's timer empties
+      # the horizon at once rather than one step at a time
+      assert scheduler.update(model, 30, 0.5, reversed_targets, False) == grown  # one frame decides nothing
+      assert scheduler.update(model, 31, 0.5, ramp(peak), False) < grown  # the second one does
+
+  def test_preview_flicker_gate_leaves_the_preview_steady_under_replan_noise(self):
+    # R7: the served signal may not step frame to frame, and the preview is the only thing this gate
+    # can step. driven with the model's own measured re-plan noise (dk std 4e-5 * sqrt(offset / 2)
+    # 1/m at 31 m/s, quiet road, routes 5b and 54), the preview must climb to the distance cap and
+    # stay there -- the shipped fixed-angle tolerance sat at ~1 sigma of that noise and chattered.
+    speed = 31.0
+    times = [i * 0.25 for i in range(13)]
+    model = horizon_model(times, [0.0] * 13, [speed] * 13)
+    rng = np.random.default_rng(20260908)
+    sigma = [2.8e-5 * math.sqrt(offset / HORIZON_S) for offset in HORIZON_OFFSETS_S]
+    scheduler = PreviewScheduler()
+    levels = []
+    for frame in range(1, 400):
+      noisy = self._scheduler_targets([s * rng.standard_normal() for s in sigma], speed)
+      levels.append(scheduler.update(model, frame, 0.5, noisy, False))
+    assert max(levels) == 5  # the 40 m distance cap at 31 m/s
+    settled = levels[levels.index(5):]
+    assert set(settled) == {5}  # once earned it is never given back to noise
+
+  def test_preview_flicker_gate_does_not_step_the_preview_as_the_car_speeds_up(self):
+    # R7 on the threshold itself: it is now a smooth function of vEgo rather than a constant read
+    # through the car's v^2 understeer gain, so a car accelerating on an unchanging plan may not lose
+    # the preview as it goes faster. driven with a 4e-5 1/m far re-plan -- the model's own measured
+    # per-frame noise on a quiet road -- the admitted depth must be the 40 m distance cap at every
+    # speed, monotone and one step at a time. the shipped .25 deg tolerance crossed that noise at
+    # ~35 m/s (4e-5 * 6333 deg/(1/m) = .25) and emptied the horizon there instead.
+    replan = 4.0e-5
+    times = [i * 0.25 for i in range(13)]
+    previous = None
+    for tenths in range(201, 361):
+      speed = tenths / 10.0
+      model = horizon_model(times, [0.0] * 13, [speed] * 13)
+      steady = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), speed)
+      targets = self._scheduler_targets([0.0] + [replan] * (len(HORIZON_OFFSETS_S) - 1), speed)
+      scheduler = PreviewScheduler()
+      scheduler.update(model, 1, 0.5, steady, False)
+      admitted = scheduler._admissible(model, 0.5, targets, tuple(t.angle_deg for t in targets))
+      cap = min(len(HORIZON_OFFSETS_S) - 1, int(PREVIEW_MAX_DISTANCE_M / (HORIZON_STEP_S * speed)))
+      assert admitted == cap, f"{speed} m/s: admitted {admitted}, distance cap {cap}"
+      assert previous is None or 0 <= previous - admitted <= 1
+      previous = admitted
 
   def test_motion_limits_carry_the_scheduled_response_time_through_a_transition(self):
     controller = RackTrajectoryController()
