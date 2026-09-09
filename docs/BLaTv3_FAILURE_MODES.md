@@ -101,8 +101,8 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   step is admitted only if (a) the model's own path samples inside `[t_action, t_action + step]`
   lie within 0.15 m of the clothoid from the near to the far curvature (0.20 m to keep an
   admitted step), (b) the far wheel angle is within 1° of the near one (1.33° to keep), (c) the
-  path's `yStd` stays under 0.35 m (its p99 at 2 s on straight frames) and `confidence` is not red, (d) the far target's swing since
-  the previous model frame is no larger than the near target's plus 0.25° (FM1.18), and (e) the
+  path's `yStd` stays under 0.35 m (its p99 at 2 s on straight frames) and `confidence` is not red, (d) the far target's re-plan since
+  the previous model frame is no larger than the near target's plus the model's own replan noise (FM1.18), and (e) the
   preview covers at most 40 m at the plan's own speed (FM1.8). Hands on the wheel, a lane change
   starting or finishing, a limited immediate target or a measured curvature out of bounds pin the
   preview at the action time at once.*
@@ -310,6 +310,30 @@ red-team pass.
   *Phase 3 step 5: `envelope_scheduler` shares this exact gate (unconditionally, not gated by
   confidence), so a dithering far target moves neither its admitted depth nor the
   `required_rate` `_horizon_opened_profile` derives from it, for either sign of the dither.*
+  *Phase 3 step 8 (2026-09-08): the mechanism above was right and the constant was in the wrong
+  units. 0.25° is a wheel angle; the noise it must sit above is a lateral acceleration, so the same
+  v² understeer term this entry names put the threshold **inside** its own noise — 0.002 m/s² at
+  5 m/s and 0.054 at 36, against a measured quiet-road p99.9 of 0.12–0.16 m/s² flat from 8 to
+  41 m/s (routes 5b and 54, 71,764 model-frame pairs; the same statistic spans 3–5× in degrees and
+  6–11× in curvature over that range). The gate was therefore firing on the model's own replan
+  noise — 12 % of frame–index pairs, 18.5 % of frames — and, breaking at index 2–3, it owned 52 % of all preview
+  level changes and 73–75 % of the ≥3-step collapses on the flagged highway window. It is now
+  `PREVIEW_FLICKER_TOLERANCE_LATERAL_ACCEL / v²`, scaled along the horizon by
+  `(offset / HORIZON_S) ** PREVIEW_FLICKER_HORIZON_EXPONENT`: successive plans disagree like a
+  random walk along the look-ahead, and the measured quiet-road p99.9 as a fraction of its own 2 s
+  value is 0.29–0.47 at 0.25 s, 0.50–0.72 at 0.5 s and 0.70–0.98 at 1 s across three speed bands
+  on both routes, against √'s 0.35/0.50/0.71. **Why the shaping is not optional:** with a flat
+  floor the shallow steps sit ~3× looser than their own noise, and a far-plan sign reversal
+  (FM1.3) at 40 mph is then caught no earlier than the absolute heading gate catches it — the
+  island-jog reversal guard in `test_latcontrol_rack.py` fails on the flat form and passes with the
+  shaping. Route 5b, whole route: preview level changes 30.1 → 23.7/min, ≥3-step collapses
+  3.12 → 1.96/min, every replayable frequency-gate cell moved by ≤0.01.*
+  *Where the gate binds after this change (Palisade, route-5b live steerRatio 16.55): it is the
+  tighter of the two frame-to-frame tests above 25.8 m/s at the 2 s step, 21.6 at 1.25 s, 20.0 at
+  1 s, 16.0 at 0.5 s and 13.0 at 0.25 s — the shaping is what keeps it an independent constraint at
+  ordinary road speeds instead of retiring it below ~26 m/s. Below each of those the absolute
+  heading gate (1.0°/1.33°) is strictly tighter and breaks first, which is already the status quo
+  down there: heading owns 22.4 % of non-forced breaks under 8 m/s against flicker's 7.6 %.*
 
 ### L2 Motion planner (virtual rack)
 

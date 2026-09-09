@@ -397,7 +397,23 @@ PREVIEW_ADMIT_DEVIATION_M = .15  # path consistency, in metres, to read the targ
 PREVIEW_KEEP_DEVIATION_M = .2  # and to keep reading it there
 PREVIEW_ADMIT_HEADING_DEG = 1.0
 PREVIEW_KEEP_HEADING_DEG = 1.33
-PREVIEW_FLICKER_TOLERANCE_DEG = .25  # a far target may not swing more than the near one between model frames
+# a far target may not re-plan more than the near one between model frames, plus the model's own
+# replan noise. that noise is a lateral acceleration, not a wheel angle: |dcurvature| * v^2 at the 2 s
+# point holds a quiet-road p99.9 of .12-.16 from 8 to 41 m/s on routes 5b and 54, while the same
+# statistic spans 3-5x in wheel degrees and 6-11x in curvature over that range. a fixed .25 deg is
+# .002 m/s^2 at 5 m/s and .054 at 36 -- inside its own noise everywhere -- because the v^2 understeer
+# term FM1.18 names (2.8k deg/(1/m) at 5 m/s, 5.2k at 31) belongs to the car, not to the plan being
+# tested. this is the floor at the full horizon; PREVIEW_FLICKER_HORIZON_EXPONENT shapes it below.
+# scaled this way it fires on .2-.35 % of quiet frames instead of 18.5 %, and it must stay under
+# REFERENCE_FILTER_TRAIL_LATERAL_ACCEL, the trail the served target may already carry: a gate
+# testing whether two plans agree has to fire below the disagreement we ship anyway.
+PREVIEW_FLICKER_TOLERANCE_LATERAL_ACCEL = .15
+# successive plans disagree like a random walk along the look-ahead, so the floor grows as the square
+# root of it rather than being flat: measured quiet-road p99.9 of this statistic, as a fraction of its
+# own 2 s value, is .29-.47 at .25 s, .50-.72 at .5 s, .63-.85 at .75 s and .70-.98 at 1 s across
+# three speed bands on both routes, against sqrt's .35/.50/.61/.71. flat instead leaves the shallow
+# steps ~3x looser than their own noise, where a far-plan sign reversal lives (FM1.3).
+PREVIEW_FLICKER_HORIZON_EXPONENT = .5
 PREVIEW_MAX_DISTANCE_M = 40.0
 PREVIEW_MAX_Y_STD_M = .35  # p99 of the path's yStd at 2 s on straight frames (routes 20/22)
 PREVIEW_SHORTEN_UPDATES = 2  # model frames of disagreement before the preview shortens
@@ -460,7 +476,7 @@ class PreviewScheduler:
     self.fail_updates = 0
     self.pass_updates = 0
     self.last_model_timestamp_ns: int | None = None
-    self.previous_angles: tuple[float, ...] | None = None
+    self.previous_curvatures: tuple[float, ...] | None = None
     self.previous_far_y: tuple[float, ...] | None = None
 
   def reset(self) -> None:
@@ -468,7 +484,7 @@ class PreviewScheduler:
     self.fail_updates = 0
     self.pass_updates = 0
     self.last_model_timestamp_ns = None
-    self.previous_angles = None
+    self.previous_curvatures = None
     self.previous_far_y = None
 
   @property
@@ -482,7 +498,7 @@ class PreviewScheduler:
       self.pass_updates = 0
       # R4 fix: a forced frame skips _admissible entirely below, so it must clear the DCPC
       # baseline itself -- otherwise the next real frame compares against a pre-event far point
-      # instead of treating the resumed data as having no baseline yet (previous_angles has no
+      # instead of treating the resumed data as having no baseline yet (previous_curvatures has no
       # analogous gap: it is always refreshed unconditionally a few lines down).
       self.previous_far_y = None
     timestamp = int(model_timestamp_ns)
@@ -491,7 +507,7 @@ class PreviewScheduler:
     self.last_model_timestamp_ns = timestamp
     angles = tuple(target.angle_deg for target in targets)
     admissible = 0 if forced else self._admissible(model, action_time_s, targets, angles)
-    self.previous_angles = angles
+    self.previous_curvatures = tuple(target.curvature for target in targets)
     if forced:
       return 0
     if admissible < self.index:
@@ -532,6 +548,10 @@ class PreviewScheduler:
       return 0
     x_action = float(np.interp(action_time_s, times, xs))
     near = targets[0]
+    # the model re-plans by a roughly constant lateral acceleration, so the floor scales with 1 / v^2.
+    # near.speed_mps is max(MIN_SPEED, ...) by model_path_targets' construction, so it needs no floor.
+    # this is the value at the full horizon; each step scales it by its own look-ahead below.
+    flicker_tolerance = PREVIEW_FLICKER_TOLERANCE_LATERAL_ACCEL / near.speed_mps ** 2
     admitted = 0
     for index in range(1, len(targets)):
       far_time = action_time_s + HORIZON_OFFSETS_S[index]
@@ -546,8 +566,10 @@ class PreviewScheduler:
           break
       if abs(angles[index] - angles[0]) > (PREVIEW_KEEP_HEADING_DEG if keeping else PREVIEW_ADMIT_HEADING_DEG):
         break
-      if self.previous_angles is not None and len(self.previous_angles) == len(angles):
-        if abs(angles[index] - self.previous_angles[index]) > abs(angles[0] - self.previous_angles[0]) + PREVIEW_FLICKER_TOLERANCE_DEG:
+      if self.previous_curvatures is not None and len(self.previous_curvatures) == len(targets):
+        far_replan = abs(targets[index].curvature - self.previous_curvatures[index])
+        tolerance = flicker_tolerance * (HORIZON_OFFSETS_S[index] / HORIZON_S) ** PREVIEW_FLICKER_HORIZON_EXPONENT
+        if far_replan > abs(near.curvature - self.previous_curvatures[0]) + tolerance:
           break
       sample_times = np.linspace(action_time_s, far_time, 9)
       if float(np.trapezoid(np.interp(sample_times, speed_times, speeds), sample_times)) > PREVIEW_MAX_DISTANCE_M:
