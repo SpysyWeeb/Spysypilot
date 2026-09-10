@@ -26,7 +26,7 @@ and the reference filter's rate consistency) landed 2026-09-05 after three repla
 (route 54, 47 min, replayed on its own logged inputs with and without the step: straight-road torque step above 100 km/h −48 % at
 the median, reversals 10.9 → 1.3 per minute, onset/overshoot/unwind timing unchanged at every percentile; owner: "highway did feel
 calmer, and curves felt fine"). Open item carried: 7 of 21 gentle highway moves build torque 40–300 ms more slowly with the taper
-(onset unchanged) because its 5 °/s wheel-rate gate sits above the 2–5 °/s of such moves; a speed-scaled gate is the follow-up.**
+(onset unchanged) because its 5 °/s wheel-rate gate sits above the 2–5 °/s of such moves; a speed-scaled gate is the follow-up. The preview-flicker units fix (2819d9879: the scheduler's frame-to-frame flicker tolerance was a fixed 0.25° of wheel against a re-plan noise that is a constant lateral acceleration, so it fired on two thirds of frames below 8 m/s) merged 2026-09-08 and ✅ field-validated 2026-09-10 (route 00000062, 46 engaged min: the gate fires on 5.3 / 1.8 / 0.6 % of frames below 8, 8–20 and above 20 m/s against 67.6 / 35.4 / 15.0 for the old formula; deep preview collapses above 8 m/s −30–45 % against the five pre-fix routes; served target and torque inside the pre-fix range at every speed; owner: no difference noticed).**
 
 ## What it does
 
