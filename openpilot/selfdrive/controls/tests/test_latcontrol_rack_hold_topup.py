@@ -174,6 +174,13 @@ class TestHoldTopup(OpenpilotTestCase):
     output, frame = settle(controller, CS, step)
     start = output.hold_topup_torque
     values = []
+    # the fixture puts the wheel 1.5 deg short of the plan between one frame and the next, a move no wheel
+    # makes; the rate tracker (FM3.8) reads that step as a 15 deg/s transient that closes the measured-rate
+    # gate for ~9 frames, and the leak dips the term while growth is off -- a wheel arriving with real
+    # motion does the same in the field, by design. This test is about growth under a STANDING error, so
+    # tell the tracker the wheel was already there
+    pin_short_of_plan(CS, output, 1.5)
+    controller.rack_rate_estimator.reseed(CS.steeringAngleDeg)
     for i in range(1, 2001):
       pin_short_of_plan(CS, output, 1.5)
       output = step(frame + i)

@@ -94,55 +94,73 @@ class RackTrajectoryOutput:
   hold_topup_growing: bool
 
 
-MEASURED_RATE_FILTER_RC_S = .05
+# Wheel rate (docs/BLaTv3_FAILURE_MODES.md FM3.8). This car's SAS_Speed is an unsigned 8-bit signal at 4 deg/s per
+# count (opendbc hyundai_2015_ccan.dbc): it reads 0 on 83 % of all frames and on 93 % of the frames where the wheel
+# really turns 1-2 deg/s, so it cannot be the rate's magnitude at the rates highway driving lives at (audit
+# 2026-09-10, F1: with the magnitude taken from it the estimate carried 17-25 % of the true rate at 1-4 deg/s with
+# the sign right 56-78 % of the time, and the rate feedback tracked the plan's rate instead of the wheel's). The
+# rate comes from the 0.1 deg SAS_Angle instead, through an alpha-beta tracker: predict the angle with the rate,
+# correct both with the residual. Against a zero-phase reference on routes 5b/62 it holds unity gain with 19 deg of
+# lag at 0.55-0.8 Hz and the sign right 92-94 % of the time at 2-4 deg/s, for 0.0012 torque per frame of D-term
+# chatter at 30 m/s (route-audit phase3/rate_source_2026-09-10/DESIGN.md). The gains are the pair that keeps the
+# band gain at 1.00 while passing the least of what lies above 2 Hz -- there the 0.1 deg steps are as much of
+# the signal as the wheel is, and the D term would carry it straight into the torque (a brisker .30/.045 pair
+# held 0.97 of that content against this pair's 0.65-0.84, for 4 deg less lag). Below about 1 deg/s every
+# estimator is noise: 0.1 deg at 100 Hz resolves nothing finer without a longer window. The sensor keeps one
+# job, validity: two of its counts is unambiguous motion, and an angle stream that stays still through that
+# is not live.
+MEASURED_RATE_TRACKER_ALPHA = .25  # angle-residual gain per frame
+MEASURED_RATE_TRACKER_BETA = .030  # rate-residual gain per frame, applied over dt
+MEASURED_RATE_SENSOR_MOVING_DEG_S = 8.0  # two counts of the 4 deg/s sensor: the wheel is certainly turning
+MEASURED_RATE_STILL_DEG_S = 1.0  # what the tracker calls not turning, at its own noise floor
+MEASURED_RATE_FROZEN_FRAMES = 10  # sensor turning, tracker still, for this long: the angle is not live
+MEASURED_RATE_MAX_STEP_DEG = 20.0  # 2000 deg/s inside one frame is not a wheel: start over, do not track it
 
 
 class RackRateEstimator:
-  def __init__(self, dt: float, filter_rc_s: float = MEASURED_RATE_FILTER_RC_S) -> None:
+  def __init__(self, dt: float, alpha: float = MEASURED_RATE_TRACKER_ALPHA, beta: float = MEASURED_RATE_TRACKER_BETA) -> None:
     self.dt = dt
-    self.filter_rc_s = filter_rc_s
-    self.previous_angle_deg: float | None = None
-    self.direction = 0
-    self.raw_signed_episode = False
-    self.rate_filter = FirstOrderFilter(0.0, filter_rc_s, dt)
-    self.rate_filter_valid = False
+    self.alpha = alpha
+    self.beta = beta
+    self.previous_angle_deg: float | None = None  # the controller reads this for its hold and driver-press carries
+    self.angle_deg = 0.0  # the tracker's own angle
+    self.rate_deg_s = 0.0
+    self.ticks = 0
+    self.frozen_frames = 0
 
   def reset(self) -> None:
     self.previous_angle_deg = None
-    self.direction = 0
-    self.raw_signed_episode = False
-    self.rate_filter.x = 0.0
-    self.rate_filter_valid = False
+    self.angle_deg = 0.0
+    self.rate_deg_s = 0.0
+    self.ticks = 0
+    self.frozen_frames = 0
+
+  def reseed(self, angle_deg: float) -> None:
+    """Start over where the wheel is, at rest: after a hold blip the wheel may have moved unseen, and that
+    motion must never come out as one frame of rate. Validity is earned again after two tracker steps, so
+    the update made in the same frame as a reseed (the hold carry) cannot publish a rate of zero as valid
+    while the wheel is moving."""
+    self.previous_angle_deg = self.angle_deg = float(angle_deg)
+    self.rate_deg_s = 0.0
+    self.ticks = 0
+    self.frozen_frames = 0
 
   def update(self, angle_deg: float, raw_rate_deg_s: float) -> tuple[float, bool]:
-    magnitude = abs(raw_rate_deg_s)
-    if magnitude == 0.0:
-      self.direction = 0
-      self.raw_signed_episode = False
-      rate, valid = 0.0, True
-    elif raw_rate_deg_s < 0.0:
-      self.direction = -1
-      self.raw_signed_episode = True
-      rate, valid = -magnitude, True
-    elif self.raw_signed_episode:
-      self.direction = 1
-      rate, valid = magnitude, True
-    elif self.previous_angle_deg is not None and angle_deg != self.previous_angle_deg:
-      self.direction = 1 if angle_deg > self.previous_angle_deg else -1
-      rate, valid = self.direction * magnitude, True
-    elif self.direction:
-      rate, valid = self.direction * magnitude, True
+    angle = float(angle_deg)
+    if self.previous_angle_deg is None or abs(angle - self.previous_angle_deg) > MEASURED_RATE_MAX_STEP_DEG:
+      self.reseed(angle)
+      return 0.0, False
+    self.angle_deg += self.rate_deg_s * self.dt
+    residual = angle - self.angle_deg
+    self.angle_deg += self.alpha * residual
+    self.rate_deg_s += self.beta * residual / self.dt
+    self.previous_angle_deg = angle
+    self.ticks += 1
+    if abs(raw_rate_deg_s) >= MEASURED_RATE_SENSOR_MOVING_DEG_S and abs(self.rate_deg_s) < MEASURED_RATE_STILL_DEG_S:
+      self.frozen_frames += 1
     else:
-      rate, valid = 0.0, False
-    self.previous_angle_deg = angle_deg
-    if not valid:
-      return rate, False
-    if not self.rate_filter_valid:
-      self.rate_filter.x = rate
-      self.rate_filter_valid = True
-    else:
-      rate = float(self.rate_filter.update(rate))
-    return rate, True
+      self.frozen_frames = 0
+    return self.rate_deg_s, self.ticks >= 2 and self.frozen_frames < MEASURED_RATE_FROZEN_FRAMES
 
 
 def _smoothstep(value: float, edge0: float, edge1: float) -> float:
@@ -1030,7 +1048,7 @@ class RackTrajectoryController:
     if self.inactive_frames and self.planner is not None and self.hold_angle_deg is not None:
       # the wheel may have moved while the plan was held: carry the plan along with it, once
       self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
-      self.rack_rate_estimator.previous_angle_deg = float(CS.steeringAngleDeg)
+      self.rack_rate_estimator.reseed(float(CS.steeringAngleDeg))
     self.inactive_frames = 0
     self.hold_angle_deg = None
     if self.model is None:
