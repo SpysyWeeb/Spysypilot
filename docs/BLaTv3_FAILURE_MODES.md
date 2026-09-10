@@ -442,7 +442,18 @@ red-team pass.
   sweep ±5°: monotonic.
 - **FM3.8 — Rate signal quality.** Unsigned 4 °/s `SAS_Speed`; wrong sign 1–4 frames after a
   reversal. → Rate from the angle derivative, magnitude as validity; invalid until two
-  consistent ticks. → No wrong-sign valid samples.
+  consistent ticks. → Wrong-sign valid samples reduced from 22 % to 6.6 % at 2–4 °/s (measured 2026-09-10; below
+  1 °/s the 0.1° angle is sign-blind for any estimator).
+  *Audit 2026-09-10 (route-audit `phase3/blatv3_audit_2026-09-10/AUDIT.md` F1): the shipped estimator had this
+  backwards — magnitude from the sensor, sign from the angle. The sensor reads 0 on 83 % of frames and on 93 % of
+  frames where the wheel really turns 1–2 °/s; at highway the estimate carried 17–25 % of the true rate with the
+  sign right 56–78 % of the time, so the rate feedback followed the plan's rate (corr +0.70..+0.84) and the hold
+  top-up's approach gate ran on noise. Implemented as written on branch `rack-rate-source` (2026-09-10): an
+  alpha-beta tracker on the 0.1° angle (α .30, β .045 per frame; unity gain, 15° lag at 0.55–0.8 Hz against a
+  zero-phase reference, sign right 93–94 % at 2–4 °/s), the sensor kept only as validity (two counts of motion
+  against a still tracker for 10 frames means the angle is not live), a one-frame step above 20° reseeds, and the
+  hold carry reseeds. Floor: 0.1° at 100 Hz resolves nothing below ~1 °/s; the top-up's 0.25–1.0 °/s approach
+  gate sits at that floor and is re-derived with the Step 1 ablation, not here.*
 - **FM3.9 — Zero-crossing special cases.** → None; continuous through zero.
   *Phase 3 step 4 (2026-09-01): the last exact-zero special case (`measured_angle == 0.0` forcing
   `raw_torque = 0.0`, just above the direction guard) is deleted — direction guard v2's continuous

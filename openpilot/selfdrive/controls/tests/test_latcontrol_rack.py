@@ -37,7 +37,7 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   JerkLimitedRackPlanner,
   MAX_DRIVER_ASSIST_TORQUE,
   MAX_FEEDBACK_TORQUE,
-  MEASURED_RATE_FILTER_RC_S,
+  MEASURED_RATE_FROZEN_FRAMES,
   MotionLimits,
   PathTarget,
   PREVIEW_ENVELOPE_DRIFT_M,
@@ -1026,30 +1026,61 @@ class TestLatControlRack(OpenpilotTestCase):
     assert worst <= REFERENCE_FILTER_TRAIL_MAX_DEG + 1e-6
     assert abs(worst - REFERENCE_FILTER_TRAIL_MAX_DEG) < 0.5
 
-  def test_signed_rack_rate_handles_signed_and_unsigned_samples(self):
+  def test_rack_rate_comes_from_the_angle_and_the_sensor_only_vouches_for_it(self):
+    # FM3.8: this car's SAS_Speed is unsigned and 4 deg/s per count, so the rate's magnitude and sign both
+    # come from the 0.1 deg angle; the sensor only says whether the wheel is certainly turning
     estimator = RackRateEstimator(DT_CTRL)
-    assert estimator.update(-1.0, -5.0) == (-5.0, True)
-    positive_rate, valid = estimator.update(-0.9, 5.0)
-    alpha = DT_CTRL / (MEASURED_RATE_FILTER_RC_S + DT_CTRL)
-    assert valid and abs(positive_rate - (-5.0 + alpha * 10.0)) < 1e-12
+    assert estimator.update(1.0, 0.0) == (0.0, False)  # one sample is not a rate
+    assert estimator.update(1.0, 0.0) == (0.0, False)  # nor is one tracker step
+    assert estimator.update(1.0, 0.0) == (0.0, True)  # two are, and a still wheel reads exactly still
 
-    estimator.reset()
-    assert estimator.update(1.0, 5.0) == (0.0, False)
-    assert estimator.update(1.0, 0.0) == (0.0, True)
-    step_rate = 0.0
-    for index in range(5):
-      step_rate, valid = estimator.update(1.1 + index * 0.1, 8.0)
-    assert valid and abs(step_rate - 8.0 * (1.0 - (1.0 - alpha) ** 5)) < 1e-12
-    reversal_rate, valid = estimator.update(1.0, 8.0)
-    assert valid and reversal_rate > 0.0
-    for index in range(100):
-      reversal_rate, valid = estimator.update(0.9 - index * 0.1, 8.0)
-    assert valid and abs(reversal_rate + 8.0) < 0.1
+    # a wheel turning at a steady rate, seen through the sensor's 0.1 deg steps, with the sensor reading
+    # whatever a 4 deg/s unsigned signal reads: the estimate converges on the rate with the angle's sign
+    for rate in (0.5, 2.0, 5.0, 20.0, 200.0):
+      estimator.reset()
+      estimates = []
+      for frame in range(400):
+        sensor = 4.0 * round(rate / 4.0) if frame % 3 else 0.0
+        estimate, valid = estimator.update(round(rate * frame * DT_CTRL, 1), sensor)
+        assert valid == (frame >= 2)
+        estimates.append(estimate)
+      settled = np.asarray(estimates[200:])
+      assert abs(settled.mean() - rate) < 0.05 * rate + 0.05, (rate, settled.mean())
+      assert settled.min() > -1e-9, (rate, settled.min())  # the ripple never crosses zero: no wrong-sign sample
+      assert settled.max() - settled.min() < 0.2 * rate + 1.0, (rate, settled.max() - settled.min())
 
+    # a reversal: the sensor stays positive (it is unsigned on this car); the estimate follows the angle down
     estimator.reset()
-    assert estimator.update(1.0, 5.0) == (0.0, False)
-    filtered = [estimator.update(1.1 if index % 2 else 1.0, 8.0)[0] for index in range(1, 21)]
-    assert sum(abs(filtered[index] - filtered[index - 1]) for index in range(1, len(filtered))) < 8.0 * 19 * 0.4
+    for frame in range(100):
+      estimator.update(round(8.0 * frame * DT_CTRL, 1), 8.0)
+    reversal = [estimator.update(round(8.0 - 8.0 * frame * DT_CTRL, 1), 8.0)[0] for frame in range(100)]
+    assert all(rate < 0.0 for rate in reversal[20:])
+    assert abs(reversal[-1] + 8.0) < 0.5
+
+    # an angle step no wheel can make inside one frame starts the tracker over instead of becoming a rate
+    estimator.reset()
+    for frame in range(50):
+      estimator.update(round(2.0 * frame * DT_CTRL, 1), 0.0)
+    assert estimator.update(500.0, 0.0) == (0.0, False)
+    assert estimator.update(500.0, 0.0) == (0.0, False)
+    estimate, valid = estimator.update(500.0, 0.0)
+    assert valid and abs(estimate) < 1e-9
+
+    # the sensor certain of motion while the angle never moves: the angle is not live, so after
+    # MEASURED_RATE_FROZEN_FRAMES the estimate stops vouching for itself, until the wheel visibly turns again
+    estimator.reset()
+    validity = [estimator.update(3.0, 12.0)[1] for _ in range(MEASURED_RATE_FROZEN_FRAMES + 5)]
+    assert validity[2] and not validity[-1]
+    assert validity.index(False, 2) == MEASURED_RATE_FROZEN_FRAMES
+    moving = [estimator.update(round(3.0 + 12.0 * frame * DT_CTRL, 1), 12.0)[1] for frame in range(1, 40)]
+    assert not moving[0] and moving[-1]
+
+    # reseed (the hold carry): where the wheel is, at rest; the update made in the same frame as the reseed
+    # is not yet a rate, the one after it is
+    estimator.reseed(7.0)
+    assert estimator.previous_angle_deg == 7.0 and estimator.rate_deg_s == 0.0
+    assert estimator.update(7.0, 0.0) == (0.0, False)
+    assert estimator.update(7.0, 0.0) == (0.0, True)
 
   # ---- RackTrajectoryController: full pipeline behaviors ----
 
@@ -1772,7 +1803,7 @@ class TestLatControlRack(OpenpilotTestCase):
       model.action.desiredCurvature = curvature
       controller.set_model(model, 1_050_000_000)
       output = None
-      for _frame in range(2):
+      for _frame in range(3):  # the rate tracker vouches for itself from its second step (FM3.8)
         output = controller.update(True, self.CS, self.VM, self.params, torque_params,
                                    lambda lateral_accel, _: lateral_accel, .2, curvature)
         assert output is not None
@@ -1813,14 +1844,15 @@ class TestLatControlRack(OpenpilotTestCase):
     def run(sign):
       controller = RackTrajectoryController()
       controller.planner = JerkLimitedRackPlanner(sign * 3.0)
-      # a real unwind: the angle falls toward center while the CAN rate reports the return; the raw
-      # rate is unsigned-magnitude on the positive side, so the moving angle is what signs it
-      self.CS.steeringRateDeg = sign * -80.0
+      # a real unwind: the angle falls toward center at 40 deg/s for long enough that the tracker (FM3.8:
+      # the rate comes from the angle) carries it; the CAN rate is unsigned magnitude on this car and
+      # only vouches for motion, so it reads the same whichever way the wheel goes
+      self.CS.steeringRateDeg = 40.0
       model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [15.0] * 6)
       model.action.desiredCurvature = 0.0
       controller.set_model(model, 1_050_000_000)
       output = None
-      for angle in (12.4, 12.0):
+      for angle in [12.0 + 0.4 * k for k in range(24, -1, -1)]:
         self.CS.steeringAngleDeg = sign * angle
         output = controller.update(True, self.CS, self.VM, self.params, torque_params,
                                    lambda lateral_accel, _: lateral_accel, .2, 0.0)
