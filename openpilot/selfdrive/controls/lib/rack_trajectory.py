@@ -175,10 +175,14 @@ def _clip(value: float, limit: float) -> float:
 def _hold_topup_step(state: float, error_deg: float, steady_gate: float, accumulating: bool, fast_leak: bool, dt: float) -> float:
   """One frame of the hold top-up's leaky integrator (FM3.14). The caller resolves the anti-windup gates
   (`accumulating`) and the steadiness weight (`steady_gate`); this owns only the ODE, the leak selection,
-  the hard bound and the zero snap. Growth and the fast leak never apply in the same call (the caller
-  passes accumulating=False whenever the driver's hand selects the fast leak), so the per-frame step is
-  bounded by dt * (HOLD_TOPUP_RATE * HOLD_TOPUP_ERROR_CAP_DEG + MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S)
-  = 0.0117 even when a reversed error drains the state while growing the other way -- inside R7_MAX_TORQUE_STEP."""
+  the hard bound and the zero snap. Growth and the fast leak DO apply in the same call: the driver's hand
+  and the release cooldown select the fast leak with accumulating=False, but `reversed_residual` selects it
+  while growth continues, whenever the carried state opposes the current error (66 such frames in the live
+  harness, max step 0.0075; route-audit phase3/hygiene_batch_2026-09-11/out_q7_topup_rerun.txt -- the
+  sentence claiming the case cannot occur was wrong, audit F13). The bound below was always derived for it:
+  the per-frame step is at most dt * (HOLD_TOPUP_RATE * HOLD_TOPUP_ERROR_CAP_DEG + MAX_HOLD_TOPUP_TORQUE /
+  HOLD_TOPUP_OVERRIDE_DECAY_S) = 0.0117, reached exactly when a reversed error drains the state at the fast
+  rate while growth pushes the other way, and 4.3x inside R7_MAX_TORQUE_STEP (out_measure_claims.txt item 7)."""
   growth = HOLD_TOPUP_RATE * _clip(error_deg, HOLD_TOPUP_ERROR_CAP_DEG) * steady_gate if accumulating else 0.0
   leak_rc = HOLD_TOPUP_OVERRIDE_DECAY_S if fast_leak else HOLD_TOPUP_LEAK_RC_S
   state = _clip(state + dt * (growth - state / leak_rc), MAX_HOLD_TOPUP_TORQUE)
@@ -253,6 +257,11 @@ class JerkLimitedRackPlanner:
 HORIZON_S = 2.0
 HORIZON_STEP_S = .25
 HORIZON_OFFSETS_S = tuple(index * HORIZON_STEP_S for index in range(round(HORIZON_S / HORIZON_STEP_S) + 1))
+# how far short of the horizon the published preview may fall and still count as covering it. The times
+# are List(Float32) (cereal/log.capnp) built as action_time + offset, so the span this checks carries at
+# most a couple of float32 ulps -- 2.4e-7 s at the 2.6 s end of the grid -- while a preview one step
+# short falls 0.25 s, 250x this, and modeld's grid is the controller's own (test_modeld_*).
+PREVIEW_COVERAGE_TOLERANCE_S = 1e-3
 
 
 def model_path_targets(
@@ -275,8 +284,9 @@ def model_path_targets(
   Queries are on the vehicle's timeline (seconds from the plan origin; the plan's age is now). The
   preview is desiredCurvature's own function from the action time on, so it is read one action time
   ahead of each query: at the plan's age it is the scalar the plan would publish now, and further out
-  it is the scalar's future. Past the preview's end the last sample holds: the covered range is the
-  horizon.
+  it is the scalar's future. It has to reach as far past its own first sample as the furthest query
+  lies past now, and a preview that does not is a fault (STATUS_INVALID_PATH, a held frame), not
+  something to extrapolate through -- see the check below.
   """
   scalar = float(scalar_curvature)
   measured_speed = float(measured_v_ego)
@@ -302,6 +312,11 @@ def model_path_targets(
   now = float(plan_time_now_s)
   if not all(times[0] <= query <= times[-1] for query in (now, *queries)):
     raise ValueError("model path does not cover requested timestamps")
+  # past the preview's last sample np.interp holds it flat, and a flat far curvature is exactly what
+  # the preview scheduler reads as a perfectly steady far plan and lengthens into (FM1.3). So the
+  # preview must really cover the horizon it is asked for; short is a fault, not an extrapolation.
+  if preview_times[-1] - preview_times[0] < max(queries) - now - PREVIEW_COVERAGE_TOLERANCE_S:
+    raise ValueError("curvature preview does not cover the horizon")
   # controlsd's scalar is the model's first sample after the ISO clip, so the pin keeps the clip
   curvatures = np.array([scalar + preview - previews[0] for preview in previews])
 
@@ -332,10 +347,41 @@ def model_path_targets(
   return tuple(targets)
 
 
+def _bound_target(raw_target: PathTarget, speed_mps: float, vehicle_model, roll_rad: float,
+                  angle_offset_deg: float, roll_compensation: float) -> tuple[PathTarget, bool]:
+  """One path target, held inside the same ISO lateral-acceleration bound the scalar already carries
+  (drive_helpers.clip_curvature's own numbers, roll included). The curvature is bounded first, then
+  the curvature the target's own angle implies -- the two disagree when the angle came from a
+  different speed -- and a bounded target is served at rest: it is a limit, not a motion. Returns
+  (target, limited); `limited` is what pins the preview and bypasses the reference filter."""
+  bound_speed = max(float(speed_mps), MIN_SPEED)
+  minimum = max(-MAX_CURVATURE, (-MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
+  maximum = min(MAX_CURVATURE, (MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
+  bounded_curvature = min(max(raw_target.curvature, minimum), maximum)
+  limited = bounded_curvature != raw_target.curvature
+  if not limited:
+    angle_curvature = -vehicle_model.calc_curvature(
+      math.radians(raw_target.angle_deg - angle_offset_deg), bound_speed, roll_rad,
+    )
+    bounded_curvature = min(max(angle_curvature, minimum), maximum)
+    limited = bounded_curvature != angle_curvature
+  if not limited:
+    return raw_target, False
+  bounded_angle = math.degrees(
+    vehicle_model.get_steer_from_curvature(-bounded_curvature, bound_speed, roll_rad),
+  ) + angle_offset_deg
+  return PathTarget(bounded_curvature, raw_target.speed_mps, bounded_angle, 0.0), True
+
+
 REFERENCE_FILTER_RC_S = .1
 REFERENCE_FILTER_PREVIEW_RC_S = .2  # added to the time constant at the full preview: a consistent road earns calmer tracking
 REFERENCE_FILTER_TRAIL_LATERAL_ACCEL = .2  # m/s^2: how far the served target may trail the raw one
-REFERENCE_FILTER_TRAIL_MAX_DEG = 3.0  # and in wheel angle, which is the tighter bound below ~12 m/s
+REFERENCE_FILTER_TRAIL_MAX_DEG = 3.0  # and in wheel angle, the tighter of the two below 15.6 m/s on this car: the
+                                       # lateral-acceleration leg is 9.86 deg at 8 m/s and 3.20 at 15, and crosses
+                                       # this cap at 15.59 m/s (34.9 mph). Re-measured 2026-09-11 against the real
+                                       # Palisade VM (route-audit phase3/hygiene_batch_2026-09-11/
+                                       # out_measure_claims.txt item 3); the "~12 m/s" carried here until then was
+                                       # 30 % low (audit F13).
 DIRECTION_GUARD_RC_S = .12
 
 
@@ -366,7 +412,12 @@ class ReferenceFilter:
   dragged target stopping dead is a real kink in the served position and is served as one: a
   10 deg step from rest serves 64 deg/s for one frame at rc .1 and trail_limit / rc from the next
   (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1). The tracker's jerk
-  limit bounds what the plan makes of such a frame, and nothing else extrapolates the served rate.
+  limit is what bounds the plan's response to such a frame, and it binds at every speed: the
+  acceleration the largest served-rate step can demand (trail_limit / rc through the tracker's rate
+  term) is 2.5-31x the planner's own per-frame jerk step from 8 to 36 m/s at both time constants, so
+  the plan never sees the step the filter can serve (re-measured 2026-09-11, route-audit
+  phase3/hygiene_batch_2026-09-11/out_measure_claims.txt item 3). Nothing else extrapolates the
+  served rate.
   A served rate larger than the served position's own derivative scales the tracker's rate term
   with it and moves the tracker's zero with speed; that is what amplified the model's target by 1.26
   at 0.55-0.8 Hz at highway speed (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
@@ -617,11 +668,20 @@ DT = .01
 RATE_HORIZON_S = .1
 MAX_FEEDBACK_TORQUE = .35
 TURN_IN_BLEND_DEG = 3.0  # the feedback cap blends between its two values over this much angle, not a boolean jump
+# direction_fraction's own near-centre fade (_intent_signals): how much angle the wheel must hold before the
+# fraction counts for its full value. The same 3.0 the turn-in ramps use and deliberately no longer written as
+# TURN_IN_BLEND_DEG -- one number carried four meanings (audit F14, route-audit phase3/blatv3_audit_2026-09-10),
+# and the fade and the cap's blend width have to be movable one without the other.
+DIRECTION_FADE_DEG = 3.0
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
 MAX_DRIVER_ASSIST_TORQUE = .5     # unchanged value; now the envelope's FLOOR, not its fixed cap
 DRIVER_ASSIST_CEILING = 1.0       # == the ISO clip already applied upstream; not a new ceiling (R10)
 # Direction guard v2 (target-referred bounded fallback, docs/BLaTv3_FAILURE_MODES.md FM3.5/FM3.9/R7/R10):
 R7_MAX_TORQUE_STEP = .05  # existing rule bound (FM3.5: "R7 sweeps, jump < 0.05"), reused on the output verbatim
+GUARD_REFERENCE_BLEND_DEG = 3.0  # how far the plan must sit past zero on the wrong side of the target before the
+                                  # guard reads a full reference conflict. The same 3.0 as the turn-in ramps, its
+                                  # own constant since audit F14: this one is the guard's own sensitivity, and
+                                  # widening the turn-in cap's blend must not quietly desensitize the guard.
 GUARD_TORQUE_BLEND = .05  # set equal to R7_MAX_TORQUE_STEP: an opposing torque smaller than the R7 step can't
                            # produce a meaningful "opposing push", so the sign-disagreement trip only arms above it
 GUARD_UNWIND_BLEND = .15  # ramps the old direction_fraction>=1.0 snap over the top 15% of its range instead,
@@ -670,27 +730,36 @@ assert MAX_HOLD_TOPUP_TORQUE < MAX_FEEDBACK_TORQUE  # the two sum directly in ra
 # still exactly "the feedforward layer" the fix's own mandate names, just downstream of where friction
 # joins it, so the taper reaches whichever of the two inputs is actually chattering that frame.
 # Low-passes that combined input, but ONLY while every one of three smoothstep gates (R7) is open:
-# near-zero curvature (reuses TURN_IN_BLEND_DEG, the same near-center deadband turn_in_fraction and
-# direction_fraction already use, and the report's own "near-straight" definition -- the worst 128
-# km/h windows in torque_decomp/rough_windows.json sit at 0.4-1.6 deg near/target range), holding
-# rather than moving (reuses HOLD_TOPUP_PLAN_RATE_DEG_S/BLEND, the top-up's own "holding not chasing"
-# threshold, applied to whichever of the served target's own rate and the plan's is larger -- the
-# served rate leads the plan into a real highway turn-in, so the plan's rate alone leaves the taper
-# open for the first frames of the move), and highway speed (FF_TAPER_SPEED_MPS matches
-# _STOCK_KP_SPEEDS[-1] below: above it P/D gain no longer grows with speed while feedforward keeps
-# scaling as v^2, so the same angle-level dither buys ever less P/D counter-authority as speed climbs
-# further). A turn-in or unwind at any speed, a curve already held, or the driver's hands on the wheel
-# drives the gate to exactly 0.0, so the low-passed term contributes nothing and today's code
-# reproduces bit-for-bit (R5/R7).
+# near-zero curvature (FF_TAPER_ANGLE_DEG, the same 3 deg near-center width the turn-in ramps use,
+# and the report's own "near-straight" definition -- the worst 128 km/h windows in
+# torque_decomp/rough_windows.json sit at 0.4-1.6 deg near/target range), holding rather than moving
+# (FF_TAPER_RATE_DEG_S/BLEND, the top-up's own "holding not chasing" threshold, applied to whichever
+# of the served target's own rate and the plan's is larger -- the served rate leads the plan into a
+# real highway turn-in, so the plan's rate alone leaves the taper open for the first frames of the
+# move), and highway speed (FF_TAPER_SPEED_MPS matches _STOCK_KP_SPEEDS[-1] below, the speed at which
+# the stock Kp table stops rising). What that threshold does NOT mean, corrected 2026-09-11: P/D
+# torque per degree divided by feedforward torque per degree is exactly gain(v) -- the shared
+# lateral_accel_per_degree factor cancels, so both legs carry the same v^2 -- and gain(v) is FLAT at
+# 0.80 above 30 m/s rather than falling (re-measured on the Palisade VM: 2.0000 at 15 m/s, 1.6000 at
+# 20, 1.2000 at 25, 0.8000 at 30, 35 and 40; route-audit phase3/hygiene_batch_2026-09-11/
+# out_measure_claims.txt item 5). So the same angle-level dither does NOT buy ever less P/D
+# counter-authority as speed climbs past 30 m/s -- the 2.5x fall in that ratio is the 15-30 m/s span
+# the speed ramp is still climbing through, and above 30 the ratio is constant. The measured chatter
+# reduction below stands on its own route-4d measurement; only this rationale for where the speed
+# gate sits was wrong (audit F13). A turn-in or unwind at any speed, a curve already held, or the
+# driver's hands on the wheel drives the gate to exactly 0.0, so the low-passed term contributes
+# nothing and today's code reproduces bit-for-bit (R5/R7).
 FF_TAPER_SPEED_MPS = 30.0               # m/s (108 km/h); == _STOCK_KP_SPEEDS[-1] (below)
 FF_TAPER_SPEED_BLEND_MPS = 8.0          # opens from 22 m/s (79 km/h): speed_vs_chatter.py's own
                                          # 60-80/80-100 km/h bucket boundary, already 13-19x the
                                          # 0-20 km/h mean|d f| baseline; fully open well inside
                                          # segments 37-44's 120-129 km/h (33.3-35.8 m/s)
-FF_TAPER_ANGLE_DEG = TURN_IN_BLEND_DEG  # 3 deg: reused, not re-tuned -- see the comment block above
-FF_TAPER_RATE_DEG_S = HOLD_TOPUP_PLAN_RATE_DEG_S              # 5 deg/s: reused, ditto
-FF_TAPER_RATE_BLEND_DEG_S = HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S  # 3 deg/s: reused, ditto
-FF_TAPER_RC_S = REFERENCE_FILTER_RC_S   # reused verbatim, not re-tuned: measured on route 4d
+FF_TAPER_ANGLE_DEG = 3.0                # reused from the turn-in ramps' width, not re-tuned -- see the block
+                                         # comment above. Its own literal since audit F14: the taper's idea of
+                                         # "near straight" is not the feedback cap's idea of "a turn-in".
+FF_TAPER_RATE_DEG_S = 5.0               # reused from the top-up's "holding, not chasing" knee, ditto
+FF_TAPER_RATE_BLEND_DEG_S = 3.0         # reused from the top-up's fade width, ditto
+FF_TAPER_RC_S = .1                      # reused verbatim, not re-tuned: measured on route 4d
                                          # (impl_F3/speed_chatter_before_after.py) against a slower
                                          # 0.2s candidate -- 0.1s gives the same highway-chatter
                                          # reduction (120-150 km/h bucket: mean|d output| -35.5% vs
@@ -741,7 +810,7 @@ def _direction_guard(
   bounded" -- built from the file's own torque_from_lateral_accel machinery, re-pointed at the
   served target instead of the plan. `scale` is a mix weight (0 = no conflict, 1 = full fallback)
   low-passed at DIRECTION_GUARD_RC_S toward a continuous conflict signal (fuzzy-OR of the straddle
-  and full-unwind trips, each a ramp over TURN_IN_BLEND_DEG/GUARD_TORQUE_BLEND/GUARD_UNWIND_BLEND
+  and full-unwind trips, each a ramp over GUARD_REFERENCE_BLEND_DEG/GUARD_TORQUE_BLEND/GUARD_UNWIND_BLEND
   instead of a boolean). R7 (FM3.5: "rule boundaries are continuous, jump < 0.05") is enforced
   algebraically on the resultant *output* against the previous frame's output, but ONLY while this
   guard itself is blending (mix > 0) -- R7 bounds the discontinuity this rule's own transition could
@@ -756,8 +825,8 @@ def _direction_guard(
   (guarded_torque, new_scale, direction_guarded)."""
   toward = math.copysign(1.0, target_angle) if target_angle != 0.0 else 0.0
   # reference_conflict: degrees the plan sits past zero on the wrong side of target, ramped over
-  # TURN_IN_BLEND_DEG (reused, not a new width) -- continuous form of planned_angle*target_angle<0
-  reference_conflict = min(max(-planned_angle * toward / TURN_IN_BLEND_DEG, 0.0), 1.0)
+  # GUARD_REFERENCE_BLEND_DEG (this rule's own width) -- continuous form of planned_angle*target_angle<0
+  reference_conflict = min(max(-planned_angle * toward / GUARD_REFERENCE_BLEND_DEG, 0.0), 1.0)
   torque_away_from_target = min(max(-torque * toward / GUARD_TORQUE_BLEND, 0.0), 1.0)
   straddle_conflict = reference_conflict * torque_away_from_target
 
@@ -849,6 +918,140 @@ def _ff_taper_gate(v_ego_mps: float, target_angle_deg: float, measured_angle_deg
   )
 
 
+def _intent_signals(target_angle: float, intended_angle: float, measured_angle: float,
+                    planned_angle: float) -> tuple[float, float]:
+  """The frame's two intent ramps, both continuous in their inputs (R7), both in offset-free angle.
+
+  `turn_in_fraction` is how much of a turn-in this frame is: the wheel on (or near) the target's side,
+  the target beyond it, and the motion demanded toward it -- each condition a ramp over
+  TURN_IN_BLEND_DEG, not a test. It opens the feedback cap.
+
+  `direction_fraction` is how far past what is still needed the wheel already is, signed: +1 a pure
+  unwind (neither the plan nor the commanded motion holds any of the current angle), 0 exactly at the
+  need (bit-identical to no relaxation), negative a turn-in still short of the need. It generalizes the
+  retired unwind magnitude clamp: instead of scaling the whole request, only the rate feedback relaxes,
+  so a return the rack's own self-aligning torque is already producing is not resisted.
+  """
+  target_motion = intended_angle - measured_angle
+  toward = math.copysign(1.0, target_angle) if target_angle != 0.0 else 0.0
+  turn_in_fraction = (
+    (1.0 - min(max(-measured_angle * toward / TURN_IN_BLEND_DEG, 0.0), 1.0))
+    * min(max((abs(target_angle) - abs(measured_angle)) / TURN_IN_BLEND_DEG, 0.0), 1.0)
+    * min(max(target_motion * toward / TURN_IN_BLEND_DEG, 0.0), 1.0)
+  )
+  direction_fraction = 0.0
+  if measured_angle != 0.0:
+    planned_hold_angle = abs(planned_angle) if planned_angle * measured_angle > 0.0 else 0.0
+    turn_in_angle = abs(intended_angle) if intended_angle * measured_angle > 0.0 else 0.0
+    # faded out within DIRECTION_FADE_DEG of center: a near-center dither must not pin the fraction
+    # at its endpoints and strip the rate damping (or arm the guard) frame to frame (R7)
+    direction_fraction = min(max(
+      1.0 - max(planned_hold_angle, turn_in_angle) / abs(measured_angle), -1.0), 1.0,
+    ) * min(abs(measured_angle) / DIRECTION_FADE_DEG, 1.0)
+  return turn_in_fraction, direction_fraction
+
+
+def _rate_relaxation(direction_fraction: float) -> float:
+  """How much of the rate feedback still applies, and with it how steady the hold top-up may call the
+  frame: full damping while the wheel is still short of the need, fading to none at a pure unwind,
+  where the rack's own self-aligning torque is already producing the return. One ramp, read by both
+  rules, so they can never disagree about what a wanted unwind is."""
+  return _smoothstep(-direction_fraction, -1.0, 0.0)
+
+
+def _feedforward_lateral_accel(planned_lateral_accel: float, target_lateral_accel: float,
+                               filtered_lateral_accel: float, friction: float,
+                               roll_rad: float, lat_accel_offset: float) -> float:
+  """The lateral acceleration feedforward is asked to produce. The plan's own, except where the model's
+  immediate target disagrees with it in sign -- the plan is crossing zero to somewhere the model no
+  longer wants, so predict nothing and let feedback carry it -- or where the served target asks for
+  less than the plan in the same direction, where the smaller of the two is the honest prediction.
+  Then the road's roll, the platform's offset and the friction term, exactly as stock composes them."""
+  trajectory_feedforward_lateral_accel = planned_lateral_accel
+  if target_lateral_accel * planned_lateral_accel <= 0.0:
+    trajectory_feedforward_lateral_accel = 0.0
+  elif (filtered_lateral_accel * planned_lateral_accel > 0.0
+        and abs(filtered_lateral_accel) < abs(planned_lateral_accel)):
+    trajectory_feedforward_lateral_accel = filtered_lateral_accel
+  return (
+    trajectory_feedforward_lateral_accel - roll_rad * ACCELERATION_DUE_TO_GRAVITY - lat_accel_offset + friction
+  )
+
+
+def _feedback_torque(
+  plan: RackPlan, steering_angle_deg: float, measured_rate: float, measured_rate_valid: bool,
+  gain: float, lateral_accel_per_degree: float, direction_fraction: float, turn_in_fraction: float,
+  target_angle: float, torque_params, torque_from_lateral_accel: Callable[[float, object], float],
+) -> tuple[float, float, float, bool]:
+  """Position and rate feedback on the plan, and the cap the pair is held to.
+
+  P is the plan's angle error, D the plan's rate error over RATE_HORIZON_S, both converted to torque
+  through the same lateral-acceleration pipeline feedforward uses, so a degree of error is worth the
+  same torque either way. D is relaxed by `_rate_relaxation` on a wanted unwind and is zero while the
+  rate estimate is not valid -- a rate the estimator cannot vouch for is not damping, it is noise.
+  The cap opens from MAX_FEEDBACK_TORQUE to MAX_TURN_IN_FEEDBACK_TORQUE with `turn_in_fraction`, and
+  only on the side the target lies: extra authority is for turning in, never for holding out.
+  Returns (position_feedback, rate_feedback, feedback, feedback_limited)."""
+  position_feedback = -float(torque_from_lateral_accel(
+    gain * lateral_accel_per_degree * (plan.position_deg - steering_angle_deg), torque_params,
+  ))
+  rate_feedback = -float(torque_from_lateral_accel(
+    gain * _rate_relaxation(direction_fraction) * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate),
+    torque_params,
+  )) if measured_rate_valid else 0.0
+  raw_feedback = position_feedback + rate_feedback
+  turn_in_cap = MAX_FEEDBACK_TORQUE + turn_in_fraction * (MAX_TURN_IN_FEEDBACK_TORQUE - MAX_FEEDBACK_TORQUE)
+  feedback_lower = -turn_in_cap if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
+  feedback_upper = turn_in_cap if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
+  feedback = min(max(raw_feedback, feedback_lower), feedback_upper)
+  return position_feedback, rate_feedback, feedback, feedback != raw_feedback
+
+
+def _hold_topup_gates(
+  hold_topup_torque: float, position_error_deg: float, target_angle: float, measured_angle: float,
+  raw_torque: float, platform_saturated: bool, feedback: float, feedback_limited: bool,
+  direction_guard_scale: float, direction_fraction: float, plan_rate_deg_s: float,
+  measured_rate: float, measured_rate_valid: bool, driver_pressed: bool, in_release_cooldown: bool,
+) -> tuple[bool, bool, float]:
+  """Whether the hold top-up may grow this frame, whether it drains at the fast rate, and how steady
+  the frame is (FM3.14). Pure: the caller owns the state and the cooldown counter.
+
+  A shortfall is only worth making up when the plan and the served target both lie on the same side of
+  the wheel: near center at speed the plan sits half a degree one way and the target the other, and a
+  term chasing the plan there pushes against the target (replay: the guard engaged twice as often, at a
+  mix too small to correct it). Growth also stops wherever something upstream already binds in the
+  error's own direction -- the platform clip, the feedback cap, the guard -- or the term would be
+  integrating against a limiter. A push the target does not want drains at the fast rate, as does a
+  residual the current error already opposes, so a stale push never outlives ~0.3 s.
+
+  The steadiness weight is a product of four ramps and none of them is a turn-in test: a wheel standing
+  short of a static plan and target IS the standing shortfall this term exists for, and gating on the
+  turn-in fraction stopped it acting on the route 0x3e window it was built for. What separates an active
+  turn-in from a standing shortfall is motion -- the plan's, the wheel's, or the wheel's own approach --
+  plus the rate feedback's own unwind relaxation. Returns (accumulating, fast_leak, steady_gate)."""
+  error_sign = math.copysign(1.0, position_error_deg) if position_error_deg != 0.0 else 0.0
+  aligned = position_error_deg * (target_angle - measured_angle) > 0.0
+  reversed_residual = hold_topup_torque * position_error_deg < 0.0
+  platform_bind = platform_saturated and error_sign != 0.0 and math.copysign(1.0, raw_torque) == error_sign
+  feedback_bind = feedback_limited and error_sign != 0.0 and math.copysign(1.0, feedback) == error_sign
+  accumulating = (
+    aligned and not driver_pressed and not in_release_cooldown and direction_guard_scale <= 0.0
+    and not platform_bind and not feedback_bind
+  )
+  fast_leak = driver_pressed or in_release_cooldown or not aligned or reversed_residual
+  plan_rate_gate = 1.0 - _smoothstep(
+    abs(plan_rate_deg_s), HOLD_TOPUP_PLAN_RATE_DEG_S, HOLD_TOPUP_PLAN_RATE_DEG_S + HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S,
+  )
+  measured_rate_gate = (1.0 - _smoothstep(
+    abs(measured_rate), HOLD_TOPUP_MEASURED_RATE_DEG_S, HOLD_TOPUP_MEASURED_RATE_DEG_S + HOLD_TOPUP_MEASURED_RATE_BLEND_DEG_S,
+  )) if measured_rate_valid else 0.0
+  approach_gate = (1.0 - _smoothstep(
+    measured_rate * error_sign, HOLD_TOPUP_APPROACH_RATE_DEG_S, HOLD_TOPUP_APPROACH_RATE_DEG_S + HOLD_TOPUP_APPROACH_BLEND_DEG_S,
+  )) if measured_rate_valid else 0.0
+  steady_gate = _rate_relaxation(direction_fraction) * plan_rate_gate * measured_rate_gate * approach_gate
+  return accumulating, fast_leak, steady_gate
+
+
 class RackTrajectoryController:
   def __init__(self, dt: float = DT, driver_assist_limits: DriverAssistLimits | None = None) -> None:
     self.dt = dt
@@ -881,8 +1084,77 @@ class RackTrajectoryController:
       self.model = model
     self.state_mono_ns = int(state_mono_ns)
 
+  @property
+  def holding(self) -> bool:
+    """The last frame was held rather than served or thrown away: the plan is alive and the controller
+    means to resume it (R6). The caller reads this to keep steering with what it last committed through
+    a content fault -- the output is state too, so a bad frame of model content does not change hands."""
+    return self.planner is not None and 0 < self.inactive_frames <= INACTIVE_HOLD_FRAMES
+
+  def _commit_torque(self, torque: float, CS) -> tuple[float, bool, float]:
+    """The driver's say on the torque about to be committed, and the R7 baseline that follows from it.
+
+    While the driver steers, the request is capped by the platform's own driver-allowance envelope --
+    widened toward DRIVER_ASSIST_CEILING for a push that agrees with the controller's live intent,
+    floored at MAX_DRIVER_ASSIST_TORQUE for one that opposes (FM4.9) -- and slewed from the last
+    committed torque at the R7 step, so a grab is answered at once but never with a jump. When the hand
+    comes off, the same slew continues until the request is within a step of what was committed.
+
+    R7's baseline is the torque actually committed, taken after this clip and its own backstop -- not
+    the guard's own pre-clip value -- so a saturated hand-off can't leave a phantom-high baseline that
+    forces an unwanted high-torque hold the instant the driver releases the wheel.
+
+    Every torque this controller commits passes through here, the frames it holds included
+    (`held_output`): a held frame composes no request, but the driver's hands are this frame's news,
+    and the envelope is about them, not about the request's age. Returns (torque, limited, cap)."""
+    driver_assist_limited = False
+    driver_assist_cap = DRIVER_ASSIST_CEILING
+    if CS.steeringPressed:
+      # Agreement relaxation (docs/BLaTv3_FAILURE_MODES.md FM4.9): a driver pushing with the
+      # controller's own live intent widens the cap toward 1.0, exactly as far as the platform's
+      # own driver-allowance limiter already would; an opposing driver still floors at
+      # MAX_DRIVER_ASSIST_TORQUE. Falls back to the old fixed cap for callers with no CP (tests,
+      # any future caller that hasn't threaded driver_assist_limits through).
+      driver_assist_cap = (
+        _driver_assist_envelope(CS.steeringTorque, torque, self.driver_assist_limits)
+        if self.driver_assist_limits is not None else MAX_DRIVER_ASSIST_TORQUE
+      )
+      assisted_torque = _clip(torque, driver_assist_cap)
+      if self.previous_output_torque is not None:  # same R7 idiom as _direction_guard, scoped to this branch
+        assisted_torque = min(max(assisted_torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
+                               self.previous_output_torque + R7_MAX_TORQUE_STEP)
+      driver_assist_limited = assisted_torque != torque
+      torque = assisted_torque
+      self.release_reconcile = True
+    elif self.release_reconcile and self.previous_output_torque is not None:
+      # The hand comes off: the branch above has slewed the committed torque toward the cap, and the
+      # composed request (the hold top-up's carried-in value included -- the fast leak only starts
+      # this frame) may sit a full step or more away. Keep the same R7 slew until the request is
+      # within a step of what was committed, then hand over cleanly (FM3.14 review: an unclamped
+      # release frame jumped by the term's whole value; the pre-existing gap was smaller, same shape).
+      reconciled_torque = min(max(torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
+                              self.previous_output_torque + R7_MAX_TORQUE_STEP)
+      self.release_reconcile = reconciled_torque != torque
+      driver_assist_limited = self.release_reconcile
+      torque = reconciled_torque
+    self.previous_output_torque = torque
+    return torque, driver_assist_limited, driver_assist_cap
+
+  def held_output(self, committed_torque: float, CS) -> tuple[float, bool, float]:
+    """What to keep steering with on a frame this controller held (R6, `holding`). The frame composed
+    no request of its own, so the torque already committed to the car stands in for one -- but the
+    driver is not held with it: the committed value goes through the same driver-assist envelope, the
+    same R7 slew and the same release bookkeeping an ordinary frame does, against this frame's own
+    driver state. Without that a grab landing on the fault frame was answered only when the hold ended,
+    up to INACTIVE_HOLD_FRAMES later, at whatever authority the last composed frame had
+    (route-audit phase3/hygiene_batch_2026-09-11/review/probe_held_c_driver_press.py: a frame saturated
+    at -1.0 held against a hard opposing press the envelope would have capped at 0.5).
+    Returns (torque, limited, cap), like the ordinary path."""
+    return self._commit_torque(float(committed_torque), CS)
+
   def hold(self) -> None:
-    # inactive for a frame: keep the planned rack through a short blip, start over after a real disengage
+    # a frame not served -- inactive, or one whose own inputs were faulty (_hold_fault below): keep the
+    # planned rack through a short blip, start over after a real disengage
     self.inactive_frames += 1
     self.status = STATUS_INACTIVE
     if self.inactive_frames == 1:
@@ -910,7 +1182,24 @@ class RackTrajectoryController:
     self.ff_taper_filter.x = 0.0
 
   def _invalidate(self, status: int) -> None:
+    """The model is gone, or the controller's own state is suspect: throw the plan away and build a new
+    one from the wheel when a good frame comes back. There are no held frames to carry into it."""
     self.reset()
+    self.inactive_frames = 0
+    self.hold_angle_deg = None
+    self.status = status
+
+  def _hold_fault(self, status: int) -> None:
+    """A content fault in one frame's inputs (R6: below the staleness threshold, hold state, never
+    reset). The plan is still the right plan -- one bad frame of model content says nothing about the
+    trajectory being executed -- so hold it exactly as an inactive frame is held: the same
+    INACTIVE_HOLD_FRAMES budget, the same wheel-drag and rate-estimator reseed on the frame that
+    resumes, the same held frames counted as elapsed time, and a reset only past the budget. The
+    status is still set and the frame still returns None -- it composed no request -- but `holding` is
+    then True, and the wrapper keeps steering with the torque it last committed rather than changing
+    hands for one frame (audit F12: resetting instead cost a 0.20-0.23 torque step, 4x the R7 bound,
+    plus 3.7 s to rebuild the hold top-up and 0.45 s of preview, for one bad frame)."""
+    self.hold()
     self.status = status
 
   @staticmethod
@@ -1028,17 +1317,17 @@ class RackTrajectoryController:
 
   def update(self, active: bool, CS, VM, params, torque_params, torque_from_lateral_accel: Callable[[float, object], float],
              lat_delay: float, desired_curvature: float, applied_torque: float = 0.0) -> RackTrajectoryOutput | None:
+    # The frame's order of operations, in sections: gates, targets, schedulers, limits, filter, planner,
+    # bounding, intent, feedforward, feedback, the top-up applied, the platform clip, the direction guard,
+    # driver assist, the R7 baseline latch, the top-up's growth, output.
+    # --- gates: is this frame the controller's to serve, and is what it is given usable?
+    # The model being gone, or the controller's own state being unusable, is a reset; a fault in one
+    # frame's content is a hold (R6), so the plan, the top-up, the preview and the R7 baseline survive
+    # a single bad frame. Either way the frame serves no request; the caller hands a reset frame to
+    # stock and keeps steering with what it last committed through a hold. ---
     if not active:
       self.hold()
       return None
-    if self.inactive_frames and self.planner is not None and self.hold_angle_deg is not None:
-      # the wheel may have moved while the plan was held: carry the plan along with it, once
-      self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
-      self.rack_rate_estimator.reseed(float(CS.steeringAngleDeg))
-    # the frames held through are elapsed time for everything differenced against the last served frame
-    elapsed_s = self.dt * (1 + self.inactive_frames)
-    self.inactive_frames = 0
-    self.hold_angle_deg = None
     if self.model is None:
       self._invalidate(STATUS_NO_MODEL)
       return None
@@ -1046,7 +1335,7 @@ class RackTrajectoryController:
       CS.vEgo, CS.steeringAngleDeg, CS.steeringRateDeg, CS.steeringTorque,
       params.roll, params.angleOffsetDeg, lat_delay, desired_curvature,
     )):
-      self._invalidate(STATUS_INVALID_VEHICLE_STATE)
+      self._hold_fault(STATUS_INVALID_VEHICLE_STATE)
       return None
     model_age_s = (self.state_mono_ns - int(self.model.timestampEof)) * 1e-9
     if not 0.0 <= model_age_s <= STALE_MODEL_S:
@@ -1056,8 +1345,8 @@ class RackTrajectoryController:
     preview_times = self.model.action.desiredCurvaturePreviewTimes
     preview = self.model.action.desiredCurvaturePreview
     if len(preview_times) < 2 or len(preview) != len(preview_times):
-      # a modeld that publishes no usable preview: there is no path to build, stock steers
-      self._invalidate(STATUS_INVALID_PREVIEW)
+      # a modeld that publishes no usable preview: there is no path to build this frame
+      self._hold_fault(STATUS_INVALID_PREVIEW)
       return None
 
     try:
@@ -1075,35 +1364,32 @@ class RackTrajectoryController:
         angle_offset_deg=float(params.angleOffsetDeg),
       )
     except (TypeError, ValueError, OverflowError):
-      self._invalidate(STATUS_INVALID_PATH)
+      self._hold_fault(STATUS_INVALID_PATH)
       return None
 
+    # --- the frame is served: this is where a hold ends. It sits below the ladder because a frame the
+    # controller cannot serve is another held frame, not the resume: carrying the wheel's motion into
+    # the plan, reseeding the rate estimator and taking the held frames as elapsed time all belong to
+    # the frame that actually serves, and doing it on a fault frame would re-arm the hold every frame
+    # and never reach the budget. ---
+    if self.inactive_frames and self.planner is not None and self.hold_angle_deg is not None:
+      # the wheel may have moved while the plan was held: carry the plan along with it, once
+      self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
+      self.rack_rate_estimator.reseed(float(CS.steeringAngleDeg))
+    # the frames held through are elapsed time for everything differenced against the last served frame
+    elapsed_s = self.dt * (1 + self.inactive_frames)
+    self.inactive_frames = 0
+    self.hold_angle_deg = None
+
+    # --- targets: the model's path, each knot held inside the ISO bound ---
     roll_compensation = float(params.roll) * ACCELERATION_DUE_TO_GRAVITY
-
-    def bound_target(raw_target: PathTarget, speed_mps: float) -> tuple[PathTarget, bool]:
-      bound_speed = max(float(speed_mps), MIN_SPEED)
-      minimum = max(-MAX_CURVATURE, (-MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
-      maximum = min(MAX_CURVATURE, (MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation) / bound_speed ** 2)
-      bounded_curvature = min(max(raw_target.curvature, minimum), maximum)
-      limited = bounded_curvature != raw_target.curvature
-      if not limited:
-        angle_curvature = -VM.calc_curvature(
-          math.radians(raw_target.angle_deg - params.angleOffsetDeg), bound_speed, params.roll,
-        )
-        bounded_curvature = min(max(angle_curvature, minimum), maximum)
-        limited = bounded_curvature != angle_curvature
-      if not limited:
-        return raw_target, False
-      bounded_angle = math.degrees(
-        VM.get_steer_from_curvature(-bounded_curvature, bound_speed, params.roll),
-      ) + params.angleOffsetDeg
-      return PathTarget(bounded_curvature, raw_target.speed_mps, bounded_angle, 0.0), True
-
     targets: list[PathTarget] = []
     target_limits: list[bool] = []
     for offset, raw_target in zip(HORIZON_OFFSETS_S, raw_targets, strict=True):
       target_speed = float(CS.vEgo) if offset == 0.0 else raw_target.speed_mps
-      bounded_target, target_limited = bound_target(raw_target, target_speed)
+      bounded_target, target_limited = _bound_target(
+        raw_target, target_speed, VM, params.roll, params.angleOffsetDeg, roll_compensation,
+      )
       targets.append(bounded_target)
       target_limits.append(target_limited)
 
@@ -1114,6 +1400,8 @@ class RackTrajectoryController:
       math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), bound_speed, params.roll,
     )
     measured_out_of_bounds = not minimum_curvature - 1e-9 <= measured_curvature <= maximum_curvature + 1e-9
+
+    # --- schedulers: how far ahead the plan is trusted, for the tracker and for the envelope ---
     # the driver's hands, a lane change or a limited immediate target pin the preview at the action time
     lane_changing = str(self.model.meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
     forced = bool(CS.steeringPressed) or lane_changing or target_limits[0] or measured_out_of_bounds
@@ -1123,6 +1411,8 @@ class RackTrajectoryController:
     preview_s = self.preview_scheduler.preview_s
     target = targets[0]
     path_limited = target_limits[0]
+
+    # --- limits: the wheel's own rate, read once, then the envelope the plan may move inside ---
     previous_angle_deg = self.rack_rate_estimator.previous_angle_deg
     measured_rate, measured_rate_valid = self.rack_rate_estimator.update(float(CS.steeringAngleDeg), float(CS.steeringRateDeg))
     # a far, steady target may be approached more slowly
@@ -1140,11 +1430,15 @@ class RackTrajectoryController:
     ceiling = self._iso_ceiling(float(CS.vEgo), VM, float(params.roll), profile)
     opened_profile = self._horizon_opened_profile(profile, targets, self.envelope_scheduler.index, ceiling)
     limits, profile_transition = self._motion_limits(opened_profile)  # opened profile feeds the ratchet, never the reverse (R4/R10)
+
+    # --- filter: the served target, bounded in how far it may trail the model's ---
     filtered_target = self.reference_filter.update(
       target.angle_deg, reference_trail_limit_deg(VM, CS.vEgo), elapsed_s,
       path_limited or measured_out_of_bounds or profile_transition,
       REFERENCE_FILTER_RC_S + REFERENCE_FILTER_PREVIEW_RC_S * preview_s / HORIZON_S,
     )
+
+    # --- planner: one frame of jerk-limited rack motion toward the served target ---
     planner = self.planner
     assert planner is not None
     # the planner's own tracker law is the only acceleration source; recovery is the one override
@@ -1157,6 +1451,8 @@ class RackTrajectoryController:
     except ValueError:
       self._invalidate(STATUS_INVALID_PLANNER_STATE)
       return None
+
+    # --- bounding: the plan held inside the same ISO bound the targets are ---
     raw_planned_curvature = -VM.calc_curvature(math.radians(raw_plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
     planned_out_of_bounds = not minimum_curvature - 1e-9 <= raw_planned_curvature <= maximum_curvature + 1e-9
     plan = raw_plan
@@ -1167,8 +1463,10 @@ class RackTrajectoryController:
     planned_curvature = -VM.calc_curvature(math.radians(plan.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll)
     planned_lateral_accel = planned_curvature * CS.vEgo ** 2
     measured_lateral_accel = measured_curvature * CS.vEgo ** 2
+    # --- intent: where the frame is going, in offset-free angle ---
     target_angle = filtered_target.position_deg - params.angleOffsetDeg
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
+    planned_angle = plan.position_deg - params.angleOffsetDeg
     # where the served target is heading is the model's own bounded target, which the reference filter
     # converges to: while the filter runs free, target + rc * served_rate IS that target, exactly. It is not
     # extrapolated over a response time: with the served rate the served position's own motion, a bounded
@@ -1176,15 +1474,9 @@ class RackTrajectoryController:
     # (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1: direction_fraction jumping
     # by more than 0.5 in a frame rose 0.01 % -> 0.5 % of frames below 10 m/s with the extrapolation kept)
     intended_angle = target.angle_deg - params.angleOffsetDeg
-    target_motion = intended_angle - measured_angle
-    # how much of a turn-in this frame is, continuously: the wheel on (or near) the target's side, the
-    # target beyond it, and the motion demanded toward it -- each condition a ramp, not a test (R7)
-    toward = math.copysign(1.0, target_angle) if target_angle != 0.0 else 0.0
-    turn_in_fraction = (
-      (1.0 - min(max(-measured_angle * toward / TURN_IN_BLEND_DEG, 0.0), 1.0))
-      * min(max((abs(target_angle) - abs(measured_angle)) / TURN_IN_BLEND_DEG, 0.0), 1.0)
-      * min(max(target_motion * toward / TURN_IN_BLEND_DEG, 0.0), 1.0)
-    )
+    turn_in_fraction, direction_fraction = _intent_signals(target_angle, intended_angle, measured_angle, planned_angle)
+
+    # --- feedforward: what the plan itself should cost in torque ---
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
       (planned_lateral_accel - self.previous_planned_lateral_accel) / elapsed_s
@@ -1204,29 +1496,9 @@ class RackTrajectoryController:
       math.radians(filtered_target.position_deg - params.angleOffsetDeg), CS.vEgo, params.roll,
     )
     filtered_lateral_accel = filtered_curvature * CS.vEgo ** 2
-    trajectory_feedforward_lateral_accel = planned_lateral_accel
-    if target_lateral_accel * planned_lateral_accel <= 0.0:
-      trajectory_feedforward_lateral_accel = 0.0
-    elif (filtered_lateral_accel * planned_lateral_accel > 0.0
-          and abs(filtered_lateral_accel) < abs(planned_lateral_accel)):
-      trajectory_feedforward_lateral_accel = filtered_lateral_accel
-    planned_angle = plan.position_deg - params.angleOffsetDeg
-    # how far past what is still needed the wheel already is, signed and continuous: +1 a pure unwind
-    # (neither the plan nor the commanded motion holds any of the current angle), 0 exactly at the need
-    # (bit-identical to no relaxation), negative a turn-in still short of the need. Generalizes the
-    # retired unwind magnitude clamp: instead of scaling the whole request, only the rate feedback
-    # relaxes, so a return the rack's own self-aligning torque is already producing is not resisted.
-    direction_fraction = 0.0
-    if measured_angle != 0.0:
-      planned_hold_angle = abs(planned_angle) if planned_angle * measured_angle > 0.0 else 0.0
-      turn_in_angle = abs(intended_angle) if intended_angle * measured_angle > 0.0 else 0.0
-      # faded out within TURN_IN_BLEND_DEG of center: a near-center dither must not pin the fraction
-      # at its endpoints and strip the rate damping (or arm the guard) frame to frame (R7)
-      direction_fraction = min(max(
-        1.0 - max(planned_hold_angle, turn_in_angle) / abs(measured_angle), -1.0), 1.0,
-      ) * min(abs(measured_angle) / TURN_IN_BLEND_DEG, 1.0)
-    feedforward_lateral_accel = (
-      trajectory_feedforward_lateral_accel - params.roll * ACCELERATION_DUE_TO_GRAVITY - torque_params.latAccelOffset + friction
+    feedforward_lateral_accel = _feedforward_lateral_accel(
+      planned_lateral_accel, target_lateral_accel, filtered_lateral_accel, friction,
+      params.roll, torque_params.latAccelOffset,
     )
     # F3 highway feedforward taper -- see the FF_TAPER_* block comment above for the mechanism and data.
     filtered_ff_lateral_accel = float(self.ff_taper_filter.update(feedforward_lateral_accel))
@@ -1236,23 +1508,15 @@ class RackTrajectoryController:
       feedforward_lateral_accel += ff_taper_gate * (filtered_ff_lateral_accel - feedforward_lateral_accel)
     feedforward_torque = -float(torque_from_lateral_accel(feedforward_lateral_accel, torque_params))
 
-    # feedback keeps authority at standstill: the per-degree gain uses the floored speed (creep must correct)
+    # --- feedback: what the wheel's own error costs. It keeps authority at standstill, so the
+    # per-degree gain uses the floored speed (creep must correct) ---
     curvature_per_degree = -VM.calc_curvature(math.radians(1.0), bound_speed, 0.0)
     lateral_accel_per_degree = curvature_per_degree * bound_speed ** 2
     gain = self._feedback_gain(float(CS.vEgo))
-    position_feedback = -float(torque_from_lateral_accel(
-      gain * lateral_accel_per_degree * (plan.position_deg - CS.steeringAngleDeg), torque_params,
-    ))
-    rate_gain_scale = _smoothstep(-direction_fraction, -1.0, 0.0)
-    rate_feedback = -float(torque_from_lateral_accel(
-      gain * rate_gain_scale * lateral_accel_per_degree * RATE_HORIZON_S * (plan.rate_deg_s - measured_rate), torque_params,
-    )) if measured_rate_valid else 0.0
-    raw_feedback = position_feedback + rate_feedback
-    turn_in_cap = MAX_FEEDBACK_TORQUE + turn_in_fraction * (MAX_TURN_IN_FEEDBACK_TORQUE - MAX_FEEDBACK_TORQUE)
-    feedback_lower = -turn_in_cap if target_angle < 0.0 else -MAX_FEEDBACK_TORQUE
-    feedback_upper = turn_in_cap if target_angle > 0.0 else MAX_FEEDBACK_TORQUE
-    feedback = min(max(raw_feedback, feedback_lower), feedback_upper)
-    feedback_limited = feedback != raw_feedback
+    position_feedback, rate_feedback, feedback, feedback_limited = _feedback_torque(
+      plan, float(CS.steeringAngleDeg), measured_rate, measured_rate_valid, gain, lateral_accel_per_degree,
+      direction_fraction, turn_in_fraction, target_angle, torque_params, torque_from_lateral_accel,
+    )
     # the hold top-up applied cold from last frame's fully resolved state; this frame's growth is decided
     # below, after the platform clip, the guard and the driver-assist envelope have all had their say
     topup_applied = self.hold_topup_torque
@@ -1268,6 +1532,8 @@ class RackTrajectoryController:
     # reversal-lag benefit, so it is removed rather than re-gated; the applied-torque plumbing and
     # the earlyRelease log field remain for a future redesign against a true torque-reversal test.
     early_release = False
+
+    # --- the platform clip ---
     torque = min(max(raw_torque, -1.0), 1.0)
     platform_saturated = torque != raw_torque
     # Direction guard v2: continuously blends torque toward a capped, target-referred fallback
@@ -1287,87 +1553,30 @@ class RackTrajectoryController:
     )):
       self._invalidate(STATUS_INVALID_OUTPUT)
       return None
-    driver_assist_limited = False
-    driver_assist_cap = DRIVER_ASSIST_CEILING
-    if CS.steeringPressed:
-      # Agreement relaxation (docs/BLaTv3_FAILURE_MODES.md FM4.9): a driver pushing with the
-      # controller's own live intent widens the cap toward 1.0, exactly as far as the platform's
-      # own driver-allowance limiter already would; an opposing driver still floors at
-      # MAX_DRIVER_ASSIST_TORQUE. Falls back to the old fixed cap for callers with no CP (tests,
-      # any future caller that hasn't threaded driver_assist_limits through).
-      driver_assist_cap = (
-        _driver_assist_envelope(CS.steeringTorque, torque, self.driver_assist_limits)
-        if self.driver_assist_limits is not None else MAX_DRIVER_ASSIST_TORQUE
-      )
-      assisted_torque = _clip(torque, driver_assist_cap)
-      if self.previous_output_torque is not None:  # same R7 idiom as _direction_guard, scoped to this branch
-        assisted_torque = min(max(assisted_torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
-                               self.previous_output_torque + R7_MAX_TORQUE_STEP)
-      driver_assist_limited = assisted_torque != torque
-      torque = assisted_torque
-      self.release_reconcile = True
-    elif self.release_reconcile and self.previous_output_torque is not None:
-      # The hand comes off: the branch above has slewed the committed torque toward the cap, and the
-      # composed request (the hold top-up's carried-in value included -- the fast leak only starts
-      # this frame) may sit a full step or more away. Keep the same R7 slew until the request is
-      # within a step of what was committed, then hand over cleanly (FM3.14 review: an unclamped
-      # release frame jumped by the term's whole value; the pre-existing gap was smaller, same shape).
-      reconciled_torque = min(max(torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
-                              self.previous_output_torque + R7_MAX_TORQUE_STEP)
-      self.release_reconcile = reconciled_torque != torque
-      driver_assist_limited = self.release_reconcile
-      torque = reconciled_torque
-    # R7's baseline is the torque actually committed this frame, taken after the driver-assist clip
-    # (and its own backstop above) -- not the guard's own pre-clip value -- so a saturated hand-off
-    # can't leave a phantom-high baseline that forces an unwanted high-torque hold the instant the
-    # driver releases the wheel.
-    self.previous_output_torque = torque
-    # Hold top-up, deferred write (FM3.14): grow only while the wheel is meant to be steady and nothing
-    # upstream already binds in the error's own direction -- the platform clip and the feedback cap flags
-    # above are the real applied-composition flags (last frame's top-up included), and the guard mix is this
-    # frame's resolved value, not a stale one. A press freezes growth and selects the fast leak, and the
-    # cooldown keeps both for HOLD_TOPUP_RELEASE_COOLDOWN_S after the hand comes off, so a brief grab can't
-    # hand a barely-decayed residual back to the slow leak. Stock fallback never reaches here (reset() ran).
+
+    # --- driver assist, the reconcile that follows a release, and the R7 baseline latch ---
+    torque, driver_assist_limited, driver_assist_cap = self._commit_torque(torque, CS)
+    # --- the hold top-up's growth, deferred to here (FM3.14): the platform clip and the feedback cap
+    # flags are the real applied-composition flags (last frame's top-up included) and the guard mix is
+    # this frame's resolved value, not a stale one. A press freezes growth and selects the fast leak, and
+    # the cooldown below keeps both for HOLD_TOPUP_RELEASE_COOLDOWN_S after the hand comes off, so a brief
+    # grab can't hand a barely-decayed residual back to the slow leak. Stock fallback never reaches here.
     in_release_cooldown = not CS.steeringPressed and self.hold_topup_cooldown_frames > 0
     if CS.steeringPressed:
       self.hold_topup_cooldown_frames = round(HOLD_TOPUP_RELEASE_COOLDOWN_S / self.dt)
     elif in_release_cooldown:
       self.hold_topup_cooldown_frames -= 1
     position_error_deg = plan.position_deg - float(CS.steeringAngleDeg)
-    error_sign = math.copysign(1.0, position_error_deg) if position_error_deg != 0.0 else 0.0
-    # a shortfall is only worth making up when the plan and the served target both lie on the same side
-    # of the wheel: near center at speed the plan sits half a degree one way and the target the other,
-    # and a term chasing the plan there pushes against the target (replay: the guard engaged twice as
-    # often, at a mix too small to correct it). A push the target does not want drains at the fast rate,
-    # as does a residual the current error already opposes -- a stale push never outlives ~0.3 s.
-    aligned = position_error_deg * (target_angle - measured_angle) > 0.0
-    reversed_residual = self.hold_topup_torque * position_error_deg < 0.0
-    platform_bind = platform_saturated and error_sign != 0.0 and math.copysign(1.0, raw_torque) == error_sign
-    feedback_bind = feedback_limited and error_sign != 0.0 and math.copysign(1.0, feedback) == error_sign
-    accumulating = (
-      aligned and not CS.steeringPressed and not in_release_cooldown and self.direction_guard_scale <= 0.0
-      and not platform_bind and not feedback_bind
+    accumulating, fast_leak, steady_gate = _hold_topup_gates(
+      self.hold_topup_torque, position_error_deg, target_angle, measured_angle, raw_torque, platform_saturated,
+      feedback, feedback_limited, self.direction_guard_scale, direction_fraction, plan.rate_deg_s,
+      measured_rate, measured_rate_valid, bool(CS.steeringPressed), in_release_cooldown,
     )
-    plan_rate_gate = 1.0 - _smoothstep(
-      abs(plan.rate_deg_s), HOLD_TOPUP_PLAN_RATE_DEG_S, HOLD_TOPUP_PLAN_RATE_DEG_S + HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S,
-    )
-    measured_rate_gate = (1.0 - _smoothstep(
-      abs(measured_rate), HOLD_TOPUP_MEASURED_RATE_DEG_S, HOLD_TOPUP_MEASURED_RATE_DEG_S + HOLD_TOPUP_MEASURED_RATE_BLEND_DEG_S,
-    )) if measured_rate_valid else 0.0
-    approach_gate = (1.0 - _smoothstep(
-      measured_rate * error_sign, HOLD_TOPUP_APPROACH_RATE_DEG_S, HOLD_TOPUP_APPROACH_RATE_DEG_S + HOLD_TOPUP_APPROACH_BLEND_DEG_S,
-    )) if measured_rate_valid else 0.0
-    # none against a wanted unwind (the rate feedback's own relaxation), none while the plan itself is moving,
-    # none while the wheel is swinging, none while the wheel is already visibly closing on the plan. Deliberately
-    # NOT the turn-in fraction: a wheel standing short of a static plan and target is exactly the standing
-    # shortfall, and the turn-in fraction reads any wheel more than TURN_IN_BLEND_DEG short of the target as a
-    # turn-in -- gated on it the term never acted on the route 0x3e window it exists for. What separates an
-    # active turn-in from a standing shortfall is motion: the plan's, the wheel's, or the wheel's approach.
-    steady_gate = rate_gain_scale * plan_rate_gate * measured_rate_gate * approach_gate
     self.hold_topup_torque = _hold_topup_step(
-      self.hold_topup_torque, position_error_deg, steady_gate, accumulating,
-      bool(CS.steeringPressed) or in_release_cooldown or not aligned or reversed_residual, self.dt,
+      self.hold_topup_torque, position_error_deg, steady_gate, accumulating, fast_leak, self.dt,
     )
+
+    # --- output ---
     self.status = STATUS_ACTIVE
     return RackTrajectoryOutput(
       torque=torque,
