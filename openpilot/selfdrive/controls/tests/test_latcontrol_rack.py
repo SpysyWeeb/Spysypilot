@@ -1,6 +1,7 @@
 import ast
 import inspect
 import math
+from unittest import mock
 
 import numpy as np
 
@@ -22,12 +23,18 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   _clothoid_y,
   _direction_guard,
   _driver_assist_envelope,
+  _ff_taper_gate,
+  _intent_signals,
   _smoothstep,
+  DIRECTION_FADE_DEG,
+  DIRECTION_GUARD_RC_S,
   DriverAssistLimits,
   DRIVER_ASSIST_CEILING,
   ENVELOPE_EASE_UP_RC_S,
+  FF_TAPER_ANGLE_DEG,
   ENVELOPE_OPEN_MARGIN,
   GUARD_FALLBACK_TORQUE_CAP,
+  GUARD_REFERENCE_BLEND_DEG,
   HORIZON_OFFSETS_S,
   HORIZON_S,
   HORIZON_STEP_S,
@@ -680,6 +687,40 @@ class TestLatControlRack(OpenpilotTestCase):
     # R10: checked, not implicit -- also enforced live by the assert inside _direction_guard itself.
     assert GUARD_FALLBACK_TORQUE_CAP < MAX_FEEDBACK_TORQUE
 
+  def test_each_near_center_rule_reads_its_own_width(self):
+    # audit F14, "one number, four meanings": the turn-in ramps, direction_fraction's fade, the
+    # guard's reference conflict and the feedforward taper's near-straight gate all sit at 3.0 deg
+    # today, and until 2026-09-11 three of them were spelled TURN_IN_BLEND_DEG. A tuner has to be
+    # able to move one without the others: widen each in turn and only its own rule may respond.
+    def guard_conflict():
+      # dt == DIRECTION_GUARD_RC_S makes the scale's own ramp inert, so new_scale IS the conflict
+      _, new_scale, _ = _direction_guard(
+        0.0, None, -0.2, planned_angle=-1.5, target_angle=5.0, measured_angle=0.0,
+        direction_fraction=0.0, dt=DIRECTION_GUARD_RC_S, gain=1.0, lateral_accel_per_degree=1.0,
+        torque_params=None, torque_from_lateral_accel=lambda accel, _: accel,
+      )
+      return new_scale
+
+    def rules():
+      turn_in_fraction, direction_fraction = _intent_signals(3.0, 3.0, 1.5, 0.0)
+      return turn_in_fraction, direction_fraction, guard_conflict(), _ff_taper_gate(35.0, 1.5, 0.0, 0.0, 0.0, False)
+
+    baseline = rules()
+    assert all(0.0 < abs(value) < 1.0 for value in baseline)  # every rule mid-ramp, free to move either way
+    for name, moved in (("TURN_IN_BLEND_DEG", 0), ("DIRECTION_FADE_DEG", 1),
+                        ("GUARD_REFERENCE_BLEND_DEG", 2), ("FF_TAPER_ANGLE_DEG", 3)):
+      with mock.patch.object(rack_trajectory, name, 2.0 * getattr(rack_trajectory, name)):
+        widened = rules()
+      for index, (before, after) in enumerate(zip(baseline, widened, strict=True)):
+        if index == moved:
+          assert after != before, f"{name} no longer reaches its own rule"
+        else:
+          assert after == before, f"{name} leaked into rule {index}"
+
+  def test_the_near_center_widths_still_share_one_value(self):
+    # they were one constant and are still tuned as one: naming them apart must not have moved any
+    assert DIRECTION_FADE_DEG == GUARD_REFERENCE_BLEND_DEG == FF_TAPER_ANGLE_DEG == TURN_IN_BLEND_DEG == 3.0
+
   def test_guard_never_widens_authority(self):
     # a convex combination of torque and the fallback can't exceed either endpoint's magnitude;
     # assert it directly (convexity guard against a future edit), sweeping the mix over [0, 1].
@@ -688,9 +729,9 @@ class TestLatControlRack(OpenpilotTestCase):
     # test_guard_authority_decays_at_the_r7_rate_with_a_stale_baseline for that accepted trade-off.
     for mix_target in (0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0):
       # reference_conflict alone lands the mix at mix_target: planned partway across
-      # TURN_IN_BLEND_DEG, torque fully opposing so torque_away_from_target saturates to 1, and the
-      # unwind side stays inert (measured_angle == 0.0)
-      planned_angle = -mix_target * TURN_IN_BLEND_DEG
+      # GUARD_REFERENCE_BLEND_DEG, torque fully opposing so torque_away_from_target saturates to 1,
+      # and the unwind side stays inert (measured_angle == 0.0)
+      planned_angle = -mix_target * GUARD_REFERENCE_BLEND_DEG
       for torque in (0.05, 0.35, 1.0):
         guarded, new_scale, _ = _direction_guard(
           mix_target, None, -torque,
@@ -712,7 +753,7 @@ class TestLatControlRack(OpenpilotTestCase):
     # guarantee: a monotonic, R7-bounded decay that fully converges on the capped, target-referred
     # fallback -- so this known trade-off stays a documented, checked behavior, not a silent gap.
     kwargs = {
-      "planned_angle": -TURN_IN_BLEND_DEG, "target_angle": 5.0, "measured_angle": 0.0,
+      "planned_angle": -GUARD_REFERENCE_BLEND_DEG, "target_angle": 5.0, "measured_angle": 0.0,
       "direction_fraction": 0.0, "dt": 0.01, "gain": 1.0, "lateral_accel_per_degree": 1.0,
       "torque_params": None, "torque_from_lateral_accel": lambda accel, _: accel,
     }
@@ -1963,7 +2004,7 @@ class TestLatControlRack(OpenpilotTestCase):
       measured = self.CS.steeringAngleDeg
       hold_angle = abs(output.planned_angle_deg) if output.planned_angle_deg * measured > 0.0 else 0.0
       turn_in_angle = abs(output.near_target_angle_deg) if output.near_target_angle_deg * measured > 0.0 else 0.0
-      expected = min(max(1.0 - max(hold_angle, turn_in_angle) / abs(measured), -1.0), 1.0) * min(abs(measured) / TURN_IN_BLEND_DEG, 1.0)
+      expected = min(max(1.0 - max(hold_angle, turn_in_angle) / abs(measured), -1.0), 1.0) * min(abs(measured) / DIRECTION_FADE_DEG, 1.0)
       assert math.isclose(output.direction_fraction, expected, abs_tol=1e-9)
       if output.reference_limited and abs(output.target_rate_deg_s) > 100.0:
         excursion_frames += 1
