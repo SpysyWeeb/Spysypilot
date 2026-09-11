@@ -1246,7 +1246,7 @@ class TestLatControlRack(OpenpilotTestCase):
   def test_a_content_fault_holds_the_plan_and_recovers_warm(self):
     # one bad frame of model content says nothing about the trajectory being executed, so it is held
     # exactly as an inactive frame is (R6: below the threshold, hold state, never reset) and counted
-    # against the same budget. The frame still returns None, so stock steers it.
+    # against the same budget. The frame still serves no request of its own.
     self.CS.vEgo = 5.0
     valid = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [5.0] * 6)
     for invalid, expected_status in self._content_fault_models():
@@ -1266,6 +1266,54 @@ class TestLatControlRack(OpenpilotTestCase):
       assert all(math.isfinite(value) for value in (
         recovered.torque, recovered.planned_angle_deg, recovered.planned_rate_deg_s,
       ))
+
+  def test_a_non_finite_vehicle_state_is_held_and_reaches_nothing(self):
+    # STATUS_INVALID_VEHICLE_STATE is the content fault closest to NaN safety, and the one the model
+    # fixtures above cannot produce: one frame of unusable CS is held like any other (R6), and nothing
+    # non-finite may reach the plan, the rate estimator, the hold's own angle or the served target --
+    # the ladder gates every one of them, and the resume that reads CS sits below it.
+    self.CS.vEgo = 15.0
+    self.CS.steeringAngleDeg = 1.0
+    torque_params = self.CP.lateralTuning.torque
+    torque_from_lateral_accel = self.CI.torque_from_lateral_accel()
+    controller = RackTrajectoryController()
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.03] * 6, [15.0] * 6)
+    model.action.desiredCurvature = 0.002
+
+    def step(frame):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      return controller.update(True, self.CS, self.VM, self.params, torque_params,
+                               torque_from_lateral_accel, 0.2, 0.002)
+
+    for frame in range(300):  # long enough for the top-up and both preview indices to be worth losing
+      assert step(frame) is not None
+    planner, served = controller.planner, controller.reference_filter.target
+    topup = controller.hold_topup_torque
+    previews = (controller.preview_scheduler.index, controller.envelope_scheduler.index)
+    tracker = (controller.rack_rate_estimator.previous_angle_deg, controller.rack_rate_estimator.angle_deg,
+               controller.rack_rate_estimator.rate_deg_s)
+    assert abs(topup) > 0.01 and previews[0] > 0 and previews[1] > 0
+
+    self.CS.steeringAngleDeg = math.nan  # one frame of unusable vehicle state
+    assert step(300) is None
+    assert controller.status == STATUS_INVALID_VEHICLE_STATE
+    assert controller.inactive_frames == 1  # held, not reset
+    assert controller.planner is planner
+    assert controller.reference_filter.target is served
+    assert controller.hold_topup_torque == topup
+    assert (controller.preview_scheduler.index, controller.envelope_scheduler.index) == previews
+    assert all(math.isfinite(value) for value in (planner.position_deg, planner.rate_deg_s, planner.acceleration_deg_s2))
+    assert (controller.rack_rate_estimator.previous_angle_deg, controller.rack_rate_estimator.angle_deg,
+            controller.rack_rate_estimator.rate_deg_s) == tracker
+    assert math.isfinite(controller.hold_angle_deg)
+    assert math.isfinite(served.position_deg) and math.isfinite(served.rate_deg_s)
+
+    self.CS.steeringAngleDeg = 1.0
+    resumed = step(301)
+    assert resumed is not None and math.isfinite(resumed.torque)
+    assert controller.status == STATUS_ACTIVE
+    assert controller.planner is planner and controller.inactive_frames == 0
 
   def test_a_content_fault_past_the_hold_budget_resets(self):
     # a hold is for a blip. Past INACTIVE_HOLD_FRAMES the fault is not one frame's content any more,
@@ -1543,10 +1591,13 @@ class TestLatControlRack(OpenpilotTestCase):
       controller.reset()
     assert controller.rack.planner is None
 
-  def _steady_wrapper_run(self, frames, fault_frame):
+  def _steady_wrapper_run(self, frames, fault_frame, fault_len=1, fault="content"):
     """A standing shortfall at 15 m/s: the wheel pinned a degree off the plan so the hold top-up
-    integrates to something worth losing, one model frame every five control frames, and one frame of
-    unusable model content at `fault_frame`. Returns the per-frame rows."""
+    integrates to something worth losing, one model frame every five control frames, and a fault from
+    `fault_frame` for `fault_len` frames -- either one frame of unusable model content ("content") or
+    a model dropout long enough to go stale ("stale"), the one fault class that really changes hands.
+    The control clock runs whether or not a model arrives, so a dropout ages the last one. Returns the
+    per-frame rows."""
     controller, _, VM = get_rack_controller()
     CS = car.CarState.new_message()
     CS.vEgo = 15.0
@@ -1557,68 +1608,102 @@ class TestLatControlRack(OpenpilotTestCase):
     bad.action.desiredCurvaturePreview = [math.nan] + list(bad.action.desiredCurvaturePreview)[1:]
     rows = []
     for frame in range(frames):
-      eof = 1_000_000_000 + (frame // 5) * 50_000_000
-      model = bad if frame == fault_frame else good
-      model.timestampEof = eof
+      faulting = fault_frame <= frame < fault_frame + fault_len
+      model = None if (fault == "stale" and faulting) else (bad if faulting else good)
+      if model is not None:
+        model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
       torque, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2,
-                                              model=model, mono_time_ns=eof + 30_000_000)
+                                              model=model, mono_time_ns=1_030_000_000 + frame * 10_000_000)
       rows.append({
         "torque": float(torque), "logged": float(rack_log.output), "fallback": bool(rack_log.fallback),
+        "active": bool(rack_log.active), "limited": bool(rack_log.torqueLimited),
+        "p": float(rack_log.p), "d": float(rack_log.d), "f": float(rack_log.f),
         "status": int(rack_log.status), "topup": float(controller.rack.hold_topup_torque),
         "preview_index": controller.rack.preview_scheduler.index,
+        "envelope_index": controller.rack.envelope_scheduler.index,
         "baseline": controller.rack.previous_output_torque,
         "reconciling": controller.handover_reconcile,
         "request": None if controller.output is None else float(controller.output.torque),
       })
     return controller, rows
 
-  def test_a_content_fault_keeps_the_slow_state_through_the_hand_over(self):
+  def test_a_content_fault_keeps_the_slow_state_and_the_wheel(self):
     # audit F12: one bad model frame used to reset the plan, the hold top-up (3.7 s to rebuild), both
-    # preview indices and the R7 baseline. It is a hold now, so the only thing the frame costs is the
-    # frame itself.
+    # preview indices and the R7 baseline, and to change hands twice. R6 holds state, and the output is
+    # state too: the frame costs nothing but the frame.
     fault = 450
     controller, rows = self._steady_wrapper_run(520, fault)
     before, during, after = rows[fault - 1], rows[fault], rows[fault + 1]
     assert abs(before["topup"]) > 0.05  # the term really had something to lose (it holds against the curve)
-    assert during["fallback"] and during["status"] == STATUS_INVALID_PATH
-    assert not before["fallback"] and not after["fallback"]
+    assert during["status"] == STATUS_INVALID_PATH
     assert during["topup"] == before["topup"]  # frozen through the held frame, not zeroed
     assert during["preview_index"] == before["preview_index"] > 0
+    assert during["envelope_index"] == before["envelope_index"] > 0
     assert during["baseline"] == before["baseline"] is not None
     assert controller.rack.planner is not None
+    # the wheel does not change hands for one bad model frame: the committed torque is held
+    assert during["torque"] == before["torque"]
+    assert during["active"] and not during["fallback"]
+    assert not before["fallback"] and not after["fallback"]
+    assert during["limited"]  # the committed torque is not this frame's composition
+    assert during["p"] == during["d"] == during["f"] == 0.0  # there was no composition to log
+    assert not any(row["fallback"] for row in rows)  # stock never steered a frame of this run
 
-  def test_the_torque_step_across_the_hand_over_is_r7_bounded(self):
-    # the two controllers each bound their own rules, but neither can see the other: unslewed, the
-    # rack-to-stock and stock-to-rack frames stepped by the whole difference between two independently
-    # composed requests. LatControlRack is the only place that sees both, so it owns R7 there.
+  def test_a_content_fault_run_past_the_budget_gives_the_wheel_back(self):
+    # the wheel is held for the frames the plan is, and no longer: past INACTIVE_HOLD_FRAMES the
+    # controller has reset and stock takes over, R7-bounded like any other hand-over.
     fault = 450
-    controller, rows = self._steady_wrapper_run(520, fault)
+    _, rows = self._steady_wrapper_run(520, fault, fault_len=INACTIVE_HOLD_FRAMES + 2)
+    held = rows[fault:fault + INACTIVE_HOLD_FRAMES]
+    assert all(row["active"] and not row["fallback"] for row in held)
+    assert all(row["torque"] == rows[fault - 1]["torque"] for row in held)  # the committed torque, held
+    handed = rows[fault + INACTIVE_HOLD_FRAMES]
+    assert handed["fallback"]  # stock steers it (`active` stays stock's own flag on that branch)
+    assert handed["status"] == STATUS_INVALID_PATH  # a content fault arms no stale-model hold
     steps = [abs(b["torque"] - a["torque"]) for a, b in zip(rows, rows[1:], strict=False)]
     assert max(steps) <= R7_MAX_TORQUE_STEP + 1e-9
-    assert max(steps[fault - 1:fault + 1]) > 0.0  # both boundaries really moved, they were not no-ops
+
+  def test_the_torque_step_across_a_real_hand_over_is_r7_bounded(self):
+    # the two controllers each bound their own rules, but neither can see the other: unslewed, the
+    # rack-to-stock and stock-to-rack frames stepped by the whole difference between two independently
+    # composed requests. LatControlRack is the only place that sees both, so it owns R7 there. A lost
+    # model is the fault class that really changes hands (a content fault holds the wheel instead).
+    fault, dropout = 450, 70
+    controller, rows = self._steady_wrapper_run(700, fault, fault_len=dropout, fault="stale")
+    handed_over = [row["fallback"] for row in rows]
+    assert any(handed_over)
+    first, last = handed_over.index(True), len(handed_over) - 1 - handed_over[::-1].index(True)
+    assert rows[first]["status"] == STATUS_STALE_MODEL
+    steps = [abs(b["torque"] - a["torque"]) for a, b in zip(rows, rows[1:], strict=False)]
+    assert max(steps) <= R7_MAX_TORQUE_STEP + 1e-9
+    # both boundaries really moved: they are hand-overs, not no-ops
+    assert steps[first - 1] > 0.0 and steps[last] > 0.0
     for row in rows:
       # the log carries what was committed, not the source's own request (Float32 in the schema)
       assert abs(row["logged"] - row["torque"]) < 1e-6
+      assert row["limited"] or row["torque"] == row["request"] or row["fallback"]
     # and the slew hands over cleanly: once the new source's own request is within a step it is served
-    # verbatim again, and the controller's R7 baseline is the value the car actually saw
-    reconciled = next(row for row in rows[fault + 1:] if not row["reconciling"])
-    assert reconciled["torque"] == reconciled["request"] == reconciled["baseline"]
+    # verbatim again
+    reconciled = next(row for row in rows[last + 1:] if not row["reconciling"])
+    assert reconciled["torque"] == reconciled["request"]
     assert not controller.handover_reconcile
 
-  def test_content_fault_hands_back_on_the_next_good_frame(self):
+  def test_a_content_fault_keeps_the_wheel_and_serves_again_on_the_next_good_frame(self):
     controller, _, VM = get_rack_controller()
     CS = car.CarState.new_message()
     CS.vEgo = 15.0
     params = log.VehicleParameters.new_message()
     model = self._curve_model()
-    controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
+    served, _, _ = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_050_000_000)
 
-    # one garbage model frame is steered by stock; a good frame right after resumes the rack without a hold
+    # one garbage model frame: the plan is held (R6) and so is the wheel -- stock does not take it for
+    # a frame and give it straight back. The frame after it is served normally.
     model.orientationRate.z = [0.03, 0.03, math.nan, 0.03, 0.03, 0.03]
     set_curvature_preview(model)
-    _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_060_000_000)
-    assert rack_log.fallback
+    torque, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_060_000_000)
+    assert not rack_log.fallback and rack_log.active
     assert rack_log.status == STATUS_INVALID_PATH
+    assert torque == served and rack_log.torqueLimited
     model.orientationRate.z = [0.03] * 6
     set_curvature_preview(model)
     _, _, rack_log = controller.update(True, CS, VM, params, False, 0.002, False, 0.2, model=model, mono_time_ns=1_070_000_000)

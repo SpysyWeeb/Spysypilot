@@ -1078,19 +1078,18 @@ class RackTrajectoryController:
     self.rack_rate_estimator = RackRateEstimator(dt)
     self.ff_taper_filter = FirstOrderFilter(0.0, FF_TAPER_RC_S, dt)  # F3: always warm, only ever blended in when gated
 
-  def commit_output_torque(self, torque: float) -> None:
-    """R7's baseline is the torque actually committed to the car, and the caller has the last word on
-    that: LatControlRack owns the slew across the rack/stock hand-over, which neither controller can
-    see from the inside. When what it committed differs from what this frame asked for it says so
-    here, so the next in-rule clamp -- the driver-assist branch, the direction guard -- measures its
-    step against a value the car really saw instead of one that was slewed away."""
-    self.previous_output_torque = torque
-
   def set_model(self, model, state_mono_ns: int) -> None:
     # a dropped or invalid model frame keeps the last good plan; staleness is judged by its age
     if model is not None:
       self.model = model
     self.state_mono_ns = int(state_mono_ns)
+
+  @property
+  def holding(self) -> bool:
+    """The last frame was held rather than served or thrown away: the plan is alive and the controller
+    means to resume it (R6). The caller reads this to keep steering with what it last committed through
+    a content fault -- the output is state too, so a bad frame of model content does not change hands."""
+    return self.planner is not None and 0 < self.inactive_frames <= INACTIVE_HOLD_FRAMES
 
   def hold(self) -> None:
     # a frame not served -- inactive, or one whose own inputs were faulty (_hold_fault below): keep the
@@ -1135,9 +1134,10 @@ class RackTrajectoryController:
     trajectory being executed -- so hold it exactly as an inactive frame is held: the same
     INACTIVE_HOLD_FRAMES budget, the same wheel-drag and rate-estimator reseed on the frame that
     resumes, the same held frames counted as elapsed time, and a reset only past the budget. The
-    status is still set and the frame still returns None, so the wrapper hands this frame to stock
-    (audit F12: resetting instead cost a 0.20-0.23 torque step, 4x the R7 bound, plus 3.7 s to rebuild
-    the hold top-up and 0.45 s of preview, for one bad frame)."""
+    status is still set and the frame still returns None -- it composed no request -- but `holding` is
+    then True, and the wrapper keeps steering with the torque it last committed rather than changing
+    hands for one frame (audit F12: resetting instead cost a 0.20-0.23 torque step, 4x the R7 bound,
+    plus 3.7 s to rebuild the hold top-up and 0.45 s of preview, for one bad frame)."""
     self.hold()
     self.status = status
 
@@ -1262,7 +1262,8 @@ class RackTrajectoryController:
     # --- gates: is this frame the controller's to serve, and is what it is given usable?
     # The model being gone, or the controller's own state being unusable, is a reset; a fault in one
     # frame's content is a hold (R6), so the plan, the top-up, the preview and the R7 baseline survive
-    # a single bad frame. Either way the frame returns None and stock steers it. ---
+    # a single bad frame. Either way the frame serves no request; the caller hands a reset frame to
+    # stock and keeps steering with what it last committed through a hold. ---
     if not active:
       self.hold()
       return None
@@ -1283,7 +1284,7 @@ class RackTrajectoryController:
     preview_times = self.model.action.desiredCurvaturePreviewTimes
     preview = self.model.action.desiredCurvaturePreview
     if len(preview_times) < 2 or len(preview) != len(preview_times):
-      # a modeld that publishes no usable preview: there is no path to build, stock steers
+      # a modeld that publishes no usable preview: there is no path to build this frame
       self._hold_fault(STATUS_INVALID_PREVIEW)
       return None
 

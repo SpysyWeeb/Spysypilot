@@ -22,13 +22,15 @@ Shape ("upstream-shaped controller"):
 - Own `lateralControlState` union arm `rackState` (carries `saturated` for lagd, a `fallback`
   flag, status, `t_p`, planned/measured rack state, FF/P/D terms, restriction reason).
 - Owns a stock `LatControlTorque` that runs in shadow every frame with `active = CC.latActive`
-  while its output is discarded; any invalidation hands the frame to it (never zero torque).
+  while its output is discarded; losing the plan hands the frame to it (never zero torque).
   The shadow's request buffer, jerk filter and the shared saturation timer are warm; its
   integrator starts clean on handover. Since phase 2 step 2: a dropped model frame keeps the last
   plan, a model is stale past 0.5 s (SubMaster's alive window), stock holds for 0.5 s before the
-  rack resumes (stale model only — a one-frame content fault hands back on the next good frame),
-  and a `latActive` blip of up to five frames holds the planned rack and carries it along with any
-  wheel motion meanwhile (R6, FM1.6, FM3.12, FM5.2). A warm integrator in the shadow is still open.
+  rack resumes, and a `latActive` blip of up to five frames holds the planned rack and carries it
+  along with any wheel motion meanwhile (R6, FM1.6, FM3.12, FM5.2). Since the hygiene batch
+  (2026-09-11) a content fault in one frame's inputs is held rather than handed over at all: the
+  plan is kept and the wheel stays with the last committed torque for those frames (R6/R7).
+  A warm integrator in the shadow is still open.
 - modeld publishes a short curvature preview on `ModelDataV2.Action` next to
   `desiredCurvature`/`desiredCurvatureTime`, computed with the same function as the scalar
   (phase 2 step 3: `desiredCurvaturePreview[Times]`, 0.25 s apart from the action time to 2 s past it).
@@ -165,8 +167,10 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   trailing must decay with a stated time constant; a real change always passes at once, short
   of the raw target by no more than the amplitude bound and at the raw target's own rate.
   *Phase 2 step 4 (2026-08-29): `ReferenceFilter` — first-order, τ = 0.10 s, bound
-  `min(0.2 m/s² / v² in wheel angle, 3°)` (the 3° cap binds below ~12 m/s, the lateral
-  acceleration above). Chosen by replaying three mechanisms on the logged targets of routes
+  `min(0.2 m/s² / v² in wheel angle, 3°)` (the 3° cap binds below 15.6 m/s, the lateral
+  acceleration above — corrected 2026-09-11 from the "~12 m/s" this note first carried: the
+  lateral-acceleration leg is 9.86° at 8 m/s and 3.20° at 15, and crosses the cap at 15.59 m/s
+  on the real Palisade VM, route-audit phase3/hygiene_batch_2026-09-11/out_measure_claims.txt). Chosen by replaying three mechanisms on the logged targets of routes
   00000023/22 at 2–13.5 m/s (`phase2/step4_design/filter_sim/`): a one-model-frame hold of
   small reversals removed 6 % of the p95 step and froze the target for 20° mid-unwind (model
   noise reverses sign inside real moves); the old governor removed nothing (its 1° / 5 °/s gates
@@ -213,18 +217,28 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   `STATUS_INVALID_PATH`) is a hold: `_hold_fault` calls the same `hold()` an inactive frame uses,
   counts the frame against `INACTIVE_HOLD_FRAMES` and resets only past it, and the frame that resumes
   drags the plan along the wheel's motion, reseeds the rate estimator and takes the held frames as
-  elapsed time. The status is still set and the frame still returns None, so the wrapper is unchanged
-  and stock steers it. `_invalidate` had called `reset()` for every status, so one bad model frame
-  threw away the plan, the hold top-up, both preview indices, the guard mix and the R7 baseline
-  (audit F12). Measured on the audit's own harness (30 m/s, wheel 1 deg short of the plan): the top-up
-  survives the fault at 0.200 and is back at its cap 0.02 s after the resume instead of 3.69 s, and
-  the preview index holds at 5 instead of collapsing to 0 and taking 0.45 s to climb back
-  (route-audit phase3/hygiene_batch_2026-09-11/out_q1_handover_before.txt vs _after.txt). The resume
-  itself moved below the validity ladder: a frame the controller cannot serve is another held frame,
-  not the resume, and re-arming the hold on every fault frame would never reach the budget.
+  elapsed time. The status is still set and the frame still composes no request, but the output is
+  state too: `LatControlRack` keeps steering with the torque it last committed for the held frames
+  (`RackTrajectoryController.holding`) instead of handing the wheel to stock and taking it straight
+  back. Past the budget the controller has reset and the ordinary hand-over applies.
+  `_invalidate` had called `reset()` for every status, so one bad model frame threw away the plan,
+  the hold top-up, both preview indices, the guard mix and the R7 baseline, and changed hands twice
+  (audit F12). Measured on the audit's own harness (30 m/s, wheel 1 deg short of the plan): a
+  one-model-frame fault now produces no hand-over at all and the largest torque step anywhere in the
+  fault window is 0.000667, against 0.2249 before — less than the cold-engage transient of the same
+  run (0.0089). The top-up leaks by one step across the held frames (0.200000 → 0.199333) instead of
+  being zeroed and taking 3.69 s back, and the preview index stays at 5 instead of collapsing to 0
+  for 0.45 s (route-audit phase3/hygiene_batch_2026-09-11/out_q1_handover_before.txt vs
+  out_q1_handover_after_review.txt). The resume itself moved below the validity ladder: a frame the
+  controller cannot serve is another held frame, not the resume, and re-arming the hold on every
+  fault frame would never reach the budget.
   `test_a_content_fault_holds_the_plan_and_recovers_warm`,
+  `test_a_non_finite_vehicle_state_is_held_and_reaches_nothing`,
   `test_a_content_fault_past_the_hold_budget_resets`,
   `test_a_content_fault_before_the_first_plan_holds_nothing`,
+  `test_a_content_fault_keeps_the_slow_state_and_the_wheel`,
+  `test_a_content_fault_keeps_the_wheel_and_serves_again_on_the_next_good_frame`,
+  `test_a_content_fault_run_past_the_budget_gives_the_wheel_back`,
   `test_a_lost_model_resets_and_recovers_cold`.*
 - **R7 Continuity.** Every rule is continuous in its inputs; sweep tests across every rule
   boundary are required unit tests. No exact-zero special cases.
@@ -239,18 +253,29 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   *Hygiene batch (2026-09-11): R7 now holds across the rack/stock hand-over too. Each controller bounds
   the steps of its own rules, but neither can see the other's, so the frame stock took over and the
   frame the rack took it back stepped by the whole difference between two independently composed
-  requests — 0.200 and 0.225 on a one-frame content fault, 0.200 and 0.229 on a stale model, 4x the
-  0.05 bound (audit F12). `LatControlRack` is the only place that sees both controllers, so it keeps
-  the torque actually committed to the car and, once the source changes, slews the new source's request
-  toward it by at most `R7_MAX_TORQUE_STEP` a frame until that request is within one step, then hands
-  over cleanly. Both boundaries now step exactly 0.050 in both scenarios and the no-fault run is
-  untouched (largest single-frame step 0.0089, the cold-engage transient, before and after). Cost: up
-  to four frames of lag on a hand-over. The rack controller's own R7 baseline is seeded from the
-  committed value (`commit_output_torque`), so its in-rule clamps measure their step against what the
-  car saw rather than against a request that was slewed away, and the log's `output` field carries the
-  committed torque rather than the source's request.
-  `test_the_torque_step_across_the_hand_over_is_r7_bounded`,
-  `test_a_content_fault_keeps_the_slow_state_through_the_hand_over`.*
+  requests — 0.200 and 0.229 on a stale model, 4x the 0.05 bound (audit F12). `LatControlRack` is the
+  only place that sees both controllers, so it keeps the torque actually committed to the car and,
+  once the source changes, slews the new source's request toward it by at most `R7_MAX_TORQUE_STEP` a
+  frame until that request is within one step, then hands over cleanly. Both boundaries now step
+  exactly 0.050 and the no-fault run is untouched (largest single-frame step 0.0089, the cold-engage
+  transient, before and after). Cost: up to four frames of lag on a hand-over.
+  Since a content fault holds the wheel here (R6), the source can only change when the controller has
+  really lost its plan — a stale or missing model, an infeasible plan, a non-finite request, or a
+  content fault past the hold budget — and every one of those is followed by a stock hold
+  (`FALLBACK_HOLD_S`) or by the controller re-seeding its plan from the wheel. The source therefore
+  cannot flap frame to frame, and the slew always starts from a settled value.
+  The controller's own R7 baseline is deliberately not re-seeded from the committed value: every
+  hand-over is preceded by a reset that clears it, and on the reconcile frames the wrapper's clamp is
+  the binding one — a probe that presses the driver's hand through a stale-model hand-over delivers
+  bit-identical torque with and without such a seed
+  (route-audit phase3/hygiene_batch_2026-09-11/probe_seed_effect.py).
+  The log's `output` carries the committed torque rather than the source's request, and `torqueLimited`
+  is set on every frame the wrapper altered — a slew frame or a held frame — which is what that flag
+  already means for the platform clip, the guard and driver assist. Field tooling must read it that
+  way: on those frames `output` is not `p + d + f + holdTopupTorque`, because the committed torque is
+  not that frame's composition.
+  `test_the_torque_step_across_a_real_hand_over_is_r7_bounded`,
+  `test_a_content_fault_keeps_the_slow_state_and_the_wheel`.*
 - **R8 Fail closed at selection — for the controller *and* the torque authority.** Unknown,
   mixed, or empty firmware → stock controller **and** stock 384/3/7 envelope, from the same test.
 - **R9 The controller knows every platform limiter by name:** opendbc slew 409/+4/−7 with its
@@ -336,8 +361,10 @@ red-team pass.
   position and rate come from one curve — the review of the first cut caught a borrowed-rate variant
   (flat position, first-segment slope as rate) that fed the planner a fictitious lead on every frame
   at lagd's 0.375 s action time, and a second cut that added the plan's age on top of the action time
-  double-counted lagd's delay. Past the preview's end the last sample holds. Missing preview →
-  status 6, stock steers (R8).
+  double-counted lagd's delay. Missing preview → status 6; a preview that does not reach the
+  furthest query → status 7 (hygiene batch 2026-09-11: past its end `np.interp` held the last
+  sample flat, which the scheduler read as a steady far plan — see FM1.3). Both are content
+  faults, so the frame is held, not handed over (R6).
 - **FM1.5 — Truncated or invalid plan.** Approaching a stop the plan's velocity reaches ≤ 0
   inside the horizon. *Today: whole frame invalid → zero torque while still rolling.* → R6:
   clip the horizon to the covered range; `t_p → t_action`. → Plan hitting 0 at 1.5 s, vEgo
@@ -527,7 +554,9 @@ red-team pass.
   continuity over instant suppression), now pinned by a test instead of an unqualified "always"
   claim.*
   *Hygiene batch (2026-09-11): the last unbounded step in the chain was the hand-over between the two
-  controllers, and it is bounded now in `LatControlRack._commit` (see R7). Separately, the rules that
+  controllers. It is bounded now in `LatControlRack._commit`, and for a content fault it does not
+  happen at all — the wheel is held with the last committed torque for the frames the plan is held
+  (see R6/R7). Separately, the rules that
   had shared `TURN_IN_BLEND_DEG` each own their width at the same 3.0 —
   `GUARD_REFERENCE_BLEND_DEG` (the guard's reference conflict), `DIRECTION_FADE_DEG`
   (`direction_fraction`'s near-centre fade) and `FF_TAPER_ANGLE_DEG` (the taper's near-straight gate)
