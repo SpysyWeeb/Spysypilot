@@ -14,7 +14,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import MAX_CURVATURE, MAX_LA
 # plus angle and rate feedback. Ported from BLaTv2; since phase 2 step 3 the path comes from modeld's
 # curvature preview (the scalar's own function evaluated along the plan). See docs/BLaTv3_FAILURE_MODES.md.
 
-RESPONSE_TIME_S = .4
+RESPONSE_TIME_S = .3  # tracker response time, wn = 2 / it (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md)
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +197,25 @@ def _required_rate_headroom(rate: float, acceleration: float, jerk: float, dt: f
   return outward_acceleration * dt + outward_acceleration * outward_acceleration / (2.0 * jerk)
 
 
+# Anticipation weight on the target's rate in the tracker's acceleration law below, k in
+# `a = wn^2 (r - x) + 2 wn (k rdot - xdot)` (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md). The law's
+# transfer function is `H(s) = (2 k wn s + wn^2) / (s + wn)^2`: at k = 1 its zero sits at wn / 2 and the tracker
+# amplifies every frequency below sqrt(2) wn (1.155 at 0.56 Hz) even when the rate it is fed is perfect. Trimming k
+# moves the zero out, and with an honest rate (the reference filter serves the derivative of the position it serves)
+# the band gain is monotone in k, so one number settles it: .925 keeps the plan within 1-3 % of unity following in
+# every measured band below 0.8 Hz on routes 5b/4d/54 (k .9 sits 5-8 % under unity at 0.55-0.8 Hz above 112 km/h,
+# k .95 sits 1-2 % over unity in the low bands).
+TARGET_RATE_ANTICIPATION = .925
+
+
+def tracker_acceleration(target: RackTarget, position_deg: float, rate_deg_s: float, natural_frequency: float) -> float:
+  """The rack tracker's acceleration toward a target: `a = wn^2 (r - x) + 2 wn (k rdot - xdot)`."""
+  return (
+    natural_frequency * natural_frequency * (target.position_deg - position_deg)
+    + 2.0 * natural_frequency * (TARGET_RATE_ANTICIPATION * target.rate_deg_s - rate_deg_s)
+  )
+
+
 class JerkLimitedRackPlanner:
   def __init__(self, position_deg: float, rate_deg_s: float = 0.0) -> None:
     self.position_deg = float(position_deg)
@@ -205,10 +224,9 @@ class JerkLimitedRackPlanner:
 
   def update(self, target: RackTarget, limits: MotionLimits, dt: float,
              desired_acceleration_override: float | None = None) -> RackPlan:
-    natural_frequency = 2.0 / limits.response_time_s
-    desired_acceleration_raw = float(desired_acceleration_override) if desired_acceleration_override is not None else (
-      natural_frequency * natural_frequency * (target.position_deg - self.position_deg)
-      + 2.0 * natural_frequency * (target.rate_deg_s - self.rate_deg_s)
+    desired_acceleration_raw = (
+      float(desired_acceleration_override) if desired_acceleration_override is not None
+      else tracker_acceleration(target, self.position_deg, self.rate_deg_s, 2.0 / limits.response_time_s)
     )
     desired_acceleration = _clip(desired_acceleration_raw, limits.max_acceleration_deg_s2)
     jerk_step = limits.max_jerk_deg_s3 * dt
@@ -230,38 +248,6 @@ class JerkLimitedRackPlanner:
       desired_acceleration != desired_acceleration_raw,
       desired_acceleration < jerk_lower or desired_acceleration > jerk_upper,
     )
-
-
-def horizon_desired_acceleration(
-  planner: JerkLimitedRackPlanner,
-  timed_targets: Sequence[tuple[float, RackTarget]],
-) -> float:
-  """Fit one current acceleration to the model-authored future rack states."""
-  weighted_acceleration = 0.0
-  weight_total = 0.0
-  previous_time = 0.0
-  for time_s, target in timed_targets:
-    time = float(time_s)
-    values = (time, target.position_deg, target.rate_deg_s)
-    if not all(math.isfinite(value) for value in values) or time <= previous_time:
-      raise ValueError("invalid rack horizon")
-    # Initial acceleration of the cubic joining current position/rate to this
-    # model target. Near knots carry more weight but later path phases still
-    # influence preparation; the live planner applies the physical limits.
-    acceleration = (
-      6.0 * (target.position_deg - planner.position_deg) / time ** 2
-      - (4.0 * planner.rate_deg_s + 2.0 * target.rate_deg_s) / time
-    )
-    weight = 1.0 / time
-    weighted_acceleration += weight * acceleration
-    weight_total += weight
-    previous_time = time
-  if weight_total == 0.0:
-    raise ValueError("empty rack horizon")
-  result = weighted_acceleration / weight_total
-  if not math.isfinite(result):
-    raise ValueError("non-finite rack horizon")
-  return result
 
 
 HORIZON_S = 2.0
@@ -369,45 +355,66 @@ class ReferenceFilter:
   wheel at low speed and nothing in lateral acceleration. The served target may trail the raw one
   by at most a lateral acceleration, capped in wheel angle, so a turn-in or an unwind passes with
   at most that trailing at once, and any trailing decays with the time constant once the raw target
-  settles. The served rate is the rate the served position has: the filtered rate while the filter
-  runs free, and the raw target's own rate while the bound holds the served position against it (a
-  pinned trail no longer changes, so the two move together) -- reached with a bounded step, not the
-  one-frame snap the bound used to make.
+  settles. The served rate is the derivative of the served position at the filter's own bandwidth,
+  never a filtered copy of the raw target's plan-slope rate. While the filter runs free that
+  derivative is exact and already smooth: `(r - x) / rc` is the backward difference of the served
+  position (both are `(r - x_prev) / (rc + dt)`). While the bound pins the served position to the
+  raw target, or a bypass snaps it there, the position is not filtered and its frame difference is
+  the raw target's own 20 Hz staircase, so that difference is served through the same time constant
+  instead, continued from the rate served before. The two expressions agree where a target crosses
+  the bound smoothly (both are trail_limit / rc there); a jump into the bound, a bypass snap, or a
+  dragged target stopping dead is a real kink in the served position and is served as one: a
+  10 deg step from rest serves 64 deg/s for one frame at rc .1 and trail_limit / rc from the next
+  (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1). The tracker's jerk
+  limit bounds what the plan makes of such a frame, and nothing else extrapolates the served rate.
+  A served rate larger than the served position's own derivative scales the tracker's rate term
+  with it and moves the tracker's zero with speed; that is what amplified the model's target by 1.26
+  at 0.55-0.8 Hz at highway speed (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+
+  `dt` is the time since the position last served, not the loop period: a frame the controller
+  held through is elapsed time, and both the filter step and the served rate are taken over it.
   """
 
   def __init__(self) -> None:
     self.target: RackTarget | None = None
     self.limited = False
+    self.rate_deg_s = 0.0  # the served rate: the served position's derivative, low-passed while the position is pinned
 
   def reset(self) -> None:
     self.target = None
     self.limited = False
+    self.rate_deg_s = 0.0
 
-  def update(self, target: RackTarget, trail_limit_deg: float, dt: float, bypass: bool = False,
+  def update(self, position_deg: float, trail_limit_deg: float, dt: float, bypass: bool = False,
              rc_s: float = REFERENCE_FILTER_RC_S) -> RackTarget:
-    if self.target is None or bypass:
-      self.target = target
+    if self.target is None:
+      # no served position to differentiate yet: serve the raw position at rest. The raw target's plan-slope
+      # rate never enters the served rate (it ran 1.27x ahead of the served motion at speed), so it is not an input
+      self.target = RackTarget(position_deg, 0.0)
       self.limited = False
-      return target
+      self.rate_deg_s = 0.0
+      return self.target
     alpha = dt / (rc_s + dt)
-    position = self.target.position_deg + alpha * (target.position_deg - self.target.position_deg)
-    rate = self.target.rate_deg_s + alpha * (target.rate_deg_s - self.target.rate_deg_s)
-    trail = target.position_deg - position
-    self.limited = abs(trail) > trail_limit_deg
-    if self.limited:
-      # Bound the position at the trail limit so a real change still passes at once (R5), and serve
-      # the rate that bounded position actually has. Held against the raw target the trail stops
-      # changing, so the served position tracks the raw target one for one and its rate is the raw
-      # target's own rate -- the low-passed rate describes a motion the served target is not making,
-      # and the tracker's rate term is driven by the difference. Reach it with a bounded step rather
-      # than the snap this branch used to make: the branch may move the served rate at most
-      # trail_limit_deg / rc_s away from what the free-running filter would have served, which is
-      # the rate the served position has exactly where this branch begins (both branches step the
-      # position by trail_limit_deg * dt / rc_s there), so no crossing of this boundary hands the
-      # tracker a rate step larger than the filter's own smoothing already produces at it.
-      position = target.position_deg - math.copysign(trail_limit_deg, trail)
-      rate += _clip(target.rate_deg_s - rate, trail_limit_deg / rc_s)
-    self.target = RackTarget(position, rate)
+    previous = self.target.position_deg
+    if bypass:
+      position = position_deg
+      self.limited = False
+    else:
+      position = previous + alpha * (position_deg - previous)
+      trail = position_deg - position
+      self.limited = abs(trail) > trail_limit_deg
+      if self.limited:
+        # bound the position at the trail limit so a real change still passes at once (R5)
+        position = position_deg - math.copysign(trail_limit_deg, trail)
+    if self.limited or bypass:
+      # the served position is the raw target's (less a fixed trail): its frame difference is that target's own
+      # staircase, served through the filter's time constant from the value the free branch last served
+      self.rate_deg_s += alpha * ((position - previous) / dt - self.rate_deg_s)
+    else:
+      # the served position is the filter's output: (r - x) / rc is its backward difference exactly, and
+      # better conditioned than differencing two nearly equal positions
+      self.rate_deg_s = (position_deg - position) / rc_s
+    self.target = RackTarget(position, self.rate_deg_s)
     return self.target
 
 
@@ -608,9 +615,6 @@ class PreviewScheduler:
 
 DT = .01
 RATE_HORIZON_S = .1
-HORIZON_POSITION_TOLERANCE_DEG = .01
-HORIZON_RATE_TOLERANCE_DEG_S = .5
-HORIZON_ACCELERATION_BLEND = .1
 MAX_FEEDBACK_TORQUE = .35
 TURN_IN_BLEND_DEG = 3.0  # the feedback cap blends between its two values over this much angle, not a boolean jump
 MAX_TURN_IN_FEEDBACK_TORQUE = .7
@@ -725,29 +729,6 @@ _LOW_SPEED_KP_SPEEDS = np.asarray([2.0, 3.0, 5.0, _LOW_SPEED_KP_END])
 _LOW_SPEED_KP = np.asarray([65.0, 10.0, 10.0, np.interp(_LOW_SPEED_KP_END, _STOCK_KP_SPEEDS, _STOCK_KP)])
 
 
-def horizon_candidate_preserves_immediate_path(
-  planner_position_deg: float,
-  target: RackTarget,
-  baseline: RackPlan,
-  candidate: RackPlan,
-) -> bool:
-  immediate_error = target.position_deg - planner_position_deg
-  candidate_motion = candidate.position_deg - planner_position_deg
-  wrong_side = (
-    immediate_error * candidate_motion < 0.0
-    and abs(candidate_motion) > HORIZON_POSITION_TOLERANCE_DEG
-  )
-  position_preserved = (
-    abs(target.position_deg - candidate.position_deg)
-    <= abs(target.position_deg - baseline.position_deg) + HORIZON_POSITION_TOLERANCE_DEG
-  )
-  rate_preserved = (
-    abs(target.rate_deg_s - candidate.rate_deg_s)
-    <= abs(target.rate_deg_s - baseline.rate_deg_s) + HORIZON_RATE_TOLERANCE_DEG_S
-  )
-  return not wrong_side and position_preserved and rate_preserved
-
-
 def _direction_guard(
   scale: float, previous_output: float | None, torque: float,
   planned_angle: float, target_angle: float, measured_angle: float, direction_fraction: float,
@@ -843,10 +824,15 @@ def _ff_taper_gate(v_ego_mps: float, target_angle_deg: float, measured_angle_deg
 
   The motion gate reads the SERVED target's rate alongside the plan's: the reference-filtered target
   is what the plan is chasing, so it leads the plan into a real move and the plan's own rate alone
-  leaves the taper open through the lead-in frames of a highway turn-in or unwind (route 4d/4c:
-  r2_impl_F3/gate_change_scan.py, 111/114 active frames where the served rate is the larger of the
-  two, every one of them at 79-129 km/h inside a real leg, the gate dropping by up to 0.62/0.76).
-  Whichever rate is larger governs, so this can only ever close the gate sooner, never open it.
+  leaves the taper open through the lead-in frames of a highway turn-in or unwind. With the served
+  rate the served position's own derivative (2026-09-11) it leads the plan's rate by 0.08 s at
+  22+ m/s (peak cross-correlation 0.84-0.89, routes 5b/4d/54/69) and is the larger of the two on
+  47-50 % of the frames where either exceeds the knee (route-audit
+  phase3/resonance_fix_2026-09-11/review/ff_lead.py; the earlier 111/114 was the plan-slope rate,
+  which ran ahead of the served motion). While the filter runs free that rate is bounded by
+  trail_limit / rc -- 4.0 deg/s at 30 m/s with the preview fully open, under the 5 deg/s knee -- so
+  there the plan's own rate is what closes the gate, 0.08 s later. Whichever rate is larger governs,
+  so this can only ever close the gate sooner, never open it.
 
   A hand on the wheel closes it outright, like every other steeringPressed site in this file: while
   the driver steers, the wheel's own motion -- not a model dither -- is what the friction term reads,
@@ -978,7 +964,7 @@ class RackTrajectoryController:
       )
     raw_rate = min(max(comfort.max_rate_deg_s, required_rate * ENVELOPE_OPEN_MARGIN), ceiling.max_rate_deg_s)
     raw_accel = min(max(comfort.max_acceleration_deg_s2, required_accel * ENVELOPE_OPEN_MARGIN), ceiling.max_acceleration_deg_s2)
-    raw_jerk = min(max(comfort.max_jerk_deg_s3, raw_accel / RESPONSE_TIME_S), ceiling.max_jerk_deg_s3)
+    raw_jerk = min(max(comfort.max_jerk_deg_s3, raw_accel / comfort.response_time_s), ceiling.max_jerk_deg_s3)
 
     def ease(attribute: str, raw: float, floor: float) -> float:
       current = getattr(self, attribute)
@@ -1049,6 +1035,8 @@ class RackTrajectoryController:
       # the wheel may have moved while the plan was held: carry the plan along with it, once
       self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
       self.rack_rate_estimator.reseed(float(CS.steeringAngleDeg))
+    # the frames held through are elapsed time for everything differenced against the last served frame
+    elapsed_s = self.dt * (1 + self.inactive_frames)
     self.inactive_frames = 0
     self.hold_angle_deg = None
     if self.model is None:
@@ -1153,42 +1141,19 @@ class RackTrajectoryController:
     opened_profile = self._horizon_opened_profile(profile, targets, self.envelope_scheduler.index, ceiling)
     limits, profile_transition = self._motion_limits(opened_profile)  # opened profile feeds the ratchet, never the reverse (R4/R10)
     filtered_target = self.reference_filter.update(
-      RackTarget(target.angle_deg, target.rate_deg_s), reference_trail_limit_deg(VM, CS.vEgo), self.dt,
+      target.angle_deg, reference_trail_limit_deg(VM, CS.vEgo), elapsed_s,
       path_limited or measured_out_of_bounds or profile_transition,
       REFERENCE_FILTER_RC_S + REFERENCE_FILTER_PREVIEW_RC_S * preview_s / HORIZON_S,
     )
     planner = self.planner
     assert planner is not None
-    timed_targets = tuple(
-      (offset, RackTarget(path_target.angle_deg, path_target.rate_deg_s))
-      for offset, path_target in zip(HORIZON_OFFSETS_S, targets, strict=True)
-      if offset > 0.0
-    )
+    # the planner's own tracker law is the only acceleration source; recovery is the one override
     desired_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
-      if desired_acceleration is None:
-        fitted_acceleration = horizon_desired_acceleration(planner, timed_targets)
-        natural_frequency = 2.0 / limits.response_time_s
-        reactive_acceleration = (
-          natural_frequency ** 2 * (filtered_target.position_deg - planner.position_deg)
-          + 2.0 * natural_frequency * (filtered_target.rate_deg_s - planner.rate_deg_s)
-        )
-        horizon_acceleration = reactive_acceleration + HORIZON_ACCELERATION_BLEND * (
-          fitted_acceleration - reactive_acceleration
-        )
-
-        def preview(acceleration_override: float | None) -> RackPlan:
-          candidate = JerkLimitedRackPlanner(planner.position_deg, planner.rate_deg_s)
-          candidate.acceleration_deg_s2 = planner.acceleration_deg_s2
-          return candidate.update(filtered_target, limits, self.dt, acceleration_override)
-
-        baseline = preview(None)
-        horizon = preview(horizon_acceleration)
-        if horizon_candidate_preserves_immediate_path(planner.position_deg, filtered_target, baseline, horizon):
-          desired_acceleration = horizon_acceleration
-      raw_plan = planner.update(
-        filtered_target, limits, self.dt, desired_acceleration,
-      )
+      # one frame of the plan, held frames or not: the plan is the trajectory being executed and a hold pauses
+      # it (R6), so it resumes where it stopped instead of jumping the frames it did not run. Only what is
+      # differenced against the world -- the served rate, the planned lateral jerk -- takes the elapsed time
+      raw_plan = planner.update(filtered_target, limits, self.dt, desired_acceleration)
     except ValueError:
       self._invalidate(STATUS_INVALID_PLANNER_STATE)
       return None
@@ -1204,7 +1169,14 @@ class RackTrajectoryController:
     measured_lateral_accel = measured_curvature * CS.vEgo ** 2
     target_angle = filtered_target.position_deg - params.angleOffsetDeg
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
-    target_motion = target_angle - measured_angle + RESPONSE_TIME_S * filtered_target.rate_deg_s
+    # where the served target is heading is the model's own bounded target, which the reference filter
+    # converges to: while the filter runs free, target + rc * served_rate IS that target, exactly. It is not
+    # extrapolated over a response time: with the served rate the served position's own motion, a bounded
+    # excursion or a bypass snap is a staircase, and 0.3 s of its rate is up to 300 deg of phantom intent
+    # (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1: direction_fraction jumping
+    # by more than 0.5 in a frame rose 0.01 % -> 0.5 % of frames below 10 m/s with the extrapolation kept)
+    intended_angle = target.angle_deg - params.angleOffsetDeg
+    target_motion = intended_angle - measured_angle
     # how much of a turn-in this frame is, continuously: the wheel on (or near) the target's side, the
     # target beyond it, and the motion demanded toward it -- each condition a ramp, not a test (R7)
     toward = math.copysign(1.0, target_angle) if target_angle != 0.0 else 0.0
@@ -1215,7 +1187,7 @@ class RackTrajectoryController:
     )
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
-      (planned_lateral_accel - self.previous_planned_lateral_accel) / self.dt
+      (planned_lateral_accel - self.previous_planned_lateral_accel) / elapsed_s
       if self.previous_planned_lateral_accel is not None else 0.0
     )
     self.previous_planned_lateral_accel = planned_lateral_accel
@@ -1239,7 +1211,6 @@ class RackTrajectoryController:
           and abs(filtered_lateral_accel) < abs(planned_lateral_accel)):
       trajectory_feedforward_lateral_accel = filtered_lateral_accel
     planned_angle = plan.position_deg - params.angleOffsetDeg
-    intended_angle = measured_angle + target_motion
     # how far past what is still needed the wheel already is, signed and continuous: +1 a pure unwind
     # (neither the plan nor the commanded motion holds any of the current angle), 0 exactly at the need
     # (bit-identical to no relaxation), negative a turn-in still short of the need. Generalizes the
