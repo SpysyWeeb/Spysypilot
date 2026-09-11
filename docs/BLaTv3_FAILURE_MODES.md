@@ -141,6 +141,18 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   and carried through profile transitions (a branch of `_motion_limits` used to drop it). The
   proactive and corroborated opening of the comfort envelope itself is still open: it belongs to
   the phase-4 envelope `(headroom − H) × G`.*
+  *Phase 3 step 6 (2026-09-11, the resonance fix): the response time is now 0.3 s at the action
+  time (0.4 s at the full preview), and the tracker's own law is the only source of the plan's
+  acceleration. The cubic fit to the far knots and the 10 % blend that mixed it in
+  (`horizon_desired_acceleration`, `horizon_candidate_preserves_immediate_path`,
+  `HORIZON_ACCELERATION_BLEND`) are gone: the blend carried its own unweighted target-rate term,
+  so the anticipation weight would have had to be one number in the tracker and another in the
+  blend, chosen to net out. One law in one function, `tracker_acceleration`, with the target's
+  rate weighted by `TARGET_RATE_ANTICIPATION` = 0.925 — `H(s) = (2 k wn s + wn²)/(s + wn)²` has a
+  zero at wn/(2k) that amplifies everything below √2 wn at k = 1, even with a perfect rate. The far
+  knots stay (both schedulers read them); `_recovery_acceleration` stays the one override. Measured
+  on routes 5b/4d/54 in route-audit phase3/resonance_fix_2026-09-11/DESIGN.md; the merge waits on
+  the highway drive.*
 - **R5 Filtering is bounded in amplitude *and* time.** Any smoothing of the reference may
   hold the served target back from the model's by at most a stated amplitude, and any such
   trailing must decay with a stated time constant; a real change always passes at once, short
@@ -155,6 +167,14 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   reversals with the 3° hard bound. The owner's bound: ≤ 3° in the twelve largest low-speed
   turn-ins/unwinds, checked in replay. The reversal governor is retired; its 0.12 s constant
   survives as `DIRECTION_GUARD_RC_S` for the direction guard's recovery ramp.*
+  *Phase 3 step 6 (2026-09-11, the resonance fix): the served rate is the derivative of the served
+  position — `(r − x)/rc` in the free branch, the backward difference of the served position
+  exactly — and no longer a low-pass of the model's plan-slope stencil, which ran up to 1.27× ahead
+  of that derivative at 31–40 m/s and so scaled the tracker's rate term with speed (the stencil
+  still builds the far knots' rates for the schedulers). The bounded branch is unchanged, but with
+  the free branch's derivative as its base it no longer walks to the raw target's rate over
+  successive frames: a sustained pinned excursion serves that derivative plus one bounded step.
+  route-audit phase3/resonance_fix_2026-09-11/DESIGN.md.*
 - **R6 No frame is ever invalid-to-zero; degrade to warm stock, not to a weaker tier.** The
   only fallback is the stock shadow (it has the integrator a scalar-only rack tier lacks).
   One staleness threshold, owned by the controller, checked against `timestampEof` **and**

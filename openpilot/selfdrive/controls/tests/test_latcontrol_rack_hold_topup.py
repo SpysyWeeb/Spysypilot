@@ -390,15 +390,19 @@ class TestHoldTopup(OpenpilotTestCase):
       output = step(frame + i)
     frame += 30
     assert abs(output.hold_topup_torque) < 0.45 * abs(grown), (output.hold_topup_torque, grown)
-    # plan and target on opposite sides of the wheel: no growth at all, whatever the plan error
+    # plan and target on opposite sides of the wheel: no growth at all, whatever the plan error.
+    # The settled plan sits ON the served target here, so the gap is opened deliberately -- the plan
+    # held short of the target and the wheel between the two -- rather than read off whichever side
+    # of the target the settled plan happens to land on (2026-09-11: it used to be decided by the
+    # last bit of that landing, route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
     controller.hold_topup_torque = 0.0
     for i in range(1, 201):
-      # a wheel past the served target on the target's side while the plan is still short of it
-      plan_short = abs(output.planned_angle_deg) < abs(output.near_target_angle_deg)
-      CS.steeringAngleDeg = output.near_target_angle_deg * 1.02 if plan_short else output.planned_angle_deg
+      target_angle = output.near_target_angle_deg
+      controller.planner.position_deg = target_angle * 0.9  # the plan short of the target ...
+      CS.steeringAngleDeg = target_angle * 0.95             # ... and the wheel between the two
       output = step(frame + i)
-      if abs(output.planned_angle_deg) < abs(output.near_target_angle_deg) and abs(CS.steeringAngleDeg) > abs(output.planned_angle_deg):
-        assert not output.hold_topup_growing
+      assert abs(output.planned_angle_deg) < abs(CS.steeringAngleDeg) < abs(output.near_target_angle_deg)
+      assert not output.hold_topup_growing and output.hold_topup_torque == 0.0
 
   def test_composed_torque_r7_bound_across_a_press_and_release(self):
     # the review's finding: the assist branch slews the committed torque toward its cap during an

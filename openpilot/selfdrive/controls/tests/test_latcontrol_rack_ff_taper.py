@@ -183,8 +183,12 @@ class TestFFTaperController(OpenpilotTestCase):
     chatter_without = self._mean_abs_step(feedforward_without)
     chatter_with = self._mean_abs_step(feedforward_with)
     assert chatter_without > 0.001  # sanity: the untapered fixture really does chatter
-    # meaningfully smoothed (measured: ~4.2x on this fixture), not just nudged
-    assert chatter_with < 0.5 * chatter_without
+    # meaningfully smoothed (measured: 1.9x on this fixture), not just nudged. It was 4.2x before
+    # 2026-09-11: the served rate is now the served position's own derivative, which carries this
+    # fixture's 15 Hz dither (served rate p95 0.0 -> 6.4 deg/s, plan rate p95 0.5 -> 2.4 deg/s), so
+    # the untapered chatter it is measured against rose 2.5x with it
+    # (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+    assert chatter_with < 0.6 * chatter_without
     # steady-state authority is preserved (measured: <1% mean shift on this fixture); the
     # authoritative check is the real route: impl_F3/analyze_4d.py's "steady-state authority"
     # section on segments 37-44 (route 4d, the report's own worst highway stretch)
@@ -248,12 +252,15 @@ class TestFFTaperController(OpenpilotTestCase):
     without = run(True)
     with_taper = run(False)
     deltas = [taper.torque - base.torque for base, taper in zip(without, with_taper)]
-    # bounded: on this fixture the largest deviation is ~0.0036 (~1.5 CAN counts of 409, opendbc's
+    # bounded: on this fixture the largest deviation is ~0.0070 (~2.9 CAN counts of 409, opendbc's
     # STEER_MAX for this platform -- materials.md), well under R7_MAX_TORQUE_STEP (0.05, ~20 counts).
+    # It was ~0.0036 before 2026-09-11: the served rate the gate closes on is now the served
+    # position's own derivative, so the gate's ramp at the onset differs
+    # (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
     # A real highway turn-in can cost more than this synthetic fixture shows -- see
     # impl_F3/highway_turnin_scan.py's route-4d scan (median 0.014, worst 0.051 across 17 events at
     # RC=0.1s) and FIX_NOTE.md's honest risk writeup; this unit test only pins the mechanism's shape.
-    assert max(abs(delta) for delta in deltas) < 0.006
+    assert max(abs(delta) for delta in deltas) < 0.01
     # and it does not linger: exactly bit-identical again well before the ramp finishes (by the time
     # the served -- reference-filtered -- target has cleared the deadband, index 11 on this fixture,
     # ~0.11 s into a 0.3 s turn-in)
