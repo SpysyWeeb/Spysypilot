@@ -699,6 +699,53 @@ red-team pass.
   press, so the release jump they target is the assist cap's own, pre-existing and out of scope.
   Documented exemption: every driver gate is keyed on `steeringPressed` (150 raw counts on the Palisade),
   so a sustained light hand below the threshold is invisible to this term as to every other.*
+  *Phase 3 step 2 (2026-09-11): the term runs in two regimes, because at speed it was never the term
+  described above. Measured over 1395 holds of ≥ 1 s on routes 5b/4d/54/69/6a/6e
+  (route-audit `phase3/topup_2026-09-11/DESIGN.md`): from 17 m/s up the settled top-up **opposes** the
+  feedforward on 81–93 % of holds and tracks the plan error (+0.68…+0.81) and the held angle negatively
+  (−0.34…−0.75) — it trims a feedforward that over-delivers in a held curve. That is integral action, and
+  the design case it exists for (a hold past 10° below 17 m/s) occurs seven times in six routes of
+  ordinary driving. Its gates are in wheel degrees, so above 17 m/s they are open 93–100 % of the time,
+  and its angle-space rate made it a second proportional path there (`K_i / K_p` = 1.1 per second at
+  35 m/s) with 60–85° of lag inside the 0.35–0.8 Hz band — the ablation's `no_topup` arm put its share of
+  in-band `planned:torque` at −7.6…−8.6 % at 86–144 km/h. So: below `HOLD_TOPUP_HOLD_SPEED_MPS` (10 m/s)
+  the term is exactly what it was, bit for bit; above `HOLD_TOPUP_TRIM_SPEED_MPS` (15 m/s) it integrates
+  the same error P acts on, in P's own units, at `K_i = K_p(v) / HOLD_TOPUP_TRIM_TIME_CONSTANT_S`, so its
+  share of P is `1 / (2 π f T_i)` at every speed by construction; between them a smoothstep of speed
+  blends the growth law, the passive leak, the cap and the zero snap (the fast leak is not blended: a
+  press drains the term in 0.3 s at any speed). `T_i` is derived, not tuned — the band rule "at most a
+  tenth of P at 0.35 Hz" needs `T_i ≥ 4.5 s`, and 5 s gives 0.091. The cap is 0.10, under a third of P's
+  own (the 0.20 above is 57 % of it); the leak is 30 s, because a 3 s leak is a lag compensator with a
+  0.053 Hz corner, not integral action. The boundary is measured: the sign against the feedforward flips
+  between the 5–10 and the 17–24 m/s holds, and 15 m/s is torqued's own validated speed floor (R10).
+  The zero snap had to become regime-scoped too (`HOLD_TOPUP_TRIM_ZERO_EPS_TORQUE` 1e-6): a trim frame
+  grows by `dt · P / T_i`, 5.2e-5 at the P this term actually sees at 20–40 m/s, and the hold regime's
+  1e-4 snapped that back to 0.0 every frame — with it kept, the integrator is identically zero for every
+  |P| < 0.05, which is most of the highway. Open-loop replay on 5b/4d/54/69/6a: in-band (0.35–0.8 Hz)
+  `planned:torque` h1 0.1246 → 0.1133 at 86–112 km/h and 0.1734 → 0.1591 at 112–144 km/h (−9.1 %,
+  −8.3 %); commanded-torque band rms −10.7 % at 0.35–0.55 Hz / −7.3 % at 0.55–0.8 Hz for 24–31 m/s and
+  −7.9 % / −7.4 % for 31–40 m/s; the top-up's own in-band rms falls from 0.51 of P's to 0.088 at
+  24–40 m/s; P itself is unchanged to 0.00 % in every band. Every frame at or below 10 m/s whose
+  engagement had never been faster is byte-identical on every logged array across all six routes; on the
+  rest of the sub-10 m/s time the carried state differs by at most 0.024 torque and 1e-4 on average.
+  Route 0x3e's hold (1556.0–1557.3 s, 7.2–9.9 m/s) is preserved: the request differs from the shipped
+  term by at most 3.4e-4 and the top-up reaches −0.1125 against −0.1127, the difference being only the
+  state carried in as the car decelerated 19 → 10 m/s through the blend. Closed loop on the phase-3 plant
+  twin over the same window is bit-identical (the plant is stiction-bound there, 92 of 130 frames at
+  exactly zero rate either way — the documented plant limit, not evidence). **The hold-effort regime is
+  provisional**: it stands in for a hold-effort feedforward (tyre scrub, static friction past the
+  lateral-acceleration model) that phase 4 owes, and is retired to a single integrator when that exists —
+  the phase-3 plant twin cannot supply it (its steady-state load is the same linear lateral-acceleration
+  form plus friction, and its Stage B dynamics are fitted only below 14 m/s). Evidence:
+  route-audit `phase3/topup_2026-09-11/IMPL.md`.
+  `test_the_hold_regime_is_the_shipped_term_bit_for_bit`,
+  `test_the_trim_leg_integrates_p_at_the_derived_time_constant`,
+  `test_the_trim_leg_is_a_tenth_of_p_at_the_bands_low_edge`,
+  `test_the_trim_regime_leaks_at_its_own_time_constant`,
+  `test_the_trim_regime_zero_snap_is_below_one_frame_of_growth`,
+  `test_the_regime_blend_is_continuous_and_r7_bounded_across_the_boundary`,
+  `test_the_hold_regime_has_no_speed_term`, `test_the_trim_regime_follows_ps_own_speed_schedule`,
+  `test_the_trim_regime_stays_a_trim_at_highway_speed`.*
 
 ### L4 Driver interaction
 
