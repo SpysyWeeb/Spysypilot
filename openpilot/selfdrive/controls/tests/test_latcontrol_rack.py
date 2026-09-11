@@ -227,35 +227,33 @@ class TestLatControlRack(OpenpilotTestCase):
 
   def test_reference_filter_passes_a_large_step_within_its_bound_and_settles(self):
     filter_ = ReferenceFilter()
-    assert filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01) == RackTarget(0.0, 0.0)
-    served = filter_.update(RackTarget(30.0, 300.0), 3.0, 0.01)
+    assert filter_.update(0.0, 3.0, 0.01) == RackTarget(0.0, 0.0)
+    served = filter_.update(30.0, 3.0, 0.01)
     # the position passes at once, short of the target by the bound. The served rate is the served position's
     # own frame difference through the filter's time constant, from the rate served before (0 here): the
-    # 27 deg catch-up is 2700 deg/s for one frame, of which one alpha is served; the raw target's plan-slope
-    # rate (300) never enters
+    # 27 deg catch-up is 2700 deg/s for one frame, of which one alpha is served
     alpha = 0.01 / (0.1 + 0.01)
     assert math.isclose(served.position_deg, 27.0) and filter_.limited
     assert math.isclose(served.rate_deg_s, alpha * 2700.0)
     for _ in range(30):
-      served = filter_.update(RackTarget(30.0, 0.0), 3.0, 0.01)
+      served = filter_.update(30.0, 3.0, 0.01)
       assert 27.0 - 1e-9 <= served.position_deg <= 30.0
     assert abs(30.0 - served.position_deg) < 0.2 and not filter_.limited
 
   def test_reference_filter_rate_is_the_served_position_s_own_motion_in_every_branch(self):
-    # Feed a jittery low-speed target (2-30 deg steps, the model's own frame-to-frame swing below 3 m/s) with an
-    # arbitrary plan-slope rate, and require every frame that the served rate is the served position's own
-    # motion: the exact derivative (r - x) / rc while the filter runs free, the low-passed frame difference
-    # while the bound pins the position to the raw target -- and that the raw rate is never served.
+    # Feed a jittery low-speed target (2-30 deg steps, the model's own frame-to-frame swing below 3 m/s) and
+    # require every frame that the served rate is the served position's own motion: the exact derivative
+    # (r - x) / rc while the filter runs free, the low-passed frame difference while the bound pins the
+    # position to the raw target. The raw target's plan-slope rate is not an input at all.
     filter_ = ReferenceFilter()
-    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    filter_.update(0.0, 3.0, 0.01)
     raws = [1.0, 3.0, 9.0, 12.0, 11.0, 25.0, 40.0, 41.0, 20.0, -5.0, -30.0, -31.0, -31.5, -10.0, 0.0]
     alpha = 0.01 / (0.1 + 0.01)
     previous = filter_.target
     model_rate = 0.0
     limited_frames = free_frames = 0
-    for index, raw_position in enumerate(raws * 3):
-      raw_rate = 1000.0 * ((index % 7) - 3)  # deliberately unrelated to the position: it must not matter
-      served = filter_.update(RackTarget(raw_position, raw_rate), 3.0, 0.01)
+    for raw_position in raws * 3:
+      served = filter_.update(raw_position, 3.0, 0.01)
       free_position = previous.position_deg + alpha * (raw_position - previous.position_deg)
       if filter_.limited:
         limited_frames += 1
@@ -267,7 +265,6 @@ class TestLatControlRack(OpenpilotTestCase):
         model_rate = (raw_position - served.position_deg) / 0.1
         assert abs(model_rate - (served.position_deg - previous.position_deg) / 0.01) <= 1e-9 * max(1.0, abs(model_rate))
       assert math.isclose(served.rate_deg_s, model_rate, rel_tol=1e-12, abs_tol=1e-9)
-      assert not math.isclose(served.rate_deg_s, raw_rate) or raw_rate == 0.0
       previous = served
     assert limited_frames > 20 and free_frames >= 5
 
@@ -279,18 +276,18 @@ class TestLatControlRack(OpenpilotTestCase):
     # six time constants, never past it; when the target stops, the served rate returns to the exact derivative
     # at once, because the pinned position really stops (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
     filter_ = ReferenceFilter()
-    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    filter_.update(0.0, 3.0, 0.01)
     raw_position = 0.0
     previous_rate = 0.0
     for frame in range(60):
       raw_position += 300.0 * 0.01
-      served = filter_.update(RackTarget(raw_position, 300.0), 3.0, 0.01)
+      served = filter_.update(raw_position, 3.0, 0.01)
       if frame >= 1:  # the first 3 deg step is inside the bound; the second pins it
         assert filter_.limited and math.isclose(raw_position - served.position_deg, 3.0)  # trail pinned at the bound
       assert previous_rate - 1e-9 <= served.rate_deg_s <= 300.0 + 1e-9
       previous_rate = served.rate_deg_s
     assert served.rate_deg_s > 0.99 * 300.0
-    stopped = filter_.update(RackTarget(raw_position, 300.0), 3.0, 0.01)
+    stopped = filter_.update(raw_position, 3.0, 0.01)
     assert not filter_.limited and math.isclose(stopped.rate_deg_s, (raw_position - stopped.position_deg) / 0.1)
     assert stopped.rate_deg_s < 0.11 * 300.0
 
@@ -298,69 +295,117 @@ class TestLatControlRack(OpenpilotTestCase):
     # The free branch's rate is `(r - x) / rc`, which is the backward difference of the served
     # position exactly -- both are `(r - x_prev) / (rc + dt)` -- so the rate the tracker
     # anticipates with is the motion the served target is actually making, at any rc and dt. The
-    # raw target's own rate does not enter it: the plan-slope stencil it used to be low-passed from
-    # ran ahead of the served position by up to 1.27x at highway speed, which scaled the tracker's
-    # rate term with speed and amplified the model's target at 0.55-0.8 Hz
-    # (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+    # plan-slope stencil rate it used to be low-passed from ran ahead of the served position by up
+    # to 1.27x at highway speed, which scaled the tracker's rate term with speed and amplified the
+    # model's target at 0.55-0.8 Hz (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
     for rc_s in (.05, .1, .3):
       for dt in (.005, .01, .02):
-        for raw_rate in (0.0, 25.0, -400.0):
-          filter_ = ReferenceFilter()
-          filter_.update(RackTarget(-1.5, 7.0), 100.0, dt, rc_s=rc_s)
-          previous = filter_.target
-          for raw_position in (-1.5, -1.2, .4, .45, -.3, 2.0, 2.0, 1.0):
-            served = filter_.update(RackTarget(raw_position, raw_rate), 100.0, dt, rc_s=rc_s)
-            assert not filter_.limited  # the 100 deg bound never binds here: the free branch only
-            backward_difference = (served.position_deg - previous.position_deg) / dt
-            assert abs(served.rate_deg_s - backward_difference) <= 1e-9 * max(1.0, abs(backward_difference))
-            assert math.isclose(served.rate_deg_s, (raw_position - served.position_deg) / rc_s)
-            previous = served
+        filter_ = ReferenceFilter()
+        filter_.update(-1.5, 100.0, dt, rc_s=rc_s)
+        previous = filter_.target
+        for raw_position in (-1.5, -1.2, .4, .45, -.3, 2.0, 2.0, 1.0):
+          served = filter_.update(raw_position, 100.0, dt, rc_s=rc_s)
+          assert not filter_.limited  # the 100 deg bound never binds here: the free branch only
+          backward_difference = (served.position_deg - previous.position_deg) / dt
+          assert abs(served.rate_deg_s - backward_difference) <= 1e-9 * max(1.0, abs(backward_difference))
+          assert math.isclose(served.rate_deg_s, (raw_position - served.position_deg) / rc_s)
+          previous = served
 
   def test_reference_filter_is_bounded_across_the_trail_bound_boundary(self):
     # R7 sweep of the only input that can cross this rule's boundary: the raw target's position. The served
     # position is continuous there (both branches agree at |trail| == the bound). The served rate changes
     # expression there, from the exact derivative to the low-passed frame difference started from the rate
     # served before; at the boundary the exact derivative is trail_limit_deg / rc_s, so the change is at most
-    # that, for any raw rate, however large -- the raw rate never enters either expression. (The 2e-6 of gap
-    # between the two probes is itself worth 2e-5 deg/s of free-branch rate, which the tolerance carries.)
-    def served(gap, seed_rate, raw_rate):
+    # that. (The 2e-6 of gap between the two probes is itself worth 2e-5 deg/s of free-branch rate, which the
+    # tolerance carries.) Away from the boundary the served position itself kinks -- a jump into the bound or
+    # a bypass snap -- and the rate says so; test_reference_filter_serves_a_kink_as_one_low_passed_frame pins that.
+    def served(gap):
       filter_ = ReferenceFilter()
-      filter_.update(RackTarget(0.0, seed_rate), 3.0, 0.01)
-      return filter_, filter_.update(RackTarget(gap, raw_rate), 3.0, 0.01)
+      filter_.update(0.0, 3.0, 0.01)
+      return filter_, filter_.update(gap, 3.0, 0.01)
 
     boundary = 3.0 * 11.0 / 10.0  # |trail| = (1 - alpha) * gap == 3.0 with alpha = 1/11
-    for seed_rate in (-20.0, 0.0, 10.0, 40.0):
-      for raw_rate in (-400.0, -40.0, 5.0, 40.0, 400.0):
-        below_filter, below = served(boundary - 1e-6, seed_rate, raw_rate)
-        above_filter, above = served(boundary + 1e-6, seed_rate, raw_rate)
-        assert not below_filter.limited and above_filter.limited
-        assert abs(above.position_deg - below.position_deg) < 1e-5
-        assert math.isclose(below.rate_deg_s, 3.0 / 0.1, rel_tol=1e-5)
-        assert abs(above.rate_deg_s - below.rate_deg_s) <= 3.0 / 0.1 + 2e-5
-        assert not math.isclose(above.rate_deg_s, raw_rate)
+    for sign in (1.0, -1.0):
+      below_filter, below = served(sign * (boundary - 1e-6))
+      above_filter, above = served(sign * (boundary + 1e-6))
+      assert not below_filter.limited and above_filter.limited
+      assert abs(above.position_deg - below.position_deg) < 1e-5
+      assert math.isclose(below.rate_deg_s, sign * 3.0 / 0.1, rel_tol=1e-5)
+      assert abs(above.rate_deg_s - below.rate_deg_s) <= 3.0 / 0.1 + 2e-5
+
+  def test_reference_filter_serves_a_kink_as_one_low_passed_frame(self):
+    # The served position is C0 but not C1 at a jump into the bound, a bypass snap, or a dragged target stopping
+    # dead: those are real kinks in the position the filter serves, and the served rate reports each as the
+    # low-passed frame difference for one frame, then returns to the exact derivative. Pinned here, not
+    # smoothed: the numbers are what the tracker (jerk-limited) and the taper gate see, and nothing else
+    # extrapolates the served rate (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1).
+    alpha = 0.01 / (0.1 + 0.01)
+    filter_ = ReferenceFilter()
+    filter_.update(0.0, 3.0, 0.01)
+    jumped = filter_.update(10.0, 3.0, 0.01)  # from rest into the bound: the position steps 7 deg at once
+    assert filter_.limited and math.isclose(jumped.position_deg, 7.0)
+    assert math.isclose(jumped.rate_deg_s, alpha * 700.0)  # 63.6 deg/s for this one frame
+    settled = filter_.update(10.0, 3.0, 0.01)
+    assert not filter_.limited and math.isclose(settled.rate_deg_s, (10.0 - settled.position_deg) / 0.1)
+    assert settled.rate_deg_s < 3.0 / 0.1 + 1e-9  # back under the free branch's own ceiling the next frame
+
+    filter_ = ReferenceFilter()
+    filter_.update(0.0, 3.0, 0.01)
+    snapped = filter_.update(20.0, 3.0, 0.01, bypass=True)
+    assert math.isclose(snapped.rate_deg_s, alpha * 2000.0)  # 181.8 deg/s for this one frame
+    after = filter_.update(20.0, 3.0, 0.01)
+    assert math.isclose(after.rate_deg_s, 0.0, abs_tol=1e-9)  # the snap is one frame wide by construction
+
+  def test_reference_filter_takes_a_held_frame_as_elapsed_time(self):
+    # The controller keeps the plan through up to INACTIVE_HOLD_FRAMES inactive frames without serving; the
+    # frame that resumes is differenced against the last served one over the time that really passed. Pinned
+    # and bypassed frames divide by it, so a resume after a hold is the motion's real rate, not a
+    # (1 + held frames)x overestimate of it; the free branch is (r - x) / rc and only its step widens.
+    alpha_frame = 0.01 / (0.1 + 0.01)
+    alpha_gap = 0.06 / (0.1 + 0.06)
+    for bypass in (False, True):
+      filter_ = ReferenceFilter()
+      filter_.update(0.0, 3.0, 0.01)
+      position = 0.0
+      for _ in range(40):  # a 60 deg/s drag: past the free branch's 30 deg/s ceiling, so the 3 deg bound pins
+        position += 60.0 * 0.01
+        served = filter_.update(position, 3.0, 0.01, bypass=bypass)
+      assert filter_.limited or bypass
+      assert 55.0 < served.rate_deg_s < 60.0 + 1e-9  # the low-pass has all but converged to the drag's own rate
+      position += 60.0 * 0.06  # the drag continued through five held frames; the sixth resumes
+      resumed = filter_.update(position, 3.0, 0.06, bypass=bypass)
+      assert filter_.limited or bypass
+      assert math.isclose(resumed.rate_deg_s, served.rate_deg_s + alpha_gap * (60.0 - served.rate_deg_s))
+      assert resumed.rate_deg_s <= 60.0 + 1e-9  # never past the motion's own rate
+    filter_ = ReferenceFilter()
+    filter_.update(0.0, 3.0, 0.01)
+    resumed = filter_.update(1.0, 3.0, 0.06)
+    assert math.isclose(resumed.position_deg, alpha_gap * 1.0) and not filter_.limited
+    assert math.isclose(resumed.rate_deg_s, (1.0 - resumed.position_deg) / 0.1)
+    assert alpha_frame < alpha_gap  # the free step really widened with the time
 
   def test_reference_filter_smooths_small_jitter(self):
     filter_ = ReferenceFilter()
-    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    filter_.update(0.0, 3.0, 0.01)
     served = []
     for frame in range(400):
       # the model's target flipping by 2 degrees every model frame, as it does at low speed
       raw = 2.0 if (frame // 5) % 2 == 0 else -2.0
-      served.append(filter_.update(RackTarget(raw, 0.0), 3.0, 0.01).position_deg)
+      served.append(filter_.update(raw, 3.0, 0.01).position_deg)
     assert max(abs(value) for value in served[100:]) < 1.0
     assert not filter_.limited
 
   def test_reference_filter_bypass_and_reset(self):
     filter_ = ReferenceFilter()
-    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
+    filter_.update(0.0, 3.0, 0.01)
     # a bypass snaps the served position to the raw target; the served rate is that snap through the filter's
-    # time constant, not the raw target's plan-slope rate
-    bypassed = filter_.update(RackTarget(20.0, 0.0), 3.0, 0.01, bypass=True)
+    # time constant
+    bypassed = filter_.update(20.0, 3.0, 0.01, bypass=True)
     assert bypassed.position_deg == 20.0 and math.isclose(bypassed.rate_deg_s, 2000.0 * 0.01 / 0.11) and not filter_.limited
     filter_.reset()
     assert filter_.target is None
-    # the first frame after a reset serves the raw position at rest: the plan-slope rate never enters
-    assert filter_.update(RackTarget(-5.0, 1.0), 3.0, 0.01) == RackTarget(-5.0, 0.0)
+    # the first frame after a reset serves the raw position at rest
+    assert filter_.update(-5.0, 3.0, 0.01) == RackTarget(-5.0, 0.0)
 
   def test_reference_trail_limit_is_the_wheel_cap_at_low_speed_and_a_lateral_accel_at_speed(self):
     assert reference_trail_limit_deg(self.VM, 5.0) == REFERENCE_FILTER_TRAIL_MAX_DEG
@@ -441,14 +486,14 @@ class TestLatControlRack(OpenpilotTestCase):
 
   def test_preview_slows_the_filter_within_its_bound(self):
     filter_ = ReferenceFilter()
-    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
-    quick = [filter_.update(RackTarget(1.0, 0.0), 3.0, 0.01).position_deg for _ in range(10)]
+    filter_.update(0.0, 3.0, 0.01)
+    quick = [filter_.update(1.0, 3.0, 0.01).position_deg for _ in range(10)]
     filter_.reset()
-    filter_.update(RackTarget(0.0, 0.0), 3.0, 0.01)
-    calm = [filter_.update(RackTarget(1.0, 0.0), 3.0, 0.01, rc_s=0.3).position_deg for _ in range(10)]
+    filter_.update(0.0, 3.0, 0.01)
+    calm = [filter_.update(1.0, 3.0, 0.01, rc_s=0.3).position_deg for _ in range(10)]
     assert quick[-1] > calm[-1] > 0.0
     # a step past the bound is served at the bound regardless of the time constant
-    assert math.isclose(filter_.update(RackTarget(20.0, 100.0), 3.0, 0.01, rc_s=0.3).position_deg, 17.0)
+    assert math.isclose(filter_.update(20.0, 3.0, 0.01, rc_s=0.3).position_deg, 17.0)
 
   def test_feedback_keeps_authority_at_standstill(self):
     controller = RackTrajectoryController()
@@ -1835,6 +1880,45 @@ class TestLatControlRack(OpenpilotTestCase):
       assert abs(output.direction_fraction) < 0.05
       assert not output.direction_guarded
 
+  def test_intended_angle_is_the_models_bounded_target_not_a_served_rate_extrapolation(self):
+    # The turn-in lead and direction_fraction read where the served target is heading. That is the model's
+    # own bounded target, which the reference filter converges to -- not the served target plus a response
+    # time of its rate: with the served rate the served position's own motion, a bounded excursion at low
+    # speed runs at the raw target's rate (hundreds of deg/s while the model swings), and 0.3 s of that is
+    # tens of degrees of phantom intent flipping direction_fraction frame to frame
+    # (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1).
+    torque_params = self.CP.lateralTuning.torque
+    torque_params.friction = 0.0
+    torque_params.latAccelOffset = 0.0
+    speed = 5.0
+    self.CS.vEgo = speed
+    self.CS.steeringAngleDeg = 30.0  # the wheel well into the turn the model is still swinging toward
+    self.CS.steeringRateDeg = 0.0
+    controller = RackTrajectoryController()
+    controller.planner = JerkLimitedRackPlanner(30.0)
+    model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [speed] * 6)
+    excursion_frames = 0
+    for frame in range(80):
+      target_angle = min(60.0, frame * 3.0)  # a 300 deg/s swing, pinning the 3 deg trail bound every frame
+      desired_curvature = -self.VM.calc_curvature(math.radians(target_angle), speed, 0.0)
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      model.action.desiredCurvature = desired_curvature
+      controller.set_model(model, model.timestampEof + 50_000_000)
+      output = controller.update(True, self.CS, self.VM, self.params, torque_params,
+                                 lambda lateral_accel, _: lateral_accel, .2, desired_curvature)
+      assert output is not None
+      measured = self.CS.steeringAngleDeg
+      hold_angle = abs(output.planned_angle_deg) if output.planned_angle_deg * measured > 0.0 else 0.0
+      turn_in_angle = abs(output.near_target_angle_deg) if output.near_target_angle_deg * measured > 0.0 else 0.0
+      expected = min(max(1.0 - max(hold_angle, turn_in_angle) / abs(measured), -1.0), 1.0) * min(abs(measured) / TURN_IN_BLEND_DEG, 1.0)
+      assert math.isclose(output.direction_fraction, expected, abs_tol=1e-9)
+      if output.reference_limited and abs(output.target_rate_deg_s) > 100.0:
+        excursion_frames += 1
+        # the fixture discriminates: a 0.3 s extrapolation of this served rate would put the intent
+        # tens of degrees further and read the frame as a deep turn-in instead
+        extrapolated = abs(output.target_angle_deg + 0.3 * output.target_rate_deg_s)
+        assert extrapolated - abs(output.near_target_angle_deg) > 20.0
+    assert excursion_frames >= 10
 
   def test_direction_fraction_relaxes_rate_feedback_on_unwind(self):
     torque_params = self.CP.lateralTuning.torque

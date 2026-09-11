@@ -150,9 +150,16 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   blend, chosen to net out. One law in one function, `tracker_acceleration`, with the target's
   rate weighted by `TARGET_RATE_ANTICIPATION` = 0.925 — `H(s) = (2 k wn s + wn²)/(s + wn)²` has a
   zero at wn/(2k) that amplifies everything below √2 wn at k = 1, even with a perfect rate. The far
-  knots stay (both schedulers read them); `_recovery_acceleration` stays the one override. Measured
-  on routes 5b/4d/54 in route-audit phase3/resonance_fix_2026-09-11/DESIGN.md; the merge waits on
-  the highway drive.*
+  knots stay (the two `PreviewScheduler` instances read their angles and curvatures, the profile
+  opener `_horizon_opened_profile` their rates); `_recovery_acceleration` stays the one override.
+  Measured on routes 5b/4d/54 in route-audit phase3/resonance_fix_2026-09-11/DESIGN.md; the merge
+  waits on the highway drive.*
+  *Review pass (2026-09-11): the opener's jerk leg (`raw_accel / response time`) read the module
+  constant while every other leg of the profile carries the scheduled response time; it now reads
+  `comfort.response_time_s`. Inert on the corpus — the opening binds on 0.000 % of engaged frames on
+  routes 5b/4d/54/69 (review/envelope_bind.py), the comfort table always wins — so consistency, not a
+  retune; noted because the 0.4 → 0.3 s change had silently moved that leg by +33 % where it would
+  bind. `RESPONSE_TIME_S` now has one consumer, the profile schedule.*
 - **R5 Filtering is bounded in amplitude *and* time.** Any smoothing of the reference may
   hold the served target back from the model's by at most a stated amplitude, and any such
   trailing must decay with a stated time constant; a real change always passes at once, short
@@ -171,17 +178,40 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   position — `(r − x)/rc` in the free branch, the backward difference of the served position
   exactly — and no longer a low-pass of the model's plan-slope stencil, which ran up to 1.27× ahead
   of that derivative at 31–40 m/s and so scaled the tracker's rate term with speed (the stencil
-  still builds the far knots' rates for the schedulers). The bounded branch is unchanged, but with
-  the free branch's derivative as its base it no longer walks to the raw target's rate over
-  successive frames: a sustained pinned excursion serves that derivative plus one bounded step.
-  route-audit phase3/resonance_fix_2026-09-11/DESIGN.md.*
+  still builds the far knots' rates, which the R4 profile opener reads; the raw target's rate is
+  no longer an input to the filter). While the bound pins the served position to the raw target,
+  or a bypass snaps it there, the served rate is that position's own frame difference through the
+  same time constant, continued from the rate served before: a sustained pinned excursion converges
+  to the raw target's rate, because the pinned position moves with it, and the frame the pin
+  releases the exact derivative is served again. A jump into the bound, a snap, or a dragged
+  target stopping dead is a real kink in the served position and is served as one for a frame
+  (a 10° step from rest: 64 deg/s at rc 0.1, trail/rc from the next frame); the tracker's jerk
+  limit bounds what the plan makes of it, and nothing else extrapolates the served rate (R7 note,
+  the intended angle). The filter takes `dt` as the time since the position last served, so a
+  frame held through (R6) is elapsed time, not a skipped one.
+  route-audit phase3/resonance_fix_2026-09-11/DESIGN.md and review/REVIEW.md.*
 - **R6 No frame is ever invalid-to-zero; degrade to warm stock, not to a weaker tier.** The
   only fallback is the stock shadow (it has the integrator a scalar-only rack tier lacks).
   One staleness threshold, owned by the controller, checked against `timestampEof` **and**
   `sm.alive` (`sm.valid` never decays and cannot detect a hung publisher); below it, *hold*
   state, never reset; above it, hand over with hysteresis (≥0.5 s in stock).
+  *Review pass (2026-09-11): a hold through up to `INACTIVE_HOLD_FRAMES` inactive frames keeps the
+  plan and the reference filter alive without serving; the resuming frame differences the served
+  position and the planned lateral acceleration over the time that really passed
+  (`elapsed_s = dt × (1 + frames held)`), so a pinned or bypassed resume serves the motion's real
+  rate rather than a (1 + held)× overestimate, and the friction term's jerk does not spike. Before
+  this the pinned branch had never differenced positions, so the case did not exist
+  (review/REVIEW.md §7). `test_reference_filter_takes_a_held_frame_as_elapsed_time`.*
 - **R7 Continuity.** Every rule is continuous in its inputs; sweep tests across every rule
   boundary are required unit tests. No exact-zero special cases.
+  *Review pass (2026-09-11): the turn-in lead and `direction_fraction` read where the served
+  target is heading as the model's own bounded target (`intended_angle = target.angle_deg −
+  offset`), not the served target plus `RESPONSE_TIME_S` of its rate. While the filter runs free
+  the two are the same thing (`x + rc·(r − x)/rc = r`); with the served rate the served position's
+  own motion, a pinned excursion at low speed runs at the raw target's rate and 0.3 s of it was up
+  to 300° of phantom intent — `direction_fraction` jumping by more than 0.5 in one frame had risen
+  from 0.01 % to 0.5 % of frames below 10 m/s with the extrapolation kept (review/REVIEW.md §1).
+  `test_intended_angle_is_the_models_bounded_target_not_a_served_rate_extrapolation`.*
 - **R8 Fail closed at selection — for the controller *and* the torque authority.** Unknown,
   mixed, or empty firmware → stock controller **and** stock 384/3/7 envelope, from the same test.
 - **R9 The controller knows every platform limiter by name:** opendbc slew 409/+4/−7 with its

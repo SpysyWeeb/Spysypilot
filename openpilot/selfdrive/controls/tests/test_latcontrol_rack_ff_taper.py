@@ -88,17 +88,17 @@ class TestFFTaperGate(OpenpilotTestCase):
 
   def test_continuous_through_every_boundary(self):
     # R7: each factor is a smoothstep, so the product is continuous everywhere, never a step
-    speeds = [FF_TAPER_SPEED_MPS - FF_TAPER_SPEED_BLEND_MPS + step for step in range(0, 9)]
+    speeds = [FF_TAPER_SPEED_MPS - FF_TAPER_SPEED_BLEND_MPS + step for step in range(9)]
     gates = [_ff_taper_gate(speed, 0.0, 0.0, 0.0, 0.0, False) for speed in speeds]
     assert gates == sorted(gates)  # monotonic in speed
     assert all(0.0 <= gate <= 1.0 for gate in gates)
-    for previous, current in zip(gates, gates[1:]):
+    for previous, current in zip(gates, gates[1:], strict=False):
       assert current - previous < 0.4  # no boundary jump; a 1 m/s step moves the gate smoothly
 
     angles = [step * FF_TAPER_ANGLE_DEG / 8.0 for step in range(9)]
     angle_gates = [_ff_taper_gate(35.0, angle, angle, 0.0, 0.0, False) for angle in angles]
     assert angle_gates == sorted(angle_gates, reverse=True)  # monotonically closes as curvature grows
-    for previous, current in zip(angle_gates, angle_gates[1:]):
+    for previous, current in zip(angle_gates, angle_gates[1:], strict=False):
       assert previous - current < 0.4
 
     # the served-rate half of the motion gate is a smoothstep too, not a test
@@ -172,7 +172,7 @@ class TestFFTaperController(OpenpilotTestCase):
   @staticmethod
   def _mean_abs_step(values, warmup=10):
     settled = values[warmup:]
-    return sum(abs(b - a) for a, b in zip(settled, settled[1:])) / (len(settled) - 1)
+    return sum(abs(b - a) for a, b in zip(settled, settled[1:], strict=False)) / (len(settled) - 1)
 
   def test_taper_meaningfully_smooths_highway_straight_feedforward(self):
     speed = 35.0  # m/s, 126 km/h -- inside segments 37-44's own ~120-129 km/h band
@@ -183,11 +183,14 @@ class TestFFTaperController(OpenpilotTestCase):
     chatter_without = self._mean_abs_step(feedforward_without)
     chatter_with = self._mean_abs_step(feedforward_with)
     assert chatter_without > 0.001  # sanity: the untapered fixture really does chatter
-    # meaningfully smoothed (measured: 1.9x on this fixture), not just nudged. It was 4.2x before
-    # 2026-09-11: the served rate is now the served position's own derivative, which carries this
-    # fixture's 15 Hz dither (served rate p95 0.0 -> 6.4 deg/s, plan rate p95 0.5 -> 2.4 deg/s), so
-    # the untapered chatter it is measured against rose 2.5x with it
-    # (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+    # meaningfully smoothed (measured: 1.86x on this fixture, 0.005302 -> 0.002851), not just nudged.
+    # It was 4.2x before 2026-09-11 (0.002081 -> 0.000495): the served rate is now the served
+    # position's own derivative, which carries this fixture's 15 Hz dither (served rate p95 0.0 ->
+    # 4.9 deg/s over the frames measured here, 6.0 over all 80; plan rate p95 0.5 -> 2.4 deg/s), so
+    # the untapered chatter it is measured against rose 2.5x with it and the tapered residual 5.8x.
+    # The ratio is what this test pins; the residual is a real cost of the honest rate on this
+    # synthetic dither, scored on the real routes in route-audit phase3/resonance_fix_2026-09-11/
+    # DESIGN.md (0.8-2 Hz torque content).
     assert chatter_with < 0.6 * chatter_without
     # steady-state authority is preserved (measured: <1% mean shift on this fixture); the
     # authoritative check is the real route: impl_F3/analyze_4d.py's "steady-state authority"
@@ -251,20 +254,21 @@ class TestFFTaperController(OpenpilotTestCase):
 
     without = run(True)
     with_taper = run(False)
-    deltas = [taper.torque - base.torque for base, taper in zip(without, with_taper)]
-    # bounded: on this fixture the largest deviation is ~0.0070 (~2.9 CAN counts of 409, opendbc's
-    # STEER_MAX for this platform -- materials.md), well under R7_MAX_TORQUE_STEP (0.05, ~20 counts).
-    # It was ~0.0036 before 2026-09-11: the served rate the gate closes on is now the served
-    # position's own derivative, so the gate's ramp at the onset differs
-    # (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+    deltas = [taper.torque - base.torque for base, taper in zip(without, with_taper, strict=True)]
+    # bounded: on this fixture the largest deviation is 0.000218 (under 0.1 CAN count of 409, opendbc's
+    # STEER_MAX for this platform -- materials.md), far under R7_MAX_TORQUE_STEP (0.05, ~20 counts).
+    # It was ~0.0036 before 2026-09-11 and ~0.0070 with the first form of the served rate (a bounded
+    # step toward the plan-slope rate while pinned); with the served rate the served position's own
+    # derivative the gate closes on the move's real onset, so the taper blends in almost nothing
+    # (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md, review/REVIEW.md section 5).
     # A real highway turn-in can cost more than this synthetic fixture shows -- see
     # impl_F3/highway_turnin_scan.py's route-4d scan (median 0.014, worst 0.051 across 17 events at
     # RC=0.1s) and FIX_NOTE.md's honest risk writeup; this unit test only pins the mechanism's shape.
-    assert max(abs(delta) for delta in deltas) < 0.01
+    assert max(abs(delta) for delta in deltas) < 0.001
     # and it does not linger: exactly bit-identical again well before the ramp finishes (by the time
-    # the served -- reference-filtered -- target has cleared the deadband, index 11 on this fixture,
-    # ~0.11 s into a 0.3 s turn-in)
-    for baseline_output, taper_output in list(zip(without, with_taper))[11:]:
+    # the served -- reference-filtered -- target has cleared the deadband, index 3 on this fixture,
+    # 0.03 s into a 0.3 s turn-in)
+    for baseline_output, taper_output in list(zip(without, with_taper, strict=True))[3:]:
       assert taper_output.torque == baseline_output.torque
       assert taper_output.feedforward_torque == baseline_output.feedforward_torque
 

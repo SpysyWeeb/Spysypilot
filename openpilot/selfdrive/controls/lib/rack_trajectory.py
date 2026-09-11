@@ -361,12 +361,18 @@ class ReferenceFilter:
   position (both are `(r - x_prev) / (rc + dt)`). While the bound pins the served position to the
   raw target, or a bypass snaps it there, the position is not filtered and its frame difference is
   the raw target's own 20 Hz staircase, so that difference is served through the same time constant
-  instead, starting from the free branch's value so the two expressions meet without a step; when
-  the pin releases the served rate returns to the exact derivative at once, which is the motion the
-  served position really makes when a dragged target stops. A served rate larger than the served
-  position's own derivative scales the tracker's rate term with it and moves the tracker's zero
-  with speed; that is what amplified the model's target by 1.26 at 0.55-0.8 Hz at highway speed
-  (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+  instead, continued from the rate served before. The two expressions agree where a target crosses
+  the bound smoothly (both are trail_limit / rc there); a jump into the bound, a bypass snap, or a
+  dragged target stopping dead is a real kink in the served position and is served as one: a
+  10 deg step from rest serves 64 deg/s for one frame at rc .1 and trail_limit / rc from the next
+  (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1). The tracker's jerk
+  limit bounds what the plan makes of such a frame, and nothing else extrapolates the served rate.
+  A served rate larger than the served position's own derivative scales the tracker's rate term
+  with it and moves the tracker's zero with speed; that is what amplified the model's target by 1.26
+  at 0.55-0.8 Hz at highway speed (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+
+  `dt` is the time since the position last served, not the loop period: a frame the controller
+  held through is elapsed time, and both the filter step and the served rate are taken over it.
   """
 
   def __init__(self) -> None:
@@ -379,27 +385,27 @@ class ReferenceFilter:
     self.limited = False
     self.rate_deg_s = 0.0
 
-  def update(self, target: RackTarget, trail_limit_deg: float, dt: float, bypass: bool = False,
+  def update(self, position_deg: float, trail_limit_deg: float, dt: float, bypass: bool = False,
              rc_s: float = REFERENCE_FILTER_RC_S) -> RackTarget:
     if self.target is None:
       # no served position to differentiate yet: serve the raw position at rest. The raw target's plan-slope
-      # rate never enters the served rate, not even here (it ran 1.27x ahead of the served motion at speed)
-      self.target = RackTarget(target.position_deg, 0.0)
+      # rate never enters the served rate (it ran 1.27x ahead of the served motion at speed), so it is not an input
+      self.target = RackTarget(position_deg, 0.0)
       self.limited = False
       self.rate_deg_s = 0.0
       return self.target
     alpha = dt / (rc_s + dt)
     previous = self.target.position_deg
     if bypass:
-      position = target.position_deg
+      position = position_deg
       self.limited = False
     else:
-      position = previous + alpha * (target.position_deg - previous)
-      trail = target.position_deg - position
+      position = previous + alpha * (position_deg - previous)
+      trail = position_deg - position
       self.limited = abs(trail) > trail_limit_deg
       if self.limited:
         # bound the position at the trail limit so a real change still passes at once (R5)
-        position = target.position_deg - math.copysign(trail_limit_deg, trail)
+        position = position_deg - math.copysign(trail_limit_deg, trail)
     if self.limited or bypass:
       # the served position is the raw target's (less a fixed trail): its frame difference is that target's own
       # staircase, served through the filter's time constant from the value the free branch last served
@@ -407,7 +413,7 @@ class ReferenceFilter:
     else:
       # the served position is the filter's output: (r - x) / rc is its backward difference exactly, and
       # better conditioned than differencing two nearly equal positions
-      self.rate_deg_s = (target.position_deg - position) / rc_s
+      self.rate_deg_s = (position_deg - position) / rc_s
     self.target = RackTarget(position, self.rate_deg_s)
     return self.target
 
@@ -818,10 +824,15 @@ def _ff_taper_gate(v_ego_mps: float, target_angle_deg: float, measured_angle_deg
 
   The motion gate reads the SERVED target's rate alongside the plan's: the reference-filtered target
   is what the plan is chasing, so it leads the plan into a real move and the plan's own rate alone
-  leaves the taper open through the lead-in frames of a highway turn-in or unwind (route 4d/4c:
-  r2_impl_F3/gate_change_scan.py, 111/114 active frames where the served rate is the larger of the
-  two, every one of them at 79-129 km/h inside a real leg, the gate dropping by up to 0.62/0.76).
-  Whichever rate is larger governs, so this can only ever close the gate sooner, never open it.
+  leaves the taper open through the lead-in frames of a highway turn-in or unwind. With the served
+  rate the served position's own derivative (2026-09-11) it leads the plan's rate by 0.08 s at
+  22+ m/s (peak cross-correlation 0.84-0.89, routes 5b/4d/54/69) and is the larger of the two on
+  47-50 % of the frames where either exceeds the knee (route-audit
+  phase3/resonance_fix_2026-09-11/review/ff_lead.py; the earlier 111/114 was the plan-slope rate,
+  which ran ahead of the served motion). While the filter runs free that rate is bounded by
+  trail_limit / rc -- 4.0 deg/s at 30 m/s with the preview fully open, under the 5 deg/s knee -- so
+  there the plan's own rate is what closes the gate, 0.08 s later. Whichever rate is larger governs,
+  so this can only ever close the gate sooner, never open it.
 
   A hand on the wheel closes it outright, like every other steeringPressed site in this file: while
   the driver steers, the wheel's own motion -- not a model dither -- is what the friction term reads,
@@ -953,7 +964,7 @@ class RackTrajectoryController:
       )
     raw_rate = min(max(comfort.max_rate_deg_s, required_rate * ENVELOPE_OPEN_MARGIN), ceiling.max_rate_deg_s)
     raw_accel = min(max(comfort.max_acceleration_deg_s2, required_accel * ENVELOPE_OPEN_MARGIN), ceiling.max_acceleration_deg_s2)
-    raw_jerk = min(max(comfort.max_jerk_deg_s3, raw_accel / RESPONSE_TIME_S), ceiling.max_jerk_deg_s3)
+    raw_jerk = min(max(comfort.max_jerk_deg_s3, raw_accel / comfort.response_time_s), ceiling.max_jerk_deg_s3)
 
     def ease(attribute: str, raw: float, floor: float) -> float:
       current = getattr(self, attribute)
@@ -1024,6 +1035,8 @@ class RackTrajectoryController:
       # the wheel may have moved while the plan was held: carry the plan along with it, once
       self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
       self.rack_rate_estimator.reseed(float(CS.steeringAngleDeg))
+    # the frames held through are elapsed time for everything differenced against the last served frame
+    elapsed_s = self.dt * (1 + self.inactive_frames)
     self.inactive_frames = 0
     self.hold_angle_deg = None
     if self.model is None:
@@ -1128,7 +1141,7 @@ class RackTrajectoryController:
     opened_profile = self._horizon_opened_profile(profile, targets, self.envelope_scheduler.index, ceiling)
     limits, profile_transition = self._motion_limits(opened_profile)  # opened profile feeds the ratchet, never the reverse (R4/R10)
     filtered_target = self.reference_filter.update(
-      RackTarget(target.angle_deg, target.rate_deg_s), reference_trail_limit_deg(VM, CS.vEgo), self.dt,
+      target.angle_deg, reference_trail_limit_deg(VM, CS.vEgo), elapsed_s,
       path_limited or measured_out_of_bounds or profile_transition,
       REFERENCE_FILTER_RC_S + REFERENCE_FILTER_PREVIEW_RC_S * preview_s / HORIZON_S,
     )
@@ -1153,7 +1166,14 @@ class RackTrajectoryController:
     measured_lateral_accel = measured_curvature * CS.vEgo ** 2
     target_angle = filtered_target.position_deg - params.angleOffsetDeg
     measured_angle = float(CS.steeringAngleDeg) - params.angleOffsetDeg
-    target_motion = target_angle - measured_angle + RESPONSE_TIME_S * filtered_target.rate_deg_s
+    # where the served target is heading is the model's own bounded target, which the reference filter
+    # converges to: while the filter runs free, target + rc * served_rate IS that target, exactly. It is not
+    # extrapolated over a response time: with the served rate the served position's own motion, a bounded
+    # excursion or a bypass snap is a staircase, and 0.3 s of its rate is up to 300 deg of phantom intent
+    # (route-audit phase3/resonance_fix_2026-09-11/review/REVIEW.md, section 1: direction_fraction jumping
+    # by more than 0.5 in a frame rose 0.01 % -> 0.5 % of frames below 10 m/s with the extrapolation kept)
+    intended_angle = target.angle_deg - params.angleOffsetDeg
+    target_motion = intended_angle - measured_angle
     # how much of a turn-in this frame is, continuously: the wheel on (or near) the target's side, the
     # target beyond it, and the motion demanded toward it -- each condition a ramp, not a test (R7)
     toward = math.copysign(1.0, target_angle) if target_angle != 0.0 else 0.0
@@ -1164,7 +1184,7 @@ class RackTrajectoryController:
     )
     lateral_accel_error = planned_lateral_accel - measured_lateral_accel
     raw_lateral_jerk = (
-      (planned_lateral_accel - self.previous_planned_lateral_accel) / self.dt
+      (planned_lateral_accel - self.previous_planned_lateral_accel) / elapsed_s
       if self.previous_planned_lateral_accel is not None else 0.0
     )
     self.previous_planned_lateral_accel = planned_lateral_accel
@@ -1188,7 +1208,6 @@ class RackTrajectoryController:
           and abs(filtered_lateral_accel) < abs(planned_lateral_accel)):
       trajectory_feedforward_lateral_accel = filtered_lateral_accel
     planned_angle = plan.position_deg - params.angleOffsetDeg
-    intended_angle = measured_angle + target_motion
     # how far past what is still needed the wheel already is, signed and continuous: +1 a pure unwind
     # (neither the plan nor the commanded motion holds any of the current angle), 0 exactly at the need
     # (bit-identical to no relaxation), negative a turn-in still short of the need. Generalizes the
