@@ -1663,6 +1663,81 @@ class TestLatControlRack(OpenpilotTestCase):
     steps = [abs(b["torque"] - a["torque"]) for a, b in zip(rows, rows[1:], strict=False)]
     assert max(steps) <= R7_MAX_TORQUE_STEP + 1e-9
 
+  def _held_frames_with_driver_press(self, driver_torque):
+    """The re-review's item (c) scenario (review/probe_held_c_driver_press.py): a tight curve with the
+    wheel well behind the plan composes near-saturation torque with the driver's hands off, then a
+    content fault lands on the same frame the driver grabs the wheel, and keeps landing for the whole
+    hold budget. Returns (the last composed torque, the held frames' rows)."""
+    controller, _, VM = get_rack_controller()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    CS.steeringAngleDeg = 0.5
+    params = log.VehicleParameters.new_message()
+    curvature = 0.006
+    good = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [curvature * 15.0] * 6, [15.0] * 6)
+    good.action.desiredCurvature = curvature
+    bad = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [curvature * 15.0] * 6, [15.0] * 6)
+    bad.action.desiredCurvature = curvature
+    bad.action.desiredCurvaturePreview = [math.nan] + list(bad.action.desiredCurvaturePreview)[1:]
+
+    def step(frame, model):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      return controller.update(True, CS, VM, params, False, curvature, False, 0.2,
+                               model=model, mono_time_ns=model.timestampEof + 30_000_000)
+
+    composed = 0.0
+    for frame in range(300):
+      composed, _, _ = step(frame, good)
+    CS.steeringPressed = driver_torque != 0.0
+    CS.steeringTorque = driver_torque
+    rows = []
+    for frame in range(300, 300 + INACTIVE_HOLD_FRAMES):
+      torque, _, rack_log = step(frame, bad)
+      assert rack_log.active and not rack_log.fallback and rack_log.status == STATUS_INVALID_PATH
+      rows.append({"torque": float(torque), "cap": float(rack_log.driverAssistCap),
+                   "limited": bool(rack_log.driverAssistLimited), "torqueLimited": bool(rack_log.torqueLimited)})
+    return float(composed), rows
+
+  def test_a_held_frame_answers_an_opposing_grab_at_the_assist_envelope(self):
+    # re-review item (c): the held frame used to re-serve the committed torque untouched, so a hard
+    # opposing grab landing on the fault frame was answered only when the hold ended -- a frame
+    # saturated at 1.0 held for five frames against an envelope that allows 0.5. The held torque now
+    # goes through the same driver-assist clamp and R7 slew an ordinary frame does.
+    composed, rows = self._held_frames_with_driver_press(200.0)
+    assert composed == -1.0  # the platform clip, with the driver's hands off
+    limits = CarControllerParams(self.CP)
+    cap = _driver_assist_envelope(200.0, composed, DriverAssistLimits(
+      STEER_MAX=float(limits.STEER_MAX),
+      STEER_DRIVER_ALLOWANCE=float(limits.STEER_DRIVER_ALLOWANCE),
+      STEER_DRIVER_MULTIPLIER=float(limits.STEER_DRIVER_MULTIPLIER),
+      STEER_DRIVER_FACTOR=float(limits.STEER_DRIVER_FACTOR),
+    ))
+    assert cap == MAX_DRIVER_ASSIST_TORQUE  # an opposing push floors the envelope
+    previous = composed
+    for row in rows:
+      assert row["cap"] == cap and row["limited"] and row["torqueLimited"]
+      assert abs(row["torque"]) < abs(previous)  # moving toward the cap, not sitting at the raw value
+      assert math.isclose(abs(row["torque"] - previous), R7_MAX_TORQUE_STEP, abs_tol=1e-9)  # one step a frame
+      previous = row["torque"]
+    assert abs(rows[-1]["torque"]) <= abs(composed) - INACTIVE_HOLD_FRAMES * R7_MAX_TORQUE_STEP + 1e-9
+
+  def test_a_held_frame_widens_the_cap_for_a_grab_that_agrees(self):
+    # the same relaxation an ordinary pressed frame gets (FM4.9): a driver pushing with the
+    # controller's own intent widens the cap toward the ceiling, so the held torque stands
+    composed, rows = self._held_frames_with_driver_press(-200.0)
+    assert composed == -1.0
+    for row in rows:
+      assert row["cap"] > MAX_DRIVER_ASSIST_TORQUE
+      assert row["torque"] == composed and not row["limited"]
+
+  def test_a_held_frame_with_hands_off_serves_the_committed_torque(self):
+    # nothing changes for the case the hold was built for: no press, no cap, no slew
+    composed, rows = self._held_frames_with_driver_press(0.0)
+    for row in rows:
+      assert row["torque"] == composed
+      assert row["cap"] == DRIVER_ASSIST_CEILING and not row["limited"]
+      assert row["torqueLimited"]  # still not this frame's own composition
+
   def test_the_torque_step_across_a_real_hand_over_is_r7_bounded(self):
     # the two controllers each bound their own rules, but neither can see the other: unslewed, the
     # rack-to-stock and stock-to-rack frames stepped by the whole difference between two independently

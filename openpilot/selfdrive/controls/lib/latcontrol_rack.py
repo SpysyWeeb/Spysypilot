@@ -86,9 +86,9 @@ class LatControlRack(LatControl):
 
     The rack controller's own R7 baseline is deliberately left alone. Every hand-over is preceded by a
     reset that clears it, so it can never be stale from before a stock interval, and on the reconcile
-    frames the clamp here is the binding one: a probe that presses the driver's hand through a
-    stale-model hand-over delivers bit-identical torque whether or not the controller is told what was
-    committed (route-audit phase3/hygiene_batch_2026-09-11/probe_seed_effect.py).
+    frames the clamp here is the binding one: a probe that reconstructs that seed in memory and presses
+    the driver's hand through a stale-model hand-over delivers bit-identical torque with and without it
+    (route-audit phase3/hygiene_batch_2026-09-11/review/reintroduce_seed.py).
 
     `output_altered` records whether this frame's committed torque is the source's own request or
     something this class changed, for the log's torqueLimited flag."""
@@ -137,18 +137,22 @@ class LatControlRack(LatControl):
     rack_log.version = VERSION
     rack_log.status = self.rack.status
     if held:
-      # keep steering with what was already committed; stock stays in shadow with a clean integrator,
-      # exactly as while the rack steers. p/d/f and the top-up are a frame's composition and this frame
-      # has none, so they stay at 0.0 rather than repeat the last frame's; torqueLimited says the
-      # committed torque is not this frame's composition, which is what it already means for the
-      # platform clip, the guard and driver assist.
-      torque = self._commit(active, self.committed_torque, True)
+      # keep steering with what was already committed, through the controller's own driver-assist
+      # envelope and release slew: the frame composed no request, but the driver's hands are this
+      # frame's news. Stock stays in shadow with a clean integrator, exactly as while the rack steers.
+      # p/d/f and the top-up are a frame's composition and this frame has none, so they stay at 0.0
+      # rather than repeat the last frame's; torqueLimited says the committed torque is not this
+      # frame's composition, which is what it already means for the platform clip, the guard and
+      # driver assist.
+      held_torque, driver_assist_limited, driver_assist_cap = self.rack.held_output(self.committed_torque, CS)
+      torque = self._commit(active, held_torque, True)
       self.torque.pid.reset()
       rack_log.active = True
       rack_log.fallback = False
       rack_log.output = torque
       rack_log.torqueLimited = True
-      rack_log.driverAssistCap = DRIVER_ASSIST_CEILING  # not "capped to zero"; see the stock branch below
+      rack_log.driverAssistLimited = bool(driver_assist_limited)
+      rack_log.driverAssistCap = float(driver_assist_cap)
       rack_log.saturated = bool(self._check_saturation(self.steer_max - abs(torque) < 1e-3, CS,
                                                        steer_limited_by_safety, curvature_limited))
       self.torque.sat_time = self.sat_time

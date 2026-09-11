@@ -1091,6 +1091,67 @@ class RackTrajectoryController:
     a content fault -- the output is state too, so a bad frame of model content does not change hands."""
     return self.planner is not None and 0 < self.inactive_frames <= INACTIVE_HOLD_FRAMES
 
+  def _commit_torque(self, torque: float, CS) -> tuple[float, bool, float]:
+    """The driver's say on the torque about to be committed, and the R7 baseline that follows from it.
+
+    While the driver steers, the request is capped by the platform's own driver-allowance envelope --
+    widened toward DRIVER_ASSIST_CEILING for a push that agrees with the controller's live intent,
+    floored at MAX_DRIVER_ASSIST_TORQUE for one that opposes (FM4.9) -- and slewed from the last
+    committed torque at the R7 step, so a grab is answered at once but never with a jump. When the hand
+    comes off, the same slew continues until the request is within a step of what was committed.
+
+    R7's baseline is the torque actually committed, taken after this clip and its own backstop -- not
+    the guard's own pre-clip value -- so a saturated hand-off can't leave a phantom-high baseline that
+    forces an unwanted high-torque hold the instant the driver releases the wheel.
+
+    Every torque this controller commits passes through here, the frames it holds included
+    (`held_output`): a held frame composes no request, but the driver's hands are this frame's news,
+    and the envelope is about them, not about the request's age. Returns (torque, limited, cap)."""
+    driver_assist_limited = False
+    driver_assist_cap = DRIVER_ASSIST_CEILING
+    if CS.steeringPressed:
+      # Agreement relaxation (docs/BLaTv3_FAILURE_MODES.md FM4.9): a driver pushing with the
+      # controller's own live intent widens the cap toward 1.0, exactly as far as the platform's
+      # own driver-allowance limiter already would; an opposing driver still floors at
+      # MAX_DRIVER_ASSIST_TORQUE. Falls back to the old fixed cap for callers with no CP (tests,
+      # any future caller that hasn't threaded driver_assist_limits through).
+      driver_assist_cap = (
+        _driver_assist_envelope(CS.steeringTorque, torque, self.driver_assist_limits)
+        if self.driver_assist_limits is not None else MAX_DRIVER_ASSIST_TORQUE
+      )
+      assisted_torque = _clip(torque, driver_assist_cap)
+      if self.previous_output_torque is not None:  # same R7 idiom as _direction_guard, scoped to this branch
+        assisted_torque = min(max(assisted_torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
+                               self.previous_output_torque + R7_MAX_TORQUE_STEP)
+      driver_assist_limited = assisted_torque != torque
+      torque = assisted_torque
+      self.release_reconcile = True
+    elif self.release_reconcile and self.previous_output_torque is not None:
+      # The hand comes off: the branch above has slewed the committed torque toward the cap, and the
+      # composed request (the hold top-up's carried-in value included -- the fast leak only starts
+      # this frame) may sit a full step or more away. Keep the same R7 slew until the request is
+      # within a step of what was committed, then hand over cleanly (FM3.14 review: an unclamped
+      # release frame jumped by the term's whole value; the pre-existing gap was smaller, same shape).
+      reconciled_torque = min(max(torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
+                              self.previous_output_torque + R7_MAX_TORQUE_STEP)
+      self.release_reconcile = reconciled_torque != torque
+      driver_assist_limited = self.release_reconcile
+      torque = reconciled_torque
+    self.previous_output_torque = torque
+    return torque, driver_assist_limited, driver_assist_cap
+
+  def held_output(self, committed_torque: float, CS) -> tuple[float, bool, float]:
+    """What to keep steering with on a frame this controller held (R6, `holding`). The frame composed
+    no request of its own, so the torque already committed to the car stands in for one -- but the
+    driver is not held with it: the committed value goes through the same driver-assist envelope, the
+    same R7 slew and the same release bookkeeping an ordinary frame does, against this frame's own
+    driver state. Without that a grab landing on the fault frame was answered only when the hold ended,
+    up to INACTIVE_HOLD_FRAMES later, at whatever authority the last composed frame had
+    (route-audit phase3/hygiene_batch_2026-09-11/review/probe_held_c_driver_press.py: a frame saturated
+    at -1.0 held against a hard opposing press the envelope would have capped at 0.5).
+    Returns (torque, limited, cap), like the ordinary path."""
+    return self._commit_torque(float(committed_torque), CS)
+
   def hold(self) -> None:
     # a frame not served -- inactive, or one whose own inputs were faulty (_hold_fault below): keep the
     # planned rack through a short blip, start over after a real disengage
@@ -1493,42 +1554,8 @@ class RackTrajectoryController:
       self._invalidate(STATUS_INVALID_OUTPUT)
       return None
 
-    # --- driver assist, and the reconcile that follows a release ---
-    driver_assist_limited = False
-    driver_assist_cap = DRIVER_ASSIST_CEILING
-    if CS.steeringPressed:
-      # Agreement relaxation (docs/BLaTv3_FAILURE_MODES.md FM4.9): a driver pushing with the
-      # controller's own live intent widens the cap toward 1.0, exactly as far as the platform's
-      # own driver-allowance limiter already would; an opposing driver still floors at
-      # MAX_DRIVER_ASSIST_TORQUE. Falls back to the old fixed cap for callers with no CP (tests,
-      # any future caller that hasn't threaded driver_assist_limits through).
-      driver_assist_cap = (
-        _driver_assist_envelope(CS.steeringTorque, torque, self.driver_assist_limits)
-        if self.driver_assist_limits is not None else MAX_DRIVER_ASSIST_TORQUE
-      )
-      assisted_torque = _clip(torque, driver_assist_cap)
-      if self.previous_output_torque is not None:  # same R7 idiom as _direction_guard, scoped to this branch
-        assisted_torque = min(max(assisted_torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
-                               self.previous_output_torque + R7_MAX_TORQUE_STEP)
-      driver_assist_limited = assisted_torque != torque
-      torque = assisted_torque
-      self.release_reconcile = True
-    elif self.release_reconcile and self.previous_output_torque is not None:
-      # The hand comes off: the branch above has slewed the committed torque toward the cap, and the
-      # composed request (the hold top-up's carried-in value included -- the fast leak only starts
-      # this frame) may sit a full step or more away. Keep the same R7 slew until the request is
-      # within a step of what was committed, then hand over cleanly (FM3.14 review: an unclamped
-      # release frame jumped by the term's whole value; the pre-existing gap was smaller, same shape).
-      reconciled_torque = min(max(torque, self.previous_output_torque - R7_MAX_TORQUE_STEP),
-                              self.previous_output_torque + R7_MAX_TORQUE_STEP)
-      self.release_reconcile = reconciled_torque != torque
-      driver_assist_limited = self.release_reconcile
-      torque = reconciled_torque
-    # R7's baseline is the torque actually committed this frame, taken after the driver-assist clip
-    # (and its own backstop above) -- not the guard's own pre-clip value -- so a saturated hand-off
-    # can't leave a phantom-high baseline that forces an unwanted high-torque hold the instant the
-    # driver releases the wheel.
-    self.previous_output_torque = torque
+    # --- driver assist, the reconcile that follows a release, and the R7 baseline latch ---
+    torque, driver_assist_limited, driver_assist_cap = self._commit_torque(torque, CS)
     # --- the hold top-up's growth, deferred to here (FM3.14): the platform clip and the feedback cap
     # flags are the real applied-composition flags (last frame's top-up included) and the guard mix is
     # this frame's resolved value, not a stale one. A press freezes growth and selects the fast leak, and

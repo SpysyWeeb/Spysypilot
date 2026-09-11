@@ -240,6 +240,18 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   `test_a_content_fault_keeps_the_wheel_and_serves_again_on_the_next_good_frame`,
   `test_a_content_fault_run_past_the_budget_gives_the_wheel_back`,
   `test_a_lost_model_resets_and_recovers_cold`.*
+  *Re-review (2026-09-11): the plan is held, the driver is not. The first cut re-served the committed
+  torque untouched, so a hard opposing grab landing on the fault frame went unanswered until the hold
+  ended — a frame saturated at 1.0 held for five frames against an envelope that allows 0.5
+  (review/probe_held_c_driver_press.py; FM4.10's class of risk, but without FM4.10's ramp toward the
+  floor). The controller's press/release block is now one method, `_commit_torque`, and both the
+  ordinary path and `held_output` go through it: a held frame takes the same driver-assist envelope,
+  the same R7 slew from the last committed value and the same release bookkeeping, against this
+  frame's own driver state. The ordinary path is the same computation in the same order, so replay
+  stays bit-identical.
+  `test_a_held_frame_answers_an_opposing_grab_at_the_assist_envelope`,
+  `test_a_held_frame_widens_the_cap_for_a_grab_that_agrees`,
+  `test_a_held_frame_with_hands_off_serves_the_committed_torque`.*
 - **R7 Continuity.** Every rule is continuous in its inputs; sweep tests across every rule
   boundary are required unit tests. No exact-zero special cases.
   *Review pass (2026-09-11): the turn-in lead and `direction_fraction` read where the served
@@ -266,9 +278,9 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   cannot flap frame to frame, and the slew always starts from a settled value.
   The controller's own R7 baseline is deliberately not re-seeded from the committed value: every
   hand-over is preceded by a reset that clears it, and on the reconcile frames the wrapper's clamp is
-  the binding one — a probe that presses the driver's hand through a stale-model hand-over delivers
-  bit-identical torque with and without such a seed
-  (route-audit phase3/hygiene_batch_2026-09-11/probe_seed_effect.py).
+  the binding one — a probe that reconstructs that seed in memory and presses the driver's hand through
+  a stale-model hand-over delivers bit-identical torque with and without it
+  (route-audit phase3/hygiene_batch_2026-09-11/review/reintroduce_seed.py).
   The log's `output` carries the committed torque rather than the source's request, and `torqueLimited`
   is set on every frame the wrapper altered — a slew frame or a held frame — which is what that flag
   already means for the platform clip, the guard and driver assist. Field tooling must read it that
@@ -739,6 +751,11 @@ red-team pass.
   10 allowed frames; `rack_log.driverAssistCap` now reports `DRIVER_ASSIST_CEILING` rather than the
   capnp `Float32` default on fallback (stock-steered) frames, so this field never reads as "capped
   to zero" when the cap simply wasn't evaluated that frame.
+  *Hygiene batch re-review (2026-09-11): a frame the controller holds through a content fault (R6) was
+  briefly the one place where this cap was not evaluated at all — the held torque was re-served as
+  composed, for up to `INACTIVE_HOLD_FRAMES`, without moving toward the floor. It goes through the same
+  `_commit_torque` the ordinary path does now, so a held frame is bounded by this same FM4.10 case
+  rather than by nothing, and `driverAssistCap`/`driverAssistLimited` are logged from it.*
 
 ### L5 Runtime, fallback, integration
 
