@@ -355,52 +355,60 @@ class ReferenceFilter:
   wheel at low speed and nothing in lateral acceleration. The served target may trail the raw one
   by at most a lateral acceleration, capped in wheel angle, so a turn-in or an unwind passes with
   at most that trailing at once, and any trailing decays with the time constant once the raw target
-  settles. The served rate is the derivative of the served position, never a filtered copy of the
-  raw target's own rate: while the filter runs free it is `(r - x) / rc`, which is the backward
-  difference of the served position exactly (both are `(r - x_prev) / (rc + dt)`) without
-  differencing raw samples, so the rate the tracker anticipates with is the motion the served
-  target is actually making. While the bound holds the served position against the raw target the
-  trail no longer changes and the two move together, so the rate that position has is the raw
-  target's own -- reached with a bounded step, not the one-frame snap the bound used to make.
-  A served rate larger than the served position's own derivative scales the tracker's rate term
-  with it and moves the tracker's zero with speed; that is what amplified the model's target by
-  1.26 at 0.55-0.8 Hz at highway speed (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
+  settles. The served rate is the derivative of the served position at the filter's own bandwidth,
+  never a filtered copy of the raw target's plan-slope rate. While the filter runs free that
+  derivative is exact and already smooth: `(r - x) / rc` is the backward difference of the served
+  position (both are `(r - x_prev) / (rc + dt)`). While the bound pins the served position to the
+  raw target, or a bypass snaps it there, the position is not filtered and its frame difference is
+  the raw target's own 20 Hz staircase, so that difference is served through the same time constant
+  instead, starting from the free branch's value so the two expressions meet without a step; when
+  the pin releases the served rate returns to the exact derivative at once, which is the motion the
+  served position really makes when a dragged target stops. A served rate larger than the served
+  position's own derivative scales the tracker's rate term with it and moves the tracker's zero
+  with speed; that is what amplified the model's target by 1.26 at 0.55-0.8 Hz at highway speed
+  (route-audit phase3/resonance_fix_2026-09-11/DESIGN.md).
   """
 
   def __init__(self) -> None:
     self.target: RackTarget | None = None
     self.limited = False
+    self.rate_deg_s = 0.0  # the served rate: the served position's derivative, low-passed while the position is pinned
 
   def reset(self) -> None:
     self.target = None
     self.limited = False
+    self.rate_deg_s = 0.0
 
   def update(self, target: RackTarget, trail_limit_deg: float, dt: float, bypass: bool = False,
              rc_s: float = REFERENCE_FILTER_RC_S) -> RackTarget:
-    if self.target is None or bypass:
-      self.target = target
+    if self.target is None:
+      # no served position to differentiate yet: serve the raw position at rest. The raw target's plan-slope
+      # rate never enters the served rate, not even here (it ran 1.27x ahead of the served motion at speed)
+      self.target = RackTarget(target.position_deg, 0.0)
       self.limited = False
-      return target
+      self.rate_deg_s = 0.0
+      return self.target
     alpha = dt / (rc_s + dt)
-    position = self.target.position_deg + alpha * (target.position_deg - self.target.position_deg)
-    rate = (target.position_deg - position) / rc_s
-    trail = target.position_deg - position
-    self.limited = abs(trail) > trail_limit_deg
-    if self.limited:
-      # Bound the position at the trail limit so a real change still passes at once (R5), and serve
-      # the rate that bounded position actually has. Held against the raw target the trail stops
-      # changing, so the served position tracks the raw target one for one and its rate is the raw
-      # target's own rate -- the free branch's derivative describes a motion the bounded served
-      # target is not making, and the tracker's rate term is driven by the difference. Reach it
-      # with a bounded step rather than the snap this branch used to make: the branch may move the
-      # served rate at most trail_limit_deg / rc_s away from what the free-running filter would
-      # have served, which is the rate the served position has exactly where this branch begins
-      # (both branches step the position by trail_limit_deg * dt / rc_s there), so no crossing of
-      # this boundary hands the tracker a rate step larger than the filter's own smoothing
-      # already produces at it.
-      position = target.position_deg - math.copysign(trail_limit_deg, trail)
-      rate += _clip(target.rate_deg_s - rate, trail_limit_deg / rc_s)
-    self.target = RackTarget(position, rate)
+    previous = self.target.position_deg
+    if bypass:
+      position = target.position_deg
+      self.limited = False
+    else:
+      position = previous + alpha * (target.position_deg - previous)
+      trail = target.position_deg - position
+      self.limited = abs(trail) > trail_limit_deg
+      if self.limited:
+        # bound the position at the trail limit so a real change still passes at once (R5)
+        position = target.position_deg - math.copysign(trail_limit_deg, trail)
+    if self.limited or bypass:
+      # the served position is the raw target's (less a fixed trail): its frame difference is that target's own
+      # staircase, served through the filter's time constant from the value the free branch last served
+      self.rate_deg_s += alpha * ((position - previous) / dt - self.rate_deg_s)
+    else:
+      # the served position is the filter's output: (r - x) / rc is its backward difference exactly, and
+      # better conditioned than differencing two nearly equal positions
+      self.rate_deg_s = (target.position_deg - position) / rc_s
+    self.target = RackTarget(position, self.rate_deg_s)
     return self.target
 
 
