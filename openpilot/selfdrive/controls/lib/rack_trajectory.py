@@ -257,6 +257,11 @@ class JerkLimitedRackPlanner:
 HORIZON_S = 2.0
 HORIZON_STEP_S = .25
 HORIZON_OFFSETS_S = tuple(index * HORIZON_STEP_S for index in range(round(HORIZON_S / HORIZON_STEP_S) + 1))
+# how far short of the horizon the published preview may fall and still count as covering it. The times
+# are List(Float32) (cereal/log.capnp) built as action_time + offset, so the span this checks carries at
+# most a couple of float32 ulps -- 2.4e-7 s at the 2.6 s end of the grid -- while a preview one step
+# short falls 0.25 s, 250x this, and modeld's grid is the controller's own (test_modeld_*).
+PREVIEW_COVERAGE_TOLERANCE_S = 1e-3
 
 
 def model_path_targets(
@@ -279,8 +284,9 @@ def model_path_targets(
   Queries are on the vehicle's timeline (seconds from the plan origin; the plan's age is now). The
   preview is desiredCurvature's own function from the action time on, so it is read one action time
   ahead of each query: at the plan's age it is the scalar the plan would publish now, and further out
-  it is the scalar's future. Past the preview's end the last sample holds: the covered range is the
-  horizon.
+  it is the scalar's future. It has to reach as far past its own first sample as the furthest query
+  lies past now, and a preview that does not is a fault (STATUS_INVALID_PATH, a held frame), not
+  something to extrapolate through -- see the check below.
   """
   scalar = float(scalar_curvature)
   measured_speed = float(measured_v_ego)
@@ -306,6 +312,11 @@ def model_path_targets(
   now = float(plan_time_now_s)
   if not all(times[0] <= query <= times[-1] for query in (now, *queries)):
     raise ValueError("model path does not cover requested timestamps")
+  # past the preview's last sample np.interp holds it flat, and a flat far curvature is exactly what
+  # the preview scheduler reads as a perfectly steady far plan and lengthens into (FM1.3). So the
+  # preview must really cover the horizon it is asked for; short is a fault, not an extrapolation.
+  if preview_times[-1] - preview_times[0] < max(queries) - now - PREVIEW_COVERAGE_TOLERANCE_S:
+    raise ValueError("curvature preview does not cover the horizon")
   # controlsd's scalar is the model's first sample after the ISO clip, so the pin keeps the clip
   curvatures = np.array([scalar + preview - previews[0] for preview in previews])
 
@@ -1067,6 +1078,14 @@ class RackTrajectoryController:
     self.rack_rate_estimator = RackRateEstimator(dt)
     self.ff_taper_filter = FirstOrderFilter(0.0, FF_TAPER_RC_S, dt)  # F3: always warm, only ever blended in when gated
 
+  def commit_output_torque(self, torque: float) -> None:
+    """R7's baseline is the torque actually committed to the car, and the caller has the last word on
+    that: LatControlRack owns the slew across the rack/stock hand-over, which neither controller can
+    see from the inside. When what it committed differs from what this frame asked for it says so
+    here, so the next in-rule clamp -- the driver-assist branch, the direction guard -- measures its
+    step against a value the car really saw instead of one that was slewed away."""
+    self.previous_output_torque = torque
+
   def set_model(self, model, state_mono_ns: int) -> None:
     # a dropped or invalid model frame keeps the last good plan; staleness is judged by its age
     if model is not None:
@@ -1074,7 +1093,8 @@ class RackTrajectoryController:
     self.state_mono_ns = int(state_mono_ns)
 
   def hold(self) -> None:
-    # inactive for a frame: keep the planned rack through a short blip, start over after a real disengage
+    # a frame not served -- inactive, or one whose own inputs were faulty (_hold_fault below): keep the
+    # planned rack through a short blip, start over after a real disengage
     self.inactive_frames += 1
     self.status = STATUS_INACTIVE
     if self.inactive_frames == 1:
@@ -1102,7 +1122,23 @@ class RackTrajectoryController:
     self.ff_taper_filter.x = 0.0
 
   def _invalidate(self, status: int) -> None:
+    """The model is gone, or the controller's own state is suspect: throw the plan away and build a new
+    one from the wheel when a good frame comes back. There are no held frames to carry into it."""
     self.reset()
+    self.inactive_frames = 0
+    self.hold_angle_deg = None
+    self.status = status
+
+  def _hold_fault(self, status: int) -> None:
+    """A content fault in one frame's inputs (R6: below the staleness threshold, hold state, never
+    reset). The plan is still the right plan -- one bad frame of model content says nothing about the
+    trajectory being executed -- so hold it exactly as an inactive frame is held: the same
+    INACTIVE_HOLD_FRAMES budget, the same wheel-drag and rate-estimator reseed on the frame that
+    resumes, the same held frames counted as elapsed time, and a reset only past the budget. The
+    status is still set and the frame still returns None, so the wrapper hands this frame to stock
+    (audit F12: resetting instead cost a 0.20-0.23 torque step, 4x the R7 bound, plus 3.7 s to rebuild
+    the hold top-up and 0.45 s of preview, for one bad frame)."""
+    self.hold()
     self.status = status
 
   @staticmethod
@@ -1223,18 +1259,13 @@ class RackTrajectoryController:
     # The frame's order of operations, in sections: gates, targets, schedulers, limits, filter, planner,
     # bounding, intent, feedforward, feedback, the top-up applied, the platform clip, the direction guard,
     # driver assist, the R7 baseline latch, the top-up's growth, output.
-    # --- gates: is this frame the controller's to serve, and is what it is given usable? ---
+    # --- gates: is this frame the controller's to serve, and is what it is given usable?
+    # The model being gone, or the controller's own state being unusable, is a reset; a fault in one
+    # frame's content is a hold (R6), so the plan, the top-up, the preview and the R7 baseline survive
+    # a single bad frame. Either way the frame returns None and stock steers it. ---
     if not active:
       self.hold()
       return None
-    if self.inactive_frames and self.planner is not None and self.hold_angle_deg is not None:
-      # the wheel may have moved while the plan was held: carry the plan along with it, once
-      self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
-      self.rack_rate_estimator.reseed(float(CS.steeringAngleDeg))
-    # the frames held through are elapsed time for everything differenced against the last served frame
-    elapsed_s = self.dt * (1 + self.inactive_frames)
-    self.inactive_frames = 0
-    self.hold_angle_deg = None
     if self.model is None:
       self._invalidate(STATUS_NO_MODEL)
       return None
@@ -1242,7 +1273,7 @@ class RackTrajectoryController:
       CS.vEgo, CS.steeringAngleDeg, CS.steeringRateDeg, CS.steeringTorque,
       params.roll, params.angleOffsetDeg, lat_delay, desired_curvature,
     )):
-      self._invalidate(STATUS_INVALID_VEHICLE_STATE)
+      self._hold_fault(STATUS_INVALID_VEHICLE_STATE)
       return None
     model_age_s = (self.state_mono_ns - int(self.model.timestampEof)) * 1e-9
     if not 0.0 <= model_age_s <= STALE_MODEL_S:
@@ -1253,7 +1284,7 @@ class RackTrajectoryController:
     preview = self.model.action.desiredCurvaturePreview
     if len(preview_times) < 2 or len(preview) != len(preview_times):
       # a modeld that publishes no usable preview: there is no path to build, stock steers
-      self._invalidate(STATUS_INVALID_PREVIEW)
+      self._hold_fault(STATUS_INVALID_PREVIEW)
       return None
 
     try:
@@ -1271,8 +1302,22 @@ class RackTrajectoryController:
         angle_offset_deg=float(params.angleOffsetDeg),
       )
     except (TypeError, ValueError, OverflowError):
-      self._invalidate(STATUS_INVALID_PATH)
+      self._hold_fault(STATUS_INVALID_PATH)
       return None
+
+    # --- the frame is served: this is where a hold ends. It sits below the ladder because a frame the
+    # controller cannot serve is another held frame, not the resume: carrying the wheel's motion into
+    # the plan, reseeding the rate estimator and taking the held frames as elapsed time all belong to
+    # the frame that actually serves, and doing it on a fault frame would re-arm the hold every frame
+    # and never reach the budget. ---
+    if self.inactive_frames and self.planner is not None and self.hold_angle_deg is not None:
+      # the wheel may have moved while the plan was held: carry the plan along with it, once
+      self.planner.position_deg += float(CS.steeringAngleDeg) - self.hold_angle_deg
+      self.rack_rate_estimator.reseed(float(CS.steeringAngleDeg))
+    # the frames held through are elapsed time for everything differenced against the last served frame
+    elapsed_s = self.dt * (1 + self.inactive_frames)
+    self.inactive_frames = 0
+    self.hold_angle_deg = None
 
     # --- targets: the model's path, each knot held inside the ISO bound ---
     roll_compensation = float(params.roll) * ACCELERATION_DUE_TO_GRAVITY
