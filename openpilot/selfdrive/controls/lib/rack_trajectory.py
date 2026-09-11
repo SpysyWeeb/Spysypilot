@@ -172,21 +172,47 @@ def _clip(value: float, limit: float) -> float:
   return max(-limit, min(limit, value))
 
 
-def _hold_topup_step(state: float, error_deg: float, steady_gate: float, accumulating: bool, fast_leak: bool, dt: float) -> float:
+def _hold_topup_step(state: float, error_deg: float, position_feedback: float, steady_gate: float,
+                     trim_weight: float, accumulating: bool, fast_leak: bool, dt: float) -> float:
   """One frame of the hold top-up's leaky integrator (FM3.14). The caller resolves the anti-windup gates
-  (`accumulating`) and the steadiness weight (`steady_gate`); this owns only the ODE, the leak selection,
-  the hard bound and the zero snap. Growth and the fast leak DO apply in the same call: the driver's hand
-  and the release cooldown select the fast leak with accumulating=False, but `reversed_residual` selects it
-  while growth continues, whenever the carried state opposes the current error (66 such frames in the live
-  harness, max step 0.0075; route-audit phase3/hygiene_batch_2026-09-11/out_q7_topup_rerun.txt -- the
-  sentence claiming the case cannot occur was wrong, audit F13). The bound below was always derived for it:
-  the per-frame step is at most dt * (HOLD_TOPUP_RATE * HOLD_TOPUP_ERROR_CAP_DEG + MAX_HOLD_TOPUP_TORQUE /
-  HOLD_TOPUP_OVERRIDE_DECAY_S) = 0.0117, reached exactly when a reversed error drains the state at the fast
-  rate while growth pushes the other way, and 4.3x inside R7_MAX_TORQUE_STEP (out_measure_claims.txt item 7)."""
-  growth = HOLD_TOPUP_RATE * _clip(error_deg, HOLD_TOPUP_ERROR_CAP_DEG) * steady_gate if accumulating else 0.0
+  (`accumulating`), the steadiness weight (`steady_gate`) and the regime weight (`trim_weight`); this owns
+  only the ODE, the leak selection, the hard bound and the zero snap. Growth and the fast leak DO apply in
+  the same call: the driver's hand and the release cooldown select the fast leak with accumulating=False,
+  but `reversed_residual` selects it while growth continues, whenever the carried state opposes the current
+  error (66 such frames in the live harness, max step 0.0075; route-audit
+  phase3/hygiene_batch_2026-09-11/out_q7_topup_rerun.txt -- the sentence claiming the case cannot occur was
+  wrong, audit F13).
+
+  Two regimes blend by `trim_weight` (see the HOLD_TOPUP_* block above). The hold leg grows on the angle
+  error; the trim leg grows on this frame's own P torque over T_i, which is integral action in P's units
+  (K_i = K_p(v) / T_i). The rate, the passive leak, the cap and the zero snap all blend with it; the fast
+  leak does not, because a press must drain the term in 0.3 s at any speed. At `trim_weight` exactly 0.0 --
+  every frame at or below HOLD_TOPUP_HOLD_SPEED_MPS -- the hold branch runs the shipped expressions
+  verbatim, so replay is bit-identical there (the same exact-0.0 idiom as the F3 taper gate, R7).
+
+  Per-frame step: in the hold regime at most dt * (HOLD_TOPUP_RATE * HOLD_TOPUP_ERROR_CAP_DEG +
+  MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S) = 0.0117, reached exactly when a reversed error
+  drains the state at the fast rate while growth pushes the other way, and 4.3x inside R7_MAX_TORQUE_STEP
+  (out_measure_claims.txt item 7); in the trim regime at most dt * (MAX_HOLD_TOPUP_TRIM_TORQUE /
+  HOLD_TOPUP_TRIM_TIME_CONSTANT_S + MAX_HOLD_TOPUP_TRIM_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S) = 0.0035.
+  Crossing the boundary adds only what the blended cap itself moves, 0.03 torque per m/s of speed change
+  (1.5 / 5 m/s of smoothstep slope times the 0.1 the cap closes by): under 0.0003 in a frame at 1 m/s^2."""
+  hold_leg = HOLD_TOPUP_RATE * _clip(error_deg, HOLD_TOPUP_ERROR_CAP_DEG)
   leak_rc = HOLD_TOPUP_OVERRIDE_DECAY_S if fast_leak else HOLD_TOPUP_LEAK_RC_S
-  state = _clip(state + dt * (growth - state / leak_rc), MAX_HOLD_TOPUP_TORQUE)
-  return 0.0 if abs(state) < HOLD_TOPUP_ZERO_EPS_TORQUE else state
+  if trim_weight == 0.0:  # exact 0.0 at and below the hold speed: bit-identical to the shipped term (R7)
+    growth = hold_leg * steady_gate if accumulating else 0.0
+    state = _clip(state + dt * (growth - state / leak_rc), MAX_HOLD_TOPUP_TORQUE)
+    zero_eps = HOLD_TOPUP_ZERO_EPS_TORQUE
+  else:
+    trim_leg = _clip(position_feedback, MAX_HOLD_TOPUP_TRIM_TORQUE) / HOLD_TOPUP_TRIM_TIME_CONSTANT_S
+    growth = ((1.0 - trim_weight) * hold_leg + trim_weight * trim_leg) * steady_gate if accumulating else 0.0
+    leak = state / leak_rc if fast_leak else state * (
+      (1.0 - trim_weight) / HOLD_TOPUP_LEAK_RC_S + trim_weight / HOLD_TOPUP_TRIM_LEAK_RC_S
+    )
+    cap = (1.0 - trim_weight) * MAX_HOLD_TOPUP_TORQUE + trim_weight * MAX_HOLD_TOPUP_TRIM_TORQUE
+    state = _clip(state + dt * (growth - leak), cap)
+    zero_eps = (1.0 - trim_weight) * HOLD_TOPUP_ZERO_EPS_TORQUE + trim_weight * HOLD_TOPUP_TRIM_ZERO_EPS_TORQUE
+  return 0.0 if abs(state) < zero_eps else state
 
 
 def _rate_viable_acceleration(headroom: float, jerk: float, dt: float) -> float:
@@ -692,11 +718,31 @@ GUARD_FALLBACK_TORQUE_CAP = .18  # empirically derived from real 2c/2d/2e replay
                                   # near-center regime without clipping while hard-capping the reversal-lag tail.
                                   # Fit to the old build's zero-episode geometry, which this change eliminates --
                                   # owner decision 2026-09-01: ship now, re-derive after the next field drive.
-# Hold top-up (docs/BLaTv3_FAILURE_MODES.md FM3.14): the third torque term. Feedforward predicts, position/rate
+# Hold top-up (docs/BLaTv3_FAILURE_MODES.md FM3.14): the third torque term, in two regimes by speed.
+#
+# Below HOLD_TOPUP_HOLD_SPEED_MPS it is the hold-effort term it was built as: feedforward predicts, position/rate
 # feedback correct, and this bounded leaky integrator makes up whatever standing shortfall is left while the
 # wheel is meant to hold -- in angle space, deliberately NOT through gain(v) * lateral_accel_per_degree, since
 # that v^2-scaled pipeline is what under-supplied the real hold effort on route 0x3e (request -0.57 -> -0.36 at a
 # constant 35 deg as the car slowed 9.4 -> 7.9 m/s; the wheel crept out while the plan tracked it).
+#
+# Above HOLD_TOPUP_TRIM_SPEED_MPS it is the loop's integral action and nothing else. Measured on 1395 holds over
+# routes 5b/4d/54/69/6a/6e (route-audit phase3/topup_2026-09-11/DESIGN.md): from 17 m/s up the settled term opposes
+# the feedforward on 81-93 % of holds and tracks the plan error, i.e. it trims a feedforward that over-delivers in a
+# held curve -- integral action, not hold effort, and the design case it was built for (a hold past 10 deg below
+# 17 m/s) appears seven times in six routes. Its angle-space rate made it a second proportional path there
+# (K_i / K_p = 1.1 per second at 35 m/s) with 60-85 deg of lag inside the 0.35-0.8 Hz band, worth -7.6 to -8.6 % of
+# in-band planned:torque at 86-144 km/h in the ablation's no_topup arm. So above the boundary it integrates the same
+# error P acts on, in P's own units, at K_i = K_p(v) / HOLD_TOPUP_TRIM_TIME_CONSTANT_S: its share of P is
+# 1 / (2 pi f T_i) at every speed, by construction, and the speed schedule is P's own.
+#
+# The boundary is measured, not tuned: the sign against the feedforward flips between the 5-10 m/s holds (where the
+# term still adds to it on a third of them) and the 17-24 m/s holds, and torqued's own validated speed floor is
+# 15 m/s (R10). The hold-effort regime is provisional: it stands in for a hold-effort feedforward (tyre scrub,
+# static friction past the lateral-accel model) that phase 4 owes, and is retired when that exists.
+HOLD_TOPUP_HOLD_SPEED_MPS = 10.         # at and below: the hold-effort regime, exactly today's term (0x3e is 8-9.4 m/s)
+HOLD_TOPUP_TRIM_SPEED_MPS = 15.         # at and above: the trim regime; torqued's own validated speed floor (R10)
+# the hold-effort regime
 HOLD_TOPUP_RATE = .1                    # torque per (deg * s): a held 1.5 deg error is worth an R7 step within ~0.35 s
 MAX_HOLD_TOPUP_TORQUE = .2              # the field event's own measured gap (0.21); must stay under MAX_FEEDBACK_TORQUE
 HOLD_TOPUP_ERROR_CAP_DEG = 5.           # beyond this the error is no longer a small shortfall; P/D and the filter own it
@@ -704,6 +750,22 @@ HOLD_TOPUP_LEAK_RC_S = 3.               # always-on passive leak: a curve hold b
 HOLD_TOPUP_OVERRIDE_DECAY_S = .3        # fast leak while the driver presses and through the release cooldown below
 HOLD_TOPUP_RELEASE_COOLDOWN_S = .3      # a brief grab must not hand a barely-decayed residual back to the slow leak
 HOLD_TOPUP_ZERO_EPS_TORQUE = 1e-4       # snap to exact 0.0 below this so bit-identity with no top-up is reachable
+# the trim regime: each of these replaces the hold constant above it, blended by speed. There is no trim
+# fast leak on purpose -- a press drains the term in HOLD_TOPUP_OVERRIDE_DECAY_S at every speed.
+HOLD_TOPUP_TRIM_TIME_CONSTANT_S = 5.    # T_i: the band rule "at most a tenth of P at 0.35 Hz" needs >= 4.5 s; 5 gives 0.091
+MAX_HOLD_TOPUP_TRIM_TORQUE = .1         # a trim stays under a third of P's own cap (0.2 above is 57 % of it), and it
+                                        # clips the integrand the way the hold leg clips its error: past that P is no
+                                        # longer correcting a small standing bias and P/D own the frame
+HOLD_TOPUP_TRIM_LEAK_RC_S = 30.         # integral action, so no lag-compensator leak: the 3 s above is what gave the
+                                        # term a 0.053 Hz corner and 85 deg of phase in band. 30 s still honours
+                                        # "nothing outlives its cause" without shaping anything the loop can hear
+HOLD_TOPUP_TRIM_ZERO_EPS_TORQUE = 1e-6  # the zero snap is a state resolution, so it is regime-scoped like the cap: a
+                                        # trim frame grows by dt * P / T_i, 5.2e-5 at the highway P this term actually
+                                        # sees (0.026), and the hold regime's 1e-4 above would snap that back to 0.0
+                                        # every frame -- with it, the integrator is identically zero for any |P| < .05.
+                                        # 1e-6 is three orders under one CAN count (1/409) and under one frame's
+                                        # growth at any P the trim leg integrates
+# the motion gates, both regimes (`_hold_topup_gates`)
 HOLD_TOPUP_PLAN_RATE_DEG_S = 5.         # the virtual rack is holding, not chasing, below this planned rate ...
 HOLD_TOPUP_PLAN_RATE_BLEND_DEG_S = 3.   # ... fading out continuously by 8 deg/s (R7: no boolean gate on a ramp)
 HOLD_TOPUP_MEASURED_RATE_DEG_S = 8.     # the real wheel is not actively turning below this: above the shadow observer's
@@ -712,6 +774,8 @@ HOLD_TOPUP_APPROACH_RATE_DEG_S = .25     # the wheel already closing on the plan
 HOLD_TOPUP_APPROACH_BLEND_DEG_S = .75    # shortfall: growth fades out by 1 deg/s of approach so the last additions are
                                          # allowed to finish their work before more is added (no integrator overshoot)
 assert MAX_HOLD_TOPUP_TORQUE < MAX_FEEDBACK_TORQUE  # the two sum directly in raw_torque (R10: checked, not implicit)
+assert MAX_HOLD_TOPUP_TRIM_TORQUE < MAX_HOLD_TOPUP_TORQUE  # a trim is never the larger of the two caps
+assert HOLD_TOPUP_HOLD_SPEED_MPS < HOLD_TOPUP_TRIM_SPEED_MPS  # the blend is a ramp, never a step (R7)
 
 # F3 highway feedforward taper (report.md S2 rank 3): on a highway-speed straight, a flat,
 # speed-independent amount of angle-level noise (route audit torque_decomp/speed_vs_chatter.py:
@@ -1572,8 +1636,13 @@ class RackTrajectoryController:
       feedback, feedback_limited, self.direction_guard_scale, direction_fraction, plan.rate_deg_s,
       measured_rate, measured_rate_valid, bool(CS.steeringPressed), in_release_cooldown,
     )
+    # which regime the top-up grows in: hold effort below HOLD_TOPUP_HOLD_SPEED_MPS, integral action on P
+    # above HOLD_TOPUP_TRIM_SPEED_MPS, a smoothstep of speed between (exactly 0.0 below, so replay below
+    # the hold speed is bit-identical to the shipped term)
+    trim_weight = _smoothstep(float(CS.vEgo), HOLD_TOPUP_HOLD_SPEED_MPS, HOLD_TOPUP_TRIM_SPEED_MPS)
     self.hold_topup_torque = _hold_topup_step(
-      self.hold_topup_torque, position_error_deg, steady_gate, accumulating, fast_leak, self.dt,
+      self.hold_topup_torque, position_error_deg, position_feedback, steady_gate, trim_weight,
+      accumulating, fast_leak, self.dt,
     )
 
     # --- output ---

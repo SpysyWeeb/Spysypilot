@@ -12,17 +12,25 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.latcontrol_rack import FALLBACK_HOLD_S
 from openpilot.selfdrive.controls.lib.rack_trajectory import (
   HOLD_TOPUP_ERROR_CAP_DEG,
+  HOLD_TOPUP_HOLD_SPEED_MPS,
   HOLD_TOPUP_LEAK_RC_S,
   HOLD_TOPUP_OVERRIDE_DECAY_S,
   HOLD_TOPUP_RATE,
   HOLD_TOPUP_RELEASE_COOLDOWN_S,
+  HOLD_TOPUP_TRIM_LEAK_RC_S,
+  HOLD_TOPUP_TRIM_SPEED_MPS,
+  HOLD_TOPUP_TRIM_TIME_CONSTANT_S,
+  HOLD_TOPUP_TRIM_ZERO_EPS_TORQUE,
   HOLD_TOPUP_ZERO_EPS_TORQUE,
   INACTIVE_HOLD_FRAMES,
+  MAX_FEEDBACK_TORQUE,
   MAX_HOLD_TOPUP_TORQUE,
+  MAX_HOLD_TOPUP_TRIM_TORQUE,
   R7_MAX_TORQUE_STEP,
   RackTrajectoryController,
   STALE_MODEL_S,
   _hold_topup_step,
+  _smoothstep,
 )
 import openpilot.selfdrive.controls.lib.rack_trajectory as rack_trajectory
 from openpilot.selfdrive.controls.tests.test_latcontrol_rack import get_rack_controller, horizon_model
@@ -79,12 +87,12 @@ def settle(controller, CS, step, frames=400):
 class TestHoldTopup(OpenpilotTestCase):
   """FM3.14: the third torque term (predict / correct position / make up the standing shortfall)."""
 
-  # ---- the pure step ----
+  # ---- the pure step, hold regime (trim_weight exactly 0.0, at and below HOLD_TOPUP_HOLD_SPEED_MPS) ----
 
   def test_step_never_grows_when_not_accumulating(self):
     state = 0.1
     for _ in range(300):
-      new = _hold_topup_step(state, 5.0, 1.0, False, False, 0.01)
+      new = _hold_topup_step(state, 5.0, 0.0, 1.0, 0.0, False, False, 0.01)
       assert abs(new) <= abs(state)
       state = new
     assert 0.0 <= state < 0.1
@@ -94,7 +102,7 @@ class TestHoldTopup(OpenpilotTestCase):
     for error in (1.5, 2.0):
       state = 0.0
       for frame in range(1, 51):
-        state = _hold_topup_step(state, error, 1.0, True, False, 0.01)
+        state = _hold_topup_step(state, error, 0.0, 1.0, 0.0, True, False, 0.01)
         t = frame * 0.01
         if t in (0.3, 0.4, 0.5):
           expected = HOLD_TOPUP_RATE * error * rc * (1.0 - math.exp(-t / rc))
@@ -104,8 +112,8 @@ class TestHoldTopup(OpenpilotTestCase):
     state = 0.0
     fast = 0.0
     for _ in range(3000):
-      state = _hold_topup_step(state, 40.0, 1.0, True, False, 0.01)
-      fast = _hold_topup_step(fast, HOLD_TOPUP_ERROR_CAP_DEG, 1.0, True, False, 0.01)
+      state = _hold_topup_step(state, 40.0, 0.0, 1.0, 0.0, True, False, 0.01)
+      fast = _hold_topup_step(fast, HOLD_TOPUP_ERROR_CAP_DEG, 0.0, 1.0, 0.0, True, False, 0.01)
       assert abs(state) <= MAX_HOLD_TOPUP_TORQUE + 1e-12
       assert state == fast  # 40 deg and the cap grow identically
     assert state == MAX_HOLD_TOPUP_TORQUE
@@ -114,21 +122,21 @@ class TestHoldTopup(OpenpilotTestCase):
     peak = 0.15
     state = peak
     for _ in range(int(3 * HOLD_TOPUP_LEAK_RC_S / 0.01)):
-      state = _hold_topup_step(state, 0.0, 1.0, False, False, 0.01)
+      state = _hold_topup_step(state, 0.0, 0.0, 1.0, 0.0, False, False, 0.01)
     assert math.isclose(state, peak * math.exp(-3.0), rel_tol=0.05)
     state = peak
     for _ in range(int(2 * HOLD_TOPUP_OVERRIDE_DECAY_S / 0.01)):
-      state = _hold_topup_step(state, 5.0, 1.0, False, True, 0.01)
+      state = _hold_topup_step(state, 5.0, 0.0, 1.0, 0.0, False, True, 0.01)
     assert state <= 0.14 * peak
 
   def test_step_reaches_exact_zero(self):
     state = 0.01
     frames = 0
     while state != 0.0:
-      state = _hold_topup_step(state, 0.0, 1.0, False, False, 0.01)
+      state = _hold_topup_step(state, 0.0, 0.0, 1.0, 0.0, False, False, 0.01)
       frames += 1
       assert frames < 5000
-    assert _hold_topup_step(0.0, 0.0, 1.0, False, False, 0.01) == 0.0
+    assert _hold_topup_step(0.0, 0.0, 0.0, 1.0, 0.0, False, False, 0.01) == 0.0
     assert HOLD_TOPUP_ZERO_EPS_TORQUE < 1e-3
 
   def test_step_per_frame_bound_under_gate_thrashing(self):
@@ -138,10 +146,114 @@ class TestHoldTopup(OpenpilotTestCase):
     for _ in range(5000):
       fast = bool(rng.integers(2))
       accumulating = bool(rng.integers(2))
-      new = _hold_topup_step(state, float(rng.choice([-40.0, -5.0, -1.0, 1.0, 5.0, 40.0])), float(rng.random()), accumulating, fast, 0.01)
+      new = _hold_topup_step(state, float(rng.choice([-40.0, -5.0, -1.0, 1.0, 5.0, 40.0])), 0.0,
+                             float(rng.random()), 0.0, accumulating, fast, 0.01)
       assert abs(new - state) <= bound + 1e-9
       state = new
     assert bound < R7_MAX_TORQUE_STEP / 4
+
+  def test_the_hold_regime_is_the_shipped_term_bit_for_bit(self):
+    # the term as it shipped before the two regimes, kept here as the oracle and written out in full
+    # (no module helpers, so a change to one of them cannot hide inside it)
+    def shipped(state, error_deg, steady_gate, accumulating, fast_leak, dt):
+      clipped = max(-HOLD_TOPUP_ERROR_CAP_DEG, min(HOLD_TOPUP_ERROR_CAP_DEG, error_deg))
+      growth = HOLD_TOPUP_RATE * clipped * steady_gate if accumulating else 0.0
+      leak_rc = HOLD_TOPUP_OVERRIDE_DECAY_S if fast_leak else HOLD_TOPUP_LEAK_RC_S
+      state = max(-MAX_HOLD_TOPUP_TORQUE,
+                  min(MAX_HOLD_TOPUP_TORQUE, state + dt * (growth - state / leak_rc)))
+      return 0.0 if abs(state) < HOLD_TOPUP_ZERO_EPS_TORQUE else state
+
+    for state in (-MAX_HOLD_TOPUP_TORQUE, -0.1373, -1e-5, 0.0, 1e-5, 0.0731, MAX_HOLD_TOPUP_TORQUE):
+      for error in (-40.0, -5.0, -1.0, -0.017, 0.0, 0.017, 1.0, 5.0, 40.0):
+        for gate in (0.0, 0.3137, 1.0):
+          for accumulating in (False, True):
+            for fast_leak in (False, True):
+              for feedback in (-MAX_FEEDBACK_TORQUE, 0.0, 0.21):  # P is not read in the hold regime
+                got = _hold_topup_step(state, error, feedback, gate, 0.0, accumulating, fast_leak, DT_CTRL)
+                want = shipped(state, error, gate, accumulating, fast_leak, DT_CTRL)
+                assert got == want, (state, error, gate, accumulating, fast_leak, feedback, got, want)
+
+  # ---- the pure step, trim regime ----
+
+  def test_the_trim_leg_integrates_p_at_the_derived_time_constant(self):
+    # one frame from rest: the state is dt * clip(P, trim cap) / T_i and the angle error is out of it
+    for feedback in (0.004, 0.02, MAX_HOLD_TOPUP_TRIM_TORQUE, 0.3, -0.3):
+      clipped = max(-MAX_HOLD_TOPUP_TRIM_TORQUE, min(MAX_HOLD_TOPUP_TRIM_TORQUE, feedback))
+      state = _hold_topup_step(0.0, 5.0, feedback, 1.0, 1.0, True, False, DT_CTRL)
+      assert math.isclose(state / DT_CTRL, clipped / HOLD_TOPUP_TRIM_TIME_CONSTANT_S, rel_tol=1e-12), feedback
+
+  def test_the_trim_leg_is_a_tenth_of_p_at_the_bands_low_edge(self):
+    # integral action's share of P is 1 / (2 pi f T_i) at every speed: T_i = 5 s puts it at 0.091 of P
+    # at 0.35 Hz, the low edge of the band the resonance work scores (route-audit phase3/freq_gate)
+    frequency, amplitude = 0.35, MAX_HOLD_TOPUP_TRIM_TORQUE  # at the cap the integrand clip is a no-op
+    frames = int(300.0 / DT_CTRL)
+    state = 0.0
+    response = np.zeros(frames)
+    for i in range(frames):
+      feedback = amplitude * math.sin(2.0 * math.pi * frequency * i * DT_CTRL)
+      state = _hold_topup_step(state, 0.0, feedback, 1.0, 1.0, True, False, DT_CTRL)
+      response[i] = state
+    tail = response[-6000:]  # the last 60 s: 21 whole cycles, and 10 leak time constants in
+    t = np.arange(tail.size) * DT_CTRL
+    share = 2.0 * abs(np.mean(tail * np.exp(-2j * math.pi * frequency * t))) / amplitude
+    assert math.isclose(share, 1.0 / (2.0 * math.pi * frequency * HOLD_TOPUP_TRIM_TIME_CONSTANT_S), rel_tol=0.01), share
+    assert share < 0.1, share
+
+  def test_the_trim_regime_leaks_at_its_own_time_constant(self):
+    # a residual outlives its cause by the trim leak, not the hold regime's 3 s lag-compensator leak
+    state = MAX_HOLD_TOPUP_TRIM_TORQUE
+    for _ in range(int(HOLD_TOPUP_TRIM_LEAK_RC_S / DT_CTRL)):
+      state = _hold_topup_step(state, 0.0, 0.0, 1.0, 1.0, False, False, DT_CTRL)
+    assert math.isclose(state, MAX_HOLD_TOPUP_TRIM_TORQUE * math.exp(-1.0), rel_tol=0.01), state
+    # a press still drains it in 0.3 s: the fast leak is not blended
+    state = MAX_HOLD_TOPUP_TRIM_TORQUE
+    for _ in range(int(2 * HOLD_TOPUP_OVERRIDE_DECAY_S / DT_CTRL)):
+      state = _hold_topup_step(state, 5.0, 0.3, 1.0, 1.0, False, True, DT_CTRL)
+    assert state <= 0.14 * MAX_HOLD_TOPUP_TRIM_TORQUE, state
+
+  def test_the_trim_regime_zero_snap_is_below_one_frame_of_growth(self):
+    # the hold regime's own snap is 2 frames of trim growth at the P this term sees at speed, so it
+    # would zero the integrator every frame: at 1e-6 the smallest P that still accumulates is 5e-4
+    assert HOLD_TOPUP_TRIM_ZERO_EPS_TORQUE < DT_CTRL * 0.005 / HOLD_TOPUP_TRIM_TIME_CONSTANT_S
+    highway_feedback, seconds = 0.026, 5.0  # the P this term sees at 20-40 m/s (DESIGN.md)
+    assert DT_CTRL * highway_feedback / HOLD_TOPUP_TRIM_TIME_CONSTANT_S < HOLD_TOPUP_ZERO_EPS_TORQUE
+    state = 0.0
+    for _ in range(int(seconds / DT_CTRL)):
+      state = _hold_topup_step(state, 0.0, highway_feedback, 1.0, 1.0, True, False, DT_CTRL)
+    growth = highway_feedback / HOLD_TOPUP_TRIM_TIME_CONSTANT_S
+    settled = growth * HOLD_TOPUP_TRIM_LEAK_RC_S * (1.0 - math.exp(-seconds / HOLD_TOPUP_TRIM_LEAK_RC_S))
+    assert math.isclose(state, settled, rel_tol=0.01), (state, settled)
+
+  # ---- the boundary between them ----
+
+  def test_the_regime_blend_is_continuous_and_r7_bounded_across_the_boundary(self):
+    hold_bound = DT_CTRL * (HOLD_TOPUP_RATE * HOLD_TOPUP_ERROR_CAP_DEG
+                            + MAX_HOLD_TOPUP_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S)
+    trim_bound = DT_CTRL * (MAX_HOLD_TOPUP_TRIM_TORQUE / HOLD_TOPUP_TRIM_TIME_CONSTANT_S
+                            + MAX_HOLD_TOPUP_TRIM_TORQUE / HOLD_TOPUP_OVERRIDE_DECAY_S)
+    assert max(hold_bound, trim_bound) < R7_MAX_TORQUE_STEP / 4
+    # a term wound to the hold cap carried across the boundary under hard acceleration: the shrinking
+    # cap sheds the difference, and never faster than the regime the frame is in could move it anyway
+    for acceleration in (1.0, 3.0):
+      state, speed, worst = MAX_HOLD_TOPUP_TORQUE, 8.0, 0.0
+      while speed < 17.0:
+        weight = _smoothstep(speed, HOLD_TOPUP_HOLD_SPEED_MPS, HOLD_TOPUP_TRIM_SPEED_MPS)
+        stepped = _hold_topup_step(state, 5.0, MAX_FEEDBACK_TORQUE, 1.0, weight, True, False, DT_CTRL)
+        worst = max(worst, abs(stepped - state))
+        state, speed = stepped, speed + acceleration * DT_CTRL
+      assert worst <= max(hold_bound, trim_bound), (acceleration, worst)
+      assert math.isclose(state, MAX_HOLD_TOPUP_TRIM_TORQUE), (acceleration, state)
+    # and the frame's own output is continuous in speed: nothing steps at 10.0 or at 15.0 m/s
+    for state in (0.05, MAX_HOLD_TOPUP_TORQUE):  # off the cap, and pinned to the shrinking one
+      previous, worst = None, 0.0
+      for i in range(1801):
+        weight = _smoothstep(8.0 + i * 0.005, HOLD_TOPUP_HOLD_SPEED_MPS, HOLD_TOPUP_TRIM_SPEED_MPS)
+        stepped = _hold_topup_step(state, 1.5, 0.2, 1.0, weight, True, False, DT_CTRL)
+        worst = max(worst, abs(stepped - previous)) if previous is not None else worst
+        previous = stepped
+      # 0.005 m/s of speed moves the blend by at most 0.0015, and the cap is the steepest thing it
+      # moves: 0.0015 * (MAX_HOLD_TOPUP_TORQUE - MAX_HOLD_TOPUP_TRIM_TORQUE)
+      assert worst <= 0.0015 * (MAX_HOLD_TOPUP_TORQUE - MAX_HOLD_TOPUP_TRIM_TORQUE) + 1e-12, (state, worst)
 
   # ---- through the controller ----
 
@@ -195,10 +307,12 @@ class TestHoldTopup(OpenpilotTestCase):
     # monotonic while the error stands (the leak never wins against a held error under the cap)
     assert all(abs(b) >= abs(a) - 1e-9 for a, b in zip(values, values[1:], strict=False))
 
-  def test_no_speed_term(self):
+  def test_the_hold_regime_has_no_speed_term(self):
+    # up to HOLD_TOPUP_HOLD_SPEED_MPS the term is hold effort: an angle error is worth the same torque
+    # whatever the speed, which is the whole reason it is not routed through gain(v) * lat_accel/deg
     growth = {}
-    for speed in (8.0, 16.0, 30.0):
-      controller, CS, step = hold_fixture(speed=speed, curvature=0.3 / speed ** 2)
+    for speed in (5.0, 8.0, HOLD_TOPUP_HOLD_SPEED_MPS):
+      controller, CS, step = hold_fixture(speed=speed, curvature=1.5 / speed ** 2)
       output, frame = settle(controller, CS, step)
       start = output.hold_topup_torque
       for i in range(1, 51):
@@ -206,6 +320,45 @@ class TestHoldTopup(OpenpilotTestCase):
         output = step(frame + i)
       growth[speed] = abs(output.hold_topup_torque - start)
     assert max(growth.values()) < 1.5 * min(growth.values()), growth
+
+  def test_the_trim_regime_follows_ps_own_speed_schedule(self):
+    # above HOLD_TOPUP_TRIM_SPEED_MPS the term is integral action in P's units, so its gain per degree
+    # is K_p(v) per degree over T_i -- measured through the controller, at three speeds whose K_p
+    # differs by 30 %. What must hold at every speed is the RATIO, and it does, to eleven places.
+    ratios = {}
+    for speed in (20.0, 30.0, 40.0):
+      assert _smoothstep(speed, HOLD_TOPUP_HOLD_SPEED_MPS, HOLD_TOPUP_TRIM_SPEED_MPS) == 1.0
+      error_deg = 0.5  # small enough that P stays well inside the trim cap at every speed
+      controller, CS, step = hold_fixture(speed=speed, curvature=1.5 / speed ** 2)
+      output, frame = settle(controller, CS, step)
+      pin_short_of_plan(CS, output, error_deg)
+      controller.rack_rate_estimator.reseed(CS.steeringAngleDeg)  # the wheel arrived without motion
+      feedback, topup = [], []
+      for i in range(1, 121):
+        pin_short_of_plan(CS, output, error_deg)
+        output = step(frame + i)
+        feedback.append(output.position_feedback_torque)
+        topup.append(output.hold_topup_torque)
+      position_feedback = float(np.mean(feedback[20:]))
+      assert abs(position_feedback) < MAX_HOLD_TOPUP_TRIM_TORQUE, (speed, position_feedback)
+      measured = (topup[-1] - topup[19]) / ((len(topup) - 20) * DT_CTRL)
+      ratios[speed] = measured / (position_feedback / HOLD_TOPUP_TRIM_TIME_CONSTANT_S)
+      assert math.isclose(measured / error_deg, position_feedback / error_deg / HOLD_TOPUP_TRIM_TIME_CONSTANT_S,
+                          rel_tol=0.03), (speed, measured, position_feedback)
+    assert max(ratios.values()) - min(ratios.values()) < 1e-9, ratios
+
+  def test_the_trim_regime_stays_a_trim_at_highway_speed(self):
+    # the same standing error that takes the term to 0.20 at 8 m/s is held to the trim cap at 30 m/s
+    controller, CS, step = hold_fixture(speed=30.0, curvature=1.5 / 30.0 ** 2)
+    output, frame = settle(controller, CS, step)
+    pin_short_of_plan(CS, output, 1.5)
+    controller.rack_rate_estimator.reseed(CS.steeringAngleDeg)
+    peak = 0.0
+    for i in range(1, 12001):  # 120 s, four trim leak time constants
+      pin_short_of_plan(CS, output, 1.5)
+      output = step(frame + i)
+      peak = max(peak, abs(output.hold_topup_torque))
+    assert peak == MAX_HOLD_TOPUP_TRIM_TORQUE, peak
 
   def test_disturbance_plant_closes_the_shortfall_without_overshoot(self):
     # a rack that needs more torque to hold than the lateral-accel feedforward predicts (the route 0x3e
