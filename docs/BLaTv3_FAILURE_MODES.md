@@ -199,9 +199,13 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   plan and the reference filter alive without serving; the resuming frame differences the served
   position and the planned lateral acceleration over the time that really passed
   (`elapsed_s = dt × (1 + frames held)`), so a pinned or bypassed resume serves the motion's real
-  rate rather than a (1 + held)× overestimate, and the friction term's jerk does not spike. Before
-  this the pinned branch had never differenced positions, so the case did not exist
-  (review/REVIEW.md §7). `test_reference_filter_takes_a_held_frame_as_elapsed_time`.*
+  rate — the raw frame difference had been (1 + held)× too large, 5–27 % on the served rate after
+  the low-pass for 1–5 held frames (review/REVIEW2.md §1) — and the friction term's jerk does not
+  spike. Before this the pinned branch had never differenced positions, so the case did not exist
+  (review/REVIEW.md §7). The plan itself is not advanced over the gap: it is the trajectory being
+  executed and the hold paused it, so it resumes with one frame of its own budget.
+  `test_reference_filter_takes_a_held_frame_as_elapsed_time`,
+  `test_a_hold_is_elapsed_time_for_the_served_rate`.*
 - **R7 Continuity.** Every rule is continuous in its inputs; sweep tests across every rule
   boundary are required unit tests. No exact-zero special cases.
   *Review pass (2026-09-11): the turn-in lead and `direction_fraction` read where the served

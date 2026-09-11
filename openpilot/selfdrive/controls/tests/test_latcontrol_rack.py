@@ -47,6 +47,8 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   PREVIEW_MAX_DISTANCE_M,
   PREVIEW_LENGTHEN_UPDATES,
   PreviewScheduler,
+  REFERENCE_FILTER_PREVIEW_RC_S,
+  REFERENCE_FILTER_RC_S,
   REFERENCE_FILTER_TRAIL_MAX_DEG,
   ReferenceFilter,
   reference_trail_limit_deg,
@@ -1879,6 +1881,57 @@ class TestLatControlRack(OpenpilotTestCase):
       assert output is not None
       assert abs(output.direction_fraction) < 0.05
       assert not output.direction_guarded
+
+  def test_a_hold_is_elapsed_time_for_the_served_rate(self):
+    # The controller keeps the plan and the reference filter through up to INACTIVE_HOLD_FRAMES inactive frames
+    # without serving, while the model keeps landing new targets. The resuming frame must difference the served
+    # position over the time that really passed: pinned to a target swinging 3 deg per frame, the served rate on
+    # resume is the last served rate plus one elapsed-time alpha of the swing's true 300 deg/s -- not one frame's
+    # alpha of a (1 + held)x staircase (review/REVIEW2.md section 1: 5-27 % high on the served value for 1-5
+    # held frames, after the low-pass; the raw frame difference was (1 + held)x). The plan itself is not
+    # advanced over the gap: a hold pauses the trajectory being executed.
+    torque_params = self.CP.lateralTuning.torque
+    speed = 5.0
+    self.CS.vEgo = speed
+    self.CS.steeringAngleDeg = 0.0
+    self.CS.steeringRateDeg = 0.0
+
+    def hold_and_resume(held):
+      controller = RackTrajectoryController()
+      model = horizon_model([0.0, .5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [speed] * 6)
+      angle = 0.0
+      mono_ns = 1_000_000_000
+
+      def land(active):
+        nonlocal angle, mono_ns
+        angle += 3.0  # a 300 deg/s swing: past the 3 deg low-speed trail bound every frame, so the served position pins
+        desired_curvature = -self.VM.calc_curvature(math.radians(angle), speed, 0.0)
+        model.timestampEof = mono_ns
+        model.action.desiredCurvature = desired_curvature
+        controller.set_model(model, mono_ns + 50_000_000)
+        mono_ns += 10_000_000
+        return controller.update(active, self.CS, self.VM, self.params, torque_params,
+                                 lambda lateral_accel, _: lateral_accel, .2, desired_curvature)
+
+      for _ in range(6):
+        served = land(True)
+      assert served is not None and served.reference_limited
+      for _ in range(held):
+        assert land(False) is None
+      planned_before = controller.planner.position_deg
+      resumed = land(True)
+      assert resumed is not None and resumed.reference_limited
+      return served, resumed, planned_before
+
+    for held in range(1, INACTIVE_HOLD_FRAMES + 1):
+      served, resumed, planned_before = hold_and_resume(held)
+      elapsed = 0.01 * (1 + held)
+      alpha = elapsed / (REFERENCE_FILTER_RC_S + REFERENCE_FILTER_PREVIEW_RC_S * resumed.preview_time_s / HORIZON_S + elapsed)
+      expected = served.target_rate_deg_s + alpha * (300.0 - served.target_rate_deg_s)
+      assert math.isclose(resumed.target_rate_deg_s, expected, rel_tol=1e-9), (held, resumed.target_rate_deg_s, expected)
+      assert resumed.target_rate_deg_s <= 300.0
+      # the plan moved one frame's worth, not (1 + held) frames' worth
+      assert abs(resumed.planned_angle_deg - planned_before) <= abs(resumed.planned_rate_deg_s) * 0.01 + 1e-9
 
   def test_intended_angle_is_the_models_bounded_target_not_a_served_rate_extrapolation(self):
     # The turn-in lead and direction_fraction read where the served target is heading. That is the model's

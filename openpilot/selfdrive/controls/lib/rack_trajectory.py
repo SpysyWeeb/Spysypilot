@@ -1150,6 +1150,9 @@ class RackTrajectoryController:
     # the planner's own tracker law is the only acceleration source; recovery is the one override
     desired_acceleration = self._recovery_acceleration(profile, profile_transition)
     try:
+      # one frame of the plan, held frames or not: the plan is the trajectory being executed and a hold pauses
+      # it (R6), so it resumes where it stopped instead of jumping the frames it did not run. Only what is
+      # differenced against the world -- the served rate, the planned lateral jerk -- takes the elapsed time
       raw_plan = planner.update(filtered_target, limits, self.dt, desired_acceleration)
     except ValueError:
       self._invalidate(STATUS_INVALID_PLANNER_STATE)
