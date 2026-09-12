@@ -108,6 +108,26 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   preview covers at most 40 m at the plan's own speed (FM1.8). Hands on the wheel, a lane change
   starting or finishing, a limited immediate target or a measured curvature out of bounds pin the
   preview at the action time at once.*
+  *Phase 3 step 3 (2026-09-11, one scheduler in physical units): (c)'s confidence half and (e)'s 40 m cap
+  are gone, and (b) is now a lateral acceleration. **Confidence** is a driver-disengage predictor, not a
+  statement about the path (audit F10): it is red on 72 % of route 69's model frames, and it is what kept
+  the preview closed on 70–94 % of frames below 24 m/s. The "smooth but wrong" defence it was adopted for
+  does not need it, because the far target is never authority (this rule's own 2026-08-30 field note): a
+  path that is consistent but wrong earns only the calmer reference (0.1 → 0.3 s) and the longer response
+  time (0.3 → 0.4 s), the near target still governs every frame's magnitude, and both settings are undone
+  within two model frames when the path stops agreeing. **The 40 m cap** is a speed clock — 1.1 s at 35 m/s
+  against 6 s at 6 — so it made the calm settings unreachable on exactly the road this rule calls
+  consistent; the horizon (2 s) is the bound now, and the far end's quality is judged by the gates built
+  for it: `yStd` (0.35 m, inert until now only because the cap fired first; its field p95 is 0.28–0.32 m,
+  right at the gate), the clothoid deviation and the flicker consistency gate. **The heading gate** is
+  `PREVIEW_ADMIT_HEADING_LATERAL_ACCEL = 0.2 m/s²` (0.266 to keep), tested in curvature against the
+  tolerance over the near target's speed squared, exactly as the flicker gate already is: in wheel degrees
+  1° was 17× tighter at parking speed than on the highway on this car's VehicleModel (0.2 m/s² is 1.03° at
+  35 m/s, 3.20° at 15 and 17.11° at 6), and it was the low-speed flapper. Measured on six routes
+  (5b/4d/54/69/6a/6f, 284 min engaged hands-off, route-audit phase3/preview_2026-09-11/IMPL.md): the
+  schedule's mean rises from 0.03–0.80 s to 1.36–1.76 s in every speed bucket, frames at 0 s fall from
+  33–98 % to 1.6–18 %, and the full 2 s — never once reached above 24 m/s before — is held on 53–80 % of
+  highway frames.*
 - **R3 Shorten fast, lengthen slowly, don't starve.** `t_p` collapses to `t_action` within at
   most two consecutive failing model frames (≤100 ms ≈ 1.8 m at 40 mph); it grows back at a
   bounded rate. Growth progress is a decaying score, not reset by one isolated failing frame,
@@ -115,6 +135,13 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   *Phase 2 step 4: the preview shortens to the largest admissible step after two consecutive
   disagreeing model frames (≤ 100 ms) and lengthens one 0.25 s step per two agreeing frames
   (0 → 2 s in ~0.8 s); an isolated disagreeing frame does not reset the growth count (FM1.16).*
+  *Phase 3 step 3 (2026-09-11): the schedule still collapses in at most two disagreeing model frames; what
+  the controller is served now walks to it instead of jumping (see R7). The walk is rate-limited at
+  `PREVIEW_COLLAPSE_RATE_S_PER_S` = `HORIZON_S / (2 · MODEL_FRAME_S)` = 20 s/s, which is this rule's own
+  number written as a rate: a full 2 s empties in exactly the two model frames it allows. On the road the
+  served value reaches a dropped schedule in 1 control frame at the median and 9 at the worst over seven
+  routes (route-audit phase3/preview_2026-09-11/out_collapse_timing.txt), so the whole collapse — two model
+  frames to see the disagreement plus the ramp — stays inside 0.19 s.*
 - **R4 The envelope bounds rate/accel/jerk, never amplitude — and opens ahead of need.** Two
   triggers open the comfort envelope: *proactive* — R2 has confirmed a real deviation ahead, so
   the envelope pre-opens to the rate the model path itself requires; *reactive* — measured
@@ -137,6 +164,15 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   admitted horizon falls, ease up over one `HORIZON_STEP_S` (0.25 s) otherwise. Feeds
   `_motion_limits` unmodified, in that order, so the feasibility ratchet still narrows on top;
   never widens torque authority (R10) — see `rack_trajectory.py`.*
+  *Phase 3 step 3 (2026-09-11): the second scheduler is gone and `_horizon_opened_profile` reads the one
+  `preview_scheduler.index`. Its drift gate (`PREVIEW_ENVELOPE_DRIFT_M`) fired on 1 model frame in 51,646
+  (audit F19), because it sat behind the 40 m cap in the gate order and never got a frame to judge; where
+  it could fire it was measuring the car's own motion between model frames as much as the model's opinion.
+  Once the confidence gate went, the two instances had the same gate set anyway, and with it the design
+  conflict F10 named — two halves of one mechanism disagreeing on 33–87 % of frames — is gone by
+  construction rather than by tuning. The opener keeps reading the stepped index: its own outputs are
+  already eased (`ENVELOPE_EASE_UP_RC_S`), and `PREVIEW_EASE_UP_RC_S` is tied to the same
+  `HORIZON_STEP_S` for the same reason.*
   *Phase 2 step 4 implements only the response-time side: the tracker's response time is
   scheduled from 0.4 s at the action time to 0.5 s at the full 2 s preview (`RESPONSE_TIME_PREVIEW_S`)
   and the reference filter's time constant from 0.1 s to 0.3 s (`REFERENCE_FILTER_PREVIEW_RC_S`),
@@ -288,6 +324,24 @@ Phases: (0) safety fixes on today's branch + back-port combo's direction-guard f
   not that frame's composition.
   `test_the_torque_step_across_a_real_hand_over_is_r7_bounded`,
   `test_a_content_fault_keeps_the_slow_state_and_the_wheel`.*
+  *Phase 3 step 3 (2026-09-11): the preview was the last stepped signal the controller served. The
+  schedule is stepped by construction — one 0.25 s grid point at a time — and the two settings derived from
+  it, the reference filter's time constant and the tracker's response time, stepped with it: a one-frame
+  drop of a second, which the audit's F4 found a few times a minute even with the old gates, moved the
+  filter's constant by 0.1 s and the tracker's natural frequency with it, in one frame. `PreviewScheduler`
+  now keeps `served_preview_s`, which walks toward `HORIZON_OFFSETS_S[index]` every control frame: down at
+  `PREVIEW_COLLAPSE_RATE_S_PER_S` (R3's own bound as a rate), up as a one-pole with
+  `PREVIEW_EASE_UP_RC_S` = `HORIZON_STEP_S`, over elapsed time so a held frame counts as the frames it held
+  (R6), and that is the value `preview_time_s` logs and the controller uses. The derived settings are then
+  bounded by construction at 0.02 s of time constant and 0.01 s of response time per frame, which is what
+  the replay measures on all six routes (max per-frame |Δpreview| exactly 0.200 s, the collapse rate).
+  With the 40 m cap gone the far end's own frame-to-frame inconsistency is visible in the schedule — the
+  stepped index changes 36–132 times a minute against 4–68 before, most of it at 31–40 m/s where the plan
+  at 50–70 m genuinely disagrees with itself — and that is precisely why the served value may not follow it
+  step for step: it sits near 1.5 s and breathes instead. `envelope_preview_time_s` logs the stepped target
+  beside it so the field tooling can see both. `test_served_preview_is_continuous_in_both_directions`,
+  `test_the_served_preview_bounds_the_time_constant_and_the_response_time_per_frame`,
+  `test_a_held_frame_is_elapsed_time_for_the_served_preview`.*
 - **R8 Fail closed at selection — for the controller *and* the torque authority.** Unknown,
   mixed, or empty firmware → stock controller **and** stock 384/3/7 envelope, from the same test.
 - **R9 The controller knows every platform limiter by name:** opendbc slew 409/+4/−7 with its
@@ -359,6 +413,12 @@ red-team pass.
   frame) when it falls short, and modeld's grid is pinned to the controller's
   (`test_the_preview_grid_is_modelds_own`,
   `test_a_preview_short_of_the_horizon_is_a_fault_not_a_flat_extrapolation`).*
+  *Phase 3 step 3 (2026-09-11): the model's `confidence` was adopted here as the "smooth but wrong"
+  defence and has been retired (R2). It never was one: it predicts driver disengagement, not path error
+  (audit F10), and the flip-flop this entry is about is caught by the gates that actually look at the
+  plan — the clothoid deviation, `yStd`, and the flicker gate that compares the far target's own re-plan
+  against the near one's (FM1.18). What a consistent-but-wrong far path can still buy is bounded by the
+  two settings it earns and reversible inside two model frames, which is the argument R2 now carries.*
 - **FM1.4 — Scalar/plan anchor mismatch.** Action head vs plan-derived curvature; the
   look-ahead formula vs interpolation (+12–14 % bias found on curve entry). → Preview
   computed in modeld by the same function; `preview[0] == desiredCurvature`. → Bit-exact unit.
@@ -417,10 +477,29 @@ red-team pass.
   decreasing-radius ramp, a confidently wrong branch at an ambiguous exit. *A mean-path
   consistency test passes anything smooth.* → R2(c): uncertainty + confidence gates. →
   Synthetic 0.3–0.5 m sinusoidal wander: `t_p` never reaches max.
+  *Phase 3 step 3 (2026-09-11): the confidence half of R2(c) is gone (see R2's own note) and this entry's
+  defence is no longer a gate. It is the structure: the far target is never authority (R2), so a path that
+  is smooth and wrong earns only the calmer reference (0.1 → 0.3 s) and the longer response time
+  (0.3 → 0.4 s), the near target still sets every frame's magnitude, and both are undone within two model
+  frames of the path disagreeing. `yStd` — the uncertainty half of R2(c), and inert until now only because
+  the 40 m cap fired ahead of it — and the clothoid and flicker consistency gates are what still judge the
+  far end. The wander this entry names is not smooth to those gates, and its own stated test still passes
+  without the confidence gate: a 0.3-0.5 m peak-to-peak sinusoid at 4-6 s, swept over 64 phases at 20 and
+  31 m/s, is admitted to index 0-5 of 8 and never reaches the horizon, because it carries 0.36-0.85 m of
+  clothoid deviation against the 0.15 m admit tolerance (route-audit
+  phase3/preview_2026-09-11/review_fixes/fm1_13_wander.py).*
 - **FM1.14 — Confidence never consulted. [v2]** Night, rain, glare. *`modelV2.confidence`
   rises before curvature error appears; nothing reads it.* → Yellow/red: no extension past
   `t_action`; stronger corroboration before R4 exceeds comfort. Never *reduces* authority.
   → Red-confidence frame: `t_p` pinned, reason logged.
+  *Phase 3 step 3 (2026-09-11): withdrawn. A red-confidence frame no longer pins `t_p`, and nothing reads
+  `modelV2.confidence` — the resolution above is false as written from this commit on. The premise was
+  wrong: this signal predicts that the driver is about to disengage, not that the path is wrong (audit F10),
+  and it is red on 72 % of route 69's model frames. Read as a path test it was simply a way of keeping the
+  preview closed 70-94 % of the time below 24 m/s, which is what it did. What the field wanted from this
+  entry — night, rain, glare — is `position.yStd` (R2(c)'s other half, 0.35 m) and the two consistency
+  gates, which test the plan itself. See R2's Phase 3 step 3 note for the ruling and its evidence, and
+  FM1.13 for what now carries the "smooth but wrong" defence. `test_a_consistent_path_reaches_the_horizon_at_highway_speed_and_ignores_confidence`.*
 - **FM1.15 — Clothoid entries rejected by an arc test. [v2]** Every standard highway curve
   entry. → R2(a) clothoid-consistent extrapolation; tolerance scales with the expected
   buildup-vs-arc gap. → Six AASHTO-typical transitions pass consistency.
@@ -444,7 +523,9 @@ red-team pass.
   jitter is ≤ the near target's.
   *Phase 3 step 5: `envelope_scheduler` shares this exact gate (unconditionally, not gated by
   confidence), so a dithering far target moves neither its admitted depth nor the
-  `required_rate` `_horizon_opened_profile` derives from it, for either sign of the dither.*
+  `required_rate` `_horizon_opened_profile` derives from it, for either sign of the dither.
+  Phase 3 step 3 (2026-09-11): there is one scheduler now, so "shares" is literal — the opener reads the
+  same index the tracker's settings come from.*
   *Phase 3 step 8 (2026-09-08): the mechanism above was right and the constant was in the wrong
   units. 0.25° is a wheel angle; the noise it must sit above is a lateral acceleration, so the same
   v² understeer term this entry names put the threshold **inside** its own noise — 0.002 m/s² at
