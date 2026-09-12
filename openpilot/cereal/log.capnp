@@ -1169,7 +1169,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     pathLimited @26 :Bool;
     profileTransition @27 :Bool;
     version @28 :Int32;
-    previewTime @29 :Float32;  # seconds of preview actually served: what sets the reference filter's time constant and the tracker's response time (continuous, R7)
+    previewTime @29 :Float32;  # seconds past the action time the immediate target is read at
     referenceLimited @30 :Bool;  # the served target trails the model's by the filter's bound
     nearSteeringAngleDeg @31 :Float32;  # the model's target at the action time, before the filter
     directionGuarded @32 :Bool;
@@ -1180,7 +1180,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     envelopeRateDegS @37 :Float32;  # R4: the horizon-implied envelope's opened rate limit this frame, deg/s (floors at comfort)
     envelopeAccelerationDegS2 @38 :Float32;  # and the opened acceleration limit, deg/s^2
     envelopeJerkDegS3 @39 :Float32;  # and the opened jerk limit, deg/s^3
-    envelopePreviewTime @40 :Float32;  # the same scheduler's stepped target, the pre-ease value previewTime is walking toward
+    envelopePreviewTime @40 :Float32;  # seconds the confidence-free envelope scheduler's own admitted horizon reaches
     holdTopupTorque @41 :Float32;  # FM3.14 hold top-up applied this frame, already summed into output; 0 when stock steers
     holdTopupGrowing @42 :Bool;  # this frame's anti-windup gates admitted growth (the leak runs every active frame regardless)
   }
