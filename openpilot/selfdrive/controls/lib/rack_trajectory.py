@@ -78,7 +78,7 @@ class RackTrajectoryOutput:
   path_limited: bool
   infeasible: bool
   saturated: bool
-  preview_time_s: float
+  preview_time_s: float  # the served preview: continuous (R7), and what the two calm settings are derived from
   reference_limited: bool
   near_target_angle_deg: float
   direction_guarded: bool
@@ -89,7 +89,7 @@ class RackTrajectoryOutput:
   envelope_open_rate_deg_s: float
   envelope_open_acceleration_deg_s2: float
   envelope_open_jerk_deg_s3: float
-  envelope_preview_time_s: float
+  envelope_preview_time_s: float  # the same scheduler's stepped target, the value preview_time_s walks toward
   hold_topup_torque: float
   hold_topup_growing: bool
 
@@ -497,8 +497,16 @@ class ReferenceFilter:
 
 PREVIEW_ADMIT_DEVIATION_M = .15  # path consistency, in metres, to read the target one step further ahead
 PREVIEW_KEEP_DEVIATION_M = .2  # and to keep reading it there
-PREVIEW_ADMIT_HEADING_DEG = 1.0
-PREVIEW_KEEP_HEADING_DEG = 1.33
+# how far the far target may point away from the near one before the step stops being the same road.
+# a lateral acceleration, not a wheel angle: on this car's VehicleModel .2 m/s^2 is 1.03 deg of wheel at
+# 35 m/s, 3.20 deg at 15 and 17.11 deg at 6 (measured, route-audit phase3/preview_2026-09-11/IMPL.md),
+# where a fixed 1 deg of wheel was 17x tighter at parking speed than on the highway and the low-speed
+# flapper -- read in lateral acceleration the same routes lose a second or more of preview 0-6 times a
+# minute below 24 m/s instead of 27-48 (phase3/preview_2026-09-11/DESIGN.md, flapping table). same family
+# as PREVIEW_FLICKER_TOLERANCE_LATERAL_ACCEL below, and tested the same way: in curvature, against the
+# tolerance divided by the near target's speed squared.
+PREVIEW_ADMIT_HEADING_LATERAL_ACCEL = .2
+PREVIEW_KEEP_HEADING_LATERAL_ACCEL = .266  # the same 1.33 keep/admit ratio the deviation gate carries
 # a far target may not re-plan more than the near one between model frames, plus the model's own
 # replan noise. that noise is a lateral acceleration, not a wheel angle: |dcurvature| * v^2 at the 2 s
 # point holds a quiet-road p99.9 of .12-.16 from 8 to 41 m/s on routes 5b and 54, while the same
@@ -516,21 +524,20 @@ PREVIEW_FLICKER_TOLERANCE_LATERAL_ACCEL = .15
 # three speed bands on both routes, against sqrt's .35/.50/.61/.71. flat instead leaves the shallow
 # steps ~3x looser than their own noise, where a far-plan sign reversal lives (FM1.3).
 PREVIEW_FLICKER_HORIZON_EXPONENT = .5
-PREVIEW_MAX_DISTANCE_M = 40.0
 PREVIEW_MAX_Y_STD_M = .35  # p99 of the path's yStd at 2 s on straight frames (routes 20/22)
 PREVIEW_SHORTEN_UPDATES = 2  # model frames of disagreement before the preview shortens
 PREVIEW_LENGTHEN_UPDATES = 2  # model frames of agreement before it lengthens by one step
+MODEL_FRAME_S = .05  # modelV2's own period: the pace every gate above counts its updates in
+# R3, in physical units: a full preview empties in two model frames, but as a ramp rather than a step,
+# so the two settings the preview buys -- the reference filter's time constant and the tracker's
+# response time -- never jump. At 20 s/s that is at most .2 s of preview per control frame, .02 s of
+# time constant and .01 s of response time (docs/BLaTv3_FAILURE_MODES.md R7).
+PREVIEW_COLLAPSE_RATE_S_PER_S = HORIZON_S / (2 * MODEL_FRAME_S)
+PREVIEW_EASE_UP_RC_S = HORIZON_STEP_S  # lengthening eases on the same tie ENVELOPE_EASE_UP_RC_S uses and
+                                        # for the same reason: it may never lag PREVIEW_LENGTHEN_UPDATES
 RESPONSE_TIME_PREVIEW_S = .1  # extra tracker response time granted at the full preview
 CLOTHOID_STEPS = 20
 
-# R4 horizon-implied envelope opening (G-independent, docs/BLaTv3_FAILURE_MODES.md): a second,
-# confidence-free PreviewScheduler (envelope_scheduler, below) reuses every gate above except the
-# confidence check, corroborated instead by its own DCPC-graft frame-to-frame far-point stability
-# check (previous_far_y / PREVIEW_ENVELOPE_DRIFT_M).
-PREVIEW_ENVELOPE_DRIFT_M = .25  # route-20 decode (owner Q2, 31,107 model frames): |dy@2s| between
-                                 # consecutive model frames swings 0.2-2.0 m through the island
-                                 # window while the 1s point stays 0.03-0.25 m; this flat gate
-                                 # admits the stable near approach and rejects the swinging far end
 ENVELOPE_OPEN_MARGIN = 1.15  # demand is re-derived from the live horizon every frame, so a modest margin suffices
 ENVELOPE_EASE_UP_RC_S = HORIZON_STEP_S  # owner Q4: tied to the scheduler's own lengthen pace so
                                          # ease-up can never lag PREVIEW_LENGTHEN_UPDATES's own admission rate
@@ -568,50 +575,71 @@ class PreviewScheduler:
   entry, a flickering far point, a lane change, the driver's hands, a limited path) it collapses
   within two model frames. The preview never replaces the near target: it only earns the tracker a
   calmer reference (a longer filter time constant) and a longer response time.
+
+  Every gate is in physical units -- deviation and yStd in metres, heading and flicker in lateral
+  acceleration -- and the walk is bounded by the horizon itself, not by a distance: a fixed distance
+  cap is a speed clock (40 m was 1.1 s at 35 m/s and 6 s at 6) and it kept the calm settings out of
+  reach on exactly the road this schedule calls consistent. One instance serves both consumers, the
+  tracker's settings and R4's envelope opening (docs/BLaTv3_FAILURE_MODES.md R4).
+
+  What the index schedules is stepped; what the controller is served is not. `served_preview_s`
+  follows the index continuously -- down at PREVIEW_COLLAPSE_RATE_S_PER_S, still emptying inside R3's
+  two model frames, up as a one-pole at the lengthen pace -- so neither the reference filter's time
+  constant nor the tracker's response time ever steps (R7).
   """
 
-  def __init__(self, require_confidence: bool = True) -> None:
-    # require_confidence=False (R4's envelope_scheduler): every gate above still applies except
-    # the confidence check, corroborated instead by previous_far_y's own temporal-stability check.
-    self.require_confidence = require_confidence
+  def __init__(self) -> None:
     self.index = 0
+    self.served_preview_s = 0.0
     self.fail_updates = 0
     self.pass_updates = 0
     self.last_model_timestamp_ns: int | None = None
     self.previous_curvatures: tuple[float, ...] | None = None
-    self.previous_far_y: tuple[float, ...] | None = None
 
   def reset(self) -> None:
     self.index = 0
+    self.served_preview_s = 0.0
     self.fail_updates = 0
     self.pass_updates = 0
     self.last_model_timestamp_ns = None
     self.previous_curvatures = None
-    self.previous_far_y = None
 
   @property
-  def preview_s(self) -> float:
+  def target_preview_s(self) -> float:
+    """The stepped schedule the served preview is walking toward."""
     return HORIZON_OFFSETS_S[self.index]
 
-  def update(self, model, model_timestamp_ns: int, action_time_s: float, targets: Sequence[PathTarget], forced: bool) -> int:
+  def update(self, model, model_timestamp_ns: int, action_time_s: float, targets: Sequence[PathTarget],
+             forced: bool, elapsed_s: float) -> float:
+    """One control frame: schedule the index on a new model frame, then serve toward it.
+
+    `elapsed_s` is the time since the preview last served, not the loop period -- a frame the
+    controller held through is elapsed time for the served preview exactly as it is for the
+    reference filter it feeds (R6)."""
+    self._schedule(model, model_timestamp_ns, action_time_s, targets, forced)
+    return self._serve(elapsed_s)
+
+  def _serve(self, elapsed_s: float) -> float:
+    target_s = HORIZON_OFFSETS_S[self.index]
+    if target_s < self.served_preview_s:
+      self.served_preview_s = max(target_s, self.served_preview_s - PREVIEW_COLLAPSE_RATE_S_PER_S * elapsed_s)
+    else:
+      self.served_preview_s += (elapsed_s / (PREVIEW_EASE_UP_RC_S + elapsed_s)) * (target_s - self.served_preview_s)
+    return self.served_preview_s
+
+  def _schedule(self, model, model_timestamp_ns: int, action_time_s: float, targets: Sequence[PathTarget], forced: bool) -> None:
     if forced:
       self.index = 0
       self.fail_updates = 0
       self.pass_updates = 0
-      # R4 fix: a forced frame skips _admissible entirely below, so it must clear the DCPC
-      # baseline itself -- otherwise the next real frame compares against a pre-event far point
-      # instead of treating the resumed data as having no baseline yet (previous_curvatures has no
-      # analogous gap: it is always refreshed unconditionally a few lines down).
-      self.previous_far_y = None
     timestamp = int(model_timestamp_ns)
     if timestamp == self.last_model_timestamp_ns:
-      return self.index
+      return
     self.last_model_timestamp_ns = timestamp
-    angles = tuple(target.angle_deg for target in targets)
-    admissible = 0 if forced else self._admissible(model, action_time_s, targets, angles)
+    admissible = 0 if forced else self._admissible(model, action_time_s, targets)
     self.previous_curvatures = tuple(target.curvature for target in targets)
     if forced:
-      return 0
+      return
     if admissible < self.index:
       self.fail_updates += 1
       if self.fail_updates >= PREVIEW_SHORTEN_UPDATES:
@@ -627,26 +655,17 @@ class PreviewScheduler:
           self.pass_updates = 0
       else:
         self.pass_updates = 0
-    return self.index
 
-  def _admissible(self, model, action_time_s: float, targets: Sequence[PathTarget], angles: tuple[float, ...]) -> int:
+  def _admissible(self, model, action_time_s: float, targets: Sequence[PathTarget]) -> int:
     position = model.position
     times = np.asarray(position.t, dtype=np.float64)
     if len(times) < 2 or len(position.x) != len(times) or len(position.y) != len(times):
-      self.previous_far_y = None  # R4 fix: no valid position data -- drop the DCPC baseline
-                                    # rather than let a later frame compare against it stale
-      return 0
-    if self.require_confidence and str(model.confidence) == "red":
       return 0
     xs = np.asarray(position.x, dtype=np.float64)
     ys = np.asarray(position.y, dtype=np.float64)
     y_std = np.asarray(position.yStd, dtype=np.float64) if len(position.yStd) == len(times) else None
-    speed_times = np.asarray(model.velocity.t, dtype=np.float64)
-    speeds = np.asarray(model.velocity.x, dtype=np.float64)
     # a path with a hole in it proves nothing: comparisons against NaN never fail, so check up front
-    if not all(np.isfinite(array).all() for array in (times, xs, ys, speed_times, speeds)) or (y_std is not None and not np.isfinite(y_std).all()):
-      self.previous_far_y = None  # R4 fix: same rationale -- a NaN/holed frame must not leave a
-                                    # stale (or, worse, NaN-poisoned) baseline for the next frame
+    if not all(np.isfinite(array).all() for array in (times, xs, ys)) or (y_std is not None and not np.isfinite(y_std).all()):
       return 0
     x_action = float(np.interp(action_time_s, times, xs))
     near = targets[0]
@@ -654,6 +673,9 @@ class PreviewScheduler:
     # near.speed_mps is max(MIN_SPEED, ...) by model_path_targets' construction, so it needs no floor.
     # this is the value at the full horizon; each step scales it by its own look-ahead below.
     flicker_tolerance = PREVIEW_FLICKER_TOLERANCE_LATERAL_ACCEL / near.speed_mps ** 2
+    # the heading gate reads the same way: a curvature difference against a lateral acceleration
+    admit_heading_curvature = PREVIEW_ADMIT_HEADING_LATERAL_ACCEL / near.speed_mps ** 2
+    keep_heading_curvature = PREVIEW_KEEP_HEADING_LATERAL_ACCEL / near.speed_mps ** 2
     admitted = 0
     for index in range(1, len(targets)):
       far_time = action_time_s + HORIZON_OFFSETS_S[index]
@@ -666,26 +688,14 @@ class PreviewScheduler:
           break
         if y_std is not None and float(np.max(y_std[window])) > PREVIEW_MAX_Y_STD_M:
           break
-      if abs(angles[index] - angles[0]) > (PREVIEW_KEEP_HEADING_DEG if keeping else PREVIEW_ADMIT_HEADING_DEG):
+      if abs(targets[index].curvature - near.curvature) > (keep_heading_curvature if keeping else admit_heading_curvature):
         break
       if self.previous_curvatures is not None and len(self.previous_curvatures) == len(targets):
         far_replan = abs(targets[index].curvature - self.previous_curvatures[index])
         tolerance = flicker_tolerance * (HORIZON_OFFSETS_S[index] / HORIZON_S) ** PREVIEW_FLICKER_HORIZON_EXPONENT
         if far_replan > abs(near.curvature - self.previous_curvatures[0]) + tolerance:
           break
-      sample_times = np.linspace(action_time_s, far_time, 9)
-      if float(np.trapezoid(np.interp(sample_times, speed_times, speeds), sample_times)) > PREVIEW_MAX_DISTANCE_M:
-        break
-      if not self.require_confidence:
-        # DCPC graft: cheap insurance for the "smooth but wrong" defense that dropping confidence
-        # removes -- this step's own far prediction must hold steady frame to frame, not just be
-        # smooth against the current frame's own near-to-far shape.
-        y_far = float(np.interp(far_time, times, ys))
-        if self.previous_far_y is not None and abs(y_far - self.previous_far_y[index]) > PREVIEW_ENVELOPE_DRIFT_M:
-          break
       admitted = index
-    if not self.require_confidence:
-      self.previous_far_y = tuple(float(np.interp(action_time_s + offset, times, ys)) for offset in HORIZON_OFFSETS_S)
     return admitted
 
 
@@ -1136,8 +1146,7 @@ class RackTrajectoryController:
     self.status = STATUS_INACTIVE
     self.jerk_filter = FirstOrderFilter(0.0, 1.0 / (2.0 * math.pi * 1.2), dt)
     self.reference_filter = ReferenceFilter()
-    self.preview_scheduler = PreviewScheduler()
-    self.envelope_scheduler = PreviewScheduler(require_confidence=False)  # R4: proactive, G-independent
+    self.preview_scheduler = PreviewScheduler()  # one schedule, read by the tracker and by R4's envelope
     self.envelope_open_rate = self.envelope_open_accel = self.envelope_open_jerk = 0.0  # eased state; floors at comfort
     self.rack_rate_estimator = RackRateEstimator(dt)
     self.ff_taper_filter = FirstOrderFilter(0.0, FF_TAPER_RC_S, dt)  # F3: always warm, only ever blended in when gated
@@ -1240,7 +1249,6 @@ class RackTrajectoryController:
     self.jerk_filter.x = 0.0
     self.reference_filter.reset()
     self.preview_scheduler.reset()
-    self.envelope_scheduler.reset()
     self.envelope_open_rate = self.envelope_open_accel = self.envelope_open_jerk = 0.0
     self.rack_rate_estimator.reset()
     self.ff_taper_filter.x = 0.0
@@ -1300,7 +1308,7 @@ class RackTrajectoryController:
     self, comfort: MotionLimits, targets: Sequence[PathTarget], g_env: int, ceiling: MotionLimits,
   ) -> MotionLimits:
     """R4 proactive opening (G-independent): how far the comfort envelope opens is driven by what
-    the model's own admitted horizon (envelope_scheduler.index, g_env) already implies the plan
+    the model's own admitted horizon (preview_scheduler.index, g_env) already implies the plan
     will need -- margined (ENVELOPE_OPEN_MARGIN) and capped at the ISO ceiling -- never by the
     current lateral acceleration or error. A bounded one-pole state per limit keeps the OPENING
     side continuous (R7): snap down the same frame the demand or the admitted horizon falls, ease
@@ -1469,10 +1477,10 @@ class RackTrajectoryController:
     # the driver's hands, a lane change or a limited immediate target pin the preview at the action time
     lane_changing = str(self.model.meta.laneChangeState) in ("laneChangeStarting", "laneChangeFinishing")
     forced = bool(CS.steeringPressed) or lane_changing or target_limits[0] or measured_out_of_bounds
-    self.preview_scheduler.update(self.model, int(self.model.timestampEof), float(preview_times[0]), targets, forced)
-    # R4 envelope scheduler: same gates and hysteresis, confidence-free (docs/BLaTv3_FAILURE_MODES.md R4)
-    self.envelope_scheduler.update(self.model, int(self.model.timestampEof), float(preview_times[0]), targets, forced)
-    preview_s = self.preview_scheduler.preview_s
+    # one schedule feeds both consumers: the tracker's calm settings below and R4's envelope opening
+    preview_s = self.preview_scheduler.update(
+      self.model, int(self.model.timestampEof), float(preview_times[0]), targets, forced, elapsed_s,
+    )
     target = targets[0]
     path_limited = target_limits[0]
 
@@ -1492,7 +1500,7 @@ class RackTrajectoryController:
     if 0.0 < abs(self.planner.acceleration_deg_s2) - profile.max_acceleration_deg_s2 <= 1e-6:
       self.planner.acceleration_deg_s2 = math.copysign(profile.max_acceleration_deg_s2, self.planner.acceleration_deg_s2)
     ceiling = self._iso_ceiling(float(CS.vEgo), VM, float(params.roll), profile)
-    opened_profile = self._horizon_opened_profile(profile, targets, self.envelope_scheduler.index, ceiling)
+    opened_profile = self._horizon_opened_profile(profile, targets, self.preview_scheduler.index, ceiling)
     limits, profile_transition = self._motion_limits(opened_profile)  # opened profile feeds the ratchet, never the reverse (R4/R10)
 
     # --- filter: the served target, bounded in how far it may trail the model's ---
@@ -1689,7 +1697,8 @@ class RackTrajectoryController:
       envelope_open_rate_deg_s=opened_profile.max_rate_deg_s,
       envelope_open_acceleration_deg_s2=opened_profile.max_acceleration_deg_s2,
       envelope_open_jerk_deg_s3=opened_profile.max_jerk_deg_s3,
-      envelope_preview_time_s=self.envelope_scheduler.preview_s,
+      # the schedule's stepped target beside the served preview_time_s above: one scheduler, both readings
+      envelope_preview_time_s=self.preview_scheduler.target_preview_s,
       hold_topup_torque=topup_applied,  # this frame's applied contribution, already inside `torque`
       hold_topup_growing=accumulating,
     )
