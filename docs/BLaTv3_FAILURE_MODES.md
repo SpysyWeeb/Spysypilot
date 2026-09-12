@@ -477,10 +477,29 @@ red-team pass.
   decreasing-radius ramp, a confidently wrong branch at an ambiguous exit. *A mean-path
   consistency test passes anything smooth.* → R2(c): uncertainty + confidence gates. →
   Synthetic 0.3–0.5 m sinusoidal wander: `t_p` never reaches max.
+  *Phase 3 step 3 (2026-09-11): the confidence half of R2(c) is gone (see R2's own note) and this entry's
+  defence is no longer a gate. It is the structure: the far target is never authority (R2), so a path that
+  is smooth and wrong earns only the calmer reference (0.1 → 0.3 s) and the longer response time
+  (0.3 → 0.4 s), the near target still sets every frame's magnitude, and both are undone within two model
+  frames of the path disagreeing. `yStd` — the uncertainty half of R2(c), and inert until now only because
+  the 40 m cap fired ahead of it — and the clothoid and flicker consistency gates are what still judge the
+  far end. The wander this entry names is not smooth to those gates, and its own stated test still passes
+  without the confidence gate: a 0.3-0.5 m peak-to-peak sinusoid at 4-6 s, swept over 64 phases at 20 and
+  31 m/s, is admitted to index 0-5 of 8 and never reaches the horizon, because it carries 0.36-0.85 m of
+  clothoid deviation against the 0.15 m admit tolerance (route-audit
+  phase3/preview_2026-09-11/review_fixes/fm1_13_wander.py).*
 - **FM1.14 — Confidence never consulted. [v2]** Night, rain, glare. *`modelV2.confidence`
   rises before curvature error appears; nothing reads it.* → Yellow/red: no extension past
   `t_action`; stronger corroboration before R4 exceeds comfort. Never *reduces* authority.
   → Red-confidence frame: `t_p` pinned, reason logged.
+  *Phase 3 step 3 (2026-09-11): withdrawn. A red-confidence frame no longer pins `t_p`, and nothing reads
+  `modelV2.confidence` — the resolution above is false as written from this commit on. The premise was
+  wrong: this signal predicts that the driver is about to disengage, not that the path is wrong (audit F10),
+  and it is red on 72 % of route 69's model frames. Read as a path test it was simply a way of keeping the
+  preview closed 70-94 % of the time below 24 m/s, which is what it did. What the field wanted from this
+  entry — night, rain, glare — is `position.yStd` (R2(c)'s other half, 0.35 m) and the two consistency
+  gates, which test the plan itself. See R2's Phase 3 step 3 note for the ruling and its evidence, and
+  FM1.13 for what now carries the "smooth but wrong" defence. `test_a_consistent_path_reaches_the_horizon_at_highway_speed_and_ignores_confidence`.*
 - **FM1.15 — Clothoid entries rejected by an arc test. [v2]** Every standard highway curve
   entry. → R2(a) clothoid-consistent extrapolation; tolerance scales with the expected
   buildup-vs-arc gap. → Six AASHTO-typical transitions pass consistency.

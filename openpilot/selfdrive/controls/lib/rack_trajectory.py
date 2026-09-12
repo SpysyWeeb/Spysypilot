@@ -586,6 +586,15 @@ class PreviewScheduler:
   follows the index continuously -- down at PREVIEW_COLLAPSE_RATE_S_PER_S, still emptying inside R3's
   two model frames, up as a one-pole at the lengthen pace -- so neither the reference filter's time
   constant nor the tracker's response time ever steps (R7).
+
+  A `forced` frame zeroes the index at once and the served value then ramps to it like any other
+  collapse: it is not a bypass, and only two of the four conditions that force the schedule also bypass
+  the reference filter. A limited immediate target and a measured curvature out of bounds do both (the
+  filter's own `bypass` argument names them; `_bound_target`'s docstring says so). The driver's hands and
+  a lane change force the schedule only -- the filter keeps filtering, and the served target is not
+  snapped to the model's. That is deliberate: while `steeringPressed` the planner re-anchors its own
+  position to the measured wheel every frame, so the plan follows the driver's hand whatever the filtered
+  target says, and a lane change is a path the model itself is re-drawing rather than a fault in ours.
   """
 
   def __init__(self) -> None:

@@ -1048,6 +1048,35 @@ class TestLatControlRack(OpenpilotTestCase):
       assert math.isclose(abs(math.degrees(self.VM.get_steer_from_curvature(-admit, speed, 0.0))),
                           wheel_deg, abs_tol=0.01)
 
+  def test_preview_heading_gate_holds_inside_its_hysteresis_band(self):
+    # the deviation gate's own hysteresis test above (test_preview_scheduler_holds_inside_the_hysteresis_band)
+    # for the heading gate, now that it is a lateral acceleration: a far step strictly between the admit
+    # and keep tolerances must be kept by a schedule already reading that far and never admitted by one
+    # that is not, so the two constants cannot be collapsed into one value.
+    speed = 20.0
+    times = [i * 0.25 for i in range(13)]
+    model = horizon_model(times, [0.0] * 13, [speed] * 13)
+    between = 0.5 * (PREVIEW_ADMIT_HEADING_LATERAL_ACCEL + PREVIEW_KEEP_HEADING_LATERAL_ACCEL) / speed ** 2
+    steady = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), speed)
+    # the 1 s step is the one that turns: deep enough that this gate decides it (its clothoid deviation is
+    # .04 m against the .15 m tolerance) and shallow enough to stay inside the flicker gate as it drifts in
+    def band(fraction):
+      return self._scheduler_targets([0.0] * 4 + [between * fraction] + [0.0] * 4, speed)
+
+    scheduler = PreviewScheduler()
+    for frame in range(1, 20):
+      schedule(scheduler, model, frame, 0.5, steady)
+    assert scheduler.index == 8
+    # the far step drifts into the band a third of the way at a time, under the flicker gate's own floor
+    for frame, fraction in enumerate((0.0, 1 / 3, 2 / 3, 1.0), start=20):
+      assert schedule(scheduler, model, frame, 0.5, band(fraction)) == 8
+    for frame in range(24, 34):  # and it stays there: inside the keep tolerance is not a disagreement
+      assert schedule(scheduler, model, frame, 0.5, band(1.0)) == 8
+    fresh = PreviewScheduler()
+    for frame in range(1, 20):
+      schedule(fresh, model, frame, 0.5, band(1.0))
+    assert fresh.index == 3  # the same step, admitted from below, stops one short of it
+
   def test_served_preview_is_continuous_in_both_directions(self):
     # R7: the index is stepped, the served preview is not. Falling is a ramp that still empties the
     # full horizon inside R3's two model frames (20 s/s = .2 s of preview per control frame, ten
