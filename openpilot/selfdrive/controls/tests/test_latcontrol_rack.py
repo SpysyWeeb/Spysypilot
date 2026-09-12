@@ -45,17 +45,14 @@ from openpilot.selfdrive.controls.lib.rack_trajectory import (
   MEASURED_RATE_FROZEN_FRAMES,
   MotionLimits,
   PathTarget,
-  MODEL_FRAME_S,
-  PREVIEW_COLLAPSE_RATE_S_PER_S,
-  PREVIEW_EASE_UP_RC_S,
+  PREVIEW_ENVELOPE_DRIFT_M,
   R7_MAX_TORQUE_STEP,
   RackRateEstimator,
   RackTarget,
   RackTrajectoryController,
   model_path_targets,
   PREVIEW_ADMIT_DEVIATION_M,
-  PREVIEW_ADMIT_HEADING_LATERAL_ACCEL,
-  PREVIEW_KEEP_HEADING_LATERAL_ACCEL,
+  PREVIEW_MAX_DISTANCE_M,
   PREVIEW_LENGTHEN_UPDATES,
   PreviewScheduler,
   REFERENCE_FILTER_PREVIEW_RC_S,
@@ -127,13 +124,6 @@ def horizon_model(times, rates, speeds, path_y=None):
   message.confidence = "green"  # the schema's default is red, which admits no preview
   set_curvature_preview(message)
   return message
-
-
-def schedule(scheduler, model, timestamp, action_time_s, targets, forced=False, elapsed_s=DT_CTRL):
-  """One control frame of the scheduler, returning the stepped index the schedule tests reason about.
-  update() itself returns the served preview time, which is a continuous function of that index."""
-  scheduler.update(model, timestamp, action_time_s, targets, forced, elapsed_s)
-  return scheduler.index
 
 
 def build_feedforward_boundary_controller(driver_assist_limits=None):
@@ -442,16 +432,16 @@ class TestLatControlRack(OpenpilotTestCase):
     targets = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), 20.0)
     scheduler = PreviewScheduler()
     for frame in range(1, 40):
-      index = schedule(scheduler, straight, frame, 0.5, targets)
+      index = scheduler.update(straight, frame, 0.5, targets, False)
       assert index == min(8, frame // PREVIEW_LENGTHEN_UPDATES)
-    assert scheduler.target_preview_s == 2.0
+    assert scheduler.preview_s == 2.0
     # the same model frame again decides nothing new
-    assert schedule(scheduler, straight, 39, 0.5, targets) == 8
+    assert scheduler.update(straight, 39, 0.5, targets, False) == 8
     # the path now jogs 1.5 m from 1.5 s on: everything past 1 s disagrees, and the preview shortens in two frames
     jog = horizon_model(times, [0.0] * 7, [20.0] * 7, path_y=[0.0, 0.0, 0.0, 1.5, 1.5, 1.5, 1.5])
-    assert schedule(scheduler, jog, 40, 0.5, targets) == 8
-    assert schedule(scheduler, jog, 41, 0.5, targets) == 3
-    assert scheduler.target_preview_s == 0.75
+    assert scheduler.update(jog, 40, 0.5, targets, False) == 8
+    assert scheduler.update(jog, 41, 0.5, targets, False) == 3
+    assert scheduler.preview_s == 0.75
 
   def test_preview_scheduler_grows_through_periodic_texture(self):
     times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
@@ -461,7 +451,7 @@ class TestLatControlRack(OpenpilotTestCase):
     scheduler = PreviewScheduler()
     # every third model frame disagrees (a joint, a rumble strip): the preview still grows and never shortens
     for frame in range(1, 40):
-      index = schedule(scheduler, bump if frame % 3 == 0 else straight, frame, 0.5, targets)
+      index = scheduler.update(bump if frame % 3 == 0 else straight, frame, 0.5, targets, False)
       assert index >= min(8, (frame - frame // 3) // PREVIEW_LENGTHEN_UPDATES) - 1
     assert scheduler.index == 8
 
@@ -482,15 +472,10 @@ class TestLatControlRack(OpenpilotTestCase):
         CS.steeringPressed = True
       else:
         model.meta.laneChangeState = "laneChangeStarting"
-      served = output.preview_time_s
-      for _ in range(10):  # R3 as a ramp: the schedule is pinned at once, the served preview follows
-        model.timestampEof += 50_000_000
-        controller.set_model(model, model.timestampEof + 30_000_000)
-        output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
-        assert output is not None and output.envelope_preview_time_s == 0.0
-        assert output.preview_time_s == max(0.0, served - PREVIEW_COLLAPSE_RATE_S_PER_S * DT_CTRL)
-        served = output.preview_time_s
-      assert served == 0.0
+      model.timestampEof += 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None and output.preview_time_s == 0.0
 
   def test_preview_never_replaces_the_near_target(self):
     controller = RackTrajectoryController()
@@ -960,7 +945,7 @@ class TestLatControlRack(OpenpilotTestCase):
   def test_full_preview_keeps_steering_without_a_farther_target(self):
     controller = RackTrajectoryController()
     CS = car.CarState.new_message()
-    CS.vEgo = 15.0
+    CS.vEgo = 15.0  # 40 m of preview covers the full 2 s only below 20 m/s
     params = log.VehicleParameters.new_message()
     model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [15.0] * 7)
     for frame in range(150):
@@ -968,8 +953,7 @@ class TestLatControlRack(OpenpilotTestCase):
       controller.set_model(model, model.timestampEof + 30_000_000)
       output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, 0.0)
       assert output is not None and controller.status == STATUS_ACTIVE
-    assert output.envelope_preview_time_s == 2.0  # the schedule reaches the horizon
-    assert math.isclose(output.preview_time_s, 1.9611, abs_tol=5e-5)  # and the served preview eases onto it
+    assert output.preview_time_s == 2.0
 
   def test_preview_scheduler_holds_inside_the_hysteresis_band(self):
     times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
@@ -977,177 +961,53 @@ class TestLatControlRack(OpenpilotTestCase):
     targets = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), 20.0)
     scheduler = PreviewScheduler()
     for frame in range(1, 20):
-      schedule(scheduler, straight, frame, 0.5, targets)
+      scheduler.update(straight, frame, 0.5, targets, False)
     assert scheduler.index == 8
     # a deviation above the admission tolerance but below the keep tolerance keeps the preview where it is
     wobble = horizon_model(times, [0.0] * 7, [20.0] * 7, path_y=[0.0] * 3 + [PREVIEW_ADMIT_DEVIATION_M + 0.02] * 4)
     for frame in range(20, 30):
-      assert schedule(scheduler, wobble, frame, 0.5, targets) == 8
+      assert scheduler.update(wobble, frame, 0.5, targets, False) == 8
     fresh = PreviewScheduler()
     for frame in range(1, 20):
-      schedule(fresh, wobble, frame, 0.5, targets)
+      fresh.update(wobble, frame, 0.5, targets, False)
     assert fresh.index == 3
 
-  def test_preview_scheduler_gates_heading_flicker_and_hands(self):
+  def test_preview_scheduler_gates_heading_flicker_distance_hands_and_confidence(self):
     times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
     model = horizon_model(times, [0.0] * 7, [20.0] * 7)
-    # the far target turns: admitted only as far as its curvature stays within .2 m/s^2 of the near
-    # target's, which at 20 m/s is 5e-4 1/m -- the .001 1/m step at index 4 is .4 m/s^2 and is not
+    # the far target turns: admitted only as far as the heading stays within a degree of the near target
     turning = self._scheduler_targets([0.0, 0.0, 0.0002, 0.0002, 0.001, 0.001, 0.001, 0.001, 0.001], 20.0)
     scheduler = PreviewScheduler()
-    assert scheduler._admissible(model, 0.5, turning) == 3
+    assert scheduler._admissible(model, 0.5, turning, tuple(t.angle_deg for t in turning)) == 3
     # a far target that re-plans between model frames more than the near one is not admitted. the
     # tolerance is a lateral acceleration shaped by the look-ahead, so at 20 m/s the .5 s step allows
-    # .15 / 20**2 * sqrt(.5 / 2) = 1.88e-4 1/m: 2.1e-4 breaks it while staying inside the .2 m/s^2
-    # heading gate (5e-4 1/m) and the .15 m clothoid gate (.004 m), so this is the gate under test.
+    # .15 / 20**2 * sqrt(.5 / 2) = 1.88e-4 1/m: 2.1e-4 breaks it while staying inside the 1 deg
+    # heading gate (.86 deg) and the .15 m clothoid gate (.004 m), so this is the gate under test.
     steady = self._scheduler_targets([0.0] * 9, 20.0)
     flicker = list(steady)
     flicker[2] = self._scheduler_targets([2.1e-4], 20.0)[0]
     scheduler = PreviewScheduler()
-    schedule(scheduler, model, 1, 0.5, steady)
-    assert scheduler._admissible(model, 0.5, tuple(flicker)) == 1
+    scheduler.update(model, 1, 0.5, steady, False)
+    assert scheduler._admissible(model, 0.5, tuple(flicker), tuple(t.angle_deg for t in flicker)) == 1
     # with no previous frame to compare against, the same targets pass every other gate
-    assert PreviewScheduler()._admissible(model, 0.5, tuple(flicker)) == 8
-    # the driver's hands pin the schedule at the action time at once; the served preview then ramps
-    # down to it at PREVIEW_COLLAPSE_RATE_S_PER_S (test_served_preview_is_continuous_in_both_directions)
+    assert PreviewScheduler()._admissible(model, 0.5, tuple(flicker), tuple(t.angle_deg for t in flicker)) == 8
+    # 40 m of preview at 35 m/s is 1.14 s
+    fast = horizon_model(times, [0.0] * 7, [35.0] * 7)
+    assert PreviewScheduler()._admissible(fast, 0.5, steady, tuple(t.angle_deg for t in steady)) == 4
+    # the driver's hands pin the preview at the action time at once
     scheduler = PreviewScheduler()
     for frame in range(1, 20):
-      schedule(scheduler, model, frame, 0.5, steady)
-    assert schedule(scheduler, model, 20, 0.5, steady, True) == 0 and scheduler.target_preview_s == 0.0
-    # a path with a hole in it proves nothing and admits nothing
+      scheduler.update(model, frame, 0.5, steady, False)
+    assert scheduler.update(model, 20, 0.5, steady, True) == 0 and scheduler.preview_s == 0.0
+    # a red-confidence model admits nothing, and neither does a path with a hole in it
+    model.confidence = "red"
+    assert PreviewScheduler()._admissible(model, 0.5, steady, tuple(t.angle_deg for t in steady)) == 0
     holed = horizon_model(times, [0.0] * 7, [20.0] * 7)
     holed.position.y = [0.0, 0.0, math.nan, 0.0, 0.0, 0.0, 0.0]
-    assert PreviewScheduler()._admissible(holed, 0.5, steady) == 0
+    assert PreviewScheduler()._admissible(holed, 0.5, steady, tuple(t.angle_deg for t in steady)) == 0
     holed = horizon_model(times, [0.0] * 7, [20.0] * 7)
     holed.position.yStd = [0.0, 0.0, 0.0, math.nan, 0.0, 0.0, 0.0]
-    assert PreviewScheduler()._admissible(holed, 0.5, steady) == 0
-
-  def test_preview_heading_gate_is_a_lateral_acceleration_at_every_speed(self):
-    # the gate reads a curvature difference against a lateral acceleration, so the wheel angle it
-    # allows grows as the car slows: on this car's VehicleModel 1.03 deg at 35 m/s, 3.20 at 15 and
-    # 17.11 at 6. In wheel degrees the same gate was 17x tighter at parking speed than on the highway.
-    times = [i * 0.25 for i in range(13)]
-    for speed, wheel_deg in ((6.0, 17.11), (15.0, 3.20), (35.0, 1.03)):
-      model = horizon_model(times, [0.0] * 13, [speed] * 13)
-      admit = PREVIEW_ADMIT_HEADING_LATERAL_ACCEL / speed ** 2
-      keep = PREVIEW_KEEP_HEADING_LATERAL_ACCEL / speed ** 2
-
-      def targets_with(curvature, speed=speed):
-        # only the last step turns, so the gate under test decides that step and nothing shallower
-        return self._scheduler_targets([0.0] * 8 + [curvature], speed)
-
-      # admitting: just inside the admit tolerance passes, just outside stops one step short
-      assert PreviewScheduler()._admissible(model, 0.5, targets_with(admit * 0.99)) == 8
-      assert PreviewScheduler()._admissible(model, 0.5, targets_with(admit * 1.01)) == 7
-      # keeping: a step already held tolerates the wider keep tolerance, and nothing beyond it
-      for curvature, expected in ((keep * 0.99, 8), (keep * 1.01, 7)):
-        held = PreviewScheduler()
-        held.index = 8
-        assert held._admissible(model, 0.5, targets_with(curvature)) == expected
-      # and that tolerance is the wheel angle the constant's comment claims at this speed
-      assert math.isclose(abs(math.degrees(self.VM.get_steer_from_curvature(-admit, speed, 0.0))),
-                          wheel_deg, abs_tol=0.01)
-
-  def test_preview_heading_gate_holds_inside_its_hysteresis_band(self):
-    # the deviation gate's own hysteresis test above (test_preview_scheduler_holds_inside_the_hysteresis_band)
-    # for the heading gate, now that it is a lateral acceleration: a far step strictly between the admit
-    # and keep tolerances must be kept by a schedule already reading that far and never admitted by one
-    # that is not, so the two constants cannot be collapsed into one value.
-    speed = 20.0
-    times = [i * 0.25 for i in range(13)]
-    model = horizon_model(times, [0.0] * 13, [speed] * 13)
-    between = 0.5 * (PREVIEW_ADMIT_HEADING_LATERAL_ACCEL + PREVIEW_KEEP_HEADING_LATERAL_ACCEL) / speed ** 2
-    steady = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), speed)
-    # the 1 s step is the one that turns: deep enough that this gate decides it (its clothoid deviation is
-    # .04 m against the .15 m tolerance) and shallow enough to stay inside the flicker gate as it drifts in
-    def band(fraction):
-      return self._scheduler_targets([0.0] * 4 + [between * fraction] + [0.0] * 4, speed)
-
-    scheduler = PreviewScheduler()
-    for frame in range(1, 20):
-      schedule(scheduler, model, frame, 0.5, steady)
-    assert scheduler.index == 8
-    # the far step drifts into the band a third of the way at a time, under the flicker gate's own floor
-    for frame, fraction in enumerate((0.0, 1 / 3, 2 / 3, 1.0), start=20):
-      assert schedule(scheduler, model, frame, 0.5, band(fraction)) == 8
-    for frame in range(24, 34):  # and it stays there: inside the keep tolerance is not a disagreement
-      assert schedule(scheduler, model, frame, 0.5, band(1.0)) == 8
-    fresh = PreviewScheduler()
-    for frame in range(1, 20):
-      schedule(fresh, model, frame, 0.5, band(1.0))
-    assert fresh.index == 3  # the same step, admitted from below, stops one short of it
-
-  def test_served_preview_is_continuous_in_both_directions(self):
-    # R7: the index is stepped, the served preview is not. Falling is a ramp that still empties the
-    # full horizon inside R3's two model frames (20 s/s = .2 s of preview per control frame, ten
-    # frames from 2 s); rising is the one-pole ease at the lengthen pace.
-    scheduler = PreviewScheduler()
-    scheduler.index = 8
-    scheduler.served_preview_s = 2.0
-    scheduler.index = 0
-    served = [scheduler._serve(DT_CTRL) for _ in range(12)]
-    for step, value in enumerate(served):
-      assert math.isclose(value, max(0.0, 2.0 - 0.2 * (step + 1)), abs_tol=1e-12)
-    assert served[9] < 1e-12 and served[-1] == 0.0  # ten frames to empty, and it stays there
-    assert 2.0 / PREVIEW_COLLAPSE_RATE_S_PER_S == 2 * MODEL_FRAME_S  # R3, written in the constant
-
-    scheduler = PreviewScheduler()
-    scheduler.index = 8
-    value = 0.0
-    alpha = DT_CTRL / (PREVIEW_EASE_UP_RC_S + DT_CTRL)
-    for _ in range(100):
-      value += alpha * (2.0 - value)
-      assert math.isclose(scheduler._serve(DT_CTRL), value, rel_tol=1e-12)
-    assert 1.9 < value < 2.0  # a one-pole approaches the horizon, never oversteps it
-
-  def test_the_served_preview_bounds_the_time_constant_and_the_response_time_per_frame(self):
-    # what the continuity is for: neither derived setting may step. The bound is the collapse rate's
-    # own .2 s of preview per frame, scaled by each setting's share of the full preview.
-    scheduler = PreviewScheduler()
-    rc = REFERENCE_FILTER_RC_S + REFERENCE_FILTER_PREVIEW_RC_S * scheduler.served_preview_s / HORIZON_S
-    response = RESPONSE_TIME_S + RESPONSE_TIME_PREVIEW_S * scheduler.served_preview_s / HORIZON_S
-    rc_bound = REFERENCE_FILTER_PREVIEW_RC_S * PREVIEW_COLLAPSE_RATE_S_PER_S * DT_CTRL / HORIZON_S
-    response_bound = RESPONSE_TIME_PREVIEW_S * PREVIEW_COLLAPSE_RATE_S_PER_S * DT_CTRL / HORIZON_S
-    assert math.isclose(rc_bound, 0.02) and math.isclose(response_bound, 0.01)
-    # a sweep that steps the index every way it can: up one at a time, straight to the horizon, and
-    # back to zero from every depth
-    indices = list(range(9)) + [8] * 20 + [0] + list(range(8, -1, -1)) * 2 + [8, 0] * 5
-    for index in indices:
-      scheduler.index = index
-      for _ in range(12):
-        served = scheduler._serve(DT_CTRL)
-        new_rc = REFERENCE_FILTER_RC_S + REFERENCE_FILTER_PREVIEW_RC_S * served / HORIZON_S
-        new_response = RESPONSE_TIME_S + RESPONSE_TIME_PREVIEW_S * served / HORIZON_S
-        assert abs(new_rc - rc) <= rc_bound + 1e-12
-        assert abs(new_response - response) <= response_bound + 1e-12
-        rc, response = new_rc, new_response
-
-  def test_a_held_frame_is_elapsed_time_for_the_served_preview(self):
-    # R6: a frame the controller held through is elapsed time for the served preview exactly as it is
-    # for the reference filter it feeds -- N held frames advance it by N frames' worth, not one.
-    for held in range(1, 6):
-      stepwise = PreviewScheduler()
-      stepwise.index = 8
-      stepwise.served_preview_s = 2.0
-      stepwise.index = 0
-      at_once = PreviewScheduler()
-      at_once.index = 0
-      at_once.served_preview_s = 2.0
-      for _ in range(1 + held):
-        stepwise._serve(DT_CTRL)
-      assert math.isclose(at_once._serve(DT_CTRL * (1 + held)), stepwise.served_preview_s, rel_tol=1e-12)
-
-  def test_a_consistent_path_reaches_the_horizon_at_highway_speed_and_ignores_confidence(self):
-    # the 40 m cap was a speed clock -- 1.1 s at 35 m/s, 6 s at 6 -- and it is gone: the horizon is
-    # the bound. And the model's confidence is a driver-disengage predictor, not a statement about
-    # the path (audit F10, red on 72 % of route 69's model frames), so it gates nothing here.
-    times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
-    steady = self._scheduler_targets([0.0] * 9, 35.0)
-    fast = horizon_model(times, [0.0] * 7, [35.0] * 7)
-    assert PreviewScheduler()._admissible(fast, 0.5, steady) == 8  # 70 m of road, the full 2 s
-    red = horizon_model(times, [0.0] * 7, [35.0] * 7)
-    red.confidence = "red"
-    assert PreviewScheduler()._admissible(red, 0.5, steady) == 8
+    assert PreviewScheduler()._admissible(holed, 0.5, steady, tuple(t.angle_deg for t in steady)) == 0
 
   def test_preview_flicker_gate_admits_the_model_own_replan_noise_at_speed(self):
     # the defect this gate's scaling fixes: at 31 m/s the model re-plans its own curvature preview by
@@ -1159,7 +1019,7 @@ class TestLatControlRack(OpenpilotTestCase):
     times = [i * 0.25 for i in range(13)]
     model = horizon_model(times, [0.0] * 13, [speed] * 13)
     steady = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), speed)
-    horizon = len(HORIZON_OFFSETS_S) - 1  # no distance cap: a consistent path is admitted to the horizon
+    capped = 5  # 40 m at 31 m/s: the distance cap, and the deepest step any gate can admit here
 
     def admitted_after(step, curvature):
       curvatures = [0.0] * len(HORIZON_OFFSETS_S)
@@ -1167,18 +1027,18 @@ class TestLatControlRack(OpenpilotTestCase):
       targets = list(steady)
       targets[step] = self._scheduler_targets([curvature], speed)[0]
       scheduler = PreviewScheduler()
-      schedule(scheduler, model, 1, 0.5, steady)
-      return scheduler._admissible(model, 0.5, tuple(targets))
+      scheduler.update(model, 1, 0.5, steady, False)
+      return scheduler._admissible(model, 0.5, tuple(targets), tuple(t.angle_deg for t in targets))
 
-    # 1.0e-4 1/m at the 1.25 s step is .096 m/s^2 of re-plan, under the floor: admitted, and with it
-    # the horizon. in wheel angle it is .56 deg, so the old fixed .25 deg tolerance rejected it here.
-    assert admitted_after(5, 1.0e-4) == horizon
+    # 1.0e-4 1/m at the 1.25 s step is .096 m/s^2 of re-plan, under the floor: admitted to the cap.
+    # in wheel angle it is .56 deg, so the old fixed .25 deg tolerance rejected it and lost two steps.
+    assert admitted_after(capped, 1.0e-4) == capped
     # 1.5e-4 at the 1.0 s step is .144 against a floor of .110: still rejected, and by this gate --
     # its heading is .84 deg and its clothoid deviation .02 m, both well inside their own gates
     assert admitted_after(4, 1.5e-4) == 3
     fresh = list(steady)
     fresh[4] = self._scheduler_targets([1.5e-4], speed)[0]
-    assert PreviewScheduler()._admissible(model, 0.5, tuple(fresh)) == horizon
+    assert PreviewScheduler()._admissible(model, 0.5, tuple(fresh), tuple(t.angle_deg for t in fresh)) == capped
 
   def test_preview_flicker_gate_still_collapses_a_far_plan_reversal_at_once(self):
     # R5: the tolerance may only clear the model's own noise, never a real change of mind. a plan
@@ -1194,23 +1054,23 @@ class TestLatControlRack(OpenpilotTestCase):
 
       scheduler = PreviewScheduler()
       for frame in range(1, 30):  # a smooth, self-consistent buildup: the preview grows through it
-        schedule(scheduler, model, frame, 0.5, ramp(peak * min(1.0, frame / 12.0)))
+        scheduler.update(model, frame, 0.5, ramp(peak * min(1.0, frame / 12.0)), False)
       grown = scheduler.index
       assert grown >= 3
 
       # the frame the plan reverses, the gate rejects it outright
       reversed_targets = ramp(-peak)
-      assert scheduler._admissible(model, 0.5, reversed_targets) < grown
+      assert scheduler._admissible(model, 0.5, reversed_targets, tuple(t.angle_deg for t in reversed_targets)) < grown
       # a plan that keeps changing its mind (FM1.3) fails two frames running, and R3's timer empties
       # the horizon at once rather than one step at a time
-      assert schedule(scheduler, model, 30, 0.5, reversed_targets) == grown  # one frame decides nothing
-      assert schedule(scheduler, model, 31, 0.5, ramp(peak)) < grown  # the second one does
+      assert scheduler.update(model, 30, 0.5, reversed_targets, False) == grown  # one frame decides nothing
+      assert scheduler.update(model, 31, 0.5, ramp(peak), False) < grown  # the second one does
 
   def test_preview_flicker_gate_leaves_the_preview_steady_under_replan_noise(self):
     # R7: the served signal may not step frame to frame, and the preview is the only thing this gate
     # can step. driven with the model's own measured re-plan noise (dk std 4e-5 * sqrt(offset / 2)
-    # 1/m at 31 m/s, quiet road, routes 5b and 54), the preview must climb to the horizon and stay
-    # there -- the shipped fixed-angle tolerance sat at ~1 sigma of that noise and chattered.
+    # 1/m at 31 m/s, quiet road, routes 5b and 54), the preview must climb to the distance cap and
+    # stay there -- the shipped fixed-angle tolerance sat at ~1 sigma of that noise and chattered.
     speed = 31.0
     times = [i * 0.25 for i in range(13)]
     model = horizon_model(times, [0.0] * 13, [speed] * 13)
@@ -1220,18 +1080,18 @@ class TestLatControlRack(OpenpilotTestCase):
     levels = []
     for frame in range(1, 400):
       noisy = self._scheduler_targets([s * rng.standard_normal() for s in sigma], speed)
-      levels.append(schedule(scheduler, model, frame, 0.5, noisy))
-    assert max(levels) == 8  # the horizon itself, 62 m of road at 31 m/s
-    settled = levels[levels.index(8):]
-    assert set(settled) == {8}  # once earned it is never given back to noise
+      levels.append(scheduler.update(model, frame, 0.5, noisy, False))
+    assert max(levels) == 5  # the 40 m distance cap at 31 m/s
+    settled = levels[levels.index(5):]
+    assert set(settled) == {5}  # once earned it is never given back to noise
 
   def test_preview_flicker_gate_does_not_step_the_preview_as_the_car_speeds_up(self):
     # R7 on the threshold itself: it is now a smooth function of vEgo rather than a constant read
     # through the car's v^2 understeer gain, so a car accelerating on an unchanging plan may not lose
     # the preview as it goes faster. driven with a 4e-5 1/m far re-plan -- the model's own measured
-    # per-frame noise on a quiet road -- the admitted depth must be the horizon at every speed in the
-    # range. the shipped .25 deg tolerance crossed that noise at ~35 m/s (4e-5 * 6333 deg/(1/m) = .25)
-    # and emptied the horizon there instead; the 40 m cap, now gone, capped it at 3-7 steps besides.
+    # per-frame noise on a quiet road -- the admitted depth must be the 40 m distance cap at every
+    # speed, monotone and one step at a time. the shipped .25 deg tolerance crossed that noise at
+    # ~35 m/s (4e-5 * 6333 deg/(1/m) = .25) and emptied the horizon there instead.
     replan = 4.0e-5
     times = [i * 0.25 for i in range(13)]
     previous = None
@@ -1241,9 +1101,10 @@ class TestLatControlRack(OpenpilotTestCase):
       steady = self._scheduler_targets([0.0] * len(HORIZON_OFFSETS_S), speed)
       targets = self._scheduler_targets([0.0] + [replan] * (len(HORIZON_OFFSETS_S) - 1), speed)
       scheduler = PreviewScheduler()
-      schedule(scheduler, model, 1, 0.5, steady)
-      admitted = scheduler._admissible(model, 0.5, targets)
-      assert admitted == len(HORIZON_OFFSETS_S) - 1, f"{speed} m/s: admitted {admitted}"
+      scheduler.update(model, 1, 0.5, steady, False)
+      admitted = scheduler._admissible(model, 0.5, targets, tuple(t.angle_deg for t in targets))
+      cap = min(len(HORIZON_OFFSETS_S) - 1, int(PREVIEW_MAX_DISTANCE_M / (HORIZON_STEP_S * speed)))
+      assert admitted == cap, f"{speed} m/s: admitted {admitted}, distance cap {cap}"
       assert previous is None or 0 <= previous - admitted <= 1
       previous = admitted
 
@@ -1263,9 +1124,8 @@ class TestLatControlRack(OpenpilotTestCase):
     params = log.VehicleParameters.new_message()
     model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5], [0.0] * 6, [4.0] * 6)
     # a 250 degree turn-in over 3 s and its unwind, the plan's curvature still building along the horizon: the served
-    # target follows within the bound every frame and the preview stays short
+    # target follows within the bound every frame and the far preview is never admitted
     worst = 0.0
-    deepest = 0.0
     for frame in range(600):
       curvature = 0.08 * min(1.0, frame / 300.0) if frame < 300 else 0.08 * max(0.0, 1.0 - (frame - 300) / 300.0)
       slope = 0.08 / 3.0 if frame < 300 else -0.08 / 3.0
@@ -1276,14 +1136,10 @@ class TestLatControlRack(OpenpilotTestCase):
       controller.set_model(model, model.timestampEof + 30_000_000)
       output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque, self.CI.torque_from_lateral_accel(), .2, curvature)
       assert output is not None
-      # the plan's curvature builds at .027 1/m per second of look-ahead, which is .43 m/s^2 at the
-      # 2 s point and .107 at the .25 s one: while the plan really is curving the heading gate admits
-      # one step of preview and no more (past the unwind the plan flattens and the gate opens again)
-      if curvature >= 0.02:
-        deepest = max(deepest, output.envelope_preview_time_s)
+      # while the plan is still curving no far preview is admitted; once it has straightened it may be
+      assert curvature < 0.02 or output.preview_time_s == 0.0
       raw_angle = math.degrees(self.VM.get_steer_from_curvature(-curvature, 4.0, 0.0))
       worst = max(worst, abs(output.target_angle_deg - raw_angle))
-    assert deepest == HORIZON_STEP_S
     assert worst <= REFERENCE_FILTER_TRAIL_MAX_DEG + 1e-6
     assert abs(worst - REFERENCE_FILTER_TRAIL_MAX_DEG) < 0.5
 
@@ -1430,11 +1286,11 @@ class TestLatControlRack(OpenpilotTestCase):
       return controller.update(True, self.CS, self.VM, self.params, torque_params,
                                torque_from_lateral_accel, 0.2, 0.002)
 
-    for frame in range(300):  # long enough for the top-up and the preview to be worth losing
+    for frame in range(300):  # long enough for the top-up and both preview indices to be worth losing
       assert step(frame) is not None
     planner, served = controller.planner, controller.reference_filter.target
     topup = controller.hold_topup_torque
-    previews = (controller.preview_scheduler.index, controller.preview_scheduler.served_preview_s)
+    previews = (controller.preview_scheduler.index, controller.envelope_scheduler.index)
     tracker = (controller.rack_rate_estimator.previous_angle_deg, controller.rack_rate_estimator.angle_deg,
                controller.rack_rate_estimator.rate_deg_s)
     assert abs(topup) > 0.01 and previews[0] > 0 and previews[1] > 0
@@ -1446,7 +1302,7 @@ class TestLatControlRack(OpenpilotTestCase):
     assert controller.planner is planner
     assert controller.reference_filter.target is served
     assert controller.hold_topup_torque == topup
-    assert (controller.preview_scheduler.index, controller.preview_scheduler.served_preview_s) == previews
+    assert (controller.preview_scheduler.index, controller.envelope_scheduler.index) == previews
     assert all(math.isfinite(value) for value in (planner.position_deg, planner.rate_deg_s, planner.acceleration_deg_s2))
     assert (controller.rack_rate_estimator.previous_angle_deg, controller.rack_rate_estimator.angle_deg,
             controller.rack_rate_estimator.rate_deg_s) == tracker
@@ -1764,7 +1620,7 @@ class TestLatControlRack(OpenpilotTestCase):
         "p": float(rack_log.p), "d": float(rack_log.d), "f": float(rack_log.f),
         "status": int(rack_log.status), "topup": float(controller.rack.hold_topup_torque),
         "preview_index": controller.rack.preview_scheduler.index,
-        "served_preview": controller.rack.preview_scheduler.served_preview_s,
+        "envelope_index": controller.rack.envelope_scheduler.index,
         "baseline": controller.rack.previous_output_torque,
         "reconciling": controller.handover_reconcile,
         "request": None if controller.output is None else float(controller.output.torque),
@@ -1772,8 +1628,8 @@ class TestLatControlRack(OpenpilotTestCase):
     return controller, rows
 
   def test_a_content_fault_keeps_the_slow_state_and_the_wheel(self):
-    # audit F12: one bad model frame used to reset the plan, the hold top-up (3.7 s to rebuild), the
-    # preview schedule and the R7 baseline, and to change hands twice. R6 holds state, and the output is
+    # audit F12: one bad model frame used to reset the plan, the hold top-up (3.7 s to rebuild), both
+    # preview indices and the R7 baseline, and to change hands twice. R6 holds state, and the output is
     # state too: the frame costs nothing but the frame.
     fault = 450
     controller, rows = self._steady_wrapper_run(520, fault)
@@ -1782,7 +1638,7 @@ class TestLatControlRack(OpenpilotTestCase):
     assert during["status"] == STATUS_INVALID_PATH
     assert during["topup"] == before["topup"]  # frozen through the held frame, not zeroed
     assert during["preview_index"] == before["preview_index"] > 0
-    assert during["served_preview"] == before["served_preview"] > 0
+    assert during["envelope_index"] == before["envelope_index"] > 0
     assert during["baseline"] == before["baseline"] is not None
     assert controller.rack.planner is not None
     # the wheel does not change hands for one bad model frame: the committed torque is held
@@ -2559,33 +2415,23 @@ class TestLatControlRack(OpenpilotTestCase):
 
   # ---- R4 horizon-implied envelope opening (G-independent), docs/BLaTv3_FAILURE_MODES.md ----
 
-  def test_one_schedule_feeds_the_tracker_and_the_envelope_and_ignores_confidence(self):
-    # tests_required item 1, re-pointed: there is one schedule now, and it is confidence-free. The two
-    # instances disagreed on 33-87 % of field frames (audit F10); a red model reaches the same index as
-    # a green one, and the envelope opener and the tracker's calm settings read that one index.
-    def run(confidence):
-      controller = RackTrajectoryController()
-      CS = car.CarState.new_message()
-      CS.vEgo = 15.0
-      params = log.VehicleParameters.new_message()
-      model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [15.0] * 7)
-      model.confidence = confidence
-      output = None
-      for frame in range(150):
-        model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
-        controller.set_model(model, model.timestampEof + 30_000_000)
-        output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
-                                    self.CI.torque_from_lateral_accel(), .2, 0.0)
-        assert output is not None
-      return controller, output
-
-    red_controller, red_output = run("red")
-    green_controller, green_output = run("green")
-    assert red_controller.preview_scheduler.index == green_controller.preview_scheduler.index > 0
-    assert red_output.preview_time_s == green_output.preview_time_s > 1.0
-    # the envelope opener read the same index the tracker's served preview came from
-    assert red_output.envelope_preview_time_s == red_controller.preview_scheduler.target_preview_s
-    assert red_output.envelope_open_rate_deg_s >= RackTrajectoryController._limits(15.0).max_rate_deg_s
+  def test_envelope_scheduler_confidence_independent(self):
+    # tests_required item 1: red confidence must not stop the envelope scheduler, only preview_scheduler.
+    controller = RackTrajectoryController()
+    CS = car.CarState.new_message()
+    CS.vEgo = 15.0
+    params = log.VehicleParameters.new_message()
+    model = horizon_model([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], [0.0] * 7, [15.0] * 7)
+    model.confidence = "red"
+    output = None
+    for frame in range(150):
+      model.timestampEof = 1_000_000_000 + (frame // 5) * 50_000_000
+      controller.set_model(model, model.timestampEof + 30_000_000)
+      output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
+                                  self.CI.torque_from_lateral_accel(), .2, 0.0)
+      assert output is not None
+    assert controller.preview_scheduler.index == 0  # confidence red: unaffected, still closed
+    assert controller.envelope_scheduler.index > 0  # R4: confidence-free, opens on the same clean straight
 
   def test_envelope_opening_sweep_is_bounded_except_on_snap_down(self):
     # tests_required item 2(a): g_env ramps 0->8->8->0 with a discontinuous required_rate jump at
@@ -2622,7 +2468,8 @@ class TestLatControlRack(OpenpilotTestCase):
 
   def test_envelope_opening_and_collapse_is_torque_continuous_through_the_pipeline(self):
     # tests_required item 2(b): drive the REAL update() pipeline through a consistent curvature
-    # buildup so g_env ramps up through a real admit boundary, then force an immediate g_env collapse
+    # buildup (confidence forced red to isolate R4's authority from preview_scheduler) so g_env
+    # ramps up through a real admit boundary, then force an immediate g_env collapse
     # (steeringPressed) while still open; every per-frame torque step stays within R7's bound,
     # including exactly at the admit-growth frames and the forced-drop frame.
     speed = 15.0
@@ -2646,22 +2493,18 @@ class TestLatControlRack(OpenpilotTestCase):
       output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
                                   self.CI.torque_from_lateral_accel(), .2, 0.0)
       assert output is not None
-      saw_open_index = saw_open_index or controller.preview_scheduler.index > 0
+      saw_open_index = saw_open_index or controller.envelope_scheduler.index > 0
       if previous_torque is not None:
         assert abs(output.torque - previous_torque) <= R7_MAX_TORQUE_STEP + 1e-9
       previous_torque = output.torque
-      if force_frame is None and controller.preview_scheduler.index >= 4:
+      if force_frame is None and controller.envelope_scheduler.index >= 4:
         force_frame = frame + 3  # force the collapse a few frames after a real admit depth
     assert saw_open_index and force_frame is not None
 
-  def test_a_temporally_jittering_far_prediction_costs_only_the_two_calm_settings(self):
-    # tests_required item 3, re-pointed to the owner's 2026-09-11 ruling: the DCPC drift graft is
-    # retired. It fired on 1 model frame in 51,646 (audit F19) because it sat behind the 40 m cap in
-    # the gate order, and where it could fire it was measuring the car's own motion between model
-    # frames. This fixture is what it was built for -- a far Y swinging .3 m between frames while each
-    # frame is internally a perfect arc -- and it is admitted now, on purpose: the far target is never
-    # authority (R2), so a consistent-but-wrong far path buys only the calmer reference and the longer
-    # response time, undone within two model frames. Pinned so restoring the gate fails here.
+  def test_envelope_dcpc_graft_rejects_a_temporally_jittering_far_prediction(self):
+    # tests_required item 3: a far Y that would pass the existing clothoid/heading gates alone
+    # (each frame is internally a perfect constant-curvature arc) must still be rejected once its
+    # ABSOLUTE position swings more than PREVIEW_ENVELOPE_DRIFT_M between consecutive model frames.
     speed = 15.0
     times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
     xs = np.array([speed * t for t in times])
@@ -2683,21 +2526,26 @@ class TestLatControlRack(OpenpilotTestCase):
     far_index = len(HORIZON_OFFSETS_S) - 1
     far_time = action_t + HORIZON_OFFSETS_S[far_index]
     drift = abs(float(np.interp(far_time, times, m2.position.y)) - float(np.interp(far_time, times, m1.position.y)))
-    assert drift > 0.25  # the fixture is the one the retired gate's own 0.25 m threshold was set for
+    assert drift > PREVIEW_ENVELOPE_DRIFT_M  # the fixture actually exercises the gate
 
-    scheduler = PreviewScheduler()
-    schedule(scheduler, m1, 1, action_t, t1)
-    assert scheduler._admissible(m2, action_t, t2) == far_index  # the geometry gates admit it, and stand alone
-    # what the drift gate used to buy, and what the admission now costs instead: the reference filter's
-    # time constant and the tracker's response time at the full preview, both bounded and reversible
-    assert REFERENCE_FILTER_PREVIEW_RC_S == 0.2 and RESPONSE_TIME_PREVIEW_S == 0.1
+    plain = PreviewScheduler(require_confidence=True)  # confidence green: geometry alone decides
+    plain.update(m1, 1, action_t, t1, False)
+    plain_admitted = plain._admissible(m2, action_t, t2, tuple(t.angle_deg for t in t2))
+    assert plain_admitted == far_index  # would pass the existing clothoid/heading gates alone
 
-  def test_the_flicker_baseline_is_refreshed_across_a_malformed_or_forced_frame(self):
-    # Reconcile regression, re-pointed: previous_far_y is gone with the drift gate, and
-    # previous_curvatures is the only cross-frame baseline left. Its guarantee is the one the old
-    # test named as the reason previous_far_y needed a fix: _schedule refreshes it unconditionally on
-    # every new model frame, malformed or forced, so no later frame is ever compared against a
-    # baseline from before the gap.
+    envelope = PreviewScheduler(require_confidence=False)
+    envelope.update(m1, 1, action_t, t1, False)
+    envelope_admitted = envelope._admissible(m2, action_t, t2, tuple(t.angle_deg for t in t2))
+    assert envelope_admitted < plain_admitted  # DCPC graft: the swinging far end is not trusted
+
+  def test_envelope_dcpc_baseline_clears_across_a_malformed_or_forced_frame(self):
+    # Reconcile regression: previous_far_y (the DCPC-graft baseline above) must not survive an
+    # early return inside _admissible (the pre-existing NaN/length-mismatch guard) or a forced
+    # frame in update() (which skips calling _admissible at all) -- either gap must leave
+    # previous_far_y back at None, exactly like the scheduler's first-ever frame, so a resumed good
+    # frame is never silently compared against a baseline from before the gap. previous_angles has
+    # no such hole (update() always refreshes it unconditionally); this pins the same guarantee for
+    # previous_far_y.
     speed = 15.0
     times = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
     xs = np.array([speed * t for t in times])
@@ -2713,26 +2561,39 @@ class TestLatControlRack(OpenpilotTestCase):
       message.position.y = [float(y) for y in _arc_y(k, xs)]
       return message
 
-    k1, k2 = 0.0, 0.00045  # a curvature pair far enough apart to be visible in the baseline
+    k1, k2 = 0.0, 0.00045  # the same drift-inducing pair as the DCPC-graft test above
     m1, t1 = message_for(k1), targets_for(k1)
-    t2 = targets_for(k2)
+    m2, t2 = message_for(k2), targets_for(k2)
+    angles2 = tuple(t.angle_deg for t in t2)
+    far_index = len(HORIZON_OFFSETS_S) - 1
 
     holed = message_for(k1)
     holed_y = list(holed.position.y)
-    holed_y[2] = math.nan  # trips the finiteness guard: _admissible returns 0 without reading a gate
+    holed_y[2] = math.nan  # trips the pre-existing finiteness guard, not the DCPC check itself
     holed.position.y = holed_y
 
-    # a malformed frame: _admissible returns 0 early, and the baseline is still this frame's targets
-    gapped = PreviewScheduler()
-    schedule(gapped, m1, 1, action_t, t1)
-    schedule(gapped, holed, 2, action_t, t2)
-    assert gapped.previous_curvatures == tuple(target.curvature for target in t2)
+    # baseline: a real m1 immediately before m2 -- DCPC actively rejects the swinging far end
+    direct = PreviewScheduler(require_confidence=False)
+    direct.update(m1, 1, action_t, t1, False)
+    direct_admitted = direct._admissible(m2, action_t, t2, angles2)
+    assert direct_admitted < far_index
 
-    # a forced frame (hands/lane-change) skips _admissible outright -- same guarantee, other call site
-    forced = PreviewScheduler()
-    schedule(forced, m1, 1, action_t, t1)
-    schedule(forced, m1, 2, action_t, t2, True)
-    assert forced.previous_curvatures == tuple(target.curvature for target in t2)
+    # a malformed frame between them: _admissible returns 0 early and must drop the baseline
+    gapped = PreviewScheduler(require_confidence=False)
+    gapped.update(m1, 1, action_t, t1, False)
+    gapped.update(holed, 2, action_t, t1, False)
+    assert gapped.previous_far_y is None  # the fix -- pre-fix this was still m1's far_y tuple
+    gapped_admitted = gapped._admissible(m2, action_t, t2, angles2)
+    # with no baseline to compare against, DCPC defers entirely to the other gates (same
+    # previous_angles state as `direct` above), which is exactly what confidence-gated PreviewScheduler
+    # already does for this pair -- i.e. full admission, not a stale-vs-m1 verdict either way
+    assert gapped_admitted == far_index
+
+    # a forced frame (hands/lane-change) skips _admissible outright -- same fix, other call site
+    forced = PreviewScheduler(require_confidence=False)
+    forced.update(m1, 1, action_t, t1, False)
+    forced.update(m1, 2, action_t, t1, True)
+    assert forced.previous_far_y is None
 
   def test_envelope_far_curvature_dither_does_not_move_g_env_or_required_rate(self):
     # tests_required item 4 (FM1.18): kappa_far dithering +-0.0006 at 20 m/s must not move the
@@ -2747,10 +2608,10 @@ class TestLatControlRack(OpenpilotTestCase):
       return self._scheduler_targets(curvatures, speed)
 
     def admitted_for(sign):
-      scheduler = PreviewScheduler()
-      schedule(scheduler, model, 1, 0.5, steady)
+      scheduler = PreviewScheduler(require_confidence=False)
+      scheduler.update(model, 1, 0.5, steady, False)
       targets = dithered(sign)
-      return scheduler._admissible(model, 0.5, targets), targets
+      return scheduler._admissible(model, 0.5, targets, tuple(t.angle_deg for t in targets)), targets
 
     idx_plus, targets_plus = admitted_for(1.0)
     idx_minus, targets_minus = admitted_for(-1.0)
@@ -2764,9 +2625,9 @@ class TestLatControlRack(OpenpilotTestCase):
     profile_minus = RackTrajectoryController()._horizon_opened_profile(comfort, targets_minus, idx_minus, ceiling)
     assert profile_plus.max_rate_deg_s == profile_minus.max_rate_deg_s  # required_rate reads only the admitted prefix
 
-  def test_envelope_forced_zero_parity_with_the_schedule(self):
-    # tests_required item 5: steeringPressed/lane-change zero the schedule and snap envelope_open_*
-    # back to comfort on the same frame. The served preview is the one value that ramps (R7).
+  def test_envelope_forced_zero_parity_with_preview_scheduler(self):
+    # tests_required item 5: steeringPressed/lane-change zero envelope_scheduler.index and snap
+    # envelope_open_* back to comfort the same frame preview_scheduler is zeroed.
     for what in ("hands", "lane change"):
       controller = RackTrajectoryController()
       CS = car.CarState.new_message()
@@ -2779,9 +2640,8 @@ class TestLatControlRack(OpenpilotTestCase):
         controller.set_model(model, model.timestampEof + 30_000_000)
         output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
                                     self.CI.torque_from_lateral_accel(), .2, 0.0)
-      assert output is not None and output.preview_time_s > 1.0 and controller.preview_scheduler.index > 0
+      assert output is not None and output.preview_time_s > 1.0 and controller.envelope_scheduler.index > 0
       comfort = RackTrajectoryController._limits(CS.vEgo)
-      served = output.preview_time_s
       if what == "hands":
         CS.steeringPressed = True
       else:
@@ -2790,9 +2650,9 @@ class TestLatControlRack(OpenpilotTestCase):
       controller.set_model(model, model.timestampEof + 30_000_000)
       output = controller.update(True, CS, self.VM, params, self.CP.lateralTuning.torque,
                                   self.CI.torque_from_lateral_accel(), .2, 0.0)
-      assert output is not None and controller.preview_scheduler.index == 0
+      assert output is not None and output.preview_time_s == 0.0
+      assert controller.envelope_scheduler.index == 0
       assert output.envelope_preview_time_s == 0.0
-      assert output.preview_time_s == served - PREVIEW_COLLAPSE_RATE_S_PER_S * DT_CTRL
       assert output.envelope_open_rate_deg_s == comfort.max_rate_deg_s
       assert output.envelope_open_acceleration_deg_s2 == comfort.max_acceleration_deg_s2
       assert output.envelope_open_jerk_deg_s3 == comfort.max_jerk_deg_s3
@@ -2905,17 +2765,17 @@ class TestLatControlRack(OpenpilotTestCase):
       )
       return message, targets
 
-    envelope = PreviewScheduler()
+    envelope = PreviewScheduler(require_confidence=False)
     buildup_frames = 8
     depth = 0
     for frame in range(buildup_frames):
       k = k_peak * 0.3 * (frame + 1) / buildup_frames
       message, targets = targets_and_model(k, frame)
-      depth = schedule(envelope, message, frame, action_t, targets)
+      depth = envelope.update(message, frame, action_t, targets, False)
     assert depth >= 2  # a genuine, if modest, admitted depth before the reversal
 
     message, targets = targets_and_model(-k_peak * 0.3, buildup_frames + 1)
-    raw_after_reversal = envelope._admissible(message, action_t, targets)
+    raw_after_reversal = envelope._admissible(message, action_t, targets, tuple(t.angle_deg for t in targets))
     assert raw_after_reversal < depth  # the reversal is rejected outright, not merely capped
 
   def test_iso_ceiling_opens_all_three_limits_as_a_family(self):
