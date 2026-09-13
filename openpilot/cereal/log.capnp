@@ -3542,17 +3542,11 @@ struct Event {
     gpsLocation @21 :GpsLocationData;
     vehicleParameters @61 :VehicleParameters;
     lateralTorqueParameters @94 :LateralTorqueParameters;
-    # KNOWN MERGE COLLISION (capnp ordinals must be sequential with no holes, so this
-    # branch cannot skip ahead to dodge it): combo's log.capnp independently reused
-    # 154-157 for drivingEventRecorded/blatV2Shadow/lateralEvent/chestnutGpuState --
-    # unrelated features not yet rebased onto BLaTv3, whose own chestnutGpuState sits
-    # at @153. Per the upstream-sync convention (conflict = manual renumber at merge
-    # time, never a silent push), whichever side merges second must renumber its new
-    # fields past the other's max. See docs/RACK_EFFORT_OBSERVER.md.
+    # Fork fields follow upstream chestnutGpuState @153; keep ordinals unique.
     rackEffortFrame @158 :RackEffortFrame;        # step 3-C shadow observer, log-only, see RESO
-    rackEffortSnapshot @159 :RackEffortSnapshot;  # (combo: next free ordinals after chestnutGpuState@157)
+    rackEffortSnapshot @159 :RackEffortSnapshot;  # combo fork fields retain their existing ordinals
     lateralDelay @146 : LateralDelay;
-    blatV2Shadow @155 :BlatV2Shadow;
+    blatV2Shadow @156 :BlatV2Shadow;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
     onroadEvents @134: List(OnroadEvent);
@@ -3587,9 +3581,7 @@ struct Event {
     clocks @35 :Clocks;
     deviceState @6 :DeviceState;
     chestnutState @152 :ChestnutState;
-    # @153 is occupied by the fork's historical drivingEvent; preserve its
-    # wire meaning and append the upstream GPU state at the next free ordinal.
-    chestnutGpuState @157 :ChestnutState;
+    chestnutGpuState @153 :ChestnutState;
     logMessage @18 :Text;
     errorLogMessage @85 :Text;
 
@@ -3604,10 +3596,10 @@ struct Event {
     bookmarkButton @148 :UserBookmark;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
-    # Historical lateralEvent @152 routes require their exact source schema.
-    lateralEvent @156 :LateralEvent;
-    drivingEvent @153 :DrivingEvent;
-    drivingEventRecorded @154 :DrivingEventRecorded;
+    # Fork driving-feedback fields follow upstream ordinals through @153.
+    lateralEvent @157 :LateralEvent;
+    drivingEvent @154 :DrivingEvent;
+    drivingEventRecorded @155 :DrivingEventRecorded;
 
     # *********** debug ***********
     testJoystick @52 :Joystick;

@@ -87,7 +87,7 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
 
 
 class ChestnutGpuState:
-  # SMU metrics are only accessible from modeld.
+  # GPU metrics require modeld's GPU context
   def __init__(self, pm: PubMaster, big: bool):
     self.pm = pm
     self.big = big
@@ -101,6 +101,8 @@ class ChestnutGpuState:
     return smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
 
   def send(self) -> None:
+    msg = messaging.new_message('chestnutGpuState')
+    state = msg.chestnutGpuState
     self.sends += 1
     if self.big and "AMD" in Device._opened_devices and self.sends % 100 == 1:
       try:
@@ -123,12 +125,10 @@ class ChestnutGpuState:
         self.valid = False
         self.metrics.clear()
 
-    msg = messaging.new_message('chestnutGpuState')
-    state = msg.chestnutGpuState
     if self.big:
       for k, v in self.metrics.items():
         setattr(state, k, v)
-    msg.valid = self.big and self.valid
+    msg.valid = not self.big or (self.valid and bool(self.metrics))
     self.pm.send('chestnutGpuState', msg)
 
 

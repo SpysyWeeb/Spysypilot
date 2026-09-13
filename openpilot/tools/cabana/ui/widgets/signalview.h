@@ -110,6 +110,7 @@ public:
   void setMessage(const MessageId &id);
   void draw();
   static float minimumWidth();
+  static float minimumHeight();
   void signalHovered(const cabana::Signal *sig);  // handler for BinaryView::signalHovered
   void updateChartState();
   void selectSignal(const cabana::Signal *sig, bool expand = false);
@@ -190,6 +191,7 @@ private:
   std::function<void()> pending_commit_;
   SignalModel::Item *editing_item_ = nullptr;  // the open text editor
   std::string edit_text_;
+  int edit_int_ = 0;
   bool editor_active_ = false;   // editor had the keyboard focus last frame
   bool refocus_editor_ = false;  // reopen the editor rejected by the validator
   bool enter_pressed_ = false;
