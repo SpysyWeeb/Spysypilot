@@ -25,6 +25,8 @@ and remaining validation work.
 
 [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) is the only maintained combined testing branch and uses comma's stock release model. No standalone model-variant branch is active; the former `tsfdo-combo` branch was retired and deleted.
 
+⚠️ 2026-09-14: modeld/Chestnut build files, hardwared status and 60+ upstream-owned files re-synced to upstream; opendbc pins set by the consistency rule (docs/SYNC_POLICY.md); awaiting a drive — watch modeld lag and LDW re-arm timing.
+
 ## Engagement CI
 
 Every `combo` push and pull request builds the tree, compiles Python, and runs the existing model-schema, torque-learning, all-car controller-construction, and platform-contract tests. Automated panda/opendbc bumps build the updated tree and run the model-schema, torque-learning, and controller-construction checks before they can commit or push a new gitlink.
