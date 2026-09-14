@@ -1,4 +1,13 @@
-name: bump panda/opendbc submodule pointers
+name: sync panda/opendbc pins (consistency rule)
+
+# Moves each branch's panda and opendbc_repo gitlinks to the commit the consistency rule picks
+# (docs/SYNC_POLICY.md, rule 5) and is the only thing that moves them:
+#   - a commaai-direct submodule is pinned to the commit commaai/openpilot master pins;
+#   - a fork submodule is pinned to the newest first-parent commit of its tracked fork branch whose
+#     merge base with commaai master is contained in commaai/openpilot master's pin
+#     (tools/sync/pin_target.sh).
+# The target is recomputed from scratch every run, so a hand-set pin is corrected, forward or backward.
+# A changed pin is built and checked before it is committed; nothing is pushed red.
 
 on:
   schedule:
@@ -10,60 +19,187 @@ permissions:
   issues: write
 
 jobs:
-  bump:
+  pins:
     strategy:
       fail-fast: false
       matrix:
         branch:
           - combo
           - SOL
-    runs-on: ubuntu-latest
+          - BLaTv3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    concurrency:
+      group: sync-submodules-${{ matrix.branch }}
+      cancel-in-progress: false
+    env:
+      BRANCH: ${{ matrix.branch }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: repo
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out ${{ matrix.branch }}
+        uses: actions/checkout@v4
         with:
           ref: ${{ matrix.branch }}
+          path: repo
           fetch-depth: 0
           submodules: recursive
 
+      # tools/sync comes from the commit that runs this workflow (combo for scheduled runs),
+      # so SOL and BLaTv3 are covered without carrying the scripts.
+      - name: Check out sync tools
+        uses: actions/checkout@v4
+        with:
+          path: policy
+          fetch-depth: 1
+          sparse-checkout: tools/sync
+
       - name: Configure git
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Unshallow submodules
-        run: git submodule foreach 'git fetch --unshallow || true'
-
-      - name: Advance submodules to their tracked branch tip (fast-forward only)
-        id: bump
+      - name: Compute consistent pins
+        id: pins
         run: |
-          changed=""
-          skipped=""
-          for sub in panda opendbc_repo; do
-            old=$(git -C "$sub" rev-parse HEAD)
-            git submodule update --remote -- "$sub"
-            new=$(git -C "$sub" rev-parse HEAD)
-            if [ "$old" = "$new" ]; then
-              continue
+          set -euo pipefail
+          report="$RUNNER_TEMP/pins-report.md"
+          body="$RUNNER_TEMP/commit-body.txt"
+          : > "$report"
+          fail() { printf '%s\n' "$*" | tee -a "$report" >&2; exit 1; }
+          note() { printf '%s\n' "$*" | tee -a "$report"; }
+          pin_target="$GITHUB_WORKSPACE/policy/tools/sync/pin_target.sh"
+          [ -x "$pin_target" ] || fail "missing $pin_target"
+
+          git fetch --no-tags https://github.com/commaai/openpilot.git +refs/heads/master:refs/remotes/upstream/master
+          upstream_head=$(git rev-parse upstream/master)
+          note "branch ${BRANCH} at $(git rev-parse HEAD); commaai/openpilot master at ${upstream_head}"
+
+          summary=()
+          details=()
+          changed=()
+          for path in panda opendbc_repo; do
+            name=$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' \
+                   | awk -v p="$path" '$2 == p { n = $1; sub(/^submodule\./, "", n); sub(/\.path$/, "", n); print n }')
+            [ -n "$name" ] || fail "$path: no .gitmodules entry"
+            url=$(git config -f .gitmodules --get "submodule.${name}.url")
+            fork_branch=$(git config -f .gitmodules --default '' --get "submodule.${name}.branch")
+            repo_name=$(basename "$url" .git)
+
+            current=$(git ls-tree HEAD "$path" | awk '$2 == "commit" { print $3 }')
+            upstream_pin=$(git ls-tree upstream/master "$path" | awk '$2 == "commit" { print $3 }')
+            [ -n "$current" ] || fail "$path: ${BRANCH} has no gitlink"
+            [ -n "$upstream_pin" ] || fail "$path: commaai/openpilot master has no gitlink"
+
+            sub=(git -C "$path")
+            if [ "$("${sub[@]}" rev-parse --is-shallow-repository)" = true ]; then
+              "${sub[@]}" fetch --no-tags --unshallow origin
             fi
-            if git -C "$sub" merge-base --is-ancestor "$old" "$new"; then
-              git add "$sub"
-              changed="$changed $sub"
+            "${sub[@]}" remote add commaai "https://github.com/commaai/${repo_name}.git"
+            "${sub[@]}" fetch --no-tags commaai +refs/heads/master:refs/remotes/commaai/master
+            if ! "${sub[@]}" cat-file -e "${upstream_pin}^{commit}" 2>/dev/null; then
+              "${sub[@]}" fetch --no-tags commaai "$upstream_pin"
+            fi
+
+            if [ -n "$fork_branch" ]; then
+              "${sub[@]}" fetch --no-tags origin "+refs/heads/${fork_branch}:refs/remotes/origin/${fork_branch}"
+              source="${url} ${fork_branch}"
+              target=$("$pin_target" "$path" "$upstream_pin" refs/remotes/commaai/master "refs/remotes/origin/${fork_branch}") \
+                || fail "$path: no commit on ${fork_branch} is consistent with commaai/openpilot's pin ${upstream_pin}"
             else
-              git -C "$sub" checkout -q "$old"
-              skipped="$skipped $sub"
+              case "$url" in
+                */commaai/*) ;;
+                *) fail "$path: ${url} is not commaai and .gitmodules names no tracked branch" ;;
+              esac
+              source="${url} (commaai-direct)"
+              target=$("$pin_target" "$path" "$upstream_pin" refs/remotes/commaai/master) \
+                || fail "$path: cannot resolve commaai/openpilot's pin ${upstream_pin}"
+            fi
+            base=$("${sub[@]}" merge-base --all "$target" refs/remotes/commaai/master | tr '\n' ' ')
+
+            if [ "$current" = "$target" ]; then
+              move=unchanged
+            elif ! "${sub[@]}" cat-file -e "${current}^{commit}" 2>/dev/null; then
+              move="replaced (old pin not fetchable)"
+            elif "${sub[@]}" merge-base --is-ancestor "$current" "$target"; then
+              move=forward
+            elif "${sub[@]}" merge-base --is-ancestor "$target" "$current"; then
+              move=backward
+            else
+              move=diverged
+            fi
+            # A pin that is not on the tracked branch was set by hand; the rule replaces it, the body says so.
+            offbranch=""
+            if [ -n "$fork_branch" ] && [ "$move" != unchanged ] && "${sub[@]}" cat-file -e "${current}^{commit}" 2>/dev/null \
+               && ! "${sub[@]}" merge-base --is-ancestor "$current" "refs/remotes/origin/${fork_branch}"; then
+              offbranch=" (old pin was not on ${fork_branch})"
+            fi
+
+            note "$path: ${source}; upstream pin ${upstream_pin}; current ${current}; target ${target}; ${move}${offbranch}"
+            details+=("${path}: ${source}"
+                      "  old ${current}"
+                      "  new ${target} (${move}${offbranch})"
+                      "  merge base with commaai master: ${base% }"
+                      "  commaai/openpilot master pin: ${upstream_pin}")
+            if [ "$move" != unchanged ]; then
+              "${sub[@]}" checkout -q --detach "$target"
+              git update-index --cacheinfo "160000,${target},${path}"
+              changed+=("$path")
+              summary+=("${path} ${current:0:9} -> ${target:0:9}")
             fi
           done
-          echo "changed=$changed" >> "$GITHUB_OUTPUT"
-          echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
+
+          # safety_tick contract between the pair that will be pinned
+          panda_pin=$(git ls-files -s panda | awk '{ print $2 }')
+          opendbc_pin=$(git ls-files -s opendbc_repo | awk '{ print $2 }')
+          git -C panda show "${panda_pin}:board/main.c" > "$RUNNER_TEMP/main.c"
+          git -C opendbc_repo show "${opendbc_pin}:opendbc/safety/safety.h" > "$RUNNER_TEMP/safety.h"
+          call=$(grep -m1 -oE 'safety_tick\([^)]*\)' "$RUNNER_TEMP/main.c") || fail "panda ${panda_pin}: no safety_tick call in board/main.c"
+          decl=$(grep -m1 -oE 'void safety_tick\([^)]*\)' "$RUNNER_TEMP/safety.h") || fail "opendbc ${opendbc_pin}: no safety_tick declaration in opendbc/safety/safety.h"
+          if { [ "$call" = "safety_tick()" ] && [ "$decl" = "void safety_tick(void)" ]; } \
+             || { [ "$call" != "safety_tick()" ] && [ "$decl" != "void safety_tick(void)" ]; }; then
+            pair=ok
+          else
+            pair=MISMATCH
+          fi
+          note "safety_tick: panda calls '${call}', opendbc declares '${decl}': ${pair}"
+          [ "$pair" = ok ] || fail "safety_tick pair mismatch between panda ${panda_pin} and opendbc ${opendbc_pin}"
+
+          staged=$(git diff --cached --name-only | tr '\n' ' ')
+          [ "${staged% }" = "${changed[*]:-}" ] || fail "unexpected staged paths: '${staged}' (expected '${changed[*]:-}')"
+
+          if [ "${#changed[@]}" -eq 0 ]; then
+            echo "changed=" >> "$GITHUB_OUTPUT"
+            note "pins already consistent; nothing to do"
+          else
+            subject=$(printf '%s, ' "${summary[@]}")
+            {
+              echo "bump submodules: ${subject%, }"
+              echo
+              echo "Pins set by the consistency rule (docs/SYNC_POLICY.md, rule 5) against"
+              echo "commaai/openpilot master ${upstream_head}."
+              echo
+              printf '%s\n' "${details[@]}"
+              echo
+              echo "safety_tick: panda board/main.c calls ${call};"
+              echo "  opendbc opendbc/safety/safety.h declares ${decl}: ${pair}"
+            } > "$body"
+            echo "changed=${changed[*]}" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up openpilot
-        if: steps.bump.outputs.changed != ''
+        if: steps.pins.outputs.changed != ''
         run: ./tools/op.sh setup
 
       - name: Build and check engagement contracts
-        if: steps.bump.outputs.changed != ''
+        if: steps.pins.outputs.changed != ''
         run: |
-          scons -j$(nproc)
+          set -euo pipefail
+          scons -j"$(nproc)"
           python -m compileall -q -j 0 openpilot
           python - <<'PY'
           import openpilot.cereal.messaging as messaging
@@ -75,24 +211,47 @@ jobs:
             openpilot/selfdrive/car/tests/test_car_interfaces.py
 
       - name: Commit and push
-        if: steps.bump.outputs.changed != ''
+        if: steps.pins.outputs.changed != ''
         run: |
-          git commit -m "bump submodules:${{ steps.bump.outputs.changed }}"
-          git push origin ${{ matrix.branch }}
+          set -euo pipefail
+          body="$RUNNER_TEMP/commit-body.txt"
+          {
+            echo
+            echo "checks: passed (scons, compileall, modelV2 schema, test_torqued.py, test_car_interfaces.py)"
+            echo "  ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$body"
+          git commit -F "$body"
+          git show --stat HEAD
+          git push origin "HEAD:refs/heads/${BRANCH}"
 
-      - name: Notify on divergence
-        if: steps.bump.outputs.skipped != ''
+      - name: Open an issue on failure
+        if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          title="[sync] submodule divergence on ${{ matrix.branch }} need review:${{ steps.bump.outputs.skipped }}"
-          existing=$(gh api "repos/${{ github.repository }}/issues?state=open&labels=bot&per_page=100" \
-            --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
-          if [ -z "$existing" ]; then
-            gh api "repos/${{ github.repository }}/issues" \
-              -f title="$title" \
-              -f body="On **${{ matrix.branch }}**, the tracked submodule branch tip for:${{ steps.bump.outputs.skipped }} is not a fast-forward from what's currently pinned (it's diverged, not just ahead). Nothing was changed. Resolve manually: decide which commit should win, then \`git -C <submodule> checkout <commit> && git add <submodule> && git commit && git push\`." \
-              -f "labels[]=bot"
-          else
-            echo "Issue #$existing already open, skipping"
+          set -euo pipefail
+          title="[sync] submodule pins on ${BRANCH} need review"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          report="$RUNNER_TEMP/pins-report.md"
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&labels=bot&per_page=100" \
+            --jq ".[] | select(.title == \"${title}\") | .number" | head -n1)
+          if [ -n "$existing" ]; then
+            echo "Issue #${existing} already open, not opening another"
+            exit 0
           fi
+          {
+            echo "The submodule pin sync for **${BRANCH}** failed, so nothing was pushed: ${run_url}"
+            echo
+            echo "Either no commit on a tracked fork branch is consistent with commaai/openpilot's pin, the"
+            echo "panda/opendbc safety_tick pair does not match, or the build/checks failed on the new pins."
+            echo "Fix the fork branch (merge commaai master up to the pinned commit), never the gitlink by hand;"
+            echo "see docs/SYNC_POLICY.md."
+            echo
+            echo '```'
+            if [ -s "$report" ]; then cat "$report"; else echo "(the run failed before the pin report was written)"; fi
+            echo '```'
+          } > "$RUNNER_TEMP/issue.md"
+          gh api "repos/${GITHUB_REPOSITORY}/issues" \
+            -f title="$title" \
+            -F body=@"$RUNNER_TEMP/issue.md" \
+            -f "labels[]=bot"
