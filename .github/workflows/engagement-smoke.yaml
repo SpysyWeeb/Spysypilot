@@ -33,7 +33,7 @@ jobs:
           scons -j$(nproc)
           python -m compileall -q -j 0 openpilot
           python -c "from openpilot.cereal import log"
-          pytest -q \
+          "$HOME/.local/bin/uv" run --frozen --with pytest pytest -q \
             openpilot/cereal/tests \
             openpilot/selfdrive/locationd/test/test_torqued.py \
             openpilot/selfdrive/car/tests/test_car_interfaces.py \
