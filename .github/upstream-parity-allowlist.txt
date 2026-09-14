@@ -1,0 +1,294 @@
+# Paths where Spysypilot intentionally differs from the merge base with commaai/openpilot master.
+# Syntax: gitignore patterns (anchored with a leading /), matched by git check-ignore.
+# Everything after " # " on a line is the owning branch(es); tools/sync/parity_check.sh strips it.
+# Policy: docs/SYNC_POLICY.md. Generated 2026-09-14 from the per-branch audit; edit by hand from now on.
+
+/.github/pull_request_template.md  # combo-only fork_only_file (no feature-branch owner)
+/.github/upstream-parity-allowlist.txt  # combo-level
+/.github/workflows/*  # combo-level
+/.gitignore  # kept: combo-only BLaTv2 leftover
+/.gitmodules  # combo-level
+/AGENTS.md  # combo-level
+/README.md  # combo-level
+/SConstruct  # kept: combo-only BLaTv2 leftover
+/conftest.py  # combo-only fork_only_file (no feature-branch owner)
+/docs/**  # combo-level
+/openpilot/cereal/README.md  # kept: combo-level
+/openpilot/cereal/custom.capnp  # SOL
+/openpilot/cereal/log.capnp  # BLaTv3,BLoTv3,SOL,curve-speed-limit,rack-rate-source; kept: BLaTv3,BLoTv3,SOL,curve-speed-limit,rack-rate-source
+/openpilot/cereal/services.py  # BLaTv3,SOL,rack-rate-source; kept: combo-level
+/openpilot/cereal/tests/test_blatv2_schema_compat.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/cereal/tests/test_model_schema_contract.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/common/params_keys.h  # BLaTv3,params-clear-pandad-keys,params-clear-pandad-keys-at-offroad,rack-rate-source,side-buttons; kept: side-buttons
+/openpilot/common/spinner.py  # better-boot-screen
+/openpilot/common/swaglog.py  # kept: custom-main-menu (consumer terminal_widget.py) - handler lives only on combo
+/openpilot/common/tests/test_params.py  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad
+/openpilot/selfdrive/assets/sounds/complete.wav  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/car/car_events.py  # combo-only deletion: reverts upstream c9f0d296b (#38493) rename to car_specific.py; to fix
+/openpilot/selfdrive/car/car_specific.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/car/card.py  # SOL
+/openpilot/selfdrive/car/cruise.py  # swapped-cruise-speed
+/openpilot/selfdrive/car/tests/test_cruise_speed.py  # swapped-cruise-speed
+/openpilot/selfdrive/controls/SConscript  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/blatv2_profiled.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/blatv2_rlog_extract.cc  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/blatv2_shadowd.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/controlsd.py  # BLaTv3,BLoTv3,SOL,rack-rate-source; kept: BLaTv3,BLoTv3,SOL,rack-rate-source + combo-level
+/openpilot/selfdrive/controls/controlsd_ext.py  # SOL
+/openpilot/selfdrive/controls/lib/blatv2/README.md  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/__init__.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/actuator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/approved_artifact.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_aggregate.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_configuration.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_coordinator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_evidence.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_filebacked.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_gate_spec.json  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_generation.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_learning_status.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_metrics.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_partition.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_pipeline.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_plant_set.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_policy.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_replay.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_replay_authority.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_route_evaluator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_segmentation.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_segmentation_config.json  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_training_authority.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/behavior_transaction.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/bootstrap.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/breakaway_episode.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/calibration_coordinator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/calibration_learner.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/calibration_profile.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/calibration_source.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/certification_vector.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/contextual_dynamics_study.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/contracts.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/controller.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/core.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/counterfactual_plant.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/development_baselines.json  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/device_acceptance.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/feasibility.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/feedback.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/historical_build_descriptors.json  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/horizon.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/intent.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learner.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_backfill.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_backfill_progress.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_backfill_spool.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_coordinator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_frame.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_operation_status.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_runtime.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_status.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/learning_store.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/lifecycle_status.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/live_adapter.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/live_controller.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/live_safety.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/live_telemetry.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/measurement.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/observer.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/owned_scratch.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/plant.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/policy.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/preparation_contract.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/preparation_frame.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/preparation_identity.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/preview.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/provisional_controller_policy.json  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/provisional_horizon_policy.json  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/provisional_rack_dynamics.json  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/rack_mapper.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/rack_motion.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/reference.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/response_alignment.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/route_evidence.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/runtime_vehicle.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/stock_bootstrap.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/blatv2/vehicle_profile.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/lib/conditional_experimental_mode.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/desire_helper.py  # nudgless-lane-changes
+/openpilot/selfdrive/controls/lib/force_stops.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/latcontrol.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/lib/latcontrol_angle.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/lib/latcontrol_curvature.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/lib/latcontrol_pid.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/lib/latcontrol_rack.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/lib/latcontrol_torque.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/lib/longcontrol.py  # smooth-stops
+/openpilot/selfdrive/controls/lib/longitudinal_lead.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/longitudinal_planner.py  # BLoTv3,better-green-lights,curve-speed-limit; kept: combo-level (BLoTv3,better-green-lights,curve-speed-limit integration)
+/openpilot/selfdrive/controls/lib/model_curve_speed.py  # curve-speed-limit
+/openpilot/selfdrive/controls/lib/necessity_supervisor.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/rack_trajectory.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/lib/smooth_stops.py  # smooth-stops
+/openpilot/selfdrive/controls/lib/stop_helpers.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/stop_landing.py  # BLoTv3
+/openpilot/selfdrive/controls/plannerd.py  # curve-speed-limit
+/openpilot/selfdrive/controls/radard.py  # smooth-stops; kept: smooth-stops + combo-level
+/openpilot/selfdrive/controls/tests/blatv2_artifact_test_helpers.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py  # SOL
+/openpilot/selfdrive/controls/tests/test_blatv2_actuator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_approved_artifact.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_aggregate.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_cohort_selection.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_configuration.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_coordinator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_evidence.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_filebacked.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_generation.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_learning_status.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_metrics.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_partition.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_pipeline.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_plant_set.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_policy.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_replay.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_replay_authority.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_route_evaluator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_segmentation.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_training_authority.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_behavior_transaction.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_bootstrap.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_breakaway_episode.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_calibration_coordinator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_calibration_learner.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_calibration_profile.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_certification_vector.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_contextual_dynamics_study.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_controller.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_core.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_counterfactual_plant.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_device_acceptance.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_feasibility.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_feedback.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_historical_build_descriptors.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_horizon.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_horizon_closed_loop.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_intent.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learner.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_backfill_engine.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_backfill_generation.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_backfill_progress.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_backfill_routes.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_backfill_shared_join.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_backfill_spool.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_coordinator.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_operation_status.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_status_v2.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_learning_store.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_live_integration.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_live_safety.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_manager_processes.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_measurement.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_observer.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_owned_scratch.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_plant.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_policy.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_preparation_contract.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_preview.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_profiled.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_rack_mapper.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_rack_motion.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_reference.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_response_alignment.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_rlog_extract.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_route_evidence.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_runtime_vehicle.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_shadowd.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_blatv2_vehicle_profile.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_combo_contracts.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_conditional_experimental_mode.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_controlsd.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_force_stops.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_latcontrol.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/tests/test_latcontrol_rack.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/tests/test_latcontrol_rack_ff_taper.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/tests/test_latcontrol_rack_hold_topup.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/controls/tests/test_long_mpc.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_longcontrol.py  # smooth-stops
+/openpilot/selfdrive/controls/tests/test_longitudinal_lead.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_longitudinal_planner.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_longitudinal_planner_model.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_model_curve_speed.py  # curve-speed-limit
+/openpilot/selfdrive/controls/tests/test_necessity_supervisor.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_nudgless_lane_changes.py  # nudgless-lane-changes
+/openpilot/selfdrive/controls/tests/test_radard_low_speed.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py  # smooth-stops
+/openpilot/selfdrive/controls/tests/test_smooth_stops.py  # smooth-stops
+/openpilot/selfdrive/controls/tests/test_stop_helpers.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_stop_landing.py  # BLoTv3
+/openpilot/selfdrive/locationd/lagd.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/rack_effort_classifier.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/rack_effort_observer.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/test/test_lagd.py  # BLaTv3,rack-rate-source; kept: BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/test/test_rack_effort_bitexact.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/test/test_rack_effort_freeze_gates.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/test/test_rack_effort_isolation.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/test/test_rack_effort_restore.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/locationd/test/test_rack_effort_snapshot.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/modeld/modeld.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/modeld/tests/test_action_timing.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/modeld/tests/test_helpers.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/modeld/timing.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/pandad/panda.cc  # SOL
+/openpilot/selfdrive/pandad/panda.h  # SOL
+/openpilot/selfdrive/pandad/pandad.cc  # SOL
+/openpilot/selfdrive/selfdrived/selfdrived.py  # BLoTv3,SOL,hot-swap-experimental; kept: BLoTv3,SOL,hot-swap-experimental + combo-level
+/openpilot/selfdrive/selfdrived/tests/test_conditional_experimental_mode.py  # BLoTv3
+/openpilot/selfdrive/spysypilot/__init__.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/test/longitudinal_maneuvers/maneuver.py  # BLoTv3,curve-speed-limit; kept: BLoTv3,curve-speed-limit + combo-level
+/openpilot/selfdrive/test/longitudinal_maneuvers/plant.py  # BLoTv3,curve-speed-limit; kept: BLoTv3,curve-speed-limit
+/openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py  # BLoTv3,curve-speed-limit; kept: BLoTv3,curve-speed-limit
+/openpilot/selfdrive/test/process_replay/process_replay.py  # curve-speed-limit; kept: curve-speed-limit
+/openpilot/selfdrive/test/process_replay/regen.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/test/process_replay/regen_all.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/test/process_replay/test_regen.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/ui/layouts/home.py  # custom-main-menu,side-buttons; kept: combo-only (should move to custom-main-menu)
+/openpilot/selfdrive/ui/layouts/main.py  # custom-main-menu
+/openpilot/selfdrive/ui/layouts/settings/developer.py  # error-log-viewer
+/openpilot/selfdrive/ui/layouts/settings/software.py  # auto-update
+/openpilot/selfdrive/ui/layouts/sidebar.py  # detailed-stats-sidebar
+/openpilot/selfdrive/ui/mici/onroad/torque_bar.py  # torque-bar
+/openpilot/selfdrive/ui/onroad/augmented_road_view.py  # SOL; kept: SOL
+/openpilot/selfdrive/ui/onroad/exp_button.py  # spinning-steering-wheel
+/openpilot/selfdrive/ui/onroad/hud_renderer.py  # torque-bar
+/openpilot/selfdrive/ui/tests/test_exp_button.py  # spinning-steering-wheel
+/openpilot/selfdrive/ui/tests/test_main_layout.py  # custom-main-menu
+/openpilot/selfdrive/ui/tests/test_ui_state.py  # SOL
+/openpilot/selfdrive/ui/ui_state.py  # SOL,auto-update,side-buttons
+/openpilot/selfdrive/ui/widgets/blatv2_feedback.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/ui/widgets/error_log_button.py  # side-buttons
+/openpilot/selfdrive/ui/widgets/exp_mode_button.py  # side-buttons
+/openpilot/selfdrive/ui/widgets/screen_timeout_button.py  # side-buttons
+/openpilot/selfdrive/ui/widgets/setup.py  # kept: custom-main-menu (commit 9489859c8 is on origin/custom-main-menu history but branch tip file equals MB)
+/openpilot/selfdrive/ui/widgets/system_stats.py  # custom-main-menu
+/openpilot/selfdrive/ui/widgets/terminal_widget.py  # custom-main-menu
+/openpilot/selfdrive/ui/widgets/update_button.py  # side-buttons
+/openpilot/spysypilot/__init__.py  # SOL
+/openpilot/spysypilot/aol/__init__.py  # SOL
+/openpilot/spysypilot/aol/aol.py  # SOL
+/openpilot/spysypilot/aol/helpers.py  # SOL
+/openpilot/spysypilot/aol/state.py  # SOL
+/openpilot/system/hardware/fan_controller.py  # fan-control
+/openpilot/system/hardware/tests/test_fan_controller.py  # fan-control
+/openpilot/system/loggerd/tests/test_platform_arch.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/system/manager/build.py  # better-boot-screen
+/openpilot/system/manager/manager.py  # better-boot-screen; kept: better-boot-screen,error-log-viewer
+/openpilot/system/manager/process_config.py  # BLaTv3,rack-rate-source; kept: BLaTv3,rack-rate-source (rack_effort_observer); BLaTv2 comment is combo-only leftover
+/openpilot/system/sentry.py  # error-log-viewer
+/openpilot/system/ui/spinner.py  # better-boot-screen
+/openpilot/system/ui/widgets/html_render.py  # error-log-viewer,side-buttons
+/openpilot/system/updated/common.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/system/updated/updated.py  # auto-update
+/tools/blatv2_context_study.py  # combo-only fork_only_file (no feature-branch owner)
+/tools/scripts/profiling/clpeak/no_print.patch  # combo-only fork_only_file (no feature-branch owner)
+/tools/sync/**  # combo-level
