@@ -168,8 +168,13 @@ jobs:
           note "safety_tick: panda calls '${call}', opendbc declares '${decl}': ${pair}"
           [ "$pair" = ok ] || fail "safety_tick pair mismatch between panda ${panda_pin} and opendbc ${opendbc_pin}"
 
-          staged=$(git diff --cached --name-only | tr '\n' ' ')
-          [ "${staged% }" = "${changed[*]:-}" ] || fail "unexpected staged paths: '${staged}' (expected '${changed[*]:-}')"
+          # git lists staged paths in tree order, the loop appends in its own order: compare as sorted sets
+          staged=$(git diff --cached --name-only | LC_ALL=C sort | tr '\n' ' ')
+          expected=""
+          if [ "${#changed[@]}" -gt 0 ]; then
+            expected=$(printf '%s\n' "${changed[@]}" | LC_ALL=C sort | tr '\n' ' ')
+          fi
+          [ "$staged" = "$expected" ] || fail "unexpected staged paths: '${staged% }' (expected '${expected% }')"
 
           if [ "${#changed[@]}" -eq 0 ]; then
             echo "changed=" >> "$GITHUB_OUTPUT"
