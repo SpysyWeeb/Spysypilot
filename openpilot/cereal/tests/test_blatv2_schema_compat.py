@@ -501,15 +501,17 @@ class TestBLaTv2SchemaCompatibility(unittest.TestCase):
     self.assertEqual(_field_type_name(field), "Float32")
 
   def test_event_union_prerequisites_and_shadow_ordinals(self) -> None:
-    # Historical lateralEvent @152 routes require their exact source schema;
-    # current trees retain upstream chestnutState wire compatibility at @152.
+    # Upstream fields keep upstream ordinals: chestnutState @152 and
+    # chestnutGpuState @153 (commaai d38264c42). Fork members follow at @154+.
+    # Routes recorded before 2026-09-13 carry drivingEvent @153 .. lateralEvent
+    # @156 and chestnutGpuState @157; decode them with their source schema.
     expected = {
       152: ("chestnutState", log.ChestnutState),
-      153: ("drivingEvent", log.DrivingEvent),
-      154: ("drivingEventRecorded", log.DrivingEventRecorded),
-      155: ("blatV2Shadow", log.BlatV2Shadow),
-      156: ("lateralEvent", log.LateralEvent),
-      157: ("chestnutGpuState", log.ChestnutState),
+      153: ("chestnutGpuState", log.ChestnutState),
+      154: ("drivingEvent", log.DrivingEvent),
+      155: ("drivingEventRecorded", log.DrivingEventRecorded),
+      156: ("blatV2Shadow", log.BlatV2Shadow),
+      157: ("lateralEvent", log.LateralEvent),
     }
     for ordinal, (name, struct_module) in expected.items():
       with self.subTest(ordinal=ordinal, name=name):
