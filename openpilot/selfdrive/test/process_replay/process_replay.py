@@ -593,9 +593,9 @@ def get_custom_params_from_lr(lr: LogIterable, initial_state: str = "first") -> 
   """
 
   car_params = [m for m in lr if m.which() == "carParams"]
-  live_calibration = [m for m in lr if m.which() == "extrinsicsCalibration"]
-  live_parameters = [m for m in lr if m.which() == "vehicleParameters"]
-  live_torque_parameters = [m for m in lr if m.which() == "lateralTorqueParameters"]
+  extrinsics_calibration = [m for m in lr if m.which() == "extrinsicsCalibration"]
+  vehicle_parameters = [m for m in lr if m.which() == "vehicleParameters"]
+  torque_parameters = [m for m in lr if m.which() == "lateralTorqueParameters"]
 
   assert initial_state in ["first", "last"]
   msg_index = 0 if initial_state == "first" else -1
@@ -607,12 +607,12 @@ def get_custom_params_from_lr(lr: LogIterable, initial_state: str = "first") -> 
     "CarParamsPrevRoute": CP.as_builder().to_bytes()
   }
 
-  if len(live_calibration) > 0:
-    custom_params["CalibrationParams"] = live_calibration[msg_index].as_builder().to_bytes()
-  if len(live_parameters) > 0:
-    custom_params["LiveParametersV2"] = live_parameters[msg_index].as_builder().to_bytes()
-  if len(live_torque_parameters) > 0:
-    custom_params["LiveTorqueParameters"] = live_torque_parameters[msg_index].as_builder().to_bytes()
+  if len(extrinsics_calibration) > 0:
+    custom_params["CalibrationParams"] = extrinsics_calibration[msg_index].as_builder().to_bytes()
+  if len(vehicle_parameters) > 0:
+    custom_params["LiveParametersV2"] = vehicle_parameters[msg_index].as_builder().to_bytes()
+  if len(torque_parameters) > 0:
+    custom_params["LiveTorqueParameters"] = torque_parameters[msg_index].as_builder().to_bytes()
 
   return custom_params
 
