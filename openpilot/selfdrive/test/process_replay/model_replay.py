@@ -148,8 +148,8 @@ def trim_logs(logs, start_frame, end_frame, frs_types, include_all_types):
 
 def model_replay(lr, frs):
   # modeld is using frame pairs
-  modeld_logs = trim_logs(lr, START_FRAME, END_FRAME,
-                          {"narrowRoadCameraState", "wideRoadCameraState"},
+  camera_states = {"narrowRoadCameraState", "wideRoadCameraState"}
+  modeld_logs = trim_logs(lr, START_FRAME, END_FRAME, camera_states,
                           {"narrowRoadEncodeIdx", "wideRoadEncodeIdx", "carParams", "carState", "carControl", "can"})
   dmodeld_logs = trim_logs(lr, START_FRAME, END_FRAME, {"cabinCameraState"}, {"cabinEncodeIdx", "carParams", "can"})
 
