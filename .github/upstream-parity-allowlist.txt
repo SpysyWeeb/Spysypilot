@@ -24,8 +24,6 @@
 /openpilot/common/swaglog.py  # kept: custom-main-menu (consumer terminal_widget.py) - handler lives only on combo
 /openpilot/common/tests/test_params.py  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad
 /openpilot/selfdrive/assets/sounds/complete.wav  # combo-only fork_only_file (no feature-branch owner)
-/openpilot/selfdrive/car/car_events.py  # combo-only deletion: reverts upstream c9f0d296b (#38493) rename to car_specific.py; to fix
-/openpilot/selfdrive/car/car_specific.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/car/card.py  # SOL
 /openpilot/selfdrive/car/cruise.py  # swapped-cruise-speed
 /openpilot/selfdrive/car/tests/test_cruise_speed.py  # swapped-cruise-speed
