@@ -392,7 +392,7 @@ def migrate_cameraStates(msgs):
         del_ops.append(index)
         continue
 
-      # fallback mechanism for logs without encodeIdx (e.g. logs from before 2022 with dcamera recording disabled)
+      # fallback mechanism for logs without encodeIdx (e.g. logs from before 2022 with driver recording disabled)
       # try to fake encode_id by subtracting lowest frameId
       encode_id = camera_state.frameId - min_frame_id[msg.which()]
       print(f"Faking encodeId to {encode_id} for camera feed {msg.which()} with frameId: {camera_state.frameId}")
