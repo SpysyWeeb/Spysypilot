@@ -19,7 +19,6 @@ from openpilot.system.manager.process_config import managed_processes
 from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.common.version import get_build_metadata
-from openpilot.system.sentry import capture_exception
 from openpilot.common.hardware.hw import Paths
 
 
@@ -209,7 +208,7 @@ def main() -> None:
       manager_thread(boot_spinner)  # closes boot_spinner internally when UI is live
     except Exception:
       traceback.print_exc()
-      capture_exception()
+      cloudlog.exception("crash")
     finally:
       manager_cleanup()
   finally:

@@ -282,7 +282,6 @@
 /openpilot/system/manager/build.py  # better-boot-screen
 /openpilot/system/manager/manager.py  # better-boot-screen; kept: better-boot-screen,error-log-viewer
 /openpilot/system/manager/process_config.py  # BLaTv3,rack-rate-source; kept: BLaTv3,rack-rate-source (rack_effort_observer); BLaTv2 comment is combo-only leftover
-/openpilot/system/sentry.py  # error-log-viewer
 /openpilot/system/ui/spinner.py  # better-boot-screen
 /openpilot/system/ui/widgets/html_render.py  # error-log-viewer,side-buttons
 /openpilot/system/updated/common.py  # combo-only fork_only_file (no feature-branch owner)
