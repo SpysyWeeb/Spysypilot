@@ -38,6 +38,9 @@ from tinygrad.engine.jit import TinyJit
 
 NV12Frame = namedtuple("NV12Frame", ['width', 'height', 'stride', 'y_height', 'uv_height', 'size'])
 MODELD_INPUTS = ['img_q', 'big_img_q', 'feat_q', 'desire_q', 'packed_npy_inputs']
+FRAME_INPUTS = {'img': 'frame', 'big_img': 'big_frame'}
+
+FRAME_DEV = os.getenv('FRAME_DEV')
 
 
 def nv12_copy_size(stride: int, y_height: int, uv_height: int) -> int:
@@ -94,7 +97,7 @@ def make_frame_prepare(nv12: NV12Frame, model_w, model_h):
 
   def frame_prepare_tinygrad(input_frame, M_inv):
     # UV_SCALE @ M_inv @ UV_SCALE_INV simplifies to elementwise scaling
-    M_inv_uv = M_inv * Tensor([[1.0, 1.0, 0.5], [1.0, 1.0, 0.5], [2.0, 2.0, 1.0]], device=Device.DEFAULT)
+    M_inv_uv = M_inv * Tensor([[1.0, 1.0, 0.5], [1.0, 1.0, 0.5], [2.0, 2.0, 1.0]], device=FRAME_DEV)
     # deinterleave NV12 UV plane (UVUV... -> separate U, V)
     uv = input_frame[uv_offset:uv_offset + uv_height * stride].reshape(uv_height, stride)
     with Context(SPLIT_REDUCEOP=0):
@@ -124,7 +127,7 @@ def get_policy_npy_shapes(input_shapes):
   return shapes, [math.prod(s) for s in shapes.values()]
 
 
-def make_input_queues(input_shapes, frame_skip, device, frame_copy_size):
+def make_input_queues(input_shapes, frame_skip, device, frame_copy_size, frame_device='NPY'):
   img = input_shapes['img']  # (1, 12, 128, 256)
   fb = input_shapes['features_buffer']  # (1, T-1, ...), past features only; the model appends the current frame's feature
   feat_dim = math.prod(fb[2:])
@@ -136,10 +139,14 @@ def make_input_queues(input_shapes, frame_skip, device, frame_copy_size):
   shapes = {'tfm': (3, 3), 'big_tfm': (3, 3)} | policy_shapes
   sizes = [math.prod(s) for s in shapes.values()]
   packed_npy_size = sum(sizes) * np.dtype(np.float32).itemsize
-  packed_input = np.zeros(packed_npy_size + 2 * frame_copy_size, dtype=np.uint8)
+  packed_input = np.zeros(packed_npy_size + (2 * frame_copy_size if frame_device == 'NPY' else 0), dtype=np.uint8)
   packed_npy_inputs = packed_input[:packed_npy_size].view(np.float32)
-  frames = packed_input[packed_npy_size:]
-  frame_views = {'img': frames[:frame_copy_size], 'big_img': frames[frame_copy_size:]}
+  if frame_device == 'NPY':
+    frames = packed_input[packed_npy_size:]
+    frame_views = {'img': frames[:frame_copy_size], 'big_img': frames[frame_copy_size:]}
+  else:
+    # frame_device reads the frames in place, the model device only gets the warped frames
+    frame_views = {k: np.zeros(frame_copy_size, dtype=np.uint8) for k in FRAME_INPUTS}
   # views into the packed inputs, to be refilled at runtime
   npy = {k: v.reshape(s) for (k, s), v in zip(shapes.items(), np.split(packed_npy_inputs, np.cumsum(sizes[:-1])), strict=True)}
   input_queues = {
@@ -149,6 +156,8 @@ def make_input_queues(input_shapes, frame_skip, device, frame_copy_size):
     'desire_q': Tensor(np.zeros((frame_skip * dp[1], dp[0], dp[2]), dtype=np.float32), device=device).contiguous().realize(),
     'packed_npy_inputs': Tensor(packed_input, device='NPY').realize(),
   }
+  if frame_device != 'NPY':
+    input_queues |= {FRAME_INPUTS[k]: Tensor.from_blob(v.ctypes.data, v.shape, dtype='uint8', device=frame_device) for k, v in frame_views.items()}
   return input_queues, npy, frame_views
 
 
@@ -169,10 +178,9 @@ def make_warp(nv12, model_w, model_h):
   frame_prepare = make_frame_prepare(nv12, model_w, model_h)
 
   def warp(tfm, big_tfm, frame, big_frame):
-    tfm = tfm.to(Device.DEFAULT)
-    big_tfm = big_tfm.to(Device.DEFAULT)
-    frame = frame.to(Device.DEFAULT)
-    big_frame = big_frame.to(Device.DEFAULT)
+    tfm = tfm.to(frame.device)
+    big_tfm = big_tfm.to(frame.device)
+    big_frame = big_frame.to(frame.device)
     Tensor.realize(tfm, big_tfm, frame, big_frame)
 
     warped_frame = frame_prepare(frame, tfm).unsqueeze(0)
@@ -190,6 +198,7 @@ def make_run_policy(model_runner, model_metadata, frame_skip):
 
   def run_policy(warped, img_q, big_img_q, feat_q, desire_q, packed_npy_inputs):
     packed_npy_inputs = packed_npy_inputs.to(Device.DEFAULT)
+    warped = warped.to(Device.DEFAULT)
     Tensor.realize(packed_npy_inputs, warped)
 
     img = shift_and_sample(img_q, warped[0:1], sample_skip_fn)
@@ -217,13 +226,16 @@ def make_run_model(warp, run_policy, model_metadata, frame_copy_size):
   _, policy_sizes = get_policy_npy_shapes(model_metadata['input_shapes'])
   packed_npy_size = (18 + sum(policy_sizes)) * np.dtype(np.float32).itemsize
 
-  def run_model(img_q, big_img_q, feat_q, desire_q, packed_npy_inputs):
+  def run_model(img_q, big_img_q, feat_q, desire_q, packed_npy_inputs, frame=None, big_frame=None):
     packed_input = packed_npy_inputs.to(Device.DEFAULT)
     Tensor.realize(packed_input)
-    packed_npy_inputs = packed_input[:packed_npy_size].bitcast('float32')
-    frame = packed_input[packed_npy_size:packed_npy_size + frame_copy_size]
-    big_frame = packed_input[packed_npy_size + frame_copy_size:]
-    tfm, big_tfm, policy_inputs = packed_npy_inputs.split([9, 9, sum(policy_sizes)])
+    tfm, big_tfm, policy_inputs = packed_input[:packed_npy_size].bitcast('float32').split([9, 9, sum(policy_sizes)])
+    if frame is None:
+      frame = packed_input[packed_npy_size:packed_npy_size + frame_copy_size]
+      big_frame = packed_input[packed_npy_size + frame_copy_size:]
+    else:
+      # warp on the frames' device, so only the warped frames and the small inputs reach the model device
+      tfm, big_tfm, _ = packed_npy_inputs.to(frame.device).bitcast('float32').split([9, 9, sum(policy_sizes)])
     warped = warp(tfm.reshape(3, 3), big_tfm.reshape(3, 3), frame, big_frame)
     return run_policy(warped, img_q, big_img_q, feat_q, desire_q, policy_inputs)
   return run_model
@@ -308,10 +320,14 @@ if __name__ == "__main__":
   model_path = read_file_chunked_to_disk(args.onnx)
   model_w, model_h = args.model_size
 
+  # FRAME_DEV runs the warp where the camera frames are, NPY packs the frames into the model device's inputs
+  frame_device = FRAME_DEV or 'NPY'
+  input_keys = MODELD_INPUTS + ([] if frame_device == 'NPY' else list(FRAME_INPUTS.values()))
+
   model_runner = OnnxRunner(model_path)
   out = {
     'metadata': make_metadata_dict(model_path),
-    'input_devices': {'model': Device.DEFAULT},
+    'input_devices': {'model': Device.DEFAULT, 'frame': frame_device},
     'run_model': {},
   }
 
@@ -321,11 +337,10 @@ if __name__ == "__main__":
     nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
     frame_copy_size = nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
     make_model_queues = partial(make_input_queues, out['metadata']['input_shapes'], args.frame_skip,
-                                frame_copy_size=frame_copy_size)
+                                frame_copy_size=frame_copy_size, frame_device=frame_device)
     warp = make_warp(nv12, model_w, model_h)
     run_model_jit = TinyJit(make_run_model(warp, run_policy, out['metadata'], frame_copy_size), prune=True)
-    out['run_model'][(cam_w,cam_h)] = compile_jit(run_model_jit, MODELD_INPUTS, make_model_queues,
-                                                  args.benchmark_runs)
+    out['run_model'][(cam_w,cam_h)] = compile_jit(run_model_jit, input_keys, make_model_queues, args.benchmark_runs)
 
   with open(args.output, "wb") as f:
     dump_oob(out, f)
