@@ -315,7 +315,7 @@ function op_lint() {
 
 function op_test() {
   op_before_cmd
-  op_run_command pytest -n logical --dist worksteal "$@"
+  op_run_command tools/test_runner.py "$@"
 }
 
 function op_replay() {
@@ -397,6 +397,8 @@ function op_switch() {
 
   # remove openpilot update flag if present
   rm -f .overlay_init
+
+  op_check_agnos_update
 }
 
 function op_start() {
