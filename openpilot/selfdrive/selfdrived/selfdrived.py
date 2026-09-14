@@ -7,8 +7,8 @@ import openpilot.cereal.messaging as messaging
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
-from msgq.visionipc import VisionIpcClient
 from openpilot.cereal.visionipc import VisionStreamType
+from msgq.visionipc import VisionIpcClient
 
 
 from openpilot.common.params import Params
@@ -304,8 +304,8 @@ class SelfdriveD:
     if self.sm.updated['extrinsicsCalibration']:
       self.pose_calibrator.feed_extrinsics_calibration(self.sm['extrinsicsCalibration'])
     if self.sm.updated['deviceMotion']:
-      device_pose = Pose.from_device_motion(self.sm['deviceMotion'])
-      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
+      device_motion = Pose.from_device_motion(self.sm['deviceMotion'])
+      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_motion)
 
     if self.calibrated_pose is not None and not self.CP.notCar:
       excessive_actuation = self.excessive_actuation_check.update(self.sm, CS, self.calibrated_pose)
@@ -583,16 +583,15 @@ class SelfdriveD:
     self.params.put_bool("ExperimentalMode", self.manual_experimental_mode)
 
   def update_experimental_mode(self, CS):
-    conditional_mode = self.conditional_experimental_mode.update(
-      self.sm['modelV2'],
-      CS,
-      self.sm['radarState'],
+    # the manual setting and the conditional request resolve here, the only owner of the effective mode
+    conditional = self.conditional_experimental_mode.update(
+      self.sm['modelV2'], CS, self.sm['radarState'],
       controls_enabled=self.enabled and self.CP.openpilotLongitudinalControl,
-      model_updated=bool(self.sm.updated['modelV2']),
-      model_valid=bool(self.sm.valid['modelV2'] and self.sm.alive['modelV2'] and self.sm.freq_ok['modelV2']),
-      radar_valid=bool(self.sm.valid['radarState'] and self.sm.alive['radarState'] and self.sm.freq_ok['radarState']),
+      model_updated=self.sm.updated['modelV2'],
+      model_valid=self.sm.valid['modelV2'] and self.sm.alive['modelV2'] and self.sm.freq_ok['modelV2'],
+      radar_valid=self.sm.valid['radarState'] and self.sm.alive['radarState'] and self.sm.freq_ok['radarState'],
     )
-    self.experimental_mode = self.manual_experimental_mode or conditional_mode
+    self.experimental_mode = self.manual_experimental_mode or conditional
 
   def step(self):
     CS = self.data_sample()

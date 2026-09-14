@@ -59,28 +59,11 @@ class Controls:
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP)
 
-    self.sm = messaging.SubMaster(
-      [
-        'lateralDelay',
-        'vehicleParameters',
-        'lateralTorqueParameters',
-        'modelV2',
-        'selfdriveState',
-        'extrinsicsCalibration',
-        'deviceMotion',
-        'longitudinalPlan',
-        'lateralManeuverPlan',
-        'carState',
-        'carOutput',
-        'driverMonitoringState',
-        'onroadEvents',
-        'driverAssistance',
-        'spysydriveStateSP',
-      ],
-      poll='selfdriveState',
-      ignore_alive=['spysydriveStateSP'],
-      ignore_valid=['spysydriveStateSP'],
-    )
+    self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
+                                   'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'spysydriveStateSP'],
+                                  poll='selfdriveState', ignore_alive=['spysydriveStateSP'],
+                                  ignore_valid=['spysydriveStateSP'])
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited_by_safety = False
@@ -114,8 +97,8 @@ class Controls:
     if self.sm.updated["extrinsicsCalibration"]:
       self.pose_calibrator.feed_extrinsics_calibration(self.sm['extrinsicsCalibration'])
     if self.sm.updated["deviceMotion"]:
-      device_pose = Pose.from_device_motion(self.sm['deviceMotion'])
-      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
+      device_motion = Pose.from_device_motion(self.sm['deviceMotion'])
+      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_motion)
 
   def state_control(self):
     CS = self.sm['carState']
@@ -144,10 +127,8 @@ class Controls:
 
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
-    CC.latActive = (
-      self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and
-      (not standstill or self.CP.steerAtStandstill)
-    )
+    CC.latActive = self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
+                   (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
     actuators = CC.actuators
@@ -231,13 +212,11 @@ class Controls:
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    # AOL can steer while selfdriveState is inactive, so keep stock limiter
-    # feedback live whenever lateral control is active.
-    self.steer_limited_by_safety = get_steer_limited_by_safety(
-      self.CP,
-      CC,
-      self.sm['carOutput'],
-    )
+    # AOL can steer while selfdriveState is inactive. Keep limiter feedback live whenever lateral control is active.
+    self.steer_limited_by_safety = get_steer_limited_by_safety(self.CP, CC, self.sm['carOutput'])
+
+    # TODO: both controlsState and carControl valids should be set by
+    #       sm.all_checks(), but this creates a circular dependency
 
     # controlsState
     dat = messaging.new_message('controlsState')
