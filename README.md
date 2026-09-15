@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress; awaiting bench test and field validation**
+**Status: ⚠️ in progress; the local warp ran the big model on two drives, the PCIe link wait awaits field validation**
 
 ## What it does
 
@@ -16,6 +16,12 @@ kept openpilot from engaging. A comma four bins its cameras to 1344x760 and cope
 This branch warps the frames on the device's own GPU and sends only the warped model-size
 frames (393,216 B) and the packed float inputs to the Chestnut: 395,384 B per run with the
 small model's input shapes, about 0.46 MB if the big model carries spatial features.
+
+It also stops the big model from being given up while the Chestnut's PCIe link is still
+training. On one of three drives with this build the link was not up when `modeld` began
+loading 1.5 s after start. tinygrad requested PCIe power and read the link state straight
+away, so the load raised `PCIe link not up (LTSSM=0x00)` at 4.1 s and the drive ran on the
+small model, though the link trained at 23 s. On the other two drives it was up at 1.0-1.2 s.
 
 ## How it works
 
@@ -31,6 +37,13 @@ small model's input shapes, about 0.46 MB if the big model carries spatial featu
 - The compile-time checks still mean something with two devices: random frames are written to
   host memory the frame device reads in place (the same path VisionIpc buffers take), and the
   capture replay and pickle round trip compare outputs and buffers across both devices.
+- Before the big model load starts, `modeld` polls the same `link_up()` probe the SConscript
+  uses before compiling (PCIe power request, then an LTSSM read) once a second until the link
+  is in L0, for up to `BIG_MODEL_TIMEOUT` (60 s) from the start of loading. The load thread only
+  starts once the link is up and keeps its own 60 s timeout, so a load is never started after
+  `modeld` has given up. If the link never comes up, no load starts: `ChestnutActive` goes
+  False and the small model runs, as it would after a failed load. "Big Model Loading" stays up
+  for the wait, as long as 60 s when the link never comes up.
 - No toggles and no new params.
 
 ## Before driving
@@ -45,6 +58,10 @@ small model's input shapes, about 0.46 MB if the big model carries spatial featu
   `captured._linear`, and confirm no written `QCOM` buffer in one pickle matches the other.
 - Check `modelV2.frameDropPerc` and the model execution time on a 3X with the Chestnut before
   engaging.
+- On a drive where `chestnutState.pcieLtssm` reaches `0x78` late, check that the first
+  `chestnutGpuState` with `big` set follows it and there is no `bigModelFailed`. While the link
+  is down, each `link_up()` request can hold the dock's control endpoint for about 2 s, so
+  hardwared's `chestnutState` can have gaps while `modeld` waits.
 
 ## What changed
 
@@ -57,4 +74,7 @@ small model's input shapes, about 0.46 MB if the big model carries spatial featu
   pickle records `input_devices['frame']`.
 - `openpilot/selfdrive/modeld/modeld.py` — with a frame device, `ModelState.run` caches one
   `from_blob` tensor per VisionIpc buffer and passes them as the frame inputs instead of copying
-  the frames into the packed buffer.
+  the frames into the packed buffer. `main` waits for the Chestnut PCIe link with `link_up()`
+  before starting the big model load, and skips the load if the link is not up within
+  `BIG_MODEL_TIMEOUT`. The model compile does not depend on this file, so the device does not
+  recompile.
