@@ -15,11 +15,11 @@
 /docs/**  # combo-level
 /openpilot/cereal/README.md  # kept: combo-level
 /openpilot/cereal/custom.capnp  # SOL
-/openpilot/cereal/log.capnp  # BLaTv3,BLoTv3,SOL,curve-speed-limit,rack-rate-source; kept: BLaTv3,BLoTv3,SOL,curve-speed-limit,rack-rate-source
-/openpilot/cereal/services.py  # BLaTv3,SOL,rack-rate-source; kept: combo-level
+/openpilot/cereal/log.capnp  # BLoTv3,SOL,curve-speed-limit; kept: BLoTv3,SOL,curve-speed-limit + ModelDataV2.Action.desiredCurvatureTime for the combo-only BLaTv2 tooling
+/openpilot/cereal/services.py  # SOL; kept: combo-level
 /openpilot/cereal/tests/test_blatv2_schema_compat.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/cereal/tests/test_model_schema_contract.py  # combo-only fork_only_file (no feature-branch owner)
-/openpilot/common/params_keys.h  # BLaTv3,params-clear-pandad-keys,params-clear-pandad-keys-at-offroad,rack-rate-source,side-buttons; kept: side-buttons
+/openpilot/common/params_keys.h  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad,side-buttons; kept: side-buttons
 /openpilot/common/spinner.py  # better-boot-screen
 /openpilot/common/swaglog.py  # kept: custom-main-menu (consumer terminal_widget.py) - handler lives only on combo
 /openpilot/common/tests/test_params.py  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad
@@ -31,7 +31,7 @@
 /openpilot/selfdrive/controls/blatv2_profiled.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/blatv2_rlog_extract.cc  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/blatv2_shadowd.py  # combo-only fork_only_file (no feature-branch owner)
-/openpilot/selfdrive/controls/controlsd.py  # BLaTv3,BLoTv3,SOL,rack-rate-source; kept: BLaTv3,BLoTv3,SOL,rack-rate-source + combo-level
+/openpilot/selfdrive/controls/controlsd.py  # BLoTv3,SOL; kept: BLoTv3,SOL + combo-level
 /openpilot/selfdrive/controls/controlsd_ext.py  # SOL
 /openpilot/selfdrive/controls/lib/blatv2/README.md  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/lib/blatv2/__init__.py  # combo-only fork_only_file (no feature-branch owner)
@@ -114,19 +114,12 @@
 /openpilot/selfdrive/controls/lib/conditional_experimental_mode.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/desire_helper.py  # nudgless-lane-changes
 /openpilot/selfdrive/controls/lib/force_stops.py  # BLoTv3
-/openpilot/selfdrive/controls/lib/latcontrol.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/lib/latcontrol_angle.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/lib/latcontrol_curvature.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/lib/latcontrol_pid.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/lib/latcontrol_rack.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/lib/latcontrol_torque.py  # BLaTv3,rack-rate-source
 /openpilot/selfdrive/controls/lib/longcontrol.py  # smooth-stops
 /openpilot/selfdrive/controls/lib/longitudinal_lead.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/longitudinal_planner.py  # BLoTv3,better-green-lights,curve-speed-limit; kept: combo-level (BLoTv3,better-green-lights,curve-speed-limit integration)
 /openpilot/selfdrive/controls/lib/model_curve_speed.py  # curve-speed-limit
 /openpilot/selfdrive/controls/lib/necessity_supervisor.py  # BLoTv3
-/openpilot/selfdrive/controls/lib/rack_trajectory.py  # BLaTv3,rack-rate-source
 /openpilot/selfdrive/controls/lib/smooth_stops.py  # smooth-stops
 /openpilot/selfdrive/controls/lib/stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/stop_landing.py  # BLoTv3
@@ -207,10 +200,6 @@
 /openpilot/selfdrive/controls/tests/test_conditional_experimental_mode.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_controlsd.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/tests/test_force_stops.py  # BLoTv3
-/openpilot/selfdrive/controls/tests/test_latcontrol.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/tests/test_latcontrol_rack.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/tests/test_latcontrol_rack_ff_taper.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/controls/tests/test_latcontrol_rack_hold_topup.py  # BLaTv3,rack-rate-source
 /openpilot/selfdrive/controls/tests/test_long_mpc.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_longcontrol.py  # smooth-stops
 /openpilot/selfdrive/controls/tests/test_longitudinal_lead.py  # BLoTv3
@@ -224,19 +213,9 @@
 /openpilot/selfdrive/controls/tests/test_smooth_stops.py  # smooth-stops
 /openpilot/selfdrive/controls/tests/test_stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_stop_landing.py  # BLoTv3
-/openpilot/selfdrive/locationd/lagd.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/rack_effort_classifier.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/rack_effort_observer.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/test/test_lagd.py  # BLaTv3,rack-rate-source; kept: BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/test/test_rack_effort_bitexact.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/test/test_rack_effort_freeze_gates.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/test/test_rack_effort_isolation.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/test/test_rack_effort_restore.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/locationd/test/test_rack_effort_snapshot.py  # BLaTv3,rack-rate-source
 /openpilot/selfdrive/modeld/SConscript  # c3x-chestnut
 /openpilot/selfdrive/modeld/compile_modeld.py  # c3x-chestnut
-/openpilot/selfdrive/modeld/modeld.py  # BLaTv3,c3x-chestnut,rack-rate-source
-/openpilot/selfdrive/modeld/tests/test_action_timing.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/modeld/modeld.py  # c3x-chestnut; kept: desiredCurvatureTime write for the combo-only BLaTv2 tooling
 /openpilot/selfdrive/modeld/tests/test_helpers.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/modeld/timing.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/pandad/panda.cc  # SOL
@@ -284,7 +263,7 @@
 /openpilot/system/loggerd/tests/test_platform_arch.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/system/manager/build.py  # better-boot-screen
 /openpilot/system/manager/manager.py  # better-boot-screen; kept: better-boot-screen,error-log-viewer
-/openpilot/system/manager/process_config.py  # BLaTv3,rack-rate-source; kept: BLaTv3,rack-rate-source (rack_effort_observer); BLaTv2 comment is combo-only leftover
+/openpilot/system/manager/process_config.py  # kept: combo-only BLaTv2 leftover (comment)
 /openpilot/system/ui/spinner.py  # better-boot-screen
 /openpilot/system/ui/widgets/html_render.py  # error-log-viewer,side-buttons
 /openpilot/system/updated/common.py  # combo-only fork_only_file (no feature-branch owner)

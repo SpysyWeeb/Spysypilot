@@ -27,7 +27,6 @@ jobs:
           - auto-update
           - custom-main-menu
           - side-buttons
-          - BLaTv3
           - BLoTv3
           - curve-speed-limit
           - fan-control

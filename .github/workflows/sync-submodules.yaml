@@ -26,7 +26,6 @@ jobs:
         branch:
           - combo
           - SOL
-          - BLaTv3
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     concurrency:
@@ -48,7 +47,7 @@ jobs:
           submodules: recursive
 
       # tools/sync comes from the commit that runs this workflow (combo for scheduled runs),
-      # so SOL and BLaTv3 are covered without carrying the scripts.
+      # so SOL is covered without carrying the scripts.
       - name: Check out sync tools
         uses: actions/checkout@v4
         with:
