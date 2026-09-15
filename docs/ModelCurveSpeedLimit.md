@@ -29,11 +29,11 @@ steering is working (torque ≥ 0.40) and tracking (error ≤ 0.30), filtered wi
 drive is approached conservatively.
 
 ### Layer 2 — reaction (the steering now)
-Reads `controlsState.lateralControlState` (`torqueState` on stock, `rackState` on combo): torque, tracking error,
+Reads `controlsState.lateralControlState.torqueState`: torque, tracking error,
 actual and desired lateral acceleration, saturated / torque-limited. Only while openpilot steers and the driver is not.
 - **coast** — torque ≥ `T_COAST` (0.85) for `COAST_ENTER_S` (0.3 s): throttle off, no brake (`min(coast, 0)`, so never a
   net acceleration downhill); demand falls with v². Ends after `COAST_EXIT_S` below `T_COAST_EXIT` (0.75).
-- **brake** — pinned (`T_PIN` 0.95, saturated, or torque limited) *and* understeering (`sign(desired)·error ≥ E_TRACK`
+- **brake** — pinned (`T_PIN` 0.95 or saturated) *and* understeering (`sign(desired)·error ≥ E_TRACK`
   0.30, so an exit overshoot never triggers it) for `BRAKE_ENTER_S` (0.3 s): decelerate toward the speed at which the
   measured curvature fits the budget within `T_RESTORE` (1 s); back to coast below `E_TRACK_EXIT`. Never below
   `V_REACT_MIN` (3 m/s), where the measured curvature is noise.
@@ -215,3 +215,15 @@ past the priced cap, peak engaged lateral 2.47 against comfort 3.4). What reads 
 harsh catch caused by the model's far-curvature under-read — 0.72 of truth at 180–200 m, 0.60 at 200–220, and 36 % of
 curved road beyond 150 m reported straight. Still the remaining gap. Separately, once the policy lets go the plan rides
 `get_max_accel_request` frame-exact, so a slow pick-up after the hold is fixed is the cruise envelope, not this policy.
+
+## 2026-09-14 — the stock torque controller's state
+
+BLaTv3 was retired from combo on 2026-09-14, so every build steers with upstream's `LatControlTorque` and the policy
+reads `torqueState` only. Its inputs keep their meaning: both controllers measured lateral acceleration from the
+steering angle through the vehicle model with the live roll, and both report the error as desired minus measured, so
+the bank handling and the understeer sign are unchanged. What went is the rack's `torqueLimited` flag, which also
+counted as pinned. Over 13 BLaTv3 drives (routes 0x62–0x72, 5.1 h of steering) that flag alone opened 14 of the 113
+brake-regime entries (pinned and understeering for 0.3 s), all at 4–12 m/s with torque as low as 0.15: the rack
+clipping its own output, not a pinned car. The stock definition (`saturated`, or torque at `T_PIN`) keeps the other
+99. The thresholds and the authority numbers above were measured with BLaTv3 steering; a drive on stock steering is
+the check.
