@@ -2,7 +2,13 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: ⚠️ in progress — phase 1 (behavior-preserving port of BLaTv2) merged into combo and field-validated 2026-08-29; phase 2 in progress: steps 2 and 3 (hold through model gaps; modeld's curvature preview as the rack path) merged into combo and field-validated 2026-08-29 (routes 00000023/24: every model frame carried the preview, all engaged frames `active`, no fallbacks, all stop approaches clean; the path-compile fix took controlsd from 36 % to 25 % of its core with zero skipped control frames); step 4 (bounded reference filter + scheduled preview) merged 2026-08-29, corrected 2026-08-30 after its first
+**Status: 🔒 retired 2026-09-14.** The owner retired BLaTv3 and it was removed from `combo`, which steers with upstream's
+`LatControlTorque` again and keeps the Palisade's 409/4/7 torque envelope from the opendbc fork. The branch is frozen: no
+further commits, no upstream syncs, no merges into `combo`. It stays as the reference for the rack-trajectory design, the
+field log below and the failure-mode catalog in [`docs/BLaTv3_FAILURE_MODES.md`](docs/BLaTv3_FAILURE_MODES.md). The
+history below is as it stood at retirement.
+
+**History at retirement:** phase 1 (behavior-preserving port of BLaTv2) merged into combo and field-validated 2026-08-29; phase 2 in progress: steps 2 and 3 (hold through model gaps; modeld's curvature preview as the rack path) merged into combo and field-validated 2026-08-29 (routes 00000023/24: every model frame carried the preview, all engaged frames `active`, no fallbacks, all stop approaches clean; the path-compile fix took controlsd from 36 % to 25 % of its core with zero skipped control frames); step 4 (bounded reference filter + scheduled preview) merged 2026-08-29, corrected 2026-08-30 after its first
 drive (the preview no longer replaces the near target) and field-validated 2026-08-30 (route 00000029: the served target within
 0.03 m/s² of the near target's demand while the preview is open, all engaged frames `active`, no preview with hands on). Phase 3
 in progress: step 1 (torque-tail continuity) merged and field-validated 2026-08-30; step 2 merged 2026-08-30 — its slew-aware early
