@@ -289,16 +289,19 @@ class TestReaction(unittest.TestCase):
     slow = settle(limiter, make_model(2.0), 20, v_ego=2.0, lateral_active=True, lateral_state=losing)
     self.assertNotEqual(slow.regime, REGIME_BRAKE)
 
-  def test_lateral_state_reads_both_controllers_and_fails_closed(self):
+  def test_lateral_state_reads_the_torque_controller_and_fails_closed(self):
     torque = SimpleNamespace(active=True, output=-0.9, error=0.2, actualLateralAccel=-2.0, desiredLateralAccel=-2.2, saturated=False)
     cs = SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'torqueState', torqueState=torque))
     state = LateralState.from_controls_state(cs)
     self.assertTrue(state.active and math.isclose(state.torque, 0.9) and not state.pinned)
     self.assertAlmostEqual(state.understeer, -0.2)                            # desired -2.2, actual -2.0: exit overshoot, not understeer
+    held = SimpleNamespace(active=True, output=0.6, error=0.5, actualLateralAccel=2.3, desiredLateralAccel=2.8, saturated=True)
+    cs = SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'torqueState', torqueState=held))
+    self.assertTrue(LateralState.from_controls_state(cs).pinned)                # the controller's own saturation pins below T_PIN
     rack = SimpleNamespace(active=True, output=0.99, error=0.5, actualLateralAccel=2.3, desiredLateralAccel=2.8, saturated=False,
                            torqueLimited=True)
     cs = SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'rackState', rackState=rack))
-    self.assertTrue(LateralState.from_controls_state(cs).pinned)
+    self.assertFalse(LateralState.from_controls_state(cs).active)               # the retired rack controller is not read
     self.assertFalse(LateralState.from_controls_state(SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'pidState'))).active)
     bad = SimpleNamespace(active=True, output=math.nan, error=0.0, actualLateralAccel=0.0, desiredLateralAccel=0.0, saturated=False)
     cs = SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'torqueState', torqueState=bad))

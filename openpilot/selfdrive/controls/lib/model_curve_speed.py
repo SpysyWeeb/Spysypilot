@@ -9,7 +9,7 @@ Two layers decide how the car should accelerate through the curves the model pat
   tracking, take the foot off (coast); pinned and understeering, brake to the speed that restores margin.
 
 The steering authority the anticipation counts on is calibrated online from the steering's own share of the lateral
-acceleration per unit of torque (the ground-plane value the rack reports, less the bank the limit adds back), measured
+acceleration per unit of torque (the ground-plane value the torque controller reports, less the bank the limit adds back), measured
 only in real corners at speed and bounded around the torque tuning's own factor.
 
 The result is one plan candidate. The planner's arbitration can only lower the chosen acceleration with it, never raise
@@ -115,13 +115,13 @@ REGIME_FREE, REGIME_ANTICIPATE, REGIME_COAST, REGIME_BRAKE = 'free', 'anticipate
 
 @dataclass
 class LateralState:
-  # the measured steering state, from either the stock torque controller or combo's rack controller
+  # the measured steering state, from the torque controller's log
   active: bool = False
   torque: float = 0.0          # |output|, 0..1 of the EPS limit
   error: float = 0.0           # desired - actual lateral acceleration, m/s^2, signed as the controller reports it
   actual_lateral_accel: float = 0.0
   desired_lateral_accel: float = 0.0
-  pinned: bool = False         # saturated or torque limited, as the controller reports it
+  pinned: bool = False         # saturated, as the controller reports it
 
   @property
   def understeer(self):
@@ -132,16 +132,15 @@ class LateralState:
   def from_controls_state(cls, controls_state):
     try:
       union = controls_state.lateralControlState
-      kind = union.which()
-      if kind not in ('torqueState', 'rackState'):
+      if union.which() != 'torqueState':
         return cls()
-      st = getattr(union, kind)
+      st = union.torqueState
       values = (float(st.output), float(st.error), float(st.actualLateralAccel), float(st.desiredLateralAccel))
     except (AttributeError, TypeError, ValueError, OverflowError):
       return cls()
     if not all(math.isfinite(v) for v in values):
       return cls()
-    pinned = bool(st.saturated) or (kind == 'rackState' and bool(st.torqueLimited))
+    pinned = bool(st.saturated)
     return cls(bool(st.active), min(abs(values[0]), 1.0), values[1], values[2], values[3], pinned)
 
 
@@ -246,7 +245,7 @@ class ModelCurveSpeedLimiter:
   def _calibrated(self, params, state, v_ego, lateral_active, roll):
     # the torque tuning's factor is the prior; the measured ratio moves it inside AUTHORITY_BOUNDS while the steering
     # is working and tracking through a real corner at speed. The measurement is the steering's own share of the
-    # lateral acceleration: the rack reports the ground-plane value, and the bank's share is the same bias the limit
+    # lateral acceleration: the torque controller reports the ground-plane value, and the bank's share is the same bias the limit
     # adds back (route 0x4d: sweepers banked 3-4 deg railed the factor to 1.6x the tuning)
     if params is None:
       return None
