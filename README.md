@@ -38,12 +38,15 @@ small model, though the link trained at 23 s. On the other two drives it was up 
   host memory the frame device reads in place (the same path VisionIpc buffers take), and the
   capture replay and pickle round trip compare outputs and buffers across both devices.
 - Before the big model load starts, `modeld` polls the same `link_up()` probe the SConscript
-  uses before compiling (PCIe power request, then an LTSSM read) once a second until the link
-  is in L0, for up to `BIG_MODEL_TIMEOUT` (60 s) from the start of loading. The load thread only
+  uses before compiling once a second until the link is in L0, for up to `BIG_MODEL_TIMEOUT` (60 s) from the start of loading. The load thread only
   starts once the link is up and keeps its own 60 s timeout, so a load is never started after
   `modeld` has given up. If the link never comes up, no load starts: `ChestnutActive` goes
   False and the small model runs, as it would after a failed load. "Big Model Loading" stays up
   for the wait, as long as 60 s when the link never comes up.
+- `link_up()` reads the LTSSM first and sends the PCIe power request (`0xF3`) only when the link
+  is not in L0, then reads it again, the same order tinygrad's `CustomASM24Controller` uses. It
+  used to send the request on every call, so waiting in `modeld` would have sent it on every
+  start even with the link already trained, as on the two drives that loaded the big model.
 - No toggles and no new params.
 
 ## Before driving
@@ -60,8 +63,13 @@ small model, though the link trained at 23 s. On the other two drives it was up 
   engaging.
 - On a drive where `chestnutState.pcieLtssm` reaches `0x78` late, check that the first
   `chestnutGpuState` with `big` set follows it and there is no `bigModelFailed`. While the link
-  is down, each `link_up()` request can hold the dock's control endpoint for about 2 s, so
-  hardwared's `chestnutState` can have gaps while `modeld` waits.
+  is down, each `link_up()` power request can hold the dock's control endpoint for about 2 s, so
+  hardwared's `chestnutState` can have gaps while `modeld` waits. `link_up()` sends that request
+  once a second while the link is not in L0; it is not yet known whether this firmware restarts
+  link training on a repeated request, so a late link that never reaches `0x78` while `modeld`
+  waits but trains after `bigModelFailed` points there.
+- On a drive where the link is already `0x78` when `modeld` starts loading, check that
+  `chestnutState` has no gap and no LTSSM change around the load start (no power request is sent).
 
 ## What changed
 
@@ -77,4 +85,8 @@ small model, though the link trained at 23 s. On the other two drives it was up 
   the frames into the packed buffer. `main` waits for the Chestnut PCIe link with `link_up()`
   before starting the big model load, and skips the load if the link is not up within
   `BIG_MODEL_TIMEOUT`. The model compile does not depend on this file, so the device does not
+  recompile.
+- `openpilot/system/hardware/chestnut/flash.py` — `link_up()` reads the LTSSM before the PCIe
+  power request and skips the request when the link is already in L0. The SConscript's
+  pre-compile check uses the same probe; the file is not a compile input, so the device does not
   recompile.
