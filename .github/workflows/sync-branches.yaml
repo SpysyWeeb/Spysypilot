@@ -35,6 +35,7 @@ jobs:
           - params-clear-pandad-keys-at-offroad
           - spinning-steering-wheel
           - torque-bar
+          - c3x-chestnut
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

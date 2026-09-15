@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       all_branches:
-        description: "check combo and the 21 rebuild branches instead of the selected ref"
+        description: "check combo and the 22 rebuild branches instead of the selected ref"
         type: boolean
         default: false
   schedule:
@@ -78,6 +78,7 @@ jobs:
           - better-green-lights
           - BLaTv3
           - BLoTv3
+          - c3x-chestnut
           - curve-speed-limit
           - custom-main-menu
           - detailed-stats-sidebar
