@@ -25,7 +25,7 @@ and remaining validation work.
 
 [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) is the only maintained combined testing branch and uses comma's stock release model. No standalone model-variant branch is active; the former `tsfdo-combo` branch was retired and deleted.
 
-⚠️ 2026-09-14: modeld/Chestnut build files, hardwared status and 60+ upstream-owned files re-synced to upstream; opendbc pins set by the consistency rule (docs/SYNC_POLICY.md); awaiting a drive — watch modeld lag and LDW re-arm timing.
+⚠️ 2026-09-14: modeld/Chestnut build files, hardwared status and 60+ upstream-owned files re-synced to upstream; opendbc pins set by the consistency rule (docs/SYNC_POLICY.md); awaiting a drive — watch modeld lag and LDW re-arm timing. c3x-chestnut was merged on top the same day and changes the modeld build files, modeld.py and the Chestnut PCIe probe again; see its To-Do entry.
 
 ## Engagement CI
 
@@ -67,6 +67,7 @@ Each feature links to its branch — the branch README has the full "what/how/wh
 - ✅ **[Hot-swap button between Chill/Experimental mode](https://github.com/SpysyWeeb/Spysypilot/tree/hot-swap-experimental)** — hold the steering-wheel distance button 0.5s to toggle Chill/Experimental without going into settings; a tap still cycles the follow personality &nbsp;*(inspired by sunnypilot)*
 - ⚠️ **[Comma 3X torque bar](https://github.com/SpysyWeeb/Spysypilot/tree/torque-bar)** — shows the comma four steering-torque utilization arc by default on the comma 3X onroad display, scaled for its 2160×1080 UI with no settings toggle &nbsp;*(inspired by comma four and sunnypilot)*
 - ⚠️ **[Comma 3X spinning steering wheel](https://github.com/SpysyWeeb/Spysypilot/tree/spinning-steering-wheel)** — rotates the existing top-right steering-wheel icon with the measured steering angle, with no settings toggle &nbsp;*(inspired by FrogPilot)*
+- ⚠️ **[Comma 3X Chestnut big model](https://github.com/SpysyWeeb/Spysypilot/tree/c3x-chestnut)** — the big driving model runs on a Chestnut dock from a comma 3X: the device's own GPU warps the camera frames, so only model-size frames cross the dock's USB link, and modeld waits for the dock's PCIe link before loading the big model &nbsp;*(based on upstream's routing before #38684; merged into combo 2026-09-14; the big model ran on two drives, the PCIe link wait awaits a drive)*
 - ⚠️ **[Side panel quick-action buttons](https://github.com/SpysyWeeb/Spysypilot/tree/side-buttons)** — the home screen's right column is a stack of quick-access buttons: experimental-mode toggle, an update button with live download/install status, a screen-always-on toggle, and an error-log shortcut &nbsp;*(personal idea)*
 - ⚠️ **[Nudgeless lane changes](https://github.com/SpysyWeeb/Spysypilot/tree/nudgless-lane-changes)** — lane changes trigger on turn signal alone, one automatic change per blinker event; pressing the brake cancels auto for that blinker event entirely (manual nudge still works) &nbsp;*(inspired by sunnypilot)*
 - 🔒 **[Better longitudinal tune v2 (BLoTv2)](https://github.com/SpysyWeeb/Spysypilot/tree/BLoTv2)** — superseded by BLoTv3, which reimplements its planner/MPC policy, lead response, Conditional Experimental Mode and cruise behavior with one owner per decision; the branch is kept as the reference the replay gates were proven against &nbsp;*(personal idea)*
