@@ -23,6 +23,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+from openpilot.system.hardware.chestnut.flash import link_up
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
@@ -239,6 +240,10 @@ def main(demo=False):
   cloudlog.warning("loading model")
   model = None
   if CHESTNUT:
+    # chestnut can enumerate before its PCIe link is up due to varying 12V power behavior across cars,
+    # and tinygrad checks the link only once. only start a load that can reach the GPU
+    while not (link := link_up()) and time.monotonic() - st < BIG_MODEL_TIMEOUT:
+      time.sleep(1)
     big_model = None
     def load_big():
       nonlocal big_model
@@ -248,9 +253,12 @@ def main(demo=False):
         big_model = m
       except Exception:
         cloudlog.exception("big model load failed")
-    loader = threading.Thread(target=load_big, daemon=True)
-    loader.start()
-    loader.join(BIG_MODEL_TIMEOUT)
+    if link:
+      loader = threading.Thread(target=load_big, daemon=True)
+      loader.start()
+      loader.join(BIG_MODEL_TIMEOUT)
+    else:
+      cloudlog.warning("chestnut PCIe link not up, skipping big model")
     model = big_model
     params.put_bool("ChestnutActive", model is not None)
 
