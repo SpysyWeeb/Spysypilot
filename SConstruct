@@ -284,7 +284,6 @@ if arch == "comma_arm64":
 
 # Build selfdrive
 SConscript([
-  'openpilot/selfdrive/controls/SConscript',
   'openpilot/selfdrive/pandad/SConscript',
   'openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/SConscript',
   'openpilot/selfdrive/locationd/SConscript',
