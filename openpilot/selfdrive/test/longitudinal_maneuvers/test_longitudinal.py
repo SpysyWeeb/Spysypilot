@@ -232,6 +232,16 @@ class TestCurvePolicy(OpenpilotTestCase):
     assert a[inside].min() >= -2.05                                         # ... within the floor
     assert v[inside][-1] < v[inside][0]                                     # ... and is slower deep in the curve
 
+  def test_a_left_and_a_right_hand_curve_are_driven_alike(self):
+    # the simulated steering saturates the same way in both directions, and the policy reading it must not care which
+    left, right = (self._run(title=f'brake in a {side}-hand curve the steering cannot hold', initial_speed=9.0, cruise_values=[9.0, 9.0],
+                             curve=(30.0, 150.0, curvature), curve_model_scale=0.5, duration=25.0)
+                   for side, curvature in (('left', 0.06), ('right', -0.06)))
+    np.testing.assert_allclose(right[1], left[1], atol=1e-6)
+    np.testing.assert_allclose(right[2], left[2], atol=1e-6)
+    inside = (left[0] > 35.0) & (left[0] < 150.0)
+    assert right[2][inside].min() <= -0.8, right[2][inside].min()           # the right-hand curve brakes too
+
   def test_a_lift_ends_in_a_hold_until_the_bend_opens(self):
     # a tight entry the steering can only just hold, then a looser section that is still a bend at the owner's own
     # cornering level (above BEND_OPEN_A_LAT at the settled speed): the coast releases as the torque eases, and the

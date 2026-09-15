@@ -44,6 +44,7 @@ AUTHORITY_MIN_LATERAL = 1.0   # m/s^2, ... in a real corner (the friction term d
 AUTHORITY_MIN_SPEED = 10.0    # m/s, ... at a speed where the assist resembles the highway's: town corners at 5-8 m/s
                               # dragged the factor to 0.9x the tuning and a bend 300 s later was braked for (route 0x4c)
 AUTHORITY_BOUNDS = (0.8, 1.8) # times the torque tuning's own factor
+AUTHORITY_MIN_TORQUE_OVER_FRICTION = 0.05  # torque above friction below which the ratio measures friction, not the steering
 AUTHORITY_HELD_LATERAL = 2.5  # m/s^2, the lateral acceleration the rack is known to hold INSIDE the budget at highway speed,
                               # and therefore a floor under what the budget may be priced at. `margin` below asserts that
                               # lateral acceleration is linear in torque and extrapolates the tuning's slope out to the
@@ -56,6 +57,8 @@ AUTHORITY_HELD_LATERAL = 2.5  # m/s^2, the lateral acceleration the rack is know
 AUTHORITY_HELD_SPEED = (15.0, 20.0)  # m/s, the floor blends in over this range. Below it the term is honest and stays: every
                               # one of route 5b's 534 at-budget frames was under 20 m/s, and 18 of 43 curve episodes that
                               # peaked at the budget were town corners. The rack genuinely pins in town; it does not up here
+AUTHORITY_HELD_CARS = ("HYUNDAI_PALISADE",)  # the platforms the hold above was measured on. It is a statement about one rack's
+                              # saturation, so every other car prices its budget with the torque model alone
 FAR_NODE_DECEL_MAX = 1.0      # m/s^2, the most a node beyond the roll horizon may ask for when its shortfall is one a bank could
                               # explain: the bank there is unknown, and a banked sweeper read without it is 10-15 % too slow
                               # (route 0x4d: the far limit 20.7 for a bend the rack held at 24, the candidate at the -2.0 floor
@@ -86,6 +89,8 @@ T_PIN = 0.95                  # torque at which the steering is pinned (the fiel
 E_TRACK = 0.30                # m/s^2, understeer above which a pinned car is losing the line
 E_TRACK_EXIT = 0.20           # m/s^2, understeer below which the brake regime hands back to coasting
 BRAKE_ENTER_S = 0.3           # s, the loss must persist this long before the brake regime enters
+BRAKE_EXIT_S = 0.5            # s, recovery must persist this long before the brake regime hands back to coasting, as the coast's
+                              # own exit does: one sample at 0.19 among pinned 0.6 ones relaxed a -2.0 request to -1.1
 T_RESTORE = 1.0               # s, time in which the brake regime aims to restore the torque margin
 V_REACT_MIN = 3.0             # m/s, below this the reaction layer never brakes: measured curvature is noise there
 CURVE_GAS_GRACE_S = 5.0       # s after a driver gas override in which the anticipation may hold but never brake: the owner
@@ -175,9 +180,14 @@ def _torque_values(params):
   return values if np.all(np.isfinite(values)) and values[0] > 0.0 and 0.0 <= values[2] < TORQUE_BUDGET else None
 
 
-def held_lateral(v_ego):
+def held_lateral(v_ego, held=AUTHORITY_HELD_LATERAL):
   """The demonstrated lateral hold that applies at this speed, blended in so the cap has no step at the boundary."""
-  return float(np.interp(v_ego, AUTHORITY_HELD_SPEED, (0.0, AUTHORITY_HELD_LATERAL)))
+  return float(np.interp(v_ego, AUTHORITY_HELD_SPEED, (0.0, held)))
+
+
+def steering_share(state, bias):
+  """The lateral acceleration the steering itself produces: the measured value less the bank and offset the limit adds back."""
+  return abs(state.actual_lateral_accel - bias)
 
 
 def authority_margin(factor, friction, held=0.0):
@@ -221,6 +231,7 @@ class ModelCurveSpeedLimiter:
     lateral_tuning = getattr(CP, "lateralTuning", None)
     if lateral_tuning is not None and lateral_tuning.which() == "torque":
       self.torque_params = _torque_values(lateral_tuning.torque)
+    self.held_lateral = AUTHORITY_HELD_LATERAL if str(getattr(CP, "carFingerprint", "")) in AUTHORITY_HELD_CARS else 0.0
     self.authority = None                        # FirstOrderFilter on the measured lateral acceleration per unit torque
     self.v_limit = math.inf
     self.distance = 0.0
@@ -236,6 +247,7 @@ class ModelCurveSpeedLimiter:
     self._coast_enter_s = 0.0
     self._coast_exit_s = 0.0
     self._losing_s = 0.0
+    self._recovered_s = 0.0
     self.regime = REGIME_FREE
     self.active = False
     self._holding = False
@@ -252,9 +264,10 @@ class ModelCurveSpeedLimiter:
     factor, offset, friction = params
     if self.authority is None:
       self.authority = FirstOrderFilter(factor, AUTHORITY_RC, self.dt)
-    share = abs(state.actual_lateral_accel - (roll * ACCELERATION_DUE_TO_GRAVITY + offset))
+    share = steering_share(state, roll * ACCELERATION_DUE_TO_GRAVITY + offset)
     if (lateral_active and state.active and v_ego >= AUTHORITY_MIN_SPEED and state.torque >= AUTHORITY_MIN_TORQUE
-        and share >= AUTHORITY_MIN_LATERAL and abs(state.error) <= AUTHORITY_MAX_ERROR and state.torque > friction + 0.05):
+        and share >= AUTHORITY_MIN_LATERAL and abs(state.error) <= AUTHORITY_MAX_ERROR
+        and state.torque > friction + AUTHORITY_MIN_TORQUE_OVER_FRICTION):
       measured = share / (state.torque - friction)
       self.authority.update(float(np.clip(measured, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)))
     return (float(np.clip(self.authority.x, AUTHORITY_BOUNDS[0] * factor, AUTHORITY_BOUNDS[1] * factor)), offset, friction)
@@ -276,7 +289,8 @@ class ModelCurveSpeedLimiter:
     path_distance = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(position_x), np.diff(position_y)))))
     signed_curvature = _median_filter_three(yaw_rate / np.maximum(np.abs(velocity_x), MIN_MODEL_SPEED))
     near = path_distance <= v_ego * ROLL_HORIZON_S
-    limits = curve_speed_limits(signed_curvature, params, np.where(near, roll, 0.0), lateral_active, held_lateral(v_ego))
+    limits = curve_speed_limits(signed_curvature, params, np.where(near, roll, 0.0), lateral_active,
+                                held_lateral(v_ego, self.held_lateral))
 
     # per node, the less demanding of the kinematic acceleration that meets its limit at its distance and a proportional
     # approach: far limits are kinematic, near or reached ones proportional, and the two meet continuously. Small and
@@ -308,14 +322,19 @@ class ModelCurveSpeedLimiter:
     heavy = state.torque >= T_COAST
     pinned = state.pinned or state.torque >= T_PIN
     understeer = state.understeer
-    if self.regime == REGIME_BRAKE and (understeer < E_TRACK_EXIT or not pinned):
-      self.regime = REGIME_COAST
-      self._losing_s = 0.0
+    if self.regime == REGIME_BRAKE:
+      # recovery is tracking again or coming off the pin, and it must persist: one good sample in a pinned, understeering
+      # stretch is not the car getting back inside its authority
+      self._recovered_s = self._recovered_s + self.dt if (understeer < E_TRACK_EXIT or not pinned) else 0.0
+      if self._recovered_s + 1e-9 >= BRAKE_EXIT_S:
+        self.regime = REGIME_COAST
+        self._losing_s = self._recovered_s = self._coast_exit_s = 0.0
     if self.regime != REGIME_BRAKE:
       self._losing_s = self._losing_s + self.dt if (pinned and understeer >= E_TRACK) else 0.0
       self._coast_enter_s = self._coast_enter_s + self.dt if heavy else 0.0
       if self._losing_s + 1e-9 >= BRAKE_ENTER_S and v_ego >= V_REACT_MIN:
         self.regime = REGIME_BRAKE
+        self._recovered_s = 0.0
       elif self.regime != REGIME_COAST and self._coast_enter_s + 1e-9 >= COAST_ENTER_S:
         self.regime = REGIME_COAST
         self._coast_exit_s = 0.0
@@ -336,9 +355,16 @@ class ModelCurveSpeedLimiter:
       curvature_now = abs(lateral) / max(v_ego, V_REACT_MIN) ** 2
       if params is not None:
         factor, offset, friction = params
+        bias = roll * ACCELERATION_DUE_TO_GRAVITY + offset
+        margin = authority_margin(factor, friction, held_lateral(v_ego, self.held_lateral))
+        if state.torque >= T_PIN:
+          # losing the line at the torque limit is itself a measurement of the authority there is: neither the priced
+          # budget nor the demonstrated hold may promise the restore more than the steering is delivering now. Only at
+          # the limit: the controller's saturated flag also covers a rate-limited curvature request, where a frame of
+          # little lateral at moderate torque says nothing about what the rack can hold
+          margin = min(margin, (TORQUE_BUDGET - friction) * steering_share(state, bias) / (state.torque - friction))
         turn = math.copysign(1.0, state.desired_lateral_accel) if state.desired_lateral_accel != 0.0 else 1.0
-        a_lat_ok = max(authority_margin(factor, friction, held_lateral(v_ego))
-                       + turn * (roll * ACCELERATION_DUE_TO_GRAVITY + offset), 0.5)
+        a_lat_ok = max(margin + turn * bias, 0.5)
       else:
         a_lat_ok = A_LAT_COMFORT
       v_ok = math.sqrt(a_lat_ok / max(curvature_now, MIN_CURVATURE))
@@ -380,7 +406,7 @@ class ModelCurveSpeedLimiter:
       reaction = self._react(state, v_ego, accel_coast, params, roll)
     else:
       self.regime = REGIME_FREE
-      self._losing_s = self._coast_enter_s = self._coast_exit_s = 0.0
+      self._losing_s = self._coast_enter_s = self._coast_exit_s = self._recovered_s = 0.0
       reaction = A_CURVE_FREE
 
     # the hold: a lift ends into zero, not into whichever candidate wants to accelerate, until the bend reads open or the

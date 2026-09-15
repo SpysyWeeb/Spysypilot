@@ -5,6 +5,8 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot).
 Status: **in progress pending field testing**. This feature must not be marked
 complete until the owner has tested it on-device.
 
+2026-09-15: audit fixes — the brake regime prices the restore no higher than the authority the steering delivers at its torque limit, the 2.5 m/s² demonstrated hold applies to the Palisade only, brake recovery must persist 0.5 s (`BRAKE_EXIT_S`), the maneuver plant saturates both curve directions (mirrored maneuver added), and the decision is logged as `curvePolicyState`. Awaiting the owner's drive.
+
 2026-09-05: route 0x54's late lift — the authority calibration samples only at torque ≥ 0.70 (`AUTHORITY_MIN_TORQUE`, the ratio is not constant in torque and the plan is aimed at the 0.90 budget), and a path node beyond the roll horizon whose shortfall a bank could explain (within 25 % of the speed) asks for a moderate deceleration at most (`FAR_NODE_DECEL_MAX` 1.0 m/s²). Replay-gated on routes 0x54, 0x4c, 0x4d; awaiting the owner's drive.
 
 2026-09-04: the same bend twice (routes 0x4c/0x4d) — far path nodes no longer get the car's live roll (`ROLL_HORIZON_S` 2 s), the authority calibration learns only from real corners at speed with the bank taken out of the measurement, and the hold releases as a `J_UP` ramp instead of a step. Replay-gated on both passes; awaiting the owner's drive. Details: docs/ModelCurveSpeedLimit.md.

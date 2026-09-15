@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.model_curve_speed import (
   authority_margin,
   held_lateral,
   BRAKE_ENTER_S,
+  BRAKE_EXIT_S,
   COAST_ENTER_S,
   COAST_EXIT_S,
   REGIME_ANTICIPATE,
@@ -62,9 +63,10 @@ def curve_ahead(speed, start, length, curvature):
   return make_model(speed, np.where((x >= start) & (x <= start + length), curvature, 0.0))
 
 
-def make_cp(factor=FACTOR, friction=FRICTION, delay=0.5):
+def make_cp(factor=FACTOR, friction=FRICTION, delay=0.5, fingerprint="HYUNDAI_PALISADE"):
   torque = SimpleNamespace(latAccelFactor=factor, latAccelOffset=0.0, friction=friction)
-  return SimpleNamespace(longitudinalActuatorDelay=delay, lateralTuning=SimpleNamespace(which=lambda: "torque", torque=torque))
+  return SimpleNamespace(carFingerprint=fingerprint, longitudinalActuatorDelay=delay,
+                         lateralTuning=SimpleNamespace(which=lambda: "torque", torque=torque))
 
 
 def tracking(torque=0.3, error=0.05, lat=1.0, pinned=False, desired=None):
@@ -133,6 +135,15 @@ class TestDemonstratedHold(unittest.TestCase):
     strong = (AUTHORITY_BOUNDS[1] * FACTOR, 0.0, FRICTION)
     self.assertAlmostEqual(float(curve_speed_limits(kappa, strong, 0.0, True, held_lateral(30.0))[0]),
                            math.sqrt(A_LAT_COMFORT / 0.05))
+
+  def test_the_floor_belongs_to_the_car_it_was_measured_on(self):
+    # the hold is a measurement of the Palisade's rack; another car's saturation is its own, so it keeps the torque model
+    bend = make_model(25.0, np.full(N, 0.005))
+    palisade = settle(ModelCurveSpeedLimiter(make_cp()), bend, 5, v_ego=25.0, lateral_active=True, lateral_state=tracking())
+    other = settle(ModelCurveSpeedLimiter(make_cp(fingerprint="HONDA_CIVIC")), bend, 5, v_ego=25.0, lateral_active=True,
+                   lateral_state=tracking())
+    self.assertAlmostEqual(palisade.v_limit, math.sqrt(AUTHORITY_HELD_LATERAL / 0.005), places=3)
+    self.assertAlmostEqual(other.v_limit, math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / 0.005), places=3)
 
   def test_the_floor_does_not_touch_the_measured_authority_factor(self):
     # the reported factor stays a measurement of the torque ratio; the floor is a statement about the budget, not the ratio
@@ -257,14 +268,16 @@ class TestReaction(unittest.TestCase):
   def test_pinned_and_losing_brakes_toward_the_speed_that_restores_margin_after_a_debounce(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
     straight = make_model(15.0)
-    losing = tracking(torque=1.0, error=0.6, lat=2.3, pinned=True)
+    losing = tracking(torque=1.0, error=0.35, lat=2.3, pinned=True)          # a loss mild enough that no request below meets the floor
     result = settle(limiter, straight, round(BRAKE_ENTER_S / DT_MDL) - 1, v_ego=15.0, lateral_active=True, lateral_state=losing)
     self.assertNotEqual(result.regime, REGIME_BRAKE)                        # not on a single sample
     result = settle(limiter, straight, 40, v_ego=15.0, a_ego=-1.0, lateral_active=True, accel_coast=-0.3, lateral_state=losing)
     self.assertEqual(result.regime, REGIME_BRAKE)
-    a_lat_ok = (TORQUE_BUDGET - FRICTION) * result.authority_factor
-    v_ok = math.sqrt(a_lat_ok / (2.9 / 15.0 ** 2))                           # the demanded 2.9, not the achieved 2.3
-    self.assertAlmostEqual(result.a_target, max((v_ok - 15.0) / 1.0, A_CURVE_MIN), places=5)
+    measured = 2.3 / (1.0 - FRICTION)                                        # the authority the pinned steering shows now
+    a_lat_ok = (TORQUE_BUDGET - FRICTION) * min(result.authority_factor, measured)
+    v_ok = math.sqrt(a_lat_ok / (2.65 / 15.0 ** 2))                          # the demanded 2.65, not the achieved 2.3
+    self.assertAlmostEqual(result.a_target, (v_ok - 15.0) / 1.0, places=5)
+    self.assertGreater(result.a_target, A_CURVE_MIN)
     helped = settle(ModelCurveSpeedLimiter(make_cp()), straight, 40, v_ego=15.0, a_ego=-1.0, lateral_active=True, accel_coast=-0.3,
                     roll=0.05, lateral_state=losing)                        # a bank in the turn's favour (the same sign as its lateral) ...
     self.assertGreater(helped.a_target, result.a_target)                     # ... asks for less than the flat ...
@@ -277,8 +290,75 @@ class TestReaction(unittest.TestCase):
     right = LateralState(True, 1.0, -0.6, -2.3, -2.9, True)                # a right-hand curve: understeer reads negative
     right_hand = settle(ModelCurveSpeedLimiter(make_cp()), straight, 40, v_ego=15.0, lateral_active=True, lateral_state=right)
     self.assertEqual(right_hand.regime, REGIME_BRAKE)
-    back = settle(limiter, straight, 3, v_ego=15.0, lateral_active=True, lateral_state=tracking(torque=1.0, error=0.1, lat=2.3, pinned=True))
-    self.assertEqual(back.regime, REGIME_COAST)                              # tracking again: hand back to coasting
+    recovering = tracking(torque=1.0, error=0.1, lat=2.3, pinned=True)
+    back = settle(limiter, straight, round(BRAKE_EXIT_S / DT_MDL) - 1, v_ego=15.0, lateral_active=True, lateral_state=recovering)
+    self.assertEqual(back.regime, REGIME_BRAKE)                              # recovery must persist ...
+    back = settle(limiter, straight, 2, v_ego=15.0, lateral_active=True, lateral_state=recovering)
+    self.assertEqual(back.regime, REGIME_COAST)                              # ... then tracking again hands back to coasting
+
+  def test_pinned_and_losing_brakes_below_a_hold_the_steering_is_not_delivering(self):
+    # 25 m/s, pinned at full torque, 2.0 achieved of 2.4 asked: the demonstrated hold alone would call the bend holdable at
+    # this speed and leave the brake regime only the coast; the steering's own measurement says it is not
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    bend = make_model(25.0, np.full(N, 2.4 / 25.0 ** 2))
+    losing = tracking(torque=1.0, error=0.4, lat=2.0, pinned=True)
+    result = settle(limiter, bend, 60, v_ego=25.0, a_ego=-2.0, lateral_active=True, accel_coast=-0.3, lateral_state=losing)
+    self.assertEqual(result.regime, REGIME_BRAKE)
+    self.assertGreater(held_lateral(25.0), 2.4)
+    v_ok = math.sqrt((TORQUE_BUDGET - FRICTION) * 2.0 / (1.0 - FRICTION) / (2.4 / 25.0 ** 2))
+    self.assertLess(v_ok, 25.0)
+    self.assertAlmostEqual(result.a_target, max(v_ok - 25.0, A_CURVE_MIN), places=5)
+
+  def test_a_flag_pinned_below_the_torque_limit_prices_the_restore_from_the_budget(self):
+    # saturated can mean a rate-limited curvature request: 0.11 torque and 0.02 of 1.5 m/s^2 is not the rack's authority,
+    # and must not turn the priced coast into the braking floor
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(15.0)
+    settle(limiter, straight, 40, v_ego=15.0, a_ego=-2.0, lateral_active=True, lateral_state=tracking(torque=1.0, error=0.6, lat=2.3, pinned=True))
+    limited = LateralState(True, 0.11, 1.48, 0.02, 1.5, True)
+    result = settle(limiter, straight, 40, v_ego=15.0, a_ego=-0.3, lateral_active=True, accel_coast=-0.3, lateral_state=limited)
+    self.assertEqual(result.regime, REGIME_BRAKE)
+    v_ok = math.sqrt((TORQUE_BUDGET - FRICTION) * FACTOR / (1.5 / 15.0 ** 2))
+    self.assertGreater(v_ok, 15.0)                                           # the budget holds this bend at this speed ...
+    self.assertAlmostEqual(result.a_target, -0.3, places=5)                   # ... so the regime asks for the coast, not a brake
+
+  def test_one_recovered_sample_does_not_release_the_brake(self):
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    straight = make_model(15.0)
+    losing = tracking(torque=1.0, error=0.6, lat=2.3, pinned=True)
+    braking = settle(limiter, straight, 40, v_ego=15.0, a_ego=-2.0, lateral_active=True, lateral_state=losing)
+    self.assertEqual(braking.regime, REGIME_BRAKE)
+    blip = limiter.update(straight, v_ego=15.0, a_ego=-2.0, lateral_active=True, lateral_state=tracking(torque=1.0, error=0.19, lat=2.3, pinned=True))
+    self.assertEqual(blip.regime, REGIME_BRAKE)
+    after = settle(limiter, straight, round(BRAKE_EXIT_S / DT_MDL) // 2, v_ego=15.0, a_ego=-2.0, lateral_active=True, lateral_state=losing)
+    self.assertEqual(after.regime, REGIME_BRAKE)
+    self.assertAlmostEqual(after.a_target, braking.a_target)
+
+  def test_the_brake_releases_on_sustained_recovery_by_tracking_or_by_coming_off_the_pin(self):
+    self.assertGreaterEqual(BRAKE_EXIT_S, BRAKE_ENTER_S)
+    straight = make_model(15.0)
+    losing = tracking(torque=1.0, error=0.6, lat=2.3, pinned=True)
+    for recovered in (tracking(torque=1.0, error=0.1, lat=2.3, pinned=True),     # tracking again at the pin
+                      tracking(torque=0.8, error=0.6, lat=2.3, pinned=False)):   # off the pin, still wide
+      limiter = ModelCurveSpeedLimiter(make_cp())
+      settle(limiter, straight, 40, v_ego=15.0, lateral_active=True, lateral_state=losing)
+      held = settle(limiter, straight, round(BRAKE_EXIT_S / DT_MDL) - 1, v_ego=15.0, lateral_active=True, lateral_state=recovered)
+      self.assertEqual(held.regime, REGIME_BRAKE)
+      self.assertEqual(limiter.update(straight, v_ego=15.0, lateral_active=True, lateral_state=recovered).regime, REGIME_COAST)
+
+  def test_the_drivers_wheel_a_steering_dropout_and_a_disengagement_end_the_brake_at_once(self):
+    # the measurement that justified braking is no longer the steering's own: the dwell never delays these exits
+    straight = make_model(15.0)
+    losing = tracking(torque=1.0, error=0.6, lat=2.3, pinned=True)
+    for interrupt in ({'lateral_active': True, 'steering_pressed': True}, {'lateral_active': False}):
+      limiter = ModelCurveSpeedLimiter(make_cp())
+      self.assertEqual(settle(limiter, straight, 40, v_ego=15.0, lateral_active=True, lateral_state=losing).regime, REGIME_BRAKE)
+      self.assertEqual(limiter.update(straight, v_ego=15.0, lateral_state=losing, **interrupt).regime, REGIME_FREE)
+    limiter = ModelCurveSpeedLimiter(make_cp())
+    settle(limiter, straight, 40, v_ego=15.0, lateral_active=True, lateral_state=losing)
+    limiter.reset()
+    self.assertEqual(limiter.regime, REGIME_FREE)
+    self.assertIsNone(limiter.update(straight, v_ego=15.0, lateral_active=False, lateral_state=losing).a_target)
 
   def test_no_reaction_without_active_lateral_or_with_the_driver_steering_or_at_crawl_speed(self):
     limiter = ModelCurveSpeedLimiter(make_cp())
@@ -350,6 +430,32 @@ class TestPlannerIntegration(unittest.TestCase):
                         __import__('openpilot.selfdrive.controls.lib.model_curve_speed', fromlist=['CurveResult']).CurveResult(-1.2, 'coast')):
         planner.update(sm)
         self.assertAlmostEqual(planner.output_a_target, -1.2)                  # a lower one binds
+
+  def test_the_policys_decision_is_published(self):
+    from openpilot.selfdrive.controls.lib import longitudinal_planner
+    from openpilot.selfdrive.controls.lib.model_curve_speed import CurveResult
+
+    class FakeSubMaster(dict):
+      logMonoTime = {'modelV2': 0}
+
+      def all_checks(self, services=None):
+        return True
+
+    planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2))
+    sm = FakeSubMaster(radarState=SimpleNamespace(leadOne=SimpleNamespace(present=False)))
+    sent = {}
+    pm = SimpleNamespace(send=lambda service, msg: sent.__setitem__(service, msg))
+    for result in (CurveResult(-1.1, REGIME_BRAKE, 21.5, 34.0, 2.6, True), CurveResult()):
+      planner.curve = result
+      planner.publish(sm, pm)
+      state = sent['curvePolicyState'].curvePolicyState
+      self.assertEqual(state.regime, result.regime)
+      self.assertEqual(state.active, result.a_target is not None)
+      self.assertAlmostEqual(state.aTarget, result.a_target if result.a_target is not None else 0.0, places=5)
+      self.assertAlmostEqual(state.vLimit, result.v_limit, places=4)
+      self.assertAlmostEqual(state.limitDistance, result.distance, places=4)
+      self.assertAlmostEqual(state.authorityFactor, result.authority_factor, places=5)
+      self.assertEqual(state.holding, result.holding)
 
 
 if __name__ == "__main__":
