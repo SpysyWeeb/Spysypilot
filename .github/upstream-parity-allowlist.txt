@@ -233,7 +233,9 @@
 /openpilot/selfdrive/locationd/test/test_rack_effort_isolation.py  # BLaTv3,rack-rate-source
 /openpilot/selfdrive/locationd/test/test_rack_effort_restore.py  # BLaTv3,rack-rate-source
 /openpilot/selfdrive/locationd/test/test_rack_effort_snapshot.py  # BLaTv3,rack-rate-source
-/openpilot/selfdrive/modeld/modeld.py  # BLaTv3,rack-rate-source
+/openpilot/selfdrive/modeld/SConscript  # c3x-chestnut
+/openpilot/selfdrive/modeld/compile_modeld.py  # c3x-chestnut
+/openpilot/selfdrive/modeld/modeld.py  # BLaTv3,c3x-chestnut,rack-rate-source
 /openpilot/selfdrive/modeld/tests/test_action_timing.py  # BLaTv3,rack-rate-source
 /openpilot/selfdrive/modeld/tests/test_helpers.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/modeld/timing.py  # combo-only fork_only_file (no feature-branch owner)
@@ -276,6 +278,7 @@
 /openpilot/spysypilot/aol/aol.py  # SOL
 /openpilot/spysypilot/aol/helpers.py  # SOL
 /openpilot/spysypilot/aol/state.py  # SOL
+/openpilot/system/hardware/chestnut/flash.py  # c3x-chestnut
 /openpilot/system/hardware/fan_controller.py  # fan-control
 /openpilot/system/hardware/tests/test_fan_controller.py  # fan-control
 /openpilot/system/loggerd/tests/test_platform_arch.py  # combo-only fork_only_file (no feature-branch owner)
