@@ -12,9 +12,9 @@
 /conftest.py  # combo-only fork_only_file (no feature-branch owner)
 /docs/**  # combo-level
 /openpilot/cereal/README.md  # kept: combo-level
-/openpilot/cereal/custom.capnp  # SOL
+/openpilot/cereal/custom.capnp  # SOL,curve-speed-limit
 /openpilot/cereal/log.capnp  # BLoTv3,SOL,curve-speed-limit; kept: BLoTv3,SOL,curve-speed-limit + combo-level Event.blatV2ShadowDEPRECATED @156 placeholder (keeps the union dense)
-/openpilot/cereal/services.py  # SOL; kept: combo-level
+/openpilot/cereal/services.py  # SOL,curve-speed-limit; kept: combo-level
 /openpilot/cereal/tests/test_model_schema_contract.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/common/params_keys.h  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad,side-buttons; kept: side-buttons
 /openpilot/common/spinner.py  # better-boot-screen
