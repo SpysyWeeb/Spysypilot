@@ -889,7 +889,6 @@ struct ControlsState @0x97ff69c53601abf1 {
     torqueState @60 :LateralTorqueState;
 
     curvatureState @65 :LateralCurvatureState;
-    rackState @67 :LateralRackState;
     lqrStateDEPRECATED @55 :Deprecated.LateralLQRState;
     indiStateDEPRECATED @52 :Deprecated.LateralINDIState;
   }
@@ -1139,52 +1138,6 @@ struct ControlsState @0x97ff69c53601abf1 {
     modularFinalLimiterAltered @222 :Bool;
    }
 
-  struct LateralRackState {
-    active @0 :Bool;
-    fallback @1 :Bool;  # the stock torque controller steered this frame
-    status @2 :UInt8;  # rack_trajectory.STATUS_*
-    error @3 :Float32;
-    errorRate @4 :Float32;
-    p @5 :Float32;
-    d @6 :Float32;
-    f @7 :Float32;
-    output @8 :Float32;
-    saturated @9 :Bool;
-    actualLateralAccel @10 :Float32;
-    desiredLateralAccel @11 :Float32;
-    desiredLateralJerk @12 :Float32;
-    targetCurvature @13 :Float32;
-    targetSteeringAngleDeg @14 :Float32;
-    targetSteeringRateDegS @15 :Float32;
-    plannedSteeringAngleDeg @16 :Float32;
-    plannedSteeringRateDegS @17 :Float32;
-    plannedSteeringAccelerationDegS2 @18 :Float32;
-    measuredSteeringRateDegS @19 :Float32;
-    rateLimitDegS @20 :Float32;
-    accelerationLimitDegS2 @21 :Float32;
-    jerkLimitDegS3 @22 :Float32;
-    feedbackLimited @23 :Bool;
-    motionLimited @24 :Bool;
-    torqueLimited @25 :Bool;
-    pathLimited @26 :Bool;
-    profileTransition @27 :Bool;
-    version @28 :Int32;
-    previewTime @29 :Float32;  # seconds past the action time the immediate target is read at
-    referenceLimited @30 :Bool;  # the served target trails the model's by the filter's bound
-    nearSteeringAngleDeg @31 :Float32;  # the model's target at the action time, before the filter
-    directionGuarded @32 :Bool;
-    driverAssistLimited @33 :Bool;
-    earlyRelease @34 :Bool;
-    directionFraction @35 :Float32;
-    driverAssistCap @36 :Float32;  # the envelope's effective cap this frame; 1.0 (no cap) when not pressed
-    envelopeRateDegS @37 :Float32;  # R4: the horizon-implied envelope's opened rate limit this frame, deg/s (floors at comfort)
-    envelopeAccelerationDegS2 @38 :Float32;  # and the opened acceleration limit, deg/s^2
-    envelopeJerkDegS3 @39 :Float32;  # and the opened jerk limit, deg/s^3
-    envelopePreviewTime @40 :Float32;  # seconds the confidence-free envelope scheduler's own admitted horizon reaches
-    holdTopupTorque @41 :Float32;  # FM3.14 hold top-up applied this frame, already summed into output; 0 when stock steers
-    holdTopupGrowing @42 :Bool;  # this frame's anti-windup gates admitted growth (the leak runs every active frame regardless)
-  }
-
   struct LateralAngleState {
     active @0 :Bool;
     steeringAngleDeg @1 :Float32;
@@ -1424,9 +1377,6 @@ struct ModelDataV2 {
     desiredAcceleration @1 :Float32;
     shouldStop @2 :Bool;
     desiredCurvatureTime @3 :Float32;  # seconds from the plan origin at which desiredCurvature is read
-    # desiredCurvature's own function evaluated further along the plan, pinned so [0] is desiredCurvature
-    desiredCurvaturePreview @4 :List(Float32);
-    desiredCurvaturePreviewTimes @5 :List(Float32);  # seconds from the plan origin, starting at desiredCurvatureTime
   }
 
   deprecated :group {
@@ -2599,50 +2549,6 @@ struct LateralTorqueParameters {
   calPerc @13 :Int8;
 }
 
-# Step 3-C: Rack Effort Shadow Observer (RESO) -- log-only hold-torque (H)
-# shadow learner, selfdrive/locationd/rack_effort_observer.py. Zero torque
-# authority: nothing reads these back into carControl. See
-# docs/RACK_EFFORT_OBSERVER.md and phase3/step3c_design/shadow_learner_design.md.
-struct RackEffortFrame @0xeef1eea48520927c {
-  version @0 :UInt8;
-  runId @1 :UInt32;          # monotonic per-cell-contiguous-run counter, see RackEffortAccumulator
-  vBandIdx @2 :Int8;
-  angleBandIdx @3 :Int8;
-  latAccelBinIdx @4 :Int8;
-  direction @5 :Int8;        # -1 right, 0 center, +1 left (0.05deg deadband)
-  hMeasured @6 :Float32;     # carOutput.actuatorsOutput.torque at this frame
-  hPrior @7 :Float32;        # torqued-linear-model physics prior, extract.py's h_prior_vec
-  freezeBits @8 :UInt8;      # bit0 driverOverride, bit1 saturated, bit2 paramsMoving,
-                             # bit3 rackFallback (audit-only, non-gating in v1)
-  steeringTorqueRaw @9 :Float32;  # lets offline re-derive under either the on-device or offline cut
-  calPerc @10 :UInt8;        # lateralTorqueParameters.calPerc at this frame
-  vEgo @11 :Float32;
-}
-
-struct RackEffortSnapshot @0xcd0459f3e4061c7b {
-  version @0 :UInt8;
-  gridVersion @1 :UInt8;   # bumps only if V_BANDS/ANGLE_BANDS/bin width change
-  defVersion @2 :UInt8;    # bumps only if the mask/hPrior definition itself changes
-  epoch @3 :Int64;         # logMonoTime this snapshot was taken
-  cells @4 :List(Cell);
-
-  struct Cell {
-    vBandIdx @0 :Int8;
-    angleBandIdx @1 :Int8;
-    latAccelBinIdx @2 :Int8;
-    direction @3 :Int8;
-    biasHat @4 :Float32;      # count-capped EMA of hResidual, learner_note.md section 3
-    nEvents @5 :UInt16;
-    routeSketch @6 :List(RouteCount);  # capped ROUTE_SKETCH_CAP, a documented lower-bound sketch
-    lastUpdateMonoTime @7 :Int64;
-
-    struct RouteCount {
-      routeIdHash @0 :UInt64;
-      nEvents @1 :UInt16;
-    }
-  }
-}
-
 struct LateralDelay {
   lateralDelay @0 :Float32;
   validBlocks @1 :Int32;
@@ -3542,9 +3448,6 @@ struct Event {
     gpsLocation @21 :GpsLocationData;
     vehicleParameters @61 :VehicleParameters;
     lateralTorqueParameters @94 :LateralTorqueParameters;
-    # Fork fields follow upstream chestnutGpuState @153; keep ordinals unique.
-    rackEffortFrame @158 :RackEffortFrame;        # step 3-C shadow observer, log-only, see RESO
-    rackEffortSnapshot @159 :RackEffortSnapshot;  # combo fork fields retain their existing ordinals
     lateralDelay @146 : LateralDelay;
     blatV2Shadow @156 :BlatV2Shadow;
     cameraOdometry @63 :CameraOdometry;
