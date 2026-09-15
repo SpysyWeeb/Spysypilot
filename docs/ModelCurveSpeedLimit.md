@@ -35,7 +35,9 @@ actual and desired lateral acceleration, saturated / torque-limited. Only while 
   net acceleration downhill); demand falls with v². Ends after `COAST_EXIT_S` below `T_COAST_EXIT` (0.75).
 - **brake** — pinned (`T_PIN` 0.95 or saturated) *and* understeering (`sign(desired)·error ≥ E_TRACK`
   0.30, so an exit overshoot never triggers it) for `BRAKE_ENTER_S` (0.3 s): decelerate toward the speed at which the
-  measured curvature fits the budget within `T_RESTORE` (1 s); back to coast below `E_TRACK_EXIT`. Never below
+  measured curvature fits the budget, priced no higher than the authority the steering delivers at its torque limit, within
+  `T_RESTORE` (1 s); back to coast once recovery (below `E_TRACK_EXIT`, or off the pin) persists `BRAKE_EXIT_S` (0.5 s),
+  while the driver's wheel, a lateral dropout or a disengagement end it at once. Never below
   `V_REACT_MIN` (3 m/s), where the measured curvature is noise.
 - **free** otherwise. Regimes are dwelled at every edge; a single sample never switches them.
 
@@ -227,3 +229,30 @@ brake-regime entries (pinned and understeering for 0.3 s), all at 4–12 m/s wit
 clipping its own output, not a pinned car. The stock definition (`saturated`, or torque at `T_PIN`) keeps the other
 99. The thresholds and the authority numbers above were measured with BLaTv3 steering; a drive on stock steering is
 the check.
+
+## 2026-09-15 — audit: the brake regime believes the steering, the floor is the Palisade's, the decision is logged
+
+An audit of 30f6c55d2 reproduced four defects; all four are fixed.
+
+- **The demonstrated hold defeated the corrective brake.** The brake regime priced its restore target with the same 2.5 m/s²
+  floor as the anticipation, so at 25 m/s a car pinned at full torque, holding 2.0 of the 2.4 m/s² it was asked for, sat
+  "inside the budget" and got only the coast (−0.30). Losing the line at the torque limit (`T_PIN`) is itself a measurement
+  of the authority there is: the regime now prices the budget no higher than `(TORQUE_BUDGET − friction) · share /
+  (torque − friction)`, the calibration's own ratio taken there (the steering's share, bank and offset removed). The same
+  case asks for the −2.0 floor. The controller's `saturated` flag alone does not qualify: it also covers a rate-limited
+  curvature request, where a frame of little lateral at moderate torque says nothing about the rack (a review of this
+  change turned a −0.3 coast into the −2.0 floor that way). The anticipation keeps the floor, which is where the field evidence for it was gathered.
+- **The floor was one car's measurement applied to every car.** It came from the owner's Palisade over seven routes; another
+  EPS saturates on its own curve. `AUTHORITY_HELD_CARS` limits it to `HYUNDAI_PALISADE`, and every other platform prices the
+  budget with the torque model alone. Nothing changes on the owner's car.
+- **One good sample ended the brake.** Entry needed 0.3 s of loss, exit a single sample: one 0.19 m/s² frame in a pinned 0.6
+  stretch relaxed −2.0 to −1.1 while the car stayed pinned. Recovery (tracking again, or off the pin) must now persist
+  `BRAKE_EXIT_S` (0.5 s), the coast exit's own dwell. The driver's hand on the wheel, a lateral dropout and a disengagement
+  still end the regime at once: the measurement that justified the braking is no longer the steering's own.
+- **The maneuver plant mirrored nothing.** Its steering saturated only positive curvature, so a right-hand curve reported
+  perfect tracking at zero torque. It now saturates by magnitude, and a mirrored maneuver asserts that a left-hand and a
+  right-hand curve are driven identically.
+
+The policy's decision is logged every model frame as `curvePolicyState`: `custom.capnp`'s `CustomReserved1` renamed, the
+schema's own convention for forks (combo's `SpysydriveStateSP` holds slot 0). It carries the regime, whether the candidate
+is active, its acceleration, the strictest node's limit and distance, the authority factor and the hold.

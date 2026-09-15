@@ -11,7 +11,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
-from openpilot.selfdrive.controls.lib.model_curve_speed import LateralState, ModelCurveSpeedLimiter
+from openpilot.selfdrive.controls.lib.model_curve_speed import CurveResult, LateralState, ModelCurveSpeedLimiter
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
 from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop
@@ -115,6 +115,7 @@ class LongitudinalPlanner:
     self.holding_prev = False
     self.anticipating_prev = False
     self.mpc_a_target = init_a
+    self.curve = CurveResult()
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -302,6 +303,7 @@ class LongitudinalPlanner:
       # a committed stop's own approach profile competes like any candidate; the column and the hold still own the landing
       candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False))
 
+    self.curve = curve
     if curve.a_target is not None and not reset_state:
       # a frame after engaging the arbitration would otherwise seed the MPC with a stale floored candidate
       candidates.append((curve.a_target, LongitudinalPlanSource.curve, False))
@@ -351,3 +353,15 @@ class LongitudinalPlanner:
     longitudinalPlan.allowThrottle = bool(self.allow_throttle)
 
     pm.send('longitudinalPlan', plan_send)
+
+    curve_send = messaging.new_message('curvePolicyState')
+    curve_send.valid = plan_send.valid
+    curve_state = curve_send.curvePolicyState
+    curve_state.regime = self.curve.regime
+    curve_state.active = self.curve.a_target is not None
+    curve_state.aTarget = float(self.curve.a_target) if self.curve.a_target is not None else 0.0
+    curve_state.vLimit = float(self.curve.v_limit)
+    curve_state.limitDistance = float(self.curve.distance)
+    curve_state.authorityFactor = float(self.curve.authority_factor)
+    curve_state.holding = bool(self.curve.holding)
+    pm.send('curvePolicyState', curve_send)

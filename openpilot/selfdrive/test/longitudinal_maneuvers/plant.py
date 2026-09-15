@@ -116,7 +116,7 @@ class Plant:
 
   def _plan_curve(self, model, controls_state, car_control):
     # path curvature along the model's own positions, and a steering state: the car holds the path up to the torque
-    # authority factor * (1 - friction); beyond it the torque pins at 1 and the tracking error is the shortfall
+    # authority factor * (1 - friction) either way round; beyond it the torque pins at 1 and the tracking error is the shortfall
     positions = np.asarray(model.position.x, dtype=float)
     speeds = np.asarray(model.velocity.x, dtype=float)
     model.position.y = [0.0] * len(positions)          # the policy measures arc length from x and y
@@ -126,15 +126,16 @@ class Plant:
     model.orientationRate = rate
     desired = self.speed ** 2 * self._curvature_at(self.distance)
     authority = self.torque_factor * (1.0 - self.torque_friction)
-    self.lateral_accel = min(desired, authority)
-    self.torque = min(desired / self.torque_factor + self.torque_friction, 1.0) if desired > 0.0 else 0.0
+    turn = np.sign(desired)
+    self.lateral_accel = turn * min(abs(desired), authority)
+    self.torque = turn * min(abs(desired) / self.torque_factor + self.torque_friction, 1.0)
     state = controls_state.lateralControlState.init('torqueState')
     state.active = True
     state.output = float(self.torque)
     state.error = float(desired - self.lateral_accel)
     state.actualLateralAccel = float(self.lateral_accel)
     state.desiredLateralAccel = float(desired)
-    state.saturated = bool(self.torque >= 1.0)
+    state.saturated = bool(abs(self.torque) >= 1.0)
     car_control.latActive = True
 
   def _plan_stop_line(self, model):
