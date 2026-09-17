@@ -34,6 +34,7 @@ jobs:
           - params-clear-pandad-keys-at-offroad
           - spinning-steering-wheel
           - torque-bar
+          - esp-active-debounce
           - c3x-chestnut
     runs-on: ubuntu-latest
     steps:
