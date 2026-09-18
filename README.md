@@ -4,7 +4,7 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see 
 
 ## Status
 
-**In progress.** The on-device BLaTv2 learning dashboard has been retired with
+**Done.** The on-device BLaTv2 learning dashboard has been retired with
 the on-device learner. Learning now runs on a PC from pulled routes; the car is
 responsible only for recording data and running a separately reviewed profile.
 
