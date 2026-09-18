@@ -207,10 +207,14 @@ class LongitudinalPlanner:
     # the landing law is the last word on every stop's final metres, whichever candidate is landing it. Intent: a
     # committed stop or hold, the MPC's own horizon ending in a stop (a stopped lead, the committed column), or the
     # model calling a stop in Experimental mode. The law latches through the landing once started; the planner's own
-    # releases (a corroborated lead departure, a hold release) end it at once, a climbing plan ends it by itself
+    # releases (a corroborated lead departure, a Force Stops release) end it at once, a climbing plan ends it by itself
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
-    launch = lead_departing or (self.holding_prev and not force_stop.holding)
+    # a hold ends in one of two ways and only one of them is a launch: creeping past RESUME_SPEED on a grade turns the
+    # hold back into a moving commitment with the latch alive, while a real release drops the commitment altogether.
+    # Force Stops tells them apart by its stop point -- it keeps one while forcing or holding, and reports none on a
+    # release -- so the hold edge alone used to tear the landing corridor down mid-stop (audit 2026-09-17)
+    launch = lead_departing or (self.holding_prev and not force_stop.holding and force_stop.stop_x is None)
     self.holding_prev = force_stop.holding
     output_a_target = self.stop_landing.update(output_a_target, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo)
     # the stop bit follows the landed target too: the MPC's hover around zero at walking pace must not flicker it

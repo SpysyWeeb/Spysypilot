@@ -43,9 +43,10 @@ DOWN_RATE = 2.0
 DOWN_DEADBAND = 1.0
 FOLLOW_CONFIRM_S = 1.0    # s, net evidence before the point follows the endpoint forward at any speed, or down above DOWN_SPEED:
                           # a count of frames with the endpoint past the deadband that only contrary frames drain, so a
-                          # stuttering drift (route 25) still counts. Route 0x59 t=609: a 1.5 s excursion of +8..+14 m during the braking onset extended the point
-                          # 4 m and nothing could bring it back above 3 m/s; route 0x58 t=548: the commit took the first strict
-                          # frames' endpoint, 5.8 m long, and the settled point sat 5 m short for 7 s while the follow-down waited
+                          # stuttering drift (route 25) still counts. Route 0x59 t=609: a 1.5 s excursion of +8..+14 m during the
+                          # braking onset extended the point 4 m and nothing could bring it back above 3 m/s; route 0x58 t=548: the
+                          # commit took the first strict frames' endpoint, 5.8 m long, and the settled point sat 5 m short for 7 s
+                          # while the follow-down waited
 QUALIFY_S = 0.3           # s of consistent strict, lead-free stop evidence on a world-fixed endpoint that commits before the
                           # classic window (was 1.0: the model calls a red light only 4-5 s out, every 0.1 s is 1.4 m at 14 m/s)
 QUALIFY_WORLD_TOLERANCE = 5.0
@@ -117,6 +118,14 @@ class ForceStops:
     self._extend_evidence = 0
     self._down_evidence = 0
 
+  def _end_commitment(self):
+    # a moving commitment ends without a full reset: the detector keeps decaying, but the profile's anchor and the release
+    # counter belong to the commitment and go with it -- a stale anchor started the next commitment's ramp from the old
+    # braking level instead of the car's own acceleration, and a stale count gave its green release a head start
+    self.forcing = False
+    self.profile_accel = None
+    self._open_frames = 0
+
   def _profile(self, v_ego, a_ego):
     # constant deceleration to the landing, entered from the car's current acceleration and jerk-limited from there
     if self.remaining <= PROFILE_MIN_DISTANCE or v_ego <= PROFILE_FADE_SPEED:
@@ -167,7 +176,9 @@ class ForceStops:
 
     if CS.gasPressed:
       self.override_timer = GAS_OVERRIDE_S
-      if self.holding:
+      if self.holding or self.forcing:
+        # the tap breaks a hold or a commitment; stopping again with stop evidence inside REARM_S re-enters the hold, as
+        # after a lead. Only the hold used to arm it, so a tap at speed left the car on the raw stop bit at the line
         self.rearm_remaining = REARM_S
       self.reset()
       return ForceStopsResult()
@@ -280,26 +291,33 @@ class ForceStops:
     if short and (v_ego < DOWN_SPEED or self._down_evidence >= confirm_frames):
       self.remaining = max(self.remaining - DOWN_RATE * self.dt, committed_length)
     if self.detect_filter.x < RELEASE_THRESHOLD and self.position_hold_remaining <= 0.0:
-      self.forcing = False
+      self._end_commitment()
       return ForceStopsResult()
     return self._result(v_ego, a_ego)
 
   def _hold(self, obs, v_ego, a_ego):
     if v_ego >= RESUME_SPEED:
-      # rolling again (creep or a grade): back to a moving commitment, the latch survives
+      # rolling again (creep or a grade): back to a moving commitment, the latch survives; its release and follow counts
+      # start over -- the hold's own open-path count and the evidence from before the stop are not this commitment's
       self.holding = False
       self.forcing = True
+      self._open_frames = 0
+      self._extend_evidence = 0
+      self._down_evidence = 0
       return self._result(v_ego, a_ego)
     if obs.relevant_lead:
       self.reset()
       self.rearm_remaining = REARM_S
       return ForceStopsResult()
     self.release_filter.update(1.0 if obs.release_open else 0.0)
-    self._open_frames = self._open_frames + 1 if path_open(obs.path_end) else 0
+    stop_evidence = obs.should_stop or obs.strict_stop
+    # the green: a long path for RELEASE_OPEN_FRAMES with no stop evidence, the same test a moving commitment's release
+    # applies. A long path the model still calls a stop on is not a green (the big model plans through an anticipated
+    # green, route 0x7e), and a hold let go on it could not re-form: the raw stop bit was back at the line
+    self._open_frames = self._open_frames + 1 if (path_open(obs.path_end) and not stop_evidence) else 0
     if self._open_frames >= RELEASE_OPEN_FRAMES:
       self.reset()
       return ForceStopsResult()
-    stop_evidence = obs.should_stop or obs.strict_stop
     self.clear_window.append(not stop_evidence and obs.terminal_moving and obs.corridor_clear)
     window_clear = (len(self.clear_window) == self.clear_window.maxlen
                     and sum(self.clear_window) >= CLEAR_WINDOW_FRACTION * self.clear_window.maxlen)

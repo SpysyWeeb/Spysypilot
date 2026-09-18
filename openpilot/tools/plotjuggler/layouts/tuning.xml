@@ -83,7 +83,7 @@
        <curve color="#dc267f" name="/carState/brakePressed"/>
       </plot>
      </DockArea>
-     <DockArea name="State [blue: off,pid,stop,start] Source [green: cruise,lead0,lead1,lead2,e2e]">
+     <DockArea name="State [blue: off,pid,stop,start] Source [green: cruise,lead0,lead1,lead2,e2e,stop]">
       <plot style="Lines" mode="TimeSeries">
        <range left="1.253620" top="5.125000" bottom="-0.125000" right="631.055759"/>
        <limitY/>

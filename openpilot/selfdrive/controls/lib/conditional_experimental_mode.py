@@ -64,9 +64,14 @@ class ConditionalExperimentalMode:
     self._post_stop_remaining = max(self._post_stop_remaining, suppress_for)
     self._clear_evidence()
 
-  def _update_model_evidence(self, model, car_state, radar_state, model_valid):
+  def _update_model_evidence(self, model, car_state, radar_state, model_valid, radar_valid):
     obs = observe_model_stop(model, car_state, radar_state) if model_valid else StopObservation()
+    # completeness is a property of the model frame alone: judging it on radar validity too certified a garbage
+    # trajectory as complete on every radar dropout and the MODEL_INVALID_RELEASE_S release never fired
     self._model_complete = obs.complete or not model_valid
+    # every tier below is read against the radar leads, so an invalid radar leaves the frame with no stop evidence
+    # to judge: it carries the empty observation, exactly as an invalid model does
+    obs = obs if radar_valid else StopObservation()
 
     # a relevant lead vetoes a new handoff and starts a grace; during it one strict frame may mint a revocable release
     # if both raw leads are gone and every model lead hypothesis is outside the stop corridor
@@ -126,7 +131,7 @@ class ConditionalExperimentalMode:
       self._lead_release_active = False
 
     if model_updated:
-      self._update_model_evidence(model, car_state, radar_state, model_valid and radar_valid)
+      self._update_model_evidence(model, car_state, radar_state, model_valid, radar_valid)
 
     if not self.experimental_mode and self._invalid_elapsed >= MODEL_INVALID_RELEASE_S:
       self._clear_evidence()

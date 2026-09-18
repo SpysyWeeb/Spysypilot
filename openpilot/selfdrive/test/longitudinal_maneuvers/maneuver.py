@@ -83,7 +83,10 @@ class Maneuver:
         print("Crashed!!!!")
         valid = False
 
-      if self.ensure_start and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
+      # Once ego is moving, a faster lead plus a brief non-positive command can be normal gap
+      # settling, not proof the planner failed to start (a86a44e4f); scope the check below 2 m/s
+      # so a genuine stall during the launch itself still fails the maneuver.
+      if self.ensure_start and log['speed'] < 2.0 and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
         if not_starting_t == 0.0:
           not_starting_t = plant.current_time
         elif plant.current_time - not_starting_t > 0.5:

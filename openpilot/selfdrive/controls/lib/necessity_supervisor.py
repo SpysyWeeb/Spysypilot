@@ -32,6 +32,9 @@ JERK_SCALE_RATE = 1.5
 ONSET_LEAD_DECEL = 0.4
 ONSET_PAD_MAX = 0.45
 STOPPED_LEAD_PAD_MAX = 0.75
+STOPPED_LEAD_FULL_DECEL = 1.2   # m/s^2 of required deceleration at which the near-stopped-lead pad reaches its ceiling; BLoTv2's
+                                # field value, kept verbatim. BLoTv3 only removed the `required_decel < ONSET_MAX_A_REQ` gate that
+                                # made this pad vanish above 1.5 instead of staying at its ceiling; the ramp still ends at 1.2
 ONSET_FULL_DECEL = 1.5
 ONSET_MAX_A_REQ = 1.5
 STAND_DOWN_SHORTFALL_MIN = 0.15
@@ -182,7 +185,7 @@ class NecessitySupervisor:
         if onset_lead_accel < -ONSET_LEAD_DECEL and not recovering:
           pad_target = ONSET_PAD_MAX * min(-onset_lead_accel / ONSET_FULL_DECEL, 1.0)
         if lead.speed < 2.0 and required_decel > 0.3 and not recovering:
-          pad_target = max(pad_target, STOPPED_LEAD_PAD_MAX * min(required_decel / 1.2, 1.0))
+          pad_target = max(pad_target, STOPPED_LEAD_PAD_MAX * min(required_decel / STOPPED_LEAD_FULL_DECEL, 1.0))
 
         self._responsive = scale_target < 1.0 or pad_target > 0.0
       else:

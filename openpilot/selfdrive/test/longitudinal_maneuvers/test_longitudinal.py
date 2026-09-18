@@ -199,6 +199,26 @@ class TestLongitudinalControl(OpenpilotTestCase):
         assert valid
 
 
+class TestEnsureStartLaunchScope(OpenpilotTestCase):
+  # a86a44e4f: ensure_start is a launch-phase check. Above the 2 m/s launch band a faster lead
+  # plus a momentarily flat command is ordinary cruise gap settling, not a stalled launch, and
+  # must not fail the maneuver the way an unscoped check would.
+  def test_ensure_start_ignores_gap_settling_once_above_the_launch_band(self):
+    maneuver = Maneuver(
+      'cruising at 5 m/s while a lead pulls away',
+      duration=5.0,
+      initial_speed=5.0,
+      lead_relevancy=True,
+      initial_distance_lead=30.0,
+      cruise_values=[5.0, 5.0],
+      speed_lead_values=[5.0, 8.0],
+      breakpoints=[0.0, 1.0],
+      ensure_start=True,
+    )
+    valid, _ = maneuver.evaluate()
+    assert valid
+
+
 class TestManeuverHarnessLiveness(OpenpilotTestCase):
   # the planner never sees sm.all_checks(); this checks the shim itself, since
   # that is the only place a scheduled radar/model validity drop is observable
@@ -260,7 +280,7 @@ def landing_excess(logs, lead=False, v_min=KISS_SPEED, v_max=LANDING_SPEED):
   # the most the commanded braking exceeded the landing law through the last metres (KISS_SPEED .. LANDING_SPEED, plan braking).
   # Below the kiss speed the corridor is the kiss plus the anti-creep press by design, and the aEgo checks judge that end.
   # Each row's plan was computed from the previous row's state (the plant logs after integrating), so the law is judged at
-  # that speed and gap; below 0.3 m/s the plant's own stop bit forces -0.5. With a lead, the braking that stopping
+  # that speed and gap; below 0.3 m/s the plant's own stop bit settles on min(plan, -0.12) (D24). With a lead, the braking that stopping
   # LEAD_LANDING_GAP behind it needs passes
   v, a, d_rel, v_lead = logs[:, 3], logs[:, 5], logs[:, 6], logs[:, 4]
   excess = 0.0

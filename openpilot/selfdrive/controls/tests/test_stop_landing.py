@@ -82,6 +82,18 @@ class TestLatchAndLaunch:
     assert law.update(-2.0, math.inf, NO_LEAD, True) == -2.0
     assert math.isclose(law.update(-2.0, -0.01, NO_LEAD, True), -2.0, rel_tol=1e-9, abs_tol=1e-9) or law.landing
 
+  def test_a_nonfinite_target_leaves_the_plan_alone_and_does_not_corrupt_the_launch_count(self):
+    # a solver-divergence frame (get_accel_from_plan has no isfinite guard) must not spend one of the LAUNCH_FRAMES
+    # a climbing plan needs to end a landing -- the bad frame is skipped outright, not counted as a non-positive one
+    law = landing(0.6, -0.3)
+    assert law.update(0.1, 0.6, NO_LEAD, True) == -landing_floor(0.6) and law.landing     # 1 of LAUNCH_FRAMES
+    assert law.update(0.2, 0.6, NO_LEAD, True) == -landing_floor(0.6) and law.landing     # 2 of LAUNCH_FRAMES
+    assert math.isnan(law.update(math.nan, 0.6, NO_LEAD, True)) and law.landing           # the bad frame passes through untouched
+    assert law.update(0.3, 0.6, NO_LEAD, True) == 0.3 and not law.landing                 # the 3rd positive frame still ends it
+    fresh = StopLanding()
+    assert math.isnan(fresh.update(math.nan, 1.5, NO_LEAD, True))
+    assert not fresh.landing                                                              # nor does a bad frame start one
+
   def test_a_hover_around_zero_is_held_at_the_floor_and_never_flickers(self):
     # route 28: the MPC column lets go of the brake by 0.2 m/s and alternates +-0.1 around zero
     law = landing(0.3, -0.2)
