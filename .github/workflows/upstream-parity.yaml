@@ -77,7 +77,7 @@ jobs:
           - better-boot-screen
           - better-green-lights
           - BLoTv3
-          - c3x-chestnut
+          - c3x-chestnut-v2
           - curve-speed-limit
           - custom-main-menu
           - detailed-stats-sidebar

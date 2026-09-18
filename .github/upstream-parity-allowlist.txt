@@ -21,8 +21,10 @@
 /openpilot/common/swaglog.py  # kept: custom-main-menu (consumer terminal_widget.py) - handler lives only on combo
 /openpilot/common/tests/test_params.py  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad
 /openpilot/selfdrive/assets/sounds/complete.wav  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/car/car_events.py  # esp-active-debounce
 /openpilot/selfdrive/car/card.py  # SOL
 /openpilot/selfdrive/car/cruise.py  # swapped-cruise-speed
+/openpilot/selfdrive/car/tests/test_car_events.py  # esp-active-debounce
 /openpilot/selfdrive/car/tests/test_cruise_speed.py  # swapped-cruise-speed
 /openpilot/selfdrive/controls/controlsd.py  # BLoTv3,SOL; kept: BLoTv3,SOL + combo-level
 /openpilot/selfdrive/controls/controlsd_ext.py  # SOL
@@ -44,6 +46,7 @@
 /openpilot/selfdrive/controls/tests/test_combo_contracts.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/tests/test_conditional_experimental_mode.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_controlsd.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_controlsd_long_state.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_force_stops.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_long_mpc.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_longcontrol.py  # smooth-stops
@@ -58,9 +61,9 @@
 /openpilot/selfdrive/controls/tests/test_smooth_stops.py  # smooth-stops
 /openpilot/selfdrive/controls/tests/test_stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_stop_landing.py  # BLoTv3
-/openpilot/selfdrive/modeld/SConscript  # c3x-chestnut
-/openpilot/selfdrive/modeld/compile_modeld.py  # c3x-chestnut
-/openpilot/selfdrive/modeld/modeld.py  # c3x-chestnut
+/openpilot/selfdrive/modeld/SConscript  # c3x-chestnut-v2
+/openpilot/selfdrive/modeld/helpers.py  # c3x-chestnut-v2
+/openpilot/selfdrive/modeld/modeld.py  # c3x-chestnut-v2
 /openpilot/selfdrive/modeld/tests/test_helpers.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/pandad/panda.cc  # SOL
 /openpilot/selfdrive/pandad/panda.h  # SOL
@@ -100,7 +103,7 @@
 /openpilot/spysypilot/aol/aol.py  # SOL
 /openpilot/spysypilot/aol/helpers.py  # SOL
 /openpilot/spysypilot/aol/state.py  # SOL
-/openpilot/system/hardware/chestnut/flash.py  # c3x-chestnut
+/openpilot/system/hardware/chestnut/flash.py  # c3x-chestnut-v2
 /openpilot/system/hardware/fan_controller.py  # fan-control
 /openpilot/system/hardware/tests/test_fan_controller.py  # fan-control
 /openpilot/system/loggerd/tests/test_platform_arch.py  # combo-only fork_only_file (no feature-branch owner)
@@ -110,5 +113,7 @@
 /openpilot/system/ui/widgets/html_render.py  # error-log-viewer,side-buttons
 /openpilot/system/updated/common.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/system/updated/updated.py  # auto-update
+/openpilot/tools/jotpluggler/layouts/tuning.json  # BLoTv3
+/openpilot/tools/plotjuggler/layouts/tuning.xml  # BLoTv3
 /tools/scripts/profiling/clpeak/no_print.patch  # combo-only fork_only_file (no feature-branch owner)
 /tools/sync/**  # combo-level
