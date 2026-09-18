@@ -52,8 +52,8 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 | D18 | Landing taper (field test 4) | the profile never plans to reach its landing sooner than `PROFILE_MIN_TIME` (1 s): the need is at most v/2 near the end and only eases, instead of blowing up as the landing closes (route 27 t=1052, −2.4 m/s² at 2.6 m/s) |
 | D19 | No speed cap once committed | `v_cruise_cap` is `NO_CAP` while forcing: the shaping cap's cruise floor used to land the car at −1.2 down to walking pace once the profile had faded (route 27 t=1053); the profile, the MPC column (which eases −0.9 → −0.4) and the hold own a committed stop |
 | D20 | e2e against a committed profile | while the profile is moving the car, the model's own request joins the arbitration only if it is more urgent by `E2E_STOP_MARGIN` (0.5 m/s²): its late ramp used to overtake the flat profile through `min()` and put the heavy braking back at the end (route 27 t=250) |
-| D21 | Green release and lane changes | a path longer than `RELEASE_OPEN_LENGTH` (30 m) for `RELEASE_OPEN_FRAMES` (3) releases a hold at once (saves ~0.2 s of the ~0.5 s the filtered release took; a one- or two-frame flash, route 27 t=263, does not); a lane change (`meta.laneChangeState`) drops shaping and a moving commitment so the stop re-qualifies on the new lane's endpoint (route 27 t=379: the through lane's line held a stop 15 m short of the left-turn lane's) **Audit note 2026-09-02:** `lane_changing()` looked the enum up under `LateralPlan` inside a try/except and so returned False on every frame — the lane-change re-qualification was inert from 2026-08-30 until the audit pass fixed the path (`log.LaneChangeState`) and added the test |
-| D22 | Landing law for every stop (2026-08-30, corridor form after route 28) | the planner bounds the arbitrated target through the last metres of any stop with a corridor: allowed braking `landing_bound(v)` = 0.70·v + 0.30 above 0.5 m/s (1.35 m/s² at 1.5 m/s, 0.65 at 0.5) and a floor `landing_floor(v)` of 0.40 at 1 m/s (fading to nothing by 1.5 m/s: a queue is not held to a stop's floor), **both tapering to one 0.15 m/s² kiss by 0.15 m/s** so the wheels stop under a whisper. The bound only removes surplus braking: a lead within `LEAD_FULL_AUTHORITY` (5 m) lifts it (the floor stays), the braking that stopping `LEAD_LANDING_GAP` (4 m) behind a lead needs always passes (`total_decel_requirement`), and a watchdog shifts the corridor toward more braking at 0.15 m/s² per second once the car has not slowed for 1 s while rolling. **The landing latches**: it starts on stop intent with the plan braking, lasts through the MPC's hover around zero and through standstill, and ends only on the planner's own release (the lead-departure pre-release, a hold release) or the raw plan positive for `LAUNCH_FRAMES` (3) in a row; the stop bit follows the landed target while landing. Why: routes 23–27 — lead-free landings exceeded the bound in 32–66 % of their last-3 m/s frames, up to 1.1 m/s² at walking pace; e2e, MPC-column and cruise-floor landings had no law. Route 28 (first form, a switched flat 0.40 creep floor): behind a stopped lead the MPC column lets go of the brake by 0.2 m/s and hovers ±0.15 around zero; the floor's on/off edge, fed back through the MPC's starting acceleration, made the target alternate −0.40 / +0.1 every frame for the last half second (8 of 14 stops), the positive frames dropped the stop bit into LongControl's raw PID branch (+0.13 in one frame, `SCC12 aReq`) and once released the hold clamp — the ESP's own accelerometer shows the brake–blip–clamp as a 1.3–1.55 m/s² swing in 0.2 s. This is the owner's original Smooth Stops design (sunnypilot `smooth-stops-dev` v01–v13, June 2026) rehomed in the planner, now with its "release-then-clamp" half — the June LongControl ramp eased toward a settle deceleration before standstill; here the planner's own corridor does it **2026-09-04:** a launch frame never starts a landing — the entry path ignored `launch`, so a lead-departure pre-release ended the latch and the entry re-armed it on alternate frames, toggling the stop bit and StopReq (route 0x4b t=299) |
+| D21 | Green release and lane changes | a path longer than `RELEASE_OPEN_LENGTH` (30 m) for `RELEASE_OPEN_FRAMES` (3) releases a hold at once (saves ~0.2 s of the ~0.5 s the filtered release took; a one- or two-frame flash, route 27 t=263, does not); a lane change (`meta.laneChangeState`) drops shaping and a moving commitment so the stop re-qualifies on the new lane's endpoint (route 27 t=379: the through lane's line held a stop 15 m short of the left-turn lane's) **Audit note 2026-09-02:** `lane_changing()` looked the enum up under `LateralPlan` inside a try/except and so returned False on every frame — the lane-change re-qualification was inert from 2026-08-30 until the audit pass fixed the path (`log.LaneChangeState`) and added the test **Cross-reference (2026-09-17, not a change to this row):** this release also requires no stop evidence on those frames — the guard D28 gave the moving commitment, which the hold's own counter never had (§3, `force_stops.py`) |
+| D22 | Landing law for every stop (2026-08-30, corridor form after route 28) | the planner bounds the arbitrated target through the last metres of any stop with a corridor: allowed braking `landing_bound(v)` = 0.70·v + 0.30 above 0.5 m/s (1.35 m/s² at 1.5 m/s, 0.65 at 0.5) and a floor `landing_floor(v)` of 0.40 at 1 m/s (fading to nothing by 1.5 m/s: a queue is not held to a stop's floor), **both tapering to one 0.15 m/s² kiss by 0.15 m/s** so the wheels stop under a whisper. The bound only removes surplus braking: a lead within `LEAD_FULL_AUTHORITY` (5 m) lifts it (the floor stays), the braking that stopping `LEAD_LANDING_GAP` (4 m) behind a lead needs always passes (`total_decel_requirement`), and a watchdog shifts the corridor toward more braking at 0.15 m/s² per second once the car has not slowed for 1 s while rolling. **The landing latches**: it starts on stop intent with the plan braking, lasts through the MPC's hover around zero and through standstill, and ends only on the planner's own release (the lead-departure pre-release, a hold release) or the raw plan positive for `LAUNCH_FRAMES` (3) in a row; the stop bit follows the landed target while landing. Why: routes 23–27 — lead-free landings exceeded the bound in 32–66 % of their last-3 m/s frames, up to 1.1 m/s² at walking pace; e2e, MPC-column and cruise-floor landings had no law. Route 28 (first form, a switched flat 0.40 creep floor): behind a stopped lead the MPC column lets go of the brake by 0.2 m/s and hovers ±0.15 around zero; the floor's on/off edge, fed back through the MPC's starting acceleration, made the target alternate −0.40 / +0.1 every frame for the last half second (8 of 14 stops), the positive frames dropped the stop bit into LongControl's raw PID branch (+0.13 in one frame, `SCC12 aReq`) and once released the hold clamp — the ESP's own accelerometer shows the brake–blip–clamp as a 1.3–1.55 m/s² swing in 0.2 s. This is the owner's original Smooth Stops design (sunnypilot `smooth-stops-dev` v01–v13, June 2026) rehomed in the planner, now with its "release-then-clamp" half — the June LongControl ramp eased toward a settle deceleration before standstill; here the planner's own corridor does it **2026-09-04:** a launch frame never starts a landing — the entry path ignored `launch`, so a lead-departure pre-release ended the latch and the entry re-armed it on alternate frames, toggling the stop bit and StopReq (route 0x4b t=299) **Cross-references (2026-09-17, not a change to this row):** the bound's elbow and the kiss speed quoted above are pre-D24 — D24 moved `KISS_SPEED` to 0.40 and the elbow to 0.9 m/s (`BOUND_BP`); and "a hold release" here means the commitment ending, not the hold bit dropping (§3, `stop_landing.py`) |
 | D23 | Release lift in the landing (2026-08-30, route 0x2a) | the ESP follows a braking increase with ~0.2 s but a release with ~0.7 s (request vs measured over 50 s of low-speed braking, gain 0.99 at steady state), so through every landing the car brakes harder than the plan asks — 0.6 m/s² typically, 1.0 at worst — and a two-frame spike (a radar return under the bumper adopted as the lead) became a second of −1.9. The landing closes the loop on the measured acceleration one way only: when the car decelerates more than the plan wants, the request is lifted by `RELEASE_GAIN` (0.5) of the surplus beyond `RELEASE_DEADBAND` (0.1), at most `RELEASE_LIFT_MAX` (1.0), never above the floor and never above the lead's own requirement (a plan already braking less than that is left alone). Only while rolling and braking. This is the owner's accelerometer idea ("it's about the g-force and how quickly it shifts") in the planner; the maneuver plant gained an asymmetric actuator (`actuator_lag=(0.2, 0.7)`) so landings can be judged through the car's real response |
 | D24 | The kiss arrives early (2026-08-31, route 0x2b) | the final blip is the body's pitch return, and it begins while the command is still flat at the kiss: the car carries −0.34…−0.42 of measured deceleration at 0.15 m/s because the ESP releases ~0.7 s behind the request. `KISS_SPEED` 0.15 → **0.40** (the corridor reaches the kiss one release-lag before the wheels stop; bound elbow moves to 0.9 m/s), the release lift's deadband 0.1 → 0.05, and a climbing plan ends a landing only while rolling (`v > KISS_SPEED`) — at standstill the MPC's hover can drift positive for a few frames and the launch authority there is the planner's own release. The maneuver plant grew the asymmetric actuator (`actuator_lag=(0.2, 0.7)`) and its stop-bit stand-in became the thin handoff's settle (`min(plan, −0.12)`) instead of a flat −0.5 that overwrote exactly the behavior under test. Cost: the last ~0.4 m/s is a slightly longer soft crawl |
 | D25 | Lead departure releases at 0.5 m/s (route 0x2b t=1540) | a lead that crept at 0.65 m/s and stopped again cycled the hold (StopReq off and back on under a standing car); the pre-release's instant threshold rises 0.3 → 0.5 m/s, slower creeps go through the existing 0.2 s confirmed path |
@@ -62,7 +62,7 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 | D28 | A green releases a moving commitment (route 0x2c t=1105/1135) | the moving-commitment release required the filtered detector below 0.30 AND the 4 s position hold — re-armed by every detected frame, including noisy path dips after the road had opened — so the committed profile kept braking 1.2–1.7 s past the green (6.3 and 4.2 m/s of speed lost post-green) until the owner's gas ended it. A path longer than `RELEASE_OPEN_LENGTH` with no stop evidence for `RELEASE_OPEN_FRAMES` (3) now releases a moving commitment at once — the same release the hold got in D21; the rolling green's remaining latency is CEM's own exit (~1.1 s) plus the cruise ramp (~0.8 s) |
 | D29 | Pursuit tail: after excess braking behind a lead that is already accelerating away, the supervisor keeps the low jerk cost for `PURSUIT_TAIL_S` 3 s after the recovery trigger disarms (route 0x3b t=392: the trigger dropped at the plan's zero crossing and the stiff cost slowed the pickup by ~0.26 m/s² early); ends when the lead stops pulling; following time untouched | field test pending |
 | D30 | The committed point follows the model on confirmed evidence (routes 0x58 t=548, 0x59 t=609, 2026-09-06) | both stops rested 3–4 m past the model's settled endpoint while the day's good stops rest ~1.7 m before it (committed point ~2.5 m before it). 0x58: the commit took the first strict frames' endpoint, 5.8 m long; the model settled within 1 s and sat 5–8 m short of the point for 7 s, but the follow-down waited for `DOWN_SPEED` and reclaimed 2 of 4.4 m. 0x59 (a yellow from 60 mph, −3.3 m/s²): the commit was fine (−1.6) but the forward follow chased a 1.5 s endpoint excursion of +8..+14 m during the braking onset and moved the point 4 m; the model then sat 5 m short for 5.3 s with the car above 3 m/s until the owner braked. `FOLLOW_CONFIRM_S` (1 s of frames past the deadband, drained only by contrary frames so route 25's stuttering drift still counts) now gates the forward follow at any speed and the follow-down above `DOWN_SPEED`; below it the follow-down stays immediate (route 38). Open-loop replay of the committed point relative to the settled endpoint: 0x58 +0.8 → −3.0, 0x59 +2.5 → −2.8, route 25 t=1547 −2.9 → −3.8 (0.9 m given back to the confirmation) | field test pending |
-| D31 | The published control state matches the acceleration it was computed with (2026-09-06) | `controlsd` assigned `actuators.longControlState` before running `LoC.update()`, so the state travelled with the previous control frame's decision. The Hyundai interface derives both the stop request (`stopping`) and the standstill-exit `JerkUpperLimit` from that field, so on every stop and every launch the car was told a state belonging to a different acceleration in the same SCC12 message. Published after the update now; the skew was one control frame, 10 ms against the 20 ms SCC14 period | field test pending |
+| D31 | The published control state matches the acceleration it was computed with (2026-09-06) | `controlsd` assigned `actuators.longControlState` before running `LoC.update()`, so the state travelled with the previous control frame's decision. The Hyundai interface derives both the stop request (`stopping`) and the standstill-exit `JerkUpperLimit` from that field, so on every stop and every launch the car was told a state belonging to a different acceleration in the same SCC12 message. Published after the update now; the skew was one control frame, 10 ms against the 20 ms SCC14 period | `openpilot/selfdrive/controls/tests/test_controlsd_long_state.py` (the published state on the engage, stop and release frames); field test pending |
 | D32 | The standstill-exit jerk limit, restored (2026-09-06) | SCC14 `JerkUpperLimit` gates when the car's cruise module commits to a standstill exit; it is a permission, not a command, and the realized acceleration ramp is ~140 ms whatever it says. The Palisade bracket (start-from-stop maneuver, one variable, command to wheel roll) was 1.0 = 1390 ms, 3.0 = 960, 5.0 = 790, 7.0 = 1200, and 5.0 was locked. It rode on the `starting` `LongCtrlState`; upstream deleted that state in July 2026 and the fork inherited the deletion through a sync merge, putting every launch back on the 3.0 arm with the 5.0 branch left as unreachable code. `acc_jerk_upper()` in the opendbc fork writes the old window out: the pid state while the wheels are still. The acceleration request is untouched, so nothing gains authority | field test pending |
 | D33 | A reset clears the whole launch state (2026-09-06) | the reset block cleared `anticipating_prev` but not `anticipating`, `launch_armed` or the `launch_open` filter, so re-engaging at a light with an open path read as a fresh green-light opening on the next frame and fired the launch edge that releases the landing law | field test pending |
 | D17 | Latched point follows a drifting endpoint | the forward extension (`EXTEND_RATE`/`EXTEND_DEADBAND`) needs only the model still calling the stop with latch confidence, not the latch window: route 25 t=1547 (field test 3) drifted 3 m beyond a frozen commitment and, with the 5 m setback, headed for a stop ~10 m short of the line |
@@ -73,7 +73,7 @@ their ordinals stay reserved. `LongitudinalPlanSource.stop` is added.
 
 ### longitudinal_lead.py
 `LeadObservation.from_radar(lead, service_valid)` (filtered speed/accel, finite, `dRel > 0`),
-`lead_present(radar_state)`, `relevant_lead(radar_state, v_ego, path_end_m)` (BLoTv2's distance/time
+`lead_present(radar_state)`, `relevant_lead(radar_state, v_ego, path_end)` (BLoTv2's distance/time
 relevance rule — the only filtered presence check in the tree), `anchor_model_lead(model_lead, radar_lead)`
 (BLoTv2's validity gate plus first-horizon acceleration/speed, computed once per frame; since the
 2026-08-29 field test the gate tolerates `MODEL_LEAD_STATIONARY_NOISE` = 0.2 m/s of below-zero sensor
@@ -84,12 +84,14 @@ closing-speed / `total_decel_requirement` / TTC physics. `total_decel_requiremen
 `max(closing_requirement, stop_requirement)`, not the sum BLoTv2's doc stated.
 
 ### necessity_supervisor.py
-`NecessitySupervisor.update(lead, v_ego, a_mpc_prev, predicted_lead_accel=None) -> LongitudinalPolicy(jerk_scale, t_follow_pad)`;
+`NecessitySupervisor.update(lead, v_ego, a_mpc, predicted_lead_accel=None) -> LongitudinalPolicy(jerk_scale, t_follow_pad)`;
 the follow time itself is assembled in `long_mpc.py` (`get_T_FOLLOW(personality) + t_follow_pad`).
 Triggers, thresholds, slews, the whiplash ratchet (kept as its own guard) and both pad ceilings
-(0.45 s onset braking, 0.75 s near-stopped lead) are BLoTv2's. Fixes: the pad ratio uses
-`min(required_decel, ONSET_MAX_A_REQ)` so pads saturate instead of vanishing above 1.5 m/s²; the
-low-speed hold latches only when the supervisor was necessity-braking in the frame before `v_ego`
+(0.45 s onset braking, 0.75 s near-stopped lead) are BLoTv2's. Fixes: both pads hold at their ceiling
+instead of vanishing — BLoTv2 gated them off above `ONSET_MAX_A_REQ`; the onset pad ramps to
+`ONSET_FULL_DECEL` (1.5 m/s² of lead braking) and the near-stopped-lead pad to `STOPPED_LEAD_FULL_DECEL`
+(1.2 m/s² of required deceleration, BLoTv2's field value), and `ONSET_MAX_A_REQ` is only the stand-down
+gate; the low-speed hold latches only when the supervisor was necessity-braking in the frame before `v_ego`
 crossed `MIN_SPEED`, and the emergency / lead-loss release paths clear it. A stand-down (low TTC, high need, a real
 shortfall against the MPC's own braking) is internal: it returns the stock policy for that frame and reaches no alert and
 no other module. `JERK_SCALE_MIN` is the single clip source for `long_mpc.set_weights`.
@@ -109,9 +111,12 @@ envelope carries the 4.0 m/s² launch request.
 
 ### stop_landing.py
 `StopLanding.update(a_target, v_ego, lead, stop_intent, launch=False, a_ego=None) -> a_target` keeps the arbitrated target inside the
-landing corridor (D22) while a landing is live: intent with a braking plan below `LANDING_SPEED` starts it; `launch` (the
-planner's lead-departure pre-release or a hold release), the raw plan positive for `LAUNCH_FRAMES` frames, or the speed
-reaching `LANDING_SPEED` end it. `landing_bound(v)` / `landing_floor(v)` are the corridor's edges; both are `KISS_DECEL` at and
+landing corridor (D22) while a landing is live: intent with a braking plan below `LANDING_SPEED` starts it, unless the
+planner is issuing a launch on that same frame. A landing ends on a launch — a corroborated lead departure or a Force Stops
+release, the frame the commitment is over (the result carries no stop point) — on the raw plan positive for `LAUNCH_FRAMES`
+frames, or on the speed reaching `LANDING_SPEED`. The hold bit also drops when the car rolls past `RESUME_SPEED` and the hold
+becomes a moving commitment again; that frame is not a launch and the landing survives it. A non-finite `a_target` passes
+through untouched, leaving the latch and the watchdog alone. `landing_bound(v)` / `landing_floor(v)` are the corridor's edges; both are `KISS_DECEL` at and
 below `KISS_SPEED`. The planner computes intent as: a committed stop or hold, the MPC's own horizon ending below
 `STOP_INTENT_SPEED` (a stopped lead, the committed column), or the model calling a stop in Experimental mode
 (`should_stop`/`strict_stop`), and sets the plan's stop bit from the landed target while landing. The lead is the planner's
@@ -129,20 +134,22 @@ turn budget (D2). `update()` order: reset state → lead and anchors → supervi
 `force_stops.update(...)` → `mpc.set_cur_state` → `mpc.update(...)` → `fcw = mpc.crash_cnt > 2 and not standstill` →
 candidates (MPC, cruise, e2e only in Experimental mode with a valid model, the committed profile) → the landing law →
 `output_should_stop = force_stops.holding or any(candidate stops) or (landing and should_stop(v, landed target))`.
+The landing law's launch edge is `lead_departing or (holding_prev and not holding and stop_x is None)`: only the end of the
+commitment counts, never a creep resume that turns a hold back into a moving commitment.
 
 ### stop_helpers.py
 `observe_model_stop(model, car_state, radar_state) -> StopObservation` — BLoTv2's tiers
 (`shouldStop`, strict trajectory, early high-speed, early hint; BLoTv2's missing-velocity fallback
 tier cannot occur with complete typed messages and is gone), straight-approach guard, relevant lead,
 committed turn, and per frame the launch-evidence and corridor verdicts. `stop_release_open(model)` — one definition, non-braking not
-required (combo's field-tested semantics). `leads_clear_of_stop_path(model, path_end_m)` — fails
+required (combo's field-tested semantics). `leads_clear_of_stop_path(model, path_end)` — fails
 closed unless **every** model-lead hypothesis with probability > 0 is outside the corridor, and on
 any shape/finite irregularity (route-29 negative sentinel); a flat path, which is what the model
 publishes at standstill, is a legal straight corridor, a reversing one is not. `MODEL_INVALID_RELEASE_S = 0.5` is
 defined here and shared. Typed capnp access; no `getattr` guards.
 
 ### force_stops.py
-`ForceStops.update(observation, car_state, experimental_mode, enabled, model_valid) -> (v_cruise_cap, stop_x, holding, a_target)`; the observation
+`ForceStops.update(obs, CS, experimental_mode, enabled, model_valid) -> (v_cruise_cap, stop_x, holding, a_target)`; the observation
 carries lead presence/relevance, launch evidence and the corridor verdict, and `enabled` is the planner's own active signal.
 States: `idle → shaping → committed → holding → (committed | idle)`.
 - Entry requires Experimental mode (**entry only** — a later mode exit never releases a hold), no
@@ -159,11 +166,17 @@ States: `idle → shaping → committed → holding → (committed | idle)`.
 - `holding`: entered at `CS.standstill` while committed, or within 10 s of a lead or a gas tap breaking
   a commitment or a hold when the car is stopped with stop evidence; `stop_x = 0` and `holding` forces
   `shouldStop`, so `controlsd`'s `cruiseControl.resume` cannot pulse. Leaves to `committed` (not
-  idle) at `v_ego ≥ 0.8 m/s`, so an unsigned wheel-speed flicker on a grade never drops the latch.
-- Release to idle: filtered launch evidence (`stop_release_open`, 0.30 s time constant); gas;
-  brake; a **relevant** lead; model invalid ≥ 0.5 s; the D10 fallback. Fast re-entry: after a
-  lead-triggered or gas-triggered release, if the car is at standstill again with stop evidence
-  present, `holding` is re-entered directly; the 10 s gas grace suppresses only the shaping cap.
+  idle) at `v_ego ≥ 0.8 m/s`, so an unsigned wheel-speed flicker on a grade never drops the latch. That resume is not a
+  release: the commitment carries on with the latch, and it starts its release and follow evidence over — the hold's own
+  counts and the evidence from before the stop are not this commitment's.
+- Release to idle: a green — a path longer than `RELEASE_OPEN_LENGTH` for `RELEASE_OPEN_FRAMES` frames with no stop
+  evidence, one test applied identically to a hold and to a moving commitment (a long path the model still calls a stop on
+  is not a green: the big model plans through an anticipated green); filtered launch evidence (`stop_release_open`, 0.30 s
+  time constant); gas; brake; a **relevant** lead; model invalid ≥ 0.5 s; the D10 fallback. Every release ends the
+  commitment whole — the approach profile's anchor and the open-path count go with it, so the next commitment enters its
+  ramp from the car's own acceleration (D13) and its green release from zero. Fast re-entry: a lead **or** a gas tap that
+  breaks a hold **or** a moving commitment arms `REARM_S`; inside that window, if the car is at standstill again with stop
+  evidence present, `holding` is re-entered directly; the 10 s gas grace suppresses only the shaping cap.
 - Non-goal: no committed-lifetime + delay-projection scheme to move `shouldStop` earlier — tried
   on route 29 in BLoTv2 (0.450 s landed inside the 0.5 s actuator delay and weakened a fail-closed
   release). Holding engages at standstill only.
@@ -173,7 +186,10 @@ Runs every control tick (watchdogs, pedals, timers at `DT_CTRL`); evidence acqui
 model frames. Entry filter, debounce, hysteresis, the 3 s recent-lead guard with corridor release,
 committed-turn veto and post-stop/override suppression as BLoTv2. Fix: on control ticks a raw lead
 may only revoke a *pending* recent-lead release, never wipe entry evidence; entry vetoes use
-`relevant_lead`. Exits: resumed motion, stable clear, pedals, invalid model. selfdrived hook:
+`relevant_lead`. Model and radar validity are separate inputs: completeness — and with it the `MODEL_INVALID_RELEASE_S`
+release — is judged on the model frame alone, while an invalid radar only empties that frame's stop evidence (every tier is
+read against the radar leads) and revokes a pending lead release. Exits: resumed motion, stable clear, pedals, invalid model
+(radar validity is not part of that judgment). selfdrived hook:
 `experimental_mode = openpilotLong and (manual or conditional)`; pedal (driver-override) suppression lives inside
 `ConditionalExperimentalMode.update()`, not in the hook.
 
@@ -211,7 +227,8 @@ the owner's field test before the next phase.
 
 ## 6. Verification map
 Envelope samples on the requested curve; comfort;
-arbitration incl. hold; no FCW from the removed stand-down path; pad saturation across 1.5 m/s²;
+arbitration incl. hold; no FCW from the removed stand-down path; each following-time pad at its ceiling past the
+stand-down gate (the onset pad's ramp ends at 1.5 m/s², the near-stopped-lead pad's at 1.2);
 low-speed hold at partial softening with emergency/lead-loss release still reaching 1.0; whiplash
 ratchet and hold in one scenario; row-0 policy; single `set_weights`; `a_prev` refill on the exact
 handoff frame; corridor rule with a 0.2-probability hypothesis; commit → hold → every release path;
@@ -219,6 +236,28 @@ flickering model stop signal while holding never drops `shouldStop`; grade flick
 `committed`; lead passes through then fast re-entry; gas tap re-stop; CEM entry with a far lead;
 model hang releases within 0.5 s; pedal latency; the selfdrived hook keeps manual mode under
 override. Landing law: bound shape, window, intent latch through a flicker, close-lead authority, gap physics never blocked, watchdog release, creep floor; the planner bounds whichever candidate lands (e2e at walking pace) and not above the window or beside a close lead; plant: a stopped lead, a red light and a hard close lead stop all land inside the law and still stop, and the model's late ramp (`e2e_landing_push`) is bounded with the law and not without.
+
+Added by the 2026-09-17 audit pass, by name (paths under `openpilot/selfdrive/controls/tests/` unless noted):
+- `test_controlsd_long_state.py::test_the_published_state_is_the_one_the_engage_frame_computed`,
+  `::test_the_published_state_enters_stopping_on_the_frame_that_asks_to_stop`,
+  `::test_the_published_state_leaves_stopping_on_the_frame_that_releases_the_stop` — D31: the published
+  `actuators.longControlState` is the state the same frame's `LoC.update()` computed, on the engage, stop and release frames.
+- `test_force_stops.py::TestMovingReleases::test_the_slow_release_ends_the_profile_with_the_commitment`,
+  `::TestFollowConfirmation::test_a_new_commitment_starts_with_no_follow_evidence`,
+  `::TestHold::test_a_gas_tap_that_breaks_a_moving_commitment_arms_the_hold_re_entry`,
+  `::TestHold::test_a_long_path_the_model_still_calls_a_stop_on_does_not_release_the_hold`,
+  `::TestHold::test_a_hold_that_rolls_again_counts_its_release_and_follow_evidence_over`.
+- `test_conditional_experimental_mode.py::TestExitAndHold::test_a_nonfinite_trajectory_still_releases_the_mode_while_the_radar_is_down`
+  and `::TestExitAndHold::test_a_radar_dropout_alone_is_not_an_invalid_model`.
+- `test_longitudinal_planner.py::TestHoldRelease::test_a_creep_resume_from_a_hold_is_not_a_launch_and_the_landing_survives`
+  and `::TestHoldRelease::test_a_hold_released_by_an_open_road_still_ends_the_landing`.
+- `test_stop_landing.py::TestLatchAndLaunch::test_a_nonfinite_target_leaves_the_plan_alone_and_does_not_corrupt_the_launch_count`.
+- `test_necessity_supervisor.py::TestPads::test_the_stopped_lead_pad_tops_out_below_the_stand_down_gate` — the
+  near-stopped-lead pad is at its ceiling between `STOPPED_LEAD_FULL_DECEL` and `ONSET_MAX_A_REQ`.
+- `openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py::TestEnsureStartLaunchScope::test_ensure_start_ignores_gap_settling_once_above_the_launch_band`
+  — the harness's `ensure_start` check is scoped below 2 m/s (ported from `combo`), so gap settling above the launch band
+  no longer fails a maneuver.
+- `test_long_mpc.py::TestUpdateProtocol::test_committed_stop_is_a_fixed_obstacle` now pins `STOP_DISTANCE` at 7.0 (D3).
 
 ## 8. Field test log
 
@@ -312,3 +351,18 @@ during the release. Fixes: radard's override gets a distance floor of 0.6 s of t
 **2026-08-31, route 0x2b follow-up (built on the owner's go):** D24 (early kiss + smaller lift deadband + rolling-only launch frames), D25 (departure release at 0.5 m/s), D26 (CEM search release). The lagged plant lands the stopped-lead maneuver with ≤ 0.25 m/s² still on the car at 0.15 m/s (was −0.37 in the field), and the CEM replay gates above.
 
 **2026-08-31, route 0x2c (combo a56860fc62).** Owner: one stop crept at the end (t=727: D27), a curve exit after a gas override was pulled back down mid-corner (t=885: the curve branch's post-override grace), and two rolling red→greens kept braking after the road opened (t=1105/1135: D28; the standstill-gated launch boost never arms on a rolling green — the cruise ramp is the recovery, ~0.8 s).
+
+**Open items (known, not fixed — recorded 2026-09-17).** Seen in the logs, no fix built; the branch should not read cleaner
+than it is.
+
+- **2026-09-15, route 0x7e — the big model plans through an anticipated green.** Force Stops' open-path release and CEM's
+  open-road evidence (`stop_release_open`) judge the plan by its end (terminal speed, raw path length), so a green the model
+  expects far down the road reads as an open road and the car gave up a red-light stop at 16 mph. No fix built: the
+  2026-09-17 stop-evidence guard on the open-path release narrows the hold case only.
+- **2026-09-02, route 0x3e t=577 — a queue inch trips the lead-departure pre-release.** A lead moving 0.61 m/s for ~1 s
+  cleared `LEAD_DEPARTURE_SPEED` (0.5), the pre-release launched the car and it had to stop again. Proposal: confirm a
+  departure by growing gap or sustained speed, not one instantaneous reading. Not built.
+- **2026-09-02, route 0x3a t=557 — an uphill crawl never arms the anti-creep press.** Crawling at 0.2 m/s for 4 s behind a
+  stopped lead, the D27 press never armed: the landing latch needs `a_target` strictly below −`KISS_DECEL` while the raw plan
+  sat at exactly −0.15. Proposal: press whenever `v ≤ KISS_SPEED` with stop intent. Not built.
+- D30 and D31 are **field test pending**, as their §2 rows say, and so is every fix in the 2026-09-17 audit pass.

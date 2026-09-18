@@ -8,9 +8,10 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, ForceStopsResult
+from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, RELEASE_OPEN_FRAMES, ForceStopsResult
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LongitudinalPolicy
-from openpilot.selfdrive.controls.lib.stop_landing import KISS_DECEL, LEAD_FULL_AUTHORITY, landing_bound
+from openpilot.selfdrive.controls.lib.stop_helpers import PATH_OPEN_LENGTH
+from openpilot.selfdrive.controls.lib.stop_landing import KISS_DECEL, LEAD_FULL_AUTHORITY, landing_bound, landing_floor
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (LAUNCH_MAX_ACCEL, LAUNCH_OPEN_LENGTH,
                                                                    A_CRUISE_MAX_LAUNCH, A_CRUISE_MAX_HIGH_SPEED, A_CRUISE_MAX_SPEED,
                                                                    A_CRUISE_MIN, CRUISE_COMFORT_KP, J_CRUISE_BP, J_CRUISE_VALS,
@@ -414,3 +415,63 @@ class TestGreenLaunch:
     self.run(planner, data, 1.0)
     self.set_path(data['modelV2'], LAUNCH_OPEN_LENGTH * 2.0, 1.0)
     assert max(a for a, _ in self.run(planner, data, 1.5)) <= 0.1
+
+
+class TestHoldRelease:
+  # the real ForceStops drives these: a commit, the hold at standstill, then the two ways a hold can end. The planner
+  # read every frame the hold bit dropped as a launch, including the creep/grade resume that keeps the commitment
+  # (force_stops "the latch survives"), and tore the landing corridor down mid-stop (audit 2026-09-17)
+  def step(self, planner, v_ego, path_end, terminal_speed, should_stop, e2e_accel):
+    # one model frame: a path ending path_end ahead at terminal_speed, with the model's own stop bit and request
+    n = ModelConstants.IDX_N
+    car_state = messaging.new_message('carState').carState
+    car_state.vEgo = v_ego
+    car_state.vCruise = 100.0
+    car_state.standstill = v_ego < 0.01
+    model = messaging.new_message('modelV2').modelV2
+    position = log.XYZTData.new_message()
+    position.x = [float(x) for x in np.linspace(0.0, path_end, n)]
+    model.position = position
+    velocity = log.XYZTData.new_message()
+    velocity.x = [float(v) for v in np.linspace(v_ego, terminal_speed, n)]
+    model.velocity = velocity
+    model.action.shouldStop = should_stop
+    model.action.desiredAcceleration = e2e_accel
+    controls_state = messaging.new_message('controlsState').controlsState
+    controls_state.longControlState = LongCtrlState.pid
+    selfdrive_state = messaging.new_message('selfdriveState').selfdriveState
+    selfdrive_state.enabled = True
+    selfdrive_state.experimentalMode = True
+    data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
+            'radarState': messaging.new_message('radarState').radarState, 'carControl': messaging.new_message('carControl').carControl,
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+    planner.update(_PlantSubMaster(data, 0))
+
+  def hold_at_a_committed_stop(self):
+    # a lead-free strict stop 10 m out at 3 m/s commits, then standstill turns the commitment into the hold
+    planner = LongitudinalPlanner(car.CarParams.new_message(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.5,
+                                                            steerRatio=CP.steerRatio, wheelbase=CP.wheelbase))
+    for i in range(10):
+      self.step(planner, 3.0, 10.0 - 3.0 * i * DT_MDL, 0.0, False, -1.0)
+    assert planner.force_stops.forcing
+    for _ in range(10):
+      self.step(planner, 0.0, 1.0, 0.0, True, 0.0)
+    assert planner.force_stops.holding
+    assert planner.stop_landing.landing
+    return planner
+
+  def test_a_creep_resume_from_a_hold_is_not_a_launch_and_the_landing_survives(self):
+    planner = self.hold_at_a_committed_stop()
+    self.step(planner, 1.0, 1.0, 0.0, True, 0.0)
+    assert planner.force_stops.forcing and not planner.force_stops.holding   # a moving commitment again, not a release
+    assert planner.stop_landing.landing
+    assert math.isclose(planner.output_a_target, -landing_floor(1.0), rel_tol=1e-6, abs_tol=1e-9)
+
+  def test_a_hold_released_by_an_open_road_still_ends_the_landing(self):
+    # the green: the model drops its stop bit and plans a long moving path, the commitment goes with the hold
+    planner = self.hold_at_a_committed_stop()
+    for _ in range(RELEASE_OPEN_FRAMES):
+      self.step(planner, 0.0, 2.0 * PATH_OPEN_LENGTH, 5.0, False, 0.5)
+    assert not planner.force_stops.holding and not planner.force_stops.forcing
+    assert not planner.stop_landing.landing
+    assert planner.output_a_target > 0.0

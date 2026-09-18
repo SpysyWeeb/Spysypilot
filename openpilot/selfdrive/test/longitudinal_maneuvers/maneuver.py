@@ -91,11 +91,9 @@ class Maneuver:
         print("Crashed!!!!")
         valid = False
 
-      # This assertion protects the launch phase. Once ego is moving, a faster
-      # lead plus a brief non-positive command can be normal gap settling and is
-      # not evidence that the planner failed to start.
-      # a launch that stalls anywhere in the launch band (below the assist's disarm speed) fails the maneuver; above it a
-      # coast is legitimate cruising, not a failed start
+      # Once ego is moving, a faster lead plus a brief non-positive command can be normal gap
+      # settling, not proof the planner failed to start (a86a44e4f); scope the check below 2 m/s
+      # so a genuine stall during the launch itself still fails the maneuver.
       if self.ensure_start and log['speed'] < 2.0 and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
         if not_starting_t == 0.0:
           not_starting_t = plant.current_time

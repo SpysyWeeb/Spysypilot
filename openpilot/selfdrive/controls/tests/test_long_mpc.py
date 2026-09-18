@@ -95,6 +95,10 @@ class TestUpdateProtocol:
     mpc.set_cur_state(5.0, 0.0)
     mpc.update(radar_state(), STANDARD, stop_x=10.0)
     assert mpc.source == LongitudinalPlanSource.stop
+    # D3: owner keeps STOP_DISTANCE at 7 m instead of stock's 6 m -- pin the literal
+    # so a revert to stock's 6.0 fails here instead of only in the tautological
+    # live-imported comparison below.
+    assert STOP_DISTANCE == 7.0
     assert np.allclose(mpc.params[:, 2], 10.0 + STOP_DISTANCE)
     assert np.min(mpc.a_solution) < -0.5
     assert mpc.v_solution[-1] < 1.0

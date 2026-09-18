@@ -158,6 +158,21 @@ class TestExitAndHold:
     assert run(cem, MODEL_INVALID_RELEASE_S - 0.1, broken)
     assert not run(cem, 0.2, broken)
 
+  def test_a_nonfinite_trajectory_still_releases_the_mode_while_the_radar_is_down(self):
+    # the release is the model's own: a radar dropout used to certify the garbage trajectory as complete and the
+    # 0.5 s window never opened, so a double fault held the mode until the 4 s intent hold ran out
+    cem = self.entered()
+    broken = stop_model()
+    broken.velocity.x = [float('nan')] * N
+    assert run(cem, MODEL_INVALID_RELEASE_S - 0.1, broken, radar_valid=False)
+    assert not run(cem, 0.2, broken, radar_valid=False)
+
+  def test_a_radar_dropout_alone_is_not_an_invalid_model(self):
+    # the radar only decides whether a frame carries stop evidence; a complete model frame keeps the mode past the
+    # invalid window, and the ordinary clear hysteresis is what ends the search
+    cem = self.entered()
+    assert run(cem, MODEL_INVALID_RELEASE_S + 0.3, stop_model(), radar_valid=False)
+
   def test_disable_resets_to_chill(self):
     cem = self.entered()
     assert not run(cem, 0.05, stop_model(), enabled=False)

@@ -7,7 +7,7 @@ from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR
                                                            ForceStops, GAS_OVERRIDE_S,
                                                            LATCH_SETBACK, MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK,
                                                            PROFILE_LANDING, PROFILE_MAX_DECEL, PROFILE_MIN_TIME, QUALIFY_S, REARM_S,
-                                                           RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH)
+                                                           RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH, RELEASE_THRESHOLD)
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, StopObservation
 
@@ -61,6 +61,14 @@ def commit_on_strict_evidence(v_ego, path_end, a_ego=0.0):
   return fs, result
 
 
+def commit_on_strict_evidence_on(fs, v_ego, path_end, a_ego=0.0):
+  for i in range(frames(QUALIFY_S) + 2):
+    result = fs.update(obs(path_end=path_end - v_ego * DT_MDL * i, should_stop=False, strict=True, braking=False),
+                       car_state_accel(v_ego, a_ego), True, True, True)
+  assert fs.forcing
+  return fs, result
+
+
 def holding(fs=None):
   fs, _ = committed(fs)
   result = run(fs, 0.1, obs(path_end=4.0), car_state(0.0, standstill=True))
@@ -70,8 +78,14 @@ def holding(fs=None):
 
 class TestEntry:
   def test_classic_latch_commits_the_model_endpoint_with_its_setback(self):
-    fs, result = committed()
-    assert abs((result.stop_x) - (20.0 - LATCH_SETBACK - 10.0 * DT_MDL * (frames(1.5) - frames(1.5) + 0))) <= 10.0 * DT_MDL * frames(1.5)
+    fs = ForceStops()
+    frames_committed = 0
+    for _ in range(frames(1.5)):
+      result = fs.update(obs(path_end=20.0), car_state(10.0), True, True, True)
+      frames_committed += fs.forcing
+    assert fs.forcing
+    # the point is the endpoint at the commit frame less the setback, and then travels with the odometer
+    assert math.isclose(result.stop_x, 20.0 - LATCH_SETBACK - 10.0 * DT_MDL * (frames_committed - 1), rel_tol=1e-6, abs_tol=1e-9)
 
   def test_widened_window_needs_braking_evidence(self):
     slow_brake = ForceStops()
@@ -150,6 +164,41 @@ class TestMovingReleases:
     assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is not None
     assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is None
 
+  def test_the_slow_release_ends_the_profile_with_the_commitment(self):
+    # a profile anchor that outlived its commitment started the next one's ramp from the old braking level
+    fs, result = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.2)
+    assert result.a_target is not None and result.a_target < -1.0
+    # the detector fades on a short, clear path (not a green: below RELEASE_OPEN_LENGTH), the position hold runs out
+    assert run(fs, 5.0, obs(path_end=25.0, should_stop=False, braking=False), car_state(5.0)).stop_x is None
+    assert not fs.forcing and fs.profile_accel is None
+    _, result = commit_on_strict_evidence_on(fs, 13.0, 60.0, a_ego=0.0)
+    assert result.a_target is not None
+    assert -PROFILE_JERK * DT_MDL * 3 - 1e-9 <= result.a_target <= 0.0   # entered from the car's own acceleration, not the old profile
+
+  def test_the_slow_release_ends_the_open_path_count_with_the_commitment(self):
+    # an open frame on the very frame the slow release fires used to survive into the next commitment's green count
+    fs, _ = committed()
+    short_clear = obs(path_end=25.0, should_stop=False, braking=False)
+    open_road = obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False, braking=False, moving=True)
+    while fs.position_hold_remaining > DT_MDL + 1e-9 or fs.detect_filter.x >= RELEASE_THRESHOLD:
+      fs.update(short_clear, car_state(5.0), True, True, True)
+      assert fs.forcing
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      fs.update(open_road, car_state(5.0), True, True, True)   # the slow release fires on an open frame, before a green count could
+      if not fs.forcing:
+        break
+    assert not fs.forcing
+    # the next stop latches on an open road the model brakes for (no stop bit, no strict tier: every frame is a green frame)
+    open_braking = obs(path_end=50.0, should_stop=False, braking=True, moving=True)
+    for _ in range(frames(1.5)):
+      fs.update(open_braking, car_state(17.0), True, True, True)
+      if fs.forcing:
+        break
+    assert fs.forcing                                                            # its green count starts at this frame ...
+    for _ in range(RELEASE_OPEN_FRAMES - 2):
+      assert run(fs, DT_MDL, open_braking, car_state(17.0)).stop_x is not None   # ... needs its own three frames ...
+    assert run(fs, DT_MDL, open_braking, car_state(17.0)).stop_x is None          # ... not the leftover ones
+
   def test_latched_point_follows_the_model_forward_after_the_confirmation_and_down_at_once_below_walking_pace(self):
     fs, _ = committed(path_end=20.0)
     before = fs.remaining
@@ -216,6 +265,19 @@ class TestFollowConfirmation:
     assert math.isclose(_follow(fs, 0.6, -6.0, 10.0), 0.0, abs_tol=1e-9)
     assert math.isclose(_follow(fs, 1.0, 0.0, 10.0), 0.0, abs_tol=1e-9)
 
+  def test_a_new_commitment_starts_with_no_follow_evidence(self):
+    # evidence gathered by one commitment, unconfirmed when it ended, must not confirm the next one's first excursion
+    fs, _ = commit_on_strict_evidence(10.0, 70.0)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 10.0), 0.0, abs_tol=1e-9)
+    assert math.isclose(_follow(fs, FOLLOW_CONFIRM_S - DT_MDL, 12.0, 10.0), 0.0, abs_tol=1e-9)   # one frame short of confirmed
+    fs.remaining = 20.0
+    # the slow release, with the endpoint still beyond the point (inside the deadband, so the count holds) and no green
+    run(fs, 5.0, obs(path_end=28.0, should_stop=False, braking=False), car_state(2.0))
+    assert not fs.forcing and fs._extend_evidence > 0
+    commit_on_strict_evidence_on(fs, 10.0, 70.0)
+    assert math.isclose(_follow(fs, 1.0, 12.0, 10.0), 0.0, abs_tol=1e-9)   # the confirmation starts over ...
+    assert _follow(fs, 1.5, 12.0, 10.0) > 0.0                                # ... and completes on this excursion's own evidence
+
 
 class TestHold:
   def test_a_hold_needs_a_commitment_or_a_recent_release(self):
@@ -258,6 +320,35 @@ class TestHold:
     fs, _ = holding()
     assert not run(fs, 0.2, obs(path_end=4.0), car_state(0.5, gas=True)).holding
     assert run(fs, 0.5, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_a_gas_tap_that_breaks_a_moving_commitment_arms_the_hold_re_entry(self):
+    # the contract: a lead or a gas tap breaking a commitment or a hold; only the hold used to arm it after a tap
+    fs, _ = committed()
+    assert run(fs, DT_MDL, obs(), car_state(10.0, gas=True)).stop_x is None and not fs.forcing
+    assert fs.rearm_remaining > 0.0
+    assert run(fs, 0.5, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_a_long_path_the_model_still_calls_a_stop_on_does_not_release_the_hold(self):
+    # the big model plans through an anticipated green (route 0x7e): a long path with stop evidence is not a green
+    fs, _ = holding()
+    long_path = RELEASE_OPEN_LENGTH + 20.0
+    for _ in range(RELEASE_OPEN_FRAMES + 2):
+      assert run(fs, DT_MDL, obs(path_end=long_path, should_stop=True), car_state(0.0, standstill=True)).holding
+    for _ in range(RELEASE_OPEN_FRAMES + 2):
+      assert run(fs, DT_MDL, obs(path_end=long_path, should_stop=False, strict=True), car_state(0.0, standstill=True)).holding
+    assert not run(fs, RELEASE_OPEN_FRAMES * DT_MDL, obs(path_end=long_path, should_stop=False), car_state(0.0, standstill=True)).holding
+
+  def test_a_hold_that_rolls_again_counts_its_release_and_follow_evidence_over(self):
+    fs, _ = holding()
+    fs._extend_evidence, fs._down_evidence = 5, 5
+    open_road = obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False, braking=False, moving=True)
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      assert run(fs, DT_MDL, open_road, car_state(0.0, standstill=True)).holding   # two open frames: not yet a green
+    result = run(fs, DT_MDL, obs(path_end=4.0), car_state(0.9, standstill=False))   # creep: a moving commitment again
+    assert not result.holding and fs.forcing and fs._extend_evidence == 0 and fs._down_evidence == 0
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      assert run(fs, DT_MDL, open_road, car_state(0.9)).stop_x is not None       # the moving release counts from zero ...
+    assert run(fs, DT_MDL, open_road, car_state(0.9)).stop_x is None              # ... and needs its own three frames
 
   def test_rollback_flicker_keeps_the_latch_and_creep_returns_to_a_commitment(self):
     fs, _ = holding()

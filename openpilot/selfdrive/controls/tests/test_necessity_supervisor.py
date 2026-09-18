@@ -5,7 +5,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.necessity_supervisor import (DebouncedTrigger, JERK_SCALE_MIN, JERK_SCALE_RATE, LEAD_DEPARTURE_CANCEL,
                                                                    LEAD_DEPARTURE_CONFIRM, LeadDeparturePreRelease, NecessitySupervisor,
-                                                                   ONSET_PAD_MAX, ONSET_RATE_DOWN, ONSET_RATE_UP, PURSUIT_TAIL_S, STOPPED_LEAD_PAD_MAX)
+                                                                   ONSET_MAX_A_REQ, ONSET_PAD_MAX, ONSET_RATE_DOWN, ONSET_RATE_UP, PURSUIT_TAIL_S,
+                                                                   STOPPED_LEAD_FULL_DECEL, STOPPED_LEAD_PAD_MAX)
 
 
 def frames(seconds):
@@ -114,6 +115,14 @@ class TestPads:
     assert math.isclose(policy.t_follow_pad, STOPPED_LEAD_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
     policy = run(NecessitySupervisor(), lead(v=10.0, d=20.0, a=-3.0), 15.0, -3.4, 2.0)
     assert math.isclose(policy.t_follow_pad, ONSET_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
+
+  def test_the_stopped_lead_pad_tops_out_below_the_stand_down_gate(self):
+    # the two 1.5s are different things: ONSET_MAX_A_REQ is the stand-down gate, this pad's ramp ends at BLoTv2's 1.2.
+    # 9 m/s toward a stopped lead 34 m out needs 1.35 m/s^2, inside that window, and the pad is already at its ceiling
+    # (audit 2026-09-17 F006: the docs said the ramp ran to 1.5, the field value it inherited is 1.2)
+    assert STOPPED_LEAD_FULL_DECEL < 1.35 < ONSET_MAX_A_REQ
+    pad = run(NecessitySupervisor(), lead(v=0.0, d=34.0), 9.0, -1.35, 2.0).t_follow_pad
+    assert math.isclose(pad, STOPPED_LEAD_PAD_MAX, rel_tol=1e-6, abs_tol=1e-9)
 
   def test_pads_respect_their_slew_rates(self):
     supervisor = NecessitySupervisor()

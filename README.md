@@ -42,6 +42,9 @@ the mode in `selfdrived`, everything else in the planner (stop commit, the hold 
 [curve policy](https://github.com/SpysyWeeb/Spysypilot/tree/curve-speed-limit) shapes cruise through curves. What each
 decision is, why, and what the field said: the BLoTv3 README and
 [`docs/BLoTv3.md`](https://github.com/SpysyWeeb/Spysypilot/blob/BLoTv3/docs/BLoTv3.md) (decisions, contracts, field log).
+2026-09-17: the branch's cleanliness audit fixes (five stop-layer defects — a stale profile anchor after the slow release, the
+hold's green release ignoring the model's stop call, a gas tap at speed arming no re-entry, a radar dropout hiding an invalid model
+from CEM, a creep resume read as a launch — plus tests and docs) merged; awaiting a drive.
 
 ## To-Do
 

@@ -23,7 +23,8 @@ from openpilot.selfdrive.controls.lib.longitudinal_lead import total_decel_requi
 #   does not rock -- route 28 (2026-08-30): a flat 0.40 floor held to the wheel stop, and its on/off edge against the
 #   MPC's hover made the target alternate -0.40 / +0.1 every frame for the last half second, a throttle blip and a clamp
 #   inside 0.2 s. The landing therefore latches: once started it lasts through the hover and through standstill, and ends
-#   only on a launch -- the lead-departure pre-release, a hold release, or the plan positive for LAUNCH_FRAMES in a row.
+#   only on a launch -- the lead-departure pre-release, a Force Stops release (the commitment over, not a hold rolling on
+#   into a moving commitment), or the plan positive for LAUNCH_FRAMES in a row.
 #
 # This is the owner's original Smooth Stops design (June 2026, sunnypilot smooth-stops-dev), rehomed in the planner:
 # the one place that knows the lead, the plan and the stop intent. LongControl's thin handoff keeps only the deferred
@@ -108,15 +109,21 @@ class StopLanding:
     """Bound the arbitrated acceleration target through a landing; returns the plan unchanged otherwise.
 
     lead is the planner's LeadObservation, stop_intent says the plan ends in a stop this frame, launch says the planner
-    itself is letting the car go (a lead-departure pre-release, a hold release), a_ego is the car's measured acceleration
-    (None: no release lift). A landing starts on intent with the plan braking more than the kiss below LANDING_SPEED, and
-    then lasts -- through the MPC's hover around zero and through standstill -- until a launch, the plan climbing above
+    itself is letting the car go (a lead-departure pre-release, a Force Stops release), a_ego is the car's measured acceleration
+    (None: no release lift). A landing starts on intent with the plan braking more than the kiss below LANDING_SPEED,
+    unless the planner is issuing a launch that same frame (d6db6bf5d: a launch frame never starts one), and then lasts
+    -- through the MPC's hover around zero and through standstill -- until a launch, the plan climbing above
     zero for LAUNCH_FRAMES in a row, or the speed leaving the window.
     """
     if not math.isfinite(v_ego) or v_ego >= LANDING_SPEED:
       self.reset()
       return a_target
     v_ego = max(v_ego, 0.0)
+    if not math.isfinite(a_target):
+      # a NaN target (an MPC solve diverging before its own reset lands) must not enter the corridor's clamps -- min/max
+      # return NaN regardless of the other side -- so it is passed through exactly as upstream's own NaN handling would,
+      # touching neither the latch nor the watchdog: a transient bad frame must not end or restart a landing
+      return a_target
     if not self.landing:
       # a landing starts on intent with the plan braking more than the kiss: a hover frame right after a launch is not a stop,
       # and a launch frame never starts one (route 0x4b t=299: the entry re-latched on every frame the pre-release ended it,
