@@ -2,8 +2,6 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-> ⚠️ In progress — awaiting field testing on a comma 3X.
-
 ## What it does
 
 Rotates the comma 3X onroad display's existing top-right steering-wheel icon with the car's measured steering angle.
