@@ -53,9 +53,9 @@ class LongControl:
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
-    # Smooth Stops: while the plan wants to stop but the car still rolls, the hold clamp waits and the pid branch lands
-    # the car; once holding, the release is debounced. The off edge takes the stock path: engaging into a stop at
-    # standstill must clamp at once, and there is no separate starting command that could blip on off -> pid.
+    # While the plan wants to stop but the car still rolls, the hold clamp waits and the pid branch lands the car;
+    # once holding, the release is debounced. The off edge takes the stock path: engaging into a stop at standstill
+    # must clamp at once.
     if active and self.long_control_state == LongCtrlState.pid:
       stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo)
     elif active and self.long_control_state == LongCtrlState.stopping:
@@ -71,7 +71,6 @@ class LongControl:
 
     if self.long_control_state == LongCtrlState.off:
       self.reset()
-      self.smooth_stop.reset()
       output_accel = 0.
 
     elif self.long_control_state == LongCtrlState.stopping:
@@ -81,18 +80,16 @@ class LongControl:
         # TODO: can we just go straight to stopAccel?
         output_accel -= 1.0 * DT_CTRL  # m/s^2/s while trying to stop
       self.reset()
-      self.smooth_stop.reset()
 
     else:  # LongCtrlState.pid
-      if active and should_stop:
+      if should_stop:
         # the landing: open-loop like the stopping state, so the PID stays reset
-        output_accel = self.smooth_stop.settle(a_target, CS.vEgo, self.last_output_accel)
+        output_accel = self.smooth_stop.settle(a_target, self.last_output_accel)
         self.reset()
       else:
         error = a_target - CS.aEgo
         output_accel = self.pid.update(error, speed=CS.vEgo,
                                        feedforward=a_target)
-        self.smooth_stop.reset()
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel
