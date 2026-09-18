@@ -2,8 +2,6 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-> ⚠️ In progress — awaiting field testing on a comma 3X.
-
 ## What it does
 
 The "TAKE CONTROL IMMEDIATELY / Electronic Stability Control Active" alert no longer fires when the ESC flags a brief ABS intervention over a bump, a pothole or a pavement joint. It only fires once the car has reported ESC activity for 0.5 s without interruption, which a real skid or ABS stop does within its first half second.
