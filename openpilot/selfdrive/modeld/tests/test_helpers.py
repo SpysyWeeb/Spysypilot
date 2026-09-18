@@ -24,3 +24,14 @@ class TestHelpers(unittest.TestCase):
           (device / "product").write_text(product)
           with patch.object(helpers, "USB_DEVICES_PATH", root):
             self.assertIs(helpers.chestnut_present(), expected)
+
+  def test_chestnut_compiled_rejects_lfs_pointer(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      root = Path(tmp)
+      pkl = root / "big_driving_tinygrad.pkl"
+      with patch.object(helpers, "MODELS_DIR", root):
+        self.assertFalse(helpers.chestnut_compiled())
+        pkl.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:76cc\nsize 776634338\n")
+        self.assertFalse(helpers.chestnut_compiled())
+        pkl.write_bytes(b"\0" * (2 << 20))
+        self.assertTrue(helpers.chestnut_compiled())
