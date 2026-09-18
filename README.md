@@ -56,7 +56,8 @@ road opening, like the hold — it used to brake 1–2 s past a rolling green.
   cliffs. `longitudinal_lead.py` is the one definition of a usable lead and anchors the model
   lead once per frame. `long_mpc.py` gets one `update()` call that resolves obstacles, sets the
   cost weights once, solves, and scores FCW against the trajectory it actually solved.
-- `radard.py`, `longcontrol.py` and `controlsd.py` are not edited. Stock opendbc limits apply on
+- `radard.py` and `longcontrol.py` are not edited; `controlsd.py` carries exactly one line, D31's
+  reordering (`actuators.longControlState` is read after `LoC.update()` computes it). Stock opendbc limits apply on
   this branch (2.0 m/s²); `combo`'s opendbc/panda lineage supplies the 4.0 m/s² envelope.
 - Design, owner decisions, module contracts, the hold state machine rules and the acceptance
   gates live in [`docs/BLoTv3.md`](docs/BLoTv3.md). Phases, each field-tested by the owner before
@@ -64,6 +65,16 @@ road opening, like the hold — it used to brake 1–2 s past a rolling green.
   (3) stop layer; (4) staged integration into `combo`.
 
 ## What changed
+
+**2026-09-17 — audit fixes.** A cleanliness audit of the branch found five logic defects in the stop layer, none of them covered by a test. All are fixed with a test each; nothing here is field-tested.
+
+- **Force Stops' slow release left the last commitment behind.** When the detector decayed below `RELEASE_THRESHOLD` with the position hold spent, the commitment ended without clearing the approach profile's anchor or the green-release frame count, so the next, unrelated commitment started its jerk-limited ramp from the old braking level instead of the car's own acceleration — a brake step on the first frame, which is not what D13 says the profile does. Every release now ends the commitment whole.
+- **The hold's green release ignored the model's own stop call.** D28 gave a moving commitment's fast release a no-stop-evidence guard and called it "the same release the hold got in D21"; the hold's counter never had it. A frame with a path longer than `RELEASE_OPEN_LENGTH` and `shouldStop` still set — the big model planning through an anticipated green, route 0x7e — dropped a hold in three frames, and the hold could not re-form. The two releases are now literally the same test.
+- **A gas tap at speed armed nothing.** Only a tap that broke a *hold* armed the `REARM_S` re-entry window; a tap that broke a moving commitment did not, so reaching the line inside those 10 s formed no hold and the car sat on the raw stop bit until the gas grace ran out. A tap now arms it either way, as a lead does.
+- **A radar dropout hid an invalid model from CEM.** Completeness was judged on model *and* radar validity, so a radar dropout certified a garbage trajectory as complete and the `MODEL_INVALID_RELEASE_S` release never opened (the mode still left through the clear hysteresis, ~5 s instead of ~0.5 s). The two are separate inputs now: completeness is the model frame's alone, an invalid radar only empties that frame's stop evidence and revokes a pending lead release.
+- **A creep resume read as a launch.** A creep or a grade rolling the car past `RESUME_SPEED` turns a hold back into a moving commitment with the latch alive; the planner derived its landing-corridor `launch` from the hold bit alone and tore the corridor down mid-stop for a frame or two. A launch is now a corroborated lead departure or a real Force Stops release — the frame where the commitment itself ends, which is the frame that carries no stop point.
+
+Hygiene in the same pass: a non-finite plan target passes the landing corridor untouched instead of poisoning its clamps; the near-stopped-lead pad's divisor is now the named `STOPPED_LEAD_FULL_DECEL` (1.2 m/s², BLoTv2's field value — the docs claimed 1.5, which is only the stand-down gate); a hold that rolls again starts its release and follow evidence over; new tests for D31's publish order, D3's 7 m `STOP_DISTANCE` and the maneuver harness's launch-band-scoped `ensure_start` (ported from `combo`); this README and `docs/BLoTv3.md` corrected against the code; the plan-source legend in both tuning layouts gained `stop`. Field test pending.
 
 **2026-09-06 — D31, the published control state.** `controlsd` read `self.LoC.long_control_state` into the CarControl before `LoC.update()` computed it, so the state was always one control frame behind the acceleration published beside it. The Hyundai interface derives the stop request and the standstill-exit jerk limit from that field. Now published after the update. Expect a process-replay diff wherever a stop or a launch crosses a frame boundary. Field test pending.
 
@@ -92,14 +103,16 @@ road opening, like the hold — it used to brake 1–2 s past a rolling green.
   `anchor_model_lead`, which validates the model's lead forecast once per frame and anchors it to
   radar (tolerating the few cm/s of below-zero noise a stopped lead reads on both sensors — the
   strict gate dropped the anchor mid-launch in the 2026-08-29 field test; reversing still fails closed). `necessity_supervisor.py`: BLoTv2's supervisor with two fixes — the following-time pads
+  hold at their ceiling instead of vanishing once the required deceleration passes the stand-down gate
+  (the onset pad ramps to 1.5 m/s² of lead braking, the near-stopped-lead pad to 1.2 m/s² of required
+  deceleration), and the low-speed hold keeps whatever softening was built while necessity-braking (a
+  stand-down or lead loss still releases it); its stand-down never reaches an alert.
   `force_stops.py` also owns the committed approach profile (field test 2, 2026-08-29): the constant
   deceleration that lands short of the committed point, entered from the car's own deceleration at 2 m/s³,
   capped at 3 m/s², fading out from 3 m/s to gone at 1.5 m/s so the MPC column and the hold land the car — the MPC's quadratic
   stop column cannot be front-loaded on its own. A commitment forms after 0.3 s of strict world-fixed
   evidence and only a tracked lead breaks it; the MPC re-anchors its change cost on every obstacle handoff.
-  saturate instead of vanishing above 1.5 m/s² of required deceleration, and the low-speed hold
-  keeps whatever softening was built while necessity-braking (a stand-down or lead loss still
-  releases it); its stand-down never reaches an alert. `long_mpc.py`: one `update()` call takes
+  `long_mpc.py`: one `update()` call takes
   the anchors, the supervisor's jerk scale and pad, and a committed stop point; it sets the cost
   weights exactly once, applies the policy only while lead0 owns the solve, re-anchors the
   change cost on a handoff, and has no third-lead machinery; `STOP_DISTANCE` is 7 m and the
