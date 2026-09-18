@@ -22,14 +22,13 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 
 # stationary qualification parameters
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
-LOW_SPEED_LEAD_MIN_CNT = 20  # ~1s at 20Hz: the unconfirmed low-speed override only trusts tracks that were
-LOW_SPEED_LEAD_MIN_TIME = 0.6  # s of travel: an unconfirmed track closer than this cannot become the lead. This radar's ground
-                               # returns live there -- a plate the car drove over (route 0x2a t=498, 2026-08-30) was tracked
-                               # from 3 m to under the bumper and became the lead at 1.1 m the moment it was old enough,
-                               # for a -2.6 m/s^2 landing -- and nothing useful can be done about a real object that close
-                             # tracked in from a distance. A real stopped lead is tracked for seconds on
-                             # approach; clutter and crossing traffic pop into existence at close range
-                             # (seen max-braking a stop for a 0.8s ghost 3.6m ahead with modelProb 0.00)
+# The unconfirmed low speed override only trusts a track it watched arrive: clutter and crossing traffic
+# appear at close range, while a real stopped lead is tracked for seconds on approach. A track's age
+# restarts whenever the radar drops it for a cycle, so the age gate filters short lived returns; a real
+# object the radar flickers on has to age in again. A return closer than 0.6s of travel at the current
+# speed is ground under the bumper, not a lead.
+LOW_SPEED_LEAD_MIN_CNT = 20  # ~1 s at 20 Hz
+LOW_SPEED_LEAD_MIN_TIME = 0.6  # s of travel
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
@@ -106,8 +105,6 @@ class Track:
   def potential_low_speed_lead(self, v_ego: float):
     # stop for stuff in front of you and low speed, even without model confirmation
     # Radar points closer than 0.75, are almost always glitches on toyota radars
-    # Require track age: vision-confirmed leads bypass this path entirely, so radar alone
-    # only gets to declare a close lead for objects it tracked arriving (see LOW_SPEED_LEAD_MIN_CNT)
     return (abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (self.cnt >= LOW_SPEED_LEAD_MIN_CNT)
             and (max(0.75, LOW_SPEED_LEAD_MIN_TIME * v_ego) < self.dRel < 25))
 
@@ -181,6 +178,7 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
       closest_track = min(low_speed_tracks, key=lambda c: c.dRel)
 
       # Only choose new track if it is actually closer than the previous one
+      # this holds whether the current lead is vision confirmed or not
       if (not lead_dict['present']) or (closest_track.dRel < lead_dict['dRel']):
         lead_dict = closest_track.get_RadarState()
 

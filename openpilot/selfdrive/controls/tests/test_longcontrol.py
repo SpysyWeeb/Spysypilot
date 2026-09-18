@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+from opendbc.car.structs import car
 
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState, long_control_state_trans
@@ -44,37 +44,34 @@ class TestLongControlStateTransition(OpenpilotTestCase):
     assert next_state == LongCtrlState.pid
 
 
-def long_control():
-  tuning = SimpleNamespace(kpBP=[0.0], kpV=[1.0], kiBP=[0.0], kiV=[0.0])
-  return LongControl(SimpleNamespace(longitudinalTuning=tuning, stopAccel=-2.0))
+def long_control(ki=0.0):
+  CP = car.CarParams.new_message()
+  CP.longitudinalTuning.kiBP = [0.0]
+  CP.longitudinalTuning.kiV = [ki]
+  CP.stopAccel = -2.0
+  return LongControl(CP)
 
 
-def car_state():
-  return SimpleNamespace(
-    vEgo=0.0,
-    aEgo=0.0,
-    brakePressed=False,
-    standstill=True,
-    cruiseState=SimpleNamespace(standstill=False),
-  )
+def car_state(v_ego=0.0, a_ego=0.0):
+  CS = car.CarState.new_message()
+  CS.vEgo = v_ego
+  CS.aEgo = a_ego
+  return CS
 
 
 class TestSmoothStopHandoff(OpenpilotTestCase):
-  def test_the_clamp_waits_for_the_car_to_stop_and_the_landing_owns_the_meantime(self):
+
+  def test_clamp_waits_for_stop(self):
     control = long_control()
     control.long_control_state = LongCtrlState.pid
     control.last_output_accel = -0.4
-    rolling = car_state()
-    rolling.vEgo = 0.25
-    rolling.standstill = False
-    output = control.update(True, rolling, -0.05, True, (-3.5, 2.0))
-    assert control.long_control_state == LongCtrlState.pid               # still rolling: no clamp
-    assert output <= -STOP_KISS_DECEL                                     # the landing keeps the kiss on
-    stopped = car_state()
-    control.update(True, stopped, -0.05, True, (-3.5, 2.0))
-    assert control.long_control_state == LongCtrlState.stopping          # stopped: the clamp arms
+    output = control.update(True, car_state(v_ego=0.25), -0.05, True, (-3.5, 2.0))
+    assert control.long_control_state == LongCtrlState.pid          # still rolling: no clamp
+    assert output <= -STOP_KISS_DECEL                               # the landing keeps the kiss on
+    control.update(True, car_state(), -0.05, True, (-3.5, 2.0))
+    assert control.long_control_state == LongCtrlState.stopping     # stopped: the clamp arms
 
-  def test_plan_chatter_shorter_than_the_debounce_does_not_release_the_hold(self):
+  def test_chatter_keeps_hold(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.last_output_accel = -0.75
@@ -85,25 +82,25 @@ class TestSmoothStopHandoff(OpenpilotTestCase):
       states.append(control.long_control_state)
     assert set(states) == {LongCtrlState.stopping}
 
-  def test_a_launch_releases_the_hold_on_its_first_frame(self):
+  def test_launch_release(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.smooth_stop.arm_hold()
     control.update(True, car_state(), 0.2, True, (-3.5, 2.0))
-    control.update(True, car_state(), 0.2, False, (-3.5, 2.0))            # the stop bit drops with the plan asking to move
+    control.update(True, car_state(), 0.2, False, (-3.5, 2.0))      # the stop bit drops with the plan asking to move
     assert control.long_control_state == LongCtrlState.pid
 
-  def test_a_stop_bit_flicker_with_the_plan_still_braking_keeps_the_hold(self):
+  def test_flicker_keeps_hold(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.smooth_stop.arm_hold()
-    for _ in range(5):                                                     # one planner frame of dropped bit at the kiss
+    for _ in range(5):                                              # a few frames of dropped bit, plan at the kiss
       control.update(True, car_state(), -0.15, False, (-3.5, 2.0))
       assert control.long_control_state == LongCtrlState.stopping
     control.update(True, car_state(), -0.15, True, (-3.5, 2.0))
     assert control.long_control_state == LongCtrlState.stopping
 
-  def test_a_plan_sitting_at_zero_releases_after_the_backstop(self):
+  def test_backstop_release(self):
     control = long_control()
     control.long_control_state = LongCtrlState.stopping
     control.smooth_stop.arm_hold()
@@ -111,4 +108,26 @@ class TestSmoothStopHandoff(OpenpilotTestCase):
       control.update(True, car_state(), 0.0, False, (-3.5, 2.0))
       assert control.long_control_state == LongCtrlState.stopping
     control.update(True, car_state(), 0.0, False, (-3.5, 2.0))
+    assert control.long_control_state == LongCtrlState.pid
+
+  def test_arm_resets_backstop(self):
+    control = long_control()
+    control.long_control_state = LongCtrlState.stopping
+    control.smooth_stop.arm_hold()
+    for _ in range(HOLD_RELEASE_FRAMES):
+      control.update(True, car_state(), 0.0, False, (-3.5, 2.0))
+    assert control.long_control_state == LongCtrlState.pid
+    control.update(True, car_state(), -0.05, True, (-3.5, 2.0))     # back into the hold
+    assert control.long_control_state == LongCtrlState.stopping
+    control.update(True, car_state(), 0.0, False, (-3.5, 2.0))      # the debounce starts over
+    assert control.long_control_state == LongCtrlState.stopping
+
+  def test_landing_resets_pid(self):
+    control = long_control(ki=0.5)
+    control.long_control_state = LongCtrlState.pid
+    for _ in range(10):
+      control.update(True, car_state(v_ego=1.0), 1.0, False, (-3.5, 2.0))
+    assert control.pid.i != 0.0
+    control.update(True, car_state(v_ego=0.25), -0.05, True, (-3.5, 2.0))
+    assert control.pid.i == 0.0
     assert control.long_control_state == LongCtrlState.pid
