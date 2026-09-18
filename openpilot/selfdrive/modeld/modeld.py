@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 from collections.abc import Callable
+from typing import NamedTuple
+import base64
 import ctypes
 from functools import cached_property
 import os
 os.environ['GMMU'] = '0' # for chestnut fast loading, noop for qcom
+from tinygrad.device import Buffer, Device
+from tinygrad.dtype import DType, dtypes
 from tinygrad.tensor import Tensor
-from tinygrad.device import Device
-import usb1
-import struct
+from tinygrad.helpers import round_up
+from tinygrad.uop.ops import UOp
+import math
+import pickle
 import threading
 import time
 import numpy as np
@@ -25,21 +30,18 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+from openpilot.system.hardware.chestnut.flash import link_up
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
-from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, WARP_INPUTS, POLICY_INPUTS
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
-from openpilot.common.file_chunker import open_file_chunked
-from openpilot.common.hardware.usb import CHESTNUT_USB_IDS
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.timing import LAT_SMOOTH_SECONDS
-from openpilot.selfdrive.modeld.helpers import chestnut_present, chestnut_compiled, modeld_pkl_path, get_tg_input_devices, load_oob
+from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob
 
-PROCESS_NAME = "openpilot.selfdrive.modeld.modeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
+LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
 BIG_MODEL_TIMEOUT = 60
@@ -70,49 +72,17 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
 
   return log.ModelDataV2.Action(desiredCurvature=float(desired_curvature),
                                 desiredAcceleration=float(desired_accel),
-                                shouldStop=bool(stop),
-                                desiredCurvatureTime=float(lat_action_t))
+                                shouldStop=bool(stop))
 
 
-class ChestnutState:
-  # only modeld can access chestnut
+class ChestnutGpuState:
+  # GPU metrics require modeld's GPU context
   def __init__(self, pm: PubMaster, big: bool):
     self.pm = pm
     self.big = big
     self.valid = True
     self.sends = 0
     self.metrics = {}
-    self._asm_usb = None
-
-  def _close_asm_usb(self) -> None:
-    if self._asm_usb is not None:
-      self._asm_usb.close()
-      self._asm_usb = None
-
-  def _open_asm_usb(self):
-    context = usb1.USBContext()
-    for vendor_id, product_id in CHESTNUT_USB_IDS:
-      if (handle := context.openByVendorIDAndProductID(vendor_id, product_id, skip_on_error=True)) is not None:
-        return handle
-    context.close()
-
-  def _read_ina(self) -> tuple[int, int, bool]:
-    if "AMD" in Device._opened_devices and self._asm_usb is None:
-      try:
-        raw = Device["AMD"].iface.pci_dev.usb.usb.control_read(0xC0, 5)
-        return struct.unpack('<Hh?', bytes(raw))
-      except Exception:
-        pass
-    if self._asm_usb is None:
-      self._asm_usb = self._open_asm_usb()
-    if self._asm_usb is None:
-      raise usb1.USBErrorNoDevice
-    try:
-      raw = self._asm_usb.controlRead(0xC0, 0xC0, 0, 0, 5, timeout=100)
-    except usb1.USBError:
-      self._close_asm_usb()
-      raise
-    return struct.unpack('<Hh?', bytes(raw))
 
   @cached_property
   def power_limit(self) -> int:
@@ -120,8 +90,8 @@ class ChestnutState:
     return smu._send_msg(smu.smu_mod.PPSMC_MSG_GetPptLimit, 0, read_back_arg=True, timeout=100)
 
   def send(self) -> None:
-    msg = messaging.new_message('chestnutState')
-    state = msg.chestnutState
+    msg = messaging.new_message('chestnutGpuState')
+    state = msg.chestnutGpuState
     self.sends += 1
     if self.big and "AMD" in Device._opened_devices and self.sends % 100 == 1:
       try:
@@ -147,21 +117,8 @@ class ChestnutState:
       for k, v in self.metrics.items():
         setattr(state, k, v)
 
-    asm_valid = False
-    try:
-      # ASM runs on USB-C power, these still read without a gpu
-      state.supplyVoltage, state.supplyCurrent, state.supplyFault = self._read_ina()
-      asm_valid = True
-    except Exception:
-      pass
-    if "AMD" in Device._opened_devices:
-      try:
-        state.pcieLtssm = Device["AMD"].iface.pci_dev.usb.read(0xB450, 1)[0]
-      except Exception:
-        pass
-
-    msg.valid = asm_valid and (not self.big or self.valid)
-    self.pm.send('chestnutState', msg)
+    msg.valid = not self.big or (self.valid and bool(self.metrics))
+    self.pm.send('chestnutGpuState', msg)
 
 
 class FrameMeta:
@@ -174,44 +131,90 @@ class FrameMeta:
       self.frame_id, self.timestamp_sof, self.timestamp_eof = vipc.frame_id, vipc.timestamp_sof, vipc.timestamp_eof
 
 
+def input_view(buffer: Buffer, shape: tuple[int, ...], dtype: DType, offset: int) -> Tensor:
+  view = buffer.view(math.prod(shape), dtype, offset).ensure_allocated()
+  return Tensor(UOp.from_buffer(view)).reshape(shape)
+
+
+class Upload(NamedTuple):
+  # one host buffer and its copy on a device: float inputs at 128-byte offsets, then a tail of frame bytes
+  packed: np.ndarray
+  host: Buffer
+  device: Buffer
+  views: dict[str, Tensor]
+  npy_size: int
+
+
 class ModelState:
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
 
   def __init__(self, cam_w: int, cam_h: int, chestnut: bool):
-    input_devices = get_tg_input_devices(PROCESS_NAME, chestnut)
-    self.WARP_DEV, self.QUEUE_DEV = input_devices['WARP_DEV'], input_devices['QUEUE_DEV']
-    jits = load_oob(open_file_chunked(modeld_pkl_path(chestnut)))
-    metadata = jits['metadata']
-    self.input_shapes = metadata['input_shapes']
-    self.vision_input_names = [k for k in self.input_shapes if 'img' in k]
-    self.output_slices = metadata['output_slices']
+    with open(modeld_pkl_path(chestnut), 'rb') as f:
+      jits = load_oob(f)
+    self.model_device = jits['input_specs']['new_img'][2]
+    self.input_shapes = {name: (shape, np.dtype(dtype)) for name, (shape, dtype, _) in jits['input_specs'].items()}
+    self.state_pairs = {name: f'next_{name}' for name in self.input_shapes if f'next_{name}' in jits['metadata']['output_shapes']}
+    self.vision_input_names = ('img', 'big_img')
+    self.output_slices = pickle.loads(base64.b64decode(jits['metadata']['metadata']['output_slices']))
 
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
     self.chestnut = chestnut
 
-    self.frame_skip = ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ
-    self.input_queues, self.npy = make_input_queues(self.input_shapes, self.frame_skip, device=self.QUEUE_DEV)
-    self.full_frames: dict[str, Tensor] = {}
-    self._blob_cache: dict[tuple[str, int], Tensor] = {}
+    stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
+    self.frame_copy_size = stride * (y_height + uv_height)
+    # the warp runs where the camera frames are, so a model on another GPU only receives the warped frames
+    with open(MODELS_DIR / f'driving_warp_{cam_w}x{cam_h}_tinygrad.pkl', 'rb') as f:
+      warp = pickle.load(f)
+    self.run_warp = warp['run']
+    self.warp_device = warp['input_specs']['input_frame'][2]
+    self.pack_inputs()
+    self.run_model = jits['run']
+    self.outputs = {name: Tensor(np.zeros(shape, dtype=dtype), device=device).realize() for name, (shape, dtype, device) in jits['output_specs'].items()}
+    for name, next_name in self.state_pairs.items():
+      state = self.input_queues[name]
+      self.outputs[next_name] = input_view(state._buffer(), state.shape, state.dtype, 0)
     self.parser = Parser()
-    self.frame_buf_params = {k: get_nv12_info(cam_w, cam_h) for k in ('img', 'big_img')}
-    self.run_policy = jits['run_policy']
-    self.warp = jits[(cam_w,cam_h)]
+
+  def pack_inputs(self) -> None:
+    # Pack host inputs into one upload per device to reduce USB transfer overhead for the eGPU.
+    self.input_queues = {name: Tensor(np.zeros(shape, dtype=dtype), device=self.model_device).realize()
+                         for name, (shape, dtype) in self.input_shapes.items() if name in self.state_pairs}
+    self.npy = {}
+    tfm = {'tfm': (2, 3, 3)}
+    shapes = {name: shape for name, (shape, _) in self.input_shapes.items() if name not in self.state_pairs and name != 'new_img'}
+    warped_shape = self.input_shapes['new_img'][0]
+    frames_size = 2 * self.frame_copy_size
+    if self.warp_device == self.model_device:
+      self.model_input = self.frame_input = self.pack(tfm | shapes, frames_size, self.model_device)
+    else:
+      # the warped frames take the place of the frames in the model device's upload
+      self.model_input = self.pack(shapes, math.prod(warped_shape), self.model_device)
+      self.frame_input = self.pack(tfm, frames_size, self.warp_device)
+      self.warped = self.model_input.packed[self.model_input.npy_size:]
+      self.input_queues['new_img'] = input_view(self.model_input.device, warped_shape, dtypes.uint8, self.model_input.npy_size)
+    self.input_queues |= {name: view for name, view in self.model_input.views.items() if name != 'tfm'}
+    self.frames = self.frame_input.packed[self.frame_input.npy_size:].reshape(2, self.frame_copy_size)
+    self.warp_inputs = {'input_frame': input_view(self.frame_input.device, self.frames.shape, dtypes.uint8, self.frame_input.npy_size),
+                        'M_inv': self.frame_input.views['tfm']}
+
+  def pack(self, shapes: dict[str, tuple[int, ...]], tail: int, device: str) -> Upload:
+    npy_size = sum(round_up(math.prod(shape) * 4, 128) for shape in shapes.values())
+    packed = np.zeros(npy_size + tail, dtype=np.uint8)
+    dev, views, offset = Tensor(packed, device=device)._buffer(), {}, 0
+    for name, shape in shapes.items():
+      self.npy[name] = np.ndarray(shape, dtype=np.float32, buffer=packed, offset=offset)
+      views[name] = input_view(dev, shape, dtypes.float32, offset)
+      offset += round_up(self.npy[name].nbytes, 128)
+    return Upload(packed, Tensor(packed, device='NPY')._buffer(), dev, views, npy_size)
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
-    parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
-    return parsed_model_outputs
+    return {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray], after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray]:
-    for key in bufs.keys():
-      ptr = np.frombuffer(bufs[key].data, dtype=np.uint8).ctypes.data
-      yuv_size = self.frame_buf_params[key][3]
-      # There is a ringbuffer of imgs, just cache tensors pointing to all of them
-      cache_key = (key, ptr)
-      if cache_key not in self._blob_cache:
-        self._blob_cache[cache_key] = Tensor.from_blob(ptr, (yuv_size,), dtype='uint8', device=self.WARP_DEV)
-      self.full_frames[key] = self._blob_cache[cache_key]
+    for i, key in enumerate(self.vision_input_names):
+      np.copyto(self.frames[i], np.frombuffer(bufs[key].data, dtype=np.uint8, count=self.frame_copy_size))
+      self.npy['tfm'][i] = transforms[key]
 
     # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
     inputs['desire_pulse'][0] = 0
@@ -219,35 +222,37 @@ class ModelState:
     self.prev_desire[:] = inputs['desire_pulse']
     self.npy['traffic_convention'][:] = inputs['traffic_convention']
     self.npy['action_t'][:] = inputs['action_t']
-    self.npy['tfm'][:,:] = transforms['img'][:,:]
-    self.npy['big_tfm'][:,:] = transforms['big_img'][:,:]
 
-    warped = self.warp(**{k: self.input_queues[k] for k in WARP_INPUTS}, frame=self.full_frames['img'], big_frame=self.full_frames['big_img'])
-
-    outs, = self.run_policy(
-      **{k: self.input_queues[k] for k in POLICY_INPUTS if k in self.input_queues}, warped=warped
-    )
+    self.frame_input.device.copy_from(self.frame_input.host)
+    new_img = self.run_warp(**self.warp_inputs)
+    if self.warp_device == self.model_device:
+      self.input_queues['new_img'] = new_img
+    else:
+      # the warped frames join the other inputs in the model device's upload
+      np.copyto(self.warped, np.frombuffer(new_img._buffer().as_memoryview(allow_zero_copy=True), dtype=np.uint8))
+      self.model_input.device.copy_from(self.model_input.host)
+    self.run_model(output_buffers=self.outputs, **self.input_queues)
     if after_enqueue is not None:
       after_enqueue()
-    model_output = outs.numpy()[0]
+    model_output = self.outputs['outputs'].numpy()[0]
     if self.chestnut and not np.all(np.isfinite(model_output)):
       raise RuntimeError("model output not finite")
     outputs_dict = self.parser.parse_outputs(self.slice_outputs(model_output, self.output_slices))
-    self.npy['prev_feat'][:] = model_output[self.output_slices['hidden_state']]
 
     if SEND_RAW_PRED:
       outputs_dict['raw_pred'] = model_output.copy()
     return outputs_dict
 
   def warmup(self) -> None:
-    dummy_frames = {k: np.zeros(self.frame_buf_params[k][3], dtype=np.uint8) for k in self.vision_input_names}
+    dummy_frames = {k: np.zeros(self.frame_copy_size, dtype=np.uint8) for k in self.vision_input_names}
     eye = np.eye(3, dtype=np.float32)
     dims = {'desire_pulse': ModelConstants.DESIRE_LEN, 'traffic_convention': 2, 'action_t': 2}
     self.run(dummy_frames, dict.fromkeys(self.vision_input_names, eye), {k: np.zeros(v, dtype=np.float32) for k, v in dims.items()})
-    self.input_queues, self.npy = make_input_queues(self.input_shapes, self.frame_skip, device=self.QUEUE_DEV)
+    self.model_input.packed[:] = 0
+    self.frame_input.packed[:] = 0
+    for key in self.state_pairs:
+      self.input_queues[key].assign(0).realize()
     self.prev_desire[:] = 0
-    self.full_frames.clear()
-    self._blob_cache.clear()
 
 
 def main(demo=False):
@@ -289,6 +294,10 @@ def main(demo=False):
   cloudlog.warning("loading model")
   model = None
   if CHESTNUT:
+    # chestnut can enumerate before its PCIe link is up due to varying 12V power behavior across cars,
+    # and tinygrad checks the link only once. only start a load that can reach the GPU
+    while not (link := link_up()) and time.monotonic() - st < BIG_MODEL_TIMEOUT:
+      time.sleep(1)
     big_model = None
     def load_big():
       nonlocal big_model
@@ -298,9 +307,12 @@ def main(demo=False):
         big_model = m
       except Exception:
         cloudlog.exception("big model load failed")
-    loader = threading.Thread(target=load_big, daemon=True)
-    loader.start()
-    loader.join(BIG_MODEL_TIMEOUT)
+    if link:
+      loader = threading.Thread(target=load_big, daemon=True)
+      loader.start()
+      loader.join(BIG_MODEL_TIMEOUT)
+    else:
+      cloudlog.warning("chestnut PCIe link not up, skipping big model")
     model = big_model
     params.put_bool("ChestnutActive", model is not None)
 
@@ -311,13 +323,13 @@ def main(demo=False):
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry"] + (["chestnutState"] if CHESTNUT else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
   params = Params()
-  chestnut_state = ChestnutState(pm, model.chestnut) if CHESTNUT else None
+  chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
@@ -426,7 +438,7 @@ def main(demo=False):
     mt1 = time.perf_counter()
     try:
       send_chestnut = (chestnut_state is not None and
-                       run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
+                       run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
       model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
     except Exception:
       if not params.get_bool("ChestnutActive"):

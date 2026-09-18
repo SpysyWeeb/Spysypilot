@@ -42,7 +42,7 @@ public:
 
   inline double currentSec() const { return current_sec_; }
   inline uint64_t toMonoTime(double sec) const { return beginMonoTime() + std::max(sec, 0.0) * 1e9; }
-  inline double toSeconds(uint64_t mono_time) const { return std::max(0.0, (mono_time - beginMonoTime()) / 1e9); }
+  inline double toSeconds(uint64_t mono_time) const { return mono_time > beginMonoTime() ? (mono_time - beginMonoTime()) / 1e9 : 0.0; }
 
   inline const std::unordered_map<MessageId, CanData> &lastMessages() const { return last_msgs; }
   bool isMessageActive(const MessageId &id) const;
@@ -64,6 +64,7 @@ public:
   Observable<const std::optional<std::pair<double, double>> &> timeRangeChanged;
   Observable<const MessageEventsMap &> eventsMerged;
   Observable<const std::set<MessageId> *, bool> msgsReceived;
+  Observable<const std::string &> error;
 
   SourceSet sources;
 
@@ -73,6 +74,7 @@ protected:
   void cancelWaits();  // call before joining threads, the main thread isn't pumping events during destruction
   void requestUpdateLastMessages() { postToMainThread([this]() { updateLastMessages(); }); }
   void mergeEvents(const std::vector<const CanEvent *> &events);
+  void insertEvents(const std::vector<const CanEvent *> &events, const MessageEventsMap &msg_events);
   const CanEvent *newEvent(uint64_t mono_time, const cereal::CanData::Reader &c);
   void updateEvent(const MessageId &id, double sec, const uint8_t *data, uint8_t size);
   void waitForSeekFinshed();
@@ -99,16 +101,6 @@ private:
   std::set<MessageId> new_msgs_;
   std::unordered_map<MessageId, CanData> messages_;
   std::unordered_map<MessageId, std::vector<uint8_t>> masks_;
-};
-
-class AbstractOpenStreamWidget : public QWidget {
-  Q_OBJECT
-public:
-  AbstractOpenStreamWidget(QWidget *parent = nullptr) : QWidget(parent) {}
-  virtual AbstractStream *open() = 0;
-
-signals:
-  void enableOpenButton(bool);
 };
 
 class DummyStream : public AbstractStream {

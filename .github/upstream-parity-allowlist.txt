@@ -1,0 +1,119 @@
+# Paths where Spysypilot intentionally differs from the merge base with commaai/openpilot master.
+# Syntax: gitignore patterns (anchored with a leading /), matched by git check-ignore.
+# Everything after " # " on a line is the owning branch(es); tools/sync/parity_check.sh strips it.
+# Policy: docs/SYNC_POLICY.md. Generated 2026-09-14 from the per-branch audit; edit by hand from now on.
+
+/.github/pull_request_template.md  # combo-only fork_only_file (no feature-branch owner)
+/.github/upstream-parity-allowlist.txt  # combo-level
+/.github/workflows/*  # combo-level
+/.gitmodules  # combo-level
+/AGENTS.md  # combo-level
+/README.md  # combo-level
+/conftest.py  # combo-only fork_only_file (no feature-branch owner)
+/docs/**  # combo-level
+/openpilot/cereal/README.md  # kept: combo-level
+/openpilot/cereal/custom.capnp  # SOL,curve-speed-limit
+/openpilot/cereal/log.capnp  # BLoTv3,SOL,curve-speed-limit; kept: BLoTv3,SOL,curve-speed-limit + combo-level Event.blatV2ShadowDEPRECATED @156 placeholder (keeps the union dense)
+/openpilot/cereal/services.py  # SOL,curve-speed-limit; kept: combo-level
+/openpilot/cereal/tests/test_model_schema_contract.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/common/params_keys.h  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad,side-buttons; kept: side-buttons
+/openpilot/common/spinner.py  # better-boot-screen
+/openpilot/common/swaglog.py  # kept: custom-main-menu (consumer terminal_widget.py) - handler lives only on combo
+/openpilot/common/tests/test_params.py  # params-clear-pandad-keys,params-clear-pandad-keys-at-offroad
+/openpilot/selfdrive/assets/sounds/complete.wav  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/car/car_events.py  # esp-active-debounce
+/openpilot/selfdrive/car/card.py  # SOL
+/openpilot/selfdrive/car/cruise.py  # swapped-cruise-speed
+/openpilot/selfdrive/car/tests/test_car_events.py  # esp-active-debounce
+/openpilot/selfdrive/car/tests/test_cruise_speed.py  # swapped-cruise-speed
+/openpilot/selfdrive/controls/controlsd.py  # BLoTv3,SOL; kept: BLoTv3,SOL + combo-level
+/openpilot/selfdrive/controls/controlsd_ext.py  # SOL
+/openpilot/selfdrive/controls/lib/conditional_experimental_mode.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/desire_helper.py  # nudgless-lane-changes
+/openpilot/selfdrive/controls/lib/force_stops.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/longcontrol.py  # smooth-stops
+/openpilot/selfdrive/controls/lib/longitudinal_lead.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/longitudinal_planner.py  # BLoTv3,better-green-lights,curve-speed-limit; kept: combo-level (BLoTv3,better-green-lights,curve-speed-limit integration)
+/openpilot/selfdrive/controls/lib/model_curve_speed.py  # curve-speed-limit
+/openpilot/selfdrive/controls/lib/necessity_supervisor.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/smooth_stops.py  # smooth-stops
+/openpilot/selfdrive/controls/lib/stop_helpers.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/stop_landing.py  # BLoTv3
+/openpilot/selfdrive/controls/plannerd.py  # curve-speed-limit
+/openpilot/selfdrive/controls/radard.py  # smooth-stops; kept: smooth-stops + combo-level
+/openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py  # SOL
+/openpilot/selfdrive/controls/tests/test_combo_contracts.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_conditional_experimental_mode.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_controlsd.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_controlsd_long_state.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_force_stops.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_long_mpc.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_longcontrol.py  # smooth-stops
+/openpilot/selfdrive/controls/tests/test_longitudinal_lead.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_longitudinal_planner.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_longitudinal_planner_model.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_model_curve_speed.py  # curve-speed-limit
+/openpilot/selfdrive/controls/tests/test_necessity_supervisor.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_nudgless_lane_changes.py  # nudgless-lane-changes
+/openpilot/selfdrive/controls/tests/test_radard_low_speed.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py  # smooth-stops
+/openpilot/selfdrive/controls/tests/test_smooth_stops.py  # smooth-stops
+/openpilot/selfdrive/controls/tests/test_stop_helpers.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_stop_landing.py  # BLoTv3
+/openpilot/selfdrive/modeld/SConscript  # c3x-chestnut-v2
+/openpilot/selfdrive/modeld/helpers.py  # c3x-chestnut-v2
+/openpilot/selfdrive/modeld/modeld.py  # c3x-chestnut-v2
+/openpilot/selfdrive/modeld/tests/test_helpers.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/pandad/panda.cc  # SOL
+/openpilot/selfdrive/pandad/panda.h  # SOL
+/openpilot/selfdrive/pandad/pandad.cc  # SOL
+/openpilot/selfdrive/selfdrived/selfdrived.py  # BLoTv3,SOL,hot-swap-experimental; kept: BLoTv3,SOL,hot-swap-experimental + combo-level
+/openpilot/selfdrive/selfdrived/tests/test_conditional_experimental_mode.py  # BLoTv3
+/openpilot/selfdrive/spysypilot/__init__.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/test/longitudinal_maneuvers/maneuver.py  # BLoTv3,curve-speed-limit; kept: BLoTv3,curve-speed-limit + combo-level
+/openpilot/selfdrive/test/longitudinal_maneuvers/plant.py  # BLoTv3,curve-speed-limit; kept: BLoTv3,curve-speed-limit
+/openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py  # BLoTv3,curve-speed-limit; kept: BLoTv3,curve-speed-limit
+/openpilot/selfdrive/test/process_replay/process_replay.py  # curve-speed-limit; kept: curve-speed-limit
+/openpilot/selfdrive/test/process_replay/regen.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/test/process_replay/regen_all.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/test/process_replay/test_regen.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/selfdrive/ui/layouts/home.py  # custom-main-menu,side-buttons; kept: combo-only (should move to custom-main-menu)
+/openpilot/selfdrive/ui/layouts/main.py  # custom-main-menu
+/openpilot/selfdrive/ui/layouts/settings/developer.py  # error-log-viewer
+/openpilot/selfdrive/ui/layouts/settings/software.py  # auto-update
+/openpilot/selfdrive/ui/layouts/sidebar.py  # detailed-stats-sidebar
+/openpilot/selfdrive/ui/mici/onroad/torque_bar.py  # torque-bar
+/openpilot/selfdrive/ui/onroad/augmented_road_view.py  # SOL; kept: SOL
+/openpilot/selfdrive/ui/onroad/exp_button.py  # spinning-steering-wheel
+/openpilot/selfdrive/ui/onroad/hud_renderer.py  # torque-bar
+/openpilot/selfdrive/ui/tests/test_exp_button.py  # spinning-steering-wheel
+/openpilot/selfdrive/ui/tests/test_main_layout.py  # custom-main-menu
+/openpilot/selfdrive/ui/tests/test_ui_state.py  # SOL
+/openpilot/selfdrive/ui/ui_state.py  # SOL,auto-update,side-buttons
+/openpilot/selfdrive/ui/widgets/error_log_button.py  # side-buttons
+/openpilot/selfdrive/ui/widgets/exp_mode_button.py  # side-buttons
+/openpilot/selfdrive/ui/widgets/screen_timeout_button.py  # side-buttons
+/openpilot/selfdrive/ui/widgets/setup.py  # kept: custom-main-menu (commit 9489859c8 is on origin/custom-main-menu history but branch tip file equals MB)
+/openpilot/selfdrive/ui/widgets/system_stats.py  # custom-main-menu
+/openpilot/selfdrive/ui/widgets/terminal_widget.py  # custom-main-menu
+/openpilot/selfdrive/ui/widgets/update_button.py  # side-buttons
+/openpilot/spysypilot/__init__.py  # SOL
+/openpilot/spysypilot/aol/__init__.py  # SOL
+/openpilot/spysypilot/aol/aol.py  # SOL
+/openpilot/spysypilot/aol/helpers.py  # SOL
+/openpilot/spysypilot/aol/state.py  # SOL
+/openpilot/system/hardware/chestnut/flash.py  # c3x-chestnut-v2
+/openpilot/system/hardware/fan_controller.py  # fan-control
+/openpilot/system/hardware/tests/test_fan_controller.py  # fan-control
+/openpilot/system/loggerd/tests/test_platform_arch.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/system/manager/build.py  # better-boot-screen
+/openpilot/system/manager/manager.py  # better-boot-screen; kept: better-boot-screen,error-log-viewer
+/openpilot/system/ui/spinner.py  # better-boot-screen
+/openpilot/system/ui/widgets/html_render.py  # error-log-viewer,side-buttons
+/openpilot/system/updated/common.py  # combo-only fork_only_file (no feature-branch owner)
+/openpilot/system/updated/updated.py  # auto-update
+/openpilot/tools/jotpluggler/layouts/tuning.json  # BLoTv3
+/openpilot/tools/plotjuggler/layouts/tuning.xml  # BLoTv3
+/tools/scripts/profiling/clpeak/no_print.patch  # combo-only fork_only_file (no feature-branch owner)
+/tools/sync/**  # combo-level

@@ -63,9 +63,9 @@ def find_chestnut():
   found = []
   for d in glob.glob("/sys/bus/usb/devices/*"):
     try:
-      vid_pid = (open(d + "/idVendor").read().strip(), open(d + "/idProduct").read().strip())
+      vid_pid = (Path(d, "idVendor").read_text().strip(), Path(d, "idProduct").read_text().strip())
       if vid_pid in VID_PIDS + ROM_VID_PIDS:
-        found.append((d, vid_pid, open(d + "/product").read().strip()))
+        found.append((d, vid_pid, Path(d, "product").read_text().strip()))
     except OSError:
       pass
   if len(found) > 1:
@@ -101,7 +101,7 @@ def unbind_drivers(path):
 
 
 def open_device(path):
-  bus, dev = int(open(path + "/busnum").read()), int(open(path + "/devnum").read())
+  bus, dev = int(Path(path, "busnum").read_text()), int(Path(path, "devnum").read_text())
   return os.open(f"/dev/bus/usb/{bus:03d}/{dev:03d}", os.O_RDWR)
 
 
@@ -115,9 +115,13 @@ def link_up() -> bool:
   except (OSError, RuntimeError):
     return False
   try:
-    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0x40, 0xF3, 1, 0, 0, 2000, None))
     buf = (ctypes.c_ubyte * 1)()
-    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0xC0, 0xE4, 0xB450, 0, 1, 1000, ctypes.cast(buf, ctypes.c_void_p)))
+    read_ltssm = Ctrl(0xC0, 0xE4, 0xB450, 0, 1, 1000, ctypes.cast(buf, ctypes.c_void_p))
+    fcntl.ioctl(fd, USBDEVFS_CONTROL, read_ltssm)
+    if buf[0] != 0x78:
+      # custom firmware boots with pcie off, only request power when the link is not already up
+      fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0x40, 0xF3, 1, 0, 0, 2000, None))
+      fcntl.ioctl(fd, USBDEVFS_CONTROL, read_ltssm)
     return buf[0] == 0x78  # LTSSM L0
   except OSError:
     return False

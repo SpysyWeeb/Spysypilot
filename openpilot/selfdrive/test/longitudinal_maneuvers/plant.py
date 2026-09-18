@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import time
 import numpy as np
 
 from openpilot.cereal import log
@@ -11,28 +10,50 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
-class _SubMasterShim(dict):
-  """Expose the liveness contract consumed by the production planner."""
+class _PlantSubMaster:
+  # mimics messaging.SubMaster's liveness contract so the planner (and future
+  # BLoTv3 modules) see a real all_checks() instead of one that is always True
+  def __init__(self, data, mono_time, invalid=()):
+    self.data = data
+    self.updated = dict.fromkeys(data, True)
+    self.logMonoTime = dict.fromkeys(data, mono_time)
+    self.valid = {s: s not in invalid for s in data}
+    self.alive = dict(self.valid)
+    self.freq_ok = dict.fromkeys(data, True)
+
+  def __getitem__(self, s):
+    return self.data[s]
 
   def all_checks(self, service_list=None):
-    services = self.keys() if service_list is None else service_list
-    return all(service in self for service in services)
+    services = self.data.keys() if service_list is None else service_list
+    return all(self.valid[s] and self.alive[s] and self.freq_ok[s] for s in services)
+
+
+def _model_lead_v3(x, v, prob):
+  n = len(ModelConstants.LEAD_T_IDXS)
+  lead = log.ModelDataV2.LeadDataV3.new_message()
+  lead.prob = float(prob)
+  lead.probTime = 0.0
+  lead.t = [float(t) for t in ModelConstants.LEAD_T_IDXS]
+  lead.x = [float(p) for p in x]
+  lead.xStd = [1.0] * n
+  lead.y = [0.0] * n
+  lead.yStd = [1.0] * n
+  lead.v = [float(vv) for vv in v]
+  lead.vStd = [0.5] * n
+  return lead
+
+
+E2E_PUSH_DISTANCE = 12.0  # m, the fake model's late ramp builds over this distance to the line
 
 
 class Plant:
-  messaging_initialized = False
-
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
-               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False):
+               enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
+               stop_line=None, stop_line_horizon_s=5.0,
+               curve=None, torque_factor=2.7, torque_friction=0.11, curve_model_scale=1.0, e2e_landing_push=0.0, actuator_lag=None):
     self.rate = 1. / DT_MDL
 
-    if not Plant.messaging_initialized:
-      Plant.radar = messaging.pub_sock('radarState')
-      Plant.controls_state = messaging.pub_sock('controlsState')
-      Plant.selfdrive_state = messaging.pub_sock('selfdriveState')
-      Plant.car_state = messaging.pub_sock('carState')
-      Plant.plan = messaging.sub_sock('longitudinalPlan')
-      Plant.messaging_initialized = True
 
     self.v_lead_prev = 0.0
 
@@ -50,22 +71,108 @@ class Plant:
     self.e2e = e2e
     self.personality = personality
     self.force_decel = force_decel
+    # a world-fixed stop line the fake model plans to stop at once it is within stop_line_horizon_s of travel,
+    # the way the real model calls a red light only a few seconds out
+    self.stop_line = stop_line
+    self.stop_line_horizon_s = stop_line_horizon_s
+    # a world-fixed curve (start distance, length, curvature) the fake model shows along its path; the fake steering
+    # holds the path up to its torque authority and reports the torque controller state the curve policy reads
+    self.curve = curve
+    self.curve_model_scale = curve_model_scale       # the model reads the curve at this fraction of its true curvature
+    self.torque_factor = torque_factor
+    self.torque_friction = torque_friction
+    self.lateral_accel = 0.0
+    self.torque = 0.0
+    # extra braking the fake model asks for over the last metres before the line, the way the real model's request
+    # ramps late (route 24/27: -0.7 ... -1.3 -> -2.5 into the last seconds)
+    self.e2e_landing_push = e2e_landing_push
+    # the car's brake actuation as a first-order response to the plan, with separate time constants for taking braking
+    # up and letting it off: the Palisade's ESP follows a braking increase with ~0.2 s and a release with ~0.7 s (route 0x2a,
+    # 2026-08-30). None keeps the ideal car that applies the plan at once
+    self.actuator_lag = actuator_lag
+    self.applied_accel = 0.0
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
-    time.sleep(0.1)
-    self.sm = messaging.SubMaster(['longitudinalPlan'])
 
     from opendbc.car.honda.values import CAR
     from opendbc.car.honda.interface import CarInterface
 
-    self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=self.speed)
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    if self.curve is not None:
+      torque = CP.lateralTuning.init('torque')
+      torque.latAccelFactor = self.torque_factor
+      torque.latAccelOffset = 0.0
+      torque.friction = self.torque_friction
+    self.planner = LongitudinalPlanner(CP, init_v=self.speed)
+
+  def _curvature_at(self, world_x):
+    # one (start, length, curvature) or a list of them: a bend that tightens or opens along the way
+    segments = self.curve if isinstance(self.curve[0], tuple | list) else [self.curve]
+    for start, length, curvature in segments:
+      if start <= world_x <= start + length:
+        return curvature
+    return 0.0
+
+  def _plan_curve(self, model, controls_state, car_control):
+    # path curvature along the model's own positions, and a steering state: the car holds the path up to the torque
+    # authority factor * (1 - friction) either way round; beyond it the torque pins at 1 and the tracking error is the shortfall
+    positions = np.asarray(model.position.x, dtype=float)
+    speeds = np.asarray(model.velocity.x, dtype=float)
+    model.position.y = [0.0] * len(positions)          # the policy measures arc length from x and y
+    curvatures = np.array([self._curvature_at(self.distance + x) for x in positions])
+    rate = log.XYZTData.new_message()
+    rate.z = [float(k * self.curve_model_scale * v) for k, v in zip(curvatures, speeds, strict=True)]
+    model.orientationRate = rate
+    desired = self.speed ** 2 * self._curvature_at(self.distance)
+    authority = self.torque_factor * (1.0 - self.torque_friction)
+    turn = np.sign(desired)
+    self.lateral_accel = turn * min(abs(desired), authority)
+    self.torque = turn * min(abs(desired) / self.torque_factor + self.torque_friction, 1.0)
+    state = controls_state.lateralControlState.init('torqueState')
+    state.active = True
+    state.output = float(self.torque)
+    state.error = float(desired - self.lateral_accel)
+    state.actualLateralAccel = float(self.lateral_accel)
+    state.desiredLateralAccel = float(desired)
+    state.saturated = bool(abs(self.torque) >= 1.0)
+    car_control.latActive = True
+
+  def _plan_stop_line(self, model):
+    # the model's path ends at the line with a constant-deceleration speed profile; its e2e request is
+    # deliberately softer than that need, as the real model's early request is
+    d_line = self.stop_line - self.distance
+    t = np.array(ModelConstants.T_IDXS)
+    if d_line <= 0.5 or self.speed < 0.3:
+      x = np.zeros_like(t)
+      v = np.zeros_like(t)
+      model.action.shouldStop = True
+      model.action.desiredAcceleration = float(min(self.acceleration, 0.0)) if self.speed >= 0.3 else 0.0
+    elif d_line <= self.speed * self.stop_line_horizon_s:
+      a_req = self.speed ** 2 / (2.0 * d_line)
+      t_stop = self.speed / a_req
+      tc = np.minimum(t, t_stop)
+      x = self.speed * tc - 0.5 * a_req * tc ** 2
+      v = np.maximum(self.speed - a_req * tc, 0.0)
+      model.action.shouldStop = bool(d_line < 3.0)
+      push = self.e2e_landing_push * float(np.clip((E2E_PUSH_DISTANCE - d_line) / E2E_PUSH_DISTANCE, 0.0, 1.0))
+      model.action.desiredAcceleration = float(-0.7 * a_req - push)
+    else:
+      return
+    position = log.XYZTData.new_message()
+    position.x = [float(xx) for xx in x]
+    model.position = position
+    velocity = log.XYZTData.new_message()
+    velocity.x = [float(vv) for vv in v]
+    velocity.x[0] = float(self.speed)
+    model.velocity = velocity
 
   @property
   def current_time(self):
     return float(self.rk.frame) / self.rate
 
-  def step(self, v_lead=0.0, prob_lead=1.0, v_cruise=50., pitch=0.0, prob_throttle=1.0):
+  def step(self, v_lead=0.0, prob_lead=1.0, v_cruise=50., pitch=0.0, prob_throttle=1.0,
+           radar_valid=True, model_valid=True):
     # ******** publish a fake model going straight and fake calibration ********
     # note that this is worst case for MPC, since model will delay long mpc by one time step
     radar = messaging.new_message('radarState')
@@ -123,45 +230,67 @@ class Plant:
     acceleration = log.XYZTData.new_message()
     acceleration.x = [float(x) for x in np.zeros_like(ModelConstants.T_IDXS)]
     model.modelV2.acceleration = acceleration
+    if self.stop_line is not None:
+      self._plan_stop_line(model.modelV2)
+    if self.curve is not None:
+      self._plan_curve(model.modelV2, control.controlsState, car_control.carControl)
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
-    lead_times = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
+    # lead0 mirrors the radar lead above; lead1/lead2 are shaped but carry no probability
+    lead_t = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
     if a_lead < 0.0:
-      integration_times = np.minimum(lead_times, max(-v_lead / a_lead, 0.0))
+      stop_t = np.minimum(lead_t, max(-v_lead / a_lead, 0.0))
     else:
-      integration_times = lead_times
-    lead_velocities = np.maximum(v_lead + a_lead * lead_times, 0.0)
-    lead_positions = d_rel + v_lead * integration_times + 0.5 * a_lead * np.square(integration_times)
-
-    lead_v3 = log.ModelDataV2.LeadDataV3.new_message()
-    lead_v3.prob = float(prob_lead) if self.lead_relevancy else 0.0
-    lead_v3.x = [float(x) for x in lead_positions]
-    lead_v3.v = [float(v) for v in lead_velocities]
-    model.modelV2.leadsV3 = [lead_v3, lead_v3, lead_v3]
+      stop_t = lead_t
+    lead0_v = np.maximum(v_lead + a_lead * lead_t, 0.0)
+    lead0_x = np.maximum.accumulate(d_rel + v_lead * stop_t + 0.5 * a_lead * stop_t ** 2)
+    lead0_prob = float(prob_lead) if self.lead_relevancy else 0.0
+    zeros = np.zeros_like(lead_t)
+    model.modelV2.leadsV3 = [
+      _model_lead_v3(lead0_x, lead0_v, lead0_prob),
+      _model_lead_v3(zeros, zeros, 0.0),
+      _model_lead_v3(zeros, zeros, 0.0),
+    ]
 
     control.controlsState.longControlState = LongCtrlState.pid if self.enabled else LongCtrlState.off
+    ss.selfdriveState.enabled = self.enabled
     ss.selfdriveState.experimentalMode = self.e2e
     ss.selfdriveState.personality = self.personality
+    ss.selfdriveState.enabled = bool(self.enabled)
     control.controlsState.forceDecel = self.force_decel
     car_state.carState.vEgo = float(self.speed)
+    car_state.carState.aEgo = float(self.acceleration)
     car_state.carState.standstill = bool(self.speed < 0.01)
     car_state.carState.vCruise = float(v_cruise * 3.6)
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = _SubMasterShim({
-      'radarState': radar.radarState,
-      'carState': car_state.carState,
-      'carControl': car_control.carControl,
-      'controlsState': control.controlsState,
-      'selfdriveState': ss.selfdriveState,
-      'vehicleParameters': lp.vehicleParameters,
-      'modelV2': model.modelV2,
-    })
+    invalid = set()
+    if not radar_valid:
+      invalid.add('radarState')
+    if not model_valid:
+      invalid.add('modelV2')
+    sm = _PlantSubMaster({'radarState': radar.radarState,
+                           'carState': car_state.carState,
+                           'carControl': car_control.carControl,
+                           'controlsState': control.controlsState,
+                           'selfdriveState': ss.selfdriveState,
+                           'vehicleParameters': lp.vehicleParameters,
+                           'modelV2': model.modelV2},
+                          mono_time=int(self.current_time * 1e9), invalid=invalid)
+    self.last_sm = sm
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:
-      self.acceleration = min(-0.5, self.acceleration)
+      # the thin-handoff LongControl settles on the plan bounded by its kiss while rolling; the old flat -0.5 stand-in
+      # overwrote exactly the landing behavior these tests exist to judge
+      self.acceleration = min(self.acceleration, -0.12)
+    if self.actuator_lag is not None:
+      # the car lags the plan: braking builds at tau_up, releases at tau_down
+      tau_up, tau_down = self.actuator_lag
+      tau = tau_up if self.acceleration < self.applied_accel else tau_down
+      self.applied_accel += (self.acceleration - self.applied_accel) * min(self.ts / tau, 1.0)
+      self.acceleration = self.applied_accel
     self.speed = self.speed + self.acceleration * self.ts
     self.should_stop = self.planner.output_should_stop
     fcw = self.planner.fcw
@@ -198,6 +327,8 @@ class Plant:
       "should_stop": self.should_stop,
       "distance_lead": self.distance_lead,
       "fcw": fcw,
+      "lateral_accel": self.lateral_accel,
+      "torque": self.torque,
     }
 
 # simple engage in standalone mode

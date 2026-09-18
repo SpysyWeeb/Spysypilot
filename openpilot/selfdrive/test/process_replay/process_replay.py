@@ -17,7 +17,7 @@ from openpilot.common.hardware.hw import Paths
 import openpilot.cereal.messaging as messaging
 from opendbc.car.structs import car
 from openpilot.cereal.services import SERVICE_LIST
-from msgq.visionipc import VisionIpcServer, get_endpoint_name as vipc_get_endpoint_name
+from msgq.visionipc import VisionIpcClient, VisionIpcServer, get_endpoint_name as vipc_get_endpoint_name
 from opendbc.car.can_definitions import CanData
 from opendbc.car.car_helpers import get_car, interfaces
 from openpilot.common.params import Params
@@ -209,6 +209,7 @@ class ProcessContainer:
         stride, y_height, _, yuv_size = get_nv12_info(frame_size[0], frame_size[1])
         vipc_server.create_buffers_with_sizes(meta.stream, 2, frame_size[0], frame_size[1], yuv_size, stride, stride * y_height)
     vipc_server.start_listener()
+    VisionIpcClient.available_streams("camerad", block=True)
 
     self.vipc_server = vipc_server
     self.cfg.vision_pubs = [meta.camera_state for meta in streams_metas if meta.camera_state in self.cfg.vision_pubs]
@@ -481,7 +482,7 @@ CONFIGS = [
     proc_name="plannerd",
     pubs=["modelV2", "carControl", "carState", "controlsState", "vehicleParameters", "lateralTorqueParameters",
           "radarState", "selfdriveState"],
-    subs=["longitudinalPlan", "driverAssistance"],
+    subs=["longitudinalPlan", "curvePolicyState", "driverAssistance"],
     ignore=["logMonoTime", "longitudinalPlan.processingDelay", "longitudinalPlan.solverExecutionTime"],
     init_callback=get_car_params_callback,
     should_recv_callback=MessageBasedRcvCallback("modelV2"),
@@ -592,9 +593,9 @@ def get_custom_params_from_lr(lr: LogIterable, initial_state: str = "first") -> 
   """
 
   car_params = [m for m in lr if m.which() == "carParams"]
-  live_calibration = [m for m in lr if m.which() == "extrinsicsCalibration"]
-  live_parameters = [m for m in lr if m.which() == "vehicleParameters"]
-  live_torque_parameters = [m for m in lr if m.which() == "lateralTorqueParameters"]
+  extrinsics_calibration = [m for m in lr if m.which() == "extrinsicsCalibration"]
+  vehicle_parameters = [m for m in lr if m.which() == "vehicleParameters"]
+  torque_parameters = [m for m in lr if m.which() == "lateralTorqueParameters"]
 
   assert initial_state in ["first", "last"]
   msg_index = 0 if initial_state == "first" else -1
@@ -606,12 +607,12 @@ def get_custom_params_from_lr(lr: LogIterable, initial_state: str = "first") -> 
     "CarParamsPrevRoute": CP.as_builder().to_bytes()
   }
 
-  if len(live_calibration) > 0:
-    custom_params["CalibrationParams"] = live_calibration[msg_index].as_builder().to_bytes()
-  if len(live_parameters) > 0:
-    custom_params["LiveParametersV2"] = live_parameters[msg_index].as_builder().to_bytes()
-  if len(live_torque_parameters) > 0:
-    custom_params["LiveTorqueParameters"] = live_torque_parameters[msg_index].as_builder().to_bytes()
+  if len(extrinsics_calibration) > 0:
+    custom_params["CalibrationParams"] = extrinsics_calibration[msg_index].as_builder().to_bytes()
+  if len(vehicle_parameters) > 0:
+    custom_params["LiveParametersV2"] = vehicle_parameters[msg_index].as_builder().to_bytes()
+  if len(torque_parameters) > 0:
+    custom_params["LiveTorqueParameters"] = torque_parameters[msg_index].as_builder().to_bytes()
 
   return custom_params
 

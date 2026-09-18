@@ -1,32 +1,258 @@
-# Model Curve Speed Limit
+# Curve longitudinal policy
 
-Status: **in progress pending field testing**.
+Status: **in progress pending field testing** (rebuilt 2026-08-29; the previous speed-cap limiter is described at the end).
 
-## Goal
+## What it does
 
-Slow for model-predicted curves before the Palisade exhausts steering authority.
+`model_curve_speed.py` decides how the car should accelerate through the curves the model path shows ahead and the
+one it is in, and hands the planner **one acceleration candidate** (plan source `curve`). The planner's `min()`
+arbitration can only lower the chosen acceleration with it. The cruise target, the stop bit and the mode are untouched.
 
-## Curve-speed envelope
+### Layer 1 — anticipation (the path ahead)
+Every model path node gets a curvature (yaw rate ÷ speed, 3-node spatial median) and two speed limits:
+- **authority** — the speed at which the steering demand *at that node, at that node's speed* stays inside
+  `TORQUE_BUDGET` (0.90) of the EPS limit: `v² = ((budget − friction)·factor ± roll·g + offset) / κ`;
+- **comfort** — `v² = A_LAT_COMFORT / κ` with `A_LAT_COMFORT = 3.0 m/s²`, the owner's own turns (p90 of manual driving).
+  Inert on the Palisade today because the authority binds first; it is the ceiling should the torque headroom grow.
 
-The existing 50/22/13 mph field envelope, spatial median, temporal median,
-target-release rate, and `0.5 m/s²` approach calculation remain unchanged.
-For valid Palisade torque parameters while lateral control is active, each
-future signed-curvature sample also gets the maximum speed that keeps predicted
-feedforward plus friction demand at or below `TORQUE_BUDGET = 0.90`. The lower
-of the field and torque-budget speeds enters the existing approach-distance
-calculation.
+Per node the candidate is the less demanding of the kinematic acceleration that meets the limit at its distance and a
+proportional approach `(v_limit − v)/T_APPROACH`; the strictest node wins. That is small and positive near a limit
+(no burst toward it), zero at it, and the needed deceleration beyond it. It is floored at `A_CURVE_MIN` (−2.0: harder
+braking is the lead and stop logic's business), 3-frame median filtered, and jerk-limited from the car's own
+acceleration (`J_DOWN` 2.0 m/s³ down, `J_UP` 3.0 up: a curve releases in about a second).
 
-Valid filtered live torque parameters replace the static `CarParams` values.
-Invalid geometry or unusable parameters retain field-envelope behavior rather
-than inventing a torque limit.
+### Steering authority calibrated online
+The feedforward torque model under-reads what the steering achieves (route 22: 3.1 m/s² lateral at 0.9 torque
+against 2.14 predicted). The lateral acceleration achieved per unit of torque above friction is measured whenever the
+steering is working (torque ≥ 0.40) and tracking (error ≤ 0.30), filtered with a 5 s time constant, and bounded to
+0.8–1.8 × the torque tuning's own factor. It starts at the tuning's factor on every boot, so the first heavy curve of a
+drive is approached conservatively.
 
-## Torque veto
+### Layer 2 — reaction (the steering now)
+Reads `controlsState.lateralControlState.torqueState`: torque, tracking error,
+actual and desired lateral acceleration, saturated / torque-limited. Only while openpilot steers and the driver is not.
+- **coast** — torque ≥ `T_COAST` (0.85) for `COAST_ENTER_S` (0.3 s): throttle off, no brake (`min(coast, 0)`, so never a
+  net acceleration downhill); demand falls with v². Ends after `COAST_EXIT_S` below `T_COAST_EXIT` (0.75).
+- **brake** — pinned (`T_PIN` 0.95 or saturated) *and* understeering (`sign(desired)·error ≥ E_TRACK`
+  0.30, so an exit overshoot never triggers it) for `BRAKE_ENTER_S` (0.3 s): decelerate toward the speed at which the
+  measured curvature fits the budget, priced no higher than the authority the steering delivers at its torque limit, within
+  `T_RESTORE` (1 s); back to coast once recovery (below `E_TRACK_EXIT`, or off the pin) persists `BRAKE_EXIT_S` (0.5 s),
+  while the driver's wheel, a lateral dropout or a disengagement end it at once. Never below
+  `V_REACT_MIN` (3 m/s), where the measured curvature is noise.
+- **free** otherwise. Regimes are dwelled at every edge; a single sample never switches them.
 
-The existing two-of-three future-torque veto remains a backstop. When predicted
-demand reaches the budget, the longitudinal planner clamps only positive final
-acceleration to zero. Stronger MPC/e2e/lead/stop braking remains authoritative.
+The final candidate is `max(min(anticipation, reaction), A_CURVE_MIN)`, jerk-limited as one signal, and absent
+(`None`) whenever it would not bind or is not finite. The planner adds it only while engaged (`not reset_state`).
 
-This predicts path-driven feedforward and friction demand—not future PID
-feedback, tire grip, or a guaranteed full-controller 90% ceiling. Route replay
-must check final acceleration and jerk, false slowing on ordinary bends, and
-actual entry torque before owner field testing.
+## Why (field evidence, 2026-08-29, routes 22–26)
+Steering pinned (≥ 0.95) 8.4 s in ~2 min of engaged turning, tracking ~75 % of that time. The old limiter's predicted
+torque (max over the 10 s path at the *current* speed) ran +0.15–0.2 above actual (p90 +0.4); of its 18 braking episodes
+6 were needed and 12 not; its 0.2 m/s² cap release produced 186 s of crawl after curves; 7 bursts of ≥ 1.5 m/s² toward a
+cap less than 3 m/s above the car. Route 22 t=2934–2986: the driver held a banked sweeper at 23–25 m/s under
+always-on lateral with the steering at 0.45–0.9 torque and error ≤ 0.3 while the limiter wanted 23 m/s with the veto on.
+
+## Validation
+- `test_model_curve_speed.py`: limits, kinematic/proportional candidate, spikes and invalid models, jerk limits and floor,
+  coast/brake dwell and hysteresis, understeer sign, both lateral state kinds, authority calibration and bounds, the
+  candidate never raising the plan, and a guard that the legacy veto/cap surface is gone from the planner.
+- `test_longitudinal.py::TestCurvePolicy`: the maneuver plant gained a world-fixed curve with a synthetic torque state
+  (`Plant(curve=(start, length, curvature))`); approach without a burst within the floor, coast when heavy, brake when the
+  steering cannot hold the line.
+- Replay (`~/Documents/blotv3/replay/curve_gates.py`, like-for-like on this branch): crawl 84/24/28/62 s → 0/0.1/0.3/0 s,
+  hard-braking frames unchanged, 12 of the 18 audit episodes exact, the rest between; the route-22 sweeper is approached
+  conservatively on a cold calibration (limit 20 m/s before the filter has learned that curve) — the first-drive check.
+
+## Open
+- Persist the calibrated authority across boots (torqued-style) so the first curve of a drive is not the cold case.
+- A speed-dependent authority if the field shows the single factor too low at highway speed.
+- Experimental mode: the e2e candidate also slows for curves; the two simply share the `min()`.
+
+## Previous design (replaced)
+A model-path curve speed cap fed in as a lower `v_cruise` (three field points 50/22/13 mph, a Palisade torque-budget
+speed, 0.5 m/s² approach, 0.2 m/s² release) plus a two-of-three predicted-torque veto that clamped positive acceleration.
+
+## 2026-08-31 — ride the authority, hold it steady (owner ruling)
+
+`A_LAT_COMFORT` 3.0 → 3.4 m/s²: the owner's manual cornering tops out at 2.86 (181 manual cornering frames in the whole
+archive — always-on-lateral steers everything else), and the ruling is to push closer to the limit. With comfort above the
+calibrated authority, the steering's own per-curve, bank-aware ceiling binds nearly everywhere; comfort stays as the
+backstop against an implausible learned authority. And `V_HOLD_BAND` 0.3 m/s: within the band of the binding limit the
+candidate is a flat zero, so the settled car holds the limit instead of stitching gas/brake corrections across the zero
+crossing; drift is corrected at the band edges by the proportional approach. Route 22 sweeper: the in-curve limit moves
+from ~25–26 (comfort-bound) to ~27–28 m/s (authority-bound with the bank).
+
+## 2026-08-31 — a gas override earns a grace
+
+`CURVE_GAS_GRACE_S` 5.0: after the driver's gas press, the anticipation layer may hold the speed but never pull it back down
+for five seconds — route 0x2c t=885: the owner released the pedal 1.4 m/s above the in-curve limit and the still-active episode
+dragged the exit from +1.8 back to −1.0 mid-corner. The reaction brake regime (pinned and understeering) still runs inside the
+grace, and the grace re-arms on every gas frame.
+
+## 2026-09-02 — a lift ends in a hold
+
+Route 0x33 t=2524–2544, a 20 s bend at a 74.6 mph set speed: the reaction layer lifted seven times, and every release handed
+the plan straight back to the cruise or lead candidate at +0.75 m/s², which drove the car back into heavy steering — a square
+wave between +0.75 and the coast, 16 source handoffs, 6 throttle closes and 3 brake taps, the speed 59.7 → 55.1 → 61.8 mph
+inside one bend. The steering itself held its line (no oscillation, no driver input) but ran torque-limited on 22 % of the
+bend's frames: the anticipation planned to a limit ~1.7 m/s above what the steering could hold, because the lateral
+acceleration it calibrates on is derived from the steering angle and overstates at the limit (accelerometer ≈ 0.54× of it at
+the peak). That bias is a separate item; this change takes the cycling away.
+
+**The hold.** When the coast or brake regime releases, the candidate holds at zero instead of falling back to "free", until
+the measured lateral acceleration has read under `BEND_OPEN_A_LAT` 1.0 m/s² for `BEND_OPEN_S` 1.0 s (an S-bend's
+crossover does not release it) or `HOLD_MAX_S` 30 s has passed (a backstop, not a release path). The clamp only ever pulls a
+positive fallthrough down to zero: it never adds braking, never applies while the driver steers or within the gas grace. The
+anticipation reading free does not end it: the path sees the exit before the car is through the bend; the road reading open does. The car therefore lifts once on the way in, holds the speed the
+steering settled at through the bend, and accelerates once the car is through it: on combo's replay of route 0x33 the exit
+acceleration begins at t=2545.6, when the measured lateral acceleration has been under 1 m/s² for the dwell, 1.7 s after the
+model's own release at 2543.9 — where the car was still at 2–3 m/s² and the old release drew the third brake tap. The
+dwell is the price of not releasing into an S-bend's crossover. A steering dropout arms the hold too and keeps it for the resumption; an idle controller's zero lateral
+acceleration no longer feeds the open test (`_lateral_history` freezes until the steering is back), and a disengagement
+resets the policy (`reset()`, called from the planner's reset path).
+
+Replay, route 0x33 t=2519.65–2546 on combo: source handoffs 18 → 4, frames asking more than +0.5 m/s² 236 → 8 (the exit
+acceleration itself, now from 2545.6), peak braking unchanged at −0.92. Route 0x2c t=878–896 (the gas-grace exit): byte-identical.
+Route 22: no lift in the whole route's replay, so it says nothing about the hold. Plant: `test_a_lift_ends_in_a_hold_until_the_bend_opens`
+(a bend that opens to a still-bent section holds through it; one that opens under 1 m/s² releases within the dwell).
+
+Field questions for the next drive: does the held part of a bend feel like a steady speed or a light drag; and uphill exits,
+where a zero candidate means no acceleration until the bend reads open. Not yet addressed: the coast threshold (0.85) still
+sits below the planning budget (0.90), so the settle point is the same as today's; and the calibration's steering-derived
+lateral acceleration.
+
+## 2026-09-04 — the same bend twice: the roll horizon, a cleaner calibration, a ramped release
+
+Routes 0x4c t=773–802 and 0x4d t=2756–2796 are one bend (520 m, R≈250 m with a 200 m pinch, banked 3–3.5° in its
+favour, an adverse crown on the approach), both at an 80 mph set speed, on the same policy. The first pass was braked at
+−1.84 m/s² for 2.5 s (57 → 48 mph) for a node 143 m ahead read at 19.7 m/s, and cruise then pulled the car back to 55 mph
+at the tightest point; the second pass was never braked by the anticipation (the node read 27–30 m/s), the reaction layer
+found the rack's limit in three lifts and the hold kept 24.0 ± 0.14 m/s for 9 s. Two inputs made the difference, each
+measured by running the limit function on the recorded path:
+
+* **the live roll was applied to every path node** — the approach's crown (+0.044 rad, real) charged against a node banked
+  the other way, worth 2–5 m/s of limit there. Nodes farther than `ROLL_HORIZON_S` (2 s of travel) now get no roll either
+  way; the near nodes keep the live value, and the brake regime now charges the bank by the turn's sign too (it had
+  used the magnitude, so a crown against the turn was credited as help). Replay: 0x4c's candidate minimum −1.79 → −1.34 and the
+  brake starts 10 m later; 0x4d unchanged.
+* **the online authority factor drifted with the last road driven** — 2.33 carried into 0x4c from town corners 300 s
+  earlier, 4.13 into 0x4d from banked sweepers; swap them and the outcomes swap. The factor learned from the rack's
+  ground-plane lateral, so a bank was credited to the steering and then added again by the limit's bias. The measurement
+  is now the steering's own share (`actual − (roll·g + offset)`), taken only in real corners
+  (`AUTHORITY_MIN_LATERAL` 1.0 m/s²) at speed (`AUTHORITY_MIN_SPEED` 10 m/s, where the assist resembles the highway's).
+
+And the hold's release was a one-frame step from 0.00 to whatever the next candidate asked (+0.48 on 0x4d): the candidate
+now ramps out at `J_UP` when nothing binds any more, so the hand-off is a ramp of a few tenths of a second.
+
+Not changed: the hold is still speed-blind (it keeps the speed the lift left), and a bend that pinches repeatedly still
+earns a lift per pinch. Awaiting the owner's drive.
+
+## 2026-09-05 — the calibration measures at the budget, and a far node asks for a moderate deceleration at most (route 0x54)
+
+Route 0x54 t=2825–2853: a 75 mph approach into a right-hander tightening to R≈220 m. The anticipation saw the bend from
+224 m but computed 29–31 m/s for it against the car's 31.4, let off by only −0.15…−0.4, and the tighter section only
+entered the model's view at 58 m: −1.7 then the brake regime's −2.0, the rack at 100 % torque for 2.5 s, the car 0.85 m
+from the left line and the owner adding torque. The rack could hold about 24.5 m/s here.
+
+* **The lateral per unit of torque is not a constant**: on the 250 s before the bend it was 5.6 at 0.4–0.6 torque, 3.5
+  at 0.6–0.8, 2.8–3.0 from 0.8 up and 3.2 on the pinned apex frames. The filter averaged the moderate-torque samples to
+  3.79 while the anticipation plans to a 0.90 budget where the number is about 3.0 — every limit 14 % high.
+  `AUTHORITY_MIN_TORQUE` 0.40 → 0.70: the samples come from where the plan is aimed. Replay: the first lift on this
+  approach moves from 2827.3 to 2824.6.
+* **A node beyond the roll horizon whose shortfall a bank could explain asks for a moderate deceleration at most**
+  (`FAR_NODE_DECEL_MAX` 1.0 m/s², for far limits within `FAR_LIMIT_UNCERTAINTY` 25 % of the car's speed; a far bend well
+  under that keeps its full deceleration). With an honest factor, a banked sweeper read without its bank is 10–15 % too
+  slow: route 0x4d's far limit came out at 20.7 m/s for a bend the rack held at 24, and the kinematic candidate hit the
+  −2.0 floor five seconds out. A cap of 0.5 left that car 4 m/s over at the horizon and the floor still came; at 1.0 the
+  early, moderate deceleration sheds the doubt-sized shortfall before the node comes within the horizon, where the bank
+  is the car's own and the hard brake is allowed.
+
+Tried and dropped: a coast trigger on the torque's projected rise. On this approach it would have lifted 0.9 s earlier,
+but on route 0x4c's bend, where the rack's torque swings 0.2–0.9 with a 2–3 s period at a steady lateral, it called
+heavy on every upswing (the first coast 4 s early and a third more curve-bound frames) — the alternation the owner's
+ruling forbids.
+
+The model's far-curvature under-read is the remaining gap (R 315 m shown at 170 m and 283 m at 58 m for a 220 m bend).
+
+## 2026-09-07 — the cap was always the torque model, and the torque model was wrong
+
+Route 0x5b, the owner: "it feels like it's starting to get sloppy… braking too harshly for a curve I know it can
+handle fine", and "it takes too long to start accelerating when a curve comes to an end".
+
+**The comfort limit has never bound.** Both terms scale as `sqrt(x / kappa)`, so `min(comfort, authority)` reduces to
+whichever constant is smaller: authority wins whenever `margin + bias < A_LAT_COMFORT`. The deployed margin is
+`(0.90 − 0.114) × 2.63 = 2.07` against a comfort limit of 3.4, so comfort could only win on a road banked past ~7.8°
+(this route peaks at 5.9°). Measured: authority bound on 2265 of 2265 active frames.
+
+**And 2.07 is falsified by the car.** On the owner's own sweeper (t=2655–2675) the rack held 2.28 m/s² of lateral at
+0.70 torque — more than the model claims the *full* budget could buy, at 78 % of it. Across 7 routes and 204k steering
+frames, settled and tracking with the driver off the wheel, the rack held 2.86 m/s² at 0.64 torque (20–25 m/s) and 3.03
+at 0.68 (25–30 m/s); 686 frames held more than 2.07 with torque still under 0.75. The ratio saturates — 8.8 at 0.20–0.35
+torque down to 3.1 at 0.80–1.01 — so extrapolating the tuning's slope out to 0.90 under-prices the corner by ~40 %.
+More torque cannot buy less lateral in steady state, so the budget holds at least what has already been held.
+
+`AUTHORITY_HELD_LATERAL` 2.5 m/s² is that floor, blended in over `AUTHORITY_HELD_SPEED` 15→20 m/s so the cap has no
+step. It never lowers the model, and comfort remains the ceiling above both — including for a learned authority, which
+can now reach comfort where before it could not. Below the blend nothing changes: every one of this route's 534
+at-budget frames was under 20 m/s and 18 of 43 curve episodes that peaked at the budget were town corners. The rack
+genuinely pins in town; it does not up here.
+
+The harsh entry was the same defect. A low cap forces a large required deceleration, which `A_CURVE_MIN` then clips:
+38 frames sat on the −2.0 floor. Open-loop replay of t=2644–2690 with the floor in: the sustained cap rises from
+~22.0 to ~24.1 m/s (+4.7 mph, the owner asked for about 5) and the deepest request is −1.39, so the floor is never
+reached.
+
+**The hold released nowhere near where he does.** Over 70 holds on three routes it released at a median measured
+lateral of 0.28 m/s² and never once above 0.88. His own six clean accelerate-out onsets are 1.13, 1.22, 1.48, 1.71,
+1.75 and 2.26 (median 1.59) — the policy was about five times more conservative than his foot. `BEND_OPEN_A_LAT` 1.0 →
+1.5 sits above his minimum and below his median. `BEND_OPEN_S` 1.0 → 0.5: all six observed holds released exactly one
+frame after the dwell elapsed, so it was a flat tax on every exit; it must not reach zero, since it is what stops a
+bend whose lateral dips mid-corner from chattering (route 0x33). Measured ceiling: 1.8 releases this route's t=2660
+hold while the car is still in the bend. Hold time on 0x5b falls 113.6 → 59.2 s, on 0x58 45.8 → 15.6 s.
+
+Order matters: at the old budget the hold clamped a candidate that wanted to accelerate for only 7.3 s of this event's
+21.9 s hold, because the cap itself was binding. Both changes together, or the budget change is masked.
+
+Not a curve defect, found alongside: there was no overshoot anywhere on this route (0 of 875 live-candidate frames ran
+past the priced cap, peak engaged lateral 2.47 against comfort 3.4). What reads as "not braking soon enough" is a late,
+harsh catch caused by the model's far-curvature under-read — 0.72 of truth at 180–200 m, 0.60 at 200–220, and 36 % of
+curved road beyond 150 m reported straight. Still the remaining gap. Separately, once the policy lets go the plan rides
+`get_max_accel_request` frame-exact, so a slow pick-up after the hold is fixed is the cruise envelope, not this policy.
+
+## 2026-09-14 — the stock torque controller's state
+
+BLaTv3 was retired from combo on 2026-09-14, so every build steers with upstream's `LatControlTorque` and the policy
+reads `torqueState` only. Its inputs keep their meaning: both controllers measured lateral acceleration from the
+steering angle through the vehicle model with the live roll, and both report the error as desired minus measured, so
+the bank handling and the understeer sign are unchanged. What went is the rack's `torqueLimited` flag, which also
+counted as pinned. Over 13 BLaTv3 drives (routes 0x62–0x72, 5.1 h of steering) that flag alone opened 14 of the 113
+brake-regime entries (pinned and understeering for 0.3 s), all at 4–12 m/s with torque as low as 0.15: the rack
+clipping its own output, not a pinned car. The stock definition (`saturated`, or torque at `T_PIN`) keeps the other
+99. The thresholds and the authority numbers above were measured with BLaTv3 steering; a drive on stock steering is
+the check.
+
+## 2026-09-15 — audit: the brake regime believes the steering, the floor is the Palisade's, the decision is logged
+
+An audit of 30f6c55d2 reproduced four defects; all four are fixed.
+
+- **The demonstrated hold defeated the corrective brake.** The brake regime priced its restore target with the same 2.5 m/s²
+  floor as the anticipation, so at 25 m/s a car pinned at full torque, holding 2.0 of the 2.4 m/s² it was asked for, sat
+  "inside the budget" and got only the coast (−0.30). Losing the line at the torque limit (`T_PIN`) is itself a measurement
+  of the authority there is: the regime now prices the budget no higher than `(TORQUE_BUDGET − friction) · share /
+  (torque − friction)`, the calibration's own ratio taken there (the steering's share, bank and offset removed). The same
+  case asks for the −2.0 floor. The controller's `saturated` flag alone does not qualify: it also covers a rate-limited
+  curvature request, where a frame of little lateral at moderate torque says nothing about the rack (a review of this
+  change turned a −0.3 coast into the −2.0 floor that way). The anticipation keeps the floor, which is where the field evidence for it was gathered.
+- **The floor was one car's measurement applied to every car.** It came from the owner's Palisade over seven routes; another
+  EPS saturates on its own curve. `AUTHORITY_HELD_CARS` limits it to `HYUNDAI_PALISADE`, and every other platform prices the
+  budget with the torque model alone. Nothing changes on the owner's car.
+- **One good sample ended the brake.** Entry needed 0.3 s of loss, exit a single sample: one 0.19 m/s² frame in a pinned 0.6
+  stretch relaxed −2.0 to −1.1 while the car stayed pinned. Recovery (tracking again, or off the pin) must now persist
+  `BRAKE_EXIT_S` (0.5 s), the coast exit's own dwell. The driver's hand on the wheel, a lateral dropout and a disengagement
+  still end the regime at once: the measurement that justified the braking is no longer the steering's own.
+- **The maneuver plant mirrored nothing.** Its steering saturated only positive curvature, so a right-hand curve reported
+  perfect tracking at zero torque. It now saturates by magnitude, and a mirrored maneuver asserts that a left-hand and a
+  right-hand curve are driven identically.
+
+The policy's decision is logged every model frame as `curvePolicyState`: `custom.capnp`'s `CustomReserved1` renamed, the
+schema's own convention for forks (combo's `SpysydriveStateSP` holds slot 0). It carries the regime, whether the candidate
+is active, its acceleration, the strictest node's limit and distance, the authority factor and the hold.

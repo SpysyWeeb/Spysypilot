@@ -149,7 +149,7 @@ def migrate_drivingModelData(msgs):
   add_ops = []
   for _, msg in msgs:
     dmd = messaging.new_message('drivingModelData', valid=msg.valid, logMonoTime=msg.logMonoTime)
-    for field in ["frameId", "frameIdExtra", "frameDropPerc", "modelExecutionTime", "action"]:
+    for field in ["frameId", "frameIdExtra", "frameDropPerc", "modelExecutionTime", "big", "action"]:
       setattr(dmd.drivingModelData, field, getattr(msg.modelV2, field))
     for meta_field in ["laneChangeState", "laneChangeState"]:
       setattr(dmd.drivingModelData.meta, meta_field, getattr(msg.modelV2.meta, meta_field))
@@ -392,7 +392,7 @@ def migrate_cameraStates(msgs):
         del_ops.append(index)
         continue
 
-      # fallback mechanism for logs without encodeIdx (e.g. logs from before 2022 with dcamera recording disabled)
+      # fallback mechanism for logs without encodeIdx (e.g. logs from before 2022 with driver recording disabled)
       # try to fake encode_id by subtracting lowest frameId
       encode_id = camera_state.frameId - min_frame_id[msg.which()]
       print(f"Faking encodeId to {encode_id} for camera feed {msg.which()} with frameId: {camera_state.frameId}")

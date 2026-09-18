@@ -17,9 +17,8 @@ from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurvature
-from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque, palisade_rack_trajectory_compatible
+from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
-from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
@@ -59,29 +58,11 @@ class Controls:
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP)
 
-    self.sm = messaging.SubMaster(
-      [
-        'lateralDelay',
-        'vehicleParameters',
-        'lateralTorqueParameters',
-        'modelV2',
-        'selfdriveState',
-        'extrinsicsCalibration',
-        'deviceMotion',
-        'longitudinalPlan',
-        'lateralManeuverPlan',
-        'carState',
-        'carOutput',
-        'driverMonitoringState',
-        'onroadEvents',
-        'driverAssistance',
-        'radarState',
-        'spysydriveStateSP',
-      ],
-      poll='selfdriveState',
-      ignore_alive=['spysydriveStateSP'],
-      ignore_valid=['spysydriveStateSP'],
-    )
+    self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
+                                   'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'spysydriveStateSP'],
+                                  poll='selfdriveState', ignore_alive=['spysydriveStateSP'],
+                                  ignore_valid=['spysydriveStateSP'])
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
 
     self.steer_limited_by_safety = False
@@ -103,10 +84,7 @@ class Controls:
     elif self.lateral_tuning_type == 'pid':
       self.LaC = LatControlPID(self.CP, self.CI, DT_CTRL)
     elif self.is_torque_lateral:
-      self.LaC = LatControlTorque(
-        self.CP, self.CI, DT_CTRL,
-        use_rack_trajectory=palisade_rack_trajectory_compatible(self.CP),
-      )
+      self.LaC = LatControlTorque(self.CP, self.CI, DT_CTRL)
 
     self.controls_ext = ControlsExt()
 
@@ -115,8 +93,8 @@ class Controls:
     if self.sm.updated["extrinsicsCalibration"]:
       self.pose_calibrator.feed_extrinsics_calibration(self.sm['extrinsicsCalibration'])
     if self.sm.updated["deviceMotion"]:
-      device_pose = Pose.from_device_motion(self.sm['deviceMotion'])
-      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
+      device_motion = Pose.from_device_motion(self.sm['deviceMotion'])
+      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_motion)
 
   def state_control(self):
     CS = self.sm['carState']
@@ -139,25 +117,17 @@ class Controls:
 
     long_plan = self.sm['longitudinalPlan']
     model_v2 = self.sm['modelV2']
-    if isinstance(self.LaC, LatControlTorque):
-      self.LaC.set_rack_trajectory_model(
-        model_v2 if self.sm.valid['modelV2'] else None,
-        self.sm.logMonoTime['selfdriveState'],
-      )
 
     CC = car.CarControl.new_message()
     CC.enabled = self.sm['selfdriveState'].enabled
 
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
-    CC.latActive = (
-      self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and
-      (not standstill or self.CP.steerAtStandstill)
-    )
+    CC.latActive = self.controls_ext.get_lat_active(self.sm) and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
+                   (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
     actuators = CC.actuators
-    actuators.longControlState = self.LoC.long_control_state
 
     # Enable blinkers while lane changing
     if model_v2.meta.laneChangeState != LaneChangeState.off:
@@ -171,18 +141,10 @@ class Controls:
 
     # accel PID loop
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
-    lead = LeadObservation.from_radar(
-      self.sm['radarState'].leadOne,
-      self.sm.all_checks(['radarState']),
-    )
-    actuators.accel = float(self.LoC.update(
-      CC.longActive,
-      CS,
-      long_plan.aTarget,
-      long_plan.shouldStop,
-      pid_accel_limits,
-      lead,
-    ))
+    actuators.accel = float(self.LoC.update(CC.longActive, CS, long_plan.aTarget, long_plan.shouldStop, pid_accel_limits))
+    # published after the update, not before it: the car interface derives the stop request and the standstill-exit jerk
+    # limit from this state, so reading it first sent the previous frame's state alongside this frame's acceleration
+    actuators.longControlState = self.LoC.long_control_state
 
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
@@ -242,13 +204,11 @@ class Controls:
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    # AOL can steer while selfdriveState is inactive, so keep stock limiter
-    # feedback live whenever lateral control is active.
-    self.steer_limited_by_safety = get_steer_limited_by_safety(
-      self.CP,
-      CC,
-      self.sm['carOutput'],
-    )
+    # AOL can steer while selfdriveState is inactive. Keep limiter feedback live whenever lateral control is active.
+    self.steer_limited_by_safety = get_steer_limited_by_safety(self.CP, CC, self.sm['carOutput'])
+
+    # TODO: both controlsState and carControl valids should be set by
+    #       sm.all_checks(), but this creates a circular dependency
 
     # controlsState
     dat = messaging.new_message('controlsState')
@@ -259,29 +219,6 @@ class Controls:
     cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
     cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
     cs.desiredCurvature = self.desired_curvature
-    if isinstance(self.LaC, LatControlTorque) and self.LaC.rack_trajectory is not None:
-      rack_state = cs.rackTrajectoryState
-      rack_state.status = self.LaC.rack_trajectory.status
-      output = self.LaC.rack_trajectory_output
-      if output is not None:
-        rack_state.active = True
-        rack_state.targetSteeringAngleDeg = float(output.target_angle_deg)
-        rack_state.targetSteeringRateDegS = float(output.target_rate_deg_s)
-        rack_state.plannedSteeringAngleDeg = float(output.planned_angle_deg)
-        rack_state.plannedSteeringRateDegS = float(output.planned_rate_deg_s)
-        rack_state.plannedSteeringAccelerationDegS2 = float(output.planned_acceleration_deg_s2)
-        rack_state.measuredSteeringRateDegS = float(output.measured_rate_deg_s)
-        rack_state.feedbackTorque = float(output.feedback_torque)
-        rack_state.feedbackLimited = bool(output.feedback_limited)
-        rack_state.motionLimited = bool(output.motion_limited)
-        rack_state.torqueLimited = bool(output.torque_limited)
-        rack_state.infeasible = bool(output.infeasible)
-        rack_state.rateLimitDegS = float(output.rate_limit_deg_s)
-        rack_state.accelerationLimitDegS2 = float(output.acceleration_limit_deg_s2)
-        rack_state.jerkLimitDegS3 = float(output.jerk_limit_deg_s3)
-        rack_state.profileTransition = bool(output.profile_transition)
-        rack_state.pathLimited = bool(output.path_limited)
-        rack_state.targetCurvature = float(output.target_curvature)
     cs.longControlState = self.LoC.long_control_state
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)

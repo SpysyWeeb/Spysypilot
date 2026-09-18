@@ -1,103 +1,64 @@
-import unittest
+import math
 
+from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.common.realtime import DT_CTRL
-from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
-from openpilot.selfdrive.controls.lib.smooth_stops import (
-  HOLD_RELEASE_FRAMES,
-  LEAD_DROPOUT_GRACE,
-  SETTLE_JERK,
-  SmoothStopController,
-)
+from openpilot.common.test import OpenpilotTestCase
+from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
+from openpilot.selfdrive.controls.lib.smooth_stops import (HOLD_RELEASE_FRAMES, SETTLE_JERK, STANDSTILL_SPEED, STOP_KISS_DECEL,
+                                                           SmoothStopController)
 
 
-def run_settle(controller, seconds, *, v_ego, a_target=-0.05, last_output=-0.15, lead=None):
-  output = last_output
-  for _ in range(round(seconds / DT_CTRL)):
-    output = controller.settle(a_target, v_ego, output, lead)
-  return output
+class TestSmoothStopController(OpenpilotTestCase):
 
-
-class TestSmoothStopHandoff(unittest.TestCase):
-  def test_hold_only_arms_at_true_standstill(self):
+  def test_hold_arms_when_stopped(self):
     controller = SmoothStopController()
-    self.assertFalse(controller.want_hold(True, 0.16, True))
-    self.assertTrue(controller.want_hold(True, 0.14, True))
-    self.assertTrue(controller.want_hold(True, 0.04, False))
-    self.assertFalse(controller.want_hold(False, 0.0, True))
+    assert not controller.want_hold(True, 0.2)                     # still rolling: the kiss keeps the stop, not the car
+    assert controller.want_hold(True, STANDSTILL_SPEED)
+    assert not controller.want_hold(True, STANDSTILL_SPEED + 0.05)
+    assert not controller.want_hold(False, 0.0)
+    assert should_stop(STANDSTILL_SPEED, 0.0)                      # the gates nest: the hold speed sits inside the stop window
 
-  def test_hold_release_is_consecutive_and_debounced(self):
+  def test_kiss_floor(self):
+    controller = SmoothStopController()
+    eased = controller.settle(-0.02, -STOP_KISS_DECEL)             # the plan has faded to nothing: the kiss stays
+    assert math.isclose(eased, -STOP_KISS_DECEL, abs_tol=1e-9)
+
+  def test_hard_braking_passes_through(self):
+    controller = SmoothStopController()
+    hard = controller.settle(-1.5, -1.5)
+    assert math.isclose(hard, -1.5, abs_tol=1e-9)
+
+  def test_jerk_limit(self):
+    controller = SmoothStopController()
+    step = SETTLE_JERK * DT_CTRL
+    assert math.isclose(controller.settle(-2.0, -0.2), -0.2 - step, abs_tol=1e-9)
+    assert math.isclose(controller.settle(-0.02, -1.0), -1.0 + step, abs_tol=1e-9)
+    assert controller.settle(-9.0, ACCEL_MIN) >= ACCEL_MIN
+
+  def test_launch_release(self):
+    controller = SmoothStopController()
+    controller.arm_hold()
+    assert controller.hold_release(False, 0.1)                     # the stop bit drops with the plan asking to move
+
+  def test_flicker_keeps_hold(self):
+    controller = SmoothStopController()
+    controller.arm_hold()
+    for _ in range(5):                                             # a few frames of dropped bit, plan at the kiss
+      assert not controller.hold_release(False, -0.15)
+    assert not controller.hold_release(True, -0.15)
+
+  def test_backstop_release(self):
     controller = SmoothStopController()
     controller.arm_hold()
     for _ in range(HOLD_RELEASE_FRAMES - 1):
-      self.assertFalse(controller.hold_release(False))
-    self.assertTrue(controller.hold_release(False))
-    self.assertFalse(controller.hold_release(True))
+      assert not controller.hold_release(False, 0.0)
+    assert controller.hold_release(False, 0.0)
+    assert not controller.hold_release(True, 0.0)                  # the stop bit back on zeroes the count
 
-
-class TestSmoothStopSettle(unittest.TestCase):
-  def test_entry_is_continuous(self):
+  def test_arm_resets_counter(self):
     controller = SmoothStopController()
-    output = controller.settle(-0.05, 1.0, -0.4)
-    self.assertAlmostEqual(output, -0.4)
-
-  def test_settle_pressure_respects_jerk_limit(self):
-    controller = SmoothStopController()
-    previous = controller.settle(-0.05, 1.0, -0.4)
-    output = controller.settle(-0.05, 0.5, previous)
-    self.assertLessEqual(abs(output - previous), SETTLE_JERK * DT_CTRL + 1e-9)
-
-  def test_stronger_plan_braking_passes_through(self):
-    controller = SmoothStopController()
-    self.assertEqual(controller.settle(-3.0, 1.0, -0.1), -3.0)
-
-  def test_stationary_vehicle_creep_ratchets_firmer(self):
-    output = run_settle(SmoothStopController(), 2.0, v_ego=0.6)
-    self.assertLess(output, -0.8)
-
-  def test_continuously_moving_lead_does_not_ratchet(self):
-    lead = LeadObservation(True, distance=8.0, speed=0.31)
-    output = run_settle(SmoothStopController(), 10.0, v_ego=0.6, lead=lead)
-    self.assertGreater(output, -0.3)
-
-  def test_moving_threshold_noise_has_hysteresis(self):
-    controller = SmoothStopController()
-    output = -0.15
-    for frame in range(round(10.0 / DT_CTRL)):
-      lead_speed = 0.31 if frame % 2 else 0.29
-      lead = LeadObservation(True, distance=8.0, speed=lead_speed)
-      output = controller.settle(-0.05, 0.6, output, lead)
-    self.assertGreater(output, -0.3)
-
-  def test_short_radar_dropout_does_not_add_permanent_brake(self):
-    controller = SmoothStopController()
-    moving = LeadObservation(True, distance=8.0, speed=0.4)
-    output = run_settle(controller, 1.0, v_ego=0.6, lead=moving)
-    output = run_settle(
-      controller,
-      LEAD_DROPOUT_GRACE,
-      v_ego=0.6,
-      last_output=output,
-      lead=LeadObservation(),
-    )
-    output = run_settle(controller, 1.0, v_ego=0.6, last_output=output, lead=moving)
-    self.assertGreater(output, -0.3)
-
-  def test_stopped_then_moving_lead_releases_ratchet_smoothly(self):
-    controller = SmoothStopController()
-    stopped = LeadObservation(True, distance=5.0, speed=0.0)
-    output = run_settle(controller, 2.0, v_ego=0.6, lead=stopped)
-    self.assertLess(output, -0.8)
-
-    moving = LeadObservation(True, distance=5.0, speed=0.5)
-    output = run_settle(controller, 2.0, v_ego=0.6, last_output=output, lead=moving)
-    self.assertGreater(output, -0.3)
-
-  def test_close_equal_speed_lead_uses_relative_motion(self):
-    controller = SmoothStopController()
-    lead = LeadObservation(True, distance=2.9, speed=0.6)
-    output = controller.settle(-0.05, 0.6, -0.15, lead)
-    self.assertGreater(output, -0.2)
-
-
-if __name__ == "__main__":
-  unittest.main()
+    controller.arm_hold()
+    for _ in range(HOLD_RELEASE_FRAMES):
+      controller.hold_release(False, 0.0)
+    controller.arm_hold()
+    assert not controller.hold_release(False, 0.0)

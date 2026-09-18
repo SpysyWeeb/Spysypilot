@@ -22,7 +22,13 @@ SPEED, ACCEL = 0, 1     # Kalman filter states enum
 
 # stationary qualification parameters
 V_EGO_STATIONARY = 4.   # no stationary object flag below this speed
-LOW_SPEED_LEAD_MIN_CNT = 20  # ~1 s at 20 Hz before an unconfirmed close radar track can override vision
+# The unconfirmed low speed override only trusts a track it watched arrive: clutter and crossing traffic
+# appear at close range, while a real stopped lead is tracked for seconds on approach. A track's age
+# restarts whenever the radar drops it for a cycle, so the age gate filters short lived returns; a real
+# object the radar flickers on has to age in again. A return closer than 0.6s of travel at the current
+# speed is ground under the bumper, not a lead.
+LOW_SPEED_LEAD_MIN_CNT = 20  # ~1 s at 20 Hz
+LOW_SPEED_LEAD_MIN_TIME = 0.6  # s of travel
 
 RADAR_TO_CAMERA = 1.52  # RADAR is ~ 1.5m ahead from center of mesh frame
 
@@ -99,15 +105,8 @@ class Track:
   def potential_low_speed_lead(self, v_ego: float):
     # stop for stuff in front of you and low speed, even without model confirmation
     # Radar points closer than 0.75, are almost always glitches on toyota radars
-    # Vision-confirmed leads bypass this override. Require an unconfirmed track
-    # to persist before it can command a close-range stop; this rejects brief
-    # clutter/cross-traffic tracks that first appear beside a stopped vehicle.
-    return (
-      abs(self.yRel) < 1.0
-      and v_ego < V_EGO_STATIONARY
-      and 0.75 < self.dRel < 25
-      and self.cnt >= LOW_SPEED_LEAD_MIN_CNT
-    )
+    return (abs(self.yRel) < 1.0 and (v_ego < V_EGO_STATIONARY) and (self.cnt >= LOW_SPEED_LEAD_MIN_CNT)
+            and (max(0.75, LOW_SPEED_LEAD_MIN_TIME * v_ego) < self.dRel < 25))
 
   def __str__(self):
     ret = f"x: {self.dRel:4.1f}  y: {self.yRel:4.1f}  v: {self.vRel:4.1f}  a: {self.aLeadK:4.1f}"
@@ -179,6 +178,7 @@ def get_lead(v_ego: float, ready: bool, tracks: dict[int, Track], lead_msg: capn
       closest_track = min(low_speed_tracks, key=lambda c: c.dRel)
 
       # Only choose new track if it is actually closer than the previous one
+      # this holds whether the current lead is vision confirmed or not
       if (not lead_dict['present']) or (closest_track.dRel < lead_dict['dRel']):
         lead_dict = closest_track.get_RadarState()
 

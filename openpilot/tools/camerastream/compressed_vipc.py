@@ -8,8 +8,8 @@ from collections import deque
 
 
 import openpilot.cereal.messaging as messaging
-from msgq.visionipc import VisionIpcServer
 from openpilot.cereal.visionipc import VisionStreamType
+from msgq.visionipc import VisionIpcServer
 from openpilot.tools.camerastream.ffmpeg_decoder import Decoder, FFmpegError
 
 V4L2_BUF_FLAG_KEYFRAME = 8

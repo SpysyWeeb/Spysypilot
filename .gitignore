@@ -39,6 +39,8 @@ bin/
 *.os-*
 *.so
 *.a
+st[0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z][0-9A-Za-z]
+*.unchunked
 *.clb
 *.class
 *.pyxbldc
@@ -48,15 +50,15 @@ bin/
 *.stats
 *.pkl
 *.pkl*
+!openpilot/selfdrive/modeld/models/big_driving_tinygrad.pkl
 config.json
 compile_commands.json
 compare_runtime*.html
 openpilot/selfdrive/modeld/models/tg_input_devices.json
 
 # build artifacts
-docs_site/
+docs/_site/
 openpilot/selfdrive/pandad/pandad
-openpilot/selfdrive/controls/blatv2_rlog_extract
 openpilot/cereal/services.h
 openpilot/cereal/gen
 openpilot/cereal/messaging/bridge

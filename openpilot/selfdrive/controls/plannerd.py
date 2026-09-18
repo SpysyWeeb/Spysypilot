@@ -25,7 +25,7 @@ def main():
 
   ldw = LaneDepartureWarning()
   longitudinal_planner = LongitudinalPlanner(CP)
-  pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance'])
+  pm = messaging.PubMaster(['longitudinalPlan', 'curvePolicyState', 'driverAssistance'])
   sm = get_submaster()
 
   while True:

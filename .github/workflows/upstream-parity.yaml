@@ -1,0 +1,127 @@
+name: upstream parity
+
+# Fails when a file differs from the merge base with commaai/openpilot master and is not listed in
+# .github/upstream-parity-allowlist.txt (docs/SYNC_POLICY.md, rule 1). The check itself is
+# tools/sync/parity_check.sh, which humans run the same way.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - combo
+  workflow_dispatch:
+    inputs:
+      all_branches:
+        description: "check combo and the 20 rebuild branches instead of the selected ref"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-parity-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # the commit this event is about: PR head, pushed commit, or dispatched ref
+  parity:
+    if: github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.all_branches)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out parity tools
+        uses: actions/checkout@v4
+        with:
+          path: policy
+          fetch-depth: 1
+          sparse-checkout: |
+            tools/sync/
+            .github/upstream-parity-allowlist.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Check out the commit under test
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check parity with upstream
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/policy/tools/sync/parity_check.sh" --rev HEAD --repo-slug "$SLUG" \
+            --fallback-allowlist "$GITHUB_WORKSPACE/policy/.github/upstream-parity-allowlist.txt"
+
+  # Scheduled runs read the default branch's copy of this workflow and of tools/sync, so they also
+  # cover the feature branches that carry neither; those are matched against combo's allowlist.
+  parity-branches:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.all_branches)
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - combo
+          - auto-update
+          - better-boot-screen
+          - better-green-lights
+          - BLoTv3
+          - c3x-chestnut-v2
+          - curve-speed-limit
+          - custom-main-menu
+          - detailed-stats-sidebar
+          - error-log-viewer
+          - fan-control
+          - hot-swap-experimental
+          - nudgless-lane-changes
+          - params-clear-pandad-keys
+          - params-clear-pandad-keys-at-offroad
+          - side-buttons
+          - smooth-stops
+          - SOL
+          - spinning-steering-wheel
+          - swapped-cruise-speed
+          - torque-bar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out parity tools
+        uses: actions/checkout@v4
+        with:
+          path: policy
+          fetch-depth: 1
+          sparse-checkout: |
+            tools/sync/
+            .github/upstream-parity-allowlist.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Check out ${{ matrix.branch }}
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          ref: ${{ matrix.branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check parity with upstream
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/policy/tools/sync/parity_check.sh" --rev HEAD --repo-slug "$GITHUB_REPOSITORY" \
+            --fallback-allowlist "$GITHUB_WORKSPACE/policy/.github/upstream-parity-allowlist.txt"

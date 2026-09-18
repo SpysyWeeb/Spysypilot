@@ -7,8 +7,8 @@ import openpilot.cereal.messaging as messaging
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
-from msgq.visionipc import VisionIpcClient
 from openpilot.cereal.visionipc import VisionStreamType
+from msgq.visionipc import VisionIpcClient
 
 
 from openpilot.common.params import Params
@@ -16,7 +16,7 @@ from openpilot.common.realtime import config_realtime_process, Priority, Ratekee
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.gps import get_gps_location_service
 
-from openpilot.selfdrive.car.car_specific import CarSpecificEvents
+from openpilot.selfdrive.car.car_events import CarEvents
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
@@ -63,7 +63,7 @@ class SelfdriveD:
     else:
       self.CP = CP
 
-    self.car_events = CarSpecificEvents(self.CP)
+    self.car_events = CarEvents(self.CP)
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -209,7 +209,9 @@ class SelfdriveD:
 
     # Check for user bookmark press
     if self.sm.updated['userBookmark']:
-      self.events.add(EventName.userBookmark)
+      prime_type = self.params.get("PrimeType")
+      paired = prime_type is not None and int(prime_type) >= 0
+      self.events.add(EventName.userBookmark if paired else EventName.userBookmarkNotPaired)
 
     # Don't add any more events while in dashcam mode
     if self.CP.passive:
@@ -304,8 +306,8 @@ class SelfdriveD:
     if self.sm.updated['extrinsicsCalibration']:
       self.pose_calibrator.feed_extrinsics_calibration(self.sm['extrinsicsCalibration'])
     if self.sm.updated['deviceMotion']:
-      device_pose = Pose.from_device_motion(self.sm['deviceMotion'])
-      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_pose)
+      device_motion = Pose.from_device_motion(self.sm['deviceMotion'])
+      self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_motion)
 
     if self.calibrated_pose is not None and not self.CP.notCar:
       excessive_actuation = self.excessive_actuation_check.update(self.sm, CS, self.calibrated_pose)
@@ -408,11 +410,12 @@ class SelfdriveD:
       self.logged_comm_issue = None
 
     if not self.CP.notCar and not big_model_settling:  # localization has nothing to work with during the load
-      if not self.sm['deviceMotion'].posenetOK:
+      # the defaults of a message that was never received are not a localizer failure
+      if self.sm.seen['deviceMotion'] and not self.sm['deviceMotion'].posenetOK:
         self.events.add(EventName.posenetInvalid)
-      if not self.sm['deviceMotion'].inputsOK:
+      if self.sm.seen['deviceMotion'] and not self.sm['deviceMotion'].inputsOK:
         self.events.add(EventName.locationdTemporaryError)
-      if (not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
+      if (self.sm.seen['vehicleParameters'] and not self.sm['vehicleParameters'].valid and cal_status == log.ExtrinsicsCalibration.Status.calibrated and
           not TESTING_CLOSET and (not SIMULATION or REPLAY)):
         self.events.add(EventName.paramsdTemporaryError)
 
@@ -558,10 +561,6 @@ class SelfdriveD:
     ss.engageable = not self.events.contains(ET.NO_ENTRY)
     ss.experimentalMode = self.experimental_mode
     ss.personality = self.personality
-    ss.conditionalStopQualified = self.conditional_experimental_mode.stop_qualified
-    ss.conditionalStopDistance = self.conditional_experimental_mode.stop_distance or 0.0
-    ss.conditionalStopModelMonoTime = self.sm.logMonoTime['modelV2'] if self.conditional_experimental_mode.stop_qualified else 0
-    ss.conditionalStopLatched = self.conditional_experimental_mode.stop_latched
 
     ss.alertText1 = self.AM.current_alert.alert_text_1
     ss.alertText2 = self.AM.current_alert.alert_text_2
@@ -586,20 +585,15 @@ class SelfdriveD:
     self.params.put_bool("ExperimentalMode", self.manual_experimental_mode)
 
   def update_experimental_mode(self, CS):
-    conditional_mode = self.conditional_experimental_mode.update(
-      self.sm['modelV2'],
-      CS,
-      self.sm['radarState'],
+    # the manual setting and the conditional request resolve here, the only owner of the effective mode
+    conditional = self.conditional_experimental_mode.update(
+      self.sm['modelV2'], CS, self.sm['radarState'],
       controls_enabled=self.enabled and self.CP.openpilotLongitudinalControl,
-      model_updated=bool(self.sm.updated['modelV2']),
-      model_valid=bool(self.sm.valid['modelV2'] and self.sm.alive['modelV2'] and self.sm.freq_ok['modelV2']),
-      radar_valid=bool(self.sm.valid['radarState'] and self.sm.alive['radarState'] and self.sm.freq_ok['radarState']),
+      model_updated=self.sm.updated['modelV2'],
+      model_valid=self.sm.valid['modelV2'] and self.sm.alive['modelV2'] and self.sm.freq_ok['modelV2'],
+      radar_valid=self.sm.valid['radarState'] and self.sm.alive['radarState'] and self.sm.freq_ok['radarState'],
     )
-    self.experimental_mode = bool(
-      self.CP.openpilotLongitudinalControl and
-      not self.conditional_experimental_mode.driver_override_active and
-      (self.manual_experimental_mode or conditional_mode)
-    )
+    self.experimental_mode = self.manual_experimental_mode or conditional
 
   def step(self):
     CS = self.data_sample()

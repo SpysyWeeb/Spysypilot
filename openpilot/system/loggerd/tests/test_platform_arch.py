@@ -43,11 +43,18 @@ def test_comma_hardware_runtime_contract():
 
 
 def test_chestnut_build_contract():
-  text = (ROOT / "openpilot/selfdrive/modeld/SConscript").read_text()
+  # c3x-chestnut-v2: the big model is upstream's precompiled LFS pickle and every warp is compiled for the
+  # device GPU, so nothing is built for the Chestnut and modeld warps locally for the big model too
+  sconscript = (ROOT / "openpilot/selfdrive/modeld/SConscript").read_text()
+  assert "chestnut" not in sconscript.lower()
+  assert "USB+AMD" not in sconscript
 
-  assert "TC_OPT=2" in text
-  assert "from openpilot.system.hardware.chestnut.flash import link_up" in text
-  assert "Chestnut not ready, skipping big model build" in text
+  modeld = (ROOT / "openpilot/selfdrive/modeld/modeld.py").read_text()
+  assert "big_driving_warp" not in modeld
+  assert "from openpilot.system.hardware.chestnut.flash import link_up" in modeld
+
+  attributes = (ROOT / ".gitattributes").read_text()
+  assert "openpilot/selfdrive/modeld/models/big_driving_tinygrad.pkl filter=lfs" in attributes
 
 
 def test_camera_name_contract():

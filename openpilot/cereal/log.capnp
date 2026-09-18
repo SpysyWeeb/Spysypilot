@@ -128,6 +128,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     personalityChanged @91;
     aeb @92;
     userBookmark @95;
+    userBookmarkNotPaired @104;
     excessiveActuation @96;
     bigModelLoading @100;
     bigModelFailed @102;
@@ -180,13 +181,13 @@ struct InitData {
 
   enum DeviceType {
     unknown @0;
-    neo @1;
+    neo @1;   # NEO, EON, & comma two
     chffrAndroid @2;
     chffrIos @3;
-    tici @4;
+    tici @4;  # comma three
     pc @5;
-    tizi @6;
-    mici @7;
+    tizi @6;  # comma 3X
+    mici @7;  # comma four
   }
 
   struct PandaInfo {
@@ -821,10 +822,6 @@ struct SelfdriveState {
   # configurable driving settings
   experimentalMode @10 :Bool;
   personality @11 :LongitudinalPersonality;
-  conditionalStopQualified @14 :Bool;
-  conditionalStopDistance @15 :Float32;
-  conditionalStopModelMonoTime @16 :UInt64;
-  conditionalStopLatched @17 :Bool;
 
   enum AudibleAlert {
     none @0;
@@ -867,6 +864,10 @@ struct SelfdriveState {
 
   deprecated :group {
     alertSound @8 :Car.CarControl.HUDControl.AudibleAlert;
+    conditionalStopQualified @14 :Bool;
+    conditionalStopDistance @15 :Float32;
+    conditionalStopModelMonoTime @16 :UInt64;
+    conditionalStopLatched @17 :Bool;
   }
 }
 
@@ -881,7 +882,6 @@ struct ControlsState @0x97ff69c53601abf1 {
   curvature @37 :Float32;  # path curvature from vehicle model
   desiredCurvature @61 :Float32;  # lag adjusted curvatures used by lateral controllers
   forceDecel @51 :Bool;
-  rackTrajectoryState @67 :RackTrajectoryState;
 
   lateralControlState :union {
     pidState @53 :LateralPIDState;
@@ -921,245 +921,7 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
-    measurementRate @13 :Float32;  # filtered curvature-motion lateral-acceleration rate, excludes 2*v*a*kappa, m/s^3
-    rateBrake @14 :Float32;        # bounded D-on-measurement contribution, m/s^2
-    rateBrakeScale @15 :Float32;   # combined opposing-demand and speed-schedule gate
-    delayedDesiredCurvature @16 :Float32;    # delay-aligned curvature used by feedback, 1/m
-    legacyDesiredLateralAccel @17 :Float32;  # old-speed buffered reference for A/B attribution, m/s^2
-    speedAlignmentCorrection @18 :Float32;   # new reference minus legacy reference, m/s^2
-    actuationSpeed @19 :Float32;               # bounded delay-projected speed before lateral-acceleration cap, m/s
-    currentSpeedDesiredLateralAccel @20 :Float32; # desired lateral acceleration before speed projection, m/s^2
-    speedProjectionCorrection @21 :Float32;    # projected minus current-speed feedforward reference, m/s^2
-    longitudinalLateralAccelRate @22 :Float32; # excluded 2*v*a*kappa measurement-rate component, m/s^3
-    rateBrakeSpeedScale @23 :Float32;          # speed-only portion of the all-speed rate-brake gate
-    referenceVersion @24 :Int32;               # future-path reference implementation version
-    referenceBaseCurvature @25 :Float32;       # legacy fixed-delay trajectory sample, 1/m
-    referenceOutputCurvature @26 :Float32;     # actuator-aware path reference before clip_curvature, 1/m
-    referencePreviewTime @27 :Float32;         # total model-horizon sample time, seconds
-    referencePreviewExtraTime @28 :Float32;    # actuator-delivery addition to fixed preview, seconds
-    referenceTargetTorque @29 :Float32;        # normalized torque estimated for the selected future path
-    referenceAppliedTorque @30 :Float32;       # normalized torque delivered by carcontroller last cycle
-    referenceUnwindScale @31 :Float32;         # path-phase confidence that the selected reference is unwinding
-    referenceAuthorityRestored @32 :Float32;   # turn strength restored over smoothed path, m/s^2
-    referencePreviewCorrection @33 :Float32;   # output minus legacy reference, m/s^2
-    referenceRate @34 :Float32;                # future-path curvature rate at the tracking speed floor, m/s^3
-    trackingMeasurementRate @35 :Float32;      # measured curvature-motion rate at the same tracking speed, m/s^3
-    rateTrackingError @36 :Float32;            # reference minus measured curvature-motion rate, m/s^3
-    rateTrackingCorrection @37 :Float32;       # bounded rate-tracking contribution, m/s^2
-    rateTrackingSpeedScale @38 :Float32;       # all-speed gain schedule applied to rate tracking
-    referenceCurvatureRate @39 :Float32;        # curvature rate selected for cascade tracking, 1/m/s
-    measurementCurvatureRate @40 :Float32;      # filtered measured curvature rate, 1/m/s
-    cascadePositionError @41 :Float32;          # delay-aligned curvature error at the tracking speed, m/s^2
-    cascadeCatchupRate @42 :Float32;            # bounded position-error contribution to desired rate, m/s^3
-    cascadeDesiredRate @43 :Float32;            # future-path rate plus bounded catch-up rate, m/s^3
-    cascadeRateError @44 :Float32;              # cascade desired rate minus measured rate, m/s^3
-    actuatorAppliedLateralAccel @45 :Float32;    # applied normalized torque expressed in controller coordinates, m/s^2
-    actuatorStateCorrection @46 :Float32;       # future-rate-gated feedback from applied actuator state, m/s^2
-    cascadePScale @47 :Float32;                 # residual share of the legacy direct proportional path
-    unwindBrakeActivation @48 :Float32;         # future-path/applied-torque braking blend
-    unwindTorqueZeroTime @49 :Float32;           # predicted time for applied torque to decay to zero, seconds
-    unwindProjectedPositionError @50 :Float32;   # position error projected to torque-zero time, m/s^2
-    unwindTorqueCorrection @51 :Float32;         # normalized request shift toward the future target torque
-    cascadeBasePScale @52 :Float32;              # speed-scheduled P share before future-unwind arbitration
-    dampingTurnInBlocked @53 :Bool;               # preserve authority while a same-direction turn is under-tracked
-    referenceGeometricTargetTorque @54 :Float32;  # controller-consistent torque for the selected path sample
-    referenceNeutralTorque @55 :Float32;          # roll/offset torque required at zero geometric curvature
-    referenceReachableTargetTorque @56 :Float32;  # backward rate-reachable target from the future torque trajectory
-    unwindEffectivePhase @57 :Float32;             # geometry phase retained through actuator delivery and P handback
-    unwindPhaseDirection @58 :Float32;             # original turn torque sign for the active unwind episode
-    unwindDeliveryGap @59 :Float32;                # old-turn applied torque remaining beyond the reachable target
-    unwindPhaseOverspeed @60 :Float32;             # wheel-rate excess in the active unwind direction, m/s^3
-    unwindNeutralTorque @61 :Float32;               # controller-side roll/offset neutral used for delivery timing
-    unwindTorqueNeutralTime @62 :Float32;           # predicted transition time from applied torque to neutral, seconds
-    unwindSameEpisode @63 :Bool;                    # active phase still belongs to the original geometric maneuver
-    unwindOppositeTime @64 :Float32;                # persisted opposite geometric-torque demand, seconds
-    unwindEpisodeArmed @65 :Bool;                   # planner unwind geometry reset since the previous handoff
-    finiteDifferenceReferenceCurvatureRate @66 :Float32; # shadow rate from differentiating the final command, 1/m/s
-    trajectoryReferenceCurvatureRate @67 :Float32;       # centered rate from the continuous future path, 1/m/s
-    trajectoryReferenceRateValid @68 :Bool;              # future-path rate selected instead of the shadow fallback
-    trajectoryReferenceInnovation @69 :Float32;          # differentiated-command rate minus trajectory rate, 1/m/s
-    filteredTrajectoryReferenceInnovation @70 :Float32;  # low-frequency innovation retained by the cascade, 1/m/s
-    referenceSustainedUnwindScale @71 :Float32;           # unwind confidence sustained across the release-preview horizon
-    referenceEpisodeTargetTorque @72 :Float32;           # later geometric torque used to confirm episode handoff
-    referenceEpisodeLateralAccel @73 :Float32;           # later geometric lateral acceleration used to reject friction-only sign flips
-    # BLaTv2 live promotion telemetry. The preceding frozen-v14 slots remain
-    # permanently assigned for old-route wire compatibility even when the
-    # active controller leaves them unpopulated.
-    blatV2Status @74 :UInt8;
-    blatV2ComputeTimeSeconds @75 :Float64;
-    blatV2OutputValid @76 :Bool;
-    blatV2InvalidFrames @77 :UInt16;
-    blatV2RecoveryOkFrames @78 :UInt8;
-    blatV2CommandTorque @79 :Float64;
-    blatV2RawCommandTorque @80 :Float64;
-    blatV2FeedforwardTorque @81 :Float64;
-    blatV2FeedbackTorque @82 :Float64;
-    blatV2DesiredAngleDeg @83 :Float64;
-    blatV2DesiredRateDegS @84 :Float64;
-    blatV2DesiredAccelerationDegS2 @85 :Float64;
-    blatV2PredictedAngleDeg @86 :Float64;
-    blatV2PredictedRateDegS @87 :Float64;
-    blatV2RequiredAccelerationDegS2 @88 :Float64;
-    blatV2ActionSpeedMps @89 :Float64;
-    blatV2AligningTorque @90 :Float64;
-    blatV2FrictionTorque @91 :Float64;
-    blatV2DynamicTorque @92 :Float64;
-    blatV2ActionTimeSeconds @93 :Float64;
-    blatV2SlewConstrained @94 :Bool;
-    blatV2BreakawayActive @95 :Bool;
-    blatV2BreakawayPersistenceFrames @96 :UInt16;
-    blatV2HorizonAssistActive @97 :Bool;
-    blatV2HorizonTorqueDemand @98 :Float64;
-    blatV2HorizonDemandTimeSeconds @99 :Float64;
-    blatV2NoLeadLimited @100 :Bool;
-    blatV2PredictionDelaySeconds @101 :Float64;
-    blatV2SignedRackRateDegS @102 :Float64;
-    blatV2HeldStaticLoad @103 :Float64;
-    blatV2RackStationary @104 :Bool;
-    blatV2AdaptiveModelVersion @105 :UInt16;
-    blatV2AdaptiveGain @106 :Float64;
-    blatV2AdaptiveDamping @107 :Float64;
-    blatV2AdaptiveAlignGain @108 :Float64;
-    blatV2AdaptiveMovingFriction @109 :Float64;
-    blatV2AdaptiveRoadLoad @110 :Float64;
-    blatV2AdaptiveConfidence @111 :Float64;
-    blatV2AdaptiveSampleCount @112 :UInt64;
-    blatV2AdaptiveLearningActive @113 :Bool;
-    blatV2AdaptiveRateDegS @114 :Float64;
-    blatV2AdaptiveAccelerationDegS2 @115 :Float64;
-    blatV2AdaptiveRateResolutionDegS @116 :Float64;
-    blatV2AdaptiveResponseLagSeconds @117 :Float64;
-    blatV2AdaptiveOutcomeConfidence @118 :Float64;
-    blatV2AdaptiveOutcomePhase @119 :UInt8;
-    blatV2AdaptiveOutcomeSignedLagSeconds @120 :Float64;
-    blatV2AdaptiveOutcomeTrackingErrorFraction @121 :Float64;
-    blatV2AdaptiveOutcomeReleaseOvershootMps2 @122 :Float64;
-    blatV2AdaptiveOutcomeRoughnessPerS @123 :Float64;
-    blatV2AdaptiveOutcomeBurstPerS @124 :Float64;
-    blatV2AdaptiveOutcomeCount @125 :UInt64;
-    blatV2AdaptiveOutcomeLearningActive @126 :Bool;
-
-    # Ground-up modular BLaTv2 live controller telemetry. Historical fields
-    # @0..126 remain reserved with their original wire meanings.
-    modularArchitecture @127 :Text;
-    modularControllerVersion @128 :UInt16;
-    modularSelection @129 :UInt8;
-    modularBindingReason @130 :UInt8;
-    modularCandidateStatus @131 :UInt8;
-    modularCoreStatus @132 :UInt8;
-    modularArtifactHash @133 :Text;
-    modularProfileHash @134 :Text;
-    modularPolicyHash @135 :Text;
-    modularRuntimeIdentityHash @136 :Text;
-    modularSourceOpenpilotCommit @137 :Text;
-    modularOpendbcCommit @138 :Text;
-    modularControlWitnessMonoTime @139 :UInt64;
-    modularStateSampleMonoTime @140 :UInt64;
-    modularModelPublicationMonoTime @141 :UInt64;
-    modularModelTimestampEof @142 :UInt64;
-    modularDesiredCurvatureTimeSeconds @143 :Float64;
-    modularRawScalarCurvature @144 :Float64;
-    modularReferenceCurvature @145 :Float64;
-    modularRawTorque @146 :Float64;
-    modularCommandTorque @147 :Float64;
-    modularFeasibleTorque @148 :Float64;
-    modularAligningTorque @149 :Float64;
-    modularFrictionTorque @150 :Float64;
-    modularMotionFeedforwardTorque @151 :Float64;
-    modularPositionFeedbackTorque @152 :Float64;
-    modularRateFeedbackTorque @153 :Float64;
-    modularDisturbanceTorque @154 :Float64;
-    modularDesiredAngleDeg @155 :Float64;
-    modularDesiredRateDegS @156 :Float64;
-    modularDesiredAccelerationDegS2 @157 :Float64;
-    modularMeasuredAngleDeg @158 :Float64;
-    modularMeasuredRateDegS @159 :Float64;
-    modularMeasuredAccelerationDegS2 @160 :Float64;
-    modularPredictedAngleDeg @161 :Float64;
-    modularPredictedRateDegS @162 :Float64;
-    modularPreviousAppliedCounts @163 :Int32;
-    modularPreviousAppliedTorque @164 :Float64;
-    modularDriverTorque @165 :Float64;
-    modularConstraintActive @166 :Bool;
-    modularConstraintReason @167 :UInt8;
-    modularFeasibilityStatus @168 :UInt8;
-    modularSafetyState @169 :UInt8;
-    modularControlsValid @170 :Bool;
-    modularCarControlValid @171 :Bool;
-    modularInvalidFrames @172 :UInt16;
-    modularRecoveryOkFrames @173 :UInt8;
-    modularPreviousOutputConstrained @174 :Bool;
-    modularPreviousActuatorConstrained @175 :Bool;
-    modularVehicleStateValid @176 :Bool;
-    modularLiveParametersValid @177 :Bool;
-    modularIntentStatus @178 :UInt8;
-    modularComputeTimeSeconds @179 :Float64;
-    modularStateAgeSeconds @180 :Float64;
-    modularTotalPredictionHorizonSeconds @181 :Float64;
-    modularTransportDelaySeconds @182 :Float64;
-    modularCommandEnvelopeApplied @183 :Bool;
-    modularManeuverForcedStock @184 :Bool;
-    modularProductionEnvelopeVerified @185 :Bool;
-    modularSelectionBound @186 :Bool;
-    modularHorizonPolicyHash @187 :Text;
-    modularPlannedTorque @188 :Float64;
-    modularPlannedCounts @189 :Int32;
-    modularReactiveTorque @190 :Float64;
-    modularReactiveCounts @191 :Int32;
-    modularRawRequestedCounts @192 :Int32;
-    modularRawToPlannedResidualCounts @193 :Int32;
-    modularRawToPlannedUnmetTorque @194 :Float64;
-    modularPreparationActive @195 :Bool;
-    modularPreparationScheduled @196 :Bool;
-    modularHorizonStatus @197 :UInt8;
-    modularHorizonValid @198 :Bool;
-    modularDriverSuppressed @199 :Bool;
-    modularFutureBandReachable @200 :Bool;
-    modularFirstUnreachableIndex @201 :Int16;
-    modularFirstUnreachableTimeSeconds @202 :Float64;
-    modularMaximumBandResidualCounts @203 :UInt16;
-    modularMaximumPathLeadDeg @204 :Float64;
-    modularMaximumPathRateLeadDegS @205 :Float64;
-    modularPathLeadConstrainedSamples @206 :UInt16;
-    modularMaximumAuthorityRequired @207 :Bool;
-    modularMaximumAuthorityActive @208 :Bool;
-    modularMaximumUrgency @209 :Float64;
-    modularPreviousCommandCounts @210 :Int32;
-    modularRecordedAppliedTorque @211 :Float64;
-    modularSteeringRequestActive @212 :Bool;
-    modularSteeringRequestValid @213 :Bool;
-    modularSteeringRequestFaultAvoidanceCounter @214 :UInt8;
-    modularControlCadenceValid @215 :Bool;
-    modularTransportReprimed @216 :Bool;
-    modularAdapterException @217 :Bool;
-    modularRawToPlannedConstrained @218 :Bool;
-    modularFinalExpectedCounts @219 :Int32;
-    modularFinalCountResidual @220 :Int32;
-    modularFinalCountMatchValid @221 :Bool;
-    modularFinalLimiterAltered @222 :Bool;
    }
-
-  struct RackTrajectoryState {
-    active @0 :Bool;
-    targetSteeringAngleDeg @1 :Float32;
-    targetSteeringRateDegS @2 :Float32;
-    plannedSteeringAngleDeg @3 :Float32;
-    plannedSteeringRateDegS @4 :Float32;
-    plannedSteeringAccelerationDegS2 @5 :Float32;
-    measuredSteeringRateDegS @6 :Float32;
-    feedbackTorque @7 :Float32;
-    feedbackLimited @8 :Bool;
-    motionLimited @9 :Bool;
-    torqueLimited @10 :Bool;
-    infeasible @11 :Bool;
-    rateLimitDegS @12 :Float32;
-    accelerationLimitDegS2 @13 :Float32;
-    jerkLimitDegS3 @14 :Float32;
-    profileTransition @15 :Bool;
-    status @16 :UInt8; # 0 inactive, 1 active, 2 reserved, 3 no model, 4 invalid state, 5 stale, 6 invalid action time, 7 invalid path, 8 invalid output, 9 invalid planner state
-    pathLimited @17 :Bool;
-    targetCurvature @18 :Float32;
-  }
 
   struct LateralAngleState {
     active @0 :Bool;
@@ -1248,6 +1010,7 @@ struct DrivingModelData {
   frameIdExtra @1 :UInt32;
   frameDropPerc @6 :Float32;
   modelExecutionTime @7 :Float32;
+  big @8 :Bool;
 
   action @2 :ModelDataV2.Action;
 
@@ -1398,7 +1161,6 @@ struct ModelDataV2 {
     desiredCurvature @0 :Float32;
     desiredAcceleration @1 :Float32;
     shouldStop @2 :Bool;
-    desiredCurvatureTime @3 :Float32; # seconds from the model plan/timestampEof origin
   }
 
   deprecated :group {
@@ -1491,6 +1253,7 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
     lead2 @3;
     e2e @4;
     stop @5;
+    curve @6;
   }
 
 
@@ -3258,168 +3021,9 @@ struct AudioData {
   sampleRate @1 :UInt32;
 }
 
-struct BlatV2Shadow {
-  shadowVersion @0 :UInt16;
-  valid @1 :Bool;
-  referenceCurvature @2 :Float64;
-  torqueDemand @3 :Float64;
-  feasibleTorque @4 :Float64;
-  plantResidual @5 :Float64;
-  scalarPlanDisagreement @6 :Float64;
-  horizon @7 :Float64;
-  computeTimeSeconds @8 :Float64;
-  vEgo @9 :Float64;
-  aligningTorque @10 :Float64;
-  alignInputsValid @11 :Bool;
-  disturbanceEstimate @12 :Float64;
-  observerStatus @13 :UInt8;
-  observerUnconstrainedUpdate @14 :Float64;
-  mpcCommandTorque @15 :Float64;
-  mpcStatus @16 :UInt8;
-  mpcCandidateCount @17 :UInt16;
-  mpcOptimalityResidual @18 :Float64;
-  mpcComputeTimeSeconds @19 :Float64;
-  fallbackCommandTorque @20 :Float64;
-  fallbackStatus @21 :UInt8;
-  fallbackCandidateCount @22 :UInt16;
-  fallbackOptimalityResidual @23 :Float64;
-  fallbackComputeTimeSeconds @24 :Float64;
-  sharedComputeTimeSeconds @25 :Float64;
-  mpcAvailableScheduleCount @26 :UInt16;
-  liveLqiCommandTorque @27 :Float64;
-  liveLqiStatus @28 :UInt8;
-  liveLqiComputeTimeSeconds @29 :Float64;
-  liveLqiOutputValid @30 :Bool;
-  liveLqiInvalidFrames @31 :UInt16;
-  liveLqiRecoveryOkFrames @32 :UInt8;
-  v14CommandTorque @33 :Float64;
-  v14DesiredCurvature @34 :Float64;
-  v14ControllerVersion @35 :Int32;
-  v14Valid @36 :Bool;
-  v14ComputeTimeSeconds @37 :Float64;
-  liveLqiControllerVersion @38 :Int32;
-  liveActionRawCommandTorque @39 :Float64;
-  liveActionFeedforwardTorque @40 :Float64;
-  liveActionFeedbackTorque @41 :Float64;
-  liveActionDesiredAngleDeg @42 :Float64;
-  liveActionDesiredRateDegS @43 :Float64;
-  liveActionDesiredAccelerationDegS2 @44 :Float64;
-  liveActionPredictedAngleDeg @45 :Float64;
-  liveActionPredictedRateDegS @46 :Float64;
-  liveActionRequiredAccelerationDegS2 @47 :Float64;
-  liveActionSpeedMps @48 :Float64;
-  liveActionAligningTorque @49 :Float64;
-  liveActionFrictionTorque @50 :Float64;
-  liveActionDynamicTorque @51 :Float64;
-  liveActionTimeSeconds @52 :Float64;
-  liveActionSlewConstrained @53 :Bool;
-  liveActionBreakawayActive @54 :Bool;
-  liveActionBreakawayPersistenceFrames @55 :UInt16;
-  liveActionHorizonAssistActive @56 :Bool;
-  liveActionHorizonTorqueDemand @57 :Float64;
-  liveActionHorizonDemandTimeSeconds @58 :Float64;
-  liveActionNoLeadLimited @59 :Bool;
-  liveActionPredictionDelaySeconds @60 :Float64;
-  signedRackRateDegS @61 :Float64;
-  liveActionHeldStaticLoad @62 :Float64;
-  rackStationary @63 :Bool;
-  liveAdaptiveModelVersion @64 :UInt16;
-  liveAdaptiveGain @65 :Float64;
-  liveAdaptiveDamping @66 :Float64;
-  liveAdaptiveAlignGain @67 :Float64;
-  liveAdaptiveMovingFriction @68 :Float64;
-  liveAdaptiveRoadLoad @69 :Float64;
-  liveAdaptiveConfidence @70 :Float64;
-  liveAdaptiveSampleCount @71 :UInt64;
-  liveAdaptiveLearningActive @72 :Bool;
-  liveAdaptiveRateDegS @73 :Float64;
-  liveAdaptiveAccelerationDegS2 @74 :Float64;
-  liveAdaptiveRateResolutionDegS @75 :Float64;
-  liveAdaptiveResponseLagSeconds @76 :Float64;
-  liveAdaptiveOutcomeConfidence @77 :Float64;
-  liveAdaptiveOutcomePhase @78 :UInt8;
-  liveAdaptiveOutcomeSignedLagSeconds @79 :Float64;
-  liveAdaptiveOutcomeTrackingErrorFraction @80 :Float64;
-  liveAdaptiveOutcomeReleaseOvershootMps2 @81 :Float64;
-  liveAdaptiveOutcomeRoughnessPerS @82 :Float64;
-  liveAdaptiveOutcomeBurstPerS @83 :Float64;
-  liveAdaptiveOutcomeCount @84 :UInt64;
-  liveAdaptiveOutcomeLearningActive @85 :Bool;
-
-  # Modular BLaTv2 shadow telemetry. Historical fields @0..85 are immutable.
-  modularSchemaVersion @86 :UInt16;
-  modularRuntimeVehicleIdentityHash @87 :Text;
-  modularPolicyHash @88 :Text;
-  modularProfileHash @89 :Text;
-  modularModelFrameId @90 :UInt32;
-  modularIntentStatus @91 :UInt8;
-  modularCoreStatus @92 :UInt8;
-  modularValid @93 :Bool;
-  modularIntentUsable @94 :Bool;
-  modularProfileQualified @95 :Bool;
-  modularReferenceValid @96 :Bool;
-  modularScalarOnly @97 :Bool;
-  modularNominalMappingUsed @98 :Bool;
-  modularLiveParametersValid @99 :Bool;
-  modularRecordedActuatorConstrained @100 :Bool;
-  modularFeasibilityConstrained @101 :Bool;
-  modularObserverSaturated @102 :Bool;
-  modularRawTorque @103 :Float64;
-  modularFeasibleTorque @104 :Float64;
-  modularUnmetTorque @105 :Float64;
-  modularAligningTorque @106 :Float64;
-  modularFrictionTorque @107 :Float64;
-  modularMotionFeedforwardTorque @108 :Float64;
-  modularPositionFeedbackTorque @109 :Float64;
-  modularRateFeedbackTorque @110 :Float64;
-  modularDisturbanceTorque @111 :Float64;
-  modularDesiredCurvature @112 :Float64;
-  modularDesiredCurvatureRate @113 :Float64;
-  modularDesiredCurvatureAcceleration @114 :Float64;
-  modularDesiredAngleDeg @115 :Float64;
-  modularDesiredRateDegS @116 :Float64;
-  modularDesiredAccelerationDegS2 @117 :Float64;
-  modularMeasuredAngleDeg @118 :Float64;
-  modularMeasuredRateDegS @119 :Float64;
-  modularMeasuredAccelerationDegS2 @120 :Float64;
-  modularPredictedAngleDeg @121 :Float64;
-  modularPredictedRateDegS @122 :Float64;
-  modularPositionErrorDeg @123 :Float64;
-  modularRateErrorDegS @124 :Float64;
-  modularRequiredAccelerationDegS2 @125 :Float64;
-  modularObserverEstimateTorque @126 :Float64;
-  modularObserverInstantaneousTorque @127 :Float64;
-  modularObserverStatus @128 :UInt8;
-  modularProfileLowerNodeSpeedMps @129 :Float64;
-  modularProfileUpperNodeSpeedMps @130 :Float64;
-  modularProfileUpperWeight @131 :Float64;
-  modularTorquePerLateralAccel @132 :Float64;
-  modularRackGainDegS2PerTorque @133 :Float64;
-  modularRackDampingPerS @134 :Float64;
-  modularTransportDelaySeconds @135 :Float64;
-  modularStaticFrictionTorque @136 :Float64;
-  modularKineticFrictionTorque @137 :Float64;
-  modularRackRateResolutionDegS @138 :Float64;
-  modularProfileConfidence @139 :Float64;
-  modularPlanAgeSeconds @140 :Float64;
-  modularDesiredCurvatureTimeSeconds @141 :Float64;
-  modularPlanTimeNowSeconds @142 :Float64;
-  modularPhysicalEffectPlanSeconds @143 :Float64;
-  modularCurrentSpeedMps @144 :Float64;
-  modularEffectSpeedMps @145 :Float64;
-  modularMeasuredPreviousAppliedTorque @146 :Float64;
-  modularMeasuredDriverTorque @147 :Float64;
-  modularComputeTimeSeconds @148 :Float64;
-  modularModelInputValid @149 :Bool;
-  modularVehicleStateValid @150 :Bool;
-  modularLateralActive @151 :Bool;
-  modularLateralValid @152 :Bool;
-  modularActuationEnvelopeVerified @153 :Bool;
-  modularStateSampleMonoTime @154 :UInt64;
-  modularControlWitnessMonoTime @155 :UInt64;
-  modularStateAgeSeconds @156 :Float64;
-  modularTotalPredictionHorizonSeconds @157 :Float64;
-  modularHorizonPolicyHash @158 :Text;
+# Event's @156 slot held the BLaTv2 shadow message until the BLaTv2 tooling left combo on 2026-09-14. The empty
+# struct keeps the union's ordinals dense; routes recorded before then decode the member as an empty struct.
+struct BlatV2ShadowDEPRECATED {
 }
 
 struct Touch {
@@ -3470,7 +3074,7 @@ struct Event {
     vehicleParameters @61 :VehicleParameters;
     lateralTorqueParameters @94 :LateralTorqueParameters;
     lateralDelay @146 : LateralDelay;
-    blatV2Shadow @155 :BlatV2Shadow;
+    blatV2ShadowDEPRECATED @156 :BlatV2ShadowDEPRECATED;
     cameraOdometry @63 :CameraOdometry;
     thumbnail @66: Thumbnail;
     onroadEvents @134: List(OnroadEvent);
@@ -3505,6 +3109,7 @@ struct Event {
     clocks @35 :Clocks;
     deviceState @6 :DeviceState;
     chestnutState @152 :ChestnutState;
+    chestnutGpuState @153 :ChestnutState;
     logMessage @18 :Text;
     errorLogMessage @85 :Text;
 
@@ -3519,10 +3124,10 @@ struct Event {
     bookmarkButton @148 :UserBookmark;
 
     lateralManeuverPlan @150 :LateralManeuverPlan;
-    # Historical lateralEvent @152 routes require their exact source schema.
-    lateralEvent @156 :LateralEvent;
-    drivingEvent @153 :DrivingEvent;
-    drivingEventRecorded @154 :DrivingEventRecorded;
+    # Fork driving-feedback fields follow upstream ordinals through @153.
+    lateralEvent @157 :LateralEvent;
+    drivingEvent @154 :DrivingEvent;
+    drivingEventRecorded @155 :DrivingEventRecorded;
 
     # *********** debug ***********
     testJoystick @52 :Joystick;
@@ -3548,7 +3153,7 @@ struct Event {
     # DON'T change the ID (e.g. @107)
     # DON'T change which struct it points to
     spysydriveStateSP @107 :Custom.SpysydriveStateSP;
-    customReserved1 @108 :Custom.CustomReserved1;
+    curvePolicyState @108 :Custom.CurvePolicyState;
     customReserved2 @109 :Custom.CustomReserved2;
     customReserved3 @110 :Custom.CustomReserved3;
     customReserved4 @111 :Custom.CustomReserved4;

@@ -1,683 +1,490 @@
 import math
-from types import SimpleNamespace
-from unittest.mock import patch
-
-import numpy as np
-
-from openpilot.cereal import log
-from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, DV_MAX, ForceStops,
-                                                           GAS_OVERRIDE_S, LATCH_SETBACK, LATCH_THRESHOLD,
-                                                           STOP_POSITION_HOLD_S)
-from openpilot.selfdrive.controls.lib.force_stops import MPC_PROFILE_OFFSET_M
-from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE, LongitudinalMpc, LongitudinalPlanSource
-from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, get_cruise_accel
-from openpilot.selfdrive.modeld.constants import ModelConstants
-
-
-DT = 0.05
-
-
-def test_force_stop_cruise_candidate_limits_decel_jerk_in_experimental_mode():
-  args = (0.0, 10.0, 0.0, 0.0, SimpleNamespace(steerRatio=15.0, wheelbase=2.9), DT, 0.0, True)
-  assert math.isclose(get_cruise_accel(True, *args), get_cruise_accel(False, *args))
-
-
-class FakeSubMaster(dict):
-  def __init__(self, *, model_length=20.0, should_stop=True, desired_accel=-0.6,
-               v_ego=10.0, lead_present=False, model_valid=True, terminal_speed=0.0,
-               conditional_stop_qualified=False, qualified_distance=0.0,
-               model_mono_time=2_000_000_000, qualified_model_mono_time=2_000_000_000,
-               conditional_stop_latched=False):
-    super().__init__(
-      carState=SimpleNamespace(vEgo=v_ego, gasPressed=False, brakePressed=False, standstill=False,
-                               leftBlinker=False, rightBlinker=False),
-      selfdriveState=SimpleNamespace(enabled=True, experimentalMode=True,
-                                     conditionalStopQualified=conditional_stop_qualified,
-                                     conditionalStopDistance=qualified_distance,
-                                     conditionalStopModelMonoTime=qualified_model_mono_time,
-                                     conditionalStopLatched=conditional_stop_latched),
-      radarState=SimpleNamespace(
-        leadOne=SimpleNamespace(present=lead_present),
-        leadTwo=SimpleNamespace(present=False),
-      ),
-      modelV2=SimpleNamespace(
-        position=SimpleNamespace(x=[model_length * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]),
-        velocity=SimpleNamespace(x=[v_ego + (terminal_speed - v_ego) * i / (ModelConstants.IDX_N - 1)
-                                    for i in range(ModelConstants.IDX_N)]),
-        acceleration=SimpleNamespace(x=[desired_accel] * ModelConstants.IDX_N),
-        orientation=SimpleNamespace(z=[0.0, 0.0]),
-        action=SimpleNamespace(shouldStop=should_stop, desiredAcceleration=desired_accel, desiredCurvature=0.0),
-      ),
-    )
-    self.valid = {"carState": True, "modelV2": model_valid, "radarState": True, "selfdriveState": True}
-    self.alive = dict.fromkeys(self.valid, True)
-    self.freq_ok = dict.fromkeys(self.valid, True)
-    self.logMonoTime = {"modelV2": model_mono_time}
-
-  def all_checks(self, services=None):
-    services = self.keys() if services is None else services
-    return all(self.valid.get(service, False) and self.alive.get(service, False) and self.freq_ok.get(service, False)
-               for service in services)
-
-
-def arm(force_stops, sm):
-  for _ in range(30):
-    force_stops.update(sm)
-  assert force_stops.forcing
-
-
-def test_force_stops_latches_on_the_bounded_early_horizon():
-  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=False, desired_accel=-0.8)
-  force_stops = ForceStops(dt=DT)
-
-  for _ in range(30):
-    force_stops.update(sm)
-
-  assert force_stops.forcing
-  assert 3.0 * sm["carState"].vEgo < sm["modelV2"].position.x[-1] < 3.25 * sm["carState"].vEgo
-
-  nonbraking = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=0.0)
-  force_stops = ForceStops(dt=DT)
-  for _ in range(30):
-    force_stops.update(nonbraking)
-  assert not force_stops.forcing
-
-
-def test_force_stops_does_not_spend_nonbraking_confidence_on_one_braking_frame():
-  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=0.0)
-  force_stops = ForceStops(dt=DT)
-  while force_stops.detect_filter.x < LATCH_THRESHOLD:
-    force_stops.update(sm)
-  assert not force_stops.forcing
-
-  sm["modelV2"].action.desiredAcceleration = -0.8
-  force_stops.update(sm)
-  assert not force_stops.forcing
-
-  sm["modelV2"].action.desiredAcceleration = 0.0
-  sm["modelV2"].position.x[-1] = 30.0
-  force_stops.update(sm)
-  assert force_stops.forcing
-
 
-def test_cem_qualified_stop_commits_before_classic_horizon():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=95.0, v_ego=20.0, should_stop=False,
-                     desired_accel=-0.8, terminal_speed=4.0,
-                     conditional_stop_qualified=True, qualified_distance=95.0)
-
-  force_stops.update(sm)
-
-  assert force_stops.forcing
-  assert math.isclose(force_stops.remaining, 95.0 - LATCH_SETBACK)
-
-
-def test_widened_latch_requires_stable_braking_but_classic_latch_does_not():
-  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=-0.8)
-  force_stops = ForceStops(dt=DT)
-  for _ in range(30):
-    force_stops.update(sm)
-  assert force_stops.forcing
-
-  sm = FakeSubMaster(model_length=32.149414, v_ego=10.098594, should_stop=True, desired_accel=0.0)
-  force_stops = ForceStops(dt=DT)
-  while force_stops.detect_filter.x < LATCH_THRESHOLD:
-    force_stops.update(sm)
-  sm["modelV2"].action.desiredAcceleration = -0.8
-  force_stops.update(sm)
-  assert not force_stops.forcing
-
-  sm["modelV2"].action.desiredAcceleration = 0.0
-  sm["modelV2"].position.x[-1] = 30.0
-  force_stops.update(sm)
-  assert force_stops.forcing
-
-
-def test_cem_qualified_stop_requires_current_valid_bound_authority():
-  for mutation in (
-    lambda sm: sm.valid.__setitem__("carState", False),
-    lambda sm: sm.valid.__setitem__("selfdriveState", False),
-    lambda sm: sm.alive.__setitem__("modelV2", False),
-    lambda sm: sm.freq_ok.__setitem__("selfdriveState", False),
-    lambda sm: setattr(sm["selfdriveState"], "conditionalStopModelMonoTime", sm.logMonoTime["modelV2"] - 500_000_000),
-    lambda sm: setattr(sm["selfdriveState"], "conditionalStopDistance", float("nan")),
-  ):
-    force_stops = ForceStops(dt=DT)
-    sm = FakeSubMaster(model_length=50.0, v_ego=20.0, should_stop=False, desired_accel=0.0,
-                       terminal_speed=20.0, conditional_stop_qualified=True, qualified_distance=95.0)
-    mutation(sm)
-    assert math.isinf(force_stops.update(sm))
-    assert not force_stops.forcing
-
-
-def test_brake_and_nonfinite_inputs_release_without_priming():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=95.0, v_ego=20.0, should_stop=False,
-                     desired_accel=-0.8, terminal_speed=4.0,
-                     conditional_stop_qualified=True, qualified_distance=95.0)
-  force_stops.update(sm)
-  assert force_stops.forcing
-
-  sm["carState"].brakePressed = True
-  assert math.isinf(force_stops.update(sm))
-  assert not force_stops.forcing
-
-  sm["carState"].brakePressed = False
-  sm["selfdriveState"].conditionalStopQualified = False
-  sm["modelV2"].action.desiredAcceleration = -math.inf
-  for _ in range(30):
-    assert math.isinf(force_stops.update(sm))
-  assert force_stops.detect_filter.x == 0.0
-
-
-def test_gas_override_keeps_priority_when_both_pedals_are_pressed():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  sm["carState"].gasPressed = True
-  sm["carState"].brakePressed = True
-  sm["carState"].vEgo = float("nan")
-
-  assert math.isinf(force_stops.update(sm))
-  assert force_stops.override_timer == GAS_OVERRIDE_S
-
-
-def test_committed_target_stays_fixed_and_mpc_releases_after_crossing():
-  force_stops = ForceStops(dt=1.0)
-  sm = FakeSubMaster(model_length=100.0, v_ego=4.0, should_stop=False, desired_accel=0.0)
-  force_stops.forcing = True
-  force_stops.detect_filter.x = 1.0
-  force_stops.position_hold_remaining = 4.0
-  force_stops.remaining = 6.5
-  world_targets = []
-  travel = 0.0
-
-  for _ in range(3):
-    force_stops.update(sm)
-    travel += sm["carState"].vEgo
-    world_targets.append(travel + force_stops.remaining)
-
-  np.testing.assert_allclose(world_targets, world_targets[0])
-  assert force_stops.remaining < 0.0
-
-
-def test_cem_qualified_stop_starts_live_shaping_before_latch():
-  v_ego = 19.477
-  for model_length in (116.146, 150.0):
-    expected_cap = max(math.sqrt(2.0 * A_STOP_ENVELOPE * (model_length - MPC_PROFILE_OFFSET_M)), v_ego - DV_MAX)
-    force_stops = ForceStops(dt=DT)
-    sm = FakeSubMaster(model_length=model_length, should_stop=False, desired_accel=-0.73,
-                       v_ego=v_ego, terminal_speed=4.066)
-
-    assert math.isclose(force_stops.update(sm), expected_cap)
-    assert not force_stops.forcing
-
-
-def test_starpilot_profile_uses_six_meter_offset():
-  assert A_STOP_ENVELOPE == 0.65
-  assert MPC_PROFILE_OFFSET_M == 6.0
-  force_stops = ForceStops(dt=DT)
-  profile_distance = 20.0
-  force_stops.forcing = True
-  force_stops.remaining = MPC_PROFILE_OFFSET_M + profile_distance
-  sm = FakeSubMaster(model_length=force_stops.remaining + LATCH_SETBACK, v_ego=0.0)
-
-  expected_cap = math.sqrt(2.0 * A_STOP_ENVELOPE * profile_distance)
-  assert math.isclose(force_stops.update(sm), expected_cap)
-
-
-def test_committed_stop_is_the_mpc_obstacle_until_final_landing():
-  absent_lead = SimpleNamespace(present=False, dRel=0.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=0.0)
-  radar_state = SimpleNamespace(leadOne=absent_lead, leadTwo=absent_lead)
-  mpc = LongitudinalMpc()
-  mpc.set_cur_state(10.0, 0.0)
-  mpc.update(radar_state)
-  baseline_obstacle = mpc.params[:, 2].copy()
-
-  for _ in range(4):
-    mpc.update(radar_state, stop_x=30.0)
-  np.testing.assert_allclose(mpc.params[:, 2], 30.0 + STOP_DISTANCE)
-  assert mpc.source == LongitudinalPlanSource.stop
-  assert mpc.a_solution[1] < 0.0
-  assert mpc.crash_cnt == 0
-
-  close_lead = SimpleNamespace(present=True, dRel=15.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=1.0)
-  mpc.update(SimpleNamespace(leadOne=close_lead, leadTwo=absent_lead), stop_x=30.0)
-  assert mpc.source == LongitudinalPlanSource.lead0
-  assert np.all(mpc.params[:, 2] <= 30.0 + STOP_DISTANCE)
-
-  mpc.update(SimpleNamespace(leadOne=absent_lead, leadTwo=close_lead), stop_x=30.0)
-  assert mpc.source == LongitudinalPlanSource.lead1
-  assert np.all(mpc.params[:, 2] <= 30.0 + STOP_DISTANCE)
-
-  for active_stop_x in (-STOP_DISTANCE, -STOP_DISTANCE + 0.25, 0.0, STOP_DISTANCE):
-    mpc.update(radar_state, stop_x=active_stop_x)
-    np.testing.assert_allclose(mpc.params[:, 2], active_stop_x + STOP_DISTANCE)
-    assert mpc.solution_status == 0
-    assert np.all(np.isfinite(mpc.a_solution))
-
-  for released_stop_x in (-STOP_DISTANCE - 0.25, float("-inf"), float("inf"), float("nan")):
-    mpc.update(radar_state, stop_x=released_stop_x)
-    np.testing.assert_allclose(mpc.params[:, 2], baseline_obstacle)
-
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=MPC_PROFILE_OFFSET_M + LATCH_SETBACK, v_ego=0.0)
-  force_stops.forcing = True
-  force_stops.remaining = MPC_PROFILE_OFFSET_M
-  assert force_stops.update(sm) == 0.0
-
-
-def test_committed_stop_stays_with_mpc_until_force_stops_releases():
-  v_ego = 6.4
-  CP = SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
-                       steerRatio=15.0, wheelbase=2.9)
-  planner = LongitudinalPlanner(CP, init_v=v_ego)
-  planner.curve_speed_limiter.update = lambda model, v_cruise, v_ego=0.0, lateral_active=False, roll=0.0, torque_params=None: v_cruise
-  planner.blotv2.update = lambda *args: SimpleNamespace(jerk_scale=1.0, t_follow=1.45, emergency=False)
-  planner.lead_departure.update = lambda **kwargs: False
-  sm = FakeSubMaster(model_length=100.0, should_stop=False, desired_accel=0.0, v_ego=v_ego)
-  sm["carState"].vCruise = 100.0
-  sm["carState"].aEgo = 0.0
-  sm["carState"].steeringAngleDeg = 0.0
-  sm["carState"].steeringPressed = False
-  sm["controlsState"] = SimpleNamespace(forceDecel=False, longControlState=LongCtrlState.pid)
-  sm["carControl"] = SimpleNamespace(orientationNED=[], latActive=True)
-  sm["vehicleParameters"] = SimpleNamespace(angleOffsetDeg=0.0, roll=0.0)
-  sm["lateralTorqueParameters"] = SimpleNamespace(useParams=False)
-  sm["selfdriveState"].personality = 1
-  sm["modelV2"].meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[]),
-                                        laneChangeState=log.LaneChangeState.off)
-  sm["modelV2"].leadsV3 = []
-  absent_lead = SimpleNamespace(present=False, dRel=0.0, vLead=0.0, aLeadK=0.0, aLeadTau=1.5, modelProb=0.0)
-  sm["radarState"] = SimpleNamespace(leadOne=absent_lead, leadTwo=absent_lead)
-  sm.all_checks = lambda services=None: True
-
-  planner.force_stops.forcing = True
-  planner.force_stops.remaining = MPC_PROFILE_OFFSET_M + 0.48
-  planner.force_stops.position_hold_remaining = 1.0
-  planner.update(sm)
-  before_remaining = planner.force_stops.remaining
-  before_accel = planner.output_a_target
-  planner.update(sm)
-
-  assert before_remaining > MPC_PROFILE_OFFSET_M >= planner.force_stops.remaining
-  np.testing.assert_allclose(planner.mpc.params[:, 2], planner.force_stops.remaining + STOP_DISTANCE)
-  assert planner.output_a_target <= before_accel + 0.25
-
-  sm["modelV2"].velocity.x[-1] = 14.0
-  sm["modelV2"].action.desiredAcceleration = -1.5
-  sm["selfdriveState"].conditionalStopQualified = True
-  sm["selfdriveState"].conditionalStopDistance = 10.0
-  planner.update(sm)
-  release_before = planner.output_a_target
-  assert planner.force_stops.forcing
-  planner.update(sm)
-  assert not planner.force_stops.forcing
-  assert planner.output_a_target <= release_before + 0.25
-
-  sm["carState"].vEgo = 0.2
-  sm["modelV2"].velocity.x[-1] = 0.0
-  sm["modelV2"].action.desiredAcceleration = 0.0
-  planner.force_stops.forcing = True
-  planner.force_stops.remaining = MPC_PROFILE_OFFSET_M + 0.48
-  planner.force_stops.position_hold_remaining = 1.0
-  planner.update(sm)
-  np.testing.assert_allclose(planner.mpc.params[:, 2], planner.force_stops.remaining + STOP_DISTANCE)
-  assert planner.output_should_stop
-
-  sm["carState"].vEgo = 1.0
-  planner.force_stops.remaining = -STOP_DISTANCE - 1.0
-  planner.force_stops.position_hold_remaining = 1.0
-  planner.update(sm)
-  assert planner.force_stops.forcing
-  np.testing.assert_allclose(planner.mpc.params[:, 2], 0.0)
-
-  sm["selfdriveState"].experimentalMode = False
-  planner.update(sm)
-  assert not planner.force_stops.forcing
-  assert np.all(planner.mpc.params[:, 2] > STOP_DISTANCE)
-
-  sm["selfdriveState"].experimentalMode = True
-  sm["selfdriveState"].conditionalStopLatched = True
-  sm["carState"].vEgo = 0.2
-  sm["carState"].standstill = True
-  sm["modelV2"].action.desiredAcceleration = 0.0
-  planner.a_cruise = 1.0
-  planner.output_a_target = 1.0
-  planner.v_desired_filter.x = 0.2
-  with patch("openpilot.selfdrive.controls.lib.longitudinal_planner.get_accel_from_plan", return_value=0.2):
-    planner.update(sm)
-  assert not planner.force_stops.forcing
-  assert planner.output_should_stop
-
-
-def test_force_stops_retains_and_clamps_the_crossed_mpc_obstacle():
-  force_stops = ForceStops(dt=1.0)
-  sm = FakeSubMaster(model_length=20.0, v_ego=1.0, should_stop=False, desired_accel=0.0)
-  force_stops.forcing = True
-  force_stops.detect_filter.x = 1.0
-  force_stops.position_hold_remaining = 1.0
-  force_stops.remaining = -STOP_DISTANCE + sm["carState"].vEgo
-
-  assert force_stops.update(sm) == 0.0
-  assert force_stops.forcing
-  assert force_stops.remaining == -STOP_DISTANCE
-
-  sm["selfdriveState"].experimentalMode = False
-  assert math.isinf(force_stops.update(sm))
-  assert not force_stops.forcing
-
-
-def test_incomplete_early_trajectory_cannot_shape():
-  for field, axis in (("position", "x"), ("velocity", "x"), ("orientation", "z")):
-    force_stops = ForceStops(dt=DT)
-    sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-0.73,
-                       v_ego=19.477, terminal_speed=4.066)
-    trajectory = getattr(sm["modelV2"], field)
-    setattr(trajectory, axis, [getattr(trajectory, axis)[-1]])
-
-    assert math.isinf(force_stops.update(sm))
-
-
-def test_nonfinite_early_action_cannot_shape():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-math.inf,
-                     v_ego=19.477, terminal_speed=4.066)
-
-  assert math.isinf(force_stops.update(sm))
-
-
-def test_filtered_lead_blocks_immediate_early_shaping_after_dropout():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-0.73,
-                     v_ego=19.477, terminal_speed=4.066, lead_present=True)
-  for _ in range(30):
-    assert math.isinf(force_stops.update(sm))
-  sm["radarState"].leadOne.present = False
-
-  assert math.isinf(force_stops.update(sm))
-
-
-def test_early_shaping_does_not_prime_physical_latch():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=116.146, should_stop=False, desired_accel=-0.73,
-                     v_ego=19.477, terminal_speed=4.066)
-  for _ in range(30):
-    assert math.isfinite(force_stops.update(sm))
-  sm["modelV2"].position.x[-1] = 58.0
-
-  force_stops.update(sm)
-
-  assert not force_stops.forcing
-
-
-def test_committed_endpoint_keeps_configured_setback():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  while not force_stops.forcing:
-    force_stops.update(sm)
-  assert math.isclose(force_stops.remaining, 20.0 - LATCH_SETBACK)
-
-  force_stops.remaining = 3.0
-  sm["carState"].vEgo = 4.0
-  sm["modelV2"].position.x[-1] = 7.0
-  force_stops.update(sm)
-  assert math.isclose(force_stops.remaining, 3.0 - 4.0 * DT)
-
-  outward_force_stops = ForceStops(dt=1.0)
-  outward_force_stops.forcing = True
-  outward_force_stops.detect_filter.x = 1.0
-  outward_force_stops.remaining = 6.0
-  outward_sm = FakeSubMaster(model_length=10.0, v_ego=4.0)
-  outward_force_stops.update(outward_sm)
-  assert math.isclose(outward_force_stops.remaining, 10.0 - LATCH_SETBACK)
-
-  force_stops.remaining = 3.5
-  sm["carState"].vEgo = 0.0
-  sm["modelV2"].position.x[-1] = 5.0
-  force_stops.update(sm)
-  assert math.isclose(force_stops.remaining, 3.5 - 2.0 * DT)
-
-  near_force_stops = ForceStops(dt=DT)
-  near_sm = FakeSubMaster(model_length=1.0, v_ego=1.0)
-  cap = math.inf
-  while not near_force_stops.forcing:
-    cap = near_force_stops.update(near_sm)
-  assert near_force_stops.remaining == 0.0
-  assert cap == max(0.0, near_sm["carState"].vEgo - DV_MAX)
-  assert math.isfinite(cap)
-
-
-def test_latched_position_survives_brief_model_clear():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-
-  sm["modelV2"].position.x[-1] = 100.0
-  sm["modelV2"].action.shouldStop = False
-  sm["modelV2"].action.desiredAcceleration = 0.0
-
-  hold_frames = int(0.5 / DT)
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(hold_frames))
-  cap = 0.0
-  for _ in range(int(STOP_POSITION_HOLD_S / DT) + 1):
-    cap = force_stops.update(sm)
-  assert math.isinf(cap)
-
-
-def test_committed_stop_releases_on_sustained_open_model_before_standstill():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-  open_path = [93.5 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
-  open_speed = [4.2 + (14.0 - 4.2) * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
-  sm["modelV2"].position.x = open_path
-  sm["modelV2"].velocity.x = open_speed
-  sm["modelV2"].action.shouldStop = False
-  sm["modelV2"].action.desiredAcceleration = 0.3
-
-  assert math.isfinite(force_stops.update(sm))
-  assert force_stops.forcing
-  sm["modelV2"].position.x = open_path[:-1]
-  assert math.isinf(force_stops.update(sm))
-  assert force_stops.open_release_filter.x == 0.0
-  assert not force_stops.forcing
-
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-  sm["modelV2"].position.x = open_path
-  sm["modelV2"].velocity.x = open_speed
-  sm["modelV2"].action.shouldStop = False
-  sm["modelV2"].action.desiredAcceleration = 0.3
-  assert math.isfinite(force_stops.update(sm))
-  assert force_stops.forcing
-  assert math.isinf(force_stops.update(sm))
-  assert not force_stops.forcing
-
-
-def test_open_release_fails_closed_on_low_terminal_speed():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-  sm["modelV2"].position.x = [93.5 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
-  sm["modelV2"].velocity.x = [2.0] * ModelConstants.IDX_N
-  sm["modelV2"].action.shouldStop = False
-
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(20))
-  assert force_stops.forcing
-
-  sm["modelV2"].action.desiredAcceleration = "invalid"
-  assert math.isinf(force_stops.update(sm))
-  assert force_stops.open_release_filter.x == 0.0
-  assert not force_stops.forcing
-
-
-def test_new_evidence_refreshes_position_hold():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_length=1.0, v_ego=0.5)
-  arm(force_stops, sm)
-
-  sm["modelV2"].position.x[-1] = 100.0
-  sm["modelV2"].action.shouldStop = False
-  sm["modelV2"].action.desiredAcceleration = 0.0
-  for _ in range(int(3.0 / DT)):
-    force_stops.update(sm)
-
-  sm["modelV2"].position.x[-1] = 20.0
-  sm["modelV2"].action.shouldStop = True
-  force_stops.update(sm)
-  sm["modelV2"].position.x[-1] = 100.0
-  sm["modelV2"].action.shouldStop = False
-
-  assert all(math.isfinite(force_stops.update(sm)) for _ in range(int(3.5 / DT)))
-
-
-def test_clear_model_cannot_move_latched_point_outward():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-  remaining = force_stops.remaining
-
-  sm["modelV2"].position.x[-1] = 100.0
-  sm["modelV2"].action.shouldStop = False
-  sm["modelV2"].action.desiredAcceleration = 0.0
-  force_stops.update(sm)
-
-  expected = max(remaining - sm["carState"].vEgo * DT, 0.0)
-  assert math.isclose(force_stops.remaining, expected)
-
-
-def test_stale_should_stop_cannot_move_latched_point_to_long_path():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-  remaining = force_stops.remaining
-
-  sm["modelV2"].position.x[-1] = 100.0
-  force_stops.update(sm)
-
-  expected = max(remaining - sm["carState"].vEgo * DT, 0.0)
-  assert math.isclose(force_stops.remaining, expected)
-
-
-def test_raw_lead_immediately_releases_latched_position():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-
-  sm["radarState"].leadOne.present = True
-
-  assert math.isinf(force_stops.update(sm))
-  assert not force_stops.forcing
-
-
-def test_standstill_clears_latch_before_launch():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-
-  sm["carState"].standstill = True
-  assert math.isinf(force_stops.update(sm))
-  sm["carState"].standstill = False
-
-  assert math.isinf(force_stops.update(sm))
-  assert not force_stops.forcing
-
-
-def test_immediate_exit_conditions_bypass_position_hold():
-  for condition in ("disabled", "gas", "model_invalid", "radar_invalid"):
-    force_stops = ForceStops(dt=DT)
-    sm = FakeSubMaster()
-    arm(force_stops, sm)
-
-    if condition == "disabled":
-      sm["selfdriveState"].enabled = False
-    elif condition == "gas":
-      sm["carState"].gasPressed = True
-    else:
-      sm.valid["modelV2" if condition == "model_invalid" else "radarState"] = False
-
-    assert math.isinf(force_stops.update(sm))
-    assert not force_stops.forcing
-
-
-def test_gas_bypasses_pre_latch_shaping():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  for _ in range(9):
-    force_stops.update(sm)
-
-  sm["carState"].gasPressed = True
-
-  assert math.isinf(force_stops.update(sm))
-
-
-def test_gas_override_survives_experimental_mode_release():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  sm["selfdriveState"].experimentalMode = False
-  sm["carState"].gasPressed = True
-
-  assert math.isinf(force_stops.update(sm))
-  assert force_stops.override_timer == GAS_OVERRIDE_S
-
-  sm["carState"].gasPressed = False
-  for _ in range(int(1.0 / DT)):
-    force_stops.update(sm)
-  sm["selfdriveState"].experimentalMode = True
-
-  assert math.isinf(force_stops.update(sm))
-
-
-def test_secondary_raw_lead_bypasses_pre_latch_shaping():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  for _ in range(9):
-    force_stops.update(sm)
-
-  sm["radarState"].leadTwo.present = True
-
-  assert math.isinf(force_stops.update(sm))
-
-
-def test_invalid_model_cannot_arm_force_stop():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster(model_valid=False)
-
-  assert all(math.isinf(force_stops.update(sm)) for _ in range(30))
-  assert not force_stops.forcing
-
-
-def test_nonfinite_model_position_releases_latched_stop():
-  force_stops = ForceStops(dt=DT)
-  sm = FakeSubMaster()
-  arm(force_stops, sm)
-
-  sm["modelV2"].position.x[-1] = float("nan")
-
-  assert math.isinf(force_stops.update(sm))
-  assert not force_stops.forcing
-
-
-def test_nonfinite_trajectory_samples_cannot_prime_detector_or_latch():
-  for axis in ("position", "velocity"):
-    for bad_value in (float("nan"), float("inf"), float("-inf")):
-      for sample in (10, -1):
-        force_stops = ForceStops(dt=DT)
-        sm = FakeSubMaster()
-        sm["modelV2"].position.x = [20.0 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
-        sm["modelV2"].velocity.x = [10.0 * (1.0 - i / (ModelConstants.IDX_N - 1)) for i in range(ModelConstants.IDX_N)]
-        getattr(sm["modelV2"], axis).x[sample] = bad_value
-
-        for _ in range(30):
-          assert math.isinf(force_stops.update(sm))
-        assert force_stops.detect_filter.x == 0.0
-        assert not force_stops.forcing
-        assert force_stops.position_hold_remaining == 0.0
-
-        sm["modelV2"].position.x = [20.0 * i / (ModelConstants.IDX_N - 1) for i in range(ModelConstants.IDX_N)]
-        sm["modelV2"].velocity.x = [10.0 * (1.0 - i / (ModelConstants.IDX_N - 1)) for i in range(ModelConstants.IDX_N)]
-        assert math.isinf(force_stops.update(sm))
-        assert not force_stops.forcing
-        arm(force_stops, sm)
+
+import openpilot.cereal.messaging as messaging
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.force_stops import (A_STOP_ENVELOPE, CLEAR_WINDOW_S, DOWN_RATE, DV_MAX, EXTEND_RATE, FOLLOW_CONFIRM_S,
+                                                           ForceStops, GAS_OVERRIDE_S,
+                                                           LATCH_SETBACK, MPC_PROFILE_OFFSET, NO_CAP, PROFILE_HANDOVER_SPEED, PROFILE_JERK,
+                                                           PROFILE_LANDING, PROFILE_MAX_DECEL, PROFILE_MIN_TIME, QUALIFY_S, REARM_S,
+                                                           RELEASE_OPEN_FRAMES, RELEASE_OPEN_LENGTH, RELEASE_THRESHOLD)
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
+from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S, StopObservation
+
+
+def frames(seconds):
+  return round(seconds / DT_MDL)
+
+
+def obs(path_end=20.0, should_stop=True, braking=True, strict=False, early=False, lead=False, relevant=False, turn=False,
+        release_open=False, moving=False, corridor_clear=True, lane_change=False):
+  return StopObservation(1.0 if should_stop else 0.0, path_end, should_stop, strict, early, True, braking, moving, relevant, lead, turn,
+                         release_open, corridor_clear, lane_change)
+
+
+def car_state(v_ego=10.0, standstill=False, gas=False, brake=False):
+  cs = messaging.new_message('carState').carState
+  cs.vEgo = v_ego
+  cs.standstill = standstill
+  cs.gasPressed = gas
+  cs.brakePressed = brake
+  return cs
+
+
+def run(fs, seconds, observation, cs, experimental=True, enabled=True, valid=True):
+  result = None
+  for _ in range(frames(seconds)):
+    result = fs.update(observation, cs, experimental, enabled, valid)
+  return result
+
+
+def committed(fs=None, v_ego=10.0, path_end=20.0):
+  fs = fs or ForceStops()
+  result = run(fs, 1.5, obs(path_end=path_end), car_state(v_ego))
+  assert fs.forcing
+  return fs, result
+
+
+def car_state_accel(v_ego, a_ego):
+  cs = car_state(v_ego)
+  cs.aEgo = a_ego
+  return cs
+
+
+def commit_on_strict_evidence(v_ego, path_end, a_ego=0.0):
+  # a world-fixed endpoint under strict evidence commits through the qualify path, as a red light does
+  fs = ForceStops()
+  for i in range(frames(QUALIFY_S) + 2):
+    result = fs.update(obs(path_end=path_end - v_ego * DT_MDL * i, should_stop=False, strict=True, braking=False),
+                       car_state_accel(v_ego, a_ego), True, True, True)
+  assert fs.forcing
+  return fs, result
+
+
+def commit_on_strict_evidence_on(fs, v_ego, path_end, a_ego=0.0):
+  for i in range(frames(QUALIFY_S) + 2):
+    result = fs.update(obs(path_end=path_end - v_ego * DT_MDL * i, should_stop=False, strict=True, braking=False),
+                       car_state_accel(v_ego, a_ego), True, True, True)
+  assert fs.forcing
+  return fs, result
+
+
+def holding(fs=None):
+  fs, _ = committed(fs)
+  result = run(fs, 0.1, obs(path_end=4.0), car_state(0.0, standstill=True))
+  assert fs.holding and result.holding
+  return fs, result
+
+
+class TestEntry:
+  def test_classic_latch_commits_the_model_endpoint_with_its_setback(self):
+    fs = ForceStops()
+    frames_committed = 0
+    for _ in range(frames(1.5)):
+      result = fs.update(obs(path_end=20.0), car_state(10.0), True, True, True)
+      frames_committed += fs.forcing
+    assert fs.forcing
+    # the point is the endpoint at the commit frame less the setback, and then travels with the odometer
+    assert math.isclose(result.stop_x, 20.0 - LATCH_SETBACK - 10.0 * DT_MDL * (frames_committed - 1), rel_tol=1e-6, abs_tol=1e-9)
+
+  def test_widened_window_needs_braking_evidence(self):
+    slow_brake = ForceStops()
+    run(slow_brake, 3.0, obs(path_end=38.0, should_stop=False, braking=False), car_state(10.0))
+    assert not slow_brake.forcing
+    braking = ForceStops()
+    run(braking, 3.0, obs(path_end=32.0, should_stop=True, braking=True), car_state(10.0))
+    assert braking.forcing
+
+  def test_shaping_caps_the_approach_on_the_live_endpoint(self):
+    fs = ForceStops()
+    result = fs.update(obs(path_end=60.0, should_stop=False, early=True), car_state(15.0), True, True, True)
+    assert not fs.forcing
+    assert math.isclose(result.v_cruise_cap, max(math.sqrt(2.0 * A_STOP_ENVELOPE * (60.0 - MPC_PROFILE_OFFSET)), 15.0 - DV_MAX), rel_tol=1e-6, abs_tol=1e-9)
+    assert result.stop_x is None
+
+  def test_a_short_window_of_strict_world_fixed_evidence_commits_before_the_classic_window(self):
+    fs = ForceStops()
+    path_end = 60.0
+    for i in range(frames(QUALIFY_S) + 2):
+      fs.update(obs(path_end=path_end - 10.0 * DT_MDL * i, should_stop=False, strict=True, braking=False), car_state(10.0), True, True, True)
+    assert fs.forcing
+    drifting = ForceStops()
+    for i in range(frames(QUALIFY_S) + 2):
+      drifting.update(obs(path_end=60.0 + 8.0 * (i % 2), should_stop=False, strict=True, braking=False), car_state(10.0), True, True, True)
+    assert not drifting.forcing
+
+  def test_a_committed_turn_never_commits(self):
+    fs = ForceStops()
+    run(fs, 2.0, obs(turn=True), car_state(5.0))
+    assert not fs.forcing
+
+  def test_mode_gates_entry_only(self):
+    fs = ForceStops()
+    assert run(fs, 2.0, obs(), car_state(10.0), experimental=False).v_cruise_cap == NO_CAP and not fs.forcing
+    fs, _ = committed()
+    assert run(fs, 1.0, obs(), car_state(10.0), experimental=False).stop_x is not None and fs.forcing
+
+
+class TestMovingReleases:
+  def test_a_tracked_lead_hands_the_stop_to_the_lead_logic_and_the_hold_can_re_form(self):
+    fs, _ = committed()
+    # one radar frame is not a lead: the commitment survives it (route 24 lost a red-light commitment to a single frame)
+    assert run(fs, DT_MDL, obs(lead=True), car_state(10.0)).stop_x is not None and fs.forcing
+    blocked = ForceStops()
+    for i in range(frames(QUALIFY_S) + 4):
+      blocked.update(obs(path_end=60.0 - 10.0 * DT_MDL * i, should_stop=False, strict=True, braking=False, lead=(i % 3 == 0)),
+                     car_state(10.0), True, True, True)
+    assert not blocked.forcing                                   # a raw lead, even a flickering one, blocks a new commitment
+    assert run(fs, 0.8, obs(lead=True), car_state(10.0)).stop_x is None and not fs.forcing
+    assert run(fs, 3.0, obs(path_end=30.0, should_stop=False, braking=False), car_state(2.0)).stop_x is None
+    assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_brake_releases_and_gas_suppresses_shaping_for_the_grace(self):
+    fs, _ = committed()
+    assert not run(fs, 0.05, obs(), car_state(10.0, brake=True)).holding and not fs.forcing
+    fs, _ = committed()
+    run(fs, 0.05, obs(), car_state(10.0, gas=True))
+    assert not fs.forcing
+    assert run(fs, GAS_OVERRIDE_S - 1.0, obs(path_end=60.0, should_stop=False, early=True), car_state(10.0)).v_cruise_cap == NO_CAP
+    assert run(fs, 1.5, obs(path_end=60.0, should_stop=False, early=True), car_state(10.0)).v_cruise_cap < NO_CAP
+
+  def test_model_invalid_is_debounced(self):
+    fs, _ = committed()
+    assert run(fs, MODEL_INVALID_RELEASE_S - 0.1, obs(), car_state(10.0), valid=False).stop_x is not None
+    assert run(fs, 0.2, obs(), car_state(10.0), valid=False).stop_x is None and not fs.forcing
+
+  def test_an_open_clear_path_releases_at_once_and_an_ambiguous_one_waits_out_the_position_hold(self):
+    # D28: a long, evidence-free path is a green and releases within RELEASE_OPEN_FRAMES; a clear but SHORT path
+    # (nothing to drive toward yet) still goes the slow way -- filtered detector decay plus the position hold
+    fs, _ = committed()
+    open_road = obs(path_end=90.0, should_stop=False, braking=False, moving=True)
+    assert run(fs, (RELEASE_OPEN_FRAMES + 1) * DT_MDL, open_road, car_state(5.0)).stop_x is None
+    fs2, _ = committed()
+    short_clear = obs(path_end=25.0, should_stop=False, braking=False, moving=True)
+    assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is not None
+    assert run(fs2, 3.0, short_clear, car_state(5.0)).stop_x is None
+
+  def test_the_slow_release_ends_the_profile_with_the_commitment(self):
+    # a profile anchor that outlived its commitment started the next one's ramp from the old braking level
+    fs, result = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.2)
+    assert result.a_target is not None and result.a_target < -1.0
+    # the detector fades on a short, clear path (not a green: below RELEASE_OPEN_LENGTH), the position hold runs out
+    assert run(fs, 5.0, obs(path_end=25.0, should_stop=False, braking=False), car_state(5.0)).stop_x is None
+    assert not fs.forcing and fs.profile_accel is None
+    _, result = commit_on_strict_evidence_on(fs, 13.0, 60.0, a_ego=0.0)
+    assert result.a_target is not None
+    assert -PROFILE_JERK * DT_MDL * 3 - 1e-9 <= result.a_target <= 0.0   # entered from the car's own acceleration, not the old profile
+
+  def test_the_slow_release_ends_the_open_path_count_with_the_commitment(self):
+    # an open frame on the very frame the slow release fires used to survive into the next commitment's green count
+    fs, _ = committed()
+    short_clear = obs(path_end=25.0, should_stop=False, braking=False)
+    open_road = obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False, braking=False, moving=True)
+    while fs.position_hold_remaining > DT_MDL + 1e-9 or fs.detect_filter.x >= RELEASE_THRESHOLD:
+      fs.update(short_clear, car_state(5.0), True, True, True)
+      assert fs.forcing
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      fs.update(open_road, car_state(5.0), True, True, True)   # the slow release fires on an open frame, before a green count could
+      if not fs.forcing:
+        break
+    assert not fs.forcing
+    # the next stop latches on an open road the model brakes for (no stop bit, no strict tier: every frame is a green frame)
+    open_braking = obs(path_end=50.0, should_stop=False, braking=True, moving=True)
+    for _ in range(frames(1.5)):
+      fs.update(open_braking, car_state(17.0), True, True, True)
+      if fs.forcing:
+        break
+    assert fs.forcing                                                            # its green count starts at this frame ...
+    for _ in range(RELEASE_OPEN_FRAMES - 2):
+      assert run(fs, DT_MDL, open_braking, car_state(17.0)).stop_x is not None   # ... needs its own three frames ...
+    assert run(fs, DT_MDL, open_braking, car_state(17.0)).stop_x is None          # ... not the leftover ones
+
+  def test_latched_point_follows_the_model_forward_after_the_confirmation_and_down_at_once_below_walking_pace(self):
+    fs, _ = committed(path_end=20.0)
+    before = fs.remaining
+    fs.remaining, fs._extend_evidence = 40.0, 0   # the car sits still in this test; the endpoint stays 12 m beyond the point
+    run(fs, FOLLOW_CONFIRM_S - DT_MDL, obs(path_end=55.0), car_state(0.0))
+    assert math.isclose(fs.remaining, 40.0, abs_tol=1e-9)
+    fs.update(obs(path_end=55.0), car_state(0.0), True, True, True)   # the frame that completes the confirmation follows
+    assert math.isclose(fs.remaining, 40.0 + EXTEND_RATE * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    fs.remaining = 12.0
+    fs.update(obs(path_end=8.0), car_state(2.0), True, True, True)
+    assert math.isclose(fs.remaining, 12.0 - 2.0 * DT_MDL - DOWN_RATE * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    del before
+
+  def test_the_latched_point_follows_a_far_drifting_endpoint_while_the_model_still_calls_the_stop(self):
+    fs, _ = committed(path_end=20.0)
+    fs.remaining, fs._extend_evidence = 40.0, 0
+    run(fs, FOLLOW_CONFIRM_S - DT_MDL, obs(path_end=60.0), car_state(0.0))   # beyond the latch window, still a stop: confirmed
+    fs.update(obs(path_end=60.0), car_state(0.0), True, True, True)
+    assert math.isclose(fs.remaining, 40.0 + EXTEND_RATE * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+    before = fs.remaining
+    fs.update(obs(path_end=60.0, should_stop=False, braking=False), car_state(0.0), True, True, True)   # a green: no stop call, no extension
+    assert math.isclose(fs.remaining, before, abs_tol=1e-9)
+
+
+def _follow(fs, seconds, offset, v_ego, pattern=None):
+  # drives a moving commitment with the model's endpoint `offset` m from the committed point (a callable gives the offset per
+  # frame); returns how far the point moved on its own, odometer removed
+  moved = 0.0
+  for i in range(frames(seconds)):
+    off = offset(i) if callable(offset) else offset
+    before = fs.remaining
+    fs.update(obs(path_end=fs.remaining + LATCH_SETBACK + off, strict=True), car_state(v_ego), True, True, True)
+    moved += fs.remaining - (before - v_ego * DT_MDL)
+  return moved
+
+
+class TestFollowConfirmation:
+  # route 0x59 t=609 and 0x58 t=548 (2026-09-06): both stops ended 3-4 m past the model's settled endpoint. One followed a
+  # 1.5 s endpoint excursion forward by 4 m, the other committed on a 5.8 m long first reading; neither could follow back
+  # down above 3 m/s. The good stops of the day rest ~1.7 m before the settled endpoint
+
+  def test_a_short_excursion_beyond_the_point_barely_moves_it(self):
+    fs, _ = commit_on_strict_evidence(20.0, 90.0)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 20.0), 0.0, abs_tol=1e-9)   # the detector settles on the committed point
+    moved = _follow(fs, 1.5, 12.0, 20.0)
+    assert EXTEND_RATE * 0.4 <= moved <= EXTEND_RATE * 0.6   # 1.5 s of excursion, 1 s of it spent confirming (was 4.5 m)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 20.0), 0.0, abs_tol=1e-9)
+
+  def test_a_stuttering_drift_beyond_the_point_still_extends(self):
+    # route 25 t=1547: the excess sat beyond the deadband in 0.45 s runs with 0.1 s dips between them
+    fs, _ = commit_on_strict_evidence(8.0, 70.0)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 8.0), 0.0, abs_tol=1e-9)
+    moved = _follow(fs, 3.0, lambda i: 5.0 if (i % 11) < 9 else 1.0, 8.0)
+    assert moved >= 3.0   # the dips sit inside the deadband and do not drain the count
+
+  def test_a_sustained_nearer_endpoint_pulls_the_point_in_at_speed(self):
+    fs, _ = commit_on_strict_evidence(10.0, 70.0)
+    assert math.isclose(_follow(fs, FOLLOW_CONFIRM_S - DT_MDL, -6.0, 10.0), 0.0, abs_tol=1e-9)   # nothing yet
+    moved = _follow(fs, 3.5, -6.0, 10.0)
+    assert moved <= -5.9 and fs.remaining > 0.0   # converged onto the model's point at DOWN_RATE, well before the landing
+
+  def test_a_brief_nearer_dip_at_speed_leaves_the_point_alone(self):
+    fs, _ = commit_on_strict_evidence(10.0, 70.0)
+    assert math.isclose(_follow(fs, 0.6, -6.0, 10.0), 0.0, abs_tol=1e-9)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 10.0), 0.0, abs_tol=1e-9)
+
+  def test_a_new_commitment_starts_with_no_follow_evidence(self):
+    # evidence gathered by one commitment, unconfirmed when it ended, must not confirm the next one's first excursion
+    fs, _ = commit_on_strict_evidence(10.0, 70.0)
+    assert math.isclose(_follow(fs, 1.0, 0.0, 10.0), 0.0, abs_tol=1e-9)
+    assert math.isclose(_follow(fs, FOLLOW_CONFIRM_S - DT_MDL, 12.0, 10.0), 0.0, abs_tol=1e-9)   # one frame short of confirmed
+    fs.remaining = 20.0
+    # the slow release, with the endpoint still beyond the point (inside the deadband, so the count holds) and no green
+    run(fs, 5.0, obs(path_end=28.0, should_stop=False, braking=False), car_state(2.0))
+    assert not fs.forcing and fs._extend_evidence > 0
+    commit_on_strict_evidence_on(fs, 10.0, 70.0)
+    assert math.isclose(_follow(fs, 1.0, 12.0, 10.0), 0.0, abs_tol=1e-9)   # the confirmation starts over ...
+    assert _follow(fs, 1.5, 12.0, 10.0) > 0.0                                # ... and completes on this excursion's own evidence
+
+
+class TestHold:
+  def test_a_hold_needs_a_commitment_or_a_recent_release(self):
+    fs = ForceStops()
+    assert not run(fs, 2.0, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+    fs, _ = holding()
+    run(fs, 0.05, obs(path_end=4.0, lead=True, relevant=True), car_state(0.0, standstill=True))
+    run(fs, REARM_S + 0.5, obs(path_end=90.0, should_stop=False, braking=False, moving=True), car_state(0.0, standstill=True))
+    assert not run(fs, 0.5, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_standstill_turns_a_commitment_into_a_hold(self):
+    _, result = holding()
+    assert result.holding and result.v_cruise_cap == 0.0 and result.stop_x is not None and result.stop_x >= -STOP_DISTANCE
+
+  def test_the_hold_ignores_a_flickering_stop_signal(self):
+    fs, _ = holding()
+    for i in range(frames(3.0)):
+      result = fs.update(obs(path_end=4.0, should_stop=(i % 2 == 0)), car_state(0.0, standstill=True), True, True, True)
+      assert result.holding
+
+  def test_launch_evidence_releases_the_hold(self):
+    fs, _ = holding()
+    result = run(fs, 0.5, obs(path_end=60.0, should_stop=False, braking=False, release_open=True, moving=True), car_state(0.0, standstill=True))
+    assert not result.holding and result.stop_x is None
+
+  def test_a_mode_exit_does_not_release_the_hold(self):
+    fs, _ = holding()
+    assert run(fs, 2.0, obs(path_end=4.0), car_state(0.0, standstill=True), experimental=False).holding
+
+  def test_a_relevant_lead_releases_and_the_hold_re_enters_when_it_leaves(self):
+    fs, _ = holding()
+    assert not run(fs, 0.05, obs(path_end=4.0, lead=True, relevant=True), car_state(0.0, standstill=True)).holding
+    assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_a_far_lead_does_not_break_the_hold(self):
+    fs, _ = holding()
+    assert run(fs, 1.0, obs(path_end=4.0, lead=True, relevant=False), car_state(0.0, standstill=True)).holding
+
+  def test_a_gas_tap_re_stop_re_enters_the_hold_inside_the_grace(self):
+    fs, _ = holding()
+    assert not run(fs, 0.2, obs(path_end=4.0), car_state(0.5, gas=True)).holding
+    assert run(fs, 0.5, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_a_gas_tap_that_breaks_a_moving_commitment_arms_the_hold_re_entry(self):
+    # the contract: a lead or a gas tap breaking a commitment or a hold; only the hold used to arm it after a tap
+    fs, _ = committed()
+    assert run(fs, DT_MDL, obs(), car_state(10.0, gas=True)).stop_x is None and not fs.forcing
+    assert fs.rearm_remaining > 0.0
+    assert run(fs, 0.5, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_a_long_path_the_model_still_calls_a_stop_on_does_not_release_the_hold(self):
+    # the big model plans through an anticipated green (route 0x7e): a long path with stop evidence is not a green
+    fs, _ = holding()
+    long_path = RELEASE_OPEN_LENGTH + 20.0
+    for _ in range(RELEASE_OPEN_FRAMES + 2):
+      assert run(fs, DT_MDL, obs(path_end=long_path, should_stop=True), car_state(0.0, standstill=True)).holding
+    for _ in range(RELEASE_OPEN_FRAMES + 2):
+      assert run(fs, DT_MDL, obs(path_end=long_path, should_stop=False, strict=True), car_state(0.0, standstill=True)).holding
+    assert not run(fs, RELEASE_OPEN_FRAMES * DT_MDL, obs(path_end=long_path, should_stop=False), car_state(0.0, standstill=True)).holding
+
+  def test_a_hold_that_rolls_again_counts_its_release_and_follow_evidence_over(self):
+    fs, _ = holding()
+    fs._extend_evidence, fs._down_evidence = 5, 5
+    open_road = obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False, braking=False, moving=True)
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      assert run(fs, DT_MDL, open_road, car_state(0.0, standstill=True)).holding   # two open frames: not yet a green
+    result = run(fs, DT_MDL, obs(path_end=4.0), car_state(0.9, standstill=False))   # creep: a moving commitment again
+    assert not result.holding and fs.forcing and fs._extend_evidence == 0 and fs._down_evidence == 0
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      assert run(fs, DT_MDL, open_road, car_state(0.9)).stop_x is not None       # the moving release counts from zero ...
+    assert run(fs, DT_MDL, open_road, car_state(0.9)).stop_x is None              # ... and needs its own three frames
+
+  def test_rollback_flicker_keeps_the_latch_and_creep_returns_to_a_commitment(self):
+    fs, _ = holding()
+    assert run(fs, 0.5, obs(path_end=4.0), car_state(0.5, standstill=False)).holding
+    result = run(fs, 0.05, obs(path_end=4.0), car_state(0.9, standstill=False))
+    assert not result.holding and fs.forcing and result.stop_x is not None
+    assert run(fs, 0.05, obs(path_end=4.0), car_state(0.0, standstill=True)).holding
+
+  def test_model_invalid_while_holding_is_debounced(self):
+    fs, _ = holding()
+    assert run(fs, MODEL_INVALID_RELEASE_S - 0.1, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False).holding
+    assert not run(fs, 0.2, obs(path_end=4.0), car_state(0.0, standstill=True), valid=False).holding
+
+  def test_fallback_release_needs_mostly_clear_moving_frames(self):
+    fs, _ = holding()
+    ambiguous = obs(path_end=30.0, should_stop=False, braking=False, moving=True, corridor_clear=True)
+    assert run(fs, CLEAR_WINDOW_S - 0.2, ambiguous, car_state(0.0, standstill=True)).holding
+    assert not run(fs, 0.3, ambiguous, car_state(0.0, standstill=True)).holding
+    fs, _ = holding()
+    for i in range(frames(CLEAR_WINDOW_S + 1.0)):
+      result = fs.update(obs(path_end=30.0, should_stop=(i % 3 != 0), braking=False, moving=True), car_state(0.0, standstill=True), True, True, True)
+    assert result.holding
+
+
+class TestApproachProfile:
+  def test_the_profile_is_the_constant_deceleration_to_the_landing_entered_at_the_jerk_limit(self):
+    fs, result = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.2)
+    world = fs.remaining
+    previous = result.a_target
+    assert -1.2 - PROFILE_JERK * DT_MDL * 3 <= previous <= -1.2   # entered from the car's own deceleration, not from zero
+    for _ in range(frames(1.0)):
+      world -= 13.0 * DT_MDL
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(13.0, previous), True, True, True)
+      assert result.a_target is not None and result.a_target <= 0.0
+      assert previous - result.a_target <= PROFILE_JERK * DT_MDL + 1e-9
+      previous = result.a_target
+    need = 13.0 ** 2 / (2.0 * (fs.remaining - PROFILE_LANDING))
+    assert math.isclose(result.a_target, -need, rel_tol=1e-6, abs_tol=1e-9)
+
+  def test_following_the_profile_holds_it_flat_and_hands_over_short_of_the_point(self):
+    fs, _ = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.0)
+    v = 13.0
+    a = -1.0
+    world = fs.remaining
+    history = []
+    for _ in range(frames(15.0)):
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(v, a), True, True, True)
+      if result.a_target is None:
+        break
+      a = result.a_target
+      history.append((v, a, fs.remaining))
+      v = max(v + a * DT_MDL, 0.0)
+      world -= v * DT_MDL
+    flat = [a for v, a, _ in history if 9.0 < v < 12.5]
+    assert max(flat) - min(flat) < 0.1                           # constant deceleration once entered ...
+    easing = [a for v, a, _ in history if 3.0 < v < 9.0]
+    assert all(later >= earlier - 1e-6 for earlier, later in zip(easing, easing[1:], strict=False))   # ... then only ever easing off
+    assert easing[-1] - easing[0] < 0.6                          # gently: the landing margin shrinks with the remaining distance
+    assert min(a for _, a, _ in history) > -2.2                  # a 13 m/s stop seen 60 m out never needs more than ~2 m/s^2
+    assert history[-1][0] <= PROFILE_HANDOVER_SPEED               # the profile fades out below the handover speed ...
+    assert history[-1][2] >= 0.0                                 # ... never past the committed point: the column and the hold land
+
+  def test_the_profile_is_capped_and_absent_without_a_moving_commitment(self):
+    fs, _ = commit_on_strict_evidence(20.0, 60.0)
+    world = fs.remaining
+    for _ in range(frames(1.6)):
+      world -= 20.0 * DT_MDL
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(20.0, 0.0), True, True, True)
+    assert math.isclose(result.a_target, -PROFILE_MAX_DECEL, rel_tol=1e-6, abs_tol=1e-9)
+    shaping = ForceStops()
+    assert run(shaping, 0.5, obs(path_end=80.0, should_stop=False, early=True, braking=True), car_state(15.0)).a_target is None
+    _, held = holding()
+    assert held.a_target is None
+
+
+class TestFieldTest4:
+  def test_the_profile_tapers_with_the_speed_as_the_landing_closes(self):
+    fs, _ = commit_on_strict_evidence(13.0, 60.0, a_ego=-1.0)
+    v, a, world = 13.0, -1.0, fs.remaining
+    history = []
+    for _ in range(frames(15.0)):
+      result = fs.update(obs(path_end=world + LATCH_SETBACK, should_stop=False, strict=True, braking=True), car_state_accel(v, a), True, True, True)
+      if result.a_target is None:
+        break
+      a = result.a_target
+      history.append((v, a, fs.remaining))
+      v = max(v + a * DT_MDL, 0.0)
+      world -= v * DT_MDL
+    tail = [(v, a) for v, a, _ in history if v < 3.0]
+    assert all(-a <= v / (2.0 * PROFILE_MIN_TIME) + 1e-6 for v, a in tail)          # never harder than v/2 near the end ...
+    assert all(later >= earlier - 1e-3 for (_, earlier), (_, later) in zip(tail, tail[1:], strict=False))   # ... and only easing
+
+  def test_no_speed_cap_once_committed(self):
+    fs, result = committed()
+    assert result.v_cruise_cap == NO_CAP and result.stop_x is not None
+    shaping = ForceStops()
+    assert run(shaping, 0.5, obs(path_end=80.0, should_stop=False, early=True, braking=True), car_state(15.0)).v_cruise_cap < NO_CAP
+
+  def test_a_lane_change_drops_the_commitment_and_the_shaping(self):
+    fs, _ = committed()
+    assert run(fs, DT_MDL, obs(lane_change=True), car_state(10.0)).stop_x is None and not fs.forcing
+    shaping = ForceStops()
+    assert run(shaping, 0.5, obs(path_end=80.0, should_stop=False, early=True, braking=True, lane_change=True), car_state(15.0)).v_cruise_cap == NO_CAP
+    fs, held = holding()
+    assert run(fs, DT_MDL, obs(path_end=4.0, lane_change=True), car_state(0.0, standstill=True)).holding   # a hold is not a lane
+
+  def test_an_open_path_releases_the_hold_in_three_frames_but_a_flash_does_not(self):
+    fs, _ = holding()
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      assert run(fs, DT_MDL, obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False), car_state(0.0, standstill=True)).holding
+    assert run(fs, DT_MDL, obs(path_end=4.0), car_state(0.0, standstill=True)).holding                       # the flash ends: still held
+    for _ in range(RELEASE_OPEN_FRAMES):
+      result = run(fs, DT_MDL, obs(path_end=RELEASE_OPEN_LENGTH + 20.0, should_stop=False), car_state(0.0, standstill=True))
+    assert not result.holding and not fs.holding
+
+
+class TestMovingGreenRelease:
+  # route 0x2c t=1105/1135: the light turned green mid-approach; the commitment must let go with the road, not 4 s later
+  def test_an_open_path_releases_a_moving_commitment_in_three_frames(self):
+    fs, _ = committed()
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      result = fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+      assert result.a_target is not None or result.stop_x is not None or fs.forcing
+    result = fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+    assert not fs.forcing and result.stop_x is None
+
+  def test_a_noisy_dip_or_lingering_stop_evidence_resets_the_release(self):
+    fs, _ = committed()
+    fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+    # one short-path frame between open frames: the counter starts over
+    fs.update(obs(path_end=10.0), car_state(8.0), True, True, True)
+    for _ in range(RELEASE_OPEN_FRAMES - 1):
+      fs.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, braking=False, moving=True), car_state(8.0), True, True, True)
+    assert fs.forcing
+    # a long path that still carries strict stop evidence is not a green
+    fs2, _ = committed()
+    for _ in range(RELEASE_OPEN_FRAMES + 2):
+      fs2.update(obs(path_end=RELEASE_OPEN_LENGTH + 10.0, should_stop=False, strict=True, moving=True), car_state(8.0), True, True, True)
+    assert fs2.forcing
