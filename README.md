@@ -2,8 +2,6 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-> ⚠️ In progress — awaiting field testing on a comma 3X.
-
 ## What it does
 
 Shows openpilot's steering-torque utilization arc at the bottom of the comma 3X onroad display by default. The arc grows left or right with commanded steering effort and changes from white toward orange near the available steering limit.
