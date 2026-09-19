@@ -27,6 +27,8 @@ and remaining validation work.
 
 ⚠️ 2026-09-14: modeld/Chestnut build files, hardwared status and 60+ upstream-owned files re-synced to upstream; opendbc pins set by the consistency rule (docs/SYNC_POLICY.md); awaiting a drive — watch modeld lag and LDW re-arm timing. c3x-chestnut-v2 (2026-09-17) brings upstream's split warp / precompiled big model and changes modeld.py, its SConscript and helpers again; see its To-Do entry.
 
+⚠️ 2026-09-19: combo merged with upstream master `2eee697f7` (20 commits): the Cinque v3 driving model (#38932), tinygrad moved to upstream master with retargetable model artifacts (#38933, #38956) and the Super Leicht driver monitoring model (#38942); no conflicts, only the tinygrad pin moved; awaiting a drive with the dock.
+
 ## Engagement CI
 
 Every `combo` push and pull request builds the tree, compiles Python, and runs the existing model-schema, torque-learning, all-car controller-construction, and platform-contract tests. Automated panda/opendbc bumps build the updated tree and run the model-schema, torque-learning, and controller-construction checks before they can commit or push a new gitlink.
