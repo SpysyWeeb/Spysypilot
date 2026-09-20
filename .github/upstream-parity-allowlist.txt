@@ -26,11 +26,12 @@
 /openpilot/selfdrive/car/cruise.py  # swapped-cruise-speed
 /openpilot/selfdrive/car/tests/test_car_events.py  # esp-active-debounce
 /openpilot/selfdrive/car/tests/test_cruise_speed.py  # swapped-cruise-speed
-/openpilot/selfdrive/controls/controlsd.py  # BLoTv3,SOL; kept: BLoTv3,SOL + combo-level
+/openpilot/selfdrive/controls/controlsd.py  # BLoTv3,SOL,lane-centering; kept: BLoTv3,SOL,lane-centering + combo-level
 /openpilot/selfdrive/controls/controlsd_ext.py  # SOL
 /openpilot/selfdrive/controls/lib/conditional_experimental_mode.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/desire_helper.py  # nudgless-lane-changes
 /openpilot/selfdrive/controls/lib/force_stops.py  # BLoTv3
+/openpilot/selfdrive/controls/lib/lane_centering.py  # lane-centering
 /openpilot/selfdrive/controls/lib/longcontrol.py  # smooth-stops
 /openpilot/selfdrive/controls/lib/longitudinal_lead.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py  # BLoTv3
@@ -48,6 +49,7 @@
 /openpilot/selfdrive/controls/tests/test_controlsd.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/tests/test_controlsd_long_state.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_force_stops.py  # BLoTv3
+/openpilot/selfdrive/controls/tests/test_lane_centering.py  # lane-centering
 /openpilot/selfdrive/controls/tests/test_long_mpc.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_longcontrol.py  # smooth-stops
 /openpilot/selfdrive/controls/tests/test_longitudinal_lead.py  # BLoTv3

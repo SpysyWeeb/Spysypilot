@@ -36,6 +36,7 @@ jobs:
           - torque-bar
           - esp-active-debounce
           - c3x-chestnut-v2
+          - lane-centering
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

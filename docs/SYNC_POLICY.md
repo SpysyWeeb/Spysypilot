@@ -32,7 +32,7 @@ stale. The fix for that is merging upstream, never copying files from upstream's
    leading `/`. After any merge, a file that differs from the merge base with commaai/openpilot master and is not
    on the list is a bug. Fix it in the same commit, never carry it forward. If you add a fork-owned file, add its
    line in the same commit. `upstream-parity.yaml` enforces this on every pull request, every push to `combo`,
-   and daily on `combo` plus the 20 rebuild branches. Feature branches that don't carry the list are checked
+   and daily on `combo` plus the 21 rebuild branches. Feature branches that don't carry the list are checked
    against `combo`'s copy.
 2. **Upstream wins where ours equals the base.** In a merge, a file the fork has not changed since the merge base
    always takes upstream's version. For a conflict in a file the fork owns, re-apply the fork's lines onto
