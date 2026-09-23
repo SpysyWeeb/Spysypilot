@@ -16,7 +16,7 @@ jobs:
       matrix:
         branch:
           - swapped-cruise-speed
-          - nudgless-lane-changes
+          - lane-changes
           - hot-swap-experimental
           - error-log-viewer
           - detailed-stats-sidebar

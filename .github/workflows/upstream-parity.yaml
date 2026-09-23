@@ -85,7 +85,7 @@ jobs:
           - fan-control
           - hot-swap-experimental
           - lane-centering
-          - nudgless-lane-changes
+          - lane-changes
           - params-clear-pandad-keys
           - params-clear-pandad-keys-at-offroad
           - side-buttons
