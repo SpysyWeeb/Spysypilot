@@ -210,7 +210,8 @@ class TestPlannerCruise:
     selfdrive_state.experimentalMode = True
     data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
             'radarState': messaging.new_message('radarState').radarState, 'carControl': messaging.new_message('carControl').carControl,
-            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters,
+            'radarTracks': messaging.new_message('radarTracks').radarTracks}
     for _ in range(5):
       planner.update(_PlantSubMaster(data, 0))
     assert planner.mpc.source == LongitudinalPlanSource.e2e
@@ -295,7 +296,8 @@ class TestStopLanding:
       radar.leadOne.modelProb = 1.0
     data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
             'radarState': radar, 'carControl': messaging.new_message('carControl').carControl,
-            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters,
+            'radarTracks': messaging.new_message('radarTracks').radarTracks}
     return planner, data
 
   def test_the_law_bounds_whichever_candidate_lands_the_stop(self):
@@ -368,7 +370,8 @@ class TestGreenLaunch:
       radar.leadOne.modelProb = 1.0
     data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
             'radarState': radar, 'carControl': messaging.new_message('carControl').carControl,
-            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters,
+            'radarTracks': messaging.new_message('radarTracks').radarTracks}
     return planner, data
 
   @staticmethod
@@ -444,7 +447,8 @@ class TestHoldRelease:
     selfdrive_state.experimentalMode = True
     data = {'carState': car_state, 'modelV2': model, 'controlsState': controls_state, 'selfdriveState': selfdrive_state,
             'radarState': messaging.new_message('radarState').radarState, 'carControl': messaging.new_message('carControl').carControl,
-            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters}
+            'vehicleParameters': messaging.new_message('vehicleParameters').vehicleParameters,
+            'radarTracks': messaging.new_message('radarTracks').radarTracks}
     planner.update(_PlantSubMaster(data, 0))
 
   def hold_at_a_committed_stop(self):
