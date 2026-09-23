@@ -290,6 +290,41 @@ class TestLaneChangeGap:
     assert relaxed(gap)
     assert np.isclose(step(gap, CS=get_car_state(steeringPressed=True, steeringTorque=50.0)), PAD)
 
+  def test_backing_out_ends_the_acceleration_at_any_point_of_the_change(self):
+    off = get_car_state(left_blinker=False)
+    # after the handoff
+    gap = LaneChangeGap(CP, DT_MDL)
+    assert relaxed(gap)
+    step(gap, radar_state=get_radar_state(track_id=8, d_rel=60.0))
+    assert gap.accelerate
+    step(gap, CS=off)
+    assert not gap.accelerate
+    assert step(gap, n=10) == 0.0 and not gap.accelerate
+    # after the time limit
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, n=int(round(RELAX_TIME_MAX / DT_MDL)) + 2)
+    assert gap.accelerate
+    step(gap, CS=off)
+    assert not gap.accelerate
+    # with no lead at the start
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, radar_state=get_radar_state(present=False))
+    assert gap.accelerate
+    step(gap, radar_state=get_radar_state(present=False), CS=off)
+    assert not gap.accelerate
+    # the new lead braking after the handoff
+    gap = LaneChangeGap(CP, DT_MDL)
+    assert relaxed(gap)
+    step(gap, radar_state=get_radar_state(track_id=8, d_rel=60.0))
+    assert gap.accelerate
+    step(gap, radar_state=get_radar_state(track_id=8, d_rel=60.0, a_lead=LEAD_BRAKING - 0.5))
+    assert not gap.accelerate
+
+  def test_speed_glitch_on_the_arming_frame_is_harmless(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    assert np.isclose(step(gap, radar_state=get_radar_state(v_rel=-1.0 + 3.0)), PAD)
+    assert np.isclose(step(gap, n=20), PAD)
+
   def test_relaxation_times_out_but_the_acceleration_stays(self):
     gap = LaneChangeGap(CP, DT_MDL)
     steps = int(round(RELAX_TIME_MAX / DT_MDL))

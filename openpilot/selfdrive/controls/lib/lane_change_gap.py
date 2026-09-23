@@ -129,7 +129,8 @@ class LaneChangeGap:
     self.lead_distance = lead.dRel
     self.lead_v_rel = lead.vRel
     # the fastest the lead has read for LEAD_SPEED_FRAMES frames running, so one high glitch cannot raise it
-    self.lead_v_max = max(self.lead_v_max, min(self.lead_speeds))
+    if len(self.lead_speeds) == LEAD_SPEED_FRAMES:
+      self.lead_v_max = max(self.lead_v_max, min(self.lead_speeds))
 
   def same_lead(self, lead):
     if not lead.present:
@@ -142,11 +143,12 @@ class LaneChangeGap:
 
   def lead_braking(self, lead, model):
     # the radar's filtered deceleration lags a hard brake by about half a second; the raw speed and the
-    # model's estimate of the lead's acceleration both read it earlier
+    # model's estimate of the lead's acceleration both read it earlier. The speed history belongs to the
+    # lead being left, so it only counts while that lead is still the one in front
     model_lead = model.leadsV3[0] if len(model.leadsV3) > 0 else None
     model_braking = model_lead is not None and model_lead.prob > 0.5 and len(model_lead.a) > 0 and model_lead.a[0] < LEAD_BRAKING
-    slowing = len(self.lead_speeds) == LEAD_SPEED_FRAMES and max(self.lead_speeds) < self.lead_v_max - LEAD_SLOWING
-    return lead.aLeadK < LEAD_BRAKING or slowing or model_braking
+    slowing = self.armed and len(self.lead_speeds) == LEAD_SPEED_FRAMES and max(self.lead_speeds) < self.lead_v_max - LEAD_SLOWING
+    return (lead.present and (lead.aLeadK < LEAD_BRAKING or slowing)) or model_braking
 
   @staticmethod
   def driver_backs_out(CS, direction):
@@ -174,20 +176,21 @@ class LaneChangeGap:
       self.relax_timer = 0.0
       self.lead_speeds.clear()
       self.lead_speeds.append(lead.vLead)
-      self.lead_v_max = lead.vLead
+      # unknown until a full window has been read, so a glitch on this frame cannot set it
+      self.lead_v_max = -np.inf
       self.remember(lead)
     elif starting and self.armed:
       self.relax_timer += self.dt
       self.lead_speeds.append(lead.vLead)
-    if starting and self.armed:
-      # the model handing the lead over or the time limit end the relaxation only; the driver backing out or the
-      # lead braking end the acceleration for this change too
-      if self.relax_timer > RELAX_TIME_MAX or not self.same_lead(lead):
+    if starting:
+      # the model handing the lead over or the time limit end the relaxation only; the driver backing out or
+      # the lead braking, whichever lead is in front, end the acceleration for this change too
+      if self.armed and (self.relax_timer > RELAX_TIME_MAX or not self.same_lead(lead)):
         self.armed = False
-      elif self.driver_backs_out(CS, direction) or self.lead_braking(lead, model):
+      if self.driver_backs_out(CS, direction) or self.lead_braking(lead, model):
         self.armed = False
         self.backed_out = True
-      else:
+      elif self.armed:
         self.remember(lead)
     if not starting:
       self.armed = False
