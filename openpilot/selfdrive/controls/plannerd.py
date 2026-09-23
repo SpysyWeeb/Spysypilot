@@ -19,8 +19,10 @@ def main():
   ldw = LaneDepartureWarning()
   longitudinal_planner = LongitudinalPlanner(CP)
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance'])
-  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'radarState', 'modelV2', 'selfdriveState'],
-                           poll='modelV2')
+  # radar tracks only feed the lane change gap; the plan stays valid without them
+  optional = ['radarTracks']
+  sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'radarState', 'radarTracks', 'modelV2', 'selfdriveState'],
+                           poll='modelV2', ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional)
 
   while True:
     sm.update()

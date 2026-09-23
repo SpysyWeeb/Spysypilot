@@ -11,6 +11,21 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 
+class _PlantSubMaster:
+  # the planner reads SubMaster's liveness bookkeeping for its optional services
+  def __init__(self, data):
+    self.data = data
+    self.valid = dict.fromkeys(data, True)
+    self.alive = dict.fromkeys(data, True)
+    self.freq_ok = dict.fromkeys(data, True)
+
+  def __getitem__(self, s):
+    return self.data[s]
+
+  def all_checks(self, service_list=None):
+    return all(self.valid[s] and self.alive[s] and self.freq_ok[s] for s in (service_list or self.data))
+
+
 class Plant:
   messaging_initialized = False
 
@@ -61,6 +76,7 @@ class Plant:
     # ******** publish a fake model going straight and fake calibration ********
     # note that this is worst case for MPC, since model will delay long mpc by one time step
     radar = messaging.new_message('radarState')
+    radar_tracks = messaging.new_message('radarTracks')
     control = messaging.new_message('controlsState')
     ss = messaging.new_message('selfdriveState')
     car_state = messaging.new_message('carState')
@@ -127,13 +143,14 @@ class Plant:
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
 
     # ******** get controlsState messages for plotting ***
-    sm = {'radarState': radar.radarState,
-          'carState': car_state.carState,
-          'carControl': car_control.carControl,
-          'controlsState': control.controlsState,
-          'selfdriveState': ss.selfdriveState,
-          'vehicleParameters': lp.vehicleParameters,
-          'modelV2': model.modelV2}
+    sm = _PlantSubMaster({'radarState': radar.radarState,
+                          'radarTracks': radar_tracks.radarTracks,
+                          'carState': car_state.carState,
+                          'carControl': car_control.carControl,
+                          'controlsState': control.controlsState,
+                          'selfdriveState': ss.selfdriveState,
+                          'vehicleParameters': lp.vehicleParameters,
+                          'modelV2': model.modelV2})
     self.planner.update(sm)
     self.acceleration = self.planner.output_a_target
     if self.planner.output_should_stop:

@@ -307,9 +307,7 @@ class LongitudinalMpc:
     lead_xv = self.extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau)
     return lead_xv
 
-  def update(self, radarstate, personality=log.LongitudinalPersonality.standard):
-    t_follow = get_T_FOLLOW(personality)
-
+  def update(self, radarstate, personality=log.LongitudinalPersonality.standard, t_follow_pad=0.0):
     lead_xv_0 = self.process_lead(radarstate.leadOne)
     lead_xv_1 = self.process_lead(radarstate.leadTwo)
 
@@ -321,6 +319,8 @@ class LongitudinalMpc:
 
     x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle])
     self.source = MPC_SOURCES[np.argmin(x_obstacles[0])]
+    # the lane change relaxation shapes lead0's gap only
+    t_follow = get_T_FOLLOW(personality) + (t_follow_pad if self.source == LongitudinalPlanSource.lead0 else 0.0)
 
     self.yref[:,:] = 0.0
     for i in range(N):
