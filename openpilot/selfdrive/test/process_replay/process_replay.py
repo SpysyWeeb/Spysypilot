@@ -481,7 +481,7 @@ CONFIGS = [
   ProcessConfig(
     proc_name="plannerd",
     pubs=["modelV2", "carControl", "carState", "controlsState", "vehicleParameters", "lateralTorqueParameters",
-          "radarState", "selfdriveState"],
+          "radarState", "radarTracks", "selfdriveState"],
     subs=["longitudinalPlan", "curvePolicyState", "driverAssistance"],
     ignore=["logMonoTime", "longitudinalPlan.processingDelay", "longitudinalPlan.solverExecutionTime"],
     init_callback=get_car_params_callback,

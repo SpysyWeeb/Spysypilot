@@ -176,6 +176,7 @@ class Plant:
     # ******** publish a fake model going straight and fake calibration ********
     # note that this is worst case for MPC, since model will delay long mpc by one time step
     radar = messaging.new_message('radarState')
+    radar_tracks = messaging.new_message('radarTracks')
     control = messaging.new_message('controlsState')
     ss = messaging.new_message('selfdriveState')
     car_state = messaging.new_message('carState')
@@ -271,6 +272,7 @@ class Plant:
     if not model_valid:
       invalid.add('modelV2')
     sm = _PlantSubMaster({'radarState': radar.radarState,
+                           'radarTracks': radar_tracks.radarTracks,
                            'carState': car_state.carState,
                            'carControl': car_control.carControl,
                            'controlsState': control.controlsState,

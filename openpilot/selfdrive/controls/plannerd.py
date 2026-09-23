@@ -9,9 +9,10 @@ import openpilot.cereal.messaging as messaging
 
 
 def get_submaster():
-  optional = ['lateralTorqueParameters']
+  # radar tracks only feed the lane change gap; the plan stays valid without them
+  optional = ['lateralTorqueParameters', 'radarTracks']
   return messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'lateralTorqueParameters',
-                              'radarState', 'modelV2', 'selfdriveState'], poll='modelV2',
+                              'radarState', 'radarTracks', 'modelV2', 'selfdriveState'], poll='modelV2',
                              ignore_alive=optional, ignore_avg_freq=optional, ignore_valid=optional)
 
 

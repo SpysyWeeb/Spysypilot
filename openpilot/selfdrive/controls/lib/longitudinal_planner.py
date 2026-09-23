@@ -9,10 +9,11 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.force_stops import ForceStops
+from openpilot.selfdrive.controls.lib.lane_change_gap import LaneChangeGap
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
 from openpilot.selfdrive.controls.lib.model_curve_speed import CurveResult, LateralState, ModelCurveSpeedLimiter
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import COMFORT_BRAKE, LongitudinalMpc, LongitudinalPlanSource, STOP_DISTANCE, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
 from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop
 from openpilot.selfdrive.controls.lib.stop_landing import STOP_INTENT_SPEED, StopLanding
@@ -116,6 +117,7 @@ class LongitudinalPlanner:
     self.anticipating_prev = False
     self.mpc_a_target = init_a
     self.curve = CurveResult()
+    self.lane_change_gap = LaneChangeGap(CP, dt)
 
     self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
     self.a_cruise = init_a
@@ -186,6 +188,7 @@ class LongitudinalPlanner:
       self.anticipating_prev = False
       self.launch_armed = False
       self.launch_open.x = 0.0
+      self.lane_change_gap.reset()
 
     # the curve policy forgets only on a real disengagement, not on a driver's gas override (route 0x3a t=329: a level-
     # triggered reset wiped its regime and hold every frame of a 3.9 s override while the steering was still pinned in the bend)
@@ -213,9 +216,14 @@ class LongitudinalPlanner:
     v_cruise = min(v_cruise, force_stop.v_cruise_cap)
 
     personality = sm['selfdriveState'].personality
+    radar_ok = radar_valid and sm.alive['radarTracks'] and sm.valid['radarTracks']
+    lane_change_pad = self.lane_change_gap.update(sm['modelV2'], sm['carState'], sm['radarState'], sm['radarTracks'], radar_ok,
+                                                  v_ego, v_cruise, get_T_FOLLOW(personality), STOP_DISTANCE, COMFORT_BRAKE)
+    # the supervisor's necessity pad outranks the lane change relaxation
+    t_follow_pad = policy.t_follow_pad if policy.t_follow_pad > 0.0 else lane_change_pad
     self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
     self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, stop_x,
-                    policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint)
+                    policy.jerk_scale, t_follow_pad, prev_accel_constraint)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -259,7 +267,8 @@ class LongitudinalPlanner:
       else:
         output_should_stop_e2e = False
 
-    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
+    # a lane change into a clear lane takes the full envelope, not the comfort ramp
+    comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid) and not self.lane_change_gap.accelerate
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
