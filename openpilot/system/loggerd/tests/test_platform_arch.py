@@ -53,8 +53,9 @@ def test_chestnut_build_contract():
   assert "big_driving_warp" not in modeld
   assert "from openpilot.system.hardware.chestnut.flash import link_up" in modeld
 
-  attributes = (ROOT / ".gitattributes").read_text()
-  assert "openpilot/selfdrive/modeld/models/big_driving_tinygrad.pkl filter=lfs" in attributes
+  attrs = subprocess.run(["git", "check-attr", "filter", "--", "openpilot/selfdrive/modeld/models/big_driving_tinygrad.pkl"],
+                         cwd=ROOT, check=True, capture_output=True, text=True).stdout
+  assert attrs.strip().endswith("filter: lfs")
 
 
 def test_camera_name_contract():
