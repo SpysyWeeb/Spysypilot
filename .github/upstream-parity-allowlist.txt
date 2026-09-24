@@ -65,7 +65,6 @@
 /openpilot/selfdrive/controls/tests/test_smooth_stops.py  # smooth-stops
 /openpilot/selfdrive/controls/tests/test_stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_stop_landing.py  # BLoTv3
-/openpilot/selfdrive/modeld/SConscript  # c3x-chestnut-v2
 /openpilot/selfdrive/modeld/helpers.py  # c3x-chestnut-v2
 /openpilot/selfdrive/modeld/modeld.py  # c3x-chestnut-v2
 /openpilot/selfdrive/modeld/tests/test_helpers.py  # combo-only fork_only_file (no feature-branch owner)
