@@ -323,6 +323,9 @@ def main(demo=False):
   small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or CHESTNUT else None
   if model is None:
     model = small_model
+  elif small_model is not None:
+    # the standby's first run would otherwise build its graph inside the fallback, at realtime priority and without a model output
+    small_model.warmup()
   params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
