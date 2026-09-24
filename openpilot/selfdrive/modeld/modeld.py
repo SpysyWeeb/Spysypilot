@@ -3,9 +3,11 @@ from collections.abc import Callable
 from typing import NamedTuple
 import base64
 import ctypes
+import gc
 from functools import cached_property
 import os
 os.environ['GMMU'] = '0' # for chestnut fast loading, noop for qcom
+os.environ.setdefault('AM_POWER_LIMIT', '100')
 from tinygrad.device import Buffer, Device
 from tinygrad.dtype import DType, dtypes
 from tinygrad.engine.realize import lower_and_compile
@@ -166,6 +168,7 @@ class ModelState:
     with open(MODELS_DIR / f'driving_warp_{cam_w}x{cam_h}_tinygrad.pkl', 'rb') as f:
       warp = pickle.load(f)
     self.run_warp = warp['run']
+    self.run_warp.captured._linear = lower_and_compile(self.run_warp.captured._linear)
     self.warp_device = warp['input_specs']['input_frame'][2]
     self.pack_inputs()
     self.run_model = jits['run']
@@ -266,7 +269,7 @@ def main(demo=False):
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
 
-  config_realtime_process(7, 54)
+  gc.disable()
 
   # visionipc clients
   while True:
@@ -322,6 +325,8 @@ def main(demo=False):
     model = small_model
   params.put_bool("ChestnutLoading", False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
+
+  config_realtime_process(7, 54)
 
   # messaging
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry"] + (["chestnutGpuState"] if CHESTNUT else [])
@@ -442,7 +447,7 @@ def main(demo=False):
                        run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutGpuState'].frequency) == 0)
       model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
     except Exception:
-      if not params.get_bool("ChestnutActive"):
+      if not model.chestnut:
         raise
       # fallback to small model
       cloudlog.exception("big model failed, fall back to small")

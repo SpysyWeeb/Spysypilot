@@ -405,6 +405,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.bigModelLoading: {
+    ET.PERMANENT: NormalPermanentAlert("Big Model Loading", "Waiting for the eGPU, up to a minute"),
     ET.NO_ENTRY: NoEntryAlert("Big Model Loading"),
   },
 
