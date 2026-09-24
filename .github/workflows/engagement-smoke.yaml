@@ -14,6 +14,10 @@ concurrency:
 env:
   CI: 1
   PYTHONPATH: ${{ github.workspace }}
+  # the big model pickle is not read here; upstream's CI excludes it the same way
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: lfs.fetchexclude
+  GIT_CONFIG_VALUE_0: openpilot/selfdrive/modeld/models/big_*_tinygrad.pkl
 
 jobs:
   engagement-smoke:
@@ -33,6 +37,7 @@ jobs:
           scons -j$(nproc)
           python -m compileall -q -j 0 openpilot
           python -c "from openpilot.cereal import log"
+          python -c "from openpilot.selfdrive.modeld.modeld import ModelState; ModelState(1928, 1208, False).warmup()"
           "$HOME/.local/bin/uv" run --frozen --with pytest pytest -q \
             openpilot/cereal/tests \
             openpilot/selfdrive/locationd/test/test_torqued.py \
