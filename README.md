@@ -41,7 +41,8 @@ model while the Chestnut's PCIe link is still training.
   L0, for up to `BIG_MODEL_TIMEOUT` (60 s) from the start of loading. The load thread only starts
   once the link is up and keeps its own 60 s timeout, so a load is never started after `modeld` has
   given up. If the link never comes up, no load starts: `ChestnutActive` goes False and the small
-  model runs.
+  model runs. The whole wait and load shows as a permanent "Big Model Loading" alert; upstream only
+  raises a no-entry alert, so nothing was on screen unless the driver tried to engage.
 - `link_up()` reads the LTSSM first and sends the PCIe power request (`0xF3`) only when the link is
   not in L0, the order tinygrad's `CustomASM24Controller` uses, so a link that trained by itself is
   not disturbed by the poll.
