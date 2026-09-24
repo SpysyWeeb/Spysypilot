@@ -72,6 +72,7 @@
 /openpilot/selfdrive/pandad/panda.cc  # SOL
 /openpilot/selfdrive/pandad/panda.h  # SOL
 /openpilot/selfdrive/pandad/pandad.cc  # SOL
+/openpilot/selfdrive/selfdrived/events.py  # c3x-chestnut-v2
 /openpilot/selfdrive/selfdrived/selfdrived.py  # BLoTv3,SOL,hot-swap-experimental; kept: BLoTv3,SOL,hot-swap-experimental + combo-level
 /openpilot/selfdrive/selfdrived/tests/test_conditional_experimental_mode.py  # BLoTv3
 /openpilot/selfdrive/spysypilot/__init__.py  # combo-only fork_only_file (no feature-branch owner)
