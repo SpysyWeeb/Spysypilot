@@ -96,7 +96,21 @@ Both expect stock LongControl's stopping ramp once the stop bit rises above `STA
 for 0.10 m/s and its settle followed the plan (D37 (2)): two owners of when the car is handed to the stopping ramp. The owner
 retired `smooth-stops`' LongControl half (settle, speed wait, release debounce); `longcontrol.py` is upstream's on `combo` too and
 both cases pass. The places in this document that still describe `combo`'s settle as live (the ownership table, D37 (2), the
-`stop_landing.py` contract, the step-1 open items) are BLoTv3's text and follow on `BLoTv3`.
+`stop_landing.py` contract, the step-1 open items) are BLoTv3's text and follow on `BLoTv3`. `test_controlsd_long_state.py`'s two
+stop-edge cases (the bit alone enters stopping at 10 m/s, the bit alone leaves it) fail if the speed wait or the debounce comes back.
+
+The retirement's cost, until `BLoTv3` closes it. Both are the planner's to close: a wait or a filter in LongControl would be a
+third owner of the same decision.
+1. **The pre-release's false releases reach StopReq.** The debounce was the only filter between the planner's stop bit and StopReq
+   at rest. A release the lead-departure pre-release takes back 0.20–0.25 s later (F009's remainder) now drops StopReq for that
+   long and puts LongControl in pid with the wheels still, the window C1's 5.0 arm opens on. Step 1b replayed open loop over the 21
+   GATE routes with upstream's LongControl: 3 such drops (0x3e t=18000.0, 0x4d t=795.4, 0x54 t=1210.3).
+2. **A stop whose landing has not latched gets stock's stopping ramp from 0.3 m/s.** The landing latches only on a plan braking
+   more than `KISS_DECEL`, and the bit waits for `STANDSTILL_SPEED` only while a landing is latched (D37). Behind a lead at walking
+   pace that stops gently the plan stays above −0.15 m/s², so the candidates' `should_stop` raises the bit at 0.30 m/s and the
+   ramp runs from there. In the plant (a lead at 0.4–0.6 m/s stopping at 0.05–0.1 m/s², both `ACCEL_MAX` pins) the wheels stop
+   under a request of −1.03…−1.05 m/s² with the car at −0.69…−0.70, against −0.65 / −0.35 with the retired settle and −0.64 /
+   −0.34 on a latched landing. On the 21 routes, open loop: 1 such stop (0x3e t=17940.5).
 
 ## 3. Module contracts
 

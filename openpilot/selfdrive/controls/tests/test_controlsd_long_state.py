@@ -7,6 +7,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.controlsd import Controls
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
+from openpilot.selfdrive.controls.lib.lane_centering import LaneCentering
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 
@@ -51,9 +52,11 @@ def controls():
   controlsd.VM = VehicleModel(CP)
   controlsd.LoC = LongControl(CP)
   controlsd.LaC = LatControlTorque(CP, CI, DT_CTRL)
-  # combo: the lateral tuning kind and the Sometimes-On-Lateral extension state_control() consults (AOL unavailable here)
+  # combo: the lateral tuning kind, lane centering and the Sometimes-On-Lateral extension state_control() consults
+  # (AOL unavailable here)
   controlsd.lateral_tuning_type = CP.lateralTuning.which()
   controlsd.is_torque_lateral = controlsd.lateral_tuning_type == 'torque'
+  controlsd.lane_centering = LaneCentering()
   controlsd.controls_ext = ControlsExt()
   controlsd.sm = StubSubMaster(messages)
   controlsd.steer_limited_by_safety = False
