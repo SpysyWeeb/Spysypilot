@@ -81,9 +81,6 @@ def test_the_published_state_enters_stopping_on_the_frame_that_asks_to_stop():
   messages['longitudinalPlan'].shouldStop = False
   controlsd.state_control()
 
-  # combo's thin handoff enters stopping once the car stands (STANDSTILL_SPEED), not on the bit alone
-  messages['carState'].vEgo = 0.0
-  messages['carState'].standstill = True
   messages['longitudinalPlan'].shouldStop = True
   CC, _ = controlsd.state_control()
 
@@ -95,15 +92,11 @@ def test_the_published_state_leaves_stopping_on_the_frame_that_releases_the_stop
   # the mirror case, the launch edge: stopping -> pid has to reach the interface with the frame that stops commanding
   # the stop, or the standstill-exit jerk limit is held one frame past the release (route 0x7e green-launch work)
   controlsd, messages = controls()
-  messages['carState'].vEgo = 0.0
-  messages['carState'].standstill = True
   messages['longitudinalPlan'].shouldStop = True
   controlsd.state_control()
   assert controlsd.LoC.long_control_state == LongCtrlState.stopping
 
-  # a launch: the bit drops with the plan asking to move (combo's hold_release releases on that frame, no debounce)
   messages['longitudinalPlan'].shouldStop = False
-  messages['longitudinalPlan'].aTarget = 1.0
   CC, _ = controlsd.state_control()
 
   assert controlsd.LoC.long_control_state == LongCtrlState.pid

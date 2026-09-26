@@ -33,19 +33,16 @@
 /openpilot/selfdrive/controls/lib/force_stops.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/lane_centering.py  # lane-centering
 /openpilot/selfdrive/controls/lib/lane_change_gap.py  # lane-changes
-/openpilot/selfdrive/controls/lib/longcontrol.py  # smooth-stops
 /openpilot/selfdrive/controls/lib/longitudinal_lead.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py  # BLoTv3,lane-changes
 /openpilot/selfdrive/controls/lib/longitudinal_planner.py  # BLoTv3,better-green-lights,curve-speed-limit,lane-changes; kept: combo-level (BLoTv3,better-green-lights,curve-speed-limit integration)
 /openpilot/selfdrive/controls/lib/model_curve_speed.py  # curve-speed-limit
 /openpilot/selfdrive/controls/lib/necessity_supervisor.py  # BLoTv3
-/openpilot/selfdrive/controls/lib/smooth_stops.py  # smooth-stops
 /openpilot/selfdrive/controls/lib/stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/stop_landing.py  # BLoTv3
 /openpilot/selfdrive/controls/plannerd.py  # curve-speed-limit,lane-changes
 /openpilot/selfdrive/controls/radard.py  # smooth-stops; kept: smooth-stops + combo-level
 /openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py  # SOL
-/openpilot/selfdrive/controls/tests/test_combo_contracts.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/tests/test_conditional_experimental_mode.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_controlsd.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/tests/test_controlsd_long_state.py  # BLoTv3
@@ -54,7 +51,6 @@
 /openpilot/selfdrive/controls/tests/test_lane_change_gap.py  # lane-changes
 /openpilot/selfdrive/controls/tests/test_lane_changes.py  # lane-changes
 /openpilot/selfdrive/controls/tests/test_long_mpc.py  # BLoTv3
-/openpilot/selfdrive/controls/tests/test_longcontrol.py  # smooth-stops
 /openpilot/selfdrive/controls/tests/test_longitudinal_lead.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_longitudinal_planner.py  # BLoTv3,lane-changes
 /openpilot/selfdrive/controls/tests/test_longitudinal_planner_model.py  # combo-only fork_only_file (no feature-branch owner)
@@ -62,7 +58,6 @@
 /openpilot/selfdrive/controls/tests/test_necessity_supervisor.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_radard_low_speed.py  # combo-only fork_only_file (no feature-branch owner)
 /openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py  # smooth-stops
-/openpilot/selfdrive/controls/tests/test_smooth_stops.py  # smooth-stops
 /openpilot/selfdrive/controls/tests/test_stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_stop_landing.py  # BLoTv3
 /openpilot/selfdrive/modeld/helpers.py  # c3x-chestnut-v2

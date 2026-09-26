@@ -3,7 +3,6 @@ from opendbc.car.structs import car
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
-from openpilot.selfdrive.controls.lib.smooth_stops import SmoothStopController
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -43,7 +42,6 @@ class LongControl:
     self.pid = PIDController(0.0, (CP.longitudinalTuning.kiBP, CP.longitudinalTuning.kiV),
                              rate=1 / DT_CTRL)
     self.last_output_accel = 0.0
-    self.smooth_stop = SmoothStopController()
 
   def reset(self):
     self.pid.reset()
@@ -53,22 +51,8 @@ class LongControl:
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
-    # While the plan wants to stop but the car still rolls, the hold clamp waits and the pid branch lands the car;
-    # once holding, the release is debounced. The off edge takes the stock path: engaging into a stop at standstill
-    # must clamp at once.
-    if active and self.long_control_state == LongCtrlState.pid:
-      stop_now = self.smooth_stop.want_hold(should_stop, CS.vEgo)
-    elif active and self.long_control_state == LongCtrlState.stopping:
-      stop_now = not self.smooth_stop.hold_release(should_stop, a_target)
-    else:
-      stop_now = should_stop
-
-    previous_state = self.long_control_state
-    self.long_control_state = long_control_state_trans(active, self.long_control_state, stop_now,
+    self.long_control_state = long_control_state_trans(active, self.long_control_state, should_stop,
                                                        CS.brakePressed, CS.cruiseState.standstill)
-    if self.long_control_state == LongCtrlState.stopping and previous_state != LongCtrlState.stopping:
-      self.smooth_stop.arm_hold()
-
     if self.long_control_state == LongCtrlState.off:
       self.reset()
       output_accel = 0.
@@ -82,14 +66,9 @@ class LongControl:
       self.reset()
 
     else:  # LongCtrlState.pid
-      if should_stop:
-        # the landing: open-loop like the stopping state, so the PID stays reset
-        output_accel = self.smooth_stop.settle(a_target, self.last_output_accel)
-        self.reset()
-      else:
-        error = a_target - CS.aEgo
-        output_accel = self.pid.update(error, speed=CS.vEgo,
-                                       feedforward=a_target)
+      error = a_target - CS.aEgo
+      output_accel = self.pid.update(error, speed=CS.vEgo,
+                                     feedforward=a_target)
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel

@@ -89,12 +89,14 @@ BLoTv3's step 1 now uses.
 | C1 | The standstill-exit jerk limit, restored (2026-09-06) | SCC14 `JerkUpperLimit` gates when the car's cruise module commits to a standstill exit; it is a permission, not a command, and the realized acceleration ramp is ~140 ms whatever it says. The Palisade bracket (start-from-stop maneuver, one variable, command to wheel roll) was 1.0 = 1390 ms, 3.0 = 960, 5.0 = 790, 7.0 = 1200, and 5.0 was locked. It rode on the `starting` `LongCtrlState`; upstream deleted that state in July 2026 and the fork inherited the deletion through a sync merge, putting every launch back on the 3.0 arm with the 5.0 branch left as unreachable code. `acc_jerk_upper()` in the opendbc fork writes the old window out: the pid state while the wheels are still. The acceleration request is untouched, so nothing gains authority | `TestHyundaiLaunchJerk` in the opendbc fork (`opendbc/car/hyundai/tests/test_hyundai.py`); field test pending |
 | C2 | A reset clears the whole launch state (2026-09-06) | the reset block cleared `anticipating_prev` but not `anticipating`, `launch_armed` or the `launch_open` filter, so re-engaging at a light with an open path read as a fresh green-light opening on the next frame and fired the launch edge that releases the landing law | `openpilot/selfdrive/controls/tests/test_longitudinal_planner.py` (`TestResetClearsTheLaunchState`); field test pending |
 
-**Open on `combo` (2026-09-25, the owner's call):** two of BLoTv3's cases fail on `combo`'s LongControl and pass on BLoTv3's:
+**Closed on `combo` (2026-09-26):** two of BLoTv3's cases failed on `combo`'s LongControl from 2026-09-25:
 `test_longitudinal.py::TestPlant::test_the_stop_bit_hands_the_car_to_longcontrols_stopping_ramp` and
 `test_longitudinal_planner.py::TestStopBit::test_a_target_nearer_than_the_kiss_can_stop_short_of_takes_the_stop_bit_at_once`.
-Both expect stock LongControl's stopping ramp once the stop bit rises above `STANDSTILL_SPEED`; `smooth-stops`' hold waits for
-0.10 m/s and its settle follows the plan until then (D37 (2)). Retiring the settle's speed wait (`want_hold`'s speed test,
-`STOP_KISS_DECEL`, `SETTLE_JERK`) or accepting the corner on `combo` is open.
+Both expect stock LongControl's stopping ramp once the stop bit rises above `STANDSTILL_SPEED`, where `smooth-stops`' hold waited
+for 0.10 m/s and its settle followed the plan (D37 (2)): two owners of when the car is handed to the stopping ramp. The owner
+retired `smooth-stops`' LongControl half (settle, speed wait, release debounce); `longcontrol.py` is upstream's on `combo` too and
+both cases pass. The places in this document that still describe `combo`'s settle as live (the ownership table, D37 (2), the
+`stop_landing.py` contract, the step-1 open items) are BLoTv3's text and follow on `BLoTv3`.
 
 ## 3. Module contracts
 
