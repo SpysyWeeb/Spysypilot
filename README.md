@@ -53,6 +53,9 @@ from CEM, a creep resume read as a launch — plus tests and docs) merged; await
 the measured speed, a feed-forward landing law whose kiss lands the car before the stop bit rises) merged; awaiting a drive.
 2026-09-26: step 1b of the braking audit (the lead-departure pre-release is the one owner of the release at standstill behind
 the lead the car came to rest behind, and Chill's throttle gate decides on the gas-press probability's 0.25 s mean) merged; awaiting a drive.
+2026-09-26: step 1d of the braking audit (a car held at rest for a lead that has gone missing — one that turned off, or a car crossing
+at a red light flagged as the car came to rest — goes once the model sees open road the way Force Stops sees a green, not only on a
+Force Stops release; a one- or two-frame flash is not one) merged; awaiting a drive.
 
 ## To-Do
 

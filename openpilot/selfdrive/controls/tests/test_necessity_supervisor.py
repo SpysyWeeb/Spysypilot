@@ -331,11 +331,14 @@ class TestLeadDeparturePreRelease:
   def test_the_models_path_opening_ends_the_hold_on_a_missing_lead(self):
     release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
     release.update(True, True, lead(v=0.0, d=7.5), None, True)
-    # with the lead in sight its own departure is the evidence, not the model's path
-    release.update(True, True, lead(v=0.0, d=7.5), None, False, True)
-    assert release.holding
+    # with the lead in sight its own departure is the evidence, not the model's path, however long that stays open
+    for _ in range(frames(1.0)):
+      release.update(True, True, lead(v=0.0, d=7.5), None, False, True)
+      assert release.holding
+    # the lead missing while the path is not open says nothing; the first frame both hold, it has left
     for _ in range(frames(1.0)):
       release.update(True, True, LeadObservation(), None)
+      assert release.holding and not release.handed_back
     release.update(True, True, LeadObservation(), None, False, True)
     assert not release.holding and release.handed_back
 

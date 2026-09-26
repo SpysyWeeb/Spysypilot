@@ -83,7 +83,7 @@ class LeadDeparturePreRelease:
   # plan stops the car for that lead its stop bit stays up until the lead's departure is corroborated, and a release taken back
   # while the lead still stands where it was released restores the hold it ended. All of it belongs to that lead, a return on
   # its radar track or where it stood. The lead missing is not evidence: the hold waits for it, and only a car standing beyond
-  # it, or the model's path opening while it is missing, ends it as a launch; the lead's own track taking the slot back makes it
+  # it, or the model's open road while it is missing, ends it as a launch; the lead's own track taking the slot back makes it
   # that lead again. A measured speed counts only while the model confirms the return (radard's low-speed override reads a
   # standing car as moving) and from the second frame of its radar track
   def __init__(self, dt=DT_MDL, absence_frames=1):
@@ -112,8 +112,7 @@ class LeadDeparturePreRelease:
     self.handed_back = False
 
   def update(self, active, standstill, lead, predicted_speed, lead_stop=False, path_open=False):
-    # lead_stop: the MPC's own plan stops the car for this lead this frame; path_open: the model's path opened (a Force Stops
-    # release) this frame
+    # lead_stop: the MPC's own plan stops the car for this lead this frame; path_open: the road ahead is confirmed open this frame
     if not (active and standstill):
       self.reset()
       return False
