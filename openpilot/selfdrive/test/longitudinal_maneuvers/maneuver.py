@@ -32,7 +32,10 @@ class Maneuver:
     self.stop_line = kwargs.get("stop_line", None)
     self.stop_line_horizon_s = kwargs.get("stop_line_horizon_s", 5.0)
     self.e2e_landing_push = kwargs.get("e2e_landing_push", 0.0)
-    self.actuator_lag = kwargs.get("actuator_lag", None)
+    self.actuator_lag = kwargs.get("actuator_lag", False)
+    self.CP = kwargs.get("CP", None)
+    self.accel_error = kwargs.get("accel_error", 0.0)
+    self.creep = kwargs.get("creep", 0.0)
 
     self.duration = duration
     self.title = title
@@ -52,6 +55,9 @@ class Maneuver:
       stop_line_horizon_s=self.stop_line_horizon_s,
       e2e_landing_push=self.e2e_landing_push,
       actuator_lag=self.actuator_lag,
+      CP=self.CP,
+      accel_error=self.accel_error,
+      creep=self.creep,
     )
 
     valid = True
@@ -77,14 +83,16 @@ class Maneuver:
                             log['speed'],
                             speed_lead,
                             log['acceleration'],
-                            log['d_rel']]))
+                            log['d_rel'],
+                            log['a_target'],
+                            log['forcing']]))
 
       if d_rel < .4 and (self.only_radar or prob_lead > 0.5):
         print("Crashed!!!!")
         valid = False
 
       # Once ego is moving, a faster lead plus a brief non-positive command can be normal gap
-      # settling, not proof the planner failed to start (a86a44e4f); scope the check below 2 m/s
+      # settling, not proof the planner failed to start; scope the check below 2 m/s
       # so a genuine stall during the launch itself still fails the maneuver.
       if self.ensure_start and log['speed'] < 2.0 and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
         if not_starting_t == 0.0:
@@ -99,7 +107,8 @@ class Maneuver:
       print('LongitudinalPlanner not slowing down!')
       valid = False
 
-    if self.force_decel and log['speed'] > 1e-1 and log['acceleration'] > -0.04:
+    # forceDecel is judged on the plan, which a disengaged car does not follow
+    if self.force_decel and log['speed'] > 1e-1 and log['a_target'] > -0.04:
       print('Not stopping with force decel')
       valid = False
 

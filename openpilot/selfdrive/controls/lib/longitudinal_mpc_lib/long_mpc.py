@@ -58,6 +58,10 @@ T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 7.0
 MIN_X_LEAD_FACTOR = 0.5
+# the QP plans against the obstacles present each frame; the hand-over in update() waits LEAD_PRESENCE_FRAMES for a radar lead
+# taking over from the free run and LEAD_ABSENCE_FRAMES for one that is gone, so toggles and short dropouts do not restart the plan
+LEAD_PRESENCE_FRAMES = 2
+LEAD_ABSENCE_FRAMES = 7
 
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
@@ -243,10 +247,14 @@ class LongitudinalMpc:
     self.crash_cnt = 0.0
     self.source = LongitudinalPlanSource.cruise
     self.binding_obstacle = None
+    self.pending_frames = 0
+    self.lead_present = False
+    self.column_present = False
     self.solution_status = 0
     # timers
     self.solve_time = 0.0
     self.x0 = np.zeros(X_DIM)
+    self.a_told = 0.0
     self.set_weights()
 
   def set_cost_weights(self, cost_weights, constraint_cost_weights):
@@ -273,13 +281,32 @@ class LongitudinalMpc:
     constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     self.set_cost_weights(cost_weights, constraint_cost_weights)
 
-  def set_cur_state(self, v, a):
+  def set_cur_state(self, v, a, a_told):
+    # a: the acceleration the plan continues from; a_told: the target the car was last given, where a new obstacle's plan starts
     v_prev = self.x0[1]
     self.x0[1] = v
     self.x0[2] = a
+    self.a_told = a_told
     if abs(v_prev - v) > 2.:  # probably only helps if v < v_prev
       for i in range(N+1):
         self.solver.set(i, 'x', self.x0)
+
+  def reseed(self):
+    # the iterate restarts from a constant-acceleration rollout of the current state, at rest once stopped
+    v0, a0 = self.x0[1], self.x0[2]
+    t_stop = -v0 / a0 if a0 < 0.0 else np.inf
+    t = np.minimum(T_IDXS, t_stop)
+    x = np.column_stack((v0 * t + a0 * t**2 / 2, np.maximum(v0 + a0 * t, 0.0), np.where(T_IDXS < t_stop, a0, 0.0)))
+    x[0] = self.x0
+    for i in range(N+1):
+      self.solver.set(i, 'x', x[i])
+    for i in range(N):
+      self.solver.set(i, 'u', np.zeros(U_DIM))
+
+  @property
+  def a_next(self):
+    # the plan one frame on (acceleration is linear between nodes); unclipped: the plan, not what the car was told
+    return float(np.interp(self.dt, T_IDXS, self.a_solution))
 
   @staticmethod
   def extrapolate_lead(x_lead, v_lead, a_lead, a_lead_tau):
@@ -345,12 +372,30 @@ class LongitudinalMpc:
     binding = int(np.argmin(x_obstacles[0]))
     self.source = MPC_SOURCES[binding]
 
-    # a new binding obstacle re-anchors the change cost on the current acceleration: continuity with the
-    # previous owner's solution (a free run, a departed lead, a policy that just ended) would drag the
-    # first solves toward it -- a committed stop used to start 1.5 s late for exactly that reason
-    if binding != self.binding_obstacle:
+    # the binding obstacle's identity, not its column: the fake lead's free run, a real lead in either slot, or the stop column.
+    # It changes when an obstacle comes or goes; a lead and the column trading the binding while both are present do not change it
+    leads = (radarstate.leadOne, radarstate.leadTwo)
+    obstacle = 'stop' if binding == 2 else 'lead' if leads[binding].present else 'fake'
+    lead_present = leads[0].present or leads[1].present
+    column_edge = (stop_x is not None) != self.column_present
+    if {obstacle, self.binding_obstacle} == {'lead', 'stop'} and lead_present and self.lead_present and not column_edge:
+      self.binding_obstacle = obstacle
+    self.lead_present, self.column_present = lead_present, stop_x is not None
+    hold = 1
+    if self.binding_obstacle == 'lead' and not (column_edge and obstacle == 'stop'):
+      hold = LEAD_ABSENCE_FRAMES
+    elif self.binding_obstacle == 'fake' and obstacle == 'lead':
+      hold = LEAD_PRESENCE_FRAMES
+    self.pending_frames = self.pending_frames + 1 if obstacle != self.binding_obstacle else 0
+    new_obstacle = self.pending_frames >= hold
+    # a new binding obstacle discards the old plan: its plan starts from what the car was told, the change cost re-anchors
+    # there and the iterate restarts from that state; that frame runs one more SQP-RTI iteration
+    if new_obstacle:
+      self.binding_obstacle = obstacle
+      self.pending_frames = 0
+      self.x0[2] = self.a_told
       self.a_prev.fill(self.x0[2])
-    self.binding_obstacle = binding
+      self.reseed()
 
     # the supervisor's policy shapes lead0's solve only; another owner solves with the incumbent weights
     if self.source != LongitudinalPlanSource.lead0:
@@ -371,21 +416,25 @@ class LongitudinalMpc:
     self.params[:,4] = t_follow
     self.params[:,5] = LEAD_DANGER_FACTOR
 
-    self.run()
+    self.run(2 if new_obstacle else 1)
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
             radarstate.leadOne.present and radarstate.leadOne.modelProb > 0.9):
       self.crash_cnt += 1
     else:
       self.crash_cnt = 0
 
-  def run(self):
+  def run(self, iterations=1):
     for i in range(N+1):
       self.solver.set(i, 'p', self.params[i])
     self.solver.constraints_set(0, "lbx", self.x0)
     self.solver.constraints_set(0, "ubx", self.x0)
 
-    self.solution_status = self.solver.solve()
-    self.solve_time = float(self.solver.get_stats('time_tot')[0])
+    self.solve_time = 0.0
+    for _ in range(iterations):
+      self.solution_status = self.solver.solve()
+      self.solve_time += float(self.solver.get_stats('time_tot')[0])
+      if self.solution_status != 0:
+        break
 
     for i in range(N+1):
       self.x_sol[i] = self.solver.get(i, 'x')
