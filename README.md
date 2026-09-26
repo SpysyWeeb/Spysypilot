@@ -2,42 +2,47 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-**Status: in progress; awaiting owner field validation.** Watch the last few centimetres of each stop for any residual creep the kiss doesn't fully arrest, and the release for hesitation on a green.
+**Status: in progress; awaiting owner field validation.** This branch now carries only radard's low-speed lead gates.
+Watch the last metres of a stop behind a stopped car or at walking pace for a close radar return becoming the lead.
 
 ## What it does
 
-Kills the **"headbang" at the end of every stop**. Stock openpilot jumps to the `stopping` state the moment the
-planner's stop bit sets (v < 0.3 m/s) and ramps the brake command to −2.0 m/s² *while the car is still rolling*. This
-branch waits for the car to actually slow to 0.10 m/s before that clamp lands, and in between keeps the planner's
-request bounded from below by a gentle "kiss" of braking so the stop completes.
-
-This branch has no anti-creep of its own: if the car stalls under the kiss and stops making progress, nothing here
-presses harder. The planner and the Palisade's own ESP, which brings the car to rest below ~0.3 m/s whatever is
-requested, finish the stop. On the `combo` branch the planner-side landing corridor (BLoTv3) owns anti-creep instead;
-against the stock planner this branch runs on, that job is the ESP's.
-
-*(personal idea)*
-
-## How it works
-
-`SmoothStopController` inside longcontrol, at control rate:
-
-- **Hold only once stopped** — the clamp arms once the car has actually slowed to ≤ 0.10 m/s (`STANDSTILL_SPEED`).
-  The car's own standstill flag is not used for this: it asserts at ~0.6 m/s, far too early to be believed.
-- **The landing** — while the planner's stop bit is set and the car still rolls, the command is the planner's request
-  bounded from below by the kiss (0.15 m/s², `STOP_KISS_DECEL`), jerk-limited at 2.5 m/s³ (`SETTLE_JERK`) in both
-  directions. Braking harder than the kiss is not held back by that floor, but it still rides the jerk limit, and
-  the PID is held reset for the whole landing.
-- **Release** — the frame the stop bit drops with the plan asking to move (`a_target > 0`) lifts the hold at once;
-  launch response time isn't for sale, so there's no debounce on that edge. A dropped bit with the plan still braking
-  is a flicker unless it lasts 50 control frames (0.5 s, `HOLD_RELEASE_FRAMES`).
 - **radard** — the unconfirmed low-speed lead override (a radar-only track below the stationary speed threshold)
   needs a track age of 20 cycles (~1 s, `LOW_SPEED_LEAD_MIN_CNT`) and a distance past `max(0.75 m, 0.6 s × v_ego)`.
   A track's age restarts whenever the radar drops it for even one cycle.
 
-What used to be here — an entry-anchored taper, a lead floor, a queue-aware anti-creep ratchet with hysteresis and
-radar-dropout grace, and a radarState subscription in controlsd — never triggered in the field and re-derived lead
-physics the planner already owns, so it was removed.
+*(personal idea)*
+
+## Where the stop landing went
+
+This branch used to own the last 0.3 m/s of every stop inside LongControl (the "thin handoff"): the hold clamp waited
+for the car to slow to 0.10 m/s, a 0.15 m/s² "kiss" bounded the planner's request from below while the car rolled out,
+and a dropped stop bit with the plan still braking lifted the hold only after 0.5 s. Stock openpilot clamps the frame
+the planner's stop bit sets (v < 0.3 m/s) and ramps the brake command toward −2.0 m/s² while the car still rolls; that
+ramp was the "headbang" this branch was written to kill. (Before the thin handoff of 2026-08-29, an entry-anchored
+taper, a lead floor, a queue-aware anti-creep ratchet and a radarState subscription in controlsd lived here; they never
+triggered in the field and re-derived lead physics the planner already owns.)
+
+Since BLoTv3's braking-audit step 1 (`docs/BLoTv3.md` D37, on the `BLoTv3` and `combo` branches) the **planner owns the
+stop bit's timing**: it withholds the bit while its landing's kiss lands a rolling car and raises it at the standstill
+speed, 0.10 m/s (the Palisade's own standstill flag rises at 0.07–0.11 m/s), or at once when a target is nearer than the
+kiss can stop short of. The same decision had two owners, so the LongControl half is retired: `longcontrol.py` is
+upstream's again and its clamp follows the plan's stop bit. What it measured before going (the merged `combo` tree,
+LongControl variants on the same planner):
+
+- **The speed wait and the settle.** With the hold on the stop bit the settle can no longer run. The wait only mattered
+  where the bit rises above 0.10 m/s outside the kiss: 6 of 161 maneuver runs, and the two BLoTv3 cases it failed — the
+  plant's check that the stop bit hands the car to the stopping ramp, and a target appearing 0.3 m ahead at walking pace,
+  which with a car braking 0.3 m/s² short of the request the settle followed into contact (−0.11 m) where the stopping
+  ramp stops 0.12 m clear. On 21 replayed routes (438,623 engaged frames, open loop) it changed 6 stops, only one by more
+  than 0.05 m/s²: a queue creep on route 0x3e whose plan never braked past the kiss, so no landing formed and the car gets
+  the stopping ramp from 0.26 m/s. The six traced stops closed loop through three ESP fits: 18 of 18 runs byte-identical.
+- **The release debounce.** On the same routes it released the hold later than the stop bit on 70 of 104 releases. 65
+  were launches: the planner drops the bit on the frame its landing hands the kiss back (−0.05 m/s² there, positive a
+  frame later), and waiting for a positive plan held StopReq 50–250 ms into the green. 4 were releases with the plan at
+  −0.15…0, held the full 0.5 s. 1 was a 0.25 s stop-bit flicker at rest that it hid. With BLoTv3's step 1b on top: 74
+  launches, 5 full holds, 3 flickers — all three the lead-departure pre-release releasing and taking it back 0.2–0.25 s
+  later, which is the pre-release's decision to get right, not LongControl's.
 
 ## What changed
 
@@ -59,9 +64,12 @@ restarts on a one-cycle radar dropout, not just a sustained loss. Tests moved on
 cases for the age boundary, the 25 m ceiling, the speed off-switch, a vision lead versus a closer track, the release counter
 re-arming on hold entry, and the PID staying reset through the landing. No constant or behavior changed.
 
-- `openpilot/selfdrive/controls/lib/smooth_stops.py` — `SmoothStopController`: hold arm/release and the landing settle.
-- `openpilot/selfdrive/controls/lib/longcontrol.py` — the stopping-state transition and hold release route through the
-  controller; the pid branch lands the car while the plan's stop bit is set.
-- `openpilot/selfdrive/controls/radard.py` — the unconfirmed low-speed lead override's track-age and distance gates.
+- **2026-09-26 — the LongControl half is retired.** BLoTv3's planner now owns when the stop bit rises (see "Where the stop
+landing went"), so `smooth_stops.py`, its tests and the handoff's tests in `test_longcontrol.py` are deleted and
+`longcontrol.py` is upstream's again. The module's claim that the standstill flag asserts at ~0.6 m/s was wrong: the
+Palisade's rises at 0.073–0.111 m/s (median 0.098 over 98 edges).
 
-History note: this branch once also carried Smooth Approach / Smooth Release wrappers for braking further out; those were retired in favor of the [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/tree/BLoT) supervisor, which drives the MPC's own knobs instead of wrapping its output. This branch is now the stop-landing piece only.
+- `openpilot/selfdrive/controls/radard.py` — the unconfirmed low-speed lead override's track-age and distance gates.
+- `openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py` — its tests.
+
+History note: this branch once also carried Smooth Approach / Smooth Release wrappers for braking further out; those were retired in favor of the [`BLoT`](https://github.com/SpysyWeeb/Spysypilot/tree/BLoT) supervisor, which drives the MPC's own knobs instead of wrapping its output. The stop-landing piece followed on 2026-09-26 (above); radard's gate is what remains.
