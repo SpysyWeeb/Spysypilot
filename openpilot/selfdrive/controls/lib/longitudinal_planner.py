@@ -5,12 +5,13 @@ import numpy as np
 import openpilot.cereal.messaging as messaging
 from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from openpilot.common.constants import CV
+from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.force_stops import ForceStops
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_ABSENCE_FRAMES, LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
 from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop
 from openpilot.selfdrive.controls.lib.stop_landing import STANDSTILL_SPEED, STOP_INTENT_SPEED, StopLanding
@@ -35,6 +36,9 @@ CRUISE_COMFORT_COAST_ERROR = 5.0 * CV.MPH_TO_MS
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
 MIN_ALLOW_THROTTLE_SPEED = 2.5
+# s; near the threshold the gas-press probability moves as much from frame to frame (sd 0.11) as it sits from the threshold, so
+# the gate decides on its mean, not on each frame's noise
+ALLOW_THROTTLE_PROB_TAU = 0.25
 
 def get_max_accel_request(v_ego):
   remaining = 1.0 - np.clip(v_ego / A_CRUISE_MAX_SPEED, 0.0, 1.0)
@@ -86,8 +90,9 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
+    self.throttle_prob = FirstOrderFilter(1.0, ALLOW_THROTTLE_PROB_TAU, dt)
     self.supervisor = NecessitySupervisor(dt)
-    self.lead_departure = LeadDeparturePreRelease(dt)
+    self.lead_departure = LeadDeparturePreRelease(dt, LEAD_ABSENCE_FRAMES)
     self.force_stops = ForceStops(dt)
     self.stop_landing = StopLanding(dt, CP.longitudinalActuatorDelay + DT_MDL, (J_CRUISE_BP, J_CRUISE_VALS))
     self.holding_prev = False
@@ -128,7 +133,11 @@ class LongitudinalPlanner:
 
     throttle_probs = sm['modelV2'].meta.disengagePredictions.gasPressProbs
     throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
-    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
+    if math.isfinite(throttle_prob):
+      if reset_state:
+        self.throttle_prob.x = throttle_prob
+      self.throttle_prob.update(throttle_prob)
+    self.allow_throttle = self.throttle_prob.x > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
 
     if reset_state:
       self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
@@ -159,10 +168,15 @@ class LongitudinalPlanner:
 
     personality = sm['selfdriveState'].personality
     # the published target is the plan read action_t ahead, not its current acceleration: while the MPC drives it continues its
-    # own plan as far as the car can follow it, otherwise it starts from what the car was told. Nothing below the planner closes
-    # a loop on speed, so the plan starts from the car's measured speed
-    a_seed = float(np.clip(self.mpc.a_next, ACCEL_MIN, ACCEL_MAX)) if self.plan_winner in ('mpc', 'column') else self.output_a_target
-    self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, self.output_a_target)
+    # own plan as far as the car can follow it, otherwise it starts from what the car was told. A car the pre-release held at
+    # rest last frame drove no plan: it starts from rest. Nothing below the planner closes a loop on speed, so the plan starts
+    # from the car's measured speed
+    if self.lead_departure.holding:
+      a_seed = a_told = 0.0
+    else:
+      a_told = self.output_a_target
+      a_seed = float(np.clip(self.mpc.a_next, ACCEL_MIN, ACCEL_MAX)) if self.plan_winner in ('mpc', 'column') else a_told
+    self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, a_told)
     self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, stop_x,
                     policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint)
 
@@ -180,20 +194,25 @@ class LongitudinalPlanner:
                                               action_t=action_t)
     self.mpc_a_target = float(output_a_target_mpc)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
-    # a stopped lead that is confirmed leaving releases the MPC's stop bit early; its acceleration target is untouched
-    lead_departing = self.lead_departure.update(self.CP.openpilotLongitudinalControl and not long_control_off, sm['carState'].standstill,
-                                                lead, lead0_anchor.speed if lead0_anchor is not None else None)
-    if lead_departing:
-      output_should_stop_mpc = False
-    output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
-    output_should_stop_e2e = sm['modelV2'].action.shouldStop
-
     # a hold ends in one of two ways and only one of them is a launch: creeping past RESUME_SPEED on a grade turns the
     # hold back into a moving commitment with the latch alive, while a real release drops the commitment altogether.
     # Force Stops tells them apart by its stop point -- it keeps one while forcing or holding, and reports none on a
     # release -- so the hold edge alone does not tear the landing corridor down mid-stop
-    launch = lead_departing or (self.holding_prev and not force_stop.holding and force_stop.stop_x is None)
+    force_stops_release = self.holding_prev and not force_stop.holding and force_stop.stop_x is None
     self.holding_prev = force_stop.holding
+    # once the MPC holds the car at rest for a lead, its stop bit is the pre-release's: the plan's hover at rest does not release
+    # it, a corroborated departure does, a release taken back before the lead moved holds the car again, and a hold is handed
+    # back to the plan only on evidence that its lead has left. The acceleration target is untouched
+    lead_departing = self.lead_departure.update(self.CP.openpilotLongitudinalControl and not long_control_off, sm['carState'].standstill,
+                                                lead, lead0_anchor.speed if lead0_anchor is not None else None,
+                                                output_should_stop_mpc and self.mpc.binding_obstacle == 'lead', force_stops_release)
+    if lead_departing:
+      output_should_stop_mpc = False
+    elif self.lead_departure.holding:
+      output_should_stop_mpc = True
+    output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
+    output_should_stop_e2e = sm['modelV2'].action.shouldStop
+    launch = lead_departing or self.lead_departure.handed_back or force_stops_release
 
     # while a committed stop's profile is moving the car, the model's own request joins only if it is clearly more urgent:
     # its late ramp would overtake the profile through min() and put the heavy braking back at the end. Once it leads it stays
@@ -233,7 +252,8 @@ class LongitudinalPlanner:
     # releases (a corroborated lead departure, a Force Stops release) end it at once, a climbing plan ends it by itself
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
-    output_a_target = self.stop_landing.update(a_arbitrated, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo)
+    output_a_target = self.stop_landing.update(a_arbitrated, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo,
+                                               launch_cancelled=self.lead_departure.cancelled)
     # the landing's kiss stops the wheels of a rolling car; LongControl's stopping ramp ignores the plan, so it takes over at the
     # standstill speed. A lead nearer than the kiss can stop short of is not the kiss's stop, and once the stop bit has risen in
     # a landing it stays for as long as its own rule holds it

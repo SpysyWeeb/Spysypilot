@@ -198,6 +198,23 @@ class TestLatchAndLaunch:
     law.update(0.02, 0.0, NO_LEAD, True, launch=True)
     assert not law.landing
 
+  def test_a_launch_taken_back_at_standstill_latches_the_landing_again(self):
+    # the release ended the landing and the plan hovers above the kiss, where no landing would start: the planner takes the
+    # launch back while the car still stands, and the landing it ended holds the car on the kiss again, braking passing at once
+    law = landing(0.2, -0.2)
+    law.update(0.13, 0.0, NO_LEAD, True, launch=True)
+    law.update(0.13, 0.0, NO_LEAD, True, launch=True)
+    assert law.update(0.13, 0.0, NO_LEAD, True) > -KISS_DECEL and not law.landing
+    assert law.update(0.13, 0.0, NO_LEAD, True, launch_cancelled=True) == -KISS_DECEL and law.landing and not law.releasing
+    assert law.update(0.13, 0.0, NO_LEAD, True) == -KISS_DECEL and law.landing
+    # a launch starting on the frame it is taken back, or a car already rolling, is not the landing's to restore
+    law = landing(0.2, -0.2)
+    law.update(0.13, 0.0, NO_LEAD, True, launch=True)
+    law.update(0.13, 0.0, NO_LEAD, True, launch=True, launch_cancelled=True)
+    assert not law.landing
+    law.update(0.13, STANDSTILL_SPEED + 0.05, NO_LEAD, True, launch_cancelled=True)
+    assert not law.landing
+
   def test_reset_forgets_the_landing_and_its_release(self):
     law = landing(0.2, -0.2)
     law.update(0.02, 0.0, NO_LEAD, True)

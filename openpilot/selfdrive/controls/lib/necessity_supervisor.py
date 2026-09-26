@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import math
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.longitudinal_lead import closing_speed, time_to_collision, total_decel_requirement
+from openpilot.selfdrive.controls.lib.longitudinal_lead import MODEL_LEAD_PROB_MIN, closing_speed, time_to_collision, total_decel_requirement
 
 # The supervisor never commands acceleration. It only moves two solver inputs the MPC already
 # owns, the acceleration-change/jerk cost and the following time, in proportion to measured need.
@@ -49,6 +49,10 @@ LEAD_DEPARTURE_SPEED = 0.5   # m/s of lead speed that releases at once; 0.3 rele
 LEAD_MOVING_SPEED = 0.25
 LEAD_DEPARTURE_CONFIRM = 0.2
 LEAD_DEPARTURE_CANCEL = 0.2
+LEAD_SAME_CAR_JUMP = 2.0     # m; at standstill radard re-associates the car it has within 1.1 m, and another car taking the slot
+                             # reads 3.3 m or more away
+LEAD_STANDING_NOISE = 0.25   # m; a car standing ahead of the car at rest reads within two of the radar's 0.1 m range steps of where
+                             # it stood (its quantisation and one step of noise), and a third step is motion
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,29 +79,81 @@ class DebouncedTrigger:
 
 
 class LeadDeparturePreRelease:
-  # releases only the MPC stop bit once a stopped lead's departure is corroborated
-  def __init__(self, dt=DT_MDL):
+  # the one owner of the release at standstill behind the lead the car came to rest behind: from the first frame the MPC's own
+  # plan stops the car for that lead its stop bit stays up until the lead's departure is corroborated, and a release taken back
+  # while the lead still stands where it was released restores the hold it ended. All of it belongs to that lead, a return on
+  # its radar track or where it stood. The lead missing is not evidence: the hold waits for it, and only a car standing beyond
+  # it, or the model's path opening while it is missing, ends it as a launch; the lead's own track taking the slot back makes it
+  # that lead again. A measured speed counts only while the model confirms the return (radard's low-speed override reads a
+  # standing car as moving) and from the second frame of its radar track
+  def __init__(self, dt=DT_MDL, absence_frames=1):
     self.dt = dt
+    self.absence_frames = absence_frames
     self.reset()
 
   def reset(self):
+    self._forget_lead()
+    self._arrival = True
+    self._arrival_tracks = set()
+
+  def _forget_lead(self):
     self._prediction_s = 0.0
     self._cancel_s = 0.0
     self._released = False
+    self._released_at = 0.0
+    self._stopped_for = False
+    self._arrival = False
+    self._track_id = None
+    self._distance = 0.0
+    self._stood = 0.0
+    self._absent_frames = 0
+    self.holding = False
+    self.cancelled = False
+    self.handed_back = False
 
-  def update(self, active, standstill, lead, predicted_speed):
-    if not (active and standstill and lead.present):
+  def update(self, active, standstill, lead, predicted_speed, lead_stop=False, path_open=False):
+    # lead_stop: the MPC's own plan stops the car for this lead this frame; path_open: the model's path opened (a Force Stops
+    # release) this frame
+    if not (active and standstill):
       self.reset()
       return False
+    held = self.holding
+    self.cancelled = self.handed_back = False
+    if not lead.present:
+      # the hold waits and a release fails closed. Before any lead, the MPC's own absence hold bounds how late the lead the car
+      # came to rest behind can appear
+      self._prediction_s = 0.0
+      self._cancel_s = 0.0
+      self._released = False
+      if self._track_id is None:
+        self._absent_frames += 1
+        self._arrival = self._arrival and self._absent_frames < self.absence_frames
+      elif path_open:
+        self._forget_lead()
+        self.handed_back = held
+      return False
+    same_track = self._track_id is None or lead.track_id == self._track_id
+    if self._track_id is None or not ((same_track and lead.track_id != -1) or abs(lead.distance - self._distance) <= LEAD_SAME_CAR_JUMP):
+      if self._track_id is not None and self.holding and lead.distance <= self._stood + LEAD_STANDING_NOISE:
+        # a nearer car, or the held one back from behind it: nothing has left
+        self._prediction_s = 0.0
+      else:
+        if self._track_id is not None:
+          self._forget_lead()
+        self._arrival = self._arrival or lead.track_id in self._arrival_tracks
+    if self._arrival and lead.track_id != -1:
+      self._arrival_tracks.add(lead.track_id)
+    self._track_id, self._distance = lead.track_id, lead.distance
+    stops_car = lead_stop and self._arrival
+    self._stopped_for = self._stopped_for or self.holding or stops_car
 
+    measured = lead.speed > LEAD_MOVING_SPEED and lead.model_prob > MODEL_LEAD_PROB_MIN and same_track
+    released = self._released
     if lead.speed > LEAD_DEPARTURE_SPEED:
       self._released = True
       self._prediction_s = 0.0
       self._cancel_s = 0.0
-      return True
-
-    departure_valid = lead.speed > LEAD_MOVING_SPEED or (predicted_speed is not None and predicted_speed > LEAD_DEPARTURE_SPEED)
-    if departure_valid:
+    elif measured or (predicted_speed is not None and predicted_speed > LEAD_DEPARTURE_SPEED):
       self._prediction_s += self.dt
       self._cancel_s = 0.0
       if self._prediction_s + 1e-9 >= LEAD_DEPARTURE_CONFIRM:
@@ -107,7 +163,17 @@ class LeadDeparturePreRelease:
       if self._released:
         self._cancel_s += self.dt
         if self._cancel_s + 1e-9 >= LEAD_DEPARTURE_CANCEL:
-          self.reset()
+          self._released = False
+          self._cancel_s = 0.0
+          # a lead that has moved since it was released is leaving: its launch stays the MPC's plan
+          self.cancelled = self._stopped_for and lead.distance <= self._released_at + LEAD_STANDING_NOISE
+    if self._released and not released:
+      self._released_at = lead.distance
+    holding = not self._released and (self.holding or stops_car or self.cancelled)
+    # where the car the hold is on stands: a nearer car taking the slot does not move it
+    self._stood = max(self._stood, lead.distance) if self.holding and holding else lead.distance
+    self.holding = holding
+    self.handed_back = held and not self.holding and not self._released
     return self._released
 
 

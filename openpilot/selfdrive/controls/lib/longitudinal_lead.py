@@ -19,11 +19,14 @@ LEAD_PATH_MARGIN = 10.0
 
 @dataclass(frozen=True, slots=True)
 class LeadObservation:
-  # finite, filtered values from one valid radarState sample; the MPC obstacle uses the raw vLead as stock does
+  # finite, filtered values from one valid radarState sample; the MPC obstacle uses the raw vLead as stock does. model_prob is the
+  # model's confidence in this return (0 for radard's low-speed override), track_id its radar track (-1 vision-only)
   present: bool = False
   distance: float = math.inf
   speed: float = 0.0
   acceleration: float = 0.0
+  model_prob: float = 0.0
+  track_id: int = -1
 
   @classmethod
   def from_radar(cls, lead, service_valid):
@@ -32,7 +35,7 @@ class LeadObservation:
     values = (lead.dRel, lead.vLeadK, lead.aLeadK)
     if not all(math.isfinite(v) for v in values) or lead.dRel <= 0.0:
       return cls()
-    return cls(True, lead.dRel, max(lead.vLeadK, 0.0), float(np.clip(lead.aLeadK, -10.0, 5.0)))
+    return cls(True, lead.dRel, max(lead.vLeadK, 0.0), float(np.clip(lead.aLeadK, -10.0, 5.0)), lead.modelProb, lead.radarTrackId)
 
 
 @dataclass(frozen=True, slots=True)

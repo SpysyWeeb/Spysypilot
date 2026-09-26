@@ -43,6 +43,13 @@ class TestLeadObservation:
     assert not LeadObservation.from_radar(radar_lead(dRel=0.0), True).present
     assert not LeadObservation.from_radar(radar_lead(vLeadK=math.inf), True).present
 
+  def test_carries_the_models_confidence_and_the_radar_track(self):
+    radar = radar_lead(modelProb=0.75)
+    radar.radarTrackId = 396447
+    lead = LeadObservation.from_radar(radar, True)
+    assert lead.model_prob == 0.75 and lead.track_id == 396447
+    assert LeadObservation.from_radar(radar_lead(), True).track_id == -1
+
   def test_sanitizes_filtered_values(self):
     lead = LeadObservation.from_radar(radar_lead(vLeadK=-0.2, aLeadK=-20.0, modelProb=1.4), True)
     assert lead.present
