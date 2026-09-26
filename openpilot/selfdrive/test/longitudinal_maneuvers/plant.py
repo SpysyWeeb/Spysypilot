@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
+import math
+from collections import deque
+
 import numpy as np
 
+from opendbc.car import gen_empty_fingerprint
+from opendbc.car.car_helpers import interfaces
+from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
-from openpilot.common.realtime import Ratekeeper, DT_MDL
-from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.common.realtime import Ratekeeper, DT_CTRL, DT_MDL
+from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
+from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
+
+RADAR_DREL_STEP = 0.1  # m, the resolution of the Palisade radar's track distance
+# driveline creep is an assumed model, not an identified one: it fades out by DRIVELINE_CREEP_SPEED, and the brakes hold against
+# it only while the request (not the braking the actuator applies) asks for at least CREEP_HOLD_REQUEST
+DRIVELINE_CREEP_SPEED = 1.0  # m/s
+CREEP_HOLD_REQUEST = -0.2  # m/s^2
 
 
 class _PlantSubMaster:
@@ -44,6 +57,38 @@ def _model_lead_v3(x, v, prob):
   return lead
 
 
+def palisade_car_params():
+  # the car BLoTv3 drives: a Palisade under openpilot longitudinal control
+  from opendbc.car.hyundai.values import CAR
+  return interfaces[CAR.HYUNDAI_PALISADE].get_params(CAR.HYUNDAI_PALISADE, gen_empty_fingerprint(), [], alpha_long=True, is_release=False, docs=False)
+
+
+class ActuatorLag:
+  """The Palisade's acceleration response to its SCC request: per speed band, the held-out best fit of a dead time and a first
+  order with separate time constants for building and releasing braking, identified on braking requests against the wheel
+  acceleration on its CAN bus. The data do not identify the dead time (0-0.24 s fit within 1 %) or the asymmetry below 4 m/s
+  (a symmetric lag or a rate limit fits as well), so a result that moves within those spreads is not decided by this fit.
+  It has no standstill regime: held wheels do not accelerate, and a launch starts from rest behind the dead time."""
+  SPEED_BP = [4.0, 8.0]
+  # per speed band: dead time (s), time constant building braking (s), releasing it (s), gain
+  BANDS = [(0.12, 0.20, 0.60, 0.95), (0.08, 0.25, 0.30, 1.0), (0.16, 0.20, 0.30, 1.0)]
+
+  def __init__(self):
+    n = round(max(band[0] for band in self.BANDS) / DT_CTRL) + 1
+    self.requests = deque([0.0] * n, maxlen=n)
+    self.accel = 0.0
+
+  def update(self, request, v_ego):
+    dead_time, tau_bite, tau_release, gain = self.BANDS[int(np.searchsorted(self.SPEED_BP, v_ego, side='right'))]
+    self.requests.append(request)
+    target = gain * self.requests[-1 - round(dead_time / DT_CTRL)]
+    tau = tau_bite if target < self.accel else tau_release
+    self.accel += (target - self.accel) * (1.0 - math.exp(-DT_CTRL / tau))
+    if v_ego <= 0.0:
+      self.accel = max(self.accel, 0.0)
+    return self.accel
+
+
 E2E_PUSH_DISTANCE = 12.0  # m, the fake model's late ramp builds over this distance to the line
 
 
@@ -51,7 +96,8 @@ class Plant:
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
                enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
                stop_line=None, stop_line_horizon_s=5.0,
-               curve=None, torque_factor=2.7, torque_friction=0.11, curve_model_scale=1.0, e2e_landing_push=0.0, actuator_lag=None):
+               curve=None, torque_factor=2.7, torque_friction=0.11, curve_model_scale=1.0,
+               e2e_landing_push=0.0, actuator_lag=False, CP=None, accel_error=0.0, creep=0.0):
     self.rate = 1. / DT_MDL
 
 
@@ -61,6 +107,7 @@ class Plant:
     self.speed = speed
     self.should_stop = False
     self.acceleration = 0.0
+    self.a_target = 0.0
 
     # lead car
     self.lead_relevancy = lead_relevancy
@@ -84,27 +131,36 @@ class Plant:
     self.lateral_accel = 0.0
     self.torque = 0.0
     # extra braking the fake model asks for over the last metres before the line, the way the real model's request
-    # ramps late (route 24/27: -0.7 ... -1.3 -> -2.5 into the last seconds)
+    # ramps late (-0.7 ... -1.3 -> -2.5 into the last seconds)
     self.e2e_landing_push = e2e_landing_push
-    # the car's brake actuation as a first-order response to the plan, with separate time constants for taking braking
-    # up and letting it off: the Palisade's ESP follows a braking increase with ~0.2 s and a release with ~0.7 s (route 0x2a,
-    # 2026-08-30). None keeps the ideal car that applies the plan at once
-    self.actuator_lag = actuator_lag
-    self.applied_accel = 0.0
+    # without it the car applies the request at once
+    self.actuator = ActuatorLag() if actuator_lag else None
+    # added to the car's acceleration while it rolls, whatever it was asked: brakes that fall short, and the same push at cruise
+    # and on a launch; held wheels do not feel it
+    self.accel_error = accel_error
+    # driveline creep, added to launch requests too
+    self.creep = creep
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
 
-    from opendbc.car.honda.values import CAR
-    from opendbc.car.honda.interface import CarInterface
-
-    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    if CP is None:
+      from opendbc.car.honda.values import CAR
+      CP = interfaces[CAR.HONDA_CIVIC].get_non_essential_params(CAR.HONDA_CIVIC)
     if self.curve is not None:
       torque = CP.lateralTuning.init('torque')
       torque.latAccelFactor = self.torque_factor
       torque.latAccelOffset = 0.0
       torque.friction = self.torque_friction
+    self.CP = CP
+    self.CI = interfaces[CP.carFingerprint](CP)
     self.planner = LongitudinalPlanner(CP, init_v=self.speed)
+    # under the stop bit the car follows this tree's LongControl, not the plan
+    self.long_control = LongControl(CP)
+    # carState's acceleration is the car's speed filter on its wheels, not the applied acceleration; the maneuver starts with
+    # the car settled at its initial speed
+    self.CI.CS.v_ego_kf.set_x([[self.speed], [0.0]])
+    self.a_ego = 0.0
 
   def _curvature_at(self, world_x):
     # one (start, length, curvature) or a list of them: a bend that tightens or opens along the way
@@ -146,7 +202,6 @@ class Plant:
     if d_line <= 0.5 or self.speed < 0.3:
       x = np.zeros_like(t)
       v = np.zeros_like(t)
-      model.action.shouldStop = True
       model.action.desiredAcceleration = float(min(self.acceleration, 0.0)) if self.speed >= 0.3 else 0.0
     elif d_line <= self.speed * self.stop_line_horizon_s:
       a_req = self.speed ** 2 / (2.0 * d_line)
@@ -154,11 +209,12 @@ class Plant:
       tc = np.minimum(t, t_stop)
       x = self.speed * tc - 0.5 * a_req * tc ** 2
       v = np.maximum(self.speed - a_req * tc, 0.0)
-      model.action.shouldStop = bool(d_line < 3.0)
       push = self.e2e_landing_push * float(np.clip((E2E_PUSH_DISTANCE - d_line) / E2E_PUSH_DISTANCE, 0.0, 1.0))
       model.action.desiredAcceleration = float(-0.7 * a_req - push)
     else:
       return
+    # modeld's own stop bit: below its stopping speed with the request braking
+    model.action.shouldStop = should_stop(self.speed, model.action.desiredAcceleration)
     position = log.XYZTData.new_message()
     position.x = [float(xx) for xx in x]
     model.position = position
@@ -202,7 +258,7 @@ class Plant:
       status = False
 
     lead = log.RadarState.LeadData.new_message()
-    lead.dRel = float(d_rel)
+    lead.dRel = float(RADAR_DREL_STEP * round(d_rel / RADAR_DREL_STEP))
     lead.yRel = 0.0
     lead.vRel = float(v_rel)
     lead.vLead = float(v_lead)
@@ -260,7 +316,7 @@ class Plant:
     ss.selfdriveState.enabled = bool(self.enabled)
     control.controlsState.forceDecel = self.force_decel
     car_state.carState.vEgo = float(self.speed)
-    car_state.carState.aEgo = float(self.acceleration)
+    car_state.carState.aEgo = float(self.a_ego)
     car_state.carState.standstill = bool(self.speed < 0.01)
     car_state.carState.vCruise = float(v_cruise * 3.6)
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
@@ -282,28 +338,30 @@ class Plant:
                           mono_time=int(self.current_time * 1e9), invalid=invalid)
     self.last_sm = sm
     self.planner.update(sm)
-    self.acceleration = self.planner.output_a_target
-    if self.planner.output_should_stop:
-      # the thin-handoff LongControl settles on the plan bounded by its kiss while rolling; the old flat -0.5 stand-in
-      # overwrote exactly the landing behavior these tests exist to judge
-      self.acceleration = min(self.acceleration, -0.12)
-    if self.actuator_lag is not None:
-      # the car lags the plan: braking builds at tau_up, releases at tau_down
-      tau_up, tau_down = self.actuator_lag
-      tau = tau_up if self.acceleration < self.applied_accel else tau_down
-      self.applied_accel += (self.acceleration - self.applied_accel) * min(self.ts / tau, 1.0)
-      self.acceleration = self.applied_accel
-    self.speed = self.speed + self.acceleration * self.ts
+    self.a_target = float(self.planner.output_a_target)
     self.should_stop = self.planner.output_should_stop
     fcw = self.planner.fcw
     self.distance_lead = self.distance_lead + v_lead * self.ts
 
     # ******** run the car ********
-    #print(self.distance, speed)
-    if self.speed <= 0:
-      self.speed = 0
-      self.acceleration = 0
-    self.distance = self.distance + self.speed * self.ts
+    # controlsd's LongControl on the held plan, then the actuator, the wheels and the car's speed filter
+    cs = messaging.new_message('carState').carState
+    # opendbc's limits, the Palisade's own; a port's clamp (the Civic's Nidec near its set speed) is not what these judge
+    accel_limits = CarInterfaceBase.get_pid_accel_limits(self.CP, self.speed, v_cruise)
+    for _ in range(round(DT_MDL / DT_CTRL)):
+      cs.vEgo, cs.aEgo = self.speed, self.a_ego
+      request = float(self.long_control.update(self.enabled, cs, self.a_target, self.should_stop, accel_limits))
+      accel = self.actuator.update(request, self.speed) if self.actuator is not None else request
+      if self.speed > 0.0:
+        accel += self.accel_error
+      if request > CREEP_HOLD_REQUEST:
+        accel += self.creep * max(1.0 - self.speed / DRIVELINE_CREEP_SPEED, 0.0)
+      if self.speed <= 0.0:
+        accel = max(accel, 0.0)
+      self.speed = max(self.speed + accel * DT_CTRL, 0.0)
+      self.distance = self.distance + self.speed * DT_CTRL
+      self.a_ego = self.CI.CS.update_speed_kf(self.speed)[1]
+    self.acceleration = accel if self.speed > 0.0 else 0.0
 
     # *** radar model ***
     if self.lead_relevancy:
@@ -326,7 +384,9 @@ class Plant:
       "distance": self.distance,
       "speed": self.speed,
       "acceleration": self.acceleration,
+      "a_target": self.a_target,
       "should_stop": self.should_stop,
+      "forcing": self.planner.force_stops.forcing,
       "distance_lead": self.distance_lead,
       "fcw": fcw,
       "lateral_accel": self.lateral_accel,

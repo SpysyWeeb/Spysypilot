@@ -29,6 +29,7 @@ from msgq.visionipc import VisionIpcClient, VisionBuf
 from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
+from openpilot.common.hardware.usb import cable_connected
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
@@ -40,7 +41,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, 
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob
+from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob, wait_for_chestnut
 
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
@@ -262,9 +263,10 @@ class ModelState:
 def main(demo=False):
   cloudlog.warning("modeld init")
 
-  CHESTNUT = chestnut_present() and chestnut_compiled()
+  CHESTNUT = chestnut_compiled() and (chestnut_present() or cable_connected())
   if CHESTNUT:
-    os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
+    from tinygrad.runtime.ops_amd import AMDDevice
+    AMDDevice.wait_timeout_ms = 3000
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
   params.remove("ChestnutActive")
@@ -298,14 +300,25 @@ def main(demo=False):
   cloudlog.warning("loading model")
   model = None
   if CHESTNUT:
-    # chestnut can enumerate before its PCIe link is up due to varying 12V power behavior across cars,
-    # and tinygrad checks the link only once. only start a load that can reach the GPU
-    while not (link := link_up()) and time.monotonic() - st < BIG_MODEL_TIMEOUT:
-      time.sleep(1)
+    # a connected cable starts this before chestnut enumerates: wait for it no longer than the loader does, so the link wait
+    # below never runs on a cable with no chestnut behind it
+    link = False
+    try:
+      wait_for_chestnut()
+    except TimeoutError:
+      cloudlog.warning("chestnut did not enumerate, skipping big model")
+    else:
+      # chestnut can enumerate before its PCIe link is up due to varying 12V power behavior across cars,
+      # and tinygrad checks the link only once. only start a load that can reach the GPU
+      while not (link := link_up()) and time.monotonic() - st < BIG_MODEL_TIMEOUT:
+        time.sleep(1)
+      if not link:
+        cloudlog.warning("chestnut PCIe link not up, skipping big model")
     big_model = None
     def load_big():
       nonlocal big_model
       try:
+        wait_for_chestnut()
         m = ModelState(vipc_client_main.width, vipc_client_main.height, True)
         m.warmup()
         big_model = m
@@ -315,8 +328,6 @@ def main(demo=False):
       loader = threading.Thread(target=load_big, daemon=True)
       loader.start()
       loader.join(BIG_MODEL_TIMEOUT)
-    else:
-      cloudlog.warning("chestnut PCIe link not up, skipping big model")
     model = big_model
     params.put_bool("ChestnutActive", model is not None)
 

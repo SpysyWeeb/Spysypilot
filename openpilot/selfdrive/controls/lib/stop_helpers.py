@@ -34,7 +34,7 @@ STOP_EARLY_HINT_ENTRY_CONFIDENCE = 0.70
 STOP_SAMPLE_MIN_CONFIDENCE = 0.70
 
 STOP_RELEASE_PATH_MIN_DISTANCE = 20.0
-PATH_OPEN_LENGTH = 30.0    # m, a raw path this long reads as "the way ahead is open" (red-light stubs sit at 2-5 m; greens open 30-60 m)
+PATH_OPEN_LENGTH = 30.0    # m, at standstill a raw path this long reads as "the way ahead is open" (stubs sit at 2-5 m; greens 30-60 m)
 STOP_RELEASE_TERMINAL_SPEED_MIN = 3.0
 STOP_COMMIT_MAX_DISTANCE = 100.0
 LEAD_STOP_PATH_HALF_WIDTH = 1.5

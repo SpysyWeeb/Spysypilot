@@ -393,7 +393,7 @@ class TestPlannerIntegration(unittest.TestCase):
     from openpilot.selfdrive.controls.lib import longitudinal_planner
     from unittest.mock import patch
     model = make_model(15.0)
-    model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]))
+    model.meta = SimpleNamespace(disengagePredictions=SimpleNamespace(gasPressProbs=[1.0, 1.0]), laneChangeDirection=0, laneChangeState=0)
     model.action = SimpleNamespace(desiredAcceleration=1.0, shouldStop=False, desiredCurvature=0.0)
     absent = SimpleNamespace(present=False)
     messages = {
@@ -407,6 +407,7 @@ class TestPlannerIntegration(unittest.TestCase):
       'modelV2': model,
       'radarState': SimpleNamespace(leadOne=absent, leadTwo=absent),
       'lateralTorqueParameters': SimpleNamespace(useParams=False),
+      'radarTracks': SimpleNamespace(points=[]),
     }
 
     class FakeSubMaster(dict):
@@ -418,7 +419,8 @@ class TestPlannerIntegration(unittest.TestCase):
         # the model message here is a stub: planners that classify stops or anchor leads from it must see it invalid
         return services is not None and 'modelV2' not in services
 
-    planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2))
+    planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
+                                                                          radarUnavailable=False, enableBsm=True))
     sm = FakeSubMaster(messages)
     with (patch.object(planner.mpc, 'set_weights'), patch.object(planner.mpc, 'set_cur_state'), patch.object(planner.mpc, 'update'),
           patch.object(longitudinal_planner, 'get_accel_from_plan', return_value=0.5)):
@@ -441,7 +443,8 @@ class TestPlannerIntegration(unittest.TestCase):
       def all_checks(self, services=None):
         return True
 
-    planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2))
+    planner = longitudinal_planner.LongitudinalPlanner(SimpleNamespace(openpilotLongitudinalControl=True, longitudinalActuatorDelay=0.2,
+                                                                          radarUnavailable=False, enableBsm=True))
     sm = FakeSubMaster(radarState=SimpleNamespace(leadOne=SimpleNamespace(present=False)))
     sent = {}
     pm = SimpleNamespace(send=lambda service, msg: sent.__setitem__(service, msg))

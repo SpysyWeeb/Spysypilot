@@ -49,6 +49,8 @@ decision is, why, and what the field said: the BLoTv3 README and
 2026-09-17: the branch's cleanliness audit fixes (five stop-layer defects — a stale profile anchor after the slow release, the
 hold's green release ignoring the model's stop call, a gas tap at speed arming no re-entry, a radar dropout hiding an invalid model
 from CEM, a creep resume read as a launch — plus tests and docs) merged; awaiting a drive.
+2026-09-25: step 1 of the braking audit (hand-overs converge and are carried at the cruise jerk, the MPC plans from its own plan and
+the measured speed, a feed-forward landing law whose kiss lands the car before the stop bit rises) merged; awaiting a drive.
 
 ## To-Do
 
