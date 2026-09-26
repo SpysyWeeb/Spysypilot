@@ -8,12 +8,12 @@ from openpilot.common.constants import CV
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
-from openpilot.selfdrive.controls.lib.force_stops import ForceStops
+from openpilot.selfdrive.controls.lib.force_stops import RELEASE_OPEN_FRAMES, RELEASE_OPEN_THRESHOLD, RELEASE_RC, ForceStops
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_ABSENCE_FRAMES, LongitudinalMpc, LongitudinalPlanSource
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
-from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop
+from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop, path_open
 from openpilot.selfdrive.controls.lib.stop_landing import STANDSTILL_SPEED, STOP_INTENT_SPEED, StopLanding
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
@@ -93,6 +93,8 @@ class LongitudinalPlanner:
     self.throttle_prob = FirstOrderFilter(1.0, ALLOW_THROTTLE_PROB_TAU, dt)
     self.supervisor = NecessitySupervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt, LEAD_ABSENCE_FRAMES)
+    self.open_road_frames = 0
+    self.open_road_filter = FirstOrderFilter(0.0, RELEASE_RC, dt)
     self.force_stops = ForceStops(dt)
     self.stop_landing = StopLanding(dt, CP.longitudinalActuatorDelay + DT_MDL, (J_CRUISE_BP, J_CRUISE_VALS))
     self.holding_prev = False
@@ -146,6 +148,8 @@ class LongitudinalPlanner:
       self.plan_winner = 'cruise'
       self.supervisor.reset()
       self.lead_departure.reset()
+      self.open_road_frames = 0
+      self.open_road_filter.x = 0.0
       self.stop_landing.reset()
       self.holding_prev = False
 
@@ -200,12 +204,24 @@ class LongitudinalPlanner:
     # release -- so the hold edge alone does not tear the landing corridor down mid-stop
     force_stops_release = self.holding_prev and not force_stop.holding and force_stop.stop_x is None
     self.holding_prev = force_stop.holding
+    # the model's open road while the lead is missing, judged as Force Stops judges the green at its hold and counted from the
+    # first missing frame: RELEASE_OPEN_FRAMES frames of an open path without stop evidence, or its launch samples filtered past
+    # RELEASE_OPEN_THRESHOLD. A flash is not a green
+    if lead.present:
+      self.open_road_frames = 0
+      self.open_road_filter.x = 0.0
+    else:
+      self.open_road_frames = self.open_road_frames + 1 if path_open(stop.path_end) and not (stop.should_stop or stop.strict_stop) else 0
+      self.open_road_filter.update(1.0 if stop.release_open else 0.0)
+    open_road = self.open_road_frames >= RELEASE_OPEN_FRAMES or self.open_road_filter.x > RELEASE_OPEN_THRESHOLD
     # once the MPC holds the car at rest for a lead, its stop bit is the pre-release's: the plan's hover at rest does not release
     # it, a corroborated departure does, a release taken back before the lead moved holds the car again, and a hold is handed
-    # back to the plan only on evidence that its lead has left. The acceleration target is untouched
+    # back to the plan only on evidence that its lead has left -- with the lead missing, the model's open road or a Force Stops
+    # release. The acceleration target is untouched
     lead_departing = self.lead_departure.update(self.CP.openpilotLongitudinalControl and not long_control_off, sm['carState'].standstill,
                                                 lead, lead0_anchor.speed if lead0_anchor is not None else None,
-                                                output_should_stop_mpc and self.mpc.binding_obstacle == 'lead', force_stops_release)
+                                                output_should_stop_mpc and self.mpc.binding_obstacle == 'lead',
+                                                open_road or force_stops_release)
     if lead_departing:
       output_should_stop_mpc = False
     elif self.lead_departure.holding:

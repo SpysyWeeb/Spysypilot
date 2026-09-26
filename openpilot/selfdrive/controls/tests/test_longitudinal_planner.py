@@ -641,9 +641,12 @@ class TestStandstillRelease:
     planner.update(frame(0.0, lead=(d + moved, 1.0, 1.0), v_cruise=10.0))
     assert not planner.output_should_stop and not planner.stop_landing.landing
 
-  def radar_frame(self, lead, track_id, radar_valid=True):
-    # a frame at rest with leadOne on a radar track (lead None: no lead), or with radarState failing its checks
-    sm = frame(0.0, lead=lead, v_cruise=10.0)
+  STOP_PLAN = (1.0, 0.0)
+  OPEN_ROAD = (2.0 * PATH_OPEN_LENGTH, 5.0)
+
+  def radar_frame(self, lead, track_id, radar_valid=True, path=None, should_stop=False):
+    # a frame at rest with leadOne on a radar track (lead None: no lead), or with radarState failing its checks; path: the model's plan
+    sm = frame(0.0, lead=lead, v_cruise=10.0, path=path, should_stop=should_stop)
     sm['radarState'].leadOne.radarTrackId = track_id
     sm.valid['radarState'] = radar_valid
     return sm
@@ -742,10 +745,12 @@ class TestStandstillRelease:
       states.append((planner.output_should_stop, planner.stop_landing.landing, planner.lead_departure.handed_back))
     assert all(bit and landing and not handed for bit, landing, handed in states), states
 
-  @pytest.mark.parametrize('lead_seen', [False, True])
-  def test_the_models_path_opening_ends_a_hold_only_while_its_lead_is_missing(self, lead_seen):
-    # stopped at a red line behind a lead the car is held for; at the green the model's path opens (Force Stops releases). A
-    # lead that has gone missing leaves nothing but the path to go on, and the car goes; a lead still standing there holds it
+  @pytest.mark.parametrize('lead', ['missing', 'standing', 'leaves'])
+  def test_the_models_path_opening_ends_a_hold_only_while_its_lead_is_missing(self, lead):
+    # stopped at a red line behind a lead the car is held for; at the green Force Stops releases. A lead gone missing before it
+    # leaves nothing but the release to go on, and the car goes; with the model planning open road from the release on, a lead
+    # still standing there holds it, and a lead in sight on the release frame and missing two frames later has left once the open
+    # road outlasts a flash: the car goes then
     car = IdealCar(8.0)
     stop = {'x': 40.0}
 
@@ -757,22 +762,86 @@ class TestStandstillRelease:
     while car.v >= 0.01:
       car.step(lead=(38.0 - car.x, 0.0, 0.0), v_cruise=10.0)
     planner, d = car.planner, 38.0 - car.x
-    lead = (d, 0.0, 0.0) if lead_seen else None
     for _ in range(round(1.0 / DT_MDL)):
       planner.update(self.radar_frame((d, 0.0, 0.0), 7))
     for _ in range(round(1.0 / DT_MDL)):
-      planner.update(self.radar_frame(lead, 7))
+      planner.update(self.radar_frame(None if lead == 'missing' else (d, 0.0, 0.0), 7))
     assert planner.output_should_stop and planner.stop_landing.landing and planner.lead_departure.holding
     stop['x'] = None
+    gone = {'missing': 0, 'standing': None, 'leaves': 2}[lead]
+    handback = {'missing': 0, 'standing': None, 'leaves': 2 + RELEASE_OPEN_FRAMES - 1}[lead]
+    states = []
+    for i in range(round(2.0 / DT_MDL)):
+      planner.update(self.radar_frame(None if gone is not None and i >= gone else (d, 0.0, 0.0), 7,
+                                      path=None if lead == 'missing' else self.OPEN_ROAD))
+      states.append((planner.lead_departure.handed_back, planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
+    assert [i for i, (handed, _, _, _) in enumerate(states) if handed] == ([] if handback is None else [handback]), states
+    if handback is None:
+      assert all(bit for _, bit, _, _ in states), states
+    else:
+      assert all(bit for _, bit, _, _ in states[:handback]) and not any(bit or landing for _, bit, landing, _ in states[handback:]), states
+      assert states[-1][3] > 0.5, states[-1]
+
+  @pytest.mark.parametrize('arrival', [(0.3, 7.5), (6.0, 30.0)], ids=['no_landing', 'landed'])
+  def test_a_lead_missing_while_the_model_plans_the_stop_keeps_the_hold(self, arrival):
+    # held at rest in a queue, and leadOne goes missing for good while the model, the second sensor, still plans the stop (a truck
+    # or a tall trailer the radar loses): nothing says the lead has left, and the car stays held, on the kiss if it landed
+    planner, d = self.rest_behind(*arrival)
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7, path=self.STOP_PLAN))
+    landed = planner.stop_landing.landing
+    states = []
+    for _ in range(round(3.0 / DT_MDL)):
+      planner.update(self.radar_frame(None, -1, path=self.STOP_PLAN))
+      states.append((planner.output_should_stop, planner.lead_departure.holding, planner.lead_departure.handed_back, planner.stop_landing.landing))
+    assert all(bit and held and not handed and landing == landed for bit, held, handed, landing in states), states
+
+  @pytest.mark.parametrize('arrival', [(0.3, 7.5), (6.0, 30.0)], ids=['no_landing', 'landed'])
+  def test_a_lead_missing_while_the_model_plans_open_road_ends_the_hold_as_a_launch(self, arrival):
+    # held at rest in a queue, no red light anywhere, and the car ahead turns off: leadOne goes missing for good and the model plans
+    # open road, which is the evidence that it has left once it outlasts a flash. The car goes then, its landing ended
+    planner, d = self.rest_behind(*arrival)
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7, path=self.STOP_PLAN))
+    assert planner.output_should_stop and planner.lead_departure.holding
+    landed = planner.stop_landing.landing
     states = []
     for _ in range(round(2.0 / DT_MDL)):
-      planner.update(self.radar_frame(lead, 7))
-      states.append((planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
-    if lead_seen:
-      assert all(bit for bit, _, _ in states), states
-    else:
-      assert not any(bit or landing for bit, landing, _ in states), states
-      assert states[-1][2] > 0.5, states[-1]
+      planner.update(self.radar_frame(None, -1, path=self.OPEN_ROAD))
+      states.append((planner.lead_departure.handed_back, planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
+    handback = RELEASE_OPEN_FRAMES - 1
+    assert [i for i, (handed, _, _, _) in enumerate(states) if handed] == [handback], states
+    assert all(bit and landing == landed for _, bit, landing, _ in states[:handback]), states
+    assert not any(bit or landing for _, bit, landing, _ in states[handback:]), states
+    assert states[-1][3] > 0.5, states[-1]
+
+  @pytest.mark.parametrize('reading', ['one_frame', 'two_frames', 'amid_the_stop', 'either_side_of_the_car_in_sight', 'after_open_road_in_sight',
+                                       'short_plan_either_side_of_the_car_in_sight', 'still_calling_the_stop'])
+  @pytest.mark.parametrize('arrival', [(0.3, 7.5), (6.0, 30.0)], ids=['no_landing', 'landed'])
+  def test_open_road_short_of_a_green_while_the_lead_drops_out_keeps_the_hold(self, arrival, reading):
+    # held at rest behind a car that stays where it stands; leadOne drops out for a few frames while the model reads open road short
+    # of a green: one or two frames of it (alone, amid the stop, or either side of a frame with the car in sight), one frame after a
+    # second of open road with the car in sight, a plan reaching 25 m still moving for 0.35 s either side of a frame with the car
+    # in sight, or a long plan it still calls the stop on. Nothing says the car has left, and the car stays held
+    planner, d = self.rest_behind(*arrival)
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7, path=self.STOP_PLAN))
+    landed = planner.stop_landing.landing
+    seen = (d, 0.0, 0.0)
+    missing_open, missing_stop, missing_short = (None, self.OPEN_ROAD, False), (None, self.STOP_PLAN, False), (None, (25.0, 4.0), False)
+    flash = [missing_open] * (RELEASE_OPEN_FRAMES - 1)
+    short = [missing_short] * round(0.35 / DT_MDL)
+    frames = {'one_frame': [missing_open], 'two_frames': flash, 'amid_the_stop': [missing_stop, missing_open, missing_stop],
+              'either_side_of_the_car_in_sight': flash + [(seen, self.STOP_PLAN, False)] + flash,
+              'after_open_road_in_sight': [(seen, self.OPEN_ROAD, False)] * round(1.0 / DT_MDL) + [missing_open],
+              'short_plan_either_side_of_the_car_in_sight': short + [(seen, self.STOP_PLAN, False)] + short,
+              'still_calling_the_stop': [(None, self.OPEN_ROAD, True)] * round(1.0 / DT_MDL)}[reading]
+    frames += [(seen, self.STOP_PLAN, False)] * round(2.0 / DT_MDL)
+    states = []
+    for lead, path, stopping in frames:
+      planner.update(self.radar_frame(lead, 7 if lead is not None else -1, path=path, should_stop=stopping))
+      states.append((planner.output_should_stop, planner.lead_departure.holding, planner.lead_departure.handed_back, planner.stop_landing.landing))
+    assert all(bit and held and not handed and landing == landed for bit, held, handed, landing in states), states
 
   @pytest.mark.parametrize('dropout', ['radar_invalid', 'lead_absent'])
   def test_a_dropout_at_rest_does_not_release_the_hold(self, dropout):
@@ -844,6 +913,83 @@ class TestHoldRelease:
     assert planner.force_stops.holding
     assert planner.stop_landing.landing
     return planner
+
+  OPEN_ROAD = (2.0 * PATH_OPEN_LENGTH, 5.0, False, 0.5)
+
+  def red_light(self, crossing, reading=lambda i: None, stop_bit=True):
+    # first in line at a red: the car lands on the committed stop, the light stays red for 10 s, then turns green and the model
+    # plans open road. crossing(i) is the car crossing the intersection that is flagged as the lead on the i-th frame at rest, or
+    # None; reading(i) is what the model reads instead of the red's stop on that frame, (path end, terminal speed, shouldStop,
+    # request), or None; stop_bit False: the model plans the red's stop without its shouldStop. The car stays at rest while the
+    # stop bit is up. Returns each frame's (stop bit, Force Stops hold, pre-release hold, hand-back) and the car's final speed
+    planner = self.land_a_committed_stop()
+    v, states = 0.0, []
+    for i in range(round(12.0 / DT_MDL)):
+      green = i >= round(10.0 / DT_MDL)
+      end, terminal, stopping, request = reading(i) or (self.OPEN_ROAD if green else (1.0, 0.0, stop_bit, 0.0))
+      sm = frame(v, experimental=True, e2e_accel=request, should_stop=stopping, path=(end, terminal), lead=crossing(i))
+      sm['radarState'].leadOne.radarTrackId = 7
+      planner.update(sm)
+      states.append((planner.output_should_stop, planner.force_stops.holding, planner.lead_departure.holding, planner.lead_departure.handed_back))
+      if not planner.output_should_stop:
+        v = max(v + float(planner.output_a_target) * DT_MDL, 0.0)
+    return states, v
+
+  def test_a_car_crossing_at_a_red_light_after_the_car_stopped_is_not_its_lead(self):
+    # a car crossing the intersection is flagged as the lead 8 m ahead 2 s into the red and clears a second later: the car did not
+    # come to rest behind it, so the pre-release never holds, the stop bit stays up through the red and Force Stops' release at
+    # the green launches the car
+    states, v = self.red_light(lambda i: (8.0, 0.0, 0.0) if round(2.0 / DT_MDL) <= i < round(3.0 / DT_MDL) else None)
+    release = round(10.0 / DT_MDL) + RELEASE_OPEN_FRAMES - 1
+    assert v > 0.5
+    assert not any(held for _, _, held, _ in states), states
+    assert all(bit for bit, _, _, _ in states[:release]) and not any(bit for bit, _, _, _ in states[release:]), states
+    assert states[release - 1][1] and not states[release][1]
+
+  def test_a_car_crossing_at_a_red_light_as_the_car_stops_does_not_hold_it_past_the_green(self):
+    # a car crossing the intersection is flagged as the lead 8 m ahead from the car's first frames at rest, so the car is held for it
+    # as for a car it came to rest behind, and Force Stops' hold ends for it. The light turns green while it is still crossing and
+    # it clears two frames later, the model planning open road: the hold ends as a launch once that outlasts a flash
+    green = round(10.0 / DT_MDL)
+    states, v = self.red_light(lambda i: (8.0, 0.0, 0.0) if 2 <= i < green + 2 else None)
+    handback = green + 2 + RELEASE_OPEN_FRAMES - 1
+    assert v > 0.5
+    assert all(held and not fs_hold for _, fs_hold, held, _ in states[3:green + 2]), states
+    assert all(bit for bit, _, _, _ in states[:handback]), states
+    assert [i for i, (_, _, _, handed) in enumerate(states) if handed] == [handback], states
+    assert not any(bit for bit, _, _, _ in states[handback:]), states
+
+  @pytest.mark.parametrize('stop_bit', [True, False], ids=['should_stop', 'path_only'])
+  @pytest.mark.parametrize('flash', [1, RELEASE_OPEN_FRAMES - 1])
+  def test_a_car_crossing_as_the_car_stops_that_clears_on_a_flash_of_open_road_keeps_it_held_at_the_red(self, flash, stop_bit):
+    # the car crossing from the car's first frames at rest clears 4 s into the red on the very frame the model flashes open road
+    # for a frame or two; then the model plans the stop again, with its shouldStop or as a path only. A flash is not a green: the
+    # stop bit stays up through the red, and Force Stops' release at the green launches the car
+    clear, green = round(4.0 / DT_MDL), round(10.0 / DT_MDL)
+    states, v = self.red_light(lambda i: (8.0, 0.0, 0.0) if 2 <= i < clear else None,
+                               lambda i: self.OPEN_ROAD if clear <= i < clear + flash else None, stop_bit)
+    release = green + RELEASE_OPEN_FRAMES - 1
+    assert all(held and not fs_hold for _, fs_hold, held, _ in states[3:clear]), states
+    assert all(bit for bit, _, _, _ in states[clear:release]) and not any(bit for bit, _, _, _ in states[release:]), states
+    assert not any(handed for _, _, _, handed in states[clear:release]) and v > 0.5, states
+
+  @pytest.mark.parametrize('frames', [1, RELEASE_OPEN_FRAMES - 1, 7, 12, None])
+  @pytest.mark.parametrize('reading', [(2.0 * PATH_OPEN_LENGTH, 5.0, False, 0.5), (25.0, 4.0, False, 0.3), (2.0 * PATH_OPEN_LENGTH, 5.0, True, 0.0)],
+                           ids=['long', 'short', 'long_still_stopping'])
+  def test_the_models_open_road_at_a_red_ends_a_hold_for_a_crossing_car_only_where_it_ends_force_stops_hold(self, reading, frames):
+    # 4 s into the red the model reads open road for a few frames or up to the green, as the big model does at a red it expects to
+    # turn green: a long plan, one that reaches 25 m still moving, or a long plan it still calls the stop on. With no car crossing,
+    # Force Stops' hold judges it. With a car crossing from the car's first frames at rest that clears on the reading's first frame,
+    # the pre-release holds the car and Force Stops does not: the stop bit first falls on the same frame either way
+    read = round(4.0 / DT_MDL)
+    reading_at = lambda i: reading if read <= i < (read + frames if frames is not None else round(10.0 / DT_MDL)) else None  # noqa: E731
+    alone, _ = self.red_light(lambda i: None, reading_at)
+    crossed, _ = self.red_light(lambda i: (8.0, 0.0, 0.0) if 2 <= i < read else None, reading_at)
+    assert all(held for _, _, held, _ in crossed[3:read]) and not any(held for _, _, held, _ in alone), crossed
+    assert all(bit for bit, _, _, _ in alone[:read]) and all(bit for bit, _, _, _ in crossed[3:read])
+    down = next(i for i in range(read, len(alone)) if not (alone[i][0] and crossed[i][0]))
+    assert not alone[down][0] and not crossed[down][0], (down, crossed[read:down + 1], alone[read:down + 1])
+    assert [i for i, (_, _, _, handed) in enumerate(crossed[:down + 1]) if handed] == [down], crossed[read:down + 1]
 
   def test_a_creep_resume_from_a_hold_is_not_a_launch_and_the_landing_survives(self):
     planner = self.hold_at_a_committed_stop()
