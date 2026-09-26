@@ -13,7 +13,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
 from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, PROFILE_JERK, RELEASE_OPEN_FRAMES, ForceStopsResult
 from openpilot.selfdrive.controls.lib.model_curve_speed import REGIME_BRAKE, REGIME_FREE, CurveResult
-from openpilot.selfdrive.controls.lib.necessity_supervisor import LongitudinalPolicy
+from openpilot.selfdrive.controls.lib.necessity_supervisor import LEAD_DEPARTURE_CANCEL, LEAD_DEPARTURE_CONFIRM, LongitudinalPolicy
 from openpilot.selfdrive.controls.lib.stop_helpers import PATH_OPEN_LENGTH, STOP_PREDICTION_HORIZON_S
 from openpilot.selfdrive.controls.lib.stop_landing import KISS_DECEL, LEAD_MIN_GAP_BUDGET, STANDSTILL_SPEED
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -39,9 +39,11 @@ def accel_max(request, monkeypatch):
 
 
 def frame(v_ego, a_ego=0.0, experimental=False, e2e_accel=0.0, should_stop=False, path=None, lead=None, v_cruise=100.0 * CV.KPH_TO_MS,
-          engaged=True, standstill=None):
+          engaged=True, standstill=None, forecast=None, gas_prob=None):
   # one model frame of real messages: path = (end, terminal speed) of the model's plan, lead = (dRel, vLead, aLead) on radar,
-  # engaged = openpilot controls the speed (not the driver's foot), standstill = the car's own flag (default: the car is at rest)
+  # engaged = openpilot controls the speed (not the driver's foot), standstill = the car's own flag (default: the car is at rest),
+  # forecast = the acceleration the model sees the lead hold when it differs from the radar's, gas_prob = the model's
+  # gas-press probability
   car_state = messaging.new_message('carState').carState
   car_state.vEgo = v_ego
   car_state.aEgo = a_ego
@@ -58,6 +60,8 @@ def frame(v_ego, a_ego=0.0, experimental=False, e2e_accel=0.0, should_stop=False
     model.velocity = velocity
   model.action.shouldStop = should_stop
   model.action.desiredAcceleration = e2e_accel
+  if gas_prob is not None:
+    model.meta.disengagePredictions.gasPressProbs = [float(gas_prob)] * 6
   radar = messaging.new_message('radarState').radarState
   if lead is not None:
     radar.leadOne.present = True
@@ -68,6 +72,7 @@ def frame(v_ego, a_ego=0.0, experimental=False, e2e_accel=0.0, should_stop=False
     radar.leadOne.radar = True
     # the model sees the same car hold its acceleration until it stops
     d, v, a = lead
+    a = a if forecast is None else forecast
     t = np.array(ModelConstants.LEAD_T_IDXS)
     t_moving = np.minimum(t, -v / a) if a < 0.0 else t
     model_lead = log.ModelDataV2.LeadDataV3.new_message()
@@ -344,6 +349,36 @@ class TestPlannerCruise:
     plant.planner.force_stops.update = lambda *args: ForceStopsResult(NO_CAP, float('nan'), False)
     plant.step(v_cruise=20.0)
     assert plant.planner.mpc.source != LongitudinalPlanSource.stop
+
+
+class TestThrottleGate:
+  # Chill's throttle gate caps the cruise candidate at the coast above 5 m/s when the model expects no gas press; it decides on the
+  # probability's recent mean, not on each frame's noise
+  def test_the_gate_decides_on_the_smoothed_probability(self):
+    # a probability whose mean sits clearly above the threshold, jittering by the field's frame-to-frame spread
+    rng = np.random.default_rng(0)
+    plant = Plant(speed=15.0, distance_lead=300.0, lead_relevancy=False)
+    toggles, prev = 0, True
+    for _ in range(round(10.0 / DT_MDL)):
+      plant.step(v_cruise=15.0, prob_throttle=float(np.clip(0.55 + rng.normal(0.0, 0.078), 0.0, 1.0)))
+      toggles += int(plant.planner.allow_throttle != prev)
+      prev = plant.planner.allow_throttle
+    assert toggles <= 2, toggles
+
+  def test_a_driver_hand_back_restarts_the_gate_from_the_models_reading(self):
+    planner = LongitudinalPlanner(PALISADE_CP)
+    for _ in range(round(2.0 / DT_MDL)):
+      planner.update(frame(20.0, gas_prob=0.9))
+    assert planner.allow_throttle
+    planner.update(frame(20.0, gas_prob=0.1, engaged=False))
+    planner.update(frame(20.0, gas_prob=0.1))
+    assert not planner.allow_throttle
+
+  def test_a_nonfinite_probability_does_not_stick_in_the_gate(self):
+    planner = LongitudinalPlanner(PALISADE_CP)
+    for gas_prob in (0.9, math.nan, 0.9, 0.9):
+      planner.update(frame(20.0, gas_prob=gas_prob))
+      assert planner.allow_throttle, gas_prob
 
 
 class TestCommittedProfileArbitration:
@@ -661,6 +696,285 @@ class TestStopBit:
     assert reading(0.0)
     assert not any(reading(v_ego) for v_ego in (0.35, 0.25, 0.15))
     assert reading(STANDSTILL_SPEED - 0.02)
+
+
+class TestStandstillRelease:
+  # once the MPC holds the car at rest for a lead, the lead-departure pre-release is the one owner of the release: the MPC's plan
+  # drifting above the stop bit's threshold does not let the car go, and a release the pre-release takes back holds it again
+  def rest_behind(self, v_ego, gap):
+    # the car rolls up to a standing lead and comes to rest; returns its planner and the gap
+    car = IdealCar(v_ego)
+    while car.v >= 0.01:
+      car.step(lead=(gap - car.x, 0.0, 0.0), v_cruise=10.0)
+    return car.planner, gap - car.x
+
+  def inch(self, planner, d, to):
+    # the lead inches forward below any departure evidence while the car stands; returns the new gap and every frame's bit and MPC
+    frames = []
+    while d < to:
+      d += 0.2 * DT_MDL
+      planner.update(frame(0.0, lead=(d, 0.2, 0.0), v_cruise=10.0))
+      frames.append((planner.output_should_stop, planner.mpc_a_target))
+    return d, frames
+
+  def test_the_plans_hover_at_rest_does_not_release_the_stop_bit(self):
+    # rolling slowly up to the lead, the MPC's own plan stops the car and no landing starts
+    planner, d = self.rest_behind(0.3, 7.5)
+    assert not planner.stop_landing.landing and planner.output_should_stop
+    d, frames = self.inch(planner, d, 9.0)
+    assert not should_stop(0.0, max(mpc for _, mpc in frames)), max(mpc for _, mpc in frames)
+    assert all(bit for bit, _ in frames)
+    planner.update(frame(0.0, lead=(d, 1.0, 1.0), v_cruise=10.0))
+    assert not planner.output_should_stop
+
+  def test_a_lead_the_car_did_not_stop_for_does_not_hold_it(self):
+    # engaged at rest with a stationary lead well beyond the stop distance: the MPC does not stop the car for it, and it goes
+    planner = LongitudinalPlanner(PALISADE_CP)
+    planner.update(frame(0.0, lead=(20.0, 0.0, 0.0), v_cruise=10.0, engaged=False))
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(frame(0.0, lead=(20.0, 0.0, 0.0), v_cruise=10.0))
+    assert not planner.output_should_stop and planner.output_a_target > 0.5
+    # a Force Stops hold at a red line with a stationary car well beyond it: at the green the car pulls up behind that car
+    car = IdealCar(8.0)
+    stop = {'x': 25.0}
+
+    def force_stops(*args):
+      if stop['x'] is None:
+        return ForceStopsResult()
+      return ForceStopsResult(NO_CAP, stop['x'] - car.x, car.v < 0.01, None)
+    car.planner.force_stops.update = force_stops
+    while car.v >= 0.01:
+      car.step(lead=(60.0 - car.x, 0.0, 0.0), v_cruise=10.0)
+    for _ in range(round(1.0 / DT_MDL)):
+      car.planner.update(frame(0.0, lead=(60.0 - car.x, 0.0, 0.0), v_cruise=10.0))
+    assert car.planner.output_should_stop
+    stop['x'] = None
+    released = []
+    for _ in range(round(1.0 / DT_MDL)):
+      car.planner.update(frame(0.0, lead=(60.0 - car.x, 0.0, 0.0), v_cruise=10.0))
+      released.append(not car.planner.output_should_stop)
+    assert all(released[1:]), released
+
+  def test_a_measured_departure_counts_only_on_the_track_the_model_confirms(self):
+    planner, d = self.rest_behind(1.0, 12.0)
+
+    def step(v_lead, track_id, model_prob=1.0):
+      sm = frame(0.0, lead=(d, v_lead, 0.0), v_cruise=10.0)
+      sm['radarState'].leadOne.radarTrackId = track_id
+      sm['radarState'].leadOne.modelProb = model_prob
+      planner.update(sm)
+      return planner.output_should_stop
+
+    for _ in range(round(1.0 / DT_MDL)):
+      assert step(0.0, 7)
+    # radard's low-speed override: a return of the standing car that the model does not confirm reads 0.3 m/s
+    assert all(step(0.3, 8, model_prob=0.0) for _ in range(round(1.0 / DT_MDL)))
+    # the model-confirmed track reading the same speed, from the frame after it takes the slot back, is the lead leaving
+    assert all(step(0.3, 7) for _ in range(round(LEAD_DEPARTURE_CONFIRM / DT_MDL)))
+    assert not step(0.3, 7)
+
+  @pytest.mark.parametrize('moved', [0.0, 0.2, 0.5])
+  def test_a_release_taken_back_at_rest_holds_the_car_again_only_if_the_lead_has_not_moved(self, moved):
+    # the kiss lands the car behind a stopped lead, which then inches forward below any departure evidence, so the MPC comes to
+    # plan toward the gap and hover above the stop bit's threshold. The model forecasts the lead leaving and the pre-release
+    # lets the car go; the forecast then fades. A lead that reads where it was released (the radar's 0.1 m range steps flicker
+    # by up to two on a standing car) is standing, and the car is held on the kiss again; a lead half a metre on is leaving
+    planner, d = self.rest_behind(6.0, 30.0)
+    assert planner.stop_landing.landing and planner.output_should_stop
+    d, frames = self.inch(planner, d, 8.8)
+    assert all(bit for bit, _ in frames) and planner.stop_landing.landing
+    for _ in range(round(LEAD_DEPARTURE_CONFIRM / DT_MDL) + 2):
+      planner.update(frame(0.0, lead=(d, 0.0, 0.0), v_cruise=10.0, forecast=0.5))
+    assert not planner.output_should_stop and not planner.stop_landing.landing
+    held = []
+    for _ in range(round(LEAD_DEPARTURE_CANCEL / DT_MDL) + 10):
+      planner.update(frame(0.0, lead=(d + moved, 0.0, 0.0), v_cruise=10.0, forecast=0.12))
+      held.append((planner.lead_departure.cancelled, planner.mpc_a_target, planner.output_should_stop, planner.stop_landing.landing,
+                   float(planner.output_a_target)))
+    cancel = [i for i, h in enumerate(held) if h[0]]
+    if moved < 0.3:
+      assert len(cancel) == 1, held
+      assert not should_stop(0.0, held[cancel[0]][1]), held[cancel[0]]
+      assert all(bit and landing and math.isclose(out, -KISS_DECEL, abs_tol=1e-9) for _, _, bit, landing, out in held[cancel[0]:]), held
+    else:
+      # the launch stays the MPC's plan: its own stop bit, its own target
+      assert not cancel and not any(bit or landing for _, _, bit, landing, _ in held), held
+      assert math.isclose(held[-1][4], held[-1][1], abs_tol=1e-9) and held[-1][4] > 0.1, held[-1]
+    # the lead leaving for real still launches the car at once
+    planner.update(frame(0.0, lead=(d + moved, 1.0, 1.0), v_cruise=10.0))
+    assert not planner.output_should_stop and not planner.stop_landing.landing
+
+  def radar_frame(self, lead, track_id, radar_valid=True):
+    # a frame at rest with leadOne on a radar track (lead None: no lead), or with radarState failing its checks
+    sm = frame(0.0, lead=lead, v_cruise=10.0)
+    sm['radarState'].leadOne.radarTrackId = track_id
+    sm.valid['radarState'] = radar_valid
+    return sm
+
+  def released_then_taken_back(self):
+    # the test above up to the cancel: the car held again on the kiss behind a lead that inched to 8.8 m
+    planner, d = self.rest_behind(6.0, 30.0)
+    d, _ = self.inch(planner, d, 8.8)
+    for _ in range(round(LEAD_DEPARTURE_CONFIRM / DT_MDL) + 2):
+      planner.update(frame(0.0, lead=(d, 0.0, 0.0), v_cruise=10.0, forecast=0.5))
+    for _ in range(round(LEAD_DEPARTURE_CANCEL / DT_MDL) + 2):
+      planner.update(frame(0.0, lead=(d, 0.0, 0.0), v_cruise=10.0, forecast=0.12))
+    assert planner.output_should_stop and planner.stop_landing.landing and planner.lead_departure.holding
+    return planner, d
+
+  @pytest.mark.parametrize('arrival', [(0.3, 7.5), (6.0, 30.0)], ids=['no_landing', 'landed'])
+  def test_a_car_taking_the_slot_after_a_release_does_not_hold_the_car(self, arrival):
+    # the lead leaves and, while the car still stands through the brakes' exit, the slot passes to a car standing 20 m ahead:
+    # the release is not taken back on that car, and the car goes to it
+    planner, d = self.rest_behind(*arrival)
+    x, v = d, 0.0
+    for _ in range(round(0.6 / DT_MDL)):
+      v += 1.5 * DT_MDL
+      x += v * DT_MDL
+      planner.update(self.radar_frame((x, v, 1.5), 7))
+    assert not planner.output_should_stop
+    states = []
+    for _ in range(round(3.0 / DT_MDL)):
+      planner.update(self.radar_frame((20.0, 0.0, 0.0), 9))
+      states.append((planner.output_should_stop, planner.stop_landing.landing, planner.lead_departure.cancelled))
+    assert not any(any(state) for state in states), states
+
+  @pytest.mark.parametrize('far', [15.0, 25.0])
+  @pytest.mark.parametrize('arrival', [(0.3, 7.5), (6.0, 30.0)], ids=['no_landing', 'landed'])
+  def test_a_hold_ends_with_the_lead_it_was_for(self, arrival, far):
+    # held at rest behind a lead that then leaves the slot sideways: a car standing farther ahead takes it, nothing departed,
+    # and the car goes to that car -- the landing included. The MPC's plan takes a few frames to climb to the new car, and
+    # its stop bit on those frames is not a hold
+    planner, d = self.rest_behind(*arrival)
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7))
+    assert planner.output_should_stop and planner.lead_departure.holding
+    states = []
+    for _ in range(round(2.0 / DT_MDL)):
+      planner.update(self.radar_frame((far, 0.0, 0.0), 9))
+      states.append((planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
+    assert not any(bit or landing for bit, landing, _ in states[round(0.5 / DT_MDL):]), states
+    assert not any(landing for _, landing, _ in states) and states[-1][2] > 0.5, states
+
+  @pytest.mark.parametrize('dropout', ['radar_invalid', 'lead_absent'])
+  def test_a_lead_missing_at_rest_keeps_the_hold_and_the_landing(self, dropout):
+    # landed and held behind a stopped lead; then for a second radarState fails its checks or leadOne is missing, far beyond the
+    # MPC's own absence hold. Nothing says the lead has left: the car stays on the kiss, and the lead back where it stood is the
+    # same lead, whose departure releases the car
+    planner, d = self.rest_behind(6.0, 30.0)
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7))
+    assert planner.output_should_stop and planner.stop_landing.landing and planner.lead_departure.holding
+    states = []
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7, radar_valid=False) if dropout == 'radar_invalid' else self.radar_frame(None, -1))
+      states.append((planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d + 0.1, 0.0, 0.0), 7))
+      states.append((planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
+    assert all(bit and landing and math.isclose(out, -KISS_DECEL, abs_tol=1e-9) for bit, landing, out in states), states
+    planner.update(self.radar_frame((d + 0.1, 1.0, 1.0), 7))
+    assert not planner.output_should_stop and not planner.stop_landing.landing
+
+  @pytest.mark.parametrize('missing', [0.0, 1.0])
+  @pytest.mark.parametrize('arrival', [(0.3, 7.5), (6.0, 30.0)], ids=['no_landing', 'landed'])
+  def test_a_car_standing_beyond_the_lead_ends_the_hold_as_a_launch(self, arrival, missing):
+    # held at rest behind a lead; at once or after a second with no lead, the slot reads a car standing 5 m beyond where the lead
+    # stood: the lead has left, and the car goes to that car, its landing ended
+    planner, d = self.rest_behind(*arrival)
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7))
+    for _ in range(round(missing / DT_MDL)):
+      planner.update(self.radar_frame(None, -1))
+    assert planner.output_should_stop and planner.lead_departure.holding
+    states = []
+    for _ in range(round(2.0 / DT_MDL)):
+      planner.update(self.radar_frame((d + 5.0, 0.0, 0.0), 9))
+      states.append((planner.lead_departure.handed_back, planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
+    assert states[0][0] and not any(handed for handed, _, _, _ in states[1:]), states
+    assert not any(bit or landing for _, bit, landing, _ in states[round(0.5 / DT_MDL):]), states
+    assert not any(landing for _, _, landing, _ in states) and states[-1][3] > 0.1, states
+
+  @pytest.mark.parametrize('tracks', [(7, 9), (-1, -1)], ids=['radar', 'vision'])
+  def test_a_nearer_car_in_the_slot_keeps_the_hold(self, tracks):
+    # landed and held behind a lead; a car cuts in between and the slot trades between it and the lead: nothing left
+    planner, d = self.rest_behind(6.0, 30.0)
+    states = []
+    for i in range(round(2.0 / DT_MDL)):
+      planner.update(self.radar_frame((3.1, 0.0, 0.0), tracks[1]) if i % 3 else self.radar_frame((d, 0.0, 0.0), tracks[0]))
+      states.append((planner.output_should_stop, planner.stop_landing.landing, planner.lead_departure.handed_back))
+    assert all(bit and landing and not handed for bit, landing, handed in states), states
+
+  @pytest.mark.parametrize('lead_seen', [False, True])
+  def test_the_models_path_opening_ends_a_hold_only_while_its_lead_is_missing(self, lead_seen):
+    # stopped at a red line behind a lead the car is held for; at the green the model's path opens (Force Stops releases). A
+    # lead that has gone missing leaves nothing but the path to go on, and the car goes; a lead still standing there holds it
+    car = IdealCar(8.0)
+    stop = {'x': 40.0}
+
+    def force_stops(*args):
+      if stop['x'] is None:
+        return ForceStopsResult()
+      return ForceStopsResult(NO_CAP, stop['x'] - car.x, car.v < 0.01, None)
+    car.planner.force_stops.update = force_stops
+    while car.v >= 0.01:
+      car.step(lead=(38.0 - car.x, 0.0, 0.0), v_cruise=10.0)
+    planner, d = car.planner, 38.0 - car.x
+    lead = (d, 0.0, 0.0) if lead_seen else None
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), 7))
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame(lead, 7))
+    assert planner.output_should_stop and planner.stop_landing.landing and planner.lead_departure.holding
+    stop['x'] = None
+    states = []
+    for _ in range(round(2.0 / DT_MDL)):
+      planner.update(self.radar_frame(lead, 7))
+      states.append((planner.output_should_stop, planner.stop_landing.landing, float(planner.output_a_target)))
+    if lead_seen:
+      assert all(bit for bit, _, _ in states), states
+    else:
+      assert not any(bit or landing for bit, landing, _ in states), states
+      assert states[-1][2] > 0.5, states[-1]
+
+  @pytest.mark.parametrize('dropout', ['radar_invalid', 'lead_absent'])
+  def test_a_dropout_at_rest_does_not_release_the_hold(self, dropout):
+    # the hover recipe: the MPC plans above the stop bit's threshold at rest and only the hold keeps the car. A radarState that
+    # fails its checks, or a leadOne missing, for a frame or for a second is the same lead
+    planner, d = self.rest_behind(0.3, 7.5)
+    d, frames = self.inch(planner, d, 9.0)
+    assert not should_stop(0.0, frames[-1][1]) and planner.output_should_stop
+    for _ in range(round(1.0 / DT_MDL)):
+      if dropout == 'radar_invalid':
+        planner.update(self.radar_frame((d, 0.0, 0.0), -1, radar_valid=False))
+      else:
+        planner.update(self.radar_frame(None, -1))
+      assert planner.output_should_stop and planner.lead_departure.holding
+    for _ in range(round(1.0 / DT_MDL)):
+      planner.update(self.radar_frame((d, 0.0, 0.0), -1))
+      assert planner.output_should_stop
+
+  def test_a_lead_missing_under_a_hold_leaves_nothing_in_the_launch(self, accel_max):
+    # the hover recipe, and leadOne missing for a second under the hold: the MPC plans for no lead meanwhile, but the car stood.
+    # Once the lead is back and leaves, the car launches no harder than it would have without the absence
+    launches = []
+    for missing in (0.0, 1.0):
+      planner, d = self.rest_behind(0.3, 7.5)
+      d, _ = self.inch(planner, d, 9.0)
+      for _ in range(round(missing / DT_MDL)):
+        planner.update(self.radar_frame(None, -1))
+      for _ in range(2):
+        planner.update(self.radar_frame((d, 0.0, 0.0), -1))
+      assert planner.output_should_stop
+      x, v, launch = d, 0.0, []
+      while len(launch) < round(1.0 / DT_MDL):
+        v += 1.5 * DT_MDL
+        x += v * DT_MDL
+        planner.update(self.radar_frame((x, v, 1.5), -1))
+        if not planner.output_should_stop:
+          launch.append(float(planner.output_a_target))
+      launches.append(np.array(launch))
+    assert np.all(launches[1] <= launches[0] + 0.01), np.round(launches, 2)
 
 
 class TestHoldRelease:
@@ -987,6 +1301,17 @@ class TestMpcSeed:
       car.step()
       assert car.planner.plan_winner == 'cruise'
       assert car.planner.mpc.x0[2] == published
+
+  def test_the_mpc_starts_from_rest_while_the_pre_release_holds_the_car(self):
+    # the hover recipe: the pre-release holds the car at rest while the MPC plans above the stop bit's threshold, then leadOne
+    # goes missing and comes back. The car stands throughout, and every plan starts from the car at rest
+    standstill = TestStandstillRelease()
+    planner, d = standstill.rest_behind(0.3, 7.5)
+    d, _ = standstill.inch(planner, d, 9.0)
+    for lead in [(d, 0.0, 0.0)] * 10 + [None] * 20 + [(d, 0.0, 0.0)] * 10:
+      planner.update(standstill.radar_frame(lead, -1))
+      assert planner.lead_departure.holding and planner.output_should_stop
+      assert planner.mpc.a_solution[0] == 0.0, planner.mpc.a_solution[0]
 
   def test_the_mpc_plans_from_the_measured_speed(self):
     # nothing below the planner closes a loop on speed, so a car that does not do what it is told -- it answers through the ESP's

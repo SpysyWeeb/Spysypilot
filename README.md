@@ -51,6 +51,8 @@ hold's green release ignoring the model's stop call, a gas tap at speed arming n
 from CEM, a creep resume read as a launch — plus tests and docs) merged; awaiting a drive.
 2026-09-25: step 1 of the braking audit (hand-overs converge and are carried at the cruise jerk, the MPC plans from its own plan and
 the measured speed, a feed-forward landing law whose kiss lands the car before the stop bit rises) merged; awaiting a drive.
+2026-09-26: step 1b of the braking audit (the lead-departure pre-release is the one owner of the release at standstill behind
+the lead the car came to rest behind, and Chill's throttle gate decides on the gas-press probability's 0.25 s mean) merged; awaiting a drive.
 
 ## To-Do
 

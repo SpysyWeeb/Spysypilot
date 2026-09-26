@@ -22,10 +22,11 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_
 #
 # The car answers a request one actuator delay later, so each edge is requested that much earlier (request_breakpoints).
 # The landing latches, since an on/off floor against the MPC's hover would alternate the target every frame: once started
-# it lasts through the hover and through standstill, and ends only on a launch -- the lead-departure pre-release, a Force
-# Stops release (the commitment over, not a hold rolling on into a moving commitment) -- the plan positive for
-# LAUNCH_FRAMES in a row above KISS_SPEED, or the speed leaving the window. Whatever it still holds the plan below when it
-# ends is handed back at the planner's cruise jerk, so no exit steps the car; a reset drops it.
+# it lasts through the hover and through standstill, and ends only on a launch -- the lead-departure pre-release or its
+# hold handed back, a Force Stops release (the commitment over, not a hold rolling on into a moving commitment) -- the
+# plan positive for LAUNCH_FRAMES in a row above KISS_SPEED, or the speed leaving the window; a launch the planner takes
+# back at standstill latches it again. Whatever it still holds the plan below when it ends is handed back at the planner's
+# cruise jerk, so no exit steps the car; a reset drops it.
 LANDING_SPEED = 3.5          # m/s, the law acts below this; at the top the bound (2.75 m/s^2) exceeds any comfort approach
 STOP_INTENT_SPEED = 0.5      # m/s, the MPC's horizon must reach below this for a slowdown to count as a stop
 KISS_SPEED = 0.40            # m/s, from here down the car rides the kiss alone
@@ -117,16 +118,17 @@ class StopLanding:
       requirement = max(requirement, stop_within(v_ego, room))
     return requirement
 
-  def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None):
+  def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None, launch_cancelled=False):
     """Bound the arbitrated acceleration target through a landing; returns the plan unchanged otherwise.
 
     lead is the planner's LeadObservation, stop_intent says the plan ends in a stop this frame, launch says the planner
-    itself is letting the car go (a lead-departure pre-release, a Force Stops release), a_ego is the car's measured
-    acceleration (None: the anti-stall integral holds). A landing starts on intent with the plan braking more than the
-    kiss below LANDING_SPEED, unless the planner is issuing a launch that same frame, and then lasts -- through the MPC's
-    hover around zero and through standstill -- until a launch, the plan climbing above zero for LAUNCH_FRAMES in a row
-    above KISS_SPEED, or the speed leaving the window. Then an output it held below the plan rises at the release jerk
-    until it meets the plan.
+    itself is letting the car go (a lead-departure pre-release or its hold handed back, a Force Stops release), a_ego is
+    the car's measured acceleration (None: the anti-stall integral holds), launch_cancelled says the planner took back a
+    launch it issued at standstill. A landing starts on intent with the plan braking more than the kiss below
+    LANDING_SPEED, unless the planner is issuing a launch that same frame, or at standstill on a cancelled launch, and then
+    lasts -- through the MPC's hover around zero and through standstill -- until a launch, the plan climbing above zero for
+    LAUNCH_FRAMES in a row above KISS_SPEED, or the speed leaving the window. Then an output it held below the plan rises
+    at the release jerk until it meets the plan.
     """
     if not math.isfinite(v_ego):
       # a non-finite speed resets everything, a release included
@@ -145,9 +147,11 @@ class StopLanding:
       if launch or v_ego >= LANDING_SPEED or self._positive_frames >= LAUNCH_FRAMES:
         self.landing = False
         self.releasing = self._held
-    elif not launch and v_ego < LANDING_SPEED and stop_intent and a_target < -KISS_DECEL:
+    elif not launch and ((v_ego < LANDING_SPEED and stop_intent and a_target < -KISS_DECEL) or
+                         (launch_cancelled and v_ego <= STANDSTILL_SPEED)):
       # a landing starts on intent with the plan braking more than the kiss: a hover frame right after a launch is not a stop,
-      # and a launch frame never starts one, or every frame the pre-release ends would re-latch and toggle the stop bit
+      # and a launch frame never starts one, or every frame the pre-release ends would re-latch and toggle the stop bit. A
+      # launch taken back at standstill restores the landing it ended, whatever the plan's hover
       self.landing = True
       self._positive_frames = 0
       self.integral = 0.0
