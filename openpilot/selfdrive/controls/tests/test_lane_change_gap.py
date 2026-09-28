@@ -4,7 +4,7 @@ from openpilot.cereal import log
 from opendbc.car.structs import car
 from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, LaneLines, target_lane_blocked, ARRIVAL_TIME, BLOCKED_HOLD,
+from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, LaneLines, target_lane_blocked, ARRIVAL_TIME, BLOCKED_HOLD, CLOSE_FRAMES,
                                                               LANDED_FRAMES, LANDED_MARGIN, LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BESIDE,
                                                               LEAD_BRAKING, LEAD_CONTINUITY, LEAD_DANGER_FACTOR, LEAD_OFF_PATH, LEAD_ON_PATH,
                                                               LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LEAD_UNPLACED_STD,
@@ -486,12 +486,12 @@ class TestLeadRelease:
     gap = LaneChangeGap(CP, DT_MDL)
     step(gap, model=model, radar_state=get_radar_state(d_rel=FOLLOW_GAP - 5.0), n=5)
     assert released(gap) == [False, False]
-    # released far out, then closing: held for LEAD_SPEED_FRAMES - 1 frames, then followed at the full gap
+    # released far out, then closing: held for CLOSE_FRAMES - 1 frames, then followed at the full gap
     gap = LaneChangeGap(CP, DT_MDL)
     assert np.isclose(step(gap, model=model, radar_state=get_radar_state(d_rel=FAR)), PAD)
     assert released(gap)[0]
     closing = get_radar_state(d_rel=45.0, v_rel=-4.0)
-    step(gap, model=model, radar_state=closing, n=LEAD_SPEED_FRAMES - 1)
+    step(gap, model=model, radar_state=closing, n=CLOSE_FRAMES - 1)
     assert released(gap)[0]
     assert step(gap, model=model, radar_state=closing) == 0.0
     assert not released(gap)[0] and gap.closing
@@ -518,7 +518,7 @@ class TestLeadRelease:
     closing, far = get_radar_state(d_rel=45.0, v_rel=-4.0), get_radar_state(d_rel=FAR)
     gap = LaneChangeGap(CP, DT_MDL)
     step(gap, model=model, radar_state=far)
-    step(gap, model=model, radar_state=closing, n=LEAD_SPEED_FRAMES - 1)
+    step(gap, model=model, radar_state=closing, n=CLOSE_FRAMES - 1)
     step(gap, model=model, radar_state=far, tracks=get_tracks((30.0, 3.4, -1.0)))
     step(gap, model=model, radar_state=far, n=int(round(BLOCKED_HOLD / DT_MDL)))
     step(gap, model=model, radar_state=closing)
@@ -573,7 +573,7 @@ class TestLeadRelease:
     step(gap, model=get_model(path=path_for(1.5, d_rel)), radar_state=radar_state, tracks=tracks, n=5)
     assert released(gap) == [True, True] and gap.moved_over
     back = get_model(path=path_for(LEAD_BESIDE - 0.1 + y_rel, d_rel))
-    step(gap, model=back, radar_state=radar_state, tracks=tracks, n=LEAD_SPEED_FRAMES - 1)
+    step(gap, model=back, radar_state=radar_state, tracks=tracks, n=CLOSE_FRAMES - 1)
     assert released(gap) == [True, True]
     step(gap, model=back, radar_state=radar_state, tracks=tracks)
     assert released(gap) == [False, False] and gap.closing
@@ -914,7 +914,7 @@ class TestLeadRelease:
   def test_latch_and_evidence_reset_with_the_next_change(self):
     model = get_model(path=path_for(2.0, FAR))
     gap = LaneChangeGap(CP, DT_MDL)
-    step(gap, model=model, radar_state=get_radar_state(d_rel=45.0, v_rel=-4.0), tracks=get_tracks((45.0, 0.0, -4.0, 7)), n=LEAD_SPEED_FRAMES + 1)
+    step(gap, model=model, radar_state=get_radar_state(d_rel=45.0, v_rel=-4.0), tracks=get_tracks((45.0, 0.0, -4.0, 7)), n=CLOSE_FRAMES + 1)
     assert gap.closing
     step(gap, model=get_model(state=LaneChangeState.off))
     step(gap, model=model, radar_state=get_radar_state(d_rel=FAR))

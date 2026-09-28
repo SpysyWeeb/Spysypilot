@@ -10,7 +10,7 @@ from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.simple_kalman import KF1D
 from openpilot.selfdrive.controls.lib import longitudinal_planner
-from openpilot.selfdrive.controls.lib.lane_change_gap import LEAD_BRAKING, LEAD_SPEED_FRAMES
+from openpilot.selfdrive.controls.lib.lane_change_gap import CLOSE_FRAMES, LEAD_BRAKING
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_stopped_equivalence_factor, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
@@ -129,12 +129,14 @@ class TestPlanningView:
       'change over': {'state': LaneChangeState.off},
       'path back': {'path': -1.5},
     }.get(cue, {})
+    a_ego = 0.0
     if cue == 'too close':
-      d_rel, v_lead = 24.0, 9.0
-      for _ in range(LEAD_SPEED_FRAMES - 1):
-        planner.update(frame(12.0, 0.0, d_rel, v_lead, y_ego=1.5, path=2.0))
+      # the car accelerating toward the lead at its steady speed, so no braking cue fires with the floor
+      d_rel, a_ego = 24.0, 1.5
+      for _ in range(CLOSE_FRAMES - 1):
+        planner.update(frame(12.0, a_ego, d_rel, v_lead, y_ego=1.5, path=2.0))
       assert any(planner.lane_change_gap.released)
-    planner.update(frame(12.0, 0.0, d_rel, v_lead, **{'y_ego': 1.5, 'path': 2.0, **kwargs}))
+    planner.update(frame(12.0, a_ego, d_rel, v_lead, **{'y_ego': 1.5, 'path': 2.0, **kwargs}))
     assert not any(planner.lane_change_gap.released)
     assert mpc_follows(planner, d_rel, v_lead)
 

@@ -24,6 +24,7 @@ MIN_HEADROOM = 0.5           # m/s, the set speed must be this far above the cur
 LEAD_BRAKING = -1.0          # m/s^2, a lead braking harder than this keeps its full gap
 LEAD_SLOWING = 0.5           # m/s, a lead this much below its speed since the change started is braking
 LEAD_SPEED_FRAMES = 3        # a radar speed glitch lasts one frame
+CLOSE_FRAMES = 3             # a lead at the floor's edge, or another car in its slot for a frame, reads too close a frame or two
 LEAD_CONTINUITY = 2.0        # m, the same car across a track id change, or frame to frame for a vision lead
 LEAD_SPEED_CONTINUITY = 1.5  # m/s
 LEAD_OFF_PATH = 1.0          # m, a lead this far off the planned path, toward the lane being left, is being passed
@@ -208,12 +209,12 @@ class LaneChangeGap:
   followed, and so is one the floor, too_close(), finds too close: one that would need more than
   RESTORE_DECEL of steady braking to stop closing before the follow distance, or is inside that
   distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or the car being
-  passed, has been too close for LEAD_SPEED_FRAMES running, every lead is followed at the full gap
-  until the car being passed is beside the car. A radar lead beside the car is past the floor and the
-  latch while the plan keeps as clear of it. Far out the path can stray LEAD_OFF_PATH from a car still
-  in the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's
-  verdict when radard gives both slots the same radar track, is judged on its own otherwise, and is
-  never released while braking.
+  passed, has been too close for CLOSE_FRAMES running, every lead is followed at the full gap until
+  the car being passed is beside the car. A radar lead beside the car is past the floor and the latch
+  while the plan keeps as clear of it. Far out the path can stray LEAD_OFF_PATH from a car still in
+  the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict
+  when radard gives both slots the same radar track, is judged on its own otherwise, and is never
+  released while braking.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -428,14 +429,14 @@ class LaneChangeGap:
                     not any(lead.present and lead.radar and lead.radarTrackId == passing.trackId for lead in leads) and \
                     too_close(passing.dRel, passing.vRel, v_ego + passing.vRel, a_ego, t_follow, stop_distance)
     self.close_frames = self.close_frames + 1 if any(close) or passing_close else 0
-    if self.close_frames >= LEAD_SPEED_FRAMES:
+    if self.close_frames >= CLOSE_FRAMES:
       # followed at the full gap until the car being passed is beside the car
       self.closing = True
       self.armed = False
     released = []
     for k, (candidate, lead) in enumerate(zip((one, two), leads, strict=True)):
       # the debounce keeps the car released last frame, not whichever car now fills its slot
-      held = self.close_frames < LEAD_SPEED_FRAMES and self.was_released(lead)
+      held = self.close_frames < CLOSE_FRAMES and self.was_released(lead)
       released.append(bool(candidate and (beside[k] or not self.closing) and (not close[k] or held)))
     return released
 
