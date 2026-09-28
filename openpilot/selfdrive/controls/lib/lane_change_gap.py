@@ -1,4 +1,5 @@
 from collections import deque
+from typing import NamedTuple
 
 import numpy as np
 
@@ -178,6 +179,11 @@ def lateral_agrees(lead, lead_model):
   return abs(lead.yRel + lead_model.y[0]) < LEAD_CONTINUITY
 
 
+def continues(lead, d_rel, v_rel):
+  # the same car as one expected at d_rel and v_rel: a track id can change on the same car, and a vision lead has none
+  return abs(lead.dRel - d_rel) < LEAD_CONTINUITY and abs(lead.vRel - v_rel) < LEAD_SPEED_CONTINUITY
+
+
 def too_close(d_rel, v_rel, v_lead, a_ego, t_follow, stop_distance):
   # whether a car handed back to the MPC now, after the car has kept its acceleration for RESTORE_LAG, needs more than
   # RESTORE_DECEL of steady braking to stop closing before the follow distance behind it. That bounds the average, not
@@ -190,6 +196,14 @@ def too_close(d_rel, v_rel, v_lead, a_ego, t_follow, stop_distance):
   if room <= 0.0:
     return closing > 0.0 or d_rel < LEAD_DANGER_FACTOR * gap
   return max(closing, 0.0)**2 / (2 * room) > RESTORE_DECEL
+
+
+class ReleasedLead(NamedTuple):
+  radar: bool
+  track_id: int
+  d_rel: float
+  y_rel: float
+  v_rel: float
 
 
 class LaneChangeGap:
@@ -271,8 +285,11 @@ class LaneChangeGap:
     self.blocked_timer = 0.0
     self.t_follow_pad = 0.0
     self.accelerate = False
-    self.released = [False, False]
     self.released_leads = [None, None]
+
+  @property
+  def released(self):
+    return [lead is not None for lead in self.released_leads]
 
   def remember(self, lead):
     self.lead_id = lead.radarTrackId if lead.radar else -1
@@ -287,9 +304,7 @@ class LaneChangeGap:
       return False
     if lead.radar and lead.radarTrackId == self.lead_id:
       return True
-    # a track id can change on the same car, and a vision lead has none
-    return abs(lead.dRel - (self.lead_distance + self.lead_v_rel * self.dt)) < LEAD_CONTINUITY and \
-           abs(lead.vRel - self.lead_v_rel) < LEAD_SPEED_CONTINUITY
+    return continues(lead, self.lead_distance + self.lead_v_rel * self.dt, self.lead_v_rel)
 
   def follow_passing(self, radar_tracks):
     # the car the change started behind, by its radar track or one continuing it, whether or not radard still
@@ -300,8 +315,7 @@ class LaneChangeGap:
     track = next((pt for pt in radar_tracks.points if pt.trackId == self.passing_id), None)
     if track is None:
       # a target lane car can match its range and speed, so a new track continues it only in the same place
-      near = [pt for pt in radar_tracks.points if abs(pt.dRel - expected) < LEAD_CONTINUITY and
-              abs(pt.yRel - self.passing_y_rel) < LEAD_CONTINUITY and abs(pt.vRel - self.passing_v_rel) < LEAD_SPEED_CONTINUITY]
+      near = [pt for pt in radar_tracks.points if continues(pt, expected, self.passing_v_rel) and abs(pt.yRel - self.passing_y_rel) < LEAD_CONTINUITY]
       track = min(near, key=lambda pt: abs(pt.dRel - expected)) if near else None
     if track is None:
       self.passing_distance = expected
@@ -386,10 +400,10 @@ class LaneChangeGap:
 
   def was_released(self, lead):
     # the same car as one released last frame: its radar track, or its distance and speed across an id change
-    for radar, track_id, d_rel, _, v_rel in filter(None, self.released_leads):
-      if lead.radar and radar and lead.radarTrackId == track_id:
+    for last in filter(None, self.released_leads):
+      if lead.radar and last.radar and lead.radarTrackId == last.track_id:
         return True
-      if abs(lead.dRel - (d_rel + v_rel * self.dt)) < LEAD_CONTINUITY and abs(lead.vRel - v_rel) < LEAD_SPEED_CONTINUITY:
+      if continues(lead, last.d_rel + last.v_rel * self.dt, last.v_rel):
         return True
     return False
 
@@ -398,15 +412,14 @@ class LaneChangeGap:
     # the path. A release made on the track belongs to the car, which is judged on its last radar reading carried forward,
     # or on the model's distance and speed once radar has lost the track
     last = self.released_leads[i]
-    if not lead.present or lead.radar or last is None or not last[0]:
+    if not lead.present or lead.radar or last is None or not last.radar:
       return lead
-    _, track_id, d_rel, y_rel, v_rel = last
-    d_rel += v_rel * self.dt
-    if abs(lead.dRel - d_rel) >= LEAD_CONTINUITY or abs(lead.vRel - v_rel) >= LEAD_SPEED_CONTINUITY:
+    d_rel, v_rel = last.d_rel + last.v_rel * self.dt, last.v_rel
+    if not continues(lead, d_rel, v_rel):
       return lead
-    if not any(pt.trackId == track_id for pt in radar_tracks.points):
+    if not any(pt.trackId == last.track_id for pt in radar_tracks.points):
       d_rel, v_rel = lead.dRel, lead.vRel
-    return log.RadarState.LeadData.new_message(present=True, radar=True, radarTrackId=track_id, dRel=d_rel, yRel=y_rel, vRel=v_rel,
+    return log.RadarState.LeadData.new_message(present=True, radar=True, radarTrackId=last.track_id, dRel=d_rel, yRel=last.y_rel, vRel=v_rel,
                                                vLead=v_ego + v_rel)
 
   @staticmethod
@@ -438,7 +451,7 @@ class LaneChangeGap:
     if lead_model is None or len(lead_model.yStd) == 0 or not self.leaving or self.across:
       return False
     last = self.released_leads[i]
-    held = last is not None and not last[0]  # the slot was released on a lead only the model sees
+    held = last is not None and not last.radar  # the slot was released on a lead only the model sees
     return offset > (LEAD_ON_PATH if held else LEAD_OFF_PATH) and \
            lead_model.yStd[0] >= (LEAD_UNPLACED_STD_HOLD if held else LEAD_UNPLACED_STD) and \
            self.corridor_clear(model, direction, radar_tracks, lead.dRel, LEAD_ON_PATH if held else LEAD_OFF_PATH)
@@ -471,8 +484,8 @@ class LaneChangeGap:
     released = []
     for k, (candidate, lead) in enumerate(zip((one, two), leads, strict=True)):
       # the debounce keeps the car released last frame, not whichever car now fills its slot
-      held = self.close_frames < CLOSE_FRAMES and self.was_released(lead)
-      released.append(bool(candidate and (beside[k] or not self.closing) and (not close[k] or held)))
+      debounced = self.close_frames < CLOSE_FRAMES and self.was_released(lead)
+      released.append(bool(candidate and (beside[k] or not self.closing) and (not close[k] or debounced)))
     return released
 
   def update(self, model, CS, radar_state, radar_tracks, radar_ok, v_ego, v_cruise, t_follow, stop_distance, comfort_brake):
@@ -554,9 +567,9 @@ class LaneChangeGap:
       self.accelerate = self.enabled and clear and not self.backed_out and v_cruise - v_ego > MIN_HEADROOM
       if self.accelerate and self.armed:
         self.t_follow_pad = min(LANE_CHANGE_T_FOLLOW - t_follow, 0.0)
-    self.released = released
     self.released_in_change = self.released_in_change or any(released)
-    self.released_leads = [(ld.radar, ld.radarTrackId, ld.dRel, ld.yRel, ld.vRel) if r else None for ld, r in zip(leads, released, strict=True)]
+    self.released_leads = [ReleasedLead(ld.radar, ld.radarTrackId, ld.dRel, ld.yRel, ld.vRel) if r else None
+                           for ld, r in zip(leads, released, strict=True)]
     return self.t_follow_pad
 
   def followed(self, radar_state):
