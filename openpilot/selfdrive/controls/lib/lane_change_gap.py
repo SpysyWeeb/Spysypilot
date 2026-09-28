@@ -31,7 +31,7 @@ LEAD_ON_PATH = 0.5           # m, and the same lead back this close is in front 
 LEAD_BESIDE = 2.0            # m, lateral toward the lane being left where the two cars' bodies stop overlapping
 LEAD_UNPLACED_STD = 1.0      # m, the model's lateral std on a lead it cannot put in a lane
 LEAD_UNPLACED_STD_HOLD = 0.8
-RESTORE_DECEL = 1.0          # m/s^2, the most braking a lead handed back to the MPC may ask for
+RESTORE_DECEL = 1.0          # m/s^2, the steady braking a lead handed back may need to stop closing before the follow distance
 RESTORE_LAG = 1.0            # s, the car keeps its acceleration this long before a lead handed back slows it
 LANE_WIDTH_DEFAULT = 3.5     # m, target lane width when the model's lines are not confident
 LANE_WIDTH_MIN = 2.7
@@ -161,9 +161,11 @@ def target_lane_blocked(direction, lines, radar_tracks, v_ego, t_follow, stop_di
 
 
 def too_close(d_rel, v_rel, v_lead, a_ego, t_follow, stop_distance):
-  # whether the MPC, handed this car once the car has kept its acceleration for RESTORE_LAG, would brake harder than
-  # RESTORE_DECEL to fall back to its own follow distance behind it. A car already inside that distance asks for little
-  # while it holds or opens the gap, so there it counts only while closing or inside the MPC's danger distance
+  # whether a car handed back to the MPC now, after the car has kept its acceleration for RESTORE_LAG, needs more than
+  # RESTORE_DECEL of steady braking to stop closing before the follow distance behind it. That bounds the average, not
+  # the MPC: while closing it aims further back and is jerk limited, so its peak runs about 1.1 to 1.5 times that at
+  # 5 m/s of closing and up to 1.7 times at 7 m/s. A car already inside the follow distance asks for little while it
+  # holds or opens the gap, so there it counts only while closing or inside LEAD_DANGER_FACTOR of that distance
   gap = t_follow * max(v_lead, 0.0) + stop_distance
   closing = -v_rel + a_ego * RESTORE_LAG
   room = d_rel - gap - max(closing - v_rel, 0.0) / 2 * RESTORE_LAG
@@ -182,17 +184,21 @@ class LaneChangeGap:
   the MPC targets the relaxed distance. The relaxation ends for the rest of the change when the model
   hands the lead over, the lead brakes (its filtered deceleration, a drop in its raw speed or the
   model's own estimate), the driver backs out (blinker off before the car is across, counter-steer,
-  a gas or brake override) or after RELAX_TIME_MAX.
+  a gas or brake override), the floor below hands a lead back, or after RELAX_TIME_MAX.
 
   A slower lead cannot be passed at any finite gap, and after the handoff the model's lead slides onto
   the lane being left with no radar return behind it. So while the target lane is clear and the driver
   has not backed out, the MPC stops following a radar lead the planned path has left toward that lane,
   and, once the car being passed has gone off the path and until the car is across, a lead only the
   model sees while it is off the path too, the model cannot place it and radar sees nothing on the
-  path. A stopped lead is always followed, and so is any lead the MPC could not take back gently, until
-  the car being passed is beside the car. Far out the path can stray LEAD_OFF_PATH from a car still in
-  the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict
-  when it is the same car, unless it sits on the target side, and is judged on its own otherwise.
+  path. A stopped lead is always followed, and so is one the floor, too_close(), finds too close: one
+  that would need more than RESTORE_DECEL of steady braking to stop closing before the follow distance,
+  or is inside that distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or
+  the car being passed, has been too close for LEAD_SPEED_FRAMES running, every lead not beside the car
+  is followed at the full gap until the car being passed is beside it. Far out the path can stray
+  LEAD_OFF_PATH from a car still in the lane, but a far lead rarely binds and the same floor bounds
+  it. leadTwo gets leadOne's verdict when it is the same car, unless it sits on the target side, is
+  judged on its own otherwise, and is never released while braking.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -301,8 +307,9 @@ class LaneChangeGap:
     return (not CS.rightBlinker and not across) or (CS.steeringPressed and CS.steeringTorque > 0)
 
   def follow_lines(self, model, direction, starting):
-    # the car's own lines whenever the model places them, and through the change the line being crossed, followed
-    # by position: the model keeps placing it while it doubts it is the car's, and relabels it once the car is across
+    # the car's own lines whenever the model places them outside a change, aged only there, and through the change the
+    # line being crossed, followed by position: the model keeps placing it while it doubts it is the car's, and
+    # relabels it once the car is across
     lines, probs, stds = model.laneLines, model.laneLineProbs, model.laneLineStds
     valid = len(lines) == 4 and len(probs) == 4 and all(len(line.x) > 0 for line in lines)
     placed = [valid and (probs[i] > 0.5 or (len(stds) == 4 and stds[i] < LINE_STD_MAX)) for i in range(4)]
