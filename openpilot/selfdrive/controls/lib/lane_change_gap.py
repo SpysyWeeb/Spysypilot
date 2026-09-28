@@ -2,6 +2,14 @@ from collections import deque
 
 import numpy as np
 
+from opendbc.car.chrysler.values import ChryslerFlags
+from opendbc.car.ford.values import FordFlags
+from opendbc.car.gm.values import GMFlags
+from opendbc.car.honda.values import HondaFlags
+from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.car.subaru.values import SubaruFlags
+from opendbc.car.toyota.values import ToyotaFlags
+from opendbc.car.volkswagen.values import VolkswagenFlags
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.radard import RADAR_TO_CAMERA
@@ -26,6 +34,18 @@ TRACK_MIN_DISTANCE = 2.0     # m, closer returns are beside the car, which the b
 TRACK_MOVING_SPEED = 2.0     # m/s absolute, below this a return is clutter, a stopped car or oncoming traffic
 ARRIVAL_TIME = 3.0           # s, a target lane car inside the follow gap by then blocks
 BLOCKED_HOLD = 0.5           # s, radar returns flicker
+
+# opendbc marks a blind spot monitor with each brand's own flag (commaai/opendbc#3788)
+BSM_FLAGS = {
+  'chrysler': ChryslerFlags.HAS_BSM,
+  'ford': FordFlags.HAS_BSM,
+  'gm': GMFlags.HAS_BSM,
+  'honda': HondaFlags.HAS_BSM,
+  'hyundai': HyundaiFlags.HAS_BSM,
+  'subaru': SubaruFlags.HAS_BSM,
+  'toyota': ToyotaFlags.HAS_BSM,
+  'volkswagen': VolkswagenFlags.HAS_BSM,
+}
 
 
 class LaneLines:
@@ -105,7 +125,7 @@ class LaneChangeGap:
   def __init__(self, CP, dt=DT_MDL):
     self.dt = dt
     # the check needs a view of the target lane: front radar tracks ahead, the blind spot monitor beside
-    self.enabled = not CP.radarUnavailable and CP.enableBsm
+    self.enabled = not CP.radarUnavailable and bool(CP.flags & BSM_FLAGS.get(CP.brand, 0))
     self.starting_prev = False
     self.backed_out = False
     self.lead_id = -1

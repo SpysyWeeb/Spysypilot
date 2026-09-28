@@ -2,6 +2,7 @@ import numpy as np
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
+from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, LaneLines, target_lane_blocked, ARRIVAL_TIME, BLOCKED_HOLD,
                                                               LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BRAKING, LEAD_CONTINUITY,
@@ -19,7 +20,7 @@ COMFORT_BRAKE = 2.5
 PAD = LANE_CHANGE_T_FOLLOW - T_FOLLOW
 FOLLOW_GAP = STOP_DISTANCE + T_FOLLOW * V_EGO  # behind a car at the same speed
 X_IDXS = np.array(ModelConstants.X_IDXS)
-CP = car.CarParams.new_message(radarUnavailable=False, enableBsm=True)
+CP = car.CarParams.new_message(radarUnavailable=False, brand='hyundai', flags=HyundaiFlags.HAS_BSM.value)
 
 
 def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDirection.left, left_y=-1.6, right_y=1.76, probs=(1.0, 1.0),
@@ -169,7 +170,9 @@ class TestLaneChangeGap:
     assert not gap.accelerate
 
   def test_needs_the_sensors(self):
-    for cp in (car.CarParams.new_message(radarUnavailable=True, enableBsm=True), car.CarParams.new_message(radarUnavailable=False, enableBsm=False)):
+    for cp in (car.CarParams.new_message(radarUnavailable=True, brand='hyundai', flags=HyundaiFlags.HAS_BSM.value),
+               car.CarParams.new_message(radarUnavailable=False, brand='hyundai'),
+               car.CarParams.new_message(radarUnavailable=False, brand='mazda', flags=HyundaiFlags.HAS_BSM.value)):
       gap = LaneChangeGap(cp, DT_MDL)
       assert step(gap) == 0.0
       assert not gap.accelerate
