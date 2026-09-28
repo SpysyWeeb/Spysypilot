@@ -7,7 +7,8 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, LaneLines, target_lane_blocked, ARRIVAL_TIME, BLOCKED_HOLD,
                                                               LANDED_FRAMES, LANDED_MARGIN, LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BESIDE,
                                                               LEAD_BRAKING, LEAD_CONTINUITY, LEAD_DANGER_FACTOR, LEAD_OFF_PATH, LEAD_ON_PATH,
-                                                              LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LINE_HOLD, MIN_HEADROOM,
+                                                              LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LEAD_UNPLACED_STD,
+                                                              LEAD_UNPLACED_STD_HOLD, LINE_HOLD, MIN_HEADROOM,
                                                               RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN, TRACK_MOVING_SPEED)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -25,11 +26,14 @@ CP = car.CarParams.new_message(radarUnavailable=False, brand='hyundai', flags=Hy
 
 
 def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDirection.left, left_y=-1.6, right_y=1.76, probs=(1.0, 1.0),
-              curvature=0.0, lead_accel=0.0, lead_prob=1.0, path=None, lead_two_std=None, lead_two_accel=0.0, line_stds=None, lines=None):
+              curvature=0.0, lead_accel=0.0, lead_prob=1.0, path=None, lead_std=None, lead_two_std=None, lead_two_accel=0.0,
+              line_stds=None, lines=None):
   model = log.ModelDataV2.new_message()
   model.init('leadsV3', 1 if lead_two_std is None else 2)
   model.leadsV3[0].prob = lead_prob
   model.leadsV3[0].a = [lead_accel] * len(ModelConstants.LEAD_T_IDXS)
+  if lead_std is not None:
+    model.leadsV3[0].yStd = [lead_std] * len(ModelConstants.LEAD_T_IDXS)
   if lead_two_std is not None:
     model.leadsV3[1].prob = lead_prob
     model.leadsV3[1].a = [lead_two_accel] * len(ModelConstants.LEAD_T_IDXS)
@@ -567,6 +571,78 @@ class TestLeadRelease:
     assert gap.leaving
     step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - 2 * DT_MDL, 3.4, -1.0, 9)))
     assert gap.passing_id == 7 and gap.leaving
+
+  def vision_after_handoff(self, gap, passed_offset, lead_std=1.5, lead_offset=0.0, d_rel=70.0, tracks=(), left_line=-1.6, n=1):
+    # the change starts behind radar track 7 at FAR; the model has since handed its lead to one only it sees
+    path = path_for(passed_offset, FAR)
+    y_rel = on_path(d_rel, path) - lead_offset
+    radar_state = get_radar_state(radar=False, track_id=-1, d_rel=d_rel, y_rel=y_rel)
+    model = get_model(path=path, lead_std=lead_std, left_y=left_line, right_y=left_line + 3.36)
+    step(gap, model=model, radar_state=radar_state, tracks=get_tracks((FAR, 0.0, -1.0, 7), *tracks), n=n)
+    return released(gap)[0]
+
+  def start_behind_track_7(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=0.0), radar_state=get_radar_state(d_rel=FAR), tracks=get_tracks((FAR, 0.0, -1.0, 7)))
+    return gap
+
+  def test_vision_lead_needs_the_car_being_passed_off_the_path(self):
+    gap = self.start_behind_track_7()
+    assert not self.vision_after_handoff(gap, LEAD_OFF_PATH - 0.1)
+    assert self.vision_after_handoff(gap, LEAD_OFF_PATH + 0.1)
+    assert gap.leaving
+    # the path coming back to the car being passed
+    assert not self.vision_after_handoff(gap, LEAD_ON_PATH - 0.1)
+    assert not gap.leaving
+    # with the car being passed gone from the radar, nothing shows the car moving over, however clear the path
+    gap = self.start_behind_track_7()
+    path = path_for(1.5, FAR)
+    vision = get_radar_state(radar=False, track_id=-1, d_rel=70.0, y_rel=on_path(70.0, path))
+    step(gap, model=get_model(path=path, lead_std=1.5), radar_state=vision, n=5)
+    assert released(gap) == [False, False] and not gap.leaving
+
+  def test_vision_lead_the_model_can_place_is_followed(self):
+    gap = self.start_behind_track_7()
+    assert not self.vision_after_handoff(gap, 1.5, lead_std=LEAD_UNPLACED_STD - 0.1)
+    assert self.vision_after_handoff(gap, 1.5, lead_std=LEAD_UNPLACED_STD + 0.1)
+    assert self.vision_after_handoff(gap, 1.5, lead_std=LEAD_UNPLACED_STD_HOLD + 0.05)
+    assert not self.vision_after_handoff(gap, 1.5, lead_std=LEAD_UNPLACED_STD_HOLD - 0.05)
+    assert not self.vision_after_handoff(gap, 1.5, lead_std=LEAD_UNPLACED_STD_HOLD + 0.05)
+
+  def test_vision_lead_needs_an_empty_radar_corridor(self):
+    path = path_for(1.5, FAR)
+    for v_rel in (-1.0, -V_EGO):  # moving or stationary
+      gap = self.start_behind_track_7()
+      assert not self.vision_after_handoff(gap, 1.5, tracks=[(40.0, on_path(40.0, path), v_rel, 3)])
+      # past the far end of radard's match window for a lead at 70 m
+      assert self.vision_after_handoff(gap, 1.5, tracks=[(95.0, on_path(95.0, path), v_rel, 3)])
+    # a return 0.7 m off the path keeps a held release but blocks a new one
+    gap = self.start_behind_track_7()
+    near_path = [(40.0, on_path(40.0, path) - 0.7, -1.0, 3)]
+    assert self.vision_after_handoff(gap, 1.5)
+    assert self.vision_after_handoff(gap, 1.5, tracks=near_path)
+    gap = self.start_behind_track_7()
+    assert not self.vision_after_handoff(gap, 1.5, tracks=near_path)
+
+  def test_vision_lead_on_the_target_side_is_followed(self):
+    gap = self.start_behind_track_7()
+    assert not self.vision_after_handoff(gap, 1.5, lead_offset=-(LEAD_ON_PATH + 0.1), n=5)
+
+  def test_vision_lead_is_followed_once_the_car_is_across(self):
+    # across the line, a lead on the path is in the lane moved into; the model's relabel can land the car for a frame
+    gap = self.start_behind_track_7()
+    for left_line in np.linspace(-1.6, LANDED_MARGIN - 0.1, 11):
+      assert self.vision_after_handoff(gap, 1.5, left_line=left_line)
+    landed, not_landed = LANDED_MARGIN + 0.1, LANDED_MARGIN - 0.1
+    assert self.vision_after_handoff(gap, 1.5, left_line=landed)
+    assert self.vision_after_handoff(gap, 1.5, left_line=not_landed)
+    assert self.vision_after_handoff(gap, 1.5, left_line=landed, n=LANDED_FRAMES - 1)
+    assert not self.vision_after_handoff(gap, 1.5, left_line=landed)
+    assert not self.vision_after_handoff(gap, 1.5, left_line=not_landed, n=5)
+    # a radar lead the path has left is still released
+    step(gap, model=get_model(path=path_for(1.5, FAR), left_y=landed, right_y=landed + 3.36), radar_state=get_radar_state(track_id=8, d_rel=FAR),
+         tracks=get_tracks((FAR, 0.0, -1.0, 7), (FAR, 0.0, -1.0, 8)))
+    assert released(gap)[0]
 
   def test_lead_two_is_judged_on_its_own(self):
     gap = LaneChangeGap(CP, DT_MDL)

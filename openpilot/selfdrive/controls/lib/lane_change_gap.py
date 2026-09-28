@@ -29,6 +29,8 @@ LEAD_SPEED_CONTINUITY = 1.5  # m/s
 LEAD_OFF_PATH = 1.0          # m, a lead this far off the planned path, toward the lane being left, is being passed
 LEAD_ON_PATH = 0.5           # m, and the same lead back this close is in front again; a radar lateral steps ~0.6 m
 LEAD_BESIDE = 2.0            # m, lateral toward the lane being left where the two cars' bodies stop overlapping
+LEAD_UNPLACED_STD = 1.0      # m, the model's lateral std on a lead it cannot put in a lane
+LEAD_UNPLACED_STD_HOLD = 0.8
 RESTORE_DECEL = 1.0          # m/s^2, the most braking a lead handed back to the MPC may ask for
 RESTORE_LAG = 1.0            # s, the car keeps its acceleration this long before a lead handed back slows it
 LANE_WIDTH_DEFAULT = 3.5     # m, target lane width when the model's lines are not confident
@@ -176,12 +178,15 @@ class LaneChangeGap:
   model's own estimate), the driver backs out (blinker off before the car is across, counter-steer,
   a gas or brake override) or after RELAX_TIME_MAX.
 
-  A slower lead cannot be passed at any finite gap. So while the target lane is clear and the driver
-  has not backed out, the MPC stops following a radar lead the planned path has left toward that lane.
-  A stopped lead is always followed, and so is any lead the MPC could not take back gently, until the
-  car being passed is beside the car. Far out the path can stray LEAD_OFF_PATH from a car still in the
-  lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict when
-  it is the same car, and is judged on its own otherwise.
+  A slower lead cannot be passed at any finite gap, and after the handoff the model's lead slides onto
+  the lane being left with no radar return behind it. So while the target lane is clear and the driver
+  has not backed out, the MPC stops following a radar lead the planned path has left toward that lane,
+  and, once the car being passed has gone off the path and until the car is across, a lead only the
+  model sees while the model cannot place it and radar sees nothing on the path. A stopped lead is
+  always followed, and so is any lead the MPC could not take back gently, until the car being passed is
+  beside the car. Far out the path can stray LEAD_OFF_PATH from a car still in the lane, but a far lead
+  rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict when it is the same car,
+  and is judged on its own otherwise.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -228,6 +233,7 @@ class LaneChangeGap:
     self.accelerate = False
     self.released = [False, False]
     self.released_leads = []
+    self.released_vision = [False, False]
 
   def remember(self, lead):
     self.lead_id = lead.radarTrackId if lead.radar else -1
@@ -357,16 +363,35 @@ class LaneChangeGap:
       return a.radarTrackId == b.radarTrackId
     return abs(a.dRel - b.dRel) < LEAD_CONTINUITY and abs(a.vRel - b.vRel) < LEAD_SPEED_CONTINUITY
 
-  def releases(self, lead, model, direction):
-    if not lead.present or not lead.radar or lead.vLead < TRACK_MOVING_SPEED:
-      return False
-    return path_offset(model, lead.dRel, lead.yRel, direction) > (LEAD_ON_PATH if self.was_released(lead) else LEAD_OFF_PATH)
+  @staticmethod
+  def corridor_clear(model, direction, radar_tracks, d_rel, offset_min):
+    # radar sees nothing on the planned path from beside the car to the far end of radard's own match window
+    d_max = d_rel + max(0.25 * d_rel, 5.0)
+    return all(abs(path_offset(model, pt.dRel, pt.yRel, direction)) >= offset_min
+               for pt in radar_tracks.points if TRACK_MIN_DISTANCE < pt.dRel < d_max)
 
-  def release_leads(self, radar_state, model, direction, passing, v_ego, a_ego, t_follow, stop_distance):
+  def releases(self, i, lead, model, direction, radar_tracks):
+    if not lead.present or lead.vLead < TRACK_MOVING_SPEED:
+      return False
+    offset = path_offset(model, lead.dRel, lead.yRel, direction)
+    if lead.radar:
+      return offset > (LEAD_ON_PATH if self.was_released(lead) else LEAD_OFF_PATH)
+    # a lead only the model sees: released once the car being passed has gone off the path, while the model cannot
+    # place it and radar sees nothing on the path out past it. It is the model's slot rather than a tracked car, so
+    # the slot's release holds while its lead stays unplaced. Once the car is across, a lead on the path is in the
+    # lane moved into
+    model_lead = model.leadsV3[i] if len(model.leadsV3) > i else None
+    if model_lead is None or len(model_lead.yStd) == 0 or not self.leaving or self.across or offset < -LEAD_ON_PATH:
+      return False
+    held = self.released_vision[i]
+    return model_lead.yStd[0] >= (LEAD_UNPLACED_STD_HOLD if held else LEAD_UNPLACED_STD) and \
+           self.corridor_clear(model, direction, radar_tracks, lead.dRel, LEAD_ON_PATH if held else LEAD_OFF_PATH)
+
+  def release_leads(self, radar_state, model, direction, radar_tracks, passing, v_ego, a_ego, t_follow, stop_distance):
     leads = (radar_state.leadOne, radar_state.leadTwo)
-    one = self.releases(leads[0], model, direction)
+    one = self.releases(0, leads[0], model, direction, radar_tracks)
     # the same car in both slots gets one verdict
-    two = one if self.same_car(*leads) else self.releases(leads[1], model, direction)
+    two = one if self.same_car(*leads) else self.releases(1, leads[1], model, direction, radar_tracks)
     beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) for lead in leads]
     close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
              for candidate, b, lead in zip((one, two), beside, leads, strict=True)]
@@ -449,13 +474,14 @@ class LaneChangeGap:
       # the target lane gate and the back-out cues but not the headroom: a car reaching its set speed mid pass is not
       # handed back the car it is passing
       if self.enabled and clear and not self.backed_out:
-        released = self.release_leads(radar_state, model, direction, passing, v_ego, CS.aEgo, t_follow, stop_distance)
+        released = self.release_leads(radar_state, model, direction, radar_tracks, passing, v_ego, CS.aEgo, t_follow, stop_distance)
       self.accelerate = self.enabled and clear and not self.backed_out and v_cruise - v_ego > MIN_HEADROOM
       if self.accelerate and self.armed:
         self.t_follow_pad = min(LANE_CHANGE_T_FOLLOW - t_follow, 0.0)
     self.released = released
     self.released_leads = [(ld.radar, ld.radarTrackId, ld.dRel, ld.vRel)
                            for ld, r in zip((radar_state.leadOne, radar_state.leadTwo), released, strict=True) if r]
+    self.released_vision = [r and not ld.radar for ld, r in zip((radar_state.leadOne, radar_state.leadTwo), released, strict=True)]
     return self.t_follow_pad
 
   def followed(self, radar_state):
