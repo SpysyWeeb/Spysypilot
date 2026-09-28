@@ -8,7 +8,7 @@ from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, Lan
                                                               LANDED_FRAMES, LANDED_MARGIN, LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BESIDE,
                                                               LEAD_BRAKING, LEAD_CONTINUITY, LEAD_DANGER_FACTOR, LEAD_OFF_PATH, LEAD_ON_PATH,
                                                               LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LEAD_UNPLACED_STD,
-                                                              LEAD_UNPLACED_STD_HOLD, LINE_HOLD, MIN_HEADROOM,
+                                                              LEAD_UNPLACED_STD_HOLD, LINE_HOLD, LINE_OFFSET_MIN, MIN_HEADROOM,
                                                               RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN, TRACK_MIN_DISTANCE, TRACK_MOVING_SPEED,
                                                               too_close)
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -1125,34 +1125,44 @@ class TestLeadRelease:
     step(gap, model=model, radar_state=radar_state, n=10)
     assert released(gap) == [True, True]
 
-  def cross_the_line(self, gap, radar_state, tracks):
-    # a left change: the car's left line walks in from 1.6 m to just short of landing, and the model that lands it
-    for left_line in np.linspace(-1.6, LANDED_MARGIN - 0.1, 11):
-      step(gap, model=get_model(path=0.0, left_y=left_line, right_y=left_line + 3.36), radar_state=radar_state, tracks=tracks)
-    assert not gap.landed(LaneChangeDirection.left)
-    return get_model(path=0.0, left_y=LANDED_MARGIN + 0.1, right_y=LANDED_MARGIN + 0.1 + 3.36)
+  @staticmethod
+  def lines_at(direction, line):
+    # the car's lines with the one on the change side at line, right positive
+    if direction == LaneChangeDirection.left:
+      return get_model(path=0.0, left_y=line, right_y=line + 3.36)
+    return change_right(path=0.0, left_y=line - 3.36, right_y=line)
+
+  def cross_the_line(self, gap, direction, CS, radar_state, tracks):
+    # the car's line on the change side walks in from 1.6 m to just short of landing; returns the model that lands it
+    side = -1.0 if direction == LaneChangeDirection.left else 1.0
+    for line in np.linspace(1.6, -(LANDED_MARGIN - 0.1), 11):
+      step(gap, model=self.lines_at(direction, side * line), CS=CS, radar_state=radar_state, tracks=tracks)
+    assert not gap.landed(direction)
+    return self.lines_at(direction, -side * (LANDED_MARGIN + 0.1))
 
   def test_blinker_off_once_the_car_is_across_finishes_the_change(self):
-    # the car being passed beside the car, released however close
-    beside = get_radar_state(d_rel=20.0, y_rel=-(LEAD_BESIDE + 0.5), lead_two='same')
-    tracks = get_tracks((20.0, -(LEAD_BESIDE + 0.5), -1.0, 7))
     blinker_off = get_car_state(left_blinker=False)
-    gap = LaneChangeGap(CP, DT_MDL)
-    landed = self.cross_the_line(gap, beside, tracks)
-    step(gap, model=landed, radar_state=beside, tracks=tracks, n=LANDED_FRAMES)
-    assert gap.landed(LaneChangeDirection.left) and released(gap) == [True, True]
-    step(gap, model=landed, CS=blinker_off, radar_state=beside, tracks=tracks, n=10)
-    assert released(gap) == [True, True] and not gap.backed_out and gap.accelerate
-    # counter-steer still backs out
-    step(gap, model=landed, CS=get_car_state(left_blinker=False, steeringPressed=True, steeringTorque=-50.0), radar_state=beside, tracks=tracks)
-    assert released(gap) == [False, False] and gap.backed_out
-    # landed for fewer frames than the model's relabel can last, the same blinker off backs out
-    gap = LaneChangeGap(CP, DT_MDL)
-    landed = self.cross_the_line(gap, beside, tracks)
-    step(gap, model=landed, radar_state=beside, tracks=tracks, n=LANDED_FRAMES - 2)
-    assert released(gap) == [True, True]
-    step(gap, model=landed, CS=blinker_off, radar_state=beside, tracks=tracks)
-    assert gap.landed(LaneChangeDirection.left) and released(gap) == [False, False] and gap.backed_out
+    for direction, blinker_on, counter_steer in ((LaneChangeDirection.left, get_car_state(), -50.0), (LaneChangeDirection.right, right_blinker(), 50.0)):
+      # the car being passed beside the car, released however close
+      y_rel = -(LEAD_BESIDE + 0.5) if direction == LaneChangeDirection.left else LEAD_BESIDE + 0.5
+      beside = get_radar_state(d_rel=20.0, y_rel=y_rel, lead_two='same')
+      tracks = get_tracks((20.0, y_rel, -1.0, 7))
+      gap = LaneChangeGap(CP, DT_MDL)
+      landed = self.cross_the_line(gap, direction, blinker_on, beside, tracks)
+      step(gap, model=landed, CS=blinker_on, radar_state=beside, tracks=tracks, n=LANDED_FRAMES)
+      assert gap.landed(direction) and released(gap) == [True, True]
+      step(gap, model=landed, CS=blinker_off, radar_state=beside, tracks=tracks, n=10)
+      assert released(gap) == [True, True] and not gap.backed_out and gap.accelerate
+      # counter-steer still backs out
+      step(gap, model=landed, CS=get_car_state(left_blinker=False, steeringPressed=True, steeringTorque=counter_steer), radar_state=beside, tracks=tracks)
+      assert released(gap) == [False, False] and gap.backed_out
+      # landed for fewer frames than the model's relabel can last, the same blinker off backs out
+      gap = LaneChangeGap(CP, DT_MDL)
+      landed = self.cross_the_line(gap, direction, blinker_on, beside, tracks)
+      step(gap, model=landed, CS=blinker_on, radar_state=beside, tracks=tracks, n=LANDED_FRAMES - 2)
+      assert released(gap) == [True, True]
+      step(gap, model=landed, CS=blinker_off, radar_state=beside, tracks=tracks)
+      assert gap.landed(direction) and released(gap) == [False, False] and gap.backed_out
 
   def test_blocked_target_lane_restores_while_blocked(self):
     model = get_model(path=path_for(1.5, FAR))
@@ -1289,6 +1299,16 @@ class TestCrossedLine:
     self.run(gap, 1.0, self.DOUBTED, self.PLACED)
     lo, hi = LaneLines(change_right(probs=self.DOUBTED), gap.crossed, gap.lane_width).band(LaneChangeDirection.right, 0.0)
     assert np.isclose(hi - lo, 3.0) and np.isclose(hi, -1.0)
+
+  def test_near_edge_stays_off_the_cars_path(self):
+    # with the car 0.2 m from the line, a return just past it is on the car's own path, and the band starts LINE_OFFSET_MIN
+    # out from the car
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    for right_line in np.arange(1.2, 0.2, -0.1):
+      self.run(gap, right_line, self.DOUBTED, self.PLACED)
+    assert not self.run(gap, 0.2, self.DOUBTED, self.PLACED, tracks=[(30.0, -(LINE_OFFSET_MIN - 0.1), -4.9)])
+    assert self.run(gap, 0.2, self.DOUBTED, self.PLACED, tracks=[(30.0, -(LINE_OFFSET_MIN + 0.1), -4.9)])
 
   def test_far_edge_stays_one_lane_past_the_crossed_line(self):
     # with the car 0.2 m from the line, the near edge is kept off its path but the far edge does not move out
