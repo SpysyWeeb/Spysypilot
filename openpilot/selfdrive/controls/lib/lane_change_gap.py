@@ -182,11 +182,11 @@ class LaneChangeGap:
   the lane being left with no radar return behind it. So while the target lane is clear and the driver
   has not backed out, the MPC stops following a radar lead the planned path has left toward that lane,
   and, once the car being passed has gone off the path and until the car is across, a lead only the
-  model sees while the model cannot place it and radar sees nothing on the path. A stopped lead is
-  always followed, and so is any lead the MPC could not take back gently, until the car being passed is
-  beside the car. Far out the path can stray LEAD_OFF_PATH from a car still in the lane, but a far lead
-  rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict when it is the same car,
-  and is judged on its own otherwise.
+  model sees while it is off the path too, the model cannot place it and radar sees nothing on the
+  path. A stopped lead is always followed, and so is any lead the MPC could not take back gently, until
+  the car being passed is beside the car. Far out the path can stray LEAD_OFF_PATH from a car still in
+  the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict
+  when it is the same car, unless it sits on the target side, and is judged on its own otherwise.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -377,21 +377,27 @@ class LaneChangeGap:
     if lead.radar:
       return offset > (LEAD_ON_PATH if self.was_released(lead) else LEAD_OFF_PATH)
     # a lead only the model sees: released once the car being passed has gone off the path, while the model cannot
-    # place it and radar sees nothing on the path out past it. It is the model's slot rather than a tracked car, so
-    # the slot's release holds while its lead stays unplaced. Once the car is across, a lead on the path is in the
-    # lane moved into
+    # place it, radar sees nothing on the path out past it and it is off the path itself, as a radar lead is. The
+    # model's range on such a lead can run 5 to 15 m long, so one on the path may be the car ahead. It is the model's
+    # slot rather than a tracked car, so the slot's release holds while its lead stays unplaced and off the path. Once
+    # the car is across, the model's lead is the one in the lane moved into
     model_lead = model.leadsV3[i] if len(model.leadsV3) > i else None
-    if model_lead is None or len(model_lead.yStd) == 0 or not self.leaving or self.across or offset < -LEAD_ON_PATH:
+    if model_lead is None or len(model_lead.yStd) == 0 or not self.leaving or self.across:
       return False
     held = self.released_vision[i]
-    return model_lead.yStd[0] >= (LEAD_UNPLACED_STD_HOLD if held else LEAD_UNPLACED_STD) and \
+    return offset > (LEAD_ON_PATH if held else LEAD_OFF_PATH) and \
+           model_lead.yStd[0] >= (LEAD_UNPLACED_STD_HOLD if held else LEAD_UNPLACED_STD) and \
            self.corridor_clear(model, direction, radar_tracks, lead.dRel, LEAD_ON_PATH if held else LEAD_OFF_PATH)
 
   def release_leads(self, radar_state, model, direction, radar_tracks, passing, v_ego, a_ego, t_follow, stop_distance):
     leads = (radar_state.leadOne, radar_state.leadTwo)
     one = self.releases(0, leads[0], model, direction, radar_tracks)
-    # the same car in both slots gets one verdict
-    two = one if self.same_car(*leads) else self.releases(1, leads[1], model, direction, radar_tracks)
+    # the same car in both slots gets one verdict, unless the second one sits on the target side: matched on range and
+    # speed alone, it can be another car, or the model placing the same one in the lane moved into
+    if self.same_car(*leads):
+      two = one and path_offset(model, leads[1].dRel, leads[1].yRel, direction) >= -LEAD_ON_PATH
+    else:
+      two = self.releases(1, leads[1], model, direction, radar_tracks)
     beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) for lead in leads]
     close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
              for candidate, b, lead in zip((one, two), beside, leads, strict=True)]

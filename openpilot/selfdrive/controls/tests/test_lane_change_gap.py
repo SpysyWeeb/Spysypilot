@@ -572,12 +572,16 @@ class TestLeadRelease:
     step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - 2 * DT_MDL, 3.4, -1.0, 9)))
     assert gap.passing_id == 7 and gap.leaving
 
-  def vision_after_handoff(self, gap, passed_offset, lead_std=1.5, lead_offset=0.0, d_rel=70.0, tracks=(), left_line=-1.6, n=1):
-    # the change starts behind radar track 7 at FAR; the model has since handed its lead to one only it sees
+  def vision_after_handoff(self, gap, passed_offset, lead_std=1.5, lead_offset=LEAD_OFF_PATH + 0.5, d_rel=70.0, tracks=(), left_line=-1.6, n=1,
+                           lead_two_offset=None):
+    # the change starts behind radar track 7 at FAR; the model has since handed its lead to one only it sees, lead_offset
+    # meters off the path toward the lane being left, and optionally a second one a meter further at the same speed
     path = path_for(passed_offset, FAR)
-    y_rel = on_path(d_rel, path) - lead_offset
-    radar_state = get_radar_state(radar=False, track_id=-1, d_rel=d_rel, y_rel=y_rel)
-    model = get_model(path=path, lead_std=lead_std, left_y=left_line, right_y=left_line + 3.36)
+    lead_two = None
+    if lead_two_offset is not None:
+      lead_two = {'radar': False, 'track_id': -1, 'd_rel': d_rel + 1.0, 'y_rel': on_path(d_rel + 1.0, path) - lead_two_offset}
+    radar_state = get_radar_state(radar=False, track_id=-1, d_rel=d_rel, y_rel=on_path(d_rel, path) - lead_offset, lead_two=lead_two)
+    model = get_model(path=path, lead_std=lead_std, lead_two_std=None if lead_two is None else lead_std, left_y=left_line, right_y=left_line + 3.36)
     step(gap, model=model, radar_state=radar_state, tracks=get_tracks((FAR, 0.0, -1.0, 7), *tracks), n=n)
     return released(gap)[0]
 
@@ -597,7 +601,7 @@ class TestLeadRelease:
     # with the car being passed gone from the radar, nothing shows the car moving over, however clear the path
     gap = self.start_behind_track_7()
     path = path_for(1.5, FAR)
-    vision = get_radar_state(radar=False, track_id=-1, d_rel=70.0, y_rel=on_path(70.0, path))
+    vision = get_radar_state(radar=False, track_id=-1, d_rel=70.0, y_rel=on_path(70.0, path) - (LEAD_OFF_PATH + 0.5))
     step(gap, model=get_model(path=path, lead_std=1.5), radar_state=vision, n=5)
     assert released(gap) == [False, False] and not gap.leaving
 
@@ -624,9 +628,53 @@ class TestLeadRelease:
     gap = self.start_behind_track_7()
     assert not self.vision_after_handoff(gap, 1.5, tracks=near_path)
 
+  def test_vision_lead_on_the_path_is_followed(self):
+    # the model's range on a lead only it sees can run 5 to 15 m long, so one on the path may be the car ahead: it is
+    # released only off the path, and held there like a radar lead
+    gap = self.start_behind_track_7()
+    assert not self.vision_after_handoff(gap, 1.5, lead_offset=0.0, n=5)
+    assert not self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_OFF_PATH - 0.1)
+    assert self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_OFF_PATH + 0.1)
+    assert self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_ON_PATH + 0.1)
+    assert not self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_ON_PATH - 0.1)
+    assert not self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_ON_PATH + 0.1)
+
   def test_vision_lead_on_the_target_side_is_followed(self):
     gap = self.start_behind_track_7()
     assert not self.vision_after_handoff(gap, 1.5, lead_offset=-(LEAD_ON_PATH + 0.1), n=5)
+
+  def test_target_lane_car_on_a_bend_is_followed(self):
+    # camera check case 27: a left change on a road bending left, where the path runs a lane over through a car only
+    # the model sees, 7.8 m left of the car's heading and pulling away
+    d_rel = 38.3
+    x = d_rel + RADAR_TO_CAMERA
+    curvature = -2 * (7.8 - 3.5) / x**2
+    path = -3.5 * 30.0 / x
+    passed = -curvature * (FAR + RADAR_TO_CAMERA)**2 / 2
+    tracks = get_tracks((FAR, passed, -1.0, 7))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(curvature=curvature, path=0.0), radar_state=get_radar_state(d_rel=FAR, y_rel=passed), tracks=tracks)
+    model = get_model(curvature=curvature, path=path, lead_std=1.82)
+    step(gap, model=model, radar_state=get_radar_state(radar=False, track_id=-1, d_rel=d_rel, v_rel=0.5, y_rel=7.8), tracks=tracks, n=5)
+    assert gap.leaving and released(gap) == [False, False]
+    # the same lead off the path toward the lane being left is a car in that lane
+    step(gap, model=model, radar_state=get_radar_state(radar=False, track_id=-1, d_rel=d_rel, v_rel=0.5, y_rel=7.8 - 1.5), tracks=tracks)
+    assert released(gap)[0]
+
+  def test_lead_two_on_the_target_side_is_followed(self):
+    # the same car in both slots by range and speed shares a verdict, but not on the target side, where it can be a
+    # car in the lane moved into or the model placing the same one there
+    gap = self.start_behind_track_7()
+    self.vision_after_handoff(gap, 1.5, lead_two_offset=1.5)
+    assert released(gap) == [True, True]
+    self.vision_after_handoff(gap, 1.5, lead_two_offset=-(LEAD_ON_PATH + 0.1))
+    assert released(gap) == [True, False]
+    # a radar lead the path has left, and a model-only one at its range and speed in the target lane
+    path = path_for(1.5, FAR)
+    lead_two = {'radar': False, 'track_id': -1, 'd_rel': FAR + 0.5, 'y_rel': on_path(FAR + 0.5, path) + 2.0}
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path, lead_std=1.5, lead_two_std=1.5), radar_state=get_radar_state(d_rel=FAR, lead_two=lead_two))
+    assert released(gap) == [True, False]
 
   def test_vision_lead_is_followed_once_the_car_is_across(self):
     # across the line, a lead on the path is in the lane moved into; the model's relabel can land the car for a frame
