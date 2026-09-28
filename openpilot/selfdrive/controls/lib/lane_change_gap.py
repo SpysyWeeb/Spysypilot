@@ -202,7 +202,8 @@ class LaneChangeGap:
   the MPC targets the relaxed distance. The relaxation ends for the rest of the change when the model
   hands the lead over, the lead brakes (its filtered deceleration, a drop in its raw speed or the
   model's own estimate), the driver backs out (blinker off before the car is across, counter-steer,
-  a gas or brake override), the floor below hands a lead back, or after RELAX_TIME_MAX.
+  a gas or brake override), the floor below latches after a release in the change, or after
+  RELAX_TIME_MAX.
 
   A slower lead cannot be passed at any finite gap, and after the handoff the model's lead slides onto
   the lane being left with no radar return behind it. So while the target lane is clear and the driver
@@ -213,15 +214,15 @@ class LaneChangeGap:
   followed, and so is one the floor, too_close(), finds too close: one that would need more than
   RESTORE_DECEL of steady braking to stop closing before the follow distance, or is inside that
   distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or the car being
-  passed, has been too close for CLOSE_FRAMES running, every lead is followed at the full gap until
-  the car being passed is beside the car. A radar lead beside the car is past the floor and the latch
-  while the model's lead is there too and the plan keeps as clear of it. Far out the path can stray
-  LEAD_OFF_PATH from a car still in the lane, but a far lead rarely binds and the same floor bounds
-  it. leadTwo gets leadOne's verdict when radard gives both slots the same radar track, is judged on
-  its own otherwise, and is never released while braking. A release belongs to the car rather than
-  the sensor: where radard swaps a released car's radar track for the model's reading of the same
-  car, the release holds, and the car is judged on the radar's last reading of it while radar still
-  tracks it.
+  passed, has been too close for CLOSE_FRAMES running, every lead is followed until the car being
+  passed is beside the car, at the full gap if anything has been released in the change. A radar
+  lead beside the car is past the floor and the latch while the model's lead is there too and the
+  plan keeps as clear of it. Far out the path can stray LEAD_OFF_PATH from a car still in the lane,
+  but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict when
+  radard gives both slots the same radar track, is judged on its own otherwise, and is never
+  released while braking. A release belongs to the car rather than the sensor: where radard swaps a
+  released car's radar track for the model's reading of the same car, the release holds, and the
+  car is judged on the radar's last reading of it while radar still tracks it.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -252,6 +253,7 @@ class LaneChangeGap:
     self.beside_frames = 0
     self.closing = False
     self.close_frames = 0
+    self.released_in_change = False
     self.landed_frames = 0
     self.across = False
     self.lines_seen = [None, None]
@@ -460,9 +462,12 @@ class LaneChangeGap:
                     too_close(passing.dRel, passing.vRel, v_ego + passing.vRel, a_ego, t_follow, stop_distance)
     self.close_frames = self.close_frames + 1 if any(close) or passing_close else 0
     if self.close_frames >= CLOSE_FRAMES:
-      # followed at the full gap until the car being passed is beside the car
+      # followed until the car being passed is beside the car. After a release the car has been gaining on the leads handed
+      # back, and a relaxed gap would let it close further before braking, so the relaxation ends; with nothing released
+      # the relaxation has run as it would without the release
       self.closing = True
-      self.armed = False
+      if self.released_in_change:
+        self.armed = False
     released = []
     for k, (candidate, lead) in enumerate(zip((one, two), leads, strict=True)):
       # the debounce keeps the car released last frame, not whichever car now fills its slot
@@ -493,6 +498,7 @@ class LaneChangeGap:
       self.beside_frames = 0
       self.closing = False
       self.close_frames = 0
+      self.released_in_change = False
       self.landed_frames = 0
       self.across = False
     elif starting and self.armed:
@@ -549,6 +555,7 @@ class LaneChangeGap:
       if self.accelerate and self.armed:
         self.t_follow_pad = min(LANE_CHANGE_T_FOLLOW - t_follow, 0.0)
     self.released = released
+    self.released_in_change = self.released_in_change or any(released)
     self.released_leads = [(ld.radar, ld.radarTrackId, ld.dRel, ld.yRel, ld.vRel) if r else None for ld, r in zip(leads, released, strict=True)]
     return self.t_follow_pad
 

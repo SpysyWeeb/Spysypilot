@@ -10,7 +10,7 @@ from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.simple_kalman import KF1D
 from openpilot.selfdrive.controls.lib import longitudinal_planner
-from openpilot.selfdrive.controls.lib.lane_change_gap import CLOSE_FRAMES, LEAD_BRAKING
+from openpilot.selfdrive.controls.lib.lane_change_gap import CLOSE_FRAMES, LEAD_BRAKING, LaneChangeGap
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_stopped_equivalence_factor, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
@@ -265,13 +265,16 @@ class TestLaneChangeManeuvers:
     assert design['min_gap'] >= today['min_gap'] - 5.5
     assert design['min_a'] >= today['min_a'] - 0.6
 
-  def test_much_slower_car_on_the_highway_is_released_beside(self):
+  def test_much_slower_car_on_the_highway_is_released_beside(self, monkeypatch):
     today = summary(LaneChangePlant(False, 29.0, 22.0, 45.0, v_cruise=31.3).run())
     design = summary(LaneChangePlant(True, 29.0, 22.0, 45.0, v_cruise=31.3).run())
     assert design['first_release'] >= 2.4
-    before = design['t'] < design['first_release']
-    assert np.allclose(design['a_target'][before], today['a_target'][before], atol=0.05)
     assert design['min_gap'] >= today['min_gap'] - 0.5
+    # the floor latches from the start, but with nothing released the relaxation runs as it would without the release
+    monkeypatch.setattr(LaneChangeGap, 'release_leads', lambda *args: [False, False])
+    relaxation = summary(LaneChangePlant(True, 29.0, 22.0, 45.0, v_cruise=31.3).run())
+    before = design['t'] < design['first_release']
+    assert np.allclose(design['a_target'][before], relaxation['a_target'][before], atol=0.05)
 
   def test_driver_aborts_after_the_release(self):
     # 40 m behind, the car being passed is still released when the driver switches the blinker off and steers back

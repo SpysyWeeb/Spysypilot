@@ -526,6 +526,24 @@ class TestLeadRelease:
     step(gap, model=get_model(path=0.0), radar_state=beside, tracks=get_tracks((20.0, -LEAD_BESIDE, -4.0, 7)))
     assert not gap.closing and released(gap)[0]
 
+  def test_floor_ends_the_relaxation_only_after_a_release(self):
+    # with nothing released the relaxation runs as it would without the release; once something has been released, the
+    # leads the floor hands back are followed at the full gap
+    model = get_model(path=path_for(2.0, FAR))
+    closing = get_radar_state(d_rel=45.0, v_rel=-4.0)
+    gap = LaneChangeGap(CP, DT_MDL)
+    assert np.isclose(step(gap, model=model, radar_state=closing, n=CLOSE_FRAMES + 5), PAD)
+    assert gap.closing and released(gap) == [False, False]
+    gap = LaneChangeGap(CP, DT_MDL)
+    assert np.isclose(step(gap, model=model, radar_state=get_radar_state(d_rel=FAR)), PAD)
+    assert released(gap)[0]
+    assert step(gap, model=model, radar_state=closing, n=CLOSE_FRAMES) == 0.0
+    assert gap.closing and not gap.armed
+    # the next change starts with nothing released
+    step(gap, model=get_model(state=LaneChangeState.off))
+    assert np.isclose(step(gap, model=model, radar_state=closing, n=CLOSE_FRAMES + 5), PAD)
+    assert gap.closing
+
   def test_car_being_passed_in_no_slot_is_watched_by_the_floor(self):
     # the model has moved its lead to a car far out that the path has left, while the car being passed, track 7, is in
     # neither slot and still overlaps the car
