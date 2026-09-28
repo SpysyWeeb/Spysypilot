@@ -12,6 +12,7 @@ from opendbc.car.toyota.values import ToyotaFlags
 from opendbc.car.volkswagen.values import VolkswagenFlags
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_DANGER_FACTOR
 from openpilot.selfdrive.controls.radard import RADAR_TO_CAMERA
 
 LaneChangeState = log.LaneChangeState
@@ -25,6 +26,11 @@ LEAD_SLOWING = 0.5           # m/s, a lead this much below its speed since the c
 LEAD_SPEED_FRAMES = 3        # a radar speed glitch lasts one frame
 LEAD_CONTINUITY = 2.0        # m, the same car across a track id change, or frame to frame for a vision lead
 LEAD_SPEED_CONTINUITY = 1.5  # m/s
+LEAD_OFF_PATH = 1.0          # m, a lead this far off the planned path, toward the lane being left, is being passed
+LEAD_ON_PATH = 0.5           # m, and the same lead back this close is in front again; a radar lateral steps ~0.6 m
+LEAD_BESIDE = 2.0            # m, lateral toward the lane being left where the two cars' bodies stop overlapping
+RESTORE_DECEL = 1.0          # m/s^2, the most braking a lead handed back to the MPC may ask for
+RESTORE_LAG = 1.0            # s, the car keeps its acceleration this long before a lead handed back slows it
 LANE_WIDTH_DEFAULT = 3.5     # m, target lane width when the model's lines are not confident
 LANE_WIDTH_MIN = 2.7
 LANE_WIDTH_MAX = 4.5
@@ -33,6 +39,7 @@ LINE_OFFSET_MAX = 2.5
 LINE_STD_MAX = 0.3           # m, a line placed this well marks the lane even while the model doubts it is the car's
 LINE_HOLD = 1.0              # s, the model places no line for a moment while it relabels them
 LANDED_MARGIN = 0.5          # m, the car's center past the line it crossed
+LANDED_FRAMES = 3            # the model's relabel can land the car for a frame
 ROADSIDE_MARGIN = 0.9        # m, a stopped car in the target lane shows at least half its width inside the outer line
 TRACK_MIN_DISTANCE = 2.0     # m, closer returns are beside the car, which the blind spot monitor covers
 TRACK_MOVING_SPEED = 2.0     # m/s absolute, below this a return is clutter, a stopped car or oncoming traffic
@@ -55,6 +62,14 @@ BSM_FLAGS = {
 def side_left(direction):
   # +1 when the lane being left is on the radar's positive (left) side, a change to the right
   return 1.0 if direction == LaneChangeDirection.right else -1.0
+
+
+def path_offset(model, d_rel, y_rel, direction):
+  # how far a radar frame point sits from the planned path at its own distance, toward the lane being left; a bend
+  # and the car's yaw move the path and a car in the lane together
+  if len(model.position.x) == 0:
+    return 0.0
+  return side_left(direction) * (y_rel + float(np.interp(d_rel + RADAR_TO_CAMERA, model.position.x, model.position.y)))
 
 
 class LaneLines:
@@ -137,8 +152,20 @@ def target_lane_blocked(direction, lines, radar_tracks, v_ego, t_follow, stop_di
   return False
 
 
+def too_close(d_rel, v_rel, v_lead, a_ego, t_follow, stop_distance):
+  # whether the MPC, handed this car once the car has kept its acceleration for RESTORE_LAG, would brake harder than
+  # RESTORE_DECEL to fall back to its own follow distance behind it. A car already inside that distance asks for little
+  # while it holds or opens the gap, so there it counts only while closing or inside the MPC's danger distance
+  gap = t_follow * max(v_lead, 0.0) + stop_distance
+  closing = -v_rel + a_ego * RESTORE_LAG
+  room = d_rel - gap - max(closing - v_rel, 0.0) / 2 * RESTORE_LAG
+  if room <= 0.0:
+    return closing > 0.0 or d_rel < LEAD_DANGER_FACTOR * gap
+  return max(closing, 0.0)**2 / (2 * room) > RESTORE_DECEL
+
+
 class LaneChangeGap:
-  """Owns the follow gap while a lane change starts.
+  """Owns the leads the MPC follows while a lane change starts.
 
   The model keeps the lead in the lane being left for about 1.5 s after the change begins, so the
   planner brakes behind a car the driver is pulling out to pass. While the change is starting, that
@@ -146,8 +173,21 @@ class LaneChangeGap:
   MPC's time gap to it is relaxed to LANE_CHANGE_T_FOLLOW so the cruise acceleration takes over, and
   the MPC targets the relaxed distance. The relaxation ends for the rest of the change when the model
   hands the lead over, the lead brakes (its filtered deceleration, a drop in its raw speed or the
-  model's own estimate), the driver backs out (blinker off, counter-steer, a gas or brake override)
-  or after RELAX_TIME_MAX.
+  model's own estimate), the driver backs out (blinker off before the car is across, counter-steer,
+  a gas or brake override) or after RELAX_TIME_MAX.
+
+  A slower lead cannot be passed at any finite gap. So while the target lane is clear and the driver
+  has not backed out, the MPC stops following a radar lead the planned path has left toward that lane.
+  A stopped lead is always followed, and so is any lead the MPC could not take back gently, until the
+  car being passed is beside the car. Far out the path can stray LEAD_OFF_PATH from a car still in the
+  lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict when
+  it is the same car, and is judged on its own otherwise.
+
+  The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
+  plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
+  radarState itself, and hasLead with it, stays as radard published it. A planner reset (a gas or
+  brake override) ends the release for the rest of the change. In experimental mode the model's own
+  acceleration stays among the planner's candidates, and a release does not lift it.
   """
 
   def __init__(self, CP, dt=DT_MDL):
@@ -161,6 +201,16 @@ class LaneChangeGap:
     self.lead_v_rel = 0.0
     self.lead_v_max = 0.0
     self.lead_speeds = deque(maxlen=LEAD_SPEED_FRAMES)
+    self.passing_id = -1
+    self.passing_distance = 0.0
+    self.passing_y_rel = 0.0
+    self.passing_v_rel = 0.0
+    self.leaving = False
+    self.moved_over = False
+    self.closing = False
+    self.close_frames = 0
+    self.landed_frames = 0
+    self.across = False
     self.lines_seen = [None, None]
     self.lines_age = [np.inf, np.inf]
     self.lane_width = None
@@ -176,6 +226,8 @@ class LaneChangeGap:
     self.blocked_timer = 0.0
     self.t_follow_pad = 0.0
     self.accelerate = False
+    self.released = [False, False]
+    self.released_leads = []
 
   def remember(self, lead):
     self.lead_id = lead.radarTrackId if lead.radar else -1
@@ -194,6 +246,24 @@ class LaneChangeGap:
     return abs(lead.dRel - (self.lead_distance + self.lead_v_rel * self.dt)) < LEAD_CONTINUITY and \
            abs(lead.vRel - self.lead_v_rel) < LEAD_SPEED_CONTINUITY
 
+  def follow_passing(self, radar_tracks):
+    # the car the change started behind, by its radar track or one continuing it, whether or not radard still
+    # calls it the lead; None while the radar does not see it
+    if self.passing_id < 0:
+      return None
+    expected = self.passing_distance + self.passing_v_rel * self.dt
+    track = next((pt for pt in radar_tracks.points if pt.trackId == self.passing_id), None)
+    if track is None:
+      # a target lane car can match its range and speed, so a new track continues it only in the same place
+      near = [pt for pt in radar_tracks.points if abs(pt.dRel - expected) < LEAD_CONTINUITY and
+              abs(pt.yRel - self.passing_y_rel) < LEAD_CONTINUITY and abs(pt.vRel - self.passing_v_rel) < LEAD_SPEED_CONTINUITY]
+      track = min(near, key=lambda pt: abs(pt.dRel - expected)) if near else None
+    if track is None:
+      self.passing_distance = expected
+      return None
+    self.passing_id, self.passing_distance, self.passing_y_rel, self.passing_v_rel = track.trackId, track.dRel, track.yRel, track.vRel
+    return track
+
   def lead_braking(self, lead, model):
     # the radar's filtered deceleration lags a hard brake by about half a second; the raw speed and the
     # model's estimate of the lead's acceleration both read it earlier. The speed history belongs to the
@@ -203,11 +273,19 @@ class LaneChangeGap:
     slowing = self.armed and len(self.lead_speeds) == LEAD_SPEED_FRAMES and max(self.lead_speeds) < self.lead_v_max - LEAD_SLOWING
     return (lead.present and (lead.aLeadK < LEAD_BRAKING or slowing)) or model_braking
 
+  def released_lead_braking(self, radar_state, model):
+    # a released second lead that brakes is followed again, as the first one is
+    lead = radar_state.leadTwo
+    model_lead = model.leadsV3[1] if len(model.leadsV3) > 1 else None
+    model_braking = model_lead is not None and model_lead.prob > 0.5 and len(model_lead.a) > 0 and model_lead.a[0] < LEAD_BRAKING
+    return self.released[1] and ((lead.present and lead.aLeadK < LEAD_BRAKING) or model_braking)
+
   @staticmethod
-  def driver_backs_out(CS, direction):
+  def driver_backs_out(CS, direction, across):
+    # once the car is across, switching the blinker off finishes the change rather than abandoning it
     if direction == LaneChangeDirection.left:
-      return not CS.leftBlinker or (CS.steeringPressed and CS.steeringTorque < 0)
-    return not CS.rightBlinker or (CS.steeringPressed and CS.steeringTorque > 0)
+      return (not CS.leftBlinker and not across) or (CS.steeringPressed and CS.steeringTorque < 0)
+    return (not CS.rightBlinker and not across) or (CS.steeringPressed and CS.steeringTorque > 0)
 
   def follow_lines(self, model, direction, starting):
     # the car's own lines whenever the model places them, and through the change the line being crossed, followed
@@ -253,6 +331,60 @@ class LaneChangeGap:
       self.blocked_timer = max(self.blocked_timer - self.dt, 0.0)
     return self.blocked_timer <= 0.0
 
+  def beside(self, d_rel, y_rel, direction):
+    # the radar lateral toward the lane being left, measured from the crossed line's sweep out to that distance, so
+    # neither a bend nor the car's yaw mid change puts a car still in its lane beside the car
+    sweep = 0.0
+    if self.crossed is not None:
+      crossed_x, crossed_y = self.crossed
+      sweep = float(np.interp(d_rel + RADAR_TO_CAMERA, crossed_x, crossed_y)) - float(crossed_y[0])
+    return side_left(direction) * (y_rel - sweep) >= LEAD_BESIDE
+
+  def was_released(self, lead):
+    # the same car as one released last frame: its radar track, or its distance and speed across an id change
+    for radar, track_id, d_rel, v_rel in self.released_leads:
+      if lead.radar and radar and lead.radarTrackId == track_id:
+        return True
+      if abs(lead.dRel - (d_rel + v_rel * self.dt)) < LEAD_CONTINUITY and abs(lead.vRel - v_rel) < LEAD_SPEED_CONTINUITY:
+        return True
+    return False
+
+  @staticmethod
+  def same_car(a, b):
+    if not (a.present and b.present):
+      return False
+    if a.radar and b.radar:
+      return a.radarTrackId == b.radarTrackId
+    return abs(a.dRel - b.dRel) < LEAD_CONTINUITY and abs(a.vRel - b.vRel) < LEAD_SPEED_CONTINUITY
+
+  def releases(self, lead, model, direction):
+    if not lead.present or not lead.radar or lead.vLead < TRACK_MOVING_SPEED:
+      return False
+    return path_offset(model, lead.dRel, lead.yRel, direction) > (LEAD_ON_PATH if self.was_released(lead) else LEAD_OFF_PATH)
+
+  def release_leads(self, radar_state, model, direction, passing, v_ego, a_ego, t_follow, stop_distance):
+    leads = (radar_state.leadOne, radar_state.leadTwo)
+    one = self.releases(leads[0], model, direction)
+    # the same car in both slots gets one verdict
+    two = one if self.same_car(*leads) else self.releases(leads[1], model, direction)
+    beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) for lead in leads]
+    close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
+             for candidate, b, lead in zip((one, two), beside, leads, strict=True)]
+    # the car being passed still overlaps the car after the model has moved its lead elsewhere
+    passing_close = passing is not None and not self.moved_over and \
+                    not any(lead.present and lead.radar and lead.radarTrackId == passing.trackId for lead in leads) and \
+                    too_close(passing.dRel, passing.vRel, v_ego + passing.vRel, a_ego, t_follow, stop_distance)
+    self.close_frames = self.close_frames + 1 if any(close) or passing_close else 0
+    if self.close_frames >= LEAD_SPEED_FRAMES:
+      # followed at the full gap until the car being passed is beside the car
+      self.closing = True
+      self.armed = False
+    released = []
+    for k, candidate in enumerate((one, two)):
+      held = self.released[k] and self.close_frames < LEAD_SPEED_FRAMES
+      released.append(bool(candidate and (beside[k] or not self.closing) and (not close[k] or held)))
+    return released
+
   def update(self, model, CS, radar_state, radar_tracks, radar_ok, v_ego, v_cruise, t_follow, stop_distance, comfort_brake):
     direction = model.meta.laneChangeDirection
     starting = model.meta.laneChangeState == LaneChangeState.laneChangeStarting and direction != LaneChangeDirection.none
@@ -268,19 +400,41 @@ class LaneChangeGap:
       # unknown until a full window has been read, so a glitch on this frame cannot set it
       self.lead_v_max = -np.inf
       self.remember(lead)
+      self.passing_id = lead.radarTrackId if lead.present and lead.radar else -1
+      self.passing_distance, self.passing_y_rel, self.passing_v_rel = lead.dRel, lead.yRel, lead.vRel
+      self.leaving = False
+      # with nothing in front at the start there is no car to pass
+      self.moved_over = not lead.present
+      self.closing = False
+      self.close_frames = 0
+      self.landed_frames = 0
+      self.across = False
     elif starting and self.armed:
       self.relax_timer += self.dt
       self.lead_speeds.append(lead.vLead)
+    passing = self.follow_passing(radar_tracks) if starting else None
     if starting:
+      self.landed_frames = self.landed_frames + 1 if self.landed(direction) else 0
+      self.across = self.across or self.landed_frames >= LANDED_FRAMES
       # the model handing the lead over or the time limit end the relaxation only; the driver backing out or
       # the lead braking, whichever lead is in front, end the acceleration for this change too
       if self.armed and (self.relax_timer > RELAX_TIME_MAX or not self.same_lead(lead)):
         self.armed = False
-      if self.driver_backs_out(CS, direction) or self.lead_braking(lead, model):
+      if self.driver_backs_out(CS, direction, self.across) or self.lead_braking(lead, model) or self.released_lead_braking(radar_state, model):
         self.armed = False
         self.backed_out = True
       elif self.armed:
         self.remember(lead)
+      if passing is not None:
+        # the path leaving the car being passed shows the car is moving over; the path coming back undoes it
+        offset = path_offset(model, passing.dRel, passing.yRel, direction)
+        if offset > LEAD_OFF_PATH:
+          self.leaving = True
+        elif offset < LEAD_ON_PATH:
+          self.leaving = False
+        if not self.moved_over and self.beside(passing.dRel, passing.yRel, direction):
+          self.moved_over = True
+          self.closing = False
     if not starting:
       self.armed = False
       self.backed_out = False
@@ -289,9 +443,27 @@ class LaneChangeGap:
 
     self.accelerate = False
     self.t_follow_pad = 0.0
+    released = [False, False]
     if starting:
       clear = self.target_lane_clear(direction, CS, model, radar_tracks, radar_ok, v_ego, t_follow, stop_distance, comfort_brake)
+      # the target lane gate and the back-out cues but not the headroom: a car reaching its set speed mid pass is not
+      # handed back the car it is passing
+      if self.enabled and clear and not self.backed_out:
+        released = self.release_leads(radar_state, model, direction, passing, v_ego, CS.aEgo, t_follow, stop_distance)
       self.accelerate = self.enabled and clear and not self.backed_out and v_cruise - v_ego > MIN_HEADROOM
       if self.accelerate and self.armed:
         self.t_follow_pad = min(LANE_CHANGE_T_FOLLOW - t_follow, 0.0)
+    self.released = released
+    self.released_leads = [(ld.radar, ld.radarTrackId, ld.dRel, ld.vRel)
+                           for ld, r in zip((radar_state.leadOne, radar_state.leadTwo), released, strict=True) if r]
     return self.t_follow_pad
+
+  def followed(self, radar_state):
+    # the leads the MPC plans for: radard's, less the ones released for this lane change; radarState itself stays
+    # as radard published it for everything else
+    if not any(self.released):
+      return radar_state
+    followed = log.RadarState.new_message(leadOne=radar_state.leadOne, leadTwo=radar_state.leadTwo)
+    followed.leadOne.present = radar_state.leadOne.present and not self.released[0]
+    followed.leadTwo.present = radar_state.leadTwo.present and not self.released[1]
+    return followed

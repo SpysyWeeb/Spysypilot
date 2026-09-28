@@ -5,9 +5,10 @@ from opendbc.car.structs import car
 from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, LaneLines, target_lane_blocked, ARRIVAL_TIME, BLOCKED_HOLD,
-                                                              LANDED_MARGIN, LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BRAKING,
-                                                              LEAD_CONTINUITY, LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LINE_HOLD,
-                                                              MIN_HEADROOM, RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN)
+                                                              LANDED_FRAMES, LANDED_MARGIN, LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BESIDE,
+                                                              LEAD_BRAKING, LEAD_CONTINUITY, LEAD_DANGER_FACTOR, LEAD_OFF_PATH, LEAD_ON_PATH,
+                                                              LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LINE_HOLD, MIN_HEADROOM,
+                                                              RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN, TRACK_MOVING_SPEED)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 LaneChangeState = log.LaneChangeState
@@ -24,11 +25,15 @@ CP = car.CarParams.new_message(radarUnavailable=False, brand='hyundai', flags=Hy
 
 
 def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDirection.left, left_y=-1.6, right_y=1.76, probs=(1.0, 1.0),
-              curvature=0.0, lead_accel=0.0, lead_prob=1.0, line_stds=None, lines=None):
+              curvature=0.0, lead_accel=0.0, lead_prob=1.0, path=None, lead_two_std=None, lead_two_accel=0.0, line_stds=None, lines=None):
   model = log.ModelDataV2.new_message()
-  model.init('leadsV3', 1)
+  model.init('leadsV3', 1 if lead_two_std is None else 2)
   model.leadsV3[0].prob = lead_prob
   model.leadsV3[0].a = [lead_accel] * len(ModelConstants.LEAD_T_IDXS)
+  if lead_two_std is not None:
+    model.leadsV3[1].prob = lead_prob
+    model.leadsV3[1].a = [lead_two_accel] * len(ModelConstants.LEAD_T_IDXS)
+    model.leadsV3[1].yStd = [lead_two_std] * len(ModelConstants.LEAD_T_IDXS)
   model.meta.laneChangeState = state
   model.meta.laneChangeDirection = direction
   model.init('laneLines', 4)
@@ -39,29 +44,48 @@ def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDire
   model.laneLineProbs = [1.0, *probs, 1.0] if len(probs) == 2 else list(probs)
   if line_stds is not None:
     model.laneLineStds = list(line_stds)
+  if path is not None:
+    # the planned path, right positive, reaching path meters over at 30 m and following the road's bend
+    model.position.x = X_IDXS.tolist()
+    model.position.y = (path * X_IDXS / 30.0 + curvature * X_IDXS**2 / 2).tolist()
   return model
 
 
-def get_radar_state(present=True, radar=True, track_id=7, d_rel=35.0, v_rel=-1.0, a_lead=0.0):
-  radar_state = log.RadarState.new_message()
-  lead = radar_state.leadOne
+def path_for(offset, d_rel, direction=LaneChangeDirection.left):
+  # the path that puts a lead straight ahead at d_rel offset meters off it, toward the lane being left
+  sign = -1.0 if direction == LaneChangeDirection.left else 1.0
+  return sign * offset * 30.0 / (d_rel + RADAR_TO_CAMERA)
+
+
+def set_lead(lead, present=True, radar=True, track_id=7, d_rel=35.0, v_rel=-1.0, a_lead=0.0, y_rel=0.0):
   lead.present = present
   lead.radar = radar
   lead.radarTrackId = track_id
   lead.dRel = d_rel
+  lead.yRel = y_rel
   lead.vRel = v_rel
   lead.vLead = V_EGO + v_rel
   lead.aLeadK = a_lead
+
+
+def get_radar_state(present=True, radar=True, track_id=7, d_rel=35.0, v_rel=-1.0, a_lead=0.0, y_rel=0.0, lead_two=None):
+  # lead_two: None for no second lead, 'same' for the model's usual mirror of the first, or set_lead() arguments
+  radar_state = log.RadarState.new_message()
+  set_lead(radar_state.leadOne, present, radar, track_id, d_rel, v_rel, a_lead, y_rel)
+  if lead_two == 'same':
+    set_lead(radar_state.leadTwo, present, radar, track_id, d_rel, v_rel, a_lead, y_rel)
+  elif lead_two is not None:
+    set_lead(radar_state.leadTwo, **lead_two)
   return radar_state
 
 
 def get_tracks(*points):
+  # (dRel, yRel, vRel) or (dRel, yRel, vRel, trackId)
   tracks = car.RadarData.new_message()
   tracks.init('points', len(points))
-  for pt, (d_rel, y_rel, v_rel) in zip(tracks.points, points, strict=True):
-    pt.dRel = d_rel
-    pt.yRel = y_rel
-    pt.vRel = v_rel
+  for pt, point in zip(tracks.points, points, strict=True):
+    pt.dRel, pt.yRel, pt.vRel = point[:3]
+    pt.trackId = point[3] if len(point) > 3 else 0
   return tracks
 
 
@@ -360,12 +384,308 @@ class TestLaneChangeGap:
     assert not gap.accelerate and not gap.armed
 
 
+FAR = 60.0  # m, a lead the MPC could take back gently at V_EGO and T_FOLLOW
+
+
+def released(gap):
+  return list(gap.released)
+
+
 def change_right(**kwargs):
   return get_model(direction=LaneChangeDirection.right, **kwargs)
 
 
 def right_blinker(**kwargs):
   return get_car_state(left_blinker=False, rightBlinker=True, **kwargs)
+
+
+def on_path(d_rel, path):
+  # the radar lateral of a lead sitting on a path that reaches path meters over at 30 m
+  return -path * (d_rel + RADAR_TO_CAMERA) / 30.0
+
+
+class TestLeadRelease:
+  def test_off_path_radar_lead_is_released_in_both_slots(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    radar_state = get_radar_state(d_rel=FAR, lead_two='same')
+    step(gap, model=get_model(path=path_for(LEAD_OFF_PATH - 0.1, FAR)), radar_state=radar_state)
+    assert released(gap) == [False, False]
+    step(gap, model=get_model(path=path_for(LEAD_OFF_PATH + 0.1, FAR)), radar_state=radar_state)
+    assert released(gap) == [True, True]
+    followed = gap.followed(radar_state)
+    assert not followed.leadOne.present and not followed.leadTwo.present
+    # radarState itself stays as radard published it
+    assert radar_state.leadOne.present and radar_state.leadTwo.present
+
+  def test_only_toward_the_lane_being_left(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(-1.5, FAR)), radar_state=get_radar_state(d_rel=FAR), n=5)
+    assert released(gap) == [False, False]
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=change_right(path=path_for(1.5, FAR, LaneChangeDirection.right)), CS=right_blinker(), radar_state=get_radar_state(d_rel=FAR))
+    assert released(gap)[0]
+
+  def test_hysteresis_holds_the_same_car_only(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(LEAD_OFF_PATH + 0.2, FAR)), radar_state=get_radar_state(d_rel=FAR))
+    assert released(gap)[0]
+    step(gap, model=get_model(path=path_for(LEAD_ON_PATH + 0.1, FAR)), radar_state=get_radar_state(d_rel=FAR))
+    assert released(gap)[0]
+    step(gap, model=get_model(path=path_for(LEAD_ON_PATH - 0.1, FAR)), radar_state=get_radar_state(d_rel=FAR))
+    assert not released(gap)[0]
+    step(gap, model=get_model(path=path_for(LEAD_ON_PATH + 0.1, FAR)), radar_state=get_radar_state(d_rel=FAR))
+    assert not released(gap)[0]
+    # a different car in the slot has to earn its own release
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(LEAD_OFF_PATH + 0.2, FAR)), radar_state=get_radar_state(d_rel=FAR))
+    assert released(gap)[0]
+    step(gap, model=get_model(path=path_for(LEAD_ON_PATH + 0.1, FAR + 10.0)), radar_state=get_radar_state(track_id=8, d_rel=FAR + 10.0))
+    assert not released(gap)[0]
+
+  def test_lead_moving_over_the_same_way_is_followed_again(self):
+    # the path leaves the lead before the lead itself moves toward the target lane; back on the path, it is in front again
+    path = path_for(1.5, FAR)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(d_rel=FAR))
+    assert released(gap)[0]
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(d_rel=FAR, y_rel=on_path(FAR, path) - (LEAD_ON_PATH + 0.1)))
+    assert released(gap)[0]
+    radar_state = get_radar_state(d_rel=FAR, y_rel=on_path(FAR, path) - (LEAD_ON_PATH - 0.1))
+    step(gap, model=get_model(path=path), radar_state=radar_state)
+    assert released(gap) == [False, False] and gap.followed(radar_state) is radar_state
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(d_rel=FAR, y_rel=on_path(FAR, path)), n=5)
+    assert released(gap) == [False, False]
+
+  def test_no_planned_path_releases_nothing(self):
+    radar_state = get_radar_state(d_rel=FAR, y_rel=-1.5)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=0.0), radar_state=radar_state)
+    assert released(gap)[0]
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, radar_state=radar_state, n=5)
+    assert released(gap) == [False, False]
+
+  def test_stopped_or_crawling_lead_is_never_released(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    crawling = get_radar_state(d_rel=FAR, v_rel=TRACK_MOVING_SPEED - 0.1 - V_EGO)
+    step(gap, model=get_model(path=path_for(3.0, FAR)), radar_state=crawling, n=5)
+    assert released(gap) == [False, False]
+
+  def test_lead_the_mpc_could_not_take_back_is_followed_until_the_car_is_beside(self):
+    model = get_model(path=path_for(2.0, FAR))
+    # inside the follow distance
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=get_radar_state(d_rel=FOLLOW_GAP - 5.0), n=5)
+    assert released(gap) == [False, False]
+    # released far out, then closing: held for LEAD_SPEED_FRAMES - 1 frames, then followed at the full gap
+    gap = LaneChangeGap(CP, DT_MDL)
+    assert np.isclose(step(gap, model=model, radar_state=get_radar_state(d_rel=FAR)), PAD)
+    assert released(gap)[0]
+    closing = get_radar_state(d_rel=45.0, v_rel=-4.0)
+    step(gap, model=model, radar_state=closing, n=LEAD_SPEED_FRAMES - 1)
+    assert released(gap)[0]
+    assert step(gap, model=model, radar_state=closing) == 0.0
+    assert not released(gap)[0] and gap.closing
+    assert step(gap, model=model, radar_state=get_radar_state(d_rel=FAR), n=5) == 0.0
+    assert not released(gap)[0]
+    # the car being passed beside the car lifts it, and a lead beside is released however close
+    beside = get_radar_state(d_rel=20.0, v_rel=-4.0, y_rel=-LEAD_BESIDE)
+    step(gap, model=get_model(path=0.0), radar_state=beside, tracks=get_tracks((20.0, -LEAD_BESIDE, -4.0, 7)))
+    assert not gap.closing and released(gap)[0]
+
+  def test_lead_inside_the_follow_distance_is_too_close_only_while_closing(self):
+    # a car holding or opening the gap asks the MPC for little braking, unless it is inside the MPC's danger distance
+    d_rel = FOLLOW_GAP - 5.0
+    assert d_rel > LEAD_DANGER_FACTOR * FOLLOW_GAP
+    model = get_model(path=path_for(1.5, d_rel))
+    for v_rel, followed in ((0.0, False), (0.5, False), (-0.3, True)):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=model, radar_state=get_radar_state(d_rel=d_rel, v_rel=v_rel), n=5)
+      assert released(gap)[0] != followed
+    # the car accelerating toward it will be closing once handed back
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=get_radar_state(d_rel=d_rel, v_rel=0.0), CS=get_car_state(aEgo=0.5), n=5)
+    assert not released(gap)[0]
+    d_rel = LEAD_DANGER_FACTOR * FOLLOW_GAP - 1.0
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(1.5, d_rel)), radar_state=get_radar_state(d_rel=d_rel, v_rel=0.5), n=5)
+    assert not released(gap)[0]
+
+  def test_accelerating_car_is_judged_where_it_will_be(self):
+    model = get_model(path=path_for(2.0, 50.0))
+    radar_state = get_radar_state(d_rel=50.0, v_rel=-2.0)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=radar_state, CS=get_car_state(aEgo=0.0))
+    assert released(gap)[0]
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=radar_state, CS=get_car_state(aEgo=2.0))
+    assert not released(gap)[0]
+
+  def test_beside_is_measured_not_planned(self):
+    # the plan swinging 3 m over does not put a car that is still dead ahead beside the car
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(3.0, 15.0)), radar_state=get_radar_state(d_rel=15.0, v_rel=-3.0), n=5)
+    assert released(gap) == [False, False]
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=0.0), radar_state=get_radar_state(d_rel=15.0, v_rel=-3.0, y_rel=-LEAD_BESIDE))
+    assert released(gap)[0]
+
+  def test_car_in_its_lane_on_a_bend_is_not_beside(self):
+    # a left change on a right hand bend: the car ahead in the lane reads more than LEAD_BESIDE to the right of the
+    # car's heading, but sits on the lane like the line being crossed
+    d_rel = 20.0
+    curvature = 2 * (LEAD_BESIDE + 0.2) / (d_rel + RADAR_TO_CAMERA)**2
+    y_rel = -curvature * (d_rel + RADAR_TO_CAMERA)**2 / 2
+    radar_state = get_radar_state(d_rel=d_rel, y_rel=y_rel)
+    tracks = get_tracks((d_rel, y_rel, -1.0, 7))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(curvature=curvature, path=path_for(1.5, d_rel)), radar_state=radar_state, tracks=tracks, n=5)
+    assert released(gap) == [False, False] and not gap.moved_over
+    # the same lateral on a straight road is a car beside
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(1.5, d_rel)), radar_state=radar_state, tracks=tracks)
+    assert released(gap)[0] and gap.moved_over
+
+  def test_car_being_passed_is_followed_across_a_track_id_change(self):
+    path = path_for(1.5, FAR)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=0.0), radar_state=get_radar_state(d_rel=FAR), tracks=get_tracks((FAR, 0.0, -1.0, 7)))
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - DT_MDL, 0.0, -1.0, 7)))
+    assert gap.leaving
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - 2 * DT_MDL, 0.3, -1.0, 8)))
+    assert gap.passing_id == 8
+    # the path coming back to the car under its new track
+    step(gap, model=get_model(path=0.0), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - 3 * DT_MDL, 0.3, -1.0, 8)))
+    assert not gap.leaving
+
+  def test_target_lane_car_does_not_continue_the_car_being_passed(self):
+    # a car in the target lane at the range and speed the car being passed would have
+    path = path_for(1.5, FAR)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=0.0), radar_state=get_radar_state(d_rel=FAR), tracks=get_tracks((FAR, 0.0, -1.0, 7)))
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - DT_MDL, 0.0, -1.0, 7)))
+    assert gap.leaving
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - 2 * DT_MDL, 3.4, -1.0, 9)))
+    assert gap.passing_id == 7 and gap.leaving
+
+  def test_lead_two_is_judged_on_its_own(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    path = path_for(1.5, FAR)
+    on_path_two = {'track_id': 9, 'd_rel': FAR + 20.0, 'y_rel': on_path(FAR + 20.0, path)}
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(d_rel=FAR, lead_two=on_path_two))
+    assert released(gap) == [True, False]
+    followed = gap.followed(get_radar_state(d_rel=FAR, lead_two=on_path_two))
+    assert not followed.leadOne.present and followed.leadTwo.present
+
+  def test_braking_restores_every_slot_for_the_rest_of_the_change(self):
+    path = path_for(1.5, FAR)
+    off_path_two = {'track_id': 9, 'd_rel': FAR + 20.0, 'y_rel': on_path(FAR + 20.0, path) - 1.5}
+    cases = (
+      ({'a_lead': LEAD_BRAKING - 0.5}, {}),
+      ({'lead_two': dict(off_path_two, a_lead=LEAD_BRAKING - 0.5)}, {}),
+      ({}, {'lead_two_std': 0.3, 'lead_two_accel': LEAD_BRAKING - 0.5}),
+    )
+    for radar_kwargs, model_kwargs in cases:
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=get_model(path=path, lead_two_std=0.3), radar_state=get_radar_state(d_rel=FAR, lead_two=off_path_two))
+      assert released(gap) == [True, True]
+      model = get_model(path=path, **{'lead_two_std': 0.3, **model_kwargs})
+      step(gap, model=model, radar_state=get_radar_state(d_rel=FAR, **{'lead_two': off_path_two, **radar_kwargs}))
+      assert released(gap) == [False, False] and gap.backed_out
+      step(gap, model=get_model(path=path, lead_two_std=0.3), radar_state=get_radar_state(d_rel=FAR, lead_two=off_path_two), n=10)
+      assert released(gap) == [False, False]
+
+  def test_driver_backing_out_restores_for_the_rest_of_the_change(self):
+    model = get_model(path=path_for(1.5, FAR))
+    radar_state = get_radar_state(d_rel=FAR, lead_two='same')
+    for back_out in (get_car_state(left_blinker=False), get_car_state(steeringPressed=True, steeringTorque=-50.0), 'reset'):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=model, radar_state=radar_state)
+      assert released(gap) == [True, True]
+      if back_out == 'reset':
+        gap.reset()
+        step(gap, model=model, radar_state=radar_state)
+      else:
+        step(gap, model=model, radar_state=radar_state, CS=back_out)
+      assert released(gap) == [False, False]
+      step(gap, model=model, radar_state=radar_state, n=10)
+      assert released(gap) == [False, False]
+
+  def cross_the_line(self, gap, radar_state, tracks):
+    # a left change: the car's left line walks in from 1.6 m to just short of landing, and the model that lands it
+    for left_line in np.linspace(-1.6, LANDED_MARGIN - 0.1, 11):
+      step(gap, model=get_model(path=0.0, left_y=left_line, right_y=left_line + 3.36), radar_state=radar_state, tracks=tracks)
+    assert not gap.landed(LaneChangeDirection.left)
+    return get_model(path=0.0, left_y=LANDED_MARGIN + 0.1, right_y=LANDED_MARGIN + 0.1 + 3.36)
+
+  def test_blinker_off_once_the_car_is_across_finishes_the_change(self):
+    # the car being passed beside the car, released however close
+    beside = get_radar_state(d_rel=20.0, y_rel=-(LEAD_BESIDE + 0.5), lead_two='same')
+    tracks = get_tracks((20.0, -(LEAD_BESIDE + 0.5), -1.0, 7))
+    blinker_off = get_car_state(left_blinker=False)
+    gap = LaneChangeGap(CP, DT_MDL)
+    landed = self.cross_the_line(gap, beside, tracks)
+    step(gap, model=landed, radar_state=beside, tracks=tracks, n=LANDED_FRAMES)
+    assert gap.landed(LaneChangeDirection.left) and released(gap) == [True, True]
+    step(gap, model=landed, CS=blinker_off, radar_state=beside, tracks=tracks, n=10)
+    assert released(gap) == [True, True] and not gap.backed_out and gap.accelerate
+    # counter-steer still backs out
+    step(gap, model=landed, CS=get_car_state(left_blinker=False, steeringPressed=True, steeringTorque=-50.0), radar_state=beside, tracks=tracks)
+    assert released(gap) == [False, False] and gap.backed_out
+    # landed for fewer frames than the model's relabel can last, the same blinker off backs out
+    gap = LaneChangeGap(CP, DT_MDL)
+    landed = self.cross_the_line(gap, beside, tracks)
+    step(gap, model=landed, radar_state=beside, tracks=tracks, n=LANDED_FRAMES - 2)
+    assert released(gap) == [True, True]
+    step(gap, model=landed, CS=blinker_off, radar_state=beside, tracks=tracks)
+    assert gap.landed(LaneChangeDirection.left) and released(gap) == [False, False] and gap.backed_out
+
+  def test_blocked_target_lane_restores_while_blocked(self):
+    model = get_model(path=path_for(1.5, FAR))
+    radar_state = get_radar_state(d_rel=FAR)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=radar_state)
+    assert released(gap)[0]
+    step(gap, model=model, radar_state=radar_state, tracks=get_tracks((30.0, 3.4, -1.0)))
+    assert not released(gap)[0]
+    step(gap, model=model, radar_state=radar_state, n=int(round(BLOCKED_HOLD / DT_MDL)))
+    assert not released(gap)[0]
+    step(gap, model=model, radar_state=radar_state)
+    assert released(gap)[0]
+
+  def test_release_does_not_need_headroom(self):
+    # a car reaching its set speed mid pass is not handed back the car it is passing
+    gap = LaneChangeGap(CP, DT_MDL)
+    assert step(gap, model=get_model(path=path_for(1.5, FAR)), radar_state=get_radar_state(d_rel=FAR), v_cruise=V_EGO) == 0.0
+    assert not gap.accelerate and released(gap)[0]
+
+  def test_release_only_while_the_change_is_starting(self):
+    radar_state = get_radar_state(d_rel=FAR)
+    for model in (get_model(state=LaneChangeState.preLaneChange, path=path_for(1.5, FAR)), get_model(state=LaneChangeState.off, path=path_for(1.5, FAR)),
+                  get_model(state=LaneChangeState.laneChangeFinishing, path=path_for(1.5, FAR)),
+                  get_model(direction=LaneChangeDirection.none, path=path_for(1.5, FAR))):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=get_model(path=path_for(1.5, FAR)), radar_state=radar_state)
+      assert released(gap)[0]
+      step(gap, model=model, radar_state=radar_state)
+      assert released(gap) == [False, False]
+      assert gap.followed(radar_state) is radar_state
+
+  def test_latch_and_evidence_reset_with_the_next_change(self):
+    model = get_model(path=path_for(2.0, FAR))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=get_radar_state(d_rel=45.0, v_rel=-4.0), tracks=get_tracks((45.0, 0.0, -4.0, 7)), n=LEAD_SPEED_FRAMES + 1)
+    assert gap.closing
+    step(gap, model=get_model(state=LaneChangeState.off))
+    step(gap, model=model, radar_state=get_radar_state(d_rel=FAR))
+    assert not gap.closing and released(gap)[0]
+
+  def test_needs_the_sensors_to_release(self):
+    for cp in (car.CarParams.new_message(radarUnavailable=True, brand='hyundai', flags=HyundaiFlags.HAS_BSM.value),
+               car.CarParams.new_message(radarUnavailable=False, brand='hyundai')):
+      gap = LaneChangeGap(cp, DT_MDL)
+      step(gap, model=get_model(path=path_for(1.5, FAR)), radar_state=get_radar_state(d_rel=FAR), n=5)
+      assert released(gap) == [False, False]
 
 
 class TestCrossedLine:
