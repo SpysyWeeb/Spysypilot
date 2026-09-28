@@ -115,7 +115,7 @@ class TestPlanningView:
     assert sm['radarState'].leadOne.present and sm['radarState'].leadTwo.present
 
   @pytest.mark.parametrize('cue', ['blinker off', 'counter-steer', 'lead braking', 'model braking', 'blocked', 'change over', 'path back',
-                                   'too close'])
+                                   'too close', 'passed car too close'])
   def test_every_restore_reaches_the_mpc_in_the_same_frame(self, cue):
     planner = LongitudinalPlanner(get_cp(), init_v=12.0)
     released_frames(planner)
@@ -129,14 +129,25 @@ class TestPlanningView:
       'change over': {'state': LaneChangeState.off},
       'path back': {'path': -1.5},
     }.get(cue, {})
+
+    def cue_frame(a_ego):
+      if cue != 'passed car too close':
+        return frame(12.0, a_ego, d_rel, v_lead, **{'y_ego': 1.5, 'path': 2.0, **kwargs})
+      # the model has moved its lead to a car 60 m out that the path has left too, and the car being passed, in neither
+      # slot, is 24 m ahead
+      sm = frame(12.0, a_ego, 24.0, v_lead, y_ego=1.5, path=2.0, extra_tracks=[(2, 60.0, 1.5, v_lead - 12.0)])
+      for lead in (sm['radarState'].leadOne, sm['radarState'].leadTwo):
+        lead_data(lead, 60.0, v_lead, 12.0, y_rel=1.5, track_id=2)
+      return sm
+
     a_ego = 0.0
-    if cue == 'too close':
-      # the car accelerating toward the lead at its steady speed, so no braking cue fires with the floor
-      d_rel, a_ego = 24.0, 1.5
+    if cue in ('too close', 'passed car too close'):
+      # the car accelerating toward a car at its steady speed, so no braking cue fires with the floor
+      d_rel, a_ego = (24.0 if cue == 'too close' else 60.0), 1.5
       for _ in range(CLOSE_FRAMES - 1):
-        planner.update(frame(12.0, a_ego, d_rel, v_lead, y_ego=1.5, path=2.0))
+        planner.update(cue_frame(a_ego))
       assert any(planner.lane_change_gap.released)
-    planner.update(frame(12.0, a_ego, d_rel, v_lead, **{'y_ego': 1.5, 'path': 2.0, **kwargs}))
+    planner.update(cue_frame(a_ego))
     assert not any(planner.lane_change_gap.released)
     assert mpc_follows(planner, d_rel, v_lead)
 

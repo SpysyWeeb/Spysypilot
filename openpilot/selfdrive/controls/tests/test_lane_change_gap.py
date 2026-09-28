@@ -9,7 +9,8 @@ from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, Lan
                                                               LEAD_BRAKING, LEAD_CONTINUITY, LEAD_DANGER_FACTOR, LEAD_OFF_PATH, LEAD_ON_PATH,
                                                               LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LEAD_UNPLACED_STD,
                                                               LEAD_UNPLACED_STD_HOLD, LINE_HOLD, MIN_HEADROOM,
-                                                              RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN, TRACK_MOVING_SPEED)
+                                                              RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN, TRACK_MIN_DISTANCE, TRACK_MOVING_SPEED,
+                                                              too_close)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 LaneChangeState = log.LaneChangeState
@@ -444,6 +445,11 @@ class TestLeadRelease:
     assert not released(gap)[0]
     step(gap, model=get_model(path=path_for(LEAD_ON_PATH + 0.1, FAR)), radar_state=get_radar_state(d_rel=FAR))
     assert not released(gap)[0]
+    # the same car under a new track id keeps it
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(LEAD_OFF_PATH + 0.2, FAR)), radar_state=get_radar_state(d_rel=FAR))
+    step(gap, model=get_model(path=path_for(LEAD_ON_PATH + 0.1, FAR)), radar_state=get_radar_state(track_id=8, d_rel=FAR))
+    assert released(gap)[0]
     # a different car in the slot has to earn its own release
     gap = LaneChangeGap(CP, DT_MDL)
     step(gap, model=get_model(path=path_for(LEAD_OFF_PATH + 0.2, FAR)), radar_state=get_radar_state(d_rel=FAR))
@@ -488,10 +494,13 @@ class TestLeadRelease:
     assert released(gap) == [False, False]
 
   def test_stopped_or_crawling_lead_is_never_released(self):
-    gap = LaneChangeGap(CP, DT_MDL)
-    crawling = get_radar_state(d_rel=FAR, v_rel=TRACK_MOVING_SPEED - 0.1 - V_EGO)
-    step(gap, model=get_model(path=path_for(3.0, FAR)), radar_state=crawling, n=5)
-    assert released(gap) == [False, False]
+    # in town a crawling car 100 m out asks the MPC for little braking, so only its own speed keeps it followed
+    v_ego, d_rel = 12.0, 100.0
+    for v_lead, followed in ((0.0, True), (TRACK_MOVING_SPEED - 0.1, True), (TRACK_MOVING_SPEED + 0.1, False)):
+      assert not too_close(d_rel, v_lead - v_ego, v_lead, 0.0, T_FOLLOW, STOP_DISTANCE)
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=get_model(path=path_for(3.0, d_rel)), radar_state=get_radar_state(d_rel=d_rel, v_rel=v_lead - v_ego, v_ego=v_ego), v_ego=v_ego, n=5)
+      assert released(gap)[0] != followed
 
   def test_lead_the_mpc_could_not_take_back_is_followed_until_the_car_is_beside(self):
     model = get_model(path=path_for(2.0, FAR))
@@ -543,6 +552,9 @@ class TestLeadRelease:
     assert released(gap)[0]
     step(gap, model=model, radar_state=leads, tracks=passed(45.0))
     assert released(gap) == [False, False] and gap.closing
+    # a car beside the car is released through the latch
+    step(gap, model=model, radar_state=get_radar_state(track_id=9, d_rel=20.0, y_rel=-(LEAD_BESIDE + 0.5)), tracks=passed(45.0))
+    assert released(gap)[0] and gap.closing
     # one wide radar frame is not the car being passed beside
     step(gap, model=model, radar_state=leads, tracks=passed(45.0, y_rel=-(LEAD_BESIDE + 0.1)))
     step(gap, model=model, radar_state=leads, tracks=passed(45.0), n=5)
@@ -568,18 +580,20 @@ class TestLeadRelease:
     assert released(gap) == [False, False]
 
   def test_floor_counts_frames_running(self):
-    # close frames on either side of a blocked target lane are not frames running
+    # close frames on either side of a blocked target lane are not frames running: the count starts again on the frame the
+    # block ends, the first one the floor judges
     model = get_model(path=path_for(2.0, FAR))
-    closing, far = get_radar_state(d_rel=45.0, v_rel=-4.0), get_radar_state(d_rel=FAR)
+    closing = get_radar_state(d_rel=45.0, v_rel=-4.0)
     gap = LaneChangeGap(CP, DT_MDL)
-    step(gap, model=model, radar_state=far)
+    step(gap, model=model, radar_state=get_radar_state(d_rel=FAR))
     step(gap, model=model, radar_state=closing, n=CLOSE_FRAMES - 1)
-    step(gap, model=model, radar_state=far, tracks=get_tracks((30.0, 3.4, -1.0)))
-    step(gap, model=model, radar_state=far, n=int(round(BLOCKED_HOLD / DT_MDL)))
-    step(gap, model=model, radar_state=closing)
+    step(gap, model=model, radar_state=closing, tracks=get_tracks((30.0, 3.4, -1.0)))
+    while gap.blocked_timer > 0.0:
+      step(gap, model=model, radar_state=closing)
+    step(gap, model=model, radar_state=closing, n=CLOSE_FRAMES - 2)
     assert not gap.closing
-    step(gap, model=model, radar_state=far)
-    assert released(gap)[0]
+    step(gap, model=model, radar_state=closing)
+    assert gap.closing
 
   def test_lead_inside_the_follow_distance_is_too_close_only_while_closing(self):
     # a car holding or opening the gap asks the MPC for little braking, unless it is inside the MPC's danger distance
@@ -680,6 +694,14 @@ class TestLeadRelease:
     # the path coming back to the car under its new track
     step(gap, model=get_model(path=0.0), radar_state=get_radar_state(present=False), tracks=get_tracks((FAR - 3 * DT_MDL, 0.3, -1.0, 8)))
     assert not gap.leaving
+    # unseen for a second, it is looked for where it will have got to
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=0.0), radar_state=get_radar_state(d_rel=FAR, v_rel=-5.0), tracks=get_tracks((FAR, 0.0, -5.0, 7)))
+    unseen = int(round(1.0 / DT_MDL))
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), n=unseen)
+    d_rel = FAR - 5.0 * (unseen + 1) * DT_MDL
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(present=False), tracks=get_tracks((d_rel, 0.3, -5.0, 8)))
+    assert gap.passing_id == 8
 
   def test_target_lane_car_does_not_continue_the_car_being_passed(self):
     # a car in the target lane at the range and speed the car being passed would have
@@ -714,6 +736,8 @@ class TestLeadRelease:
     gap = self.start_behind_track_7()
     assert not self.vision_after_handoff(gap, LEAD_OFF_PATH - 0.1)
     assert self.vision_after_handoff(gap, LEAD_OFF_PATH + 0.1)
+    assert gap.leaving
+    assert self.vision_after_handoff(gap, (LEAD_ON_PATH + LEAD_OFF_PATH) / 2)
     assert gap.leaving
     # the path coming back to the car being passed
     assert not self.vision_after_handoff(gap, LEAD_ON_PATH - 0.1)
@@ -750,8 +774,12 @@ class TestLeadRelease:
     for v_rel in (-1.0, -V_EGO):  # moving or stationary
       gap = self.start_behind_track_7()
       assert not self.vision_after_handoff(gap, 1.5, tracks=[(40.0, on_path(40.0, path), v_rel, 3)])
-      # past the far end of radard's match window for a lead at 70 m
+      # past the lead, out to the far end of radard's match window for a lead at 70 m
+      assert not self.vision_after_handoff(gap, 1.5, tracks=[(80.0, on_path(80.0, path), v_rel, 3)])
       assert self.vision_after_handoff(gap, 1.5, tracks=[(95.0, on_path(95.0, path), v_rel, 3)])
+    # a return beside the car is the blind spot monitor's
+    gap = self.start_behind_track_7()
+    assert self.vision_after_handoff(gap, 1.5, tracks=[(TRACK_MIN_DISTANCE - 0.5, on_path(TRACK_MIN_DISTANCE - 0.5, path), -1.0, 3)])
     # a return 0.7 m off the path keeps a held release but blocks a new one
     gap = self.start_behind_track_7()
     near_path = [(40.0, on_path(40.0, path) - 0.7, -1.0, 3)]
@@ -770,6 +798,11 @@ class TestLeadRelease:
     assert self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_ON_PATH + 0.1)
     assert not self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_ON_PATH - 0.1)
     assert not self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_ON_PATH + 0.1)
+
+  def test_vision_lead_off_to_the_side_is_still_judged_by_the_floor(self):
+    # the lateral of a lead the model cannot place is no measure of a car beside
+    gap = self.start_behind_track_7()
+    assert not self.vision_after_handoff(gap, 1.5, lead_offset=LEAD_BESIDE + 1.0, d_rel=20.0, n=CLOSE_FRAMES)
 
   def test_vision_lead_on_the_target_side_is_followed(self):
     gap = self.start_behind_track_7()
@@ -1000,9 +1033,9 @@ class TestCrossedLine:
   PLACED = (0.1, 0.1, 0.1, 0.1)
   DOUBTED = (0.0, 0.05, 0.05, 0.0)
 
-  def run(self, gap, right_line, probs, stds, tracks=(), state=LaneChangeState.laneChangeStarting, CS=None, n=1, lines=None):
+  def run(self, gap, right_line, probs, stds, tracks=(), state=LaneChangeState.laneChangeStarting, CS=None, n=1, lines=None, curvature=0.0):
     lines = lines if lines is not None else (right_line - 6.0, right_line - 3.0, right_line, right_line + 3.5)
-    model = change_right(state=state, lines=lines, probs=probs, line_stds=stds)
+    model = change_right(state=state, lines=lines, probs=probs, line_stds=stds, curvature=curvature)
     step(gap, model=model, CS=CS if CS is not None else right_blinker(), radar_state=get_radar_state(present=False),
          tracks=get_tracks(*tracks), n=n)
     return gap.blocked_timer > 0.0
@@ -1025,12 +1058,30 @@ class TestCrossedLine:
     self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
     for right_line in np.arange(1.2, 0.0, -0.1):
       self.run(gap, right_line, self.DOUBTED, self.PLACED)
-    # the model relabels: the crossed line is now the car's left line, 0.6 m to its left
+    # the model relabels: the crossed line is now the car's left line, 0.6 m to its left, and the lane moved into is the
+    # car's own, where a car ahead is a lead to follow rather than a blocked target lane
     relabelled = (-3.6, -LANDED_MARGIN - 0.1, 2.9, 6.4)
-    assert not self.run(gap, None, (0.5, 0.7, 0.7, 0.5), self.PLACED, lines=relabelled, tracks=beyond)
+    ahead = [(30.0, -1.5, -4.9)]
+    assert not self.run(gap, None, (0.5, 0.7, 0.7, 0.5), self.PLACED, lines=relabelled, tracks=beyond + ahead)
     assert gap.landed(LaneChangeDirection.right)
     # the blind spot still counts after landing
     assert self.run(gap, None, (0.5, 0.7, 0.7, 0.5), self.PLACED, lines=relabelled, CS=right_blinker(rightBlindspot=True))
+
+  def test_band_bends_with_the_crossed_line(self):
+    # a right hand bend puts the lane moved into 2 m further right 30 m out than beside the car
+    curvature = 2 * 2.0 / (30.0 + RADAR_TO_CAMERA)**2
+    for y_rel, blocks in ((-4.5, True), (-2.0, False)):
+      gap = LaneChangeGap(CP, DT_MDL)
+      self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange, curvature=curvature)
+      assert self.run(gap, 1.0, self.DOUBTED, self.PLACED, tracks=[(30.0, y_rel, -4.9)], curvature=curvature) == blocks
+
+  def test_crossed_line_is_held_rather_than_moved_a_lane(self):
+    # with the crossed line not placed for a moment, the nearest placed line is the next one over, 3 m away
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    self.run(gap, 1.0, self.DOUBTED, self.PLACED)
+    assert self.run(gap, 1.0, self.DOUBTED, (0.1, 0.1, 1.0, 0.1), tracks=[(30.0, -2.5, -4.9)])
+    assert np.isclose(gap.crossed[1][0], -1.0) and gap.crossed_age > 0.0
 
   def test_crossed_line_hold_expires(self):
     pickup = [(30.0, -5.2, -4.9)]
@@ -1040,6 +1091,13 @@ class TestCrossedLine:
     assert not self.run(gap, 1.0, self.DOUBTED, self.PLACED, tracks=pickup)
     assert not self.run(gap, 1.0, self.DOUBTED, lost, tracks=pickup, n=int(round(LINE_HOLD / DT_MDL)) - 1)
     assert self.run(gap, 1.0, self.DOUBTED, lost, tracks=pickup, n=2)
+    assert gap.crossed is None
+
+  def test_line_well_away_does_not_seed(self):
+    # a line past LINE_OFFSET_MAX is the next one over, not the one the car crosses
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 2.6, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    assert self.run(gap, 2.6, self.DOUBTED, self.PLACED, tracks=[(30.0, -2.0, -4.9)])
     assert gap.crossed is None
 
   def test_crossed_line_is_seeded_before_the_change(self):
