@@ -216,12 +216,6 @@ class LongitudinalPlanner:
 
     radar_valid = sm.all_checks(['radarState'])
     model_valid = sm.all_checks(['modelV2'])
-    lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
-    model_leads = sm['modelV2'].leadsV3 if model_valid else []
-    lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if len(model_leads) > 0 else None
-    lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
-    policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
-
     experimental_mode = sm['selfdriveState'].experimentalMode
     stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
     force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, not reset_state, model_valid, self.output_a_target)
@@ -232,6 +226,14 @@ class LongitudinalPlanner:
     radar_ok = radar_valid and sm.alive['radarTracks'] and sm.valid['radarTracks']
     lane_change_pad = self.lane_change_gap.update(sm['modelV2'], sm['carState'], sm['radarState'], sm['radarTracks'], radar_ok,
                                                   v_ego, v_cruise, get_T_FOLLOW(personality), STOP_DISTANCE, COMFORT_BRAKE)
+    # the supervisor, the lead anchors and the MPC plan on the leads the lane change still follows; the stop evidence and
+    # hasLead keep radard's
+    view = self.lane_change_gap.followed(sm['radarState'])
+    lead = LeadObservation.from_radar(view.leadOne, radar_valid)
+    model_leads = sm['modelV2'].leadsV3 if model_valid else []
+    lead0_anchor = anchor_model_lead(model_leads[0], view.leadOne) if len(model_leads) > 0 else None
+    lead1_anchor = anchor_model_lead(model_leads[1], view.leadTwo) if len(model_leads) > 1 else None
+    policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
     # the supervisor's necessity pad outranks the lane change relaxation
     t_follow_pad = policy.t_follow_pad if policy.t_follow_pad > 0.0 else lane_change_pad
     # the published target is the plan read action_t ahead, not its current acceleration: while the MPC drives it continues its
@@ -244,7 +246,7 @@ class LongitudinalPlanner:
       a_told = self.output_a_target
       a_seed = float(np.clip(self.mpc.a_next, ACCEL_MIN, ACCEL_MAX)) if self.plan_winner in ('mpc', 'column') else a_told
     self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, a_told)
-    self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, stop_x,
+    self.mpc.update(view, personality, lead0_anchor, lead1_anchor, stop_x,
                     policy.jerk_scale, t_follow_pad, prev_accel_constraint)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
