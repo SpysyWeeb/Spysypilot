@@ -74,6 +74,12 @@ def path_offset(model, d_rel, y_rel, direction):
   return side_left(direction) * (y_rel + float(np.interp(d_rel + RADAR_TO_CAMERA, model.position.x, model.position.y)))
 
 
+def line_sweep(line, x):
+  # a held line's lateral drift out to x, which carries the bend and the car's yaw
+  line_x, line_y = line
+  return float(np.interp(x, line_x, line_y)) - float(line_y[0])
+
+
 class LaneLines:
   # the model's two lane lines in the radar's left positive frame, sampled at a distance ahead so a bend keeps
   # the target lane band on the lane. While the car straddles the line it crosses, the model doubts which lane is
@@ -104,13 +110,12 @@ class LaneLines:
     # the lane the car is moving into: from the line it crosses to one lane width beyond, shifted by the
     # lines' sweep out to x; the car's offset in its lane is bounded, the sweep of a bend is not
     if self.crossed is not None:
-      crossed_x, crossed_y = self.crossed
       width = self.width if self.width is not None else LANE_WIDTH_DEFAULT
       # the near edge stays off the car's own path, the far edge one lane width past the line itself
-      line = -side_left(direction) * float(crossed_y[0])
+      line = -side_left(direction) * float(self.crossed[1][0])
       near = float(np.clip(line, LINE_OFFSET_MIN, LINE_OFFSET_MAX))
       far = min(line, LINE_OFFSET_MAX) + width
-      sweep = float(np.interp(x, crossed_x, crossed_y)) - float(crossed_y[0])
+      sweep = line_sweep(self.crossed, x)
       if direction == LaneChangeDirection.left:
         return near + sweep, far + sweep
       return -far + sweep, -near + sweep
@@ -342,10 +347,7 @@ class LaneChangeGap:
   def beside(self, d_rel, y_rel, direction):
     # the radar lateral toward the lane being left, measured from the crossed line's sweep out to that distance, so
     # neither a bend nor the car's yaw mid change puts a car still in its lane beside the car
-    sweep = 0.0
-    if self.crossed is not None:
-      crossed_x, crossed_y = self.crossed
-      sweep = float(np.interp(d_rel + RADAR_TO_CAMERA, crossed_x, crossed_y)) - float(crossed_y[0])
+    sweep = line_sweep(self.crossed, d_rel + RADAR_TO_CAMERA) if self.crossed is not None else 0.0
     return side_left(direction) * (y_rel - sweep) >= LEAD_BESIDE
 
   def was_released(self, lead):
