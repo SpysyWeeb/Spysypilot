@@ -673,15 +673,32 @@ class TestLeadRelease:
     step(gap, model=change_right(path=0.0, lead_std=0.2, lead_y=0.0), CS=right_blinker(), radar_state=radar_state, tracks=tracks, n=5)
     assert released(gap) == [False, False]
     assert gap.passing_id == -1 and not gap.moved_over
-    # the plan moving off the lead does not release it either
-    step(gap, model=change_right(path=path_for(1.5, d_rel, LaneChangeDirection.right), lead_std=0.2, lead_y=0.0), CS=right_blinker(),
-         radar_state=radar_state, tracks=tracks, n=5)
-    assert released(gap) == [False, False]
     # where the model puts its lead there too, or cannot place it, the track is the lead: beside, and released however close
     for lead_std, lead_y in ((0.2, -y_rel), (LEAD_UNPLACED_STD_HOLD, 0.0)):
       gap = LaneChangeGap(CP, DT_MDL)
       step(gap, model=change_right(path=0.0, lead_std=lead_std, lead_y=lead_y), CS=right_blinker(), radar_state=radar_state, tracks=tracks)
       assert released(gap) == [True, True] and gap.passing_id == 7
+    # released beside where the model put its lead, then with the model's lead back on the path, it is no car beside
+    # and the floor judges it again
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=change_right(path=0.0, lead_std=0.2, lead_y=-y_rel), CS=right_blinker(), radar_state=radar_state, tracks=tracks)
+    back = change_right(path=0.0, lead_std=0.2, lead_y=0.0)
+    step(gap, model=back, CS=right_blinker(), radar_state=radar_state, tracks=tracks, n=CLOSE_FRAMES - 1)
+    assert released(gap) == [True, True]
+    step(gap, model=back, CS=right_blinker(), radar_state=radar_state, tracks=tracks)
+    assert released(gap) == [False, False] and gap.closing
+    # far out, where the floor would let it go, the track is still no new release for a lead the model places elsewhere
+    far = get_radar_state(d_rel=FAR, y_rel=y_rel, lead_two='same')
+    far_tracks = get_tracks((FAR, y_rel, -1.0, 7))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=change_right(path=0.0, lead_std=0.2, lead_y=0.0), CS=right_blinker(), radar_state=far, tracks=far_tracks, n=5)
+    assert released(gap) == [False, False]
+    # a car released where the model put its lead holds its release on the path when the model's lead moves off it, as the
+    # floor watches it
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=change_right(path=0.0, lead_std=0.2, lead_y=-y_rel), CS=right_blinker(), radar_state=far, tracks=far_tracks)
+    step(gap, model=change_right(path=0.0, lead_std=0.2, lead_y=0.0), CS=right_blinker(), radar_state=far, tracks=far_tracks, n=5)
+    assert released(gap) == [True, True]
 
   def test_car_being_passed_is_followed_across_a_track_id_change(self):
     path = path_for(1.5, FAR)

@@ -207,18 +207,18 @@ class LaneChangeGap:
   A slower lead cannot be passed at any finite gap, and after the handoff the model's lead slides onto
   the lane being left with no radar return behind it. So while the target lane is clear and the driver
   has not backed out, the MPC stops following a radar lead the planned path has left toward that lane,
-  unless the model places the lead radard matched it to elsewhere, and, once the car being passed has
-  gone off the path and until the car is across, a lead only the model sees while it is off the path
-  too, the model cannot place it and radar sees nothing on the path. A stopped lead is always
+  a new one only where the model's lead radard matched it to is too, and, once the car being passed
+  has gone off the path and until the car is across, a lead only the model sees while it is off the
+  path too, the model cannot place it and radar sees nothing on the path. A stopped lead is always
   followed, and so is one the floor, too_close(), finds too close: one that would need more than
   RESTORE_DECEL of steady braking to stop closing before the follow distance, or is inside that
   distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or the car being
   passed, has been too close for CLOSE_FRAMES running, every lead is followed at the full gap until
   the car being passed is beside the car. A radar lead beside the car is past the floor and the latch
-  while the plan keeps as clear of it. Far out the path can stray LEAD_OFF_PATH from a car still in
-  the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict
-  when radard gives both slots the same radar track, is judged on its own otherwise, and is never
-  released while braking.
+  while the model's lead is there too and the plan keeps as clear of it. Far out the path can stray
+  LEAD_OFF_PATH from a car still in the lane, but a far lead rarely binds and the same floor bounds
+  it. leadTwo gets leadOne's verdict when radard gives both slots the same radar track, is judged on
+  its own otherwise, and is never released while braking.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -405,7 +405,10 @@ class LaneChangeGap:
     offset = path_offset(model, lead.dRel, lead.yRel, direction)
     lead_model = model_lead(model, i)
     if lead.radar:
-      return lateral_agrees(lead, lead_model) and offset > (LEAD_ON_PATH if self.was_released(lead) else LEAD_OFF_PATH)
+      # a new car needs the model's lead where its track is, and one released holds on the path, as the floor watches it
+      if self.was_released(lead):
+        return offset > LEAD_ON_PATH
+      return offset > LEAD_OFF_PATH and lateral_agrees(lead, lead_model)
     # a lead only the model sees: released once the car being passed has gone off the path, while the model cannot
     # place it, radar sees nothing on the path out past it and it is off the path itself, as a radar lead is. The
     # model's range on such a lead can run 5 to 15 m long, so one on the path may be the car ahead. It is the model's
@@ -424,11 +427,13 @@ class LaneChangeGap:
     one = self.releases(0, leads[0], model, direction, radar_tracks)
     # one radar track in both slots is one car, whatever the model's second lead shows; a pair matched on range and speed
     # alone can be two cars, so each lead is judged on its own
-    two = one if self.same_track(*leads) else self.releases(1, leads[1], model, direction, radar_tracks)
+    same = self.same_track(*leads)
+    two = one if same else self.releases(1, leads[1], model, direction, radar_tracks)
     two = two and not self.lead_two_braking(radar_state, model)
-    # a car beside is past the floor while the plan keeps clear of it too; one the path swings back toward is judged again
-    beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) and path_offset(model, lead.dRel, lead.yRel, direction) >= LEAD_BESIDE
-              for lead in leads]
+    # a car beside is past the floor while the model's lead is there too and the plan keeps as clear of it; one the path
+    # swings back toward is judged again
+    beside = [lead.radar and lateral_agrees(lead, model_lead(model, 0 if same else k)) and self.beside(lead.dRel, lead.yRel, direction) and
+              path_offset(model, lead.dRel, lead.yRel, direction) >= LEAD_BESIDE for k, lead in enumerate(leads)]
     close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
              for candidate, b, lead in zip((one, two), beside, leads, strict=True)]
     # the car being passed still overlaps the car after the model has moved its lead elsewhere
