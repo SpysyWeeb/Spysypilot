@@ -448,7 +448,9 @@ class LaneChangeGap:
       self.lead_speeds.append(lead.vLead)
     passing = self.follow_passing(radar_tracks) if starting else None
     if starting:
-      self.landed_frames = self.landed_frames + 1 if self.landed(direction) else 0
+      # counted on the line as placed this frame: one held through a blackout is no new sign of landing
+      if self.crossed_age == 0.0:
+        self.landed_frames = self.landed_frames + 1 if self.landed(direction) else 0
       self.across = self.across or self.landed_frames >= LANDED_FRAMES
       # the model handing the lead over or the time limit end the relaxation only; the driver backing out or
       # the lead braking, whichever lead is in front, end the acceleration for this change too

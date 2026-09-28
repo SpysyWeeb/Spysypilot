@@ -597,7 +597,7 @@ class TestLeadRelease:
     assert gap.passing_id == 7 and gap.leaving
 
   def vision_after_handoff(self, gap, passed_offset, lead_std=1.5, lead_offset=LEAD_OFF_PATH + 0.5, d_rel=70.0, tracks=(), left_line=-1.6, n=1,
-                           lead_two_offset=None):
+                           lead_two_offset=None, probs=(1.0, 1.0), line_stds=None):
     # the change starts behind radar track 7 at FAR; the model has since handed its lead to one only it sees, lead_offset
     # meters off the path toward the lane being left, and optionally a second one a meter further at the same speed
     path = path_for(passed_offset, FAR)
@@ -605,7 +605,8 @@ class TestLeadRelease:
     if lead_two_offset is not None:
       lead_two = {'radar': False, 'track_id': -1, 'd_rel': d_rel + 1.0, 'y_rel': on_path(d_rel + 1.0, path) - lead_two_offset}
     radar_state = get_radar_state(radar=False, track_id=-1, d_rel=d_rel, y_rel=on_path(d_rel, path) - lead_offset, lead_two=lead_two)
-    model = get_model(path=path, lead_std=lead_std, lead_two_std=None if lead_two is None else lead_std, left_y=left_line, right_y=left_line + 3.36)
+    model = get_model(path=path, lead_std=lead_std, lead_two_std=None if lead_two is None else lead_std, left_y=left_line, right_y=left_line + 3.36,
+                      probs=probs, line_stds=line_stds)
     step(gap, model=model, radar_state=radar_state, tracks=get_tracks((FAR, 0.0, -1.0, 7), *tracks), n=n)
     return released(gap)[0]
 
@@ -715,6 +716,14 @@ class TestLeadRelease:
     step(gap, model=get_model(path=path_for(1.5, FAR), left_y=landed, right_y=landed + 3.36), radar_state=get_radar_state(track_id=8, d_rel=FAR),
          tracks=get_tracks((FAR, 0.0, -1.0, 7), (FAR, 0.0, -1.0, 8)))
     assert released(gap)[0]
+    # one landed frame, then the model places no line for a moment: the line held meanwhile is no new sign of landing
+    gap = self.start_behind_track_7()
+    for left_line in np.linspace(-1.6, LANDED_MARGIN - 0.1, 11):
+      self.vision_after_handoff(gap, 1.5, left_line=left_line)
+    assert self.vision_after_handoff(gap, 1.5, left_line=landed)
+    assert self.vision_after_handoff(gap, 1.5, left_line=landed, probs=(0.0,) * 4, line_stds=(1.0,) * 4, n=5)
+    assert self.vision_after_handoff(gap, 1.5, left_line=landed, n=LANDED_FRAMES - 2)
+    assert not self.vision_after_handoff(gap, 1.5, left_line=landed)
 
   def test_lead_two_is_judged_on_its_own(self):
     gap = LaneChangeGap(CP, DT_MDL)
