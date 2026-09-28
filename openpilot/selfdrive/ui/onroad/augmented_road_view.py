@@ -26,8 +26,8 @@ BORDER_COLORS = {
   UIStatus.AOL_ACTIVE: rl.Color(0x1E, 0x3A, 0x8A, 0xFF),  # Dark blue for AOL active state
 }
 
-WIDE_CAM_MAX_SPEED = 10.0  # m/s (22 mph)
-ROAD_CAM_MIN_SPEED = 15.0  # m/s (34 mph)
+WIDE_CAM_MAX_SPEED = 5.0  # m/s (11 mph)
+ROAD_CAM_MIN_SPEED = 10.0  # m/s (22 mph)
 INF_POINT = np.array([1000.0, 0.0, 0.0])
 
 
