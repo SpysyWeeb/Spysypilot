@@ -30,6 +30,10 @@ LANE_WIDTH_MIN = 2.7
 LANE_WIDTH_MAX = 4.5
 LINE_OFFSET_MIN = 1.0        # m, distance from the car to the line it will cross
 LINE_OFFSET_MAX = 2.5
+LINE_STD_MAX = 0.3           # m, a line placed this well marks the lane even while the model doubts it is the car's
+LINE_HOLD = 1.0              # s, the model places no line for a moment while it relabels them
+LANDED_MARGIN = 0.5          # m, the car's center past the line it crossed
+ROADSIDE_MARGIN = 0.9        # m, a stopped car in the target lane shows at least half its width inside the outer line
 TRACK_MIN_DISTANCE = 2.0     # m, closer returns are beside the car, which the blind spot monitor covers
 TRACK_MOVING_SPEED = 2.0     # m/s absolute, below this a return is clutter, a stopped car or oncoming traffic
 ARRIVAL_TIME = 3.0           # s, a target lane car inside the follow gap by then blocks
@@ -48,16 +52,25 @@ BSM_FLAGS = {
 }
 
 
+def side_left(direction):
+  # +1 when the lane being left is on the radar's positive (left) side, a change to the right
+  return 1.0 if direction == LaneChangeDirection.right else -1.0
+
+
 class LaneLines:
   # the model's two lane lines in the radar's left positive frame, sampled at a distance ahead so a bend keeps
-  # the target lane band on the lane
-  def __init__(self, model):
+  # the target lane band on the lane. While the car straddles the line it crosses, the model doubts which lane is
+  # the car's and the lines' probabilities collapse, so the owner passes that line in, followed by position, with
+  # the last confident lane width
+  def __init__(self, model, crossed=None, width=None):
     lane_lines, probs = model.laneLines, model.laneLineProbs
     valid = len(lane_lines) >= 3 and len(probs) >= 3 and len(lane_lines[1].x) > 0 and len(lane_lines[2].x) > 0
     self.left_valid = valid and probs[1] > 0.5
     self.right_valid = valid and probs[2] > 0.5
     self.x = (np.array(lane_lines[1].x), np.array(lane_lines[2].x)) if valid else None
     self.y = (-np.array(lane_lines[1].y), -np.array(lane_lines[2].y)) if valid else None
+    self.crossed = crossed
+    self.width = width
 
   def line(self, i, x):
     return float(np.interp(x, self.x[i], self.y[i]))
@@ -73,6 +86,17 @@ class LaneLines:
   def band(self, direction, x):
     # the lane the car is moving into: from the line it crosses to one lane width beyond, shifted by the
     # lines' sweep out to x; the car's offset in its lane is bounded, the sweep of a bend is not
+    if self.crossed is not None:
+      crossed_x, crossed_y = self.crossed
+      width = self.width if self.width is not None else LANE_WIDTH_DEFAULT
+      # the near edge stays off the car's own path, the far edge one lane width past the line itself
+      line = -side_left(direction) * float(crossed_y[0])
+      near = float(np.clip(line, LINE_OFFSET_MIN, LINE_OFFSET_MAX))
+      far = min(line, LINE_OFFSET_MAX) + width
+      sweep = float(np.interp(x, crossed_x, crossed_y)) - float(crossed_y[0])
+      if direction == LaneChangeDirection.left:
+        return near + sweep, far + sweep
+      return -far + sweep, -near + sweep
     left = self.line(0, 0.0) if self.left_valid else None
     right = self.line(1, 0.0) if self.right_valid else None
     width = float(np.clip(left - right, LANE_WIDTH_MIN, LANE_WIDTH_MAX)) if left is not None and right is not None else LANE_WIDTH_DEFAULT
@@ -97,8 +121,12 @@ def target_lane_blocked(direction, lines, radar_tracks, v_ego, t_follow, stop_di
       continue
     v_track = v_ego + pt.vRel
     if v_track < TRACK_MOVING_SPEED:
-      # stationary returns are mostly clutter, so only one already inside the follow gap counts as a stopped car;
-      # oncoming traffic is judged where it will be
+      # stationary returns are mostly clutter, so only one already inside the follow gap counts as a stopped car, and
+      # one on the lane's outer edge is the roadside, where a stopped car in the lane cannot sit; oncoming traffic is
+      # judged where it will be, on that edge too, which is where it drives on a two-lane road
+      outer = hi if direction == LaneChangeDirection.left else lo
+      if abs(v_track) < TRACK_MOVING_SPEED and abs(outer - pt.yRel) < ROADSIDE_MARGIN:
+        continue
       arrival = pt.dRel + pt.vRel * ARRIVAL_TIME if v_track < -TRACK_MOVING_SPEED else pt.dRel
       if arrival < follow_gap:
         return True
@@ -133,6 +161,11 @@ class LaneChangeGap:
     self.lead_v_rel = 0.0
     self.lead_v_max = 0.0
     self.lead_speeds = deque(maxlen=LEAD_SPEED_FRAMES)
+    self.lines_seen = [None, None]
+    self.lines_age = [np.inf, np.inf]
+    self.lane_width = None
+    self.crossed = None
+    self.crossed_age = 0.0
     self.reset()
 
   def reset(self):
@@ -176,10 +209,45 @@ class LaneChangeGap:
       return not CS.leftBlinker or (CS.steeringPressed and CS.steeringTorque < 0)
     return not CS.rightBlinker or (CS.steeringPressed and CS.steeringTorque > 0)
 
+  def follow_lines(self, model, direction, starting):
+    # the car's own lines whenever the model places them, and through the change the line being crossed, followed
+    # by position: the model keeps placing it while it doubts it is the car's, and relabels it once the car is across
+    lines, probs, stds = model.laneLines, model.laneLineProbs, model.laneLineStds
+    valid = len(lines) == 4 and len(probs) == 4 and all(len(line.x) > 0 for line in lines)
+    placed = [valid and (probs[i] > 0.5 or (len(stds) == 4 and stds[i] < LINE_STD_MAX)) for i in range(4)]
+    if valid and probs[1] > 0.5 and probs[2] > 0.5:
+      self.lane_width = float(np.clip(lines[2].y[0] - lines[1].y[0], LANE_WIDTH_MIN, LANE_WIDTH_MAX))
+    if not (starting and self.starting_prev):
+      for side, i in enumerate((1, 2)):
+        self.lines_age[side] += self.dt
+        if placed[i]:
+          self.lines_seen[side], self.lines_age[side] = (np.array(lines[i].x), -np.array(lines[i].y)), 0.0
+    if not starting:
+      self.crossed = None
+    elif not self.starting_prev:
+      side = 0 if direction == LaneChangeDirection.left else 1
+      seen, age = self.lines_seen[side], self.lines_age[side]
+      self.crossed = seen if seen is not None and age <= LINE_HOLD and abs(seen[1][0]) < LINE_OFFSET_MAX else None
+      self.crossed_age = 0.0
+    elif self.crossed is not None:
+      # the placed line nearest where the crossed line was; the next one over is at least a lane away
+      gaps = [abs(-lines[i].y[0] - self.crossed[1][0]) if placed[i] else np.inf for i in range(4)]
+      i = int(np.argmin(gaps))
+      if gaps[i] < LANE_WIDTH_MIN / 2:
+        self.crossed, self.crossed_age = (np.array(lines[i].x), -np.array(lines[i].y)), 0.0
+      else:
+        self.crossed_age += self.dt
+        if self.crossed_age > LINE_HOLD:
+          self.crossed = None
+
+  def landed(self, direction):
+    return self.crossed is not None and side_left(direction) * self.crossed[1][0] >= LANDED_MARGIN
+
   def target_lane_clear(self, direction, CS, model, radar_tracks, radar_ok, v_ego, t_follow, stop_distance, comfort_brake):
     blind_spot = CS.leftBlindspot if direction == LaneChangeDirection.left else CS.rightBlindspot
-    if blind_spot or not radar_ok or \
-       target_lane_blocked(direction, LaneLines(model), radar_tracks, v_ego, t_follow, stop_distance, comfort_brake):
+    # once across the line, the lane moved into is the car's own, where its leads are followed
+    if blind_spot or not radar_ok or (not self.landed(direction) and target_lane_blocked(
+       direction, LaneLines(model, self.crossed, self.lane_width), radar_tracks, v_ego, t_follow, stop_distance, comfort_brake)):
       self.blocked_timer = BLOCKED_HOLD
     else:
       self.blocked_timer = max(self.blocked_timer - self.dt, 0.0)
@@ -189,6 +257,7 @@ class LaneChangeGap:
     direction = model.meta.laneChangeDirection
     starting = model.meta.laneChangeState == LaneChangeState.laneChangeStarting and direction != LaneChangeDirection.none
     lead = radar_state.leadOne
+    self.follow_lines(model, direction, starting)
 
     if starting and not self.starting_prev:
       self.armed = self.enabled and lead.present

@@ -5,9 +5,9 @@ from opendbc.car.structs import car
 from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_change_gap import (LaneChangeGap, LaneLines, target_lane_blocked, ARRIVAL_TIME, BLOCKED_HOLD,
-                                                              LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BRAKING, LEAD_CONTINUITY,
-                                                              LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, MIN_HEADROOM, RADAR_TO_CAMERA,
-                                                              RELAX_TIME_MAX)
+                                                              LANDED_MARGIN, LANE_CHANGE_T_FOLLOW, LANE_WIDTH_DEFAULT, LEAD_BRAKING,
+                                                              LEAD_CONTINUITY, LEAD_SLOWING, LEAD_SPEED_CONTINUITY, LEAD_SPEED_FRAMES, LINE_HOLD,
+                                                              MIN_HEADROOM, RADAR_TO_CAMERA, RELAX_TIME_MAX, ROADSIDE_MARGIN)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 LaneChangeState = log.LaneChangeState
@@ -24,7 +24,7 @@ CP = car.CarParams.new_message(radarUnavailable=False, brand='hyundai', flags=Hy
 
 
 def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDirection.left, left_y=-1.6, right_y=1.76, probs=(1.0, 1.0),
-              curvature=0.0, lead_accel=0.0, lead_prob=1.0):
+              curvature=0.0, lead_accel=0.0, lead_prob=1.0, line_stds=None, lines=None):
   model = log.ModelDataV2.new_message()
   model.init('leadsV3', 1)
   model.leadsV3[0].prob = lead_prob
@@ -32,10 +32,13 @@ def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDire
   model.meta.laneChangeState = state
   model.meta.laneChangeDirection = direction
   model.init('laneLines', 4)
-  for line, y in zip(model.laneLines, (left_y - 3.5, left_y, right_y, right_y + 3.5), strict=True):
+  lines = lines if lines is not None else (left_y - 3.5, left_y, right_y, right_y + 3.5)
+  for line, y in zip(model.laneLines, lines, strict=True):
     line.x = X_IDXS.tolist()
     line.y = (y + curvature * X_IDXS**2 / 2).tolist()
-  model.laneLineProbs = [1.0, *probs, 1.0]
+  model.laneLineProbs = [1.0, *probs, 1.0] if len(probs) == 2 else list(probs)
+  if line_stds is not None:
+    model.laneLineStds = list(line_stds)
   return model
 
 
@@ -355,3 +358,102 @@ class TestLaneChangeGap:
     assert relaxed(gap)
     assert step(gap, model=get_model(state=LaneChangeState.off)) == 0.0
     assert not gap.accelerate and not gap.armed
+
+
+def change_right(**kwargs):
+  return get_model(direction=LaneChangeDirection.right, **kwargs)
+
+
+def right_blinker(**kwargs):
+  return get_car_state(left_blinker=False, rightBlinker=True, **kwargs)
+
+
+class TestCrossedLine:
+  # a change to the right: the car's lines at -1.8 and +1.2 m (model frame, right positive), 3.0 m apart
+  PLACED = (0.1, 0.1, 0.1, 0.1)
+  DOUBTED = (0.0, 0.05, 0.05, 0.0)
+
+  def run(self, gap, right_line, probs, stds, tracks=(), state=LaneChangeState.laneChangeStarting, CS=None, n=1, lines=None):
+    lines = lines if lines is not None else (right_line - 6.0, right_line - 3.0, right_line, right_line + 3.5)
+    model = change_right(state=state, lines=lines, probs=probs, line_stds=stds)
+    step(gap, model=model, CS=CS if CS is not None else right_blinker(), radar_state=get_radar_state(present=False),
+         tracks=get_tracks(*tracks), n=n)
+    return gap.blocked_timer > 0.0
+
+  def test_band_follows_the_crossed_line_the_model_doubts(self):
+    # route bb: a pickup two lanes over at 30 m, 5.2 m to the right, slowing to turn off
+    pickup = [(30.0, -5.2, -4.9)]
+    target_lane_car = [(30.0, -2.5, -4.9)]
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    assert not self.run(gap, 1.0, self.DOUBTED, self.PLACED, tracks=pickup, n=10)
+    assert self.run(gap, 1.0, self.DOUBTED, self.PLACED, tracks=target_lane_car)
+    # the lines as such fall back to the default lane, which reaches the pickup
+    lo, hi = LaneLines(change_right(probs=(0.0, 0.05, 0.05, 0.0))).band(LaneChangeDirection.right, 30.0 + RADAR_TO_CAMERA)
+    assert lo <= -5.2 <= hi
+
+  def test_crossed_line_is_followed_across_the_relabel(self):
+    beyond = [(30.0, -4.5, -4.9)]
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    for right_line in np.arange(1.2, 0.0, -0.1):
+      self.run(gap, right_line, self.DOUBTED, self.PLACED)
+    # the model relabels: the crossed line is now the car's left line, 0.6 m to its left
+    relabelled = (-3.6, -LANDED_MARGIN - 0.1, 2.9, 6.4)
+    assert not self.run(gap, None, (0.5, 0.7, 0.7, 0.5), self.PLACED, lines=relabelled, tracks=beyond)
+    assert gap.landed(LaneChangeDirection.right)
+    # the blind spot still counts after landing
+    assert self.run(gap, None, (0.5, 0.7, 0.7, 0.5), self.PLACED, lines=relabelled, CS=right_blinker(rightBlindspot=True))
+
+  def test_crossed_line_hold_expires(self):
+    pickup = [(30.0, -5.2, -4.9)]
+    lost = (1.0, 1.0, 1.0, 1.0)
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    assert not self.run(gap, 1.0, self.DOUBTED, self.PLACED, tracks=pickup)
+    assert not self.run(gap, 1.0, self.DOUBTED, lost, tracks=pickup, n=int(round(LINE_HOLD / DT_MDL)) - 1)
+    assert self.run(gap, 1.0, self.DOUBTED, lost, tracks=pickup, n=2)
+    assert gap.crossed is None
+
+  def test_crossed_line_is_seeded_before_the_change(self):
+    pickup = [(30.0, -5.2, -4.9)]
+    lost = (1.0, 1.0, 1.0, 1.0)
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    self.run(gap, 1.2, self.DOUBTED, lost, state=LaneChangeState.preLaneChange, n=int(round(LINE_HOLD / DT_MDL)) + 2)
+    assert self.run(gap, 1.0, self.DOUBTED, lost, tracks=pickup)
+    assert gap.crossed is None
+
+  def test_band_width_is_the_last_confident_lane(self):
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    self.run(gap, 1.0, self.DOUBTED, self.PLACED)
+    lo, hi = LaneLines(change_right(probs=self.DOUBTED), gap.crossed, gap.lane_width).band(LaneChangeDirection.right, 0.0)
+    assert np.isclose(hi - lo, 3.0) and np.isclose(hi, -1.0)
+
+  def test_far_edge_stays_one_lane_past_the_crossed_line(self):
+    # with the car 0.2 m from the line, the near edge is kept off its path but the far edge does not move out
+    # into the next lane over
+    gap = LaneChangeGap(CP, DT_MDL)
+    self.run(gap, 1.2, (0.8, 0.9, 0.8, 0.8), self.PLACED, state=LaneChangeState.preLaneChange)
+    for right_line in np.arange(1.2, 0.2, -0.1):
+      self.run(gap, right_line, self.DOUBTED, self.PLACED)
+    far = 0.2 + 3.0
+    assert not self.run(gap, 0.2, self.DOUBTED, self.PLACED, tracks=[(30.0, -(far + 0.5), -4.9)])
+    assert self.run(gap, 0.2, self.DOUBTED, self.PLACED, tracks=[(30.0, -(far - 0.5), -4.9)])
+
+
+class TestRoadside:
+  def test_stationary_return_on_the_outer_line_is_the_roadside(self):
+    _, outer = LaneLines(get_model()).band(LaneChangeDirection.left, FOLLOW_GAP - 1.0 + RADAR_TO_CAMERA)
+    assert not blocked(get_tracks((FOLLOW_GAP - 1.0, outer - ROADSIDE_MARGIN / 2, -V_EGO)))
+    assert blocked(get_tracks((FOLLOW_GAP - 1.0, outer - 2 * ROADSIDE_MARGIN, -V_EGO)))
+    # a car moving with traffic there is a car
+    assert blocked(get_tracks((FOLLOW_GAP - 1.0, outer - ROADSIDE_MARGIN / 2, 0.0)))
+
+  def test_oncoming_car_on_the_outer_line_is_a_car(self):
+    # on a two-lane road the target lane's outer edge is where oncoming traffic drives
+    arriving = FOLLOW_GAP + 2.0 * V_EGO * ARRIVAL_TIME - 1.0
+    _, outer = LaneLines(get_model()).band(LaneChangeDirection.left, arriving + RADAR_TO_CAMERA)
+    assert blocked(get_tracks((arriving, outer - ROADSIDE_MARGIN / 2, -2.0 * V_EGO)))
+    assert not blocked(get_tracks((arriving + 2.0, outer - ROADSIDE_MARGIN / 2, -2.0 * V_EGO)))
