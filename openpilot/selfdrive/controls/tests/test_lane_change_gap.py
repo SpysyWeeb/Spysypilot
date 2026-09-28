@@ -27,13 +27,16 @@ CP = car.CarParams.new_message(radarUnavailable=False, brand='hyundai', flags=Hy
 
 def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDirection.left, left_y=-1.6, right_y=1.76, probs=(1.0, 1.0),
               curvature=0.0, lead_accel=0.0, lead_prob=1.0, path=None, lead_std=None, lead_two_std=None, lead_two_accel=0.0,
-              line_stds=None, lines=None):
+              line_stds=None, lines=None, lead_y=None):
   model = log.ModelDataV2.new_message()
   model.init('leadsV3', 1 if lead_two_std is None else 2)
   model.leadsV3[0].prob = lead_prob
   model.leadsV3[0].a = [lead_accel] * len(ModelConstants.LEAD_T_IDXS)
   if lead_std is not None:
     model.leadsV3[0].yStd = [lead_std] * len(ModelConstants.LEAD_T_IDXS)
+  if lead_y is not None:
+    # where the model places its lead, right positive
+    model.leadsV3[0].y = [lead_y] * len(ModelConstants.LEAD_T_IDXS)
   if lead_two_std is not None:
     model.leadsV3[1].prob = lead_prob
     model.leadsV3[1].a = [lead_two_accel] * len(ModelConstants.LEAD_T_IDXS)
@@ -573,6 +576,26 @@ class TestLeadRelease:
     gap = LaneChangeGap(CP, DT_MDL)
     step(gap, model=get_model(path=path_for(1.5, d_rel)), radar_state=radar_state, tracks=tracks)
     assert released(gap)[0] and gap.moved_over
+
+  def test_track_of_a_car_in_the_next_lane_is_not_the_leads(self):
+    # radard matches the model's lead to a radar track on range and speed alone: with no return from the lead itself, a
+    # motorcycle say, it comes with the track of a car in the lane being left, 3.3 m to the side of it
+    d_rel, y_rel = 30.0, LEAD_BESIDE + 1.3
+    radar_state = get_radar_state(d_rel=d_rel, v_rel=-5.0, y_rel=y_rel, lead_two='same')
+    tracks = get_tracks((d_rel, y_rel, -5.0, 7))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=change_right(path=0.0, lead_std=0.2, lead_y=0.0), CS=right_blinker(), radar_state=radar_state, tracks=tracks, n=5)
+    assert released(gap) == [False, False]
+    assert gap.passing_id == -1 and not gap.moved_over
+    # the plan moving off the lead does not release it either
+    step(gap, model=change_right(path=path_for(1.5, d_rel, LaneChangeDirection.right), lead_std=0.2, lead_y=0.0), CS=right_blinker(),
+         radar_state=radar_state, tracks=tracks, n=5)
+    assert released(gap) == [False, False]
+    # where the model puts its lead there too, or cannot place it, the track is the lead: beside, and released however close
+    for lead_std, lead_y in ((0.2, -y_rel), (LEAD_UNPLACED_STD_HOLD, 0.0)):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=change_right(path=0.0, lead_std=lead_std, lead_y=lead_y), CS=right_blinker(), radar_state=radar_state, tracks=tracks)
+      assert released(gap) == [True, True] and gap.passing_id == 7
 
   def test_car_being_passed_is_followed_across_a_track_id_change(self):
     path = path_for(1.5, FAR)

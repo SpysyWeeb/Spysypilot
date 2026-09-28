@@ -160,6 +160,19 @@ def target_lane_blocked(direction, lines, radar_tracks, v_ego, t_follow, stop_di
   return False
 
 
+def model_lead(model, i):
+  return model.leadsV3[i] if len(model.leadsV3) > i else None
+
+
+def lateral_agrees(lead, lead_model):
+  # radard pairs the model's lead with its likeliest radar track on range and speed, with no lateral bound, so a car the
+  # radar does not see, a motorcycle say, can come with the track of a car in the next lane. Where the model places its
+  # lead, the track stands for it only in the same place
+  if lead_model is None or len(lead_model.y) == 0 or len(lead_model.yStd) == 0 or lead_model.yStd[0] >= LEAD_UNPLACED_STD_HOLD:
+    return True
+  return abs(lead.yRel + lead_model.y[0]) < LEAD_CONTINUITY
+
+
 def too_close(d_rel, v_rel, v_lead, a_ego, t_follow, stop_distance):
   # whether a car handed back to the MPC now, after the car has kept its acceleration for RESTORE_LAG, needs more than
   # RESTORE_DECEL of steady braking to stop closing before the follow distance behind it. That bounds the average, not
@@ -189,16 +202,17 @@ class LaneChangeGap:
   A slower lead cannot be passed at any finite gap, and after the handoff the model's lead slides onto
   the lane being left with no radar return behind it. So while the target lane is clear and the driver
   has not backed out, the MPC stops following a radar lead the planned path has left toward that lane,
-  and, once the car being passed has gone off the path and until the car is across, a lead only the
-  model sees while it is off the path too, the model cannot place it and radar sees nothing on the
-  path. A stopped lead is always followed, and so is one the floor, too_close(), finds too close: one
-  that would need more than RESTORE_DECEL of steady braking to stop closing before the follow distance,
-  or is inside that distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or
-  the car being passed, has been too close for LEAD_SPEED_FRAMES running, every lead not beside the car
-  is followed at the full gap until the car being passed is beside it. Far out the path can stray
-  LEAD_OFF_PATH from a car still in the lane, but a far lead rarely binds and the same floor bounds
-  it. leadTwo gets leadOne's verdict when it is the same car, unless it sits on the target side, is
-  judged on its own otherwise, and is never released while braking.
+  unless the model places the lead radard matched it to elsewhere, and, once the car being passed has
+  gone off the path and until the car is across, a lead only the model sees while it is off the path
+  too, the model cannot place it and radar sees nothing on the path. A stopped lead is always
+  followed, and so is one the floor, too_close(), finds too close: one that would need more than
+  RESTORE_DECEL of steady braking to stop closing before the follow distance, or is inside that
+  distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or the car being
+  passed, has been too close for LEAD_SPEED_FRAMES running, every lead not beside the car is followed
+  at the full gap until the car being passed is beside it. Far out the path can stray LEAD_OFF_PATH
+  from a car still in the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets
+  leadOne's verdict when it is the same car, unless it sits on the target side, is judged on its own
+  otherwise, and is never released while braking.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -284,8 +298,8 @@ class LaneChangeGap:
 
   @staticmethod
   def model_braking(model, i):
-    model_lead = model.leadsV3[i] if len(model.leadsV3) > i else None
-    return model_lead is not None and model_lead.prob > 0.5 and len(model_lead.a) > 0 and model_lead.a[0] < LEAD_BRAKING
+    lead_model = model_lead(model, i)
+    return lead_model is not None and lead_model.prob > 0.5 and len(lead_model.a) > 0 and lead_model.a[0] < LEAD_BRAKING
 
   def lead_braking(self, lead, model):
     # the radar's filtered deceleration lags a hard brake by about half a second; the raw speed and the
@@ -385,19 +399,19 @@ class LaneChangeGap:
     if not lead.present or lead.vLead < TRACK_MOVING_SPEED:
       return False
     offset = path_offset(model, lead.dRel, lead.yRel, direction)
+    lead_model = model_lead(model, i)
     if lead.radar:
-      return offset > (LEAD_ON_PATH if self.was_released(lead) else LEAD_OFF_PATH)
+      return lateral_agrees(lead, lead_model) and offset > (LEAD_ON_PATH if self.was_released(lead) else LEAD_OFF_PATH)
     # a lead only the model sees: released once the car being passed has gone off the path, while the model cannot
     # place it, radar sees nothing on the path out past it and it is off the path itself, as a radar lead is. The
     # model's range on such a lead can run 5 to 15 m long, so one on the path may be the car ahead. It is the model's
     # slot rather than a tracked car, so the slot's release holds while its lead stays unplaced and off the path. Once
     # the car is across, the model's lead is the one in the lane moved into
-    model_lead = model.leadsV3[i] if len(model.leadsV3) > i else None
-    if model_lead is None or len(model_lead.yStd) == 0 or not self.leaving or self.across:
+    if lead_model is None or len(lead_model.yStd) == 0 or not self.leaving or self.across:
       return False
     held = self.released_vision[i]
     return offset > (LEAD_ON_PATH if held else LEAD_OFF_PATH) and \
-           model_lead.yStd[0] >= (LEAD_UNPLACED_STD_HOLD if held else LEAD_UNPLACED_STD) and \
+           lead_model.yStd[0] >= (LEAD_UNPLACED_STD_HOLD if held else LEAD_UNPLACED_STD) and \
            self.corridor_clear(model, direction, radar_tracks, lead.dRel, LEAD_ON_PATH if held else LEAD_OFF_PATH)
 
   def release_leads(self, radar_state, model, direction, radar_tracks, passing, v_ego, a_ego, t_follow, stop_distance):
@@ -444,7 +458,8 @@ class LaneChangeGap:
       # unknown until a full window has been read, so a glitch on this frame cannot set it
       self.lead_v_max = -np.inf
       self.remember(lead)
-      self.passing_id = lead.radarTrackId if lead.present and lead.radar else -1
+      # the car being passed is the lead's radar track, where the model puts its lead
+      self.passing_id = lead.radarTrackId if lead.present and lead.radar and lateral_agrees(lead, model_lead(model, 0)) else -1
       self.passing_distance, self.passing_y_rel, self.passing_v_rel = lead.dRel, lead.yRel, lead.vRel
       self.leaving = False
       # with nothing in front at the start there is no car to pass
