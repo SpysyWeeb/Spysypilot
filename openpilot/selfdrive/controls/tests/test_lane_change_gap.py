@@ -940,6 +940,9 @@ class TestRoadside:
     assert blocked(get_tracks((FOLLOW_GAP - 1.0, outer - 2 * ROADSIDE_MARGIN, -V_EGO)))
     # a car moving with traffic there is a car
     assert blocked(get_tracks((FOLLOW_GAP - 1.0, outer - ROADSIDE_MARGIN / 2, 0.0)))
+    # a return just short of oncoming speed is one of the stationary ones, for the margin as for its arrival
+    assert not blocked(get_tracks((FOLLOW_GAP - 1.0, outer - ROADSIDE_MARGIN / 2, -V_EGO - TRACK_MOVING_SPEED)))
+    assert not blocked(get_tracks((FOLLOW_GAP + 1.0, 3.4, -V_EGO - TRACK_MOVING_SPEED)))
 
   def test_oncoming_car_on_the_outer_line_is_a_car(self):
     # on a two-lane road the target lane's outer edge is where oncoming traffic drives

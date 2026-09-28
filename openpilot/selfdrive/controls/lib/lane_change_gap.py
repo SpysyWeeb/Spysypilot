@@ -137,20 +137,21 @@ def target_lane_blocked(direction, lines, radar_tracks, v_ego, t_follow, stop_di
     if not lo <= pt.yRel <= hi:
       continue
     v_track = v_ego + pt.vRel
-    if v_track < TRACK_MOVING_SPEED:
-      # stationary returns are mostly clutter, so only one already inside the follow gap counts as a stopped car, and
-      # one on the lane's outer edge is the roadside, where a stopped car in the lane cannot sit; oncoming traffic is
-      # judged where it will be, on that edge too, which is where it drives on a two-lane road
-      outer = hi if direction == LaneChangeDirection.left else lo
-      if abs(v_track) < TRACK_MOVING_SPEED and abs(outer - pt.yRel) < ROADSIDE_MARGIN:
-        continue
-      arrival = pt.dRel + pt.vRel * ARRIVAL_TIME if v_track < -TRACK_MOVING_SPEED else pt.dRel
-      if arrival < follow_gap:
+    if v_track < -TRACK_MOVING_SPEED:
+      # oncoming traffic is judged where it will be, on the lane's outer edge too, which is where it drives on a
+      # two-lane road
+      if pt.dRel + pt.vRel * ARRIVAL_TIME < follow_gap:
         return True
-      continue
-    gap = max(v_ego**2 - v_track**2, 0.0) / (2 * comfort_brake) + follow_gap
-    if pt.dRel + pt.vRel * ARRIVAL_TIME < gap:
-      return True
+    elif v_track < TRACK_MOVING_SPEED:
+      # stationary returns are mostly clutter, so only one already inside the follow gap counts as a stopped car, and
+      # not on the lane's outer edge: that is the roadside, where a stopped car in the lane cannot sit
+      outer = hi if direction == LaneChangeDirection.left else lo
+      if pt.dRel < follow_gap and abs(outer - pt.yRel) >= ROADSIDE_MARGIN:
+        return True
+    else:
+      gap = max(v_ego**2 - v_track**2, 0.0) / (2 * comfort_brake) + follow_gap
+      if pt.dRel + pt.vRel * ARRIVAL_TIME < gap:
+        return True
   return False
 
 
