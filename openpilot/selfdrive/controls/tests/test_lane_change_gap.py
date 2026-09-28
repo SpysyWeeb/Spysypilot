@@ -786,6 +786,66 @@ class TestLeadRelease:
       assert self.vision_after_handoff(gap, 1.5)
       assert self.vision_after_handoff(gap, 1.5, lead_offset=lead_offset, lead_std=lead_std)
 
+  def test_release_stays_with_the_car_across_the_models_reading_of_it(self):
+    # radard can swap a released car's radar track in its slot for the model's reading of the same car, which the model
+    # puts on the path
+    path = path_for(1.5, FAR)
+    model = get_model(path=path, lead_std=1.5, lead_two_std=1.5)
+    tracks = get_tracks((FAR, 0.0, -1.0, 7))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=get_radar_state(d_rel=FAR, lead_two='same'), tracks=tracks)
+    assert released(gap) == [True, True]
+    for k in range(1, 6):
+      # the model reads the car short, within LEAD_CONTINUITY of where it has got to
+      d_rel = FAR - k * DT_MDL - (LEAD_CONTINUITY - 0.05)
+      camera = {'radar': False, 'track_id': -1, 'd_rel': d_rel, 'y_rel': on_path(d_rel, path)}
+      radar_state = get_radar_state(**camera, lead_two=camera)
+      step(gap, model=model, radar_state=radar_state, tracks=tracks)
+      assert released(gap) == [True, True]
+      assert not gap.followed(radar_state).leadOne.present and not gap.followed(radar_state).leadTwo.present
+    # back on its track it is still the car released
+    step(gap, model=model, radar_state=get_radar_state(d_rel=FAR - 6 * DT_MDL, lead_two='same'), tracks=tracks)
+    assert released(gap) == [True, True]
+    # the path coming back to where radar last saw it ends the release through the model's reading too
+    camera = {'radar': False, 'track_id': -1, 'd_rel': FAR - 7 * DT_MDL, 'y_rel': 0.0}
+    step(gap, model=get_model(path=0.0, lead_std=1.5, lead_two_std=1.5), radar_state=get_radar_state(**camera, lead_two=camera), tracks=tracks)
+    assert released(gap) == [False, False]
+
+  def test_models_reading_of_another_car_is_judged_on_its_own(self):
+    path = path_for(1.5, FAR)
+    model = get_model(path=path, lead_std=1.5, lead_two_std=1.5)
+    tracks = get_tracks((FAR, 0.0, -1.0, 7))
+    # a reading on the path at another distance or speed than the released car's is a car ahead
+    for d_rel, v_rel in ((FAR - DT_MDL - LEAD_CONTINUITY - 0.1, -1.0), (FAR - DT_MDL, -1.0 + LEAD_SPEED_CONTINUITY + 0.1)):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=model, radar_state=get_radar_state(d_rel=FAR), tracks=tracks)
+      assert released(gap)[0]
+      camera = get_radar_state(radar=False, track_id=-1, d_rel=d_rel, v_rel=v_rel, y_rel=on_path(d_rel, path))
+      step(gap, model=model, radar_state=camera, tracks=tracks)
+      assert released(gap) == [False, False] and gap.followed(camera).leadOne.present
+    # and so is one in the other slot: radard swapped nothing there
+    gap = LaneChangeGap(CP, DT_MDL)
+    lead_two = {'radar': False, 'track_id': -1, 'd_rel': FAR + 0.5, 'y_rel': on_path(FAR + 0.5, path)}
+    step(gap, model=model, radar_state=get_radar_state(d_rel=FAR, lead_two=lead_two), tracks=tracks, n=3)
+    assert released(gap) == [True, False]
+
+  def test_floor_judges_the_car_across_the_models_reading_of_it(self):
+    # on the radar's last reading of the car while radar still tracks it, and on the model's reading once radar has lost
+    # it; here the model reads the car further out and closing slower, where the floor would let it go
+    path = path_for(1.5, FAR)
+    model = get_model(path=path, lead_std=1.5)
+    v_rel = -4.0
+    for tracks, still_released in ((get_tracks((FAR, 0.0, v_rel, 7)), CLOSE_FRAMES - 1), (get_tracks(), 5)):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=model, radar_state=get_radar_state(d_rel=FAR, v_rel=v_rel), tracks=get_tracks((FAR, 0.0, v_rel, 7)))
+      assert released(gap)[0]
+      for k in range(1, 6):
+        d_rel = FAR + k * v_rel * DT_MDL + LEAD_CONTINUITY - 0.5
+        camera = get_radar_state(radar=False, track_id=-1, d_rel=d_rel, v_rel=v_rel + LEAD_SPEED_CONTINUITY - 0.1, y_rel=on_path(d_rel, path))
+        step(gap, model=model, radar_state=camera, tracks=tracks, CS=get_car_state(aEgo=2.0))
+        assert released(gap)[0] == (k <= still_released)
+      assert gap.closing == (still_released < 5)
+
   def test_vision_lead_needs_an_empty_radar_corridor(self):
     path = path_for(1.5, FAR)
     for v_rel in (-1.0, -V_EGO):  # moving or stationary
