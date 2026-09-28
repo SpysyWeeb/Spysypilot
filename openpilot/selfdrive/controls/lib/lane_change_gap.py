@@ -411,8 +411,9 @@ class LaneChangeGap:
       self.closing = True
       self.armed = False
     released = []
-    for k, candidate in enumerate((one, two)):
-      held = self.released[k] and self.close_frames < LEAD_SPEED_FRAMES
+    for k, (candidate, lead) in enumerate(zip((one, two), leads, strict=True)):
+      # the debounce keeps the car released last frame, not whichever car now fills its slot
+      held = self.close_frames < LEAD_SPEED_FRAMES and self.was_released(lead)
       released.append(bool(candidate and (beside[k] or not self.closing) and (not close[k] or held)))
     return released
 
@@ -481,6 +482,9 @@ class LaneChangeGap:
       # handed back the car it is passing
       if self.enabled and clear and not self.backed_out:
         released = self.release_leads(radar_state, model, direction, radar_tracks, passing, v_ego, CS.aEgo, t_follow, stop_distance)
+      else:
+        # the floor latches on frames it judges running
+        self.close_frames = 0
       self.accelerate = self.enabled and clear and not self.backed_out and v_cruise - v_ego > MIN_HEADROOM
       if self.accelerate and self.armed:
         self.t_follow_pad = min(LANE_CHANGE_T_FOLLOW - t_follow, 0.0)

@@ -497,6 +497,30 @@ class TestLeadRelease:
     step(gap, model=get_model(path=0.0), radar_state=beside, tracks=get_tracks((20.0, -LEAD_BESIDE, -4.0, 7)))
     assert not gap.closing and released(gap)[0]
 
+  def test_floor_holds_only_the_car_it_released(self):
+    # a different car too close in a slot released last frame is new to the floor, not a glitch of the released one
+    model = get_model(path=path_for(2.0, FAR))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=get_radar_state(d_rel=FAR))
+    assert released(gap)[0]
+    d_rel = FOLLOW_GAP - 8.0
+    step(gap, model=model, radar_state=get_radar_state(track_id=8, d_rel=d_rel, v_rel=-3.0, y_rel=on_path(d_rel, path_for(2.0, FAR)) - 2.0))
+    assert released(gap) == [False, False]
+
+  def test_floor_counts_frames_running(self):
+    # close frames on either side of a blocked target lane are not frames running
+    model = get_model(path=path_for(2.0, FAR))
+    closing, far = get_radar_state(d_rel=45.0, v_rel=-4.0), get_radar_state(d_rel=FAR)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=far)
+    step(gap, model=model, radar_state=closing, n=LEAD_SPEED_FRAMES - 1)
+    step(gap, model=model, radar_state=far, tracks=get_tracks((30.0, 3.4, -1.0)))
+    step(gap, model=model, radar_state=far, n=int(round(BLOCKED_HOLD / DT_MDL)))
+    step(gap, model=model, radar_state=closing)
+    assert not gap.closing
+    step(gap, model=model, radar_state=far)
+    assert released(gap)[0]
+
   def test_lead_inside_the_follow_distance_is_too_close_only_while_closing(self):
     # a car holding or opening the gap asks the MPC for little braking, unless it is inside the MPC's danger distance
     d_rel = FOLLOW_GAP - 5.0
