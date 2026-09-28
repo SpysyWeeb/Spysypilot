@@ -265,8 +265,7 @@ class LaneChangeGap:
     self.t_follow_pad = 0.0
     self.accelerate = False
     self.released = [False, False]
-    self.released_leads = []
-    self.released_vision = [False, False]
+    self.released_leads = [None, None]
 
   def remember(self, lead):
     self.lead_id = lead.radarTrackId if lead.radar else -1
@@ -380,7 +379,7 @@ class LaneChangeGap:
 
   def was_released(self, lead):
     # the same car as one released last frame: its radar track, or its distance and speed across an id change
-    for radar, track_id, d_rel, v_rel in self.released_leads:
+    for radar, track_id, d_rel, v_rel in filter(None, self.released_leads):
       if lead.radar and radar and lead.radarTrackId == track_id:
         return True
       if abs(lead.dRel - (d_rel + v_rel * self.dt)) < LEAD_CONTINUITY and abs(lead.vRel - v_rel) < LEAD_SPEED_CONTINUITY:
@@ -412,7 +411,8 @@ class LaneChangeGap:
     # the car is across, the model's lead is the one in the lane moved into
     if lead_model is None or len(lead_model.yStd) == 0 or not self.leaving or self.across:
       return False
-    held = self.released_vision[i]
+    last = self.released_leads[i]
+    held = last is not None and not last[0]  # the slot was released on a lead only the model sees
     return offset > (LEAD_ON_PATH if held else LEAD_OFF_PATH) and \
            lead_model.yStd[0] >= (LEAD_UNPLACED_STD_HOLD if held else LEAD_UNPLACED_STD) and \
            self.corridor_clear(model, direction, radar_tracks, lead.dRel, LEAD_ON_PATH if held else LEAD_OFF_PATH)
@@ -523,9 +523,8 @@ class LaneChangeGap:
       if self.accelerate and self.armed:
         self.t_follow_pad = min(LANE_CHANGE_T_FOLLOW - t_follow, 0.0)
     self.released = released
-    self.released_leads = [(ld.radar, ld.radarTrackId, ld.dRel, ld.vRel)
-                           for ld, r in zip((radar_state.leadOne, radar_state.leadTwo), released, strict=True) if r]
-    self.released_vision = [r and not ld.radar for ld, r in zip((radar_state.leadOne, radar_state.leadTwo), released, strict=True)]
+    self.released_leads = [(ld.radar, ld.radarTrackId, ld.dRel, ld.vRel) if r else None
+                           for ld, r in zip((radar_state.leadOne, radar_state.leadTwo), released, strict=True)]
     return self.t_follow_pad
 
   def followed(self, radar_state):

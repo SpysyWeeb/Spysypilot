@@ -733,6 +733,18 @@ class TestLeadRelease:
     assert not self.vision_after_handoff(gap, 1.5, lead_std=LEAD_UNPLACED_STD_HOLD - 0.05)
     assert not self.vision_after_handoff(gap, 1.5, lead_std=LEAD_UNPLACED_STD_HOLD + 0.05)
 
+  def test_slot_released_on_a_radar_lead_holds_nothing_for_the_next(self):
+    # the model's lead taking over a slot released on a radar track is a new lead there, held to the release thresholds
+    for lead_offset, lead_std in (((LEAD_ON_PATH + LEAD_OFF_PATH) / 2, 1.5), (1.5, (LEAD_UNPLACED_STD_HOLD + LEAD_UNPLACED_STD) / 2)):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=get_model(path=path_for(1.5, FAR)), radar_state=get_radar_state(d_rel=FAR), tracks=get_tracks((FAR, 0.0, -1.0, 7)))
+      assert released(gap)[0]
+      assert not self.vision_after_handoff(gap, 1.5, lead_offset=lead_offset, lead_std=lead_std)
+      # released on a lead only the model sees, the slot holds it there
+      gap = self.start_behind_track_7()
+      assert self.vision_after_handoff(gap, 1.5)
+      assert self.vision_after_handoff(gap, 1.5, lead_offset=lead_offset, lead_std=lead_std)
+
   def test_vision_lead_needs_an_empty_radar_corridor(self):
     path = path_for(1.5, FAR)
     for v_rel in (-1.0, -V_EGO):  # moving or stationary
