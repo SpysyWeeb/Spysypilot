@@ -950,6 +950,12 @@ class TestLeadRelease:
       assert released(gap) == [False, False]
       step(gap, model=model, radar_state=radar_state, n=10)
       assert released(gap) == [False, False]
+    # the planner resets before it updates, so a reset on the frame the change starts comes before the change
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(state=LaneChangeState.off))
+    gap.reset()
+    step(gap, model=model, radar_state=radar_state, n=10)
+    assert released(gap) == [True, True]
 
   def cross_the_line(self, gap, radar_state, tracks):
     # a left change: the car's left line walks in from 1.6 m to just short of landing, and the model that lands it

@@ -223,8 +223,10 @@ class LaneChangeGap:
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
   radarState itself, and hasLead with it, stays as radard published it. A planner reset (a gas or
-  brake override) ends the release for the rest of the change. In experimental mode the model's own
-  acceleration stays among the planner's candidates, and a release does not lift it.
+  brake override) during the change ends the release for the rest of it; the planner resets before it
+  updates, so one on the change's first frame comes before the change and does not. In experimental
+  mode the model's own acceleration stays among the planner's candidates, and a release does not lift
+  it.
   """
 
   def __init__(self, CP, dt=DT_MDL):
