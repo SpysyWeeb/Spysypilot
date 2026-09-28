@@ -27,7 +27,7 @@ CP = car.CarParams.new_message(radarUnavailable=False, brand='hyundai', flags=Hy
 
 def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDirection.left, left_y=-1.6, right_y=1.76, probs=(1.0, 1.0),
               curvature=0.0, lead_accel=0.0, lead_prob=1.0, path=None, lead_std=None, lead_two_std=None, lead_two_accel=0.0,
-              line_stds=None, lines=None, lead_y=None):
+              line_stds=None, lines=None, lead_y=None, lead_two_y=None):
   model = log.ModelDataV2.new_message()
   model.init('leadsV3', 1 if lead_two_std is None else 2)
   model.leadsV3[0].prob = lead_prob
@@ -41,6 +41,8 @@ def get_model(state=LaneChangeState.laneChangeStarting, direction=LaneChangeDire
     model.leadsV3[1].prob = lead_prob
     model.leadsV3[1].a = [lead_two_accel] * len(ModelConstants.LEAD_T_IDXS)
     model.leadsV3[1].yStd = [lead_two_std] * len(ModelConstants.LEAD_T_IDXS)
+    if lead_two_y is not None:
+      model.leadsV3[1].y = [lead_two_y] * len(ModelConstants.LEAD_T_IDXS)
   model.meta.laneChangeState = state
   model.meta.laneChangeDirection = direction
   model.init('laneLines', 4)
@@ -710,8 +712,8 @@ class TestLeadRelease:
     assert released(gap)[0]
 
   def test_lead_two_on_the_target_side_is_followed(self):
-    # the same car in both slots by range and speed shares a verdict, but not on the target side, where it can be a
-    # car in the lane moved into or the model placing the same one there
+    # a second lead at the first one's range and speed can be a car in the lane moved into, or the model placing the
+    # same one there
     gap = self.start_behind_track_7()
     self.vision_after_handoff(gap, 1.5, lead_two_offset=1.5)
     assert released(gap) == [True, True]
@@ -722,6 +724,36 @@ class TestLeadRelease:
     lead_two = {'radar': False, 'track_id': -1, 'd_rel': FAR + 0.5, 'y_rel': on_path(FAR + 0.5, path) + 2.0}
     gap = LaneChangeGap(CP, DT_MDL)
     step(gap, model=get_model(path=path, lead_std=1.5, lead_two_std=1.5), radar_state=get_radar_state(d_rel=FAR, lead_two=lead_two))
+    assert released(gap) == [True, False]
+
+  def test_model_only_lead_two_is_judged_on_its_own(self):
+    # a second lead only the model sees, at the first one's range and speed, can be another car: it is released only off
+    # the path itself, like any lead only the model sees
+    gap = self.start_behind_track_7()
+    for lead_two_offset in (0.0, LEAD_OFF_PATH - 0.1):
+      self.vision_after_handoff(gap, 1.5, lead_two_offset=lead_two_offset)
+      assert released(gap) == [True, False]
+    self.vision_after_handoff(gap, 1.5, lead_two_offset=LEAD_OFF_PATH + 0.1)
+    assert released(gap) == [True, True]
+    # a radar lead the path has left, and one only the model sees at its range and speed, on the path and placed
+    path = path_for(1.5, FAR)
+    lead_two = {'radar': False, 'track_id': -1, 'd_rel': FAR + 0.5, 'y_rel': on_path(FAR + 0.5, path)}
+    radar_state = get_radar_state(d_rel=FAR, lead_two=lead_two)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path, lead_two_std=0.3), radar_state=radar_state)
+    assert released(gap) == [True, False] and gap.followed(radar_state).leadTwo.present
+
+  def test_one_radar_track_in_both_slots_is_one_car(self):
+    # radard can match the model's second lead, placed elsewhere, to the track of the car in front: followed through
+    # leadTwo, that car would still hold the MPC back
+    path = path_for(1.5, FAR)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path, lead_two_std=0.3, lead_two_y=-(LEAD_CONTINUITY + 0.5)), radar_state=get_radar_state(d_rel=FAR, lead_two='same'))
+    assert released(gap) == [True, True]
+    # two radar tracks at the same range and speed are two cars
+    gap = LaneChangeGap(CP, DT_MDL)
+    lead_two = {'track_id': 9, 'd_rel': FAR + 0.5, 'y_rel': on_path(FAR + 0.5, path)}
+    step(gap, model=get_model(path=path), radar_state=get_radar_state(d_rel=FAR, lead_two=lead_two))
     assert released(gap) == [True, False]
 
   def test_vision_lead_is_followed_once_the_car_is_across(self):

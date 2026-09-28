@@ -211,8 +211,8 @@ class LaneChangeGap:
   passed, has been too close for LEAD_SPEED_FRAMES running, every lead not beside the car is followed
   at the full gap until the car being passed is beside it. Far out the path can stray LEAD_OFF_PATH
   from a car still in the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets
-  leadOne's verdict when it is the same car, unless it sits on the target side, is judged on its own
-  otherwise, and is never released while braking.
+  leadOne's verdict when radard gives both slots the same radar track, is judged on its own otherwise,
+  and is never released while braking.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -381,12 +381,8 @@ class LaneChangeGap:
     return False
 
   @staticmethod
-  def same_car(a, b):
-    if not (a.present and b.present):
-      return False
-    if a.radar and b.radar:
-      return a.radarTrackId == b.radarTrackId
-    return abs(a.dRel - b.dRel) < LEAD_CONTINUITY and abs(a.vRel - b.vRel) < LEAD_SPEED_CONTINUITY
+  def same_track(a, b):
+    return a.present and b.present and a.radar and b.radar and a.radarTrackId == b.radarTrackId
 
   @staticmethod
   def corridor_clear(model, direction, radar_tracks, d_rel, offset_min):
@@ -417,12 +413,9 @@ class LaneChangeGap:
   def release_leads(self, radar_state, model, direction, radar_tracks, passing, v_ego, a_ego, t_follow, stop_distance):
     leads = (radar_state.leadOne, radar_state.leadTwo)
     one = self.releases(0, leads[0], model, direction, radar_tracks)
-    # the same car in both slots gets one verdict, unless the second one sits on the target side: matched on range and
-    # speed alone, it can be another car, or the model placing the same one in the lane moved into
-    if self.same_car(*leads):
-      two = one and path_offset(model, leads[1].dRel, leads[1].yRel, direction) >= -LEAD_ON_PATH
-    else:
-      two = self.releases(1, leads[1], model, direction, radar_tracks)
+    # one radar track in both slots is one car, whatever the model's second lead shows; a pair matched on range and speed
+    # alone can be two cars, so each lead is judged on its own
+    two = one if self.same_track(*leads) else self.releases(1, leads[1], model, direction, radar_tracks)
     two = two and not self.lead_two_braking(radar_state, model)
     beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) for lead in leads]
     close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
