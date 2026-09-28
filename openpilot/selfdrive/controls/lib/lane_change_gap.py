@@ -26,13 +26,13 @@ LEAD_BRAKING = -1.0          # m/s^2, a lead braking harder than this keeps its 
 LEAD_SLOWING = 0.5           # m/s, a lead this much below its speed since the change started is braking
 LEAD_SPEED_FRAMES = 3        # a radar speed glitch lasts one frame
 CLOSE_FRAMES = 3             # a lead at the floor's edge, or another car in its slot for a frame, reads too close a frame or two
-LEAD_CONTINUITY = 2.0        # m, the same car across a track id change, or frame to frame for a vision lead
+LEAD_CONTINUITY = 2.0        # m, the same car across a track id change or frame to frame, and a track's lateral from the model's lead
 LEAD_SPEED_CONTINUITY = 1.5  # m/s
 LEAD_OFF_PATH = 1.0          # m, a lead this far off the planned path, toward the lane being left, is being passed
 LEAD_ON_PATH = 0.5           # m, and the same lead back this close is in front again; a radar lateral steps ~0.6 m
 LEAD_BESIDE = 2.0            # m, lateral toward the lane being left where the two cars' bodies stop overlapping
 LEAD_UNPLACED_STD = 1.0      # m, the model's lateral std on a lead it cannot put in a lane
-LEAD_UNPLACED_STD_HOLD = 0.8
+LEAD_UNPLACED_STD_HOLD = 0.8  # m, below this the model places its lead: a lead only it sees is followed, a radar track must agree with it
 RESTORE_DECEL = 1.0          # m/s^2, the steady braking a lead handed back may need to stop closing before the follow distance
 RESTORE_LAG = 1.0            # s, the car keeps its acceleration this long before a lead handed back slows it
 LANE_WIDTH_DEFAULT = 3.5     # m, target lane width when the model's lines are not confident
@@ -221,10 +221,11 @@ class LaneChangeGap:
 
   A slower lead cannot be passed at any finite gap, and after the handoff the model's lead slides onto
   the lane being left with no radar return behind it. So while the target lane is clear and the driver
-  has not backed out, the MPC stops following a radar lead the planned path has left toward that lane,
-  a new one only where the model's lead radard matched it to is too, and, once the car being passed
-  has gone off the path and until the car is across, a lead only the model sees while it is off the
-  path too, the model cannot place it and radar sees nothing on the path. A stopped lead is always
+  has not backed out, the MPC stops following a radar lead the planned path has left toward that lane;
+  a newly released one also needs the model's lead, where the model places it, within LEAD_CONTINUITY
+  of the track radard matched it to. From when the car being passed has gone off the path until the
+  car is across, it also stops following a lead only the model sees, when that lead is off the path
+  too, the model cannot place it and radar sees nothing on the path. A stopped lead is always
   followed, and so is one the floor, too_close(), finds too close: one that would need more than
   RESTORE_DECEL of steady braking to stop closing before the follow distance, or is inside that
   distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or the car being
@@ -280,7 +281,7 @@ class LaneChangeGap:
     self.reset()
 
   def reset(self):
-    # a planner reset mid change (a gas or brake override) ends the relaxation and the acceleration for that change
+    # a planner reset mid change (a gas or brake override) ends the relaxation, the acceleration and the release for that change
     self.armed = False
     self.backed_out = self.starting_prev
     self.relax_timer = 0.0
