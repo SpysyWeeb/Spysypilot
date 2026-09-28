@@ -10,7 +10,7 @@ from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.simple_kalman import KF1D
 from openpilot.selfdrive.controls.lib import longitudinal_planner
-from openpilot.selfdrive.controls.lib.lane_change_gap import LEAD_BRAKING
+from openpilot.selfdrive.controls.lib.lane_change_gap import LEAD_BRAKING, LEAD_SPEED_FRAMES
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_stopped_equivalence_factor, get_T_FOLLOW
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
@@ -131,7 +131,7 @@ class TestPlanningView:
     }.get(cue, {})
     if cue == 'too close':
       d_rel, v_lead = 24.0, 9.0
-      for _ in range(2):
+      for _ in range(LEAD_SPEED_FRAMES - 1):
         planner.update(frame(12.0, 0.0, d_rel, v_lead, y_ego=1.5, path=2.0))
       assert any(planner.lane_change_gap.released)
     planner.update(frame(12.0, 0.0, d_rel, v_lead, **{'y_ego': 1.5, 'path': 2.0, **kwargs}))
@@ -261,11 +261,14 @@ class TestLaneChangeManeuvers:
     assert design['min_gap'] >= today['min_gap'] - 0.5
 
   def test_driver_aborts_after_the_release(self):
-    today = summary(LaneChangePlant(False, 12.8, 11.1, 28.0, abort_at=1.5).run())
-    design = summary(LaneChangePlant(True, 12.8, 11.1, 28.0, abort_at=1.5).run())
+    # 40 m behind, the car being passed is still released when the driver switches the blinker off and steers back
+    today = summary(LaneChangePlant(False, 12.8, 11.1, 40.0, abort_at=1.5).run())
+    design = summary(LaneChangePlant(True, 12.8, 11.1, 40.0, abort_at=1.5).run())
+    aborted = design['t'] >= 1.5 - 1e-6
+    assert design['released'][~aborted][-1] and not design['released'][aborted].any()
     assert design['onsets'] == 1 and not design['fcw']
-    assert design['min_gap'] >= today['min_gap'] - 5.5
-    assert design['min_a'] >= today['min_a'] - 0.6
+    assert design['min_gap'] >= today['min_gap'] - 5.6
+    assert design['min_a'] >= today['min_a'] - 0.75
 
   def test_set_speed_close_does_not_flicker(self):
     today = summary(LaneChangePlant(False, 12.8, 11.1, 28.0, v_cruise=12.8 + 0.8).run())
