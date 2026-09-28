@@ -743,6 +743,19 @@ class TestLeadRelease:
       step(gap, model=get_model(path=path, lead_two_std=0.3), radar_state=get_radar_state(d_rel=FAR, lead_two=off_path_two), n=10)
       assert released(gap) == [False, False]
 
+  def test_second_lead_braking_as_it_comes_is_never_released(self):
+    path = path_for(1.5, FAR)
+    off_path_two = {'track_id': 9, 'd_rel': FAR + 20.0, 'y_rel': on_path(FAR + 20.0, path) - 1.5}
+    for radar_kwargs, model_kwargs in (({'a_lead': LEAD_BRAKING - 0.5}, {}), ({}, {'lead_two_accel': LEAD_BRAKING - 0.5})):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=get_model(path=path, lead_two_std=0.3), radar_state=get_radar_state(d_rel=FAR))
+      assert released(gap) == [True, False]
+      radar_state = get_radar_state(d_rel=FAR, lead_two={**off_path_two, **radar_kwargs})
+      model = get_model(path=path, **{'lead_two_std': 0.3, **model_kwargs})
+      for _ in range(3):
+        step(gap, model=model, radar_state=radar_state)
+        assert released(gap) == [True, False] and gap.followed(radar_state).leadTwo.present
+
   def test_driver_backing_out_restores_for_the_rest_of_the_change(self):
     model = get_model(path=path_for(1.5, FAR))
     radar_state = get_radar_state(d_rel=FAR, lead_two='same')

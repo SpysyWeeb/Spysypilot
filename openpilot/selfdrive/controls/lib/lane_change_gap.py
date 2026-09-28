@@ -270,21 +270,22 @@ class LaneChangeGap:
     self.passing_id, self.passing_distance, self.passing_y_rel, self.passing_v_rel = track.trackId, track.dRel, track.yRel, track.vRel
     return track
 
+  @staticmethod
+  def model_braking(model, i):
+    model_lead = model.leadsV3[i] if len(model.leadsV3) > i else None
+    return model_lead is not None and model_lead.prob > 0.5 and len(model_lead.a) > 0 and model_lead.a[0] < LEAD_BRAKING
+
   def lead_braking(self, lead, model):
     # the radar's filtered deceleration lags a hard brake by about half a second; the raw speed and the
     # model's estimate of the lead's acceleration both read it earlier. The speed history belongs to the
     # lead being left, so it only counts while that lead is still the one in front
-    model_lead = model.leadsV3[0] if len(model.leadsV3) > 0 else None
-    model_braking = model_lead is not None and model_lead.prob > 0.5 and len(model_lead.a) > 0 and model_lead.a[0] < LEAD_BRAKING
     slowing = self.armed and len(self.lead_speeds) == LEAD_SPEED_FRAMES and max(self.lead_speeds) < self.lead_v_max - LEAD_SLOWING
-    return (lead.present and (lead.aLeadK < LEAD_BRAKING or slowing)) or model_braking
+    return (lead.present and (lead.aLeadK < LEAD_BRAKING or slowing)) or self.model_braking(model, 0)
 
-  def released_lead_braking(self, radar_state, model):
-    # a released second lead that brakes is followed again, as the first one is
+  def lead_two_braking(self, radar_state, model):
+    # a second lead that brakes is never released, and one released is followed again, as the first one is
     lead = radar_state.leadTwo
-    model_lead = model.leadsV3[1] if len(model.leadsV3) > 1 else None
-    model_braking = model_lead is not None and model_lead.prob > 0.5 and len(model_lead.a) > 0 and model_lead.a[0] < LEAD_BRAKING
-    return self.released[1] and ((lead.present and lead.aLeadK < LEAD_BRAKING) or model_braking)
+    return (lead.present and lead.aLeadK < LEAD_BRAKING) or self.model_braking(model, 1)
 
   @staticmethod
   def driver_backs_out(CS, direction, across):
@@ -398,6 +399,7 @@ class LaneChangeGap:
       two = one and path_offset(model, leads[1].dRel, leads[1].yRel, direction) >= -LEAD_ON_PATH
     else:
       two = self.releases(1, leads[1], model, direction, radar_tracks)
+    two = two and not self.lead_two_braking(radar_state, model)
     beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) for lead in leads]
     close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
              for candidate, b, lead in zip((one, two), beside, leads, strict=True)]
@@ -452,7 +454,8 @@ class LaneChangeGap:
       # the lead braking, whichever lead is in front, end the acceleration for this change too
       if self.armed and (self.relax_timer > RELAX_TIME_MAX or not self.same_lead(lead)):
         self.armed = False
-      if self.driver_backs_out(CS, direction, self.across) or self.lead_braking(lead, model) or self.released_lead_braking(radar_state, model):
+      if self.driver_backs_out(CS, direction, self.across) or self.lead_braking(lead, model) or \
+         (self.released[1] and self.lead_two_braking(radar_state, model)):
         self.armed = False
         self.backed_out = True
       elif self.armed:
