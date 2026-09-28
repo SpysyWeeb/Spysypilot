@@ -563,6 +563,21 @@ class TestLeadRelease:
     step(gap, model=get_model(path=0.0), radar_state=get_radar_state(d_rel=15.0, v_rel=-3.0, y_rel=-LEAD_BESIDE))
     assert released(gap)[0]
 
+  def test_car_beside_is_judged_again_once_the_path_swings_back_toward_it(self):
+    # the model gives up the change without a cue from the driver once the car is beside a slower one, and the path comes
+    # back toward it while the car is still over
+    d_rel, v_rel, y_rel = 15.0, -3.0, -(LEAD_BESIDE + 0.5)
+    radar_state = get_radar_state(d_rel=d_rel, v_rel=v_rel, y_rel=y_rel, lead_two='same')
+    tracks = get_tracks((d_rel, y_rel, v_rel, 7))
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=get_model(path=path_for(1.5, d_rel)), radar_state=radar_state, tracks=tracks, n=5)
+    assert released(gap) == [True, True] and gap.moved_over
+    back = get_model(path=path_for(LEAD_BESIDE - 0.1 + y_rel, d_rel))
+    step(gap, model=back, radar_state=radar_state, tracks=tracks, n=LEAD_SPEED_FRAMES - 1)
+    assert released(gap) == [True, True]
+    step(gap, model=back, radar_state=radar_state, tracks=tracks)
+    assert released(gap) == [False, False] and gap.closing
+
   def test_car_in_its_lane_on_a_bend_is_not_beside(self):
     # a left change on a right hand bend: the car ahead in the lane reads more than LEAD_BESIDE to the right of the
     # car's heading, but sits on the lane like the line being crossed

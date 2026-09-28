@@ -208,11 +208,12 @@ class LaneChangeGap:
   followed, and so is one the floor, too_close(), finds too close: one that would need more than
   RESTORE_DECEL of steady braking to stop closing before the follow distance, or is inside that
   distance while still closing or within LEAD_DANGER_FACTOR of it. Once a lead, or the car being
-  passed, has been too close for LEAD_SPEED_FRAMES running, every lead not beside the car is followed
-  at the full gap until the car being passed is beside it. Far out the path can stray LEAD_OFF_PATH
-  from a car still in the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets
-  leadOne's verdict when radard gives both slots the same radar track, is judged on its own otherwise,
-  and is never released while braking.
+  passed, has been too close for LEAD_SPEED_FRAMES running, every lead is followed at the full gap
+  until the car being passed is beside the car. A radar lead beside the car is past the floor and the
+  latch while the plan keeps as clear of it. Far out the path can stray LEAD_OFF_PATH from a car still
+  in the lane, but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's
+  verdict when radard gives both slots the same radar track, is judged on its own otherwise, and is
+  never released while braking.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -417,7 +418,9 @@ class LaneChangeGap:
     # alone can be two cars, so each lead is judged on its own
     two = one if self.same_track(*leads) else self.releases(1, leads[1], model, direction, radar_tracks)
     two = two and not self.lead_two_braking(radar_state, model)
-    beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) for lead in leads]
+    # a car beside is past the floor while the plan keeps clear of it too; one the path swings back toward is judged again
+    beside = [lead.radar and self.beside(lead.dRel, lead.yRel, direction) and path_offset(model, lead.dRel, lead.yRel, direction) >= LEAD_BESIDE
+              for lead in leads]
     close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
              for candidate, b, lead in zip((one, two), beside, leads, strict=True)]
     # the car being passed still overlaps the car after the model has moved its lead elsewhere
