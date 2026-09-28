@@ -235,8 +235,10 @@ class LaneChangeGap:
   but a far lead rarely binds and the same floor bounds it. leadTwo gets leadOne's verdict when
   radard gives both slots the same radar track, is judged on its own otherwise, and is never
   released while braking. A release belongs to the car rather than the sensor: where radard swaps a
-  released car's radar track for the model's reading of the same car, the release holds, and the
-  car is judged on the radar's last reading of it while radar still tracks it.
+  released car's radar track for the model's reading of the same car, the release holds while that
+  reading stays with the car where radar has it, or last had it once radar has lost it. The car is
+  then judged on radar's reading, or on the model's distance and speed once radar has lost it, and
+  never as beside.
 
   The release has no timer: it ends with the change, and a stall is caught by the floor. What the MPC
   plans on, followed(), is also what its crash check sees, so FCW does not warn for a released lead;
@@ -408,19 +410,23 @@ class LaneChangeGap:
     return False
 
   def car(self, i, lead, radar_tracks, v_ego):
-    # radard can swap a car's radar track in its slot for the model's reading of the same car, which the model may put on
-    # the path. A release made on the track belongs to the car, which is judged on its last radar reading carried forward,
-    # or on the model's distance and speed once radar has lost the track
+    # the lead to judge in slot i, and the car a release of it is made on. radard can swap a car's radar track in its slot
+    # for the model's reading of the same car, which the model may put on the path. A release made on the track belongs to
+    # the car, which is where radar has it this frame, or where its last radar reading carried forward puts it once radar
+    # has lost it; a reading that stays with it is judged as that car, on radar's reading, or on the model's distance and
+    # speed once radar has lost it. The car stays where radar puts it, so a reading drifting off it is judged on its own
+    seen = ReleasedLead(lead.radar, lead.radarTrackId, lead.dRel, lead.yRel, lead.vRel)
     last = self.released_leads[i]
     if not lead.present or lead.radar or last is None or not last.radar:
-      return lead
-    d_rel, v_rel = last.d_rel + last.v_rel * self.dt, last.v_rel
-    if not continues(lead, d_rel, v_rel):
-      return lead
-    if not any(pt.trackId == last.track_id for pt in radar_tracks.points):
-      d_rel, v_rel = lead.dRel, lead.vRel
-    return log.RadarState.LeadData.new_message(present=True, radar=True, radarTrackId=last.track_id, dRel=d_rel, yRel=last.y_rel, vRel=v_rel,
-                                               vLead=v_ego + v_rel)
+      return lead, seen
+    track = next((pt for pt in radar_tracks.points if pt.trackId == last.track_id), None)
+    known = ReleasedLead(True, track.trackId, track.dRel, track.yRel, track.vRel) if track is not None else \
+            last._replace(d_rel=last.d_rel + last.v_rel * self.dt)
+    if not continues(lead, known.d_rel, known.v_rel):
+      return lead, seen
+    d_rel, v_rel = (known.d_rel, known.v_rel) if track is not None else (lead.dRel, lead.vRel)
+    return log.RadarState.LeadData.new_message(present=True, radar=True, radarTrackId=known.track_id, dRel=d_rel, yRel=known.y_rel, vRel=v_rel,
+                                               vLead=v_ego + v_rel), known
 
   @staticmethod
   def same_track(a, b):
@@ -556,7 +562,7 @@ class LaneChangeGap:
     self.accelerate = False
     self.t_follow_pad = 0.0
     released = [False, False]
-    leads = [self.car(i, lead, radar_tracks, v_ego) for i, lead in enumerate((radar_state.leadOne, radar_state.leadTwo))]
+    leads, cars = zip(*(self.car(i, lead, radar_tracks, v_ego) for i, lead in enumerate((radar_state.leadOne, radar_state.leadTwo))), strict=True)
     if starting:
       clear = self.target_lane_clear(direction, CS, model, radar_tracks, radar_ok, v_ego, t_follow, stop_distance, comfort_brake)
       # the target lane gate and the back-out cues but not the headroom: a car reaching its set speed mid pass is not
@@ -570,8 +576,7 @@ class LaneChangeGap:
       if self.accelerate and self.armed:
         self.t_follow_pad = min(LANE_CHANGE_T_FOLLOW - t_follow, 0.0)
     self.released_in_change = self.released_in_change or any(released)
-    self.released_leads = [ReleasedLead(ld.radar, ld.radarTrackId, ld.dRel, ld.yRel, ld.vRel) if r else None
-                           for ld, r in zip(leads, released, strict=True)]
+    self.released_leads = [car if r else None for car, r in zip(cars, released, strict=True)]
     return self.t_follow_pad
 
   def followed(self, radar_state):
