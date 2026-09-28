@@ -463,9 +463,11 @@ class LaneChangeGap:
     same = self.same_track(*leads)
     two = one if same else self.releases(1, leads[1], model, direction, radar_tracks)
     two = two and not self.lead_two_braking(radar_state, model)
-    # a car beside is past the floor while the model's lead is there too and the plan keeps as clear of it; one the path
-    # swings back toward is judged again
-    beside = [lead.radar and lateral_agrees(lead, model_lead(model, 0 if same else k)) and self.beside(lead.dRel, lead.yRel, direction) and
+    # a car beside is past the floor while radar measures it there, the model's lead is there too and the plan keeps as
+    # clear of it; one the path swings back toward is judged again. Where radard has put the model's reading of the car in
+    # its slot, the model's lateral is no measure of a car beside, so the floor judges it
+    published = (radar_state.leadOne, radar_state.leadTwo)
+    beside = [published[k].radar and lateral_agrees(lead, model_lead(model, 0 if same else k)) and self.beside(lead.dRel, lead.yRel, direction) and
               path_offset(model, lead.dRel, lead.yRel, direction) >= LEAD_BESIDE for k, lead in enumerate(leads)]
     close = [candidate and not b and too_close(lead.dRel, lead.vRel, lead.vLead, a_ego, t_follow, stop_distance)
              for candidate, b, lead in zip((one, two), beside, leads, strict=True)]
