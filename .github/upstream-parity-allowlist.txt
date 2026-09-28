@@ -49,6 +49,7 @@
 /openpilot/selfdrive/controls/tests/test_force_stops.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_lane_centering.py  # lane-centering
 /openpilot/selfdrive/controls/tests/test_lane_change_gap.py  # lane-changes
+/openpilot/selfdrive/controls/tests/test_lane_change_release.py  # lane-changes
 /openpilot/selfdrive/controls/tests/test_lane_changes.py  # lane-changes
 /openpilot/selfdrive/controls/tests/test_long_mpc.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_longitudinal_lead.py  # BLoTv3
