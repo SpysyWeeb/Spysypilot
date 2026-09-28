@@ -66,23 +66,23 @@ def path_for(offset, d_rel, direction=LaneChangeDirection.left):
   return sign * offset * 30.0 / (d_rel + RADAR_TO_CAMERA)
 
 
-def set_lead(lead, present=True, radar=True, track_id=7, d_rel=35.0, v_rel=-1.0, a_lead=0.0, y_rel=0.0):
+def set_lead(lead, present=True, radar=True, track_id=7, d_rel=35.0, v_rel=-1.0, a_lead=0.0, y_rel=0.0, v_ego=V_EGO):
   lead.present = present
   lead.radar = radar
   lead.radarTrackId = track_id
   lead.dRel = d_rel
   lead.yRel = y_rel
   lead.vRel = v_rel
-  lead.vLead = V_EGO + v_rel
+  lead.vLead = v_ego + v_rel
   lead.aLeadK = a_lead
 
 
-def get_radar_state(present=True, radar=True, track_id=7, d_rel=35.0, v_rel=-1.0, a_lead=0.0, y_rel=0.0, lead_two=None):
+def get_radar_state(present=True, radar=True, track_id=7, d_rel=35.0, v_rel=-1.0, a_lead=0.0, y_rel=0.0, lead_two=None, v_ego=V_EGO):
   # lead_two: None for no second lead, 'same' for the model's usual mirror of the first, or set_lead() arguments
   radar_state = log.RadarState.new_message()
-  set_lead(radar_state.leadOne, present, radar, track_id, d_rel, v_rel, a_lead, y_rel)
+  set_lead(radar_state.leadOne, present, radar, track_id, d_rel, v_rel, a_lead, y_rel, v_ego)
   if lead_two == 'same':
-    set_lead(radar_state.leadTwo, present, radar, track_id, d_rel, v_rel, a_lead, y_rel)
+    set_lead(radar_state.leadTwo, present, radar, track_id, d_rel, v_rel, a_lead, y_rel, v_ego)
   elif lead_two is not None:
     set_lead(radar_state.leadTwo, **lead_two)
   return radar_state
@@ -107,14 +107,14 @@ def blocked(tracks, direction=LaneChangeDirection.left, model=None, v_ego=V_EGO)
   return target_lane_blocked(direction, lines, tracks, v_ego, T_FOLLOW, STOP_DISTANCE, COMFORT_BRAKE)
 
 
-def step(gap, model=None, CS=None, radar_state=None, tracks=None, radar_ok=True, v_cruise=V_EGO + 5.0, t_follow=T_FOLLOW, n=1):
+def step(gap, model=None, CS=None, radar_state=None, tracks=None, radar_ok=True, v_cruise=V_EGO + 5.0, t_follow=T_FOLLOW, n=1, v_ego=V_EGO):
   model = model if model is not None else get_model()
   CS = CS if CS is not None else get_car_state()
   radar_state = radar_state if radar_state is not None else get_radar_state()
   tracks = tracks if tracks is not None else get_tracks()
   pad = 0.0
   for _ in range(n):
-    pad = gap.update(model, CS, radar_state, tracks, radar_ok, V_EGO, v_cruise, t_follow, STOP_DISTANCE, COMFORT_BRAKE)
+    pad = gap.update(model, CS, radar_state, tracks, radar_ok, v_ego, v_cruise, t_follow, STOP_DISTANCE, COMFORT_BRAKE)
   return pad
 
 
@@ -472,6 +472,19 @@ class TestLeadRelease:
     assert released(gap)[0]
     gap = LaneChangeGap(CP, DT_MDL)
     step(gap, radar_state=radar_state, n=5)
+    assert released(gap) == [False, False]
+
+  def test_path_turning_back_is_read_out_to_its_farthest_point(self):
+    # a left turn at a junction taken as a change: the path runs round a 20 m radius until it heads back toward the car,
+    # and a car turning ahead sits on it 70 degrees round
+    radius, turned = 20.0, np.radians(70.0)
+    arc = np.linspace(0.0, 0.75 * np.pi, len(X_IDXS))
+    model = get_model()
+    model.position.x = (radius * np.sin(arc)).tolist()
+    model.position.y = (-radius * (1 - np.cos(arc))).tolist()
+    radar_state = get_radar_state(d_rel=float(radius * np.sin(turned)) - RADAR_TO_CAMERA, y_rel=float(radius * (1 - np.cos(turned))), v_rel=-0.5, v_ego=6.0)
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=radar_state, v_ego=6.0, n=5)
     assert released(gap) == [False, False]
 
   def test_stopped_or_crawling_lead_is_never_released(self):

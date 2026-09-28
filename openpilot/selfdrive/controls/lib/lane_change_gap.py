@@ -69,10 +69,14 @@ def side_left(direction):
 
 def path_offset(model, d_rel, y_rel, direction):
   # how far a radar frame point sits from the planned path at its own distance, toward the lane being left; a bend
-  # and the car's yaw move the path and a car in the lane together
-  if len(model.position.x) == 0:
+  # and the car's yaw move the path and a car in the lane together. A turn can carry the path round until it runs back
+  # toward the car, where its distance no longer grows, so it is read only out to its farthest point ahead
+  x = np.array(model.position.x)
+  if len(x) == 0:
     return 0.0
-  return side_left(direction) * (y_rel + float(np.interp(d_rel + RADAR_TO_CAMERA, model.position.x, model.position.y)))
+  back = np.flatnonzero(np.diff(x) <= 0.0)
+  end = back[0] + 1 if len(back) else len(x)
+  return side_left(direction) * (y_rel + float(np.interp(d_rel + RADAR_TO_CAMERA, x[:end], np.array(model.position.y)[:end])))
 
 
 def line_sweep(line, x):
