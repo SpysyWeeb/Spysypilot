@@ -240,6 +240,7 @@ class LaneChangeGap:
     self.passing_v_rel = 0.0
     self.leaving = False
     self.moved_over = False
+    self.beside_frames = 0
     self.closing = False
     self.close_frames = 0
     self.landed_frames = 0
@@ -459,8 +460,8 @@ class LaneChangeGap:
       self.passing_id = lead.radarTrackId if lead.present and lead.radar and lateral_agrees(lead, model_lead(model, 0)) else -1
       self.passing_distance, self.passing_y_rel, self.passing_v_rel = lead.dRel, lead.yRel, lead.vRel
       self.leaving = False
-      # with nothing in front at the start there is no car to pass
-      self.moved_over = not lead.present
+      self.moved_over = False
+      self.beside_frames = 0
       self.closing = False
       self.close_frames = 0
       self.landed_frames = 0
@@ -491,7 +492,9 @@ class LaneChangeGap:
           self.leaving = True
         elif offset < LEAD_ON_PATH:
           self.leaving = False
-        if not self.moved_over and self.beside(passing.dRel, passing.yRel, direction):
+        # beside for as many frames running as the latch takes to set: one wide radar frame is no car moved over
+        self.beside_frames = self.beside_frames + 1 if self.beside(passing.dRel, passing.yRel, direction) else 0
+        if not self.moved_over and self.beside_frames >= CLOSE_FRAMES:
           self.moved_over = True
           self.closing = False
     if not starting:

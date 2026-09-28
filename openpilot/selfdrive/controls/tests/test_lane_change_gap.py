@@ -497,10 +497,52 @@ class TestLeadRelease:
     assert not released(gap)[0] and gap.closing
     assert step(gap, model=model, radar_state=get_radar_state(d_rel=FAR), n=5) == 0.0
     assert not released(gap)[0]
-    # the car being passed beside the car lifts it, and a lead beside is released however close
+    # the car being passed beside the car for CLOSE_FRAMES running lifts it, and a lead beside is released however close
     beside = get_radar_state(d_rel=20.0, v_rel=-4.0, y_rel=-LEAD_BESIDE)
+    step(gap, model=get_model(path=0.0), radar_state=beside, tracks=get_tracks((20.0, -LEAD_BESIDE, -4.0, 7)), n=CLOSE_FRAMES - 1)
+    assert gap.closing and released(gap)[0]
     step(gap, model=get_model(path=0.0), radar_state=beside, tracks=get_tracks((20.0, -LEAD_BESIDE, -4.0, 7)))
     assert not gap.closing and released(gap)[0]
+
+  def test_car_being_passed_in_no_slot_is_watched_by_the_floor(self):
+    # the model has moved its lead to a car far out that the path has left, while the car being passed, track 7, is in
+    # neither slot and still overlaps the car
+    path = path_for(2.0, FAR)
+    model = get_model(path=path)
+    far_lead = (80.0, on_path(80.0, path) - 2.0, -1.0, 8)
+    leads = get_radar_state(track_id=8, d_rel=far_lead[0], y_rel=far_lead[1])
+
+    def passed(d_rel, y_rel=0.0):
+      return get_tracks((d_rel, y_rel, -4.0, 7), far_lead)
+
+    def handed_over(d_rel):
+      gap = LaneChangeGap(CP, DT_MDL)
+      step(gap, model=get_model(path=0.0), radar_state=get_radar_state(d_rel=d_rel, v_rel=-4.0), tracks=passed(d_rel))
+      step(gap, model=model, radar_state=leads, tracks=passed(d_rel), n=CLOSE_FRAMES - 1)
+      return gap
+
+    # judged at its own speed: 52 m behind a car closing at 4 m/s the MPC could still take it back gently
+    gap = handed_over(52.0)
+    step(gap, model=model, radar_state=leads, tracks=passed(52.0), n=5)
+    assert released(gap)[0] and not gap.closing
+    # at 45 m it could not: the released lead is handed back after CLOSE_FRAMES running and followed at the full gap
+    gap = handed_over(45.0)
+    assert released(gap)[0]
+    step(gap, model=model, radar_state=leads, tracks=passed(45.0))
+    assert released(gap) == [False, False] and gap.closing
+    # one wide radar frame is not the car being passed beside
+    step(gap, model=model, radar_state=leads, tracks=passed(45.0, y_rel=-(LEAD_BESIDE + 0.1)))
+    step(gap, model=model, radar_state=leads, tracks=passed(45.0), n=5)
+    assert released(gap) == [False, False] and gap.closing
+    # beside for CLOSE_FRAMES running, it lifts the latch and the floor stops watching it
+    step(gap, model=model, radar_state=leads, tracks=passed(45.0, y_rel=-(LEAD_BESIDE + 0.5)), n=CLOSE_FRAMES)
+    assert released(gap)[0] and not gap.closing
+    # in a slot it is judged there: followed on the path, it does not hand the second lead back
+    on_the_path = on_path(45.0, path)
+    both = get_radar_state(d_rel=45.0, v_rel=-4.0, y_rel=on_the_path, lead_two={'track_id': 8, 'd_rel': far_lead[0], 'y_rel': far_lead[1]})
+    gap = LaneChangeGap(CP, DT_MDL)
+    step(gap, model=model, radar_state=both, tracks=get_tracks((45.0, on_the_path, -4.0, 7), far_lead), n=5)
+    assert released(gap) == [False, True] and not gap.closing
 
   def test_floor_holds_only_the_car_it_released(self):
     # a different car too close in a slot released last frame is new to the floor, not a glitch of the released one
@@ -591,7 +633,7 @@ class TestLeadRelease:
     assert released(gap) == [False, False] and not gap.moved_over
     # the same lateral on a straight road is a car beside
     gap = LaneChangeGap(CP, DT_MDL)
-    step(gap, model=get_model(path=path_for(1.5, d_rel)), radar_state=radar_state, tracks=tracks)
+    step(gap, model=get_model(path=path_for(1.5, d_rel)), radar_state=radar_state, tracks=tracks, n=CLOSE_FRAMES)
     assert released(gap)[0] and gap.moved_over
 
   def test_track_of_a_car_in_the_next_lane_is_not_the_leads(self):
