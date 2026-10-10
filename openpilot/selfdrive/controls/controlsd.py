@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import threading
 from numbers import Number
 
 from openpilot.cereal import log
@@ -7,12 +8,13 @@ from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
-from openpilot.common.realtime import config_realtime_process, DT_CTRL, Priority, Ratekeeper
+from openpilot.common.realtime import config_realtime_process, drop_realtime, DT_CTRL, Priority, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
+from openpilot.selfdrive.controls.lib.lane_centering import LaneCentering
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
@@ -62,6 +64,8 @@ class Controls:
     self.calibrated_pose: Pose | None = None
 
     self.LoC = LongControl(self.CP)
+    self.lane_centering = LaneCentering()
+    self.lane_centering_enabled = bool(self.params.get("LaneCenteringEnabled", return_default=True))
     self.VM = VehicleModel(self.CP)
     self.LaC: LatControl
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
@@ -135,8 +139,10 @@ class Controls:
     # Reset desired curvature to current to avoid violating the limits on engage
     if self.sm.valid['lateralManeuverPlan']:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
+      self.lane_centering.reset()
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      new_desired_curvature += self.lane_centering.update(CC.latActive and self.lane_centering_enabled, CS, model_v2)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
@@ -238,13 +244,26 @@ class Controls:
     cc_send.carControl = CC
     self.pm.send('carControl', cc_send)
 
+  def params_thread(self, stop_event):
+    drop_realtime()
+    while not stop_event.is_set():
+      self.lane_centering_enabled = bool(self.params.get("LaneCenteringEnabled", return_default=True))
+      stop_event.wait(0.1)
+
   def run(self):
     rk = Ratekeeper(100, print_delay_threshold=None)
-    while True:
-      self.update()
-      CC, lac_log = self.state_control()
-      self.publish(CC, lac_log)
-      rk.monitor_time()
+    stop_event = threading.Event()
+    thread = threading.Thread(target=self.params_thread, args=(stop_event,))
+    try:
+      thread.start()
+      while True:
+        self.update()
+        CC, lac_log = self.state_control()
+        self.publish(CC, lac_log)
+        rk.monitor_time()
+    finally:
+      stop_event.set()
+      thread.join()
 
 
 def main():

@@ -7,6 +7,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.widgets.ssh_key import SshKeyFetcher
+from openpilot.selfdrive.ui.layouts.settings.developer import DESCRIPTIONS
 
 
 class AlphaLongConfirmPage(NavScroller):
@@ -67,6 +68,8 @@ class DeveloperLayoutMici(NavScroller):
 
     # adb, ssh, ssh keys, debug mode, joystick debug mode, longitudinal maneuver mode, ip address
     # ******** Main Scroller ********
+    self._lane_centering_toggle = BigParamControl("lane centering", "LaneCenteringEnabled", description=DESCRIPTIONS["lane_centering"])
+    self._lane_centering_toggle.set_checked(bool(ui_state.params.get("LaneCenteringEnabled", return_default=True)))
     self._adb_toggle = BigCircleParamControl(gui_app.texture("icons_mici/adb_short.png", 82, 82), "AdbEnabled", icon_offset=(0, 12),
                                              description="Use Android Debug Bridge (ADB) over USB or the network.", title="enable ADB")
     self._ssh_toggle = BigCircleParamControl(gui_app.texture("icons_mici/ssh_short.png", 82, 82), "SshEnabled", icon_offset=(0, 12),
@@ -88,6 +91,7 @@ class DeveloperLayoutMici(NavScroller):
                                               description="Show touch locations and the UI frame rate.")
 
     self._scroller.add_widgets([
+      self._lane_centering_toggle,
       self._adb_toggle,
       self._ssh_toggle,
       self._ssh_keys_btn,
@@ -100,6 +104,7 @@ class DeveloperLayoutMici(NavScroller):
 
     # Toggle lists
     self._refresh_toggles = (
+      ("LaneCenteringEnabled", self._lane_centering_toggle),
       ("AdbEnabled", self._adb_toggle),
       ("SshEnabled", self._ssh_toggle),
       ("JoystickDebugMode", self._joystick_toggle),
@@ -161,7 +166,7 @@ class DeveloperLayoutMici(NavScroller):
 
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
-      item.set_checked(ui_state.params.get_bool(key))
+      item.set_checked(bool(ui_state.params.get(key, return_default=True)))
 
   def _on_joystick_debug_mode(self, state: bool):
     ui_state.params.put_bool("JoystickDebugMode", state, block=True)

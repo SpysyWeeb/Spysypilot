@@ -11,6 +11,11 @@ from openpilot.system.ui.widgets import DialogResult
 
 # Description constants
 DESCRIPTIONS = {
+  'lane_centering': tr_noop(
+    "Add lane-centering correction to the model's steering. Turn off to compare with the model's steering alone. " +
+    "Applies while engaged without restarting; steering limits still apply. This changes steering, not the displayed model path. " +
+    "Have a passenger operate this toggle while driving."
+  ),
   'enable_adb': tr_noop(
     "ADB (Android Debug Bridge) allows connecting to your device over USB or over the network. " +
     "See https://docs.comma.ai/how-to/connect-to-comma for more info."
@@ -35,6 +40,13 @@ class DeveloperLayout(Widget):
     self._is_release = self._params.get_bool("IsReleaseBranch")
 
     # Build items and keep references for callbacks/state updates
+    self._lane_centering_toggle = toggle_item(
+      lambda: tr("Lane Centering"),
+      description=lambda: tr(DESCRIPTIONS["lane_centering"]),
+      initial_state=bool(self._params.get("LaneCenteringEnabled", return_default=True)),
+      callback=self._on_lane_centering,
+    )
+
     self._adb_toggle = toggle_item(
       lambda: tr("Enable ADB"),
       description=lambda: tr(DESCRIPTIONS["enable_adb"]),
@@ -91,6 +103,7 @@ class DeveloperLayout(Widget):
     self._on_enable_ui_debug(self._params.get_bool("ShowDebugInfo"))
 
     self._scroller = Scroller([
+      self._lane_centering_toggle,
       self._adb_toggle,
       self._ssh_toggle,
       self._ssh_keys,
@@ -101,7 +114,7 @@ class DeveloperLayout(Widget):
       self._ui_debug_toggle,
     ], line_separator=True, spacing=0)
 
-    # Toggles should be not available to change in onroad state
+    # Refresh state and offroad-only gates on transitions.
     ui_state.add_offroad_transition_callback(self._update_toggles)
 
   def _render(self, rect):
@@ -140,6 +153,7 @@ class DeveloperLayout(Widget):
     # TODO: make a param control list item so we don't need to manage internal state as much here
     # refresh toggles from params to mirror external changes
     for key, item in (
+      ("LaneCenteringEnabled", self._lane_centering_toggle),
       ("AdbEnabled", self._adb_toggle),
       ("SshEnabled", self._ssh_toggle),
       ("JoystickDebugMode", self._joystick_toggle),
@@ -148,7 +162,10 @@ class DeveloperLayout(Widget):
       ("AlphaLongitudinalEnabled", self._alpha_long_toggle),
       ("ShowDebugInfo", self._ui_debug_toggle),
     ):
-      item.action_item.set_state(self._params.get_bool(key))
+      item.action_item.set_state(bool(self._params.get(key, return_default=True)))
+
+  def _on_lane_centering(self, state: bool):
+    self._params.put_bool("LaneCenteringEnabled", state, block=True)
 
   def _on_enable_ui_debug(self, state: bool):
     self._params.put_bool("ShowDebugInfo", state, block=True)

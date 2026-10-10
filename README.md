@@ -1,120 +1,73 @@
-<div align="center" style="text-align: center;">
+# lane-centering
 
-<h1>openpilot</h1>
+Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-<p>
-  <b>openpilot is an operating system for robotics.</b>
-  <br>
-  Currently, it upgrades the driver assistance system in 300+ supported cars.
-</p>
+**Status: in progress; awaiting owner field validation.** Watch for a slow weave with a period of 8–10 s on a straight highway, for the car running wider than before through left curves, for how much room it still gives a cyclist or a parked car, and on roads with only one painted line for whether it stays centred or pulls toward the missing line.
 
-<h3>
-  <a href="https://docs.comma.ai">Docs</a>
-  <span> · </span>
-  <a href="https://docs.comma.ai/contributing/roadmap/">Roadmap</a>
-  <span> · </span>
-  <a href="https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md">Contribute</a>
-  <span> · </span>
-  <a href="https://discord.comma.ai">Community</a>
-  <span> · </span>
-  <a href="https://comma.ai/shop">Try it on a comma four</a>
-</h3>
+## What it does
 
-Quick start: `bash <(curl -fsSL openpilot.comma.ai)`
+Keeps the car in the middle of the lane lines the model sees. The driving model is content to sit off-center: on the 2021 Hyundai Palisade it rides 0.21 m left of the midpoint between the lines on average (0.14 m with the previous model), is more than 0.56 m off for a tenth of the time, and cuts curves by about 0.4 m to the inside. Left to itself it drifts back toward *its own* preferred spot, not the center, and slowly: it closes about 6 % of an offset per second.
 
-[![openpilot tests](https://github.com/commaai/openpilot/actions/workflows/tests.yaml/badge.svg)](https://github.com/commaai/openpilot/actions/workflows/tests.yaml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![X Follow](https://img.shields.io/twitter/follow/comma_ai)](https://x.com/comma_ai)
-[![Discord](https://img.shields.io/discord/469524606043160576)](https://discord.comma.ai)
+This branch adds a small steering correction toward the lane center on top of the model's. The model still drives: the correction is at most 0.2 m/s² of lateral acceleration (the model's own demand is 1.1 m/s² at the 90th percentile), and it lets go when the driver or the model means to leave the lane. With one line painted over or worn away it keeps going from the other line and the lane width it learned while both were visible.
 
-</div>
+## Live comparison toggle
 
-<table>
-  <tr>
-    <td><a href="https://youtu.be/NmBfgOanCyk" title="Video By Greer Viau"><img src="https://github.com/commaai/openpilot/assets/8762862/2f7112ae-f748-4f39-b617-fabd689c3772"></a></td>
-    <td><a href="https://youtu.be/VHKyqZ7t8Gw" title="Video By Logan LeGrand"><img src="https://github.com/commaai/openpilot/assets/8762862/92351544-2833-40d7-9e0b-7ef7ae37ec4c"></a></td>
-    <td><a href="https://youtu.be/SUIZYzxtMQs" title="A drive to Taco Bell"><img src="https://github.com/commaai/openpilot/assets/8762862/05ceefc5-2628-439c-a9b2-89ce77dc6f63"></a></td>
-  </tr>
-</table>
+**Settings → Dev → Lane Centering** switches the correction on or off without restarting or disengaging. It defaults **on** to preserve this branch's existing behavior, and the persistent `LaneCenteringEnabled` setting survives restarts.
 
+- **On:** adds the existing lane-centering correction, ramping in from zero through its existing filter.
+- **Off:** removes the added correction and resets its filter. The model's desired steering still passes through the normal curvature limits, so the delivered command can take time to settle after a switch.
+- A background worker reads the setting about every 0.1 s, outside the real-time steering loop. Direct control-process startup/replay also uses the registered default when the key is absent. The toggle does not bypass lateral-activity gates or the lateral maneuver tool.
+- This changes actual steering, **not the displayed model path**; the model output itself is untouched. Have a passenger operate the toggle while driving, or change it while stopped.
 
-Using openpilot in a car
-------
+The live toggle has local control-loop and UI-callback regression tests; on-device timing and road A/B behavior still need owner validation. Disengage if the comparison produces unexpected steering or weaving.
 
-To use openpilot in a car, you need four things:
-1. **Supported Device:** a comma four, available at [comma.ai/shop/comma-four](https://www.comma.ai/shop/comma-four).
-2. **Software:** The setup procedure for the comma four allows users to enter a URL for custom software. Use the URL `openpilot.comma.ai` to install the release version.
-3. **Supported Car:** Ensure that you have one of [the 300+ supported cars](docs/CARS.md).
-4. **Car Harness:** You will also need a [car harness](https://comma.ai/shop/car-harness) to connect your comma four to your car.
+## How it works
 
-We have detailed instructions for [how to install the harness and device in a car](https://comma.ai/setup). Note that it's possible to run openpilot on [other hardware](https://blog.comma.ai/self-driving-car-for-free/), although it's not plug-and-play.
+Every model frame, `get_lane_center` looks one second ahead (at least 10 m) and compares the midpoint of the two lane lines with where the model's plan puts the car, over the plan points up to that distance. The road's curvature is in both, so only the offset between them is left. A straight line fitted to that offset gives where the plan sits and which way it is heading relative to the lane; the target error is the offset plus twice the heading's contribution at the lookahead, bounded to ±0.5 m, so a plan heading away from the center is corrected before the gap has opened and a plan already coming back is left alone. The correction is the curvature of the arc that closes 20 % of that error by the lookahead, `0.2 · 2 · error / lookahead²`, added to `modelV2.action.desiredCurvature` in `controlsd` before `clip_curvature`, so stock's lateral jerk and acceleration limits still apply to the sum. A 0.25 s first-order filter at 100 Hz smooths the 20 Hz steps.
 
+**One line missing.** While both lines are visible the lane width at the lookahead is learned through a 5 s filter; a width that differs by more than 0.4 m for five consecutive frames replaces it outright, because that is a new road, not noise. When exactly one line is valid, the center is that line plus or minus half the learned width, for as long as the line stays valid and the width is less than 60 s old. The learned width cannot be checked against the line that is gone, only against the model's plan, which sees the whole road: if the center it gives moves more than 0.25 m relative to the plan compared with the last frame that had both lines, the width is wrong for this road and the correction stops.
 
-### Branches
+It fades out instead of fighting:
 
-Running `master` and other branches directly is supported, but it's recommended to run one of the following prebuilt branches:
+- **No lane:** a line below 0.5 probability or above 0.3 m standard deviation does not count; with both lines, a lane narrower than 2.5 m or wider than 4.5 m (merges, splits, misread lines) gives no correction; with one line and no learned width, none either.
+- **Leaving the lane on purpose:** steering pressed, either blinker, or a lane change in progress — the correction decays to zero over the filter's time constant.
+- **The model means it:** full correction up to 0.5 m between the plan and the center, tapering to none at 0.9 m. Corner cutting sits below 0.5 m and is corrected; a plan 0.9 m off center has the wheels over the line, which is a decision (an obstacle, a lane change without a blinker), not drift.
+- **Low speed:** below 10 m/s the fixed 10 m lookahead makes the correction fade with speed squared. The car is already centered there and town lane lines are the least trustworthy.
+- **Lateral control inactive, or the lateral maneuver tool supplying the curvature:** nothing is added and the filter resets, so the correction always ramps back in from zero.
+- **A modelV2 message that is not shaped like one** (missing lines, x and y of different lengths, a plan with non-finite distances, a non-finite result): no correction. Stock reads a single number from the model here, so a bad message cannot crash `controlsd`; this reads arrays, and returns zero for the malformed shapes in the tests rather than raising.
 
-| comma four branch      | comma 3X branch        | URL                                    | description                                                                         |
-|------------------------|------------------------|----------------------------------------|-------------------------------------------------------------------------------------|
-| `release-mici`         | `release-tizi`         | openpilot.comma.ai                     | This is openpilot's release branch.                                                 |
-| `release-mici-staging` | `release-tizi-staging` | openpilot-test.comma.ai                | This is the staging branch for releases. Use it to get new releases slightly early. |
-| `nightly`              | `nightly`              | openpilot-nightly.comma.ai             | This is the bleeding edge development branch. Do not expect this to be stable.      |
-| `nightly-dev`          | `nightly-dev`          | installer.comma.ai/commaai/nightly-dev | Same as nightly, but includes experimental development features for some cars.      |
+The idea of correcting the plan toward the lane lines comes from StarPilot's lane centering, the heading term and the one-line hold from gm1500's `lp-e2e-blend`; the control law, gates and numbers here are this branch's own, from the measurements below.
 
-For [chestnut](https://comma.ai/shop/chestnut), use the following installer URLs:
+No new telemetry fields are added. While engaged on the ordinary model-steering path, the correction is `controlsState.desiredCurvature` minus `modelV2.action.desiredCurvature` wherever the limits are not active. Exact recomputation of the correction and learned width needs `modelV2`, `carState`, and the enable/disable history; note the toggle times for A/B log review. `lagd` keeps learning the steering delay from `controlsState.desiredCurvature`, which is the command the car actually receives, correction included; `torqued` does not read it.
 
-| branch                       | URL                                                        | description                                                                         |
-|------------------------------|------------------------------------------------------------|-------------------------------------------------------------------------------------|
-| `release-chestnut`           | installer.comma.ai/commaai/release-chestnut                | This is openpilot's release branch.                                                 |
-| `release-chestnut-staging`   | installer.comma.ai/commaai/release-chestnut-staging        | This is the staging branch for releases. Use it to get new releases slightly early. |
-| `nightly-chestnut`           | installer.comma.ai/commaai/nightly-chestnut                | This is the bleeding edge development branch. Do not expect this to be stable.      |
-| `nightly-chestnut-dev`       | installer.comma.ai/commaai/nightly-chestnut-dev            | Same as nightly, but includes experimental development features for some cars.      |
+### Why these numbers
 
-To start developing openpilot
-------
+Measured on the Palisade: four drives of 2026-09-10 to 09-14 (68 min engaged and hands-off) for the first design, then the two drives of 2026-09-19 (52 min, 25 min measurable) on the current upstream model, which sits further left.
 
-openpilot is developed by [comma](https://comma.ai/) and by users like you. We welcome both pull requests and issues on [GitHub](http://github.com/commaai/openpilot).
+| | |
+|---|---|
+| Car's offset from the lane center | mean 0.21 m left, rms 0.34 m; 39 % of the time more than 0.3 m off; the body within 15 cm of a line 17 % of the time |
+| Model's own recentring | the plan keeps 94 % of an offset after 1 s: it returns to its own spot over about 17 s |
+| In curves | 0.39 m inside in left curves, 0.19 m inside in firm right curves |
+| Lines | both usable 72 % of engaged time, exactly one 21 % (left only 13 %, right only 7 %), neither 8 %; one-line stretches are mostly under a second but the long ones hold most of the time: a 1 s hold covers 44 % of it, 20 s covers 97 % |
+| Lane width | median 3.29 m, p1–p99 2.67–4.49 m; it drifts 0.12 m over 1 s and 0.24 m over 30 s at the 90th percentile |
+| Steering latency, desired to actual curvature | 0.30–0.35 s (cross-correlation), 0.29 s (`lateralDelay`) |
 
-* Join the [community Discord](https://discord.comma.ai)
-* Check out [the contributing docs](docs/CONTRIBUTING.md)
-* Check out the [openpilot tools](openpilot/tools/)
-* Code documentation lives at https://docs.comma.ai
-* Information about running openpilot lives on the [community wiki](https://github.com/commaai/openpilot/wiki)
+The correction adds position stiffness, so latency between the command and the car turns into negative damping that the model's own heading control has to absorb. The heading term supplies the damping the lookahead alone lacks. In a closed-loop replay of the two drives, with the recorded lane lines and a driving model fitted to the numbers above, the plain lookahead law weaves with an 8–10 s period once the model straightens up slowly (2 s) or the latency reaches 0.45 s; with the heading term at twice the lookahead it does not weave in any case tried, including 3 s and 0.45 s, and the car moves sideways 15 % less than it did in the recording instead of 2 % more. A heading gain of 1.5 still weaves in the worst case; leaving the error unbounded reaches 0.4 m/s²; a longer lookahead removes the weave but centres worse, since authority falls with its square. The rest of the replay: rms offset 0.34 → 0.13 m, time more than 0.3 m off 39 % → 4 %, body within 15 cm of a line 17 % → 1 %, left curves 0.39 → 0.05 m; active 78 % of engaged time (62 % without the hold); correction p99 0.18 and max 0.202 m/s²; jerk p99 0.29 and max 0.68 m/s³.
 
-Want to get paid to work on openpilot? [comma is hiring](https://comma.ai/jobs#open-positions) and offers lots of [bounties](https://comma.ai/bounties) for external contributors.
+The one-line hold was checked on 1,482 recorded stretches where the lost line came back: the center rebuilt from the other line and the learned width was within 0.16 m of the true one 90 % of the time, and the error does not grow with how long the hold lasts — it is set by why the line was lost. Where it was lost at an exit or a merge the width is wrong, which is what the plan check is for: it drops 87 % of the holds that would have ended more than 0.3 m off and 3 % of the good ones. The snap rule comes from a right turn off a 4.2 m road onto a 3.3 m one with only the left line: the 5 s filter kept the wide width for two minutes and the check had to drop nearly every hold, while a width taken from a 0.4 s glimpse of both lines makes the rest of that road centred. Fleet-wide the snap fires about once a minute and makes the hold error smaller, not larger.
 
-Safety and Testing
-----
+### What it costs
 
-* openpilot observes [ISO26262](https://en.wikipedia.org/wiki/ISO_26262) guidelines, see [SAFETY.md](docs/SAFETY.md) for more details.
-* openpilot has software-in-the-loop [tests](.github/workflows/tests.yaml) that run on every commit.
-* The code enforcing the safety model lives in panda and is written in C, see [code rigor](https://github.com/commaai/panda#code-rigor) for more details.
-* panda has software-in-the-loop [safety tests](https://github.com/commaai/panda/tree/master/tests/safety).
-* Internally, we have a hardware-in-the-loop Jenkins test suite that builds and unit tests the various processes.
-* panda has additional hardware-in-the-loop [tests](https://github.com/commaai/panda/blob/master/Jenkinsfile).
-* We run the latest openpilot in a testing closet containing 10 comma devices continuously replaying routes.
+- A deliberate move of less than 0.9 m gets smaller. Against a model holding a 0.6 m offset the estimate is about 0.5 m; beyond 0.9 m nothing changes.
+- The lane center is measured from the camera. A device mounted off the car's centerline moves "center" by the same amount; the left offset grows with speed, which a mount error would not do, so most of it is how the model drives — but check the mount if the car ends up right of center.
+- With one line and no width learned in the last 60 s, or with neither line (8 % of engaged time), it does nothing.
+- Real lanes narrower than 2.5 m exist (a 2.4 m stretch in the logs); the width gate stands the two-line correction down there.
 
-<details>
-<summary>MIT Licensed</summary>
+## What changed
 
-openpilot is released under the MIT license. Some parts of the software are released under other licenses as specified.
-
-Any user of this software shall indemnify and hold harmless Comma.ai, Inc. and its directors, officers, employees, agents, stockholders, affiliates, subcontractors and customers from and against all allegations, claims, actions, suits, demands, damages, liabilities, obligations, losses, settlements, judgments, costs and expenses (including without limitation attorneys’ fees and costs) which arise out of, relate to or result from any use of this software by user.
-
-**THIS IS ALPHA QUALITY SOFTWARE FOR RESEARCH PURPOSES ONLY. THIS IS NOT A PRODUCT.
-YOU ARE RESPONSIBLE FOR COMPLYING WITH LOCAL LAWS AND REGULATIONS.
-NO WARRANTY EXPRESSED OR IMPLIED.**
-</details>
-
-<details>
-<summary>User Data and comma Account</summary>
-
-By default, openpilot uploads driving data to our servers. You can also access your data through [comma connect](https://connect.comma.ai/). We use your data to train better models and improve openpilot for everyone.
-
-openpilot is open source software, and users can disable data collection if they wish.
-
-openpilot logs the road-facing cameras, CAN, GPS, IMU, magnetometer, thermal sensors, crashes, and operating system logs.
-The driver-facing camera and microphone are only logged if you explicitly opt-in in settings.
-
-By using openpilot, you agree to [our Privacy Policy](https://comma.ai/privacy). You understand that use of this software or its related services will generate certain types of user data, which may be logged and stored at the sole discretion of comma. By accepting this agreement, you grant an irrevocable, perpetual, worldwide right to comma for the use of this data.
-</details>
+- `openpilot/selfdrive/controls/lib/lane_centering.py` — `get_lane_center` (the fit, the fade and the gates), `LaneCentering` (the filter, the learned width and the plan check).
+- `openpilot/selfdrive/controls/controlsd.py` — adds the correction to the model's desired curvature; polls the live toggle and resets the correction filter when disabled or while the lateral maneuver tool drives.
+- `openpilot/common/params_keys.h` and both `openpilot/selfdrive/ui/layouts/settings/developer.py` and `openpilot/selfdrive/ui/mici/layouts/settings/developer.py` — persistent default-on toggle at the top of Dev in both screen layouts, available while engaged.
+- `openpilot/selfdrive/controls/tests/test_lane_centering_toggle.py` and `openpilot/selfdrive/ui/tests/test_developer_lane_centering.py` — defaults/persistence (including absent keys), live on/off/on behavior through real controls and Params, no control-loop Param reads, worker shutdown, curvature limits, disabled startup, maneuver/inactive gates, and both UI toggle callbacks/state refresh.
+- `openpilot/selfdrive/controls/tests/test_lane_centering.py` — geometry, the heading term, the 0.2 m/s² bound over offsets and headings at every speed, each gate, malformed model messages, the hand-over to the driver, the hold (needs a width, a valid line and a plan that agrees; expires; snaps to a new road within five frames and filters small changes), and a closed-loop run at 15/25/35 m/s with 0.4–0.45 s of steering latency and a model straightening up over 1–2 s that must settle within 5 cm of center without overshoot. Each of 29 single-line mutations of the module fails a test, a gain of 0.21 and a heading gain of 1 or 3 included.
