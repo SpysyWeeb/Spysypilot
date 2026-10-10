@@ -78,8 +78,8 @@ class DesireHelper:
           self.nudgeless_used = False
           self.brake_cancelled = False
         elif not blindspot_detected and (torque_applied or auto_allowed):
-          if auto_allowed:
-            self.nudgeless_used = True
+          # A manual start also consumes this blinker event's automatic allowance.
+          self.nudgeless_used = True
           self.lane_change_state = LaneChangeState.laneChangeStarting
           self.lane_change_timer = 0.0
           self.lane_change_wait_timer = 0.0

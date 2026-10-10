@@ -2,7 +2,7 @@
 
 Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see the [`combo`](https://github.com/SpysyWeeb/Spysypilot/tree/combo) branch for the full fork overview. This fork is entirely vibe-coded, is a personal project, and is **not meant for others to use** — anyone is welcome to try it at their own risk.
 
-> ⚠️ In progress — the lane change acceleration and the lead release are awaiting field testing on a comma 3X. The nudgeless part has been field-validated.
+> ⚠️ In progress — the lane change acceleration and the lead release are awaiting field testing on a comma 3X. The original nudgeless behavior was field-validated; the manual-start retry fix has not yet been field-tested.
 
 *(Renamed from `nudgless-lane-changes` on 2026-09-23.)*
 
@@ -10,7 +10,7 @@ Feature branch of [Spysypilot](https://github.com/SpysyWeeb/Spysypilot) — see 
 
 **Lane changes trigger on the turn signal alone** — no steering nudge needed to confirm. With guardrails so it never fires when you didn't mean it:
 
-- **One auto change per blinker activation.** A second change on the same blinker needs a manual nudge; cycling the blinker re-arms the automatic one.
+- **The first lane-change start consumes the automatic allowance**, whether it starts automatically or from a manual nudge. Returning to the waiting state does not grant another automatic attempt. A second change on the same blinker needs manual steering input; cycling the blinker re-arms the automatic one. This does not add release-and-nudge edge detection or prove that the car crossed a lane line.
 - **Braking cancels the automatic change for the whole blinker event.** If you touch the brake with the blinker on, that blinker activation requires a manual nudge — the change will *not* fire the moment you lift off the pedal. Re-arm by cycling the blinker.
 
 *(inspired by sunnypilot)*
