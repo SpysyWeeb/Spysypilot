@@ -5,6 +5,7 @@ from unittest.mock import patch
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.hyundai.values import CAR
 from openpilot.cereal import log
+import openpilot.cereal.messaging as messaging
 from openpilot.common.parameterized import parameterized
 from openpilot.common.params import Params, ParamKeyFlag, ParamKeyType
 from openpilot.common.test import OpenpilotTestCase
@@ -37,14 +38,21 @@ class TestLaneCenteringToggle(OpenpilotTestCase):
     controls.sm.data['vehicleParameters'] = log.VehicleParameters.new_message(stiffnessFactor=1.0, steerRatio=CP.steerRatio)
     controls.sm.data['modelV2'] = get_model(lane_center=0.3)
     controls.sm['modelV2'].action.desiredCurvature = 0.001
+    self.update_controls(controls)
     return controls
+
+  def update_controls(self, controls):
+    # Daily requires a fresh SOL status even for ordinary cruise engagement.
+    state = messaging.new_message('spysydriveStateSP', valid=True)
+    controls.sm.update_msgs(time.monotonic(), [state.as_reader()])
+    controls.update()
 
   def test_control_loop_does_not_read_params(self):
     controls = self.make_controls()
     with patch.object(controls.params, 'get_bool', side_effect=AssertionError('Param I/O in control loop')), \
          patch.object(controls.params, 'get', side_effect=AssertionError('Param I/O in control loop')):
       for _ in range(20):
-        controls.update()
+        self.update_controls(controls)
         controls.state_control()
 
   def test_live_toggle_uses_model_and_keeps_curvature_limits(self):
@@ -62,7 +70,7 @@ class TestLaneCenteringToggle(OpenpilotTestCase):
       Params().put_bool("LaneCenteringEnabled", enabled, block=True)
       deadline = time.monotonic() + 2
       while controls.lane_centering_enabled != enabled and time.monotonic() < deadline:
-        controls.update()
+        self.update_controls(controls)
       assert controls.lane_centering_enabled == enabled
 
     model_curvature = controls.sm['modelV2'].action.desiredCurvature

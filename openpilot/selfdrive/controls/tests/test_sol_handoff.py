@@ -4,9 +4,10 @@ from typing import Any
 import pytest
 
 from opendbc.car.structs import car
-from openpilot.cereal import log
 from openpilot.selfdrive.controls.controlsd import Controls
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
+from openpilot.selfdrive.controls.lib.lane_centering import LaneCentering
+from openpilot.selfdrive.controls.tests.test_lane_centering import get_model
 
 
 def make_controls(torque_request):
@@ -19,8 +20,7 @@ def make_controls(torque_request):
     'carState': CS,
     'vehicleParameters': SimpleNamespace(stiffnessFactor=1.0, steerRatio=15.0, angleOffsetDeg=0.0, roll=0.0),
     'longitudinalPlan': SimpleNamespace(aTarget=0.0, shouldStop=False),
-    'modelV2': SimpleNamespace(meta=SimpleNamespace(laneChangeState=log.LaneChangeState.off),
-                               action=SimpleNamespace(desiredCurvature=0.0)),
+    'modelV2': get_model(lane_center=0.3, v_ego=CS.vEgo),
     'selfdriveState': SimpleNamespace(enabled=False, active=False),
     'spysydriveStateSP': SimpleNamespace(aol=SimpleNamespace(available=True, active=True)),
     'onroadEvents': [],
@@ -38,6 +38,8 @@ def make_controls(torque_request):
   controls.CI = SimpleNamespace(get_pid_accel_limits=lambda *a: (-3.5, 2.0))
   controls.LaC = SimpleNamespace(reset=lambda: None, update=lambda *a: (torque_request, 0.0, None))
   controls.controls_ext = ControlsExt()
+  controls.lane_centering = LaneCentering()
+  controls.lane_centering_enabled = True
   controls.desired_curvature = 0.0
   controls.steer_limited_by_safety = False
   return controls, CS

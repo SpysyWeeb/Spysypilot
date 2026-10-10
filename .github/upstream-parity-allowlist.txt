@@ -1,4 +1,4 @@
-# Intentional daily delta from the upstream master baseline. No other feature imports.
+# Intentional daily delta: torque/SOL, nudgeless-only, and lane centering. No passing-planner import.
 .github/upstream-parity-allowlist.txt # daily dependency policy
 .gitmodules # daily dependency policy
 opendbc_repo # SOL + default Hyundai 409/4/7
@@ -6,13 +6,13 @@ openpilot/cereal/custom.capnp # SOL
 openpilot/cereal/log.capnp # SOL
 openpilot/cereal/services.py # SOL
 openpilot/selfdrive/car/card.py # SOL
-openpilot/selfdrive/controls/controlsd.py # SOL
+openpilot/selfdrive/controls/controlsd.py # SOL + lane centering
 openpilot/selfdrive/controls/controlsd_ext.py # SOL
 openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_contract.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_controls.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_driver.py # SOL
-openpilot/selfdrive/controls/tests/test_sol_handoff.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_handoff.py # SOL + lane-centering fixture
 openpilot/selfdrive/controls/tests/test_sol_monitoring.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_roundtrip.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_state.py # SOL
@@ -31,3 +31,14 @@ openpilot/spysypilot/aol/aol.py # SOL
 openpilot/spysypilot/aol/helpers.py # SOL
 openpilot/spysypilot/aol/state.py # SOL
 panda # SOL
+README.md # daily feature scope
+openpilot/common/params_keys.h # lane-centering toggle
+openpilot/selfdrive/controls/lib/desire_helper.py # nudgeless-only + repeat prevention
+openpilot/selfdrive/controls/lib/lane_centering.py # lane centering
+openpilot/selfdrive/controls/tests/test_daily_lane_features.py # combined daily lane-feature regression
+openpilot/selfdrive/controls/tests/test_lane_centering.py # lane centering
+openpilot/selfdrive/controls/tests/test_lane_centering_toggle.py # lane centering + SOL fixture
+openpilot/selfdrive/controls/tests/test_lane_changes.py # nudgeless-only + repeat prevention
+openpilot/selfdrive/ui/layouts/settings/developer.py # lane-centering toggle
+openpilot/selfdrive/ui/mici/layouts/settings/developer.py # lane-centering toggle
+openpilot/selfdrive/ui/tests/test_developer_lane_centering.py # lane-centering toggle
