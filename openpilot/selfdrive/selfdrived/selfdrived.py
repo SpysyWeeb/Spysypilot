@@ -22,6 +22,7 @@ from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
+from openpilot.spysypilot.aol.aol import AolDriver
 
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
@@ -72,7 +73,7 @@ class SelfdriveD:
     self.big_model_ready_t = 0.
 
     # Setup sockets
-    self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'])
+    self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents', 'spysydriveStateSP'])
 
     self.gps_location_service = get_gps_location_service(self.params)
     self.gps_packets = [self.gps_location_service]
@@ -132,6 +133,9 @@ class SelfdriveD:
     self.dm_uncertain_alerted = False
     self.state_machine = StateMachine()
     self.rk = Ratekeeper(100, print_delay_threshold=None)
+
+    # Always-On-Lateral
+    self.aol = AolDriver(self)
 
     # Determine startup event
     self.startup_event = EventName.startup if build_metadata.openpilot.comma_remote and build_metadata.tested_channel else EventName.startupMaster
@@ -512,16 +516,21 @@ class SelfdriveD:
     return CS
 
   def update_alerts(self, CS):
+    pers = LONGITUDINAL_PERSONALITY_MAP[self.personality]
+    callback_args = [self.CP, CS, self.sm, self.is_metric, self.state_machine.soft_disable_timer, pers]
+
+    # AOL: lane-change prompts and AOL state alerts are WARNING alerts, which are
+    # suppressed unless fully engaged — surface them during AOL-only driving
+    aol_alerts = self.aol.create_lane_change_alerts(callback_args) + self.aol.create_aol_alerts()
+
     clear_event_types = set()
-    if ET.WARNING not in self.state_machine.current_alert_types:
+    if ET.WARNING not in self.state_machine.current_alert_types and not aol_alerts:
       clear_event_types.add(ET.WARNING)
     if self.enabled:
       clear_event_types.add(ET.NO_ENTRY)
 
-    pers = LONGITUDINAL_PERSONALITY_MAP[self.personality]
-    alerts = self.events.create_alerts(self.state_machine.current_alert_types, [self.CP, CS, self.sm, self.is_metric,
-                                                                                self.state_machine.soft_disable_timer, pers])
-    self.AM.add_many(self.sm.frame, alerts)
+    alerts = self.events.create_alerts(self.state_machine.current_alert_types, callback_args)
+    self.AM.add_many(self.sm.frame, alerts + aol_alerts)
     self.AM.process_alerts(self.sm.frame, clear_event_types)
 
   def publish_selfdriveState(self, CS):
@@ -559,9 +568,12 @@ class SelfdriveD:
     self.update_events(CS)
     if not self.CP.passive and self.initialized:
       self.enabled, self.active = self.state_machine.update(self.events)
+      self.aol.update_events(CS)
+      self.aol.update(CS)
     self.update_alerts(CS)
 
     self.publish_selfdriveState(CS)
+    self.aol.publish(self.pm)
 
     self.CS_prev = CS
 

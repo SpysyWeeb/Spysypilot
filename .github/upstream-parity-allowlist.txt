@@ -1,0 +1,33 @@
+# Intentional daily delta from the upstream master baseline. No other feature imports.
+.github/upstream-parity-allowlist.txt # daily dependency policy
+.gitmodules # daily dependency policy
+opendbc_repo # SOL + default Hyundai 409/4/7
+openpilot/cereal/custom.capnp # SOL
+openpilot/cereal/log.capnp # SOL
+openpilot/cereal/services.py # SOL
+openpilot/selfdrive/car/card.py # SOL
+openpilot/selfdrive/controls/controlsd.py # SOL
+openpilot/selfdrive/controls/controlsd_ext.py # SOL
+openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_contract.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_controls.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_driver.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_handoff.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_monitoring.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_roundtrip.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_state.py # SOL
+openpilot/selfdrive/monitoring/dmonitoringd.py # SOL
+openpilot/selfdrive/monitoring/policy.py # SOL
+openpilot/selfdrive/pandad/panda.cc # SOL
+openpilot/selfdrive/pandad/panda.h # SOL
+openpilot/selfdrive/pandad/pandad.cc # SOL
+openpilot/selfdrive/selfdrived/selfdrived.py # SOL
+openpilot/selfdrive/ui/onroad/augmented_road_view.py # SOL
+openpilot/selfdrive/ui/tests/test_sol_status.py # SOL
+openpilot/selfdrive/ui/ui_state.py # SOL
+openpilot/spysypilot/__init__.py # SOL
+openpilot/spysypilot/aol/__init__.py # SOL
+openpilot/spysypilot/aol/aol.py # SOL
+openpilot/spysypilot/aol/helpers.py # SOL
+openpilot/spysypilot/aol/state.py # SOL
+panda # SOL

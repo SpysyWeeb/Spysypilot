@@ -1,9 +1,11 @@
 [submodule "panda"]
   path = panda
-  url = ../../commaai/panda.git
+  url = ../../SpysyWeeb/panda.git
+  branch = daily
 [submodule "opendbc"]
   path = opendbc_repo
-  url = ../../commaai/opendbc.git
+  url = ../../SpysyWeeb/opendbc.git
+  branch = daily
 [submodule "msgq"]
   path = msgq_repo
   url = ../../commaai/msgq.git

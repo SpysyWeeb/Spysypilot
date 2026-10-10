@@ -3,7 +3,7 @@ import time
 import threading
 from collections.abc import Callable
 from enum import Enum
-from openpilot.cereal import messaging, log
+from openpilot.cereal import messaging, log, custom
 from opendbc.car.structs import car
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
@@ -24,6 +24,7 @@ class UIStatus(Enum):
   DISENGAGED = "disengaged"
   ENGAGED = "engaged"
   OVERRIDE = "override"
+  AOL_ACTIVE = "aol_active"
 
 
 class ChestnutState(Enum):
@@ -63,6 +64,7 @@ class UIState:
         "wideRoadCameraState",
         "managerState",
         "selfdriveState",
+        "spysydriveStateSP",
         "longitudinalPlan",
         "gpsLocationExternal",
         "carOutput",
@@ -182,14 +184,21 @@ class UIState:
         callback()
 
   def _update_status(self) -> None:
-    if self.started and self.sm.updated["selfdriveState"]:
+    if self.started:
       ss = self.sm["selfdriveState"]
       state = ss.state
 
-      if state in (log.SelfdriveState.OpenpilotState.preEnabled, log.SelfdriveState.OpenpilotState.overriding):
+      aol = self.sm["spysydriveStateSP"].aol
+      aol_valid = self.sm.alive["spysydriveStateSP"] and self.sm.valid["spysydriveStateSP"]
+      if state in (log.SelfdriveState.OpenpilotState.preEnabled, log.SelfdriveState.OpenpilotState.overriding) or \
+         (aol_valid and aol.active and aol.state == custom.AolState.AolStateEnum.overriding):
         self.status = UIStatus.OVERRIDE
+      elif ss.enabled:
+        self.status = UIStatus.ENGAGED
+      elif aol_valid and aol.active:
+        self.status = UIStatus.AOL_ACTIVE
       else:
-        self.status = UIStatus.ENGAGED if ss.enabled else UIStatus.DISENGAGED
+        self.status = UIStatus.DISENGAGED
 
     # Check for engagement state changes
     if self.engaged != self._engaged_prev:
