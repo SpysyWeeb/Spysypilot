@@ -10,6 +10,17 @@ Keeps the car in the middle of the lane lines the model sees. The driving model 
 
 This branch adds a small steering correction toward the lane center on top of the model's. The model still drives: the correction is at most 0.2 m/s² of lateral acceleration (the model's own demand is 1.1 m/s² at the 90th percentile), and it lets go when the driver or the model means to leave the lane. With one line painted over or worn away it keeps going from the other line and the lane width it learned while both were visible.
 
+## Live comparison toggle
+
+**Settings → Dev → Lane Centering** switches the correction on or off without restarting or disengaging. It defaults **on** to preserve this branch's existing behavior, and the persistent `LaneCenteringEnabled` setting survives restarts.
+
+- **On:** adds the existing lane-centering correction, ramping in from zero through its existing filter.
+- **Off:** removes the added correction and resets its filter. The model's desired steering still passes through the normal curvature limits, so the delivered command can take time to settle after a switch.
+- A background worker reads the setting about every 0.1 s, outside the real-time steering loop. Direct control-process startup/replay also uses the registered default when the key is absent. The toggle does not bypass lateral-activity gates or the lateral maneuver tool.
+- This changes actual steering, **not the displayed model path**; the model output itself is untouched. Have a passenger operate the toggle while driving, or change it while stopped.
+
+The live toggle has local control-loop and UI-callback regression tests; on-device timing and road A/B behavior still need owner validation. Disengage if the comparison produces unexpected steering or weaving.
+
 ## How it works
 
 Every model frame, `get_lane_center` looks one second ahead (at least 10 m) and compares the midpoint of the two lane lines with where the model's plan puts the car, over the plan points up to that distance. The road's curvature is in both, so only the offset between them is left. A straight line fitted to that offset gives where the plan sits and which way it is heading relative to the lane; the target error is the offset plus twice the heading's contribution at the lookahead, bounded to ±0.5 m, so a plan heading away from the center is corrected before the gap has opened and a plan already coming back is left alone. The correction is the curvature of the arc that closes 20 % of that error by the lookahead, `0.2 · 2 · error / lookahead²`, added to `modelV2.action.desiredCurvature` in `controlsd` before `clip_curvature`, so stock's lateral jerk and acceleration limits still apply to the sum. A 0.25 s first-order filter at 100 Hz smooths the 20 Hz steps.
@@ -27,7 +38,7 @@ It fades out instead of fighting:
 
 The idea of correcting the plan toward the lane lines comes from StarPilot's lane centering, the heading term and the one-line hold from gm1500's `lp-e2e-blend`; the control law, gates and numbers here are this branch's own, from the measurements below.
 
-There is no toggle and nothing new in the log. While engaged, the correction is `controlsState.desiredCurvature` minus `modelV2.action.desiredCurvature` wherever the limits are not active, and everything above, the learned width included, can be recomputed exactly from `modelV2` and `carState`. `lagd` keeps learning the steering delay from `controlsState.desiredCurvature`, which is the command the car actually receives, correction included; `torqued` does not read it.
+No new telemetry fields are added. While engaged on the ordinary model-steering path, the correction is `controlsState.desiredCurvature` minus `modelV2.action.desiredCurvature` wherever the limits are not active. Exact recomputation of the correction and learned width needs `modelV2`, `carState`, and the enable/disable history; note the toggle times for A/B log review. `lagd` keeps learning the steering delay from `controlsState.desiredCurvature`, which is the command the car actually receives, correction included; `torqued` does not read it.
 
 ### Why these numbers
 
@@ -56,5 +67,7 @@ The one-line hold was checked on 1,482 recorded stretches where the lost line ca
 ## What changed
 
 - `openpilot/selfdrive/controls/lib/lane_centering.py` — `get_lane_center` (the fit, the fade and the gates), `LaneCentering` (the filter, the learned width and the plan check).
-- `openpilot/selfdrive/controls/controlsd.py` — adds the correction to the model's desired curvature, resets it while the lateral maneuver tool drives (four lines).
+- `openpilot/selfdrive/controls/controlsd.py` — adds the correction to the model's desired curvature; polls the live toggle and resets the correction filter when disabled or while the lateral maneuver tool drives.
+- `openpilot/common/params_keys.h` and both `openpilot/selfdrive/ui/layouts/settings/developer.py` and `openpilot/selfdrive/ui/mici/layouts/settings/developer.py` — persistent default-on toggle at the top of Dev in both screen layouts, available while engaged.
+- `openpilot/selfdrive/controls/tests/test_lane_centering_toggle.py` and `openpilot/selfdrive/ui/tests/test_developer_lane_centering.py` — defaults/persistence (including absent keys), live on/off/on behavior through real controls and Params, no control-loop Param reads, worker shutdown, curvature limits, disabled startup, maneuver/inactive gates, and both UI toggle callbacks/state refresh.
 - `openpilot/selfdrive/controls/tests/test_lane_centering.py` — geometry, the heading term, the 0.2 m/s² bound over offsets and headings at every speed, each gate, malformed model messages, the hand-over to the driver, the hold (needs a width, a valid line and a plan that agrees; expires; snaps to a new road within five frames and filters small changes), and a closed-loop run at 15/25/35 m/s with 0.4–0.45 s of steering latency and a model straightening up over 1–2 s that must settle within 5 cm of center without overshoot. Each of 29 single-line mutations of the module fails a test, a gain of 0.21 and a heading gain of 1 or 3 included.
