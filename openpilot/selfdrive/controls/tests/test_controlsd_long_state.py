@@ -1,3 +1,5 @@
+from typing import Any
+
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.hyundai.values import CAR
 from opendbc.car.structs import car
@@ -6,6 +8,8 @@ from opendbc.car.vehicle_model import VehicleModel
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.controlsd import Controls
+from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
+from openpilot.selfdrive.controls.lib.lane_centering import LaneCentering
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 
@@ -19,6 +23,7 @@ class StubSubMaster:
   def __init__(self, messages):
     self.messages = messages
     self.valid = dict.fromkeys(messages, True)
+    self.alive = dict.fromkeys(messages, True)
 
   def __getitem__(self, service):
     return self.messages[service]
@@ -33,9 +38,9 @@ def controls():
   CI = interfaces[CAR.HYUNDAI_PALISADE](CP)
   CP = CP.as_reader()
 
-  messages = {}
+  messages: dict[str, Any] = {}
   for service in ('lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
-                  'longitudinalPlan', 'lateralManeuverPlan', 'carState'):
+                  'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'spysydriveStateSP'):
     messages[service] = getattr(messaging.new_message(service), service)
   messages['onroadEvents'] = []
   messages['vehicleParameters'].steerRatio = 16.0
@@ -44,11 +49,14 @@ def controls():
   messages['selfdriveState'].enabled = True
   messages['carState'].vEgo = 10.0
 
-  controlsd = Controls.__new__(Controls)
+  controlsd: Any = Controls.__new__(Controls)
   controlsd.CP = CP
   controlsd.CI = CI
   controlsd.VM = VehicleModel(CP)
   controlsd.LoC = LongControl(CP)
+  controlsd.controls_ext = ControlsExt()
+  controlsd.lane_centering = LaneCentering()
+  controlsd.lane_centering_enabled = True
   controlsd.LaC = LatControlTorque(CP, CI, DT_CTRL)
   controlsd.sm = StubSubMaster(messages)
   controlsd.steer_limited_by_safety = False

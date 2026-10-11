@@ -25,7 +25,7 @@ DV_MAX = 2.0              # m/s, the cap may never sit further below current spe
                           # the MPC erases in seconds, so a collapsing path must not command a slam
 LATCH_SETBACK = 3.0       # m, short of the model's endpoint. 5.0 was calibrated for the soft MPC column that overshot its point;
                           # with the committed profile the car stops ~0.6 m short of the point (routes 25/26), and the owner's
-                          # own stops sat 1.5-2.7 m short of the model's endpoint: 3 m lands about a metre before them
+                          # own stops sat 1.5-2.7 m short of the model's endpoint: 3 m lands about a meter before them
 MIN_STOP_LENGTH = 3.0     # m, floor of the detector window, keeps it alive at crawl speeds
 DETECT_RC = 1.0           # s
 LATCH_THRESHOLD = 0.55
@@ -65,10 +65,10 @@ NO_CAP = math.inf
 # hard (route 24, 2026-08-29: +1.45 -> -1.86 over 1.5 s after a commit that needed 1.9 m/s^2). The owner's own
 # stops do the opposite: reach the needed deceleration within a second, hold it, ease off at the end. The profile
 # below is that shape as a plan candidate: the constant deceleration that lands short of the committed point,
-# jerk-limited, faded out at low speed so the column's own easing landing (and the hold) take the last metres.
+# jerk-limited, faded out at low speed so the column's own easing landing (and the hold) take the last meters.
 PROFILE_JERK = 2.0             # m/s^3, the candidate moves at most this fast (the owner builds braking at 1-2 m/s^3)
 PROFILE_LANDING = 2.5          # m, the constant-deceleration profile lands this far short of the committed point, so the
-                               # column's easing landing has room with the car's actuation lag. The car stops about a metre
+                               # column's easing landing has room with the car's actuation lag. The car stops about a meter
                                # past the landing (closed-loop plant), so this margin sets the stop position almost 1:1
 PROFILE_MIN_DISTANCE = 0.5     # m, past the committed point the column and the hold own everything
 PROFILE_MIN_TIME = 1.0         # s, the profile never plans to reach its landing sooner than this: the need tapers with
@@ -241,7 +241,7 @@ class ForceStops:
       return self._result(v_ego, a_prev_output)
 
     if model_length <= 0.0 and not self.forcing:
-      # at walking pace the model's stopped plan ends a few centimetres behind the car, so a commitment reads a non-positive
+      # at walking pace the model's stopped plan ends a few centimeters behind the car, so a commitment reads a non-positive
       # endpoint at any speed like one inside the setback, and the hold above forms on it
       self.reset()
       return ForceStopsResult()

@@ -66,3 +66,8 @@ openpilot/selfdrive/test/longitudinal_maneuvers/plant.py # BLoTv3
 openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py # BLoTv3
 openpilot/tools/jotpluggler/layouts/tuning.json # BLoTv3
 openpilot/tools/plotjuggler/layouts/tuning.xml # BLoTv3
+openpilot/selfdrive/controls/tests/test_daily_blotv3_integration.py # daily BLoTv3 integration regressions
+openpilot/selfdrive/selfdrived/tests/test_daily_cem_sol.py # daily CEM + SOL integration regressions
+pyproject.toml # preserve BLoTv3 cancelled identifier in the existing spelling allowlist
+openpilot/selfdrive/car/tests/test_cruise_speed.py # BLoTv3 steady-state settling horizon; original speed tolerance
+openpilot/selfdrive/controls/tests/test_daily_lead_departure.py # daily BLoTv3 controlling-lead hold/departure regressions

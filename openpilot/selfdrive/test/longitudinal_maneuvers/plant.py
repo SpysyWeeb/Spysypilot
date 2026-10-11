@@ -120,7 +120,7 @@ class Plant:
     # the way the real model calls a red light only a few seconds out
     self.stop_line = stop_line
     self.stop_line_horizon_s = stop_line_horizon_s
-    # extra braking the fake model asks for over the last metres before the line, the way the real model's request
+    # extra braking the fake model asks for over the last meters before the line, the way the real model's request
     # ramps late (-0.7 ... -1.3 -> -2.5 into the last seconds)
     self.e2e_landing_push = e2e_landing_push
     # without it the car applies the request at once
@@ -150,6 +150,7 @@ class Plant:
   def _plan_stop_line(self, model):
     # the model's path ends at the line with a constant-deceleration speed profile; its e2e request is
     # deliberately softer than that need, as the real model's early request is
+    assert self.stop_line is not None
     d_line = self.stop_line - self.distance
     t = np.array(ModelConstants.T_IDXS)
     if d_line <= 0.5 or self.speed < 0.3:

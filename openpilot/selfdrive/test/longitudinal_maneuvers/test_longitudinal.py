@@ -351,7 +351,7 @@ class TestPlant(OpenpilotTestCase):
 class TestRedLightStop(PinnedTestCase):
   def test_a_late_red_light_stops_front_loaded_short_of_the_line(self):
     # the model calls a red light ~5 s out; the owner wants the needed deceleration reached within a second, held, and
-    # eased off at the end -- never still increasing in the last metres
+    # eased off at the end -- never still increasing in the last meters
     maneuver = Maneuver('approach a red light at 14 m/s, seen 5 s out', duration=30.0, initial_speed=14.0,
                         cruise_values=[14.0, 14.0], e2e=True, stop_line=160.0, CP=PALISADE)
     valid, logs = maneuver.evaluate()
@@ -360,6 +360,7 @@ class TestRedLightStop(PinnedTestCase):
     stopped = np.flatnonzero(v < 0.05)
     assert len(stopped) > 0, 'did not stop'
     i_stop = int(stopped[0])
+    assert maneuver.stop_line is not None
     assert maneuver.stop_line - 5.0 <= x[i_stop] <= maneuver.stop_line, x[i_stop]
     onset = int(np.flatnonzero(a < -0.3)[0])
     approach = a[onset:i_stop]
@@ -438,6 +439,7 @@ class RedLightPlan(PinnedTestCase):
     x, v, a_target, committed = logs[:, 1], logs[:, 3], logs[:, 7], logs[:, 8] > 0.5
     stopped = np.flatnonzero(v < 0.05)
     assert len(stopped) > 0, 'did not stop'
+    assert maneuver.stop_line is not None
     assert maneuver.stop_line - 5.0 <= x[int(stopped[0])] <= maneuver.stop_line, x[int(stopped[0])]
     self.onset, end = braking_window(logs, self.speed)
     assert committed.any(), 'no commit'
@@ -488,7 +490,7 @@ class TestRedLightPlanContinuityOnAnIdealActuator(RedLightPlan):
 
 
 def landing_excess(logs, lead=False, v_min=KISS_SPEED, v_max=LANDING_SPEED):
-  # the most the car's braking exceeded the landing corridor through the last metres (KISS_SPEED .. LANDING_SPEED).
+  # the most the car's braking exceeded the landing corridor through the last meters (KISS_SPEED .. LANDING_SPEED).
   # Below the kiss speed the corridor is the kiss plus the anti-stall integral by design, and the aEgo checks judge that end.
   # Each row's plan was computed from the previous row's state (the plant logs after integrating), so the corridor is judged
   # at that speed and gap. With a lead, the braking that stopping STOP_DISTANCE behind it needs always passes
@@ -526,6 +528,7 @@ class TestStopLanding(PinnedTestCase):
     x, v = logs[:, 1], logs[:, 3]
     stopped = np.flatnonzero(v < 0.05)
     assert len(stopped) > 0, 'did not stop'
+    assert maneuver.stop_line is not None
     assert maneuver.stop_line - 5.0 <= x[int(stopped[0])] <= maneuver.stop_line
     assert landing_excess(logs) <= 0.02
 
@@ -543,7 +546,7 @@ class TestStopLanding(PinnedTestCase):
     assert landing_excess(logs, lead=True) <= 0.02
 
   def test_the_models_late_ramp_is_bounded_and_the_car_still_stops_before_the_line(self):
-    # the model's request ramps hard into the last metres of a stop the car is already landing. The law bounds that landing
+    # the model's request ramps hard into the last meters of a stop the car is already landing. The law bounds that landing
     # to its taper; the stop still lands short of the line
     kwargs = {'duration': 30.0, 'initial_speed': 14.0, 'cruise_values': [14.0, 14.0], 'e2e': True, 'stop_line': 160.0, 'e2e_landing_push': 3.5,
               'CP': PALISADE}
@@ -564,7 +567,7 @@ class TestStopLanding(PinnedTestCase):
     assert landing_excess(unbounded) >= 0.5, landing_excess(unbounded)
 
   def test_a_car_that_lets_go_of_the_brake_slowly_still_lands_close_to_the_law(self):
-    # through the Palisade's actuator the car may not brake much harder than the corridor allows in the last metres, and it
+    # through the Palisade's actuator the car may not brake much harder than the corridor allows in the last meters, and it
     # still stops behind the lead
     kwargs = {'duration': 25.0, 'initial_speed': 10.0, 'lead_relevancy': True, 'initial_distance_lead': 90.0,
               'speed_lead_values': [0.0, 0.0], 'cruise_values': [10.0, 10.0], 'actuator_lag': True, 'CP': PALISADE}
@@ -605,7 +608,7 @@ class TestACarThatBrakesLessThanAsked(PinnedTestCase):
     assert_the_plan_builds_to_the_stop_without_steps_or_let_offs(self.logs[onset:end, 7], onset)
 
   # the landing's edges assume the car does as asked, and its one feedback, the anti-stall integral, closes on the deceleration (the
-  # kiss less its deadband), not on the gap: a car 0.3 short is asked about -0.42, rolls the last metres in at -0.10 and rests ~3 m back
+  # kiss less its deadband), not on the gap: a car 0.3 short is asked about -0.42, rolls the last meters in at -0.10 and rests ~3 m back
   @unittest.expectedFailure
   def test_it_rests_at_least_the_rest_gap_behind_it(self):
     assert self.logs[-1, 6] >= LEAD_REST_GAP, self.logs[-1, 6]

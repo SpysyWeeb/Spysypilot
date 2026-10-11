@@ -221,7 +221,7 @@ class TestSearchRelease:
   def test_an_open_road_cancels_the_hold(self):
     cem = ConditionalExperimentalMode()
     assert run(cem, 1.0, stop_model(), car_state(10.0))
-    # the road opens (a long, moving path): the hold is cancelled and the ordinary clear hysteresis exits well
+    # the road opens (a long, moving path): the hold is canceled and the ordinary clear hysteresis exits well
     # before the 4 s the last strict frame would have held
     assert not run(cem, CLEAR_CANCEL_S + 1.0, model(path_end=150.0, terminal_speed=12.0), car_state(10.0))
 

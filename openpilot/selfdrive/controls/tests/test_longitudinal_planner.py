@@ -1,4 +1,5 @@
 import math
+from unittest.mock import patch
 import numpy as np
 import pytest
 
@@ -226,12 +227,13 @@ class TestPlannerCruise:
     accels = [a for _, _, a in log]
     assert all(b >= a - 1e-6 for a, b in zip(accels, accels[1:], strict=False) if b < get_max_accel(0.0) - 1e-3)
 
-  def test_lead_launch_starts_smooth_because_the_change_cost_stays_on(self):
+  def test_lead_launch_starts_smooth_because_the_change_cost_stays_on(self, monkeypatch):
     # behind a departing lead the MPC owns the launch; keeping the change cost through standstill softens its first step
     def launch(keep_cost):
       plant = Plant(speed=0.0, distance_lead=7.0, lead_relevancy=True)
       set_weights = plant.planner.mpc.set_weights
-      plant.planner.mpc.set_weights = lambda prev_accel_constraint, *args: set_weights(prev_accel_constraint and keep_cost, *args)
+      monkeypatch.setattr(plant.planner.mpc, 'set_weights',
+                          lambda prev_accel_constraint, *args: set_weights(prev_accel_constraint and keep_cost, *args))
       accels, sources = [], []
       while plant.current_time < 3.0:
         plant.step(v_lead=np.interp(plant.current_time, [0.5, 2.0], [0.0, 7.0]), v_cruise=20.0)
@@ -271,11 +273,11 @@ class TestPlannerCruise:
     assert planner.plan_source != LongitudinalPlanSource.e2e
     assert planner.output_a_target > -3.0
 
-  def test_standstill_keeps_the_acceleration_change_cost(self):
+  def test_standstill_keeps_the_acceleration_change_cost(self, monkeypatch):
     plant = Plant(speed=0.0, distance_lead=200.0, lead_relevancy=False)
     calls = []
     original = plant.planner.mpc.set_weights
-    plant.planner.mpc.set_weights = lambda *args, **kwargs: (calls.append((args, kwargs)), original(*args, **kwargs))
+    monkeypatch.setattr(plant.planner.mpc, 'set_weights', lambda *args, **kwargs: (calls.append((args, kwargs)), original(*args, **kwargs)))
     plant.step(v_cruise=50.0)
     assert plant.last_sm['carState'].standstill
     assert calls[-1][0][0] is True
@@ -292,22 +294,22 @@ class TestPlannerCruise:
         plant.speed = v_ego  # hold speed so the settled cruise target is observable
       assert abs((plant.planner.a_cruise) - (expected)) <= 0.02, (radar_valid, e2e)
 
-  def test_fcw_comes_only_from_the_mpc_crash_counter(self):
+  def test_fcw_comes_only_from_the_mpc_crash_counter(self, monkeypatch):
     plant = Plant(speed=15.0, distance_lead=40.0, lead_relevancy=True)
-    plant.planner.supervisor.update = lambda *args: LongitudinalPolicy(1.0, 0.0)   # a stand-down: stock policy, and nothing else
+    monkeypatch.setattr(plant.planner.supervisor, 'update', lambda *args: LongitudinalPolicy(1.0, 0.0))   # a stand-down: stock policy, and nothing else
     plant.step(v_lead=15.0)
     assert not plant.planner.fcw
 
-  def test_a_force_stops_hold_forces_should_stop_and_caps_cruise(self):
+  def test_a_force_stops_hold_forces_should_stop_and_caps_cruise(self, monkeypatch):
     plant = Plant(speed=0.0, distance_lead=200.0, lead_relevancy=False, e2e=True)
-    plant.planner.force_stops.update = lambda *args: ForceStopsResult(0.0, 0.0, True)
+    monkeypatch.setattr(plant.planner.force_stops, 'update', lambda *args: ForceStopsResult(0.0, 0.0, True))
     plant.step(v_cruise=20.0)
     assert plant.planner.output_should_stop
     assert plant.planner.output_a_target <= 0.0
 
-  def test_a_nonfinite_stop_point_never_reaches_the_mpc(self):
+  def test_a_nonfinite_stop_point_never_reaches_the_mpc(self, monkeypatch):
     plant = Plant(speed=10.0, distance_lead=200.0, lead_relevancy=False, e2e=True)
-    plant.planner.force_stops.update = lambda *args: ForceStopsResult(NO_CAP, float('nan'), False)
+    monkeypatch.setattr(plant.planner.force_stops, 'update', lambda *args: ForceStopsResult(NO_CAP, float('nan'), False))
     plant.step(v_cruise=20.0)
     assert plant.planner.mpc.source != LongitudinalPlanSource.stop
 
@@ -475,6 +477,7 @@ class TestStopBit:
         x += v * DT_CTRL
     assert rolling and all(state == LongCtrlState.pid and out == target for state, out, target in rolling)
     assert bit_at is not None and bit_at <= STANDSTILL_SPEED, bit_at
+    assert wheel_stop is not None
     assert math.isclose(wheel_stop, -KISS_DECEL, rel_tol=1e-6, abs_tol=1e-9), wheel_stop
     assert v == 0.0 and planner.output_should_stop and long_control.long_control_state == LongCtrlState.stopping
 
@@ -502,6 +505,7 @@ class TestStopBit:
         x += v * DT_CTRL
     assert len(bits) > 2 and all(bits), bits
     assert all(state == LongCtrlState.stopping for state in states)
+    assert target is not None
     assert v == 0.0 and target - x > 0.0, target - x
 
   def test_a_speed_reading_after_the_stop_keeps_the_stop_bit_until_the_car_rolls_again(self):
@@ -564,7 +568,7 @@ class TestStandstillRelease:
     planner.update(frame(0.0, lead=(d, 1.0, 1.0), v_cruise=10.0))
     assert not planner.output_should_stop
 
-  def test_a_lead_the_car_did_not_stop_for_does_not_hold_it(self):
+  def test_a_lead_the_car_did_not_stop_for_does_not_hold_it(self, monkeypatch):
     # engaged at rest with a stationary lead well beyond the stop distance: the MPC does not stop the car for it, and it goes
     planner = LongitudinalPlanner(PALISADE_CP)
     planner.update(frame(0.0, lead=(20.0, 0.0, 0.0), v_cruise=10.0, engaged=False))
@@ -579,7 +583,7 @@ class TestStandstillRelease:
       if stop['x'] is None:
         return ForceStopsResult()
       return ForceStopsResult(NO_CAP, stop['x'] - car.x, car.v < 0.01, None)
-    car.planner.force_stops.update = force_stops
+    monkeypatch.setattr(car.planner.force_stops, 'update', force_stops)
     while car.v >= 0.01:
       car.step(lead=(60.0 - car.x, 0.0, 0.0), v_cruise=10.0)
     for _ in range(round(1.0 / DT_MDL)):
@@ -615,7 +619,7 @@ class TestStandstillRelease:
     # the kiss lands the car behind a stopped lead, which then inches forward below any departure evidence, so the MPC comes to
     # plan toward the gap and hover above the stop bit's threshold. The model forecasts the lead leaving and the pre-release
     # lets the car go; the forecast then fades. A lead that reads where it was released (the radar's 0.1 m range steps flicker
-    # by up to two on a standing car) is standing, and the car is held on the kiss again; a lead half a metre on is leaving
+    # by up to two on a standing car) is standing, and the car is held on the kiss again; a lead half a meter on is leaving
     planner, d = self.rest_behind(6.0, 30.0)
     assert planner.stop_landing.landing and planner.output_should_stop
     d, frames = self.inch(planner, d, 8.8)
@@ -746,7 +750,7 @@ class TestStandstillRelease:
     assert all(bit and landing and not handed for bit, landing, handed in states), states
 
   @pytest.mark.parametrize('lead', ['missing', 'standing', 'leaves'])
-  def test_the_models_path_opening_ends_a_hold_only_while_its_lead_is_missing(self, lead):
+  def test_the_models_path_opening_ends_a_hold_only_while_its_lead_is_missing(self, lead, monkeypatch):
     # stopped at a red line behind a lead the car is held for; at the green Force Stops releases. A lead gone missing before it
     # leaves nothing but the release to go on, and the car goes; with the model planning open road from the release on, a lead
     # still standing there holds it, and a lead in sight on the release frame and missing two frames later has left once the open
@@ -758,7 +762,7 @@ class TestStandstillRelease:
       if stop['x'] is None:
         return ForceStopsResult()
       return ForceStopsResult(NO_CAP, stop['x'] - car.x, car.v < 0.01, None)
-    car.planner.force_stops.update = force_stops
+    monkeypatch.setattr(car.planner.force_stops, 'update', force_stops)
     while car.v >= 0.01:
       car.step(lead=(38.0 - car.x, 0.0, 0.0), v_cruise=10.0)
     planner, d = car.planner, 38.0 - car.x
@@ -1075,10 +1079,13 @@ class TestHandOver:
       assert not car.planner.force_stops.forcing
       self.assert_carried(car, 20, experimental=True, e2e_accel=1.0, path=(100.0, car.v))
 
-  def test_the_profile_ending_while_the_column_stays_hands_over_from_the_output(self):
+  def test_the_profile_ending_while_the_column_stays_hands_over_from_the_output(self, monkeypatch):
     car = IdealCar(8.0)
     stop = {'x': 30.0, 'a': -2.0}
-    car.planner.force_stops.update = lambda *args: ForceStopsResult(NO_CAP, stop['x'] - car.x, False, stop['a'])
+    def force_stops(*args):
+      assert stop['x'] is not None
+      return ForceStopsResult(NO_CAP, stop['x'] - car.x, False, stop['a'])
+    monkeypatch.setattr(car.planner.force_stops, 'update', force_stops)
     for _ in range(20):
       car.step()
     assert car.planner.plan_winner == 'profile'
@@ -1283,8 +1290,8 @@ class TestMpcSeed:
       a_lead = a_brake if onset and v_lead > 0.0 else 0.0
       v_lead = max(v_lead + a_lead * DT_MDL, 0.0)
       d_lead += v_lead * DT_MDL
-      car.planner.mpc.run = (lambda iterations=1: run(30)) if onset and not targets else run
-      car.step(lead=(d_lead - car.x, v_lead, a_lead), v_cruise=20.0)
+      with patch.object(car.planner.mpc, 'run', (lambda iterations=1: run(30)) if onset and not targets else run):
+        car.step(lead=(d_lead - car.x, v_lead, a_lead), v_cruise=20.0)
       if onset:
         targets.append(car.a)
     onset = targets[:int(np.argmin(targets)) + 1]

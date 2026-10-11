@@ -113,20 +113,20 @@ def accel_max(request, monkeypatch):
 
 
 class TestUpdateProtocol:
-  def test_weights_are_set_exactly_once_per_update(self):
+  def test_weights_are_set_exactly_once_per_update(self, monkeypatch):
     mpc = LongitudinalMpc()
     calls = []
     set_weights = mpc.set_weights
-    mpc.set_weights = lambda *args: (calls.append(args), set_weights(*args))
+    monkeypatch.setattr(mpc, 'set_weights', lambda *args: (calls.append(args), set_weights(*args)))
     mpc.set_cur_state(10.0, 0.0, 0.0)
     mpc.update(radar_state(d_one=20.0, v_one=8.0), STANDARD, jerk_scale=0.3, t_follow_pad=0.5)
     assert len(calls) == 1
 
-  def test_supervisor_policy_shapes_lead0_only(self):
+  def test_supervisor_policy_shapes_lead0_only(self, monkeypatch):
     mpc = LongitudinalMpc()
     weights = []
     set_weights = mpc.set_weights
-    mpc.set_weights = lambda *args: (weights.append(args), set_weights(*args))
+    monkeypatch.setattr(mpc, 'set_weights', lambda *args: (weights.append(args), set_weights(*args)))
     mpc.set_cur_state(10.0, 0.0, 0.0)
     mpc.update(radar_state(d_one=20.0, v_one=8.0), STANDARD, jerk_scale=0.3, t_follow_pad=0.5)
     assert mpc.source == LongitudinalPlanSource.lead0

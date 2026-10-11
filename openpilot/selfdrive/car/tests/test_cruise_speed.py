@@ -13,7 +13,9 @@ ButtonEvent = car.CarState.ButtonEvent
 ButtonType = car.CarState.ButtonEvent.Type
 
 
-def run_cruise_simulation(cruise, e2e, personality, t_end=20.):
+# BLoTv3's 0.18/s ordinary-cruise comfort gain needs longer to settle a 1 m/s step.
+# Keep the original 0.01 m/s steady-state precision and the controller tuning, not a 20-second fixture horizon.
+def run_cruise_simulation(cruise, e2e, personality, t_end=30.):
   man = Maneuver(
     '',
     duration=t_end,

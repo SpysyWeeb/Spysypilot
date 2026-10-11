@@ -522,7 +522,7 @@ class TestMovingGreenRelease:
 
 
 class TestStopHere:
-  # at walking pace the model's stopped plan ends a few centimetres behind the car: that is the stop, not the absence of one.
+  # at walking pace the model's stopped plan ends a few centimeters behind the car: that is the stop, not the absence of one.
   # The field's frames carry no stop bit (only the position hold keeps the commitment); both are covered
   @pytest.mark.parametrize('should_stop', [True, False])
   def test_a_commitment_keeps_its_point_through_a_non_positive_endpoint_and_forms_the_hold(self, should_stop):

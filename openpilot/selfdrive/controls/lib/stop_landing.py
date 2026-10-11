@@ -4,13 +4,13 @@ import numpy as np
 
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.selfdrive.controls.lib.longitudinal_lead import closing_speed, total_decel_requirement
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_ABSENCE_FRAMES, STOP_DISTANCE
 
 # The landing law: the planner's last word on braking as a stop closes.
 #
 # Every stop -- a committed red light, the MPC column behind a stopped lead, the model's own request in Experimental
 # mode, the cruise floor under a shaping cap -- reaches the arbitration as its own candidate with its own idea of the
-# last metres, and they all land harder than a stop needs to. A stop should brake as hard as it needs early, let off as
+# last meters, and they all land harder than a stop needs to. A stop should brake as hard as it needs early, let off as
 # the car settles, and always let off at the very end. The law is a corridor on the car's deceleration through the landing:
 #
 # * a bound, falling with speed, that only removes surplus braking: whatever stopping STOP_DISTANCE behind a lead needs
@@ -95,6 +95,9 @@ class StopLanding:
     self._held = False
     self._positive_frames = 0
     self.integral = 0.0
+    self.required_decel = 0.0
+    self._lead_requirements = [0.0, 0.0]
+    self._lead_missing = [LEAD_ABSENCE_FRAMES, LEAD_ABSENCE_FRAMES]
 
   def bound(self, v_ego):
     # the most braking requested at this speed
@@ -118,10 +121,10 @@ class StopLanding:
       requirement = max(requirement, stop_within(v_ego, room))
     return requirement
 
-  def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None, launch_cancelled=False):
+  def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None, launch_cancelled=False, lead2=None):
     """Bound the arbitrated acceleration target through a landing; returns the plan unchanged otherwise.
 
-    lead is the planner's LeadObservation, stop_intent says the plan ends in a stop this frame, launch says the planner
+    lead and optional lead2 are the planner's LeadObservations. stop_intent says the plan ends in a stop, launch says the planner
     itself is letting the car go (a lead-departure pre-release or its hold handed back, a Force Stops release), a_ego is
     the car's measured acceleration (None: the anti-stall integral holds), launch_cancelled says the planner took back a
     launch it issued at standstill. A landing starts on intent with the plan braking more than the kiss below
@@ -135,6 +138,19 @@ class StopLanding:
       self.reset()
       return a_target
     v_ego = max(v_ego, 0.0)
+    expired_requirement = 0.0
+    # Retain each slot's last urgency over the MPC's brief absence window, even if the other lead remains.
+    # This only permits planned braking through the comfort bound; it is not a retained MPC obstacle or a brake demand.
+    for i, observation in enumerate((lead, lead2)):
+      if observation is not None and observation.present:
+        self._lead_requirements[i] = self.lead_requirement(v_ego, observation)
+        self._lead_missing[i] = 0
+      else:
+        self._lead_missing[i] = min(self._lead_missing[i] + 1, LEAD_ABSENCE_FRAMES)
+        if self._lead_missing[i] >= LEAD_ABSENCE_FRAMES:
+          expired_requirement = max(expired_requirement, self._lead_requirements[i])
+          self._lead_requirements[i] = 0.0
+    self.required_decel = max(self._lead_requirements)
     if not math.isfinite(a_target):
       # a NaN target (an MPC solve diverging before its own reset lands) must not enter the corridor's clamps -- min/max
       # return NaN regardless of the other side -- so it is passed through exactly as upstream's own NaN handling would,
@@ -164,7 +180,9 @@ class StopLanding:
       self.integral = min(max(self.integral, 0.0), float(np.interp(v_ego, [CREEP_SPEED, CREEP_FADE_SPEED], [STALL_MAX, 0.0])))
       press = self.integral if v_ego > STANDSTILL_SPEED else 0.0
       floor = self.floor(v_ego) + press
-      bound = max(self.bound(v_ego) + press, self.lead_requirement(v_ego, lead))
+      bound = max(self.bound(v_ego) + press, self.required_decel)
+      # A dropout timer must not jump braking into the comfort corridor. Reuse the existing release jerk.
+      self.releasing |= expired_requirement > bound and self.output < -bound
       output = min(a_target, -floor) if floor > 0.0 else a_target
       output = max(output, -bound, ACCEL_MIN)
     if self.releasing:

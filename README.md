@@ -10,6 +10,11 @@ A minimal-diff personal branch on the official Mountain Dew master baseline. Exp
 
 - **BLoTv3 longitudinal (in progress; not field validated):** full model-lead forecasting, following-response supervision, cruise comfort/tuning, Conditional Experimental Mode, committed model stops, lead hold/departure handling, planner handoffs and final stop landing. Newer upstream AccelBoost is retained. The platform acceleration ceiling and paired safety pins are unchanged; the nominal stopped-lead distance is 7 m and aggressive base following time is 1.0 s. This replaces stock longitudinal planning, not radar selection or steering. See [BLoTv3 design](docs/BLoTv3.md) for its behavior and outstanding qualification limits.
 
+Daily's BLoTv3 adaptations include shared primary/secondary-lead landing urgency, a bounded missing-lead urgency
+window, and model/radar freshness gates for lead forecasts. They do not add a retained radar obstacle or autonomous
+braking authority. Conditional model stops are not a traffic-light detector. See the daily-integration section of
+the design document; historical source-branch replay notes are not qualification of this composition.
+
 ## Lane-centering toggle
 
 **Settings -> Dev -> Lane Centering** is available in both UI layouts. It defaults **on**, persists across restarts, and can be switched without restarting or disengaging. A background reader polls the setting outside the real-time steering loop. Turning it off resets the extra correction; ordinary curvature limits still shape the delivered command. It changes actual steering, not the displayed model path. Have a passenger operate it while moving, or change it while stopped.

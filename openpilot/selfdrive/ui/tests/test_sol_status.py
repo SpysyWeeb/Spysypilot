@@ -14,7 +14,7 @@ def test_sol_steering_has_visible_status_and_stale_state_clears_it():
     valid = {'spysydriveStateSP': True}
     frame = 2
 
-  ui: Any = UIState.__new__(UIState)
+  ui: Any = object.__new__(UIState)
   ui.started = True
   ui.status = UIStatus.DISENGAGED
   ui._engaged_prev = False

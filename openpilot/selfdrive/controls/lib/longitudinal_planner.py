@@ -161,7 +161,8 @@ class LongitudinalPlanner:
     radar_valid = sm.all_checks(['radarState'])
     model_valid = sm.all_checks(['modelV2'])
     lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
-    model_leads = sm['modelV2'].leadsV3 if model_valid else []
+    lead2 = LeadObservation.from_radar(sm['radarState'].leadTwo, radar_valid)
+    model_leads = sm['modelV2'].leadsV3 if model_valid and radar_valid else []
     lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if len(model_leads) > 0 else None
     lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
     policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
@@ -209,7 +210,10 @@ class LongitudinalPlanner:
     # the model's open road while the lead is missing, judged as Force Stops judges the green at its hold and counted from the
     # first missing frame: RELEASE_OPEN_FRAMES frames of an open path without stop evidence, or its launch samples filtered past
     # RELEASE_OPEN_THRESHOLD. A flash is not a green
-    if lead.present:
+    departure_lead, departure_speed = self.lead_departure.select_lead(
+      (lead, lead2), (lead0_anchor.speed if lead0_anchor is not None else None, lead1_anchor.speed if lead1_anchor is not None else None),
+      1 if self.mpc.source == LongitudinalPlanSource.lead1 else 0)
+    if departure_lead.present:
       self.open_road_frames = 0
       self.open_road_filter.x = 0.0
     else:
@@ -220,10 +224,14 @@ class LongitudinalPlanner:
     # it, a corroborated departure does, a release taken back before the lead moved holds the car again, and a hold is handed
     # back to the plan only on evidence that its lead has left -- with the lead missing, the model's open road or a Force Stops
     # release. The acceleration target is untouched
+    # A departure can end its own hold, not the MPC's stop (or landing) for another car.
+    mpc_lead = lead2 if self.mpc.source == LongitudinalPlanSource.lead1 else lead
+    other_lead_stop = (output_should_stop_mpc and self.mpc.binding_obstacle == 'lead' and departure_lead is not mpc_lead
+                       and (departure_lead.track_id == -1 or departure_lead.track_id != mpc_lead.track_id))
     lead_departing = self.lead_departure.update(self.CP.openpilotLongitudinalControl and not long_control_off, sm['carState'].standstill,
-                                                lead, lead0_anchor.speed if lead0_anchor is not None else None,
-                                                output_should_stop_mpc and self.mpc.binding_obstacle == 'lead',
-                                                open_road or force_stops_release)
+                                                departure_lead, departure_speed,
+                                                output_should_stop_mpc and self.mpc.binding_obstacle == 'lead' and not other_lead_stop,
+                                                open_road or force_stops_release) and not other_lead_stop
     if lead_departing:
       output_should_stop_mpc = False
     elif self.lead_departure.holding:
@@ -273,19 +281,19 @@ class LongitudinalPlanner:
       candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False, 'profile'))
 
     a_arbitrated, self.plan_source, _, self.plan_winner = min(candidates, key=lambda c: c[0])
-    # the landing law is the last word on every stop's final metres, whichever candidate is landing it. Intent: a
+    # the landing law is the last word on every stop's final meters, whichever candidate is landing it. Intent: a
     # committed stop or hold, the MPC's own horizon ending in a stop (a stopped lead, the committed column), or the
     # model calling a stop in Experimental mode. The law latches through the landing once started; the planner's own
     # releases (a corroborated lead departure, a Force Stops release) end it at once, a climbing plan ends it by itself
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
     output_a_target = self.stop_landing.update(a_arbitrated, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo,
-                                               launch_cancelled=self.lead_departure.cancelled)
+                                               launch_cancelled=self.lead_departure.cancelled, lead2=lead2)
     # the landing's kiss stops the wheels of a rolling car; LongControl's stopping ramp ignores the plan, so it takes over at the
     # standstill speed. A lead nearer than the kiss can stop short of is not the kiss's stop, and once the stop bit has risen in
     # a landing it stays for as long as its own rule holds it
     kiss_lands = (self.stop_landing.landing and not self.landing_stop_bit and v_ego > STANDSTILL_SPEED and
-                  self.stop_landing.lead_requirement(v_ego, lead) <= self.stop_landing.bound(v_ego))
+                  self.stop_landing.required_decel <= self.stop_landing.bound(v_ego))
     if kiss_lands:
       self.output_should_stop = force_stop.holding
     else:

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import math
 
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.controls.lib.longitudinal_lead import MODEL_LEAD_PROB_MIN, closing_speed, time_to_collision, total_decel_requirement
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, MODEL_LEAD_PROB_MIN, closing_speed, time_to_collision, total_decel_requirement
 
 # The supervisor never commands acceleration. It only moves two solver inputs the MPC already
 # owns, the acceleration-change/jerk cost and the following time, in proportion to measured need.
@@ -95,6 +95,37 @@ class LeadDeparturePreRelease:
     self._forget_lead()
     self._arrival = True
     self._arrival_tracks = set()
+    self._lead_slot = 0
+    self._other_tracks = set()
+
+  def select_lead(self, leads, predicted_speeds, controlling_slot):
+    # The MPC chooses the arrival lead. Once stopped for it, follow its identity across slots rather than the next binding
+    # obstacle. A car already seen in the other slot is not evidence that a missing held lead has left, even if it swaps slots.
+    slot = controlling_slot
+    matches = []
+    if self._stopped_for:
+      matches = [i for i, lead in enumerate(leads) if lead.present and lead.track_id != -1 and lead.track_id == self._track_id]
+      if not matches:
+        matches = [i for i, lead in enumerate(leads) if lead.present and lead.track_id not in self._other_tracks
+                   and (i == self._lead_slot or lead.track_id == -1 or self._track_id == -1)
+                   and abs(lead.distance - self._distance) <= LEAD_SAME_CAR_JUMP]
+      if matches:
+        slot = min(matches, key=lambda i: (leads[i].speed, abs(leads[i].distance - self._distance)))
+      else:
+        # A new standing car can still take this slot (the original hand-back), but motion on an unrelated track is not
+        # the held car's departure. Without its identity, another slot's real radar track cannot claim a range-only match.
+        slot = self._lead_slot
+        if leads[slot].present and (leads[slot].track_id in self._other_tracks or leads[slot].speed > LEAD_MOVING_SPEED):
+          return LeadObservation(), None
+    self._lead_slot = slot
+    self._other_tracks.update(lead.track_id for i, lead in enumerate(leads)
+                              if i != slot and i not in matches and lead.present and lead.track_id not in (-1, leads[slot].track_id))
+    predicted_speed = predicted_speeds[slot]
+    if len(matches) > 1:
+      # Duplicate reports of the same car cannot donate a departure to a report that still has it standing.
+      predictions = [predicted_speeds[i] for i in matches]
+      predicted_speed = min(predictions) if all(speed is not None for speed in predictions) else None
+    return leads[slot], predicted_speed
 
   def _forget_lead(self):
     self._prediction_s = 0.0

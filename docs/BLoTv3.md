@@ -12,6 +12,37 @@ It keeps BLoTv2's tuned behavior where BLoTv2 was right and fixes the verified d
 not add tuning knobs or toggles. Standalone BLoTv3 runs on the stock opendbc pointer
 (`ACCEL_MAX = 2.0`); `combo` runs the same code on the fork opendbc/panda lineage (4.0 m/s²).
 
+## Daily integration (local; not field validated)
+
+Daily imports the complete feature from `926ccb7a3f24ab49d47b64fde2cbcc98ff02e14f`, not `combo`. The historical
+source-branch replay and field notes below are provenance, **not validation of this daily composition**.
+
+- The existing daily opendbc/panda pins remain unchanged, including the **2.0 m/s²** acceleration ceiling.
+  SOL, its freshness/monitoring guards and driver-input cap, nudgeless lane changes, and lane centering remain present.
+- Newer upstream **AccelBoost** remains in the planner. The corrected model target is compared against the committed
+  profile before candidate admission. Learning accounts for the profile contender and requires an admitted model;
+  the upstream gas-press eligibility latch is retained. Cruise handoffs still carry the last published target.
+- Both model lead forecasts require healthy model **and radar** services. Rejected or unavailable forecasts use the
+  ordinary radar extrapolation. This does not change radar selection, replace absent leads with forecasts, or make
+  an invalid overall plan valid.
+- Terminal landing and its stop-bit decision share the strongest urgency requirement from **both** lead slots.
+  Each slot retains only its last braking requirement during a brief absence: it expires on the seventh consecutive
+  missing/invalid planner sample, matching the MPC absence window. A fresh observation replaces that slot's remembered
+  requirement, and reset clears both. Expiry returns through the existing brake-release jerk/state rather than
+  abruptly snapping to the comfort bound; fresh urgent braking can still interrupt that release immediately.
+  This memory only permits already-planned braking: it is not a retained MPC obstacle, a new brake demand, or
+  evidence that a missing obstacle is clear.
+- Standstill/departure ownership follows the held radar track across both lead slots; unrelated or inconsistent
+  observations cannot donate a departure to that track. The existing confirmation thresholds remain unchanged.
+- Source tuning is unchanged. The upstream steady-state cruise fixture runs for 30 rather than 20 seconds to let
+  the source's 0.18/s comfort response settle; the original 0.01 m/s final-speed tolerance is retained.
+- The separate radar-age filter, hot-swap mode button, swapped cruise buttons, curve-speed limiter, and model-only
+  cut-in obstacle are excluded. Conditional Experimental Mode is composed with SOL, not substituted for it. Model
+  stop commitment is not an independent traffic-light detector.
+
+Local host regressions and synthetic maneuvers are necessary checks, not target-device or physical closed-loop
+qualification. No daily road-comfort or driving-safety acceptance is implied; owner field acceptance remains pending.
+
 ## 1. Sole-owner contract
 
 | Decision | Owner |
