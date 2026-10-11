@@ -8,6 +8,8 @@ A minimal-diff personal branch on the official Mountain Dew master baseline. Exp
 - **Nudgeless lane changes only:** a turn signal can initiate the existing lane-change maneuver without a steering nudge, retaining speed and blind-spot gates. The first start, automatic or manual, consumes that signal event's automatic allowance. Holding the signal does not grant another automatic attempt; another manual nudge is still permitted, and cycling the signal rearms automatic operation. Braking cancels the automatic allowance for that signal event. This does not add release-and-nudge edge detection or prove a lane line was crossed.
 - **Lane centering:** the feature branch's correction, filter, confidence/geometry checks, one-line width hold, and live toggle are imported without changing their behavior. The correction feeds the existing curvature limits and controller, then SOL's downstream driver-input cap. It also operates during SOL-only lateral activation.
 
+- **BLoTv3 longitudinal (in progress; not field validated):** full model-lead forecasting, following-response supervision, cruise comfort/tuning, Conditional Experimental Mode, committed model stops, lead hold/departure handling, planner handoffs and final stop landing. Newer upstream AccelBoost is retained. The platform acceleration ceiling and paired safety pins are unchanged; the nominal stopped-lead distance is 7 m and aggressive base following time is 1.0 s. This replaces stock longitudinal planning, not radar selection or steering. See [BLoTv3 design](docs/BLoTv3.md) for its behavior and outstanding qualification limits.
+
 ## Lane-centering toggle
 
 **Settings -> Dev -> Lane Centering** is available in both UI layouts. It defaults **on**, persists across restarts, and can be switched without restarting or disengaging. A background reader polls the setting outside the real-time steering loop. Turning it off resets the extra correction; ordinary curvature limits still shape the delivered command. It changes actual steering, not the displayed model path. Have a passenger operate it while moving, or change it while stopped.
@@ -16,9 +18,11 @@ Centering fades for driver steering, either blinker, or a non-off lane-change st
 
 ## Deliberately excluded
 
-No lane-change passing acceleration, follow-gap relaxation, lead release, target-lane radar planner, or lane-change MPC changes. Stock longitudinal planning, lead selection/FCW inputs, upstream AccelBoost, models, and the existing paired opendbc/panda pins are retained. The accepted upstream type-check diagnostics are not fixed by this import.
+No lane-change passing acceleration, follow-gap relaxation, lead release, target-lane radar planner, or lane-change MPC changes. The separate smooth-stops radar-age filter, hot-swap Experimental button, swapped cruise-speed buttons, curve-speed limiter, and third model-only cut-in obstacle are not imported. Radar selection, upstream AccelBoost, models, and the existing paired opendbc/panda pins are retained. MPC collision-warning prediction follows the accepted BLoTv3 lead trajectory. The accepted upstream type-check diagnostics are not fixed by this import.
 
 ## Import provenance
+
+- Full longitudinal feature: [BLoTv3 at 926ccb7a3](https://github.com/SpysyWeeb/Spysypilot/tree/926ccb7a3f24ab49d47b64fde2cbcc98ff02e14f), reconciled with daily’s newer upstream planner and SOL. Local verification is not device or field acceptance.
 
 - Nudgeless production helper and source-owned tests: [lane-changes at ac85e99c](https://github.com/SpysyWeeb/Spysypilot/tree/ac85e99c3049f4a88c376deae94ba46af99b50d5), including the early-manual-start retry fix. The rest of that branch is intentionally not imported or recorded as wholly merged.
 - Complete centering feature and both Dev toggles: [lane-centering at a3f3b942](https://github.com/SpysyWeeb/Spysypilot/tree/a3f3b94250611608dc39b9357e1364ea1b091960). Test setup is adapted to daily's required SOL status; production behavior is unchanged.

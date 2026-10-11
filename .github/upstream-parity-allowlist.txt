@@ -1,12 +1,12 @@
-# Intentional daily delta: torque/SOL, nudgeless-only, and lane centering. No passing-planner import.
+# Intentional daily delta: torque/SOL, nudgeless-only, lane centering, and BLoTv3. No passing-planner import.
 .github/upstream-parity-allowlist.txt # daily dependency policy
 .gitmodules # daily dependency policy
 opendbc_repo # SOL + default Hyundai 409/4/7
 openpilot/cereal/custom.capnp # SOL
-openpilot/cereal/log.capnp # SOL
+openpilot/cereal/log.capnp # SOL + BLoTv3 stop source
 openpilot/cereal/services.py # SOL
 openpilot/selfdrive/car/card.py # SOL
-openpilot/selfdrive/controls/controlsd.py # SOL + lane centering
+openpilot/selfdrive/controls/controlsd.py # SOL + lane centering + BLoTv3 control-state timing
 openpilot/selfdrive/controls/controlsd_ext.py # SOL
 openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_contract.py # SOL
@@ -21,7 +21,7 @@ openpilot/selfdrive/monitoring/policy.py # SOL
 openpilot/selfdrive/pandad/panda.cc # SOL
 openpilot/selfdrive/pandad/panda.h # SOL
 openpilot/selfdrive/pandad/pandad.cc # SOL
-openpilot/selfdrive/selfdrived/selfdrived.py # SOL
+openpilot/selfdrive/selfdrived/selfdrived.py # SOL + BLoTv3 CEM
 openpilot/selfdrive/ui/onroad/augmented_road_view.py # SOL
 openpilot/selfdrive/ui/tests/test_sol_status.py # SOL
 openpilot/selfdrive/ui/ui_state.py # SOL
@@ -42,3 +42,27 @@ openpilot/selfdrive/controls/tests/test_lane_changes.py # nudgeless-only + repea
 openpilot/selfdrive/ui/layouts/settings/developer.py # lane-centering toggle
 openpilot/selfdrive/ui/mici/layouts/settings/developer.py # lane-centering toggle
 openpilot/selfdrive/ui/tests/test_developer_lane_centering.py # lane-centering toggle
+docs/BLoTv3.md # BLoTv3
+openpilot/selfdrive/controls/lib/conditional_experimental_mode.py # BLoTv3
+openpilot/selfdrive/controls/lib/force_stops.py # BLoTv3
+openpilot/selfdrive/controls/lib/longitudinal_lead.py # BLoTv3
+openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py # BLoTv3
+openpilot/selfdrive/controls/lib/longitudinal_planner.py # BLoTv3
+openpilot/selfdrive/controls/lib/necessity_supervisor.py # BLoTv3
+openpilot/selfdrive/controls/lib/stop_helpers.py # BLoTv3
+openpilot/selfdrive/controls/lib/stop_landing.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_conditional_experimental_mode.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_controlsd_long_state.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_force_stops.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_long_mpc.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_longitudinal_lead.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_longitudinal_planner.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_necessity_supervisor.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_stop_helpers.py # BLoTv3
+openpilot/selfdrive/controls/tests/test_stop_landing.py # BLoTv3
+openpilot/selfdrive/selfdrived/tests/test_conditional_experimental_mode.py # BLoTv3
+openpilot/selfdrive/test/longitudinal_maneuvers/maneuver.py # BLoTv3
+openpilot/selfdrive/test/longitudinal_maneuvers/plant.py # BLoTv3
+openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py # BLoTv3
+openpilot/tools/jotpluggler/layouts/tuning.json # BLoTv3
+openpilot/tools/plotjuggler/layouts/tuning.xml # BLoTv3
