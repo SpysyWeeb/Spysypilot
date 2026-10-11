@@ -1,9 +1,10 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from opendbc.car.structs import car
+from openpilot.cereal import log, messaging
 from openpilot.selfdrive.controls.controlsd import Controls
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCentering
@@ -23,13 +24,18 @@ def make_controls(torque_request):
     'modelV2': get_model(lane_center=0.3, v_ego=CS.vEgo),
     'selfdriveState': SimpleNamespace(enabled=False, active=False),
     'spysydriveStateSP': SimpleNamespace(aol=SimpleNamespace(available=True, active=True)),
+    'pandaStates': [log.PandaState.new_message(safetyModel=car.CarParams.SafetyModel.hyundai, lateralAllowed=True).as_reader()],
     'onroadEvents': [],
     'lateralDelay': SimpleNamespace(lateralDelay=0.2),
   }
 
   class Sm(dict):
-    valid = {'lateralManeuverPlan': False, 'spysydriveStateSP': True}
-    alive = {'spysydriveStateSP': True}
+    valid = {'lateralManeuverPlan': False, 'spysydriveStateSP': True, 'pandaStates': True}
+    alive = {'spysydriveStateSP': True, 'pandaStates': True}
+    logMonoTime = {'spysydriveStateSP': 1, 'pandaStates': 2}
+
+    def all_checks(self, services):
+      return all(self.valid[s] and self.alive[s] for s in services)
 
   controls.sm = Sm(data)
   controls.VM = SimpleNamespace(update_params=lambda *a: None, calc_curvature=lambda *a: 0.0)
@@ -38,6 +44,8 @@ def make_controls(torque_request):
   controls.CI = SimpleNamespace(get_pid_accel_limits=lambda *a: (-3.5, 2.0))
   controls.LaC = SimpleNamespace(reset=lambda: None, update=lambda *a: (torque_request, 0.0, None))
   controls.controls_ext = ControlsExt()
+  controls.controls_ext.get_lat_active(cast(messaging.SubMaster, controls.sm))
+  controls.sm.logMonoTime['pandaStates'] = 3
   controls.lane_centering = LaneCentering()
   controls.lane_centering_enabled = True
   controls.desired_curvature = 0.0

@@ -11,6 +11,7 @@ openpilot/selfdrive/controls/controlsd_ext.py # SOL
 openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_contract.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_controls.py # SOL
+openpilot/selfdrive/controls/tests/test_sol_engagement.py # SOL host/Panda engagement synchronization
 openpilot/selfdrive/controls/tests/test_sol_driver.py # SOL
 openpilot/selfdrive/controls/tests/test_sol_handoff.py # SOL + lane-centering fixture
 openpilot/selfdrive/controls/tests/test_sol_monitoring.py # SOL

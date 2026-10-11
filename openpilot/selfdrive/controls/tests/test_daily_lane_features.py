@@ -29,6 +29,12 @@ class TestDailyLaneFeatures(OpenpilotTestCase):
     state.spysydriveStateSP.aol.available = True
     state.spysydriveStateSP.aol.active = True
     controls.sm.update_msgs(time.monotonic(), [state.as_reader()])
+    panda = log.PandaState.new_message(safetyModel=CP.safetyConfigs[0].safetyModel, lateralAllowed=True)
+    controls.sm.data['pandaStates'] = [panda.as_reader()]
+    controls.sm.alive['pandaStates'] = controls.sm.valid['pandaStates'] = controls.sm.freq_ok['pandaStates'] = True
+    controls.sm.logMonoTime['pandaStates'] = state.logMonoTime + 1
+    controls.controls_ext.get_lat_active(controls.sm)
+    controls.sm.logMonoTime['pandaStates'] += 1
     controls.sm.data['carState'] = get_car_state(canValid=True)
     controls.sm.data['selfdriveState'] = log.SelfdriveState.new_message(enabled=False, active=False)
     controls.sm.data['vehicleParameters'] = log.VehicleParameters.new_message(stiffnessFactor=1.0, steerRatio=CP.steerRatio)

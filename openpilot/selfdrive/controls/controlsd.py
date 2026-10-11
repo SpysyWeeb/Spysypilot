@@ -51,7 +51,7 @@ class Controls:
 
     self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
                                    'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'spysydriveStateSP'],
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'spysydriveStateSP', 'pandaStates'],
                                   poll='selfdriveState', ignore_alive=['spysydriveStateSP'],
                                   ignore_valid=['spysydriveStateSP'])
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
