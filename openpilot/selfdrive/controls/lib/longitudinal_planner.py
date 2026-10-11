@@ -44,6 +44,14 @@ MIN_ALLOW_THROTTLE_SPEED = 2.5
 # the gate decides on its mean, not on each frame's noise
 ALLOW_THROTTLE_PROB_TAU = 0.25
 
+LAUNCH_DISARM_SPEED = 2.0
+LAUNCH_COMMIT_T = 3.5
+LAUNCH_MOVING_SPEED = 1.2
+LAUNCH_MAX_ACCEL = 1.5
+LAUNCH_OPEN_LENGTH = 20.0
+LAUNCH_OPEN_CONFIRM = 0.7
+LAUNCH_CLOSE_LENGTH = 10.0
+
 def get_max_accel_request(v_ego):
   remaining = 1.0 - np.clip(v_ego / A_CRUISE_MAX_SPEED, 0.0, 1.0)
   return float(A_CRUISE_MAX_HIGH_SPEED + (A_CRUISE_MAX_LAUNCH - A_CRUISE_MAX_HIGH_SPEED) * remaining ** 3)
@@ -132,6 +140,10 @@ class LongitudinalPlanner:
     self.a_cruise = init_a
     self.output_a_target = init_a
     self.output_should_stop = False
+    self.launch_open = FirstOrderFilter(0.0, 0.3, dt)
+    self.launch_armed = False
+    self.anticipating = False
+    self.anticipation_cancelled = False
     self.landing_stop_bit = False
     # the candidate that set the output: the stop column and the profile both publish as stop
     self.plan_winner = 'cruise'
@@ -284,7 +296,52 @@ class LongitudinalPlanner:
       output_should_stop_mpc = True
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
+    # A sustained opening of the model's path can precede its stop bit. Only that bit is released;
+    # the committed stop, lead and cruise candidates keep their own authority.
+    anticipating_prev = self.anticipating
+    md = sm['modelV2']
+    xs, model_vel, model_acc = md.position.x, md.velocity.x, md.acceleration.x
+    launch_enabled = (self.CP.openpilotLongitudinalControl and experimental_mode and sm['selfdriveState'].enabled and
+                      not reset_state and not force_decel and not (sm['carState'].gasPressed or sm['carState'].brakePressed) and
+                      model_valid and radar_valid and sm.all_checks(['carState', 'controlsState', 'selfdriveState']) and
+                      math.isfinite(v_ego) and math.isfinite(output_a_target_e2e) and
+                      all(len(values) == ModelConstants.IDX_N and np.isfinite(values).all()
+                          for values in (xs, md.position.y, md.position.z, model_vel, model_acc)) and
+                      (np.diff(xs) >= 0.0).all())
+    if not launch_enabled:
+      # Reset here, not only above: no evidence may accumulate or re-arm later in an inactive frame.
+      self.anticipating = False
+      self.launch_armed = False
+      self.launch_open.x = 0.0
+    else:
+      model_length = float(xs[ModelConstants.IDX_N - 1])
+      self.launch_open.update(1.0 if model_length > LAUNCH_OPEN_LENGTH else 0.0)
+      if sm['carState'].standstill and output_should_stop_e2e and self.launch_open.x > LAUNCH_OPEN_CONFIRM:
+        self.anticipating = True
+      if model_length < LAUNCH_CLOSE_LENGTH or v_ego > LAUNCH_DISARM_SPEED:
+        self.anticipating = False
+      if self.anticipating:
+        output_should_stop_e2e = False
+      if v_ego > LAUNCH_DISARM_SPEED:
+        self.launch_armed = False
+      elif sm['carState'].standstill:
+        self.launch_armed = True
     launch = lead_departing or self.lead_departure.handed_back or force_stops_release
+    # The landing law consumes cancellation at standstill. Retain a creep-speed cancellation until
+    # the wheels stop, but never carry it across an inactive frame, another opening or disarm speed.
+    self.anticipation_cancelled = ((self.anticipation_cancelled or anticipating_prev) and launch_enabled and
+                                   not self.anticipating and v_ego <= LAUNCH_DISARM_SPEED)
+
+    if self.launch_armed and not output_should_stop_e2e and v_ego < LAUNCH_DISARM_SPEED:
+      model_v = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_vel)
+      model_a = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, model_acc)
+      if np.interp(LAUNCH_COMMIT_T, T_IDXS_MPC, model_v) > LAUNCH_DISARM_SPEED:
+        t_cut = min(float(T_IDXS_MPC[np.argmax(model_v > LAUNCH_MOVING_SPEED)]), LAUNCH_COMMIT_T)
+        v_shifted = np.interp(T_IDXS_MPC + t_cut, T_IDXS_MPC, model_v)
+        a_shifted = np.interp(T_IDXS_MPC + t_cut, T_IDXS_MPC, model_a)
+        a_launch = get_accel_from_plan(v_shifted, a_shifted, T_IDXS_MPC, action_t=action_t)
+        a_launch_max = np.interp(v_ego, [LAUNCH_MOVING_SPEED, LAUNCH_DISARM_SPEED], [LAUNCH_MAX_ACCEL, 0.0])
+        output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
 
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
@@ -302,7 +359,8 @@ class LongitudinalPlanner:
     curve_admitted = curve.a_target is not None and not reset_state
     self.curve = curve if curve_admitted else CurveResult()
     # Apply the upstream correction before deciding whether the model clears the committed stop's urgency margin.
-    a_other = min(output_a_target_mpc, force_stop.a_target if force_stop.a_target is not None else np.inf)
+    a_other = min(output_a_target_mpc, force_stop.a_target if force_stop.a_target is not None else np.inf,
+                  curve.a_target if curve_admitted else np.inf)
     output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, a_other, self.a_cruise)
 
     # while a committed stop's profile is moving the car, the model's own request joins only if it is clearly more urgent:
@@ -344,6 +402,12 @@ class LongitudinalPlanner:
       candidates.append((curve.a_target, LongitudinalPlanSource.curve, False, 'curve'))
 
     a_arbitrated, self.plan_source, _, self.plan_winner = min(candidates, key=lambda c: c[0])
+    # An opening may release only the model's landing, never a committed column, either lead's hold,
+    # forceDecel or an urgent min candidate. Keep the opening pending until those owners allow it,
+    # rather than consuming its edge while blocked. Leave their existing releases untouched.
+    launch |= (self.anticipating and e2e_admitted and stop_x is None and
+               force_stop.a_target is None and not force_stop.holding and not self.lead_departure.holding and
+               not output_should_stop_mpc and not cruise_should_stop and a_arbitrated >= 0.0)
     # the landing law is the last word on every stop's final meters, whichever candidate is landing it. Intent: a
     # committed stop or hold, the MPC's own horizon ending in a stop (a stopped lead, the committed column), or the
     # model calling a stop in Experimental mode. The law latches through the landing once started; the planner's own
@@ -351,7 +415,8 @@ class LongitudinalPlanner:
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
     output_a_target = self.stop_landing.update(a_arbitrated, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo,
-                                               launch_cancelled=self.lead_departure.cancelled, lead2=lead2)
+                                               launch_cancelled=self.lead_departure.cancelled or self.anticipation_cancelled, lead2=lead2)
+    self.anticipation_cancelled &= not (launch or self.stop_landing.landing)
     # the landing's kiss stops the wheels of a rolling car; LongControl's stopping ramp ignores the plan, so it takes over at the
     # standstill speed. A lead nearer than the kiss can stop short of is not the kiss's stop, and once the stop bit has risen in
     # a landing it stays for as long as its own rule holds it

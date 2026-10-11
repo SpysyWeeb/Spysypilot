@@ -17,8 +17,9 @@ not add tuning knobs or toggles. Standalone BLoTv3 runs on the stock opendbc poi
 Daily imports the complete feature from `926ccb7a3f24ab49d47b64fde2cbcc98ff02e14f`, not `combo`. The historical
 source-branch replay and field notes below are provenance, **not validation of this daily composition**.
 
-- The existing daily opendbc/panda pins remain unchanged, including the **2.0 m/s²** acceleration ceiling.
+- Daily now selects the **4.0 m/s²** host/Hyundai acceleration ceiling, with matching native Hyundai safety in its opendbc dependency. The existing speed-dependent cruise envelope, jerk laws, stopped gap and other platforms' own safety ceilings remain; 4.0 is an upper bound, not a constant acceleration demand.
   SOL, its freshness/monitoring guards and driver-input cap, nudgeless lane changes, and lane centering remain present.
+  The separate excessive-actuation diagnostic retains the existing `2 × ACCEL_MAX` positive measured-acceleration threshold: 8.0 m/s² as in combo, not an actuator permission of 8.0. Its negative threshold, debounce and measurement-consistency check are unchanged.
 - Newer upstream **AccelBoost** remains in the planner. The corrected model target is compared against the committed
   profile before candidate admission. Learning accounts for the profile contender and requires an admitted model;
   the upstream gas-press eligibility latch is retained. Cruise handoffs still carry the last published target.

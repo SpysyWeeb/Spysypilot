@@ -32,7 +32,7 @@ openpilot/spysypilot/aol/helpers.py # SOL
 openpilot/spysypilot/aol/state.py # SOL
 panda # SOL
 README.md # daily feature scope
-openpilot/common/params_keys.h # lane-centering toggle
+openpilot/common/params_keys.h # lane-centering toggle; manager-session Chestnut timeout latch
 openpilot/selfdrive/controls/lib/desire_helper.py # nudgeless-only + repeat prevention
 openpilot/selfdrive/controls/lib/lane_centering.py # lane centering
 openpilot/selfdrive/controls/tests/test_daily_lane_features.py # combined daily lane-feature regression
@@ -94,3 +94,17 @@ openpilot/selfdrive/controls/tests/test_lane_change_gap.py
 openpilot/selfdrive/controls/tests/test_lane_change_release.py
 openpilot/selfdrive/controls/tests/test_model_curve_speed.py
 openpilot/selfdrive/test/process_replay/process_replay.py
+
+# Better Green Lights and custom comma 3X/Chestnut, composed on the current Mountain Dew runtime
+openpilot/selfdrive/selfdrived/tests/test_daily_acceleration_contract.py # daily ceiling and derived diagnostic threshold
+openpilot/selfdrive/controls/tests/test_daily_better_green_lights.py # better-green-lights + daily arbitration
+openpilot/selfdrive/modeld/helpers.py # c3x-chestnut-v2
+openpilot/selfdrive/modeld/modeld.py # c3x-chestnut-v2
+openpilot/selfdrive/selfdrived/events.py # c3x-chestnut-v2 loading alert
+openpilot/selfdrive/selfdrived/tests/test_chestnut_loading.py # c3x-chestnut-v2
+openpilot/selfdrive/test/test_chestnut_modeld.py # c3x-chestnut-v2
+openpilot/system/hardware/chestnut/flash.py # c3x-chestnut-v2 link readiness
+openpilot/system/hardware/tests/test_chestnut_link.py # c3x-chestnut-v2
+openpilot/selfdrive/test/test_chestnut_lifecycle.py # real-process timeout/fallback and restart regression
+openpilot/system/manager/process.py # opt-in exact-exit-code restart; all other behavior retained
+openpilot/system/manager/process_config.py # modeld-only timeout restart selection

@@ -155,15 +155,20 @@ class NativeProcess(ManagerProcess):
 
 
 class PythonProcess(ManagerProcess):
-  def __init__(self, name, module, should_run, enabled=True, sigkill=False):
+  def __init__(self, name, module, should_run, enabled=True, sigkill=False, restart_on_exit_code: int | None = None):
     self.name = name
     self.module = module
     self.should_run = should_run
     self.enabled = enabled
     self.sigkill = sigkill
+    self.restart_on_exit_code = restart_on_exit_code
     self.launcher = launcher
 
   def start(self) -> None:
+    # Only explicitly requested recovery exits restart; ordinary crashes retain the normal lifecycle.
+    if self.proc is not None and self.restart_on_exit_code is not None and self.proc.exitcode == self.restart_on_exit_code:
+      self.stop()
+
     # In case we only tried a non blocking stop we need to stop it before restarting
     if self.shutting_down:
       self.stop()

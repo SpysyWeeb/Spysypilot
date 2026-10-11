@@ -39,6 +39,6 @@ def wait_for_chestnut(timeout: float = 10.) -> None:
     time.sleep(0.1)
 
 def chestnut_compiled() -> bool:
+  # the model pickle comes through git LFS; an unfetched pointer file is not a model
   path = modeld_pkl_path(chestnut=True)
-  return path.is_file() and all(
-    (MODELS_DIR / f'big_driving_warp_{size}_tinygrad.pkl').is_file() for size in ('1344x760', '1928x1208'))
+  return path.is_file() and path.stat().st_size > 1 << 20

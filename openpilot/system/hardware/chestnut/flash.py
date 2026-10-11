@@ -115,9 +115,13 @@ def link_up() -> bool:
   except (OSError, RuntimeError):
     return False
   try:
-    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0x40, 0xF3, 1, 0, 0, 2000, None))
     buf = (ctypes.c_ubyte * 1)()
-    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0xC0, 0xE4, 0xB450, 0, 1, 1000, ctypes.cast(buf, ctypes.c_void_p)))
+    read_ltssm = Ctrl(0xC0, 0xE4, 0xB450, 0, 1, 1000, ctypes.cast(buf, ctypes.c_void_p))
+    fcntl.ioctl(fd, USBDEVFS_CONTROL, read_ltssm)
+    if buf[0] != 0x78:
+      # custom firmware boots with pcie off, only request power when the link is not already up
+      fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0x40, 0xF3, 1, 0, 0, 2000, None))
+      fcntl.ioctl(fd, USBDEVFS_CONTROL, read_ltssm)
     return buf[0] == 0x78  # LTSSM L0
   except OSError:
     return False
