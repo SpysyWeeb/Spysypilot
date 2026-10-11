@@ -1,4 +1,4 @@
-# Intentional daily delta: torque/SOL, nudgeless-only, lane centering, and BLoTv3. No passing-planner import.
+# Intentional daily delta: torque/SOL, lane features, BLoTv3, ESP debounce, button features and Smooth Stops radar gate.
 .github/upstream-parity-allowlist.txt # daily dependency policy
 .gitmodules # daily dependency policy
 opendbc_repo # SOL + default Hyundai 409/4/7
@@ -21,7 +21,7 @@ openpilot/selfdrive/monitoring/policy.py # SOL
 openpilot/selfdrive/pandad/panda.cc # SOL
 openpilot/selfdrive/pandad/panda.h # SOL
 openpilot/selfdrive/pandad/pandad.cc # SOL
-openpilot/selfdrive/selfdrived/selfdrived.py # SOL + BLoTv3 CEM
+openpilot/selfdrive/selfdrived/selfdrived.py # SOL + BLoTv3 CEM + hot-swap manual mode
 openpilot/selfdrive/ui/onroad/augmented_road_view.py # SOL
 openpilot/selfdrive/ui/tests/test_sol_status.py # SOL
 openpilot/selfdrive/ui/ui_state.py # SOL
@@ -69,5 +69,14 @@ openpilot/tools/plotjuggler/layouts/tuning.xml # BLoTv3
 openpilot/selfdrive/controls/tests/test_daily_blotv3_integration.py # daily BLoTv3 integration regressions
 openpilot/selfdrive/selfdrived/tests/test_daily_cem_sol.py # daily CEM + SOL integration regressions
 pyproject.toml # preserve BLoTv3 cancelled identifier in the existing spelling allowlist
-openpilot/selfdrive/car/tests/test_cruise_speed.py # BLoTv3 steady-state settling horizon; original speed tolerance
+openpilot/selfdrive/car/tests/test_cruise_speed.py # BLoTv3 settling horizon + swapped-cruise-speed; original speed tolerance
 openpilot/selfdrive/controls/tests/test_daily_lead_departure.py # daily BLoTv3 controlling-lead hold/departure regressions
+openpilot/selfdrive/car/car_events.py # esp-active-debounce
+openpilot/selfdrive/car/tests/test_car_events.py # esp-active-debounce source regressions
+openpilot/selfdrive/car/tests/test_daily_esp_debounce.py # daily ESP + SOL/event integration
+openpilot/selfdrive/car/cruise.py # swapped-cruise-speed
+openpilot/selfdrive/car/tests/test_daily_cruise_buttons.py # swapped speed-button boundaries
+openpilot/selfdrive/controls/radard.py # smooth-stops unconfirmed low-speed radar gate
+openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py # smooth-stops source regressions
+openpilot/selfdrive/controls/tests/test_daily_radar_filter.py # daily radar + BLoTv3 integration
+openpilot/selfdrive/selfdrived/tests/test_daily_hot_swap.py # hot-swap manual preference + CEM integration

@@ -6,6 +6,7 @@ import threading
 import openpilot.cereal.messaging as messaging
 
 from openpilot.cereal import log
+from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.car.structs import car
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient
@@ -41,6 +42,7 @@ LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 EventName = log.OnroadEvent.EventName
 ButtonType = car.CarState.ButtonEvent.Type
+DISTANCE_LONG_PRESS = 50  # frames @ 100 Hz = 0.5s hold to toggle ExperimentalMode
 SafetyModel = car.CarParams.SafetyModel
 AlertLevel = log.DriverMonitoringState.AlertLevel
 MonitoringPolicy = log.DriverMonitoringState.MonitoringPolicy
@@ -128,9 +130,14 @@ class SelfdriveD:
     self.logged_comm_issue = None
     self.not_running_prev = None
     self.conditional_experimental_mode = ConditionalExperimentalMode()
+    self.manual_mode_lock = threading.Lock()
+    self.manual_mode_generation = 0
+    self.manual_mode_pending = False
     self.manual_experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
     self.experimental_mode = self.manual_experimental_mode
     self.personality = self.params.get("LongitudinalPersonality", return_default=True)
+    self.gap_button_frame_count = 0
+    self.experimental_mode_switched = False
     self.recalibrating_seen = False
     self.dm_lockout_set = False
     self.dm_uncertain_alerted = False
@@ -464,12 +471,32 @@ class SelfdriveD:
       if self.sm['modelV2'].frameDropPerc > 1 and not big_model_settling:
         self.events.add(EventName.modeldLagging)
 
-    # Decrement personality on distance button press
-    if self.CP.openpilotLongitudinalControl:
+    # Distance button: hold 0.5s to toggle ExperimentalMode; tap to cycle personality
+    if not CS.canValid:
+      self.gap_button_frame_count = 0
+    elif self.CP.openpilotLongitudinalControl:
+      if self.gap_button_frame_count > 0:
+        self.gap_button_frame_count += 1
+      for be in CS.buttonEvents:
+        if be.type == ButtonType.gapAdjustCruise:
+          self.gap_button_frame_count = 1 if be.pressed else 0
+
+      # Hyundai CAN-FD button messages can pause for ~0.5s without invalid CAN.
+      # Edge-only events cannot qualify a hold there; keep release-to-personality.
+      hold_supported = not (self.CP.brand == 'hyundai' and self.CP.flags & HyundaiFlags.CANFD)
+      if hold_supported and self.gap_button_frame_count >= DISTANCE_LONG_PRESS and not self.experimental_mode_switched:
+        with self.manual_mode_lock:
+          self.manual_experimental_mode = not self.manual_experimental_mode
+          self.manual_mode_generation += 1
+          self.manual_mode_pending = True
+        self.experimental_mode_switched = True
+
       if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents):
-        self.personality = (self.personality - 1) % 3
-        self.params.put('LongitudinalPersonality', self.personality)
-        self.events.add(EventName.personalityChanged)
+        if not self.experimental_mode_switched:
+          self.personality = (self.personality - 1) % 3
+          self.params.put('LongitudinalPersonality', self.personality)
+          self.events.add(EventName.personalityChanged)
+        self.experimental_mode_switched = False
 
   def data_sample(self):
     _car_state = messaging.recv_one(self.car_state_sock)
@@ -597,7 +624,20 @@ class SelfdriveD:
       self.is_metric = self.params.get_bool("IsMetric")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
-      self.manual_experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
+      with self.manual_mode_lock:
+        generation = self.manual_mode_generation
+        pending = self.manual_mode_pending
+        requested_mode = self.manual_experimental_mode
+      # Persist button requests off the main loop, with no lock held during I/O.
+      # An acknowledged write, not a matching old disk value, retires the request.
+      if pending:
+        self.params.put_bool("ExperimentalMode", requested_mode, block=True)
+      manual_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
+      with self.manual_mode_lock:
+        # A read or write begun before a newer hold must not undo that hold.
+        if generation == self.manual_mode_generation:
+          self.manual_experimental_mode = manual_mode
+          self.manual_mode_pending = False
       self.personality = self.params.get("LongitudinalPersonality", return_default=True)
       time.sleep(0.1)
 

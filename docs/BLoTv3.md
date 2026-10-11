@@ -36,9 +36,12 @@ source-branch replay and field notes below are provenance, **not validation of t
   observations cannot donate a departure to that track. The existing confirmation thresholds remain unchanged.
 - Source tuning is unchanged. The upstream steady-state cruise fixture runs for 30 rather than 20 seconds to let
   the source's 0.18/s comfort response settle; the original 0.01 m/s final-speed tolerance is retained.
-- The separate radar-age filter, hot-swap mode button, swapped cruise buttons, curve-speed limiter, and model-only
-  cut-in obstacle are excluded. Conditional Experimental Mode is composed with SOL, not substituted for it. Model
-  stop commitment is not an independent traffic-light detector.
+- Daily also imports the separate Smooth Stops unconfirmed low-speed radar age/range gate and swapped cruise-button
+  steps. The hot-swap distance-button hold toggles the manual Experimental preference, not the effective manual OR CEM
+  state; manual-off does not veto CEM. These do not replace this branch's landing/hold or LongControl. The curve-speed
+  limiter and model-only cut-in obstacle remain excluded. Conditional Experimental Mode is composed with SOL, not
+  substituted for it. Model stop commitment is not an independent traffic-light detector. See daily's README for
+  source identities and the radar filter/ESP debounce trade-offs; neither filter distinguishes every genuine hazard.
 
 Local host regressions and synthetic maneuvers are necessary checks, not target-device or physical closed-loop
 qualification. No daily road-comfort or driving-safety acceptance is implied; owner field acceptance remains pending.

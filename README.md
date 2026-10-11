@@ -8,6 +8,11 @@ A minimal-diff personal branch on the official Mountain Dew master baseline. Exp
 - **Nudgeless lane changes only:** a turn signal can initiate the existing lane-change maneuver without a steering nudge, retaining speed and blind-spot gates. The first start, automatic or manual, consumes that signal event's automatic allowance. Holding the signal does not grant another automatic attempt; another manual nudge is still permitted, and cycling the signal rearms automatic operation. Braking cancels the automatic allowance for that signal event. This does not add release-and-nudge edge detection or prove a lane line was crossed.
 - **Lane centering:** the feature branch's correction, filter, confidence/geometry checks, one-line width hold, and live toggle are imported without changing their behavior. The correction feeds the existing curvature limits and controller, then SOL's downstream driver-input cap. It also operates during SOL-only lateral activation.
 
+- **ESP-active debounce:** the common car-event path raises `espActive` after 50 consecutive active samples (nominally 0.5 s). Any inactive sample resets it. This delays genuine interventions as well as nuisance pulses; it is not a bump detector. `espDisabled`, other faults, the existing downstream soft-disable policy, and vehicle/panda safety behavior are unchanged.
+- **Hot-swap Experimental:** hold the distance button for 0.5 s to toggle the saved manual Experimental preference once per hold; a short tap still cycles personality. Requires openpilot longitudinal control. The hold action is disabled on Hyundai CAN-FD, whose edge-only button stream can pause long enough to misclassify a tap; release still cycles personality there. The classic-CAN Palisade is eligible. Effective mode remains manual OR Conditional Experimental Mode, so manual-off does not veto an automatic CEM request.
+- **Swapped cruise-speed steps:** for openpilot-owned set speed, short taps move to the next five-unit grid point and held presses repeat one-unit steps. Metric/imperial conversion, speed bounds, engagement, gas-override and standstill-resume guards remain. Vehicle-owned cruise speed is unchanged.
+- **Smooth Stops radar filter:** the current branch adds an age/range gate only to unconfirmed low-speed lead overrides: 20 consecutive radar updates and a distance above `max(0.75 m, 0.6 s × ego speed)`, retaining the existing below-4 m/s, lateral and 25 m gates. Model-confirmed leads bypass this extra gate; a missing radar cycle restarts track age. This can also delay or reject a real newly appearing, flickering or close unconfirmed object. BLoTv3's landing and the existing LongControl remain unchanged.
+
 - **BLoTv3 longitudinal (in progress; not field validated):** full model-lead forecasting, following-response supervision, cruise comfort/tuning, Conditional Experimental Mode, committed model stops, lead hold/departure handling, planner handoffs and final stop landing. Newer upstream AccelBoost is retained. The platform acceleration ceiling and paired safety pins are unchanged; the nominal stopped-lead distance is 7 m and aggressive base following time is 1.0 s. This replaces stock longitudinal planning, not radar selection or steering. See [BLoTv3 design](docs/BLoTv3.md) for its behavior and outstanding qualification limits.
 
 Daily's BLoTv3 adaptations include shared primary/secondary-lead landing urgency, a bounded missing-lead urgency
@@ -23,9 +28,14 @@ Centering fades for driver steering, either blinker, or a non-off lane-change st
 
 ## Deliberately excluded
 
-No lane-change passing acceleration, follow-gap relaxation, lead release, target-lane radar planner, or lane-change MPC changes. The separate smooth-stops radar-age filter, hot-swap Experimental button, swapped cruise-speed buttons, curve-speed limiter, and third model-only cut-in obstacle are not imported. Radar selection, upstream AccelBoost, models, and the existing paired opendbc/panda pins are retained. MPC collision-warning prediction follows the accepted BLoTv3 lead trajectory. The accepted upstream type-check diagnostics are not fixed by this import.
+No lane-change passing acceleration, follow-gap relaxation, lead release, target-lane radar planner, or lane-change MPC changes. The curve-speed limiter, BLaTv2 controller, and third model-only cut-in obstacle are not imported. Upstream AccelBoost, models, and the existing paired opendbc/panda pins are retained. Radar selection changes only by the Smooth Stops unconfirmed low-speed gate described above. MPC collision-warning prediction follows the accepted BLoTv3 lead trajectory. The accepted upstream type-check diagnostics are not fixed by these imports. All additions remain local/host-tested until separate device and owner field acceptance.
 
 ## Import provenance
+
+- ESP-active debounce: `e9fd5e680cc0e80934295fb210483e8ceadc2d70`.
+- Hot-swap Experimental: `a91715adbf7605dba9c934e9de545fa99a0c0b40`, adapted for daily's manual/CEM ownership, asynchronous settings updates and the Hyundai CAN-FD input limitation.
+- Swapped cruise-speed steps: `091691fd8873e1c7b06b2503f57f415544da8ffc`.
+- Smooth Stops radar filter: `07705fad18ee7b6024d19e37edb3ccd0dcefe542`; not the historical LongControl implementation.
 
 - Full longitudinal feature: [BLoTv3 at 926ccb7a3](https://github.com/SpysyWeeb/Spysypilot/tree/926ccb7a3f24ab49d47b64fde2cbcc98ff02e14f), reconciled with daily’s newer upstream planner and SOL. Local verification is not device or field acceptance.
 

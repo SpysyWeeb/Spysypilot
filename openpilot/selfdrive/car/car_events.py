@@ -18,6 +18,7 @@ class CarEvents:
     self.CP = CP
 
     self.steering_unpressed = 0
+    self.esp_active_frames = 0
     self.low_speed_alert = False
     self.no_steer_warning = False
     self.silent_steer_warning = True
@@ -115,8 +116,6 @@ class CarEvents:
       events.add(EventName.wrongCarMode)
     if CS.espDisabled:
       events.add(EventName.espDisabled)
-    if CS.espActive:
-      events.add(EventName.espActive)
     if CS.stockFcw:
       events.add(EventName.stockFcw)
     if CS.stockAeb:
@@ -158,6 +157,11 @@ class CarEvents:
       # TODO: only check the cancel button with openpilot longitudinal on all brands to match panda safety
       if b.type == ButtonType.cancel and (allow_button_cancel or not self.CP.pcmCruise):
         events.add(EventName.buttonCancel)
+
+    # the ESC flags a brief intervention (a wheel unloading over a bump) for a few hundred ms; only a sustained one is an event
+    self.esp_active_frames = self.esp_active_frames + 1 if CS.espActive else 0
+    if self.esp_active_frames >= int(0.5 / DT_CTRL):
+      events.add(EventName.espActive)
 
     # Handle permanent and temporary steering faults
     self.steering_unpressed = 0 if CS.steeringPressed else self.steering_unpressed + 1
