@@ -38,8 +38,9 @@ source-branch replay and field notes below are provenance, **not validation of t
   the source's 0.18/s comfort response settle; the original 0.01 m/s final-speed tolerance is retained.
 - Daily also imports the separate Smooth Stops unconfirmed low-speed radar age/range gate and swapped cruise-button
   steps. The hot-swap distance-button hold toggles the manual Experimental preference, not the effective manual OR CEM
-  state; manual-off does not veto CEM. These do not replace this branch's landing/hold or LongControl. The curve-speed
-  limiter and model-only cut-in obstacle remain excluded. Conditional Experimental Mode is composed with SOL, not
+  state; manual-off does not veto CEM. These do not replace this branch's landing/hold or LongControl. Daily's current
+  curve policy and longitudinal passing/lead-release composition are described in its README; the third model-only
+  cut-in obstacle remains excluded. Conditional Experimental Mode is composed with SOL, not
   substituted for it. Model stop commitment is not an independent traffic-light detector. See daily's README for
   source identities and the radar filter/ESP debounce trade-offs; neither filter distinguishes every genuine hazard.
 

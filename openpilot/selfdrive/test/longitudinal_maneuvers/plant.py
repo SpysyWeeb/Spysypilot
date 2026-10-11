@@ -95,7 +95,8 @@ E2E_PUSH_DISTANCE = 12.0  # m, the fake model's late ramp builds over this dista
 class Plant:
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
                enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
-               stop_line=None, stop_line_horizon_s=5.0, e2e_landing_push=0.0, actuator_lag=False, CP=None, accel_error=0.0, creep=0.0):
+               stop_line=None, stop_line_horizon_s=5.0, e2e_landing_push=0.0, actuator_lag=False, CP=None, accel_error=0.0, creep=0.0,
+               curve=None, torque_factor=2.7, torque_friction=0.11, curve_model_scale=1.0):
     self.rate = 1. / DT_MDL
 
 
@@ -130,6 +131,13 @@ class Plant:
     self.accel_error = accel_error
     # driveline creep, added to launch requests too
     self.creep = creep
+    # World-fixed curve geometry and a synthetic steering state, independent of the daily longitudinal plant.
+    self.curve = curve
+    self.curve_model_scale = curve_model_scale
+    self.torque_factor = torque_factor
+    self.torque_friction = torque_friction
+    self.lateral_accel = 0.0
+    self.torque = 0.0
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
@@ -137,6 +145,11 @@ class Plant:
     if CP is None:
       from opendbc.car.honda.values import CAR
       CP = interfaces[CAR.HONDA_CIVIC].get_non_essential_params(CAR.HONDA_CIVIC)
+    if self.curve is not None:
+      torque = CP.lateralTuning.init('torque')
+      torque.latAccelFactor = self.torque_factor
+      torque.latAccelOffset = 0.0
+      torque.friction = self.torque_friction
     self.CP = CP
     self.CI = interfaces[CP.carFingerprint](CP)
     self.planner = LongitudinalPlanner(CP, init_v=self.speed)
@@ -146,6 +159,39 @@ class Plant:
     # the car settled at its initial speed
     self.CI.CS.v_ego_kf.set_x([[self.speed], [0.0]])
     self.a_ego = 0.0
+
+  def _curvature_at(self, world_x):
+    # one (start, length, curvature) or a list of them: a bend that tightens or opens along the way
+    assert self.curve is not None
+    segments = self.curve if isinstance(self.curve[0], tuple | list) else [self.curve]
+    for start, length, curvature in segments:
+      if start <= world_x <= start + length:
+        return curvature
+    return 0.0
+
+  def _plan_curve(self, model, controls_state, car_control):
+    # path curvature along the model's own positions, and a steering state: the car holds the path up to the torque
+    # authority factor * (1 - friction) either way round; beyond it the torque pins at 1 and the tracking error is the shortfall
+    positions = np.asarray(model.position.x, dtype=float)
+    speeds = np.asarray(model.velocity.x, dtype=float)
+    model.position.y = [0.0] * len(positions)          # the policy measures arc length from x and y
+    curvatures = np.array([self._curvature_at(self.distance + x) for x in positions])
+    rate = log.XYZTData.new_message()
+    rate.z = [float(k * self.curve_model_scale * v) for k, v in zip(curvatures, speeds, strict=True)]
+    model.orientationRate = rate
+    desired = self.speed ** 2 * self._curvature_at(self.distance)
+    authority = self.torque_factor * (1.0 - self.torque_friction)
+    turn = np.sign(desired)
+    self.lateral_accel = turn * min(abs(desired), authority)
+    self.torque = turn * min(abs(desired) / self.torque_factor + self.torque_friction, 1.0)
+    state = controls_state.lateralControlState.init('torqueState')
+    state.active = True
+    state.output = float(self.torque)
+    state.error = float(desired - self.lateral_accel)
+    state.actualLateralAccel = float(self.lateral_accel)
+    state.desiredLateralAccel = float(desired)
+    state.saturated = bool(abs(self.torque) >= 1.0)
+    car_control.latActive = True
 
   def _plan_stop_line(self, model):
     # the model's path ends at the line with a constant-deceleration speed profile; its e2e request is
@@ -242,6 +288,8 @@ class Plant:
     model.modelV2.acceleration = acceleration
     if self.stop_line is not None:
       self._plan_stop_line(model.modelV2)
+    if self.curve is not None:
+      self._plan_curve(model.modelV2, control.controlsState, car_control.carControl)
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
     # lead0 mirrors the radar lead above; lead1/lead2 are shaped but carry no probability
@@ -338,6 +386,8 @@ class Plant:
       "forcing": self.planner.force_stops.forcing,
       "distance_lead": self.distance_lead,
       "fcw": fcw,
+      "lateral_accel": self.lateral_accel,
+      "torque": self.torque,
     }
 
 # simple engage in standalone mode

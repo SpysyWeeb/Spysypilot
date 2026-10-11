@@ -5,7 +5,7 @@ A minimal-diff personal branch on the official Mountain Dew master baseline. Exp
 ## Selected features
 
 - **Torque + SOL:** default classic-Hyundai 409 / +4 / -7 envelope, retaining existing lower-limit/CAN-FD exceptions and paired safety. SOL provides independent lateral operation, fault/freshness and monitoring integration. Driver steering caps an available SOL torque request at +/-0.5; smaller ordinary requests stay smaller, and downstream limits still apply.
-- **Nudgeless lane changes only:** a turn signal can initiate the existing lane-change maneuver without a steering nudge, retaining speed and blind-spot gates. The first start, automatic or manual, consumes that signal event's automatic allowance. Holding the signal does not grant another automatic attempt; another manual nudge is still permitted, and cycling the signal rearms automatic operation. Braking cancels the automatic allowance for that signal event. This does not add release-and-nudge edge detection or prove a lane line was crossed.
+- **Nudgeless lane changes:** a turn signal can initiate the existing lane-change maneuver without a steering nudge, retaining speed and blind-spot gates. The first start, automatic or manual, consumes that signal event's automatic allowance. Holding the signal does not grant another automatic attempt; another manual nudge is still permitted, and cycling the signal rearms automatic operation. Braking cancels the automatic allowance for that signal event. This does not add release-and-nudge edge detection or prove a lane line was crossed.
 - **Lane centering:** the feature branch's correction, filter, confidence/geometry checks, one-line width hold, and live toggle are imported without changing their behavior. The correction feeds the existing curvature limits and controller, then SOL's downstream driver-input cap. It also operates during SOL-only lateral activation.
 
 - **ESP-active debounce:** the common car-event path raises `espActive` after 50 consecutive active samples (nominally 0.5 s). Any inactive sample resets it. This delays genuine interventions as well as nuisance pulses; it is not a bump detector. `espDisabled`, other faults, the existing downstream soft-disable policy, and vehicle/panda safety behavior are unchanged.
@@ -26,11 +26,25 @@ the design document; historical source-branch replay notes are not qualification
 
 Centering fades for driver steering, either blinker, or a non-off lane-change state. It resets when lateral control is inactive or the lateral-maneuver tool owns the target. The combined signal/start/recenter path has host regression coverage, not physical closed-loop validation. Watch for unexpected weave, curve tracking, or reduced obstacle clearance; no road-validation claim is made here.
 
+## Curve and passing composition (not field validated)
+
+- **Curve-speed limiter:** the current model-path policy anticipates bends and supplies a torque-aware coast/brake candidate. It competes with cruise, lead braking, the model and committed stops; it does not change the driver's set speed or replace steering. Live torque calibration is optional, with the source fallback retained. Its decision is logged as `curvePolicyState`; the existing BLoTv3 `stop` source and SOL telemetry retain their schema IDs. See [curve policy design](docs/ModelCurveSpeedLimit.md).
+- **Passing acceleration and relaxed gaps:** a starting lane change with a clear target lane and set-speed headroom can temporarily reduce the primary lead's nominal following time to **0.6 s**, allowing the existing cruise acceleration to take over. This is not an extra acceleration boost or a global personality-gap reduction. The relaxation uses the source's nominal **2.5 s** window and cancels for the source's lead-braking, handover, driver-back-out and reset conditions. BLoTv3's additional protective gap padding remains additive; the stopped gap and platform acceleration ceiling are unchanged.
+- **Target-lane radar planning:** front radar tracks, lane geometry and the appropriate blind-spot indication gate the longitudinal passing behavior. This requires an eligible radar/BSM vehicle, healthy inputs, and full forward-ordered model/lane polylines. Unusable or non-forward geometry disables the passing policy without removing ordinary lead following or curve control. It is not an independent lane-change safety guarantee and does not add a target-lane radar veto to the lateral nudgeless state machine.
+- **Lead release (explicitly selected):** while the source's path, clearance and restoration conditions permit, selected old-lane leads are removed from the MPC planning view and its FCW calculation. They remain in the original `radarState` and `hasLead` publication. Released slots cannot return as model-lead forecasts. Stopped/braking or unsafe-to-restore leads are retained/restored according to the source gates. Release is not time-limited like the shorter gap: it can continue through the starting phase until a restore/end condition. Model braking and committed-stop authority are not lifted by passing.
+
+Short gaps reduce reaction margin. Lead-release mistakes can suppress braking and FCW for a real vehicle; radar/BSM and model lane placement have blind spots and cannot prove the target lane safe. The curve policy can request inappropriate slowing from bad geometry or authority estimates. These are local experimental changes, not road-qualified behavior.
+
+Intentional lead restoration drops only the MPC's obsolete free-run change-cost reference through re-anchoring. Jerk and safety costs remain; ordinary radar dropouts keep their existing behavior. The release guard does not assume current braking will continue after the lead is released.
+
 ## Deliberately excluded
 
-No lane-change passing acceleration, follow-gap relaxation, lead release, target-lane radar planner, or lane-change MPC changes. The curve-speed limiter, BLaTv2 controller, and third model-only cut-in obstacle are not imported. Upstream AccelBoost, models, and the existing paired opendbc/panda pins are retained. Radar selection changes only by the Smooth Stops unconfirmed low-speed gate described above. MPC collision-warning prediction follows the accepted BLoTv3 lead trajectory. The accepted upstream type-check diagnostics are not fixed by these imports. All additions remain local/host-tested until separate device and owner field acceptance.
+BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream AccelBoost, models, and the existing paired opendbc/panda pins are retained. The upstream radar publication retains the Smooth Stops unconfirmed low-speed gate; lane-change filtering is a separate planner-local view. MPC collision-warning prediction follows the accepted BLoTv3 trajectory for non-released leads. The accepted upstream type-check diagnostics are not fixed by these imports. All additions remain local pending separate device and owner field acceptance.
 
 ## Import provenance
+
+- Current curve-speed policy: `e976ab76aa4bd394ff2d5baeb0591623eb893f92`, composed with BLoTv3 arbitration; its unrelated `teleoprtc_repo` pin change is excluded.
+- Passing gap/acceleration, target-lane checks and lead release: `ac85e99c3049f4a88c376deae94ba46af99b50d5`, composed with BLoTv3's existing MPC gap API and predictive lead ownership. These are feature-delta imports, not whole-source-branch ancestry merges.
 
 - ESP-active debounce: `e9fd5e680cc0e80934295fb210483e8ceadc2d70`.
 - Hot-swap Experimental: `a91715adbf7605dba9c934e9de545fa99a0c0b40`, adapted for daily's manual/CEM ownership, asynchronous settings updates and the Hyundai CAN-FD input limitation.
@@ -39,7 +53,7 @@ No lane-change passing acceleration, follow-gap relaxation, lead release, target
 
 - Full longitudinal feature: [BLoTv3 at 926ccb7a3](https://github.com/SpysyWeeb/Spysypilot/tree/926ccb7a3f24ab49d47b64fde2cbcc98ff02e14f), reconciled with daily’s newer upstream planner and SOL. Local verification is not device or field acceptance.
 
-- Nudgeless production helper and source-owned tests: [lane-changes at ac85e99c](https://github.com/SpysyWeeb/Spysypilot/tree/ac85e99c3049f4a88c376deae94ba46af99b50d5), including the early-manual-start retry fix. The rest of that branch is intentionally not imported or recorded as wholly merged.
+- Nudgeless production helper and source-owned tests: [lane-changes at ac85e99c](https://github.com/SpysyWeeb/Spysypilot/tree/ac85e99c3049f4a88c376deae94ba46af99b50d5), including the early-manual-start retry fix. Its lateral behavior is unchanged by the subsequent longitudinal passing import.
 - Complete centering feature and both Dev toggles: [lane-centering at a3f3b942](https://github.com/SpysyWeeb/Spysypilot/tree/a3f3b94250611608dc39b9357e1364ea1b091960). Test setup is adapted to daily's required SOL status; production behavior is unchanged.
 
 ---

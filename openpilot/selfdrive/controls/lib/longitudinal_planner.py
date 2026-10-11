@@ -9,10 +9,13 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
+from openpilot.selfdrive.controls.lib.lane_change_gap import LaneChangeGap
 from openpilot.selfdrive.controls.lib.force_stops import RELEASE_OPEN_FRAMES, RELEASE_OPEN_THRESHOLD, RELEASE_RC, ForceStops
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.model_curve_speed import CurveResult, LateralState, ModelCurveSpeedLimiter
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation, anchor_model_lead
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_ABSENCE_FRAMES, LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import (COMFORT_BRAKE, LEAD_ABSENCE_FRAMES, STOP_DISTANCE,
+                                                                       LongitudinalMpc, LongitudinalPlanSource, get_T_FOLLOW)
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
 from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop, path_open
 from openpilot.selfdrive.controls.lib.stop_landing import STANDSTILL_SPEED, STOP_INTENT_SPEED, StopLanding
@@ -84,6 +87,27 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow
   return target_accel
 
 
+def get_live_torque_params(sm):
+  service = 'lateralTorqueParameters'
+  try:
+    params = sm[service]
+    healthy = sm.alive[service] and sm.freq_ok[service] and sm.valid[service]
+  except (AttributeError, KeyError):
+    return None
+  return params if healthy and params.useParams else None
+
+
+def get_radar_tracks(sm):
+  service = 'radarTracks'
+  try:
+    tracks = sm[service]
+    healthy = sm.alive[service] and sm.freq_ok[service] and sm.valid[service]
+  except (AttributeError, KeyError):
+    return None
+  errors = tracks.errors
+  return tracks if healthy and not (errors.canError or errors.radarFault or errors.wrongConfig or errors.radarUnavailableTemporary) else None
+
+
 class LongitudinalPlanner:
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
     self.CP = CP
@@ -91,6 +115,9 @@ class LongitudinalPlanner:
     self.fcw = False
     self.dt = dt
     self.allow_throttle = True
+    self.curve_speed_limiter = ModelCurveSpeedLimiter(CP, dt=dt)
+    self.curve = CurveResult()
+    self.lane_change_gap = LaneChangeGap(CP, dt=dt)
     self.accel_boost = AccelBoost()
     self.throttle_prob = FirstOrderFilter(1.0, ALLOW_THROTTLE_PROB_TAU, dt)
     self.supervisor = NecessitySupervisor(dt)
@@ -156,6 +183,10 @@ class LongitudinalPlanner:
       self.holding_prev = False
 
     # No change cost when user is controlling the speed; it stays on through standstill so launches start smooth
+    # A gas override turns longControlState off, but must not erase the curve's regime/hold.
+    if not sm['selfdriveState'].enabled:
+      self.curve_speed_limiter.reset()
+
     prev_accel_constraint = not reset_state
 
     radar_valid = sm.all_checks(['radarState'])
@@ -166,6 +197,20 @@ class LongitudinalPlanner:
     lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if len(model_leads) > 0 else None
     lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
     policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
+
+    # Raw observations still own stop admission/supervision. Only the MPC/FCW view releases leads.
+    radar_tracks = get_radar_tracks(sm)
+    lane_pad = 0.0
+    released_prev = self.lane_change_gap.released
+    if (self.CP.openpilotLongitudinalControl and not reset_state and model_valid and radar_valid and
+        sm.all_checks(['carState']) and radar_tracks is not None and not (sm['carState'].gasPressed or sm['carState'].brakePressed)):
+      lane_pad = self.lane_change_gap.update(sm['modelV2'], sm['carState'], sm['radarState'], radar_tracks, True,
+                                             v_ego, v_cruise, get_T_FOLLOW(sm['selfdriveState'].personality), STOP_DISTANCE, COMFORT_BRAKE)
+    else:
+      self.lane_change_gap.reset()
+    planning_radar = self.lane_change_gap.followed(sm['radarState'])
+    restored_leads = tuple(was_released and lead.present for was_released, lead in
+                           zip(released_prev, (planning_radar.leadOne, planning_radar.leadTwo), strict=True))
 
     experimental_mode = sm['selfdriveState'].experimentalMode
     stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
@@ -184,8 +229,9 @@ class LongitudinalPlanner:
       a_told = self.output_a_target
       a_seed = float(np.clip(self.mpc.a_next, ACCEL_MIN, ACCEL_MAX)) if self.plan_winner in ('mpc', 'column') else a_told
     self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, a_told)
-    self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, stop_x,
-                    policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint)
+    self.mpc.update(planning_radar, personality,
+                    lead0_anchor if planning_radar.leadOne.present else None, lead1_anchor if planning_radar.leadTwo.present else None, stop_x,
+                    policy.jerk_scale, policy.t_follow_pad + lane_pad, prev_accel_constraint, restored_leads=restored_leads)
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -242,6 +288,19 @@ class LongitudinalPlanner:
 
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
+    curve = CurveResult()
+    if not model_valid:
+      # Drop stale path authority, including its median/jerk anchor. Authority calibration and gas grace survive reset.
+      self.curve_speed_limiter.reset()
+    elif sm['selfdriveState'].enabled:
+      curve = self.curve_speed_limiter.update(sm['modelV2'], v_ego=v_ego, a_ego=sm['carState'].aEgo,
+                                              lateral_active=sm['carControl'].latActive, steering_pressed=sm['carState'].steeringPressed,
+                                              roll=sm['vehicleParameters'].roll, accel_coast=accel_coast,
+                                              torque_params=get_live_torque_params(sm),
+                                              lateral_state=LateralState.from_controls_state(sm['controlsState']),
+                                              gas_pressed=sm['carState'].gasPressed)
+    curve_admitted = curve.a_target is not None and not reset_state
+    self.curve = curve if curve_admitted else CurveResult()
     # Apply the upstream correction before deciding whether the model clears the committed stop's urgency margin.
     a_other = min(output_a_target_mpc, force_stop.a_target if force_stop.a_target is not None else np.inf)
     output_a_target_e2e = self.accel_boost.update(sm, output_a_target_e2e, a_other, self.a_cruise)
@@ -262,6 +321,8 @@ class LongitudinalPlanner:
       present.add('e2e')
     if force_stop.a_target is not None:
       present.add('profile')
+    if curve_admitted:
+      present.add('curve')
     # whatever set the output can leave instead of being crossed: the winner leaving min() (e2e at a mode exit, a committed stop
     # at its release). Cruise then carries the car from the published target, not from wherever it slewed meanwhile
     handed_over = self.plan_winner not in present
@@ -279,6 +340,8 @@ class LongitudinalPlanner:
     if force_stop.a_target is not None:
       # a committed stop's own approach profile competes like any candidate; the column and the hold still own the landing
       candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False, 'profile'))
+    if curve_admitted:
+      candidates.append((curve.a_target, LongitudinalPlanSource.curve, False, 'curve'))
 
     a_arbitrated, self.plan_source, _, self.plan_winner = min(candidates, key=lambda c: c[0])
     # the landing law is the last word on every stop's final meters, whichever candidate is landing it. Intent: a
@@ -327,4 +390,15 @@ class LongitudinalPlanner:
     longitudinalPlan.allowBrake = True
     longitudinalPlan.allowThrottle = bool(self.allow_throttle)
 
+    curve_send = messaging.new_message('curvePolicyState')
+    curve_send.valid = plan_send.valid
+    curve_state = curve_send.curvePolicyState
+    curve_state.regime = self.curve.regime
+    curve_state.active = self.curve.a_target is not None
+    curve_state.aTarget = float(self.curve.a_target) if self.curve.a_target is not None else 0.0
+    curve_state.vLimit = float(self.curve.v_limit)
+    curve_state.limitDistance = float(self.curve.distance)
+    curve_state.authorityFactor = float(self.curve.authority_factor)
+    curve_state.holding = bool(self.curve.holding)
+    pm.send('curvePolicyState', curve_send)
     pm.send('longitudinalPlan', plan_send)

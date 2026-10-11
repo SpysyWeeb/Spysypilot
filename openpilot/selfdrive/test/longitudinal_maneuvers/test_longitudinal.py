@@ -10,6 +10,7 @@ from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.values import PLATFORMS
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib import longitudinal_planner
+from openpilot.selfdrive.controls.lib.model_curve_speed import BEND_OPEN_S
 from openpilot.selfdrive.controls.lib.longitudinal_planner import J_CRUISE_BP, J_CRUISE_VALS
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.controls.lib.stop_landing import KISS_SPEED, LANDING_SPEED, STALL_MAX, StopLanding, landing_bound
@@ -646,3 +647,68 @@ class TestALeadLeavingALatchedLanding(PinnedTestCase):
       worst = max(handed_back)
       assert worst[0] <= 1e-9, f'{worst[0]:+.4f} over the cruise jerk {worst[1]:.2f} s after the lead left'
       assert plant.a_target == law.call_args.args[0] and plant.speed > 0.5, (plant.a_target, law.call_args.args[0], plant.speed)
+
+
+class TestCurvePolicy(OpenpilotTestCase):
+  def _run(self, **kwargs):
+    maneuver = Maneuver(kwargs.pop('title'), duration=kwargs.pop('duration', 30.0), **kwargs)
+    valid, logs = maneuver.evaluate()
+    assert valid
+    return logs[:, 1], logs[:, 3], logs[:, 5]     # distance, speed, acceleration
+
+  def test_a_curve_ahead_is_approached_at_the_needed_deceleration_without_a_burst(self):
+    # a 0.05 1/m curve (authority ~6.5 m/s with factor 2.7, friction 0.11) 120 m ahead at 20 m/s
+    x, v, a = self._run(title='approach a tight curve', initial_speed=20.0, cruise_values=[20.0, 20.0], curve=(120.0, 80.0, 0.05))
+    entry = int(np.flatnonzero(x >= 120.0)[0])
+    assert v[entry] <= 7.5, v[entry]                                       # slowed to the curve's limit by its start
+    assert a[:entry].min() >= -2.05, a[:entry].min()                       # never harder than the comfort floor
+    onset = int(np.flatnonzero(a < -0.3)[0])
+    assert a[onset:entry].max() <= 0.3, a[onset:entry].max()                # no burst toward the limit once braking has begun
+    exit_ = int(np.flatnonzero(x >= 200.0)[0])
+    after = a[exit_:exit_ + int(2.0 / DT_MDL)]
+    assert after.max() >= 1.0, after.max()                                  # and it accelerates again within two seconds of the exit
+
+  def test_pinned_but_tracking_coasts_and_pinned_understeering_brakes(self):
+    # a curve the steering can only just hold: heavy torque, tracking -> coast; then a tighter one it cannot -> brake
+    x, v, a = self._run(title='coast in a heavy curve', initial_speed=8.0, cruise_values=[8.0, 8.0], curve=(30.0, 150.0, 0.038),
+                        duration=25.0)
+    inside = (x > 40.0) & (x < 150.0)
+    assert np.all(a[inside] <= 0.05), a[inside].max()                       # foot off through the curve ...
+    assert a[inside].min() >= -1.0, a[inside].min()                         # ... but no real braking while it tracks
+    # a curve the model reads at half its true curvature: anticipation lets the car in too fast, the steering pins
+    # and understeers, and the reaction layer must brake it down
+    x, v, a = self._run(title='brake in a curve the steering cannot hold', initial_speed=9.0, cruise_values=[9.0, 9.0],
+                        curve=(30.0, 150.0, 0.06), curve_model_scale=0.5, duration=25.0)
+    inside = (x > 35.0) & (x < 150.0)
+    assert a[inside].min() <= -0.8, a[inside].min()                         # it brakes ...
+    assert a[inside].min() >= -2.05                                         # ... within the floor
+    assert v[inside][-1] < v[inside][0]                                     # ... and is slower deep in the curve
+
+  def test_a_left_and_a_right_hand_curve_are_driven_alike(self):
+    # the simulated steering saturates the same way in both directions, and the policy reading it must not care which
+    left, right = (self._run(title=f'brake in a {side}-hand curve the steering cannot hold', initial_speed=9.0, cruise_values=[9.0, 9.0],
+                             curve=(30.0, 150.0, curvature), curve_model_scale=0.5, duration=25.0)
+                   for side, curvature in (('left', 0.06), ('right', -0.06)))
+    np.testing.assert_allclose(right[1], left[1], atol=1e-6)
+    np.testing.assert_allclose(right[2], left[2], atol=1e-6)
+    inside = (left[0] > 35.0) & (left[0] < 150.0)
+    assert right[2][inside].min() <= -0.8, right[2][inside].min()           # the right-hand curve brakes too
+
+  def test_a_lift_ends_in_a_hold_until_the_bend_opens(self):
+    # a tight entry the steering can only just hold, then a looser section that is still a bend at the owner's own
+    # cornering level (above BEND_OPEN_A_LAT at the settled speed): the coast releases as the torque eases, and the
+    # cruise set speed of 12 m/s wants the car back up at once
+    x, v, a = self._run(title='hold through the looser half', initial_speed=9.0, cruise_values=[12.0, 12.0],
+                        curve=[(30.0, 60.0, 0.038), (90.0, 100.0, 0.036)], duration=40.0)
+    enter, exit_ = int(np.flatnonzero(x >= 92.0)[0]), int(np.flatnonzero(x >= 192.0)[0])
+    assert a[enter:exit_].max() <= 0.05, a[enter:exit_].max()               # no acceleration for the rest of the bend ...
+    assert abs(v[enter:exit_].max() - v[enter]) <= 0.3                      # ... the speed simply holds
+    after = a[exit_:exit_ + int((BEND_OPEN_S + 1.5) / DT_MDL)]
+    assert after.max() >= 0.3, after.max()                                  # and the bend's end gives the acceleration back
+    # the same entry into a section that reads open at the level the owner goes back to power (his six measured
+    # accelerate-out onsets sit at 1.13-2.26 m/s^2): the hold releases within its dwell
+    x, v, a = self._run(title='release when the bend opens', initial_speed=9.0, cruise_values=[12.0, 12.0],
+                        curve=[(30.0, 60.0, 0.038), (90.0, 120.0, 0.028)], duration=35.0)
+    enter = int(np.flatnonzero(x >= 92.0)[0])
+    soon = a[enter:enter + int((BEND_OPEN_S + 1.5) / DT_MDL)]
+    assert soon.max() >= 0.3, soon.max()                                    # not held back once the road has opened

@@ -29,7 +29,22 @@ struct AolState @0xcfe2a93b1d754086 {
   }
 }
 
-struct CustomReserved1 @0xaedffd8f31e7b55d {
+# the curve longitudinal policy's decision each model frame (selfdrive/controls/lib/model_curve_speed.py)
+struct CurvePolicyState @0xaedffd8f31e7b55d {
+  regime @0 :Regime;
+  active @1 :Bool;              # the candidate is in the planner's arbitration
+  aTarget @2 :Float32;          # m/s^2, the candidate acceleration while active
+  vLimit @3 :Float32;           # m/s, the strictest path node's speed limit, inf on a straight
+  limitDistance @4 :Float32;    # m, that node's distance along the path
+  authorityFactor @5 :Float32;  # lateral acceleration per unit of torque the policy counts on
+  holding @6 :Bool;             # the hold after a lift: no acceleration until the bend reads open
+
+  enum Regime {
+    free @0;
+    anticipate @1;
+    coast @2;
+    brake @3;
+  }
 }
 
 struct CustomReserved2 @0xf35cc4560bbf6ec2 {

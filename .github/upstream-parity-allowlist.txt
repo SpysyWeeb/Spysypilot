@@ -80,3 +80,17 @@ openpilot/selfdrive/controls/radard.py # smooth-stops unconfirmed low-speed rada
 openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py # smooth-stops source regressions
 openpilot/selfdrive/controls/tests/test_daily_radar_filter.py # daily radar + BLoTv3 integration
 openpilot/selfdrive/selfdrived/tests/test_daily_hot_swap.py # hot-swap manual preference + CEM integration
+
+# Curve-speed policy and explicitly selected radar-aware passing/lead release
+docs/ModelCurveSpeedLimit.md
+openpilot/selfdrive/controls/lib/lane_change_gap.py
+openpilot/selfdrive/controls/lib/model_curve_speed.py
+openpilot/selfdrive/controls/plannerd.py
+openpilot/selfdrive/controls/tests/test_daily_curve_integration.py
+openpilot/selfdrive/controls/tests/test_daily_lane_invalid_inputs.py
+openpilot/selfdrive/controls/tests/test_daily_lane_planning.py
+openpilot/selfdrive/controls/tests/test_daily_lane_recovery.py
+openpilot/selfdrive/controls/tests/test_lane_change_gap.py
+openpilot/selfdrive/controls/tests/test_lane_change_release.py
+openpilot/selfdrive/controls/tests/test_model_curve_speed.py
+openpilot/selfdrive/test/process_replay/process_replay.py

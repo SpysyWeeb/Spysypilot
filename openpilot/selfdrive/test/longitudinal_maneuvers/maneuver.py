@@ -36,6 +36,10 @@ class Maneuver:
     self.CP = kwargs.get("CP", None)
     self.accel_error = kwargs.get("accel_error", 0.0)
     self.creep = kwargs.get("creep", 0.0)
+    self.curve = kwargs.get("curve", None)
+    self.torque_factor = kwargs.get("torque_factor", 2.7)
+    self.torque_friction = kwargs.get("torque_friction", 0.11)
+    self.curve_model_scale = kwargs.get("curve_model_scale", 1.0)
 
     self.duration = duration
     self.title = title
@@ -58,6 +62,10 @@ class Maneuver:
       CP=self.CP,
       accel_error=self.accel_error,
       creep=self.creep,
+      curve=self.curve,
+      torque_factor=self.torque_factor,
+      torque_friction=self.torque_friction,
+      curve_model_scale=self.curve_model_scale,
     )
 
     valid = True

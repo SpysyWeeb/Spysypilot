@@ -248,6 +248,7 @@ class LongitudinalMpc:
     self.source = LongitudinalPlanSource.cruise
     self.binding_obstacle = None
     self.pending_frames = 0
+    self.restoring_lead = None
     self.lead_present = False
     self.column_present = False
     self.solution_status = 0
@@ -353,7 +354,7 @@ class LongitudinalMpc:
     return np.column_stack((x_lead, v_lead))
 
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard, lead0_anchor=None, lead1_anchor=None,
-             stop_x=None, jerk_scale=1.0, t_follow_pad=0.0, prev_accel_constraint=True):
+             stop_x=None, jerk_scale=1.0, t_follow_pad=0.0, prev_accel_constraint=True, restored_leads=(False, False)):
     lead_xv_0 = self.process_lead_model(lead0_anchor, radarstate.leadOne)
     lead_xv_1 = self.process_lead_model(lead1_anchor, radarstate.leadTwo)
 
@@ -376,6 +377,7 @@ class LongitudinalMpc:
     # It changes when an obstacle comes or goes; a lead and the column trading the binding while both are present do not change it
     leads = (radarstate.leadOne, radarstate.leadTwo)
     obstacle = 'stop' if binding == 2 else 'lead' if leads[binding].present else 'fake'
+    restoring = obstacle == 'lead' and (restored_leads[binding] or self.restoring_lead == binding)
     lead_present = leads[0].present or leads[1].present
     column_edge = (stop_x is not None) != self.column_present
     if {obstacle, self.binding_obstacle} == {'lead', 'stop'} and lead_present and self.lead_present and not column_edge:
@@ -397,12 +399,17 @@ class LongitudinalMpc:
       self.a_prev.fill(self.x0[2])
       self.reseed()
 
+    # An intentionally released lead is not a radar dropout. Its return invalidates the free-run change reference
+    # from the first solve through the pending obstacle's re-anchor. Keep jerk and every safety cost; normal change
+    # cost resumes once that hand-over has produced a lead plan. Another binding slot or a stop cancels the hand-over.
+    self.restoring_lead = binding if restoring and obstacle != self.binding_obstacle else None
+
     # the supervisor's policy shapes lead0's solve only; another owner solves with the incumbent weights
     if self.source != LongitudinalPlanSource.lead0:
       jerk_scale = 1.0
       t_follow_pad = 0.0
     t_follow = get_T_FOLLOW(personality) + t_follow_pad
-    self.set_weights(prev_accel_constraint, personality, jerk_scale)
+    self.set_weights(prev_accel_constraint and not restoring, personality, jerk_scale)
 
     self.yref[:,:] = 0.0
     for i in range(N):
