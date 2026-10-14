@@ -427,3 +427,44 @@ def test_manager_start_clears_timeout_latch_and_ready_model_runs(lifecycle, monk
   configured = [name for name, proc in managed_processes.items() if getattr(proc, 'restart_on_exit_code', None) is not None]
   assert configured == ['modeld']
   print(f'manager_init reset latch; ready pid={current.pid}, events={life.events(current.pid)}')
+
+
+@pytest.mark.parametrize('retried', [False, True])
+def test_failed_big_load_retries_once_through_onroad_cycle(lifecycle, monkeypatch, tmp_path, retried):
+  life = lifecycle
+  life.scenario.stall = None
+  monkeypatch.setattr(modeld, 'BIG_MODEL_TIMEOUT', 5)
+  if retried:
+    life.params.put_bool('ChestnutRetry', True, block=True)
+  assert life.params.get_type('ChestnutRetry') == ParamKeyType.BOOL
+
+  def fail_big_load(phase):
+    if phase == 'load':
+      raise RuntimeError('test big model load failure')
+  life.scenario.compile = fail_big_load
+
+  def drop_chestnut():
+    with (tmp_path / 'trace.txt').open('a') as f:
+      f.write(f'{os.getpid()} drop\n')
+  monkeypatch.setattr(modeld, 'drop_chestnut', drop_chestnut)
+
+  life.tick()
+  current = life.proc.proc
+  assert life.ran.wait(10)
+  # Both boots drop pending AMD work before the small model is built, then run it.
+  assert life.events(current.pid) == ['enumerate', 'enumerate', 'big', 'drop', 'small', 'realtime', 'run_small']
+  deadline = time.monotonic() + 3
+  while life.params.get('ChestnutLoading') is not False and time.monotonic() < deadline:
+    time.sleep(0.01)
+  assert life.params.get('ChestnutLoading') is False
+  assert life.params.get_bool('ChestnutRetry')
+  assert not life.params.get_bool('ChestnutLoadTimedOut')
+  if not retried:
+    # First failure: request one onroad cycle and leave ChestnutActive unset, so no failure alert fires before the retry.
+    assert life.params.get_bool('OnroadCycleRequested')
+    assert life.params.get('ChestnutActive') is None
+  else:
+    # Failure on the retry boot: report the failure and never request another cycle.
+    assert life.params.get('ChestnutActive') is False
+    assert not life.params.get_bool('OnroadCycleRequested')
+  assert current.is_alive()

@@ -101,9 +101,10 @@ def test_model_upload_run_and_warmup(tmp_path, monkeypatch, model_device):
     np.testing.assert_array_equal(model.run(frames, transforms, inputs)['probe'], first)
 
 
+@pytest.mark.parametrize('retry', [False, True], ids=['first_boot', 'retry_boot'])
 @pytest.mark.parametrize('scenario', ['ready', 'cable_only', 'late_link', 'no_link', 'load_error', 'no_chestnut'])
-def test_startup_enumeration_link_and_standby(monkeypatch, scenario):
-  calls, values = [], {}
+def test_startup_enumeration_link_and_standby(monkeypatch, scenario, retry):
+  calls, values = [], {'ChestnutRetry': True} if retry else {}
   clock = [0.0]
 
   class StartupDone(Exception):
@@ -181,7 +182,8 @@ def test_startup_enumeration_link_and_standby(monkeypatch, scenario):
   monkeypatch.setattr(modeld, 'threading', SimpleNamespace(Thread=Thread))
   monkeypatch.setattr(modeld, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
   monkeypatch.setattr(modeld, 'gc', SimpleNamespace(disable=lambda: None))
-  monkeypatch.setattr(modeld, 'cloudlog', SimpleNamespace(warning=lambda *_: None, exception=lambda *_: None))
+  monkeypatch.setattr(modeld, 'cloudlog', SimpleNamespace(warning=lambda *_: None, error=lambda *_: None,
+                                                        exception=lambda *_: None))
   monkeypatch.setattr(modeld, 'chestnut_compiled', lambda: scenario != 'no_chestnut')
   monkeypatch.setattr(modeld, 'chestnut_present', lambda: scenario != 'cable_only')
   monkeypatch.setattr(modeld, 'cable_connected', lambda: True)
@@ -195,9 +197,18 @@ def test_startup_enumeration_link_and_standby(monkeypatch, scenario):
   if scenario == 'no_chestnut':
     assert calls == ['small']
     assert 'ChestnutActive' not in values
+    assert 'OnroadCycleRequested' not in values
     return
   assert calls[0] == 'enumerate'
-  assert values['ChestnutActive'] is success
+  if success or retry:
+    assert values['ChestnutActive'] is success
+    assert values.get('ChestnutRetry', False) is retry
+    assert 'OnroadCycleRequested' not in values
+  else:
+    # a first failure retries once through an onroad cycle; the retry boot decides ChestnutActive
+    assert values['ChestnutRetry'] is True
+    assert values['OnroadCycleRequested'] is True
+    assert 'ChestnutActive' not in values
   if scenario == 'cable_only':
     assert calls == ['enumerate', 'small']
     assert clock[0] < 11
