@@ -78,3 +78,34 @@ def test_pcm_cruise_remains_owned_by_vehicle():
   expected = tick(helper, cs, True)
   for pressed in (True, False):
     assert tick(helper, cs, True, ButtonType.accelCruise, pressed) == expected
+
+
+@pytest.mark.parametrize('experimental', [False, True])
+@pytest.mark.parametrize('speed_kph,expected', [(0., 40), (30., 40), (80., 80), (120., 120), (180., 145)])
+def test_initial_set_uses_normal_speed_floor_in_both_modes(experimental, speed_kph, expected):
+  from openpilot.common.constants import CV
+
+  helper = VCruiseHelper(car.CarParams(pcmCruise=False))
+  cs = car.CarState(vEgo=speed_kph * CV.KPH_TO_MS,
+                     buttonEvents=[car.CarState.ButtonEvent(type=ButtonType.decelCruise)])
+  helper.initialize_v_cruise(cs, experimental)
+  assert helper.v_cruise_kph == expected
+  assert helper.v_cruise_cluster_kph == expected
+  assert V_CRUISE_MIN == 8, 'the daily adjustable-speed floor is separate from initialization'
+
+
+@pytest.mark.parametrize('experimental', [False, True])
+@pytest.mark.parametrize('button', [ButtonType.resumeCruise, ButtonType.accelCruise])
+def test_initial_resume_retains_previous_set_speed(experimental, button):
+  helper, cs = cruise()
+  helper.v_cruise_kph_last = 73
+  cs.buttonEvents = [car.CarState.ButtonEvent(type=button)]
+  helper.initialize_v_cruise(cs, experimental)
+  assert helper.v_cruise_kph == helper.v_cruise_cluster_kph == 73
+
+
+@pytest.mark.parametrize('experimental', [False, True])
+def test_initial_set_does_not_replace_pcm_speed(experimental):
+  helper, cs = cruise(start=73., pcm=True)
+  helper.initialize_v_cruise(cs, experimental)
+  assert helper.v_cruise_kph == 73

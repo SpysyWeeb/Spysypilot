@@ -28,6 +28,59 @@ from openpilot.system.manager.process_config import managed_processes, only_onro
 pytestmark = pytest.mark.skipif(multiprocessing.get_start_method() != 'fork', reason='manager uses inherited fork fixtures')
 
 
+@pytest.mark.parametrize('lat_active', [False, True])
+@pytest.mark.parametrize('speed', [0., 0.3, 0.31, 5.])
+@pytest.mark.parametrize('curvature', [-0.027, 0.027])
+def test_main_action_tracks_inactive_curvature_without_changing_active_or_moving(lifecycle, monkeypatch, lat_active, speed, curvature):
+  lifecycle.scenario.stall = None
+  monkeypatch.setattr(modeld, 'BIG_MODEL_TIMEOUT', 2)
+  subscribed, actions = [], []
+
+  class SubMaster(dict):
+    updated = {'extrinsicsCalibration': False}
+
+    def __init__(self, services):
+      super().__init__(driverMonitoringState=SimpleNamespace(isRHD=False), narrowRoadCameraState=SimpleNamespace(frameId=1),
+                       carState=SimpleNamespace(vEgo=speed), lateralDelay=SimpleNamespace(lateralDelay=0),
+                       carControl=SimpleNamespace(latActive=lat_active), controlsState=SimpleNamespace(curvature=curvature))
+      subscribed.extend(services)
+
+    def update(self, *_args, **_kwargs):
+      pass
+
+  class FrameCaptured(Exception):
+    pass
+
+  def capture(_msg, _model_output, action, *_args):
+    actions.append(action)
+    raise FrameCaptured
+
+  monkeypatch.setattr(modeld, 'SubMaster', SubMaster)
+  monkeypatch.setattr(modeld.ModelState, 'run', lambda *_: {'action': np.array([[0.02, -0.1]])})
+  monkeypatch.setattr(modeld, 'fill_model_msg', capture)
+  with pytest.raises(FrameCaptured):
+    modeld.main()
+  assert len(actions) == 1
+  expected = (curvature if not lat_active else 0.) if speed <= 0.3 else 0.02 / max(1., speed) ** 2
+  assert actions[0].desiredCurvature == pytest.approx(expected)
+  assert 'controlsState' in subscribed, 'the seed must have a live messaging subscription'
+
+
+def test_model_replay_receives_curvature_seed():
+  import ast
+  import inspect
+  from openpilot.selfdrive.test.process_replay import model_replay, process_replay
+
+  config = next(c for c in process_replay.CONFIGS if c.proc_name == 'modeld')
+  assert 'controlsState' in config.pubs
+  tree = ast.parse(inspect.getsource(model_replay.model_replay))
+  trims = [n.value for n in ast.walk(tree) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call) and
+           isinstance(n.value.func, ast.Name) and n.value.func.id == 'trim_logs' and any(
+             isinstance(t, ast.Name) and t.id == 'modeld_logs' for t in n.targets)]
+  assert len(trims) == 1
+  assert 'controlsState' in ast.literal_eval(trims[0].args[-1])
+
+
 @pytest.mark.parametrize('configured, exitcode, restart', [(True, os.EX_TEMPFAIL, True), (True, 1, False), (True, 0, False),
                                                           (True, -signal.SIGKILL, False), (False, os.EX_TEMPFAIL, False)])
 def test_manager_restarts_only_explicit_modeld_timeout(tmp_path, monkeypatch, configured, exitcode, restart):

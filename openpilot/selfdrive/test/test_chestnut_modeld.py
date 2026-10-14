@@ -213,3 +213,53 @@ def test_startup_enumeration_link_and_standby(monkeypatch, scenario):
     else:
       assert calls[-1] == 'small'
       assert 'warm_small' not in calls
+
+
+def test_firmware_flash_starts_immediately_and_bounds_startup_hold(monkeypatch):
+  import ast
+  import inspect
+  import threading
+  from openpilot.common.hardware.usb import CHESTNUT_USB_IDS
+  from openpilot.system.hardware import hardwared
+
+  clock = [1.0]
+  started, release = threading.Event(), threading.Event()
+  chestnut = hardwared.Chestnut()
+  usb = [dict(zip(('vendorId', 'productId'), CHESTNUT_USB_IDS[0], strict=True), product='old firmware')]
+
+  def flash():
+    started.set()
+    assert release.wait(5), 'test must release its real worker'
+
+  monkeypatch.setattr(chestnut, 'flash', flash)
+  monkeypatch.setattr(hardwared, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+  try:
+    chestnut.update(False, usb)
+    assert chestnut.thread is None, 'never start firmware flashing onroad'
+    chestnut.update(True, usb)
+    assert started.wait(1), 'first offroad attempt must not wait for the retry interval'
+    assert chestnut.thread is not None
+    assert chestnut.attempts == 1
+    chestnut.update(True, usb)
+    assert chestnut.attempts == 1, 'do not launch a second live worker'
+
+    # Execute the real hardware-thread admission assignment, not a test-owned copy of its predicate.
+    tree = ast.parse(inspect.getsource(hardwared.hardware_thread))
+    gates: list[ast.stmt] = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and any(
+      isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == 'startup_conditions' and
+      isinstance(t.slice, ast.Constant) and t.slice.value == 'not_flashing_chestnut' for t in n.targets)]
+    assert len(gates) == 1
+    gate = compile(ast.Module(body=gates, type_ignores=[]), hardwared.__file__, 'exec')
+    for elapsed, held in [(0., True), (29.999, True), (30., False), (31., False)]:
+      clock[0] = chestnut.last_attempt + elapsed
+      assert chestnut.flashing is held
+      state = {'chestnut': chestnut, 'startup_conditions': {}}
+      exec(gate, state)
+      assert state['startup_conditions']['not_flashing_chestnut'] is not held
+    assert chestnut.thread.is_alive(), 'timeout releases admission; it does not cancel the worker'
+  finally:
+    release.set()
+    if chestnut.thread is not None:
+      chestnut.thread.join(2)
+      assert not chestnut.thread.is_alive()
+  assert not chestnut.flashing
