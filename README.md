@@ -70,6 +70,7 @@ BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream Accel
 - Big-model load retry: upstream `6939d172e85e3b91f16d90cc8de72e8f938cc196` (#39086), placed after daily's timeout latch with the drop-chestnut fallback kept unconditional.
 - Ignored-uploads offroad alert: upstream `35e78a9d9518855ec0dacec919e719624a28131f` (#39104), applied unchanged.
 - Initial Max Speed setting: upstream `24c26487f42b1d92cf96e3e23d686208e35e74e3` (#39081), applied unchanged; daily's cruise-button tests now pass an initial speed in km/h.
+- Following Distance label: upstream `41acce17fa226cb40af8f3e17f64259784731b01` (#39100), applied unchanged; translations were not regenerated, so the renamed label shows in English in other languages until upstream's catalog update is taken.
 - Acceleration ceiling: the 4.0 m/s² generic/Hyundai host and native Hyundai limit from combo's opendbc reference `97640dca1bb21174de16503ad53a18bbbb3efa8e`; no wholesale dependency replacement or unrelated safety-limit import.
 
 - Current curve-speed policy: `e976ab76aa4bd394ff2d5baeb0591623eb893f92`, composed with BLoTv3 arbitration; its unrelated `teleoprtc_repo` pin change is excluded.
