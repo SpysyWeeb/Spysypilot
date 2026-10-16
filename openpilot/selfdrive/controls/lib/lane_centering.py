@@ -80,8 +80,9 @@ def get_lane_center(model_v2, v_ego: float, width: float | None = None) -> LaneC
   heading = np.dot(x - x_mean, offset - offset_mean) / x_var if x_var > 0 else 0.0
 
   # a plan heading away from the center will be further off than the lookahead shows, one heading back needs less
-  error = np.clip(offset_mean - heading * x_mean + HEADING_GAIN * heading * lookahead, -MAX_OFFSET, MAX_OFFSET)
-  error *= np.interp(abs(offset[-1]), OFFSET_BP, OFFSET_V)
+  error = offset_mean - heading * x_mean + HEADING_GAIN * heading * lookahead
+  # fading on the same error lets a plan that has started to move over go, not only one that is already there
+  error = np.clip(error, -MAX_OFFSET, MAX_OFFSET) * np.interp(abs(error), OFFSET_BP, OFFSET_V)
 
   # curvature of the arc that closes the error at the lookahead
   curvature = GAIN * 2 * error / lookahead**2
