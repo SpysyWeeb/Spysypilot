@@ -31,9 +31,19 @@ WIDTH_STEP_FRAMES = 5
 MAX_WIDTH_AGE = 60.0  # s
 MAX_OFFSET_JUMP = 0.25  # m, a lane center that moves this much relative to the plan came from the wrong width
 
+# a driver who pushes the car further the way the model leans agrees with the model, so the correction stands down
+NUDGE_SETTLE = 0.5  # s without steering before a push is judged, so a push in several presses counts once
+MIN_LEAN = 0.05  # m, of correction against the model before it leans any way
+MIN_NUDGE = 0.1  # m, the push has to move the plan
+MAX_NUDGE = 1.0  # m, further is another lane
+YIELD_OFFSET = 0.25  # m off center the push has to leave the plan
+REARM_OFFSET = 0.15  # m, a plan back this close to the center gets centered again
+MAX_YIELD_TIME = 120.0  # s
+
 
 class LaneCenter(NamedTuple):
   curvature: float
+  error: float  # of the lane center from where the plan is heading, before the gain
   offset: float  # of the lane center from the plan at the lookahead
   width: float | None  # of the lane at the lookahead, when both lines were seen
 
@@ -88,7 +98,7 @@ def get_lane_center(model_v2, v_ego: float, width: float | None = None) -> LaneC
   curvature = GAIN * 2 * error / lookahead**2
   if not math.isfinite(curvature):
     return None
-  return LaneCenter(float(curvature), float(offset[-1]), None if width is None else float(width))
+  return LaneCenter(float(curvature), float(error), float(offset[-1]), None if width is None else float(width))
 
 
 class LaneCentering:
@@ -100,42 +110,91 @@ class LaneCentering:
     self.width_frame_id = 0
     self.width_steps = 0
     self.offset = 0.0
+    self.lean = 0.0
+    self.position: float | None = None
+    self.nudge: tuple[float, float | None] | None = None
+    self.nudge_torque = 0.0
+    self.released_frames = 0
+    self.yield_frame_id: int | None = None
 
   def reset(self):
     self.curvature.x = 0.0
+    self.lean, self.position = 0.0, None
+    self.nudge = None
+    self.yield_frame_id = None
 
   def update(self, lat_active: bool, CS, model_v2) -> float:
     if not lat_active:
       self.reset()
       return 0.0
 
+    # a push starts and ends where the plan was before this model frame
+    self.update_nudge(CS.steeringPressed, CS.steeringTorque)
     if model_v2.frameId != self.frame_id:
       self.frame_id = model_v2.frameId
       self.target = self.update_target(model_v2, CS.vEgo)
 
-    leaving_lane = CS.steeringPressed or CS.leftBlinker or CS.rightBlinker or \
-                   model_v2.meta.laneChangeState != LaneChangeState.off
-    return self.curvature.update(0.0 if leaving_lane else self.target)
+    changing_lanes = CS.leftBlinker or CS.rightBlinker or model_v2.meta.laneChangeState != LaneChangeState.off
+    if changing_lanes:
+      self.yield_frame_id = None
+
+    holding_off = CS.steeringPressed or changing_lanes or self.yield_frame_id is not None
+    return self.curvature.update(0.0 if holding_off else self.target)
 
   def update_target(self, model_v2, v_ego: float) -> float:
+    if self.yield_frame_id is not None and not 0 <= (model_v2.frameId - self.yield_frame_id) * DT_MDL <= MAX_YIELD_TIME:
+      self.yield_frame_id = None
+
     width_age = (model_v2.frameId - self.width_frame_id) * DT_MDL
     width = self.width.x if self.width is not None and 0 <= width_age <= MAX_WIDTH_AGE else None
     lane = get_lane_center(model_v2, v_ego, width)
     if lane is None or lane.width is None:
       self.width_steps = 0
+    self.lean, self.position = 0.0, None
     if lane is None:
       return 0.0
+
+    self.position = -lane.offset
+    if abs(lane.offset) < REARM_OFFSET:
+      self.yield_frame_id = None
 
     if lane.width is not None:
       self.learn_width(lane.width)
       self.width_frame_id = model_v2.frameId
       self.offset = lane.offset
-      return lane.curvature
-
     # only the plan can tell that the learned width no longer fits the road
-    if abs(lane.offset - self.offset) > MAX_OFFSET_JUMP:
+    elif abs(lane.offset - self.offset) > MAX_OFFSET_JUMP:
       return 0.0
+
+    self.lean = -lane.error
     return lane.curvature
+
+  def update_nudge(self, steering_pressed: bool, steering_torque: float):
+    if steering_pressed:
+      if self.nudge is None:
+        self.nudge, self.nudge_torque = (self.lean, self.position), 0.0
+      self.nudge_torque += steering_torque
+      self.released_frames = 0
+    elif self.nudge is not None:
+      self.released_frames += 1
+      if self.released_frames >= round(NUDGE_SETTLE / DT_CTRL):
+        self.judge_nudge(*self.nudge)
+        self.nudge = None
+
+  def judge_nudge(self, lean: float, start: float | None):
+    if abs(lean) < MIN_LEAN or start is None or self.position is None:
+      return
+    side = math.copysign(1.0, lean)
+    moved = (self.position - start) * side
+    if abs(moved) > MAX_NUDGE:
+      return
+    # the model moves the car too while the driver holds the wheel, only the driver's torque says who pushed: it is
+    # positive to the left, the lane is measured to the right
+    pushed = -self.nudge_torque * side > 0
+    if pushed and moved >= MIN_NUDGE and self.position * side >= YIELD_OFFSET:
+      self.yield_frame_id = self.frame_id
+    elif moved <= -MIN_NUDGE:
+      self.yield_frame_id = None
 
   def learn_width(self, width: float):
     if self.width is None:
