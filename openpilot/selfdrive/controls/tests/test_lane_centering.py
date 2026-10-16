@@ -56,10 +56,17 @@ class TestLaneCenter(OpenpilotTestCase):
     np.testing.assert_allclose(get_curvature(get_model(lane_center=0.3, plan=0.3)), 0.0, atol=1e-3 * CM)
 
   def test_plan_heading(self):
-    # a plan closing half the gap by the lookahead is left alone, one opening it by as much gets the full correction
+    # a plan closing half the gap by the lookahead is left alone, one opening it by as much is corrected for twice that
     plan_x = V_EGO * T_IDXS
-    np.testing.assert_allclose(get_curvature(get_model(lane_center=0.3, plan=0.15 * plan_x / LOOKAHEAD)), 0.0, atol=CM)
-    np.testing.assert_allclose(get_curvature(get_model(lane_center=0.3, plan=-0.15 * plan_x / LOOKAHEAD)), MAX_LAT_ACCEL / V_EGO**2, rtol=1e-3)
+    np.testing.assert_allclose(get_curvature(get_model(lane_center=0.2, plan=0.1 * plan_x / LOOKAHEAD)), 0.0, atol=CM)
+    np.testing.assert_allclose(get_curvature(get_model(lane_center=0.2, plan=-0.1 * plan_x / LOOKAHEAD)), 40 * CM, rtol=1e-3)
+
+  def test_plan_moving_over(self):
+    # a plan heading off center fades like one that is already there, before the lookahead shows it
+    plan_x = V_EGO * T_IDXS
+    np.testing.assert_allclose(get_curvature(get_model(plan=0.35 * plan_x / LOOKAHEAD)), get_curvature(get_model(lane_center=-0.7)), rtol=1e-3)
+    assert get_curvature(get_model(plan=0.45 * plan_x / LOOKAHEAD)) == 0.0
+    assert get_curvature(get_model(plan=-0.45 * plan_x / LOOKAHEAD)) == 0.0
 
   @parameterized.expand([(0.002,), (-0.002,)])
   def test_road_curvature_cancels(self, curvature):
