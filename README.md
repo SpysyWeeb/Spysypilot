@@ -67,6 +67,7 @@ BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream Accel
 - Custom comma 3X/Chestnut: `08584ed71ee6144cbe9af937e2bf7857595355e4`, preserving upstream enumeration ordering; the big-model and tinygrad pin were changed afterwards (next item).
 - Big model pin: Cinque v3 pickles (`big_driving_tinygrad.pkl` and both `big_driving_warp_*` pointers) and tinygrad `9d0446a4b` from `combo` at `907f3965fb92b1572f6d37cb6cf2834157b9de10` (upstream's state before #39037), plus upstream `a0d47bcd08d9c359ccc7bd73145ed90ade2255ab` (#39044) re-placed around daily's loader. Owner ruling 2026-10-18.
 - Big-model load retry: upstream `6939d172e85e3b91f16d90cc8de72e8f938cc196` (#39086), placed after daily's timeout latch with the drop-chestnut fallback kept unconditional.
+- Ignored-uploads offroad alert: upstream `35e78a9d9518855ec0dacec919e719624a28131f` (#39104), applied unchanged.
 - Acceleration ceiling: the 4.0 m/s² generic/Hyundai host and native Hyundai limit from combo's opendbc reference `97640dca1bb21174de16503ad53a18bbbb3efa8e`; no wholesale dependency replacement or unrelated safety-limit import.
 
 - Current curve-speed policy: `e976ab76aa4bd394ff2d5baeb0591623eb893f92`, composed with BLoTv3 arbitration; its unrelated `teleoprtc_repo` pin change is excluded.
