@@ -127,7 +127,7 @@ def j_cruise_step(v_ego):
 def settled_cruise_accel(v_cruise, v_ego, accel_coast=-0.3, comfort=True, e2e=False):
   target = 0.0
   for _ in range(200):
-    target = get_cruise_accel(e2e, v_cruise, v_ego, target, DT_MDL, accel_coast, True, comfort)
+    target = get_cruise_accel(e2e, v_cruise, v_ego, target, target, DT_MDL, accel_coast, True, comfort)
   return target
 
 
@@ -153,8 +153,19 @@ class TestAccelEnvelope:
 
   def test_jerk_schedule_bounds_the_first_step(self):
     v_ego = 75.0 * CV.MPH_TO_MS
-    first = get_cruise_accel(False, v_ego + 5.0 * CV.MPH_TO_MS, v_ego, 0.0, DT_MDL, -0.3, True)
+    first = get_cruise_accel(False, v_ego + 5.0 * CV.MPH_TO_MS, v_ego, 0.0, 0.0, DT_MDL, -0.3, True)
     assert math.isclose(first, np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS) * DT_MDL, rel_tol=1e-6, abs_tol=1e-9)
+
+  def test_cruise_falls_from_the_published_target_but_never_rises_from_it(self):
+    v_ego = 25.0
+    j = j_cruise_step(v_ego)
+    # another candidate holds the output below cruise's own value: a lowered set speed is felt from the output, not after a slew
+    assert math.isclose(get_cruise_accel(False, v_ego - 3.0, v_ego, 0.8, 0.0, DT_MDL, -0.3, True, True), 0.0 - j, rel_tol=1e-6, abs_tol=1e-9)
+    # a raised set speed still climbs from cruise's own value, however far below it the output sits
+    assert math.isclose(get_cruise_accel(False, v_ego + 5.0, v_ego, 0.2, -2.0, DT_MDL, -0.3, True, True), 0.2 + j, rel_tol=1e-6, abs_tol=1e-9)
+    # an output at or above cruise's value changes nothing
+    assert get_cruise_accel(False, v_ego - 3.0, v_ego, 0.8, 1.5, DT_MDL, -0.3, True, True) == \
+        get_cruise_accel(False, v_ego - 3.0, v_ego, 0.8, 0.8, DT_MDL, -0.3, True, True)
 
 
 class TestCruiseComfort:
@@ -206,7 +217,7 @@ class TestCruiseComfort:
     for comfort in (False, True):
       target = 0.0
       for _ in range(200):
-        target = get_cruise_accel(False, v_cruise, v_ego, target, DT_MDL, -0.3, False, comfort)
+        target = get_cruise_accel(False, v_cruise, v_ego, target, target, DT_MDL, -0.3, False, comfort)
       assert math.isclose(target, np.interp(v_ego, [2.5, 5.0], [get_max_accel(v_ego), -0.3]), rel_tol=1e-6, abs_tol=1e-9)
 
   def test_comfort_blends_in_between_8_and_15_mps(self):
@@ -215,6 +226,32 @@ class TestCruiseComfort:
     legacy = settled_cruise_accel(v_cruise, v_ego, comfort=False)
     full = np.clip(get_cruise_comfort_accel(v_cruise, v_ego, -0.3), A_CRUISE_MIN, get_max_accel(v_ego))
     assert math.isclose(settled_cruise_accel(v_cruise, v_ego), (legacy + full) / 2.0, rel_tol=1e-6, abs_tol=1e-9)
+
+
+class TestSetSpeedDrop:
+  # the driver lowers the set speed while another candidate owns the output: cruise's stale value used to slew down through it first
+  def drop(self, experimental, lead):
+    car = IdealCar(25.0)
+    x_lead = 45.0
+    for _ in range(round(40.0 / DT_MDL)):
+      x_lead += 25.0 * DT_MDL
+      car.step(v_cruise=31.0, experimental=experimental, e2e_accel=0.0, lead=(x_lead - car.x, 25.0, 0.0) if lead else None)
+    assert car.planner.plan_winner == ('mpc' if lead else 'e2e')
+    before, outputs, steps = car.a, [], []
+    for _ in range(round(2.0 / DT_MDL)):
+      x_lead += 25.0 * DT_MDL
+      # the jerk schedule is read at the speed the frame is planned at, and it grows as the car slows: each frame's own step
+      # is the exact bound, where one speed's step for the whole window is too loose above it and too tight below it
+      steps.append(j_cruise_step(car.v))
+      outputs.append(car.step(v_cruise=22.0, experimental=experimental, e2e_accel=0.0, lead=(x_lead - car.x, 25.0, 0.0) if lead else None))
+    return before, np.array(outputs), np.array(steps)
+
+  @pytest.mark.parametrize('experimental, lead', [(False, True), (True, False)])
+  def test_the_output_follows_the_lowered_set_speed_within_a_few_frames(self, experimental, lead):
+    before, outputs, steps = self.drop(experimental, lead)
+    assert outputs[round(0.3 / DT_MDL)] < before - 0.1
+    assert np.all(np.diff(np.concatenate(([before], outputs))) >= -steps - 1e-6)
+    assert outputs[-1] < -0.2
 
 
 class TestPlannerCruise:

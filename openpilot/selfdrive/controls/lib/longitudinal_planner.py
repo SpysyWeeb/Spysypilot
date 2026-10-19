@@ -76,7 +76,7 @@ def ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
   # comfort shaping only for ordinary cruise with a healthy radar; lead following and e2e keep their own targets
   return not (experimental_mode or force_decel or not radar_valid)
 
-def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow_throttle, comfort=False):
+def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, a_target_prev, dt, accel_coast, allow_throttle, comfort=False):
   # the envelope alone bounds cruise acceleration; stock's shared lateral budget held the car back out of curves (owner ruling)
   max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
 
@@ -91,7 +91,10 @@ def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, dt, accel_coast, allow
     comfort_accel = np.clip(get_cruise_comfort_accel(v_cruise, v_ego, accel_coast), A_CRUISE_MIN, max_accel)
     target_accel = np.interp(v_ego, CRUISE_COMFORT_BP, [target_accel, comfort_accel])
   j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
-  target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
+  # cruise falls from the lower of its own value and the published target, so a lowered set speed is felt from what another
+  # candidate set instead of after a slew down through it (D45); it rises on its own value only, so a deeper output never
+  # holds back its rise and the release behind a lead pulling away is untouched (D33)
+  target_accel = float(np.clip(target_accel, min(a_cruise_prev, a_target_prev) - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
   return target_accel
 
@@ -254,6 +257,9 @@ class LongitudinalPlanner:
     stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
     force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, not reset_state, model_valid, self.output_a_target)
     stop_x = force_stop.stop_x if force_stop.stop_x is not None and math.isfinite(force_stop.stop_x) else None
+    # Force Stops' cap (0 at a hold, the shaping speed before a commitment) is no set speed: it rides cruise's own slew until
+    # design-B step 4 deletes it (F045), so only a set speed below the cap is felt from the published target (D45)
+    cap_binds = force_stop.v_cruise_cap < v_cruise
     v_cruise = min(v_cruise, force_stop.v_cruise_cap)
 
     personality = sm['selfdriveState'].personality
@@ -359,7 +365,9 @@ class LongitudinalPlanner:
         output_a_target_e2e = max(output_a_target_e2e, min(a_launch, a_launch_max))
 
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
-    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, self.dt, accel_coast, self.allow_throttle, comfort)
+    a_fall_from = self.a_cruise if cap_binds else self.output_a_target
+    self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.a_cruise, a_fall_from, self.dt, accel_coast, self.allow_throttle,
+                                     comfort)
     curve = CurveResult()
     if not model_valid:
       # Drop stale path authority, including its median/jerk anchor. Authority calibration and gas grace survive reset.
@@ -401,7 +409,7 @@ class LongitudinalPlanner:
     # it slewed meanwhile
     handed_over = self.plan_winner not in present or (self.plan_winner == 'mpc' and self.mpc.lead_handover)
     if handed_over:
-      self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.output_a_target, self.dt,
+      self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, self.output_a_target, self.output_a_target, self.dt,
                                      accel_coast, self.allow_throttle, comfort)
     # the set speed asks for a stop only at zero (a hold, forceDecel), not a cruise candidate carrying a hand-over below zero
     cruise_should_stop = should_stop(v_ego, v_cruise - v_ego)

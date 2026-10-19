@@ -46,7 +46,7 @@ def corridor_ride(edge, v0, h=1e-4):
 
 def cruise_carry(a_prev, v_ego):
   # the planner's cruise candidate carrying a hand-over up from a_prev toward a set speed far above
-  return get_cruise_accel(True, v_ego + 10.0, v_ego, a_prev, DT_MDL, 0.0, True)
+  return get_cruise_accel(True, v_ego + 10.0, v_ego, a_prev, a_prev, DT_MDL, 0.0, True)
 
 
 def stopping_needs(v_ego, distance, speed=0.0, acceleration=0.0):
