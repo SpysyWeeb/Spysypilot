@@ -1,6 +1,6 @@
 # Spysypilot daily
 
-A minimal-diff personal branch on the official Mountain Dew master baseline. Experimental controller changes remain subject to owner/device/field validation; local tests are not a driving-safety qualification.
+A minimal-diff personal branch on the official master baseline (code as of the Mountain Dew release), with the Chestnut big model pinned to Cinque v3 (see the Chestnut section). Experimental controller changes remain subject to owner/device/field validation; local tests are not a driving-safety qualification.
 
 ## Selected features
 
@@ -54,16 +54,17 @@ This shapes the model candidate only. BLoTv3's committed stops, lead/MPC braking
 - Add a permanent **Big Model Loading** alert alongside the existing no-entry alert, and warm the standby small model before realtime operation when the big model is selected.
 - Check for a materialized big-model pickle rather than requiring the unused big-model warp pickles; this rejects an unfetched LFS pointer but is not a checksum or inference-validation test.
 
-The official Mountain Dew model artifacts and current tinygrad pin are unchanged. Host tests and CPU stand-ins cannot establish QCOM/USB+AMD compatibility, inference timing or dock-disconnect recovery. Real comma 3X/Chestnut startup, frame budget and offroad fallback checks remain unperformed; no firmware was flashed or device accessed for this import.
+**Big model pinned to Cinque v3 (owner's call, 2026-10-18: it drove better than Mountain Dew).** `big_driving_tinygrad.pkl` is upstream's Cinque v3 pickle (#38932, checkpoint `f78ed37d`, LFS sha256 `4937fc6f…`), the same one `combo` runs. A tinygrad pickle only loads under the tinygrad it was pickled with, so the `tinygrad_repo` pin stays at `9d0446a4b` and `input_view` keeps that pin's `Buffer.view(size, dtype, offset)` call; daily's previous pin `d3f09c9bb` (#39054) raises `TypeError` on this pickle (verified on a CPU unpickle). Upstream's drop-chestnut-on-fallback fix (#39044), written for pin `9d0446a4b` and reverted only as part of the bump, returns with it. Upstream model releases after Cinque v3 (ResAction #39037, Mountain Dew #39045/#39047, MD v3 #39087) and the tinygrad bumps that re-pickled them (#39054, #39085) are deliberately not taken: an upstream import must leave the tinygrad pin and the three `big_driving_*_tinygrad.pkl` pointers alone unless the owner picks a new model. Host tests and CPU stand-ins cannot establish QCOM/USB+AMD compatibility, inference timing or dock-disconnect recovery. Real comma 3X/Chestnut startup, frame budget and offroad fallback checks remain unperformed; no firmware was flashed or device accessed for this import.
 
 ## Deliberately excluded
 
-BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream AccelBoost and the Mountain Dew model/runtime artifacts are retained. The opendbc pin advances for the selected 4.0 m/s² ceiling; existing SOL and torque safety behavior is retained, and unrelated dependency pins are unchanged. The upstream radar publication retains the Smooth Stops unconfirmed low-speed gate; lane-change filtering is a separate planner-local view. MPC collision-warning prediction follows the accepted BLoTv3 trajectory for non-released leads. The accepted upstream type-check diagnostics are not fixed by these imports. All additions remain local pending separate device and owner field acceptance.
+BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream AccelBoost is retained; the Mountain Dew big model and the tinygrad bump that shipped with it are not (see the Chestnut section). The opendbc pin advances for the selected 4.0 m/s² ceiling; existing SOL and torque safety behavior is retained, and unrelated dependency pins are unchanged. The upstream radar publication retains the Smooth Stops unconfirmed low-speed gate; lane-change filtering is a separate planner-local view. MPC collision-warning prediction follows the accepted BLoTv3 trajectory for non-released leads. The accepted upstream type-check diagnostics are not fixed by these imports. All additions remain local pending separate device and owner field acceptance.
 
 ## Import provenance
 
 - Better Green Lights: `cec0e0405a4dade816659966de2dc1df4f991ef0`, with `combo` at `907f3965fb92b1572f6d37cb6cf2834157b9de10` as the composed reset/landing reference, adapted to daily's current planner owners and input-health gates.
-- Custom comma 3X/Chestnut: `08584ed71ee6144cbe9af937e2bf7857595355e4`, preserving upstream enumeration ordering and daily's current Mountain Dew runtime/artifacts.
+- Custom comma 3X/Chestnut: `08584ed71ee6144cbe9af937e2bf7857595355e4`, preserving upstream enumeration ordering; the big-model and tinygrad pin were changed afterwards (next item).
+- Big model pin: Cinque v3 pickles (`big_driving_tinygrad.pkl` and both `big_driving_warp_*` pointers) and tinygrad `9d0446a4b` from `combo` at `907f3965fb92b1572f6d37cb6cf2834157b9de10` (upstream's state before #39037), plus upstream `a0d47bcd08d9c359ccc7bd73145ed90ade2255ab` (#39044) re-placed around daily's loader. Owner ruling 2026-10-18.
 - Acceleration ceiling: the 4.0 m/s² generic/Hyundai host and native Hyundai limit from combo's opendbc reference `97640dca1bb21174de16503ad53a18bbbb3efa8e`; no wholesale dependency replacement or unrelated safety-limit import.
 
 - Current curve-speed policy: `e976ab76aa4bd394ff2d5baeb0591623eb893f92`, composed with BLoTv3 arbitration; its unrelated `teleoprtc_repo` pin change is excluded.
