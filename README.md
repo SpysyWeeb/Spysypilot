@@ -90,6 +90,7 @@ BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream Accel
 - Ignored-uploads offroad alert: upstream `35e78a9d9518855ec0dacec919e719624a28131f` (#39104), applied unchanged.
 - Initial Max Speed setting: upstream `24c26487f42b1d92cf96e3e23d686208e35e74e3` (#39081), applied unchanged; daily's cruise-button tests now pass an initial speed in km/h.
 - Following Distance label: upstream `41acce17fa226cb40af8f3e17f64259784731b01` (#39100), applied unchanged; translations were not regenerated, so the renamed label shows in English in other languages until upstream's catalog update is taken.
+- Panda debug log: upstream `6f68efea69f31019aa2a4b55f82d3f5c9fa8e6c1` (#39152), applied unchanged; daily's pinned panda firmware already serves the debug log on request 0xb6 and has no 0xe0 handler, so pandad's debug-log read works again. No firmware change; not checked on the device.
 - Acceleration ceiling: the 4.0 m/s² generic/Hyundai host and native Hyundai limit from combo's opendbc reference `97640dca1bb21174de16503ad53a18bbbb3efa8e`; no wholesale dependency replacement or unrelated safety-limit import.
 
 - Current curve-speed policy: `e976ab76aa4bd394ff2d5baeb0591623eb893f92`, composed with BLoTv3 arbitration; its unrelated `teleoprtc_repo` pin change is excluded.
