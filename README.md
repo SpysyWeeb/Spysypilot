@@ -46,6 +46,8 @@ Better Green Lights uses the model's planned path and motion, **not an independe
 
 This shapes the model candidate only. BLoTv3's committed stops, lead/MPC braking, curve restriction, cruise/force-deceleration target and downstream stopping/vehicle safety remain separate constraints. It cannot declare a light green or the road safe. A false open-path prediction can invite an early launch; driver supervision and immediate braking remain necessary. Malformed/stale model input cannot grant or retain this added launch authority.
 
+The import's monotone-path health check rejected the model's normal path jitter at rest (points stepping back by millimetres to centimetres), so a held green never armed the launch assist. Backward steps are now tolerated up to 5 m/s over the points' time spacing; logged paths below the 2 m/s disarm speed stay under 2.5 m/s, and a reversed path is still rejected.
+
 ## Custom comma 3X/Chestnut integration (in progress; not device validated)
 
 - Warp the camera frames on the device GPU, transferring the smaller warped input to the big-model device instead of both raw camera frames. The ordinary same-device path remains supported.

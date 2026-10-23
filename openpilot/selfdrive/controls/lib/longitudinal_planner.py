@@ -51,6 +51,7 @@ LAUNCH_MAX_ACCEL = 1.5
 LAUNCH_OPEN_LENGTH = 20.0
 LAUNCH_OPEN_CONFIRM = 0.7
 LAUNCH_CLOSE_LENGTH = 10.0
+LAUNCH_PATH_BACKWARD_SPEED = 5.0  # m/s, over the points' spacing; the path jitters back at rest, a reversal is faster
 
 def get_max_accel_request(v_ego):
   remaining = 1.0 - np.clip(v_ego / A_CRUISE_MAX_SPEED, 0.0, 1.0)
@@ -307,7 +308,7 @@ class LongitudinalPlanner:
                       math.isfinite(v_ego) and math.isfinite(output_a_target_e2e) and
                       all(len(values) == ModelConstants.IDX_N and np.isfinite(values).all()
                           for values in (xs, md.position.y, md.position.z, model_vel, model_acc)) and
-                      (np.diff(xs) >= 0.0).all())
+                      (np.diff(xs) >= -LAUNCH_PATH_BACKWARD_SPEED * np.diff(ModelConstants.T_IDXS)).all())
     if not launch_enabled:
       # Reset here, not only above: no evidence may accumulate or re-arm later in an inactive frame.
       self.anticipating = False

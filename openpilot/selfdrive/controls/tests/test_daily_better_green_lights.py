@@ -166,6 +166,45 @@ def test_malformed_model_cannot_retain_anticipation_or_apply_launch_assist(field
   assert plan.aTarget <= 0.05 + 1e-6
 
 
+def step_back(sm, steps):
+  # move point i + 1 to a given distance behind point i
+  xs = list(sm['modelV2'].position.x)
+  for i, back in steps:
+    xs[i + 1] = xs[i] - back
+  sm['modelV2'].position.x = xs
+
+
+def test_path_jitter_at_rest_still_arms_and_applies_the_launch_assist():
+  cp = car_params()
+  planner, sm, control = LongitudinalPlanner(cp), messages(), LongControl(cp)
+  # at rest the model's stub steps back by a few cm and its opened path by a few mm
+  step_back(sm, [(13, 0.03), (21, 0.08)])
+  plan = step(planner, sm, control, frames=5)
+  assert plan.shouldStop and planner.stop_landing.landing
+  assert planner.launch_armed
+  set_model(sm, length=25.0, accel=0.05, moving=True)
+  step_back(sm, [(3, 0.0035), (6, 0.002)])
+  plan = step(planner, sm, control, frames=8)
+  assert planner.anticipating and not plan.shouldStop
+  plan = step(planner, sm, control, frames=30)
+  expected = source_launch_floor(sm['modelV2'], 0.0, cp.longitudinalActuatorDelay + planner.dt)
+  assert expected > 0.7
+  assert plan.aTarget == pytest.approx(expected, abs=1e-6)
+  assert control.last_output_accel > 0.7
+
+
+@pytest.mark.parametrize('index', [0, 31])
+@pytest.mark.parametrize('speed,accepted', [(4.9, True), (5.1, False)])
+def test_backward_path_step_is_bounded_as_a_speed_over_the_point_spacing(index, speed, accepted):
+  planner, sm, control = held_model_stop()
+  set_model(sm, length=30.0, accel=0.05, moving=True)
+  times = ModelConstants.T_IDXS
+  step_back(sm, [(index, speed * (times[index + 1] - times[index]))])
+  step(planner, sm, control, frames=10)
+  assert planner.anticipating == accepted
+  assert planner.launch_armed == accepted
+
+
 @pytest.mark.parametrize('speed', [0.0, 0.2])
 def test_path_recollapse_cancels_launch_and_restores_the_hold_even_with_hover_accel(speed):
   planner, sm, control = held_model_stop()
