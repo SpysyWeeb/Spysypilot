@@ -41,7 +41,7 @@
 /openpilot/selfdrive/controls/lib/stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/lib/stop_landing.py  # BLoTv3
 /openpilot/selfdrive/controls/plannerd.py  # curve-speed-limit,lane-changes
-/openpilot/selfdrive/controls/radard.py  # smooth-stops; kept: smooth-stops + combo-level
+/openpilot/selfdrive/controls/radard.py  # BLoTv3; kept: BLoTv3 + combo-level
 /openpilot/selfdrive/controls/tests/test_aol_steering_limit_feedback.py  # SOL
 /openpilot/selfdrive/controls/tests/test_conditional_experimental_mode.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_controlsd.py  # combo-only fork_only_file (no feature-branch owner)
@@ -57,7 +57,7 @@
 /openpilot/selfdrive/controls/tests/test_model_curve_speed.py  # curve-speed-limit
 /openpilot/selfdrive/controls/tests/test_necessity_supervisor.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_radard_low_speed.py  # combo-only fork_only_file (no feature-branch owner)
-/openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py  # smooth-stops
+/openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_stop_helpers.py  # BLoTv3
 /openpilot/selfdrive/controls/tests/test_stop_landing.py  # BLoTv3
 /openpilot/selfdrive/modeld/helpers.py  # c3x-chestnut-v2

@@ -23,7 +23,6 @@ jobs:
           - better-green-lights
           - better-boot-screen
           - SOL
-          - smooth-stops
           - auto-update
           - custom-main-menu
           - side-buttons
