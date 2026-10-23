@@ -5,7 +5,7 @@ from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE
                                                            STOP_TRAJECTORY_CONFIDENCE, StopObservation, model_complete_and_finite,
                                                            observe_model_stop)
 
-# Requests Experimental mode for a confirmed, lead-free model stop so the e2e candidate can plan the
+# Requests Experimental mode for a confirmed model stop that no lead owns so the e2e candidate can plan the
 # approach; it never chooses a speed, an acceleration, a brake command or a stop point.
 STOP_FILTER_TIME_CONSTANT_S = 0.30
 STOP_ENTRY_FILTER_THRESHOLD = 0.55
@@ -85,9 +85,16 @@ class ConditionalExperimentalMode:
     # to judge: it carries the empty observation, exactly as an invalid model does
     obs = obs if radar_valid else StopObservation()
 
-    # a relevant lead vetoes a new handoff and starts a grace; during it one strict frame may mint a revocable release
-    # if both raw leads are gone and every model lead hypothesis is outside the stop corridor
-    self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S if obs.relevant_lead else max(self._lead_veto_remaining - self.model_dt, 0.0)
+    # a relevant lead vetoes a new handoff and starts a grace; on a near stop (strict, direct) at speed, a tracked lead that does
+    # not own it ends the veto at once. During the grace one strict frame may mint a revocable release if both raw leads are
+    # gone and every model lead hypothesis is outside the stop corridor
+    near_stop = obs.should_stop or obs.strict_stop
+    if obs.relevant_lead and (obs.lead_owns_stop or not near_stop or car_state.vEgo < GO_ROLL_SPEED):
+      self._lead_veto_remaining = LEAD_RELEASE_HYSTERESIS_S
+    elif obs.relevant_lead:
+      self._lead_veto_remaining = 0.0
+    else:
+      self._lead_veto_remaining = max(self._lead_veto_remaining - self.model_dt, 0.0)
     release_safe = (self._lead_veto_remaining > 0.0 and not obs.lead_present and not obs.committed_turn
                     and obs.path_end is not None and obs.path_end > 0.0 and obs.corridor_clear)
     if not release_safe:

@@ -51,11 +51,15 @@ def lead_present(radar_state):
   return radar_state.leadOne.present or radar_state.leadTwo.present
 
 
-def relevant_lead(radar_state, v_ego, path_end=None):
+def relevant_leads(radar_state, v_ego, path_end=None):
   limit = max(LEAD_RELEVANCE_MIN_DISTANCE, v_ego * LEAD_RELEVANCE_TIME)
   if path_end is not None:
     limit = max(limit, path_end + LEAD_PATH_MARGIN)
-  return any(lead.present and 0.0 <= lead.dRel <= limit for lead in (radar_state.leadOne, radar_state.leadTwo))
+  return tuple(lead for lead in (radar_state.leadOne, radar_state.leadTwo) if lead.present and 0.0 <= lead.dRel <= limit)
+
+
+def relevant_lead(radar_state, v_ego, path_end=None):
+  return len(relevant_leads(radar_state, v_ego, path_end)) > 0
 
 
 def anchor_model_lead(model_lead, radar_lead):

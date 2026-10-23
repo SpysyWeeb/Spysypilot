@@ -2,7 +2,9 @@ from dataclasses import dataclass
 import math
 
 from openpilot.cereal import log
-from openpilot.selfdrive.controls.lib.longitudinal_lead import LEAD_PATH_MARGIN, lead_present, relevant_lead
+from openpilot.selfdrive.controls.lib.longitudinal_lead import (LEAD_PATH_MARGIN, MODEL_LEAD_PROB_MIN, lead_present, relevant_lead,
+                                                                relevant_leads)
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.constants import STOP_DISTANCE, get_stopped_equivalence_factor
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 # The deployed model publishes no traffic-light or stop-sign class. These tiers describe a generic,
@@ -39,6 +41,7 @@ STOP_RELEASE_TERMINAL_SPEED_MIN = 3.0
 SLOWING_MARGIN = 1.0       # m/s, the plan's low point must sit at least this far below the car's speed to read as slowing
 STOP_COMMIT_MAX_DISTANCE = 100.0
 LEAD_STOP_PATH_HALF_WIDTH = 1.5
+LEAD_CRAWL_SPEED = 1.0     # m/s, a relevant lead slower than this is stopped or creeping: a queue, which owns the stop
 MODEL_INVALID_RELEASE_S = 0.5
 
 COMMITTED_TURN_MAX_SPEED = 8.0
@@ -63,6 +66,7 @@ class StopObservation:
   corridor_clear: bool = False
   lane_change: bool = False     # the model is changing lanes: its endpoint is about to belong to another lane
   slowing: bool = False         # the plan's low point sheds most of the car's speed, wherever the plan ends
+  lead_owns_stop: bool = False  # a relevant lead is a queue or ends the approach by the model's stop point (lead_owns_stop below)
 
 
 def _finite(values):
@@ -118,6 +122,29 @@ def leads_clear_of_stop_path(model, path_end):
   return True
 
 
+def lead_owns_stop(model, radar_state, v_ego, path_end):
+  # a relevant radar lead owns the stop if it is at a crawl or would rest, by the long MPC's geometry, by the stop point; a likely
+  # model lead does if its forecast ends there. Fails closed on any reading it cannot judge
+  if path_end is None or not math.isfinite(path_end) or path_end <= 0.0:
+    return True
+  if not all(math.isfinite(lead.dRel) and math.isfinite(lead.vLead) for lead in (radar_state.leadOne, radar_state.leadTwo) if lead.present):
+    return True
+  for lead in relevant_leads(radar_state, v_ego, path_end):
+    if lead.vLead < LEAD_CRAWL_SPEED or lead.dRel + get_stopped_equivalence_factor(lead.vLead) - STOP_DISTANCE <= path_end:
+      return True
+  if len(model.leadsV3) != ModelConstants.LEAD_MHP_SELECTION:
+    return True
+  n_lead = len(ModelConstants.LEAD_T_IDXS)
+  for lead in model.leadsV3:
+    if not math.isfinite(lead.prob):
+      return True
+    if lead.prob < MODEL_LEAD_PROB_MIN:
+      continue
+    if len(lead.x) != n_lead or not _finite(lead.x) or lead.x[n_lead - 1] <= path_end + LEAD_PATH_MARGIN:
+      return True
+  return False
+
+
 def observe_model_stop(model, car_state, radar_state):
   if not model_complete_and_finite(model) or not math.isfinite(car_state.vEgo):
     return StopObservation(lead_present=lead_present(radar_state))
@@ -159,11 +186,12 @@ def observe_model_stop(model, car_state, radar_state):
   steering_angle = abs(car_state.steeringAngleDeg) if math.isfinite(car_state.steeringAngleDeg) else 0.0
   committed_turn = blinker and v_ego <= COMMITTED_TURN_MAX_SPEED and (steering_angle >= COMMITTED_TURN_MIN_STEERING_DEG
                                                                         or abs(action.desiredCurvature) >= COMMITTED_TURN_MIN_CURVATURE)
+  relevant = relevant_lead(radar_state, v_ego, path_end)
   return StopObservation(confidence, path_end, bool(action.shouldStop), strict_stop, early_stop, True,
                          desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX, terminal_speed >= STOP_TERMINAL_SPEED_MAX,
-                         relevant_lead(radar_state, v_ego, path_end),
-                         lead_present(radar_state), committed_turn, stop_release_open(model),
-                         path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model), slowing)
+                         relevant, lead_present(radar_state), committed_turn, stop_release_open(model),
+                         path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model), slowing,
+                         relevant and lead_owns_stop(model, radar_state, v_ego, path_end))
 
 
 def lane_changing(model):
