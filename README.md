@@ -43,6 +43,14 @@ deceleration: the release lift and the anti-creep press of 08-30/31 are gone, an
 measured deceleration enters — presses a car that is not slowing (never at standstill). Whatever the landing held when it ends is
 handed back at the cruise jerk, and while its kiss lands a rolling car the plan's stop bit waits for the standstill speed.
 
+- **radard low-speed lead gates.** The unconfirmed low-speed lead override (a radar-only track below the stationary speed
+  threshold) needs a track age of 20 cycles (~1 s) and a distance past `max(0.75 m, 0.6 s × v_ego)`. On route 0x2a,
+  a ground return the car drove over became the lead at 1.1 m and put −2.6 m/s² into a landing; the age gate keeps
+  clutter and crossing traffic out, and a track's age restarts whenever the radar drops it for a cycle. A closer qualifying
+  track replaces the lead whether or not the current lead is vision confirmed. Status: awaiting owner field validation —
+  separate from BLoTv3's own status above. Watch the last metres of a stop behind a stopped car or at walking pace for a close
+  radar return becoming the lead. Tests: `openpilot/selfdrive/controls/tests/test_radard_low_speed_lead.py`.
+
 ## How it works (planned)
 
 - **selfdrived** keeps owning the effective Chill/Experimental mode, exactly where stock publishes
@@ -57,7 +65,7 @@ handed back at the cruise jerk, and while its kiss lands a rolling car the plan'
   cliffs. `longitudinal_lead.py` is the one definition of a usable lead and anchors the model
   lead once per frame. `long_mpc.py` gets one `update()` call that resolves obstacles, sets the
   cost weights once, solves, and scores FCW against the trajectory it actually solved.
-- `radard.py` and `longcontrol.py` are not edited; `controlsd.py` carries exactly one line, D31's
+- `longcontrol.py` is not edited and `radard.py` carries only the low-speed lead gates above; `controlsd.py` carries exactly one line, D31's
   reordering (`actuators.longControlState` is read after `LoC.update()` computes it). Stock opendbc limits apply on
   this branch (2.0 m/s²); `combo`'s opendbc/panda lineage supplies the 4.0 m/s² envelope.
 - Design, owner decisions, module contracts, the hold state machine rules and the acceptance
@@ -66,6 +74,8 @@ handed back at the cruise jerk, and while its kiss lands a rolling car the plan'
   (3) stop layer; (4) staged integration into `combo`.
 
 ## What changed
+
+**2026-10-22 — smooth-stops folded in.** The `smooth-stops` branch held only radard's low-speed lead gates; they moved here (see "radard low-speed lead gates" above) and the branch is retired. Its last tip, `7470c97ad`, is tagged `smooth-stops-final`. Its LongControl half had been retired on 2026-09-26 (D37), so `longcontrol.py` is upstream's. The gates are awaiting owner field validation.
 
 **2026-09-25 — audit step 1.** A braking audit (2026-09-24) found the stops' instability in the plan, not in the car: a lead-free red light is braked by several owners in turn, and every hand-over between them is a step or a reversal of the request. The owner approved all of its findings. Step 1 is the set of independent root fixes, each with its own tests; steps 2–5, one law owning the stop, wait for his drive. Nothing here is field-tested: every number below is a replay, a plant run or a unit test.
 
