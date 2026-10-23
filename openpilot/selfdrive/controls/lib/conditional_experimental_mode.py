@@ -2,7 +2,8 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import lead_present
 from openpilot.selfdrive.controls.lib.stop_helpers import (MODEL_INVALID_RELEASE_S, STOP_COMMIT_MAX_DISTANCE, STOP_SAMPLE_MIN_CONFIDENCE,
-                                                           StopObservation, model_complete_and_finite, observe_model_stop)
+                                                           STOP_TRAJECTORY_CONFIDENCE, StopObservation, model_complete_and_finite,
+                                                           observe_model_stop)
 
 # Requests Experimental mode for a confirmed, lead-free model stop so the e2e candidate can plan the
 # approach; it never chooses a speed, an acceleration, a brake command or a stop point.
@@ -22,6 +23,9 @@ RESUME_RELEASE_SPEED = 0.8
 POST_STOP_SUPPRESS_S = 2.0
 DRIVER_OVERRIDE_SUPPRESS_S = 2.0
 LEAD_RELEASE_HYSTERESIS_S = 3.0
+GO_ROLL_SPEED = 1.0  # m/s, below this the open road alone is a go (a green at rest or a crawl); above it the model must launch
+GO_ACCEL = 0.5       # m/s^2
+GO_CONFIRM_S = 0.5   # s, longer than the model's brief open-road flashes at rest
 
 
 class ConditionalExperimentalMode:
@@ -33,6 +37,7 @@ class ConditionalExperimentalMode:
 
   def reset(self):
     self._open_elapsed = 0.0
+    self._go_elapsed = 0.0
     self.experimental_mode = False
     self.intent_filter.x = 0.0
     self._entry_elapsed = 0.0
@@ -45,12 +50,14 @@ class ConditionalExperimentalMode:
     self._lead_veto_remaining = 0.0
     self._lead_release_active = False
     self._post_stop_remaining = 0.0
+    self._exit_revocable = False
     self._override_remaining = 0.0
     self._model_complete = True
 
   def _clear_evidence(self):
     self.intent_filter.x = 0.0
     self._open_elapsed = 0.0
+    self._go_elapsed = 0.0
     self._entry_elapsed = 0.0
     self._clear_elapsed = 0.0
     self._intent_hold_remaining = 0.0
@@ -62,7 +69,12 @@ class ConditionalExperimentalMode:
     self._standstill_elapsed = 0.0
     self._standstill_seen = False
     self._post_stop_remaining = max(self._post_stop_remaining, suppress_for)
+    self._exit_revocable = False
     self._clear_evidence()
+
+  @property
+  def _entry_suppressed(self):
+    return self._post_stop_remaining > 0.0 and not self._exit_revocable
 
   def _update_model_evidence(self, model, car_state, radar_state, model_valid, radar_valid):
     obs = observe_model_stop(model, car_state, radar_state) if model_valid else StopObservation()
@@ -87,6 +99,10 @@ class ConditionalExperimentalMode:
     entry_veto = (self._lead_veto_remaining > 0.0 and not self._lead_release_active) or obs.committed_turn
 
     confidence = obs.confidence if self.experimental_mode or not entry_veto else 0.0
+    if self.experimental_mode and obs.slowing:
+      # a plan still shedding most of the speed has not reached the stop, even when it relaunches before its end:
+      # trajectory evidence, so neither the hold nor the clear hysteresis runs out and the open-road count cannot start
+      confidence = max(confidence, STOP_TRAJECTORY_CONFIDENCE)
     raw_stop = confidence >= STOP_SAMPLE_MIN_CONFIDENCE
     if raw_stop and (not self.experimental_mode or confidence >= STOP_HOLD_MIN_CONFIDENCE):
       # entry evidence arms the hold; once active, a lone borderline hint may not keep the search alive
@@ -95,6 +111,10 @@ class ConditionalExperimentalMode:
     self._open_elapsed = self._open_elapsed + self.model_dt if obs.release_open and not raw_stop else 0.0
     if self._open_elapsed + 1e-9 >= CLEAR_CANCEL_S:
       self._intent_hold_remaining = 0.0
+    # a go frame: the open road and the plan no longer slowing, with the car at a crawl or the model asking for real acceleration
+    go = (self.experimental_mode and obs.release_open and not obs.slowing
+          and (car_state.vEgo < GO_ROLL_SPEED or model.action.desiredAcceleration >= GO_ACCEL))
+    self._go_elapsed = self._go_elapsed + self.model_dt if go else 0.0
     # a filter-only hint shortens entry, but cannot sustain an active latch after qualifying evidence disappears
     filtered = self.intent_filter.update(confidence if not self.experimental_mode or raw_stop else 0.0)
 
@@ -103,7 +123,7 @@ class ConditionalExperimentalMode:
       self._clear_elapsed = self._clear_elapsed + self.model_dt if not raw_stop and filtered <= STOP_RELEASE_FILTER_THRESHOLD else 0.0
     else:
       self._clear_elapsed = 0.0
-      entry_ready = raw_stop and filtered >= STOP_ENTRY_FILTER_THRESHOLD and self._post_stop_remaining <= 0.0
+      entry_ready = raw_stop and filtered >= STOP_ENTRY_FILTER_THRESHOLD and not self._entry_suppressed
       self._entry_elapsed = self._entry_elapsed + self.model_dt if entry_ready else 0.0
 
   def update(self, model, car_state, radar_state, *, controls_enabled, model_updated, model_valid, radar_valid=True):
@@ -118,6 +138,8 @@ class ConditionalExperimentalMode:
       self._override_remaining = DRIVER_OVERRIDE_SUPPRESS_S
       self._deactivate(0.0)
       return False
+    if car_state.vEgo >= RESUME_RELEASE_SPEED:
+      self._exit_revocable = False
     if self._override_remaining > 0.0:
       self._override_remaining = max(self._override_remaining - self.control_dt, 0.0)
       self._clear_evidence()
@@ -143,13 +165,17 @@ class ConditionalExperimentalMode:
         self._standstill_elapsed += self.control_dt
       resumed_after_stop = self._standstill_seen and car_state.vEgo >= RESUME_RELEASE_SPEED
       standstill_latch_satisfied = not self._standstill_seen or self._standstill_elapsed >= STANDSTILL_MIN_LATCH_S
-      stable_clear = (self._active_elapsed >= MODE_MIN_LATCH_S and self._intent_hold_remaining <= 0.0
-                      and standstill_latch_satisfied and self._clear_elapsed >= STOP_RELEASE_HYSTERESIS_S)
-      if resumed_after_stop or stable_clear:
+      latch_satisfied = self._active_elapsed >= MODE_MIN_LATCH_S and standstill_latch_satisfied
+      stable_clear = latch_satisfied and self._intent_hold_remaining <= 0.0 and self._clear_elapsed >= STOP_RELEASE_HYSTERESIS_S
+      go_confirmed = latch_satisfied and self._go_elapsed + 1e-9 >= GO_CONFIRM_S
+      if resumed_after_stop or stable_clear or go_confirmed:
         self._deactivate(POST_STOP_SUPPRESS_S)
+        # an exit at rest hands the stop to Chill on the model's word alone: until the car moves off, the model calling
+        # the stop again takes it back, since nothing else can form a hold in Chill
+        self._exit_revocable = car_state.vEgo < GO_ROLL_SPEED
       elif self._invalid_elapsed >= MODEL_INVALID_RELEASE_S:
         self._deactivate(0.0)
-    elif (self._post_stop_remaining <= 0.0 and self._invalid_elapsed < MODEL_INVALID_RELEASE_S
+    elif (not self._entry_suppressed and self._invalid_elapsed < MODEL_INVALID_RELEASE_S
           and self._entry_elapsed >= STOP_ENTRY_DEBOUNCE_S):
       self.experimental_mode = True
       self._active_elapsed = 0.0

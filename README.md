@@ -23,6 +23,12 @@ window, and model/radar freshness gates for lead forecasts. They do not add a re
 braking authority. Conditional model stops are not a traffic-light detector. See the daily-integration section of
 the design document; historical source-branch replay notes are not qualification of this composition.
 
+Conditional Experimental Mode keeps Experimental while the model's plan still sheds most of the car's speed, wherever the
+plan ends (a plan that dips toward the line and relaunches no longer reads as an open road), and returns to Chill on the
+model's go: 0.5 s of open road with the plan no longer slowing, at rest or below 1 m/s, or with the model asking for
+0.5 m/s² or more. An exit taken at rest stays revocable by the model's stop until the car moves off. Entry is unchanged
+(BLoTv3 D41; not field validated).
+
 ## Lane-centering toggle
 
 **Settings -> Dev -> Lane Centering** is available in both UI layouts. It defaults **on**, persists across restarts, and can be switched without restarting or disengaging. A background reader polls the setting outside the real-time steering loop. Turning it off resets the extra correction; ordinary curvature limits still shape the delivered command. It changes actual steering, not the displayed model path. Have a passenger operate it while moving, or change it while stopped.
@@ -84,6 +90,7 @@ BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream Accel
 - Smooth Stops radar filter: age gate `97da369c4bded416fb5dc68c6e09a62b66140a55` and distance floor `61cc462bbc551c5d0bb4bca146301e6d4de612fe`, now carried on BLoTv3 at afa3adf7f1c2980d545e2d9a5325f68183d34670; not the historical LongControl implementation.
 
 - Full longitudinal feature: [BLoTv3 at 926ccb7a3](https://github.com/SpysyWeeb/Spysypilot/tree/926ccb7a3f24ab49d47b64fde2cbcc98ff02e14f), reconciled with daily’s newer upstream planner and SOL. Local verification is not device or field acceptance.
+- Conditional Experimental Mode slowing hold and go exit: BLoTv3 `5dac58958257cb6a14b432a07e206b4a9f73881f` (D41), applied unchanged; `conditional_experimental_mode.py`, `stop_helpers.py` and their tests match BLoTv3's, and the design document carries D40/D41.
 
 - Nudgeless production helper and source-owned tests: [lane-changes at ac85e99c](https://github.com/SpysyWeeb/Spysypilot/tree/ac85e99c3049f4a88c376deae94ba46af99b50d5), including the early-manual-start retry fix. Its lateral behavior is unchanged by the subsequent longitudinal passing import.
 - Complete centering feature and both Dev toggles: [lane-centering at a3f3b942](https://github.com/SpysyWeeb/Spysypilot/tree/a3f3b94250611608dc39b9357e1364ea1b091960). Test setup is adapted to daily's required SOL status; production behavior is unchanged.

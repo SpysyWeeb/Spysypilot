@@ -143,3 +143,28 @@ class TestLaneChanging:
     assert not lane_changing(md)
     md.meta.laneChangeState = log.LaneChangeState.laneChangeStarting
     assert lane_changing(md)
+
+
+def speeds(md, start, low, end):
+  # the plan's speed profile: down from start to low at its middle, then on to end
+  mid = (N - 1) // 2
+  md.velocity.x = [start + (low - start) * i / mid if i <= mid else low + (end - low) * (i - mid) / (N - 1 - mid) for i in range(N)]
+  return md
+
+
+class TestSlowing:
+  def test_a_dip_and_relaunch_is_slowing_though_its_end_reads_open(self):
+    obs = observe(speeds(model(path_end=40.0), 8.0, 1.0, 6.0), car_state(8.0))
+    assert obs.slowing and obs.release_open
+
+  def test_the_low_point_must_shed_most_of_the_speed(self):
+    assert observe(model(path_end=85.0, terminal_speed=3.5), car_state(12.5)).slowing
+    assert not observe(model(path_end=85.0, terminal_speed=5.0), car_state(12.5)).slowing
+    # near the line the low point must also sit SLOWING_MARGIN below the car
+    assert observe(speeds(model(path_end=5.0), 2.0, 0.6, 0.6), car_state(2.0)).slowing
+    assert not observe(speeds(model(path_end=2.0), 1.2, 0.3, 0.3), car_state(1.2)).slowing
+
+  def test_standstill_and_an_accelerating_plan_are_not_slowing(self):
+    assert not observe(speeds(model(path_end=0.5), 0.0, -0.05, 0.0), car_state(0.0)).slowing
+    assert not observe(speeds(model(path_end=60.0), 6.0, 6.0, 12.0), car_state(6.0)).slowing
+    assert not observe(messaging.new_message('modelV2').modelV2).slowing
