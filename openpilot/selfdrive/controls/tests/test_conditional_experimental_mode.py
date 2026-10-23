@@ -1,7 +1,10 @@
+import subprocess
+import sys
+
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.conditional_experimental_mode import (ConditionalExperimentalMode, DRIVER_OVERRIDE_SUPPRESS_S,
-                                                                            GO_ACCEL, GO_CONFIRM_S, LEAD_RELEASE_HYSTERESIS_S,
+                                                                            GO_ACCEL, GO_CONFIRM_S, GO_ROLL_SPEED, LEAD_RELEASE_HYSTERESIS_S,
                                                                             MODE_MIN_LATCH_S, POST_STOP_SUPPRESS_S, STANDSTILL_MIN_LATCH_S,
                                                                             STOP_INTENT_HOLD_S, CLEAR_CANCEL_S)
 from openpilot.selfdrive.controls.lib.stop_helpers import MODEL_INVALID_RELEASE_S
@@ -42,12 +45,13 @@ def car_state(v_ego=10.0, standstill=False, gas=False, brake=False, blinker=Fals
   return cs
 
 
-def radar_state(d_one=None, d_two=None):
+def radar_state(d_one=None, d_two=None, v_one=0.0, v_two=0.0):
   rs = messaging.new_message('radarState').radarState
-  for lead, d in ((rs.leadOne, d_one), (rs.leadTwo, d_two)):
+  for lead, d, v in ((rs.leadOne, d_one, v_one), (rs.leadTwo, d_two, v_two)):
     if d is not None:
       lead.present = True
       lead.dRel = d
+      lead.vLead = v
   return rs
 
 
@@ -347,3 +351,62 @@ class TestSlowingAndGo:
     assert not run(cem, 0.15, go, car_state(6.0))
     assert not run(cem, POST_STOP_SUPPRESS_S - 0.5, stop_model())
     assert run(cem, 1.5, stop_model())
+
+
+def through_lead():
+  # a lead going through the stop: 25 m ahead at 10 m/s, it comes to rest past stop_model()'s 30 m stop point
+  return radar_state(d_one=25.0, v_one=10.0)
+
+
+class TestLeadOwnership:
+  # route 0x158 t=5266-5286: the model stopped for a yellow light while the SUV ahead braked, then went through it; the
+  # relevant-lead veto on every frame kept the mode in Chill until the driver braked
+
+  def test_a_lead_going_through_a_near_stop_does_not_block_entry(self):
+    assert run(ConditionalExperimentalMode(), 1.0, stop_model(), rs=through_lead())
+    assert run(ConditionalExperimentalMode(), 1.0, model(should_stop=True, desired_accel=-0.3), rs=radar_state(d_one=30.0, v_one=25.0))
+
+  def test_a_lead_stopping_short_of_the_stop_blocks_entry(self):
+    assert not run(ConditionalExperimentalMode(), 2.0, stop_model(), rs=radar_state(d_one=25.0, v_one=5.0))
+
+  def test_the_models_likely_lead_ending_short_of_the_stop_blocks_entry(self):
+    md = model(path_end=30.0, terminal_speed=0.2, desired_accel=-0.3, leads=((0.8, 35.0, 0.0), (0.0, 200.0, 0.0), (0.0, 200.0, 0.0)))
+    assert not run(ConditionalExperimentalMode(), 2.0, md, rs=through_lead())
+
+  def test_a_queue_past_the_stop_point_blocks_entry(self):
+    # the model stops a few meters farther back from a stopped car than the MPC does, so the car's rest point lies past
+    # the model's; it is the queue the model stops for, and its creep and launch are the lead logic's
+    md, cs = model(path_end=60.0, terminal_speed=0.2, desired_accel=-0.3), car_state(15.0)
+    for v_lead in (-0.5, 0.0, 0.9):
+      assert not run(ConditionalExperimentalMode(), 2.0, md, cs, rs=radar_state(d_one=68.0, v_one=v_lead))
+    assert run(ConditionalExperimentalMode(), 2.0, md, cs, rs=radar_state(d_one=68.0, v_one=14.0))
+
+  def test_a_tracked_lead_no_longer_owning_the_stop_ends_the_veto_at_once(self):
+    cem = ConditionalExperimentalMode()
+    assert not run(cem, 1.0, stop_model(), rs=radar_state(d_one=25.0, v_one=5.0))
+    # the lead speeds up through the stop: positive evidence, so no grace runs (a lead the radar loses keeps it, see TestEntry)
+    assert run(cem, 1.0, stop_model(), rs=through_lead())
+
+  def test_a_far_stop_keeps_the_lead_veto(self):
+    # the early and hint tiers read a stop far ahead; a lead there going through it is no evidence the stop is the model's
+    # (route 0xa2 t=459.8: a lead 107 m ahead slowing, a hint-tier stop at 147 m, then e2e out-braking Chill with no stop)
+    lead = radar_state(d_one=60.0, v_one=15.0)
+    assert not run(ConditionalExperimentalMode(), 2.0, early_model(), car_state(15.0), rs=lead)
+    assert not run(ConditionalExperimentalMode(), 2.0, hint_model(), car_state(15.0), rs=lead)
+    assert run(ConditionalExperimentalMode(), 2.0, early_model(), car_state(15.0))
+
+  def test_at_a_crawl_a_relevant_lead_always_blocks_entry(self):
+    # route 0x158 t=5333.2: at rest behind a creeping queue; the queue's creep and launch are the lead logic's
+    creeping = radar_state(d_one=9.0, v_one=1.2)
+    stub = model(path_end=1.5, terminal_speed=0.2, should_stop=True)
+    assert not run(ConditionalExperimentalMode(), 2.0, stub, car_state(0.0, standstill=True), rs=creeping)
+    assert not run(ConditionalExperimentalMode(), 2.0, stub, car_state(GO_ROLL_SPEED - 0.5), rs=creeping)
+    assert run(ConditionalExperimentalMode(), 2.0, stub, car_state(GO_ROLL_SPEED + 0.5), rs=creeping)
+
+
+class TestFootprint:
+  def test_the_mode_does_not_load_the_long_mpc(self):
+    # selfdrived runs the mode: it reads the MPC's stopping geometry without loading casadi or the generated solver
+    heavy = ('casadi', 'openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc')
+    code = f"import sys; import openpilot.selfdrive.controls.lib.conditional_experimental_mode; print([m for m in {heavy} if m in sys.modules])"
+    assert subprocess.check_output([sys.executable, '-c', code], text=True).strip() == '[]'

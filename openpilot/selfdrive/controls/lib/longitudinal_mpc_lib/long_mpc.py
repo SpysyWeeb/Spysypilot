@@ -8,6 +8,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 # WARNING: imports outside of constants will not trigger a rebuild
 from openpilot.selfdrive.modeld.constants import index_function
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.constants import COMFORT_BRAKE, STOP_DISTANCE, get_stopped_equivalence_factor
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LEAD_T_IDXS
 from openpilot.selfdrive.controls.lib.necessity_supervisor import JERK_SCALE_MIN
@@ -55,8 +56,6 @@ T_IDXS_LST = [index_function(idx, max_val=MAX_T, max_idx=N) for idx in range(N+1
 T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
-COMFORT_BRAKE = 2.5
-STOP_DISTANCE = 7.0
 MIN_X_LEAD_FACTOR = 0.5
 # the QP plans against the obstacles present each frame; the hand-over in update() waits LEAD_PRESENCE_FRAMES for a radar lead
 # taking over from the free run and LEAD_ABSENCE_FRAMES for one that is gone, so toggles and short dropouts do not restart the plan
@@ -83,9 +82,6 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
     return 1.0
   else:
     raise NotImplementedError("Longitudinal personality not supported")
-
-def get_stopped_equivalence_factor(v_lead):
-  return (v_lead**2) / (2 * COMFORT_BRAKE)
 
 def get_safe_obstacle_distance(v_ego, t_follow):
   return (v_ego**2) / (2 * COMFORT_BRAKE) + t_follow * v_ego + STOP_DISTANCE

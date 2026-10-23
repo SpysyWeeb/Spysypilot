@@ -5,7 +5,7 @@ import math
 import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.stop_helpers import (STOP_DIRECT_CONFIDENCE, STOP_EARLY_CONFIDENCE, STOP_EARLY_HINT_CONFIDENCE,
                                                            STOP_EARLY_HINT_ENTRY_CONFIDENCE, STOP_TRAJECTORY_CONFIDENCE,
-                                                           leads_clear_of_stop_path, observe_model_stop, stop_release_open)
+                                                           lead_owns_stop, leads_clear_of_stop_path, observe_model_stop, stop_release_open)
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 N = ModelConstants.IDX_N
@@ -36,12 +36,13 @@ def car_state(v_ego=10.0, blinker=False, steering_angle=0.0):
   return cs
 
 
-def radar_state(d_one=None, d_two=None):
+def radar_state(d_one=None, d_two=None, v_one=0.0, v_two=0.0):
   rs = messaging.new_message('radarState').radarState
-  for lead, d in ((rs.leadOne, d_one), (rs.leadTwo, d_two)):
+  for lead, d, v in ((rs.leadOne, d_one, v_one), (rs.leadTwo, d_two, v_two)):
     if d is not None:
       lead.present = True
       lead.dRel = d
+      lead.vLead = v
   return rs
 
 
@@ -95,6 +96,85 @@ class TestVetoes:
     assert observe(model(curvature=0.05), car_state(5.0, blinker=True)).committed_turn
     assert not observe(model(), car_state(5.0, blinker=True, steering_angle=10.0)).committed_turn
     assert not observe(model(), car_state(12.0, blinker=True, steering_angle=45.0)).committed_turn
+
+
+def stop_ahead(leads=()):
+  # a 50 m stop; the model publishes LEAD_MHP_SELECTION hypotheses, the ones not given here unlikely and far away
+  leads = tuple(leads) + ((0.0, 200.0, 0.0),) * (ModelConstants.LEAD_MHP_SELECTION - len(leads))
+  return model(path_end=50.0, terminal_speed=0.2, desired_accel=-0.3, leads=leads)
+
+
+class TestLeadOwnership:
+  # a 50 m stop: a lead owns it when it is a queue (a relevant lead at a crawl), when the MPC, stopping STOP_DISTANCE behind
+  # the lead's rest point, would stop the car at or before it, or when the model's likely lead forecast ends by the stop
+  # point plus LEAD_PATH_MARGIN
+  def test_a_lead_stopping_short_of_the_stop_owns_it(self):
+    assert observe(stop_ahead(), rs=radar_state(d_one=30.0)).lead_owns_stop
+    assert observe(stop_ahead(), rs=radar_state(d_one=30.0, v_one=8.0)).lead_owns_stop  # rest point 30 + 12.8 - 7 m
+    assert observe(stop_ahead(), rs=radar_state(d_one=52.0, v_one=5.0)).lead_owns_stop  # rest point exactly at the stop point
+
+  def test_a_lead_going_through_the_stop_does_not_own_it(self):
+    # the yellow light: a lead 31 m ahead at 14 m/s rests past a 50 m stop; it stays the relevant lead Force Stops holds for
+    obs = observe(stop_ahead(), rs=radar_state(d_one=31.0, v_one=14.0))
+    assert obs.relevant_lead and not obs.lead_owns_stop
+    assert not observe(stop_ahead(), rs=radar_state(d_one=52.5, v_one=5.0)).lead_owns_stop
+
+  def test_a_queue_owns_the_stop_the_model_makes_behind_it(self):
+    # the model stops a few meters farther back than the MPC's STOP_DISTANCE: a stopped or creeping car whose rest point
+    # lies past the stop is the queue the model stops for, not a car going through
+    for v_lead in (-0.5, 0.0, 0.9):
+      obs = observe(stop_ahead(), rs=radar_state(d_one=58.0, v_one=v_lead))
+      assert obs.relevant_lead and obs.lead_owns_stop
+    assert not observe(stop_ahead(), rs=radar_state(d_one=58.0, v_one=2.0)).lead_owns_stop  # rest point 51.8 m
+
+  def test_a_queue_beyond_the_relevance_window_does_not_own_the_stop(self):
+    # a lead going through, and a stopped car beyond the window: past the junction, not in it
+    obs = observe(stop_ahead(), rs=radar_state(d_one=31.0, v_one=14.0, d_two=100.0, v_two=0.0))
+    assert obs.relevant_lead and not obs.lead_owns_stop
+    assert observe(stop_ahead(), rs=radar_state(d_one=31.0, v_one=14.0, d_two=60.0, v_two=0.0)).lead_owns_stop
+
+  def test_either_lead_slot_can_own_the_stop(self):
+    assert observe(stop_ahead(), rs=radar_state(d_one=31.0, d_two=45.0, v_one=14.0, v_two=5.0)).lead_owns_stop
+
+  def test_the_models_likely_lead_forecast_also_owns_the_stop(self):
+    through = radar_state(d_one=31.0, v_one=14.0)
+    assert observe(stop_ahead(((0.6, 58.0, 0.0),)), rs=through).lead_owns_stop
+    assert not observe(stop_ahead(((0.6, 62.0, 0.0),)), rs=through).lead_owns_stop
+    # an unlikely hypothesis is no forecast; the radar alone decides
+    assert not observe(stop_ahead(((0.4, 40.0, 0.0),)), rs=through).lead_owns_stop
+
+  def test_the_radar_geometry_owns_the_stop_whatever_the_forecast(self):
+    assert observe(stop_ahead(((0.9, 200.0, 0.0),)), rs=radar_state(d_one=30.0, v_one=5.0)).lead_owns_stop
+
+  def test_only_a_relevant_lead_can_own_the_stop(self):
+    obs = observe(stop_ahead(((0.9, 40.0, 0.0),)), rs=radar_state(d_one=120.0))
+    assert not obs.relevant_lead and not obs.lead_owns_stop
+
+  def test_ownership_fails_closed(self):
+    nan = float('nan')
+    through = radar_state(d_one=31.0, v_one=14.0)
+    assert lead_owns_stop(stop_ahead(), through, 10.0, 0.0)
+    assert lead_owns_stop(stop_ahead(), through, 10.0, nan)
+    assert lead_owns_stop(stop_ahead(), radar_state(d_one=nan), 10.0, 50.0)
+    assert lead_owns_stop(stop_ahead(), radar_state(d_one=31.0, v_one=nan), 10.0, 50.0)
+    assert lead_owns_stop(stop_ahead(), radar_state(d_one=31.0, v_one=14.0, d_two=nan), 10.0, 50.0)
+    md = stop_ahead(((0.6, 80.0, 0.0),))
+    md.leadsV3[0].x = [80.0, 80.0, nan, 80.0, 80.0, 80.0]
+    assert lead_owns_stop(md, through, 10.0, 50.0)
+    md = stop_ahead(((0.6, 80.0, 0.0),))
+    md.leadsV3[0].x = [80.0] * 3
+    assert lead_owns_stop(md, through, 10.0, 50.0)
+    assert lead_owns_stop(stop_ahead(((nan, 80.0, 0.0),)), through, 10.0, 50.0)
+    assert not lead_owns_stop(stop_ahead(((0.6, 80.0, 0.0),)), through, 10.0, 50.0)
+
+  def test_a_short_hypothesis_list_fails_closed(self):
+    # with no likely hypothesis the radar alone decides; a list the model did not fill is no such reading
+    through = radar_state(d_one=31.0, v_one=14.0)
+    for leads in ((), ((0.9, 200.0, 0.0),), ((0.9, 200.0, 0.0),) * 2):
+      md = model(path_end=50.0, terminal_speed=0.2, desired_accel=-0.3, leads=leads)
+      assert lead_owns_stop(md, through, 10.0, 50.0)
+      assert observe(md, rs=through).lead_owns_stop
+    assert not lead_owns_stop(stop_ahead(), through, 10.0, 50.0)
 
 
 class TestRelease:
