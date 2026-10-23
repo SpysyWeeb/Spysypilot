@@ -25,8 +25,9 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_
 # it lasts through the hover and through standstill, and ends only on a launch -- the lead-departure pre-release or its
 # hold handed back, a Force Stops release (the commitment over, not a hold rolling on into a moving commitment) -- the
 # plan positive for LAUNCH_FRAMES in a row above KISS_SPEED, or the speed leaving the window; a launch the planner takes
-# back at standstill latches it again. Whatever it still holds the plan below when it ends is handed back at the planner's
-# cruise jerk, so no exit steps the car; a reset drops it.
+# back at standstill latches it again. Whatever it still holds the plan below when it ends, and the braking a lead needed
+# beyond the bound once that lead is gone from sight, is handed back at the planner's cruise jerk, so no exit steps the car;
+# a reset drops it.
 LANDING_SPEED = 3.5          # m/s, the law acts below this; at the top the bound (2.75 m/s^2) exceeds any comfort approach
 STOP_INTENT_SPEED = 0.5      # m/s, the MPC's horizon must reach below this for a slowdown to count as a stop
 KISS_SPEED = 0.40            # m/s, from here down the car rides the kiss alone
@@ -95,6 +96,7 @@ class StopLanding:
     self._held = False
     self._positive_frames = 0
     self.integral = 0.0
+    self._lead_held = False
 
   def bound(self, v_ego):
     # the most braking requested at this speed
@@ -121,14 +123,14 @@ class StopLanding:
   def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None, launch_cancelled=False):
     """Bound the arbitrated acceleration target through a landing; returns the plan unchanged otherwise.
 
-    lead is the planner's LeadObservation, stop_intent says the plan ends in a stop this frame, launch says the planner
+    lead is the lead the plan keeps, stop_intent says the plan ends in a stop this frame, launch says the planner
     itself is letting the car go (a lead-departure pre-release or its hold handed back, a Force Stops release), a_ego is
     the car's measured acceleration (None: the anti-stall integral holds), launch_cancelled says the planner took back a
     launch it issued at standstill. A landing starts on intent with the plan braking more than the kiss below
     LANDING_SPEED, unless the planner is issuing a launch that same frame, or at standstill on a cancelled launch, and then
     lasts -- through the MPC's hover around zero and through standstill -- until a launch, the plan climbing above zero for
     LAUNCH_FRAMES in a row above KISS_SPEED, or the speed leaving the window. Then an output it held below the plan rises
-    at the release jerk until it meets the plan.
+    at the release jerk until it meets the plan, and so does braking held beyond the bound for a lead gone from sight.
     """
     if not math.isfinite(v_ego):
       # a non-finite speed resets everything, a release included
@@ -164,9 +166,16 @@ class StopLanding:
       self.integral = min(max(self.integral, 0.0), float(np.interp(v_ego, [CREEP_SPEED, CREEP_FADE_SPEED], [STALL_MAX, 0.0])))
       press = self.integral if v_ego > STANDSTILL_SPEED else 0.0
       floor = self.floor(v_ego) + press
-      bound = max(self.bound(v_ego) + press, self.lead_requirement(v_ego, lead))
+      corridor = self.bound(v_ego) + press
+      bound = max(corridor, self.lead_requirement(v_ego, lead))
       output = min(a_target, -floor) if floor > 0.0 else a_target
       output = max(output, -bound, ACCEL_MIN)
+      # braking held beyond the corridor for a lead now gone from sight goes back like any exit, at the release jerk
+      if self._lead_held and not lead.present:
+        self.releasing = True
+      self._lead_held = output < -corridor
+    else:
+      self._lead_held = False
     if self.releasing:
       # the floor and the press it held go back at the same rate, and a landing starting again meanwhile cannot drop them
       ceiling = self.output + float(np.interp(v_ego, *self.release_jerk)) * self.dt

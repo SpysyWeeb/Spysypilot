@@ -93,6 +93,7 @@ class LongitudinalPlanner:
     self.throttle_prob = FirstOrderFilter(1.0, ALLOW_THROTTLE_PROB_TAU, dt)
     self.supervisor = NecessitySupervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt, LEAD_ABSENCE_FRAMES)
+    self.lead_kept = LeadObservation()
     self.open_road_frames = 0
     self.open_road_filter = FirstOrderFilter(0.0, RELEASE_RC, dt)
     self.force_stops = ForceStops(dt)
@@ -158,19 +159,11 @@ class LongitudinalPlanner:
 
     radar_valid = sm.all_checks(['radarState'])
     model_valid = sm.all_checks(['modelV2'])
-    lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
-    model_leads = sm['modelV2'].leadsV3 if model_valid else []
-    lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if len(model_leads) > 0 else None
-    lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
-    policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
-
-    experimental_mode = sm['selfdriveState'].experimentalMode
-    stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
-    force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, not reset_state, model_valid, self.output_a_target)
-    stop_x = force_stop.stop_x if force_stop.stop_x is not None and math.isfinite(force_stop.stop_x) else None
-    v_cruise = min(v_cruise, force_stop.v_cruise_cap)
-
-    personality = sm['selfdriveState'].personality
+    # one reading of each radar slot for the lead view, the model's lead and the MPC: the lead the message holds, with finite values.
+    # radarState failing its checks is selfdrived's to act on; the lead it still reports is the lead
+    lead = LeadObservation.from_radar(sm['radarState'].leadOne)
+    lead_two = LeadObservation.from_radar(sm['radarState'].leadTwo)
+    at_rest = self.CP.openpilotLongitudinalControl and not long_control_off and sm['carState'].standstill
     # the published target is the plan read action_t ahead, not its current acceleration: while the MPC drives it continues its
     # own plan as far as the car can follow it, otherwise it starts from what the car was told. A car the pre-release held at
     # rest last frame drove no plan: it starts from rest. Nothing below the planner closes a loop on speed, so the plan starts
@@ -180,9 +173,29 @@ class LongitudinalPlanner:
     else:
       a_told = self.output_a_target
       a_seed = float(np.clip(self.mpc.a_next, ACCEL_MIN, ACCEL_MAX)) if self.plan_winner in ('mpc', 'column') else a_told
-    self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, a_told)
+    self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, a_told, at_rest)
+    # the supervisor, the landing and the kiss see the lead the plan keeps, advanced a frame at a time through a dropout, a reset
+    # included: the MPC's keep outlives it. The MPC's state is set first so it answers as its update() will
+    if lead.present:
+      self.lead_kept = lead
+    elif self.lead_kept.present and self.mpc.keeps_lead(0, lead.present):
+      self.lead_kept = self.lead_kept.advanced(v_ego, self.dt)
+    else:
+      self.lead_kept = LeadObservation()
+    model_leads = sm['modelV2'].leadsV3 if model_valid else []
+    lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if lead.present and len(model_leads) > 0 else None
+    lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
+    policy = self.supervisor.update(self.lead_kept, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
+
+    experimental_mode = sm['selfdriveState'].experimentalMode
+    stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
+    force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, not reset_state, model_valid, self.output_a_target)
+    stop_x = force_stop.stop_x if force_stop.stop_x is not None and math.isfinite(force_stop.stop_x) else None
+    v_cruise = min(v_cruise, force_stop.v_cruise_cap)
+
+    personality = sm['selfdriveState'].personality
     self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, stop_x,
-                    policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint)
+                    policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint, usable=(lead.present, lead_two.present))
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -244,8 +257,9 @@ class LongitudinalPlanner:
     if force_stop.a_target is not None:
       present.add('profile')
     # whatever set the output can leave instead of being crossed: the winner leaving min() (e2e at a mode exit, a committed stop
-    # at its release). Cruise then carries the car from the published target, not from wherever it slewed meanwhile
-    handed_over = self.plan_winner not in present
+    # at its release) or the MPC's lead gone for good. Cruise then carries the car from the published target, not from wherever
+    # it slewed meanwhile
+    handed_over = self.plan_winner not in present or (self.plan_winner == 'mpc' and self.mpc.lead_handover)
     a_cruise_prev = self.output_a_target if handed_over else self.a_cruise
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, a_cruise_prev, self.dt, accel_coast, self.allow_throttle, comfort)
@@ -268,13 +282,13 @@ class LongitudinalPlanner:
     # releases (a corroborated lead departure, a Force Stops release) end it at once, a climbing plan ends it by itself
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
-    output_a_target = self.stop_landing.update(a_arbitrated, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo,
+    output_a_target = self.stop_landing.update(a_arbitrated, v_ego, self.lead_kept, stop_intent, launch, a_ego=sm['carState'].aEgo,
                                                launch_cancelled=self.lead_departure.cancelled)
     # the landing's kiss stops the wheels of a rolling car; LongControl's stopping ramp ignores the plan, so it takes over at the
     # standstill speed. A lead nearer than the kiss can stop short of is not the kiss's stop, and once the stop bit has risen in
     # a landing it stays for as long as its own rule holds it
     kiss_lands = (self.stop_landing.landing and not self.landing_stop_bit and v_ego > STANDSTILL_SPEED and
-                  self.stop_landing.lead_requirement(v_ego, lead) <= self.stop_landing.bound(v_ego))
+                  self.stop_landing.lead_requirement(v_ego, self.lead_kept) <= self.stop_landing.bound(v_ego))
     if kiss_lands:
       self.output_should_stop = force_stop.holding
     else:

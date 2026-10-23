@@ -1,4 +1,6 @@
 import math
+from typing import NamedTuple
+
 import numpy as np
 import pytest
 
@@ -10,6 +12,8 @@ from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib import longitudinal_planner
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_ABSENCE_FRAMES
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
 from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
 from openpilot.selfdrive.controls.lib.force_stops import NO_CAP, PROFILE_JERK, RELEASE_OPEN_FRAMES, ForceStopsResult
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LEAD_DEPARTURE_CANCEL, LEAD_DEPARTURE_CONFIRM, LongitudinalPolicy
@@ -860,6 +864,33 @@ class TestStandstillRelease:
       planner.update(self.radar_frame((d, 0.0, 0.0), -1))
       assert planner.output_should_stop
 
+  @pytest.mark.parametrize('lead', ['drives_away', 'leaves_the_radar'])
+  def test_radarState_failing_at_rest_holds_and_releases_as_its_message(self, lead):
+    # landed at rest behind a car standing 9 m ahead, the model's road open. A second after rest radarState fails its checks for 2 s with
+    # the car still in the message: the car drives away half a second into it, or it stands and leaves the radar as the failure ends. The
+    # failing frames are the message's, so the car is held, released and handed back frame for frame as without the failure
+    def run(failing):
+      car, start, x_lead, v_lead, frames = IdealCar(3.0), None, 9.0, 0.0, []
+      for k in range(round(10.0 / DT_MDL)):
+        if start is None and car.v == 0.0:
+          start = k + round(1.0 / DT_MDL)
+        if lead == 'drives_away' and start is not None and k >= start + round(0.5 / DT_MDL):
+          v_lead = 1.5
+        x_lead += v_lead * DT_MDL
+        gone = lead == 'leaves_the_radar' and start is not None and k >= start + round(2.0 / DT_MDL)
+        sm = frame(car.v, car.a, lead=None if gone else (x_lead - car.x, v_lead, 0.0), v_cruise=10.0, path=self.OPEN_ROAD)
+        sm.valid['radarState'] = not (failing and start is not None and start <= k < start + round(2.0 / DT_MDL))
+        car.planner.update(sm)
+        car.a = float(car.planner.output_a_target)
+        car.v = max(car.v + car.a * DT_MDL, 0.0)
+        car.x += car.v * DT_MDL
+        frames.append((car.a, car.planner.output_should_stop, car.planner.lead_departure.handed_back))
+      return start, frames
+    start, clean = run(False)
+    assert clean[start][1] and not clean[-1][1], (clean[start], clean[-1])
+    failed = run(True)[1]
+    assert failed == clean, next(k - start for k, (f, c) in enumerate(zip(failed, clean, strict=True)) if f != c)
+
   def test_a_lead_missing_under_a_hold_leaves_nothing_in_the_launch(self, accel_max):
     # the hover recipe, and leadOne missing for a second under the hold: the MPC plans for no lead meanwhile, but the car stood.
     # Once the lead is back and leaves, the car launches no harder than it would have without the absence
@@ -1088,23 +1119,26 @@ class TestHandOver:
 
   def test_a_lead_that_leaves_hands_over_from_what_the_car_was_told(self, accel_max):
     # braking behind a lead that brakes hard, then it leaves the radar: when the MPC hands its plan to the free run, the new plan
-    # starts from the target the car was given, not from the lead's plan one frame on, which lies well below it
+    # starts from the target the car was given, not from the lead's plan one frame on, which lies well below it, and from there the
+    # output rises at the cruise jerk
     car = IdealCar(15.0)
     x_lead, v_lead = 25.0, 15.0
     for i in range(round(4.5 / DT_MDL)):
       v_lead = max(v_lead - 3.0 * DT_MDL, 5.0) if i * DT_MDL > 2.0 else v_lead
       x_lead += v_lead * DT_MDL
       car.step(lead=(x_lead - car.x, v_lead, -3.0 if v_lead > 5.0 else 0.0), v_cruise=20.0)
-    handed_over = []
+    handed_over, carried = [], []
     for _ in range(20):
-      told, before = car.a, car.planner.mpc.binding_obstacle
+      told, before, v_ego = car.a, car.planner.mpc.binding_obstacle, car.v
       car.step(v_cruise=20.0)
       if before != car.planner.mpc.binding_obstacle:
-        handed_over.append((told, float(car.planner.mpc.a_solution[0]), car.a))
-    assert len(handed_over) == 1 and handed_over[0][0] > 0.0, handed_over
-    told, plan_start, published = handed_over[0]
+        handed_over.append((told, float(car.planner.mpc.a_solution[0])))
+      if handed_over:
+        carried.append((told, car.a, told + j_cruise_step(v_ego)))
+    assert len(handed_over) == 1, handed_over
+    told, plan_start = handed_over[0]
     assert math.isclose(plan_start, told, abs_tol=1e-6)
-    assert published >= told, handed_over
+    assert all(told <= published <= bound + 1e-6 for told, published, bound in carried), carried
 
   def test_a_commit_joins_from_the_published_target_not_the_measured_acceleration(self):
     # the car's measured acceleration lags and rings around what it was told; the committed profile starts from the published target
@@ -1156,6 +1190,319 @@ class TestHandOver:
       assert car.a - previous <= bound + 1e-6, (previous, car.a, car.planner.plan_winner)
       previous = car.a
     assert car.a > 0.5 and not car.planner.output_should_stop
+
+
+class LeadFrame(NamedTuple):
+  v_ego: float  # the speed the planner read
+  told: float  # the target the car had been told
+  published: float
+  gap: float  # to the lead, after the car moved
+  seen: bool  # the radar reported the lead
+  handed_over: bool  # the plan's lead changed hands to the free run
+  a_cruise: float
+  kept: tuple  # per radar slot, the MPC kept its lead through this frame
+  viewed: bool  # the planner's lead view held a lead
+
+
+class TestLeadAbsence:
+  # the radar loses a lead for a few frames far more often than the lead leaves: the plan keeps a lead it confirmed where it was going
+  # through the MPC's absence hold, the supervisor, the landing and the kiss see the same lead, and a lead gone for good hands the car
+  # over from the published target at the cruise jerk
+  def follow(self, v_ego, gap, a_lead, seen, seconds, v_cruise, v_lead=None, floor=0.0, brakes_at=1.0, gas_prob=None, lead_two=None,
+             overridden=(), forecast=None, radar_failed=(), radar_empty=(), unreadable=()):
+    # an ideal car behind a lead that brakes at a_lead from brakes_at on, down to floor, the model seeing it brake at forecast when
+    # that differs; seen(k, car) says whether the radar reports it on frame k, lead_two starts a car that far beyond it in leadTwo,
+    # holding the car's first speed and reported but on the radar_empty frames, radarState fails its checks on the radar_failed frames
+    # with its leads still in the message, the leads it reports read a NaN acceleration on the unreadable frames, and on the overridden
+    # frames the driver has the pedal
+    car = IdealCar(v_ego)
+    x_lead, v_lead, frames = gap, v_ego if v_lead is None else v_lead, []
+    x_two = None if lead_two is None else gap + lead_two
+    for k in range(round(seconds / DT_MDL)):
+      a = a_lead if k * DT_MDL >= brakes_at and v_lead > floor else 0.0
+      v_lead = max(v_lead + a * DT_MDL, floor)
+      x_lead += v_lead * DT_MDL
+      in_sight = seen(k, car)
+      sm = frame(car.v, car.a, lead=(x_lead - car.x, v_lead, a) if in_sight else None, v_cruise=v_cruise, gas_prob=gas_prob,
+                 engaged=k not in overridden, forecast=forecast if a < 0.0 else None)
+      if x_two is not None:
+        x_two += v_ego * DT_MDL
+        if k not in radar_empty:
+          two = sm['radarState'].leadTwo
+          two.present, two.dRel, two.vLead, two.vLeadK, two.aLeadTau, two.modelProb, two.radar = True, x_two - car.x, v_ego, v_ego, 1.5, 1.0, True
+      if k in radar_failed:
+        sm.valid['radarState'] = False
+      if k in unreadable:
+        sm['radarState'].leadOne.aLeadK = sm['radarState'].leadTwo.aLeadK = math.nan
+      v_read, told, before = car.v, car.a, car.planner.mpc.binding_obstacle
+      car.planner.update(sm)
+      car.a = float(car.planner.output_a_target)
+      car.v = max(car.v + car.a * DT_MDL, 0.0)
+      car.x += car.v * DT_MDL
+      frames.append(LeadFrame(v_read, told, car.a, x_lead - car.x, in_sight, before == 'lead' and car.planner.mpc.binding_obstacle == 'fake',
+                              car.planner.a_cruise, tuple(car.planner.mpc.kept), car.planner.lead_kept.present))
+    return frames
+
+  @pytest.mark.parametrize('dropout', range(1, LEAD_ABSENCE_FRAMES))
+  @pytest.mark.parametrize('v_ego, gap, a_lead', [(20.0, 30.0, -3.5), (25.0, 40.0, -4.0), (15.0, 20.0, -3.0), (10.0, 20.0, -1.0)])
+  def test_a_lead_dropped_while_braking_stays_in_the_plan(self, v_ego, gap, a_lead, dropout):
+    # 3 s in, the radar loses the braking lead for up to the absence hold, then finds it again where it went: no frame, the one it is
+    # back on included, lets go of the brake faster than the cruise jerk
+    lost = range(round(3.0 / DT_MDL), round(3.0 / DT_MDL) + dropout)
+    frames = self.follow(v_ego, gap, a_lead, lambda k, car: k not in lost, 4.5, v_ego)
+    rises = [(f.published - f.told - j_cruise_step(f.v_ego), k) for k, f in enumerate(frames) if k >= lost.start - 1]
+    assert max(rises)[0] <= 0.005, max(rises)
+
+  @pytest.mark.parametrize('dropout', [1, 3, LEAD_ABSENCE_FRAMES - 1])
+  def test_a_leadOne_dropout_with_leadTwo_present_stays_in_the_plan(self, dropout):
+    # braking hard behind leadOne with a car that was 45 m beyond it in leadTwo, holding its speed and always reported: leadOne lost for
+    # up to the absence hold is not leadTwo's to fill, and the output rises no more than it does without the dropout
+    start = round(2.0 / DT_MDL)
+
+    def largest_rise(lost):
+      frames = self.follow(20.0, 35.0, -3.5, lambda k, car: k not in lost, 3.0, 23.0, brakes_at=0.55, lead_two=45.0)
+      return max(f.published - f.told for f in frames[start - 1:start + 12])
+    assert largest_rise(range(start, start + dropout)) <= largest_rise(range(0)) + 0.005
+
+  @pytest.mark.parametrize('v_ego, gap, a_lead, floor, v_cruise, lost', [
+    (12.0, 25.0, -1.5, 5.0, 25.0, lambda k, car: k >= round(3.0 / DT_MDL)),
+    (11.0, 18.0, -2.0, 0.0, 9.2, lambda k, car: car.v <= 9.8),
+  ], ids=['set speed 25 m/s at 12 m/s', 'cruise 0.5 above, braking -1.03 at 9.8 m/s'])
+  def test_a_genuine_departure_hands_over_at_the_cruise_jerk(self, v_ego, gap, a_lead, floor, v_cruise, lost):
+    # Chill with the throttle gate open, cruise wound up above the output, braking behind a lead that leaves for good (it turned off):
+    # through the absence hold the plan brakes as it did with the lead in sight, then the MPC hands the car to cruise on the hold's
+    # last frame, and the output rises from the published target at the cruise jerk
+    in_sight = self.follow(v_ego, gap, a_lead, lambda k, car: True, 6.0, v_cruise, floor=floor, gas_prob=0.9)
+    frames = self.follow(v_ego, gap, a_lead, lambda k, car: not lost(k, car), 6.0, v_cruise, floor=floor, gas_prob=0.9)
+    loss = next(k for k, f in enumerate(frames) if not f.seen)
+    assert not any(f.seen for f in frames[loss:])
+    assert frames[loss - 1].a_cruise - frames[loss - 1].published >= 0.5, frames[loss - 1]
+    hold = slice(loss, loss + LEAD_ABSENCE_FRAMES - 1)
+    assert all(abs(f.published - s.published) <= 0.02 for f, s in zip(frames[hold], in_sight[hold], strict=True)), (frames[hold], in_sight[hold])
+    assert [k for k, f in enumerate(frames) if f.handed_over] == [hold.stop], [k - loss for k, f in enumerate(frames) if f.handed_over]
+    rises = [(f.published - f.told - j_cruise_step(f.v_ego), k - loss) for k, f in enumerate(frames) if k >= hold.stop]
+    assert max(rises)[0] <= 1e-6, max(rises)
+
+  def test_a_lead_lost_at_landing_speed_hands_back_at_the_cruise_jerk(self):
+    # landing at 3 m/s on a car standing 9 m ahead, the radar loses it for good: the landing hands back the room it held for that car at
+    # the cruise jerk, and over the next 3 s the car stays well short of where it stands
+    loss = round(1.0 / DT_MDL)
+    frames = self.follow(3.0, 9.0, 0.0, lambda k, car: k < loss, 4.0, 10.0, v_lead=0.0)
+    rises = [f.published - f.told for f in frames[loss - 1:]]
+    assert max(rises) <= j_cruise_step(3.0) + 0.005, max(rises)
+    assert min(f.gap for f in frames) >= 1.0, min(f.gap for f in frames)
+
+  def test_an_override_inside_a_dropout_keeps_the_lead_the_landing_holds(self):
+    # the same landing with the driver's foot on the pedal for one frame while the car is out of sight: the plan keeps the car it
+    # lost through the override, and so do the landing and the kiss, so the car stops about as far short of it as without the override
+    loss = round(1.0 / DT_MDL)
+
+    def least_gap(overridden):
+      return min(f.gap for f in self.follow(3.0, 9.0, 0.0, lambda k, car: k < loss, 4.0, 10.0, v_lead=0.0, overridden=overridden))
+    overridden, clean = least_gap({loss + 4}), least_gap(())
+    assert overridden >= clean - 0.1, (overridden, clean)
+
+  def test_a_landing_whose_car_is_lost_after_a_frame_radarState_fails_hands_back_at_the_cruise_jerk(self):
+    # the same landing, radarState failing its checks on the car's last frame in the message: that frame holds the car for the plan and
+    # the landing alike, so the car is lost a frame later, the room the landing held goes back at the cruise jerk and the car stays short
+    loss = round(1.0 / DT_MDL)
+    frames = self.follow(3.0, 9.0, 0.0, lambda k, car: k <= loss, 4.0, 10.0, v_lead=0.0, radar_failed={loss})
+    rises = [f.published - f.told for f in frames[loss - 1:]]
+    assert max(rises) <= j_cruise_step(3.0) + 0.005, max(rises)
+    assert min(f.gap for f in frames) >= 1.0, min(f.gap for f in frames)
+
+  @pytest.mark.parametrize('gap, a_lead, forecast, lead_two', [(30.0, -3.5, None, None), (30.0, -3.5, None, 45.0), (60.0, -0.3, -3.0, None)],
+                           ids=['braking hard', 'braking hard with a car beyond it', 'easing off while the model sees it brake'])
+  def test_a_frame_radarState_fails_is_planned_as_its_message_and_an_unreadable_lead_as_a_missing_one(self, gap, a_lead, forecast, lead_two):
+    # following at 20 m/s, the lead lost for good at 3 s. A frame on which radarState fails its checks, every lead still in the message,
+    # is planned as that message: the loss after it is the clean loss a frame later. A frame whose leads read a value the planner cannot
+    # use begins the loss as a frame that reports no lead: the plan and the view keep the lead for the same six frames, the plan hands the
+    # car over on the same frame, and the car is told the same target on every frame
+    loss = round(3.0 / DT_MDL)
+    kw = {'forecast': forecast, 'lead_two': lead_two}
+    clean = self.follow(20.0, gap, a_lead, lambda k, car: k <= loss, 4.5, 20.0, **kw)
+    failed = self.follow(20.0, gap, a_lead, lambda k, car: k <= loss, 4.5, 20.0, radar_failed={loss}, **kw)
+    empty = self.follow(20.0, gap, a_lead, lambda k, car: k < loss, 4.5, 20.0, radar_empty={loss}, **kw)
+    unreadable = self.follow(20.0, gap, a_lead, lambda k, car: k <= loss, 4.5, 20.0, unreadable={loss}, **kw)
+    assert [k - loss for k, f in enumerate(empty) if f.kept[0]] == list(range(LEAD_ABSENCE_FRAMES - 1))
+    assert [k - loss for k, f in enumerate(empty) if f.handed_over] == [LEAD_ABSENCE_FRAMES - 1]
+    for run, same in ((failed, clean), (unreadable, empty)):
+      for k, (f, e) in enumerate(zip(run, same, strict=True)):
+        assert (f.kept, f.viewed, f.handed_over) == (e.kept, e.viewed, e.handed_over), (k - loss, f, e)
+        assert abs(f.published - e.published) <= 1e-9, (k - loss, f.published, e.published)
+
+  @pytest.mark.parametrize('dropout', [1, 3, LEAD_ABSENCE_FRAMES - 1])
+  def test_a_close_lead_dropout_inside_a_landing_does_not_lift_it(self, dropout):
+    # landing from 3 m/s on a car standing 10 m ahead; once the car reads below 1 m/s the radar loses it for up to the absence hold:
+    # the landing keeps the room it holds for that car, and the output rises no more than without the dropout
+    def landing(dropout):
+      car, lost, rises = IdealCar(3.0), None, []
+      for k in range(round(10.0 / DT_MDL)):
+        if lost is None and car.planner.stop_landing.landing and car.v < 1.0:
+          lost = range(k, k + dropout)
+        told = car.a
+        car.step(lead=None if lost is not None and k in lost else (10.0 - car.x, 0.0, 0.0), v_cruise=10.0)
+        if lost is not None:
+          rises.append(car.a - told)
+      return max(rises[:30])
+    assert abs(landing(dropout) - landing(0)) <= 0.005, (landing(dropout), landing(0))
+
+  @pytest.mark.parametrize('dropout', [2, 3, LEAD_ABSENCE_FRAMES - 1])
+  def test_a_dropout_as_a_landing_starts_does_not_hand_the_stop_bit_to_the_kiss(self, dropout):
+    # Experimental, the model calling the stop at a car standing 8 m ahead, rolling up to it at 1 m/s: a car nearer than the kiss can
+    # stop short of is not the kiss's stop, so the stop bit is the plan's from the landing's first frame on. The radar losing the car
+    # from the frame before the landing starts does not hand the bit to the kiss
+    def run(lost):
+      car, frames = IdealCar(1.0), []
+      for k in range(round(3.0 / DT_MDL)):
+        d = 8.0 - car.x
+        car.step(lead=None if k in lost else (d, 0.0, 0.0), v_cruise=10.0, experimental=True, should_stop=True, path=(d, 0.0),
+                 e2e_accel=-0.7 * car.v ** 2 / (2.0 * d))
+        frames.append((car.planner.stop_landing.landing, car.planner.output_should_stop))
+      return frames
+    in_sight = run(())
+    start = next(k for k, (landing, _) in enumerate(in_sight) if landing)
+    assert all(bit for _, bit in in_sight[start:])
+    assert run(range(start - 1, start - 1 + dropout)) == in_sight
+
+  @pytest.mark.parametrize('below, column', [(False, False), (False, True), (True, False)],
+                           ids=['above the output', 'a stop column taking the plan from the lead', 'below the output'])
+  def test_cruise_is_not_anchored_without_a_lead_event(self, below, column):
+    # nothing hands over: cruise, not winning, keeps slewing toward its own set speed. Above the output behind a slower lead the MPC
+    # brakes for, also once a committed stop at the line that lead is crossing takes the plan from it (the lead has not gone), or
+    # below the output where the landing lifts it above the model's hard request at walking pace
+    if below:
+      car, v_cruise = IdealCar(1.5), 0.0
+    else:
+      car, v_cruise, x_lead = IdealCar(20.0), 100.0 * CV.KPH_TO_MS, 40.0
+    if column:
+      stop_x = None
+      force_stops = car.planner.force_stops.update
+      car.planner.force_stops.update = lambda *args: force_stops(*args) if stop_x is None else ForceStopsResult(NO_CAP, stop_x - car.x, False)
+    for k in range(round((1.0 if below else 3.5 if column else 3.0) / DT_MDL)):
+      if column and k == round(3.0 / DT_MDL):
+        stop_x, identity = car.x + 25.0, car.planner.mpc.binding_obstacle
+      v_ego = car.v
+      if below:
+        car.step(experimental=True, e2e_accel=-3.0, path=(3.0, 0.0), should_stop=True, v_cruise=v_cruise)
+      else:
+        x_lead += 12.0 * DT_MDL
+        car.step(lead=(x_lead - car.x, 12.0, 0.0), v_cruise=v_cruise)
+      assert car.planner.plan_winner != 'cruise'
+    if column:
+      assert (identity, car.planner.mpc.binding_obstacle, car.planner.plan_winner) == ('lead', 'stop', 'column')
+    assert (car.planner.a_cruise < car.a) == below, (car.planner.a_cruise, car.a)
+    settled = settled_cruise_accel(v_cruise, v_ego, comfort=not below, e2e=below)
+    assert math.isclose(car.planner.a_cruise, settled, abs_tol=1e-6), (car.planner.a_cruise, settled)
+
+
+class TestLeadContact:
+  # a lead the radar reads at or behind the bumper is in contact, a lead at 0 m for every reader of that reading: the plan brakes for it to rest, the view
+  # holds it there, and the landing and the kiss neither lift that braking nor release or launch the car
+  def test_contact_at_speed_brakes_to_rest_in_the_plan_and_the_view_alike(self):
+    # a car standing 80 m ahead of a car at 35 m/s, which cannot stop for it: from contact on the radar reads it at or behind the bumper
+    car = IdealCar(35.0)
+    for _ in range(60):
+      car.step(v_cruise=35.0)
+      car.v = 35.0
+    car.x, frames = 0.0, []
+    for _ in range(round(20.0 / DT_MDL)):
+      d, mpc = 80.0 - car.x, car.planner.mpc
+      car.step(lead=(d, 0.0, 0.0), v_cruise=35.0)
+      if d <= 0.0:
+        frames.append((car.v, car.a, car.planner.mpc_a_target, mpc.binding_obstacle, mpc.lead_handover, car.planner.lead_kept))
+      if car.v == 0.0:
+        break
+    assert frames and frames[-1][0] == 0.0, frames[-1:]
+    assert all(identity == 'lead' and not handover and published <= max(plan, ACCEL_MIN) + 1e-9
+               for _, published, plan, identity, handover, _ in frames), frames
+    assert all(view.present and view.distance == 0.0 for *_, view in frames), frames
+
+  @pytest.mark.parametrize('at_rest', [False, True], ids=['rolling', 'at rest'])
+  def test_a_landing_whose_lead_reads_at_the_bumper_neither_releases_nor_launches(self, at_rest):
+    # landing from 3 m/s on a car standing 9 m ahead, the model's road open beyond it. From 1 s on, or once the car has rested behind
+    # it for a second, the radar reads that car at the bumper: the landing holds, the car brakes to rest and stays held on the kiss
+    car, frames, switch = IdealCar(3.0), [], None if at_rest else round(1.0 / DT_MDL)
+    for k in range(round(8.0 / DT_MDL)):
+      if switch is None and car.v == 0.0:
+        switch = k + round(1.0 / DT_MDL)
+      contact = switch is not None and k >= switch
+      car.step(lead=(-0.3 if contact else 9.0 - car.x, 0.0, 0.0), v_cruise=10.0, path=TestStandstillRelease.OPEN_ROAD)
+      landing, departure = car.planner.stop_landing, car.planner.lead_departure
+      if contact:
+        frames.append((car.v, car.a, landing.landing and not landing.releasing, departure.handed_back, car.planner.output_should_stop))
+    assert all(held and not handed_back for _, _, held, handed_back, _ in frames), frames
+    rest = next((k for k, f in enumerate(frames) if f[0] == 0.0), len(frames))
+    assert len(frames) - rest >= round(1.0 / DT_MDL), (rest, len(frames))
+    assert all(bit and math.isclose(a, -KISS_DECEL, abs_tol=1e-9) for _, a, _, _, bit in frames[rest:]), frames[rest:]
+
+  @pytest.mark.parametrize('v_ego', [0.0, 0.3, 2.0, 15.0])
+  def test_a_lead_at_the_bumper_is_read_without_a_division_or_corridor_error(self, v_ego):
+    # a car standing 6 m ahead, then read at 0 m: the view holds it at 0 m and every reader's value is finite. The landing's requirement
+    # for it is unbounded while the car closes on it, so the plan passes unlifted, and nothing at rest, where the corridor stands
+    planner = LongitudinalPlanner(PALISADE_CP, init_v=v_ego)
+    for d in [6.0] * round(2.0 / DT_MDL) + [0.0]:
+      planner.update(frame(v_ego, lead=(d, 0.0, 0.0), v_cruise=10.0))
+    view, landing = planner.lead_kept, planner.stop_landing
+    assert view.present and view.distance == 0.0, view
+    values = (planner.output_a_target, planner.mpc_a_target, planner.supervisor.jerk_scale, planner.supervisor.t_follow_pad)
+    assert planner.mpc.solution_status == 0 and all(math.isfinite(x) for x in values), (planner.mpc.solution_status, values)
+    assert landing.lead_requirement(v_ego, view) == (math.inf if v_ego > 0.0 else 0.0)
+    if landing.landing:
+      assert planner.output_a_target == planner.mpc_a_target, (planner.output_a_target, planner.mpc_a_target)
+
+  @pytest.mark.parametrize('lead', ['drives_away', 'leaves_the_radar'])
+  def test_a_lead_at_the_bumper_that_leaves_is_released_as_the_same_lead_ahead_of_it(self, lead):
+    # landed at rest behind a car standing 9 m ahead, the model's road open; a second after rest the radar reads that car at the bumper. A second
+    # later it drives away, or two seconds later the radar loses it: the car is released, or handed back, on the same frame as when the
+    # radar reads it 0.3 m ahead
+    def run(reading):
+      car, switch, x_lead, v_lead, frames = IdealCar(3.0), None, 9.0, 0.0, []
+      for k in range(round(10.0 / DT_MDL)):
+        if switch is None and car.v == 0.0:
+          switch = k + round(1.0 / DT_MDL)
+        contact = switch is not None and k >= switch
+        if lead == 'drives_away' and contact and k >= switch + round(1.0 / DT_MDL):
+          v_lead = 1.5
+        x_lead += v_lead * DT_MDL
+        gone = lead == 'leaves_the_radar' and contact and k >= switch + round(2.0 / DT_MDL)
+        car.step(lead=None if gone else (reading + x_lead - 9.0 if contact else x_lead - car.x, v_lead, 0.0), v_cruise=10.0,
+                 path=TestStandstillRelease.OPEN_ROAD)
+        frames.append((car.planner.output_should_stop, car.planner.lead_departure.handed_back))
+      return switch, frames
+    switch, ahead = run(0.3)
+    assert ahead[switch][0] and not ahead[-1][0], (ahead[switch], ahead[-1])
+    at_bumper = run(-0.3)[1]
+    assert at_bumper == ahead, next(k - switch for k, (a, b) in enumerate(zip(at_bumper, ahead, strict=True)) if a != b)
+
+  def test_the_stop_bit_for_a_lead_at_the_bumper_rises_while_the_car_rolls(self):
+    # landing from 3 m/s on a car standing 9 m ahead that the radar reads at the bumper from 1 s on: a car in contact is nearer than the
+    # kiss can stop short of, so the stop bit is the plan's, not the kiss's. It rises while the car still rolls above the standstill speed
+    # and stays up to rest
+    car, bits = IdealCar(3.0), []
+    for k in range(round(8.0 / DT_MDL)):
+      v_ego, contact = car.v, k >= round(1.0 / DT_MDL)
+      car.step(lead=(-0.3 if contact else 9.0 - car.x, 0.0, 0.0), v_cruise=10.0, path=TestStandstillRelease.OPEN_ROAD)
+      if contact:
+        bits.append((v_ego, car.planner.output_should_stop))
+    rise = next((k for k, (_, bit) in enumerate(bits) if bit), None)
+    assert rise is not None and bits[rise][0] > STANDSTILL_SPEED and all(bit for _, bit in bits[rise:]), (rise, bits)
+    assert car.v == 0.0
+
+  def test_the_supervisor_reads_a_lead_at_the_bumper_as_a_lead_in_contact(self):
+    # crawling at 2.5 m/s into a car read at the bumper: the supervisor, like every reader, sees a lead in contact at 0 m, so on every frame
+    # it hands the MPC the policy a planner's supervisor gives that lead, the obstacle cost opened for a stopped car, not the one for an
+    # empty road
+    car, supervisor, pads = IdealCar(2.5), LongitudinalPlanner(PALISADE_CP).supervisor, []
+    for _ in range(round(4.0 / DT_MDL)):
+      sm, a_mpc = frame(car.v, car.a, lead=(-0.2, 0.0, 0.0), v_cruise=10.0, path=TestStandstillRelease.OPEN_ROAD), car.planner.mpc_a_target
+      car.planner.update(sm)
+      car.a = float(car.planner.output_a_target)
+      car.v = max(car.v + car.a * DT_MDL, 0.0)
+      contact, policy = supervisor.update(LeadObservation(True, 0.0), sm['carState'].vEgo, a_mpc), car.planner.supervisor
+      assert (policy.jerk_scale, policy.t_follow_pad) == (contact.jerk_scale, contact.t_follow_pad), (sm['carState'].vEgo, contact)
+      pads.append(policy.t_follow_pad)
+    assert max(pads) > 0.0
 
 
 class TestMpcSeed:
