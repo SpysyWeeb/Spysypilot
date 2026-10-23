@@ -36,6 +36,7 @@ STOP_SAMPLE_MIN_CONFIDENCE = 0.70
 STOP_RELEASE_PATH_MIN_DISTANCE = 20.0
 PATH_OPEN_LENGTH = 30.0    # m, at standstill a raw path this long reads as "the way ahead is open" (stubs sit at 2-5 m; greens 30-60 m)
 STOP_RELEASE_TERMINAL_SPEED_MIN = 3.0
+SLOWING_MARGIN = 1.0       # m/s, the plan's low point must sit at least this far below the car's speed to read as slowing
 STOP_COMMIT_MAX_DISTANCE = 100.0
 LEAD_STOP_PATH_HALF_WIDTH = 1.5
 MODEL_INVALID_RELEASE_S = 0.5
@@ -61,6 +62,7 @@ class StopObservation:
   release_open: bool = False
   corridor_clear: bool = False
   lane_change: bool = False     # the model is changing lanes: its endpoint is about to belong to another lane
+  slowing: bool = False         # the plan's low point sheds most of the car's speed, wherever the plan ends
 
 
 def _finite(values):
@@ -126,6 +128,9 @@ def observe_model_stop(model, car_state, radar_state):
   path_end = model.position.x[last]
   terminal_speed = model.velocity.x[last]
   terminal_heading = model.orientation.z[last] if len(model.orientation.z) == ModelConstants.IDX_N else math.nan
+  # judged on the plan's low point, not its end: a plan that dips toward the line and relaunches is still slowing for it
+  low_speed = min(list(model.velocity.x)[1:])
+  slowing = v_ego - low_speed >= SLOWING_MARGIN and low_speed <= v_ego * STOP_EARLY_TERMINAL_SPEED_RATIO
 
   blinker = car_state.leftBlinker or car_state.rightBlinker
   lateral_accel = abs(action.desiredCurvature) * v_ego ** 2
@@ -158,7 +163,7 @@ def observe_model_stop(model, car_state, radar_state):
                          desired_accel <= STOP_EARLY_DESIRED_ACCEL_MAX, terminal_speed >= STOP_TERMINAL_SPEED_MAX,
                          relevant_lead(radar_state, v_ego, path_end),
                          lead_present(radar_state), committed_turn, stop_release_open(model),
-                         path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model))
+                         path_end > 0.0 and leads_clear_of_stop_path(model, path_end), lane_changing(model), slowing)
 
 
 def lane_changing(model):
