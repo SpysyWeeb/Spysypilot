@@ -15,6 +15,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_
 from openpilot.selfdrive.controls.lib.necessity_supervisor import LeadDeparturePreRelease, NecessitySupervisor
 from openpilot.selfdrive.controls.lib.stop_helpers import StopObservation, observe_model_stop, path_open
 from openpilot.selfdrive.controls.lib.stop_landing import STANDSTILL_SPEED, STOP_INTENT_SPEED, StopLanding
+from openpilot.selfdrive.controls.lib.standstill_exit import StandstillExit
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, should_stop
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
@@ -93,14 +94,18 @@ class LongitudinalPlanner:
     self.throttle_prob = FirstOrderFilter(1.0, ALLOW_THROTTLE_PROB_TAU, dt)
     self.supervisor = NecessitySupervisor(dt)
     self.lead_departure = LeadDeparturePreRelease(dt, LEAD_ABSENCE_FRAMES)
+    self.lead_kept = LeadObservation()
     self.open_road_frames = 0
     self.open_road_filter = FirstOrderFilter(0.0, RELEASE_RC, dt)
     self.force_stops = ForceStops(dt)
     self.stop_landing = StopLanding(dt, CP.longitudinalActuatorDelay + DT_MDL, (J_CRUISE_BP, J_CRUISE_VALS))
+    self.standstill_exit = StandstillExit(dt, (J_CRUISE_BP, J_CRUISE_VALS))
     self.holding_prev = False
     self.mpc_a_target = init_a
 
     self.a_cruise = init_a
+    # the plan's target is what the planner's own candidates and owners read back; the published one adds the standstill exit's lift
+    self.plan_a_target = init_a
     self.output_a_target = init_a
     self.output_should_stop = False
     self.landing_stop_bit = False
@@ -143,6 +148,7 @@ class LongitudinalPlanner:
 
     if reset_state:
       self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
+      self.plan_a_target = float(self.output_a_target)
       self.a_cruise = self.output_a_target
       self.mpc_a_target = float(self.output_a_target)
       self.plan_winner = 'cruise'
@@ -151,6 +157,7 @@ class LongitudinalPlanner:
       self.open_road_frames = 0
       self.open_road_filter.x = 0.0
       self.stop_landing.reset()
+      self.standstill_exit.reset()
       self.holding_prev = False
 
     # No change cost when user is controlling the speed; it stays on through standstill so launches start smooth
@@ -158,31 +165,43 @@ class LongitudinalPlanner:
 
     radar_valid = sm.all_checks(['radarState'])
     model_valid = sm.all_checks(['modelV2'])
-    lead = LeadObservation.from_radar(sm['radarState'].leadOne, radar_valid)
+    # one reading of each radar slot for the lead view, the model's lead and the MPC: the lead the message holds, with finite values.
+    # radarState failing its checks is selfdrived's to act on; the lead it still reports is the lead
+    lead = LeadObservation.from_radar(sm['radarState'].leadOne)
+    lead_two = LeadObservation.from_radar(sm['radarState'].leadTwo)
+    at_rest = self.CP.openpilotLongitudinalControl and not long_control_off and sm['carState'].standstill
+    # the plan's target is the plan read action_t ahead, not its current acceleration: while the MPC drives it continues its
+    # own plan as far as the car can follow it, otherwise it starts from the plan's last target, never the standstill exit's
+    # lift. A car the pre-release held at rest last frame drove no plan: it starts from rest. Nothing below the planner closes a
+    # loop on speed, so the plan starts from the car's measured speed
+    if self.lead_departure.holding:
+      a_seed = a_told = 0.0
+    else:
+      a_told = self.plan_a_target
+      a_seed = float(np.clip(self.mpc.a_next, ACCEL_MIN, ACCEL_MAX)) if self.plan_winner in ('mpc', 'column') else a_told
+    self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, a_told, at_rest)
+    # the supervisor, the landing and the kiss see the lead the plan keeps, advanced a frame at a time through a dropout, a reset
+    # included: the MPC's keep outlives it. The MPC's state is set first so it answers as its update() will
+    if lead.present:
+      self.lead_kept = lead
+    elif self.lead_kept.present and self.mpc.keeps_lead(0, lead.present):
+      self.lead_kept = self.lead_kept.advanced(v_ego, self.dt)
+    else:
+      self.lead_kept = LeadObservation()
     model_leads = sm['modelV2'].leadsV3 if model_valid else []
-    lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if len(model_leads) > 0 else None
+    lead0_anchor = anchor_model_lead(model_leads[0], sm['radarState'].leadOne) if lead.present and len(model_leads) > 0 else None
     lead1_anchor = anchor_model_lead(model_leads[1], sm['radarState'].leadTwo) if len(model_leads) > 1 else None
-    policy = self.supervisor.update(lead, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
+    policy = self.supervisor.update(self.lead_kept, v_ego, self.mpc_a_target, lead0_anchor.accel if lead0_anchor is not None else None)
 
     experimental_mode = sm['selfdriveState'].experimentalMode
     stop = observe_model_stop(sm['modelV2'], sm['carState'], sm['radarState']) if model_valid else StopObservation()
-    force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, not reset_state, model_valid, self.output_a_target)
+    force_stop = self.force_stops.update(stop, sm['carState'], experimental_mode, not reset_state, model_valid, self.plan_a_target)
     stop_x = force_stop.stop_x if force_stop.stop_x is not None and math.isfinite(force_stop.stop_x) else None
     v_cruise = min(v_cruise, force_stop.v_cruise_cap)
 
     personality = sm['selfdriveState'].personality
-    # the published target is the plan read action_t ahead, not its current acceleration: while the MPC drives it continues its
-    # own plan as far as the car can follow it, otherwise it starts from what the car was told. A car the pre-release held at
-    # rest last frame drove no plan: it starts from rest. Nothing below the planner closes a loop on speed, so the plan starts
-    # from the car's measured speed
-    if self.lead_departure.holding:
-      a_seed = a_told = 0.0
-    else:
-      a_told = self.output_a_target
-      a_seed = float(np.clip(self.mpc.a_next, ACCEL_MIN, ACCEL_MAX)) if self.plan_winner in ('mpc', 'column') else a_told
-    self.mpc.set_cur_state(max(v_ego, 0.0), a_seed, a_told)
     self.mpc.update(sm['radarState'], personality, lead0_anchor, lead1_anchor, stop_x,
-                    policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint)
+                    policy.jerk_scale, policy.t_follow_pad, prev_accel_constraint, usable=(lead.present, lead_two.present))
 
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
@@ -217,11 +236,13 @@ class LongitudinalPlanner:
     # once the MPC holds the car at rest for a lead, its stop bit is the pre-release's: the plan's hover at rest does not release
     # it, a corroborated departure does, a release taken back before the lead moved holds the car again, and a hold is handed
     # back to the plan only on evidence that its lead has left -- with the lead missing, the model's open road or a Force Stops
-    # release. The acceleration target is untouched
+    # release. A car taking leadOne at rest with no hold standing, where the MPC leaves it no room, is held as that lead: only its
+    # own departure releases it. The acceleration target is untouched
     lead_departing = self.lead_departure.update(self.CP.openpilotLongitudinalControl and not long_control_off, sm['carState'].standstill,
                                                 lead, lead0_anchor.speed if lead0_anchor is not None else None,
                                                 output_should_stop_mpc and self.mpc.binding_obstacle == 'lead',
-                                                open_road or force_stops_release)
+                                                open_road or force_stops_release,
+                                                self.mpc.no_room and self.mpc.source == LongitudinalPlanSource.lead0)
     if lead_departing:
       output_should_stop_mpc = False
     elif self.lead_departure.holding:
@@ -232,7 +253,7 @@ class LongitudinalPlanner:
 
     # while a committed stop's profile is moving the car, the model's own request joins only if it is clearly more urgent:
     # its late ramp would overtake the profile through min() and put the heavy braking back at the end. Once it leads it stays
-    # until the profile is as deep: a profile that joins from the published target must not evict the request that set it
+    # until the profile is as deep: a profile that joins from the plan's target must not evict the request that set it
     e2e_admitted = experimental_mode and model_valid and (force_stop.a_target is None or
                                                           output_a_target_e2e < force_stop.a_target - E2E_STOP_MARGIN or
                                                           (self.plan_winner == 'e2e' and output_a_target_e2e <= force_stop.a_target))
@@ -244,9 +265,10 @@ class LongitudinalPlanner:
     if force_stop.a_target is not None:
       present.add('profile')
     # whatever set the output can leave instead of being crossed: the winner leaving min() (e2e at a mode exit, a committed stop
-    # at its release). Cruise then carries the car from the published target, not from wherever it slewed meanwhile
-    handed_over = self.plan_winner not in present
-    a_cruise_prev = self.output_a_target if handed_over else self.a_cruise
+    # at its release) or the MPC's lead gone for good. Cruise then carries the car from the plan's target, not from wherever it
+    # slewed meanwhile
+    handed_over = self.plan_winner not in present or (self.plan_winner == 'mpc' and self.mpc.lead_handover)
+    a_cruise_prev = self.plan_a_target if handed_over else self.a_cruise
     comfort = ordinary_cruise_comfort_enabled(experimental_mode, force_decel, radar_valid)
     self.a_cruise = get_cruise_accel(experimental_mode, v_cruise, v_ego, a_cruise_prev, self.dt, accel_coast, self.allow_throttle, comfort)
     # the set speed asks for a stop only at zero (a hold, forceDecel), not a cruise candidate carrying a hand-over below zero
@@ -262,27 +284,42 @@ class LongitudinalPlanner:
       candidates.append((force_stop.a_target, LongitudinalPlanSource.stop, False, 'profile'))
 
     a_arbitrated, self.plan_source, _, self.plan_winner = min(candidates, key=lambda c: c[0])
+    # at rest the stop bit is a hold or a committed launch. What holds the car: a Force Stops hold and every candidate's stop bit,
+    # the MPC's carrying the pre-release's hold. The releases stay the planner's own: the pre-release's corroborated departure, its
+    # hold handed back, a Force Stops green that does not hand its stop to a lead. An obstacle is the lead the MPC binds, in its
+    # radar slot, while from rest it leaves the car no room to move
+    held = force_stop.holding or any(stop_bit for _, _, stop_bit, _ in candidates)
+    slot = {LongitudinalPlanSource.lead0: 0, LongitudinalPlanSource.lead1: 1}.get(self.mpc.source)
+    self.standstill_exit.update(self.CP.openpilotLongitudinalControl and not long_control_off, sm['carState'].standstill, v_ego,
+                                held, force_stop.holding or self.lead_departure.holding,
+                                cruise_should_stop or (e2e_admitted and output_should_stop_e2e), lead_departing,
+                                self.lead_departure.handed_back or (force_stops_release and not stop.relevant_lead), a_arbitrated,
+                                self.lead_departure.lead, (slot, (lead, lead_two)[slot]) if self.mpc.no_room else None)
+    launch = launch or self.standstill_exit.committed
     # the landing law is the last word on every stop's final metres, whichever candidate is landing it. Intent: a
     # committed stop or hold, the MPC's own horizon ending in a stop (a stopped lead, the committed column), or the
     # model calling a stop in Experimental mode. The law latches through the landing once started; the planner's own
     # releases (a corroborated lead departure, a Force Stops release) end it at once, a climbing plan ends it by itself
     stop_intent = (force_stop.a_target is not None or force_stop.holding or float(np.min(self.mpc.v_solution)) < STOP_INTENT_SPEED
                    or (experimental_mode and model_valid and (stop.should_stop or stop.strict_stop)))
-    output_a_target = self.stop_landing.update(a_arbitrated, v_ego, lead, stop_intent, launch, a_ego=sm['carState'].aEgo,
-                                               launch_cancelled=self.lead_departure.cancelled)
+    output_a_target = self.stop_landing.update(a_arbitrated, v_ego, self.lead_kept, stop_intent, launch, a_ego=sm['carState'].aEgo,
+                                               launch_cancelled=self.lead_departure.cancelled or self.standstill_exit.taken_back)
     # the landing's kiss stops the wheels of a rolling car; LongControl's stopping ramp ignores the plan, so it takes over at the
     # standstill speed. A lead nearer than the kiss can stop short of is not the kiss's stop, and once the stop bit has risen in
     # a landing it stays for as long as its own rule holds it
     kiss_lands = (self.stop_landing.landing and not self.landing_stop_bit and v_ego > STANDSTILL_SPEED and
-                  self.stop_landing.lead_requirement(v_ego, lead) <= self.stop_landing.bound(v_ego))
-    if kiss_lands:
+                  self.stop_landing.lead_requirement(v_ego, self.lead_kept) <= self.stop_landing.bound(v_ego))
+    if self.standstill_exit.at_rest:
+      self.output_should_stop = self.standstill_exit.holding
+    elif kiss_lands:
       self.output_should_stop = force_stop.holding
     else:
       # the stop bit follows the landed target too: the MPC's hover around zero at standstill must not flicker it
       self.output_should_stop = (force_stop.holding or any(should_stop for _, _, should_stop, _ in candidates)
                                  or (self.stop_landing.landing and should_stop(v_ego, output_a_target)))
     self.landing_stop_bit = self.stop_landing.landing and self.output_should_stop and not kiss_lands
-    self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
+    self.plan_a_target = float(np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX))
+    self.output_a_target = np.clip(self.standstill_exit.apply(self.plan_a_target, v_ego), ACCEL_MIN, ACCEL_MAX)
 
   def publish(self, sm, pm):
     plan_send = messaging.new_message('longitudinalPlan')

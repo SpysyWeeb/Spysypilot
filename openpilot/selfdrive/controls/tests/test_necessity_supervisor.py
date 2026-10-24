@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
@@ -414,9 +416,175 @@ class TestLeadDeparturePreRelease:
       assert not (release.cancelled or release.holding or release.handed_back)
 
   def test_scope_loss_fails_closed(self):
+    # a frame without the lead is no evidence and the release stands; leaving the scope ends it
     release = LeadDeparturePreRelease()
     for _ in range(frames(LEAD_DEPARTURE_CONFIRM)):
       release.update(True, True, lead(v=0.0, d=6.0), 1.0)
-    assert not release.update(True, True, LeadObservation(), 1.0)
+    assert release.update(True, True, LeadObservation(), 1.0)
     assert not release.update(False, True, lead(v=0.0, d=6.0), 1.0)
     assert not release.update(True, False, lead(v=0.0, d=6.0), 1.0)
+
+  @pytest.mark.parametrize('length', [1, 2, 4])
+  @pytest.mark.parametrize('after', [0, 1, 3])
+  def test_a_frame_without_the_lead_neither_counts_toward_the_cancel_nor_withdraws_the_release(self, after, length):
+    # a forecast releases a car held behind a lead 6 m ahead and fades while the lead stands; the radar misses the lead for
+    # `length` frames after `after` frames of the fade. The release stands on every missing frame, and the cancel comes on the
+    # LEAD_DEPARTURE_CANCEL-th frame with the lead in sight, holding the car again
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=6.0), None, True)
+    for _ in range(frames(LEAD_DEPARTURE_CONFIRM)):
+      release.update(True, True, lead(v=0.0, d=6.0), 1.0)
+    assert not release.holding
+    rows = []
+    for k in range(frames(LEAD_DEPARTURE_CANCEL) + length + 2):
+      missing = after <= k < after + length
+      released = release.update(True, True, LeadObservation() if missing else lead(v=0.0, d=6.0), None if missing else 0.0)
+      rows.append((missing, released, release.cancelled, release.holding))
+    seen = [k for k, row in enumerate(rows) if not row[0]]
+    cancel = seen[frames(LEAD_DEPARTURE_CANCEL) - 1]
+    assert [k for k, row in enumerate(rows) if row[2]] == [cancel], rows
+    assert all(row[1] and not row[3] for row in rows[:cancel]) and all(row[3] and not row[1] for row in rows[cancel:]), rows
+
+  @pytest.mark.parametrize('drops', [{1, 3}, set(range(1, frames(1.0), 2))], ids=['two_within_the_window', 'alternate'])
+  def test_a_departure_with_frames_without_the_lead_is_not_cancelled(self, drops):
+    # the forecast releases the car and the lead pulls away; the radar misses it on some frames: on every frame it is seen the
+    # forecast or its measured speed is departure evidence, and the frames without it count nothing, so the release stands
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=6.0), None, True)
+    for _ in range(frames(LEAD_DEPARTURE_CONFIRM)):
+      release.update(True, True, lead(v=0.0, d=6.0), 1.0)
+    d, v = 6.0, 0.0
+    for k in range(frames(1.0)):
+      v += 1.0 * DT_MDL
+      d += v * DT_MDL
+      seen = k not in drops
+      assert release.update(True, True, lead(v=v, d=d) if seen else LeadObservation(), 1.0 if seen else None), k
+      assert not (release.cancelled or release.holding), k
+
+  @pytest.mark.parametrize('speed', [0.0, 0.6], ids=['standing', 'leaving'])
+  def test_a_lead_read_at_the_bumper_is_not_released_until_it_reads_clear(self, speed):
+    # the forecast releases a car held behind a lead 6 m ahead; the radar then reads that lead at the bumper, standing or leaving,
+    # the forecast still up: the release is taken back on that frame and the hold restored, and while it reads there nothing
+    # releases it, a measured speed above LEAD_DEPARTURE_SPEED included. On the first frame it reads clear of the bumper it is released
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=6.0), None, True)
+    for _ in range(frames(LEAD_DEPARTURE_CONFIRM)):
+      release.update(True, True, lead(v=0.0, d=6.0), 1.0)
+    assert release.update(True, True, lead(v=0.0, d=6.0), 1.0)
+    assert not release.update(True, True, lead(v=speed, d=0.0), 1.0)
+    assert release.cancelled and release.holding
+    for _ in range(3):
+      assert not release.update(True, True, lead(v=0.6, d=0.0), 1.0)
+      assert release.holding and not release.cancelled
+    assert release.update(True, True, lead(v=0.6, d=0.03), 1.0) and not release.holding
+
+  @pytest.mark.parametrize('every', [2, 3])
+  @pytest.mark.parametrize('start', [1, 2, 3])
+  @pytest.mark.parametrize('evidence', ['measured', 'forecast'])
+  def test_a_departure_seen_on_some_frames_confirms_on_the_frames_it_is_seen(self, evidence, start, every):
+    # held behind a lead 6 m ahead, which creeps off at 0.3 m/s on its model-confirmed track, or stands while the model forecasts it
+    # leaving; the radar misses it on every 2nd or 3rd frame from `start`. A frame without it neither advances nor restarts the
+    # confirmation: the release comes on the frame the lead has been seen with that evidence for LEAD_DEPARTURE_CONFIRM, and stands
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=6.0), None, True)
+    drops = set(range(start, frames(1.0), every))
+    d, v = 6.0, 0.3 if evidence == 'measured' else 0.0
+    seen, rows = 0, []
+    for k in range(frames(1.0)):
+      d += v * DT_MDL
+      if k in drops:
+        released = release.update(True, True, LeadObservation(), None)
+      else:
+        released = release.update(True, True, lead(v=v, d=d), 1.0 if evidence == 'forecast' else None)
+        seen += 1
+      rows.append((seen, released, release.holding))
+    first = next(k for k, (_, released, _) in enumerate(rows) if released)
+    assert rows[first][0] == frames(LEAD_DEPARTURE_CONFIRM) and first not in drops, rows
+    assert all(holding and not released for _, released, holding in rows[:first]), rows
+    assert all(released and not holding for _, released, holding in rows[first:]), rows
+
+  @pytest.mark.parametrize('before', ['released', 'handed_back', 'no_lead'])
+  def test_a_car_taking_the_slot_at_rest_where_the_mpc_leaves_no_room_is_held(self, before):
+    # no hold stands: the car's lead was released and is driving off, its hold was handed back on the open road, or there was no lead
+    # at all. A car the model does not see then takes the slot 2 m ahead, and the MPC leaves the car no room to move for it: the car
+    # now rests behind it, held from that frame with no release. A car taking the slot with room is not held
+    for no_room in (True, False):
+      release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+      if before == 'no_lead':
+        for _ in range(LEAD_ABSENCE_FRAMES):
+          release.update(True, True, LeadObservation(), None)
+      else:
+        release.update(True, True, lead(v=0.0, d=6.0), None, True)
+        if before == 'released':
+          assert release.update(True, True, lead(v=0.6, d=6.1), None)
+        else:
+          release.update(True, True, LeadObservation(), None, False, True)
+          assert release.handed_back
+      for _ in range(frames(1.0)):
+        assert not release.update(True, True, lead(v=0.0, d=2.0, model_prob=0.0, track_id=11), None, False, False, no_room)
+        assert release.holding == no_room and not (release.handed_back or release.cancelled), (before, no_room)
+
+  def test_behind_a_car_taken_at_rest_a_car_beyond_is_a_frame_without_it(self):
+    # the car's lead drives off and is released; a car the model does not see takes the slot 2 m ahead with no room and is held. The
+    # radar then misses it on alternate frames and then for a second, reading on most of those frames the leaving lead beyond it,
+    # above LEAD_DEPARTURE_SPEED, forecast leaving and with no room for it: none of that is the held car's, so nothing is released,
+    # cancelled or handed back and the held car stays the lead it judges. Its own departure, on its radar track, releases the car
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=6.0), None, True)
+    assert release.update(True, True, lead(v=0.6, d=6.1), None)
+    cut_in = lead(v=0.0, d=2.0, model_prob=0.0, track_id=11)
+    release.update(True, True, cut_in, None, False, False, True)
+    assert release.holding
+    d = 6.1
+    for k in range(frames(2.0)):
+      d += 1.0 * DT_MDL
+      seen = k < frames(1.0) and k % 2 == 1
+      reading = cut_in if seen else lead(v=1.0, d=d) if k % 3 else LeadObservation()
+      assert not release.update(True, True, reading, None if seen else 1.0, False, False, True), k
+      assert release.holding and not (release.handed_back or release.cancelled) and release.lead == cut_in, k
+    assert release.update(True, True, lead(v=0.6, d=2.1, model_prob=0.0, track_id=11), None, False, False, True)
+    assert not release.holding
+
+  def test_the_models_open_road_does_not_end_the_hold_on_a_car_taken_at_rest(self):
+    # a car taken at rest and then missed for a second while the model's road reads open, or Force Stops releases: the radar misses
+    # a car this near and the road reads open past a car the model does not see, so the hold stands; the lead the car came to rest
+    # behind is handed back on it as before
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=6.0), None, True)
+    assert release.update(True, True, lead(v=0.6, d=6.1), None)
+    release.update(True, True, lead(v=0.0, d=2.0, model_prob=0.0, track_id=11), None, False, False, True)
+    for _ in range(frames(1.0)):
+      assert not release.update(True, True, LeadObservation(), None, False, True)
+      assert release.holding and not release.handed_back
+    assert release.update(True, True, lead(v=0.6, d=2.1, model_prob=0.0, track_id=11), None, False, False, True)
+
+  def test_a_car_taking_the_slot_while_a_hold_stands_is_under_that_hold(self):
+    # held behind the lead the car came to rest behind, 8.9 m ahead, a car cuts in 3.1 m ahead with no room for it: the hold stands as
+    # for any nearer car, on where the held lead stood, so a car then read beyond that ends it as before
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=8.9), None, True)
+    release.update(True, True, lead(v=0.0, d=3.1, track_id=9), None, False, False, True)
+    assert release.holding and not release.handed_back
+    release.update(True, True, lead(v=0.0, d=9.2, track_id=10), None)
+    assert not release.holding and release.handed_back
+
+  def test_the_lead_the_car_came_to_rest_behind_is_not_a_car_taken_at_rest(self):
+    # the lead present as the car comes to rest, with no room for it, is that lead: held from the MPC's own stop for it, and a car
+    # standing beyond it ends the hold. Its own track taking the slot back after that is that lead again, and so is ended again
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=5.0), None, False, False, True)
+    assert not release.holding
+    for _ in range(2):
+      release.update(True, True, lead(v=0.0, d=5.0), None, True, False, True)
+      assert release.holding
+      release.update(True, True, lead(v=0.0, d=12.5, track_id=9), None)
+      assert not release.holding and release.handed_back
+
+  def test_the_lead_it_judges_is_kept_as_last_read_through_a_frame_without_it(self):
+    release = LeadDeparturePreRelease(absence_frames=LEAD_ABSENCE_FRAMES)
+    release.update(True, True, lead(v=0.0, d=6.0), None, True)
+    release.update(True, True, LeadObservation(), None)
+    assert release.lead == lead(v=0.0, d=6.0)
+    # the model's open road while it is missing hands the hold back and forgets it
+    release.update(True, True, LeadObservation(), None, False, True)
+    assert release.handed_back and not release.lead.present

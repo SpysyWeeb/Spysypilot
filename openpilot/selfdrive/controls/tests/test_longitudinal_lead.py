@@ -3,6 +3,7 @@ import math
 import numpy as np
 
 from openpilot.cereal import log
+from openpilot.common.realtime import DT_MDL
 import openpilot.cereal.messaging as messaging
 from openpilot.selfdrive.controls.lib.longitudinal_lead import (LEAD_T_IDXS, LeadObservation, anchor_model_lead, closing_decel_requirement,
                                                                 lead_present, relevant_lead, time_to_collision, total_decel_requirement)
@@ -35,26 +36,50 @@ def model_lead(v, x=None, prob=0.9, x_std=1.0, v_std=0.5, t=None):
 
 class TestLeadObservation:
   def test_needs_a_live_present_lead(self):
-    assert not LeadObservation.from_radar(radar_lead(), False).present
-    assert not LeadObservation.from_radar(radar_lead(present=False), True).present
+    assert not LeadObservation.from_radar(radar_lead(present=False)).present
 
   def test_rejects_nonfinite_or_impossible_values(self):
-    assert not LeadObservation.from_radar(radar_lead(dRel=math.nan), True).present
-    assert not LeadObservation.from_radar(radar_lead(dRel=0.0), True).present
-    assert not LeadObservation.from_radar(radar_lead(vLeadK=math.inf), True).present
+    assert not LeadObservation.from_radar(radar_lead(dRel=math.nan)).present
+    assert not LeadObservation.from_radar(radar_lead(vLeadK=math.inf)).present
+
+  def test_a_lead_at_or_behind_the_bumper_is_in_contact(self):
+    for d in (0.0, -0.4):
+      lead = LeadObservation.from_radar(radar_lead(dRel=d))
+      assert lead.present and lead.distance == 0.0, (d, lead)
 
   def test_carries_the_models_confidence_and_the_radar_track(self):
     radar = radar_lead(modelProb=0.75)
     radar.radarTrackId = 396447
-    lead = LeadObservation.from_radar(radar, True)
+    lead = LeadObservation.from_radar(radar)
     assert lead.model_prob == 0.75 and lead.track_id == 396447
-    assert LeadObservation.from_radar(radar_lead(), True).track_id == -1
+    assert LeadObservation.from_radar(radar_lead()).track_id == -1
 
   def test_sanitizes_filtered_values(self):
-    lead = LeadObservation.from_radar(radar_lead(vLeadK=-0.2, aLeadK=-20.0, modelProb=1.4), True)
+    lead = LeadObservation.from_radar(radar_lead(vLeadK=-0.2, aLeadK=-20.0, modelProb=1.4))
     assert lead.present
     assert lead.speed == 0.0
     assert lead.acceleration == -10.0
+
+
+class TestLeadAdvanced:
+  # a lead the plan keeps through a dropout, one frame on at its own speed and acceleration, seen from the car
+  def test_a_lead_moves_at_its_own_speed_and_acceleration_and_the_car_closes_by_its_travel(self):
+    radar = radar_lead(dRel=20.0, vLeadK=5.0, aLeadK=-2.0, modelProb=0.8)
+    radar.radarTrackId = 7
+    lead = LeadObservation.from_radar(radar)
+    ahead = lead.advanced(6.0, DT_MDL)
+    assert ahead.present and (ahead.model_prob, ahead.track_id) == (lead.model_prob, lead.track_id)
+    assert math.isclose(ahead.speed, 5.0 - 2.0 * DT_MDL, rel_tol=1e-9) and ahead.acceleration == -2.0
+    assert math.isclose(ahead.distance, 20.0 + (5.0 + ahead.speed) / 2.0 * DT_MDL - 6.0 * DT_MDL, rel_tol=1e-9)
+
+  def test_a_braking_lead_comes_to_rest_and_stays_there(self):
+    # 5 m/s braking at 2 m/s^2: at rest after 2.5 s and 6.25 m, and from then on it neither moves nor brakes
+    lead = LeadObservation.from_radar(radar_lead(dRel=20.0, vLeadK=5.0, aLeadK=-2.0))
+    for _ in range(round(3.0 / DT_MDL)):
+      lead = lead.advanced(0.0, DT_MDL)
+    assert lead.speed == 0.0 and lead.acceleration == 0.0
+    assert math.isclose(lead.distance, 20.0 + 5.0 ** 2 / (2.0 * 2.0), rel_tol=1e-9)
+    assert math.isclose(lead.advanced(1.0, DT_MDL).distance, lead.distance - 1.0 * DT_MDL, rel_tol=1e-9)
 
 
 class TestLeadPhysics:

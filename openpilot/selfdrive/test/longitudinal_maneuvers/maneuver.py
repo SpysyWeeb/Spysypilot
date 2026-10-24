@@ -1,5 +1,9 @@
 import numpy as np
+from openpilot.selfdrive.controls.lib.standstill_exit import LAUNCH_ACCEL
 from openpilot.selfdrive.test.longitudinal_maneuvers.plant import Plant
+
+# s the planner may leave a car with a faster lead not starting; the ESC's own exit under the launch level comes on top
+START_WINDOW = 0.5
 
 
 class Maneuver:
@@ -36,6 +40,7 @@ class Maneuver:
     self.CP = kwargs.get("CP", None)
     self.accel_error = kwargs.get("accel_error", 0.0)
     self.creep = kwargs.get("creep", 0.0)
+    self.esc = kwargs.get("esc", "integral")
 
     self.duration = duration
     self.title = title
@@ -58,11 +63,13 @@ class Maneuver:
       CP=self.CP,
       accel_error=self.accel_error,
       creep=self.creep,
+      esc=self.esc,
     )
 
     valid = True
     logs = []
     not_starting_t = 0.0
+    start_window = START_WINDOW + (plant.esc.launch_delay(LAUNCH_ACCEL) if plant.esc is not None else 0.0)
     while plant.current_time < self.duration:
       speed_lead = np.interp(plant.current_time, self.breakpoints, self.speed_lead_values)
       prob_lead = np.interp(plant.current_time, self.breakpoints, self.prob_lead_values)
@@ -97,7 +104,7 @@ class Maneuver:
       if self.ensure_start and log['speed'] < 2.0 and log['v_rel'] > 0 and log['acceleration'] < 1e-3:
         if not_starting_t == 0.0:
           not_starting_t = plant.current_time
-        elif plant.current_time - not_starting_t > 0.5:
+        elif plant.current_time - not_starting_t > start_window:
           print('LongitudinalPlanner not starting!')
           valid = False
       else:

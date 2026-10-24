@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from openpilot.selfdrive.controls.lib.stop_landing import STANDSTILL_SPEED
 from openpilot.selfdrive.controls.radard import _LEAD_ACCEL_TAU
 
 RADAR_DREL_STEP = 0.1  # m, the resolution of the Palisade radar's track distance
@@ -89,13 +90,78 @@ class ActuatorLag:
     return self.accel
 
 
+class EscStandstill:
+  """The Palisade's ESC standstill brake, fitted on its CAN bus from SCC12's StopReq and request to the engine torque's onset and
+  the wheels' first motion. It holds the wheels of a car at rest under StopReq, and from the frame StopReq falls lets them go once
+  the request has built up past its release level: the torque comes in at the onset, and the wheels turn BREAKAWAY_S later, more
+  uphill. 'integral' is the best held-out fit (the onset INTEGRAL_DELAY after the request's excess over INTEGRAL_ACCEL integrates to
+  INTEGRAL_BUILD, sooner the higher the request); 'threshold' is the level-blind fit that brackets it (THRESHOLD_DELAY after the
+  request held THRESHOLD_ACCEL for THRESHOLD_DWELL). StopReq rising again before the wheels turn holds them and starts over. The
+  actuator keeps answering the request under the held wheels, so they turn, at the fitted time, on what it has built."""
+  INTEGRAL_ACCEL = 0.30    # m/s^2
+  INTEGRAL_BUILD = 0.25    # m/s
+  INTEGRAL_DELAY = 0.20    # s
+  THRESHOLD_ACCEL = 0.50   # m/s^2
+  THRESHOLD_DWELL = 0.10   # s
+  THRESHOLD_DELAY = 0.65   # s
+  BREAKAWAY_S = 0.556      # s from the onset to the wheels turning on the flat ...
+  BREAKAWAY_PER_DEG = 0.075  # ... and this much longer per degree uphill
+  FORMS = ('integral', 'threshold')
+
+  def __init__(self, form='integral'):
+    assert form in self.FORMS, form
+    self.form = form
+    self.holding = False
+    self._start_over()
+
+  def _start_over(self):
+    self.build = 0.0       # the integral (m/s) or the dwell (s) toward the onset
+    self.release_in = None  # s from the onset until the wheels turn
+
+  def launch_delay(self, request, pitch=0.0):
+    # s from StopReq falling under a steady request to the wheels turning
+    if self.form == 'integral':
+      onset = self.INTEGRAL_BUILD / (request - self.INTEGRAL_ACCEL) + self.INTEGRAL_DELAY if request > self.INTEGRAL_ACCEL else math.inf
+    else:
+      onset = self.THRESHOLD_DWELL + self.THRESHOLD_DELAY if request >= self.THRESHOLD_ACCEL else math.inf
+    return onset + self.BREAKAWAY_S + self.BREAKAWAY_PER_DEG * max(math.degrees(pitch), 0.0)
+
+  def update(self, stop_req, request, at_rest, pitch, dt):
+    """One control step; returns whether the wheels are held."""
+    if stop_req:
+      self.holding = self.holding or at_rest
+      self._start_over()
+      return self.holding
+    if not self.holding:
+      return False
+    if self.release_in is None:
+      if self.form == 'integral':
+        self.build += max(request - self.INTEGRAL_ACCEL, 0.0) * dt
+        onset, delay = self.build + 1e-9 >= self.INTEGRAL_BUILD, self.INTEGRAL_DELAY
+      else:
+        self.build = self.build + dt if request >= self.THRESHOLD_ACCEL else 0.0
+        onset, delay = self.build + 1e-9 >= self.THRESHOLD_DWELL, self.THRESHOLD_DELAY
+      if onset:
+        self.release_in = delay + self.BREAKAWAY_S + self.BREAKAWAY_PER_DEG * max(math.degrees(pitch), 0.0)
+      return True
+    self.release_in -= dt
+    if self.release_in < 1e-9:
+      self.holding = False
+      self._start_over()
+    return self.holding
+
+
 E2E_PUSH_DISTANCE = 12.0  # m, the fake model's late ramp builds over this distance to the line
+GREEN_PATH = 60.0  # m, at a green the fake model plans a long path, twice what reads as an open road at standstill
+GREEN_SPEED = 5.0  # m/s, its terminal speed
+GREEN_ACCEL = 0.5  # m/s^2, its request
 
 
 class Plant:
   def __init__(self, lead_relevancy=False, speed=0.0, distance_lead=2.0,
                enabled=True, only_lead2=False, only_radar=False, e2e=False, personality=0, force_decel=False,
-               stop_line=None, stop_line_horizon_s=5.0, e2e_landing_push=0.0, actuator_lag=False, CP=None, accel_error=0.0, creep=0.0):
+               stop_line=None, stop_line_horizon_s=5.0, e2e_landing_push=0.0, actuator_lag=False, CP=None, accel_error=0.0, creep=0.0,
+               esc='integral'):
     self.rate = 1. / DT_MDL
 
 
@@ -130,6 +196,9 @@ class Plant:
     self.accel_error = accel_error
     # driveline creep, added to launch requests too
     self.creep = creep
+    # the ESC's standstill brake under the actuator (None: wheels at rest go on any positive request)
+    self.esc = EscStandstill(esc) if esc is not None else None
+    self.pitch = 0.0
 
     self.rk = Ratekeeper(self.rate, print_delay_threshold=100.0)
     self.ts = 1. / self.rate
@@ -176,12 +245,26 @@ class Plant:
     velocity.x[0] = float(self.speed)
     model.velocity = velocity
 
+  def _plan_open_road(self, model):
+    # a green: the model drops its stop, plans a long moving path and asks to go
+    n = len(ModelConstants.T_IDXS)
+    position = log.XYZTData.new_message()
+    position.x = [float(x) for x in np.linspace(0.0, GREEN_PATH, n)]
+    model.position = position
+    velocity = log.XYZTData.new_message()
+    velocity.x = [float(v) for v in np.linspace(self.speed, GREEN_SPEED, n)]
+    model.velocity = velocity
+    model.action.desiredAcceleration = GREEN_ACCEL
+    model.action.shouldStop = False
+
   @property
   def current_time(self):
     return float(self.rk.frame) / self.rate
 
   def step(self, v_lead=0.0, prob_lead=1.0, v_cruise=50., pitch=0.0, prob_throttle=1.0,
-           radar_valid=True, model_valid=True):
+           radar_valid=True, model_valid=True, forecast=None, green=False):
+    # forecast: the acceleration the model sees the lead hold when it differs from the radar's; green: the model reads the stop
+    # line's light green and plans open road
     # ******** publish a fake model going straight and fake calibration ********
     # note that this is worst case for MPC, since model will delay long mpc by one time step
     radar = messaging.new_message('radarState')
@@ -239,18 +322,21 @@ class Plant:
     acceleration = log.XYZTData.new_message()
     acceleration.x = [float(x) for x in np.zeros_like(ModelConstants.T_IDXS)]
     model.modelV2.acceleration = acceleration
-    if self.stop_line is not None:
+    if green:
+      self._plan_open_road(model.modelV2)
+    elif self.stop_line is not None:
       self._plan_stop_line(model.modelV2)
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle) for _ in range(6)]
 
     # lead0 mirrors the radar lead above; lead1/lead2 are shaped but carry no probability
     lead_t = np.asarray(ModelConstants.LEAD_T_IDXS, dtype=np.float64)
-    if a_lead < 0.0:
-      stop_t = np.minimum(lead_t, max(-v_lead / a_lead, 0.0))
+    a_model = a_lead if forecast is None else forecast
+    if a_model < 0.0:
+      stop_t = np.minimum(lead_t, max(-v_lead / a_model, 0.0))
     else:
       stop_t = lead_t
-    lead0_v = np.maximum(v_lead + a_lead * lead_t, 0.0)
-    lead0_x = np.maximum.accumulate(d_rel + v_lead * stop_t + 0.5 * a_lead * stop_t ** 2)
+    lead0_v = np.maximum(v_lead + a_model * lead_t, 0.0)
+    lead0_x = np.maximum.accumulate(d_rel + v_lead * stop_t + 0.5 * a_model * stop_t ** 2)
     lead0_prob = float(prob_lead) if self.lead_relevancy else 0.0
     zeros = np.zeros_like(lead_t)
     model.modelV2.leadsV3 = [
@@ -266,9 +352,11 @@ class Plant:
     control.controlsState.forceDecel = self.force_decel
     car_state.carState.vEgo = float(self.speed)
     car_state.carState.aEgo = float(self.a_ego)
-    car_state.carState.standstill = bool(self.speed < 0.01)
+    # the car's standstill flag, under 0.104 m/s of wheel speed on Hyundai
+    car_state.carState.standstill = bool(self.speed < STANDSTILL_SPEED)
     car_state.carState.vCruise = float(v_cruise * 3.6)
     car_control.carControl.orientationNED = [0., float(pitch), 0.]
+    self.pitch = float(pitch)
 
     # ******** get controlsState messages for plotting ***
     invalid = set()
@@ -292,20 +380,22 @@ class Plant:
     self.distance_lead = self.distance_lead + v_lead * self.ts
 
     # ******** run the car ********
-    # controlsd's LongControl on the held plan, then the actuator, the wheels and the car's speed filter
+    # controlsd's LongControl on the held plan, then the ESC's standstill brake and the actuator, the wheels and the car's speed filter
     cs = messaging.new_message('carState').carState
     # opendbc's limits, the Palisade's own; a port's clamp (the Civic's Nidec near its set speed) is not what these judge
     accel_limits = CarInterfaceBase.get_pid_accel_limits(self.CP, self.speed, v_cruise)
     for _ in range(round(DT_MDL / DT_CTRL)):
       cs.vEgo, cs.aEgo = self.speed, self.a_ego
       request = float(self.long_control.update(self.enabled, cs, self.a_target, self.should_stop, accel_limits))
+      stop_req = self.long_control.long_control_state == LongCtrlState.stopping
+      held = self.esc is not None and self.esc.update(stop_req, request, self.speed <= 0.0, self.pitch, DT_CTRL)
       accel = self.actuator.update(request, self.speed) if self.actuator is not None else request
       if self.speed > 0.0:
         accel += self.accel_error
       if request > CREEP_HOLD_REQUEST:
         accel += self.creep * max(1.0 - self.speed / DRIVELINE_CREEP_SPEED, 0.0)
       if self.speed <= 0.0:
-        accel = max(accel, 0.0)
+        accel = 0.0 if held else max(accel, 0.0)
       self.speed = max(self.speed + accel * DT_CTRL, 0.0)
       self.distance = self.distance + self.speed * DT_CTRL
       self.a_ego = self.CI.CS.update_speed_kf(self.speed)[1]
@@ -335,6 +425,7 @@ class Plant:
       "a_target": self.a_target,
       "should_stop": self.should_stop,
       "forcing": self.planner.force_stops.forcing,
+      "held": self.esc is not None and self.esc.holding,
       "distance_lead": self.distance_lead,
       "fcw": fcw,
     }
