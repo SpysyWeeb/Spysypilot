@@ -2,10 +2,16 @@
 import numpy as np
 import pytest
 
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_PRESENCE_FRAMES, LongitudinalMpc
+from openpilot.selfdrive.controls.lib.longitudinal_lead import LeadObservation
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_ABSENCE_FRAMES, LEAD_PRESENCE_FRAMES, LongitudinalMpc
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.controls.tests.test_lane_change_release import (LaneChangePlant, LaneChangeState, frame, get_cp,
                                                                         mpc_follows, released_frames, summary)
+
+
+def update(mpc, radar, **kwargs):
+  # one MPC update as the planner makes it, on its one reading of each radar slot
+  mpc.update(radar, usable=tuple(LeadObservation.from_radar(lead).present for lead in (radar.leadOne, radar.leadTwo)), **kwargs)
 
 
 def test_restored_lead_discards_free_run_change_cost_through_the_reanchor(monkeypatch):
@@ -78,8 +84,8 @@ def test_restoring_a_nonbinding_lead_does_not_change_the_incumbent(restored_slot
   for _ in range(20):
     for mpc in (restored, ordinary):
       mpc.set_cur_state(12.0, 0.0, 0.0)
-    restored.update(radar, restored_leads=mask)
-    ordinary.update(radar)
+    update(restored, radar, restored_leads=mask)
+    update(ordinary, radar)
     assert restored.restoring_lead is None
     np.testing.assert_array_equal(restored.params, ordinary.params)
     np.testing.assert_array_equal(restored.a_solution, ordinary.a_solution)
@@ -93,8 +99,8 @@ def test_pending_restore_cannot_leak_to_another_obstacle(monkeypatch, interrupti
   radar = frame(12.0, 0.0, 40.0, 11.0)['radarState']
   for _ in range(20):
     mpc.set_cur_state(12.0, 1.0, 1.0)
-    mpc.update(absent)
-  mpc.update(radar, restored_leads=(True, True))
+    update(mpc, absent)
+  update(mpc, radar, restored_leads=(True, True))
   assert mpc.restoring_lead == 0
   kwargs = {}
   if interruption == 'lead_missing':
@@ -115,7 +121,7 @@ def test_pending_restore_cannot_leak_to_another_obstacle(monkeypatch, interrupti
 
   monkeypatch.setattr(mpc, 'set_cost_weights', record)
   mpc.set_cur_state(12.0, 1.0, 1.0)
-  mpc.update(radar, **kwargs)
+  update(mpc, radar, **kwargs)
   assert mpc.restoring_lead is None
   assert costs[0] > 0.0
 
@@ -126,3 +132,28 @@ def test_a_missing_released_lead_is_not_a_restored_obstacle():
   planner.update(frame(12.0, 0.0, 40.0, 11.0, y_ego=3.5, path=0.0, lead_present=False))
   assert planner.mpc.restoring_lead is None
   assert planner.mpc.binding_obstacle == 'fake'
+
+
+def test_a_released_lead_is_not_kept_as_a_dropout():
+  # the MPC keeps a lead the radar loses through its absence hold; a lead the lane-change gap releases has left the plan on purpose, so
+  # from its release frame on its slot is the free run and nothing is kept for it, while the identity hands over after the absence
+  # hold as before. A lead restored later starts its own count again, so the keep never spans a release
+  planner = LongitudinalPlanner(get_cp(), init_v=12.0)
+  for _ in range(20):
+    planner.update(frame(12.0, 0.0, 40.0, 11.0, state=LaneChangeState.off, blinker=False))
+  assert mpc_follows(planner, 40.0, 11.0)
+  frames = []
+  for _ in range(10):
+    planner.update(frame(12.0, 0.0, 40.0, 11.0, y_ego=1.5, path=2.0))
+    frames.append((tuple(planner.lane_change_gap.released), tuple(planner.mpc.kept), planner.mpc.binding_obstacle))
+  released = [k for k, (slots, _, _) in enumerate(frames) if all(slots)]
+  assert released and released == list(range(released[0], len(frames))), frames
+  assert not any(any(kept) for _, kept, _ in frames), frames
+  assert not mpc_follows(planner, 40.0, 11.0)
+  first = next(k for k, (slots, _, _) in enumerate(frames) if any(slots))
+  assert [identity for _, _, identity in frames[first:first + LEAD_ABSENCE_FRAMES]] == ['lead'] * (LEAD_ABSENCE_FRAMES - 1) + ['fake'], frames
+  # the change called off: the gap restores the car, which the radar then loses after one frame back. One frame is no confirmation
+  planner.update(frame(12.0, 0.0, 40.0, 11.0, state=LaneChangeState.off, blinker=False))
+  assert not any(planner.lane_change_gap.released) and mpc_follows(planner, 40.0, 11.0)
+  planner.update(frame(12.0, 0.0, 40.0, 11.0, state=LaneChangeState.off, blinker=False, lead_present=False))
+  assert not any(planner.mpc.kept) and not planner.lead_kept.present

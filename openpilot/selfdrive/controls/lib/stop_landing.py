@@ -25,8 +25,9 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_
 # it lasts through the hover and through standstill, and ends only on a launch -- the lead-departure pre-release or its
 # hold handed back, a Force Stops release (the commitment over, not a hold rolling on into a moving commitment) -- the
 # plan positive for LAUNCH_FRAMES in a row above KISS_SPEED, or the speed leaving the window; a launch the planner takes
-# back at standstill latches it again. Whatever it still holds the plan below when it ends is handed back at the planner's
-# cruise jerk, so no exit steps the car; a reset drops it.
+# back at standstill latches it again. Whatever it still holds the plan below when it ends, and the braking a missing lead
+# needed beyond the bound once its absence window ends, is handed back at the planner's cruise jerk, so no exit steps the car;
+# a reset drops it.
 LANDING_SPEED = 3.5          # m/s, the law acts below this; at the top the bound (2.75 m/s^2) exceeds any comfort approach
 STOP_INTENT_SPEED = 0.5      # m/s, the MPC's horizon must reach below this for a slowdown to count as a stop
 KISS_SPEED = 0.40            # m/s, from here down the car rides the kiss alone
@@ -121,17 +122,18 @@ class StopLanding:
       requirement = max(requirement, stop_within(v_ego, room))
     return requirement
 
-  def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None, launch_cancelled=False, lead2=None):
+  def update(self, a_target, v_ego, lead, stop_intent, launch=False, a_ego=None, launch_cancelled=False, lead2=None, lead_read=None):
     """Bound the arbitrated acceleration target through a landing; returns the plan unchanged otherwise.
 
-    lead and optional lead2 are the planner's LeadObservations. stop_intent says the plan ends in a stop, launch says the planner
+    lead is the lead the plan keeps and lead_read whether the planner's reading holds it this frame (None: lead is that reading),
+    optional lead2 the planner's reading of leadTwo. stop_intent says the plan ends in a stop, launch says the planner
     itself is letting the car go (a lead-departure pre-release or its hold handed back, a Force Stops release), a_ego is
     the car's measured acceleration (None: the anti-stall integral holds), launch_cancelled says the planner took back a
     launch it issued at standstill. A landing starts on intent with the plan braking more than the kiss below
     LANDING_SPEED, unless the planner is issuing a launch that same frame, or at standstill on a cancelled launch, and then
     lasts -- through the MPC's hover around zero and through standstill -- until a launch, the plan climbing above zero for
     LAUNCH_FRAMES in a row above KISS_SPEED, or the speed leaving the window. Then an output it held below the plan rises
-    at the release jerk until it meets the plan.
+    at the release jerk until it meets the plan, and so does braking held beyond the bound for a lead whose absence window ended.
     """
     if not math.isfinite(v_ego):
       # a non-finite speed resets everything, a release included
@@ -141,12 +143,17 @@ class StopLanding:
     expired_requirement = 0.0
     # Retain each slot's last urgency over the MPC's brief absence window, even if the other lead remains.
     # This only permits planned braking through the comfort bound; it is not a retained MPC obstacle or a brake demand.
+    # The window counts from the reading's loss. A lead the plan still keeps is present, its urgency follows it, and its
+    # window cannot end before that keep does; the expiry below is the one hand-back of a vanished lead's room, for either slot
+    read = (lead.present if lead_read is None else lead_read, lead2 is not None and lead2.present)
     for i, observation in enumerate((lead, lead2)):
-      if observation is not None and observation.present:
+      present = observation is not None and observation.present
+      if present:
         self._lead_requirements[i] = self.lead_requirement(v_ego, observation)
+      if read[i]:
         self._lead_missing[i] = 0
       else:
-        self._lead_missing[i] = min(self._lead_missing[i] + 1, LEAD_ABSENCE_FRAMES)
+        self._lead_missing[i] = min(self._lead_missing[i] + 1, LEAD_ABSENCE_FRAMES - 1 if present else LEAD_ABSENCE_FRAMES)
         if self._lead_missing[i] >= LEAD_ABSENCE_FRAMES:
           expired_requirement = max(expired_requirement, self._lead_requirements[i])
           self._lead_requirements[i] = 0.0

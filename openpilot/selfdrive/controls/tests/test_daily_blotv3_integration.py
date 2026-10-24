@@ -8,6 +8,7 @@ from openpilot.cereal import log
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR
 from opendbc.car.interfaces import ACCEL_MAX
+from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.selfdrive.controls.lib.force_stops import ForceStopsResult
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
@@ -15,6 +16,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_lead import LEAD_T_IDXS, Lead
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LEAD_ABSENCE_FRAMES
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner, get_max_accel
 from openpilot.selfdrive.controls.tests.test_longitudinal_lead import model_lead, radar_lead
+from openpilot.selfdrive.controls.tests.test_longitudinal_planner import IdealCar, j_cruise_step
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
@@ -123,8 +125,14 @@ def test_landing_urgency_survives_only_the_bounded_lead_absence_window(slot, dro
   assert math.isclose(planner.output_a_target, -3.0, abs_tol=1e-6)
 
   if dropout == 'radar_invalid':
+    # a frame radarState fails its checks is planned as its message: the lead it still reports is no dropout, its urgency stays
     sm.invalid.add('radarState')
-  elif dropout == 'nonfinite':
+    for _ in range(LEAD_ABSENCE_FRAMES + 1):
+      planner.update(sm)
+      assert math.isclose(planner.output_a_target, -3.0, abs_tol=1e-6)
+      assert planner.output_should_stop and planner.stop_landing.required_decel > planner.stop_landing.bound(1.0)
+    return
+  if dropout == 'nonfinite':
     getattr(sm['radarState'], slot).aLeadK = math.nan
   else:
     getattr(sm['radarState'], slot).present = False
@@ -263,3 +271,79 @@ def test_an_in_progress_urgency_release_yields_to_new_authority(event):
     assert planner.output_a_target <= -2.9
   else:
     assert planner.stop_landing.required_decel == 0.0
+
+
+
+
+def landing(lost, experimental=False):
+  # an ideal car landing from 3.3 m/s on a car standing 7.6 m ahead, which the radar does not report on the lost frames; in Experimental
+  # the model calls the stop at the car asking -2.5. Per frame: the published target, its rise, the speed, whether the MPC keeps the
+  # car, the landing's absence count for it, whether the landing is latched, its release ramp, and whether it holds the car below its
+  # corridor
+  car, frames = IdealCar(3.3), []
+  for k in range(round(6.0 / DT_MDL)):
+    told, v_ego, d = car.a, car.v, 7.6 - car.x
+    model = {'experimental': True, 'should_stop': True, 'path': (max(d, 0.0), 0.0), 'e2e_accel': -2.5} if experimental else {}
+    car.step(lead=None if k in lost else (d, 0.0, 0.0), v_cruise=10.0, **model)
+    law = car.planner.stop_landing
+    frames.append((car.a, car.a - told, v_ego, car.planner.mpc.kept[0], law._lead_missing[0], law.landing, law.releasing,
+                   car.a < -(law.bound(v_ego) + law.integral) - 1e-6))
+  return frames
+
+
+def loss_start(frames, v_loss):
+  return next(k for k, f in enumerate(frames) if f[5] and f[2] <= v_loss)
+
+
+def ramps(frames, start):
+  # the frames, counted from the loss, on which a release ramp starts while the landing still holds: a lead's room going back. The
+  # landing's own exit ramps later
+  return [k - start for k, (prev, f) in enumerate(zip(frames, frames[1:], strict=False), start=1) if f[6] and not prev[6] and f[5]]
+
+
+@pytest.mark.parametrize('v_loss', [3.0, 2.5], ids=['at 3 m/s', 'held beyond the corridor at 2.5 m/s'])
+def test_a_four_frame_dropout_in_a_landing_never_steps_the_target(v_loss):
+  # the radar loses the car for four frames while the landing brakes the car toward it. The MPC keeps it and the landing reads the lead
+  # it keeps; the landing's absence window counts from the radar's loss but cannot end while the keep runs, so nothing hands back: the
+  # target lands as without the dropout
+  clean = landing(())
+  start = loss_start(clean, v_loss)
+  assert v_loss - 0.1 <= clean[start][2] and all(f[5] for f in clean[start:start + 4])
+  assert clean[start][7] == (v_loss < 3.0), clean[start]
+  lost = range(start, start + 4)
+  dropout = landing(lost)
+  assert all(f[3] and f[4] == k + 1 and f[5] and not f[6] for k, f in enumerate(dropout[lost.start:lost.stop])), dropout[lost.start:lost.stop]
+  assert all(abs(d[0] - c[0]) <= 0.02 and d[1] <= c[1] + 0.005 for d, c in zip(dropout, clean, strict=True)), \
+    max((d[1] - c[1], k) for k, (d, c) in enumerate(zip(dropout, clean, strict=True)))
+
+
+def lost_for_good(experimental):
+  # the same landing, the car gone for good at 2.5 m/s with its room held below the corridor: the MPC keeps it for the rest of the
+  # absence hold, which the landing's window runs alongside, and the room goes back through one release ramp from the frame that keep
+  # ends, no frame rising faster than the release jerk
+  frames = landing(range(loss_start(landing((), experimental), 2.5), round(6.0 / DT_MDL)), experimental)
+  start = loss_start(frames, 2.5)
+  kept = [k - start for k, f in enumerate(frames) if f[3]]
+  assert kept == list(range(LEAD_ABSENCE_FRAMES - 1)), kept
+  assert frames[start + LEAD_ABSENCE_FRAMES - 2][7], frames[start + LEAD_ABSENCE_FRAMES - 2]
+  assert ramps(frames, start) == [LEAD_ABSENCE_FRAMES - 1], ramps(frames, start)
+  assert all(f[1] <= j_cruise_step(f[2]) + 0.005 for f in frames[start:]), max((f[1] - j_cruise_step(f[2]), k - start) for k, f in enumerate(frames))
+
+
+def test_a_car_lost_for_good_in_a_landing_hands_its_room_back_once_at_the_release_jerk():
+  lost_for_good(experimental=False)
+
+
+def test_a_car_lost_for_good_in_an_experimental_landing_hands_its_room_back_from_the_frame_the_keep_ends():
+  # the same with the model asking -2.5 at the car, which holds the plan below the corridor through the loss
+  lost_for_good(experimental=True)
+
+
+def test_a_car_back_nine_frames_after_it_was_lost_in_an_experimental_landing_does_not_step_the_target():
+  # Experimental, the model asking -2.5 at the car: the radar loses it at 2.5 m/s and finds it again three frames after the keep ended.
+  # The room the landing held went back from the keep's end, so the car's return finds the ramp running and the target never rises
+  # faster than the release jerk
+  start = loss_start(landing((), True), 2.5)
+  frames = landing(range(start, start + 9), True)
+  assert ramps(frames, start) == [LEAD_ABSENCE_FRAMES - 1], ramps(frames, start)
+  assert all(f[1] <= j_cruise_step(f[2]) + 0.005 for f in frames[start:]), max((f[1] - j_cruise_step(f[2]), k - start) for k, f in enumerate(frames))

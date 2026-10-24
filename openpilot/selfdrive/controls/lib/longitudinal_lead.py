@@ -19,8 +19,9 @@ LEAD_PATH_MARGIN = 10.0
 
 @dataclass(frozen=True, slots=True)
 class LeadObservation:
-  # finite, filtered values from one valid radarState sample; the MPC obstacle uses the raw vLead as stock does. model_prob is the
-  # model's confidence in this return (0 for radard's low-speed override), track_id its radar track (-1 vision-only)
+  # finite, filtered values from one radarState sample, or that sample advanced in time; the MPC obstacle uses the raw vLead
+  # as stock does. model_prob is the model's confidence in this return (0 for radard's low-speed override), track_id its radar
+  # track (-1 vision-only)
   present: bool = False
   distance: float = math.inf
   speed: float = 0.0
@@ -29,13 +30,20 @@ class LeadObservation:
   track_id: int = -1
 
   @classmethod
-  def from_radar(cls, lead, service_valid):
-    if not service_valid or not lead.present:
+  def from_radar(cls, lead):
+    if not lead.present:
       return cls()
     values = (lead.dRel, lead.vLeadK, lead.aLeadK)
-    if not all(math.isfinite(v) for v in values) or lead.dRel <= 0.0:
+    if not all(math.isfinite(v) for v in values):
       return cls()
-    return cls(True, lead.dRel, max(lead.vLeadK, 0.0), float(np.clip(lead.aLeadK, -10.0, 5.0)), lead.modelProb, lead.radarTrackId)
+    # a lead read at or behind the bumper is in contact, not gone
+    return cls(True, max(lead.dRel, 0.0), max(lead.vLeadK, 0.0), float(np.clip(lead.aLeadK, -10.0, 5.0)), lead.modelProb, lead.radarTrackId)
+
+  def advanced(self, v_ego, dt):
+    # the same lead dt later, at its own speed and acceleration, seen from a car at v_ego; a lead that stops stays stopped
+    speed = max(self.speed + self.acceleration * dt, 0.0)
+    distance = self.distance + (0.5 * (self.speed + speed) - v_ego) * dt
+    return LeadObservation(True, distance, speed, self.acceleration if speed > 0.0 else 0.0, self.model_prob, self.track_id)
 
 
 @dataclass(frozen=True, slots=True)

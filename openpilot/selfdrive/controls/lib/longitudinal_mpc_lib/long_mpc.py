@@ -57,8 +57,9 @@ T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 MIN_X_LEAD_FACTOR = 0.5
-# the QP plans against the obstacles present each frame; the hand-over in update() waits LEAD_PRESENCE_FRAMES for a radar lead
-# taking over from the free run and LEAD_ABSENCE_FRAMES for one that is gone, so toggles and short dropouts do not restart the plan
+# the hand-over in update() waits LEAD_PRESENCE_FRAMES for a radar lead taking over from the free run and LEAD_ABSENCE_FRAMES for
+# one that is gone, so toggles and short dropouts do not restart the plan; while the car moves, a lead seen LEAD_PRESENCE_FRAMES in
+# a row stays in the QP through that absence hold
 LEAD_PRESENCE_FRAMES = 2
 LEAD_ABSENCE_FRAMES = 7
 
@@ -245,6 +246,12 @@ class LongitudinalMpc:
     self.binding_obstacle = None
     self.pending_frames = 0
     self.restoring_lead = None
+    self.lead_handover = False
+    # per radar slot: (its last trajectory, frames seen in a row, frames since, the car's travel since, frames missing while moving),
+    # and whether this frame keeps its lead or ends that keep
+    self._last_leads = [None, None]
+    self.kept = [False, False]
+    self.expired = [False, False]
     self.lead_present = False
     self.column_present = False
     self.solution_status = 0
@@ -252,6 +259,7 @@ class LongitudinalMpc:
     self.solve_time = 0.0
     self.x0 = np.zeros(X_DIM)
     self.a_told = 0.0
+    self.at_rest = False
     self.set_weights()
 
   def set_cost_weights(self, cost_weights, constraint_cost_weights):
@@ -278,12 +286,14 @@ class LongitudinalMpc:
     constraint_cost_weights = [LIMIT_COST, LIMIT_COST, LIMIT_COST, DANGER_ZONE_COST]
     self.set_cost_weights(cost_weights, constraint_cost_weights)
 
-  def set_cur_state(self, v, a, a_told):
-    # a: the acceleration the plan continues from; a_told: the target the car was last given, where a new obstacle's plan starts
+  def set_cur_state(self, v, a, a_told, at_rest=False):
+    # a: the acceleration the plan continues from; a_told: the target the car was last given, where a new obstacle's plan starts;
+    # at_rest: the car stands engaged, where a missing lead is not kept
     v_prev = self.x0[1]
     self.x0[1] = v
     self.x0[2] = a
     self.a_told = a_told
+    self.at_rest = at_rest
     if abs(v_prev - v) > 2.:  # probably only helps if v < v_prev
       for i in range(N+1):
         self.solver.set(i, 'x', self.x0)
@@ -349,10 +359,44 @@ class LongitudinalMpc:
     v_lead = np.interp(T_IDXS, LEAD_T_IDXS, v_lead)
     return np.column_stack((x_lead, v_lead))
 
+  def keeps_lead(self, slot, present, lead_gone=False, released=False):
+    # a missing radar lead is not a departure while the car moves: a lead seen LEAD_PRESENCE_FRAMES in a row stays in the plan,
+    # advanced along its own future, through the absence hold. A lead the lane-change gap released has left the plan on purpose
+    last = self._last_leads[slot]
+    return (not present and not released and last is not None and last[1] >= LEAD_PRESENCE_FRAMES and not self.at_rest and
+            last[4] + 1 < LEAD_ABSENCE_FRAMES)
+
+  def _lead_xv(self, slot, anchor, lead, present, lead_gone, released):
+    self.expired[slot] = False
+    if present:
+      xv = self.process_lead_model(anchor, lead)
+      last = self._last_leads[slot]
+      self._last_leads[slot] = (xv, 1 if last is None else last[1] + 1, 0, 0.0, 0)
+      self.kept[slot] = False
+      return xv
+    kept = self.kept[slot]
+    self.kept[slot] = self.keeps_lead(slot, False, lead_gone, released)
+    if not self.kept[slot]:
+      # a keep that ends here, its absence hold served or the car at rest, hands its lead over on this frame; a release is no
+      # keep's end, and a lead it restores later starts its count afresh
+      self.expired[slot] = kept and not released
+      self._last_leads[slot] = None
+      return self.process_lead(None)
+    xv, seen, n, travel, absent = self._last_leads[slot]
+    n, travel, absent = n + 1, travel + self.x0[1] * self.dt, absent + (0 if self.at_rest else 1)
+    self._last_leads[slot] = (xv, seen, n, travel, absent)
+    # the last trajectory n frames on along its own future, less the car's travel since
+    shift = n * self.dt
+    return np.column_stack((np.interp(T_IDXS + shift, T_IDXS, xv[:, 0]) - travel, np.interp(T_IDXS + shift, T_IDXS, xv[:, 1])))
+
   def update(self, radarstate, personality=log.LongitudinalPersonality.standard, lead0_anchor=None, lead1_anchor=None,
-             stop_x=None, jerk_scale=1.0, t_follow_pad=0.0, prev_accel_constraint=True, restored_leads=(False, False)):
-    lead_xv_0 = self.process_lead_model(lead0_anchor, radarstate.leadOne)
-    lead_xv_1 = self.process_lead_model(lead1_anchor, radarstate.leadTwo)
+             stop_x=None, jerk_scale=1.0, t_follow_pad=0.0, prev_accel_constraint=True, lead_gone=False, *, usable,
+             restored_leads=(False, False), released_leads=(False, False)):
+    # usable: the planner's one reading of each radar slot the plan follows; a lead it does not hold is a missing lead here too.
+    # released_leads: the slots the lane-change gap releases this frame, restored_leads: the slots it gave back this frame
+    leads = (radarstate.leadOne, radarstate.leadTwo)
+    lead_xv_0 = self._lead_xv(0, lead0_anchor, leads[0], usable[0], lead_gone, released_leads[0])
+    lead_xv_1 = self._lead_xv(1, lead1_anchor, leads[1], usable[1], lead_gone, released_leads[1])
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
@@ -371,21 +415,24 @@ class LongitudinalMpc:
 
     # the binding obstacle's identity, not its column: the fake lead's free run, a real lead in either slot, or the stop column.
     # It changes when an obstacle comes or goes; a lead and the column trading the binding while both are present do not change it
-    leads = (radarstate.leadOne, radarstate.leadTwo)
-    obstacle = 'stop' if binding == 2 else 'lead' if leads[binding].present else 'fake'
+    # a kept lead is still the plan's lead; a keep that ended this frame stood in for the absence hold: the hand-over waits no more
+    present = (usable[0] or self.kept[0], usable[1] or self.kept[1])
+    obstacle = 'stop' if binding == 2 else 'lead' if present[binding] else 'fake'
     restoring = obstacle == 'lead' and (restored_leads[binding] or self.restoring_lead == binding)
-    lead_present = leads[0].present or leads[1].present
+    lead_present = present[0] or present[1]
     column_edge = (stop_x is not None) != self.column_present
     if {obstacle, self.binding_obstacle} == {'lead', 'stop'} and lead_present and self.lead_present and not column_edge:
       self.binding_obstacle = obstacle
     self.lead_present, self.column_present = lead_present, stop_x is not None
     hold = 1
-    if self.binding_obstacle == 'lead' and not (column_edge and obstacle == 'stop'):
+    if self.binding_obstacle == 'lead' and not (column_edge and obstacle == 'stop') and not any(self.expired):
       hold = LEAD_ABSENCE_FRAMES
     elif self.binding_obstacle == 'fake' and obstacle == 'lead':
       hold = LEAD_PRESENCE_FRAMES
     self.pending_frames = self.pending_frames + 1 if obstacle != self.binding_obstacle else 0
     new_obstacle = self.pending_frames >= hold
+    # the binding lead is gone for good: whatever carries the car next starts from what it was told
+    self.lead_handover = new_obstacle and self.binding_obstacle == 'lead' and obstacle == 'fake'
     # a new binding obstacle discards the old plan: its plan starts from what the car was told, the change cost re-anchors
     # there and the iterate restarts from that state; that frame runs one more SQP-RTI iteration
     if new_obstacle:
@@ -421,7 +468,7 @@ class LongitudinalMpc:
 
     self.run(2 if new_obstacle else 1)
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
-            radarstate.leadOne.present and radarstate.leadOne.modelProb > 0.9):
+            usable[0] and radarstate.leadOne.modelProb > 0.9):
       self.crash_cnt += 1
     else:
       self.crash_cnt = 0

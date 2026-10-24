@@ -19,9 +19,10 @@ A minimal-diff personal branch on the official master baseline (code as of the M
 The positive excessive-actuation diagnostic keeps the inherited `2 × ACCEL_MAX` rule: it now detects sustained calibrated/measured acceleration above 8.0 m/s², as in combo. This is distinct from the actual 4.0 m/s² Hyundai command/safety ceiling; the negative threshold, measurement-consistency gate and debounce are unchanged.
 
 Daily's BLoTv3 adaptations include shared primary/secondary-lead landing urgency, a bounded missing-lead urgency
-window, and model/radar freshness gates for lead forecasts. They do not add a retained radar obstacle or autonomous
-braking authority. Conditional model stops are not a traffic-light detector. See the daily-integration section of
-the design document; historical source-branch replay notes are not qualification of this composition.
+window, and model/radar freshness gates for lead forecasts. They do not add a retained radar obstacle (D43's keep of a
+confirmed lead through the MPC's absence hold is BLoTv3's own) or autonomous braking authority. Conditional model
+stops are not a traffic-light detector. See the daily-integration section of the design document; historical
+source-branch replay notes are not qualification of this composition.
 
 Conditional Experimental Mode keeps Experimental while the model's plan still sheds most of the car's speed, wherever the
 plan ends (a plan that dips toward the line and relaunches no longer reads as an open road), and returns to Chill on the
@@ -30,6 +31,14 @@ model's go: 0.5 s of open road with the plan no longer slowing, at rest or below
 radar lead vetoes entry only while it owns the stop: a queue (below 1 m/s), a lead the MPC would stop behind at or before
 the model's stop point, or a likely model lead forecast to end there; on a near stop with the car above a crawl, a lead
 going through ends the veto at once (BLoTv3 D42). Neither is field validated.
+
+A radar lead lost while the car brakes behind it stays in the plan: a lead the MPC saw on two frames in a row is kept,
+moving along its last trajectory, for the rest of the seven-frame absence hold while the car moves, and when it is gone
+for good cruise takes the car on from the published target at the cruise jerk instead of jumping (BLoTv3 D43). The planner
+reads each radar slot once, by the message's own slot status with finite values, so a frame radarState fails its checks
+no longer hides its leads from the supervisor, the landing or the pre-release; the model's lead forecasts still need a
+healthy radar. A lead read at or behind the bumper is a lead in contact, braked for to rest. A lead the lane-change gap
+releases leaves the plan at once and is never kept. Not field validated.
 
 ## Lane-centering toggle
 
@@ -70,7 +79,7 @@ The import's monotone-path health check rejected the model's normal path jitter 
 
 ## Deliberately excluded
 
-BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream AccelBoost is retained; the Mountain Dew big model and the tinygrad bump that shipped with it are not (see the Chestnut section). The opendbc pin advances for the selected 4.0 m/s² ceiling; existing SOL and torque safety behavior is retained, and unrelated dependency pins are unchanged. The upstream radar publication retains the Smooth Stops unconfirmed low-speed gate; lane-change filtering is a separate planner-local view. MPC collision-warning prediction follows the accepted BLoTv3 trajectory for non-released leads. The accepted upstream type-check diagnostics are not fixed by these imports. All additions remain local pending separate device and owner field acceptance.
+BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream AccelBoost is retained; the Mountain Dew big model and the tinygrad bump that shipped with it are not (see the Chestnut section). The opendbc pin advances for the selected 4.0 m/s² ceiling, and to `a9379506` on SpysyWeeb/opendbc branch `daily`, restoring the standstill-exit launch jerk (SCC14 `JerkUpperLimit` 5.0 in the pid state while the wheels are still, the owner's earlier decision lost when the pin moved; field effect at most 0.05 s on the standstill release); existing SOL and torque safety behavior is retained, and unrelated dependency pins are unchanged. The upstream radar publication retains the Smooth Stops unconfirmed low-speed gate; lane-change filtering is a separate planner-local view. MPC collision-warning prediction follows the accepted BLoTv3 trajectory for non-released leads. The accepted upstream type-check diagnostics are not fixed by these imports. All additions remain local pending separate device and owner field acceptance.
 
 ## Import provenance
 
@@ -94,6 +103,7 @@ BLaTv2 and the third model-only cut-in obstacle are not imported. Upstream Accel
 - Full longitudinal feature: [BLoTv3 at 926ccb7a3](https://github.com/SpysyWeeb/Spysypilot/tree/926ccb7a3f24ab49d47b64fde2cbcc98ff02e14f), reconciled with daily’s newer upstream planner and SOL. Local verification is not device or field acceptance.
 - Conditional Experimental Mode slowing hold and go exit: BLoTv3 `5dac58958257cb6a14b432a07e206b4a9f73881f` (D41), applied unchanged; `conditional_experimental_mode.py`, `stop_helpers.py` and their tests match BLoTv3's, and the design document carries D40/D41.
 - Conditional Experimental Mode lead ownership: BLoTv3 `4390b44f22c75f60375b57737c1a9c4af9d884d9` (D42), applied unchanged; the MPC's stopping geometry moves to `longitudinal_mpc_lib/constants.py` so selfdrived does not load the solver.
+- Lead kept through its absence hold, one reading of lead presence: BLoTv3 `4eaa4f4131ecd1048791632659e7d69e4213da99` (D43), composed with daily's lane-change release and restore (a released lead is never kept), its landing urgency window (leadOne reads the kept lead; its window counts from the radar's loss and ends no sooner than the keep, and that expiry is the one hand-back of the lead's room) and its model-forecast health gate (on a frame radarState fails, the leads stay and only the forecasts fall back). The radar-invalid lead hiding, which daily had extended to leadTwo, is retired with BLoTv3's; the design document carries D43.
 
 - Nudgeless production helper and source-owned tests: [lane-changes at ac85e99c](https://github.com/SpysyWeeb/Spysypilot/tree/ac85e99c3049f4a88c376deae94ba46af99b50d5), including the early-manual-start retry fix. Its lateral behavior is unchanged by the subsequent longitudinal passing import.
 - Complete centering feature and both Dev toggles: [lane-centering at a3f3b942](https://github.com/SpysyWeeb/Spysypilot/tree/a3f3b94250611608dc39b9357e1364ea1b091960). Test setup is adapted to daily's required SOL status; production behavior is unchanged.

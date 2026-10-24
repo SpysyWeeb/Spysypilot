@@ -29,6 +29,9 @@ PLAN_JERK_MAX = 3.0  # m/s^3, the plan's comfort jerk bound; the car limits a ri
 PLAN_REVERSAL = 0.15  # m/s^2, a let-off or a re-brake of this size before the final ease
 BRAKE_SHORTFALL = 0.3  # m/s^2, how far short of every request a car falls while it rolls
 DRIVELINE_CREEP = 0.5  # m/s^2 at rest, an assumed level: no creep event is in the logs
+BRAKING_ONSET = -0.5  # m/s^2, the car's acceleration from which a lead maneuver counts as braking
+ANTICIPATION = 0.3  # s, how much earlier the model's forecast of a braking lead brakes the car than the radar alone
+ANTICIPATION_GAP = 0.8  # m, how much more room it keeps behind that lead
 
 
 class PinnedTestCase(OpenpilotTestCase):
@@ -229,6 +232,37 @@ class TestLongitudinalControl(PinnedTestCase):
         print(maneuver.title, f'in {"e2e" if maneuver.e2e else "acc"} mode')
         valid, _ = maneuver.evaluate()
         assert valid
+
+
+@parameterized_class('accel_max', ACCEL_MAX_PINS)
+class TestLeadAnticipation(PinnedTestCase):
+  # the model's forecast of the lead, anchored to the radar lead, reaches the MPC: the stock plant's model lead holds the lead's
+  # braking to a stop, while the radar's own extrapolation fades it out, so a lead braking hard is braked for earlier and with more room
+  def braking(self, maneuver, anchored=True):
+    # the time the car first brakes and the least gap, with the forecast, or with the planner reading the radar alone
+    if anchored:
+      valid, logs = maneuver.evaluate()
+    else:
+      with mock.patch.object(longitudinal_planner, 'anchor_model_lead', lambda *args: None):
+        valid, logs = maneuver.evaluate()
+    assert valid, maneuver.title
+    t, a, d_rel = logs[:, 0], logs[:, 5], logs[:, 6]
+    return float(t[np.flatnonzero(a < BRAKING_ONSET)[0]]), float(d_rel.min())
+
+  def test_a_lead_braking_to_a_stop_is_braked_for_earlier_and_further_back(self, subtests):
+    stops = [m for m in create_maneuvers({'e2e': False, 'force_decel': False}) if 'then lead decel to 0mph' in m.title]
+    assert len(stops) == 4
+    for maneuver in stops:
+      with subtests.test(title=maneuver.title):
+        (onset, gap), (radar_onset, radar_gap) = self.braking(maneuver), self.braking(maneuver, anchored=False)
+        assert radar_onset - onset >= ANTICIPATION, (onset, radar_onset)
+        assert gap - radar_gap >= ANTICIPATION_GAP, (gap, radar_gap)
+
+  def test_a_lead_slowing_to_a_crawl_is_braked_for_earlier(self):
+    maneuver = Maneuver('following a car at 15 m/s that slows to 5 m/s at 1 m/s^2', duration=30., initial_speed=15., lead_relevancy=True,
+                        initial_distance_lead=30., speed_lead_values=[15., 15., 5.], breakpoints=[0., 10., 20.])
+    (onset, _), (radar_onset, _) = self.braking(maneuver), self.braking(maneuver, anchored=False)
+    assert radar_onset - onset >= ANTICIPATION, (onset, radar_onset)
 
 
 @parameterized_class('accel_max', ACCEL_MAX_PINS)
