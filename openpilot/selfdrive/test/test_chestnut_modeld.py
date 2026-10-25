@@ -99,6 +99,23 @@ def test_model_upload_run_and_warmup(tmp_path, monkeypatch, model_device):
     assert not model.prev_desire.any()
     np.testing.assert_array_equal(model.input_queues['history'].numpy(), [0])
     np.testing.assert_array_equal(model.run(frames, transforms, inputs)['probe'], first)
+    if model.chestnut:
+      # a failure the big-model device reports in its error word during the run raises into main's fallback handler,
+      # before the after-enqueue callback and the output read
+      err = modeld.Device[model.outputs['outputs'].device].error_state.host.view(fmt='q')
+      run_model = model.run_model
+
+      def failing_run(**kwargs):
+        run_model(**kwargs)
+        err[0] = 3
+      model.run_model = failing_run
+      try:
+        with pytest.raises(RuntimeError, match='chestnut failed with 3'):
+          model.run(frames, transforms, inputs, lambda: called.append('late'))
+        assert called == [True]
+      finally:
+        err[0] = 0
+        model.run_model = run_model
 
 
 @pytest.mark.parametrize('retry', [False, True], ids=['first_boot', 'retry_boot'])
