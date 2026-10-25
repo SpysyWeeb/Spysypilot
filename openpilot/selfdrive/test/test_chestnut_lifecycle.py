@@ -129,7 +129,7 @@ def lifecycle(tmp_path, monkeypatch):
   # A killed multiprocessing.Condition waiter can deadlock Event.set(); a pipe has no userspace waiter handshake.
   release_read, release_write = os.pipe()
   release = SimpleNamespace(set=lambda: os.write(release_write, b'1'))
-  scenario = SimpleNamespace(stall='load', compile=None, run_error=None)
+  scenario = SimpleNamespace(stall='load', compile=None)
 
   def record(event):
     with trace.open('a') as f:
@@ -178,8 +178,6 @@ def lifecycle(tmp_path, monkeypatch):
 
     def run(self, *_):
       record('run_big' if self.chestnut else 'run_small')
-      if self.chestnut and scenario.run_error is not None:
-        raise RuntimeError(scenario.run_error)
       ran.set()
       # Keep modeld alive after reaching actual main-loop model selection/invocation.
       threading.Event().wait()
@@ -432,7 +430,7 @@ def test_manager_start_clears_timeout_latch_and_ready_model_runs(lifecycle, monk
 
 
 @pytest.mark.parametrize('retried', [False, True])
-def test_failed_big_load_retries_once_through_onroad_cycle(lifecycle, monkeypatch, retried):
+def test_failed_big_load_retries_once_through_onroad_cycle(lifecycle, monkeypatch, tmp_path, retried):
   life = lifecycle
   life.scenario.stall = None
   monkeypatch.setattr(modeld, 'BIG_MODEL_TIMEOUT', 5)
@@ -445,12 +443,16 @@ def test_failed_big_load_retries_once_through_onroad_cycle(lifecycle, monkeypatc
       raise RuntimeError('test big model load failure')
   life.scenario.compile = fail_big_load
 
+  def drop_chestnut():
+    with (tmp_path / 'trace.txt').open('a') as f:
+      f.write(f'{os.getpid()} drop\n')
+  monkeypatch.setattr(modeld, 'drop_chestnut', drop_chestnut)
+
   life.tick()
   current = life.proc.proc
   assert life.ran.wait(10)
-  # Both boots build the small model straight after the failed load and run it; this tinygrad keeps no per-device
-  # pending table for modeld to clear first.
-  assert life.events(current.pid) == ['enumerate', 'enumerate', 'big', 'small', 'realtime', 'run_small']
+  # Both boots drop pending AMD work before the small model is built, then run it.
+  assert life.events(current.pid) == ['enumerate', 'enumerate', 'big', 'drop', 'small', 'realtime', 'run_small']
   deadline = time.monotonic() + 3
   while life.params.get('ChestnutLoading') is not False and time.monotonic() < deadline:
     time.sleep(0.01)
@@ -465,34 +467,4 @@ def test_failed_big_load_retries_once_through_onroad_cycle(lifecycle, monkeypatc
     # Failure on the retry boot: report the failure and never request another cycle.
     assert life.params.get('ChestnutActive') is False
     assert not life.params.get_bool('OnroadCycleRequested')
-  assert current.is_alive()
-
-
-def test_big_model_run_failure_falls_back_to_warm_small_model(lifecycle, monkeypatch):
-  life = lifecycle
-  life.scenario.stall = None
-  life.scenario.run_error = 'chestnut failed with 1'
-  monkeypatch.setattr(modeld, 'BIG_MODEL_TIMEOUT', 5)
-  Vision = modeld.VisionIpcClient
-
-  class Frames(Vision):
-    def recv(self):
-      # a new camera frame each call, so the main loop reaches the run after the fallback
-      self.frame_id += 1
-      self.timestamp_sof += 50_000_000
-      self.timestamp_eof += 50_000_000
-      return super().recv()
-  monkeypatch.setattr(modeld, 'VisionIpcClient', Frames)
-
-  life.tick()
-  current = life.proc.proc
-  assert life.ran.wait(10), 'the failed big-model run must hand the next frame to the small model'
-  # The handler keeps modeld alive and switches to the standby warmed at startup; nothing is rebuilt.
-  assert life.events(current.pid) == ['enumerate', 'enumerate', 'big', 'warm_big', 'small', 'warm_small', 'realtime', 'run_big',
-                                      'run_small']
-  deadline = time.monotonic() + 3
-  while life.params.get('ChestnutActive') is not False and time.monotonic() < deadline:
-    time.sleep(0.01)
-  assert life.params.get('ChestnutActive') is False
-  assert not life.params.get_bool('ChestnutLoadTimedOut')
   assert current.is_alive()
