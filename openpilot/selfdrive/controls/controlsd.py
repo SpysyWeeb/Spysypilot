@@ -24,6 +24,7 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
+from openpilot.spysypilot.aol.helpers import MAX_DRIVER_ASSIST_TORQUE, driver_assist_envelope, driver_assist_limits_from_cp
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -48,6 +49,7 @@ class Controls:
     cloudlog.info("controlsd got CarParams")
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP)
+    self.driver_assist_limits = driver_assist_limits_from_cp(self.CP)
 
     self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
                                    'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
@@ -167,11 +169,13 @@ class Controls:
         cloudlog.error(f"actuators.{p} not finite {actuators.to_dict()}")
         setattr(actuators, p, 0.0)
 
-    # Driver touch reduces authority, not the ordinary controller request below the cap.
-    # Platform rate/driver-torque limits and panda remain the final authority.
+    # Driver touch caps the request by the platform's driver-allowance envelope: full authority pushing with it, floored
+    # at 0.5 opposing it; smaller requests stay smaller. Platform rate/driver-torque limits and panda remain the final authority.
     if CS.steeringPressed and self.sm['spysydriveStateSP'].aol.available and \
        self.CP.steerControlType == car.CarParams.SteerControlType.torque:
-      actuators.torque = max(-0.5, min(0.5, actuators.torque))
+      cap = MAX_DRIVER_ASSIST_TORQUE if self.driver_assist_limits is None else \
+        driver_assist_envelope(CS.steeringTorque, actuators.torque, self.driver_assist_limits)
+      actuators.torque = max(-cap, min(cap, actuators.torque))
 
     return CC, lac_log
 

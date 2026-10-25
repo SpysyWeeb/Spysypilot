@@ -3,12 +3,18 @@ from typing import Any, cast
 
 import pytest
 
+from opendbc.car.car_helpers import interfaces
+from opendbc.car.hyundai.values import CAR
 from opendbc.car.structs import car
 from openpilot.cereal import log, messaging
 from openpilot.selfdrive.controls.controlsd import Controls
 from openpilot.selfdrive.controls.controlsd_ext import ControlsExt
 from openpilot.selfdrive.controls.lib.lane_centering import LaneCentering
 from openpilot.selfdrive.controls.tests.test_lane_centering import get_model
+from openpilot.spysypilot.aol.helpers import driver_assist_limits_from_cp
+
+# The Palisade's own limits, resolved the way Controls.__init__ resolves them, from its real CarParams.
+PALISADE_LIMITS = driver_assist_limits_from_cp(interfaces[CAR.HYUNDAI_PALISADE].get_non_essential_params(CAR.HYUNDAI_PALISADE))
 
 
 def make_controls(torque_request):
@@ -50,12 +56,17 @@ def make_controls(torque_request):
   controls.lane_centering_enabled = True
   controls.desired_curvature = 0.0
   controls.steer_limited_by_safety = False
+  controls.driver_assist_limits = PALISADE_LIMITS
   return controls, CS
 
 
-@pytest.mark.parametrize('torque_request,expected', [(0.8, 0.5), (-0.8, -0.5), (0.3, 0.3), (-0.3, -0.3), (0.0, 0.0)])
-@pytest.mark.parametrize('driver_torque', [-250.0, 250.0])
-def test_driver_touch_caps_not_scales_and_has_no_release_latch(torque_request, expected, driver_torque):
+@pytest.mark.parametrize('torque_request,driver_torque,expected', [
+  (0.8, 250.0, 0.8), (0.8, -250.0, 0.5),  # agreeing keeps full authority; opposing floors at 0.5
+  (-0.8, -250.0, -0.8), (-0.8, 250.0, -0.5),
+  (0.3, 250.0, 0.3), (0.3, -250.0, 0.3), (-0.3, -250.0, -0.3), (-0.3, 250.0, -0.3),  # below the floor: untouched
+  (0.0, 250.0, 0.0), (0.0, -250.0, 0.0),
+])
+def test_driver_touch_caps_not_scales_and_has_no_release_latch(torque_request, driver_torque, expected):
   controls, CS = make_controls(torque_request)
   CS.steeringPressed = True
   CS.steeringTorque = driver_torque
@@ -65,6 +76,29 @@ def test_driver_touch_caps_not_scales_and_has_no_release_latch(torque_request, e
   CS.steeringPressed = False
   cc, _ = controls.state_control()
   assert cc.actuators.torque == pytest.approx(torque_request)
+
+
+@pytest.mark.parametrize('torque_request,expected', [(0.8, 0.5), (-0.8, -0.5), (0.3, 0.3), (-0.3, -0.3), (0.0, 0.0)])
+@pytest.mark.parametrize('driver_torque', [-250.0, 250.0])
+def test_platform_without_driver_allowance_keeps_the_flat_cap(torque_request, expected, driver_torque):
+  controls, CS = make_controls(torque_request)
+  controls.driver_assist_limits = None
+  CS.steeringPressed = True
+  CS.steeringTorque = driver_torque
+  cc, _ = controls.state_control()
+  assert cc.actuators.torque == pytest.approx(expected)
+  CS.steeringPressed = False
+  cc, _ = controls.state_control()
+  assert cc.actuators.torque == pytest.approx(torque_request)
+
+
+def test_real_controlsd_resolves_the_platform_envelope():
+  from openpilot.common.prefix import OpenpilotPrefix
+  from openpilot.selfdrive.controls.tests.test_daily_lane_features import TestDailyLaneFeatures
+
+  with OpenpilotPrefix():
+    controls = TestDailyLaneFeatures().make_controls()
+    assert controls.driver_assist_limits == PALISADE_LIMITS
 
 
 def test_stock_fallback_does_not_gain_sol_driver_cap():
