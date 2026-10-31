@@ -450,7 +450,7 @@ CONFIGS = [
     proc_name="controlsd",
     pubs=["vehicleParameters", "lateralTorqueParameters", "modelV2", "selfdriveState",
           "extrinsicsCalibration", "deviceMotion", "longitudinalPlan", "carState", "carOutput",
-          "driverMonitoringState", "onroadEvents", "driverAssistance", "spysydriveStateSP", "pandaStates"],
+          "driverMonitoringState", "onroadEvents", "driverAssistance", "spysydriveStateSP", "pandaStates", "radarState"],
     subs=["carControl", "controlsState"],
     ignore=["logMonoTime", ],
     init_callback=get_car_params_callback,

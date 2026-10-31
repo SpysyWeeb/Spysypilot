@@ -53,7 +53,7 @@ class Controls:
 
     self.sm = messaging.SubMaster(['lateralDelay', 'vehicleParameters', 'lateralTorqueParameters', 'modelV2', 'selfdriveState',
                                    'extrinsicsCalibration', 'deviceMotion', 'longitudinalPlan', 'lateralManeuverPlan', 'carState', 'carOutput',
-                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'spysydriveStateSP', 'pandaStates'],
+                                   'driverMonitoringState', 'onroadEvents', 'driverAssistance', 'spysydriveStateSP', 'pandaStates', 'radarState'],
                                   poll='selfdriveState', ignore_alive=['spysydriveStateSP'],
                                   ignore_valid=['spysydriveStateSP'])
     self.pm = messaging.PubMaster(['carControl', 'controlsState'])
@@ -198,6 +198,8 @@ class Controls:
     hudControl.speedVisible = CC.enabled
     hudControl.lanesVisible = CC.enabled
     hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
+    lead_one = self.sm['radarState'].leadOne
+    hudControl.leadDistance = lead_one.dRel if lead_one.present and (lead_one.radar or lead_one.modelProb > 0.5) else 0.0
     hudControl.leadDistanceBars = self.sm['selfdriveState'].personality.raw + 1
     hudControl.visualAlert = self.sm['selfdriveState'].alertHudVisual
 
