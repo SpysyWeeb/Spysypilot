@@ -112,9 +112,6 @@ class TestAthenadMethods(OpenpilotTestCase):
 
   # *** test cases ***
 
-  def test_echo(self):
-    assert dispatcher["echo"]("bob") == "bob"
-
   def test_get_message(self):
     with self.assertRaises(TimeoutError) as _:
       dispatcher["getMessage"]("controlsState")
@@ -333,7 +330,7 @@ class TestAthenadMethods(OpenpilotTestCase):
   @with_upload_handler
   def test_cancel_upload(self):
     item = athenad.UploadItem(path="qlog.zst", url="http://localhost:44444/qlog.zst", headers={},
-                              created_at=int(time.time()*1000), id='id', allow_cellular=True)  # noqa: TID251
+                              created_at=int(time.time()*1000), id='0' * 40, allow_cellular=True)  # noqa: TID251
     athenad.upload_queue.put_nowait(item)
     dispatcher["cancelUpload"](item.id)
 
@@ -480,9 +477,9 @@ class TestAthenadMethods(OpenpilotTestCase):
     thread.start()
     try:
       # with params
-      athenad.recv_queue.put_nowait(json.dumps({"method": "echo", "params": ["hello"], "jsonrpc": "2.0", "id": 0}))
+      athenad.recv_queue.put_nowait(json.dumps({"method": "cancelUpload", "params": ["0" * 40], "jsonrpc": "2.0", "id": 0}))
       _, _, resp = athenad.send_queue.get(timeout=3)
-      assert json.loads(resp) == {'result': 'hello', 'id': 0, 'jsonrpc': '2.0'}
+      assert json.loads(resp) == {'result': {'success': 0, 'error': 'not found'}, 'id': 0, 'jsonrpc': '2.0'}
       # without params
       athenad.recv_queue.put_nowait(json.dumps({"method": "getNetworkType", "jsonrpc": "2.0", "id": 0}))
       _, _, resp = athenad.send_queue.get(timeout=3)
